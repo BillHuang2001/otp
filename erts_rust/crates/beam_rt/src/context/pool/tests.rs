@@ -26,9 +26,10 @@
 //!
 //! [`crate::config::RuntimeConfig::with_heap_words`] sizes *both* the pooled BIF heap and the
 //! store, and the runtime **floors** it at its own minimum (1024 words), so no test can conjure a
-//! 256-word region — and a region crossing is not something a test should hope for anyway. The 4
-//! tests below therefore either (a) hold a workload that is a sizeable fraction of a *real*
-//! region ([`REGION_WORDS`]) so a crossing is arithmetic rather than luck, or (b) drive
+//! 256-word region — and a region crossing is not something a test should hope for anyway. Every
+//! test below therefore either (a) holds a workload that is a sizeable fraction of the region it
+//! configures — the suite's [`REGION_WORDS`], or the smallest legal one where a store crossing has
+//! to be forced — so a crossing is arithmetic rather than luck, or (b) drives
 //! [`Runtime::grow_eval_heap`] itself, whose contract is what the copy's growth step relies on.
 //! The premise that used to be asserted here — "a 256-word runtime gets a 256-word region" — was
 //! simply false.
@@ -37,11 +38,13 @@ use std::rc::Rc;
 
 use beam_bifs::BifContext;
 use beam_common::Result;
+use beam_engine::terms;
 use beam_engine::ExecutionContext;
-use beam_term::make_small;
 use beam_term::prelude::make_header;
 use beam_term::Eterm;
+use beam_term::{make_small, NIL};
 
+use crate::config::RuntimeConfig;
 use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
@@ -65,6 +68,17 @@ fn small_region_runtime() -> Runtime {
 /// The frontier region's `used` offset — the pool's allocation position after a call returns.
 fn frontier_used(rt: &Runtime) -> usize {
     rt.bif_heaps.last().expect("the pool keeps a region").used()
+}
+
+/// Every region the pool holds, as `(capacity, used)`, in pool order.
+///
+/// A retired region is pushed back **before** the fresh frontier is built, so the last entry is
+/// always the region the next call will allocate on.
+fn pool_shape(rt: &Runtime) -> Vec<(usize, usize)> {
+    rt.bif_heaps
+        .iter()
+        .map(|heap| (heap.capacity(), heap.used()))
+        .collect()
 }
 
 /// The address range a pooled region currently covers: a [`beam_alloc::Heap`] hands out words
@@ -341,6 +355,228 @@ fn the_store_grows_by_region_replacement_and_earlier_terms_stay_valid() {
     }
 }
 
+/// The shape the `-eval`/single-pass **store** must have after `calls` container copies of
+/// `words` words each, given a starting region of `region` words.
+///
+/// `(frontier_used, capacity, retired)`: what [`Runtime::eval_heap`]'s `used()` and `capacity()`
+/// must read (a replacement starts a fresh region, so the offset restarts at `0`), and the widths
+/// of the replaced regions in order. The model is [`Runtime::grow_eval_heap`]'s documented policy
+/// and nothing more: a copy that fits the remaining room lands as it is, one that does not replaces
+/// the region with one **twice as wide** (`needed.max(EVAL_STORE_GROWTH_FLOOR)` only matters below
+/// 256 words, which `MIN_HEAP_WORDS` rules out) and lands at offset `0` of the fresh one — which is
+/// kept, never freed, so its words stay readable.
+fn expected_store_shape(calls: usize, words: usize, region: usize) -> (usize, usize, Vec<usize>) {
+    let mut frontier = 0;
+    let mut capacity = region;
+    let mut retired = Vec::new();
+    for _ in 0..calls {
+        if frontier + words > capacity {
+            retired.push(capacity);
+            capacity *= 2;
+            frontier = 0;
+        }
+        frontier += words;
+    }
+    (frontier, capacity, retired)
+}
+
+/// **A table-less container result is re-homed to the store, and the pooled BIF region is rewound
+/// to the call's mark.**
+///
+/// The `-eval`/single-pass route has no scheduled process, so
+/// [`RuntimeContext::call_registered`]'s copy-out takes the **store** arm
+/// ([`RuntimeContext::move_result_into_runtime_store`]) instead of the process-heap one: the
+/// result is deep-copied onto the runtime's long-lived `-eval` store ([`Runtime::eval_heap`], its
+/// off-heap payloads adopted into [`Runtime::eval_off_heap`]) and only *then* is the pool rewound.
+/// Three consequences, all pinned here per round:
+///
+/// * the caller gets a **correct, readable** container back — the load-bearing half, since a copy
+///   that lost a word or a rewind that recycled one shows up here;
+/// * the pooled region is **not** retained: one region, `used() == 0`, capacity unchanged. The
+///   accumulation the pool's growth path used to exist for — every result staying on the region it
+///   was built on for the run's whole life — no longer happens on this route;
+/// * the surviving result words are owned by the **store**, exactly: each call adds the tuple's own
+///   101 words (a header plus 100 elements) and the store's region replacements follow
+///   [`expected_store_shape`] — here one, at the eleventh copy.
+///
+/// The first round's tuple is read back at the end, out of the region that replacement *retired*
+/// (a retired store region is kept alive, never moved), so a store that merely forgot its earlier
+/// words fails too.
+#[test]
+fn a_table_less_container_result_is_stored_and_the_pool_rewound_to_the_call_mark() {
+    // The smallest region a runtime accepts (`MIN_HEAP_WORDS`), which sizes **both** the pooled BIF
+    // heap and the store; 100 elements is a 101-word tuple, built from immediates alone.
+    const REGION_WORDS: usize = 1024;
+    const ELEMENTS: usize = 100;
+    const TUPLE_WORDS: usize = ELEMENTS + 1;
+    const ROUNDS: usize = 20;
+
+    let mut rt = Runtime::new(RuntimeConfig::new().with_heap_words(REGION_WORDS))
+        .expect("a runtime with the smallest legal term-construction region");
+    assert_eq!(rt.bif_heap_words, REGION_WORDS, "the configured region");
+    let mut kept = NIL;
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        for round in 0..ROUNDS {
+            let tuple = ctx
+                .call_bif(
+                    "erlang",
+                    "make_tuple",
+                    2,
+                    &[make_small(ELEMENTS as i64), make_small(0)],
+                )
+                .unwrap_or_else(|e| panic!("round {round}: make_tuple({ELEMENTS}, 0): {e}"));
+            assert_eq!(
+                (
+                    terms::tuple_arity(tuple).expect("the BIF built a tuple"),
+                    terms::tuple_element(tuple, ELEMENTS - 1).expect("in range"),
+                ),
+                (ELEMENTS, make_small(0)),
+                "round {round}: every call returns its whole container"
+            );
+            if round == 0 {
+                kept = tuple;
+            }
+            // The pool gave every word this call handed out back, in one region, at its mark.
+            let pool = ctx
+                .runtime
+                .bif_heaps
+                .last()
+                .expect("the pool keeps a region");
+            assert_eq!(
+                (ctx.runtime.bif_heaps.len(), pool.used(), pool.capacity()),
+                (1, 0, REGION_WORDS),
+                "round {round}: one region, at the call's mark, never grown"
+            );
+            // The store owns one result per completed call, in its own growth policy's shape.
+            let (frontier, capacity, retired) =
+                expected_store_shape(round + 1, TUPLE_WORDS, REGION_WORDS);
+            assert_eq!(
+                (
+                    ctx.runtime.eval_heap.used(),
+                    ctx.runtime.eval_heap.capacity(),
+                    ctx.runtime.eval_heap_retired.len(),
+                ),
+                (frontier, capacity, retired.len()),
+                "round {round}: the store owns every surviving result word"
+            );
+        }
+    }
+
+    let (_, capacity, retired) = expected_store_shape(ROUNDS, TUPLE_WORDS, REGION_WORDS);
+    assert_eq!(
+        rt.eval_heap.capacity(),
+        capacity,
+        "{ROUNDS} calls × {TUPLE_WORDS} words, ending on a {capacity}-word region"
+    );
+    assert_eq!(
+        rt.eval_heap_retired
+            .iter()
+            .map(|heap| heap.capacity())
+            .collect::<Vec<_>>(),
+        retired,
+        "the region the first ten copies landed in is retired, not freed: {retired:?}"
+    );
+    assert_eq!(
+        (
+            terms::tuple_arity(kept).expect("the first round's container is intact"),
+            terms::tuple_element(kept, ELEMENTS - 1).expect("in range"),
+        ),
+        (ELEMENTS, make_small(0)),
+        "a result whose words live in the retired region still reads"
+    );
+}
+
+/// **Capacity independence: a table-less container workload that would exhaust a fixed pooled
+/// region completes.**
+///
+/// The pool's own growth path ([`RuntimeContext::take_bif_frontier`]) is **pre-call** and
+/// `+hmax`-capped: it retires a region *already* nearly exhausted when a call starts — exactly the
+/// accumulation the store made unnecessary — and it does not rescue a call whose own result
+/// exceeds the region (measured: `make_tuple(2000, 0)` on a 1024-word region is
+/// `error:system_limit` with and without a `+hmax`). Pinning `+hmax` to the region's own size
+/// therefore disables the branch outright (`grown = min(2 × capacity, cap) <= capacity`) and makes
+/// this case's arithmetic a proof: [`ROUNDS`] × [`TUPLE_WORDS`] is 10 100 words against 1024, nearly
+/// ten times its capacity, so a frontier that kept each result where it was built would raise
+/// `error:system_limit` at the eleventh call. Every call succeeding is the rewind — and only the
+/// rewind — at work. `tests/eval_pool_result.rs` drives the same discriminator end to end through
+/// the CLI (a 1000-container `-eval` expression needed `+hmax 16384` before the store and completes
+/// at `+hmax 4096` with it); this is the cheap in-node form.
+#[test]
+fn a_table_less_container_workload_that_would_exhaust_a_fixed_pool_now_completes() {
+    const REGION_WORDS: usize = 1024;
+    const ELEMENTS: usize = 100;
+    const TUPLE_WORDS: usize = ELEMENTS + 1;
+    const ROUNDS: usize = 100;
+
+    let config = RuntimeConfig::new()
+        .with_heap_words(REGION_WORDS)
+        .with_heap_options(crate::config::HeapOptions::new().with_max_heap_words(REGION_WORDS));
+    let mut rt = Runtime::new(config).expect("a runtime whose +hmax is pinned to its region");
+    assert_eq!(
+        rt.bif_heap_words, REGION_WORDS,
+        "`+hmax` both sizes and caps the pooled region"
+    );
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        for round in 0..ROUNDS {
+            let tuple = ctx
+                .call_bif(
+                    "erlang",
+                    "make_tuple",
+                    2,
+                    &[make_small(ELEMENTS as i64), make_small(0)],
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "round {round}: the accumulated frontier would have exhausted the capped \
+                         region here, the rewind is what keeps it legal: {e}"
+                    )
+                });
+            assert_eq!(
+                terms::tuple_arity(tuple).expect("the BIF built a tuple"),
+                ELEMENTS,
+                "round {round}: a complete container, not a truncated one"
+            );
+            let pool = ctx
+                .runtime
+                .bif_heaps
+                .last()
+                .expect("the pool keeps a region");
+            assert_eq!(
+                (pool.used(), pool.capacity()),
+                (0, REGION_WORDS),
+                "round {round}: one capped region, rewound to the call's mark"
+            );
+        }
+        assert_eq!(
+            ctx.runtime.bif_heaps.len(),
+            1,
+            "the capped pool never needed — nor could have got — a second region"
+        );
+    }
+
+    // The store, not the pool, absorbed the workload, in its own growth policy's shape.
+    let (frontier, capacity, retired) = expected_store_shape(ROUNDS, TUPLE_WORDS, REGION_WORDS);
+    assert_eq!(
+        (rt.eval_heap.used(), rt.eval_heap.capacity()),
+        (frontier, capacity),
+        "the store absorbed all {ROUNDS} results ({TUPLE_WORDS} words each)"
+    );
+    assert_eq!(
+        rt.eval_heap_retired
+            .iter()
+            .map(|heap| heap.capacity())
+            .collect::<Vec<_>>(),
+        retired,
+        "its region replacements are what pay for the bounded pool: {retired:?}"
+    );
+    assert!(
+        retired.len() >= 3,
+        "the workload really crossed several store regions: {retired:?}"
+    );
+}
+
 /// A registered BIF that allocates words on the pooled heap and returns a **container the copier
 /// refuses** (`make_header(0, 0)` is the C ABI's non-value, a bare header word).
 fn refused_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
@@ -383,5 +619,89 @@ fn a_refused_copy_leaves_the_pooled_bif_heap_unrewound() {
         (rt.eval_heap_retired.len(), rt.eval_heap.capacity()),
         (retired_before, capacity_before),
         "a permanent refusal grows nothing"
+    );
+}
+
+/// **An exhausted pooled region is RETIRED and replaced by a wider frontier.**
+///
+/// [`RuntimeContext::take_bif_frontier`](super::super::calls::RuntimeContext::take_bif_frontier)
+/// has two branches: the ordinary one hands back the region the pool popped, and the retirement
+/// one — taken when that region has less than `capacity()/16` free words — puts it back and
+/// continues in a fresh region **twice as wide**. The rewind leaves the first branch as the only
+/// one an ordinary container workload ever sees, so this case drives the second through the one
+/// **refused** copy: [`refused_result`] builds a three-word tuple on `ctx.heap()` and answers with
+/// the C ABI's non-value, so the copier refuses it, both re-home arms answer `None`, and the call
+/// does not rewind — its words accumulate exactly as a NIF result's (never copied out, see
+/// `try_call_nif`) or an escaping `DispatchHooks` arm's (no rewind at all, see `safe_to_rewind`)
+/// would. Those two are out of reach for a unit case of this size: a NIF result needs a
+/// `dlopen`ed library (`tests/nif.rs`), and an escaping arm needs the process rig the
+/// `context::tests` dictionary case builds.
+///
+/// The retirement is arithmetic, not luck: three words per refused call (a `{1,2}` tuple: a
+/// header plus two elements) against a [`REGION_WORDS`] region whose free-word floor is
+/// `REGION_WORDS / 16 = 128`, so the 642nd call — the first to start with fewer than 128 free
+/// words (`2048 - 1923 = 125`) — retires the region and continues on a 4096-word frontier.
+/// Nothing is relocated: the retired region goes back to the pool **as it is** — never rewound,
+/// never freed — so the words its callers still own stay valid and at their own address, and only
+/// the allocation rotation moves to the fresh, wider frontier.
+#[test]
+fn an_exhausted_pooled_region_is_retired_and_replaced_by_a_wider_frontier() {
+    let mut rt = small_region_runtime();
+    {
+        let registry = Rc::get_mut(&mut rt.registry).expect("the runtime holds the only handle");
+        let _ = registry.register("pool_fixture", "refused", 0, refused_result);
+    }
+    let mut calls = 0usize;
+    // One refused call per round: each leaves its own words on the frontier, so the offset marches
+    // toward the region's capacity until a call finds less than the threshold free.
+    while rt.bif_heaps.len() == 1 {
+        {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            let _ = ctx
+                .call_bif("pool_fixture", "refused", 0, &[])
+                .expect("the fixture BIF returns");
+        }
+        calls += 1;
+        assert!(
+            calls < 10_000,
+            "the frontier never filled up, so the retirement branch was not driven: {:?}",
+            pool_shape(&rt)
+        );
+    }
+    assert_eq!(
+        calls, 642,
+        "the retirement lands on the first call that starts below the `capacity()/16` floor"
+    );
+    assert_eq!(
+        pool_shape(&rt),
+        vec![(REGION_WORDS, 1_923), (REGION_WORDS * 2, 3)],
+        "the exhausted region is RETIRED with every word its callers still own (641 calls × 3 \
+         words) and the next call runs on a fresh, twice-as-wide frontier"
+    );
+    // The floor is `capacity() / 16` free words — 128 here — and the boundary is exact: the 641st
+    // call started with exactly 128 free words and was served from the region, the 642nd with 125.
+    assert!(
+        REGION_WORDS - 1_920 >= REGION_WORDS / 16 && REGION_WORDS - 1_923 < REGION_WORDS / 16,
+        "the retirement happened at the free-word floor and not before it"
+    );
+    assert_eq!(
+        rt.eval_heap.used(),
+        0,
+        "every copy was refused, so the store received nothing: the words really accumulated on \
+         the pool"
+    );
+
+    // The rotation moved: the next refused call allocates on the fresh frontier, and the retired
+    // region is left exactly as it was.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let _ = ctx
+            .call_bif("pool_fixture", "refused", 0, &[])
+            .expect("the fixture BIF returns");
+    }
+    assert_eq!(
+        pool_shape(&rt),
+        vec![(REGION_WORDS, 1_923), (REGION_WORDS * 2, 6)],
+        "the frontier serves the next call; the retired region keeps its words untouched"
     );
 }

@@ -99,18 +99,32 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// # Why the pool needs a growth path
     ///
-    /// A registered BIF's container result is moved onto the running process's own young heap and
-    /// the pooled region is then rewound to this call's `mark` — but only when that rewind is both
-    /// **safe** and **complete**, and the copy-out requires a scheduled process
-    /// ([`Self::move_result_into_process_heap`] answers `None` without a `mailbox_table`). On the
-    /// **table-less** route — the `-eval` evaluator and every single-pass nested run — there is no
-    /// process heap to move a container onto, so nothing rewinds the pool: every container a BIF
-    /// builds stays on the same [`beam_alloc::Heap`] for the run's whole life, the bump pointer
-    /// marches to that region's fixed capacity, and the next allocation there is
-    /// [`AllocKind::Heap`](beam_common::AllocKind) — which
+    /// A registered BIF's container result is re-homed off the pooled region and the region is
+    /// then rewound to this call's `mark` — onto the running process's own young heap when there
+    /// is one ([`Self::move_result_into_process_heap`]), and onto the runtime's long-lived
+    /// `-eval` store on the **table-less** route ([`Self::move_result_into_runtime_store`]: the
+    /// `-eval` evaluator and every single-pass nested run). An ordinary container result therefore
+    /// gives its words back instead of accumulating ([`Self::rehome_container_result`]).
+    ///
+    /// The rewind cannot cover **everything**, and covering the rest is what this growth path is
+    /// for:
+    ///
+    /// * a **NIF** result is never copied off the pool ([`Self::try_call_nif`]), so its words stay
+    ///   on the region they were built on;
+    /// * an **escaping** `DispatchHooks` arm (the process dictionary, the process/port registry, a
+    ///   loaded NIF library, a delivered message, the persistent-term store, the timer/reference
+    ///   space) can leak a term the BIF built on `ctx.heap()` into state that outlives the call, so
+    ///   the `safe_to_rewind` gate forbids the rewind outright;
+    /// * a **refused** copy — a graph the copier rejects, an unresolvable off-heap container, or a
+    ///   destination that could not be grown — leaves the result on the pool at the call's own
+    ///   offset (both re-home arms answer `None`, and the caller then does not rewind).
+    ///
+    /// A run of any of those marches the region's bump pointer toward its fixed capacity, and the
+    /// next allocation there is [`AllocKind::Heap`](beam_common::AllocKind) — which
     /// [`error::enforce_term_heap_limit`] renders as `error:system_limit`. A long in-process
-    /// workload (the installed compiler is the load-bearing one) therefore used to stop for a
-    /// reason unrelated to its live set.
+    /// workload (the installed compiler is the load-bearing one) must not stop for a reason
+    /// unrelated to its live set, so an exhausted region is retired here instead of ending the
+    /// run.
     ///
     /// # Retirement, never relocation
     ///
@@ -359,9 +373,10 @@ impl<'a> RuntimeContext<'a> {
         // `beam_bifs`) rather than blanket-enabling every reentrant call, which would break
         // `lists:map(fun(X) -> ets:lookup(T, X) end, L)` by blocking that nested call.
         let install_tables = !reentrant || Self::tables_capable(module, function, arity);
-        // Whether the BIF's result may be **moved out of the pooled BIF heap onto the running
-        // process's own young heap** and the pooled heap then **rewound** — the tail of this
-        // method (see [`Self::move_result_into_process_heap`]).
+        // Whether the BIF's result may be **moved out of the pooled BIF heap onto a region that
+        // outlives the call** (the running process's young heap, or the runtime's `-eval` store on
+        // the table-less route) and the pooled heap then **rewound** — the tail of this method
+        // (see [`Self::rehome_container_result`]).
         //
         // Six of the `DispatchHooks` arms ([`super::dispatch`]) each let a term the BIF built on
         // `ctx.heap()` **escape** into state that outlives the call, which is exactly what a
@@ -730,9 +745,11 @@ impl<'a> RuntimeContext<'a> {
         // the running process's copying collector does **not** scan, so the unscanned-root valve
         // ([`super::gc::root_is_unscanned`]) declines every collection while it is live in an x
         // register — and a churn loop that keeps such a result alive then grows peak memory with
-        // its iteration count. Move it onto the running process's own young heap (a scanned
-        // region) and rewind the pool **to this call's `mark`**, so the result is collectable and
-        // the words this call handed out are given back.
+        // its iteration count. Move it onto a region that outlives the call — the running
+        // process's own young heap (a scanned region) when there is one, the runtime's `-eval`
+        // store on the table-less route ([`Self::rehome_container_result`]) — and rewind the pool
+        // **to this call's `mark`**, so the result is collectable and the words this call handed
+        // out are given back.
         //
         // The rewind happens only when the move is both **safe** and **complete**:
         //
@@ -744,8 +761,8 @@ impl<'a> RuntimeContext<'a> {
         //   in the frozen literal area, so neither can reach a word on this heap; skipping the
         //   copy keeps the arithmetic/immediate hot path free (dispatch cost is measured —
         //   see `TRACE_AND_PERF.md`);
-        // * a move that **succeeded** — no scheduled process, a nursery that cannot be grown, or
-        //   a graph the copier refuses all leave the result where it is.
+        // * a move that **succeeded** — a graph the copier refuses, a destination that cannot be
+        //   grown, and a nursery that cannot be grown all leave the result where it is.
         //
         // A **partially used** pool is no obstacle: `mark` was taken before the call, so
         // `reset_to(mark)` frees exactly this call's words `[mark..used)` and leaves the ones a
@@ -790,10 +807,11 @@ impl<'a> RuntimeContext<'a> {
         }
         // Rewind to this call's mark and give the heap back to the pool. Every word this call
         // handed out of the pooled heap is now either unreachable (the BIF's intermediate terms)
-        // or has a scanned copy in the process's young heap, so the bump pointer can safely
-        // return to `mark` — the words below it belong to another caller and stay owned. The
-        // pooled heap then serves the next call from `mark` instead of marching toward the pool's
-        // capacity.
+        // or has a copy on a region that outlives the call — the process's scanned young heap, or
+        // the runtime's `-eval` store ([`Self::rehome_container_result`]) — so the bump pointer
+        // can safely return to `mark`: the words below it belong to another caller and stay owned.
+        // The pooled heap then serves the next call from `mark` instead of marching toward the
+        // pool's capacity.
         //
         // `reset_to` is fallible, but the error arm is unreachable: `mark` was read from **this**
         // heap at the top of this call, the heap is a local held for the call's whole body, and
