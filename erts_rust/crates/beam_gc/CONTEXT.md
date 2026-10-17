@@ -306,17 +306,26 @@ constructors only (no new error enum).
   `mature_after_fullsweep` sizes the fresh mature space from `need` = the **exact reachable live word count**
   and re-uses `should_grow` (`3*cap < 4*need`) / `should_shrink` (`cap > 4*need && cap > min`), floored by
   `min_heap_words` and clamped by `max_heap_words`.
-  - **The nursery re-size (`young_after_collection`) is a BOUNDED rule, not a growth rule.** `live` is the
-    words the round **left in the nursery** (a minor passes what it promoted, a fullsweep `0`). With
-    `request = live.max(need_reserve_words)`, the *only* grow branch is `request > capacity_words` (a
+  - **The nursery re-size (`young_after_collection`) is a BOUNDED rule, not a growth rule.** `demand` is a
+    **minor**'s surviving words (what it promoted) and, for a **fullsweep**, the occupancy the round
+    **observed** before the copy (`collect_major`/`run_major`/`relocate_major` sample `nursery.used_words()`
+    up front and pass it to `Nursery::collapse` as `demand_words`) — the C `erl_gc.c::adjust_after_fullsweep`
+    `need_after = HEAP_TOP(p) - HEAP_START(p)` rule, and the same `need` input
+    `mature_after_fullsweep(capacity, live, young_occupancy)` already takes. Passing `0` there collapsed a
+    settled nursery to the 64-word reserve floor on every fullsweep, so the next allocation re-grew through
+    `Nursery::grow` (1.00 space installs/op on the `gc_bound/churn` shape — `MEASURED.md`). With
+    `request = demand.max(need_reserve_words)`, the *only* grow branch is `request > capacity_words` (a
     surviving set larger than the nursery), which steps up to offset-0 `next_words(request, 0)`; otherwise
     `should_shrink(capacity, request)` falls it back to `next_words(request, 0)`, and otherwise the capacity
-    is kept. A nursery the round left mostly empty therefore **shrinks** and one that turned out about right
-    **keeps** its size — the rule the pressure tests depend on (a test that must keep a large nursery alive
-    raises `min_heap_words`). Sizing instead from the pre-`reset()` fill (≈ capacity) or stepping offset-1
-    `next_words(capacity.max(request), 1)` would fire on *every* collection, growing the nursery ~20 % per
-    round with no bound. The capacity is therefore **bounded**: a fixed live set converges to a constant, and
-    the nursery never grows merely because a collection ran (`tests/nursery_bounded.rs`; `MEASURED.md`).
+    is kept. **`collapse` therefore can never grow the nursery**: `demand_words` is a space's own occupancy,
+    so it is `≤` the chain's `capacity_words`, and the enlarge branch needs `request > capacity_words`; the
+    sole exception is the `need_reserve_words` policy constant flooring a nursery smaller than itself. Only
+    `Nursery::grow`/`ensure_capacity` enlarge, and only on an explicit request. A nursery the round left
+    mostly empty therefore **shrinks** and one that turned out about right **keeps** its size — the rule the
+    pressure tests depend on (a test that must keep a large nursery alive raises `min_heap_words`). The
+    capacity is therefore **bounded**: a fixed live set (or a fixed demand) converges to a constant, and the
+    nursery never grows merely because a collection ran (`tests/nursery_bounded.rs`,
+    `tests/post_fullsweep_nursery.rs`; `MEASURED.md`).
 - **The young nursery is a CHAIN of spaces (`src/nursery.rs`), and `grow_nursery` is a NO-RELOCATION seam.**
   `Collector`/`GenImmixCollector` own a `Nursery` — a **current** space plus the spaces a growth **retired**
   — rather than a single `HeapSpace`. `HeapSpace` never reallocates, so growing by *replacement* would strand
