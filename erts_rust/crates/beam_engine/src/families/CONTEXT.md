@@ -25,7 +25,7 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 - `exceptions/` (`mod.rs`, `raise.rs`, `stacktrace.rs`, `tests/`) — `Try`/`Catch`/`Badmatch`/`CaseEnd`/`TryCaseEnd`/`Badrecord`/`IfEnd`/`Raise`/`TryCase`/`TryEnd`/`CatchEnd`/`BuildStacktrace`/`RawRaise`.
 - `floats/` (`mod.rs`, `arith.rs`, `convert.rs`) — `Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`.
 - `maps/` (`mod.rs`, `read.rs`, `write.rs`) — `GetMapElements`/`HasMapFields`/`PutMapAssoc`/`PutMapExact`.
-- `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is the node's **only** `#[allow(unsafe_code)]` module; `create/` = `bs_create_bin`, `matching/` = the match commands. Endianness: `matching/reads.rs::field_is_little` is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit` normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand carries it).
+- `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is this sub-node's `#[allow(unsafe_code)]` module (`records/raw.rs` is the other one in the node); `create/` = `bs_create_bin`, `matching/` = the match commands. Endianness: `matching/reads.rs::field_is_little` is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit` normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand carries it).
 - `receive.rs` — `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`/`RecvMarkerReserve`/`RecvMarkerBind`/`RecvMarkerUse`/`RecvMarkerClear`.
 
 ## The router sentinel + the honest-error convention
