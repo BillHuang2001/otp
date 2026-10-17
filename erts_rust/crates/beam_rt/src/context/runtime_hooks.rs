@@ -413,6 +413,110 @@ impl<'a> RuntimeHooksBridge<'a> {
         }
     }
 
+    /// `erlang:port_set_data/2` — store `Data` as the port's opaque data term and answer the
+    /// atom `true`.
+    ///
+    /// The body is [`PortRegistry::set_port_data`](crate::port::PortRegistry) — the *one*
+    /// implementation, shared with nothing else because the `PortHook` seam has no data-term
+    /// member. What this arm adds is the two things a BIF has and a table does not:
+    ///
+    /// * the port argument is resolved the C's way (`lookup_port`): an internal port term, or
+    ///   an **atom** naming a registered port. Anything else — a pid, an integer, a name
+    ///   naming no port — is the oracle's `badarg`;
+    /// * `Data` is **stabilised** before it is stored. The runtime-level data table outlives
+    ///   the call (and the heap the term was built on), so the word is copied onto the
+    ///   pointer-stable escape store exactly as every other runtime-level store does
+    ///   ([`Runtime::try_stabilize_escaped`]) — afterwards it may be read back by a later
+    ///   `port_get_data/1`, or by the driver itself.
+    ///
+    /// A **poll/interrupt-disabled** port refuses (`ERTS_PORT_OP_BUSY`) and a dead one is
+    /// `badarg`; the latter is [`PortRegistry::set_port_data`]'s own check.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-port/non-name argument, a name naming no port, or a port the runtime
+    /// does not hold; the typed capability gap when the port table is already borrowed (never a
+    /// panic); whatever [`Runtime::try_stabilize_escaped`] reports for a term it cannot copy.
+    fn port_set_data(&mut self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let port = *args.first().ok_or(BeamError::BadArg)?;
+        let data = *args.get(1).ok_or(BeamError::BadArg)?;
+        let data = self.runtime.try_stabilize_escaped(data)?;
+        let ports = Rc::clone(&self.runtime.ports);
+        let id = match ports.try_borrow() {
+            Ok(registry) => registry.resolve_port(port).ok_or(BeamError::BadArg)?,
+            Err(_) => return Err(error::unsupported("the port table is already in use")),
+        };
+        match ports.try_borrow_mut() {
+            Ok(mut registry) => registry.set_port_data(id, data)?,
+            Err(_) => return Err(error::unsupported("the port table is already in use")),
+        }
+        atom_term(atoms, "true")
+    }
+
+    /// `erlang:port_get_data/1` — the port's opaque data term, or the atom `undefined` when
+    /// `port_set_data/2` was never called for it.
+    ///
+    /// The stored word is already on the pointer-stable escape store (see
+    /// [`Self::port_set_data`]), so it is handed back as-is: a data term set by one call and
+    /// read by a much later one is the same immutable term, exactly as the C's `prt->data` is.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-port/non-name argument, a name naming no port, or a port the runtime
+    /// does not hold (the oracle's own answer for a dead port); the typed capability gap when
+    /// the port table is already borrowed.
+    fn port_get_data(&mut self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let port = *args.first().ok_or(BeamError::BadArg)?;
+        let ports = Rc::clone(&self.runtime.ports);
+        let data = {
+            let registry = match ports.try_borrow() {
+                Ok(registry) => registry,
+                Err(_) => return Err(error::unsupported("the port table is already in use")),
+            };
+            let id = registry.resolve_port(port).ok_or(BeamError::BadArg)?;
+            registry.port_data(id)?
+        };
+        match data {
+            Some(term) => Ok(term),
+            // The C initialises the field to `am_undefined` (`erts_init_port_data`).
+            None => atom_term(atoms, "undefined"),
+        }
+    }
+
+    /// `erts_internal:port_connect/2` — hand the port to `Target`, moving its **owner** (so
+    /// every future `{Port, {data, …}}` / `{Port, {exit_status, …}}` message is addressed to
+    /// `Target`) while **adding** a link rather than replacing the old owner's.
+    ///
+    /// The body is [`crate::port::ops::connect`], shared with the `erlang:port_connect/2`
+    /// spelling the runtime-native floor serves (`erlang.erl`'s wrapper
+    /// `port_connect(Port, Pid) -> erts_internal:port_connect(Port, Pid)` cannot be entered
+    /// here because `erlang` is a floor namespace), so the transfer logic exists once.
+    ///
+    /// The exit **signal** a connected port sends its links when it dies is a separate
+    /// mechanism (the `'EXIT'` delivery path), not part of this transfer.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-port/non-name port argument, a name naming no port, a port the
+    /// runtime does not hold, a non-pid `Target`, or a `Target` with no live process (the
+    /// oracle's own answer: `port_connect(Port, DeadPid)` ⇒ `error:badarg`); the typed
+    /// capability gap when the port table is already borrowed.
+    fn port_connect_2(&mut self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let port = *args.first().ok_or(BeamError::BadArg)?;
+        let target = *args.get(1).ok_or(BeamError::BadArg)?;
+        let answer = atom_term(atoms, "true")?;
+        let ports = Rc::clone(&self.runtime.ports);
+        // The target must be a live **local** process; the table this call runs against is the
+        // caller-supplied one on a scheduler pass and the runtime's own otherwise (the same
+        // resolution [`Self::link`] uses).
+        let table: &ProcessTable = match self.table.as_deref() {
+            Some(table) => table,
+            None => &self.runtime.processes,
+        };
+        crate::port::ops::connect(&ports, table, port, target)?;
+        Ok(answer)
+    }
+
     /// `erlang:dt_spread_tag/1` — the dynamic-tracing tag spreader, a **boolean check**.
     ///
     /// Oracle-verified (OTP 29/`erts-17.1`): the argument must be the atom `true` **or** the

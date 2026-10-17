@@ -66,10 +66,9 @@
 //!
 //! ⚠️ `PortHook` is only *named* in this module's docs; nothing here calls it.
 
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_process::{PortId, ProcessId, ProcessTable};
@@ -118,6 +117,19 @@ pub(crate) struct PortExtras {
     links: HashMap<u64, Vec<ProcessId>>,
 }
 
+impl PortExtras {
+    /// Drops the state `port_set_data/2`, `register/2` and `port_connect/2` established for
+    /// port `number`.
+    ///
+    /// Called from [`PortRegistry::close`](super::PortRegistry) — the single place a port
+    /// leaves the runtime — so a closed port's name disappears from `whereis/1` (the oracle's
+    /// own answer: `undefined` after `port_close/1`) and a recycled port number starts clean.
+    pub(crate) fn forget_port(&mut self, number: u64) {
+        self.data.remove(&number);
+        self.names.remove(&number);
+        self.links.remove(&number);
+    }
+}
 impl PortRegistry {
     // -- erlang:port_set_data/2 · erlang:port_get_data/1 -----------------------
 
@@ -294,17 +306,15 @@ impl PortRegistry {
     /// Drops the state `port_set_data/2`, `register/2` and `port_connect/2` established for
     /// port `number`.
     ///
-    /// Called from [`PortRegistry::close`](super::PortRegistry) — the single place a port
-    /// leaves the runtime — so a closed port's name disappears from `whereis/1` (the oracle's
-    /// own answer: `undefined` after `port_close/1`) and a recycled port number starts clean.
+    /// Forwards to [`PortExtras::forget_port`] — the state lives in [`PortExtras`], so the
+    /// drain is defined where the fields are. [`PortRegistry::close`](super::PortRegistry)
+    /// calls the `PortExtras` form directly; this registry-level form exists for a caller that
+    /// holds the registry rather than its `extras` (the unit suite's own teardown checks).
+    #[cfg(test)]
     pub(crate) fn forget_port(&mut self, number: u64) {
-        self.extras.data.remove(&number);
-        self.extras.names.remove(&number);
-        self.extras.links.remove(&number);
+        self.extras.forget_port(number);
     }
-}
-
-/// `erlang:port_connect/2`'s whole body, shared by its two entry points.
+}/// `erlang:port_connect/2`'s whole body, shared by its two entry points.
 ///
 /// The `erlang:` spelling is the `erlang.erl` wrapper `port_connect(Port, Pid) ->
 /// erts_internal:port_connect(Port, Pid)` (`erts/preloaded/src/erlang.erl:12126-12133`), and

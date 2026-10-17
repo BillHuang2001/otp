@@ -1826,8 +1826,11 @@ impl PortRegistry {
         // without removing the old one, so the oracle's `links` grows — see
         // [`ops::PortExtras::links`]).
         let owner = meta.owner.to_eterm();
-        let links = match self.extra_links(port.number()) {
-            Some(linked) => pid_list(&mut self.heap, linked)?,
+        // The link set is copied out first: `extra_links` borrows the whole registry, and the
+        // arena below is a second (disjoint) field.
+        let linked = self.extra_links(port.number()).map(<[_]>::to_vec);
+        let links = match linked {
+            Some(linked) => pid_list(&mut self.heap, &linked)?,
             None => pid_list(&mut self.heap, &[meta.owner])?,
         };
         // A registered port reports `{registered_name, Name}` **first** (the oracle's own
