@@ -802,4 +802,67 @@ mod tests {
         assert_eq!(capped.young_after_collection(233, 1_000), 300);
         assert_eq!(capped.young_after_collection(233, 233), 233);
     }
+
+    /// Step 1 (`major_collection`, `erl_gc.c:1866`) and step 2 (`adjust_after_fullsweep`,
+    /// `erl_gc.c:2062-2098`) in sequence, and the clamp/floor interaction of the pair.
+    #[test]
+    fn young_after_fullsweep_applies_both_steps_in_order() {
+        let policy = HeapPolicy::default();
+
+        // (1) Step 1 keeps a nursery the round observed full (233 is not > 4 * 233): the
+        // pre-copy-occupancy rule — the churn win `8f74faff19` removed the per-op install with.
+        assert_eq!(policy.young_after_collection(2_819, 2_586), 2_819);
+        // (2) Step 2 then shrinks that same nursery when almost nothing survived:
+        // need_after = 60 + 64 = 124, 4 * 124 = 496 < 2 819 ⇒ target next_words(248, 0) = 376.
+        assert_eq!(policy.young_after_fullsweep(2_819, 2_586, 60), 376);
+        assert_eq!(policy.next_words(2 * (60 + policy.need_reserve_words), 0), 376);
+
+        // Step 1 alone would have kept 2 819 — the shrink is step 2's, never step 1's.
+        assert_ne!(policy.young_after_collection(2_819, 2_586), 376);
+
+        // A live set that is *not* far below the capacity protects it: 4 * (400 + 64) = 1 856 >
+        // 1 220 ⇒ no shrink (the `gc_bound/churn` geometry, `MEASURED.md`).
+        assert_eq!(policy.young_after_fullsweep(1_220, 987, 400), 1_220);
+        assert_eq!(policy.young_after_fullsweep(609, 609, 464), 609);
+
+        // Step 2 never exceeds step 1's size, whatever the inputs (a fullsweep cannot enlarge).
+        for &capacity in &[12usize, 38, 90, 233, 376, 987, 1_598, 2_586] {
+            for observed in [0, 1, capacity / 2, capacity] {
+                let kept = policy.young_after_collection(capacity, observed);
+                for live in [0, 1, 60, 233, 1_000, 10_000] {
+                    let target = policy.young_after_fullsweep(capacity, observed, live);
+                    assert!(target <= kept, "{capacity}/{observed}/{live}: {target} > {kept}");
+                }
+                // ... and it is a fixed point of itself once shrunk: the gate it just passed
+                // cannot fire again, because every curated step is under 4x its request.
+                for live in [0usize, 60, 200, 2_000] {
+                    let shrunk = policy.young_after_fullsweep(capacity, observed, live);
+                    assert_eq!(policy.young_after_fullsweep(shrunk, shrunk, live), shrunk);
+                }
+            }
+        }
+
+        // The reserve is part of `need_after`, so even an empty live set never collapses the
+        // nursery below `next_words(2 * need_reserve_words, 0)`.
+        assert_eq!(
+            policy.young_after_fullsweep(1_000, 1_000, 0),
+            policy.next_words(2 * policy.need_reserve_words, 0)
+        );
+
+        // `+hms` (`min_heap_words`) floors the shrunk target ...
+        let floored = HeapPolicy {
+            min_heap_words: 500,
+            ..HeapPolicy::default()
+        };
+        assert_eq!(floored.young_after_fullsweep(100_000, 100_000, 10), 500);
+        // ... and `+hmax` (`max_heap_words`) clamps it, still strictly shrinking.
+        let capped = HeapPolicy {
+            max_heap_words: 300,
+            ..HeapPolicy::default()
+        };
+        assert_eq!(capped.young_after_fullsweep(100_000, 100_000, 10), 233);
+        assert!(capped.young_after_fullsweep(100_000, 100_000, 10) < 100_000);
+        // A live set above the cap leaves the clamp — not a fabricated larger target.
+        assert_eq!(capped.young_after_fullsweep(233, 233, 5_000), 233);
+    }
 }
