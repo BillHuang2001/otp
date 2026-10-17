@@ -158,8 +158,7 @@ Verified against the system `erlc` (OTP 29) disassembly:
   engine-defined sentinel errors, which the read path no longer raises — it now raises the bare atom
   `function_clause` (class `error`). The unseeded fixture therefore surfaces the missing-atom gap, so
   the two expected strings must become `maps: no 'function_clause' atom in the module` (the module in
-  that fixture names neither tag). This file is outside this node's scope.
-
+  <!-- -->
 ## Notes for Agents
 - To make the tags nameable for **any** host (not just a seeding one), the engine would need
   a new **defaulted** `ExecutionContext` method (e.g. `resolve_atom(&mut self, name: &str) ->
