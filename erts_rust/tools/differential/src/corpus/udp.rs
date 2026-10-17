@@ -503,7 +503,8 @@ mod tests {
     /// The shapes that are **measured** to diverge stay out of the group: the datagram *data*
     /// path (a `gen_udp` send and `inet:getstat` hit the driver's untracked statistics counters,
     /// an incoming datagram is never delivered, and `gen_tcp:connect/3` refuses), the
-    /// `prim_inet` module whose calls would drive them.
+    /// `prim_inet` module whose calls would drive them, and the port-monitor term (see the
+    /// per-item comments below).
     ///
     /// `port_command/2` is pinnable **only on a closed port** (both runtimes answer `badarg`):
     /// on the socket-less port the two runtimes share no observable at all (the oracle answers
@@ -525,6 +526,10 @@ mod tests {
                 // A stream connect against a live listener is `{ok, Socket}` on the oracle and a
                 // `badarg` raise here.
                 "gen_tcp:",
+                // A port monitor still disagrees on the delivered term: the oracle hands the
+                // trapping evaluator `{'EXIT', P, normal}` while `beam_rt` hands it
+                // `{'DOWN', Ref, port, P, normal}`.
+                "monitor(port",
             ] {
                 assert!(
                     !expr.contains(forbidden),
