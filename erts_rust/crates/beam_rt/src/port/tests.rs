@@ -232,14 +232,7 @@ fn pump_events_until_exit(
             // A signal and a tty-select report carry no port (both are node-global / owner-keyed
             // rather than port-derived), so they are the events that say nothing about which port
             // a round drained.
-            let source = match &event {
-                PortEvent::Data { port, .. }
-                | PortEvent::Line { port, .. }
-                | PortEvent::Exited { port, .. }
-                | PortEvent::Term { port, .. } => Some(*port),
-                PortEvent::Signal { .. } | PortEvent::Select { .. } => None,
-            };
-            if let Some(source) = source {
+            if let Some(source) = event.port() {
                 assert_eq!(
                     source, port,
                     "another live port produced an event in the round for {port:?}; \
@@ -616,6 +609,260 @@ fn a_builtin_driver_name_opens_a_live_driver_port() {
     }
 }
 
+// The **descriptor-less built-in** driver's reply path — the `ram_file_drv` regression.
+//
+// A `{spawn_driver, "ram_file_drv"}` port is a [`PortName::SpawnDriverBuiltin`]: it has no C
+// driver host and no `dlopen`ed `output` callback, so its bytes come from the driver writing
+// into `beam_io`'s `DriverContext::input` **during the port-task round the write itself runs**
+// ([`PortRegistry::write_command`]) and the round harvesting them as a
+// [`beam_io::PortNotification::Data`]. That harvest is destructive, so the outcome has to be
+// retained ([`PortRegistry::pending_events`]) for the next pump: dropping it was the defect —
+// the owner's `receive` timed out and `port_info(Port, input)` stayed `0` where the oracle
+// answers the reply and `5`.
+
+/// The `ram_file_drv` `RAM_FILE_OPEN` command for the 3-byte name `"abc"` — an 8-byte payload
+/// whose first four bytes are the opcode and whose last four are the name length.
+const RAM_FILE_OPEN_ABC: [u8; 8] = [1, 0, 0, 0, 3, b'a', b'b', b'c'];
+
+/// `ram_file_drv`'s reply to [`RAM_FILE_OPEN_ABC`]: the `OK` code `3` followed by the handle the
+/// driver minted (`0`). The oracle delivers exactly these five bytes (`{data,[3,0,0,0,0]}`).
+const RAM_FILE_OPEN_REPLY: [u8; 5] = [3, 0, 0, 0, 0];
+
+/// The oracle expression of the whole probe: open `ram_file_drv`, send [`RAM_FILE_OPEN_ABC`],
+/// receive the reply, and report `Reply|Input|Output` — the payload and both `port_info`
+/// counters, as `~w` renders them (`[3,0,0,0,0]|5|8`).
+const RAM_FILE_PROBE_EXPR: &str = "begin \
+     P = open_port({spawn_driver,\"ram_file_drv\"},[]), \
+     port_command(P, <<1,0,0,0,3,97,98,99>>), \
+     D = receive {P,{data,Data}} -> Data after 2000 -> timeout end, \
+     {input,I} = erlang:port_info(P,input), \
+     {output,O} = erlang:port_info(P,output), \
+     io:format(\"~w|~w|~w\",[D,I,O]) end";
+
+impl Fixture {
+    /// A second hook over `registry` — the **runtime's own** port table — so a port opened
+    /// through it is the one `Runtime::deliver_port_messages` (the scheduler route) and
+    /// `RuntimeContext::poll_port_messages` (the `-eval` route) poll, while the term vocabulary
+    /// still comes from this fixture.
+    fn hook_over(&self, registry: Rc<RefCell<PortRegistry>>, owner: ProcessId) -> RuntimePorts {
+        RuntimePorts::new(registry, Rc::clone(&self.atoms), owner)
+    }
+
+    /// Opens `{spawn_driver, "ram_file_drv"}` with the default (`list`) stream through `hook`.
+    fn open_ram_file(&mut self, hook: &mut RuntimePorts) -> PortId {
+        let name = self.string("ram_file_drv");
+        let name = self.name("spawn_driver", name);
+        hook.open_port(name, NIL)
+            .expect("open_port({spawn_driver, \"ram_file_drv\"}, [])")
+    }
+}
+
+/// The payload of a `{Port, {data, Data}}` message as raw byte values.
+///
+/// The default (`list`) stream shapes `Data` as a char list — the oracle's own
+/// `{data,[3,0,0,0,0]}` — so this reads the integers back rather than text.
+fn data_payload_bytes(message: Eterm) -> Vec<i64> {
+    let inner = terms::tuple_element(message, 1).expect("the {data, Data} pair");
+    let payload = terms::tuple_element(inner, 1).expect("the payload");
+    assert!(
+        terms::binary_bytes(payload).is_err(),
+        "the default stream is a char list, not a binary"
+    );
+    terms::list_elements(payload)
+        .expect("a char list")
+        .into_iter()
+        .map(signed_value)
+        .collect()
+}
+
+/// `bytes` as `~w`-rendered Erlang: `[3,0,0,0,0]`. Used to compare a payload against the
+/// oracle's printed one without depending on Rust's `Debug` spacing.
+fn erl_bytes(bytes: &[i64]) -> String {
+    let rendered: Vec<String> = bytes.iter().map(i64::to_string).collect();
+    format!("[{}]", rendered.join(","))
+}
+
+/// The `port_info(Port, Item)` counter `fx`'s hook answers, as a plain integer.
+fn counter(fx: &mut Fixture, hook: &mut RuntimePorts, port: PortId, item: &str) -> i64 {
+    let wanted = fx.atom(item);
+    let pairs = hook
+        .port_info(port)
+        .unwrap_or_else(|error| panic!("port_info({port:?}) failed: {error}"));
+    let value = pairs
+        .iter()
+        .find(|(key, _)| *key == wanted)
+        .map(|(_, value)| *value)
+        .unwrap_or_else(|| panic!("no {item:?} item in {pairs:?}"));
+    signed_value(value)
+}
+
+/// A **built-in** driver's reply reaches its owner on the `-eval` route — exactly once — and is
+/// counted as input where it is harvested.
+///
+/// `runtime.eval("P = open_port(...), port_command(...), receive …")` is the shape the earlier
+/// defect made time out: the write's own task round harvested the driver's reply, the outcome was
+/// discarded, and the `receive` saw nothing (`port_info(P, input)` answered `0`). Every assertion
+/// here is oracle-anchored (`RAM_FILE_PROBE_EXPR`).
+#[test]
+fn a_builtin_drivers_reply_reaches_the_owner_exactly_once_on_the_eval_route() {
+    let mut fx = fixture();
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let mut hook = fx.hook_over(Rc::clone(&rt.ports), OWNER);
+    let port = fx.open_ram_file(&mut hook);
+
+    rt.ports
+        .borrow_mut()
+        .write_command(port, &RAM_FILE_OPEN_ABC)
+        .expect("the RAM_FILE_OPEN command is written");
+
+    // The reply is already harvested (the write's task round drained the port's input queue), so
+    // this quiet round is the one that has to report it — from the retained buffer.
+    let messages = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.poll_port_messages(Duration::from_millis(50))
+            .expect("the port poll must not fail")
+    };
+    assert_eq!(
+        messages.len(),
+        1,
+        "one command yields exactly one message: {messages:?}"
+    );
+    let data_atom = make_atom(rt.code_server_atoms_mut().intern("data"));
+    let inner = terms::tuple_element(messages[0], 1).expect("the {data, Data} pair");
+    assert_eq!(
+        terms::tuple_element(inner, 0).expect("the tag"),
+        data_atom,
+        "the message is `{{data, …}}`"
+    );
+    let payload = data_payload_bytes(messages[0]);
+    assert_eq!(
+        payload,
+        RAM_FILE_OPEN_REPLY.iter().map(|byte| i64::from(*byte)).collect::<Vec<i64>>(),
+        "ram_file_drv's RAM_FILE_OPEN reply, byte for byte"
+    );
+
+    // ...and a further quiet round reports nothing: the bytes left `beam_io`'s queue when they
+    // were harvested, so they can be reported exactly once and never re-delivered.
+    let quiet = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.poll_port_messages(Duration::from_millis(50))
+            .expect("the port poll must not fail")
+    };
+    assert!(
+        quiet.is_empty(),
+        "the reply must not be delivered twice: {quiet:?}"
+    );
+
+    // Both counters are bumped where the bytes were harvested: the port's own `input` (the
+    // reply's five bytes) and its `output` (the eight command bytes).
+    assert_eq!(counter(&mut fx, &mut hook, port, "input"), 5);
+    assert_eq!(
+        counter(&mut fx, &mut hook, port, "output"),
+        i64::try_from(RAM_FILE_OPEN_ABC.len()).expect("the command length")
+    );
+
+    // Oracle cross-check: the very driver this port runs is a built-in of the host OTP, so the
+    // whole probe — payload and both counters — is comparable with no fixture.
+    let observed = format!(
+        "{}|{}|{}",
+        erl_bytes(&payload),
+        counter(&mut fx, &mut hook, port, "input"),
+        counter(&mut fx, &mut hook, port, "output")
+    );
+    match erl_eval(RAM_FILE_PROBE_EXPR) {
+        Some(oracle) => assert_eq!(
+            observed, oracle,
+            "the reply and both `port_info` counters must match the oracle"
+        ),
+        None => skip_oracle_check("a built-in driver's reply and its `port_info` counters"),
+    }
+}
+
+/// The same reply reaches the owner on the **scheduler** route:
+/// `Runtime::deliver_port_messages` puts `{Port, {data, Data}}` in the owning process's mailbox,
+/// once, even though the write's own round already harvested the bytes.
+#[test]
+fn the_scheduler_round_delivers_a_builtin_drivers_reply_into_the_owners_mailbox() {
+    let mut fx = fixture();
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+    let owner = table.spawn_default().expect("the port's owner");
+    let mut hook = fx.hook_over(Rc::clone(&rt.ports), owner);
+    let port = fx.open_ram_file(&mut hook);
+
+    rt.ports
+        .borrow_mut()
+        .write_command(port, &RAM_FILE_OPEN_ABC)
+        .expect("the RAM_FILE_OPEN command is written");
+
+    // A registered port keeps `has_nothing_to_poll` false, so the round cannot take its
+    // "nothing to poll" early return — and the reply is in the retained buffer, so it is
+    // delivered without waiting out the timeout.
+    assert!(!rt.ports.borrow().has_nothing_to_poll());
+    let delivered = rt
+        .deliver_port_messages(&mut table, PORT_POLL_SLICE)
+        .expect("the port round runs");
+    assert_eq!(delivered, 1, "one command delivers exactly one message");
+
+    let message = table
+        .get(owner)
+        .expect("the owner")
+        .mailbox()
+        .peek()
+        .expect("the reply is in the owner's mailbox")
+        .payload();
+    assert_eq!(
+        data_payload_bytes(message),
+        RAM_FILE_OPEN_REPLY.iter().map(|byte| i64::from(*byte)).collect::<Vec<i64>>(),
+        "the delivered payload is ram_file_drv's reply, byte for byte"
+    );
+    assert_eq!(
+        table.get(owner).unwrap().mailbox().peek().unwrap().from(),
+        port.to_eterm(),
+        "the message's sender is the port itself"
+    );
+
+    // A further round delivers nothing: the retained event was taken, never copied.
+    let again = rt
+        .deliver_port_messages(&mut table, PORT_POLL_SLICE)
+        .expect("the port round runs");
+    assert_eq!(again, 0, "the reply must not be delivered twice");
+}
+
+/// Closing a port drops a reply no pump has reported yet, rather than leaking it to a later round.
+///
+/// `beam_io` retires a port number only once its close has been reported, so a number can be
+/// **reused**; a retained event for the dead port must therefore not survive to be attributed to
+/// the next port that lands on the same number.
+#[test]
+fn closing_a_port_drops_its_unreported_reply() {
+    let mut fx = fixture();
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let mut hook = fx.hook_over(Rc::clone(&rt.ports), OWNER);
+    let port = fx.open_ram_file(&mut hook);
+    rt.ports
+        .borrow_mut()
+        .write_command(port, &RAM_FILE_OPEN_ABC)
+        .expect("the RAM_FILE_OPEN command is written");
+
+    rt.ports
+        .borrow_mut()
+        .close(port)
+        .expect("the built-in driver port closes");
+    let messages = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.poll_port_messages(Duration::from_millis(50))
+            .expect("the port poll must not fail")
+    };
+    assert!(
+        messages.is_empty(),
+        "a closed port has no recipient for its unreported reply: {messages:?}"
+    );
+    assert!(
+        rt.ports.borrow().has_nothing_to_poll(),
+        "the dropped reply is not pending work"
+    );
+}
 /// An unknown `{spawn_driver, Name}` still fails as before: the built-in fallback only catches a
 /// name this runtime links in, so a name no built-in and no `.so` answers stays the oracle's own
 /// `error:badarg` (`io.c`'s `ERTS_OPEN_DRIVER_RET(NULL, -3, BADARG)`).

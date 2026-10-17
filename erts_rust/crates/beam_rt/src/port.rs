@@ -579,6 +579,25 @@ enum PortEvent {
     },
 }
 
+impl PortEvent {
+    /// The port this event is **about**, or `None` for the two node-global / owner-keyed kinds
+    /// that no port carries (a handled signal and a `tty_select/2` report).
+    ///
+    /// Used where an event has to be checked against the registry's live ports before it is
+    /// reported — [`PortRegistry::drain_pending_events`], which drops a retained event whose port
+    /// has since been closed — and by the test suites' drain helpers, so the roster of port-bearing
+    /// variants lives in exactly one place.
+    fn port(&self) -> Option<PortId> {
+        match self {
+            PortEvent::Data { port, .. }
+            | PortEvent::Line { port, .. }
+            | PortEvent::Exited { port, .. }
+            | PortEvent::Term { port, .. } => Some(*port),
+            PortEvent::Signal { .. } | PortEvent::Select { .. } => None,
+        }
+    }
+}
+
 /// The node-global **I/O byte counters** behind `erlang:statistics(io)`.
 ///
 /// Shared as an [`Rc`] between the [`Runtime`](crate::Runtime) (which answers
@@ -737,6 +756,22 @@ pub struct PortRegistry {
     /// `driver_monitor_process`'s positive `ERL_DRV_MONITOR_NOT_ALIVE` (see
     /// [`ProcessLiveness`]).
     liveness: Rc<ProcessLiveness>,
+    /// Events a port-task round has already **harvested** but no [`PortRegistry::pump`] has
+    /// reported yet.
+    ///
+    /// A round is destructive: [`beam_io::PortRegistry::execute_port_tasks`] drains every live
+    /// port's buffered input into [`beam_io::PortNotification::Data`]
+    /// ([`beam_io::Port::take_input_notifications`]), so a round run *outside* a pump would
+    /// otherwise throw its bytes away. The one such round is
+    /// [`PortRegistry::write_command`]'s — it runs the `OUTPUT` task that carried the command,
+    /// and a **built-in** driver (`ram_file_drv`, `efile`) writes its reply from that very
+    /// `output` call, so the reply is in that round's outcome. Folding it here retains it until
+    /// the next pump reports it.
+    ///
+    /// This is still **exactly once**: the bytes left `beam_io`'s input queue when they were
+    /// harvested, so no later round can produce them again, and
+    /// [`PortRegistry::drain_pending_events`] takes the buffer as it reports it.
+    pending_events: Vec<PortEvent>,
 }
 
 impl PortRegistry {
@@ -763,6 +798,7 @@ impl PortRegistry {
             watch: watch::SignalWatch::new(),
             tty: tty::TtyWatch::new(),
             liveness: ProcessLiveness::new(),
+            pending_events: Vec::new(),
         })
     }
 
@@ -911,6 +947,17 @@ impl PortRegistry {
     /// descriptor — writing is the oracle's own behaviour for a descriptor port, so the write
     /// takes the same path rather than being a capability gap.
     ///
+    /// # The driver's reply is retained, not discarded
+    ///
+    /// That task round is the round a **built-in** driver answers from: `ram_file_drv`/`efile`
+    /// write their reply into [`beam_io::DriverContext::input`] during the `OUTPUT` task, and
+    /// the round then harvests it as a [`beam_io::PortNotification::Data`] — draining the port's
+    /// input queue, so no later round can see it. The outcome is therefore **folded into**
+    /// [`PortRegistry::pending_events`] (through the same
+    /// [`PortRegistry::fold_notifications`] the pump uses) rather than dropped, and the next
+    /// [`PortRegistry::pump`] reports it as the owner's `{Port, {data, Data}}`. Dropping it was
+    /// the defect: the reply never reached the owner and `port_info(Port, input)` stayed `0`.
+    ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never
@@ -945,9 +992,15 @@ impl PortRegistry {
             .port_command(&mut self.poller, id, bytes, PortCommandOptions::EMPTY)?;
         // `port_command` only queues the bytes and schedules the task; run it now so the
         // write really happened.
-        let _outcome = self
+        let outcome = self
             .registry
             .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
+        // The round harvested the replies the drivers just wrote (and every other live port's
+        // buffered input along with them — a round drains them all), so its notifications are
+        // **retained** here for the next pump: the queue they came from is already empty.
+        let mut events = Vec::new();
+        self.fold_notifications(outcome.notifications, &mut events);
+        self.pending_events.extend(events);
         Ok(())
     }
 
@@ -1177,8 +1230,15 @@ impl PortRegistry {
     /// it would be waiting for nothing. A signal that *has* been caught makes the pipe readable
     /// and so is pending work — and it is delivered either way, because
     /// [`PortRegistry::pump`] drains the facility unconditionally at the top of every round.
+    ///
+    /// An event a port-task round already harvested ([`PortRegistry::pending_events`]) is pending
+    /// work too — it is a message the owner is still owed — so it keeps the runtime awake until a
+    /// pump has reported it.
     pub fn has_nothing_to_poll(&self) -> bool {
-        self.meta.is_empty() && !self.tty.is_armed() && !self.watch.has_pending_signal()
+        self.meta.is_empty()
+            && self.pending_events.is_empty()
+            && !self.tty.is_armed()
+            && !self.watch.has_pending_signal()
     }
     /// The ids of the **live** ports, in port-number order.
     ///
@@ -1221,6 +1281,12 @@ impl PortRegistry {
         // The port is leaving this registry either way: a close the runtime has begun is
         // never abandoned halfway, so a failed notification cannot leave the table stale.
         self.meta.remove(&id.number());
+        // Bytes a round harvested for this port but no pump has reported yet are dropped: a closed
+        // port has no recipient. Purging them here (rather than only at the drain) is what keeps a
+        // **reused** port number — `beam_io` retires a number only once its close has been
+        // reported — from inheriting the dead port's messages.
+        self.pending_events
+            .retain(|event| event.port() != Some(id));
         let closed = self.registry.close(&mut self.poller, id);
         // `and` returns the teardown's error when it failed, and the notification's
         // otherwise — so a failure on either path reaches the caller.
@@ -1266,7 +1332,12 @@ impl PortRegistry {
         // `os:set_signal/2`, so the descriptor to register only exists after that call — the
         // watch catches up here, on the first round after the first `handle` disposition.
         self.watch.sync(&mut self.poller)?;
-        let mut events = self.take_due_exit_statuses()?;
+        // Events an earlier round harvested **outside** a pump are reported first: they are older
+        // than anything this round can produce, and the queue they were taken from is already
+        // empty, so reporting them here neither loses nor duplicates them (see
+        // [`PortRegistry::pending_events`]).
+        let mut events = self.drain_pending_events();
+        events.extend(self.take_due_exit_statuses()?);
         // The driver ports' bytes may already be queued (a `port_command` on a driver port ran
         // the driver's `output` callback inline), so they are harvested before any wait too —
         // together with the terms a driver's callback emitted (`erl_drv_output_term`).
@@ -1383,34 +1454,7 @@ impl PortRegistry {
                     });
                 }
             }
-            for notification in outcome.notifications {
-                match notification {
-                    PortNotification::Data { port, bytes } => {
-                        if bytes.is_empty() {
-                            continue;
-                        }
-                        // A notification for a port whose metadata is gone (closed while the
-                        // task was queued) has no recipient and is dropped.
-                        if let Some(meta) = self.meta.get(&port.number()) {
-                            // Bytes a port produced are **input** for
-                            // `erlang:statistics(io)`, counted where they really arrive.
-                            self.io_counters.note_input(bytes.len());
-                            // ...and for this port's own `port_info(Port, input)`.
-                            meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
-                            events.push(PortEvent::Data {
-                                port,
-                                bytes,
-                                stream: meta.stream,
-                                owner: meta.owner,
-                            });
-                        }
-                    }
-                    // A close is the caller's own `port_close/1` (which has already dropped
-                    // the port's metadata), so there is nobody to notify: an explicit close
-                    // produces no message in ERTS either.
-                    PortNotification::Closed { .. } => {}
-                }
-            }
+            self.fold_notifications(outcome.notifications, &mut events);
             events.extend(self.take_driver_outputs());
             events.extend(self.take_driver_terms());
             events.extend(self.take_due_exit_statuses()?);
@@ -1466,6 +1510,69 @@ impl PortRegistry {
             }
         }
         events
+    }
+
+    /// Folds one port-task round's notifications into `events`, crediting every payload where it
+    /// is **harvested**.
+    ///
+    /// This is the **single** place a [`beam_io::PortNotification`] becomes a [`PortEvent`]: both
+    /// rounds that can produce one use it — [`PortRegistry::pump`], which runs its own round, and
+    /// [`PortRegistry::write_command`], whose round runs outside any pump and retains the result in
+    /// [`PortRegistry::pending_events`] — so the two cannot drift.
+    ///
+    /// A payload is counted in **both** places here, at this one instant: the node-global
+    /// [`IoCounters::note_input`] behind `erlang:statistics(io)`, and the port's own
+    /// [`PortMeta::input`] behind `port_info(Port, input)`.
+    ///
+    /// A notification whose port's metadata is gone (closed while the task was queued) has no
+    /// recipient and is dropped; a notification for an **empty** payload is no message at all
+    /// (a driver read of nothing), unlike an empty *line* frame. A close is the caller's own
+    /// `port_close/1` — which has already dropped the metadata — so there is nobody to notify
+    /// and no message is produced, in ERTS either.
+    fn fold_notifications(&self, notifications: Vec<PortNotification>, events: &mut Vec<PortEvent>) {
+        for notification in notifications {
+            match notification {
+                PortNotification::Data { port, bytes } => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if let Some(meta) = self.meta.get(&port.number()) {
+                        // Bytes a port produced are **input** for `erlang:statistics(io)`,
+                        // counted where they really arrive.
+                        self.io_counters.note_input(bytes.len());
+                        // ...and for this port's own `port_info(Port, input)`.
+                        meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
+                        events.push(PortEvent::Data {
+                            port,
+                            bytes,
+                            stream: meta.stream,
+                            owner: meta.owner,
+                        });
+                    }
+                }
+                PortNotification::Closed { .. } => {}
+            }
+        }
+    }
+
+    /// Takes the events an earlier port-task round harvested outside a pump (see
+    /// [`PortRegistry::pending_events`]), dropping those whose port has since gone away.
+    ///
+    /// A port closed between the harvest and this drain has no recipient — the same rule
+    /// [`PortRegistry::fold_notifications`] follows — so its bytes are dropped rather than
+    /// delivered to a stale owner ([`PortRegistry::close`] purges them outright, which is what
+    /// keeps a reused port number from inheriting them).
+    ///
+    /// Nothing is re-delivered: the bytes left [`beam_io`]'s input queue when they were harvested,
+    /// so this is the **only** report they can still have.
+    fn drain_pending_events(&mut self) -> Vec<PortEvent> {
+        std::mem::take(&mut self.pending_events)
+            .into_iter()
+            .filter(|event| match event.port() {
+                Some(port) => self.meta.contains_key(&port.number()),
+                None => true,
+            })
+            .collect()
     }
 
     /// Runs the **end-of-stream line flush** for every `line`/`{line, N}` port.
