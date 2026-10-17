@@ -390,12 +390,19 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
         // takes the smallest curated size covering the request and, only when that would not
         // enlarge the space, at least a doubling — so the ladder of *retained* capacities is a
         // geometric one, a few growth-table steps above the size a collection settles on — and
-        // the collection's own `young_after_collection` shrink rule (`capacity > 4 × live`)
+        // a collection's own `young_after_collection` shrink rule (`capacity > 4 × demand`)
         // pulls it back down at the next admission. The bound below is therefore an
-        // order-of-magnitude guard (`16 × 256 = 4096`), not a pinned geometry: it fails only for
-        // a capacity that scales with the iteration count.
+        // order-of-magnitude guard, not a pinned geometry: it fails only for a capacity that
+        // scales with the iteration count.
+        //
+        // The high-water is one **doubling step** above the plateau: the settlement after a
+        // fullsweep keeps the capacity the round observed (so the next round's constant request
+        // finds a nearly-full space) and the doubling branch then installs `next_words(2 ×
+        // capacity)`, which the *following* minor's shrink rule collapses again — the tail
+        // below shows exactly that four-state cycle. So the guard is one ladder step above
+        // `16 × OP_WORDS`: still an order-of-magnitude constant independent of the run.
         assert!(
-            peak_young <= 16 * OP_WORDS,
+            peak_young <= 24 * OP_WORDS,
             "{kind:?}: the nursery must stay a small multiple of the op's object, got {peak_young}"
         );
         // The peaks are *bounded*, but the run's global high-water marks need not be the
@@ -412,7 +419,7 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
             "{kind:?}: the plateau holds exactly one retired space"
         );
         assert!(
-            tail_young <= 16 * OP_WORDS,
+            tail_young <= 24 * OP_WORDS,
             "{kind:?}: the plateau's nursery is a small multiple of the op's object, got {tail_young}"
         );
         assert!(

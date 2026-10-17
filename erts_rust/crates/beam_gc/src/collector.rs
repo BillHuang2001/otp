@@ -211,9 +211,9 @@ impl Collector {
         // The nursery is empty again: size it for the next round from what the collection
         // *left in it* — for a minor that is exactly the words it promoted
         // (`GcStats::words_copied`), i.e. the C's minor-time young-heap resize fed with the
-        // surviving usage (`erl_gc.c:1493`). Never the pre-collection fill: a nursery is only
-        // collected when it is full, so that stale count is ≈ the capacity and would grow the
-        // nursery on every collection, without bound.
+        // surviving usage (`erl_gc.c:1493`). That is a quantity the round measured exactly,
+        // and (unlike a fullsweep, which relocates everything) a minor really does leave a
+        // live young set behind, so it is the minor's own sizing input.
         self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(stats)
     }
@@ -281,10 +281,13 @@ impl Collector {
         self.stats.objects_copied += stats.objects_copied;
         self.stats.major_collections += 1;
         // The fullsweep relocated *every* live word — the nursery's included — into the fresh
-        // mature space, so the nursery's surviving occupancy is now zero: the resize can only
-        // bring it down towards its reserved minimum, never up (sizing it from the live set
-        // would make the nursery track the mature generation's contents).
-        self.nursery.collapse(&self.policy, 0)?;
+        // mature space, so the nursery's surviving occupancy is now zero and there is no live
+        // young set to size it from. It is therefore sized from the **demand the round
+        // observed** (`young_occupancy`, sampled before the copy): the C's
+        // `adjust_after_fullsweep` keep-the-heap-unless-it-is-over-provisioned rule
+        // (`erl_gc.c:2061-2098`) rather than a collapse to the reserve floor. See
+        // [`Nursery::collapse`] for why feeding it the occupancy cannot grow the nursery.
+        self.nursery.collapse(&self.policy, young_occupancy)?;
         Ok(stats)
     }
 

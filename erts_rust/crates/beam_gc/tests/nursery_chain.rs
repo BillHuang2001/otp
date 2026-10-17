@@ -464,24 +464,23 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     // The growth path really was exercised.
     assert!(grew, "the loop must have grown the nursery at least once");
 
-    // The capacities plateau: the last 50 triples form a bounded **period-2** cycle.
+    // The capacities plateau: the last 50 triples are **one single state**.
     //
     // After the growth path has run, a round's *collection* collapses the chain and re-sizes
-    // the nursery from what it left alive in it: the round's `STEADY_NEED`-word object is
-    // promoted out, so the surviving set is empty and `young_after_collection` falls the
-    // nursery back to a small size; the *next* round's request then outgrows that and
-    // `grow_nursery` steps it back up. The loop therefore alternates deterministically between
-    // a grown and a collapsed nursery rather than sitting at a single constant.
+    // the nursery from the capacity the chain held and the demand the round observed (the
+    // `STEADY_NEED`-word object plus the request that produced it, `young_after_collection`):
+    // the collapsed space already covers the request, so the next round's `grow_nursery` is a
+    // no-op and no space is retired. The loop therefore sits on **one** fixed state instead of
+    // alternating between a grown and a collapsed nursery.
     //
-    // What matters is that the cycle is **bounded** — a fixed period over a fixed, finite set
-    // of states, each capacity pinned — not that it is a single value. A creep would show as a
-    // third (or drifting) state, which the exact-set assertion below rejects.
+    // What matters is that the state is **bounded** — a fixed point over a fixed, finite set of
+    // states, each capacity pinned — not which one it is. A creep would show as a second (or
+    // drifting) state, which the exact-set assertion below rejects.
     //
-    // The grown capacity is the curated size the request resolves to (`987` = the smallest
-    // growth-table entry covering `STEADY_NEED`) plus the capacity of the space the growth
-    // superseded (`90`): a superseded space is retained until a collection evacuates it, and
-    // the collapse that follows sizes the single remaining space from the whole chain.
-    const PERIOD: usize = 2;
+    // The capacity is the curated size the chain's collapse settles on for a `STEADY_NEED`-word
+    // survival under this small-start policy; the mature generation is its own policy fixed
+    // point.
+    const PERIOD: usize = 1;
     let tail = &recorded[ROUNDS - 50..];
     assert!(
         tail.iter().enumerate().all(|(i, t)| *t == tail[i % PERIOD]),
@@ -490,10 +489,10 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     let distinct: std::collections::BTreeSet<(usize, usize, usize)> =
         tail.iter().copied().collect();
     let pinned: std::collections::BTreeSet<(usize, usize, usize)> =
-        [(1, 90, 1598), (1, 1077, 1598)].into_iter().collect();
+        [(1, 984, 1598)].into_iter().collect();
     assert_eq!(
         distinct, pinned,
-        "the converged cycle must be exactly the pinned grown/collapsed alternation"
+        "the converged cycle must be exactly the pinned fixed point"
     );
 
     // Nothing creeps without bound.

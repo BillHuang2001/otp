@@ -306,12 +306,25 @@ impl Nursery {
     /// It drops the retired spaces (and their containment index) and re-sizes the single
     /// remaining current space from the heap-size policy
     /// ([`HeapPolicy::young_after_collection`]) over the capacity the chain held when it was
-    /// collected, where `live_words` is what the collection left in the nursery (the promoted
-    /// words for a minor, `0` after a fullsweep). The space is only replaced when the target
-    /// differs; otherwise its bump pointer is merely rewound.
-    pub(crate) fn collapse(&mut self, policy: &HeapPolicy, live_words: usize) -> Result<()> {
+    /// collected, where `demand_words` is the **demand the round observed**: the words the
+    /// mutator had admitted into the chain when it was collected (see
+    /// [`Nursery::used_words`], sampled by the collector *before* the copy). The space is only
+    /// replaced when the target differs; otherwise its bump pointer is merely rewound.
+    ///
+    /// # The sizing input is bounded by the collected capacity, so this can never creep
+    ///
+    /// `demand_words` is at most `capacity_words()` (the chain's own occupancy cannot exceed
+    /// the chain's capacity), and every branch of [`HeapPolicy::young_after_collection`] that
+    /// could enlarge the target beyond `collected_capacity` needs `demand_words >
+    /// collected_capacity`, which that bound forbids. So **`collapse` never grows the
+    /// nursery**: the post-collection capacity is at most the pre-collection capacity, and a
+    /// collection that finds the nursery mostly empty shrinks it towards the demand. The only
+    /// thing that enlarges a nursery is the explicit, request-driven
+    /// [`grow`](Nursery::grow) seam — so a fixed demand converges to a constant capacity
+    /// instead of climbing one growth-table step per collection.
+    pub(crate) fn collapse(&mut self, policy: &HeapPolicy, demand_words: usize) -> Result<()> {
         let collected_capacity = self.capacity_words();
-        let target = policy.young_after_collection(collected_capacity, live_words);
+        let target = policy.young_after_collection(collected_capacity, demand_words);
         self.retired.clear();
         self.retired_regions.clear();
         if self.current.capacity_words() == target {

@@ -559,7 +559,7 @@ impl GenImmixCollector {
         stats.words_reclaimed = used.saturating_sub(stats.words_copied);
         self.minor_since_major += 1;
         // What the minor left in the nursery is exactly what it promoted (see
-        // `HeapPolicy::young_after_collection`), never the pre-collection fill.
+        // `HeapPolicy::young_after_collection`) — the live young set it measured.
         self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(PromoteOutcome::Done(stats))
     }
@@ -639,8 +639,11 @@ impl GenImmixCollector {
                 stats.words_reclaimed = immix.words_reclaimed + nursery_garbage;
                 self.minor_since_major = 0;
                 // The fullsweep promoted the nursery's live words into the mature region, so
-                // the nursery's surviving occupancy is zero and the resize can only shrink it.
-                self.nursery.collapse(&self.policy, 0)?;
+                // there is no surviving young set to size the nursery from: it is sized from the
+                // **demand this round observed** (`used`, sampled before the promotion), the
+                // copying collector's rule and the C `adjust_after_fullsweep`'s
+                // keep-unless-over-provisioned behaviour (`crate::Nursery::collapse`).
+                self.nursery.collapse(&self.policy, used)?;
                 Ok(stats)
             }
             PromoteOutcome::WouldNotFit => self.grow_major(roots, needed, live.lines),
@@ -786,8 +789,10 @@ impl GenImmixCollector {
         // No in-place reclaim ran, so there is nothing to report for it.
         self.last_immix = None;
         // The relocation copied every live word — the nursery's included — into the fresh
-        // mature region, so the nursery's surviving occupancy is zero.
-        self.nursery.collapse(&self.policy, 0)?;
+        // mature region, so there is no surviving young set: the nursery is sized from the
+        // **demand this round observed** (`used`, sampled before the copy), exactly as the
+        // in-place fullsweep and the copying collector size it.
+        self.nursery.collapse(&self.policy, used)?;
         Ok(stats)
     }
 }

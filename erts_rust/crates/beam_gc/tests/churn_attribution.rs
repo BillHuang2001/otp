@@ -316,4 +316,20 @@ fn the_churn_shape_attributes_its_per_op_cost_to_collection_counts_not_to_copyin
         "the chain collapses at every collection, peaked at {} spaces",
         k.peak_spaces
     );
+    // **The post-fullsweep nursery sizing settles the heap** (`Nursery::collapse`'s demand
+    // rule): a fullsweep keeps the capacity the round observed instead of collapsing the
+    // nursery to the reserve floor, so the per-op space install that a floor-collapse forced
+    // (`1.00` growth events/op — one fresh space for every operation) is gone — the growth
+    // seam runs a handful of times over the whole run and the collections per op fall with it.
+    // Both figures are deterministic counts of this shape, not timings.
+    assert!(
+        per_op(k.growths) < 0.05,
+        "the nursery settles instead of being re-installed per op ({} installs/op)",
+        per_op(k.growths)
+    );
+    assert!(
+        per_op(k.collections) < 1.75,
+        "the settled nursery collects less often than the floor-collapsed one ({} collections/op)",
+        per_op(k.collections)
+    );
 }
