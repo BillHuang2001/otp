@@ -26,6 +26,7 @@
 //! registered-BIF suites.
 
 use beam_common::{AllocFailure, AllocKind};
+use beam_engine::ExecutionContext;
 use beam_process::SignalAtoms;
 use beam_term::make_small;
 use beam_term::prelude::make_header;
@@ -247,4 +248,254 @@ fn a_refused_copy_adopts_nothing_into_the_runtime_store() {
     let (attempts, grows, _) = notes::snapshot();
     assert_eq!(attempts, 1, "the malformed graph is refused on the first attempt");
     assert_eq!(grows, 0, "a permanent refusal never grows the nursery");
+}
+
+// -----------------------------------------------------------------------
+// What the copier registers, and what the copy-out therefore adopts
+// -----------------------------------------------------------------------
+/// The off-heap payload owner a [`beam_codec::term::make_refc_binary`] call needs — exactly the
+/// role `beam_engine`'s `Machine::refc_binaries` plays for a real run.
+struct Payloads(Vec<beam_alloc::RefcBinary>);
+impl beam_codec::OffHeapBinaries for Payloads {
+    fn alloc_refc_payload(&mut self, bytes: &[u8]) -> Result<*mut Eterm> {
+        let handle = beam_alloc::RefcBinary::new(bytes)?;
+        let data = handle.data_ptr();
+        self.0.push(handle);
+        Ok(data.cast::<Eterm>())
+    }
+}
+
+/// A 200-byte payload — above [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`], so the term built from
+/// it is the frozen 8-word `[BinRef][ErlSubBits]` off-heap pair rather than an on-heap binary.
+fn payload_bytes() -> Vec<u8> {
+    let bytes: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+    assert!(bytes.len() > beam_term::refc::ERL_ONHEAP_BINARY_LIMIT);
+    bytes
+}
+
+/// The off-heap **MSO** reference container `[HEADER_BIN_REF, slot, next]` (the frozen `BinRef`
+/// thing, `beam_term::refc`) for slot `slot` on `heap`.
+///
+/// Written through [`beam_alloc::Heap::used_words_mut`] — the safe, initialised-prefix view — so
+/// this crate's `#![deny(unsafe_code)]` holds: no production path builds one (nothing in the
+/// workspace produces an MSO yet), and the raw layout owner is `beam_term::refc`, whose
+/// on-heap writer is an `unsafe fn`.
+fn off_heap_container(heap: &mut beam_alloc::Heap, slot: usize) -> Eterm {
+    // A 2-tuple occupies exactly `ERL_BIN_REF_SIZE` words: the header plus its two elements.
+    let words = beam_term::prelude::ERL_BIN_REF_SIZE;
+    heap.tuple(&vec![beam_term::prelude::NIL; words - 1])
+        .expect("the container's words fit");
+    let base = {
+        let slot_words = heap.used_words_mut();
+        assert_eq!(slot_words.len(), words, "the tuple is the whole used prefix");
+        slot_words[0] = beam_term::prelude::HEADER_BIN_REF;
+        slot_words[1] = Eterm::from_raw(slot);
+        slot_words[2] = Eterm::from_raw(0);
+        slot_words.as_mut_ptr()
+    };
+    beam_term::prelude::make_boxed(base)
+}
+
+/// **A container holding an off-heap refc binary is copied out byte-faithfully.**
+///
+/// The copy's source off-heap table is empty (the pooled BIF heap owns no handle), so the copier
+/// takes its documented fallback and **flattens** the refc binary's window into a fresh on-heap
+/// bitstring: the result is byte-identical, self-contained, and registers **nothing** in the
+/// runtime store — the copy-out succeeds where a dangling payload reference would have been the
+/// alternative.
+#[test]
+fn a_container_holding_an_off_heap_refc_binary_is_copied_out_as_an_on_heap_binary() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    // The BIF result: a 2-tuple whose first element is an off-heap refc binary — the shape
+    // `bs_create_bin`/`base64:encode/1` hands back above the on-heap limit.
+    let bytes = payload_bytes();
+    let mut source = beam_alloc::Heap::new(64).expect("the source heap");
+    let mut payloads = Payloads(Vec::new());
+    let binary = beam_codec::term::make_refc_binary(
+        &mut source,
+        &mut payloads,
+        &bytes,
+        0,
+        bytes.len() * 8,
+    )
+    .expect("the source refc binary");
+    let term = source
+        .tuple(&[binary, make_small(1)])
+        .expect("the source tuple");
+    // What the flattened copy must read back as: the same bytes as an on-heap binary.
+    let mut reference_heap = beam_alloc::Heap::new(64).expect("the reference heap");
+    let reference_binary =
+        beam_codec::term::make_binary(&mut reference_heap, &bytes).expect("the reference binary");
+    let reference = reference_heap
+        .tuple(&[reference_binary, make_small(1)])
+        .expect("the reference tuple");
+
+    let used_before = table
+        .get(pid)
+        .expect("the spawned process")
+        .heap()
+        .used();
+    notes::reset();
+    let copied = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.move_result_into_process_heap(term)
+            .expect("the container is re-homed")
+    };
+    assert!(
+        beam_term::prelude::is_boxed(copied) && !beam_term::literal::is_literal(copied),
+        "the result is a real tuple built on the process's own heap"
+    );
+    assert!(
+        beam_term::compare::eq(copied, reference, rt.atoms()),
+        "the copied binary reads back byte-identical to the payload it was flattened from"
+    );
+    assert!(
+        rt.eval_off_heap.binaries().is_empty(),
+        "a flattened payload registers no off-heap handle in the runtime store"
+    );
+    let copied_words = table.get(pid).expect("the spawned process").heap().used() - used_before;
+    assert_eq!(
+        copied_words,
+        beam_term::size_object(copied),
+        "the whole copied graph — the flattened bitstring included — lives on the process heap"
+    );
+    let (attempts, grows, empties) = notes::snapshot();
+    assert_eq!(
+        (attempts, grows, empties),
+        (1, 0, 1),
+        "one attempt, on the empty-destination fast path, with nothing to grow"
+    );
+}
+
+/// **An off-heap reference with no resolvable owner is refused, never copied into a dangling one.**
+///
+/// The copy's source table is empty, so an off-heap MSO container's slot does not resolve
+/// (`clone_slot` is `None`) and the copier answers its typed `bad_term` — the pool-owning caller
+/// then gets `None` (so it neither rewinds the pool nor adopts anything) rather than a term whose
+/// `val` word names a slot the runtime store does not hold.
+///
+/// The refusal has **no root**: the copier's sized fall-back path may already have materialised the
+/// container's ancestors (the two words of the tuple below) before it reached the unresolvable
+/// slot, and those words are unreachable — nothing in the process's root set points at them — so
+/// the invariant asserted here is that no *result* exists, never that the bump pointer is where it
+/// was (only the exhaustion preflight, and a refusal of a root that is itself malformed, promise
+/// that; see `a_permanent_copy_refusal_grows_no_nursery_and_writes_nothing`).
+#[test]
+fn an_off_heap_reference_with_no_owner_is_refused_and_adopts_nothing() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    let mut source = beam_alloc::Heap::new(64).expect("the source heap");
+    let container = off_heap_container(&mut source, 0);
+    let term = source
+        .tuple(&[container, make_small(1)])
+        .expect("the source tuple");
+    notes::reset();
+    let copy = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.move_result_into_process_heap(term)
+    };
+    assert!(
+        copy.is_none(),
+        "the unresolvable container is refused (never re-homed with a dangling slot)"
+    );
+    assert!(
+        rt.eval_off_heap.nodes().is_empty() && rt.eval_off_heap.binaries().is_empty(),
+        "a refused copy adopts nothing into the runtime store"
+    );
+    let (attempts, grows, empties) = notes::snapshot();
+    assert_eq!(
+        (attempts, grows, empties),
+        (1, 0, 1),
+        "one attempt, refused on the empty-destination fast path, with nothing to grow"
+    );
+}
+
+/// A registered BIF whose result is a **container the copier refuses** (`make_header(0, 0)` is the
+/// C ABI's non-value, a bare header word), after allocating words on the pooled heap.
+fn refused_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let _pooled = ctx.heap().tuple(&[make_small(1), make_small(2)])?;
+    Ok(make_header(0, 0))
+}
+
+/// A registered BIF that allocates on the pooled heap and returns a **copyable** container.
+fn copyable_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let _pooled = ctx.heap().tuple(&[make_small(1), make_small(2)])?;
+    ctx.heap().tuple(&[make_small(9)])
+}
+
+/// **The pool rewind is a decision of its own, and a refused copy-out leaves the pool alone.**
+///
+/// `call_registered` rewinds the pooled BIF heap to this call's `mark` **only** when the copy-out
+/// reported a container result it could re-home. A refused result is returned to the caller
+/// **as it was built** — still on the pool — so rewinding would recycle the very words the result
+/// points at. The positive control is the same call shape with a copyable result, whose words
+/// *are* given back (to its own `mark`, which is exactly where the refused call left the pool).
+#[test]
+fn a_refused_copy_out_leaves_the_pooled_bif_heap_unrewound() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    {
+        let registry = Rc::get_mut(&mut rt.registry)
+            .expect("the runtime holds the only handle to its registry");
+        let _ = registry.register("copy_out_fixture", "refused", 0, refused_result);
+        let _ = registry.register("copy_out_fixture", "copied", 0, copyable_result);
+    }
+    let pool_used = |rt: &crate::runtime::Runtime| {
+        rt.bif_heaps
+            .last()
+            .expect("the pool keeps its region")
+            .used()
+    };
+    assert_eq!(pool_used(&rt), 0, "the pool starts clean");
+    // The refused result: the BIF's own three words are on the pooled heap when the call returns
+    // them, so the pool's bump pointer must still be where the call left it.
+    let pool_after_refusal = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        notes::reset();
+        let result = ctx
+            .call_bif("copy_out_fixture", "refused", 0, &[])
+            .expect("the fixture BIF returns");
+        assert_eq!(
+            result.raw(),
+            make_header(0, 0).raw(),
+            "the un-re-homed result is handed to the caller unchanged"
+        );
+        assert_eq!(
+            notes::snapshot(),
+            (1, 0, 1),
+            "the copy-out did run — one attempt, on the empty-destination fast path — and refused"
+        );
+        pool_used(ctx.runtime)
+    };
+    assert_eq!(
+        pool_after_refusal, 3,
+        "a refused copy-out must not rewind: the result still points into those words"
+    );
+    // The positive control: the same call shape, a result the copier can re-home — the call's own
+    // words are given back, leaving the pool exactly where the previous call left it.
+    let pool_after_copy = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        notes::reset();
+        let result = ctx
+            .call_bif("copy_out_fixture", "copied", 0, &[])
+            .expect("the fixture BIF returns");
+        assert!(
+            beam_term::prelude::is_boxed(result) && !beam_term::literal::is_literal(result),
+            "the copyable result is a real container on the process heap"
+        );
+        assert_eq!(
+            notes::snapshot(),
+            (1, 0, 1),
+            "the copy-out ran once on the empty-destination fast path"
+        );
+        pool_used(ctx.runtime)
+    };
+    assert_eq!(
+        pool_after_copy, pool_after_refusal,
+        "a successful copy-out rewinds the pool to its own mark"
+    );
 }

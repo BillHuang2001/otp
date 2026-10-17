@@ -866,6 +866,8 @@ impl<'a> RuntimeContext<'a> {
     /// [`Runtime::eval_off_heap`] — the runtime-lifetime owner the copied term resolves them
     /// through — and only then is the copy returned; a **refusal** adopts nothing (the local table
     /// is dropped, its `Drop` releasing the node references the abandoned attempt registered). The
+    /// adoption runs per family and only for a family whose list holds an entry, so an ordinary
+    /// result with no off-heap reference pays three emptiness tests and nothing else. The
     /// copied term resolves a refc binary by payload **data pointer**
     /// ([`binary_by_data_ptr`](beam_message::OffHeapTable::binary_by_data_ptr)) and a node by
     /// **identity**, never by destination slot index, so the adoption is transparent: each drained
@@ -1169,18 +1171,26 @@ impl RuntimeContext<'_> {
 /// Runs **one** copy-out attempt of `term` onto `heap` through a **fresh, empty** local destination
 /// off-heap table, adopting that table's off-heap references into `store` on success.
 ///
-/// The fresh table is the whole point: `beam_message`'s copier takes its single-traversal fast path
-/// (`copy.rs`'s `try_copy_fast`) only for a destination whose three off-heap lists are empty, and
-/// `store` ([`Runtime::eval_off_heap`]) is routinely non-empty because transport copies
+/// The empty destination is the whole point: `beam_message`'s copier takes its single-traversal
+/// fast path (`copy.rs`'s `try_copy_fast`) only for a destination whose three off-heap lists are
+/// empty, and `store` ([`Runtime::eval_off_heap`]) is routinely non-empty because transport copies
 /// ([`Runtime::stabilize_term_with`]) and nested runs
 /// ([`Runtime::adopt_escaped_binaries`]) register entries there. Handing the copier a local table
-/// keeps the copy-out on that fast path no matter what the shared store holds; the adoption below
-/// then hands the references back to the runtime before the (now dead) local table drops them.
+/// keeps the copy-out on that fast path no matter what the shared store holds.
 ///
-/// On **success** the local table's MSO handles, refc binaries and per-reference node entries move
-/// into `store`; on **failure** nothing is adopted — the local table is dropped, its `Drop`
-/// releasing the node references the abandoned attempt took. Because every attempt calls this with
-/// its own new table, no partial state can be carried into a retry.
+/// The table is also where the copier registers the off-heap objects the copy referenced, and each
+/// family is adopted into `store` **only when it holds something** — three `Vec::len` tests and
+/// nothing else for the overwhelmingly common result, a graph with no off-heap reference at all
+/// (its MSO list can never fill — see below — and its refc binaries are flattened, so only a node
+/// entry of an external pid/port/reference can ever appear). On **failure** nothing is adopted: the
+/// local table is dropped, its `Drop` releasing the node references the abandoned attempt took.
+/// Because every attempt calls this with its own new table, no partial state can be carried into a
+/// retry.
+///
+/// A table-free entry point would have to be exactly this shape, and
+/// [`beam_message::copy_struct_simple`] is not it: it builds these very two tables internally (so it
+/// removes no work) and keeps the destination one private, which would leave a successful copy's
+/// node entries to be released by its `Drop` instead of adopted into `store`.
 ///
 /// The SOURCE table is empty and stays empty: the pooled BIF heap owns no off-heap handle, so a
 /// refc binary whose payload no source handle owns is **flattened** into an on-heap bitstring (the
@@ -1202,23 +1212,30 @@ fn copy_result_fresh(
         beam_message::copy_struct(term, heap, &mut ctx)
     };
     if outcome.is_ok() {
-        // Adopt the local table's off-heap references into the runtime-lifetime store. The copied
-        // term resolves them by payload **data pointer** (refc binaries) and by node **identity**,
-        // never by destination slot index, so re-registering each drained entry there is
-        // transparent. (`push` is a no-op on the empty MSO list success guarantees; the guard on
-        // the outcome is what makes the node adoption release-correct on the refusal path.)
-        for handle in local.drain_handles() {
-            store.push(handle);
+        // Adopt the local table's off-heap references into the runtime-lifetime store — each
+        // family only when it holds an entry, so an ordinary (on-heap only) result pays three
+        // emptiness tests and no drain. The copied term resolves them by payload **data pointer**
+        // (refc binaries) and by node **identity**, never by destination slot index, so
+        // re-registering each drained entry there is transparent. (The guard on the outcome is what
+        // makes the node adoption release-correct on the refusal path.)
+        if !local.is_empty() {
+            for handle in local.drain_handles() {
+                store.push(handle);
+            }
         }
-        for binary in local.drain_binaries() {
-            store.push_binary(binary);
+        if !local.binaries().is_empty() {
+            for binary in local.drain_binaries() {
+                store.push_binary(binary);
+            }
         }
-        for entry in local.drain_nodes() {
-            // One reference per count, faithfully: the local table dedups by identity and counts
-            // references, so replaying `push_node` once per counted reference restores exactly that
-            // count in the store (which dedups the same way).
-            for _ in 0..entry.refcount() {
-                store.push_node(beam_message::NodeEntry::new(entry.node(), entry.creation()));
+        if !local.nodes().is_empty() {
+            for entry in local.drain_nodes() {
+                // One reference per count, faithfully: the local table dedups by identity and
+                // counts references, so replaying `push_node` once per counted reference restores
+                // exactly that count in the store (which dedups the same way).
+                for _ in 0..entry.refcount() {
+                    store.push_node(beam_message::NodeEntry::new(entry.node(), entry.creation()));
+                }
             }
         }
     }
