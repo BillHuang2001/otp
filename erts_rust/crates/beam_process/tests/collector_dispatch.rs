@@ -308,7 +308,10 @@ fn the_selected_strategy_collects_through_the_process() {
             .expect("the growth seam succeeds through the dispatcher");
         assert_roots_survive(table.get(pid).expect("the process is live"));
 
-        // `collect_if_needed` runs a collection only when the nursery cannot satisfy the request;
+        // `collect_if_needed` runs a collection only when the admission requires one — the
+        // nursery cannot satisfy the request (`should_collect`) or the collector is carrying the
+        // retired-space collection debt. The growth above collapsed the chain and fitted the
+        // request, so this process is debt-free with a roomy space and admits without collecting;
         // the roots survive either way.
         table
             .get_mut(pid)

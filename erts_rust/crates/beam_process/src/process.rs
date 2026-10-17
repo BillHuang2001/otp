@@ -1243,11 +1243,34 @@ impl Process {
     ///
     /// A no-collect, no-relocation nursery growth ([`Process::grow_nursery`]) retires the space it
     /// replaces instead of freeing it, so the collector can carry that retention (its *collection
-    /// debt*) while the current young space still has room to spare. A host's heap-admission point
-    /// that only consulted the occupancy check would let the retired chain accumulate; consulting
-    /// this accessor as well lets a collection collapse it.
+    /// debt*) while the current young space still has room to spare. A heap-admission point that
+    /// only consulted the occupancy check would let the retired chain accumulate; consulting this
+    /// accessor as well lets a collection collapse it — which is exactly what the crate's own
+    /// admission seam does ([`Process::admission_requires_collection`]).
     pub fn collection_debt(&self) -> bool {
         self.collector.collection_debt()
+    }
+
+    /// Whether a heap admission for `need_words` more words must **collect** — the crate's own
+    /// heap-admission predicate, and the test [`Process::collect_if_needed`] runs.
+    ///
+    /// It is the OR of two independent reasons, because only a collection clears either:
+    ///
+    /// * [`Process::should_collect`] — the pure occupancy test: the current young space has no
+    ///   room for the request;
+    /// * [`Process::collection_debt`] — the collector is **retaining replaced spaces**, so the
+    ///   nursery is a chain whose spent capacity only a collection reclaims. A no-collect,
+    ///   no-relocation growth ([`Process::grow_nursery`], the route a host takes when a
+    ///   relocating collection is declined) retires a space per growth, so a process whose
+    ///   current space keeps having room would otherwise never collect and its footprint would
+    ///   climb instead of levelling off.
+    ///
+    /// The predicate is **self-limiting**: a collection collapses the chain, so the debt half can
+    /// never fire twice for one debt — a second admission right after the collecting one answers
+    /// `false` (absent a fresh growth or a genuinely full space). It is a query only: it neither
+    /// collects nor mutates the collector.
+    pub fn admission_requires_collection(&self, need_words: usize) -> bool {
+        self.should_collect(need_words) || self.collection_debt()
     }
 
     /// The number of words used in the young heap.
@@ -1552,8 +1575,16 @@ impl Process {
             Err(err) => Err(err),
         }
     }
-    /// Collects first when `need` more words do not fit, then reports whether a collection
-    /// ran.
+    /// Collects first when the admission for `need` more words requires it, then reports whether a
+    /// collection ran.
+    ///
+    /// "Requires it" is [`Process::admission_requires_collection`]: the occupancy test
+    /// ([`Process::should_collect`]) **OR** the retired-space debt
+    /// ([`Process::collection_debt`]). Honouring the debt half is what stops a process whose
+    /// nursery keeps being grown without relocating ([`Process::grow_nursery`], the route a host
+    /// takes when a relocating collection is declined) from retaining a chain of spent spaces
+    /// forever: only a collection collapses the chain, and the collapse makes the debt half
+    /// self-limiting.
     ///
     /// A **relocation-exempt** process ([`Process::set_relocation_exempt`]) never collects here
     /// (its heap must not be relocated against an incomplete root set), so this returns
@@ -1567,14 +1598,13 @@ impl Process {
         if self.relocation_exempt {
             return Ok(false);
         }
-        if self.should_collect(need) {
+        if self.admission_requires_collection(need) {
             self.collect()?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
-
     /// The copy half of [`Process::deliver`]: copies `term` into the young heap through the
     /// shared copy engine and enqueues the resulting message.
     ///
@@ -1934,7 +1964,9 @@ mod tests {
         assert_eq!(process.heap_used_words(), 0);
         assert!(process.mailbox().is_empty());
 
-        // `collect_if_needed` only runs when the heap cannot satisfy the request.
+        // `collect_if_needed` collects only when the admission requires it (the occupancy test OR
+        // the retired-space collection debt); this process never grew its nursery, so it carries
+        // no debt and the roomy space admits without a collection.
         assert!(!process
             .collect_if_needed(1)
             .expect("a tiny request needs no collection"));
