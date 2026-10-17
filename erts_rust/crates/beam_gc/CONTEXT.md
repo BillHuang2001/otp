@@ -533,6 +533,12 @@ the section to read them in.
   always resolved by the automatic rule (`MatureSource::Automatic`).
   An explicit `GcConfig`/`MatureSelection` pin would need a parameter on the process-construction path (owner:
   `beam_process`).
+- **`Process::collect_kind` is owed by `beam_process`** (this crate's half is in place: `AnyCollector::collect_kind`).
+  `pub fn collect_kind(&mut self, kind: CollectionKind) -> Result<Collection>` = the `relocation_exempt` guard
+  naming `collect_kind`, then `self.run_rooted_collection(|collector, roots| collector.collect_kind(kind, roots))`.
+  The `beam_rt` handoff: `process.collect_kind(beam_gc::CollectionKind::Minor)?` yields
+  `Collection { kind: Minor, .. }` or the typed `BeamError::Alloc` (`out_of_memory`) when the promotion cannot fit
+  the mature space — never an escalated fullsweep — and `CollectionKind::Major` pins a fullsweep.
 - **`beam_process` should adopt the safe reachability view (`for_each_reachable_object_view`).** Its
   `sweep_off_heap_binaries_reachable_from` still drives `AnyCollector::for_each_reachable_object`, whose raw
   `(header, ptr)` pairs force the single production `unsafe { *ptr.add(1) }` word read in its
