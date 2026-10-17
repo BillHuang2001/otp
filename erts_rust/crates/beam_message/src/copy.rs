@@ -605,6 +605,23 @@ pub(crate) fn shallow<A: CopyTarget>(
     if is_shared(src) {
         return Ok(src);
     }
+    shallow_unshared(to, ctx, src, work)
+}
+/// [`shallow`] for a source term the caller has **already** proven not shared — the form the
+/// worklist loops use.
+///
+/// A fix-up is only ever recorded for a non-shared child ([`push_fixup`]), so the copy loop's pop
+/// side knows the answer the head of [`shallow`] would re-derive. Splitting the two saves one
+/// [`is_shared`] per copied object (four tag tests on the hottest path of the copy), at the cost of
+/// one extra character in the API: the two entry points must stay behaviourally identical for every
+/// term `is_shared` rejects, which holds by construction because [`shallow`] is exactly this
+/// function behind that one guard.
+pub(crate) fn shallow_unshared<A: CopyTarget>(
+    to: &mut A,
+    ctx: &mut CopyContext<'_>,
+    src: Eterm,
+    work: &mut Vec<Fixup>,
+) -> Result<Eterm> {
 
     match primary_tag(src) {
         PrimaryTag::List => {
@@ -732,7 +749,7 @@ fn try_copy_fast(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Resul
     let mut work: Vec<Fixup> = Vec::new();
     let root = shallow(&mut trial, ctx, term, &mut work)?;
     while let Some((slot, src)) = work.pop() {
-        let copied = shallow(&mut trial, ctx, src, &mut work)?;
+        let copied = shallow_unshared(&mut trial, ctx, src, &mut work)?;
         // SAFETY: `slot` was recorded by `shallow` as a reference word inside an object it just
         // materialised in the trial region (words of the destination heap, which never
         // reallocates), so the word is still live, exclusively owned by this copy and writable.
@@ -809,7 +826,7 @@ pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Res
     let mut work: Vec<Fixup> = Vec::new();
     let root = shallow(to, ctx, term, &mut work)?;
     while let Some((slot, src)) = work.pop() {
-        let copied = shallow(to, ctx, src, &mut work)?;
+        let copied = shallow_unshared(to, ctx, src, &mut work)?;
         // SAFETY: `slot` was recorded by `shallow` as a reference word inside an object it just
         // materialised on the destination heap. That heap never reallocates, so the word is still
         // live, exclusively owned by this copy and writable.
