@@ -33,6 +33,11 @@ use beam_bifs::{default_registry, BifContext, BifRegistry};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
 use beam_term::{atom_val, make_atom, make_small, signed_value, AtomTable, Eterm, NIL};
+/// `ERTS_MONOTONIC_TIME_START_EXTERNAL` (`erl_time.h:312-323`) — the origin of
+/// `erlang:monotonic_time/0`, i.e. the value `erlang:system_info(start_time)`
+/// answers on this build (ORACLE: `-576460752000000000`). The private constant it
+/// mirrors lives in `src/time.rs`.
+const ERTS_START: i64 = -576_460_752_000_000_000;
 
 /// A registry + heap + atom table the tests drive BIF calls through.
 struct Fixture {
@@ -206,35 +211,48 @@ fn native_time_values_promote_to_bignums() {
     }
 
     // `time_offset/0` is `system_time - monotonic_time` in native units, so it is
-    // the same scale: a bignum, non-negative, and a plausible epoch too.
+    // the same scale and likewise a bignum, non-negative, and — because the
+    // monotonic reading is on the **ERTS epoch** (`start_time` =
+    // `-576_460_752_000_000_000`) — it exceeds the system time by the whole
+    // `|start_time|`: `offset/1e9` is `sys/1e9 + 576_460_752`.
     let offset = fx.erlang("time_offset", &[]).expect("time_offset/0");
     assert!(is_bignum(offset), "time_offset/0 must be a bignum");
     let non_negative = fx.erlang(">=", &[offset, zero]).expect(">=/2");
     assert!(truth(&fx, non_negative), "time_offset/0 must not be negative");
     let offset_secs = small(fx.erlang("div", &[offset, billion]).expect("div/2"));
+    let epoch_secs = -ERTS_START / 1_000_000_000;
     assert!(
-        (1_577_836_800..4_102_444_800).contains(&offset_secs),
-        "time_offset()/1e9 = {offset_secs} is not a plausible epoch value"
+        (offset_secs - secs_value - epoch_secs).abs() <= 1,
+        "time_offset()/1e9 = {offset_secs} is not the epoch {epoch_secs} past \
+         the system time {secs_value}"
     );
 
     // The invariant `system_time = monotonic_time + time_offset` holds: the
-    // difference is the (small) monotonic reading, a process-relative value, so it
-    // is within the process's lifetime of zero.
+    // difference is the monotonic reading itself, a **negative** small integer just
+    // above `start_time` on the ERTS epoch (a few hundred ms of uptime past it).
     let difference = fx.erlang("-", &[system, offset]).expect("-/2");
     assert!(
         beam_term::is_small(difference),
         "system_time - time_offset is the monotonic reading"
     );
     let elapsed = small(difference);
+    let uptime = elapsed - ERTS_START;
+    // `system_time` and the offset are read a few microseconds apart, so the skewed
+    // subtraction can land just below `start_time` — one millisecond of slack below,
+    // and a generous ceiling above.
     assert!(
-        elapsed.abs() < 1_000_000_000,
-        "system_time - time_offset = {elapsed} is not a plausible process uptime"
+        (-1_000_000..1_000_000_000_000).contains(&uptime),
+        "system_time - time_offset = {elapsed} is not start_time plus a plausible uptime"
     );
 
-    // `monotonic_time/0` stays a non-negative small integer.
+    // `monotonic_time/0` is a negative small integer on the ERTS epoch (ORACLE:
+    // `-576460751768187266`), inside `start_time .. 0`.
     let monotonic = small(fx.erlang("monotonic_time", &[]).expect("monotonic_time/0"));
-    assert!(monotonic >= 0, "monotonic_time must not be negative");
-
+    assert!(monotonic < 0, "monotonic_time must be negative: {monotonic}");
+    assert!(
+        monotonic > ERTS_START,
+        "monotonic_time {monotonic} must be above start_time {ERTS_START}"
+    );
     // `time_offset(second)` / `time_offset(millisecond)` are small.
     for unit in [second, millisecond] {
         let offset = fx.erlang("time_offset", &[unit]).expect("time_offset/1");

@@ -383,12 +383,16 @@ impl Dd {
     /// to `[1, √2)`, sum `atanh((m-1)/(m+1))` (the cancellation-free form of the
     /// `ln m` series) and add `k·ln 2`.
     fn ln_positive(self) -> Self {
-        /// `ln 2` to double-double precision.
+        /// `ln 2` to double-double precision: the `std` rounding-to-nearest `LN_2`
+        /// as the leading half (bit-identical to the decimal literal it replaces —
+        /// pinned by `log_constants_are_the_std_roundings`) plus the residual.
         const LN2: Dd = Dd {
-            hi: 0.6931471805599453,
+            hi: std::f64::consts::LN_2,
             lo: 2.3190468138462996e-17,
         };
-        const SQRT2: f64 = 1.4142135623730951;
+        /// The `[1, √2)` range-reduction threshold (same bit pattern as the
+        /// decimal literal `1.4142135623730951`; pinned by the same test).
+        const SQRT2: f64 = std::f64::consts::SQRT_2;
         let bits = self.hi.to_bits();
         let mut k = ((bits >> 52) & 0x7ff) as i32 - 1023;
         let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
@@ -630,6 +634,21 @@ mod tests {
             }
         };
         (to_ordered(a) - to_ordered(b)).abs()
+    }
+    /// `ln_positive` takes its `ln 2` leading half and its `[1, √2)` reduction
+    /// threshold from `std` instead of carrying decimal literals. These are the
+    /// bit patterns of the literals it used to carry (`0.6931471805599453`,
+    /// `1.4142135623730951`), pinned by bit pattern — were `std`'s constants ever
+    /// anything but the round-to-nearest `f64` of those mathematical values, the
+    /// `atanh`/`erf` renderings would move by an ulp and this test would say so.
+    #[test]
+    fn log_constants_are_the_std_roundings() {
+        /// `0.6931471805599453_f64`.
+        const LN2_LITERAL_BITS: u64 = 0x3fe6_2e42_fefa_39ef;
+        /// `1.4142135623730951_f64`.
+        const SQRT2_LITERAL_BITS: u64 = 0x3ff6_a09e_667f_3bcd;
+        assert_eq!(std::f64::consts::LN_2.to_bits(), LN2_LITERAL_BITS);
+        assert_eq!(std::f64::consts::SQRT_2.to_bits(), SQRT2_LITERAL_BITS);
     }
     #[test]
     fn unary_trig_is_bit_exact_against_the_oracle() {

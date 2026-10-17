@@ -130,13 +130,31 @@ fn unit_1_bsl_200(fx: &mut Fixture) -> Eterm {
     fx.bignum(false, &[0, 0, 0, 1 << 8])
 }
 
-/// Compares two non-negative decimal integers of arbitrary size.
+/// Compares two decimal integers of arbitrary size and either sign.
 fn cmp_decimal(a: &str, b: &str) -> Ordering {
-    assert!(
-        !a.starts_with('-') && !b.starts_with('-'),
-        "the bracketed clock values are non-negative"
-    );
-    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+    // Split the sign off; a non-negative value sorts after a negative one, and
+    // within a sign the magnitude comparison is the digit-count-then-lexicographic
+    // rule (with the order reversed for two negatives).
+    let (a_neg, a_mag) = match a.strip_prefix('-') {
+        Some(mag) => (true, mag),
+        None => (false, a),
+    };
+    let (b_neg, b_mag) = match b.strip_prefix('-') {
+        Some(mag) => (true, mag),
+        None => (false, b),
+    };
+    if a_neg != b_neg {
+        return if a_neg { Ordering::Less } else { Ordering::Greater };
+    }
+    let magnitude = a_mag
+        .len()
+        .cmp(&b_mag.len())
+        .then_with(|| a_mag.cmp(b_mag));
+    if a_neg {
+        magnitude.reverse()
+    } else {
+        magnitude
+    }
 }
 
 /// Asserts that `function/1` with `unit` — `monotonic_time(unit)`,
@@ -211,13 +229,24 @@ fn a_positive_bignum_unit_is_accepted_by_every_unit_bif() {
     let mut fx = Fixture::new();
     let unit = unit_1_bsl_200(&mut fx);
 
-    // `monotonic_time(1 bsl 200)` is non-negative; its native operand is the
-    // process-relative monotonic reading, so it may still be small.
+    // `monotonic_time(1 bsl 200)` scales the **ERTS-epoch** native reading — a large
+    // negative integer — by `2^200`, so it is a *negative* bignum (ORACLE:
+    // `-926336713075587891010068494398143295895281295409423312654023500425432`,
+    // and `abs(erlang:monotonic_time(1 bsl 200)) < 2^60` is `false`).
     let mono = fx.erlang("monotonic_time", &[unit]).expect("monotonic_time/1");
+    let mono_bignum = is_bignum(mono);
     let mono = fx.decimal(mono);
     assert!(
-        !mono.starts_with('-'),
-        "monotonic_time(1 bsl 200) must not be negative: {mono}"
+        mono_bignum,
+        "monotonic_time(1 bsl 200) must be a bignum: {mono}"
+    );
+    assert!(
+        mono.starts_with('-'),
+        "monotonic_time(1 bsl 200) must be negative on the ERTS epoch: {mono}"
+    );
+    assert!(
+        mono.len() > 60,
+        "monotonic_time(1 bsl 200) = {mono} is not the 2^200-scaled reading"
     );
 
     // The epoch reading and the offset scale the ~1.7e18-ns native value by

@@ -62,21 +62,44 @@
 //! the native reading exceeds `BIG_ARITY_MAX` limbs
 //! (`convert_time_unit(1000000, nanosecond, 1 bsl 4194239)` => `badarg`).
 //!
-//! # Where M1's clocks come from
+//! # The ERTS monotonic epoch
 //!
-//! * `monotonic_time/0` reads the **Rust process monotonic clock**
-//!   ([`Instant`] captured lazily on first use through a global [`OnceLock`]). Its
-//!   origin is arbitrary (the first call) and it never decreases — which is all
-//!   `erlang:monotonic_time/0` promises. Real ERTS maps the OS `CLOCK_MONOTONIC`
-//!   onto its own epoch; that absolute value is opaque to programs, so M1 does
-//!   not reproduce it.
+//! `erlang:monotonic_time/0,1` reports the **same monotonic epoch a real
+//! erts-17.1 VM reports**, not a process-relative elapsed count. ERTS measures
+//! monotonic time internally in `ERTS_MONOTONIC_TIME_UNIT` ticks — nanoseconds on
+//! the 64-bit Unix build (`erl_unix_sys.h:193-198`) — whose *internal* origin is
+//! `ERTS_MONOTONIC_BEGIN = UNIT` (`erl_time.h:235-236`), and exposes it externally
+//! shifted by a fixed offset (`erl_time.h:331-332`) so that the external origin is
+//!
+//! ```text
+//! ERTS_MONOTONIC_TIME_START_EXTERNAL
+//!   = (MIN_SMALL / ERTS_MONOTONIC_TIME_UNIT) * ERTS_MONOTONIC_TIME_UNIT   (erl_time.h:312-323)
+//!   = -576_460_752_000_000_000
+//! ```
+//!
+//! with `MIN_SMALL = -(1 << 59)` (`erl_term.h:269-270`) and the C division
+//! truncating toward zero. The external reading is therefore
+//! `START_EXTERNAL + elapsed` — a large **negative** integer that grows toward
+//! zero as the VM runs, bounded below by
+//! `erlang:system_info(start_time)` and above by `(end_time)`. The *(elapsing)*
+//! half is the Rust process monotonic clock ([`Instant`] captured lazily through a
+//! global [`OnceLock`]), which never decreases; the epoch half is the compile-time
+//! constant [`MONOTONIC_TIME_START_EXTERNAL`]. Both bounds of the external range
+//! are the same interface constants `beam_rt`'s `src/info/time.rs` publishes as
+//! `START_TIME`/`END_TIME` (the two crates cannot share a private const: `beam_rt`
+//! depends on this crate, not the other way round — see the Handoffs note in the
+//! crate `CONTEXT.md`).
+//!
+//! # The other clocks
+//!
 //! * `system_time/0` reads [`SystemTime`] — **nanoseconds since the UNIX epoch**
 //!   (`1970-01-01T00:00:00Z`), the oracle's meaning.
 //! * `time_offset/0` is the offset for which
 //!   `system_time = monotonic_time + time_offset` (the invariant the oracle
-//!   exhibits), i.e. `system_time(native) - monotonic_time(native)`. Its value is
-//!   arbitrary in M1 because the monotonic origin is, but the *relationship* is
-//!   reproduced faithfully.
+//!   exhibits), i.e. `system_time(native) - monotonic_time(native)`. With the ERTS
+//!   epoch on both sides it is the oracle's own ~74-year constant (probe:
+//!   `erlang:time_offset()` ⇒ `2368668745638096205` ns), and it tracks the system
+//!   clock as the two halves advance together.
 //! * `timestamp/0` splits `system_time/0` into `{MegaSecs, Secs, MicroSecs}`
 //!   exactly as `make_timestamp_value` does (`erl_time_sup.c:1907`).
 //!
@@ -89,12 +112,15 @@
 //! the module-local `int_from_i128`, which folds a value that fits back into a
 //! small integer through [`crate::arith::int_from_i64`] and promotes otherwise.
 //! The coarser units (`second`/`millisecond`/`microsecond`) stay small in
-//! practice, while a coarse **integer** unit conversely promotes
-//! (`system_time(1 bsl 58)`), and `monotonic_time/1` is a process-relative, hence
-//! small, value.
+//! practice, and so do the monotonic readings of the whole/near-by units
+//! (`native`/`nanosecond`: the epoch's external origin is a 60-bit small and a
+//! VM would have to run ~36 years for `start_time + elapsed` to leave the small
+//! range), while a coarse **integer** unit conversely promotes to a *negative*
+//! bignum (`system_time(1 bsl 58)`, `monotonic_time(1 bsl 58)`).
 //!
-//! [`BeamError::SystemLimit`] remains only for a clock before 1970 or a
-//! nanosecond count past `i64` (year ~2262) — never a truncated value.
+//! [`BeamError::SystemLimit`] remains only for a clock before 1970, a nanosecond
+//! count past `i64` (year ~2262), or a `time_offset` that would not fit `i64`
+//! (year ~2243 on this epoch) — never a truncated or wrapped value.
 //!
 //! # `unique_integer`
 //!
@@ -458,22 +484,67 @@ pub(crate) fn int_from_i128(ctx: &mut BifContext<'_>, value: i128) -> Result<Ete
     arith::int_from_mag(ctx, value < 0, &limbs)
 }
 
-/// The process-global monotonic clock; its origin is the first call.
+/// `ERTS_MONOTONIC_TIME_UNIT` (`erl_time.h:282-283`): the compile-time monotonic
+/// time unit of the 64-bit Unix build, one **nanosecond** per tick
+/// (`erl_unix_sys.h:193-198`) — the native unit this module is fixed to.
+const MONOTONIC_TIME_UNIT: i64 = 1_000_000_000;
+
+/// `MIN_SMALL` (`erl_term.h:269-270`): the most negative 60-bit small integer,
+/// `-(1 << 59)`. Taken from the frozen term crate rather than restated, so the
+/// epoch below cannot drift from the small-integer representation.
+const MIN_SMALL: i64 = beam_term::MIN_SMALL;
+
+/// `ERTS_MONOTONIC_TIME_START_EXTERNAL` (`erl_time.h:312-323`): the external
+/// origin of ERTS monotonic time, i.e. the value `erlang:monotonic_time/0`
+/// reports at the instant the VM starts. `(MIN_SMALL / UNIT) * UNIT` with the C's
+/// **truncating** division, which is why it is `MIN_SMALL`'s own unit multiple
+/// (`erl_time.h:286-288`) — `-576_460_752_000_000_000` on this build (the same
+/// constant `beam_rt` answers for `erlang:system_info(start_time)`).
+const MONOTONIC_TIME_START_EXTERNAL: i64 =
+    (MIN_SMALL / MONOTONIC_TIME_UNIT) * MONOTONIC_TIME_UNIT;
+
+// The C's own invariant, checked when this module compiles: the epoch *need* be a
+// multiple of `ERTS_MONOTONIC_TIME_UNIT` (`erl_time.h:286-288`), and every reading
+// must stay `> MIN_SMALL` (a small integer) at the instant the VM starts.
+const _: () = assert!(MONOTONIC_TIME_START_EXTERNAL % MONOTONIC_TIME_UNIT == 0);
+const _: () = assert!(MONOTONIC_TIME_START_EXTERNAL > MIN_SMALL);
+
+/// The process-global monotonic clock that measures **elapsed** time: the
+/// [`Instant`] captured on first use.
+///
+/// This instant is an implementation detail, not what a caller sees — the elapsed
+/// count it produces is reported on the ERTS monotonic epoch by
+/// [`monotonic_native`].
 fn monotonic_start() -> &'static Instant {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now)
 }
 
-/// The monotonic clock in native units (nanoseconds since process start).
+/// `erlang:monotonic_time/0`'s value in native units: the **ERTS monotonic
+/// epoch**, `ERTS_MONOTONIC_TIME_START_EXTERNAL + elapsed` (nanoseconds).
 ///
-/// Non-negative and non-decreasing. A nanosecond count only overflows `i64`
-/// after ~292 years of uptime, so the saturation below is unreachable in practice
-/// and keeps the value monotonic regardless.
+/// The origin is the compile-time [`MONOTONIC_TIME_START_EXTERNAL`] (`-576460752e9`,
+/// what `erlang:system_info(start_time)` answers), so the reading is a large
+/// **negative** integer that grows toward zero as the VM runs — exactly the shape
+/// the oracle reports (probe, OTP 29.1.1/erts-17.1: `erlang:monotonic_time()` ⇒
+/// `-576460751768187266`, `erlang:monotonic_time(second)` ⇒ `-576460752`). It is
+/// non-decreasing, and every value is `> system_info(start_time)`.
+///
+/// The addition is `saturating_add` for two independent reasons: the elapsed count
+/// is itself saturated at `i64::MAX` (reachable only after ~292 years of uptime),
+/// and the epoch constant is negative, so no wrap can ever turn a monotonic clock
+/// into a decreasing one — an unreachable saturation is still better than a
+/// wrapping reading.
+///
+/// The result fits a 60-bit small integer for the first ~36 years of a VM's life
+/// (`START_EXTERNAL` is a small, and the small range ends `1.15e18` ns above it);
+/// past that `arith::int_from_i64` promotes it to a bignum, as the C's
+/// `make_time_val` does (`erl_time_sup.c:2133-2146`).
 fn monotonic_native() -> i64 {
     let elapsed = monotonic_start().elapsed();
-    i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
+    let elapsed = i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX);
+    MONOTONIC_TIME_START_EXTERNAL.saturating_add(elapsed)
 }
-
 /// `system_time` in native units: nanoseconds since the UNIX epoch.
 ///
 /// # Errors
@@ -509,16 +580,37 @@ fn system_time_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     convert_unit(ctx, system_native()?, &unit)
 }
 
+/// The `system_time - monotonic_time` offset in native units — the value
+/// `erlang:time_offset/0,1` reports.
+///
+/// With the ERTS monotonic epoch the monotonic reading is a large **negative**
+/// integer, so this difference is `system_time + |monotonic_time|` — the oracle's
+/// own ~74-year constant (probe: `erlang:time_offset()` ⇒
+/// `2368668745638096205` ns against a system time of `1792207993869922845` ns).
+///
+/// # Errors
+///
+/// [`BeamError::SystemLimit`] from [`system_native`], and for a difference past
+/// `i64` — a system clock later than ~year 2243 on this epoch, i.e. the same class
+/// of "past `i64`" refusal `system_time/0` reports ~19 years further on. Checked
+/// rather than wrapped, so an unrepresentable offset is a typed error and never a
+/// silently wrong constant.
+fn time_offset_native() -> Result<i64> {
+    system_native()?
+        .checked_sub(monotonic_native())
+        .ok_or(BeamError::SystemLimit)
+}
+
 /// `erlang:time_offset/0` — `system_time - monotonic_time` in native units.
 fn time_offset_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    let offset = system_native()? - monotonic_native();
+    let offset = time_offset_native()?;
     arith::int_from_i64(ctx, offset)
 }
 
 /// `erlang:time_offset/1` — the `system_time - monotonic_time` offset, in `unit`.
 fn time_offset_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unit = time_unit(ctx, args[0])?;
-    let offset = system_native()? - monotonic_native();
+    let offset = time_offset_native()?;
     convert_unit(ctx, offset, &unit)
 }
 
@@ -716,18 +808,58 @@ pub(crate) fn register(reg: &mut BifRegistry) {
         Heap::new(256).expect("test heap")
     }
 
+    /// `ERTS_MONOTONIC_TIME_START_EXTERNAL` — the value
+    /// `erlang:system_info(start_time)` answers (probe: `-576460752000000000`).
+    const ERTS_START: i64 = MONOTONIC_TIME_START_EXTERNAL;
+
+    /// `ERTS_MONOTONIC_TIME_END_EXTERNAL` — the value `erlang:system_info(end_time)`
+    /// answers (probe: OTP 29.1.1 / erts-17.1 ⇒ `8646911283000000000`). The mirror of
+    /// `beam_rt`'s `START_TIME`/`END_TIME`, derived from the same C macros here so the
+    /// crate owns no second hand-written copy of the numbers.
+    const ERTS_END: i64 = ERTS_START
+        + ((i64::MAX / MONOTONIC_TIME_UNIT) * MONOTONIC_TIME_UNIT - MONOTONIC_TIME_UNIT);
+
     #[test]
-    fn monotonic_time_is_non_negative_and_non_decreasing() {
+    fn the_epoch_constants_are_the_erts_interface_values() {
+        // The C `ERTS_MONOTONIC_TIME_START_EXTERNAL`/`_END_EXTERNAL` of the 64-bit Unix
+        // build, cross-checked against `erlang:system_info(start_time|end_time)` on OTP
+        // 29.1.1 / erts-17.1 (`-576460752000000000 8646911283000000000`).
+        assert_eq!(ERTS_START, -576_460_752_000_000_000);
+        assert_eq!(ERTS_END, 8_646_911_283_000_000_000);
+        assert!(ERTS_START < 0 && ERTS_START > beam_term::MIN_SMALL);
+        assert!(ERTS_END > beam_term::MAX_SMALL, "end_time is a bignum");
+    }
+
+    /// `monotonic_time/0` sits **inside the ERTS monotonic epoch**: above
+    /// `system_info(start_time)` and below `system_info(end_time)` — so it is a large
+    /// *negative* small integer just after a VM starts (probe:
+    /// `erlang:monotonic_time()` ⇒ `-576460751768187266`), and it never decreases.
+    #[test]
+    fn monotonic_time_is_inside_the_erts_epoch_and_non_decreasing() {
         let mut heap = heap();
         let atoms = seeded_atoms();
         let mut ctx = context(&mut heap, &atoms);
 
         let a = as_int(monotonic_time_0(&mut ctx, &[]).expect("monotonic_time/0"));
         let b = as_int(monotonic_time_0(&mut ctx, &[]).expect("monotonic_time/0"));
-        assert!(a >= 0, "monotonic_time/0 must not be negative: {a}");
+        assert!(a > ERTS_START, "monotonic_time/0 {a} must be above start_time {ERTS_START}");
+        assert!(a < ERTS_END, "monotonic_time/0 {a} must be below end_time {ERTS_END}");
         assert!(b >= a, "monotonic_time/0 decreased: {a} then {b}");
+        // Negative by design: the epoch origin is `start_time`, so a reading only
+        // turns non-negative after ~18 years of uptime.
+        assert!(a < 0, "monotonic_time/0 must be negative on the ERTS epoch: {a}");
+        // The elapsed half is this run's own uptime — seconds at most, never the
+        // ~36 years the small-integer headroom allows.
+        let elapsed = a - ERTS_START;
+        assert!(
+            (0..1_000_000_000_000).contains(&elapsed),
+            "monotonic_time/0 is {elapsed} ns into the epoch — not a plausible uptime"
+        );
     }
 
+    /// `monotonic_time(millisecond)` is the **floor** of the bracketing native
+    /// readings. The epoch makes every reading negative, where `/` truncates toward
+    /// zero and would be off by one — `div_euclid` is the ERTS rounding.
     #[test]
     fn monotonic_millisecond_tracks_nanoseconds() {
         let mut heap = heap();
@@ -741,16 +873,115 @@ pub(crate) fn register(reg: &mut BifRegistry) {
         let ms = as_int(monotonic_time_1(&mut ctx, &[millisecond]).expect("ms"));
         let hi = as_int(monotonic_time_1(&mut ctx, &[nanosecond]).expect("ns"));
 
-        // Every reading lies in the [lo, hi] bracket, and the conversion floors.
+        assert!(lo <= hi, "the native clock went backwards: {lo} then {hi}");
+        // Every reading lies in the floored [lo, hi] bracket.
         assert!(
-            lo / 1_000_000 <= ms && ms <= hi / 1_000_000,
+            lo.div_euclid(1_000_000) <= ms && ms <= hi.div_euclid(1_000_000),
             "monotonic_time(millisecond) = {ms} not within [{}, {}]",
-            lo / 1_000_000,
-            hi / 1_000_000
+            lo.div_euclid(1_000_000),
+            hi.div_euclid(1_000_000)
         );
+        // ... and truncation is *observably* wrong on this epoch, which is what makes
+        // the `div_euclid` above load-bearing rather than cosmetic: a reading half a
+        // millisecond below a whole millisecond is `-1` ms, not `0`.
+        let sub_millisecond = -500_000_i64;
+        assert_eq!(sub_millisecond.div_euclid(1_000_000), -1);
+        assert_eq!(sub_millisecond / 1_000_000, 0);
+        // The real reading is negative too, so it takes the same branch.
+        assert!(lo < 0 && hi < 0, "the ERTS epoch readings are negative");
     }
 
-    /// Every accepted unit spelling names its exact ratio, and the conversion is
+    /// `/1` consistency, driven through the **registry**: `monotonic_time(U)` is
+    /// `erlang:convert_time_unit(monotonic_time(), native, U)` for every accepted
+    /// unit — the atom set plus a positive integer unit (`1000` ⇒ milliseconds).
+    ///
+    /// The two forms are separate clock reads, so the pin brackets the `/1` reading
+    /// with two native ones and requires the registered `/3` conversion of both to
+    /// enclose it: a `/1` that were scaled or rounded differently (truncation instead
+    /// of the floor on this now-negative epoch, say) leaves the bracket.
+    #[test]
+    fn monotonic_time_1_agrees_with_the_registered_convert_time_unit() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut registry = BifRegistry::new();
+        register(&mut registry);
+        let mut ctx = context(&mut heap, &atoms);
+
+        let native = ctx.atom("native").expect("seeded");
+        let thousand = ctx.int(1000).expect("fits");
+        let units = [
+            ("second", ctx.atom("second").expect("seeded")),
+            ("millisecond", ctx.atom("millisecond").expect("seeded")),
+            ("microsecond", ctx.atom("microsecond").expect("seeded")),
+            ("nanosecond", ctx.atom("nanosecond").expect("seeded")),
+            ("native", native),
+            ("perf_counter", ctx.atom("perf_counter").expect("seeded")),
+            ("1000", thousand),
+        ];
+        for (label, unit) in units {
+            let lo = monotonic_time_0(&mut ctx, &[]).expect("monotonic_time/0");
+            let value = monotonic_time_1(&mut ctx, &[unit]).expect("monotonic_time/1");
+            let hi = monotonic_time_0(&mut ctx, &[]).expect("monotonic_time/0");
+            let converted = |ctx: &mut BifContext<'_>, time: Eterm| {
+                decimal(
+                    registry
+                        .call("erlang", "convert_time_unit", 3, ctx, &[time, native, unit])
+                        .expect("erlang:convert_time_unit/3"),
+                )
+                .parse::<i128>()
+                .expect("an i128-sized conversion")
+            };
+            let (converted_lo, value, converted_hi) = (
+                converted(&mut ctx, lo),
+                decimal(value).parse::<i128>().expect("an i128-sized reading"),
+                converted(&mut ctx, hi),
+            );
+            assert!(
+                converted_lo <= value && value <= converted_hi,
+                "monotonic_time({label}) = {value} is outside \
+                 convert_time_unit({}, native, {label}) = [{converted_lo}, {converted_hi}]",
+                decimal(lo)
+            );
+        }
+    }
+
+    /// The ERTS epoch keeps the oracle's `system_time() = monotonic_time() +
+    /// time_offset()` invariant **and** puts the epoch magnitude into the offset:
+    /// `time_offset() - system_time()` is `|start_time|` less this VM's uptime
+    /// (probe: `1792207993869922845 + 576460752000000000 ≈ 2368668745…`).
+    ///
+    /// Both values are bignums on this epoch, so they are compared as `f64` — its
+    /// granularity at ~2.4e18 is a few hundred nanoseconds, far below the tolerances
+    /// the read skew between the four clock calls forces.
+    #[test]
+    fn the_offset_carries_the_erts_epoch() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        let mono1 = as_number(monotonic_time_0(&mut ctx, &[]).expect("monotonic_time/0"));
+        let sys = as_number(system_time_0(&mut ctx, &[]).expect("system_time/0"));
+        let off = as_number(time_offset_0(&mut ctx, &[]).expect("time_offset/0"));
+        let mono2 = as_number(monotonic_time_0(&mut ctx, &[]).expect("monotonic_time/0"));
+
+        // The reads happen microseconds apart; the bracket measures how far apart, and
+        // one millisecond of slack covers a preemption between two BIF calls.
+        let span = (mono2 - mono1).max(0.0) + 1.0e6;
+        assert!(
+            (off - (sys - mono1)).abs() <= span && (off - (sys - mono2)).abs() <= span,
+            "system_time ({sys}) is not monotonic_time + time_offset ({off}) \
+             within the {span} ns the reads span"
+        );
+        // The epoch itself: `off - sys` is `|start_time|` minus the uptime (a
+        // sub-second value here), so an offset measured from *zero* would be off by
+        // the whole `-576460752e9`.
+        let epoch = -ERTS_START as f64;
+        assert!(
+            (off - sys - epoch).abs() <= span + 1.0e9,
+            "time_offset - system_time = {} is not the ERTS epoch {epoch}",
+            off - sys
+        );
+    }    /// Every accepted unit spelling names its exact ratio, and the conversion is
     /// `native * per_second div 1_000_000_000` flooring toward negative infinity
     /// (the `erlang:convert_time_unit/3` rounding, pinned against the oracle:
     /// `convert_time_unit(-1500000000, nanosecond, second)` => `-2`).
@@ -862,7 +1093,15 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 
         for (arg, ns_per_unit) in aliases {
             let mono = as_number(monotonic_time_1(&mut ctx, &[arg]).expect("monotonic_time/1"));
-            assert!(mono >= 0.0, "monotonic_time/1 must not be negative: {mono}");
+            // The monotonic epoch is negative, and every reading lies between
+            // `system_info(start_time)` and `(end_time)` expressed in the same unit
+            // (both constants are exact multiples of any whole-second unit).
+            let epoch_start = ERTS_START as f64 / ns_per_unit;
+            let epoch_end = ERTS_END as f64 / ns_per_unit;
+            assert!(
+                mono >= epoch_start && mono < epoch_end,
+                "monotonic_time/1 ({mono}) is outside the ERTS epoch [{epoch_start}, {epoch_end})"
+            );
 
             let sys = as_number(system_time_1(&mut ctx, &[arg]).expect("system_time/1"));
             assert!(sys > 0.0, "system_time/1 must be positive: {sys}");
@@ -917,15 +1156,17 @@ pub(crate) fn register(reg: &mut BifRegistry) {
             (perf_counter, 1),
         ];
         for (unit, ns_per_unit) in cases {
-            // Bracket the reading between two nanosecond readings.
+            // Bracket the reading between two nanosecond readings. The monotonic
+            // epoch is negative, so the bracket must **floor** (`div_euclid`), not
+            // truncate toward zero, exactly as `convert_time_unit/3` does.
             let lo = as_int(monotonic_time_1(&mut ctx, &[nanosecond]).expect("ns"));
             let value = as_int(monotonic_time_1(&mut ctx, &[unit]).expect("unit"));
             let hi = as_int(monotonic_time_1(&mut ctx, &[nanosecond]).expect("ns"));
             assert!(
-                lo / ns_per_unit <= value && value <= hi / ns_per_unit,
+                lo.div_euclid(ns_per_unit) <= value && value <= hi.div_euclid(ns_per_unit),
                 "a reading of {value} is outside [{}, {}]",
-                lo / ns_per_unit,
-                hi / ns_per_unit
+                lo.div_euclid(ns_per_unit),
+                hi.div_euclid(ns_per_unit)
             );
         }
     }
@@ -1193,7 +1434,8 @@ pub(crate) fn register(reg: &mut BifRegistry) {
         );
 
         // `time_offset/0` is `system_time - monotonic_time`, so it is the same
-        // scale and likewise a bignum.
+        // scale and likewise a bignum — and, on the ERTS epoch, it exceeds the
+        // system time by the whole `|start_time|` (less this VM's uptime).
         let offset = time_offset_0(&mut ctx, &[]).expect("time_offset/0");
         assert!(
             !crate::access::is_small(offset),
@@ -1201,8 +1443,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
         );
         let offset_value = crate::arith::integer_to_f64(offset).expect("round-trips to f64");
         assert!(
-            (offset_value - value).abs() < 1.0e18,
-            "time_offset/0 = {offset_value} is not within a process-lifetime of {value}"
+            (offset_value - value - (-ERTS_START as f64)).abs() < 1.0e9,
+            "time_offset/0 = {offset_value} is not {value} plus the epoch {}",
+            -ERTS_START
         );
     }
 

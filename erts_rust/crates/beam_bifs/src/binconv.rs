@@ -90,8 +90,9 @@
 //!
 //! # The `term_to_binary/2` options
 //!
-//! * **`compressed`/`{compressed, Level}`.** The term is encoded as a *body* (no
-//!   version byte) and deflated; the compressed wrapper
+//! * **`compressed`/`{compressed, Level}`.** The term is encoded as an *image*
+//!   (version byte first) whose **body** — the image minus that byte — is deflated;
+//!   the compressed wrapper
 //!   `[131][80][body_len:4 BE][zlib]` is emitted **only** when the zlib stream fits
 //!   the C's `real_size - 5` budget, otherwise the plain uncompressed image is
 //!   returned (`external.c:2250-2301`). That is why
@@ -259,10 +260,44 @@ fn uint_arg(term: Eterm) -> Result<usize> {
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for anything that is not
 /// a binary (including a non-byte-aligned bitstring) — the oracle's
 /// `is_not_bitstring`/`TAIL_BITS` rejections.
+///
+/// # Why this copies (measured, deliberately not "optimised")
+///
+/// This is the one **payload-proportional** allocation left on the
+/// `binary_to_term`/`binary_to_list`/`binary_to_atom`/`integer_from_binary` path: the
+/// whole input image is copied into a fresh `Vec` before the codec sees it
+/// (`tests/binconv_alloc.rs` measures 1 allocation / 4102 bytes for a 4 KiB image, and
+/// 101 of the 285 bytes the five-key map's decode allocates).
+///
+/// It stays a copy because a **borrowing** accessor cannot be written inside this
+/// crate's safe-Rust boundary:
+///
+/// * The only route to a term's payload bytes is
+///   [`beam_term::bitstring::bitstring_parts`] — an `unsafe` raw-pointer API. An
+///   `Eterm` is a bare machine word, so the returned `*const u8` carries no lifetime
+///   tied to the term; producing `&[u8]` from it needs an unchecked lifetime
+///   extension, which is exactly the kind of `unsafe` that `binconv.rs`/`bits.rs` must
+///   not carry (`src/access.rs` is the crate's only sanctioned `unsafe` module, and
+///   even there the lifetime would be unprovable, not merely unwritten).
+/// * The bytes may also live in an **off-heap refc binary**, whose payload is
+///   refcounted and released by the runtime's `beam_gc::OffHeap` sweep — the term does
+///   not express that ownership as a Rust lifetime, so a borrowed slice could outlive
+///   it in principle.
+/// * Two borrow hazards would have to be excluded at *every* call site: the decoder
+///   writes the result onto [`BifContext::heap`] **while** reading the source bytes
+///   (a bump arena that never reallocates, so the write cannot move them — but the
+///   aliasing is only sound because the two are distinct arenas, which a `&[u8]`
+///   derived from a raw pointer would not record), and several sites
+///   (`binary_to_list/3`, `binary_part/3`) return a term built from a *slice* of the
+///   buffer.
+///
+/// Closing this needs a new borrowing accessor in `src/access.rs` (owner: the crate
+/// root, not this module) with the slice's scope bounded by a closure rather than
+/// returned. The measurable saving would be exactly the numbers above: one
+/// allocation, `image.len()` bytes, per decode.
 fn bytes_arg(term: Eterm) -> Result<Vec<u8>> {
     bits::bytes(term)
 }
-
 /// A binary of `bytes` built on the context heap.
 ///
 /// # Errors
@@ -852,8 +887,9 @@ fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> 
             // writes the `LOCAL_EXT` prologue into the buffer it compresses
             // (`erts_term_to_binary_simple`, `external.c:2265-2298`): the image is
             // `[VERSION_MAGIC][COMPRESSED_EXT][local_body_len:4 BE][zlib local body]`,
-            // reverting to the plain `[local]` image when compression does not help.
-            Some(level) => compressed_image(&image[1..], level),
+            // reverting to the plain `[local]` image when compression does not help
+            // (handed back as the very buffer it was given, not a copy).
+            Some(level) => compressed_image(image, level),
         };
     }
     // `deterministic` is threaded into the encoder itself (`DFLAG_DETERMINISTIC`
@@ -862,18 +898,20 @@ fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> 
     // rather than refused (see [`encode_body`]).
     match options.compression {
         None => plain_image_of(ctx, term, options),
-        Some(level) => compressed_image(&encode_body(ctx, term, options)?, level),
+        Some(level) => compressed_image(encode_body(ctx, term, options)?, level),
     }
 }
 
-/// The **uncompressed** external image of `term` under `options`: the version byte
-/// followed by [`encode_body`]'s bytes — or, for the `local` option, the
+/// The **uncompressed** external image of `term` under `options`: [`encode_body`]'s
+/// bytes — which already begin with the version byte — or, for the `local` option, the
 /// `LOCAL_EXT`-wrapped image `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]` (see
 /// [`encode_image`]; the hash comes from [`BifContext::local_node_hash`], and with no
 /// seam installed `[local]` is the typed `unsupported_bif` gap).
 ///
 /// This is the image `erlang:term_to_binary/1` produces, and the one
-/// `erlang:external_size/1,2` ([`crate::term_conv`]) sizes.
+/// `erlang:external_size/1,2` ([`crate::term_conv`]) sizes — `external_size` only reads
+/// the length, which costs nothing extra because the image is the encoder's own buffer
+/// (see [`encode_body`]) rather than a copy of it.
 ///
 /// The oracle's `external_size_2` (`external.c:2221-2246`) validates the whole option
 /// list — `compressed`/`{compressed, Level}` included — but passes only the *flags*
@@ -901,17 +939,23 @@ pub(crate) fn plain_image_of(
         let hash = ctx.local_node_hash().ok_or_else(unsupported_bif)?;
         return Ok(term_encoder(ctx, term, options)?.finish_local(hash));
     }
-    Ok(plain_image(&encode_body(ctx, term, options)?))
+    encode_body(ctx, term, options)
 }
-
-/// Encodes `term` as a **body** — the term with no version byte — under the tag set
-/// `options.minor_version` selects.
+/// Encodes `term` as the whole `term_to_binary` image: the version byte `131`
+/// followed by the term's body, under the tag set `options.minor_version` selects.
 ///
 /// Shared by `term_to_binary/1,2` (via [`encode_image`]) and by
 /// `erlang:external_size/1,2` (via [`plain_image_of`]), so both BIFs agree on the tag
 /// set and on what is encodable. It is [`term_encoder`] plus [`Encoder::finish`]; the
 /// `local` option's `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE]` prologue is added by
 /// [`Encoder::finish_local`] in [`encode_image`]/[`plain_image_of`], not here.
+///
+/// **The image is the encoder's own buffer, not a copy.** [`term_encoder`] builds an
+/// [`Encoder::new`] (which writes `VERSION_MAGIC` into the writer *before* the body)
+/// and [`Encoder::finish`] moves that buffer out, so one encode allocates the writer
+/// and nothing else — there is no `[push(VERSION_MAGIC)] + extend(body)` second
+/// `Vec` and no `Vec::insert(0, …)` memmove of the body
+/// (`tests/binconv_alloc.rs` pins it).
 ///
 /// The three `{minor_version, N}` flavours are [`MinorVersion`]'s (`external.c:1499-1514`:
 /// `DFLAG_UTF8_ATOMS` and `DFLAG_NEW_FLOATS`); the codec owns the tag selection, so an
@@ -935,12 +979,17 @@ pub(crate) fn encode_body(
 ) -> Result<Vec<u8>> {
     Ok(term_encoder(ctx, term, options)?.finish())
 }
-
 /// Builds the term encoder for `term` under `options`, over `ctx`'s atom table.
 ///
 /// Factored out of [`encode_body`] so the `local` path can consume the encoder through
 /// [`Encoder::finish_local`] (the `LOCAL_EXT` wrapper) instead of [`Encoder::finish`]
-/// (the plain body).
+/// (the plain image).
+///
+/// It is an [`Encoder::new`], not an [`Encoder::new_body`]: the codec writes
+/// `VERSION_MAGIC` into its writer *before* the term body, so [`Encoder::finish`]
+/// already **is** the whole `[131][body]` image. Adding the version byte afterwards
+/// would mean a second image-sized `Vec` (or an `O(n)` memmove), which is the one
+/// allocation this shape exists to avoid — the bytes are identical either way.
 ///
 /// The context's local node identity, its `local` node hash and the local-fun identity
 /// all borrow `ctx` mutably, while the encoder holds an immutable borrow of `ctx`'s
@@ -971,14 +1020,15 @@ fn term_encoder<'c>(
 ) -> Result<Encoder<'c>> {
     let local = ctx.local_node();
     let identity = ctx.local_fun_identity(term)?;
-    // The body carries no version byte; `Encoder::new_body` plus the selected
-    // minor version reproduces `term_to_binary`'s tag set exactly.
+    // `Encoder::new` writes the version byte into the writer first, so finishing the
+    // encoder yields the whole image (see this function's docs); the selected minor
+    // version reproduces `term_to_binary`'s tag set exactly.
     let minor_version = match options.minor_version {
         0 => MinorVersion::V0,
         1 => MinorVersion::V1,
         _ => MinorVersion::V2,
     };
-    let mut encoder = Encoder::new_body(ctx.atoms()).with_minor_version(minor_version);
+    let mut encoder = Encoder::new(ctx.atoms()).with_minor_version(minor_version);
     if options.deterministic {
         encoder = encoder.with_deterministic();
     }
@@ -995,27 +1045,34 @@ fn term_encoder<'c>(
     encoder.encode(term)?;
     Ok(encoder)
 }
-/// The plain image: the version byte followed by the body.
-fn plain_image(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 1);
-    out.push(VERSION_MAGIC);
-    out.extend_from_slice(body);
-    out
-}
-
 /// The C's compressed-or-revert rule (`external.c:2250-2301`).
 ///
-/// The body is deflated at `level`; the `[131][80][body_len:4 BE][zlib]` image is
-/// emitted only when the stream fits the `body_len - 5` budget, otherwise the plain
-/// image is returned (which is what happens for every small body — zlib's own
-/// framing costs more than the body saves).
+/// Takes the **uncompressed image** `[VERSION_MAGIC][body]` by value (the encoder's own
+/// buffer — see [`encode_body`]) and deflates its body at `level`: the
+/// `[131][80][body_len:4 BE][zlib]` image is emitted only when the stream fits the
+/// `body_len - 5` budget, otherwise the image it was given is handed straight back —
+/// the same bytes, with **no** copy and no second image-sized allocation (which is what
+/// happens for every small body, zlib's own framing costing more than the body saves).
+///
+/// The `local` caller passes its `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]` image:
+/// the C deflates that whole wrapper (`external.c:2265-2298`), i.e. exactly "the image
+/// minus its version byte", which is what the slice below is.
 ///
 /// # Errors
 ///
 /// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) for a body that
 /// does not fit the 4-byte size field (unreachable in practice: the term would have
 /// to be larger than 4 GiB).
-fn compressed_image(body: &[u8], level: u8) -> Result<Vec<u8>> {
+fn compressed_image(image: Vec<u8>, level: u8) -> Result<Vec<u8>> {
+    // Every caller builds the image through `term_encoder`/`finish_local`, both of which
+    // begin with `VERSION_MAGIC`; a missing one would silently deflate a body that
+    // still carries its version byte.
+    debug_assert_eq!(
+        image.first().copied(),
+        Some(VERSION_MAGIC),
+        "a compressed body is the image minus its version byte"
+    );
+    let body = &image[1..];
     if body.len() >= COMPRESSED_OVERHEAD {
         if let Ok(deflated) = zlib_compress(body, level) {
             if deflated.len() <= body.len() - COMPRESSED_OVERHEAD {
@@ -1029,9 +1086,8 @@ fn compressed_image(body: &[u8], level: u8) -> Result<Vec<u8>> {
             }
         }
     }
-    Ok(plain_image(body))
+    Ok(image)
 }
-
 /// `binary_to_term(Binary)` — trailing bytes are ignored.
 fn binary_to_term_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     decode_term_bif(ctx, args[0], false, false)

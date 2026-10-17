@@ -39,7 +39,7 @@
 //! | [`DictHook`] | [`DICT_HOOK_BIFS`] | 7 |
 //! | [`ProcessHook`] | [`PROCESS_HOOK_BIFS`] | 11 |
 //! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 4 |
-//! | [`SendHook`] | [`SEND_HOOK_BIFS`] | 3 |
+//! | [`SendHook`] | [`SEND_HOOK_BIFS`] | 4 |
 //! | [`NifLoader`] | [`NIF_LOADER_BIFS`] | 1 |
 //! | [`RecordSource`] | [`RECORD_SOURCE_BIFS`] | 1 |
 //! | [`ModuleInfo`] | [`MODULE_INFO_BIFS`] | 2 |
@@ -203,15 +203,26 @@ pub const PORT_HOOK_BIFS: &[(&str, &str, u32)] = &[
 
 /// The registered BIFs that read the [`SendHook`] seam — `erlang:send/2`, its quoted
 /// alias `erlang:'!'/2` and the options-aware `erlang:send/3`, all three the `src/proc.rs`
-/// implementations (`send/2` and `"!"/2` are the *same* `BifFn`).
+/// implementations (`send/2` and `"!"/2` are the *same* `BifFn`), plus the
+/// ownership-transfer `ets:give_away/3`.
 ///
-/// `erlang:self/0` shares the module but reads only the injected
+/// `ets:give_away(Tab, Pid, GiftData)` (`src/ets/adopt.rs`'s `give_away_3`) moves the
+/// table to `Pid` **and** delivers `{'ETS-TRANSFER', Tid, FromPid, GiftData}` to the
+/// new owner; the delivery is that BIF's own obligation, so it goes through
+/// [`BifContext::sender`](crate::context::BifContext::sender) →
+/// [`SendHook::send`](crate::context::SendHook::send) exactly as a send does. With no
+/// hook installed the transfer cannot be announced, so the call is the typed
+/// `unsupported_bif` gap (checked *before* the table is taken, so the table never
+/// moves without its announcement) — which is why the key belongs in this table.
+///
+/// `erlang:self/0` shares the `src/proc.rs` module but reads only the injected
 /// [`BifContext::self_pid`](crate::context::BifContext::self_pid), so it is absent.
 /// Sorted by `(module, function, arity)`; see [`needs_send_hook`].
 pub const SEND_HOOK_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "!", 2),
     ("erlang", "send", 2),
     ("erlang", "send", 3),
+    ("ets", "give_away", 3),
 ];
 
 /// The registered BIFs that read the [`NifLoader`] seam — `erlang:load_nif/2`, the
@@ -853,11 +864,18 @@ mod tests {
     }
 
     #[test]
-    fn send_hook_bifs_are_every_send_name() {
-        // `erlang:self/0` shares the module but reads only the injected pid.
+    fn send_hook_bifs_are_every_send_name_plus_give_away() {
+        // `erlang:self/0` shares the module but reads only the injected pid. The
+        // `ets:give_away/3` arm is the ownership transfer's `{'ETS-TRANSFER', …}`
+        // delivery, which is the BIF's own obligation through the same seam.
         assert_eq!(
             SEND_HOOK_BIFS,
-            &[("erlang", "!", 2), ("erlang", "send", 2), ("erlang", "send", 3)]
+            &[
+                ("erlang", "!", 2),
+                ("erlang", "send", 2),
+                ("erlang", "send", 3),
+                ("ets", "give_away", 3),
+            ]
         );
     }
 
@@ -1030,7 +1048,8 @@ mod tests {
     ///
     /// This pins the doc's attribution — "the four `src/port.rs` operations",
     /// "`erlang:send/2` and its quoted alias … the same `src/proc.rs`
-    /// implementation", `node/0,1` in `src/convert.rs`, the encoders split across
+    /// implementation" plus the `ets:give_away/3` transfer announcement in
+    /// `src/ets/adopt.rs`, `node/0,1` in `src/convert.rs`, the encoders split across
     /// `src/binconv.rs`/`src/term_conv.rs`, the fun-taking surface across
     /// `src/lists.rs`/`src/maps.rs`/`src/ets/adopt.rs` — and catches a key listed
     /// under the wrong module (a typo, or a BIF that moved).
@@ -1048,7 +1067,11 @@ mod tests {
                 &[crate::binconv::register, crate::term_conv::register],
             ),
             ("PORT_HOOK_BIFS", PORT_HOOK_BIFS, &[crate::port::register]),
-            ("SEND_HOOK_BIFS", SEND_HOOK_BIFS, &[crate::proc::register]),
+            (
+                "SEND_HOOK_BIFS",
+                SEND_HOOK_BIFS,
+                &[crate::ets::register, crate::proc::register],
+            ),
             (
                 "RECORD_SOURCE_BIFS",
                 RECORD_SOURCE_BIFS,
@@ -1213,8 +1236,8 @@ mod tests {
             "the doc's documented-key total must equal the sum over every exported table"
         );
         assert_eq!(
-            aggregate, 244,
-            "the documented seam surface is 244 keys across the 13 tables; a table \
+            aggregate, 245,
+            "the documented seam surface is 245 keys across the 13 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
         );
     }
@@ -1325,10 +1348,14 @@ mod tests {
                 needs_send_hook,
                 "needs_send_hook",
                 &[
-                    ("erlang", "send", 1), // wrong arity
-                    ("erlang", "self", 0), // the same module, but reads only the pid
-                    ("erlang", "!", 1),    // wrong arity
-                    ("maps", "send", 2),   // wrong module
+                    ("erlang", "send", 1),          // wrong arity
+                    ("erlang", "self", 0),          // the same module, but reads only the pid
+                    ("erlang", "!", 1),             // wrong arity
+                    ("maps", "send", 2),            // wrong module
+                    ("ets", "give_away", 2),        // wrong arity
+                    ("ets", "give_away", 4),        // wrong arity
+                    ("ets", "setopts", 2),          // ownership, but announces nothing
+                    ("ets", "give_away_", 3),       // not a registered key
                 ],
             ),
             (
