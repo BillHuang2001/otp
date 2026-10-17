@@ -56,7 +56,13 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 - Every capability gap is a typed `error::unsupported(...)`/`BadArg`/`SystemLimit` — **never** a wrong value.
 
 ## Capability gaps — each a typed `unsupported` (NEVER a wrong value)
-- `records/mod.rs` `fail_step`: `fail == NO_FAIL` ⇒ `unsupported("{instr}/no_fail")`.
+- `records/mod.rs` `fail_step`: `fail == NO_FAIL` ⇒ the shared failed-clause raise
+  (`crate::interpreter::raise_function_clause_no_fail`, the same route `maps/mod.rs` `fail_or_function_clause`
+  takes): class `error` with the bare atom `function_clause` resolved through `machine::namespace_atom`
+  (`ctx.atoms(module)` first, the module's load-time snapshot second). A namespace that can name **neither**
+  yields `unsupported("<instr>: no 'function_clause' atom in the module")` — never a substituted atom index.
+  The raise is uncaught-structured out of the machine (`ExitReason::Structured` + the atom as the raise's
+  live reason term), so a caller reading `as_atom()` sees `None` by design.
 - `records/mod.rs` `local_definition`: a **foreign** `{Module,Name}` record id ⇒ `unsupported`
   ("create: no record definition table for another module"). **The running module's own
   `put_record/6` create form IS implemented** (`create_native_record`) — see the Handoff below.
@@ -88,16 +94,13 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
   (out-of-small-range ⇒ build a bignum).
 
 ## Duplication with sibling crates (audit finding)
-- **`bitstrings/raw.rs` hand-rolls term layout a PUBLIC `beam_term` writer/reader already owns** (reachable,
-  fixable — unlike the map walk below):
-  - `raw.rs` re-declares `const ERL_ONHEAP_BINARY_LIMIT = 64` == `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT` (`beam_term/src/refc.rs:103`).
-  - `raw.rs` `make_bits` mirrors `beam_term::bitstring::write_heap_bits` (`beam_term/src/bitstring.rs:170-198`) —
-    including zeroing the **whole** reserved data region (padding bytes of the last data word included) before
-    the payload copy, matching the LCA invariant.
-  - `raw.rs` `make_ctx` copies `beam_term::bitstring::write_sub_bits` (`bitstring.rs:234-251`, `base_flags = 0`).
-  - `raw.rs` `ctx_parts` copies `beam_term::bitstring::sub_bits_parts` (`bitstring.rs:267-279`); `set_ctx_start` writes word 2 directly (no LCA setter exists).
-  - `raw.rs` `heap_bits` derives the data pointer itself instead of `beam_term::bitstring::bitstring_parts` (`bitstring.rs:299`; used only for the refc case).
-  - **Forwarded (no duplication):** the bignum path (`raw.rs` uses `beam_term::{big_size_words, write_big, big_parts}`) and the refc path (`raw.rs` uses `beam_term::refc::{ERL_REFC_BITS_SIZE, write_refc_binary, is_refc_binary}`).
+- **`bitstrings/raw.rs` FORWARDS the heap-bits/binary layout** to the `beam_term` LCA: the on-heap limit is
+  `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT` (imported, not re-declared), the block is sized by
+  `beam_term::bitstring::heap_bits_size_words` and written by `beam_term::bitstring::write_heap_bits`, and the
+  reads go through `beam_term::bitstring_parts` / `beam_term::bitstring::{sub_bits_parts, write_sub_bits}`.
+  `raw.rs` keeps only the family's own reserve-and-call plumbing (the `*_rooted` builder route) and the
+  unreachable malformed-input guards; `set_ctx_start` writes `ErlSubBits` word 2 directly because the LCA
+  exposes no setter for it.
 - **`../terms/map.rs`** (`hashmap_entries`/`collect_hashmap_node`/`hashmap_node_shape`) re-implements
   HAMT node walking + node-shape decode that `beam_term::map::{map_pairs, map_pairs_storage_order, map_get}`
   (`beam_term/src/map.rs:458,471,518`) already do. It is what `maps/{read,write}.rs` uses for enumeration.
@@ -142,20 +145,8 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
   a `#[cfg(test)]` module. This is a genuinely rigorous result.
 
 ## Known Issues
-- **`records`' `NO_FAIL` fail-arm diverges from `maps`' — OPEN, engine-side, small.** `records/mod.rs:463-475`
-  `fail_step` returns the typed `unsupported("<instruction>/no_fail")` for `NO_FAIL`, while
-  `maps/mod.rs:260-271` `fail_or_function_clause` forwards the same situation to the engine's single
-  failed-clause definition `crate::interpreter::raise_function_clause_no_fail`. C's `$FAIL(0)`
-  (`emu/macros.tab:56`) is an unresolvable self-jump — `NO_FAIL` is only ever emitted where the compiler
-  proved the test cannot fail — so neither choice can be observed from compiler-generated IR; the divergence
-  is a consistency defect (two different answers for one unreachable state), not a wrong value. Fix: route
-  `fail_step`'s `NO_FAIL` arm through `raise_function_clause_no_fail`, which needs `machine`/`module` threaded
-  into `fail_step` from its nine call sites (`records/mod.rs:289,308,399,571,577,607,613,619,623`).
-- **`bitstrings/raw.rs:69` re-declares `const ERL_ONHEAP_BINARY_LIMIT = 64` and hand-rolls the heap-binary
-  layout** instead of forwarding to `beam_term::bitstring` as `records/raw.rs` already forwards to
-  `beam_term::record`. A duplicated frozen constant: if `beam_term`'s limit ever moves, this copy silently
-  disagrees. OPEN, engine-side, small.
 - **`bitstrings` differential-corpus hole (tools-owned).** `bitstrings/CONTEXT.md` records the missing
+  `wire`/bitstring gate cases; the owner is `tools/differential`, not this crate.- **`bitstrings` differential-corpus hole (tools-owned).** `bitstrings/CONTEXT.md` records the missing
   `wire`/bitstring gate cases; the owner is `tools/differential`, not this crate.
 
 ## Handoffs (owned elsewhere — NOT closeable in this node)

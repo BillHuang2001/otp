@@ -99,7 +99,10 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `wait_timeout` at `current_code` (the blocked instruction, exact because a blocking op is never JIT-inlined)
   in the module `active_context()` names — the callee's own module when the park is inside a cross-module
   callee (context != 0), else the passed entry module — and reports the `timeout` continuation (`pc + 1`) a
-  host re-enters when its own timer fires. The engine arms no timer: a non-zero `wait_timeout` just suspends.
+  host re-enters when its own timer fires. `Machine::timeout_delay` accepts every operand shape the compiled
+  `wait_timeout` can carry: an `Integer`/`Literal` delay, an `X`/`Y` register, and an `Operand::Typed { reg, .. }`
+  (the `{tr,..}` typed-register operand, unwrapped to its `X`/`Y` register — the type annotation is a
+  compiler hint, not a heap type). The engine arms no timer: a non-zero `wait_timeout` just suspends.
 - `run.rs` — `run_export`/`run_label` (non-blocking) and `run_export_outcome`/`run_label_outcome`/`resume_outcome`
   (blocking-aware); the **tier-selecting** entries `run_with_tier`/`run_export_outcome_with_tier`/
   `run_label_outcome_with_tier` (first entry) and `resume_outcome_with_tier` (**resume** — a slice that suspended on a
