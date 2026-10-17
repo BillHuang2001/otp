@@ -1011,7 +1011,50 @@ pub(crate) fn loaded_driver_names() -> Vec<String> {
             .collect()
     })
 }
+/// The order the emulator's statically linked drivers appear in the generated `driver_tab.c`
+/// table — the order `erl_ddll:loaded_drivers/0` reports the statics in.
+///
+/// An **ordering key only**: [`static_drivers`] filters it through
+/// [`is_static_driver`] (a name `beam_io` does not know is dropped) and appends any `beam_io` static
+/// it omits, so the membership is always `beam_io`'s ([`beam_io::STATIC_SPAWN_DRIVERS`]).
+const DRIVER_TAB_ORDER: [&str; 3] = ["tcp_inet", "udp_inet", "ram_file_drv"];
 
+/// The emulator's **statically linked** driver names in the C `driver_tab.c` order — the order
+/// `erl_ddll:loaded_drivers/0` reports them in (`tcp_inet`, `udp_inet`, `ram_file_drv`).
+///
+/// The *set* is `beam_io`'s ([`beam_io::STATIC_SPAWN_DRIVERS`], the one source of truth for which
+/// names are emulator drivers — the same set [`is_static_driver`] gates an
+/// `open_port({spawn_driver, Name})` request on); [`DRIVER_TAB_ORDER`] only supplies the
+/// **arrangement**, because the emulator's table order is not derivable from a sorted set. It
+/// follows the generated table: `erts/emulator/Makefile.in`'s `DRV_OBJS` lists `inet_drv.o` (which
+/// declares `tcp_inet` then `udp_inet`) ahead of `ram_file_drv.o`, and `utils/make_driver_tab` emits
+/// the entries in link order.
+///
+/// The arrangement can neither add nor hide a driver: a name `beam_io` does not know is filtered
+/// out, and a `beam_io` static the arrangement omits is appended in `beam_io`'s own order — so this
+/// view and `open_port`'s cannot fork.
+pub(crate) fn static_drivers() -> Vec<&'static str> {
+    let mut ordered: Vec<&'static str> = DRIVER_TAB_ORDER
+        .iter()
+        .copied()
+        .filter(|name| is_static_driver(name))
+        .collect();
+    for name in beam_io::STATIC_SPAWN_DRIVERS {
+        if !ordered.contains(&name) {
+            ordered.push(name);
+        }
+    }
+    ordered
+}
+/// Whether `name` is one of the emulator's **statically linked** drivers — the membership gate an
+/// `open_port({spawn_driver, Name})` request must apply before asking for a factory.
+///
+/// Delegated to [`beam_io::is_static_spawn_driver`], so this crate holds no copy of the set: it is
+/// the same predicate `beam_io`'s [`beam_io::DriverRegistry::create_static_spawn`] applies. A name
+/// outside it — this runtime's internal `fd`/`efile`, or an invented one — is the oracle's `badarg`.
+pub(crate) fn is_static_driver(name: &str) -> bool {
+    beam_io::is_static_spawn_driver(name)
+}
 /// Forgets `name`, answering whether it was loaded (`false` ⇒ the caller reports `not_loaded`).
 ///
 /// A record that owns a `dlopen` handle drops it here (running the driver's `finish` and
