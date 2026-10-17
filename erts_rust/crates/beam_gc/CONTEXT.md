@@ -450,18 +450,23 @@ the section to read them in.
   fullsweep's reclaim cannot fit the nursery's promotion (`grow_major`).
   A growable heap therefore never fails a collectable collection; only a `max_heap_words` ceiling the promotion
   cannot fit returns the typed `heap_exhausted` (before any copy).
-- **A retired nursery space is freed only by a collection.** `Nursery::grow` supersedes the space the mutator was
-  allocating in **without collecting and without moving a term**, so a live term may still name into it; the space
-  therefore stays addressable as a chain link, whatever its occupancy (dropping the provably-empty case would be
-  sound but changes `young_space_count()`, so it is deliberately not done), and only a collapse frees it, because
-  the collection's from-set covers every space and has copied everything reachable out.
-  A growth refuses **only** when the policy/table ceiling lies below the request (`target < need_words`,
-  `src/nursery.rs:285-287`): once the capacity already equals the ceiling, a smaller request installs a **same-size**
-  fresh space and retires the old one — a whole capacity retained per call, nothing reclaimed, and **no error** (the
-  `CAP` test policy builds a 1024-space chain exactly this way, `src/nursery.rs:400-437`).
-  Otherwise growth is bounded only by `max_heap_words` (default `0` = unbounded) and the growth table's last entry
-  (just under `(1<<53)/8` words), so an allocate-and-abandon loop with small requests stays growable indefinitely
-  and never falls through to a refusal.
+- **A retired nursery space is freed only by a collection; a provably empty one is re-adopted instead.**
+  `Nursery::grow` supersedes the space the mutator was allocating in **without collecting and without moving a term**,
+  so a live term may still name into it; the space therefore stays addressable as a chain link (whatever its
+  occupancy) and only a collapse frees it, because the collection's from-set covers every space and has copied
+  everything reachable out.
+  A superseded space that never handed the mutator a word (`used_words() == 0`) is not retained: `grow` **re-adopts**
+  the smallest adequate empty retired space (nothing allocated, no capacity consumed, nothing stranded) and only
+  allocates a fresh space when no empty retired one is large enough.
+  `max_heap_words` bounds the **summed** chain capacity: a fresh space may claim only the budget the chain has left
+  (`max_heap_words - capacity_words()`) and, when that cannot reach the request, `grow` returns the typed
+  `heap_exhausted` **before** allocating or retiring anything — so after every successful growth
+  `capacity_words() <= max_heap_words` and an allocate-and-abandon loop cannot append one ceiling-sized space per
+  call.
+  `max_heap_words == 0` (the default) is "no cap": growth is then bounded only by the growth table's last entry (just
+  under `(1<<53)/8` words), and the doubling rule keeps the chain `O(log(heap))` long by design.
+  A policy whose `initial_young_words` already exceeds `max_heap_words` starts the chain above its ceiling (the
+  caller's explicit configuration), and every growth is then the same typed refusal.
 - **The chain's collection debt is an opt-in seam; `should_collect` stays occupancy-only** (seam semantics: Notes
   for Agents). `Nursery::retains_old_spaces` is exported as `collection_debt() -> bool` on all three collector
   types; `true` means *a collection is required to reclaim the chain — a heap-admission door should treat it like a
