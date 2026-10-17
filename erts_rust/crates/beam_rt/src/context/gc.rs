@@ -308,6 +308,23 @@ pub(crate) enum WordRegion {
 /// that chain is resolved by [`any_root_is_unscanned`], which expands foreign containers to any
 /// depth. This single-term form is the depth-1 answer the per-word root classification uses.
 ///
+/// # A word no live term can be at is inert, and is never read
+///
+/// Both facts above are about **containers**, and the frozen tag tricks cannot tell a container
+/// from a word the runtime never produced: `is_list(0)` and `is_boxed(0)` are both `true`, so
+/// `make_header(0, 0)` — the C ABI's `THE_NON_VALUE` — looks like a cons cell whose pointer is
+/// `NULL`. [`word_region`] therefore rejects an address no term word can name (null or not
+/// word-aligned, [`dereferenceable_pointer`]) **before** anything dereferences it, and such a word
+/// answers `false` here — inert, like an immediate. That is a robustness property, not a
+/// correctness relaxation: no term word has either property, so no live container is skipped, and
+/// the descent in [`crate::context::gc_walk`] inherits the same reject because it classifies
+/// through the same function.
+///
+/// The residual is a **non-null, word-aligned but bogus** pointer (an all-zero garbage slot is
+/// handled, a bare header word that survives the tag tricks is not): whether an aligned address
+/// names a live term cannot be decided without faulting, and the C runtime faults there too. See
+/// [`dereferenceable_pointer`] for the full statement of what this does and does not make safe.
+///
 /// # The scanned test: an aggregate fast reject, then the exact fallback
 ///
 /// "Scanned" is decided in two tiers ([`outside_bounds`]), and the second one exists only to skip
@@ -340,7 +357,8 @@ pub(crate) fn root_is_unscanned_with(
 }
 
 /// Which region `word` points into: `None` for a word no relocation touches (an immediate, a
-/// literal-area pointer), otherwise the side of the scan boundary the container lives on.
+/// literal-area pointer, or a word whose pointer names no address a term can live at —
+/// [`dereferenceable_pointer`]), otherwise the side of the scan boundary the container lives on.
 ///
 /// This is the **one** place the scanned test is applied, so the per-word root classification,
 /// the walk's descent and the foreign-container expansion can never disagree about a word.
@@ -355,7 +373,9 @@ pub(crate) fn word_region(
     if beam_term::literal::is_literal(word) {
         return None;
     }
-    let ptr = beam_term::list::ptr_val(word) as usize;
+    let Some(ptr) = dereferenceable_pointer(word) else {
+        return None;
+    };
     if in_heap_block(process.heap(), ptr) || !outside_bounds(process.collector(), bounds, ptr) {
         Some(WordRegion::Scanned)
     } else {
@@ -417,7 +437,9 @@ pub(crate) fn word_region_exactly(process: &Process, word: Eterm) -> Option<Word
     if !is_pointer_bearing(word) || beam_term::literal::is_literal(word) {
         return None;
     }
-    let ptr = beam_term::list::ptr_val(word) as usize;
+    // The same address guard the production classifier applies ([`dereferenceable_pointer`]), so
+    // the filter-less oracle cannot disagree with it about a word no live term can be at.
+    let ptr = dereferenceable_pointer(word)?;
     if in_heap_block(process.heap(), ptr) || !outside_scanned_exactly(process.collector(), ptr) {
         Some(WordRegion::Scanned)
     } else {
@@ -498,6 +520,44 @@ fn is_pointer_bearing(word: Eterm) -> bool {
     beam_term::prelude::is_boxed(word) || beam_term::prelude::is_list(word)
 }
 
+/// The address `word`'s pointer bits name, or `None` when **no live term can be there** — so the
+/// valve classifies such a word inert (answers `false` from [`root_is_unscanned`]) instead of
+/// reading the object it appears to point at.
+///
+/// # Why: the frozen bit tricks cannot tell a container from the non-value
+///
+/// [`is_pointer_bearing`] is the C's own bit trick, mirrored verbatim, and it is **also true for
+/// words that are not terms**: `is_list(x)` is `(x & (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST)) == 0`
+/// and `is_boxed(x)` is `(x & (TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0`, so **both** answer
+/// `true` for the all-zero word. `make_header(0, 0)` — the C ABI's `THE_NON_VALUE`, which
+/// `beam_term` names with [`beam_term::boxed::is_boxed_term`] — is therefore classified as a
+/// container by the tag test alone, and its pointer is `NULL`. The witness is that very word: a
+/// fixture BIF returning `make_header(0, 0)` (a bare header word) as its "result" used to abort
+/// the whole `beam_rt` lib-test binary with `null pointer dereference occurred` inside
+/// [`forwards_word_matching`], because the pre-rework valve happened to answer `true` for a
+/// list-tagged word without ever reading its two words.
+///
+/// A term word is always **non-null and word-aligned** (`ptr_val` strips the tag bits, so every
+/// pointer it yields is `align_of::<Eterm>()` aligned; a `NULL` address is the one the allocator
+/// never hands out), so rejecting those two cases can never reject a live term — and it costs two
+/// compares against an address the classifier already computed.
+///
+/// # What this does NOT make safe
+///
+/// The residual is any **non-null, word-aligned but bogus** pointer — a garbage slot, or a bare
+/// header word such as `make_header(3, FLOAT_SUBTAG)` that survives the frozen `is_boxed`/
+/// `is_list` tricks with a plausible-looking address. No cheap test can reject those: whether an
+/// aligned address is mapped, let alone a term, is not decidable without faulting. The C runtime
+/// faults there too, and this valve inherits that bound; what it no longer does is fault on the
+/// one word the C ABI defines as "not a term at all".
+#[inline]
+fn dereferenceable_pointer(word: Eterm) -> Option<usize> {
+    let ptr = beam_term::list::ptr_val(word) as usize;
+    if ptr == 0 || ptr % core::mem::align_of::<Eterm>() != 0 {
+        return None;
+    }
+    Some(ptr)
+}
 /// One past the last **pointer-bearing** word of `words` — the bound the full-root doors publish
 /// and classify a register file at.
 ///
@@ -2902,6 +2962,77 @@ mod tests {
                 "the walk must classify the foreign {label} as unscanned == {expected}"
             );
         }
+    }
+
+    /// **A word no live term can be at is inert, and is never read.**
+    ///
+    /// The witness is `make_header(0, 0)` — the all-zero word, the C ABI's `THE_NON_VALUE`, and
+    /// the fabricated "result" a fixture BIF returns: `beam_term`'s frozen bit tricks answer
+    /// `true` to **both** `is_list` and `is_boxed` for it, so before
+    /// [`dereferenceable_pointer`] the valve classified it as a foreign container and
+    /// [`forwards_word_matching`] dereferenced its `NULL` pointer — aborting the whole `beam_rt`
+    /// lib-test binary with `null pointer dereference occurred`
+    /// (`context::calls::tests::a_refused_copy_out_leaves_the_pooled_bif_heap_unrewound`).
+    ///
+    /// So the valve must answer `false` for it on every route — the direct predicate, the
+    /// region classifier, the reachability walk, and the `open_gate_for_foreign_result` seam that
+    /// arms the per-pid descent latch — and answering at all is the proof it never read the
+    /// object: a single word read at address `0` aborts the process rather than failing an
+    /// assertion. The tag tricks are pinned here too, so the guard cannot be dropped as
+    /// "unreachable" when the frozen predicates change.
+    #[test]
+    fn an_all_zero_word_is_inert_and_never_read() {
+        let non_value = beam_term::prelude::make_header(0, 0);
+        assert_eq!(non_value.raw(), 0, "the witness is the all-zero word");
+        assert!(
+            beam_term::prelude::is_list(non_value) && beam_term::prelude::is_boxed(non_value),
+            "both frozen tag tricks claim the non-value is a container — which is why the \
+             address guard, not the tag test, has to reject it"
+        );
+        assert_eq!(
+            dereferenceable_pointer(non_value),
+            None,
+            "the non-value's pointer is NULL, so it names no term"
+        );
+
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process");
+        {
+            let process = table.get(pid).expect("the spawned process");
+            assert!(
+                !root_is_unscanned(process, non_value),
+                "the non-value is inert, never a hazard"
+            );
+            assert_eq!(
+                word_region(process, &process.collector().scanned_bounds(), non_value),
+                None,
+                "the classifier must not even place it in a region"
+            );
+            let mut scratch = crate::context::gc_walk::WalkScratch::default();
+            assert!(
+                !crate::context::gc_walk::any_root_is_unscanned(
+                    &mut scratch,
+                    process,
+                    std::iter::once(&non_value),
+                    true,
+                ),
+                "the descent must reach no hit for the non-value"
+            );
+        }
+
+        assert!(!rt.foreign_reachable(pid), "a fresh pid's latch is closed");
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.open_gate_for_foreign_result(non_value);
+        }
+        assert!(
+            !rt.foreign_reachable(pid),
+            "the non-value must not arm the descent latch (a result that is not a term opens no \
+             gate)"
+        );
     }
 
     /// **Only a foreign container that forwards a scanned word opens the per-pid descent latch.**
