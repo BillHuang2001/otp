@@ -579,7 +579,9 @@ the section to read them in.
   `AnyCollector::heap_info()` itself is called only from tests.
 - **Repo-root owned** (`../../CHANGE.md`): the mature-generation room policy and the measured GenImmix decision
   are recorded (Milestones 6 and 9); the two-step post-fullsweep nursery sizing, the `HeapPolicy` field surface
-  (`min_bin_vheap_words`/`fullsweep_after`) and the `HeapInfo` observables are still owed entries.
+  (`min_bin_vheap_words`/`fullsweep_after`), the `HeapInfo` observables, the nursery chain's **summed**
+  `max_heap_words` budget + the provably-empty re-adoption, and the kind-pinned `collect_kind` are still owed
+  entries.
 
 ## Notes for Agents
 - **`minor_gcs` is NOT monotone — it is `minor_since_major`, and a major RESETS it to 0.**
