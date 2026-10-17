@@ -53,6 +53,12 @@
 //! the real argument list, a location list). `modules/fun_info_external_fun_created_in_compiled_code`
 //! pins `erlang:fun_info/1` of a `fun ?MODULE:f/0` **built by compiled code** (an *external* fun:
 //! exactly the `arity`/`env`/`module`/`name`/`type` keys and their values).
+//!
+//! `modules/timer_apply_after_message_is_delivered_in_compiled_code` pins the **fired** timer
+//! from real bytecode: `timer:apply_after/4` must really send its message once the delay
+//! elapses and the engine must wake the process waiting in the compiled `receive` (the `wait`/
+//! `timeout` opcodes, under an `after` guard), so the function returns `42` — the `0` of the
+//! timeout branch would be a `mismatch`.
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 
@@ -219,6 +225,23 @@ pub(crate) const DIFF_TRACE_SOURCE: &str = "-module(diff_trace_info).\n\
      \x20       + 16 * bool2int(proplists:get_value(type, I) =:= external).\n\
      bool2int(true) -> 1;\n\
      bool2int(false) -> 0.\n";
+
+/// The source of the fired-timer module.
+///
+/// A timer is only observable once it **fires**, and the message it sends must arrive at the
+/// receiving process — a shape the `-eval` route pins as well
+/// (`bifs/timer_apply_after_message_is_delivered`), but from *real bytecode* here: the
+/// `receive` is compiled to the real `wait`/`timeout` opcodes rather than interpreted, so the
+/// module-run route pins that the scheduler really wakes the process when the timer expires.
+/// The exported function reduces the observation to an **integer** (the shape a module-run
+/// golden pins): `42` when the scheduled `erlang:send(self(), fired)` message arrived, `0` when
+/// nothing arrived within the `after` guard. The timer's reference is discarded (`_ =`) — a
+/// per-VM value is never rendered.
+pub(crate) const DIFF_TIMER_SOURCE: &str = "-module(diff_timer).\n\
+     -export([wait_fired/0]).\n\
+     wait_fired() ->\n\
+     \x20   _ = timer:apply_after(50, erlang, send, [self(), fired]),\n\
+     \x20   receive fired -> 42 after 2000 -> 0 end.\n";
 
 /// Build one module-run case.
 fn case(
@@ -985,5 +1008,31 @@ pub(crate) fn group() -> Vec<Case> {
             "external_fun_info",
             "31",
         ),
+        // --- A.7/A.2: the *fired* timer from real bytecode ---------------------------------
+        //
+        // `timer:apply_after/4` is a plain Erlang library call over `erlang:send_after/3`, so
+        // the observable is the same one the `-eval` route pins
+        // (`bifs/timer_apply_after_message_is_delivered`): the message must really be sent when
+        // the delay elapses. Here the `receive` is **real bytecode** (the `wait`/`timeout`
+        // opcodes), which is what makes the case worth a compiled run: the golden is `42` only
+        // if the timer fired *and* the engine woke the waiting process; anything else lands in
+        // the `after` branch and reads `0`.
+        Case {
+            id: "modules/timer_apply_after_message_is_delivered_in_compiled_code",
+            description: "a compiled module observes the message timer:apply_after/4 sends when the timer fires",
+            contracts: &[BeamAsm, OtpApps],
+            kind: CaseKind::Module(ModuleRun {
+                source: DIFF_TIMER_SOURCE,
+                module: "diff_timer",
+                function: "wait_fired",
+                arity: 0,
+                args: &[],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("42"),
+                exit_code: 0,
+            },
+        },
     ]
 }
