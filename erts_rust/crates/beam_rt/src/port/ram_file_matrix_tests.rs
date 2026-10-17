@@ -54,17 +54,19 @@
 //! covers `GET` as that row.
 //!
 //! `erlang:port_control/3` is `error:badarg` for **every** opcode on this port (the driver entry's
-//! `control` slot is `NULL`), so `beam_io`'s named-verb `Driver::control` transport is a Rust-only
-//! extension with no oracle counterpart: nothing here drives it. Everything goes through
-//! `port_command`, which is the only transport the oracle has.
+//! `control` slot is `NULL` — this crate's `BUILTIN_DRIVERS_WITHOUT_CONTROL` gate), so `beam_io`'s
+//! named-verb `Driver::control` transport is a Rust-only extension with no oracle counterpart:
+//! nothing here drives it. Everything goes through `port_command`, which is the only transport the
+//! oracle has.
 //!
 //! # Honest scope
 //!
 //! Nothing here fabricates a reply or papers a difference over: a row that disagrees with the
-//! oracle fails on the session string (with the oracle's live output in the failure message), and
-//! the one measured divergence this suite found — the `[binary]` stream's *term shape* — has its
-//! own loud test rather than a relaxed assertion
-//! ([`the_binary_stream_option_diverges_in_term_shape_only`]).
+//! oracle fails on the session string (with the oracle's live output in the failure message). The
+//! `[binary]` stream's *term shape* — the one measured divergence this suite found — is pinned per
+//! reply kind by its own test, which also pins the runtime's **builder** reproducing every shape and
+//! names the residual **producer** gap loudly
+//! ([`a_binary_stream_port_renders_the_oracles_shapes_but_the_producer_still_flattens_them`]).
 use super::tests::{
     counter, data_payload_bytes, erl_bytes, fixture, skip_oracle_check, text_of, Fixture,
 };
@@ -95,8 +97,9 @@ struct Row {
 enum Stream {
     /// The default: the reply arrives as a char list (the oracle's `{data,[3,0,0,0,0]}`).
     List,
-    /// The `binary` option, whose reply *shape* diverges — see
-    /// [`the_binary_stream_option_diverges_in_term_shape_only`].
+    /// The `binary` option: the reply's *bytes* are the same, its *term shape* follows the driver
+    /// output call that carried them — see
+    /// [`a_binary_stream_port_renders_the_oracles_shapes_but_the_producer_still_flattens_them`].
     Binary,
 }
 
@@ -490,9 +493,29 @@ pub(super) fn oracle_output(expr: &str) -> Option<String> {
     }
 }
 
-/// A session row rendered the way the oracle's `~w` prints it: `{row, [Reply], Input, Output}`.
+/// A row rendered the way the oracle's `~w` prints it: `{row, [Reply], Input, Output}`.
 fn row_w(name: &str, reply: &[i64], input: i64, output: i64) -> String {
     format!("{{{name},{},{input},{output}}}", erl_bytes(reply))
+}
+
+/// The `Data` payload [`RuntimeContext::port_data_message_shaped`] builds for `bytes` on `stream`
+/// with `shape`, rendered by the registered `~w` printer — the oracle's own control, so the two
+/// renderings are compared as text (`[2,0,0,0,2|<<97,98>>]`).
+///
+/// The runtime owns the heap the term is built on, so it is borrowed for the whole read.
+fn built_reply(rt: &mut Runtime, bytes: &[u8], stream: StreamType, shape: StreamShape) -> String {
+    let port = PortId::new(9001);
+    let message = {
+        let mut ctx = RuntimeContext::new(&mut *rt);
+        ctx.port_data_message_shaped(port, bytes, stream, shape)
+            .unwrap_or_else(|error| panic!("a message for {bytes:?} ({shape:?}): {error}"))
+    };
+    let inner = terms::tuple_element(message, 1).expect("the `{data, …}` tuple");
+    let payload = terms::tuple_element(inner, 1).expect("the data payload");
+    let rendered = rt
+        .format_term_w(payload, None)
+        .unwrap_or_else(|error| panic!("the `~w` printer refused a built message: {error}"));
+    rendered.trim_end_matches('\n').to_string()
 }
 
 /// `bytes` as an Erlang binary literal: `<<1,0,0,0,3,97,98,99>>`.
@@ -793,20 +816,37 @@ fn closing_a_ram_file_port_refuses_later_commands_like_the_oracle() {
     }
 }
 
-/// The `[binary]` stream option's **term shape** diverges while the reply *bytes* agree.
+/// The `[binary]` stream's **term shape**, pinned per reply kind: the oracle's measured terms, and
+/// the runtime's message builder reproducing every one of them.
 ///
-/// Measured (erts-17.1): the oracle prints this driver's `NUMBER`/`OK` replies as flat lists
-/// (`[3,0,0,0,0]`) and its `DATA` replies as an **improper** list (`[2,0,0,0,2|<<97,98>>]`) —
-/// `driver_output_binary` hands the five-byte header to the list stream and the payload on as a
-/// binary tail. This runtime's message builder turns a binary-stream port's whole reply into one
-/// binary (`<<2,0,0,0,2,97,98>>`).
+/// Measured (erts-17.1), one row per reply kind — the shape is a function of the driver output call
+/// that carried the bytes, never of the bytes alone (`driver_output2` hands the header to the list
+/// stream, `driver_output_binary` hands the header to the list and the payload on as a binary tail):
 ///
-/// The bytes and both counters agree, so nothing a caller *reads* is lost — but the term shape is
-/// a real divergence, and it lives in the stream-message builder rather than in this driver. This
-/// test pins **both** measured shapes, prints the divergence loudly, and asserts the byte equality,
-/// rather than relaxing the comparison or hiding the difference.
+/// | reply (`ram_file_drv.c`) | call | `[binary]` port's `{data, D}` | default `list` port |
+/// |---|---|---|---|
+/// | `NUMBER` (`numeric_reply`, `:197`) | `driver_output2(buf, len, NULL, 0)` | `[3,0,0,0,0]` — a **proper** list | `[3,0,0,0,0]` |
+/// | `OK` (`reply`, `:181`) | the same | `[0]` | `[0]` |
+/// | `ERROR` (`error_reply`, `:222`) | the same | `[1,101,105,110,118,97,108]` | the same |
+/// | `DATA` (`:448`) | `driver_output_binary(port, hdr, 5, bin, 0, n)`, `n >= 1` | `[2,0,0,0,2\|<<97,98>>]` — **improper** | `[2,0,0,0,2,97,98]` |
+/// | `DATA` at end of file | the same, `n == 0` | `[2,0,0,0,0\|<<>>]` | `[2,0,0,0,0]` |
+///
+/// Every one of those terms is asserted below through [`built_reply`] — the runtime's **own**
+/// builder ([`RuntimeContext::port_data_message_shaped`]) fed the bytes this session really
+/// received, shaped by the driver call that produced them, and rendered by the registered `~w`
+/// printer (the oracle's own control).
+///
+/// # The producer is still `beam_io`, and it still flattens the split
+///
+/// The builder renders every shape; the **producer** does not yet carry the split: `beam_io`'s
+/// stream layer folds `driver_output2`'s header and data into one `Vec<u8>`
+/// ([`beam_io::DriverContext::input`]), so the port layer is handed bytes without the split and
+/// reports [`StreamShape::Data`] — and end to end this runtime still delivers a binary-stream reply
+/// as one binary where the oracle delivers a list of the header plus (for `DATA`) a binary tail. The
+/// `reply_is_binary` assertion below is that residual, kept loud: closing it is a `beam_io` change
+/// (this node's `CONTEXT.md`, *Handoffs*), not something this test may paper over.
 #[test]
-fn the_binary_stream_option_diverges_in_term_shape_only() {
+fn a_binary_stream_port_renders_the_oracles_shapes_but_the_producer_still_flattens_them() {
     let mut session = Matrix::new(Stream::Binary);
     session.run(BINARY_SESSION);
     session.finish();
@@ -821,40 +861,117 @@ fn the_binary_stream_option_diverges_in_term_shape_only() {
     );
     assert!(
         session.reply_is_binary("read_data"),
-        "this runtime delivers a binary-stream payload as a binary"
+        "the end-to-end residual: `beam_io` flattened the header/data split, so this runtime still \
+         delivers one binary where the oracle delivers `[2,0,0,0,2|<<97,98>>]`"
     );
     // … and the counters count the same bytes the oracle counts.
     assert_eq!(session.input, 5 + 7 + 5 + 5 + 1 + 6);
     assert_eq!(session.output, 8 + 5 + 1 + 9 + 1 + 1);
 
-    let expr = "begin \
-                P = open_port({spawn_driver,\"ram_file_drv\"},[binary]), \
-                C = fun(Cmd) -> true = port_command(P, Cmd), \
-                                receive {P,{data,D}} -> D after 2000 -> timeout end end, \
-                I = fun(Item) -> {Item,V} = erlang:port_info(P, Item), V end, \
-                D1 = C(<<1,0,0,0,3,97,98,99>>), \
-                D2 = C(<<2,0,0,0,2>>), \
-                io:format(\"~w~n\",[{open,D1}]), \
-                io:format(\"~w~n\",[{read,D2}]), \
-                io:format(\"~w~n\",[{input,I(input),output,I(output)}]) end";
-    match oracle_output(expr) {
-        Some(oracle) => {
-            // The oracle's measured shape: a flat list for NUMBER, an improper list for DATA.
-            assert_eq!(
-                oracle, "{open,[3,0,0,0,0]}\n{read,[2,0,0,0,2|<<97,98>>]}\n{input,12,output,13}",
-                "the oracle's binary-stream reply shape (measured on erts-17.1)"
-            );
-            println!("================================================================");
-            println!(
-                "DIVERGENCE (reported, not papered over): the `[binary]` stream's term shape."
-            );
-            println!("  oracle: {oracle}");
-            println!(
-                "  this runtime: {{open,<<3,0,0,0,0>>}}, {{read,<<2,0,0,0,2,97,98>>}} — the same \
-                 bytes, delivered as binaries"
-            );
-            println!("================================================================");
-        }
-        None => skip_oracle_check("the `[binary]` stream reply shape"),
+    // The measured matrix, whole session: the oracle's own rendering of these opcodes on a
+    // `[binary]` port, counters included. A toolchain-less host is a loud skip, never a pass.
+    match oracle_output(&oracle_session_expr("[binary]", BINARY_SESSION, "")) {
+        Some(oracle) => assert_eq!(
+            oracle,
+            "{open_fresh,[3,0,0,0,0],5,8}\n\
+             {read_data,[2,0,0,0,2|<<97,98>>],12,13}\n\
+             {size,[3,0,0,0,3],17,14}\n\
+             {truncate_seek,[3,0,0,0,1],22,23}\n\
+             {truncate,[0],23,24}\n\
+             {get,[2,0,0,0,1|<<97>>],29,25}\n\
+             {final,29,25}",
+            "the `[binary]` stream's measured reply shapes (erts-17.1)"
+        ),
+        None => skip_oracle_check("the `[binary]` stream's measured reply shapes"),
+    }
+
+    // ...and the runtime's **builder** renders each of those terms, from the bytes this session
+    // really received, shaped by the driver output call that carried them.
+    let shapes: [(&str, StreamShape, &str, &str); 6] = [
+        // `numeric_reply` — `driver_output2(buf, len, NULL, 0)`.
+        ("open_fresh", StreamShape::Header, "[3,0,0,0,0]", "[3,0,0,0,0]"),
+        // `READ` — `driver_output_binary(port, hdr, 5, bin, 0, n)`.
+        (
+            "read_data",
+            StreamShape::HeaderThenData { len: 5 },
+            "[2,0,0,0,2|<<97,98>>]",
+            "[2,0,0,0,2,97,98]",
+        ),
+        ("size", StreamShape::Header, "[3,0,0,0,3]", "[3,0,0,0,3]"),
+        (
+            "truncate_seek",
+            StreamShape::Header,
+            "[3,0,0,0,1]",
+            "[3,0,0,0,1]",
+        ),
+        // `reply` — the bare `OK` byte.
+        ("truncate", StreamShape::Header, "[0]", "[0]"),
+        (
+            "get",
+            StreamShape::HeaderThenData { len: 5 },
+            "[2,0,0,0,1|<<97>>]",
+            "[2,0,0,0,1,97]",
+        ),
+    ];
+    for (name, shape, binary_term, list_term) in shapes {
+        let bytes: Vec<u8> = session
+            .reply(name)
+            .into_iter()
+            .map(|byte| u8::try_from(byte).expect("a reply byte"))
+            .collect();
+        assert_eq!(
+            built_reply(&mut session.runtime, &bytes, StreamType::Binary, shape),
+            binary_term,
+            "row {name:?}: a `[binary]` port renders `{shape:?}` as the oracle's term"
+        );
+        assert_eq!(
+            built_reply(&mut session.runtime, &bytes, StreamType::List, shape),
+            list_term,
+            "row {name:?}: the default `list` stream renders the same bytes without a binary tail"
+        );
+    }
+    // The two shapes no session row reaches: a zero-length `DATA` (a read at end of file) and an
+    // `ERROR` reply — both measured above, both the builder's to reproduce.
+    for (bytes, shape, oracle_term) in [
+        (
+            &[2u8, 0, 0, 0, 0][..],
+            StreamShape::HeaderThenData { len: 5 },
+            "[2,0,0,0,0|<<>>]",
+        ),
+        (
+            &[1u8, 101, 105, 110, 118, 97, 108][..],
+            StreamShape::Header,
+            "[1,101,105,110,118,97,108]",
+        ),
+    ] {
+        assert_eq!(
+            built_reply(&mut session.runtime, bytes, StreamType::Binary, shape),
+            oracle_term,
+            "{bytes:?} on a `[binary]` port renders `{shape:?}` as the oracle's term"
+        );
+    }
+    // The default stream's own measured form of a `DATA` reply: every byte a list element.
+    assert_eq!(
+        built_reply(
+            &mut session.runtime,
+            &[2, 0, 0, 0, 2, 97, 98],
+            StreamType::List,
+            StreamShape::HeaderThenData { len: 5 },
+        ),
+        "[2,0,0,0,2,97,98]",
+        "the default `list` stream is a proper list of the header and the data"
+    );
+
+    if session.reply_is_binary("read_data") {
+        println!("================================================================");
+        println!(
+            "RESIDUAL (reported, not papered over): the `[binary]` stream's term shape, end to end."
+        );
+        println!("  oracle: {{read_data,[2,0,0,0,2|<<97,98>>]}} — header list ++ a binary tail");
+        println!(
+            "  this runtime: {{read_data,<<2,0,0,0,2,97,98>>}} — the same bytes, one binary: the \
+             builder renders the split, `beam_io`'s stream layer does not produce it yet"
+        );
+        println!("================================================================");
     }
 }

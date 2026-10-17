@@ -48,7 +48,7 @@
 //! [`super::ram_file_matrix_tests`], and the exact `beam_io` change that closes it is recorded in
 //! this node's `CONTEXT.md` (*Handoffs*).
 use super::ram_file_matrix_tests::oracle_output;
-use super::tests::text_of;
+use super::tests::{skip_oracle_check, text_of};
 use super::*;
 use crate::config::RuntimeConfig;
 /// One measured reply: the `port_command/2` payload that provokes it, the reply bytes the driver
@@ -133,16 +133,54 @@ const PREAD_NEG: Reply = Reply {
 const SESSION: &[Reply] = &[
     OPEN, READ_DATA, READ_CLAMPED, READ_EOF, TRUNCATE, PREAD_NEG,
 ];
-/// Builds one port message through the runtime's builder and returns its `Data` payload.
-fn payload(bytes: &[u8], stream: StreamType, shape: StreamShape) -> Eterm {
-    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
-    let port = PortId::new(1);
-    let mut ctx = RuntimeContext::new(&mut rt);
-    let message = ctx
-        .port_data_message_shaped(port, bytes, stream, shape)
-        .unwrap_or_else(|error| panic!("a message for {bytes:?} ({shape:?}): {error}"));
-    let inner = terms::tuple_element(message, 1).expect("the `{data, …}` tuple");
-    terms::tuple_element(inner, 1).expect("the data payload")
+/// Builds one port message through the runtime's **own** message builder and renders it the way
+/// the oracle's `~w` prints it.
+///
+/// The runtime outlives every read: a term is only meaningful while the heap it was built on is
+/// alive, so the builder is created once per test and borrowed for each message.
+struct Builder {
+    /// The runtime whose heap the messages are built on and whose printer renders them.
+    rt: Runtime,
+    /// The port the messages are addressed to (never compared: only `element(2, Msg)` is read).
+    port: PortId,
+}
+
+impl Builder {
+    /// A builder over a fresh default runtime.
+    fn new() -> Builder {
+        Builder {
+            rt: Runtime::new(RuntimeConfig::default()).expect("the default runtime"),
+            port: PortId::new(1),
+        }
+    }
+
+    /// The `Data` payload of the `{Port, {data, Data}}` message
+    /// [`RuntimeContext::port_data_message_shaped`] builds for `bytes` on `stream` with `shape`.
+    fn payload(&mut self, bytes: &[u8], stream: StreamType, shape: StreamShape) -> Eterm {
+        let port = self.port;
+        let mut ctx = RuntimeContext::new(&mut self.rt);
+        let message = ctx
+            .port_data_message_shaped(port, bytes, stream, shape)
+            .unwrap_or_else(|error| panic!("a message for {bytes:?} ({shape:?}): {error}"));
+        let inner = terms::tuple_element(message, 1).expect("the `{data, …}` tuple");
+        terms::tuple_element(inner, 1).expect("the data payload")
+    }
+
+    /// `term` rendered by the registered `~w` printer — the very control the oracle's expression
+    /// uses, so the two renderings are compared as text.
+    fn render(&mut self, term: Eterm) -> String {
+        let rendered = self
+            .rt
+            .format_term_w(term, None)
+            .unwrap_or_else(|error| panic!("the `~w` printer refused a built message: {error}"));
+        rendered.trim_end_matches('\n').to_string()
+    }
+
+    /// [`Self::payload`] rendered with [`Self::render`].
+    fn rendered_payload(&mut self, bytes: &[u8], stream: StreamType, shape: StreamShape) -> String {
+        let term = self.payload(bytes, stream, shape);
+        self.render(term)
+    }
 }
 /// The oracle expression for [`SESSION`]: open `ram_file_drv` with `options`, send every row in
 /// order and print one `{name, Reply}` line per row.
@@ -170,10 +208,11 @@ fn session_expr(options: &str) -> String {
 /// the `list` stream renders the same bytes as a proper list whatever the split.
 #[test]
 fn every_reply_kind_renders_the_oracles_stream_shape() {
+    let mut builder = Builder::new();
     let mut our_binary = Vec::new();
     let mut our_list = Vec::new();
     for reply in SESSION {
-        let binary = text_of(payload(reply.bytes, StreamType::Binary, reply.shape));
+        let binary = builder.rendered_payload(reply.bytes, StreamType::Binary, reply.shape);
         assert_eq!(
             binary, reply.binary_term,
             "{}: a `[binary]` port renders the C's header/data split",
@@ -181,7 +220,7 @@ fn every_reply_kind_renders_the_oracles_stream_shape() {
         );
         our_binary.push(format!("{{{},{binary}}}", reply.name));
         // The `list` stream is insensitive to the split: header and data are both list elements.
-        let list = text_of(payload(reply.bytes, StreamType::List, reply.shape));
+        let list = builder.rendered_payload(reply.bytes, StreamType::List, reply.shape);
         assert_eq!(
             list, reply.list_term,
             "{}: the default stream is a proper list of every byte, whatever the split",
@@ -195,14 +234,11 @@ fn every_reply_kind_renders_the_oracles_stream_shape() {
         ("[]", &our_list, "the default `list` stream"),
     ] {
         match oracle_output(&session_expr(options)) {
-            Some(oracle) => {
-                assert_eq!(
-                    ours.join("\n"),
-                    oracle,
-                    "{what}: every reply kind must render the oracle's term"
-                );
-                oracle_agreed += 1;
-            }
+            Some(oracle) => assert_eq!(
+                ours.join("\n"),
+                oracle,
+                "{what}: every reply kind must render the oracle's term"
+            ),
             None => skip_oracle_check(what),
         }
     }
@@ -211,6 +247,7 @@ fn every_reply_kind_renders_the_oracles_stream_shape() {
 /// leak a stray `ImproperList` into the default stream.
 #[test]
 fn the_list_stream_ignores_the_header_split() {
+    let mut builder = Builder::new();
     for shape in [
         StreamShape::Data,
         StreamShape::Header,
@@ -218,15 +255,15 @@ fn the_list_stream_ignores_the_header_split() {
         // A header longer than the payload is clamped, never a dropped byte.
         StreamShape::HeaderThenData { len: 99 },
     ] {
-        let term = payload(&[2, 0, 0, 0, 2, 97, 98], StreamType::List, shape);
-        assert_eq!(
-            text_of(term),
-            "[2,0,0,0,2,97,98]",
-            "{shape:?}: the list stream is every byte as list elements"
-        );
+        let term = builder.payload(&[2, 0, 0, 0, 2, 97, 98], StreamType::List, shape);
         assert!(
             terms::list_elements(term).is_ok(),
             "{shape:?}: the list-stream payload is a proper list"
+        );
+        assert_eq!(
+            builder.render(term),
+            "[2,0,0,0,2,97,98]",
+            "{shape:?}: the list stream is every byte as list elements"
         );
     }
 }
@@ -234,13 +271,14 @@ fn the_list_stream_ignores_the_header_split() {
 /// been — the shape machinery must not change `driver_output`'s own rendering.
 #[test]
 fn a_headerless_call_is_still_a_binary() {
-    let term = payload(b"abc", StreamType::Binary, StreamShape::Data);
+    let mut builder = Builder::new();
+    let term = builder.payload(b"abc", StreamType::Binary, StreamShape::Data);
     assert_eq!(
         terms::binary_bytes(term).expect("a header-less binary-stream read is a binary"),
         b"abc"
     );
     // ...and an empty header on a header-plus-data call degenerates to the same bare binary.
-    let term = payload(b"abc", StreamType::Binary, StreamShape::HeaderThenData { len: 0 });
+    let term = builder.payload(b"abc", StreamType::Binary, StreamShape::HeaderThenData { len: 0 });
     assert_eq!(
         terms::binary_bytes(term).expect("an empty header leaves the data binary"),
         b"abc"
@@ -253,14 +291,11 @@ fn a_headerless_call_is_still_a_binary() {
 /// not from one driver output call.)
 #[test]
 fn a_line_frame_wraps_the_stream_shaped_payload() {
-    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
-    let port = PortId::new(1);
-    let mut fx = super::tests::fixture();
-    let eol = fx.atom("eol");
-    let noeol = fx.atom("noeol");
-    for (eol_flag, tag) in [(true, eol), (false, noeol)] {
-        let binary = {
-            let mut ctx = RuntimeContext::new(&mut rt);
+    let mut builder = Builder::new();
+    let port = builder.port;
+    for (eol_flag, marker) in [(true, "eol"), (false, "noeol")] {
+        let framed = {
+            let mut ctx = RuntimeContext::new(&mut builder.rt);
             let message = ctx
                 .port_line_message(port, b"ab", eol_flag, StreamType::Binary)
                 .expect("a binary-stream line frame");
@@ -270,15 +305,19 @@ fn a_line_frame_wraps_the_stream_shaped_payload() {
             )
             .expect("the frame")
         };
-        let framed = terms::tuple_element(binary, 0).expect("the `{eol|noeol, Data}` tuple");
-        assert_eq!(framed, make_atom(tag), "the frame's tag");
-        let data = terms::tuple_element(binary, 1).expect("the frame's data");
+        let tag = terms::tuple_element(framed, 0).expect("the `{eol|noeol, Data}` tuple");
+        assert_eq!(
+            builder.rt.atom_name_of(tag),
+            Some(marker),
+            "a binary-stream frame's marker"
+        );
+        let data = terms::tuple_element(framed, 1).expect("the frame's data");
         assert_eq!(
             terms::binary_bytes(data).expect("a binary-stream frame's data is a binary"),
             b"ab"
         );
         let list = {
-            let mut ctx = RuntimeContext::new(&mut rt);
+            let mut ctx = RuntimeContext::new(&mut builder.rt);
             let message = ctx
                 .port_line_message(port, b"ab", eol_flag, StreamType::List)
                 .expect("a list-stream line frame");
@@ -288,7 +327,21 @@ fn a_line_frame_wraps_the_stream_shaped_payload() {
             )
             .expect("the frame")
         };
+        let tag = terms::tuple_element(list, 0).expect("the `{eol|noeol, Data}` tuple");
+        assert_eq!(
+            builder.rt.atom_name_of(tag),
+            Some(marker),
+            "the list stream carries the same marker"
+        );
         let data = terms::tuple_element(list, 1).expect("the frame's data");
-        assert_eq!(text_of(data), "[97,98]", "a list-stream frame is a char list");
+        assert!(
+            terms::list_elements(data).is_ok(),
+            "a list-stream frame's data is a proper char list"
+        );
+        assert_eq!(
+            text_of(data),
+            "ab",
+            "a list-stream frame carries the delivered bytes as char integers"
+        );
     }
 }

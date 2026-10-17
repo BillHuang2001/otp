@@ -111,21 +111,35 @@ fn oracle_packets(width: i64, script: &str) -> Option<Vec<Vec<u8>>> {
     Some(parse_int_lists(&text))
 }
 /// Parses the `[[1,2],[3]]` shape `~w` prints for a list of byte lists.
+///
+/// The **outer** brackets are the message list itself, so only a list nested inside them is a
+/// payload: an empty result (`[]`, no message at all) must parse to *no* payloads, not to one empty
+/// one. The depth counter is what tells the two apart — counting bytes out of the outer bracket pair
+/// would turn "the oracle delivered nothing" into "the oracle delivered an empty packet".
 fn parse_int_lists(text: &str) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut current: Option<Vec<u8>> = None;
+    let mut depth = 0usize;
     let mut digits = String::new();
     for character in text.chars() {
         match character {
-            '[' => current = Some(Vec::new()),
-            ']' => {
-                if let Some(mut bytes) = current.take() {
-                    if !digits.is_empty() {
-                        bytes.push(digits.parse().expect("a byte"));
-                        digits.clear();
-                    }
-                    out.push(bytes);
+            '[' => {
+                depth += 1;
+                if depth == 2 {
+                    current = Some(Vec::new());
                 }
+            }
+            ']' => {
+                if depth >= 2 {
+                    if let Some(mut bytes) = current.take() {
+                        if !digits.is_empty() {
+                            bytes.push(digits.parse().expect("a byte"));
+                            digits.clear();
+                        }
+                        out.push(bytes);
+                    }
+                }
+                depth = depth.saturating_sub(1);
             }
             ',' => {
                 if !digits.is_empty() {
@@ -135,7 +149,11 @@ fn parse_int_lists(text: &str) -> Vec<Vec<u8>> {
                     digits.clear();
                 }
             }
-            other if other.is_ascii_digit() => digits.push(other),
+            other if other.is_ascii_digit() => {
+                if depth == 2 {
+                    digits.push(other);
+                }
+            }
             _ => {}
         }
     }
