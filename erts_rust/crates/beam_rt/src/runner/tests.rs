@@ -2994,7 +2994,7 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 ///   ([`crate::context::gc::reds_door`], called from the runner's `Yield` arm). A slice spends
 ///   `DEFAULT_REDUCTIONS_PER_SLICE` = 4 000 reds, which is exactly the door's
 ///   `REDS_BOUNDARY_MIN_REDS` interval, and the loop's 401-word allocation per iteration fills the
-///   space well past the door's half-occupancy watermark, so **every** pre-emption collects —
+///   space well past the door's 7/8 occupancy watermark, so **every** pre-emption collects —
 ///   once, never more, because the interval resets at each boundary.
 ///
 /// Hence the relation this test pins, over each row's own counters:

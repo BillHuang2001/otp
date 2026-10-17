@@ -338,9 +338,13 @@ pub(crate) fn process_roots_are_unscanned(
 
 /// The **one** per-runtime cell holding the pids whose descent latch is open.
 ///
-/// The latch is the host's sticky, add-only per-process bit: it is set by every event that can
+/// The latch is the host's per-process bit: it is set by every event that can
 /// put a container from a region the process's collector does not scan into that process's
-/// reachable term graph, and set again (never cleared) by the valve itself on a root hit. The
+/// reachable term graph, and set again by the valve itself on a root hit. It is cleared by
+/// `Runtime::close_foreign_reachable` from the doors
+/// that hand the walk the machine's **whole** root set (`ensure_heap_full`,
+/// `alloc_words_rooted`, `gc::reds_door`) and only when the walk reports no foreign reach, so a
+/// clear can never hide a container the walk was not shown. The
 /// runtime owns the one cell and shares it by cloning the `Rc` at the collection gate's install
 /// site, so a `beam_process` signal site decides exactly as an admission point does and never
 /// pays the `O(live objects)` descent for a pid whose bit is clear. It is a **verdict-only** set
