@@ -399,6 +399,17 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility gate).
 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
+- **Payload-growth limits.** The reservation is a *logical* limit inside one ordinary allocator block —
+  there is no `mprotect`/`madvise` reservation, so committed RSS follows the writes and the process is
+  charged carrier bytes for `reserved`, not for `len`; only `compact()` (or `Drop`) gives the slack
+  back, and nothing trims it automatically. `payload_capacity` is an unconditional header read (its
+  `# Safety` contract is the caller's liveness proof — there is no magic word or side table to validate
+  a pointer). A `Moved` payload is *reported*, not repaired: re-pointing on-heap `BinRef.val` words is
+  the term owner's job (`beam_term::refc`) driven by the host, so this crate never walks a heap.
+  `max_capacity` is a caller policy (a host deriving it from a `max_heap_words`-style budget multiplies
+  by 8) and is capped by `MAX_PAYLOAD_BYTES`, the allocator's own single-block ceiling. There is no
+  `as_bytes_mut` (mutation goes through `append`/`set_len`, and hosts that write raw bytes through
+  `data_ptr` keep their own length).
 - Thread-specific / thread-preferred allocators (`tspec`/`tpref`), per-scheduler instances, and the
   delayed-dealloc queue + thread-progress barrier for cross-scheduler frees.
 - The variable-block engine's **strategy plugins** (`goodfit`/`bestfit`/`afit`) — `AllocatorConfig::strategy`
