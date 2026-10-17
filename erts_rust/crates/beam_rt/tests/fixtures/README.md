@@ -426,8 +426,9 @@ These eight are committed oracle fixtures for the process-heap collector
 * `gc_ints.beam` — `l1/1` accumulates `+`/`rem` on small integers only: it allocates nothing,
   pinning that a non-allocating loop's young heap never moves.
 * `gc_floats.beam` — `l1/1` accumulates `sqrt/1` in one IEEE-754 double: a module with a
-  float-family instruction is never collected over (a live float register is outside the root
-  set), and its result must stay exact.
+  float-family instruction is collected over safely (the engine reaches only the full door,
+  which publishes the machine's whole root set — the FR file included — so a live float
+  register is relocated like any other root), and its result must stay exact.
 * `heap_growth.beam` — `sprawl/1` builds a 400-element tuple of a *runtime* value in one block
   (the compiler emits a single `test_heap 1 401`, far above the 233-word fresh nursery) and
   `run/1` repeats it, discarding each tuple, so a runtime that cannot grow the nursery must

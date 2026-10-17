@@ -695,7 +695,7 @@ fn the_aggregate_span_is_reported_for_both_collector_kinds() {
             );
         }
         // A far-away address — no space can reach it — is rejected, which is the whole point:
-        // `outside_scanned` then answers without touching the chain index or the mature space.
+        // `outside_bounds` then answers without touching the chain index or the mature space.
         let far = bounds.limit().saturating_add(1 << 20);
         assert!(
             bounds.definitely_unscanned(far as *const Eterm),
