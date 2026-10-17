@@ -97,8 +97,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     object** across the **whole heap** (every nursery space + the mature generation's live region `[base,
     top)`), each once, as `(header_word, *const Eterm)`; `for_each_reachable_object_view(...)` is the
     **no-caller-`unsafe`** sibling (safe `ReachableObject` callback). Both mirrored.
-  - After **every** collection the chain is collapsed to one space via `Nursery::collapse`, which re-sizes
-    that space via `young_after_collection` from the round's **surviving** words, and a fullsweep sizes the
+  - After **every** collection the chain is collapsed to one space via `Nursery::collapse(policy,
+    demand_words)`, which re-sizes that space via `young_after_collection(capacity, demand)` from a minor's
+    **surviving** words and a fullsweep's **observed occupancy** before the copy, and a fullsweep sizes the
     fresh mature space from `live.rs`'s exact live count plus the **young heap's occupancy** — never the
     **mature** occupancy (Design Decisions).
 
