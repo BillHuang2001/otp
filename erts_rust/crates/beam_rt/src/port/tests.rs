@@ -40,7 +40,7 @@ const OWNER: ProcessId = ProcessId::new(7, 0);
 ///
 /// The atom table is interned **before** the provider takes its handle: the handle is
 /// an `Rc` clone, so mutating the table afterwards would fork it (see the module docs).
-struct Fixture {
+pub(super) struct Fixture {
     registry: Rc<RefCell<PortRegistry>>,
     atoms: Rc<AtomTable>,
     hook: RuntimePorts,
@@ -85,7 +85,7 @@ const TEST_ATOMS: &[&str] = &[
     "nope",
 ];
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let mut atoms = AtomTable::new();
     boot::seed_core_atoms(&mut atoms);
     for name in TEST_ATOMS {
@@ -104,17 +104,17 @@ fn fixture() -> Fixture {
 
 impl Fixture {
     /// The atom `name` as a term (it must be pre-interned: see [`Fixture`]).
-    fn atom(&self, name: &str) -> Eterm {
+    pub(super) fn atom(&self, name: &str) -> Eterm {
         make_atom(self.atoms.lookup(name).expect("a pre-interned atom"))
     }
 
     /// `text` as an Erlang string on the fixture's heap.
-    fn string(&mut self, text: &str) -> Eterm {
+    pub(super) fn string(&mut self, text: &str) -> Eterm {
         charlist(&mut self.heap, text).expect("a string")
     }
 
     /// An Erlang list of `elements` on the fixture's heap.
-    fn list(&mut self, elements: &[Eterm]) -> Eterm {
+    pub(super) fn list(&mut self, elements: &[Eterm]) -> Eterm {
         let mut list = NIL;
         for element in elements.iter().rev() {
             list = heap_cons(&mut self.heap, *element, list);
@@ -123,7 +123,7 @@ impl Fixture {
     }
 
     /// The `{tag, value}` `Name` tuple `open_port/2` takes.
-    fn name(&mut self, tag: &str, value: Eterm) -> Eterm {
+    pub(super) fn name(&mut self, tag: &str, value: Eterm) -> Eterm {
         let tag = self.atom(tag);
         self.heap.tuple(&[tag, value]).expect("a name tuple")
     }
@@ -141,7 +141,7 @@ impl Fixture {
         let tag = self.atom("args");
         self.heap.tuple(&[tag, list]).expect("an args option")
     }        /// The value `port_info/1` answered for `name`.
-    fn item(&mut self, port: PortId, name: &str) -> Eterm {
+    pub(super) fn item(&mut self, port: PortId, name: &str) -> Eterm {
         let pairs = self
             .hook
             .port_info(port)
@@ -162,7 +162,7 @@ fn heap_cons(heap: &mut Heap, head: Eterm, tail: Eterm) -> Eterm {
 }
 
 /// `term` read as a byte string.
-fn text_of(term: Eterm) -> String {
+pub(super) fn text_of(term: Eterm) -> String {
     terms::list_elements(term)
         .expect("a proper list")
         .into_iter()
@@ -258,7 +258,7 @@ fn pump_until_exit(registry: &mut PortRegistry, port: PortId, bound: Duration) -
 }
 /// Runs `expr` under the host `erl` and returns its stdout, or `None` when the toolchain is
 /// not usable (the caller then prints a loud skip banner — never a silent pass).
-fn erl_eval(expr: &str) -> Option<String> {
+pub(super) fn erl_eval(expr: &str) -> Option<String> {
     let output = std::process::Command::new("erl")
         .args(["-noshell", "-eval", expr, "-s", "init", "stop"])
         .output()
@@ -270,7 +270,7 @@ fn erl_eval(expr: &str) -> Option<String> {
 }
 
 /// Prints the loud "this oracle cross-check was skipped" banner (see [`erl_eval`]).
-fn skip_oracle_check(what: &str) {
+pub(super) fn skip_oracle_check(what: &str) {
     println!("================================================================");
     println!("SKIP: no usable `erl` on PATH — the oracle cross-check for {what} is skipped");
     println!("================================================================");
@@ -620,12 +620,15 @@ fn a_builtin_driver_name_opens_a_live_driver_port() {
 // the owner's `receive` timed out and `port_info(Port, input)` stayed `0` where the oracle
 // answers the reply and `5`.
 
-/// The `ram_file_drv` `RAM_FILE_OPEN` command for the 3-byte name `"abc"` — an 8-byte payload
-/// whose first four bytes are the opcode and whose last four are the name length.
+/// The `ram_file_drv` `RAM_FILE_OPEN` command — an 8-byte payload whose first byte is the opcode
+/// `1`, whose next four are the access-mode flags `3` (`RAM_FILE_MODE_READ_WRITE`) big-endian, and
+/// whose last three are the file's **initial content** `"abc"` (the operand is content, not a
+/// name: `rfile_command`'s `ram_file_init(f, buf+4, count-4, …)`).
 const RAM_FILE_OPEN_ABC: [u8; 8] = [1, 0, 0, 0, 3, b'a', b'b', b'c'];
 
-/// `ram_file_drv`'s reply to [`RAM_FILE_OPEN_ABC`]: the `OK` code `3` followed by the handle the
-/// driver minted (`0`). The oracle delivers exactly these five bytes (`{data,[3,0,0,0,0]}`).
+/// `ram_file_drv`'s reply to [`RAM_FILE_OPEN_ABC`]: the `NUMBER` response code `3`
+/// (`RAM_FILE_RESP_NUMBER`) followed by a big-endian `i32` — the zero the C's `numeric_reply(f, 0)`
+/// reports ("0 is not used"). The oracle delivers exactly these five bytes (`{data,[3,0,0,0,0]}`).
 const RAM_FILE_OPEN_REPLY: [u8; 5] = [3, 0, 0, 0, 0];
 
 /// The oracle expression of the whole probe: open `ram_file_drv`, send [`RAM_FILE_OPEN_ABC`],
@@ -644,16 +647,27 @@ impl Fixture {
     /// through it is the one `Runtime::deliver_port_messages` (the scheduler route) and
     /// `RuntimeContext::poll_port_messages` (the `-eval` route) poll, while the term vocabulary
     /// still comes from this fixture.
-    fn hook_over(&self, registry: Rc<RefCell<PortRegistry>>, owner: ProcessId) -> RuntimePorts {
+    pub(super) fn hook_over(
+        &self,
+        registry: Rc<RefCell<PortRegistry>>,
+        owner: ProcessId,
+    ) -> RuntimePorts {
         RuntimePorts::new(registry, Rc::clone(&self.atoms), owner)
     }
 
     /// Opens `{spawn_driver, "ram_file_drv"}` with the default (`list`) stream through `hook`.
-    fn open_ram_file(&mut self, hook: &mut RuntimePorts) -> PortId {
+    pub(super) fn open_ram_file(&mut self, hook: &mut RuntimePorts) -> PortId {
+        self.open_ram_file_with(hook, NIL)
+    }
+
+    /// As [`Fixture::open_ram_file`], with `options` — the `[binary]` stream row of the
+    /// command/reply matrix (`ram_file_matrix_tests.rs`) drives the same driver through a
+    /// binary-stream port.
+    pub(super) fn open_ram_file_with(&mut self, hook: &mut RuntimePorts, options: Eterm) -> PortId {
         let name = self.string("ram_file_drv");
         let name = self.name("spawn_driver", name);
-        hook.open_port(name, NIL)
-            .expect("open_port({spawn_driver, \"ram_file_drv\"}, [])")
+        hook.open_port(name, options)
+            .expect("open_port({spawn_driver, \"ram_file_drv\"}, Options)")
     }
 }
 
@@ -661,7 +675,7 @@ impl Fixture {
 ///
 /// The default (`list`) stream shapes `Data` as a char list — the oracle's own
 /// `{data,[3,0,0,0,0]}` — so this reads the integers back rather than text.
-fn data_payload_bytes(message: Eterm) -> Vec<i64> {
+pub(super) fn data_payload_bytes(message: Eterm) -> Vec<i64> {
     let inner = terms::tuple_element(message, 1).expect("the {data, Data} pair");
     let payload = terms::tuple_element(inner, 1).expect("the payload");
     assert!(
@@ -677,13 +691,18 @@ fn data_payload_bytes(message: Eterm) -> Vec<i64> {
 
 /// `bytes` as `~w`-rendered Erlang: `[3,0,0,0,0]`. Used to compare a payload against the
 /// oracle's printed one without depending on Rust's `Debug` spacing.
-fn erl_bytes(bytes: &[i64]) -> String {
+pub(super) fn erl_bytes(bytes: &[i64]) -> String {
     let rendered: Vec<String> = bytes.iter().map(i64::to_string).collect();
     format!("[{}]", rendered.join(","))
 }
 
 /// The `port_info(Port, Item)` counter `fx`'s hook answers, as a plain integer.
-fn counter(fx: &mut Fixture, hook: &mut RuntimePorts, port: PortId, item: &str) -> i64 {
+pub(super) fn counter(
+    fx: &mut Fixture,
+    hook: &mut RuntimePorts,
+    port: PortId,
+    item: &str,
+) -> i64 {
     let wanted = fx.atom(item);
     let pairs = hook
         .port_info(port)

@@ -3221,6 +3221,11 @@ fn byte_count(count: u64) -> Result<Eterm> {
 #[cfg(test)]
 mod tests;
 
+/// The `ram_file_drv` **command/reply matrix** against the live oracle
+/// (see `src/port/ram_file_matrix_tests.rs`). A separate file so the matrix's session runner and
+/// oracle-expression builder do not grow the provider's unit suite.
+#[cfg(test)]
+mod ram_file_matrix_tests;
 /// The A.4 **driver-monitor marking** suite: the runtime's pass-boundary sweep over every live
 /// port's C-driver monitor tree (see `src/port/monitor_tests.rs`). A separate file so the suite
 /// does not grow this one.
