@@ -521,8 +521,12 @@ constructors only (no new error enum).
   chain's covering at every step).
 - **Per-op attribution**: `tests/churn_attribution.rs` reproduces the `tools/bench` `gc_bound/churn` shape and
   drives it through the runtime's own admission door (`should_collect`/`collection_debt` →
-  `ensure_capacity`), asserting the collection counts, the garbage share, and the bounded
-  nursery/mature/chain capacities — the table is in `MEASURED.md`.
+  `ensure_capacity`), asserting the collection counts, the garbage share, the growth-event count and the
+  bounded nursery/mature/chain capacities — the table is in `MEASURED.md`.
+- **Post-fullsweep nursery sizing**: `tests/post_fullsweep_nursery.rs` (a fullsweep keeps the capacity the
+  round observed, keeps the `need_reserve_words` floor over an untouched nursery, never exceeds the collected
+  capacity, and converges to ONE constant capacity under a fixed demand — mutation-verified: stashing the
+  `collector.rs`/`immix_collector.rs` change fails 2/4).
 - **Immix**: `immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` +
   `tests/gen_immix_collector.rs` (geometry/allocation/mark/pin/evacuation/accounting and the hard major cases;
   one corpus through both strategies behind one structural walker; a multi-block object);
