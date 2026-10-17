@@ -264,15 +264,12 @@ and the one-line semantic contract only.
   re-allocated.** `max_heap_words` is the process's heap budget (the C `+hmax`) and the nursery chain *is* the
   process's young heap, so it is enforced against `capacity_words()` (the sum over every space) rather than against
   the space being installed: a fresh space may claim only the remaining budget, and a request that budget cannot
-  cover is the typed `heap_exhausted`. The two behaviours this replaces are an unbounded chain of ceiling-sized
-  spaces and a same-size replacement that retained a whole capacity per call without an error.
-  The ceiling never costs a *reallocation*: a retired space with `used_words() == 0` is provably empty (no word was
-  ever handed out of it, so no term can name into it), so it is re-adopted as the current space — the smallest
-  adequate one, leaving the largest free for a later request — and that swap allocates nothing, moves nothing and
-  changes the summed capacity by nothing, so it consumes no budget.
-  A re-adoption leaves the chain's *set* of spaces unchanged, so the aggregate covering cannot move and `extent` is
-  untouched, but the geometry epoch still advances: which space is current (whose `top` may still move) is part of
-  the cached geometry a host's fast-reject filter is invalidated by.
+  cover is the typed `heap_exhausted`, decided before anything is allocated or retired.
+  It never costs a *reallocation*: a retired space with `used_words() == 0` is provably empty (no word was ever
+  handed out of it, so no term can name into it), so it is re-adopted as the current space — the smallest adequate
+  one, leaving the largest free for a later request — and that swap allocates nothing, moves nothing and consumes no
+  budget. The chain's *set* of spaces is unchanged, so `extent` cannot move, but the geometry epoch still advances:
+  which space is current (whose `top` may still move) is part of the cached geometry.
 - **Containment over the chain is indexed, not scanned.** `Nursery::contains` answers from an ordered index of
   the retired spaces' live regions (`retired_regions: BTreeMap<base, top>`) plus one direct test of the current
   space, so it is `O(log #spaces)`; the intervals are pairwise disjoint (every space is a distinct live
