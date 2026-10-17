@@ -254,10 +254,8 @@ pub(crate) type FastBuildHasher = BuildHasherDefault<FastHasher>;
 /// A [`HashSet`] over [`FastBuildHasher`] — the convenience alias for an internal, verdict-only
 /// key set (see the module docs for when this is the right hasher and when it is not).
 ///
-/// The alias is only spelled out where a *typed* set is needed: the latch's `ForeignLatch` writes
-/// the hasher inline at its one definition site, while `Runtime::async_dist` uses this alias, and
-/// this module's own tests exercise it.
-#[allow(dead_code)]
+/// Used by `Runtime::async_dist`; the latch's `ForeignLatch` spells the same hasher inline at its
+/// one definition site.
 pub(crate) type FastHashSet<T> = HashSet<T, FastBuildHasher>;
 
 /// A [`HashMap`] over [`FastBuildHasher`] — the convenience alias for an internal map whose
@@ -266,7 +264,6 @@ pub(crate) type FastHashSet<T> = HashSet<T, FastBuildHasher>;
 /// `engines`/`results`/`exits`/`errors`, `TimerWakes`'s `deliver`/`resume`, `Runtime::mailboxes`
 /// and the façade's `group_leaders`/`monitor_nodes`/`timer_resumes` — each only probed by an
 /// internal id and never iterated for an observable order.
-#[allow(dead_code)]
 pub(crate) type FastHashMap<K, V> = HashMap<K, V, FastBuildHasher>;
 
 #[cfg(test)]
