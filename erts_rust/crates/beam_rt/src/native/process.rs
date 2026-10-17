@@ -549,6 +549,10 @@ impl RuntimeContext<'_> {
     /// [`BeamError::BadArg`] (the oracle's `badarg`, carrying `badopt` as extended info),
     /// and the typed capability gap is reserved for an option the oracle **accepts** that
     /// this runtime genuinely cannot honour (`{scheduler, N}`, `{async_dist, B}`).
+    ///
+    /// The list is validated **as a whole**: once every option is parsed, the C's cross-field
+    /// heap rule is applied (a nonzero `max_heap_size` must be at least the *rounded*
+    /// `min_heap_size`), so the option order is irrelevant.
     fn spawn_options(&mut self, term: Eterm, arity: u32) -> Result<SpawnOptions> {
         let options = self.argument_list(term)?;
         let mut parsed = SpawnOptions::default();
@@ -603,6 +607,25 @@ impl RuntimeContext<'_> {
                 }
                 // An unknown option tuple, or a tuple whose key is not an atom.
                 Some(_) | None => return Err(BeamError::BadArg),
+            }
+        }
+        // The C's **cross-field** check, run once the whole list is parsed so the option
+        // order cannot matter (`erl_process.c:12429-12431`):
+        //
+        // ```c
+        // if (sop->max_heap_size != 0 && sop->max_heap_size < sop->min_heap_size) result = -1;
+        // ```
+        //
+        // `max_heap_size == 0` is the C's "no upper bound", so it is always accepted, and
+        // `sop->min_heap_size` there is the **rounded** value — `H_MIN_SIZE` (233) when the
+        // option was absent or below it, else `erts_next_heap_size(x, 0)` — which is exactly
+        // what [`SpawnOptions::policy`]'s `HeapPolicy::from_spawn_opts` computes, so this
+        // comparison cannot drift from the growth table. Oracle (OTP 29.1.1): `{min_heap_size,
+        // 100}, {max_heap_size, 233}` spawns, 232 is `badarg`; `{min_heap_size, 1000},
+        // {max_heap_size, 1597}` is `badarg`, 1598 spawns.
+        if let Some(max) = parsed.max_heap_words {
+            if max != 0 && max < parsed.policy().min_heap_words {
+                return Err(BeamError::BadArg);
             }
         }
         Ok(parsed)
