@@ -146,8 +146,8 @@ struct Case {
     name: &'static str,
     /// The exported driver function (arity 1: the loop count).
     function: &'static str,
-    /// Loop count calibrated for the Rust runtime (≥0.5 s of loop work, ≳1.5 s for the case
-    /// whose marginal had fallen into the boot-jitter band).
+    /// Loop count calibrated for the Rust runtime (≥0.5 s of loop work, re-derived whenever the
+    /// measured per-op cost changes materially).
     n_rust: i64,
     /// Loop count calibrated for the system-runtime oracle (a marginal well above its own
     /// run-to-run startup noise).
@@ -167,25 +167,27 @@ impl Case {
 /// The fixed case table.
 ///
 /// The `n_rust`/`n_sys` values are **constants, not measurements**, calibrated on the
-/// reference host (a heavily loaded shared machine — see the crate CONTEXT) under one rule:
-/// **a runtime's timed loop must do enough work that its marginal cost stands clear of that
-/// runtime's own run-to-run boot/startup jitter**, measured here at ≈±0.1 s on the rust boot
-/// (≈0.7–1.5 s under load). The rust-side floor is **≥0.5 s of loop work** (≈5× that
-/// jitter); `etf_roundtrip` — the case whose marginal had collapsed *inside* the band — is
-/// targeted at **≳1.5 s** (as is the sibling `list_walk`). Measured rust per-op cost
-/// (2026-10-16, `/proc/loadavg` 45–100, min-of-reps, default baseline-JIT tier): ≈54 µs
-/// (`etf_roundtrip`), ≈7 µs (`ets_copy`), ≈150 µs (`send_recv`), ≈115 µs
-/// (`send_recv_plain`) — so the counts below are ≈1.4–2.2 s of work; the pre-recalibration
-/// `n_rust` (5 000/100 000/2 000/2 000) were ≈0.27/0.7/0.3/0.2 s. The metric is normalized
-/// **per op**, so the counts only have to keep both marginals measurable, and the
-/// deterministic `case_<name>_ops` companion records the `N` behind every figure — never
-/// compare raw `wall_ms` across sides with different `N`. A loop count whose marginal falls
-/// below the timer noise yields **no** per-op metric (an honest note), never a number.
+/// reference host (a shared machine — see the crate CONTEXT) under one rule: **a runtime's
+/// timed loop must do enough work that its paired marginal stands clear of the measurement
+/// noise**. The samples are interleaved (see the module docs), so the residual noise is the MAD
+/// of the paired differences — a few milliseconds — and a uniform **≥0.5 s of loop work** on the
+/// rust side clears it by orders of magnitude. Measured rust per-op cost (2026-10-17,
+/// `/proc/loadavg` 5.7–7.7, `--full`, paired-median marginals, default baseline-JIT tier):
+/// **1 441.1 ns** (`etf_roundtrip`), **2 409.7 ns** (`ets_copy`), **7 984.0 ns** (`send_recv`),
+/// **2 065.3 ns** (`send_recv_plain`), so the counts below are ≈0.60–0.72 s of work per case:
+/// `etf_roundtrip` 500 000 → ≈721 ms, `ets_copy` 250 000 → ≈602 ms, `send_recv` 90 000 →
+/// ≈719 ms, `send_recv_plain` 300 000 → ≈620 ms. The oracle's `n_sys` stays far larger (its own
+/// marginals are ≈0.9–1.2 s). The metric is normalized **per op**, so the counts only have to
+/// keep both marginals measurable, and the deterministic `case_<name>_ops` companion records the
+/// `N` behind every figure — never compare raw `wall_ms` across sides with different `N`.
+/// Maintenance rule: **when a case's measured per-op cost changes materially, re-derive `n_rust`
+/// so the loop work stays ≥0.5 s**. A loop count whose marginal falls below the timer noise
+/// yields **no** per-op metric (an honest note), never a number.
 static CASES: &[Case] = &[
-    Case { name: "etf_roundtrip", function: ETF, n_rust: 40_000, n_sys: 1_500_000 },
-    Case { name: "ets_copy", function: ETS, n_rust: 200_000, n_sys: 2_000_000 },
-    Case { name: "send_recv", function: SR, n_rust: 10_000, n_sys: 500_000 },
-    Case { name: "send_recv_plain", function: SR_PLAIN, n_rust: 15_000, n_sys: 1_000_000 },
+    Case { name: "etf_roundtrip", function: ETF, n_rust: 500_000, n_sys: 1_500_000 },
+    Case { name: "ets_copy", function: ETS, n_rust: 250_000, n_sys: 2_000_000 },
+    Case { name: "send_recv", function: SR, n_rust: 90_000, n_sys: 500_000 },
+    Case { name: "send_recv_plain", function: SR_PLAIN, n_rust: 300_000, n_sys: 1_000_000 },
 ];
 
 /// The `copy_bound` workload.
@@ -695,18 +697,25 @@ mod tests {
         }
     }
 
-    /// The m14 recalibration: every rust loop count must do ≥0.5 s of work so its marginal stands
-    /// clear of the rust side's ≈±0.1 s boot jitter, and `etf_roundtrip` — the case whose marginal
-    /// had collapsed into that band (≈0.27 s at the old `N` = 5 000) — ≳1.5 s.
+    /// Every rust loop count must do ≥0.5 s of work so its paired marginal stands clear of the
+    /// measurement noise, and ≥3× the conservative noise floor below.
+    ///
+    /// The floor is uniform: with the interleaved (paired) schedule the residual noise is the MAD of
+    /// the paired differences — a few milliseconds — so no case needs extra headroom. Do **not**
+    /// reintroduce a per-case special case (`etf_roundtrip` used to demand ≳1.5 s, which existed
+    /// only because the *old sequential* schedule's marginal collapsed inside the boot-jitter band).
     #[test]
     fn the_rust_loop_counts_clear_the_boot_jitter_band() {
-        // Per-op costs measured on the reference host (2026-10-16, min-of-reps, default
-        // baseline-JIT tier) — see the case table's doc comment.
+        // A conservative bound on the noise a paired marginal must clear: the measured MAD of the
+        // paired differences is a few milliseconds, well under this 50 ms floor.
+        const NOISE_FLOOR_S: f64 = 0.05;
+        // Per-op costs measured on the reference host (2026-10-17, `--full`, paired-median
+        // marginals, default baseline-JIT tier) — see the case table's doc comment.
         const COST_NS: &[(&str, f64, i64)] = &[
-            ("etf_roundtrip", 54_000.0, 40_000),
-            ("ets_copy", 7_000.0, 200_000),
-            ("send_recv", 150_000.0, 10_000),
-            ("send_recv_plain", 115_000.0, 15_000),
+            ("etf_roundtrip", 1_441.1, 500_000),
+            ("ets_copy", 2_409.7, 250_000),
+            ("send_recv", 7_984.0, 90_000),
+            ("send_recv_plain", 2_065.3, 300_000),
         ];
         assert_eq!(COST_NS.len(), CASES.len());
         for (name, ns_per_op, n_rust) in COST_NS {
@@ -714,9 +723,11 @@ mod tests {
             assert_eq!(case.n_rust, *n_rust, "{name}: the recalibrated count");
             let work_s = *n_rust as f64 * ns_per_op / 1e9;
             assert!((0.5..=5.0).contains(&work_s), "{name}: {work_s} s of work");
+            assert!(
+                work_s >= 3.0 * NOISE_FLOOR_S,
+                "{name}: {work_s} s of work must clear 3x the {NOISE_FLOOR_S} s noise floor"
+            );
         }
-        let etf = CASES.iter().find(|c| c.name == "etf_roundtrip").expect("etf");
-        assert!(etf.n_rust as f64 * 54_000.0 / 1e9 >= 1.5);
     }
 
     #[test]

@@ -37,9 +37,10 @@
 //!
 //! A single call is far too short to time, and the two runtimes differ by orders of
 //! magnitude, so a single fixed loop count cannot give both a meaningful marginal. Each
-//! case therefore declares a **per-runtime loop count** `N` (calibrated so a single run
-//! costs a few hundred ms on that runtime) and the workload runs the identical program
-//! twice:
+//! case therefore declares a **per-runtime loop count** `N` (calibrated so the loop does
+//! enough work to lift its paired marginal clear of that runtime's own boot jitter — ≥0.5 s
+//! of loop work on the Rust runtime, see the case table) and the workload runs the identical
+//! program twice:
 //!
 //! * at `N` iterations ⇒ `case_<name>_wall_ms` (end-to-end process wall time),
 //! * at `0` iterations ⇒ `case_<name>_startup_ms` (the same program's pure
@@ -90,9 +91,10 @@
 //! **On `beam_rt` the per-call cost itself grows with `N`** (measured super-linear; see
 //! `RESULTS.md` §3.4), so `case_<name>_ns_per_call` is only a clean marginal at the declared
 //! `N` and is **only comparable across runs that used the SAME `N`**. The `sys` (system
-//! ERTS) side is ~flat over the same range. The per-runtime `N` values are unchanged since
-//! m10, so the m10↔m11 A/B was taken at **matched `N`** and is a valid comparison; a run
-//! that changes a case's `n_rust` is not. Each Rust row therefore carries an explicit note
+//! ERTS) side is ~flat over the same range. The m15 recalibration re-derived every `n_rust`
+//! (the runtime had become ≈3× faster), so a per-call figure is comparable only across runs
+//! that quote the same `n_rust` — a recalibration is a **new** measurement baseline, never a
+//! continuation of the old one. Each Rust row therefore carries an explicit note
 //! stating this, and every row carries the `N` it used in `case_<name>_calls`. The Rust
 //! peak-RSS figure is likewise **not** a like-for-like memory comparison: it is
 //! boot-dominated (the resident preloaded-module set dwarfs the loop's own footprint).
@@ -112,13 +114,14 @@
 
 use std::path::{Path, PathBuf};use std::process::Command;
 
-use crate::marginal::{resolve, sample_pairs, Marginal, PairedRuns, Pass, PassError};
+use crate::marginal::Marginal;
 use crate::metrics::{Category, Metric, Probe, Runtimes, Status};
-use crate::proc::{self, Completed};
+use crate::proc;
 use crate::report::{Profile, WorkloadResult};
 use crate::runtime::RuntimeKind;
 use crate::scratch::ScratchDir;
 use crate::workload::{RunContext, Workload};
+use crate::workloads::foreign_sample::execute_case;
 use crate::workloads::{resolve_repo, slice};
 
 /// The documented default Cowboy checkout (overridable via `--repo cowboy=<path>` /
@@ -160,9 +163,9 @@ const DRIVER_SOURCE: &str = "-module(bench_foreign_driver).\n\
 
 /// One foreign case: a real module from a target repo plus the driver function that
 /// loops over it.
-struct Case {
+pub(super) struct Case {
     /// Stable, short case name (used in the metric names, e.g. `case_<name>_wall_ms`).
-    name: &'static str,
+    pub(super) name: &'static str,
     /// The driver function to call (arity 1: the loop count).
     function: &'static str,
     /// The repo id used by `--repo <id>=<path>` / `$BENCH_<ID>_REPO`.
@@ -172,16 +175,17 @@ struct Case {
     /// The `*.erl` sources to stage and compile, relative to the repo root.
     sources: &'static [&'static str],
     /// The result increment per iteration (`result == N * per_call`).
-    per_call: i64,
-    /// Loop count calibrated for the Rust runtime (a few hundred ms per run).
+    pub(super) per_call: i64,
+    /// Loop count calibrated for the Rust runtime (≥0.5 s of loop work — see the case table).
     n_rust: i64,
-    /// Loop count calibrated for the system-runtime oracle (a few tens of ms per run).
+    /// Loop count calibrated for the system-runtime oracle (a marginal well above its own
+    /// run-to-run startup noise).
     n_sys: i64,
 }
 
 impl Case {
     /// The loop count this runtime should use.
-    fn n_for(&self, kind: RuntimeKind) -> i64 {
+    pub(super) fn n_for(&self, kind: RuntimeKind) -> i64 {
         match kind {
             RuntimeKind::Rust => self.n_rust,
             RuntimeKind::Sys => self.n_sys,
@@ -206,13 +210,34 @@ impl Case {
 
 /// The fixed case table.
 ///
-/// `n_rust`/`n_sys` were calibrated on the reference host (see the crate CONTEXT) so that
-/// a single run costs a few hundred ms on Rust and a **oracle marginal well above the
-/// ~±30 ms run-to-run startup noise** on the system runtime (each oracle function costs
-/// a few hundred ns, so the oracle loop count is in the 10^5–10^6 range); they are
-/// constants, not measurements, and the reported metric is normalized per call. A loop
-/// count whose marginal falls below the timer noise yields **no** per-call metric (an
-/// honest note), never a fabricated one.
+/// `n_rust`/`n_sys` are **constants, not measurements**, calibrated on the reference host (a
+/// loaded shared machine — see the crate CONTEXT) under one rule: **a runtime's timed loop must
+/// do enough work that its marginal cost stands clear of that runtime's own run-to-run
+/// boot/startup jitter**. The rust-side floor is therefore **≥0.5 s of loop work** (the m15
+/// session measured the paired noise at ≈±3–9 ms per case, and the boot jitter reaches ≈±0.1 s
+/// under load).
+///
+/// Measured rust per-call cost and the loop work each count below implies (m15, 2026-10-17,
+/// `/proc/loadavg` 5.7–7.7, `--full`, default baseline-JIT tier, paired-median marginals):
+/// `bstr_to_lower` ≈13.4 µs × 50 000 ≈ 0.67 s; `bstr_capitalize_token` ≈16.0 µs × 40 000
+/// ≈ 0.64 s; `emqx_base62_encode` ≈10.7 µs × 60 000 ≈ 0.64 s; `emqx_base62_decode` ≈10.3 µs ×
+/// 60 000 ≈ 0.62 s. The counts these replace (20 000/15 000/25 000/15 000) were calibrated
+/// against a ≈3× slower runtime and had fallen to 154–268 ms of work. `n_sys` keeps the
+/// oracle's marginal at ≈1–1.2 s.
+///
+/// **Maintenance rule: when a case's measured per-call cost changes materially, re-derive that
+/// case's `n_rust` from the new cost under this rule** (and re-pin it in
+/// `the_rust_loop_counts_clear_the_boot_jitter_band`, which also fails if a new case is added
+/// without a measured cost). One consequence of the `N`-dependence documented at the top of this
+/// file: the rust per-call figure is itself `N`-dependent, so a recalibrated `n_rust` also ends
+/// comparability with runs taken at the old `N` — quote a per-call figure only alongside the `N`
+/// it was measured at.
+///
+/// The metric is normalized **per call**, so the counts only have to keep both marginals
+/// measurable, and the deterministic `case_<name>_calls` companion records the `N` behind every
+/// figure — never compare raw `wall_ms` across sides with different `N`. A loop count whose
+/// marginal falls below the timer noise yields **no** per-call metric (an honest note), never a
+/// fabricated one.
 static CASES: &[Case] = &[
     Case {
         name: "bstr_to_lower",
@@ -221,7 +246,7 @@ static CASES: &[Case] = &[
         default_root: COWBOY_ROOT,
         sources: &["src/cowboy_bstr.erl"],
         per_call: 30,
-        n_rust: 20_000,
+        n_rust: 50_000,
         n_sys: 1_500_000,
     },
     Case {
@@ -231,7 +256,7 @@ static CASES: &[Case] = &[
         default_root: COWBOY_ROOT,
         sources: &["src/cowboy_bstr.erl"],
         per_call: 30,
-        n_rust: 15_000,
+        n_rust: 40_000,
         n_sys: 1_500_000,
     },
     Case {
@@ -241,7 +266,7 @@ static CASES: &[Case] = &[
         default_root: EMQX_ROOT,
         sources: &["apps/emqx/src/emqx_base62.erl"],
         per_call: 16,
-        n_rust: 25_000,
+        n_rust: 60_000,
         n_sys: 3_000_000,
     },
     Case {
@@ -251,7 +276,7 @@ static CASES: &[Case] = &[
         default_root: EMQX_ROOT,
         sources: &["apps/emqx/src/emqx_base62.erl"],
         per_call: 11,
-        n_rust: 15_000,
+        n_rust: 60_000,
         // The oracle's marginal is the smallest of the four, so it needs the largest loop.
         n_sys: 3_000_000,
     },
@@ -279,7 +304,7 @@ fn any_sources_available() -> bool {
 }
 
 /// The per-side argv for one case at `n` iterations (everything after the program path).
-fn argv_for(kind: RuntimeKind, dir: &Path, case: &Case, n: i64) -> Vec<String> {
+pub(super) fn argv_for(kind: RuntimeKind, dir: &Path, case: &Case, n: i64) -> Vec<String> {
     let beam = dir.join(format!("{DRIVER_MODULE}.beam"));
     let call = format!("{DRIVER_MODULE}:{}/1", case.function);
     match kind {
@@ -419,129 +444,6 @@ fn stage(
     Ok(wanted)
 }
 
-/// The samples collected for one case under one runtime.
-struct CaseOutcome {
-    /// The loop count used.
-    n: i64,
-    /// Wall-clock samples (ms) of the `n`-iteration runs, in interleaved round order.
-    wall: Vec<f64>,
-    /// Wall-clock samples (ms) of the `0`-iteration (startup-only) runs, one per work sample.
-    startup: Vec<f64>,
-    /// Peak-RSS samples (bytes) of the `n`-iteration (work) runs only.
-    rss: Vec<f64>,
-    /// The stdout observed on the first successful `n`-iteration run.
-    observed: Option<String>,
-    /// Whether the runtime reported the case as `unsupported` (Rust exit `3`).
-    unsupported: bool,
-    /// Notes about failures/variations (never silent).
-    notes: Vec<String>,
-    /// The paired, drift-cancelling marginal the per-call figure is resolved from.
-    marginal: Marginal,
-}
-
-impl CaseOutcome {
-    /// Whether the case produced at least one usable timing.
-    fn ok(&self) -> bool {
-        !self.wall.is_empty()
-    }
-}
-
-/// One completed sample of a case: the wall time, the poller's peak RSS, the trimmed stdout
-/// and any note about this particular run.
-struct CaseSample {
-    /// End-to-end process wall time, in milliseconds.
-    wall_ms: f64,
-    /// The process's peak RSS, when the poller could read it.
-    peak_memory_bytes: Option<u64>,
-    /// The run's trimmed stdout.
-    stdout: String,
-    /// Per-sample notes (e.g. an unexpected stdout on this pass).
-    notes: Vec<String>,
-}
-
-/// Runs **one** sample of `case` — the `Work` pass (`n` iterations) or the `Startup` pass
-/// (`0` iterations, i.e. the same program's pure boot cost) — returning the sample, or a
-/// [`PassError`] carrying the classified note when the run fails. The Rust runtime's `exit 3`
-/// capability gap is flagged `unsupported` **only** while no work sample has completed: once
-/// the case has produced a timing, a later failure is a real one.
-fn sample_once(
-    program: &Path, kind: RuntimeKind, dir: &Path, case: &Case, n: i64, pass: Pass,
-    completed_work_samples: usize,
-) -> std::result::Result<CaseSample, PassError> {
-    let loops = n * pass.units();
-    let mut cmd = Command::new(program);
-    cmd.args(argv_for(kind, dir, case, loops));
-    let completed = proc::run(&mut cmd).map_err(|e| PassError {
-        note: format!("case {} ({}): spawn failed: {e}", case.name, kind.as_str()),
-        unsupported: false,
-    })?;
-    if !completed.success {
-        return Err(PassError {
-            note: classify_failure(kind, case, &completed),
-            unsupported: kind == RuntimeKind::Rust
-                && completed.exit_code == Some(3)
-                && completed_work_samples == 0,
-        });
-    }
-    // The driver's result is linear in the loop count, so the expected stdout is exact on both
-    // passes (`0` on the startup pass). A mismatch is a note, never a fatal error: the timing
-    // is still real.
-    let stdout = completed.stdout_trim().to_string();
-    let expected = (loops * case.per_call).to_string();
-    let mut notes = Vec::new();
-    if stdout != expected {
-        notes.push(format!(
-            "case {}: unexpected stdout on the {} pass `{stdout}` (expected `{expected}`)",
-            case.name,
-            pass.as_str()
-        ));
-    }
-    Ok(CaseSample {
-        wall_ms: completed.wall_ms,
-        peak_memory_bytes: completed.peak_memory_bytes,
-        stdout,
-        notes,
-    })
-}
-
-/// Folds the interleaved runs into a [`CaseOutcome`]: the paired wall times, the work-pass peak
-/// RSS, the first observed stdout, every per-sample note, the resolved marginal and the abort
-/// (if any — the rounds completed before it are **kept** and still reported).
-fn outcome_from(n: i64, sampled: PairedRuns<CaseSample>) -> CaseOutcome {
-    let PairedRuns { pairs, aborted } = sampled;
-    let (mut wall, mut startup) = (Vec::with_capacity(pairs.len()), Vec::with_capacity(pairs.len()));
-    let (mut rss, mut observed, mut notes) = (Vec::new(), None, Vec::new());
-    for (work, baseline) in pairs {
-        wall.push(work.wall_ms);
-        startup.push(baseline.wall_ms);
-        if let Some(bytes) = work.peak_memory_bytes {
-            rss.push(bytes as f64);
-        }
-        if observed.is_none() {
-            observed = Some(work.stdout);
-        }
-        notes.extend(work.notes);
-        notes.extend(baseline.notes);
-    }
-    let deltas: Vec<(f64, f64)> = wall.iter().copied().zip(startup.iter().copied()).collect();
-    // The closure already decided whether an abort was a capability gap (`exit 3` with no
-    // completed work sample), so that classification carries over untouched.
-    let unsupported = matches!(aborted.as_ref(), Some(abort) if abort.unsupported);
-    if let Some(abort) = aborted {
-        notes.push(abort.note);
-    }
-    CaseOutcome {
-        n,
-        wall,
-        startup,
-        rss,
-        observed,
-        unsupported,
-        notes,
-        marginal: resolve(&deltas, n),
-    }
-}
-
 /// Emits the per-call metric family for one case: the `case_<name>_ns_per_call` figure plus its
 /// auditable `paired median=…` detail note when the marginal cleared the noise band, or the
 /// withholding note (and **no** metric) when it did not.
@@ -571,40 +473,8 @@ fn calls_metric(case: &Case, n: i64) -> Metric {
 /// limitation is machine-visible rather than buried in prose).
 const N_DEPENDENCE_NOTE: &str = "caveat: on the Rust runtime this per-call metric is \
      N-DEPENDENT (the measured per-call cost grows with N, super-linearly), so \
-     case_<name>_ns_per_call is only comparable across runs that used the SAME N; the m10 \
-     vs m11 (HEAD) A/B was run at matched N (the case table's n_rust is unchanged). See \
-     RESULTS.md 3.4.";
-
-/// Classifies a non-zero / killed run into a human note.
-fn classify_failure(kind: RuntimeKind, case: &Case, completed: &Completed) -> String {
-    let stderr = completed.stderr.trim();
-    match (kind, completed.exit_code) {
-        (RuntimeKind::Rust, Some(3)) => {
-            let reason = stderr.strip_prefix("beam_rt: unsupported: ").unwrap_or(stderr);
-            format!("case {}: unsupported: {reason}", case.name)
-        }
-        (_, Some(code)) => format!("case {} ({}): exited {code}: {stderr}", case.name, kind.as_str()),
-        (_, None) => format!("case {} ({}): terminated by signal: {stderr}", case.name, kind.as_str()),
-    }
-}
-
-/// Runs one case `runs` times **interleaved**: every round samples the `n`-iteration pass and
-/// then the `0`-iteration pass back to back, so the boot cost drifts *inside* a pair rather than
-/// between two passes (see the module docs and `crate::marginal`). A failing sample aborts the
-/// measurement; the rounds already completed are kept and reported, and a case whose **first
-/// work** pass failed is flagged `unsupported` instead of timed.
-fn execute_case(program: &Path, kind: RuntimeKind, dir: &Path, case: &Case, runs: usize) -> CaseOutcome {
-    let n = case.n_for(kind);
-    let mut completed_work_samples = 0usize;
-    let sampled = sample_pairs(runs, |pass| {
-        let sample = sample_once(program, kind, dir, case, n, pass, completed_work_samples)?;
-        if pass == Pass::Work {
-            completed_work_samples += 1;
-        }
-        Ok(sample)
-    });
-    outcome_from(n, sampled)
-}
+     case_<name>_ns_per_call is only comparable across runs that used the SAME N; a \
+     recalibrated n_rust is a new baseline, so compare only at matched N. See RESULTS.md 3.4.";
 
 impl Workload for Foreign {
     fn id(&self) -> &'static str {
@@ -781,7 +651,8 @@ impl Workload for Foreign {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::marginal::{sample_pairs, Pass, PassError};
+    use crate::workloads::foreign_sample::{outcome_from, CaseSample};
     #[test]
     fn metadata_is_stable() {
         let w = Foreign;
@@ -805,6 +676,29 @@ mod tests {
                 "{}: the oracle loop must be the larger one",
                 case.name
             );
+        }
+    }
+
+    /// The m15 recalibration, pinned: every rust loop count must do ≥0.5 s of loop work so its
+    /// paired marginal stands clear of the rust side's noise band, computed at the per-call cost
+    /// measured for that case (see the case table's doc comment). Pinning the table also means a
+    /// newly added case cannot slip through uncalibrated — `COST_NS` must grow with `CASES`.
+    #[test]
+    fn the_rust_loop_counts_clear_the_boot_jitter_band() {
+        // Measured rust per-call costs (m15, 2026-10-17, `/proc/loadavg` 5.7–7.7, `--full`,
+        // default baseline-JIT tier, paired-median marginals) and the `n_rust` they imply.
+        const COST_NS: &[(&str, f64, i64)] = &[
+            ("bstr_to_lower", 13_400.7, 50_000),
+            ("bstr_capitalize_token", 15_996.6, 40_000),
+            ("emqx_base62_encode", 10_737.3, 60_000),
+            ("emqx_base62_decode", 10_286.2, 60_000),
+        ];
+        assert_eq!(COST_NS.len(), CASES.len(), "every case needs a measured per-call cost");
+        for (name, ns_per_call, n_rust) in COST_NS {
+            let case = CASES.iter().find(|c| c.name == *name).expect("case");
+            assert_eq!(case.n_rust, *n_rust, "{name}: the recalibrated count");
+            let work_s = *n_rust as f64 * ns_per_call / 1e9;
+            assert!((0.5..=5.0).contains(&work_s), "{name}: {work_s} s of loop work");
         }
     }
 
