@@ -152,7 +152,7 @@ Verified against the system `erlc` (OTP 29) disassembly:
 - `write.rs:165` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
   for an impossible post-reserve state.
 
-## Handoff (parent-owned)
+## Handoff (parent-owned) REMOVE_ME
 - `../../../tests/gaps.rs` still asserts the two read instructions' `no_fail` cases against the **old**
   engine-defined sentinel errors, which the read path no longer raises — it now raises the bare atom
   `function_clause` (class `error`). The unseeded fixture therefore surfaces the missing-atom gap, so
