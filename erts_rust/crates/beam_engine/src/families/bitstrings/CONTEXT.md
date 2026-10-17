@@ -121,6 +121,11 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   the instruction's fail label (or raises `{badmatch, Value}` when the label is `NO_FAIL`);
   a construction-segment failure raises the bare `SegReason` atom (`badarg` /
   `system_limit`), never the matching side's `fail_step`.
+- The `{badmatch, Value}` tag resolves through `machine::namespace_atom` (the host's live
+  `ctx.atoms(module)` namespace first, the module's load-time snapshot second) via
+  `crate::terms::badmatch_reason_rooted`, so a namespace that can name `badmatch` raises the
+  tuple even when the module snapshot cannot, and a name **neither** source knows is the typed
+  `BeamError::BadMatch` — never a substituted index.
 - Term construction/inspection is **only** `beam_term`; a match context's interior is
   never re-derived by hand.
 - Term-constructing arms allocate through the rooted seam
