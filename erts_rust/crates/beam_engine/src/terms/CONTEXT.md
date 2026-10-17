@@ -7,7 +7,10 @@ context and passes it to the `beam_term` writers, and reads terms back for the i
 It is the crate's — and the widened interpreter's — **single point of raw-heap access**
 (`lib.rs` lifts the crate-wide `#![deny(unsafe_code)]` for `pub mod terms` alone, alongside
 `predicates`). Only the **heap binary** family has no `beam_term` owner and hand-rolls its
-layout here, pinned to the C ground truth.
+layout here, pinned to the C ground truth. Both heap-binary builders zero the whole data
+section before the payload copy, so the padding tail of the last data word is always zero
+and the term never carries stale heap content past its bit count — the same discipline as
+`beam_term::bitstring::write_heap_bits`.
 
 ## Two builder flavours: classic (public) and `*_rooted`
 The module exposes **both** an allocation seam's worth of builders, side by side, and both are
