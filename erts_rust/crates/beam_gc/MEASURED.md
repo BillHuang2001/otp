@@ -772,6 +772,7 @@ own heap admissions" is that artifact: it **does not reproduce at HEAD**.
 | 1 000 | 1 050 | 2 591 | 2 591 | 2 593 | 0 |
 | 3 000 | 3 144 | 7 785 | 7 785 | 7 787 | 0 |
 | 10 000 | 10 474 | 25 967 | 25 967 | 25 969 | 0 |
+
 | `live/1` N | oracle `minor_gcs` | rust `minor_gcs` (default) | rust `minor_gcs` (`+hms 233`) | rust collections | rust fullsweeps |
 |---|---|---|---|---|---|
 | 1 000 | 1 448 | 25 955 | 25 955 | 25 956 | 0 |
