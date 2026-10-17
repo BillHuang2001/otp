@@ -525,3 +525,100 @@ fn monitor_reference_term(
     ctx.runtime.put_bif_heap(heap);
     term
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The process-table number the dead recipient of every case uses.
+    const DEAD: u64 = 9;
+
+    /// A link-family signal for port `port`, addressed to process `to`.
+    ///
+    /// Only the `'EXIT'` kind is built: [`PendingPortSignals::prune`] is kind-agnostic (it
+    /// filters on the recipient alone), so a `'DOWN'` entry would exercise nothing extra and
+    /// would need a `MonitorRef` from a `beam_process` allocator.
+    fn exit_signal(port: u64, to: u64) -> PortSignal {
+        PortSignal {
+            port: PortId::new(port),
+            to: ProcessId::new(to, 0),
+            kind: PortSignalKind::Exit,
+        }
+    }
+
+    /// A queue whose one close has already been reported, so its entries are deliverable.
+    fn reported(signals: Vec<PortSignal>) -> PendingPortSignals {
+        let mut pending = PendingPortSignals::default();
+        pending.stash(PortId::new(1), signals);
+        pending.report(PortId::new(1));
+        pending
+    }
+
+    #[test]
+    fn prune_drops_a_dead_recipients_entries_and_keeps_the_live_ones_in_order() {
+        let mut pending = reported(vec![
+            exit_signal(1, 7),
+            exit_signal(1, DEAD),
+            exit_signal(1, 8),
+        ]);
+        assert!(!pending.is_empty(), "the report made the entries deliverable");
+
+        pending.prune(|to| to.number() != DEAD);
+
+        assert_eq!(
+            pending.take(),
+            vec![exit_signal(1, 7), exit_signal(1, 8)],
+            "the live recipients keep their entries, in report order"
+        );
+    }
+
+    #[test]
+    fn prune_empties_a_queue_whose_only_recipient_is_dead() {
+        // The stale-queue shape: every entry belongs to a process that will never poll again,
+        // so leaving them queued would hold `has_nothing_to_poll()` false for ever.
+        let mut pending = reported(vec![exit_signal(1, DEAD)]);
+        assert!(!pending.is_empty());
+
+        pending.prune(|_| false);
+
+        assert!(
+            pending.is_empty(),
+            "a queue of dead recipients is no longer pending work"
+        );
+        assert!(pending.take().is_empty(), "and it hands out nothing");
+    }
+
+    #[test]
+    fn prune_keeps_every_entry_when_every_recipient_is_alive() {
+        let signals = vec![exit_signal(1, 7), exit_signal(1, 8)];
+        let mut pending = reported(signals.clone());
+
+        pending.prune(|_| true);
+
+        assert_eq!(
+            pending.take(),
+            signals,
+            "a live recipient's entry is never dropped"
+        );
+    }
+
+    #[test]
+    fn prune_leaves_an_unreported_close_queued_for_its_report() {
+        // An entry whose close has not been reported is not *deliverable* yet, but it is still
+        // owed: pruning must not reach it (the report is what moves it to `ready`).
+        let mut pending = PendingPortSignals::default();
+        pending.stash(PortId::new(1), vec![exit_signal(1, DEAD)]);
+
+        pending.prune(|_| false);
+
+        assert!(pending.has_unreported(), "the close is still outstanding");
+        assert!(
+            !pending.is_empty(),
+            "an unreported close is still pending work"
+        );
+
+        pending.report(PortId::new(1));
+        pending.prune(|_| false);
+        assert!(pending.is_empty(), "once reported, a dead entry is pruned");
+    }
+}
