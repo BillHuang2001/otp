@@ -1026,6 +1026,23 @@ impl Rig {
         self.driver.output(&mut ctx)
     }
 
+    /// Queues `bytes` on the port output queue, as `port_command/2` does (the C's `ioq`).
+    fn queue_output(&mut self, bytes: &[u8]) {
+        self.output.push(bytes);
+    }
+
+    /// [`Driver::ready_output`]: the write-readiness re-drive of a queued command.
+    fn ready_output(&mut self) -> Result<usize> {
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut self.poller,
+            &mut self.input,
+            &mut self.output,
+            &mut self.arms,
+        );
+        self.driver.ready_output(&mut ctx)
+    }
+
     /// The bytes the driver has read into the port input queue, consumed.
     fn take_input(&mut self) -> Vec<u8> {
         let bytes = self.input.front().to_vec();
@@ -1350,6 +1367,121 @@ fn a_shutdown_on_a_not_connected_port_is_enotconn() {
 }
 
 // -----------------------------------------------------------------------
+// A socket-less / unconnected port command is refused (`inet_drv.c:12629`)
+// -----------------------------------------------------------------------
+
+/// **A `port_command/2` on a port with no socket is refused, and the queued bytes survive.**
+///
+/// The C has two ways to reject a command here: with a well-formed caller-ref prefix its
+/// `tcp_inet_command` answers `inet_reply_error(ENOTCONN)` for a socket it cannot write
+/// (`inet_drv.c:12645` — the caller still gets `true` from `port_command/2` and learns the
+/// outcome from the later `{inet_reply, S, {error, enotconn}}` message), while a bare
+/// `port_command/2` payload carries no caller-ref prefix at all, so `init_caller` (`:1854`)
+/// rejects it and the driver fails the port (`driver_failure_posix(EINVAL)`, `:12634`).
+///
+/// This driver has neither seam — the frozen [`Driver`] trait has no `driver_failure` and no
+/// asynchronous reply channel — so it reports the same condition as a typed
+/// [`BeamError::BadArg`] and never touches the queue: `Port::output`/`Port::ready_output`
+/// propagate the error up to `erlang:port_command/2`'s caller instead of silently dropping the
+/// command. The refusal is **idempotent**: the write-readiness re-drive refuses identically and
+/// still leaves every byte queued.
+/// [`the_socket_less_command_sequence_matches_the_erl_oracle`] pins the oracle's own sequence.
+#[test]
+fn a_socket_less_port_command_is_refused_and_keeps_its_bytes() {
+    let mut rig = Rig::new(TcpInetDriver::new());
+    rig.start().expect("a socket-less driver registers nothing");
+
+    rig.queue_output(b"\x01\x02\x03");
+    assert_eq!(rig.output_len(), 3, "the command is queued");
+    assert!(
+        matches!(rig.drain_output(), Err(BeamError::BadArg)),
+        "`Driver::output` refuses a command it has no socket for"
+    );
+    assert_eq!(
+        rig.output_len(),
+        3,
+        "the refused command's bytes are never consumed"
+    );
+
+    assert!(
+        matches!(rig.ready_output(), Err(BeamError::BadArg)),
+        "the write-readiness re-drive refuses the same command the same way"
+    );
+    assert_eq!(rig.output_len(), 3, "still never consumed");
+    assert_eq!(
+        rig.driver.state(),
+        InetState::Closed,
+        "a refusal is not a state change: the port is still socket-less"
+    );
+}
+
+/// The same refusal on an **opened but unconnected** socket: `open` + `bind` leaves the driver in
+/// [`InetState::Open`], which is still not `IS_CONNECTED` (`inet_drv.c:1037`), so the C's
+/// `tcp_inet_command` answers `enotconn` there too (`:12645`) — a bound socket with no peer cannot
+/// write.
+///
+/// The socket really exists here, so this is the shape that could otherwise silently drop bytes:
+/// the refusal must still leave them queued.
+#[test]
+fn an_unconnected_socket_refuses_a_port_command_and_keeps_its_bytes() {
+    let mut rig = Rig::new(TcpInetDriver::new());
+    rig.start().expect("the driver starts");
+
+    assert_eq!(
+        rig.control("open", &open_arg()).expect("the open verb"),
+        ctl_ok()
+    );
+    assert_eq!(
+        rig.control("bind", &loopback_arg(0)).expect("the bind verb")[0],
+        INET_REP_OK
+    );
+    assert_eq!(rig.driver.state(), InetState::Open);
+    assert!(rig.driver.socket().is_some(), "the socket exists");
+
+    rig.queue_output(b"\x01\x02\x03");
+    assert!(
+        matches!(rig.drain_output(), Err(BeamError::BadArg)),
+        "a command on a socket with no peer is refused"
+    );
+    assert_eq!(rig.output_len(), 3, "the bytes are never consumed");
+    assert!(
+        matches!(rig.ready_output(), Err(BeamError::BadArg)),
+        "and the write-readiness re-drive refuses it too"
+    );
+    assert_eq!(rig.output_len(), 3, "still never consumed");
+}
+
+/// **A connected socket still writes** — the shape this driver must keep working. The queued
+/// command is drained to the socket, `Driver::output` reports exactly the queued count (what the
+/// port charges as written) and the output queue is left empty.
+#[test]
+fn a_connected_socket_drains_a_queued_port_command() {
+    let (mut rig, mut client) = Rig::connected();
+    client
+        .set_read_timeout(Some(WAIT))
+        .expect("a read timeout");
+
+    rig.queue_output(b"hello");
+    assert_eq!(rig.output_len(), 5);
+    assert_eq!(
+        rig.drain_output().expect("the output callback"),
+        5,
+        "the drained command is reported byte for byte"
+    );
+    assert_eq!(rig.output_len(), 0, "the queue is empty after the write");
+    assert!(
+        !rig.driver.interest.is_writable(),
+        "a fully drained queue leaves write readiness unarmed"
+    );
+
+    let mut buf = [0u8; 5];
+    client
+        .read_exact(&mut buf)
+        .expect("the peer reads the command");
+    assert_eq!(&buf, b"hello", "the bytes really reached the peer");
+}
+
+// -----------------------------------------------------------------------
 // The oracle cross-check (skips loudly when `erl` is absent)
 // -----------------------------------------------------------------------
 
@@ -1599,4 +1731,59 @@ fn the_half_close_and_peer_close_semantics_agree_with_the_erl_oracle() {
         ctl_xerror("enotconn"),
         "the oracle's `{{error,enotconn}}`"
     );
+}
+
+/// The oracle's side of the **socket-less `port_command/2`**, pinned on a fresh bare
+/// `{spawn_driver,"tcp_inet"}` port: the first command answers `true`, the port is dead
+/// afterwards (`port_info(P, name)` is `undefined`) and every later command raises `badarg`
+/// (caught here as an exit-shaped term, hence the `contains` check rather than equality with the
+/// bare atom).
+///
+/// That sequence is the **caller-ref grammar**, not the socket state: `tcp_inet_command` fails
+/// through `init_caller` (`inet_drv.c:1854`) whenever the payload is too short to carry the
+/// two-byte length + caller-ref tag a distribution-style command prefixes, and then runs
+/// `driver_failure_posix(EINVAL)` (`:12634`). The same probe with a well-formed prefix
+/// (`<<0,0,1>>`, a zero-length ref) answers `true` **and leaves the port alive**
+/// (`{name,"tcp_inet"}`), the C replying `{error, enotconn}` out of band (`:12645`).
+///
+/// The residual difference is deliberate and asserted, not glossed over: the frozen [`Driver`]
+/// trait has neither a `driver_failure` seam nor an asynchronous `{inet_reply, …}` channel, so
+/// the Rust side refuses the **first** delivered round with a typed [`BeamError::BadArg`] and
+/// keeps the bytes. Neither oracle shape is compared against our reply — only the sequence
+/// (first command accepted, port unusable afterwards) is pinned.
+///
+/// **Skips loudly** when `erl` is not on `PATH`.
+#[test]
+fn the_socket_less_command_sequence_matches_the_erl_oracle() {
+    let expr = "process_flag(trap_exit, true), \
+                P = open_port({spawn_driver, \"tcp_inet\"}, [binary]), \
+                First = (catch erlang:port_command(P, <<1>>)), \
+                Dead = erlang:port_info(P, name), \
+                Second = (catch erlang:port_command(P, <<1>>)), \
+                io:format(\"~p|~p|~p\", [First, Dead, Second])";
+    let Some(dump) = erl_stdout(expr) else {
+        eprintln!("SKIP: no `erl` on PATH — skipping the socket-less command oracle check");
+        return;
+    };
+    assert!(
+        dump.starts_with("true|undefined|"),
+        "the oracle accepts the first command and kills the port: {dump:?}"
+    );
+    assert!(
+        dump.contains("badarg"),
+        "the oracle refuses every command after the port died (a caught, exit-shaped badarg \
+         raise): {dump:?}"
+    );
+
+    // Our side of the same port state: the first delivered round is refused and the bytes stay
+    // queued, so a caller learns about the refusal instead of losing its command.
+    let mut rig = Rig::new(TcpInetDriver::new());
+    rig.start().expect("a socket-less driver registers nothing");
+    rig.queue_output(b"\x01");
+    assert!(
+        matches!(rig.drain_output(), Err(BeamError::BadArg)),
+        "the Rust side refuses the first round (the oracle answers `true` and kills the port — \
+         a `driver_failure` seam this driver has no access to)"
+    );
+    assert_eq!(rig.output_len(), 1, "and the refused bytes stay queued");
 }

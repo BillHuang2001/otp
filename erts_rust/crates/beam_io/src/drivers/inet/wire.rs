@@ -31,9 +31,13 @@
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`.
 
+use std::os::unix::io::RawFd;
+
 use beam_common::Result;
 
 use crate::error;
+
+use super::sys;
 
 /// The result tag of a successful control operation (`INET_REP_OK`, `inet_drv.c:870`).
 pub const INET_REP_OK: u8 = 1;
@@ -137,6 +141,7 @@ pub(super) fn errno_name(errno: i32) -> String {
         libc::EAFNOSUPPORT => Some("eafnosupport"),
         libc::EAGAIN => Some("eagain"),
         libc::EALREADY => Some("ealready"),
+        libc::EBADF => Some("ebadf"),
         libc::ECONNABORTED => Some("econnaborted"),
         libc::ECONNREFUSED => Some("econnrefused"),
         libc::ECONNRESET => Some("econnreset"),
@@ -169,6 +174,132 @@ pub(super) fn errno_name(errno: i32) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The reply shapes of the shared `inet_ctl` arms
+// ---------------------------------------------------------------------------
+//
+// Both drivers delegate `GETSTAT`/`GETTYPE`/`GETFD`/`GETSTATUS`/`NAME`/`PEER` to the *same*
+// `inet_ctl` function (`inet_drv.c:10988`), so their reply shapes are built once here rather than
+// once per driver. Each builder is a faithful port of the corresponding C arm; where this floor
+// cannot produce the C's payload it is a typed error, never a fabricated reply.
+
+/// The `INET_REQ_GETSTAT` reply (the C's `inet_fill_stat`, `inet_drv.c:10732`).
+///
+/// An **empty** request answers the bare success tag — the C's `fill_stat` writes a record only
+/// for each requested counter, so nothing requested means nothing appended (measured `[1]` on
+/// both drivers' bare ports).
+///
+/// # Errors
+///
+/// [`beam_common::BeamError`] carrying the typed "not served" reason for a non-empty request: the
+/// C's statistics counters (`recv_cnt`/`send_cnt`/`recv_oct`/`send_oct`/…) live on the driver's
+/// descriptor and are not tracked by this floor, and answering a zeroed counter would be a wrong
+/// value rather than a missing one.
+pub(super) fn getstat_reply(arg: &[u8]) -> Result<Vec<u8>> {
+    if arg.is_empty() {
+        return Ok(ctl_ok());
+    }
+    Err(error::unsupported(
+        "the C's inet statistics counters (inet_fill_stat) are not tracked by this driver",
+    ))
+}
+
+/// The `INET_REQ_GETTYPE` reply: the socket's `{Family, Type}` pair
+/// (`inet_drv.c:11145`, `case INET_REQ_GETTYPE`).
+///
+/// A socket-less port answers [`ctl_xerror`]`("einval")` — the C's `if (!IS_OPEN) return
+/// ctl_error(EINVAL)` (measured `[0]einval` on a bare port of either driver). With a socket it is
+/// `[1] ++ [0,0,0,INET_AF_INET] ++ [0,0,0,type]`, where the type is [`INET_TYPE_STREAM`] for
+/// `tcp_inet` and [`INET_TYPE_DGRAM`] for `udp_inet` (measured `[1,0,0,0,1,0,0,0,1]` and
+/// `[1,0,0,0,1,0,0,0,2]`).
+pub(super) fn gettype_reply(fd: Option<RawFd>, stream: bool) -> Result<Vec<u8>> {
+    let Some(_fd) = fd else {
+        return Ok(ctl_xerror("einval"));
+    };
+    let socket_type = if stream {
+        INET_TYPE_STREAM
+    } else {
+        INET_TYPE_DGRAM
+    };
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&[0, 0, 0, INET_AF_INET]);
+    reply.extend_from_slice(&[0, 0, 0, socket_type]);
+    Ok(reply)
+}
+
+/// The `INET_REQ_GETFD` reply: the driver's descriptor number, big-endian
+/// (`inet_drv.c:11160`, `case INET_REQ_GETFD`).
+///
+/// A socket-less port answers [`ctl_xerror`]`("einval")` — the C's `if (!IS_OPEN) return
+/// ctl_error(EINVAL)` (measured `[0]einval`).
+pub(super) fn getfd_reply(fd: Option<RawFd>) -> Vec<u8> {
+    match fd {
+        Some(fd) => {
+            let mut reply = ctl_ok();
+            reply.extend_from_slice(&fd.to_be_bytes());
+            reply
+        }
+        None => ctl_xerror("einval"),
+    }
+}
+
+/// The `INET_REQ_GETSTATUS` reply: the C's `INET_STATE_*` bit set, big-endian
+/// (`inet_drv.c:11175`, `case INET_REQ_GETSTATUS`).
+///
+/// There is no `IS_OPEN` guard in the C — the state bits are the driver's own — so a socket-less
+/// port answers the `0` (`Closed`) it is really in (measured `[1,0,0,0,0]`).
+pub(super) fn getstatus_reply(state_code: u32) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&state_code.to_be_bytes());
+    reply
+}
+
+/// The `INET_REQ_NAME` reply: the port's own endpoint, as a packed address
+/// (`inet_drv.c:11329`, `case INET_REQ_NAME`).
+///
+/// The C arm has **no `IS_OPEN` guard**: it calls `getsockname(2)` on the descriptor unconditionally,
+/// so a socket-less port answers the syscall's own errno (measured `[0]ebadf`) rather than a
+/// fabricated `einval`. This floor reproduces that: no descriptor ⇒ the `EBADF` refusal, an open
+/// socket ⇒ `[1] ++ pack_address(...)` (measured the 8-byte `[1,1,<port_hi>,<port_lo>,a,b,c,d]`), a
+/// failing syscall ⇒ `[0] ++ errno_name(errno)`.
+pub(super) fn name_reply(fd: Option<RawFd>) -> Result<Vec<u8>> {
+    let Some(fd) = fd else {
+        return Ok(ctl_xerror(&errno_name(libc::EBADF)));
+    };
+    match sys::local_address(fd) {
+        Ok(address) => {
+            let mut reply = ctl_ok();
+            reply.extend_from_slice(&pack_address(address.port, address.addr));
+            Ok(reply)
+        }
+        Err(err) => Ok(ctl_error(err)),
+    }
+}
+
+/// The `INET_REQ_PEER` reply: the peer's endpoint, as a packed address
+/// (`inet_drv.c:11280`, `case INET_REQ_PEER`).
+///
+/// The C guards on the connection, not on the descriptor: `if (!(desc->state & INET_F_ACTIVE))
+/// return ctl_error(ENOTCONN)` (measured `[0]enotconn` on a bare port **and** on a listening one).
+/// A connected socket answers `[1] ++ pack_address(...)` (measured `[1,1,225,36,127,0,0,1]`); a
+/// failing `getpeername(2)` answers `[0] ++ errno_name(errno)`.
+pub(super) fn peer_reply(fd: Option<RawFd>, connected: bool) -> Result<Vec<u8>> {
+    if !connected {
+        return Ok(ctl_xerror("enotconn"));
+    }
+    let Some(fd) = fd else {
+        // A connected state with no descriptor cannot happen; refuse rather than call into the
+        // kernel with a dangling number.
+        return Ok(ctl_xerror("enotconn"));
+    };
+    match sys::peer_address(fd) {
+        Ok(address) => {
+            let mut reply = ctl_ok();
+            reply.extend_from_slice(&pack_address(address.port, address.addr));
+            Ok(reply)
+        }
+        Err(err) => Ok(ctl_error(err)),
+    }
+}// ---------------------------------------------------------------------------
 // Argument decoding
 // ---------------------------------------------------------------------------
 

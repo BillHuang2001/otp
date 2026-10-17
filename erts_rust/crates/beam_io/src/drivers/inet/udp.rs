@@ -37,10 +37,11 @@
 //! The driver registers under `"udp_inet"` — what the oracle's `port_info(Port, name)` reports
 //! for a `gen_udp:open/1` socket, and the C entry `udp_inet_driver_entry` (`:1406`).
 //!
-//! Where the C decodes a magic-offset command integer plus a packed binary, this floor takes a
-//! **named** operation plus raw argument bytes in [`Driver::control`] (the runtime owns the
-//! Erlang term decoding, which is out of scope here). The verbs, and the C request each one
-//! mirrors, are:
+//! [`Driver::control`] serves **both** wire forms: a decimal command is the C's `unsigned int`
+//! control opcode, decoded with wrapping offset subtraction ([`super::opcode`]) and routed to the
+//! verb its `case` selects; a non-decimal command is a **named** verb for a direct caller. The
+//! *operand* is the C's packed request payload in both forms and is decoded here. The verbs, and
+//! the C request each one mirrors, are:
 //!
 //! | verb | C request | argument | reply |
 //! |---|---|---|---|
@@ -144,6 +145,7 @@ use crate::error;
 use crate::poller::{Interest, Token};
 
 use super::opt::{get_options, set_options, SocketOptions};
+use super::opcode::{decode as decode_opcode, Opcode};
 use super::sys::{
     bind_socket, close_fd, connect_socket, dgram_socket_fd, has_peer, local_port, recv_from,
     send_connected, send_to,
@@ -322,21 +324,27 @@ impl UdpInetDriver {
     ///
     /// Only a **connected** socket can be written from a queue: a datagram needs a destination,
     /// and the unconnected case carries it in the `send` verb's argument (see
-    /// [`UdpInetDriver::verb_send`], which calls `sendto(2)` directly and never queues). So an
-    /// empty queue, or a socket with no default peer, sends nothing and reports zero — there is
-    /// no routing decision to make here.
+    /// [`UdpInetDriver::verb_send`], which calls `sendto(2)` directly and never queues). So a
+    /// queued command on a socket-less or unconnected port is a **refusal**, not a silent success:
+    /// the C's `packet_inet_command` guards the send with `!IS_OPEN` and fails the port
+    /// (`inet_drv.c:15051`), and its queue-draining form expects the `[address][data]` grammar —
+    /// a bare port command carries no address at all, so nothing in the queue can name a peer.
+    /// **The queued bytes are never consumed** on that path: the caller learns the command was
+    /// refused, and the queue keeps exactly what it was given.
     ///
     /// # Errors
     ///
+    /// [`beam_common::BeamError::BadArg`] when the port has no socket, or has one that is not
+    /// connected (`inet_drv.c:15051`) — the queued bytes stay queued, never silently dropped.
     /// `BeamError::Io` when a send fails irrecoverably.
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if ctx.output().is_empty() {
             return Ok(0);
         }
+        // No socket, or a socket with no default peer: the queue holds a bare command with no
+        // destination, which the C refuses (`:15051`). Nothing is consumed.
         let Some(fd) = self.socket.filter(|_| self.state.is_connected()) else {
-            // No default peer: nothing in the queue can name a destination (the verb path never
-            // leaves bytes here for an unconnected socket), so there is nothing to send.
-            return Ok(0);
+            return Err(error::badarg());
         };
         let mut written = 0usize;
         loop {
@@ -618,6 +626,96 @@ impl UdpInetDriver {
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
         get_options(&self.options, false, self.socket, arg)
     }
+
+    /// Routes one decoded numeric control opcode to the verb or shared reply that serves it.
+    ///
+    /// This is the datagram half of the bridge documented in [`super::opcode`]: `packet_inet_ctl`
+    /// (`inet_drv.c:14570`) owns `{OPEN, FDOPEN, CLOSE, CONNECT, LISTEN (SCTP only),
+    /// SCTP_REQ_BINDX, SCTP_REQ_PEELOFF, PACKET_REQ_RECV}` and delegates the rest to `inet_ctl`
+    /// (`:10988`). A number **neither** switch has a case for — the TCP-only stream requests, or a
+    /// wrapped command — reaches `inet_ctl`'s `default:` arm and answers `ctl_xerror(EXBADPORT)`
+    /// ⇒ `[0]exbadport` (measured: `TCP_REQ_RECV` 42 and `ACCEPT` 26 on a UDP port).
+    ///
+    /// # Errors
+    ///
+    /// A typed "not served" reason for an opcode the C's switches do serve but this floor does not
+    /// implement, plus the verbs' own argument faults (`BeamError::BadArg`).
+    fn control_opcode(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        op: Opcode,
+        arg: &[u8],
+    ) -> Result<Vec<u8>> {
+        match op {
+            // The verbs whose operand is already the C's request payload.
+            Opcode::Open => self.verb_open(ctx, arg),
+            Opcode::Bind => self.verb_bind(arg),
+            Opcode::Setopts => self.verb_setopts(arg),
+            Opcode::Getopts => self.verb_getopts(arg),
+            Opcode::Close => self.verb_close(ctx),
+            // `packet_inet_ctl`'s `INET_REQ_CONNECT` payload is `Timeout(4), Address(N)` and the C
+            // rejects fewer than six bytes with `ctl_error(EINVAL)` (`:14816`-`:14830`). The C's
+            // *empty* payload is the "dissolve the default peer" form (`:14740`); it is
+            // unreachable through a numeric opcode because the numeric route always needs the
+            // six-byte prefix, so the empty case never arises here.
+            Opcode::Connect => {
+                if arg.len() < 6 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                self.verb_connect(arg)
+            }
+            // `PACKET_REQ_RECV` is `packet_inet_ctl`'s own receive: it requires a socket
+            // (`!IS_OPEN ⇒ `[0]exbadport`, `:14981`) and an eight-byte `Timeout(4), Length(4)`
+            // payload (`:14988`).
+            //
+            // **Documented divergence:** the C enqueues an async operation and answers the
+            // three-byte op id `[1] ++ async_id_be16` (measured `[1,0,0]`), the datagram arriving
+            // later as an `{inet_async, …}` message. This floor has no driver→owner message path,
+            // so `recv` is a synchronous read-now: it answers `[1] ++ source_address` with a
+            // datagram (or the bare `[1]`) and never an op id. The operand is validated and then
+            // ignored.
+            Opcode::PacketRecv => {
+                if self.socket.is_none() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                if arg.len() != 8 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                self.verb_recv(ctx, &[])
+            }
+            // The shared-`inet_ctl` replies both drivers build identically.
+            Opcode::Peer => super::wire::peer_reply(self.socket, self.state.is_connected()),
+            Opcode::Name => super::wire::name_reply(self.socket),
+            Opcode::Gettype => super::wire::gettype_reply(self.socket, false),
+            Opcode::Getfd => Ok(super::wire::getfd_reply(self.socket)),
+            Opcode::Getstatus => Ok(super::wire::getstatus_reply(self.state.state_code())),
+            Opcode::Getstat => super::wire::getstat_reply(arg),
+            // The C's switches DO serve these, but this floor does not: a typed gap.
+            Opcode::Gethostname
+            | Opcode::Getservbyname
+            | Opcode::Getservbyport
+            | Opcode::Setname
+            | Opcode::Setpeer
+            | Opcode::Getiflist
+            | Opcode::Ifget
+            | Opcode::Ifset
+            | Opcode::Subscribe
+            | Opcode::Getifaddrs
+            | Opcode::Ignorefd
+            | Opcode::Getladdrs
+            | Opcode::Getpaddrs
+            | Opcode::Fdopen
+            | Opcode::Listen => Err(op.not_served()),
+            // The TCP-only cases (a `tcp_inet_ctl` case, so neither switch owns them for a
+            // datagram socket) plus any wrapped/unassigned number: the C's `[0]exbadport`.
+            Opcode::TcpRecv
+            | Opcode::TcpUnrecv
+            | Opcode::TcpShutdown
+            | Opcode::TcpSendfile
+            | Opcode::Accept
+            | Opcode::Unknown => Ok(ctl_xerror("exbadport")),
+        }
+    }
 }
 
 impl Default for UdpInetDriver {
@@ -667,6 +765,11 @@ impl Driver for UdpInetDriver {
         command: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
+        // A decimal command is the C's numeric `INET_REQ_*`/`PACKET_REQ_*` opcode (see
+        // [`super::opcode`]) and takes the opcode path; a named verb falls through unchanged.
+        if let Some(op) = decode_opcode(command) {
+            return self.control_opcode(ctx, op, arg);
+        }
         match command {
             "open" => self.verb_open(ctx, arg),
             "bind" => self.verb_bind(arg),
