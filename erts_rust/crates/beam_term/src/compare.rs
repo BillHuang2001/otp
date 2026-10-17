@@ -34,12 +34,17 @@
 //! # Term order
 //!
 //! Ascending term order is
-//! `number < atom < reference < fun < port < pid < tuple < record < map < nil < list < bitstring`
-//! (plus the external variants `external_ref`/`external_port`/`external_pid`
-//! interleaved after their internal counterpart). This is derived directly from
-//! the `_DEF` virtual-tag constants in `erts/emulator/beam/erl_term.h` — term
-//! order ascends as `_DEF` descends (`rank = 0x11 - _DEF`), matching
-//! `beam_term::ops::TermClass`'s documented order.
+//! `small < big < float < atom < external_ref < ref < fun < external_port < port <
+//! external_pid < pid < tuple < record < map < nil < list < bitstring`, with the C's
+//! `bin_ref` class last. [`class_rank`] derives those positions from the `*_DEF`
+//! virtual-tag constants in `erts/emulator/beam/erl_term.h:1441-1457`: the rank is
+//! `0x10 - _DEF` over the 17 real classes (`SMALL_DEF` `0x10` ⇒ 0 … `BITSTRING_DEF`
+//! `0x00` ⇒ 16), i.e. term order ascends as `_DEF` descends. The C's `BIN_REF_DEF`
+//! (`0x11`, `:1458`, documented there as "not a real term") is outside that ladder
+//! and is placed after every real class (rank 17), and this crate's
+//! [`TermClass::NonValue`] (a bare header word — see below) after that. These ranks
+//! decide any pair of *different* classes; two numeric classes are compared by
+//! [`numbers`] instead (by rank in exact mode, numerically in arithmetic mode).
 //!
 //! ## Known Issues (documented comparison gaps)
 //!
@@ -86,7 +91,14 @@
 //!   longer slice's leading zero ids trimmed first); a native record by its
 //!   definition's `module`, `name` and `is_exported` (`false < true`), its field
 //!   count and keys, and finally its field values.
-//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
+//!   Those structural arms are reached only when *both* operands are external (or
+//!   both records): a **mixed internal/external** pair of the same category is
+//!   decided by [`class_rank`] instead, whereas the C's `pid_common`/`ref_common`
+//!   arms (`utils.c:1777`/`:2262`, reached from the external cases at
+//!   `:2212`/`:2235`/`:2288`) compare `serial`, `number` and the node first. The two
+//!   rules agree when the foreign sysname sorts before the local one and disagree
+//!   otherwise — the one known ordering gap for these classes; it is pinned by
+//!   `tests/compare_class_order.rs`.//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
 //!   class first (which is exact), then by object arity, then by the raw term word
 //!   (a stable proxy). This never panics but is not a faithful reproduction of the
 //!   C's structural comparison; a caller that needs exact ordering for it must
@@ -144,7 +156,10 @@ use maps::cmp_maps;
 use numbers::cmp_numbers;
 /// Ascending term-order rank of a [`TermClass`].
 ///
-/// `rank = 0x11 - _DEF`, so a smaller rank sorts first. See the module docs.
+/// `rank = 0x10 - _DEF` over the 17 real classes of the C's `*_DEF` ladder
+/// (`erts/emulator/beam/erl_term.h:1441-1457`), with `BIN_REF_DEF` (`0x11`, "not a
+/// real term") placed after every real class and [`TermClass::NonValue`] after that;
+/// a smaller rank sorts first. See the module docs.
 fn class_rank(class: TermClass) -> u8 {
     match class {
         TermClass::Small => 0,
