@@ -568,6 +568,17 @@ the section to read them in.
   converges to one constant capacity), so a steady state under continuous collection shows a **converged
   constant** capacity plus a **rising** `minor_gcs`; a constant capacity with a *frozen* `minor_gcs` means no
   collection.
+- **`should_collect(need)` cannot be true right after a growth that satisfied the same `need`** — it reads only the
+  **current** space (`current().available_words() < need`) and a growth/`ensure_capacity` guarantees that space's
+  room covers `need`, so it answers `false` until the fresh space fills up; the same holds for the two entry points
+  of `ensure_capacity` (its `next_words(need, 0) < need` pre-check and the post-collection `grow`).
+  It also ignores the chain, so a retired space is visible **only** through `collection_debt()`
+  (`!retired.is_empty()`, set unconditionally by every `Nursery::grow` that actually replaces a space — the
+  `available_words() >= need` early return retires nothing — and cleared only by a collapse, i.e. a collection or
+  `ensure_capacity`'s own collect; after `ensure_capacity` the chain is `2` whenever its post-collection `grow`
+  had to install a space).
+  `retired.clear()`/`retired_regions.clear()` exist in exactly one place, `Nursery::install_collapsed`
+  (`src/nursery.rs:363-364`), and `retired.push` in exactly one, `Nursery::grow` (`src/nursery.rs:292`).
 - **Address-level membership is public; enumeration of the nursery chain is NOT.** From outside the crate a caller
   reaches only the **current** nursery space (`young()`), a space **count** (`young_space_count()`) and a
   membership test over **every** space (`young_contains(ptr)`); the `Nursery` chain itself (`spaces()`, the
