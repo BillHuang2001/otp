@@ -1144,6 +1144,58 @@ fn the_run_route_never_sleeps_a_poll_slice_while_it_still_has_slices_to_run() {
     rt.set_run_wake_pid(None);
 }
 
+/// The **port-poll half** of the same rule, pinned structurally: a round that ran slices polls
+/// **without blocking**, while a round that ran nothing still blocks (the anti-spin half).
+///
+/// The poll's timeout changes no observable state — whether a given poll actually waits depends
+/// on what the host's poller holds (a booted kernel keeps the `inet_gethost` port open, so on
+/// many hosts the poll *can* block every round) — so the pin reads the test-only
+/// blocking-round counter ([`super::blocking_port_rounds`]) rather than a syscall. The decision
+/// is taken before the poll runs, so the count is the policy's. A live but idle port used to
+/// charge a full [`PORT_POLL_SLICE`] to every pass that had work to hand.
+#[test]
+fn the_port_poll_blocks_only_for_a_round_that_ran_nothing() {
+    // A round with work to hand: a **yielding** allocating loop, so the round runs a slice and
+    // the pass ends with the run queue still non-empty.
+    let mut rt = runtime();
+    rt.load_module(PREEMPT_BEAM).expect("load preempt.beam");
+    rt.spawn_process("preempt", "alloc_loop", vec![make_small(1_000_000)])
+        .expect("preempt:alloc_loop/1 is exported");
+    reset_blocking_port_rounds();
+    let (ran, _) = rt
+        .scheduler_pass(Some(1), false, TimerWait::AtMostWhenIdle(PORT_POLL_SLICE))
+        .expect("a pass");
+    assert_eq!(ran, 1, "one slice ran");
+    assert_eq!(
+        blocking_port_rounds(),
+        0,
+        "a round that ran a slice must poll without blocking"
+    );
+
+    // A round that ran nothing: the target parks on `receive X -> X after 2000`, so the pass
+    // has no slice to hand and must still block — that is what keeps a parked port reader (and
+    // the parked `receive … after T` of
+    // `the_run_route_still_sleeps_to_a_parked_receive_timeout`) waited on instead of spun past.
+    let mut rt = runtime();
+    let target = spawn_recv_after(&mut rt, "after2000");
+    assert_eq!(rt.run_one_slice().expect("one slice"), 1, "the target parks");
+    assert_eq!(
+        rt.processes().get(target).expect("still in the table").state(),
+        ProcessState::Waiting
+    );
+    rt.set_run_wake_pid(Some(target));
+    reset_blocking_port_rounds();
+    let (ran, _) = rt
+        .scheduler_pass(Some(1), false, TimerWait::AtMostWhenIdle(PORT_POLL_SLICE))
+        .expect("a pass");
+    assert_eq!(ran, 0, "nothing was runnable");
+    assert!(
+        blocking_port_rounds() >= 1,
+        "an idle round still blocks in the port poll — the anti-spin half"
+    );
+    rt.set_run_wake_pid(None);
+}
+
 /// The **anti-spin half is unchanged**, end to end on the `run` route: a target parked on a
 /// finite `receive … after T` with nothing else to do still *sleeps* to its deadline (the
 /// pass-sleep counter proves it slept rather than spinning, which would reach the same

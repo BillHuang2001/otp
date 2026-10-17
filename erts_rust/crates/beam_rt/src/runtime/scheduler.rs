@@ -183,6 +183,31 @@ fn reset_pass_sleeps() {
     PASS_SLEEPS.with(|count| count.set(0));
 }
 
+// **Test-only** count of the rounds whose port poll was allowed to **block** on this thread;
+// read through [`blocking_port_rounds`], reset through [`reset_blocking_port_rounds`].
+#[cfg(test)]
+thread_local! {
+    static BLOCKING_PORT_ROUNDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many rounds of this thread's scheduler passes were allowed to block in the port poll
+/// (test instrumentation — the [`pass_sleeps`] counterpart for the port half).
+///
+/// Like the sleep itself, the poll's timeout changes no observable state, so a test can pin the
+/// "a pass with work to do never blocks in the poll" rule only through a counter. The decision
+/// is taken before the poll runs, so the count is the policy's, not the syscall's: a round
+/// counted here is one that *may* have waited, whatever the poller made of it.
+#[cfg(test)]
+fn blocking_port_rounds() -> u64 {
+    BLOCKING_PORT_ROUNDS.with(std::cell::Cell::get)
+}
+
+/// Resets this thread's test-only blocking-port-round counter.
+#[cfg(test)]
+fn reset_blocking_port_rounds() {
+    BLOCKING_PORT_ROUNDS.with(|count| count.set(0));
+}
+
 impl Runtime {
     /// Runs a **bounded** scheduler pass from inside the running code — the `-eval`
     /// evaluator's `receive` pump.
@@ -754,6 +779,24 @@ impl Runtime {
                 }
                 Err(err) => break Err(err),
             };
+            // The round's **progress** signal, shared by both of the pass's waits below. A round
+            // that ran at least one slice left the pass work to hand: this single-threaded pass can
+            // act on it immediately, and blocking first only delays it by a whole poll slice. So
+            // the port poll below is non-blocking for such a round — it still *polls* (a driver may
+            // already have bytes queued) but with a zero timeout — and the timer wait is skipped
+            // (`TimerWait::AtMostWhenIdle`). A round that ran **nothing** still blocks, so a parked
+            // `receive … after T` is still slept to without spinning and a live port whose driver
+            // has not written yet is still waited on.
+            let progressed = round_slices > 0;
+            let port_timeout = if progressed {
+                Duration::ZERO
+            } else {
+                crate::port::PORT_POLL_SLICE
+            };
+            #[cfg(test)]
+            if !port_timeout.is_zero() {
+                BLOCKING_PORT_ROUNDS.with(|count| count.set(count.get() + 1));
+            }
             // A `garbage_collect` request (see `Runtime::request_gc`) whose process
             // terminated in the slices just run can never be served — its heap is gone — so
             // the request set is pruned to the pass's live processes here, where the table
@@ -835,8 +878,11 @@ impl Runtime {
                 break Err(err);
             }
             // The port half: with a live port, read what it produced and deliver it into
-            // the owning process's mailbox (which may wake a blocked receiver).
-            match self.deliver_port_messages(&mut table, crate::port::PORT_POLL_SLICE) {
+            // the owning process's mailbox (which may wake a blocked receiver). The timeout is
+            // the round's own: a round that ran slices polls **without blocking**, so a live but
+            // idle port (the `inet_gethost` child a booted kernel keeps open, say) cannot make a
+            // pass that has work to do pay a poll slice for nothing (see `progressed` above).
+            match self.deliver_port_messages(&mut table, port_timeout) {
                 Err(err) => break Err(err),
                 // A fragment wake was absorbed above, so go round again and run it.
                 Ok(0) => {}
@@ -918,7 +964,6 @@ impl Runtime {
             // again is what runs the rest, and this single-threaded pass can gain nothing by
             // sleeping a poll slice first. A round that ran **nothing** still sleeps, so a
             // parked `receive … after T` is still reached without spinning.
-            let progressed = round_slices > 0;
             match self.timer_wait(wait, waits, progressed) {
                 Some(wait_for) => {
                     waits += 1;
