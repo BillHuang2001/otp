@@ -1,10 +1,16 @@
 # `beam_rt` test fixtures
 
 `mailbox.beam`, `sched.beam`, `port_recv.beam`, `raise_structured.beam`,
-`function_clause_fixture.beam`, `recv_after.beam` and `dist_echo.beam` are committed oracle
-fixtures: real `.beam` images produced by the **system Erlang** toolchain (OTP 29 /
-`erts-17.1`), which is also the differential oracle.
-* `mailbox.beam` is the receive/message end-to-end image — `tests/mailbox.rs` (the
+`function_clause_fixture.beam`, `recv_after.beam`, `dist_echo.beam` and `pingpong.beam` are
+committed oracle fixtures: real `.beam` images produced by the **system Erlang** toolchain
+(OTP 29 / `erts-17.1`), which is also the differential oracle.
+* `pingpong.beam` is the **two-process ping-pong** image for the `run` route's sleep
+  accounting (`tests/run_route_sleep.rs`): `go/1` spawns one fun-bodied worker and runs `N`
+  synchronous round trips (`Worker ! {self(), N}` / a bound-variable `receive {_, N}`, with
+  an `after 5000` guard that raises `{pingpong_timeout, N}` instead of hanging). Every
+  iteration parks the parent on an empty mailbox until the reply arrives, so the run queue
+  empties and the pass boundary is reached repeatedly — the shape whose per-pass poll sleep
+  the syscall assertion rules out.* `mailbox.beam` is the receive/message end-to-end image — `tests/mailbox.rs` (the
   runtime slice) and the receive-seam unit tests in `src/context.rs` run it through the
   real `RuntimeContext`.
 * `sched.beam` is the **sender** image for the cross-process scheduler test
@@ -262,6 +268,12 @@ rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
 cp bifent.erl tmr.erl "$SCRATCH/gen/"
 ( cd "$SCRATCH/gen" && erlc +deterministic bifent.erl tmr.erl )
 cp "$SCRATCH/gen/bifent.beam" "$SCRATCH/gen/tmr.beam" .
+# pingpong.beam (1004 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_pingpong_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp pingpong.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic pingpong.erl )
+cp "$SCRATCH/gen/pingpong.beam" pingpong.beam
 ```
 Every fixture is built with `+deterministic` in a `$TMPDIR` scratch dir, so no
 absolute checkout path is embedded in any committed `.beam`.
@@ -355,6 +367,38 @@ fire() -> timer:apply_after(50, erlang, send, [self(), done]),
 ```
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
+
+`pingpong.erl` (the input, also committed):
+
+```erlang
+-module(pingpong).
+-export([go/1]).
+
+go(N) when is_integer(N), N >= 0 ->
+    Worker = spawn(fun() -> worker() end),
+    loop(N, Worker),
+    Worker ! stop,
+    N.
+
+loop(0, _Worker) ->
+    ok;
+loop(N, Worker) ->
+    Worker ! {self(), N},
+    case receive {_, N} -> ok after 5000 -> timeout end of
+        ok -> loop(N - 1, Worker);
+        timeout -> erlang:error({pingpong_timeout, N})
+    end.
+
+worker() ->
+    receive
+        {From, N} ->
+            From ! {self(), N},
+            worker();
+        stop ->
+            ok
+    end.
+```
+Oracle: `pingpong:go(N)` answers `N` for every `N` (verified against `erl -noshell`).
 
 ## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload` · `pt_gc` · `churn`, committed)
 

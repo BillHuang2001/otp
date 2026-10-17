@@ -291,13 +291,40 @@ past the per-instruction hook, so a loop that reaches no heap-admission point ei
 binary-accumulating or `call_ext`-only loop, or a natively linked tail loop with no allocation — charges
 nothing and runs to completion inside one slice on the tier its first entry selected (pinned by
 `a_non_allocating_loop_on_the_native_tier_completes_within_one_slice`).
-Per-workload speed and memory figures are **measured, never
-modelled**, and live in [`../../PERF.md`](../../PERF.md) and the bench driver's
-[`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md); they are re-measured there
-rather than transcribed here.
+Per-workload speed and memory figures are **measured, never modelled**: the full cross-runtime
+record lives in [`../../PERF.md`](../../PERF.md) and the bench driver's
+[`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md), and the figures the
+scheduled path is judged on are re-measured below rather than carried forward.
 
 `BEAM_RT_TIER=interpreter` is the always-correct reference tier and the **only** kill switch: the
 default (`Auto`, and its `baseline` alias) puts every process on the native tier.
+
+**The two-process delivery path** (measured 2026-10-17 with the committed driver,
+`bench run --quick --runtime all --workloads copy_bound`, `taskset -c 3`, 15 rounds with the two
+runtimes paired **inside** each round and the min taken over the rounds; `rust` = the release
+`beam_rt` on its default baseline-JIT tier, `sys` = OTP 29.1.1 / erts-17.1; host `/proc/loadavg`
+1.0–3.2):
+
+| case (`case_<name>_ns_per_op`) | rust | sys | rust/sys |
+|---|---|---|---|
+| `send_recv_plain` (delivery only) | 1 943 ns (median 2 046) | 666.5 ns (median 672.8) | **2.92×** (per-round median 3.01×, range 2.90–3.16×) |
+| `send_recv` (+ the ETF codec in the worker) | 7 631 ns (median 7 837) | 1 493 ns (median 1 506) | **5.11×** (median 5.22×) |
+| `ets_copy` | 2 367 ns (median 2 391) | 219.3 ns (median 222.9) | **10.8×** (median 10.7×) |
+| `etf_roundtrip` | 1 449 ns (median 1 521) | 655.0 ns (median 660.0) | **2.21×** (median 2.30×) |
+
+The loop count behind each marginal is the deterministic, contention-immune `case_*_ops` counter —
+rust **15 000** / **10 000** / **200 000** / **40 000**, sys **1 000 000** / **500 000** /
+**2 000 000** / **1 500 000** — so the shape of the ratios survives a loaded host even though the
+absolute walls do not.
+
+**The `run` route issues no poll sleep on a ping-pong loop, and still sleeps to a parked
+`receive … after T`** (`strace -f -e trace=clock_nanosleep -T` on the release binary,
+2026-10-17): `beam_rt run tests/fixtures/pingpong.beam pingpong:go/1 200000` — 200 000 synchronous
+round trips, the same two-process shape — makes **0** `clock_nanosleep` calls, while
+`recv_after:after20/0` (parked on `after 20`, nothing else to run) makes **1** (19.9 ms) and
+`recv_after:after2000/0` makes **80** (75 clamped 25 ms poll slices plus 8.6 ms/0.7 ms remainders,
+≈2.0 s in total). Both halves are pinned by `tests/run_route_sleep.rs`, which skips loudly when
+`strace` is absent.
 
 **The per-call work of a growth-shaped loop is FLAT in N — deterministic counters, never wall clock.**
 `the_churn_workloads_per_call_counters_are_flat_in_n` and
@@ -313,31 +340,26 @@ shapes `peak_young_spaces == 2` and the young capacity plateaus (376 / 610 words
 retired-nursery chain the `collection_debt` trigger protects is bounded rather than N-dependent, and
 `yields == slices − 1` with `waits == 0` throughout (neither loop ever parks).
 
-**The recorded `foreign` / `emqx_base62:encode` regression is measurable as CLOSED, and the module-literal
-tagging is why.** Interleaved matched-N A/B through the bench harness (`--quick --runtime rust
---workloads foreign`, `$BEAM_RT` per variant, N = 25 000, 3 rounds per side, host loadavg 23–61):
-`case_emqx_base62_encode_ns_per_call` HEAD `75ee31bef3` 17 730 / 17 277 / 22 217 ns vs the m10 baseline
-`b4593818b3` 16 381 / 22 797 / 18 697 ns — **ratio of medians 0.95×**, mean of the three round ratios
-1.01×; two independent quiet-host replications (loadavg 2.5–4 and 0.96–1.40, 3 rounds each) give
-**1.06×** and **1.07×**, i.e. parity within the run-to-run spread. The m13 tree `a141d6878c`, which
-reproduces the recorded regression on this host at **3.91×–3.97×** m10, shows the comparison is
-discriminating.
-Startup-cancelled per-call marginals (`N = 0 / 5 000 / 25 000 / 60 000`): HEAD 9.4 / 16.6 / 24.4 µs, m10
-13.2 / 16.8 / 27.5 µs → **head/m10 0.71 / 0.99 / 0.89, flat in N** with no superlinear residual, while
-m13 climbs 36.3 / 68.1 / 126.9 µs (5.2× HEAD at N = 60 000).
-Deterministic counters (`erlang:statistics(garbage_collection)` + `process_info(self(), heap_size)` over
-the same driver): HEAD collects `{667,155964,0}` / `{16667,3899977,0}` / `{40000,9359864,0}` at
-N = 1 000 / 25 000 / 60 000 with `heap_size` flat at 466 words, whereas m10 **and** m13 run **zero**
-collections with a linearly growing nursery (m10 147 249 / 3 756 849 / 9 020 849 ≈ 150.4 words/call, m13
-the same shape).
-The mechanism is the one the previous pass recorded, and it is off the path now: `Nursery::grow` retires
-the old space into `retired` and only `Nursery::collapse` — reached at a collection — clears it, so a
-runtime that never collects walks an ever-longer `spaces()` = `retired.chain(current)` through
-`root_is_unscanned` → `Nursery::contains` on every admission; HEAD tags the decoded literal area
-(ancestor `98d65f2fd3`, `crates/beam_loader/src/literal.rs` — `tag_literal_area`, the safe form of the C
-load-time `erts_set_literal_tag`), so the walk recognizes the driver's constant literal-area binary as an
-off-heap literal rather than an unscanned container, the valve no longer fires, a collection runs about
-every 1.5 calls and the retired chain stays collapsed.
+**`foreign` per-call cost, with the mechanism that keeps the loops from degenerating.** Measured
+2026-10-17 with the committed driver (`bench run --quick --runtime all --workloads foreign`,
+`taskset -c 3`, 8 rounds, both runtimes paired per round, min over the rounds; host `/proc/loadavg`
+1.0–2.5):
+
+| case (`case_<name>_ns_per_call`) | rust | sys | rust/sys |
+|---|---|---|---|
+| `bstr_to_lower` | 12 413 ns | 324.3 ns | 38.3× |
+| `bstr_capitalize_token` | 15 255 ns | 317.2 ns | 48.1× |
+| `emqx_base62_encode` | 10 512 ns | 206.3 ns | 51.0× |
+| `emqx_base62_decode` | 10 111 ns | 282.5 ns | 35.8× |
+
+The mechanism is the **literal-area tagging**: `Nursery::grow` retires the old space into `retired`
+and only `Nursery::collapse` — reached at a collection — clears it, so a runtime that never collects
+walks an ever-longer `spaces()` = `retired.chain(current)` through `root_is_unscanned` →
+`Nursery::contains` on every admission. `beam_loader`'s `tag_literal_area`
+(`crates/beam_loader/src/literal.rs`, the safe form of the C load-time `erts_set_literal_tag`) tags
+the decoded literal area, so the walk recognizes these modules' constant literal-area binary as an
+off-heap literal rather than an unscanned container, the valve stays shut, and the retired chain
+stays collapsed instead of growing with the iteration count.
 
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.
@@ -391,18 +413,22 @@ every 1.5 calls and the retired chain stays collapsed.
   `tests/engine_off_heap_transport.rs` — the `Returned`/exit-reason arms for a binary the process
   **built** *and* one it **received from another process** (`received_off_heap_binaries_survive_the_transport_copy`),
   each byte-compared with the live oracle.
+* The `run` route's **sleep accounting** is pinned end to end by `tests/run_route_sleep.rs` over the
+  committed `pingpong` fixture: `pingpong:go/1` (a two-process synchronous round trip — every iteration
+  parks the parent on an empty mailbox, so the pass boundary is reached repeatedly) is run by the CLI
+  and compared with the oracle, and under `strace -f -e trace=clock_nanosleep -T` it must show **no**
+  `clock_nanosleep` while `recv_after:after20/0` (parked on a finite deadline, nothing else to run) must
+  show at least one — the run route's "never sleep while it has work" half and the anti-spin half. The
+  syscall test skips loudly without `strace`; the value test skips loudly without an oracle.
 * Crate gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt`.
 
 ## Known Issues / Handoffs
-* **A matched-N `ns_per_call` comparison against the m10/m13 trees is not like-for-like on an
-  allocation-shaped loop.** They run **zero** collections on the `foreign` loops — the admission declined
-  and the heap grew instead (m10's `enc` nursery is 147 249 words at N = 1 000, 3 756 849 at N = 25 000
-  and 9 020 849 at N = 60 000) — whereas HEAD collects about once per call, so `bstr_to_lower`,
-  `bstr_capitalize_token` and `emqx_base62_decode` read 1.25×–1.60× dearer on HEAD at matched N on both
-  the default and the interpreter tier. The difference is the memory management HEAD performs and the
-  unbounded heap the old trees retained, not dispatch or tier; `emqx_base62_encode` — the case the
-  regression was recorded on — is at parity.
-* **A natively executed compiled block is charged only at a deopt / heap-admission boundary.** The
+* **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like
+  on an allocation-shaped loop.** Such a runtime runs **zero** collections — the admission declines and
+  the nursery grows instead, ≈150 words/call — whereas this one collects about once per call, so the
+  allocation-shaped `foreign` decode cases read 1.25×–1.60× dearer here at matched N on both the
+  default and the interpreter tier. The difference is the memory management this runtime performs and
+  the unbounded heap the other retains, not dispatch or tier.* **A natively executed compiled block is charged only at a deopt / heap-admission boundary.** The
   per-instruction charge belongs to the interpreter's loop; the engine's baseline driver runs compiled
   blocks and only deopts (or reaches `ensure_heap` through the host), so a natively linked tail loop that
   neither allocates nor leaves the block still runs to its next `return`/`wait` inside the one slice that
