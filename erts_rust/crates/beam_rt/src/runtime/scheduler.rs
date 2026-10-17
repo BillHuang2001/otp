@@ -253,6 +253,61 @@ impl Runtime {
         Ok(ran + delivered as u64)
     }
 
+    /// Advances the runtime's own **timers** up to `until`, sleeping out the window when
+    /// nothing else can happen; returns whether anything ran or was delivered.
+    ///
+    /// This is the `-eval` evaluator's `receive … after T` wait. The evaluator is *outside*
+    /// any scheduler slice, so the timeout it is waiting on is a **wall-clock** deadline it
+    /// owns — but the message it is waiting for very often arrives from a runtime timer
+    /// instead. `timer:apply_after/4` ends in a `timer_server` that arms
+    /// `erlang:start_timer/3`, and `erlang:send_after/3`/`erlang:start_timer/3` deliver
+    /// straight into a mailbox; only a scheduler pass fires those deadlines
+    /// ([`fire_due_timers`]). An `after` loop that merely re-pumped a run queue would
+    /// therefore run its `after` body before the timer was ever due — a 50 ms
+    /// `timer:apply_after/4` appeared to work only because the port poller happened to own a
+    /// sleep, and anything longer than the poll clamp reported `timeout` while the oracle
+    /// reported the message.
+    ///
+    /// The wait is the earlier of two instants, and it is the *early* one that decides:
+    ///
+    /// * the **earliest pending runtime deadline**
+    ///   ([`crate::timers::Timers::next_deadline`]) — sleeping to it makes the following pass
+    ///   fire it, delivering its message into the target's mailbox (waking a blocked receiver
+    ///   through [`Scheduler::resume_woken`]) or resuming a parked finite receive; a non-zero
+    ///   answer tells the caller to rescan;
+    /// * the caller's own **window end** (`until`) — with nothing pending to fire, the window
+    ///   *is* the next instant at which anything can change, so it is slept out and `false`
+    ///   is returned, letting the caller run its `after` body with the oracle's wall-clock
+    ///   behaviour instead of returning at once.
+    ///
+    /// A pending deadline **beyond** `until` never extends the wait past the window, so a
+    /// long housekeeping timer cannot make an `after T` overshoot its own timeout.
+    ///
+    /// It neither spins nor hangs: there is exactly one sleep, bounded by `until`, followed
+    /// by one **bounded** pass, so the call cannot outlive the caller's deadline. That is the
+    /// shape [`crate::context::RuntimeContext::pump_once`] already uses for the compiled
+    /// route's finite `receive … after T`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::pump_scheduler_boot`]: the process table's delivery/termination errors,
+    /// the port poller's/driver's failures and a nested borrow of the port table.
+    pub(crate) fn wait_for_timer(&mut self, until: Instant, max_slices: u64) -> Result<bool> {
+        // The instant the runtime can next change state on its own. With no pending deadline
+        // that instant is the caller's own window end — the evaluator's `after T`.
+        let target = self
+            .timers
+            .next_deadline()
+            .map_or(until, |deadline| deadline.min(until));
+        let now = Instant::now();
+        if now < target {
+            std::thread::sleep(target.saturating_duration_since(now));
+        }
+        // One bounded pass: a deadline that has now elapsed fires (and delivers) in it, a
+        // deadline that has not stays pending for the caller's next window.
+        Ok(self.pump_scheduler_boot(max_slices)? > 0)
+    }
+
     /// Runs **one** scheduler slice (one process, once), returning how many slices ran
     /// (`0` or `1`).
     ///

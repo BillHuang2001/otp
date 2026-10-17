@@ -1646,6 +1646,87 @@ marked() -> element(2, process_info(whereis(init), {dictionary, bootscript_mark}
     }
 
     // -----------------------------------------------------------------------
+    // An `{apply, …}` naming a **host-served** BIF
+    // -----------------------------------------------------------------------
+
+    /// A boot `{apply, {erlang, put, [Key, Val]}}` names an MFA the **host** serves while the
+    /// preloaded `erlang.beam` *also* exports it — so it must be **dispatched** to the host,
+    /// never entered as `erlang`'s own code.
+    ///
+    /// `erlang.beam`'s `put/2` is the `func_info; move undefined->x0; call_ext_only
+    /// erlang:nif_error/1` stub real ERTS installs a BIF trampoline at: entering it as code
+    /// raises the bare atom `undefined` (the reason `init`'s `{apply, {erlang, send, [… ]}}`
+    /// directive could never deliver a message). [`drive::apply_boot_call`] therefore settles
+    /// the routing through the engine's cross-module-call seam *before* preferring the module's
+    /// own export, exactly as the runner does for a spawned process's entry MFA.
+    ///
+    /// The directive's value is discarded by `init`, so the observable is the **side effect**:
+    /// the call must leave `Key` bound to `Val` on the process the script runs as — read back
+    /// straight from that process's dictionary, because `Runtime::eval` runs as a *fresh*
+    /// action child (see `Runtime::as_action_process`) and would not see it.
+    #[test]
+    fn an_apply_directive_naming_a_host_served_bif_is_dispatched_not_entered() {
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let script = BootScript {
+            name: "host-served-apply".to_string(),
+            vsn: "1".to_string(),
+            instructions: vec![
+                Instruction::PreLoaded(vec!["erlang".to_string()]),
+                Instruction::Apply {
+                    mfa: Mfa {
+                        module: "erlang".to_string(),
+                        function: "put".to_string(),
+                        args: vec![
+                            Value::Atom("boot_apply_probe".to_string()),
+                            Value::Atom("applied".to_string()),
+                        ],
+                    },
+                },
+                Instruction::Progress("started".to_string()),
+            ],
+        };
+        execute_reporting(&mut runtime, &script).unwrap_or_else(|stop| {
+            panic!(
+                "a host-served `{{apply, {{erlang, put, […]}}}}` must be dispatched, not \
+                 entered as the module's `nif_error` stub: {}",
+                stop.describe_with(&mut runtime)
+            )
+        });
+        // The premise: the loaded module **does** export `put/2`, so the pre-seam route (the
+        // module's own export first) entered its stub and raised `undefined`.
+        let module = runtime.module("erlang").expect("the boot preloaded `erlang`");
+        let put = module
+            .atom_table
+            .lookup("put")
+            .expect("`erlang`'s atom table holds `put`");
+        assert!(
+            module.export(put, 2).is_some(),
+            "the premise of this test: `erlang.beam` exports put/2 (as its `nif_error` stub)"
+        );
+        // The dispatch really ran: `erlang:put/2` stored the value on the **boot process**'s
+        // dictionary (`RuntimeContext::new` runs as `Runtime::self_pid`).
+        let key = beam_term::make_atom(
+            runtime
+                .atoms()
+                .lookup("boot_apply_probe")
+                .expect("the directive's key atom is interned"),
+        );
+        let stored = runtime
+            .processes()
+            .get(runtime.self_pid())
+            .expect("the boot process is alive")
+            .dict()
+            .get(key);
+        assert_eq!(
+            stored.and_then(|value| runtime.atom_name_of(value)),
+            Some("applied"),
+            "the directive must have been dispatched to the host's erlang:put/2"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // A boot-spawned process answering a blocked `apply`
     // -----------------------------------------------------------------------
 

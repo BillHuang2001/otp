@@ -389,7 +389,14 @@ script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"
   list); the bounded prefix test `the_real_start_boot_prefix_loads_only_the_pre_marker_batch` and its
   embedded-mode counterpart `the_post_marker_batches_load_in_embedded_mode`; 
   `a_synthetic_script_executes_end_to_end` (compiles a fixture with `erlc`, writes a synthetic
-  `.boot` with `erl`, asserts the `apply` step really ran); `a_boot_spawned_process_answers_a_blocked_apply`
+  `.boot` with `erl`, asserts the `apply` step really ran);
+  `an_apply_directive_naming_a_host_served_bif_is_dispatched_not_entered` (pins `drive.rs`: an
+  `{apply, {erlang, put, [K, V]}}` names an MFA the **host** serves while `erlang.beam` *also*
+  exports it as its `nif_error` stub, so it must be routed through the cross-module-call seam to
+  `call_bif` — the pre-seam route entered the stub and raised `undefined`; the module's own export
+  is asserted as the premise and the value is read back from the **boot process**'s dictionary,
+  `Runtime::eval` running as a *fresh* action child that would not see it);
+  `a_boot_spawned_process_answers_a_blocked_apply`
   (pins `drive.rs`: a `{kernelProcess, …}` burst and a later `{apply, …}` blocked on it, resumed by a
   scheduler drive, its dictionary side effect — left on the **boot process** (`init`), where the
   directive ran — read back through `runtime.eval`, which itself runs in a spawned action process);
@@ -433,8 +440,8 @@ script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"
   `pump_scheduler_boot` step with a 1 h timer returns `0` in well under 100 ms, timer untouched) and
   `a_boot_drive_step_sleeps_to_an_imminent_deadline_and_fires_it` (a 5 ms timer is slept to, the parked
   receiver is resumed and the message delivered).
-- In-file `#[test]` counts: `bootscript.rs` **13** (the `#[cfg(test)] mod tests` at lines 802–2022),
-  `preloaded.rs` **3** (lines 75–143), `drive.rs` **0** — directory total **16**; the module root
+- In-file `#[test]` counts: `bootscript.rs` **14** (the `#[cfg(test)] mod tests` at lines 803–2103),
+  `preloaded.rs` **3** (lines 75–143), `drive.rs` **0** — directory total **17**; the module root
   `../boot.rs` adds **9** (its own `#[cfg(test)] mod tests`).
 - `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry;
   `boot_from_script_reporting` is the boot-stop-position entry point, and the in-crate boot-script suite

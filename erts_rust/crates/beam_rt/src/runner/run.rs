@@ -680,43 +680,78 @@ impl ProcessRunner for RuntimeRunner<'_> {
                             module,
                             function,
                             arity,
-                        } => match module.export(*function, *arity) {
-                            // Entered at the export's own label on the tier chosen above
-                            // (`Tier::BaselineJit` under the default mode, `Tier::Interpreter`
-                            // under the `BEAM_RT_TIER=interpreter` kill switch). The baseline
-                            // driver handles the in-machine module-context switch itself: a
-                            // `call_ext*` the host resolves through
-                            // `ExecutionContext::resolve_external_call` (see
-                            // `src/context/mod.rs`) is entered in this same machine as a
-                            // `Step::Enter` — the `ENTER` block-ABI word, resolved and
-                            // re-entered in native code (see
-                            // `crates/beam_engine/src/jit/CONTEXT.md`). The tier is therefore
-                            // sound for any module and needs no per-module inspection; the
-                            // selection and its soundness argument live in `super::tier`. The
-                            // resume path above re-enters on the tier this process was selected
-                            // for (remembered in `ProcessEngine::tier`), so both halves of a
-                            // parked-and-resumed process stay tier-equivalent.
-                            //
-                            // The label entry stays the equivalence-preserving route to the
-                            // export: `run_label_outcome_with_tier` calls `Machine::enter_run`,
-                            // so the run's `initial_call`/`current_function` are recorded and
-                            // `process_info/2`'s execution-position items can be answered.
-                            Some(label) => engine.machine.run_label_outcome_with_tier(
-                                module,
-                                label,
-                                *arity,
-                                &engine.args,
-                                &mut budget_ctx,
-                                tier,
-                            ),
-                            // An export the module does not define stays the engine's own typed
-                            // error, byte for byte (`Machine::run_export_outcome`'s). Unreachable
-                            // for a spawned entry (`Runtime::spawn_process` resolves the export
-                            // first), and never a fabricated result.
-                            None => Err(crate::error::unsupported(
-                                "run_export: export not found",
-                            )),
-                        },
+                        } => {
+                            // A process entry that names an MFA the **host serves** must be
+                            // dispatched to the host, never entered as the module's own code:
+                            // `erlang.beam`'s `send/2` (for `spawn(erlang, send, [Pid, Msg])` —
+                            // which is what `timer_server`'s `do_apply/2` runs for a
+                            // `timer:apply_after/4` MFA) is
+                            // `func_info; move undefined->x0; call_ext_only erlang:nif_error/1`,
+                            // so entering it raises the bare atom `undefined` and the message is
+                            // never delivered. Real ERTS installs a BIF trampoline at such an
+                            // export. `entry_is_host_served` (computed above, on the outer
+                            // `ctx` and before this borrow) is the runtime's own host-dispatch
+                            // predicate, so a host-served entry is dispatched exactly as a
+                            // `call_ext` would be (`call_bif` applies the NIF → the
+                            // runtime-native floor → the `beam_bifs` registry) and the returned
+                            // value is the process's `x(0)`, recorded like any other return — so
+                            // `spawn(erlang, abs, [-3])` yields `3`. A fun entry with no local
+                            // label takes the same shape below
+                            // (`apply_fun(..).map(EngineRunOutcome::Returned)`).
+                            if entry_is_host_served {
+                                // Both atoms resolved when the predicate was computed, so this
+                                // cannot miss (and a name the module's own table lacks chose
+                                // the code route instead).
+                                match (
+                                    module.atom_table.name(module.name),
+                                    module.atom_table.name(*function),
+                                ) {
+                                    (Some(module_name), Some(function_name)) => budget_ctx
+                                        .call_bif(
+                                            module_name,
+                                            function_name,
+                                            *arity,
+                                            &engine.args,
+                                        )
+                                        .map(EngineRunOutcome::Returned),
+                                    _ => Err(crate::error::unsupported(
+                                        "run_export: the entry module/function atom has no name",
+                                    )),
+                                }
+                            } else {
+                                // The original entry route: the export's own label, on the tier
+                                // chosen above (`Tier::BaselineJit` under the default mode,
+                                // `Tier::Interpreter` under the `BEAM_RT_TIER=interpreter` kill
+                                // switch). The label entry is the equivalence-preserving route
+                                // to the export — it calls `Machine::enter_run`, so the run's
+                                // `initial_call`/`current_function` are recorded and
+                                // `process_info/2`'s execution-position items can be answered
+                                // exactly as they were before the host-dispatch arm was added.
+                                // It is the `Arc<Module>` the code server caches (the entry's
+                                // own), so the engine's `Arc::ptr_eq` module-context dedup still
+                                // holds. Every entry that is not host-served — including one
+                                // whose module is not registered with the code server at all —
+                                // keeps this route unchanged.
+                                match module.export(*function, *arity) {
+                                    Some(label) => engine.machine.run_label_outcome_with_tier(
+                                        module,
+                                        label,
+                                        *arity,
+                                        &engine.args,
+                                        &mut budget_ctx,
+                                        tier,
+                                    ),
+                                    // An export the module does not define stays the engine's
+                                    // own typed error, byte for byte
+                                    // (`Machine::run_export_outcome`'s). Unreachable for a
+                                    // spawned entry (`Runtime::spawn_process` resolves the
+                                    // export first), and never a fabricated result.
+                                    None => Err(crate::error::unsupported(
+                                        "run_export: export not found",
+                                    )),
+                                }
+                            }
+                        }
                         // A fun entry: a resolved **local** closure is entered at its own label
                         // on this process's machine — the same entry an export takes, so its
                         // `receive` can park the process (see above). A fun with no local label

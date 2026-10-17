@@ -46,8 +46,10 @@
 //!   driven and the call is resumed, exactly as
 //!   [`Runtime::run_scheduled`](crate::runtime::Runtime::run_scheduled) resumes a blocked
 //!   workload. A call the runtime's own non-blocking dispatch chain serves — a NIF, the
-//!   runtime-native floor, a registered `beam_bifs` BIF — is *not* a module export and is
-//!   dispatched there instead (see [`apply_boot_call`]).
+//!   runtime-native floor, a registered `beam_bifs` BIF — is settled by the engine's
+//!   cross-module-call seam first and dispatched there instead of being entered as the
+//!   module's own code, even when that module *also* exports the name (the preloaded
+//!   `erlang.beam` exports every BIF name as a stub — see [`apply_boot_call`]).
 //!
 //! Every drive is **bounded**: a per-`pump_scheduler_boot` slice budget between deadline
 //! checks and one wall-clock [`DRIVE_DEADLINE`] per [`execute`](crate::boot::bootscript::execute),
@@ -316,7 +318,7 @@ pub(super) fn drive_scheduler(runtime: &mut Runtime, deadline: Instant, slices: 
 /// `init`'s `apply` directive is an ordinary Erlang function application, so the call is
 /// resolved the way the runtime resolves any external call, with the one difference that it
 /// is **blocking-aware**: the module's export is run through the engine's
-/// [`Machine::run_export_outcome`]/[`Machine::resume_outcome`], so a `gen_server:call`
+/// [`Machine::run_label_outcome`]/[`Machine::resume_outcome`], so a `gen_server:call`
 /// inside it that suspends in a `receive` waiting for a boot-spawned process is resumed by
 /// [`drive_scheduler`] instead of being folded into a typed error.
 ///
@@ -325,16 +327,23 @@ pub(super) fn drive_scheduler(runtime: &mut Runtime, deadline: Instant, slices: 
 /// effect the applied function produces stays observable through the runtime.
 ///
 /// The runtime's non-blocking dispatch chain (a loaded NIF, the runtime-native floor, a
-/// registered `beam_bifs` BIF) serves an MFA the module does not export — those can never
-/// suspend in a `receive` — so `M:F/A` is first resolved against the module's own **export**
-/// and only a miss falls back to [`ExecutionContext::call_bif`]. A module this runtime has
-/// not loaded is that same fallback, exactly as it is for any other external call.
+/// registered `beam_bifs` BIF) serves an MFA a module may nonetheless *also* export — the
+/// preloaded `erlang.beam` exports every BIF name as a
+/// `func_info; move undefined->x0; call_ext_only erlang:nif_error/1` stub — so `M:F/A` is
+/// first settled through the engine's **cross-module-call seam**
+/// ([`ExecutionContext::resolve_external_call`]), exactly as the runner settles a spawned
+/// process's entry MFA (see [`crate::runner`]): `Ok(None)` means the host serves this MFA
+/// (floor / NIF / registry key — and equally a module this runtime cannot load, or an export
+/// the module lacks), so it is dispatched there instead of entering that stub, while
+/// `Ok(Some((module, label)))` is the route to the module's own code. Real ERTS installs a BIF
+/// trampoline at such an export; entering the stub as code would raise the bare atom
+/// `undefined`.
 ///
 /// # Errors
 ///
-/// The call's own error, passed through [`error::name_atom_raise`] exactly as
-/// [`RuntimeContext::run_export`](crate::context::RuntimeContext) passes it, so an uncaught
-/// reason the engine can only carry as a term (a failed function head's bare
+/// The seam's own load error; the call's own error, passed through [`error::name_atom_raise`]
+/// exactly as [`RuntimeContext::run_export`](crate::context::RuntimeContext) passes it, so an
+/// uncaught reason the engine can only carry as a term (a failed function head's bare
 /// `function_clause`, say) keeps its atom name; the engine's typed [`beam_engine::blocked`]
 /// when a suspended call has nothing left that could wake it; and [`drive_scheduler`]'s
 /// errors.
@@ -345,14 +354,17 @@ pub(super) fn apply_boot_call(
     deadline: Instant,
 ) -> Result<()> {
     let arity = args.len() as u32;
-    let resolved = runtime
-        .code_server()
-        .module_handle(&mfa.module)
-        .and_then(|module| {
-            let function = module.atom_table.lookup(&mfa.function)?;
-            module.export(function, arity).map(|_| (module, function))
-        });
-    let Some((module, function)) = resolved else {
+    // Settle the routing **before** the blocking-aware entry below: the seam takes `&mut self`,
+    // so its context is scoped to the resolution alone (it only loads/caches a module — it has
+    // no side effect on the run). `Ok(None)` is the host-served name — a NIF, the runtime-native
+    // floor, a registered `beam_bifs` BIF, or a module this runtime cannot load / an export it
+    // lacks — and that is precisely the chain [`call_bif`] dispatches; such a call can never
+    // suspend in a `receive`.
+    let resolved = {
+        let mut context = RuntimeContext::new(runtime);
+        context.resolve_external_call(&mfa.module, &mfa.function, arity)?
+    };
+    let Some((module, label)) = resolved else {
         return call_bif(runtime, mfa, args);
     };
     let mut machine = Machine::new();
@@ -363,7 +375,7 @@ pub(super) fn apply_boot_call(
     let entered = {
         let mut context = RuntimeContext::new(runtime);
         context.enter_module(&module);
-        machine.run_export_outcome(&module, function, arity, args, &mut context)
+        machine.run_label_outcome(&module, label, arity, args, &mut context)
     };
     if crate::debug_trace::enabled() {
         crate::debug_trace::trace(format_args!(
