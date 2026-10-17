@@ -231,6 +231,7 @@ fn register_driver_port(
         os_pid: None,
         stream: StreamType::List,
         line: None,
+        packet: None,
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,

@@ -275,7 +275,7 @@ impl PortRegistry {
             return Ok(());
         }
         let outcome = self.registry.handle_events(&mut self.poller, &[])?;
-        self.fold_notifications(outcome.notifications, events);
+        self.fold_notifications(outcome.notifications, events)?;
         if self.pending_port_signals.has_unreported() {
             return Err(error::unsupported(
                 "a closed port's report was not minted by the port round",

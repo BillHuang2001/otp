@@ -147,6 +147,7 @@
 //! and a nested borrow is reported as a typed capability gap instead of panicking (the
 //! crate is `#![deny(unsafe_code)]` and never panics on runtime data).
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::os::fd::RawFd;
@@ -157,6 +158,7 @@ pub mod driver;
 pub(crate) mod exit;
 pub(crate) mod info_extras;
 pub(crate) mod ops;
+pub(crate) mod packet;
 pub(crate) mod tty;
 pub(crate) mod watch;
 use beam_alloc::Heap;
@@ -268,8 +270,9 @@ const PORT_OPTION_ATOMS: &[&str] = &[
 /// The option **tuple tags** an `open_port/2` call accepts — the oracle's strict whitelist
 /// (`erts/emulator/beam/erl_bif_port.c`).
 ///
-/// `cd`, `env` and `args` are honored in the child, `line` sets the line framing and `packet`
-/// is what the `line`/`packet` mutual-exclusion check reads; the remaining tags
+/// `cd`, `env` and `args` are honored in the child, `line` sets the line framing and
+/// `packet` sets the [`packet`] framing width (which the `line`/`packet` mutual-exclusion
+/// check reads); the remaining tags
 /// (`arg0`, `parallelism`, `busy_limits_port`, `busy_limits_msgq`) are recognized and
 /// accepted without effect. A tag outside this list is [`BeamError::BadArg`].
 const PORT_OPTION_TUPLES: &[&str] = &[
@@ -350,6 +353,23 @@ impl PortName {
             | PortName::Fd => false,
         }
     }
+
+    /// Whether the **emulator** owns this port's `{packet, N}` framing — the C's
+    /// `prt->opts.packet_bytes`, which only the sys drivers read.
+    ///
+    /// `true` for the spawn/fd family (`io.c`'s `erts_sys_spawn`/`fd` drivers, whose
+    /// `output`/`ready_input` callbacks prepend and strip the header:
+    /// `erts/emulator/sys/unix/sys_drivers.c:1144-1160`, `:1268-1450`) and `false` for both
+    /// driver forms, whose `packet` option belongs to the **driver** (an inet driver's
+    /// `packet_inet_*`). Measured on the oracle: `open_port({spawn_driver,"ram_file_drv"},
+    /// [{packet,4}])` answers a bare `SIZE` byte exactly as the unframed port does, so no
+    /// header was added by the emulator — see [`packet`].
+    fn frames_packets(self) -> bool {
+        match self {
+            PortName::Spawn | PortName::SpawnExecutable | PortName::Fd => true,
+            PortName::SpawnDriver | PortName::SpawnDriverBuiltin => false,
+        }
+    }
 }
 
 /// The Erlang-side representation of a port's stream: the `binary`/`list` option.
@@ -401,6 +421,21 @@ struct PortMeta {
     /// two are **independent** port state bits (`[binary, line]` sets both; see
     /// [`StreamType::port_flags`]), and [`PortRegistry::register`] arms the framing from it.
     line: Option<usize>,
+    /// The port's `{packet, N}` framing — the C's `prt->opts.packet_bytes`, or `None` when the
+    /// option is off **or** the port is driver-backed ([`PortName::frames_packets`]).
+    ///
+    /// The framing is the emulator's own for the spawn/fd family:
+    /// [`PortRegistry::write_command`] prepends the length header through
+    /// [`packet::PacketFraming::frame_output`] and [`PortRegistry::fold_notifications`]
+    /// reassembles the child's bytes into whole packets through
+    /// [`packet::PacketFraming::push`]. A driver port carries `None` because its `packet`
+    /// option belongs to the driver (see [`packet`]).
+    ///
+    /// The reassembler's partial packet lives **on the port**, so it dies with this metadata at
+    /// [`PortRegistry::close`] — which is what keeps a reused port number from inheriting a
+    /// dead child's half packet, and what makes an end-of-stream partial packet vanish exactly
+    /// as the C's `port_inp_failure` discards it.
+    packet: Option<packet::PacketFraming>,
     /// Whether the `exit_status` option was asked for.
     ///
     /// `beam_io`'s driver already hands the status out exactly once
@@ -1066,8 +1101,19 @@ impl PortRegistry {
             self.registry.output(&mut self.poller, id, bytes)?;
             return Ok(());
         }
+        // A `{packet, N}` port's stream is framed by the emulator: the length header is
+        // prepended to this payload here, **before** the bytes reach `beam_io`, exactly as the
+        // reference C's sys driver does in its `output`/`outputv` callbacks
+        // (`sys_drivers.c:1144-1160`, `:1062-1077`). The counters above were bumped with the
+        // **payload** length, which is what the oracle's own `port_info(Port, output)` reports
+        // for a framed port (measured: 3, not 7, for a 3-byte payload on `{packet,4}`).
+        let wire: Cow<'_, [u8]> = match self.meta.get(&id.number()).and_then(|meta| meta.packet.as_ref())
+        {
+            Some(framing) => Cow::Owned(framing.frame_output(bytes)?),
+            None => Cow::Borrowed(bytes),
+        };
         self.registry
-            .port_command(&mut self.poller, id, bytes, PortCommandOptions::EMPTY)?;
+            .port_command(&mut self.poller, id, &wire, PortCommandOptions::EMPTY)?;
         // `port_command` only queues the bytes and schedules the task; run it now so the
         // write really happened.
         let outcome = self
@@ -1077,7 +1123,7 @@ impl PortRegistry {
         // buffered input along with them — a round drains them all), so its notifications are
         // **retained** here for the next pump: the queue they came from is already empty.
         let mut events = Vec::new();
-        self.fold_notifications(outcome.notifications, &mut events);
+        self.fold_notifications(outcome.notifications, &mut events)?;
         self.pending_events.extend(events);
         Ok(())
     }
@@ -1559,7 +1605,7 @@ impl PortRegistry {
                     });
                 }
             }
-            self.fold_notifications(outcome.notifications, &mut events);
+            self.fold_notifications(outcome.notifications, &mut events)?;
             events.extend(self.take_driver_outputs());
             events.extend(self.take_driver_terms());
             events.extend(self.take_due_exit_statuses()?);
@@ -1631,16 +1677,65 @@ impl PortRegistry {
     ///
     /// A notification whose port's metadata is gone (closed while the task was queued) has no
     /// recipient and is dropped; a notification for an **empty** payload is no message at all
-    /// (a driver read of nothing), unlike an empty *line* frame. A close is the caller's own
+    /// (a driver read of nothing), unlike an empty *line* frame. A `{packet, N}` port's read is
+    /// a different matter: it is fed to the port's framer ([`packet`]), which answers **one
+    /// message per completed packet** — including a legitimately empty one, which the C
+    /// delivers as `{Port,{data,<<>>}}`. A close is the caller's own
     /// `port_close/1` — whose metadata is already gone, so no `{Port, {data, …}}` is produced,
     /// in ERTS either — but it is precisely the point at which the port leaves the runtime, so
     /// the signals [`PortRegistry::capture_port_exit`](super::PortRegistry) snapshotted at the
     /// close become deliverable here (see [`exit`]).
-    fn fold_notifications(&mut self, notifications: Vec<PortNotification>, events: &mut Vec<PortEvent>) {
+    ///
+    /// # Errors
+    ///
+    /// The framer's growth refusal (the C's `ENOMEM` port death) for a `{packet, N}` port.
+    fn fold_notifications(
+        &mut self,
+        notifications: Vec<PortNotification>,
+        events: &mut Vec<PortEvent>,
+    ) -> Result<()> {
         for notification in notifications {
             match notification {
                 PortNotification::Data { port, bytes } => {
                     if bytes.is_empty() {
+                        continue;
+                    }
+                    // A `{packet, N}` port reassembles the child's stream into whole packets: the
+                    // bytes are fed to the port's own framer and **one** message is produced per
+                    // completed packet (see [`packet`]). This is the C's `ready_input` packet arm
+                    // (`sys_drivers.c:1393-1447`), including its two edge cases: a packet split
+                    // across several reads is buffered until it completes, and a **zero-length**
+                    // packet is a real `{Port,{data,<<>>}}` message (which is why the empty-payload
+                    // drop above is checked before this arm and not inside it).
+                    let framed = {
+                        let mut framed = None;
+                        if let Some(meta) = self.meta.get_mut(&port.number()) {
+                            if let Some(framing) = meta.packet.as_mut() {
+                                // The framer's refusal (a buffer that cannot grow) is the C's
+                                // `ENOMEM` port death; it is reported, never papered over.
+                                framed = Some((framing.push(&bytes)?, meta.stream, meta.owner));
+                            }
+                        }
+                        framed
+                    };
+                    if let Some((packets, stream, owner)) = framed {
+                        for payload in packets {
+                            // A framed payload is **input** for `erlang:statistics(io)` and for
+                            // this port's own `port_info(Port, input)`, and the header is not
+                            // counted — the oracle reports the delivered bytes (measured: 3 for a
+                            // 7-byte `{packet,4}` wire packet, and 0 for an empty one).
+                            self.io_counters.note_input(payload.len());
+                            if let Some(meta) = self.meta.get(&port.number()) {
+                                meta.input
+                                    .set(meta.input.get().saturating_add(payload.len() as u64));
+                            }
+                            events.push(PortEvent::Data {
+                                port,
+                                bytes: payload,
+                                stream,
+                                owner,
+                            });
+                        }
                         continue;
                     }
                     if let Some(meta) = self.meta.get(&port.number()) {
@@ -1665,6 +1760,7 @@ impl PortRegistry {
                 }
             }
         }
+        Ok(())
     }
 
     /// Takes the events an earlier port-task round harvested outside a pump (see
@@ -2062,11 +2158,14 @@ struct PortOptions {
     /// [`StreamType`] leaves the read path's message shape ([`RuntimeContext::port_data_message`])
     /// untouched.
     line: Option<usize>,
-    /// Whether a `{packet, N}` option is in effect — the C's `opts.packet_bytes != 0`
-    /// (`erl_bif_port.c:813,849-861`). The `stream` atom resets it to `false` (the C clears
-    /// `packet_bytes`), and only the **mutual-exclusion** check reads it
-    /// (`line` + packet ⇒ `badarg`); this runtime does not frame packets.
-    packet: bool,
+    /// The `{packet, N}` framing width in bytes — the C's `opts.packet_bytes`
+    /// (`erl_bif_port.c:813,849-861`): `0` (the default) is no framing, `1`/`2`/`4` are the
+    /// accepted header widths. The `stream` atom resets it to `0` (the C clears
+    /// `packet_bytes`), the `line` option is **mutually exclusive** with a non-zero width, and
+    /// the framing itself is [`packet::PacketFraming`]'s — carried onto [`PortMeta::packet`]
+    /// for the spawn/fd family, whose framing the emulator owns (see
+    /// [`PortName::frames_packets`]).
+    packet_bytes: usize,
     /// The `use_stdio`/`nouse_stdio` choice — `None` is the oracle's default (`true`;
     /// `erl_bif_port.c:814`). Only the mutual-exclusion check reads it
     /// (`stderr_to_stdout` without `use_stdio` ⇒ `badarg`).
@@ -2139,8 +2238,10 @@ impl PortOptions {
             self.use_stdio = other.use_stdio;
         }
         // `{packet, N}` from either list is in effect unless the same list cancelled it with
-        // `stream` — which `port_options` has already folded into `other.packet`.
-        self.packet |= other.packet;
+        // `stream` — which `port_options` has already folded into `other.packet_bytes`.
+        if other.packet_bytes != 0 {
+            self.packet_bytes = other.packet_bytes;
+        }
         if other.cd.is_some() {
             self.cd = other.cd;
         }
@@ -2416,7 +2517,7 @@ impl RuntimePorts {
                     // `stream` cancels any packet framing (`opts.packet_bytes = 0`,
                     // `erl_bif_port.c:979-980`), which is what makes `[line, {packet,2},
                     // stream]` legal where `[line, {packet,2}]` is not.
-                    "stream" => parsed.packet = false,
+                    "stream" => parsed.packet_bytes = 0,
                     // Whitelisted, accepted, without effect here (see the module docs).
                     _ => {}
                 }
@@ -2458,9 +2559,24 @@ impl RuntimePorts {
                     parsed.line =
                         Some(usize::try_from(length).map_err(|_| BeamError::BadArg)?);
                 }
-                // A `{packet, N}` puts packet framing in effect (only the mutual-exclusion
-                // check below reads that; this runtime does not frame packets).
-                "packet" => parsed.packet = true,
+                // `{packet, N}` is the framing width in bytes: the oracle accepts `1`, `2` and
+                // `4` only (`switch (opts.packet_bytes)` → `default: goto bad_settings`,
+                // `erl_bif_port.c:854-860`), so `{packet,0}`/`{packet,3}`/`{packet,foo}` are
+                // `badarg` — a non-small first, exactly like `{line, N}`.
+                "packet" => {
+                    let value = terms::tuple_element(element, 1)?;
+                    if !is_small(value) {
+                        return Err(BeamError::BadArg);
+                    }
+                    let width = signed_value(value);
+                    let Ok(width) = usize::try_from(width) else {
+                        return Err(BeamError::BadArg);
+                    };
+                    if !packet::PACKET_WIDTHS.contains(&width) {
+                        return Err(BeamError::BadArg);
+                    }
+                    parsed.packet_bytes = width;
+                }
                 // Whitelisted, accepted, without effect here.
                 _ => {}
             }
@@ -2468,7 +2584,7 @@ impl RuntimePorts {
         // The oracle's **mutual-exclusion** rules, checked **after** the whole list is parsed
         // (so they are order-independent): a line-buffered port cannot also be packet-framed,
         // and a redirected stderr requires `use_stdio` (`erl_bif_port.c:1019-1022`).
-        if (parsed.line.is_some() && parsed.packet)
+        if (parsed.line.is_some() && parsed.packet_bytes != 0)
             || (parsed.stderr_to_stdout && !parsed.use_stdio())
         {
             return Err(BeamError::BadArg);
@@ -2551,6 +2667,14 @@ impl PortHook for RuntimePorts {
         // The resolved line framing, read before the honored fields below are moved out of
         // `resolved`; it is carried into every `PortMeta` so `PortRegistry::register` arms it.
         let line = resolved.line;
+        // The resolved `{packet, N}` framing — the same read-before-the-move rule. Only the
+        // spawn/fd family is framed by the emulator; a driver port's `packet` option is its
+        // driver's (see [`PortName::frames_packets`] and [`packet`]).
+        let packet = if spec.kind.frames_packets() {
+            packet::PacketFraming::new(resolved.packet_bytes)?
+        } else {
+            None
+        };
         if spec.kind == PortName::SpawnDriver {
             // The driver name is the prefix up to the first blank — the C's own rule (`io.c` walks
             // the name to the first blank before matching `driver_name`), the same rule
@@ -2581,6 +2705,8 @@ impl PortHook for RuntimePorts {
                     os_pid: None,
                     stream,
                     line,
+                    // A driver port's `{packet, N}` belongs to the driver, not to the emulator.
+                    packet: None,
                     // Nothing to reap, so no `{Port, {exit_status, …}}` is ever synthesized.
                     notify_exit: false,
                     monitors: Vec::new(),
@@ -2661,6 +2787,8 @@ impl PortHook for RuntimePorts {
                 os_pid: None,
                 stream,
                 line,
+                // A driver port's `{packet, N}` belongs to the driver, not to the emulator.
+                packet: None,
                 // Nothing to reap, so no `{Port, {exit_status, …}}` is ever synthesized.
                 notify_exit: false,
                 monitors: Vec::new(),
@@ -2695,6 +2823,8 @@ impl PortHook for RuntimePorts {
             os_pid,
             stream,
             line,
+            // The spawn/fd family is the one the emulator frames itself (see [`packet`]).
+            packet,
             notify_exit: spawn_options.exit_status,
             monitors: Vec::new(),
             owner: self.owner,
