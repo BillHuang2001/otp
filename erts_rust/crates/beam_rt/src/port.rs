@@ -3427,3 +3427,8 @@ mod inet_matrix_tests;
 /// shape matrix does not grow this one.
 #[cfg(test)]
 mod stream_shape_tests;
+/// The `{packet, N}` **framing** suite: the emulator-side length header on the way out and the
+/// packet reassembly on the way in (see `src/port/packet_framing_tests.rs`). A separate file so the
+/// framing matrix does not grow this one.
+#[cfg(test)]
+mod packet_framing_tests;
