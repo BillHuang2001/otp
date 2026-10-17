@@ -31,9 +31,13 @@
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`.
 
+use std::os::unix::io::RawFd;
+
 use beam_common::Result;
 
 use crate::error;
+
+use super::sys;
 
 /// The result tag of a successful control operation (`INET_REP_OK`, `inet_drv.c:870`).
 pub const INET_REP_OK: u8 = 1;
@@ -137,6 +141,7 @@ pub(super) fn errno_name(errno: i32) -> String {
         libc::EAFNOSUPPORT => Some("eafnosupport"),
         libc::EAGAIN => Some("eagain"),
         libc::EALREADY => Some("ealready"),
+        libc::EBADF => Some("ebadf"),
         libc::ECONNABORTED => Some("econnaborted"),
         libc::ECONNREFUSED => Some("econnrefused"),
         libc::ECONNRESET => Some("econnreset"),
@@ -169,6 +174,140 @@ pub(super) fn errno_name(errno: i32) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The reply shapes of the shared `inet_ctl` arms
+// ---------------------------------------------------------------------------
+//
+// Both drivers delegate `GETSTAT`/`GETTYPE`/`GETFD`/`GETSTATUS`/`NAME`/`PEER` to the *same*
+// `inet_ctl` function (`inet_drv.c:10988`), so their reply shapes are built once here rather than
+// once per driver. Each builder is a faithful port of the corresponding C arm; where this floor
+// cannot produce the C's payload it is a typed error, never a fabricated reply.
+
+/// The `INET_REQ_GETSTAT` reply (the C's `inet_fill_stat`, `inet_drv.c:10732`).
+///
+/// An **empty** request answers the bare success tag — the C's `fill_stat` writes a record only
+/// for each requested counter, so nothing requested means nothing appended (measured `[1]` on
+/// both drivers' bare ports).
+///
+/// # Errors
+///
+/// [`beam_common::BeamError`] carrying the typed "not served" reason for a non-empty request: the
+/// C's statistics counters (`recv_cnt`/`send_cnt`/`recv_oct`/`send_oct`/…) live on the driver's
+/// descriptor and are not tracked by this floor, and answering a zeroed counter would be a wrong
+/// value rather than a missing one.
+pub(super) fn getstat_reply(arg: &[u8]) -> Result<Vec<u8>> {
+    if arg.is_empty() {
+        return Ok(ctl_ok());
+    }
+    Err(error::unsupported(
+        "the C's inet statistics counters (inet_fill_stat) are not tracked by this driver",
+    ))
+}
+
+/// The `INET_REQ_GETTYPE` reply: the descriptor's **cached** `{Family, Type}` pair
+/// (`inet_drv.c:11165`-`:11203`, `case INET_REQ_GETTYPE`).
+///
+/// The C arm has **no `IS_OPEN` guard**: it switches on the descriptor's cached `sfamily` and only
+/// then on its cached `stype`. Both are set when a socket is opened or adopted (`inet_ctl_open`,
+/// `:5214`-`:5216`; `inet_ctl_fdopen`, `:5265`) and are started at `-1` by `inet_init_desc`
+/// (`:10925`); no close path clears them. So a port that never opened a socket still carries the
+/// unset pair and answers `einval` (measured `[0]einval` on a bare port of either driver), while a
+/// port whose socket has been closed reports the type it was opened with (measured
+/// `[1,0,0,0,1,0,0,0,1]` after a `tcp_inet` close and `[1,0,0,0,1,0,0,0,2]` after a `udp_inet` one).
+///
+/// `family`/`stype` are the wire tags with `0` meaning "unset": only [`INET_AF_INET`] with
+/// [`INET_TYPE_STREAM`] or [`INET_TYPE_DGRAM`] is served, and anything else is the C's
+/// `ctl_error(EINVAL)` (IPv6/SCTP are out of scope, so their tags never appear here).
+pub(super) fn gettype_reply(family: u16, stype: u16) -> Vec<u8> {
+    if family != u16::from(INET_AF_INET) {
+        return ctl_xerror("einval");
+    }
+    if stype != u16::from(INET_TYPE_STREAM) && stype != u16::from(INET_TYPE_DGRAM) {
+        return ctl_xerror("einval");
+    }
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&u32::from(INET_AF_INET).to_be_bytes());
+    reply.extend_from_slice(&u32::from(stype).to_be_bytes());
+    reply
+}
+
+/// The `INET_REQ_GETFD` reply: the driver's descriptor number, big-endian
+/// (`inet_drv.c:11160`, `case INET_REQ_GETFD`).
+///
+/// A socket-less port answers [`ctl_xerror`]`("einval")` — the C's `if (!IS_OPEN) return
+/// ctl_error(EINVAL)` (measured `[0]einval`).
+pub(super) fn getfd_reply(fd: Option<RawFd>) -> Vec<u8> {
+    match fd {
+        Some(fd) => {
+            let mut reply = ctl_ok();
+            reply.extend_from_slice(&fd.to_be_bytes());
+            reply
+        }
+        None => ctl_xerror("einval"),
+    }
+}
+
+/// The `INET_REQ_GETSTATUS` reply: the C's `INET_STATE_*` bit set, big-endian
+/// (`inet_drv.c:11175`, `case INET_REQ_GETSTATUS`).
+///
+/// There is no `IS_OPEN` guard in the C — the state bits are the driver's own — so a socket-less
+/// port answers the `0` (`Closed`) it is really in (measured `[1,0,0,0,0]`).
+pub(super) fn getstatus_reply(state_code: u32) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&state_code.to_be_bytes());
+    reply
+}
+
+/// The `INET_REQ_NAME` reply: the port's own endpoint, as a packed address
+/// (`inet_drv.c:11329`, `case INET_REQ_NAME`).
+///
+/// The C arm has **no `IS_OPEN` guard**: it calls `getsockname(2)` on the descriptor unconditionally,
+/// so a socket-less port answers the syscall's own errno (measured `[0]ebadf`) rather than a
+/// fabricated `einval`. This floor reproduces that: no descriptor ⇒ the `EBADF` refusal, an open
+/// socket ⇒ `[1] ++ pack_address(...)` (measured the 8-byte `[1,1,<port_hi>,<port_lo>,a,b,c,d]`), a
+/// failing syscall ⇒ `[0] ++ errno_name(errno)`.
+pub(super) fn name_reply(fd: Option<RawFd>) -> Result<Vec<u8>> {
+    let Some(fd) = fd else {
+        return Ok(ctl_xerror(&errno_name(libc::EBADF)));
+    };
+    match sys::local_address(fd) {
+        Ok(address) => Ok(packed_addr_reply(address)),
+        Err(err) => Ok(ctl_error(err)),
+    }
+}
+
+/// The success reply carrying one packed address — `[1, INET_AF_INET, port_hi, port_lo, a, b, c, d]`.
+///
+/// The `INET_REQ_NAME`/`INET_REQ_PEER`/`INET_REQ_GETLADDRS`/`INET_REQ_GETPADDRS` arms all answer
+/// through it (`ctl_reply(INET_REP_OK, tbuf, sz, …)` with `tbuf` from `inet_get_address`,
+/// `inet_drv.c:11296`, `:11361`), and so does the fake address a `INET_REQ_SETNAME`/`SETPEER`
+/// installed.
+pub(super) fn packed_addr_reply(address: InetAddr) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&pack_address(address.port, address.addr));
+    reply
+}
+
+/// The `INET_REQ_PEER` reply: the peer's endpoint, as a packed address
+/// (`inet_drv.c:11280`, `case INET_REQ_PEER`).
+///
+/// The C guards on the connection, not on the descriptor: `if (!(desc->state & INET_F_ACTIVE))
+/// return ctl_error(ENOTCONN)` (measured `[0]enotconn` on a bare port **and** on a listening one).
+/// A connected socket answers `[1] ++ pack_address(...)` (measured `[1,1,225,36,127,0,0,1]`); a
+/// failing `getpeername(2)` answers `[0] ++ errno_name(errno)`.
+pub(super) fn peer_reply(fd: Option<RawFd>, connected: bool) -> Result<Vec<u8>> {
+    if !connected {
+        return Ok(ctl_xerror("enotconn"));
+    }
+    let Some(fd) = fd else {
+        // A connected state with no descriptor cannot happen; refuse rather than call into the
+        // kernel with a dangling number.
+        return Ok(ctl_xerror("enotconn"));
+    };
+    match sys::peer_address(fd) {
+        Ok(address) => Ok(packed_addr_reply(address)),
+        Err(err) => Ok(ctl_error(err)),
+    }
+}// ---------------------------------------------------------------------------
 // Argument decoding
 // ---------------------------------------------------------------------------
 
@@ -243,4 +382,65 @@ pub(super) fn split_address(arg: &[u8]) -> Result<(InetAddr, &[u8])> {
     }
     let address = parse_address(&arg[..consumed])?;
     Ok((address, &arg[consumed..]))
+}
+
+/// What one `INET_REQ_SETNAME`/`INET_REQ_SETPEER` operand asks of the driver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum FakeAddress {
+    /// `len == 0`: the C clears the pointer and answers `[1]`
+    /// (`inet_drv.c:11307`/`:11392`).
+    Clear,
+    /// A well-formed address: store it and answer `[1]`.
+    Store(InetAddr),
+    /// The C's `ctl_xerror(name)` payload — `inet_set_faddress`'s own `str_einval`/
+    /// `str_eafnosupport`, or the `len < 2` guard before it (`:11310`/`:11395`).
+    Refuse(&'static str),
+}
+
+/// Decodes the operand of `INET_REQ_SETNAME`(19)/`INET_REQ_SETPEER`(20) — the C's
+/// `inet_set_faddress(desc->sfamily, &desc->name_addr, &buf, &len)` (`inet_drv.c:11397`,
+/// `:11313`).
+///
+/// `cached_family` is the descriptor's cached `sfamily` (`inet_drv.c:10925`) as a wire tag, with
+/// `0` for "no socket yet". It matters only for the [`INET_AF_ANY`]/[`INET_AF_LOOPBACK`] short
+/// form: `inet_set_faddress` switches on the **descriptor's** family there (`:4823`), so on a port
+/// that never opened a socket (`sfamily == -1`) that form is `str_einval` — measured `[0]einval`
+/// for `<<INET_AF_LOOPBACK,0,80>>` on a bare port, `[1]` after an `open`. The explicit
+/// [`INET_AF_INET`] form overrides the family with its own tag, so it is accepted on a bare port.
+///
+/// A tag this driver's IPv4-only scope (`open`/`bind`/`connect` refuse IPv6 the same way) does not
+/// serve is `eafnosupport` — which is also the C's answer for a tag no `case` of
+/// `inet_set_faddress` matches (`:4885`).
+pub(super) fn parse_fake_address(cached_family: u16, arg: &[u8]) -> FakeAddress {
+    let Some((&tag, rest)) = arg.split_first() else {
+        return FakeAddress::Clear;
+    };
+    match tag {
+        INET_AF_INET => {
+            let &[hi, lo, a, b, c, d] = rest else {
+                return FakeAddress::Refuse("einval");
+            };
+            FakeAddress::Store(InetAddr {
+                port: u16::from_be_bytes([hi, lo]),
+                addr: [a, b, c, d],
+            })
+        }
+        INET_AF_ANY | INET_AF_LOOPBACK => {
+            let &[hi, lo] = rest else {
+                return FakeAddress::Refuse("einval");
+            };
+            if cached_family != u16::from(INET_AF_INET) {
+                return FakeAddress::Refuse("einval");
+            }
+            FakeAddress::Store(InetAddr {
+                port: u16::from_be_bytes([hi, lo]),
+                addr: if tag == INET_AF_ANY {
+                    [0, 0, 0, 0]
+                } else {
+                    [127, 0, 0, 1]
+                },
+            })
+        }
+        _ => FakeAddress::Refuse("eafnosupport"),
+    }
 }

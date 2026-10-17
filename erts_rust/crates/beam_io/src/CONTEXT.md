@@ -16,6 +16,23 @@ denies `unsafe_code`, cannot issue itself) rather than parts of the I/O pipeline
 `fs_access.rs` (`access(2)` / `geteuid(2)` / `getegid(2)`, for the `file`/`filelib` floor). Their
 frozen APIs are documented in the parent `../CONTEXT.md` and in each module's own rustdoc.
 
+### The statically-linked driver set (`driver.rs` — the C `driver_tab.c` seam)
+Only the drivers the emulator **statically links** are addressable through
+`open_port({spawn_driver, Name}, …)`; `erts-*/lib/` ships zero `.so`, and the oracle's
+`erl_ddll:loaded_drivers/0` answers exactly `{ok,["tcp_inet","udp_inet","ram_file_drv"]}`
+(OTP 29.1.1 / erts-17.1). `driver.rs` exposes that set and nothing else there:
+- `STATIC_SPAWN_DRIVERS: [&str; 3]` — `["ram_file_drv","tcp_inet","udp_inet"]`, sorted; the
+  emulator's `driver_tab` entries, **not** `.so`-loadable.
+- `is_static_spawn_driver(name) -> bool` — membership in that set.
+- `DriverRegistry::with_static_spawn_drivers()` — a registry whose `names()` is exactly the three.
+- `DriverRegistry::create_static_spawn(name)` — the `{spawn_driver, Name}` resolution path: a
+  non-member is `BeamError::BadArg` (the oracle's `badarg` for `{spawn_driver,"fd"}` / `"efile"`)
+  *even on a registry that registers it*, then the ordinary factory lookup (so a static name
+  missing from *this* registry is also `BadArg`, never a wrong driver).
+`DriverRegistry::with_builtins()` still registers five names — `fd` and `efile` are this crate's
+own drivers (its internal users and tests build ports from them) — so a runtime must gate
+`{spawn_driver, Name}` on `create_static_spawn`, **not** on `with_builtins`/`create`.
+
 ### `{line, N}` line framing (`open_port(…, [line])` / `[binary, {line, N}]`)
 The C splits lines **in the port**, not in the driver: `open_port`'s bare `line` option sets
 `ERTS_PORT_SFLG_LINEBUF_IO` with a 512-byte line buffer and `{line, N}` sets it to `N`
@@ -43,6 +60,26 @@ out of a read as `{eol | noeol, Data}` inside `{Port, {data, …}}` (`deliver_li
   order — the accessor style of `take_eof`/`take_closed_notifications`); `execute_port_tasks` still
   harvests one `PortNotification` per port and its `notifications` carry only `PortNotification`s,
   so a single read can stage many frames (597 bytes at `{line,4}` ⇒ 150, on the line channel).
+
+### A driver's write path — the reply round trip and a refused command
+`PortRegistry::port_command` only **queues** the bytes and schedules one `Output` task; the write
+belongs to the round (`execute_port_tasks` → `run_scheduled_tasks` → `Port::run_task(Output)` →
+`Port::ready_output`, whose `Driver` default forwards to `output`). Whatever a driver pushes onto
+`ctx.input()` — a built-in driver's `port_command` reply, or a `driver_output` made from
+`start`/`control`/`timeout`/`output` — is harvested for **every** live port after the round and
+reported as **exactly one** `PortNotification::Data`, drained once per byte (no double report on a
+later round; a port in `{line, N}` mode reports through the separate `LineNotification` channel
+instead). A `ram_file_drv` port needs no descriptor, so the whole chain is testable with no
+child process and no poller wait.
+A driver that **refuses** a write (`Err(BeamError::BadArg)` from `output`/`ready_output`, e.g. an
+`inet` port whose socket is not open) is surfaced as that error: it short-circuits
+`Port::check_write_accounting` (`result?` runs first, so the driver's reported byte count is never
+inspected) and propagates out of `PortRegistry::execute_port_tasks` (`Err` — **not** a
+`PortTaskOutcome`). Because the command was queued before it was driven, a refused command's bytes
+stay in the output queue and the failing task is already popped, so a later round neither retries
+nor re-reports it. A loaded C driver cannot refuse at all (`output`/`outputv` are `void`,
+`prt->bytes_out += size`), so this shape is Rust-side: the runtime must read the error as "the
+command was refused" and render the oracle's `badarg`.
 
 ## Known Issues (durable gotchas — not fixed by changing this file)
 - **A `PortNotification::Closed` names a number that is retired *with the report*.** `PortRegistry::close`
@@ -96,15 +133,30 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   pinned oracle table byte-for-byte against the system `erl` through a real `cat` child behind a real
   `[line]` / `[binary, {line, N}]` port, plus the `[binary]` no-wrapper row and the
   close-does-not-flush rule, skipping **loudly** when `erl` is absent.
+- **The write path** is pinned hermetically (no `erl`, no child, no sleep) in
+  `registry_reply_tests.rs` — a sibling module declared from `registry.rs` as
+  `#[cfg(test)] #[path = "registry_reply_tests.rs"] mod reply_tests;` so that 1960-line file does not
+  grow: one `ram_file_drv` port, `port_command [1,0,0,0,3,97,98,99]` ⇒ **one**
+  `execute_port_tasks` round reports exactly one `Data { bytes: [3,0,0,0,0] }` with `output_len()`
+  and `input_len()` back to `0` and no task left pending, a second round reports nothing; plus a
+  `RefusingWriteDriver` whose `output`/`ready_output` answer `Err(BadArg)` — `Port::output`,
+  `Port::ready_output` and `execute_port_tasks` each surface `BadArg` with the bytes still queued.
+- **The static-driver set** is pinned in `driver.rs` both ways (each of the three constructs through
+  `create_static_spawn` and reports its own `Driver::name()`; `fd`/`efile` are `BadArg` there while
+  still constructing through `with_builtins()`; `STATIC_SPAWN_DRIVERS` is sorted and agrees with
+  `is_static_spawn_driver`; `with_static_spawn_drivers().names()` is exactly the three) and
+  cross-checked against `erl_ddll:loaded_drivers/0` on the `erl` oracle, skipping **loudly** when
+  `erl` is absent (the `fs_access.rs` pattern).
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` regular-file fallback), `Token`, `Interest`, `Ready`, `Event`, `Waker`
 - `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`
 - `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`)
+- `registry_reply_tests.rs` → the write-path pin: the reply round trip (`port_command` ⇒ one `Data`) and the refused-command propagation (`Err(BadArg)` out of `execute_port_tasks`), a `#[path]` test module of `registry.rs`
 - `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `PortNotification` (`Data` + `Closed`), `LineNotification` (the separate `{line,N}` channel), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`
-- `driver.rs` → `Driver`, `DriverContext`, `DriverFlags`, `DriverRegistry`, `PortExitReason`, `PortArms`
+- `driver.rs` → `Driver`, `DriverContext`, `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors
 - `signal.rs` → `Signal`/`Disposition`/`SignalFacility`; `cpu_time.rs` → `CpuTimes`/`RuntimeClock`; `ddll.rs` → `DynLib`/`DllError`
 - `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site), `access` (`Result<bool>`, refusal ⇒ `false`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>`)

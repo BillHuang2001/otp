@@ -211,7 +211,11 @@ impl PortRegistry {
     ///
     /// Returns any error raised by a port's driver while the scheduled tasks run; the closes
     /// still pending at that point stay queued (they are reported, and their numbers retired, by
-    /// the next round) rather than being dropped.
+    /// the next round) rather than being dropped. The failing task is never retried — it was
+    /// popped from its port's task queue before it ran and is not re-queued, so a later round
+    /// neither re-runs it nor reports anything for it, and a refused write leaves the command's
+    /// bytes in the port's output queue (the contract [`PortRegistry::execute_port_tasks`] states
+    /// in full).
     pub fn handle_events(
         &mut self,
         poller: &mut Poller,
@@ -285,10 +289,15 @@ impl PortRegistry {
     ///
     /// # Errors
     ///
-    /// Returns any error raised by a port's driver while a task runs; the tasks after it
-    /// stay queued. A close pending at that point is **not** lost: the closes are drained only
-    /// after every fallible step of the round has succeeded, so an error leaves them queued for
-    /// the next round (and keeps their numbers allocated meanwhile — see
+    /// Returns any error raised by a port's driver while a task runs. That task has already
+    /// been removed from the port's task queue — it is popped before it is run — and is **not**
+    /// re-queued, so neither this round nor a later one retries it or reports anything for it;
+    /// the port's **other** queued tasks stay queued. For a refused **write** the command's
+    /// bytes additionally stay in the port's output queue: a command is queued before it is
+    /// driven, so a driver answering an error cannot un-queue it — the refused-command contract
+    /// [`Port::output`] documents. A close pending at that point is **not** lost: the closes are
+    /// drained only after every fallible step of the round has succeeded, so an error leaves them
+    /// queued for the next round (and keeps their numbers allocated meanwhile — see
     /// [`PortRegistry::take_closed_notifications`]).
     pub fn execute_port_tasks(
         &mut self,
@@ -613,6 +622,11 @@ impl PortRegistry {
     ///
     /// Returns `(tasks run, reductions used)`. The ports are visited in port-number order
     /// so a round is deterministic.
+    ///
+    /// A task is popped from its port's queue **before** it is run, so an error from a driver
+    /// callback returns from here with that task already gone — never re-queued, hence neither
+    /// retried nor re-reported by a later round — while every other queued task stays queued.
+    /// That is the shape [`PortRegistry::execute_port_tasks`] documents for its callers.
     fn run_scheduled_tasks(
         &mut self,
         poller: &mut Poller,
@@ -1953,3 +1967,11 @@ mod tests {
         );
     }
 }
+
+/// One port-task round's write-path outcome — the built-in driver's reply bytes reaching the
+/// owner as one [`PortNotification::Data`](crate::PortNotification), and a refusing driver's
+/// error surfacing out of the round — lives in this sibling file so neither of the two long
+/// sources (`registry.rs`, `port.rs`) grows a second undeclared suite.
+#[cfg(test)]
+#[path = "registry_reply_tests.rs"]
+mod reply_tests;

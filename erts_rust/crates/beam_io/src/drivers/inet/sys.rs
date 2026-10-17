@@ -139,6 +139,75 @@ pub(super) fn local_port(fd: RawFd) -> Result<u16> {
     Ok(u16::from_be(sin.sin_port))
 }
 
+/// The local endpoint of `fd` (`getsockname(2)`), the C's `sockname`
+/// (`inet_drv.c:4890`, `inet_get_address`'s encoder of `INET_REQ_NAME`).
+///
+/// # Errors
+///
+/// The raw `getsockname(2)` failure (`EBADF` for a descriptor that is not a socket) and the typed
+/// "not an IPv4 endpoint" refusal for a family this floor does not encode — a wrong family tag
+/// would be a wrong address, so it is never guessed.
+pub(super) fn local_address(fd: RawFd) -> std::io::Result<InetAddr> {
+    // SAFETY: an all-zero `sockaddr_storage` is a valid value of that type and is exactly the
+    // out-parameter `getsockname(2)` expects; `len` starts as its size and may be shrunk.
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `addr`/`len` are a valid address buffer and its length, so the kernel writes at
+    // most `len` bytes into `addr`. `fd` is the caller's descriptor; a descriptor that is not a
+    // socket is reported by the syscall as `EBADF`/`ENOTSOCK`, not by any promise made here.
+    if unsafe { libc::getsockname(fd, std::ptr::addr_of_mut!(addr).cast(), &mut len) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    decode_inet_address(&addr)
+}
+
+/// The peer endpoint of `fd` (`getpeername(2)`), the C's `sockpeer`
+/// (`inet_drv.c:11280`, the body of `INET_REQ_PEER`).
+///
+/// # Errors
+///
+/// The raw `getpeername(2)` failure (`ENOTCONN` for an unconnected socket) and the typed "not an
+/// IPv4 endpoint" refusal, as in [`local_address`].
+pub(super) fn peer_address(fd: RawFd) -> std::io::Result<InetAddr> {
+    // SAFETY: an all-zero `sockaddr_storage` is a valid value of that type and is exactly the
+    // out-parameter `getpeername(2)` expects; `len` starts as its size and may be shrunk.
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `addr`/`len` are a valid address buffer and its length, so the kernel writes at
+    // most `len` bytes into `addr`. `fd` is the caller's descriptor; an unconnected peer is
+    // reported by the syscall as `ENOTCONN`, not by any promise made here.
+    if unsafe { libc::getpeername(fd, std::ptr::addr_of_mut!(addr).cast(), &mut len) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    decode_inet_address(&addr)
+}
+
+/// Decodes the `sockaddr` the kernel filled into `addr` as an IPv4 endpoint.
+///
+/// # Errors
+///
+/// [`std::io::ErrorKind::Unsupported`] for a family other than `AF_INET`: the drivers are
+/// `AF_INET`-only, so a different family means the descriptor is not one this floor can describe,
+/// and inventing a packed `INET_AF_INET` address for it would be a wrong value.
+fn decode_inet_address(addr: &libc::sockaddr_storage) -> std::io::Result<InetAddr> {
+    // SAFETY: `addr` is a fully initialized `sockaddr_storage`, whose first field is the
+    // `sa_family_t` every `sockaddr` variant starts with, so reading it is well defined for any
+    // family the kernel wrote.
+    let family = unsafe { (*std::ptr::from_ref(addr).cast::<libc::sockaddr>()).sa_family };
+    if family != libc::AF_INET as libc::sa_family_t {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the endpoint is not an AF_INET address",
+        ));
+    }
+    // SAFETY: the family check above proves the kernel filled in a `sockaddr_in` at the start of
+    // the `sockaddr_storage`, which is at least as large and at least as aligned as it.
+    let sin: libc::sockaddr_in = unsafe { std::ptr::read(addr_ptr_as_sockaddr_in(addr)) };
+    Ok(InetAddr {
+        port: u16::from_be(sin.sin_port),
+        addr: sin.sin_addr.s_addr.to_ne_bytes(),
+    })
+}
 /// Whether `fd` is a listening socket (`SO_ACCEPTCONN`).
 ///
 /// # Errors
@@ -191,6 +260,66 @@ pub(super) fn socket_error(fd: RawFd) -> Result<i32> {
         return Err(error::io(std::io::Error::last_os_error()));
     }
     Ok(err)
+}
+
+/// The cached socket-type tag of `fd`: `1` ([`super::wire::INET_TYPE_STREAM`]) or `2`
+/// ([`super::wire::INET_TYPE_DGRAM`]), and `0` for a descriptor whose `SO_TYPE` is neither.
+///
+/// The C descriptor records the kernel's `SO_TYPE` in `inet.stype` when it opens or adopts a
+/// socket (`inet_ctl_open`, `inet_drv.c:5215`; `inet_ctl_fdopen`, `:5265`) and reports it from
+/// `INET_REQ_GETTYPE` (`:11165`). `0` is the "unset" value that makes `GETTYPE` answer the C's
+/// `einval` rather than a type this floor does not serve.
+///
+/// # Errors
+///
+/// `BeamError::Io` when `getsockopt(2)` fails (`fd` is not a socket).
+pub(super) fn socket_type(fd: RawFd) -> Result<u16> {
+    // SAFETY: `option` is a writable `c_int` and `len` its valid size, which is exactly the
+    // out-parameter pair `getsockopt(2)` expects for a `c_int`-valued option.
+    let mut option: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is the caller's socket, and `option`/`len` are a valid buffer and size for
+    // the `SO_TYPE` option.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(option).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    let stype = match option {
+        libc::SOCK_STREAM => 1,
+        libc::SOCK_DGRAM => 2,
+        _ => 0,
+    };
+    Ok(stype)
+}
+
+/// The host's name, from `gethostname(2)` — the `INET_REQ_GETHOSTNAME` reply payload
+/// (`inet_drv.c:11219`, the C's `sock_hostname`, a **local** syscall with no resolver
+/// involved).
+///
+/// The trailing NUL (and anything the kernel truncated after it) is trimmed, so the bytes are
+/// exactly the C's `ctl_reply(INET_REP_OK, tbuf, strlen(tbuf))` payload.
+///
+/// # Errors
+///
+/// `BeamError::Io` when `gethostname(2)` fails.
+pub(super) fn hostname() -> Result<Vec<u8>> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a writable array of `buf.len()` bytes; the kernel writes at most that
+    // many bytes into it (truncating a longer name) and never retains the pointer.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(buf[..end].to_vec())
 }
 
 /// Reads an `int`-valued socket option of `fd` (`getsockopt(2)`).
