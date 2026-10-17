@@ -169,6 +169,13 @@ readers, raw-word layout assertions against stack buffers (allowed here — this
 module), the wrong-type/limit error cases, and the carve discipline (`slack_carves_*` builds a
 nested graph out of ONE reservation and asserts the region is consumed exactly once;
 `a_carve_region_too_small_*` pins the typed error; `context_sink_*` covers the unrooted sink).
+Two further pins: `terms::tests::DirtyContext` — a context whose heap is pre-filled with a
+non-zero byte pattern, so "these bytes were never written" is observable — backs
+`a_heap_binary_zeroes_the_padding_of_its_last_data_word`, which reads the **whole** first data
+word of a 3-byte heap binary back as bytes for both the classic and the rooted builder; and
+`a_sink_tuple_beyond_max_arityval_is_a_system_limit` pins the `MAX_ARITYVAL` guard of both
+`Sink::tuple` implementations (`a_sink_tuple_writes_the_arityval_header` pins the header they
+do write).
 The moving-collector discipline is proved by `alloc_tests.rs` (builders) and by the family
 suites `../families/records/tests/rooted.rs` and `../families/bitstrings/matching/rooted.rs`
 (which assert a real relocation occurred, the result is correct, and the vacated address was
