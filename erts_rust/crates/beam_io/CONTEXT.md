@@ -281,7 +281,7 @@ Current: **747 passing / 0 failing / 2 ignored** — **547** lib in-module (`#[c
 - `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `src/drivers/binary_io.rs` → `Phase`, `PhaseChange`
 - `src/drivers/efile.rs` → `EfileDriver`, `make_efile`, `FileDataMode`
 - `src/drivers/spawn.rs` → `SpawnDriver`, `SpawnSpec`/`SpawnOptions`/`StreamOptions`/`SpawnStream`, `build_command`
-- `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers, the numeric `erlang:port_control/3` opcode bridge (`opcode.rs` — the `0x03f1a300` magic, wrapping unsigned subtraction, the C's three switches; oracle-pinned by `opcode_tests.rs`/`opcode_tests_udp.rs`), and `{packet, N}` framing (read + send paths) (child node `src/drivers/inet/CONTEXT.md`)
+- `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers, the numeric `erlang:port_control/3` opcode bridge (`opcode.rs` — the `0x03f1a300` magic, wrapping unsigned subtraction, the C's three switches; oracle-pinned by `opcode_tests.rs`, `opcode_tests_udp.rs` and the state-machine suite `opcode_tests_states.rs`), and `{packet, N}` framing (read + send paths) (child node `src/drivers/inet/CONTEXT.md`)
 - `src/registry_reply_tests.rs` (4) → `registry.rs`'s reply/refusal suite: a descriptor-less built-in (`ram_file_drv`) port's `port_command` → one `PortNotification::Data` carrying the driver's reply, exactly once (no double report, `output_len`/`input_len` back to 0), and a refusing driver's `Err(BadArg)` surfacing out of the whole port-task round with its bytes retained
 - `src/drivers/ram_file.rs` → the `ram_file_drv` in-memory file driver (`RamFileDriver`/`make_ram_file`)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
