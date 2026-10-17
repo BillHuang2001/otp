@@ -2982,13 +2982,23 @@ fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
     let rows = counter_table(heap_growth_fixture(), "heap_growth", COUNTS);
     let [(n1, r1), (_, r2), (n3, r3)] = rows;
 
-    // The 401-word request cannot fit a fresh nursery: the growth/collection door is reached
-    // once per iteration (or more), and the no-relocation growth seam retires the space it
-    // replaces, so the retired chain is longer than one space.
-    assert!(
-        r1.collections >= n1 as u64,
-        "every iteration must reach the collection door: N={n1} collections={}: {r1:?}",
+    // The 401-word request cannot fit a fresh nursery, so the growth/collection door is reached
+    // on essentially every iteration; the two iterations that do not collect take the
+    // no-relocation **growth** arm instead (a fresh nursery that cannot be grown by collecting —
+    // there is nothing to free — is enlarged, which is why the retired chain is longer than one
+    // space). The count is therefore `N - 2` **exactly**, at every N: a constant offset, derived,
+    // not an inequality — the calibrated form of "every iteration reaches the door".
+    assert_eq!(
+        r1.collections,
+        (n1 as u64) - 2,
+        "the door is reached once per iteration bar the two growth warm-ups: N={n1} collections={}: \
+         {r1:?}",
         r1.collections
+    );
+    assert_eq!(
+        (r2.collections, r3.collections),
+        ((25_000u64) - 2, (n3 as u64) - 2),
+        "the offset is constant in N (never a per-call work increase): {r2:?} {r3:?}"
     );
     assert!(r3.collections > r1.collections, "more iterations ⇒ more collections: {r3:?}");
     assert!(

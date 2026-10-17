@@ -331,14 +331,24 @@ round trips, the same two-process shape — makes **0** `clock_nanosleep` calls,
 `the_heap_growth_workloads_per_call_counters_are_flat_in_n` each drive their fixture at three
 increasing iteration counts and print a `counter_table`: N vs slices / yields / waits / collections /
 major / fallbacks / peak young-nursery geometry / debt boundaries, plus the derived per-call ratios.
-Measured (release): `churn` collections/call 6.996002 / 6.999200 / 6.999800 and slices/call
-0.191904 / 0.191981 / 0.191995 at N=2 000 / 10 000 / 40 000 — flat to within 0.06 %, with
-`collections == 7N − 1` exactly at every N; `heap_growth` collections/call 0.999900 / 0.999960 /
-0.999980 and slices/call 0.000300 / 0.000280 / 0.000260 at N=10 000 / 25 000 / 50 000 — one
-collection per iteration throughout, since the 401-word request cannot fit a fresh nursery. In both
-shapes `peak_young_spaces == 2` and the young capacity plateaus (376 / 610 words) at every N, so the
-retired-nursery chain the `collection_debt` trigger protects is bounded rather than N-dependent, and
-`yields == slices − 1` with `waits == 0` throughout (neither loop ever parks).
+Measured: `churn` collections/call 5.997501 / 5.999500 / 5.999875 and slices/call
+0.191904 / 0.191981 / 0.191995 at N=2 000 / 10 000 / 40 000 — flat to within 0.04 %, with
+`collections == 6N + 1` and `major == N + 1` exactly at every N (one fullsweep per iteration);
+`heap_growth` collections/call 0.999700 / 0.999880 / 0.999940 and slices/call 0.000300 / 0.000280 /
+0.000260 at N=10 000 / 25 000 / 50 000, with `collections == N − 2` and `major == 2` exactly at every
+N: the 401-word request cannot fit a fresh nursery, so the door is reached on every iteration bar a
+**constant two** growth warm-ups (a fresh nursery with nothing to free can only be grown), which is
+the derived constant that assertion pins.
+In both shapes `peak_young_spaces == 2` and the young capacity plateaus (609 / 610 words) at every N,
+so the retired-nursery chain the `collection_debt` trigger protects is bounded rather than
+N-dependent, and `yields == slices − 1` with `waits == 0` throughout (neither loop ever parks).
+`peak_mature_capacity` plateaus at 987 words; `churn`'s `peak_mature_used` is 840 there while
+`heap_growth`'s stays 0 (its tuples are garbage the sweep reclaims, so a fullsweep leaves the mature
+space entry-free).
+Neither loop's cadence is this node's to set: the door decides *whether* a collection may run (and
+the counters above show it declining nothing), the collector's post-collection nursery sizing decides
+*how often* — see [`../context/IMPLEMENTATION.md`](../context/IMPLEMENTATION.md) *What the doors do
+NOT decide*.
 
 **`foreign` per-call cost, with the mechanism that keeps the loops from degenerating.** Measured
 2026-10-17 with the committed driver (`bench run --quick --runtime all --workloads foreign`,
