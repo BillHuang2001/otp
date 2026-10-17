@@ -124,12 +124,21 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   a `#[cfg(test)]` module. This is a genuinely rigorous result.
 
 ## Known Issues
-- **`../tests/gaps.rs` fixture stale (owner: the crate node, `../tests/` — outside this node).**
-  `interpreter_capability_gaps_report_their_exact_typed_error`'s `context/apply_fun-has-no-hook` fixture drives
-  `Instr::CallFun2 { arity: 0, func: X(0) }` with `x(0)` never set, i.e. a **non-fun** target. Since `funs::call_fun`
-  now classifies the target's shape before the seam (oracle-correct), the fixture reaches the target-shape error
-  instead of the pinned `unsupported_opcode: apply_fun`. The fixture needs a genuine 0-ary closure in `x(0)`
-  (`MakeFun3` before the `CallFun2`) to exercise the seam again — a change outside this subtree.
+- **`records`' `NO_FAIL` fail-arm diverges from `maps`' — OPEN, engine-side, small.** `records/mod.rs:463-475`
+  `fail_step` returns the typed `unsupported("<instruction>/no_fail")` for `NO_FAIL`, while
+  `maps/mod.rs:260-271` `fail_or_function_clause` forwards the same situation to the engine's single
+  failed-clause definition `crate::interpreter::raise_function_clause_no_fail`. C's `$FAIL(0)`
+  (`emu/macros.tab:56`) is an unresolvable self-jump — `NO_FAIL` is only ever emitted where the compiler
+  proved the test cannot fail — so neither choice can be observed from compiler-generated IR; the divergence
+  is a consistency defect (two different answers for one unreachable state), not a wrong value. Fix: route
+  `fail_step`'s `NO_FAIL` arm through `raise_function_clause_no_fail`, which needs `machine`/`module` threaded
+  into `fail_step` from its four call sites.
+- **`bitstrings/raw.rs:69` re-declares `const ERL_ONHEAP_BINARY_LIMIT = 64` and hand-rolls the heap-binary
+  layout** instead of forwarding to `beam_term::bitstring` as `records/raw.rs` already forwards to
+  `beam_term::record`. A duplicated frozen constant: if `beam_term`'s limit ever moves, this copy silently
+  disagrees. OPEN, engine-side, small.
+- **`bitstrings` differential-corpus hole (tools-owned).** `bitstrings/CONTEXT.md` records the missing
+  `wire`/bitstring gate cases; the owner is `tools/differential`, not this crate.
 
 ## Handoffs (owned elsewhere — NOT closeable in this node)
 - **`records` foreign-module `put_record/6` create form** (a `{OtherModule,Name}` record id) ⇒ typed `unsupported`;
