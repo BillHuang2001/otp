@@ -94,6 +94,10 @@ sound only because `alloc_words` never collects:
     `&self` caller that cannot lend `&mut` roots uses it; `alloc_words` never collects). It is
     only moving-safe for shapes with **no** machine-heap operand held across an allocation.
   A region too small for a node is a typed `crate::error::unsupported`, never a wrong term.
+  `tuple` additionally rejects more than `MAX_ARITYVAL` (`(1 << 24) - 1`, the `arityval`
+  header's 24-bit field) elements with `BeamError::SystemLimit` **before** carving (one
+  private `check_tuple_arity` used by both sinks), so a slice no header can encode is never
+  written as a bogus arity.
 - **Readers** (`read.rs`, `map.rs::map_entries`, `fun.rs`): `tuple_arity`, `tuple_element`,
   `cons_head`, `cons_tail`, `list_elements`, `binary_bytes`, `fun_*`, `is_fun`, `is_hashmap`.
   Wrong type / out-of-range ⇒ `BeamError::BadArg`; no reader panics.
