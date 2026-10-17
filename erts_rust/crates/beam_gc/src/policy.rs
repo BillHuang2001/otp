@@ -287,9 +287,8 @@ impl HeapPolicy {
 
     /// The nursery size (in words) to use after a collection, from the `capacity_words` the
     /// nursery chain had when it was collected and the `demand_words` the round observed — the
-    /// nursery half of the C's minor-time young-heap resize
-    /// (`next_heap_size(p, stack_size + MAX(size_before, need), 0)`, `erl_gc.c:1493`) and of
-    /// `adjust_after_fullsweep` (`erl_gc.c:2061-2098`).
+    /// nursery half of the C's **minor-time** young-heap resize
+    /// (`next_heap_size(p, stack_size + MAX(size_before, need), 0)`, `erl_gc.c:1493`).
     ///
     /// The nursery is **bounded**: the *only* branch that grows it needs
     /// `demand_words > capacity_words`, so a demand the round actually demonstrated inside the
@@ -304,11 +303,13 @@ impl HeapPolicy {
     /// a *single* allocation about to happen: growing the nursery to cover a larger single
     /// request is [`ensure_capacity`](crate::Collector::ensure_capacity)'s job (the explicit,
     /// request-driven growth seam), which is why the nursery never has to grow merely because a
-    /// collection ran. The callers pass, respectively, the words a minor **left alive in the
-    /// nursery** (the promoted set — the C's minor-time `size_before`) and the **occupancy a
-    /// fullsweep observed** before it relocated everything out (there is no surviving young set
-    /// to size from, and the C keeps the heap it had in exactly that situation). Bounded by
-    /// [`min_heap_words`](Self::min_heap_words)/[`max_heap_words`](Self::max_heap_words).
+    /// collection ran.
+    ///
+    /// **This is the minor's rule.** A minor leaves a live young set behind, so its single
+    /// input is the words it **promoted** (the C's minor-time `size_before`); a fullsweep
+    /// relocates everything out of the nursery and therefore needs the C's *second*,
+    /// post-copy rule as well — see [`young_after_fullsweep`](Self::young_after_fullsweep).
+    /// Bounded by [`min_heap_words`](Self::min_heap_words)/[`max_heap_words`](Self::max_heap_words).
     pub fn young_after_collection(&self, capacity_words: usize, demand_words: usize) -> usize {
         let request = demand_words.max(self.need_reserve_words);
         if request > capacity_words {
@@ -322,6 +323,73 @@ impl HeapPolicy {
         } else {
             // The nursery turned out to be about right: keep it.
             capacity_words
+        }
+    }
+
+    /// The nursery size (in words) to use after a **fullsweep** — the C's **two-step** sizing,
+    /// in order:
+    ///
+    /// 1. `major_collection` (`erl_gc.c:1866`) sizes the receiving heap from the **pre-copy**
+    ///    occupancy: `new_sz = next_heap_size(stack_size + size_before + S_RESERVED, 0)`, where
+    ///    `size_before` is the young usage plus the old heap's occupancy. Here that is
+    ///    [`young_after_collection`](Self::young_after_collection) over `observed_words`, the
+    ///    occupancy the round sampled **before** the copy — a nursery the round found genuinely
+    ///    used keeps its capacity, so a steady workload stops paying a space install per
+    ///    fullsweep (`MEASURED.md`, "Post-fullsweep nursery sizing").
+    /// 2. `adjust_after_fullsweep` (`erl_gc.c:2062-2098`) then runs **after** the copy and
+    ///    re-sizes off the **post-copy live set**:
+    ///    `need_after = (HEAP_TOP - HEAP_START) + need + stack_size + S_RESERVED`; when
+    ///    `4 * need_after < HEAP_SIZE && HEAP_SIZE > H_MIN_SIZE` it shrinks to
+    ///    `wanted = 2 * need_after` (`next_heap_size(wanted, 0)`). Here that is
+    ///    [`should_shrink`](Self::should_shrink) over `need_after = live_words +
+    ///    need_reserve_words` and the target `next_words(2 * need_after, 0)` — the C's
+    ///    `wanted`, floored by [`min_heap_words`](Self::min_heap_words) and clamped by
+    ///    [`max_heap_words`](Self::max_heap_words) through
+    ///    [`next_words`](Self::next_words).
+    ///
+    /// Step 2 is what step 1 cannot see: a fullsweep fires *when the nursery is full*, so the
+    /// pre-copy occupancy is ~the capacity and would never trigger a shrink. Only the size of
+    /// what **survived** the copy says whether the nursery is over-provisioned — the case a
+    /// heap the growth seam stepped up for a burst and then stopped using lands in, where
+    /// step 1 alone would keep a nursery so large that the minors the cadence relies on stop
+    /// happening.
+    ///
+    /// `live_words` must be the **whole-heap** post-copy live count (the young *and* mature
+    /// graphs the fullsweep kept), not the nursery's own surviving set: a fullsweep evacuates
+    /// everything, so a nursery-only count is `≈ 0` and would collapse the nursery to the
+    /// reserve floor on every fullsweep.
+    ///
+    /// # Boundedness
+    ///
+    /// The result is `<=` step 1's, which is `<=` `capacity_words` whenever
+    /// `observed_words <= capacity_words` (a space's occupancy cannot exceed its capacity), so
+    /// a fullsweep never enlarges the nursery — only [`grow`](crate::nursery::Nursery::grow) /
+    /// [`ensure_capacity`](crate::Collector::ensure_capacity) do, on an explicit request. The
+    /// shrink cannot oscillate either: `next_words(2 * need_after, 0)` is the smallest curated
+    /// size `>= 2 * need_after`, and every curated step is at most ~1.6x its predecessor, so
+    /// the target is `< 4 * need_after` in every region of the table (the Fibonacci stage's
+    /// worst case is `next_words(2n) / n < 3.5` for `n >= 12`) — the very next fullsweep's
+    /// [`should_shrink`](Self::should_shrink) gate is then false and the capacity is a fixed
+    /// point. Should the live set *grow*, `should_shrink` simply stops firing.
+    pub fn young_after_fullsweep(
+        &self,
+        capacity_words: usize,
+        observed_words: usize,
+        live_words: usize,
+    ) -> usize {
+        // Step 1 — the C `major_collection` pre-copy occupancy sizing (`erl_gc.c:1866`).
+        let kept = self.young_after_collection(capacity_words, observed_words);
+        // Step 2 — the C `adjust_after_fullsweep` post-copy rule (`erl_gc.c:2062-2098`). The
+        // reserve is part of `need_after`, so this target can never fall below
+        // `2 * need_reserve_words` and the next round starts with the documented slack.
+        let need_after = live_words.saturating_add(self.need_reserve_words);
+        if self.should_shrink(kept, need_after) {
+            // The C's `wanted = 2 * need_after`, curated and policy-bounded. `min(kept)` keeps
+            // this a *shrink*: a growth-table step can overshoot the kept capacity only when
+            // the policy's own floor raised it, and step 2 may never enlarge what step 1 chose.
+            self.next_words(need_after.saturating_mul(2), 0).min(kept)
+        } else {
+            kept
         }
     }
 }

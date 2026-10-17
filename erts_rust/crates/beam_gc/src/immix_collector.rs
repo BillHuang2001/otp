@@ -597,7 +597,7 @@ impl GenImmixCollector {
             .policy
             .mature_after_fullsweep(capacity, live.words, young_occupancy);
         if target != capacity {
-            return self.relocate_major(roots, target, live.lines);
+            return self.relocate_major(roots, target, live.lines, live.words);
         }
 
         // The nursery's mature references, as additional roots: a mature object reachable
@@ -618,7 +618,7 @@ impl GenImmixCollector {
         if self.mature.free_lines() < needed {
             // Even after reclaiming the mature generation the *in-place* region cannot hold
             // the promotion: grow the region instead of failing — see [`Self::grow_major`].
-            return self.grow_major(roots, needed, live.lines);
+            return self.grow_major(roots, needed, live.lines, live.words);
         }
 
         // Attempt the promotion atomically. A line-granular destination can refuse it even
@@ -639,14 +639,17 @@ impl GenImmixCollector {
                 stats.words_reclaimed = immix.words_reclaimed + nursery_garbage;
                 self.minor_since_major = 0;
                 // The fullsweep promoted the nursery's live words into the mature region, so
-                // there is no surviving young set to size the nursery from: it is sized from the
-                // **demand this round observed** (`used`, sampled before the promotion), the
-                // copying collector's rule and the C `adjust_after_fullsweep`'s
-                // keep-unless-over-provisioned behaviour (`crate::Nursery::collapse`).
-                self.nursery.collapse(&self.policy, used)?;
+                // there is no surviving young set to size the nursery from: it is sized by the
+                // C's **two-step** rule ([`HeapPolicy::young_after_fullsweep`]) — the demand this
+                // round observed (`used`, sampled before the promotion; `erl_gc.c:1866`) followed
+                // by the whole-heap post-copy live set (`live.words`; the
+                // `adjust_after_fullsweep` shrink, `erl_gc.c:2062-2098`), the copying
+                // collector's rule.
+                self.nursery
+                    .collapse_after_fullsweep(&self.policy, used, live.words)?;
                 Ok(stats)
             }
-            PromoteOutcome::WouldNotFit => self.grow_major(roots, needed, live.lines),
+            PromoteOutcome::WouldNotFit => self.grow_major(roots, needed, live.lines, live.words),
         }
     }
     /// The **growth fallback** for a fullsweep whose **in-place** reclaim could not take the
@@ -690,6 +693,7 @@ impl GenImmixCollector {
         roots: &mut [Eterm],
         needed: usize,
         live_lines: usize,
+        live_words: usize,
     ) -> Result<GcStats> {
         let capacity = self.mature.capacity_words();
         // The target must cover both the promotion the reclaim could not fit (`needed`) and
@@ -703,7 +707,7 @@ impl GenImmixCollector {
         // (or the growth table's own ceiling) forbids growing at all.
         let target = self.policy.next_words(want, 0);
         if target > capacity {
-            return self.relocate_major(roots, target, live_lines);
+            return self.relocate_major(roots, target, live_lines, live_words);
         }
         if live_lines <= self.mature.line_count() {
             // Growth is forbidden, but the *in-place* region's fragmentation is not the last
@@ -711,7 +715,7 @@ impl GenImmixCollector {
             // the promotion that found no run gets one. The capacity is a whole number of
             // blocks, so `line_count() * LINE_WORDS == capacity` and the target needs no
             // raising (and would be clamped back to the ceiling if it were raised).
-            return self.relocate_major(roots, capacity, live_lines);
+            return self.relocate_major(roots, capacity, live_lines, live_words);
         }
         Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)))
     }
@@ -735,6 +739,11 @@ impl GenImmixCollector {
     /// [`max_heap_words`](HeapPolicy::max_heap_words) ceiling that forbids the raise is the
     /// typed heap exhaustion instead, and the from-space is never left half-forwarded.
     ///
+    /// `live_words` is the same graph's exact **word** count, which the nursery's post-copy
+    /// sizing needs ([`HeapPolicy::young_after_fullsweep`]'s second step — the C
+    /// `adjust_after_fullsweep`, `erl_gc.c:2062-2098`) and which the line count cannot stand in
+    /// for, since a mark-region line charges 16 words for a 2-word cell.
+    ///
     /// The promotion itself is [atomic](\`promote\`), so a fresh region whose *run* layout
     /// cannot place the graph is refused with the same typed exposure and **nothing
     /// installed**: the trial region is dropped, the from-space keeps every live word at its
@@ -744,6 +753,7 @@ impl GenImmixCollector {
         roots: &mut [Eterm],
         target: usize,
         live_lines: usize,
+        live_words: usize,
     ) -> Result<GcStats> {
         let used = self.nursery.used_words();
         let before = self.mature.used_words().saturating_add(used);
@@ -789,10 +799,13 @@ impl GenImmixCollector {
         // No in-place reclaim ran, so there is nothing to report for it.
         self.last_immix = None;
         // The relocation copied every live word — the nursery's included — into the fresh
-        // mature region, so there is no surviving young set: the nursery is sized from the
-        // **demand this round observed** (`used`, sampled before the copy), exactly as the
-        // in-place fullsweep and the copying collector size it.
-        self.nursery.collapse(&self.policy, used)?;
+        // mature region, so there is no surviving young set: the nursery is sized by the C's
+        // **two-step** rule ([`HeapPolicy::young_after_fullsweep`]) from the demand this round
+        // observed (`used`, sampled before the copy; `erl_gc.c:1866`) and the whole-heap
+        // post-copy live set (`live_words`; `erl_gc.c:2062-2098`), exactly as the in-place
+        // fullsweep and the copying collector size it.
+        self.nursery
+            .collapse_after_fullsweep(&self.policy, used, live_words)?;
         Ok(stats)
     }
 }

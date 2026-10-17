@@ -300,16 +300,20 @@ impl Nursery {
             .with_generation(self.extent.generation().saturating_add(1));
         Ok(())
     }
-    /// Collapses the chain back to **exactly one** space, after a collection has evacuated
+    /// Collapses the chain back to **exactly one** space, after a **minor** has evacuated
     /// every space.
     ///
     /// It drops the retired spaces (and their containment index) and re-sizes the single
     /// remaining current space from the heap-size policy
     /// ([`HeapPolicy::young_after_collection`]) over the capacity the chain held when it was
-    /// collected, where `demand_words` is the **demand the round observed**: the words the
-    /// mutator had admitted into the chain when it was collected (see
-    /// [`Nursery::used_words`], sampled by the collector *before* the copy). The space is only
+    /// collected, where `demand_words` is what the round measured: for a minor the words it
+    /// **promoted** (which is what it left alive in the young generation). The space is only
     /// replaced when the target differs; otherwise its bump pointer is merely rewound.
+    ///
+    /// A **fullsweep** passes the post-copy live set as well and therefore calls
+    /// [`collapse_after_fullsweep`](Nursery::collapse_after_fullsweep) — the C applies a
+    /// second, post-copy sizing rule to a fullsweep (`erl_gc.c:2062-2098`) that a minor never
+    /// reaches.
     ///
     /// # The sizing input is bounded by the collected capacity, so this can never creep
     ///
@@ -325,6 +329,37 @@ impl Nursery {
     pub(crate) fn collapse(&mut self, policy: &HeapPolicy, demand_words: usize) -> Result<()> {
         let collected_capacity = self.capacity_words();
         let target = policy.young_after_collection(collected_capacity, demand_words);
+        self.install_collapsed(target)
+    }
+
+    /// Collapses the chain after a **fullsweep**, applying the C's **two-step** nursery sizing
+    /// ([`HeapPolicy::young_after_fullsweep`]): the pre-copy occupancy sizing
+    /// (`erl_gc.c:1866`) followed by the post-copy live-set shrink (`erl_gc.c:2062-2098`).
+    ///
+    /// `observed_words` is the occupancy the round sampled **before** the copy and
+    /// `live_words` the **whole-heap** post-copy live word count (young *and* mature), which is
+    /// the input the second step needs: a fullsweep leaves no live young set of its own, so its
+    /// own surviving set cannot size the nursery, and a nursery-only count would collapse it to
+    /// the reserve floor every round (`MEASURED.md`).
+    ///
+    /// Both inputs only ever *shrink* the target relative to the collected capacity, so this
+    /// keeps [`collapse`](Nursery::collapse)'s guarantee that a collection never enlarges a
+    /// nursery.
+    pub(crate) fn collapse_after_fullsweep(
+        &mut self,
+        policy: &HeapPolicy,
+        observed_words: usize,
+        live_words: usize,
+    ) -> Result<()> {
+        let collected_capacity = self.capacity_words();
+        let target =
+            policy.young_after_fullsweep(collected_capacity, observed_words, live_words);
+        self.install_collapsed(target)
+    }
+
+    /// The shared body of the two collapse seams: install (or rewind to) a single space of
+    /// `target` words, drop the retired chain, and re-seed the aggregate extent.
+    fn install_collapsed(&mut self, target: usize) -> Result<()> {
         self.retired.clear();
         self.retired_regions.clear();
         if self.current.capacity_words() == target {
