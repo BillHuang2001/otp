@@ -147,6 +147,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub mod driver;
+pub(crate) mod exit;
 pub(crate) mod ops;
 pub(crate) mod tty;
 pub(crate) mod watch;
@@ -777,6 +778,9 @@ pub struct PortRegistry {
     /// harvested, so no later round can produce them again, and
     /// [`PortRegistry::drain_pending_events`] takes the buffer as it reports it.
     pending_events: Vec<PortEvent>,
+    /// The `'EXIT'`/`'DOWN'` messages a closing port owes its links and monitors — snapshotted
+    /// at close and released when the close report is folded (see [`exit`]).
+    pending_port_signals: exit::PendingPortSignals,
 }
 
 impl PortRegistry {
@@ -805,6 +809,7 @@ impl PortRegistry {
             liveness: ProcessLiveness::new(),
             extras: ops::PortExtras::default(),
             pending_events: Vec::new(),
+            pending_port_signals: exit::PendingPortSignals::default(),
         })
     }
 
@@ -1239,10 +1244,14 @@ impl PortRegistry {
     ///
     /// An event a port-task round already harvested ([`PortRegistry::pending_events`]) is pending
     /// work too — it is a message the owner is still owed — so it keeps the runtime awake until a
-    /// pump has reported it.
+    /// pump has reported it. The same holds for the `'EXIT'`/`'DOWN'` messages of a port that has
+    /// closed or is still to be reported as closed ([`PortRegistry::pending_port_signals`]): they
+    /// are messages a process is owed, and a route that skipped the poll because "nothing is
+    /// live" would strand them (see [`exit`]).
     pub fn has_nothing_to_poll(&self) -> bool {
         self.meta.is_empty()
             && self.pending_events.is_empty()
+            && self.pending_port_signals.is_empty()
             && !self.tty.is_armed()
             && !self.watch.has_pending_signal()
     }
@@ -1279,6 +1288,11 @@ impl PortRegistry {
         if !self.meta.contains_key(&id.number()) {
             return Err(BeamError::BadArg);
         }
+        // The `'EXIT'`/`'DOWN'` messages this close owes its links and monitors are
+        // snapshotted **here**, while the port's metadata, link set and incoming monitors are
+        // still readable; they become deliverable once `beam_io` reports the close (see
+        // [`exit`]).
+        self.capture_port_exit(id);
         // The port-exit notification first: the driver sees `port_exit` before the teardown
         // `stop`, and the port is still live for it.
         let notified = self
@@ -1364,6 +1378,10 @@ impl PortRegistry {
         // blocking on it would be waiting for nothing. A live port or an armed `tty_select/2`
         // interest is real async I/O and is still waited on.
         if self.registry.is_empty() && !self.tty.is_armed() {
+            // A close `beam_io` has not reported yet still owes its `'EXIT'`/`'DOWN'`: minting
+            // the report is what retires the port's number and releases them, and with no
+            // live port left nothing else would ever run the round that mints it.
+            self.report_pending_closes(&mut events)?;
             return Ok(events);
         }
         let deadline = Instant::now() + timeout;
@@ -1537,9 +1555,11 @@ impl PortRegistry {
     /// A notification whose port's metadata is gone (closed while the task was queued) has no
     /// recipient and is dropped; a notification for an **empty** payload is no message at all
     /// (a driver read of nothing), unlike an empty *line* frame. A close is the caller's own
-    /// `port_close/1` — which has already dropped the metadata — so there is nobody to notify
-    /// and no message is produced, in ERTS either.
-    fn fold_notifications(&self, notifications: Vec<PortNotification>, events: &mut Vec<PortEvent>) {
+    /// `port_close/1` — whose metadata is already gone, so no `{Port, {data, …}}` is produced,
+    /// in ERTS either — but it is precisely the point at which the port leaves the runtime, so
+    /// the signals [`PortRegistry::capture_port_exit`](super::PortRegistry) snapshotted at the
+    /// close become deliverable here (see [`exit`]).
+    fn fold_notifications(&mut self, notifications: Vec<PortNotification>, events: &mut Vec<PortEvent>) {
         for notification in notifications {
             match notification {
                 PortNotification::Data { port, bytes } => {
@@ -1560,7 +1580,12 @@ impl PortRegistry {
                         });
                     }
                 }
-                PortNotification::Closed { .. } => {}
+                PortNotification::Closed { port } => {
+                    // The port has genuinely left the runtime, so the `'EXIT'`/`'DOWN'`
+                    // messages its close owed its links and monitors are released for the
+                    // delivery routes to take (see [`exit`]).
+                    self.pending_port_signals.report(port);
+                }
             }
         }
     }
@@ -2848,6 +2873,10 @@ impl Runtime {
             RuntimeContext::deliver_in_table(self, table, recipient, from, message)?;
             delivered += 1;
         }
+        // The `'EXIT'`/`'DOWN'` messages a port close owes its links and monitors take this
+        // same route — the same `table`, the same delivery seam, so the same receiver is woken
+        // through `beam_process`'s wake list (see [`exit`]).
+        delivered += self.deliver_port_signals(table)?;
         Ok(delivered)
     }
 }
@@ -2935,6 +2964,11 @@ impl RuntimeContext<'_> {
                 PortEvent::Select { .. } => continue,
             }
         }
+        // A port close owes `'EXIT'`/`'DOWN'` messages to its links and monitors; the ones
+        // addressed to the evaluator itself are returned for its `receive` to match, and every
+        // other recipient's stay queued for the scheduler route that owns a process table (see
+        // [`exit`]).
+        messages.extend(self.poll_port_signals()?);
         Ok(messages)
     }
 
