@@ -34,11 +34,23 @@ Verified: no production path mutates a `Module`'s `functions`/`funs`/`records`/`
 **A post-load mutation would invalidate the key** — the accepted trade for O(1).
 
 ## Known Issues
-- The **one-time cold staging** of a module still costs exactly one `module_fingerprint`: `CompiledModule::lazy` / the eager constructor (in `../baseline/`) compute the artifact's stored `fingerprint` at creation. The digest key removes all **per-slice** cost, not that one-time construction cost.
+- The **one-time cold staging** hash is not exactly one `module_fingerprint` call for a synthetic
+  module: `CompiledModule::lazy` / the eager constructor (in `../baseline/`) compute the artifact's stored
+  `fingerprint` at creation, and the key derivation may hash the same module too, so the real cost is
+  **one or two** hashes per cold staging (`tests.rs::an_unprimed_entry_pays_the_content_hash_on_every_slice`
+  asserts `1..=2`). The digest key removes all **per-slice** cost, not that one-time construction cost.
+- **No artifact/memo eviction or unload hook.** `CodeCache` never evicts: its API is
+  `new`/`len`/`is_empty`/`compiles`/`contains`/`clear`/`get_or_compile`/`compiled_handle`/`prime`
+  plus the run entries and `code_map`, and nothing removes a **single** module's artifacts or memos
+  (only the whole-cache `clear`, and the free `clear_baseline_cache`). A host therefore cannot unload a
+  module's compiled blocks; a long-lived node that recompiles many distinct module bodies grows the cache
+  monotonically.
 - The address-keyed resolution memo (`memo`/`MemoEntry`) is a redundant micro-optimisation on top of the O(1) key; it is load-bearing only for a synthetic (zero-checksum) module, and its entry is honoured only while its `Weak<Module>` upgrades **and** the module's current snapshot still equals the memoized key's.
 - A synthetic zero-checksum module still pays one content hash per **un-memoized** lookup — the mandated fallback.
 
 ## Routing Table
 - `mod.rs` → `CodeCache`, the per-thread `CODE_CACHE`, the `run_baseline_cached*` / `cached_module_blocks` / `remember_module` free functions, and the `module_fingerprint` re-export.
 - `key.rs` → the key machinery: `CacheKey`/`ModuleKey` (+ `of`/`with_fingerprint`), the `module_fingerprint`/`HashWriter` fallback content hash, `digest_of`/`module_name`/`module_address`. Split out of `mod.rs` when the cache plus its key machinery exceeded the ~1000-line budget.
-- `tests.rs` → the counter tests (deterministic `fingerprint_calls()`, no wall-clock): real-module zero-rehash, digest-keyed artifact sharing, the synthetic fallback, priming/entry-path coverage, and the namespace-truth pins `two_loads_of_one_beam_are_two_namespaces_and_two_entries` and `two_loads_of_the_same_beam_share_the_digest_half_but_not_the_namespace_half`, plus `a_second_atom_namespace_is_never_handed_the_first_namespaces_artifact` — the pin that fails without the namespace half.
+- `tests.rs` → the counter tests (deterministic `fingerprint_calls()`, plus the one `Instant`-based
+  ns/slice measurement in `the_entry_and_resume_slice_cost_is_measured_on_both_tiers`, whose figure is a
+  measurement and is not asserted): real-module zero-rehash, digest-keyed artifact sharing, the synthetic fallback, priming/entry-path coverage, and the namespace-truth pins `two_loads_of_one_beam_are_two_namespaces_and_two_entries` and `two_loads_of_the_same_beam_share_the_digest_half_but_not_the_namespace_half`, plus `a_second_atom_namespace_is_never_handed_the_first_namespaces_artifact` — the pin that fails without the namespace half.
