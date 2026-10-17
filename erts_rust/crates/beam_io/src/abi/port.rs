@@ -617,6 +617,12 @@ impl Driver for DriverPort {
         driver_flags(self.lib.entry().driver_flags)
     }
 
+    /// The loaded `ErlDrvEntry`'s own `control` slot: `false` when the C driver left it `NULL`,
+    /// which is what makes `erlang:port_control/3` answer `badarg` without calling anything
+    /// (`call_driver_control`'s first line, `io.c:4034-4036`).
+    fn has_control(&self) -> bool {
+        self.lib.entry().control.is_some()
+    }
     /// `start`: hand the driver the port handle and the command string, and keep its `ErlDrvData`.
     ///
     /// The command pointer is cast to `char*` because that is the frozen signature

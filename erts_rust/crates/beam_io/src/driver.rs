@@ -313,6 +313,31 @@ pub trait Driver {
         Ok(Vec::new())
     }
 
+    /// Whether the driver's C counterpart has a non-`NULL` `control` entry.
+    ///
+    /// This is the **control-capability answer** of the frozen C ABI: `erlang:port_control/3`
+    /// first asks whether the driver has a control entry at all and, when it has none, answers
+    /// `badarg` **without calling anything** — `call_driver_control` opens with
+    /// `if (!prt->drv_ptr->control) return ERTS_PORT_OP_BADARG;`
+    /// (`erts/emulator/beam/io.c:4034-4036`). The knowledge belongs to the driver that has it, so
+    /// it is a property here rather than a name list at the runtime.
+    ///
+    /// `true` (the default) means [`Driver::control`] is the whole story. A `false` answer means
+    /// the runtime must answer the oracle's `badarg`/refusal for **every**
+    /// `erlang:port_control/3` call on this port and never consult [`Driver::control`] — the
+    /// driver's `control` the trait still requires is then unreachable through that BIF (the port
+    /// layer's own [`crate::PortRegistry::port_control`] stays driver-agnostic; this is the
+    /// runtime's gate).
+    ///
+    /// The built-in drivers whose C entry points do have a `control` slot (the `inet` pair) answer
+    /// `true`; [`crate::drivers::RamFileDriver`] answers `false`, because the C's
+    /// `ram_file_driver_entry` initialises `control` to `NULL`
+    /// (`erts/emulator/drivers/common/ram_file_drv.c:116`) and the oracle therefore raises
+    /// `badarg` for `port_control` on a `ram_file_drv` port.
+    fn has_control(&self) -> bool {
+        true
+    }
+
     /// Declares the deadline at which this driver next wants [`Driver::timeout`] to run.
     ///
     /// This is the driver-facing **timer-arming seam**: a driver that needs a port timer (an
@@ -694,6 +719,39 @@ mod tests {
             .expect("the ram_file_drv driver exists");
         assert_eq!(ram_file.name(), "ram_file_drv");
         assert!(matches!(registry.create("nope"), Err(BeamError::BadArg)));
+    }
+
+    /// The `has_control` capability answer: `true` by default, `false` for the built-in whose C
+    /// entry point leaves `control` `NULL` (`ram_file_drv`).
+    #[test]
+    fn has_control_defaults_to_true_and_ram_file_drv_answers_false() {
+        // The additive trait default: a driver that overrides nothing inherits `true`.
+        assert!(MinimalDriver.has_control(), "the default is `true`");
+        // The one built-in without a C `control` entry (`ram_file_drv.c:116`).
+        assert!(
+            !super::super::drivers::RamFileDriver::new().has_control(),
+            "ram_file_drv's C entry has `control == NULL`"
+        );
+        // Every other built-in keeps the default, including the `inet` pair.
+        let registry = DriverRegistry::with_builtins();
+        for name in registry.names() {
+            let driver = registry.create(name).expect("the built-in constructs");
+            assert_eq!(
+                driver.has_control(),
+                name != "ram_file_drv",
+                "unexpected has_control for {name}"
+            );
+        }
+        // `spawn` (constructed, not registered) has a `control` entry too.
+        let spawn = crate::drivers::SpawnDriver::new(
+            &crate::drivers::SpawnSpec::Spawn {
+                command: "true".to_string(),
+                argv: None,
+            },
+            &crate::drivers::SpawnOptions::default(),
+        )
+        .expect("the child starts");
+        assert!(spawn.has_control());
     }
 
     #[test]

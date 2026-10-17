@@ -426,6 +426,17 @@ impl Driver for RamFileDriver {
         Ok(())
     }
 
+    /// `false` — the C's `ram_file_driver_entry` has `control == NULL`
+    /// (`erts/emulator/drivers/common/ram_file_drv.c:116`), so `erlang:port_control/3` on a
+    /// `ram_file_drv` port is the oracle's `badarg` and never reaches the driver.
+    ///
+    /// The opcode core stays reachable through [`Driver::output`] (this driver's actual transport,
+    /// the C's `rfile_command`), and [`Driver::control`] keeps the named-verb form as a crate-only
+    /// test/driver aid — it is simply not on the `port_control` path, exactly as in the C.
+    fn has_control(&self) -> bool {
+        false
+    }
+
     /// The named-verb transport: map `command` to its opcode and run the shared core.
     ///
     /// Accepts both the C-style opcode names (`open`, `read`, `lseek`, `write`, `fsync`,
