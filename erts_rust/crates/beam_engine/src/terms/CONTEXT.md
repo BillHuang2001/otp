@@ -132,9 +132,11 @@ sound only because `alloc_words` never collects:
 - `slack.rs` → the rooted reserve seam, `Slack` (bump cursor, `alloc_words`, `integer`),
   `reserve`, `reserve_slack`; the reserve→read→write contract in the module docs.
 - `sink.rs` → the `Sink` trait, `impl Sink for Slack` (rooted carve), `ContextSink` (unrooted),
-  and the shared `write_tuple_at`/`write_list_at`/`write_cons_at` node writers.
+  `check_tuple_arity` (both `tuple` entry points' `MAX_ARITYVAL` guard), and the shared
+  `write_tuple_at`/`write_list_at`/`write_cons_at` node writers.
 - `construct.rs` → the classic tuple/cons/list/`badmatch_reason`/heap-binary builders **and**
-  their `*_rooted` twins.
+  their `*_rooted` twins; the heap-binary builders zero the data section before the payload
+  copy (padding tail zeroed).
 - `number.rs` → the classic `make_float`/`make_integer` **and** the `*_rooted` twins, plus
   `make_integer_unrooted` (the operand-immediate path).
 - `map.rs` → the classic `make_flatmap`/`make_map` **and** the `*_rooted` twins, plus the
