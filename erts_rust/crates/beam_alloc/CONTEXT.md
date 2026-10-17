@@ -174,15 +174,43 @@ nothing** and reports `error::heap_exhausted` (`AllocKind::Heap`).
 `dec_and_test(min)`. Safe Rust; `Send + Sync`. The **single** refcount primitive for the workspace;
 `beam_gc` re-exports this one rather than defining its own.
 
-### `binary` — off-heap refcounted large binary (`RefcBinary`)
-- `pub struct RefcBinary` — `new(bytes)`, `with_allocator(alloc, bytes)`, `len`, `is_empty`,
-  `as_bytes`, `refcount`, `data_ptr`. `Clone` bumps the refcount; last `Drop` frees once through the
-  **same `AllocRef` + exact `Layout`**.
+### `binary` — off-heap refcounted large binary (`RefcBinary`), with capacity growth
+Module layout: `binary.rs` (handle, header, constructors, read accessors, `Clone`/`Drop`, in-module
+tests) + `binary/growth.rs` (capacity growth, counters, the relocation protocol).
+- `pub struct RefcBinary` — `new(bytes)`, `with_allocator(alloc, bytes)` (**`len == capacity ==
+  reserved == bytes.len()`**, no spare capacity), `with_capacity(capacity)`,
+  `with_capacity_and_allocator(alloc, capacity)`, `with_limits(alloc, capacity, reserved_bytes,
+  max_capacity)`; read side `len`, `is_empty`, `capacity`, `reserved_bytes`, `spare_capacity`,
+  `max_capacity`, `as_bytes`, `refcount`, `data_ptr`, `growth_counters`, and
+  `GROW_DOUBLING_LIMIT_BYTES`/`DEFAULT_RESERVATION_FACTOR`/`MAX_PAYLOAD_BYTES`. `Clone` bumps the
+  refcount; last `Drop` frees once through the **same `AllocRef` + exact `Layout`** (`HEADER_SIZE +
+  header.reserved`, the layout the *current* block was allocated with).
+- **Payload = reservation + capacity + length** (all in the private header, i.e. allocator space —
+  never in a term): `reserved` is the block's payload size, `capacity` the writable limit
+  (`len <= capacity <= reserved <= max_capacity`), `len` the logical length. Growth mutators (all
+  `&mut self`, all requiring `refcount() == 1`, C's writable-binary precondition): `ensure_capacity`
+  (absolute), `reserve(extra)` (= `ensure_capacity(len + extra)`), `append(bytes)`, `set_len`
+  (zero-fills what it newly exposes), `compact` (drop spare capacity to `round_up_unit(len)`).
+  Growth schedule = C's `GROW_PROC_BIN_SIZE` in integer math: double up to
+  `GROW_DOUBLING_LIMIT_BYTES` (16 MiB), then +20 %; `with_capacity` reserves
+  `round_up_unit(max(capacity, DEFAULT_RESERVATION_FACTOR × capacity))`.
+- **`GrowOutcome { InPlace { capacity }, Moved(Relocation) }`** (exported at the crate root and in the
+  prelude as **`PayloadGrowOutcome`** / **`PayloadRelocation`**, because `reserved_heap::GrowOutcome`
+  owns the bare name): `InPlace` guarantees `data_ptr()` is unchanged, so every on-heap `BinRef.val`,
+  every GC copy of it and a host's `(base, capacity)` registry stay valid with **no fixup**; `Moved`
+  invalidates them and hands over `Relocation::{from, to, len, delta, copied_bytes}` so the host
+  republishes (`beam_term::refc::write_refc_binary`/`write_bin_ref`) — C's non-writable fallback arm
+  (`erl_bits.c:1990-2010`). `GrowthCounters { in_place_grows, moves, bytes_copied }` is the
+  structural (wall-clock-free) record a test asserts the growth *shape* on.
+- `pub unsafe fn payload_capacity(data_ptr) -> usize` reads the header at `data_ptr - HEADER_SIZE`:
+  the live "is it still writable, and how wide" query for a host holding only a `BinRef.val`.
 - Allocates through **`alloc_typed(TypeId::from_name("BINARY"), layout)`** / `dealloc_typed(...)`, so
-  payload bytes are attributed to the **`BINARY`** type of the **binary_alloc** allocator in the
-  per-type stats (`binary_alloc` is pinned to exactly `["BINARY","DRV_BINARY"]`). The public API is
-  unchanged. Private `#[repr(C)] BinaryHeader { refc, len }` sits immediately before the payload
-  (`data_ptr` = first payload byte; `data_ptr - HEADER_SIZE` recovers the base). `Send` but not `Sync`.
+  payload bytes (reservation included) are attributed to the **`BINARY`** type of the
+  **binary_alloc** allocator in the per-type stats (`binary_alloc` is pinned to exactly
+  `["BINARY","DRV_BINARY"]`). Every relocation frees the old block through the same allocator/type.
+  Private `#[repr(C)] BinaryHeader { refc, len, capacity, reserved }` = 4 words = 32 bytes sits
+  immediately before the payload (`data_ptr` = first payload byte; `data_ptr - HEADER_SIZE` recovers
+  the base; `HEADER_SIZE % UNIT_SIZE == 0` keeps `data_ptr` `MIN_ALIGN`-aligned). `Send` but not `Sync`.
 
 ### `mseg` — the mmap-backed segment allocator (`erl_mseg.c`)
 Facade + submodules `mseg/{mapping,header,config,state,allocator}.rs`.
