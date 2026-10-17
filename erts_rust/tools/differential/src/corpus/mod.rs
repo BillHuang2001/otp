@@ -84,6 +84,9 @@
 //! | [`records`] | A.1/A.2/A.7 — native records: the `records:*` BIFs + the native-record opcodes |
 //! | [`selfhost`] | A.9/A.2 — the E0 route of the self-hosted build: an *in-process* `compile:file/2` |
 //! | [`zlib`] | A.7 — the raw-DEFLATE `zlib:zip/1` / `zlib:unzip/1` pair (byte-exact tiny bodies, the round trip, the error matrix) |
+//! | [`bits`] | A.1/A.7 — the `-eval` bit-string surface: constructed segment images and matched fields |
+//! | [`udp`] | A.4 — the `udp_inet` built-in driver through `open_port/2` / `port_command` / `port_info` |
+//! | [`ram_file`] | A.4 — the `ram_file_drv` built-in driver's reply encodings |
 //!
 //! A.3 is reachable **end to end**, not only through its raise surface: the [`nif_so`] group
 //! runs a compiled module that `erlang:load_nif/2`s a **real `.so`** (built into the case's
@@ -96,6 +99,7 @@
 
 mod bifs;
 mod binmatch;
+mod bits;
 mod boot;
 mod boot_extra;
 mod boot_prereq;
@@ -131,12 +135,14 @@ mod phash;
 mod printing;
 mod proc_control;
 mod proc_signals;
+mod ram_file;
 mod re;
 mod records;
 mod selfhost;
 mod semantics;
 mod system_info;
 mod terms;
+mod udp;
 mod wire;
 mod wire_extra;
 mod wire_ids;
@@ -617,6 +623,9 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(modules::group());
     cases.extend(selfhost::group());
     cases.extend(zlib::group());
+    cases.extend(bits::group());
+    cases.extend(udp::group());
+    cases.extend(ram_file::group());
     cases
 }
 
