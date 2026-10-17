@@ -664,7 +664,7 @@ the section to read them in.
 - `src/immix_collector/promote.rs` → the ATOMIC two-phase promotion driver (`promote`, `PromoteOutcome`)
 - `src/immix_collector/{tests,grow_tests}.rs` → `GenImmixCollector`'s in-module promotion + `grow_major` tests
 - `src/any_collector.rs` → `AnyCollector`: the `Copying`/`Immix` dispatch over one API — the drop-in for the
-  concrete `Collector` incl. the mature geometry accessors
+  concrete `Collector` incl. the kind-pinned `collect_kind` and the mature geometry accessors
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`, `from_spawn_opts`/
   `fullsweep_due`/`mature_after_fullsweep`/`young_after_collection`/`young_after_fullsweep`, `unbounded`
 - `src/heap_info.rs` → `HeapInfo`, `HeapObservable`, `GARBAGE_COLLECTION_KEYS`
