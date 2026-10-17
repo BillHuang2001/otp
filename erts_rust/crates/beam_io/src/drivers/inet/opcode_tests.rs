@@ -515,7 +515,7 @@ pub(super) fn connection() -> Connection {
 }
 
 /// The typed "not served" reason of a numeric opcode, as the crate spells it.
-fn not_served_reason(name: &str, switch: &str) -> String {
+pub(super) fn not_served_reason(name: &str, switch: &str) -> String {
     format!("unsupported: control opcode `{name}` ({switch}) is not served by this driver floor")
 }
 

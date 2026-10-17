@@ -918,11 +918,14 @@ fn walk_ifconf(buf: &[u8], reported: usize, slot: usize) -> Vec<Vec<u8>> {
     while offset + stride <= reported {
         let entry = &buf[offset..offset + stride];
         offset += stride;
-        // SAFETY: `entry` is exactly `stride` bytes starting at `offset`, which is a whole,
-        // zero-initialized `ifreq` the kernel filled in; a `sockaddr` is the same size and
-        // alignment as the union member it aliases, so reading the front of the entry as one is
-        // well defined.
-        let family = unsafe { (*entry.as_ptr().cast::<libc::sockaddr>()).sa_family } as libc::c_int;
+        // SAFETY: `entry` is a whole, zero-initialized `ifreq` the kernel filled in. Its
+        // `ifr_addr` member starts after `ifr_name`, i.e. `name_len` bytes in, and `stride` — the
+        // entry's own length — is at least `name_len + addr_len`, so the `sockaddr` read at that
+        // offset stays inside the entry; a `sockaddr` has the same layout as the union member it
+        // aliases.
+        let family = unsafe {
+            (*entry.as_ptr().add(name_len).cast::<libc::sockaddr>()).sa_family
+        } as libc::c_int;
         if family == libc::AF_INET || family == libc::AF_INET6 {
             let end = entry.iter().position(|&b| b == 0).unwrap_or(name_len);
             names.push(entry[..end.min(name_len)].to_vec());

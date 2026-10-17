@@ -1690,6 +1690,8 @@ mod frame_tests;
 #[cfg(test)]
 mod opcode_tests;
 #[cfg(test)]
+mod opcode_tests_refusals;
+#[cfg(test)]
 mod opcode_tests_states;
 #[cfg(test)]
 mod opcode_tests_udp;

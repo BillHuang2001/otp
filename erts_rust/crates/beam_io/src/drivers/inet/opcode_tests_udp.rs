@@ -34,17 +34,17 @@ use super::{
 use beam_common::BeamError;
 
 /// The packed `open` argument of the datagram driver: `[AF_INET, SOCK_DGRAM, default protocol]`.
-fn open_arg() -> [u8; 3] {
+pub(super) fn open_arg() -> [u8; 3] {
     [INET_AF_INET, INET_TYPE_DGRAM, INET_PROTO_DEFAULT]
 }
 
 /// A **bare** (socket-less) `udp_inet` port — the state the driver factory starts in.
-fn bare_port() -> Rig {
+pub(super) fn bare_port() -> Rig {
     Rig::new(Box::new(UdpInetDriver::new()))
 }
 
 /// An `open`ed `udp_inet` port (a datagram socket exists, nothing is bound).
-fn opened_port() -> Rig {
+pub(super) fn opened_port() -> Rig {
     let mut port = bare_port();
     assert_eq!(
         port.control(&op(1), &open_arg()),
@@ -90,7 +90,7 @@ fn connected_port() -> (Rig, u16) {
 
 /// Asserts that `code` is still one of this floor's **typed** "not served" gaps — a capability
 /// whose body the C has and this driver does not, never a fabricated reply.
-fn assert_typed_gap(port: &mut Rig, code: u32, arg: &[u8], label: &str) {
+pub(super) fn assert_typed_gap(port: &mut Rig, code: u32, arg: &[u8], label: &str) {
     match port.try_control(&op(code), arg) {
         Ok(reply) => panic!("{label}: expected the typed gap, got {reply:?}"),
         Err(err) => assert!(
