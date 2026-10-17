@@ -57,8 +57,8 @@
 //!
 //! A handful of `udp` shapes are **known divergences owned by other nodes** — the `subscribe`
 //! body, a well-formed `fdopen`, the `getservby*`/`getif*` lookups, the asynchronous
-//! `PACKET_REQ_RECV` op-id and the second-`open` `exbadseq`, plus `getopts` of a `getsockopt` the
-//! socket refuses. Each is asserted on **both** sides: the exact oracle output (so the recorded
+//! `PACKET_REQ_RECV` op-id, plus `getopts` of a `getsockopt` the socket refuses. Each is asserted on
+//! **both** sides: the exact oracle output (so the recorded
 //! divergence cannot rot) and this runtime's current honest answer (a typed error, or the
 //! documented synchronous read-now substitution — never a wrong result).
 //!
@@ -716,9 +716,8 @@ const IO_RESIDUAL: Ours = Ours::Io("Operation not supported (os error 95)");
 /// The driver floor has no driver→owner message path, so `INET_REQ_SUBSCRIBE`'s notification and the
 /// asynchronous `PACKET_REQ_RECV` op-id cannot be honoured; adopting a caller's descriptor
 /// (`INET_REQ_FDOPEN`), the `getservby*(3)` and `getifaddrs(3)` lookups are not wrapped by its `sys`
-/// layer; a second `open` is the documented `einval` non-mirror of the C's `exbadseq`; and
-/// `getopts` of an option the socket refuses propagates the `getsockopt` failure where the C drops
-/// the record (`inet_drv.c:9734-9741`).
+/// layer; and `getopts` of an option the socket refuses propagates the `getsockopt` failure where the
+/// C drops the record (`inet_drv.c:9734-9741`).
 ///
 /// The three `subscribe` rows are the one group that closes **outside** this crate: `beam_io` owes
 /// `INET_REQ_SUBSCRIBE` the `[1]` / `[1,1,0,0,0,0]` / `badarg` answers (its body only registers a
