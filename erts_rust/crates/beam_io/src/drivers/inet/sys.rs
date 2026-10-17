@@ -262,6 +262,66 @@ pub(super) fn socket_error(fd: RawFd) -> Result<i32> {
     Ok(err)
 }
 
+/// The cached socket-type tag of `fd`: `1` ([`super::wire::INET_TYPE_STREAM`]) or `2`
+/// ([`super::wire::INET_TYPE_DGRAM`]), and `0` for a descriptor whose `SO_TYPE` is neither.
+///
+/// The C descriptor records the kernel's `SO_TYPE` in `inet.stype` when it opens or adopts a
+/// socket (`inet_ctl_open`, `inet_drv.c:5215`; `inet_ctl_fdopen`, `:5265`) and reports it from
+/// `INET_REQ_GETTYPE` (`:11165`). `0` is the "unset" value that makes `GETTYPE` answer the C's
+/// `einval` rather than a type this floor does not serve.
+///
+/// # Errors
+///
+/// `BeamError::Io` when `getsockopt(2)` fails (`fd` is not a socket).
+pub(super) fn socket_type(fd: RawFd) -> Result<u16> {
+    // SAFETY: `option` is a writable `c_int` and `len` its valid size, which is exactly the
+    // out-parameter pair `getsockopt(2)` expects for a `c_int`-valued option.
+    let mut option: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is the caller's socket, and `option`/`len` are a valid buffer and size for
+    // the `SO_TYPE` option.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(option).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    let stype = match option {
+        libc::SOCK_STREAM => 1,
+        libc::SOCK_DGRAM => 2,
+        _ => 0,
+    };
+    Ok(stype)
+}
+
+/// The host's name, from `gethostname(2)` — the `INET_REQ_GETHOSTNAME` reply payload
+/// (`inet_drv.c:11219`, the C's `sock_hostname`, a **local** syscall with no resolver
+/// involved).
+///
+/// The trailing NUL (and anything the kernel truncated after it) is trimmed, so the bytes are
+/// exactly the C's `ctl_reply(INET_REP_OK, tbuf, strlen(tbuf))` payload.
+///
+/// # Errors
+///
+/// `BeamError::Io` when `gethostname(2)` fails.
+pub(super) fn hostname() -> Result<Vec<u8>> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a writable array of `buf.len()` bytes; the kernel writes at most that
+    // many bytes into it (truncating a longer name) and never retains the pointer.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(buf[..end].to_vec())
+}
+
 /// Reads an `int`-valued socket option of `fd` (`getsockopt(2)`).
 ///
 /// This is the C's `sock_getopt` for the option family whose value is a plain `int`: the

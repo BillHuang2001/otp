@@ -686,7 +686,16 @@ impl UdpInetDriver {
             // The shared-`inet_ctl` replies both drivers build identically.
             Opcode::Peer => super::wire::peer_reply(self.socket, self.state.is_connected()),
             Opcode::Name => super::wire::name_reply(self.socket),
-            Opcode::Gettype => super::wire::gettype_reply(self.socket, false),
+            Opcode::Gettype => {
+                if self.has_socket() {
+                    Ok(super::wire::gettype_reply(
+                        u16::from(INET_AF_INET),
+                        u16::from(INET_TYPE_DGRAM),
+                    ))
+                } else {
+                    Ok(super::wire::gettype_reply(0, 0))
+                }
+            }
             Opcode::Getfd => Ok(super::wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(super::wire::getstatus_reply(self.state.state_code())),
             Opcode::Getstat => super::wire::getstat_reply(arg),
@@ -704,8 +713,13 @@ impl UdpInetDriver {
             | Opcode::Ignorefd
             | Opcode::Getladdrs
             | Opcode::Getpaddrs
-            | Opcode::Fdopen
-            | Opcode::Listen => Err(op.not_served()),
+            | Opcode::Fdopen => Err(op.not_served()),
+            // `INET_REQ_LISTEN` is a case of `packet_inet_ctl` only inside `#ifdef HAVE_SCTP`
+            // (`:14846`). With SCTP compiled out the case does not exist and the `default:`
+            // delegates to `inet_ctl`, whose own `default:` is `ctl_xerror(EXBADPORT)`
+            // (`:11551`): the answer is `[0]exbadport` in **every** state and for **every**
+            // operand (measured bare and opened, `len` 0 and 2).
+            Opcode::Listen => Ok(ctl_xerror("exbadport")),
             // The TCP-only cases (a `tcp_inet_ctl` case, so neither switch owns them for a
             // datagram socket) plus any wrapped/unassigned number: the C's `[0]exbadport`.
             Opcode::TcpRecv

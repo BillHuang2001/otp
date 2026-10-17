@@ -438,6 +438,13 @@ pub struct TcpInetDriver {
     /// (`:10925`). It gates the `send_timeout`/`send_timeout_close` options, which the C stores
     /// and reports only on a stream socket (`:7104`/`:7115`, `:9237`/`:9247`).
     stream: bool,
+    /// The C descriptor's cached address family (`inet.sfamily`, `inet_drv.c:10925`), as the
+    /// wire's [`INET_AF_INET`] tag, with `0` meaning "unset". Set by `open`/`fdopen` and
+    /// **never** cleared by a close, which is why `INET_REQ_GETTYPE` still answers after one.
+    family: u16,
+    /// The C descriptor's cached socket type (`inet.stype`), as the wire's
+    /// [`INET_TYPE_STREAM`]/[`INET_TYPE_DGRAM`] tag; `0` = unset. Same lifetime as [`Self::family`].
+    stype: u16,
 }
 
 impl TcpInetDriver {
@@ -459,6 +466,8 @@ impl TcpInetDriver {
             options: SocketOptions::default(),
             pending_input: Vec::new(),
             stream: false,
+            family: 0,
+            stype: 0,
         }
     }
 
@@ -496,6 +505,8 @@ impl TcpInetDriver {
             options: SocketOptions::default(),
             pending_input: Vec::new(),
             stream: true,
+            family: u16::from(INET_AF_INET),
+            stype: super::sys::socket_type(fd)?,
         })
     }
 
@@ -572,6 +583,10 @@ impl TcpInetDriver {
                 // `open`/`accept` hand the driver a `SOCK_STREAM` socket: the C's `inet.stype`
                 // is `SOCK_STREAM` from `open` on (`inet_drv.c:5215`), never cleared by `close`.
                 self.stream = true;
+                // The C's `inet_ctl_open` records the family and type here too
+                // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close.
+                self.family = u16::from(INET_AF_INET);
+                self.stype = u16::from(INET_TYPE_STREAM);
                 Ok(())
             }
             Err(err) => {
@@ -1304,76 +1319,235 @@ impl TcpInetDriver {
         arg: &[u8],
     ) -> Result<Vec<u8>> {
         match op {
-            // The verbs whose operand is already exactly the C's request payload.
-            Opcode::Open => self.verb_open(ctx, arg),
+            // `INET_REQ_OPEN` (`:11961`): the length is checked **before** the family, type and
+            // protocol bytes, and each of those answers its own refusal rather than an argument
+            // fault — only the numeric route reports the C's `ctl_*error` replies, the named
+            // route keeps its `BadArg`.
+            Opcode::Open => {
+                if arg.len() != 3 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if arg[0] != INET_AF_INET {
+                    return Ok(ctl_xerror("eafnosupport"));
+                }
+                if arg[1] != INET_TYPE_STREAM {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if arg[2] != INET_PROTO_DEFAULT && arg[2] != INET_PROTO_TCP {
+                    return Ok(ctl_xerror("eprotonosupport"));
+                }
+                self.verb_open(ctx, arg)
+            }
             Opcode::Close => self.verb_close(ctx),
-            Opcode::Bind => self.verb_bind(arg),
+            // `inet_ctl`'s `INET_REQ_BIND` (`:11409`): `len < 2` first, **then** the state.
+            Opcode::Bind => {
+                if arg.len() < 2 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if self.state != InetState::Open {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                self.verb_bind(arg)
+            }
             Opcode::Setopts => self.verb_setopts(arg),
             Opcode::Getopts => self.verb_getopts(arg),
-            Opcode::Listen => self.verb_listen(arg),
-            // `INET_REQ_CONNECT` carries `Timeout(4), Port(2), Address(N)` and the C rejects a
-            // shorter payload with `ctl_error(EINVAL)` (`:12085`); the six leading bytes are the
-            // async-connect timeout and the reply port, neither of which this synchronous floor
-            // uses, so only the address is forwarded. The verb's own state checks reproduce the
-            // C's `!IS_OPEN ⇒ exbadport`, `IS_CONNECTED ⇒ eisconn`, `IS_CONNECTING ⇒ einval`.
+            // `INET_REQ_LISTEN` (`:12042`): the state guard comes first, the operand length last.
+            Opcode::Listen => {
+                if !self.has_socket() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                if arg.len() != 2 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                self.verb_listen(arg)
+            }
+            // `INET_REQ_CONNECT` (`:12064`): the socket-state guards come first
+            // (`!IS_OPEN ⇒ exbadport`, `IS_CONNECTED ⇒ eisconn`, `IS_CONNECTING ⇒ einval`) and
+            // only then `len < 6 ⇒ einval`. The six leading operand bytes are the async-connect
+            // timeout and the reply port, neither of which this synchronous floor uses, so only
+            // the address is forwarded.
             Opcode::Connect => {
+                match self.state {
+                    InetState::Closed => return Ok(ctl_xerror("exbadport")),
+                    InetState::Connected => return Ok(ctl_xerror("eisconn")),
+                    InetState::Connecting => return Ok(ctl_xerror("einval")),
+                    InetState::Open | InetState::Listening => {}
+                }
                 if arg.len() < 6 {
                     return Ok(ctl_xerror("einval"));
                 }
                 self.verb_connect(ctx, &arg[6..])
             }
-            // `INET_REQ_ACCEPT` carries a bare `Timeout(4)`; the C requires exactly that much and
-            // rejects anything else with `ctl_error(EINVAL)` (`:12155`). Measured: `<<>>` on a
-            // listening socket ⇒ `[0]einval`.
+            // `INET_REQ_ACCEPT` (`:12144`): one combined "not listening **or** wrong operand"
+            // guard, so both faults answer `einval`.
             Opcode::Accept => {
-                if arg.len() != 4 {
+                if !self.state.is_listening() || arg.len() != 4 {
                     return Ok(ctl_xerror("einval"));
                 }
                 self.verb_accept(ctx)
             }
-            // `TCP_REQ_RECV` carries `Timeout(4), Length(4)` (`:12284`). The timeout/length pair
-            // selects the C's **asynchronous** receive; this floor's `recv` is the synchronous
-            // read-now substitution the named verb documents, so the operand is validated and
-            // then ignored.
+            // `TCP_REQ_RECV` (`:12268`): the connection guard (including the C's one-shot
+            // `closed`/`econnreset` reply, modelled by [`PeerClose`]) comes **first**, then
+            // `active || len != 8 ⇒ einval`. The `Timeout(4), Length(4)` operand selects the
+            // C's asynchronous receive; this floor's `recv` is the synchronous read-now
+            // substitution, so the operand is validated and then ignored.
             Opcode::TcpRecv => {
-                if arg.len() != 8 {
+                if !self.state.is_connected() {
+                    return Ok(ctl_xerror("enotconn"));
+                }
+                if let Some(name) = self.peer_close.recv_reply() {
+                    return Ok(ctl_xerror(name));
+                }
+                // `desc->inet.active` (`:12290`): this floor never delivers active-mode input,
+                // so the flag stays false unless a `{active, …}` option asked for it.
+                if self.options.active != 0 || arg.len() != 8 {
                     return Ok(ctl_xerror("einval"));
                 }
                 self.verb_recv(ctx, &[])
             }
-            // `TCP_REQ_SHUTDOWN` carries the one-byte `TCP_SHUT_*` "how" (`:12339`); the verb
-            // answers the C's `enotconn` when the socket is not connected (`:12347`).
+            // `TCP_REQ_UNRECV` (`:12326`): the connection guard, then `tcp_push_buffer`: the
+            // operand's bytes go back to the front of the driver's input buffer and the C
+            // answers `[1]`. The raw read path drains `pending_input` into the port queue before
+            // touching the socket ([`TcpInetDriver::read_available`]), so pushed bytes are
+            // delivered ahead of anything the socket holds — and a framed `recv` re-decodes them.
+            Opcode::TcpUnrecv => {
+                if !self.state.is_connected() {
+                    return Ok(ctl_xerror("enotconn"));
+                }
+                self.pending_input.splice(0..0, arg.iter().copied());
+                Ok(ctl_ok())
+            }
+            // `TCP_REQ_SHUTDOWN` (`:12339`): the connection guard first, then the one-byte
+            // `TCP_SHUT_*` operand.
             Opcode::TcpShutdown => {
+                if !self.state.is_connected() {
+                    return Ok(ctl_xerror("enotconn"));
+                }
                 if arg.len() != 1 {
                     return Ok(ctl_xerror("einval"));
                 }
                 self.verb_shutdown(ctx, arg)
             }
+            // `TCP_REQ_SENDFILE` (`:12380`): `required_len` is
+            // `sizeof(desc->sendfile.dup_file_fd) + 2*sizeof(Uint64)` = 4 + 16 = 20 on every
+            // platform this crate targets, and the length is checked **before** the connection.
+            // The sendfile itself is not implemented, so a connected stream stays a typed gap.
+            Opcode::TcpSendfile => {
+                if arg.len() != 20 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if !self.state.is_connected() {
+                    return Ok(ctl_xerror("enotconn"));
+                }
+                Err(op.not_served())
+            }
+            // `INET_REQ_GETHOSTNAME` (`:11219`): `len != 0 ⇒ einval`, else the local
+            // `gethostname(2)` payload — no resolver is involved, so the reply is exact.
+            Opcode::Gethostname => {
+                if !arg.is_empty() {
+                    return Ok(ctl_xerror("einval"));
+                }
+                let mut reply = ctl_ok();
+                reply.extend_from_slice(&super::sys::hostname()?);
+                Ok(reply)
+            }
+            // `INET_REQ_FDOPEN` (`:12003`): the length/family/type refusals are exact; adopting a
+            // caller's descriptor stays a typed gap.
+            Opcode::Fdopen => {
+                if arg.len() != 6 && arg.len() != 10 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if arg[0] != INET_AF_INET {
+                    return Ok(ctl_xerror("eafnosupport"));
+                }
+                if arg[1] != INET_TYPE_STREAM {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            // The name-service lookups (`:11493`, `:11525`): only the operand-length refusals are
+            // served; the lookup itself (`getservbyname(3)`/`getservbyport(3)`) stays a typed gap.
+            Opcode::Getservbyname => {
+                if arg.len() < 2 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            Opcode::Getservbyport => {
+                if arg.len() < 3 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            // `INET_REQ_SETNAME`/`SETPEER` (`:11386`, `:11301`): the empty operand clears the fake
+            // address and answers `[1]`, a one-byte operand is the C's `einval`. Storing a fake
+            // address would only matter through the `NAME`/`PEER` short-circuits (`:11360`,
+            // `:11272`), which this floor still answers from the socket, so a well-formed address
+            // stays a typed gap rather than a `[1]` that would not be honoured afterwards.
+            Opcode::Setname | Opcode::Setpeer => {
+                if arg.is_empty() {
+                    return Ok(ctl_ok());
+                }
+                if arg.len() < 2 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            // The `getifaddrs(3)`-backed family (`:11067`, `:11078`, `:11089`, `:11100`): only
+            // the `!IS_OPEN` refusal is exact; the open-state reply needs an interface walk.
+            Opcode::Getiflist | Opcode::Ifget | Opcode::Ifset | Opcode::Getifaddrs => {
+                if !self.has_socket() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                Err(op.not_served())
+            }
+            // `INET_REQ_IGNOREFD` (`:11456`): `!IS_CONNECTED ⇒ enotconn`, then
+            // `stype != SOCK_STREAM ⇒ einval`. A connected stream stays a typed gap: its reply
+            // means "suppress read **and** write readiness", which this driver would not honour
+            // (and the C then reads `*buf` with no length check at all).
+            Opcode::Ignorefd => {
+                if !self.state.is_connected() {
+                    return Ok(ctl_xerror("enotconn"));
+                }
+                if !self.stream {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            // `INET_REQ_GETLADDRS`/`GETPADDRS` (`:11324`, `:11236`): `len != 4 ⇒ einval`, then
+            // `!IS_OPEN ⇒ exbadport`, and the non-SCTP fallback of each is byte-identical to the
+            // `NAME`/`PEER` reply, so both are single-sourced through those helpers.
+            Opcode::Getladdrs => {
+                if arg.len() != 4 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if !self.has_socket() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                wire::name_reply(self.socket)
+            }
+            Opcode::Getpaddrs => {
+                if arg.len() != 4 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if !self.has_socket() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                wire::peer_reply(self.socket, self.state.is_connected())
+            }
             // The shared-`inet_ctl` replies both drivers build identically.
             Opcode::Peer => wire::peer_reply(self.socket, self.state.is_connected()),
             Opcode::Name => wire::name_reply(self.socket),
-            Opcode::Gettype => wire::gettype_reply(self.socket, true),
+            Opcode::Gettype => Ok(wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(wire::getstatus_reply(self.state.state_code())),
             Opcode::Getstat => wire::getstat_reply(arg),
-            // The C's switches DO serve these, but this floor does not: a typed gap, never a
-            // fabricated reply.
-            Opcode::Gethostname
-            | Opcode::Fdopen
-            | Opcode::Getservbyname
-            | Opcode::Getservbyport
-            | Opcode::Setname
-            | Opcode::Setpeer
-            | Opcode::Getiflist
-            | Opcode::Ifget
-            | Opcode::Ifset
-            | Opcode::Subscribe
-            | Opcode::Getifaddrs
-            | Opcode::Ignorefd
-            | Opcode::Getladdrs
-            | Opcode::Getpaddrs
-            | Opcode::TcpUnrecv
-            | Opcode::TcpSendfile => Err(op.not_served()),
+            // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): its only op registers a
+            // driver-side subscriber for the empty-output-queue notification, i.e. a driver→owner
+            // message channel this floor does not have. Answering `[1] ++ op ++ be32(outq)`
+            // without ever sending that notification would be a wrong promise, so it stays a
+            // typed gap.
+            Opcode::Subscribe => Err(op.not_served()),
             // `PACKET_REQ_RECV` is a case of `packet_inet_ctl` only, so on a TCP port it is a case
             // of neither `tcp_inet_ctl` nor `inet_ctl`: the C answers `[0]exbadport` (measured),
             // exactly like a wrapped or unassigned number.

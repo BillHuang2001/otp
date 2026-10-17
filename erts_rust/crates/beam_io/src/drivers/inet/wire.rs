@@ -203,27 +203,31 @@ pub(super) fn getstat_reply(arg: &[u8]) -> Result<Vec<u8>> {
     ))
 }
 
-/// The `INET_REQ_GETTYPE` reply: the socket's `{Family, Type}` pair
-/// (`inet_drv.c:11145`, `case INET_REQ_GETTYPE`).
+/// The `INET_REQ_GETTYPE` reply: the descriptor's **cached** `{Family, Type}` pair
+/// (`inet_drv.c:11165`-`:11203`, `case INET_REQ_GETTYPE`).
 ///
-/// A socket-less port answers [`ctl_xerror`]`("einval")` — the C's `if (!IS_OPEN) return
-/// ctl_error(EINVAL)` (measured `[0]einval` on a bare port of either driver). With a socket it is
-/// `[1] ++ [0,0,0,INET_AF_INET] ++ [0,0,0,type]`, where the type is [`INET_TYPE_STREAM`] for
-/// `tcp_inet` and [`INET_TYPE_DGRAM`] for `udp_inet` (measured `[1,0,0,0,1,0,0,0,1]` and
-/// `[1,0,0,0,1,0,0,0,2]`).
-pub(super) fn gettype_reply(fd: Option<RawFd>, stream: bool) -> Result<Vec<u8>> {
-    let Some(_fd) = fd else {
-        return Ok(ctl_xerror("einval"));
-    };
-    let socket_type = if stream {
-        INET_TYPE_STREAM
-    } else {
-        INET_TYPE_DGRAM
-    };
+/// The C arm has **no `IS_OPEN` guard**: it switches on the descriptor's cached `sfamily` and only
+/// then on its cached `stype`. Both are set when a socket is opened or adopted (`inet_ctl_open`,
+/// `:5214`-`:5216`; `inet_ctl_fdopen`, `:5265`) and are started at `-1` by `inet_init_desc`
+/// (`:10925`); no close path clears them. So a port that never opened a socket still carries the
+/// unset pair and answers `einval` (measured `[0]einval` on a bare port of either driver), while a
+/// port whose socket has been closed reports the type it was opened with (measured
+/// `[1,0,0,0,1,0,0,0,1]` after a `tcp_inet` close and `[1,0,0,0,1,0,0,0,2]` after a `udp_inet` one).
+///
+/// `family`/`stype` are the wire tags with `0` meaning "unset": only [`INET_AF_INET`] with
+/// [`INET_TYPE_STREAM`] or [`INET_TYPE_DGRAM`] is served, and anything else is the C's
+/// `ctl_error(EINVAL)` (IPv6/SCTP are out of scope, so their tags never appear here).
+pub(super) fn gettype_reply(family: u16, stype: u16) -> Vec<u8> {
+    if family != u16::from(INET_AF_INET) {
+        return ctl_xerror("einval");
+    }
+    if stype != u16::from(INET_TYPE_STREAM) && stype != u16::from(INET_TYPE_DGRAM) {
+        return ctl_xerror("einval");
+    }
     let mut reply = ctl_ok();
-    reply.extend_from_slice(&[0, 0, 0, INET_AF_INET]);
-    reply.extend_from_slice(&[0, 0, 0, socket_type]);
-    Ok(reply)
+    reply.extend_from_slice(&u32::from(INET_AF_INET).to_be_bytes());
+    reply.extend_from_slice(&u32::from(stype).to_be_bytes());
+    reply
 }
 
 /// The `INET_REQ_GETFD` reply: the driver's descriptor number, big-endian
