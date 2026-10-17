@@ -133,6 +133,20 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   pinned oracle table byte-for-byte against the system `erl` through a real `cat` child behind a real
   `[line]` / `[binary, {line, N}]` port, plus the `[binary]` no-wrapper row and the
   close-does-not-flush rule, skipping **loudly** when `erl` is absent.
+- **The write path** is pinned hermetically (no `erl`, no child, no sleep) in
+  `registry_reply_tests.rs` — a sibling module declared from `registry.rs` as
+  `#[cfg(test)] #[path = "registry_reply_tests.rs"] mod reply_tests;` so that 1960-line file does not
+  grow: one `ram_file_drv` port, `port_command [1,0,0,0,3,97,98,99]` ⇒ **one**
+  `execute_port_tasks` round reports exactly one `Data { bytes: [3,0,0,0,0] }` with `output_len()`
+  and `input_len()` back to `0` and no task left pending, a second round reports nothing; plus a
+  `RefusingWriteDriver` whose `output`/`ready_output` answer `Err(BadArg)` — `Port::output`,
+  `Port::ready_output` and `execute_port_tasks` each surface `BadArg` with the bytes still queued.
+- **The static-driver set** is pinned in `driver.rs` both ways (each of the three constructs through
+  `create_static_spawn` and reports its own `Driver::name()`; `fd`/`efile` are `BadArg` there while
+  still constructing through `with_builtins()`; `STATIC_SPAWN_DRIVERS` is sorted and agrees with
+  `is_static_spawn_driver`; `with_static_spawn_drivers().names()` is exactly the three) and
+  cross-checked against `erl_ddll:loaded_drivers/0` on the `erl` oracle, skipping **loudly** when
+  `erl` is absent (the `fs_access.rs` pattern).
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
