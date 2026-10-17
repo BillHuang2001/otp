@@ -439,6 +439,14 @@ constructors only (no new error enum).
   copy loop at **4.2 %** of samples (interpreter 20 %, libc malloc/free/memmove 15 %), so the shape's dominant
   terms are the interpreted recursion, `beam_bifs`' `Vec`-based list→binary/tuple conversion and the
   per-collection space installs — not the copy loop (Handoffs).
+- **Post-fullsweep nursery sizing (`gc_bound/churn`).** Sizing the young heap from the round's observed
+  occupancy removes the per-op space install (growths/op **1.0004 → 0.0004**, debt admissions 0.5002 →
+  0.0002) and cuts the collection count a third (**2.000 → 1.500/op**; minor 1.500 → 1.000, major 0.500
+  unchanged), at the cost of a mildly higher copy volume (1 269.5 → 1 283.5 words/op) and a higher young
+  occupancy (347 → 461 peak words). Paired A/B on the same `.beam` (`taskset -c 3`, N = 2 000, 15/21 wall
+  rounds and 15 `task-clock` rounds, loads recorded both sides): ratio new/base **0.964 / 0.960 / 0.929**.
+  The wall clock on this host is badly perturbed, so the `perf stat -e task-clock` pass is the stable signal.
+  Full table and caveats in `MEASURED.md`.
 - Folding the **young heap's occupancy** into the fullsweep's size request is what makes the mature
   generation reachable at the default policy — the copying default runs **147 minors : 73 fullsweeps**.
 - GenImmix wins **copy work on long-lived data** but pays footprint and pause on the small-heap/high-churn
