@@ -168,4 +168,4 @@ The per-key roster and its C citations are in [`IMPLEMENTATION.md`](IMPLEMENTATI
 * `memory_hook.rs` → the `MemoryHook` arm + `RuntimeMemory` (`erlang:memory/0,1`).
 * `tests.rs` / `test_support.rs` → the colocated unit suite + the shared test helpers.
 * Sibling (not owned here): [`../mailbox.rs`](../mailbox.rs) (the nine `Mailbox` seam methods), [`../runtime/`](../runtime/CONTEXT.md) (the scheduler/runner that drives the session), [`../native/CONTEXT.md`](../native/CONTEXT.md) (the BIF floor `try_native` consults first).
-* `IMPLEMENTATION.md` — companion detail: the pooled BIF-heap frontier, the dispatch memo, `PendingInterner`, the runtime-hooks served/closable rosters, the truthful fixed answers, the per-call cost breakdowns, the two-phase valve and the nested-pump bounds.
+* `IMPLEMENTATION.md` — companion detail: the pooled BIF-heap frontier, the table-less arm's store, the dispatch memo, `PendingInterner`, the runtime-hooks served/closable rosters, the truthful fixed answers, the per-call cost breakdowns, the two-phase valve and the nested-pump bounds.
