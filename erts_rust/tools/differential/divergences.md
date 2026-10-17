@@ -474,19 +474,33 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   *already loaded from* one. Needs `-kernel logger_level none` to be deterministic (the oracle's
   `beam_load.c` "resides in sticky dir" report races onto stdout).
 
-## A.9 — in-process compile of a large stdlib module (owner: `beam_gc` / `beam_rt`)
-- `selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator` (an in-process
-  `compile:file/2` of `lib/stdlib/src/timer.erl`, 1016 source lines) is **still not** in the corpus:
-  the Rust side now **completes and agrees** (one measured run `[AGREE]`: rust stdout `1`, exit `0`,
-  no stderr) but takes **≈ 615 s** against the oracle's ~0.7 s, and a >100-min serial gate cannot
-  carry a ~10-minute case. `perf` shows the hotspot is **unchanged**:
-  `beam_rt::context::gc_walk::Walk::seed` ≈ 72 % (it inlines
-  `beam_gc::nursery::Nursery::contains` via `root_is_unscanned` — the
-  `spaces().any(|s| s.contains(ptr))` O(#spaces) walk run per heap admission), with
-  `Walk::Visited::insert` the next cost. The sibling landed `ordsets` compile (579 lines) improved
-  from 304 s to **≈ 108 s**, so the fix helped ~2.8× yet the cost stays superlinear (~cubic) in module
-  source size. Closing that scan makes the case landable.
-
+## A.9 — in-process compile of a large stdlib module (owner: `beam_bifs` / `beam_rt`)
+- `selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator` **is in the corpus and
+  agrees**: it compiles `lib/stdlib/src/timer.erl` (1017 source lines, addressed repo-relatively —
+  the harness spawns both runtimes with the repository root as their cwd) through `-eval` with
+  `[binary, no_spawn_compiler_process, deterministic]`. Measured at the commit that landed it: rust
+  ≈ **2.3 s**, oracle ≈ **0.3 s**, both `[AGREE]` over repeated runs. The former entry's ≈ 615 s
+  cost and its `gc_walk::Walk::seed` ≈ 72 % hotspot no longer reproduce (the whole compile now costs
+  2.3 s); that hotspot was **not** re-measured.
+- The case is the group's only **expression** case because the module-run argv shape cannot carry
+  this source at an acceptable cost: the same in-process compile driven through the runtime's `run`
+  entry point costs ≈ **43 s**, and through the *spawned* compiler process (the `sched_case` default
+  route) ≈ **36.6 s**, against ≈ 2.3 s in the calling process — the same penalty the `ordsets`
+  sibling shows (7.6 s versus 0.8 s). What is slow is work executed in a freshly spawned process,
+  and the module-run entry process is one. Owner: `beam_rt` / `beam_engine` (execution-tier
+  selection for spawned processes).
+- **Residual divergence: the `Docs` chunk's compressed image.** Every other chunk of the produced
+  artifact is byte-identical between the two runtimes — `AtU8`, `Code`, `StrT`, `ImpT`, `ExpT`,
+  `FunT`, `LitT`, `Meta`, `LocT`, `Attr`, `CInf`, `Dbgi`, `Line`, `Type` — and `beam_lib:md5/1`
+  (which covers `AtU8`/`Code`/`StrT`/`ImpT`/`ExpT`/`FunT`/`LitT`/`Meta`, i.e. the object code
+  itself) is the very same `<<212,65,234,56,60,147,88,139,85,190,88,223,28,10,50,95>>` on both
+  sides. Only `Docs` differs, and only in its **compressed image**: 4463 bytes on the oracle
+  against 4465 on the Rust runtime, while `binary_to_term/1` of either chunk yields the *identical*
+  `docs_v1` term (the module doc, the `#{otp_doc_vsn => {1,0,0}, behaviours => [], source_anno =>
+  {22,2}}` metadata and all 38 documented functions compare `=:=`). That is the known zlib encoder
+  choice (the A.7 zlib entries), not a compiler divergence, so **whole-file byte identity of the
+  artifact stays unpinnable** and the case pins the source-derived **export table** of the produced
+  image instead of a compiler-release hash.
 ## A.2 — term/ETF image (owner: `beam_bifs`)
 - `term_to_binary(Term, [local])` is served: the image is `131`, `LOCAL_EXT` (121), a 4-byte local
   node **hash**, then the ordinary ETF body. The hash is randomised per VM start on **both** sides,
