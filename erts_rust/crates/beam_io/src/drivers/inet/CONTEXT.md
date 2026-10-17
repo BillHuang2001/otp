@@ -176,7 +176,14 @@ All four need a change **outside** `src/drivers/inet/`; each is a real `gen_tcp`
 - **`INET_REQ_GETTYPE` after a `close`** answers `[0]einval` here (the descriptor is released) where the oracle answers the **cached** `stype` (`[1,0,0,0,1,0,0,0,1]`).
 - **`INET_REQ_LISTEN` on a datagram port** is a typed `unsupported` here, where the oracle answers `[0]exbadport` (the C's arm is SCTP-only, `:14846`) — the C's own refusal is not a case this floor models, so the honest answer is the typed gap.
 - **`TCP_REQ_RECV` with a wrong-length operand on a port with no peer** answers `[0]einval` here (the operand is validated first) where the oracle answers `[0]enotconn` (it checks the connection first).
-- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1978, `src/registry.rs` 1955, `src/drivers/inet/tests.rs` 1789, `src/drivers/inet/udp/udp_tests.rs` ~1760, `src/drivers/inet/efile.rs`… (crate-root doc carries the full cross-crate list). Inside this subtree: `packet.rs` 1245 and `tests.rs` 1789 are the documented "source half + suite" pairs; `mod.rs` 1483, `udp.rs` 810, `frame_tests.rs` 769, `opt.rs` 937, `sys.rs` 532, `opcode.rs` 488, `opcode_tests_udp.rs` 448, `opcode_tests.rs` 886 are within or near the baseline. If a source half grows, split its test module into a sibling file — the pattern is `opcode_tests.rs`/`opcode_tests_udp.rs` and `udp/udp_tests.rs`.
+- **File sizes (`wc -l`, this subtree).** Over the baseline: `tests.rs` **1789** (a source-half-less
+  suite, the documented split-from-source pattern) and `packet.rs` **1245** (one decoder per
+  `{packet, N}` type — splitting it would scatter a single table). At/over 1000 in `mod.rs` **1484**
+  (the driver + its verb table + docs; its suite already lives in `tests.rs`). Under 1000:
+  `opt.rs` 937, `opcode_tests.rs` 886, `udp.rs` 810, `frame_tests.rs` 769, `udp/udp_tests.rs` 647,
+  `sys.rs` 532, `opcode.rs` 488, `opcode_tests_udp.rs` 448, `frame.rs` 387, `wire.rs` 377.
+  If a source half grows, split its test module into a sibling file — the patterns here are
+  `opcode_tests.rs`/`opcode_tests_udp.rs` and `udp/udp_tests.rs`.
 - Non-obvious framing divergences recorded in code: an out-of-range `{packet,N}` code is treated as **no framing** where the C's `packet_get_length` `default:` rejects it (`inet/frame.rs:96-105`); an unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).
 
 ## Test Strategy
