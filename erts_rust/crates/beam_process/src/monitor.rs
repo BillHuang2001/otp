@@ -41,7 +41,8 @@
 //!
 //! `beam_term` has no `make_ref` in Milestone-1, so a reference is represented as the
 //! frozen 4-word ref thing `[make_header(3, REF_SUBTAG), node(0), serial, id]`, built here
-//! with `beam_term`'s public `make_header` (see the crate `CONTEXT.md`, Design Decisions).
+//! through `beam_term`'s checked writer `write_internal_ref` (see the crate `CONTEXT.md`,
+//! Design Decisions).
 //! `beam_message::layout::object_words` copies such a thing verbatim and
 //! `beam_term::compare` compares internal refs by payload words, so a `{'DOWN', …}` message
 //! round-trips and matches; when `beam_term` gains a proper `make_ref`, only
@@ -98,14 +99,56 @@
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{
-    boxed_val, header_subtag, internal_ref_id, is_boxed_term, is_tuple, make_atom, make_boxed,
-    make_header, make_small, signed_value, tuple_element, tuple_size, Atom, Eterm, REF_SUBTAG,
+    boxed_val, header_arity, header_subtag, internal_ref_id, is_boxed_term, is_tuple, make_atom,
+    signed_value, try_make_small, tuple_element, tuple_size, write_internal_ref, Atom, Eterm,
+    TermError, INTERNAL_REF_PAYLOAD_WORDS, INTERNAL_REF_WORDS, REF_SUBTAG,
 };
 
+use crate::error;
 use crate::pid::{PortId, ProcessId};
 
-/// The number of payload words of the ref thing: `node`, `serial` and `id`.
-const REF_PAYLOAD_WORDS: usize = 3;
+/// Whether `id` is encodable as a reference id at all — the **checked** bound of
+/// [`MonitorRef::to_eterm`], which is where the whole identity of a reference lives.
+///
+/// # The bound
+///
+/// A reference is an **immediate** in the frozen term layout, and its entire identity rides
+/// the one small-integer word of `beam_term`'s 4-word ref thing
+/// (`beam_term::boxed::INTERNAL_REF_WORDS`: `[header, node, serial, id]`, with `node`/`serial`
+/// pinned to zero and the wire codec rebuilding them as zero), so the id space is exactly the
+/// small-integer range: `MIN_SMALL..=MAX_SMALL` (`beam_term::immediate`, derived from
+/// `TAG_IMMED1_SIZE`). An id is a `u64`, so the encodable half is `0..=MAX_SMALL`.
+///
+/// # Why it is *checked* rather than asserted
+///
+/// `make_small` is an unchecked `const fn` that only `debug_assert!`s its range (it mirrors
+/// the C macro and sits on engine hot paths), so encoding an out-of-range id would **panic**
+/// in a debug build and, in release, silently produce a *wrong term*: `1 << 59` shifted into
+/// the immediate payload sets the sign bit, so the word decodes as a **negative** small and
+/// distinct ids collide. Neither is acceptable for a value a peer can address a message to.
+/// Widening the slot is not an option either (a bignum id needs a variable-size thing, which
+/// breaks the frozen block — see `beam_term::boxed::INTERNAL_REF_WORDS`), so an id past the
+/// bound is refused with the crate's typed resource-limit error
+/// ([`error::system_limit`] ⇒ `BeamError::SystemLimit`), exactly as pid/port number-space
+/// exhaustion is.
+///
+/// # Is it reachable?
+///
+/// Only in principle: [`RefAllocator`] hands out one id per `erlang:monitor/2,3` /
+/// `erlang:alias/1`, monotonically from `0`, so a node would need `MAX_SMALL + 1` monitors
+/// before it reached the bound. It is therefore not a practical limit — but it *is* the
+/// allocator's real limit, and a refusal is the only honest answer once it is passed: an
+/// unchecked wrap would hand out two **equal** references, so a stale `{'DOWN', …}` could be
+/// mistaken for a live monitor's (the invariant [`RefAllocator`] exists to keep).
+fn ref_id_fits(id: u64) -> Result<()> {
+    // `MIN_SMALL` needs no test: a `u64` id is never negative, and `i64::try_from` rejects the
+    // whole upper half of the `u64` space.
+    let signed = i64::try_from(id).map_err(|_| error::system_limit())?;
+    match try_make_small(signed) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(error::system_limit()),
+    }
+}
 
 /// A monitor reference: the identity a `{'DOWN', …}` message carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,25 +164,35 @@ impl MonitorRef {
 
     /// Builds the on-heap ref thing for this reference (see the module docs).
     ///
-    /// The thing is `[make_header(3, REF_SUBTAG), node, serial, id]`; Milestone-1 has a
+    /// The thing is `[make_header(3, REF_SUBTAG), node, serial, id]` — Milestone-1 has a
     /// single monotonic id space, so `node` and `serial` are zero and the whole id lives in
-    /// the last word (a `small`).
+    /// the last word (a `small`). The block is written by `beam_term`'s checked
+    /// `write_internal_ref`, so this producer and the crate's other reference writers cannot
+    /// drift out of the frozen layout.
     ///
     /// # Errors
     ///
-    /// Propagates `BeamError::Alloc` when `heap` cannot fit the ref thing.
+    /// * `BeamError::Alloc` when `heap` cannot fit the ref thing.
+    /// * `BeamError::SystemLimit` when this reference's id does not fit the block's single
+    ///   small-integer id word — the bound [`ref_id_fits`] documents and *checks* (never a
+    ///   silently wrong term, never a panic, never a layout-breaking bignum).
     pub fn to_eterm(self, heap: &mut Heap) -> Result<Eterm> {
-        // SAFETY: `alloc_words` returns four exclusively-owned, writable words.
-        let p = unsafe { heap.alloc_words(REF_PAYLOAD_WORDS + 1)? };
-        // SAFETY: `p` addresses the four words just handed out; every one of them is
-        // written before the pointer escapes this block.
-        unsafe {
-            *p = make_header(REF_PAYLOAD_WORDS, REF_SUBTAG);
-            *p.add(1) = make_small(0); // node: the local node
-            *p.add(2) = make_small(0); // serial: one id space in M1
-            *p.add(3) = make_small(self.id as i64);
+        // Refuse an unencodable id **before** reserving heap words, so the refusal allocates
+        // nothing at all.
+        ref_id_fits(self.id)?;
+        // SAFETY: `alloc_words` returns `INTERNAL_REF_WORDS` exclusively-owned, writable words.
+        let p = unsafe { heap.alloc_words(INTERNAL_REF_WORDS)? };
+        // SAFETY: `p` addresses exactly the words just handed out and nothing else writes them;
+        // `write_internal_ref` initialises all `INTERNAL_REF_WORDS` of them before handing the
+        // pointer back inside the returned root.
+        match unsafe { write_internal_ref(p, self.id) } {
+            Ok(term) => Ok(term),
+            // Unreachable after `ref_id_fits` — `write_internal_ref`'s only error is the very
+            // range check just done — but mapped, never `unwrap`ped, so the pair cannot panic.
+            Err(TermError::SmallIntOutOfRange) => Err(error::system_limit()),
+            // No other variant exists today; propagating it keeps this honest if one appears.
+            Err(other) => Err(other.into()),
         }
-        Ok(make_boxed(p as *const Eterm))
     }
 
     /// Decodes an on-heap internal reference thing — the inverse of [`MonitorRef::to_eterm`].
@@ -217,23 +270,34 @@ pub struct AliasEntry {
 ///
 /// # Encoding
 ///
-/// Word 3 of a ref thing is the id: [`MonitorRef::to_eterm`] builds the frozen
-/// `[make_header(3, REF_SUBTAG), node, serial, id]`, so its **last payload word** holds
+/// The id is the ref thing's **last payload word**
+/// (`INTERNAL_REF_PAYLOAD_WORDS`): [`MonitorRef::to_eterm`] builds the frozen
+/// `[make_header(3, REF_SUBTAG), node, serial, id]`, so that word holds
 /// `make_small(reference.id())` (`monitor_ref_to_eterm_builds_the_frozen_thing` pins exactly
-/// that layout). The identity test is therefore `signed_value(word[3]) == reference.id() as i64`.
+/// that layout). The identity test is therefore "word
+/// [`INTERNAL_REF_PAYLOAD_WORDS`] decodes to `reference.id()`", spelled **totally and
+/// sign-safely**: the word is read as a sign-extended small payload and then converted with
+/// `u64::try_from`, so a **negative** id word (a corrupt or foreign block) can never compare
+/// equal to a `u64` reference id — the old `word as i64 == id as i64` form wrapped both sides
+/// and could match a huge id against a negative word.
 ///
 /// # Robustness
 ///
 /// Every read is guarded: a non-tuple payload, a payload that is not a 5-tuple, a head element
 /// that is not `down_atom`, and an element 1 that is not a boxed ref thing are all `false`
-/// without reading a word the guards have not first proven to exist. It never panics.
+/// without reading a word the guards have not first proven to exist. The ref block must carry
+/// **both** `REF_SUBTAG` **and** arity [`INTERNAL_REF_PAYLOAD_WORDS`], because the subtag alone
+/// is also worn by the C-layout `ErtsORefThing` (arity 2, three words — no id slot), so the
+/// arity is what proves the id word exists rather than over-reading a shorter block. It never
+/// panics.
 pub fn payload_is_down_for(payload: Eterm, reference: MonitorRef, down_atom: Atom) -> bool {
     // SAFETY: the guards form a chain. `is_tuple` first rejects everything that is not a live
     // boxed term whose header word is a valid arity value, so `tuple_size`/`tuple_element` only
     // ever read a live tuple; the arity test bounds every element read to `0..5`; and element 1
-    // is only dereferenced after `is_boxed_term` proved it a dereferenceable boxed term and
-    // `header_subtag` proved its header carries the 3-payload-word `REF_SUBTAG`, so word 3 is in
-    // bounds. No path reads a word it has not first proven to exist.
+    // is only dereferenced after `is_boxed_term` proved it a dereferenceable boxed term, and
+    // `header_subtag` + `header_arity` proved its header carries `REF_SUBTAG` with
+    // `INTERNAL_REF_PAYLOAD_WORDS` payload words, so word `INTERNAL_REF_PAYLOAD_WORDS` (the id)
+    // is in bounds. No path reads a word it has not first proven to exist.
     unsafe {
         if !is_tuple(payload) || tuple_size(payload) != 5 {
             return false;
@@ -246,10 +310,13 @@ pub fn payload_is_down_for(payload: Eterm, reference: MonitorRef, down_atom: Ato
             return false;
         }
         let words = boxed_val(reference_term);
-        if header_subtag(*words) != REF_SUBTAG as u32 {
+        if header_subtag(*words) != REF_SUBTAG as u32
+            || header_arity(*words) != INTERNAL_REF_PAYLOAD_WORDS
+        {
             return false;
         }
-        signed_value(*words.add(3)) == reference.id() as i64
+        u64::try_from(signed_value(*words.add(INTERNAL_REF_PAYLOAD_WORDS))).ok()
+            == Some(reference.id())
     }
 }
 
@@ -408,6 +475,23 @@ impl Monitors {
 ///
 /// A reference id is never reused, so a stale `{'DOWN', …}` can never be confused with a
 /// live monitor.
+///
+/// # The real limit is the encodable one, and it is checked at the encoder
+///
+/// The counter is a `u64`, but an *encodable* reference id is only `0..=MAX_SMALL`
+/// (`2^59 - 1`): the whole identity of a reference rides the one small-integer word of
+/// `beam_term`'s frozen 4-word ref thing (see [`ref_id_fits`]). [`RefAllocator::next`] is
+/// therefore deliberately **total and infallible** — sibling crates call it as
+/// `RefAllocator::new().next()` — and [`MonitorRef::to_eterm`] is the single **checked** gate:
+/// an id past the bound is refused there with `BeamError::SystemLimit`, so no id is ever
+/// truncated, substituted or wrapped into a *different* reference. Exhaustion is thus a typed
+/// resource limit (like pid/port number-space exhaustion), not an invariant taken on trust.
+///
+/// The `wrapping_add` in [`RefAllocator::next`] is consequently **not** a claim that the wrap
+/// point is reachable: it only keeps the counter itself total rather than panicking. The
+/// allocator stops being able to *produce a usable reference* at `MAX_SMALL + 1` — about
+/// `5.8e17` monitors, far below the `2^64` wrap — so an id can never be handed out, refused,
+/// and then handed out again under the wrap.
 pub struct RefAllocator {
     next: u64,
 }
@@ -419,10 +503,13 @@ impl RefAllocator {
     }
 
     /// Hands out the next never-reused reference.
+    ///
+    /// This never fails; what can fail is **encoding** the returned id as a term
+    /// ([`MonitorRef::to_eterm`] refuses an id past `MAX_SMALL` with `BeamError::SystemLimit`).
+    /// `wrapping_add` only keeps the counter total: the wrap point lies far beyond the
+    /// encodable bound, so no observable reference is ever reused (see the type docs).
     pub fn next(&mut self) -> MonitorRef {
         let id = self.next;
-        // `wrapping_add` only matters after 2^64 references; a real runtime can never
-        // reach that, and wrapping keeps the allocator total rather than panicking.
         self.next = self.next.wrapping_add(1);
         MonitorRef { id }
     }
@@ -430,11 +517,15 @@ impl RefAllocator {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for `RefAllocator` monotonicity, the `Monitors` set operations and the
-    //! frozen shape of the on-heap ref thing [`MonitorRef::to_eterm`] builds.
+    //! Unit tests for `RefAllocator` monotonicity, the `Monitors` set operations, the
+    //! frozen shape of the on-heap ref thing [`MonitorRef::to_eterm`] builds and its
+    //! checked id bound.
 
     use beam_common::BeamError;
-    use beam_term::prelude::{boxed_val, header_subtag, is_boxed, signed_value, REF_SUBTAG};
+    use beam_term::prelude::{
+        boxed_val, header_subtag, is_boxed, make_boxed, make_header, make_small, signed_value,
+        MAX_SMALL, MIN_SMALL, REF_SUBTAG, SMALL_BITS,
+    };
 
     use super::*;
 
@@ -615,6 +706,91 @@ mod tests {
     }
 
     #[test]
+    fn to_eterm_checks_the_ref_id_against_the_small_integer_bound() {
+        // The whole identity of a ref thing rides its single id word, so the encodable id space
+        // is exactly the small-integer one — `MIN_SMALL..=MAX_SMALL`, which `beam_term` derives
+        // from the immediate tag width (`SMALL_BITS = 64 - TAG_IMMED1_SIZE`) and this test must
+        // not restate as a literal.
+        assert_eq!(MAX_SMALL, (1i64 << (SMALL_BITS - 1)) - 1);
+        assert_eq!(MIN_SMALL, -MAX_SMALL - 1);
+        // The boundary itself still encodes, byte-exactly as before, and round-trips.
+        let at_bound = MonitorRef {
+            id: MAX_SMALL as u64,
+        };
+        let mut heap = Heap::new(8).expect("test heap");
+        let term = at_bound
+            .to_eterm(&mut heap)
+            .expect("the largest encodable id encodes");
+        assert_eq!(heap.used(), 4, "a ref thing is four words");
+        // SAFETY: `term` is a live, four-word heap object; words 0..4 are in bounds and were all
+        // written by `to_eterm`.
+        unsafe {
+            let p = boxed_val(term);
+            assert_eq!(header_subtag(*p), REF_SUBTAG as u32);
+            assert_eq!(signed_value(*p.add(1)), 0, "node is local (0)");
+            assert_eq!(signed_value(*p.add(2)), 0, "one id space in M1");
+            assert_eq!(
+                signed_value(*p.add(INTERNAL_REF_PAYLOAD_WORDS)),
+                MAX_SMALL,
+                "the boundary id is the last word, still a positive small"
+            );
+        }
+        assert_eq!(
+            MonitorRef::from_eterm(term).expect("the boundary id decodes"),
+            at_bound
+        );
+
+        // Everything past the bound is the typed resource limit: no panic (a debug-only
+        // `debug_assert!` would fire in `make_small`), no silently wrong — and colliding —
+        // negative small, no layout-breaking bignum, and no heap words reserved.
+        for id in [
+            MAX_SMALL as u64 + 1, // the very next id: sign-extended to a *negative* small
+            ((MAX_SMALL as u64) << 1), // `2^60 - 2`
+            i64::MAX as u64,      // still an `i64`, but far past the small range
+            u64::MAX,             // not even an `i64`
+        ] {
+            let mut heap = Heap::new(8).expect("test heap");
+            let refused = MonitorRef { id };
+            assert!(
+                matches!(refused.to_eterm(&mut heap), Err(BeamError::SystemLimit)),
+                "id {id} must be refused with system_limit"
+            );
+            assert_eq!(heap.used(), 0, "a refused id reserves no heap words");
+        }
+
+        // Driving the *allocator* to the boundary: the last encodable draw works, the next one is
+        // refused at the encoder (the allocator's own `next` stays total, by contract).
+        let mut refs = RefAllocator::new();
+        refs.next = MAX_SMALL as u64; // reachable only from an in-module test
+        let last = refs.next();
+        assert_eq!(last.id(), MAX_SMALL as u64);
+        let mut heap = Heap::new(8).expect("test heap");
+        assert!(last.to_eterm(&mut heap).is_ok());
+        let overflowed = refs.next();
+        assert_eq!(overflowed.id(), MAX_SMALL as u64 + 1);
+        let mut heap = Heap::new(8).expect("test heap");
+        assert!(matches!(
+            overflowed.to_eterm(&mut heap),
+            Err(BeamError::SystemLimit)
+        ));
+
+        // The ordinary draw path is unaffected: every id the allocator actually reaches early on
+        // encodes and round-trips.
+        let mut refs = RefAllocator::new();
+        for _ in 0..64 {
+            let reference = refs.next();
+            let mut heap = Heap::new(8).expect("test heap");
+            let term = reference
+                .to_eterm(&mut heap)
+                .expect("an ordinary id encodes");
+            assert_eq!(
+                MonitorRef::from_eterm(term).expect("an ordinary id decodes"),
+                reference
+            );
+        }
+    }
+
+    #[test]
     fn payload_is_down_for_matches_only_its_own_reference_and_shape() {
         use beam_term::prelude::{make_atom, AtomTable};
 
@@ -627,8 +803,8 @@ mod tests {
         let reference = refs.next();
         let other = refs.next();
 
-        let mut heap = Heap::new(32).expect("test heap");
-        let mut ref_heap = Heap::new(8).expect("test heap");
+        let mut heap = Heap::new(64).expect("test heap");
+        let mut ref_heap = Heap::new(32).expect("test heap");
         let reference_term = reference.to_eterm(&mut ref_heap).expect("the ref fits");
 
         // The exact shape the signal builders produce.
@@ -669,6 +845,63 @@ mod tests {
             ])
             .expect("fits");
         assert!(!payload_is_down_for(not_ref, reference, down));
+
+        // A **C-layout** reference block (header arity 2, three words — no id slot) wears the
+        // same `REF_SUBTAG`, so it must be refused on arity rather than over-read for its id.
+        let c_layout_ref = {
+            let p = unsafe { ref_heap.alloc_words(3) }.expect("fits");
+            // SAFETY: the three words are exclusively owned and written before escaping.
+            unsafe {
+                *p = make_header(2, REF_SUBTAG);
+                *p.add(1) = make_small(0);
+                *p.add(2) = make_small(0);
+            }
+            make_boxed(p as *const Eterm)
+        };
+        let c_layout_down = heap
+            .tuple(&[
+                make_atom(down),
+                c_layout_ref,
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("fits");
+        assert!(!payload_is_down_for(c_layout_down, reference, down));
+
+        // A ref block whose id word is *negative* is never an id: `u64::try_from` refuses it, so
+        // it cannot match even a reference whose id wraps to that value in `i64`.
+        let negative_id_ref = {
+            let p = unsafe { ref_heap.alloc_words(4) }.expect("fits");
+            // SAFETY: the four words are exclusively owned and written before escaping.
+            unsafe {
+                *p = make_header(3, REF_SUBTAG);
+                *p.add(1) = make_small(0);
+                *p.add(2) = make_small(0);
+                *p.add(3) = make_small(-1);
+            }
+            make_boxed(p as *const Eterm)
+        };
+        let negative_down = heap
+            .tuple(&[
+                make_atom(down),
+                negative_id_ref,
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("fits");
+        assert!(!payload_is_down_for(negative_down, reference, down));
+        assert!(
+            !payload_is_down_for(
+                negative_down,
+                MonitorRef {
+                    id: u64::MAX // `-1i64 as u64`
+                },
+                down
+            ),
+            "a negative id word must not match a huge id"
+        );
 
         // Non-tuple payloads must never be dereferenced.
         assert!(!payload_is_down_for(make_small(7), reference, down));
