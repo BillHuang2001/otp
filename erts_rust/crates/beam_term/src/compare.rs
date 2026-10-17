@@ -96,7 +96,8 @@
 //!   [`class_rank`] in the *context-free* [`cmp`]/[`cmp_arith`] (the documented
 //!   no-context convention) and field by field by [`cmp_with_local_node`] /
 //!   [`cmp_arith_with_local_node`], which supply the local node the internal word
-//!   cannot carry — see [`identity`] and [`LocalNodeId`].//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
+//!   cannot carry — see [`identity`] and [`LocalNodeId`].
+//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
 //!   class first (which is exact), then by object arity, then by the raw term word
 //!   (a stable proxy). This never panics but is not a faithful reproduction of the
 //!   C's structural comparison; a caller that needs exact ordering for it must
@@ -132,9 +133,11 @@
 //! creation) and calls [`cmp_with_local_node`] (exact `=:=` ordering — what
 //! `beam_process`'s monitor/link ordering needs) or
 //! [`cmp_arith_with_local_node`] (arithmetic `==` ordering — what the `<`/`>` BIFs
-//! and `ordered_set` need). Both behave **exactly** like [`cmp`]/[`cmp_arith`] for
-//! every pair that is not a mixed internal/external `pid`/`port`/`ref` pair, and for
-//! those they compare the fields in the C's order (see [`identity`]).
+//! need). `beam_ets`' `ordered_set` deliberately stays on the context-free
+//! [`cmp_arith`]: a table's order must not depend on which node asks. Both behave
+//! **exactly** like [`cmp`]/[`cmp_arith`] for every pair that is not a mixed
+//! internal/external `pid`/`port`/`ref` pair, and for those they compare the fields
+//! in the C's order (see [`identity`]).
 //!
 //! The three mixed arms, and their documented conventions:
 //!
@@ -184,7 +187,9 @@ pub use identity::LocalNodeId;
 
 use identity::{cmp_mixed, cmp_ref_ids};
 use maps::cmp_maps;
-use numbers::cmp_numbers;/// Ascending term-order rank of a [`TermClass`].
+use numbers::cmp_numbers;
+
+/// Ascending term-order rank of a [`TermClass`].
 ///
 /// `rank = 0x10 - _DEF` over the 17 real classes of the C's `*_DEF` ladder
 /// (`erts/emulator/beam/erl_term.h:1441-1457`), with `BIN_REF_DEF` (`0x11`, "not a
@@ -332,7 +337,7 @@ pub fn cmp_with_local_node(
 }
 
 /// The arithmetic (`==`) ordering with the runtime's own node supplied — the
-/// node-aware twin of [`cmp_arith`], for the `<`/`>` BIFs and `ordered_set`.
+/// node-aware twin of [`cmp_arith`], for the `<`/`>` BIFs.
 ///
 /// Behaves like [`cmp_arith`] (IEEE floats, numeric mixed int/float) everywhere,
 /// including in the mixed internal/external arms [`cmp_with_local_node`] documents:
@@ -347,7 +352,8 @@ pub fn cmp_arith_with_local_node(
 }
 
 /// The shared comparison core, parameterised by the [`CmpCtx`].
-fn cmp_impl(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {    // Identical words are always equal (the C `is_same` fast path).
+fn cmp_impl(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
+    // Identical words are always equal (the C `is_same` fast path).
     if a.raw() == b.raw() {
         return Ordering::Equal;
     }
@@ -455,7 +461,9 @@ pub fn cmp_flatmap_keys(key_a: Eterm, key_b: Eterm, atoms: &AtomTable) -> Orderi
     } else {
         cmp(key_a, key_b, atoms)
     }
-}/// Compare two maps — the `MAP_SUBTAG` arm of `erts_cmp_compound`
+}
+
+/// Compare two maps — the `MAP_SUBTAG` arm of `erts_cmp_compound`
 /// (`erts/emulator/beam/utils.c:1955-2118`).
 ///
 /// Erlang map order is: **size first**, then the key/value pairs ordered by the
