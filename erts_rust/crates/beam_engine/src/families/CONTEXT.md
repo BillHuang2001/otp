@@ -132,7 +132,7 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   proved the test cannot fail — so neither choice can be observed from compiler-generated IR; the divergence
   is a consistency defect (two different answers for one unreachable state), not a wrong value. Fix: route
   `fail_step`'s `NO_FAIL` arm through `raise_function_clause_no_fail`, which needs `machine`/`module` threaded
-  into `fail_step` from its four call sites.
+  into `fail_step` from its nine call sites (`records/mod.rs:289,308,399,571,577,607,613,619,623`).
 - **`bitstrings/raw.rs:69` re-declares `const ERL_ONHEAP_BINARY_LIMIT = 64` and hand-rolls the heap-binary
   layout** instead of forwarding to `beam_term::bitstring` as `records/raw.rs` already forwards to
   `beam_term::record`. A duplicated frozen constant: if `beam_term`'s limit ever moves, this copy silently
