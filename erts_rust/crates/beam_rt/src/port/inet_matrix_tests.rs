@@ -72,6 +72,14 @@
 //!   `tcp_sendfile`, which need a connected stream), so those rows are pinned on this runtime's side
 //!   alone — each asserted to be a typed capability gap naming the request, never a fabricated reply.
 //!
+//! # Layout
+//!
+//! The file is deliberately one **matrix**: a builder per port-state sequence, the shared
+//! [`Probe`]/[`Rule`]/[`Session`] comparison machinery, and the two residual tables, because every
+//! sequence is read against the same vocabulary and against each other. It is a table, not a
+//! subsystem, so it is kept whole rather than split into sibling files; the capability-gate matrix
+//! over the same bridge is the sibling `control_capability_tests`.
+//!
 //! # The oracle
 //!
 //! The system `erl` on `PATH` (OTP 29.1.1 / erts-17.1) is the oracle, driven exactly as the rest of
