@@ -354,6 +354,13 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - Integration: `tests/allocator.rs` (alloc/dealloc/realloc round trips, alignment, dedicated-carrier
   path, stats deltas, `max_footprint` cap, typed/unsized entry points, `allocator_info`), `tests/heap.rs`
   (`cons`/`tuple`/`alloc_words`/`alloc_tuple`/`reset`/`reset_to`/peak, pointer stability, `Drop`),
+  `tests/refc_binary_growth.rs` (the growth shape: an append loop to 64 KiB is **linear** — `moves <= 8`,
+  `bytes_copied <= 2n`, and 8× the bytes copies ≥4× fewer than the full loop — plus a
+  fully-in-place run with 0 moves/0 bytes and an identical `data_ptr`, move correctness +
+  `Relocation` fields, `compact`, the `max_capacity` boundary (typed `AllocKind::LargeObject`, nothing
+  changed) and `BadArg` for self-inconsistent limits, the shared-payload refusal, per-type/aggregate
+  allocator cleanliness across a move, `set_len` zero-fill, `payload_capacity`, and the
+  **term-layout invariant** that `size_object`/`refc_size` see only the logical length),
   `tests/reserved_heap.rs` (in-place growth across the committed limit with a byte-identical `hp` and no
   extra allocation, reservation exhaustion ⇒ `MoveRequired` with no state change and still-usable old
   limit, the host move path with its constant delta and byte-identical live region, zero/small
