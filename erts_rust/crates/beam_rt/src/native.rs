@@ -393,10 +393,12 @@ impl RuntimeContext<'_> {
             ("init", "code_path_choice", 0) => Some(self.code_path_choice()),
             ("os", "cmd", 1) => Some(self.os_cmd(args)),
             // The port surface the `PortHook` seam cannot express: `port_command/2,3` (the
-            // port's *input* direction) and `port_control/3` (the driver's `control` callback) —
-            // see [`port`] — plus the closed-port half of `port_info/1,2`. Every other form of
-            // those three names falls through to the registry (`port_native` answers `None`).
-            ("erlang", "port_command" | "port_control" | "port_info", 1 | 2 | 3) => {
+            // port's *input* direction), `port_control/3` (the driver's `control` callback),
+            // `port_connect/2` (the `erlang.erl` wrapper's `erts_internal:port_connect/2`
+            // spelling, which the `RuntimeHooks` bridge owns for the internal name) — see
+            // [`port`] — plus the closed-port/name half of `port_info/1,2`. Every other form of
+            // those names falls through to the registry (`port_native` answers `None`).
+            ("erlang", "port_command" | "port_control" | "port_connect" | "port_info", 1 | 2 | 3) => {
                 self.port_native(function, arity, args)
             }
             ("code", "get_path", 0) => Some(self.code_get_path()),

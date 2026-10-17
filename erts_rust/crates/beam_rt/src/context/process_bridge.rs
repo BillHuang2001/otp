@@ -39,10 +39,11 @@
 //!
 //! # Documented divergences (honest, by construction)
 //!
-//! * `whereis/1` / `register/2`: the oracle's registry can hold a **port** id as well as a
-//!   pid term. [`beam_process::ProcessTable`] registers pids only, so a faithful pid answer
-//!   is given and a port id is reported as the typed capability gap (never a fabricated
-//!   `undefined`/`false`).
+//! * `whereis/1` / `register/2` / `unregister/1` / `registered/0`: the oracle's registry holds
+//!   a **pid or a port** id ([`beam_process::ProcessTable`] registers pids, the port registry
+//!   [`PortRegistry`] registers ports), so this bridge consults the process table first and
+//!   the port registry second — one name can only ever be held by one entry. A name a
+//!   *process* holds shadows nothing: `register(init, Port)` is the oracle's `badarg`.
 //! * `error_handler`: this runtime holds no `error_handler` state, so the flag accepts a new
 //!   atom value and answers the unchanging runtime default atom `error_handler` as the
 //!   previous value (the oracle's default for a fresh process).
@@ -174,32 +175,66 @@ fn atom_name(atoms: &AtomTable, value: Eterm) -> Option<String> {
 
 impl ProcessHook for ProcessBridge<'_> {
     fn whereis(&mut self, name: Atom) -> Result<Option<Eterm>> {
-        Ok(self.table_mut().whereis(name).map(ProcessId::to_eterm))
+        // The name registry holds a **pid or a port** (the C's register table, `register.c:175-300`),
+        // so the process table is consulted first and the port registry second — one name can
+        // only ever be held by one of them (see [`Self::register`]).
+        if let Some(pid) = self.table_mut().whereis(name) {
+            return Ok(Some(pid.to_eterm()));
+        }
+        let ports = Rc::clone(&self.ports);
+        let registered = match ports.try_borrow() {
+            Ok(registry) => registry.port_of_name(name),
+            Err(_) => return Err(error::unsupported("the port table is already in use")),
+        };
+        Ok(registered.map(PortId::to_eterm))
     }
 
     fn register(&mut self, name: Atom, id: Eterm) -> Result<bool> {
-        // The BIF layer already restricted `id` to an internal pid or an internal port.
-        // The oracle's registry holds either; this runtime's holds pids only, so the port
-        // case is the honest typed capability gap, never a fabricated `true`/`false`.
-        let Ok(pid) = ProcessId::from_eterm(id) else {
-            return Err(error::unsupported(
-                "erlang:register/2: registering a port under a name (this runtime's name \
-                 registry holds pids only)",
-            ));
+        // The BIF layer already restricted `id` to an internal pid or an internal port, and the
+        // oracle's registry holds either — so both arms register for real.
+        if let Ok(pid) = ProcessId::from_eterm(id) {
+            return Ok(self.table_mut().register(name, pid).is_ok());
+        }
+        let port = PortId::from_eterm(id)?;
+        // A name another *process* holds is the oracle's `badarg` (`register(init, Port)`), which
+        // the port registry cannot see; a name another *port* holds, a port that already has a
+        // name and a port that is not alive are all [`PortRegistry::name_port`]'s `false`.
+        if self.table_mut().whereis(name).is_some() {
+            return Ok(false);
+        }
+        let ports = Rc::clone(&self.ports);
+        let inserted = match ports.try_borrow_mut() {
+            Ok(mut registry) => registry.name_port(name, port),
+            Err(_) => return Err(error::unsupported("the port table is already in use")),
         };
-        Ok(self.table_mut().register(name, pid).is_ok())
+        Ok(inserted)
     }
 
     fn unregister(&mut self, name: Atom) -> Result<bool> {
-        Ok(self.table_mut().unregister(name).is_ok())
+        if self.table_mut().unregister(name).is_ok() {
+            return Ok(true);
+        }
+        let ports = Rc::clone(&self.ports);
+        let removed = match ports.try_borrow_mut() {
+            Ok(mut registry) => registry.unname_port(name),
+            Err(_) => return Err(error::unsupported("the port table is already in use")),
+        };
+        Ok(removed)
     }
 
     fn registered(&mut self) -> Result<Vec<Atom>> {
-        Ok(self
+        let mut names: Vec<Atom> = self
             .table_mut()
             .registered()
             .map(|(name, _)| name)
-            .collect())
+            .collect();
+        let ports = Rc::clone(&self.ports);
+        let port_names = match ports.try_borrow() {
+            Ok(registry) => registry.port_names(),
+            Err(_) => return Err(error::unsupported("the port table is already in use")),
+        };
+        names.extend(port_names);
+        Ok(names)
     }
 
     fn is_process_alive(&mut self, pid: ProcessId) -> Result<bool> {
@@ -390,7 +425,7 @@ mod tests {
     //! unknown flag or a non-boolean `trap_exit` value raises `badarg`.
 
     use super::*;
-    use beam_term::make_small;
+    use beam_term::{make_small, NIL};
 
     /// A runtime with the root `init` process registered (the default runtime).
     fn runtime() -> Runtime {
@@ -450,27 +485,82 @@ mod tests {
         assert!(!bridge.unregister(name).unwrap());
     }
 
+    /// A live `{spawn_driver, "ram_file_drv"}` port opened on the runtime's **own** registry, so
+    /// the bridge sees exactly the port a program opened.
+    ///
+    /// The name/option terms are built on a scratch [`Heap`] (the `open_port/2` shape) and the
+    /// atoms it needs are interned in the runtime's shared table first — `open_port/2` resolves
+    /// them **by name**, so a missing atom would be `badarg`.
+    fn live_port(rt: &mut Runtime) -> PortId {
+        use beam_bifs::PortHook;
+        for name in ["spawn_driver", "ram_file_drv"] {
+            atom(rt, name);
+        }
+        let mut heap = Heap::new(64).expect("a scratch heap");
+        let driver = char_list(&mut heap, "ram_file_drv");
+        let tag = make_atom(rt.code_server.atoms().lookup("spawn_driver").expect("interned"));
+        let name = heap.tuple(&[tag, driver]).expect("a name tuple");
+        let owner = rt.self_pid();
+        let mut hook = crate::port::RuntimePorts::new(
+            Rc::clone(&rt.ports),
+            rt.code_server.atoms_handle(),
+            owner,
+        );
+        hook.open_port(name, NIL)
+            .expect("open_port({spawn_driver, \"ram_file_drv\"}, [])")
+    }
+
+    /// `text` as an Erlang char list on `heap` (a `String`-shaped `open_port/2` operand).
+    fn char_list(heap: &mut Heap, text: &str) -> Eterm {
+        let mut list = NIL;
+        for byte in text.bytes().rev() {
+            list = heap
+                .cons(make_small(i64::from(byte)), list)
+                .expect("a cons cell");
+        }
+        list
+    }
+
     #[test]
-    fn register_of_a_port_id_is_the_typed_capability_gap() {
+    fn a_port_registers_like_a_pid_and_leaves_the_registry_on_close() {
         let mut rt = runtime();
+        let port = live_port(&mut rt);
+        let closed = live_port(&mut rt);
+        rt.ports
+            .borrow_mut()
+            .close(closed)
+            .expect("the port closes");
         let name = atom(&mut rt, "zz_bridge_port_name");
+        let second = atom(&mut rt, "zz_bridge_port_name_2");
+        let dead_name = atom(&mut rt, "zz_bridge_dead_port_name");
+        let taken_by_process = atom(&mut rt, "init");
         let ports = Rc::clone(&rt.ports);
         let self_pid = rt.self_pid();
         let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
 
-        // The oracle's registry holds a port id as well as a pid; this runtime's holds pids
-        // only, so registering a port is the honest typed gap — never a fabricated
-        // `true`/`false` (see the module docs).
-        let error = bridge
-            .register(name, PortId::new(7).to_eterm())
-            .expect_err("a port id is not registrable");
-        assert!(
-            crate::error::unsupported_reason(&error).is_some(),
-            "expected a typed capability gap, got {error:?}"
-        );
-    }
-
-    #[test]
+        // Registering a live port succeeds, and `whereis/1` answers the **port term** (the
+        // oracle's `#Port<0.3>`), not a pid.
+        assert!(bridge.register(name, port.to_eterm()).unwrap());
+        assert_eq!(bridge.whereis(name).unwrap(), Some(port.to_eterm()));
+        // `registered/0` lists it alongside the process names.
+        assert!(bridge.registered().unwrap().contains(&name));
+        // A second name for the **same** port is the oracle's `badarg` (`false` here) ...
+        assert!(!bridge.register(second, port.to_eterm()).unwrap());
+        // ... as is a name a **process** already holds (`register(init, Port)`).
+        assert!(!bridge.register(taken_by_process, port.to_eterm()).unwrap());
+        // A **closed** port cannot be registered at all, and no name appears for it.
+        assert!(!bridge.register(dead_name, closed.to_eterm()).unwrap());
+        assert_eq!(bridge.whereis(dead_name).unwrap(), None);
+        // `unregister/1` removes the name — once.
+        assert!(bridge.unregister(name).unwrap());
+        assert_eq!(bridge.whereis(name).unwrap(), None);
+        assert!(!bridge.unregister(name).unwrap());
+        // A name a **port** holds is not a process name: registering it again and unregistering
+        // it goes through the port registry and leaves `registered/0` without it.
+        assert!(bridge.register(name, port.to_eterm()).unwrap());
+        assert!(bridge.unregister(name).unwrap());
+        assert!(!bridge.registered().unwrap().contains(&name));
+    }    #[test]
     fn registered_lists_the_root_init_name() {
         let mut rt = runtime();
         let init = atom(&mut rt, "init");

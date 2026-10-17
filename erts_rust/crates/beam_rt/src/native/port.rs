@@ -19,20 +19,21 @@
 // %CopyrightEnd%
 
 //! The port half of the runtime-native BIF floor: `erlang:port_command/2,3`,
-//! `erlang:port_control/3` and the closed-port half of `erlang:port_info/1,2`.
+//! `erlang:port_control/3`, `erlang:port_connect/2` and the closed-port / name half of
+//! `erlang:port_info/1,2`.
 //!
 //! `beam_bifs` owns the *roster* of port BIFs (`open_port/2`, `port_close/1`,
 //! `port_info/1,2`, `list_to_port/1`, `port_to_list/1` — see
 //! `../../beam_bifs/src/port.rs`) and reaches the port *machinery* through the
 //! [`PortHook`](beam_bifs::PortHook) seam, which [`crate::port::RuntimePorts`] implements.
-//! Three things do **not** fit that seam and are served here instead, ahead of the registry:
+//! Four things do **not** fit that seam and are served here instead, ahead of the registry:
 //!
 //! | Call | Why it is runtime-native |
 //! |---|---|
 //! | `erlang:port_command/2,3` | writing to the port's write stream is the port's *input* direction, which the `PortHook` seam has no method for — the runtime owns the write handle |
 //! | `erlang:port_control/3` | the driver's `control` callback, which the `PortHook` seam has no method for either (an `erlang.erl` wrapper over `erts_internal:port_control/3`) |
-//! | `erlang:port_info/1,2` | two answers a `PortHook` returning `{Item, Value}` pairs cannot express: `undefined` for a port the runtime does not hold, and the bare `[]` for a live, **unregistered** port's `registered_name` item |
-//!
+//! | `erlang:port_connect/2` | the owner transfer is a **table** operation (`crate::port::ops::connect`), and `erlang.erl`'s wrapper `port_connect(Port, Pid) -> erts_internal:port_connect(Port, Pid)` is un-enterable because `erlang` is a floor namespace — so the floor owns this spelling and the [`RuntimeHooks`](beam_bifs::RuntimeHooks) bridge the `erts_internal:` one |
+//! | `erlang:port_info/1,2` | answers a `PortHook` returning `{Item, Value}` pairs cannot express: `undefined` for a port the runtime does not hold **or for an atom naming no port**, the bare `[]` for a live, **unregistered** port's `registered_name` item, and — for a port named by an atom, which `beam_bifs` rejects before it resolves it — the `/2` pair and the `/1` list (whose **leading** pair is `{registered_name, Name}`) |//!
 //! # `port_command/2,3`
 //!
 //! `Data` is Erlang **iodata** (`binary() | iolist()`) — a binary, a char list, or a nested
@@ -73,28 +74,53 @@
 //! port the runtime does not hold (closed, or never opened), and non-iodata are
 //! [`BeamError::BadArg`] — the oracle's own reason.
 //!
+//! # `port_connect/2`
+//!
+//! The owner transfer moves the port's `connected` field to the target pid and **adds** a
+//! link rather than replacing the previous owner's (so `port_info(Port, links)` grows), and
+//! the body is [`crate::port::ops::connect`] — the very function the `RuntimeHooks` bridge's
+//! `erts_internal:port_connect/2` arm calls, so the transfer logic exists once. A
+//! non-port/non-name port argument, a name naming no port, a port the runtime does not hold,
+//! a non-pid target and a target with no live process are all the oracle's `error:badarg`
+//! (measured: `port_connect(Port, DeadPid)` ⇒ `badarg`).
+//!
 //! # `port_info/1,2`
 //!
-//! The floor claims exactly two answers that `beam_bifs`'s `{Item, Value}` pair list cannot
-//! express:
+//! The floor claims the answers that `beam_bifs`'s `{Item, Value}` pair list cannot express,
+//! all measured against OTP 29.1.1 / erts-17.1:
 //!
-//! * a port the runtime does **not** hold (closed, or never opened) is the atom
-//!   `undefined` — the oracle's answer for both arities, where `beam_bifs` would build `[]`
-//!   from the empty pair list for `/1` and `badarg` for `/2`;
+//! * a port the runtime does **not** hold (closed, or never opened) is the atom `undefined`
+//!   for both arities, where `beam_bifs` would build `[]` from the empty pair list for `/1`
+//!   and `badarg` for `/2`;
+//! * an **atom** is a *name*: a name that no port holds — including an atom naming a
+//!   *process* (`port_info(init)`) or an unknown atom — is `undefined` for both arities,
+//!   where `beam_bifs` would raise `badarg` for the atom;
+//! * a **non-port, non-atom** argument (a pid, an integer, …) is not claimed here at all:
+//!   `beam_bifs`'s `PortId` decode raises the oracle's `badarg` before any item is read;
 //! * the `/2` item `registered_name` on a **live** port is the bare **empty list** `[]` when
-//!   the port is unregistered — the oracle's own value (`erlang.erl` passes
-//!   `erts_internal:port_info/2`'s `[]` straight through), which a `{registered_name, _}`
-//!   pair cannot carry. `beam_rt` keeps no port registrations (`erlang:register/2` registers
-//!   pids only), so a live port is always unregistered here.
+//!   the port is unregistered (the oracle's own value, which a `{registered_name, _}` pair
+//!   cannot carry) and the pair `{registered_name, Name}` when it is;
+//! * `/2` of a **named** port with any other item answers that item's `{Item, Value}` pair,
+//!   found in the port's own pair list ([`PortHook::port_info`] — the one pair producer), or
+//!   `badarg` when the port has no such item;
+//! * `/1` of a **registered** port answers the whole list, *starting* with
+//!   `{registered_name, Name}` followed by the seven `/1` items — because `beam_bifs`'s
+//!   `PORT_INFO_1_ITEMS` filter would drop the prepended pair — and with **no** `monitors`
+//!   item. Measured:
+//!   `port_info(P)` ⇒ `[{registered_name,myp},{name,"ram_file_drv"},{links,[<0.10.0>]},
+//!   {id,24},{connected,<0.10.0>},{input,0},{output,0},{os_pid,undefined}]`.
 //!
-//! Everything else falls through to the registry unchanged: a **live** port's other items
-//! are `beam_bifs`'s own `port_info/1`/`port_info/2` (including its `badarg`-for-an-unknown-
-//! *item* rule and its `=:=` lookup), so no other item vocabulary is duplicated.
+//! Everything else falls through to the registry unchanged: a live **unregistered** port's
+//! items are `beam_bifs`'s own `port_info/1`/`port_info/2` (including its `badarg`-for-an-
+//! unknown-*item* rule and its `=:=` lookup), so no other item vocabulary is duplicated.
 
+use std::rc::Rc;
+
+use beam_bifs::PortHook;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_process::PortId;
-use beam_term::{is_small, make_small, signed_value, Eterm, NIL};
+use beam_process::{PortId, ProcessTable};
+use beam_term::{is_atom, is_small, make_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -116,12 +142,12 @@ struct CommandOptions {
 
 impl RuntimeContext<'_> {
     /// The single entry the [`try_native`](RuntimeContext::try_native) dispatch arm added
-    /// for the port surface calls: `erlang:port_command/2,3` and the native half of
-    /// `erlang:port_info/1,2`.
+    /// for the port surface calls: `erlang:port_command/2,3`, `erlang:port_connect/2` and the
+    /// native half of `erlang:port_info/1,2`.
     ///
-    /// Anything this floor does not claim — every other `(function, arity)` of the two
-    /// names — is `None`, i.e. "not a native BIF, fall through to the `beam_bifs`
-    /// registry", exactly as if the arm did not exist.
+    /// Anything this floor does not claim — every other `(function, arity)` of the names —
+    /// is `None`, i.e. "not a native BIF, fall through to the `beam_bifs` registry", exactly
+    /// as if the arm did not exist.
     pub(super) fn port_native(
         &mut self,
         function: &str,
@@ -132,11 +158,38 @@ impl RuntimeContext<'_> {
             ("port_command", 2) => Some(self.port_command(args, false)),
             ("port_command", 3) => Some(self.port_command(args, true)),
             ("port_control", 3) => Some(self.port_control(args)),
+            ("port_connect", 2) => Some(self.port_connect(args)),
             ("port_info", 1) | ("port_info", 2) => self.port_info_native(args),
             _ => None,
         }
     }
 
+    /// `erlang:port_connect(Port, Pid)`: hand the port to `Pid` and answer the atom `true`.
+    ///
+    /// `erlang.erl`'s wrapper is `port_connect(Port, Pid) -> erts_internal:port_connect(Port,
+    /// Pid)`, and since `erlang` is a [floor namespace](crate::native::FLOOR_MODULES) the
+    /// wrapper is un-enterable here — the floor serves this spelling and the
+    /// [`RuntimeHooks`](beam_bifs::RuntimeHooks) bridge the `erts_internal:` one. Both call
+    /// [`crate::port::ops::connect`], so the transfer exists once.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-port/non-name port argument, a name naming no port, a port the
+    /// runtime does not hold, a non-pid `Pid`, or a `Pid` with no live process (the oracle's
+    /// own answer: `port_connect(Port, DeadPid)` ⇒ `error:badarg`); the typed capability gap
+    /// when the port table is already borrowed.
+    fn port_connect(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let port = *args.first().ok_or(BeamError::BadArg)?;
+        let target = *args.get(1).ok_or(BeamError::BadArg)?;
+        let answer = self.atom("true")?;
+        let ports = Rc::clone(&self.runtime.ports);
+        // The target must be a live **local** process; the table is the caller-supplied one on
+        // a scheduler pass and the runtime's own otherwise (see
+        // [`RuntimeContext::process_table`]).
+        let table: &ProcessTable = self.process_table();
+        crate::port::ops::connect(&ports, table, port, target)?;
+        Ok(answer)
+    }
     /// `erlang:port_command(Port, Data[, Options])`: write `Data`'s bytes to the port's write
     /// stream and answer the atom `true` — or the atom `false`, or a raise, when the port's
     /// **busy state** intervenes.
@@ -363,34 +416,174 @@ impl RuntimeContext<'_> {
         terms::make_list(self, &elements)
     }
 
-    /// The native half of `erlang:port_info/1,2`: `undefined` for a port the runtime does
-    /// not hold, and the bare `[]` for a **live** port's `registered_name` item.
+    /// The native half of `erlang:port_info/1,2` — see the module docs for the measured rules.
     ///
-    /// `None` (fall through to `beam_bifs`) when the argument is not a port term at all (the
-    /// registry's own `badarg` is the oracle's answer there), and — for a **live** port —
-    /// for every item except `registered_name` (whose `{Item, Value}` pair list answers
-    /// them).
+    /// `None` (fall through to `beam_bifs`) when this floor has no answer that the registry's
+    /// `{Item, Value}` pair list cannot express: a **non-port, non-atom** argument (its own
+    /// `PortId` decode raises the oracle's `badarg`), a live **unregistered** port's `/1`
+    /// (the seven items are `beam_bifs`'s), and a live unregistered port's `/2` for every item
+    /// but `registered_name` (again `beam_bifs`'s own `=:=` search, `badarg` included).
     pub(super) fn port_info_native(&mut self, args: &[Eterm]) -> Option<Result<Eterm>> {
-        let port = args.first().copied().and_then(|term| PortId::from_eterm(term).ok())?;
-        let live = {
-            let registry = self.runtime.ports.try_borrow().ok()?;
-            registry.is_live(port)
+        let term = *args.first()?;
+        // Resolve the argument the C's way (`lookup_port`): an internal port term, or an
+        // **atom** naming a registered port. The `Rc` is cloned first, so the borrow below is
+        // of the clone and a nested borrow is a typed gap rather than a panic.
+        let ports = Rc::clone(&self.runtime.ports);
+        let resolved = {
+            let registry = match ports.try_borrow() {
+                Ok(registry) => registry,
+                Err(_) => {
+                    return Some(Err(error::unsupported("the port table is already in use")))
+                }
+            };
+            registry
+                .resolve_port(term)
+                .map(|id| (id, registry.is_live(id)))
+        };
+        let Some((port, live)) = resolved else {
+            // An atom is a *name*, and a name no port holds is `undefined` for **both**
+            // arities — including an atom that names a *process* (`port_info(init)`), whose
+            // registry entry this runtime's port table does not have. Anything else (a pid, an
+            // integer, …) is `beam_bifs`'s `badarg`.
+            return if is_atom(term) {
+                Some(self.atom("undefined"))
+            } else {
+                None
+            };
         };
         if !live {
             // A closed/unknown port is `undefined` for **both** arities, whatever the item.
             return Some(self.atom("undefined"));
         }
-        // A **live** port: the floor owns exactly the `registered_name` item. `beam_rt` keeps
-        // no port registrations (`erlang:register/2` registers pids only), so the port is
-        // unregistered and the oracle's answer is the bare empty list `[]` — deliberately
-        // **not** a `{registered_name, _}` pair, which is what `beam_bifs`'s pair search
-        // would build. Every other item falls through unchanged.
-        if args.len() == 2 && self.atom_name(args[1]).as_deref() == Some("registered_name") {
-            return Some(Ok(NIL));
+        if args.len() == 1 {
+            // Only a **registered** port's `/1` needs this floor (it prepends
+            // `{registered_name, Name}`); an unregistered one is `beam_bifs`'s seven items.
+            return match self.port_is_named(port) {
+                Ok(true) => Some(self.port_info_all(port)),
+                Ok(false) => None,
+                Err(reason) => Some(Err(reason)),
+            };
+        }
+        let item = args[1];
+        if self.atom_name(item).as_deref() == Some("registered_name") {
+            return Some(self.port_info_registered_name(port));
+        }
+        // Every other item of a port the caller named by **atom**: `beam_bifs` rejects the atom
+        // before it resolves it, so the pair search has to happen here.
+        if is_atom(term) {
+            return Some(self.port_info_item(port, item));
         }
         None
     }
 
+    /// Whether the live port `port` holds a registered name.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap when the port table is already borrowed.
+    fn port_is_named(&self, port: PortId) -> Result<bool> {
+        let ports = Rc::clone(&self.runtime.ports);
+        let named = match ports.try_borrow() {
+            Ok(registry) => registry.port_name(port).is_some(),
+            Err(_) => return Err(error::unsupported("the port table is already in use")),
+        };
+        Ok(named)
+    }
+
+    /// The port's own `{Item, Value}` pair list, from the **one** pair producer,
+    /// [`PortHook::port_info`] over [`crate::port::RuntimePorts`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates the hook's errors (the typed capability gap for a nested borrow, and the
+    /// arena's failure while it builds a value).
+    fn port_info_pairs(&mut self, port: PortId) -> Result<Vec<(Eterm, Eterm)>> {
+        let mut hook = crate::port::RuntimePorts::new(
+            Rc::clone(&self.runtime.ports),
+            self.runtime.code_server.atoms_handle(),
+            self.pid(),
+        );
+        hook.port_info(port)
+    }
+
+    /// The `/2` `registered_name` answer of the live port `port`: the pair
+    /// `{registered_name, Name}` when it is registered, the bare empty list `[]` when it is
+    /// not (the oracle's own value — `erlang.erl` passes `erts_internal:port_info/2`'s `[]`
+    /// straight through, which a `{registered_name, _}` pair cannot carry).
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap when the port table is already borrowed, and the heap's
+    /// failure while the pair is built.
+    fn port_info_registered_name(&mut self, port: PortId) -> Result<Eterm> {
+        let name = {
+            let ports = Rc::clone(&self.runtime.ports);
+            let held = match ports.try_borrow() {
+                Ok(registry) => registry.port_name(port),
+                Err(_) => return Err(error::unsupported("the port table is already in use")),
+            };
+            held
+        };
+        let Some(name) = name else {
+            return Ok(NIL);
+        };
+        let item = self.atom("registered_name")?;
+        terms::make_tuple(self, &[item, beam_term::make_atom(name)])
+    }
+
+    /// The `/1` answer of the live **registered** port `port`: the whole item list, **starting**
+    /// with `{registered_name, Name}` and with no `monitors` item.
+    ///
+    /// The prefix is load-bearing: `beam_bifs`'s `port_info/1` keeps only its seven
+    /// `/1` items, so a prepended `registered_name` pair would be filtered away there — and the
+    /// `monitors` pair is the `/2`-only item, which the oracle's `/1` never reports.
+    ///
+    /// # Errors
+    ///
+    /// As for [`RuntimeContext::port_info_pairs`].
+    fn port_info_all(&mut self, port: PortId) -> Result<Eterm> {
+        let registered = self.port_info_registered_name(port)?;
+        let pairs = self.port_info_pairs(port)?;
+        let mut listed = Vec::with_capacity(pairs.len());
+        // The oracle's leading pair, built by the `registered_name` arm above (so it is the
+        // very pair object the `/2` answer produces, never a second spelling of it).
+        listed.push(registered);
+        for (key, value) in pairs {
+            // `monitors` is `/2`-only, and `registered_name` was already prepended (moving it
+            // from the pair list's tail to the front is the oracle's order).
+            let skip = matches!(
+                self.atom_name(key).as_deref(),
+                Some("monitors" | "registered_name")
+            );
+            if skip {
+                continue;
+            }
+            listed.push(terms::make_tuple(self, &[key, value])?);
+        }
+        terms::make_list(self, &listed)
+    }
+
+    /// The `/2` `{Item, Value}` pair of the live port `port` for an item the caller spelled a
+    /// **registered name** for: the pair found in the port's own list by `=:=`, else the
+    /// oracle's `badarg`.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for an item the port does not report (the oracle's own answer); as
+    /// [`RuntimeContext::port_info_pairs`] for the rest.
+    fn port_info_item(&mut self, port: PortId, item: Eterm) -> Result<Eterm> {
+        let pairs = self.port_info_pairs(port)?;
+        let found = {
+            let atoms = self.runtime.code_server.atoms();
+            pairs
+                .into_iter()
+                .find(|(key, _)| beam_term::compare::eq(*key, item, atoms))
+        };
+        let Some((key, value)) = found else {
+            return Err(BeamError::BadArg);
+        };
+        terms::make_tuple(self, &[key, value])
+    }
     /// Collects `term` as Erlang **iodata** into `out`: a binary, or a (possibly nested)
     /// list of byte-sized integers/binaries.
     ///
@@ -956,12 +1149,11 @@ mod tests {
         assert!(context.port_info_native(&[make_small(1)]).is_none());
     }
 
-    /// A **live** port's `registered_name` item is the bare empty list `[]` — the oracle's
-    /// value for an unregistered port (`erlang.erl` passes `erts_internal:port_info/2`'s `[]`
-    /// through unchanged). `beam_rt` keeps no port registrations, so a live port is always
-    /// unregistered here; every other item falls through to `beam_bifs`.
+    /// A **live, unregistered** port's `registered_name` item is the bare empty list `[]` — the
+    /// oracle's value (`erlang.erl` passes `erts_internal:port_info/2`'s `[]` through
+    /// unchanged) — and every other item falls through to `beam_bifs`.
     #[test]
-    fn port_info_registered_name_on_a_live_port_is_the_empty_list() {
+    fn port_info_registered_name_on_an_unregistered_live_port_is_the_empty_list() {
         let mut runtime = runtime();
         let port = live_port(&mut runtime);
         let registered_name = atom(&mut runtime, "registered_name");
@@ -978,7 +1170,165 @@ mod tests {
         assert!(context.port_info_native(&[port.to_eterm()]).is_none());
     }
 
+    /// The `/1` of a **registered** port starts with `{registered_name, Name}`, carries the
+    /// seven `/1` items and has **no** `monitors` pair — the oracle's measured answer
+    /// (`[{registered_name,myp},{name,"ram_file_drv"},{links,[…]},{id,24},…,{os_pid,undefined}]`)
+    /// — and `/2` answers the port's own pairs for every item, `badarg` for one it lacks.
     #[test]
+    fn port_info_of_a_registered_port_leads_with_registered_name_and_covers_every_item() {
+        let mut runtime = runtime();
+        let port = live_port(&mut runtime);
+        let name_atom = |runtime: &mut Runtime, name: &str| -> Eterm {
+            beam_term::make_atom(runtime.code_server_atoms_mut().intern(name))
+        };
+        let myp = name_atom(&mut runtime, "zz_native_registered_port");
+        let registered_name = name_atom(&mut runtime, "registered_name");
+        let name = name_atom(&mut runtime, "name");
+        let monitors = name_atom(&mut runtime, "monitors");
+        let input = name_atom(&mut runtime, "input");
+        let bogus = name_atom(&mut runtime, "zz_native_no_such_port_item");
+        assert!(
+            runtime.ports.borrow_mut().name_port(beam_term::atom_val(myp), port),
+            "the live port takes the name"
+        );
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+
+        // `/1`: the leading pair is the registration, the seven items follow, `monitors` is
+        // absent (it is the `/2`-only item).
+        let all = context
+            .port_info_native(&[port.to_eterm()])
+            .expect("a registered port's /1 is claimed")
+            .expect("the item list");
+        let items = terms::list_elements(all).expect("a proper list");
+        assert_eq!(items.len(), 8, "one leading pair + the seven /1 items");
+        let first = items[0];
+        assert_eq!(terms::tuple_element(first, 0).expect("a pair"), registered_name);
+        assert_eq!(terms::tuple_element(first, 1).expect("a pair"), myp);
+        assert!(!items
+            .iter()
+            .any(|item| terms::tuple_element(*item, 0).ok() == Some(monitors)));
+
+        // `/2` for the very same item on the **port term** is the pair.
+        let pair = context
+            .port_info_native(&[port.to_eterm(), registered_name])
+            .expect("claimed")
+            .expect("the pair");
+        assert_eq!(terms::tuple_element(pair, 1).expect("a pair"), myp);
+
+        // `/2` spelled with the **name atom**: another item's pair comes from the port's own
+        // list, an item the port does not report is `badarg`.
+        let pair = context
+            .port_info_native(&[myp, name])
+            .expect("a named port's /2 is claimed")
+            .expect("the name pair");
+        assert_eq!(terms::tuple_element(pair, 0).expect("a pair"), name);
+        let pair = context
+            .port_info_native(&[myp, input])
+            .expect("claimed")
+            .expect("the input pair");
+        assert_eq!(terms::tuple_element(pair, 0).expect("a pair"), input);
+        assert!(matches!(
+            context.port_info_native(&[myp, bogus]).expect("claimed"),
+            Err(BeamError::BadArg)
+        ));
+        // `/1` spelled with the name atom is the same list (compared structurally: the two
+        // calls build their own terms, so word identity is not the measure).
+        let by_name = context
+            .port_info_native(&[myp])
+            .expect("a named port's /1 is claimed")
+            .expect("the item list");
+        let named_items = terms::list_elements(by_name).expect("a proper list");
+        assert_eq!(named_items.len(), items.len());
+        assert_eq!(
+            terms::tuple_element(named_items[0], 0).expect("a pair"),
+            registered_name
+        );
+    }
+
+    /// An **atom** argument is a *name*: a name no port holds is `undefined` for both arities,
+    /// whether it names a process (`init`) or nothing at all — the oracle's own answer, where
+    /// `beam_bifs` would raise `badarg` for the atom.
+    #[test]
+    fn port_info_of_a_name_no_port_holds_is_undefined() {
+        let mut runtime = runtime();
+        let absent = atom(&mut runtime, "zz_native_absent_port_name");
+        let init = atom(&mut runtime, "init");
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+        for name in [absent, init] {
+            for arity in [1usize, 2] {
+                let mut args = vec![name];
+                if arity == 2 {
+                    args.push(name);
+                }
+                let answer = context
+                    .port_info_native(&args)
+                    .unwrap_or_else(|| panic!("port_info/{arity} must claim a name"))
+                    .expect("the atom undefined");
+                assert_eq!(context.atom_name(answer).as_deref(), Some("undefined"));
+            }
+        }
+    }
+
+    /// `erlang:port_connect/2` hands the port to a live process: `true`, the owner moves, the
+    /// link set grows, and every failure the oracle rejects is `badarg`.
+    #[test]
+    fn port_connect_moves_the_owner_and_rejects_what_the_oracle_rejects() {
+        let mut runtime = runtime();
+        let port = live_port(&mut runtime);
+        let owner = runtime.self_pid();
+        let port_term = port.to_eterm();
+        let unknown = PortId::new(4242).to_eterm();
+        let dead = beam_process::ProcessId::new(999_999, 0).to_eterm();
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+        // A non-port and an unknown port are `badarg`; so is a non-pid target and a pid the
+        // table does not hold.
+        for (label, args) in [
+            ("a pid port argument", vec![owner.to_eterm(), owner.to_eterm()]),
+            ("an integer port argument", vec![make_small(7), owner.to_eterm()]),
+            ("an unknown port", vec![unknown, owner.to_eterm()]),
+            ("a non-pid target", vec![port_term, make_small(1)]),
+            ("a pid the table does not hold", vec![port_term, dead]),
+        ] {
+            match context.port_connect(&args) {
+                Err(BeamError::BadArg) => {}
+                Err(other) => panic!("{label} must be badarg, got {other}"),
+                Ok(_) => panic!("{label} must not be accepted"),
+            }
+        }
+        // The real connect answers `true`; the port's own pair list then reports the new owner
+        // as `connected` and both pids as `links`.
+        let answer = context
+            .port_connect(&[port_term, owner.to_eterm()])
+            .expect("a live pid target");
+        assert_eq!(context.atom_name(answer).as_deref(), Some("true"));
+        let pairs = context
+            .port_info_pairs(port)
+            .expect("the port's pair list");
+        let wanted = |context: &mut RuntimeContext<'_>, item: &str| -> Eterm {
+            context.atom(item).expect("an interned item atom")
+        };
+        let connected = wanted(&mut context, "connected");
+        let links = wanted(&mut context, "links");
+        let value = |pairs: &[(Eterm, Eterm)], key: Eterm| -> Eterm {
+            pairs
+                .iter()
+                .find(|(item, _)| *item == key)
+                .map(|(_, value)| *value)
+                .expect("the item is reported")
+        };
+        assert_eq!(
+            value(&pairs, connected),
+            owner.to_eterm(),
+            "the owner moved to the connecting process"
+        );
+        // `open_port/2`'s own link comes first; a connect to the same pid adds nothing, so the
+        // set is still the single owner.
+        let linked = terms::list_elements(value(&pairs, links)).expect("a pid list");
+        assert_eq!(linked, vec![owner.to_eterm()]);
+    }    #[test]
     fn port_native_claims_only_the_command_and_closed_info_pairs() {
         let mut runtime = runtime();
         let mut sink = NullSink;

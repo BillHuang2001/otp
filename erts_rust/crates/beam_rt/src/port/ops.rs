@@ -44,8 +44,8 @@
 //! registered name are both established *later*, may be replaced, and (the name) must be
 //! dropped when the port dies. They are lifecycle-free presentation state, so they live in
 //! one [`PortExtras`] side table keyed by port number and are drained by
-//! [`PortRegistry::forget_port`] from [`PortRegistry::close`] — the single place a port
-//! leaves the runtime.
+//! [`PortExtras::forget_port`] from [`PortRegistry::close`](super::PortRegistry) — the single
+//! place a port leaves the runtime.
 //!
 //! # Reference shapes (oracle, OTP 29.1.1 / erts-17.1)
 //!
@@ -83,7 +83,7 @@ use super::PortRegistry;
 ///
 /// Keyed by **port number** (the same key [`PortRegistry::meta`](super::PortRegistry) uses),
 /// so a lookup is one hash probe. Every map is drained by
-/// [`PortRegistry::forget_port`] when the port closes, so a reused port number (the id space
+/// [`PortExtras::forget_port`] when the port closes, so a reused port number (the id space
 /// really is reused by `beam_io`'s registry) never inherits a dead port's name or data.
 ///
 /// `Default` is the empty state — a registry with no port has nothing to forget.
@@ -300,21 +300,9 @@ impl PortRegistry {
         meta.owner = to;
         Ok(())
     }
+}
 
-    // -- lifecycle -------------------------------------------------------------
-
-    /// Drops the state `port_set_data/2`, `register/2` and `port_connect/2` established for
-    /// port `number`.
-    ///
-    /// Forwards to [`PortExtras::forget_port`] — the state lives in [`PortExtras`], so the
-    /// drain is defined where the fields are. [`PortRegistry::close`](super::PortRegistry)
-    /// calls the `PortExtras` form directly; this registry-level form exists for a caller that
-    /// holds the registry rather than its `extras` (the unit suite's own teardown checks).
-    #[cfg(test)]
-    pub(crate) fn forget_port(&mut self, number: u64) {
-        self.extras.forget_port(number);
-    }
-}/// `erlang:port_connect/2`'s whole body, shared by its two entry points.
+/// `erlang:port_connect/2`'s whole body, shared by its two entry points.
 ///
 /// The `erlang:` spelling is the `erlang.erl` wrapper `port_connect(Port, Pid) ->
 /// erts_internal:port_connect(Port, Pid)` (`erts/preloaded/src/erlang.erl:12126-12133`), and

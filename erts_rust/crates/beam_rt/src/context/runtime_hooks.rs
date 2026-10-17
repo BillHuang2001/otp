@@ -37,6 +37,8 @@
 //! | `erlang:cancel_timer/2` | [`crate::timers`] — the `/1` answers under the option list |
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer)'s loaded exports + the **emulator builtins** (the declared `bif.tab` surface plus the `erlang`-namespace registry extras) |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set — a **local** pid through [`ProcessTable::link`]/`unlink`, a **remote** pid through [`ProcessTable::link_term`]/`unlink_term` (the remote-link set + the wire `DOP_LINK`/`DOP_UNLINK_ID`) |
+//! | `erlang:port_set_data/2`, `erlang:port_get_data/1` | [`PortRegistry`](crate::port::PortRegistry)'s opaque per-port data term (`prt->data`) |
+//! | `erts_internal:port_connect/2` | [`crate::port::ops::connect`] — the owner transfer, shared with the floor's `erlang:port_connect/2` spelling |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
 //! | `erlang:statistics/1` | `run_queue`; `run_queues`/`run_queue_lengths`/`run_queue_lengths_all`/`total_run_queue_lengths`/`total_run_queue_lengths_all` (the runtime's **one** real run queue, `beam_process`'s `Scheduler`); `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `garbage_collection` (the runtime's own node-global cumulative collection counters); `scheduler_wall_time`/`scheduler_wall_time_all` (`undefined` — the switch is recorded but no per-scheduler wall time is sampled) |
 //! | `erts_internal:scheduler_wall_time/1` | the node-global sampling switch: any non-`true` argument disables, `true` enables, and the **previous** state is answered as `true`/`false` (the C's `atomic_xchg`, `bif.c:5357-5366`) |
@@ -1254,6 +1256,13 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             ("net_kernel", "dflag_unicode_io", 1) => self.dflag_unicode_io(atoms, args),
             ("erlang", "link", 1) => self.link(args, false),
             ("erlang", "unlink", 1) => self.link(args, true),
+            // The port table's own operations: the opaque data term and the owner transfer.
+            // `erlang:port_connect/2`'s wrapper is un-enterable (`erlang` is a floor
+            // namespace), so the floor serves that spelling and this arm the `erts_internal:`
+            // one; both reach the same `crate::port::ops::connect`.
+            ("erlang", "port_set_data", 2) => self.port_set_data(atoms, args),
+            ("erlang", "port_get_data", 1) => self.port_get_data(atoms, args),
+            ("erts_internal", "port_connect", 2) => self.port_connect_2(atoms, args),
             ("erlang", "dt_spread_tag", 1) => self.dt_spread_tag(atoms, args),
             ("erlang", "dt_restore_tag", 1) => self.dt_restore_tag(atoms, args),
             ("erlang", "statistics", 1) => self.statistics(heap, atoms, args),

@@ -544,8 +544,9 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     // `bif.tab` entry.
     ("set_cookie", 2),
     ("disconnect_node", 1),
-    // Ports: declared as `erts_internal:port_*`.
-    ("port_connect", 2),
+    // Ports: declared as `erts_internal:port_*`. `port_connect/2` is **not** here: the
+    // native floor serves the `erlang:` spelling (`src/native/port.rs`) and the
+    // `RuntimeHooks` bridge the `erts_internal:` one.
     ("port_call", 3),
     // Spawning on a remote node: the whole `spawn_request` family is exported by the
     // oracle, and no arity of it carries an `erlang`-module `bif.tab` entry (the
