@@ -27,7 +27,7 @@ never touched from here.
 - Every `.rs` carries the OTP Apache-2.0 `// %CopyrightBegin% … // %CopyrightEnd%` header block;
   files target ~1000 lines. Sixteen suites are above that target, each one cohesive harness rather
   than a mix of subjects (splitting any of them is a parity-neutral refactor): `jit_cranelift.rs`
-  (4118), `opcodes.rs` (2761), `jit.rs` (2688), `exceptions.rs` (1523), `engine_bench.rs` (1482),
+  (4298), `opcodes.rs` (2761), `jit.rs` (2701), `exceptions.rs` (1523), `engine_bench.rs` (1482),
   `jit_cranelift_real.rs` (1423), `call_ext_apply.rs` (1333), `jit_compare.rs` (1319), `census.rs`
   (1219), `bitstrings_extra_big.rs` (1204), `records.rs` (1191), `raise_rooting.rs` (1098),
   `trace.rs` (1079), `stdlib_text.rs` (1016), `jit_linking.rs` (1009), `stdlib_exports_more.rs`
