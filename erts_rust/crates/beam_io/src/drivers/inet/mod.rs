@@ -506,7 +506,7 @@ impl TcpInetDriver {
             pending_input: Vec::new(),
             stream: true,
             family: u16::from(INET_AF_INET),
-            stype: super::sys::socket_type(fd)?,
+            stype: sys::socket_type(fd)?,
         })
     }
 
@@ -1448,7 +1448,7 @@ impl TcpInetDriver {
                     return Ok(ctl_xerror("einval"));
                 }
                 let mut reply = ctl_ok();
-                reply.extend_from_slice(&super::sys::hostname()?);
+                reply.extend_from_slice(&sys::hostname()?);
                 Ok(reply)
             }
             // `INET_REQ_FDOPEN` (`:12003`): the length/family/type refusals are exact; adopting a
