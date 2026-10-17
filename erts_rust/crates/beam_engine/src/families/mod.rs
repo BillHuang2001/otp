@@ -129,7 +129,8 @@ pub(crate) fn dispatch(
     // name would select its catch frame and then abandon it with a typed
     // `unsupported` instead of landing (C reads its class atoms from globals).
     machine.ensure_class_atoms(ctx, module);
-    let claimed = match instr {        // tuples
+    let claimed = match instr {
+        // tuples
         Instr::PutTuple2 { .. }
         | Instr::GetTupleElement { .. }
         | Instr::SetTupleElement { .. }

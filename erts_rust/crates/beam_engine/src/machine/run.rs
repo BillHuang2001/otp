@@ -663,7 +663,8 @@ mod tests {
     }
 
     #[test]
-    fn resume_outcome_does_not_reset_the_suspended_machine() {        // A resumed machine keeps the x-registers written before the suspension:
+    fn resume_outcome_does_not_reset_the_suspended_machine() {
+        // A resumed machine keeps the x-registers written before the suspension:
         // `resume_outcome` must not reset (a reset would also drop the bottom frame
         // the trailing `return` needs).
         let (module, name) = receive_module();

@@ -407,7 +407,8 @@ impl Machine {
         error: BeamError,
         head: Option<Eterm>,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Step> {        // A `None` head leaves every path byte-identical to the pre-head funnel: the
+    ) -> Result<Step> {
+        // A `None` head leaves every path byte-identical to the pre-head funnel: the
         // raw trace stays `NIL` and the latch is never armed.
         let has_head = head.is_some();
         let trace = head.unwrap_or(NIL);
