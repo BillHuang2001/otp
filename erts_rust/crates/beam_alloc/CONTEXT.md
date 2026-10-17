@@ -349,10 +349,11 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - **A payload carries reservation + capacity, and growth is amortised.** Spare capacity is what makes
   repeated appends amortised instead of O(n²), and it can only live in allocator space: the frozen
   `[BinRef][ErlSubBits]` pair records a payload *pointer* and a *logical bit window*, never a capacity,
-  so `beam_term::size::size_object` and every term-copy path are untouched by a growth (a `No
-  capacity-aware sizing walk is needed anywhere` consequence, and the reason `beam_term`/
-  `beam_message`'s `size_object_bounded` handoff is **not** this crate's concern).
-- **Growth is stock-and-sell by address**: growing inside the reservation only raises a header word, so
+  so `beam_term::size::size_object` and every term-copy path are untouched by a growth. (Corollary: no
+  *capacity-aware* sizing walk is needed anywhere — so the `size_object_bounded` handoff from
+  `beam_message`/`beam_term` is **not** this crate's concern; its owner is `beam_message`, which should
+  delegate its private bounded walk to `beam_term::size::size_object_bounded`.)
+- **Growth is address-stable by default**: growing inside the reservation only raises a header word, so
   `data_ptr()` — and therefore every `BinRef.val` word and every GC copy of one — stays valid. Only a
   reservation-exhausting move reallocates, and it *reports* itself (`GrowOutcome::Moved(Relocation)`),
   because a payload that moved silently would leave dangling pointer words in terms this crate cannot
