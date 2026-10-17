@@ -153,7 +153,8 @@ Verified against the system `erlc` (OTP 29) disassembly:
   for an impossible post-reserve state.
 
 ## Handoff (parent-owned) REMOVE_ME
-- `../../../tests/gaps.rs` still asserts the two read instructions' `no_fail` cases against the **old**
+- `../../../tests/gaps.rs` pins the two read instructions' `no_fail` cases to
+  `maps: no 'function_clause' atom in the module` (`:272`, `:300`).
   engine-defined sentinel errors, which the read path no longer raises — it now raises the bare atom
   `function_clause` (class `error`). The unseeded fixture therefore surfaces the missing-atom gap, so
   the two expected strings must become `maps: no 'function_clause' atom in the module` (the module in
