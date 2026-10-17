@@ -537,8 +537,8 @@ mod tests {
         let step = dispatch_with(&Instr::IfEnd, &module, &mut machine, &mut ctx)
             .expect("the class atom comes from the engine's live namespace");
         assert_eq!(step, Step::Goto { func: 4, pc: 6 });
-        assert_eq!(machine.x(1), Some(make_atom(module.atom_table.lookup("if_clause").unwrap())));
-        assert_eq!(machine.x(3), Some(make_atom(error)));
+        assert_eq!(machine.x(1), Some(beam_term::make_atom(module.atom_table.lookup("if_clause").unwrap())));
+        assert_eq!(machine.x(3), Some(beam_term::make_atom(error)));
     }
 
     #[test]
