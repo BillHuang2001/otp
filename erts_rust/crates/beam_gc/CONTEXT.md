@@ -554,7 +554,9 @@ the section to read them in.
   `alloc_words_rooted`'s grow-and-retry (`context/gc.rs:1366-1373`) returns before its `process.collect()`
   (`:1472`), and the un-rooted `alloc_words` (`:1196-1235`) has no collect branch at all — so such a loop retires
   space after space with `minor_gcs == 0` and `statistics(garbage_collection) == {0,0,0}` while the chain-summed
-  `heap_size` climbs **linearly** in N.
+  `heap_size` climbs in N (geometrically under the doubling rule), stopped only by the policy's `max_heap_words`
+  chain budget — which now refuses with the typed `heap_exhausted` (`error:system_limit` at the runtime) instead of
+  appending another space; an unbounded policy (`max_heap_words == 0`) has no such stop.
   `ensure_capacity` is the only method that collects *unconditionally* (no occupancy test,
   `src/collector.rs:321-334`), and an explicit `erlang:garbage_collect()` is honoured before the bump on both seams
   (`:1332`, `:1457`), so a `heap_size` that collapses after it distinguishes "no door reached" from a valve
