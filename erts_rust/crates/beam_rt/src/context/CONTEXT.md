@@ -4,7 +4,7 @@
 The concrete `beam_engine::ExecutionContext` the runtime installs: it adapts the engine's seam types onto the real `beam_bifs` registry, the `beam_alloc` heap and the `beam_process` process/port tables, and installs **every** optional `beam_bifs` host seam.
 It owns the BIF dispatch order (`try_call_nif` → `try_native` → dispatch memo → `call_registered` → external-module load), the nine bridge arms, the dispatch memo (`dispatch` + `DispatchHooks`), the atom-interner discipline (`PendingInterner`), caller-module tracking, the **lent-`TableRegistry` propagation into a nested fun application**, the **in-machine execution-position door** (`position.rs`) and the node's real `LOCAL_EXT` hash (`node_hash.rs`).
 The nine `beam_engine::Mailbox` seam methods live in [`../mailbox.rs`](../mailbox.rs); the scheduler/runner that drives this glue in [`../runtime/`](../runtime/CONTEXT.md).
-Mechanics-level companion: [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — the dispatch memo, the pooled BIF-heap frontier, `PendingInterner`, the runtime-hooks served/closable rosters, the truthful fixed answers, the per-call cost breakdowns, the two-phase valve and the nested-pump bounds.
+Mechanics-level companion: [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — the dispatch memo, the pooled BIF-heap frontier, the table-less arm's store, `PendingInterner`, the runtime-hooks served/closable rosters, the truthful fixed answers, the per-call cost breakdowns, the two-phase valve and the nested-pump bounds.
 
 ## API Surface
 ### `context/` — the concrete `ExecutionContext` (the glue)
