@@ -1953,3 +1953,11 @@ mod tests {
         );
     }
 }
+
+/// One port-task round's write-path outcome — the built-in driver's reply bytes reaching the
+/// owner as one [`PortNotification::Data`](crate::PortNotification), and a refusing driver's
+/// error surfacing out of the round — lives in this sibling file so neither of the two long
+/// sources (`registry.rs`, `port.rs`) grows a second undeclared suite.
+#[cfg(test)]
+#[path = "registry_reply_tests.rs"]
+mod reply_tests;

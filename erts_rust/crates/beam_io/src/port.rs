@@ -238,6 +238,27 @@ impl Port {
     /// The driver's byte count is checked against the queue through
     /// [`Port::check_write_accounting`] — see that method for the contract.
     ///
+    /// # A refused command
+    ///
+    /// A driver reports a refusal as an **error**, and that error short-circuits
+    /// `check_write_accounting`: the reported byte count is never inspected, `data` stays in
+    /// the output queue (**not** counted as written) and no [`PortTaskKind::Output`] task is
+    /// scheduled for the remainder.
+    ///
+    /// That is deliberate, and it is where this layer's grammar differs from the C's. The C
+    /// cannot express a refused command for a loaded driver at all: `drv->output`/`outputv`
+    /// are `void`, so the emulator counts the whole command as written
+    /// (`prt->bytes_out += size`) and frees it unconditionally (`call_driver_output`,
+    /// `erts/emulator/beam/io.c:1517,1520`; the free is `port_sig_output`'s
+    /// `cleanup_scheduled_output`, `:1571`). Here the write path is queue-then-drive
+    /// ([`Port::queue_output`] queues, the driver is asked to drain), so a refusal necessarily
+    /// leaves the command in the queue as a Rust-side artefact. A caller that sees the error
+    /// must therefore treat the command as **refused** — raise it, as the oracle does for
+    /// `port_command/2` on a socket-less `tcp_inet`/`udp_inet` port — and must not re-drive the
+    /// port: no task retries the bytes, and they disappear with the port (a
+    /// [`crate::PortRegistry::close`] drops it, and both queues with it). There is deliberately
+    /// no "discard the remainder" seam on this path.
+    ///
     /// # Errors
     ///
     /// Returns whatever the driver's `output` returns, or the typed accounting diagnostic when
@@ -540,6 +561,14 @@ impl Port {
     /// [`Port::refresh_timeout`]) and the driver's byte count is checked against the output
     /// queue (see [`Port::check_write_accounting`]).
     ///
+    /// A driver that **refuses** the write returns its error, which propagates from here with
+    /// the accounting check short-circuited and the queued bytes left in the output queue (see
+    /// [`Port::output`]'s *A refused command* section). This is the callback an
+    /// [`PortTaskKind::Output`] task runs, so the refusal then surfaces out of the whole
+    /// port-task round ([`crate::PortRegistry::execute_port_tasks`]) rather than as a
+    /// [port-task outcome](crate::PortTaskOutcome): the task was already popped, so it is **not**
+    /// re-queued and the refused command is never retried implicitly.
+    ///
     /// # Errors
     ///
     /// Returns whatever the driver's `ready_output` returns, or the typed accounting diagnostic
@@ -578,6 +607,16 @@ impl Port {
     /// than reported, or pushing more onto the queue are all the same mismatch. The diagnostic
     /// is typed (never a panic and never a silently truncated write), because only a driver
     /// implementation can produce it.
+    ///
+    /// # A driver error short-circuits the check
+    ///
+    /// The driver's outcome is unwrapped **first** (`let reported = result?`), so a driver that
+    /// answers `Err` has its byte count discarded without being compared to the queue: a
+    /// **refused** write is propagated verbatim and the command's bytes stay in the output
+    /// queue, never counted as written ([`Port::output`] and [`Port::ready_output`] both go
+    /// through here, the latter also being the one [`PortTaskKind::Output`] runs — see
+    /// [`Port::output`]'s *A refused command* section for why the remainder is deliberately
+    /// left queued). Only a driver that claims **success** is held to the accounting contract.
     ///
     /// # Errors
     ///
