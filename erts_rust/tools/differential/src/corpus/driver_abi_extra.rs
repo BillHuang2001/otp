@@ -101,7 +101,9 @@
 //! The **built-in-driver** cases use [`DRIVER_BUILTIN_MODULE_SOURCE`], which opens a driver port by
 //! a name the emulator itself owns; they carry no C fixture (`nif: None`), so they need no C
 //! compiler. Its `probe/1` encodes the open/name-resolution shape and its `info/1` encodes one
-//! `port_info/1,2` / `ports/0` observation of a live `tcp_inet` port.
+//! `port_info/1,2` / `ports/0` observation of a live `tcp_inet` port. The other two names both
+//! runtimes resolve (`udp_inet`, `ram_file_drv`) are pinned by the sibling groups [`super::udp`]
+//! and [`super::ram_file`], not here.
 //!
 //! # The observable (honest, never asserted module-side)
 //!
@@ -183,14 +185,20 @@
 //!   the driver's own `ErlDrvData`, i.e. a pointer), while the Rust hook keeps the `DriverHost`
 //!   trait default, so the call answers `0`. A fabricated key is not *the* key, so no value is
 //!   pinnable even once the hook exists. Owner: `beam_rt` (`DriverHost::async_port_key`).
-//! * **the built-in drivers other than `tcp_inet`** — the oracle's `open_port/2` resolves *any* of
-//!   its statically linked drivers, so `{spawn_driver, "udp_inet"}` and `{spawn_driver,
-//!   "ram_file_drv"}` open live ports (measured: `erlang:port_info(P, name)` answers
-//!   `{name,"udp_inet"}` / `{name,"ram_file_drv"}`), while the Rust runtime's built-in registry
-//!   carries only `tcp_inet` and raises `badarg` for the other two — a divergence, so those two
-//!   names are **not** pinned here. `erl_ddll:loaded_drivers/0` diverges too: the oracle answers
-//!   `{ok,["tcp_inet","udp_inet","ram_file_drv"]}` and the Rust runtime `{ok,[]}`, so no
-//!   loaded-driver *membership* case is pinnable either. Owner: `beam_io` / `beam_rt`.
+//! * **the registry names the oracle's statically linked driver table does not carry** — the Rust
+//!   runtime registers five built-in names (`"fd"`, `"efile"`, `"tcp_inet"`, `"udp_inet"`,
+//!   `"ram_file_drv"`, `DriverRegistry::with_builtins`), while the oracle's table carries the
+//!   three `"tcp_inet"`, `"udp_inet"`, `"ram_file_drv"`. Those three resolve to a live port on
+//!   both runtimes, and `udp_inet` / `ram_file_drv` are pinned end to end by the sibling groups
+//!   [`super::udp`] (the `udp/*` ids: name resolution, the `port_info/1,2` view, `ports/0`
+//!   membership, the close lifecycle) and [`super::ram_file`] (the `ram_file/*` ids: name,
+//!   `os_pid`, byte counters, opcode acceptance, the close refusals) — this group keeps only its
+//!   own `tcp_inet` shape. `"fd"` and `"efile"` are unpinnable: the oracle answers `error:badarg`
+//!   for `open_port({spawn_driver, "fd" | "efile"}, [binary])` (no driver of that name is linked
+//!   in) while the Rust runtime opens the port, so no shape for them can agree. Owner: `beam_io`
+//!   / `beam_rt`. `erl_ddll:loaded_drivers/0` **agrees** — both runtimes answer `{ok, …}` with the
+//!   same driver-name list; [`super::ddll`] pins that list's shape, never the installation's
+//!   names.
 //!
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!

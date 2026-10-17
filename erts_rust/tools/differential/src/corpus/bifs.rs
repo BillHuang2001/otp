@@ -1543,13 +1543,19 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "bifs/monotonic_and_unique_integer_are_integers",
-            description: "erlang:unique_integer/0,1, system_time/0 and monotonic_time/0 are integers (shape, not value)",
+            description: "erlang:unique_integer/0,1 and system_time/0 are integers, and monotonic_time/0 is an integer reading at or after system_info(start_time) (type and relation, not value)",
             contracts: &[Contract::OtpApps],
             kind: CaseKind::Eval {
-                // A per-VM-start value, so only the shape is pinned: a `[positive]` unique integer
-                // is > 0 and every clock reading is an integer.
-                expr: "{erlang:unique_integer([positive]) > 0, is_integer(erlang:unique_integer()), \
-                       is_integer(erlang:system_time()), is_integer(erlang:monotonic_time())}",
+                // `erlang:monotonic_time/0` is a *running* clock on the ERTS monotonic epoch, so
+                // its reading is never pinned — only its type and its relation to the runtime's
+                // own `system_info(start_time)`, which both runtimes anchor on the same epoch
+                // (`-576460752000000000`, i.e. `-(1 bsl 59)` ns) and which the clock always reads
+                // at or after. A `[positive]` unique integer is > 0 and `system_time/0` is an
+                // integer.
+                expr: "begin T = erlang:monotonic_time(), \
+                       {erlang:unique_integer([positive]) > 0, is_integer(erlang:unique_integer()), \
+                       is_integer(erlang:system_time()), \
+                       is_integer(T) andalso T - erlang:system_info(start_time) >= 0} end",
                 extra_argv: &[],
                 probe: Probe::Value,
             },

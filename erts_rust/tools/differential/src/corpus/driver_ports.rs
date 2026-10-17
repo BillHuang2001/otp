@@ -58,8 +58,9 @@
 //!   under the oracle once the child closes its output; `beam_rt`'s `eof` is inert.
 //! * **`port_command(P, 42)`** (a non-iodata payload): the oracle raises `error:badarg`;
 //!   `beam_rt` accepts it and answers `true`.
-//! * **`port_info(P, registered_name)`**: the oracle answers `[]`; `beam_rt` raises
-//!   `error:badarg`.
+//!
+//! `port_info(P, registered_name)` on an unregistered port is *not* among them: both runtimes
+//! answer `[]` (`super::udp`'s `udp/port_info_registered_name_is_empty` pins the agreement).
 //!
 //! The structural half of A.4 (that a C translation unit referencing the `driver_*` /
 //! `erl_drv_*` declarations still compiles against the frozen headers) is asserted in
