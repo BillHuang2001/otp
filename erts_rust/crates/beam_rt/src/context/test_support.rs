@@ -132,13 +132,13 @@ pub(super) fn process_nonce() -> u64 {
 
 /// A compiled-fixture scratch directory that removes itself on drop, so the per-call
 /// unique directories never accumulate in the temp dir.
-pub(super) struct FixtureDir {
+pub(crate) struct FixtureDir {
     path: PathBuf,
 }
 
 impl FixtureDir {
     /// The directory itself (e.g. for `erlc -o` / the oracle's `-pa`).
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
@@ -182,8 +182,10 @@ pub(super) fn compile_fixture(
 /// Same per-call uniqueness (label/pid/atomic counter/process nonce) and same self-removal
 /// contract as [`compile_fixture`], for a test that needs a directory of its own rather than
 /// compiled fixtures — e.g. the `{outdir, Dir}` of an in-process `compile:file/2` (the compiler
-/// does not create it) or a scratch `-pa` for the oracle.
-pub(super) fn scratch_dir(label: &str) -> FixtureDir {
+/// does not create it), a scratch `-pa` for the oracle, or a scratch `-pa` holding a deliberately
+/// corrupt `.beam`. Every test that needs a scratch directory uses it, in every node of the
+/// crate, so the uniqueness scheme exists once.
+pub(crate) fn scratch_dir(label: &str) -> FixtureDir {
     let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "beam_rt_scratch_{label}_{pid}_{seq}_{nonce:016x}",

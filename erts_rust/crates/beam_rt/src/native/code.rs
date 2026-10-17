@@ -325,11 +325,12 @@ impl RuntimeContext<'_> {
     /// here with the bare-atom reason atom exactly as [`Self::code_lib_dir_2`] does.
     ///
     /// **Failure order.** The oracle's list is built by `do_par_recv/3`, which **prepends** each
-    /// result as it arrives, so on a fresh single-run host it is the `usort` order **reversed**
-    /// (probed five times, stable: `[b_m,a_m,c_m]` ⇒ `{error,[{c_m,nofile},{b_m,nofile},
-    /// {a_m,nofile}]}`, `[lists,a_m,b_m]` ⇒ `{error,[{b_m,nofile},{a_m,nofile}]}`). It is racy by
-    /// design for large sets, so the deterministic reverse-of-sorted order is emitted — an
-    /// unambiguous match for a single failing module, which is the shape a probe can pin.
+    /// result as it arrives, so its order is the completion order of a **parallel** load — it is
+    /// racy by design and not repeatable across runs. This runtime therefore emits the
+    /// deterministic reverse-of-sorted order (`[b_m,a_m,c_m]` ⇒
+    /// `{error,[{c_m,nofile},{b_m,nofile},{a_m,nofile}]}`), which is one of the orders the oracle
+    /// produces and an unambiguous match for a single failing module, the shape a probe can pin.
+    /// The failure **set** is the contract; the order is not (see the tests' order note).
     ///
     /// **Accepted residual.** For a `<Name>.beam` that *is* on the code path but corrupt, the
     /// oracle answers `{error,[{Name,badfile}]}` and **also** logs an
@@ -971,6 +972,7 @@ mod tests {
     //! set and the installation directories.
 
     use super::*;
+    use crate::context::test_support::scratch_dir;
     use crate::native::test_support::{atom, call, chars, runtime, string_of, system_runtime};
     use beam_term::make_small;
 
@@ -1670,8 +1672,8 @@ mod tests {
         let Some(mut runtime) = system_runtime() else {
             return;
         };
-        let dir = temp_dir("code_goc_off_path");
-        let module = dir.join("off_path_probe.beam");
+        let dir = scratch_dir("code_goc_off_path");
+        let module = dir.path().join("off_path_probe.beam");
         std::fs::copy(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -1692,7 +1694,6 @@ mod tests {
             Some("error"),
             "an off-path module has no object code"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1757,13 +1758,6 @@ mod tests {
         answer.parse().ok()
     }
 
-    /// A fresh scratch directory for the off-path fixture.
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
-        dir
-    }
     #[test]
     fn code_is_sticky_matches_the_oracle() {
         let Some(mut runtime) = system_runtime() else {
@@ -1907,6 +1901,13 @@ mod tests {
             .collect()
     }
 
+    /// The same pairs as [`failure_pairs`], **sorted by name then reason** — the
+    /// order-insensitive view, for every answer whose emitted order is not a contract.
+    fn failure_pair_set(runtime: &mut crate::Runtime, answer: Eterm) -> Vec<(String, String)> {
+        let mut pairs = failure_pairs(runtime, answer);
+        pairs.sort();
+        pairs
+    }
     /// `code:ensure_modules_loaded/1`, driven through the floor's dispatch whenever the key is
     /// registered on it and through the entry itself otherwise.
     ///
@@ -1978,11 +1979,14 @@ mod tests {
 
     #[test]
     fn code_ensure_modules_loaded_emits_the_reverse_of_the_sorted_failures() {
-        // The oracle's `do_par_recv/3` prepends each result as it arrives, so on a fresh
-        // single-run host the emitted list is the `usort` order reversed. Oracle-verified
-        // (stable over five runs): `code:ensure_modules_loaded([b_m,a_m,c_m])` ⇒
-        // `{error,[{c_m,nofile},{b_m,nofile},{a_m,nofile}]}` (`lists:usort([b_m,a_m,c_m])` ⇒
-        // `[a_m,b_m,c_m]`).
+        // This runtime's own emission order, which is **deterministic**: the `usort` order over
+        // the failures, reversed (the shape the oracle's `do_par_recv/3` produces, since it
+        // prepends each result as it arrives). The oracle's own order is *not* repeatable —
+        // `code:ensure_modules_loaded/1` is parallel, so it is the completion order (a sibling
+        // measured 117 × `c_m,b_m,a_m` against 3 × `b_m,c_m,a_m` in 120 probes) — which is why
+        // the oracle cross-check next door compares the failure **set**, and this test pins only
+        // the order this runtime can promise: `lists:usort([b_m,a_m,c_m])` ⇒ `[a_m,b_m,c_m]`,
+        // emitted reversed.
         let mut runtime = runtime();
         let argument = atom_list(&mut runtime, &["b_m", "a_m", "c_m"]);
         let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
@@ -1996,8 +2000,8 @@ mod tests {
         );
 
         // The reverse is over the **failures**, not the argument order: a loadable name is
-        // filtered out before the reversal. Oracle-verified:
-        // `code:ensure_modules_loaded([lists,a_m,b_m])` ⇒ `{error,[{b_m,nofile},{a_m,nofile}]}`.
+        // filtered out before the reversal — `[lists,a_m,b_m]` ⇒
+        // `{error,[{b_m,nofile},{a_m,nofile}]}` here.
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -2068,23 +2072,17 @@ mod tests {
         // handler; this runtime has no logger and emits no such line — the one accepted
         // residual, the value itself is exact.
         let mut runtime = runtime();
-        let dir = std::env::temp_dir().join(format!("beam_rt_eml_{}", std::process::id()));
-        if std::fs::create_dir_all(&dir).is_err() {
-            eprintln!("SKIP code:ensure_modules_loaded/1: cannot create {}", dir.display());
-            return;
-        }
-        let path = dir.join("badmod.beam");
+        let dir = scratch_dir("eml_corrupt");
+        let path = dir.path().join("badmod.beam");
         if std::fs::write(&path, b"garbage-not-a-beam").is_err() {
             eprintln!("SKIP code:ensure_modules_loaded/1: cannot write {}", path.display());
-            let _ = std::fs::remove_dir_all(&dir);
             return;
         }
-        let directory = chars(&mut runtime, &dir.display().to_string());
+        let directory = chars(&mut runtime, &dir.path().display().to_string());
         call(&mut runtime, "code", "add_patha", &[directory]).expect("code:add_patha/1");
         let argument = atom_list(&mut runtime, &["badmod"]);
         let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
         let pairs = failure_pairs(&mut runtime, answer);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(pairs, vec![("badmod".to_string(), "badfile".to_string())]);
         assert!(
             !runtime.code_server.is_loaded("badmod"),
@@ -2094,8 +2092,13 @@ mod tests {
 
     #[test]
     fn code_ensure_modules_loaded_agrees_with_the_oracle() {
-        // The live-oracle cross-check for the answer value, the failure order and the guard's
-        // raise (empty stdout, exit 1) — so the expectations pinned above cannot rot.
+        // The live-oracle cross-check for the answer value and the guard's raise (empty stdout,
+        // exit 1) — so the expectations pinned above cannot rot. The failure **order** is not
+        // part of it: `code:ensure_modules_loaded/1` is parallel in OTP (`do_par_recv/3`
+        // prepends each result as it arrives, so the emitted order is the completion order — a
+        // sibling measured 117 × `c_m,b_m,a_m` against 3 × `b_m,c_m,a_m` in 120 oracle probes).
+        // The oracle is therefore asked for the `lists:sort/1`-ed pair list and this runtime's
+        // answer is compared as a **set**; pinning the emitted order would flake.
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -2114,28 +2117,29 @@ mod tests {
             vec![("no_such_mod_xyz".to_string(), "nofile".to_string())]
         );
 
-        let Some(answer) =
-            oracle_probe("io:format(\"~p~n\",[code:ensure_modules_loaded([b_m,a_m,c_m])])")
-        else {
+        let Some(answer) = oracle_probe(
+            "case code:ensure_modules_loaded([b_m,a_m,c_m]) of \
+             {error, Fs} -> io:format(\"~p~n\",[{error,lists:sort(Fs)}]); \
+             Other -> io:format(\"~p~n\",[Other]) end",
+        ) else {
             skip_oracle_loudly();
             return;
         };
         assert_eq!(
-            answer, "{error,[{c_m,nofile},{b_m,nofile},{a_m,nofile}]}",
-            "the oracle's own reverse order"
+            answer, "{error,[{a_m,nofile},{b_m,nofile},{c_m,nofile}]}",
+            "the oracle's own failure set in `lists:sort/1` order"
         );
         let argument = atom_list(&mut runtime, &["b_m", "a_m", "c_m"]);
         let ours = ensure_modules_loaded(&mut runtime, &[argument])
             .expect("ensure_modules_loaded/1");
         assert_eq!(
-            failure_pairs(&mut runtime, ours),
+            failure_pair_set(&mut runtime, ours),
             vec![
-                ("c_m".to_string(), "nofile".to_string()),
-                ("b_m".to_string(), "nofile".to_string()),
                 ("a_m".to_string(), "nofile".to_string()),
+                ("b_m".to_string(), "nofile".to_string()),
+                ("c_m".to_string(), "nofile".to_string()),
             ]
         );
-
         // A non-list argument: the oracle's run prints nothing and exits 1; this runtime
         // reports the same bare-atom `function_clause` raise.
         let Some((stdout, code)) =
@@ -2261,22 +2265,16 @@ mod tests {
         // A `bogus.beam` of garbage in a scratch `-pa` directory: found on the code path, so
         // the not-found half cannot hide it, and the loader rejects it — the oracle's
         // `{error,badfile}`.
-        let dir = std::env::temp_dir().join(format!("beam_rt_load_file_{}", std::process::id()));
-        if std::fs::create_dir_all(&dir).is_err() {
-            eprintln!("SKIP code:load_file/1: cannot create {}", dir.display());
-            return;
-        }
-        let path = dir.join("bogus.beam");
+        let dir = scratch_dir("load_file_corrupt");
+        let path = dir.path().join("bogus.beam");
         if std::fs::write(&path, b"garbage-not-a-beam").is_err() {
             eprintln!("SKIP code:load_file/1: cannot write {}", path.display());
-            let _ = std::fs::remove_dir_all(&dir);
             return;
         }
-        runtime.code_server.add_path(&dir);
+        runtime.code_server.add_path(dir.path());
         let bogus = module_atom(&mut runtime, "bogus");
         let answer = call(&mut runtime, "code", "load_file", &[bogus]).expect("load_file/1");
         let reason = error_reason(&mut runtime, answer);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(reason, "badfile");
         assert!(
             !runtime.code_server.is_loaded("bogus"),
