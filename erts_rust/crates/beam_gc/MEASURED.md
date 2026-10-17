@@ -740,3 +740,68 @@ unchanged by construction (the rule only fires at a fullsweep collapse, and only
 observed a non-empty nursery); the A/B on the same binary was not re-run per shape, so the honest
 statement is: no sibling-shape regression is expected or observed in the crate's own suites, but only
 the churn shape was A/B'd.
+
+### The cadence against the oracle with a matched heap policy (counts, 2026-10-17)
+Source: `$TMPDIR`-built `gcprobe6.erl`/`gcprobe7.erl`, run as
+`beam_rt [flags] run gcprobe6.beam gcprobe6:{steady,live}/1 <N>` against
+`erl -noshell -pa $TMPDIR/gccheck -eval "gcprobe6:{steady,live}(<N>)" -s init stop`; sys = OTP 29.1.1 /
+erts-17.1, rust = `beam_rt` at its default baseline-JIT tier (both debug builds).
+**Every figure is a count, so it is load-invariant; no timing is quoted** (`/proc/loadavg` 0.95 → 0.96,
+`nproc` 14).
+**The two-step rule, in one line.** A fullsweep sizes the nursery from the pre-copy occupancy
+(`young_after_collection`, C `major_collection` at `erl_gc.c:1866`), then shrinks it to
+`next_words(2 * need_after, 0)` with `need_after = live_words + need_reserve_words` while
+`4 * need_after < HEAP_SIZE` (C `adjust_after_fullsweep`, `erl_gc.c:2062-2098`).
+**The shapes.** `steady/1` keeps a 200-element list alive and churns a 4-tuple plus a one-element list per
+iteration; `live/1` does the same with a 2000-element list kept alive (the live-set-protected regime).
+**`minor_gcs` is the C `GEN_GCS` on both sides — minors since the last fullsweep, reset to 0 by a
+fullsweep** (`erl_gc.c:1511`/`:1943`) — never a lifetime total, so a small value does not mean few
+collections.
+**The regime difference is NOT `DEFAULT_HEAP_WORDS`.** `beam_rt`'s 16.7 M-word default
+(`../beam_rt/src/config.rs:68`) sizes the runtime's term-construction heaps (BIF-heap pool, `-eval` heap),
+never a process nursery: a fresh `run` process reports `heap_size` **843** words against the oracle's
+**376**, and the nursery is the heap-size policy's from then on, so the matched column is `+hms 233` (the
+oracle's own `H_DEFAULT_SIZE`, already this runtime's default) and it reproduces the default column
+**exactly** — the flag that really moves the cadence is a *larger* `+hms`.
+**One trap:** holding the `statistics(garbage_collection)` 3-tuple live across the loop suppresses *every*
+collection (a foreign BIF container in a root declines the unscanned-root valve, `../beam_rt/CONTEXT.md`),
+so the baselines here are integers — and the ≈`N/3` slope recorded under "The `run` path collects at its
+own heap admissions" is that artifact: it **does not reproduce at HEAD**.
+| `steady/1` N | oracle `minor_gcs` | rust `minor_gcs` (default) | rust `minor_gcs` (`+hms 233`) | rust collections | rust fullsweeps |
+|---|---|---|---|---|---|
+| 1 000 | 1 050 | 2 591 | 2 591 | 2 593 | 0 |
+| 3 000 | 3 144 | 7 785 | 7 785 | 7 787 | 0 |
+| 10 000 | 10 474 | 25 967 | 25 967 | 25 969 | 0 |
+| `live/1` N | oracle `minor_gcs` | rust `minor_gcs` (default) | rust `minor_gcs` (`+hms 233`) | rust collections | rust fullsweeps |
+|---|---|---|---|---|---|
+| 1 000 | 1 448 | 25 955 | 25 955 | 25 956 | 0 |
+| 3 000 | 4 340 | 12 367 | 12 367 | 77 905 | 1 |
+| 10 000 | 14 463 | 63 114 | 63 114 | 259 724 | 3 |
+**Slopes (per loop iteration, N = 1 000 → 10 000).** `steady/1`: oracle **1.047** `minor_gcs`/op, rust
+**2.597** collections/op (**2.5×**); `live/1`: oracle **1.446**/op, rust **25.97**/op (**18×**) — **both
+sides linear in N and of the same order**, the per-op count differing with the two heaps' geometry.
+The exact minor/major split (`gcprobe7.erl` counts `minor_gcs`'s *decreases*, one per fullsweep):
+`steady/1` **2 998 / 8 998 / 29 998** collections with **0** fullsweeps, `live/1` **25 879 / 77 880 /
+259 880** with **0 / 1 / 3** — so the rust `minor_gcs` above is a within-period count, not a total.
+**The heap-size flag is the cadence lever: the count scales as `∝ N / nursery`** — `steady/1`, rust,
+collections per op: default (nursery 2 441 words) **2.597**, `+hms 1000` (1 598) **0.376**, `+hms 20000`
+(28 690) **0.021**; on `live/1` **25.97 / 3.76 / 0.21**.
+**Footprint, N = 10 000.** `steady/1`: rust `heap_size` **2 441** / `total_heap_size` **4 039** words
+against the oracle's **2 586** / **3 286**, with node `erlang:memory(total)` **13.45 MB** against
+**34.97 MB** (the oracle's total carries a far larger process population); `live/1`: rust 2 441 /
+**13 399** against 4 185 / 8 440 — a 2000-word live set plus churn in a *smaller* young space, paid for
+in collections rather than in words.
+**Load-bearing, proven by mutation:** reverting step 2 at that one site (`collapse_after_fullsweep(…,
+live)` → `collapse(&policy, young_occupancy)` in `collect_major`) fails exactly
+`post_fullsweep_nursery.rs::a_fullsweep_whose_live_set_is_small_shrinks_toward_twice_need_after` (2 819 vs
+376) and `::both_mature_strategies_size_the_nursery_identically` (Copying 2 819 vs Immix 376 — Immix keeps
+376 because `relocate_major` was not mutated); the rest of the suite stays green.
+**Cross-crate, reported not fixed:** `beam_rt`'s
+`runner::tests::the_heap_growth_workloads_per_call_counters_are_flat_in_n` pins `collections == N − 2` and
+observes **`N`** at HEAD (10 000/25 000/50 000), passing with step 2 reverted — this crate's sizing is
+what moved that constant (owner: `beam_rt`'s assertion).
+**What the rule does and does not do.** It cuts the footprint and makes the nursery capacity track the
+live set; it does **not** realign the cadence, which is dominated by fullsweep-escalation frequency (the
+`gc_bound/churn` shape — "the minor→major escalation test" in `CONTEXT.md`) and by the nursery size the
+heap policy installs — so the residual 2.5×/18× is that sizing policy, `beam_gc`/`beam_rt`-owned, not the
+two-step rule.

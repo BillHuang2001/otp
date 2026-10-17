@@ -356,6 +356,13 @@ the section to read them in.
   and cut the collection count a third (**2.000 → 1.500/op**), at a mildly higher copy volume (1 269.5 → 1 283.5
   words/op) — paired A/B ratios **0.964 / 0.960 / 0.929**, with the `perf stat -e task-clock` pass the stable
   signal on this perturbed host — `MEASURED.md`, "Post-fullsweep nursery sizing (the `gc_bound/churn` win)".
+- Against the **oracle** at a matched heap policy (`+hms 233`, the C `H_DEFAULT_SIZE`), the minor count grows
+  linearly with the loop count at **2.5×** the oracle's per-op slope on a small live set and **18×** on a
+  live-set-protected one, at `total_heap_size` **4 039** vs **3 286** words — so the two-step rule **cuts
+  footprint and makes the capacity track the live set**; it does **not** realign the cadence, which is
+  dominated by fullsweep frequency and by the nursery size the heap policy installs (`beam_rt`'s
+  `DEFAULT_HEAP_WORDS` sizes only its term-construction heaps, never a process nursery) — `MEASURED.md`,
+  "The cadence against the oracle with a matched heap policy".
 - Folding the young heap's occupancy into the fullsweep's size request is what makes the mature generation
   reachable at the default policy: the copying default runs **147 minors : 73 fullsweeps** — `MEASURED.md`,
   "The mature-generation room policy (generational cadence)".
