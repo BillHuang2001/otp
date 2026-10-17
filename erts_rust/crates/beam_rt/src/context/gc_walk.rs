@@ -82,6 +82,55 @@
 //!   entry is pruned only when the process itself is gone), so a flag observed `true` at one
 //!   collection stays `true` at every later one.
 //!
+//! # Why there is no "close the latch again" fast path (analysed, **not** implemented)
+//!
+//! The descent's cost is its **invocation count**: the baseline JIT's `jit_test_heap` reaches the
+//! valve at roughly every heap test, so a real compile pays a walk per heap-admission point
+//! (hundreds of thousands of them — see [`seed_counters`]' measurement test). The obvious next
+//! step is therefore to *re-close* the per-pid latch after an exhaustive descent that found no
+//! foreign container, so a loop that settles into a foreign-free steady state pays the descent once
+//! instead of once per admission point.
+//!
+//! **That is unsound as posed.** The refutation is one sentence: *a descent is exhaustive only over
+//! the roots it was handed, and one of the two callers does not have all of them.* The runner's park
+//! arm ([`process_roots_are_unscanned`]) and the collection gate ([`RuntimeCollectionGate`]) run for
+//! a process that is **not** the running one, whose `x`/stack/FR words are unpublished — and an
+//! *exempt* park ([`Process::has_unpublished_roots`], the `Wait` arm and a `Yield` whose slice ended
+//! with a live FR prefix) publishes **nothing at all** (`src/runner/run.rs::park_machine` returns
+//! early). Concrete counterexample:
+//!
+//! 1. the process holds a container from an unscanned region (the bit opens) and stores it into a
+//!    scanned young tuple `T` held **only** in `x[1]`; no admission point has run since;
+//! 2. it parks on `receive` — an exempt park, so `x[1]` is not in the gathered roots;
+//! 3. a signal site (or the parked process's own `Process::deliver`) runs
+//!    [`RuntimeCollectionGate::declines_relocation`]: the descent sees the gathered roots only,
+//!    reaches nothing foreign, and (hypothetically) closes the bit;
+//! 4. the receiver resumes; `x[1] = T` is published at the next admission point, the bit is clear,
+//!    the descent is skipped — and the per-word phase classifies `T` as a *scanned* container, so
+//!    the collection proceeds and leaves the foreign container's child pointing into the evacuated
+//!    from-space.
+//!
+//! What a sound version would need, and where each piece lives — **none of it in this file**:
+//!
+//! * a "the descent saw the *whole* root set" bit, set only by the admission-point walks, whose
+//!   root set is the machine's published `RootSet` (`super::gc::ensure_heap*`) — a clear on any
+//!   other walk (the gate's, the park arm's) is the bug above;
+//! * the **clear site**: the latch itself is only an alias here ([`ForeignLatch`]); the real cell is
+//!   `crate::runtime::gc::GcState::foreign`, written by `Runtime::note_foreign_reachable`;
+//! * a **completeness proof for that writer**: every event that can put a foreign container into the
+//!   reachable graph must open the bit. Today the bit is *add-only*, so a missed event costs only a
+//!   descent; with a clear, a missed event is a memory-safety bug. The known suspects are the ones
+//!   `M1_GAPS.md`'s *GC-relocation hazards* roster names as pinned outside the root set — a
+//!   `beam_bifs` fast-path BIF's Rust-local accumulator, the BIF-result copy-out slot, the
+//!   `beam_engine` `PendingException` reason — an audit across `beam_bifs`/`beam_engine`;
+//! * an **ordering** guarantee: a set that happens while (or just before) the clear runs must not be
+//!   lost, i.e. the clear must be a compare-and-swap against the state the walk started from.
+//!
+//! **Verdict: sound-but-cross-crate at best, and unsound as posed.** The pieces above are owned by
+//! `super::gc`, `src/runtime/gc.rs`, `src/runner/` and `beam_process`'s signal sites; nothing in
+//! this file can make the skip safe on its own, so it is deliberately **not** implemented here. What
+//! this file does own — the per-walk allocation — is fixed instead (see [`WalkScratch`]).
+//!
 //! # The same valve installed as the `beam_process` collection gate
 //!
 //! The valve's host call sites — the three heap-admission points in [`super::gc`] and the
@@ -156,18 +205,38 @@ use super::gc::root_is_unscanned;
 
 // ============================ END TEMPORARY POLICY SWITCH ============================
 
-/// The **reused** mutable state of the descent: its worklist and its visited set.
+/// The **reused** mutable state of the descent: its worklist, its visited set and the root buffer
+/// the appending [`Process`] sub-rootsets are gathered into.
 ///
 /// One lives in the runtime's GC state ([`crate::runtime::gc::GcState`]) and is handed to every
 /// walk, so a collection **never allocates** the descent's structures (see [`Visited`] for the
-/// `O(1)` per-walk reset that makes the reuse free). Both buffers only ever grow, so the steady
-/// state of a running process is allocation-free after its first few walks.
+/// `O(1)` per-walk reset that makes the reuse free). All three buffers only ever grow, so the
+/// steady state of a running process is allocation-free after its first few walks.
+///
+/// The third buffer is load-bearing for that claim: three of the six root-set families
+/// ([`Registers`](beam_process::Registers), [`SavedArgs`](beam_process::SavedArgs),
+/// [`SignalQueue`](beam_process::SignalQueue)) *append into a caller buffer* — their
+/// `gather_roots` API takes a `&mut Vec<Eterm>` and returns a start offset — so the seeding needs
+/// a buffer for them. A fresh `Vec::new()` per call was the one allocation that broke the
+/// module's "allocation-free after warm-up" property, and it was paid on **every** walk (the
+/// walk runs once per heap-admission point, i.e. hundreds of thousands of times over a single
+/// in-process stdlib compile). The buffer is reused instead: [`Walk::seed_process_roots`] takes
+/// it with a 3-word [`std::mem::take`] and puts it back before returning, so a walk neither
+/// allocates nor retains a borrow of the scratch.
+///
+/// The other three families are seeded **straight from their iterators**
+/// ([`Queue::iter`](beam_message::Queue::iter) for the mailbox envelope,
+/// [`Dict::entries`](beam_process::Dict::entries) for the dictionary), so they need no buffer at
+/// all and never touch this one.
 #[derive(Default)]
 pub(crate) struct WalkScratch {
     /// The objects still to expand (the worklist).
     pending: Vec<Eterm>,
     /// The objects already entered.
     visited: Visited,
+    /// The root buffer the appending sub-rootsets are gathered into — taken and returned by
+    /// [`Walk::seed_process_roots`], so it never re-allocates once warmed up.
+    roots: Vec<Eterm>,
 }
 
 /// Whether a collection of `process` would be **unsound** — whether a container in a region
@@ -403,6 +472,9 @@ struct Visited {
     generation: u32,
     /// How many slots the current generation occupies.
     len: usize,
+    /// The `grow` re-insert's key buffer, kept across grows so a rebuild allocates only the
+    /// (doubled) slot array, never a scratch `Vec` beside it.
+    keys: Vec<usize>,
     /// Test-only: the probes the walk in progress has made (the probe-quality test's witness).
     #[cfg(test)]
     probes: u64,
@@ -492,12 +564,16 @@ impl Visited {
     /// Doubles the table and re-inserts the current generation's keys (the only allocation the
     /// descent ever performs, and it amortises away).
     fn grow(&mut self) {
-        let keys: Vec<usize> = self
-            .slots
-            .iter()
-            .filter(|slot| slot.generation == self.generation)
-            .map(|slot| slot.key)
-            .collect();
+        // The key buffer is taken out of `self` so the rebuild can borrow the table mutably;
+        // it is returned at the end, so a warm table's grows allocate the slot array alone.
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.clear();
+        keys.extend(
+            self.slots
+                .iter()
+                .filter(|slot| slot.generation == self.generation)
+                .map(|slot| slot.key),
+        );
         self.resize_table(self.slots.len() * 2);
         #[cfg(test)]
         {
@@ -505,9 +581,10 @@ impl Visited {
         }
         // The re-insert cannot re-enter `grow`: the table is twice one that was at most
         // three-quarters full, so the resulting load is at most three-eighths.
-        for key in keys {
+        for &key in &keys {
             let _ = self.insert(key);
         }
+        self.keys = keys;
     }
 
     /// The initial probe index of `key` — a **full-width multiplicative (Fibonacci) mix**, the
@@ -571,22 +648,86 @@ impl<'a> Walk<'a> {
     /// Seeds from every container [`Process::collect`] gathers: the registers (`x[0..live)`,
     /// the whole stack and the host-published extra roots), then each queued message's
     /// `payload`/`from`/`token`, the process dictionary, the saved arguments and the pending
-    /// signals.
+    /// signals — in that order, and **exactly** that set (nothing more, nothing less: the walk's
+    /// answer may over-approximate the roots, but a *missing* root would be a memory-safety bug,
+    /// so the set is pinned by the `a_foreign_container_in_every_seeded_root_family_is_detected`
+    /// case).
+    ///
+    /// # No per-call allocation
+    ///
+    /// The mailbox and the dictionary expose iterators, so those two families are seeded
+    /// **directly**, with no buffer. The other three append into a caller buffer, so they are
+    /// gathered into the scratch's reusable [`WalkScratch::roots`] — taken with a 3-word
+    /// [`std::mem::take`] (`self.scratch` is behind `&mut self`, so it cannot be borrowed for the
+    /// gather *and* for the `seed` calls at once) and handed back at the end. A warmed-up walk
+    /// therefore performs **no allocation at all** here.
     fn seed_process_roots(&mut self, process: &Process) {
-        let mut roots: Vec<Eterm> = Vec::new();
-        process.registers().gather_roots(&mut roots);
-        for message in process.mailbox().iter() {
-            roots.push(message.payload());
-            roots.push(message.from());
-            roots.push(message.token());
+        let mut buf = std::mem::take(&mut self.scratch.roots);
+        #[cfg(test)]
+        seed_counters::note_walk(buf.capacity() == 0);
+        buf.clear();
+
+        // 1. The registers: `x[0..live)`, the whole Erlang stack, the extra roots.
+        process.registers().gather_roots(&mut buf);
+        #[cfg(test)]
+        {
+            seed_counters::note_register_words(buf.len());
+            seed_counters::note_root_words(buf.len());
         }
-        for (key, value) in process.dict().entries() {
-            roots.push(key);
-            roots.push(value);
+        self.seed_all(process, &buf);
+        // 2. The mailbox envelope — three words per message, straight from the queue.
+        if !self.hit {
+            #[cfg(test)]
+            seed_counters::note_root_words(3 * process.mailbox().len());
+            for message in process.mailbox().iter() {
+                self.seed(process, message.payload());
+                self.seed(process, message.from());
+                self.seed(process, message.token());
+                if self.hit {
+                    break;
+                }
+            }
         }
-        process.saved_args().gather_roots(&mut roots);
-        process.signals().gather_roots(&mut roots);
-        for word in roots {
+        // 3. The dictionary, straight from its entry iterator.
+        if !self.hit {
+            #[cfg(test)]
+            seed_counters::note_root_words(2 * process.dict().len());
+            for (key, value) in process.dict().entries() {
+                self.seed(process, key);
+                self.seed(process, value);
+                if self.hit {
+                    break;
+                }
+            }
+        }
+        // 4. The saved BIF/NIF arguments.
+        if !self.hit {
+            buf.clear();
+            process.saved_args().gather_roots(&mut buf);
+            #[cfg(test)]
+            seed_counters::note_root_words(buf.len());
+            self.seed_all(process, &buf);
+        }
+        // 5. The pending-signal queue.
+        if !self.hit {
+            buf.clear();
+            process.signals().gather_roots(&mut buf);
+            #[cfg(test)]
+            seed_counters::note_root_words(buf.len());
+            self.seed_all(process, &buf);
+        }
+
+        // Hand the buffer back, so the next walk reuses this allocation.
+        self.scratch.roots = buf;
+    }
+
+    /// Classifies every word of `words` in order, stopping at the first hit (`seed` itself
+    /// short-circuits, but the loop must not keep walking a long stack after one).
+    fn seed_all(&mut self, process: &Process, words: &[Eterm]) {
+        for &word in words {
+            if self.hit {
+                return;
+            }
             self.seed(process, word);
         }
     }
@@ -631,12 +772,101 @@ impl<'a> Walk<'a> {
     }
 }
 
+/// Test-only tallies of the seeding's *scale* and of its **allocation discipline** — the witness
+/// behind the module's "the walk allocates nothing after warm-up" claim and the counters a
+/// measurement run reports per in-process compile.
+///
+/// Gated on `#[cfg(test)]` (`super::gc`'s `prefix_counters` is the same pattern), so neither the
+/// release binary the differential gate builds nor the debug one it drives carries a single extra
+/// instruction.
+#[cfg(test)]
+pub(crate) mod seed_counters {
+    use std::cell::Cell;
+
+    /// One thread's tallies since the last [`reset`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct SeedCounts {
+        /// Calls to [`super::Walk::seed_process_roots`] — exactly one per walk, and therefore
+        /// exactly the number of root-buffer `Vec`s a per-call `Vec::new()` would have malloc'd.
+        pub(crate) walks: usize,
+        /// Walks that found the root buffer with **no capacity** and so had to allocate it. One
+        /// per warm scratch, never per walk: this is the counter that pins the reuse.
+        pub(crate) buffer_allocations: usize,
+        /// Every family's root words, summed over every walk — the whole seeded root set.
+        pub(crate) root_words: usize,
+        /// Register-family words gathered (`x[0..live)` + the whole stack + the extra roots),
+        /// summed over every walk — the walk's dominant root family.
+        pub(crate) register_words: usize,
+    }
+
+    impl SeedCounts {
+        /// The all-zero tally (the `const` form the thread-local's initialiser needs).
+        pub(crate) const ZERO: SeedCounts = SeedCounts {
+            walks: 0,
+            buffer_allocations: 0,
+            root_words: 0,
+            register_words: 0,
+        };
+    }
+
+    thread_local! {
+        /// This thread's tallies since the last [`reset`].
+        static COUNTERS: Cell<SeedCounts> = const { Cell::new(SeedCounts::ZERO) };
+    }
+
+    /// This thread's tallies since the last [`reset`].
+    pub(crate) fn snapshot() -> SeedCounts {
+        COUNTERS.with(Cell::get)
+    }
+
+    /// Zeroes this thread's tallies (a measurement's "before" reading).
+    pub(crate) fn reset() {
+        COUNTERS.with(|counters| counters.set(SeedCounts::ZERO));
+    }
+
+    /// Records one walk, and whether its root buffer had to be allocated (`cold`).
+    pub(crate) fn note_walk(cold: bool) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.walks += 1;
+            if cold {
+                value.buffer_allocations += 1;
+            }
+            counters.set(value);
+        });
+    }
+
+    /// Records one walk's register-family word count.
+    pub(crate) fn note_register_words(words: usize) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.register_words += words;
+            counters.set(value);
+        });
+    }
+
+    /// Records one family's root-word count for the walk in progress.
+    pub(crate) fn note_root_words(words: usize) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.root_words += words;
+            counters.set(value);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    // ---------------------------------------------------------------------------------------
+    use beam_message::Message;
+    use beam_process::{
+        ExitFamily, MonitorKind, PendingSignal, ProcessTable, RefAllocator, SignalAtoms,
+    };
+    use beam_term::heap::Heap;
+    use beam_term::prelude::{make_small, NIL};
+    use beam_term::AtomTable;    // ---------------------------------------------------------------------------------------
     // The probe quality
     // ---------------------------------------------------------------------------------------
 
@@ -965,6 +1195,529 @@ mod tests {
                 "a shallow walk resized the table"
             );
             assert_eq!(visited.grows, grows, "a shallow walk rebuilt the table");
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The seeded root set: exactly `Process::collect`'s, family by family
+    // ---------------------------------------------------------------------------------------
+    //
+    // The walk's answer may over-approximate the collected roots — a spurious hit only declines a
+    // collection that might have been sound — but a root it **misses** is a memory-safety bug: the
+    // collector would relocate a term the valve never classified. The family-by-family cases below
+    // are that pin, and they are *hazard-shaped* rather than count-shaped: each plants the one term
+    // that makes the walk's answer matter (a container built outside every region the collector
+    // scans) in exactly ONE root family, and requires the walk to find it.
+
+    /// A spawned process in a table of its own, so a case can plant a word in any root family and
+    /// keep the process alive to read it back.
+    fn seeded_process() -> (ProcessTable, ProcessId) {
+        let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+        let pid = table.spawn_default().expect("spawn a process");
+        (table, pid)
+    }
+
+    /// The cons cell a case plants: built on a `beam_term` test arena, i.e. outside every region
+    /// the process's collector scans, and header-less — so the collector would have to forward
+    /// both of its words, which is exactly the hazard the valve exists for.
+    ///
+    /// The arena must **outlive** every walk that classifies the cell (the walk reads the cell's
+    /// address, and a nested case descends into it).
+    fn foreign_container(arena: &mut Heap) -> Eterm {
+        arena
+            .cons(make_small(11), make_small(12))
+            .expect("the arena builds the cons cell")
+    }
+
+    /// One root family [`Walk::seed_process_roots`] seeds from, and how a word is planted in it.
+    struct RootFamily {
+        /// The family's name (the failure messages name it).
+        name: &'static str,
+        /// Plants `word` in exactly this family and nowhere else.
+        plant: fn(&mut Process, Eterm),
+    }
+
+    /// The register family: `x[0]` (inside the live prefix).
+    fn plant_x(process: &mut Process, word: Eterm) {
+        let x = process.registers_mut().x_mut();
+        x.set_live(1).expect("x[0] is inside the register file");
+        x.set(0, word).expect("x[0] is live");
+    }
+
+    /// The register family: the whole Erlang stack is a root (`gather_roots` appends all of it).
+    fn plant_stack(process: &mut Process, word: Eterm) {
+        process.registers_mut().stack_mut().push(word);
+    }
+
+    /// The register family: the host-published extra roots.
+    fn plant_extra_root(process: &mut Process, word: Eterm) {
+        process.registers_mut().extra_roots_mut().push(word);
+    }
+
+    /// The mailbox envelope: the message payload.
+    fn plant_mailbox_payload(process: &mut Process, word: Eterm) {
+        process.mailbox_mut().enqueue(Message::new(word, NIL));
+    }
+
+    /// The process dictionary's key.
+    fn plant_dict_key(process: &mut Process, word: Eterm) {
+        process.dict_mut().put(word, make_small(1));
+    }
+
+    /// The process dictionary's value.
+    fn plant_dict_value(process: &mut Process, word: Eterm) {
+        process.dict_mut().put(make_small(2), word);
+    }
+
+    /// The saved BIF/NIF arguments.
+    fn plant_saved_arg(process: &mut Process, word: Eterm) {
+        process.saved_args_mut().push(word);
+    }
+
+    /// The pending-signal queue: an exit signal's reason.
+    fn plant_signal_reason(process: &mut Process, word: Eterm) {
+        process.signals_mut().push(PendingSignal::exit(
+            ProcessId::new(0, 0),
+            word,
+            ExitFamily::Explicit,
+        ));
+    }
+
+    /// The pending-signal queue: a monitor-DOWN's user tag — the one signal word a per-signal
+    /// root list could lose while still holding the reason.
+    fn plant_signal_tag(process: &mut Process, word: Eterm) {
+        let mut references = RefAllocator::new();
+        process.signals_mut().push(PendingSignal::down(
+            references.next(),
+            ProcessId::new(0, 0),
+            MonitorKind::Process,
+            Some(word),
+            make_small(0),
+        ));
+    }
+
+    /// Every family [`Walk::seed_process_roots`] seeds from, in the order it seeds them
+    /// (registers → mailbox → dictionary → saved arguments → pending signals).
+    ///
+    /// A family the walk stopped seeding must fail
+    /// [`a_foreign_container_in_every_seeded_root_family_is_detected`].
+    ///
+    /// The mailbox's `from` and `token` words are **not** in this list, and that is not an
+    /// omission: [`Queue::enqueue`](beam_message::Queue::enqueue) debug-asserts both envelope words
+    /// are **immediates** (`beam_message`'s deliberate narrowing of the C's heap-`token`/heap-`from`
+    /// latitude), so no in-tree or test producer can put a heap container there to be detected.
+    /// Their seeding is pinned by **word count** instead — the envelope contributes exactly three
+    /// root words per message
+    /// ([`the_mailbox_envelope_contributes_three_root_words_per_message`]), which is
+    /// [`Process::collect`]'s own accounting.
+    const ROOT_FAMILIES: [RootFamily; 9] = [
+        RootFamily {
+            name: "x[0]",
+            plant: plant_x,
+        },
+        RootFamily {
+            name: "the Erlang stack",
+            plant: plant_stack,
+        },
+        RootFamily {
+            name: "the extra roots",
+            plant: plant_extra_root,
+        },
+        RootFamily {
+            name: "a mailbox payload",
+            plant: plant_mailbox_payload,
+        },
+        RootFamily {
+            name: "a dictionary key",
+            plant: plant_dict_key,
+        },
+        RootFamily {
+            name: "a dictionary value",
+            plant: plant_dict_value,
+        },
+        RootFamily {
+            name: "a saved BIF/NIF argument",
+            plant: plant_saved_arg,
+        },
+        RootFamily {
+            name: "a pending-signal reason",
+            plant: plant_signal_reason,
+        },
+        RootFamily {
+            name: "a pending-signal DOWN tag",
+            plant: plant_signal_tag,
+        },
+    ];
+
+    /// The two answers a case reads from the process's root set alone: with the descent gated
+    /// **off** (the always-run per-word phase) and with it **on** (the full descent).
+    fn seeded_answers(table: &ProcessTable, pid: ProcessId) -> (bool, bool) {
+        let process = table.get(pid).expect("the spawned process");
+        let mut scratch = WalkScratch::default();
+        let gated = any_root_is_unscanned(&mut scratch, process, std::iter::empty(), false);
+        let descended = any_root_is_unscanned(&mut scratch, process, std::iter::empty(), true);
+        (gated, descended)
+    }
+
+    /// The number of root words [`Process::collect`] gathers for `process` — the walk's root set
+    /// must be **exactly** this many words (no family dropped, none seeded twice).
+    fn collect_root_words(process: &Process) -> usize {
+        let mut buf: Vec<Eterm> = Vec::new();
+        process.registers().gather_roots(&mut buf);
+        let mut total = buf.len();
+        total += 3 * process.mailbox().len();
+        total += 2 * process.dict().len();
+        buf.clear();
+        process.saved_args().gather_roots(&mut buf);
+        total += buf.len();
+        buf.clear();
+        process.signals().gather_roots(&mut buf);
+        total + buf.len()
+    }
+
+    /// **The pin: an unscanned container in ANY single root family is detected, and a clean
+    /// process is not.**
+    ///
+    /// For every family in [`ROOT_FAMILIES`], four cases:
+    ///
+    /// * **clean** — nothing planted: neither phase may report a hit (the negative control that
+    ///   keeps the assertions below from being satisfied by a walk that always answers `true`);
+    /// * **direct** — the foreign cons cell *is* the root word: the per-word phase must catch it
+    ///   with the descent gate **closed** (so a family the walk seeds only inside the descent
+    ///   would fail here);
+    /// * **nested** — a scanned young tuple holding the foreign cell is the root word: the gated
+    ///   phase must NOT report a hit (the per-word classifier cannot see through a scanned
+    ///   container) and the descent MUST (so the family is really seeded as a descent origin);
+    /// * **safe** — a young tuple holding an immediate: no hit either way.
+    ///
+    /// The word count of the gathered set is pinned too ([`collect_root_words`]): the walk must
+    /// seed exactly the words `Process::collect` gathers.
+    #[test]
+    fn a_foreign_container_in_every_seeded_root_family_is_detected() {
+        for family in ROOT_FAMILIES {
+            let name = family.name;
+            // One arena per family: its cell must outlive every walk below that classifies it.
+            let mut arena = Heap::new(64);
+            let foreign = foreign_container(&mut arena);
+
+            // (0) The word count, on a process whose every family is non-empty — where they are
+            //     plantable at all (an empty root set still pins the register family's length).
+            {
+                let (mut table, pid) = seeded_process();
+                {
+                    (family.plant)(
+                        table.get_mut(pid).expect("the spawned process"),
+                        make_small(7),
+                    );
+                }
+                let process = table.get(pid).expect("the spawned process");
+                let expected = collect_root_words(process);
+                seed_counters::reset();
+                let mut scratch = WalkScratch::default();
+                let _ = any_root_is_unscanned(&mut scratch, process, std::iter::empty(), true);
+                let counts = seed_counters::snapshot();
+                assert_eq!(counts.walks, 1);
+                assert_eq!(
+                    counts.root_words, expected,
+                    "{name}: the walk must seed exactly the words `Process::collect` gathers"
+                );
+            }
+
+            // (a) clean: an untouched process is never declined, gated or descended.
+            {
+                let (table, pid) = seeded_process();
+                let (gated, descended) = seeded_answers(&table, pid);
+                assert!(
+                    !gated && !descended,
+                    "{name}: an empty root set must never report an unscanned root \
+                     (gated {gated}, descended {descended})"
+                );
+            }
+
+            // (b) direct: the foreign cell is the root word itself.
+            {
+                let (mut table, pid) = seeded_process();
+                (family.plant)(table.get_mut(pid).expect("the spawned process"), foreign);
+                let (gated, descended) = seeded_answers(&table, pid);
+                assert!(
+                    gated,
+                    "{name}: a foreign container planted directly in this family must be caught \
+                     by the per-word phase, with the descent gate closed"
+                );
+                assert!(
+                    descended,
+                    "{name}: a foreign container planted directly in this family must be caught \
+                     by the full valve"
+                );
+            }
+
+            // (c) nested: a SCANNED young tuple holding the foreign cell.
+            {
+                let (mut table, pid) = seeded_process();
+                let wrapper = {
+                    let process = table.get_mut(pid).expect("the spawned process");
+                    let wrapper = process
+                        .heap_mut()
+                        .tuple(&[foreign])
+                        .expect("the young heap builds `{Foreign}`");
+                    (family.plant)(process, wrapper);
+                    wrapper
+                };
+                let (gated, descended) = seeded_answers(&table, pid);
+                assert!(
+                    !gated,
+                    "{name}: the per-word phase classifies a scanned young tuple as safe, so it \
+                     must not claim a hit for `{{Foreign}}` (wrapper {wrapper:?})"
+                );
+                assert!(
+                    descended,
+                    "{name}: the descent must reach the foreign container nested one level below \
+                     a scanned young tuple seeded from this family"
+                );
+            }
+
+            // (d) safe: a scanned young tuple holding an immediate.
+            {
+                let (mut table, pid) = seeded_process();
+                {
+                    let process = table.get_mut(pid).expect("the spawned process");
+                    let safe = process
+                        .heap_mut()
+                        .tuple(&[make_small(3), make_small(4)])
+                        .expect("the young heap builds `{3,4}`");
+                    (family.plant)(process, safe);
+                }
+                let (gated, descended) = seeded_answers(&table, pid);
+                assert!(
+                    !gated && !descended,
+                    "{name}: a scanned young tuple of immediates must never decline a collection \
+                     (gated {gated}, descended {descended})"
+                );
+            }
+        }
+    }
+
+    /// **The mailbox envelope contributes three root words per message** — `payload`, `from` and
+    /// `token`, exactly as [`Process::collect`] gathers them.
+    ///
+    /// This is how the `from`/`token` envelope words are pinned: their producer
+    /// ([`Queue::enqueue`](beam_message::Queue::enqueue)) debug-asserts both are immediates, so no
+    /// heap container can be planted there to be *detected* (see [`ROOT_FAMILIES`]). Counting the
+    /// words catches a walk that seeds only the payload, or that seeds an envelope word twice.
+    #[test]
+    fn the_mailbox_envelope_contributes_three_root_words_per_message() {
+        /// The root words one walk gathers for `process`.
+        fn walk_root_words(process: &Process) -> usize {
+            seed_counters::reset();
+            let mut scratch = WalkScratch::default();
+            let _ = any_root_is_unscanned(&mut scratch, process, std::iter::empty(), true);
+            let counts = seed_counters::snapshot();
+            assert_eq!(counts.walks, 1);
+            counts.root_words
+        }
+
+        let (mut table, pid) = seeded_process();
+        let empty = walk_root_words(table.get(pid).expect("the spawned process"));
+
+        for messages in 1..=3usize {
+            let (mut table, pid) = seeded_process();
+            {
+                let process = table.get_mut(pid).expect("the spawned process");
+                for _ in 0..messages {
+                    process.mailbox_mut().enqueue(Message::new(make_small(1), NIL));
+                }
+            }
+            let process = table.get(pid).expect("the spawned process");
+            assert_eq!(process.mailbox().len(), messages);
+            assert_eq!(
+                walk_root_words(process),
+                empty + 3 * messages,
+                "{messages} queued messages must contribute `payload`+`from`+`token` each"
+            );
+            // ... and the same count `Process::collect` would gather.
+            assert_eq!(collect_root_words(process), walk_root_words(process));
+        }
+        let _ = &mut table;
+        let _ = empty;
+    }
+
+    /// **The root buffer is allocated once per scratch and then reused** — the property the
+    /// per-call `Vec::new()` broke, measured by [`seed_counters`] rather than asserted by
+    /// inspection.
+    ///
+    /// A steady root set pays exactly one allocation, on the first walk; every later walk finds
+    /// the capacity it needs. A fresh [`WalkScratch`] pays its own one (the runtime's
+    /// admission-point scratch and the collection gate's are independent by design), and the
+    /// answers of the 64 walks must be identical — a reused buffer must never leak state between
+    /// walks.
+    #[test]
+    fn the_root_buffer_is_allocated_once_and_then_reused() {
+        let (mut table, pid) = seeded_process();
+        {
+            let process = table.get_mut(pid).expect("the spawned process");
+            let young = process
+                .heap_mut()
+                .tuple(&[make_small(5)])
+                .expect("the young heap builds `{5}`");
+            plant_x(process, young);
+            plant_stack(process, make_small(6));
+            process.saved_args_mut().push(make_small(7));
+            process.signals_mut().push(PendingSignal::exit(
+                ProcessId::new(0, 0),
+                make_small(8),
+                ExitFamily::Explicit,
+            ));
+        }
+        let process = table.get(pid).expect("the spawned process");
+        let expected_words = collect_root_words(process);
+
+        seed_counters::reset();
+        let mut scratch = WalkScratch::default();
+        for round in 0..64 {
+            assert!(
+                !any_root_is_unscanned(&mut scratch, process, std::iter::empty(), true),
+                "round {round}: a fully scanned root set must never be declined"
+            );
+        }
+        let counts = seed_counters::snapshot();
+        assert_eq!(counts.walks, 64, "one walk per call");
+        assert_eq!(
+            counts.buffer_allocations, 1,
+            "the scratch's root buffer must be allocated exactly once (on the first walk) and \
+             reused by the other 63 — it was allocated on {} of {} walks",
+            counts.buffer_allocations, counts.walks
+        );
+        assert_eq!(
+            counts.root_words,
+            64 * expected_words,
+            "every walk must seed the whole root set, {expected_words} words"
+        );
+
+        // A second scratch (the collection gate's own) pays its own first allocation and nothing
+        // more: the reuse is per scratch, never per call.
+        seed_counters::reset();
+        let mut gate_scratch = WalkScratch::default();
+        for _ in 0..8 {
+            let _ = any_root_is_unscanned(&mut gate_scratch, process, std::iter::empty(), true);
+        }
+        let counts = seed_counters::snapshot();
+        assert_eq!(counts.walks, 8);
+        assert_eq!(counts.buffer_allocations, 1);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The scale of the seeding, measured on a real in-process compile
+    // ---------------------------------------------------------------------------------------
+
+    /// The repository root: `$ERL_TOP` when set, else three levels up from this crate's manifest
+    /// directory (`<root>/erts_rust/crates/beam_rt`).
+    fn source_root() -> std::path::PathBuf {
+        match std::env::var_os("ERL_TOP") {
+            Some(value) => std::path::PathBuf::from(value),
+            None => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."),
+        }
+    }
+
+    /// A booted runtime on the CLI's own route (`-eval`, driving the real
+    /// `bootstrap/bin/start.boot` first) — the route `beam_rt -noshell -eval '<compile:file(…)>'`
+    /// takes. The boot script matters to the compiler: it is what makes `epp`'s io requests reach
+    /// a real `file_server_2` (`super::super::pump`'s in-process compile suites record the same).
+    fn booted_runtime() -> crate::runtime::Runtime {
+        let config = crate::config::RuntimeConfig::default()
+            .with_resolved_boot_script(Some("start".to_string()));
+        let mut runtime = crate::runtime::Runtime::new(config).expect("the default runtime");
+        runtime.boot().expect("the boot sequence");
+        let script = crate::CodeServer::own_bootstrap_boot_script()
+            .expect("this runtime's own release carries `bootstrap/bin/start.boot`");
+        runtime
+            .boot_from_script(&script)
+            .expect("the real boot script runs");
+        runtime
+    }
+
+    /// **Opt-in measurement — the deterministic counters behind this module's cost claims.**
+    ///
+    /// Compiles one real stdlib source **in process** (the A.9 route) and reports, per module: the
+    /// walk count (the valve's invocation count — one per heap-admission point), the root words and
+    /// register words per walk, and how many times the root buffer had to be **allocated** (once
+    /// per scratch plus a handful of growths, never once per walk).
+    ///
+    /// Ignored by default: it compiles `pool`/`ordsets`/`timer` in the **debug** profile, which
+    /// takes minutes. Run it with
+    /// `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --lib \
+    /// -- --ignored --nocapture the_seeding_cost_of_an_in_process_compile`.
+    #[test]
+    #[ignore = "measurement: compiles real stdlib sources in-process (minutes in the debug profile)"]
+    fn the_seeding_cost_of_an_in_process_compile() {
+        let root = source_root();
+        let sources: Vec<(&str, std::path::PathBuf)> = ["pool", "ordsets", "timer"]
+            .iter()
+            .map(|module| {
+                (
+                    *module,
+                    root.join("lib/stdlib/src").join(format!("{module}.erl")),
+                )
+            })
+            .collect();
+        for (module, src) in &sources {
+            if !src.is_file() {
+                crate::context::test_support::skip_loudly(
+                    "gc-walk seeding cost",
+                    &format!("no stdlib source to compile at {} for `{module}`", src.display()),
+                );
+                return;
+            }
+        }
+
+        for (module, src) in &sources {
+            let mut runtime = booted_runtime();
+            let out = crate::context::test_support::scratch_dir(&format!("gc_walk_cost_{module}"));
+            let expr = format!(
+                "compile:file({:?}, [no_spawn_compiler_process, deterministic, no_docs, \
+                 {{outdir, {:?}}}])",
+                src.to_str().expect("an ASCII source path"),
+                out.path().to_str().expect("an ASCII temporary path"),
+            );
+
+            seed_counters::reset();
+            let started = std::time::Instant::now();
+            let result = runtime
+                .eval(&expr)
+                .unwrap_or_else(|error| panic!("the in-process `{module}` compile: {error}"));
+            let elapsed = started.elapsed();
+            let counts = seed_counters::snapshot();
+            let rendered = runtime
+                .format_term_w(result, None)
+                .expect("the compile result prints");
+            assert_eq!(
+                rendered.trim(),
+                format!("{{ok,{module}}}"),
+                "the in-process compile of `{module}` must answer `{{ok,{module}}}`"
+            );
+
+            let walks = counts.walks.max(1) as f64;
+            eprintln!(
+                "gc-walk seeding {module} ({} lines): {:.0} ms | walks {} | roots/walk {:.1} | \
+                 register words/walk {:.1} | root-buffer allocations {} | collections {}",
+                std::fs::read_to_string(src)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0),
+                elapsed.as_secs_f64() * 1e3,
+                counts.walks,
+                counts.root_words as f64 / walks,
+                counts.register_words as f64 / walks,
+                counts.buffer_allocations,
+                runtime.gc_stats().collections,
+            );
+            // The buffer grows a handful of times as the deepest root set it meets grows; it is
+            // **not** allocated per walk (which is what a per-call `Vec::new()` did).
+            assert!(
+                counts.buffer_allocations <= 32,
+                "{module}: the root buffer was allocated {} times over {} walks — it is not being \
+                 reused",
+                counts.buffer_allocations,
+                counts.walks
+            );
         }
     }
 }
