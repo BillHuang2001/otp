@@ -21,7 +21,7 @@ The Erlang side never sends a control *verb*: `erlang:port_control(Port, Op, Dat
 
 #### Served vs refused, per driver
 `op` = `code + 0x03f1_a300`. "Served" means the decoded opcode is routed to the **same verb body** the named form uses (never a second implementation).
-Every row is cross-checked byte-for-byte against the system `tcp_inet` port by the `erl` matrix in `opcode_tests.rs::oracle_matrix` (bare / opened / listening / closed states, one `erl` run).
+Every row is cross-checked byte-for-byte against the system driver by two `erl` matrices — `opcode_tests.rs::oracle_matrix` (the `tcp_inet` half, 80 calls) and `opcode_tests_udp.rs::oracle_matrix` (the `udp_inet` half, 89 calls) — each driving bare / opened / listening-or-bound / connected / post-close states in one `erl` run.
 
 **Served — the reply is exact.** The whole arm is implemented, success included.
 
@@ -36,16 +36,16 @@ Every row is cross-checked byte-for-byte against the system `tcp_inet` port by t
 | 7 | `Setopts` | served | served | `[opt, val_be32]*` records | `[1]`, or the whole-reply `[0]einval` |
 | 8 | `Getopts` | served | served | one-byte codes | `[1] ++ [opt, val_be32]*`, or `[0]einval` |
 | 11 | `Getstat` | served | served | empty ⇒ `[1]`; a bad `INET_STAT_*` op ⇒ `badarg` (the C's `-1` return) | |
-| 12 | `Gethostname` | served (`len != 0` ⇒ `[0]einval`) | typed gap | — | `[1] ++ gethostname(2)` |
+| 12 | `Gethostname` | served (`len != 0` ⇒ `[0]einval`) | served | — | `[1] ++ gethostname(2)` — a plain syscall, no resolver (`:11219`) |
 | 14 | `Getfd` | served | served | — | `[1] ++ fd_be32`, socket-less ⇒ `[0]einval` |
 | 15 | `Gettype` | served | served | — | the **cached** `[1,0,0,0,family_be32,type_be32]` — `[1,0,0,0,1,0,0,0,1]` for a stream, `…,2` for a datagram, and the cached pair **survives a `close`**; nothing cached ⇒ `[0]einval` |
 | 16 | `Getstatus` | served | served | — | `[1,0,0,0,Code]` — `InetState::state_code()`: Closed 0, Open 1, Connected 5, Listening 9, Connecting 17 |
-| 19 | `Setname` | served | typed gap | `len == 0` clears, `len == 1` ⇒ `[0]einval`, else `inet_set_faddress` | `[1]` (stored), or `[0]einval`/`[0]eafnosupport` |
-| 20 | `Setpeer` | served | typed gap | as `Setname` | `[1]` (stored), or `[0]einval`/`[0]eafnosupport` |
+| 19 | `Setname` | served | served | `len == 0` clears, `len == 1` ⇒ `[0]einval`, else `inet_set_faddress` | `[1]` (stored), or `[0]einval`/`[0]eafnosupport` |
+| 20 | `Setpeer` | served | served | as `Setname` | `[1]` (stored), or `[0]einval`/`[0]eafnosupport` |
 | 26 | `Accept` | served (`len == 4`, else `[0]einval`) | `[0]exbadport` | `Timeout(4)`, validated then unused | the `accept` verb's |
 | 27 | `Listen` | served | `[0]exbadport` (the C's arm is SCTP-only, `:14846`) | `[backlog_hi, backlog_lo]` | `[1]` |
-| 29 | `Getladdrs` | served (`len != 4` ⇒ `[0]einval`, then `!IS_OPEN` ⇒ `[0]exbadport`) | typed gap | — | **byte-identical to the `NAME` reply** — the C's non-SCTP fallback calls `sock_name` and never reads `name_ptr` (`:11341`) |
-| 30 | `Getpaddrs` | served (same guards) | typed gap | — | **byte-identical to the `PEER` reply**, likewise ignoring `peer_ptr` (`:11261`) |
+| 29 | `Getladdrs` | served (`len != 4` ⇒ `[0]einval`, then `!IS_OPEN` ⇒ `[0]exbadport`) | served | — | **byte-identical to the `NAME` reply** — the C's non-SCTP fallback calls `sock_name` and never reads `name_ptr` (`:11341`) |
+| 30 | `Getpaddrs` | served (same guards) | served | — | **byte-identical to the `PEER` reply**, likewise ignoring `peer_ptr` (`:11261`) |
 | 42 | `TcpRecv` | served (connection guard **first**, then `active || len != 8` ⇒ `[0]einval`) | `[0]exbadport` | `Timeout(4), Length(4)`, validated then unused | the synchronous `recv` verb's |
 | 43 | `TcpUnrecv` | served (connection guard first) | `[0]exbadport` | the bytes to push back | `[1]`; the operand is spliced to the **front** of `pending_input`, so the next `recv` yields it first |
 | 44 | `TcpShutdown` | served (connection guard first, then `len != 1` ⇒ `[0]einval`) | `[0]exbadport` | the `TCP_SHUT_*` byte | the `shutdown` verb's |
@@ -55,11 +55,11 @@ Every row is cross-checked byte-for-byte against the system `tcp_inet` port by t
 
 | code | opcode | TCP / UDP | refusals served | the missing capability behind the success path |
 |---|---|---|---|---|
-| 13 | `Fdopen` | TCP refusal-only, UDP typed gap | `len` not 6/10 ⇒ `[0]einval`; family ≠ `INET_AF_INET` ⇒ `[0]eafnosupport`; type ≠ `INET_TYPE_STREAM` ⇒ `[0]einval` | adopting a caller's descriptor into the live port and re-registering it (`beam_rt` owns the `open_port({fd,N})` path today) |
-| 17 | `Getservbyname` | TCP refusal-only, UDP typed gap | `len < 2` ⇒ `[0]einval` | the `getservbyname(3)` lookup and its term-encoded service record |
-| 18 | `Getservbyport` | TCP refusal-only, UDP typed gap | `len < 3` ⇒ `[0]einval` | the `getservbyport(3)` lookup (same record shape) |
-| 21, 22, 23, 25 | `Getiflist` / `Ifget` / `Ifset` / `Getifaddrs` | TCP refusal-only, UDP typed gap | `!IS_OPEN` ⇒ `[0]exbadport` | a `getifaddrs(3)` interface walk and the C's address-record encoding (`:11067`-`:11109`) |
-| 28 | `Ignorefd` | TCP refusal-only, UDP typed gap | `!IS_CONNECTED` ⇒ `[0]enotconn`; `stype != SOCK_STREAM` ⇒ `[0]einval` | "suppress read **and** write readiness" — this driver keeps one flipped `Interest` mask, so it could not honour the reply it gave |
+| 13 | `Fdopen` | both drivers | `len` not 6/10 ⇒ `[0]einval`; family ≠ `INET_AF_INET` ⇒ `[0]eafnosupport`; type is neither stream nor datagram ⇒ `[0]einval` | adopting a caller's descriptor into the live port and re-registering it (`beam_rt` owns the `open_port({fd,N})` path today) |
+| 17 | `Getservbyname` | both drivers | `len < 2` ⇒ `[0]einval` | the `getservbyname(3)` lookup and its term-encoded service record |
+| 18 | `Getservbyport` | both drivers | `len < 3` ⇒ `[0]einval` | the `getservbyport(3)` lookup (same record shape) |
+| 21, 22, 23, 25 | `Getiflist` / `Ifget` / `Ifset` / `Getifaddrs` | both drivers | `!IS_OPEN` ⇒ `[0]exbadport` | a `getifaddrs(3)` interface walk and the C's address-record encoding (`:11067`-`:11109`) |
+| 28 | `Ignorefd` | both drivers | `!IS_CONNECTED` ⇒ `[0]enotconn`; `stype != SOCK_STREAM` ⇒ `[0]einval` (so the datagram driver always lands here) | "suppress read **and** write readiness" — this driver keeps one flipped `Interest` mask, so it could not honour the reply it gave |
 | 45 | `TcpSendfile` | TCP refusal-only, UDP `[0]exbadport` | `len != 20` ⇒ `[0]einval` (**before** the connection check); then `!IS_CONNECTED` ⇒ `[0]enotconn` | `sendfile(2)` plumbing plus the C's dup-file/offset bookkeeping (`:12380`) |
 
 **Typed gap in every state** — no refusal is modelled because the C has no refusal to reproduce:
@@ -70,7 +70,8 @@ Every row is cross-checked byte-for-byte against the system `tcp_inet` port by t
 
 **Neither switch owns the number** ⇒ `[0]exbadport` for both drivers: `Unknown`, a wrapped/sub-magic `Op`, and a number that is a case of *the other* driver's switch (`PACKET_REQ_RECV` on TCP, `TCP_REQ_*`/`Accept` on UDP). On the datagram driver `Listen`(27) also lands here (`[0]exbadport`, SCTP compiled out).
 
-A refused opcode is **never** a fabricated success and never an invented number, and every named verb keeps answering exactly what it answered before (`tests::*` pin those replies byte-for-byte). The five unserved shared arms (`Gethostname`/`Fdopen`/`Getserv{by,byname}`/… on **UDP**) are flat typed gaps there — the datagram driver models none of their refusals.
+A refused opcode is **never** a fabricated success and never an invented number, and every named verb keeps answering exactly what it answered before (`tests::*` pin those replies byte-for-byte).
+The two drivers are **symmetric** on every arm of the shared `inet_ctl` switch (`:10988`): the datagram half reproduces each of its refusals too, so a shared row's "served"/"refusal-only" status is the same for TCP and UDP — only the per-driver switches (`tcp_inet_ctl` / `packet_inet_ctl`) and `Sendfile` differ.
 
 ### `mod.rs` — the driver
 - `DRIVER_NAME: &str = "tcp_inet"`; `make_tcp_inet() -> Result<Box<dyn Driver>>` (the `DriverFactory`).
@@ -205,20 +206,24 @@ All four need a change **outside** `src/drivers/inet/`; each is a real `gen_tcp`
 - **`SUBSCRIBE`(24) is a typed gap in every state** — its only op registers a driver-side subscriber for the empty-output-queue notification (`inet_subscribe`, `:10819`), i.e. a driver→owner message channel this crate's `Driver`/`PortNotification` seam has no room for. Answering the C's `[1] ++ op ++ be32(outq)` without ever sending that notification would be a wrong promise.
 - **The fake endpoint is a *reporting* substitution only.** `SETNAME`/`SETPEER` store an `InetAddr` that `NAME`/`PEER` then render; nothing binds, connects or resolves to it, and `GETLADDRS`/`GETPADDRS` keep asking the kernel — exactly the C's split (`desc->name_ptr`/`peer_ptr` are read only by `NAME`/`PEER`, `:11365`, `:11270`).
 - **File sizes (`wc -l`, this subtree).** Over the baseline: `tests.rs` **1789** (a source-half-less
-  suite, the documented split-from-source pattern) and `packet.rs` **1245** (one decoder per
-  `{packet, N}` type — splitting it would scatter a single table). At/over 1000 in `mod.rs` **1484**
-  (the driver + its verb table + docs; its suite already lives in `tests.rs`). Under 1000:
-  `opt.rs` 937, `opcode_tests.rs` 886, `udp.rs` 810, `frame_tests.rs` 769, `udp/udp_tests.rs` 647,
-  `sys.rs` 532, `opcode.rs` 488, `opcode_tests_udp.rs` 448, `frame.rs` 387, `wire.rs` 377.
+  suite, the documented split-from-source pattern), `mod.rs` **1698** (the driver + its verb table +
+  docs; its suite already lives in `tests.rs`), `packet.rs` **1245** (one decoder per `{packet, N}`
+  type — splitting it would scatter a single table), `udp.rs` **1143** (the datagram driver + its
+  verb table + docs; its suite is `udp/udp_tests.rs`) and `opcode_tests.rs` **1033** (its
+  state-machine half is split into `opcode_tests_states.rs`). Near the target:
+  `opcode_tests_udp.rs` 994, `opt.rs` 937, `frame_tests.rs` 769, `udp/udp_tests.rs` 647, `sys.rs`
+  592, `opcode_tests_states.rs` 491, `opcode.rs` 488, `wire.rs` 446, `frame.rs` 387.
   If a source half grows, split its test module into a sibling file — the patterns here are
-  `opcode_tests.rs`/`opcode_tests_udp.rs` and `udp/udp_tests.rs`.
+  `opcode_tests.rs`/`opcode_tests_udp.rs`/`opcode_tests_states.rs` and `udp/udp_tests.rs`.
 - Non-obvious framing divergences recorded in code: an out-of-range `{packet,N}` code is treated as **no framing** where the C's `packet_get_length` `default:` rejects it (`inet/frame.rs:96-105`); an unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).
 
 ## Test Strategy
-Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN** (sandbox `$HOME` read-only — always the wrapper; never `cd`). The crate is at **718 passed / 0 failed / 2 ignored** (518 lib + 197 across the 23 `tests/*.rs` suites + 3 doctests; 2 doctests `ignore`d).
-- **In-module, this subtree — 188 tests:** `packet.rs` **62**, `tests.rs` **33**, `udp/udp_tests.rs` **25**, `opcode_tests.rs` **16**, `frame_tests.rs` **15**, `frame.rs` **13**, `opcode_tests_udp.rs` **11**, `opcode.rs` **7**, `opt.rs` **6**.
+Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN** (sandbox `$HOME` read-only — always the wrapper; never `cd`). The crate is at **747 passed / 0 failed / 2 ignored** (547 lib + 197 across the 21 `tests/*.rs` suites + 3 doctests; 2 doctests `ignore`d).
+- **In-module, this subtree — 209 tests:** `packet.rs` **62**, `tests.rs` **33**, `udp/udp_tests.rs` **25**, `opcode_tests_udp.rs` **21**, `opcode_tests.rs` **16**, `frame_tests.rs` **15**, `frame.rs` **13**, `opcode_tests_states.rs` **11**, `opcode.rs` **7**, `opt.rs` **6**.
 - `tests.rs` — the wire/reply vocabulary, argument decoding, the lifecycle and verb round trips over **real loopback sockets**, the latched peer-close state machine, and the socket-less / unconnected / connected **port-command** contract (`Driver::output` **and** `Driver::ready_output`).
-- `opcode_tests.rs` / `opcode_tests_udp.rs` — the **numeric opcode bridge** driven through a **real `PortRegistry` port** with `PortRegistry::port_control(port, &opcode.to_string(), &arg)` (the runtime's own route): the lifecycle verbs, `Gettype`/`Getstat`/`Getstatus`/`Getfd`/`Peer`, the operand validation of `Connect`/`Accept`/`TcpRecv`/`PacketRecv`, the cross-driver `[0]exbadport` refusals, the wrapped/sub-magic (`"1"`, `"99"`) refusals, the typed `not_served` gaps, **named-vs-numeric reply equality**, and one `erl` **opcode matrix per driver** (41 compared rows) cross-checked byte-for-byte.
+- `opcode_tests.rs` / `opcode_tests_udp.rs` / `opcode_tests_states.rs` — the **numeric opcode bridge** driven through a **real `PortRegistry` port** with `PortRegistry::port_control(port, &opcode.to_string(), &arg)` (the runtime's own route): the lifecycle verbs, `Gettype`/`Getstat`/`Getstatus`/`Getfd`/`Peer`, the operand validation of `Connect`/`Accept`/`TcpRecv`/`PacketRecv`, the cross-driver `[0]exbadport` refusals, the wrapped/sub-magic (`"1"`, `"99"`) refusals, the typed `not_served` gaps, and **named-vs-numeric reply equality**.
+  `opcode_tests_states.rs` is the state-machine suite split out of `opcode_tests.rs` (which would otherwise pass the ~1000-line target): the cached-`stype` post-close `GETTYPE` rows, the fake `SETNAME`/`SETPEER` endpoint, the `GETLADDRS`/`GETPADDRS` fallbacks, the `IGNOREFD`/`Fdopen`/`Getservby*` refusal ladders, and the C's guard **order** (state before operand length).
+  Each driver also gets one `erl` **oracle matrix** compared byte-for-byte: **80 calls** for `tcp_inet`, **89** for `udp_inet`.
 - `udp/udp_tests.rs` — the datagram driver's verbs over real loopback datagram sockets (the open/bind/send/recv round trip with its source address, the connected-socket send, the option wire), the socket-less/unconnected command refusals, the `udp_inet` name, and **two `erl`-oracle cross-checks** (the open/bind/close reply bytes and the oracle's `port_info(Port, name)`).
 - `frame_tests.rs` — the `{packet, N}` read path over real loopback sockets, cross-checking the delivered payloads against the system `gen_tcp` oracle.
 - **Crate-level integration `tests/inet.rs` (8):** a loopback byte round trip through a `"tcp_inet"` port created via the `DriverRegistry`; a stalled write arming write-readiness + an unknown verb's `BadArg`; the post-close `[0]closed` shape; a reactor-observed peer close releasing the registration; and **three `erl`-oracle cross-checks** (`the_covered_control_replies_…`, `the_peer_close_replies_…`, `the_socket_option_replies_…`) plus `the_driver_state_option_replies_agree_with_the_erl_oracle`.
@@ -229,14 +234,15 @@ Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p b
 - `mod.rs` → `TcpInetDriver`, `DRIVER_NAME`, `make_tcp_inet`, `InetState` (+`state_code`), `PeerClose`, `pending_input`, the `control` two-form dispatch + `control_opcode` (the TCP half), the poller read/write paths, `write_pending` (the no-connection refusal), `accept`/`close`, module docs (the verb table + the absent-by-design list)
 - `opcode.rs` → `CONTROL_MAGIC_NUMBER`, `Scope`, `Opcode` (+`code`/`from_code`/`scope`/`name`/`not_served`/`ALL`), `decode`, `decimal_to_u32` (the wrapping mod-2³² decimal decode)
 - `udp.rs` → `UdpInetDriver`, `UDP_DRIVER_NAME`, `make_udp_inet`, `DATAGRAM_CHUNK`, the datagram `control` two-form dispatch + `control_opcode` (the UDP half), the `recv`-carries-the-source-address reception model, `write_pending` (the no-peer refusal), `stop`/`Drop`
-- `wire.rs` → `INET_REP_*`/`INET_AF_*`/`INET_TYPE_*`/`INET_PROTO_*`/`TCP_SHUT_*`, `InetAddr`/`parse_address`/`pack_address`/`split_address`, `ctl_ok`/`ctl_error`/`ctl_xerror`, `errno_name`, and the shared reply builders `getstat_reply`/`gettype_reply`/`getfd_reply`/`getstatus_reply`/`name_reply`/`peer_reply`
+- `wire.rs` → `INET_REP_*`/`INET_AF_*`/`INET_TYPE_*`/`INET_PROTO_*`/`TCP_SHUT_*`, `InetAddr`/`parse_address`/`pack_address`/`split_address`, `FakeAddress`/`parse_fake_address` (the `SETNAME`/`SETPEER` decoder, switching on the **cached** family), `ctl_ok`/`ctl_xerror`/`ctl_error`, `errno_name`, and the shared reply builders `getstat_reply`/`gettype_reply(family, stype)`/`getfd_reply`/`getstatus_reply`/`name_reply`/`packed_addr_reply`/`peer_reply`
 - `opt.rs` → `SocketOptions`, `set_options`/`get_options`, `resolve`, the `INET_OPT_*`/`TCP_OPT_NODELAY`/`INET_LOPT_*`/`INET_ACTIVE`/`INET_INFINITY`/`INET_ONCE`/`INET_MULTI`/`INET_PASSIVE`/`INET_MODE_*`/`INET_DELIVER_*`/`INET_PACKET_POLL` codes
 - `packet.rs` → `PacketType`/`PacketLength`/`PacketOptions`/`DEFAULT_DELIMITER`, the per-type decoders, `payload_range`, `mod tests` (62)
 - `frame.rs` → `options`/`framed`/`write_header`/`extract`, `mod tests` (13)
-- `sys.rs` → the raw `libc` socket wrappers + `get_socket_int_option`/`set_socket_int_option` + `local_address`/`peer_address`; the datagram family `dgram_socket_fd`/`bind_socket`/`connect_socket`/`send_to`/`send_connected`/`recv_from`
+- `sys.rs` → the raw `libc` socket wrappers + `get_socket_int_option`/`set_socket_int_option` + `local_address`/`peer_address`/`local_port`/`has_peer`/`is_listening`/`socket_error`/`socket_type` (`getsockopt(SO_TYPE)`)/`hostname` (`gethostname(2)`, no resolver) + `shutdown_socket`/`close_fd`; the datagram family `dgram_socket_fd`/`bind_socket`/`connect_socket`/`send_to`/`send_connected`/`recv_from`
 - `tests.rs` → the in-module suite (33)
-- `opcode_tests.rs` → the numeric-opcode suite + `erl` opcode matrix for `tcp_inet` (16), and the shared matrix helpers the UDP sibling imports
-- `opcode_tests_udp.rs` → the numeric-opcode suite + `erl` opcode matrix for `udp_inet` (11)
+- `opcode_tests.rs` → the numeric-opcode suite + the 80-call `erl` opcode matrix for `tcp_inet` (16), and the shared matrix helpers the UDP and states siblings import
+- `opcode_tests_udp.rs` → the numeric-opcode suite + the 89-call `erl` opcode matrix for `udp_inet` (21)
+- `opcode_tests_states.rs` → the numeric bridge's state-machine suite: cached-`stype` post-close `GETTYPE`, the fake `SETNAME`/`SETPEER` endpoint, the `GETLADDRS`/`GETPADDRS` fallbacks, the refusal ladders and the C's guard order (11)
 - `frame_tests.rs` → the in-module framing suite (15)
 - `udp/udp_tests.rs` → the in-module datagram suite (25)
 - `../../../tests/inet.rs` → the crate-level integration + `erl`-oracle suite (8) (parent node)
