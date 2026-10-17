@@ -48,7 +48,7 @@ use super::run::{
     reset_registered_payload_total, reset_run_slice_counters, run_slice_counters, RuntimeRunner,
 };
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
-use crate::context::RuntimeContext;
+mod reds_door;use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
 fn runtime() -> Runtime {

@@ -134,7 +134,16 @@ pub(crate) struct GcState {
     /// BIF and served at a point that owns the executing machine's root set (see
     /// [`Runtime::request_gc`]).
     requested: HashSet<ProcessId>,
-    /// The **asynchronous** `erlang:garbage_collect/2` requests still owed a completion
+    /// The reductions each pid has accumulated since its last **reduction/yield-boundary**
+    /// collection ([`crate::context::gc::collect_at_reds_boundary`]).
+    ///
+    /// The interval gate of the slice-end door: a pre-emption may collect a process's heap at
+    /// most once per [`crate::context::gc::REDS_BOUNDARY_MIN_REDS`] of accumulated work, so a
+    /// pid is absent here until its first boundary and an entry is removed the moment the door
+    /// resets it. A `HashMap` rather than a set: the entry carries the *count*, so several
+    /// short slices add up to one boundary. A terminated pid's entry is pruned with the forced
+    /// requests ([`Runtime::prune_gc_requests`]) — its heap is gone, so the count is noise.
+    reds_since_boundary: HashMap<ProcessId, u32>,    /// The **asynchronous** `erlang:garbage_collect/2` requests still owed a completion
     /// message, in **request order**, at most one entry per **target** pid (see
     /// [`AsyncGcCompletion`]).
     ///
@@ -222,7 +231,7 @@ impl GcState {
             pinned: HashSet::new(),
             halted: HashSet::new(),
             requested: HashSet::new(),
-            async_completions: Vec::new(),
+            reds_since_boundary: HashMap::new(),            async_completions: Vec::new(),
             foreign: ForeignLatch::default(),
             walk: WalkScratch::default(),
             disabled: false,
@@ -582,11 +591,43 @@ impl Runtime {
         if !self.gc.requested.is_empty() {
             self.gc.requested.retain(|pid| table.contains(*pid));
         }
+        if !self.gc.reds_since_boundary.is_empty() {
+            self.gc.reds_since_boundary.retain(|pid, _| table.contains(*pid));
+        }
         if !self.gc.foreign.borrow().is_empty() {
             self.gc.foreign.borrow_mut().retain(|pid| table.contains(*pid));
         }
     }
-
+    /// Adds `reds` to the reductions `pid` has accumulated since its last
+    /// **reduction/yield-boundary** collection, returning the new total.
+    ///
+    /// The interval half of the slice-end door
+    /// ([`crate::context::gc::collect_at_reds_boundary`]): the caller passes the reduction count
+    /// its just-ended slice spent and gets back the pid's running total, which it compares
+    /// against [`crate::context::gc::REDS_BOUNDARY_MIN_REDS`]. Adding up (rather than replacing)
+    /// is what makes several short pre-emptions equal one boundary, so a process cannot avoid
+    /// the door by yielding early every time.
+    ///
+    /// Saturating: a process that somehow outlived `u32::MAX` accumulated reductions is over any
+    /// boundary — never a panic, never a wrap back below the threshold.
+    pub(crate) fn accumulate_reds_since_gc_boundary(&mut self, pid: ProcessId, reds: u32) -> u32 {
+        let total = self
+            .gc
+            .reds_since_boundary
+            .entry(pid)
+            .and_modify(|total| *total = total.saturating_add(reds))
+            .or_insert(reds);
+        *total
+    }
+    /// Clears `pid`'s accumulated reduction interval — the boundary was just reached and the
+    /// door ran (or declined past the interval gate, which is the same thing from the interval's
+    /// point of view: the next window starts here).
+    pub(crate) fn reset_reds_since_gc_boundary(&mut self, pid: ProcessId) {
+        if self.gc.reds_since_boundary.is_empty() {
+            return;
+        }
+        self.gc.reds_since_boundary.remove(&pid);
+    }
     /// Records that a collection ran.
     ///
     /// This is the **kind-only** half: the engine's heap-admission doors

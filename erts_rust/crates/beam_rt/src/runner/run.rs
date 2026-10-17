@@ -211,8 +211,64 @@ impl<'a> RuntimeRunner<'a> {
     pub(crate) fn new(runtime: &'a mut Runtime, state: &'a mut RunnerState) -> RuntimeRunner<'a> {
         RuntimeRunner { runtime, state }
     }
+    /// Runs the **reduction/yield-boundary** collection point over a just-parked machine — the
+    /// slice-end door of [`crate::context::gc::collect_at_reds_boundary`].
+    ///
+    /// A slice has already ended here, which is the one moment a process that never reaches a
+    /// heap-admission point can be collected at: a loop whose body allocates only through
+    /// registered BIFs (`_ = list_to_tuple(lists:seq(1, 400)), loop(N - 1)`) emits no
+    /// `test_heap`/`allocate_heap`, so [`RuntimeContext::alloc_words`] and the BIF-result
+    /// copy-out can only **grow** the nursery and its retired-space chain — the summed capacity
+    /// `process_info(P, garbage_collection)` reports as `heap_size` — with the loop count.
+    ///
+    /// # Why it fires far from every slice
+    ///
+    /// The door's own two gates keep this off the per-slice path: the **reduction interval**
+    /// ([`crate::context::gc::REDS_BOUNDARY_MIN_REDS`], accumulated per pid) means at most one
+    /// collection per slice budget, and the **occupancy watermark** means none at all over a
+    /// nursery that is barely used. Both are typed no-ops, so a declined boundary costs one map
+    /// probe and two word counts.
+    ///
+    /// # The window must be a publishing one
+    ///
+    /// `park_machine` publishes the machine's whole root set only for a **non-exempt** window;
+    /// an exempt park (a live FR prefix at the slice's end) published nothing and its machine
+    /// stays the authoritative root set, so a collection here would leave the machine's own
+    /// words dangling into the evacuated from-space. `engine.parked_published` is exactly that
+    /// answer, so an exempt window is refused before any context is built.
+    ///
+    /// The machine is handed over through
+    /// [`Machine::with_roots`](beam_engine::Machine::with_roots) (`RootSet::ALL_LIVE`, which the
+    /// door narrows to each register file's pointer-bearing prefix), and `fr_count` is the count
+    /// this park published — the resume re-reads **the same** count, so a different one here
+    /// would mis-size the FR region and halt the process's collection.
+    ///
+    /// # Errors
+    ///
+    /// The door itself never errs (a failed collection halts collection for that pid). The
+    /// `Result` is for the context's own construction-time failures, propagated with `?` exactly
+    /// as the other slice-level seams do.
+    fn collect_at_reds_boundary(
+        &mut self,
+        table: &mut ProcessTable,
+        pid: ProcessId,
+        engine: &mut ProcessEngine,
+        fr_count: usize,
+        used: u32,
+    ) -> Result<()> {
+        if !engine.parked_published {
+            return Ok(());
+        }
+        let mut ctx =
+            RuntimeContext::for_process_with_engines(&mut *self.runtime, table, pid, self.state);
+        if let Some(module) = engine.entry.entry_module() {
+            ctx.enter_module(module);
+        }
+        engine.machine.with_roots(RootSet::ALL_LIVE, |roots| {
+            gc::collect_at_reds_boundary(&mut ctx, roots, fr_count, used)
+        })
+    }
 }
-
 /// Resolves a process engine's **current execution site** for the debug trace —
 /// `module:function /arity +pc instr=…` — or `None` when no position is resolvable.
 ///
@@ -1046,8 +1102,15 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // resume has cleared the mark — serves it. (An exempt window publishes nothing and
             // collects nothing, so both halves agree: nothing moved.)
             self.runtime.serve_gc_request(table, pid);
-            self.state.engines.insert(pid, engine);
-            // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended at
+            // The **reduction/yield-boundary** collection point: a slice has already ended, so
+            // this is where a process whose loop reaches no heap-admission point (BIF-only
+            // allocation — the unrooted `alloc_words` seam and the BIF-result copy-out can only
+            // grow the nursery) is collected over its just-published root set. Its own interval
+            // and occupancy gates keep it off the per-slice path, and it refuses an **exempt**
+            // park outright (nothing was published for that window, so the machine stays the
+            // authoritative root set). See `RuntimeRunner::collect_at_reds_boundary`.
+            self.collect_at_reds_boundary(table, pid, &mut engine, fr_count, used)?;
+            self.state.engines.insert(pid, engine);            // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended at
             // the `Yield` (pre-emption) arm.
             #[cfg(test)]
             note_slice_parked(true);

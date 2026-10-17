@@ -161,12 +161,55 @@ pub(super) fn mode_from_value(value: Option<&str>) -> JitMode {
 /// The variable's semantics are [`mode_from_value`]'s; an unset value is the default
 /// [`JitMode::Auto`] and an unknown one the always-correct [`JitMode::Interpreter`]. Read
 /// **once** (a `OnceLock`), so a long-running process pays no repeated `getenv`.
+///
+/// # The test-only override
+///
+/// Under `cfg(test)` [`forced`] answers first: a test that needs a specific tier for the
+/// *whole* process (a runtime driven through `Runtime::run_one_slice`, which builds its
+/// [`RunnerState`](super::entry::RunnerState) internally and so cannot be reached through
+/// [`RunnerState::jit_mode`](super::entry::RunnerState::jit_mode)'s field) pins it there.
+/// Production never consults it — the override does not exist outside `cfg(test)`, so the
+/// shipped behaviour is byte-identical.
 pub(super) fn env_default() -> JitMode {
+    #[cfg(test)]
+    if let Some(mode) = forced() {
+        return mode;
+    }
     static DEFAULT: OnceLock<JitMode> = OnceLock::new();
     *DEFAULT
         .get_or_init(|| mode_from_value(std::env::var("BEAM_RT_TIER").ok().as_deref()))
 }
-
+#[cfg(test)]
+thread_local! {
+    /// The tier this thread's runtimes are forced onto (see [`env_default`]), or `None`.
+    ///
+    /// **Per thread**, not a shared static: `cargo test` runs tests concurrently, and a shared
+    /// override would silently change another test's tier. The thread that spawns and drives a
+    /// runtime is the thread whose slices resolve the tier, so a `thread_local!` scopes the
+    /// override to exactly the test that set it.
+    static FORCED: std::cell::Cell<Option<JitMode>> = const { std::cell::Cell::new(None) };
+}
+/// This thread's forced tier, if [`force`] set one (see [`env_default`]).
+#[cfg(test)]
+pub(super) fn forced() -> Option<JitMode> {
+    FORCED.with(std::cell::Cell::get)
+}
+/// Forces every execution-tier decision on this thread onto `mode` until [`clear`].
+///
+/// The test-only knob behind [`env_default`]'s override: a test that must run a workload on a
+/// **deterministic** tier (the pre-emption counters of a reduction-bound loop only exist on the
+/// interpreter — a natively linked baseline block never crosses the per-instruction hook) calls
+/// this, and calls [`clear`] when it is done so a later test on the same harness thread is not
+/// affected.
+#[cfg(test)]
+pub(super) fn force(mode: JitMode) {
+    FORCED.with(|forced| forced.set(Some(mode)));
+}
+/// Drops this thread's forced tier ([`force`]), restoring the production resolution.
+#[cfg(test)]
+pub(super) fn clear() {
+    FORCED.with(|forced| forced.set(None));
+}
 /// The execution tier for a process's first entry.
 ///
 /// `runtime`, `state` and `entry` are not consulted: the baseline tier is sound for any module
