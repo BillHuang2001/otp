@@ -136,7 +136,7 @@
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
-use beam_gc::{Collection, CollectionKind};
+use beam_gc::{AnyCollector, Collection, CollectionKind};
 use beam_loader::{Instr, Module};
 use beam_process::{Process, ProcessTable, MAX_REG};
 use beam_term::Eterm;
@@ -264,6 +264,29 @@ fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
 /// nursery space, the current one or one a [`Process::grow_nursery`] growth retained, since a
 /// collection evacuates the whole chain — or its **mature** heap.
 ///
+/// # The scanned test: an aggregate fast reject, then the exact fallback
+///
+/// "Scanned" is decided in two tiers, and the second one exists only to skip work in the first:
+///
+/// 1. the current mutator block, directly ([`in_heap_block`]). It is the answer for the
+///    overwhelming majority of live roots and the cheapest test in the pipeline (two loads and
+///    two compares on the space the mutator is already touching), so it stays **first** — no
+///    term it accepts pays anything for the tier below.
+/// 2. everything else through [`outside_scanned`]: the collector's aggregate geometry,
+///    [`AnyCollector::scanned_bounds`], is read **once** and
+///    [`beam_gc::ScannedBounds::definitely_unscanned`] is asked first. Its `true` *proves* the address
+///    lies in no region the collector scans and answers without touching the nursery chain's
+///    ordered index or the mature space. Only when the aggregate cannot decide (a nursery space
+///    a growth retired, the mature generation, or a hole between two scanned regions) do the
+///    exact `young_contains`/`mature_contains` tests run.
+///
+/// The aggregate is a **superset** of every region the collector scans (each space contributes
+/// its reserved extent, see [`beam_gc::ScannedBounds`]), so this ordering can only remove work: an
+/// address the aggregate rejects would have been rejected by both exact tests anyway, and one
+/// it accepts gets the identical verdict from them. The valve's decisions are therefore
+/// byte-for-byte what the plain `young_contains || mature_contains` test answers, for every
+/// address.
+///
 /// # The childless exemption — why a foreign *leaf* does not decline
 ///
 /// A foreign container is a hazard only through the words it **forwards**: a copying collector's
@@ -296,14 +319,41 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
         return false;
     }
     let ptr = beam_term::list::ptr_val(term) as usize;
-    let foreign = !in_heap_block(process.heap(), ptr)
-        && !process.collector().young_contains(ptr as *const Eterm)
-        && !process.collector().mature_contains(ptr as *const Eterm);
+    let foreign = !in_heap_block(process.heap(), ptr) && outside_scanned(process.collector(), ptr);
     // A cons is header-less and always pointer-bearing; a boxed object only matters when the
     // collector would forward something out of it. The predicate runs only for a term already
     // known foreign, so a scanned term — the overwhelming majority of the per-word calls — pays
     // nothing new.
     foreign && (beam_term::prelude::is_list(term) || foreign_boxed_has_copy_children(term))
+}
+
+/// Whether `ptr` lies outside **every** region `collector` scans — the two-tier scanned test
+/// behind [`root_is_unscanned`], for an address already known to be outside the process's
+/// current mutator block.
+///
+/// Tier one is the collector's aggregate geometry: [`AnyCollector::scanned_bounds`] is one
+/// `O(1)`, allocation-free read (the nursery chain's half is cached inside the chain, the mature
+/// half is two reads of a space that never moves), and
+/// [`beam_gc::ScannedBounds::definitely_unscanned`] answers for **every** address outside it — the pooled
+/// BIF heaps, the `-eval` heap, the pointer-stable arena and a message heap fragment, which is
+/// what a foreign container really is — with two compares. That is exact, because the aggregate
+/// is a superset of every scanned region: a reject would have been a reject through the exact
+/// per-region tests too.
+///
+/// Tier two is those exact tests ([`AnyCollector::young_contains`] — the whole nursery chain,
+/// current space and growth-retired spaces, `O(log #spaces)` — then
+/// [`AnyCollector::mature_contains`]), run only when the aggregate **cannot** decide: an address
+/// in a hole between two scanned regions, in a space's reserved-but-unallocated tail, or on a
+/// free line of a mark-region mature generation. `may_contain == true` is never treated as
+/// containment (see [`beam_gc::ScannedBounds`] for why a fast accept would be unsound); it only means
+/// "ask them".
+fn outside_scanned(collector: &AnyCollector, ptr: usize) -> bool {
+    let bounds = collector.scanned_bounds();
+    if bounds.definitely_unscanned(ptr as *const Eterm) {
+        return true;
+    }
+    !collector.young_contains(ptr as *const Eterm)
+        && !collector.mature_contains(ptr as *const Eterm)
 }
 
 /// Whether the **boxed** object `term` names exposes at least one child slot the collector
@@ -1987,6 +2037,8 @@ pub(crate) mod prefix_counters {
 }
 #[cfg(test)]
 mod refs_plateau;
+#[cfg(test)]
+mod valve_bounds;
 #[cfg(test)]
 mod tests {
     //! Unit tests for the mechanical pieces of the adoption: the float guard scan, the safe
