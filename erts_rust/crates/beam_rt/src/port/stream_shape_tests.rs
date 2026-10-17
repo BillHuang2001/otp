@@ -48,7 +48,7 @@
 //! [`super::ram_file_matrix_tests`], and the exact `beam_io` change that closes it is recorded in
 //! this node's `CONTEXT.md` (*Handoffs*).
 use super::ram_file_matrix_tests::oracle_output;
-use super::tests::text_of;
+use super::tests::{skip_oracle_check, text_of};
 use super::*;
 use crate::config::RuntimeConfig;
 /// One measured reply: the `port_command/2` payload that provokes it, the reply bytes the driver
@@ -201,7 +201,6 @@ fn every_reply_kind_renders_the_oracles_stream_shape() {
                     oracle,
                     "{what}: every reply kind must render the oracle's term"
                 );
-                oracle_agreed += 1;
             }
             None => skip_oracle_check(what),
         }
@@ -271,7 +270,7 @@ fn a_line_frame_wraps_the_stream_shaped_payload() {
             .expect("the frame")
         };
         let framed = terms::tuple_element(binary, 0).expect("the `{eol|noeol, Data}` tuple");
-        assert_eq!(framed, make_atom(tag), "the frame's tag");
+        assert_eq!(framed, tag, "the frame's tag");
         let data = terms::tuple_element(binary, 1).expect("the frame's data");
         assert_eq!(
             terms::binary_bytes(data).expect("a binary-stream frame's data is a binary"),
