@@ -208,7 +208,11 @@ impl Collector {
     ///
     /// The selected collection's own `BeamError` — the typed heap exhaustion above for a minor
     /// that cannot fit, or an allocation failure. A `Minor` failure is never masked by a major.
-    pub fn collect_kind(&mut self, kind: CollectionKind, roots: &mut [Eterm]) -> Result<Collection> {
+    pub fn collect_kind(
+        &mut self,
+        kind: CollectionKind,
+        roots: &mut [Eterm],
+    ) -> Result<Collection> {
         let stats = match kind {
             CollectionKind::Minor => self.collect_minor(roots)?,
             CollectionKind::Major => self.collect_major(roots)?,
@@ -526,9 +530,7 @@ mod tests {
 
     use super::*;
     use beam_common::BeamError;
-    use beam_term::prelude::{
-        arityval, boxed_val, is_arity_value, make_small, signed_value,
-    };
+    use beam_term::prelude::{arityval, boxed_val, is_arity_value, make_small, signed_value};
 
     /// Allocates the 2-tuple `{1,2}` in the nursery.
     fn build_tuple(c: &mut Collector) -> Eterm {
@@ -639,7 +641,10 @@ mod tests {
         let heap = c.young_mut().heap_mut();
         let mut live = Vec::new();
         for i in 0..20i64 {
-            live.push(heap.cons(make_small(i), beam_term::prelude::NIL).expect("cell"));
+            live.push(
+                heap.cons(make_small(i), beam_term::prelude::NIL)
+                    .expect("cell"),
+            );
         }
         let mut roots = live.clone();
         assert!(

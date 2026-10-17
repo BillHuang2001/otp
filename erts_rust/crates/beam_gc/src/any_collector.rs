@@ -293,12 +293,18 @@ impl AnyCollector {
     /// # Errors
     ///
     /// The selected collection's own `BeamError`; a `Minor` failure is never masked by a major.
-    pub fn collect_kind(&mut self, kind: CollectionKind, roots: &mut [Eterm]) -> Result<Collection> {
+    pub fn collect_kind(
+        &mut self,
+        kind: CollectionKind,
+        roots: &mut [Eterm],
+    ) -> Result<Collection> {
         match self {
             AnyCollector::Copying(c) => c.collect_kind(kind, roots),
             AnyCollector::Immix(c) => c.collect_kind(kind, roots),
         }
-    }    /// Forces a **minor** collection on the selected strategy (escalation is bypassed).
+    }
+
+    /// Forces a **minor** collection on the selected strategy (escalation is bypassed).
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         match self {
             AnyCollector::Copying(c) => c.collect_minor(roots),
@@ -521,7 +527,8 @@ mod tests {
     /// The two mature strategies over one policy — the dispatch seam `beam_process` holds.
     fn strategies(policy: HeapPolicy) -> [AnyCollector; 2] {
         [
-            AnyCollector::from_config(&GcConfig::copying(policy.clone())).expect("copying collector"),
+            AnyCollector::from_config(&GcConfig::copying(policy.clone()))
+                .expect("copying collector"),
             AnyCollector::from_config(&GcConfig::immix(policy)).expect("immix collector"),
         ]
     }
@@ -574,7 +581,7 @@ mod tests {
             assert_eq!(
                 any.stats().major_collections,
                 1,
-                "{strategy:?}: the pinned minor added no major"
+                "{strategy:?}: the chosen major only — the pinned minor added none"
             );
 
             // The relocated root is a live, intact 2-tuple in the mature generation.
@@ -627,10 +634,17 @@ mod tests {
             let err = any
                 .collect_kind(CollectionKind::Minor, &mut roots)
                 .expect_err("the pinned minor must not fit");
-            assert!(matches!(err, BeamError::Alloc(_)), "{strategy:?}: got {err:?}");
+            assert!(
+                matches!(err, BeamError::Alloc(_)),
+                "{strategy:?}: got {err:?}"
+            );
 
             // No escalation, no copy, no counter and no geometry change.
-            assert_eq!(any.stats(), stats_before, "{strategy:?}: no counter advanced");
+            assert_eq!(
+                any.stats(),
+                stats_before,
+                "{strategy:?}: no counter advanced"
+            );
             assert_eq!(any.minor_gcs(), 0, "{strategy:?}");
             assert_eq!(any.mature_used_words(), mature_used, "{strategy:?}");
             assert_eq!(any.mature_capacity_words(), mature_capacity, "{strategy:?}");

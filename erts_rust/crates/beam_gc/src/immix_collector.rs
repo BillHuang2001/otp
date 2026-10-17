@@ -379,7 +379,11 @@ impl GenImmixCollector {
     /// The selected collection's own `BeamError` — the typed heap exhaustion above for a
     /// promotion that cannot fit, or an allocation failure. A `Minor` failure is never masked by
     /// a major.
-    pub fn collect_kind(&mut self, kind: CollectionKind, roots: &mut [Eterm]) -> Result<Collection> {
+    pub fn collect_kind(
+        &mut self,
+        kind: CollectionKind,
+        roots: &mut [Eterm],
+    ) -> Result<Collection> {
         let stats = match kind {
             CollectionKind::Minor => self.collect_minor(roots)?,
             CollectionKind::Major => self.collect_major(roots)?,
