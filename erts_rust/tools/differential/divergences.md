@@ -264,8 +264,36 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   where the oracle refuses it.
 
 ## A.4 — port/driver observable grammar (owner: `beam_rt` / `beam_io`)
+- **A built-in driver's reply bytes never reach its owner** (owner: `beam_rt`, `src/port.rs`): a
+  port opened as `{spawn_driver,"ram_file_drv"}` / `"udp_inet"` is a descriptor-less built-in port,
+  whose `Driver::output` queue is never harvested, so no reply term is observable. Measured:
+  `port_command(P, <<1,0,0,0,3,97,98,99>>)` then a 2 s `receive` ⇒ oracle
+  `{P,{data,<<3,0,0,0,0>>}}` vs `beam_rt` `timeout`; `port_info(P,input)` ⇒ oracle `{input,5}` vs
+  `beam_rt` `{input,0}`. Consequence: the whole `efile` reply matrix of `ram_file_drv` (the
+  `open`/`read`/`lseek`/`write`/`truncate`/… replies, the read-back bytes/eof/positions and the
+  `{error,…}` refusals) and every `udp_inet` datagram delivery are unpinnable. `src/corpus/ram_file.rs`
+  and `src/corpus/udp.rs` pin only the port-surface shapes that agree (driver name, `os_pid`, byte
+  counters, opcode acceptance, close/`badarg`); the exact probes are in their module docs.
+- **`erlang:port_control/3` reaches no built-in driver's named-verb transport** (owner: `beam_rt`
+  `src/port.rs` / `beam_io`): the operation is forwarded as the C-driver convention's decimal string
+  while the built-in inet drivers' `Driver::control` speaks named verbs, so no `INET_REQ_*` /
+  `PACKET_REQ_*` code is reachable. Measured `port_control(P, 1 + 16#03f1a300, <<1,2,0>>)` ⇒ oracle
+  `[1]` vs `beam_rt` `error:badarg`; this is the other blocker behind `gen_udp:open/2` (oracle
+  `{ok,Port}` vs `beam_rt` `{error,einval}`).
+- **`port_command/2` on a socket-less inet port**: the oracle raises `badarg` (the C `!IS_OPEN`
+  check), `beam_rt` answers `true`/`{true,none}`. Owner: `beam_rt` / `beam_io`.
+- **`port_info/2` item set**: `queue_size` and `memory` answer in the oracle (`{queue_size,0}`,
+  `{memory,48}`) and are `badarg` in `beam_rt`'s native `port_info/2` floor. Owner: `beam_rt`.
+- **Port exit signalling**: with the owner trapping exits, `port_close(P)` delivers
+  `{'EXIT',P,normal}` in the oracle and nothing in `beam_rt`; `erlang:monitor(port,P)` +
+  `port_close/1` behaves the same way. Owner: `beam_rt`.
+- **The registry names the oracle does not link**: `beam_rt` opens a live port for
+  `{spawn_driver,"fd"}` / `"efile"`, the oracle raises `badarg`. Owner: `beam_io` / `beam_rt`.
+- **Unimplemented port BIFs**: `erlang:port_connect/2` and `erlang:port_set_data/2` are typed exit-3
+  capability gaps, and `erlang:register/2` of a *port* under a name is unsupported. Owner:
+  `beam_bifs` / `beam_rt`.
 - The `{fd,…}` port grammar is disjoint; `eof` is never delivered; a non-iodata `port_command/2`
-  is accepted; `port_info(P,registered_name)` is `badarg`; only the oracle writes a
+  is accepted; only the oracle writes a
   missing-`{spawn,Cmd}` shell stderr line.
 - The **`{line,N}` half now agrees and is pinned**: the runtime reproduces the oracle's line framing
   exactly — the `{eol, Line}` / `{noeol, Line}` frames, the split at exactly N bytes with no EOL, the
@@ -362,17 +390,6 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 - `ets:match_spec_compile/1`: the empty **binary** `<<>>` is `badarg` on both (pinned by
   `specs/match_spec_compile_empty_spec_is_badarg`), but the empty **list** `[]` is `badarg` in the
   oracle and a compiled handle (`#Ref<…>`) in the Rust runtime. Owner: `beam_bifs`.
-- `ets:give_away/3` returns `true` on both, but the Rust runtime **never delivers the transfer
-  message** to the new owner, so the gift data is unobservable there. Measured with the new owner as
-  a child that replies:
-  `begin Parent=self(), T=ets:new(ets_give_away,[set]), ets:insert(T,{a,1}), P=spawn(fun() -> receive {'ETS-TRANSFER',_Tab,_From,Gift} -> Parent ! {gift,Gift} end end), ets:give_away(T,P,my_gift), receive {gift,Gift} -> Gift end end`
-  ⇒ oracle `my_gift`, exit `0`; Rust no stdout, stderr
-  `beam_rt: unsupported: receive: no matching message arrived`, **exit 3**. A child that forwards
-  *any* message (`receive Msg -> Parent ! {got,Msg} after 2000 -> Parent ! timeout end`) ⇒ oracle the
-  transfer `{true, Tab, From, my_gift}` (the `{'ETS-TRANSFER', Tab, From, Gift}` body) vs Rust
-  `{true,timeout}` — i.e. no message is sent at all. An honest exit-3 capability gap, so no case pins
-  it; the requested corpus id `ets/give_away_gift_data_reaches_the_new_owner` was therefore **not**
-  added. Owner: `beam_ets` / `beam_bifs`.
 - ETS access control: the mode set at `ets:new/2` **is** enforced — a non-owner `ets:lookup/2` of a
   `private` table and a non-owner `ets:insert/2` of a `private`/`protected` table raise
   `error:badarg` in both runtimes — but the raised **reason shape** differs: the rust runtime raises

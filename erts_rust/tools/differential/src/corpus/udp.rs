@@ -91,9 +91,7 @@
 //!   `beam_rt` (port exit signalling).
 //!
 //! The group therefore pins the whole port surface the driver *does* agree on, and nothing it
-//! does not — the upstream `driver_abi_extra` module doc's note that `udp_inet` was unpinnable
-//! ("the Rust runtime's built-in registry carries only `tcp_inet`") is superseded by the name
-//! resolution this group now pins.
+//! does not.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// One A.4 `udp_inet` eval case.
