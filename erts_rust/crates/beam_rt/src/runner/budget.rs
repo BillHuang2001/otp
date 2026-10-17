@@ -21,24 +21,60 @@
 //! The **reduction budget** of one scheduler slice and the slice context that charges it.
 //!
 //! [`BudgetProbe`] counts the reduction units a slice spends; [`BudgetContext`] is the wrapper
-//! [`ExecutionContext`] that charges it from the two seams the executing machine reaches — the
-//! interpreter's **per-instruction** hook ([`reduce`](ExecutionContext::reduce)) and the
-//! machine's **heap-admission points** ([`ensure_heap`](ExecutionContext::ensure_heap)/
+//! [`ExecutionContext`] that charges it from the seams the executing machine reaches — the
+//! interpreter's **per-instruction** hook ([`reduce`](ExecutionContext::reduce)), the machine's
+//! **heap-admission points** ([`ensure_heap`](ExecutionContext::ensure_heap)/
 //! [`ensure_heap_full`](ExecutionContext::ensure_heap_full), reached by
-//! `test_heap`/`allocate_heap`). See
+//! `test_heap`/`allocate_heap`) and — as a *pricing*, never refusing, charge — the two
+//! **call-resolution** seams
+//! ([`resolve_external_call`](ExecutionContext::resolve_external_call) for a `call_ext*`,
+//! [`resolve_local_call`](ExecutionContext::resolve_local_call) for a local call) plus the BIF
+//! dispatch ([`call_bif`](ExecutionContext::call_bif)/
+//! [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine)). See
 //! [`RuntimeRunner::run`](crate::runner::RuntimeRunner) for how the probe's exhaustion becomes a
 //! pre-emption.
 //!
-//! Every other [`ExecutionContext`] method — BIF/apply dispatch, the heap, the whole
-//! receive/message seam, the cross-module-call seam
-//! ([`resolve_external_call`](ExecutionContext::resolve_external_call)), the local-call seam
-//! ([`resolve_local_call`](ExecutionContext::resolve_local_call)) **and the
-//! execution-trace seam** ([`trace_enabled`](ExecutionContext::trace_enabled) /
+//! Every other [`ExecutionContext`] method — the heap, the whole receive/message seam, the local
+//! fun/apply seam ([`resolve_local_fun`](ExecutionContext::resolve_local_fun),
+//! [`apply_fun`](ExecutionContext::apply_fun)) **and the execution-trace seam**
+//! ([`trace_enabled`](ExecutionContext::trace_enabled) /
 //! [`trace_event`](ExecutionContext::trace_event)) — is forwarded to the slice's real
 //! [`RuntimeContext`] unchanged, so a scheduled process reports `call`/`return_from`/
 //! `return_to` events exactly as the single-pass `Runtime::run_*` path does, a
 //! `call_ext*` the host can run in-machine is entered in this very slice, and a local call the
 //! host serves as a BIF (a `prim_tty` NIF stub) is dispatched rather than jumped into.
+//!
+//! # The two kinds of charge: **refusing** and **spending**
+//!
+//! A charge can only end a slice where the engine propagates the seam's error **unchanged**
+//! *and* where the machine's recorded position is the instruction the charge belongs to (the
+//! runner parks at [`Machine::current_code`](beam_engine::Machine::current_code) and re-enters
+//! there). That splits the seams into two kinds:
+//!
+//! * **Refusing charges** ([`BudgetProbe::charge`]) hand back the typed `preemption: …` error
+//!   when the budget is spent, and the runner turns that into
+//!   [`RunOutcome::Yield`](beam_process::RunOutcome::Yield). They are taken where the engine
+//!   treats a seam error as a *propagating* failure and, crucially, **before** the instruction's
+//!   effect: [`reduce`](ExecutionContext::reduce) (charged by `Machine::drive` *after* it has
+//!   recorded the instruction as the machine's position) and the two `ensure_heap` doors
+//!   (`?`-propagated out of [`Machine::ensure_heap`], reached on the native tier through
+//!   `jit_test_heap`, which stores the instruction's position *before* the door —
+//!   `jit/baseline/runtime.rs:1442`). Those are the two seams the runner's `Yield` arm is
+//!   written for: both leave the machine parked **exactly on** the instruction that was not run.
+//! * **Spending charges** ([`BudgetProbe::spend`]) only *price* the work: they consume a unit
+//!   when the slice still has one and are a **silent no-op** otherwise — they never return an
+//!   error. Three seams are priced this way: the BIF dispatch
+//!   ([`call_bif`](ExecutionContext::call_bif)/
+//!   [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine)) and the two
+//!   **call-resolution** seams ([`resolve_external_call`](ExecutionContext::resolve_external_call)
+//!   for a `call_ext*`, [`resolve_local_call`](ExecutionContext::resolve_local_call) for a local
+//!   call). For the BIF seam it is deliberately the only safe shape: every engine arm that
+//!   dispatches a BIF folds a seam error **into BEAM semantics** — `gc_bif`/`bif` with a fail
+//!   label turns it into `Step::Goto(fail)` (`exec_bif`'s guard-failure arm), so a refusing
+//!   charge on a guard BIF would take the *fail* path without the BIF ever having run, and a
+//!   `call_ext`/`apply` lands it in a live catch frame (`raise_bif_error`). Either way a refused
+//!   BIF charge would be a **wrong result**, not a pre-emption. A `call_bif` mistake cannot be
+//!   undone by resuming either — see *exactly-once* below.
 //!
 //! # Why charging the per-instruction hook is safe
 //!
@@ -49,17 +85,86 @@
 //! instruction's effect **not yet applied** and the machine parked exactly on it, so
 //! [`Machine::resume_outcome`](beam_engine::Machine::resume_outcome) applies it **exactly once**
 //! — the same guarantee C's `DISPATCH` gives by checking and consuming `FCALLS` before the body.
-//! A loop that allocates nothing (`test_heap` is unreachable from it, and a `gc_bif` reaches
-//! only [`call_bif`](ExecutionContext::call_bif)) is thereby pre-emptible, which is precisely
-//! what a heap-admission charge alone cannot do.
 //!
-//! The two `ensure_heap` doors stay charged as well: they are the **only** charge a native
-//! baseline-JIT block reaches, because a compiled block runs natively and never crosses the
-//! per-instruction hook (see
-//! [`RuntimeRunner::run`](crate::runner::RuntimeRunner) for the residual limit that leaves on
-//! that tier). An interpreted instruction that also allocates is consequently charged twice —
-//! harmless, since pre-emption is conservative, and it leaves the native tier's fairness
-//! unchanged.
+//! # Why a **native** baseline-JIT block is only *priced*, never pre-empted at a call
+//!
+//! A compiled block runs natively and never crosses the per-instruction hook, and a
+//! BIF-and-call-only loop reaches no heap-admission point either, so on the default tier such a
+//! loop used to run for free: every BIF dispatch and every call resolution was invisible to the
+//! budget, which therefore drained only at an admission door the loop never reached. Pricing
+//! those two sites is the C's own rule — in C a call/BIF return consumes reductions and the
+//! following `DISPATCH`/`ERTS_BIF_REDS_LEFT` check pre-empts — and it is what makes `used` (and
+//! hence `erlang:statistics(reductions)` and `process_info(_, reductions)`) reflect the work the
+//! C counts too.
+//!
+//! Pricing is *not* pre-emption, and the difference matters: the slice of such a loop still ends
+//! only at a seam that can safely refuse (an admission door, a `reduce` on an instruction the
+//! native tier hands back to the interpreter, or the caller's own hook). The reason is the
+//! engine's **position store**, not a preference:
+//!
+//! * the native tier publishes [`Machine::current_code`](beam_engine::Machine::current_code) at
+//!   **block granularity** — the block prologue's `jit_set_position`/`jit_publish_y`
+//!   (`jit/baseline/runtime.rs:993`, `:1027`) store the block's *entry* `(func, pc)`, and the
+//!   local-call helpers consult the seam **before** any store of their own:
+//!   `store_continuation` asks `machine.local_call_seam(...)` at `jit/baseline/call.rs:210` and
+//!   only then does `machine.set_current_code(func, pc)` at `:232`; `probe_local_call`
+//!   (`jit/baseline/runtime.rs:948`) stores nothing; `resolve_ext_entry` (`:797-849`) asks the
+//!   seam at `:818` with the block-entry position still in place;
+//! * the runner parks an exhausted machine at `current_code` (`src/runner/run.rs:1162`) and the
+//!   driver re-enters at that address from its **block-entry table** first, falling back to a
+//!   single interpreter step only for an address no block covers (`jit/baseline/mod.rs:53-54`,
+//!   `:125-126`). A block entry is always in that table, so a refusal from one of those two
+//!   seams would resume the machine at the *start of the block* and re-execute its prefix — a
+//!   second `send`/`put/2`/ETS write for a block that had already performed one. That is a
+//!   **wrong result**, not a pre-emption. (Measured, not inferred: with a refusing charge at
+//!   those seams, `-eval 'halt(0).'` and `run <fixture> …` both died with `unsupported: opcode:
+//!   run: process blocked (no message available)` — a resumed `receive` found the message its
+//!   double-executed `send` had already delivered.)
+//!
+//! The refusal becomes sound as soon as those three sites store the *instruction's* address
+//! before consulting the seam (`machine.set_current_code(func, pc)` — exactly what `jit_step_ext`
+//! already does at `runtime.rs:574-576` and `jit_test_heap` at `:1442`), because a mid-block
+//! address is re-entrant through the interpreter-step fallback. That is a `beam_engine` change
+//! (`jit/baseline/{call,runtime}.rs`), so this crate cannot make it; until it lands, the two
+//! call-resolution seams and the BIF dispatch **price** their work and the slice ends at the next
+//! seam that may refuse.
+//!
+//! # Priced once per instruction execution
+//!
+//! A seam is consulted once per **instruction execution**, not twice: the native `call_ext*`
+//! helper asks the host seam itself and hands the answer to the dispatching step so the
+//! instruction does not ask a second time ([`Machine::call_ext_dispatch`]'s `seam` argument), and
+//! a local-call probe that declines jumps straight to the callee instead of re-running the
+//! instruction. The BIF seams are mutually exclusive per dispatch too — the engine's
+//! `dispatch_bif_call` takes exactly one branch on its `wants_bif_in_machine` latch — so a BIF
+//! is never priced twice. The one exception is a **host error/deduction fallback**: `jit_ext_call`
+//! leaves an errored seam to the interpreter step, which asks again — the same seam asked twice
+//! for one instruction. For a *pricing* charge that is merely conservative (it may price two
+//! units where the C counts one); since no charge on that path refuses, it cannot manufacture an
+//! exhaustion out of an instruction that never ran twice.
+//!
+//! # Exactly-once, and why no BIF charge may refuse
+//!
+//! Every **refusing** seam above is reached **before** its instruction's effect: the `reduce`
+//! hook before the body, the heap doors before the allocation. A slice that ends there is resumed
+//! at `Machine::current_code` and the instruction runs exactly once, so no work is lost or
+//! doubled — and both seams store that address *before* they charge, which is what makes the
+//! stored address the instruction itself rather than its block.
+//!
+//! A BIF dispatch is different: the charge would be taken **around** the dispatch, so a refusal
+//! could not be delivered as a clean re-runnable stop. Charging it *before* the dispatch would
+//! still be observed by a guard-BIF arm as a guard failure (`Step::Goto(fail)`), i.e. a wrong
+//! result; charging it *after* the dispatch and refusing there would leave the BIF already
+//! applied — and the surrounding instruction already written its destination — so resuming would
+//! re-dispatch a BIF with a visible side effect (`erlang:send/2`, an ETS write, `put/2`). Both
+//! are unsound, which is exactly why [`spend`](BudgetProbe::spend) exists: the BIF seam prices
+//! the work and the **next** refusing seam ends the slice. A BIF therefore never loses or
+//! repeats its effect; the price of the BIF is merely paid into the budget that a later
+//! `reduce`/heap-door charge then exhausts.
+//!
+//! An interpreted instruction that also allocates, calls or dispatches a BIF is consequently
+//! priced more than once — harmless, since pre-emption is conservative, and the budget is a
+//! *slice* granularity, not a precise per-instruction price.
 
 use std::sync::Arc;
 
@@ -76,11 +181,13 @@ use crate::context::RuntimeContext;
 /// The [`ProcessRunner`](beam_process::ProcessRunner) contract puts the reduction count in
 /// the runner's hands (the scheduler never inspects or resets `Process::reductions`), and
 /// `beam_engine` exposes no mid-run step counter the runner could read itself, so the count is
-/// derived from the two seams the executing machine reaches:
-/// [`ExecutionContext::reduce`] — called once per interpreted instruction, and therefore the
-/// charge that prices a loop with **no** allocation at all — and
-/// [`ExecutionContext::ensure_heap`], called by `test_heap`/`allocate_heap` (the only charge a
-/// native baseline-JIT block reaches).
+/// derived from the seams the executing machine reaches: [`ExecutionContext::reduce`] — called
+/// once per interpreted instruction, and therefore the charge that prices an **interpreted** loop
+/// with no allocation at all — the two `ensure_heap` doors called by
+/// `test_heap`/`allocate_heap`, and, **spend-only**, the two **call-resolution** seams
+/// ([`ExecutionContext::resolve_external_call`] for a `call_ext*` and
+/// [`ExecutionContext::resolve_local_call`] for a local call) plus the BIF dispatch — which are
+/// what price a **native** baseline-JIT block, since it crosses neither of the first two.
 ///
 /// One charge is one reduction-like unit. When the budget runs out, `charge` reports the
 /// exhaustion through a typed error; the runner recognises it (the sticky [`exhausted`] flag
@@ -89,7 +196,8 @@ use crate::context::RuntimeContext;
 ///
 /// An exhausted probe is **sticky**: it keeps refusing so a single exhaustion yields exactly
 /// once (the first refusal propagates out of the run, so no second charge can occur — the
-/// stickiness is what makes the runner's classification unambiguous).
+/// stickiness is what makes the runner's classification unambiguous). Only
+/// [`charge`](BudgetProbe::charge) sets it; [`spend`](BudgetProbe::spend) never does.
 ///
 /// [`exhausted`]: BudgetProbe::is_exhausted
 pub(super) struct BudgetProbe {
@@ -125,16 +233,17 @@ impl BudgetProbe {
 
     /// Charges one reduction unit, or reports the exhaustion.
     ///
-    /// This is the single accounting primitive of **both** of the slice's charging points — the
-    /// per-instruction [`reduce`](ExecutionContext::reduce) hook and the two `ensure_heap`
-    /// doors — so `used` is always the real work the slice did, whichever seam observed it.
+    /// This is the accounting primitive of every **refusing** charging point — the
+    /// per-instruction [`reduce`](ExecutionContext::reduce) hook and the two `ensure_heap` doors —
+    /// so `used` is always the real work the slice did, whichever seam observed it.
     ///
     /// # Errors
     ///
     /// A typed `unsupported`-prefixed error once the budget is spent — the runner's signal
     /// that the slice must end in [`RunOutcome::Yield`](beam_process::RunOutcome::Yield). It
     /// is **never** a process failure: the runner intercepts it and parks the machine
-    /// instead of recording an exit.
+    /// instead of recording an exit. A seam may only take this charge where the machine's
+    /// recorded position is the instruction the charge belongs to (see the module docs).
     pub(super) fn charge(&mut self) -> Result<()> {
         if self.remaining == 0 {
             self.exhausted = true;
@@ -145,6 +254,33 @@ impl BudgetProbe {
         self.remaining -= 1;
         self.used += 1;
         Ok(())
+    }
+
+    /// Prices one unit of work **without ever refusing** — the charging primitive of the seams
+    /// whose error the engine would neither deliver as a clean, re-runnable stop nor keep out of
+    /// BEAM semantics.
+    ///
+    /// That is the BIF dispatch ([`call_bif`](ExecutionContext::call_bif)/
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine)) — every engine arm folds a
+    /// BIF-seam error into BEAM semantics (a guard failure, or a caught raise), so a refusal
+    /// there would be a **wrong result** rather than a pre-emption, and a charge taken around an
+    /// already-applied BIF could not be re-run exactly once either — and the two
+    /// call-resolution seams ([`resolve_external_call`](ExecutionContext::resolve_external_call)/
+    /// [`resolve_local_call`](ExecutionContext::resolve_local_call)), whose refusal would park the
+    /// machine at its **block entry** on the native tier rather than at the instruction (see the
+    /// module docs). All of them price their work so the budget really drains; the exhaustion is
+    /// reported by the next [`charge`](BudgetProbe::charge).
+    ///
+    /// A spend consumes one unit when the slice still has one and is a **silent no-op** once the
+    /// budget is gone: the exhaustion itself is always reported by the **next**
+    /// [`charge`](BudgetProbe::charge), which is why `exhausted` is never set here — an
+    /// `exhausted` probe with the machine still running would make the runner park a machine that
+    /// had walked on (or even finished), and the recorded resume address would then be wrong.
+    pub(super) fn spend(&mut self) {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            self.used += 1;
+        }
     }
 }
 
@@ -160,13 +296,20 @@ impl BudgetProbe {
 /// the recorded resume address exact and keeps a nested run from being mistaken for the
 /// pre-empted one (nor from consuming the budget).
 ///
-/// The two charging seams are declared here rather than forwarded:
-/// [`reduce`](ExecutionContext::reduce) and [`wants_reduce`](ExecutionContext::wants_reduce)
-/// are the wrapper's own, because the [`RuntimeContext`] it wraps is a
-/// *host* whose `reduce` is the default no-op and whose `wants_reduce` is `false` — the
-/// wrapper is the pre-empting host, so it must answer both for itself.
+/// [`reduce`](ExecutionContext::reduce) and [`wants_reduce`](ExecutionContext::wants_reduce) are
+/// the wrapper's own, because the [`RuntimeContext`] it wraps is a *host* whose `reduce` is the
+/// default no-op and whose `wants_reduce` is `false` — the wrapper is the pre-empting host, so it
+/// must answer both for itself. The two other **refusing** seams
+/// ([`ensure_heap`](ExecutionContext::ensure_heap),
+/// [`ensure_heap_full`](ExecutionContext::ensure_heap_full)) charge **around** their forward; the
+/// three **pricing** seams — the two call-resolution ones
+/// ([`resolve_external_call`](ExecutionContext::resolve_external_call),
+/// [`resolve_local_call`](ExecutionContext::resolve_local_call)) and the BIF dispatch
+/// ([`call_bif`](ExecutionContext::call_bif)/
+/// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine)) — price their forwards with the
+/// non-refusing [`BudgetProbe::spend`].
 ///
-/// Everything else — the BIF/apply dispatch, the heap, the receive seam **and the
+/// Everything else — the heap, the local fun/apply seam, the receive seam **and the
 /// execution-trace seam** — is forwarded unchanged; the redirect is purely mechanical.
 pub(super) struct BudgetContext<'c, 'a> {
     /// The slice's real context.
@@ -176,6 +319,18 @@ pub(super) struct BudgetContext<'c, 'a> {
 }
 
 impl ExecutionContext for BudgetContext<'_, '_> {
+    /// Serve the BIF, then **price** it with one reduction unit
+    /// ([`BudgetProbe::spend`] — never a refusal: see the module docs for why a BIF-seam error
+    /// cannot be a pre-emption and why charging after the dispatch is the only exactly-once
+    /// shape).
+    ///
+    /// The BIF's own error is propagated **unchanged** and is not priced: an erroring BIF ends
+    /// the process (or lands a raise) and its unit is not worth accounting.
+    ///
+    /// This is not the only BIF seam of a slice's machine — the engine prefers
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine) whenever the host opts in,
+    /// which [`RuntimeContext`] does — so both are priced, and they are mutually exclusive per
+    /// dispatch (one BIF is never charged twice).
     fn call_bif(
         &mut self,
         module: &str,
@@ -183,7 +338,9 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        ExecutionContext::call_bif(self.inner, module, function, arity, args)
+        let value = ExecutionContext::call_bif(self.inner, module, function, arity, args)?;
+        self.probe.spend();
+        Ok(value)
     }
 
     /// Forwarded like every other method — and **load-bearing** for the scheduled path.
@@ -197,11 +354,14 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::wants_bif_in_machine(self.inner)
     }
 
-    /// Forwarded like every other method (see
-    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
-    /// wrapper itself overrides) — and **load-bearing** for the scheduled path, because the
-    /// slice's machine runs on this wrapper and therefore reaches the entry-aware dispatch
+    /// Forwarded like every other method — and **load-bearing** for the scheduled path, because
+    /// the slice's machine runs on this wrapper and therefore reaches the entry-aware dispatch
     /// here, never on the inner context directly.
+    ///
+    /// Priced exactly like [`call_bif`](ExecutionContext::call_bif): a **spend**, after the
+    /// dispatch, never a refusal. This is the seam the engine's `dispatch_bif_call` actually
+    /// takes (the host opts into the in-machine door), so without this pair the slice would
+    /// price no BIF dispatch at all.
     fn call_bif_in_machine(
         &mut self,
         machine: &Machine,
@@ -211,7 +371,7 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        ExecutionContext::call_bif_in_machine(
+        let value = ExecutionContext::call_bif_in_machine(
             self.inner,
             machine,
             entry_module,
@@ -219,27 +379,49 @@ impl ExecutionContext for BudgetContext<'_, '_> {
             function,
             arity,
             args,
-        )
+        )?;
+        self.probe.spend();
+        Ok(value)
     }
-    /// Forwarded like every other method (the wrapper's own overrides are
-    /// [`reduce`](ExecutionContext::reduce)/[`wants_reduce`](ExecutionContext::wants_reduce)
-    /// and the two `ensure_heap` doors).
+    /// **Price one reduction per `call_ext*` resolution**, then forward the resolution.
     ///
-    /// This one is **load-bearing** rather than merely faithful: the slice's machine runs on
-    /// *this* wrapper, so without the forward the engine would never see the real context's
-    /// cross-module-call seam (`RuntimeContext::resolve_external_call`) and a `call_ext*`
-    /// would always take the synchronous `call_bif` route — a second `Machine` whose GC
-    /// admission point is never armed, so the callee's allocations fall back to the
-    /// runtime-wide arena and the process's peak memory grows with the loop count. Forwarding
-    /// lets the engine `Step::Enter` the callee **inside this same machine**, whose
-    /// [`ensure_heap`](ExecutionContext::ensure_heap) above charges the budget *and* arms the
-    /// collection latch for it.
+    /// This is one of the two pricing seams that make a **native** baseline-JIT block's budget
+    /// drain: a compiled block crosses neither the per-instruction hook nor (for a
+    /// BIF-and-call-only loop) a heap-admission point, so before this price a `call_ext`-driven
+    /// loop ran its whole slice for free. In C a call's return consumes reductions and the
+    /// following `DISPATCH` pre-empts; this is the same unit, charged at the resolution.
+    ///
+    /// # Why it *prices* rather than refuses
+    ///
+    /// `Machine::resolve_external_entry` **`?`-propagates** this seam's error, and it reaches the
+    /// seam *before* any continuation, frame, module context or heap write — so the instruction
+    /// itself would be re-runnable. The machine's **recorded position**, however, would not be:
+    /// the native tier stores a block's *entry* `(func, pc)` in the block prologue and
+    /// `resolve_ext_entry` asks this seam (`jit/baseline/runtime.rs:818`) with that entry still in
+    /// place, so a refusal would park the runner at the block entry (a real compiled-block
+    /// address) and the resume would re-execute the block's prefix — repeating any `send`/`put/2`
+    /// it already performed. See the module docs; the instruction-exact store that makes a
+    /// refusal sound is a `beam_engine` change.
+    ///
+    /// The price is still worth taking: it is what makes `used` (and
+    /// `erlang:statistics(reductions)`) count the call, and it is what lets the **next** refusing
+    /// seam end the slice at a safe address.
+    ///
+    /// Still **load-bearing** beyond the price: the slice's machine runs on *this* wrapper, so
+    /// without the forward the engine would never see the real context's cross-module-call seam
+    /// (`RuntimeContext::resolve_external_call`) and a `call_ext*` would always take the
+    /// synchronous `call_bif` route — a second `Machine` whose GC admission point is never armed,
+    /// so the callee's allocations fall back to the runtime-wide arena and the process's peak
+    /// memory grows with the loop count. Forwarding lets the engine `Step::Enter` the callee
+    /// **inside this same machine**, whose [`ensure_heap`](ExecutionContext::ensure_heap) below
+    /// charges the budget *and* arms the collection latch for it.
     fn resolve_external_call(
         &mut self,
         module: &str,
         function: &str,
         arity: u32,
     ) -> Result<Option<(Arc<Module>, Label)>> {
+        self.probe.spend();
         ExecutionContext::resolve_external_call(self.inner, module, function, arity)
     }
 
@@ -262,21 +444,43 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::resolve_local_fun(self.inner, fun, args)
     }
 
-    /// Forwarded like every other method (see
-    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
-    /// wrapper itself overrides) — and **load-bearing** for the scheduled path.
+    /// **Price one reduction per local-call resolution**, then forward the resolution.
     ///
-    /// The slice's machine runs on *this* wrapper, so the engine's three local-call arms
-    /// (`Call`/`CallOnly`/`CallLast`) and the native baseline tier's `jit_local_call` probe
-    /// consult the local-call seam here: without the forward they would see the trait default
-    /// (`Ok(false)`), always decline, and jump **in-machine** into a non-exported same-module
-    /// callee's own code — which for a built-in/static NIF library stub such as
-    /// `prim_tty:tty_create/1` (body `erlang:nif_error(undef)`) raises `undef` instead of
+    /// The same native-tier pricing as
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call), for the loop shape
+    /// that calls instead of calling out: a tail-recursive counter whose work is `bif` arithmetic
+    /// plus a local `call_only`/`call_last` reaches **no** heap-admission point and no
+    /// `call_ext`, so this is the only seam such a loop crosses that observes its work at all. C
+    /// charges a reduction per call; this is the same unit.
+    ///
+    /// # Why it *prices* rather than refuses
+    ///
+    /// `Machine::local_call_seam` **`?`-propagates** this seam's error on all three interpreted
+    /// local-call arms, and it asks the seam *before* the continuation is stored / the frame is
+    /// popped. On the native tier, though, the two helpers that reach it ask it with the
+    /// **block-entry** position still current (`store_continuation` asks at
+    /// `jit/baseline/call.rs:210` and stores the call site's address only afterwards at `:232`;
+    /// `probe_local_call` at `jit/baseline/runtime.rs:948` stores nothing), so a refusal would
+    /// park the machine at the block entry and the resume would re-execute the block's prefix —
+    /// a second side effect, not a pre-emption. See the module docs; the instruction-exact store
+    /// that makes a refusal sound is a `beam_engine` change.
+    ///
+    /// A probe that *declines* (`Ok(false)`) is unaffected either way: the arm/block jumps
+    /// straight to the callee instead of re-running the instruction, so the seam is asked once
+    /// per executed local call and priced once.
+    ///
+    /// Still **load-bearing** beyond the price: the slice's machine runs on *this* wrapper, so
+    /// the engine's three local-call arms (`Call`/`CallOnly`/`CallLast`) and the native baseline
+    /// tier's `jit_local_call` probe consult the local-call seam here: without the forward they
+    /// would see the trait default (`Ok(false)`), always decline, and jump **in-machine** into a
+    /// non-exported same-module callee's own code — which for a built-in/static NIF library stub
+    /// such as `prim_tty:tty_create/1` (body `erlang:nif_error(undef)`) raises `undef` instead of
     /// reaching the host that serves it. Forwarding reaches
     /// [`RuntimeContext`]'s own override (`crate::native::prim_tty::serves_local_call`), so the
     /// served key is dispatched through [`call_bif`](ExecutionContext::call_bif) under the arm's
     /// frame discipline and every other key stays the unchanged in-machine jump.
     fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        self.probe.spend();
         ExecutionContext::resolve_local_call(self.inner, module, function, arity)
     }
 
