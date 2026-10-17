@@ -398,10 +398,10 @@ the section to read them in.
 - **Each integration test file under `tests/` carries its own `//!` module doc stating the contract it pins and
   why** — read the file rather than looking for a per-file inventory here.
 - In-module `#[cfg(test)] mod tests` live in `space`, `policy`, `mso`, `heap_info`, `config`, `selection`,
-  `any_collector`, `nursery`, `bounds`, `live`, `immix_collector` (+ `src/immix_collector/{tests,grow_tests}.rs`)
-  and `immix/tests.rs`.
-  `copy.rs` and `collector.rs` carry no in-module tests: the copier is pinned by `tests/copy_correctness.rs`, the
-  driver by `tests/generations.rs` / `tests/gc_pressure*.rs`.
+  `any_collector`, `collector`, `bounds`, `live`, `immix_collector` (+ `src/immix_collector/{tests,grow_tests}.rs`),
+  in `src/nursery/tests.rs` (the nursery chain) and in `immix/tests.rs`.
+  `copy.rs` carries no in-module tests: the copier is pinned by `tests/copy_correctness.rs`, the collector driver by
+  `tests/generations.rs` / `tests/gc_pressure*.rs`.
 - The suite is organised around five invariants:
   - **Exact copy correctness** — structure preserved, roots relocated, exactly the live size retained,
     off-from-space refs verbatim, verified per shape (cons/tuples, flat + HAMT maps, the refc pair, all three fun
