@@ -443,7 +443,11 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - In-module `#[cfg(test)] mod tests`: `stats` (percentile/mean edge cases), `metrics`/`report`
   (JSON round-trip + schema stability + exactly-one-of value/summary), `cli` (every subcommand, defaults,
   `--help`, `--out-file`, error cases), `probe` decision helpers, `compare` (deltas), `scratch`
-  (RAII/copy/skip), `http_load` (loopback keep-alive server + pure parsers), `workloads::tool`
+  (RAII/copy/skip), `http_load` (loopback keep-alive server + pure parsers), `marginal` (the pinning test
+  `interleaving_cancels_a_drifting_boot_cost` — a fake clock proves the paired median recovers the true
+  per-unit cost exactly where the old sequential `mean(work) − mean(startup)` is off by `runs × drift_step`;
+  plus the median-vs-outlier, noise-band, degenerate-input, pair-retention and `Pass` round-trip cases),
+  `workloads::tool`
   (tool/argv + the version-aware store ranking + `command_for_min`'s selection: greatest satisfying
   version, tie-break by source order, fallback note, `parse_version_output`, provenance/rejection notes),
   `workloads::plb` (a run with no result JSON is a *failed* row, never `ok`), `workloads::foreign`,
