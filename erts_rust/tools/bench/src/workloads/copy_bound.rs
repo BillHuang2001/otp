@@ -21,74 +21,82 @@
 //! `copy_bound` — **the messaging / copy-bound metric**: the term-copy boundary run under
 //! *both* runtimes (the system oracle and the Rust runtime `beam_rt`).
 //!
-//! Every repo-backed workload (Cowboy, Khepri, EMQX, PLB, the compilers) is `sys`-only, so
-//! the only cross-runtime signals were `list_walk`/`foreign`, both **compute**-bound. This
-//! workload supplies the *messaging/copy boundary* signal that
-//! `ERTS_RUST_REWRITE_TEST_PROJECTS.md` names — the point where a term must leave its owning
-//! process (ETF encoding, ETS, process-to-process send).
+//! Every repo-backed workload (Cowboy, Khepri, EMQX, PLB, the compilers) is `sys`-only, and
+//! the other cross-runtime signals (`list_walk`/`foreign`) are **compute**-bound. This workload
+//! supplies the *messaging/copy boundary* signal that `ERTS_RUST_REWRITE_TEST_PROJECTS.md`
+//! names — the point where a term must leave its owning process.
 //!
 //! # The four cases (all in one embedded module)
 //!
-//! Each case performs the copy round-trip of the **same structured payload**, verifies the
-//! result with an Erlang bound-variable pattern (a real equality test that raises on a
-//! mismatch), and adds `PER_OP` to an accumulator, so a run at `N` ops prints exactly
-//! `N * PER_OP`:
+//! Each case copies the **same structured payload**, validates the round-trip with an Erlang
+//! bound-variable pattern (a real equality test that raises on a mismatch) and adds `PER_OP`
+//! per validated op, so a run at `N` ops prints exactly `N * PER_OP`:
 //!
-//! * `etf_roundtrip` — `term_to_binary/1` + `binary_to_term/1`: the **External Term Format
-//!   wire codec** (contract A.5) — the encoding a distributed node puts on the line.
-//! * `ets_copy` — `ets:insert/2` + `ets:lookup/2`: the **ETS copy boundary** (copied into
-//!   the table and back out). One table and one key per process, so the table never grows
-//!   and the measured work is the copy, not table growth.
-//! * `send_recv` — a term is sent to a second process, round-tripped through
-//!   `term_to_binary/1` there, and sent back: **both directions** of the process copy
-//!   boundary. An `after` guard turns a missing reply into a loud failure, never a hang.
-//! * `send_recv_plain` — the **same two-process delivery shape with *no* ETF codec call in
-//!   the receiver** (the worker replies `From ! {self(), T}` directly), so the
-//!   `send_recv − send_recv_plain` difference attributes the codec component *inside* the
-//!   two-process path (the `beam_process`/`beam_message` delivery shape). Same
-//!   bound-variable validation and same `after`-guard.
+//! * `etf_roundtrip` — `term_to_binary/1` + `binary_to_term/1`, the **External Term Format
+//!   wire codec** (contract A.5).
+//! * `ets_copy` — `ets:insert/2` + `ets:lookup/2`, the **ETS copy boundary** (one table and
+//!   key per process, so the table never grows: the work is the copy, not table growth).
+//! * `send_recv` — a term to a second process, codec round-tripped there and sent back: **both
+//!   directions** of the process copy boundary (an `after` guard makes a missing reply loud).
+//! * `send_recv_plain` — the **same two-process shape, no codec call in the receiver** (the
+//!   worker replies `From ! {self(), T}`), so `send_recv − send_recv_plain` attributes the
+//!   codec component *inside* the two-process path.
 //!
 //! The payload is *generated from this crate's constants* (see [`module_source`]), so the
 //! Rust and Erlang sides cannot drift.
 //!
-//! # The measurement (startup-cancelled, per op)
+//! # The measurement (paired, drift-cancelling, per op)
 //!
 //! Each case declares a **per-runtime loop count** `N` (calibrated by the rule in the case
-//! table's doc comment) and runs the identical program twice per sample: at `N` ops
-//! (`case_<name>_wall_ms`) and at `0` ops (`case_<name>_startup_ms`, the same program's pure
-//! startup/boot cost — the Rust runtime loads its preloaded-module set and resolves its
-//! system code path with a native filesystem probe (`crates/beam_rt/src/codeserver.rs`; the
-//! system `erl` is only *run* as a last resort), so this is not zero). The derived metric
+//! table's doc comment) and is sampled through the shared interleaved measurement
+//! ([`crate::marginal`]): in **every round** the program runs at `N` ops
+//! (`case_<name>_wall_ms`) and then, *immediately after*, at `0` ops
+//! (`case_<name>_startup_ms` — the pure boot cost, which is **not** zero: the Rust runtime
+//! loads its preloaded-module set and probes its system code path on disk
+//! (`crates/beam_rt/src/codeserver.rs`); the system `erl` is only *run* as a last resort).
 //!
 //! ```text
-//! case_<name>_ns_per_op = (mean(wall_ms) - mean(startup_ms)) / N * 1e6
+//! case_<name>_ns_per_op = median(wall@N - wall@0) / N * 1e6
 //! ```
 //!
-//! cancels the fixed process-startup cost from both sides and is emitted only when the
-//! marginal is positive; otherwise a note records that the marginal is below timer
-//! resolution — never a fabricated or negative number. The deterministic
+//! # Why the pairs are interleaved — the old schedule must never come back
+//!
+//! The boot cost cancels only if both samples of a **pair** see the same host conditions. The
+//! earlier schedule collected *all* `N`-op samples first and *all* `0`-op samples afterwards
+//! and used `mean(work) - mean(startup)`; on this shared, loaded host the boot cost drifts by
+//! tens of milliseconds *between* the passes, so the difference absorbed the drift instead of
+//! cancelling it (the only guard was refusing a negative result). Against an independent
+//! interleaved measurement the published `etf_roundtrip` gap was inflated by ≈56× (`136.3×`
+//! published where the interleaved figure is `2.42×`). So: one `Work` sample followed by its
+//! `Startup` sample, round after round — **never** a whole pass at a time.
+//!
+//! The statistic is the **median** of the per-round differences (one contended round cannot
+//! drag it, unlike a mean), with min/max spread reported; the figure is withheld — `marginal
+//! below timer resolution`, **no** metric — when the median does not clear
+//! [`crate::marginal::NOISE_MULTIPLE`] × `max(`[`crate::marginal::MIN_NOISE_MS`]`, 1.4826 ×
+//! MAD)`. Never a fabricated, negative or drift-inflated number; every published figure carries
+//! an auditable `paired median=… min=… noise=±… over k round(s)` note. The deterministic
 //! `case_<name>_ops = N` companion is **contention-immune**, so the `N` behind every wall
-//! figure is always in the report (never compare raw `wall_ms` across sides with different
-//! `N`).
+//! figure is in the report (never compare raw `wall_ms` across sides with different `N`).
 //!
 //! # Honest reporting
 //!
-//! Every runtime's stdout must equal the deterministic `N * PER_OP` (a mismatch is a note).
-//! A Rust exit `3` (`beam_rt: unsupported: …`) records the capability gap and emits **no**
-//! timing for that case; `erlc` unavailable ⇒ `skipped(erlc-absent)`; the embedded module
-//! failing to compile is a **failure** (`module-compile-failed`), never a skip (the source
-//! is ours). Everything is staged in a private, self-cleaning [`ScratchDir`] under
-//! `$TMPDIR`; the workload never writes outside it and never panics.
+//! Every runtime's stdout must equal the deterministic `N * PER_OP` (a mismatch is a note). A
+//! Rust exit `3` (`beam_rt: unsupported: …`) records the capability gap and emits **no** timing
+//! for that case; no `erlc` ⇒ `skipped(erlc-absent)`; the embedded module failing to compile is
+//! a **failure** (`module-compile-failed`), never a skip (the source is ours). Everything is
+//! staged in a private, self-cleaning [`ScratchDir`] under `$TMPDIR`; the workload never writes
+//! outside it and never panics.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::marginal::{self, Marginal, Pass, PassError};
 use crate::metrics::{Category, Metric, Probe, Runtimes, Status};
 use crate::proc::{self, Completed};
 use crate::report::{Profile, WorkloadResult};
 use crate::runtime::RuntimeKind;
 use crate::scratch::ScratchDir;
-use crate::stats::mean;
 use crate::workload::{RunContext, Workload};
 use crate::workloads::slice;
 
@@ -112,31 +120,24 @@ const SR_PLAIN: &str = "send_recv_plain";
 /// The exported functions' shared arity (the loop count).
 const ARITY: u32 = 1;
 
-/// The number of list elements in the copied payload.
+/// The copied payload (generated into `payload/0`, so the two sides cannot drift): a
+/// `PAYLOAD_LIST_LEN`-element list, a tuple (atom + binary + float), a `PAYLOAD_BIN_BYTES`-byte
+/// binary, a char-list string and a negative integer.
 const PAYLOAD_LIST_LEN: i64 = 10;
-
-/// The number of bytes in the copied payload's binary.
 const PAYLOAD_BIN_BYTES: i64 = 12;
-
-/// The copied payload's float (the ETF codec's only non-immediate numeric case).
 const PAYLOAD_FLOAT: f64 = 3.5;
-
-/// The copied payload's char-list string.
 const PAYLOAD_STRING: &str = "a char list";
-
-/// The copied payload's negative small integer.
 const PAYLOAD_NEG: i64 = -42;
-
 /// The number of top-level keys in the copied payload (the map built by `payload/0`).
 const PAYLOAD_KEYS: usize = 5;
-/// How much one validated copy round-trip adds to a case's accumulator, so a run at `N`
-/// ops prints `N * PER_OP`. The Erlang source is generated from it.
+/// How much one validated copy round-trip adds to a case's accumulator, so a run at `N` ops
+/// prints `N * PER_OP`. The Erlang source is generated from it.
 const PER_OP: i64 = 1;
 
 /// How long the two-process case waits for the worker's reply before failing loudly.
 ///
-/// A missing reply must abort the case (the run exits non-zero and is reported), never
-/// hang the harness: the driver invokes the runtime with no process timeout of its own.
+/// A missing reply must abort the case (the run exits non-zero and is reported), never hang
+/// the harness: the driver invokes the runtime with no process timeout of its own.
 const RECV_TIMEOUT_MS: u32 = 30_000;
 
 /// One copy-bound case: the embedded driver function that loops over the copy round-trip.
@@ -145,8 +146,8 @@ struct Case {
     name: &'static str,
     /// The exported driver function (arity 1: the loop count).
     function: &'static str,
-    /// Loop count calibrated for the Rust runtime (target: ≥0.5 s of loop work, ≳1.5 s for
-    /// the case whose marginal had fallen into the boot-jitter band).
+    /// Loop count calibrated for the Rust runtime (≥0.5 s of loop work, ≳1.5 s for the case
+    /// whose marginal had fallen into the boot-jitter band).
     n_rust: i64,
     /// Loop count calibrated for the system-runtime oracle (a marginal well above its own
     /// run-to-run startup noise).
@@ -181,30 +182,10 @@ impl Case {
 /// compare raw `wall_ms` across sides with different `N`. A loop count whose marginal falls
 /// below the timer noise yields **no** per-op metric (an honest note), never a number.
 static CASES: &[Case] = &[
-    Case {
-        name: "etf_roundtrip",
-        function: ETF,
-        n_rust: 40_000,
-        n_sys: 1_500_000,
-    },
-    Case {
-        name: "ets_copy",
-        function: ETS,
-        n_rust: 200_000,
-        n_sys: 2_000_000,
-    },
-    Case {
-        name: "send_recv",
-        function: SR,
-        n_rust: 10_000,
-        n_sys: 500_000,
-    },
-    Case {
-        name: "send_recv_plain",
-        function: SR_PLAIN,
-        n_rust: 15_000,
-        n_sys: 1_000_000,
-    },
+    Case { name: "etf_roundtrip", function: ETF, n_rust: 40_000, n_sys: 1_500_000 },
+    Case { name: "ets_copy", function: ETS, n_rust: 200_000, n_sys: 2_000_000 },
+    Case { name: "send_recv", function: SR, n_rust: 10_000, n_sys: 500_000 },
+    Case { name: "send_recv_plain", function: SR_PLAIN, n_rust: 15_000, n_sys: 1_000_000 },
 ];
 
 /// The `copy_bound` workload.
@@ -233,10 +214,9 @@ fn module_source() -> String {
 -module({MODULE}).
 -export([{ETF}/{ARITY}, {ETS}/{ARITY}, {SR}/{ARITY}, {SR_PLAIN}/{ARITY}]).
 
-%% The one structured payload every case copies: a map holding a {PAYLOAD_LIST_LEN}-element
-%% list, a tuple (an atom + a binary + a float), a {PAYLOAD_BIN_BYTES}-byte binary, a
-%% char-list string and a negative integer. It is generated from this crate's constants, so
-%% the Rust and Erlang sides cannot drift.
+%% The one structured payload every case copies — a map with a {PAYLOAD_LIST_LEN}-element list,
+%% a tuple (atom + binary + float), a {PAYLOAD_BIN_BYTES}-byte binary, a char-list string and a
+%% negative integer. Generated from this crate's constants, so the sides cannot drift.
 payload() ->
     #{{a => [{list_items}],
       b => {{ok, <<\"hello world\">>, {PAYLOAD_FLOAT}}},
@@ -244,9 +224,8 @@ payload() ->
       d => \"{PAYLOAD_STRING}\",
       e => {PAYLOAD_NEG}}}.
 
-%% term_to_binary/1 + binary_to_term/1: the External Term Format copy boundary (A.5). The
-%% bound `T` in the case pattern is an equality test, so a corrupted round-trip raises.
-%% Each validated round-trip adds {PER_OP}, so {ETF}(N) == N * {PER_OP}.
+%% term_to_binary/1 + binary_to_term/1: the External Term Format copy boundary (A.5). The bound
+%% `T` is an equality test, so a corrupted round-trip raises; {ETF}(N) == N * {PER_OP}.
 {ETF}(N) -> {ETF}(N, 0).
 
 {ETF}(0, Acc) -> Acc;
@@ -257,8 +236,8 @@ payload() ->
         T -> {ETF}(N - 1, Acc + {PER_OP})
     end.
 
-%% ets:insert/2 + ets:lookup/2: the ETS copy boundary (copied into the table, copied back
-%% out). One table and one key per process, so the table never grows.
+%% ets:insert/2 + ets:lookup/2: the ETS copy boundary, with one table and key per process so the
+%% table never grows (the work is the copy, not table growth).
 {ETS}(N) ->
     Tab = ets:new({MODULE}, [set, public]),
     Result = {ETS}(N, Tab, 0),
@@ -274,7 +253,7 @@ payload() ->
     end.
 
 %% Two-process send/receive: the term is copied onto the worker's heap and back, so both
-%% directions of the process copy boundary are exercised. An `after` guard makes a missing
+%% directions of the process copy boundary are exercised. The `after` guard makes a missing
 %% reply a loud failure instead of a hang.
 {SR}(N) ->
     Worker = spawn(fun() -> worker() end),
@@ -304,10 +283,9 @@ worker() ->
             ok
     end.
 
-%% The delivery-only two-process case: identical shape to {SR}/1, but the worker replies
-%% the payload DIRECTLY (no term_to_binary/binary_to_term), so the case measures pure
-%% two-way process copy/delivery. Subtracting it from {SR} attributes the ETF codec
-%% component inside the two-process path. The same `after` guard applies.
+%% The delivery-only sibling: identical shape, but the worker replies the payload DIRECTLY (no
+%% term_to_binary/binary_to_term), so subtracting it from {SR} attributes the codec component
+%% inside the two-process path. Same bound-variable validation and `after` guard.
 {SR_PLAIN}(N) ->
     Worker = spawn(fun() -> worker_plain() end),
     Result = {SR_PLAIN}(N, Worker, 0),
@@ -351,33 +329,31 @@ fn expected_stdout(n: i64) -> String {
 
 /// The per-side argv for one case at `n` ops (everything after the program path).
 fn argv_for(kind: RuntimeKind, dir: &Path, case: &Case, n: i64) -> Vec<String> {
-    let beam = dir.join(format!("{MODULE}.beam"));
+    let beam = dir.join(format!("{MODULE}.beam")).display().to_string();
+    let dir = dir.display().to_string();
     match kind {
         RuntimeKind::Rust => vec![
             "-pa".to_string(),
-            dir.display().to_string(),
+            dir,
             "run".to_string(),
-            beam.display().to_string(),
+            beam,
             format!("{MODULE}:{}/1", case.function),
             n.to_string(),
         ],
         RuntimeKind::Sys => vec![
             "-noshell".to_string(),
             "-pa".to_string(),
-            dir.display().to_string(),
+            dir,
             "-eval".to_string(),
-            format!(
-                "io:format(\"~w~n\",[{MODULE}:{}({n})]), halt(0).",
-                case.function
-            ),
+            format!("io:format(\"~w~n\",[{MODULE}:{}({n})]), halt(0).", case.function),
         ],
     }
 }
 
 /// Writes the embedded module into `dir` and compiles it with `erlc`.
 ///
-/// Returns `Err(reason)` — never a silent `false` — when the source cannot be written or
-/// the module does not compile, so the caller can report a real failure.
+/// Returns `Err(reason)` — never a silent `false` — when the source cannot be written or the
+/// module does not compile, so the caller can report a real failure.
 fn stage(dir: &Path, erlc: &Path) -> Result<PathBuf, String> {
     let source = dir.join(format!("{MODULE}.erl"));
     std::fs::write(&source, module_source())
@@ -387,13 +363,7 @@ fn stage(dir: &Path, erlc: &Path) -> Result<PathBuf, String> {
     cmd.arg("-o").arg(dir).arg(&source);
     match proc::run(&mut cmd) {
         Ok(out) if out.success => {}
-        Ok(out) => {
-            return Err(format!(
-                "erlc exited {:?}: {}",
-                out.exit_code,
-                out.stderr.trim()
-            ))
-        }
+        Ok(out) => return Err(format!("erlc exited {:?}: {}", out.exit_code, out.stderr.trim())),
         Err(e) => return Err(format!("erlc spawn failed: {e}")),
     }
 
@@ -405,42 +375,34 @@ fn stage(dir: &Path, erlc: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// The samples collected for one case under one runtime.
-struct CaseOutcome {
-    /// The loop count used.
-    n: i64,
-    /// Wall-clock samples (ms) of the `n`-op runs.
-    wall: Vec<f64>,
-    /// Wall-clock samples (ms) of the `0`-op (startup-only) runs.
-    startup: Vec<f64>,
-    /// Peak-RSS samples (bytes) of the `n`-op runs.
-    rss: Vec<f64>,
-    /// The stdout observed on the first successful `n`-op run.
-    observed: Option<String>,
-    /// Whether the runtime reported the case as `unsupported` (Rust exit `3`).
-    unsupported: bool,
-    /// Notes about failures/variations (never silent).
+/// One pass sample: what a single run of the case's program contributes — the wall time (ms),
+/// the peak RSS (bytes; only `Work` passes feed [`CaseOutcome::rss`]), the trimmed stdout, and
+/// any non-fatal notes (a stdout mismatch is recorded here, never as an abort).
+struct Sample {
+    wall_ms: f64,
+    peak_memory_bytes: Option<u64>,
+    stdout: String,
     notes: Vec<String>,
 }
 
-impl CaseOutcome {
-    /// Whether the case produced at least one usable timing.
-    fn ok(&self) -> bool {
-        !self.wall.is_empty()
-    }
+/// The samples collected for one case under one runtime: the loop count `n`, the per-round
+/// `(work_ms, startup_ms)` pairs behind `marginal` (in round order), the `Work`-pass peak-RSS
+/// samples, the first `Work`-pass stdout, the capability-gap flag, the failure/variation notes,
+/// and the resolved [`Marginal`] (the per-op figure, or why there is none).
+struct CaseOutcome {
+    n: i64,
+    pairs: Vec<(f64, f64)>,
+    rss: Vec<f64>,
+    observed: Option<String>,
+    unsupported: bool,
+    notes: Vec<String>,
+    marginal: Marginal,
 }
 
-/// The startup-cancelled marginal cost per op, in nanoseconds — `None` when either sample
-/// set is unusable or the marginal is not positive (below timer resolution).
-fn ns_per_op(wall: &[f64], startup: &[f64], n: i64) -> Option<f64> {
-    if wall.is_empty() || startup.is_empty() || n <= 0 {
-        return None;
-    }
-    let marginal = mean(wall) - mean(startup);
-    if marginal <= 0.0 {
-        None
-    } else {
-        Some(marginal / n as f64 * 1_000_000.0)
+impl CaseOutcome {
+    /// Whether the case produced at least one completed round.
+    fn ok(&self) -> bool {
+        !self.pairs.is_empty()
     }
 }
 
@@ -448,26 +410,50 @@ fn ns_per_op(wall: &[f64], startup: &[f64], n: i64) -> Option<f64> {
 fn classify_failure(kind: RuntimeKind, case: &Case, completed: &Completed) -> String {
     let stderr = completed.stderr.trim();
     match (kind, completed.exit_code) {
-        (RuntimeKind::Rust, Some(3)) => {
-            let reason = stderr
-                .strip_prefix("beam_rt: unsupported: ")
-                .unwrap_or(stderr);
-            format!("case {}: unsupported: {reason}", case.name)
-        }
-        (_, Some(code)) => format!(
-            "case {} ({}): exited {code}: {stderr}",
+        (RuntimeKind::Rust, Some(3)) => format!(
+            "case {}: unsupported: {}",
             case.name,
-            kind.as_str()
+            stderr.strip_prefix("beam_rt: unsupported: ").unwrap_or(stderr)
         ),
-        (_, None) => format!(
-            "case {} ({}): terminated by signal: {stderr}",
-            case.name,
-            kind.as_str()
-        ),
+        (_, Some(code)) => format!("case {} ({}): exited {code}: {stderr}", case.name, kind.as_str()),
+        (_, None) => format!("case {} ({}): terminated by signal: {stderr}", case.name, kind.as_str()),
     }
 }
 
-/// Runs one case at `n` ops and at `0` ops, `runs` times each, collecting samples.
+/// Drives `runs` interleaved rounds through [`marginal::sample_pairs`] — the `Work` sample then
+/// its `Startup` sample, back to back, every round — and folds the samples into a
+/// [`CaseOutcome`]: the per-round wall pairs, the `Work`-pass peak-RSS samples, the first
+/// `Work`-pass stdout, the per-sample notes, and the resolved [`Marginal`].
+///
+/// The per-pass runner is a parameter so the schedule, the note folding and the metric decision
+/// can be tested without spawning a process.
+fn measure_case<F>(n: i64, runs: usize, sample: F) -> CaseOutcome
+where
+    F: FnMut(Pass) -> Result<Sample, PassError>,
+{
+    let sampled = marginal::sample_pairs(runs, sample);
+    let mut notes = Vec::new();
+    let mut rss = Vec::new();
+    let pairs: Vec<(f64, f64)> = sampled.pairs.iter().map(|(w, s)| (w.wall_ms, s.wall_ms)).collect();
+    for (work, startup) in &sampled.pairs {
+        notes.extend(work.notes.iter().chain(startup.notes.iter()).cloned());
+        rss.extend(work.peak_memory_bytes.map(|bytes| bytes as f64));
+    }
+    let aborted = sampled.aborted.as_ref();
+    notes.extend(aborted.map(|abort| abort.note.clone()));
+    CaseOutcome {
+        n,
+        marginal: marginal::resolve(&pairs, ops(n)),
+        pairs,
+        rss,
+        observed: sampled.pairs.first().map(|(work, _)| work.stdout.clone()),
+        unsupported: aborted.is_some_and(|abort| abort.unsupported),
+        notes,
+    }
+}
+
+/// Runs one case under one runtime: `runs` interleaved rounds of an `n`-op sample and a `0`-op
+/// sample, per [`marginal`]'s sanctioned schedule.
 fn execute_case(
     program: &Path,
     kind: RuntimeKind,
@@ -476,97 +462,68 @@ fn execute_case(
     runs: usize,
 ) -> CaseOutcome {
     let n = case.n_for(kind);
-    let mut outcome = CaseOutcome {
-        n,
-        wall: Vec::new(),
-        startup: Vec::new(),
-        rss: Vec::new(),
-        observed: None,
-        unsupported: false,
-        notes: Vec::new(),
-    };
-    let expected = expected_stdout(n);
-
-    // Pass 1: the `n`-op runs (the measured work).
-    for _ in 0..runs {
+    // A Rust exit `3` marks the whole case `unsupported` only while nothing is measured yet.
+    let mut work_sample_seen = false;
+    measure_case(n, runs, |pass| {
+        let count = n * pass.units();
         let mut cmd = Command::new(program);
-        cmd.args(argv_for(kind, dir, case, n));
-        match proc::run(&mut cmd) {
-            Ok(completed) if completed.success => {
-                outcome.wall.push(completed.wall_ms);
-                if let Some(bytes) = completed.peak_memory_bytes {
-                    outcome.rss.push(bytes as f64);
-                }
-                let got = completed.stdout_trim().to_string();
-                if got != expected {
-                    outcome.notes.push(format!(
-                        "case {}: unexpected stdout `{got}` (expected `{expected}`)",
-                        case.name
-                    ));
-                }
-                if outcome.observed.is_none() {
-                    outcome.observed = Some(got);
-                }
+        cmd.args(argv_for(kind, dir, case, count));
+        let (pass_name, kind_name) = (pass.as_str(), kind.as_str());
+        let completed = proc::run(&mut cmd).map_err(|e| PassError {
+            note: format!("case {} ({kind_name}): {pass_name}-pass spawn failed: {e}", case.name),
+            unsupported: false,
+        })?;
+        if !completed.success {
+            let mut note = classify_failure(kind, case, &completed);
+            if pass == Pass::Startup {
+                note.push_str(" (startup pass)");
             }
-            Ok(completed) => {
-                if kind == RuntimeKind::Rust
-                    && completed.exit_code == Some(3)
-                    && outcome.wall.is_empty()
-                {
-                    outcome.unsupported = true;
-                }
-                outcome.notes.push(classify_failure(kind, case, &completed));
-                break;
-            }
-            Err(e) => {
-                outcome.notes.push(format!(
-                    "case {} ({}): spawn failed: {e}",
-                    case.name,
-                    kind.as_str()
-                ));
-                break;
-            }
+            let unsupported =
+                kind == RuntimeKind::Rust && completed.exit_code == Some(3) && !work_sample_seen;
+            return Err(PassError { note, unsupported });
+        }
+        let expected = expected_stdout(count);
+        let got = completed.stdout_trim().to_string();
+        let mut notes = Vec::new();
+        if got != expected {
+            notes.push(format!("case {}: the {pass_name} run printed `{got}` (expected `{expected}`)", case.name));
+        }
+        work_sample_seen |= pass == Pass::Work;
+        Ok(Sample {
+            wall_ms: completed.wall_ms,
+            peak_memory_bytes: completed.peak_memory_bytes,
+            stdout: got,
+            notes,
+        })
+    })
+}
+
+/// Emits one case's metric rows: the wall / startup / peak-RSS sample rows, the per-op
+/// marginal (or the note explaining why there is none) and the deterministic `ops` companion.
+fn push_case_metrics(result: &mut WorkloadResult, case: &Case, outcome: &CaseOutcome) {
+    let wall: Vec<f64> = outcome.pairs.iter().map(|&(work_ms, _)| work_ms).collect();
+    let startup: Vec<f64> = outcome.pairs.iter().map(|&(_, startup_ms)| startup_ms).collect();
+    // One `Metric::samples` row per non-empty sample set (a round can be cut short, so only push
+    // what we have).
+    let rows = [("wall_ms", "ms", &wall), ("startup_ms", "ms", &startup), ("peak_rss_bytes", "bytes", &outcome.rss)];
+    for (suffix, unit, values) in rows {
+        if !values.is_empty() {
+            result.metrics.push(Metric::samples(format!("case_{}_{suffix}", case.name), unit, values));
         }
     }
-
-    // Pass 2: the `0`-op runs (startup only). Skipped when pass 1 already failed — a
-    // broken case must not be timed at all.
-    if outcome.ok() {
-        let expected_startup = expected_stdout(0);
-        for _ in 0..runs {
-            let mut cmd = Command::new(program);
-            cmd.args(argv_for(kind, dir, case, 0));
-            match proc::run(&mut cmd) {
-                Ok(completed) if completed.success => {
-                    outcome.startup.push(completed.wall_ms);
-                    let got = completed.stdout_trim().to_string();
-                    if got != expected_startup {
-                        outcome.notes.push(format!(
-                            "case {}: the startup run printed `{got}` (expected `{expected_startup}`)",
-                            case.name
-                        ));
-                    }
-                }
-                Ok(completed) => {
-                    outcome.notes.push(format!(
-                        "case {}: startup run failed: {}",
-                        case.name,
-                        classify_failure(kind, case, &completed)
-                    ));
-                    break;
-                }
-                Err(e) => {
-                    outcome.notes.push(format!(
-                        "case {}: startup spawn failed: {e}",
-                        case.name
-                    ));
-                    break;
-                }
-            }
+    match outcome.marginal.unit_cost_ns() {
+        Some(ns) => {
+            result.metrics.push(Metric::scalar(format!("case_{}_ns_per_op", case.name), "ns", ns));
+            let detail = outcome.marginal.detail();
+            result.notes.push(format!("case {}: {detail}", case.name));
+        }
+        None => {
+            let note = outcome.marginal.below_resolution_note();
+            result.notes.push(format!("case {}: {note}", case.name));
         }
     }
-
-    outcome
+    // The deterministic, contention-immune companion: the copy round-trips the timing came from.
+    result.metrics.push(Metric::scalar(format!("case_{}_ops", case.name), "ops", ops(outcome.n) as f64));
 }
 
 impl Workload for CopyBound {
@@ -601,35 +558,19 @@ impl Workload for CopyBound {
 
     fn run(&self, ctx: &RunContext) -> WorkloadResult {
         let kind = ctx.runtime.kind;
+        let (id, category, description) = (self.id(), self.category(), self.description());
         let Some(program) = ctx.runtime.program() else {
-            return WorkloadResult::skipped(
-                self.id(),
-                kind,
-                self.category(),
-                self.description(),
-                "runtime-unsupported",
-            );
+            return WorkloadResult::skipped(id, kind, category, description, "runtime-unsupported");
         };
         let Some(erlc) = slice::resolve_erlc() else {
-            return WorkloadResult::skipped(
-                self.id(),
-                kind,
-                self.category(),
-                self.description(),
-                "erlc-absent",
-            );
+            return WorkloadResult::skipped(id, kind, category, description, "erlc-absent");
         };
 
-        let scratch = match ScratchDir::new(self.id()) {
+        let scratch = match ScratchDir::new(id) {
             Ok(dir) => dir,
             Err(e) => {
-                return WorkloadResult::failed(
-                    self.id(),
-                    kind,
-                    self.category(),
-                    self.description(),
-                    format!("scratch-dir-failed: {e}"),
-                )
+                let reason = format!("scratch-dir-failed: {e}");
+                return WorkloadResult::failed(id, kind, category, description, reason);
             }
         };
         let dir = scratch.path();
@@ -643,20 +584,15 @@ impl Workload for CopyBound {
                 erlc.display()
             ),
             Err(reason) => {
-                let mut result = WorkloadResult::failed(
-                    self.id(),
-                    kind,
-                    self.category(),
-                    self.description(),
-                    "module-compile-failed",
-                );
+                let mut result =
+                    WorkloadResult::failed(id, kind, category, description, "module-compile-failed");
                 result.notes.push(reason);
                 return result;
             }
         };
 
         let runs = runs_for(ctx.profile);
-        let mut result = WorkloadResult::new(self.id(), kind, self.category(), self.description());
+        let mut result = WorkloadResult::new(id, kind, category, description);
         result.notes.push(staged);
 
         let mut overall_peak: Option<u64> = None;
@@ -668,52 +604,18 @@ impl Workload for CopyBound {
             let outcome = execute_case(program, kind, dir, case, runs);
             if outcome.ok() {
                 ok_cases += 1;
-                // One `Metric::samples` row per non-empty sample set (the `0`-op startup
-                // pass can be absent if it broke, so only push what we have).
-                for (suffix, unit, values) in [
-                    ("wall_ms", "ms", &outcome.wall),
-                    ("startup_ms", "ms", &outcome.startup),
-                    ("peak_rss_bytes", "bytes", &outcome.rss),
-                ] {
-                    if !values.is_empty() {
-                        result.metrics.push(Metric::samples(
-                            format!("case_{}_{suffix}", case.name),
-                            unit,
-                            values,
-                        ));
-                    }
-                }
+                push_case_metrics(&mut result, case, &outcome);
                 for &bytes in &outcome.rss {
-                    let bytes = bytes as u64;
-                    overall_peak = Some(overall_peak.map_or(bytes, |peak| peak.max(bytes)));
+                    overall_peak = Some(overall_peak.map_or(bytes as u64, |peak| peak.max(bytes as u64)));
                 }
-                match ns_per_op(&outcome.wall, &outcome.startup, outcome.n) {
-                    Some(ns) => result.metrics.push(Metric::scalar(
-                        format!("case_{}_ns_per_op", case.name),
-                        "ns",
-                        ns,
-                    )),
-                    None => result.notes.push(format!(
-                        "case {}: marginal below timer resolution; no ns_per_op metric",
-                        case.name
-                    )),
-                }
-                // The deterministic, contention-immune companion metric: how many copy
-                // round-trips the timing above was derived from.
-                result.metrics.push(Metric::scalar(
-                    format!("case_{}_ops", case.name),
-                    "ops",
-                    ops(outcome.n) as f64,
-                ));
                 if let Some(value) = &outcome.observed {
                     observed_all.push(format!("{}={value}", case.name));
                 }
                 result.notes.push(format!(
-                    "case {}: N={} ({}) copy round-trips of the {}-key payload",
+                    "case {}: N={} ({}) copy round-trips of the {PAYLOAD_KEYS}-key payload",
                     case.name,
                     outcome.n,
-                    kind.as_str(),
-                    PAYLOAD_KEYS
+                    kind.as_str()
                 ));
             } else if outcome.unsupported {
                 unsupported_cases += 1;
@@ -723,16 +625,17 @@ impl Workload for CopyBound {
 
         result.peak_memory_bytes = overall_peak;
         if !observed_all.is_empty() {
-            result.notes.push(format!(
-                "observed stdout: {} (each case prints N * {PER_OP})",
-                observed_all.join(" ")
-            ));
+            let observed = observed_all.join(" ");
+            result.notes.push(format!("observed stdout: {observed} (each case prints N * {PER_OP})"));
         }
         result.notes.push(
-            "method: ns/op = (mean wall at N ops - mean wall at 0 ops) / N * 1e6; N is per \
+            "method: ns/op = median(wall at N ops - wall at 0 ops) / N * 1e6, from \
+             interleaved paired rounds (each round runs the N-op sample and then the 0-op \
+             sample back to back, so a drifting boot cost cancels inside the pair); N is per \
              runtime so both marginals are measurable, and the fixed process startup (incl. \
-             the Rust runtime's code-path resolution) cancels out of both sides; every case \
-             validates its copy round-trip with a bound-variable pattern"
+             the Rust runtime's code-path resolution) cancels out of every pair; the figure is \
+             withheld when the median does not clear the noise band; every case validates its \
+             copy round-trip with a bound-variable pattern"
                 .to_string(),
         );
         result.notes.push(
@@ -746,13 +649,13 @@ impl Workload for CopyBound {
         ));
 
         if ok_cases == 0 {
-            if unsupported_cases == CASES.len() {
-                result.status = Status::Skipped;
-                result.reason = Some("unsupported-case-set".to_string());
+            let (status, reason) = if unsupported_cases == CASES.len() {
+                (Status::Skipped, "unsupported-case-set")
             } else {
-                result.status = Status::Failed;
-                result.reason = Some("no-copy-bound-case-ran".to_string());
-            }
+                (Status::Failed, "no-copy-bound-case-ran")
+            };
+            result.status = status;
+            result.reason = Some(reason.to_string());
         }
 
         result
@@ -779,30 +682,26 @@ mod tests {
     #[test]
     fn every_case_declares_a_calibrated_n() {
         assert_eq!(CASES.len(), 4, "etf + ets + send/receive + delivery-only send/receive");
+        let mut functions: Vec<&str> = CASES.iter().map(|c| c.function).collect();
+        functions.sort_unstable();
+        functions.dedup();
+        assert_eq!(functions.len(), CASES.len(), "case functions must be distinct");
         for case in CASES {
             assert!(!case.name.is_empty(), "a case has no name");
-            assert!(!case.function.is_empty(), "{} has no function", case.name);
-            assert!(case.n_for(RuntimeKind::Rust) > 0, "{}", case.name);
-            assert!(case.n_for(RuntimeKind::Sys) > 0, "{}", case.name);
+            assert!(module_source().contains(&format!("{}(N) ->", case.function)), "{}", case.name);
+            assert!(case.n_for(RuntimeKind::Rust) > 0 && case.n_for(RuntimeKind::Sys) > 0, "{}", case.name);
             // The oracle is the faster runtime, so it always gets the larger loop count.
-            assert!(
-                case.n_sys > case.n_rust,
-                "{}: the oracle loop must be the larger one",
-                case.name
-            );
+            assert!(case.n_sys > case.n_rust, "{}: the oracle loop must be the larger one", case.name);
         }
     }
 
-    /// The m14 recalibration: every rust loop count must be large enough that the loop's
-    /// marginal stands clear of the rust side's ≈±0.1 s run-to-run boot jitter (a ≥0.5 s
-    /// floor), and the case whose marginal had actually collapsed inside that band
-    /// (`etf_roundtrip`, ≈0.27 s at the old `N` = 5 000) is targeted at ≳1.5 s.
+    /// The m14 recalibration: every rust loop count must do ≥0.5 s of work so its marginal stands
+    /// clear of the rust side's ≈±0.1 s boot jitter, and `etf_roundtrip` — the case whose marginal
+    /// had collapsed into that band (≈0.27 s at the old `N` = 5 000) — ≳1.5 s.
     #[test]
     fn the_rust_loop_counts_clear_the_boot_jitter_band() {
         // Per-op costs measured on the reference host (2026-10-16, min-of-reps, default
-        // baseline-JIT tier) — see the case table's doc comment. Every rust loop must do
-        // ≥0.5 s of work (≈5× the ≈±0.1 s boot jitter) and stay within a few seconds;
-        // `etf_roundtrip` — the case whose marginal had collapsed into the band — ≳1.5 s.
+        // baseline-JIT tier) — see the case table's doc comment.
         const COST_NS: &[(&str, f64, i64)] = &[
             ("etf_roundtrip", 54_000.0, 40_000),
             ("ets_copy", 7_000.0, 200_000),
@@ -816,9 +715,10 @@ mod tests {
             let work_s = *n_rust as f64 * ns_per_op / 1e9;
             assert!((0.5..=5.0).contains(&work_s), "{name}: {work_s} s of work");
         }
-        let etf = CASES.iter().find(|c| c.name == "etf_roundtrip").unwrap();
+        let etf = CASES.iter().find(|c| c.name == "etf_roundtrip").expect("etf");
         assert!(etf.n_rust as f64 * 54_000.0 / 1e9 >= 1.5);
     }
+
     #[test]
     fn argv_carries_the_loop_count_and_the_pa_dir_for_both_runtimes() {
         let dir = Path::new("/tmp/xyz");
@@ -836,64 +736,129 @@ mod tests {
         assert_eq!(sys[0], "-noshell");
         assert!(sys.contains(&"-pa".to_string()));
         assert!(sys.contains(&"/tmp/xyz".to_string()));
-        assert!(sys
-            .iter()
-            .any(|a| a.contains(&format!("{MODULE}:{}(9)", case.function))));
-    }
-
-    #[test]
-    fn each_case_has_a_distinct_function_and_the_expected_arity() {
-        let mut functions: Vec<&str> = CASES.iter().map(|c| c.function).collect();
-        functions.sort_unstable();
-        functions.dedup();
-        assert_eq!(functions.len(), CASES.len(), "case functions must be distinct");
-        for f in functions {
-            assert!(module_source().contains(&format!("{f}(N) ->")));
-        }
-    }
-
+        assert!(sys.iter().any(|a| a.contains(&format!("{MODULE}:{}(9)", case.function))));
+    }    /// `send_recv_plain` is the isolation case that attributes the ETF codec component of
+    /// `send_recv` *inside* the two-process path: it mirrors `send_recv`'s bound-variable
+    /// validation and `after` guard exactly, performs **no** codec call, and is a sibling of it
+    /// in the fixed table with a calibrated loop count per runtime.
     #[test]
     fn the_delivery_only_case_mirrors_send_recv_without_the_codec() {
-        // `send_recv_plain` is the isolation case that attributes the ETF codec component
-        // of `send_recv` *inside* the two-process path. It must mirror `send_recv`'s
-        // bound-variable validation and its `after` timeout guard exactly, and its worker
-        // must reply directly (no codec call in the receiver).
         let src = module_source();
         let plain = src
             .split(&format!("{SR_PLAIN}(N) ->"))
             .nth(1)
             .expect("the delivery-only case is generated");
-        assert!(plain.contains("Worker ! {self(), T},"));
-        assert!(plain.contains("case T2 of"));
-        assert!(plain.contains(&format!("{SR_PLAIN}(0, _Worker, Acc) -> Acc;")));
-        assert!(plain.contains(&format!(r"after {RECV_TIMEOUT_MS} ->")));
-        assert!(plain.contains("exit(message_timeout)"));
-        assert!(
-            !plain.contains("term_to_binary"),
-            "the delivery-only case must perform no ETF codec call"
-        );
-        // It is a sibling of `send_recv` in the fixed table, with a calibrated loop count
-        // for each runtime.
+        for needle in ["Worker ! {self(), T},", "case T2 of", "exit(message_timeout)"] {
+            assert!(plain.contains(needle), "missing `{needle}`");
+        }
+        assert!(!plain.contains("term_to_binary"), "no ETF codec call may remain");
         let case = CASES
             .iter()
             .find(|c| c.name == "send_recv_plain")
             .expect("the delivery-only case is in the fixed table");
         assert_eq!(case.function, SR_PLAIN);
-        assert!(case.n_for(RuntimeKind::Rust) > 0);
         assert!(case.n_for(RuntimeKind::Sys) > case.n_for(RuntimeKind::Rust));
     }
 
+    /// A fake pass sample: `work_ms` on the `Work` pass, `startup_ms` on the `Startup` pass,
+    /// the deterministic stdout of `units × n`, no RSS, no notes.
+    fn fake_sample(pass: Pass, work_ms: f64, startup_ms: f64, n: i64) -> Sample {
+        let wall_ms = if pass == Pass::Work { work_ms } else { startup_ms };
+        Sample { wall_ms, peak_memory_bytes: None, stdout: expected_stdout(n * pass.units()), notes: Vec::new() }
+    }
+
+    /// `CASES[0]`'s metrics pushed into a fresh result, from a steady fake clock whose `Work`
+    /// pass costs `delta_ms` (ms) more than its `Startup` pass, over `runs` rounds.
+    fn measured(delta_ms: f64, runs: usize) -> WorkloadResult {
+        let outcome = measure_case(1_000, runs, |pass| Ok(fake_sample(pass, 100.0 + delta_ms, 100.0, 1_000)));
+        let mut result = WorkloadResult::new("copy_bound", RuntimeKind::Rust, Category::Messaging, "test");
+        push_case_metrics(&mut result, &CASES[0], &outcome);
+        result
+    }
+
+    /// The `case_<CASES[0]>_<suffix>` metric, if the case emitted it.
+    fn case_metric<'a>(result: &'a WorkloadResult, suffix: &str) -> Option<&'a Metric> {
+        let name = format!("case_{}_{suffix}", CASES[0].name);
+        result.metrics.iter().find(|m| m.name == name)
+    }
+
+    /// The note starting with `case <CASES[0]>: <prefix>`.
+    fn case_note<'a>(result: &'a WorkloadResult, prefix: &str) -> Option<&'a String> {
+        let prefix = format!("case {}: {prefix}", CASES[0].name);
+        result.notes.iter().find(|n| n.starts_with(&prefix))
+    }
+
+    /// The schedule `copy_bound` uses: every round is a `Work` sample *immediately* followed by
+    /// its `Startup` sample — never a whole pass at a time (the old sequential all-`N`-then-
+    /// all-`0` schedule is what let host drift inflate the published gap ≈56×). A clear
+    /// marginal then publishes its figure together with the auditable paired evidence.
     #[test]
-    fn ns_per_op_cancels_startup_and_rejects_unusable_samples() {
-        // 100 ms at N=1000 ops, 10 ms at 0 ⇒ 90 ms of copying over 1000 ops ⇒ 90 µs/op.
-        assert_eq!(ns_per_op(&[100.0], &[10.0], 1_000), Some(90_000.0));
-        // Equal or inverted (noise) ⇒ no metric, never a negative number.
-        assert_eq!(ns_per_op(&[100.0], &[100.0], 1_000), None);
-        assert_eq!(ns_per_op(&[90.0], &[100.0], 1_000), None);
-        // Missing sample sets / a non-positive count ⇒ no metric.
-        assert_eq!(ns_per_op(&[], &[1.0], 1_000), None);
-        assert_eq!(ns_per_op(&[1.0], &[], 1_000), None);
-        assert_eq!(ns_per_op(&[1.0], &[0.0], -1), None);
+    fn rounds_are_paired_work_then_startup() {
+        let mut order = Vec::new();
+        let outcome = measure_case(1_000, 3, |pass| {
+            order.push(pass);
+            Ok(fake_sample(pass, 110.0, 100.0, 1_000))
+        });
+        assert_eq!(order, [Pass::Work, Pass::Startup].repeat(3), "one round is Work then Startup");
+        assert_eq!(outcome.pairs, vec![(110.0, 100.0); 3]);
+        assert!(outcome.ok() && outcome.notes.is_empty() && !outcome.unsupported);
+        // 10 ms of work over 1 000 ops = 10 000 ns/op, well clear of the noise band.
+        assert_eq!((outcome.marginal.rounds, outcome.marginal.unit_cost_ns()), (3, Some(10_000.0)));
+
+        let result = measured(10.0, 3);
+        let ns = case_metric(&result, "ns_per_op").expect("a clear marginal must publish");
+        assert_eq!((ns.unit.as_str(), ns.value), ("ns", Some(10_000.0)));
+        let note = case_note(&result, "paired median=").expect("the figure must cite its evidence");
+        assert!(note.contains("over 3 round(s)"), "{note}");
+        for suffix in ["ops", "wall_ms", "startup_ms"] {
+            assert!(case_metric(&result, suffix).is_some(), "{suffix}");
+        }
+        // No `Work`-pass peak RSS was supplied here, so no RSS row is emitted.
+        assert!(case_metric(&result, "peak_rss_bytes").is_none());
+    }
+
+    /// A failing startup pass keeps the pairs already completed, reports where it stopped, and
+    /// carries the capability-gap flag through untouched.
+    #[test]
+    fn a_failing_startup_pass_keeps_the_completed_pairs() {
+        let mut samples = 0;
+        let outcome = measure_case(1_000, 3, |pass| {
+            samples += 1;
+            // Sample 4 is round 2's `Startup` pass (the order is W,S,W,S,...).
+            if samples == 4 {
+                assert_eq!(pass, Pass::Startup);
+                let note = "case etf_roundtrip (rust): exited 1: boom (startup pass)".to_string();
+                return Err(PassError { note, unsupported: false });
+            }
+            Ok(fake_sample(pass, 110.0, 100.0, 1_000))
+        });
+        assert_eq!(outcome.pairs, vec![(110.0, 100.0)], "round 1 only");
+        assert!(outcome.ok(), "one completed round is still a usable sample");
+        assert_eq!(outcome.marginal.rounds, 1);
+        assert!(!outcome.unsupported);
+        assert!(outcome.notes.iter().any(|n| n.contains("boom")), "{:?}", outcome.notes);
+
+        // A capability gap on the very first `Work` pass: nothing measured ⇒ unsupported.
+        let gap = || PassError { note: "case etf_roundtrip: unsupported: unsupported_bif".into(), unsupported: true };
+        let outcome = measure_case(1_000, 2, |_pass| Err::<Sample, PassError>(gap()));
+        assert!(outcome.pairs.is_empty() && !outcome.ok() && outcome.unsupported);
+        assert_eq!(outcome.marginal.unit_cost_ns(), None);
+        assert!(outcome.notes.iter().any(|n| n.contains("unsupported_bif")));
+    }
+
+    /// A noisy sample set publishes **no** `ns_per_op` metric — only the withholding note — so
+    /// a drift artifact can never reach the report.
+    #[test]
+    fn the_metric_is_withheld_inside_the_noise_band() {
+        // A steady 1 ms of "work" per round is below NOISE_MULTIPLE × MIN_NOISE_MS.
+        let result = measured(1.0, 3);
+        assert!(case_metric(&result, "ns_per_op").is_none(), "no figure inside the noise band");
+        // The deterministic companion and the raw sample rows are still published.
+        for suffix in ["ops", "wall_ms", "startup_ms"] {
+            assert!(case_metric(&result, suffix).is_some(), "{suffix}");
+        }
+        let note = case_note(&result, "marginal below timer resolution").expect("the withholding note");
+        assert!(note.contains("paired median=1.000 ms"), "{note}");
     }
 
     #[test]
@@ -908,64 +873,53 @@ mod tests {
         assert_eq!(expected_stdout(3), (3 * PER_OP).to_string());
     }
 
+    /// The generated module pins the shared constants, each case is a top-level clause pair,
+    /// and it uses only the constructs `beam_rt` supports today (the ETF codec, ETS
+    /// insert/lookup and two-process send/receive with and without the codec in the receiver).
+    /// The delivery-only worker replies the payload directly; the map it copies has exactly
+    /// `PAYLOAD_KEYS` top-level entries (the number the per-case note reports).
     #[test]
-    fn the_module_source_pins_the_shared_constants() {
+    fn the_embedded_module_pins_the_shared_constants() {
         let src = module_source();
         assert!(src.starts_with(&format!("-module({MODULE}).")), "{src}");
         assert!(src.contains(&format!(
             "-export([{ETF}/{ARITY}, {ETS}/{ARITY}, {SR}/{ARITY}, {SR_PLAIN}/{ARITY}])."
         )));
-        // The payload is generated from the crate constants.
-        assert!(src.contains("10,11,12"), "the binary bytes come from the constant");
-        assert!(src.contains(PAYLOAD_STRING));
-        assert!(src.contains(&PAYLOAD_NEG.to_string()));
-        assert!(src.contains(&format!("{PAYLOAD_FLOAT}")));
-        assert!(src.contains(&format!("Acc + {PER_OP}")));
-        assert!(src.contains(&format!("after {RECV_TIMEOUT_MS} ->")));
-        // Each case must be present as a top-level clause pair.
-        assert!(src.contains(&format!("{ETF}(0, Acc) -> Acc;")));
-        assert!(src.contains(&format!("{ETS}(0, _Tab, Acc) -> Acc;")));
-        assert!(src.contains(&format!("{SR}(0, _Worker, Acc) -> Acc;")));
-        assert!(src.contains(&format!("{SR_PLAIN}(0, _Worker, Acc) -> Acc;")));
-        // The delivery-only worker replies the payload directly, with no codec call in the
-        // receiver; the codec round-trip stays confined to the `send_recv` worker.
-        assert!(src.contains("From ! {self(), T},"));
-        assert!(src.contains("From ! {self(), binary_to_term(term_to_binary(T))},"));
-    }
-
-    #[test]
-    fn the_module_source_uses_only_supported_constructs() {
-        // The four copies are exactly the constructs `beam_rt` supports today: the ETF
-        // codec, ETS insert/lookup, and two-process send/receive (with and without the
-        // codec in the receiver).
-        let src = module_source();
         for needle in [
-            "term_to_binary(",
-            "binary_to_term(",
-            "ets:new(",
-            "ets:insert(",
-            "ets:lookup(",
-            "ets:delete(",
-            "spawn(",
-            "!",
-            "receive",
+            "10,11,12".to_string(),
+            PAYLOAD_STRING.to_string(),
+            PAYLOAD_NEG.to_string(),
+            PAYLOAD_FLOAT.to_string(),
+            format!("Acc + {PER_OP}"),
+            format!("after {RECV_TIMEOUT_MS} ->"),
+            format!("{ETF}(0, Acc) -> Acc;"),
+            format!("{ETS}(0, _Tab, Acc) -> Acc;"),
+            format!("{SR}(0, _Worker, Acc) -> Acc;"),
+            format!("{SR_PLAIN}(0, _Worker, Acc) -> Acc;"),
+            // The delivery-only worker replies the payload directly; the codec round trip stays
+            // confined to the `send_recv` worker.
+            "From ! {self(), T},".to_string(),
+            "From ! {self(), binary_to_term(term_to_binary(T))},".to_string(),
+            "term_to_binary(".to_string(),
+            "binary_to_term(".to_string(),
+            "ets:new(".to_string(),
+            "ets:insert(".to_string(),
+            "ets:lookup(".to_string(),
+            "ets:delete(".to_string(),
+            "spawn(".to_string(),
+            "!".to_string(),
+            "receive".to_string(),
         ] {
-            assert!(src.contains(needle), "missing construct `{needle}`");
+            assert!(src.contains(&needle), "missing `{needle}`");
         }
-    }
-
-    #[test]
-    fn the_payload_has_the_declared_number_of_keys() {
-        // The note reports PAYLOAD_KEYS, so the generated map must actually have that many
-        // top-level entries (the payload's body ends at the first `}.`).
-        let src = module_source();
+        // The payload's body ends at the first `}.`, with one `=> ` per top-level key.
         let body = src
             .split("payload() ->")
             .nth(1)
             .expect("the payload clause is generated")
             .split("}.")
             .next()
-            .unwrap();
+            .expect("the payload body is terminated");
         assert_eq!(body.matches("=> ").count(), PAYLOAD_KEYS, "{body}");
     }
 

@@ -53,29 +53,47 @@
 //!
 //! Every churn adds `PER_OP`, so a run at `N` churns prints exactly `N * PER_OP`.
 //!
-//! # The measurement (startup-cancelled, per op)
+//! # The measurement (paired, interleaved, per op)
 //!
 //! The two runtimes differ by more than an order of magnitude per op, so one fixed loop
 //! count cannot give both a measurable marginal: an `N` that is a real signal for the Rust
 //! runtime is below the oracle's own run-to-run startup noise. The program therefore
 //! declares a **per-runtime loop count** `N` and the workload runs the identical program
-//! twice per sample:
-//!
-//! * at `N` churns ⇒ `case_churn_wall_ms` (end-to-end process wall time),
-//! * at `0` churns ⇒ `case_churn_startup_ms` (the same program's pure startup/boot cost —
-//!   the Rust runtime loads its preloaded-module set and resolves its system code path with
-//!   a native filesystem probe (`crates/beam_rt/src/codeserver.rs`; the system `erl` is only
-//!   *run* as a last resort), so this is not zero),
-//!
-//! and derives the throughput metric
+//! twice per round — at `N` churns (the *work* sample, `case_churn_wall_ms`) and at `0`
+//! churns (the *startup* sample, `case_churn_startup_ms`: not zero, the Rust runtime loads
+//! its preloaded-module set and resolves its system code path with a native filesystem probe,
+//! `crates/beam_rt/src/codeserver.rs`) — **back to back inside every round**
+//! ([`marginal::sample_pairs`]), and derives the throughput metric from the **median of the
+//! paired differences**:
 //!
 //! ```text
-//! case_churn_ns_per_op = (mean(wall_ms) - mean(startup_ms)) / N * 1e6
+//! case_churn_ns_per_op = median_i(wall_ms@N[i] - wall_ms@0[i]) / N * 1e6
 //! ```
 //!
-//! which cancels the fixed process-startup cost from both sides. It is emitted only when
-//! the marginal is positive; otherwise a note records that the marginal is below timer
-//! resolution — never a fabricated or negative number.
+//! Each pair's two samples straddle essentially the same host conditions, so the fixed
+//! process-startup cost cancels against *its own* baseline run instead of against another
+//! pass's mean.
+//!
+//! # Why the schedule is paired (do not "simplify" it back)
+//!
+//! An earlier version took **all** `N`-churn samples and then **all** `0`-churn samples and
+//! formed `(mean(wall@N) - mean(wall@0)) / N`; only a *negative* marginal was refused. That
+//! is valid only if the startup cost is constant over the whole measurement, and on this
+//! shared host it is not: boot cost drifts by tens — at times hundreds — of milliseconds
+//! between the two passes, so the mean-based difference **absorbs** the drift instead of
+//! cancelling it and silently publishes an inflated figure (an independent interleaved
+//! measurement of the sibling `copy_bound` workload shows the failure mode is worth a ~56×
+//! inflation of a published gap). Sampling both passes inside one round makes drift a
+//! per-pair residual of at most one sampling interval rather than a bias of `runs`
+//! intervals, and the median ignores the one round a load spike hit. **The sequential
+//! all-N-then-all-0 schedule must never come back**; the rules live in [`crate::marginal`],
+//! which every per-unit workload shares.
+//!
+//! The figure is withheld — recorded as `marginal below timer resolution`, with no metric —
+//! when the median paired difference does not clear
+//! `NOISE_MULTIPLE × max(MIN_NOISE_MS, 1.4826 × MAD)` of the deltas: no number is better than
+//! a drift artifact, and every published figure carries its auditable
+//! `paired median=… min=… max=… noise=±… over k round(s)` note.
 //!
 //! Because the *timing* is only as stable as the host, the workload also emits
 //! `case_churn_ops = N`, the deterministic number of allocate-and-abandon iterations the
@@ -102,12 +120,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::marginal::{self, Marginal, Pass, PassError};
 use crate::metrics::{Category, Metric, Probe, Runtimes, Status};
 use crate::proc::{self, Completed};
 use crate::report::{Profile, WorkloadResult};
 use crate::runtime::RuntimeKind;
 use crate::scratch::ScratchDir;
-use crate::stats::mean;
 use crate::workload::{RunContext, Workload};
 use crate::workloads::slice;
 
@@ -252,6 +270,12 @@ fn argv_for(kind: RuntimeKind, dir: &Path, n: i64) -> Vec<String> {
     }
 }
 
+/// The argv for one pass of the measurement: the [`Pass::Work`] pass runs `N` churns, the
+/// [`Pass::Startup`] pass `0`.
+fn pass_argv(kind: RuntimeKind, dir: &Path, n: i64, pass: Pass) -> Vec<String> {
+    argv_for(kind, dir, n * pass.units())
+}
+
 /// Writes the embedded module into `dir` and compiles it with `erlc`.
 ///
 /// Returns `Err(reason)` — never a silent `false` — when the source cannot be written or
@@ -283,42 +307,87 @@ fn stage(dir: &Path, erlc: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// The samples collected under one runtime.
-struct Outcome {
-    /// The loop count used.
-    n: i64,
-    /// Wall-clock samples (ms) of the `n`-churn runs.
-    wall: Vec<f64>,
-    /// Wall-clock samples (ms) of the `0`-churn (startup-only) runs.
-    startup: Vec<f64>,
-    /// Peak-RSS samples (bytes) of the `n`-churn runs.
-    rss: Vec<f64>,
-    /// The stdout observed on the first successful `n`-churn run.
-    observed: Option<String>,
-    /// Whether the runtime reported the case as `unsupported` (Rust exit `3`).
-    unsupported: bool,
-    /// Notes about failures/variations (never silent).
+/// One pass's raw sample: the program ran, so its wall time and peak RSS are real.
+struct Sample {
+    /// End-to-end process wall time (ms).
+    wall_ms: f64,
+    /// Peak RSS (bytes) of the run, when the poller could read it.
+    peak_memory_bytes: Option<u64>,
+    /// The trimmed stdout, validated against the deterministic constant by [`run_pass`].
+    stdout: String,
+    /// Per-sample notes (a stdout mismatch is a note, never an abort).
     notes: Vec<String>,
 }
 
+/// The samples collected under one runtime, plus the marginal resolved from them.
+struct Outcome {
+    /// The loop count used.
+    n: i64,
+    /// One `(wall_ms@N, wall_ms@0)` sample pair per completed round, in round order.
+    pairs: Vec<(f64, f64)>,
+    /// Peak-RSS samples (bytes) of the `n`-churn runs.
+    rss: Vec<f64>,
+    /// The stdout observed on the first completed `n`-churn run.
+    observed: Option<String>,
+    /// Whether the runtime reported the case as `unsupported` (Rust exit `3` before any
+    /// `n`-churn run ever completed).
+    unsupported: bool,
+    /// Notes about failures/variations (never silent).
+    notes: Vec<String>,
+    /// The paired, drift-cancelling per-op marginal (`None` figure inside the noise band).
+    marginal: Marginal,
+}
+
 impl Outcome {
-    /// Whether the case produced at least one usable timing.
+    /// Whether the case produced at least one usable `(work, startup)` pair.
     fn ok(&self) -> bool {
-        !self.wall.is_empty()
+        !self.pairs.is_empty()
     }
 }
 
-/// The startup-cancelled marginal cost per churn, in nanoseconds — `None` when either
-/// sample set is unusable or the marginal is not positive (below timer resolution).
-fn ns_per_op(wall: &[f64], startup: &[f64], n: i64) -> Option<f64> {
-    if wall.is_empty() || startup.is_empty() || n <= 0 {
-        return None;
-    }
-    let marginal = mean(wall) - mean(startup);
-    if marginal <= 0.0 {
-        None
-    } else {
-        Some(marginal / n as f64 * 1_000_000.0)
+/// Runs one pass — the program at `n × pass.units()` churns — and collects its sample.
+///
+/// A non-zero exit or a killed run is an `Err`; a stdout mismatch is a note on the sample,
+/// never an abort (that run's timing is still real).
+fn run_pass(
+    program: &Path,
+    kind: RuntimeKind,
+    dir: &Path,
+    n: i64,
+    pass: Pass,
+) -> Result<Sample, PassError> {
+    let churns = n * pass.units();
+    let mut cmd = Command::new(program);
+    cmd.args(pass_argv(kind, dir, n, pass));
+    match proc::run(&mut cmd) {
+        Ok(completed) if completed.success => {
+            let expected = expected_stdout(churns);
+            let stdout = completed.stdout_trim().to_string();
+            let mut notes = Vec::new();
+            if stdout != expected {
+                notes.push(format!(
+                    "case {}: the {} run printed `{stdout}` (expected `{expected}`)",
+                    CASE.name,
+                    pass.as_str()
+                ));
+            }
+            Ok(Sample {
+                wall_ms: completed.wall_ms,
+                peak_memory_bytes: completed.peak_memory_bytes,
+                stdout,
+                notes,
+            })
+        }
+        Ok(completed) => Err(PassError {
+            note: classify_failure(kind, &completed),
+            // The Rust runtime's capability gap. `execute` downgrades it to a real failure
+            // once the loop has run at least once.
+            unsupported: kind == RuntimeKind::Rust && completed.exit_code == Some(3),
+        }),
+        Err(e) => Err(PassError {
+            note: format!("case {} ({}): spawn failed: {e}", CASE.name, kind.as_str()),
+            unsupported: false,
+        }),
     }
 }
 
@@ -345,99 +414,70 @@ fn classify_failure(kind: RuntimeKind, completed: &Completed) -> String {
     }
 }
 
-/// Runs the program at `N` churns and at `0` churns, `runs` times each, collecting samples.
+/// Runs `runs` interleaved rounds — the `n`-churn pass and then the `0`-churn pass inside
+/// every round — and resolves the paired marginal.
 fn execute(program: &Path, kind: RuntimeKind, dir: &Path, runs: usize) -> Outcome {
     let n = CASE.n_for(kind);
-    let mut outcome = Outcome {
+    let mut work_samples = 0usize;
+    measure(n, runs, |pass| match run_pass(program, kind, dir, n, pass) {
+        Ok(sample) => {
+            if pass == Pass::Work {
+                work_samples += 1;
+            }
+            Ok(sample)
+        }
+        // A capability gap classifies as `unsupported` only while the loop has never run: a
+        // Rust exit `3` after a completed round is a real failure, not a missing capability.
+        Err(err) => Err(PassError {
+            note: err.note,
+            unsupported: err.unsupported && work_samples == 0,
+        }),
+    })
+}
+
+/// Assembles an [`Outcome`] from `runs` rounds sampled by `sample`.
+///
+/// `sample` produces one pass's [`Sample`] — in production one process spawn ([`run_pass`]).
+/// Keeping it a parameter is what makes the *schedule* and a mid-measurement failure testable
+/// without spawning anything. A failure aborts the measurement, but the rounds completed
+/// before it are retained, so a case with usable pairs is still reported.
+fn measure<F>(n: i64, runs: usize, sample: F) -> Outcome
+where
+    F: FnMut(Pass) -> Result<Sample, PassError>,
+{
+    let paired = marginal::sample_pairs(runs, sample);
+    let mut notes = Vec::new();
+    if let Some(abort) = &paired.aborted {
+        notes.push(match abort.pass {
+            Pass::Work => abort.note.clone(),
+            Pass::Startup => format!("case {}: startup run failed: {}", CASE.name, abort.note),
+        });
+    }
+
+    let mut pairs = Vec::with_capacity(paired.pairs.len());
+    let mut rss = Vec::new();
+    let mut observed = None;
+    for (work, startup) in &paired.pairs {
+        pairs.push((work.wall_ms, startup.wall_ms));
+        // Peak RSS is a property of the work run; the `0`-churn run is not attributed to it.
+        if let Some(bytes) = work.peak_memory_bytes {
+            rss.push(bytes as f64);
+        }
+        if observed.is_none() {
+            observed = Some(work.stdout.clone());
+        }
+        notes.extend(work.notes.iter().chain(startup.notes.iter()).cloned());
+    }
+
+    Outcome {
         n,
-        wall: Vec::new(),
-        startup: Vec::new(),
-        rss: Vec::new(),
-        observed: None,
-        unsupported: false,
-        notes: Vec::new(),
-    };
-    let expected = expected_stdout(n);
-
-    // Pass 1: the `N`-churn runs (the measured work).
-    for _ in 0..runs {
-        let mut cmd = Command::new(program);
-        cmd.args(argv_for(kind, dir, n));
-        match proc::run(&mut cmd) {
-            Ok(completed) if completed.success => {
-                outcome.wall.push(completed.wall_ms);
-                if let Some(bytes) = completed.peak_memory_bytes {
-                    outcome.rss.push(bytes as f64);
-                }
-                let got = completed.stdout_trim().to_string();
-                if got != expected {
-                    outcome.notes.push(format!(
-                        "case {}: unexpected stdout `{got}` (expected `{expected}`)",
-                        CASE.name
-                    ));
-                }
-                if outcome.observed.is_none() {
-                    outcome.observed = Some(got);
-                }
-            }
-            Ok(completed) => {
-                if kind == RuntimeKind::Rust
-                    && completed.exit_code == Some(3)
-                    && outcome.wall.is_empty()
-                {
-                    outcome.unsupported = true;
-                }
-                outcome.notes.push(classify_failure(kind, &completed));
-                break;
-            }
-            Err(e) => {
-                outcome.notes.push(format!(
-                    "case {} ({}): spawn failed: {e}",
-                    CASE.name,
-                    kind.as_str()
-                ));
-                break;
-            }
-        }
+        rss,
+        observed,
+        unsupported: paired.aborted.map(|a| a.unsupported).unwrap_or(false),
+        notes,
+        marginal: marginal::resolve(&pairs, n),
+        pairs,
     }
-
-    // Pass 2: the `0`-churn runs (startup only). Skipped when pass 1 already failed — a
-    // broken case must not be timed at all.
-    if outcome.ok() {
-        let expected_startup = expected_stdout(0);
-        for _ in 0..runs {
-            let mut cmd = Command::new(program);
-            cmd.args(argv_for(kind, dir, 0));
-            match proc::run(&mut cmd) {
-                Ok(completed) if completed.success => {
-                    outcome.startup.push(completed.wall_ms);
-                    let got = completed.stdout_trim().to_string();
-                    if got != expected_startup {
-                        outcome.notes.push(format!(
-                            "case {}: the startup run printed `{got}` (expected `{expected_startup}`)",
-                            CASE.name
-                        ));
-                    }
-                }
-                Ok(completed) => {
-                    outcome.notes.push(format!(
-                        "case {}: startup run failed: {}",
-                        CASE.name,
-                        classify_failure(kind, &completed)
-                    ));
-                    break;
-                }
-                Err(e) => {
-                    outcome
-                        .notes
-                        .push(format!("case {}: startup spawn failed: {e}", CASE.name));
-                    break;
-                }
-            }
-        }
-    }
-
-    outcome
 }
 
 impl Workload for GcBound {
@@ -531,73 +571,7 @@ impl Workload for GcBound {
         result.notes.push(staged);
 
         if outcome.ok() {
-            result.metrics.push(Metric::samples(
-                format!("case_{}_wall_ms", CASE.name),
-                "ms",
-                &outcome.wall,
-            ));
-            if !outcome.startup.is_empty() {
-                result.metrics.push(Metric::samples(
-                    format!("case_{}_startup_ms", CASE.name),
-                    "ms",
-                    &outcome.startup,
-                ));
-            }
-            if !outcome.rss.is_empty() {
-                result.metrics.push(Metric::samples(
-                    format!("case_{}_peak_rss_bytes", CASE.name),
-                    "bytes",
-                    &outcome.rss,
-                ));
-                let peak = outcome.rss.iter().fold(0.0_f64, |a, &b| a.max(b));
-                result.peak_memory_bytes = Some(peak as u64);
-            }
-            match ns_per_op(&outcome.wall, &outcome.startup, outcome.n) {
-                Some(ns) => result.metrics.push(Metric::scalar(
-                    format!("case_{}_ns_per_op", CASE.name),
-                    "ns",
-                    ns,
-                )),
-                None => result.notes.push(format!(
-                    "case {}: marginal below timer resolution; no ns_per_op metric",
-                    CASE.name
-                )),
-            }
-            // The deterministic, contention-immune companion metric: how many
-            // allocate-and-abandon iterations the timing above was derived from.
-            result.metrics.push(Metric::scalar(
-                format!("case_{}_ops", CASE.name),
-                "ops",
-                ops(outcome.n) as f64,
-            ));
-
-            if let Some(value) = &outcome.observed {
-                result.notes.push(format!(
-                    "observed stdout: {}=N*{PER_OP}={value}",
-                    CASE.name
-                ));
-            }
-            result.notes.push(format!(
-                "case {}: N={} churns ({}), each allocating and abandoning a {LEN}-element \
-                 list, a {LEN}-byte binary and a {LEN}-element tuple",
-                CASE.name,
-                outcome.n,
-                kind.as_str()
-            ));
-            result.notes.push(
-                "method: ns/op = (mean wall at N churns - mean wall at 0 churns) / N * 1e6; N \
-                 is per runtime so both marginals are measurable, and the fixed process \
-                 startup (incl. the Rust runtime's code-path resolution) cancels out of both \
-                 sides"
-                    .to_string(),
-            );
-            result.notes.push(
-                "note: the op count is deterministic and contention-immune; the wall-clock \
-                 rows move with host load. Whether a runtime's collector actually runs during \
-                 the loop is its own admission policy — this row measures the \
-                 allocate-and-abandon wall time, and claims no collection count"
-                    .to_string(),
-            );
+            emit(&mut result, &outcome, kind);
         } else {
             result.notes.extend(outcome.notes);
             if outcome.unsupported {
@@ -611,6 +585,82 @@ impl Workload for GcBound {
 
         result
     }
+}
+
+/// A sampled metric named for the case: `case_<case>_<suffix>`.
+fn case_samples(suffix: &str, unit: &str, samples: &[f64]) -> Metric {
+    Metric::samples(format!("case_{}_{suffix}", CASE.name), unit, samples)
+}
+
+/// Records one completed case's metrics and notes onto `result`.
+///
+/// Pure — it reads an [`Outcome`] and spawns nothing — so the emission decision that matters
+/// most (a figure inside the noise band is withheld, never published) is directly testable.
+fn emit(result: &mut WorkloadResult, outcome: &Outcome, kind: RuntimeKind) {
+    let wall: Vec<f64> = outcome.pairs.iter().map(|(work, _)| *work).collect();
+    let startup: Vec<f64> = outcome.pairs.iter().map(|(_, startup)| *startup).collect();
+    result.metrics.push(case_samples("wall_ms", "ms", &wall));
+    result.metrics.push(case_samples("startup_ms", "ms", &startup));
+    if !outcome.rss.is_empty() {
+        result
+            .metrics
+            .push(case_samples("peak_rss_bytes", "bytes", &outcome.rss));
+        let peak = outcome.rss.iter().fold(0.0_f64, |a, &b| a.max(b));
+        result.peak_memory_bytes = Some(peak as u64);
+    }
+    // The figure, or *why* there is none — never a number inside the noise band.
+    match outcome.marginal.unit_cost_ns() {
+        Some(ns) => {
+            result.metrics.push(Metric::scalar(
+                format!("case_{}_ns_per_op", CASE.name),
+                "ns",
+                ns,
+            ));
+            result
+                .notes
+                .push(format!("case {}: {}", CASE.name, outcome.marginal.detail()));
+        }
+        None => result.notes.push(format!(
+            "case {}: {}",
+            CASE.name,
+            outcome.marginal.below_resolution_note()
+        )),
+    }
+    // The deterministic, contention-immune companion metric: how many allocate-and-abandon
+    // iterations the timing above was derived from.
+    result.metrics.push(Metric::scalar(
+        format!("case_{}_ops", CASE.name),
+        "ops",
+        ops(outcome.n) as f64,
+    ));
+    if let Some(value) = &outcome.observed {
+        result
+            .notes
+            .push(format!("observed stdout: {}=N*{PER_OP}={value}", CASE.name));
+    }
+    result.notes.push(format!(
+        "case {}: N={} churns ({}), each allocating and abandoning a {LEN}-element \
+         list, a {LEN}-byte binary and a {LEN}-element tuple",
+        CASE.name,
+        outcome.n,
+        kind.as_str()
+    ));
+    result.notes.push(
+        "method: every round runs the program at N churns and then at 0 churns back to back, \
+         and ns/op is the median paired difference (wall@N - wall@0) / N * 1e6 — never two \
+         separate means, whose difference absorbs a drifting boot cost instead of cancelling \
+         it. N is per runtime so both marginals are measurable, the fixed process startup \
+         (incl. the Rust runtime's code-path resolution) cancels inside every pair, and a \
+         figure inside the noise band is withheld rather than published"
+            .to_string(),
+    );
+    result.notes.push(
+        "note: the op count is deterministic and contention-immune; the wall-clock \
+         rows move with host load. Whether a runtime's collector actually runs during \
+         the loop is its own admission policy — this row measures the \
+         allocate-and-abandon wall time, and claims no collection count"
+            .to_string(),
+    );
 }
 
 #[cfg(test)]
@@ -646,6 +696,23 @@ mod tests {
         );
     }
 
+    /// The calibration rule from the [`CASE`] doc, pinned: the rust loop must be worth ≥0.5 s
+    /// of churn work (5× the ≈±0.1 s run-to-run boot jitter), computed at the *cheapest* rust
+    /// churn measured on the reference host (2026-10-16) — a slower host only grows it.
+    #[test]
+    fn the_rust_loop_count_clears_the_boot_jitter_band() {
+        const BOOT_JITTER_MS: f64 = 100.0;
+        const FLOOR_MULTIPLE: f64 = 5.0;
+        const MIN_CHURN_US: f64 = 100.0;
+
+        let marginal_ms = CASE.n_rust as f64 * MIN_CHURN_US / 1_000.0;
+        let floor_ms = FLOOR_MULTIPLE * BOOT_JITTER_MS;
+        assert!(
+            marginal_ms >= floor_ms,
+            "n_rust={} ⇒ {marginal_ms:.0} ms of churn work, below the {floor_ms:.0} ms floor",
+            CASE.n_rust
+        );
+    }
     #[test]
     fn argv_carries_the_loop_count_and_the_pa_dir_for_both_runtimes() {
         let dir = Path::new("/tmp/xyz");
@@ -666,17 +733,172 @@ mod tests {
             .any(|a| a.contains(&format!("{MODULE}:{FUNCTION}(9)"))));
     }
 
+    /// A measured [`Outcome`] over `runs` fake rounds whose true per-op cost is `ns_per_op`.
+    ///
+    /// Nothing is spawned: only the *sample shape* is faked, so the pairing, the marginal and
+    /// the emission decision are exercised exactly as in production.
+    fn fake_outcome(n: i64, runs: usize, ns_per_op: f64) -> Outcome {
+        let work_ms = n as f64 * ns_per_op / 1e6;
+        measure(n, runs, |pass| {
+            Ok(Sample {
+                wall_ms: 100.0 + if pass == Pass::Work { work_ms } else { 0.0 },
+                peak_memory_bytes: Some(1_000_000),
+                stdout: expected_stdout(n * pass.units()),
+                notes: Vec::new(),
+            })
+        })
+    }
+
+    /// The schedule itself: one round is the `N`-churn pass and then the `0`-churn pass,
+    /// back to back — never all work passes followed by all startup passes.
     #[test]
-    fn ns_per_op_cancels_startup_and_rejects_unusable_samples() {
-        // 100 ms at N=1000 churns, 10 ms at 0 ⇒ 90 ms of churn over 1000 ops ⇒ 90 µs/op.
-        assert_eq!(ns_per_op(&[100.0], &[10.0], 1_000), Some(90_000.0));
-        // Equal or inverted (noise) ⇒ no metric, never a negative number.
-        assert_eq!(ns_per_op(&[100.0], &[100.0], 1_000), None);
-        assert_eq!(ns_per_op(&[90.0], &[100.0], 1_000), None);
-        // Missing sample sets / a non-positive count ⇒ no metric.
-        assert_eq!(ns_per_op(&[], &[1.0], 1_000), None);
-        assert_eq!(ns_per_op(&[1.0], &[], 1_000), None);
-        assert_eq!(ns_per_op(&[1.0], &[0.0], -1), None);
+    fn rounds_are_paired_work_then_startup() {
+        let dir = Path::new("/tmp/gc-bound-pairing");
+        let n = 7;
+        let mut order = Vec::new();
+        let mut loop_counts = Vec::new();
+        let outcome = measure(n, 3, |pass| {
+            let argv = pass_argv(RuntimeKind::Rust, dir, n, pass);
+            order.push(pass.as_str());
+            // Rust argv: `-pa <dir> run <beam> mod:fun/1 <n>` — the loop count is last.
+            loop_counts.push(argv[argv.len() - 1].clone());
+            Ok(Sample {
+                wall_ms: 100.0 + n as f64 * pass.units() as f64,
+                peak_memory_bytes: None,
+                stdout: expected_stdout(n * pass.units()),
+                notes: Vec::new(),
+            })
+        });
+        assert_eq!(
+            order,
+            ["work", "startup", "work", "startup", "work", "startup"],
+            "each round must sample the N-churn pass and then the 0-churn pass"
+        );
+        assert_eq!(
+            loop_counts,
+            ["7", "0", "7", "0", "7", "0"],
+            "the work pass runs N churns, the startup pass 0"
+        );
+        assert_eq!(outcome.pairs.len(), 3);
+        assert!(!outcome.unsupported, "no abort ⇒ nothing is a capability gap");
+        assert_eq!(outcome.observed.as_deref(), Some(expected_stdout(n).as_str()));
+        // 7 ms over 7 churns, recovered exactly because both passes of a round share the
+        // same (here constant) 100 ms boot cost.
+        assert_eq!(outcome.marginal.unit_cost_ns(), Some(1_000_000.0));
+    }
+
+    /// A failing pass aborts the measurement but keeps the rounds already completed — and a
+    /// capability gap that stopped the very first work pass stays `unsupported`.
+    #[test]
+    fn a_failing_startup_pass_keeps_the_completed_pairs() {
+        let n = 7;
+        let mut samples = 0;
+        let outcome = measure(n, 5, |pass| {
+            samples += 1;
+            if samples == 4 {
+                // Passes run Work, Startup, Work, Startup, … ⇒ sample 4 is round 2's startup.
+                return Err(PassError {
+                    note: "case churn (sys): exited 1: the case printed nothing".into(),
+                    unsupported: false,
+                });
+            }
+            Ok(Sample {
+                wall_ms: 100.0 + n as f64 * pass.units() as f64,
+                peak_memory_bytes: None,
+                stdout: expected_stdout(n * pass.units()),
+                notes: Vec::new(),
+            })
+        });
+        // Round 1 completed, so its pair is retained and the case is still reportable.
+        assert_eq!(outcome.pairs.len(), 1);
+        assert!(outcome.ok());
+        assert!(!outcome.unsupported);
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|note| note.contains("startup run failed")
+                    && note.contains("printed nothing")),
+            "{:?}",
+            outcome.notes
+        );
+
+        // A capability gap on the very first work pass: nothing measured, flag survives.
+        let gap = measure(n, 5, |_pass| {
+            Err::<Sample, PassError>(PassError {
+                note: "case churn: unsupported: unsupported_bif".into(),
+                unsupported: true,
+            })
+        });
+        assert!(!gap.ok());
+        assert!(gap.pairs.is_empty());
+        assert!(gap.unsupported);
+        assert_eq!(
+            gap.notes,
+            vec!["case churn: unsupported: unsupported_bif".to_string()]
+        );
+    }
+
+    /// The row keeps its wall/startup/RSS/ops metrics either way, but `ns_per_op` is
+    /// published only for a marginal clearly outside the noise band.
+    #[test]
+    fn the_metric_is_withheld_inside_the_noise_band() {
+        let n = CASE.n_for(RuntimeKind::Rust);
+        let emit_for = |ns_per_op: f64| {
+            let mut result =
+                WorkloadResult::new("gc_bound", RuntimeKind::Rust, Category::Gc, "fake");
+            emit(&mut result, &fake_outcome(n, 4, ns_per_op), RuntimeKind::Rust);
+            result
+        };
+        let value = |result: &WorkloadResult, name: &str| {
+            result
+                .metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .and_then(|metric| metric.value)
+        };
+        let note = |result: &WorkloadResult, prefix: &str| {
+            result.notes.iter().any(|note| note.starts_with(prefix))
+        };
+
+        // 0 and 10 ns/op over `n` churns are a 0 ms and a ~0 ms delta — inside the band.
+        for withheld in [0.0, 10.0] {
+            let result = emit_for(withheld);
+            let mut names: Vec<&str> = result.metrics.iter().map(|m| m.name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                [
+                    "case_churn_ops",
+                    "case_churn_peak_rss_bytes",
+                    "case_churn_startup_ms",
+                    "case_churn_wall_ms"
+                ],
+                "{withheld} ns/op: the figure must be withheld, the rest kept"
+            );
+            assert!(
+                note(&result, "case churn: marginal below timer resolution"),
+                "{:?}",
+                result.notes
+            );
+            // The deterministic companion, the peak RSS and the observed stdout survive.
+            assert_eq!(result.peak_memory_bytes, Some(1_000_000));
+            assert!(
+                note(&result, "observed stdout: churn=N*"),
+                "{:?}",
+                result.notes
+            );
+        }
+
+        // 100 µs/op over `n` churns is a ~500 ms delta: published, with its evidence.
+        let result = emit_for(100_000.0);
+        let ns = value(&result, "case_churn_ns_per_op").expect("a published figure");
+        assert!((ns - 100_000.0).abs() < 1e-6, "{ns}");
+        assert!(
+            note(&result, "case churn: paired median="),
+            "{:?}",
+            result.notes
+        );
     }
 
     #[test]
