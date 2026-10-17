@@ -639,8 +639,11 @@ the section to read them in.
 - `src/space.rs` → `HeapSpace` + `FromSet` (base-sorted ranges, binary-search `locate`)
 - `src/nursery.rs` → `Nursery`: the young nursery **chain of spaces** (`grow`/`collapse`/
   `collapse_after_fullsweep`/`spaces`/`contains`/`add_to_from_set`/`used_words`/`capacity_words`), its indexed
-  containment (`retired_regions`), its cached reserved-extent aggregate (`extent: ScannedBounds`, `bounds()`) and
-  its debt query (`retains_old_spaces`)
+  containment (`retired_regions`), its cached reserved-extent aggregate (`extent: ScannedBounds`, `bounds()`), its
+  debt query (`retains_old_spaces`), the `max_heap_words` chain budget and the provably-empty-space re-adoption
+  (`empty_retired_for`/`readopt_retired`/`install`)
+- `src/nursery/tests.rs` → the nursery chain's in-module test suite (the growth contract, the re-adoption, the
+  containment index and the aggregate extent, incl. a directly installed long chain)
 - `src/bounds.rs` → `ScannedBounds`: the O(1) aggregate extent over every scanned region (nursery chain + mature)
   and its geometry epoch — the fast-reject filter a host's unscanned-root valve calls
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `collect` + the copy-specific
