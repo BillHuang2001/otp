@@ -405,11 +405,20 @@ in-process compiler route.
   `beam_rt/src/boot/bootscript.rs::the_real_start_boot_completes_through_execute_reporting`.
   `beam_rt`'s `-eval`/`-s`/`-run` actions drive the default boot script too (as the oracle does), so a
   `-eval` process has the live `kernel_sup`/`timer_server` tree — `timer:apply_after/4` is
-  oracle-identical (`is_reference(timer:apply_after(...))` prints `false` under both runtimes, exit 0). A timer
-  that actually FIRES does not yet deliver its message on the `-eval` route — `timer:apply_after(50,erlang,send,
-  [self(),done])` then `receive` yields `timeout` where the oracle prints `got=done`, while an already-queued
-  `self() ! done` is received on both — a real scheduler/timer-delivery fidelity gap, not a receive-path gap. The differential case
-  `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** (not in `tools/differential/known-gaps.txt`).
+  oracle-identical (`is_reference(timer:apply_after(...))` prints `false` under both runtimes, exit 0).
+  A timer that actually FIRES delivers its message on **both** routes (`timer:apply_after(50,erlang,send,
+  [self(),done])` then `receive` prints `got=done` like the oracle). Reaching that required implementing a
+  **BIF-entry trampoline**: a process spawned as `spawn(erlang,send,[P,M])` enters `erlang.beam`'s
+  `erlang:nif_error(undef)` stub as *code*, so the bare atom `undefined` was raised and no message was sent.
+  `ProcessEntry::Export` now asks the narrow host-dispatch predicate `RuntimeContext::host_serves`
+  (runtime-native floor ∪ loaded NIF module ∪ registered `beam_bifs` key) on its **first** entry only and
+  dispatches a hit through `call_bif`, taking the BIF's value as `x(0)`; a resolvable module's export keeps
+  the label route (a nested non-pumping call could not park a blocking callee). The same predicate gates a
+  boot script's `{apply,…}` directive. The `-eval` route's `receive … after T` now really waits
+  (`Runtime::wait_for_timer`, bounded at both ends). Pinned by `tests/bif_entry_spawn.rs` (5 cases) and
+  `src/boot/bootscript.rs::an_apply_directive_naming_a_host_served_bif_is_dispatched_not_entered`.
+  The differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** (not in
+  `tools/differential/known-gaps.txt`).
 - **Cross-node note (tools-owned):** `tools/differential` passes `-noshell` to the oracle but not to the
   Rust side (`corpus/mod.rs::rust_argv` emits `run <beam> <mfa>`); that is harmless today because
   `beam_rt <action> run <beam> <mfa>` prints no banner, so its stdout matches the oracle's `-noshell`
