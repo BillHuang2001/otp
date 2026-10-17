@@ -46,10 +46,11 @@
 //! one-bit-per-word visited set), `live.rs` (the exact-live counter a fullsweep sizes
 //! itself from), `immix/` (the mark-region space's word-level mark/evacuation
 //! walks), the raw-pointer range tests in `space.rs` and the two narrow `NonNull`-deref /
-//! `Box::from_raw` blocks in `mso.rs`; `policy.rs`, `stats.rs` and the collector driving
-//! logic are safe Rust.
+//! `Box::from_raw` blocks in `mso.rs`; `policy.rs`, `stats.rs`, `bounds.rs` and the collector
+//! driving logic are safe Rust.
 
 pub mod any_collector;
+pub mod bounds;
 pub mod collector;
 pub mod config;
 pub mod copy;
@@ -68,6 +69,7 @@ pub mod space;
 pub mod stats;
 
 pub use crate::any_collector::*;
+pub use crate::bounds::ScannedBounds;
 pub use crate::collector::*;
 pub use crate::config::*;
 pub use crate::copy::*;
@@ -83,6 +85,7 @@ pub use crate::stats::*;
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
     pub use crate::any_collector::*;
+    pub use crate::bounds::ScannedBounds;
     pub use crate::collector::*;
     pub use crate::config::*;
     pub use crate::copy::*;

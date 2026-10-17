@@ -609,3 +609,55 @@ runtime-spawned process reproduces the small-object/high-churn verdict exactly a
 **6.57×** the mature occupancy. That is why the automatic rule's default stays Copying and
 `MatureKind::Immix` remains an opt-in — `BEAM_RT_GC_STRATEGY=immix` raises the spawned policy's mature
 generation past the break-even. Load-invariant counts only; timings are not asserted.
+
+## Per-op attribution of the `gc_bound/churn` shape (the collector's own counters)
+
+Source: `tests/churn_attribution.rs` (`--nocapture`; deterministic counts only, no timing asserted). It
+reproduces the `tools/bench` `churn/1` allocation shape — LEN = 256 (a 512-word list built one cons cell at a
+time, a 256-byte binary copy-out, a 257-word tuple, two O(1) checks ⇒ **806 words allocated/op**, all of it
+garbage by the next op) — and drives it through the runtime's own heap-admission door
+(`Collector::should_collect` / `collection_debt` → `Collector::ensure_capacity`, i.e. `beam_rt`'s
+`collect_or_grow`) at the **default spawn policy**, with the op's intermediates held as roots.
+
+| per operation | in-crate instrument (4 000 ops) | `beam_rt` runner counters, same shape (`churn.beam`) |
+|---|---|---|
+| environment | `beam_gc` unit-shaped driver, `HeapPolicy::default()` | real runtime, scheduled slice |
+| words allocated | 806 (asserted from the shape) | ≈1 830 (3 × 256 cons + copy-out + tuple) |
+| collections | **2.00** | **7.00** |
+| — minor | 1.50 | 5.50 |
+| — major (fullsweep) | **0.50** | **1.50** |
+| words copied | **1 269.5** (1.58 × the allocated volume) | — |
+| words reclaimed (junk) | 806.6 (≈ all of it) | 1 825.8 |
+| objects copied | 418.0 | — |
+| words copied / collection | 634.6 | — |
+| growth events (space installs) | 1.00 | ≈1 |
+| debt admissions | 0.50 | — |
+| peak nursery capacity / occupancy | 609 / 347 words | 376 / 376 words |
+| peak mature capacity / occupancy | 2 586 / 2 074 words | 987 / 880 words |
+| fullsweep live set (min…peak) | 464 … 1 353 words | ≈500 words |
+
+**Reading the split.** The copy volume is the surprise: the collector copies **1.58× more words than the
+mutator allocates**, because a fullsweep re-copies the whole live set out of the *mature* generation, which
+has meanwhile accumulated promoted garbage (the mature never reclaims between fullsweeps). So per op the cost
+is `allocated words (806) + copied words (1 269) + one fresh mature install`, and the copied half is the
+larger one — but note it is paid *per collection*, so the number of collections per op multiplies whatever the
+copy loop costs.
+
+**Where the escalations come from (mechanism, `src/collector.rs:166-173`).** `Collector::collect` escalates a
+minor to a fullsweep whenever `mature.available_words() < nursery.used_words()` — the test is against the
+nursery's whole **occupancy**, not the live young set a minor would actually copy. The instrument records the
+escalation's inputs: the mature had as little as **1** free word when an escalation fired, against a nursery
+occupancy of up to **550**, so on this shape every escalation is a genuine "the mature is full of promoted
+garbage", not a conservative-test artifact. `fullsweep_after` (65 535) never fires: every one of the 0.5
+majors/op is **capacity**-forced, and the fresh mature space is sized by `mature_after_fullsweep(capacity,
+live, young_occupancy)`, which on this shape takes the grow branch or keeps the capacity — it never shrinks.
+
+**Bounded-growth sanity (asserted).** The nursery stays at a policy size (peak 609 words, `≤ 16 Ki` asserted),
+the mature at ≤ 64 Ki words asserted, and the chain never holds more than the one space a same-round growth
+retired (`peak_spaces ≤ 2`) — so nothing here is capacity creep.
+
+**Caveats.** In-crate numbers come from a debug-profile test binary on a shared host; they are counts, so they
+are load-invariant, but the *shape* is a model (the copy-out binary is a 33-word tuple, and the driver's doors
+sit on the op's own allocation boundaries rather than on the interpreter's `test_heap` instructions), which is
+why the runtime column differs in magnitude while agreeing on the structure: **one collection per few hundred
+admitted words, a fullsweep every second op, and a copy volume that exceeds the allocation volume**.

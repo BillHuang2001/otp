@@ -35,6 +35,12 @@
 //!   range test a host's *unscanned-root* valve runs at every heap admission — answers from
 //!   an ordered index of the retired spaces' live regions plus one direct test of the current
 //!   space, so it is `O(log #spaces)` rather than a walk over every space.
+//! * **The aggregate extent is cached.** [`bounds`](Nursery::bounds) hands back the covering
+//!   interval of **every** space's reserved extent (`[base, limit)`, not the moving live fill)
+//!   plus a geometry epoch, maintained in `O(1)` by [`grow`](Nursery::grow) and
+//!   [`collapse`](Nursery::collapse) — the whole-collector half a host builds
+//!   [`ScannedBounds`](crate::ScannedBounds) from, so its unscanned-root valve can reject an
+//!   address outside the chain with one comparison instead of the indexed test.
 //! * **The chain is bounded.** [`grow`](Nursery::grow) takes the plain one-step next size
 //!   whenever that already enlarges the space, and only falls back to at least a **doubling**
 //!   when the one-step target would install a space no larger than the one it replaces, so a
@@ -68,9 +74,20 @@ use beam_alloc::AllocRef;
 use beam_common::Result;
 use beam_term::prelude::Eterm;
 
+use crate::bounds::ScannedBounds;
 use crate::error::heap_exhausted;
 use crate::policy::HeapPolicy;
 use crate::space::{FromSet, HeapSpace};
+
+/// The reserved extent `[base, limit)` of `space`, as a generation-`0` [`ScannedBounds`].
+///
+/// The **reserved** extent, deliberately, not the live fill `[base, top)`: `top` moves on every
+/// allocation (so a cached bound would go stale immediately) while `limit` is fixed for the
+/// space's whole lifetime (a [`HeapSpace`] never reallocates). The aggregate therefore covers
+/// every live region — the safe direction for a reject (see [`ScannedBounds`]).
+fn space_extent(space: &HeapSpace) -> ScannedBounds {
+    ScannedBounds::new(space.base() as usize, space.limit() as usize)
+}
 
 /// The young nursery: the space the mutator allocates in (`current`) plus every space a
 /// growth has **retired** (the larger space a growth installed replaces it, never moves it).
@@ -98,16 +115,35 @@ pub(crate) struct Nursery {
     /// therefore distinct bases); a same-`base` insert could only come from a zero-capacity
     /// space — an empty live region for which both entries answer `false` identically.
     retired_regions: BTreeMap<usize, usize>,
+    /// The covering interval of **every** space's reserved extent (`[base, limit)`), maintained
+    /// incrementally — the chain-wide [`ScannedBounds`] the whole-collector aggregate is built
+    /// from, so a host's fast-reject filter costs `O(1)` per address instead of the indexed
+    /// per-space test.
+    ///
+    /// *Why it cannot go stale:* a space's `limit` is fixed for its lifetime, so the interval
+    /// only has to change when the **set** of spaces does — a space is installed
+    /// ([`grow`](Nursery::grow), which only widens the covering: `min`/`max`) or the chain is
+    /// recomputed down to one space ([`collapse`](Nursery::collapse)). Those are exactly the
+    /// two edit points, and each advances the carried
+    /// [generation](ScannedBounds::generation).
+    ///
+    /// *Why it is exact (not merely wide):* the covering of the spaces' extents **is**
+    /// `min(bases) .. max(limits)`, so [`bounds`](Nursery::bounds) answers precisely the union's
+    /// bounding interval — no accumulated slack from earlier, since-dropped spaces.
+    extent: ScannedBounds,
 }
 
 impl Nursery {
     /// A nursery with a single empty `capacity_words`-word current space and no retired
     /// spaces, backed by `alloc`.
     pub(crate) fn new(alloc: AllocRef, capacity_words: usize) -> Result<Nursery> {
+        let current = HeapSpace::with_allocator(alloc, capacity_words)?;
+        let extent = space_extent(&current);
         Ok(Nursery {
-            current: HeapSpace::with_allocator(alloc, capacity_words)?,
+            current,
             retired: Vec::new(),
             retired_regions: BTreeMap::new(),
+            extent,
         })
     }
 
@@ -184,6 +220,19 @@ impl Nursery {
         }
     }
 
+    /// The chain-wide aggregate extent: the covering interval `[base, limit)` of **every** space
+    /// of the chain (current and retired), plus the chain's geometry
+    /// [generation](ScannedBounds::generation).
+    ///
+    /// `O(1)` and allocation-free — the interval is maintained by [`grow`](Nursery::grow) and
+    /// [`collapse`](Nursery::collapse) rather than computed here — and built from each space's
+    /// **reserved** extent, so it is a superset of every live region: an address it rejects is
+    /// in no nursery space, while an address it accepts may be a hole between two spaces or the
+    /// unallocated tail of the current space and still needs [`contains`](Nursery::contains).
+    pub(crate) fn bounds(&self) -> ScannedBounds {
+        self.extent
+    }
+
     /// Enlarges the nursery so a `need_words`-word allocation can proceed — the
     /// **NO-RELOCATION** growth seam.
     ///
@@ -241,6 +290,14 @@ impl Nursery {
         self.retired_regions
             .insert(old.base() as usize, old.top() as usize);
         self.retired.push(old);
+        // The chain gained the freshly installed space; the retired one was already covered (it
+        // was the current space when it entered the aggregate). Widening by `min`/`max` makes
+        // the update `O(1)` regardless of how long the chain is, and the geometry epoch
+        // advances because the set of spaces did.
+        self.extent = self
+            .extent
+            .covering(space_extent(&self.current))
+            .with_generation(self.extent.generation().saturating_add(1));
         Ok(())
     }
     /// Collapses the chain back to **exactly one** space, after a collection has evacuated
@@ -263,6 +320,12 @@ impl Nursery {
             let alloc = self.current.allocator().clone();
             self.current = HeapSpace::with_allocator(alloc, target)?;
         }
+        // Down to exactly one space, so the aggregate is re-seeded from it rather than widened:
+        // the retired spaces' extents are gone and a stale widening would keep rejecting
+        // addresses far outside the collapsed chain's neighbourhood. The epoch advances — the
+        // set of spaces *and* the surviving space's live region both changed.
+        self.extent = space_extent(&self.current)
+            .with_generation(self.extent.generation().saturating_add(1));
         Ok(())
     }
 }
@@ -547,5 +610,123 @@ mod tests {
         looped.grow(&policy, fit).expect("an exact fit is a no-op");
         assert_eq!(looped.space_count(), spaces_before, "nothing retired");
         assert_eq!(looped.current().capacity_words(), cap_before);
+    }
+
+    /// One term word, in bytes.
+    const WORD: usize = core::mem::size_of::<Eterm>();
+
+    /// The **reserved** extent `[base, base + capacity)` of `space`, in byte addresses — what
+    /// the aggregate cache is built from, as opposed to the moving live fill `[base, top)`.
+    fn reserved_extent(space: &HeapSpace) -> (usize, usize) {
+        (
+            space.base() as usize,
+            space.base() as usize + space.capacity_words() * WORD,
+        )
+    }
+
+    /// The covering interval of `regions` — what the aggregate of exactly those spaces is.
+    fn covering(regions: &[(usize, usize)]) -> (usize, usize) {
+        (
+            regions.iter().map(|&(lo, _)| lo).min().expect("a region"),
+            regions.iter().map(|&(_, hi)| hi).max().expect("a region"),
+        )
+    }
+
+    #[test]
+    fn the_aggregate_extent_covers_every_space_and_tracks_the_geometry_epoch() {
+        let policy = capped();
+        let mut nursery = Nursery::new(default_allocator().clone(), CAP).expect("nursery");
+
+        // A fresh nursery is one space: the aggregate is exactly its reserved extent, at epoch 0.
+        let mut extents = vec![reserved_extent(nursery.current())];
+        let fresh = nursery.bounds();
+        assert_eq!((fresh.base(), fresh.limit()), covering(&extents));
+        assert_eq!(fresh.generation(), 0, "a fresh chain is epoch 0");
+        assert!(!fresh.is_empty(), "a live space has a non-empty extent");
+
+        // A growth that finds room retires nothing, so the geometry does not change: neither the
+        // interval nor the epoch may move.
+        let room = nursery.current().available_words();
+        nursery.grow(&policy, room).expect("an exact fit is a no-op");
+        assert_eq!(
+            nursery.bounds(),
+            fresh,
+            "a no-op growth must not change the aggregate or its epoch"
+        );
+
+        // Every real growth widens the aggregate to cover the space it installs (the retired one
+        // was already covered — it was the current space when it entered), advances the epoch by
+        // exactly one, and leaves the interval the covering of **every** space's extent.
+        for i in 0..RETIRED {
+            nursery
+                .current_mut()
+                .heap_mut()
+                .tuple(&[])
+                .expect("an empty tuple fits every space");
+            nursery
+                .grow(&policy, CAP)
+                .unwrap_or_else(|e| panic!("round {i}: the capped growth: {e:?}"));
+            extents.push(reserved_extent(nursery.current()));
+            let bounds = nursery.bounds();
+            assert_eq!(
+                (bounds.base(), bounds.limit()),
+                covering(&extents),
+                "round {i}: the aggregate is the covering of every space's extent"
+            );
+            assert_eq!(
+                bounds.generation(),
+                i as u64 + 1,
+                "round {i}: one geometry event per growth"
+            );
+        }
+
+        // The safety property, over the whole neighbourhood of every space's extent: a rejected
+        // address is in **no** space of the chain. (The converse is deliberately not asserted —
+        // the aggregate spans the holes between spaces and each space's unallocated tail.)
+        let mut probes = region_probes(&extents);
+        probes.extend([0, WORD, usize::MAX & !(WORD - 1)]);
+        let long = nursery.bounds();
+        let mut accepted = 0usize;
+        for addr in probes {
+            if long.may_contain(addr) {
+                accepted += 1;
+            } else {
+                assert!(
+                    !nursery.contains(addr as *const Eterm),
+                    "{addr:#x} was rejected by the aggregate but the chain contains it \
+                     ({} spaces)",
+                    nursery.space_count()
+                );
+            }
+        }
+        assert!(
+            accepted > nursery.space_count(),
+            "the probe corpus really reaches inside the chain, got {accepted}"
+        );
+
+        // The collapse re-seeds the aggregate from the single remaining space — a stale
+        // widening would keep claiming the retired spaces' neighbourhood — and advances the
+        // epoch. The safety property holds again over the same neighbourhood.
+        nursery.collapse(&policy, 0).expect("the collapse");
+        assert_eq!(nursery.space_count(), 1, "the chain is one space again");
+        let collapsed = nursery.bounds();
+        assert_eq!(
+            (collapsed.base(), collapsed.limit()),
+            reserved_extent(nursery.current()),
+            "the aggregate is exactly the surviving space's extent"
+        );
+        assert_eq!(
+            collapsed.generation(),
+            long.generation() + 1,
+            "the collapse is one geometry event"
+        );
+        for addr in region_probes(&extents) {
+            if !collapsed.may_contain(addr) {
+                assert!(
+                    !nursery.contains(addr as *const Eterm),
+                    "{addr:#x} was rejected after the collapse but is still contained"
+                );
+            }
+        }
     }
 }

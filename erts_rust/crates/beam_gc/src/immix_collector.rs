@@ -100,6 +100,7 @@ use beam_alloc::AllocRef;
 use beam_common::Result;
 use beam_term::prelude::{is_boxed, is_header, is_list, ptr_val, Eterm};
 
+use crate::bounds::ScannedBounds;
 use crate::collector::{Collection, CollectionKind};
 use crate::config::GcConfig;
 use crate::copy::{for_each_ref, move_size};
@@ -193,6 +194,11 @@ pub struct GenImmixCollector {
     minor_since_major: u32,
     stats: GcStats,
     last_immix: Option<ImmixStats>,
+    /// How many times the mature **region** has been replaced (a relocating fullsweep's
+    /// install). The mark-region space's half of the [`ScannedBounds`] geometry epoch: the
+    /// region never resizes or moves in place, so a relocation is the only event that can change
+    /// its extent — an in-place reclaim keeps `base`/`capacity` and therefore the extent.
+    mature_generation: u64,
 }
 
 impl GenImmixCollector {
@@ -221,6 +227,7 @@ impl GenImmixCollector {
             minor_since_major: 0,
             stats: GcStats::default(),
             last_immix: None,
+            mature_generation: 0,
         })
     }
 
@@ -434,6 +441,34 @@ impl GenImmixCollector {
         self.nursery.space_count()
     }
 
+    /// The `O(1)` aggregate extent over **every** region this collector scans — the whole
+    /// nursery chain (the current space and every space a [growth](Self::grow_nursery) retired)
+    /// plus the mark-region mature generation — tagged with the geometry epoch it describes.
+    ///
+    /// The mark-region sibling of [`Collector::scanned_bounds`](crate::Collector::scanned_bounds);
+    /// see it for the full contract (a fast-*reject* filter, never a containment claim; `O(1)`
+    /// and allocation-free). The only difference is the mature half: an
+    /// [`ImmixSpace`](crate::immix::ImmixSpace) is one contiguous block-aligned region, so its
+    /// extent is `base .. base + capacity_words` — its free lines included, which is exactly the
+    /// over-inclusion [`mature_contains`](crate::AnyCollector::mature_contains) already answers
+    /// with. The
+    /// [generation](ScannedBounds::generation) advances when a nursery space is installed,
+    /// retired or collapsed, or when a relocating fullsweep replaces the region; an in-place
+    /// mature reclaim keeps the region's `base`/`capacity`, so it does not move the epoch.
+    pub fn scanned_bounds(&self) -> ScannedBounds {
+        let young = self.nursery.bounds();
+        let base = self.mature.base() as usize;
+        let mature = ScannedBounds::at(
+            base,
+            base + self.mature.capacity_words() * core::mem::size_of::<Eterm>(),
+            self.mature_generation,
+        );
+        // As in the copying collector: a sum of two monotone event counters changes whenever
+        // either does.
+        young
+            .covering(mature)
+            .with_generation(young.generation().saturating_add(mature.generation()))
+    }
     /// Visits every **boxed object** reachable from `roots` across the **whole heap** — every
     /// space of the nursery chain (the current one and any a
     /// [`grow_nursery`](Self::grow_nursery) retired) plus the mark-region mature generation —
@@ -733,6 +768,7 @@ impl GenImmixCollector {
                 PromoteOutcome::Done(stats) => {
                     drop(from);
                     self.mature = fresh;
+                    self.mature_generation = self.mature_generation.saturating_add(1);
                     stats
                 }
                 // The fresh region has the lines but not a contiguous run for one of the

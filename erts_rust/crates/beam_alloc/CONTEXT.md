@@ -235,6 +235,28 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - Steady state / no leak: `leak summary: 4 cycles x 28 blocks, steady state at peak_carrier_bytes=2555920
   across 7 carriers (458752 bytes)`.
 
+### What a process/GC heap block actually costs (cost attribution)
+- **One `Heap`/`ReservedHeap` block is one allocator block**, routed purely by its byte size on the
+  registry default config (`classes = SizeClasses::default_small_block()` → ladder 16…1024 B,
+  `large_threshold` 1024; `carrier_size` 1 MiB; policy `ALLCTR_INIT` → `sbct` 512 KiB):
+  `<= 1024 B` → **slab** class (`alloc_small`); `> 1024 B` and `< 512 KiB` → the **pooled 1 MiB
+  variable-size MBC** carrier (`alloc_mid`); `>= 512 KiB` (or align > `UNIT_SIZE`) → a **dedicated
+  single-block carrier** (`alloc_large`). A GC-sized heap (`N` words × 8) therefore only takes the
+  size-class ladder when it is ≤ 128 words.
+- **Alternating create/drop of a same-size `Heap` returns the same base address.** Three reuse layers,
+  in order: the slab class free list (head insert `FreeList::insert` / head pop `take_block`), the MBC
+  pool (`take_mbc_fit`, first fit), and the **process-global `mseg` reuse cache** (`Segment::drop` →
+  `release` → `cache`, default `max_cache_size` 10) for a fully-free MBC/SBC carrier that was unmapped.
+  In the steady state `mmap` happens once per distinct carrier size, not once per heap: `unmaps` /
+  `mapped_bytes` stay flat while `cache_hits` (= `AllocStats::mseg.reused`) climbs. The address can
+  only change on cache eviction (FIFO when full), or when `take_cached` picks a different smallest
+  fitting cached segment (a bad fit is tail-trimmed, keeping the base).
+- A `Heap` allocates through the **untyped** `Allocator::alloc` path (`alloc_bytes` → `alloc_impl(_, None)`),
+  so per-type `TypeStats` rows do **not** attribute process heaps; read the aggregate counters
+  (`alloc_calls`/`free_calls` cumulative, `live_bytes`, `peak_live_bytes`, `carriers`, `carrier_bytes`)
+  plus `AllocStats::mseg` (`cached`, `reused`, `unmaps`, `calls.create/destroy`, `mapped_bytes`).
+  Both `MsegStats` and `stats.carriers` are process-global across allocator instances.
+
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. No crate-local error enum, no `panic!` on OOM
   (`AllocFailure{kind, requested}`: carriers ⇒ `Carrier`, process/slab heaps ⇒ `Heap`, large off-heap
