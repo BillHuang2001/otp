@@ -8,8 +8,9 @@
 %% the same inputs.
 %%
 %% Every function keeps its argument a plain binary (never an integer) so a
-%% non-matching argument cannot reach the engine's `func_info` no-op path; the
-%% `c_*` group wraps each pattern in a `case` so the failure path raises.
+%% non-matching argument cannot reach `func_info`, which raises the bare atom
+%% `function_clause`; the `c_*` group wraps each pattern in a `case` so the failure
+%% path raises `case_clause`.
 -module(bsbig).
 -export([g72/1, g72s/1, g72le/1, g68/1, g68le/1, g65/1, g128/1, g9u8/1,
          seq/1, c_g72/1, c_g72s/1, c_g72le/1,

@@ -56,10 +56,11 @@
 //! non-blocking and folds that into the typed
 //! `unsupported_opcode: run: process blocked (no message available)` error.
 //!
-//! The one deliberate divergence is a **non-zero `after` timeout**: Milestone 1 has
-//! no host timer, so `aftervar(5)` on an empty mailbox reports `Wait` where the
-//! oracle returns `empty` after 5 ms (tested below and documented, never a wrong
-//! result).
+//! A **non-zero `after` timeout** on an empty mailbox reports `Wait` where the
+//! oracle returns `empty` after 5 ms: the engine publishes the deadline through
+//! [`Machine::wait_deadline`] (the `timeout` continuation plus `delay_ms`), but this
+//! suite's mock mailbox arms no timer, so the test observes the deadline rather than
+//! firing it (tested below and documented, never a wrong result).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -471,9 +472,12 @@ fn aftervar_matches_a_queued_message_regardless_of_the_timeout() {
 #[test]
 fn aftervar_with_a_nonzero_timeout_suspends() {
     // DOCUMENTED GAP: the oracle returns `empty` after 5 ms
-    // (`erl -noshell -eval 'recv:aftervar(5)'` → empty), but Milestone 1 has no host
-    // timer, so a non-zero timeout suspends until a message arrives. Reporting
-    // `RunOutcome::Wait` is honest (no wrong result); the timer is the host's job.
+    // (`erl -noshell -eval 'recv:aftervar(5)'` → empty). The engine publishes that
+    // deadline through `Machine::wait_deadline` (the `timeout` continuation plus the
+    // delay), but this suite's mock mailbox arms no timer, so a non-zero timeout stays
+    // parked until a message arrives and the test observes the deadline instead of
+    // firing it. Reporting `RunOutcome::Wait` is honest (no wrong result); arming the
+    // timer is the host's job.
     let (module, undefined) = load();
     let mailbox = TestMailbox::new(make_atom(undefined));
     let mut ctx = context(&module, mailbox.clone());

@@ -64,11 +64,11 @@ pub(super) use list::{
 // `select_tuple_arity` (`emu/select_instrs.tab` `i_select_tuple_arity` `:111`) read
 // a tuple's arityval header. The interpreter (`crate::families::tuples`) gates
 // `get_tuple_element` on `terms::tuple_arity(value)` with `element < arity` and
-// otherwise *raises* `{badmatch, Source}` through `terms::badmatch_reason`; an
-// `arity` switch requires a tuple (a non-tuple is the documented typed
-// `unsupported("select_tuple_arity: non-tuple")`), then takes the **first**
-// `(Integer(n), Label)` alternative with `n == arity`, else `Fail` — a `NO_FAIL`
-// switch raising `{badmatch, Tuple}`.
+// otherwise *raises* `{badmatch, Source}` through `terms::badmatch_reason_rooted`; an
+// `arity` switch reads the source's arity (a non-tuple has none, so it matches no
+// alternative at all — C's `get_arity` sets the switch value to `NIL`) and then takes
+// the **first** `(Integer(n), Label)` alternative with `n == arity`, else `fail` — a
+// `NO_FAIL` switch raising `{badmatch, Tuple}` through the same rooted helper.
 //
 // The subset below is lowered natively and mirrors that branch for branch:
 //
@@ -351,8 +351,9 @@ pub(super) fn try_inline_select_tuple_arity(
         linker.emit_exit(buffer, allocation, done, target.0, target.1, pc)?;
     }
 
-    // Rejected (a non-tuple source): one interpreter step, whose typed
-    // `unsupported`/raise is exact.
+    // Rejected (a non-tuple source): one interpreter step. The interpreter then
+    // matches no alternative — it takes this same `fail` label, or, when `fail` is
+    // `NO_FAIL`, raises `{badmatch, Tuple}` — so the step's outcome is exact.
     buffer.bind(fallback)?;
     emit_step_and_continue(buffer, done, allocation, func, pc)?;
     Ok(true)
@@ -501,7 +502,7 @@ fn emit_tuple_read(
 // only for a tuple it has proved uniquely owned. The interpreter
 // (`crate::families::tuples::exec`) reads the tuple and the element value, gates the
 // tuple on `terms::tuple_arity` with `offset < arity` (otherwise it *raises*
-// `{badmatch, Source}` through `terms::badmatch_reason`), refuses a term in a shared
+// `{badmatch, Source}` through `terms::badmatch_reason_rooted`), refuses a term in a shared
 // literal area with the typed `error::unsupported`, and otherwise writes the value
 // through `terms::set_tuple_element` at word `1 + offset` past the header — the very
 // word `get_tuple_element` with the same index reads.

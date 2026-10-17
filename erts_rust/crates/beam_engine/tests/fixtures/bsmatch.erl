@@ -11,11 +11,10 @@
 %%
 %% The first group uses **function-head** patterns (the idiom the milestone fixture
 %% recipe prefers). A head-pattern mismatch jumps to the function's `func_info`
-%% label, which the Milestone-1 engine treats as a no-op (see `beam_engine`'s
-%% `Known Issues`), so head-pattern functions are only exercised on their *success*
-%% paths. The `c_*` group wraps each pattern in a `case`, whose failure path reaches
-%% the engine's `case_end` handler and therefore raises a typed error — that group is
-%% what the malformed/short-input tests call.
+%% label, which raises the bare atom `function_clause` (C's `i_func_info_IaaI`), so
+%% head-pattern functions are only exercised on their *success* paths. The `c_*`
+%% group wraps each pattern in a `case`, whose failure path raises `case_clause` —
+%% that group is what the malformed/short-input tests call.
 %%
 %% `strlong/1` is deliberately an 80-bit literal: the compiler folds strings of at
 %% most 64 bits into the `'=:='` `bs_match` command (`str/1`), while a longer literal

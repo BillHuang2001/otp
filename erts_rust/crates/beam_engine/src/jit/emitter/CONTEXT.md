@@ -54,8 +54,14 @@ Encoder support is `push_r`/`pop_r` + `lea`/`mov_mr`/`mov_rm`; the tier composes
 - **Prologue** (`block.rs::emit_block`): `push_r` over `SAVED_REGISTERS = [Rbx,Rbp,R12,R13,R14,R15]` (`mod.rs` `SAVED_REGISTERS`, 6 pushes keep `rsp` 16-byte aligned), `lea Rsp,[Rsp-24]` reserves the `rt` slot, `mov_mr Rsp,0,Rdi` stores the `rt` pointer, `mov_rm Rbx,Rdi,RUNTIME_XREGS_DISP` loads `rt->x_regs`, then `mov_rm(reg, Rbx, x)` fills each cached x-register.
 - **Register save/restore across a helper call**: `spill` (`regs.rs::spill`) = `mov_mr(Rbx, x, reg)` for each cached slot; `fill` (`regs.rs::fill`) = `mov_rm(reg, Rbx, x)`. `emit_helper_call` (`mod.rs::emit_helper_call`) spills first, reloads `rt` into `rdi`, then `mov_ri R11, helper; call_r R11`.
 - **Epilogue / frame teardown** (`link.rs::emit_frame_teardown`): `lea Rsp,[Rsp+24]` then `pop_r` over `SAVED_REGISTERS` reversed, then `ret` (the shared `done` epilogue in `block.rs::emit_block`). The exact inverse of the prologue; shared by the `done` epilogue and a linked jump so they cannot drift.
-`baseline/emit/mod.rs`'s module docs document the register-allocation + spill-across-blocks discipline
-(`CACHE_REGISTERS = [R12,R13,R14,R15,Rbp]` in `mod.rs`; residency is block-fixed, residents spill at every block exit so a helper/GC sees the interpreter's exact root set).
+`baseline/emit/mod.rs`'s module docs document the register-allocation + spill/fill discipline
+(`CACHE_REGISTERS = [R12,R13,R14,R15,Rbp]` in `mod.rs`; residency is block-fixed, while **both**
+directions of the cache are partial — `spill` stores only the cached registers **dirty at its own `pc`**
+(`Allocation::spill_slots_at`, derived by `regalloc.rs`'s forward dirty walk), so an already-clean
+resident costs no store and the shared `done` epilogue stores nothing, and `fill` reloads only
+`Allocation::fill_slots(pc)` (the continuation's live set), with the prologue loading the block's
+live-in set; the authoritative statement is `../baseline/emit/CONTEXT.md` and
+`../baseline/emit/regs/CONTEXT.md`).
 
 ## Constraints
 - **Crate's designated JIT unsafe zone**: module-local `#![allow(unsafe_code)]` (`mod.rs:84`) is the crate's only executable-memory mapping and only raw writes into it; `encode.rs` holds **no** `unsafe`. Every `unsafe` block carries a `// SAFETY:` rationale.
