@@ -146,6 +146,13 @@ pub fn badmatch_reason(
 /// Only *heap* binaries (at most `ERL_ONHEAP_BINARY_LIMIT`, 64, bytes) are built;
 /// a longer binary needs the off-heap ref-counted representation, which is not
 /// implemented and yields [`crate::error::unsupported`].
+///
+/// The whole data section is **zeroed before** the payload is copied in, so the
+/// trailing padding bytes of the last data word are zero rather than stale heap
+/// content — the same discipline as
+/// [`beam_term::bitstring::write_heap_bits`], which the tuple/map/fun writers also
+/// follow. Without it a sub-word binary would carry heap garbage in the bits past its
+/// bit count.
 pub fn make_heap_binary(ctx: &mut dyn ExecutionContext, bytes: &[u8]) -> Result<Eterm> {
     let num_bytes = bytes.len();
     if num_bytes > ERL_ONHEAP_BINARY_LIMIT {
@@ -156,12 +163,16 @@ pub fn make_heap_binary(ctx: &mut dyn ExecutionContext, bytes: &[u8]) -> Result<
     let hp = ctx.alloc_words(num_words)?;
     // SAFETY: `alloc_words` returned `num_words = 2 + ceil(num_bytes / word_bytes)`
     // exclusively-owned, writable words. Word 0 receives the heap-bits header (the
-    // block size minus the header word), word 1 the bit count and the data section
-    // at word 2 has room for `num_bytes` bytes.
+    // block size minus the header word), word 1 the bit count, and the data section at
+    // word 2 is written in full: its `data_words * WORD_BYTES` bytes are first zeroed
+    // (which initialises the padding tail of the last word) and the first `num_bytes`
+    // of them then receive the payload. Every write stays inside the same
+    // exclusively-owned block, and `data_words * WORD_BYTES` is at most `num_bytes + 7`.
     unsafe {
         *hp = beam_term::make_header(num_words - 1, beam_term::HEAP_BITS_SUBTAG);
         *hp.add(1) = Eterm::from_raw((num_bytes * 8) as usize);
         let data = hp.add(HEAP_BIN_HEAD_WORDS).cast::<u8>();
+        core::ptr::write_bytes(data, 0, data_words * WORD_BYTES);
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, num_bytes);
     }
     Ok(beam_term::make_boxed(hp))
@@ -351,6 +362,10 @@ where
 /// then written. Only *heap* binaries (at most `ERL_ONHEAP_BINARY_LIMIT`, 64, bytes)
 /// are built; a longer binary needs the off-heap ref-counted representation, which
 /// yields [`crate::error::unsupported`].
+///
+/// The data section is zeroed before the payload copy exactly as in
+/// [`make_heap_binary`], so the padding tail of the last data word never carries
+/// stale heap content.
 pub fn make_heap_binary_rooted(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
@@ -370,12 +385,16 @@ pub fn make_heap_binary_rooted(
     )?;
     // SAFETY: the reserve returned `num_words = 2 + ceil(num_bytes / word_bytes)`
     // exclusively-owned, writable words. Word 0 receives the heap-bits header (the
-    // block size minus the header word), word 1 the bit count and the data section
-    // at word 2 has room for `num_bytes` bytes.
+    // block size minus the header word), word 1 the bit count, and the data section at
+    // word 2 is written in full: its `data_words * WORD_BYTES` bytes are first zeroed
+    // (which initialises the padding tail of the last word) and the first `num_bytes`
+    // of them then receive the payload. Every write stays inside the same
+    // exclusively-owned block, and `data_words * WORD_BYTES` is at most `num_bytes + 7`.
     unsafe {
         *hp = beam_term::make_header(num_words - 1, beam_term::HEAP_BITS_SUBTAG);
         *hp.add(1) = Eterm::from_raw((num_bytes * 8) as usize);
         let data = hp.add(HEAP_BIN_HEAD_WORDS).cast::<u8>();
+        core::ptr::write_bytes(data, 0, data_words * WORD_BYTES);
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, num_bytes);
     }
     Ok(beam_term::make_boxed(hp))

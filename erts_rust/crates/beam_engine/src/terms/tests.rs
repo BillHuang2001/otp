@@ -653,6 +653,126 @@ fn binary_bytes_rejects_non_binaries() {
     assert_bad_arg(binary_bytes(NIL));
 }
 
+// -- heap-binary padding (the last data word's unwritten tail) -------------
+
+/// The byte every word of a [`DirtyContext`]'s heap is filled with.
+const DIRT: u8 = 0xAA;
+
+/// A context whose heap is a fixed, **pre-dirtied** word buffer.
+///
+/// [`MinimalContext`] hands out freshly reserved — and therefore zeroed — memory, so a
+/// builder that never writes the padding tail of its last data word still reads back as
+/// zero there and the defect stays invisible. This context fills every byte with
+/// [`DIRT`] instead, so "the builder left these bytes untouched" is observable.
+struct DirtyContext {
+    words: Vec<Eterm>,
+    cursor: usize,
+}
+
+impl DirtyContext {
+    /// A context whose whole heap is `words` words of [`DIRT`].
+    fn new(words: usize) -> DirtyContext {
+        // `0xAA` repeated is not a valid immediate, but the buffer is only ever handed
+        // out as raw storage and never read back as a term.
+        let dirt = Eterm::from_raw(usize::from_ne_bytes([DIRT; core::mem::size_of::<usize>()]));
+        DirtyContext {
+            words: vec![dirt; words],
+            cursor: 0,
+        }
+    }
+}
+
+impl ExecutionContext for DirtyContext {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        _args: &[Eterm],
+    ) -> Result<Eterm> {
+        Err(crate::error::unsupported(&format!(
+            "bif {module}:{function}/{arity}"
+        )))
+    }
+
+    fn ensure_heap(
+        &mut self,
+        _heap_need: u32,
+        _live: u32,
+        _x_regs: &mut [Eterm],
+        _stack: &mut [Eterm],
+    ) -> Result<()> {
+        // The buffer never moves and never collects, exactly like `MinimalContext`.
+        Ok(())
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        if self.cursor + n > self.words.len() {
+            return Err(BeamError::Alloc(beam_common::AllocFailure::new(
+                beam_common::AllocKind::Heap,
+                n * WORD_BYTES,
+            )));
+        }
+        // SAFETY: `cursor + n <= words.len()`, so `cursor` addresses `n` words inside
+        // this context's own buffer; the buffer is only ever handed out by bumping
+        // `cursor`, never resized, so the pointer stays valid and unmoved.
+        let hp = unsafe { self.words.as_mut_ptr().add(self.cursor) };
+        self.cursor += n;
+        Ok(hp)
+    }
+}
+
+/// The raw bytes of the (single) data word of a 3-byte heap binary.
+fn heap_binary_first_data_word(b: Eterm) -> [u8; WORD_BYTES] {
+    // SAFETY: `b` is a live heap binary whose block the context owns; word
+    // `HEAP_BIN_HEAD_WORDS` is its first data word, so the `WORD_BYTES` bytes there lie
+    // inside the block.
+    unsafe {
+        core::ptr::read_unaligned(
+            beam_term::boxed_val(b)
+                .add(HEAP_BIN_HEAD_WORDS)
+                .cast::<[u8; WORD_BYTES]>(),
+        )
+    }
+}
+
+/// A 3-byte payload in a `WORD_BYTES`-sized data word: the payload bytes then zeros.
+fn padded(payload: &[u8]) -> [u8; WORD_BYTES] {
+    let mut word = [0u8; WORD_BYTES];
+    word[..payload.len()].copy_from_slice(payload);
+    word
+}
+
+/// Every builder that lays down a sub-word binary must zero the padding tail of its
+/// last data word, so the term never carries stale heap content past its bit count.
+///
+/// The context pre-fills its heap with [`DIRT`], so a `copy_nonoverlapping` of just the
+/// payload bytes would leave `0xAA` in the tail — that is the failure this pins.
+#[test]
+fn a_heap_binary_zeroes_the_padding_of_its_last_data_word() {
+    const PAYLOAD: [u8; 3] = [0x11, 0x22, 0x33];
+
+    // The classic (unrooted) builder.
+    let mut c = DirtyContext::new(16);
+    let b = crate::terms::make_heap_binary(&mut c, &PAYLOAD).unwrap();
+    assert_eq!(binary_bytes(b).unwrap(), &PAYLOAD[..]);
+    assert_eq!(
+        heap_binary_first_data_word(b),
+        padded(&PAYLOAD),
+        "make_heap_binary left the data word's padding tail unwritten"
+    );
+
+    // The rooted twin (the path the engine's own instruction arms take).
+    let mut c = DirtyContext::new(16);
+    let mut machine = Machine::new();
+    let b = crate::terms::make_heap_binary_rooted(&mut machine, &mut c, &PAYLOAD).unwrap();
+    assert_eq!(binary_bytes(b).unwrap(), &PAYLOAD[..]);
+    assert_eq!(
+        heap_binary_first_data_word(b),
+        padded(&PAYLOAD),
+        "make_heap_binary_rooted left the data word's padding tail unwritten"
+    );
+}
 // -- the node sink (carving a multi-node graph out of ONE reservation) -----
 
 /// `[{1,11},{2,22}]` carved out of a **single** reserved region: every node (the two
@@ -711,4 +831,59 @@ fn context_sink_builds_each_node_with_alloc_words() {
     let l = sink.list(&[make_small(4), make_small(5)]).unwrap();
     assert_eq!(list_elements(l).unwrap(), vec![make_small(4), make_small(5)]);
     assert_eq!(sink.list(&[]).unwrap(), NIL);
+}
+
+/// Both `Sink::tuple` entry points write the `arityval` header `{Module,Function,Arity}`
+/// and friends read back — the node layout must not depend on which sink carved it.
+#[test]
+fn a_sink_tuple_writes_the_arityval_header() {
+    let elems = [make_small(7), make_small(8), make_small(9)];
+
+    // The unrooted sink.
+    let mut c = ctx();
+    let mut sink = ContextSink::new(&mut c);
+    let unrooted = sink.tuple(&elems).unwrap();
+    assert_eq!(tuple_arity(unrooted).unwrap(), 3);
+    assert_eq!(tuple_element(unrooted, 2).unwrap(), make_small(9));
+    // SAFETY: `unrooted` is a live 4-word tuple block the sink just carved.
+    assert_eq!(
+        unsafe { *beam_term::boxed_val(unrooted) },
+        beam_term::make_arityval(3)
+    );
+
+    // The rooted sink carves the identical header out of its reservation.
+    let mut machine = Machine::new();
+    let mut slack = reserve_slack(&mut machine, &mut c, 4).unwrap();
+    let rooted = slack.tuple(&elems).unwrap();
+    assert_eq!(slack.remaining(), 0);
+    assert_eq!(tuple_arity(rooted).unwrap(), 3);
+    assert_eq!(tuple_element(rooted, 0).unwrap(), make_small(7));
+    // SAFETY: `rooted` is a live 4-word tuple block inside the reservation.
+    assert_eq!(
+        unsafe { *beam_term::boxed_val(rooted) },
+        beam_term::make_arityval(3)
+    );
+}
+
+/// `MAX_ARITYVAL` (`(1 << 24) - 1`, the 24-bit `arityval` field) is a hard
+/// representation limit, so a `Sink` handed one element more raises the C's
+/// `system_limit` instead of writing a header that encodes a different arity.
+#[test]
+fn a_sink_tuple_beyond_max_arityval_is_a_system_limit() {
+    // The smallest slice that exceeds the ceiling; both sinks are tested against it.
+    let huge = vec![NIL; beam_term::MAX_ARITYVAL + 1];
+
+    // The unrooted sink.
+    let mut c = ctx();
+    let err = ContextSink::new(&mut c).tuple(&huge).unwrap_err();
+    assert!(matches!(err, BeamError::SystemLimit), "got {err:?}");
+
+    // The rooted sink, with a region far too small for the node: the arity check runs
+    // before the carve, so the answer is the arity limit rather than the region size,
+    // and the rejected node carves nothing.
+    let mut machine = Machine::new();
+    let mut slack = reserve_slack(&mut machine, &mut c, 2).unwrap();
+    let err = slack.tuple(&huge).unwrap_err();
+    assert!(matches!(err, BeamError::SystemLimit), "got {err:?}");
+    assert_eq!(slack.remaining(), 2);
 }
