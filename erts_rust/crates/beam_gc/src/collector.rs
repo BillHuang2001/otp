@@ -32,6 +32,7 @@ use beam_alloc::AllocRef;
 use beam_common::Result;
 use beam_term::prelude::Eterm;
 
+use crate::bounds::ScannedBounds;
 use crate::copy::Copier;
 use crate::error::heap_exhausted;
 use crate::heap_info::HeapObservable;
@@ -65,6 +66,11 @@ pub struct Collector {
     mature: HeapSpace,
     minor_since_major: u32,
     stats: GcStats,
+    /// How many times the mature space has been **replaced** (the fullsweep's relocation
+    /// install). The mature generation's half of the [`ScannedBounds`] geometry epoch: a
+    /// [`HeapSpace`] never moves or resizes, so a replacement is the only event that can change
+    /// the mature extent — and each one installs a *different* space at a different address.
+    mature_generation: u64,
 }
 
 impl Collector {
@@ -83,6 +89,7 @@ impl Collector {
             mature,
             minor_since_major: 0,
             stats: GcStats::default(),
+            mature_generation: 0,
         })
     }
 
@@ -267,6 +274,7 @@ impl Collector {
         }
         let stats = Copier::new(&from, &mut fresh).run(roots)?;
         self.mature = fresh; // drops the old mature space
+        self.mature_generation = self.mature_generation.saturating_add(1);
         self.minor_since_major = 0;
         self.stats.words_copied += stats.words_copied;
         self.stats.words_reclaimed += stats.words_reclaimed;
@@ -340,6 +348,39 @@ impl Collector {
         self.nursery.space_count()
     }
 
+    /// The `O(1)` aggregate extent over **every** region this collector scans — the whole
+    /// nursery chain (the current space and every space a [growth](Self::grow_nursery) retired)
+    /// plus the mature generation — tagged with the geometry epoch it describes.
+    ///
+    /// This is the **fast-reject** filter a host's unscanned-root valve evaluates per reference
+    /// word: [`may_contain`](ScannedBounds::may_contain)` == false` proves the address is in no
+    /// scanned region (so the exact [`young_contains`](Self::young_contains) and
+    /// [`mature_contains`](crate::AnyCollector::mature_contains) tests are answered without touching
+    /// the chain's ordered index or the mature space), while `== true` is **not** a containment
+    /// claim and must fall through to them. See [`ScannedBounds`] for why only the reject
+    /// direction is sound.
+    ///
+    /// `O(1)`, allocation-free, callable through `&self`: the nursery chain's half is cached
+    /// inside the chain (`src/nursery.rs`) and updated only when the chain's set of spaces
+    /// changes; the mature half is two reads of a space that never moves or resizes. Both use
+    /// each space's **reserved** extent (`[base, limit)`, not the moving live fill) so the
+    /// interval cannot go stale between allocations; the [generation](ScannedBounds::generation)
+    /// advances on every event that can change either half — a nursery space installed, retired
+    /// or collapsed, or the mature space replaced by a fullsweep.
+    pub fn scanned_bounds(&self) -> ScannedBounds {
+        let young = self.nursery.bounds();
+        let mature = ScannedBounds::at(
+            self.mature.base() as usize,
+            self.mature.limit() as usize,
+            self.mature_generation,
+        );
+        // Both halves carry a monotone event counter (the chain's geometry epochs, the mature
+        // space's replacements), so their sum changes whenever either does: one number that is
+        // exact for "the geometry moved".
+        young
+            .covering(mature)
+            .with_generation(young.generation().saturating_add(mature.generation()))
+    }
     /// Visits every **boxed object** reachable from `roots` across the **whole heap** — every
     /// space of the nursery chain (the current one and any a
     /// [`grow_nursery`](Self::grow_nursery) retired) plus the mature generation — passing the

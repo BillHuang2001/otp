@@ -34,6 +34,7 @@
 use beam_common::Result;
 use beam_term::prelude::Eterm;
 
+use crate::bounds::ScannedBounds;
 use crate::collector::{Collection, Collector};
 use crate::config::{GcConfig, MatureKind};
 use crate::heap_info::HeapObservable;
@@ -347,6 +348,33 @@ impl AnyCollector {
         }
     }
 
+    /// The `O(1)` aggregate extent over **every** region the selected strategy scans — the whole
+    /// nursery chain plus its mature generation — forwarded to whichever strategy is selected
+    /// ([`Collector::scanned_bounds`] / [`GenImmixCollector::scanned_bounds`]), the same way
+    /// [`collection_debt`](Self::collection_debt) is.
+    ///
+    /// It is the **fast-reject** filter a host's unscanned-root valve evaluates per reference
+    /// word: [`may_contain`](ScannedBounds::may_contain)` == false` proves the address is in no
+    /// scanned region, so [`young_contains`](Self::young_contains) and
+    /// [`mature_contains`](Self::mature_contains) need not run. A `true` answer is **not** a
+    /// containment claim (the interval spans the holes between spaces, each space's unallocated
+    /// tail, and the mark-region free lines) and must fall through to them; see
+    /// [`ScannedBounds`].
+    ///
+    /// `O(1)` and allocation-free on both strategies. The interval is built from each space's
+    /// **reserved** extent, so it cannot go stale between allocations, and its
+    /// [generation](ScannedBounds::generation) advances on every event that can change the
+    /// geometry — a nursery space installed, retired or collapsed, or the mature generation
+    /// replaced (a copying fullsweep, a relocating mark-region fullsweep). The two strategies
+    /// report different *intervals* (their mature regions differ in size and place) but the same
+    /// contract; each is a superset of the regions its own exact tests accept, so the reject
+    /// direction is always sound for the selected strategy.
+    pub fn scanned_bounds(&self) -> ScannedBounds {
+        match self {
+            AnyCollector::Copying(c) => c.scanned_bounds(),
+            AnyCollector::Immix(c) => c.scanned_bounds(),
+        }
+    }
     /// Visits every **boxed object** reachable from `roots` across the **whole heap** — every
     /// space of the nursery chain plus the mature generation — forwarded to whichever strategy
     /// is selected, so the enumeration is strategy-agnostic:
