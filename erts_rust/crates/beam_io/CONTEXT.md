@@ -265,7 +265,7 @@ Current: **726 passing / 0 failing / 2 ignored** — **526** lib in-module (`#[c
 - `src/port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, the line-framing state (`set_line_mode`/`line_mode`/`flush_linebuf`/`take_line_frames`); re-exports `PortRegistry`
 - `src/registry.rs` → `PortRegistry` (ids over `beam_process::PortTable`, the live-port map, reactor glue, the timer/exit/eof/async/line seams incl.
   `port_table`/`port_table_mut`, `take_line_notifications`)
-- `src/driver.rs` → `Driver`, `PortExitReason`, `DriverContext`, `DriverFlags`, `DriverRegistry`, `pub(crate) PortArms`
+- `src/driver.rs` → `Driver`, `PortExitReason`, `DriverContext`, `DriverFlags`, `DriverRegistry`, `pub(crate) PortArms`, and the emulator `driver_tab` set (`STATIC_SPAWN_DRIVERS`, `is_static_spawn_driver`, `DriverRegistry::{with_static_spawn_drivers,create_static_spawn}`)
 - `src/signal.rs` → `Signal`/`Disposition`/`SignalFacility`
 - `src/cpu_time.rs` → `CpuTimes`, `process_cpu_times`, `thread_cpu_times`, `RuntimeClock`
 - `src/ddll.rs` → `DynLib`, `DynLibFlags`, `DllError`/`DllErrorKind`, `ERRCODE_TAB`/`errcode_to_atom`/`atom_to_errcode`/`format_error_text`/`symbol_name`
