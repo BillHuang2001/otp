@@ -659,7 +659,8 @@ the section to read them in.
   primitives, `ImmixStats`/`ImmixCounters`
 - `src/immix/collect.rs` → `ImmixSpace` mark/classify/evacuate/finalize phases + its `EvacDest` impl
 - `src/immix_collector.rs` → `GenImmixCollector`: `scan_young`, fullsweep sizing via `live_full`,
-  `grow_major`/`relocate_major`, `ensure_capacity`, the collect/collect_minor/collect_major driver
+  `grow_major`/`relocate_major`, `ensure_capacity`, the
+  collect/collect_minor/collect_major/collect_kind driver
 - `src/immix_collector/promote.rs` → the ATOMIC two-phase promotion driver (`promote`, `PromoteOutcome`)
 - `src/immix_collector/{tests,grow_tests}.rs` → `GenImmixCollector`'s in-module promotion + `grow_major` tests
 - `src/any_collector.rs` → `AnyCollector`: the `Copying`/`Immix` dispatch over one API — the drop-in for the
