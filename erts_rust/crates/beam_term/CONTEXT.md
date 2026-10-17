@@ -245,7 +245,7 @@ Public surface: `RECORD_INST_FIXED_WORDS = 2` / `RECORD_DEF_FIXED_WORDS = 6` / `
 - `src/bitstring.rs` → `ErlHeapBits`/`ErlSubBits` writers+readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, `float_bits`/`float_value`
 - `src/refc.rs` → off-heap (`refc`) binaries (`BinRef`+`ErlSubBits` pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*`, `is_refc_binary`/`refc_*`)
 - `src/error.rs` → `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError` interop impl
-- `tests/` → crate-level integration tests (`layout.rs`, `abi.rs`, `non_term.rs`, `compare_terms.rs`, `compare_external.rs`, `size_bounded.rs`, `internal_ref.rs`, `atom_witness.rs`, `record_ref_hash.rs`, and the live-`erl` cross-checks `oracle.rs`/`map_hash.rs`/`number_oracle.rs`/`compare_oracle.rs`)
+- `tests/` → crate-level integration tests (`layout.rs`, `abi.rs`, `non_term.rs`, `compare_terms.rs`, `compare_external.rs`, `compare_class_order.rs` — the full cross-class ladder incl. the six internal/external boundary pairs and its live-`erl` cross-check — `size_bounded.rs`, `internal_ref.rs`, `atom_witness.rs`, `record_ref_hash.rs`, and the live-`erl` cross-checks `oracle.rs`/`map_hash.rs`/`number_oracle.rs`/`compare_oracle.rs`)
 - `examples/atom_witness.rs` → witness micro-benchmark (`run --release --example atom_witness`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
