@@ -503,12 +503,14 @@ fn a_refused_copy_out_leaves_the_pooled_bif_heap_unrewound() {
 // ---------------------------------------------------------------------------------------
 // The table-less (`-eval`) route's pooled BIF heap — counters first.
 //
-// The rewind above needs a running process to copy a container result onto. With no process
-// (`RuntimeContext::new`, i.e. `-eval`/`-s`/`-run`/the single-pass `run_*` entries) there is no
-// destination, so the pool was never rewound: the frontier marched through each region's fixed
-// capacity and every fresh page it crossed was touched for the first time. These helpers read
-// the pool's own state and the process's minor-page-fault counter, so the cost is *measured*
-// (never estimated) and the fix is pinned by a counter, not by a wall time.
+// The rewind above needs a destination for a container result. With no process
+// (`RuntimeContext::new`, i.e. `-eval`/`-s`/`-run`/the single-pass `run_*` entries) the re-home
+// arm is `move_result_into_runtime_store` instead, so the result leaves the pool for the runtime's
+// long-lived store and the pool is rewound to the call's own mark. These helpers read the pool's
+// state and the process's minor-page-fault counter, so the cost is *measured* (never estimated)
+// and the fix is pinned by counters, not by a wall time. Run the whole sweep with
+// `--ignored --exact context::calls::tests::eval_route_pool_costs`; the measured table is in
+// `../IMPLEMENTATION.md#the-table-less-arm-and-its-store`.
 // ---------------------------------------------------------------------------------------
 
 /// Every pooled BIF-heap region as `(used, peak_used, capacity)` words, in pool order.
@@ -578,7 +580,8 @@ impl Row {
 const POOL_WORKLOADS: [(&str, &str); 3] = [
     // The control: an **immediate** result already rewinds the pool on every call.
     ("immediate", "element(1, {I})"),
-    // A **container** result: the case the table-less route never rewound.
+    // A **container** result: the case the store arm exists for — it leaves the pool for
+    // `eval_heap` and the pool is rewound to the call's mark.
     ("container", "list_to_tuple([I])"),
     // A container result with a large temporary: the bulk shape, where the pool's marching
     // dominates the call.
