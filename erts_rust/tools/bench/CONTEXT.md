@@ -485,10 +485,9 @@ the repo root), then drive the subcommands. Two facts to keep in mind when repro
 
 ## Status
 - The driver is a complete library + binary: 12 workloads, all implemented and tested; `cargo test -p bench`
-  is green (**259 passed / 0 failed**: 251 lib unit + 4 integration + 1 oracle smoke + 3 doc — the two
-  `…clear_the_boot_jitter_band` calibration tests are among the lib units), and the crate builds
-  warning-free with `--all-targets`.
-- **Current measurement session: `m14` (2026-10-16).** The full cross-runtime pass ran 12/12 rows `ok` (six
+  is green (**263 passed / 0 failed**: 259 lib unit + 4 integration + 1 oracle smoke + 4 doc — the two
+  `…clear_the_boot_jitter_band` calibration tests and the `marginal` drift/noise-band pinning tests are among
+  the lib units), and the crate builds warning-free with `--all-targets`.- **Current measurement session: `m14` (2026-10-16).** The full cross-runtime pass ran 12/12 rows `ok` (six
   `Runtimes::Both` workloads × both runtimes — **no `marginal below timer resolution` anywhere**), the
   sys-only external pass ran 4/4 `ok` (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`), `plb` → `ok`
   (version-aware resolution picks `dotnet` 9.0.318), and the only honest non-`ok` row in the milestone is
