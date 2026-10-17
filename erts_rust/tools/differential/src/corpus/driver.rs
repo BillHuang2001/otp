@@ -24,7 +24,7 @@
 //! black-box CLI: a driver is a C shared object (or built-in C driver) linked into the
 //! emulator and reached through a port. What *is* observable is the port machinery that
 //! sits on top of it — a port backed by the built-in `spawn` C driver can be opened,
-//! reports itself as a port, answers `port_info/1` and its output can be read back into
+//! reports itself as a port, answers `port_info/1,2` and its output can be read back into
 //! Erlang as a `{Port, {data, …}}` message.
 //!
 //! Some cases exercise the seam end to end (`os:cmd/1` runs a real external program through
@@ -36,35 +36,43 @@
 //! `exit_status`/`eof`/`stream`/`{cd,_}` options. Every case here `agree`s; the port-*opening*
 //! error shapes the runtime must reject are pinned by the sibling [`super::driver_ports`] group.
 //!
+//! The port's **identity and lifetime** surface is pinned by the `driver/port_*` /
+//! `driver/register_*` / `driver/spawn_driver_refused_*` cases: `open_port({spawn_driver, N}, _)`
+//! resolves exactly the statically linked names (`tcp_inet`/`udp_inet`/`ram_file_drv` open, a
+//! refused name raises `error:badarg` and consumes no port id), `port_connect/2` answers `true`
+//! in both its `erlang:` and `erts_internal:` form and makes the calling process the connected
+//! one, `register/2` names a port (`whereis/1` answers the port, the `registered_name` item
+//! reports the name, `unregister/1` restores `[]`), the `memory`/`queue_size` items answer, and
+//! a `port_close/1` delivers `{'EXIT', Port, normal}` to a trapping owner and
+//! `{'DOWN', Ref, port, Port, normal}` to a port monitor.
+//!
 //! `port_info/2` agrees with erts exactly: both return the `{Item, Value}` pair (e.g.
 //! `{name, "true"}`) and expose the same `port_info/1` item set
 //! (`[connected, id, input, links, name, os_pid, output]`). The earlier cases still
 //! **normalize** the pair away (`case Raw of {Key, Q} -> Q; Q -> Q end`) and assert the
 //! unwrapped *shape* (`is_list`, `is_integer`, `> 0`); the newer cases pin the exact pair and
-//! key set. Volatile per-VM-start values (`os_pid`, the `id` number, the owner pid in `links`)
-//! are asserted as a *shape*/*count*, never verbatim — never by iterating an unstable order.
+//! key set. Volatile values (`os_pid`, the `id` number, the owner pid in `links`/`connected`)
+//! are asserted as a *shape*/*count*/*relation*, never verbatim — never by iterating an
+//! unstable order.
 //!
 //! **Current divergences (deliberately NOT cases — each would be a `mismatch`), verified
 //! against the live oracle:**
 //! - the `eof` option — the oracle delivers `{Port, eof}` once the child closes its output
-//!   (`open_port({spawn,"true"},[binary,eof])` ⇒ `eof`); `beam_rt` never delivers it.
-//! - the `{line, N}` option — the framing itself now agrees and is pinned by the
-//!   `driver/line_*` cases (the `eol`/`noeol` frame grammar, the boundary at exactly N, the
-//!   512-byte default, and the EOF no-EOL flush of a CR-pending line); only the `eof` option
-//!   above is still missing from `beam_rt`.
-//! - `port_command(P, 42)` (a non-iodata payload) — the oracle raises `badarg`; `beam_rt`
-//!   accepts it and answers `true`.
-//! - `port_info(P, registered_name)` — the oracle answers `[]`; `beam_rt` raises `badarg`.
-//! - `{spawn, Cmd}` for a non-executable `Cmd` — both go through a shell and both report exit
-//!   `127`, but only the oracle's shell emits its `not found` diagnostic on stderr.
-//! - an out-of-range `{packet, N}` (`0` or `8`) — the oracle rejects the option with `badarg`,
-//!   `beam_rt` opens the port; only the *valid* widths (`1`, `2`, `4`) are pinned.
-//! - `{env, …}` on a `{spawn, Cmd}` port — the oracle accepts the option (the child inherits
-//!   it), `beam_rt` raises `badarg`; the option is pinned only on `spawn_executable`.
-//! - `port_info(P, connected)` and the whole `port_info(P)` list — the connected term embeds
-//!   the node **and** its creation, which the two runtimes start with different values
-//!   (`beam_rt` reports creation `0`), so neither can be pinned verbatim. `port_info(P, name)`,
-//!   the `input`/`output` counters and every pure shape still agree.
+//!   (`open_port({spawn,"true"},[binary,eof])` ⇒ `eof`); `beam_rt` never delivers it, so the
+//!   bounded receive takes its `after` branch and only the live-child no-eof shape is pinned
+//!   (`driver/open_port_eof_option_live_child_no_eof`).
+//! - a `port_connect/2` handover to a **different** process — after
+//!   `erlang:port_connect(P, Other)` the old owner's `port_info(P, connected)` is `undefined`
+//!   under the oracle but still `{connected, OwnerPid}` under `beam_rt`, so only the `self()`
+//!   handover shapes are pinned (`driver/port_connect_answers_true`,
+//!   `driver/erts_internal_port_connect_answers_true`).
+//! - `port_command(P, 42)` (a non-iodata payload) — both runtimes raise `error:badarg`, but
+//!   the oracle *also* writes a timestamped `Bad value on output port 'cat'` ERROR REPORT to
+//!   stdout, which `beam_rt` does not, so the child's stdout is not comparable.
+//! - the whole `port_info(P)` list and its `connected` item — `connected` is
+//!   `{connected, OwnerPid}` and the owner pid's id/creation differ per VM start (`beam_rt`
+//!   starts with creation `0` and port id `0`), while `id` and `os_pid` are per-VM/per-child.
+//!   The *key set*, the `{Item, Value}` wrapper and every pure shape still agree.
 //!
 //! The structural half of A.4 (that a C translation unit referencing the `driver_*` /
 //! `erl_drv_*` declarations still compiles against the frozen headers) is asserted in
@@ -1302,6 +1310,146 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "driver/spawn_driver_refused_names_are_badarg",
+            description: "open_port/2 resolves exactly the statically linked spawn_driver names: the three builtins open, efile and fd raise error:badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The two names absent from erts's `driver_tab.c` are neither linked nor
+                // autoloaded, so the open is refused *before* a port exists, while the three
+                // static builtins open live ports (closed again here). The refusal *reason
+                // atom* is the observable — never the message text of a diagnostic.
+                expr: "[begin Resp = (try open_port({spawn_driver,D},[]) catch error:Rep -> Rep end), case is_port(Resp) of true -> true = erlang:port_close(Resp), {list_to_atom(D), open}; false -> {list_to_atom(D), Resp} end end || D <- [\"efile\",\"fd\",\"tcp_inet\",\"udp_inet\",\"ram_file_drv\"]]",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok [{efile,badarg},{fd,badarg},{tcp_inet,open},{udp_inet,open},{ram_file_drv,open}]",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/a_refused_driver_name_consumes_no_port_id",
+            description: "a refused {spawn_driver, Name} open consumes no port id, while a linked name consumes exactly one",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `port_count` is a relative observable: the *delta* across the refused open
+                // is zero and the delta across a real open is one. The absolute count is a
+                // per-VM value and is never printed.
+                expr: "begin C0 = erlang:system_info(port_count), Refusal = (try open_port({spawn_driver,\"efile\"},[]) catch error:Rep -> Rep end), C1 = erlang:system_info(port_count), P = open_port({spawn_driver,\"ram_file_drv\"},[]), C2 = erlang:system_info(port_count), true = erlang:port_close(P), {Refusal, C1 - C0, C2 - C1} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {badarg,0,1}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_connect_answers_true",
+            description: "erlang:port_connect/2 answers true and makes the calling process the connected one",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The `connected` item is `{connected, OwnerPid}`; the pid's id/creation are
+                // per-VM values, so the owner is compared (`=:= self()`) instead of printed.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), Rep = erlang:port_connect(P, self()), Ok = case erlang:port_info(P, connected) of {connected, Who} -> Who =:= self() end, true = erlang:port_close(P), {Rep, Ok} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/erts_internal_port_connect_answers_true",
+            description: "the erts_internal:port_connect/2 form answers true and connects to the calling process",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The BIF the `erlang:` wrapper forwards to; same observable, same
+                // `=:= self()` comparison of the owner pid.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), Rep = erts_internal:port_connect(P, self()), Ok = case erlang:port_info(P, connected) of {connected, Who} -> Who =:= self() end, true = erlang:port_close(P), {Rep, Ok} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/register_a_port_under_a_name",
+            description: "register/2 names an open port: whereis/1 and the registered_name item answer the name, unregister/1 restores []",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The port is registered under a case-private atom, looked up by identity
+                // (`=:= P`), reported through `registered_name`, then unregistered and closed
+                // inside the same expression, so the name can never leak to another case.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), Ok = erlang:register(driver_case_named_port, P), W = whereis(driver_case_named_port), Same = W =:= P, Inf = erlang:port_info(P, registered_name), true = unregister(driver_case_named_port), After = erlang:port_info(P, registered_name), true = erlang:port_close(P), {Ok, Same, Inf, After, whereis(driver_case_named_port)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {true,true,{registered_name,driver_case_named_port},[],undefined}",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_info_memory_and_queue_size",
+            description: "port_info/2 answers the memory and queue_size items as {Item, NonNegInteger} pairs",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // A word count is allocator/size-class dependent, so both items are pinned as
+                // shapes: the key atom through the pattern match, then `is_integer/1` and the
+                // value's range. Deliberately *not* combined with `port_set_data/2`, whose
+                // stored term makes the oracle's and the runtime's word counts diverge.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), {memory, Mem} = erlang:port_info(P, memory), {queue_size, Qs} = erlang:port_info(P, queue_size), true = erlang:port_close(P), {is_integer(Mem), Mem > 0, is_integer(Qs), Qs >= 0} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,true,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_close_delivers_exit_to_a_trapping_owner",
+            description: "port_close/1 delivers {'EXIT', Port, normal} to a trapping owner",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // With `trap_exit` set the port's exit signal becomes a message. The receive
+                // selects on the port term itself (the only stable part of the tuple) and
+                // reports the tag and the reason, so no pid/port is ever printed.
+                expr: "begin process_flag(trap_exit,true), P = open_port({spawn,\"cat\"},[]), true = erlang:port_close(P), Msg = receive {Tag, Q, Why} when Q =:= P -> {Tag, Why} after 2000 -> timeout end, Msg end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {'EXIT',normal}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_close_delivers_down_to_a_port_monitor",
+            description: "a port monitor receives {'DOWN', Ref, port, Port, normal} after port_close/1",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The monitor ref and the port term are matched/compared by identity in the
+                // receive pattern (never printed), so only the type tag and the reason reach
+                // the golden.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), Ref = erlang:monitor(port, P), true = erlang:port_close(P), Msg = receive {'DOWN', Rf, Ty, Ob, Why} when Rf =:= Ref, Ob =:= P -> {Ty, Why} after 2000 -> timeout end, Msg end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {port,normal}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1727,6 +1875,104 @@ mod tests {
             let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
             assert_eq!(case.golden.stdout, Some(golden), "case {id}");
             assert_eq!(case.golden.exit_code, 0, "case {id}");
+        }
+    }
+
+    /// The cases that pin the port's **identity and lifetime** surface: the statically linked
+    /// `spawn_driver` namespace and the id it does not consume when a name is refused, the two
+    /// `port_connect/2` forms, `register/2` of a port under a name, the `memory`/`queue_size`
+    /// `port_info/2` items, and the `{'EXIT', …}` / `{'DOWN', …}` notifications a
+    /// `port_close/1` delivers.
+    const PORT_OWNERSHIP_IDS: &[&str] = &[
+        "driver/spawn_driver_refused_names_are_badarg",
+        "driver/a_refused_driver_name_consumes_no_port_id",
+        "driver/port_connect_answers_true",
+        "driver/erts_internal_port_connect_answers_true",
+        "driver/register_a_port_under_a_name",
+        "driver/port_info_memory_and_queue_size",
+        "driver/port_close_delivers_exit_to_a_trapping_owner",
+        "driver/port_close_delivers_down_to_a_port_monitor",
+    ];
+
+    /// Every ownership case resolves as a plain A.4 eval case whose golden is its measured
+    /// `ok …` line, keeps the probe wrapper's reserved variables (`V`/`C`/`R`) untouched, and
+    /// prints no volatile value (a pid, a port, a ref or a count) — only reason atoms, tag
+    /// atoms and booleans produced by comparisons.
+    #[test]
+    fn port_ownership_cases_pin_the_observed_goldens() {
+        let mut goldens: Vec<(&str, &str)> = vec![
+            (
+                "driver/spawn_driver_refused_names_are_badarg",
+                "ok [{efile,badarg},{fd,badarg},{tcp_inet,open},{udp_inet,open},{ram_file_drv,open}]",
+            ),
+            (
+                "driver/a_refused_driver_name_consumes_no_port_id",
+                "ok {badarg,0,1}",
+            ),
+            ("driver/port_connect_answers_true", "ok {true,true}"),
+            (
+                "driver/erts_internal_port_connect_answers_true",
+                "ok {true,true}",
+            ),
+            (
+                "driver/register_a_port_under_a_name",
+                "ok {true,true,{registered_name,driver_case_named_port},[],undefined}",
+            ),
+            (
+                "driver/port_info_memory_and_queue_size",
+                "ok {true,true,true,true}",
+            ),
+            (
+                "driver/port_close_delivers_exit_to_a_trapping_owner",
+                "ok {'EXIT',normal}",
+            ),
+            (
+                "driver/port_close_delivers_down_to_a_port_monitor",
+                "ok {port,normal}",
+            ),
+        ];
+        goldens.sort_unstable();
+        let mut ids: Vec<&str> = PORT_OWNERSHIP_IDS.to_vec();
+        ids.sort_unstable();
+        assert_eq!(
+            goldens.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ids,
+            "every ownership id carries exactly one golden"
+        );
+        for (id, golden) in goldens {
+            let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
+            assert_eq!(
+                case.contracts,
+                &[Contract::DriverAbi],
+                "case {id}: contract"
+            );
+            let CaseKind::Eval {
+                expr,
+                extra_argv,
+                probe,
+            } = case.kind
+            else {
+                panic!("case {id} must be a plain eval case");
+            };
+            assert_eq!(probe, Probe::Value, "case {id}: probe");
+            assert!(extra_argv.is_empty(), "case {id}: no extra argv");
+            assert!(!expr.is_empty(), "case {id}: empty expression");
+            let tokens = identifiers(expr);
+            for reserved in ["V", "C", "R"] {
+                assert!(
+                    !tokens.contains(&reserved),
+                    "case {id}: expression must not bind `{reserved}` (probe-wrapper collision)"
+                );
+            }
+            // A lifetime case awaits a delivery, so its wait must stay a short bounded `after`.
+            assert!(
+                !expr.contains("after 3000")
+                    && !expr.contains("after 5000")
+                    && !expr.contains("timer:sleep"),
+                "case {id}: the bounded wait must stay a short `after`"
+            );
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}: an answer exits 0");
         }
     }
 }
