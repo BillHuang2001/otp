@@ -434,6 +434,12 @@ impl GenImmixCollector {
     /// [`Collection`] is the one it ran; afterwards `young().available_words() >= need_words`
     /// or the typed heap-exhaustion error is returned (never a half-forwarded heap, never an
     /// unbounded loop).
+    ///
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) bounds the nursery chain's **summed**
+    /// capacity and is enforced by the [`grow_nursery`](Self::grow_nursery) step, so that refusal
+    /// comes *after* the collection — deliberately, because the collection collapses the chain
+    /// and therefore gives the budget back. Only the growth table's single-space ceiling is
+    /// checked up front, which is why the fast path below reads a per-space size.
     pub fn ensure_capacity(
         &mut self,
         need_words: usize,
@@ -461,6 +467,12 @@ impl GenImmixCollector {
     /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
     /// cannot reach the request, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
+    ///
+    /// The ceiling bounds the chain's **summed** capacity ([`heap_size_words`](Self::heap_size_words)),
+    /// not each individual space, so the fresh space may only claim the budget the chain has left
+    /// and `heap_size_words() <= max_heap_words` after every successful growth. A retired space a
+    /// previous growth left provably **empty** (`used_words() == 0`) is re-adopted instead of
+    /// replaced, which consumes no budget at all.
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
         self.nursery.grow(&self.policy, need_words)
     }
