@@ -142,7 +142,7 @@ use beam_common::{BeamError, Result};
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::{Dop, InboundSink, StepOutcome};
 use beam_process::{DistSignal, DistSignalRouter, MonitorRef, ProcessId, RemotePid};
-use beam_term::prelude::{make_atom, make_small, Eterm};
+use beam_term::prelude::{make_atom, make_small, try_make_small, Eterm};
 use beam_term::AtomTable;
 
 use crate::dist::{NodeName, DIST_READ_SLICE};
@@ -803,7 +803,7 @@ impl DistClientInner {
             DistSignal::Unlink { from, to } => Ok((
                 Dop::UnlinkId,
                 vec![
-                    make_small(next_id as i64),
+                    unlink_id_term(next_id)?,
                     local(heap, from)?,
                     to.to_eterm(heap)?,
                 ],
@@ -886,6 +886,27 @@ fn monitor_ref_term(
     let id = reference.id();
     let ids = [0u32, (id >> 32) as u32, id as u32];
     make_external_ref(heap, node, &ids, creation)
+}
+
+/// The `DOP_UNLINK_ID` id element: a **checked** small integer.
+///
+/// The C's `DOP_UNLINK_ID` carries a small integer the receiver echoes back in its
+/// `DOP_UNLINK_ID_ACK` (`erl_proc_sig_queue.c`), so the id has to be encodable as an
+/// immediate — the wire's whole id slot. `make_small` is unchecked (it only
+/// `debug_assert!`s its range), so casting a counter into it would panic in a debug build
+/// and, in release, wrap into a **different** — possibly negative — id, which a peer would
+/// then ack against the wrong unlink. An id past `MIN_SMALL..=MAX_SMALL` is therefore
+/// refused with the crate's typed resource-limit error
+/// ([`BeamError::SystemLimit`]), exactly as reference-id exhaustion is in
+/// `beam_process::MonitorRef::to_eterm`.
+///
+/// Only reachable in principle: the counter starts at `1` and one id is spent per routed
+/// unlink signal, so a node would need `MAX_SMALL` unlinks before it reached the bound.
+fn unlink_id_term(id: u64) -> Result<Eterm> {
+    // `MIN_SMALL` needs no test: a `u64` id is never negative, and `i64::try_from` rejects
+    // the whole upper half of the `u64` space.
+    let signed = i64::try_from(id).map_err(|_| BeamError::SystemLimit)?;
+    try_make_small(signed).map_err(|_| BeamError::SystemLimit)
 }
 
 /// A typed "this runtime has no link to that node" error.
@@ -1199,6 +1220,58 @@ mod tests {
         assert!(
             err.to_string().contains("no established connection"),
             "unexpected error: {err}"
+        );
+    }
+    /// The `DOP_UNLINK_ID` id is encoded **checked**: the largest encodable id is exact and
+    /// one past it is the typed resource limit, never a wrapped immediate.
+    #[test]
+    fn an_unlink_id_is_encoded_checked() {
+        let max = beam_term::MAX_SMALL as u64;
+        assert_eq!(
+            unlink_id_term(max).expect("the largest id still fits"),
+            make_small(beam_term::MAX_SMALL),
+            "the id at the bound is encoded verbatim"
+        );
+        assert!(
+            matches!(unlink_id_term(max + 1), Err(BeamError::SystemLimit)),
+            "one past the bound is refused"
+        );
+        // The whole upper half of the `u64` space is unrepresentable too (an `i64` overflow,
+        // not just a small-integer overflow).
+        assert!(
+            matches!(unlink_id_term(u64::MAX), Err(BeamError::SystemLimit)),
+            "u64::MAX cannot fit an i64"
+        );
+    }
+    /// A routed unlink whose counter has left the small-integer range fails **typed** — the
+    /// signal is refused instead of carrying a wrapped id a peer would ack against the wrong
+    /// unlink. The counter is parked at the bound directly (reaching it by routing
+    /// `2^59` signals is not a test).
+    #[test]
+    fn a_routed_unlink_past_the_small_range_is_a_typed_system_limit() {
+        let (client, mut driver, mut stream, mut atoms) = loopback("cook", 5);
+        drive(&client, &mut driver, &mut stream, &mut atoms);
+        let remote = remote_pid(&mut atoms, 1, 5);
+        let mut inner = client.inner.borrow_mut();
+        // Just below the bound: the id is encoded and the signal is queued.
+        inner.next_unlink_id = beam_term::MAX_SMALL as u64;
+        inner
+            .encode_signal(DistSignal::Unlink {
+                from: ProcessId::new(3, 0),
+                to: remote,
+            })
+            .expect("an id at the bound encodes");
+        // One past it: the encode is a typed refusal, and nothing wrapped is produced.
+        inner.next_unlink_id = beam_term::MAX_SMALL as u64 + 1;
+        assert!(
+            matches!(
+                inner.encode_signal(DistSignal::Unlink {
+                    from: ProcessId::new(3, 0),
+                    to: remote,
+                }),
+                Err(BeamError::SystemLimit)
+            ),
+            "an id past the bound is a typed refusal"
         );
     }
 }
