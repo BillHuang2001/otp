@@ -290,7 +290,7 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   (`AllocFailure{kind, requested}`: carriers ⇒ `Carrier`, process/slab heaps ⇒ `Heap`, large off-heap
   ⇒ `LargeObject`, else `Other`; invalid alignment/`Layout` ⇒ `BadArg`), no `unwrap()` on runtime data.
 - **`unsafe` confinement:** allowed only in `block`, `carrier`, `free_list`, `allocator` (incl. its
-  `core`/`state` submodules), `mbc`, `mseg`, `heap`, `binary`. Every `unsafe fn` has a `# Safety`
+  `core`/`state` submodules), `mbc`, `mseg`, `heap`, `binary` (incl. its `growth` submodule). Every `unsafe fn` has a `# Safety`
   section and every `unsafe` block a `// SAFETY:` rationale. `size_class`, `registry`, `stats`,
   `strategy`, `policy`, `refcount`, `error` are safe Rust. `unsafe_op_in_unsafe_fn` stays clean.
 - **Carriers come from the OS via `mseg` (mmap)**, are page-aligned, and `munmap`'d on free/drop.
