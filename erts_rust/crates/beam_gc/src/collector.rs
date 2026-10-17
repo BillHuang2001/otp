@@ -229,8 +229,13 @@ impl Collector {
     /// the typed heap exhaustion is returned *before* a single word is copied rather than
     /// mid-copy.
     ///
+    /// The nursery is re-sized by the C's **two-step** rule
+    /// ([`HeapPolicy::young_after_fullsweep`]): its pre-copy occupancy first
+    /// (`erl_gc.c:1866`), then the exact post-copy live set
+    /// (`adjust_after_fullsweep`, `erl_gc.c:2062-2098`).
+    ///
     /// Every space of a chained nursery is evacuated, and the chain is then
-    /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
+    /// [collapsed](crate::nursery::Nursery::collapse_after_fullsweep) back to one space.
     pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         let mut from = FromSet::new();
         self.nursery.add_to_from_set(&mut from);
@@ -282,12 +287,17 @@ impl Collector {
         self.stats.major_collections += 1;
         // The fullsweep relocated *every* live word — the nursery's included — into the fresh
         // mature space, so the nursery's surviving occupancy is now zero and there is no live
-        // young set to size it from. It is therefore sized from the **demand the round
-        // observed** (`young_occupancy`, sampled before the copy): the C's
-        // `adjust_after_fullsweep` keep-the-heap-unless-it-is-over-provisioned rule
-        // (`erl_gc.c:2061-2098`) rather than a collapse to the reserve floor. See
-        // [`Nursery::collapse`] for why feeding it the occupancy cannot grow the nursery.
-        self.nursery.collapse(&self.policy, young_occupancy)?;
+        // young set to size it from. It is therefore sized by the C's **two-step** rule
+        // ([`HeapPolicy::young_after_fullsweep`]): the **demand the round observed**
+        // (`young_occupancy`, sampled before the copy — the `major_collection` pre-copy sizing,
+        // `erl_gc.c:1866`) followed by the **post-copy live set** (`live`, this fullsweep's
+        // exact reachable word count — the `adjust_after_fullsweep` shrink,
+        // `erl_gc.c:2062-2098`). The second step is what stops a nursery the growth seam
+        // stepped up for a burst from staying that size forever once the burst is dead: step 1
+        // compares the capacity against the *occupancy*, which a fullsweep always finds full,
+        // so only the live set can reveal the over-provisioning.
+        self.nursery
+            .collapse_after_fullsweep(&self.policy, young_occupancy, live)?;
         Ok(stats)
     }
 

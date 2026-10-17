@@ -56,9 +56,16 @@ materialized into the reserved block's spare tail via `Slack::integer`, so the b
 costs a single allocation. `live` is `RootSet::ALL_LIVE` whenever the caller has no
 operand-derived count (always a safe over-approximation for a copying collector).
 
-Every in-crate builder **and every in-crate call site** (`families/**`, `machine/**`) is on
-this discipline: `rg -n 'ctx.alloc_words' src/families` is empty. The one sanctioned exception
-is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
+Every term **builder** call site (`families/**`, `machine/**`) is on this discipline:
+`rg -n 'ctx.alloc_words' src/families` is empty. Two sanctioned **unrooted** paths survive, both
+sound only because `alloc_words` never collects:
+- `crate::operand::read_operand` (`../operand.rs:69`/`:75`) materializes a non-small
+  `Operand::Integer`/`Character` through `number.rs::make_integer_unrooted` → `ctx.alloc_words`, so
+  **any** instruction reading a bignum immediate allocates once per operand on the unrooted seam —
+  from the families and from the interpreter's core arms, on both tiers (the JIT's family/deopt
+  bodies reach the same reader). Moving-safe: the bignum is consumed immediately and no
+  machine-heap term is held across the call.
+- the four `&self` accessors in `../machine/location.rs` (see Handoff below).
 
 ## API Surface (`crate::terms::*`)
 - **Classic builders** (public, unrooted) — listed in the section above; each allocates with
@@ -131,7 +138,7 @@ is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
   the rooted builders); `alloc_tests.rs` → the mock moving collector + the rooted-hook/peak-words
   proofs.
 
-## Handoff — the one call site still on the unrooted path (owner: `beam_rt`)
+## Handoff — the unrooted paths still open (owner: `beam_rt`)
 `../machine/location.rs:277`/`:409` — the four `&self` accessors (`current_function`,
 `initial_call`, `current_location`, `current_stacktrace`) cannot lend the machine's `&mut` root
 slices, so they build through the **unrooted** [`ContextSink`]. Sanctioned: every term there

@@ -97,13 +97,16 @@ fn nursery_cells(c: &mut GenImmixCollector, back_reference: Eterm) -> Vec<Eterm>
 /// [`GenImmixCollector::grow_major`] from: the in-place mature reclaim has run (with the
 /// nursery's mature references as additional roots) and every nursery reference word into
 /// the mature region has been rewritten to its final in-place address. Returns the
-/// promotion's exact line count, and the exact line need of the whole live set the
-/// fallback has to relocate (what `run_major` passes through to `grow_major`).
-fn reach_the_in_place_shortfall(c: &mut GenImmixCollector, roots: &mut [Eterm]) -> (usize, usize) {
+/// promotion's exact line count, and the exact line **and word** need of the whole live set
+/// the fallback has to relocate (what `run_major` passes through to `grow_major`).
+fn reach_the_in_place_shortfall(
+    c: &mut GenImmixCollector,
+    roots: &mut [Eterm],
+) -> (usize, usize, usize) {
     let (needed, refs) = scan_young(roots, c.nursery(), &c.mature).expect("scan the nursery");
-    // The exact live line need, read *before* the reclaim moves anything (the counter is
+    // The exact live need, read *before* the reclaim moves anything (the counter is
     // read-only, the reclaim is not).
-    let live_lines = crate::live::live_full(c.nursery(), &c.mature, roots).lines;
+    let live = crate::live::live_full(c.nursery(), &c.mature, roots);
     let mut promoted: Vec<Eterm> = refs.iter().map(|(_, term)| *term).collect();
     c.mature
         .collect(roots, &mut promoted)
@@ -113,7 +116,7 @@ fn reach_the_in_place_shortfall(c: &mut GenImmixCollector, roots: &mut [Eterm]) 
         // (yielded by `scan_young`), which the in-place reclaim left untouched.
         unsafe { **slot = *new };
     }
-    (needed, live_lines)
+    (needed, live.lines, live.words)
 }
 
 #[test]
@@ -127,7 +130,7 @@ fn the_growth_fallback_grows_the_region_instead_of_failing() {
     let mut roots = mature.clone();
     roots.extend(nursery_cells(&mut c, mature[0]));
 
-    let (needed, live_lines) = reach_the_in_place_shortfall(&mut c, &mut roots);
+    let (needed, live_lines, live_words) = reach_the_in_place_shortfall(&mut c, &mut roots);
     assert_eq!(needed, 8, "one line per nursery object");
     assert_eq!(
         c.mature().used_lines(),
@@ -140,7 +143,7 @@ fn the_growth_fallback_grows_the_region_instead_of_failing() {
     );
 
     let stats = c
-        .grow_major(&mut roots, needed, live_lines)
+        .grow_major(&mut roots, needed, live_lines, live_words)
         .expect("the fallback grows the region instead of failing");
 
     assert!(
@@ -213,7 +216,7 @@ fn the_growth_fallback_is_capped_by_max_heap_words_and_promotes_nothing() {
     let mut roots = mature.clone();
     roots.extend(nursery_cells(&mut c, mature[0]));
 
-    let (needed, live_lines) = reach_the_in_place_shortfall(&mut c, &mut roots);
+    let (needed, live_lines, live_words) = reach_the_in_place_shortfall(&mut c, &mut roots);
     assert!(c.mature().free_lines() < needed, "the shortfall fires");
 
     let before = roots.clone();
@@ -222,7 +225,7 @@ fn the_growth_fallback_is_capped_by_max_heap_words_and_promotes_nothing() {
     let minor_gcs = c.minor_gcs();
 
     let err = c
-        .grow_major(&mut roots, needed, live_lines)
+        .grow_major(&mut roots, needed, live_lines, live_words)
         .expect_err("the ceiling forbids growing the region");
 
     let failure = match err {
