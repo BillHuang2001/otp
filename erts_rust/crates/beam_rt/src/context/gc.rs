@@ -262,8 +262,32 @@ fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
 /// boxed nor a cons), a **literal** (a frozen code constant in the literal area, which never
 /// points into a movable heap), or a pointer into the process's own **young** heap — **any**
 /// nursery space, the current one or one a [`Process::grow_nursery`] growth retained, since a
-/// collection evacuates the whole chain — or its **mature** heap. Anything else — including a
-/// container handed back by a registered BIF or built on the arena — declines the collection.
+/// collection evacuates the whole chain — or its **mature** heap.
+///
+/// # The childless exemption — why a foreign *leaf* does not decline
+///
+/// A foreign container is a hazard only through the words it **forwards**: a copying collector's
+/// two obligations toward a container are to *follow* the child words it finds there (they keep a
+/// young object alive) and to *update* them when it moves one. An object that exposes **no** child
+/// slot imposes neither — it can neither dangle itself (`Target::Foreign` leaves the pointer where
+/// it is, and nothing outside the collector's own spaces ever moves) nor keep a young word alive —
+/// so a foreign **leaf** is exactly as safe as an immediate and declines nothing.
+///
+/// That is not a corner case: `make_ref/0`'s frozen M1 block
+/// (`[make_header(3, REF_SUBTAG), make_small(0), make_small(0), make_small(id)]`, written by
+/// [`beam_term::boxed::write_internal_ref`]) is all immediates after its header, and it is
+/// produced by this runtime's own native floor on the pooled BIF heap. Without the exemption
+/// every reference a process ever mints keeps that process under a forever-declined valve: its
+/// collection debt is never settled and its nursery grows for the life of the loop.
+///
+/// "Exposes no child slot" is decided by [`foreign_boxed_has_copy_children`], which drives the
+/// same canonical enumeration ([`beam_term::layout::for_each_child_slot`]) the copier and the
+/// reachability walk use, so the valve cannot disagree with the collector about which words an
+/// object forwards — notably `SUB_BITS_SUBTAG`, whose `orig` word *is* forwarded and so is never
+/// exempt.
+///
+/// Anything else — a cons (header-less, always two references), a container handed back by a
+/// registered BIF **with** children, a block built on the arena — declines the collection.
 pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     if !beam_term::prelude::is_boxed(term) && !beam_term::prelude::is_list(term) {
         return false;
@@ -272,9 +296,50 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
         return false;
     }
     let ptr = beam_term::list::ptr_val(term) as usize;
-    !in_heap_block(process.heap(), ptr)
+    let foreign = !in_heap_block(process.heap(), ptr)
         && !process.collector().young_contains(ptr as *const Eterm)
-        && !process.collector().mature_contains(ptr as *const Eterm)
+        && !process.collector().mature_contains(ptr as *const Eterm);
+    // A cons is header-less and always pointer-bearing; a boxed object only matters when the
+    // collector would forward something out of it. The predicate runs only for a term already
+    // known foreign, so a scanned term — the overwhelming majority of the per-word calls — pays
+    // nothing new.
+    foreign && (beam_term::prelude::is_list(term) || foreign_boxed_has_copy_children(term))
+}
+
+/// Whether the **boxed** object `term` names exposes at least one child slot the collector
+/// forwards.
+///
+/// [`beam_term::layout::for_each_child_slot`] is the canonical enumeration that both
+/// `beam_message`'s copier and the GC reachability walk drive, so "it visits nothing" is exactly
+/// "a relocation would neither follow nor update any word of this object". The enumeration reads
+/// the object's header word (and, for a flat map, its untagged size word) — never a payload word
+/// of a shape that reports no slot — so a leaf costs one word read and a shape whose cells are
+/// all immediates still reports its slots (the valve stays conservative about *which* words are
+/// forwarded, not about their values).
+///
+/// `term` must be **boxed**: the header-less cons cell is the caller's own case, and reading a
+/// header out of a cons's car word would be meaningless.
+///
+/// # Safety
+///
+/// The caller must pass a **live** boxed term — one reachable from the root set or from another
+/// live object — so its header word is a readable, aligned term word. The object may live in
+/// **any** region, scanned or not: the enumeration only reads words belonging to the object the
+/// header describes.
+#[allow(unsafe_code)]
+fn foreign_boxed_has_copy_children(term: Eterm) -> bool {
+    // SAFETY: `term` is a live boxed term (the caller's contract), so its header word is a
+    // readable, aligned term word at the address the term's pointer bits name. `for_each_child_slot`
+    // only visits offsets belonging to the shape that header describes, and a shape that reports no
+    // slot reads the header alone (or a flat map's size word), so no word outside the object is
+    // touched.
+    unsafe {
+        let address = beam_term::boxed::boxed_val(term) as *const Eterm;
+        let header = *address;
+        let mut has_children = false;
+        beam_term::layout::for_each_child_slot(header, address, |_| has_children = true);
+        has_children
+    }
 }
 
 /// The width of the blocks [`pointer_prefix_len`]'s fast path skips at a time: one 64-byte cache
@@ -1921,6 +1986,8 @@ pub(crate) mod prefix_counters {
     }
 }
 #[cfg(test)]
+mod refs_plateau;
+#[cfg(test)]
 mod tests {
     //! Unit tests for the mechanical pieces of the adoption: the float guard scan, the safe
     //! heap bump, and the unrooted seam's grow-and-retry (which needs no `.beam` and so is
@@ -2478,4 +2545,215 @@ mod tests {
                 "aligned case {case}: the block sweep changed the bound of {file:?}"
             );
         }
-    }}
+    }
+
+    /// A **foreign region** for the valve's tests: a heap block that is neither the process
+    /// heap's live storage nor any space of its collector, plus the four terms the childless
+    /// exemption has to tell apart.
+    ///
+    /// The terms are written by the same heap-agnostic `beam_term` writers the production
+    /// producers use ([`beam_term::boxed::write_internal_ref`] — the exact M1 block `make_ref/0`'s
+    /// native floor writes, all immediates after its header — an ordinary tuple, a cons and an
+    /// `ErlSubBits`), so the shapes are the real ones and not stand-ins.
+    struct ForeignRegion {
+        /// The block the terms live in; dropped last, after the terms are done with.
+        heap: Heap,
+        /// `make_ref/0`'s frozen M1 childless block (`_ => None` in the child-slot table).
+        reference: Eterm,
+        /// A 2-tuple: two child slots.
+        tuple: Eterm,
+        /// A cons cell: header-less, both words are references.
+        cons: Eterm,
+        /// An `ErlSubBits`, whose `orig` word (offset 4) **is** forwarded — never exempt.
+        sub_bits: Eterm,
+    }
+
+    impl ForeignRegion {
+        /// Builds the four terms in one fresh 64-word block.
+        #[allow(unsafe_code)]
+        fn new() -> ForeignRegion {
+            let mut heap = Heap::new(64).expect("a 64-word foreign block");
+            let fill = [NIL; 8];
+            // SAFETY: each `bump` reserves exactly the words the writer it feeds needs, inside
+            // this block, and every word is written before the term escapes.
+            unsafe {
+                let slot = bump(&mut heap, 4, &fill).expect("four words for the reference");
+                let reference = beam_term::boxed::write_internal_ref(slot, 7)
+                    .expect("an M1 internal reference");
+                let tuple = heap
+                    .tuple(&[make_small(1), make_small(2)])
+                    .expect("a 2-tuple");
+                let slot = bump(&mut heap, 2, &fill).expect("two words for the cons");
+                *slot = make_small(3);
+                *slot.add(1) = NIL;
+                let cons = beam_term::list::make_list(slot);
+                let slot = bump(&mut heap, 5, &fill).expect("five words for the ErlSubBits");
+                let sub_bits = beam_term::bitstring::write_sub_bits(
+                    slot,
+                    make_small(0),
+                    make_small(0),
+                    make_small(0),
+                    make_small(0),
+                );
+                ForeignRegion {
+                    heap,
+                    reference,
+                    tuple,
+                    cons,
+                    sub_bits,
+                }
+            }
+        }
+
+        /// Asserts every term really lives in this block and **not** in the process's heap.
+        fn assert_foreign(&self, process: &Process) {
+            let base = (self.heap.hp() as usize)
+                .wrapping_sub(self.heap.used().saturating_mul(std::mem::size_of::<Eterm>()));
+            for (label, term) in [
+                ("reference", self.reference),
+                ("tuple", self.tuple),
+                ("cons", self.cons),
+                ("sub-bits", self.sub_bits),
+            ] {
+                let ptr = beam_term::list::ptr_val(term) as usize;
+                assert!(
+                    ptr >= base && ptr < self.heap.hend() as usize,
+                    "the {label} must live in the foreign block"
+                );
+                assert!(
+                    !in_heap_block(process.heap(), ptr),
+                    "the {label} must be outside the process heap's live storage"
+                );
+                assert!(
+                    !process.collector().young_contains(ptr as *const Eterm)
+                        && !process.collector().mature_contains(ptr as *const Eterm),
+                    "the {label} must be outside every scanned space"
+                );
+            }
+        }
+    }
+
+    /// **A foreign childless boxed object does not decline a collection, and a foreign container
+    /// with children still does.**
+    ///
+    /// This is the exemption [`root_is_unscanned`] documents: a copying collector's only
+    /// obligations toward a container are to *follow* and *update* the words it forwards, and an
+    /// object that exposes no child slot ([`beam_term::layout::for_each_child_slot`] visits
+    /// nothing) imposes neither — it can neither dangle under a relocation nor keep a young word
+    /// alive. `make_ref/0`'s block is exactly that shape, and every allocating process holds one,
+    /// so without the exemption the valve declines every collection it ever runs.
+    ///
+    /// The `SUB_BITS_SUBTAG` case is the boundary the canonical enumeration gets right for free:
+    /// its `orig` word **is** forwarded, so it must keep declining.
+    #[test]
+    fn a_foreign_childless_boxed_term_is_not_unscanned_but_a_container_with_children_is() {
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process");
+        let region = ForeignRegion::new();
+        let process = table.get(pid).expect("the spawned process");
+        region.assert_foreign(process);
+
+        // The leaf: childless, so it can neither dangle nor keep a young word alive.
+        assert!(
+            !super::foreign_boxed_has_copy_children(region.reference),
+            "make_ref/0's M1 block exposes no child slot"
+        );
+        assert!(
+            !super::root_is_unscanned(process, region.reference),
+            "a foreign childless boxed term must not decline a collection"
+        );
+
+        // ... while every container that forwards a word still does.
+        assert!(
+            super::foreign_boxed_has_copy_children(region.tuple),
+            "a 2-tuple exposes two child slots"
+        );
+        assert!(
+            super::root_is_unscanned(process, region.tuple),
+            "a foreign container with children must decline a collection"
+        );
+        assert!(
+            super::root_is_unscanned(process, region.cons),
+            "a foreign cons is header-less and always pointer-bearing"
+        );
+        assert!(
+            super::foreign_boxed_has_copy_children(region.sub_bits),
+            "an ErlSubBits forwards its orig word"
+        );
+        assert!(
+            super::root_is_unscanned(process, region.sub_bits),
+            "an ErlSubBits must keep declining: its orig word is a reference it forwards"
+        );
+
+        // The same answers through the reachability walk the valve's descent (and the process
+        // table's collection gate) drive: the childless leaf reaches **no hit** and terminates,
+        // and each container is a phase-1 hit.
+        let mut scratch = crate::context::gc_walk::WalkScratch::default();
+        for (label, term, expected) in [
+            ("reference", region.reference, false),
+            ("tuple", region.tuple, true),
+            ("cons", region.cons, true),
+            ("sub-bits", region.sub_bits, true),
+        ] {
+            assert_eq!(
+                crate::context::gc_walk::any_root_is_unscanned(
+                    &mut scratch,
+                    process,
+                    std::iter::once(&term),
+                    true,
+                ),
+                expected,
+                "the walk must classify the foreign {label} as unscanned == {expected}"
+            );
+        }
+    }
+
+    /// **A childless foreign BIF result does not open the per-pid descent latch; a container with
+    /// children does.**
+    ///
+    /// [`RuntimeContext::open_gate_for_foreign_result`] is the one production site that decides
+    /// whether a registered-BIF/native-floor/NIF result must arm the sticky
+    /// [`Runtime::note_foreign_reachable`] bit — the bit that is never cleared, so a wrong `true`
+    /// disables every collection the process would ever run. Driving the real seam (never a
+    /// re-derivation of it) is what pins the two answers.
+    #[test]
+    fn a_childless_foreign_result_leaves_the_descent_latch_closed() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process");
+        let region = ForeignRegion::new();
+        assert!(!rt.foreign_reachable(pid), "a fresh pid's latch is closed");
+
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.open_gate_for_foreign_result(region.reference);
+        }
+        assert!(
+            !rt.foreign_reachable(pid),
+            "a childless foreign result (make_ref/0's block) must not open the descent latch"
+        );
+
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.open_gate_for_foreign_result(region.cons);
+        }
+        assert!(
+            rt.foreign_reachable(pid),
+            "a foreign cons is pointer-bearing and must open the descent latch"
+        );
+
+        // The latch is add-only by design: a later clean result can never close it.
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.open_gate_for_foreign_result(region.reference);
+        }
+        assert!(
+            rt.foreign_reachable(pid),
+            "the descent latch is add-only; a later clean result can never close it"
+        );
+    }
+}
