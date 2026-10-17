@@ -1309,8 +1309,8 @@ impl TcpInetDriver {
     ///
     /// # Errors
     ///
-    /// `BeamError::Io` when a served option's `getsockopt(2)` fails on a live socket (the C
-    /// silently drops that record instead; see [`self::opt`]).
+    /// `BeamError::Io` is **not** raised for a failed `getsockopt(2)` on a live socket: that
+    /// record is dropped and the search continues, as in the C (see [`self::opt`]).
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
         get_options(&self.options, self.stream, self.socket, arg)
     }

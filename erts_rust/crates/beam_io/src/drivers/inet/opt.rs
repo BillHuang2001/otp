@@ -109,10 +109,10 @@
 //!    (`:6985`-`:6986`, hence a whole-reply `[0]einval`). Setting any other `{active, …}` value
 //!    resets the counter to zero (`:6999`-`:7000`).
 //!
-//! The one deliberate non-mirror is an **unrecoverable** `getsockopt(2)` failure on a live
-//! socket (something the four served syscall options cannot raise): the C silently drops that
-//! record and answers a *shorter* reply, which would be a wrong result, so it surfaces as the
-//! typed `BeamError::Io` instead.
+//! A failed `getsockopt(2)` mirrors the C's `TRUNCATE_TO(0, ptr); continue;`
+//! (`inet_drv.c:9734`-`:9741`): **that record only** is dropped, every record already produced is
+//! kept, and the remaining codes are still tried — so a mix of succeeding and failing codes
+//! answers the concatenation of the succeeding records.
 //!
 //! A **truncated `{active, N}` record** — a `setopts` whose multi form carries the value but not
 //! the trailing 16-bit `N` — is the one payload this floor cannot mirror: the C reads those two
@@ -407,8 +407,8 @@ pub(super) fn set_options(
 ///
 /// # Errors
 ///
-/// `BeamError::Io` when a served option's `getsockopt(2)` fails on a live socket — the
-/// deliberate non-mirror of the C's silent truncation (see the module docs).
+/// Only the unserved-code whole reply `[0]einval`. A failed `getsockopt(2)` on a live socket is
+/// **not** an error: the C drops that record and keeps going (see the module docs).
 pub(super) fn get_options(
     options: &SocketOptions,
     stream: bool,
@@ -476,10 +476,18 @@ pub(super) fn get_options(
                     // gathered so far.
                     continue;
                 };
-                let value = get_socket_int_option(fd, level, name)?;
-                // The C's `*ptr++ = opt; put_int32(ival, ptr);` (`inet_drv.c:9743`-`:9746`).
-                reply.push(code);
-                reply.extend_from_slice(&value.to_be_bytes());
+                // The C's `if (sock_getopt(...) < 0) { TRUNCATE_TO(0, ptr); continue; }`
+                // (`inet_drv.c:9734`-`:9741`): a failed `getsockopt(2)` drops **this record only**
+                // — the records already produced are kept and later codes are still tried.
+                match get_socket_int_option(fd, level, name) {
+                    Ok(value) => {
+                        // The C's `*ptr++ = opt; put_int32(ival, ptr);`
+                        // (`inet_drv.c:9743`-`:9746`).
+                        reply.push(code);
+                        reply.extend_from_slice(&value.to_be_bytes());
+                    }
+                    Err(_) => continue,
+                }
             }
         }
     }
@@ -705,6 +713,35 @@ mod tests {
 
     /// The driver-state defaults are the C descriptor's own initial values
     /// (`inet_drv.c:10923`-`:11769`), reported by `getopts` in request order.
+    /// The C's `TRUNCATE_TO(0, ptr); continue;` (`inet_drv.c:9734`-`:9741`): a failed
+    /// `getsockopt(2)` drops **only** that record — the accumulated prefix survives and later
+    /// codes are still tried.
+    ///
+    /// Measured live oracle on a real datagram socket: `getopts <<10>>` (nodelay, which a datagram
+    /// socket refuses) ⇒ `[1]`; `<<0,10>>` (reuseaddr then nodelay) ⇒ `[1,0,0,0,0,0]` (the prefix
+    /// survives, the failing record is dropped); `<<10,0>>` (the failure first) ⇒ `[1,0,0,0,0,0]`
+    /// — the `continue` does not stop the loop.
+    #[test]
+    fn a_failed_getsockopt_drops_only_that_record() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a datagram socket");
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&socket);
+        // 10 = `nodelay`, which a datagram socket refuses: the record is dropped, not an error.
+        assert_eq!(
+            get_options(&SocketOptions::default(), false, Some(fd), &[10]).expect("no error"),
+            ctl_ok()
+        );
+        // A succeeding code followed by a failing one: the prefix is preserved.
+        assert_eq!(
+            get_options(&SocketOptions::default(), false, Some(fd), &[0, 10]).expect("no error"),
+            vec![1, 0, 0, 0, 0, 0]
+        );
+        // A failing code first: the later record is still emitted.
+        assert_eq!(
+            get_options(&SocketOptions::default(), false, Some(fd), &[10, 0]).expect("no error"),
+            vec![1, 0, 0, 0, 0, 0]
+        );
+    }
+
     #[test]
     fn the_driver_state_defaults_are_the_c_descriptor_defaults() {
         let options = SocketOptions::default();
