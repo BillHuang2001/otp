@@ -64,6 +64,9 @@ and the one-line semantic contract only.
 - `collect(roots) -> Result<Collection>` picks minor vs major by policy and escalates a would-not-fit minor to a
   major; `collect_minor`/`collect_major(roots) -> Result<GcStats>` each **pre-check capacity**, so an unfittable
   destination returns the typed `heap_exhausted` *before* any copy.
+- `collect_kind(kind, roots) -> Result<Collection>` — the **pinned** counterpart of `collect`: it runs exactly the
+  kind it is given and **never escalates**, so a pinned `Minor` whose promotion does not fit is the typed
+  `heap_exhausted` instead of a fullsweep (mirrored on `GenImmixCollector`, forwarded by `AnyCollector`).
 - `ensure_capacity(need_words, roots)` — the on-demand growth seam; `grow_nursery(need_words)` — the
   **no-relocation** growth seam.
 - `young_contains(ptr)` — whether `ptr` is a word of **any** nursery space (current or growth-retired), the range
