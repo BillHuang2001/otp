@@ -177,11 +177,16 @@ impl Case {
 /// timed loop must do enough work that its marginal cost stands clear of that runtime's own
 /// run-to-run boot/startup jitter**, measured here at ≈±0.1 s on the rust boot (the boot
 /// itself is ≈0.7–1.5 s under load). The rust-side floor is therefore **≥0.5 s of loop
-/// work** (≈5× that jitter); measured rust churn cost on that host (2026-10-16,
-/// `/proc/loadavg` 45–100, min-of-reps) is ≈130–180 µs/churn, so `n_rust = 5_000` (raised
-/// from 2 000 by the m14 recalibration, whose ≈0.26 s marginal sat inside the band) is
-/// ≈0.7–1.6 s. The oracle's much smaller startup jitter (tens of ms) needs a correspondingly
-/// smaller marginal.
+/// work**. The measured rust churn cost on that host (2026-10-17, `/proc/loadavg` 5.7–7.7,
+/// `--full`, default baseline-JIT tier) is ≈69 µs/churn, so `n_rust = 10_000` is ≈0.69 s of
+/// churn work — ≳20× the paired estimator's measured ±29.5 ms residual noise band. The
+/// oracle's much smaller startup jitter (tens of ms) needs a correspondingly smaller
+/// marginal, so `n_sys = 200_000` is unchanged.
+///
+/// **Maintenance rule:** when the measured per-op cost changes materially, re-derive `n_rust`
+/// so the loop work stays ≥0.5 s; the pinning test
+/// (`the_rust_loop_count_clears_the_boot_jitter_band`) enforces the floor against the current
+/// cost constant.
 ///
 /// The reported metric is normalized per op, so the loop counts only have to keep both
 /// marginals measurable — not to equalize the two runtimes' totals. A loop count whose
@@ -189,7 +194,7 @@ impl Case {
 /// fabricated one.
 static CASE: Case = Case {
     name: "churn",
-    n_rust: 5_000,
+    n_rust: 10_000,
     n_sys: 200_000,
 };
 
@@ -697,22 +702,35 @@ mod tests {
     }
 
     /// The calibration rule from the [`CASE`] doc, pinned: the rust loop must be worth ≥0.5 s
-    /// of churn work (5× the ≈±0.1 s run-to-run boot jitter), computed at the *cheapest* rust
-    /// churn measured on the reference host (2026-10-16) — a slower host only grows it.
+    /// of churn work, computed at the m15-measured rust churn cost (2026-10-17:
+    /// ≈69 µs/churn, so the conservative `MIN_CHURN_NS` below is 69 000 ns/op — a slower host
+    /// only grows the real figure).
+    ///
+    /// The paired estimator's residual noise is the MAD of the paired differences (measured
+    /// ±29.5 ms on this host), so a ≥0.5 s floor is ≳20× headroom over the 3×
+    /// [`crate::marginal`] noise guard.
     #[test]
     fn the_rust_loop_count_clears_the_boot_jitter_band() {
         const BOOT_JITTER_MS: f64 = 100.0;
         const FLOOR_MULTIPLE: f64 = 5.0;
-        const MIN_CHURN_US: f64 = 100.0;
+        const MIN_CHURN_NS: f64 = 69_000.0;
 
-        let marginal_ms = CASE.n_rust as f64 * MIN_CHURN_US / 1_000.0;
+        let marginal_ms = CASE.n_rust as f64 * MIN_CHURN_NS / 1_000_000.0;
+        let work_s = marginal_ms / 1_000.0;
+        assert!(
+            (0.5..=5.0).contains(&work_s),
+            "n_rust={} ⇒ {work_s:.3} s of churn work, outside the 0.5..=5.0 s band",
+            CASE.n_rust
+        );
         let floor_ms = FLOOR_MULTIPLE * BOOT_JITTER_MS;
         assert!(
             marginal_ms >= floor_ms,
             "n_rust={} ⇒ {marginal_ms:.0} ms of churn work, below the {floor_ms:.0} ms floor",
             CASE.n_rust
         );
+        assert_eq!(CASE.n_rust, 10_000);
     }
+
     #[test]
     fn argv_carries_the_loop_count_and_the_pa_dir_for_both_runtimes() {
         let dir = Path::new("/tmp/xyz");
