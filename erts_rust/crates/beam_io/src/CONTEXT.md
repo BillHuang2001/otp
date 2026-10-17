@@ -61,6 +61,26 @@ out of a read as `{eol | noeol, Data}` inside `{Port, {data, …}}` (`deliver_li
   harvests one `PortNotification` per port and its `notifications` carry only `PortNotification`s,
   so a single read can stage many frames (597 bytes at `{line,4}` ⇒ 150, on the line channel).
 
+### A driver's write path — the reply round trip and a refused command
+`PortRegistry::port_command` only **queues** the bytes and schedules one `Output` task; the write
+belongs to the round (`execute_port_tasks` → `run_scheduled_tasks` → `Port::run_task(Output)` →
+`Port::ready_output`, whose `Driver` default forwards to `output`). Whatever a driver pushes onto
+`ctx.input()` — a built-in driver's `port_command` reply, or a `driver_output` made from
+`start`/`control`/`timeout`/`output` — is harvested for **every** live port after the round and
+reported as **exactly one** `PortNotification::Data`, drained once per byte (no double report on a
+later round; a port in `{line, N}` mode reports through the separate `LineNotification` channel
+instead). A `ram_file_drv` port needs no descriptor, so the whole chain is testable with no
+child process and no poller wait.
+A driver that **refuses** a write (`Err(BeamError::BadArg)` from `output`/`ready_output`, e.g. an
+`inet` port whose socket is not open) is surfaced as that error: it short-circuits
+`Port::check_write_accounting` (`result?` runs first, so the driver's reported byte count is never
+inspected) and propagates out of `PortRegistry::execute_port_tasks` (`Err` — **not** a
+`PortTaskOutcome`). Because the command was queued before it was driven, a refused command's bytes
+stay in the output queue and the failing task is already popped, so a later round neither retries
+nor re-reports it. A loaded C driver cannot refuse at all (`output`/`outputv` are `void`,
+`prt->bytes_out += size`), so this shape is Rust-side: the runtime must read the error as "the
+command was refused" and render the oracle's `badarg`.
+
 ## Known Issues (durable gotchas — not fixed by changing this file)
 - **A `PortNotification::Closed` names a number that is retired *with the report*.** `PortRegistry::close`
   queues the id in `self.closed` and keeps it **allocated** in `ids`; the reporting round
