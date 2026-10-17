@@ -22,7 +22,9 @@
 //! **E0 route** (`no_spawn_compiler_process`), the **default, scheduled-process** shape
 //! (the `erl -noshell -s compile …` / `erlc` shape), a **real stdlib module**'s object code,
 //! a **dependent pair** compiled and linked in one run, a module whose documentation lives in
-//! a **sibling file**, and the **code-path / load-state** shapes the route stands on.
+//! a **sibling file**, the **code-path / load-state** shapes the route stands on, and a
+//! **large real module compiled through the expression route**
+//! ([`timer_case`] — `lib/stdlib/src/timer.erl`, 1017 source lines).
 //!
 //! `../../../CONTEXT.md` (its "A.9 — what an in-process compile actually needs" section) is
 //! the design source: OTP's `compile:file/2` path reaches only `kernel` + `stdlib` (`epp` — an
@@ -32,8 +34,9 @@
 //! `compile:file/2`'s compiler process, and the caller parks in the receive that waits for it.
 //!
 //! This group is the **evidence scaffold** for that route: six module-run cases whose goldens
-//! are the oracle's own integer lines, so each pins a property of the *produced object code*
-//! rather than a mere "it returned".
+//! are the oracle's own integer lines, plus one expression case whose golden is the source-derived
+//! **export table** of the object code it produced, so each pins a property of the *produced
+//! object code* rather than a mere "it returned".
 //!
 //! # The cases
 //!
@@ -79,6 +82,14 @@
 //!   chunk carries **exactly that text** as the module doc. The content check is load-bearing:
 //!   an *unreadable* doc file only **warns** and yields an empty module doc (so a bare
 //!   `{ok, Mod}` match would happily pass on a runtime that never served the read).
+//! * [`timer_case`] — the **large real module** case, and the only **expression** case of the
+//!   group: it compiles the repository's own `lib/stdlib/src/timer.erl` (1017 source lines) with
+//!   `[binary, no_spawn_compiler_process, deterministic]` — the source is addressed
+//!   **repo-relatively**, because the harness spawns both runtimes with the repository root as
+//!   the working directory — and pins the produced object image's **export table**. The route is
+//!   the expression one on cost (see [`SELFHOST_TIMER_EXPR`]): the same compile driven through
+//!   the module-run `run` entry point costs ≈ 43 s on the Rust runtime against ≈ 2.3 s through
+//!   `-eval`.
 //!
 //! In every case the compile's own failure is deliberately **not** caught: a runtime that
 //! cannot host the route must raise its typed capability gap (the CLI then exits `3`), never a
@@ -92,7 +103,11 @@
 //! on a developer host (OTP 29) — so a pinned hash would be corpus drift, i.e. the oracle
 //! would stop reproducing its own golden. Every observable here is instead a property that
 //! holds on **any** host and release: an equality between two artifacts the same host
-//! produced (`.beam` `Code` chunks), or a shape classified into an integer.
+//! produced (`.beam` `Code` chunks), a shape classified into an integer, or — for
+//! [`timer_case`], which has no `erlc` reference to compare against at an acceptable cost — a
+//! **source-derived projection of the produced object code** (its export table, which
+//! `-export` attributes plus the compiler's `module_info/0,1` determine), read back out of the
+//! produced `.beam` with `beam_lib:chunks(…, [exports])`.
 //!
 //! The stronger, *cross-runtime* claim is still made — by the harness, not by a hash: the
 //! oracle side of [`stdlib_case`] compares its own in-process artifact against a
@@ -104,17 +119,18 @@
 //!
 //! # Status
 //!
-//! All six cases **agree** on the Rust runtime: the runtime hosts the E0 route, the
+//! All seven cases **agree** on the Rust runtime: the runtime hosts the E0 route, the
 //! scheduled shape, an in-process compile of a real stdlib module, the dependent pair (with
 //! the `code:add_patha/1` + `code:load_file/1` link round trip), a module whose documentation
-//! the compiler reads from a sibling file, and the code-path / load-state shapes. Three
+//! the compiler reads from a sibling file, the code-path / load-state shapes, and the
+//! in-process compile of `lib/stdlib/src/timer.erl` (1017 lines). Three
 //! contracts are in play and exactly two are claimed:
 //! [`Contract::BeamAsm`] (a real `.beam` executes and object code is produced) and
 //! [`Contract::Build`] (the build/bootstrapping route itself). [`Contract::OtpApps`] is
 //! **not** claimed — the routes' whole point is that they reach only `kernel` + `stdlib`, so
 //! nothing about them depends on the wider application surface.
 
-use super::{Case, CaseKind, Contract, Golden, ModuleRun};
+use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
 /// The embedded module of the E0 route: `no_spawn_compiler_process`, one integer result.
 ///
@@ -1136,7 +1152,92 @@ fn docfile_case() -> Case {
     }
 }
 
-/// The A.9 self-hosted-build group: the six in-process compile / link shapes.
+/// The **large real module** case: an in-process `compile:file/2` of the repository's own
+/// `lib/stdlib/src/timer.erl` (1017 source lines), projected onto the **export table** of the
+/// object image it produced.
+///
+/// Shape rules, all load-bearing:
+///
+/// * the source is addressed **repo-relatively** (`lib/stdlib/src/timer.erl`): the harness
+///   spawns both runtimes with the repository root as their working directory, so the same
+///   expression compiles the same tree-relative file on both sides;
+/// * `[binary, no_spawn_compiler_process, deterministic]` keeps the compile in the calling
+///   process and returns the object image *without* writing a file — the case needs no outdir,
+///   so it can be an expression case (both runtimes get identical argv) and no temp path can
+///   leak into the observable;
+/// * `deterministic` also makes the image host-independent, which the third clause pins: the
+///   produced `.beam` must carry **no** occurrence of the source path;
+/// * the compile's own failure is **not** caught, so a runtime that cannot host the route
+///   raises its typed capability gap (the CLI then exits `3`) instead of answering a
+///   plausible-looking value.
+///
+/// # Why this case is the group's only expression case
+///
+/// The strongest observable the group has — byte-identical object code against the **system
+/// compiler's** artifact for the identical source ([`stdlib_case`]) — needs the case
+/// directory's `erlc` output as its reference, which only the module-run argv shape provides.
+/// That shape is out of reach here on cost: the very same in-process compile driven through
+/// the runtime's `run` entry point (the module-run argv) costs **≈ 43 s** on the Rust runtime
+/// against **≈ 2.3 s** through `-eval` (measured at the commit that landed this case; the
+/// `ordsets` sibling shows the same penalty on a smaller source — 7.6 s versus 0.8 s), which a
+/// gate that boots both runtimes for every CLI case cannot carry. Landing the case on the
+/// `-eval` route keeps it at ≈ 2.3 s per Rust-side run.
+///
+/// # Why the observable is the export table, never a hash of the artifact
+///
+/// A raw `erlang:md5/1` of the produced image — and equally `beam_lib:md5/1`, which covers the
+/// `AtU8`/`Code`/`StrT`/`ImpT`/`ExpT`/`FunT`/`LitT`/`Meta` chunks, i.e. the object code itself
+/// — is a **compiler-release** artifact, so pinning either as a golden would be corpus drift
+/// (see the module docs). The **export table** is a projection of the produced object code onto
+/// something the *source* determines: the module's `-export` attributes plus the compiler's
+/// own `module_info/0,1`, so the oracle reproduces it on any OTP release. It is still read back
+/// out of the **produced** `.beam` (`beam_lib:chunks(Bin, [exports])`), so it is a property of
+/// the compiled image rather than of the source text.
+///
+/// The remaining clauses pin what every sibling route pins about a `deterministic` artifact —
+/// that `compile:file/2` returned the module's object image, that `beam_lib:md5/1` of it is
+/// the documented 16-byte value, and that the image carries no source path — so a runtime that
+/// merely returned a truncated or host-dependent binary cannot answer the golden.
+const SELFHOST_TIMER_EXPR: &str = r#"begin {ok, timer, Bin} = compile:file("lib/stdlib/src/timer.erl", [binary, no_spawn_compiler_process, deterministic]), {ok, {timer, [{exports, Exports}]}} = beam_lib:chunks(Bin, [exports]), {ok, {timer, Md5}} = beam_lib:md5(Bin), true = byte_size(Md5) =:= 16, nomatch = binary:match(Bin, <<"lib/stdlib/src">>), lists:sort(Exports) end"#;
+
+/// The large-real-module case: `lib/stdlib/src/timer.erl` compiled in-process, its produced
+/// object image's export table pinned.
+///
+/// The golden is the **oracle's own stdout line** (a `Probe::Value` rendering of the sorted
+/// export list), so it is reproduced by any OTP release — the value is what the *source*
+/// declares, not what one compiler release emits (see [`SELFHOST_TIMER_EXPR`]).
+fn timer_case() -> Case {
+    Case {
+        id: "selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator",
+        description: "the A.9 large-real-module shape: compile lib/stdlib/src/timer.erl (1017 \
+                      source lines) in-process (binary, no_spawn_compiler_process, \
+                      deterministic) and report the produced object image's export table, after \
+                      pinning that compile:file/2 returned the image, that beam_lib:md5/1 of it \
+                      is the documented 16-byte value, and that the image carries no source path",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_TIMER_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some(
+                "ok [{apply_after,2},{apply_after,3},{apply_after,4},{apply_interval,2},\
+                 {apply_interval,3},{apply_interval,4},{apply_repeatedly,2},\
+                 {apply_repeatedly,3},{apply_repeatedly,4},{cancel,1},{code_change,3},\
+                 {exit_after,2},{exit_after,3},{handle_call,3},{handle_cast,2},{handle_info,2},\
+                 {hms,3},{hours,1},{init,1},{kill_after,1},{kill_after,2},{minutes,1},\
+                 {module_info,0},{module_info,1},{now_diff,2},{seconds,1},{send_after,2},\
+                 {send_after,3},{send_interval,2},{send_interval,3},{sleep,1},{start,0},\
+                 {start_link,0},{tc,1},{tc,2},{tc,3},{tc,4},{terminate,2}]",
+            ),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The A.9 self-hosted-build group: the six in-process compile / link shapes plus the large-real
+/// module expression case.
 pub(crate) fn group() -> Vec<Case> {
     vec![
         case(),
@@ -1145,6 +1246,7 @@ pub(crate) fn group() -> Vec<Case> {
         pair_case(),
         path_case(),
         docfile_case(),
+        timer_case(),
     ]
 }
 
@@ -1161,13 +1263,13 @@ mod tests {
     }
 
     #[test]
-    fn the_group_is_the_six_self_hosted_build_shapes() {
+    fn the_group_is_the_seven_self_hosted_build_shapes() {
         let cases = group();
         assert_eq!(
             cases.len(),
-            6,
-            "the group is the two compile:file/2 routes plus the stdlib, pair, code-path and \
-             file-borne-documentation cases"
+            7,
+            "the group is the two compile:file/2 routes plus the stdlib, pair, code-path, \
+             file-borne-documentation and large-real-module cases"
         );
         assert_eq!(
             cases[0].id,
@@ -1187,9 +1289,18 @@ mod tests {
             cases[5].id,
             "selfhost/compile_file_of_a_module_whose_moduledoc_lives_in_a_file"
         );
+        assert_eq!(
+            cases[6].id,
+            "selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator"
+        );
         for case in &cases {
             assert_eq!(case.contracts, &[Contract::BeamAsm, Contract::Build]);
             assert_eq!(case.golden.exit_code, 0);
+        }
+        // The six route cases are module-run cases with integer goldens; the large-real-module
+        // case is the group's one expression case (see its own doc comment for the cost reason).
+        let (routes, timer) = cases.split_at(6);
+        for case in routes {
             assert!(
                 case.golden
                     .stdout
@@ -1203,15 +1314,30 @@ mod tests {
             assert!(run.nif.is_none(), "the routes need no C/NIF fixture");
         }
         // Each case runs its **own** module, so the temp dirs never collide.
-        assert_eq!(run_of(&cases[0]).module, "selfhost");
-        assert_eq!(run_of(&cases[1]).module, "selfhost_sched");
-        assert_eq!(run_of(&cases[2]).module, "selfhost_stdlib");
-        assert_eq!(run_of(&cases[3]).module, "selfhost_pair");
-        assert_eq!(run_of(&cases[4]).module, "selfhost_path");
-        assert_eq!(run_of(&cases[5]).module, "selfhost_docfile");
-        for case in &cases {
+        assert_eq!(run_of(&routes[0]).module, "selfhost");
+        assert_eq!(run_of(&routes[1]).module, "selfhost_sched");
+        assert_eq!(run_of(&routes[2]).module, "selfhost_stdlib");
+        assert_eq!(run_of(&routes[3]).module, "selfhost_pair");
+        assert_eq!(run_of(&routes[4]).module, "selfhost_path");
+        assert_eq!(run_of(&routes[5]).module, "selfhost_docfile");
+        for case in routes {
             assert_eq!(case.golden.stdout, Some("1"));
         }
+        let CaseKind::Eval {
+            expr,
+            extra_argv,
+            probe,
+        } = &timer[0].kind
+        else {
+            panic!("case {} must stay an expression case", timer[0].id);
+        };
+        assert_eq!(*extra_argv, &[] as &[&str], "no CLI flag is pinned");
+        assert_eq!(*probe, Probe::Value, "the golden is the `~w` export list");
+        assert!(
+            expr.starts_with("begin {ok, timer, Bin} = compile:file(\"lib/stdlib/src/timer.erl\""),
+            "the subject is the repo-relative stdlib source, in-process and file-free"
+        );
+        assert!(!expr.contains("catch"), "the raise must not be caught");
         // The staged routes are write-first: the runtime's file-service write precedes the
         // compile it feeds (the stdlib case stages nothing — the harness wrote its source).
         for (index, write_needle, compile_needle) in [
@@ -1221,18 +1347,18 @@ mod tests {
             (3, "file:write_file(B, b_source())", "compile:file(B,"),
             (5, "file:write_file(DocFile, Doc)", "compile:file(Source"),
         ] {
-            let source = run_of(&cases[index]).source;
+            let source = run_of(&routes[index]).source;
             let write = source.find(write_needle).expect("staging write");
             let compile = source.find(compile_needle).expect("compile");
             assert!(
                 write < compile,
                 "case {}: the route is staged write-first",
-                cases[index].id
+                routes[index].id
             );
         }
         // The compile's own failure must escape in every case: the runtime's typed capability
         // gap (CLI exit 3) is the only honest signal for a runtime that cannot host the route.
-        for case in &cases {
+        for case in routes {
             assert!(
                 !run_of(case).source.contains("catch"),
                 "case {}: the raise must not be caught",
@@ -1504,5 +1630,65 @@ mod tests {
             "the golden must not embed a compiler-version-dependent hash"
         );
         assert!(!source.contains("catch"), "the raise must not be caught");
+    }
+
+    /// The large-real-module case: the subject is the repository's own
+    /// `lib/stdlib/src/timer.erl` addressed **repo-relatively**, the route is the file-free
+    /// `binary` form of the E0 compile, and the observable is the produced image's **export
+    /// table** — never a compiler-release hash.
+    #[test]
+    fn the_timer_case_compiles_the_repo_stdlib_source_and_pins_the_export_table() {
+        let cases = group();
+        let case = cases.last().expect("the group is never empty");
+        let CaseKind::Eval {
+            expr,
+            extra_argv,
+            probe,
+        } = &case.kind
+        else {
+            panic!("case {} is not an expression case", case.id);
+        };
+        for needle in [
+            "compile:file(\"lib/stdlib/src/timer.erl\"",
+            "[binary, no_spawn_compiler_process, deterministic]",
+            "beam_lib:chunks(Bin, [exports])",
+            "beam_lib:md5(Bin)",
+            "binary:match(Bin, <<\"lib/stdlib/src\">>)",
+            "lists:sort(Exports)",
+        ] {
+            assert!(expr.contains(needle), "the route needs {needle:?}");
+        }
+        assert_eq!(*extra_argv, &[] as &[&str], "no CLI flag is pinned");
+        // The compile must be the file-free `binary` form: an expression case hands both
+        // runtimes identical argv, so there is no case directory to write an outdir into — and
+        // no temp path can reach the observable either.
+        assert!(
+            !expr.contains("{outdir") && !expr.contains("code:which"),
+            "the expression route writes no artifact and owns no case directory"
+        );
+        // The observable is the source-derived export table, never a hash of the artifact: both
+        // `erlang:md5/1` and the *value* of `beam_lib:md5/1` are compiler-release artifacts (see
+        // the module docs), so only the documented 16-byte *shape* of the latter is pinned.
+        assert!(
+            !expr.contains("erlang:md5") && !expr.contains("phash2"),
+            "the golden must not embed a compiler-version-dependent hash"
+        );
+        assert!(
+            expr.contains("byte_size(Md5) =:= 16") && !expr.contains("Md5 =:="),
+            "the md5 is pinned by its shape, never by its value"
+        );
+        assert_eq!(*probe, Probe::Value, "the golden is the `~w` export list");
+        assert!(!expr.contains("catch"), "the raise must not be caught");
+        // The golden is the oracle's own `~w` line: no path, no pid/port/ref, no clock value.
+        let golden = case.golden.stdout.expect("the case pins its stdout");
+        assert!(
+            golden.starts_with("ok [{apply_after,2},"),
+            "the golden is the `~w` of the sorted export list"
+        );
+        assert!(
+            golden.ends_with("{terminate,2}]"),
+            "the export list is complete"
+        );
+        assert!(!golden.contains('/'), "the golden must not carry a path");
     }
 }
