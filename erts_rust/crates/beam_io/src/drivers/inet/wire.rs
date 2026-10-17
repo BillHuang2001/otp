@@ -270,13 +270,21 @@ pub(super) fn name_reply(fd: Option<RawFd>) -> Result<Vec<u8>> {
         return Ok(ctl_xerror(&errno_name(libc::EBADF)));
     };
     match sys::local_address(fd) {
-        Ok(address) => {
-            let mut reply = ctl_ok();
-            reply.extend_from_slice(&pack_address(address.port, address.addr));
-            Ok(reply)
-        }
+        Ok(address) => Ok(packed_addr_reply(address)),
         Err(err) => Ok(ctl_error(err)),
     }
+}
+
+/// The success reply carrying one packed address — `[1, INET_AF_INET, port_hi, port_lo, a, b, c, d]`.
+///
+/// The `INET_REQ_NAME`/`INET_REQ_PEER`/`INET_REQ_GETLADDRS`/`INET_REQ_GETPADDRS` arms all answer
+/// through it (`ctl_reply(INET_REP_OK, tbuf, sz, …)` with `tbuf` from `inet_get_address`,
+/// `inet_drv.c:11296`, `:11361`), and so does the fake address a `INET_REQ_SETNAME`/`SETPEER`
+/// installed.
+pub(super) fn packed_addr_reply(address: InetAddr) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&pack_address(address.port, address.addr));
+    reply
 }
 
 /// The `INET_REQ_PEER` reply: the peer's endpoint, as a packed address
@@ -296,11 +304,7 @@ pub(super) fn peer_reply(fd: Option<RawFd>, connected: bool) -> Result<Vec<u8>> 
         return Ok(ctl_xerror("enotconn"));
     };
     match sys::peer_address(fd) {
-        Ok(address) => {
-            let mut reply = ctl_ok();
-            reply.extend_from_slice(&pack_address(address.port, address.addr));
-            Ok(reply)
-        }
+        Ok(address) => Ok(packed_addr_reply(address)),
         Err(err) => Ok(ctl_error(err)),
     }
 }// ---------------------------------------------------------------------------
@@ -378,4 +382,65 @@ pub(super) fn split_address(arg: &[u8]) -> Result<(InetAddr, &[u8])> {
     }
     let address = parse_address(&arg[..consumed])?;
     Ok((address, &arg[consumed..]))
+}
+
+/// What one `INET_REQ_SETNAME`/`INET_REQ_SETPEER` operand asks of the driver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum FakeAddress {
+    /// `len == 0`: the C clears the pointer and answers `[1]`
+    /// (`inet_drv.c:11307`/`:11392`).
+    Clear,
+    /// A well-formed address: store it and answer `[1]`.
+    Store(InetAddr),
+    /// The C's `ctl_xerror(name)` payload — `inet_set_faddress`'s own `str_einval`/
+    /// `str_eafnosupport`, or the `len < 2` guard before it (`:11310`/`:11395`).
+    Refuse(&'static str),
+}
+
+/// Decodes the operand of `INET_REQ_SETNAME`(19)/`INET_REQ_SETPEER`(20) — the C's
+/// `inet_set_faddress(desc->sfamily, &desc->name_addr, &buf, &len)` (`inet_drv.c:11397`,
+/// `:11313`).
+///
+/// `cached_family` is the descriptor's cached `sfamily` (`inet_drv.c:10925`) as a wire tag, with
+/// `0` for "no socket yet". It matters only for the [`INET_AF_ANY`]/[`INET_AF_LOOPBACK`] short
+/// form: `inet_set_faddress` switches on the **descriptor's** family there (`:4823`), so on a port
+/// that never opened a socket (`sfamily == -1`) that form is `str_einval` — measured `[0]einval`
+/// for `<<INET_AF_LOOPBACK,0,80>>` on a bare port, `[1]` after an `open`. The explicit
+/// [`INET_AF_INET`] form overrides the family with its own tag, so it is accepted on a bare port.
+///
+/// A tag this driver's IPv4-only scope (`open`/`bind`/`connect` refuse IPv6 the same way) does not
+/// serve is `eafnosupport` — which is also the C's answer for a tag no `case` of
+/// `inet_set_faddress` matches (`:4885`).
+pub(super) fn parse_fake_address(cached_family: u16, arg: &[u8]) -> FakeAddress {
+    let Some((&tag, rest)) = arg.split_first() else {
+        return FakeAddress::Clear;
+    };
+    match tag {
+        INET_AF_INET => {
+            let &[hi, lo, a, b, c, d] = rest else {
+                return FakeAddress::Refuse("einval");
+            };
+            FakeAddress::Store(InetAddr {
+                port: u16::from_be_bytes([hi, lo]),
+                addr: [a, b, c, d],
+            })
+        }
+        INET_AF_ANY | INET_AF_LOOPBACK => {
+            let &[hi, lo] = rest else {
+                return FakeAddress::Refuse("einval");
+            };
+            if cached_family != u16::from(INET_AF_INET) {
+                return FakeAddress::Refuse("einval");
+            }
+            FakeAddress::Store(InetAddr {
+                port: u16::from_be_bytes([hi, lo]),
+                addr: if tag == INET_AF_ANY {
+                    [0, 0, 0, 0]
+                } else {
+                    [127, 0, 0, 1]
+                },
+            })
+        }
+        _ => FakeAddress::Refuse("eafnosupport"),
+    }
 }

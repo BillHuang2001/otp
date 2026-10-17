@@ -68,7 +68,7 @@ pub(super) fn op(code: u32) -> String {
 }
 
 /// The packed `open` argument of the stream driver: `[AF_INET, SOCK_STREAM, default protocol]`.
-fn open_arg() -> [u8; 3] {
+pub(super) fn open_arg() -> [u8; 3] {
     [INET_AF_INET, INET_TYPE_STREAM, INET_PROTO_DEFAULT]
 }
 
@@ -131,6 +131,25 @@ impl Rig {
                 }
             })
             .collect()
+    }
+
+    /// Drains up to `len` bytes out of the port's **input queue** — what a driver pushed through
+    /// [`crate::DriverContext::input`], i.e. the bytes the runtime would deliver as
+    /// `{Port, {data, …}}`.
+    pub(super) fn take_input(&mut self, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        let port = self.registry.get_mut(self.id).expect("a live port");
+        let read = port.read_input(&mut buf);
+        buf.truncate(read);
+        buf
+    }
+
+    /// How many bytes currently sit in the port's input queue.
+    pub(super) fn input_len(&mut self) -> usize {
+        self.registry
+            .get(self.id)
+            .expect("a live port")
+            .input_len()
     }
 }
 
@@ -312,12 +331,12 @@ pub(super) fn oracle_replies(dump: &str) -> Vec<Vec<u8>> {
 }
 
 /// A **bare** (socket-less) `tcp_inet` port — the state the driver factory starts in.
-fn bare_port() -> Rig {
+pub(super) fn bare_port() -> Rig {
     Rig::new(Box::new(TcpInetDriver::new()))
 }
 
 /// An `open`ed `tcp_inet` port (a socket exists, nothing is bound).
-fn opened_port() -> Rig {
+pub(super) fn opened_port() -> Rig {
     let mut port = bare_port();
     assert_eq!(
         port.control(&op(1), &open_arg()),
@@ -328,7 +347,7 @@ fn opened_port() -> Rig {
 }
 
 /// A listening `tcp_inet` port over an ephemeral loopback port; returns the port it bound.
-fn listening_port() -> (Rig, u16) {
+pub(super) fn listening_port() -> (Rig, u16) {
     let mut port = opened_port();
     let bound = port.control(&op(6), &loopback_arg(0));
     assert_eq!(bound[0], INET_REP_OK);
@@ -345,15 +364,15 @@ fn listening_port() -> (Rig, u16) {
 /// The driver adopts a duplicate of the accepted socket (`try_clone().into_raw_fd()`, so the
 /// driver owns a descriptor number the test knows and no `unsafe` is needed to make one); the far
 /// end is held for the test's lifetime so the connection stays up.
-struct Connection {
-    port: Rig,
+pub(super) struct Connection {
+    pub(super) port: Rig,
     /// The descriptor the port's driver owns — its `INET_REQ_GETFD` value.
-    fd: RawFd,
+    pub(super) fd: RawFd,
     /// The far end, held so the connection is not closed under the port.
     _peer: TcpStream,
 }
 
-fn connection() -> Connection {
+pub(super) fn connection() -> Connection {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
     let peer = TcpStream::connect(listener.local_addr().expect("an address"))
         .expect("the far end connects");
@@ -558,21 +577,21 @@ fn numeric_peer_is_enotconn_until_the_socket_is_connected() {
     assert_eq!(&reply[4..8], &[127, 0, 0, 1], "the loopback peer address");
 }
 
-/// `TCP_REQ_RECV`(42) carries the C's `Timeout(4), Length(4)` payload: an operand of any other
-/// length is the C's `ctl_error(EINVAL)`, and an eight-byte one reaches the synchronous read-now
-/// substitution.
+/// `TCP_REQ_RECV`(42) carries the C's `Timeout(4), Length(4)` payload: the **connection** guard
+/// comes first (so a wrong-length operand on a port with no peer is the C's `enotconn`), and only a
+/// connected socket reaches the `len != 8 ⇒ einval` check.
 ///
-/// Divergence from the C, recorded here rather than asserted away: the C checks the *connection*
-/// before the operand (`tcp_recv` answers `enotconn` for a wrong-length operand on a port with no
-/// peer — measured), while this floor validates the operand first, so the wrong-length case is
-/// `einval` in every state. On a connected socket the two agree.
+/// Divergence from the C, recorded here rather than asserted away: on a connected socket the C
+/// enqueues an asynchronous receive and answers `[1] ++ async_id_be16` (measured `[1,0,1]`), while
+/// this floor's `recv` is a synchronous read-now verb and answers the bare `[1]` (see the
+/// async-op-queue entry in the crate `CONTEXT.md`).
 #[test]
 fn numeric_tcp_recv_validates_the_eight_byte_operand() {
     let mut connected = connection();
     assert_eq!(
         connected.port.control(&op(42), &[]),
         ctl_xerror("einval"),
-        "a wrong-length operand is the C's EINVAL"
+        "a wrong-length operand on a connected socket is the C's EINVAL"
     );
     assert_eq!(
         connected.port.control(&op(42), &[0, 0, 0, 0, 0, 0, 0, 0]),
@@ -585,6 +604,11 @@ fn numeric_tcp_recv_validates_the_eight_byte_operand() {
         bare.control(&op(42), &[0, 0, 0, 0, 0, 0, 0, 0]),
         ctl_xerror("enotconn"),
         "nothing to receive from without a connection"
+    );
+    assert_eq!(
+        bare.control(&op(42), &[1, 2]),
+        ctl_xerror("enotconn"),
+        "the connection guard precedes the operand-length guard"
     );
 
     let (mut listening, _port) = listening_port();
@@ -647,13 +671,11 @@ fn numeric_connect_validates_the_six_byte_prefix() {
     );
 }
 
-/// `INET_REQ_CLOSE`(2) releases the socket: the driver is back to the closed state and every
-/// descriptor-dependent reply says so.
-///
-/// Divergence from the C, measured and left as-is: after `INET_REQ_CLOSE` the oracle still
-/// answers `INET_REQ_GETTYPE` with the cached socket type (`[1,0,0,0,1,0,0,0,1]`) because its
-/// guard is the *cached* `stype`, not the descriptor; this floor releases the descriptor, so
-/// `GETTYPE` answers `einval` afterwards — the same answer it gives for a never-opened port.
+/// `INET_REQ_CLOSE`(2) releases the socket: the driver is back to the closed state, the descriptor
+/// is gone, and every descriptor-dependent reply says so — except `INET_REQ_GETTYPE`, which reports
+/// the **cached** `{Family, Type}` pair the port was opened with, because the C's arm has no
+/// `IS_OPEN` guard and reads `desc->sfamily`/`desc->stype`, neither of which a close clears
+/// (`inet_drv.c:11165`-`:11203`, `:10925`).
 #[test]
 fn numeric_close_returns_the_port_to_the_closed_state() {
     let (mut port, _bound) = listening_port();
@@ -664,7 +686,11 @@ fn numeric_close_returns_the_port_to_the_closed_state() {
         "the state bits are back to INET_STATE_CLOSED"
     );
     assert_eq!(port.control(&op(14), &[]), ctl_xerror("einval"), "no fd");
-    assert_eq!(port.control(&op(15), &[]), ctl_xerror("einval"), "no type");
+    assert_eq!(
+        port.control(&op(15), &[]),
+        vec![INET_REP_OK, 0, 0, 0, INET_AF_INET, 0, 0, 0, INET_TYPE_STREAM],
+        "the cached AF_INET + SOCK_STREAM pair outlives the descriptor"
+    );
     assert_eq!(
         port.control(&op(5), &[]),
         ctl_xerror("ebadf"),
@@ -713,24 +739,75 @@ fn a_wrapped_or_unassigned_numeric_command_is_exbadport() {
     }
 }
 
-/// The opcodes the C's switches **do** serve but this floor does not implement are a typed gap:
-/// a raise whose reason names the request and the switch that owns it, never a fabricated reply.
+/// The opcodes the C's switches **do** serve but this floor does not implement are a typed gap: a
+/// raise whose reason names the request and the switch that owns it, never a fabricated reply.
+///
+/// Each row below is the *one* state in which the C succeeds, i.e. the refusal-only arms
+/// (`gethostname`, `fdopen`, the name-service lookups, the `getifaddrs(3)` family, `ignorefd`,
+/// `tcp_sendfile`) have already answered their exact C refusal for every other operand/state and
+/// only their success path is missing. `subscribe` is a gap in **every** state.
 #[test]
 fn an_unserved_numeric_opcode_is_a_typed_gap() {
+    // `subscribe`(24) registers a driver-side subscriber for the empty-output-queue notification —
+    // a driver→owner message channel this floor has none of, so no operand or state helps.
+    let mut bare = bare_port();
+    let err = bare
+        .try_control(&op(24), &[1])
+        .expect_err("SUBSCRIBE is a typed gap in every state");
+    assert_eq!(reason_of(err), not_served_reason("subscribe", "inet_ctl"));
+
+    // The well-formed (`len == 6`) `fdopen` on a bare port.
     let mut port = opened_port();
-    for (code, name, switch) in [
-        (12u32, "gethostname", "inet_ctl"),
-        (13, "fdopen", "inet_ctl"),
-        (43, "tcp_unrecv", "tcp_inet_ctl"),
-        (45, "tcp_sendfile", "tcp_inet_ctl"),
+    let err = port
+        .try_control(&op(13), &[INET_AF_INET, INET_TYPE_STREAM, 0, 0, 0, 0])
+        .expect_err("FDOPEN adopts a caller's descriptor, which the Driver seam cannot express");
+    assert_eq!(reason_of(err), not_served_reason("fdopen", "inet_ctl"));
+
+    // The name-service lookups with a well-formed operand: `getservbyname(3)`/`getservbyport(3)`
+    // resolve against the system services database, which this floor does not consult.
+    let err = port
+        .try_control(&op(17), &[0, 0])
+        .expect_err("GETSERVBYNAME needs the resolver");
+    assert_eq!(reason_of(err), not_served_reason("getservbyname", "inet_ctl"));
+    let err = port
+        .try_control(&op(18), &[0, 0, 0])
+        .expect_err("GETSERVBYPORT needs the resolver");
+    assert_eq!(reason_of(err), not_served_reason("getservbyport", "inet_ctl"));
+
+    // The `getifaddrs(3)`-backed family on a **live** socket: only the `!IS_OPEN` refusal is exact,
+    // so the open state is where the interface walk would be needed.
+    for (code, name) in [
+        (21u32, "getiflist"),
+        (22, "ifget"),
+        (23, "ifset"),
+        (25, "getifaddrs"),
     ] {
         let err = port
             .try_control(&op(code), &[])
-            .expect_err("an unserved opcode is a typed gap");
-        assert_eq!(reason_of(err), not_served_reason(name, switch), "code {code}");
+            .expect_err("an interface request needs a getifaddrs(3) walk");
+        assert_eq!(reason_of(err), not_served_reason(name, "inet_ctl"), "code {code}");
     }
-    // `INET_REQ_GETHOSTNAME` really does have a payload for the oracle (`[1] ++ hostname`), which
-    // is exactly why answering a fabricated empty name here would be worse than the typed gap.
+
+    // `ignorefd(28)` on a **connected** stream port: its reply means "suppress read *and* write
+    // readiness", which a frozen `Driver` registration cannot express.
+    let mut connected = connection();
+    for suppress in [[1u8], [0u8]] {
+        let err = connected
+            .port
+            .try_control(&op(28), &suppress)
+            .expect_err("IGNOREFD would have to silence this driver's poller registration");
+        assert_eq!(reason_of(err), not_served_reason("ignorefd", "inet_ctl"));
+    }
+
+    // `tcp_sendfile(45)` with its full 20-byte operand on a connected port: the length and the
+    // connection are both checked first, so this is the one state left.
+    let mut sendfile = vec![0u8; 20];
+    sendfile[0..4].copy_from_slice(&0i32.to_be_bytes());
+    let err = connected
+        .port
+        .try_control(&op(45), &sendfile)
+        .expect_err("SENDFILE has no sendfile(2) path here");
+    assert_eq!(reason_of(err), not_served_reason("tcp_sendfile", "tcp_inet_ctl"));
 }
 
 // -----------------------------------------------------------------------
@@ -826,12 +903,17 @@ fn the_named_and_the_numeric_route_reply_identically() {
 // The `erl` oracle matrix (skips loudly when `erl` is absent)
 // -----------------------------------------------------------------------
 
-/// The `(opcode, operand)` list the oracle matrix drives: the bare-port queries, then the
-/// socket lifecycle, then the shared `inet_ctl` replies — every opcode a `tcp_inet` port serves
-/// that has a deterministic reply.
+/// The `(opcode, operand)` list the oracle matrix drives, in one port's lifetime order: the bare
+/// (socket-less) queries and refusals, then `open` (plus the fake-address pair and its `NAME`
+/// read-back), then the socket lifecycle with the state-dependent operands, then the same
+/// descriptor queries after `close`.
+///
+/// Every row is deterministic on this host, which is why the whole list is one oracle run: the
+/// rows that carry an ephemeral port or a descriptor number say so through their [`Rule`], and
+/// everything else must agree byte for byte.
 fn oracle_matrix() -> Vec<Call> {
     vec![
-        // The bare (socket-less) port.
+        // The bare (socket-less) port: the shared replies that need no descriptor.
         Call::req(15, vec![], Rule::Exact),               // GETTYPE  -> einval
         Call::req(14, vec![], Rule::Exact),               // GETFD    -> einval
         Call::req(16, vec![], Rule::Exact),               // GETSTATUS-> 0
@@ -840,9 +922,66 @@ fn oracle_matrix() -> Vec<Call> {
         Call::req(60, vec![], Rule::Exact),               // the datagram driver's case
         Call::raw(1, open_arg().to_vec(), Rule::Exact),   // a wrapped opcode
         Call::raw(99, vec![], Rule::Exact),               // a retired opcode
+        // The bare port's `tcp_inet_ctl` refusals: the state guard, then the operand length.
+        Call::req(27, vec![], Rule::Exact),                // LISTEN len0     -> exbadport
+        Call::req(27, vec![0, 5], Rule::Exact),            // LISTEN len2     -> exbadport
+        Call::req(3, vec![1, 2], Rule::Exact),             // CONNECT len2    -> exbadport
+        Call::req(44, vec![], Rule::Exact),                // TCP_SHUTDOWN    -> enotconn
+        Call::req(43, vec![1, 2], Rule::Exact),            // TCP_UNRECV      -> enotconn
+        Call::req(42, vec![1, 2], Rule::Exact),            // TCP_RECV len2   -> enotconn
+        Call::req(42, vec![0u8; 8], Rule::Exact),          // TCP_RECV len8   -> enotconn
+        Call::req(45, vec![], Rule::Exact),                // SENDFILE len0   -> einval
+        Call::req(45, vec![0u8; 20], Rule::Exact),         // SENDFILE len20  -> enotconn
+        Call::req(26, vec![], Rule::Exact),                // ACCEPT len0     -> einval
+        Call::req(26, vec![0u8; 4], Rule::Exact),          // ACCEPT len4     -> einval
+        Call::req(1, vec![1, 1], Rule::Exact),             // OPEN len2       -> einval
+        // The `inet_ctl` arms: `len` guards, then the `IS_OPEN` guards.
+        Call::req(6, vec![], Rule::Exact),                            // BIND len0
+        Call::req(6, vec![1, 0, 80, 127, 0, 0, 1], Rule::Exact),       // BIND len7
+        Call::req(29, vec![], Rule::Exact),                           // GETLADDRS len0
+        Call::req(29, vec![0u8; 4], Rule::Exact),                     // GETLADDRS len4
+        Call::req(30, vec![], Rule::Exact),                           // GETPADDRS len0
+        Call::req(30, vec![0u8; 4], Rule::Exact),                     // GETPADDRS len4
+        Call::req(13, vec![], Rule::Exact),                           // FDOPEN len0
+        Call::req(13, vec![9, INET_TYPE_STREAM, 0, 0, 0, 0], Rule::Exact), // FDOPEN family 9
+        Call::req(13, vec![INET_AF_INET, 9, 0, 0, 0, 0], Rule::Exact),     // FDOPEN type 9
+        Call::req(21, vec![], Rule::Exact),                      // GETIFLIST  -> exbadport
+        Call::req(25, vec![], Rule::Exact),                      // GETIFADDRS -> exbadport
+        Call::req(22, vec![1], Rule::Exact),                     // IFGET      -> exbadport
+        Call::req(23, vec![], Rule::Exact),                      // IFSET      -> exbadport
+        Call::req(28, vec![1], Rule::Exact),                     // IGNOREFD   -> enotconn
+        Call::req(17, vec![], Rule::Exact),                      // GETSERVBYNAME len0
+        Call::req(18, vec![], Rule::Exact),                      // GETSERVBYPORT len0
+        Call::req(12, vec![], Rule::Exact),                      // GETHOSTNAME -> [1] ++ name
+        Call::req(12, vec![1], Rule::Exact),                     // GETHOSTNAME len1
+        Call::req(19, vec![], Rule::Exact),                      // SETNAME len0 -> [1]
+        Call::req(19, vec![1], Rule::Exact),                     // SETNAME len1 -> einval
+        Call::req(20, vec![], Rule::Exact),                      // SETPEER len0 -> [1]
+        Call::req(20, vec![1], Rule::Exact),                     // SETPEER len1 -> einval
         // The socket lifecycle.
         Call::req(1, open_arg().to_vec(), Rule::Exact),   // OPEN
+        Call::req(15, vec![], Rule::Exact),               // GETTYPE  -> the cached stream pair
+        Call::req(5, vec![], Rule::Exact),                // NAME     -> the unbound address
+        Call::req(29, vec![0u8; 4], Rule::Exact),         // GETLADDRS is the NAME reply
+        Call::req(30, vec![0u8; 4], Rule::Exact),         // GETPADDRS-> enotconn
+        Call::req(42, vec![1, 2], Rule::Exact),           // TCP_RECV len2 -> enotconn
+        Call::req(3, vec![1, 2], Rule::Exact),            // CONNECT len2  -> einval
+        Call::req(28, vec![1], Rule::Exact),              // IGNOREFD      -> enotconn
+        // The fake address: stored without a socket, reported by `NAME`, cleared again; `PEER`
+        // keeps its connection guard in front of it.
+        Call::req(19, vec![INET_AF_INET, 0, 80, 1, 2, 3, 4], Rule::Exact), // SETNAME -> [1]
+        Call::req(5, vec![], Rule::Exact),                // NAME -> the fake address
+        Call::req(20, vec![INET_AF_INET, 0, 81, 127, 0, 0, 1], Rule::Exact), // SETPEER -> [1]
+        Call::req(4, vec![], Rule::Exact),                // PEER -> enotconn (the guard wins)
+        Call::req(19, vec![], Rule::Exact),               // SETNAME clears
+        Call::req(5, vec![], Rule::Exact),                // NAME -> the socket again
+        Call::req(20, vec![], Rule::Exact),               // SETPEER clears
+        Call::req(19, vec![INET_AF_LOOPBACK, 0, 80], Rule::Exact), // the short form now works
+        Call::req(5, vec![], Rule::Exact),                // NAME -> 127.0.0.1:80
+        Call::req(19, vec![], Rule::Exact),               // SETNAME clears again
+        // The bound listener.
         Call::req(6, loopback_arg(0), Rule::BoundPort),   // BIND (ephemeral port)
+        Call::req(27, vec![], Rule::Exact),               // LISTEN len0 -> einval
         Call::req(27, vec![0, 5], Rule::Exact),           // LISTEN
         Call::req(16, vec![], Rule::Exact),               // GETSTATUS-> 9
         Call::req(15, vec![], Rule::Exact),               // GETTYPE  -> stream
@@ -854,6 +993,14 @@ fn oracle_matrix() -> Vec<Call> {
         Call::req(11, vec![], Rule::Exact),               // GETSTAT  -> [1]
         Call::req(42, vec![0u8; 8], Rule::Exact),         // TCP_REQ_RECV on a listener
         Call::req(26, vec![], Rule::Exact),               // ACCEPT (wrong-length operand)
+        // After `close`: the descriptor is gone, the cached type pair is not.
+        Call::req(2, vec![], Rule::Exact),                // CLOSE
+        Call::req(15, vec![], Rule::Exact),               // GETTYPE  -> the cached pair
+        Call::req(14, vec![], Rule::Exact),               // GETFD    -> einval
+        Call::req(5, vec![], Rule::Exact),                // NAME     -> ebadf
+        Call::req(16, vec![], Rule::Exact),               // GETSTATUS-> 0
+        Call::req(42, vec![1, 2], Rule::Exact),           // TCP_RECV len2 -> enotconn
+        Call::req(29, vec![0u8; 4], Rule::Exact),         // GETLADDRS -> exbadport
     ]
 }
 

@@ -233,7 +233,10 @@ pub use self::wire::{
     INET_PROTO_UDP, INET_REP_ERROR, INET_REP_OK, INET_TYPE_DGRAM, INET_TYPE_STREAM, TCP_SHUT_RD,
     TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
-use self::wire::{ctl_error, ctl_ok, ctl_xerror, errno_name, parse_address};
+use self::wire::{
+    ctl_error, ctl_ok, ctl_xerror, errno_name, parse_address, parse_fake_address, FakeAddress,
+    InetAddr,
+};
 
 // The built-in datagram driver (the `udp_inet` entry point) is a sibling module that reuses this
 // module's wire vocabulary, option store and `sys` wrappers; its public surface is re-exported
@@ -445,6 +448,16 @@ pub struct TcpInetDriver {
     /// The C descriptor's cached socket type (`inet.stype`), as the wire's
     /// [`INET_TYPE_STREAM`]/[`INET_TYPE_DGRAM`] tag; `0` = unset. Same lifetime as [`Self::family`].
     stype: u16,
+    /// The **fake** local endpoint an `INET_REQ_SETNAME` installed, reported by a later
+    /// `INET_REQ_NAME` in place of `getsockname(2)` (`desc->name_ptr`, `inet_drv.c:1269`,
+    /// `:11370`-`:11377`). `None` means "ask the kernel", which is also what the clearing form
+    /// (`len == 0`) restores. Like the C's, it is **not** cleared by a close.
+    name_addr: Option<InetAddr>,
+    /// The fake peer endpoint an `INET_REQ_SETPEER` installed, reported by a later
+    /// `INET_REQ_PEER` in place of `getpeername(2)` (`desc->peer_ptr`, `inet_drv.c:1268`,
+    /// `:11284`-`:11290`) — **after** that request's `INET_F_ACTIVE` guard, so a fake peer on an
+    /// unconnected port is still `enotconn`.
+    peer_addr: Option<InetAddr>,
 }
 
 impl TcpInetDriver {
@@ -468,6 +481,8 @@ impl TcpInetDriver {
             stream: false,
             family: 0,
             stype: 0,
+            name_addr: None,
+            peer_addr: None,
         }
     }
 
@@ -507,6 +522,8 @@ impl TcpInetDriver {
             stream: true,
             family: u16::from(INET_AF_INET),
             stype: sys::socket_type(fd)?,
+            name_addr: None,
+            peer_addr: None,
         })
     }
 
@@ -1480,18 +1497,22 @@ impl TcpInetDriver {
                 Err(op.not_served())
             }
             // `INET_REQ_SETNAME`/`SETPEER` (`:11386`, `:11301`): the empty operand clears the fake
-            // address and answers `[1]`, a one-byte operand is the C's `einval`. Storing a fake
-            // address would only matter through the `NAME`/`PEER` short-circuits (`:11360`,
-            // `:11272`), which this floor still answers from the socket, so a well-formed address
-            // stays a typed gap rather than a `[1]` that would not be honoured afterwards.
+            // address and answers `[1]`, and a well-formed one is stored so that a later
+            // `NAME`/`PEER` reports it instead of asking the kernel (`:11370`, `:11284`). The
+            // address grammar — including the `len < 2` and family refusals — is
+            // [`self::wire::parse_fake_address`]'s.
             Opcode::Setname | Opcode::Setpeer => {
-                if arg.is_empty() {
-                    return Ok(ctl_ok());
+                let stored = match parse_fake_address(self.family, arg) {
+                    FakeAddress::Clear => None,
+                    FakeAddress::Store(address) => Some(address),
+                    FakeAddress::Refuse(name) => return Ok(ctl_xerror(name)),
+                };
+                if op == Opcode::Setname {
+                    self.name_addr = stored;
+                } else {
+                    self.peer_addr = stored;
                 }
-                if arg.len() < 2 {
-                    return Ok(ctl_xerror("einval"));
-                }
-                Err(op.not_served())
+                Ok(ctl_ok())
             }
             // The `getifaddrs(3)`-backed family (`:11067`, `:11078`, `:11089`, `:11100`): only
             // the `!IS_OPEN` refusal is exact; the open-state reply needs an interface walk.
@@ -1535,9 +1556,25 @@ impl TcpInetDriver {
                 }
                 wire::peer_reply(self.socket, self.state.is_connected())
             }
-            // The shared-`inet_ctl` replies both drivers build identically.
-            Opcode::Peer => wire::peer_reply(self.socket, self.state.is_connected()),
-            Opcode::Name => wire::name_reply(self.socket),
+            // The shared-`inet_ctl` replies both drivers build identically. `NAME`/`PEER`
+            // short-circuit on a fake address an `INET_REQ_SETNAME`/`SETPEER` installed —
+            // `PEER` after its connection guard, exactly as the C orders them (`:11270`-`:11290`,
+            // `:11365`-`:11377`). `GETLADDRS`/`GETPADDRS` deliberately do **not**: their
+            // non-SCTP fallback calls `sock_name`/`sock_peer` directly and never looks at
+            // `name_ptr`/`peer_ptr` (`:11341`, `:11261`).
+            Opcode::Peer => {
+                if !self.state.is_connected() {
+                    return Ok(ctl_xerror("enotconn"));
+                }
+                match self.peer_addr {
+                    Some(address) => Ok(wire::packed_addr_reply(address)),
+                    None => wire::peer_reply(self.socket, true),
+                }
+            }
+            Opcode::Name => match self.name_addr {
+                Some(address) => Ok(wire::packed_addr_reply(address)),
+                None => wire::name_reply(self.socket),
+            },
             Opcode::Gettype => Ok(wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(wire::getstatus_reply(self.state.state_code())),
@@ -1653,6 +1690,8 @@ pub fn make_tcp_inet() -> Result<Box<dyn Driver>> {
 mod frame_tests;
 #[cfg(test)]
 mod opcode_tests;
+#[cfg(test)]
+mod opcode_tests_states;
 #[cfg(test)]
 mod opcode_tests_udp;
 #[cfg(test)]
