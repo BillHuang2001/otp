@@ -139,9 +139,10 @@ fn is_record_accessible_wildcard_scope_rejects_a_record_from_another_module() {
 }
 
 #[test]
-fn is_record_accessible_with_no_fail_is_a_capability_gap() {
+fn is_record_accessible_with_no_fail_raises_function_clause() {
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
+    fx.atom("function_clause");
     let (m, r, a, external) = (
         fx.atom("m"),
         fx.atom("r"),
@@ -152,7 +153,7 @@ fn is_record_accessible_with_no_fail_is_a_capability_gap() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -163,5 +164,5 @@ fn is_record_accessible_with_no_fail_is_a_capability_gap() {
         },
         &mut ctx,
     ));
-    assert_eq!(reason, "unsupported_opcode: is_record_accessible/no_fail");
+    assert_eq!(reason, "function_clause");
 }

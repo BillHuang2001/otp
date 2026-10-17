@@ -58,22 +58,12 @@ use beam_common::Result;
 use beam_term::{
     boxed_val, Eterm, ERL_SUB_BITS_SIZE, HEADER_BIN_REF, HEADER_SUB_BITS,
 };
+use beam_term::refc::ERL_ONHEAP_BINARY_LIMIT;
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::machine::Machine;
 use crate::terms::{reserve, Slack};
-
-/// `ERL_ONHEAP_BINARY_LIMIT` (`erl_bits.h:167`): the largest byte count a hardware
-/// *heap* binary holds; a larger result becomes the off-heap ref-counted binary
-/// [`make_binary`] builds ([`make_writable`] for the `bs_init_writable` accumulator).
-const ERL_ONHEAP_BINARY_LIMIT: usize = 64;
-
-/// The number of bytes in one heap word (`sizeof(Eterm)`).
-const WORD_BYTES: usize = core::mem::size_of::<Eterm>();
-
-/// The two fixed head words of an `ErlHeapBits` (`thing_word`, `size`).
-const HEAP_BITS_HEAD_WORDS: usize = 2;
 
 /// The data pointer, **bit** size and **bit** offset of a readable bitstring
 /// subject: `(base, size, off)`.
@@ -127,12 +117,13 @@ pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize, usize)> {
     if hdr == HEADER_BIN_REF {
         return None;
     }
-    // SAFETY: an `ErlHeapBits` is `[thing_word, size, data…]`; word 1 is the bit
-    // count and word 2 begins the data.
-    let bits = unsafe { *p.add(1) }.raw();
-    // SAFETY: as above — a live heap-bits block stores its payload at word 2.
-    let data = unsafe { p.add(HEAP_BITS_HEAD_WORDS).cast::<u8>() };
-    Some((data as *const u8, bits, 0))
+    // An on-heap `ErlHeapBits`: `beam_term::bitstring_parts` (the frozen-layout owner,
+    // `erl_bits.h:150-164`) recovers its data byte base, its zero bit offset and its
+    // bit size, so this module never re-derives the `[thing_word, size, data…]` layout.
+    // SAFETY: the header is neither `ErlSubBits` nor a bare `BinRef`, so `t` is a live
+    // `ErlHeapBits` and `bitstring_parts` reads only its own `size`/data words.
+    let (base, off, bits) = unsafe { beam_term::bitstring_parts(t) };
+    Some((base, bits, off))
 }
 /// The byte payload of a bitstring **subject** term and its bit offset within it:
 /// `(base, off)`.
@@ -334,8 +325,11 @@ pub(super) fn is_refc_binary(t: Eterm) -> bool {
 ///
 /// The produced `ErlHeapBits` never carries the heap's previous contents: the whole
 /// data region is zeroed before the payload is copied in (so the trailing padding
-/// bytes of the last data word are zero — the `beam_term::bitstring::write_heap_bits`
-/// invariant) and the unused low bits of the final payload byte are cleared.
+/// bytes of the last data word are zero) and the unused low bits of the final payload
+/// byte are cleared — the invariants
+/// [`beam_term::bitstring::write_heap_bits`] establishes (this builder is a thin
+/// wrapper over it, so the frozen `[thing_word, size, data…]` layout has exactly one
+/// definition).
 ///
 /// This is the on-heap `ErlHeapBits` builder and nothing more: it is the branch
 /// [`make_binary`] takes at/below the frozen limit, and it refuses a larger result
@@ -360,35 +354,20 @@ pub(super) fn make_bits(
         // An internal invariant: every caller passes a buffer covering `nbits`.
         return Err(error::unsupported("bitstring: short byte buffer"));
     }
-    let num_words = HEAP_BITS_HEAD_WORDS + num_bytes.div_ceil(WORD_BYTES);
-    let hp = reserve(machine, ctx, num_words, RootSet::ALL_LIVE)?;
-    // SAFETY: the rooted reserve returned `2 + ceil(num_bytes / word_bytes)`
-    // exclusively-owned, writable words. Word 0 takes the heap-bits header, word 1
-    // the bit count, and the data region at word 2 has room for `num_bytes` bytes.
-    // (`bytes` is a Rust-owned buffer — never a live term's storage — so the reserve
-    // cannot invalidate it.) The write sequence is `beam_term::bitstring::write_heap_bits`'s,
-    // exactly: the **whole** data region is zeroed before the payload copy, so the
-    // trailing padding bytes of the last data word never carry whatever the heap held
-    // (they are observable after heap reuse, and a GC word-copy of the block would
-    // propagate them), and the unused low bits of the final payload byte are then
-    // masked away.
-    unsafe {
-        *hp = beam_term::make_header(num_words - 1, beam_term::HEAP_BITS_SUBTAG);
-        *hp.add(1) = Eterm::from_raw(nbits);
-        let data = hp.add(HEAP_BITS_HEAD_WORDS).cast::<u8>();
-        let data_bytes = (num_words - HEAP_BITS_HEAD_WORDS) * WORD_BYTES;
-        core::ptr::write_bytes(data, 0, data_bytes);
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, num_bytes);
-        if num_bytes != 0 && nbits % 8 != 0 {
-            // The source's trailing bits in the final partial byte are unspecified
-            // (it is a `ceil`-rounded copy), so mask them to zero — the canonical
-            // "unused low bits are zero" bitstring invariant.
-            let keep = nbits % 8;
-            let mask = 0xFFu8 << (8 - keep);
-            *data.add(num_bytes - 1) &= mask;
-        }
-    }
-    Ok(beam_term::make_boxed(hp))
+    let hp = reserve(
+        machine,
+        ctx,
+        beam_term::bitstring::heap_bits_size_words(nbits),
+        RootSet::ALL_LIVE,
+    )?;
+    // SAFETY: the rooted reserve returned exactly
+    // `beam_term::bitstring::heap_bits_size_words(nbits)` exclusively-owned, writable
+    // words — the block `write_heap_bits` requires — and `bytes` is a Rust-owned
+    // buffer (never a live term's storage), so the reserve cannot invalidate it. The
+    // writer establishes the whole data region (padding bytes zeroed, the unused
+    // trailing bits of the final payload byte masked), so this builder never re-derives
+    // the frozen heap-bits layout.
+    Ok(unsafe { beam_term::bitstring::write_heap_bits(hp, bytes, nbits)? })
 }
 
 /// Build a bitstring of exactly `nbits` bits from the leading bits of `bytes`,
@@ -999,7 +978,10 @@ mod tests {
         // region, so 7 of the data word's 8 bytes are padding.
         for nbits in [1usize, 5] {
             let num_bytes = nbits.div_ceil(8);
-            let num_words = HEAP_BITS_HEAD_WORDS + num_bytes.div_ceil(WORD_BYTES);
+            // The word count and the data-region offset both come from `beam_term`
+            // (the frozen-layout owner), so this test asserts the invariant without
+            // re-deriving the layout either.
+            let num_words = beam_term::bitstring::heap_bits_size_words(nbits);
             assert_eq!(num_words, 3, "the payload fits one data word");
             let mut ctx = DirtyHeap::new(num_words);
             let mut machine = Machine::new();
@@ -1009,10 +991,11 @@ mod tests {
             let term = make_bits(&mut machine, &mut ctx, &source, nbits).unwrap();
 
             // SAFETY: `term` is the live boxed `ErlHeapBits` `make_bits` just built in
-            // `ctx`'s block, whose data region starts at word `HEAP_BITS_HEAD_WORDS` and
-            // is `num_words - HEAP_BITS_HEAD_WORDS` words wide.
-            let data = unsafe { boxed_val(term).add(HEAP_BITS_HEAD_WORDS).cast::<u8>() };
-            let data_bytes = (num_words - HEAP_BITS_HEAD_WORDS) * WORD_BYTES;
+            // `ctx`'s block, whose data region starts at word `ERL_HEAP_BITS_SIZE` and is
+            // `num_words - ERL_HEAP_BITS_SIZE` words wide.
+            let data = unsafe { boxed_val(term).add(beam_term::ERL_HEAP_BITS_SIZE).cast::<u8>() };
+            let data_bytes =
+                (num_words - beam_term::ERL_HEAP_BITS_SIZE) * core::mem::size_of::<Eterm>();
 
             // The payload byte keeps exactly the leading `nbits` bits ...
             // SAFETY: byte 0 of the freshly built `num_bytes`-byte payload.

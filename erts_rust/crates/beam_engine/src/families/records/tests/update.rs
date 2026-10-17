@@ -136,15 +136,16 @@ fn put_record_branches_to_fail_on_an_absent_update_field() {
 }
 
 #[test]
-fn put_record_with_no_fail_is_a_capability_gap() {
+fn put_record_with_no_fail_raises_function_clause() {
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (rec, _a, _b, _r) = two_field_record(&mut fx, &mut ctx);
     let z = fx.atom("z");
+    fx.atom("function_clause");
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -158,7 +159,7 @@ fn put_record_with_no_fail_is_a_capability_gap() {
         })),
         &mut ctx,
     ));
-    assert_eq!(reason, "unsupported_opcode: put_record/no_fail");
+    assert_eq!(reason, "function_clause");
 }
 
 #[test]
@@ -172,7 +173,7 @@ fn put_record_create_with_an_unknown_record_name_is_a_typed_error() {
     let (m, r, a) = (fx.atom("m"), fx.atom("r"), fx.atom("a"));
     let mut machine = Machine::with_max_register(4);
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -207,7 +208,7 @@ fn put_record_create_for_another_module_is_a_typed_error() {
     let mut machine = Machine::with_max_register(4);
     machine.set_x(1, id).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -294,15 +295,16 @@ fn update_record_id_branches_to_fail_on_an_absent_update_field() {
 }
 
 #[test]
-fn update_record_id_with_no_fail_is_a_capability_gap() {
+fn update_record_id_with_no_fail_raises_function_clause() {
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (rec, _a, _b, _r) = two_field_record(&mut fx, &mut ctx);
     let z = fx.atom("z");
+    fx.atom("function_clause");
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = unsupported_reason(run(
+    let reason = raise_reason_atom(run(
         fx.module(),
         &LabelMap::new(),
         &mut machine,
@@ -317,7 +319,7 @@ fn update_record_id_with_no_fail_is_a_capability_gap() {
         })),
         &mut ctx,
     ));
-    assert_eq!(reason, "unsupported_opcode: update_record_id/no_fail");
+    assert_eq!(reason, "function_clause");
 }
 
 #[test]

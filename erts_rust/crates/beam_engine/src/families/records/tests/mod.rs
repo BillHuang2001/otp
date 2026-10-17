@@ -27,8 +27,10 @@
 //! * the **fail-branch** path (a record-semantics failure the C reports with
 //!   `$FAIL($Fail)` / `$FAIL_HEAD_OR_BODY($Fail)` must produce
 //!   `Step::Goto { func, pc }` for the resolved `fail` label), and
-//! * the [`NO_FAIL`] **capability gap** (a typed `unsupported("<instr>/no_fail")`,
-//!   never a fall-through with a wrong result).//!
+//! * the [`NO_FAIL`] path (the engine's single failed-clause raise, class `error` with
+//!   the bare atom `function_clause`, or the typed `unsupported` when the namespace
+//!   cannot name that atom — never a fall-through with a wrong result).
+//!
 //! The fixtures are real native records built through [`beam_term::write_record`]
 //! (reached via the family's [`raw`](super::raw) forwarder) into the
 //! [`MinimalContext`] arena, so the tests exercise the frozen layout without ever
@@ -151,8 +153,10 @@ fn run(
     exec(machine, module, labels, instr, 0, 0, ctx)
 }
 
-/// The `unsupported_opcode: <reason>` atom text of a typed error.
-fn unsupported_reason(result: beam_common::Result<Option<Step>>) -> String {
+/// The reason **atom text** of a raise — either an engine diagnostic
+/// (`unsupported_opcode: <what>`) or a program-level reason atom
+/// (`function_clause`).
+fn raise_reason_atom(result: beam_common::Result<Option<Step>>) -> String {
     match result.expect_err("expected a typed error") {
         BeamError::Raise(raise) => raise
             .reason

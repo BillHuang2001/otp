@@ -91,7 +91,7 @@
 use std::sync::Arc;
 
 use beam_common::Result;
-use beam_loader::{Function, Instr, Module, Operand};
+use beam_loader::{Function, Instr, Module, Operand, Reg};
 use beam_term::{is_small, make_atom, make_small, signed_value, Eterm, NIL};
 
 use crate::context::ExecutionContext;
@@ -350,6 +350,12 @@ impl Machine {
     /// untouched by the suspension, so the value the `wait_timeout` tested is still
     /// there. The Y case is why [`Machine::y`] is public.
     ///
+    /// An [`Operand::Typed`] (`z,5` `tr`) is its underlying register: the `Type`
+    /// annotation is a compiler hint the rest of the operand readers ignore, and the
+    /// installed compiler never emits `#tr{}` at `wait_timeout`
+    /// (`lib/compiler/src/beam_ssa_codegen.erl`) — unwrapping it keeps this reader's
+    /// behaviour uniform with [`crate::operand::read_operand`]'s.
+    ///
     /// `None` for everything else — the atom `infinity`, a zero/negative or
     /// non-integer value, a float register, and any operand a `wait_timeout` cannot
     /// carry. `None` means "no deadline": the process parks until a message arrives,
@@ -360,6 +366,10 @@ impl Machine {
             Operand::Literal(index) => module.literal(*index).and_then(millis_of),
             Operand::X(register) => self.x(*register).and_then(millis_of),
             Operand::Y(register) => self.y(*register).and_then(millis_of),
+            Operand::Typed { reg, .. } => match reg {
+                Reg::X(register) => self.x(*register).and_then(millis_of),
+                Reg::Y(register) => self.y(*register).and_then(millis_of),
+            },
             _ => None,
         }
     }
