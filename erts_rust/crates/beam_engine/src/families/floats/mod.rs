@@ -222,15 +222,17 @@ fn arithmetic_failure(
 /// (`../../erts/emulator/beam/beam_common.c:580-679`), so the raise **is
 /// catchable** by an enclosing `try`/`catch`. The engine's raise/unwind entry
 /// point is [`Machine::throw_error`], with the reason atom `badarith` resolved
-/// from the running module's atom table (the engine never invents an atom the
-/// module cannot name).
+/// through [`namespace_atom`] — the host's live atom namespace
+/// ([`ExecutionContext::atoms`]) first, the running module's load-time snapshot
+/// second (the engine never invents an atom neither source can name).
 ///
-/// A module whose atom table lacks `badarith` cannot name the reason, so the typed
-/// [`BeamError::BadArith`] is returned instead — never a substituted, wrong atom.
-/// With **no live catch frame** the raise cannot land, so it likewise propagates
-/// unchanged as the typed [`BeamError::BadArith`] (the same uncaught-error contract
-/// the interpreter's `raise_bif_error` follows). The `error` class atom is installed
-/// when the module has it, which is what a landing places in `x(3)`.
+/// A namespace in which **neither** source names `badarith` leaves the reason
+/// unnameable, so the typed [`BeamError::BadArith`] is returned instead — never a
+/// substituted, wrong atom. With **no live catch frame** the raise cannot land, so it
+/// likewise propagates unchanged as the typed [`BeamError::BadArith`] (the same
+/// uncaught-error contract the interpreter's `raise_bif_error` follows). The `error`
+/// class atom is resolved the same way and installed when nameable, which is what a
+/// landing places in `x(3)`.
 fn raise_badarith(
     machine: &mut Machine,
     module: &Module,

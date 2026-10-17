@@ -44,11 +44,13 @@ use crate::Step;
 /// Raise a `{Tag,Value}` `error` exception (the `badmatch`/`case_end`/
 /// `try_case_end`/`badrecord` expansion).
 ///
-/// The tag atom is resolved from the running module's atom table; a module that
-/// never mentions it cannot name the reason, so a missing atom is a typed
-/// `unsupported` (never a wrong atom). The `error` class atom is installed when
-/// the module has it (see [`install_class_atom`]); an uncaught raise therefore
-/// still propagates as a proper `Err(BeamError::Raise(..))`.
+/// The tag atom is resolved through [`namespace_atom`] — the host's live atom
+/// namespace ([`ExecutionContext::atoms`]) first, the running module's load-time
+/// snapshot second — so a host that owns ONE shared namespace can name a tag the
+/// module's snapshot lacks. A name **neither** source knows is a typed
+/// `unsupported` (never a wrong atom). The `error` class atom is installed the same
+/// way (see [`install_class_atom`]); an uncaught raise therefore still propagates as
+/// a proper `Err(BeamError::Raise(..))`.
 pub(super) fn raise_error_tuple(
     machine: &mut Machine,
     module: &Module,

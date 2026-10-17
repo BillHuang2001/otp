@@ -47,6 +47,11 @@ public:
   They live beside their classic twins in the same file (`construct.rs`/`number.rs`/`map.rs`/
   `fun.rs`) and are re-exported from `mod.rs`. `make_integer_unrooted` is the operand-immediate
   path (never collects) and stays `pub(crate)`.
+- **`badmatch_reason` / `badmatch_reason_rooted` resolve their tag through
+  `machine::namespace_atom`** — the host's live `ctx.atoms(module)` namespace first, the running
+  module's load-time snapshot second — and answer the typed `BeamError::BadMatch` when **neither**
+  can name `badmatch` (never a substituted atom index). The rooted twin does the lookup before its
+  `reserve`, so the `&dyn ExecutionContext` borrow ends before the `&mut` allocation.
 
 `mod.rs` re-exports both families under their own names; a caller picks the seam it needs.
 

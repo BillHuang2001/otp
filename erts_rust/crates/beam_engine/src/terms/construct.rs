@@ -115,22 +115,22 @@ pub fn make_list(ctx: &mut dyn ExecutionContext, elems: &[Eterm]) -> Result<Eter
 ///
 /// ERTS tags the reason with the **global** atom `badmatch` (`am_badmatch`,
 /// `beam_common.c:388`; the C `badmatch`/`get_*` opcodes store `freason = BADMATCH`
-/// and the tag is materialized during error handling). This engine's atoms are
-/// **module-local** indices (the frozen term model, `../CONTEXT.md` §2), so the tag
-/// is resolved through `module`'s atom table — the only table whose indices the
-/// loaded code compares against. The Erlang compiler never interns `badmatch` (the
-/// raising opcode uses the C global constant), so a real module normally lacks it;
-/// minting an arbitrary atom index there would be a *wrong result*, so this returns
-/// the canonical typed [`BeamError::BadMatch`] instead.
+/// and the tag is materialized during error handling). The tag is resolved through
+/// [`crate::machine::namespace_atom`], i.e. the host's live atom namespace
+/// ([`ExecutionContext::atoms`]) **first** and `module`'s load-time snapshot
+/// **second**: a host that owns ONE shared namespace (the runtime) can name an atom
+/// interned *after* the module was loaded, and the Erlang compiler never interns
+/// `badmatch` (the raising opcode uses the C global constant), so a real module
+/// normally lacks it in its snapshot. A name **neither** source knows yields the
+/// canonical typed [`BeamError::BadMatch`] — minting an arbitrary atom index would be
+/// a *wrong result*, because an index is valid only against the table it was read
+/// with.
 pub fn badmatch_reason(
     ctx: &mut dyn ExecutionContext,
     module: &Module,
     value: Eterm,
 ) -> Result<Eterm> {
-    let tag = module
-        .atom_table
-        .lookup("badmatch")
-        .ok_or(BeamError::BadMatch)?;
+    let tag = crate::machine::namespace_atom(ctx, module, "badmatch").ok_or(BeamError::BadMatch)?;
     make_tuple(ctx, &[make_atom(tag), value])
 }
 
@@ -307,16 +307,17 @@ where
 ///
 /// ERTS tags the reason with the **global** atom `badmatch` (`am_badmatch`,
 /// `beam_common.c:388`; the C `badmatch`/`get_*` opcodes store `freason = BADMATCH`
-/// and the tag is materialized during error handling). This engine's atoms are
-/// **module-local** indices (the frozen term model, `../CONTEXT.md` §2), so the tag
-/// is resolved through `module`'s atom table — the only table whose indices the
-/// loaded code compares against. The Erlang compiler never interns `badmatch` (the
-/// raising opcode uses the C global constant), so a real module normally lacks it;
-/// minting an arbitrary atom index there would be a *wrong result*, so this returns
-/// the canonical typed [`BeamError::BadMatch`] instead.
+/// and the tag is materialized during error handling). The tag is resolved through
+/// [`crate::machine::namespace_atom`] — the host's live atom namespace
+/// ([`ExecutionContext::atoms`]) first, `module`'s load-time snapshot second — so a
+/// host that owns ONE shared namespace can name a tag the module's snapshot lacks
+/// (the Erlang compiler never interns `badmatch`). A name **neither** source knows
+/// yields the canonical typed [`BeamError::BadMatch`], never a substituted index.
 ///
 /// The reason is a 3-word tuple reserved **rooted** before the closure reads the
-/// value from the machine's post-collection state.
+/// value from the machine's post-collection state. The lookup deliberately happens
+/// **before** the [`reserve`], so the `&dyn ExecutionContext` borrow `namespace_atom`
+/// takes ends before the `&mut` reservation.
 pub fn badmatch_reason_rooted<R>(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
@@ -327,10 +328,7 @@ pub fn badmatch_reason_rooted<R>(
 where
     R: FnOnce(&Machine, &mut Slack) -> Result<Eterm>,
 {
-    let tag = module
-        .atom_table
-        .lookup("badmatch")
-        .ok_or(BeamError::BadMatch)?;
+    let tag = crate::machine::namespace_atom(ctx, module, "badmatch").ok_or(BeamError::BadMatch)?;
     let hp = reserve(machine, ctx, 3, live)?;
     // SAFETY: the reserve returned 3 exclusively-owned, writable words and a
     // zero-length tail (the slack has no room, which is correct: the closure's value

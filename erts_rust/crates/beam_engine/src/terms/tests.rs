@@ -212,6 +212,67 @@ fn badmatch_reason_is_a_typed_error_without_the_atom() {
     ));
 }
 
+/// A live namespace that names `names` on top of `module`'s own snapshot — the
+/// runtime's ONE shared table (its ids run past the snapshot's length).
+fn namespace_with(module: &Module, names: &[&str]) -> beam_term::AtomTable {
+    let mut live = module.atom_table.clone();
+    for name in names {
+        live.intern(name);
+    }
+    live
+}
+
+#[test]
+fn badmatch_reason_resolves_the_tag_through_the_live_namespace() {
+    // The runtime's live shared namespace names `badmatch`; the running module's
+    // load-time snapshot does not (the compiler never interns the tag, it uses the C
+    // global constant). The namespace must win on BOTH builders — before the fix the
+    // lookup was snapshot-only, so this degraded to the typed `BeamError::BadMatch`
+    // even though the host could name the tag.
+    let module = Module::default();
+    let live = namespace_with(&module, &["badmatch"]);
+    let tag = live.lookup("badmatch").expect("the namespace names badmatch");
+    assert!(
+        module.atom_table.lookup("badmatch").is_none(),
+        "beyond the snapshot"
+    );
+    let value = make_small(7);
+
+    // The classic (unrooted) builder.
+    let mut c = MinimalContext::with_shared_atoms(live.clone());
+    let reason = crate::terms::badmatch_reason(&mut c, &module, value).unwrap();
+    assert_eq!(tuple_arity(reason).unwrap(), 2);
+    assert_eq!(tuple_element(reason, 0).unwrap(), make_atom(tag));
+    assert_eq!(tuple_element(reason, 1).unwrap(), value);
+
+    // The rooted builder (through the test wrapper over `badmatch_reason_rooted`).
+    let mut rooted = MinimalContext::with_shared_atoms(live);
+    let reason = badmatch_reason(&mut rooted, &module, value).unwrap();
+    assert_eq!(tuple_arity(reason).unwrap(), 2);
+    assert_eq!(tuple_element(reason, 0).unwrap(), make_atom(tag));
+    assert_eq!(tuple_element(reason, 1).unwrap(), value);
+}
+
+#[test]
+fn badmatch_reason_stays_a_typed_error_when_neither_source_names_the_tag() {
+    // A live namespace that names *other* atoms but not `badmatch`, over a module
+    // whose snapshot lacks it too: the canonical typed error on both builders, never
+    // a substituted atom index.
+    let module = Module::default();
+    let live = namespace_with(&module, &["error", "badarg"]);
+    assert!(live.lookup("badmatch").is_none());
+
+    let mut c = MinimalContext::with_shared_atoms(live);
+    assert!(matches!(
+        crate::terms::badmatch_reason(&mut c, &module, make_small(1)),
+        Err(BeamError::BadMatch)
+    ));
+    assert!(matches!(
+        badmatch_reason(&mut c, &module, make_small(1)),
+        Err(BeamError::BadMatch)
+    ));
+}
+
 // -- floats ---------------------------------------------------------------
 
 #[test]
