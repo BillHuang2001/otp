@@ -190,6 +190,21 @@ pub const PID_NUM_SIZE: u32 = 28;
 pub const PID_DATA_SIZE: u32 = 64 - TAG_IMMED1_SIZE;
 /// `_PID_SER_SIZE` = `_PID_DATA_SIZE - _PID_NUM_SIZE`.
 pub const PID_SER_SIZE: u32 = PID_DATA_SIZE - PID_NUM_SIZE;
+/// `ERTS_MAX_INTERNAL_PID_DATA` (`erl_node_container_utils.h:181`) =
+/// `(1 << _PID_DATA_SIZE) - 1`, the largest representable raw pid id payload.
+pub const MAX_INTERNAL_PID_DATA: u64 = (1u64 << PID_DATA_SIZE) - 1;
+/// `ERTS_MAX_INTERNAL_PID_NUMBER` (`erl_node_container_utils.h:182`) =
+/// `(1 << _PID_NUM_SIZE) - 1`, the largest representable process-table number.
+///
+/// The C's pid decoder (`external.c:3176-3179`) and `list_to_pid` (`bif.c:4582-4583`)
+/// range-check a process number against this limit before calling `make_pid_data`;
+/// [`try_make_pid_data`] is that same check lifted into the encoder seam.
+pub const MAX_INTERNAL_PID_NUMBER: u64 = (1u64 << PID_NUM_SIZE) - 1;
+/// `ERTS_MAX_INTERNAL_PID_SERIAL` (`erl_node_container_utils.h:183`) =
+/// `(1 << _PID_SER_SIZE) - 1`, the largest representable pid serial.
+///
+/// Checked by the same two C call sites as [`MAX_INTERNAL_PID_NUMBER`].
+pub const MAX_INTERNAL_PID_SERIAL: u64 = (1u64 << PID_SER_SIZE) - 1;
 /// `_PORT_DATA_SIZE` = `64 - _TAG_IMMED1_SIZE`.
 pub const PORT_DATA_SIZE: u32 = 64 - TAG_IMMED1_SIZE;
 
@@ -206,9 +221,44 @@ pub const fn is_not_internal_pid(x: Eterm) -> bool {
 }
 
 /// `make_pid_data(Ser, Num)` — combine a process number and serial into raw id data.
+///
+/// Unchecked (mirrors the C macro at `erl_term.h:655-656` exactly, which is
+/// `(Uint)(((Ser) << _PID_NUM_SIZE) | (Num))` with no range check and no masking):
+/// the C's contract is "macro unchecked, caller checks", so the fields are only
+/// `debug_assert`ed here and the **caller** owns the real check — see
+/// [`try_make_pid_data`] and the [`MAX_INTERNAL_PID_NUMBER`] /
+/// [`MAX_INTERNAL_PID_SERIAL`] limits the C's call sites test against.
+///
+/// Deliberately **not** masking an out-of-range field: with `num = 1 << PID_NUM_SIZE`
+/// the C computes `(ser << 28) | (1 << 28)`, i.e. `(ser | 1) << 28`, so the overflow
+/// leaks into the serial's low bit (for an even serial, [`pid_serial`] then reads
+/// `ser + 1`). Truncating instead (`num & MAX_INTERNAL_PID_NUMBER`) would yield `ser`
+/// — a *different wrong term* than the C produces for the same bad input, which a
+/// Level-1 drop-in must never do.
 #[inline]
 pub const fn make_pid_data(ser: u64, num: u64) -> u64 {
+    debug_assert!(ser <= MAX_INTERNAL_PID_SERIAL, "pid serial out of range");
+    debug_assert!(num <= MAX_INTERNAL_PID_NUMBER, "pid number out of range");
     (ser << PID_NUM_SIZE) | num
+}
+
+/// Range-checked [`make_pid_data`].
+///
+/// This is the C's `ERTS_MAX_INTERNAL_PID_*` call-site check — the pid decoder
+/// (`external.c:3176-3179`, returning `NULL`) and `list_to_pid` (`bif.c:4582-4583`,
+/// jumping to `bad`) — lifted into the encoder seam, so `beam_codec`'s pid decoder
+/// and `list_to_pid` reuse one definition instead of each writing the bound. The
+/// fields are tested in the C's own order (number first, then serial); once they are
+/// combined a bad field can no longer be told from a carry into the serial, which is
+/// exactly why the check has to happen here and not after `make_pid_data`.
+/// `TermError::PidIdOutOfRange` reconciles to the `badarg` both C call sites answer.
+#[inline]
+pub fn try_make_pid_data(ser: u64, num: u64) -> TermResult<u64> {
+    if num > MAX_INTERNAL_PID_NUMBER || ser > MAX_INTERNAL_PID_SERIAL {
+        Err(TermError::PidIdOutOfRange)
+    } else {
+        Ok(make_pid_data(ser, num))
+    }
 }
 
 /// Tag raw pid data (from [`make_pid_data`]) as an internal pid term.
@@ -373,6 +423,96 @@ mod tests {
         assert_eq!(pid_number(max), (1 << PID_NUM_SIZE) - 1);
         assert_eq!(pid_serial(max), (1 << PID_SER_SIZE) - 1);
         assert!(!is_internal_port(t));
+    }
+
+    #[test]
+    fn pid_id_limits_match_the_c_container_limits() {
+        // `erl_node_container_utils.h:181-183` with `_PID_DATA_SIZE` = 60,
+        // `_PID_NUM_SIZE` = 28, `_PID_SER_SIZE` = 32.
+        assert_eq!(PID_DATA_SIZE, 60);
+        assert_eq!(PID_SER_SIZE, 32);
+        assert_eq!(MAX_INTERNAL_PID_DATA, 0x0FFF_FFFF_FFFF_FFFF);
+        assert_eq!(MAX_INTERNAL_PID_NUMBER, 0x0FFF_FFFF);
+        assert_eq!(MAX_INTERNAL_PID_SERIAL, 0xFFFF_FFFF);
+        // The two fields tile the payload exactly, so the largest legal pair is the
+        // largest legal payload.
+        assert_eq!(
+            make_pid_data(MAX_INTERNAL_PID_SERIAL, MAX_INTERNAL_PID_NUMBER),
+            MAX_INTERNAL_PID_DATA
+        );
+    }
+
+    #[test]
+    fn try_make_pid_data_accepts_the_boundaries() {
+        let data = try_make_pid_data(MAX_INTERNAL_PID_SERIAL, MAX_INTERNAL_PID_NUMBER).unwrap();
+        assert_eq!(
+            data,
+            make_pid_data(MAX_INTERNAL_PID_SERIAL, MAX_INTERNAL_PID_NUMBER)
+        );
+        let t = make_internal_pid(data);
+        assert_eq!(pid_serial(t), MAX_INTERNAL_PID_SERIAL);
+        assert_eq!(pid_number(t), MAX_INTERNAL_PID_NUMBER);
+        // Zero is legal on both fields.
+        assert_eq!(try_make_pid_data(0, 0).unwrap(), 0);
+        assert_eq!(try_make_pid_data(7, 1234).unwrap(), make_pid_data(7, 1234));
+    }
+
+    #[test]
+    fn try_make_pid_data_rejects_each_field_past_its_limit() {
+        // The C's check (`external.c:3176`, `bif.c:4582`) rejects either field alone.
+        assert_eq!(
+            try_make_pid_data(0, MAX_INTERNAL_PID_NUMBER + 1),
+            Err(TermError::PidIdOutOfRange)
+        );
+        assert_eq!(
+            try_make_pid_data(MAX_INTERNAL_PID_SERIAL + 1, 0),
+            Err(TermError::PidIdOutOfRange)
+        );
+        assert_eq!(
+            try_make_pid_data(MAX_INTERNAL_PID_SERIAL + 1, MAX_INTERNAL_PID_NUMBER + 1),
+            Err(TermError::PidIdOutOfRange)
+        );
+        // Boundary + 1 is the tightest rejection: `MAX_INTERNAL_PID_NUMBER + 1` is
+        // exactly the value that would carry into the serial field.
+        assert_eq!(
+            try_make_pid_data(0, 1u64 << PID_NUM_SIZE),
+            Err(TermError::PidIdOutOfRange)
+        );
+        // The oracle answers `badarg` for both C call sites, so the reconciliation
+        // is `BadArg` (never a new reason).
+        assert!(matches!(
+            beam_common::BeamError::from(TermError::PidIdOutOfRange),
+            beam_common::BeamError::BadArg
+        ));
+    }
+
+    #[test]
+    fn make_pid_data_does_not_mask_so_overflow_carries_into_the_serial() {
+        // Why the encoder must NOT mask: the C macro (`erl_term.h:655-656`) ORs the
+        // raw fields together with no masking, so an out-of-range number leaks into
+        // the serial field instead of being discarded. With `num = 1 << 28` (the
+        // smallest out-of-range number) the OR sets bit 0 of the serial:
+        // `(ser << 28) | (1 << 28) == (ser | 1) << 28`, which reads as `ser + 1` for
+        // an even serial. Masking instead (`num & MAX_INTERNAL_PID_NUMBER` = 0) would
+        // give `ser << 28` — a *different wrong term* than the C builds from the same
+        // bad input.
+        //
+        // The arithmetic is demonstrated directly rather than by calling the
+        // debug-asserting encoder with an out-of-range field (a debug build would
+        // trip the `debug_assert!`).
+        let ser = 6u64; // even, so the leaked bit is exactly `ser + 1`
+        let num = 1u64 << PID_NUM_SIZE; // == MAX_INTERNAL_PID_NUMBER + 1
+        let data = (ser << PID_NUM_SIZE) | num;
+        assert_eq!(data >> PID_NUM_SIZE, 7);
+        assert_eq!(data & MAX_INTERNAL_PID_NUMBER, 0);
+        // The same value seen through the term accessors: serial carried, number 0.
+        let t = make_internal_pid(data);
+        assert_eq!(pid_serial(t), 7);
+        assert_eq!(pid_number(t), 0);
+        // Masking would have produced the other answer, which is NOT the C's.
+        let masked = make_internal_pid((ser << PID_NUM_SIZE) | (num & MAX_INTERNAL_PID_NUMBER));
+        assert_eq!(pid_serial(masked), 6);
+        assert_ne!(pid_serial(masked), pid_serial(t));
     }
 
     #[test]

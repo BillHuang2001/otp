@@ -40,6 +40,16 @@ use core::fmt;
 pub enum TermError {
     /// A value did not fit in a 60-bit BEAM small integer.
     SmallIntOutOfRange,
+    /// An internal pid's process number or serial exceeded the field the id layout
+    /// gives it (`ERTS_MAX_INTERNAL_PID_NUMBER` / `ERTS_MAX_INTERNAL_PID_SERIAL`,
+    /// `erl_node_container_utils.h:182-183`), reported by
+    /// [`crate::immediate::try_make_pid_data`].
+    ///
+    /// This lifts the C's call-site range check into the encoder seam: the pid
+    /// decoder returns `NULL` (`external.c:3176-3179`) and `list_to_pid` jumps to
+    /// `bad` (`bif.c:4582-4583`) for exactly this condition, so it reconciles to the
+    /// same `badarg` rather than inventing a new reason.
+    PidIdOutOfRange,
     /// An arity exceeded `MAX_ARITYVAL`, a fun header field exceeded
     /// [`crate::fun::FUN_MAX_FIELD`] (255), or an element index was out of range.
     ArityOutOfRange,
@@ -137,6 +147,7 @@ impl fmt::Display for TermError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
             TermError::SmallIntOutOfRange => "small integer out of range",
+            TermError::PidIdOutOfRange => "internal pid id out of range",
             TermError::ArityOutOfRange => "arity out of range",
             TermError::HeapExhausted => "heap exhausted",
             TermError::InvalidAtomName => "invalid atom name",
@@ -167,6 +178,7 @@ impl core::error::Error for TermError {}
 /// | `TermError` | `BeamError` | BEAM reason |
 /// |---|---|---|
 /// | `SmallIntOutOfRange` | `BadArith` | `badarith` |
+/// | `PidIdOutOfRange` | `BadArg` | `badarg` |
 /// | `ArityOutOfRange` | `SystemLimit` | `system_limit` |
 /// | `HeapExhausted` | `Alloc(..)` | `out_of_memory` |
 /// | `InvalidAtomName` | `BadArg` | `badarg` |
@@ -186,6 +198,9 @@ impl From<TermError> for BeamError {
         match error {
             // A 60-bit small-integer overflow is an arithmetic-range failure.
             TermError::SmallIntOutOfRange => BeamError::BadArith,
+            // An out-of-range pid id is the oracle's own `badarg` for both C call sites
+            // (the decoder's `NULL`, `list_to_pid`'s `bad`), not a new reason.
+            TermError::PidIdOutOfRange => BeamError::BadArg,
             // Exceeding `MAX_ARITYVAL` is a hard runtime limit.
             TermError::ArityOutOfRange => BeamError::SystemLimit,
             // Arena exhaustion is an allocation failure. `TermError::HeapExhausted`
@@ -246,6 +261,10 @@ mod tests {
     #[test]
     fn display_messages() {
         assert_eq!(TermError::SmallIntOutOfRange.to_string(), "small integer out of range");
+        assert_eq!(
+            TermError::PidIdOutOfRange.to_string(),
+            "internal pid id out of range"
+        );
         assert_eq!(TermError::ArityOutOfRange.to_string(), "arity out of range");
         assert_eq!(TermError::HeapExhausted.to_string(), "heap exhausted");
         assert_eq!(TermError::InvalidAtomName.to_string(), "invalid atom name");
@@ -334,6 +353,10 @@ mod tests {
         assert!(matches!(
             BeamError::from(TermError::SmallIntOutOfRange),
             BeamError::BadArith
+        ));
+        assert!(matches!(
+            BeamError::from(TermError::PidIdOutOfRange),
+            BeamError::BadArg
         ));
         assert!(matches!(
             BeamError::from(TermError::ArityOutOfRange),
