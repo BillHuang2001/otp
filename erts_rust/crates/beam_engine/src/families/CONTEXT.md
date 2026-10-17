@@ -37,11 +37,11 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 
 ## Routing Table (file → owned variants)
 - `tuples.rs` — `PutTuple2` / `GetTupleElement` / `SetTupleElement` / `SelectTupleArity`; `SetTupleElement` is the destructive in-place write (`tuple_val(Tuple)[1 + offset]`, `../terms/update.rs`), whose non-tuple/out-of-range target raises the read path's `{badmatch, Source}` and whose literal-area target is the typed `unsupported`.
-- `records/` (`mod.rs` + `raw.rs` + `tests/`) — `UpdateRecord`, `UpdateRecordId`, and the eight native-record variants (`IsAnyNativeRecord` … `UpdateRecordId`). `raw.rs` **forwards all** record layout to `beam_term::record`.
+- `records/` (`mod.rs` + `raw.rs` + `tests/`) — **nine** variants: the OTP-26 tagged-tuple `UpdateRecord`, plus the eight OTP-29 native-record ones (`IsAnyNativeRecord`, `IsNativeRecord`, `GetRecordElements`, `GetRecordElementsId`, `PutRecord`, `IsRecordAccessible`, `GetRecordField`, `UpdateRecordId`). `raw.rs` **forwards all** record layout to `beam_term::record`. Detail: `records/CONTEXT.md`.
 - `lists.rs` — `PutList` / `GetList` / `GetHd` / `GetTl`.
 - `funs/` — `MakeFun3` / `CallFun` / `CallFun2` / `Apply` / `ApplyLast` (builds closures via `crate::terms::make_fun`). `call_fun` **classifies its target's shape before the closure-apply seam** and raises the oracle's structured `error` reasons `{badfun,Fun}` / `{badarity,{Fun,Args}}` (C's `call_fun` + `expand_error_value`); see `funs/CONTEXT.md`.
 - `exceptions/` (`mod.rs`, `raise.rs`, `stacktrace.rs`, `tests/`) — `Try`/`Catch`/`Badmatch`/`CaseEnd`/`TryCaseEnd`/`Badrecord`/`IfEnd`/`Raise`/`TryCase`/`TryEnd`/`CatchEnd`/`BuildStacktrace`/`RawRaise`.
-- `floats/` (`mod.rs`, `arith.rs`, `convert.rs`) — `Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`.
+- `floats/` (`mod.rs`, `arith.rs`, `convert.rs`) — `Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`. Detail: `floats/CONTEXT.md`.
 - `maps/` (`mod.rs`, `read.rs`, `write.rs`) — `GetMapElements`/`HasMapFields`/`PutMapAssoc`/`PutMapExact`.
 - `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is this sub-node's `#[allow(unsafe_code)]` module (`records/raw.rs` is the other one in the node); `create/` = `bs_create_bin`, `matching/` = the match commands. Endianness: `matching/reads.rs::field_is_little` is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit` normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand carries it).
 - `receive.rs` — `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`/`RecvMarkerReserve`/`RecvMarkerBind`/`RecvMarkerUse`/`RecvMarkerClear`.
