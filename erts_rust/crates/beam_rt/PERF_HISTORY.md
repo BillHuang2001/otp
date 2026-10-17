@@ -3,6 +3,7 @@
 Two **dated, HEAD-labelled** snapshots of the Rust runtime taken with the **same method**, so the behavioural changes that landed between them read off directly.
 Both are **historical records kept verbatim**: each describes the tree at *its* HEAD, not today's, and neither is the figure to quote for the present tree.
 The present-tree figures are in [`PERF.md`](PERF.md) (`CURRENT` plus the standing *Current startup regime* note), the per-call dispatch and copy-out analyses are in [`PERF_DISPATCH.md`](PERF_DISPATCH.md), the measurement narrative is [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md), and the bench driver's own environment record is [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md).
+A `copy-out OFF`/`copy-out ON` or `Path A`/`Path B` arm label names that comparison's arm as it was at its own HEAD — [`PERF_DISPATCH.md`](PERF_DISPATCH.md)'s *Measurement provenance* note records what each arm did then, since both arms of the present tree copy a container result and only the destination differs.
 `BEFORE` is the pre-change baseline; `AFTER` is the same method re-run after the execution tier defaulted to the native baseline JIT for every process and the registered-BIF dispatch prologue was cut, with a `BEAM_RT_TIER=interpreter` column added so a **tier effect** reads apart from a **dispatch-prologue effect**.
 Every number here is **measured, never modelled**; a sys-only workload that cannot produce a Rust-side figure is recorded as `skipped(<reason>)` with no number.
 

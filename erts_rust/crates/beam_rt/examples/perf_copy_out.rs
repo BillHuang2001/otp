@@ -73,6 +73,17 @@
 //! not a copy-out-on/off difference; the three `copy*` rows decompose the shared copier further,
 //! because they call it directly.
 //!
+//! # Provenance of the printed row labels
+//!
+//! The row strings still read `copy-out OFF` / `copy-out ON`, and they are kept byte-identical so a
+//! previously recorded run stays attributable - but they name the two **destinations** above, never
+//! a copy vs no-copy split: the `A` rows copy onto the `-eval` store and rewind the pool exactly as
+//! the `B` rows copy onto the young heap and rewind it. The `PERF_DISPATCH.md` *Measurement
+//! provenance* note records what those labels meant at HEADs the published figures were taken at:
+//! there a table-less `RuntimeContext` had no re-homing destination at all, so the `A` side really
+//! skipped the copy - which is why the published `B - A` deltas still attribute that time to the
+//! copy, and why a run of this harness today will not reproduce them as copy-vs-no-copy.
+//!
 //! # The guard: is the copy-out actually happening?
 //!
 //! The copy-out's **process-heap arm** is only reachable from a context that has a process table,

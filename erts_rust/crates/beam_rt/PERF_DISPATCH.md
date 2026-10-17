@@ -6,6 +6,14 @@ Current cross-runtime and execution-tier figures are in [`PERF.md`](PERF.md); th
 `DISPATCH-CUT` cuts the registered-BIF dispatch prologue (the per-context dispatch memo, the byte-hashed slot, the empty-NIF short-circuit, and the path-C regression the byte hash introduced); `COPY-OUT-CUT` cuts the BIF-result copy-out's wasted graph walk and needless retry.
 Every number here is **measured, never modelled**, and absolute timings are load-polluted on every host this was run on — read the ratios and the interleaved pairs, with both sides named.
 
+## Measurement provenance — the arm labels (`Path A`/`Path B`, `copy-out ON`/`OFF`)
+The two analyses below label their arms **as they were at the HEAD each figure was taken at**, and at every one of those HEADs the BIF-result copy-out had exactly **one** destination: the running process's scanned young heap.
+"`copy-out OFF`" and "`Path A`" therefore mean that the copy-out's **process-heap arm was unreachable**: `RuntimeContext::new` leaves `mailbox_table` as `None`, and `move_result_into_process_heap` opened with `mailbox_table.as_deref_mut()?`, so such a context neither copied the result nor rewound the pool.
+That is no longer what the same construction does: today `RuntimeContext::call_registered` re-homes a container result on **both** routes — the process's young heap when there is a process, the runtime's `-eval` store (`Runtime::eval_heap` + the escaped-payload table `Runtime::eval_off_heap`, `src/context/pool.rs::move_result_into_runtime_store`) when there is none — and rewinds the pool either way, so the two arms now differ only in their **destination**.
+Every figure in this file stands as the record of the comparison it names, never as a prediction of what the same two rows would read on today's tree, where an A/B of these two arms would no longer isolate the copy-out.
+The attribution those figures support — that most of the ≈ 149 ns/call is the copy itself — was drawn from the arm that really skipped the copy, which is exactly why it still stands.
+[`PERF_HISTORY.md`](PERF_HISTORY.md), [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) and `examples/perf_copy_out.rs` (whose printed rows keep the historical `copy-out OFF`/`ON` text) all point here rather than restating it.
+
 ## `DISPATCH-CUT` snapshot — HEAD `af6d8b07bd` (+ `1b643ead0b`)
 ### What changed
 Three cuts to the **registered-BIF dispatch prologue** (`src/context/calls.rs`,
@@ -47,8 +55,8 @@ AFTER-FIXED pass at **2.51 / 2.31 / 2.31**. Absolute ns therefore do **not** com
 three blocks; the **marginal-vs-control** figure and the **before/after ratio at the same row**
 (with both sides named) are the signal, and even those carry the load caveat.
 ### Registered-BIF per-call cost — `perf_call`
-Path A = `RuntimeContext::new` (the `-eval` shape: copy-out skipped by construction).
-Path B = `RuntimeContext::for_process` (the scheduler shape: copy-out + pooled rewind ON).
+Path A = `RuntimeContext::new` (the `-eval` shape: at this HEAD the copy-out skipped by construction — see *Measurement provenance*).
+Path B = `RuntimeContext::for_process` (the scheduler shape: copy-out + pooled rewind ON; today path A copies too, onto the `-eval` store instead of the young heap).
 | row (path A) | BEFORE ns/call | AFTER ns/call | ratio (AFTER/BEFORE) |
 |---|---|---|---|
 | `erlang:abs/1` | 67.37 | 46.51 | 0.69 |
@@ -102,6 +110,7 @@ Path C is back **below** the BEFORE band (≈ 0.78× of 285.23 at a *lower* load
 rows (their keys were never colliding in the offending slot), so the fix is specific to the
 collision, not a general re-measurement.
 ### The `emqx_base62:encode/1` A/B — controlled, copy-out ON vs OFF
+Provenance: this A/B's `OFF` arm is the copy-out (and with it the rewind) removed by a temporary, never-committed edit, i.e. a container result left on the pooled heap — the *Measurement provenance* section above records why neither label describes today's arms, of which both copy and only the destination differs.
 Between m9 and m10 `tools/bench/RESULTS.md` recorded `emqx_base62_encode` at 10 283 → 16 601 ns/call
 (+61.4 %) while its three sibling `foreign` cases improved 8–9 %; two hypotheses were on the table —
 **(i)** the m10 copy-out seam (`move_result_into_process_heap` + its rewind guard) made
@@ -143,7 +152,7 @@ behaviour-adjacent, so this is the authoritative check that no result moved.
   with `erlc` once per invocation, so its *first* samples carry first-entry compile + load cost;
   the slope cancels that, the absolute ms do not.
 ## The BIF-result copy-out cut (`COPY-OUT-CUT`)
-
+Provenance: the `BEFORE — path A` block below is the table-less `RuntimeContext::new` arm, which at HEAD `9d238e22bc` had no re-homing destination at all — `move_result_into_process_heap` opened with `mailbox_table.as_deref_mut()?`, so it neither copied nor rewound — and today's tree instead copies it onto the `-eval` store; the figures stand as that comparison's record (see *Measurement provenance* above).
 HEAD `9d238e22bc8f143cec056e95ca9d19af0fa960b7` (BEFORE) → `4de5b69109e93a116c38793054b472fab35190ec` (AFTER).
 Host: 8-core x86-64 dev container, loadavg 1-min **6.55 → 20.5** during the BEFORE window and
 **≈ 1.15** during the AFTER A/B (per-block `/proc/loadavg` is quoted with each table below, exactly as
@@ -174,7 +183,7 @@ requires an empty source `OffHeapTable`, `!reentrant`, an `Ok` result, a schedul
 (`mailbox_table.is_some()`) and a **successful** copy before `Heap::reset_to(mark)`; a term that cannot
 be re-homed leaves both the result and the pool exactly as they were.
 
-### BEFORE — path A (`RuntimeContext::new`, copy-out skipped by construction), 100 000 calls
+### BEFORE — path A (`RuntimeContext::new`, copy-out skipped by construction at this HEAD — see *Measurement provenance*), 100 000 calls
 loadavg 1-min: 6.55 / 2.00 / 4.00 across the three runs.
 
 | row | run 1 | run 2 | run 3 |
