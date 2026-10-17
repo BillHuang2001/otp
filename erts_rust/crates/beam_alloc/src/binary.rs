@@ -46,7 +46,7 @@
 //! the reference count at 1; [`Clone`] bumps it through
 //! [`RefCount::inc`](crate::refcount::RefCount::inc); the final [`Drop`] — the one
 //! that drives the count to 0 — frees the buffer through the **same** [`AllocRef`]
-//! and the **exact** [`Layout`] used at construction. There is no `Sync` handle
+//! and the **exact** [`Layout`](core::alloc::Layout) used at construction. There is no `Sync` handle
 //! because the on-heap `BinRef` ownership model is single-threaded per process, but
 //! the handles are [`Send`]: the buffer is never mutated after construction (only
 //! the atomic reference count changes), so moving a handle to another thread cannot
@@ -61,13 +61,13 @@
 //! the current size, an append loop is **amortised linear** instead of O(n²) — the point
 //! of the whole capacity word.
 //!
-//! An append loop therefore sees two outcomes (see [`GrowOutcome`](binary::GrowOutcome)):
+//! An append loop therefore sees two outcomes (see [`GrowOutcome`]):
 //!
 //! * **In place** — the reservation already covers the request, or covers the grown
 //!   target, so only `header.capacity` moves. `data_ptr()` is unchanged, which means every
 //!   on-heap `BinRef.val` word pointing at this payload stays valid and no fixup is owed.
 //! * **Moved** — a bigger reservation was needed, so the payload was reallocated and
-//!   copied. The returned [`Relocation`](binary::Relocation) reports the old/new payload
+//!   copied. The returned [`Relocation`] reports the old/new payload
 //!   addresses, and the host must republish the term over the new pointer (exactly C's
 //!   non-writable fallback arm). Nothing on the *process* heap is affected: the payload is
 //!   off-heap, so no `beam_gc` root set, `StackFrame` or `RootSet` contract changes.
