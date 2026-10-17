@@ -118,10 +118,6 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   bounds; `erl_drv_getenv` sets `size` on an absent key in the rust runtime;
   `driver_dl_error()`'s message length differs (33 vs 25); `driver_dl_open(NULL)` +
   `driver_dl_sym` SIGSEGVs the oracle.
-- The **static driver namespace** resolves only `tcp_inet` in the Rust runtime:
-  `open_port({spawn_driver, "udp_inet"}, [])` and `{spawn_driver, "ram_file_drv"}` open a live port in
-  the oracle (`erlang:port_info(P, name)` answers the driver name) but raise `error:badarg` in the Rust
-  runtime, so that port-open shape is unpinnable. Owner: `beam_rt` (driver lookup) / `crates/beam_io`.
 
 ## A.5 — distribution wire / ETF (owner: `beam_codec`, `beam_rt`)
 - A `[compressed]` image is byte-identical only for a term whose image compresses to a single
@@ -264,35 +260,20 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   where the oracle refuses it.
 
 ## A.4 — port/driver observable grammar (owner: `beam_rt` / `beam_io`)
-- **A built-in driver's reply bytes never reach its owner** (owner: `beam_rt`, `src/port.rs`): a
-  port opened as `{spawn_driver,"ram_file_drv"}` / `"udp_inet"` is a descriptor-less built-in port,
-  whose `Driver::output` queue is never harvested, so no reply term is observable. Measured:
-  `port_command(P, <<1,0,0,0,3,97,98,99>>)` then a 2 s `receive` ⇒ oracle
-  `{P,{data,<<3,0,0,0,0>>}}` vs `beam_rt` `timeout`; `port_info(P,input)` ⇒ oracle `{input,5}` vs
-  `beam_rt` `{input,0}`. Consequence: the whole `efile` reply matrix of `ram_file_drv` (the
-  `open`/`read`/`lseek`/`write`/`truncate`/… replies, the read-back bytes/eof/positions and the
-  `{error,…}` refusals) and every `udp_inet` datagram delivery are unpinnable. `src/corpus/ram_file.rs`
-  and `src/corpus/udp.rs` pin only the port-surface shapes that agree (driver name, `os_pid`, byte
-  counters, opcode acceptance, close/`badarg`); the exact probes are in their module docs.
-- **`erlang:port_control/3` reaches no built-in driver's named-verb transport** (owner: `beam_rt`
-  `src/port.rs` / `beam_io`): the operation is forwarded as the C-driver convention's decimal string
-  while the built-in inet drivers' `Driver::control` speaks named verbs, so no `INET_REQ_*` /
-  `PACKET_REQ_*` code is reachable. Measured `port_control(P, 1 + 16#03f1a300, <<1,2,0>>)` ⇒ oracle
-  `[1]` vs `beam_rt` `error:badarg`; this is the other blocker behind `gen_udp:open/2` (oracle
-  `{ok,Port}` vs `beam_rt` `{error,einval}`).
-- **`port_command/2` on a socket-less inet port**: the oracle raises `badarg` (the C `!IS_OPEN`
-  check), `beam_rt` answers `true`/`{true,none}`. Owner: `beam_rt` / `beam_io`.
-- **`port_info/2` item set**: `queue_size` and `memory` answer in the oracle (`{queue_size,0}`,
-  `{memory,48}`) and are `badarg` in `beam_rt`'s native `port_info/2` floor. Owner: `beam_rt`.
-- **Port exit signalling**: with the owner trapping exits, `port_close(P)` delivers
-  `{'EXIT',P,normal}` in the oracle and nothing in `beam_rt`; `erlang:monitor(port,P)` +
-  `port_close/1` behaves the same way. Owner: `beam_rt`.
-- **The registry names the oracle does not link**: `beam_rt` opens a live port for
-  `{spawn_driver,"fd"}` / `"efile"`, the oracle raises `badarg`. Owner: `beam_io` / `beam_rt`.
-- **Unimplemented port BIFs**: `erlang:port_connect/2` and `erlang:port_set_data/2` are typed exit-3
-  capability gaps, and `erlang:register/2` of a *port* under a name is unsupported. Owner:
-  `beam_bifs` / `beam_rt`.
-- The `{fd,…}` port grammar is disjoint; `eof` is never delivered; a non-iodata `port_command/2`
+- **`port_command/2` on a socket-less inet port — measured and unpinnable, not a divergence.**
+  The oracle raises `badarg` (the C's `!IS_OPEN` guard, `packet_inet_command`,
+  `inet_drv.c:15051`). `beam_rt`'s first `port_command/2` answers `true` and the port then dies via
+  `driver_failure_posix(EINVAL)`; with a caller-ref prefix the port survives and
+  `{error,enotconn}` arrives out of band, the driver refusing the delivered round with a typed
+  `BadArg` after retaining the bytes. Neither the return value nor the reason is a stable
+  observable on either side, so the shape is deliberately unpinned (a case would be a committed
+  `mismatch`). Owner: `beam_rt` / `beam_io`.
+- **`port_info(P, memory)` after `port_set_data/2`**: the item agrees on a plain port
+  (`{memory, N}`), but the word count differs once a term is stored on it (oracle `120` vs rust
+  `136`) — an accounting residual, so only the plain-port item and the
+  `port_set_data/2`/`port_get_data/1` round trip are pinned. Owner: `beam_rt`.
+- A `driver_output2` **DATA reply** is unreachable as an improper list in `beam_rt` (the producer
+  flattens the header/body split), so that one delivery shape stays unpinned. Owner: `beam_abi`.- The `{fd,…}` port grammar is disjoint; `eof` is never delivered; a non-iodata `port_command/2`
   is accepted; only the oracle writes a
   missing-`{spawn,Cmd}` shell stderr line.
 - The **`{line,N}` half now agrees and is pinned**: the runtime reproduces the oracle's line framing
