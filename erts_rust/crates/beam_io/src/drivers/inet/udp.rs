@@ -147,12 +147,13 @@ use crate::poller::{Interest, Token};
 use super::opt::{get_options, set_options, SocketOptions};
 use super::opcode::{decode as decode_opcode, Opcode};
 use super::sys::{
-    bind_socket, close_fd, connect_socket, dgram_socket_fd, has_peer, local_port, recv_from,
-    send_connected, send_to,
+    bind_socket, close_fd, connect_socket, dgram_socket_fd, has_peer, hostname, local_port,
+    recv_from, send_connected, send_to, socket_type,
 };
 use super::wire::{
-    ctl_error, ctl_ok, ctl_xerror, pack_address, parse_address, split_address, INET_AF_INET,
-    INET_PROTO_DEFAULT, INET_PROTO_UDP, INET_TYPE_DGRAM,
+    ctl_error, ctl_ok, ctl_xerror, pack_address, parse_address, split_address, InetAddr,
+    INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_PROTO_UDP,
+    INET_TYPE_DGRAM, INET_TYPE_STREAM,
 };
 use super::InetState;
 
@@ -184,6 +185,23 @@ pub struct UdpInetDriver {
     /// ([`SocketOptions`]). The driver's socket is always a datagram socket, so the shared
     /// store is always driven with its stream gate off.
     options: SocketOptions,
+    /// The C descriptor's **cached** address family (`desc->sfamily`) as a wire tag, `0` meaning
+    /// "unset". `INET_REQ_GETTYPE` reports this cache rather than probing the socket
+    /// (`inet_drv.c:11165`-`:11203`), so it is written when a socket is created or adopted
+    /// (`inet_ctl_open`, `:5214`; `inet_ctl_fdopen`, `:5265`) and **never** cleared by a close.
+    family: u16,
+    /// The C descriptor's **cached** socket type (`desc->stype`), same lifecycle as
+    /// [`UdpInetDriver::family`] — this is what makes a closed port still report
+    /// `[1,0,0,0,1,0,0,0,2]` where a never-opened one reports `[0]einval`.
+    stype: u16,
+    /// The C's `desc->name_ptr`/`name_addr`: a **fake** local address installed by
+    /// `INET_REQ_SETNAME` (`inet_drv.c:11386`), which `INET_REQ_NAME` reports in place of
+    /// `getsockname(2)` until an empty `SETNAME` clears it (`:11351`-`:11360`).
+    name_addr: Option<InetAddr>,
+    /// The C's `desc->peer_ptr`/`peer_addr`: the `INET_REQ_SETPEER` counterpart of
+    /// [`UdpInetDriver::name_addr`], reported by `INET_REQ_PEER` **after** its connection guard
+    /// (`inet_drv.c:11282`-`:11290`).
+    peer_addr: Option<InetAddr>,
 }
 
 impl UdpInetDriver {
@@ -199,6 +217,12 @@ impl UdpInetDriver {
             interest: Interest::READABLE,
             state: InetState::Closed,
             options: SocketOptions::default(),
+            // A freshly created descriptor carries no cached family/type yet (`inet_init_desc`),
+            // so `INET_REQ_GETTYPE` answers the C's `einval` until a socket exists.
+            family: 0,
+            stype: 0,
+            name_addr: None,
+            peer_addr: None,
         }
     }
 
@@ -206,14 +230,18 @@ impl UdpInetDriver {
     /// `stop`/`close`/`Drop`).
     ///
     /// The socket's state is read from the kernel, exactly as the C's `INET_REQ_FDOPEN` does
-    /// (`inet_ctl_fdopen`, `inet_drv.c:5250`-`:5260`): a socket that answers `getpeername(2)`
+    /// (`inet_ctl_fdopen`, `inet_drv.c:5250`-`:5265`): a socket that answers `getpeername(2)`
     /// has a default peer and starts in [`InetState::Connected`], anything else in
-    /// [`InetState::Open`]. `fd` is put into non-blocking mode by [`Driver::start`].
+    /// [`InetState::Open`]. The adopted descriptor's cached family/type — what `INET_REQ_GETTYPE`
+    /// reports — are recorded from the adoption, the way `inet_ctl_fdopen` stores
+    /// `desc->sfamily`/`desc->stype` (`:5265`). `fd` is put into non-blocking mode by
+    /// [`Driver::start`].
     ///
     /// # Errors
     ///
     /// Returns `BeamError::Io` when `getpeername(2)` fails for a reason other than "not
-    /// connected" (i.e. when `fd` is not a usable socket).
+    /// connected" (i.e. when `fd` is not a usable socket), or when the kernel cannot report its
+    /// `SO_TYPE`.
     pub fn from_socket(fd: RawFd) -> Result<UdpInetDriver> {
         let state = if has_peer(fd)? {
             InetState::Connected
@@ -226,6 +254,10 @@ impl UdpInetDriver {
             interest: Interest::READABLE,
             state,
             options: SocketOptions::default(),
+            family: u16::from(INET_AF_INET),
+            stype: socket_type(fd)?,
+            name_addr: None,
+            peer_addr: None,
         })
     }
 
@@ -422,6 +454,11 @@ impl UdpInetDriver {
         }
         let fd = dgram_socket_fd()?;
         self.adopt(ctx, fd)?;
+        // The C caches the descriptor's family and type here (`inet_ctl_open`, `:5214`-`:5216`),
+        // which is what `INET_REQ_GETTYPE` reports for the rest of the port's life — a `close`
+        // never clears them.
+        self.family = u16::from(INET_AF_INET);
+        self.stype = u16::from(INET_TYPE_DGRAM);
         self.state = InetState::Open;
         Ok(ctl_ok())
     }
@@ -442,6 +479,20 @@ impl UdpInetDriver {
             return Ok(ctl_xerror("exbadport"));
         }
         let address = parse_address(arg)?;
+        self.bind_address(address)
+    }
+
+    /// The body of `INET_REQ_BIND` once the address has been decoded: the C's `sock_bind` and the
+    /// port re-read (`inet_drv.c:11426`-`:11447`).
+    ///
+    /// The numeric route decodes the argument itself (so its `inet_set_faddress` refusals can be
+    /// rendered instead of raised) and lands here; the named route reaches it through
+    /// [`UdpInetDriver::verb_bind`].
+    ///
+    /// # Errors
+    ///
+    /// `BeamError::Io` when the follow-up `getsockname(2)` fails.
+    fn bind_address(&mut self, address: InetAddr) -> Result<Vec<u8>> {
         let fd = self.socket.ok_or_else(error::badarg)?;
         if let Err(err) = bind_socket(fd, &address) {
             return Ok(ctl_error(err));
@@ -483,6 +534,17 @@ impl UdpInetDriver {
             return Ok(ctl_ok());
         }
         let address = self.connect_address(arg)?;
+        self.connect_to(address)
+    }
+
+    /// The C's UDP `connect(2)` body (`inet_drv.c:14824`-`:14850`) once the default peer has been
+    /// decoded: install it, or report the kernel's `EISCONN` spelling of "already connected".
+    ///
+    /// # Errors
+    ///
+    /// `BeamError::BadArg` when the socket vanished between the guard and here (unreachable from
+    /// the verbs, which all check first).
+    fn connect_to(&mut self, address: InetAddr) -> Result<Vec<u8>> {
         let fd = self.socket.ok_or_else(error::badarg)?;
         match connect_socket(fd, &address) {
             Ok(()) => {
@@ -627,6 +689,45 @@ impl UdpInetDriver {
         get_options(&self.options, false, self.socket, arg)
     }
 
+    /// The `INET_REQ_NAME` reply (`inet_drv.c:11329`).
+    ///
+    /// The C answers the descriptor's cached `name_ptr` **first** (`:11351`-`:11360`) — the fake
+    /// local address an `INET_REQ_SETNAME` installed — and reaches `getsockname(2)` only when it is
+    /// NULL. Measured against the oracle: `SETNAME <<1,4,210,1,2,3,4>>` then `NAME` ⇒
+    /// `[1,1,4,210,1,2,3,4]`, on a bare port as well as on an opened one, and the plain
+    /// `getsockname(2)` reply (or its errno) comes back once an empty `SETNAME` clears it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`super::wire::name_reply`] returns for the `getsockname(2)` path.
+    fn name_reply(&self) -> Result<Vec<u8>> {
+        match self.name_addr {
+            Some(address) => Ok(packed_ok(address)),
+            None => super::wire::name_reply(self.socket),
+        }
+    }
+
+    /// The `INET_REQ_PEER` reply (`inet_drv.c:11272`).
+    ///
+    /// The C's order is the connection guard (`INET_F_ACTIVE`, `:11282`) **then** the `peer_ptr`
+    /// short-circuit (`:11286`), so a fake peer installed by `INET_REQ_SETPEER` is reported only on
+    /// a connected socket. Measured: `SETPEER` + `PEER` on a bare port ⇒ `[0]enotconn`; after a
+    /// `connect` ⇒ the fake address, while `INET_REQ_GETPADDRS` keeps reporting the real one (it
+    /// calls `sock_peer` directly, `:11267`).
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`super::wire::peer_reply`] returns for the `getpeername(2)` path.
+    fn peer_reply(&self) -> Result<Vec<u8>> {
+        if !self.state.is_connected() {
+            return Ok(ctl_xerror("enotconn"));
+        }
+        match self.peer_addr {
+            Some(address) => Ok(packed_ok(address)),
+            None => super::wire::peer_reply(self.socket, true),
+        }
+    }
+
     /// Routes one decoded numeric control opcode to the verb or shared reply that serves it.
     ///
     /// This is the datagram half of the bridge documented in [`super::opcode`]: `packet_inet_ctl`
@@ -635,6 +736,12 @@ impl UdpInetDriver {
     /// (`:10988`). A number **neither** switch has a case for — the TCP-only stream requests, or a
     /// wrapped command — reaches `inet_ctl`'s `default:` arm and answers `ctl_xerror(EXBADPORT)`
     /// ⇒ `[0]exbadport` (measured: `TCP_REQ_RECV` 42 and `ACCEPT` 26 on a UDP port).
+    ///
+    /// Every arm reproduces the C's **own guard order**, which is what makes the refusals
+    /// byte-exact: a length check before a state check for `BIND`, the reverse for `CONNECT` and
+    /// `PACKET_REQ_RECV`. A `ctl_error(EINVAL)`-class refusal is an `Ok([0]… "einval")` reply, never
+    /// a raise; only an opcode the C does serve but this floor cannot is a typed
+    /// [`beam_common::BeamError`].
     ///
     /// # Errors
     ///
@@ -648,21 +755,54 @@ impl UdpInetDriver {
     ) -> Result<Vec<u8>> {
         match op {
             // The verbs whose operand is already the C's request payload.
-            Opcode::Open => self.verb_open(ctx, arg),
-            Opcode::Bind => self.verb_bind(arg),
+            //
+            // `packet_inet_ctl`'s `INET_REQ_OPEN` rejects a payload that is not the three-byte
+            // `[AF, TYPE, PROTO]` record with `ctl_error(EINVAL)` *before* decoding it (`:14580`).
+            Opcode::Open => {
+                if arg.len() != 3 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                self.verb_open(ctx, arg)
+            }
+            // `INET_REQ_BIND` (`inet_ctl`, `:11409`) checks `len < 2 ⇒ EINVAL` (`:11417`) **before**
+            // the state guard (`state != INET_STATE_OPEN ⇒ EXBADPORT`, `:11419`) and only then
+            // decodes the address with `inet_set_faddress` (`:11421`). So a bare port answers
+            // `einval` for an empty operand and `exbadport` for a well-formed address (measured),
+            // and the address decode's own refusals are the C's `ctl_xerror` names.
+            Opcode::Bind => {
+                if arg.len() < 2 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if self.state != InetState::Open {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                match faddress(self.family, arg) {
+                    Ok(address) => self.bind_address(address),
+                    Err(name) => Ok(ctl_xerror(name)),
+                }
+            }
             Opcode::Setopts => self.verb_setopts(arg),
             Opcode::Getopts => self.verb_getopts(arg),
             Opcode::Close => self.verb_close(ctx),
-            // `packet_inet_ctl`'s `INET_REQ_CONNECT` payload is `Timeout(4), Address(N)` and the C
-            // rejects fewer than six bytes with `ctl_error(EINVAL)` (`:14816`-`:14830`). The C's
-            // *empty* payload is the "dissolve the default peer" form (`:14740`); it is
-            // unreachable through a numeric opcode because the numeric route always needs the
-            // six-byte prefix, so the empty case never arises here.
+            // `packet_inet_ctl`'s `INET_REQ_CONNECT` (`:14712`) guards in this order: `!IS_OPEN ⇒
+            // EXBADPORT` (`:14727`), the **empty** payload = "dissolve the default peer" (`:14803`),
+            // then `len < 6 ⇒ EINVAL` (`:14809`). The payload is `Timeout(4), Address(N)`, so the
+            // address is decoded from `arg[4..]` with the C's `inet_set_faddress` classification
+            // (`:14814`) instead of being guessed at by [`UdpInetDriver::connect_address`].
             Opcode::Connect => {
+                if !self.has_socket() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                if arg.is_empty() {
+                    return self.verb_connect(arg);
+                }
                 if arg.len() < 6 {
                     return Ok(ctl_xerror("einval"));
                 }
-                self.verb_connect(arg)
+                match faddress(self.family, &arg[4..]) {
+                    Ok(address) => self.connect_to(address),
+                    Err(name) => Ok(ctl_xerror(name)),
+                }
             }
             // `PACKET_REQ_RECV` is `packet_inet_ctl`'s own receive: it requires a socket
             // (`!IS_OPEN ⇒ `[0]exbadport`, `:14981`) and an eight-byte `Timeout(4), Length(4)`
@@ -684,36 +824,160 @@ impl UdpInetDriver {
                 self.verb_recv(ctx, &[])
             }
             // The shared-`inet_ctl` replies both drivers build identically.
-            Opcode::Peer => super::wire::peer_reply(self.socket, self.state.is_connected()),
-            Opcode::Name => super::wire::name_reply(self.socket),
-            Opcode::Gettype => {
-                if self.has_socket() {
-                    Ok(super::wire::gettype_reply(
-                        u16::from(INET_AF_INET),
-                        u16::from(INET_TYPE_DGRAM),
-                    ))
-                } else {
-                    Ok(super::wire::gettype_reply(0, 0))
-                }
-            }
+            Opcode::Peer => self.peer_reply(),
+            Opcode::Name => self.name_reply(),
+            // `INET_REQ_GETTYPE` (`:11165`-`:11203`) has **no `IS_OPEN` guard**: it switches on the
+            // descriptor's cached `sfamily`/`stype`, which a close never clears. Hence a bare port
+            // answers `[0]einval` (nothing cached) and a closed one still reports what it was opened
+            // with — measured `[1,0,0,0,1,0,0,0,2]` after a `udp_inet` close.
+            Opcode::Gettype => Ok(super::wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(super::wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(super::wire::getstatus_reply(self.state.state_code())),
             Opcode::Getstat => super::wire::getstat_reply(arg),
-            // The C's switches DO serve these, but this floor does not: a typed gap.
-            Opcode::Gethostname
-            | Opcode::Getservbyname
-            | Opcode::Getservbyport
-            | Opcode::Setname
-            | Opcode::Setpeer
-            | Opcode::Getiflist
-            | Opcode::Ifget
-            | Opcode::Ifset
-            | Opcode::Subscribe
-            | Opcode::Getifaddrs
-            | Opcode::Ignorefd
-            | Opcode::Getladdrs
-            | Opcode::Getpaddrs
-            | Opcode::Fdopen => Err(op.not_served()),
+            // `INET_REQ_GETHOSTNAME` (`:11219`): `len != 0 ⇒ EINVAL`, else the local
+            // `gethostname(2)` payload. `sock_hostname` is a plain syscall — no resolver is
+            // involved — so the whole arm is exact (measured `[1] ++ "billmini"`).
+            Opcode::Gethostname => {
+                if !arg.is_empty() {
+                    return Ok(ctl_xerror("einval"));
+                }
+                let mut reply = ctl_ok();
+                reply.extend_from_slice(&hostname()?);
+                Ok(reply)
+            }
+            // `packet_inet_ctl`'s `INET_REQ_FDOPEN` (`:14639`) guards in this order:
+            // `len != 6 && len != 10 ⇒ EINVAL` (`:14647`), then the family tag
+            // (`⇒ eafnosupport`, `:14659`), then the type (`⇒ EINVAL`, `:14671`). Adopting the
+            // caller's descriptor — the `inet_ctl_fdopen` call at `:14677` — is a capability this
+            // floor does not have: it would have to take ownership of a descriptor number handed
+            // to it from Erlang and re-derive its state, which the `Driver` seam's construction
+            // path (a `DriverFactory` taking no argument) cannot express, so it stays a typed gap.
+            Opcode::Fdopen => {
+                if arg.len() != 6 && arg.len() != 10 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if arg[0] != INET_AF_INET {
+                    return Ok(ctl_xerror("eafnosupport"));
+                }
+                if arg[1] != INET_TYPE_STREAM && arg[1] != INET_TYPE_DGRAM {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            // The name-service lookups (`:11493`, `:11525`): only the operand-length refusals are
+            // served (`len < 2` / `len < 3`, `:11590`/`:11622`). The lookup itself is
+            // `getservbyname(3)`/`getservbyport(3)`, a libc call this crate's `sys` layer does not
+            // wrap, so a well-formed request is a typed gap (the C answers `[1] ++ port_be16` or
+            // `[0]einval` when the lookup fails).
+            Opcode::Getservbyname => {
+                if arg.len() < 2 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            Opcode::Getservbyport => {
+                if arg.len() < 3 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            // `INET_REQ_SETNAME` (`:11386`): an **empty** operand clears the fake address
+            // (`desc->name_ptr = NULL`, `:11392`) and answers `[1]`; a one-byte one is the C's
+            // `len < 2 ⇒ EINVAL` (`:11396`); anything else is decoded by `inet_set_faddress`
+            // (`:4795`) and stored, its `str_einval`/`str_eafnosupport` rendered through
+            // `ctl_xerror` (`:11399`). `INET_REQ_NAME` then reports the stored address.
+            Opcode::Setname => {
+                if arg.is_empty() {
+                    self.name_addr = None;
+                    return Ok(ctl_ok());
+                }
+                if arg.len() < 2 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                match faddress(self.family, arg) {
+                    Ok(address) => {
+                        self.name_addr = Some(address);
+                        Ok(ctl_ok())
+                    }
+                    Err(name) => Ok(ctl_xerror(name)),
+                }
+            }
+            // `INET_REQ_SETPEER` (`:11301`): the same shape, one field over — the fake peer is
+            // reported by `INET_REQ_PEER` (only while connected) and cleared by an empty operand.
+            Opcode::Setpeer => {
+                if arg.is_empty() {
+                    self.peer_addr = None;
+                    return Ok(ctl_ok());
+                }
+                if arg.len() < 2 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                match faddress(self.family, arg) {
+                    Ok(address) => {
+                        self.peer_addr = Some(address);
+                        Ok(ctl_ok())
+                    }
+                    Err(name) => Ok(ctl_xerror(name)),
+                }
+            }
+            // The `getifaddrs(3)`-backed family (`:11067`, `:11078`, `:11089`, `:11100`): only the
+            // `!IS_OPEN ⇒ EXBADPORT` refusal is exact; with a socket the reply needs a live
+            // interface walk (`inet_ctl_getiflist`/`_ifget`/`_ifset`/`_ifaddrs`), which is a typed
+            // gap here rather than a fabricated table.
+            Opcode::Getiflist | Opcode::Ifget | Opcode::Ifset | Opcode::Getifaddrs => {
+                if !self.has_socket() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                Err(op.not_served())
+            }
+            // `INET_REQ_IGNOREFD` (`:11456`): `!IS_CONNECTED ⇒ ENOTCONN` (`:11462`), then
+            // `stype != SOCK_STREAM ⇒ EINVAL` (`:11464`) — and then the C reads `*buf` with **no
+            // length check at all** (`:11465`). A *connected* socket is reachable here through the
+            // `connect` verb, but it is always a datagram socket, so this driver always lands on
+            // the `einval` arm (measured `[0]einval` on a connected datagram port); the
+            // ignore/unignore body is stream-only and therefore a typed gap.
+            Opcode::Ignorefd => {
+                if !self.state.is_connected() {
+                    return Ok(ctl_xerror("enotconn"));
+                }
+                if self.stype != u16::from(INET_TYPE_STREAM) {
+                    return Ok(ctl_xerror("einval"));
+                }
+                Err(op.not_served())
+            }
+            // `INET_REQ_GETLADDRS`/`GETPADDRS` (`:11324`, `:11236`): `len != 4 ⇒ EINVAL`, then
+            // `!IS_OPEN ⇒ EXBADPORT`, and the **non-SCTP fallback** of each is byte-identical to
+            // the `NAME`/`PEER` reply (`reply_inet_addrs(1, …)` = `[1] ++ address`, `:5013`), so
+            // both are single-sourced through those helpers — with the one C asymmetry preserved:
+            // the fallbacks call `sock_name`/`sock_peer` **directly**, so a `SETNAME`/`SETPEER`
+            // fake address is *not* reported here (measured: after `SETNAME`, `GETLADDRS` still
+            // answers the socket's own address).
+            Opcode::Getladdrs => {
+                if arg.len() != 4 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if !self.has_socket() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                super::wire::name_reply(self.socket)
+            }
+            Opcode::Getpaddrs => {
+                if arg.len() != 4 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                if !self.has_socket() {
+                    return Ok(ctl_xerror("exbadport"));
+                }
+                super::wire::peer_reply(self.socket, self.state.is_connected())
+            }
+            // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): its only op
+            // (`INET_SUBS_EMPTY_OUT_Q`) registers a **driver-side subscriber** that the driver must
+            // later notify — `send_to_subscribers(…, am_empty_out_q, …)` — whenever its output
+            // queue empties. This floor has no driver→owner message channel (see the module docs),
+            // so answering the C's `[1] ++ op ++ be32(outq)` would promise a notification it could
+            // never deliver; the C's own `-1` for an unknown op (which the oracle surfaces as a
+            // `badarg` from `port_control`) is likewise not a reply shape worth imitating.
+            Opcode::Subscribe => Err(op.not_served()),
             // `INET_REQ_LISTEN` is a case of `packet_inet_ctl` only inside `#ifdef HAVE_SCTP`
             // (`:14846`). With SCTP compiled out the case does not exist and the `default:`
             // delegates to `inet_ctl`, whose own `default:` is `ctl_xerror(EXBADPORT)`
@@ -729,6 +993,61 @@ impl UdpInetDriver {
             | Opcode::Accept
             | Opcode::Unknown => Ok(ctl_xerror("exbadport")),
         }
+    }
+}
+
+/// Renders a single stored [`InetAddr`] as the C's `reply_inet_addrs` reply
+/// (`inet_drv.c:5013`): `ctl_reply(INET_REP_OK, tbuf, sz, …)` over one packed address —
+/// `[1, family, port_hi, port_lo, a, b, c, d]`.
+///
+/// The `INET_REQ_NAME`/`INET_REQ_PEER` `name_ptr`/`peer_ptr` short-circuits (`:11351`-`:11360`,
+/// `:11286`) build exactly this shape, which is why the fake-address path and the `getsockname(2)`
+/// path ([`super::wire::name_reply`]) are byte-compatible with each other.
+fn packed_ok(address: InetAddr) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&pack_address(address.port, address.addr));
+    reply
+}
+
+/// Classifies a packed address the way the C's `inet_set_faddress` (`inet_drv.c:4795`) does,
+/// returning the parsed [`InetAddr`] or the `ctl_xerror` atom name the C would answer.
+///
+/// The C's tag switch (`:4810`-`:4843`) accepts `INET_AF_INET` (a 7-byte `[tag, port_hi, port_lo,
+/// a, b, c, d]` record, via `inet_set_address`), and `INET_AF_ANY`/`INET_AF_LOOPBACK` (a 3-byte
+/// `[tag, port_hi, port_lo]` record); every other tag — `INET_AF_INET6` included, this floor being
+/// IPv4-only — falls to `default: return str_eafnosupport` (`:4840`). A record too short for its
+/// own tag is `str_einval` (the `*len < 1` / `*len < 2` guards, `:4800`/`:4825`).
+///
+/// Measured against the oracle on a bare `udp_inet` port: `SETNAME <<1,4,210,1,2,3,4>>` ⇒ `[1]`,
+/// `SETNAME <<3,4,210>>` (the ANY form) ⇒ `[1]` reported as `<<1,4,210,0,0,0,0>>`,
+/// `SETNAME <<1>>` ⇒ `[0]einval`, `SETNAME <<9,1,2>>` ⇒ `[0]eafnosupport`.
+fn faddress(family: u16, arg: &[u8]) -> std::result::Result<InetAddr, &'static str> {
+    let tag = match arg.first() {
+        Some(tag) => *tag,
+        None => return Err("einval"),
+    };
+    match tag {
+        t if t == INET_AF_INET => parse_address(arg).map_err(|_| "einval"),
+        t if t == INET_AF_ANY || t == INET_AF_LOOPBACK => {
+            if arg.len() < 3 {
+                return Err("einval");
+            }
+            // The C's `switch (family)` on the descriptor's **cached** family (`:4826`): with
+            // `AF_INET` the ANY/LOOPBACK tag picks `INADDR_ANY`/`INADDR_LOOPBACK`; with anything
+            // else (a never-opened descriptor's `sfamily == 0`) the arm is `str_einval`.
+            if family != u16::from(INET_AF_INET) {
+                return Err("einval");
+            }
+            Ok(InetAddr {
+                port: u16::from_be_bytes([arg[1], arg[2]]),
+                addr: if tag == INET_AF_ANY {
+                    [0, 0, 0, 0]
+                } else {
+                    [127, 0, 0, 1]
+                },
+            })
+        }
+        _ => Err("eafnosupport"),
     }
 }
 
