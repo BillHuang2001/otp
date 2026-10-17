@@ -54,8 +54,8 @@
 //! trap_owner_mon    [{exit,true,normal},{down,true,port,true,normal}]   %% EXIT first, once each
 //! notrap_owner_mon  [{down,true,port,true,normal}]                      %% nothing for `normal`, survives
 //! watcher_only      [{down,true,port,true,normal}]
-//! ```
-//!
+//! connected         {true,1,2,[{exit,true,normal}]}                     %% links 1 → 2, connector told
+//! ```//!
 //! # Skip policy
 //!
 //! No `erl` on `$PATH` (and no executable `$ERTS_ORACLE`) is a **loud** skip per test, never a
@@ -230,10 +230,29 @@ fn a_watcher_that_is_not_linked_gets_only_the_down() {
 // Row 5 — the second link a `port_connect/2` adds
 // ---------------------------------------------------------------------------------------
 
+/// Row 5: `erlang:port_connect/2` **grows the port's link set** (one pid before it, two after)
+/// and the connected process — a trapping helper that is not the owner — is told of the close
+/// with exactly one `{'EXIT', Port, normal}`.
+///
+/// This is the shape that cannot be probed inline: the answer needs a second process that both
+/// connects and drains its own mailbox, so it lives in the fixture as
+/// `port_exit:connected/0` and returns `{ConnectAnswer, LinksBefore, LinksAfter, Shapes}`.
+///
+/// Measured oracle answer (OTP 29.1.1 / erts-17.1): `{true,1,2,[{exit,true,normal}]}`.
+#[test]
+fn a_connected_second_process_grows_the_links_and_gets_the_exit() {
+    let Some(oracle) = support::require_oracle("port_exit") else {
+        return;
+    };
+    agrees(
+        &oracle,
+        "io:format(\"~w~n\",[port_exit:connected()]),\nhalt(0).\n",
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Row 6 — the scheduler `run` route
 // ---------------------------------------------------------------------------------------
-
 /// Row 6a: the trapping owner's `'EXIT'` on the **scheduler** route, where the message is
 /// delivered into the recipient's mailbox (and would wake a receiver parked in a compiled
 /// `receive`) rather than returned to an evaluator.
@@ -271,4 +290,14 @@ fn the_run_route_tells_a_watcher_that_is_not_linked() {
         return;
     };
     agrees_on_the_run_route(&oracle, "watcher_only");
+}
+
+/// Row 6e: the `port_connect/2`ed second process is told on the scheduler route too — the link
+/// set grows to two and the connector gets its `'EXIT'` exactly once.
+#[test]
+fn the_run_route_tells_a_connected_second_process() {
+    let Some(oracle) = support::require_oracle("port_exit") else {
+        return;
+    };
+    agrees_on_the_run_route(&oracle, "connected");
 }

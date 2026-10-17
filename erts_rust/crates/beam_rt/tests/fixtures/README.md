@@ -1,9 +1,9 @@
 # `beam_rt` test fixtures
 
 `mailbox.beam`, `sched.beam`, `port_recv.beam`, `raise_structured.beam`,
-`function_clause_fixture.beam`, `recv_after.beam`, `dist_echo.beam` and `pingpong.beam` are
-committed oracle fixtures: real `.beam` images produced by the **system Erlang** toolchain
-(OTP 29 / `erts-17.1`), which is also the differential oracle.
+`function_clause_fixture.beam`, `recv_after.beam`, `dist_echo.beam`, `port_exit.beam` and
+`pingpong.beam` are committed oracle fixtures: real `.beam` images produced by the **system
+Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
 * `pingpong.beam` is the **two-process ping-pong** image for the `run` route's sleep
   accounting (`tests/run_route_sleep.rs`): `go/1` spawns one fun-bodied worker and runs `N`
   synchronous round trips (`Worker ! {self(), N}` / a bound-variable `receive {_, N}`, with
@@ -43,6 +43,13 @@ committed oracle fixtures: real `.beam` images produced by the **system Erlang**
   that resolves this runtime's `-sname` listener through `epmd` and sends
   `{echo, Node} ! {hello, node()}` makes the message arrive as a `DOP_REG_SEND` in the
   running process's mailbox — the value `wait/0` returns *is* the delivered payload.
+* `port_exit.beam` is the **port `'EXIT'`/`'DOWN'` on close** image (`tests/port_exit.rs`, contract
+  A.4): `trap_owner/0`, `trap_owner_mon/0`, `notrap_owner_mon/0` and `watcher_only/0` each close a
+  real `{spawn, "true"}` port and return the messages that arrived, **normalized** (`#Port<…>` /
+  `#Ref<…>` differ between two runtimes, so each is replaced by `is_port/1` / `is_reference/1`), and
+  `connected/0` does the same for a `erlang:port_connect/2`ed second process while also measuring
+  the port's link count before and after the connect (`{true,1,2,[{exit,true,normal}]}`). It pins
+  both delivery routes: the `-eval` `receive` route and the scheduler `run` route.
 * `bifent.beam` / `tmr.beam` are the **first-entry BIF dispatch** images
   (`tests/bif_entry_spawn.rs`): `bifent:fire/0` is `spawn(erlang, send, [self(), done])` followed
   by a bounded receive (`bifent:queued/0` is the regression guard — `self() ! done` then the same
@@ -274,6 +281,13 @@ rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
 cp pingpong.erl "$SCRATCH/gen/"
 ( cd "$SCRATCH/gen" && erlc +deterministic pingpong.erl )
 cp "$SCRATCH/gen/pingpong.beam" pingpong.beam
+
+# port_exit.beam (2512 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_port_exit_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp port_exit.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic port_exit.erl )
+cp "$SCRATCH/gen/port_exit.beam" port_exit.beam
 ```
 Every fixture is built with `+deterministic` in a `$TMPDIR` scratch dir, so no
 absolute checkout path is embedded in any committed `.beam`.
@@ -472,6 +486,11 @@ Each rebuilt `.beam` must be **force-added** (`git add -f gc_loop.beam`), like t
 | `recv_after:afterzero/0` | `recv_after:afterzero()` | `timeout` (no suspend) |
 | `recv_after:self_send/0` | `recv_after:self_send()` | `hello` |
 | `recv_after:after2000/0` | a receiver matching nothing, then a `hello` send | `hello` (the send **cancels** the deadline); with no send it is `timeout` |
+| `port_exit:trap_owner/0` | `port_exit:trap_owner()` | `[{exit,true,normal}]` |
+| `port_exit:trap_owner_mon/0` | `port_exit:trap_owner_mon()` | `[{exit,true,normal},{down,true,port,true,normal}]` (`'EXIT'` first, once each) |
+| `port_exit:notrap_owner_mon/0` | `port_exit:notrap_owner_mon()` | `[{down,true,port,true,normal}]` (nothing for `normal`; it survives) |
+| `port_exit:watcher_only/0` | `port_exit:watcher_only()` | `[{down,true,port,true,normal}]` |
+| `port_exit:connected/0` | `port_exit:connected()` | `{true,1,2,[{exit,true,normal}]}` (links 1 → 2 after `port_connect/2`) |
 | `recv_after:wait_forever/0` | `spawn(recv_after, wait_forever, [])` | parks indefinitely (`after infinity` ⇒ bare `wait`) |`selfsend/0` compiles to `bif self` + `send` + `loop_rec` + `remove_message` (with a
 `wait` fail branch); `scan/0` additionally emits `loop_rec_end`, because `42` fails the
 `{bar, X}` test and the scan must advance to the second message. `wait/0` is a bare

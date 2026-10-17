@@ -14,8 +14,8 @@
 %%% 'io:format("~w~n",[port_exit:trap_owner_mon()]), halt(0).'`) are the expectations the
 %%% test pins.
 -module(port_exit).
--export([trap_owner/0, trap_owner_mon/0, notrap_owner_mon/0, watcher_only/0]).
-
+-export([trap_owner/0, trap_owner_mon/0, notrap_owner_mon/0, watcher_only/0,
+         connected/0]).
 %%% A **trapping** owner gets exactly one `{'EXIT', Port, normal}`.
 trap_owner() ->
     process_flag(trap_exit, true),
@@ -40,6 +40,32 @@ notrap_owner_mon() ->
     _Reference = monitor(port, Port),
     true = port_close(Port),
     shapes(drain()).
+
+%%% A **`erlang:port_connect/2`ed** second process grows the port's link set and is told of the
+%%% close: `open_port/2` links the owner only, so `erlang:port_info(Port, links)` holds one pid
+%%% before the connect and two after it, and the connector — a trapping helper, not the owner —
+%%% gets exactly one `{'EXIT', Port, normal}`. `erlang:port_connect/2` answers `true`.
+%%%
+%%% Returned shape: `{ConnectAnswer, LinksBefore, LinksAfter, Shapes}`.
+connected() ->
+    Parent = self(),
+    Port = open_port({spawn, "true"}, []),
+    Before = length(element(2, erlang:port_info(Port, links))),
+    Connector = spawn(fun() ->
+                              process_flag(trap_exit, true),
+                              Answered = erlang:port_connect(Port, self()),
+                              Parent ! {connected, Answered},
+                              receive go -> Parent ! {signal, shapes(drain())} end
+                      end),
+    receive {connected, Answered} -> ok end,
+    After = length(element(2, erlang:port_info(Port, links))),
+    true = port_close(Port),
+    Connector ! go,
+    Shows = receive
+                {signal, S} -> S
+            after 5000 -> connector_timeout
+            end,
+    {Answered, Before, After, Shows}.
 
 %%% A watcher that is **not** linked to the port (a spawned helper) gets just the `'DOWN'`.
 watcher_only() ->
