@@ -70,7 +70,7 @@ use std::rc::Rc;
 
 use beam_alloc::Heap;
 use beam_bifs::{
-    default_registry, BifContext, BifRegistry, FunCaller, SendHook, TableRegistry,
+    default_registry, needs_send_hook, BifContext, BifRegistry, FunCaller, SendHook, TableRegistry,
 };
 use beam_codec::term::{cons_head, cons_tail, tuple_element};
 use beam_common::{BeamError, ExitReason, Result as BmResult};
@@ -829,6 +829,125 @@ fn give_away_gift_data_reaches_the_new_owner() {
         recorded(&journal).len(),
         1,
         "the hook-free call delivered nothing"
+    );
+}
+
+/// The roster **gate** and the behaviour agree for `ets:give_away/3`.
+///
+/// A host gates its optional seams per call: `beam_rt`'s `RuntimeContext::uses_send_hook`
+/// is a delegation to [`needs_send_hook`], so listing the key here is what makes the
+/// runtime build a `SendHook` bridge for this BIF instead of dispatching it through a
+/// hook-free context. This test pins both halves of that contract, so the listing can
+/// neither be dropped (the runtime would fall back to a hook-free context and the call
+/// would raise `unsupported_bif`) nor widened without the BIF behaving as listed:
+///
+/// * the key answers `needs_send_hook` and a wrong arity does not;
+/// * with the seam installed the call returns the oracle's `true` and announces the
+///   transfer with exactly one `{'ETS-TRANSFER', Tid, FromPid, GiftData}` carrying the
+///   gift to the new owner;
+/// * with the seam absent the very same call is the typed `unsupported_bif` gap and the
+///   owner never moves (never a transfer with a silently dropped gift).
+#[test]
+fn give_away_is_a_send_hook_key_and_the_gate_predicts_its_delivery() {
+    assert!(
+        needs_send_hook("ets", "give_away", 3),
+        "ets:give_away/3 announces the transfer through the SendHook, so the gate must \
+         select the send bridge for it"
+    );
+    assert!(
+        !needs_send_hook("ets", "give_away", 2),
+        "only the 3-arity form (the one carrying GiftData) announces anything"
+    );
+
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut hook = RecordingSend::default();
+    let journal = hook.journal();
+
+    // The gate says "this call reads the seam", so build the context the runtime builds
+    // for it: the `SendHook` installed.
+    let (target, gift) = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, self_pid())
+            .with_tables(&mut tables)
+            .with_sender(&mut hook);
+
+        let table = new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
+        // A gift with structure, so "carried verbatim" means something.
+        let a = atom(&mut ctx, "a");
+        let five = ctx.int(5).expect("small int");
+        let gift = ctx.tuple(&[a, five]).expect("gift tuple");
+        let target = ProcessId::new(9, 0).to_eterm();
+
+        let ret = bifs
+            .call("ets", "give_away", 3, &mut ctx, &[table, target, gift])
+            .expect("ets:give_away with the seam installed");
+        assert_true(&ctx, ret);
+        let owner_key = atom(&mut ctx, "owner");
+        assert_eq!(
+            info(&bifs, &mut ctx, table, owner_key),
+            target,
+            "the transfer moved the table to the announced new owner"
+        );
+        (target, gift)
+    };
+
+    // Exactly one announcement, to the new owner, in the oracle's 4-tuple shape.
+    let (to, message) = {
+        let recorded = recorded(&journal);
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the seam observed exactly one transfer message: {recorded:?}"
+        );
+        recorded[0]
+    };
+    assert_eq!(to, target, "the announcement goes to the new owner");
+    assert_eq!(
+        beam_codec::term::tuple_arity(message).expect("the transfer message is a tuple"),
+        4,
+        "{{'ETS-TRANSFER', Tid, FromPid, GiftData}} is a 4-tuple"
+    );
+    assert_atom_name(&atoms, elem(message, 0), "ETS-TRANSFER");
+    assert_eq!(
+        elem(message, 2),
+        self_pid().to_eterm(),
+        "FromPid is the calling (former owner) pid"
+    );
+    {
+        // The gift is the table-owned check-out, a *structural* copy of the argument —
+        // so `=:=` is the comparison, not raw word identity.
+        let mut ctx = BifContext::new(&mut heap, &atoms, self_pid());
+        let same = bifs
+            .call("erlang", "=:=", 2, &mut ctx, &[elem(message, 3), gift])
+            .expect("erlang:'=:='/2");
+        assert_true(&ctx, same);
+    }
+
+    // The other half of the gate: with **no** seam installed the same call cannot
+    // announce anything, so it is the typed gap and no table moves. This is exactly the
+    // failure mode a missing roster entry would cause at the runtime level.
+    {
+        let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+        let plain = new_table(&bifs, &mut ctx, "e", &["set"]).expect("ets:new");
+        let owner_key = atom(&mut ctx, "owner");
+        let third = ProcessId::new(11, 0).to_eterm();
+        let plain_gift = atom(&mut ctx, "a");
+        let err = bifs
+            .call("ets", "give_away", 3, &mut ctx, &[plain, third, plain_gift])
+            .expect_err("unsupported_bif without a SendHook");
+        assert_unsupported(err);
+        assert_eq!(
+            info(&bifs, &mut ctx, plain, owner_key),
+            self_pid().to_eterm(),
+            "the seam-free call leaves the owner untouched"
+        );
+    }
+    assert_eq!(
+        recorded(&journal).len(),
+        1,
+        "the seam-free call announced nothing"
     );
 }
 
