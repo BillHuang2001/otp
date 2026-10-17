@@ -65,11 +65,18 @@
 //! the documented defaults (`trap_exit`/`sensitive` `false`, `priority` `normal`, `save_calls`
 //! `0`), which is what this runtime's own root process has too.
 //!
+//! # The name registry holds a pid **or** a port
+//!
+//! The oracle's register table is keyed by name and holds either a pid or a port
+//! (`erts/emulator/beam/register.c:175-300`), and so does this bridge: `register/2` of a **live**
+//! port is `true`, `whereis/1` then answers the port (so `is_port/1` is `true`), `registered/0`
+//! lists the name and `unregister/1` removes it. A port the port registry does not hold — a
+//! closed port, or a number nothing was ever opened under — is the oracle's `badarg`, as is a
+//! second name for a port that already has one. Pinned by
+//! `registering_a_live_port_round_trips_and_refuses_the_rest` below.
+//!
 //! # Documented divergences (honoured, never hidden)
 //!
-//! * `register/2` of an internal **port** id: the oracle's registry holds a port as well as a
-//!   pid, this runtime's holds pids only, so the bridge reports the typed capability gap
-//!   (`unsupported: …`), never a fabricated `true`/`false`.
 //! * `save_calls` with a **non-integer** value: the oracle raises `badarg`
 //!   (`../../erts/emulator/beam/bif.c:1911`), while the bridge treats `true`/`false` as `1`/`0`
 //!   and leaves the flag untouched for anything else. Pinned directly in the bridge's unit
@@ -78,7 +85,6 @@
 mod support;
 
 use beam_bifs::NullSink;
-use beam_common::BeamError;
 use beam_engine::{terms, ExecutionContext};
 use beam_process::{PortId, ProcessId};
 use beam_rt::{Runtime, RuntimeContext};
@@ -117,14 +123,7 @@ fn is_atom_named(rt: &Runtime, term: Eterm, name: &str) -> bool {
 /// Whether `result` is the oracle's plain `badarg` raise.
 fn is_badarg(result: beam_common::Result<Eterm>) -> bool {
     matches!(result, Err(error) if error.as_atom() == Some("badarg"))
-}
-
-/// Whether `error` is one of this runtime's typed capability gaps (`unsupported: …`).
-fn is_capability_gap(error: &BeamError) -> bool {
-    beam_rt::error::unsupported_reason(error).is_some()
-}
-
-// ---------------------------------------------------------------------------------------
+}// ---------------------------------------------------------------------------------------
 // registered/0
 // ---------------------------------------------------------------------------------------
 
@@ -300,24 +299,81 @@ fn processes_ports_and_group_leader_have_the_oracle_shapes() {
 }
 
 // ---------------------------------------------------------------------------------------
-// The documented divergence: a port is not registrable
+// The name registry holds a port as well as a pid
 // ---------------------------------------------------------------------------------------
 
-/// The oracle's name registry holds a port id as well as a pid; this runtime's holds pids only,
-/// so `register/2` of an internal port is the honest typed capability gap — never a fabricated
-/// `true`/`false` and never a wrong `badarg`. (The BIF layer accepts an internal port, so the
-/// gap really does come from the bridge.)
+/// `register/2` of a **live port** round-trips through `whereis/1`, `registered/0` and
+/// `unregister/1`, and the two refusals the oracle reports as `badarg` are `badarg` here: a
+/// second name for a port that already has one, and a port the port registry does not hold (a
+/// number nothing was opened under — the BIF layer passes any internal port through, and the
+/// port registry refuses one that is not alive).
+///
+/// Oracle ground truth (OTP 29.1.1 / erts-17.1), with `F/1` the thunk helper that renders a
+/// `catch`ed raise as its bare reason atom:
+///
+/// ```text
+/// $ erl -noshell -eval '
+///     F = fun(G) -> case catch G() of
+///                       {EXIT, {R, _}} when is_atom(R) -> R;
+///                       {EXIT, R} when is_atom(R) -> R;
+///                       V -> V
+///                   end end,
+///     P = open_port({spawn_driver,"ram_file_drv"},[]),
+///     io:format("~p~n",[F(fun() -> erlang:register(myp,P) end)]),
+///     io:format("~p~n",[is_port(erlang:whereis(myp))]),
+///     io:format("~p~n",[lists:member(myp,erlang:registered())]),
+///     io:format("~p~n",[F(fun() -> erlang:register(myp2,P) end)]),
+///     io:format("~p~n",[F(fun() -> erlang:unregister(myp) end)]),
+///     io:format("~p~n",[erlang:whereis(myp)]), halt(0).'
+/// true
+/// true
+/// true
+/// badarg
+/// true
+/// undefined
+/// ```
+///
+/// (`EXIT` above abbreviates the quoted atom `'EXIT'` the probe matches on.)
 #[test]
-fn registering_an_internal_port_is_a_typed_capability_gap() {
+fn registering_a_live_port_round_trips_and_refuses_the_rest() {
     let mut rt = runtime();
-    let name = rt.intern("zz_proc_seams_port_name");
-    let port = PortId::new(7).to_eterm();
-    let error = call(&mut rt, "register", 2, &[name, port])
-        .expect_err("a port id is not registrable in this runtime");
-    assert!(
-        is_capability_gap(&error),
-        "expected the typed capability gap, got {error:?}"
+    let name = rt.intern("myp");
+    let second = rt.intern("myp2");
+    let third = rt.intern("myp3");
+
+    // A real `{spawn_driver, "ram_file_drv"}` port of this runtime (`open_port/2` is the
+    // runtime-native floor's, so the evaluator is the shortest honest way to open one).
+    let port = rt
+        .eval(r#"open_port({spawn_driver,"ram_file_drv"},[])"#)
+        .expect("open_port({spawn_driver,\"ram_file_drv\"},[])");
+    assert!(PortId::is_port(port), "a live port, got {port:?}");
+
+    // `register/2` → `whereis/1`: the name now resolves to the port itself.
+    let ok = call(&mut rt, "register", 2, &[name, port]).expect("register/2");
+    assert!(is_atom_named(&rt, ok, "true"), "{ok:?}");
+    let found = call(&mut rt, "whereis", 1, &[name]).expect("whereis/1");
+    assert!(PortId::is_port(found), "whereis/1 answers a port, got {found:?}");
+    assert_eq!(
+        PortId::from_eterm(found).expect("whereis/1 answers an internal port"),
+        PortId::from_eterm(port).expect("a port immediate")
     );
+
+    // ... and `registered/0` lists the name.
+    let registered = call(&mut rt, "registered", 0, &[]).expect("registered/0");
+    let names = terms::list_elements(registered).expect("a proper list");
+    assert!(names.contains(&name), "`myp` is registered: {names:?}");
+
+    // A second name for the same port is `badarg` (the C's "port already registered"), as is
+    // naming a port the registry does not hold.
+    assert!(is_badarg(call(&mut rt, "register", 2, &[second, port])));
+    let unheld = PortId::new(7).to_eterm();
+    assert!(is_badarg(call(&mut rt, "register", 2, &[third, unheld])));
+
+    // `unregister/1` removes the name; `whereis/1` is then the atom `undefined`.
+    let gone = call(&mut rt, "unregister", 1, &[name]).expect("unregister/1");
+    assert!(is_atom_named(&rt, gone, "true"), "{gone:?}");
+    let nowhere = call(&mut rt, "whereis", 1, &[name]).expect("whereis/1");
+    assert!(is_atom_named(&rt, nowhere, "undefined"), "{nowhere:?}");
 }
 
 // ---------------------------------------------------------------------------------------
