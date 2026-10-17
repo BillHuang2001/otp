@@ -518,14 +518,19 @@ the section to read them in.
   admits the request and otherwise collects, and `Process::deliver` retries a refused copy the same way; a
   bounded `+hmax N` policy the request cannot reach still refuses, and that exhaustion raises
   `error:system_limit`. `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap".
-- **A `run` process collects at its own heap admissions; the retained chain is reachable only through the
-  un-rooted allocation seam.** A probe under `beam_rt run` (an `ets:insert`/`ets:lookup` loop over a 5-field
-  payload map) shows `minor_gcs` advancing ≈ `N/3` and a `process_info(memory)` **flat** in N (identical bytes at
-  N = 100 and N = 20 000), so nothing retains per iteration on that route and an explicit
-  `erlang:garbage_collect()` adds no collection of its own.
-  A chain therefore only builds up on the paths that never reach a heap-admission point (the un-rooted
-  `alloc_words` growth seam, a declined valve, a `relocation_exempt`/halted/disabled process), where the door may
-  consult `collection_debt()` before it can collect at all. Owner of the door: `beam_rt`.
+- **A `run` process collects only at a `test_heap`/`allocate_heap` admission door; neither allocation seam collects
+  once a growth succeeds.** `beam_rt`'s two `ensure_heap*` doors are the only readers of `collection_debt()`
+  (`context/gc.rs:835-839`, `:1041-1045`), and only an `allocate_heap`/`test_heap` instruction reaches them.
+  The per-term seams short-circuit first: `alloc_words_rooted`'s grow-and-retry (`context/gc.rs:1366-1373`) returns
+  before its `process.collect()` (`:1472`), and the un-rooted `alloc_words` (`:1196-1235`) has no collect branch at
+  all — so a loop emitting no admission instruction retires space after space with `minor_gcs == 0` and
+  `statistics(garbage_collection) == {0,0,0}` while the chain-summed `heap_size` climbs **linearly** in N; that
+  signature needs no valve to decline. An explicit `erlang:garbage_collect()` is honoured before the bump on both
+  seams (`:1332`, `:1457`), so a `heap_size` that collapses after it distinguishes "no door reached" from a valve
+  decline. Owner of the doors: `beam_rt`.
+  On a route that *does* admit (an `ets:insert`/`ets:lookup` loop over a 5-field payload map) `minor_gcs` advances
+  ≈ `N/3` and `process_info(memory)` is **flat** in N (identical bytes at N = 100 and N = 20 000), so nothing
+  retains per iteration there.
 - **Cross-crate term caveats.** A pid is a heap term via `beam_term::thing::write_external_pid` (4 words) and
   `beam_term::compare::eq` orders it **structurally through its parts** (field order per the C `erts_cmp`), with
   `external_pid_parts` to read them directly; `compare::eq` still **recurses forever on a cycle**.
