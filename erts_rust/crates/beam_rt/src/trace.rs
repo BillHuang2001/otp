@@ -616,8 +616,9 @@ impl TraceState {
 pub(crate) enum TraceTimestamp {
     /// `timestamp`: the wall-clock `{MegaSecs, Secs, MicroSecs}` of `erlang:timestamp/0`.
     Wall,
-    /// `monotonic_timestamp`: the runtime's monotonic clock, in native (nanosecond) units —
-    /// the same unit `erlang:monotonic_time/0` reports.
+    /// `monotonic_timestamp`: the runtime's monotonic clock in native (nanosecond) units and on
+    /// the ERTS monotonic epoch — the exact value domain `erlang:monotonic_time/0` and the
+    /// oracle's own trace time stamps report ([`monotonic_nanos`]).
     Monotonic,
     /// `strict_monotonic_timestamp`: `{Nanoseconds, UniqueMonotonicInteger}`, unique across
     /// the events this runtime emits.
@@ -670,26 +671,45 @@ fn wall_clock_now() -> (i64, i64, i64) {
     }
 }
 
-/// The monotonic base of this runtime: the instant the first monotonic time stamp was asked
-/// for.
+/// The instant this runtime's monotonic **elapsed** counter starts from: the first read.
 ///
-/// `timers.rs` keeps no exported epoch (its deadlines are [`Instant`]s compared against each
-/// other), so the base is established here on first use. `Instant` is the platform's monotonic
-/// clock, so the difference never goes backwards and is immune to wall-clock adjustments.
+/// This is an implementation detail of the measurement, never the origin a caller sees — the
+/// value reported is [`monotonic_nanos`]'s, which puts the elapsed count on the **ERTS
+/// monotonic epoch** ([`crate::info::time::START_TIME`], the origin
+/// `erlang:monotonic_time/0`, `erlang:system_info(start_time)` and the oracle's own trace time
+/// stamps all count from). `Instant` is the platform's monotonic clock, so the difference never
+/// goes backwards and is immune to wall-clock adjustments.
 static MONOTONIC_BASE: OnceLock<Instant> = OnceLock::new();
 
-/// Nanoseconds elapsed since [`MONOTONIC_BASE`] — `erlang:monotonic_time()`'s native unit.
+/// `erlang:monotonic_time()`'s value in its native unit (nanoseconds): the ERTS monotonic epoch
+/// [`START_TIME`](crate::info::time::START_TIME) plus the time elapsed since
+/// [`MONOTONIC_BASE`].
+///
+/// The epoch is the same compile-time ERTS constant the `erlang:monotonic_time/0` BIF builds its
+/// own reading from, so a `monotonic_timestamp` / `strict_monotonic_timestamp` trace stamp is a
+/// real monotonic-time reading rather than a runtime-relative count: a large **negative**
+/// integer (the epoch is `-576460752000000000` ns) that grows toward zero as the runtime runs,
+/// and always inside `erlang:system_info(start_time) .. erlang:system_info(end_time)`.
 fn monotonic_nanos() -> i64 {
     let base = *MONOTONIC_BASE.get_or_init(Instant::now);
-    elapsed_nanos(Instant::now().duration_since(base))
+    monotonic_stamp_at(Instant::now().duration_since(base))
 }
 
-/// A duration in nanoseconds as the integer `erlang:monotonic_time/0` reports (`i64`, which
-/// covers the full `Instant` range — the saturation is the C's own `i64` counter).
+/// The ERTS-epoch monotonic time stamp for `elapsed` nanoseconds of runtime uptime:
+/// [`START_TIME`](crate::info::time::START_TIME) + `elapsed`.
+///
+/// The addition saturates, exactly as the `erlang:monotonic_time/0` BIF saturates its own
+/// reading: the epoch is negative and the elapsed count is already clamped at `i64::MAX`, so no
+/// wrap can ever turn a monotonic clock into a decreasing one.
+fn monotonic_stamp_at(elapsed: Duration) -> i64 {
+    crate::info::time::START_TIME.saturating_add(elapsed_nanos(elapsed))
+}
+
+/// An elapsed duration in nanoseconds, saturated at the C's own `i64` counter maximum
+/// (reachable only after ~292 years of uptime).
 fn elapsed_nanos(elapsed: Duration) -> i64 {
     elapsed.as_nanos().min(i64::MAX as u128) as i64
 }
-
 /// The `UniqueMonotonicInteger` of a `strict_monotonic_timestamp`: the next value of a
 /// process-wide counter that only ever increases.
 static UNIQUE_MONOTONIC: AtomicU64 = AtomicU64::new(0);
@@ -934,8 +954,13 @@ impl RuntimeContext<'_> {
     }
 
     /// The trailing time-stamp element of a `trace_ts` event, for one [`TraceTimestamp`]
-    /// flavour: `{MegaSecs, Secs, MicroSecs}` (wall clock), the nanoseconds since the
-    /// runtime's monotonic base, or `{Nanoseconds, UniqueMonotonicInteger}`.
+    /// flavour: `{MegaSecs, Secs, MicroSecs}` (wall clock), the `erlang:monotonic_time/0`
+    /// reading (the ERTS monotonic epoch plus the elapsed time, nanoseconds), or
+    /// `{Nanoseconds, UniqueMonotonicInteger}`.
+    ///
+    /// The monotonic counts are materialized with [`terms::make_integer`], the same
+    /// small-vs-bignum choice the `erlang:monotonic_time/0` BIF makes, so a reading past the
+    /// 60-bit small range stays an exact integer instead of a truncated one.
     fn timestamp_term(&mut self, flavour: TraceTimestamp) -> Result<Eterm> {
         match flavour {
             TraceTimestamp::Wall => {
@@ -943,9 +968,9 @@ impl RuntimeContext<'_> {
                 let elements = [make_small(mega), make_small(secs), make_small(micro)];
                 terms::make_tuple(self, &elements)
             }
-            TraceTimestamp::Monotonic => Ok(make_small(monotonic_nanos())),
+            TraceTimestamp::Monotonic => terms::make_integer(self, monotonic_nanos()),
             TraceTimestamp::StrictMonotonic => {
-                let nanos = make_small(monotonic_nanos());
+                let nanos = terms::make_integer(self, monotonic_nanos())?;
                 // The unique integer is a `u64` counter; every value this accepts fits the
                 // 60-bit small range for any realistic uptime (`u32::MAX` events, at least).
                 let unique = make_small(i64::try_from(next_unique_monotonic()).unwrap_or(i64::MAX));
@@ -1271,6 +1296,48 @@ mod tests {
         assert_eq!(elapsed_nanos(Duration::from_secs(u64::MAX)), i64::MAX);
     }
 
+    /// A monotonic time stamp is the **ERTS monotonic epoch** plus the elapsed time — exactly the
+    /// value `erlang:monotonic_time/0` reports, so the epoch is the compile-time interface
+    /// constant `erlang:system_info(start_time)` and not a runtime-relative zero.
+    #[test]
+    fn a_monotonic_stamp_is_the_erts_epoch_plus_the_elapsed_time() {
+        let start = crate::info::time::START_TIME;
+        let end = crate::info::time::END_TIME;
+
+        // At zero elapsed the stamp IS the epoch the oracle reports for `start_time`.
+        assert_eq!(monotonic_stamp_at(Duration::ZERO), start);
+
+        // Exactly `START_TIME + elapsed`, inside the ERTS external window, and negative (the
+        // window starts at a `MIN_SMALL`-and-up negative and ends past any realistic uptime).
+        for elapsed in [
+            Duration::from_nanos(1),
+            Duration::from_secs(1),
+            Duration::from_secs(86_400),
+            Duration::from_secs(3 * 365 * 86_400),
+        ] {
+            let stamp = monotonic_stamp_at(elapsed);
+            let elapsed_nanos = i64::try_from(elapsed.as_nanos()).expect("a plausible uptime");
+            assert_eq!(stamp, start + elapsed_nanos, "{elapsed:?}");
+            assert!(
+                stamp >= start && stamp <= end,
+                "{elapsed:?}: {stamp} must be inside the ERTS external window {start}..={end}"
+            );
+            assert!(stamp < 0, "{elapsed:?}: an ERTS-epoch reading is negative, got {stamp}");
+            // ... and still a 60-bit small integer, which is what `make_integer` materializes
+            // without allocating, exactly as the BIF's own reading is a small.
+            assert!(
+                (beam_term::MIN_SMALL..=beam_term::MAX_SMALL).contains(&stamp),
+                "{elapsed:?}: {stamp} must fit the small range"
+            );
+        }
+
+        // An elapsed count past the `i64` range saturates instead of wrapping the clock
+        // backwards (the C's own `i64` counter behaviour; unreachable — ~292 years of uptime).
+        assert_eq!(
+            monotonic_stamp_at(Duration::from_secs(u64::MAX)),
+            start.saturating_add(i64::MAX)
+        );
+    }
     #[test]
     fn the_timestamp_flavour_precedence_and_tag() {
         let flavour =
@@ -1308,16 +1375,23 @@ mod tests {
 
     #[test]
     fn the_monotonic_and_unique_counters_only_go_forwards() {
+        let start = crate::info::time::START_TIME;
         let first = monotonic_nanos();
         let second = monotonic_nanos();
-        assert!(first >= 0, "the monotonic base is the first read, got {first}");
+        // The stamps live on the ERTS monotonic epoch, so they are large negatives that grow
+        // toward zero — never a runtime-relative positive count.
+        assert!(first >= start, "a reading is never before the ERTS epoch, got {first}");
+        assert!(first < 0, "an ERTS-epoch reading is negative, got {first}");
         assert!(second >= first, "{second} >= {first}");
+        assert!(
+            second <= crate::info::time::END_TIME,
+            "{second} inside the ERTS external window"
+        );
 
         let unique = next_unique_monotonic();
         assert_eq!(next_unique_monotonic(), unique + 1, "strictly increasing");
         assert!(next_unique_monotonic() > unique);
     }
-
     /// Every message in `pid`'s mailbox, in mailbox order, removed as it is read.
     ///
     /// `pid` runs against a caller-owned [`beam_process::ProcessTable`] (what
