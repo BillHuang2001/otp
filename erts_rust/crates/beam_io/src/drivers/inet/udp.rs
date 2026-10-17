@@ -864,23 +864,12 @@ impl UdpInetDriver {
                 }
                 Err(op.not_served())
             }
-            // The name-service lookups (`:11493`, `:11525`): only the operand-length refusals are
-            // served (`len < 2` / `len < 3`, `:11590`/`:11622`). The lookup itself is
-            // `getservbyname(3)`/`getservbyport(3)`, a libc call this crate's `sys` layer does not
-            // wrap, so a well-formed request is a typed gap (the C answers `[1] ++ port_be16` or
-            // `[0]einval` when the lookup fails).
-            Opcode::Getservbyname => {
-                if arg.len() < 2 {
-                    return Ok(ctl_xerror("einval"));
-                }
-                Err(op.not_served())
-            }
-            Opcode::Getservbyport => {
-                if arg.len() < 3 {
-                    return Ok(ctl_xerror("einval"));
-                }
-                Err(op.not_served())
-            }
+            // The name-service lookups (`:11493`, `:11525`): the shared `inet_ctl` arms, built by
+            // the same helpers the stream driver uses — the system services database behind
+            // `getservbyname(3)`/`getservbyport(3)`, with the C's exact operand arithmetic and its
+            // `NULL` ⇒ `[0]einval`.
+            Opcode::Getservbyname => Ok(super::wire::getservbyname_reply(arg)),
+            Opcode::Getservbyport => Ok(super::wire::getservbyport_reply(arg)),
             // `INET_REQ_SETNAME` (`:11386`): an **empty** operand clears the fake address
             // (`desc->name_ptr = NULL`, `:11392`) and answers `[1]`; a one-byte one is the C's
             // `len < 2 ⇒ EINVAL` (`:11396`); anything else is decoded by `inet_set_faddress`

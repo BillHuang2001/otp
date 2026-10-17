@@ -1483,20 +1483,13 @@ impl TcpInetDriver {
                 }
                 Err(op.not_served())
             }
-            // The name-service lookups (`:11493`, `:11525`): only the operand-length refusals are
-            // served; the lookup itself (`getservbyname(3)`/`getservbyport(3)`) stays a typed gap.
-            Opcode::Getservbyname => {
-                if arg.len() < 2 {
-                    return Ok(ctl_xerror("einval"));
-                }
-                Err(op.not_served())
-            }
-            Opcode::Getservbyport => {
-                if arg.len() < 3 {
-                    return Ok(ctl_xerror("einval"));
-                }
-                Err(op.not_served())
-            }
+            // The name-service lookups (`:11493`, `:11525`): the shared `inet_ctl` arms, served
+            // from the system services database through [`sys::service_port`]/
+            // [`sys::service_name`]. The C's operand arithmetic — including the `n >= len` /
+            // `n > len` asymmetry — lives in [`wire::getservbyname_reply`]/
+            // [`wire::getservbyport_reply`], which the datagram driver shares.
+            Opcode::Getservbyname => Ok(wire::getservbyname_reply(arg)),
+            Opcode::Getservbyport => Ok(wire::getservbyport_reply(arg)),
             // `INET_REQ_SETNAME`/`SETPEER` (`:11386`, `:11301`): the empty operand clears the fake
             // address and answers `[1]`, and a well-formed one is stored so that a later
             // `NAME`/`PEER` reports it instead of asking the kernel (`:11370`, `:11284`). The

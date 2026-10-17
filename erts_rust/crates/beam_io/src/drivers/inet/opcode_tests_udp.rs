@@ -344,9 +344,18 @@ fn the_surviving_numeric_opcodes_on_the_datagram_port_are_typed_gaps() {
     assert_typed_gap(&mut port, 13, &[1, 2, 0, 0, 0, 1], "a well-formed INET_REQ_FDOPEN");
     assert_typed_gap(&mut port, 13, &[1, 1, 0, 0, 0, 1], "a stream FDOPEN");
 
-    // The name-service lookups: only the operand-length refusals are served.
-    assert_typed_gap(&mut port, 17, &[3, 100], "INET_REQ_GETSERVBYNAME");
-    assert_typed_gap(&mut port, 18, &[0, 53, 3], "INET_REQ_GETSERVBYPORT");
+    // The name-service lookups are served (they are shared `inet_ctl` arms); a missing entry is
+    // the C's `[0]einval`, never a typed gap.
+    assert_eq!(
+        port.control(&op(17), &[3, 100]),
+        ctl_xerror("einval"),
+        "GETSERVBYNAME of a name the services database does not have"
+    );
+    assert_eq!(
+        port.control(&op(18), &[0, 53, 3]),
+        ctl_xerror("einval"),
+        "GETSERVBYPORT needs the protocol length byte's string"
+    );
 
     // The interface family needs a live `getifaddrs(3)` walk; a socket-less port is refused.
     for code in [21u32, 22, 23, 25] {
@@ -628,8 +637,16 @@ fn numeric_getserv_requests_serve_their_length_refusals() {
             "GETSERVBYPORT needs three bytes"
         );
     }
-    assert_typed_gap(&mut port, 17, &[3, 100], "a well-formed GETSERVBYNAME");
-    assert_typed_gap(&mut port, 18, &[0, 53, 3], "a well-formed GETSERVBYPORT");
+    assert_eq!(
+        port.control(&op(17), &[3, 100]),
+        ctl_xerror("einval"),
+        "a well-formed GETSERVBYNAME the services database does not answer"
+    );
+    assert_eq!(
+        port.control(&op(18), &[0, 53, 3]),
+        ctl_xerror("einval"),
+        "a well-formed GETSERVBYPORT with no room for the protocol string"
+    );
 }
 
 /// `INET_REQ_SETNAME`(19, `:11386`)/`INET_REQ_SETPEER`(20, `:11301`): an **empty** operand clears

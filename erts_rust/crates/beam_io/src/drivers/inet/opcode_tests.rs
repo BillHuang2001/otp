@@ -878,16 +878,18 @@ fn an_unserved_numeric_opcode_is_a_typed_gap() {
         .try_control(&op(13), &[INET_AF_INET, INET_TYPE_STREAM, 0, 0, 0, 0])
         .expect_err("FDOPEN adopts a caller's descriptor, which the Driver seam cannot express");
     assert_eq!(reason_of(err), not_served_reason("fdopen", "inet_ctl"));
-    // The name-service lookups with a well-formed operand: `getservbyname(3)`/`getservbyport(3)`
-    // resolve against the system services database, which this floor does not consult.
-    let err = port
-        .try_control(&op(17), &[0, 0])
-        .expect_err("GETSERVBYNAME needs the resolver");
-    assert_eq!(reason_of(err), not_served_reason("getservbyname", "inet_ctl"));
-    let err = port
-        .try_control(&op(18), &[0, 0, 0])
-        .expect_err("GETSERVBYPORT needs the resolver");
-    assert_eq!(reason_of(err), not_served_reason("getservbyport", "inet_ctl"));
+    // The name-service lookups are served, not gapped: an empty name/protocol pair is a lookup
+    // the services database does not answer, i.e. the C's `ctl_error(EINVAL)`.
+    assert_eq!(
+        port.control(&op(17), &[0, 0]),
+        ctl_xerror("einval"),
+        "GETSERVBYNAME of an empty name"
+    );
+    assert_eq!(
+        port.control(&op(18), &[0, 0, 0]),
+        ctl_xerror("einval"),
+        "GETSERVBYPORT of port 0"
+    );
 
     // The `getifaddrs(3)`-backed family on a **live** socket: only the `!IS_OPEN` refusal is exact,
     // so the open state is where the interface walk would be needed.

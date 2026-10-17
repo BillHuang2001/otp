@@ -48,6 +48,9 @@ pub const INET_REP_ERROR: u8 = 0;
 /// The address tag of an explicit IPv4 address (`INET_AF_INET`, `inet_drv.c:757`).
 pub const INET_AF_INET: u8 = 1;
 
+/// The address tag of an explicit IPv6 address (`INET_AF_INET6`, `inet_drv.c:758`) — the tag
+/// the interface records carry for an `AF_INET6` endpoint.
+pub const INET_AF_INET6: u8 = 2;
 /// The address tag of `INADDR_ANY` (`INET_AF_ANY`, `inet_drv.c:759`).
 pub const INET_AF_ANY: u8 = 3;
 
@@ -169,6 +172,70 @@ pub(super) fn subscribe_reply(queued_output_bytes: usize, arg: &[u8]) -> Result<
         reply.extend_from_slice(&(queued_output_bytes as u32).to_be_bytes());
     }
     Ok(reply)
+}
+/// The `INET_REQ_GETSERVBYNAME`(17) reply — the shared `inet_ctl` arm both socket drivers reach
+/// (`inet_ctl_getservbyname`, `inet_drv.c:11493`).
+///
+/// The operand is `L1 Name-String L2 Proto-String`, and the C's arithmetic is reproduced
+/// literally, including its **asymmetry**: the name length is checked with `n >= len` *after* the
+/// length byte was consumed — the `=` is deliberate, because the test has to leave room for the
+/// protocol length byte that follows (`:11501`) — while the protocol length is only `n > len`
+/// (`:11508`). A lookup the services database does not answer is the C's `NULL` ⇒ `einval`, so a
+/// host without a `/etc/services` entry for a name refuses it on both sides.
+///
+/// Success is `[1] ++ port_be16`, the port being the C's `sock_ntohs(srv->s_port)` written back
+/// big-endian.
+pub(super) fn getservbyname_reply(arg: &[u8]) -> Vec<u8> {
+    if arg.len() < 2 {
+        return ctl_xerror("einval");
+    }
+    // `n = get_int8(buf); buf++; len--; if (n >= len) error;`
+    let namlen = usize::from(arg[0]);
+    let mut rest = &arg[1..];
+    if namlen >= rest.len() {
+        return ctl_xerror("einval");
+    }
+    let (name, tail) = rest.split_at(namlen);
+    // `n = get_int8(buf); buf++; len--; if (n > len) error;`
+    let protolen = usize::from(tail[0]);
+    rest = &tail[1..];
+    if protolen > rest.len() {
+        return ctl_xerror("einval");
+    }
+    let (proto, _) = rest.split_at(protolen);
+    match sys::service_port(name, proto) {
+        Some(port) => {
+            let mut reply = ctl_ok();
+            reply.extend_from_slice(&port.to_be_bytes());
+            reply
+        }
+        None => ctl_xerror("einval"),
+    }
+}
+/// The `INET_REQ_GETSERVBYPORT`(18) reply — the shared `inet_ctl` arm (`inet_drv.c:11525`).
+///
+/// The operand is `P1 P0 L1 Proto-String`: a two-byte big-endian port and the protocol length
+/// byte, whose `n > len` check comes *after* `len -= 3` (`:11540`). A `NULL` lookup is
+/// `ctl_error(EINVAL)`; success is `[1] ++ s_name`, the raw bytes with no NUL.
+pub(super) fn getservbyport_reply(arg: &[u8]) -> Vec<u8> {
+    if arg.len() < 3 {
+        return ctl_xerror("einval");
+    }
+    let port = u16::from_be_bytes([arg[0], arg[1]]);
+    let protolen = usize::from(arg[2]);
+    let rest = &arg[3..];
+    if protolen > rest.len() {
+        return ctl_xerror("einval");
+    }
+    let (proto, _) = rest.split_at(protolen);
+    match sys::service_name(port, proto) {
+        Some(name) => {
+            let mut reply = ctl_ok();
+            reply.extend_from_slice(&name);
+            reply
+        }
+        None => ctl_xerror("einval"),
+    }
 }
 /// The lowercase name the oracle reports for `errno` (`erl_errno_id`/`errno_str`,
 /// `inet_drv.c:2249`).
