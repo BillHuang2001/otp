@@ -20,7 +20,7 @@ Ground truth (read-only, never modify): `emu/instrs.tab` (`i_make_fun3` :545,
 - `mod.rs:528` `atom_name` — resolves a runtime atom **value** through `ExecutionContext::atom_name` (the live-namespace seam, defaulting to the running module's own table); typed `BadArg` for a non-atom or an id the host cannot name.
 - `MakeFun3` (`:137`) builds via `terms::make_fun_rooted`; header arity = `descriptor.arity - num_free`.
 - `CallFun`/`CallFun2` (`:178`/`:190`) hand a re-readable `FunSource` (`:304`) to the shared `call_fun` (`:480`), which classifies the target's shape and **then** routes through the in-machine closure-apply seam `ExecutionContext::resolve_local_fun` (see below); `ExecutionContext::apply_fun` is the value-returning fallback when the host declines.
-- `mod.rs:350` `reason_atom` / `:360` `raise_reason` / `:375` `raise_badfun` / `:407` `raise_badarity` — the structured target-shape reasons (see below).
+- `mod.rs:363` `reason_atom` / `:373` `raise_reason` / `:388` `raise_badfun` / `:420` `raise_badarity` — the structured target-shape reasons (see below).
 
 ## The structured target-shape reasons (`{badfun,Fun}` / `{badarity,{Fun,Args}}`)
 - `call_fun` classifies the call target **before** the seam, exactly as C's `call_fun` (`beam_common.c:1604-1622`) does, so the oracle's structured `error` reasons are reproduced instead of the bare `badarg`/`badarity` a host seam can only report:
