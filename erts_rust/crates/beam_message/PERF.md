@@ -145,10 +145,9 @@ leaves the workload at ≈ 1.73 µs/op. The residual is the sender/receiver sche
   gap lived: an allocation-door "decline circle" (29 923 arena fallbacks per 30 000 iterations), park
   hand-offs that copied the 1024-word x file twice per iteration, unbounded register-file scans and a timer
   tombstone leak — fixed there, taking `send_recv_plain` from 10 127 to ≈ 1 990 ns/op (**−80 %**).
-  An earlier revision of this section blamed a per-scheduler-pass **25 ms `std::thread::sleep`** and the
-  `PORT_POLL_SLICE` probe for that gap. **Refuted:** the run route is progress-aware and issues **0**
-  `clock_nanosleep` on a `send_recv`-shaped run, and `PORT_POLL_SLICE` is a non-destructive zero-timeout
-  probe (`../beam_rt/CONTEXT.md`).
+  No part of that per-op cost is a pass sleep: the run route's pass wait is progress-aware and issues
+  **0** `clock_nanosleep` on a `send_recv`-shaped run, and `PORT_POLL_SLICE` is a non-destructive
+  zero-timeout probe (`../beam_rt/CONTEXT.md`).
 * **`beam_process` — the delivery path.** `Process::copy_message` (the dirty young-heap destination above),
   `Process::deliver`/`deliver_message`/`run_rooted_collection`, and the mailbox + `QueueCursor`
   selective-receive scan.
