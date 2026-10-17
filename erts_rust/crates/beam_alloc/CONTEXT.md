@@ -489,6 +489,19 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - `../beam_gc/`, `../beam_message/`, `../beam_ets/`, `../beam_process/` → primary dependents.
 
 ## Handoffs (owned by other nodes — NOT adopted here)
+- **`beam_engine` has not adopted payload growth yet — its writable append is still O(n²) past the
+  first capacity.** The capability is complete here (`RefcBinary::with_capacity`/`ensure_capacity`/
+  `GrowOutcome`), but `beam_engine`'s `bs_init_writable` accumulator still builds its payload with
+  `alloc_refc_binary(&vec![0u8; capacity])` and its `private_append` arm still promotes to the
+  copy-rebuild form once it outgrows it, so no caller benefits until that node switches over. Its
+  adoption shape: build the payload with `with_capacity`/`with_limits` (`len == 0`), call
+  `ensure_capacity(needed_bytes)` when the next write would not fit, then act on the outcome —
+  `InPlace` ⇒ re-read `data_ptr()`/`capacity()` and keep writing in place (the machine's
+  `writable_payloads` entry only needs its capacity refreshed), `Moved` ⇒ republish the
+  `[BinRef][ErlSubBits]` pair over `Relocation::to()` and refresh the registry's base (or ask
+  `payload_capacity(data_ptr)` instead of caching the capacity at all). `compact()` is the "finished
+  accumulating" step. `beam_engine`'s `HANDOFF_bs_init_writable.md` and its `create/mod.rs` module docs
+  name this as `beam_alloc`/`beam_rt`-owned work and are now stale on that point.
 - **`beam_rt` `system_info` wiring (partially adopted):** `beam_rt`'s `info.rs`/`info/memory.rs`
   already answer `system_info(alloc_util_allocators)` and `system_info({allocator,A})` from
   `registry::alloc_util_allocators()` + `AllocatorInfo::from_stats(...)` — the `{allocator,A}` rows
