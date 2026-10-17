@@ -304,5 +304,7 @@ exactly that way.
   `baseline`'s compute loop is native-floor dominated.
 
 **History:** prior sessions are the committed `results/m1{0,1,2,3,4}-*` artifacts (`m15-*` is
-current; `m14-*` and older are regression baselines). **m14's `copy_bound`, `gc_bound` and `foreign`
-per-unit figures are superseded by the estimator fix (§3.4) and must not be quoted as current.**
+current). **m14's and every older session's `copy_bound`, `gc_bound` and `foreign` per-unit figures
+are superseded by the estimator fix (§3.4): they are kept as provenance, not as valid regression
+baselines, and must not be quoted as current or diffed against m15.** Their `baseline`/`slice` rows,
+startup/throughput/external figures and load records remain usable.
