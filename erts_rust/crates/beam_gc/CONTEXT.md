@@ -648,7 +648,7 @@ the section to read them in.
   and its geometry epoch — the fast-reject filter a host's unscanned-root valve calls
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `collect` + the copy-specific
   `pub(crate)` primitives
-- `src/collector.rs` → the two-generation `Collector` driver
+- `src/collector.rs` → the two-generation `Collector` driver (incl. the kind-pinned `collect_kind`)
 - `src/live.rs` → the exact-live counter (`live`/`live_full`, `Live { words, lines }`)
 - `src/reachable.rs` → the read-only whole-heap walk: `ReachableObject`, `walk_reachable`,
   `for_each_reachable_view`/`for_each_reachable`, the `Visited` set (its `index` delegates to `FromSet::locate`)
