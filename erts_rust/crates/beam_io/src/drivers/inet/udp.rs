@@ -343,7 +343,7 @@ impl UdpInetDriver {
         // No socket, or a socket with no default peer: the queue holds a bare command with no
         // destination, which the C refuses (`:15051`). Nothing is consumed.
         let Some(fd) = self.socket.filter(|_| self.state.is_connected()) else {
-            return Ok(0);
+            return Err(error::badarg());
         };
         let mut written = 0usize;
         loop {

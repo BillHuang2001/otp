@@ -147,6 +147,117 @@ impl Rig {
     fn recv(&mut self) -> Vec<u8> {
         self.control("recv", &[]).expect("recv")
     }
+
+    /// Queues `bytes` on the port output queue, as `port_command/2` does.
+    fn queue_output(&mut self, bytes: &[u8]) {
+        self.output.push(bytes);
+    }
+
+    /// How many bytes are waiting in the port output queue.
+    fn output_len(&self) -> usize {
+        self.output.len()
+    }
+
+    /// [`Driver::output`] — the port-task write path, where a queued command is drained.
+    fn drain_output(&mut self) -> Result<usize> {
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut self.poller,
+            &mut self.input,
+            &mut self.output,
+            &mut self.arms,
+        );
+        self.driver.output(&mut ctx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A socket-less / unconnected port refuses a port command (`inet_drv.c:15051`)
+// ---------------------------------------------------------------------------
+
+/// A `port_command/2` on a port with **no socket** is refused, and the queued bytes survive: the
+/// C's `packet_inet_command` guards the send with `!IS_OPEN` (`inet_drv.c:15051`), and its queue
+/// form expects the `[address][data]` grammar — a bare command carries no address at all, so
+/// nothing in the queue can name a peer.
+///
+/// The driver-side contract is a typed `BeamError::BadArg` with the bytes **never consumed**.
+/// The oracle's own first command answers `true` *and kills the port* (`driver_failure_posix`),
+/// which needs a `driver_failure` seam this crate's `Driver` trait does not have; see
+/// `the_socket_less_command_sequence_matches_the_oracle`.
+#[test]
+fn a_socket_less_port_command_is_refused_and_keeps_its_bytes() {
+    let mut rig = Rig::new();
+    rig.queue_output(b"\x01\x02\x03");
+    assert_eq!(rig.output_len(), 3, "the command is queued");
+    assert!(
+        matches!(rig.drain_output(), Err(BeamError::BadArg)),
+        "a socket-less datagram command is refused"
+    );
+    assert_eq!(
+        rig.output_len(),
+        3,
+        "the refused command's bytes are never consumed"
+    );
+}
+
+/// The same refusal once a socket exists but has no default peer: a datagram needs a destination
+/// and the queue cannot name one, so the command is refused rather than silently dropped.
+#[test]
+fn an_unconnected_datagram_command_is_refused_and_keeps_its_bytes() {
+    let mut rig = Rig::new();
+    rig.open();
+    rig.queue_output(b"\x01\x02\x03");
+    assert!(
+        matches!(rig.drain_output(), Err(BeamError::BadArg)),
+        "an unconnected datagram command is refused"
+    );
+    assert_eq!(rig.output_len(), 3, "the bytes are never consumed");
+}
+
+/// The oracle's side of the same situation, pinned as a **sequence**: on a fresh bare port the
+/// first `port_command/2` answers `true` and the port is then dead (`port_info(P, name)` is
+/// `undefined`, the C's `driver_failure_posix(EINVAL)`), after which every command raises
+/// `badarg`.
+///
+/// The residual difference is deliberate and asserted, not glossed over: reproducing the port
+/// kill needs a `driver_failure` seam this crate does not have, so the Rust side refuses the
+/// **first** delivered round with a typed `BeamError::BadArg` and keeps the bytes. The oracle's
+/// `true` is therefore **not** compared to our reply — only the sequence (first command accepted,
+/// port afterwards unusable) is pinned.
+///
+/// **Skips loudly** when `erl` is not on `PATH`.
+#[test]
+fn the_socket_less_command_sequence_matches_the_oracle() {
+    let expr = "process_flag(trap_exit, true), \
+                P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+                First = (catch erlang:port_command(P, <<1>>)), \
+                Dead = erlang:port_info(P, name), \
+                Second = (catch erlang:port_command(P, <<1>>)), \
+                io:format(\"~p|~p|~p\", [First, Dead, Second])";
+    let Some(dump) = erl_stdout(expr) else {
+        eprintln!("SKIP: no `erl` on PATH — skipping the socket-less command oracle check");
+        return;
+    };
+    let dump = String::from_utf8_lossy(&dump);
+    assert!(
+        dump.starts_with("true|undefined|"),
+        "the oracle accepts the first command and kills the port: {dump:?}"
+    );
+    assert!(
+        dump.contains("badarg"),
+        "the oracle refuses every command after the port died (measured: the `catch`ed \
+         `{'EXIT', {badarg, …}}` raise): {dump:?}"
+    );
+
+    // Our side: the very first delivered round is refused, and the bytes stay queued.
+    let mut rig = Rig::new();
+    rig.queue_output(b"\x01");
+    assert!(
+        matches!(rig.drain_output(), Err(BeamError::BadArg)),
+        "the Rust side refuses the first round (the oracle answers `true` and kills the port — \
+         a `driver_failure` seam this driver has no access to)"
+    );
+    assert_eq!(rig.output_len(), 1, "and the refused bytes stay queued");
 }
 
 // ---------------------------------------------------------------------------
