@@ -142,12 +142,16 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   a raise landing in another context's live catch frame (pinned by `drive.rs`'s tests
   `a_cross_module_return_switches_the_machine_back_into_the_caller_context` and
   `a_raise_landing_in_a_callers_catch_frame_switches_into_the_callers_context`).
-- `reset` clears the register files, stacks, catch frames, contexts, the raise snapshot, the pending exception, the
-  exception-class atoms + their `class_atoms_live` latch and the trace gate, but **not** the `refc_binaries` arena; a
-  resume (`resume_outcome`) resets nothing, so the contexts and the raise snapshot both survive it.
+- `reset` (`registers.rs`) clears the register files, stacks, catch frames, contexts, the raise snapshot, the pending
+  exception, the exception-class atoms + their `class_atoms_live` latch, the execution-position fields and the
+  trace/reduce gates, but **not** the `refc_binaries` arena, the `writable_payloads` registry, or
+  `bif_in_machine_on` (latched per run into the machine by both drivers; only `Machine::new`,
+  `machine/mod.rs`, ever sets it); a resume (`resume_outcome`) resets nothing, so the contexts and the raise snapshot
+  both survive it.
 
 ## See Also
-- `../interpreter/CONTEXT.md` → the per-instruction dispatcher (`step_instruction`, also the JIT deopt target).
+- `../interpreter/CONTEXT.md` → the per-instruction dispatcher (`step_instruction_with_entry`, also the JIT deopt
+  target).
 - `../CONTEXT.md` → the engine's binding execution semantics; `../jit/CONTEXT.md` → the native tiers' block ABI.
 
 ## `Machine::writable_payloads` — the writable-append registry

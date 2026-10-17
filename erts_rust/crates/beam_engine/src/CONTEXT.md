@@ -104,13 +104,18 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`
-(`machine/mod.rs:580`), `Machine::alloc_rooted` (`:638`, → `ExecutionContext::alloc_words_rooted`) and
+(`machine/mod.rs:632`), `Machine::alloc_rooted` (`:690`, → `ExecutionContext::alloc_words_rooted`) and
 `Machine::ensure_heap`/`allocate_heap` → `ExecutionContext::ensure_heap_full`
 (`machine/frames.rs:283`).
 Their call sites, exactly: `alloc_words_rooted` has **one** production caller — `terms/slack.rs:170`
 (`terms::reserve`, hence `reserve_slack` and every `*_rooted` builder), reached **per built term**
 (each `put_list`/`put_tuple2`/`make_fun3`/`put_map_assoc`/record/bitstring node), with
 `RootSet::ALL_LIVE` at every family site.
+The classic unrooted builders (`make_tuple`/`make_cons`/… in `terms/construct.rs`, `terms/number.rs`,
+`terms/map.rs`, `terms/fun.rs`, `terms/sink.rs`) are the host/test API and reach
+`ExecutionContext::alloc_words` directly, with neither a root set nor an admission point; **every in-crate
+construction arm** uses a `*_rooted` twin instead. That rule — not a census of `alloc_words` callers — is what a
+new engine-side build must follow.
 `ensure_heap_full` is reached **only** from `Instr::TestHeap` (`interpreter/dispatch.rs:586`) and
 `Instr::AllocateHeap` (`:581`) plus their baseline-JIT twins (`jit/baseline/runtime.rs:1407`/`:1443`),
 so it is a **per-`test_heap`** door, never a per-allocation one; `Instr::Allocate` (`:569-574`) pushes
@@ -128,7 +133,7 @@ state each holds in a Rust local across the call:
   here is the host's `with_relocation_exempt`, not publication.
 - `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments live in the
   `EMPTY_ARGS` stack array (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch`
-  (`machine/mod.rs:345`); **neither is in any `RootSet`**. The in-machine twin
+  (`machine/mod.rs:385`); **neither is in any `RootSet`**. The in-machine twin
   (`ExecutionContext::call_bif_in_machine`, reached through the single `Machine::dispatch_bif_call`
   funnel) carries the same arguments and the same constraint.
 

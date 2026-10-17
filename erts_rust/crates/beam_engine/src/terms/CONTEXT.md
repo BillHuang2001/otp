@@ -4,9 +4,10 @@
 The engine's term-heap glue. Term *construction/inspection* is owned by `beam_term` (the
 frozen-layout LCA, which never allocates); this node obtains raw storage from the execution
 context and passes it to the `beam_term` writers, and reads terms back for the interpreter.
-It is the crate's — and the widened interpreter's — **single point of raw-heap access**
-(`lib.rs` lifts the crate-wide `#![deny(unsafe_code)]` for `pub mod terms` alone, alongside
-`predicates`). Only the **heap binary** family has no `beam_term` owner and hand-rolls its
+`terms` is the engine's term-builder point of raw-heap access, **not** the crate's only one: the crate lifts
+`#![deny(unsafe_code)]` module-locally at ~18 sites, and the authoritative allowlist (with each module's rationale)
+is the crate `CONTEXT.md`'s `## Constraints`. This file documents `terms`' own scope.
+Only the **heap binary** family has no `beam_term` owner and hand-rolls its
 layout here, pinned to the C ground truth. Both heap-binary builders zero the whole data
 section before the payload copy, so the padding tail of the last data word is always zero
 and the term never carries stale heap content past its bit count — the same discipline as
@@ -27,15 +28,22 @@ public:
   correct for any host whose `alloc_words` never collects (the seam contract reserves collecting
   behaviour for `alloc_words_rooted`).
 - **`*_rooted` builders** — the engine's own term-construction path, reserving through the rooted
-  seam so a **moving** collector may run. Every one is
-  `(machine: &mut Machine, ctx, live: u32, …, read: R)` where `R: FnOnce(&Machine, &mut Slack)
-  -> Result<…>` supplies the operands read *after* the reserve:
+  seam so a **moving** collector may run. The operand-carrying shapes take the machine plus a
+  `live` hint and a `read` closure, `(machine: &mut Machine, ctx, live: u32, …, extra: usize,
+  read: R)` where `R: FnOnce(&Machine, &mut Slack) -> Result<…>` supplies the operands read *after*
+  the reserve:
   `make_tuple_rooted(machine, ctx, live, n_elems, extra, read)`,
   `make_cons_rooted(machine, ctx, live, extra, read)`,
   `make_list_rooted(machine, ctx, live, n, extra, read)` (**one** contiguous `2n`-word
   reservation), `badmatch_reason_rooted(machine, ctx, live, module, read)`,
-  `make_fun_rooted(…)`, `make_map_rooted`/`make_flatmap_rooted`, `make_float_rooted`,
-  `make_integer_rooted`, `make_heap_binary_rooted(machine, ctx, bytes)` (whole-X-file live).
+  `make_fun_rooted(machine, ctx, live, …, extra, read)`,
+  `make_flatmap_rooted(machine, ctx, live, capacity_pairs, extra, read)`.
+  Three shapes carry no term operand and so take neither `live` nor a closure:
+  `make_float_rooted(machine, ctx, value)`, `make_integer_rooted(machine, ctx, value)` and
+  `make_heap_binary_rooted(machine, ctx, bytes)` (all `RootSet::ALL_LIVE`).
+  `make_map_rooted(machine, module, ctx, live, capacity_pairs, extra, read)` adds the `module`
+  argument because its closure also receives the host's atom namespace
+  (`R: FnOnce(&Machine, &mut Slack, &AtomTable) -> Result<…>`, taken after the reserve).
   They live beside their classic twins in the same file (`construct.rs`/`number.rs`/`map.rs`/
   `fun.rs`) and are re-exported from `mod.rs`. `make_integer_unrooted` is the operand-immediate
   path (never collects) and stays `pub(crate)`.
@@ -60,8 +68,8 @@ costs a single allocation. `live` is `RootSet::ALL_LIVE` whenever the caller has
 operand-derived count (always a safe over-approximation for a copying collector).
 
 Every term **builder** call site (`families/**`, `machine/**`) is on this discipline:
-`rg -n 'ctx.alloc_words' src/families` is empty. Two sanctioned **unrooted** paths survive, both
-sound only because `alloc_words` never collects:
+`rg -n 'ctx.alloc_words' src/families` is empty. Two **sanctioned unrooted build paths** remain inside the engine's
+own instruction/accessor code, both sound only because `alloc_words` never collects:
 - `crate::operand::read_operand` (`../operand.rs:69`/`:75`) materializes a non-small
   `Operand::Integer`/`Character` through `number.rs::make_integer_unrooted` → `ctx.alloc_words`, so
   **any** instruction reading a bignum immediate allocates once per operand on the unrooted seam —
@@ -69,6 +77,11 @@ sound only because `alloc_words` never collects:
   bodies reach the same reader). Moving-safe: the bignum is consumed immediately and no
   machine-heap term is held across the call.
 - the four `&self` accessors in `../machine/location.rs` (see Handoff below).
+
+The classic builders (above) reach `ctx.alloc_words` by design — they are the host/test API — and
+`../families/exceptions/stacktrace.rs` builds through the unrooted [`ContextSink`] from
+`../machine/location.rs`, so a *count* of `alloc_words` call sites under `src/**` is not a correctness signal. The
+rule is: every in-crate construction **arm** uses a `*_rooted` twin.
 
 ## API Surface (`crate::terms::*`)
 - **Classic builders** (public, unrooted) — listed in the section above; each allocates with
@@ -148,7 +161,7 @@ sound only because `alloc_words` never collects:
   proofs.
 
 ## Handoff — the unrooted paths still open (owner: `beam_rt`)
-`../machine/location.rs:277`/`:409` — the four `&self` accessors (`current_function`,
+`../machine/location.rs:300`/`:438` — the four `&self` accessors (`current_function`,
 `initial_call`, `current_location`, `current_stacktrace`) cannot lend the machine's `&mut` root
 slices, so they build through the **unrooted** [`ContextSink`]. Sanctioned: every term there
 comes from module metadata/immediates with no machine-heap operand held across an allocation,

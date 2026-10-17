@@ -14,9 +14,11 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
 - `mod.rs` — module docs + `LabelMap` (dense or sparse label slots + the per-run `ImportTable`); `build_label_map`,
   `resolve`, `resolve_label`, `import_target` (the uncached fallback), `resolve_imports`.
 - `dispatch.rs` — `run_loop`/`run_loop_with_map` (thin run entries over `Machine::drive`), `enter_run` (the per-run
-  prologue that binds the literal area and records the entry call), **`Machine::step_instruction`** (the one-instruction
-  dispatcher — also the JIT deopt target — which wraps the body `step_instruction_inner` with the uniform raise
-  funnel, see below), `return_step`, `resolve_call_ext_apply` (the `erlang:apply/3` special case — C's
+  prologue that binds the literal area and records the entry call), **`Machine::step_instruction_with_entry`** (the
+  one-instruction dispatcher every driver calls — the interpreter's `Machine::drive` **and** the native tiers'
+  per-instruction deopt helper `../jit/baseline/runtime.rs::jit_step_one` — which wraps the body
+  `step_instruction_inner` with the uniform raise funnel, see below), `Machine::step_instruction` (the
+  single-module shorthand for it, `#[cfg(test)]`-callers only), `return_step`, `resolve_call_ext_apply` (the `erlang:apply/3` special case — C's
   `fixed_apply`→`apply()`), `resolve_call_ext_send` (the `erlang:send/2` / `'!'/2` off-heap-aware send),
   `resolve_external_entry` (the `call_ext*` cross-module seam), `call_ext_dispatch` (the single shared body of the
   three `call_ext*` arms — see below), `apply_import_target` + `ImportFrame` (the arm's own frame discipline over a
@@ -123,13 +125,14 @@ shared catch-aware `raise_bif_error`.
   for each caller. A comparison `Test`/`SelectVal` uses `cmp` (`=:=`) vs `cmp_arith` (`==`).
 - `gc_bif`/`bif` decode a boxed-term test only where the family/`predicates` do; the small-int `'+'`/`'-'`/`'*'` and the
   eight comparison BIFs have baseline-JIT inline paths (see `../jit/baseline/emit/`), everything else deopts to
-  `jit_step_one` (`../jit/baseline/runtime.rs`), which calls `step_instruction`.
+  `jit_step_one` (`../jit/baseline/runtime.rs`), which calls `step_instruction_with_entry`.
 
-## Typed-error inventory (interpreter core) — no fixable "oracle-succeeds but we bail" site
+## Typed-error inventory (interpreter core)
 Every typed error this core (and the `machine/` machinery it drives) can return is one of three classes; a real
 `erl`-compiled `.beam` never hits classes 1 or 2 as a *divergence* — class 1 is malformed-bytecode robustness, class 2
 is a capability gap owned by another node, and class 3 is the name-only refusal of a reason/class atom that no atom
-source can name.
+source can name (the reason and class atoms themselves are resolved through the live namespace, so no
+oracle-succeeds-but-we-bail site remains there).
 - **Class 1 — malformed/hand-built-bytecode robustness (NOT reachable from valid `.beam`, so never a divergence).**
   These mirror C's own `ASSERT`/unchecked invariants; C would move `E`/index and hit UB, this core returns a typed
   error instead.
@@ -174,15 +177,16 @@ source can name.
   never a substituted index. A real module image (`fc.beam`, a failed head clause) whose atom table holds no
   `function_clause` still raises it under both runtimes.
 
-**Headline:** the interpreter core has **no fixable fallback gap** that the shipped runtime actually hits — every
-typed error here is malformed-bytecode robustness (class 1), an owner-outside-this-node capability gap (class 2), or
-the name-only refusal of class 3, which the live-namespace seam answers for every host that owns a shared table.
-`error::blocked()` (`run.rs:74`) is **not** a gap — the blocking-aware entries report `RunOutcome::Wait`; the
-non-blocking `run_export`/`run_label` fold it (Handoff #1, owner `beam_rt`).
+**Headline:** every typed error here is malformed-bytecode robustness (class 1), an owner-outside-this-node
+capability gap (class 2), or the name-only refusal of class 3, which the live-namespace seam answers for every host
+that owns a shared table.
+`error::blocked()` (the constructor is `../error.rs:75`; the fold into it is `../machine/run.rs:74`) is **not** a gap
+— the blocking-aware entries report `RunOutcome::Wait`; the non-blocking `run_export`/`run_label` fold it
+(Handoff #1, owner `beam_rt`).
 
 ## Routing Table
-- `dispatch.rs` → the dispatcher + run entries; `Machine::step_instruction` is the JIT helper's deopt target, and
-  `Machine::call_ext_dispatch` + `ImportFrame` are the shared `call_ext*` body a tier drives.
+- `dispatch.rs` → the dispatcher + run entries; `Machine::step_instruction_with_entry` is the JIT helper's deopt
+  target, and `Machine::call_ext_dispatch` + `ImportFrame` are the shared `call_ext*` body a tier drives.
 - `bif.rs` → BIF operand marshalling + the fail-label/raise split (cross-ref `../context.rs` `ExecutionContext::call_bif`).
 - `test.rs` → `TestKind` evaluation (raw type tests live in `../predicates.rs`).
 - `mod.rs` → `LabelMap`/import resolution (the label+import index every run entry builds).
