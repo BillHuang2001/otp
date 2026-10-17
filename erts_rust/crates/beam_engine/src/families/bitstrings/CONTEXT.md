@@ -207,12 +207,4 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   (C's `big_to_double < 0`).
 
 ## Out-of-node findings (do not fix here)
-- **`beam_rt/src/eval/mod.rs` (the `-eval` tree-walker) diverges from the oracle** on
-  shapes this node gets right: `BitBuf::push_integer_bits(little = true)` reverses the byte
-  order then truncates, so it emits `<<2,0:4>>` where ERTS puts the trailing partial
-  byte's bits MSB-aligned (`<<2,1:4>>`, C's `fmt_small_le`/`restore_and_shift`); it also
-  returns a typed `unsupported` for `float` segments, `float-native` **patterns** and
-  `utf32-little` patterns. The **compiled** route (this node + `beam_rt`'s engine path) is
-  oracle-exact for all of them, and `differential compare` drives the `-eval` route, so
-  those ad-hoc `compare` mismatches are not this node's.
 - **`tools/differential` corpus coverage hole** (see Test Strategy).
