@@ -27,7 +27,7 @@ full gap list in `../../../INSTRUCTION_SURFACE.md`.
 ## Routing Table
 - `mod.rs` — `exec` (the variant dispatch), the shared helpers (`fail_step`, `read_atom`,
   `EXTERNAL`/`UNDERSCORE`), and the per-variant bodies (`create_native_record`,
-  `local_definition`, `write_local_record`, the update paths). 1087 lines: it is one cohesive
+  `local_definition`, `write_local_record`, the update paths). ~1086 lines: it is one cohesive
   family body and documents why at its top — do not grow it; new per-variant code goes to a
   submodule.
 - `raw.rs` — the family's **single** `#[allow(unsafe_code)]` module. Every function forwards to
