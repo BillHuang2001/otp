@@ -236,6 +236,13 @@ copy-rebuild path and the accumulator's window is left unbumped. A **failed** bu
 fast-paths whole bytes when both the source offset and the write position are byte-aligned and
 stays bit-exact per-bit otherwise.
 
+Two properties make the mutation unobservable outside the accumulator, both pinned by
+`create/inplace_tests.rs`: writes land at bit offsets `>= end`, so a shorter window over the same
+payload (an earlier alias) reads exactly its own bits; and writability is **per machine**
+(`Machine::writable_payloads`), so another machine handed the same `Eterm` copy-rebuilds and never
+writes the creator's payload (C's `erts_pin_writable_binary` "an escaped writable binary is no
+longer writable").
+
 Residual (documented, owner `beam_alloc`/`beam_rt`): the payload never *grows*, so a loop that
 outgrows the `bs_init_writable` capacity falls back to the copy-rebuild form and stays O(n²);
 C's `GROW_PROC_BIN_SIZE` (`erl_bits.c:70-73`) + `apparent_size`, the

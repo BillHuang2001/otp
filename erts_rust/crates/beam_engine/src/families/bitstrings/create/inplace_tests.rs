@@ -463,3 +463,82 @@ fn a_failed_build_leaves_the_sources_visible_bits_unchanged() {
     let extended = build_term(&module, &mut machine, &mut ctx, &next);
     assert_eq!(bytes_of(extended), (vec![0x77, 0x01], 16));
 }
+
+// ---------------------------------------------------------------------------
+// 5. An earlier, shorter window and a second machine never see the writes
+// ---------------------------------------------------------------------------
+
+/// The two properties that make the in-place write unobservable outside the
+/// accumulator, pinned directly.
+///
+/// 1. **A shorter view of the same payload is never rewritten.** In-place writes land at
+///    bit offsets `>= end`, so a reader whose window is shorter than the accumulator's
+///    sees exactly the bits it saw before — the payload is observable only through a
+///    window. An *alias* is a second `[BinRef][ErlSubBits]` pair over the same payload
+///    with its own `end`; the identical state (same payload, the pre-append window) is
+///    reproduced here by narrowing the `end` the accumulator reports, which is what an
+///    alias built before the appends still carries.
+/// 2. **Writability does not travel with the term.** The registry is per machine, so
+///    another machine handed the very same `Eterm` does not append into it — it
+///    copy-rebuilds, and the creator's payload stays byte-unchanged. C's counterpart is
+///    `erts_pin_writable_binary`: an escaped writable binary is no longer writable.
+#[test]
+fn a_shorter_window_and_another_machine_never_see_the_in_place_writes() {
+    let module = seg_module();
+    let mut machine = Machine::new();
+    let mut ctx = Counting::new();
+    let acc = raw::make_writable(&mut machine, &mut ctx, 64).expect("writable");
+    machine.set_x(0, acc).expect("x(0)");
+
+    // Seed 8 bits in place, then append three more bytes in place.
+    let mut seed = append_segment(&module, "private_append");
+    seed.extend(int_segment(&module, 0x5A, 8));
+    let seeded = build_term(&module, &mut machine, &mut ctx, &seed);
+    assert_eq!(seeded, acc, "the seed was in place");
+    machine.set_x(0, seeded).expect("x(0)");
+    let mut more = append_segment(&module, "private_append");
+    for value in [0x77, 0x11, 0x22] {
+        more.extend(int_segment(&module, value, 8));
+    }
+    let extended = build_term(&module, &mut machine, &mut ctx, &more);
+    assert_eq!(extended, acc, "the appends were in place");
+    assert_eq!(bytes_of(extended), (vec![0x5A, 0x77, 0x11, 0x22], 32));
+
+    // 1. The same payload read through the window it had before the appends.
+    let (base, start, end) = window(extended);
+    assert_eq!((start, end), (0, 32));
+    raw::set_ctx_end(extended, 8);
+    assert_eq!(
+        window(extended),
+        (base, 0, 8),
+        "the alias sees the same payload, its own window"
+    );
+    assert_eq!(
+        bytes_of(extended),
+        (vec![0x5A], 8),
+        "the shorter window reads exactly its own byte: nothing was written below `end`"
+    );
+    raw::set_ctx_end(extended, 32);
+
+    // 2. Another machine is handed the very same term.
+    let mut other = Machine::new();
+    let mut other_ctx = MinimalContext::new();
+    assert!(
+        raw::writable_append_target(&other, extended).is_none(),
+        "writability is per machine — the term does not carry it"
+    );
+    other.set_x(0, extended).expect("x(0)");
+    let mut next = append_segment(&module, "private_append");
+    next.extend(int_segment(&module, 0x99, 8));
+    let copied = build_term(&module, &mut other, &mut other_ctx, &next);
+    assert_ne!(copied, extended, "the second machine copy-rebuilds");
+    assert_eq!(
+        bytes_of(copied),
+        (vec![0x5A, 0x77, 0x11, 0x22, 0x99], 40)
+    );
+    assert_eq!(
+        bytes_of(extended),
+        (vec![0x5A, 0x77, 0x11, 0x22], 32),
+        "the creator's payload was not written by the other machine"
+    );
+}
