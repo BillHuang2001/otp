@@ -1,0 +1,15 @@
+### primary cross-runtime (--full --runtime all)
+2026-10-17T04:38:58Z
+7.31 7.78 6.99 1/864 7
+### after primary
+2026-10-17T04:39:00Z
+7.31 7.78 6.99 2/870 6
+### after primary
+2026-10-17T04:44:15Z
+5.74 5.40 6.11 16/868 33900
+### before primary (recalibrated)
+2026-10-17T04:48:55Z
+4.91 5.23 5.85 1/884 179
+### after primary (recalibrated)
+2026-10-17T04:54:54Z
+2.65 3.54 4.89 2/857 33662

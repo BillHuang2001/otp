@@ -71,7 +71,8 @@ when an older `dotnet` is first on `PATH`, from the store `dotnet-sdk-9.0.318` v
 `$BENCH_TRY_NIX` is also verified to work here (it fetches `rebar3` 3.27.1 + Erlang/OTP 28 from `cache.nixos.org`; the network is available), but it stays the last resort described above.
 `dotnet` is **store state, not repo state**: PLB needs a ≥ 9.0 SDK, and `command_for_min` finds it wherever it lives (a store entry realized with `nix build --no-link nixpkgs#dotnet-sdk_9`, or a ≥ 9.0 `dotnet` on `PATH`). If no such SDK is reachable, `plb` is either `skipped(dotnet-absent)` or — when an older `dotnet` resolves but none is ≥ 9 — a genuine `failed(plb-build-failed)` with the rejected-candidate notes attached, recorded honestly, never papered over.
 **Flake NOTE (do NOT edit `../../flake.nix`):** it lists `rebar3` in `oracleDeps` but no .NET SDK; adding one there would make `plb` reproducible.
-The sandbox record of what each tool-driven target actually does here is `results/m14-tool-targets-notes.md`.
+The sandbox record of what each tool-driven target actually does here is `results/m14-tool-targets-notes.md`;
+the current session's own record is `results/m15-load-record.md`.
 
 ### `beam_rt` is a REAL runtime (self-checked)
 `beam_rt` is a working Rust runtime (real `-eval` evaluator, a global-atom `code:*`/`init:*` floor, native
@@ -201,22 +202,25 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   note and **no** timing. A `beam_rt` process resolves the system code path with a **native filesystem probe**
   (`crates/beam_rt/src/codeserver.rs`; the `erl` shell-out survives only as a last resort), so the wrapper cases
   no longer pay an `erl` startup — only the cheap path probe when a case first needs a system module.
+  `slice` is the only loop-free workload (one call per process, `N`=1), so it takes **no** marginal: its figures
+  are whole-process wall times and its peak RSS is the one like-for-like memory comparison.
 - `foreign`: **real modules from the foreign target repos, run under *both* runtimes.** Every repo-backed
   workload is `SysOnly` (the Rust runtime cannot boot an OTP release, run `rebar3`, or act as
   `erlc`/`elixirc`), so `foreign` instead picks **pure, self-contained modules from the Cowboy and EMQX
   checkouts** (`cowboy/src/cowboy_bstr.erl`, `apps/emqx/src/emqx_base62.erl`), copies the `.erl` sources
   into a `ScratchDir`, compiles them **once** with the system `erlc` together with an embedded driver
   (`bench_foreign_driver`), and runs the identical `.beam` under **whatever runtime it is scheduled on**.
-  Measurement is **startup-corrected per call**: each case declares a per-runtime loop count `N` and the
-  program is run twice per sample — at `N` and at `0` iterations — giving `case_<name>_wall_ms`,
-  `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, the throughput metric
-  `case_<name>_ns_per_call = (mean(wall@N) − mean(wall@0)) / N × 1e6`, emitted only when positive (else an
-  honest note), plus the deterministic, contention-immune companion **`case_<name>_calls = N`** (mirroring
-  `copy_bound`'s `case_<name>_ops`) so the loop count behind every marginal is in the report. Every
-  runtime's stdout must equal `N × per_call` (recorded in an `observed stdout:` note); a Rust exit `3`
-  records the capability gap and emits **no** timing. The Rust row also carries an explicit note that
-  `case_<name>_ns_per_call` is **N-dependent** (see Known Issues). `foreign` peak RSS is **not** a
-  like-for-like memory comparison (rust RSS scales with the loop count — see Known Issues); `slice` is.
+  Measurement is **paired and startup-corrected per call**: each case declares a per-runtime loop count `N`, and
+  every measurement round samples the program at `N` iterations and then at `0` iterations **back to back**,
+  giving `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, the throughput metric
+  `case_<name>_ns_per_call` = median of the paired `(wall@N − wall@0)` differences / `N` × 1e6 — **withheld** as
+  `marginal below timer resolution` unless it clears `3 × max(1 ms, 1.4826·MAD)` of those differences — plus the
+  deterministic, contention-immune companion **`case_<name>_calls = N`** (mirroring `copy_bound`'s
+  `case_<name>_ops`) so the loop count behind every marginal is in the report. The sampling machinery lives in
+  `foreign_sample.rs`. Every runtime's stdout must equal `N × per_call` (recorded in an `observed stdout:` note); a
+  Rust exit `3` records the capability gap and emits **no** timing. The Rust row also carries an explicit note that
+  `case_<name>_ns_per_call` is **N-dependent** (see Known Issues). `foreign` peak RSS is **not** a like-for-like
+  memory comparison (rust RSS scales with the loop count — see Known Issues); `slice` is.
 - `list_walk`: **the permanent, reproducible per-element dispatch-throughput signal** — an in-tree embedded
   `bench_list_walk` module with a **BIF-free, non-tail-recursive `sum/1`** over a fixed-length list, built
   by a pure-Erlang `build/2` recursion (no native `lists:seq/2`), so the whole program exercises only the
@@ -225,17 +229,19 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   `walk(N)` sums the list `N` times and returns the deterministic `N × (LEN×(LEN+1)/2)`; `LEN = 1000` (a
   Rust const formatted into the Erlang source so the two cannot drift). The Rust and oracle sides use
   per-runtime loop counts (`n_rust` = 50 000, `n_sys` = 100 000 ⇒ 5×10⁷ vs 10⁸ elements walked; the rust
-  `N` is set by the loop-count rule in Constraints). It uses the same startup-cancelled recipe as `foreign`
-  (run at `N` and at `0`), reporting `case_list_walk_wall_ms`, `case_list_walk_startup_ms`,
+  `N` is set by the loop-count rule in Constraints). It uses the same paired startup-cancelled recipe as
+  `foreign` (every round samples the `N`-walk pass then the `0`-walk pass back to back), reporting
+  `case_list_walk_wall_ms`, `case_list_walk_startup_ms`,
   `case_list_walk_peak_rss_bytes`, `case_list_walk_ns_per_element`
-  (`(mean(wall@N) − mean(wall@0)) / (N × LEN) × 1e6`, only when positive) and the **deterministic,
+  (median of the paired `(wall@N − wall@0)` differences / (`N` × LEN) × 1e6, withheld unless it clears
+  `3 × max(1 ms, 1.4826·MAD)`) and the **deterministic,
   contention-immune** companion `case_list_walk_elements` = `N × LEN` (stays valid on a loaded host where
   the wall-clock rows do not). Each run's stdout is checked against the deterministic constant; a Rust exit
   `3` records the capability gap and emits **no** timing. `probe()` ⇒ `skipped(erlc-absent)` without `erlc`.
   A `beam_rt` process resolves its system code path with the **native filesystem probe**
   (`crates/beam_rt/src/codeserver.rs`; the `erl` shell-out is only a last resort), not by spawning `erl`.
-- `copy_bound`: **the messaging / term-copy-bound metric** — the term-copy boundary run under *both* runtimes. One embedded `bench_copy_bound` module (generated from the crate's constants, so Rust and Erlang cannot drift) with four cases, each copying the **same structured payload** (a 5-key map) and validating the round-trip with a bound-variable pattern (a real equality test that raises on a corrupted copy): `etf_roundtrip` (`term_to_binary/1` + `binary_to_term/1` — the External Term Format wire codec, contract A.5); `ets_copy` (`ets:insert/2` + `ets:lookup/2` — the ETS copy boundary, one table+key per process so the measured work is the copy, not table growth); `send_recv` (a term sent to a second process, round-tripped through `term_to_binary/1` there, and sent back — **both directions** of the process copy boundary, with an `after` guard so a missing reply fails loudly, never hangs); and `send_recv_plain` — the **delivery-only (no-ETF) attribution case**: the identical two-process shape, but the worker replies the payload *directly* (`From ! {self(), T}`) with **no** `term_to_binary`/`binary_to_term` in the receiver, so `send_recv − send_recv_plain` attributes the ETF codec component *inside* the two-process path (the `beam_process`/`beam_message` delivery shape the sibling crates asked for). It uses the shared startup-cancelled per-op recipe (run at `N` and at `0`, with a per-case per-runtime `N`; `etf_roundtrip` 40 000/1 500 000, `ets_copy` 200 000/2 000 000, `send_recv` 10 000/500 000, `send_recv_plain` 15 000/1 000 000 rust/sys — the rust `N` is set by the loop-count rule in Constraints; `--quick` ⇒ 3 runs/case, `--full` ⇒ 10), reporting `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, `case_<name>_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_<name>_ops` = `N`. A Rust exit `3` records the capability gap and emits **no** timing; an embedded-module compile failure is `failed(module-compile-failed)` (the source is ours), never a skip; `probe()` ⇒ `skipped(erlc-absent)` via the shared `slice::resolve_erlc()` lookup. **Attribution caveat:** `payload/0` is rebuilt inside every iteration, and each iteration also runs the bound-variable equality match, so the `etf_roundtrip` per-op figure is the *whole iteration* (payload construction + `term_to_binary`/`binary_to_term` + the structural equality test), **not the codec alone** — the same shape holds for `ets_copy`/`send_recv`/`send_recv_plain`, and both runtimes pay the identical per-iteration setup.
-- `gc_bound`: **the GC-bound metric** — allocate-and-abandon garbage churn under *both* runtimes. One embedded `bench_gc_bound` module whose single `churn/1` case, per iteration, builds and abandons three `LEN`=256-sized structures — a pure-Erlang recursion list (`build_list/2`, *not* a native `lists:seq/2`), a 256-byte binary built from an Erlang-level char list, and a tuple built from another Erlang list — then checks the two O(1)-checkable ones (`byte_size`/`tuple_size`) so a silently-dropped allocation fails loudly. It uses the same shared startup-cancelled per-op recipe (run at `N` and at `0`; `n_rust` = 5 000, `n_sys` = 200 000; `--quick` ⇒ 3 runs, `--full` ⇒ 10), reporting `case_churn_wall_ms`, `case_churn_startup_ms`, `case_churn_peak_rss_bytes`, `case_churn_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_churn_ops` = `N`. The row measures the allocate-and-abandon wall time and **claims no collection count** (whether a runtime's collector runs during the loop is its own admission policy); a Rust exit `3` ⇒ an honest `skipped(unsupported-case)` with **no** timing, and a compile failure is `failed(module-compile-failed)`; `probe()` ⇒ `skipped(erlc-absent)` via `slice::resolve_erlc()`.
+- `copy_bound`: **the messaging / term-copy-bound metric** — the term-copy boundary run under *both* runtimes. One embedded `bench_copy_bound` module (generated from the crate's constants, so Rust and Erlang cannot drift) with four cases, each copying the **same structured payload** (a 5-key map) and validating the round-trip with a bound-variable pattern (a real equality test that raises on a corrupted copy): `etf_roundtrip` (`term_to_binary/1` + `binary_to_term/1` — the External Term Format wire codec, contract A.5); `ets_copy` (`ets:insert/2` + `ets:lookup/2` — the ETS copy boundary, one table+key per process so the measured work is the copy, not table growth); `send_recv` (a term sent to a second process, round-tripped through `term_to_binary/1` there, and sent back — **both directions** of the process copy boundary, with an `after` guard so a missing reply fails loudly, never hangs); and `send_recv_plain` — the **delivery-only (no-ETF) attribution case**: the identical two-process shape, but the worker replies the payload *directly* (`From ! {self(), T}`) with **no** `term_to_binary`/`binary_to_term` in the receiver, so `send_recv − send_recv_plain` attributes the ETF codec component *inside* the two-process path (the `beam_process`/`beam_message` delivery shape the sibling crates asked for). It uses the shared paired per-op recipe (every round samples the `N`-op pass then the `0`-op pass back to back, with a per-case per-runtime `N`; `etf_roundtrip` 500 000/1 500 000, `ets_copy` 250 000/2 000 000, `send_recv` 90 000/500 000, `send_recv_plain` 300 000/1 000 000 rust/sys — the rust `N` is set by the loop-count rule in Constraints; `--quick` ⇒ 3 rounds/case, `--full` ⇒ 10), reporting `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, `case_<name>_ns_per_op` (median of the paired `(wall@N − wall@0)` differences / `N` × 1e6, withheld as `marginal below timer resolution` unless it clears `3 × max(1 ms, 1.4826·MAD)`) and the deterministic, contention-immune `case_<name>_ops` = `N`. A Rust exit `3` records the capability gap and emits **no** timing; an embedded-module compile failure is `failed(module-compile-failed)` (the source is ours), never a skip; `probe()` ⇒ `skipped(erlc-absent)` via the shared `slice::resolve_erlc()` lookup. **Attribution caveat:** `payload/0` is rebuilt inside every iteration, and each iteration also runs the bound-variable equality match, so the `etf_roundtrip` per-op figure is the *whole iteration* (payload construction + `term_to_binary`/`binary_to_term` + the structural equality test), **not the codec alone** — the same shape holds for `ets_copy`/`send_recv`/`send_recv_plain`, and both runtimes pay the identical per-iteration setup.
+- `gc_bound`: **the GC-bound metric** — allocate-and-abandon garbage churn under *both* runtimes. One embedded `bench_gc_bound` module whose single `churn/1` case, per iteration, builds and abandons three `LEN`=256-sized structures — a pure-Erlang recursion list (`build_list/2`, *not* a native `lists:seq/2`), a 256-byte binary built from an Erlang-level char list, and a tuple built from another Erlang list — then checks the two O(1)-checkable ones (`byte_size`/`tuple_size`) so a silently-dropped allocation fails loudly. It uses the same shared paired per-op recipe (every round samples the `N`-churn pass then the `0`-churn pass back to back; `n_rust` = 10 000, `n_sys` = 200 000; `--quick` ⇒ 3 rounds, `--full` ⇒ 10), reporting `case_churn_wall_ms`, `case_churn_startup_ms`, `case_churn_peak_rss_bytes`, `case_churn_ns_per_op` (median of the paired `(wall@N − wall@0)` differences / `N` × 1e6, withheld unless it clears `3 × max(1 ms, 1.4826·MAD)`) and the deterministic, contention-immune `case_churn_ops` = `N`. The row measures the allocate-and-abandon wall time and **claims no collection count** (whether a runtime's collector runs during the loop is its own admission policy); a Rust exit `3` ⇒ an honest `skipped(unsupported-case)` with **no** timing, and a compile failure is `failed(module-compile-failed)`; `probe()` ⇒ `skipped(erlc-absent)` via `slice::resolve_erlc()`.
 
 ### Result JSON schema (stable — `SCHEMA_VERSION = 1`)
 Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in **milliseconds** (f64).
@@ -283,6 +289,12 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `src/proc.rs` → subprocess helpers: timed run with stdout/stderr capture, `VmHWM` peak-memory poller.
 - `src/scratch.rs` → **read-only target adapter**: `ScratchDir` (RAII `$TMPDIR` temp dir), `copy_tree`, `copy_files`.
 - `src/http_load.rs` → dependency-free in-process HTTP/1.1 load driver (`LoadConfig`, `drive`, `LoadOutcome`).
+- `src/marginal.rs` → **the paired, drift-cancelling startup-cancelled marginal**: `Pass` (`units`/`as_str`),
+  `PassError`/`Abort`/`PairedRuns`, `sample_pairs(runs, sample)` (Work-then-Startup **within** every round),
+  `resolve(&[(work_ms, startup_ms)], units) -> Marginal` (median of the paired deltas, `1.4826 × MAD`
+  noise band floored at `MIN_NOISE_MS`, published only above `NOISE_MULTIPLE`), `Marginal::{unit_cost_ns,
+  detail, below_resolution_note}`, and the drift pin `tests::interleaving_cancels_a_drifting_boot_cost`.
+  The sanctioned schedule for every per-unit metric.
 - `src/report.rs` → `Report`, `WorkloadResult`, `SCHEMA_VERSION`, JSON save/load (serde).
 - `src/compare.rs` → diff two `Report`s into per-(workload,runtime,metric) deltas; one-path mode diffs `sys` vs `rust` within a single report.
 - `src/run.rs` → runner: resolve runtimes, iterate (runtime × workload), assemble `Report`, write JSON.
@@ -297,6 +309,12 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   tables + the `the_rust_loop_count(s)_clear_the_boot_jitter_band` tests) and the module docs state the rule.
   `slice.rs` also exposes `pub(crate) resolve_erlc()` (the shared `$ERLC`/`PATH` lookup reused by
   `foreign.rs`, `list_walk.rs`, `copy_bound.rs` and `gc_bound.rs`).
+- `src/workloads/foreign_sample.rs` → the `foreign` sampling machinery, extracted so `foreign.rs` stays inside
+  the ~1000-line convention: `CaseOutcome`/`CaseSample`/`sample_once`/`outcome_from`/`classify_failure`/
+  `execute_case`, all `pub(super)`. It decides nothing *what* to measure (`foreign.rs`'s `Case` supplies the
+  driver, the per-call increment and the per-runtime `N`); it runs the two passes **interleaved**, checks the
+  deterministic stdout, classifies failures (a Rust exit `3` is `unsupported` only while no work sample has
+  completed) and hands the paired wall times to `crate::marginal`.
 - `tests/integration.rs` → hermetic synthetic-report round-trip + `compare` tests (no oracle needed), plus
   the cross-runtime regression guard (`foreign`, `list_walk`, `copy_bound` and `gc_bound` stay
   `Runtimes::Both`, each with its own category/contracts: `foreign`/`list_walk` Compute·A.1+A.2,
@@ -304,34 +322,40 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `tests/oracle_smoke.rs` → `baseline` smoke test against the real oracle (no-op skip when unresolved).
 - `RESULTS.md` → the definitive results summary (per-category tables, both sides named, the load record, the
   reproduction commands, the still-open items, honesty caveats).
-- `results/` → committed raw `Report` JSON + supporting artifacts. `m14-*` = the **current** run:
-  `m14-recalibration.{md,csv}` (the loop-count recalibration evidence), `m14-bench-xrun.json` (the full
-  cross-runtime report), the two `--quick` tier controls `m14-bench-xrun-{interp,quick}.json`, the external
-  report `m14-bench-external.json`, the PLB/EMQX rows, the interleaved A/B set
-  `m14-ab-{head,m13,m10}-r{1,2,3}.json` + `m14-ab-summary.csv` (rust-vs-rust binary comparison; the
-  `$BEAM_RT` variant is selected per run, the foreign sides' programs normalised to
-  `$TMPDIR/{m13,m10}wt/erts_rust/target/release/beam_rt`), the `m14-*-load.log` records,
-  `m14-load-record.md`, `m14-tool-targets-notes.md`, `m14-tier-effect.csv` and the `m14-compare-*.txt`
-  diffs. History: `m13-*`/`m12-*`/`m11-*`/`m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` (regression baselines; the
-  `m13-*` group also holds `m13-cli-probe.csv` and `m13-foreign-ladder.csv`, `m9-*` the post-fix
-  tool-resolution smokes), the `b54-*`/`b55-*` groups (the Θ(N³) foreign regression experiments + fix), and
-  the prose records `m13-load-record.md`/`m13-tool-targets-notes.md`, `m12-foreign-regression.md`,
+- `results/` → committed raw `Report` JSON + supporting artifacts. `m15-*` = the **current** run (2026-10-17,
+  load ≈2–5): `m15-bench-xrun.json` (the full cross-runtime report), the two `--quick` tier controls
+  `m15-bench-xrun-{interp,quick}.json`, the external report `m15-bench-external.json`, the PLB row
+  `m15-bench-plb.json` and the EMQX skip row `m15-bench-emqx.json`, the
+  `m15-compare-{cross-runtime,tier-effect-quick,vs-m14-xrun,vs-m14-external}.txt` diffs, the
+  `m15-{xrun,tier,ext}-load.log` records and `m15-load-record.md` (which also records the superseded
+  pre-recalibration primary pass). History: `m14-*` (its `copy_bound`/`gc_bound`/`foreign` per-unit figures are
+  superseded by the paired estimator — see `RESULTS.md` §3.4; the `m14-ab-*` interleaved A/B set +
+  `m14-ab-summary.csv` and `m14-recalibration.{md,csv}` remain the evidence behind those decisions),
+  `m13-*`/`m12-*`/`m11-*`/`m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` (regression baselines; the `m13-*` group also
+  holds `m13-cli-probe.csv` and `m13-foreign-ladder.csv`, `m9-*` the post-fix tool-resolution smokes), the
+  `b54-*`/`b55-*` groups (the Θ(N³) foreign regression experiments + fix), and the prose records
+  `m1{3,4}-load-record.md`/`m1{3,4}-tool-targets-notes.md`, `m12-foreign-regression.md`,
   `m12-run-route-latency.md`, `m12-emqx-enablement-attempt.md` (+ `.patch`).
 
 ## Constraints
 - `#![forbid(unsafe_code)]`; **no new crates** (deps resolve offline: `serde`, `serde_json`, `beam_common`).
-- **Loop-count calibration (the rust marginal must clear the boot jitter).** Each `Runtimes::Both` loop
-  workload declares a **per-runtime loop count `N`** and runs the identical program at `N` and at `0`
-  (startup-cancelled). The rust `N` is chosen so the timed loop does enough work that its marginal stands
-  clear of the rust side's run-to-run boot jitter — measured ≈±0.1 s, so the rust floor is **≥0.5 s of loop
-  work** (≳1.5 s for a case whose marginal has collapsed). `n_sys` stays far above the oracle's tens-of-ms
-  jitter. Cross-`N` comparison is honest **only** through the per-op/per-element normalization — never
-  compare raw `wall_ms` across two sides with different `N`; every row also emits the deterministic
-  `case_*_ops`/`case_*_calls`/`case_*_elements` companion so the `N` behind each figure is in the report.
-  Current counts (rust/sys): `list_walk` 50 000/100 000; `copy_bound` `etf_roundtrip` 40 000/1.5 M,
-  `ets_copy` 200 000/2 M, `send_recv` 10 000/0.5 M, `send_recv_plain` 15 000/1 M; `gc_bound` `churn`
-  5 000/200 000. Each case table's doc comment states the rule + the measured per-unit cost, and in-file
-  tests (`…clear_the_boot_jitter_band`) pin the counts.
+- **Loop-count calibration (the rust marginal must clear the measurement noise).** Each `Runtimes::Both` loop
+  workload declares a **per-runtime loop count `N`** and samples the identical program at `N` and at `0` as
+  **interleaved pairs** (`src/marginal.rs`). The rust `N` is chosen so the timed loop does a uniform **≥0.5 s of
+  loop work**: with the interleaving the residual noise is the MAD of the paired differences (a few
+  milliseconds), which ≥0.5 s clears by orders of magnitude. `n_sys` stays far larger, so the oracle's own
+  marginal is ≈1–1.2 s. Cross-`N` comparison is honest **only** through the per-op/per-element/per-call
+  normalization — never compare raw `wall_ms` across two sides with different `N`; every row also emits the
+  deterministic `case_*_ops`/`case_*_calls`/`case_*_elements` companion so the `N` behind each figure is in the
+  report.
+  Current counts (rust/sys, m15): `list_walk` 50 000/100 000; `foreign` `bstr_to_lower` 50 000/1.5 M,
+  `bstr_capitalize_token` 40 000/1.5 M, `emqx_base62_encode` 60 000/3 M, `emqx_base62_decode` 60 000/3 M;
+  `copy_bound` `etf_roundtrip` 500 000/1.5 M, `ets_copy` 250 000/2 M, `send_recv` 90 000/0.5 M,
+  `send_recv_plain` 300 000/1 M; `gc_bound` `churn` 10 000/200 000.
+  **Maintenance rule: when a case's measured per-unit cost changes materially, re-derive that case's `n_rust`
+  so the loop work stays ≥0.5 s and re-pin it** in the file's
+  `the_rust_loop_count(s)_clear_the_boot_jitter_band` test (which also fails when a case is added without a
+  measured cost). Each case table's doc comment states the rule and the measured per-unit cost.
 - External-repo roots are **documented defaults**, overridable via `--repo <id>=<path>` (repeatable)
   and env `BENCH_<ID>_REPO` (e.g. `BENCH_COWBOY_REPO`); no other absolute path is baked in, and the store
   scan never bakes in a hash or version.
@@ -403,7 +427,7 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   with load, because the oracle `erl` (a 14-scheduler SMP VM) loses more to CPU contention than
   `beam_rt`. Prefer the **quiet** run and ratios over absolute values, always record `/proc/loadavg` with
   the numbers, and never quote a single contended run as a constant (the recorded loads are in `RESULTS.md`
-  §1 and `results/m14-*-load.log`).
+  §1 and `results/m15-*-load.log`).
 - **Elixir**: the in-repo checkout (`/home/bill/Source/elixir`, `1.21.0-dev`) is unbuilt; the workload
   measures the installed system `elixirc` (1.20.4). Compiling the checkout's stdlib in one `elixirc` batch
   fails on version skew, hence the per-file fallback.
@@ -420,32 +444,37 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked** `results/`
   directory (see `RESULTS.md`), which is for committed milestone numbers only.
 - **`foreign`'s `case_<name>_ns_per_call` is N-dependent on the Rust runtime** (the per-call cost drifts with
-  `N`, a common-mode per-op heap retention shared with the m10 baseline), so it is
-  only comparable across runs that used the same `N`; each row emits a `case_<name>_calls` companion and an
+  `N`, a common-mode per-op heap retention), so it is
+  only comparable across runs that used the same `N`; the counts were **recalibrated in m15** (§ Constraints), so
+  a figure from an older session is a *different* baseline. Each row emits a `case_<name>_calls` companion and an
   explicit note. The rows are **not** a clean cross-runtime ratio, and the loop workloads' rust peak RSS is
   **boot-dominated** (a general per-op heap retention beneath it, not ETS-specific).
   Both facts, with the owner `file:line`s and the root causes (which live **outside this node**), are in the
   dedicated *Known Issue* section below — read it before quoting a `foreign` number or a loop-workload RSS.
-- **OPEN (owner `beam_rt`, outside this node) — `foreign: emqx_base62:encode` regression — UNDER
-  INVESTIGATION, no cause attributed.** The m13 record reported the m13-era head as **3.2×–3.8× dearer than
-  the m10 binary** on `encode`. The m14 interleaved A/B (`results/m14-ab-{head,m13,m10}-r{1,2,3}.json`, load
-  88→145, `m14-ab-summary.csv`) **does not reproduce that at head**: within-round `head/m10` = 0.68× / 2.64×
-  / 0.76× (median 0.82×, i.e. head ≈ m10), while the **m13 binary does** reproduce it (within-round
-  `head/m13` = 0.23× / 0.61× / 0.32×; the m13 binary is 2.4×–4.3× m10). The other three `foreign` cases
-  scatter similarly on the loaded host. Another agent is investigating — **no cause is attributed here**
-  (`RESULTS.md` §3/§8).
+- **CLOSED — `foreign: emqx_base62:encode` is at parity with the m10 rust binary** (0.95×–1.07×). The m13-era
+  "3.2×–3.8× dearer than m10" reading is not reproducible against the current tree (the m14 interleaved A/B,
+  `results/m14-ab-*` + `m14-ab-summary.csv`, already failed to reproduce it at head), so there is no open
+  regression on that case. Only the generic `N`-sensitivity caveat above still governs how its figure is quoted.
 
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests`: `stats` (percentile/mean edge cases), `metrics`/`report`
   (JSON round-trip + schema stability + exactly-one-of value/summary), `cli` (every subcommand, defaults,
   `--help`, `--out-file`, error cases), `probe` decision helpers, `compare` (deltas), `scratch`
-  (RAII/copy/skip), `http_load` (loopback keep-alive server + pure parsers), `workloads::tool`
+  (RAII/copy/skip), `http_load` (loopback keep-alive server + pure parsers), `marginal` (the pinning test
+  `interleaving_cancels_a_drifting_boot_cost` — a fake clock proves the paired median recovers the true
+  per-unit cost exactly where the old sequential `mean(work) − mean(startup)` is off by `runs × drift_step`;
+  plus the median-vs-outlier, noise-band, degenerate-input, pair-retention and `Pass` round-trip cases),
+  `workloads::tool`
   (tool/argv + the version-aware store ranking + `command_for_min`'s selection: greatest satisfying
   version, tie-break by source order, fallback note, `parse_version_output`, provenance/rejection notes),
   `workloads::plb` (a run with no result JSON is a *failed* row, never `ok`), `workloads::foreign`,
   `workloads::list_walk`, `workloads::copy_bound` and `workloads::gc_bound` (case tables, per-side argv,
-  the startup-cancelling per-op/per-call/per-element math, deterministic stdout, and the loop-count rule —
-  `the_rust_loop_count(s)_clear_the_boot_jitter_band`). The tool-driven targets' **enable/skip decisions** are pinned so a
+  the paired per-op/per-call/per-element math, deterministic stdout, and the loop-count rule). Each loop
+  workload pins the three sampling guarantees — `rounds_are_paired_work_then_startup` (round *i* is
+  Work-then-Startup), `a_failing_startup_pass_keeps_the_completed_pairs` (the completed rounds are still
+  reported) and `the_metric_is_withheld_inside_the_noise_band` (no figure from a sub-noise marginal) — plus its
+  recalibrated counts in `the_rust_loop_count(s)_clear_the_boot_jitter_band`.
+  The tool-driven targets' **enable/skip decisions** are pinned so a
   future environment change cannot silently turn a real measurement into a skip — `khepri` probes
   `Ready` and its resolved `rebar3` exists on disk when the checkout + tool resolve; `plb` probes
   `Ready` and its version-resolved `dotnet` satisfies `MIN_DOTNET_SDK`; `emqx` gates a pinned checkout
@@ -464,7 +493,7 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 
 ## Runbook
 Nothing here is required for a code review. **`RESULTS.md` §7 is the authoritative, current runbook** (the
-exact `bench run …` commands behind every `results/m14-*` artifact); reproduce from there rather than from a
+exact `bench run …` commands behind every `results/m15-*` artifact); reproduce from there rather than from a
 copy. The shape is: build the driver *and* the runtime once
 (`erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt -p bench` from
 the repo root), then drive the subcommands. Two facts to keep in mind when reproducing:
@@ -481,33 +510,44 @@ the repo root), then drive the subcommands. Two facts to keep in mind when repro
 
 ## Status
 - The driver is a complete library + binary: 12 workloads, all implemented and tested; `cargo test -p bench`
-  is green (**259 passed / 0 failed**: 251 lib unit + 4 integration + 1 oracle smoke + 3 doc — the two
-  `…clear_the_boot_jitter_band` calibration tests are among the lib units), and the crate builds
-  warning-free with `--all-targets`.
-- **Current measurement session: `m14` (2026-10-16).** The full cross-runtime pass ran 12/12 rows `ok` (six
-  `Runtimes::Both` workloads × both runtimes — **no `marginal below timer resolution` anywhere**), the
-  sys-only external pass ran 4/4 `ok` (`erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri`), `plb` → `ok`
-  (version-aware resolution picks `dotnet` 9.0.318), and the only honest non-`ok` row in the milestone is
-  `emqx` → `skipped(emqx-requires-otp-28)`. Loads: primary pass 56.76→73.66, tier controls 74.70→40.66,
-  external 39.89→44.09, `plb`/`emqx` 43.44→59.20, foreign A/B 88.99→145.18.
-- **The m13 driver measurement gap is CLOSED.** The rust loop counts were recalibrated so the rust marginal
-  clears the boot jitter (Constraint above): `list_walk` 1 000→50 000, `etf_roundtrip` 5 000→40 000,
-  `ets_copy` 100 000→200 000, `send_recv` 2 000→10 000, `send_recv_plain` 2 000→15 000, `gc_bound churn`
-  2 000→5 000. **43/43 repeated runs resolved** (every rust marginal 5×–150× the ≈±0.1 s jitter band; every
-  sys marginal positive) — raw `results/m14-recalibration.csv`, write-up `m14-recalibration.md`.
-- Headline m14 numbers (both sides named; read `RESULTS.md` for the tables): startup `p50` **436.5 ms (sys)
-  vs 1 373.6 ms (rust)** (p99 788.7 vs 1 835.5), `erlang:memory(total)` **36.2 MB vs 14.6 MB** (rust 2.48×
-  lower); primary rust/sys per-unit ratios `list_walk` 5.3×, `etf_roundtrip` 136.3×, `ets_copy` 27.4×,
-  `send_recv` 105.4×, `send_recv_plain` 111.9×, `churn` 30.4×, `foreign` 54.5×–79.6×, `slice` ≈2.11×.
-- The **`foreign: emqx_base62:encode`** item is still **OPEN / under investigation** (another agent) — the
-  m14 A/B does not reproduce the m13-regression at head; see *Known Issues* above.
-- Read the figures from `RESULTS.md` / `results/` (`m14-*` current; `m13-*`/`m12-*`/`m11-*`/`m10-*`/`m9-*`/
-  `m6-*`/`m5-*`/`m4-*` the regression baselines) — this file deliberately restates none of them.
+  is green (**275 passed / 0 failed**: 266 lib unit + 4 integration + 1 oracle smoke + 4 doc — the
+  `the_rust_loop_count(s)_clear_the_boot_jitter_band` calibration pins, the `marginal` drift/noise-band tests and
+  the per-workload pairing/withholding tests are among the lib units), and the crate builds warning-free with
+  `--all-targets`.
+- **Current measurement session: `m15` (2026-10-17, load ≈2–5).** The full cross-runtime pass ran 12/12 rows
+  `ok` (six `Runtimes::Both` workloads × both runtimes — **no `marginal below timer resolution` anywhere**), the
+  two tier controls 6/6 `ok` each, the sys-only external pass 4/4 `ok` (`erlc_compiler`, `elixir_compiler`,
+  `cowboy`, `khepri`), `plb` → `ok` (version-aware resolution picks `dotnet` 9.0.318), and the only honest
+  non-`ok` row in the session is `emqx` → `skipped(emqx-requires-otp-28)`. Loads: primary pass 4.91→2.65, tier
+  controls 2.06→3.96→2.74, external 2.68→2.52, `plb`/`emqx` 2.40→2.27.
+- **Every per-unit figure comes from the paired, drift-cancelling estimator** (`src/marginal.rs`): each round
+  samples the `N` pass then the `0` pass **back to back**, the statistic is the **median of the paired
+  differences**, and a figure inside `3 × max(1 ms, 1.4826·MAD)` is withheld as
+  `marginal below timer resolution`. A sequential all-`N`-then-all-`0` mean schedule absorbs the host's boot
+  drift instead of cancelling it (it published `etf_roundtrip` at 136.3× where the interleaved measurement gives
+  2.42×; the paired figure is 2.18×), so **m14's `copy_bound`/`gc_bound`/`foreign` per-unit numbers are
+  withdrawn** — that session used a different statistic *and* a different `N` (`RESULTS.md` §3.4).
+- The rust loop counts were recalibrated in m15 to the ≥0.5 s loop-work floor (Constraints): `etf_roundtrip`
+  40 000→500 000, `ets_copy` 200 000→250 000, `send_recv` 10 000→90 000, `send_recv_plain` 15 000→300 000,
+  `churn` 5 000→10 000, and all four `foreign` cases (`bstr_to_lower` 20 000→50 000, `bstr_capitalize_token`
+  15 000→40 000, `emqx_base62_encode` 25 000→60 000, `emqx_base62_decode` 15 000→60 000). All 12 primary rows
+  resolved, every rust marginal 575–1 037 ms against a paired noise band of ±2.3–66.7 ms.
+- Headline m15 facts (read `RESULTS.md` for the tables): startup `p50` **111.6 ms (sys) vs 282.0 ms (rust)**
+  (p99 136.1 vs 288.8), `erlang:memory(total)` **36.19 MB vs 13.22 MB** (rust 2.74× lower), OS peak RSS for
+  `baseline` now nearly equal (135.0 vs 133.3 MB); primary rust/sys per-unit ratios `list_walk` 7.95×,
+  `etf_roundtrip` 2.18×, `ets_copy` 11.22×, `send_recv` 5.26×, `send_recv_plain` 2.95×, `churn` 15.18×,
+  `foreign` 34.8×–86.3×, `slice` ≈2.12×. The default baseline JIT is cheaper than the interpreter on **every**
+  case in the m15 tier pair.
+- The **`foreign: emqx_base62:encode`** item is **CLOSED at parity** (0.95×–1.07× vs the m10 binary); only the
+  generic `N`-sensitivity caveat still applies to quoting its figure. See *Known Issues*.
+- Read the figures from `RESULTS.md` / `results/` (`m15-*` current; `m14-*`/`m13-*`/`m12-*`/`m11-*`/`m10-*`/
+  `m9-*`/`m6-*`/`m5-*`/`m4-*` the regression baselines) — this file deliberately restates none of them beyond
+  these structural/headline facts.
 
 ## Measured — where the numbers live
 **`RESULTS.md` is the authoritative source for every measured number** (per-category tables with both sides
 named, the environment/load record, the reproduction commands, the calibration rule, the still-open items).
-The raw harness behind it is committed under `results/` (`m14-*` current; see the routing-table entry above
+The raw harness behind it is committed under `results/` (`m15-*` current; see the routing-table entry above
 for the file list). This file deliberately restates none of the numbers — read them there, and regenerate via
 the Runbook rather than quoting a stale copy.
 
@@ -549,15 +589,13 @@ characterisation (a module-graph-heavy `slice` case at **~1.2–1.3×** the inte
 `../../crates/beam_engine/MEASURED.md` and `../../crates/beam_rt/PERF.md`.
 
 **The tier effect is also measured here** as the two matched-form `--quick` rust-only controls
-`results/m14-bench-xrun-interp.json` (interpreter) and `results/m14-bench-xrun-quick.json` (default baseline
-JIT) — the same six workloads, `--runtime rust` only, with `BEAM_RT_TIER` exported (`bench` spawns the runtime
-with an inherited environment, so the switch reaches every child). They have **no `sys` rows**: they are
-Rust-vs-Rust and must never be read against the system-ERTS column. `RESULTS.md` §5 tabulates them off the
-matched-form pair (`results/m14-compare-tier-effect-quick.txt`); the as-specified
-`results/m14-compare-tier-effect.txt` (interpreter `--quick` vs default `--full`) is a form mismatch. In the
-m14 pair the default baseline JIT is cheaper than the interpreter on every case except `send_recv` (a
-load-sensitive marginal on a heavily loaded host); every tier table here is a Rust-vs-Rust observation, **NOT**
-a system-ERTS comparison.
+`results/m15-bench-xrun-interp.json` (interpreter) and `results/m15-bench-xrun-quick.json` (default baseline
+JIT) — the same six workloads, `--runtime rust` only, run back to back, with `BEAM_RT_TIER` exported (`bench`
+spawns the runtime with an inherited environment, so the switch reaches every child). They have **no `sys`
+rows**: they are Rust-vs-Rust and must never be read against the system-ERTS column. `RESULTS.md` §5 tabulates
+them off the matched-form pair (`results/m15-compare-tier-effect-quick.txt`). In the m15 pair the default
+baseline JIT is cheaper than the interpreter on **every** case; every tier table here is a Rust-vs-Rust
+observation, **NOT** a system-ERTS comparison.
 
 Consequence for reading results: startup latency is the trustworthy cross-runtime comparison for
 whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_bound`/`gc_bound`
@@ -567,19 +605,20 @@ be re-run via the Runbook rather than adjusted.
 ## Known Issue — the `foreign` per-call metric is `N`-dependent, and the loop workloads' rust peak RSS is boot-dominated
 
 ### `foreign` `case_<name>_ns_per_call` is N-dependent on the Rust runtime
-On `beam_rt` the per-call cost still drifts with `N` — a **common-mode per-op heap retention shared with the
-m10 baseline** — so `foreign`'s `case_<name>_ns_per_call` remains only a clean marginal at the declared `N`
-and is **only comparable across runs that used the same `N`**; the `sys` oracle side is ~flat over the same
-range. `RESULTS.md` §8 records the verdict; the at-`N` evidence is `results/m14-ab-*` +
-`results/m14-ab-summary.csv` (history: the m13 A/B set, the m12 re-derivation
-`results/m12-foreign-regression.md`, `results/b54-foreign-growth-curve.md`). This workload's job here is
+On `beam_rt` the per-call cost still drifts with `N` — a **common-mode per-op heap retention** — so
+`foreign`'s `case_<name>_ns_per_call` remains only a clean marginal at the declared `N` and is **only
+comparable across runs that used the same `N`**; the `sys` oracle side is ~flat over the same range. The rust
+counts were recalculated in m15 (Constraints), so every earlier session's per-call figure is a different
+baseline. `RESULTS.md` §3.4/§8 records the verdict; history: the m13 A/B set, the m12 re-derivation
+`results/m12-foreign-regression.md`, `results/b54-foreign-growth-curve.md`. This workload's job here is
 honesty, not any fix: every row emits the deterministic `case_<name>_calls = N` companion, and the Rust row
 carries an explicit N-dependence note, so a per-call figure is never quoted without the `N` behind it.
 
 ### the loop workloads' rust peak RSS is boot-dominated
 The loop workloads' rust peak RSS is **boot-dominated** — the resident preloaded-module set of the booted
 `start.boot` dwarfs the loop's own footprint, so those rows read far above the oracle's and are **not** a
-like-for-like memory comparison (`RESULTS.md` §2). Beneath it the same **general per-op heap retention**
+like-for-like memory comparison (`RESULTS.md` §3.2; e.g. `copy_bound/etf_roundtrip` reads 459 MB on rust
+against ~70 MB on the oracle). Beneath it the same **general per-op heap retention**
 remains the underlying mechanism: the BIF-result copy-out (`crates/beam_rt/src/context/calls.rs`) and the
 engine's unrooted `alloc_words` seam (`crates/beam_rt/src/context/gc.rs`) both call `Process::grow_nursery`
 (`crates/beam_process/src/process.rs`) → `Nursery::grow` (`crates/beam_gc/src/nursery.rs`), which pushes the
@@ -588,7 +627,7 @@ replaced whole `HeapSpace` onto `Nursery.retired`; `retired` is cleared only by 
 make a silently-dropped allocation fail loudly — this is a retention, not a correctness, issue.
 
 So the rust `foreign`/`copy_bound` per-case `case_<name>_peak_rss_bytes` is **not** a like-for-like memory
-comparison (loop-length- **and** boot-dependent, `RESULTS.md` §2/§8); `slice` (one call per process, `N`=1)
+comparison (loop-length- **and** boot-dependent, `RESULTS.md` §3.2); `slice` (one call per process, `N`=1)
 remains the comparable per-process memory metric.
 
 **Reproducing the counter-level evidence (the driver prints none of it).** A `copy_bound`/`gc_bound` row
@@ -628,16 +667,18 @@ impossibility guard), not silent error handling.
   `MemoryHook` seam), recording a real `vm_memory_total_bytes` for `rust`; `is_capability_gap` survives only as a
   fallback classifier.
 
-The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology is implemented exactly as
-`RESULTS.md` states (startup-cancelled `(mean wall@N − mean wall@0) / N`, with a per-runtime `N` calibrated per
-the loop-count rule), and the registered-BIF dispatch cost is **not** produced here; it is a `beam_rt`
-measurement (`../../crates/beam_rt/PERF.md`, `TRACE_AND_PERF.md`).
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` methodology is implemented exactly as `RESULTS.md` states
+(the paired startup-cancelled marginal: each round samples the `N` pass then the `0` pass back to back and the
+figure is the median of the paired differences, withheld inside the noise band; with a per-runtime `N`
+calibrated per the loop-count rule), and the registered-BIF dispatch cost is **not** produced here; it is a
+`beam_rt` measurement (`../../crates/beam_rt/PERF.md`, `TRACE_AND_PERF.md`).
 
 ## See Also
-- `RESULTS.md` → the current (m14) results summary (per-category tables, both sides named, exact reproduction
-  commands, verified skip reasons, the load record, the calibration rule, the still-open items).
+- `RESULTS.md` → the current (m15) results summary (per-category tables, both sides named, exact reproduction
+  commands, verified skip reasons, the load record, the calibration rule, the paired-estimator record §3.4, the
+  still-open items).
 - `results/` → the raw harness behind `RESULTS.md` (committed, so the numbers stay reviewable); see the
-  routing-table entry above for the `m14-*` set and the history groups.
+  routing-table entry above for the `m15-*` set and the history groups.
 - `results/m12-emqx-ezstd-env-mk.patch` → the literal, reproducible `:ezstd` `env.mk` idiom patch (a
   *fetched* dep, applied after `mix deps.get`; **insufficient alone** — the build then needs missing host
   `automake`/`libtool`/`cmake`/`krb5`), which is why the driver applies no patch and keeps its honest skip.

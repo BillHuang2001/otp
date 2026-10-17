@@ -36,6 +36,7 @@ pub mod elixir_compiler;
 pub mod emqx;
 pub mod erlc_compiler;
 pub mod foreign;
+pub mod foreign_sample;
 pub mod gc_bound;
 pub mod khepri;
 pub mod list_walk;
