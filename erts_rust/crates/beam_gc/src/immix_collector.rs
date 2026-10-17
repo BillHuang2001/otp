@@ -354,6 +354,39 @@ impl GenImmixCollector {
         Ok(Collection { kind, stats })
     }
 
+    /// Runs a collection of **exactly** `kind` — the kind-pinned counterpart of
+    /// [`collect`](Self::collect).
+    ///
+    /// [`collect`](Self::collect) *chooses* the kind (the fullsweep cadence, or a promotion
+    /// that plainly exceeds the mature region's free lines) and **escalates** a
+    /// [`PromoteOutcome::WouldNotFit`] minor to a major. This entry point never chooses and
+    /// never escalates: [`CollectionKind::Minor`] runs [`collect_minor`](Self::collect_minor)
+    /// and [`CollectionKind::Major`] runs [`collect_major`](Self::collect_major), so on success
+    /// the returned [`Collection::kind`] is the requested `kind`.
+    ///
+    /// The difference is observable exactly when a promotion would not fit: `collect` would
+    /// reclaim the mature region in place by running a major instead, while
+    /// `collect_kind(CollectionKind::Minor)` returns the typed heap-exhaustion
+    /// [`BeamError`](beam_common::BeamError) with the nursery byte-identical and the mature
+    /// region untouched (the promotion is atomic, so nothing is half-forwarded and no counter
+    /// advances).
+    ///
+    /// This is a thin dispatch: the driver logic, the atomic promotion and the counters all
+    /// stay in the two `collect_*` methods.
+    ///
+    /// # Errors
+    ///
+    /// The selected collection's own `BeamError` — the typed heap exhaustion above for a
+    /// promotion that cannot fit, or an allocation failure. A `Minor` failure is never masked by
+    /// a major.
+    pub fn collect_kind(&mut self, kind: CollectionKind, roots: &mut [Eterm]) -> Result<Collection> {
+        let stats = match kind {
+            CollectionKind::Minor => self.collect_minor(roots)?,
+            CollectionKind::Major => self.collect_major(roots)?,
+        };
+        Ok(Collection { kind, stats })
+    }
+
     /// Runs a **minor** collection: promote the nursery's live terms into the mature space.
     ///
     /// Checks up front that the mature space's free lines cover the promotion, so a

@@ -35,7 +35,7 @@ use beam_common::Result;
 use beam_term::prelude::Eterm;
 
 use crate::bounds::ScannedBounds;
-use crate::collector::{Collection, Collector};
+use crate::collector::{Collection, CollectionKind, Collector};
 use crate::config::{GcConfig, MatureKind};
 use crate::heap_info::HeapObservable;
 use crate::immix_collector::GenImmixCollector;
@@ -274,7 +274,31 @@ impl AnyCollector {
         }
     }
 
-    /// Forces a **minor** collection on the selected strategy (escalation is bypassed).
+    /// Runs a collection of **exactly** `kind` on the selected strategy — the kind-pinned
+    /// counterpart of [`collect`](Self::collect), forwarded to
+    /// [`Collector::collect_kind`](crate::Collector::collect_kind) /
+    /// [`GenImmixCollector::collect_kind`](crate::GenImmixCollector::collect_kind) the same way
+    /// the two `collect_*` forcing methods below are.
+    ///
+    /// [`collect`](Self::collect) picks the kind by policy and **escalates** a would-not-fit
+    /// minor to a major; this entry point never does. [`CollectionKind::Minor`] runs
+    /// `collect_minor` and [`CollectionKind::Major`] runs `collect_major`, so on success the
+    /// returned [`Collection::kind`] is the requested `kind`, and a minor whose promotion cannot
+    /// fit is the typed heap-exhaustion error with nothing copied and no counter advanced.
+    ///
+    /// This is the seam `beam_process::Process::collect_kind` drives: a caller that asks for a
+    /// young-only collection can never be handed a fullsweep, whichever mature strategy the
+    /// automatic rule selected.
+    ///
+    /// # Errors
+    ///
+    /// The selected collection's own `BeamError`; a `Minor` failure is never masked by a major.
+    pub fn collect_kind(&mut self, kind: CollectionKind, roots: &mut [Eterm]) -> Result<Collection> {
+        match self {
+            AnyCollector::Copying(c) => c.collect_kind(kind, roots),
+            AnyCollector::Immix(c) => c.collect_kind(kind, roots),
+        }
+    }    /// Forces a **minor** collection on the selected strategy (escalation is bypassed).
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         match self {
             AnyCollector::Copying(c) => c.collect_minor(roots),
@@ -450,6 +474,9 @@ impl HeapObservable for AnyCollector {
 }
 #[cfg(test)]
 mod tests {
+    use beam_common::BeamError;
+    use beam_term::prelude::{make_small, ptr_val, tuple_element, tuple_size, NIL};
+
     use super::*;
 
     #[test]
@@ -489,5 +516,141 @@ mod tests {
             any.mature_choice().source,
             crate::selection::MatureSource::Automatic
         );
+    }
+
+    /// The two mature strategies over one policy — the dispatch seam `beam_process` holds.
+    fn strategies(policy: HeapPolicy) -> [AnyCollector; 2] {
+        [
+            AnyCollector::from_config(&GcConfig::copying(policy.clone())).expect("copying collector"),
+            AnyCollector::from_config(&GcConfig::immix(policy)).expect("immix collector"),
+        ]
+    }
+
+    /// [`AnyCollector::collect_kind`] pins the kind on **both** strategies: a
+    /// `fullsweep_after: 0` policy makes [`AnyCollector::collect`] pick a major, while
+    /// `collect_kind(Minor)` still runs the young-only collection and relocates the live term.
+    #[test]
+    fn collect_kind_pins_the_kind_on_both_strategies() {
+        let policy = HeapPolicy {
+            fullsweep_after: 0, // the cadence fires on every collection
+            ..HeapPolicy::default()
+        };
+        for mut any in strategies(policy) {
+            let strategy = any.kind();
+            let root = any
+                .young_mut()
+                .heap_mut()
+                .tuple(&[make_small(1), make_small(2)])
+                .expect("the tuple fits the nursery");
+
+            // `collect` (unchanged) selects the major the policy asks for.
+            let mut chosen_roots = [root];
+            let chosen = any.collect(&mut chosen_roots).expect("collect");
+            assert_eq!(
+                chosen.kind,
+                CollectionKind::Major,
+                "{strategy:?}: fullsweep_after = 0 makes the policy pick a major"
+            );
+
+            // `collect_kind(Minor)` pins the minor.
+            let root = any
+                .young_mut()
+                .heap_mut()
+                .tuple(&[make_small(1), make_small(2)])
+                .expect("the tuple fits the nursery");
+            let mut roots = [root];
+            let pinned = any
+                .collect_kind(CollectionKind::Minor, &mut roots)
+                .expect("the pinned minor fits");
+
+            assert_eq!(pinned.kind, CollectionKind::Minor, "{strategy:?}");
+            assert_eq!(pinned.stats.words_copied, 3, "{strategy:?}");
+            assert_eq!(any.minor_gcs(), 1, "{strategy:?}");
+            assert_eq!(
+                any.stats().minor_collections,
+                1,
+                "{strategy:?}: only the pinned collection was a minor"
+            );
+            assert_eq!(
+                any.stats().major_collections,
+                1,
+                "{strategy:?}: the pinned minor added no major"
+            );
+
+            // The relocated root is a live, intact 2-tuple in the mature generation.
+            let ptr = ptr_val(roots[0]);
+            assert!(any.mature_contains(ptr), "{strategy:?}");
+            assert!(!any.young_contains(ptr), "{strategy:?}");
+            // SAFETY: the assertions above proved `roots[0]` addresses a live object in the
+            // mature generation and it is the 2-tuple allocated above, so slots 0..2 are in
+            // bounds.
+            unsafe {
+                assert_eq!(tuple_size(roots[0]), 2);
+                assert_eq!(tuple_element(roots[0], 0), make_small(1));
+                assert_eq!(tuple_element(roots[0], 1), make_small(2));
+            }
+        }
+    }
+
+    /// [`AnyCollector::collect_kind`]`(Minor)` on **either** strategy reports the typed heap
+    /// exhaustion for a promotion the mature generation cannot receive — never the escalated
+    /// fullsweep [`AnyCollector::collect`] would run — and changes **no** counter and **no**
+    /// space geometry.
+    #[test]
+    fn collect_kind_minor_never_escalates_on_either_strategy() {
+        // A 1 024-word nursery against a minimal mature generation: a whole nursery's promotion
+        // cannot fit, so only a major's reclaim/growth can make room for it.
+        let policy = HeapPolicy {
+            initial_young_words: 1024,
+            initial_mature_words: 1,
+            ..HeapPolicy::default()
+        };
+        for mut any in strategies(policy) {
+            let strategy = any.kind();
+            let heap = any.young_mut().heap_mut();
+            let mut live: Vec<Eterm> = Vec::new();
+            for i in 0..500i64 {
+                live.push(heap.cons(make_small(i), NIL).expect("cell"));
+            }
+            let mut roots = live;
+            assert!(
+                any.young().used_words() > any.mature_available_words(),
+                "{strategy:?}: the promotion really cannot fit"
+            );
+
+            let stats_before = any.stats();
+            let young_capacity = any.young().capacity_words();
+            let mature_capacity = any.mature_capacity_words();
+            let mature_used = any.mature_used_words();
+            let spaces = any.young_space_count();
+
+            let err = any
+                .collect_kind(CollectionKind::Minor, &mut roots)
+                .expect_err("the pinned minor must not fit");
+            assert!(matches!(err, BeamError::Alloc(_)), "{strategy:?}: got {err:?}");
+
+            // No escalation, no copy, no counter and no geometry change.
+            assert_eq!(any.stats(), stats_before, "{strategy:?}: no counter advanced");
+            assert_eq!(any.minor_gcs(), 0, "{strategy:?}");
+            assert_eq!(any.mature_used_words(), mature_used, "{strategy:?}");
+            assert_eq!(any.mature_capacity_words(), mature_capacity, "{strategy:?}");
+            assert_eq!(any.young().capacity_words(), young_capacity, "{strategy:?}");
+            assert_eq!(any.young_space_count(), spaces, "{strategy:?}");
+            assert!(
+                roots.iter().all(|root| any.young_contains(ptr_val(*root))),
+                "{strategy:?}: every root is still in the nursery"
+            );
+
+            // The same collector DOES make room when the caller asks for the major.
+            let escalated = any
+                .collect_kind(CollectionKind::Major, &mut roots)
+                .expect("the major makes room");
+            assert_eq!(escalated.kind, CollectionKind::Major, "{strategy:?}");
+            assert_eq!(any.stats().major_collections, 1, "{strategy:?}");
+            assert!(
+                roots.iter().all(|root| any.mature_contains(ptr_val(*root))),
+                "{strategy:?}: the live set was relocated into the mature generation"
+            );
+        }
     }
 }
