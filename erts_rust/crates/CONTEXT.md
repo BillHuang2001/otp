@@ -256,7 +256,18 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   main loop, and turns the resulting `PortNotification`s into `{Port,{data,Data}}`/`{Port,{exit_status,…}}`
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
-  `erlang:port_close/1` returns the oracle's `true`. The compatibility gate is `../tools/differential/gate.sh`
+  `erlang:port_close/1` returns the oracle's `true`. **A.4 driver/port state:** a built-in driver's reply
+  bytes reach the owner (`{Port,{data,…}}` plus `port_info(P,input)`) in the C's `driver_output` term
+  shape; the static `{spawn_driver, Name}` namespace is the C's `driver_tab` —
+  `beam_io::STATIC_SPAWN_DRIVERS` (`tcp_inet`/`udp_inet`/`ram_file_drv`), with `fd`/`efile` refused as
+  `badarg` and `erl_ddll:loaded_drivers/0` reading that same one set; `erlang:port_control/3` reaches the
+  numeric `INET_REQ_*`/`TCP_REQ_*`/`UDP_REQ_*`/`PACKET_REQ_*` opcodes (`beam_io`'s opcode table; the named
+  verbs still work), pinned by `beam_rt`'s `inet_matrix_tests` at **160 oracle-cross-checked shapes**;
+  `port_connect/2`, `port_set_data/2`/`port_get_data/1`, registering a port (`whereis/1` finds it), port
+  `'EXIT'`/`'DOWN'` on close for a trapping/monitoring owner and `port_info/2`'s `queue_size`/`memory` all
+  agree; a driver port's `control` answer is gated on the **driver's own** capability
+  (`Driver::has_control`, the C's `control != NULL`), not a name list; `{packet,N}` framing applies to the
+  output path too. Typed residuals are listed under *Known Structural Debt*. The compatibility gate is `../tools/differential/gate.sh`
   (root-owned) — it boots the script per case, so an end-to-end `gate.sh` run now takes >100 min single-threaded; a full-corpus
   sweep of `differential run <case-id>` is gate-equivalent per case because every `run` verdict already folds in
   the oracle-vs-golden drift check (`tools/differential/src/compare.rs::verdict_with`).
