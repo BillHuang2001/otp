@@ -186,8 +186,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   fixed point. `fullsweep_due(minor_gcs) -> bool` — `minor_gcs >= fullsweep_after` (the C `GEN_GCS >=
   MAX_GEN_GCS`); `fullsweep_after == 0` forces a fullsweep on every collection.
 - `next_words(size, offset)`; `size_after_fullsweep(live, need)`; `mature_after_fullsweep(capacity, live,
-  need)` (grow / shrink / keep — the C `adjust_after_fullsweep`); `young_after_collection(capacity, live)`
-  (the **bounded** nursery rule; the C minor-time young resize); `should_grow(...)`, `should_shrink(...)`.
+  need)` (grow / shrink / keep — the C `adjust_after_fullsweep`); `young_after_collection(capacity, demand)`
+  (the **bounded** nursery rule; a minor passes what it promoted, a fullsweep the occupancy it observed —
+  it can never enlarge the nursery); `should_grow(...)`, `should_shrink(...)`.
 - `pub const DEFAULT_MIN_HEAP_WORDS: usize = 233` — the C `H_DEFAULT_SIZE`.
 - `pub fn heap_sizes() -> &'static [usize]` — the curated growth table (Fibonacci+1 to index 23, then +20%,
   stopping before the first entry that would exceed the 64-bit cap `cap = (1u64 << 53) / 8` = `2^50` words
