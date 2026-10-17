@@ -156,6 +156,8 @@ pub(super) fn build(
         value,
         size,
     ];
+    // A `Built` answers in either form; this helper's callers all compare bytes, so
+    // it reports the `(bytes, nbits)` view of an in-place result too.
     assemble(
         machine,
         module,
@@ -164,6 +166,7 @@ pub(super) fn build(
         &segments,
         ctx,
     )
+    .map(|built| built.map(built_bytes))
 }
 
 /// A successful build's `(bytes, bit count)` for one bignum into a `nbits` field.

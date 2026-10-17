@@ -212,7 +212,7 @@ mod runtime;
 mod test_helper;
 
 #[cfg(test)]
-mod counters;
+pub(crate) mod counters;
 
 #[cfg(test)]
 mod census;

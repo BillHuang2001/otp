@@ -112,6 +112,7 @@ fn run_segments(
         segments,
         ctx,
     )
+    .map(|built| built.map(built_bytes))
     .expect("assemble")
     .expect("the build succeeds")
 }

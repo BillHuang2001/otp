@@ -25,7 +25,7 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 - `exceptions/` (`mod.rs`, `raise.rs`, `stacktrace.rs`, `tests/`) — `Try`/`Catch`/`Badmatch`/`CaseEnd`/`TryCaseEnd`/`Badrecord`/`IfEnd`/`Raise`/`TryCase`/`TryEnd`/`CatchEnd`/`BuildStacktrace`/`RawRaise`.
 - `floats/` (`mod.rs`, `arith.rs`, `convert.rs`) — `Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`.
 - `maps/` (`mod.rs`, `read.rs`, `write.rs`) — `GetMapElements`/`HasMapFields`/`PutMapAssoc`/`PutMapExact`.
-- `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is the node's **only** `#[allow(unsafe_code)]` module; `create/` = `bs_create_bin`, `matching/` = the match commands. Endianness: `matching/reads.rs::field_is_little` is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit` normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand carries it).
+- `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is this sub-node's `#[allow(unsafe_code)]` module (`records/raw.rs` is the other one in the node); `create/` = `bs_create_bin`, `matching/` = the match commands. Endianness: `matching/reads.rs::field_is_little` is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit` normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand carries it).
 - `receive.rs` — `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`/`RecvMarkerReserve`/`RecvMarkerBind`/`RecvMarkerUse`/`RecvMarkerClear`.
 
 ## The router sentinel + the honest-error convention
@@ -106,8 +106,8 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 - Dead/stub remnants (harmless): `bitstrings/mod.rs` `#[allow(dead_code)] const BSF_ALIGNED`.
 
 ## Constraints
-- `#![deny(unsafe_code)]` crate-wide; the node's **only** `#[allow(unsafe_code)]` module is `bitstrings/raw.rs`
-  (every `unsafe` block carries a `// SAFETY:` rationale).
+- `#![deny(unsafe_code)]` crate-wide; the node's two `#[allow(unsafe_code)]` modules are `bitstrings/raw.rs`
+  and `records/raw.rs` (every `unsafe` block carries a `// SAFETY:` rationale).
 - Errors are `beam_common::{Result, BeamError}` only — no crate-local error enum, no panic, no `unwrap()` on
   loaded data, no wrong result.
 - Term construction/inspection is **only** `beam_term`; ordering uses `beam_term::{cmp, eq}`, never a reimplementation.
@@ -124,12 +124,21 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   a `#[cfg(test)]` module. This is a genuinely rigorous result.
 
 ## Known Issues
-- **`../tests/gaps.rs` fixture stale (owner: the crate node, `../tests/` — outside this node).**
-  `interpreter_capability_gaps_report_their_exact_typed_error`'s `context/apply_fun-has-no-hook` fixture drives
-  `Instr::CallFun2 { arity: 0, func: X(0) }` with `x(0)` never set, i.e. a **non-fun** target. Since `funs::call_fun`
-  now classifies the target's shape before the seam (oracle-correct), the fixture reaches the target-shape error
-  instead of the pinned `unsupported_opcode: apply_fun`. The fixture needs a genuine 0-ary closure in `x(0)`
-  (`MakeFun3` before the `CallFun2`) to exercise the seam again — a change outside this subtree.
+- **`records`' `NO_FAIL` fail-arm diverges from `maps`' — OPEN, engine-side, small.** `records/mod.rs:463-475`
+  `fail_step` returns the typed `unsupported("<instruction>/no_fail")` for `NO_FAIL`, while
+  `maps/mod.rs:260-271` `fail_or_function_clause` forwards the same situation to the engine's single
+  failed-clause definition `crate::interpreter::raise_function_clause_no_fail`. C's `$FAIL(0)`
+  (`emu/macros.tab:56`) is an unresolvable self-jump — `NO_FAIL` is only ever emitted where the compiler
+  proved the test cannot fail — so neither choice can be observed from compiler-generated IR; the divergence
+  is a consistency defect (two different answers for one unreachable state), not a wrong value. Fix: route
+  `fail_step`'s `NO_FAIL` arm through `raise_function_clause_no_fail`, which needs `machine`/`module` threaded
+  into `fail_step` from its nine call sites (`records/mod.rs:289,308,399,571,577,607,613,619,623`).
+- **`bitstrings/raw.rs:69` re-declares `const ERL_ONHEAP_BINARY_LIMIT = 64` and hand-rolls the heap-binary
+  layout** instead of forwarding to `beam_term::bitstring` as `records/raw.rs` already forwards to
+  `beam_term::record`. A duplicated frozen constant: if `beam_term`'s limit ever moves, this copy silently
+  disagrees. OPEN, engine-side, small.
+- **`bitstrings` differential-corpus hole (tools-owned).** `bitstrings/CONTEXT.md` records the missing
+  `wire`/bitstring gate cases; the owner is `tools/differential`, not this crate.
 
 ## Handoffs (owned elsewhere — NOT closeable in this node)
 - **`records` foreign-module `put_record/6` create form** (a `{OtherModule,Name}` record id) ⇒ typed `unsupported`;

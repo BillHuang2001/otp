@@ -152,13 +152,14 @@ Verified against the system `erlc` (OTP 29) disassembly:
 - `write.rs:165` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
   for an impossible post-reserve state.
 
-## Handoff (parent-owned)
-- `../../../tests/gaps.rs` still asserts the two read instructions' `no_fail` cases against the **old**
-  engine-defined sentinel errors, which the read path no longer raises — it now raises the bare atom
-  `function_clause` (class `error`). The unseeded fixture therefore surfaces the missing-atom gap, so
-  the two expected strings must become `maps: no 'function_clause' atom in the module` (the module in
-  that fixture names neither tag). This file is outside this node's scope.
+## Notes for Agents
+- `../../../tests/gaps.rs` pins the two read instructions' `no_fail` cases to
+  `maps: no 'function_clause' atom in the module` (`:272`, `:300`).
 
+
+  Both read instructions' `no_fail` cases now surface the bare atom `function_clause` (class `error`);
+  an unseeded module surfaces the missing-atom typed gap instead (pinned at `tests/gaps.rs:272`/`:300`).
+  <!-- -->
 ## Notes for Agents
 - To make the tags nameable for **any** host (not just a seeding one), the engine would need
   a new **defaulted** `ExecutionContext` method (e.g. `resolve_atom(&mut self, name: &str) ->

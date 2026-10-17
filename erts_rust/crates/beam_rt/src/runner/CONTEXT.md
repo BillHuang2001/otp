@@ -364,8 +364,11 @@ NOT decide*.
 
 The mechanism is the **literal-area tagging**: `Nursery::grow` retires the old space into `retired`
 and only `Nursery::collapse` — reached at a collection — clears it, so a runtime that never collects
-walks an ever-longer `spaces()` = `retired.chain(current)` through `root_is_unscanned` →
-`Nursery::contains` on every admission. `beam_loader`'s `tag_literal_area`
+keeps every retired space's capacity resident (RSS grows per call) and pays the valve's per-word
+scanned test (`root_is_unscanned` → `outside_scanned`) over a longer chain on every admission — that
+test is `O(1)` for an address outside the aggregate `scanned_bounds` and `O(log #spaces)` otherwise
+(`Nursery::contains` reads its ordered `retired_regions` index, `beam_gc/src/nursery.rs:194-213`; it
+never walks `spaces()`). `beam_loader`'s `tag_literal_area`
 (`crates/beam_loader/src/literal.rs`, the safe form of the C load-time `erts_set_literal_tag`) tags
 the decoded literal area, so the walk recognizes these modules' constant literal-area binary as an
 off-heap literal rather than an unscanned container, the valve stays shut, and the retired chain
