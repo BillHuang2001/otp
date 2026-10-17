@@ -90,7 +90,17 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`
 (`machine/mod.rs:580`), `Machine::alloc_rooted` (`:638`, → `ExecutionContext::alloc_words_rooted`) and
 `Machine::ensure_heap`/`allocate_heap` → `ExecutionContext::ensure_heap_full`
-(`machine/frames.rs:283`). Every other engine→host call carries **no** root set, so a host that
+(`machine/frames.rs:283`).
+Their call sites, exactly: `alloc_words_rooted` has **one** production caller — `terms/slack.rs:170`
+(`terms::reserve`, hence `reserve_slack` and every `*_rooted` builder), reached **per built term**
+(each `put_list`/`put_tuple2`/`make_fun3`/`put_map_assoc`/record/bitstring node), with
+`RootSet::ALL_LIVE` at every family site.
+`ensure_heap_full` is reached **only** from `Instr::TestHeap` (`interpreter/dispatch.rs:586`) and
+`Instr::AllocateHeap` (`:581`) plus their baseline-JIT twins (`jit/baseline/runtime.rs:1407`/`:1443`),
+so it is a **per-`test_heap`** door, never a per-allocation one; `Instr::Allocate` (`:569-574`) pushes
+the frame with **no** admission.
+`ExecutionContext::heap_available` has **no** call site anywhere in the crate (introspection only).
+Every other engine→host call carries **no** root set, so a host that
 *allocated* inside it would relocate the young heap against unpublished roots. Those calls, with the
 state each holds in a Rust local across the call:
 - `ExecutionContext::resolve_local_fun` (`families/funs/mod.rs` `fn call_fun`, the seam call at `:526`)
