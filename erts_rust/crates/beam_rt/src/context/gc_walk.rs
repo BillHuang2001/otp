@@ -201,7 +201,8 @@ use beam_term::literal::is_literal;
 use beam_term::prelude::{is_boxed, is_list};
 use beam_term::Eterm;
 
-use super::gc::root_is_unscanned;
+use super::gc::{forwards_scanned_word, root_is_unscanned_with, word_region, WordRegion};
+use beam_gc::ScannedBounds;
 
 // ============================ END TEMPORARY POLICY SWITCH ============================
 
@@ -239,8 +240,26 @@ pub(crate) struct WalkScratch {
     roots: Vec<Eterm>,
 }
 
+/// What one valve call over one root set answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ValveVerdict {
+    /// A container in a region the collector does not scan, **forwards a word into one it does**,
+    /// is reachable from the roots — so a collection would leave that word pointing into an
+    /// evacuated from-space and must be declined.
+    pub(crate) declined: bool,
+    /// The descent ran (the caller's gate was open) and reached **no** container in a region the
+    /// collector does not scan at all.
+    ///
+    /// This is deliberately the *stronger* of the two clean answers: "no foreign container is
+    /// reachable" makes a hazard impossible without appealing to the forwarding test's precision,
+    /// so a caller that handed over its **whole** root set may close the process's descent latch
+    /// on it ([`crate::runtime::gc::GcState::foreign`]). A caller that handed over less (the
+    /// narrow admission door, the park arm, the collection gate) must ignore it.
+    pub(crate) foreign_free: bool,
+}
+
 /// Whether a collection of `process` would be **unsound** — whether a container in a region
-/// the collector does not scan is reachable from one it does.
+/// the collector does not scan, forwarding a word into one it does, is reachable from one it does.
 ///
 /// `machine_roots` are the words the caller is about to publish (the engine's x registers, the
 /// whole Erlang stack, and each register file at its own **pointer-bearing prefix** — the FR file
@@ -250,10 +269,10 @@ pub(crate) struct WalkScratch {
 /// collection that might have been sound (the allocation then falls back to the pointer-stable
 /// arena), never allowing one that is not.
 ///
-/// `descend` is the caller's **foreign-reachability gate** ([`WalkScratch`]'s module docs): when
-/// it is `false` the descent is skipped and only the cheap `O(roots)` per-word phase runs. The
-/// gate can only ever cost a collection (an unnecessary descent), never allow a wrong one: see
-/// the module docs' soundness argument.
+/// `descend` is the caller's **foreign-reachability gate** (this module's docs): when it is
+/// `false` the descent is skipped and only the cheap `O(roots)` per-word phase runs. The gate can
+/// only ever cost a collection, never allow a wrong one — and a gate that is *open* is closed
+/// again by a [verdict](ValveVerdict) that reached no foreign container at all.
 pub(crate) fn any_root_is_unscanned<'a, I>(
     scratch: &mut WalkScratch,
     process: &Process,
@@ -263,18 +282,45 @@ pub(crate) fn any_root_is_unscanned<'a, I>(
 where
     I: IntoIterator<Item = &'a Eterm>,
 {
-    let mut walk = Walk::begin(scratch);
+    valve_verdict(scratch, process, machine_roots, descend).declined
+}
+
+/// [`any_root_is_unscanned`], reporting **both** halves of the valve's answer so an admission
+/// point that handed over its whole root set can also close the process's descent latch.
+pub(crate) fn valve_verdict<'a, I>(
+    scratch: &mut WalkScratch,
+    process: &Process,
+    machine_roots: I,
+    descend: bool,
+) -> ValveVerdict
+where
+    I: IntoIterator<Item = &'a Eterm>,
+{
+    // The collector's aggregate geometry is read **once per call** and handed down to every
+    // per-word classification: hygiene, not a claimed win (the whole valve is 0.40 % of samples
+    // in a `beam_gc` peer's profile), but it keeps one decision on one geometry.
+    let bounds = process.collector().scanned_bounds();
+    let mut walk = Walk::begin(scratch, bounds);
     for &word in machine_roots {
         walk.seed(process, word);
         if walk.hit {
-            return true;
+            return ValveVerdict {
+                declined: true,
+                foreign_free: false,
+            };
         }
     }
     walk.seed_process_roots(process);
-    if walk.hit || !descend {
-        return walk.hit;
+    if !walk.hit && descend {
+        walk.run(process);
     }
-    walk.run(process)
+    ValveVerdict {
+        declined: walk.hit,
+        // Only a descent may claim the graph is foreign-free: the per-word phase looked at the
+        // roots alone, and a foreign container nested in a scanned one is exactly what it cannot
+        // see.
+        foreign_free: descend && !walk.foreign_reached,
+    }
 }
 
 /// The [`Process`]-only form of [`any_root_is_unscanned`], for a collection site whose machine
@@ -425,11 +471,20 @@ impl RuntimeCollectionGate {
     }
 }
 
-/// The walk's mutable state: the reused scratch plus whether an unscanned container has been
-/// reached.
+/// The walk's mutable state: the reused scratch, the scanned geometry the whole walk classifies
+/// against, and whether a hazard (a hit) or any foreign container at all has been reached.
 struct Walk<'a> {
     scratch: &'a mut WalkScratch,
+    /// The collector's aggregate scanned geometry, read once by the caller
+    /// ([`valve_verdict`]) and reused for every word of this walk.
+    bounds: ScannedBounds,
+    /// A hazard was reached: a foreign container forwarding a scanned word — or a root that is
+    /// one.
     hit: bool,
+    /// A container in a region the collector does not scan was reached at all (hazardous or not).
+    /// This is what an admission point that handed over its whole root set needs in order to
+    /// **close** the descent latch again (see [`ValveVerdict::foreign_free`]).
+    foreign_reached: bool,
 }
 
 /// The descent's **visited set**: the object addresses already expanded.
@@ -607,39 +662,54 @@ impl Visited {
 }
 
 impl<'a> Walk<'a> {
-    /// Starts a walk over `scratch`, resetting the reused state in `O(1)`.
-    fn begin(scratch: &'a mut WalkScratch) -> Walk<'a> {
+    /// Starts a walk over `scratch` against `bounds`, resetting the reused state in `O(1)`.
+    fn begin(scratch: &'a mut WalkScratch, bounds: ScannedBounds) -> Walk<'a> {
         scratch.pending.clear();
         scratch.visited.begin();
         Walk {
             scratch,
+            bounds,
             hit: false,
+            foreign_reached: false,
         }
     }
 
-    /// Classifies one root-set word: records a hit for a container in an unscanned region,
-    /// enqueues a container in the scanned region, and ignores everything else.
+    /// Classifies one reachable word: enqueues a container the collector scans, records a hazard
+    /// for a container it does not scan that forwards a scanned word, and ignores everything no
+    /// relocation touches.
     fn seed(&mut self, process: &Process, word: Eterm) {
         if self.hit {
             return;
         }
-        // An immediate (a small integer, an atom, `NIL`, an internal pid/port id) has no
-        // children: neither this walk nor the collector descends into it.
-        if !is_boxed(word) && !is_list(word) {
-            return;
+        // The per-word classifier, over the geometry this walk read once: `None` for an immediate
+        // (a small integer, an atom, `NIL`, an internal pid/port id — no children, and neither
+        // this walk nor the collector descends into it) and for a literal-area pointer (a frozen
+        // code constant; see the module docs).
+        match word_region(process, &self.bounds, word) {
+            None => {}
+            Some(WordRegion::Scanned) => {
+                // A container the collector scans: descend into it (once — the visited set is what
+                // makes a shared or cyclic graph terminate).
+                if self.scratch.visited.insert(ptr_val(word) as usize) {
+                    self.scratch.pending.push(word);
+                }
+            }
+            Some(WordRegion::Foreign) => self.reach_foreign(process, word),
         }
-        // A literal-area pointer is a frozen code constant; see the module docs.
-        if is_literal(word) {
-            return;
-        }
-        // The per-word classifier: `true` for a container in a region the collector does not
-        // scan, so the collection must be declined. Reused verbatim (never re-derived).
-        if root_is_unscanned(process, word) {
+    }
+
+    /// Records a container in a region the collector does not scan and decides what it means: a
+    /// hazard when it forwards a word into a region the collector **does** scan (a collection
+    /// would relocate that word without updating the container), otherwise a container to expand
+    /// so a foreign → foreign → scanned chain is still found.
+    fn reach_foreign(&mut self, process: &Process, word: Eterm) {
+        self.foreign_reached = true;
+        if forwards_scanned_word(process, &self.bounds, word) {
             self.hit = true;
             return;
         }
-        // A container the collector scans: descend into it (once — the visited set is what
-        // makes a shared or cyclic graph terminate).
+        // An inert foreign container (nothing it forwards is relocated) cannot dangle anything
+        // itself — but a foreign child of it can, so it joins the worklist like a scanned one.
         if self.scratch.visited.insert(ptr_val(word) as usize) {
             self.scratch.pending.push(word);
         }
@@ -746,9 +816,10 @@ impl<'a> Walk<'a> {
     /// Classifies every child of the object `word` names.
     fn expand(&mut self, process: &Process, word: Eterm) {
         let address: *const Eterm = ptr_val(word);
-        // SAFETY: `word` reaches the worklist only through `seed`, which enqueues exactly the
-        // boxed/cons words that are (a) genuine terms and (b) addressed inside a region the
-        // process's collector scans — i.e. live objects of the running process. `address`
+        // SAFETY: `word` reaches the worklist only through `seed`/`reach_foreign`, which enqueue
+        // exactly the boxed/cons words that are (a) genuine terms and (b) either addressed inside
+        // a region the process's collector scans or a container the region classifier called
+        // foreign — in both cases live objects of the running process's term graph. `address`
         // therefore heads a live object, so its header word and every payload word the shape
         // implies are live and readable (the same invariant `beam_term`'s own materialization
         // entry points document).

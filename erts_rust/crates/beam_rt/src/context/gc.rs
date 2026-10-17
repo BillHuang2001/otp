@@ -136,7 +136,7 @@
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
-use beam_gc::{AnyCollector, Collection, CollectionKind};
+use beam_gc::{AnyCollector, Collection, CollectionKind, ScannedBounds};
 use beam_loader::{Instr, Module};
 use beam_process::{Process, ProcessTable, MAX_REG};
 use beam_term::Eterm;
@@ -158,7 +158,7 @@ use crate::RuntimeContext;
 ///
 /// It is re-exported here (rather than called by its own path at each site) so the three
 /// admission-point call sites and the runner's park arm cannot drift onto different valves.
-pub(crate) use super::gc_walk::any_root_is_unscanned;
+pub(crate) use super::gc_walk::{any_root_is_unscanned, valve_verdict};
 
 /// Whether `module`'s code contains any **float-family** instruction, i.e. anything that
 /// reads or writes the machine's float-register file
@@ -244,151 +244,235 @@ fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
     ptr >= base && ptr < end
 }
 
-/// Whether `term` is a **container living in a region the collector does not scan** — the
-/// precondition that makes a collection of the owning process unsound.
+/// Which side of the collector's scan boundary a heap pointer lies on — the classification
+/// [`root_is_unscanned`] and the reachability walk both build on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WordRegion {
+    /// A pointer into a region the collector **relocates**: any space of the young nursery chain
+    /// (the current one or a growth-retired one — a collection evacuates the whole chain) or the
+    /// mature generation.
+    Scanned,
+    /// A container in a region the collector leaves **in place**: the pooled BIF heaps
+    /// ([`Runtime::take_bif_heap`]), the `-eval` heap ([`Runtime::stabilize_term`]), the
+    /// pointer-stable arena ([`alloc_words`]'s fallback), a [`beam_message`] heap fragment.
+    Foreign,
+}
+
+/// Whether `term` is a **container in a region the collector does not scan whose relocation
+/// would leave a word behind** — the precondition that makes a collection of the owning process
+/// unsound.
 ///
 /// A copying collector relocates exactly the words it finds in its *from* set (every space of
 /// the young nursery chain, plus the mature space for a major) and classifies every other
 /// address as [`Target::Foreign`](beam_gc): it leaves such a pointer where it is **and does not
-/// follow it** — so a young word a foreign container points *at* is neither kept alive by it nor
-/// updated when it moves. A term with heap children is therefore only safe in a *scanned*
-/// region. The unscanned regions this runtime really creates are the pooled BIF heaps
-/// ([`Runtime::take_bif_heap`]), the `-eval` heap ([`Runtime::stabilize_term`]), the
-/// pointer-stable arena ([`crate::context::gc::alloc_words`]'s fallback) and a
-/// [`beam_message`] heap fragment.
+/// follow it**. Its two obligations toward a container are to *follow* the child words it finds
+/// there (they keep a young object alive) and to *update* them when it moves one, and a container
+/// outside the scanned set admits **neither**. The test is therefore the conjunction of two
+/// facts, and both are required:
 ///
-/// The test is the conservative *complement* of the scanned set, so it needs no enumeration of
-/// the open-ended unscanned side: a term is safe exactly when it is an **immediate** (neither
-/// boxed nor a cons), a **literal** (a frozen code constant in the literal area, which never
-/// points into a movable heap), or a pointer into the process's own **young** heap — **any**
-/// nursery space, the current one or one a [`Process::grow_nursery`] growth retained, since a
-/// collection evacuates the whole chain — or its **mature** heap.
+/// 1. the term is a container in a region the collector does not scan — an **immediate** (neither
+///    boxed nor a cons) and a **literal** (a frozen code constant in the literal area, which never
+///    points into a movable heap) are neither ([`word_region`]); and
+/// 2. at least one word it **forwards** is a pointer into a region the collector *does* scan
+///    ([`forwards_scanned_word`]).
+///
+/// # Why the second fact is part of the test
+///
+/// A word the collector would not have to follow or update is a word it may safely ignore, so a
+/// foreign container that forwards only immediates, literals and other foreign pointers dangles
+/// nothing and keeps nothing alive: relocating the scanned regions under it is byte-for-byte the
+/// collection the graph would have received if the container had not existed. Reading those
+/// forwarded words is sound because Erlang terms are **immutable** — a slot that holds an
+/// immediate now cannot become a scanned pointer later, so a single read at the safepoint is the
+/// whole truth.
+///
+/// That is what keeps an ordinary program collectable. The runtime itself mints shared, foreign
+/// containers: `make_ref/0`'s frozen M1 block
+/// (`[make_header(3, REF_SUBTAG), make_small(0), make_small(0), make_small(id)]`, written by
+/// [`beam_term::boxed::write_internal_ref`]) and every `RuntimeHooks`-served BIF's container
+/// result — `erlang:statistics(garbage_collection)`'s `{Collections, WordsReclaimed, 0}` tuple
+/// (the shape `erlang:statistics/1` answers through `beam_bifs`'s `RuntimeHooks` seam, whose
+/// result is deliberately *not* re-homed onto the process heap) — are all-immediate blocks on the
+/// pooled BIF heap. A process that keeps one live across its loop forwards nothing, so its
+/// collections must keep running; a test that declared such a root a hazard would stop collecting
+/// for as long as the term lived, which is exactly what a bounded heap cannot afford
+/// (`tests/foreign_root_loop.rs`).
+///
+/// # The transitive case is the walk's
+///
+/// A foreign container can forward **another** foreign container that forwards a scanned word;
+/// that chain is resolved by [`any_root_is_unscanned`], which expands foreign containers to any
+/// depth. This single-term form is the depth-1 answer the per-word root classification uses.
 ///
 /// # The scanned test: an aggregate fast reject, then the exact fallback
 ///
-/// "Scanned" is decided in two tiers, and the second one exists only to skip work in the first:
-///
-/// 1. the current mutator block, directly ([`in_heap_block`]). It is the answer for the
-///    overwhelming majority of live roots and the cheapest test in the pipeline (two loads and
-///    two compares on the space the mutator is already touching), so it stays **first** — no
-///    term it accepts pays anything for the tier below.
-/// 2. everything else through [`outside_scanned`]: the collector's aggregate geometry,
-///    [`AnyCollector::scanned_bounds`], is read **once** and
-///    [`beam_gc::ScannedBounds::definitely_unscanned`] is asked first. Its `true` *proves* the address
-///    lies in no region the collector scans and answers without touching the nursery chain's
-///    ordered index or the mature space. Only when the aggregate cannot decide (a nursery space
-///    a growth retired, the mature generation, or a hole between two scanned regions) do the
-///    exact `young_contains`/`mature_contains` tests run.
-///
-/// The aggregate is a **superset** of every region the collector scans (each space contributes
-/// its reserved extent, see [`beam_gc::ScannedBounds`]), so this ordering can only remove work: an
-/// address the aggregate rejects would have been rejected by both exact tests anyway, and one
-/// it accepts gets the identical verdict from them. The valve's decisions are therefore
-/// byte-for-byte what the plain `young_contains || mature_contains` test answers, for every
-/// address.
-///
-/// # The childless exemption — why a foreign *leaf* does not decline
-///
-/// A foreign container is a hazard only through the words it **forwards**: a copying collector's
-/// two obligations toward a container are to *follow* the child words it finds there (they keep a
-/// young object alive) and to *update* them when it moves one. An object that exposes **no** child
-/// slot imposes neither — it can neither dangle itself (`Target::Foreign` leaves the pointer where
-/// it is, and nothing outside the collector's own spaces ever moves) nor keep a young word alive —
-/// so a foreign **leaf** is exactly as safe as an immediate and declines nothing.
-///
-/// That is not a corner case: `make_ref/0`'s frozen M1 block
-/// (`[make_header(3, REF_SUBTAG), make_small(0), make_small(0), make_small(id)]`, written by
-/// [`beam_term::boxed::write_internal_ref`]) is all immediates after its header, and it is
-/// produced by this runtime's own native floor on the pooled BIF heap. Without the exemption
-/// every reference a process ever mints keeps that process under a forever-declined valve: its
-/// collection debt is never settled and its nursery grows for the life of the loop.
-///
-/// "Exposes no child slot" is decided by [`foreign_boxed_has_copy_children`], which drives the
-/// same canonical enumeration ([`beam_term::layout::for_each_child_slot`]) the copier and the
-/// reachability walk use, so the valve cannot disagree with the collector about which words an
-/// object forwards — notably `SUB_BITS_SUBTAG`, whose `orig` word *is* forwarded and so is never
-/// exempt.
-///
-/// Anything else — a cons (header-less, always two references), a container handed back by a
-/// registered BIF **with** children, a block built on the arena — declines the collection.
+/// "Scanned" is decided in two tiers ([`outside_bounds`]), and the second one exists only to skip
+/// work in the first: the current mutator block directly ([`in_heap_block`]), then the collector's
+/// aggregate geometry ([`AnyCollector::scanned_bounds`]). Every walk and every admission point
+/// reads that aggregate **once** and hands it down as a [`ScannedBounds`] value
+/// ([`any_root_is_unscanned`]), so a per-word classification never re-reads it.
 pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
-    if !beam_term::prelude::is_boxed(term) && !beam_term::prelude::is_list(term) {
-        return false;
+    // The aggregate is read **once** per classification and handed down, rather than re-read per
+    // forwarded word: `ScannedBounds` is a handful of `Copy` fields derived from the collector's
+    // current geometry, so this is **hygiene, not a claimed win** — a `beam_gc` peer measured the
+    // whole valve at 0.40 % of samples, and hoisting an aggregate load cannot move that. What it
+    // buys is that the per-word classification and the forwarding test can never read two
+    // different geometries inside one decision.
+    let bounds = process.collector().scanned_bounds();
+    root_is_unscanned_with(process, &bounds, term)
+}
+
+/// [`root_is_unscanned`] against a [scanned-bounds](ScannedBounds) value the caller already read
+/// — the form the reachability walk uses, so one aggregate read serves a whole walk.
+pub(crate) fn root_is_unscanned_with(
+    process: &Process,
+    bounds: &ScannedBounds,
+    term: Eterm,
+) -> bool {
+    match word_region(process, bounds, term) {
+        Some(WordRegion::Foreign) => forwards_scanned_word(process, bounds, term),
+        Some(WordRegion::Scanned) | None => false,
     }
-    if beam_term::literal::is_literal(term) {
-        return false;
+}
+
+/// Which region `word` points into: `None` for a word no relocation touches (an immediate, a
+/// literal-area pointer), otherwise the side of the scan boundary the container lives on.
+///
+/// This is the **one** place the scanned test is applied, so the per-word root classification,
+/// the walk's descent and the foreign-container expansion can never disagree about a word.
+pub(crate) fn word_region(
+    process: &Process,
+    bounds: &ScannedBounds,
+    word: Eterm,
+) -> Option<WordRegion> {
+    if !is_pointer_bearing(word) {
+        return None;
     }
-    let ptr = beam_term::list::ptr_val(term) as usize;
-    let foreign = !in_heap_block(process.heap(), ptr) && outside_scanned(process.collector(), ptr);
-    // A cons is header-less and always pointer-bearing; a boxed object only matters when the
-    // collector would forward something out of it. The predicate runs only for a term already
-    // known foreign, so a scanned term — the overwhelming majority of the per-word calls — pays
-    // nothing new.
-    foreign && (beam_term::prelude::is_list(term) || foreign_boxed_has_copy_children(term))
+    if beam_term::literal::is_literal(word) {
+        return None;
+    }
+    let ptr = beam_term::list::ptr_val(word) as usize;
+    if in_heap_block(process.heap(), ptr) || !outside_bounds(process.collector(), bounds, ptr) {
+        Some(WordRegion::Scanned)
+    } else {
+        Some(WordRegion::Foreign)
+    }
+}
+
+/// Whether `word` is a heap pointer into a region the collector **relocates** — one of the words
+/// a collection must follow and update, and therefore the word that makes the foreign container
+/// holding it a hazard.
+pub(crate) fn word_is_scanned(process: &Process, bounds: &ScannedBounds, word: Eterm) -> bool {
+    matches!(word_region(process, bounds, word), Some(WordRegion::Scanned))
 }
 
 /// Whether `ptr` lies outside **every** region `collector` scans — the two-tier scanned test
-/// behind [`root_is_unscanned`], for an address already known to be outside the process's
-/// current mutator block.
+/// behind [`word_region`], for an address already known to be outside the process's current
+/// mutator block.
 ///
-/// Tier one is the collector's aggregate geometry: [`AnyCollector::scanned_bounds`] is one
-/// `O(1)`, allocation-free read (the nursery chain's half is cached inside the chain, the mature
-/// half is two reads of a space that never moves), and
-/// [`beam_gc::ScannedBounds::definitely_unscanned`] answers for **every** address outside it — the pooled
-/// BIF heaps, the `-eval` heap, the pointer-stable arena and a message heap fragment, which is
-/// what a foreign container really is — with two compares. That is exact, because the aggregate
-/// is a superset of every scanned region: a reject would have been a reject through the exact
-/// per-region tests too.
+/// Tier one is the collector's aggregate geometry, the `bounds` the caller read once:
+/// [`beam_gc::ScannedBounds::definitely_unscanned`] answers for **every** address outside it — the
+/// pooled BIF heaps, the `-eval` heap, the pointer-stable arena and a message heap fragment,
+/// which is what a foreign container really is — with two compares. That is exact, because the
+/// aggregate is a superset of every scanned region: a reject would have been a reject through the
+/// exact per-region tests too.
 ///
 /// Tier two is those exact tests ([`AnyCollector::young_contains`] — the whole nursery chain,
 /// current space and growth-retired spaces, `O(log #spaces)` — then
 /// [`AnyCollector::mature_contains`]), run only when the aggregate **cannot** decide: an address
 /// in a hole between two scanned regions, in a space's reserved-but-unallocated tail, or on a
 /// free line of a mark-region mature generation. `may_contain == true` is never treated as
-/// containment (see [`beam_gc::ScannedBounds`] for why a fast accept would be unsound); it only means
-/// "ask them".
-fn outside_scanned(collector: &AnyCollector, ptr: usize) -> bool {
-    let bounds = collector.scanned_bounds();
+/// containment (see [`beam_gc::ScannedBounds`] for why a fast accept would be unsound); it only
+/// means "ask them".
+fn outside_bounds(collector: &AnyCollector, bounds: &ScannedBounds, ptr: usize) -> bool {
     if bounds.definitely_unscanned(ptr as *const Eterm) {
         return true;
     }
+    outside_scanned_exactly(collector, ptr)
+}
+
+/// **Tier two on its own**: whether `ptr` lies outside every region `collector` relocates,
+/// decided by the exact per-region tests with no aggregate in front of them.
+///
+/// [`outside_bounds`] is this behind the aggregate fast reject, so the two agree by construction;
+/// the filter-less form is exposed for the `valve_bounds` suite, which asserts that the reject
+/// never changes a decision.
+pub(crate) fn outside_scanned_exactly(collector: &AnyCollector, ptr: usize) -> bool {
     !collector.young_contains(ptr as *const Eterm)
         && !collector.mature_contains(ptr as *const Eterm)
 }
 
-/// Whether the **boxed** object `term` names exposes at least one child slot the collector
-/// forwards.
+/// [`word_region`] against the exact scanned test alone — the classifier with the aggregate fast
+/// reject removed, for the same equivalence oracle.
+pub(crate) fn word_region_exactly(process: &Process, word: Eterm) -> Option<WordRegion> {
+    if !is_pointer_bearing(word) || beam_term::literal::is_literal(word) {
+        return None;
+    }
+    let ptr = beam_term::list::ptr_val(word) as usize;
+    if in_heap_block(process.heap(), ptr) || !outside_scanned_exactly(process.collector(), ptr) {
+        Some(WordRegion::Scanned)
+    } else {
+        Some(WordRegion::Foreign)
+    }
+}
+
+/// Whether the container `term` names forwards at least one word a relocation would have to
+/// follow — a cons cell's two halves, or the canonical child slots of a boxed object.
 ///
-/// [`beam_term::layout::for_each_child_slot`] is the canonical enumeration that both
-/// `beam_message`'s copier and the GC reachability walk drive, so "it visits nothing" is exactly
-/// "a relocation would neither follow nor update any word of this object". The enumeration reads
-/// the object's header word (and, for a flat map, its untagged size word) — never a payload word
-/// of a shape that reports no slot — so a leaf costs one word read and a shape whose cells are
-/// all immediates still reports its slots (the valve stays conservative about *which* words are
-/// forwarded, not about their values).
+/// [`beam_term::layout::for_each_child_slot`] is the enumeration both `beam_message`'s copier and
+/// the GC reachability walk drive, so the valve cannot disagree with the collector about which
+/// words an object forwards — notably `SUB_BITS_SUBTAG`, whose `orig` word *is* forwarded. The
+/// values of those words are then classified by [`word_is_scanned`]: a leaf forwards nothing, a
+/// shape whose cells are all immediates forwards nothing, and each one is exactly as safe in a
+/// foreign region as an immediate is.
+pub(crate) fn forwards_scanned_word(
+    process: &Process,
+    bounds: &ScannedBounds,
+    term: Eterm,
+) -> bool {
+    forwards_word_matching(term, |word| word_is_scanned(process, bounds, word))
+}
+
+/// [`forwards_scanned_word`] against an arbitrary child-word predicate — the enumeration without
+/// the classifier, so a caller that needs a *different* scanned test (the `valve_bounds` suite's
+/// aggregate-free oracle) cannot drift from the shapes the valve walks.
 ///
-/// `term` must be **boxed**: the header-less cons cell is the caller's own case, and reading a
-/// header out of a cons's car word would be meaningless.
+/// The predicate is called for a child word only until one of them answers `true`, so a shape
+/// with many slots pays at most one classification per slot.
 ///
 /// # Safety
 ///
-/// The caller must pass a **live** boxed term — one reachable from the root set or from another
-/// live object — so its header word is a readable, aligned term word. The object may live in
-/// **any** region, scanned or not: the enumeration only reads words belonging to the object the
-/// header describes.
+/// The caller must pass a **live** boxed-or-cons term — one reachable from the root set or from
+/// another live object — so the words it names are readable, aligned term words. The object may
+/// live in **any** region, scanned or not: the reads only touch words belonging to the object.
 #[allow(unsafe_code)]
-fn foreign_boxed_has_copy_children(term: Eterm) -> bool {
+pub(crate) fn forwards_word_matching<F>(term: Eterm, mut matches: F) -> bool
+where
+    F: FnMut(Eterm) -> bool,
+{
+    if beam_term::prelude::is_list(term) {
+        // SAFETY: `term` is a live cons cell (the caller's contract). A cons is header-less, so
+        // the two words at its address are its `car` and `cdr` — both live term words.
+        let address = beam_term::list::ptr_val(term) as *const Eterm;
+        // SAFETY: as above; both word reads are inside the live cons cell.
+        return unsafe { matches(*address) || matches(*address.add(1)) };
+    }
     // SAFETY: `term` is a live boxed term (the caller's contract), so its header word is a
-    // readable, aligned term word at the address the term's pointer bits name. `for_each_child_slot`
-    // only visits offsets belonging to the shape that header describes, and a shape that reports no
-    // slot reads the header alone (or a flat map's size word), so no word outside the object is
-    // touched.
+    // readable, aligned term word at the address the term's pointer bits name.
     unsafe {
         let address = beam_term::boxed::boxed_val(term) as *const Eterm;
         let header = *address;
-        let mut has_children = false;
-        beam_term::layout::for_each_child_slot(header, address, |_| has_children = true);
-        has_children
+        let mut forwards = false;
+        // SAFETY: `address` heads the live object `header` names, so `for_each_child_slot` visits
+        // exactly that shape's term-reference slots — offsets relative to the header word, every
+        // one in bounds and live. The closure stops classifying once it has its answer, so a shape
+        // with many slots pays at most one classification per slot and no more.
+        beam_term::layout::for_each_child_slot(header, address, |offset| {
+            if !forwards {
+                forwards = matches(*address.add(offset));
+            }
+        });
+        forwards
     }
 }
 
@@ -1080,7 +1164,8 @@ pub(crate) fn ensure_heap_full(
             .chain(roots.stack.iter())
             .chain(roots.fr[..fr_count].iter())
     };
-    let declined = any_root_is_unscanned(runtime.walk_scratch(), process, machine_roots(), descend);
+    let verdict = valve_verdict(runtime.walk_scratch(), process, machine_roots(), descend);
+    let declined = verdict.declined;
     #[cfg(test)]
     valve_counters::note_valve(valve_counters::Door::EnsureHeapFull, descend, declined);
     #[cfg(test)]
@@ -1102,6 +1187,15 @@ pub(crate) fn ensure_heap_full(
     if declined {
         runtime.note_foreign_reachable(pid);
         return Ok(());
+    }
+    // The **latch's closing half** (see [`root_is_unscanned`] and
+    // [`Runtime::close_foreign_reachable`]): this door handed the valve the machine's whole root
+    // set, and the descent it ran reached no container from a region the collector does not scan
+    // — so the process's graph holds none, and the descent can be skipped again until an event
+    // puts one back. No other door may do this: [`ensure_heap`] cannot see the FR file, and the
+    // park arm and the signal gate run for a process whose roots are not published.
+    if verdict.foreign_free {
+        runtime.close_foreign_reachable(pid);
     }
     if forced {
         runtime.take_gc_request(pid);
@@ -1424,7 +1518,8 @@ pub(crate) fn alloc_words_rooted(
             .chain(roots.stack.iter())
             .chain(roots.fr[..fr_count].iter())
     };
-    let declined = any_root_is_unscanned(runtime.walk_scratch(), process, machine_roots(), descend);
+    let verdict = valve_verdict(runtime.walk_scratch(), process, machine_roots(), descend);
+    let declined = verdict.declined;
     #[cfg(test)]
     valve_counters::note_valve(valve_counters::Door::AllocWordsRooted, descend, declined);
     #[cfg(test)]
@@ -1449,6 +1544,12 @@ pub(crate) fn alloc_words_rooted(
         valve_counters::note_fallback_at(valve_counters::FallbackSite::ValveDeclined);
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
+    }
+    // The latch's closing half, exactly as at [`ensure_heap_full`]: this door also handed the
+    // valve the machine's whole root set, so a descent that reached no foreign container says the
+    // process's graph holds none and the bit can be retired.
+    if verdict.foreign_free {
+        runtime.close_foreign_reachable(pid);
     }
     // From here the collection is committed to, so a pending forced request is consumed
     // **once**, at the commit point — the single `take_gc_request` [`ensure_heap_full`]

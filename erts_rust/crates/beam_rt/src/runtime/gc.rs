@@ -166,15 +166,23 @@ pub(crate) struct GcState {
     /// result outside the process heap, a heap-fragment delivery, a spawn argument that is not
     /// the new process's own).
     ///
-    /// The bit is **sticky and add-only**: it is set, never cleared while the process lives (a
-    /// gate observed open at one collection stays open at every later one), and the entry is
-    /// dropped only when the pid is gone ([`Runtime::prune_gc_requests`]).
+    /// The bit is **scoped to the foreign containers actually in the graph, not to the process's
+    /// life**: it is set by the events above and — the other half — **closed** again by a
+    /// full-root descent that reached no container from an unscanned region at all
+    /// ([`Runtime::close_foreign_reachable`]), which is what a loop that drops its foreign term
+    /// (or never nested one) relies on to stop paying the `O(live)` descent. Only the two
+    /// *full* admission doors may close it: they hand the valve the whole `RootSet`, so "no
+    /// foreign container reachable" is a statement about the process's entire term graph, while
+    /// the narrow door, the park arm and the signal gate see less. A clear is conservative in
+    /// exactly one direction: an under-approximated root set would skip a descent, so the two
+    /// doors that cannot see everything never clear.
     ///
     /// The cell is a `HashSet<ProcessId>` over the crate's own [`crate::hasher`] hasher rather
     /// than SipHash: it is a **verdict-only** set of internal pids (probed once per admission
-    /// point and, on a decline, inserted into again — see [`Runtime::note_foreign_reachable`]),
-    /// never iterated for an observable ordered result, so the seeded hash's cost buys nothing
-    /// here. See the `hasher` module docs for the soundness argument.
+    /// point, inserted into on a decline, removed by a clean full-root descent — see
+    /// [`Runtime::note_foreign_reachable`]), never iterated for an observable ordered result, so
+    /// the seeded hash's cost buys nothing here. See the `hasher` module docs for the soundness
+    /// argument.
     foreign: ForeignLatch,
     /// The reachability walk's **reused** scratch (its worklist and its visited set), so a
     /// collection never allocates the descent's structures (see
@@ -630,11 +638,14 @@ impl Runtime {
     ///
     /// Called by the events that can put a container from an unscanned region into `pid`'s
     /// reachable graph — the engine's arena fallback ([`Runtime::note_gc_fallback`]), a BIF /
-    /// runtime-native / NIF result built outside the process heap, a heap-fragment message
+    /// runtime-native / NIF result built outside the process heap that **forwards a scanned
+    /// word** ([`open_gate_for_foreign_result`](crate::RuntimeContext)), a heap-fragment message
     /// delivery, a spawn argument that is not the new process's own — and by the valve itself
-    /// when it observes such a container at a live **root**. It is deliberately **add-only**:
-    /// closing it again would let a later collection move a heap under a term the process still
-    /// holds, which is the corruption the valve exists to prevent.
+    /// when it observes a **hazard** at a live root. The bit is a hint, never a decision: while
+    /// it is open every candidate collection also runs the `O(live)` descent, and while it is
+    /// closed the always-run per-word phase still classifies every root. Its only cost direction
+    /// is to *add* conservatism, and it is closed again by a clean full-root descent
+    /// ([`Runtime::close_foreign_reachable`]).
     ///
     /// This is one of the two hot callers of the latch (the other is
     /// [`Runtime::foreign_reachable`]): the valve **declines** on essentially every allocating
@@ -646,6 +657,31 @@ impl Runtime {
         let fresh = self.gc.foreign.borrow_mut().insert(pid);
         #[cfg(test)]
         latch_counters::note_insert(fresh);
+    }
+
+    /// Closes `pid`'s **descent gate** ([`GcState::foreign`]) after a descent that ran over the
+    /// process's **whole** root set and reached no container from a region the collector does not
+    /// scan.
+    ///
+    /// This is the *only* place the bit is cleared, and it is deliberately narrow: the caller must
+    /// have handed the valve the executing machine's complete `RootSet` (the two full admission
+    /// doors, [`crate::context::gc`]) and received a
+    /// [`ValveVerdict::foreign_free`](crate::context::gc_walk::ValveVerdict) — the walk itself
+    /// only reports that property for a walk that descended over the roots it was handed. "No
+    /// foreign container is reachable" is what makes the clear sound: a hazard needs a foreign
+    /// container to *hold* a scanned word, so with none reachable there is none to leave dangling,
+    /// and the graph can only acquire one through an event that re-opens the bit.
+    ///
+    /// Answering whether the bit was open, for the test-only witnesses.
+    pub(crate) fn close_foreign_reachable(&mut self, pid: ProcessId) -> bool {
+        if self.gc.foreign.borrow().is_empty() {
+            return false;
+        }
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let closed = self.gc.foreign.borrow_mut().remove(&pid);
+        #[cfg(test)]
+        latch_counters::note_remove(closed);
+        closed
     }
 
     /// Whether `pid`'s descent gate is open (see [`GcState::foreign`]) — i.e. whether the
@@ -888,8 +924,12 @@ pub(crate) mod latch_counters {
         pub(crate) inserts: usize,
         /// Of those, the calls that **grew** the latch (the pid was not already a member) — so
         /// `fresh_inserts` counts distinct pids and `inserts - fresh_inserts` counts the
-        /// re-probes the latch's add-only rule absorbs.
+        /// re-probes a still-open bit absorbs.
         pub(crate) fresh_inserts: usize,
+        /// `remove` calls that **closed** an open bit
+        /// ([`Runtime::close_foreign_reachable`](super::Runtime::close_foreign_reachable)) —
+        /// i.e. how often a clean full-root descent retired a stale latch entry.
+        pub(crate) removes: usize,
     }
 
     impl LatchCounters {
@@ -898,6 +938,7 @@ pub(crate) mod latch_counters {
             probes: 0,
             inserts: 0,
             fresh_inserts: 0,
+            removes: 0,
         };
     }
 
@@ -931,6 +972,15 @@ pub(crate) mod latch_counters {
             let mut value = counters.get();
             value.inserts += 1;
             value.fresh_inserts += usize::from(fresh);
+            counters.set(value);
+        });
+    }
+
+    /// Records one `remove` call, `closed` being the set's own verdict (whether the bit was open).
+    pub(crate) fn note_remove(closed: bool) {
+        COUNTERS.with(|counters| {
+            let mut value = counters.get();
+            value.removes += usize::from(closed);
             counters.set(value);
         });
     }
