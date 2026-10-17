@@ -130,3 +130,19 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 ## See Also
 - `../interpreter/CONTEXT.md` → the per-instruction dispatcher (`step_instruction`, also the JIT deopt target).
 - `../CONTEXT.md` → the engine's binding execution semantics; `../jit/CONTEXT.md` → the native tiers' block ABI.
+
+## `Machine::writable_payloads` — the writable-append registry
+
+A small side list of `(payload base, capacity in bytes)` for the off-heap payloads this machine
+allocated **for appending** (`bs_init_writable`'s backing store, C's `BIN_FLAG_WRITABLE` binary),
+deposited by `Machine::mark_writable(base, capacity)` and queried by
+`Machine::writable_capacity(base) -> Option<usize>` (a linear scan; no BEAM-heap allocation). The
+frozen term layout carries no capacity word and `beam_alloc::RefcBinary` is immutable, so the
+capacity has to live beside the machine; keying it per machine also gives C's
+`erts_pin_writable_binary` property for free — a payload another process's copy points at is not in
+*this* list, so it is never written in place here.
+
+Only `mark_writable` entries are writable: an ordinary binary's payload length is never taken as a
+capacity (the roster `Machine::refc_binaries` is *not* consulted). The list is **never cleared by
+`Machine::reset`**, for the same reason `refc_binaries` is not — a registry entry must never outlive
+the payload it names. Consumer: `families::bitstrings::raw::{writable_append_target, InPlace}`.

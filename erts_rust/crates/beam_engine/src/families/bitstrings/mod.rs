@@ -522,30 +522,139 @@ pub(super) fn extract_bits(bytes: &[u8], start: usize, nbits: usize) -> Result<V
     Ok(out)
 }
 
-/// A bit sink: append bits (MSB-first) to a growable byte buffer.
+/// Where a [`BitWriter`] deposits its bits.
 ///
-/// Used by the `bs_create_bin` builder, which assembles the result as a bit vector
-/// and materialises it once at the end ([`raw::make_binary`]).
-#[derive(Default)]
+/// * [`Dest::Vec`] — the general **copy-rebuild** destination: a growable `Vec<u8>` the
+///   build fills and `raw::make_binary` materialises once at the end (the on-heap
+///   `ErlHeapBits`/off-heap refc binary choice of [`raw::make_binary`]).
+/// * [`Dest::InPlace`] — the compiler's **linear accumulator**: the bits already live in
+///   a writable `bs_init_writable` payload ([`raw::InPlace`]), so the new segment's bits
+///   are written straight after them and the build publishes the *same* term with a
+///   wider `ErlSubBits.end` (`erts_bs_private_append_checked`, `erl_bits.c:1943-2020`).
+pub(super) enum Dest {
+    /// A fresh byte buffer and the bit count written into it.
+    Vec {
+        bytes: Vec<u8>,
+        /// Bits written so far (`bytes.len() == nbits.div_ceil(8)`).
+        nbits: usize,
+    },
+    /// The writable accumulator's payload, written in place.
+    InPlace(raw::InPlace),
+}
+
+impl Default for Dest {
+    fn default() -> Dest {
+        Dest::Vec {
+            bytes: Vec::new(),
+            nbits: 0,
+        }
+    }
+}
+
+/// What a completed [`BitWriter`] build produced.
+///
+/// The in-place form is a **term**: the accumulated bits never left the payload, so the
+/// result is the accumulator itself with a bumped window end and no allocation at all.
+/// The byte form is the copy-rebuild result, which the caller materialises with
+/// [`raw::make_binary`].
+pub(super) enum Built {
+    /// Assembled bytes and their exact bit count.
+    Bytes(Vec<u8>, usize),
+    /// The accumulator term, already extended ([`raw::InPlace::finish`]).
+    Term(Eterm),
+}
+
+/// A bit sink: append bits (MSB-first) to a growable byte buffer **or** in place into a
+/// writable accumulator payload ([`Dest`]).
+///
+/// Used by the `bs_create_bin` builder, which assembles the result as a bit vector and
+/// materialises it once at the end ([`raw::make_binary`]) — unless it started in
+/// [`Dest::InPlace`], where the materialisation is the term itself.
+///
+/// # Promotion
+///
+/// The in-place destination is bounded by the payload capacity and can be invalidated by
+/// a segment source that aliases the payload. In both cases the writer **promotes**: the
+/// written prefix is copied out ([`raw::InPlace::into_bytes`]) and the build continues in
+/// [`Dest::Vec`]. Promotion is exact — the bits already written are the same bits — so the
+/// final result is byte-identical to the copy-rebuild path, and the accumulator's window
+/// is left unbumped.
 pub(super) struct BitWriter {
-    bytes: Vec<u8>,
-    /// Bits written so far (≤ `bytes.len() * 8`).
-    nbits: usize,
+    dest: Dest,
+}
+
+impl Default for BitWriter {
+    fn default() -> BitWriter {
+        BitWriter {
+            dest: Dest::default(),
+        }
+    }
 }
 
 impl BitWriter {
-    /// Append a single bit (`0` or `1`).
-    pub(super) fn push_bit(&mut self, bit: u8) {
-        let byte = self.nbits / 8;
-        if byte >= self.bytes.len() {
-            self.bytes.push(0);
+    /// A writer that deposits into `sink` — the writable accumulator's payload.
+    pub(super) fn in_place(sink: raw::InPlace) -> BitWriter {
+        BitWriter {
+            dest: Dest::InPlace(sink),
         }
-        if bit & 1 != 0 {
-            self.bytes[byte] |= 1 << (7 - (self.nbits % 8));
-        }
-        self.nbits += 1;
     }
 
+    /// Whether this build has written nothing yet (a writer that has not been switched
+    /// to a payload, and has deposited no bits) — the `bs_create_bin` loop's gate for
+    /// entering the in-place mode on its **first** segment.
+    pub(super) fn is_pristine(&self) -> bool {
+        matches!(self.dest, Dest::Vec { nbits: 0, .. })
+    }
+
+    /// Switch to the copy-rebuild destination, carrying the bits already written.
+    fn promote(&mut self) {
+        let Dest::InPlace(sink) = core::mem::replace(&mut self.dest, Dest::default()) else {
+            // Only called when the destination is in place.
+            unreachable!("promotion is only reachable from the in-place destination");
+        };
+        let (bytes, nbits) = sink.into_bytes();
+        self.dest = Dest::Vec { bytes, nbits };
+    }
+
+    /// The bits written so far — the **whole** result's bit count (for an in-place build,
+    /// the accumulator's window end plus everything this build appended).
+    pub(super) fn bit_len(&self) -> usize {
+        match &self.dest {
+            Dest::Vec { nbits, .. } => *nbits,
+            Dest::InPlace(sink) => sink.bit_len(),
+        }
+    }
+
+    /// Whether the segment source `src` overlaps the in-place payload this writer appends
+    /// into; such a source is copied out first (promotion) so no read ever aliases a write.
+    fn source_overlaps(&self, src: &[u8]) -> bool {
+        match &self.dest {
+            Dest::Vec { .. } => false,
+            Dest::InPlace(sink) => sink.overlaps(src.as_ptr(), src.len()),
+        }
+    }
+
+    /// Append a single bit (`0` or `1`).
+    pub(super) fn push_bit(&mut self, bit: u8) {
+        if let Dest::InPlace(sink) = &self.dest {
+            if sink.remaining_bits() == 0 {
+                self.promote();
+            }
+        }
+        match &mut self.dest {
+            Dest::Vec { bytes, nbits } => {
+                let byte = *nbits / 8;
+                if byte >= bytes.len() {
+                    bytes.push(0);
+                }
+                if bit & 1 != 0 {
+                    bytes[byte] |= 1 << (7 - (*nbits % 8));
+                }
+                *nbits += 1;
+            }
+            Dest::InPlace(sink) => sink.push_bit(bit),
+        }
+    }
     /// Append the low `width` bits of `value`, most-significant bit first.
     pub(super) fn push_uint(&mut self, value: u64, width: usize) {
         for k in (0..width).rev() {
@@ -595,20 +704,78 @@ impl BitWriter {
     }
 
     /// Append `count` bits from `src` (MSB-first) starting at bit `start`.
+    ///
+    /// A segment source that **overlaps** the in-place payload is copied out first
+    /// (promotion), so a read is never interleaved with the writes of the same build.
+    /// The **byte-aligned** case (`start` and the current position both on a byte
+    /// boundary) copies whole bytes — the fast path a `binary`/`append`/`string`
+    /// segment of real data always takes — and only the trailing partial byte goes
+    /// through the per-bit writer, which keeps every unaligned case bit-exact.
     pub(super) fn push_bits_from(&mut self, src: &[u8], start: usize, count: usize) {
-        for i in 0..count {
+        if self.source_overlaps(src) {
+            self.promote();
+        }
+        let mut done = 0usize;
+        if start % 8 == 0 && self.bit_len() % 8 == 0 {
+            let whole = count / 8;
+            if whole != 0 {
+                self.push_whole_bytes(&src[start / 8..start / 8 + whole]);
+                done = whole * 8;
+            }
+        }
+        for i in done..count {
             let bit_index = start + i;
             let bit = (src[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
             self.push_bit(bit);
         }
     }
 
+    /// Append `bytes` verbatim to a byte-aligned destination.
+    ///
+    /// The caller guarantees `bytes` does **not** overlap the in-place payload (the
+    /// promotion in [`BitWriter::push_bits_from`] establishes that), so the in-place arm
+    /// may use a non-overlapping copy.
+    fn push_whole_bytes(&mut self, bytes: &[u8]) {
+        if let Dest::InPlace(sink) = &self.dest {
+            if sink.remaining_bits() < bytes.len() * 8 {
+                self.promote();
+            }
+        }
+        match &mut self.dest {
+            Dest::Vec {
+                bytes: buf,
+                nbits,
+            } => {
+                buf.extend_from_slice(bytes);
+                *nbits += bytes.len() * 8;
+            }
+            Dest::InPlace(sink) => sink.copy_bytes(bytes),
+        }
+    }
+
     /// The assembled bytes and the exact bit count.
+    ///
+    /// For an in-place build this **copies out** the accumulated bits (the promotion
+    /// half of [`Dest`]) without publishing them; the builder itself uses
+    /// [`BitWriter::finish_built`]. Only the writer's own unit tests — which always
+    /// drive the copy-rebuild form — need the byte view.
+    #[cfg(test)]
     pub(super) fn finish(self) -> (Vec<u8>, usize) {
-        (self.bytes, self.nbits)
+        match self.dest {
+            Dest::Vec { bytes, nbits } => (bytes, nbits),
+            Dest::InPlace(sink) => sink.into_bytes(),
+        }
+    }
+
+    /// The finished build: the accumulator term itself for an in-place build, the
+    /// assembled bytes otherwise.
+    pub(super) fn finish_built(self) -> Built {
+        match self.dest {
+            Dest::Vec { bytes, nbits } => Built::Bytes(bytes, nbits),
+            Dest::InPlace(sink) => Built::Term(sink.finish()),
+        }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

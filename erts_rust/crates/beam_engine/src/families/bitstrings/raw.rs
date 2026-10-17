@@ -23,10 +23,11 @@
 //!
 //! Everything the `bs_*` opcodes need to *dereference* is here: reading a heap
 //! bitstring's data words, reading/writing the `ErlSubBits` match-context fields,
-//! allocating a fresh match context, and materialising a result bitstring with an
-//! explicit bit count. Every `unsafe` block carries a `// SAFETY:` rationale; every
-//! caller hands in a term this module (or `beam_term`) already validated.
-//!
+//! allocating a fresh match context, materialising a result bitstring with an
+//! explicit bit count, and — for the `bs_init_writable` accumulator — writing the
+//! payload **in place** ([`InPlace`], C's writable `private_append`). Every `unsafe`
+//! block carries a `// SAFETY:` rationale; every caller hands in a term this module
+//! (or `beam_term`) already validated.//!
 //! # Frozen layouts (C ground truth, `erts/emulator/beam/erl_bits.h:60-164`)
 //!
 //! ```text
@@ -249,6 +250,19 @@ pub(super) fn set_ctx_start(t: Eterm, start: usize) {
     }
 }
 
+/// Overwrite the **window end** (bit `end`) of an `ErlSubBits` in place — C's
+/// `sb->end = new_position` (`erl_bits.c:1975`, the writable `private_append` arm).
+///
+/// The caller must pass a term [`ctx_parts`] accepted (a live `ErlSubBits`) whose
+/// bits `[0, end)` are the ones it means to publish, and must keep
+/// `start <= end <= `the payload's capacity in bits.
+pub(super) fn set_ctx_end(t: Eterm, end: usize) {
+    // SAFETY: the caller passed a term `ctx_parts` accepted as a live `ErlSubBits`
+    // block, so word 3 is its mutable `end` field.
+    unsafe {
+        *boxed_val(t).add(3) = Eterm::from_raw(end);
+    }
+}
 /// Build a bignum term from `digits` (least significant first) with the given sign.
 ///
 /// `digits` must be non-empty and normalised (no leading zero digit) — exactly the
@@ -465,6 +479,11 @@ pub(super) fn make_writable(
         RootSet::ALL_LIVE,
     )?;
     let data = machine.alloc_refc_binary(&vec![0u8; capacity])?;
+    // The payload is the accumulator's backing store: register it so a following
+    // `private_append` can write into it in place ([`writable_append_target`]), exactly
+    // as C's `build_writable_bitstring` sets `BIN_FLAG_WRITABLE|BIN_FLAG_ACTIVE_WRITER`
+    // and threads the binary onto `p->wrt_bins` (`erl_bits.c:1684-1720`).
+    machine.mark_writable(data, capacity);
     // SAFETY: as `make_binary` — 8 exclusively-owned words for the pair, a live
     // `UNIT_SIZE`-aligned off-heap payload owned by `machine`, and a 0-bit window
     // (`start = end = 0`).
@@ -478,6 +497,236 @@ pub(super) fn make_writable(
             0,
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// The in-place writable accumulator (`private_append`)
+// ---------------------------------------------------------------------------
+
+/// The in-place append target of `src`, or `None` when `src` must take the
+/// copy-rebuild path: `(payload base, capacity in bits, window end in bits)`.
+///
+/// `Some` exactly when `src`
+/// 1. is an **off-heap refc binary** ([`beam_term::refc::is_refc_binary`]) — an
+///    `ErlSubBits` over a `BinRef` (an on-heap `ErlHeapBits` has no payload to write
+///    into),
+/// 2. has `start == 0` — C **asserts** this for both append forms
+///    (`erl_bits.c:1943-1948`), because an in-place append writes at absolute payload
+///    offsets;
+/// 3. has a payload **this machine allocated for appending**
+///    ([`Machine::writable_capacity`] — the writable-flag registry).
+///
+/// The capacity is *only* ever taken from that registry: the payload roster
+/// ([`Machine::refc_binaries`]) knows every payload's length, and an ordinary binary's
+/// length is emphatically not a writable capacity.
+pub(super) fn writable_append_target(
+    machine: &Machine,
+    src: Eterm,
+) -> Option<(*mut u8, usize, usize)> {
+    // SAFETY: `is_refc_binary` checks `is_boxed` before it dereferences the header and
+    // only reads the `ErlSubBits.orig` slot when the header says `ErlSubBits`.
+    if !unsafe { beam_term::refc::is_refc_binary(src) } {
+        return None;
+    }
+    // SAFETY: `src` is a live refc-binary `ErlSubBits` over a live `BinRef`, so its
+    // frozen `base`/`start`/`size` are initialised and the payload is alive (a
+    // `beam_alloc::RefcBinary` handle owned by some machine keeps it so).
+    let (base, start, size) = unsafe { beam_term::bitstring_parts(src) };
+    if start != 0 || base.is_null() {
+        return None;
+    }
+    let capacity_bits = machine.writable_capacity(base)?.checked_mul(8)?;
+    Some((base as *mut u8, capacity_bits, size))
+}
+
+/// An **in-place bit sink** over a writable accumulator payload — C's writable
+/// `private_append` arm (`erts_bs_private_append_checked`, `erl_bits.c:1943-2020`),
+/// which bumps `sb->end` to the new position instead of copying.
+///
+/// The sink writes bits MSB-first into the payload starting at the accumulator's own
+/// window end ([`InPlace::start_bits`]), exactly like the copy-rebuild writer it
+/// replaces, but the payload is written **where it already is**: no `Vec`, no fresh
+/// payload, no `[BinRef][ErlSubBits]` reservation, and the produced term is the
+/// **same `Eterm`** the accumulator already was ([`InPlace::finish`] only rewrites the
+/// frozen `ErlSubBits.end` word).
+///
+/// # The invariant that makes the mutation unobservable
+///
+/// Writes always land at bit offsets `>= start` — the accumulator's `end` at the time
+/// the sink was created — and never past the payload's capacity
+/// ([`InPlace::remaining_bits`]; the writer **promotes** to the copy-rebuild form when
+/// the next write would not fit). Every alias of the payload (a term copied before the
+/// append, another process's `ErlSubBits` over the same payload, a message's shared
+/// binary) has a window ending at or before that offset, so it reads exactly the bytes
+/// it read before. The only term whose *window* changes is the accumulator itself,
+/// whose `end` is bumped on success — precisely C's `sb->end = new_position`.
+///
+/// # Safety / aliasing contract (a deliberate, scoped relaxation)
+///
+/// [`beam_alloc::RefcBinary`] documents its payload as immutable, and this sink writes
+/// through a raw pointer into it. That is sound *for the accumulator only* because
+/// (a) only a payload the machine explicitly registered as writable
+/// ([`Machine::mark_writable`]) is ever written — an ordinary refc binary never is,
+/// and (b) no Rust reference to those bytes is alive across a write: the engine's
+/// builder holds raw pointers, never a `&[u8]`, while appending (a segment source that
+/// *does* alias the payload makes the writer promote to a fresh `Vec` first). It is the
+/// Rust counterpart of C's `BIN_FLAG_WRITABLE` binary, whose `orig_bytes` are likewise
+/// mutable exactly while that flag is set.
+pub(crate) struct InPlace {
+    /// The payload's first data byte (the `ErlSubBits` base / `BinRef.val`).
+    base: *mut u8,
+    /// The first bit this build may write: the accumulator's window end (`start`).
+    start: usize,
+    /// The payload capacity in bits.
+    capacity: usize,
+    /// The next bit to write, absolute in the payload.
+    cur: usize,
+    /// The accumulator term whose `ErlSubBits.end` a successful build rewrites.
+    src: Eterm,
+}
+
+impl InPlace {
+    /// A sink over the payload at `base`, writing from bit `start_bits` of a
+    /// `capacity_bits`-bit payload, publishing through `src`.
+    ///
+    /// The caller must have obtained `(base, capacity_bits, start_bits)` from
+    /// [`writable_append_target`] for this very `src`, so the payload is alive and
+    /// writable and `0 <= start_bits <= capacity_bits`.
+    pub(super) fn new(base: *mut u8, capacity_bits: usize, start_bits: usize, src: Eterm) -> InPlace {
+        debug_assert!(start_bits <= capacity_bits, "the window end fits the payload");
+        InPlace {
+            base,
+            start: start_bits,
+            capacity: capacity_bits,
+            cur: start_bits,
+            src,
+        }
+    }
+
+    /// The bits written so far: the **whole** result's bit count (the accumulator's
+    /// window end plus everything this build appended).
+    pub(super) fn bit_len(&self) -> usize {
+        self.cur
+    }
+
+    /// How many more bits fit in the payload.
+    pub(super) fn remaining_bits(&self) -> usize {
+        self.capacity.saturating_sub(self.cur)
+    }
+
+    /// Whether the byte range `[ptr, ptr + len)` overlaps this payload.
+    ///
+    /// A segment source that overlaps the accumulator is the one shape that would read
+    /// and write the same bytes; the writer promotes to a fresh `Vec` when this answers
+    /// `true` (see [`super::BitWriter`]).
+    pub(super) fn overlaps(&self, ptr: *const u8, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let payload_start = self.base as usize;
+        let payload_end = payload_start + self.capacity.div_ceil(8);
+        let src_start = ptr as usize;
+        let src_end = src_start + len;
+        src_start < payload_end && payload_start < src_end
+    }
+
+    /// Append one bit (MSB-first within each byte).
+    ///
+    /// The caller must have checked [`InPlace::remaining_bits`]. Entering a byte clears
+    /// it (or, for the one byte the accumulator's window ends inside, masks its fresh
+    /// low bits away while keeping the accumulated high bits), so the bytes this build
+    /// writes never inherit the residue of an earlier **failed** attempt at the same
+    /// offset — a failure leaves those bytes invisible, but not necessarily zero.
+    pub(super) fn push_bit(&mut self, bit: u8) {
+        debug_assert!(self.cur < self.capacity, "the caller checked the capacity");
+        let byte = self.cur / 8;
+        let position = self.cur % 8;
+        // SAFETY: `cur < capacity`, so `byte = cur / 8 < ceil(capacity / 8)` — inside the
+        // payload, whose `capacity` bytes the machine allocated and keeps alive.
+        unsafe {
+            if position == 0 {
+                // A byte boundary: everything from here on is fresh.
+                *self.base.add(byte) = 0;
+            } else if self.cur == self.start {
+                // The accumulator's window ends inside this byte: keep its bits (the
+                // high `position` ones) and clear the fresh low bits first.
+                *self.base.add(byte) &= 0xFFu8 << (8 - position);
+            }
+            if bit & 1 != 0 {
+                *self.base.add(byte) |= 1 << (7 - position);
+            }
+        }
+        self.cur += 1;
+    }
+
+    /// Bulk-append whole bytes from `src` (the byte-aligned fast path).
+    ///
+    /// The caller guarantees `src.len() * 8 <= `[`InPlace::remaining_bits`] (checked by
+    /// [`super::BitWriter`], which promotes on a shortfall) and that `src` does **not**
+    /// overlap the payload ([`InPlace::overlaps`]).
+    pub(super) fn copy_bytes(&mut self, src: &[u8]) {
+        debug_assert!(
+            src.len() * 8 <= self.remaining_bits(),
+            "the writer checked the capacity"
+        );
+        debug_assert!(self.cur % 8 == 0, "the fast path is byte-aligned");
+        if src.is_empty() {
+            return;
+        }
+        // SAFETY: the destination starts at byte `cur / 8` and spans `src.len()` bytes,
+        // which the capacity check above keeps inside the payload; `src` is a live
+        // non-overlapping slice (see the caller's contract), and its validity for
+        // `src.len()` reads is a `&[u8]` guarantee.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                self.base.add(self.cur / 8),
+                src.len(),
+            );
+        }
+        self.cur += src.len() * 8;
+    }
+
+    /// Copy the accumulated bits out as `(bytes, bit count)` — the **promotion** half
+    /// (the build outgrew the payload, or a segment source aliases it).
+    ///
+    /// The copied bytes are exactly what the copy-rebuild path would have produced for
+    /// the same bits: `ceil(bits / 8)` bytes with the unused low bits of the final byte
+    /// masked to zero ([`make_binary`]'s canonical invariant), which is also what the
+    /// payload itself holds.
+    pub(super) fn into_bytes(self) -> (Vec<u8>, usize) {
+        let nbits = self.cur;
+        let num_bytes = nbits.div_ceil(8);
+        let mut out = vec![0u8; num_bytes];
+        if num_bytes != 0 {
+            // SAFETY: `num_bytes = ceil(cur / 8) <= ceil(capacity / 8)`, so the source
+            // range is inside the payload; `out` has room for exactly those bytes and the
+            // two allocations are distinct (a fresh `Vec` versus the machine's payload).
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.base, out.as_mut_ptr(), num_bytes);
+            }
+            if nbits % 8 != 0 {
+                let keep = nbits % 8;
+                out[num_bytes - 1] &= 0xFFu8 << (8 - keep);
+            }
+        }
+        (out, nbits)
+    }
+
+    /// Publish the build: bump the accumulator's `ErlSubBits.end` to the new position
+    /// (`sb->end = new_position`, `erl_bits.c:1975`) and return the **same** term.
+    ///
+    /// A build that fails after some in-place writes never reaches here, so the window
+    /// the caller can still see keeps its old end and the bytes beyond it stay invisible
+    /// — the write is simply dropped with the sink.
+    pub(super) fn finish(self) -> Eterm {
+        debug_assert!(
+            self.cur >= self.start && self.cur <= self.capacity,
+            "the published window is the written range, inside the payload"
+        );
+        set_ctx_end(self.src, self.cur);
+        self.src
+    }
 }
 
 #[cfg(test)]

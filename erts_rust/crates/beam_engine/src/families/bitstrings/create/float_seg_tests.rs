@@ -102,6 +102,8 @@ fn build_float(
         value,
         size,
     ];
+    // A `Built` answers in either form; every caller here compares bytes, so it
+    // reports the `(bytes, nbits)` view of an in-place result too.
     assemble(
         machine,
         module,
@@ -110,6 +112,7 @@ fn build_float(
         &segments,
         ctx,
     )
+    .map(|built| built.map(super::built_bytes))
 }
 
 /// A bignum term from `digits` (least significant first), asserted to be the shape
