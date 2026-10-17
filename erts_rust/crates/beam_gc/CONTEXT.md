@@ -722,7 +722,10 @@ constructors only (no new error enum).
   ranges and the binary-search `locate`)
 - `src/nursery.rs` → `Nursery`: the young nursery **chain of spaces** (`grow`/`collapse`/`spaces`/
   `contains`/`add_to_from_set`/`used_words`/`capacity_words`), its indexed containment
-  (`retired_regions: BTreeMap<base, top>`) and its debt query (`retains_old_spaces`)
+  (`retired_regions: BTreeMap<base, top>`), its cached reserved-extent aggregate (`extent: ScannedBounds`,
+  `bounds()`) and its debt query (`retains_old_spaces`)
+- `src/bounds.rs` → `ScannedBounds`: the O(1) aggregate extent over every scanned region (nursery chain +
+  mature) and its geometry epoch — the fast-reject filter a host's unscanned-root valve calls
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `collect` + the
   copy-specific `pub(crate)` primitives
 - `src/collector.rs` → the two-generation `Collector` driver (see **API Surface**)
