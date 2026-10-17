@@ -708,7 +708,7 @@ struct Residual {
 }
 
 /// The `getsockopt` failure text of the `nodelay`-on-a-datagram-socket residual.
-const Io_RESIDUAL: Ours = Ours::Io("Operation not supported (os error 95)");
+const IO_RESIDUAL: Ours = Ours::Io("Operation not supported (os error 95)");
 
 /// The `udp` shapes this runtime answers differently, each a **capability gap or a documented
 /// substitution** on the driver side (`beam_io`), never a wrong result.
@@ -719,6 +719,12 @@ const Io_RESIDUAL: Ours = Ours::Io("Operation not supported (os error 95)");
 /// layer; a second `open` is the documented `einval` non-mirror of the C's `exbadseq`; and
 /// `getopts` of an option the socket refuses propagates the `getsockopt` failure where the C drops
 /// the record (`inet_drv.c:9734-9741`).
+///
+/// The three `subscribe` rows are the one group that closes **outside** this crate: `beam_io` owes
+/// `INET_REQ_SUBSCRIBE` the `[1]` / `[1,1,0,0,0,0]` / `badarg` answers (its body only registers a
+/// subscriber when the output queue is non-empty, which this floor's port never is). When that lands
+/// they are ordinary agreement rows — the oracle column already holds what both sides will answer —
+/// so they must move out of this table rather than be relaxed.
 fn residuals() -> Vec<Residual> {
     let gap = |probe: Probe, oracle: Oracle, name: &'static str, residual: &'static str| Residual {
         probe,
@@ -790,7 +796,7 @@ fn residuals() -> Vec<Residual> {
         Residual {
             probe: Probe::exact("getopts_nodelay", 8, vec![10]),
             oracle: Oracle::Exact("[1]"),
-            ours: Io_RESIDUAL,
+            ours: IO_RESIDUAL,
             residual: "`getsockopt(TCP_NODELAY)` on a datagram socket is ENOTSUP; the C drops the record and answers `[1]`",
         },
         Residual {
