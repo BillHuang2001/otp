@@ -32,6 +32,15 @@ and its test-only site classification live in one ~300-line file. Owned by `./er
   prologue loads the cache inline).
 
 ## The soundness contract (dirty-set spill at each pc, partial fill, fixed membership)
+- **Precondition: an `Allocation` is used only for the range it was built for, and emission starts at its
+  own `block_start`.** The static `spill_sets`/`fill_sets` tables are indexed by `pc - block_start`
+  (`spill_slots_at`/`fill_slots`), and a table that does not cover `pc` conservatively means the whole
+  `written` set (spill) / the whole cache (fill) -- sound, but not the allocation's real traffic. The `pc`
+  every emitter passes is the `store_pc`, i.e. the pc **entering** the instruction being lowered (the
+  instruction's own address, not its successor's or its branch target's). The precondition is enforced
+  structurally: registers are allocated per emitted sub-range by
+  `allocate_registers(module, code, start, end)` (`../compile.rs`, for the IR blocks **and** the
+  continuation sub-blocks), so a sub-range never inherits another range's pc-indexed tables.
 - **Membership is fixed for the whole block.** An x-register is either *always* held in its machine
   register -- and written back before the block leaves its frame -- or *never* cached, so the two
   representations can never disagree.

@@ -86,9 +86,11 @@ never reaches the family).
 non-numeric case.
 
 Note `add(1, 2)` (an integer argument) hits the failed `is_float` guard, which jumps
-to the function's `func_info` label — the oracle raises `function_clause` there, but
-the M1 interpreter treats `func_info` as a no-op, so that path is deliberately *not*
-exercised by `tests/floats.rs`.
+to the function's `func_info` label, where the engine raises class `error` with the
+bare atom `function_clause` (`src/interpreter/dispatch.rs::raise_function_clause_with_args`,
+C's `i_func_info_IaaI`) — the same reason the oracle raises. `tests/floats.rs` does not
+exercise that path; the clause-failure raise itself is pinned by
+`tests/func_info_stacktrace.rs` and `tests/no_fail.rs`.
 
 ## `bsstring.beam` (`bsstring.erl`) — `tests/bitstrings_extra_string.rs`
 
@@ -216,10 +218,14 @@ neutral dir, then
 | `recv:aftervar(5)` (empty mailbox) | `empty` (times out) |
 | `recv:marked()` | `7` |
 
-**Known gap.** Milestone 1 has no host timer, so `aftervar(5)` on an empty mailbox
-does **not** return `empty`: `wait_timeout` suspends and the run reports
-`RunOutcome::Wait` (the timer is the host's job). `tests/receive.rs` asserts that
-honest outcome instead of the oracle value; every other row matches the oracle.
+**The non-zero-timeout row is a host gap, not an engine one.** A suspended
+`wait_timeout` reports `RunOutcome::Wait`, and the engine also reports the deadline
+itself — `Machine::wait_deadline(entry_module) -> Option<WaitDeadline>` (the parked
+`wait_timeout`'s resolved target plus its statically readable delay, `None` for a
+bare `wait`). What `tests/receive.rs` lacks is a **timer**: its mock mailbox never
+delivers the `timeout` message, so `aftervar(5)` on an empty mailbox stays parked and
+the test asserts `RunOutcome::Wait` instead of the oracle's `empty`. Every other row
+matches the oracle.
 
 ## `applyrecv.beam` (`applyrecv.erl`) — `tests/call_ext_apply.rs`
 
@@ -445,3 +451,87 @@ The **cooked catch-stacktrace** shapes that pin DEFECT 2 (a reported "duplicated
 | `t3/0` | `try g2() catch _C:_R:S -> S end`; `g2() -> hh2() + 1.`; `hh2() -> erlang:error(boom).` | `[{stacktrace_frames,hh2,0,{line,11}},{stacktrace_frames,t3,0,{line,9}}]` (the tail-called `g2/0` is elided) |
 
 `t3/0`'s `g2/0` is elided because `sys_core_fold` proves `hh2/0` never returns, so `g2/0` compiles to a **tail** call into `hh2/0` (its body is `call_only {f,hh2}`); the tail call reuses the frame, so the oracle never names it. Rebuild with the neutral-directory `erlc +deterministic` recipe above.
+## `atomapply.beam` (`atomapply.erl`) — `tests/apply_atom_value.rs`
+The runtime-valued apply fixture for the `ExecutionContext::atom_name` seam: `run/3` is
+`erlang:apply(M, F, A)` with all three parameters, so the body lowers to
+`call_ext_only 3 {extfunc,erlang,apply,3}` (verified with `beam_disasm:file/1`) and the engine
+must resolve the runtime `M`/`F` **atom values**, not interned-at-load ones. It is the shape of
+the A.9 boot-path failure at `gen_server:init_it/6`, where the applied module is an atom interned
+into the shared table after `gen_server` was loaded. Oracle:
+`atomapply:run(atomtarget, target_fun, [])` = `42`.
+## `atomtarget.beam` (`atomtarget.erl`) — `tests/apply_atom_value.rs`
+The callee of that apply: `target_fun/0 -> 42.` Neither its module name nor its export name
+appears in `atomapply`'s source, so the test interns both into the **live** shared atom table
+*after* loading `atomapply` — their ids lie beyond that module's load-time snapshot, which is
+what makes a module-local lookup insufficient.
+## `bitstrings.beam` (`bitstrings.erl`) — `tests/bitstrings.rs`
+The bitstring family's base surface.
+| export | Erlang | what it exercises |
+|---|---|---|
+| `mk/2` | `<<A:8, B:16>>` | `bs_create_bin` integer + sized `binary` segments |
+| `pair/2` | `<<A:8, B:8>>` | two integer segments |
+| `le16/1` | `<<A:16/little>>` | a little-endian integer segment |
+| `lit_bin/1` | `<<"ab", X/binary>>` | a `string` segment + an `all` binary segment |
+| `lit3/2` | `<<A:8, "z", B/binary>>` | integer + string + binary segments |
+| `first8/1` | `case Bin of <<X:8, _/binary>> -> X end` | `bs_start_match3` + `bs_get_integer2` |
+| `take2/1` | `<<A:8, B:8, _/binary>>` | two integer reads + tail |
+| `tail1/1` | `<<_:8, Rest/binary>>` | `bs_get_tail` |
+| `head16/1` | an exact 16-bit read | `bs_get_integer2` + `bs_test_tail2` |
+## `bsbig.beam` (`bsbig.erl`) — `tests/bitstrings_extra_big.rs`
+Integer bitstring segments **wider than 64 bits**: the wide `bs_get_integer2` matchers
+(`g72/g72s/g72le/g68/g68le/g65/g128/g9u8`, plus the `c_*` `case`-wrapped failure paths and
+`seq/1`), the `integer` command of the flattened `bs_match` list, and the integer segment of
+`bs_create_bin` (`e72/e72s/e72le/e68/e68le/e128/e9u8/e256`). Every argument stays a plain binary
+so a bad argument takes the `case_end` path rather than a clause failure.
+## `bscreate.beam` (`bscreate.erl`) — `tests/bitstrings_extra_create.rs`, `tests/bitstrings_create_fail.rs`
+The `bs_create_bin` construction forms beyond integer/binary/string: `float` segments
+(`f16/f16le/f32/f32le/f64/f64le`, plus the rejected widths `f0/f8`) and the `utf8`/`utf16`/`utf32`
+segments (`u8/u16/u16le/u32`). Each export compiles to a `bs_create_bin` holding exactly one
+such segment.
+## `bsmatch.beam` (`bsmatch.erl`) — `tests/bitstrings_extra_match.rs`
+The match forms `tests/bitstrings.rs` does not reach: `bs_match_string` (`strlong/1`, an 80-bit
+literal; a ≤64-bit literal folds into the `'=:='` `bs_match` command, which `str/1` covers), the
+fixed float reads `bs_get_float2` (`f16/f32/f32le/f64/f64le`) and the UTF reads/skips
+`bs_get_utf{8,16,32}`/`bs_skip_utf{8,16,32}` (`u8/u16/u16le/u32`, `sk8/sk16/sk32`). The head-pattern
+group is exercised on its success paths only; the `c_*` group wraps each pattern in a `case`, so
+its failure path reaches the engine's `case_end` handler and the malformed/short-input tests call
+that group.
+## `funs.beam` (`funs.erl`) — `tests/funs.rs`
+The fun/closure family: `make_fun3` (`test/0`, `capture/0`), `call_fun2` through a local
+higher-order function (`apply_twice/2`), and the dynamic `Mod:Fun(..)` forms whose `Mod`/`Fun` are
+not static atoms (`dynamic/4` as a call, `tail_dynamic/4` as `apply_last`). The closure bodies
+call `erlang:'+'/2`, which the test context serves through its BIF hook.
+## `records.beam` (`records.erl`) — `tests/records.rs`
+Every export compiles to `update_record` over `#r{a, b, c}` = `{r, A, B, C}`: `update_a/1` (the
+`reuse` hint, destination == source), `update_b/1`, `update_a_c/1`, `chain/1` and the
+already-updated `keep/1`. `non_record/1` drives the `{badrecord, V}` raise, and `badrecord_tag/0`
+keeps the `badrecord` atom in the module so that reason is nameable.
+## `stacktrace.beam` (`stacktrace.erl`) — `tests/exceptions.rs`
+The two `try … catch C:R:S` handler shapes the compiler emits, plus the raw-raise edge cases:
+`cap/1` (cooked: the handler runs `build_stacktrace`), `reraise/1` (the `catch C:R:S` clause whose
+body is `erlang:raise(C, R, S)`, folded into the `raw_raise` instruction), `badclass/1` (`raw_raise` with
+a literal class that is neither `error`/`exit`/`throw`, so `x(0)` becomes `badarg`), and
+`classify/1` (the plain `error:`-classed form, also interning the `error`/`case_clause` atoms the
+`case_end` raise needs).
+## `tailcall.beam` (`tailcall.erl`) — `tests/tailcall.rs` (also `tests/trace.rs`, `tests/engine_bench.rs`, `tests/jit_linking.rs`)
+`call_ext_last Arity Fun Deallocate` frame discipline: in C the callee runs with the current frame
+**intact** and the deallocation happens after it returns (`emu/ops.tab:964` expands it to
+`call_light_bif | deallocate_return`), so a raising BIF unwinds from the live frame with its own
+reason. `gap/1` is the shape where `trim` has already removed the frame a following
+never-returning `call_ext_last` names (the compiler's stale `Deallocate` operand is dead code);
+`tailrev/1`, `loop/2` and the `even/1`/`odd/1` pair are the ordinary tail-call shapes.
+## `stdlists_harness.beam` (`stdlists_harness.erl`) — `tests/stdlib_lists.rs`
+The first stdlib harness: each export is a thin wrapper around a **real system** `lists` function
+(`reverse/1`, `seq/2`, `sort/1`), and `map_double/1`/`filter_pos/1` hand an anonymous fun to
+`lists:map/2`/`lists:filter/2`, so `make_fun3` + `call_fun2` + cross-module fun resolution are
+exercised against the installed `lists.beam` rather than a mock.
+## `stdlib_more_harness.beam` (`stdlib_more_harness.erl`) — `tests/stdlib_more.rs`
+The second stdlib harness: `member/2` and `reverse/2` reach the `lists:member/2` /
+`lists:reverse/2` **NIFs** (whose `.beam` bodies are the `erlang:nif_error(undef)` stub, so only a
+caller's `call_ext` reaches them), and the rest pass an anonymous fun into real stdlib functions
+(`lists:partition/2`, `splitwith/2`, `sort/2`, `foldl/3`, `zipwith/3`, `orddict:map/2`/`filter/2`/
+`update/3`/`fold/3`, `queue:filter/2`/`all/2`), reaching fun-taking exports beyond `lists`.
+## `stdlib_text_harness.beam` (`stdlib_text_harness.erl`) — `tests/stdlib_text.rs`
+The text/encoding harness: the fun-taking exports of `lists` and `ordsets` that only a caller can
+enter (`lists:any/2`, `all/2`, `foldr/3`, `mapfoldl/3`, `search/2`, `zf/2`, `ordsets:filter/2`,
+`ordsets:fold/3`), each wired through `make_fun3` + `call_fun*` + cross-module fun resolution.

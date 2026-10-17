@@ -23,16 +23,18 @@
 //! The baseline tier ([`beam_engine::jit::baseline`]) lowers a module's basic blocks to
 //! native x86-64. That lowering is pure, so the cache ([`beam_engine::jit::cache`])
 //! compiles a module **once** and reuses the artifact for every later run of the same
-//! module — keyed on the sound module identity (a real `.beam`'s load-time MD5 digest;
-//! the IR content fingerprint only for a synthetic all-zero-checksum module), never on
-//! a pointer.
+//! module — keyed on the sound module identity: a real `.beam`'s **load-time MD5
+//! digest** (`Module::checksum`, a hand-built synthetic module falling back to the
+//! content fingerprint of its decoded IR) **plus** the module's atom-namespace snapshot,
+//! since the emitted code embeds atom *indices*. Never a pointer.
 //!
 //! This suite proves both halves of the contract against the committed `beam_loader` oracle
 //! fixture (`slice.beam`, produced by the system `erlc`):
 //!
-//! * the cache is actually **reused** — a second run of the same module does not recompile
-//!   (a real compile counter and the artifact's `code_address_range`), and two separately
-//!   loaded copies of the same content share one artifact;
+//! * the cache is actually **reused** — a second run of the same `Module` does not recompile
+//!   (a real compile counter and the artifact's `code_address_range`), while a re-loaded copy
+//!   of the same content is a **second** entry (its own atom namespace, so it compiles its own
+//!   artifact);
 //! * the results stay **interpreter-identical** — the cached native run equals the
 //!   reference interpreter's, on the same `MinimalContext` BIF hook `tests/slice.rs` uses;
 //! * the identity is **sound** — a module with the same name but different content gets a

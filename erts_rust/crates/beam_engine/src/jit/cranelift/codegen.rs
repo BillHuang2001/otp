@@ -565,8 +565,8 @@ fn emit_pc(
         // inline only for a run-time tuple (see [`shape::inline_get_tuple_element`] /
         // [`shape::inline_select_tuple_arity`]); every rejection — a non-tuple source, an
         // out-of-range element, a `NO_FAIL` arity switch — deopts to the helper, whose
-        // interpreter step is the family's exact semantics (including `{badmatch, V}`
-        // and the `select_tuple_arity: non-tuple` typed error).
+        // interpreter step is the family's exact semantics (including the
+        // `{badmatch, V}` raise both reads share).
         Some(Instr::SelectTupleArity {
             tuple,
             fail,

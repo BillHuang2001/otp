@@ -2,8 +2,14 @@
 
 ## Intent
 Black-box integration tests for the `beam_engine` crate: each `tests/<name>.rs` compiles as its
-own crate and drives the engine through its **public** API. The loader appears only through
-committed `.beam` fixtures, and `src/**` is never touched from here.
+own crate and drives the engine through its **public** API. Hand-authored cases load committed
+`.beam` fixtures from `fixtures/`, while the whole-corpus suites load **real installed OTP**
+modules discovered generically at run time (`support/discovery.rs::all_otp_beams`/`all_otp_ebins`:
+`otp_lib_root()` -> one entry per application directory whose `ebin` holds at least one `.beam`,
+no application name hardcoded) in `stdlib_sweep.rs`, `census.rs`, `jit_real_module.rs`,
+`jit_cranelift_real.rs` and `apps_lists.rs` — such a suite SKIPS LOUDLY when `erl` or the OTP
+install is absent (a green run without `erl` proves nothing about corpus parity). `src/**` is
+never touched from here.
 
 ## API Surface (what a test crate may rely on)
 - `beam_engine::{Machine, MinimalContext, ExecutionContext, RootSet, RunOutcome, Step, Tier,
@@ -19,7 +25,13 @@ committed `.beam` fixtures, and `src/**` is never touched from here.
 - Failures are typed `beam_common::BeamError` values; never `unwrap()` engine runtime data;
   a harness-only invariant may panic with a message.
 - Every `.rs` carries the OTP Apache-2.0 `// %CopyrightBegin% … // %CopyrightEnd%` header block;
-  files target ~1000 lines.
+  files target ~1000 lines. Sixteen suites are above that target, each one cohesive harness rather
+  than a mix of subjects (splitting any of them is a parity-neutral refactor): `jit_cranelift.rs`
+  (4118), `opcodes.rs` (2761), `jit.rs` (2688), `exceptions.rs` (1523), `engine_bench.rs` (1482),
+  `jit_cranelift_real.rs` (1423), `call_ext_apply.rs` (1333), `jit_compare.rs` (1319), `census.rs`
+  (1219), `bitstrings_extra_big.rs` (1204), `records.rs` (1191), `raise_rooting.rs` (1098),
+  `trace.rs` (1079), `stdlib_text.rs` (1016), `jit_linking.rs` (1009), `stdlib_exports_more.rs`
+  (1002). `raise_rooting.rs`'s cohesion is spelled out in the routing table below.
 - Always the wrapper, never a bare `cargo`, never `cd`:
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine [--test <name>]`.
 

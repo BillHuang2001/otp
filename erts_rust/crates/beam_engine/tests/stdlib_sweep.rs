@@ -253,17 +253,19 @@ fn sweep_loads_every_installed_beam() {
     );
 
     // A broad sweep of the *whole* installed OTP must cover a large number of
-    // modules. The floor is well below the real count (≈1366 modules over ≈35
-    // apps here) so an OTP point release adding/removing a few modules does not
-    // break it, but a broken walk (or a missing application) does.
+    // modules. The floor is well below the real count (≈1366 modules over ≈34
+    // apps here: 35 application directories, of which one — `erl_interface` — has
+    // an empty `ebin` and is skipped by `all_otp_ebins`) so an OTP point release
+    // adding/removing a few modules does not break it, but a broken walk (or a
+    // missing application) does.
     assert!(
         total >= 1000,
         "the sweep only found {total} `.beam` files — expected the whole installed \
-         OTP (≈1366 over ≈35 applications)"
+         OTP (≈1366 over ≈34 applications)"
     );
     assert!(
         apps.len() >= 20,
-        "the sweep only covered {} applications — expected the whole installed OTP (≈35)",
+        "the sweep only covered {} applications — expected the whole installed OTP (≈34)",
         apps.len()
     );
     assert_eq!(

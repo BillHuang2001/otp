@@ -169,8 +169,11 @@ pub(super) fn emit_inline_select_val(
 // `select_tuple_arity` switches on the arity. The interpreter's family
 // (`crate::families::tuples`) is the *safety net*: it does `terms::tuple_arity`
 // (an `is_boxed` test, then `is_arity_value(header)`, then `header >> 6`) and only
-// then reads, raising `{badmatch, Source}` (or, for `select_tuple_arity`, the typed
-// `select_tuple_arity: non-tuple` error) otherwise.
+// then reads, raising `{badmatch, Source}` (built by
+// `terms::badmatch_reason_rooted`) when the source is not a tuple or the element is
+// out of range. `select_tuple_arity` treats a non-tuple exactly like an arity that
+// matches no alternative — it jumps to the instruction's `fail` label — and only a
+// `NO_FAIL` switch raises `{badmatch, Source}` on that path.
 //
 // The native path reproduces exactly that: a run-time guard accepts only a tuple
 // whose arity satisfies the read, and every rejection — a non-tuple, a too-short
@@ -365,9 +368,9 @@ pub(super) fn inline_select_tuple_arity(
 
 /// Emit the inlined `select_tuple_arity`: guard the source as a tuple, then one
 /// arity compare per alternative — each match branching to its resolved target — and,
-/// when none match, the resolved fail target; a rejected source (a non-tuple)
-/// deopts to the helper, whose `select_tuple_arity: non-tuple` typed error is the
-/// interpreter's exact outcome.
+/// when none match, the resolved fail target; a rejected source (a non-tuple) deopts to
+/// the helper, whose interpreter step is the family's exact semantics (the `fail`
+/// jump).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_inline_select_tuple_arity(
     builder: &mut FunctionBuilder,

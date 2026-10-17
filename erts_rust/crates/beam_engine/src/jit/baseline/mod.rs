@@ -442,10 +442,9 @@ pub(crate) fn run_compiled_label_outcome(
 ///
 /// Unlike [`run_native_outcome`] it **does not** call [`enter_machine`] (which
 /// resets): a resume must preserve the suspended process. It does zero the reduction
-/// counter at the slice start, exactly as
-/// [`Machine::drive`](crate::Machine) does for the interpreter entry, so the resumed
-/// slice's [`Machine::reductions`](crate::Machine::reductions) matches the
-/// interpreter's.
+/// counter at the slice start, which is redundant over
+/// [`Machine::drive`](crate::Machine) — that already zeroes it once per slice, for
+/// the interpreter entry too — and is kept as belt-and-braces.
 ///
 /// `module` is the run's **entry** module (context `0`). A process suspended
 /// **inside a cross-module callee** (a non-zero module context) is served the same
