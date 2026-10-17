@@ -63,10 +63,11 @@
 //!
 //! Nothing here fabricates a reply or papers a difference over: a row that disagrees with the
 //! oracle fails on the session string (with the oracle's live output in the failure message). The
-//! `[binary]` stream's *term shape* — the one measured divergence this suite found — is pinned per
-//! reply kind by its own test, which also pins the runtime's **builder** reproducing every shape and
-//! names the residual **producer** gap loudly
-//! ([`a_binary_stream_port_renders_the_oracles_shapes_but_the_producer_still_flattens_them`]).
+//! `[binary]` stream's *term shape* is pinned per reply kind by its own test, which also pins the
+//! runtime's **builder** reproducing every shape and the runtime's **end-to-end** delivery of the
+//! header lists; the one thing it cannot reach — a `DATA` reply's binary tail, which `beam_io`
+//! folds away producer-side — is named loudly there and pinned by
+//! [`super::driver_output_shape_tests`].
 use super::tests::{
     counter, data_payload_bytes, erl_bytes, fixture, skip_oracle_check, text_of, Fixture,
 };
@@ -99,7 +100,7 @@ enum Stream {
     List,
     /// The `binary` option: the reply's *bytes* are the same, its *term shape* follows the driver
     /// output call that carried them — see
-    /// [`a_binary_stream_port_renders_the_oracles_shapes_but_the_producer_still_flattens_them`].
+    /// [`a_binary_stream_port_delivers_the_oracles_header_lists`].
     Binary,
 }
 
@@ -836,17 +837,23 @@ fn closing_a_ram_file_port_refuses_later_commands_like_the_oracle() {
 /// received, shaped by the driver call that produced them, and rendered by the registered `~w`
 /// printer (the oracle's own control).
 ///
-/// # The producer is still `beam_io`, and it still flattens the split
+/// # End to end: the header lists, and the one residual
 ///
-/// The builder renders every shape; the **producer** does not yet carry the split: `beam_io`'s
-/// stream layer folds `driver_output2`'s header and data into one `Vec<u8>`
-/// ([`beam_io::DriverContext::input`]), so the port layer is handed bytes without the split and
-/// reports [`StreamShape::Data`] — and end to end this runtime still delivers a binary-stream reply
-/// as one binary where the oracle delivers a list of the header plus (for `DATA`) a binary tail. The
-/// `reply_is_binary` assertion below is that residual, kept loud: closing it is a `beam_io` change
-/// (this node's `CONTEXT.md`, *Handoffs*), not something this test may paper over.
+/// A **built-in driver port** reports [`StreamShape::DriverOutput`] when it folds the driver's output
+/// (the `beam_io` seam carries no header/data split), and that shape renders the bytes as list
+/// elements on **either** stream — the C's header rendering — so a `[binary]` port's header-only
+/// replies (`OK`/`NUMBER`/`ERROR`) arrive as the oracle's proper lists. Every row is therefore
+/// asserted **non-binary** below.
+///
+/// The one row no delivery path can render as the oracle does is `DATA`: the oracle's
+/// `driver_output_binary` renders `[2,0,0,0,2|<<97,98>>]`, and `beam_io`'s stream layer folds that
+/// header/body split away producer-side ([`beam_io::DriverContext::input`] is a flat queue), so this
+/// runtime delivers the same bytes as a proper list — bytes and both `port_info` counters exact, the
+/// term shape the documented residual. [`super::driver_output_shape_tests`] pins the end-to-end matrix
+/// and names that residual loudly; closing it is a `beam_io` change (this node's `CONTEXT.md`,
+/// *Handoffs*), not something this test may paper over.
 #[test]
-fn a_binary_stream_port_renders_the_oracles_shapes_but_the_producer_still_flattens_them() {
+fn a_binary_stream_port_delivers_the_oracles_header_lists() {
     let mut session = Matrix::new(Stream::Binary);
     session.run(BINARY_SESSION);
     session.finish();
@@ -859,11 +866,16 @@ fn a_binary_stream_port_renders_the_oracles_shapes_but_the_producer_still_flatte
         vec![2, 0, 0, 0, 1, 97],
         "GET after the truncate to 1 byte"
     );
-    assert!(
-        session.reply_is_binary("read_data"),
-        "the end-to-end residual: `beam_io` flattened the header/data split, so this runtime still \
-         delivers one binary where the oracle delivers `[2,0,0,0,2|<<97,98>>]`"
-    );
+    // … and on a `[binary]` port every row is a **list**, not a binary: a built-in driver port
+    // reports `StreamShape::DriverOutput`, which renders the driver's bytes as list elements on
+    // either stream (the C's header rendering).
+    for row in BINARY_SESSION {
+        assert!(
+            !session.reply_is_binary(row.name),
+            "row {:?}: a `[binary]` built-in-driver port must deliver list elements, not one binary",
+            row.name
+        );
+    }
     // … and the counters count the same bytes the oracle counts.
     assert_eq!(session.input, 5 + 7 + 5 + 5 + 1 + 6);
     assert_eq!(session.output, 8 + 5 + 1 + 9 + 1 + 1);
@@ -962,16 +974,4 @@ fn a_binary_stream_port_renders_the_oracles_shapes_but_the_producer_still_flatte
         "the default `list` stream is a proper list of the header and the data"
     );
 
-    if session.reply_is_binary("read_data") {
-        println!("================================================================");
-        println!(
-            "RESIDUAL (reported, not papered over): the `[binary]` stream's term shape, end to end."
-        );
-        println!("  oracle: {{read_data,[2,0,0,0,2|<<97,98>>]}} — header list ++ a binary tail");
-        println!(
-            "  this runtime: {{read_data,<<2,0,0,0,2,97,98>>}} — the same bytes, one binary: the \
-             builder renders the split, `beam_io`'s stream layer does not produce it yet"
-        );
-        println!("================================================================");
-    }
 }
