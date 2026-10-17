@@ -216,6 +216,7 @@ use crate::error;
 use crate::poller::{Interest, Token};
 
 mod frame;
+mod opcode;
 mod opt;
 pub mod packet;
 mod sys;
@@ -253,6 +254,11 @@ use self::opt::{get_options, set_options, SocketOptions};
 // The read-path framing glue (the bridge from the stored socket options to the pure decoder in
 // `packet`) lives in the private `frame` submodule.
 use self::packet::PacketType;
+
+// The numeric control-opcode bridge: `erlang:port_control/3` sends the C's `INET_REQ_*` number
+// (`Op + ERTS_INET_DRV_CONTROL_MAGIC_NUMBER`) as a decimal command string, so a numeric command is
+// decoded here into the same verbs the named ones reach.
+use self::opcode::{decode as decode_opcode, Opcode};
 
 // The raw `libc` socket wrappers (`socket`/`accept`/`bind`/`listen`/`getsockopt`/`shutdown`/
 // `close`) live in the private `sys` submodule, so every `unsafe` block of the driver sits in
@@ -297,6 +303,33 @@ impl InetState {
     /// Whether the socket is listening ([`InetState::Listening`]).
     pub fn is_listening(self) -> bool {
         self == InetState::Listening
+    }
+
+    /// The C's `INET_STATE_*` bit set for this state, as the `INET_REQ_GETSTATUS` reply carries it
+    /// (`inet_drv.c:1026`-`:1031`).
+    ///
+    /// The C's descriptor holds a bit mask — `INET_STATE_CLOSED = 0`, `INET_STATE_OPEN = 1`,
+    /// `INET_F_ACTIVE = 4` (connected), `INET_F_LISTEN = 8`, `INET_F_CON = 16` (connecting) — so a
+    /// connected socket is `1|4 = 5`, a listener `1|8 = 9` and a connect in progress `1|16 = 17`.
+    /// Measured against the oracle: a bare port reports `0`, a TCP socket after `open`+`listen`
+    /// reports `9`, a connected TCP socket reports `5`, and a UDP socket after `open`+`bind`
+    /// reports `1`.
+    pub(super) fn state_code(self) -> u32 {
+        /// `INET_STATE_OPEN` (`inet_drv.c:1027`).
+        const OPEN: u32 = 1;
+        /// `INET_F_ACTIVE` (`inet_drv.c:1029`).
+        const ACTIVE: u32 = 4;
+        /// `INET_F_LISTEN` (`inet_drv.c:1030`).
+        const LISTEN: u32 = 8;
+        /// `INET_F_CON` (`inet_drv.c:1031`).
+        const CONNECTING: u32 = 16;
+        match self {
+            InetState::Closed => 0,
+            InetState::Open => OPEN,
+            InetState::Connected => OPEN | ACTIVE,
+            InetState::Listening => OPEN | LISTEN,
+            InetState::Connecting => OPEN | CONNECTING,
+        }
     }
 }
 
@@ -730,8 +763,10 @@ impl TcpInetDriver {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::BadArg` when the socket is not connected, or
-    /// `BeamError::Io` when the write fails irrecoverably.
+    /// Returns `BeamError::BadArg` when the socket is not connected — the C's `tcp_inet_command`
+    /// fails the port on a socket it cannot write (`inet_drv.c:12629`); the queued bytes are
+    /// **not** consumed on that path, so the refusal is visible to the caller rather than silently
+    /// dropping data — or `BeamError::Io` when the write fails irrecoverably.
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if self.peer_close.seen {
             // The peer is gone: the queued output was dropped when the close was latched and
@@ -1244,6 +1279,105 @@ impl TcpInetDriver {
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
         get_options(&self.options, self.stream, self.socket, arg)
     }
+
+    /// Routes one decoded numeric control opcode (`inet_drv.c`'s `INET_REQ_*` numbers) to the verb
+    /// or the shared-`inet_ctl` reply that serves it.
+    ///
+    /// This is the TCP half of the bridge documented in [`self::opcode`]: `tcp_inet_ctl`
+    /// (`:11953`) owns the socket lifecycle and the stream-only requests, delegates the rest to
+    /// `inet_ctl` (`:10988`), and any number **neither** switch has a case for reaches
+    /// `inet_ctl`'s `default:` arm — `ctl_xerror(EXBADPORT)` ⇒ `[0]exbadport` (`:11551`). That is
+    /// also what a wrapped command (an `Op` below the magic number) answers, so `1` is
+    /// **not** `open`.
+    ///
+    /// # Errors
+    ///
+    /// A typed "not served" reason for an opcode the C's switches do serve but this floor does
+    /// not implement (never a fabricated reply), plus the [`verb_open`](Self::verb_open) family's
+    /// own argument faults (`BeamError::BadArg` for a malformed operand).
+    fn control_opcode(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        op: Opcode,
+        arg: &[u8],
+    ) -> Result<Vec<u8>> {
+        match op {
+            // The verbs whose operand is already exactly the C's request payload.
+            Opcode::Open => self.verb_open(ctx, arg),
+            Opcode::Close => self.verb_close(ctx),
+            Opcode::Bind => self.verb_bind(arg),
+            Opcode::Setopts => self.verb_setopts(arg),
+            Opcode::Getopts => self.verb_getopts(arg),
+            Opcode::Listen => self.verb_listen(arg),
+            // `INET_REQ_CONNECT` carries `Timeout(4), Port(2), Address(N)` and the C rejects a
+            // shorter payload with `ctl_error(EINVAL)` (`:12085`); the six leading bytes are the
+            // async-connect timeout and the reply port, neither of which this synchronous floor
+            // uses, so only the address is forwarded. The verb's own state checks reproduce the
+            // C's `!IS_OPEN ⇒ exbadport`, `IS_CONNECTED ⇒ eisconn`, `IS_CONNECTING ⇒ einval`.
+            Opcode::Connect => {
+                if arg.len() < 6 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                self.verb_connect(ctx, &arg[6..])
+            }
+            // `INET_REQ_ACCEPT` carries a bare `Timeout(4)`; the C requires exactly that much and
+            // rejects anything else with `ctl_error(EINVAL)` (`:12155`). Measured: `<<>>` on a
+            // listening socket ⇒ `[0]einval`.
+            Opcode::Accept => {
+                if arg.len() != 4 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                self.verb_accept(ctx)
+            }
+            // `TCP_REQ_RECV` carries `Timeout(4), Length(4)` (`:12284`). The timeout/length pair
+            // selects the C's **asynchronous** receive; this floor's `recv` is the synchronous
+            // read-now substitution the named verb documents, so the operand is validated and
+            // then ignored.
+            Opcode::TcpRecv => {
+                if arg.len() != 8 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                self.verb_recv(ctx, &[])
+            }
+            // `TCP_REQ_SHUTDOWN` carries the one-byte `TCP_SHUT_*` "how" (`:12339`); the verb
+            // answers the C's `enotconn` when the socket is not connected (`:12347`).
+            Opcode::TcpShutdown => {
+                if arg.len() != 1 {
+                    return Ok(ctl_xerror("einval"));
+                }
+                self.verb_shutdown(ctx, arg)
+            }
+            // The shared-`inet_ctl` replies both drivers build identically.
+            Opcode::Peer => wire::peer_reply(self.socket, self.state.is_connected()),
+            Opcode::Name => wire::name_reply(self.socket),
+            Opcode::Gettype => wire::gettype_reply(self.socket, true),
+            Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
+            Opcode::Getstatus => Ok(wire::getstatus_reply(self.state.state_code())),
+            Opcode::Getstat => wire::getstat_reply(arg),
+            // The C's switches DO serve these, but this floor does not: a typed gap, never a
+            // fabricated reply.
+            Opcode::Gethostname
+            | Opcode::Fdopen
+            | Opcode::Getservbyname
+            | Opcode::Getservbyport
+            | Opcode::Setname
+            | Opcode::Setpeer
+            | Opcode::Getiflist
+            | Opcode::Ifget
+            | Opcode::Ifset
+            | Opcode::Subscribe
+            | Opcode::Getifaddrs
+            | Opcode::Ignorefd
+            | Opcode::Getladdrs
+            | Opcode::Getpaddrs
+            | Opcode::TcpUnrecv
+            | Opcode::TcpSendfile => Err(op.not_served()),
+            // `PACKET_REQ_RECV` is a case of `packet_inet_ctl` only, so on a TCP port it is a case
+            // of neither `tcp_inet_ctl` nor `inet_ctl`: the C answers `[0]exbadport` (measured),
+            // exactly like a wrapped or unassigned number.
+            Opcode::PacketRecv | Opcode::Unknown => Ok(ctl_xerror("exbadport")),
+        }
+    }
 }
 
 impl Default for TcpInetDriver {
@@ -1293,6 +1427,13 @@ impl Driver for TcpInetDriver {
         command: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
+        // The Erlang side speaks the C's numeric `INET_REQ_*` opcodes
+        // (`erlang:port_control/3`), so a decimal command is decoded and routed to the same verbs
+        // the named forms reach — before the name match, which a numeric command must never fall
+        // into. A non-decimal command is `None` here and takes the named path unchanged.
+        if let Some(op) = decode_opcode(command) {
+            return self.control_opcode(ctx, op, arg);
+        }
         match command {
             "open" => self.verb_open(ctx, arg),
             "bind" => self.verb_bind(arg),
