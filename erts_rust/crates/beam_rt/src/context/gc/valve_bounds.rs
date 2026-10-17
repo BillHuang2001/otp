@@ -471,8 +471,16 @@ fn the_aggregate_span_is_reported_for_both_collector_kinds() {
         );
         report_span(kind, "grown", process);
         let grown_bounds = process.collector().scanned_bounds();
+        // The retired space is covered by the aggregate **and** by no mutator block, which is
+        // the whole point: it is the half of the aggregate the block test cannot answer.
+        assert!(
+            !in_heap_block(process.heap(), beam_term::list::ptr_val(term) as usize),
+            "{kind:?}: the retired term must be outside the mutator block for the case to mean \
+             anything"
+        );
 
         // Collect: the chain collapses and the live root is promoted into the mature space.
+        let mut table = table;
         {
             let process = table.get_mut(pid).expect("the process");
             process
@@ -507,22 +515,20 @@ fn the_aggregate_span_is_reported_for_both_collector_kinds() {
                 "{kind:?}: the geometry epoch is monotone ({label})"
             );
         }
+        // The superset property at the two geometries that matter: a term the growth retired
+        // (covered by the grown aggregate, and by no mutator block) and the term the collection
+        // promoted (covered by the post-collection one). Neither width is asserted — the
+        // absolute span is an allocator-geometry fact (the two halves can land megabytes apart,
+        // and a collection may install a smaller nursery elsewhere), which is exactly why the
+        // filter is a reject and not a containment claim.
         assert!(
-            grown_bounds.span_words() > fresh_bounds.span_words(),
-            "{kind:?}: a retained nursery space must widen the aggregate ({} vs {})",
-            grown_bounds.span_words(),
-            fresh_bounds.span_words()
-        );
-
-        // Every address the exact tests accept is inside the aggregate.
+            grown_bounds.may_contain(beam_term::list::ptr_val(term) as usize),
+            "{kind:?}: the grown aggregate must cover the retired-space term"
+        );        // Every address the exact tests accept is inside the aggregate.
         for (what, addr) in [
-            ("the pre-growth term", beam_term::list::ptr_val(term) as usize),
+            ("the mutator block", process.heap().hp() as usize),
             (
-                "the mutator block",
-                process.heap().hp() as usize,
-            ),
-            (
-                "the mature term",
+                "the relocated root",
                 beam_term::list::ptr_val(
                     process.registers().x().get(0).expect("x(0) reads back"),
                 ) as usize,
