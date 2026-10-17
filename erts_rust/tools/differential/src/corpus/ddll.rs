@@ -23,14 +23,15 @@
 //! `erl_ddll` is the OTP-application face of the emulator's dynamic driver loader
 //! (`load/2`, `try_load/3`, `unload/1`, `try_unload/2`, `loaded_drivers/0`, `info/2`). What a
 //! program can depend on — and what this group pins — is each call's **result shape** and its
-//! **error reasons**, never the *contents* of the loaded-driver list: those are
-//! installation-dependent (the oracle's statically linked `tcp_inet`, `udp_inet` and
-//! `ram_file_drv` versus the Rust runtime's empty list), so only order-stable projections of the
-//! list are asserted.
+//! **error reasons**. The loaded-driver *set* is pinnable too: both runtimes statically link the
+//! same three built-in drivers (`tcp_inet`, `udp_inet`, `ram_file_drv`), so `loaded_drivers/0`
+//! lists exactly them on both sides. Only the table *order* is an internal detail, so the member
+//! list is pinned as its `lists:sort/1` projection — a missing or extra driver is still caught,
+//! while a registry reshuffle is not a spurious mismatch.
 //!
 //! * `loaded_drivers/0` — pinned as `{ok, List}` with `List` a list of strings, via the tuple
-//!   shape, `is_list/1`, an all-strings fold and a filtered projection that is empty on both
-//!   runtimes. The list's members are deliberately **not** pinned.
+//!   shape, `is_list/1`, an all-strings fold, a filtered projection that is empty on both
+//!   runtimes, and the sorted member list `["ram_file_drv","tcp_inet","udp_inet"]`.
 //! * `try_load/3` — a missing object, a missing directory and a non-string name all answer
 //!   `{error,{open_error,-10}}` on both runtimes; an unknown option and a non-string directory
 //!   are `error:badarg`.
@@ -39,10 +40,10 @@
 //! * `info/2` — every probed form (a statically linked driver, an unknown name, an unknown key,
 //!   a non-string name) raises `error:badarg` on both runtimes.
 //!
-//! Two shapes **diverge** between the two runtimes and are therefore deliberately absent:
-//! `try_load(".", "tcp_inet", [])` and `try_unload("tcp_inet", [])` answer
-//! `{error,linked_in_driver}` on the oracle but the generic missing-object answer on the Rust
-//! runtime. They are recorded in `divergences.md`.
+//! The linked-in-driver shapes — `try_load(".", "tcp_inet", [])` and
+//! `try_unload("tcp_inet", [])`, both `{error,linked_in_driver}` — now agree on both runtimes;
+//! they stay outside this group's fixed case set, and `info/2` is the only row here that names a
+//! built-in driver.
 //!
 //! Every case is an [`CaseKind::Eval`] under the default `Probe::TermToBinary`, so its golden is
 //! the oracle's exact stdout line plus exit code.
@@ -119,6 +120,20 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok <<131,106>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ddll/loaded_drivers_lists_the_three_static_builtins",
+            description: "erl_ddll:loaded_drivers/0 lists exactly the three statically linked built-in drivers (pinned as a sorted projection, so the table order stays an internal detail)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:sort(element(2, erl_ddll:loaded_drivers()))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,108,0,0,0,3,107,0,12,114,97,109,95,102,105,108,101,95,100,114,118,107,0,8,116,99,112,95,105,110,101,116,107,0,8,117,100,112,95,105,110,101,116,106>>"),
                 exit_code: 0,
             },
         },
@@ -347,7 +362,7 @@ mod tests {
     #[test]
     fn the_group_pins_the_loaded_drivers_try_load_try_unload_and_info_surface() {
         let cases = group();
-        assert_eq!(cases.len(), 20, "the A.7 erl_ddll group has twenty cases");
+        assert_eq!(cases.len(), 21, "the A.7 erl_ddll group has twenty-one cases");
         assert_eq!(
             cases.iter().map(|case| case.id).collect::<Vec<_>>(),
             [
@@ -356,6 +371,7 @@ mod tests {
                 "ddll/loaded_drivers_second_element_is_a_list",
                 "ddll/loaded_driver_names_are_strings",
                 "ddll/loaded_drivers_projection_matches_no_unknown_driver",
+                "ddll/loaded_drivers_lists_the_three_static_builtins",
                 "ddll/try_load_missing_object_at_cwd",
                 "ddll/try_load_missing_directory",
                 "ddll/try_load_non_string_name",
@@ -392,11 +408,12 @@ mod tests {
     }
 
     #[test]
-    fn the_loaded_drivers_cases_pin_a_shape_not_the_installation_driver_list() {
-        // The loaded-driver *list* is installation-dependent (the oracle's built-in
-        // tcp_inet/udp_inet/ram_file_drv versus the runtime's empty list), so every
-        // loaded_drivers case reduces the result to an order-stable shape. These five
-        // goldens are exactly the encodings of `ok`, `2`, `true`, `true` and `[]`.
+    fn the_loaded_drivers_cases_pin_the_shape_and_the_static_builtin_set() {
+        // Both runtimes statically link the same three built-in drivers, so the *set* of loaded
+        // drivers is a pinnable observable; only the table *order* is an internal detail, which
+        // is why the member case pins `lists:sort/1`. These six goldens are exactly the
+        // encodings of `ok`, `2`, `true`, `true`, `[]`, and the sorted
+        // ["ram_file_drv","tcp_inet","udp_inet"].
         for (id, stdout) in [
             ("ddll/loaded_drivers_answers_ok", "ok <<131,119,2,111,107>>"),
             (
@@ -415,23 +432,25 @@ mod tests {
                 "ddll/loaded_drivers_projection_matches_no_unknown_driver",
                 "ok <<131,106>>",
             ),
+            (
+                "ddll/loaded_drivers_lists_the_three_static_builtins",
+                "ok <<131,108,0,0,0,3,107,0,12,114,97,109,95,102,105,108,101,95,100,114,118,107,0,8,116,99,112,95,105,110,101,116,107,0,8,117,100,112,95,105,110,101,116,106>>",
+            ),
         ] {
             let case = group().into_iter().find(|c| c.id == id).expect("registered");
             assert_eq!(case.golden.stdout, Some(stdout), "{id}");
             assert_eq!(case.golden.exit_code, 0, "{id}");
         }
-        // No installation driver name may leak into any golden.
-        for case in group() {
-            if let Some(golden) = case.golden.stdout {
-                for name in ["tcp_inet", "udp_inet", "ram_file_drv"] {
-                    assert!(
-                        !golden.contains(name),
-                        "case {}: the installation driver name {name:?} leaked into the golden",
-                        case.id
-                    );
-                }
-            }
-        }
+        // Exactly one case pins the member *set*, and it does so order-insensitively.
+        let members: Vec<&str> = group()
+            .iter()
+            .filter(|case| case.expr().is_some_and(|expr| expr.contains("lists:sort")))
+            .map(|case| case.id)
+            .collect();
+        assert_eq!(
+            members,
+            ["ddll/loaded_drivers_lists_the_three_static_builtins"]
+        );
     }
 
     #[test]
@@ -477,13 +496,15 @@ mod tests {
             if case.golden.stdout == Some("exception error badarg") {
                 assert_eq!(case.golden.exit_code, 1, "{}", case.id);
             }
-            // The diverging `linked_in_driver` shapes (a built-in driver through try_load /
-            // try_unload) must stay unpinned — only `info/2` may name a built-in driver.
+            // The `linked_in_driver` shapes (a built-in driver through try_load/try_unload)
+            // agree on both runtimes today but stay outside this group's fixed case set, so no
+            // row may pin them here; `info/2` is the only row that names a built-in driver, and
+            // it pins that call's `badarg` refusal.
             let expr = case.expr().expect("eval case");
             assert!(
                 !(expr.contains("try_load") && expr.contains("tcp_inet"))
                     && !(expr.contains("try_unload") && expr.contains("tcp_inet")),
-                "case {}: the diverging linked_in_driver shape must not be pinned",
+                "case {}: the linked_in_driver shape must not be pinned",
                 case.id
             );
         }

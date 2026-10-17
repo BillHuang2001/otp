@@ -17,14 +17,16 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Contract **A.4** — the `udp_inet` built-in driver's observable port surface.
+//! Contract **A.4** — the `udp_inet` built-in driver's observable port surface, and the control
+//! vocabulary `prim_inet` drives over it.
 //!
 //! `beam_rt`'s built-in driver registry serves `udp_inet`
 //! (`../../crates/beam_io/src/drivers/inet/udp.rs`), so `open_port({spawn_driver,
 //! "udp_inet"}, Opts)` must resolve the name to a **real emulator port** exactly as the
-//! oracle's statically linked `udp_inet_driver_entry` (`inet_drv.c:1406`) does. What this group
-//! pins is the port surface that resolution produces, driven only through the documented
-//! `erlang` port BIFs — the program comes from the CLI (contract A.6), the port itself is A.4:
+//! oracle's statically linked `udp_inet_driver_entry` (`inet_drv.c:1406`) does — and
+//! `erlang:port_control/3` must reach that driver's own verbs. What this group pins is both
+//! halves of that surface, driven only through the documented `erlang` port BIFs — the program
+//! comes from the CLI (contract A.6), the port and its driver are A.4:
 //!
 //! * **name resolution** — a live port whose `port_info(P, name)` is `{name, "udp_inet"}` in
 //!   both the `[binary]` and the default (list) stream mode, and with a `{packet, N}` option in
@@ -36,71 +38,88 @@
 //!   port answers: `name`, `connected` (the owning process), `os_pid` (`undefined`: a
 //!   `{spawn_driver, _}` port has no OS process), `registered_name` (`[]` while unregistered),
 //!   `links` (one link, to the owner), `input`/`output` (both zero) and `id` (a non-negative
-//!   local integer);
+//!   local integer) — plus the two accounting items the port floor now serves as well:
+//!   `queue_size` (`{queue_size, 0}` on a fresh port) and `memory` (a positive word count,
+//!   which is implementation-specific and therefore pinned as a **shape**, never a figure);
 //! * **the close lifecycle** — `port_close/1` answers `true`, the port leaves `ports/0`, the
-//!   `port_info` view becomes `undefined` (both `port_info/1` and every item), a second close is
-//!   `error:badarg`, and the term is still a port (`is_port/1`), just not a pid;
+//!   `port_info` view becomes `undefined` (both `port_info/1` and every item), a second close and
+//!   a `port_command/2` on the closed port are `error:badarg`, and the term is still a port
+//!   (`is_port/1`), just not a pid;
 //! * **port-term identity** — `list_to_port(port_to_list(P))` is `P`;
 //! * **one name per driver** — opening `"udp_inet"` and `"tcp_inet"` in the same run reports
 //!   `udp_inet` and `tcp_inet` respectively (a name is never aliased or shared);
 //! * **the emulator accounting** — `erlang:system_info(port_count)` grows by exactly one while
-//!   the port is open and is back where it started after the close.
+//!   the port is open and is back where it started after the close;
+//! * **the control verbs** — `erlang:port_control/3` with the **decimal** control code the
+//!   Erlang side sends (`INET_REQ_* + ERTS_INET_DRV_CONTROL_MAGIC_NUMBER`, i.e. `Op +
+//!   16#03f1a300`, `prim_inet.erl`) reaches the driver's `case`: `INET_REQ_OPEN` (1) answers the
+//!   `[1]` status list, `INET_REQ_BIND` (6) the `[1, port_hi, port_lo]` the kernel assigned,
+//!   `INET_REQ_NAME` (5) the packed local address, `INET_REQ_CLOSE` (2) `[1]` (and the *port*
+//!   survives that verb, so the later `port_close/1` still answers `true`), `INET_REQ_GETTYPE`
+//!   (15) / `INET_REQ_GETSTATUS` (16) the cached socket kind and the lifecycle state;
+//! * **the option store over the wire** — `INET_REQ_SETOPTS` (7) / `INET_REQ_GETOPTS` (8) with
+//!   the driver's own `[opt, val_be32]*` records: the `active`(22)/`packet`(23)/
+//!   `packet_size`(32)/`mode`(24)/`deliver`(25)/`read_packets`(33) defaults, a multi-record
+//!   `setopts` read back in request order, the `{active, N}` multi form's **accumulating**
+//!   16-bit counter, and the whole-reply `[0] ++ "einval"` refusal of an unserved code;
+//! * **the verb refusals** — an unknown verb (a code inside the magic range that no `case`
+//!   matches, the retired request `9`, a raw value *below* the magic, and an out-of-range code)
+//!   answers the C's `[0] ++ "exbadport"` reply, identically for every one of them.
 //!
-//! # Determinism (no socket, no clock, no pid is pinned)
+//! # Determinism (no socket traffic, no clock, no pid is pinned)
 //!
 //! `open_port/2` on a `{spawn_driver, Name}` port only builds the driver's descriptor: the
 //! oracle's C creates the socket in `INET_REQ_OPEN` (`packet_inet_ctl`, `inet_drv.c:14577`) and
-//! this floor's does the same in its `open` verb, so **no case here opens or binds a socket** —
-//! there is nothing to race and no network (not even loopback) is touched. Every case closes the
-//! ports it opened, so no case leaks a port into the next one. Nothing volatile is asserted: the
-//! port term itself, the `port_info(P, id)` index, the owning pid and the `ports/0` length are
-//! all specific to one VM, so they are compared **relative** to `self()`/before-open (`=:=
-//! self()`, `length(Links)`, `During - Before`) or only by their class (`is_integer/1`,
-//! `is_port/1`) — never by value. Every expression terminates on its own with no `receive`, so
-//! there is no `after` guard to need (and none is missing).
+//! this floor's does the same in its `open` verb. One row goes one step further and **binds** a
+//! datagram socket to loopback (`INET_REQ_BIND` with the `INET_AF_LOOPBACK` short form, the only
+//! way to reach the address verbs) — but **nothing is ever sent**, no listener is created and no
+//! inbound datagram is awaited, so there is no loopback traffic to race. The ephemeral port the
+//! kernel assigns is never pinned: the bind/name row reduces it to `> 0` and keeps only the
+//! loopback octets, which come from the argument itself. Every case closes the ports it opened,
+//! so no case leaks a port into the next one. Nothing volatile is asserted: the port term
+//! itself, the `port_info(P, id)` index, the owning pid and the `ports/0` length are all
+//! specific to one VM, so they are compared **relative** to `self()`/before-open (`=:= self()`,
+//! `length(Links)`, `During - Before`) or only by their class (`is_integer/1`, `is_port/1`) —
+//! never by value. Every expression terminates on its own with no `receive`, so there is no
+//! `after` guard to need (and none is missing).
 //!
-//! # Why the datagram half is deliberately absent (measured, never allowlisted)
+//! # The datagram *data* path is the remaining capability gap (measured, never allowlisted)
 //!
-//! The driver's control vocabulary (`open`/`bind`/`connect`/`send`/`recv`/`setopts`/`getopts` —
-//! `../../crates/beam_io/src/drivers/inet/udp.rs`) is **unreachable from Erlang on one of the
-//! two runtimes**, so no datagram round trip, option reply or `{error, …}` refusal can be
-//! pinned without committing a `mismatch`. Measured in this environment (oracle OTP 29.1.1 /
-//! `erts-17.1`, and the built `beam_rt`):
+//! The control/option verb transport above works on both runtimes; what `beam_rt` still does not
+//! have is the seam between those verbs and the datagram **bytes**. Measured in this environment
+//! (oracle OTP 29.1.1 / `erts-17.1`, and the built `beam_rt`) on a socket the `open`/`bind`
+//! verbs produced:
 //!
-//! * `erlang:port_control(P, 1 + 16#03f1a300, <<1,2,0>>)` (the oracle's `INET_REQ_OPEN` through
-//!   `ERTS_INET_DRV_CONTROL_MAGIC_NUMBER`, `prim_inet.erl:2969`) — the oracle answers `[1]`;
-//!   `beam_rt` raises `error:badarg`. `beam_rt`'s `erlang:port_control/3` forwards the
-//!   operation **verbatim** as its decimal string (`runtime-native` port floor), which is a C
-//!   driver's convention, while the built-in inet drivers' `Driver::control` speaks *named*
-//!   verbs — so no `INET_REQ_*`/`PACKET_REQ_*` code can reach `udp_inet`. Owner: `beam_rt`
-//!   (`port_control` verb bridge) / `beam_io`.
-//! * `erlang:port_command(P, <<"hi">>)` on the socket-less port — the oracle raises
-//!   `error:badarg` (the C's `!IS_OPEN` guard, `packet_inet_command`, `inet_drv.c:15051`), while
-//!   `beam_rt` answers `true` and leaves the bytes queued. Owner: `beam_rt` / `beam_io`.
-//! * `gen_udp:open(0, [])` — the oracle answers `{ok, #Port<…>}`; `beam_rt` answers
-//!   `{error, einval}` (the same missing verb bridge: `prim_inet` drives the driver through
-//!   those codes). Owner: `beam_rt` / `beam_io`.
-//! * `erlang:port_info(P, queue_size)` (`{queue_size,0}`) and `erlang:port_info(P, memory)`
-//!   (`{memory,48}`) — the oracle answers the item, `beam_rt` raises `error:badarg`. Owner:
-//!   `beam_rt` (the native `port_info/2` floor).
-//! * `erlang:port_connect(P, self())` — the oracle answers `true`, `beam_rt` reports the typed
-//!   capability gap `beam_rt: unsupported: erlang:port_connect/2 is a known BIF that is not
-//!   implemented`. Owner: `beam_bifs` / `beam_rt`.
-//! * `erlang:monitor(port, P)` + `port_close/1` — the oracle's owner (the evaluator process,
-//!   which traps exits) receives `{'EXIT', P, normal}`; `beam_rt` delivers nothing. Owner:
-//!   `beam_rt` (port exit signalling).
+//! * **a send is a typed capability gap.** `gen_udp:send(S, {127,0,0,1}, P, <<"hi">>)` answers
+//!   `ok` under the oracle, while `beam_rt` aborts the whole run (exit 3) with
+//!   `beam_rt: unsupported: the C's inet statistics counters (inet_fill_stat) are not tracked by
+//!   this driver`; `inet:getstat/1` is the same gap. The read side is unreachable too:
+//!   `gen_udp:recv/3` answers under the oracle and raises `{case_clause, {ok, []}}` inside
+//!   `prim_inet` here, and `{active, true}` delivery never produces a datagram at all.
+//! * **`erlang:port_command/2` on the socket-less port** (a port whose `INET_REQ_OPEN` was never
+//!   sent) is the sharp edge of the same gap: the oracle answers `true` and then kills the port
+//!   (`init_caller` fails, `driver_failure_posix(EINVAL)`, `inet_drv.c:15055`, so `port_info/2`
+//!   is afterwards `undefined` and a second `port_close/1` is `badarg`), while `beam_rt` raises
+//!   `error:badarg` and leaves the port **alive** — the two sides share no observable there, so
+//!   this group pins `port_command/2` only on a **closed** port (both sides `badarg`) and the
+//!   socket-less pair is reported to the owner instead.
+//! * **the stream half of the same driver file** is unreachable too: `gen_tcp:connect/3`
+//!   refuses with `badarg` under `beam_rt` where the oracle opens a socket, and
+//!   `gen_tcp:listen/2` refuses the list/binary stream-mode option (`{error, einval}`).
 //!
-//! The group therefore pins the whole port surface the driver *does* agree on, and nothing it
-//! does not.
+//! Owner of all three: `beam_rt` (the built-in-driver `port_command` bridge) / `beam_io` (the
+//! driver's `send`/`recv` verbs). No row below pins any of them; the module docs of
+//! [`super::inet_control`] carry the full measured matrix.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// One A.4 `udp_inet` eval case.
 ///
 /// [`Probe::Value`] prints the expression's own answer as a readable line (`ok {name, …}`,
 /// `ok badarg`), and the golden is the **oracle's** exact stdout line — measured with
-/// `differential run <id>`, never hand-written. Every case exits `0`: the one refusal shape
-/// (`error:badarg` on a second `port_close/1`) is caught *inside* the expression, so the
-/// observable is the reason atom rather than an uncaught exception.
+/// `differential run <id>`, never hand-written. Every case exits `0`: each refusal shape (a
+/// second `port_close/1`, a `port_command/2` on the closed port) is caught *inside* the
+/// expression, and the driver's own refusals are ordinary reply lists (`[0] ++ "einval"`,
+/// `[0] ++ "exbadport"`), so the observable is a value rather than an uncaught exception.
 fn case(
     id: &'static str,
     description: &'static str,
@@ -299,6 +318,131 @@ pub(crate) fn group() -> Vec<Case> {
              erlang:port_close(P), Back =:= P end",
             "ok true",
         ),
+        // --- the control verbs prim_inet drives through port_control/3 ----------------------
+        case(
+            "udp/port_control_open_reply_is_the_inet_status_list",
+            "erlang:port_control/3 with the decimal INET_REQ_OPEN code prim_inet sends (1 + 16#03f1a300) reaches the built-in driver and answers its [1] status reply",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             Rep = erlang:port_control(P, 16#03f1a300 + 1, <<1,2,0>>), \
+             erlang:port_close(P), Rep end",
+            "ok [1]",
+        ),
+        case(
+            "udp/port_control_getopts_reports_the_stored_options",
+            "INET_REQ_GETOPTS (8 + 16#03f1a300) reports the driver-state option defaults as [1] ++ [opt, val_be32]* in request order: active 0, packet 0, packet_size 0, mode 0, deliver 1, read_packets 5",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             _ = erlang:port_control(P, 16#03f1a300 + 1, <<1,2,0>>), \
+             Rep = erlang:port_control(P, 16#03f1a300 + 8, <<22,23,32,24,25,33>>), \
+             erlang:port_close(P), Rep end",
+            "ok [1,22,0,0,0,0,23,0,0,0,0,32,0,0,0,0,24,0,0,0,0,25,0,0,0,1,33,0,0,0,5]",
+        ),
+        case(
+            "udp/port_control_setopts_store_and_readback",
+            "INET_REQ_SETOPTS (7 + 16#03f1a300) storing three [opt, val_be32] records (active 1, packet 4, packet_size 300) answers [1] and each value reads back in order, while an unserved option code is the whole-reply [0] ++ \"einval\"",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             _ = erlang:port_control(P, 16#03f1a300 + 1, <<1,2,0>>), \
+             S = erlang:port_control(P, 16#03f1a300 + 7, \
+                                     <<22,0,0,0,1, 23,0,0,0,4, 32,0,0,1,44>>), \
+             G = erlang:port_control(P, 16#03f1a300 + 8, <<22,23,32>>), \
+             Bad = erlang:port_control(P, 16#03f1a300 + 8, <<200>>), \
+             erlang:port_close(P), {S, G, Bad} end",
+            "ok {[1],[1,22,0,0,0,1,23,0,0,0,4,32,0,0,1,44],[0,101,105,110,118,97,108]}",
+        ),
+        case(
+            "udp/port_control_active_multi_accumulates_its_counter",
+            "the {active, N} multi form (value 3 plus a trailing 16-bit counter) accumulates its counter across setopts (2 then +3 = 5), and setting a plain {active, true} resets it to the bare record",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             _ = erlang:port_control(P, 16#03f1a300 + 1, <<1,2,0>>), \
+             S1 = erlang:port_control(P, 16#03f1a300 + 7, <<22,0,0,0,3,0,2>>), \
+             G1 = erlang:port_control(P, 16#03f1a300 + 8, <<22>>), \
+             S2 = erlang:port_control(P, 16#03f1a300 + 7, <<22,0,0,0,3,0,3>>), \
+             G2 = erlang:port_control(P, 16#03f1a300 + 8, <<22>>), \
+             S3 = erlang:port_control(P, 16#03f1a300 + 7, <<22,0,0,0,1>>), \
+             G3 = erlang:port_control(P, 16#03f1a300 + 8, <<22>>), \
+             erlang:port_close(P), {S1, G1, S2, G2, S3, G3} end",
+            "ok {[1],[1,22,0,0,0,3,0,2],[1],[1,22,0,0,0,3,0,5],[1],[1,22,0,0,0,1]}",
+        ),
+        case(
+            "udp/port_control_bind_reports_the_loopback_address",
+            "INET_REQ_BIND (6 + 16#03f1a300) with the INET_AF_LOOPBACK short form and port 0 answers [1, port_hi, port_lo] with a kernel-assigned non-zero port, and INET_REQ_NAME (5) then reports that port with the loopback octets (the ephemeral port itself is not pinned)",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             _ = erlang:port_control(P, 16#03f1a300 + 1, <<1,2,0>>), \
+             Bind = erlang:port_control(P, 16#03f1a300 + 6, <<4,0,0>>), \
+             BShape = case Bind of \
+                          [Tag, Hi, Lo] -> {length(Bind), Tag, Hi * 256 + Lo > 0}; \
+                          Other -> Other \
+                      end, \
+             Nm = erlang:port_control(P, 16#03f1a300 + 5, <<>>), \
+             NShape = case Nm of \
+                          [Tg, Fam, Hi2, Lo2, O1, O2, O3, O4] -> \
+                              {length(Nm), Tg, Fam, {O1, O2, O3, O4}, \
+                               Hi2 * 256 + Lo2 > 0}; \
+                          Other2 -> Other2 \
+                      end, \
+             erlang:port_close(P), {BShape, NShape} end",
+            "ok {{3,1,true},{8,1,1,{127,0,0,1},true}}",
+        ),
+        case(
+            "udp/port_control_gettype_and_getstatus",
+            "INET_REQ_GETTYPE (15) reports the cached socket kind ([0] ++ \"einval\" before the open, the AF_INET/datagram pair after it) and INET_REQ_GETSTATUS (16) the lifecycle state ([1,0,0,0,0] closed, [1,0,0,0,1] open)",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             T0 = erlang:port_control(P, 16#03f1a300 + 15, <<>>), \
+             S0 = erlang:port_control(P, 16#03f1a300 + 16, <<>>), \
+             _ = erlang:port_control(P, 16#03f1a300 + 1, <<1,2,0>>), \
+             T1 = erlang:port_control(P, 16#03f1a300 + 15, <<>>), \
+             S1 = erlang:port_control(P, 16#03f1a300 + 16, <<>>), \
+             erlang:port_close(P), {T0, S0, T1, S1} end",
+            "ok {[0,101,105,110,118,97,108],[1,0,0,0,0],[1,0,0,0,1,0,0,0,2],[1,0,0,0,1]}",
+        ),
+        case(
+            "udp/port_control_close_is_accepted",
+            "INET_REQ_CLOSE (2 + 16#03f1a300) answers the driver's [1], and it closes only the driver's socket: the port is still live (port_info(P,name) unchanged) and the following port_close/1 still answers true",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             _ = erlang:port_control(P, 16#03f1a300 + 1, <<1,2,0>>), \
+             Rep = erlang:port_control(P, 16#03f1a300 + 2, <<>>), \
+             Alive = erlang:port_info(P, name), \
+             Closed = erlang:port_close(P), {Rep, Alive, Closed} end",
+            "ok {[1],{name,[117,100,112,95,105,110,101,116]},true}",
+        ),
+        case(
+            "udp/port_control_with_an_unknown_verb_is_refused",
+            "every unknown control verb — an in-range code no case matches (42), the retired request (9), a raw value below the magic (99) and an out-of-range code (1000000 + magic) — answers the identical C reply [0] ++ \"exbadport\" rather than raising",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             Reps = [erlang:port_control(P, 16#03f1a300 + Op, <<>>) \
+                     || Op <- [42, 9, 1000000]], \
+             Raw = erlang:port_control(P, 99, <<>>), \
+             All = lists:usort([Raw | Reps]), \
+             erlang:port_close(P), {length(All), hd(All)} end",
+            "ok {1,[0,101,120,98,97,100,112,111,114,116]}",
+        ),
+        // --- the port_info accounting items and the port_command refusal --------------------
+        case(
+            "udp/port_info_queue_size_and_memory_of_a_fresh_port",
+            "port_info(P,queue_size) of a fresh udp_inet port is the empty-queue {queue_size,0} and port_info(P,memory) a positive word count (its figure is implementation-specific and is pinned as a shape only)",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             {queue_size, Q} = erlang:port_info(P, queue_size), \
+             {memory, Mem} = erlang:port_info(P, memory), \
+             erlang:port_close(P), {Q, is_integer(Mem), Mem > 0} end",
+            "ok {0,true,true}",
+        ),
+        case(
+            "udp/port_command_on_a_closed_port_is_badarg",
+            "erlang:port_command/2 on an already closed udp_inet port raises error:badarg on both runtimes (caught inside the expression, so the observable is the reason atom)",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             true = erlang:port_close(P), \
+             try erlang:port_command(P, <<\"hi\">>) catch error:Reason -> Reason end end",
+            "ok badarg",
+        ),
     ]
 }
 
@@ -312,7 +456,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_udp_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 19, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 29, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -356,27 +500,49 @@ mod tests {
         );
     }
 
-    /// The shapes that were **measured** to diverge stay out of the group: the driver's
-    /// `INET_REQ_*`/`PACKET_REQ_*` verbs are unreachable from Erlang on `beam_rt`
-    /// (`port_control` forwards the operation as a decimal *verb string* that a built-in driver
-    /// never matches), so every datagram/option shape — and `port_command/2` on the socket-less
-    /// port, and the two `port_info/2` items the native floor does not serve — would be a
-    /// committed `mismatch`. See the module docs for the exact pairs of observations.
+    /// The shapes that are **measured** to diverge stay out of the group: the datagram *data*
+    /// path (a `gen_udp` send and `inet:getstat` hit the driver's untracked statistics counters,
+    /// an incoming datagram is never delivered, and `gen_tcp:connect/3` refuses), the
+    /// `prim_inet` module whose calls would drive them, and the port-monitor term (see the
+    /// per-item comments below).
+    ///
+    /// `port_command/2` is pinnable **only on a closed port** (both runtimes answer `badarg`):
+    /// on the socket-less port the two runtimes share no observable at all (the oracle answers
+    /// `true` and then kills the port, `beam_rt` raises `badarg` and keeps it — see the module
+    /// docs), so a `port_command` row must close the port first.
     #[test]
     fn no_case_pins_a_measured_divergence() {
         for case in group() {
             let expr = case.expr().expect("eval case");
             for forbidden in [
-                "port_control",
-                "port_command",
-                "gen_udp",
-                "port_connect",
-                "queue_size",
-                "memory",
+                // A send (and the statistics query) reaches the driver's untracked counters, so
+                // it is a typed `unsupported` (exit 3) rather than an observable.
+                "gen_udp:send",
+                "inet:getstat",
+                // The read path: no datagram is ever delivered, so `recv` fails inside
+                // `prim_inet` (`{case_clause, {ok, []}}`) instead of answering.
+                "gen_udp:recv",
+                "prim_inet",
+                // A stream connect against a live listener is `{ok, Socket}` on the oracle and a
+                // `badarg` raise here.
+                "gen_tcp:",
+                // A port monitor still disagrees on the delivered term: the oracle hands the
+                // trapping evaluator `{'EXIT', P, normal}` while `beam_rt` hands it
+                // `{'DOWN', Ref, port, P, normal}`.
+                "monitor(port",
             ] {
                 assert!(
                     !expr.contains(forbidden),
                     "case {} pins `{forbidden}`, a measured divergence (see the module docs)",
+                    case.id
+                );
+            }
+            if let Some(sent) = expr.find("port_command") {
+                assert!(
+                    expr.find("erlang:port_close(P)")
+                        .is_some_and(|closed| closed < sent),
+                    "case {} sends a port_command before closing the port — the socket-less \
+                     shape has no shared observable on the two runtimes (see the module docs)",
                     case.id
                 );
             }

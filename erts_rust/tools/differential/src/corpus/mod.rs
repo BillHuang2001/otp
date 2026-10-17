@@ -87,6 +87,7 @@
 //! | [`bits`] | A.1/A.7 — the `-eval` bit-string surface: constructed segment images and matched fields |
 //! | [`udp`] | A.4 — the `udp_inet` built-in driver through `open_port/2` / `port_command` / `port_info` |
 //! | [`ram_file`] | A.4 — the `ram_file_drv` built-in driver's reply encodings |
+//! | [`inet_control`] | A.4 — the built-in inet drivers' control surface through `gen_udp` / `gen_tcp` / `inet` (option store, refusal matrix, driver-name namespace, packet-framing modes) |
 //!
 //! A.3 is reachable **end to end**, not only through its raise surface: the [`nif_so`] group
 //! runs a compiled module that `erlang:load_nif/2`s a **real `.so`** (built into the case's
@@ -120,6 +121,7 @@ mod flags;
 mod flags_apply;
 mod format_limit;
 mod gc;
+mod inet_control;
 mod maps;
 mod math_bifs;
 mod mexec;
@@ -626,6 +628,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(bits::group());
     cases.extend(udp::group());
     cases.extend(ram_file::group());
+    cases.extend(inet_control::group());
     cases
 }
 
