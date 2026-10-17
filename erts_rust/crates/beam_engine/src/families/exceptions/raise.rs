@@ -32,7 +32,7 @@ use beam_term::{make_atom, Eterm};
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
-use crate::machine::Machine;
+use crate::machine::{namespace_atom, Machine};
 use crate::operand::{operand_slack_words, read_operand_slack};
 use crate::terms;
 use crate::Step;
@@ -56,9 +56,7 @@ pub(super) fn raise_error_tuple(
     tag: &str,
     value: &Operand,
 ) -> Result<Option<Step>> {
-    let tag_atom = module
-        .atom_table
-        .lookup(tag)
+    let tag_atom = namespace_atom(ctx, module, tag)
         .ok_or_else(|| error::unsupported(&format!("exceptions: no '{tag}' atom in the module")))?;
     // Reserve the reason block first, then re-read the value operand from the
     // post-collection machine state (a moving collector may run in the reserve).
@@ -66,7 +64,7 @@ pub(super) fn raise_error_tuple(
     let reason = terms::make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, 2, extra, |m, s| {
         Ok(vec![make_atom(tag_atom), read_operand_slack(m, value, s)?])
     })?;
-    let _ = install_class_atom(machine, module, ExceptionClass::Error);
+    let _ = install_class_atom(machine, module, ctx, ExceptionClass::Error);
     machine.throw_error(reason).map(Some)
 }
 
@@ -74,14 +72,13 @@ pub(super) fn raise_error_tuple(
 pub(super) fn raise_error_atom(
     machine: &mut Machine,
     module: &Module,
+    ctx: &mut dyn ExecutionContext,
     tag: &str,
 ) -> Result<Option<Step>> {
-    let atom = module
-        .atom_table
-        .lookup(tag)
+    let atom = namespace_atom(ctx, module, tag)
         .ok_or_else(|| error::unsupported(&format!("exceptions: no '{tag}' atom in the module")))?;
     let reason = make_atom(atom);
-    let _ = install_class_atom(machine, module, ExceptionClass::Error);
+    let _ = install_class_atom(machine, module, ctx, ExceptionClass::Error);
     machine.throw_error(reason).map(Some)
 }
 
@@ -96,9 +93,10 @@ pub(super) fn raise_error_atom(
 pub(super) fn install_class_atom(
     machine: &mut Machine,
     module: &Module,
+    ctx: &mut dyn ExecutionContext,
     class: ExceptionClass,
 ) -> Result<Eterm> {
-    match module.atom_table.lookup(class.as_str()) {
+    match namespace_atom(ctx, module, class.as_str()) {
         Some(atom) => {
             let term = make_atom(atom);
             machine.set_class_atom(class, term);

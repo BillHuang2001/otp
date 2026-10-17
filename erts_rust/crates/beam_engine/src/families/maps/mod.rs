@@ -146,7 +146,7 @@ use beam_term::{cmp, make_atom, AtomTable, Eterm};
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
-use crate::machine::Machine;
+use crate::machine::{namespace_atom, Machine};
 use crate::operand::{operand_slack_words, read_operand_slack};
 use crate::terms;
 use crate::Step;
@@ -285,9 +285,7 @@ fn raise_error_tuple(
     tag: &str,
     value: &Operand,
 ) -> Result<Step> {
-    let tag_atom = module
-        .atom_table
-        .lookup(tag)
+    let tag_atom = namespace_atom(ctx, module, tag)
         .ok_or_else(|| error::unsupported(&format!("maps: no '{tag}' atom in the module")))?;
     // Reserve the reason block first, then re-read the value operand from the
     // post-collection machine state (a moving collector may run in the reserve).
@@ -295,7 +293,7 @@ fn raise_error_tuple(
     let reason = terms::make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, 2, extra, |m, s| {
         Ok(vec![make_atom(tag_atom), read_operand_slack(m, value, s)?])
     })?;
-    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+    if let Some(class_atom) = namespace_atom(ctx, module, ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }
     machine.throw_error(reason)

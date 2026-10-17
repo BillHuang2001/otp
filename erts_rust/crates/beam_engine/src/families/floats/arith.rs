@@ -69,11 +69,11 @@ pub(super) fn binary(
         // A non-float FR slot is the documented arithmetic failure. A structurally
         // malformed program is a different error and was already propagated by the
         // `?` above.
-        _ => return arithmetic_failure(machine, module, labels, fail),
+        _ => return arithmetic_failure(machine, module, labels, fail, ctx),
     };
     let result = op(x, y);
     if !result.is_finite() {
-        return arithmetic_failure(machine, module, labels, fail);
+        return arithmetic_failure(machine, module, labels, fail, ctx);
     }
     let value = make_float_rooted(machine, ctx, result)?;
     write_operand(machine, dst, value)?;
@@ -95,7 +95,7 @@ pub(super) fn negate(
     let source = read_value(machine, module, ctx, src)?;
     let value = match float_value(source) {
         Ok(x) => x,
-        Err(_) => return arithmetic_failure(machine, module, labels, fail),
+        Err(_) => return arithmetic_failure(machine, module, labels, fail, ctx),
     };
     let negated = make_float_rooted(machine, ctx, -value)?;
     write_operand(machine, dst, negated)?;

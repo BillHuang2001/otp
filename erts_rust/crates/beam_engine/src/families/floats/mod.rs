@@ -92,7 +92,7 @@ use beam_term::{make_atom, Eterm};
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::machine::Machine;
+use crate::machine::{namespace_atom, Machine};
 use crate::operand::read_operand;
 use crate::Step;
 
@@ -205,9 +205,10 @@ fn arithmetic_failure(
     module: &Module,
     labels: &LabelMap,
     fail: Label,
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
     if fail == NO_FAIL {
-        return raise_badarith(machine, module).map(Some);
+        return raise_badarith(machine, module, ctx).map(Some);
     }
     let (func, pc) = labels.resolve(fail)?;
     Ok(Some(Step::Goto { func, pc }))
@@ -230,15 +231,18 @@ fn arithmetic_failure(
 /// unchanged as the typed [`BeamError::BadArith`] (the same uncaught-error contract
 /// the interpreter's `raise_bif_error` follows). The `error` class atom is installed
 /// when the module has it, which is what a landing places in `x(3)`.
-fn raise_badarith(machine: &mut Machine, module: &Module) -> Result<Step> {
+fn raise_badarith(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Step> {
     if machine.catch_frame_depth() == 0 {
         return Err(BeamError::BadArith);
     }
-    let atom = module
-        .atom_table
-        .lookup("badarith")
-        .ok_or(BeamError::BadArith)?;
-    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+    let Some(atom) = namespace_atom(ctx, module, "badarith") else {
+        return Err(BeamError::BadArith);
+    };
+    if let Some(class_atom) = namespace_atom(ctx, module, ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }
     machine.throw_error(make_atom(atom))
