@@ -315,6 +315,29 @@ impl OffHeap {
         self.iter().map(OffHeapEntry::overhead_bytes).sum()
     }
 
+    /// The number of slot positions the roster has reserved — live **and** released.
+    ///
+    /// Storage is slot-stable, so a slot a [`sweep`](OffHeap::sweep) released is never removed
+    /// and never reused: it keeps occupying its position for the list's whole lifetime.
+    /// This is therefore the roster's slot count, **not** its
+    /// [live count](OffHeap::len) — the two are equal only before the first sweep releases
+    /// anything.
+    pub fn slot_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The bytes the roster's own slot array reserves, in bytes — its `Vec` capacity times one
+    /// slot's size.
+    ///
+    /// This is **retained footprint the payload accounting does not report**:
+    /// [`overhead_bytes`](OffHeap::overhead_bytes) sums the *live* payloads' apparent sizes
+    /// only, while a released slot's position stays reserved (slot stability), so the array
+    /// never shrinks. No `beam_alloc` allocator type records these bytes either — the roster's
+    /// `Vec` goes through the process's global allocator — which is why a reporter adds them
+    /// separately from the payload ([`HeapFootprint::off_heap_slot_bytes`](crate::HeapFootprint::off_heap_slot_bytes)).
+    pub fn slot_bytes(&self) -> usize {
+        self.entries.capacity() * core::mem::size_of::<Option<OffHeapEntry>>()
+    }
     /// Releases, **in place**, the entries for which `is_live` returns `false`, and returns
     /// how many were released.
     ///

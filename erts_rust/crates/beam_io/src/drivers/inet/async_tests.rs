@@ -33,8 +33,9 @@
 //!   carries into its high byte at id 256;
 //! * the two **queue disciplines**: the single receive slot (`INET_MAX_ASYNC`, `:1069`, a second
 //!   `recv` is `[0]ealready`) versus the multi-operation accept list (`enq_multi_op`, `:12194`,
-//!   never `ealready`), including the `INET_F_ACC`/`INET_F_MULTI_CLIENT` state bits
-//!   `INET_REQ_GETSTATUS` reports;
+//!   never `ealready`), including the sticky `INET_F_ACC`/`INET_F_MULTI_CLIENT` state bits
+//!   `INET_REQ_GETSTATUS` reports (the multi bit latches at the second enqueue and clears only when
+//!   the list drains — see `accept_tests.rs`);
 //! * the full `TCP_REQ_RECV`/`INET_REQ_ACCEPT` **guard ladders**, in the C's order and with the
 //!   C's replies (`[0]enotconn`/`[0]einval`/`[0]enomem`);
 //! * the **separation of the two halves**: a control reply is the id and nothing else, the outcome
@@ -272,9 +273,12 @@ fn the_id_counter_carries_into_the_high_byte_at_id_256() {
 // ---------------------------------------------------------------------------
 
 /// Accepts are a **list** (`enq_multi_op`, `inet_drv.c:12194`/`:12209`): N queued accepts each get
-/// their own id and never `ealready`, `INET_REQ_GETSTATUS` reports the C's `INET_F_ACC`
-/// (one pending) / `INET_F_MULTI_CLIENT` (two or more) bits while the list is non-empty, and the
-/// completions arrive in **enqueue order** as `InetAsyncResult::Accepted`.
+/// their own id and never `ealready`, `INET_REQ_GETSTATUS` reports the C's `INET_F_ACC` (an accept
+/// is pending) bit and — from the **second** enqueue until the list fully drains — the **sticky**
+/// `INET_F_MULTI_CLIENT` bit (`desc->inet.state`, `:12189`-`:12194`, restored to
+/// `INET_STATE_LISTENING` only at `:12607`-`:12611`/`:13536`-`:13540`; the sticky rows are pinned
+/// by `accept_tests.rs`), and the completions arrive in **enqueue order** as
+/// `InetAsyncResult::Accepted`.
 ///
 /// The accepted descriptors belong to the completion's consumer (the runtime), so the driver's
 /// teardown must leave every one of them open.

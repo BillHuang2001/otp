@@ -490,11 +490,11 @@ struct Snapshot {
     max_heap: crate::config::MaxHeapSetting,
     /// The off-heap (MSO + refc binary) overhead, in bytes.
     off_heap_bytes: usize,
-    /// The process's **live owned off-heap refc binaries**, in slot order, each as
+    /// The process's **live owned off-heap refc binaries**, each as
     /// `(payload pointer, payload byte length, payload refcount)` — the value behind the
-    /// `binary` item ([`RuntimeContext::binary_value`]). Copied out of
-    /// [`Process::off_heap_binaries`](beam_process::Process::off_heap_binaries) so the reply
-    /// can be built after the process table borrow ends.
+    /// `binary` item ([`RuntimeContext::binary_value`]). This is the **union** of the two
+    /// places a payload can be owned (see [`RuntimeContext::snapshot`]), copied out so the
+    /// reply can be built after the process table borrow ends.
     off_heap_binaries: Vec<(usize, usize, usize)>,
 }
 
@@ -1104,6 +1104,51 @@ impl RuntimeContext<'_> {
                 .iter()
                 .map(|watch| (false, watch.port.to_eterm())),
         );
+        // The off-heap refc-binary roster — the `binary` item — has **two** possible owners, so
+        // it is their deduped union:
+        //
+        // * the target's **engine reservoir** (`RunnerState::reservoir_at`), which is the real
+        //   holder of every payload the process's own compiled bitstring code built. This is
+        //   where a scheduled process's payloads live: nothing copies them onto the PCB, so a
+        //   build-a-binary loop never grows `beam_gc::OffHeap`'s never-compacted slot space;
+        // * the process's **own** off-heap table ([`Process::off_heap_binaries`]), which stays
+        //   the path for a host that registers a payload on the PCB directly (the runner does
+        //   not; in production it is empty).
+        //
+        // Deduped by payload pointer, the frozen `BinRef.val` identity of a `RefcBinary`, so a
+        // payload both sources know is listed once. The scan is linear in the (empty in
+        // production) PCB roster, never in the reservoir.
+        //
+        // Extracted **here**, before `Snapshot` is built, because the roster is read from a
+        // table/state pair this `&self` borrow sees as one object while the reply is built later
+        // on the engine heap. Nothing is copied out of the payloads themselves: the reservoir
+        // never shrinks and holds the handles, so the pointers stay live and `refcount()` is the
+        // live count.
+        let mut off_heap_binaries: Vec<(usize, usize, usize)> = Vec::new();
+        {
+            // A scheduler pass **moves** the engine state out of the runtime exactly as it moves
+            // the process table, so the live state is the pass's own when this context is a
+            // slice (`RuntimeContext::engines`) and the runtime's otherwise. The one pid neither
+            // answers for is the process the pass is *currently executing* (its engine is out
+            // for the whole slice — see `RunnerState::reservoir_at`).
+            let engines = match self.engines() {
+                Some(state) => state,
+                None => self.runtime.runner_state(),
+            };
+            if let Some(binaries) = engines.reservoir_at(pid) {
+                off_heap_binaries.extend(
+                    binaries.iter().map(|binary| {
+                        (binary.data_ptr() as usize, binary.len(), binary.refcount())
+                    }),
+                );
+            }
+        }
+        for binary in process.off_heap_binaries() {
+            let pointer = binary.data_ptr() as usize;
+            if !off_heap_binaries.iter().any(|known| known.0 == pointer) {
+                off_heap_binaries.push((pointer, binary.len(), binary.refcount()));
+            }
+        }
         Some(Snapshot {
             pid,
             registered_name,
@@ -1151,10 +1196,7 @@ impl RuntimeContext<'_> {
                     .birth_max_heap_setting(process.collector().policy())
             },
             off_heap_bytes: process.off_heap().overhead_bytes(),
-            off_heap_binaries: process
-                .off_heap_binaries()
-                .map(|binary| (binary.data_ptr() as usize, binary.len(), binary.refcount()))
-                .collect(),
+            off_heap_binaries,
         })
     }
 

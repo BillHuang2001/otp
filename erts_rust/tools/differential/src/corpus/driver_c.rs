@@ -126,16 +126,22 @@
 //! answers `false`, and the port still closes cleanly). Selector `29` stays on the echo fixture
 //! and pins the port's own byte counters across one round trip (`{input, 5}`/`{output, 5}`).
 //!
+//! # The driver's own port-closing family (selectors `40`-`47`)
+//!
+//! [`FAILURE_DRIVER_C`] closes the port from inside its `output` callback, one command byte per
+//! C entry point: `driver_failure(P, 0)` (the eof flag ⇒ reason `normal`),
+//! `driver_failure_atom(P, "boom")`, `driver_failure_posix(P, EACCES)`,
+//! `driver_failure(P, 7)` (the bare integer) and `driver_exit(P, 0)`. Each reason is pinned on a
+//! **trapping** owner (`{'EXIT', P, Reason}`), a **monitor** is pinned for the atom and for
+//! `driver_exit` (`{'DOWN', Ref, port, P, Reason}` — `driver_exit` unlinks the owner first, so
+//! selector `44` pins that the owner receives *nothing*), and selector `46` pins the dead port's
+//! `port_info/1,2` ⇒ `undefined` together with a second `port_close/1` ⇒ `badarg`.
+//!
 //! # Measured divergences (shapes that must **not** become cases)
 //!
 //! Every shape below was measured on both runtimes while this group was widened; each is a gap,
 //! never an agreement, so it lives here (and in `divergences.md`) rather than in the corpus.
 //!
-//! * **`driver_failure_eof` / `driver_failure_atom` / `driver_failure_posix` / `driver_failure` /
-//!   `driver_exit`** — the port-closing family (`io.c:7193-7280`) is unimplemented in `beam_rt`:
-//!   `DriverHost::failure`/`port_exit` keep the trait's `-1`, so the port never closes and the
-//!   `{'EXIT', Port, Reason}` a trapping owner would see never arrives. Both the return code and
-//!   the exit reason therefore diverge. Owner: `beam_rt` (`DriverHost::failure`/`port_exit`).
 //! * **a control reply from the *request* buffer** (`*rbuf = buf`, verb `3` of the prototype) —
 //!   the oracle frees the reply pointer in `write_port_control_result` (`driver_free(resp_bufp)`,
 //!   `io.c:4170`), and that pointer is the caller's data buffer: the VM dies of SIGSEGV
@@ -287,7 +293,33 @@ classify(N) ->
         %% `30` is the capability gate on the *other* side: a driver entry with **no** `control`
         %% slot is `badarg` for every verb, before any callback runs.
         30 -> P = open(Dir, ""),
-              yn(raises_badarg(fun() -> erlang:port_control(P, 1, <<>>) end))
+              yn(raises_badarg(fun() -> erlang:port_control(P, 1, <<>>) end));
+        %% `40`-`43` drive the C's `driver_failure*` family: the driver closes its own port from
+        %% inside its `output` callback, and the reason it asked for reaches the **trapping**
+        %% owner as a plain `{'EXIT', P, Reason}` message. `driver_failure(P, 0)` is the C's eof
+        %% flag (reason `normal`, not `0`).
+        40 -> trapping_exit(Dir, <<"z">>, normal);
+        41 -> trapping_exit(Dir, <<"a">>, boom);
+        42 -> trapping_exit(Dir, <<"p">>, eacces);
+        43 -> trapping_exit(Dir, <<"7">>, 7);
+        %% `44` is `driver_exit`: the C unlinks the connected process *before* closing the port,
+        %% so the owner is owed nothing — a bounded receive pins that absence.
+        44 -> process_flag(trap_exit, true),
+              P = open(Dir, ""),
+              true = erlang:port_command(P, <<"x">>),
+              receive {'EXIT', P, _} -> 0 after 2000 -> 1 end;
+        %% `45`-`47` pin the two remaining sides of a failed port: a **monitor** is told
+        %% independently of the link (its `'DOWN'` carries the same reason), and the closed port
+        %% answers no `port_info` and refuses a second `port_close/1`.
+        45 -> monitored_exit(Dir, <<"a">>, boom);
+        46 -> process_flag(trap_exit, true),
+              P = open(Dir, ""),
+              true = erlang:port_command(P, <<"a">>),
+              receive {'EXIT', P, _} -> ok after 2000 -> timeout end,
+              yn(erlang:port_info(P, name) =:= undefined
+                 andalso erlang:port_info(P) =:= undefined
+                 andalso raises_badarg(fun() -> erlang:port_close(P) end));
+        47 -> monitored_exit(Dir, <<"x">>, normal)
     end.
 
 %% Send one payload through the driver and answer the bytes it echoed back (`timeout` when the
@@ -316,6 +348,23 @@ registry_answer(P, Command, Gap) ->
         {P, {data, _}} -> erlang:error(Gap)
     end.
 
+%% A **trapping** owner receives the driver's port-closing request as a plain message:
+%% `{'EXIT', P, Reason}` with the reason the `driver_failure*` entry point asked for. No message
+%% within the bound, or a different reason, answers `0`.
+trapping_exit(Dir, Command, Reason) ->
+    process_flag(trap_exit, true),
+    P = open(Dir, ""),
+    true = erlang:port_command(P, Command),
+    receive {'EXIT', P, Got} -> yn(Got =:= Reason) after 2000 -> 0 end.
+
+%% A **monitor** on the port is told independently of the owner's link: its `'DOWN'` carries the
+%% same reason slot (`port` for the kind, the port for the object).
+monitored_exit(Dir, Command, Reason) ->
+    process_flag(trap_exit, true),
+    P = open(Dir, ""),
+    Ref = erlang:monitor(port, P),
+    true = erlang:port_command(P, Command),
+    receive {'DOWN', Ref, port, P, Got} -> yn(Got =:= Reason) after 2000 -> 0 end.
 yn(true) -> 1;
 yn(_) -> 0.
 
@@ -766,6 +815,92 @@ DRIVER_INIT(host_driver) {
 }
 "#;
 
+/// The **failure** fixture (selectors `40`-`47`): a driver that closes its **own** port from
+/// inside its `output` callback — the C's `driver_failure*` family and `driver_exit`.
+///
+/// One command byte selects one entry point, and the reason it asks for is what the owner (or a
+/// port monitor) observes:
+///
+/// | command | the callback calls | the reason the owner observes |
+/// |---|---|---|
+/// | `'z'` | `driver_failure(port, 0)` (`io.c:7258`, eof flag) | `normal` |
+/// | `'a'` | `driver_failure_atom(port, "boom")` (`io.c:7263`) | `boom` |
+/// | `'p'` | `driver_failure_posix(port, EACCES)` (`io.c:7273`) | `eacces` |
+/// | `'7'` | `driver_failure(port, 7)` | the bare integer `7` |
+/// | `'x'` | `driver_exit(port, 0)` (`io.c:7234-7255`) | `normal`, and **no** signal at all |
+///
+/// `driver_exit` is the one entry point that unlinks the connected process before closing the
+/// port (`unlink_proc`, `io.c:7244`), so its owner receives nothing while a monitor still is
+/// told — which is why selector `44` pins the *absence* of the `'EXIT'` and selector `47` the
+/// `'DOWN'`.
+const FAILURE_DRIVER_C: &str = r#"/* A real driver .so (contract A.4): the C's port-closing family, one command byte per entry
+ * point. The port handle the calls need is the one `start` was given. */
+#include <erl_driver.h>
+#include <errno.h>
+
+typedef struct {
+    ErlDrvPort port;
+} failure_state;
+
+static ErlDrvData failure_start(ErlDrvPort port, char *command) {
+    failure_state *st;
+    (void) command;
+    st = (failure_state *) driver_alloc(sizeof(failure_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    return (ErlDrvData) st;
+}
+
+static void failure_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+/* Close the port with the reason the command selects. A code of 0 is the C's *eof* flag rather
+ * than reason 0 (`driver_failure_term(ix, make_small(code), code == 0)`), and `driver_exit`
+ * differs from the family in one way only: it unlinks the connected process first. */
+static void failure_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    failure_state *st = (failure_state *) drv_data;
+    if (st == NULL || len < 1)
+        return;
+    switch (buf[0]) {
+    case 'z':
+        (void) driver_failure(st->port, 0);
+        break;
+    case 'a':
+        (void) driver_failure_atom(st->port, "boom");
+        break;
+    case 'p':
+        (void) driver_failure_posix(st->port, EACCES);
+        break;
+    case '7':
+        (void) driver_failure(st->port, 7);
+        break;
+    case 'x':
+        (void) driver_exit(st->port, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+static ErlDrvEntry failure_entry = {
+    .init = NULL,
+    .start = failure_start,
+    .stop = failure_stop,
+    .output = failure_output,
+    .driver_name = "host_driver",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(host_driver) {
+    return &failure_entry;
+}
+"#;
+
 /// The registry fixture every selector-`7` case loads.
 const REGISTRY_DRIVER: NifFixture = NifFixture::CompiledLibrary {
     name: "host_driver",
@@ -794,6 +929,12 @@ const CONTROL_DRIVER: NifFixture = NifFixture::CompiledLibrary {
 const EXTRA_DRIVER: NifFixture = NifFixture::CompiledLibrary {
     name: "host_driver",
     c_source: EXTRA_DRIVER_C,
+};
+
+/// The port-closing fixture the `40`-`47` cases load.
+const FAILURE_DRIVER: NifFixture = NifFixture::CompiledLibrary {
+    name: "host_driver",
+    c_source: FAILURE_DRIVER_C,
 };
 
 /// Build one module-run case over [`DRIVER_MODULE_SOURCE`] with `fixture` as its `.so`.
@@ -990,6 +1131,55 @@ pub(crate) fn group() -> Vec<Case> {
             &[29],
             HOST_DRIVER,
         ),
+        // --- the driver's own port-closing family (`driver_failure*` / `driver_exit`) ---------
+        case(
+            "driver_c/driver_failure_zero_closes_the_port_with_normal",
+            "driver_failure(P, 0) is the C's eof flag: the trapping owner receives {'EXIT', P, normal}",
+            &[40],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_failure_atom_closes_the_port_with_that_atom",
+            "driver_failure_atom(P, \"boom\") closes the port: the trapping owner receives {'EXIT', P, boom}",
+            &[41],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_failure_posix_closes_the_port_with_the_errno_name",
+            "driver_failure_posix(P, EACCES) closes the port with the errno's POSIX name: {'EXIT', P, eacces}",
+            &[42],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_failure_code_closes_the_port_with_the_integer",
+            "driver_failure(P, 7) closes the port with the bare integer: {'EXIT', P, 7}",
+            &[43],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_exit_sends_the_owner_no_exit_signal",
+            "driver_exit(P, 0) unlinks the owner before closing the port, so no {'EXIT', P, _} arrives",
+            &[44],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_failure_atom_reaches_a_port_monitor",
+            "a monitor on a port a driver failed is told independently: {'DOWN', Ref, port, P, boom}",
+            &[45],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_exit_reaches_a_port_monitor_with_normal",
+            "the monitor of a port its driver exited is told even though the owner is not: {'DOWN', Ref, port, P, normal}",
+            &[47],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/a_failed_port_answers_no_port_info_and_refuses_port_close",
+            "after the driver failed the port, port_info/1,2 answer undefined and a second port_close/1 is badarg",
+            &[46],
+            FAILURE_DRIVER,
+        ),
     ]
 }
 #[cfg(test)]
@@ -1001,14 +1191,16 @@ mod tests {
 
     use super::{
         group, CaseKind, Contract, NifFixture, CONTROL_DRIVER_C, ENTRY_DRIVER_C, EXTRA_DRIVER_C,
-        HOST_DRIVER_C, LOCK_DRIVER_C, REGISTRY_DRIVER_C,
+        FAILURE_DRIVER_C, HOST_DRIVER_C, LOCK_DRIVER_C, REGISTRY_DRIVER_C,
     };
     use std::collections::HashSet;
 
     /// The selectors that own a **dedicated** C source rather than the shared echo fixture. Each
     /// carries one family's checks, so it must resolve to its family's source and never fall back
     /// to [`HOST_DRIVER_C`], whose `output` callback only echoes.
-    const OWN_SOURCE_SELECTORS: &[i64] = &[7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28];
+    const OWN_SOURCE_SELECTORS: &[i64] = &[
+        7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 44, 45, 46, 47,
+    ];
 
     /// The source each own-source selector must carry (its family's fixture).
     fn family_source(selector: i64) -> Option<&'static str> {
@@ -1018,6 +1210,7 @@ mod tests {
             9 => Some(ENTRY_DRIVER_C),
             20..=25 => Some(CONTROL_DRIVER_C),
             26..=28 => Some(EXTRA_DRIVER_C),
+            40..=47 => Some(FAILURE_DRIVER_C),
             _ => None,
         }
     }
@@ -1055,7 +1248,8 @@ mod tests {
                     LOCK_DRIVER_C,
                     ENTRY_DRIVER_C,
                     CONTROL_DRIVER_C,
-                    EXTRA_DRIVER_C
+                    EXTRA_DRIVER_C,
+                    FAILURE_DRIVER_C
                 ]
                 .contains(&c_source),
                 "case {}: the fixture is not one of the group's C sources",
@@ -1100,6 +1294,66 @@ mod tests {
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
         }
         assert_eq!(selectors.len(), group().len(), "every selector is distinct");
-        assert_eq!(selectors.len(), 26, "the group covers twenty-six distinct selectors");
+        assert_eq!(
+            selectors.len(),
+            34,
+            "the group covers thirty-four distinct selectors"
+        );
+    }
+
+    /// The port-closing family pins one selector per C entry point, and the fixture really calls
+    /// it: a fixture that stopped calling `driver_failure_posix` (say) would leave its selector
+    /// pinning nothing at all, and a selector with no case is coverage that silently vanished.
+    #[test]
+    fn the_port_closing_family_covers_each_entry_point() {
+        // The selectors `40`-`47` all ride the one failure fixture.
+        for case in group() {
+            let CaseKind::Module(run) = case.kind else {
+                panic!("case {} is not a module-run case", case.id);
+            };
+            if !(40..=47).contains(&run.args[0]) {
+                continue;
+            }
+            assert_eq!(
+                run.nif.map(|f| match f {
+                    NifFixture::CompiledLibrary { c_source, .. } => c_source,
+                    _ => "",
+                }),
+                Some(FAILURE_DRIVER_C),
+                "case {}: the failure family rides the port-closing fixture",
+                case.id
+            );
+        }
+        let failure_cases = group()
+            .into_iter()
+            .filter(|case| match case.kind {
+                CaseKind::Module(run) => (40..=47).contains(&run.args[0]),
+                _ => false,
+            })
+            .count();
+        assert_eq!(failure_cases, 8, "the family is eight selectors");
+        // Every C entry point of the family is really called by the fixture.
+        for entry_point in [
+            "driver_failure(st->port, 0)",
+            "driver_failure_atom(st->port, \"boom\")",
+            "driver_failure_posix(st->port, EACCES)",
+            "driver_failure(st->port, 7)",
+            "driver_exit(st->port, 0)",
+        ] {
+            assert!(
+                FAILURE_DRIVER_C.contains(entry_point),
+                "the fixture never calls {entry_point}"
+            );
+        }
+        // The observable is a reason, not a rendered message: the family's module helpers classify
+        // with `=:=` and print nothing, so no golden can carry a per-VM-start image.
+        let source = super::DRIVER_MODULE_SOURCE;
+        for helper in ["trapping_exit(Dir, Command, Reason)", "monitored_exit(Dir, Command, Reason)"] {
+            assert!(source.contains(helper), "the module lost its {helper} helper");
+        }
+        assert!(
+            !source.contains("io:format") && !source.contains("term_to_binary"),
+            "the module must classify, never render: a port/ref image is not VM-stable"
+        );
     }
 }

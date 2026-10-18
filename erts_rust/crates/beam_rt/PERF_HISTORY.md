@@ -358,7 +358,7 @@ native `gc_bif` fast path.
 
 ## See Also
 
-- [`PERF.md`](PERF.md) → the current figures (`CURRENT`) and the *Current startup regime* note.
+- [`PERF.md`](PERF.md) → the current figures (`CURRENT`), the *Current startup regime* note and the two controlled A/Bs it hosts (the interpreter's per-instruction reduction charge; the per-call cost's independence from the iteration count after the per-slice off-heap mirror).
 - [`PERF_DISPATCH.md`](PERF_DISPATCH.md) → the per-call `DISPATCH-CUT` / `COPY-OUT-CUT` analyses.
 - [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md) → the bench driver's environment record, per-target tables and methodology.
 - [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) → the harnesses behind every figure here and the dispatch-cost narrative.

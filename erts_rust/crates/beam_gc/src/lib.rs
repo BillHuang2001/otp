@@ -50,17 +50,20 @@
 //! driving logic are safe Rust.
 
 pub mod any_collector;
+pub mod bin_vheap;
 pub mod bounds;
 pub mod collector;
 pub mod config;
 pub mod copy;
 mod error; // pub(crate) helpers only — NOT public
+pub mod footprint;
 pub mod heap_info;
 pub mod immix;
 pub mod immix_collector;
 pub(crate) mod live; // the read-only live-graph counter — NOT public
 pub mod mso;
 mod nursery; // the young nursery chain (the no-relocation growth seam) — NOT public
+pub mod offheap;
 pub mod policy;
 pub(crate) mod reachable; // the read-only whole-heap reachability walk — NOT public
 pub use crate::reachable::ReachableObject; // the safe view a visitor reads — the walk stays crate-internal
@@ -69,14 +72,17 @@ pub mod space;
 pub mod stats;
 
 pub use crate::any_collector::*;
+pub use crate::bin_vheap::BinVheap;
 pub use crate::bounds::ScannedBounds;
 pub use crate::collector::*;
 pub use crate::config::*;
 pub use crate::copy::*;
+pub use crate::footprint::*;
 pub use crate::heap_info::*;
 pub use crate::immix::*;
 pub use crate::immix_collector::*;
 pub use crate::mso::*;
+pub use crate::offheap::{for_each_reachable_binary_payload, sweep_unreachable_binaries};
 pub use crate::policy::*;
 pub use crate::selection::*;
 pub use crate::space::*;
@@ -85,14 +91,17 @@ pub use crate::stats::*;
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
     pub use crate::any_collector::*;
+    pub use crate::bin_vheap::BinVheap;
     pub use crate::bounds::ScannedBounds;
     pub use crate::collector::*;
     pub use crate::config::*;
     pub use crate::copy::*;
+    pub use crate::footprint::*;
     pub use crate::heap_info::*;
     pub use crate::immix::*;
     pub use crate::immix_collector::*;
     pub use crate::mso::*;
+    pub use crate::offheap::{for_each_reachable_binary_payload, sweep_unreachable_binaries};
     pub use crate::policy::*;
     pub use crate::reachable::ReachableObject;
     pub use crate::selection::*;

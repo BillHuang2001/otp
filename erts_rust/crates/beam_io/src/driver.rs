@@ -45,8 +45,7 @@ use crate::completion::{CompletionEvent, PortCompletion};
 use crate::error;
 use crate::poller::{Interest, Poller, Token};
 use crate::port_failure::DriverFailure;
-use crate::port_task::ReadMessage;
-use crate::queue::ByteQueue;
+use crate::port_task::{ActiveInput, ActiveInputEvent, ReadMessage};use crate::queue::ByteQueue;
 /// Why a port is exiting, as reported to a driver through [`Driver::port_exit`].
 ///
 /// This is a small, closed vocabulary — deliberately *not* an Erlang term — because it is the
@@ -180,21 +179,26 @@ pub struct DriverContext<'a> {
     /// [`DriverContext::deliver_completion`] can see a failure latched earlier in the same
     /// callback and refuse to hand data up from a port that is on its way out.
     failure: Option<&'a mut Option<DriverFailure>>,
+    /// The port's sink for **`{active, …}` deliveries** — the `{tcp, S, Data}` /
+    /// `{udp, S, IP, Port, Data}` / `{tcp_passive, S}` / `{udp_passive, S}` messages an
+    /// active-mode socket owes the port's owner (see [`DriverContext::deliver_active_input`]) —
+    /// or `None` in a bare test context, where a driver that hands one up gets the typed
+    /// `unsupported` instead of the delivery being dropped.
+    active: Option<&'a mut VecDeque<ActiveInput>>,
 }
-
 impl<'a> DriverContext<'a> {
     /// Builds a context for `port` over the given disjoint poller/queue/arming borrows.
     ///
     /// Called by [`crate::port::Port`] after it has destructured itself into disjoint
-    /// fields, so the driver and its context borrow separate members of the `Port`. A context
-    /// built here has **no** read sink and **no** completion sink, so
-    /// [`DriverContext::deliver_read`] and [`DriverContext::deliver_completion`] answer the typed
-    /// Built here has **no** read sink, **no** completion sink and **no** failure latch, so
-    /// [`DriverContext::deliver_read`], [`DriverContext::deliver_completion`] and
+    /// fields, so the driver and its context borrow separate members of the `Port`.
+    ///
+    /// A context built here has **no** read sink, **no** completion sink, **no** active-input
+    /// sink and **no** failure latch, so [`DriverContext::deliver_read`],
+    /// [`DriverContext::deliver_completion`], [`DriverContext::deliver_active_input`] and
     /// [`DriverContext::signal_failure`] answer the typed `unsupported`; [`crate::port::Port`]
-    /// installs all three with
+    /// installs all four with
     /// [`DriverContext::with_reads`]/[`DriverContext::with_completions`]/
-    /// [`DriverContext::with_failure`] at every driver callback.
+    /// [`DriverContext::with_active`]/[`DriverContext::with_failure`] at every driver callback.
     pub(crate) fn new(
         port: PortId,
         poller: &'a mut Poller,
@@ -211,9 +215,9 @@ impl<'a> DriverContext<'a> {
             reads: None,
             completions: None,
             failure: None,
+            active: None,
         }
     }
-
     /// Installs `reads` as this context's completed-read sink (chainable).
     ///
     /// Every driver callback a [`crate::port::Port`] dispatches gets one, so a driver may
@@ -253,6 +257,21 @@ impl<'a> DriverContext<'a> {
         self
     }
 
+    /// Installs `active` as this context's `{active, …}` delivery sink (chainable).
+    ///
+    /// Every driver callback a [`crate::port::Port`] dispatches gets one — `start`, `output`,
+    /// `ready_input`, `ready_output`, `control`, `timeout`, `drive_async`, `port_exit` and
+    /// `stop` — so a driver may deliver an active-mode message from any of them, exactly as it
+    /// may deliver a read or a completion. The realistic one is `ready_input` (that is where the
+    /// C's `tcp_inet` reads a socket), but nothing here narrows it, because the C delivers
+    /// through `driver_send_term` from wherever the driver happens to be.
+    pub(crate) fn with_active(
+        mut self,
+        active: &'a mut VecDeque<ActiveInput>,
+    ) -> DriverContext<'a> {
+        self.active = Some(active);
+        self
+    }
     /// The port this context belongs to.
     pub fn port(&self) -> PortId {
         self.port
@@ -388,6 +407,50 @@ impl<'a> DriverContext<'a> {
         Ok(())
     }
 
+    /// Hands one **`{active, …}` delivery** up to the port's owner.
+    ///
+    /// This is the C's active-mode socket notification path — the message an
+    /// `{active, true}` / `{active, N}` / `{active, once}` socket sends its owner when input
+    /// arrives:
+    ///
+    /// * `tcp_message` (`erts/emulator/drivers/common/inet_drv.c:3979`) — `{tcp, S, Data}`;
+    /// * `packet_binary_message` (`:4110`) — the `{tcp, S, Data}` shape of a `{packet, N}` stream
+    ///   port, where the framing header is `read.header` and the payload `read.body`;
+    /// * `packet_passive_message` (`:4215`) — `{tcp_passive, S}` / `{udp_passive, S}` when an
+    ///   `{active, N}` counter runs out ([`ActiveInputEvent::Passive`], which carries no atom:
+    ///   the runtime picks the pair from the port's driver name).
+    ///
+    /// These are **messages to the owner**, not the `{Port, {data, Data}}` a passive socket
+    /// reports ([`PortNotification::Data`](crate::PortNotification::Data)) and not the answer to
+    /// a call ([`DriverContext::deliver_completion`]) — which is why they have their own channel,
+    /// with its own drain ([`crate::PortRegistry::take_active_inputs`]).
+    ///
+    /// The delivery is **stamped with this context's own port** ([`DriverContext::port`]), so a
+    /// driver cannot attribute it to another port. Deliveries are queued in call order, two are
+    /// never merged, and each is reported exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed `unsupported` diagnostic when this context has **no** active-input sink:
+    /// a bare context (a unit test, or a driver driven outside a port) has no owner to report to,
+    /// and dropping the delivery silently would lose the message the owner is waiting for in
+    /// `receive`. It also refuses after a failure latched earlier in the same callback, the same
+    /// rule [`DriverContext::deliver_read`]/[`DriverContext::deliver_completion`] follow.
+    pub fn deliver_active_input(&mut self, event: ActiveInputEvent) -> Result<()> {
+        if self.failure_latched() {
+            return Err(error::unsupported(
+                "a driver handed up an {active,…} delivery after signalling a port failure: the port is closing",
+            ));
+        }
+        let port = self.port;
+        let Some(active) = self.active.as_mut() else {
+            return Err(error::unsupported(
+                "a driver handed up an {active,…} delivery outside a port: no active-input sink is installed",
+            ));
+        };
+        active.push_back(ActiveInput { port, event });
+        Ok(())
+    }
     /// Closes this context's port, with `failure` as the reason — the C's `driver_failure*`
     /// family and `driver_exit`, which a driver calls from inside a callback to take its own port
     /// down ([`crate::port_failure`] carries the whole mapping).
@@ -403,11 +466,11 @@ impl<'a> DriverContext<'a> {
     /// **Exactly one** failure is latched: a driver that reports a second one (a
     /// `driver_failure_posix` followed by a `driver_exit`, say) is accepted and ignored, because
     /// in the C the first call has already closed the port. Once latched,
-    /// [`DriverContext::deliver_read`] and [`DriverContext::deliver_completion`] refuse — the Rust
+    /// [`DriverContext::deliver_read`], [`DriverContext::deliver_completion`] and
+    /// [`DriverContext::deliver_active_input`] refuse — the Rust
     /// counterpart of the C's `-1` from `driver_output*` on a dying port — and only the bytes that
     /// were handed up **before** the failure reach the owner (the pinned
-    /// `driver_output`-then-`driver_failure_posix` row).
-    ///
+    /// `driver_output`-then-`driver_failure_posix` row).    ///
     /// # Errors
     ///
     /// Returns the typed `unsupported` diagnostic when this context has **no** failure latch: a

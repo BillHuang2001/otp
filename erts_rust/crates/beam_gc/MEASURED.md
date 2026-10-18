@@ -31,6 +31,9 @@ Sections:
   — what the churn shape pays per operation.
 * [Post-fullsweep nursery sizing](#post-fullsweep-nursery-sizing-the-gc_boundchurn-win) — sizing the
   young heap from the round's observed demand instead of from zero: the counters and the A/B.
+* [The off-heap binary roster](#the-off-heap-binary-roster-reachability-reclaim-and-the-binary-virtual-heap-trigger)
+  — the reachability sweep flat in N, and the runtime probe that shows the missing virtual-heap
+  trigger costs one retained 64 KiB payload per call.
 
 ## The allocation-heavy workload
 
@@ -803,6 +806,155 @@ observes **`N`** at HEAD (10 000/25 000/50 000), passing with step 2 reverted �
 what moved that constant (owner: `beam_rt`'s assertion).
 **What the rule does and does not do.** It cuts the footprint and makes the nursery capacity track the
 live set; it does **not** realign the cadence, which is dominated by fullsweep-escalation frequency (the
-`gc_bound/churn` shape — "the minor→major escalation test" in `CONTEXT.md`) and by the nursery size the
+`gc_bound/churn` shape — "the minor→major escalation test" in `src/CONTEXT.md`) and by the nursery size the
 heap policy installs — so the residual 2.5×/18× is that sizing policy, `beam_gc`/`beam_rt`-owned, not the
 two-step rule.
+
+## The off-heap binary roster: reachability reclaim and the binary-virtual-heap trigger
+
+Sources: `tests/offheap_retention.rs` (the in-crate ladder and the without-sweep contrast — all
+deterministic counters, asserted in the test) and an end-to-end probe of the real `beam_rt` binary on a
+purpose-built `.beam` (below). The ladder runs from the repository root with
+
+```
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc \
+    --test offheap_retention -- --nocapture
+```
+
+**What is measured.** The two seams of this crate's off-heap half. The **reclaim** is
+`src/offheap.rs`'s `sweep_unreachable_binaries` — the C `sweep_off_heap`: it drops every
+`OffHeapEntry::Binary` that no reachable `BinRef` names, always keeps the `Mso` entries, and is
+slot-stable through `OffHeap::sweep`. The **trigger** is `src/bin_vheap.rs`'s `BinVheap`: the
+surviving overhead's word count against `limit_words`, i.e. the C `ERTS_IS_GC_DESIRED_INTERNAL`
+`off_heap.overhead > bin_vheap_sz` clause, with `record_collection` re-seeding the limit through the
+C `do_next_vheap_size` rule (grow at ≈1.618, shrink by half, floored by
+`HeapPolicy::min_bin_vheap_words`). The ladder isolates the reclaim by building a fresh collector per
+N; the runtime probe shows what the **missing trigger** costs when the roster is owned outside this
+crate.
+
+### The in-crate ladder — flat in N
+
+The workload allocates one `RefcBinary::with_capacity(65_536)` payload per call, roots the frozen
+`[BinRef][ErlSubBits]` handle pair naming it, registers the owning handle in the roster, and — when
+`BinVheap::triggered_for` fires — collects, sweeps the roster and re-seeds the limit from what
+survived; a final collection and sweep settle the ladder, and every figure below is that settled
+state. One retained payload reports **262 192 B** of `binary_alloc` `live_bytes` because the
+reservation is **4×** the requested capacity, and the carrier is one 1 MiB block. The policy is the
+crate default `min_heap_words` (233) with `max_heap_words` = `1 << 16` as a real ceiling and
+`min_bin_vheap_words` at its default floor.
+
+| N | `binary` live | carrier | roster len (peak) | released | collections | heap | debt |
+|---|---|---|---|---|---|---|---|
+| 0 | 0 B | 0 B | 0 (0) | 0 | 1 | 233 w, 1 space | false |
+| 250 | 262 192 B | 1 048 576 B | 1 (6) | 249 | 50 | 233 w, 1 space | false |
+| 500 | 262 192 B | 1 048 576 B | 1 (6) | 499 | 100 | 233 w, 1 space | false |
+| 1 000 | 262 192 B | 1 048 576 B | 1 (6) | 999 | 200 | 233 w, 1 space | false |
+
+**Flat in N.** Live bytes, carrier bytes, roster length and the roster's peak are *identical* at
+N = 500 and N = 1 000: the roster holds exactly the payload the loop is still using, whatever N is,
+while the collection count carries the loop (≈one per five calls, the settling collection included).
+The heap never leaves the 233-word `H_DEFAULT_SIZE` floor with a single space and `debt` stays
+`false`, so none of the shape's cost is the collector's footprint. Over the whole ladder the
+process's `VmHWM` moves **3 600 → 4 296 KiB**.
+
+**Without the reachability sweep** — the owner keeping its own roster and collecting only its heap —
+the same loop at N = 250:
+
+| measure | with `sweep_unreachable_binaries` (N = 250) | roster untouched (N = 250) |
+|---|---|---|
+| `binary` live | 262 192 B | **65 548 000 B** |
+| carrier | 1 048 576 B | **88 080 384 B** |
+| roster len (peak) | 1 (6) | 250 (250) |
+| released | 249 | 0 |
+
+i.e. **one retained 64 KiB payload per call, ≈64 KiB/call** of allocator live bytes grown
+monotonically. The roster is a leak unless something reclaims it, and a heap collection alone cannot
+(the runtime probe below).
+
+### End-to-end probe of the real `beam_rt` binary
+
+A purpose-built module (`expand/1`: one `bs_init_writable` plus 16 384 `private_append`s per call,
+64 KiB out) run as `beam_rt run expand.beam expand:expand/1 N`, reporting `erlang:memory(binary)`,
+`process_info(self(), binary)` and `erlang:memory(processes)`; peak RSS from `/proc/<pid>/status`
+`VmHWM`. The build deliberately stays below the on-heap limit so every call materializes off-heap.
+
+| N | `erlang:memory(binary)` | off-heap roster len | `erlang:memory(processes)` | peak RSS |
+|---|---|---|---|---|
+| 0 | 16 432 B | 0 | 445 904 B | — |
+| 200 | 13 133 232 B | 201 | 1 416 328 B | 129 432 KiB |
+| 800 | 52 483 632 B | 801 | 1 416 328 B | 168 548 KiB |
+
+**One payload per call.** The roster is `N + 1` (the live payload plus one retained per call), and
+the N = 200 → N = 800 delta is 39 350 400 B over 600 calls — **65 584 B/call**, one 65 536-byte
+payload plus a small fixed residue. The **process-heap total is flat** between N = 200 and N = 800
+(1 416 328 B at both), which is the counter-evidence against any collector-side retention: the
+young/mature generations are not what grows. Peak RSS tracks the payload count at a slope of ≈65 KB
+per call over a ≈113 MB boot baseline.
+
+### The decisive negative result — an explicit collection reclaims nothing
+
+The same probe with an explicit `erlang:garbage_collect()` every 100 calls changes **nothing**:
+the roster len reads 2 → 102 → 202 → … → 801, `erlang:memory(binary)` is exactly **100 × 65 536 B**
+at every probe, and the run ends at 52 483 632 B / roster 801 / peak RSS 168 024 KiB — against
+52 483 632 B / 801 / 168 548 KiB without the extra collections.
+
+A collection reclaims **no** off-heap payload whose owning handle lives outside the process heap: the
+collector can only report which on-heap `BinRef`s are reachable, and the owner must act on that
+report. That is what the two seams above are for, and it is also why the roster needs a **trigger**
+that reaches it at all — a loop that reaches no heap-admission door runs no collection of either kind
+to offer the reclamation, which is the role of `BinVheap::triggered_for` at the allocation site.
+
+**Caveats.** The host is shared, so only **structural** figures are quoted as assertions: the
+allocator's `live_bytes`/`carrier_bytes`, the roster length and its peak, the heap capacity and space
+count, the collection counts, and the exact 65 536 B payload constant. **No wall clock appears in this
+section.** The `VmHWM` figures are peak-RSS observations on that shared host rather than assertions,
+and they carry a ≈113 MB boot baseline, so the load-bearing quantity is their **slope** against N,
+never their absolute value; the in-crate ladder's 3 600 → 4 296 KiB span is four separate serialized
+runs (one collector each, serialized because the allocator registry is process-global), not one
+process growing. And the reader must not conclude from the runtime probe that this crate's collector
+retains anything — the flat `erlang:memory(processes)` figure between N = 200 and N = 800 is the
+counter-evidence. This crate's half (the walk, the sweep and the virtual-heap rule) is complete and
+measured in isolation, but the end-to-end figure stays exactly what the table shows until the owner of
+the per-process roster adopts the seam where its full root set is scanned: **no number above is a
+claim that the runtime no longer retains those payloads.**
+
+## The accounting band (a footprint against the allocator's own live bytes)
+`tests/heap_accounting.rs::accounted_bytes_track_the_allocators_live_bytes` builds a synthetic
+workload — two `grow_nursery` calls over an 8 192-word nursery with 600 + 200 cons cells kept
+live, plus 256 `RefcBinary` payloads of 4 096 B registered in a `beam_gc::OffHeap` — and compares
+`HeapFootprint::heap_bytes()` against `beam_alloc::registry::all_stats()`'s summed `live_bytes`:
+
+| quantity | value |
+|---|---|
+| `young_capacity_words` / `young_used_words` | 120 187 words (961 496 B) / 1 600 words (12 800 B) |
+| `mature_capacity_words` / `mature_used_words` | 8 192 words / 0 |
+| `off_heap_payload_bytes` | 1 048 576 B (256 × 4 096) |
+| `off_heap_slot_bytes` | 16 384 B (256 reserved slots) |
+| `heap_bytes()` | 2 010 072 B |
+| `total_bytes()` | 2 026 456 B |
+| allocator `live_bytes` (all types) | 2 022 432 B |
+| **`heap_bytes() / live_bytes`** | **0.99389** |
+
+The pinned band is **[0.90, 1.00]**: `heap_bytes() <= live_bytes` is the honesty direction (nothing
+this crate accounts for may exceed what the allocators say they hold), and the 90 % floor is what
+catches a silently dropped half. The 12 360 B remainder is entirely allocator-side and is named in
+the test: 12 288 B = 256 × 48 B of `RefcBinary` control header plus size-class rounding (a 4 096 B
+payload measures 4 144 live bytes), and 72 B = the four heap blocks' size-class rounding
+(961 568 live for 961 496 reserved). Both halves are load-bearing: heap capacity is 47.5 % of
+`live_bytes` and the payload is 51.9 %, so neither one alone can pass the 90 % floor.
+**Stability:** five consecutive runs printed bit-identical figures (`heap_bytes=2010072,
+total_bytes=2026456, live=2022432`); the workload tests serialise on a mutex because the allocator
+registry is process-global. **Caveats.** Structural figures only — no wall clock, no RSS, and
+`heap_bytes()` deliberately excludes the roster array (16 384 B here), which no allocator type
+records; `total_bytes()` includes it. `heap_used_words()` counts the chain, so the retired space's
+1 600 live words appear in the footprint where `young().used_words()` alone reports 0.
+
+## What a reported `erlang:memory(total)` actually moved (m16 A/B, runtime-side)
+Two release `beam_rt` binaries (m15-era `a34ca61332` vs that session's HEAD), one `-eval` probe
+each, modal value of 20 / 12 runs: `total` 13 222 861 → 6 788 542 B, of which **`processes`**
+(reserved process-heap capacity) accounts for −6 462 312 B, `code` +27 604 B, `atom` +917 B,
+`emulator` −528 B, `binary` and `ets` unchanged. Both identities (`processes + system = total`,
+`atom + binary + code + ets + emulator = system`) close exactly. The category map, the per-key
+tables and the handoffs live in `src/ACCOUNTING.md`; this section records only the figures. Not a
+crate assertion — these are the runtime's own totals, and the per-key spread across repeated runs
+(`processes` in whole-heap-size steps of 1 872–6 024 B) is why each side is quoted as a modal value.

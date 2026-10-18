@@ -124,6 +124,16 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// leaves the growth seam its headroom and is measured indistinguishable from `1/1` in the
 /// counters.
 ///
+/// **The A/B figures above are that A/B's tree state.** The copy-out hint gate in
+/// [`crate::context::calls`] (`hint_grow_gate`) now grows the churn shape's nursery **before** its
+/// 257-word tuple copy-out instead of after a refusal, and the growth event (one retired space ⇒
+/// one collection debt) shifts that shape's schedule: the current tip measures **7.6730
+/// collections and 1.2570 majors per iteration** at N = 2 000 (15 346 / 2 514 over 2 001 calls,
+/// one young space of **609** words), the door firing on **113 of 904** boundaries — still inside
+/// the `1/9`…`1/7` band, so the door's own rationing is unchanged and the growth events, not the
+/// door, set the new cadence. Numbers and the sibling re-derivation it implies:
+/// [`IMPLEMENTATION.md`](../../IMPLEMENTATION.md#the-learned-copy-out-hint--copy_out_hint--hint_grow_gate-the-copy-bound-fix).
+///
 /// **What would regress it:** a shape whose slice-boundary occupancy sits in `[1/2, 7/8)` — it
 /// would then be collected only through the debt arm, and if its growth seam retired no space it
 /// would climb again. Not observed: the churn shape is bimodal in eighths (12 of 95 checks empty,

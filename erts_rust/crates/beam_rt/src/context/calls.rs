@@ -421,6 +421,7 @@ impl<'a> RuntimeContext<'a> {
                 gc_armed: _,
                 dispatch_memo: _,
                 lent_tables,
+                copy_out_hint: _,
             } = self;
             // The ETS registry this call installs. Two sources, in precedence order:
             //
@@ -935,10 +936,19 @@ impl<'a> RuntimeContext<'a> {
     /// # The walk
     ///
     /// [`beam_term::layout::for_each_child_slot`] — the workspace's canonical per-shape child
-    /// enumeration, the same one the copier and the unscanned-root valve drive — over an explicit
-    /// worklist, with each object's address visited once so a shared or cyclic subgraph costs one
-    /// visit. Literals are skipped: a frozen code constant lives in the literal area and can name
-    /// nothing on this heap. So is every word that is **not a readable term** (see *Safety*).
+    /// enumeration, the same one the copier and the unscanned-root valve drive — over a
+    /// **hash-free** worklist ([`Walklist`]): an inline buffer of [`WALK_INLINE_ITEMS`] words plus a
+    /// spill `Vec` allocated only when a graph really is wider than that, so an ordinary result
+    /// allocates **nothing** and pays no per-object bookkeeping. The walk therefore keeps **no
+    /// visited set** — a well-formed BEAM term graph is acyclic, so a plain worklist terminates —
+    /// and is bounded instead by [`WALK_VISIT_BUDGET`]: a **forged** cycle exhausts the budget and
+    /// answers `true`, i.e. "assume it holds a reference", which only *declines the move* (the
+    /// result stays on the pooled heap and the call does not rewind — the residual this function
+    /// documents at its call site), never a wrong move. A *shared* subgraph is re-walked once per
+    /// parent, which costs a bounded constant factor and no allocation.
+    ///
+    /// Literals are skipped: a frozen code constant lives in the literal area and can name nothing
+    /// on this heap. So is every word that is **not a readable term** (see *Safety*).
     ///
     /// # Safety
     ///
@@ -952,8 +962,11 @@ impl<'a> RuntimeContext<'a> {
     /// itself and lets the copier refuse.
     #[allow(unsafe_code)]
     fn graph_holds_reference(term: Eterm) -> bool {
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut work: Vec<Eterm> = vec![term];
+        #[cfg(test)]
+        notes::note_walk_call();
+        let mut work = Walklist::new();
+        let mut budget = WALK_VISIT_BUDGET;
+        work.push(term);
         while let Some(item) = work.pop() {
             // Three words can reach the worklist without being a readable container, and each is
             // skipped here so nothing below ever dereferences it.
@@ -980,9 +993,14 @@ impl<'a> RuntimeContext<'a> {
                 continue;
             };
             let address = address as *const Eterm;
-            if !seen.insert(address as usize) {
-                continue;
+            #[cfg(test)]
+            notes::note_walk_visit();
+            // The budget is the only bound the walk has (see *The walk*): a forged cycle would
+            // otherwise spin here forever.
+            if budget == 0 {
+                return true;
             }
+            budget -= 1;
             if beam_term::prelude::is_list(item) {
                 // SAFETY: `item` is a term word with the `LIST` primary tag whose cell pointer is
                 // non-null and aligned, so the two words at that address are its live `car` and
@@ -1013,6 +1031,7 @@ impl<'a> RuntimeContext<'a> {
         }
         false
     }
+
     /// Moves a container a **scratch region** owns onto a region that **outlives the call**,
     /// returning the term Erlang code must see instead — or the term unchanged when it is an
     /// immediate, a literal, or a container the copier refused (in which case the scratch region
@@ -1139,10 +1158,34 @@ impl<'a> RuntimeContext<'a> {
     /// resolves — `clone_slot` is `None` ⇒ `bad_term`), so the local table's MSO list is provably
     /// empty on every success and `drain_handles` can never re-slot a container whose on-heap
     /// `val` word would then name the wrong slot.
+    ///
+    /// # The copy is hinted, not guessed
+    ///
+    /// A refusal is by far the most expensive outcome of this function: the copier's fast
+    /// path has already run, so recovering the size means `preflight_words` →
+    /// `beam_term::size::size_object_bounded_with` (a `HashSet`-backed walk) → the
+    /// acyclicity check (two more sets) → `size_object_with`, i.e. five traversals of the
+    /// graph and three hash tables — all to *learn* a number
+    /// [`copy_shortfall_words`] then also reports for free. A copy-bound loop (the
+    /// `copy_bound/ets_copy` benchmark shape) meets that cost on essentially every op,
+    /// because a collection collapses the nursery back to the `233`-word floor while the
+    /// payload in flight is already larger than what a half-full node has free.
+    ///
+    /// So the refusal also **teaches** the context: its own word count becomes
+    /// [`RuntimeContext::copy_out_hint`] (`max`, never a replacement — the hint is a lower
+    /// bound), and every later copy-out **spends** it first — see [`hint_grow_gate`].
+    ///
+    /// The gate is purely additive: with a hint of `0` (a context's first copy-out) this
+    /// function behaves exactly as it did before, and the grow-and-retry below remains the
+    /// fallback for every refusal the gate cannot pre-empt (a result larger than the hint, a
+    /// `max_heap_size` ceiling, a destination that is not an exhaustion).
     fn move_result_into_process_heap(&mut self, term: Eterm) -> Option<Eterm> {
         // `ProcessId` is `Copy`, so read it before the destructure (match ergonomics, as the
-        // dispatch block above does).
+        // dispatch block above does). The hint is `Copy` for the same reason — and reading it
+        // here keeps it a *disjoint field* loan from `runtime`/`mailbox_table`, which is also
+        // what lets the refusal arm below write it back through `self`.
         let pid = self.mailbox_pid;
+        let hint = self.copy_out_hint;
         let RuntimeContext {
             runtime,
             mailbox_table,
@@ -1152,6 +1195,9 @@ impl<'a> RuntimeContext<'a> {
         // for byte (the result stays on the pooled heap, which is then not rewound).
         let table = mailbox_table.as_deref_mut()?;
         let process = table.get_mut(pid)?;
+        // Spend the hint BEFORE the first attempt, so the copy succeeds on its first pass
+        // instead of paying the refusal it would otherwise teach us again.
+        hint_grow_gate(process, hint);
         // One fresh destination table per attempt (see the docs above): a refused attempt's
         // partial state is never rolled into the retry, so both attempts hand the copier an
         // empty destination and take the single-traversal fast path.
@@ -1171,15 +1217,61 @@ impl<'a> RuntimeContext<'a> {
             // `words * size_of::<Eterm>()`), so the growth hint costs no second traversal of the
             // graph: `beam_term::size_object(term)` — the obvious alternative — walks it all over
             // again *and* builds a `HashSet` plus a `Vec` on the way.
-            Err(error) => copy_shortfall_words(&error),
+            Err(error) => {
+                let needed = copy_shortfall_words(&error);
+                // LEARN: remember the graph size this process has proven it builds, so the
+                // next copy-out of the same shape is grown to fit *before* it is attempted.
+                // It is a `max`, so a one-off large result can never shrink what an earlier
+                // one taught, and the write is a disjoint field of the loans destructured
+                // above.
+                self.copy_out_hint = self.copy_out_hint.max(needed);
+                needed
+            }
         };
         // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
         // and moves no live term, so the copy can simply be re-attempted from the fresh space's
-        // base — `needed` is the copier's exact flat word count, so the retry fits. The floor of
-        // 256 keeps a small result from landing exactly on the new space's edge.
+        // base.
+        //
+        // The request carries **headroom**, never the copier's bare shortfall. Growing by
+        // `needed` alone leaves the fresh destination barely larger than the graph that forced
+        // it, so the next result of the same size refuses again and pays the whole sizing path of
+        // a refused copy (`try_copy_fast` → `preflight_words` → the bounded sizing walk →
+        // `size_object_with`) for one more table step. Asking for
+        // `needed * GROW_HEADROOM_FACTOR` instead (floored at `GROW_MIN_WORDS`) makes **one**
+        // growth serve many copies: 1024 words is already past the growth table's 987→1598 step
+        // ([`HeapPolicy::next_words`](beam_gc::HeapPolicy::next_words) over the C `heap_sizes[]`,
+        // `erl_gc.c:262-291`), so the installed young space is ≥1598 words — one step up and with
+        // room to spare for the next ~20 results of the `copy_bound` shape.
+        //
+        // That is the discipline the C runtime applies to its own heaps: a collection never
+        // installs `size_before` but `next_heap_size(p, size_before, 0)`, i.e. **the next table
+        // size at or above the requirement**, and when that would not actually grow the heap it
+        // steps one entry further (`next_heap_size(p, HEAP_SIZE(p), 1)`,
+        // `erts/emulator/beam/erl_gc.c:1879-1888`). `Nursery::grow` rounds the request the same
+        // way and, when the one-step size would not enlarge the current space, at least doubles
+        // it — so a growth request is never "the shortfall, exactly".
+        //
+        // `Nursery::grow` may satisfy the whole request for free by re-adopting an already
+        // retired space nothing was ever allocated in (`empty_retired_for`), and the spaces it
+        // does retire are only reclaimed by a later **collection** (`Nursery::collapse`): the
+        // headroom is a capacity request, not an allocation, and it adds no per-call work.
         #[cfg(test)]
         notes::note_grow();
-        process.grow_nursery(needed.max(256)).ok()?;
+        let request = needed
+            .saturating_mul(GROW_HEADROOM_FACTOR)
+            .max(GROW_MIN_WORDS);
+        if process.grow_nursery(request).is_err() {
+            // A configured `max_heap_size` (`+hmax`, `spawn_opt`'s `{max_heap_size,…}`) bounds
+            // the nursery chain's **summed** capacity, and `Nursery::grow` refuses a request its
+            // remaining budget cannot reach (`crates/beam_gc/src/nursery.rs:339-345`). The
+            // headroom request could therefore be refused where the bare shortfall still fits, so
+            // fall back to exactly that — the smallest growth the copier provably needs — rather
+            // than turning a growth that was reachable into a hard failure. A refusal retires
+            // nothing, so the retry starts from the identical nursery.
+            #[cfg(test)]
+            notes::note_grow();
+            process.grow_nursery(needed.max(256)).ok()?;
+        }
         copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term).ok()
     }
 
@@ -1500,6 +1592,141 @@ pub(super) fn copy_result_fresh(
     outcome
 }
 
+/// The inline capacity of [`RuntimeContext::graph_holds_reference`]'s worklist.
+///
+/// The walk never holds more than a handful of pending children (it pushes a container's slots and
+/// pops them immediately), so an ordinary BIF result — the `copy_bound` payload is 27 objects topped
+/// by a 5-key flat map — stays inside this buffer and the walk allocates nothing at all.
+const WALK_INLINE_ITEMS: usize = 64;
+
+/// The visit budget of [`RuntimeContext::graph_holds_reference`]'s walk.
+///
+/// The walk keeps no visited set (a well-formed BEAM term graph is acyclic, so a plain worklist
+/// terminates), so this is its only bound: a **forged** cycle exhausts it and the walk answers
+/// `true` — "assume it holds a reference". That answer only *declines the move* (the result keeps
+/// its pooled words and the call does not rewind), never a wrong move.
+const WALK_VISIT_BUDGET: usize = 1 << 20;
+
+/// The worklist [`RuntimeContext::graph_holds_reference`] walks a result graph with: an inline
+/// buffer of [`WALK_INLINE_ITEMS`] terms plus a spill `Vec` that is allocated **only** when a graph
+/// is genuinely wider than that.
+///
+/// `Eterm` is `Copy`, so a push costs one word and no reference counting, and the whole structure is
+/// stack-resident in the common case — which is what replaced a `HashSet` (SipHash) plus a growing
+/// `Vec` per call, the per-object bookkeeping this walk must not pay on the hot path of every
+/// container-returning BIF.
+struct Walklist {
+    inline: [Eterm; WALK_INLINE_ITEMS],
+    len: usize,
+    spill: Vec<Eterm>,
+}
+
+impl Walklist {
+    /// An empty worklist: the inline buffer unread, the spill not yet allocated (`Vec::new`).
+    fn new() -> Self {
+        Self {
+            inline: [beam_term::prelude::NIL; WALK_INLINE_ITEMS],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// Pushes one term to visit, spilling only once the inline buffer is full.
+    fn push(&mut self, item: Eterm) {
+        if self.len < WALK_INLINE_ITEMS {
+            self.inline[self.len] = item;
+            self.len += 1;
+        } else {
+            #[cfg(test)]
+            notes::note_walk_spill();
+            self.spill.push(item);
+        }
+    }
+
+    /// Pops the next term to visit — the spill first, so the inline buffer stays the common path.
+    fn pop(&mut self) -> Option<Eterm> {
+        if let Some(item) = self.spill.pop() {
+            return Some(item);
+        }
+        self.len = self.len.checked_sub(1)?;
+        Some(self.inline[self.len])
+    }
+}
+
+/// The multiple of a refused copy's own shortfall that [`RuntimeContext::move_result_into_process_heap`]
+/// asks the nursery to grow by.
+///
+/// A refusal is expensive (a second sizing traversal) while a growth is not, so the request is
+/// deliberately several times the graph that forced it. See the growth block in
+/// [`RuntimeContext::move_result_into_process_heap`] for the measurement and the C rule it matches.
+const GROW_HEADROOM_FACTOR: usize = 4;
+
+/// The floor, in term words, of a copy-out's growth request.
+///
+/// 1024 is the smallest request whose [`HeapPolicy::next_words`](beam_gc::HeapPolicy::next_words)
+/// target clears the growth table's `987` entry, so the installed young space is always ≥1598
+/// words — the size a `copy_bound`-shaped result (≈73 words) fits about twenty times over, one
+/// table step above the `376` a bare-shortfall growth installs from the default 233-word nursery
+/// (`erl_gc.c:262-291`).
+const GROW_MIN_WORDS: usize = 1024;
+
+/// The floor, in term words, of the headroom [`hint_grow_gate`] adds to a learned hint.
+///
+/// A quarter of the hint is the proportional term, but it is too small to matter at the sizes
+/// that actually refuse: the `copy_bound/ets_copy` payload refuses at ≈73 words, whose quarter
+/// is 18 — barely a fifth of one 73-word result. The floor keeps the pre-copy request a whole
+/// small container ahead, so the grown destination survives the copy-out's own result **and**
+/// the next few of its owner's allocations before the next gate.
+const COPY_OUT_HINT_MARGIN_MIN: usize = 32;
+
+/// The smallest learned hint worth spending a growth on, in term words.
+///
+/// Below this the graph is smaller than a 4-element tuple: it can only refuse onto a nursery
+/// that is essentially full, where the ordinary grow-and-retry would already have to run, so
+/// the gate would add a growth without removing one. It is the "hint is not learned yet"
+/// guard (`0`) plus the trivial sizes, in one test.
+const COPY_OUT_HINT_MIN_WORDS: usize = 8;
+
+/// Spends a learned copy-out hint: grows the destination **before** the copy is attempted, so a
+/// result of a shape this process has already been refused for is copied on its first traversal.
+///
+/// `hint` is [`RuntimeContext::copy_out_hint`] — the flat word count of the largest graph a
+/// refused copy has reported for this context ([`copy_shortfall_words`]) — and the request adds
+/// [`COPY_OUT_HINT_MARGIN_MIN`] (or a quarter of the hint, whichever is larger) so the grown
+/// destination also has room for the copy-out's own result slot and the caller's next few
+/// allocations.
+///
+/// # The growth is the NO-RELOCATION seam, which is why it is legal here
+///
+/// [`Process::grow_nursery`] retires the space it replaces and **moves no live term**, so it is
+/// correct for a host holding an incomplete or unpublished root set — exactly this situation: a
+/// registered BIF runs with the executing machine's x registers and Erlang stack *not*
+/// published ([`RuntimeContext::move_result_into_process_heap`]'s growth block states the same
+/// for its own retry). Collecting here instead would free live terms.
+///
+/// A destination that already has `request` words free is left alone: `Nursery::grow` would
+/// return `Ok` without installing anything, so the test only saves the call.
+///
+/// A refused request (`+hmax` / `spawn_opt`'s `{max_heap_size,…}` bounds the nursery chain's
+/// **summed** capacity) degrades to the bare hint and then simply returns: the ordinary path's
+/// own refusal + grow + retry still runs, so a ceiling can only ever cost the pre-copy
+/// opportunity, never the copy.
+fn hint_grow_gate(process: &mut beam_process::Process, hint: usize) {
+    if hint < COPY_OUT_HINT_MIN_WORDS {
+        return;
+    }
+    let request = hint.saturating_add((hint / 4).max(COPY_OUT_HINT_MARGIN_MIN));
+    if process.heap_mut().available() >= request {
+        return;
+    }
+    #[cfg(test)]
+    notes::note_hint_grow();
+    if process.grow_nursery(request).is_err() {
+        // A `max_heap_size` ceiling: degrade to the bare hint, never a hard failure.
+        let _ = process.grow_nursery(hint);
+    }
+}
+
 /// The flat word count a refused copy reported it could not fit.
 ///
 /// [`beam_message`]'s **message-heap exhaustion** ([`beam_message::is_message_heap_exhaustion`])
@@ -1545,7 +1772,8 @@ fn invoke_registered(
     }
     bif(context, args)
 }
-/// Test-only structural counters for the copy-out (`RuntimeContext::move_result_into_process_heap`).
+/// Test-only structural counters for the copy-out (`RuntimeContext::move_result_into_process_heap`)
+/// and for the reference walk it runs first (`RuntimeContext::graph_holds_reference`).
 ///
 /// **Thread-local**, so a test that drives the copy-out reads only the counts *it* produced and the
 /// crate's parallel unit tests cannot perturb them (each `cargo test` case runs on its own thread).
@@ -1556,6 +1784,8 @@ fn invoke_registered(
 /// * `empty_destination_attempts` — one per attempt whose destination table was **fully empty** as
 ///   handed to the copier, i.e. the copier's single-traversal fast path was eligible. Computed from
 ///   the table's **public** API (the same three-list test `is_fast_path_eligible` makes).
+/// * [`WalkCounts`] — the reference walk's own counters ([`snapshot`] keeps its three-tuple shape and
+///   meaning; [`walk_snapshot`] reads the walk's).
 #[cfg(test)]
 mod notes {
     use core::cell::Cell;
@@ -1563,7 +1793,30 @@ mod notes {
     thread_local! {
         static COPY_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
         static GROW_RETRIES: Cell<usize> = const { Cell::new(0) };
+        static HINT_GROWS: Cell<usize> = const { Cell::new(0) };
         static EMPTY_DESTINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static WALK_CALLS: Cell<usize> = const { Cell::new(0) };
+        static WALK_VISITS: Cell<usize> = const { Cell::new(0) };
+        static WALK_HASH_INSERTS: Cell<usize> = const { Cell::new(0) };
+        static WALK_SPILLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The reference walk's counters, in one value so a test can assert them as a unit.
+    ///
+    /// * `calls` — one per [`RuntimeContext::graph_holds_reference`] invocation.
+    /// * `visits` — one per **dereferenced object** visited (an object whose word passed every
+    ///   readability guard and whose address resolved), i.e. the walk's real work.
+    /// * `hash_inserts` — one per **hashed** bookkeeping insert the walk performs. The walk is
+    ///   hash-free by construction, so this is `0`; the counter exists to keep that a pinned
+    ///   property instead of a comment (a walk that reintroduces a `HashSet` must charge it).
+    /// * `spills` — one per worklist item that did **not** fit the walklist's inline buffer (and so
+    ///   forced the lazily allocated spill). `0` for every ordinary result.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct WalkCounts {
+        pub(super) calls: usize,
+        pub(super) visits: usize,
+        pub(super) hash_inserts: usize,
+        pub(super) spills: usize,
     }
 
     /// Records one copy attempt against the destination table `destination`, classifying it as an
@@ -1578,16 +1831,62 @@ mod notes {
         }
     }
 
-    /// Records one `grow_nursery` call.
+    /// Records one `grow_nursery` call answering a refusal (the grow-and-retry fallback and its
+    /// ceiling fallback), i.e. one growth a **refused** copy paid for.
     pub(super) fn note_grow() {
         GROW_RETRIES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one `grow_nursery` call made by the **learned-hint** gate
+    /// ([`hint_grow_gate`]) before a copy attempt, i.e. one growth that pre-empted a refusal
+    /// rather than answering one.
+    pub(super) fn note_hint_grow() {
+        HINT_GROWS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one [`RuntimeContext::graph_holds_reference`] invocation.
+    pub(super) fn note_walk_call() {
+        WALK_CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one **dereferenced object** the reference walk visited.
+    pub(super) fn note_walk_visit() {
+        WALK_VISITS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// This thread's count of **learned-hint** growths ([`note_hint_grow`]), i.e. of copies the
+    /// gate pre-empted a refusal for. Read next to [`snapshot`], whose second element counts the
+    /// growths that *answered* a refusal.
+    pub(super) fn hint_grows() -> usize {
+        HINT_GROWS.with(Cell::get)
+    }
+
+    /// Records one hashed bookkeeping insert the reference walk performed.
+    ///
+    /// Nothing in the walk charges it: the walk is hash-free by construction ([`Walklist`]), so
+    /// `hash_inserts` is `0` — the counter and its setter exist so the walk's own suite asserts that
+    /// as a **pinned property** and so a walk that reintroduces a `HashSet` has the one obvious
+    /// place to charge it.
+    #[allow(dead_code)]
+    pub(super) fn note_walk_hash_insert() {
+        WALK_HASH_INSERTS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one worklist item the reference walk had to spill off its inline buffer.
+    pub(super) fn note_walk_spill() {
+        WALK_SPILLS.with(|c| c.set(c.get() + 1));
     }
 
     /// Zeroes this thread's counters, so a test measures only its own work.
     pub(super) fn reset() {
         COPY_ATTEMPTS.with(|c| c.set(0));
         GROW_RETRIES.with(|c| c.set(0));
+        HINT_GROWS.with(|c| c.set(0));
         EMPTY_DESTINATION_ATTEMPTS.with(|c| c.set(0));
+        WALK_CALLS.with(|c| c.set(0));
+        WALK_VISITS.with(|c| c.set(0));
+        WALK_HASH_INSERTS.with(|c| c.set(0));
+        WALK_SPILLS.with(|c| c.set(0));
     }
 
     /// This thread's `(copy_attempts, grow_retries, empty_destination_attempts)`.
@@ -1597,6 +1896,16 @@ mod notes {
             GROW_RETRIES.with(Cell::get),
             EMPTY_DESTINATION_ATTEMPTS.with(Cell::get),
         )
+    }
+
+    /// This thread's [`WalkCounts`] — the reference walk's own counters.
+    pub(super) fn walk_snapshot() -> WalkCounts {
+        WalkCounts {
+            calls: WALK_CALLS.with(Cell::get),
+            visits: WALK_VISITS.with(Cell::get),
+            hash_inserts: WALK_HASH_INSERTS.with(Cell::get),
+            spills: WALK_SPILLS.with(Cell::get),
+        }
     }
 }
 

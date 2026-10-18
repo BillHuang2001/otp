@@ -481,6 +481,25 @@ impl HeapObservable for AnyCollector {
         }
     }
 
+    /// The words handed out across **every** nursery space — forwarded to whichever strategy is
+    /// selected, so the answer is strategy-agnostic (both share the young nursery chain).
+    fn heap_used_words(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.heap_used_words(),
+            AnyCollector::Immix(c) => c.heap_used_words(),
+        }
+    }
+
+    /// The whole nursery chain's occupancy plus the selected strategy's mature occupancy —
+    /// forwarded to whichever strategy is selected.
+    /// The mark-region mature generation accounts in whole lines, so its half of the figure is
+    /// line-rounded.
+    fn total_heap_used_words(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.total_heap_used_words(),
+            AnyCollector::Immix(c) => c.total_heap_used_words(),
+        }
+    }
     fn heap_policy(&self) -> &HeapPolicy {
         self.policy()
     }

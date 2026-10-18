@@ -46,12 +46,9 @@
 //!   second concurrent operation with `EALREADY` (`ctl_error(EALREADY)`, `:12307`), which the
 //!   caller sees as `[0]ealready`. Both socket drivers use it for their receive requests
 //!   (`TCP_REQ_RECV` 42 on `tcp_inet`, `PACKET_REQ_RECV` 60 on `udp_inet`).
-//! * **Accepts are a multi-operation list**: `INET_REQ_ACCEPT` (26) uses `enq_multi_op`
-//!   (`:12194`/`:12209`), so N pending accepts each get their own id, all answer `[1] ++ id` and
-//!   complete **in order** as connections arrive. The descriptor state carries the C's
-//!   `INET_F_ACC` (one pending accept) / `INET_F_MULTI_CLIENT` (two or more) bits while that list
-//!   is non-empty (`INET_STATE_ACCEPTING`/`INET_STATE_MULTI_ACCEPTING`, `:1031`-`:1032`), which is
-//!   what `INET_REQ_GETSTATUS` reports ([`AsyncQueue::accept_state_bits`]).
+//! * **Accepts are a multi-operation list** (`enq_multi_op`, `:12194`/`:12209`), whose ids this
+//!   queue's one counter hands out while the list itself — its per-port timer entries and the
+//!   sticky `INET_F_MULTI_CLIENT` bit — is [`super::accept`]'s.
 //!
 //! # The id counter
 //!
@@ -69,9 +66,12 @@
 //!
 //! 1. **socket readiness** — `Driver::ready_input`, with read readiness armed while an operation is
 //!    pending (the C's `sock_select(FD_READ, 1)`);
-//! 2. **the port timer** — `Driver::next_timeout` arms the port's `TIMEOUT` task from the
-//!    operation's deadline and `Driver::timeout` then reports `{error, timeout}` (the C's
-//!    `driver_set_timer` + `tcp_inet_recv_timeout`, `:12480`);
+//! 2. **the port timer** — `Driver::next_timeout` arms the port's `TIMEOUT` task from the earliest
+//!    pending deadline (for accepts: the earliest deadline in the accept list) and
+//!    `Driver::timeout` then reports `{error, timeout}` for the receive slot's own operation or, for
+//!    accepts, for the **head** of the accept list (the C's `driver_set_timer` +
+//!    `tcp_inet_recv_timeout`, `:12480`, and `fire_multi_timers` → `tcp_inet_multi_timeout`,
+//!    `:15650`/`:12600`);
 //! 3. **the round's async drive point** — `Driver::drive_async`, which retries an operation against
 //!    data that is already buffered (`desc->i_buf`, a decoded `{packet, N}` frame, a datagram
 //!    already sitting in the socket). Without it an operation whose data arrived **before** it was
@@ -96,14 +96,13 @@ use std::time::{Duration, Instant};
 
 use beam_common::Result;
 
+use super::accept::AcceptQueue;
 use super::frame;
-use super::sys::{accept_socket, close_fd};
-use super::wire::{ctl_error, ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
+use super::wire::{ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
 use super::{Interest, TcpInetDriver};
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply};
 use crate::driver::DriverContext;
 use crate::port_failure::DriverFailure;
-use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::port_task::ReadMessage;
 
@@ -136,22 +135,6 @@ impl RecvOp {
     }
 }
 
-/// One queued `accept` operation (the C's `enq_multi_op` list).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct AcceptOp {
-    /// The 16-bit id the control reply carried.
-    pub(super) id: u16,
-    /// The operation's deadline, or `None` for the C's `INET_INFINITY`.
-    pub(super) deadline: Option<Instant>,
-}
-
-impl AcceptOp {
-    /// Whether this operation's deadline has passed at `now`.
-    fn is_due(self, now: Instant) -> bool {
-        self.deadline.is_some_and(|deadline| now >= deadline)
-    }
-}
-
 /// The async-operation queue of one socket descriptor.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(super) struct AsyncQueue {
@@ -159,8 +142,11 @@ pub(super) struct AsyncQueue {
     op_ref: u32,
     /// The C's single receive slot (`INET_MAX_ASYNC`).
     recv: Option<RecvOp>,
-    /// The C's `enq_multi_op` accept list, in enqueue order.
-    accepts: Vec<AcceptOp>,
+    /// The accept half of this queue — the C's `enq_multi_op` accept list, its `desc->mtd` timer
+    /// entries and the sticky `INET_F_MULTI_CLIENT` bit. The machinery is [`super::accept`]'s; it
+    /// lives beside the receive slot because a descriptor has **one** id counter and **one** port
+    /// timer.
+    pub(super) accepts: AcceptQueue,
 }
 
 impl AsyncQueue {
@@ -202,67 +188,33 @@ impl AsyncQueue {
         true
     }
 
-    /// The queued accept operations, oldest first.
-    pub(super) fn accepts(&self) -> &[AcceptOp] {
-        &self.accepts
-    }
-
-    /// Appends an accept operation — the C's `enq_multi_op`, which never refuses (`:12194`).
-    pub(super) fn enqueue_accept(&mut self, op: AcceptOp) {
-        self.accepts.push(op);
-    }
-
-    /// Takes the oldest queued accept operation.
-    pub(super) fn take_accept(&mut self) -> Option<AcceptOp> {
-        if self.accepts.is_empty() {
-            None
-        } else {
-            Some(self.accepts.remove(0))
-        }
-    }
-
     /// Whether any operation is pending on either queue.
     pub(super) fn has_pending(&self) -> bool {
         self.recv.is_some() || !self.accepts.is_empty()
     }
 
-    /// The descriptor-state bits the queued accepts add to `INET_REQ_GETSTATUS`
-    /// (`inet_drv.c:1031`-`:1032`, `:11160`).
-    ///
-    /// One pending accept is `INET_STATE_ACCEPTING` (`INET_F_LISTEN | INET_F_ACC`) and two or more
-    /// are `INET_STATE_MULTI_ACCEPTING` (adding `INET_F_MULTI_CLIENT`), so a listener with two
-    /// accepts queued reports `[1,0,0,1,41]` — measured on the oracle.
-    pub(super) fn accept_state_bits(&self) -> u32 {
-        /// `INET_F_ACC` (`inet_drv.c:797`).
-        const INET_F_ACC: u32 = 0x0020;
-        /// `INET_F_MULTI_CLIENT` (`:800`).
-        const INET_F_MULTI_CLIENT: u32 = 0x0100;
-        match self.accepts.len() {
-            0 => 0,
-            1 => INET_F_ACC,
-            _ => INET_F_ACC | INET_F_MULTI_CLIENT,
-        }
-    }
-
     /// The earliest deadline among the pending operations — what the driver declares through
     /// `Driver::next_timeout`, which the port mirrors into its single `TIMEOUT` task.
+    ///
+    /// For accepts it is the **first armed timer entry** (the C's `desc->mtd->when`, see
+    /// [`super::accept`]), which is what the port's one timer is armed from — not the accept list
+    /// head's own deadline.
     pub(super) fn next_deadline(&self) -> Option<Instant> {
+        let accept = self.accepts.deadline();
         let recv = self.recv.and_then(|op| op.deadline);
-        self.accepts
-            .iter()
-            .filter_map(|op| op.deadline)
-            .chain(recv)
-            .min()
+        accept.into_iter().chain(recv).min()
     }
 
     /// Every pending operation's id — the receive slot first, then the accepts in enqueue order —
-    /// leaving the queue empty.
+    /// leaving the queue (and its timers) empty.
     pub(super) fn take_all(&mut self) -> Vec<u16> {
         let mut ids = Vec::new();
         if let Some(op) = self.recv.take() {
             ids.push(op.id);
         }
-        ids.extend(self.accepts.drain(..).map(|op| op.id));
+        // The accept half takes the same drain (`async_error_am_all` empties the list, so the
+        // sticky multi bit goes with it — see [`super::accept`]).
+        ids.extend(self.accepts.take_all());
         ids
     }
 }
@@ -304,32 +256,10 @@ pub(super) fn parse_recv_operand(arg: &[u8]) -> Option<(i32, u32)> {
     ))
 }
 
-/// The C's `Timeout(4)` operand of `INET_REQ_ACCEPT`(26), or `None` when the operand is not
-/// exactly four bytes.
-pub(super) fn parse_timeout_operand(arg: &[u8]) -> Option<i32> {
-    let [t0, t1, t2, t3] = arg else {
-        return None;
-    };
-    Some(i32::from_be_bytes([*t0, *t1, *t2, *t3]))
-}
-
 /// Whether an operand's `Length` is one the C refuses with `[0]enomem`
 /// (`n > TCP_MAX_PACKET_SIZE`, `inet_drv.c:12301`).
 pub(super) fn length_too_large(length: u32) -> bool {
     length > TCP_MAX_PACKET_SIZE
-}
-
-/// The `errno` an OS-level [`BeamError`](beam_common::BeamError) carries, or `None` for a failure
-/// that has no errno at all (an argument fault, a capability gap).
-///
-/// A driver has to report an operation's failure as the C's `{error, Reason}` atom, and the reason
-/// vocabulary is errno-based, so this is the one place the conversion is made — never a
-/// fabricated `EINVAL` for a failure that is not an OS error.
-fn io_errno(err: &beam_common::BeamError) -> Option<i32> {
-    match err {
-        beam_common::BeamError::Io(io) => io.raw_os_error(),
-        _ => None,
-    }
 }
 
 /// Completes **every** pending operation of `queue` with `{error, closed}` — the C's
@@ -361,11 +291,6 @@ impl TcpInetDriver {
     /// The queued operations of this descriptor.
     pub(super) fn queued_ops(&self) -> &AsyncQueue {
         &self.async_ops
-    }
-
-    /// The descriptor-state bits the queued accepts add to `INET_REQ_GETSTATUS`.
-    pub(super) fn accept_state_bits(&self) -> u32 {
-        self.async_ops.accept_state_bits()
     }
 
     /// `TCP_REQ_RECV`(42): queue one asynchronous receive and answer `[1] ++ id`.
@@ -422,84 +347,6 @@ impl TcpInetDriver {
         // call) and the completion itself is produced at a later round — see the module docs.
         self.set_interest(ctx, Interest::READABLE)?;
         Ok(async_ok_reply(id))
-    }
-
-    /// `INET_REQ_ACCEPT`(26): queue one asynchronous accept and answer `[1] ++ id`.
-    ///
-    /// The C's guard is one combined test — the socket must be listening **and** the operand must
-    /// be the four-byte timeout, both answering `[0]einval` (`inet_drv.c:12160`-`:12170`) — and the
-    /// operation joins the multi-op accept list (`enq_multi_op`, `:12194`/`:12209`), so repeats
-    /// never answer `ealready`.
-    pub(super) fn async_accept(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        if !self.state.is_listening() || arg.len() != 4 {
-            return Ok(ctl_xerror("einval"));
-        }
-        let Some(timeout_ms) = parse_timeout_operand(arg) else {
-            return Ok(ctl_xerror("einval"));
-        };
-        let id = self.async_ops.next_id();
-        self.async_ops.enqueue_accept(AcceptOp {
-            id,
-            deadline: deadline_for(timeout_ms),
-        });
-        Ok(async_ok_reply(id))
-    }
-
-    /// Accepts one connection if the listener has one, completing the oldest queued accept.
-    ///
-    /// Returns whether an operation completed. The accepted descriptor is put into non-blocking
-    /// mode and handed to the runtime **inside the completion**
-    /// ([`InetAsyncResult::Accepted`]): this driver never stores it, so no teardown path can close
-    /// it twice.
-    ///
-    /// # Errors
-    ///
-    /// Returns the typed I/O failure of a descriptor that cannot be made non-blocking — after
-    /// completing the operation with that errno, so the descriptor is still closed here and the
-    /// caller learns what happened.
-    fn accept_ready_once(&mut self, ctx: &mut DriverContext<'_>) -> Result<bool> {
-        let Some(op) = self.async_ops.accepts().first().copied() else {
-            return Ok(false);
-        };
-        let listener = self.socket.ok_or_else(error::badarg)?;
-        match accept_socket(listener) {
-            Ok(fd) => {
-                self.async_ops.take_accept();
-                if let Err(err) = set_nonblocking(fd) {
-                    // Nothing can be handed over: close what we took and report the errno, the
-                    // C's `inet_async_error` shape (`:2539`).
-                    close_fd(fd);
-                    let Some(errno) = io_errno(&err) else {
-                        // Not an OS failure: no errno to report, so the operation's caller learns
-                        // about it through the typed error instead of a fabricated reason.
-                        return Err(err);
-                    };
-                    let reason = InetReason::from_errno(errno);
-                    ctx.deliver_completion(CompletionEvent::InetAsync {
-                        id: op.id,
-                        result: InetAsyncResult::Error(reason),
-                    })?;
-                    return Ok(true);
-                }
-                ctx.deliver_completion(CompletionEvent::InetAsync {
-                    id: op.id,
-                    result: InetAsyncResult::Accepted { fd },
-                })?;
-                Ok(true)
-            }
-            Err(err) if err.raw_os_error() == Some(libc::EAGAIN) => Ok(false),
-            Err(err) => {
-                // A real accept failure: the C completes the operation with the errno
-                // (`async_error(desc, err)`) and leaves the descriptor listening.
-                self.async_ops.take_accept();
-                let reason = InetReason::from_errno(err.raw_os_error().unwrap_or(libc::EINVAL));
-                ctx.deliver_completion(CompletionEvent::InetAsync {
-                    id: op.id,
-                    result: InetAsyncResult::Error(reason),
-                })?;
-                Ok(true)
-            }
-        }
     }
 
     /// Completes the pending receive operation if the bytes are there.
@@ -596,6 +443,16 @@ impl TcpInetDriver {
     /// the receive at enqueue time, so bytes that are already there are delivered rather than
     /// reported as a timeout (which is exactly what makes a zero timeout see pending data instead
     /// of `{error, timeout}`).
+    ///
+    /// The **accept** half reports the **head** of the multi-op list, not the operation whose
+    /// deadline fired: the port keeps one timer, armed from the earliest entry of the accept-timer
+    /// list (`add_multi_timer`, `inet_drv.c:15744`-`:15790`), and its expiry runs
+    /// `fire_multi_timers` (`:15650`) → `tcp_inet_multi_timeout` (`:12600`), whose
+    /// `remove_multi_op` takes the first entry of the accept list — for a single caller that is its
+    /// head (`:2379`-`:2405`) — and answers *that* id with `{error, timeout}`
+    /// (`send_async_error(…, am_timeout)`). It then loops while the earliest remaining timer entry
+    /// is already due (`next_timeout <= 0`) and otherwise re-arms from the survivors, so one call
+    /// may report several heads, always in list order.
     pub(super) fn async_timeout(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         let now = Instant::now();
         if self.async_ops.recv().is_some_and(|op| op.is_due(now))
@@ -608,21 +465,9 @@ impl TcpInetDriver {
                 })?;
             }
         }
-        loop {
-            let due = self
-                .async_ops
-                .accepts()
-                .first()
-                .copied()
-                .filter(|op| op.is_due(now));
-            let Some(op) = due else { break };
-            self.async_ops.take_accept();
-            ctx.deliver_completion(CompletionEvent::InetAsync {
-                id: op.id,
-                result: InetAsyncResult::Error(InetReason::Timeout),
-            })?;
-        }
-        Ok(())
+        // The C's `fire_multi_timers` loop — the accept list's heads, one per due timer entry —
+        // is [`super::accept`]'s.
+        self.accept_timeouts(ctx, now)
     }
 
     /// The round's async drive point: completes what already-arrived data allows, answering how
@@ -633,10 +478,7 @@ impl TcpInetDriver {
     /// [`Driver::has_pending_async`](crate::driver::Driver::has_pending_async) turns `false` so the
     /// registry stops calling it.
     pub(super) fn drive_async_ops(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
-        let mut completed = 0;
-        while self.accept_ready_once(ctx)? {
-            completed += 1;
-        }
+        let mut completed = self.accepts_completed(ctx)?;
         if self.try_complete_recv(ctx)? {
             completed += 1;
         }
@@ -647,7 +489,7 @@ impl TcpInetDriver {
     /// complete the pending receive or move the bytes into the port's input queue (the passive
     /// floor's `{Port, {data, …}}` path).
     pub(super) fn async_ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        while self.accept_ready_once(ctx)? {}
+        self.serve_accepts(ctx)?;
         if !self.state.is_connected() {
             return Ok(());
         }
@@ -660,51 +502,17 @@ impl TcpInetDriver {
 }
 
 // ---------------------------------------------------------------------------
-// The named `accept`/`recv` verbs — this floor's own synchronous vocabulary
+// The named `recv` verbs — this floor's own synchronous vocabulary
 // ---------------------------------------------------------------------------
 //
-// These are **not** the C requests: the numeric `INET_REQ_ACCEPT`(26)/`TCP_REQ_RECV`(42) go
-// through the asynchronous queue above and answer `[1] ++ <<Id:16/big>>`. The named verbs are the
-// convenience vocabulary this driver has always had for a direct caller (its own tests, and a
-// runtime that wants a read-now answer), so they keep their synchronous contract: `accept`
-// transfers the port to the connection, `recv` reads what the socket holds into the port's input
-// queue.
+// These are **not** the C requests: the numeric `TCP_REQ_RECV`(42) goes through the asynchronous
+// queue above and answers `[1] ++ <<Id:16/big>>`. The named verbs are the convenience vocabulary
+// this driver has always had for a direct caller (its own tests, and a runtime that wants a
+// read-now answer), so they keep their synchronous contract: `recv` reads what the socket holds
+// into the port's input queue. The named `accept` verb, which transfers the port to the
+// connection, is [`TcpInetDriver::verb_accept`] in [`super::accept`].
 
 impl TcpInetDriver {
-    /// The `accept` verb: accepts one connection and **transfers the port** to it.
-    ///
-    /// The listener is released and the accepted descriptor adopted as the port's own socket
-    /// (registered read-ready), so the reply carries the **new descriptor** (`[1] ++ fd_be32`)
-    /// where the C's asynchronous accept carries an id. With nothing pending the reply is the bare
-    /// `[1]` and the caller retries when the port reports readability.
-    ///
-    /// # Errors
-    ///
-    /// A typed `einval` reply when the socket is not listening, and the poller's/adoption's own
-    /// failure when the transfer cannot be made.
-    pub(super) fn verb_accept(&mut self, ctx: &mut DriverContext<'_>) -> Result<Vec<u8>> {
-        if !self.state.is_listening() {
-            return Ok(ctl_xerror("einval"));
-        }
-        let listener = self.socket.ok_or_else(error::badarg)?;
-        let accepted = match accept_socket(listener) {
-            Ok(fd) => fd,
-            // Nothing to accept yet: the caller retries when the port reports readability.
-            Err(err) if err.raw_os_error() == Some(libc::EAGAIN) => return Ok(ctl_ok()),
-            Err(err) => return Ok(ctl_error(err)),
-        };
-        // The port follows its connection: release the listener, adopt the accepted socket.
-        self.release_socket(ctx)?;
-        if let Err(err) = self.adopt(ctx, accepted) {
-            self.close_socket();
-            return Err(err);
-        }
-        self.mark_connected();
-        let mut reply = ctl_ok();
-        reply.extend_from_slice(&(accepted as i32).to_be_bytes());
-        Ok(reply)
-    }
-
     /// The `recv` verb: reads everything available into the port input queue.
     ///
     /// In the `{packet, raw}` default the whole byte stream is moved straight to the port input

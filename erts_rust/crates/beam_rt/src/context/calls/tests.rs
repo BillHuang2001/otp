@@ -153,6 +153,462 @@ fn an_exhaustion_refusal_grows_the_nursery_and_the_retry_copies() {
     );
 }
 
+/// Builds an `n`-cell list of small ints on a heap the copier will walk — the same shape both
+/// the `copy_bound` payload and [`bench_shaped_result`] are built from.
+fn int_list(heap: &mut beam_alloc::Heap, n: i64) -> Result<Eterm> {
+    let mut list = beam_term::prelude::NIL;
+    for i in (1..=n).rev() {
+        list = heap.cons(make_small(i), list)?;
+    }
+    Ok(list)
+}
+
+/// A registered BIF whose result is a **container shaped like the `copy_bound/ets_copy` payload**:
+/// 73 flat words across 32 objects, built on the pooled BIF heap, so [`RuntimeContext::call_bif`]
+/// must re-home it onto the running process's own nursery on every call.
+///
+/// The shape is what makes the growth policy observable: at 73 words the copy cannot fit the
+/// default 233-word nursery beyond the third call, and the copier's shortfall (`73`) is far below
+/// the 1024-word headroom floor, so every refusal is the same refusal the benchmark case pays.
+fn bench_shaped_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let heap = ctx.heap();
+    let ten = int_list(heap, 10)?; // 20 words, 10 objects
+    let eleven = int_list(heap, 11)?; // 22 words, 11 objects
+    let eight = int_list(heap, 8)?; // 16 words,  8 objects
+    let triple = heap.tuple(&[make_small(7), make_small(8), make_small(9)])?; // 4 words
+    let quad = heap.tuple(&[make_small(1), make_small(2), make_small(3), make_small(4)])?; // 5
+    // 6 words: 20 + 22 + 16 + 4 + 5 + 6 = 73.
+    heap.tuple(&[ten, triple, eleven, quad, eight, make_small(-42)])
+}
+
+/// **The copy-out grows the nursery with HEADROOM, not by the bare shortfall.**
+///
+/// This is the counter pin for the `copy_bound/ets_copy` regression. A growth sized by the
+/// copier's exact shortfall (`needed.max(256)`) leaves the fresh destination only one table step
+/// ahead of the graph that forced it — 376 words for the 73-word payload — so the next calls of
+/// the same size refuse again within a handful of ops, and every refusal pays the whole sizing
+/// machinery of a refused copy (`try_copy_fast` → `preflight_words` → the bounded sizing walk →
+/// `size_object_with`) before the retry.
+///
+/// The loop below re-homes the [`bench_shaped_result`] container into a **default** (233-word)
+/// nursery and reads the copy-out's structural counters:
+///
+/// * `grows` — one per `Process::grow_nursery` call, i.e. one per refused-destination call;
+/// * `attempts` — one per `beam_message::copy_struct` call, so `attempts == copies + grows` when
+///   nothing else goes wrong.
+///
+/// Two properties are pinned (the figures are this suite's own measurement):
+///
+/// 1. **The first growth's installed capacity** carries headroom — `1598` words, the growth
+///    table's step above the 1024-word request, against `376` for a bare-shortfall growth. That is
+///    the discriminating assertion, and it is what makes one growth serve ~21 further copies of
+///    the payload instead of ~5. The headroom lives until a **collection** reclaims it
+///    (`Nursery::collapse` only drops retired spaces, and `young_after_collection` shrinks the
+///    nursery only when the round's demand is under a quarter of it), so the growth is not undone
+///    by the next allocation.
+/// 2. **The growth count stays rare over a long run** — `grows * 8 < copies` (measured: 5 growths
+///    over 1004 copies with the headroom, 6 with the bare shortfall; the long-run figure converges
+///    because `Nursery::grow` at least doubles a space it cannot enlarge, but 1 growth per 8
+///    copies would mean the growth is again sized to the shortfall).
+#[test]
+fn the_copy_out_grows_the_nursery_with_headroom_not_by_the_bare_shortfall() {
+    /// Copies before the run's counters are read.
+    const OPS: usize = 1000;
+    /// How many copies the first-growth probe may need: three 73-word payloads fill a 233-word
+    /// nursery, so the fourth refuses.
+    const PROBE_OPS: usize = 8;
+    /// The smallest installed nursery the headroom request can land on: 1024 rounds up through
+    /// the growth table to 1598, and a bare-shortfall growth installs 376.
+    const HEADROOM_FLOOR_WORDS: usize = 1024;
+
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    {
+        let registry = Rc::get_mut(&mut rt.registry)
+            .expect("the runtime holds the only handle to its registry");
+        let _ = registry.register("copy_out_fixture", "bench_shaped", 0, bench_shaped_result);
+    }
+    let nursery_before = table
+        .get(pid)
+        .expect("the spawned process")
+        .collector()
+        .young()
+        .capacity_words();
+    assert_eq!(
+        nursery_before,
+        beam_gc::DEFAULT_MIN_HEAP_WORDS,
+        "the pin is about the DEFAULT nursery: a larger one would hide the growth policy"
+    );
+    notes::reset();
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    // Phase 1 — copy until the destination refuses once, then read what that growth installed.
+    let mut first_growth_words = None;
+    let mut copies = 0usize;
+    for op in 0..PROBE_OPS {
+        let copied = ctx
+            .call_bif("copy_out_fixture", "bench_shaped", 0, &[])
+            .expect("the fixture BIF returns");
+        copies += 1;
+        assert!(
+            beam_term::prelude::is_boxed(copied) && !beam_term::literal::is_literal(copied),
+            "op {op}: the bench-shaped container is re-homed onto the process's own heap"
+        );
+        if notes::snapshot().1 > 0 {
+            first_growth_words = Some(
+                ctx.process_table()
+                    .get(pid)
+                    .expect("the spawned process")
+                    .collector()
+                    .young()
+                    .capacity_words(),
+            );
+            break;
+        }
+    }
+    let first_growth_words = first_growth_words.expect("the 73-word payload outgrows a 233-word nursery");
+    assert!(
+        first_growth_words >= HEADROOM_FLOOR_WORDS,
+        "the copy-out must grow the nursery with HEADROOM: the first growth installed \
+         {first_growth_words} words, below the {HEADROOM_FLOOR_WORDS}-word request floor — i.e. \
+         the growth is again sized by the copier's bare shortfall (which installs 376 words), so \
+         the very next copies of the same size refuse and re-walk the graph"
+    );
+    // Phase 2 — the long run the growth count is asserted over.
+    for op in 0..OPS {
+        let copied = ctx
+            .call_bif("copy_out_fixture", "bench_shaped", 0, &[])
+            .expect("the fixture BIF returns");
+        copies += 1;
+        assert!(
+            beam_term::prelude::is_boxed(copied) && !beam_term::literal::is_literal(copied),
+            "op {op}: the bench-shaped container is re-homed onto the process's own heap"
+        );
+    }
+    drop(ctx);
+    let (attempts, grows, empties) = notes::snapshot();
+    assert_eq!(
+        empties, attempts,
+        "every attempt — refused or not — is handed a fully empty destination table"
+    );
+    assert_eq!(
+        attempts,
+        copies + grows,
+        "exactly one refused attempt per growth: {attempts} attempts over {copies} copies with \
+         {grows} growths"
+    );
+    assert!(
+        grows * 8 < copies,
+        "the copy-out must grow the nursery with HEADROOM: {grows} growths (and so {grows} \
+         refused-and-re-walked copies) over {copies} copies exceeds 1 per 8, i.e. the growth is \
+         again sized by the bare shortfall instead of a table step with room to spare"
+    );
+    let nursery_after = table
+        .get(pid)
+        .expect("the spawned process")
+        .collector()
+        .young()
+        .capacity_words();
+    assert!(
+        nursery_after > first_growth_words,
+        "the long run keeps stepping the nursery up ({first_growth_words} -> {nursery_after} words)"
+    );
+}
+
+/// **A `max_heap_size` ceiling that refuses the headroom request still grows by the bare
+/// shortfall, so the copy is re-homed instead of failing.**
+///
+/// `Nursery::grow` (`crates/beam_gc/src/nursery.rs:339-345`) bounds the nursery chain's
+/// **summed** capacity by [`HeapPolicy::max_heap_words`] and refuses a request the remaining
+/// budget cannot reach. A growth request with headroom is therefore *more* likely to be refused
+/// than the bare shortfall the retry used to ask for, so the copy-out must fall back to exactly
+/// that on a refusal — otherwise a configured `+hmax` would turn a growth that always succeeded
+/// into a hard failure (the result left on the pooled BIF heap, un-rewound).
+///
+/// The policy below leaves a budget of 367 words: 1024 is unreachable, 256 is not.
+#[test]
+fn a_ceiling_that_refuses_the_headroom_request_still_grows_by_the_shortfall() {
+    /// The nursery chain's ceiling: 233 words installed + 367 of budget.
+    const CAP_WORDS: usize = 600;
+    /// Copies the first-growth probe may need (three 73-word payloads fill a 233-word nursery).
+    const PROBE_OPS: usize = 8;
+
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let signals = SignalAtoms::from_table(rt.code_server_atoms_mut());
+    let mut table = ProcessTable::new(signals);
+    let pid = table
+        .spawn(beam_gc::HeapPolicy::from_min_max(0, CAP_WORDS))
+        .expect("a capped process");
+    {
+        let registry = Rc::get_mut(&mut rt.registry)
+            .expect("the runtime holds the only handle to its registry");
+        let _ = registry.register("copy_out_fixture", "bench_shaped", 0, bench_shaped_result);
+    }
+    let capacity_before = table
+        .get(pid)
+        .expect("the spawned process")
+        .collector()
+        .young()
+        .capacity_words();
+    notes::reset();
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    let mut copies = 0usize;
+    for op in 0..PROBE_OPS {
+        let copied = ctx
+            .call_bif("copy_out_fixture", "bench_shaped", 0, &[])
+            .expect("the fixture BIF returns");
+        copies += 1;
+        assert!(
+            beam_term::prelude::is_boxed(copied) && !beam_term::literal::is_literal(copied),
+            "op {op}: the copy is re-homed even under the ceiling (copies so far: {copies})"
+        );
+        if notes::snapshot().1 > 0 {
+            break;
+        }
+    }
+    let (_, grows, _) = notes::snapshot();
+    assert_eq!(
+        grows, 2,
+        "one refused-destination copy under the ceiling makes TWO `grow_nursery` calls — the \
+         headroom request (refused: {CAP_WORDS} words of ceiling leave {CAP_WORDS} - \
+         {capacity_before} of budget, short of the 1024-word request) and the bare-shortfall \
+         fallback (accepted)"
+    );
+    let capacity_after = ctx
+        .process_table()
+        .get(pid)
+        .expect("the spawned process")
+        .collector()
+        .young()
+        .capacity_words();
+    assert!(
+        capacity_after > capacity_before && capacity_after <= CAP_WORDS,
+        "the fallback growth installed {capacity_after} words ({capacity_before} before, ceiling \
+         {CAP_WORDS}): it must cover the copier's shortfall and stay inside the ceiling"
+    );
+}
+
+/// The structural outcome of [`drive_admission_cadence`], one field per counter the pin reads.
+struct Cadence {
+    /// Copy-outs that ran (== the loop count).
+    copies: usize,
+    /// Copy attempts the copier made: `copies + refusals`, since every refusal buys exactly one
+    /// retry.
+    attempts: usize,
+    /// Expensive first attempts: `attempts - copies`.
+    refusals: usize,
+    /// `Process::grow_nursery` calls that **answered** a refusal (the fallback path).
+    refusal_grows: usize,
+    /// `Process::grow_nursery` calls the learned-hint gate made **before** an attempt.
+    hint_grows: usize,
+    /// Real collections the modelled admission door ran.
+    collections: usize,
+}
+
+impl Cadence {
+    /// Refusals per copy-out — the figure the pin bounds.
+    fn refusals_per_op(&self) -> f64 {
+        self.refusals as f64 / self.copies as f64
+    }
+}
+
+/// Drives `ops` copy-outs of the [`bench_shaped_result`] container against a **default-policy**
+/// process while modelling the runtime's own heap-admission **cadence** between them.
+///
+/// The cadence is the /point/ of this helper: the synthetic long-run tests above never collect,
+/// so the nursery they grow is never collapsed and they pass even when the copy-out refuses on
+/// every op. Here, after each copy-out, the process's own admission predicate
+/// ([`beam_process::Process::collect_if_needed`] — the OR of the occupancy test and the
+/// collector's `collection_debt`, exactly what the engine's `ensure_heap`/`ensure_heap_full`
+/// doors consult) runs with a payload-sized request, so a nursery the copy-out grew is
+/// **collapsed back to the `233`-word floor** and the next copy-out meets a part-full node again.
+/// That is the measured `copy_bound/ets_copy` regime: one collection per ~3 ops, and the
+/// destination barely large enough.
+///
+/// `clear_hint_every_op` zeroes the context's [`RuntimeContext::copy_out_hint`] before each copy,
+/// i.e. it reproduces what the copy-out did **before** the hint existed. It is the control that
+/// keeps this pin honest: the same cadence must then refuse on a large fraction of the ops.
+fn drive_admission_cadence(clear_hint_every_op: bool, ops: usize) -> Cadence {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    {
+        let registry = Rc::get_mut(&mut rt.registry)
+            .expect("the runtime holds the only handle to its registry");
+        let _ = registry.register("copy_out_fixture", "bench_shaped", 0, bench_shaped_result);
+    }
+    assert_eq!(
+        table
+            .get(pid)
+            .expect("the spawned process")
+            .collector()
+            .young()
+            .capacity_words(),
+        beam_gc::DEFAULT_MIN_HEAP_WORDS,
+        "the cadence is about the DEFAULT nursery"
+    );
+    // The 73-word payload is what the next admission must make room for — the same figure the
+    // engine's `test_heap` carries into the door.
+    const ADMISSION_NEED_WORDS: usize = 73;
+    // The loop's **own** term construction between copies: the `copy_bound` payload is a 5-key
+    // flat map over a 10-cell list, a 3-tuple, a 12-byte binary and a char list — ≈60 flat words,
+    // modelled here as 30 cons cells of `NIL`. This is what makes the loop refill the nursery
+    // between copy-outs, and it is why the real case refuses at all: 3 × 73 words alone still fit
+    // a 233-word nursery, 60 + 73 does twice and not three times.
+    const PAYLOAD_BUILD_CELLS: usize = 40;
+    let mut collections = 0usize;
+    let mut copies = 0usize;
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        for op in 0..ops {
+            if clear_hint_every_op {
+                // Reproduce the pre-hint copy-out: nothing is ever learned, so the gate never
+                // runs.
+                ctx.copy_out_hint = 0;
+            }
+            {
+                let process = ctx
+                    .process_table_mut()
+                    .get_mut(pid)
+                    .expect("the spawned process");
+                let mut built = beam_term::prelude::NIL;
+                for _ in 0..PAYLOAD_BUILD_CELLS {
+                    match process.heap_mut().cons(beam_term::prelude::NIL, built) {
+                        Ok(list) => built = list,
+                        // The nursery filled mid-construction: the engine's own admission door
+                        // would have collected first, and the collection below is the same door.
+                        Err(_) => break,
+                    }
+                }
+            }
+            let copied = ctx
+                .call_bif("copy_out_fixture", "bench_shaped", 0, &[])
+                .expect("the fixture BIF returns");
+            copies += 1;
+            assert!(
+                beam_term::prelude::is_boxed(copied) && !beam_term::literal::is_literal(copied),
+                "op {op}: the bench-shaped container is re-homed onto the process's own heap"
+            );
+            let collected = ctx
+                .process_table_mut()
+                .get_mut(pid)
+                .expect("the spawned process")
+                .collect_if_needed(ADMISSION_NEED_WORDS)
+                .expect("the admission collection");
+            if collected {
+                collections += 1;
+            }
+        }
+    }
+    let (attempts, refusal_grows, empties) = notes::snapshot();
+    assert_eq!(
+        empties, attempts,
+        "every attempt — refused or not — is handed a fully empty destination table"
+    );
+    assert!(
+        attempts >= copies,
+        "the copier cannot make fewer attempts than there are copy-outs"
+    );
+    Cadence {
+        copies,
+        attempts,
+        refusals: attempts - copies,
+        refusal_grows,
+        hint_grows: notes::hint_grows(),
+        collections,
+    }
+}
+
+/// **The copy-out must not refuse against a default-policy process that really collects.**
+///
+/// This is the `copy_bound/ets_copy` regression pin that the synthetic no-collect loops above
+/// cannot make: with the nursery collapsed to its `233`-word floor between copies and a 73-word
+/// result to re-home, the destination is under the result's size often enough that the pre-hint
+/// copy-out refused on ≈1 of every 3 ops (measured: 0.332 refusals/op over 250 000 ops). Every
+/// refusal pays the copier's whole sizing path (`try_copy_fast` → `preflight_words` → the bounded
+/// `size_object_bounded_with` walk → the acyclicity check → `size_object_with`), so the loop was
+/// paying ~4.2 µs per op for nothing.
+///
+/// The pin: the **learned hint** (`RuntimeContext::copy_out_hint` + `hint_grow_gate`) makes the
+/// first attempt fit, so refusals collapse to at most one per context (the call that teaches the
+/// hint) — asserted as `refusals * 8 <= copies`, i.e. 1 in 8, well inside the measured ≤1 per
+/// run. A regression that removes the gate (or stops learning the hint) puts the refusal rate
+/// back to ≈1 in 3 and fails here.
+#[test]
+fn a_collecting_default_process_copies_every_result_without_refusing() {
+    /// Long enough for ~100 modelled collections, short enough to stay a unit test.
+    const OPS: usize = 300;
+
+    notes::reset();
+    let cadence = drive_admission_cadence(false, OPS);
+    assert!(
+        cadence.collections * 4 > OPS,
+        "the cadence must really collect ({} collections over {OPS} ops), else this pin measures \
+         the no-collect regime the synthetic loops already cover",
+        cadence.collections
+    );
+    assert!(
+        cadence.hint_grows > 0,
+        "the learned-hint gate must be what serves the copies (0 hint growths over {} ops)",
+        cadence.copies
+    );
+    assert!(
+        cadence.refusals * 8 <= cadence.copies,
+        "the copy-out refused {} times over {} copies ({:.3} per op, {} attempts): the learned \
+         hint is not pre-growing the destination, so the copy-bound loop is back to paying the \
+         copier's whole sizing walk on a large fraction of its ops",
+        cadence.refusals,
+        cadence.copies,
+        cadence.refusals_per_op(),
+        cadence.attempts
+    );
+    assert_eq!(
+        cadence.refusal_grows, cadence.refusals,
+        "every refusal is answered by exactly one growth (the fallback), and no more"
+    );
+}
+
+/// **The hint is what keeps the refusal rate down — the control for the pin above.**
+///
+/// The same cadence with [`RuntimeContext::copy_out_hint`] zeroed before every copy (i.e. the
+/// pre-hint behaviour) must refuse on a large fraction of the ops: the nursery is back at its
+/// `233`-word floor after each collection and the 73-word result meets a destination that is
+/// often too small. That is what the measured `0.332` refusals/op looked like, and asserting it
+/// here means the pin above cannot be satisfied by anything other than the hint: if the gate ever
+/// stops being the mechanism (e.g. the growth policy alone starts sizing the nursery large enough
+/// to survive the collection), this control fails and the claim is re-examined.
+#[test]
+fn without_the_learned_hint_the_same_cadence_refuses_again() {
+    /// Same cadence as the pin above, so the two are directly comparable.
+    const OPS: usize = 300;
+
+    notes::reset();
+    let cadence = drive_admission_cadence(true, OPS);
+    assert!(
+        cadence.collections * 4 > OPS,
+        "the control runs the same collecting cadence ({} collections)",
+        cadence.collections
+    );
+    assert_eq!(
+        cadence.hint_grows, 0,
+        "with no hint ever learned the gate must never grow the destination"
+    );
+    assert!(
+        cadence.refusals * 2 >= cadence.copies,
+        "the pre-hint copy-out must refuse on a large fraction of the ops: only {} refusals over \
+         {} copies ({:.3} per op) — the cadence no longer reproduces the copy-bound regime, so \
+         the pin above asserts nothing",
+        cadence.refusals,
+        cadence.copies,
+        cadence.refusals_per_op()
+    );
+    assert_eq!(
+        cadence.refusal_grows, cadence.refusals,
+        "each refusal is answered by exactly one growth (or two under a ceiling)"
+    );
+}
+
 /// The copy-out's destination off-heap table is **fresh and empty per attempt**, so
 /// `beam_message`'s copier takes its single-traversal fast path even when the runtime's
 /// escaped-payload store ([`crate::runtime::Runtime::eval_off_heap`]) is already populated by an
@@ -611,6 +1067,96 @@ fn the_reference_walk_skips_words_that_are_not_readable_terms() {
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// The reference walk's cost, pinned by deterministic counters (never a wall time)
+// ---------------------------------------------------------------------------------------
+
+/// The `copy_bound` benchmark's payload — the 5-key map `payload/0` builds in
+/// `tools/bench/src/workloads/copy_bound.rs`, reconstructed here from that file's constants: a
+/// 10-element list, `{ok, <<"hello world">>, 3.5}`, a 12-byte binary, `"a char list"` and `-42`.
+///
+/// An 11- and a 12-byte binary both stay **on** the heap
+/// ([`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] = 64 bytes), so the graph is exactly the
+/// `etf_roundtrip` case's copy boundary: 27 dereferenceable objects.
+fn bench_payload(
+    ctx: &mut RuntimeContext<'_>,
+    keys: [Eterm; 5],
+    ok: Eterm,
+    atoms: &beam_term::AtomTable,
+) -> Result<Eterm> {
+    let cells: Vec<Eterm> = (1..=10).map(make_small).collect();
+    let list = beam_engine::terms::make_list(ctx, &cells)?;
+    let hello = beam_engine::terms::make_heap_binary(ctx, b"hello world")?;
+    let float = beam_engine::terms::make_float(ctx, 3.5)?;
+    let tuple = beam_engine::terms::make_tuple(ctx, &[ok, hello, float])?;
+    let bytes: Vec<u8> = (1..=12).collect();
+    let binary = beam_engine::terms::make_heap_binary(ctx, &bytes)?;
+    let chars: Vec<Eterm> = "a char list".chars().map(|c| make_small(c as i64)).collect();
+    let chunk = beam_engine::terms::make_list(ctx, &chars)?;
+    let pairs = [
+        (keys[0], list),
+        (keys[1], tuple),
+        (keys[2], binary),
+        (keys[3], chunk),
+        (keys[4], make_small(-42)),
+    ];
+    beam_engine::terms::make_map(ctx, &pairs, atoms)
+}
+
+/// **One registered-BIF container result costs one walk call, 27 visits, no hashing, no spill.**
+///
+/// The graph walked is the one `binary_to_term/1` **rebuilds** on the pooled BIF heap from
+/// `term_to_binary/1`'s image — the `etf_roundtrip` benchmark case's own round-trip — so the
+/// counted objects are the ones the copy boundary really moves: the flat-map block, the key tuple
+/// the flat map wraps its five keys in, the ten cons cells of `[1..10]`, the `{ok, …}` tuple, its
+/// on-heap binary and its float, the 12-byte binary, and the eleven cons cells of `"a char list"`
+/// (`1 + 1 + 10 + 1 + 1 + 1 + 1 + 11 = 27`).
+///
+/// The three bookkeeping counters are the point of the test: the walk must dereference each object
+/// once (`visits`), must do **no** hashed bookkeeping (`hash_inserts == 0` — the walk keeps no
+/// visited set) and must never leave its inline worklist (`spills == 0`), so an ordinary BIF call
+/// allocates nothing for it.
+#[test]
+fn the_reference_walk_visits_a_bench_shaped_payload_without_hashing_or_spilling() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    let keys = ["a", "b", "c", "d", "e"].map(|name| rt.intern(name));
+    let ok = rt.intern("ok");
+    let atoms = rt.code_server().atoms_handle();
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    let payload = bench_payload(&mut ctx, keys, ok, &atoms).expect("the bench payload");
+    let image = ctx
+        .call_bif("erlang", "term_to_binary", 1, &[payload])
+        .expect("term_to_binary/1 of the payload");
+    // Only the `binary_to_term/1` call is measured: its result is the container the copy-out
+    // re-homes, and therefore the graph the walk sees.
+    notes::reset();
+    let rebuilt = ctx
+        .call_bif("erlang", "binary_to_term", 1, &[image])
+        .expect("binary_to_term/1 of the image");
+    let counts = notes::walk_snapshot();
+    assert_eq!(
+        counts,
+        notes::WalkCounts {
+            calls: 1,
+            visits: 27,
+            hash_inserts: 0,
+            spills: 0
+        },
+        "one container result: one walk, one visit per object, hash-free, spill-free"
+    );
+    // The walk saw the real payload: re-encoding the rebuilt graph reproduces the image byte for
+    // byte, i.e. every object the walk visited is the payload's own object.
+    let re_encoded = ctx
+        .call_bif("erlang", "term_to_binary", 1, &[rebuilt])
+        .expect("term_to_binary/1 of the rebuilt payload");
+    assert_eq!(
+        beam_engine::terms::binary_bytes(re_encoded).expect("a binary"),
+        beam_engine::terms::binary_bytes(image).expect("a binary"),
+        "the round-trip rebuilt the payload unchanged"
+    );
+}
 // ---------------------------------------------------------------------------------------
 // The table-less (`-eval`) route's pooled BIF heap — counters first.
 //

@@ -32,9 +32,9 @@
 //!
 //! | N | slices | yields | collections | major | door checks | door collections | young spaces | young capacity |
 //! |---|---|---|---|---|---|---|---|---|
-//! | 2 000 | 905 | 904 | 13 971 | 2 997 | 904 | 105 | 1 | 609 |
-//! | 4 000 | 1 810 | 1 809 | 27 939 | 5 993 | 1 809 | 214 | 1 | 609 |
-//! | 10 000 | 4 525 | 4 524 | 69 847 | 14 981 | 4 524 | 533 | 1 | 609 |
+//! | 2 000 | 905 | 904 | 15 346 | 2 514 | 904 | 113 | 1 | 609 |
+//! | 4 000 | 1 810 | 1 809 | 30 691 | 4 514 | 1 809 | 230 | 1 | 609 |
+//! | 10 000 | 4 525 | 4 524 | 76 728 | 10 514 | 4 524 | 571 | 1 | 609 |
 //!
 //! Three repetitions of the whole table are byte-identical, so every figure here is a
 //! **deterministic counter**, never a timing. The two relations pinned are:
@@ -51,11 +51,12 @@
 //!   door settles its collection debt on every iteration, so the nursery is nearly exhausted
 //!   (seven eighths used, the C's `ERTS_VBUMP_ALLOC_REDS` moment) at only every ~eighth slice
 //!   end, and a boundary collection leaves the boundaries after it below the watermark. Measured
-//!   **105/904 = one in 8.61** (N = 2 000), **214/1 809 = one in 8.45** (N = 4 000) and
-//!   **533/4 524 = one in 8.49** (N = 10 000): the door fires on 0.0525 / 0.0535 / 0.0533 calls
-//!   of a shape that collects 6.9820 / 6.9830 / 6.9840 times per call — **0.75 %** of the run's
-//!   own collections. It is a *rate*, not an identity: 8.61 / 8.45 / 8.49 are not one another
-//!   and none of them is a law, which is why the assertion is the band and not `checks / 8`.
+//!   **113/904 = one in 8.00** (N = 2 000), **230/1 809 = one in 7.87** (N = 4 000) and
+//!   **571/4 524 = one in 7.92** (N = 10 000): the door fires on 0.0565 / 0.0575 / 0.0571 calls
+//!   of a shape that collects 7.6692 / 7.6708 / 7.6720 times per call — **0.74 %** of the run's
+//!   own collections. It is a *rate*, not an identity: 8.00 / 7.87 / 7.92 are not one another
+//!   and none of them is a law (the N = 2 000 row lands on 8.00 only because 113 × 8 = 904
+//!   exactly), which is why the assertion is the band and not `checks / 8`.
 //!
 //! **What this module can no longer verify: the door-ON vs door-OFF A/B it used to quote.**
 //! Establishing that the door's collections *substitute for* the heap-admission door's rather
@@ -64,18 +65,24 @@
 //! this measurement's scope. The figures that A/B produced (identical totals at 6.984032 /
 //! 6.996002 / 6.999200 collections and 1.497006 / 1.499250 / 1.499850 majors per call at
 //! N = 500 / 2 000 / 10 000, against a door-off two young spaces / 376 words) come from an
-//! earlier tree state and no longer describe this one — N = 2 000 now measures 6.982009 /
-//! 1.497751 per call and a **609**-word young space — so the substitution claim is **unverified**
-//! here and is not restated as a fact. Two structural changes are why the totals moved: the door
-//! now pins a young-only `Process::collect_kind(CollectionKind::Minor)` first and escalates to
-//! the unpinned `Process::collect` only when the promotion cannot fit the mature space (so a
-//! boundary firing no longer forces a fullsweep of its own), and the native baseline tier now
-//! charges its blocks per block, which moved the slice and pre-emption counts the per-call rates
-//! are expressed against. The historical `1/2`-watermark cost (**+0.048 collections/call
-//! (+0.69 %)** and **+0.134 majors/call (+8.9 %)** against its door-off build) is from that same
-//! earlier tree state and is likewise not re-measured here. What the table above *does* pin is
-//! the rationing: ~one firing in 8.5 boundaries, 0.75 % of the shape's collections, a flat
-//! per-call rate and a collapsed retired-space chain (one young space, 609 words at every N).
+//! earlier tree state and no longer describe this one — N = 2 000 measures 7.669165 /
+//! 1.256372 per call and a **609**-word young space — so the substitution claim is **unverified**
+//! here and is not restated as a fact. Three structural facts keep the totals off the closed form
+//! `collections == 7N - 1` / `major == 3N / 2`: the door pins a young-only
+//! `Process::collect_kind(CollectionKind::Minor)` first and escalates to the unpinned
+//! `Process::collect` only when the promotion cannot fit the mature space (so a boundary firing
+//! does not force a fullsweep of its own), the native baseline tier charges its blocks per block
+//! (which sets the slice and pre-emption counts the per-call rates are expressed against), and
+//! the BIF-result copy-out's learned hint grows the nursery **before** each copy
+//! (`RuntimeContext::copy_out_hint` + `hint_grow_gate`, `src/context/calls.rs`) — a growth event
+//! retires a nursery space, so it adds one unit of collection debt per iteration and therefore
+//! sets how often this shape is collected at all. The historical `1/2`-watermark cost (**+0.048
+//! collections/call (+0.69 %)** and **+0.134 majors/call (+8.9 %)** against its door-off build) is
+//! from that same earlier tree state and is likewise not re-measured here. What the table above
+//! *does* pin is the rationing: ~one firing in 7.9 boundaries, 0.74 % of the shape's collections,
+//! a per-call collection rate flat to 0.04 % across a 5× range (7.6692 → 7.6720; the majors fall
+//! from 1.2564 to 1.0513 per call, since they are one per iteration plus a fixed 514) and a
+//! collapsed retired-space chain (one young space, 609 words at every N).
 //!
 //! Every iteration of this shape reaches the engine's heap-admission door (each churn builds
 //! three 256-element structures, one of them through the interpreted `build_list/2` recursion),
@@ -179,18 +186,19 @@ fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
 /// The measured rows this module pins: `(N, collections, major)`.
 ///
 /// These are the run's **exact** totals — the honest per-N form of what used to be quoted as a
-/// closed form (`collections == 7N - 1`, `major == 3N / 2`, which this tree no longer satisfies:
-/// see the module docs for the two changes that moved it). Every figure the docs quote (slices,
-/// yields, the door's checks and collections, the nursery geometry) is printed by the test's own
-/// `eprintln!`, and three repetitions of the table are identical.
+/// closed form (`collections == 7N - 1`, `major == 3N / 2`, which this tree does not satisfy:
+/// see the module docs for the structural facts that keep it off that form). Every figure the
+/// docs quote (slices, yields, the door's checks and collections, the nursery geometry) is
+/// printed by the test's own `eprintln!`, and three repetitions of the table are identical.
 ///
 /// **Re-derive this table** from that output after any change to the runner's reduction pricing,
-/// the door's gates/watermark or the collector's nursery sizing — the files consulted are
-/// `src/runner/budget.rs`, `src/context/gc/reds_door.rs` and the `beam_gc` collector's sizing.
+/// the door's gates/watermark, the collector's nursery sizing or the BIF-result copy-out's
+/// growth gate — the files consulted are `src/runner/budget.rs`, `src/context/gc/reds_door.rs`,
+/// `src/context/calls.rs` and the `beam_gc` collector's sizing.
 const MEASURED: [(i64, u64, u64); 3] = [
-    (2_000, 13_971, 2_997),
-    (4_000, 27_939, 5_993),
-    (10_000, 69_847, 14_981),
+    (2_000, 15_346, 2_514),
+    (4_000, 30_691, 4_514),
+    (10_000, 76_728, 10_514),
 ];
 
 /// **The boundary door is a per-pre-emption, watermarked site on the `gc_bound` churn shape —
@@ -207,18 +215,23 @@ const MEASURED: [(i64, u64, u64); 3] = [
 ///   call**;
 /// * **the seven-eighths watermark rations it to between one boundary in seven and one in
 ///   nine** — `door.checks / 9 <= door.collections <= door.checks / 7`. It is a *rate*, not an
-///   identity: measured 105/904 = **one in 8.61**, 214/1 809 = **one in 8.45**, 533/4 524 =
-///   **one in 8.49**, so the door collects on **0.0525 / 0.0535 / 0.0533 calls** of a shape that
-///   collects 6.9820 / 6.9830 / 6.9840 times per call — **0.75 %** of the run's own collections;
+///   identity: measured 113/904 = **one in 8.00**, 230/1 809 = **one in 7.87**, 571/4 524 =
+///   **one in 7.92**, so the door collects on **0.0565 / 0.0575 / 0.0571 calls** of a shape that
+///   collects 7.6692 / 7.6708 / 7.6720 times per call — **0.74 %** of the run's own collections;
 /// * **the shape's own totals are a measured table** ([`MEASURED`]), pinned exactly per row:
-///   13 971 / 2 997 at N = 2 000, 27 939 / 5 993 at N = 4 000 and 69 847 / 14 981 at N = 10 000,
-///   i.e. **6.9820 / 6.9830 / 6.9840 collections and 1.4978 / 1.4979 / 1.4980 majors per call**
-///   (6.9855 / 6.9848 / 6.9847 and 1.4985 / 1.4983 / 1.4981 per iteration) — one per-iteration
-///   rate to within 0.03 %, converging on 7 / 1.5 from below instead of landing on the closed
-///   form `7N - 1` / `3N / 2`. The two changes that moved it off that closed form are named in
-///   the module docs: the door pins a young-only `CollectionKind::Minor` collection and escalates
-///   only when the promotion cannot fit the mature space, and the native baseline tier charges
-///   its blocks per block, which moved the slice/pre-emption counts.
+///   15 346 / 2 514 at N = 2 000, 30 691 / 4 514 at N = 4 000 and 76 728 / 10 514 at N = 10 000,
+///   i.e. **7.6692 / 7.6708 / 7.6720 collections and 1.2564 / 1.1282 / 1.0513 majors per call**
+///   (7.6730 / 7.6728 / 7.6728 and 1.2570 / 1.1285 / 1.0514 per iteration). The collection rate
+///   is therefore flat per iteration (7.6728 across a 5× range) while the majors are **one per
+///   iteration plus a fixed 514** (2 514 = 2 000 + 514, 4 514 = 4 000 + 514, 10 514 =
+///   10 000 + 514 exactly), so their per-iteration rate falls toward 1 from above rather than
+///   converging on the closed form's 1.5. The structural facts that keep the totals off
+///   `7N - 1` / `3N / 2` are named in the module docs: the door pins a young-only
+///   `CollectionKind::Minor` collection and escalates only when the promotion cannot fit the
+///   mature space, the native baseline tier charges its blocks per block (which sets the
+///   slice/pre-emption counts), and the BIF-result copy-out's learned hint grows the nursery
+///   before each copy (one growth event = one retired space = one unit of collection debt per
+///   iteration).
 ///
 /// What the door contributes to those totals **cannot** be measured on this tree (a door-ON/OFF
 /// A/B needs a door-disabled build — see the module docs), so nothing here claims a `Δ`; what is

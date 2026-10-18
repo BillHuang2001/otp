@@ -157,7 +157,8 @@
 //! connection) is not there yet — so they are request/reply exchanges: the reply is an **id**
 //! (`[1] ++ <<Id:16/big>>`) and the outcome arrives later through the crate's
 //! [`completion`](crate::completion) channel as `{inet_async, Port, Id, Result}`. That queue is
-//! implemented for **both** numeric requests ([`self::op_queue`]):
+//! implemented for **both** numeric requests ([`self::op_queue`], with the accept list itself in
+//! [`self::accept`]):
 //!
 //! * `TCP_REQ_RECV`(42) takes the C's `Timeout(4), Length(4)` operand and occupies the
 //!   **single** receive slot (`INET_MAX_ASYNC = 1`, `:1069`), so a second concurrent receive is
@@ -167,8 +168,9 @@
 //!   stripped.
 //! * `INET_REQ_ACCEPT`(26) takes the four-byte `Timeout` and joins the **multi-operation** accept
 //!   list (`enq_multi_op`, `:12194`/`:12209`), so N pending accepts each get their own id, all
-//!   complete in enqueue order, and `INET_REQ_GETSTATUS` reports the C's
-//!   `INET_F_ACC`/`INET_F_MULTI_CLIENT` bits while the list is non-empty.
+//!   complete in enqueue order, and `INET_REQ_GETSTATUS` reports the C's `INET_F_ACC` bit while an
+//!   accept is queued plus the **sticky** `INET_F_MULTI_CLIENT` bit from the second enqueue until
+//!   the list fully drains ([`self::accept`]).
 //!
 //! The id counter is the C's `NEW_ASYNC_ID` (`op_ref++ & 0xffff`, `:1549`): it starts at `0` and
 //! is taken *before* the capacity check, so a refused enqueue still advances it. A completion is
@@ -255,6 +257,10 @@ use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
 
+// The TCP accept state machine (`INET_REQ_ACCEPT`'s multi-operation list, its per-port timer
+// entries, the sticky `INET_F_MULTI_CLIENT` bit and the listener's readiness arming), split out of
+// the shared async-op queue it plugs into. Its own module doc is `src/drivers/inet/accept.rs`.
+mod accept;
 mod adopt_probe;
 mod frame;
 mod opcode;
@@ -313,9 +319,10 @@ use self::packet::PacketType;
 // decoded here into the same verbs the named ones reach.
 use self::opcode::{decode as decode_opcode, Opcode};
 
-// The asynchronous-operation queue of this descriptor — the C's `enq_async` slot plus its
-// `enq_multi_op` accept list, the `NEW_ASYNC_ID` counter and the completion production points
-// (`ready_input`/`timeout`/`drive_async`). Its own module doc is `src/drivers/inet/async.rs`.
+// The asynchronous-operation queue of this descriptor — the C's `enq_async` slot (with the
+// `enq_multi_op` accept list its sibling `accept` module owns), the `NEW_ASYNC_ID` counter and the
+// completion production points (`ready_input`/`timeout`/`drive_async`). Its own module doc is
+// `src/drivers/inet/async.rs`.
 use self::op_queue::{drain_closed, AsyncQueue};
 // The raw `libc` socket wrappers (`socket`/`accept`/`bind`/`listen`/`getsockopt`/`shutdown`/
 // `close`) live in the private `sys` submodule, so every `unsafe` block of the driver sits in
@@ -544,8 +551,8 @@ pub struct TcpInetDriver {
     /// (`open`/`accept`/[`TcpInetDriver::from_socket`]) clears it.
     prebound: bool,
     /// The descriptor's **asynchronous-operation queue** — the C's single `enq_async` receive slot
-    /// plus its `enq_multi_op` accept list, and the `NEW_ASYNC_ID` counter behind both
-    /// ([`AsyncQueue`], `src/drivers/inet/async.rs`).
+    /// plus its `enq_multi_op` accept list (the latter in `src/drivers/inet/accept.rs`), and the
+    /// `NEW_ASYNC_ID` counter behind both ([`AsyncQueue`], `src/drivers/inet/async.rs`).
     ///
     /// A queued operation is answered by its control op with `[1] ++ <<Id:16/big>>` and completed
     /// later through the driver→owner completion channel
@@ -1176,6 +1183,12 @@ impl TcpInetDriver {
 
     /// The `listen` verb: turns the socket into a listener.
     ///
+    /// The C does **not** arm accept readiness here: its `sock_select(FD_ACCEPT, 1)` happens only
+    /// on the first `INET_REQ_ACCEPT` whose `sock_accept` answered `ERRNO_BLOCK`
+    /// (`inet_drv.c:12224`), and the disarm on the last completion/timeout. This floor's listener
+    /// is already registered [`Interest::READABLE`] by [`TcpInetDriver::adopt`] (via the `open`
+    /// verb), so the arm/disarm pair in the async queue is the whole rule — nothing to do here.
+    ///
     /// # Errors
     ///
     /// `BeamError::BadArg` for an argument that is not a two-byte backlog; `BeamError::Io`
@@ -1464,6 +1477,12 @@ impl TcpInetDriver {
     ///
     /// Never for a served option (a rejected `setsockopt(2)` is not propagated, as in the C);
     /// `BeamError::BadArg` for a truncated `{active, N}` record.
+    ///
+    /// This is the **ctx-free** half of the request: the port's two wire forms go through
+    /// [`TcpInetDriver::setopts_with_delivery`], which is this walk plus the tail of
+    /// `inet_set_opts` (the passive message and the inline read). Kept as the reference the
+    /// suite pins that tail against, byte for byte.
+    #[allow(dead_code)]
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
         let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_TCP);
         set_options(&mut self.options, scope, self.socket, arg)
@@ -1539,7 +1558,10 @@ impl TcpInetDriver {
                 }
                 self.verb_bind(arg)
             }
-            Opcode::Setopts => self.verb_setopts(arg),
+            // `INET_REQ_SETOPTS` (`:11127`-`:11150`): the reply comes from `inet_set_opts`, whose
+            // own tail may arm read readiness and, for `{active, once}`/`{active, N}`, trigger an
+            // **inline** read (`sres == 2`). Both side effects are `setopts_with_delivery`'s.
+            Opcode::Setopts => self.setopts_with_delivery(ctx, arg),
             Opcode::Getopts => self.verb_getopts(arg),
             // `INET_REQ_LISTEN` (`:12042`): the state guard comes first, the operand length last.
             Opcode::Listen => {
@@ -1576,8 +1598,9 @@ impl TcpInetDriver {
             // guard, so both faults answer `einval`. A well-formed operand joins the C's
             // `enq_multi_op` list and the reply is the asynchronous id —
             // `[1] ++ <<Id:16/big>>` (`:12209`), with the accepted connection delivered later as
-            // `{inet_async, Port, Id, {ok, Descriptor}}`.
-            Opcode::Accept => self.async_accept(arg),
+            // `{inet_async, Port, Id, {ok, Descriptor}}`. Queueing it also arms the listener's
+            // accept (read) readiness (`sock_select(FD_ACCEPT, 1)`, `:12224`).
+            Opcode::Accept => self.async_accept(ctx, arg),
             // `TCP_REQ_RECV` (`:12268`): the whole asynchronous-receive guard ladder — the
             // connection guard (including the C's one-shot `closed`/`econnreset` reply, modelled
             // by [`PeerClose`]), `active || len != 8 ⇒ einval`, the framing/`Length` rule, the
@@ -1772,10 +1795,11 @@ impl TcpInetDriver {
             },
             Opcode::Gettype => Ok(wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
-            // The descriptor state, including the C's `INET_F_ACC`/`INET_F_MULTI_CLIENT` bits
-            // while accept operations are queued (`:1031`-`:1032`, `:11160`). A listener with one
-            // accept pending is `9 | 0x20` = 41 (`[1,0,0,1,41]`, measured on the oracle) and with
-            // two `9 | 0x120` = 297.
+            // The descriptor state, including the C's `INET_F_ACC`/`INET_F_MULTI_CLIENT` state bits
+            // (`:1031`-`:1032`, `:11160`). A listener with one accept pending is `9 | 0x20` = 41
+            // (`[1,0,0,1,41]`, measured on the oracle) and with two `9 | 0x120` = 297 — and the
+            // multi bit is **sticky**: the C restores `INET_STATE_LISTENING` only once the accept
+            // list drains (`:12607`-`:12611`, `:13536`-`:13540`), so a survivor keeps reporting 297.
             Opcode::Getstatus => Ok(wire::getstatus_reply(
                 self.state.state_code() | self.accept_state_bits(),
             )),
@@ -1824,13 +1848,27 @@ impl Driver for TcpInetDriver {
     }
 
     fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        // A listener serves its queued `accept` operations here; a connection completes its
-        // pending `recv` — the C's `tcp_inet_input`/`tcp_inet_accept` dispatch
-        // ([`TcpInetDriver::async_ready_input`]). Without a queued operation the bytes take the
-        // passive path into the port input queue.
-        self.async_ready_input(ctx)
+        // One readiness event, **one** reading of it — the C's `tcp_inet_input` dispatch
+        // (`inet_drv.c:13461`), which is on the descriptor's state and not on its mode: a
+        // listener takes the accept ladder (`:13469`/`:13529`), and a connected socket gets
+        // exactly one `tcp_recv(desc, 0)` (`:13598`-`:13600`) whose delivery then splits on
+        // `desc->inet.active` — passive ⇒ `inet_async_data` onto the port input queue
+        // (`tcp_reply_data`, `:4294`-`:4295`), otherwise `tcp_message` to the owner (`:4296`-
+        // `:4297`). So an `{active, …}` connection delivers through the **active-input channel**
+        // (one `{tcp, S, Data}` per delivered unit, never the port input queue) and never through
+        // both:
+        //
+        // * [`TcpInetDriver::owns_readiness_for_active`] is the C's connected-and-active arm —
+        //   [`TcpInetDriver::active_delivery`] owns the socket's read;
+        // * everything else (a listener's queued `accept`, a queued `TCP_REQ_RECV`, or a passive
+        //   connection's bytes into the port input queue) stays with
+        //   [`TcpInetDriver::async_ready_input`].
+        if self.owns_readiness_for_active() {
+            self.active_delivery(ctx)
+        } else {
+            self.async_ready_input(ctx)
+        }
     }
-
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if self.state == InetState::Connecting {
             self.finish_connect(ctx)?;
@@ -1882,7 +1920,7 @@ impl Driver for TcpInetDriver {
             "recv" => self.verb_recv(ctx, arg),
             "shutdown" => self.verb_shutdown(ctx, arg),
             "close" => self.verb_close(ctx),
-            "setopts" => self.verb_setopts(arg),
+            "setopts" => self.setopts_with_delivery(ctx, arg),
             "getopts" => self.verb_getopts(arg),
             _ => Err(error::badarg()),
         }
@@ -1917,6 +1955,15 @@ pub fn make_tcp_inet() -> Result<Box<dyn Driver>> {
     Ok(Box::new(TcpInetDriver::new()))
 }
 
+// The `{active, true|once|N}` delivery path — the C's `tcp_deliver`/`tcp_recv`
+// (`inet_drv.c:13045`-`:13260`) that sends the owner a `{tcp, S, Data}` message instead of
+// filling the port input queue.
+mod active;
+
+#[cfg(test)]
+mod active_tests;
+#[cfg(test)]
+mod accept_tests;
 #[cfg(test)]
 mod fdopen_errno_tests;
 #[cfg(test)]
@@ -1933,3 +1980,9 @@ mod opcode_tests_udp;
 mod stat_tests;
 #[cfg(test)]
 mod tests;
+
+/// The **length-framed** wire format the `erl`-oracle dumps use (a 4-byte big-endian byte count
+/// per reply) — the Rust half of the framing the suites' oracle expressions write, so the two
+/// halves state the format in one place.
+#[cfg(test)]
+mod oracle_dump;

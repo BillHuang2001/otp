@@ -186,8 +186,8 @@ pub use crate::timer::*;
 /// ([`PortTaskKind`], [`PortTask`], [`PortTaskQueue`], [`PortNotification`],
 /// [`PortTaskOutcome`], [`Readiness`]) and the driver→owner completion channel
 /// ([`PortCompletion`], [`CompletionEvent`], [`InetReply`], [`InetAsyncResult`],
-/// [`InetReason`]), the driver-failure channel ([`FailureReason`], [`DriverFailure`],
-/// [`PortFailure`]) the driver seam ([`Driver`], [`DriverContext`],
+/// [`InetReason`]), the active-mode input channel ([`ActiveInput`], [`ActiveInputEvent`]),
+/// the driver-failure channel ([`FailureReason`], [`DriverFailure`],/// [`PortFailure`]) the driver seam ([`Driver`], [`DriverContext`],
 /// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`PortExitReason`],
 /// the emulator's statically-linked driver set ([`STATIC_SPAWN_DRIVERS`],
 /// [`is_static_spawn_driver`]), [`FdDriver`],

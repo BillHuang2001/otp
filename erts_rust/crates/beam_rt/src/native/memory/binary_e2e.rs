@@ -53,7 +53,7 @@
 //! [`ERL_ONHEAP_BINARY_LIMIT`]: beam_term::refc::ERL_ONHEAP_BINARY_LIMIT
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,7 @@ use beam_engine::terms;
 use beam_process::ProcessState;
 use beam_term::{make_small, signed_value, Eterm};
 
+use crate::context::test_support::{scratch_dir, FixtureDir};
 use crate::native::test_support::{atom, call, runtime};
 
 /// The fixture source (`erlc` compiles it into the scratch directory at test time).
@@ -94,45 +95,13 @@ const PROBE: &str = concat!(
 /// What the probe above prints on OTP 29.1.1 / erts-17.1 (measured).
 const ORACLE_LINE: &str = "true|true|true";
 
-/// A compiled `offheap.beam` in its own scratch directory.
-///
-/// The directory is `erlc` output, not source, so it is removed on the way out — a failed
-/// removal is a printed note, never a panic (and `Drop` runs even when an assertion unwinds).
-struct Fixture {
-    /// The scratch directory holding `offheap.erl`/`offheap.beam`.
-    dir: PathBuf,
-}
-
-impl Fixture {
-    /// The compiled `offheap.beam`.
-    fn beam(&self) -> PathBuf {
-        self.dir.join("offheap.beam")
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        match std::fs::remove_dir_all(&self.dir) {
-            Ok(()) => {}
-            // The directory is ours and disposable; report rather than hide the failure.
-            Err(error) => println!("note: could not remove {}: {error}", self.dir.display()),
-        }
-    }
-}
-
-/// Compiles [`OFFHEAP_ERL`], or `None` when the system `erlc` is unavailable (the caller then
-/// skips **loudly**). A missing compiler, a non-zero exit and a missing output are all skips —
-/// never a silent pass and never a panic.
-fn build_fixture() -> Option<Fixture> {
-    let dir = std::env::temp_dir().join(format!("beam_rt_offheap_binary_{}", std::process::id()));
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "SKIPPING the `binary` end-to-end test: cannot create {}: {error}",
-            dir.display()
-        );
-        return None;
-    }
-    let source = dir.join("offheap.erl");
+/// Compiles [`OFFHEAP_ERL`] into its own scratch directory (unique per call, so parallel tests
+/// never race on one), or `None` when the system `erlc` is unavailable (the caller then skips
+/// **loudly**). A missing compiler, a non-zero exit and a missing output are all skips — never a
+/// silent pass and never a panic.
+fn build_fixture() -> Option<FixtureDir> {
+    let dir = scratch_dir("offheap_binary");
+    let source = dir.path().join("offheap.erl");
     if let Err(error) = std::fs::write(&source, OFFHEAP_ERL) {
         eprintln!(
             "SKIPPING the `binary` end-to-end test: cannot write {}: {error}",
@@ -140,7 +109,12 @@ fn build_fixture() -> Option<Fixture> {
         );
         return None;
     }
-    let output = match Command::new("erlc").arg("-o").arg(&dir).arg(&source).output() {
+    let output = match Command::new("erlc")
+        .arg("-o")
+        .arg(dir.path())
+        .arg(&source)
+        .output()
+    {
         Ok(output) => output,
         Err(error) => {
             eprintln!("SKIPPING the `binary` end-to-end test: cannot run `erlc`: {error}");
@@ -155,15 +129,14 @@ fn build_fixture() -> Option<Fixture> {
         );
         return None;
     }
-    let fixture = Fixture { dir };
-    if !fixture.beam().is_file() {
+    if !dir.path().join("offheap.beam").is_file() {
         eprintln!(
             "SKIPPING the `binary` end-to-end test: `erlc` produced no {}",
-            fixture.beam().display()
+            dir.path().join("offheap.beam").display()
         );
         return None;
     }
-    Some(fixture)
+    Some(dir)
 }
 
 /// Runs `erl -noshell -pa CODE_DIR -eval EXPR` with a **bounded** poll/kill and returns its
@@ -259,7 +232,7 @@ fn the_binary_item_matches_the_live_oracle_for_an_off_heap_payload() {
     };
 
     // -- the oracle half: the same fixture, under the live system `erl` -------------------
-    match oracle_eval_pa(&fixture.dir, PROBE) {
+    match oracle_eval_pa(fixture.path(), PROBE) {
         Some(line) => assert_eq!(
             line, ORACLE_LINE,
             "the oracle must report a non-empty, well-formed roster carrying the built 256 bytes"
@@ -273,7 +246,7 @@ fn the_binary_item_matches_the_live_oracle_for_an_off_heap_payload() {
     // -- the runtime half: the same fixture, under this runtime ---------------------------
     let mut runtime = runtime();
     runtime
-        .load_module(fixture.beam())
+        .load_module(fixture.path().join("offheap.beam"))
         .expect("the fixture compiles to a loadable module");
     let pid = runtime
         .spawn_process("offheap", "build_and_park", vec![make_small(256)])
@@ -326,5 +299,104 @@ fn the_binary_item_matches_the_live_oracle_for_an_off_heap_payload() {
     assert!(
         saw_256,
         "the roster carries the 256-byte payload the fixture built"
+    );
+}
+
+/// **The roster's source is the engine reservoir, not the process's own off-heap table.**
+///
+/// The mechanism pin for the removed per-slice mirror that made `foreign`/`emqx_base62:encode`
+/// quadratic. `beam_gc::OffHeap` never compacts, so registering a payload on the PCB on every
+/// slice made the slot vector — and every O(slots) `overhead_bytes`/`sweep` walk over it — grow
+/// with the loop count. Nothing registers any more: the machine's own
+/// [`Machine::refc_binaries`] reservoir is the one holder, and `erlang:process_info(Pid, binary)`
+/// reads it through `RunnerState::reservoir_at`.
+///
+/// This test registers **nothing** and proves that source end to end, on the same real fixture
+/// as its sibling above (a `.beam` compiled at test time, spawned through the real scheduler,
+/// parked while it really holds a payload its own run time built):
+///
+///   * the process's own off-heap table handed out **zero** slots (no count, no bytes) — the
+///     never-compacted slot space stays empty;
+///   * the engine reservoir is non-empty **and** is exactly what the roster reports: same entry
+///     count, same `Size` list.
+///
+/// Skips **loudly** when `erlc` is unavailable.
+///
+/// [`Machine::refc_binaries`]: beam_engine::Machine::refc_binaries
+#[test]
+fn the_binary_roster_is_the_engine_reservoir() {
+    let Some(fixture) = build_fixture() else {
+        return;
+    };
+
+    let mut runtime = runtime();
+    runtime
+        .load_module(fixture.path().join("offheap.beam"))
+        .expect("the fixture compiles to a loadable module");
+    let pid = runtime
+        .spawn_process("offheap", "build_and_park", vec![make_small(256)])
+        .expect("spawn offheap:build_and_park/1");
+    assert_eq!(
+        runtime.run_one_slice().expect("one slice"),
+        1,
+        "the child ran in exactly one slice"
+    );
+
+    // Nothing registered a payload on the PCB: the never-compacted slot space is untouched.
+    let (slots, bytes) = {
+        let process = runtime
+            .processes()
+            .get(pid)
+            .expect("the parked child stays in the table");
+        assert_eq!(
+            process.state(),
+            ProcessState::Waiting,
+            "parked in its `receive`"
+        );
+        (
+            process.off_heap_binary_count(),
+            process.off_heap_binary_bytes(),
+        )
+    };
+    assert_eq!(
+        slots, 0,
+        "no payload is mirrored onto the process's own off-heap table"
+    );
+    assert_eq!(bytes, 0, "so that table's slot space stays empty");
+
+    // The reservoir is the roster: `(length, size list)` must agree entry for entry.
+    let reservoir: Vec<(usize, usize, usize)> = runtime
+        .runner_state()
+        .reservoir_at(pid)
+        .expect("the parked child's engine is back in the runner state")
+        .iter()
+        .map(|binary| (binary.data_ptr() as usize, binary.len(), binary.refcount()))
+        .collect();
+    assert!(
+        !reservoir.is_empty(),
+        "the fixture builds its binary off-heap (a runtime-sized `<<0:N/unit:8>>`, N = 256)"
+    );
+
+    let reply = info(&mut runtime, pid.to_eterm(), "binary").expect("process_info/2 binary");
+    let (key, roster) = pair(reply);
+    assert_eq!(runtime.atom_name_of(key), Some("binary"));
+    let entries = terms::list_elements(roster).expect("the roster is a list");
+    assert_eq!(
+        entries.len(),
+        reservoir.len(),
+        "the roster lists exactly the reservoir's payloads (one entry per payload)"
+    );
+    let listed: Vec<i64> = entries
+        .iter()
+        .map(|entry| signed_value(terms::tuple_element(*entry, 1).expect("the size")))
+        .collect();
+    let reservoir_sizes: Vec<i64> = reservoir.iter().map(|(_, len, _)| *len as i64).collect();
+    assert_eq!(
+        listed, reservoir_sizes,
+        "the sizes agree in reservoir order"
+    );
+    assert!(
+        listed.contains(&256),
+        "the roster carries the 256-byte payload the fixture built: {listed:?}"
     );
 }
