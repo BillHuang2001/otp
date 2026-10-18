@@ -169,8 +169,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub mod driver;
-pub(crate) mod exit;
-pub(crate) mod info_extras;
+pub(crate) mod completion;
+pub(crate) mod exit;pub(crate) mod info_extras;
 pub(crate) mod ops;
 pub(crate) mod packet;
 pub(crate) mod tty;
@@ -772,6 +772,18 @@ enum PortEvent {
         /// The process the port belongs to (used when `to` is `None`).
         owner: ProcessId,
     },
+    /// A **driver→owner completion**: the `{inet_reply, …}` answer to a `port_command/2` and the
+    /// `{inet_async, …}` completion of a queued socket operation (see [`completion`]).
+    ///
+    /// Unlike every port-derived variant this one carries its **recipient already resolved**
+    /// ([`completion::CompletionPacket::owner`]): a completion staged around a port's teardown
+    /// outlives the port's [`PortMeta`], so the owner and the stream option are snapshotted at
+    /// drain time. Nothing about it is recomputed at delivery, which is why
+    /// [`PortEvent::port`] answers `None` for it.
+    Completion {
+        /// The drained completion, its recipient resolved.
+        packet: completion::CompletionPacket,
+    },
     /// A **handled signal** arrived (`os:set_signal(Sig, handle)`) — the delivery half of the
     /// A.4/A.8 signal surface, drained from the self-pipe [`watch::SignalWatch`] registers.
     ///
@@ -820,6 +832,12 @@ impl PortEvent {
             | PortEvent::Line { port, .. }
             | PortEvent::Exited { port, .. }
             | PortEvent::Term { port, .. } => Some(*port),
+            // A completion's recipient is already resolved, so there is nothing to re-derive
+            // from a live port: filtering it against [`PortRegistry::meta`] would drop exactly
+            // the completions a port's teardown produced (`async_error_am_all`), which are the
+            // ones its owner is still owed. It carries its own owner, so a recycled port number
+            // cannot mis-deliver it either.
+            PortEvent::Completion { .. } => None,
             PortEvent::Signal { .. } | PortEvent::Select { .. } => None,
         }
     }
@@ -1231,7 +1249,14 @@ impl PortRegistry {
             .map(|meta| meta.kind.bytes_from_driver_output())
             .unwrap_or(false)
         {
-            self.registry.output(&mut self.poller, id, bytes)?;
+            let written = self.registry.output(&mut self.poller, id, bytes);
+            // The driver's `output` callback is where a socket driver stages its
+            // `{inet_reply, …}` (see [`completion`]), so the channel is drained before the
+            // outcome is reported — a staged reply is a message its owner is owed, not a
+            // reason to fail the command.
+            let completions = self.drain_io_completions(None);
+            self.pending_events.extend(completions);
+            written?;
             return Ok(());
         }
         // A `{packet, N}` port's stream is framed by the emulator: the length header is
@@ -1258,6 +1283,10 @@ impl PortRegistry {
         let mut events = Vec::new();
         self.fold_notifications(outcome.notifications, &mut events)?;
         self.pending_events.extend(events);
+        // Same rule as the driver-`output` branch above: the `OUTPUT` task that carried this
+        // command is exactly where a socket driver stages `gen_udp:send`'s `{inet_reply, …}`.
+        let completions = self.drain_io_completions(None);
+        self.pending_events.extend(completions);
         Ok(())
     }
 
@@ -1319,7 +1348,14 @@ impl PortRegistry {
             // which is `badarg` too. Both are the atom `badarg`, never a fabricated reply.
             return Err(BeamError::BadArg);
         }
-        self.registry.port_control(&mut self.poller, id, op, arg)
+        let reply = self.registry.port_control(&mut self.poller, id, op, arg);
+        // A control op can in principle stage a completion (`prim_inet`'s `recv`/`accept` arms
+        // queue an operation that completes later), so the channel is drained here too — the
+        // drain is unconditional, because a failing control call must not also lose the reply
+        // it staged.
+        let completions = self.drain_io_completions(None);
+        self.pending_events.extend(completions);
+        reply
     }
 
     /// Whether `id`'s driver declares a **`control` callback** — the C's
@@ -1548,6 +1584,9 @@ impl PortRegistry {
         // snapshotted **here**, while the port's metadata, link set and incoming monitors are
         // still readable; they become deliverable once `beam_io` reports the close (see
         // [`exit`]).
+        // Everything a completion this close produces still needs must be read **here**: it
+        // outlives the metadata removed below (see [`completion::ClosedPortSnapshot`]).
+        let snapshot = self.closed_snapshot(id);
         self.capture_port_exit(id);
         // The port-exit notification first: the driver sees `port_exit` before the teardown
         // `stop`, and the port is still live for it.
@@ -1568,6 +1607,12 @@ impl PortRegistry {
         self.pending_events
             .retain(|event| event.port() != Some(id));
         let closed = self.registry.close(&mut self.poller, id);
+        // The teardown is where a driver answers its queued operations with `{error, closed}`
+        // (the C's `async_error_am_all`), and `beam_io` harvests those into a registry-owned
+        // queue precisely so they are still reported exactly once. Draining here — with the
+        // snapshot, because the port's metadata is already gone — is what keeps that reply.
+        let completions = self.drain_io_completions(snapshot);
+        self.pending_events.extend(completions);
         // `and` returns the teardown's error when it failed, and the notification's
         // otherwise — so a failure on either path reaches the caller.
         closed.and(notified)
@@ -1638,6 +1683,11 @@ impl PortRegistry {
             // the report is what retires the port's number and releases them, and with no
             // live port left nothing else would ever run the round that mints it.
             self.report_pending_closes(&mut events)?;
+            // That round is also a drive point for the completion channel (it is what mints a
+            // close report, and a close is where a driver answers its queued operations), so it
+            // is drained here — otherwise a completion awaiting the last port's teardown would
+            // be stranded for ever.
+            events.extend(self.drain_io_completions(None));
             return Ok(events);
         }
         let deadline = Instant::now() + timeout;
@@ -1698,6 +1748,12 @@ impl PortRegistry {
             let outcome = self
                 .registry
                 .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
+            // The **completion channel** is drained on *every* round, immediately after the
+            // tasks: a driver stages an `{inet_reply, …}`/`{inet_async, …}` from inside a task
+            // (or from `output`/`control`), and the port keeps it until a drain takes it, so
+            // deferring the drain until something else looked non-empty would starve a caller
+            // blocked on that very message (see [`completion`]).
+            events.extend(self.drain_io_completions(None));
             // The **line channel** is drained on *every* round, immediately after the tasks:
             // `take_line_notifications` empties every line-mode port's staged frames, so
             // deferring it until something else looked non-empty would lose them (see
@@ -3354,6 +3410,14 @@ impl Runtime {
                         port.to_eterm(),
                         ctx.stabilize_driver_term(*term)?,
                     ),
+                    // A driver→owner completion: the `Port` is the sender, exactly as the
+                    // `{Port, {data, …}}` family has it, and the recipient is the owner the
+                    // drain already resolved (see [`completion`]).
+                    PortEvent::Completion { packet } => (
+                        packet.owner,
+                        packet.port.to_eterm(),
+                        ctx.completion_message(packet)?,
+                    ),
                     // A handled signal goes to the `erl_signal_server` process by name, with the
                     // emulator (`system`) as the sender. An unregistered name resolves to no pid,
                     // in which case there is nobody to notify and the signal is dropped.
@@ -3479,6 +3543,15 @@ impl RuntimeContext<'_> {
                 // ([`Runtime::deliver_port_messages`]) delivers it into that process's mailbox
                 // instead — rather than being matched as if it were the evaluator's own. Same
                 // reasoning as the driver-term arm above.
+                // A driver→owner completion. The evaluator can only observe its **own**
+                // mailbox, so one addressed to a different process is left to the scheduler
+                // route — the same rule the driver-term and signal arms follow.
+                PortEvent::Completion { packet } => {
+                    if packet.owner != self.pid() {
+                        continue;
+                    }
+                    messages.push(self.completion_message(&packet)?);
+                }
                 PortEvent::Signal { .. } => continue,
                 // A ready `tty_select/2` interest belongs in the **owning reader's** mailbox, which
                 // the evaluator is not: it can only observe its own mailbox, so — like the signal
