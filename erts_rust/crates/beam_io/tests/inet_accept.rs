@@ -74,7 +74,7 @@
 //!
 //! # Why one file
 //!
-//! The six cases share one harness (the port plumbing, the acceptance helpers, the two adoption
+//! The seven cases share one harness (the port plumbing, the acceptance helpers, the two adoption
 //! routes) and one oracle probe set; splitting them would duplicate that vocabulary across test
 //! binaries. This is the crate's documented "comprehensive test module" exception to the
 //! ~1000-line target, like `tests/spawn.rs` and `tests/abi_driver.rs`.
@@ -515,7 +515,10 @@ fn the_whole_accept_chain_runs_with_a_foreign_peer() {
     );
     let (id2, fd2) = accepted(done.event, "the second accept completes");
     assert_eq!(id2, 1, "the second accept's completion echoes its own id");
-    assert_ne!(fd2, fd, "two connections are two descriptors");
+    // Not `assert_ne!(fd2, fd)`: the first connection's port was closed above, so its number is
+    // free again and the kernel legitimately reuses the lowest free descriptor. The two
+    // connections are distinct because each carries its own peer's bytes (below).
+    assert!(fd2 >= 0, "the second completion carries a real descriptor: {fd2}");
     let adopted = adopt_with_fdopen(&mut ports, &mut poller, fd2);
     assert_eq!(
         control(
@@ -855,8 +858,8 @@ fn a_mixed_accept_queue_times_out_the_head_like_the_oracle() {
     );
     assert_eq!(
         status_of(&mut ports, &mut poller, listener),
-        ONE_ACCEPT_STATUS,
-        "the survivor keeps the listener armed (one accept still queued)"
+        MULTI_ACCEPT_STATUS,
+        "the multi-accept bit is sticky while a survivor remains queued"
     );
 
     // The survivor: still queued, and with **no timer of its own** — its operand was
