@@ -21,7 +21,7 @@
 %%% term is delivered **bare** — never wrapped in `{Port, Term}` — so the `receive` below matches the
 %%% tuple itself, and a `timeout` names the path that did not fire.
 -module(event_driver).
--export([recv/0, recv_v/0, recv_term/0]).
+-export([recv/0, recv_v/0, recv_term/0, recv_split/0]).
 
 recv() ->
     Port = open_port({spawn_driver, "{path}"}, [binary]),
@@ -44,3 +44,11 @@ recv_term() ->
     Port = open_port({spawn_driver, "{path}"}, [binary]),
     true = port_command(Port, <<"go">>),
     receive {7, 9} -> {7, 9} after 5000 -> timeout end.
+%% The split-reply mode (`driver_output2`): the driver answers with the header `"HDR"` and the
+%% `port_command` payload as the data tail, and the boundary is **observable** — the port is in
+%% `[binary]` mode, so the reply is the improper list `[72,68,82|<<"abc">>]`, not the flattened
+%% `<<"HDRabc">>`.
+recv_split() ->
+    Port = open_port({spawn_driver, "{path}"}, [binary]),
+    true = port_command(Port, <<"abc">>),
+    receive {Port, {data, D}} -> D after 5000 -> timeout end.

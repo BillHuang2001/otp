@@ -336,9 +336,9 @@ pub enum PortName {
     /// Like [`PortName::SpawnDriver`] it is a **driver** port — so [`PortMeta::has_driver_control`]
     /// answers from the driver's own `control` capability, captured when the port is opened — but
     /// **unlike** it its bytes do not come from a C driver's inline `output` callback: they arrive
-    /// through the driver's poller-registered descriptor on the port-task round, so
-    /// [`PortRegistry::take_driver_outputs`] must not drain it and [`PortRegistry::write_command`]
-    /// takes the ordinary `port_command` path.
+    /// through the driver's poller-registered descriptor on the port-task round, and
+    /// [`PortRegistry::write_command`] takes the ordinary `port_command` path instead of running
+    /// the driver's `output` callback inline.
     SpawnDriverBuiltin,
     /// `{fd, N}`: a descriptor the Erlang side already owns.
     Fd,
@@ -524,10 +524,10 @@ struct PortMeta {
     /// The two message producers route on it (see [`PortName::bytes_from_driver_output`], and
     /// [`PortMeta::has_driver_control`] for the `port_control` gate's `Name`-form half): a
     /// `dlopen`ed `{spawn_driver, Name}` port's bytes
-    /// come from the C driver's `output` callback (queued on the port's input queue by
-    /// [`driver::DriverPortAdapter`]) and are drained by [`PortRegistry::take_driver_outputs`],
-    /// while every other port's — including a **built-in** driver port's — come from a
-    /// poller-registered descriptor through the port-task round.
+    /// come from the C driver's inline `output` callback (the port-task round reports the reads
+    /// [`driver::DriverPortAdapter`] hands up, header/body split intact), while every other port's
+    /// — including a **built-in** driver port's — come from a poller-registered descriptor through
+    /// the same round.
     kind: PortName,
     /// Whether this port's driver declares a **`control` callback** — the C's
     /// `prt->drv_ptr->control != NULL` test (`../../erts/emulator/beam/io.c:4035`), captured from
@@ -1241,8 +1241,11 @@ impl PortRegistry {
         meta.output.set(meta.output.get().saturating_add(bytes.len() as u64));
         // A **C driver** port has no child pipe: `port_command` *is* the driver's own `output`
         // callback. `beam_io::PortRegistry::output` runs it inline, and the bytes the driver
-        // answers with through `driver_output` are queued as this port's input for the next
-        // [`PortRegistry::pump`] — see [`PortRegistry::take_driver_outputs`].
+        // answers with through `driver_output*` are queued as this port's **reads**, which the next
+        // port-task round reports one message per call with the C's header/body split intact (see
+        // [`PortRegistry::fold_notifications`]). Harvesting them off the flat byte queue would
+        // flatten a `driver_output2` reply (`[h…|<<tail>>]` → `<<h…tail>>`), so it is deliberately
+        // left to the round.
         if self
             .meta
             .get(&id.number())
@@ -1663,10 +1666,19 @@ impl PortRegistry {
         // [`PortRegistry::pending_events`]).
         let mut events = self.drain_pending_events();
         events.extend(self.take_due_exit_statuses()?);
-        // The driver ports' bytes may already be queued (a `port_command` on a driver port ran
-        // the driver's `output` callback inline), so they are harvested before any wait too —
-        // together with the terms a driver's callback emitted (`erl_drv_output_term`).
-        events.extend(self.take_driver_outputs());
+        // The terms a driver's callback emitted (`erl_drv_output_term`/`erl_drv_send_term`) are
+        // queued on the port and harvested before any wait.
+        //
+        // A `dlopen`ed `{spawn_driver, Name}` port's `driver_output*` **bytes** are deliberately
+        // NOT harvested here: they are the port's buffered *reads*, and `beam_io`'s flat
+        // `Port::drain_input` view joins a `driver_output2` call's header and body into one byte
+        // string — reporting `<<h…tail>>` for the oracle's `[h…|<<tail>>]`. The port-task round
+        // below harvests them instead (`execute_port_tasks` → `Port::take_input_notifications`):
+        // one `PortNotification::Data` per `driver_output*` call with the C's header/body split
+        // intact, which `fold_notifications` renders (`StreamShape::Data`). They cannot be reported
+        // twice — a round **drains** the reads — and nothing is lost: every path that can run a
+        // driver callback (`output`, `control`, `ready_input`, `timeout`, `ready_async`) either
+        // runs inside a round or leaves its read for the next one.
         events.extend(self.take_driver_terms());
         // A signal handled before this round — or while the runtime was not polling — is
         // recorded in the facility's own bitmask, so it is drained unconditionally rather than
@@ -1812,7 +1824,6 @@ impl PortRegistry {
                 }
             }
             self.fold_notifications(outcome.notifications, &mut events)?;
-            events.extend(self.take_driver_outputs());
             events.extend(self.take_driver_terms());
             events.extend(self.take_due_exit_statuses()?);
             // A status taken by that last check releases the frames this very round harvested
@@ -1822,61 +1833,6 @@ impl PortRegistry {
                 return Ok(events);
             }
         }
-    }
-
-    /// The `{Port, {data, Data}}` events the **`dlopen`ed C driver** ports have produced.
-    ///
-    /// A `{spawn_driver, Name}` port backed by a loaded `.so` gets its bytes from the driver's
-    /// `output` callback answering through `driver_output`; [`driver::DriverPortAdapter`] queues
-    /// them on the port's input queue, and this drains it. A `spawn`/`fd` port's input queue, and a
-    /// **built-in** driver port's ([`PortName::SpawnDriverBuiltin`], whose bytes come from its
-    /// poller-registered descriptor), are drained by the port-task round instead
-    /// ([`beam_io::Port::take_input_notification`], whose `INPUT` task their registration makes
-    /// run), so the two never report the same bytes.
-    ///
-    /// # Errors
-    ///
-    /// None: a port that has gone away (closed while the bytes were queued) has no recipient and
-    /// its bytes are dropped, exactly as the task round drops a notification for a closed port.
-    fn take_driver_outputs(&mut self) -> Vec<PortEvent> {
-        let numbers: Vec<u64> = self
-            .meta
-            .iter()
-            .filter(|(_, meta)| meta.kind.bytes_from_driver_output())
-            .map(|(number, _)| *number)
-            .collect();
-        let mut events = Vec::new();
-        for number in numbers {
-            let port = PortId::new(number);
-            let bytes = match self.registry.get_mut(port) {
-                Some(live) => live.drain_input(),
-                None => Vec::new(),
-            };
-            if bytes.is_empty() {
-                continue;
-            }
-            if let Some(meta) = self.meta.get(&number) {
-                // Bytes a driver answered with are **input** for
-                // `erlang:statistics(io)`, counted where they are harvested.
-                self.io_counters.note_input(bytes.len());
-                // ...and for this port's own `port_info(Port, input)`.
-                meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
-                events.push(PortEvent::Data {
-                    port,
-                    // A `dlopen`ed driver's bytes come from its own `output` callback through the
-                    // port's **input queue**, which [`beam_io`]'s `Port::drain_input` hands over as
-                    // one flat byte sequence — the `beam_abi` host seam records neither **which**
-                    // `driver_output*` entry point the `.so` called nor its header/data split — so
-                    // the read is body-only and renders the stream's own shape (a binary on a
-                    // `binary` port). Deliberately unchanged: it is what its corpus cases pin.
-                    read: ReadMessage::body_only(bytes),
-                    stream: meta.stream,
-                    shape: StreamShape::Data,
-                    owner: meta.owner,
-                });
-            }
-        }
-        events
     }
 
     /// Folds one port-task round's notifications into `events`, crediting every payload where it
@@ -2133,8 +2089,8 @@ impl PortRegistry {
     /// of this node's pids is dropped rather than misdelivered to the owner.
     ///
     /// A port that has gone away (closed while the term was queued) has no metadata and no
-    /// recipient, so its terms are dropped exactly as [`PortRegistry::take_driver_outputs`] drops
-    /// the bytes of a closed port. A driver's queue is emptied when it is unloaded, so this never
+    /// recipient, so its terms are dropped exactly as [`PortRegistry::fold_notifications`] drops a
+    /// read whose port has closed. A driver's queue is emptied when it is unloaded, so this never
     /// reports a term whose arena is gone (see [`driver::TermQueue`]'s lifetime contract).
     fn take_driver_terms(&mut self) -> Vec<PortEvent> {
         let numbers: Vec<u64> = self
@@ -3005,8 +2961,8 @@ impl PortHook for RuntimePorts {
             // invented one is *not* a hit: it takes the `dlopen` route below and ends as the oracle's
             // `badarg`. Its bytes arrive through the poller-registered descriptor on the port-task
             // round (not a C driver's inline `output` callback), so it is recorded as
-            // [`PortName::SpawnDriverBuiltin`] — a driver port for `port_control`, but not for
-            // [`PortRegistry::take_driver_outputs`].
+            // [`PortName::SpawnDriverBuiltin`] — a driver port for `port_control`, but not one
+            // whose bytes come from an inline `output` callback.
             if let Some(created) = registry.create_static_spawn_driver(&driver_name) {
                 let driver = created?;
                 // The driver's own `control` capability, read **before** the boxed driver is moved

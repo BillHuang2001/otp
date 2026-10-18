@@ -1103,6 +1103,42 @@ fn a_driver_send_term_reaches_the_connected_process() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The split reply (`driver_output2`): the header/body boundary is observable in Erlang
+// ---------------------------------------------------------------------------------------------
+/// A driver that answers `port_command` through `driver_output2` keeps the C's **header/body**
+/// boundary: the owner receives `[72,68,82|<<"abc">>]`, never the flattened `<<"HDRabc">>`.
+///
+/// This is the end-to-end proof that the host seam's split hook is adopted. `driver_output2(hbuf,
+/// hlen, buf, len)` (`io.c:6387`; `driver_output_binary`/`driver_outputv` have the same shape) does
+/// not hand up one byte string — it builds `{Port, {data, Reply}}` with `Reply = [h…|Body]`, the
+/// header as a **list prefix** and the body as the tail, which `[binary]` port mode renders as a
+/// binary. Joining the halves would deliver a *different term*, so this test names both halves and
+/// their order.
+///
+/// Oracle ground truth (OTP 29 / `erts-17.1`, the very same `.so` compiled as `eventsplit`):
+///
+/// ```none
+/// $ erl -noshell -eval 'ok = erl_ddll:load_driver("<dir>", "eventsplit"),
+///       P = open_port({spawn_driver, "eventsplit"}, [binary]),
+///       true = port_command(P, <<"abc">>),
+///       receive {P,{data,D}} -> io:format("~p~n",[D]) after 5000 -> timeout end, halt(0).'
+/// [72,68,82|<<"abc">>]
+/// ```
+#[test]
+fn a_driver_output2_reply_keeps_its_header_and_body_apart() {
+    with_event_mode("split", 4, "eventsplit", "recv_split", |rt, result| {
+        let rendered = rt
+            .format_term_w(result, None)
+            .unwrap_or_else(|error| format!("<unprintable: {error}>"));
+        assert_eq!(
+            rendered.trim_end(), "[72,68,82|<<97,98,99>>]",
+            "`driver_output2` must deliver the header as a list prefix and the body as the binary \
+             tail (the flattened `<<72,68,82,97,98,99>>` is a DIFFERENT term, so a join is a \
+             divergence, not a degradation); got {rendered}"
+        );
+    });
+}
+// ---------------------------------------------------------------------------------------------
 // The driver registry surface: `driver_lock_driver` + `add_driver_entry`/`remove_driver_entry`
 // ---------------------------------------------------------------------------------------------
 
