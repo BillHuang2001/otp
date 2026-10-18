@@ -42,12 +42,12 @@
 //! * `bitstrings` - an on-heap small binary (`ErlHeapBits`), byte-aligned and not.
 //! * `numbers` - a boxed float (`HEADER_FLONUM`) and a positive/negative bignum (`write_big`).
 //!
-//! Two documented `beam_term::compare` limitations shape the assertions here (see the crate
-//! `CONTEXT.md` `Known Issues`): it has **no structural arm** for external pid/port/reference (so
-//! those are asserted through the `external_*_parts` accessors - see `tests/external.rs`) and none
-//! for `RECORD_SUBTAG` (so a native record is asserted through the `record_*` accessors below,
-//! exactly as a copied external thing is). Refc (off-heap) binaries share their payload rather than
-//! deep-copying - see `tests/binary.rs`.
+//! `beam_term::compare` has a layout-aware arm for every class here - including external
+//! pid/port/reference (`cmp_external_*`, see `tests/external.rs`) and `RECORD_SUBTAG`
+//! (`cmp_records`) - so a copy is `=:=` its original for all of them. Each test asserts that
+//! structural equality through `compare::eq` and, where the copy itself is not enough to pin the
+//! shape, additionally through the layout accessors (`record_*`, `external_*_parts`). Refc
+//! (off-heap) binaries share their payload rather than deep-copying - see `tests/binary.rs`.
 
 use beam_alloc::Heap;
 use beam_message::{copy_struct_simple, size_of_copy};
@@ -247,8 +247,10 @@ fn a_native_record_copies_its_definition_and_values() {
     );
     assert_eq!(dst.used(), record_block_words(2), "nothing is written twice");
 
-    // `compare` has no structural arm for `RECORD_SUBTAG`, so check through the accessors:
-    // the copy is a well-formed record over the same field table and values.
+    // `compare`'s `cmp_records` arm compares the definition's `(module, name, is_exported)`,
+    // the field count and keys, then the values - never the inlined definition pointer - so
+    // the copy is `=:=` its original. The accessors then pin the shape explicitly.
+    assert!(compare::eq(record, copy, &atoms), "the copied native record is =:= its original");
     // SAFETY: both terms are live native records.
     unsafe {
         assert!(record_is_native(copy, module, name));

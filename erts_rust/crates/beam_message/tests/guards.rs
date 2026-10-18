@@ -42,8 +42,9 @@
 //! The forged cycles are built with raw heap writes; every such write carries a `// SAFETY:`
 //! rationale.
 //!
-//! Two documented `beam_term::compare` limitations shape the assertions: it has no structural arm
-//! for external pid/port/reference (see `tests/external.rs`) and none for `RECORD_SUBTAG`.
+//! `beam_term::compare` models every class these assertions meet, including external
+//! pid/port/reference (`cmp_external_*`, pinned by `tests/external.rs`) and `RECORD_SUBTAG`
+//! (`cmp_records`), so `compare::eq` is the structural check throughout.
 
 use std::collections::HashSet;
 

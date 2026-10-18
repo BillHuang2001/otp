@@ -79,6 +79,22 @@ fn an_external_pid_is_copied_verbatim_and_registers_its_node() {
     assert_eq!((c_num, c_ser, c_creation), (o_num, o_ser, o_creation));
     assert_eq!((c_num, c_ser), (0x1234, 0x0007));
 
+    // Structural equality: `compare`'s external-pid arm reads the node identity and the
+    // `(serial, number)` fields, never the off-heap linkage word the copy rewrites, so the
+    // copy is `=:=` its original even though it lives at a different address.
+    assert!(eq(copy, original, &atoms), "the copied external pid is =:= its original");
+    // ...and the arm is *structural*, not a blanket `true`: a pid that differs only in its
+    // `number` (same node, serial and creation) must not compare equal to the copy.
+    // SAFETY: one more 4-word external pid block inside the same live source heap.
+    let sibling = unsafe {
+        let hp = src.alloc_words(external_pid_size_words()).expect("the sibling fits");
+        write_external_pid(hp, node, 0x1235, 0x0007, 5)
+    };
+    assert!(
+        !eq(copy, sibling, &atoms),
+        "a different pid number is not =:= the copy"
+    );
+
     // The node linkage is registered once, with one reference.
     assert_eq!(dst_off.nodes().len(), 1, "one entry per distinct node");
     assert_eq!(dst_off.nodes()[0].node().raw(), node.raw());
@@ -124,6 +140,18 @@ fn two_references_to_the_same_node_share_one_entry_with_refcount_two() {
     let (_, num_b, _, creation_b) = unsafe { external_pid_parts(second) };
     assert_eq!((num_a, creation_a), (1, 9));
     assert_eq!((num_b, creation_b), (2, 9));
+
+    // Structural equality, whole and elementwise: the copied tuple is `=:=` its original
+    // (which walks both external pids), and each copied pid is `=:=` the pid it came from.
+    assert!(eq(copy, pair, &atoms), "the copied 2-tuple of external pids is =:= its original");
+    assert!(eq(first, pid_a, &atoms), "pid A's copy is =:= its original");
+    assert!(eq(second, pid_b, &atoms), "pid B's copy is =:= its original");
+    // The two pids share one node but carry different `(number, serial)` ids, so they are
+    // distinguishable — the arm compares the ids, it does not stop at the shared node.
+    assert!(
+        !eq(first, second, &atoms),
+        "two pids over the same node with different ids are not =:="
+    );
 
     // Dropping the destination releases both references.
     let held = dst_off.nodes()[0].handle();
@@ -204,6 +232,40 @@ fn external_port_and_reference_nodes_are_registered_separately() {
     assert_eq!(r_creation, or_creation);
     assert_eq!(r_creation, 4);
     assert_eq!(or_node.raw(), node_b.raw());
+
+    // Structural equality: ports compare `(node, creation)` then `number`, references
+    // `(node, creation)` then their id words — never the off-heap linkage word — so the
+    // whole copied graph and each copied thing are `=:=` their originals.
+    assert!(eq(copy, tuple, &atoms), "the copied 2-tuple of external things is =:= its original");
+    assert!(eq(c_port, port, &atoms), "the copied external port is =:= its original");
+    assert!(eq(c_ref, reference, &atoms), "the copied external reference is =:= its original");
+
+    // ...and both arms are structural: a different port `number`, and different reference
+    // ids, over the same node identity, must not compare equal to the copies.
+    // SAFETY: the matching port and reference blocks are reserved inside the same live
+    // source heap (nothing is copied from them, so no node reference is registered).
+    let (other_port, other_ref) = unsafe {
+        let p = write_external_port(
+            src.alloc_words(external_port_size_words()).expect("the port fits"),
+            node_a,
+            0x9998,
+            3,
+        );
+        let r = write_external_ref(
+            src.alloc_words(external_ref_size_words(3)).expect("the ref fits"),
+            node_b,
+            &[10, 20, 31],
+            4,
+        );
+        (p, r)
+    };
+    assert!(
+        !eq(c_port, other_port, &atoms),
+        "a different port number is not =:= the copy"
+    );
+    assert!(!eq(c_ref, other_ref, &atoms), "different reference ids are not =:= the copy");
+    // A port and a reference are different classes, so they never compare equal either.
+    assert!(!eq(c_port, c_ref, &atoms), "a port is not =:= a reference");
 }
 
 #[test]
@@ -237,11 +299,37 @@ fn a_node_is_registered_once_however_many_times_it_is_copied() {
     let src_off = OffHeapTable::new();
     let mut dst = Heap::new(128).expect("destination heap");
     let mut dst_off = OffHeapTable::new();
-    let _copy = {
+    let copy = {
         let mut ctx = CopyContext::new(&src_off, &mut dst_off);
         copy_struct(list, &mut dst, &mut ctx).expect("the copy succeeds")
     };
 
     assert_eq!(dst_off.nodes().len(), 1, "still one entry per distinct node");
     assert_eq!(dst_off.nodes()[0].refcount(), 5, "one reference per copied thing");
+
+    // Structural equality: the copied list is `=:=` its original (which walks all five
+    // copied external pids)...
+    assert!(eq(copy, list, &atoms), "the copied list of external pids is =:= its original");
+    // ...and elementwise each copy is `=:=` the pid it came from, while the five pids stay
+    // mutually distinguishable (they differ in `(number, serial)`) — the arm sees the ids
+    // of a shared node, so all five registrations do not collapse into one identity.
+    // `list` was built head-first, so walking it yields `pids` in reverse.
+    let mut copied = Vec::new();
+    let mut current = copy;
+    while is_list(current) {
+        // SAFETY: `current` is a live cons cell inside the destination heap.
+        copied.push(unsafe { car(current) });
+        // SAFETY: as above.
+        current = unsafe { cdr(current) };
+    }
+    assert_eq!(current, NIL, "the copied list is proper");
+    assert_eq!(copied.len(), pids.len(), "one copied element per source pid");
+    for (i, (&element, &original)) in copied.iter().zip(pids.iter().rev()).enumerate() {
+        assert!(eq(element, original, &atoms), "copied element {i} is =:= its original");
+        for (j, &other) in copied.iter().enumerate() {
+            if i != j {
+                assert!(!eq(element, other, &atoms), "copied elements {i} and {j} are distinct");
+            }
+        }
+    }
 }
