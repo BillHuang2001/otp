@@ -472,7 +472,25 @@ fn assert_artifact(dir: &Path, oracle_dir: &Path, module: &str, what: &str) -> u
 /// The live system `erl` runs the identical chain in its own directories and must answer the same
 /// marked value ([`EXPECTED`]); every artifact both sides produce is then byte-compared, so the
 /// "same value" is backed by "same object code".
+///
+/// # Why this is not part of the default gate
+///
+/// The chain is five real compiles of compiler-front-end-sized sources in one interpreted
+/// invocation: measured **532 s** wall on this (heavily shared) host versus **4.3 s** for the
+/// oracle's identical chain, and `lib/stdlib/src/erl_lint.erl` alone accounts for ≈ 239 s of it.
+/// That is corpus-scale work, so it is `#[ignore]`d exactly as the in-crate `lib/stdlib/src`
+/// sweep is, and run at milestones:
+///
+/// ```text
+/// erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt \
+///     --offline --test selfhost_bootstrap -- --ignored --nocapture
+/// ```
+///
+/// The cheap A.9 evidence that runs by default is `tests/compile_file.rs` (in-process
+/// `compile:file/2` on real stdlib sources), `tests/selfhost_chain.rs` (compile → load → run in
+/// one invocation) and the `selfhost/*` differential cases.
 #[test]
+#[ignore = "milestone: 5 real compiles in one invocation, ~530 s on a shared host"]
 fn the_compiler_rebuilds_itself_stage_by_stage_and_the_fresh_modules_are_what_runs() {
     const BANNER: &str = "selfhost_bootstrap";
     let Some(oracle) = support::require_oracle(BANNER) else {

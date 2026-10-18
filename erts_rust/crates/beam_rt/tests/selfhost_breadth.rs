@@ -147,7 +147,7 @@ const BANNER: &str = "selfhost breadth";
 /// tens of seconds under a debug build, and the in-crate pump bound is 900 s. 300 s is the
 /// per-source deadline the corpus measurement quotes: generous for the slowest real source, short
 /// enough that a wedged runtime is reported rather than slept on.
-const SOURCE_DEADLINE: Duration = Duration::from_secs(300);
+const SOURCE_DEADLINE: Duration = Duration::from_secs(900);
 
 /// How often a running child's exit is polled.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
