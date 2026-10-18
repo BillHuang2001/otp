@@ -1113,6 +1113,60 @@ fn the_io_counters_track_the_bytes_written_to_and_read_from_a_port() {
     assert_eq!(counters.bytes(), (5, 5));
 }
 
+/// A port owes a reply **exactly** while a byte written to it is unanswered — the question the
+/// boot drive's poll budget is gated on.
+///
+/// [`PortRegistry::awaits_port_reply`] is the sharp companion of
+/// [`PortRegistry::has_nothing_to_poll`]: the latter asks "is anything live at all?", which a
+/// booted kernel's live-but-idle `inet_gethost` child keeps false for the whole run, while this
+/// one asks whether a wait inside [`PortRegistry::pump`] could still deliver anything — the reason
+/// a zero-slice boot-drive step is handed a zero timeout (see [`../PERF.md`](../PERF.md), *The
+/// boot path's one live-but-idle port, and the poll budget*). It reads the port's own `input` and
+/// `output` counters, i.e. the oracle's `port_info(Port, input)`/`output` pair.
+#[test]
+fn a_port_awaits_a_reply_exactly_while_a_written_command_is_unanswered() {
+    let mut fx = fixture();
+
+    // No port at all: nothing can answer, so nothing is awaited.
+    assert!(
+        !fx.registry.borrow().awaits_port_reply(),
+        "an empty registry owes no reply"
+    );
+
+    // A live port nobody has written to owes none either: `cat` stays idle until it is fed, which
+    // is the boot's own shape (an idle helper child, live for the rest of the run).
+    let name = fx.spawn("cat");
+    let port = fx
+        .hook
+        .open_port(name, NIL)
+        .expect("open_port({spawn, \"cat\"}, [])");
+    assert!(
+        !fx.registry.borrow().awaits_port_reply(),
+        "a live but idle port cannot speak until it is written to"
+    );
+
+    // A written command the child has not answered is the one thing a blocking poll could still
+    // deliver from: `output` is credited at the write instant, `input` only where the read is
+    // harvested.
+    fx.registry
+        .borrow_mut()
+        .write_command(port, b"hello")
+        .expect("port_command");
+    assert!(
+        fx.registry.borrow().awaits_port_reply(),
+        "five written bytes and no answer yet: the port owes a reply"
+    );
+
+    // Consuming the echo answers every written byte, so the port is owed nothing again — what
+    // lets the boot drive hand its next round a zero timeout.
+    let echo = pump_data(&mut fx.registry.borrow_mut(), port);
+    assert_eq!(&echo, b"hello", "`cat` echoes the command back");
+    assert!(
+        !fx.registry.borrow().awaits_port_reply(),
+        "the port answered every byte written to it"
+    );
+}
+
 // --- the port READ path (contract A.4) ------------------------------------------------
 //
 // Two properties of the read path are pinned here, because both are observable and both

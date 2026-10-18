@@ -264,7 +264,7 @@ so `gen_server:loop_hibernate/4` (`lib/stdlib/src/gen_server.erl:2338`) does not
   `whereis(application_controller)` is a live pid after the last directive. The detail is in
   [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
 
-### Kernel start performs a real native hostname lookup — and every zero-slice drive step pays 25 ms once it has
+### Kernel start performs a real native hostname lookup and leaves one live-but-idle port
 Directive **18** (`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`) starts the
 `kernel` application, so `kernel_sup` starts its `inet_db` child (`lib/kernel/src/kernel.erl:211-216`):
 `inet_db:start_link/0` runs `inet_config:init/0` before it answers (`lib/kernel/src/inet_db.erl:121-123`),
@@ -287,19 +287,25 @@ which
 - Consequence for the boot drive: **that child is never reaped and never closed**
   (`inet_gethost_native` passes no `exit_status`, so no round polls or reaps it — see
   [`../port/CONTEXT.md`](../port/CONTEXT.md)), so from directive 18 on the runtime holds a live, idle
-  port and `PortRegistry::has_nothing_to_poll` never answers `true` again. Every scheduler pass that
-  runs **zero** slices therefore blocks one full `PORT_POLL_SLICE` (25 ms) in the port poll —
-  `../runtime/scheduler.rs:791-804` → `../runtime/scheduler.rs:894` → `../port.rs:1716` (poll at
-  `../port.rs:1775`) — independently of the drive's `TimerWait::ImminentWithin` policy.
+  port and `PortRegistry::has_nothing_to_poll` never answers `true` again.
+  A pass that runs **zero** slices polls its ports once (`../runtime/scheduler.rs` →
+  `../port.rs::pump`), and the drive is the **one** caller whose poll budget is gated on a port owing a
+  reply: under `TimerWait::ImminentWithin` a pass with no port holding unanswered bytes
+  (`PortRegistry::awaits_port_reply`, the `output > input` rule of
+  [`../port/CONTEXT.md`](../port/CONTEXT.md) *Measured*) hands the poll a **zero** timeout, so the idle
+  helper costs no wall time; the `run`/`-eval` routes keep the blocking poll, because a child there may
+  speak unprompted.
   `apply_boot_call` ends **each** `RunOutcome::Wait` with a terminating `pump_scheduler_boot == 0` step
   (`drive.rs:397-412` → [`drive_scheduler`] at `:299-314`), and directives 18/19/20 make 2 + 2 + 1 waits
   (`application_controller:start_boot_application/2` = `application:load` + `start_application`,
   `lib/kernel/src/application_controller.erl:271-284`; directive 20's `c:erlangrc/0` file-server call),
-  so a bare `-noshell -eval 'halt().'` boot pays **five** such steps ≈ 125 ms of pure polling latency
-  after the lookup — a cost the pre-lookup boot does not have. The `-eval` action itself adds no pass
-  (`erlang:halt` returns the halt through the native floor, no trailing pump).
-  A drive step's port poll is never elided by "nothing else is runnable": `has_nothing_to_poll` is false
-  for the life of any open port, which is what an idle helper child is.
+  so those five steps are where an ungated poll would cost ≈ 125 ms of pure latency after the lookup.
+  The reply's own wake is untouched: until the helper answers, its request bytes are outstanding
+  (`output > input`), so the poll that delivers `{Port,{data,<<RID:32,Bin>>}}` still blocks as it must.
+  The `-eval` action itself adds no pass (`erlang:halt` returns the halt through the native floor, no
+  trailing pump).
+  Both sides of the comparison and the reproduction recipe are in
+  [`../PERF.md`](../PERF.md) *The boot path's one live-but-idle port, and the poll budget*.
 
 ### The completion-asserting tests (all pass)
 The three `cargo test --lib boot::` tests (`the_real_start_boot_executes_every_directive_to_progress_started`,
@@ -362,7 +368,7 @@ from neither the shim nor this executable, and a wrapper `erl` may live outside 
 Asking `erl` is authoritative, and a path is never fabricated: if neither probe produces a stdlib the
 resolution fails with the typed `cannot locate the system code path: …` error (exit 1). Consequence: a
 normal installation pays **no** `erl` start-up (measured on this host: a bare `-eval` invocation now
-takes ≈0.44 s wall, since it drives the default boot script on every action, where the resident `erl`
+takes ≈0.34 s wall, since it drives the default boot script on every action, where the resident `erl`
 shell-out alone costs ≈0.5 s and is still avoided).
 **The resolved root is the consumed SYSTEM install, not this runtime's own tree.** `native_roots`
 seeds candidate roots with the `erl` on `$PATH` first (canonicalized, never executed), then

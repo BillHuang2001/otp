@@ -3,7 +3,7 @@
 The present-tree measurement record for the Rust runtime: what `beam_rt` costs today on both sides of the comparison, with every figure's qualification attached.
 Every number in this file is **measured, never modelled**: nothing here is fabricated, and a sys-only workload that cannot produce a Rust-side figure is recorded as `skipped(<reason>)` with no number.
 It is **not** a change log — [`../../../CHANGE.md`](../../../CHANGE.md) records what changed, this file records what it cost.
-This file owns the **`CURRENT` snapshot** and the standing *Current startup regime* note that qualifies every `startup_ms` figure in the crate.
+This file owns the **`CURRENT` snapshot**, the standing *Current startup regime* note that qualifies every `startup_ms` figure in the crate, and the boot path's poll-budget note (*The boot path's one live-but-idle port, and the poll budget*).
 The rest of the record lives in two siblings: [`PERF_HISTORY.md`](PERF_HISTORY.md) holds the dated **`BEFORE` → `AFTER`** snapshots (the historical baselines and the delta between them), and [`PERF_DISPATCH.md`](PERF_DISPATCH.md) holds the per-call **`DISPATCH-CUT`** / **`COPY-OUT-CUT`** analyses.
 Route by question: today's cross-runtime figures and the execution-tier effect → this file; a dated baseline or a `BEFORE`→`AFTER` delta → `PERF_HISTORY.md`; registered-BIF per-call cost, the dispatch prologue or the BIF-result copy-out → `PERF_DISPATCH.md`.
 The measurement narrative lives in [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md); the bench driver's own environment record, per-target tables and methodology are [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md), which this file links to and does not reproduce.
@@ -11,12 +11,53 @@ The measurement narrative lives in [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md); the
 ## Current startup regime (read before quoting any `startup_ms` figure)
 
 Every CLI action except `-version` now drives a boot script before the action's own start instruction: the explicit `-boot FILE` value when given, else **this runtime's own** release's committed `bootstrap/bin/start.boot` (`CodeServer::own_bootstrap_boot_script`; the literal `start` resolves to `<Root>/bin/start.boot` only when the repo bootstrap is undiscoverable, e.g. an installed deployment).
-A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 0.55 s wall** on this host (555/557/563/643 ms over 5 runs at 1-min loadavg ≈ 1.1, so absolute ms are host-dependent).
+A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 0.35 s wall** on this host: paired medians of 12 alternating `taskset -c 3` rounds read **340.5 ms wall over 328.5 ms CPU** for `beam_rt -noshell -eval 'halt().'` (1-min `/proc/loadavg` ≈ 20 after the last round), i.e. the shape is CPU work plus whatever the shared host adds — absolute ms are host-dependent, and *The boot path's one live-but-idle port, and the poll budget* below carries that measurement in full.
 Every `startup_ms` figure in this file and in [`PERF_HISTORY.md`](PERF_HISTORY.md) is **that snapshot's own** preloaded-only-slice measurement (the ≈ 14–18 ms band) and its ratio to the oracle is that snapshot's; those numbers do not describe the current whole-process wall.
-The present whole-process wall is **CPU-bound and carries no fixed waits**: `strace -c -f` shows **0 `clock_nanosleep`** calls and only **zero-timeout** `epoll_wait` calls (12 calls, ≈ 6 µs total), so a blocked round returns instead of sleeping and the residual ≈ 0.55 s is engine work (the oracle's own `erl -noshell -eval 'halt(0).'` boot is ≈ 0.12–0.15 s here).
-The wait a *blocked* pass pays is mechanism-agnostic, so read it as a property — bounded, never a spin — not as one syscall name: with a live port in the table (a booted kernel keeps `inet_gethost` open, which makes `PortRegistry::has_nothing_to_poll()` false) the pass's wait is the port poll's blocking `epoll_wait(PORT_POLL_SLICE)`, not the timer sleep, and only a round that ran **zero** slices is allowed to pay it.
+The present whole-process wall is **CPU-bound and carries no fixed waits**: `strace -f -c -w` over a whole run shows **0 `clock_nanosleep`** calls and **≈ 4 ms** of `epoll_wait` in total, so a blocked round returns instead of sleeping and the residual wall is engine work (the oracle's own `erl -noshell -eval 'halt(0).'` boot is ≈ 0.12–0.15 s here).
+The wait a *blocked* pass pays is mechanism-agnostic, so read it as a property — bounded, never a spin — not as one syscall name: with a port live in the table (a booted kernel keeps the `inet_gethost` helper child open, which makes `PortRegistry::has_nothing_to_poll()` false from directive 18 on) the wait is that port's poll, its blocking form is taken only while a port **owes a reply**, and only by a round that ran **zero** slices — the rule and its measured figures are in *The boot path's one live-but-idle port, and the poll budget* below.
 Because that wall is now this runtime's own CPU cost rather than a fixed sleep, **no startup ratio measured against the oracle was re-recorded at this HEAD** — the committed `startup` ratios belong to the dated snapshots in [`PERF_HISTORY.md`](PERF_HISTORY.md) — so the `startup_ms` metric should be **re-recorded at the next benchmark milestone** before any current startup advantage or loss is quoted.
-The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 0.55 s boot, so those rows measure the loop against a far larger whole-process wall than the dated snapshots in [`PERF_HISTORY.md`](PERF_HISTORY.md) record.
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 0.35 s boot, so those rows measure the loop against a far larger whole-process wall than the dated snapshots in [`PERF_HISTORY.md`](PERF_HISTORY.md) record.
+
+## The boot path's one live-but-idle port, and the poll budget
+Directive 18 of the 22 in `bootstrap/bin/start.boot` starts the `kernel` application, so `kernel_sup`'s `inet_db` child runs `inet_config:init/0` (`lib/kernel/src/kernel.erl:211-216`, `lib/kernel/src/inet_db.erl:121-123`): it opens a UDP socket, asks `prim_inet` for the hostname, and — when that short name carries no dot — resolves it through `inet_gethost_native`, which opens the helper `{spawn_executable, <erts>/bin/inet_gethost}` port with `{packet,4}` (`lib/kernel/src/inet_gethost_native.erl:413-429`).
+That is the oracle's own behaviour (`strace -f` of `erl -noshell -eval 'halt().'` shows the same `execve(…/erts-17.1/bin/inet_gethost)`), so the lookup is fidelity rather than overhead, and it is why a booted run reads **98** `.beam` files where the pre-directive-18 boot reads 97 — the 98th is `inet_gethost_native`.
+The helper answers its one framed request in ≈ 2.5 ms and then stays **live but idle** for the rest of the run (`inet_gethost_native` passes no `exit_status`, so no round reaps or closes it — [`src/port/CONTEXT.md`](src/port/CONTEXT.md) *Known divergence from the oracle*), which keeps `PortRegistry::has_nothing_to_poll()` false from directive 18 on.
+
+**The rule: a blocking port poll is justified only while a port owes a reply.**
+`PortRegistry::awaits_port_reply()` (`src/port/info_extras.rs`) is exactly that question, read off the per-port byte counters `port_info(Port, input)`/`output` already report: a port with `output > input` was written to and has not answered, while a port that has answered every byte it was given cannot speak again until this runtime writes to it, so waiting on it delivers nothing.
+The boot drive is the **one** caller that takes the gate: a `TimerWait::ImminentWithin(_)` pass hands `deliver_port_messages` a `Duration::ZERO` poll when no port owes a reply (`Runtime::awaits_port_reply`, `src/runtime/scheduler.rs`), while the `run` and `-eval` routes keep their unconditional blocking poll because a child on those routes may speak unprompted.
+A port table that cannot be borrowed reports *awaiting*, so the gate can only ever shorten a sleep it can justify.
+The gate removes sleep, never work: the CPU medians below are identical on both sides of it.
+
+Paired medians of 12 alternating rounds (`taskset -c 3`, `getrusage(RUSAGE_CHILDREN)` deltas, `beam_rt -noshell -eval 'halt().'`, 1-min `/proc/loadavg` 19.95 after the run), gate off vs gate on, against the m15-era release tree as the reference side:
+
+| side | cpu_med (ms) | wall_med (ms) | wall vs m15-era |
+|---|---|---|---|
+| m15-era tree (`a34ca61332`) | 344.7 | 354.9 | 1.000 |
+| this tree, blocking poll on the idle port | 328.5 | 471.9 | 1.330 |
+| this tree, gate on | 328.5 | 340.5 | **0.959** |
+
+The oracle side is not part of this table: `sys` (OTP 29.1.1 / erts-17.1) boots its own release's script, and no `rust`/`sys` startup ratio was re-recorded at this tree (see *Current startup regime*), so the columns above compare this runtime against its own baseline.
+
+Deterministic counters (`strace -f -c -w <bin> -noshell -eval 'halt().'`), gate off → gate on: `epoll_wait` total **130.8 ms → 4.1 ms** over the same **15** calls (the five 25 ms timeouts are exactly what the gate removes: the 2 + 2 + 1 zero-slice boot-drive steps of directives 18/19/20), `read` total 233 ms → 104 ms, `execve` **2** either way (the helper is still spawned exactly once), `clone3` **1**, exit code **0**, stdout and stderr **empty**, and the boot still reads **98** `.beam` files.
+The lookup's own wake is not what the gate touches: a reply still in flight keeps `output > input`, so the poll that delivers it blocks exactly as before.
+
+**Caveats.** The host is shared and oversubscribed: read the **ratio** (0.959) and the deterministic counters, never the absolute ms, and do not compare these wall figures with the absolute figures elsewhere in this file — each belongs to its own load window (this one ran at 1-min loadavg ≈ 20).
+The `getrusage(RUSAGE_CHILDREN)` split is what makes the claim testable: the wall median moves while the CPU median does not, so the delta is removed sleep rather than removed work.
+A reply slower than one poll slice already folds to the typed `blocked()` gap, exactly as it does with the gate.
+
+### Reproduction
+```sh
+# build the release binaries the two recipes drive
+erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p beam_rt -p bench
+
+# the deterministic counters (epoll_wait total and call count, read, execve, clone3, exit status)
+strace -f -c -w erts_rust/target/release/beam_rt -noshell -eval 'halt().'
+
+# the wall/CPU split, and the boot's `.beam` opens, through the bench driver
+erts_rust/target/release/bench run --quick --runtime rust --workloads baseline
+```
+`bench` inherits the environment, so the same run under `taskset -c 3` and with the load average recorded before and after each round is the paired comparison the table above reports; its raw reports are ephemeral (re-run the recipes to regenerate), and the driver's own methodology is [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md).
 
 ## `CURRENT` snapshot — HEAD `da82ffe33c`
 
@@ -142,7 +183,7 @@ Both columns are the **min of 3** of the `rust` metric; `< 1×` means the baseli
 **Reading the tier effect.** The baseline JIT is a clear win for **`foreign`** (**0.73×–0.87×**) and
 **`gc_bound churn`** (**0.539×**), and neutral for `baseline`, `list_walk` and most `slice` cases —
 where the whole-process wall is dominated by `beam_rt` startup (this snapshot's preloaded-only slice; the
-current runtime pays the ≈ 0.55 s boot-script drive on every action, see *Current startup regime*), not
+current runtime pays the ≈ 0.35 s boot-script drive on every action, see *Current startup regime*), not
 the interpreted loop. The only real
 regressions are the **module-graph-heavy one-shot** rows, `slice`'s `string_str_length` (**1.295×**),
 `queue_from_size` (**1.217×**) and `copy_bound`'s `send_recv` (**1.456×**): the first-entry compile cost
@@ -307,7 +348,7 @@ Result — `A/B > 1` ⇒ charge ON is dearer; the variant removed `Δ = A − B`
 Which rows could show it at all:
 
 - **Process-startup-dominated — cannot show it.** `baseline` `startup_ms` (≈ 13.7 ms of process boot —
-  this snapshot's preloaded-only slice; the current runtime instead pays the ≈ 0.55 s boot-script drive,
+  this snapshot's preloaded-only slice; the current runtime instead pays the ≈ 0.35 s boot-script drive,
   see *Current startup regime*) and every `slice` row (whole-process wall for one call per OS process,
   13.9–27.4 ms), of which the interpreted work is a small fraction.
 - **Interpreted-work marginals — the rows that *can* show it.** `foreign` (per `cowboy_bstr` /
