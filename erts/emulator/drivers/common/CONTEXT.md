@@ -80,7 +80,8 @@ Caller liveness: `driver_monitor_process`/`driver_demonitor_process` on async co
 - `inet_drv.c` uses the private `prim_inet` protocol as its control ABI (magic-number-offset cmd + packed binaries), not `erl_driver`'s higher-level helpers; the Erlang half must stay in sync (`erts/preloaded/src/prim_inet.erl`).
 - The socket `driver_select` event is the OS fd on unix and a Winsock event handle on win32 (`inet_descriptor.event`, `:1225`), so event-based reasoning differs per platform.
 - `INET_MAX_ASYNC` is 1 (one outstanding async op per descriptor); a descriptor running multi-accept keeps additional ops in a separate list.
-- `driver_output_term` is never used; term replies all go through `erl_drv_send_term`.
+- The deprecated `driver_output_term` is never used; term emission splits into exactly two APIs: `erl_drv_send_term` (16 uses) for control/async **replies sent to the captured caller** and `erl_drv_output_term` (16 uses) for **active-mode messages sent to the port owner** (`desc->dport`).
+- `inet_drv.c`'s interface-constant block (`:752` "This section must be \"identical\" to the corresponding inet_int.hrl", `INET_REP_*` at `:869-871`, `INET_LOPT_*` at `:896-900`, `INET_REQ_*`/`TCP_REQ_*`/`PACKET_REQ_*`) is duplicated by hand in `lib/kernel/src/inet_int.hrl` (`INET_REP_OK` at `:126`, `TCP_REQ_RECV` at `:110`, `PACKET_REQ_RECV` at `:116`). Changing an opcode/option number requires editing BOTH; nothing enforces the sync at build time.
 
 ## Dependencies
 - POSIX/Winsock sockets, `netdb`/resolv; SCTP via headers+`-lsctp` (`LIBSCTP`) or runtime `dlopen`.
