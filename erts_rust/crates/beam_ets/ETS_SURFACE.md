@@ -292,8 +292,8 @@ These are the reference answers, each compared against the live `erl` (`tests/di
   Covered by `tests/ets_reclamation.rs` (focused reproductions + memory-accounting stress across every
   kind and interior shape).
 * **An interior's index storage follows live occupancy.** `ets:info(T, memory)` is the table-owned term
-  storage plus the index storage, and every interior now releases that storage as objects leave
-  instead of holding its high-water allocation: the chained hash index (`bag`/`duplicate_bag`, opt-in
+  storage plus the index storage, and every interior releases that storage as objects leave instead
+  of holding its high-water allocation: the chained hash index (`bag`/`duplicate_bag`, opt-in
   `set`) rebuilds its bucket array through `HashInterior::rehash_into` once the object load falls below
   an eighth (`maybe_shrink`, never below `INITIAL_BUCKETS` = 8, halving while it stays under 1/8 — a
   6× band below the 3/4 grow threshold) and trims an entry's object vector past 4× slack; the CHAMP
