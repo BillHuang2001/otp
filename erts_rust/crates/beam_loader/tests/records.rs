@@ -480,7 +480,10 @@ fn image_with_recs(recs: &[u8]) -> Vec<u8> {
     code.extend_from_slice(&16u32.to_be_bytes()); // head_size
     code.extend_from_slice(&0u32.to_be_bytes()); // format_number
     code.extend_from_slice(&181u32.to_be_bytes()); // max_opcode
-    code.extend_from_slice(&2u32.to_be_bytes()); // label_count
+    // `label_count` 3: the stream defines labels 1 and 2, and `lower::build_module`
+    // rejects a label definition outside `0 < label < label_count`
+    // (`jit/asm_load.c:512-521`).
+    code.extend_from_slice(&3u32.to_be_bytes()); // label_count
     code.extend_from_slice(&1u32.to_be_bytes()); // function_count
     // `label 1` — opcode 1 with the `u,1` label operand.
     code.extend_from_slice(&[1, 0x10]);
