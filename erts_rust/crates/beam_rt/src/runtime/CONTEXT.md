@@ -45,6 +45,36 @@ The collection gate is the **two-phase unscanned-root valve** (`context/gc.rs::r
 * **A pid with no registered engine aborts the whole pass — so a runtime-owned service must never be enqueued.** `ProcessEntry` (`../runner/entry.rs`) has exactly two variants (`Export{module,function,arity}`, `Fun{fun,target}`), and `RuntimeRunner::run` returns the typed `error::unknown_process_entry(pid)` for a pid with no `ProcessEngine` (`../runner/run.rs:208`); `scheduler_pass` propagates it with `break Err(err)` (`scheduler.rs:700`), so an enqueued pid without an engine fails the pass — it is **not** skipped. The escape is the pattern `Runtime::self_pid` (registered as `init`) already uses: create the process with `ProcessTable::spawn(policy)` (born `ProcessState::Runnable`, `insert`ed, **not** enqueued) + `ProcessTable::register(name, pid)`, and leave it `Runnable`. Then `whereis`/`monitor(process,Name)` resolve it, a send lands in its mailbox, and it is never run: only `Waiting`/`Suspended` are woken by a delivery (`Process::wake`, `../../beam_process/src/process.rs:462`), so a `Runnable` service never reaches a run queue's wake list. The runtime's native **`file_server_2` service** (`FileServices`, `../native/file_server.rs`) is exactly such a service — spawned **unregistered** on every route that drives a boot script (every CLI action but `-version`, plus an explicit `-boot FILE`), where the booted `kernel_sup` owns the name, and registered otherwise: `scheduler_pass` calls `Runtime::service_file_requests` as an **additive step right after the run queue drains** (the same place the port half runs), which drains the service's and its io-devices' mailboxes and replies via `ProcessTable::deliver_simple`, then calls `scheduler.resume_woken`; each delivered reply is counted into the pass's `delivered` so a serviced-only pass never looks like "nothing happened" and a boot-path caller resumes. The runtime's own **`erl_prim_loader`** stand-in (`../runtime.rs`) is the same shape — spawned `Runnable` and never enqueued, registered under its own name on **every** route that builds a runtime (nothing in `start.boot` claims it, so it never conflicts).
 * **Files ~1000 lines**, split by responsibility; every public item documented (`#![warn(missing_docs)]`).
 
+## Every site that can relocate a process heap (the soundness inventory)
+Heap relocation is **not** confined to the runner's slice: any path that reaches a rooted collection moves a
+process's young objects, so each must either publish that process's root set or decline. All of them share
+ONE root set — `Process::regs` + each mailbox message's `payload`/`from`/`token` + dict + saved args +
+pending-signal queue, gathered/scattered by `run_rooted_collection`
+(`../../beam_process/src/process.rs:1695-1762`):
+* the three heap-admission doors — `../context/gc.rs::ensure_heap:1034`, `ensure_heap_full:1252`,
+  `alloc_words_rooted:1568` (the *running* process; publish → collect → scatter);
+* the reduction/yield-boundary door — `../context/gc/reds_door.rs::collect_at_reds_boundary:176`
+  (refuses `is_relocation_exempt` at `:216`, then the interval/occupancy gates at `:191`/`:234`);
+* `Runtime::serve_gc_request` (`gc.rs:507`), called from the runner's Yield arm (`../runner/run.rs:1241`)
+  and Wait arm (`:1392`);
+* **message delivery**, i.e. the *receiver's* heap — `ProcessTable::deliver`
+  (`../../beam_process/src/ptab.rs:858`, gate consulted at `:879-896`) → `Process::deliver`
+  (`../../beam_process/src/process.rs:1150`, `ensure_capacity:1621` on the retry). Reachable from
+  `RuntimeContext::deliver_in_table` (`../context/send.rs:528`), hence from every pass-boundary step:
+  `deliver_gc_completions`, `service_file_requests`, `drain_ets_owner_exits`, `deliver_port_messages`,
+  `fire_due_timers`, `dispatch_dist_inbound`/`dispatch_dist_client_inbound`;
+* **the exit cascade** — `ProcessTable::enqueue_exit_signal` (`ptab.rs:2645`) → `copy_reason_onto`
+  (`ptab.rs:331`) → `grow_receiver_for_signal` (`ptab.rs:192`), reached from `terminate`/`terminate_into`;
+  deliberately **not** gated by `gc_process_enabled`, only by `has_unpublished_roots()`/the gate.
+All of them refuse when `Process::has_unpublished_roots()`
+(`../../beam_process/src/process.rs:1370` = `relocation_exempt || state == Running`); the delivery seam
+adds the receive-side valve `RuntimeContext::delivery_collection_is_unsound` (`../context/send.rs:476`).
+The `foreign_reachable` latch is only ever a **descent** short-circuit — with it clear each valve still
+classifies every root word — and `close_foreign_reachable` runs only from the three whole-`RootSet` doors.
+**Recorded residual:** `serve_gc_request`'s `Err(_) => halt_process_gc` (`gc.rs:573-576`) discards the
+`BeamError` itself, so a genuine collection failure becomes a silent halt (only the `errors` counter and
+the `halted` set record it).
+
 ## Port-aware scheduling (A.4) — design decision & handoff
 The pass runs the **port-less** `Scheduler::run_ready` (its port half, `Runtime::deliver_port_messages` + the one persistent poller, owns the polling), and discharges the port-aware slice's obligations **at the pass boundary**, where the port registry is free:
 * **covered** — a process that died in the slices just run had its recorded outgoing `(PortId, MonitorRef)` `PortWatch` pairs swept by `Runtime::drain_port_monitor_exits` (`ets_owner.rs`) — the same end state a port-aware termination reaches for its *incoming* entries.

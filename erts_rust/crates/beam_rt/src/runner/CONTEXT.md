@@ -615,6 +615,42 @@ a foreign container that forwards nothing scanned: also inert, so also collected
   iterations-per-slice pre-emption, and the residual tuple plus its interpreter control) over the
   committed `tests/fixtures/native_reds.{erl,beam}` fixture.
 
+## The collection-site inventory this node owns (and what each site publishes)
+**The scheduled path is the ONLY path that collects at all.** `RuntimeContext::gc_armed` is
+[`take`](std::mem::take)n as the **first statement** of each rooted door
+(`../context/execution.rs:472`/`:486`/`:510`, forwarded as the `armed` argument to
+`gc::{ensure_heap, ensure_heap_full, alloc_words_rooted}`), and the **only** arming sites in the
+workspace are [`budget`]'s three doors — `budget.rs:534` (`ensure_heap`), `:549`
+(`ensure_heap_full`), `:605` (`alloc_words_rooted`). So on the `-eval` route, a nested
+`run_export`, a fun a BIF applied and the evaluator, `armed` is `false` and every door refuses to
+collect: **a heap can only move during a scheduler slice.** `BudgetContext::call_bif_in_machine`
+(`budget.rs:365`) and `reduce` (`:566`) do **not** arm, so no collection can run inside a BIF
+dispatch — the invariant `../context/position.rs:67-69` relies on.
+| site | reached from | publishes | gate |
+|---|---|---|---|
+| `../context/gc.rs:1252` `ensure_heap_full` | `Instr::TestHeap`/`AllocateHeap` → `Machine::ensure_heap` (`beam_engine/src/machine/frames.rs:283-289`) + the baseline-JIT twins | `x[..pointer_prefix_len(x)]`, whole stack, `fr[..pointer_prefix_len(fr)]` (`gc.rs:1307`, rebuild `:1382-1383`) | `armed` + the unscanned-root valve |
+| `../context/gc.rs:1568` `alloc_words_rooted` | `terms/slack.rs:170` (`terms::reserve`, i.e. every `*_rooted` builder, per built term) | same narrowing (`gc.rs:1674`) | `armed` + valve |
+| `../context/gc.rs:1034` `ensure_heap` (narrow) | **no engine call site** (`gc.rs:1807`) | `x[..live]` + stack, **no FR file**; float-guarded | `armed` |
+| `../context/gc/reds_door.rs:176` `collect_at_reds_boundary` | `run.rs:1249` (the `Yield` arm only) | `RootSet::ALL_LIVE`: **all 1024 x slots** + whole stack + `fr[..fr_count]` (`reds_door.rs:279` → `gc.rs:786`) | `run.rs:337 parked_published`, `gc_process_enabled`, 4 000-red interval, `is_relocation_exempt`, 7/8 occupancy or `collection_debt`, valve |
+| `../context/gc.rs:1465` `alloc_words` | anywhere | **never collects** (grow + retry, else arena) | — |
+Out of slice, `ProcessTable::deliver`/`enqueue_exit_signal`/`grow_receiver_for_signal` relocate a
+**non-running** receiver only (`beam_process/src/ptab.rs:197`, `:243`, `:2661`, `:2715` all refuse on
+`has_unpublished_roots()`, which is `relocation_exempt || Running`), so they cannot touch a running
+process's heap.
+**Publication is airtight for `x`/`stack`/`fr`; the open root-set question is a holder that is in NO
+root set.** The park publishes all 1024 x slots (`gc.rs:786` sets `live = min(x.len(), MAX_REG)`), so
+`XRegs::gather_roots` (`beam_process/src/registers.rs:250-256`, which reads `x[0..live)` only)
+gathers every published slot, and no production site shrinks `live`. `is_pointer_bearing` is
+`(word & 3) != 3`, i.e. exactly "not `TAG_PRIMARY_IMMED1`" (`beam_term/src/tag.rs:37-45`,
+`boxed.rs:73-74`, `list.rs:68`), so an atom/small/NIL can never be bound away by
+`pointer_prefix_len`. What is NOT covered by any root set: `Machine::pending_exception`'s reason
+(`beam_engine/src/machine/mod.rs:151`; unrooted in-slice, published only across a park as
+`Registers::extra_roots`, `run.rs:527-540`), the marshalled BIF `args` copy
+(`beam_engine/src/interpreter/bif.rs:232-246`, `:157-168`) at the `&self` door
+`Machine::dispatch_bif_call` (`bif.rs:291`) which has no write-back channel, and the `Runtime`-owned
+term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mailbox` markers,
+`trace`/`seq_trace` specs, `eval_closures`).
+
 ## Routing Table
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
   `RuntimeRunner`).
