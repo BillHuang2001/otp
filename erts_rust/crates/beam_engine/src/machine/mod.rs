@@ -343,11 +343,13 @@ pub struct Machine {
     /// machine allocated **for appending** — the `bs_init_writable` accumulator's
     /// backing store (C's `BIN_FLAG_WRITABLE` binary).
     ///
-    /// **Why a side list.** The frozen term layout carries no capacity word (C keeps
-    /// it in the out-of-heap `Binary.intern.apparent_size`/`orig_size`, which
-    /// `beam_alloc::RefcBinary` does not expose and this crate cannot add), so the one
-    /// fact an in-place `private_append` needs — "this payload is ours, it is writable,
-    /// and it is `n` bytes wide" — has to live beside the machine. The list is keyed by
+    /// **Why a side list.** The frozen `[BinRef][ErlSubBits]` pair records only a pointer
+    /// and a logical bit window, so the one fact an in-place `private_append` needs on its
+    /// fast path — "this payload is ours, it is writable, and it is `n` bytes wide" — has to
+    /// live beside the machine. [`beam_alloc::RefcBinary`] now carries `capacity`,
+    /// `reserved_bytes` and `max_capacity` in its private header, so this registry is not
+    /// standing in for a missing word: it caches the payload's **real** capacity in bytes,
+    /// so an in-place append that already fits needs no header read at all. The list is keyed by
     /// the payload's **first data byte** (`beam_alloc::RefcBinary::data_ptr`, exactly
     /// the value the term's `BinRef.val` word holds), and only entries deposited by
     /// [`Machine::mark_writable`] are considered writable: a payload built by

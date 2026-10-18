@@ -149,9 +149,10 @@ modules above), an end-to-end suite in `run_tests.rs` through `Machine::run_labe
 toolchain is absent).
 Every expected byte vector in the newer suites was taken from the system `erl`
 (OTP 29.1.1 / erts-17.1) — never invented.
-Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
---lib families::bitstrings` (green: 104 tests) and the whole crate
-`... -p beam_engine --no-fail-fast` (1595 passed / 0 failed across 74 targets); the build
+Gate: the whole-crate suite is authoritative —
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --offline
+--no-fail-fast` must stay green (currently 1634 passed / 0 failed / 4 ignored across every target).
+This family's subset is `... -p beam_engine --offline --lib families::bitstrings`, and the build
 `... -p beam_engine --all-targets` is warning-free. Re-run these for the live counts.
 **Differential evidence:** the project gate `erts_rust/tools/differential` was run
 per-case over the whole `binary/` group plus every bitstring/binary-shaped corpus id

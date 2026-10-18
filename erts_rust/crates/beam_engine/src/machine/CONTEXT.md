@@ -188,4 +188,11 @@ own `[BinRef][ErlSubBits]` pair over a moved base is the *caller's* job (`raw::I
 door is safe Rust and never dereferences a term. It is consulted **only on a shortfall**, since it
 scans the roster; `compact()` is not on the append path.
 
+**A payload another party shares can no longer grow.** `beam_alloc`'s mutators refuse unless
+`refcount() == 1`, so a shared payload is never reallocated behind another handle's back.
+`beam_rt`'s `crates/beam_rt/src/runtime.rs::adopt_escaped_binaries` clones every handle of a finished
+machine into its escaped-payload store, so a writable accumulator that **survives a run boundary**
+has `refcount() >= 2` and any later append needing growth falls back to the copy-rebuild form
+(byte-correct, amortisation lost). An accumulator whose whole loop stays inside one run keeps growing.
+
 Consumer: `families::bitstrings::raw::{writable_append_target, InPlace, payload_aliased_elsewhere}`.
