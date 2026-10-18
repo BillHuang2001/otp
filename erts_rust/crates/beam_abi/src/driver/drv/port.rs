@@ -112,7 +112,9 @@ unsafe fn tail_bytes<'a>(buf: *const c_char, len: ErlDrvSizeT) -> Option<Option<
 /// `hbuf`/`hlen` list prefix and `body` its `buf`/`len` tail (`None` = `buf == NULL`).
 ///
 /// Nothing is joined here — preserving the split is the point of the hook. Returns the C's `-1` when
-/// the port is null (its `ERTS_INVALID_ERL_DRV_PORT` path), else the host's code.
+/// the operand names no port — the invalid-port sentinel
+/// [`ERTS_INVALID_ERL_DRV_PORT`](crate::driver::types::ERTS_INVALID_ERL_DRV_PORT) (the C's own
+/// failure path) or `NULL` (refused here instead of faulted) — else the host's code.
 ///
 /// # Safety
 ///
