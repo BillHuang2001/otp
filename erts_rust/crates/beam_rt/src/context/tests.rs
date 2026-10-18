@@ -2641,16 +2641,30 @@ fn the_runtime_hooks_bridge_serves_the_timer_and_export_families() {
             .expect("read_timer/1 on a cancelled reference"),
         false_atom
     );
-    // A key this bridge does **not** serve still answers a typed capability gap — never a
-    // fabricated value. The gate claims `beam_bifs`' whole `RUNTIME_HOOKS_BIFS` roster, so
-    // `system_info/1` reaches the bridge (rather than the registry's defaulted seam) and the
-    // bridge's fallback arm names the key in the reason instead of the bare `bif`.
+    // `erlang:system_info/1` is a roster key, but the **runtime-native floor** answers it
+    // before this bridge is consulted (the A.8 introspection surface), so it can never stand
+    // for an unserved key here: an unknown key is the oracle's `badarg`, not a capability gap.
     let error = ctx
         .call_bif("erlang", "system_info", 1, &[start_timer])
-        .expect_err("system_info/1 is not served by this bridge");
+        .expect_err("`start_timer` is not a system_info key");
+    assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    assert_eq!(
+        crate::error::unsupported_reason(&error),
+        None,
+        "system_info/1 is served by the floor, so a bad key is badarg: {error}"
+    );
+    // A **roster** key this bridge does not serve still answers a typed capability gap — never
+    // a fabricated value. `RUNTIME_HOOKS_BIFS` claims `erlang:dist_get_stat/1` (the C's
+    // connection-scoped byte/scheduler counters), which needs live distribution accounting this
+    // runtime does not keep; the floor does not serve it either, so it reaches the bridge
+    // (rather than the registry's defaulted seam) and the bridge's fallback arm names the key
+    // in the reason instead of the bare `bif`.
+    let error = ctx
+        .call_bif("erlang", "dist_get_stat", 1, &[me])
+        .expect_err("dist_get_stat/1 is not served by this bridge");
     assert_eq!(
         crate::error::unsupported_reason(&error).as_deref(),
-        Some("erlang:system_info/1")
+        Some("erlang:dist_get_stat/1")
     );
 }
 
