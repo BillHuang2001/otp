@@ -20,12 +20,14 @@
 
 //! The **baseline-JIT deopt census** — a test-only diagnostic that ranks which
 //! `beam_loader::Instr` opcodes the native baseline tier still fails to lower — plus the
-//! **register-cache traffic census** that measures the spill/fill store+load traffic the
-//! emitted blocks carry.
+//! **dynamic per-variant execution census** (how often each variant actually executes)
+//! and the **register-cache traffic census** that measures the spill/fill store+load
+//! traffic the emitted blocks carry.
 //!
 //! Widening the JIT's inline set is only worth doing for the opcodes that actually
 //! deopt on real code, so the choice needs *evidence*, not intuition. This module
-//! produces it, in three independent views://!
+//! produces it, in four independent views:
+//!
 //! 1. **Static census** ([`the_static_deopt_census_over_the_corpus_is_printed`]) —
 //!    *deterministic and offline*: compile a corpus (the crate's committed `erlc`
 //!    fixtures plus a bounded sample of the installed OTP `.beam`s) through the
@@ -50,20 +52,30 @@
 //!    (liveness vs full cache), their per-site splits, and the block cache/write-set
 //!    histograms. This is the evidence for whether a finer spill/fill rule is worth
 //!    adding, independent of any run.
+//! 4. **Dynamic per-variant execution census** ([`crate::exec_census`], printed by the
+//!    same [`the_runtime_deopt_census_over_the_hot_shapes_is_printed`] test, immediately
+//!    after its deopt ranking) — *dynamic*, over the same in-crate tier workloads but run
+//!    on the **interpreter** tier: how many instructions of each `Instr` variant actually
+//!    **executed**, and which of them returned a typed error. The deopt view above is the
+//!    native tiers' own record of what they refused to lower; this is the executed
+//!    population itself, so the two read together as "what ran" versus "what went back to
+//!    the interpreter".
 //!
-//! All three views assert only **liveness/consistency** — never a deopt *threshold* —
+//! All four views assert only **liveness/consistency** — never a deopt *threshold* —
 //! so they keep passing as the inline set changes; the printed rankings are the evidence.
 //!
-//! This module is above the ~1000-line guidance because it hosts four self-contained,
-//! corpus-wide diagnostics (the static and runtime deopt censuses, the per-kind
-//! emitted-code-size table and the register-cache traffic census), each with its own
-//! helpers and printed tables, that deliberately share **one** corpus-discovery and
+//! This module is above the ~1000-line guidance because it hosts five self-contained
+//! diagnostics (the static and runtime deopt censuses, the dynamic execution census, the
+//! per-kind emitted-code-size table and the register-cache traffic census), each with its
+//! own helpers and printed tables, that deliberately share **one** corpus-discovery and
 //! compilation scaffold (`fixture_corpus`, `otp_lib_root`, `otp_corpus`,
 //! `compile_corpus`, `write_dump`) rather than duplicating it.
-//! Every number is attributed by [`super::counters::variant_name`] (a `Test` is keyed
-//! by its kind), and a deopt here is a *compile-time* refusal: the run-time guard
-//! fallbacks emitted **inside** a `try_inline_*` computation (an inlined shape whose
-//! operand guard rejects) are the runtime view's business, not this one's.
+//! Every number is attributed by a `variant_name` — [`super::counters::variant_name`] for
+//! the deopt/code-size/reg-cache views, [`crate::exec_census::variant_name`] for the
+//! execution view — each of which keys a `Test` by its kind. A deopt here is a
+//! *compile-time* refusal: the run-time guard fallbacks emitted **inside** a
+//! `try_inline_*` computation (an inlined shape whose operand guard rejects) are the
+//! runtime view's business, not this one's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -506,6 +518,153 @@ fn the_runtime_deopt_census_over_the_hot_shapes_is_printed() {
     if let Some(path) = write_dump("runtime", header, body) {
         println!("machine-readable dump: {}", path.display());
     }
+
+    // -----------------------------------------------------------------------
+    // Dynamic per-variant execution census (the same workloads, interpreter tier)
+    // -----------------------------------------------------------------------
+    //
+    // The honest caveat this section must not let a reader forget lives on
+    // `dynamic_execution_census`'s docs: these are the **in-crate tier workloads**, run
+    // on the **interpreter** tier, not the OTP corpus — so no natively-inlined
+    // instruction is silently missing from the counts.
+    let exec = dynamic_execution_census();
+
+    let mut exec_ranked: Vec<(&str, u64)> = exec
+        .executed
+        .iter()
+        .map(|(variant, count)| (variant.as_str(), *count))
+        .collect();
+    exec_ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+
+    // --- liveness / consistency (never a threshold) -------------------------
+    assert!(
+        !exec.executed.is_empty(),
+        "the hot shapes must execute at least one instruction through the funnel"
+    );
+    assert_eq!(
+        exec.total_executed,
+        exec.executed.values().sum::<u64>(),
+        "total_executed must be the sum of the per-variant executed counts"
+    );
+    assert_eq!(
+        exec.total_errors,
+        exec.errors.values().sum::<u64>(),
+        "total_errors must be the sum of the per-variant error counts"
+    );
+    for variant in exec.errors.keys() {
+        let first = exec.first_error.get(variant).map(String::as_str);
+        assert!(
+            first.is_some_and(|text| !text.is_empty()),
+            "{variant} errored, so it must keep a non-empty first error text: {:?}",
+            exec.first_error
+        );
+    }
+    for variant in exec.executed.keys().chain(exec.errors.keys()) {
+        assert!(
+            !variant.is_empty(),
+            "a variant key must never be empty: {:?}",
+            exec
+        );
+    }
+    for variant in exec.first_error.keys() {
+        assert!(
+            !variant.is_empty(),
+            "a variant key must never be empty: {:?}",
+            exec
+        );
+    }
+    // The ranking is a faithful re-ordering of the map: one row per executed variant, by
+    // descending count with ties broken by ascending name, summing to the same total.
+    assert_eq!(
+        exec_ranked.len(),
+        exec.executed.len(),
+        "every executed variant must appear exactly once in the ranking"
+    );
+    assert!(
+        exec_ranked
+            .windows(2)
+            .all(|w| (w[0].1 > w[1].1) || (w[0].1 == w[1].1 && w[0].0 < w[1].0)),
+        "the ranking must be by descending count, ties by ascending variant name: {exec_ranked:?}"
+    );
+    assert_eq!(
+        exec_ranked.iter().map(|(_, count)| *count).sum::<u64>(),
+        exec.total_executed,
+        "the ranking must account for every executed instruction"
+    );
+    assert!(
+        exec_ranked
+            .iter()
+            .all(|(variant, count)| exec.executed.get(*variant) == Some(count)),
+        "every ranked row must agree with the executed map"
+    );
+
+    // --- the tables ---------------------------------------------------------
+    println!(
+        "=== dynamic per-variant execution census (interpreter tier, hot in-crate shapes) ==="
+    );
+    println!(
+        "total_executed={} distinct_variants={} total_errors={}",
+        exec.total_executed,
+        exec_ranked.len(),
+        exec.total_errors,
+    );
+    println!("-- ranked by executed instructions (variant | executed) --");
+    for (rank, (variant, count)) in exec_ranked.iter().take(PRINT_ROWS).enumerate() {
+        println!("{:>3}  {:<24} executed={count}", rank + 1, variant);
+    }
+    if exec_ranked.len() > PRINT_ROWS {
+        println!("     ... ({} more variants)", exec_ranked.len() - PRINT_ROWS);
+    }
+    println!("-- typed errors per variant (variant | errors | first error text) --");
+    for (variant, count) in &exec.errors {
+        println!(
+            "     {:<24} errors={:<6} first={}",
+            variant,
+            count,
+            exec.first_error
+                .get(variant)
+                .map(String::as_str)
+                .unwrap_or("-"),
+        );
+    }
+
+    // The machine-readable half, in the same spirit as the deopt dump above: a write
+    // failure is reported on stderr by `exec_census::write_dump` and must not fail this
+    // test.
+    if let Some(path) = crate::exec_census::write_dump("dynamic") {
+        println!("machine-readable dump: {}", path.display());
+    }
+}
+
+/// Run the in-crate tier workloads on the **interpreter** tier with
+/// [`crate::exec_census`] recording, and return its snapshot — the dynamic *execution*
+/// view of the same workload set the deopt ranking above covers.
+///
+/// **What these counts do and do not cover** (read before quoting them):
+///
+/// * The workload set is the **in-crate tier workloads** ([`crate::jit::bench`]'s
+///   thirteen programs), **not** the whole OTP corpus. They exercise the hot shapes the
+///   baseline tier's inline set was judged against, so the ranking is evidence about
+///   *those* shapes; the corpus-scale dynamic view needs a driver over real modules (a
+///   `tests/` corpus sweep's business, not this file's).
+/// * The tier is pinned to **interpreter** on purpose. On a native tier every lowered
+///   instruction is emitted as native code and never enters the funnel, so a native run
+///   would report only the steps it deopted — which is exactly the population the deopt
+///   ranking above already describes. The interpreter executes every instruction through
+///   the funnel, so no executed instruction is missing from the counts.
+/// * The counts include each workload's warm-up run, since this is a **coverage** view
+///   rather than a timing one; the run count is the tier harness' agreement count, so
+///   the sample is small and fast.
+/// * [`crate::jit::bench::assert_tier_agreement`] is deliberately **not** the driver
+///   here: it runs every available tier (twice), which would mix the tiers' instruction
+///   mixes into one sample. The driver is
+///   [`crate::jit::bench::run_workloads_on`].
+fn dynamic_execution_census() -> crate::exec_census::Snapshot {
+    crate::exec_census::reset();
+    crate::exec_census::enable();
+    crate::jit::bench::run_workloads_on(crate::jit::Tier::Interpreter);
+    crate::exec_census::disable();
+    crate::exec_census::snapshot()
 }
 
 // ---------------------------------------------------------------------------
