@@ -1910,6 +1910,130 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // ---------------------------------------------------------------------------------
+        // The **debug-tool** surfaces: `erts_debug` (with the `lcnt` lock-counter constants
+        // and the `same`/`flat_size` term walks) and the whole 13-key `erl_debugger` family.
+        // Each answer below is a **build constant or a pure term walk**, so it is
+        // host-independent and observable; `erts_debug:size/1` is pinned above
+        // (`bifs/erts_debug_size_of_tuple`). Both sides serve the model for real and every
+        // golden is the oracle's exact single-line answer.
+        //
+        // Deliberately NOT pinned from these modules:
+        // * the keys that need a live facility on both sides (`erts_debug:dirty/3`,
+        //   `dirty_cpu/2`, `dirty_io/2`, `breakpoint/2`, `dist_ext_to_term/2`,
+        //   `instructions/0`), and `erts_debug:map_info/1` of a *flat* map (both sides answer
+        //   `badarg`: the interior walk only exists above the HAMT threshold);
+        // * `erts_debug:ln/1` (`error:undef` on the oracle — not a declared `bif.tab` entry)
+        //   and `erts_debug:unaligned_bitstring/2` (both sides answer `badarg` for a
+        //   non-bitstring first argument: a refusal, not the transformation);
+        // * `erlang:delete_module/1` — this runtime answers the typed capability gap for every
+        //   argument (so a case would be `unsupported`, never an agreement), and the oracle's
+        //   *relation* is not the naive one either: after `code:ensure_loaded(lists)` it answers
+        //   `{true,true,true}` — the delete demotes to the old-code slot, so `module_loaded/1`
+        //   and `check_old_code/1` both stay `true`, which a runtime without an old-code slot
+        //   cannot reproduce.
+        // ---------------------------------------------------------------------------------
+        Case {
+            id: "bifs/erts_debug_same_is_raw_word_identity",
+            description: "erts_debug:same/2 is true for an immediate and false for two separately built tuples",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `same/2` compares the two `Eterm` words: two small ints are the same
+                // immediate, while `{a}` and `{a}` are two distinct heap objects.
+                expr: "{erts_debug:same(1,1), erts_debug:same({a},{a})}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,false}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/erts_debug_flat_size_of_a_list",
+            description: "erts_debug:flat_size/1 counts the words of a three-element list",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Three cons cells, two words each (`[CAR, CDR]`), and no shared subterm.
+                expr: "erts_debug:flat_size([1,2,3])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 6"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/erts_debug_build_constant_flags",
+            description: "erts_debug's interpreter/`lcnt` constants are the answers of a JIT build without lock counting",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `interpreter_size/0` is 0 in a build whose engine is not an interpreter-only
+                // image, `disassemble/1` is `false` without the disassembler, and the two
+                // `lcnt` sample keys answer the atom `error` without lock-counter support.
+                expr: "{erts_debug:interpreter_size(), erts_debug:disassemble(fun() -> ok end), \
+                       erts_debug:lcnt_collect(), erts_debug:lcnt_clear()}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {0,false,error,error}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/erts_debug_lcnt_control_is_badarg",
+            description: "erts_debug:lcnt_control/1 raises badarg in a build without lock counting",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The `/1,2` forms validate their argument only when the facility exists; a
+                // `true` argument is `badarg` otherwise, so the raise is the observable.
+                expr: "erts_debug:lcnt_control(1)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "bifs/erl_debugger_supported_is_false",
+            description: "erl_debugger:supported/0 answers false for an emulator without the debugger facility",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The one `erl_debugger` key that is not behind the support guard: the query
+                // itself, which a default (non-`DEBUG`) emulator answers `false`.
+                expr: "erl_debugger:supported()",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/erl_debugger_keys_are_undef_without_the_debugger",
+            description: "the guarded erl_debugger keys raise the bare atom undef before inspecting their arguments",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `BIF_UNDEF_IF_NO_DEBUGGER_SUPPORT()` precedes every argument check, so a
+                // well-formed and a garbage argument are indistinguishable: both raise the
+                // bare atom `undef` (class `error`), never `badarg` and never the typed gap.
+                // The nested `try … catch` captures the class+reason pair, which is the only
+                // stable part (a `catch` would render a stacktrace).
+                expr: "{try erl_debugger:instrumentations() catch C1:R1 -> {C1,R1} end, \
+                       try erl_debugger:xregs_count(self()) catch C2:R2 -> {C2,R2} end}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {{error,undef},{error,undef}}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 #[cfg(test)]
@@ -2167,5 +2291,48 @@ mod tests {
             expr.contains("lists:sort(maps:to_list("),
             "a multi-key map must be rendered sorted, got {expr}"
         );
+    }
+
+    /// The debug-tool block: `erts_debug`'s constant/term-walk answers and the `erl_debugger`
+    /// support guard. Each golden is the oracle's own single line (re-measured with
+    /// `differential run <id>`), and the one raise pins its `exception <class> <reason>` line.
+    #[test]
+    fn the_debug_tool_families_pin_the_oracle_lines() {
+        let golden = |id: &str| {
+            group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .golden
+                .stdout
+                .expect("a golden")
+        };
+        for (id, stdout) in [
+            (
+                "bifs/erts_debug_same_is_raw_word_identity",
+                "ok {true,false}",
+            ),
+            ("bifs/erts_debug_flat_size_of_a_list", "ok 6"),
+            (
+                "bifs/erts_debug_build_constant_flags",
+                "ok {0,false,error,error}",
+            ),
+            (
+                "bifs/erts_debug_lcnt_control_is_badarg",
+                "exception error badarg",
+            ),
+            ("bifs/erl_debugger_supported_is_false", "ok false"),
+            (
+                "bifs/erl_debugger_keys_are_undef_without_the_debugger",
+                "ok {{error,undef},{error,undef}}",
+            ),
+        ] {
+            assert_eq!(golden(id), stdout, "case {id}");
+        }
+        // The one raising case pins the probe's `exception <class> <reason>` line and exit 1;
+        // every other case in the block is an ordinary `ok …` line with exit 0.
+        for case in group().into_iter().filter(|c| c.id.contains("erts_debug_lcnt_control")) {
+            assert_eq!(case.golden.exit_code, 1, "case {}", case.id);
+        }
     }
 }
