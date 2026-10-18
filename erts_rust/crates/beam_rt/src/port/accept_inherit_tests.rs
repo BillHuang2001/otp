@@ -99,6 +99,7 @@ use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use beam_bifs::PortHook;
 use beam_common::BeamError;
 use beam_io::{CompletionEvent, InetAsyncResult, InetReason};
 use beam_process::PortId;
@@ -304,10 +305,12 @@ impl Listener {
             "INET_REQ_BIND answers `[1] ++ port`: {bound:?}"
         );
         assert_eq!(bound.len(), 3, "bind reports the ephemeral port: {bound:?}");
-        self.port = u16::from_be_bytes([bound[1], bound[2]]);
-        assert_ne!(self.port, 0, "the kernel assigned a real port");
+        let port = u16::from_be_bytes([bound[1], bound[2]]);
+        assert_ne!(port, 0, "the kernel assigned a real port");
         let listened = control(&mut reg, self.id, "listen", &[0, 5]);
         assert_eq!(listened, vec![1], "INET_REQ_LISTEN with a backlog of 5");
+        drop(reg);
+        self.port = port;
     }
 
     /// Applies [`listener_options`] through the numeric `setopts` request and asserts the driver
