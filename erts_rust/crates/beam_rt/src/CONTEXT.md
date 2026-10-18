@@ -61,14 +61,17 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   script (see above).
 
 ## File-size overages
-The `../CONTEXT.md` *Files ~1000 lines* constraint is met everywhere except the pre-existing oversize below, which are **not** restructured.
-- `src/port.rs` ~2079 production lines (unit suite lives in `port/tests.rs`, ~2190 lines).
-- `src/runtime.rs` ~2280 lines — the façade is also the colocated home of its own unit tests.
-- `src/context/calls.rs` ~1272 lines of production (the BIF-dispatch + BIF-result-copy-out machinery; suite in `context/calls/tests.rs`).
-- `src/native/file_server.rs` ~1207 lines of production (the io-device request dispatch table; suite in `native/file_server/tests.rs`).
-- `src/runtime/scheduler.rs` ~1288 lines of production, plus a small inline borrow/quiescence test module (suite in `runtime/scheduler/tests.rs`).
-- `src/context/gc.rs` ~2759 lines incl. its inline `#[cfg(test)] mod tests`; the production half is ~1.9 k lines — its unit suite **belongs** in `context/gc/tests.rs` (still owed; the `port.rs`/`port/tests.rs` pattern).
-- `src/context/gc_walk.rs` ~1.7 k lines: ~1.0 k of production (the valved reachability descent, whose module docs carry the soundness argument and the latch-clearing refutation) plus the root-set pinning suite, which **must** stay colocated because it drives the module's private `Walk`/`WalkScratch` types.
+The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's own inline `#[cfg(test)]` modules).
+- `src/port.rs` 3 948 production lines of 4 004 (unit suite lives in `port/tests.rs`, 3 824 lines, plus the sibling `port/{ram_file_matrix,monitor,spawn_driver,control_capability}_tests.rs` and `port/test_support.rs`).
+- `src/runtime.rs` 3 980 lines — 3 116 of production, the rest the colocated unit test module (from line 3 117).
+- `src/context/calls.rs` 1 551 lines of production (the BIF-dispatch + BIF-result-copy-out machinery; suite in `context/calls/tests.rs`, 866 lines, after a `#[cfg(test)] mod notes`).
+- `src/native/file_server.rs` 1 207 lines of production (the io-device request dispatch table; suite in `native/file_server/tests.rs`, 1 970 lines).
+- `src/runtime/scheduler.rs` 1 396 lines of production, plus a small inline borrow/quiescence test module (suite in `runtime/scheduler/tests.rs`, 1 225 lines).
+- `src/context/gc.rs` 3 211 lines, 1 802 of production — the remainder is the test-only counters modules (`valve_counters`/`prefix_counters`) and the inline suites; its unit suite **belongs** in `context/gc/tests.rs` (still owed; the `port.rs`/`port/tests.rs` pattern).
+- `src/context/gc_walk.rs` 1 854 lines: 857 of production (the valved reachability descent, whose module docs carry the soundness argument and the latch-clearing refutation), the test-only `seed_counters` module and the root-set pinning suite, which **must** stay colocated because it drives the module's private `Walk`/`WalkScratch` types.
+- `src/context/runtime_hooks.rs` 1 823 lines of production with no inline tests — the `RuntimeHooks` bridge, whose per-arm rustdoc blocks carry the oracle columns and the served/fixed/gap reasoning (suites `context/tests.rs` and `tests/runtime_hooks.rs`).
+- `src/codeserver.rs` 1 879 lines, 1 329 of production: the shared `Rc<AtomTable>`, the module cache with both location maps, the code path, the file-load routes and the store's one removal op, plus its colocated unit suite (550 lines).
+- `src/native/code.rs` 2 781 lines, 981 of production: the `code:*` floor (the path/load/name readers and the path mutators) with its oracle-cross-checked colocated suite in the remaining 1 800 lines.
 
 ## Routing Table
 - `boot.rs` + `boot/` → preloaded-module set (`PreloadedModules`/`CORE_ATOMS`), the boot banner, the
