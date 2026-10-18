@@ -802,3 +802,75 @@ fn the_plain_datagram_command_form_still_sends_unchanged() {
     assert_eq!(reply, ctl_ok(), "the plain [address][payload] form still answers [1]");
     assert_eq!(receive_one(&receiver), b"plain", "the payload is delivered unchanged");
 }
+
+// ---------------------------------------------------------------------------
+// The plain form is authoritative (regression: the old caller-reference-first order)
+// ---------------------------------------------------------------------------
+
+/// A loopback datagram receiver bound to a port whose **low byte is `0x83`** (131, the ETF
+/// `VERSION_MAGIC`) — the byte the old caller-reference-**first** discriminator mistook for a tag.
+///
+/// Port 131 itself needs privilege, so every `0xNN83` candidate is tried in turn; `None` means the
+/// host refused them all and the check **skips loudly** rather than flaking.
+fn udp_receiver_on_a_0x83_port() -> Option<(std::net::UdpSocket, u16)> {
+    for high in std::iter::once(0u16).chain(1..=0xfe) {
+        let port = (high << 8) | u16::from(ETF_VERSION_MAGIC);
+        let Ok(socket) = std::net::UdpSocket::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        // A hang guard, never a latency budget (the shape `udp_receiver` uses).
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("a read timeout");
+        return Some((socket, port));
+    }
+    None
+}
+
+/// A plain `[address][payload]` command whose **target** port low byte is `0x83` used to be read
+/// as a `prim_inet` caller reference: `split_caller_ref` takes `n = 0x0100 + target_port_hi` from
+/// the address's tag/first port byte and then keys on `arg[2] = target_port_lo == 0x83`, so the
+/// tail was re-parsed as a datagram operand. The plain form is now tried first, so the whole
+/// payload must reach the receiver unchanged.
+#[test]
+fn a_plain_command_with_a_0x83_low_port_byte_is_not_read_as_a_caller_reference() {
+    let Some((receiver, target)) = udp_receiver_on_a_0x83_port() else {
+        eprintln!(
+            "SKIP: no loopback UDP port with low byte 0x83 could be bound — skipping the \
+             plain-form-wins regression check"
+        );
+        return;
+    };
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+
+    // The argument's shape is exactly the one the old order misread: `n = 0x0100 + target_hi`
+    // and `arg[2] = target_lo = 0x83` satisfy `split_caller_ref`'s three conditions, and a
+    // 512-byte payload makes `2 + n` fit for every candidate port (`n <= 0x0100 + 0xfe`), so the
+    // old rule really would have stripped it (and then refused the tail as `badarg`, sending
+    // nothing). The payload byte at `2 + n` is `0xAB` — no address tag — which is what pinned the
+    // mistake to a refusal rather than a send to the wrong endpoint.
+    let payload = vec![0xABu8; 512];
+    let mut arg = loopback_arg(target);
+    assert_eq!(arg[0], INET_AF_INET, "the plain form leads with the address tag");
+    assert_eq!(arg[2], ETF_VERSION_MAGIC, "the target port's low byte is 0x83");
+    let n = usize::from(u16::from_be_bytes([arg[0], arg[1]]));
+    arg.extend_from_slice(&payload);
+    assert!(
+        arg.len() >= 2 + n,
+        "the argument is long enough for the old prefix rule to have fired (len {}, 2 + n {})",
+        arg.len(),
+        2 + n,
+    );
+
+    assert_eq!(
+        rig.control("send", &arg).expect("the plain command is accepted"),
+        ctl_ok(),
+        "the plain form is authoritative: the command is sent, not stripped",
+    );
+    assert_eq!(
+        receive_one(&receiver),
+        payload,
+        "the receiver sees the whole payload — the address was consumed and nothing was stripped",
+    );
+}

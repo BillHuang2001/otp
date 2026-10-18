@@ -680,26 +680,44 @@ impl UdpInetDriver {
     /// The C strips the `prim_inet` **caller-reference prefix** before this grammar, but only
     /// when `driver_caller(port)` is an internal pid (`init_caller`/`init_caller_iov`,
     /// `inet_drv.c:1820`-`:1890`). This crate's [`Driver`]/[`DriverContext`] seam carries no
-    /// caller, so the form is recognised from the payload (see [`split_caller_ref`]):
+    /// caller, so the form has to be recognised from the payload alone (see
+    /// [`split_caller_ref`]) — and the two rules are tried **plain form first**, so a plain
+    /// command is never mistaken for a prefixed one:
     ///
-    /// 1. **caller-reference form, tried first** — `[tag_len:be16][tag_bytes][address]
-    ///    [anc_len:be32][anc_data][data]`, where `tag_len` is non-zero, fits, and whose first tag
-    ///    byte is the ETF `VERSION_MAGIC` `131` (`prim_inet:send/3`'s
+    /// 1. **plain form, tried first (authoritative)** — `[address][data]`, the grammar every
+    ///    direct `port_control` caller and every `port_command`-shaped probe uses. When
+    ///    [`split_address`] parses the argument, that *is* the command: the caller-reference
+    ///    prefix is never looked at. See [`split_address`] for why the ancillary length word is
+    ///    not part of this form.
+    /// 2. **caller-reference form, only when rule 1 refuses** — `[tag_len:be16][tag_bytes]
+    ///    [address][anc_len:be32][anc_data][data]`, where `tag_len` is non-zero, fits, and whose
+    ///    first tag byte is the ETF `VERSION_MAGIC` `131` (`prim_inet:send/3`'s
     ///    `[<<Size:16, MrefBin/binary>>, Data]` and `do_sendto/4`'s
     ///    `[<<Size:16, RefBin/binary>>, Address, AncLen, AncData, Data]`,
     ///    `erts/preloaded/src/prim_inet.erl:575`-`:620`, `:650`-`:700`). The C's own
     ///    `len < 4` / `len < anc_len` guards (`:15205`/`:15212`) answer `[0] ++ "einval"`; a
     ///    **non-zero** `anc_len` is the typed `unsupported` raise (this floor has no `sendmsg`
-    ///    cmsg path — the C's `:15220`-`:15230` arm).
-    /// 2. **plain form** — `[address][data]`, the grammar every direct `port_control` caller and
-    ///    every `port_command`-shaped probe uses. See [`split_address`] for why the ancillary
-    ///    length word is not part of it.
+    ///    cmsg path — the C's `:15220`-`:15230` arm). An argument in *neither* form keeps rule 1's
+    ///    `badarg`.
     ///
-    /// **The one residual ambiguity.** A *plain* command whose first two bytes happen to satisfy
-    /// rule 1 (a 16-bit length that fits, followed by `0x83`) is read as a caller-reference form.
-    /// For a plain UDP command that means byte 0 would have to be `0x00` (n = 1..255) and byte 2
-    /// = `0x83`, i.e. an address family tag of `0x00` — never a valid address tag (1/3/4), so no
-    /// *valid* plain command is misparsed.
+    /// **Why the plain form can be authoritative.** A `prim_inet` caller-reference prefix starts
+    /// with the 16-bit *tag length*, so its first byte is `0` for every realistic tag (a
+    /// `term_to_binary/1` blob for `monitor/2` is ~15 bytes, far below 256) — and `0` is never a
+    /// valid address tag (1/3/4). A genuinely prefixed command therefore always fails rule 1 and
+    /// is stripped by rule 2. The reverse order is what used to break the plain form: a plain
+    /// `INET_AF_INET` command reads as `n = 0x0100 + target_port_hi` with `arg[2] =
+    /// target_port_lo` (and a plain `INET_AF_ANY`/`_LOOPBACK` command as `n = 0x0300` / `0x0400`
+    /// + `target_port_hi`), so a **target** port whose low byte is `0x83` (131) — `term_to_binary/1`'s
+    /// `VERSION_MAGIC` — plus a payload long enough for `2 + n` to fit was mistaken for a caller
+    /// reference and the tail re-parsed as a datagram. Trying the plain form first makes that
+    /// unreachable.
+    ///
+    /// **Residual (unreachable from `prim_inet:send/3`).** A prefixed command whose tag length is
+    /// 256 or more has a first byte of 1/3/4 — a valid address tag — so rule 1 parses the prefix
+    /// as an address and the command is taken as plain (the wrong payload, no strip). A
+    /// `prim_inet` caller reference is a small `term_to_binary/1` term (a `ref`/`pid` plus a
+    /// version byte and tag/arity words — tens of bytes), nowhere near 256, so this cannot arise
+    /// from `prim_inet:send/3`; only a hand-built 256+-byte tag would be misparsed.
     ///
     /// **Unsendable from this crate:** the C echoes the caller reference back as the fourth
     /// element of the later `{inet_reply, S, Reply, Ref}` message (`inet_reply_finish` /
@@ -720,16 +738,23 @@ impl UdpInetDriver {
             // The C's `!IS_OPEN` guard answers `inet_reply_error(desc, EINVAL)` (`:15051`).
             return Ok(ctl_xerror("einval"));
         };
-        // Rule 1 first (the `prim_inet` caller-reference form), then the plain grammar; both
-        // arms yield the packed address the C's `inet_set_faddress` would have produced plus the
-        // payload that follows the ancillary-length word.
-        let (address, payload) = match split_caller_ref(arg) {
-            Some(command) => match split_datagram(command)? {
-                DatagramCommand::Send(address, payload) => (address, payload),
-                // The C's `return_einval` (`:15205`/`:15212`).
-                DatagramCommand::Einval => return Ok(ctl_xerror("einval")),
+        // Rule 1 first (the plain `[address][data]` form), so a plain command can never be
+        // mistaken for a caller-reference one; rule 2 (the `prim_inet` prefix strip) runs only
+        // when the plain grammar refuses. Both arms yield the packed address the C's
+        // `inet_set_faddress` would have produced plus the payload that follows the
+        // ancillary-length word.
+        let (address, payload) = match split_address(arg) {
+            Ok(plain) => plain,
+            // Rule 1 refused the argument: rule 2 gets its chance, and an argument in neither
+            // form keeps rule 1's own reason (the plain parse's `badarg`).
+            Err(plain) => match split_caller_ref(arg) {
+                Some(command) => match split_datagram(command)? {
+                    DatagramCommand::Send(address, payload) => (address, payload),
+                    // The C's `return_einval` (`:15205`/`:15212`).
+                    DatagramCommand::Einval => return Ok(ctl_xerror("einval")),
+                },
+                None => return Err(plain),
             },
-            None => split_address(arg)?,
         };
         // `inet_output_count(desc, len)` at `inet_drv.c:15163` (`packet_inet_command`, the
         // empty-ancillary-data arm; `:15220` is the ancillary one): only the **payload** is
