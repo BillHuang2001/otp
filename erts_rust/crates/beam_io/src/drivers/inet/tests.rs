@@ -28,9 +28,9 @@
 use super::wire::InetAddr;
 use super::{
     ctl_error, ctl_ok, ctl_xerror, errno_name, make_tcp_inet, parse_address, socket_fd, InetState,
-    PeerClose, CloseSource, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK,
-    INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT, INET_REP_OK,
-    INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
+    PeerClose, CloseSource, ReadReport, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET,
+    INET_AF_LOOPBACK, INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT,
+    INET_REP_OK, INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 use crate::completion::{CompletionEvent, InetReason, InetReply, PortCompletion};
 use crate::driver::{Driver, DriverContext, DriverFlags, PortArms};
@@ -331,7 +331,10 @@ fn the_peer_close_answers_once_per_direction() {
     // A **read**-discovered reset (`tcp_recv_error`, `inet_drv.c:12849`) arms nothing at all: the
     // operation that found it reports `econnreset` inline, and both ladders are `enotconn` after.
     let mut close = PeerClose::default();
-    close.observe(CloseSource::Read { reset: true });
+    close.observe(CloseSource::Read {
+        reset: true,
+        report: ReadReport::Answered,
+    });
     assert_eq!(close.observed_atom(), "econnreset");
     assert_eq!(close.recv_reply(), Some("enotconn"));
     assert_eq!(close.send_reply(), Some("enotconn"));

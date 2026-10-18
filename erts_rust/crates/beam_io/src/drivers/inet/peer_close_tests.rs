@@ -37,8 +37,24 @@
 //!
 //! Every wait is **condition-based under a hang guard** (the RST is awaited with `poll(2)` on the
 //! port's own descriptor), never a wall-clock budget tuned for an idle host.
-use super::opcode_tests::{loopback_arg, op, opened_port, Rig};
+//!
+//! # The two discovery routes, and why the ladder must not depend on which one ran
+//!
+//! In the C a passive socket arms read interest **only** while a `TCP_REQ_RECV` is queued
+//! (`sock_select(FD_READ|FD_CLOSE, 1)`, `inet_drv.c:12315`), so the receive that armed it is
+//! always the party that reads the end-of-file — and `tcp_recv_closed` answers it through
+//! `async_error_am_all(am_closed)` (`:12829`) while arming only the *send* one-shot (`:12816`).
+//! This floor's poller is **edge-triggered** and keeps the socket's `READABLE` registration for its
+//! whole life, so the **reactor** (`ready_input`) routinely reads the end-of-file first, with no
+//! operation to answer. That discovery's `closed`/`econnreset` is still owed to the user, so it is
+//! armed as `TCP_ADDF_DELAYED_CLOSE_RECV` for the next `recv` (`ReadReport::OwedToNextRecv`) — and
+//! the *user-visible* sequence stays `closed` then `enotconn`, whichever route ran. The
+//! `a_reactor_discovered_*` and `the_reactor_rows_agree_with_the_erl_oracle` rows below pin that;
+//! the earlier rows pin the route where a `recv` makes the discovery itself.
+use super::opcode_tests::{erl_stdout, loopback_arg, op, opened_port, Rig};
 use super::wire::{ctl_ok, ctl_xerror};
+use crate::completion::{CompletionEvent, InetReason, InetReply};
+use beam_common::BeamError;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -150,6 +166,35 @@ fn close_peer_write(rig: &mut ResetRig) {
     peer.shutdown(Shutdown::Write).expect("the peer half-closes");
     wait_readable(rig.fd);
 }
+
+/// Hands the observation to the **reactor**: `poll(2)`s the port's poller and dispatches every
+/// ready event through the registry — the route `tests/inet.rs`'s
+/// `a_reactor_observed_peer_close_releases_the_registration_and_reports_closed` takes — until the
+/// driver has released the dead socket's registration, which is what its
+/// [`PeerClose`](super::PeerClose) latch does.
+fn drive_reactor(rig: &mut ResetRig) {
+    let deadline = Instant::now() + HANG_GUARD;
+    while !rig.port.poller.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the reactor never observed the peer's close"
+        );
+        let events = match rig.port.poller.poll(Some(Duration::from_millis(50))) {
+            Ok(events) => events,
+            Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => panic!("poll failed: {err:?}"),
+        };
+        rig.port
+            .registry
+            .handle_events(&mut rig.port.poller, &events)
+            .expect("the ready events are dispatched");
+    }
+}
+
+/// A `prim_inet`-style command: the two-byte tag length, the ETF-led tag `[131, 97]` and a payload.
+/// The tag is what [`crate::DriverContext::deliver_completion`] echoes back as the
+/// `{inet_reply, Port, Reply, Tag}` of a `port_command`, so the send ladder's answer is observable.
+const TAGGED_COMMAND: [u8; 5] = [0, 2, 131, 97, b'x'];
 
 // -----------------------------------------------------------------------
 // The receive ladder
@@ -276,6 +321,197 @@ fn a_command_that_discovers_the_reset_arms_the_receive_ladder() {
         rig.port.control(&op(42), &RECV_OPERAND),
         ctl_xerror("enotconn")
     );
+}
+
+// -----------------------------------------------------------------------
+// The reactor-discovered route (the C's pending-receive discovery)
+// -----------------------------------------------------------------------
+
+/// A **clean end-of-file** the **reactor** discovers (peer `shutdown(Both)`, then `ready_input`
+/// reads it) is still answered `closed` by the user's first `recv` and `enotconn` by the second.
+///
+/// The C's basis: the receive that armed the read interest is answered by
+/// `async_error_am_all(am_closed)` (`inet_drv.c:12829`) and the *following* one gets the bare
+/// `ctl_error(ENOTCONN)` of the `TCP_REQ_RECV` ladder (`:12286`) because `tcp_recv_closed` armed
+/// only the send one-shot. Here the reactor consumed the observation, so that `closed` is armed on
+/// the receive ladder instead (`PeerClose::observe`'s `ReadReport::OwedToNextRecv`).
+#[test]
+fn a_reactor_discovered_end_of_file_answers_closed_then_enotconn() {
+    let mut rig = connected_rig(HIDE_ECONNRESET);
+    rig.peer
+        .as_ref()
+        .expect("the far end is still held")
+        .shutdown(Shutdown::Both)
+        .expect("the peer shuts down");
+    drive_reactor(&mut rig);
+    assert!(
+        rig.port.poller.is_empty(),
+        "the reactor's discovery released the dead socket's registration"
+    );
+    assert_eq!(
+        rig.port.control(&op(42), &RECV_OPERAND),
+        ctl_xerror("closed"),
+        "the reactor's discovery owes the user's first receive a `closed`"
+    );
+    assert_eq!(
+        rig.port.control(&op(42), &RECV_OPERAND),
+        ctl_xerror("enotconn"),
+        "the one-shot is spent: the connection is simply gone"
+    );
+}
+
+/// The named `recv` verb reads `TCP_ADDF_DELAYED_CLOSE_RECV` through the same `recv_reply` the
+/// numeric `TCP_REQ_RECV`(42) guard does, so a reactor-discovered close answers it identically.
+#[test]
+fn a_reactor_discovered_end_of_file_answers_the_named_recv_verb_the_same_way() {
+    let mut rig = connected_rig(HIDE_ECONNRESET);
+    rig.peer
+        .as_ref()
+        .expect("the far end is still held")
+        .shutdown(Shutdown::Both)
+        .expect("the peer shuts down");
+    drive_reactor(&mut rig);
+    assert_eq!(
+        rig.port.control("recv", b""),
+        ctl_xerror("closed"),
+        "the one-shot is the driver's, not the caller's, so the verb sees it too"
+    );
+    assert_eq!(rig.port.control("recv", b""), ctl_xerror("enotconn"));
+}
+
+/// A **reset** the reactor discovers is `econnreset` under `{show_econnreset,true}` and `closed`
+/// without it — `tcp_recv`'s `ECONNRESET` arm (`inet_drv.c:13185`-`:13196`) picks
+/// `tcp_recv_error` (`:12849`, whose `async_error_am_all(error_atom(err))` is the `econnreset`) only
+/// while `TCP_ADDF_SHOW_ECONNRESET` is set, and `tcp_recv_closed` otherwise. The second receive is
+/// `enotconn` in both cases.
+#[test]
+fn a_reactor_discovered_reset_answers_econnreset_only_under_show_econnreset() {
+    for (option, expected) in [(SHOW_ECONNRESET, "econnreset"), (HIDE_ECONNRESET, "closed")] {
+        let mut rig = connected_rig(option);
+        abort_peer(&mut rig);
+        drive_reactor(&mut rig);
+        assert_eq!(
+            rig.port.control(&op(42), &RECV_OPERAND),
+            ctl_xerror(expected),
+            "{option:?}: the reactor's discovery owes the deferred reason"
+        );
+        assert_eq!(
+            rig.port.control(&op(42), &RECV_OPERAND),
+            ctl_xerror("enotconn"),
+            "{option:?}: the one-shot is spent"
+        );
+    }
+}
+
+/// The route does not change the **send** ladder: after a reactor-discovered clean end-of-file a
+/// `port_command` still answers its caller `{error,closed}` (the send one-shot `tcp_recv_closed`
+/// arms unconditionally, `inet_drv.c:12816`) and consumes **only** that one — the receive one-shot
+/// the reactor armed survives it, exactly as `tcp_inet_commandv`'s arm leaves it (`:12681`-`:12692`
+/// clears `TCP_ADDF_DELAYED_CLOSE_SEND` alone).
+#[test]
+fn a_reactor_discovered_end_of_file_still_answers_a_send_with_closed() {
+    let mut rig = connected_rig(HIDE_ECONNRESET);
+    close_peer_write(&mut rig);
+    drive_reactor(&mut rig);
+
+    rig.port
+        .command(&TAGGED_COMMAND)
+        .expect("the command is accepted: a close is a reply, not an error");
+    let completions = rig.port.completions();
+    assert_eq!(completions.len(), 1, "one command, one reply: {completions:?}");
+    match &completions[0].event {
+        CompletionEvent::InetReply { caller_ref, reply } => {
+            assert_eq!(
+                reply,
+                &InetReply::Error(InetReason::Closed),
+                "the send ladder answers the close, never `enotconn`"
+            );
+            assert_eq!(caller_ref.as_deref(), Some(&[131u8, 97][..]), "the tag is echoed");
+        }
+        other => panic!("expected an {{inet_reply, …}} completion, got {other:?}"),
+    }
+
+    // The send spent its own one-shot only: the receive's is still armed.
+    assert_eq!(
+        rig.port.control(&op(42), &RECV_OPERAND),
+        ctl_xerror("closed"),
+        "the send ladder leaves the deferred receive reply armed"
+    );
+    assert_eq!(rig.port.control(&op(42), &RECV_OPERAND), ctl_xerror("enotconn"));
+    assert_eq!(
+        rig.port.control("send", b"x"),
+        ctl_xerror("enotconn"),
+        "and the send's own one-shot is spent"
+    );
+}
+
+/// The Erlang half of the reactor rows: a passive `gen_tcp` pair with the peer gone, the two
+/// `recv` results printed as a term.
+///
+/// On the oracle's side the C reaches the close through the **pending-receive** discovery (its
+/// read interest exists only while a `recv` is queued); on this floor's side the rows above reach
+/// it through the **reactor**. The invariant under test is that the two agree, because the replies
+/// belong to the same sequence of *user-visible* operations.
+fn oracle_recv_sequence_expression(abort: bool, show_econnreset: bool) -> String {
+    let option = if show_econnreset {
+        "inet:setopts(S,[{show_econnreset,true}]), "
+    } else {
+        ""
+    };
+    let close = if abort {
+        "inet:setopts(C,[{linger,{true,0}}]), gen_tcp:close(C)"
+    } else {
+        "gen_tcp:close(C)"
+    };
+    format!(
+        "{{ok,L}} = gen_tcp:listen(0,[binary,{{active,false}}]), \
+         {{ok,P}} = inet:port(L), \
+         {{ok,C}} = gen_tcp:connect({{127,0,0,1}},P,[binary,{{active,false}}]), \
+         {{ok,S}} = gen_tcp:accept(L), \
+         {option}{close}, \
+         R1 = gen_tcp:recv(S,0), \
+         R2 = gen_tcp:recv(S,0), \
+         io:format(\"~p\", [[R1,R2]])"
+    )
+}
+
+/// The three reactor rows against the system `erl`: the Rust side discovers each close with the
+/// **reactor** and the oracle with the C's pending-receive machinery, and both must answer the user
+/// the same two atoms.
+///
+/// Measured on OTP 29.1.1 / erts-17.1 (`erl -noshell -eval`, printed literally):
+/// `[{error,closed},{error,enotconn}]` for a clean end-of-file,
+/// `[{error,econnreset},{error,enotconn}]` for a reset under `{show_econnreset,true}` and
+/// `[{error,closed},{error,enotconn}]` for a reset with the option off. The Rust replies are the
+/// C's `ctl_reply(INET_REP_ERROR, …)` bytes for the same atoms, so comparing the atoms compares the
+/// behaviour. If `erl` is absent the oracle half skips **loudly**; the Rust half always runs.
+#[test]
+fn the_reactor_rows_agree_with_the_erl_oracle() {
+    let rows = [
+        ("a clean end-of-file", false, false, "closed"),
+        ("a reset under {show_econnreset,true}", true, true, "econnreset"),
+        ("a reset with the option off", true, false, "closed"),
+    ];
+    for (label, abort, show, first) in rows {
+        let mut rig = connected_rig(if show { SHOW_ECONNRESET } else { HIDE_ECONNRESET });
+        if abort {
+            abort_peer(&mut rig);
+        } else {
+            close_peer_write(&mut rig);
+        }
+        drive_reactor(&mut rig);
+        let rust_first = rig.port.control(&op(42), &RECV_OPERAND);
+        let rust_second = rig.port.control(&op(42), &RECV_OPERAND);
+        assert_eq!(rust_first, ctl_xerror(first), "{label}: the first receive");
+        assert_eq!(rust_second, ctl_xerror("enotconn"), "{label}: the second receive");
+
+        let Some(stdout) = erl_stdout(&oracle_recv_sequence_expression(abort, show)) else {
+            continue; // the oracle is unavailable; the check skipped loudly above
+        };
+        let expected = format!("[{{error,{first}}},{{error,enotconn}}]");
+        assert_eq!(stdout.trim(), expected, "{label}: the oracle disagrees");
+        eprintln!("oracle row `{label}`: {}", stdout.trim());
+    }
 }
 
 // -----------------------------------------------------------------------

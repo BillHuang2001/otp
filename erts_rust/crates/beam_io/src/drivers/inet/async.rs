@@ -100,7 +100,7 @@ use super::accept::AcceptQueue;
 use super::frame;
 use super::stat;
 use super::wire::{ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
-use super::{Interest, TcpInetDriver};
+use super::{Interest, ReadReport, TcpInetDriver};
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply};
 use crate::driver::DriverContext;
 use crate::port_failure::DriverFailure;
@@ -429,7 +429,10 @@ impl TcpInetDriver {
             // Not enough buffered bytes: read what the socket has and try once more.
             let before = self.pending_input.len();
             let mut bytes = Vec::new();
-            self.read_bytes(ctx, &mut bytes)?;
+            // The queued operation is the party that consumes a discovery this read makes: it is
+            // answered right below from the `peer_close` latch (`async_error_am_all(am_closed)`,
+            // `inet_drv.c:12829`), so the receive ladder stays unarmed.
+            self.read_bytes(ctx, &mut bytes, ReadReport::Answered)?;
             self.pending_input.extend_from_slice(&bytes);
             if self.pending_input.len() == before {
                 // `EAGAIN`: no progress, so the operation waits for the next readiness edge.
@@ -519,7 +522,12 @@ impl TcpInetDriver {
             self.try_complete_recv(ctx)?;
             return Ok(());
         }
-        self.read_available(ctx).map(|_read| ())
+        // No operation is queued, so nothing can be answered here: a close this read discovers is
+        // owed to the user's next `recv` (see [`ReadReport`]). The C never reads in this state at
+        // all — read interest is armed only by a queued `TCP_REQ_RECV` (`:12315`) — which is why
+        // the reply has to be deferred rather than dropped.
+        self.read_available(ctx, ReadReport::OwedToNextRecv)
+            .map(|_read| ())
     }
 }
 
@@ -576,7 +584,9 @@ impl TcpInetDriver {
         if self.framed().is_some() {
             return self.verb_recv_framed(ctx);
         }
-        let read = self.read_available(ctx)?;
+        // This caller answers a close its own read discovers (below), so the receive ladder is not
+        // armed by it.
+        let read = self.read_available(ctx, ReadReport::Answered)?;
         if read == 0 && self.peer_close.seen {
             // This read is what found the peer gone, so it answers the close itself: `closed` for
             // an end-of-file, `econnreset` when the read's error was a reset under
@@ -626,7 +636,10 @@ impl TcpInetDriver {
                 None => {
                     // Not a whole frame yet: refill the framing buffer from the socket (in a
                     // framing mode `read_available` appends there) and try to decode again.
-                    let read = self.read_available(ctx)?;
+                    //
+                    // A close discovered here is answered by this verb below, so it owes no
+                    // receive one-shot.
+                    let read = self.read_available(ctx, ReadReport::Answered)?;
                     if read == 0 {
                         if self.peer_close.seen {
                             // This read is what found the peer gone (see [`verb_recv`]):
@@ -696,7 +709,21 @@ impl TcpInetDriver {
         let Some(stripped) = self.strip_command_prefix(ctx) else {
             return self.fail_malformed_command(ctx);
         };
-        if !self.state.is_connected() {
+        // The C's ladder is keyed on `!IS_CONNECTED` (`:12681`), and the C **is** in that state
+        // once a close has been latched: a passive close with the default
+        // `{exit_on_close,true}` ends the socket through `tcp_desc_close` → `erl_inet_close` →
+        // `desc_close`, whose `desc->state &= ~INET_STATE_CONNECTED` (`:5079`) is followed by
+        // `desc->state = INET_STATE_CLOSED` (`:5106`) — the comment at `:5078`-`:5079` names
+        // exactly this reply ("Next write to socket should produce {error, enotconn}").
+        //
+        // This floor keeps the descriptor for the port's whole life — [`Self::latch_peer_close`]
+        // releases the poller registration instead of closing the socket — so `state` alone can no
+        // longer answer the C's question: without the latched close in this guard, a command issued
+        // *after* the peer's close would be handed to [`Self::write_pending`], which refuses to
+        // touch a dead socket (`self.peer_close.seen`, `mod.rs`) and leaves the payload queued with
+        // **no** reply at all, where the C answers `{error, closed}`/`{error, enotconn}` from the
+        // send ladder below. The two conditions are therefore one arm, not two.
+        if !self.state.is_connected() || self.peer_close.seen {
             // The C's `!IS_CONNECTED` arm (`:12674`-`:12683`): the command is accepted (the port
             // charged `prt->bytes_out += size` for it) but never written, and the caller learns
             // the outcome from `inet_reply_error(ENOTCONN)` — a `{inet_reply, Port,
