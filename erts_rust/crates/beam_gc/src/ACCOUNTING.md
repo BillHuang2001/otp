@@ -79,24 +79,28 @@ The metric and the OS figure move in opposite directions on exactly one case, `b
 | `old` (r1/r2/r3) | 13 220 989 / 13 222 861 / 13 222 861 | 133 189 632 / 133 246 976 / 133 079 040 |
 | `new` (r1/r2/r3) | 6 788 542 / 6 788 542 / 6 788 542 | 171 352 064 / 171 356 160 / 171 294 720 |
 
-Both figures are deterministic per binary, so this is not noise; every other case in the same A/B either held flat or fell.
-The keys behind the old figure, read from that binary (`beam_rt -noshell -eval 'erlang:memory().'`, the same binary the artifact used):
+Both figures are deterministic per binary (only `processes` wobbles, in whole-heap-size steps of 1 872–6 024 B across repeated runs), so the halving is not noise; every other case in the same A/B either held flat or fell.
+The nine keys, read from each binary with `beam_rt -noshell -eval 'erlang:memory().'` (one release build per side, modal value of 20 / 12 runs):
 
-| key | old |
-|---|---|
-| `processes` | 6 906 344 |
-| `processes_used` | 271 968 |
-| `system` | 6 314 645 |
-| `atom` / `atom_used` | 202 493 / 202 493 |
-| `binary` | 0 |
-| `code` | 6 025 408 |
-| `ets` | 152 |
-| `emulator` (the remainder of `system`) | 86 592 |
-| `total` | 13 220 989 |
+| key | old (m15-era, `a34ca61332`) | new (that session's HEAD) | Δ |
+|---|---|---|---|
+| `processes` | 6 908 216 | 445 904 | **−6 462 312** |
+| `processes_used` | 274 080 | 199 808 | −74 272 |
+| `system` | 6 314 645 | 6 342 638 | +27 993 |
+| `atom` = `atom_used` | 202 493 | 203 410 | +917 |
+| `binary` | 0 | 0 | 0 |
+| `code` | 6 025 408 | 6 053 012 | +27 604 |
+| `ets` | 152 | 152 | 0 |
+| `emulator` (the remainder of `system`) | 86 592 | 86 064 | −528 |
+| `total` | 13 222 861 | 6 788 542 | **−6 434 319** |
 
-The category that moved is **`processes`** — the reserved process-heap capacity, the one key without an external counterpart.
-`code`, `atom`, `ets`, `binary` and `emulator` are not heap-sized by a collection and stay at their boot values; the boot-time heap sizes are what a collection (and the nursery chain's cap) shrinks.
-`processes_used` was 0.27 MB of the old 6.9 MB, i.e. the old `processes` was ~96 % reserved capacity the runtime had not collected down, which is consistent with the drop and with RSS not following it: the retired space is handed back to the allocator, and whether the OS reclaims the mapping is the allocator's and the OS's decision, not this crate's.
+Both identities close exactly: the `processes` + `system` deltas sum to the `total` delta, and `atom + code + ets + emulator` sums to the `system` delta.
+
+**The category that moved is `processes` — the reserved process-heap capacity, by −6.46 MB of the −6.43 MB total.** Nothing else moved by more than 28 KB.
+`system` is not heap-sized by a collection: its two movers are `code` (+27 604 B, a slightly larger loaded-module image set) and `atom` (+917 B, two more interned names), both boot-time facts, and `emulator` was 87 KB on both sides.
+The old `processes` was ~96 % reserved capacity around a 0.27 MB live set (6 908 216 reserved vs 274 080 occupied), which is what a collector that does not collect a process down leaves behind; the new side reserves 445 904 B around a 0.20 MB live set.
+That is an **accounting** change in the honest direction — the runtime stopped charging itself for heap space a collection had already reclaimed — and it cannot move RSS, because a retired space is handed back to the allocator and whether the OS reclaims the mapping is the allocator's and the OS's business.
+So the runtime's reported figure and its RSS are not even measuring the same process (the `vm_memory_total_bytes` probe is its own `-eval` run), and the 5.33× "lower" ratio must not be read as a footprint win.
 See `../MEASURED.md` for this crate's own cadence measurements (collection count, copy volume, footprint) rather than the runtime's totals.
 
 ## Handoffs
