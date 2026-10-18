@@ -392,3 +392,10 @@ fn unsupported_kind(packet: &ActiveInputPacket, delivery: &str) -> beam_common::
 #[cfg(test)]
 #[path = "active_input_tests.rs"]
 mod tests;
+
+/// The channel's end-to-end suite — real loopback sockets on `tcp_inet`/`udp_inet` ports, pumped
+/// and drained exactly as the runtime's delivery arms will (see
+/// `src/port/active_input_e2e_tests.rs`).
+#[cfg(test)]
+#[path = "active_input_e2e_tests.rs"]
+mod e2e;
