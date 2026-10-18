@@ -456,10 +456,9 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - **No self-hosted build exists in this crate.** Contract **A.9** is *declared* on `erlc_compiler`
   (`["A.9"]`) and `elixir_compiler` (`["A.1","A.9"]`), but **both run only the system oracle**
   (`Runtimes::SysOnly`): `erlc_compiler` shells out to the system `erlc`, `elixir_compiler` to the installed
-  `elixirc`. Nothing in the driver runs any compiler **under `beam_rt`**, so the crate exercises no compiler
-  under the Rust runtime and no genuine self-hosted build. Genuine end-to-end `beam_rt` execution is confined
-  to `baseline`, `slice`, `foreign`, `list_walk`, `copy_bound` and `gc_bound`; the full target apps (Cowboy
-  release, EMQX, Khepri, Elixir) are all `SysOnly` and report `skipped(runtime-unsupported)` under `rust`.
+  `elixirc`. Nothing here runs a compiler **under `beam_rt`**, so the crate exercises no genuine self-hosted
+  build; genuine end-to-end `beam_rt` execution is confined to the seven `Runtimes::Both` workloads, and every
+  full target app (Cowboy release, EMQX, Khepri, Elixir) is `SysOnly` ⇒ `skipped(runtime-unsupported)` on rust.
 - `out/` is gitignored by `../../.gitignore` (`/tools/bench/out/`); the standard scratch artifact is
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked** `results/`
   directory (see `RESULTS.md`), which is for committed milestone numbers only.
