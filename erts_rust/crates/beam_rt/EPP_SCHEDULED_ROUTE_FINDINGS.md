@@ -5,7 +5,7 @@ Sibling-owned dossier for the A.9 **scheduled (`run`) route** — the two differ
 `compile:file(Source, [no_spawn_compiler_process, deterministic, {outdir, Dir}])`) and
 `selfhost/scheduled_process_compile_file_deterministic` (the default shape through `compile:file/2`'s
 own compiler process).
-The gate is authoritative and re-run, never quoted here: `selfhost/scheduled_process_compile_file_deterministic` agrees with the oracle on both execution tiers, while `selfhost/in_process_compile_file_no_spawn_deterministic` **still mismatches** — the E0 shape dies inside a heap-admission collection on the scheduled route (§5).
+The gate is authoritative and re-run, never quoted here: both cases agree with the oracle on both execution tiers — each prints `1` and exits 0.
 Present state, not a history.
 The current picture: the `beam_process` signal-driven collection site that would relocate a woken monitor watcher's heap against an incomplete root set is **declined by the host collection gate** the `ptab.rs` signal sites consult (`beam_rt`'s `RuntimeCollectionGate`), with the runner's park-window relocation exemption as the complementary mitigation.
 
@@ -76,23 +76,16 @@ The seam is pinned by
 `context::tests::the_installed_gate_declines_a_signal_driven_relocation_of_a_foreign_reachable_receiver`
 and `runner::tests::a_parked_process_stays_relocation_exempt_for_its_parked_window`.
 
+**The durable invariant behind the E0 shape.** A registered BIF's container result is never left on the recyclable pooled BIF heap while running Erlang code can store it in a heap object.
+On a process route the copy-out moves such a result onto the process's own **scanned young heap**, where the engine's ordinary root set already publishes it (it lands in `x(0)` on return) and a later collection relocates it like any other heap object.
+The pool rewind that follows stays gated on `safe_to_rewind`: only a call the six escaping `DispatchHooks` seams and reentrancy cannot have run on, with an `Ok` result, is rewound to its own start offset.
+A graph that holds a reference is neither moved nor rewound — a reference's identity is its address.
+The table-less `-eval` route keeps the older gated move: it has no collector, so the copy lands on the pointer-stable, never-reset runtime store (`Runtime::eval_heap` + `Runtime::eval_off_heap`) instead of an object a collection would relocate.
+The invariant is [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md)'s and [`src/context/calls.rs`](src/context/calls.rs) implements it.
+
 ## 4. Where the refusal lives
 `crates/beam_process/src/ptab.rs` owns the seam: `ProcessTable::set_collection_gate` /
 `take_collection_gate` / `has_collection_gate` install/take/test the host `CollectionGate`, and its
 private `declines_signal_collection(pid)` OR-s that gate with the crate's `has_unpublished_roots` at
 every signal site. The host half is `RuntimeCollectionGate`; the runner's park-window exemption
 remains the narrower, complementary cover for the host-held-outside-roots hazard described above.
-
-## 5. The open defect: the E0 shape dies in an admission collection
-`selfhost/in_process_compile_file_no_spawn_deterministic` — the `compile:file/2` shape with `no_spawn_compiler_process` — is the one open differential defect: the Rust side aborts (SIGABRT, `unsupported: external_term` at exit) instead of matching the oracle.
-A/B: bypassing the `src/context/gc.rs::ensure_heap_full` heap-admission door makes the abort vanish (2/2); disabling the reduction-interval boundary door (`src/context/gc/reds_door.rs`) does not.
-The stale term is the third element `{outdir, Dir}` of `compile:expand_opts/1`'s option list — it survives a collection whose relocation freed its payload.
-Instrumentation (`BEAM_RT_GC_LOG`) shows the fatal action is a full **Major** with the nursery chain **collapsed** (young_spaces 2→1) and **zero** un-relocated roots reported across all ~724 collections in the run.
-That is a root-set **coverage** hole, not a bound bug.
-Ruled out by code inspection: `RuntimeContext::run_export` IS already guarded — `src/context/pump.rs::run_export_blocking` wraps the nested run in `with_relocation_exempt`, nested-safe.
-A door audit logged ~700 door-collect events, all `state=Running exempt=false`, plus ~465 `exempt=true` events with **zero** collections among them.
-A latent invariant gap worth knowing (not established as this defect's cause): the three heap-admission doors consult only the `gc_armed` latch, `current_module`, occupancy/debt and the unscanned-root valve — never `process.is_relocation_exempt()`; only `gc/reds_door.rs` does.
-It is sound today only because `BudgetContext` arms the latch immediately before forwarding and each door `mem::take`s it first.
-The next experiment: instrument `src/context/calls.rs::invoke_registered` (the `BifFn` call) to classify every `args[i]` immediately before invoking the BIF.
-On the first unclassifiable arg, print once the raw word, whether it lies inside `process.collector().scanned_bounds()`, the last 8 door-collect events for that pid (kind/base/limit), `current_module` and `is_relocation_exempt()`.
-Inside a live range ⇒ a published-root hole; outside every live range ⇒ an object reachable only from a host-side store (`dispatch_memo` slots, `lent_tables`, `Runtime::eval_off_heap`/`open_files`/`timers`; the process dictionary is NOT the hole — `Process::gather_roots` includes `dict`).
