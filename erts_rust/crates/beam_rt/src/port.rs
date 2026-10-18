@@ -1700,7 +1700,8 @@ impl PortRegistry {
     /// A round reports a reaped child's `exit_status` **before** the round's own end-of-stream
     /// line flush, which is the order the oracle delivers in (see the ordering note at the
     /// round's line drain): a partial trailing line released at end-of-stream is therefore never
-    /// seen before the status of the child that wrote it.    ///
+    /// seen before the status of the child that wrote it.
+    ///
     /// A round never blocks when there is nothing that could become ready — no live port and no
     /// armed `tty_select/2` interest (see [`PortRegistry::has_nothing_to_poll`]): an armed but
     /// **idle** signal self-pipe is not a wake source, so a runtime that only handles a signal
