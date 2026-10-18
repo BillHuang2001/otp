@@ -798,11 +798,6 @@ impl InPlace {
     ///
     /// A zero-growth request that already fits is answered `true` without touching the
     /// payload, so a caller may consult the sink unconditionally.
-    //
-    // Not yet consulted by `BitWriter`: promoting on a shortfall is still the write path's
-    // only answer, so the growth door lands ahead of its caller. The plumbing is covered by
-    // this module's unit tests.
-    #[allow(dead_code)]
     pub(super) fn grow(&mut self, machine: &mut Machine, need_bits: usize) -> Result<bool> {
         let wanted_bits = self.cur.saturating_add(need_bits);
         if wanted_bits <= self.capacity {

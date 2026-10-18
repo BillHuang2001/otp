@@ -270,13 +270,13 @@ fn assemble(
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
                 if nbits > 64 || raw::big_parts_safe(value).is_some() {
-                    push_wide_int(&mut writer, value, nbits, flags & BSF_LITTLE != 0)?;
+                    push_wide_int(&mut writer, value, nbits, flags & BSF_LITTLE != 0, machine)?;
                 } else if let Some(raw_value) = small_value(value) {
                     if flags & BSF_LITTLE != 0 {
-                        writer.push_uint_le(raw_value as u64, nbits);
+                        writer.push_uint_le(raw_value as u64, nbits, machine)?;
                     } else {
                         // `erts_bs_put_integer_*` masks the value into the field width.
-                        writer.push_uint(raw_value as u64, nbits);
+                        writer.push_uint(raw_value as u64, nbits, machine)?;
                     }
                 } else {
                     // Unreachable: `predicates::is_integer` above is exactly
@@ -318,7 +318,7 @@ fn assemble(
                 if nbits > src_bits {
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
-                writer.push_bits_from(bytes, src_off, nbits);
+                writer.push_bits_from(bytes, src_off, nbits, machine)?;
             }
             // `string Unit Fs Offset Size` — append a constant byte string from the
             // module's `StrT` table (`BS_LOAD_STRING_SRC`/`erts_bs_put_string`,
@@ -330,7 +330,7 @@ fn assemble(
             // failure is possible here, so this segment never branches to `fail`.
             "string" => {
                 let bytes = string_source(module, value_op, size_op, machine, ctx)?;
-                writer.push_bits_from(bytes, 0, bytes.len() * 8);
+                writer.push_bits_from(bytes, 0, bytes.len() * 8, machine)?;
             }
 
             // `float Unit Fs Value Size` — write a 16/32/64-bit float
@@ -366,7 +366,7 @@ fn assemble(
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 };
                 let bytes = put_float(f, nbits, flags & BSF_LITTLE != 0);
-                writer.push_bits_from(&bytes, 0, nbits);
+                writer.push_bits_from(&bytes, 0, nbits, machine)?;
             }
 
             // `utf8`/`utf16`/`utf32` — the codepoint is variable-width; the
@@ -381,7 +381,7 @@ fn assemble(
                     _ => None,
                 };
                 match encoded {
-                    Some(bytes) => writer.push_bits_from(&bytes, 0, bytes.len() * 8),
+                    Some(bytes) => writer.push_bits_from(&bytes, 0, bytes.len() * 8, machine)?,
                     None => return fail_seg(machine, module, labels, fail, SegReason::BadArg),
                 }
             }
@@ -432,7 +432,7 @@ fn assemble(
                     }
                 }
                 let (bytes, src_off) = raw::subject_bytes(value)?;
-                writer.push_bits_from(bytes, src_off, src_bits);
+                writer.push_bits_from(bytes, src_off, src_bits, machine)?;
             }
             other => {
                 return Err(error::unsupported(&format!(
