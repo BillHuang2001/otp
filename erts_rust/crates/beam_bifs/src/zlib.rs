@@ -201,9 +201,7 @@
 use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_term::Eterm;
 
-use beam_codec::compress::{
-    compress as zlib_compress, decompress_bounded as zlib_decompress_bounded, MAX_UNCOMPRESSED,
-};
+use beam_codec::compress::{decompress_bounded as zlib_decompress_bounded, MAX_UNCOMPRESSED};
 
 use crate::binary::iodata_bytes;
 use crate::bits;
@@ -212,6 +210,7 @@ use crate::context::BifContext;
 use crate::deflate;
 use crate::error::unsupported_bif;
 use crate::registry::BifRegistry;
+use crate::zlib_deflate;
 
 /// The compression level `zlib:compress/1` uses: `deflateInit(Z, default)`
 /// (`zlib.erl:686`), i.e. zlib's `Z_DEFAULT_COMPRESSION`, which zlib documents as
@@ -292,7 +291,7 @@ const GZIP_TRAILER_LENGTH: usize = 8;
 /// class.
 fn compress_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let bytes = iodata_bytes(args[0])?;
-    let deflated = zlib_compress(&bytes, DEFAULT_COMPRESSION_LEVEL)?;
+    let deflated = zlib_deflate::compress(&bytes, DEFAULT_COMPRESSION_LEVEL)?;
     bits::make_binary(ctx.heap(), &deflated)
 }
 
@@ -307,7 +306,7 @@ fn compress_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// capability gap [`unsupported_bif`] (see [`raw_deflate_of`]).
 fn zip_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let bytes = iodata_bytes(args[0])?;
-    let stream = zlib_compress(&bytes, DEFAULT_COMPRESSION_LEVEL)?;
+    let stream = zlib_deflate::compress(&bytes, DEFAULT_COMPRESSION_LEVEL)?;
     bits::make_binary(ctx.heap(), raw_deflate_of(&stream)?)
 }
 
@@ -403,7 +402,7 @@ fn uncompress_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// capability gap [`unsupported_bif`] (see [`raw_deflate_of`]).
 fn gzip_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let bytes = iodata_bytes(args[0])?;
-    let stream = zlib_compress(&bytes, DEFAULT_COMPRESSION_LEVEL)?;
+    let stream = zlib_deflate::compress(&bytes, DEFAULT_COMPRESSION_LEVEL)?;
     let payload = raw_deflate_of(&stream)?;
     let mut member =
         Vec::with_capacity(GZIP_HEADER.len() + payload.len() + GZIP_TRAILER_LENGTH);
@@ -968,7 +967,7 @@ mod tests {
             "a preset dictionary must be the typed capability gap"
         );
         // The real encoder's framing is accepted.
-        let stream = zlib_compress(b"hello", DEFAULT_COMPRESSION_LEVEL).expect("deflate");
+        let stream = zlib_deflate::compress(b"hello", DEFAULT_COMPRESSION_LEVEL).expect("deflate");
         assert_eq!(
             raw_deflate_of(&stream).expect("the encoder's own framing"),
             &stream[2..stream.len() - 4]
@@ -1018,7 +1017,7 @@ mod tests {
         if flags & GZIP_FLAG_FHCRC != 0 {
             member.extend_from_slice(&(crc32_step(0, &member) as u16).to_le_bytes());
         }
-        let stream = zlib_compress(data, DEFAULT_COMPRESSION_LEVEL).expect("deflate");
+        let stream = zlib_deflate::compress(data, DEFAULT_COMPRESSION_LEVEL).expect("deflate");
         member.extend_from_slice(raw_deflate_of(&stream).expect("the encoder's framing"));
         member.extend_from_slice(&crc32_step(0, data).to_le_bytes());
         member.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -1220,7 +1219,7 @@ mod tests {
         // result, so the observable failure is the heap's own `Alloc`, never
         // `data_error`. That is the regression witness: the inflater must not stop.
         let payload = vec![0u8; MAX_UNCOMPRESSED + 1];
-        let stream = zlib_compress(&payload, DEFAULT_COMPRESSION_LEVEL).expect("deflate");
+        let stream = zlib_deflate::compress(&payload, DEFAULT_COMPRESSION_LEVEL).expect("deflate");
         let bound = expansion_limit(stream.len());
         assert!(
             bound >= payload.len(),
