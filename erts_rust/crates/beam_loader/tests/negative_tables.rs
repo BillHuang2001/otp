@@ -166,10 +166,15 @@ fn the_reassembled_fixture_is_byte_identical() {
 fn a_missing_import_table_is_rejected() {
     // `MISSING_IMPORT_TABLE` (`beam_load.c:155-169`): `ImpT` is mandatory even for a
     // module that imports nothing (the chunk is then present with a zero count).
+    //
+    // The control is the untouched fixture — equivalently its faithful rebuild, pinned by
+    // `the_reassembled_fixture_is_byte_identical`. A zero-count `ImpT` cannot stand in for
+    // the real one: the loader resolves every `ImportRef` in the lowered code against
+    // `Module::imports` (`jit/asm_load.c:532-548`) and `slice.beam`'s code does reference
+    // imports, so an emptied table is itself rejected.
     let chunks = fixture_chunks();
-    let control = with_chunk(&chunks, b"ImpT", 0u32.to_be_bytes().to_vec());
     assert_rejects(
-        &control,
+        &build(&chunks),
         &without_chunk(&chunks, b"ImpT"),
         Expected::BadArg,
         "missing ImpT",
@@ -287,11 +292,34 @@ fn a_negative_line_number_is_rejected() {
     // `LoadAssert(val.size == 0 && val.word_value >= 0)` (`beam_file.c:519-522`): `0x19`
     // is a two-byte `i` magnitude, so `0xFF 0xFF` sign-extends to `-1` — a corrupt line
     // table, never the wrapped line `4294967295`.
+    //
+    // The table MUST be fixture-sized: every `Line`/`executable_line`/`debug_line`
+    // `LineRef` is bound-checked against `Module.line.items` (`jit/asm_load.c:324-341`), so
+    // a smaller table leaves the fixture's own line references out of range and the
+    // *control* would be rejected. The parser synthesizes `items[0]` (the undefined
+    // location), so the chunk's `item_count` is one less than `items.len()`; `0x41` is an
+    // `i`-tagged inline line number, i.e. a valid entry.
     let chunks = fixture_chunks();
-    let control = with_chunk(&chunks, b"Line", line_chunk(0, 7, 1, &[0x41]));
+    let items = load(&fixture())
+        .expect("the fixture loads")
+        .line
+        .items
+        .len()
+        - 1;
+    let control = with_chunk(
+        &chunks,
+        b"Line",
+        line_chunk(0, 7, items as u32, &vec![0x41u8; items]),
+    );
+    let mut mutated_items = vec![0x41u8; items - 1];
+    mutated_items.extend_from_slice(&[0x19, 0xFF, 0xFF]); // the last line is -1
     assert_rejects(
         &control,
-        &with_chunk(&chunks, b"Line", line_chunk(0, 7, 1, &[0x19, 0xFF, 0xFF])),
+        &with_chunk(
+            &chunks,
+            b"Line",
+            line_chunk(0, 7, items as u32, &mutated_items),
+        ),
         Expected::BadArg,
         "negative line number",
     );
