@@ -142,8 +142,8 @@ Thirteen workloads, split by how the baseline tier lowers them:
   right after the BIF hook.
 
 ## Constraints
-- Wired by `pub mod bench;` in `../mod.rs`; the crate-public surface is the two entry functions only
-  (the internal `mod`s stay `pub(crate)`/`pub(super)`).
+- Wired by `pub mod bench;` in `../mod.rs`; the crate-public surface is the two entry functions plus
+  the crate-visible `run_workloads_on(tier)` (the internal `mod`s stay `pub(crate)`/`pub(super)`).
 - Uses only the crate's own seams (`JitBackend`, `Machine::run_export`, `MinimalContext`,
   `context::Mailbox`); a native tier is compiled **once** per measurement (outside the timed loop)
   and only `run_compiled` is timed.
