@@ -28,8 +28,11 @@
 //! numbers are the C's `INET_REQ_*`/`PACKET_REQ_RECV`) and compare the reply bytes to the
 //! driver's. Every oracle case **skips loudly** when `erl` is not on `PATH`.
 
-use super::super::opt::{INET_OPT_BROADCAST, INET_OPT_REUSEADDR, INET_OPT_TTL};
-use super::super::wire::{ctl_ok, ctl_xerror};
+use super::super::opt::{
+    INET_LOPT_DELIVER, INET_LOPT_MODE, INET_LOPT_UDP_READ_PACKETS, INET_OPT_BROADCAST,
+    INET_OPT_REUSEADDR, INET_OPT_TTL,
+};
+use super::super::wire::{ctl_ok, ctl_xerror, split_caller_ref, ETF_VERSION_MAGIC};
 use super::super::{INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_TYPE_DGRAM, INET_REP_OK};
 use super::{UdpInetDriver, UDP_DRIVER_NAME};
 use crate::driver::{Driver, DriverContext, PortArms};
@@ -51,6 +54,10 @@ const INET_REQ_OPEN: u32 = 1;
 const INET_REQ_CLOSE: u32 = 2;
 /// `INET_REQ_BIND` (`inet_drv.c:810`).
 const INET_REQ_BIND: u32 = 6;
+/// `INET_REQ_SETOPTS` (`inet_drv.c:811`).
+const INET_REQ_SETOPTS: u32 = 7;
+/// `INET_REQ_GETOPTS` (`inet_drv.c:812`).
+const INET_REQ_GETOPTS: u32 = 8;
 
 /// Wall-clock budget for the `erl` oracle before the affected check is skipped.
 const ERL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -172,13 +179,12 @@ impl Rig {
 }
 
 // ---------------------------------------------------------------------------
-// A socket-less / unconnected port refuses a port command (`inet_drv.c:15051`)
+// A socket-less port refuses a port command (the C's `!IS_OPEN`, `inet_drv.c:15068`)
 // ---------------------------------------------------------------------------
 
 /// A `port_command/2` on a port with **no socket** is refused, and the queued bytes survive: the
-/// C's `packet_inet_command` guards the send with `!IS_OPEN` (`inet_drv.c:15051`), and its queue
-/// form expects the `[address][data]` grammar — a bare command carries no address at all, so
-/// nothing in the queue can name a peer.
+/// C's `packet_inet_command` guards on `!IS_OPEN` (`inet_drv.c:15068`-`:15077`) before it looks at
+/// the operand at all, because a socket-less port has no destination a command could name.
 ///
 /// The driver-side contract is a typed `BeamError::BadArg` with the bytes **never consumed**.
 /// The oracle's own first command answers `true` *and kills the port* (`driver_failure_posix`),
@@ -198,20 +204,6 @@ fn a_socket_less_port_command_is_refused_and_keeps_its_bytes() {
         3,
         "the refused command's bytes are never consumed"
     );
-}
-
-/// The same refusal once a socket exists but has no default peer: a datagram needs a destination
-/// and the queue cannot name one, so the command is refused rather than silently dropped.
-#[test]
-fn an_unconnected_datagram_command_is_refused_and_keeps_its_bytes() {
-    let mut rig = Rig::new();
-    rig.open();
-    rig.queue_output(b"\x01\x02\x03");
-    assert!(
-        matches!(rig.drain_output(), Err(BeamError::BadArg)),
-        "an unconnected datagram command is refused"
-    );
-    assert_eq!(rig.output_len(), 3, "the bytes are never consumed");
 }
 
 /// The oracle's side of the same situation, pinned as a **sequence**: on a fresh bare port the
@@ -504,33 +496,94 @@ fn an_unserved_option_code_is_einval() {
     );
 }
 
+/// A five-byte `[opt, val_be32]` `setopts` record.
+fn record(code: u8, value: i32) -> Vec<u8> {
+    let mut record = vec![code];
+    record.extend_from_slice(&value.to_be_bytes());
+    record
+}
+
+/// `{mode, …}` (`24`) and `{deliver, …}` (`25`) are **ungated** — the C's `inet_set_opts`
+/// (`inet_drv.c:6939`-`:6956`) and `inet_fill_opts` (`:9168`-`:9175`) carry no `stype` test — so
+/// the datagram driver serves both exactly as `tcp_inet` does, in every socket state.
+/// `{read_packets, N}` (`33`) is the datagram-gated one: it is served once `open` has cached
+/// `SOCK_DGRAM`, ignored before that (still answering `[1]`), and the C's `ival <= 0` refusal
+/// applies only inside the gate.
 #[test]
 fn the_datagram_driver_state_options_are_served() {
     let mut rig = Rig::new();
-    rig.open();
-    // `{mode, list}` (24) = 0, `{deliver, term}` (25) = 1, `{read_packets, }` (33) = 5.
-    let defaults = rig.control("getopts", &[24, 25, 33]).expect("getopts");
-    assert_eq!(
-        defaults,
-        vec![INET_REP_OK, 24, 0, 0, 0, 0, 25, 0, 0, 0, 1, 33, 0, 0, 0, 5],
-    );
-    // A non-positive `read_packets` is the C's `[0]einval`.
-    let mut set = vec![33];
-    set.extend_from_slice(&0i32.to_be_bytes());
-    assert_eq!(
-        rig.control("setopts", &set).expect("setopts"),
-        ctl_xerror("einval"),
-    );
-}
-
-#[test]
-fn read_packets_is_dropped_before_a_socket_exists() {
-    let mut rig = Rig::new();
+    // ---- no socket yet: `inet.stype` is -1, so 33 is gated out ----
     let reply = rig.control("getopts", &[24, 25, 33]).expect("getopts");
     assert_eq!(
         reply,
         vec![INET_REP_OK, 24, 0, 0, 0, 0, 25, 0, 0, 0, 1],
         "code 33 contributes nothing while there is no datagram socket",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(24, 1)).expect("setopts"),
+        ctl_ok(),
+        "a `mode` = binary store is accepted before a socket exists",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(25, 0)).expect("setopts"),
+        ctl_ok(),
+        "a `deliver` = port store is accepted before a socket exists",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(33, 7)).expect("setopts"),
+        ctl_ok(),
+        "a gated-out read_packets store still answers `[1]`",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(33, 0)).expect("setopts"),
+        ctl_ok(),
+        "the `ival <= 0` refusal is inside the datagram gate",
+    );
+    assert_eq!(
+        rig.control("getopts", &[24, 25, 33]).expect("getopts"),
+        vec![INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0],
+        "both ungated records read back, the gated one still contributes nothing",
+    );
+
+    // ---- an opened datagram socket: the gated code comes alive ----
+    rig.open();
+    let defaults = rig.control("getopts", &[24, 25, 33]).expect("getopts");
+    assert_eq!(
+        defaults,
+        vec![INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0, 33, 0, 0, 0, 5],
+        "`mode`/`deliver` keep their stored values and `read_packets` reports its default",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(33, 7)).expect("setopts"),
+        ctl_ok(),
+    );
+    assert_eq!(
+        rig.control("getopts", &[33]).expect("getopts"),
+        vec![INET_REP_OK, 33, 0, 0, 0, 7],
+        "a positive read_packets stores and reads back",
+    );
+    // A non-positive `read_packets` is the C's `[0]einval` — inside the datagram gate.
+    assert_eq!(
+        rig.control("setopts", &record(33, 0)).expect("setopts"),
+        ctl_xerror("einval"),
+    );
+    assert_eq!(
+        rig.control("getopts", &[33]).expect("getopts"),
+        vec![INET_REP_OK, 33, 0, 0, 0, 7],
+        "a refused record leaves the stored value alone",
+    );
+
+    // ---- after `close`: the cached `SOCK_DGRAM` keeps the read-back alive ----
+    assert_eq!(rig.control("close", &[]).expect("close"), ctl_ok());
+    assert_eq!(
+        rig.control("getopts", &[24, 25, 33]).expect("getopts"),
+        vec![INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0, 33, 0, 0, 0, 7],
+        "a close never clears `desc->stype`, so code 33 is still reported",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(33, 0)).expect("setopts"),
+        ctl_xerror("einval"),
+        "the gate is still open after a close",
     );
 }
 
@@ -626,6 +679,116 @@ fn the_control_replies_agree_with_the_erl_oracle() {
     assert_eq!(closed, oracle[2], "close agrees with the oracle");
 }
 
+/// The Rust side of an oracle comparison driven the way the runtime drives it: a **real**
+/// `PortRegistry` port on the numeric `erlang:port_control/3` route (the decimal
+/// `code + ERTS_INET_DRV_CONTROL_MAGIC_NUMBER` string the `opcode.rs` bridge decodes).
+fn port_replies(calls: &[(u32, Vec<u8>)]) -> Vec<Vec<u8>> {
+    let mut poller = Poller::new().expect("a poll set");
+    let registry = crate::driver::DriverRegistry::with_builtins();
+    let driver = registry
+        .create(UDP_DRIVER_NAME)
+        .expect("the built-in udp_inet driver is registered");
+    let mut ports = crate::port::PortRegistry::new();
+    let id = ports.open(&mut poller, driver).expect("the port opens");
+    let replies = calls
+        .iter()
+        .map(|(code, arg)| {
+            ports
+                .port_control(&mut poller, id, &(code + CONTROL_MAGIC).to_string(), arg)
+                .unwrap_or_else(|err| panic!("request {code} failed: {err:?}"))
+        })
+        .collect();
+    ports.close(&mut poller, id).expect("closes the port");
+    replies
+}
+
+/// The datagram driver's `{mode, …}`/`{deliver, …}`/`{read_packets, N}` matrix against the live
+/// oracle, over the three states a port can be in (no socket, an opened datagram socket, after a
+/// `close`).
+///
+/// Codes `24`/`25` are ungated in the C (`inet_set_opts`, `inet_drv.c:6939`-`:6956`;
+/// `inet_fill_opts`, `:9168`-`:9175`), so they answer identically in every state; code `33` is
+/// gated on the **cached** `SOCK_DGRAM` (`:7138`-`:7146`, `:9258`-`:9270`), so it is ignored
+/// before `open` (still answering `[1]`) and still reported after a `close`.
+///
+/// **Skips loudly** when `erl` is not on `PATH`.
+#[test]
+fn the_mode_deliver_and_read_packets_rows_agree_with_the_erl_oracle() {
+    let three = || vec![INET_LOPT_MODE, INET_LOPT_DELIVER, INET_LOPT_UDP_READ_PACKETS];
+    let calls = vec![
+        // ---- no socket yet ----
+        (INET_REQ_GETOPTS, three()),
+        (INET_REQ_SETOPTS, record(INET_LOPT_MODE, 1)),
+        (INET_REQ_SETOPTS, record(INET_LOPT_DELIVER, 0)),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 7)),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 0)),
+        (INET_REQ_GETOPTS, three()),
+        // ---- an opened datagram socket ----
+        (
+            INET_REQ_OPEN,
+            vec![INET_AF_INET, INET_TYPE_DGRAM, super::super::INET_PROTO_DEFAULT],
+        ),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 9)),
+        (INET_REQ_GETOPTS, three()),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 0)),
+        // ---- after a `close`: the cached stype survives ----
+        (INET_REQ_CLOSE, vec![]),
+        (INET_REQ_GETOPTS, three()),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 0)),
+    ];
+
+    let rust = port_replies(&calls);
+    assert_eq!(rust.len(), calls.len(), "one reply per call");
+    assert_eq!(
+        rust[0],
+        vec![INET_REP_OK, 24, 0, 0, 0, 0, 25, 0, 0, 0, 1],
+        "before `open` code 33 is gated out; 24/25 report their defaults",
+    );
+    assert_eq!(rust[1], ctl_ok(), "`{{mode, binary}}` before `open`");
+    assert_eq!(rust[2], ctl_ok(), "`{{deliver, port}}` before `open`");
+    assert_eq!(rust[3], ctl_ok(), "a gated-out `read_packets` store is `[1]`");
+    assert_eq!(rust[4], ctl_ok(), "the `ival <= 0` refusal is inside the gate");
+    assert_eq!(
+        rust[5],
+        vec![INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0],
+        "both ungated values read back, code 33 still contributes nothing",
+    );
+    assert_eq!(rust[6], ctl_ok(), "`open`");
+    assert_eq!(rust[7], ctl_ok(), "a positive `read_packets` on a datagram socket");
+    assert_eq!(
+        rust[8],
+        vec![
+            INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0, 33, 0, 0, 0, 9,
+        ],
+        "all three read back once the socket is a datagram",
+    );
+    assert_eq!(rust[9], ctl_xerror("einval"), "a non-positive `read_packets`");
+    assert_eq!(rust[10], ctl_ok(), "`close`");
+    assert_eq!(
+        rust[11],
+        vec![
+            INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0, 33, 0, 0, 0, 9,
+        ],
+        "a close never clears `desc->stype`, so code 33 is still reported",
+    );
+    assert_eq!(rust[12], ctl_xerror("einval"), "the gate is still open after a close");
+
+    let Some(dump) = erl_stdout(&oracle_expression(&calls)) else {
+        eprintln!("SKIP: no `erl` on PATH — skipping the udp_inet option-gate oracle check");
+        return;
+    };
+    let oracle = oracle_replies(&dump);
+    assert_eq!(oracle.len(), calls.len(), "the oracle answered every call: {dump:?}");
+    for (index, ((code, arg), (rust_reply, oracle_reply))) in
+        calls.iter().zip(rust.iter().zip(oracle.iter())).enumerate()
+    {
+        assert_eq!(
+            rust_reply, oracle_reply,
+            "reply {index} (request code {code}, argument {arg:?}) disagrees",
+        );
+    }
+}
+
 /// The oracle's `port_info(Port, name)` — the registered driver name, which is the one value
 /// that must be `"udp_inet"` for `gen_udp` to recognise the port.
 ///
@@ -643,5 +806,518 @@ fn the_oracle_reports_the_registered_driver_name() {
     assert!(
         dump.contains("udp_inet"),
         "the oracle's udp_inet port reports its name: {dump:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The `prim_inet` caller-reference prefix (`init_caller`, `inet_drv.c:1820-1890`)
+// ---------------------------------------------------------------------------
+/// The `prim_inet` caller-reference tag as it looks on the wire: `term_to_binary(Mref, [local])`
+/// for `Mref = monitor(port, S)` (`prim_inet.erl:575`-`:620`) always starts with the ETF
+/// `VERSION_MAGIC` (131) and the rest is opaque to the driver, so a hand-built tag of four-plus
+/// bytes exercises the same strip path a real monitor reference does.
+const CALLER_REF_TAG: &[u8] = &[131, 100, 0, 8, b'r', b'e', b'f', b'0'];
+
+/// The `prim_inet` command wire form:
+/// `[tag_len:be16][tag_bytes][address][anc_len:be32][anc_data][data]`
+/// (`prim_inet:send/3` + `do_sendto/4`, `erts/preloaded/src/prim_inet.erl:575`-`:700`).
+fn prefixed_command(port: u16, anc: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut arg = Vec::new();
+    arg.extend_from_slice(&(CALLER_REF_TAG.len() as u16).to_be_bytes());
+    arg.extend_from_slice(CALLER_REF_TAG);
+    arg.extend_from_slice(&loopback_arg(port));
+    arg.extend_from_slice(&(anc.len() as u32).to_be_bytes());
+    arg.extend_from_slice(anc);
+    arg.extend_from_slice(payload);
+    arg
+}
+
+/// A real `std::net::UdpSocket` on loopback — an independent receiver, so the assertions below
+/// are on the bytes that reach the wire rather than on this driver's own queue.
+///
+/// The read timeout is a **hang guard** (the shape the spawn suite uses), never a latency budget.
+fn udp_receiver() -> std::net::UdpSocket {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback datagram receiver");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+    socket
+}
+
+/// Receives exactly one datagram from `socket`.
+fn receive_one(socket: &std::net::UdpSocket) -> Vec<u8> {
+    let mut buf = [0u8; 1024];
+    let (len, _from) = socket.recv_from(&mut buf).expect("the receiver gets a datagram");
+    buf[..len].to_vec()
+}
+
+/// The reason atom of a typed error, so the `unsupported`-vs-`badarg` distinction is asserted
+/// rather than assumed.
+fn reason_of(err: BeamError) -> String {
+    err.into_raise()
+        .expect("a typed raise, not a generic failure")
+        .reason
+        .as_atom()
+        .expect("an atom reason")
+        .to_string()
+}
+
+#[test]
+fn the_caller_reference_discriminator_accepts_only_a_fitting_etf_tag() {
+    // A well-formed prefix is stripped, exactly `2 + n` bytes.
+    let mut arg = vec![0, 4, ETF_VERSION_MAGIC, 1, 2, 7];
+    arg.extend_from_slice(&loopback_arg(9));
+    assert_eq!(
+        split_caller_ref(&arg),
+        Some(&arg[6..]),
+        "a well-formed prefix is stripped and the rest returned",
+    );
+    // `n == 0` carries no caller reference (`init_caller`'s `*size_p < 2` guard).
+    assert_eq!(split_caller_ref(&[0, 0, ETF_VERSION_MAGIC, 1]), None);
+    // A truncated prefix (`2 + n` overruns the argument) is not stripped.
+    assert_eq!(split_caller_ref(&[0, 9, ETF_VERSION_MAGIC, 1, 2]), None);
+    // The tag's first byte must be the ETF version byte.
+    assert_eq!(split_caller_ref(&[0, 3, 100, 1, 2, 9, 9]), None);
+    // A plain address-first payload is never stripped: an `INET_AF_INET`/`_ANY`/`_LOOPBACK`
+    // lead byte with a port number whose low byte is not 131 is not a caller reference.
+    for tag in [INET_AF_INET, INET_AF_ANY, INET_AF_LOOPBACK] {
+        let mut plain = vec![tag, 0x04, 210];
+        plain.extend_from_slice(&[127, 0, 0, 1, b'h', b'i']);
+        assert_eq!(split_caller_ref(&plain), None, "tag {tag} is not a caller reference");
+    }
+}
+
+#[test]
+fn the_caller_reference_prefix_is_stripped_from_a_datagram_command() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    let arg = prefixed_command(target, &[], b"prefixed");
+    assert_eq!(
+        rig.control("send", &arg).expect("send"),
+        ctl_ok(),
+        "a well-formed caller-reference command is accepted",
+    );
+    assert_eq!(
+        receive_one(&receiver),
+        b"prefixed",
+        "the receiver sees exactly the payload — no prefix, ancillary word or address bytes",
+    );
+}
+
+#[test]
+fn a_caller_reference_command_with_ancillary_data_is_the_typed_unsupported() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    // `anc_len != 0` is the C's `sendmsg(2)`-with-cmsgs arm (`inet_drv.c:15220`), which this
+    // floor has no seam for: a typed raise, never a send with the ancillary bytes dropped (or
+    // mistaken for payload).
+    let arg = prefixed_command(target, &[1, 2, 3, 4], b"payload");
+    let reason = reason_of(rig.control("send", &arg).expect_err("ancillary data is not served"));
+    assert_eq!(
+        reason,
+        "unsupported: udp ancillary data (sendmsg cmsg) is not served by this driver floor",
+    );
+}
+
+#[test]
+fn a_caller_reference_command_with_a_truncated_ancillary_length_is_einval() {
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    // The C's `if (len < 4) goto return_einval` (`inet_drv.c:15205`): two bytes where the
+    // ancillary-length word needs four.
+    let mut arg = Vec::new();
+    arg.extend_from_slice(&(CALLER_REF_TAG.len() as u16).to_be_bytes());
+    arg.extend_from_slice(CALLER_REF_TAG);
+    arg.extend_from_slice(&loopback_arg(9));
+    arg.extend_from_slice(&[0, 0]);
+    assert_eq!(
+        rig.control("send", &arg).expect("send"),
+        ctl_xerror("einval"),
+        "a truncated ancillary-length word is the C's einval reply",
+    );
+}
+
+#[test]
+fn a_caller_reference_length_that_does_not_fit_falls_back_to_the_plain_parse() {
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    // `n = 16` with only four tag bytes present: not a caller reference at all, so the plain
+    // grammar runs — and its lead byte is `0x00`, which is no address tag (1/3/4). Nothing is
+    // sent: the command is a plain argument fault.
+    let arg = vec![0, 16, ETF_VERSION_MAGIC, 1, 2, 3];
+    assert!(
+        matches!(rig.control("send", &arg), Err(BeamError::BadArg)),
+        "a non-fitting prefix is not a caller reference and the plain parse refuses it",
+    );
+}
+
+#[test]
+fn the_plain_datagram_command_form_still_sends_unchanged() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    let reply = rig.send(target, b"plain");
+    assert_eq!(reply, ctl_ok(), "the plain [address][payload] form still answers [1]");
+    assert_eq!(receive_one(&receiver), b"plain", "the payload is delivered unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// The plain form is authoritative (regression: the old caller-reference-first order)
+// ---------------------------------------------------------------------------
+
+/// A loopback datagram receiver bound to a port whose **low byte is `0x83`** (131, the ETF
+/// `VERSION_MAGIC`) — the byte the old caller-reference-**first** discriminator mistook for a tag.
+///
+/// Port 131 itself needs privilege, so every `0xNN83` candidate is tried in turn; `None` means the
+/// host refused them all and the check **skips loudly** rather than flaking.
+fn udp_receiver_on_a_0x83_port() -> Option<(std::net::UdpSocket, u16)> {
+    for high in std::iter::once(0u16).chain(1..=0xfe) {
+        let port = (high << 8) | u16::from(ETF_VERSION_MAGIC);
+        let Ok(socket) = std::net::UdpSocket::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        // A hang guard, never a latency budget (the shape `udp_receiver` uses).
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("a read timeout");
+        return Some((socket, port));
+    }
+    None
+}
+
+/// A plain `[address][payload]` command whose **target** port low byte is `0x83` used to be read
+/// as a `prim_inet` caller reference: `split_caller_ref` takes `n = 0x0100 + target_port_hi` from
+/// the address's tag/first port byte and then keys on `arg[2] = target_port_lo == 0x83`, so the
+/// tail was re-parsed as a datagram operand. The plain form is now tried first, so the whole
+/// payload must reach the receiver unchanged.
+#[test]
+fn a_plain_command_with_a_0x83_low_port_byte_is_not_read_as_a_caller_reference() {
+    let Some((receiver, target)) = udp_receiver_on_a_0x83_port() else {
+        eprintln!(
+            "SKIP: no loopback UDP port with low byte 0x83 could be bound — skipping the \
+             plain-form-wins regression check"
+        );
+        return;
+    };
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+
+    // The argument's shape is exactly the one the old order misread: `n = 0x0100 + target_hi`
+    // and `arg[2] = target_lo = 0x83` satisfy `split_caller_ref`'s three conditions, and a
+    // 512-byte payload makes `2 + n` fit for every candidate port (`n <= 0x0100 + 0xfe`), so the
+    // old rule really would have stripped it (and then refused the tail as `badarg`, sending
+    // nothing). The payload byte at `2 + n` is `0xAB` — no address tag — which is what pinned the
+    // mistake to a refusal rather than a send to the wrong endpoint.
+    let payload = vec![0xABu8; 512];
+    let mut arg = loopback_arg(target);
+    assert_eq!(arg[0], INET_AF_INET, "the plain form leads with the address tag");
+    assert_eq!(arg[2], ETF_VERSION_MAGIC, "the target port's low byte is 0x83");
+    let n = usize::from(u16::from_be_bytes([arg[0], arg[1]]));
+    arg.extend_from_slice(&payload);
+    assert!(
+        arg.len() >= 2 + n,
+        "the argument is long enough for the old prefix rule to have fired (len {}, 2 + n {})",
+        arg.len(),
+        2 + n,
+    );
+
+    assert_eq!(
+        rig.control("send", &arg).expect("the plain command is accepted"),
+        ctl_ok(),
+        "the plain form is authoritative: the command is sent, not stripped",
+    );
+    assert_eq!(
+        receive_one(&receiver),
+        payload,
+        "the receiver sees the whole payload — the address was consumed and nothing was stripped",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The queued write path (`port_command`): the C's datagram grammar over the output queue
+// ---------------------------------------------------------------------------
+
+/// `INET_REQ_GETSTAT` (`inet_drv.c:816`).
+const INET_REQ_GETSTAT: u32 = 11;
+/// `INET_STAT_SEND_CNT` — the `send_cnt` record (`inet_drv.c:824`).
+const INET_STAT_SEND_CNT: u8 = 5;
+/// `INET_STAT_SEND_OCT` — the 64-bit `send_oct` record (`inet_drv.c:829`).
+const INET_STAT_SEND_OCT: u8 = 10;
+
+/// The `INET_REQ_GETSTAT` reply for the given counter codes, driven through the **numeric** control
+/// route (`erlang:port_control/3`'s opcode).
+fn getstat(rig: &mut Rig, codes: &[u8]) -> Vec<u8> {
+    rig.control(&(CONTROL_MAGIC + INET_REQ_GETSTAT).to_string(), codes)
+        .expect("getstat")
+}
+
+/// The `(send_cnt, send_oct)` pair `INET_REQ_GETSTAT` reports — the counters
+/// `inet_output_count(desc, len)` (`inet_drv.c:11560`) feeds with the **payload only**.
+fn send_counters(rig: &mut Rig) -> (u32, u64) {
+    let reply = getstat(rig, &[INET_STAT_SEND_CNT, INET_STAT_SEND_OCT]);
+    assert_eq!(reply[0], INET_REP_OK, "getstat answers [1]: {reply:?}");
+    assert_eq!(reply[1], INET_STAT_SEND_CNT, "the 5-byte send_cnt record");
+    let cnt = u32::from_be_bytes([reply[2], reply[3], reply[4], reply[5]]);
+    assert_eq!(reply[6], INET_STAT_SEND_OCT, "the 9-byte send_oct record");
+    let oct = u64::from_be_bytes([
+        reply[7], reply[8], reply[9], reply[10], reply[11], reply[12], reply[13], reply[14],
+    ]);
+    (cnt, oct)
+}
+
+/// A **caller-reference-prefixed** queued command on an **open but unconnected** socket reaches the
+/// address the command carries: `packet_inet_command` parses
+/// `[address][anc_len:be32][anc_data][data]` on every command, connected or not
+/// (`inet_drv.c:15139`-`:15158`), and `sendto(2)`s it when the socket has no default peer
+/// (`:15174`-`:15182`). That is the path `prim_inet:sendto/4` (`prim_inet.erl:652`-`:700`) —
+/// `gen_udp:send/4` — drives, which is why refusing it made a plain datagram send fail.
+///
+/// The queue is drained whole (the command's prefix/address/ancillary-length bytes have no
+/// counterpart on the wire) and the statistics see the payload **only**.
+#[test]
+fn an_unconnected_queued_command_is_sent_to_the_address_it_carries() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    let source_port = rig.bind_ephemeral();
+
+    let command = prefixed_command(target, &[], b"queued");
+    rig.queue_output(&command);
+    assert_eq!(
+        rig.drain_output()
+            .expect("an open socket sends the queued command"),
+        command.len(),
+        "the whole command (prefix, address, ancillary-length word and payload) is consumed",
+    );
+    assert_eq!(rig.output_len(), 0, "the queue is drained");
+    let mut buf = [0u8; 64];
+    let (len, from) = receiver
+        .recv_from(&mut buf)
+        .expect("the datagram reaches the address the command carries");
+    assert_eq!(
+        &buf[..len],
+        b"queued",
+        "the receiver sees exactly the payload"
+    );
+    assert_eq!(
+        from.port(),
+        source_port,
+        "and it comes from the port's own bound socket",
+    );
+
+    // `inet_output_count(desc, len)` counts the payload only — never the tag, the packed address
+    // or the ancillary-length word — and it counts at issue time.
+    assert_eq!(
+        send_counters(&mut rig),
+        (1, 6),
+        "one output command of the 6-byte payload",
+    );
+}
+
+/// The same command on a **connected** socket: the address is still parsed (and must parse), then
+/// ignored — the C's "Even if it is connected, there is an address prefix here -- ignored for
+/// connected sockets" (`inet_drv.c:15142`-`:15145`) and its `INET_F_ACTIVE` arm (`:15164`-`:15173`).
+/// The command names a *different* datagram socket, and the connected peer is what receives it.
+#[test]
+fn a_connected_queued_command_ignores_the_address_it_carries() {
+    let peer = udp_receiver();
+    let peer_port = peer.local_addr().expect("an address").port();
+    let elsewhere = udp_receiver();
+    let elsewhere_port = elsewhere.local_addr().expect("an address").port();
+
+    let mut rig = Rig::new();
+    let source_port = rig.bind_ephemeral();
+    let connect = loopback_arg(peer_port);
+    assert_eq!(rig.control("connect", &connect).expect("connect"), ctl_ok());
+
+    let command = prefixed_command(elsewhere_port, &[], b"connected");
+    rig.queue_output(&command);
+    assert_eq!(
+        rig.drain_output()
+            .expect("a connected socket sends the command"),
+        command.len(),
+    );
+    let mut buf = [0u8; 64];
+    let (len, from) = peer
+        .recv_from(&mut buf)
+        .expect("the datagram goes to the connected peer");
+    assert_eq!(&buf[..len], b"connected");
+    assert_eq!(from.port(), source_port);
+    assert_eq!(
+        send_counters(&mut rig),
+        (1, 9),
+        "the payload alone is counted",
+    );
+}
+
+/// The queued form **is** the C's grammar, so the ancillary-length word is mandatory: a command in
+/// the `send` verb's `[address][data]` convenience shape is the C's `return_einval`
+/// (`inet_drv.c:15155`, `len < 4` after the address, or `:15158`, `len < anc_len`) — a typed
+/// `BeamError::BadArg` here, with the bytes left queued so nothing is lost.
+#[test]
+fn a_queued_command_without_the_ancillary_length_word_is_refused_and_keeps_its_bytes() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+
+    // `[address][payload]` — the verb's shape. Its first payload byte reads as an ancillary length
+    // no payload can satisfy, which is `split_datagram`'s `DatagramCommand::Einval`.
+    let mut command = loopback_arg(target);
+    command.extend_from_slice(b"hi");
+    rig.queue_output(&command);
+    assert!(
+        matches!(rig.drain_output(), Err(BeamError::BadArg)),
+        "the C's einval guard is a typed refusal here",
+    );
+    assert_eq!(
+        rig.output_len(),
+        command.len(),
+        "the bytes are never consumed"
+    );
+    assert!(
+        matches!(rig.drain_output(), Err(BeamError::BadArg)),
+        "a re-driven round refuses identically instead of losing the bytes",
+    );
+    assert_eq!(rig.output_len(), command.len());
+    assert_eq!(
+        send_counters(&mut rig),
+        (0, 0),
+        "a refused command never reaches the counters",
+    );
+}
+
+/// A non-zero ancillary length is the C's `sendmsg(2)`-with-cmsgs arm (`inet_drv.c:15220`-`:15230`),
+/// which this floor has no seam for: the typed `unsupported` raise, never a send with the ancillary
+/// bytes dropped or mistaken for payload. The queued bytes stay queued.
+#[test]
+fn a_queued_command_with_ancillary_data_is_the_typed_unsupported() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+
+    let command = prefixed_command(target, &[1, 2, 3, 4], b"payload");
+    rig.queue_output(&command);
+    let reason = reason_of(
+        rig.drain_output()
+            .expect_err("ancillary data is not served"),
+    );
+    assert_eq!(
+        reason,
+        "unsupported: udp ancillary data (sendmsg cmsg) is not served by this driver floor",
+    );
+    assert_eq!(
+        rig.output_len(),
+        command.len(),
+        "the bytes are never consumed"
+    );
+    assert_eq!(
+        send_counters(&mut rig),
+        (0, 0),
+        "nothing was issued to the wire",
+    );
+}
+
+/// A plain (un-prefixed) queued command is the same grammar without the caller-reference tag, which
+/// is what a direct `erlang:port_command/2` on a `udp_inet` port carries.
+#[test]
+fn a_plain_queued_command_carries_the_ancillary_length_word() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+
+    let mut command = loopback_arg(target);
+    command.extend_from_slice(&0u32.to_be_bytes());
+    command.extend_from_slice(b"plain");
+    rig.queue_output(&command);
+    assert_eq!(
+        rig.drain_output()
+            .expect("a plain queued command is accepted"),
+        command.len(),
+    );
+    assert_eq!(receive_one(&receiver), b"plain");
+    assert_eq!(
+        send_counters(&mut rig),
+        (1, 5),
+        "the payload alone is counted"
+    );
+}
+
+/// The oracle's side of the same path: `gen_udp:send/4` → `prim_inet:sendto/4`
+/// (`erts/preloaded/src/prim_inet.erl:652`-`:700`), which queues the caller-reference-prefixed
+/// command and waits for the `{inet_reply, …}` message. Only the **observable datagram** is
+/// compared — its payload and the source port the oracle's own socket reports — because the reply
+/// message is the `driver_caller`-gated shape this crate cannot send (see the module docs).
+///
+/// **Skips loudly** when `erl` is not on `PATH`.
+#[test]
+fn the_queued_command_delivery_agrees_with_the_erl_oracle() {
+    let oracle_receiver = udp_receiver();
+    let oracle_target = oracle_receiver.local_addr().expect("an address").port();
+    let expr = format!(
+        "{{ok, S}} = gen_udp:open(0, [binary, {{ip, {{127,0,0,1}}}}, {{active, false}}]), \
+         Reply = gen_udp:send(S, {{127,0,0,1}}, {oracle_target}, <<\"queued\">>), \
+         {{ok, {{_, SrcPort}}}} = inet:sockname(S), \
+         io:format(\"~p|~p\", [Reply, SrcPort]), \
+         gen_udp:close(S)"
+    );
+    let Some(dump) = erl_stdout(&expr) else {
+        eprintln!("SKIP: no `erl` on PATH — skipping the queued-command delivery oracle check");
+        return;
+    };
+    let dump = String::from_utf8_lossy(&dump);
+    let (reply, oracle_source) = dump
+        .split_once('|')
+        .unwrap_or_else(|| panic!("the oracle prints `Reply|SrcPort`: {dump:?}"));
+    assert_eq!(
+        reply, "ok",
+        "the oracle's gen_udp:send/4 succeeds: {dump:?}"
+    );
+    let oracle_source: u16 = oracle_source
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("the oracle prints its source port: {dump:?}"));
+    let mut buf = [0u8; 64];
+    let (len, from) = oracle_receiver
+        .recv_from(&mut buf)
+        .expect("the oracle's datagram arrives");
+    assert_eq!(&buf[..len], b"queued", "the oracle sends the payload alone");
+    assert_eq!(
+        from.port(),
+        oracle_source,
+        "and it comes from the port the oracle's socket reports",
+    );
+
+    // The Rust side: the same command shape through the port queue, delivering the same datagram
+    // with the same payload/source-port relationship.
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    let source_port = rig.bind_ephemeral();
+    rig.queue_output(&prefixed_command(target, &[], b"queued"));
+    let drained = rig.drain_output().expect("the queued command is sent");
+    assert!(drained > 0, "the queue was drained");
+    let (len, from) = receiver
+        .recv_from(&mut buf)
+        .expect("the Rust driver's datagram arrives");
+    assert_eq!(&buf[..len], b"queued", "the same payload the oracle sent");
+    assert_eq!(
+        from.port(),
+        source_port,
+        "from the bound port, as the oracle's comes from its socket's port",
+    );
+    // The reply differs by construction: the oracle's `ok` is the `{inet_reply, …}` message, which
+    // needs a driver→owner channel; here the drain's byte count is the whole observable outcome.
+    assert_eq!(
+        send_counters(&mut rig),
+        (1, 6),
+        "the payload alone is counted"
     );
 }

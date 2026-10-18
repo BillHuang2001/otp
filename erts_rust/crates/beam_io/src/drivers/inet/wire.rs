@@ -340,25 +340,65 @@ pub(super) fn errno_name(errno: i32) -> String {
 // once per driver. Each builder is a faithful port of the corresponding C arm; where this floor
 // cannot produce the C's payload it is a typed error, never a fabricated reply.
 
-/// The `INET_REQ_GETSTAT` reply (the C's `inet_fill_stat`, `inet_drv.c:10732`).
+/// The `INET_REQ_GETSTAT` reply (the C's `inet_fill_stat`, `inet_drv.c:10732`-`:10792`).
+///
+/// The reply is the leading [`INET_REP_OK`] tag followed by one record per requested
+/// `INET_STAT_*` op byte **in request order**: the op byte itself, then the counter. Ops 9
+/// (`recv_oct`) and 10 (`send_oct`) carry a big-endian **64-bit** value (`put_int64`, the
+/// `ARCH_64` path at `:10768`-`:10785`); every other op carries the C's `put_int32` big-endian
+/// **32-bit** value (`:10788`), which truncates the running doubles (`(unsigned long)
+/// desc->recv_avg`, `(unsigned long) fabs(desc->recv_dvi)`) and the peak sizes.
+///
+/// `send_pend` (op 8) is the C's `driver_sizeq(desc->port)` — the port's **current** output-queue
+/// byte count, which the caller reads off the [`crate::DriverContext`] rather than off the
+/// counter block.
 ///
 /// An **empty** request answers the bare success tag — the C's `fill_stat` writes a record only
 /// for each requested counter, so nothing requested means nothing appended (measured `[1]` on
-/// both drivers' bare ports).
+/// both drivers' bare ports). There is **no `IS_OPEN` guard**: a socket-less port answers fully
+/// zeroed counters.
 ///
 /// # Errors
 ///
-/// [`beam_common::BeamError`] carrying the typed "not served" reason for a non-empty request: the
-/// C's statistics counters (`recv_cnt`/`send_cnt`/`recv_oct`/`send_oct`/…) live on the driver's
-/// descriptor and are not tracked by this floor, and answering a zeroed counter would be a wrong
-/// value rather than a missing one.
-pub(super) fn getstat_reply(arg: &[u8]) -> Result<Vec<u8>> {
-    if arg.is_empty() {
-        return Ok(ctl_ok());
+/// [`beam_common::BeamError::BadArg`] for a request containing an op byte outside 1-10: the C's
+/// `inet_fill_stat` `default: return -1` (`:10786`) makes the driver's `control` callback return
+/// negative, which `erlang:port_control/3` raises as the bare atom `badarg` — the whole reply is
+/// discarded, so nothing partial escapes.
+pub(super) fn getstat_reply(
+    arg: &[u8],
+    stats: &super::stat::InetStat,
+    send_pend: usize,
+) -> Result<Vec<u8>> {
+    let mut reply = ctl_ok();
+    for &op in arg {
+        // The C's `put_int32` copies the low 32 bits (`sys.h:1286`), so every 32-bit record
+        // truncates rather than saturating — `as u32` on an integer is that same truncation.
+        let word: u32 = match op {
+            1 => stats.recv_cnt as u32,
+            2 => stats.recv_max as u32,
+            3 => stats.recv_avg as u32,
+            4 => stats.recv_dvi.abs() as u32,
+            5 => stats.send_cnt as u32,
+            6 => stats.send_max as u32,
+            7 => stats.send_avg as u32,
+            8 => send_pend as u32,
+            9 => {
+                reply.push(op);
+                reply.extend_from_slice(&stats.recv_oct.to_be_bytes());
+                continue;
+            }
+            10 => {
+                reply.push(op);
+                reply.extend_from_slice(&stats.send_oct.to_be_bytes());
+                continue;
+            }
+            // The C's `default: return -1` — propagated as `badarg` by `port_control/3`.
+            _ => return Err(error::badarg()),
+        };
+        reply.push(op);
+        reply.extend_from_slice(&word.to_be_bytes());
     }
-    Err(error::unsupported(
-        "the C's inet statistics counters (inet_fill_stat) are not tracked by this driver",
-    ))
+    Ok(reply)
 }
 
 /// The `INET_REQ_GETTYPE` reply: the descriptor's **cached** `{Family, Type}` pair
@@ -540,6 +580,106 @@ pub(super) fn split_address(arg: &[u8]) -> Result<(InetAddr, &[u8])> {
     }
     let address = parse_address(&arg[..consumed])?;
     Ok((address, &arg[consumed..]))
+}
+
+/// The first byte of every `term_to_binary/1` blob: the external-term-format version byte
+/// (`VERSION_MAGIC`, decimal `131` / `0x83`, `erts/emulator/beam/external.h`).
+///
+/// It is the discriminator [`split_caller_ref`] keys on: `prim_inet` wraps its caller reference
+/// in `term_to_binary(Mref, [local])` (`erts/preloaded/src/prim_inet.erl:575`-`:620`), so the
+/// tag's first byte is always this one.
+pub(super) const ETF_VERSION_MAGIC: u8 = 131;
+
+/// Strips the `prim_inet` **caller-reference prefix**, if `arg` carries one: the wire form is
+/// `[tag_len:be16][tag_bytes][rest]`, the tag being `term_to_binary(Mref, [local])` for
+/// `Mref = monitor(port, S)` (`erts/preloaded/src/prim_inet.erl:575`-`:620` for `send/3`,
+/// `:650`-`:700` for `do_sendto/4`).
+///
+/// The C strips exactly this prefix in `init_caller`/`init_caller_iov`
+/// (`erts/emulator/drivers/common/inet_drv.c:1820`-`:1890`): read the 16-bit `n`, skip it and the
+/// `n` tag bytes, keeping the tag so the later `{inet_reply, S, Reply, Ref}` message can echo it
+/// (`inet_reply_caller_ref`, `:2610`-`:2660`). The C only does so when `driver_caller(port)` is
+/// an internal pid.
+///
+/// **This crate's [`Driver`](crate::Driver)/[`DriverContext`](crate::DriverContext) seam carries
+/// no caller**, so the receiving side has to decide from the payload alone: a `[n:be16][n
+/// bytes]` prefix whose `n` is non-zero, fits inside `arg`, and whose first tag byte is
+/// [`ETF_VERSION_MAGIC`] is treated as a caller reference.
+///
+/// Returns the bytes **after** the prefix, or `None` when `arg` is not in that form (the caller
+/// then falls back to the plain `[address][data]` grammar).
+///
+/// # Only a fallback — the plain form is authoritative
+///
+/// A plain command's first byte is an address family tag and byte 2 is the target port's **low**
+/// byte, so a plain command *can* satisfy this shape (e.g. `n` = `0x0100 + port_hi` with
+/// `port_lo == 0x83`). [`UdpInetDriver::verb_send`](super::udp) therefore tries the plain
+/// `[address][data]` grammar **first** and only calls this function when that refuses; a genuinely
+/// prefixed command always survives that order because a `prim_inet` tag's 16-bit length has a
+/// zero high byte (`term_to_binary/1` of a monitor reference is ~15 bytes), never a valid address
+/// tag (1/3/4).
+///
+/// Residual: a *prefixed* command whose tag length is ≥ 256 would have a first byte of 1/3/4 and
+/// be read as plain. `prim_inet:send/3`'s reference tag is far smaller, so that cannot arise from
+/// the protocol this function exists for.
+pub(super) fn split_caller_ref(arg: &[u8]) -> Option<&[u8]> {
+    let n = usize::from(u16::from_be_bytes([*arg.first()?, *arg.get(1)?]));
+    // `init_caller`'s `*size_p < 2` / `*size_p < n` guards: a zero-length or otherwise
+    // non-fitting tag carries no caller reference at all.
+    if n == 0 {
+        return None;
+    }
+    if *arg.get(2)? != ETF_VERSION_MAGIC {
+        return None;
+    }
+    // `None` when `2 + n` overruns the argument: the C's `*size_p < n` refusal.
+    arg.get(2 + n..)
+}
+
+/// The outcome of decoding the C's datagram command operand,
+/// `[address][anc_len:be32][anc_data][data]` (`packet_inet_command`,
+/// `erts/emulator/drivers/common/inet_drv.c:15205`-`:15230`).
+pub(super) enum DatagramCommand<'a> {
+    /// `anc_len == 0`: send `data` to `address` (`inet_drv.c:15220`).
+    Send(InetAddr, &'a [u8]),
+    /// The C's `return_einval` (`:15205`/`:15212`): fewer than four bytes follow the address, or
+    /// fewer than the ancillary-length word asks for. The caller renders it as
+    /// `[0] ++ "einval"` (`ctl_xerror`), exactly as the C does.
+    Einval,
+}
+
+/// Decodes the C's `[address][anc_len:be32][anc_data][data]` datagram operand — the body
+/// `packet_inet_command` runs once the caller-reference prefix is off
+/// (`inet_drv.c:15205`-`:15230`).
+///
+/// The ancillary length must be **zero**: the C's non-zero arm builds an `msghdr` with the
+/// caller's cmsgs and calls `sendmsg(2)` (`:15220`-`:15230`), a path this floor has no seam for,
+/// so it is a typed [`error::unsupported`] rather than a send with the ancillary data silently
+/// dropped or sent as payload.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] when no packed address leads the argument (the C's
+/// `inet_set_faddress` failure, which it answers with `inet_reply_error_am(xerror)`), and the
+/// typed `unsupported` raise for a non-zero ancillary length.
+pub(super) fn split_datagram(arg: &[u8]) -> Result<DatagramCommand<'_>> {
+    let (address, rest) = split_address(arg)?;
+    if rest.len() < 4 {
+        // `if (len < 4) goto return_einval` (`:15205`).
+        return Ok(DatagramCommand::Einval);
+    }
+    let anc_len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let data = &rest[4..];
+    if data.len() < anc_len {
+        // `if (len < anc_len) goto return_einval` (`:15212`).
+        return Ok(DatagramCommand::Einval);
+    }
+    if anc_len != 0 {
+        return Err(error::unsupported(
+            "udp ancillary data (sendmsg cmsg) is not served by this driver floor",
+        ));
+    }
+    Ok(DatagramCommand::Send(address, data))
 }
 
 /// What one `INET_REQ_SETNAME`/`INET_REQ_SETPEER` operand asks of the driver.

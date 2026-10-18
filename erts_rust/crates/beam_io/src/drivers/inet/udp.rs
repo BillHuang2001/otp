@@ -48,7 +48,7 @@
 //! | `open` | `INET_REQ_OPEN` (`:14577`) | `[AF, TYPE, PROTO]` (3 bytes) | `[1]`, `[0] ++ "eafnosupport"`, `[0] ++ "einval"` or `[0] ++ "eprotonosupport"` |
 //! | `bind` | `INET_REQ_BIND` (`:11409`) | packed address | `[1, port_hi, port_lo]` |
 //! | `connect` | `INET_REQ_CONNECT` (`:14710`) | packed address (the C's 4-byte timeout prefix is accepted and skipped) | `[1]`, or `[0] ++ errno` |
-//! | `send` | `packet_inet_command` (`:15037`) | `[address][payload]` | `[1]`, or `[0] ++ errno` |
+//! | `send` | `packet_inet_command` (`:15037`) | `[address][anc_len:be32][data]`, optionally behind a `prim_inet` caller-reference prefix `[n:be16][tag]` | `[1]`, or `[0] ++ errno` |
 //! | `recv` | `PACKET_REQ_RECV` (`:14968`) | — (read-now) | `[1] ++ src_address` with a datagram, the bare `[1]` when none is pending, `[0] ++ errno` on failure |
 //! | `close` | `INET_REQ_CLOSE` (`:14701`) | — | `[1]` |
 //! | `setopts` | `INET_REQ_SETOPTS` (`:11111`) | option records `[opt, val_be32]*` | `[1]`, or `[0] ++ "einval"` |
@@ -104,6 +104,16 @@
 //! * **`INET_REQ_PEER` (code `4`)** — the UDP half does not implement the peer query, so it is
 //!   not a verb here at all (it is reached only through the control code, which this node does
 //!   not decode).
+//! * **The `{inet_reply, S, Reply, Ref}` message** — the C reports a queued command's outcome
+//!   that way, echoing the tag bytes of the `prim_inet` caller-reference prefix
+//!   (`inet_reply_caller_ref`, `:2610`-`:2660`), which needs a driver→owner message channel this
+//!   crate does not have. Both write paths **accept and strip** that prefix (the `send` verb,
+//!   [`UdpInetDriver::verb_send`], and the queued `port_command` path,
+//!   [`UdpInetDriver::write_pending`]), so the datagram itself is delivered; what is missing is
+//!   the reply, so a `prim_inet` caller that waits for it after a successful `port_command`
+//!   (`do_sendto/4`, `erts/preloaded/src/prim_inet.erl:678`-`:683`) has no counterpart here. The
+//!   verb's own answer stays the synchronous `ctl_reply` bytes, and a refused queued command
+//!   surfaces as a typed error instead of that message.
 //! * **IPv6, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
 //!   `AF_INET`/`SOCK_DGRAM` and `bind`/`connect`/`send` only the packed
 //!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms.
@@ -137,7 +147,7 @@
 
 use std::os::unix::io::RawFd;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 
 use crate::driver::{Driver, DriverContext};
 use crate::drivers::fd::set_nonblocking;
@@ -151,9 +161,9 @@ use super::sys::{
     recv_from, send_connected, send_to, socket_type,
 };
 use super::wire::{
-    ctl_error, ctl_ok, ctl_xerror, pack_address, parse_address, split_address, InetAddr,
-    INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_PROTO_UDP,
-    INET_TYPE_DGRAM, INET_TYPE_STREAM,
+    ctl_error, ctl_ok, ctl_xerror, pack_address, parse_address, split_address, split_caller_ref,
+    split_datagram, DatagramCommand, InetAddr, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK,
+    INET_PROTO_DEFAULT, INET_PROTO_UDP, INET_TYPE_DGRAM, INET_TYPE_STREAM,
 };
 use super::InetState;
 
@@ -182,8 +192,9 @@ pub struct UdpInetDriver {
     /// [`InetState::Connected`] after a successful `connect`, [`InetState::Closed`] otherwise.
     state: InetState,
     /// The driver-state socket options the `setopts`/`getopts` verbs store and report
-    /// ([`SocketOptions`]). The driver's socket is always a datagram socket, so the shared
-    /// store is always driven with its stream gate off.
+    /// ([`SocketOptions`]). The shared store is driven with this port's cached [`Self::stype`],
+    /// so the datagram-gated `{read_packets, N}` (code `33`) follows the C's
+    /// `desc->stype == SOCK_DGRAM` test rather than a fixed socket type.
     options: SocketOptions,
     /// The C descriptor's **cached** address family (`desc->sfamily`) as a wire tag, `0` meaning
     /// "unset". `INET_REQ_GETTYPE` reports this cache rather than probing the socket
@@ -202,8 +213,20 @@ pub struct UdpInetDriver {
     /// [`UdpInetDriver::name_addr`], reported by `INET_REQ_PEER` **after** its connection guard
     /// (`inet_drv.c:11282`-`:11290`).
     peer_addr: Option<InetAddr>,
+    /// The descriptor's statistics counters (the C's `inet_descriptor` block,
+    /// `inet_drv.c:11560`-`:11623`; see [`super::stat::InetStat`]): advanced where a datagram is
+    /// delivered to the port (input) or a command is issued (output), and rendered by
+    /// `INET_REQ_GETSTAT`. Zeroed by construction, as `inet_init_desc` leaves it.
+    stat: super::stat::InetStat,
+    /// The C's `desc->prebound` flag (`inet_drv.c:5266`): set by the `INET_REQ_FDOPEN` adoption,
+    /// which takes a **caller-owned** descriptor over. A prebound descriptor is never `close(2)`d
+    /// — the C's `erl_inet_close` only drops the select registration for one and leaves
+    /// `desc->s`/`desc->state` untouched (`:5102`-`:5117`) — so neither a close nor a `Drop` may
+    /// release it (see [`UdpInetDriver::adopt_prebound`] and [`UdpInetDriver::close_socket`]).
+    /// Every route that installs a driver-**owned** socket (`open`/[`UdpInetDriver::from_socket`])
+    /// clears it.
+    prebound: bool,
 }
-
 impl UdpInetDriver {
     /// A UDP driver with no socket yet: the state a freshly opened port starts in.
     ///
@@ -223,9 +246,10 @@ impl UdpInetDriver {
             stype: 0,
             name_addr: None,
             peer_addr: None,
+            stat: super::stat::InetStat::default(),
+            prebound: false,
         }
     }
-
     /// Adopts an existing datagram socket, taking ownership of `fd` (closed on
     /// `stop`/`close`/`Drop`).
     ///
@@ -258,9 +282,10 @@ impl UdpInetDriver {
             stype: socket_type(fd)?,
             name_addr: None,
             peer_addr: None,
+            stat: super::stat::InetStat::default(),
+            prebound: false,
         })
     }
-
     /// The socket this port owns, if one has been opened.
     pub fn socket(&self) -> Option<RawFd> {
         self.socket
@@ -287,6 +312,9 @@ impl UdpInetDriver {
                 self.socket = Some(fd);
                 self.token = Some(token);
                 self.interest = Interest::READABLE;
+                // An `open` descriptor is the driver's own (closed on teardown), so this port is
+                // no longer holding a caller's `INET_REQ_FDOPEN` descriptor.
+                self.prebound = false;
                 Ok(())
             }
             Err(err) => {
@@ -296,6 +324,60 @@ impl UdpInetDriver {
         }
     }
 
+    /// Adopts a **caller-owned** descriptor: the C's `inet_ctl_fdopen`
+    /// (`inet_drv.c:5223`-`:5282`), the body behind `packet_inet_ctl`'s `INET_REQ_FDOPEN` arm.
+    ///
+    /// This is [`UdpInetDriver::adopt`]'s prebound twin, and the difference is **ownership**: the
+    /// descriptor belongs to whoever handed it to `INET_REQ_FDOPEN`, so it is never closed here —
+    /// not on a failed `set_nonblocking(2)`, not on a failed poller registration, not by
+    /// [`UdpInetDriver::close_socket`] and not by `Drop`. `prebound` records that, exactly as the
+    /// C's `desc->prebound = 1` does (`:5266`), which its close path honours by only dropping the
+    /// select registration (`erl_inet_close`, `:5102`-`:5117`).
+    ///
+    /// `stype` is the `INET_TYPE_*` tag the request's operand carried — the datagram driver
+    /// admits both the stream and the datagram tag (`packet_inet_ctl`, `:14671`), and the caller
+    /// has already run the length/family/type ladder plus the `sock_name(2)` pre-check
+    /// ([`super::wire::fdopen_precheck`]). The lifecycle state is the C's: [`InetState::Open`],
+    /// promoted to [`InetState::Connected`] only when a `SOCK_STREAM` adoption has a peer — the
+    /// C's `sock_peer` probe (`:5252`-`:5260`), which the C also runs solely for a stream, so an
+    /// adopted datagram socket is always reported as `INET_STATE_OPEN`.
+    ///
+    /// # Errors
+    ///
+    /// `BeamError::Io` when `fd` cannot be put into non-blocking mode, when the `getpeername(2)`
+    /// probe fails for a reason other than "not connected", or when the poller rejects it. The
+    /// descriptor is **not** closed on any of those paths, and the driver is left untouched when
+    /// one of them fires.
+    fn adopt_prebound(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        fd: RawFd,
+        stype: u16,
+    ) -> Result<()> {
+        set_nonblocking(fd)?;
+        // The C's `sock_peer` probe for a stream (`:5252`-`:5260`), taken **before** any field is
+        // touched so a failing probe leaves the driver exactly as it was.
+        let connected = stype == u16::from(INET_TYPE_STREAM) && has_peer(fd)?;
+        let token = match ctx.register(fd, Interest::READABLE) {
+            Ok(token) => token,
+            // Deliberately **no** `close_fd`: the descriptor is the caller's (see the docs above),
+            // which is the one behavioural difference from [`UdpInetDriver::adopt`].
+            Err(err) => return Err(err),
+        };
+        self.socket = Some(fd);
+        self.token = Some(token);
+        self.interest = Interest::READABLE;
+        self.state = if connected {
+            InetState::Connected
+        } else {
+            InetState::Open
+        };
+        // `desc->prebound = 1; desc->stype = type; desc->sfamily = domain` (`:5266`-`:5269`).
+        self.prebound = true;
+        self.family = u16::from(INET_AF_INET);
+        self.stype = stype;
+        Ok(())
+    }
     /// Changes the socket's registered interest mask (registering it the first time).
     ///
     /// # Errors
@@ -327,13 +409,24 @@ impl UdpInetDriver {
     ///
     /// Used after [`UdpInetDriver::deregister`] and by `Drop` (which has no poller to
     /// de-register with). Taking the field first makes it idempotent.
+    ///
+    /// A **prebound** descriptor is not this driver's to close: the C's `erl_inet_close`
+    /// (`inet_drv.c:5102`-`:5117`) only drops the select registration for one, leaves `desc->s`
+    /// and `desc->state` exactly as they were and issues no `close(2)` at all. The same rule holds
+    /// here — nothing is closed and no field is reset, so the descriptor number stays valid in the
+    /// OS (owned by whoever handed it to `INET_REQ_FDOPEN`) and a post-close
+    /// `GETSTATUS`/`GETFD`/`NAME` still answers what it answered before, which is what the C
+    /// does. `Drop` runs this too, so a prebound descriptor is never closed by a dropped driver
+    /// either.
     fn close_socket(&mut self) {
+        if self.prebound {
+            return;
+        }
         if let Some(fd) = self.socket.take() {
             close_fd(fd);
         }
         self.state = InetState::Closed;
     }
-
     /// De-registers **and** closes the current socket, returning the de-registration outcome.
     ///
     /// # Errors
@@ -346,51 +439,119 @@ impl UdpInetDriver {
         result
     }
 
-    /// Drains the port's output queue to the socket as datagrams, returning the number of bytes
-    /// written.
+    /// Counts and sends one datagram: the C's `inet_output_count(desc, len)` at
+    /// `inet_drv.c:15163` followed by its `INET_F_ACTIVE` split (`:15164`-`:15182`).
     ///
-    /// This is the port's *output* callback (the C's `packet_inet_command`), reached only when
-    /// something queued bytes and scheduled an `OUTPUT` task. A datagram send is atomic, so a
-    /// "short write" cannot occur — but the queue may still hold more than one command, and each
-    /// iteration sends the contiguous remainder as one datagram.
-    ///
-    /// Only a **connected** socket can be written from a queue: a datagram needs a destination,
-    /// and the unconnected case carries it in the `send` verb's argument (see
-    /// [`UdpInetDriver::verb_send`], which calls `sendto(2)` directly and never queues). So a
-    /// queued command on a socket-less or unconnected port is a **refusal**, not a silent success:
-    /// the C's `packet_inet_command` guards the send with `!IS_OPEN` and fails the port
-    /// (`inet_drv.c:15051`), and its queue-draining form expects the `[address][data]` grammar —
-    /// a bare port command carries no address at all, so nothing in the queue can name a peer.
-    /// **The queued bytes are never consumed** on that path: the caller learns the command was
-    /// refused, and the queue keeps exactly what it was given.
+    /// The counters see the **payload only** — never a caller-reference prefix, the packed
+    /// address or the ancillary-length word — and are advanced at issue time, before the syscall,
+    /// so a failed send still counted it. A **connected** socket sends with `send(2)` and ignores
+    /// `address`; an unconnected one `sendto(2)`s to it. Both the `send` verb
+    /// ([`UdpInetDriver::verb_send`]) and the queued write path
+    /// ([`UdpInetDriver::write_pending`]) go through here, so the two cannot diverge.
     ///
     /// # Errors
     ///
-    /// [`beam_common::BeamError::BadArg`] when the port has no socket, or has one that is not
-    /// connected (`inet_drv.c:15051`) — the queued bytes stay queued, never silently dropped.
-    /// `BeamError::Io` when a send fails irrecoverably.
+    /// The raw `send(2)`/`sendto(2)` failure — the caller decides whether it is a `[0]`-tagged
+    /// reply (the verb) or a retry/keep-the-remainder case (the queue). A datagram send is atomic,
+    /// so a successful call reports the whole `payload.len()`.
+    fn send_datagram(
+        &mut self,
+        fd: RawFd,
+        address: InetAddr,
+        payload: &[u8],
+    ) -> std::io::Result<usize> {
+        self.stat.output(payload.len());
+        if self.state.is_connected() {
+            send_connected(fd, payload)
+        } else {
+            send_to(fd, payload, &address)
+        }
+    }
+
+    /// Drains the port's output queue to the socket as datagrams, returning how many bytes were
+    /// taken off the **queue**.
+    ///
+    /// This is the port's *output* callback (the C's `packet_inet_command`,
+    /// `inet_drv.c:15037`-`:15260`), reached when something queued bytes and scheduled an
+    /// `OUTPUT` task — in practice `erlang:port_command/2`, which is what `prim_inet:send/3` and
+    /// `prim_inet:do_sendto/4` issue (`erts/preloaded/src/prim_inet.erl:575`-`:700`).
+    ///
+    /// # The queued bytes are the C's datagram command, not a bare payload
+    ///
+    /// The C parses the buffer it is handed, and so does this: `[address][anc_len:be32]
+    /// [anc_data][data]`, optionally behind the `prim_inet` caller-reference prefix
+    /// `[tag_len:be16][tag_bytes]`. The address is **always** parsed and must parse, even on a
+    /// connected socket, which then ignores it — the C's own comment at `:15142`-`:15145` ("Even
+    /// if it is connected, there is an address prefix here -- ignored for connected sockets").
+    /// [`decode_queued_command`] carries the wire forms and why the plain one is tried first.
+    ///
+    /// # Connected vs unconnected (the C's `INET_F_ACTIVE` split)
+    ///
+    /// An **open** socket is enough: one with a default peer sends with `send(2)`
+    /// (`:15164`-`:15173`), one without `sendto(2)`s to the address the command carries
+    /// (`:15174`-`:15182`) — which is exactly what the address prefix is for. The C's only state
+    /// guard is `!IS_OPEN` (`:15068`-`:15077`), so a port with **no socket** is the one state that
+    /// refuses the command.
+    ///
+    /// # Refusals
+    ///
+    /// A socket-less port (the C's `!IS_OPEN`), an operand in neither wire form, the C's two
+    /// `return_einval` guards (`:15155`/`:15158`) and an unparsable address (its
+    /// `inet_set_faddress` failure, `:15146`-`:15150`) are the typed
+    /// [`beam_common::BeamError::BadArg`]; a non-zero ancillary length is the typed `unsupported`
+    /// raise (the C's `sendmsg` cmsg arm, `:15220`, which this floor has no seam for). In every
+    /// case the **queued bytes are never consumed**, so the caller learns the command was refused
+    /// instead of losing it. The C answers an `{inet_reply, S, {error, Reason}, Ref}` message
+    /// instead, which needs a driver→owner message channel this crate does not have (see the
+    /// module docs).
+    ///
+    /// # Accounting and what the return value means
+    ///
+    /// The statistics see the **payload only** ([`UdpInetDriver::send_datagram`]); the returned
+    /// count is a different quantity — how many bytes were taken off the **output queue**, which
+    /// is the whole command, prefix/address/ancillary-length word included, because
+    /// [`crate::Port::check_write_accounting`] verifies exactly that against the queue.
+    ///
+    /// A datagram send is atomic, so a short write cannot occur. The queue does concatenate
+    /// commands, though, and [`crate::ByteQueue::front`] is a single contiguous run, so two
+    /// commands queued before the same round go out as **one** datagram — a limitation of the
+    /// byte-only queue (the C is handed one command per callback), not something a driver can
+    /// correct here.
+    ///
+    /// # Errors
+    ///
+    /// [`beam_common::BeamError::BadArg`] for a port with no socket (`:15068`) or a command in
+    /// neither wire form, as above — the queued bytes stay queued, never silently dropped — and
+    /// the typed `unsupported` raise for ancillary data. `BeamError::Io` when a send fails
+    /// irrecoverably.
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if ctx.output().is_empty() {
             return Ok(0);
         }
-        // No socket, or a socket with no default peer: the queue holds a bare command with no
-        // destination, which the C refuses (`:15051`). Nothing is consumed.
-        let Some(fd) = self.socket.filter(|_| self.state.is_connected()) else {
+        // The C's `!IS_OPEN` guard (`:15068`): with no socket there is no destination at all,
+        // not even one the command could name. Nothing is consumed.
+        let Some(fd) = self.socket else {
             return Err(error::badarg());
         };
-        let mut written = 0usize;
+        let mut consumed = 0usize;
         loop {
             let front = ctx.output().front();
-            let len = front.len();
-            if len == 0 {
+            let command_len = front.len();
+            if command_len == 0 {
                 break;
             }
-            match send_connected(fd, front) {
-                Ok(n) => {
-                    // A datagram send is all-or-nothing, so `n` is the whole `len`; consuming it
-                    // keeps the queue's invariant (front is always the contiguous remainder).
-                    ctx.output().consume(n);
-                    written += n;
+            // Every command the C is handed goes through this grammar (`:15139`-`:15230`), and a
+            // refused one keeps its bytes.
+            let (address, payload) = decode_queued_command(front)?;
+            let sent = self.send_datagram(fd, address, payload);
+            // `payload` borrows the queue, so the outcome is matched once that borrow is over.
+            match sent {
+                Ok(_) => {
+                    // The whole command is done with: its prefix/address/ancillary-length bytes
+                    // have no counterpart on the wire and the payload left in one atomic
+                    // datagram, so the queue's single contiguous run is consumed whole.
+                    ctx.output().consume(command_len);
+                    consumed += command_len;
                 }
                 Err(err) => match err.raw_os_error() {
                     Some(libc::EINTR) => continue,
@@ -403,7 +564,7 @@ impl UdpInetDriver {
                         break;
                     }
                     Some(libc::ECONNREFUSED) | Some(libc::ECONNRESET) | Some(libc::EPIPE) => {
-                        // The peer's port is gone (an `ICMP` port-unreachable surfaces as
+                        // The destination's port is gone (an `ICMP` port-unreachable surfaces as
                         // `ECONNREFUSED` on a connected datagram socket): the C's UDP send path
                         // reports the errno, so the queued remainder is dropped and the caller
                         // learns from the reply.
@@ -417,7 +578,7 @@ impl UdpInetDriver {
         if ctx.output().is_empty() && self.interest.is_writable() {
             self.set_interest(ctx, Interest::READABLE)?;
         }
-        Ok(written)
+        Ok(consumed)
     }
 
     /// The `open` verb: creates the datagram socket and registers it for read readiness.
@@ -582,27 +743,98 @@ impl UdpInetDriver {
 
     /// The `send` verb: sends one datagram.
     ///
-    /// Mirroring `packet_inet_command` (`:15037`-`:15182`), the argument is `[address][payload]`
-    /// — the C's `[address][anc_len:32][data]` without the ancillary-data length, which is out of
-    /// scope. The address is always parsed and consumed; whether it is **used** depends on the
-    /// socket: a **connected** socket sends with `send(2)` and ignores it (the C's
-    /// `INET_F_ACTIVE` branch, `:15164`-`:15175`), an unconnected one with `sendto(2)`.
+    /// Mirroring `packet_inet_command` (`:15037`-`:15230`), the argument carries the C's
+    /// `[address][anc_len:be32][anc_data][data]` grammar. The address is always parsed and
+    /// consumed; whether it is **used** depends on the socket: a **connected** socket sends with
+    /// `send(2)` and ignores it (the C's `INET_F_ACTIVE` branch, `:15164`-`:15175`), an
+    /// unconnected one with `sendto(2)`.
+    ///
+    /// # The two accepted wire forms
+    ///
+    /// The C strips the `prim_inet` **caller-reference prefix** before this grammar, but only
+    /// when `driver_caller(port)` is an internal pid (`init_caller`/`init_caller_iov`,
+    /// `inet_drv.c:1820`-`:1890`). This crate's [`Driver`]/[`DriverContext`] seam carries no
+    /// caller, so the form has to be recognised from the payload alone (see
+    /// [`split_caller_ref`]) — and the two rules are tried **plain form first**, so a plain
+    /// command is never mistaken for a prefixed one:
+    ///
+    /// 1. **plain form, tried first (authoritative)** — `[address][data]`, the grammar every
+    ///    direct `port_control` caller and every `port_command`-shaped probe uses. When
+    ///    [`split_address`] parses the argument, that *is* the command: the caller-reference
+    ///    prefix is never looked at. See [`split_address`] for why the ancillary length word is
+    ///    not part of this form.
+    /// 2. **caller-reference form, only when rule 1 refuses** — `[tag_len:be16][tag_bytes]
+    ///    [address][anc_len:be32][anc_data][data]`, where `tag_len` is non-zero, fits, and whose
+    ///    first tag byte is the ETF `VERSION_MAGIC` `131` (`prim_inet:send/3`'s
+    ///    `[<<Size:16, MrefBin/binary>>, Data]` and `do_sendto/4`'s
+    ///    `[<<Size:16, RefBin/binary>>, Address, AncLen, AncData, Data]`,
+    ///    `erts/preloaded/src/prim_inet.erl:575`-`:620`, `:650`-`:700`). The C's own
+    ///    `len < 4` / `len < anc_len` guards (`:15205`/`:15212`) answer `[0] ++ "einval"`; a
+    ///    **non-zero** `anc_len` is the typed `unsupported` raise (this floor has no `sendmsg`
+    ///    cmsg path — the C's `:15220`-`:15230` arm). An argument in *neither* form keeps rule 1's
+    ///    `badarg`.
+    ///
+    /// **Why the plain form can be authoritative.** A `prim_inet` caller-reference prefix starts
+    /// with the 16-bit *tag length*, so its first byte is `0` for every realistic tag (a
+    /// `term_to_binary/1` blob for `monitor/2` is ~15 bytes, far below 256) — and `0` is never a
+    /// valid address tag (1/3/4). A genuinely prefixed command therefore always fails rule 1 and
+    /// is stripped by rule 2. The reverse order is what used to break the plain form: a plain
+    /// `INET_AF_INET` command reads as `n = 0x0100 + target_port_hi` with `arg[2] =
+    /// target_port_lo` (and a plain `INET_AF_ANY`/`_LOOPBACK` command as `n = 0x0300` / `0x0400`
+    /// + `target_port_hi`), so a **target** port whose low byte is `0x83` (131) — `term_to_binary/1`'s
+    /// `VERSION_MAGIC` — plus a payload long enough for `2 + n` to fit was mistaken for a caller
+    /// reference and the tail re-parsed as a datagram. Trying the plain form first makes that
+    /// unreachable.
+    ///
+    /// **Residual (unreachable from `prim_inet:send/3`).** A prefixed command whose tag length is
+    /// 256 or more has a first byte of 1/3/4 — a valid address tag — so rule 1 parses the prefix
+    /// as an address and the command is taken as plain (the wrong payload, no strip). A
+    /// `prim_inet` caller reference is a small `term_to_binary/1` term (a `ref`/`pid` plus a
+    /// version byte and tag/arity words — tens of bytes), nowhere near 256, so this cannot arise
+    /// from `prim_inet:send/3`; only a hand-built 256+-byte tag would be misparsed.
+    ///
+    /// **Unsendable from this crate:** the C echoes the caller reference back as the fourth
+    /// element of the later `{inet_reply, S, Reply, Ref}` message (`inet_reply_finish` /
+    /// `inet_reply_caller_ref`, `:2610`-`:2660`). The frozen [`Driver`]/[`DriverContext`] seam
+    /// has no driver→owner message channel — and this floor's `send` is a **synchronous** reply
+    /// (see the module docs on the async-op queue) — so that message is not sent. The reply here
+    /// is the C's `ctl_reply` bytes, which is what a `port_control` caller reads; the
+    /// `{inet_reply, …}` shape stays a runtime-side gap. The queued `port_command` path does
+    /// **not** use this verb: it reaches [`UdpInetDriver::write_pending`], which parses the C's
+    /// queued grammar itself and accepts the same caller-reference prefix (see
+    /// [`decode_queued_command`] for its own order and residual).
     ///
     /// # Errors
     ///
-    /// `BeamError::BadArg` for an argument with no parsable leading address.
+    /// `BeamError::BadArg` for an argument with no parsable leading address, and the typed
+    /// `unsupported` raise for a caller-reference form carrying ancillary data.
     fn verb_send(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
         let Some(fd) = self.socket else {
             // The C's `!IS_OPEN` guard answers `inet_reply_error(desc, EINVAL)` (`:15051`).
             return Ok(ctl_xerror("einval"));
         };
-        let (address, payload) = split_address(arg)?;
-        let outcome = if self.state.is_connected() {
-            send_connected(fd, payload)
-        } else {
-            send_to(fd, payload, &address)
+        // Rule 1 first (the plain `[address][data]` form), so a plain command can never be
+        // mistaken for a caller-reference one; rule 2 (the `prim_inet` prefix strip) runs only
+        // when the plain grammar refuses. Both arms yield the packed address the C's
+        // `inet_set_faddress` would have produced plus the payload that follows the
+        // ancillary-length word.
+        let (address, payload) = match split_address(arg) {
+            Ok(plain) => plain,
+            // Rule 1 refused the argument: rule 2 gets its chance, and an argument in neither
+            // form keeps rule 1's own reason (the plain parse's `badarg`).
+            Err(plain) => match split_caller_ref(arg) {
+                Some(command) => match split_datagram(command)? {
+                    DatagramCommand::Send(address, payload) => (address, payload),
+                    // The C's `return_einval` (`:15205`/`:15212`).
+                    DatagramCommand::Einval => return Ok(ctl_xerror("einval")),
+                },
+                None => return Err(plain),
+            },
         };
-        match outcome {
+        // `inet_output_count(desc, len)` at `inet_drv.c:15163` (`packet_inet_command`, the
+        // empty-ancillary-data arm; `:15220` is the ancillary one) and the `INET_F_ACTIVE` split
+        // (`:15164`-`:15182`) live in `send_datagram`, shared with the queued write path.
+        match self.send_datagram(fd, address, payload) {
             Ok(_) => Ok(ctl_ok()),
             Err(err) => Ok(ctl_error(err)),
         }
@@ -632,6 +864,9 @@ impl UdpInetDriver {
         loop {
             match recv_from(fd, &mut buf) {
                 Ok((len, source)) => {
+                    // `inet_input_count(desc, n)` at `inet_drv.c:15513`/`:15526` (`udp_deliver`):
+                    // the received **datagram payload** length.
+                    self.stat.input(len);
                     ctx.input().push(&buf[..len]);
                     let mut reply = ctl_ok();
                     reply.extend_from_slice(&pack_address(source.port, source.addr));
@@ -663,30 +898,34 @@ impl UdpInetDriver {
 
     /// The `setopts` verb: applies the C's `INET_REQ_SETOPTS` option records.
     ///
-    /// The shared [`super::opt`] store is driven with its stream gate **off** (this driver's
-    /// socket is always a datagram socket), so the UDP-relevant syscall codes
-    /// (`reuseaddr`/`keepalive`/`broadcast`/`sndbuf`/`recbuf`/`ttl`) and the datagram
-    /// driver-state codes (`{mode, …}`/`{deliver, …}`/`{read_packets, …}`) are served and the
-    /// rest answer the C's `[0] ++ "einval"`.
+    /// The shared [`super::opt`] store is driven with this port's **cached** socket type
+    /// ([`UdpInetDriver::stype`]), exactly as the C reads `desc->stype` — so the datagram-gated
+    /// code `{read_packets, N}` is served once `open` has cached `SOCK_DGRAM` and ignored before
+    /// that, while the ungated codes (`{mode, …}`/`{deliver, …}` and the stream-gated
+    /// `send_timeout` pair) behave the same as on `tcp_inet`. The UDP-relevant syscall codes
+    /// (`reuseaddr`/`keepalive`/`broadcast`/`sndbuf`/`recbuf`/`ttl`) are served and the rest
+    /// answer the C's `[0] ++ "einval"`.
     ///
     /// # Errors
     ///
     /// `BeamError::BadArg` for a truncated `{active, N}` record (never for a served option — a
     /// rejected `setsockopt(2)` is not propagated, mirroring the C's `propagate = 0`).
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, false, self.socket, arg)
+        set_options(&mut self.options, self.stype, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
     ///
-    /// Driven with the same stream gate off as [`UdpInetDriver::verb_setopts`]; a code the
-    /// datagram store does not serve is the C's whole-reply `[0] ++ "einval"`.
+    /// Driven with the same cached socket type as [`UdpInetDriver::verb_setopts`], so
+    /// `{read_packets, N}` is reported by a port that has opened a datagram socket — including
+    /// after a `close`, which never clears `desc->stype` — and contributes no record before
+    /// that. A code the store does not serve is the C's whole-reply `[0] ++ "einval"`.
     ///
     /// # Errors
     ///
     /// `BeamError::Io` when a served option's `getsockopt(2)` fails on a live socket.
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, false, self.socket, arg)
+        get_options(&self.options, self.stype, self.socket, arg)
     }
 
     /// The `INET_REQ_NAME` reply (`inet_drv.c:11329`).
@@ -833,7 +1072,7 @@ impl UdpInetDriver {
             Opcode::Gettype => Ok(super::wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(super::wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(super::wire::getstatus_reply(self.state.state_code())),
-            Opcode::Getstat => super::wire::getstat_reply(arg),
+            Opcode::Getstat => super::wire::getstat_reply(arg, &self.stat, ctx.output().len()),
             // `INET_REQ_GETHOSTNAME` (`:11219`): `len != 0 ⇒ EINVAL`, else the local
             // `gethostname(2)` payload. `sock_hostname` is a plain syscall — no resolver is
             // involved — so the whole arm is exact (measured `[1] ++ "billmini"`).
@@ -847,14 +1086,15 @@ impl UdpInetDriver {
             }
             // `packet_inet_ctl`'s `INET_REQ_FDOPEN` (`:14639`) guards in this order:
             // `len != 6 && len != 10 ⇒ EINVAL` (`:14647`), then the family tag
-            // (`⇒ eafnosupport`, `:14659`), then the type (`⇒ EINVAL`, `:14671`), and only then
-            // the pre-adoption check `inet_ctl_fdopen` makes on a `bound` descriptor
-            // ([`super::wire::fdopen_precheck`]): a failing `sock_name(2)` is
-            // `enotsock`/`ebadf`, a family mismatch `einval`. Adopting the caller's descriptor is
-            // a capability this floor does not have: `desc->prebound = 1` (`:5266`) makes the C
-            // leave a handed-over descriptor alone for the port's life, while this crate's
-            // `stop`/`Drop` closes whatever the driver owns, so the successful form stays a
-            // typed gap rather than a fabricated `[1]`.
+            // (`⇒ eafnosupport`, `:14659`), then the type (`⇒ EINVAL`, `:14671` — both the stream
+            // and the datagram tag are admitted), and only then the pre-adoption check
+            // `inet_ctl_fdopen` makes on a `bound` descriptor ([`super::wire::fdopen_precheck`]):
+            // a failing `sock_name(2)` is `enotsock`/`ebadf`, a family mismatch `einval`. Once that
+            // ladder passes the descriptor is adopted **prebound**
+            // ([`UdpInetDriver::adopt_prebound`], the C's `inet_ctl_fdopen`, `:5223`-`:5282`): the
+            // port uses it for its whole life but never closes it, because it belongs to the
+            // caller (`desc->prebound = 1`, `:5266`). A port that already holds a socket is
+            // refused instead.
             Opcode::Fdopen => {
                 if arg.len() != 6 && arg.len() != 10 {
                     return Ok(ctl_xerror("einval"));
@@ -866,7 +1106,26 @@ impl UdpInetDriver {
                     return Ok(ctl_xerror("einval"));
                 }
                 match super::wire::fdopen_precheck(arg) {
-                    Ok(()) => Err(op.not_served()),
+                    Ok(()) => {
+                        let [a, b, c, d] = [arg[2], arg[3], arg[4], arg[5]];
+                        let fd = RawFd::from_be_bytes([a, b, c, d]);
+                        // A negative word cannot name a descriptor; the C would cast it to an
+                        // unsigned `SOCKET` and fail later, so refuse it as the `EBADF` it is
+                        // instead of handing it to the poller.
+                        if fd < 0 {
+                            return Ok(ctl_xerror("ebadf"));
+                        }
+                        if self.socket.is_some() {
+                            // The C overwrites `desc->s` here and leaks the previous socket (no
+                            // `desc_close` first, `:5267`). Refusing loudly is the honest choice:
+                            // the existing socket is left **untouched** and keeps serving the port.
+                            return Ok(ctl_xerror("einval"));
+                        }
+                        // The operand's own type tag is what the C stores as `desc->stype`
+                        // (`:5268`), so it is passed through rather than assumed to be a datagram.
+                        self.adopt_prebound(ctx, fd, u16::from(arg[1]))?;
+                        Ok(ctl_ok())
+                    }
                     Err(reply) => Ok(reply),
                 }
             }
@@ -1119,6 +1378,64 @@ impl Drop for UdpInetDriver {
         // `PortRegistry::open`, for instance). A `Drop` cannot report anything, so the
         // descriptor is simply released — the same rule `TcpInetDriver`/`FdDriver` follow.
         self.close_socket();
+    }
+}
+
+/// Decodes one queued `port_command` payload with the C's datagram grammar
+/// (`packet_inet_command`, `inet_drv.c:15037`-`:15260`), returning the destination address and
+/// the payload that follows the ancillary-length word.
+///
+/// The C strips the `prim_inet` caller-reference prefix first (`init_caller`, `:15055`-`:15065`)
+/// and then **always** parses `[address][anc_len:be32][anc_data][data]`
+/// (`:15139`-`:15230`). This crate's [`Driver`]/[`DriverContext`] seam carries no
+/// `driver_caller(port)`, so the prefix has to be recognised from the payload alone (see
+/// [`split_caller_ref`]), and the two wire forms are tried **plain first**:
+///
+/// 1. **plain form, tried first** — `[address][anc_len:be32][anc_data][data]`, i.e.
+///    [`split_datagram`] on the queue bytes directly;
+/// 2. **caller-reference form, only when rule 1 refuses** — [`split_caller_ref`], then
+///    [`split_datagram`] on the bytes after the prefix.
+///
+/// **Why the plain form can come first here.** Unlike [`UdpInetDriver::verb_send`]'s
+/// `port_control` convenience grammar, the queued form *is* the C's grammar, so there is no
+/// `[address][data]`-without-an-ancillary-length shape to protect: a plain command leads with an
+/// address tag (1, 3 or 4), while a caller-reference prefix leads with the high byte of its
+/// 16-bit tag length — `0` for every realistic `term_to_binary/1` tag (far below 256), never a
+/// valid address tag — so a prefixed command always fails rule 1 and is stripped by rule 2. The
+/// residual runs the other way and is the one [`split_caller_ref`] already documents: a prefixed
+/// command whose tag length is 256 or more begins with 1/3/4 and is taken as plain.
+///
+/// Rule 2 is only attempted for a **grammar** refusal. An `unsupported` outcome already matched
+/// the plain grammar (a parsable address plus an ancillary-length word) and *is* the command — the
+/// C's sendmsg arm — so retrying it as a prefixed command could only misroute bytes.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] for a command in neither form, or for the C's two
+/// `return_einval` guards (`:15155`/`:15158`, which [`split_datagram`] reports as
+/// [`DatagramCommand::Einval`]); the typed `unsupported` raise for a non-zero ancillary length.
+fn decode_queued_command(front: &[u8]) -> Result<(InetAddr, &[u8])> {
+    match split_datagram(front) {
+        Ok(command) => as_datagram(command),
+        Err(BeamError::BadArg) => match split_caller_ref(front) {
+            Some(rest) => split_datagram(rest).and_then(as_datagram),
+            // Not in the prefixed form either: rule 1's own reason stands.
+            None => Err(error::badarg()),
+        },
+        Err(other) => Err(other),
+    }
+}
+
+/// Folds [`DatagramCommand::Einval`] into the typed argument fault this path reports and yields
+/// the address/payload pair of a real send.
+///
+/// `Einval` is the C's `return_einval` (`inet_drv.c:15155`/`:15158`), which the `port_control`
+/// route renders as a `[0]einval` reply and the queued route — having no reply channel — reports
+/// as [`beam_common::BeamError::BadArg`].
+fn as_datagram(command: DatagramCommand<'_>) -> Result<(InetAddr, &[u8])> {
+    match command {
+        DatagramCommand::Send(address, payload) => Ok((address, payload)),
+        DatagramCommand::Einval => Err(error::badarg()),
     }
 }
 

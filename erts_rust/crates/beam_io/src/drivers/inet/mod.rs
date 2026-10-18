@@ -45,7 +45,7 @@
 //! | `bind` | `INET_REQ_BIND` (`:11409`) | packed address | `[1, port_hi, port_lo]` |
 //! | `listen` | `INET_REQ_LISTEN` (`:12042`) | `[backlog_hi, backlog_lo]` | `[1]` |
 //! | `accept` | `INET_REQ_ACCEPT` (`:12144`) | — | `[1, fd_be32]`, or `[1]` when nothing is pending |
-//! | `connect` | `INET_REQ_CONNECT` (`:12064`) | packed address | `[1]` |
+//! | `connect` | `INET_REQ_CONNECT` (`:12064`) | `Timeout(4) ++` packed address | `[1]`, or `[0] ++ errno` / `[0]etimedout` |
 //! | `send` | `tcp_inet_command` (`:12629`) | the bytes to send | `[1]` |
 //! | `recv` | `TCP_REQ_RECV` (`:12268`) | — | `[1]` |
 //! | `shutdown` | `TCP_REQ_SHUTDOWN` (`:12339`) | `[how]` | `[1]` |
@@ -83,13 +83,15 @@
 //! (on Linux a doubled request: 4096 reads back as 8192, exactly as the oracle reports it).
 //!
 //! The **driver-state** options — `{active, …}` (`22`), `{packet, …}` (`23`),
-//! `{send_timeout, …}` (`30`), `{packet_size, …}` (`32`), `{send_timeout_close, …}` (`35`) and
+//! `{mode, …}` (`24`), `{deliver, …}` (`25`), `{send_timeout, …}` (`30`),
+//! `{packet_size, …}` (`32`), `{read_packets, N}` (`33`), `{send_timeout_close, …}` (`35`) and
 //! `{line_delim, …}` (`40`) — are stored and reported with the oracle's defaults and byte-exact
 //! read-backs. `{packet, …}`/`{packet_size, …}`/`{line_delim, …}` are now **acted on** on the
 //! read path (see the framing bullet below); the remaining behaviours behind these options
 //! (active-mode delivery, the asynchronous send-timeout reply) remain the handoffs named below.
 //! `{line_delim, …}` is **set-only** — `getopts` of `40` is the C's `[0]einval`, which replaces
-//! the whole reply exactly as the oracle does.
+//! the whole reply exactly as the oracle does. `{mode, …}` is *stored and reported* only: the
+//! term a consumer builds from it (`{Port, {data, Binary | List}}`) is the runtime's to render.
 //!
 //! Any other code is the C's `[0] ++ "einval"` — see [`self::opt`] for the exact served set.
 //!
@@ -222,6 +224,7 @@ mod frame;
 mod opcode;
 mod opt;
 pub mod packet;
+mod stat;
 mod sys;
 mod udp;
 mod wire;
@@ -271,7 +274,7 @@ use self::opcode::{decode as decode_opcode, Opcode};
 // one place.
 use self::sys::{
     accept_socket, close_fd, has_peer, is_listening, local_port, shutdown_socket, socket_error,
-    socket_fd,
+    socket_fd, wait_connected,
 };
 
 /// The driver's registered name — the C `tcp_inet` entry (`inet_drv.c:1348`), which is also
@@ -281,6 +284,31 @@ pub const DRIVER_NAME: &str = "tcp_inet";
 /// The read buffer size of a single [`Driver::ready_input`] syscall.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// The longest a synchronous `connect` completion waits for the kernel, in milliseconds.
+///
+/// The C's `INET_REQ_CONNECT` is an **async** operation: it hands the request's `Timeout(4)`
+/// operand (`-1`, the C's `INET_INFINITY`, is what `prim_inet:connect/3` sends for `infinity`) to
+/// its async-op queue and returns immediately. This floor completes the connect inside the control
+/// call — there is no async-op queue and no driver→owner message channel — so the timeout becomes a
+/// **blocking** budget, and an infinity (or any other negative value) has to be capped: the
+/// callback runs on the runtime's single-threaded pump, which must never be parked for a silently
+/// dropped SYN (the kernel would retry for minutes).
+const CONNECT_WAIT_CAP_MS: i32 = 30_000;
+
+/// The `poll(2)` budget, in milliseconds, a `connect` request's `Timeout(4)` operand asks for,
+/// clamped to [`CONNECT_WAIT_CAP_MS`].
+///
+/// A negative operand is the C's `INET_INFINITY` and becomes the cap; `0` means "poll once without
+/// waiting" (the C's `timeout == 0` behaviour); a positive one is its own value, clamped.
+const fn connect_wait_ms(timeout_ms: i32) -> i32 {
+    if timeout_ms < 0 {
+        CONNECT_WAIT_CAP_MS
+    } else if timeout_ms < CONNECT_WAIT_CAP_MS {
+        timeout_ms
+    } else {
+        CONNECT_WAIT_CAP_MS
+    }
+}
 /// The lifecycle state of a TCP port.
 ///
 /// It mirrors the shape of the C descriptor's `inet.state` (`INET_STATE_*`): the socket does
@@ -437,11 +465,6 @@ pub struct TcpInetDriver {
     /// data. A switch **to** [`PacketType::Raw`] therefore delivers the whole retained buffer
     /// (plus everything after it) verbatim, so raw mode stays authoritative for queued bytes.
     pending_input: Vec<u8>,
-    /// Whether the socket's type is `SOCK_STREAM` — the C's `inet.stype`, set by `open`
-    /// (`inet_drv.c:5215`) and never cleared by `close`, with `-1` before the first `open`
-    /// (`:10925`). It gates the `send_timeout`/`send_timeout_close` options, which the C stores
-    /// and reports only on a stream socket (`:7104`/`:7115`, `:9237`/`:9247`).
-    stream: bool,
     /// The C descriptor's cached address family (`inet.sfamily`, `inet_drv.c:10925`), as the
     /// wire's [`INET_AF_INET`] tag, with `0` meaning "unset". Set by `open`/`fdopen` and
     /// **never** cleared by a close, which is why `INET_REQ_GETTYPE` still answers after one.
@@ -459,6 +482,19 @@ pub struct TcpInetDriver {
     /// `:11284`-`:11290`) — **after** that request's `INET_F_ACTIVE` guard, so a fake peer on an
     /// unconnected port is still `enotconn`.
     peer_addr: Option<InetAddr>,
+    /// The descriptor's statistics counters (the C's `inet_descriptor` block,
+    /// `inet_drv.c:11560`-`:11623`; see [`stat::InetStat`]): advanced where a payload is
+    /// delivered to the port (input) or a command is issued (output), and rendered by
+    /// `INET_REQ_GETSTAT`. Zeroed by construction, as `inet_init_desc` leaves it.
+    stat: stat::InetStat,
+    /// The C's `desc->prebound` flag (`inet_drv.c:5266`): set by the `INET_REQ_FDOPEN` adoption,
+    /// which takes a **caller-owned** descriptor over. A prebound descriptor is never `close(2)`d
+    /// — the C's `erl_inet_close` only drops the select registration for one and leaves
+    /// `desc->s`/`desc->state` untouched (`:5102`-`:5117`) — so neither a close nor a `Drop` may
+    /// release it (see [`TcpInetDriver::adopt_prebound`] and
+    /// [`TcpInetDriver::close_socket`]). Every route that installs a driver-**owned** socket
+    /// (`open`/`accept`/[`TcpInetDriver::from_socket`]) clears it.
+    prebound: bool,
 }
 
 impl TcpInetDriver {
@@ -479,11 +515,12 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
-            stream: false,
             family: 0,
             stype: 0,
             name_addr: None,
             peer_addr: None,
+            stat: stat::InetStat::default(),
+            prebound: false,
         }
     }
 
@@ -520,11 +557,12 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
-            stream: true,
             family: u16::from(INET_AF_INET),
             stype: sys::socket_type(fd)?,
             name_addr: None,
             peer_addr: None,
+            stat: stat::InetStat::default(),
+            prebound: false,
         })
     }
 
@@ -532,7 +570,6 @@ impl TcpInetDriver {
     pub fn socket(&self) -> Option<RawFd> {
         self.socket
     }
-
     /// The lifecycle state.
     pub fn state(&self) -> InetState {
         self.state
@@ -556,14 +593,14 @@ impl TcpInetDriver {
         self.peer_close.seen
     }
 
-    /// The lowercase errno name of an asynchronous `connect` that failed after the control
-    /// call had answered `ok`, if any.
+    /// The lowercase errno name of a `connect` that failed, if one has.
     ///
-    /// The control reply for `connect` is sent as soon as the connection attempt starts (the
-    /// C answers `[1] ++ async_id` then too and reports the outcome as an
-    /// `{inet_async, …}` message), so this is where the runtime reads that outcome from:
-    /// `Some("econnrefused")` for a refused connection. It stays set until the socket is
-    /// replaced or closed.
+    /// A connect is completed **inside** the control call
+    /// (see [`TcpInetDriver::verb_connect`]), so a failure is also answered there as
+    /// `[0] ++ errno`; this accessor is what the runtime reads it back from, and the only path that
+    /// leaves it set *without* a failing reply is the wait budget expiring (`[0]etimedout`) and the
+    /// attempt then failing later, observed through [`Driver::ready_output`]. It stays set until
+    /// the socket is replaced or closed.
     pub fn connect_error(&self) -> Option<&str> {
         self.connect_error.as_deref()
     }
@@ -598,13 +635,16 @@ impl TcpInetDriver {
                 // A fresh socket starts a fresh byte stream: any partial frame buffered for
                 // the previous socket no longer belongs to this one.
                 self.pending_input.clear();
-                // `open`/`accept` hand the driver a `SOCK_STREAM` socket: the C's `inet.stype`
-                // is `SOCK_STREAM` from `open` on (`inet_drv.c:5215`), never cleared by `close`.
-                self.stream = true;
-                // The C's `inet_ctl_open` records the family and type here too
-                // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close.
+                // The C's `inet_ctl_open` records the family and type here
+                // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close: `inet.stype`
+                // is `SOCK_STREAM` from `open` on, which is what gates the `send_timeout`
+                // codes and the datagram-only `{read_packets, N}`.
                 self.family = u16::from(INET_AF_INET);
                 self.stype = u16::from(INET_TYPE_STREAM);
+                // An `open`/`accept` descriptor is the driver's own: it is closed on teardown, so
+                // this port is no longer (or never was) holding a caller's `INET_REQ_FDOPEN`
+                // descriptor.
+                self.prebound = false;
                 Ok(())
             }
             Err(err) => {
@@ -614,6 +654,66 @@ impl TcpInetDriver {
         }
     }
 
+    /// Adopts a **caller-owned** descriptor: the C's `inet_ctl_fdopen`
+    /// (`inet_drv.c:5223`-`:5282`), the body behind `tcp_inet_ctl`'s `INET_REQ_FDOPEN` arm.
+    ///
+    /// This is [`TcpInetDriver::adopt`]'s prebound twin, and the difference is **ownership**: the
+    /// descriptor belongs to whoever handed it to `INET_REQ_FDOPEN`, so it is never closed here —
+    /// not on a failed `set_nonblocking(2)`, not on a failed poller registration, not by
+    /// [`TcpInetDriver::close_socket`] and not by `Drop`. `prebound` records that, exactly as the
+    /// C's `desc->prebound = 1` does (`:5266`), which its close path honours by only dropping the
+    /// select registration (`erl_inet_close`, `:5102`-`:5117`).
+    ///
+    /// `stype` is the `INET_TYPE_*` tag the request's operand carried (the caller has already run
+    /// the length/family/type ladder and the `sock_name(2)` pre-check, [`wire::fdopen_precheck`]).
+    /// The lifecycle state is the C's: [`InetState::Open`], promoted to
+    /// [`InetState::Connected`] when a `SOCK_STREAM` adoption has a peer — the C's `sock_peer`
+    /// probe (`:5252`-`:5260`) — which is why an adopted bound socket reports `INET_STATE_OPEN`
+    /// (`GETSTATUS` `[1,0,0,0,1]`) and an adopted accepted connection
+    /// `INET_STATE_CONNECTED` (`[1,0,0,0,5]`).
+    ///
+    /// # Errors
+    ///
+    /// `BeamError::Io` when `fd` cannot be put into non-blocking mode, when the `getpeername(2)`
+    /// probe fails for a reason other than "not connected", or when the poller rejects it. The
+    /// descriptor is **not** closed on any of those paths, and the driver is left untouched when
+    /// one of them fires.
+    fn adopt_prebound(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        fd: RawFd,
+        stype: u16,
+    ) -> Result<()> {
+        set_nonblocking(fd)?;
+        // The C's `sock_peer` probe for a stream (`:5252`-`:5260`), taken **before** any field is
+        // touched so a failing probe leaves the driver exactly as it was.
+        let connected = stype == u16::from(INET_TYPE_STREAM) && has_peer(fd)?;
+        let token = match ctx.register(fd, Interest::READABLE) {
+            Ok(token) => token,
+            // Deliberately **no** `close_fd`: the descriptor is the caller's (see the docs above),
+            // which is the one behavioural difference from [`TcpInetDriver::adopt`].
+            Err(err) => return Err(err),
+        };
+        self.socket = Some(fd);
+        self.token = Some(token);
+        self.interest = Interest::READABLE;
+        self.read_eof = false;
+        self.peer_close = PeerClose::default();
+        self.connect_error = None;
+        // A fresh socket starts a fresh byte stream: any partial frame buffered for the previous
+        // socket no longer belongs to this one.
+        self.pending_input.clear();
+        self.state = if connected {
+            InetState::Connected
+        } else {
+            InetState::Open
+        };
+        // `desc->prebound = 1; desc->stype = type; desc->sfamily = domain` (`:5266`-`:5269`).
+        self.prebound = true;
+        self.family = u16::from(INET_AF_INET);
+        self.stype = stype;
+        Ok(())
+    }
     /// Marks the socket as a fresh, usable connection.
     ///
     /// A `connect`/`accept` that succeeded replaces whatever the previous socket was doing, so
@@ -657,7 +757,19 @@ impl TcpInetDriver {
     ///
     /// Used after [`TcpInetDriver::deregister`] and by `Drop` (which has no poller to
     /// de-register with). Taking the field first makes it idempotent.
+    ///
+    /// A **prebound** descriptor is not this driver's to close: the C's `erl_inet_close`
+    /// (`inet_drv.c:5102`-`:5117`) only drops the select registration for one, leaves `desc->s`
+    /// and `desc->state` exactly as they were and issues no `close(2)` at all. The same rule holds
+    /// here — nothing is closed and no field is reset, so the descriptor number stays valid in the
+    /// OS (owned by whoever handed it to `INET_REQ_FDOPEN`) and a post-close
+    /// `GETSTATUS`/`GETFD`/`NAME` still answers what it answered before, which is what the C
+    /// does. `Drop` runs this too, so a prebound descriptor is never closed by a dropped driver
+    /// either.
     fn close_socket(&mut self) {
+        if self.prebound {
+            return;
+        }
         if let Some(fd) = self.socket.take() {
             close_fd(fd);
         }
@@ -667,7 +779,6 @@ impl TcpInetDriver {
         self.pending_input.clear();
         self.state = InetState::Closed;
     }
-
     /// De-registers **and** closes the current socket, returning the de-registration outcome.
     ///
     /// # Errors
@@ -701,6 +812,12 @@ impl TcpInetDriver {
             // `{packet, raw}`: deliver any bytes retained from an earlier framing mode first, so
             // raw mode is authoritative for everything already queued (see the field's note).
             let retained = core::mem::take(&mut self.pending_input);
+            // `inet_input_count(desc, len)` at `inet_drv.c:13064` (`tcp_deliver`): the C counts
+            // the bytes it **delivers** to the port, and in raw mode that is everything pushed
+            // onto the port input queue here — any retained (previously buffered) bytes plus
+            // whatever the read just collected, each counted exactly once.
+            let delivered = retained.len() + bytes.len();
+            self.stat.input(delivered);
             ctx.input().push(&retained);
             ctx.input().push(&bytes);
         }
@@ -1019,15 +1136,33 @@ impl TcpInetDriver {
 
     /// The `connect` verb: connects the socket to a literal IPv4 address.
     ///
-    /// A connection that completes immediately arms read readiness and answers `[1]`; one
-    /// that reports `EINPROGRESS` arms **write** readiness, moves to
-    /// [`InetState::Connecting`] and also answers `[1]` — the outcome then arrives through
-    /// [`Driver::ready_output`] (see [`TcpInetDriver::connect_error`]).
+    /// A connection the kernel completes immediately arms read readiness and answers `[1]`. One
+    /// that reports `EINPROGRESS` is **completed synchronously inside this call** by
+    /// [`wait_connected`], under the `poll(2)` budget `timeout_ms` asks for (clamped to
+    /// [`CONNECT_WAIT_CAP_MS`], a negative value being the C's `INET_INFINITY`):
+    ///
+    /// * connected ⇒ [`TcpInetDriver::mark_connected`], read readiness armed, `[1]`;
+    /// * failed ⇒ the descriptor is torn down (the C's `tcp_inet_connect_error` closes it), the
+    ///   errno is recorded in [`TcpInetDriver::connect_error`] and the reply is `[0] ++ errno`;
+    /// * budget spent ⇒ `[0]etimedout` with the socket left in [`InetState::Connecting`] and
+    ///   **write** readiness armed, so a completion that arrives later is still observed through
+    ///   [`Driver::ready_output`] (and [`TcpInetDriver::connect_error`]).
+    ///
+    /// The C never answers a bare `[1]` for the in-progress case: it replies `[1] ++ async_id_be16`
+    /// and delivers `{inet_async, Port, Ref, Status}` — a channel this crate has no seam for, which
+    /// is exactly why the wait above takes its place. A timed-out C operation delivers
+    /// `{inet_async, Port, Ref, {error, etimedout}}` where this answers `[0]etimedout`.
     ///
     /// # Errors
     ///
-    /// `BeamError::BadArg` for a malformed packed address.
-    fn verb_connect(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
+    /// `BeamError::BadArg` for a malformed packed address, or `BeamError::Io` when the socket
+    /// cannot be watched at all.
+    fn verb_connect(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        arg: &[u8],
+        timeout_ms: i32,
+    ) -> Result<Vec<u8>> {
         match self.state {
             InetState::Closed => return Ok(ctl_xerror("exbadport")),
             InetState::Connected => return Ok(ctl_xerror("eisconn")),
@@ -1056,8 +1191,29 @@ impl TcpInetDriver {
         match err.raw_os_error() {
             Some(libc::EINPROGRESS) => {
                 self.state = InetState::Connecting;
-                self.set_interest(ctx, Interest::WRITABLE)?;
-                Ok(ctl_ok())
+                match wait_connected(fd, connect_wait_ms(timeout_ms))? {
+                    // The connection is up: the C's `tcp_inet_connect_ok` moves to
+                    // `INET_STATE_CONNECTED` and switches to read readiness (`:12410`).
+                    Some(0) => {
+                        self.mark_connected();
+                        self.set_interest(ctx, Interest::READABLE)?;
+                        Ok(ctl_ok())
+                    }
+                    // The connect failed: the C's `tcp_inet_connect_error` closes the descriptor
+                    // (`:12422`) and answers the errno through its async reply.
+                    Some(errno) => {
+                        self.release_socket(ctx)?;
+                        self.connect_error = Some(errno_name(errno));
+                        Ok(ctl_error(std::io::Error::from_raw_os_error(errno)))
+                    }
+                    // Nothing happened within the budget: leave the attempt running so a later
+                    // completion is still observed, and report the timeout the async form would
+                    // have reported as a message.
+                    None => {
+                        self.set_interest(ctx, Interest::WRITABLE)?;
+                        Ok(ctl_xerror("etimedout"))
+                    }
+                }
             }
             // `EISCONN` and `EALREADY` are the racy spellings of "it is already connected or
             // connecting"; report them as the C does rather than failing the control call.
@@ -1069,7 +1225,6 @@ impl TcpInetDriver {
             _ => Ok(ctl_error(err)),
         }
     }
-
     /// The `send` verb: queues `arg` for output and drains as much as the kernel accepts.
     ///
     /// This is the `tcp_inet_command` path (`inet_drv.c:12629`), which is the port's *output*
@@ -1089,6 +1244,30 @@ impl TcpInetDriver {
     /// `TCP_ADDF_DELAYED_CLOSE_SEND` flag, `inet_drv.c:12682`); a `send` whose write is what
     /// discovers the close answers `closed` too.
     ///
+    /// # The `prim_inet` caller-reference prefix is *not* stripped here (a seam gap)
+    ///
+    /// `prim_inet:send/3` prefixes the payload with `[tag_len:be16][tag_bytes]` — the tag being
+    /// `term_to_binary(Mref, [local])` for `Mref = monitor(port, S)`
+    /// (`erts/preloaded/src/prim_inet.erl:575`-`:620`). The C strips it in
+    /// `init_caller`/`init_caller_iov` (`inet_drv.c:1820`-`:1890`), but **only when
+    /// `driver_caller(port)` is an internal pid** — and it echoes the tag back as the fourth
+    /// element of the later `{inet_reply, S, Reply, Ref}` message (`inet_reply_caller_ref`,
+    /// `:2610`-`:2660`).
+    ///
+    /// This crate's frozen [`Driver`]/[`DriverContext`] seam carries **no caller**, and the TCP
+    /// payload after the prefix is a structureless byte stream, so — unlike the `udp_inet` `send`
+    /// verb, whose post-prefix grammar starts with an address tag and therefore discriminates
+    /// reliably — there is **no sound way to tell a prefixed payload from a data payload that
+    /// merely begins with those bytes**. Guessing would corrupt ordinary sends, so this verb
+    /// does not guess: a `gen_tcp:send` payload arrives with its prefix intact and is written as
+    /// data. Closing the gap needs a caller-carrying seam on `DriverContext` (or the runtime
+    /// pre-stripping the prefix above this crate); the `{inet_reply, …}` echo needs the
+    /// driver→owner message channel this crate does not have either.
+    ///
+    /// Note also that the `{packet, 1|2|4}` framing described above is applied by **this verb**
+    /// only: [`TcpInetDriver::output`]/[`TcpInetDriver::ready_output`] (the
+    /// `erlang:port_command/2` path) go straight to [`TcpInetDriver::write_pending`], which
+    /// writes the queued bytes unframed.    ///
     /// A `shutdown(SHUT_WR|SHUT_RDWR)` **deferred** because output was still queued
     /// ([`TcpInetDriver::pending_shutdown`]) rejects a further `send`, exactly as the C does:
     /// `tcp_inet_commandv` routes it to `tcp_shutdown_error(desc, EPIPE)` (`inet_drv.c:12695`),
@@ -1121,10 +1300,17 @@ impl TcpInetDriver {
         // `{packet, 1|2|4}` frames the payload with a length header before the bytes reach the
         // queue; every other code (raw, line, ASN.1/…, the HTTP family) takes the C's `default:`
         // arm and writes no header at all.
+        let mut header_len = 0;
         if let Some(header) = frame::write_header(&self.options, arg.len()) {
+            header_len = header.len();
             ctx.output().push(&header);
         }
         ctx.output().push(arg);
+        // `inet_output_count(desc, len + h_len)` at `inet_drv.c:13763` (`tcp_send`; the
+        // `tcp_sendv` counterpart is `:13879`): the payload **plus** the framing header,
+        // counted once per command at issue time — so a partial write (or a write that then
+        // discovers the peer gone) still counted it, exactly as the C does before it sends.
+        self.stat.output(arg.len() + header_len);
         let _written = self.write_pending(ctx)?;
         if self.peer_close.seen {
             // This write is what found the peer gone, so it answers `closed` itself; the C
@@ -1213,6 +1399,9 @@ impl TcpInetDriver {
         loop {
             match frame::extract(&mut self.pending_input, &framing)? {
                 Some(payload) => {
+                    // `inet_input_count(desc, len)` at `inet_drv.c:13064` (`tcp_deliver`): the
+                    // **delivered payload** length — the framing header already stripped.
+                    self.stat.input(payload.len());
                     ctx.input().push(&payload);
                     return Ok(ctl_ok());
                 }
@@ -1287,15 +1476,17 @@ impl TcpInetDriver {
     ///
     /// Like the C (`inet_drv.c:11111`, which has no `IS_OPEN` guard), a port that has no socket
     /// yet still validates the codes, stores the driver-state options and answers `[1]` — a
-    /// `setopts` before `open` is not an error, exactly as the oracle behaves (only the two
-    /// `send_timeout` codes, which the C gates on a stream socket, are then ignored).
+    /// `setopts` before `open` is not an error, exactly as the oracle behaves (only the gates the
+    /// C reads off the cached `inet.stype` then keep their values out: the two `send_timeout`
+    /// codes because there is no stream socket yet, and `{read_packets, N}` because there is no
+    /// datagram one — either still answering `[1]`).
     ///
     /// # Errors
     ///
     /// Never for a served option (a rejected `setsockopt(2)` is not propagated, as in the C);
     /// `BeamError::BadArg` for a truncated `{active, N}` record.
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, self.stream, self.socket, arg)
+        set_options(&mut self.options, self.stype, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
@@ -1312,7 +1503,7 @@ impl TcpInetDriver {
     /// `BeamError::Io` is **not** raised for a failed `getsockopt(2)` on a live socket: that
     /// record is dropped and the search continues, as in the C (see [`self::opt`]).
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, self.stream, self.socket, arg)
+        get_options(&self.options, self.stype, self.socket, arg)
     }
 
     /// Routes one decoded numeric control opcode (`inet_drv.c`'s `INET_REQ_*` numbers) to the verb
@@ -1381,9 +1572,12 @@ impl TcpInetDriver {
             }
             // `INET_REQ_CONNECT` (`:12064`): the socket-state guards come first
             // (`!IS_OPEN ⇒ exbadport`, `IS_CONNECTED ⇒ eisconn`, `IS_CONNECTING ⇒ einval`) and
-            // only then `len < 6 ⇒ einval`. The six leading operand bytes are the async-connect
-            // timeout and the reply port, neither of which this synchronous floor uses, so only
-            // the address is forwarded.
+            // only then `len < 6 ⇒ einval`. The leading four operand bytes are the async-connect
+            // timeout; everything after them is the packed address, which the C hands straight to
+            // `inet_set_faddress` (`:12084`-`:12089` — the `Port(2)` its comment names is the
+            // address's own port field). The timeout port of the C's `enq_async` is unused: this
+            // floor has no async-op queue to correlate a reply through, so the connect completes
+            // inside the call and the timeout bounds that completion.
             Opcode::Connect => {
                 match self.state {
                     InetState::Closed => return Ok(ctl_xerror("exbadport")),
@@ -1394,7 +1588,8 @@ impl TcpInetDriver {
                 if arg.len() < 6 {
                     return Ok(ctl_xerror("einval"));
                 }
-                self.verb_connect(ctx, &arg[6..])
+                let timeout_ms = i32::from_be_bytes([arg[0], arg[1], arg[2], arg[3]]);
+                self.verb_connect(ctx, &arg[4..], timeout_ms)
             }
             // `INET_REQ_ACCEPT` (`:12144`): one combined "not listening **or** wrong operand"
             // guard, so both faults answer `einval`.
@@ -1471,7 +1666,10 @@ impl TcpInetDriver {
             }
             // `INET_REQ_FDOPEN` (`:12003`): the length/family/type refusals are exact, and so is
             // the pre-adoption `sock_name`/family check of a `bound` descriptor
-            // ([`wire::fdopen_precheck`]). Adopting the caller's descriptor stays a typed gap.
+            // ([`wire::fdopen_precheck`]). Once that ladder passes, the descriptor is adopted
+            // **prebound** ([`TcpInetDriver::adopt_prebound`], the C's `inet_ctl_fdopen`,
+            // `:5223`-`:5282`): the port uses it for its whole life but never closes it, because
+            // it belongs to the caller. A port that already holds a socket is refused instead.
             Opcode::Fdopen => {
                 if arg.len() != 6 && arg.len() != 10 {
                     return Ok(ctl_xerror("einval"));
@@ -1483,8 +1681,27 @@ impl TcpInetDriver {
                     return Ok(ctl_xerror("einval"));
                 }
                 match wire::fdopen_precheck(arg) {
-                    // The C would hand the descriptor to `inet_ctl_fdopen` and answer `[1]`.
-                    Ok(()) => Err(op.not_served()),
+                    Ok(()) => {
+                        let [a, b, c, d] = [arg[2], arg[3], arg[4], arg[5]];
+                        let fd = RawFd::from_be_bytes([a, b, c, d]);
+                        // A negative word cannot name a descriptor; the C would cast it to an
+                        // unsigned `SOCKET` and fail later, so refuse it as the `EBADF` it is
+                        // instead of handing it to the poller.
+                        if fd < 0 {
+                            return Ok(ctl_xerror("ebadf"));
+                        }
+                        if self.socket.is_some() {
+                            // The C overwrites `desc->s` here and leaks the previous socket (no
+                            // `desc_close` first, `:5267`). Refusing loudly is the honest choice:
+                            // the existing socket is left **untouched** and keeps serving the port.
+                            return Ok(ctl_xerror("einval"));
+                        }
+                        // The `bound` word of the ten-byte form is already accounted for: a
+                        // non-zero one made `fdopen_precheck` run `sock_name(2)` and the family
+                        // comparison, so there is nothing left to check and nothing to skip.
+                        self.adopt_prebound(ctx, fd, u16::from(INET_TYPE_STREAM))?;
+                        Ok(ctl_ok())
+                    }
                     Err(reply) => Ok(reply),
                 }
             }
@@ -1529,7 +1746,7 @@ impl TcpInetDriver {
                 if !self.state.is_connected() {
                     return Ok(ctl_xerror("enotconn"));
                 }
-                if !self.stream {
+                if self.stype != u16::from(INET_TYPE_STREAM) {
                     return Ok(ctl_xerror("einval"));
                 }
                 Err(op.not_served())
@@ -1577,7 +1794,7 @@ impl TcpInetDriver {
             Opcode::Gettype => Ok(wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(wire::getstatus_reply(self.state.state_code())),
-            Opcode::Getstat => wire::getstat_reply(arg),
+            Opcode::Getstat => wire::getstat_reply(arg, &self.stat, ctx.output().len()),
             // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): the shared `inet_ctl` arm, so
             // both socket drivers build it through one helper. The reply is exact —
             // `[1] ++ (op ++ be32(outq byte count))*` — and an operand byte that is not
@@ -1651,7 +1868,9 @@ impl Driver for TcpInetDriver {
             "bind" => self.verb_bind(arg),
             "listen" => self.verb_listen(arg),
             "accept" => self.verb_accept(ctx),
-            "connect" => self.verb_connect(ctx, arg),
+            // The named form has no `Timeout(4)` operand (it is this floor's own convenience verb,
+            // not the C request), so it asks for the C's `INET_INFINITY` — i.e. the capped wait.
+            "connect" => self.verb_connect(ctx, arg, INET_INFINITY),
             "send" => self.verb_send(ctx, arg),
             "recv" => self.verb_recv(ctx, arg),
             "shutdown" => self.verb_shutdown(ctx, arg),
@@ -1695,5 +1914,7 @@ mod opcode_tests_refusals;
 mod opcode_tests_states;
 #[cfg(test)]
 mod opcode_tests_udp;
+#[cfg(test)]
+mod stat_tests;
 #[cfg(test)]
 mod tests;
