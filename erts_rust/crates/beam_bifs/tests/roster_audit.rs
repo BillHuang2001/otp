@@ -37,9 +37,9 @@
 //! |---|---|---|
 //! | declared (`bif.tab`) | 556 | `bif 476 + ubif 73 + hbif 7` |
 //! | registry | 648 | 556 declared + 92 stdlib fast paths |
-//! | seam union | 242 | the 14 tables, deduped (`246 raw − 4 shared`) |
-//! | declared seam-backed | 212 | union members the table declares |
-//! | declared in-crate | 344 | `556 − 212`, no table lists them |
+//! | seam union | 217 | the 14 tables, deduped (`221 raw − 4 shared`) |
+//! | declared seam-backed | 187 | union members the table declares |
+//! | declared in-crate | 369 | `556 − 187`, no table lists them |
 //! | undeclared seam members | 30 | the union members registered as stdlib fast paths |
 //!
 //! "Adopted" is *not* the same as "registered": a union member returns the typed
@@ -113,9 +113,9 @@ const FAST_PATHS: usize = 92;
 const MISSING_DECLARED: usize = 0;
 
 /// The seam union and the partition of the declared surface it induces.
-const SEAM_UNION: usize = 242;
-const DECLARED_SEAM_BACKED: usize = 212;
-const DECLARED_IN_CRATE: usize = 344;
+const SEAM_UNION: usize = 217;
+const DECLARED_SEAM_BACKED: usize = 187;
+const DECLARED_IN_CRATE: usize = 369;
 const UNDECLARED_SEAM_MEMBERS: usize = 30;
 /// The keys two tables share — the four external-term encoders, which read the
 /// fun-identity **and** the local-node seams.
@@ -139,7 +139,7 @@ const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("PERSISTENT_TERM_BIFS", 7, 7),
     ("FUN_CALLER_BIFS", 24, 0),
     ("LOCAL_NODE_BIFS", 6, 2),
-    ("RUNTIME_HOOKS_BIFS", 172, 172),
+    ("RUNTIME_HOOKS_BIFS", 147, 147),
 ];
 
 /// The declared entries per module, recomputed from the parsed table and pinned in
