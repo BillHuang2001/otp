@@ -431,7 +431,7 @@ pub(crate) fn setopts_succeeded(reply: &[u8]) -> bool {
 /// | 49 | `{read_ahead, …}` | `TCP_ADDF_NO_READ_AHEAD` (`:11827`) |
 ///
 /// Everything else is **not** inherited, and the module docs say why for each family.
-fn is_inherited_record(record: &[u8]) -> bool {
+pub(crate) fn is_inherited_record(record: &[u8]) -> bool {
     let Some(&code) = record.first() else {
         return false;
     };
