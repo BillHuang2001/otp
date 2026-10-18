@@ -82,9 +82,10 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **228
-passing / 0 failing** (plus 1 `#[ignore]`d case, see below); the whole `-p beam_io` run is **983
-passed / 3 ignored** (752 lib + 228 integration + 3 doctests passed; 2 doctests `ignore`d). Per file:
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **229
+passing / 0 failing** (no `#[ignore]`d case anywhere in `tests/`); the whole `-p beam_io` run is
+**989 passed / 2 ignored** (757 lib + 229 integration + 3 doctests passed; 2 doctests `ignore`d). Per
+file:
 
 | Suite | Tests | Suite | Tests |
 |---|---|---|---|
@@ -98,9 +99,9 @@ passed / 3 ignored** (752 lib + 228 integration + 3 doctests passed; 2 doctests 
 | `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 8 |
 | `abi_busy.rs` | 2 | `inet.rs` | 8 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
-| `abi_failure.rs` | 8 | `udp_inet.rs` | 5 |
+| `abi_failure.rs` | 11 | `udp_inet.rs` | 5 |
 | `port_task.rs` | 5 | `port.rs` | 4 |
-| `inet_accept.rs` | 6 | | |
+| `inet_accept.rs` | 7 | | |
 
 Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channel** end-to-end
 (`PortRegistry::take_completions` after every round, the recipe `beam_rt` follows):
@@ -194,13 +195,14 @@ rot.
   keeps accepting with distinct fds, the 50 ms deadline completing `{error, timeout}` exactly once,
   two queued accepts with ids in order and the `9`/`41`/`297` `GETSTATUS` bits, the
   `[0]einval`/`[0]exbadport` refusals plus the pending accept drained `{error, closed}` once, and
-  the frozen two-variant `PortNotification`/`CompletionEvent` channels. One `#[ignore]`d case
-  records a **driver-side divergence**: with accept #0 at `INET_INFINITY` and accept #1 at 50 ms
-  queued, the oracle reports `{0,{error,timeout}}` (the C's multi-timer removes the *head* of the
-  caller's accept list, `inet_drv.c:12606`) while `AsyncQueue::async_timeout` gates on the head
-  being due and so completes nothing (`src/drivers/inet/async.rs:654`) — un-ignore the case once
-  the driver completes the head
-- `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
+  the frozen two-variant `PortNotification`/`CompletionEvent` channels. One case pins the **mixed
+  accept queue** (`[INET_INFINITY, 50ms]`): the port's one timer is armed from the *earliest finite*
+  entry of its sorted accept-timer list (`add_multi_timer`, `inet_drv.c:15744`) and its expiry
+  reports the list **head** (`tcp_inet_multi_timeout` → `remove_multi_op(desc, multi_first)`,
+  `:12600`), so `{0,{error,timeout}}` is reported although only accept #1 carried a deadline; an
+  infinite head contributes no timer entry, so the firing also consumes the tail's only entry and the
+  survivor stays queued with no timer at all — a real connection then completes it as
+  `{1,{ok,fd}}`, and nothing further is owed for id 0- `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
 - `udp_inet.rs`, `ram_file.rs` → the other two built-ins through the real port layer
   (`DriverRegistry::with_builtins` + `PortRegistry` + `Poller`): a loopback UDP datagram round trip
