@@ -682,10 +682,12 @@ impl ExecutionContext for RuntimeContext<'_> {
 
     /// `recv_marker_reserve`: an opaque marker term for the current scan position.
     ///
-    /// On an **empty** queue there is no position to record, so the C `am_undefined` is
-    /// returned instead — interned into the one shared atom table so the term is a real,
-    /// nameable atom (and, being non-small, makes the following `recv_marker_bind` a
-    /// no-op). Otherwise a fresh small-integer marker is returned.
+    /// The mailbox always mints a fresh **small-integer** marker, on an empty queue as much as on a
+    /// full one: the marker records an *anchor* — the queue's current length, i.e. "everything
+    /// enqueued from now on" — rather than a pointer to a message, so it keeps its meaning across
+    /// later removals instead of dying with the message it sat next to. The C's `am_undefined`
+    /// no-marker answer is therefore not modelled; the `undefined` term is still passed down
+    /// because the seam carries it, and the mailbox does not consult it.
     fn receive_marker_reserve(&mut self) -> Result<Eterm> {
         let undefined = self.runtime.intern("undefined");
         let (queue, state) = self.mailbox_parts()?;
@@ -694,7 +696,9 @@ impl ExecutionContext for RuntimeContext<'_> {
 
     /// `recv_marker_bind`: bind the opaque `marker` to the (internal) reference.
     ///
-    /// A non-small marker (the empty-queue `undefined`) is a silent no-op.
+    /// A **non-small** term (anything a caller hands back that is not a reserved marker) binds
+    /// nothing, and so does a small term no `receive_marker_reserve` minted — the C's own no-op for
+    /// a marker it does not know.
     fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
         let (_queue, state) = self.mailbox_parts()?;
         state.bind(marker, reference);
