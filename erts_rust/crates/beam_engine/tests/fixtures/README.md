@@ -535,3 +535,80 @@ caller's `call_ext` reaches them), and the rest pass an anonymous fun into real 
 The text/encoding harness: the fun-taking exports of `lists` and `ordsets` that only a caller can
 enter (`lists:any/2`, `all/2`, `foldr/3`, `mapfoldl/3`, `search/2`, `zf/2`, `ordsets:filter/2`,
 `ordsets:fold/3`), each wired through `make_fun3` + `call_fun*` + cross-module fun resolution.
+
+## The real-`.beam` variant-proof fixtures (`vb_*`) — `tests/real_beam_variant_proofs/`
+`tests/real_beam_variant_proofs.rs` proves, per instruction variant, that the *OTP compiler*
+emits it and that the engine executes it with the oracle's observable result (variant ->
+dynamic `exec_census` count -> live `erl` comparison). Each `vb_*` fixture is the smallest
+ordinary Erlang whose compiler output contains the variant under proof; every shape was
+confirmed with the system `beam_disasm:file/1` before the row was written, and all are built
+with the neutral-directory `+deterministic` recipe above.
+## `vb_calls.beam` (`vb_calls.erl`) — `tests/real_beam_variant_proofs/calls.rs`
+One export per call/frame-control instruction: `call_nontail/1` (`call` + `deallocate 0`/`return` →
+`DeallocateReturn`), `call_only/1` (`call_only`), `call_last/1` (`call_last …, 1`), `ext_nontail/1`
+(`call_ext`), `ext_only/1` (`call_ext_only`), `ext_last/1` (`call_ext_last …, 1`), `yregs/1`
+(`init_yregs` before a `try`), `clause/1` + `clause_catch/1` (a frameless failed head guard jumps to
+the `func_info` label — the only route that *executes* a `func_info`; the caller catches the bare
+`function_clause`), `node_bif/0` (`bif0 node`), `trimming/1` (`trim` in a non-tail `select_val` arm,
+via an opaque `hold/1`, plus the arm's literal `move`).
+## `vb_data.beam` (`vb_data.erl`) — `tests/real_beam_variant_proofs/data.rs`
+The data-access proofs. The three cons reads are the same shapes as `lists.erl`, under a module name
+no OTP application uses (a fixture named `lists` is shadowed by the system stdlib on the oracle side,
+where `lists:head/1` does not exist).
+| export | Erlang | opcodes |
+|---|---|---|
+| `split/1` | `case L of [H\|T] -> {H,T} end.` | `get_list` + `put_tuple2` |
+| `head/1` | `case L of [H\|_T] -> H end.` | `get_hd` |
+| `tail/1` | `case L of [_H\|T] -> T end.` | `get_tl` |
+| `update_a/1` | `R#r{a = 10}.` | `update_record` (`reuse`, fields `[2,10]`) |
+| `update_a_c/1` | `R#r{a = 11, c = 33}.` | `update_record` (`copy`, fields `[2,11,4,33]`) |
+| `non_record/1` | `V#r{a = 1}.` | `is_tagged_tuple` fail → `badrecord` → `{badrecord, V}` |
+| `badrecord_tag/0` | `badrecord.` | keeps the `badrecord` atom in the module (the opcode carries none) |
+`-record(r, {a, b, c})` is the tuple `{r, A, B, C}` (arity 4, tag at element 0).
+## `vb_funs.beam` (`vb_funs.erl`) — `tests/real_beam_variant_proofs/funs.rs`
+The fun/apply proofs: `add_n/1` (`fun(X) -> X + N end`) and `env2/2` (`fun(X) -> X + A + B end`) emit
+`make_fun3` with a one- and a two-slot env; `apply1/2` (`F(X)`) emits `call_fun,1`; `twice/2`
+(`F(F(X))`) emits `call_fun,1` then `call_fun2,{atom,safe},1`; `map_with/2` is `lists:map(F, L)` (a
+`call_ext_only` into the real `lists`, whose own compiled `call_fun2` applies the fixture's closure
+once per element); `dyn/4` (`{ok, M:F(A, B)}`) emits `apply,2` and `dyn_tail/4` (`M:F(A, B)`)
+`apply_last,2,0`. `sum2/2` is the module function the `apply` row names dynamically. The closures are
+applied through `ModuleHost`'s real fun resolution, so the *compiled* lambda body runs (its `gc_bif`
+and `return` are counted) — unlike `tests/funs.rs`, which stands a hook in for the body.
+## `vb_exc.beam` (`vb_exc.erl`) — `tests/real_beam_variant_proofs/exceptions.rs`
+One export per exception-family instruction, each with a comparable oracle value:
+| export | instruction | Erlang shape | oracle |
+|---|---|---|---|
+| `badmatch/1` | `Badmatch` | `ok = X` | `{error,{badmatch,a}}` |
+| `case_end/1` | `CaseEnd` | `case X of 1 -> one end` | `{error,{case_clause,b}}` |
+| `if_end/1` | `IfEnd` | `if X > 0 -> positive end` | `{error,if_clause}` |
+| `rethrow/1` | `Raise` | `try bump(X) catch throw:nope -> caught end` | `{error,badarith}` |
+| `rethrow_caught/1` | `Raise` | the same, inside an outer `try` | `reraised` |
+| `rethrow_after/1` | `Raise` | `try bump(X) after ok end` | `{error,badarith}` |
+| `recover/1` | `TryCase` | `try bump(X) catch error:badarith -> recovered end` | `recovered` |
+| `try_clause/1` | `TryCaseEnd` | `try X of 1 -> one …` with `X = b` | `{error,{try_clause,b}}` |
+| `normal_try/1` | `TryEnd` | `try bump(X) of V -> {ok,V} catch error:_ -> failed end` | `{ok,2}` (`X=1`) |
+| `old_catch/1` | `CatchEnd` | `catch erlang:raise(throw, X, [])` | `ball` (`X=ball`) |
+The `raise` opcode (`Instr::Raise`, as opposed to the separate `raw_raise`/`RawRaise`) is emitted
+**only** by a `try … catch` whose clauses do not match (the compiler's fallback clause re-raises the
+pending exception) or by `try … after`; a scan of all 1321 installed OTP `.beam` files finds zero
+occurrences, so this fixture is the only source of real-compiler evidence for it.
+## `vb_bitstr.beam` (`vb_bitstr.erl`) — `tests/real_beam_variant_proofs/bitstrings.rs`
+The bit-syntax **match** surface, one export per instruction: `flat/1` (`<<A:16,B:16,R/binary>>` →
+`bs_match` with an `ensure_at_least` + two `integer` + `get_tail` command list, plus `bs_get_position`),
+`rewind/1` (a two-clause `case` whose first-clause fail block runs `bs_set_position` and re-matches, so
+it appears on a **success** path), `whole/2` (`<<C:N/binary,R/binary>> = B, {B,C,R}` → `bs_get_binary2`
++ `bs_set_position` + a **standalone** `bs_get_tail`; `badmatch` on failure), `sized/2`
+(`bs_get_binary2` with a `case_end` failure), `skip/2` (`bs_skip_bits2`, dynamic size), `utf16/1`
+(`bs_get_utf16` from a head pattern). Note that a tail read is normally folded into a `bs_match`
+command, so a plain `<<_:8,R/binary>>` pattern does **not** reach the `bs_get_tail` instruction.
+## `recv.beam` — exercised by `tests/real_beam_variant_proofs/receive.rs` too
+`recv.beam` is the receive-family proof source as well as `tests/receive.rs`'s fixture: `wait/0` (a
+`loop_rec`/`remove_message` hit, and the `wait` suspension/resume), `afterzero/0` and `aftervar/0`
+(`timeout`), `aftervar(5)` (a real suspension — `RunOutcome::Wait` + `wait_deadline`; the test host
+arms no timer, so it observes the deadline rather than firing it), `bomb/1` (`send`), `marked/0` (all
+four `recv_marker_*`, with a live queue position). Oracle values: `begin Self=self(), Self ! hello,
+recv:wait() end` → `hello`; `begin Self=self(), Self ! junk, recv:marked() end` → `7` (only `junk` left
+queued); `begin Self=self(), recv:bomb(Self), receive M -> M end end` → `42` (`recv:bomb(self())` →
+`ok`). Multi-statement oracle expressions must be wrapped in `begin … end` to parse inside
+`oracle_w`'s `[<expr>]`, and `recv:bomb(self)` (the bare atom) is a `badarg`, so the oracle needs
+`self()`.

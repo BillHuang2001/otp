@@ -194,7 +194,10 @@ impl Proof {
     pub fn error(&self) -> &BeamError {
         match &self.value {
             Err(error) => error,
-            Ok(term) => panic!("expected a raise, the run returned {term:?}\n{}", self.report()),
+            Ok(term) => panic!(
+                "expected a raise, the run returned {term:?}\n{}",
+                self.report()
+            ),
         }
     }
 
@@ -291,7 +294,9 @@ pub fn oracle_w(expr: &str) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8_lossy(&output.stdout).trim_end().to_string()
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string()
 }
 
 /// The real system `erl`'s `~w` rendering for the fixture call

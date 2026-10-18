@@ -97,7 +97,10 @@ fn make_fun3_builds_a_one_capture_closure_on_real_compiler_output() {
     // `FuncInfo`), with the argument in `x(0)` and the capture in `x(1)`.
     let applied = apply(&mut host, fun, &[make_small(5)]);
     applied.require_exactly("GcBif", 1);
-    assert_eq!(render(&host, applied.value()), oracle_w("(vb_funs:add_n(10))(5)"));
+    assert_eq!(
+        render(&host, applied.value()),
+        oracle_w("(vb_funs:add_n(10))(5)")
+    );
 }
 
 /// `make_fun3` with a **two-slot environment**: `vb_funs:env2(A, B)` is
@@ -117,12 +120,20 @@ fn make_fun3_builds_a_two_capture_closure_on_real_compiler_output() {
         return;
     }
     let mut host = host(&[FIXTURE]);
-    let built = run(&mut host, "vb_funs", "env2", &[make_small(2), make_small(3)]);
+    let built = run(
+        &mut host,
+        "vb_funs",
+        "env2",
+        &[make_small(2), make_small(3)],
+    );
     built.require_exactly("MakeFun3", 1);
     let fun = built.value();
 
     let applied = apply(&mut host, fun, &[make_small(1)]);
-    assert_eq!(render(&host, applied.value()), oracle_w("(vb_funs:env2(2,3))(1)"));
+    assert_eq!(
+        render(&host, applied.value()),
+        oracle_w("(vb_funs:env2(2,3))(1)")
+    );
 }
 
 // ---------------------------------------------------------------------------

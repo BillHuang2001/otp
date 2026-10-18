@@ -233,9 +233,7 @@ fn raise_re_raises_the_unmatched_exception_on_real_compiler_output() {
     if skip_if_unavailable() {
         return;
     }
-    assert_raise_matches_oracle("Raise", "rethrow", "a", |host| {
-        vec![term_atom(host, "a")]
-    });
+    assert_raise_matches_oracle("Raise", "rethrow", "a", |host| vec![term_atom(host, "a")]);
 }
 
 /// `Raise` (landing in an outer `try`): the same re-raise, caught one frame out,

@@ -67,7 +67,14 @@
 //! | [`bitstrings`] | `BsMatch`, `BsSetPosition`, `BsGetPosition`, `BsGetTail`, `BsGetBinary2`, `BsSkipBits2`, `BsGetUtf16` |
 //! | [`receive`] | `Send`, `LoopRec`, `RemoveMessage`, `Wait`, `Timeout`, `RecvMarkerReserve`, `RecvMarkerBind`, `RecvMarkerUse`, `RecvMarkerClear` |
 //!
-//! # Variants this suite does NOT prove, and why
+//! # What is proven, and what cannot be
+//!
+//! **All 41 variants of the formerly-blocked weight ordering that the installed
+//! compiler actually emits are proven here** — from `GetTupleElement` (140 759
+//! static occurrences) down to `TryCaseEnd` (270), plus the `CallOnly`, `Move`,
+//! `Trim`, `WaitTimeout` and `GcBif` shapes the rows reach on the way. The census
+//! counts are pinned per row, and every row compares its observable with the
+//! oracle.
 //!
 //! **Zero static corpus occurrences — out of scope by construction.** These six
 //! variants occur **nowhere** in the whole installed OTP corpus, so no fixture can
@@ -77,12 +84,21 @@
 //! statement available for a shape no compiler emits:
 //!
 //! * `Deallocate` — every corpus `deallocate` is fused with the following `return`
-//!   into `DeallocateReturn` by the loader (`beam_loader::lower::fuse`).
+//!   into `DeallocateReturn` by the loader (`beam_loader::lower::fuse`); the
+//!   `calls.rs` rows pin its count at **exactly 0** on real compiler output, which
+//!   is the positive form of this statement.
 //! * `SetTupleElement` — the corpus performs no in-place tuple write (`setelement/3`
 //!   builds a fresh tuple, i.e. `bif` + `put_tuple2`).
 //! * `IsNativeRecord`, `PutRecord`, `IsRecordAccessible` — the OTP-29 *native
 //!   record* opcode family, which this toolchain does not enable.
 //! * `BsTestTail2` — not emitted by the current bit-syntax code generator.
+//!
+//! Two further shapes are reachable only through a freshly compiled fixture, not
+//! through existing fixtures, and that is stated in the rows: `Raise` (the `raise`
+//! opcode, emitted only by a `try … catch` with no matching clause or a
+//! `try … after`; a scan of all 1321 installed OTP `.beam` files finds none) and
+//! the standalone `BsGetTail` (a tail read is normally folded into a `bs_match`
+//! command list). See each row's doc comment for the evidence trail.
 //!
 //! See [`RECORDED_PROOFS`] for the machine-readable per-variant table this suite's
 //! rows fill in, and `harness` for the shared proof implementation.
@@ -92,8 +108,6 @@ mod support;
 // The family files live in the `real_beam_variant_proofs/` directory beside this
 // crate root (a test-crate root resolves a bare `mod x;` to `tests/x.rs`, so the
 // paths are explicit).
-#[path = "real_beam_variant_proofs/harness.rs"]
-mod harness;
 #[path = "real_beam_variant_proofs/bitstrings.rs"]
 mod bitstrings;
 #[path = "real_beam_variant_proofs/calls.rs"]
@@ -104,6 +118,8 @@ mod data;
 mod exceptions;
 #[path = "real_beam_variant_proofs/funs.rs"]
 mod funs;
+#[path = "real_beam_variant_proofs/harness.rs"]
+mod harness;
 #[path = "real_beam_variant_proofs/receive.rs"]
 mod receive;
 

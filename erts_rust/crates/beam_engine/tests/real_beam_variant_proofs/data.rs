@@ -63,8 +63,9 @@ use crate::support::{term_atom, term_list, term_tuple, ModuleHost};
 /// Observed census over this run: `GetTupleElement = 1` (with `Label`, `Test(IsTuple)`,
 /// `Test(TestArity)`, `Return`).
 ///
-/// Oracle: `erl -noshell -pa tests/fixtures -eval 'io:format("~w~n",[tuples:first({a,1})]),halt(0).'`
-/// → `a`.
+/// Oracle: `erl -noshell -pz tests/fixtures -eval 'io:format("~w~n",[tuples:first({a,1})]),halt(0).'`
+/// → `a`. (Appended, never prepended: several fixtures shadow stdlib modules, and
+/// `-pa` makes the emulator die at boot — see `tests/CONTEXT.md`.)
 #[test]
 fn get_tuple_element_executes_on_real_compiler_output() {
     if skip_if_unavailable() {
@@ -75,7 +76,10 @@ fn get_tuple_element_executes_on_real_compiler_output() {
     let tuple = term_tuple(&mut host, &[tag, make_small(1)]);
     let proof = run(&mut host, "tuples", "first", &[tuple]);
     proof.require(&["GetTupleElement"]);
-    assert_eq!(render(&host, proof.value()), oracle_call("tuples", "first", "{a,1}"));
+    assert_eq!(
+        render(&host, proof.value()),
+        oracle_call("tuples", "first", "{a,1}")
+    );
 }
 
 /// `GetList` — the cons split the compiler emits when a `case` head uses **both**

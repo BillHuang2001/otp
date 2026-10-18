@@ -402,9 +402,9 @@ fn a_short_subject_rewinds_then_raises_case_clause() {
 fn live_reason(proof: &Proof) -> Eterm {
     match proof.value {
         Err(BeamError::Raise(ref raise)) => {
-            let live = raise
-                .live_reason()
-                .unwrap_or_else(|| panic!("the raise carries no live reason term\n{}", proof.report()));
+            let live = raise.live_reason().unwrap_or_else(|| {
+                panic!("the raise carries no live reason term\n{}", proof.report())
+            });
             *live.downcast_ref::<Eterm>().unwrap_or_else(|| {
                 panic!(
                     "the raise's live reason payload is not an `Eterm`\n{}",
