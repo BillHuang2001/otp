@@ -298,13 +298,21 @@ impl TcpInetDriver {
     ///
     /// The guard ladder is the C's, in the C's order (`inet_drv.c:12265-12325`):
     ///
-    /// 1. not connected ⇒ the C's delayed-close reply (`[0]econnreset`/`[0]closed` once, then
-    ///    `[0]enotconn`) or `[0]enotconn` (`:12279`-`:12286`);
+    /// 1. the **delayed-close reply** first — `[0]econnreset`/`[0]closed` once, then
+    ///    `[0]enotconn` (`:12279`-`:12288`), then the `!IS_CONNECTED` `[0]enotconn`;
     /// 2. `active || len != 8` ⇒ `[0]einval` (`:12290`);
     /// 3. a framing header type with a non-zero `Length` ⇒ `[0]einval` (`:12296`) — "exactly n
     ///    bytes" only exists for the raw header type;
     /// 4. `Length > TCP_MAX_PACKET_SIZE` ⇒ `[0]enomem` (`:12301`);
     /// 5. the receive slot is taken ⇒ `[0]ealready` (`:12307`).
+    ///
+    /// Step 1's order is load-bearing: the C's ladder **is** the `tcp_add_flags` check
+    /// (`if (desc->tcp_add_flags & TCP_ADDF_DELAYED_CLOSE_RECV)`, `:12279`) and only its `else`
+    /// is the `IS_CONNECTED` test (`:12286`). A passive close with the default
+    /// `{exit_on_close,true}` ends in `tcp_desc_close` → `erl_inet_close`, which clears
+    /// `INET_STATE_CONNECTED`/sets `INET_STATE_CLOSED` (`:5078`, `:5106`) — so a guard that
+    /// tested the state first would swallow the armed `closed`/`econnreset` this receive owes
+    /// and answer the bare `enotconn` instead.
     ///
     /// The id is taken **before** step 5, so a refused enqueue still advances the counter.
     pub(super) fn async_recv(
@@ -312,11 +320,11 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        if !self.state.is_connected() {
-            return Ok(ctl_xerror("enotconn"));
-        }
         if let Some(name) = self.peer_close.recv_reply() {
             return Ok(ctl_xerror(name));
+        }
+        if !self.state.is_connected() {
+            return Ok(ctl_xerror("enotconn"));
         }
         // `desc->inet.active` (`:12290`): an active-mode socket has no passive receive.
         if self.options.active != 0 || arg.len() != 8 {
@@ -555,6 +563,12 @@ impl TcpInetDriver {
     /// too, and the bytes that read collected stay in the port input queue for the runtime to
     /// deliver.
     ///
+    /// The ladder is consulted **before** the connection state, as the C's `:12279`-`:12286`
+    /// order demands: a passive close under the default `{exit_on_close,true}` runs
+    /// `tcp_desc_close`, which clears `INET_STATE_CONNECTED` (`:5078`) and sets
+    /// `INET_STATE_CLOSED` (`:5106`), so the state alone would answer the bare `enotconn` and
+    /// swallow the `closed`/`econnreset` this receive is owed.
+    ///
     /// This is the **synchronous** read-now verb; the C's asynchronous `TCP_REQ_RECV` takes a
     /// `Timeout(4), Length(4)` payload, requires a passive socket and a raw header type, and
     /// answers `[1] ++ async_id_be16` — that route is [`TcpInetDriver::async_recv`] (the numeric
@@ -572,11 +586,11 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        if !self.state.is_connected() {
-            return Ok(ctl_xerror("enotconn"));
-        }
         if let Some(name) = self.peer_close.recv_reply() {
             return Ok(ctl_xerror(name));
+        }
+        if !self.state.is_connected() {
+            return Ok(ctl_xerror("enotconn"));
         }
         if !arg.is_empty() {
             return Err(error::badarg());

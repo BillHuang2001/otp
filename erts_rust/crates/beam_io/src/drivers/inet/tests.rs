@@ -343,8 +343,12 @@ fn the_peer_close_answers_once_per_direction() {
 /// Once the peer's end goes away the driver **latches** the close: the
 /// [`TcpInetDriver::peer_closed`] accessor the runtime reads becomes true, the socket's poller
 /// registration is released (a dead descriptor must not keep reporting readiness), and the
-/// connection's [`InetState`] is deliberately **unchanged** — only the read half is gone, so
-/// answering `closed` the way the oracle does stays the verb layer's job.
+/// connection is **torn down** — a passive socket reads a close under the default
+/// `{exit_on_close,true}`, so the C runs `tcp_desc_close` → `erl_inet_close` (`inet_drv.c:12825`,
+/// `:5098`-`:5117`), which clears `INET_STATE_CONNECTED` (`:5078`) and sets
+/// `INET_STATE_CLOSED` (`:5106`). The reply ladders survive that teardown: the C keeps
+/// `desc->tcp_add_flags` across `tcp_desc_close`, so each direction still answers its one-shot
+/// `closed` before the bare `enotconn`.
 #[test]
 fn a_peer_close_is_observable_through_the_accessor() {
     let listener = loopback_listener();
@@ -384,8 +388,10 @@ fn a_peer_close_is_observable_through_the_accessor() {
     assert!(driver.eof());
     assert_eq!(
         driver.state(),
-        InetState::Connected,
-        "only the read half is gone, so the state is unchanged"
+        InetState::Closed,
+        "a passive close under the default `{{exit_on_close,true}}` tears the descriptor down \
+         (`inet_drv.c:12825` -> `erl_inet_close` `:5098`-`:5117`: `:5078` clears CONNECTED, \
+         `:5106` sets CLOSED), so the connection state is gone, not merely half-closed"
     );
     assert_eq!(
         driver.control(&mut ctx, "recv", b"").expect("the recv verb"),

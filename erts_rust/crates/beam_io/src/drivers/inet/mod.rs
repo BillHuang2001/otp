@@ -274,6 +274,10 @@ mod opt;
 #[path = "async.rs"]
 mod op_queue;
 pub mod packet;
+// The C's passive peer-close teardown (`tcp_desc_close`, `inet_drv.c:11932`): the half of a
+// latched close that closes the descriptor, kept out of this (already grown) source half. Its
+// own module doc is `src/drivers/inet/peer_close.rs`.
+mod peer_close;
 mod stat;
 mod sys;
 mod udp;
@@ -1123,19 +1127,16 @@ impl TcpInetDriver {
     /// (`INET_STATE_CLOSED`) and `GETFD` `[0]einval`. `Drop` runs this too, so a prebound
     /// descriptor is never closed by a dropped driver either.
     fn close_socket(&mut self) {
-        self.pending_input.clear();
-        if self.prebound {
+        // The descriptor half is `erl_inet_close`'s; the latch reset below is this floor's own
+        // "start over" for a **port** teardown (the `close` verb, `Driver::stop`, `Drop`). A
+        // prebound descriptor is not ours: nothing is closed and the state is kept.
+        if !self.close_descriptor() {
             return;
-        }
-        if let Some(fd) = self.socket.take() {
-            close_fd(fd);
         }
         self.read_eof = false;
         self.peer_close = PeerClose::default();
         self.shutdown_wr_done = false;
         self.pending_shutdown = None;
-        self.pending_input.clear();
-        self.state = InetState::Closed;
     }
     /// De-registers **and** closes the current socket, returning the de-registration outcome.
     ///
@@ -1313,9 +1314,19 @@ impl TcpInetDriver {
     /// peer again. The **next** `recv`/`send` answers `closed` and every later one `enotconn`
     /// (see [`PeerClose`]).
     ///
+    /// A **passive** socket is then torn down, as the C does — the descriptor is closed and the
+    /// state becomes [`InetState::Closed`], which is what turns `GETSTATUS`/`GETFD`/`PEER`/
+    /// `NAME`/`OPEN` into their `INET_STATE_CLOSED` answers. Which discoveries tear down (a
+    /// write always, a read only under the default `{exit_on_close,true}`) is
+    /// [`TcpInetDriver::tears_down_on_close`]'s, and the close itself
+    /// [`TcpInetDriver::close_descriptor`]'s: it is deliberately **not** [`Self::close_socket`],
+    /// because the C keeps the `tcp_add_flags` one-shots across `tcp_desc_close` and they are
+    /// what make the next armed `recv` answer `closed`/`econnreset`.
+    ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` when the poller rejects the de-registration.
+    /// Returns `BeamError::Io` when the poller rejects the de-registration; the teardown runs
+    /// either way (a dead descriptor must be closed, and the C has no such failure).
     fn latch_peer_close(
         &mut self,
         ctx: &mut DriverContext<'_>,
@@ -1329,7 +1340,13 @@ impl TcpInetDriver {
         // the teardown below.
         drain_closed(&mut self.async_ops, ctx)?;
         ctx.output().clear();
-        self.deregister(ctx)
+        let released = self.deregister(ctx);
+        // `tcp_recv_closed`/`tcp_recv_error`/`tcp_send_or_shutdown_error`'s passive
+        // `tcp_desc_close` (`inet_drv.c:12825`, `:12873`, `:13670`).
+        if self.tears_down_on_close(source) {
+            self.close_descriptor();
+        }
+        released
     }
 
     /// Drains the port's output queue to the socket, returning the number of bytes written.
@@ -1717,13 +1734,20 @@ impl TcpInetDriver {
     ///
     /// The write failure [`TcpInetDriver::write_pending`] reports — `BeamError::Io`, or the
     /// `unsupported` raise of a `{packet, …}` code with no decoder. An unconnected port is the
-    /// `[0]enotconn` reply above, never an `Err`.
+    /// `[0]enotconn` reply below, never an `Err`.
     fn verb_send(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
-        if !self.state.is_connected() {
-            return Ok(ctl_xerror("enotconn"));
-        }
+        // The C's `!IS_CONNECTED` arm consults the send ladder **first**
+        // (`tcp_inet_commandv`, `inet_drv.c:12681`-`:12692`, reached from `:12674`): a latched
+        // `closed`/`econnreset` one-shot is what the caller is answered with, and only an unarmed
+        // ladder is the bare `enotconn`. The order matters because a passive close under the
+        // default `{exit_on_close,true}` ends in `tcp_desc_close` → `erl_inet_close`, which
+        // clears `INET_STATE_CONNECTED` (`:5078`) and sets `INET_STATE_CLOSED` (`:5106`) — so a
+        // state-first guard would swallow the one-shot `tcp_recv_closed` armed (`:12816`).
         if let Some(name) = self.peer_close.send_reply() {
             return Ok(ctl_xerror(name));
+        }
+        if !self.state.is_connected() {
+            return Ok(ctl_xerror("enotconn"));
         }
         if self.pending_shutdown.is_some() {
             // A write shutdown could not be applied yet (the queue was not empty), and the C
