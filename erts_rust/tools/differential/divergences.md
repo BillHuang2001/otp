@@ -273,11 +273,6 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `120`) — an accounting residual, so only the plain-port item and the
   `port_set_data/2`/`port_get_data/1` round trip (which returns `true`, not `ok`) are pinned.
   Owner: `beam_rt`.
-- A `driver_output2` **DATA reply** carries a different term shape: the oracle delivers the
-  header/body split as an improper list `{data,[2,0,0,0,N|<<Body>>]}`, the Rust producer flattens
-  it to the proper list `{data,[2,0,0,0,N,…]}`. The bytes are identical, so the delivery family is
-  pinned through `iolist_to_binary/1` (`ram_file/read_write_seek_truncate_replies`), never raw.
-  Owner: `beam_abi`.
 - **`port_connect/2` to another process only half-lands**: `erlang:port_connect(P, Other)` itself
   agrees (`port_info(P,connected)` is `{connected,Other}` on both), but once **`Other` has exited**
   the oracle kills the port — `port_info(P)` and every item are `undefined`, `port_close/1` raises

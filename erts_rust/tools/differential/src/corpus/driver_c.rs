@@ -147,10 +147,6 @@
 //! * **`erl_drv_output_term` with an `ERL_DRV_PORT` operand** — the oracle delivers the port term;
 //!   `beam_rt` delivers nothing (measured: the receiver times out). Owner: `beam_abi`
 //!   (`decode_term_spec`'s port operand).
-//! * **`driver_output2`'s header/body *term shape*** — with a header the oracle delivers
-//!   `[97,98|<<99,100>>]` (an improper list, `deliver_read_message`, `io.c:3404-3435`), `beam_rt`
-//!   the flattened `<<97,98,99,100>>`. The **bytes** agree (the sibling `driver_abi` case pins
-//!   them through `iolist_to_binary/1`), the shape does not. Owner: `beam_rt`/`beam_io`.
 //! * **a plain `port_command/2` on a busy port** — the oracle suspends the caller until the driver
 //!   unmarks the port (a hang once the driver is waiting for that same caller), `beam_rt` reports
 //!   the typed `unsupported` gap. Only the `[nosuspend]` answer is pinnable (selector `28`).
