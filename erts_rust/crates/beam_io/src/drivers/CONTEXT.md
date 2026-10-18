@@ -113,8 +113,11 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   datagram port really sends (the destination rides the command's address field), so only a socket-less
   one refuses. The oracle instead answers `true` and then either delivers `{error,enotconn}` out of band
   (a caller-ref-prefixed payload) or kills the port (`init_caller`'s `EINVAL`) — neither shape is
-  reachable through the frozen `Driver` trait (no `driver_failure` seam, no asynchronous
-  `{inet_reply,…}` channel). The measured oracle shapes are in `inet/CONTEXT.md` › *Known Issues*.
+  reachable through the frozen `Driver` trait: there is no `driver_failure` seam, and answering the
+  C's way would mean accepting the command and reporting its bytes consumed for a write that never
+  happened. The `{inet_reply,…}` completion itself *is* expressible
+  (`DriverContext::deliver_completion`); what is missing is the C's accept-then-fail sequence. The
+  measured oracle shapes are in `inet/CONTEXT.md` › *Known Issues*.
 - Non-obvious framing divergences recorded in code: an out-of-range `{packet,N}` code is treated as
   **no framing** where the C's `packet_get_length` `default:` rejects it (`inet/frame.rs:96-105`); an
   unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).

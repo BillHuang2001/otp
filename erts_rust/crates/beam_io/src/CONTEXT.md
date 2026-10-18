@@ -103,7 +103,9 @@ channel**, built exactly like the two precedents above and deliberately **not** 
 exhaustive):
 - `completion.rs` → `CompletionEvent` (`InetReply { caller_ref: Option<Vec<u8>>, reply: InetReply }`
   / `InetAsync { id: u16, result: InetAsyncResult }`), `InetReply { Ok | Error(InetReason) }`,
-  `InetAsyncResult { Ok | Data(Vec<u8>) | Port(PortId) | Error(InetReason) }`,
+  `InetAsyncResult { Ok | Data(ReadMessage) | Accepted { fd } | Port(PortId) | Error(InetReason) }`
+  (`Data` keeps the crate's header/body read split, `Accepted` hands an accepted descriptor over
+  **owned** — the driver never stores it, so no teardown path can close it),
   `InetReason { Closed | Timeout | Errno(i32) }` (+ `from_errno`, `atom_name` — the lowercase POSIX
   name via `error::errno_atom`, with the C's `errno_<N>` fallback for an errno the table does not
   name), and the port-stamped `PortCompletion { port, event }`. Term-free: `caller_ref` is the
@@ -203,7 +205,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   `RefusingWriteDriver` whose `output`/`ready_output` answer `Err(BadArg)` — `Port::output`,
   `Port::ready_output` and `execute_port_tasks` each surface `BadArg` with the bytes still queued.
 - **The completion channel** is pinned structurally in `completion_tests.rs` — a sibling `#[path]`
-  module of `completion.rs` (13 tests, no `erl` needed): each of the nine driver interaction points
+  module of `completion.rs` (11 tests, no `erl` needed): each of the nine driver interaction points
   (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`/`drive_async`/`port_exit`/
   `stop`) stages a completion through a hook driver and it reaches `Port::take_completions` exactly
   once with the port's own id stamped; a timer-driven completion escapes through `pop_ready_task` +
@@ -226,7 +228,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`), the completion stage (`completions` + `take_completions`), and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`
 - `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`, `take_completions` + the `closed_completions` harvest)
 - `completion.rs` → the driver→owner completion side channel: `CompletionEvent` (`InetReply { caller_ref: Option<Vec<u8>>, reply }` / `InetAsync { id, result }`), `InetReply` (`Ok`/`Error(InetReason)`), `InetAsyncResult` (`Ok`/`Data`/`Port`/`Error`), `InetReason` (`Closed`/`Timeout`/`Errno` + `from_errno`/`atom_name`) and the port-stamped `PortCompletion { port, event }`
-- `completion_tests.rs` → the channel's structural suite (13 tests), a `#[path]` test module of `completion.rs`: all nine interaction points, the timer-only route, both round drivers, port-number ordering, the close harvest, exactly-once, and the no-sink `unsupported`
+- `completion_tests.rs` → the channel's structural suite (11 tests), a `#[path]` test module of `completion.rs`: all nine interaction points, the timer-only route, both round drivers, port-number ordering, the close harvest, exactly-once, and the no-sink `unsupported`
 - `driver_output2.rs` (`../tests/`) → the split-read pin over a real `PortRegistry`/`Poller`: one `Data` per call, header/body exact, `Some(vec![])` vs `None`, `input_len` = `hlen+len`, no re-report on a second round
 - `registry_reply_tests.rs` → the write-path pin: the reply round trip (`port_command` ⇒ one `Data`) and the refused-command propagation (`Err(BadArg)` out of `execute_port_tasks`), a `#[path]` test module of `registry.rs`
 - `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `PortTaskOutcome`

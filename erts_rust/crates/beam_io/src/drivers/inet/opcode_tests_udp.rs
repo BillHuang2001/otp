@@ -1048,14 +1048,15 @@ fn oracle_matrix() -> Vec<Call> {
 /// the real system `udp_inet` port and against this crate's port over `port_control`.
 ///
 /// The matrix carries only rows both sides can reproduce **byte for byte**. Three families are
-/// deliberately left to the non-oracle tests above: the well-formed `PACKET_REQ_RECV` and the
-/// `subscribe`/`getservby*`/`getif*` bodies (this floor's synchronous read-now substitution, and
-/// the typed capability gaps — a gap raises rather than replying, so it cannot ride a
-/// `port_control` matrix at all), the well-formed `fdopen` adoption (a descriptor number means
-/// something else in the oracle, so it is compared Rust-side only), and the `getiflist` reply (a
-/// host-dependent `getifaddrs(3)` interface table). Everything else — including the post-close
-/// `GETTYPE` row and the `{eol}`-free refusal rows — is compared exactly, with the
-/// ephemeral-port/descriptor rows compared shape-wise by [`Rule`].
+/// deliberately left out: the `subscribe`/`getservby*`/`getif*` bodies (the typed capability gaps —
+/// a gap raises rather than replying, so it cannot ride a `port_control` matrix at all), the
+/// well-formed `fdopen` adoption (a descriptor number means something else in the oracle, so it is
+/// compared Rust-side only), and the `getiflist` reply (a host-dependent `getifaddrs(3)` interface
+/// table). The well-formed `PACKET_REQ_RECV`(60) rows are compared against the oracle in the
+/// dedicated asynchronous suite (`udp/async_tests.rs`), which drives the reply, the completion, the
+/// deadline and the teardown end to end — this matrix keeps only its refusal rows.
+/// Everything else — including the post-close `GETTYPE` row and the `{eol}`-free refusal rows — is
+/// compared exactly, with the ephemeral-port/descriptor rows compared shape-wise by [`Rule`].
 ///
 /// **Skips loudly** when `erl` is not on `PATH`.
 #[test]

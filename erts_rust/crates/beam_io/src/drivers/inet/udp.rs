@@ -49,7 +49,7 @@
 //! | `bind` | `INET_REQ_BIND` (`:11409`) | packed address | `[1, port_hi, port_lo]` |
 //! | `connect` | `INET_REQ_CONNECT` (`:14710`) | packed address (the C's 4-byte timeout prefix is accepted and skipped) | `[1]`, or `[0] ++ errno` |
 //! | `send` | `packet_inet_command` (`:15037`) | `[address][anc_len:be32][data]`, optionally behind a `prim_inet` caller-reference prefix `[n:be16][tag]` | `[1]`, or `[0] ++ errno` |
-//! | `recv` | `PACKET_REQ_RECV` (`:14968`) | — (read-now) | `[1] ++ src_address` with a datagram, the bare `[1]` when none is pending, `[0] ++ errno` on failure |
+//! | `recv` | — (this floor's own read-now verb; the numeric `PACKET_REQ_RECV`(60) is the asynchronous arm below) | — | `[1] ++ src_address` with a datagram, the bare `[1]` when none is pending, `[0] ++ errno` on failure |
 //! | `close` | `INET_REQ_CLOSE` (`:14701`) | — | `[1]` |
 //! | `setopts` | `INET_REQ_SETOPTS` (`:11111`) | option records `[opt, val_be32]*` | `[1]`, or `[0] ++ "einval"` |
 //! | `getopts` | `INET_REQ_GETOPTS` (`:11046`) | option codes `[opt]*` | `[1] ++ [opt, val_be32]*`, or `[0] ++ "einval"` |
@@ -61,25 +61,34 @@
 //! [`beam_common::BeamError::BadArg`], the crate's argument-fault convention (the C answers
 //! `ctl_error(EINVAL)` for the former).
 //!
-//! # The reception model (the one deliberate divergence)
+//! # The reception model: two paths, one datagram shape
 //!
 //! A datagram's **source address** cannot ride the port's input queue — [`crate::ByteQueue`] is
 //! byte-only — and [`crate::PortNotification`] must keep exactly its two variants (an outside
-//! crate matches it exhaustively). So reception here is **verb-driven**:
+//! crate matches it exhaustively). Reception therefore has two paths, and the address rides only
+//! the asynchronous one:
 //!
-//! * `recv` performs **one** `recvfrom(2)` into a 64 KiB buffer (the largest IPv4 UDP payload).
-//!   On a datagram it pushes the payload to the port input queue (the runtime harvests it as a
+//! * **`PACKET_REQ_RECV`(60) — the C's own asynchronous request** ([`self::op_queue`]). The
+//!   control reply is the C's three-byte async id `[1] ++ <<Id:16/big>>` and the datagram arrives
+//!   later as an `{inet_async, Port, Id, Result}` completion
+//!   ([`InetAsyncResult::Data`](crate::completion::InetAsyncResult::Data)) whose
+//!   [`ReadMessage`](crate::port_task::ReadMessage) keeps the packed source address as its
+//!   **header** and the payload as its body — which is what lets the runtime render an `[list]`
+//!   port's flat `[1, PortHi, PortLo, A, B, C, D, …data]` and a `[binary]` port's improper
+//!   `[1, PortHi, PortLo, A, B, C, D | <<Payload>>]`. The guard ladder is the C's
+//!   (`[0]exbadport` / `[0]einval` / `[0]ealready`) and the operand's `Length` is **ignored**,
+//!   exactly as the C's datagram arm says it is (`inet_drv.c:14992`).
+//! * **the named `recv` verb — this floor's read-now convenience** (the C has no such control op):
+//!   **one** `recvfrom(2)` into a 64 KiB buffer (the largest IPv4 UDP payload). On a datagram it
+//!   pushes the payload to the port input queue (the runtime harvests it as a
 //!   [`crate::PortNotification::Data`] and forms `{udp, S, IP, Port, Data}`) and answers
-//!   `[1] ++ [INET_AF_INET, port_hi, port_lo, a, b, c, d]` — eight bytes — carrying the source.
-//!   On `EAGAIN` it answers the bare `[1]` (one byte) and delivers nothing, exactly as
-//!   [`super::TcpInetDriver`]'s drained-socket reply does; the reply **length** distinguishes
-//!   the two. A real syscall error is `[0] ++ errno_name`.
-//! * `ready_input` is a **documented no-op**. The socket still registers read readiness, so the
-//!   runtime observes the event and issues `recv`; the driver cannot push anything itself.
+//!   `[1] ++ [INET_AF_INET, port_hi, port_lo, a, b, c, d]` — eight bytes — carrying the source; on
+//!   `EAGAIN` it answers the bare `[1]` (one byte) and delivers nothing; the reply **length**
+//!   distinguishes the two. A real syscall error is `[0] ++ errno_name`.
 //!
-//! This cannot mirror the oracle's `PACKET_REQ_RECV` byte for byte: the C's code-60 request accepts the `Timeout(4), Length(4)` payload, enqueues an async operation on the descriptor's `INET_MAX_ASYNC = 1` queue, and answers the three-byte async-op id `[1] ++ async_id_be16` — measured against the oracle as `[1,0,0]`, then `[1,0,1]` on the next call — with the datagram itself arriving later as an `{inet_async, Port, Ref, Result}` message.
-//! Only the **empty** argument is `[0]einval`, which the C rejects without enqueuing anything.
-//! With no driver→owner message path, the floor replaces that whole asynchronous request/reply exchange with the synchronous read-now verb above, delivering the datagram in the reply itself.
+//! [`Driver::ready_input`] completes the queued operation when one is pending; with **none**
+//! queued it stays the passive no-op, because the source address has no channel in the port input
+//! queue and the runtime is then the one issuing `recv`.
 //!
 //! # What the real `gen_udp` still needs
 //!
@@ -96,24 +105,18 @@
 //! * **Ancillary data (`recvmsg`/`sendmsg` `IP_PKTINFO`, cmsg flags)** — the C's UDP halves keep
 //!   `recv_cmsgflags`/ancillary state; out of scope, so this floor uses `recvfrom(2)`/`sendto(2)`
 //!   and answers a typed error rather than dropping the ancillary half silently.
-//! * **The async-op queue** — `INET_MAX_ASYNC = 1` (`:1069`), `enq_async`, the
-//!   `[1] ++ async_id_be16` reply and the later `{inet_async, Port, Ref, Result}` message. The
-//!   C's `recv`/`connect` are asynchronous request/reply exchanges through it; this floor's are
-//!   synchronous, which is also why `recv` rejects the C's `Timeout(4), Length(4)` payload with
-//!   `BadArg` rather than accepting arguments it cannot honor.
-//! * **`INET_REQ_PEER` (code `4`)** — the UDP half does not implement the peer query, so it is
-//!   not a verb here at all (it is reached only through the control code, which this node does
-//!   not decode).
-//! * **The `{inet_reply, S, Reply, Ref}` message** — the C reports a queued command's outcome
-//!   that way, echoing the tag bytes of the `prim_inet` caller-reference prefix
-//!   (`inet_reply_caller_ref`, `:2610`-`:2660`), which needs a driver→owner message channel this
-//!   crate does not have. Both write paths **accept and strip** that prefix (the `send` verb,
+//! * **`{inet_reply, S, Reply, Ref}`'s *recipient*** — the C sends it to the `driver_caller` its
+//!   `init_caller` recorded (`inet_reply_caller_ref`, `:2610`-`:2660`). The reply itself **is**
+//!   staged here, tag bytes verbatim, by
+//!   [`UdpInetDriver::settle_command`](self::op_queue) for a queued command; with no caller
+//!   notion on the frozen [`Driver`]/[`DriverContext`] seam it is addressed to the port's
+//!   **owner** as a [`PortCompletion`](crate::completion::PortCompletion). Both write paths accept
+//!   and strip the `prim_inet` caller-reference prefix (the `send` verb,
 //!   [`UdpInetDriver::verb_send`], and the queued `port_command` path,
-//!   [`UdpInetDriver::write_pending`]), so the datagram itself is delivered; what is missing is
-//!   the reply, so a `prim_inet` caller that waits for it after a successful `port_command`
-//!   (`do_sendto/4`, `erts/preloaded/src/prim_inet.erl:678`-`:683`) has no counterpart here. The
-//!   verb's own answer stays the synchronous `ctl_reply` bytes, and a refused queued command
-//!   surfaces as a typed error instead of that message.
+//!   [`UdpInetDriver::write_pending`]), and a command with no prefix — or the C's zero-length tag
+//!   — stages **no** reply, exactly as `inet_reply_finish` does with a `NULL` caller. The `send`
+//!   verb's own answer stays the synchronous `ctl_reply` bytes, which is what a `port_control`
+//!   caller reads.
 //! * **IPv6, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
 //!   `AF_INET`/`SOCK_DGRAM` and `bind`/`connect`/`send` only the packed
 //!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms.
@@ -532,9 +535,11 @@ pub struct UdpInetDriver {
     /// [`beam_common::BeamError::BadArg`]; a non-zero ancillary length is the typed `unsupported`
     /// raise (the C's `sendmsg` cmsg arm, `:15220`, which this floor has no seam for). In every
     /// case the **queued bytes are never consumed**, so the caller learns the command was refused
-    /// instead of losing it. The C answers an `{inet_reply, S, {error, Reason}, Ref}` message
-    /// instead, which needs a driver→owner message channel this crate does not have (see the
-    /// module docs).
+    /// instead of losing it. When the command carries a `prim_inet` caller tag, a written one is
+    /// answered with the C's `{inet_reply, S, ok | {error, Reason}, Ref}` — staged as a
+    /// [`PortCompletion`](crate::completion::PortCompletion) by
+    /// [`UdpInetDriver::settle_command`] once the queue drains. A command refused before it is
+    /// written never reaches that stage, so its refusal is this typed error.
     ///
     /// # Accounting and what the return value means
     ///
@@ -827,16 +832,15 @@ pub struct UdpInetDriver {
     /// version byte and tag/arity words — tens of bytes), nowhere near 256, so this cannot arise
     /// from `prim_inet:send/3`; only a hand-built 256+-byte tag would be misparsed.
     ///
-    /// **Unsendable from this crate:** the C echoes the caller reference back as the fourth
-    /// element of the later `{inet_reply, S, Reply, Ref}` message (`inet_reply_finish` /
-    /// `inet_reply_caller_ref`, `:2610`-`:2660`). The frozen [`Driver`]/[`DriverContext`] seam
-    /// has no driver→owner message channel — and this floor's `send` is a **synchronous** reply
-    /// (see the module docs on the async-op queue) — so that message is not sent. The reply here
-    /// is the C's `ctl_reply` bytes, which is what a `port_control` caller reads; the
-    /// `{inet_reply, …}` shape stays a runtime-side gap. The queued `port_command` path does
-    /// **not** use this verb: it reaches [`UdpInetDriver::write_pending`], which parses the C's
-    /// queued grammar itself and accepts the same caller-reference prefix (see
-    /// [`decode_queued_command`] for its own order and residual).
+    /// **The reply is the verb's own, not a completion.** The C echoes the caller reference back
+    /// as the fourth element of the later `{inet_reply, S, Reply, Ref}` message
+    /// (`inet_reply_finish` / `inet_reply_caller_ref`, `:2610`-`:2660`); here a `control` call
+    /// reads the C's `ctl_reply` bytes in answer, and the `{inet_reply, …}` completion is produced
+    /// only by the queued path. The queued `port_command` path does **not** use this verb: it
+    /// reaches [`UdpInetDriver::write_pending`], which parses the C's queued grammar itself,
+    /// accepts the same caller-reference prefix, and stages `{inet_reply, Port, ok | {error,
+    /// Reason}, Tag}` through [`UdpInetDriver::settle_command`] (see [`decode_queued_command`] for
+    /// its own order and residual).
     ///
     /// # Errors
     ///
@@ -1246,8 +1250,8 @@ pub struct UdpInetDriver {
             // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): the shared `inet_ctl` arm, built
             // by the same helper the stream driver uses — `[1] ++ (op ++ be32(outq byte count))*`,
             // with an operand byte other than `INET_SUBS_EMPTY_OUT_Q` the C's `return -1`
-            // (`badarg`). The *subscription* (the later `{empty_out_q, Port}` message) is what
-            // this floor cannot honour — no driver→owner channel exists — not the reply.
+            // (`badarg`). The *subscription* (the later `{empty_out_q, Port}` message) has no
+            // completion event of its own, so it is not delivered — the reply is exact.
             Opcode::Subscribe => super::wire::subscribe_reply(ctx.output().len(), arg),
             // `INET_REQ_LISTEN` is a case of `packet_inet_ctl` only inside `#ifdef HAVE_SCTP`
             // (`:14846`). With SCTP compiled out the case does not exist and the `default:`
