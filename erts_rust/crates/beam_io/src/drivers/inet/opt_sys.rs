@@ -524,16 +524,23 @@ pub(super) fn get(
                     let consumed = 14 + if data_provided { arg_sz as usize } else { 0 };
                     let mut buf = vec![0u8; arg_sz as usize];
                     match fd {
-                        Some(fd) if sys::get_socket_bytes(fd, proto, arg_type, &mut buf).is_ok() => {
-                            reply.push(code);
-                            reply.extend_from_slice(&proto.to_be_bytes());
-                            reply.extend_from_slice(&arg_type.to_be_bytes());
-                            reply.extend_from_slice(&arg_sz.to_be_bytes());
-                            reply.extend_from_slice(&buf);
+                        Some(fd) => {
+                            if let Ok(read) =
+                                sys::get_socket_bytes(fd, proto, arg_type, &mut buf)
+                            {
+                                // The record reports the size the **kernel returned**, not the one
+                                // the caller asked for (`sock_getopt` writes `arg_sz` back and the
+                                // C reports it, `inet_drv.c:9573`-`:9578`).
+                                reply.push(code);
+                                reply.extend_from_slice(&proto.to_be_bytes());
+                                reply.extend_from_slice(&arg_type.to_be_bytes());
+                                reply.extend_from_slice(&(read as u32).to_be_bytes());
+                                reply.extend_from_slice(&buf[..read]);
+                            }
                         }
                         // A failed (or impossible) `getsockopt` drops the record, not the reply —
                         // but the request bytes are still consumed.
-                        _ => {}
+                        None => {}
                     }
                     Step::Done(consumed)
                 }
