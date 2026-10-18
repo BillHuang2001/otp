@@ -238,6 +238,8 @@ mod tests {
             vec![make_small(0)],
             vec![make_small(1)],
             vec![Eterm::default()],
+            vec![make_small(0); 2],
+            vec![make_small(0); 3],
             vec![make_small(0); 4],
         ];
         for &(_, function, arity) in REAL_BIFS {

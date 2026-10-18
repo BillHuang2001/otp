@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use beam_common::{BeamError, ExitReason, Result};
 use beam_term::prelude::signed_value;
-use beam_term::size::{size_object_with, SizingPolicy};
+use beam_term::size::{size_object_with, DefaultSizingPolicy, SizingPolicy};
 use beam_term::{atom_val, Eterm, NIL};
 
 use crate::access;
@@ -321,6 +321,27 @@ fn set_internal_state_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eter
 /// policy's [`is_shared`](SizingPolicy::is_shared) and the walk stays the canonical
 /// one ([`size_object_with`]).
 ///
+/// # Hash-map interior nodes: priced twice, like the oracle
+///
+/// The C's `size_shared` is *not* exactly `size/1` for a map above
+/// `MAP_SMALL_MAP_LIMIT`: its `MAP_SUBTAG` arm adds `1 + n + header_arity(hdr)` for a
+/// HAMT node and the node is charged again when it is reached a second time through
+/// the queue, so the answer is `size/1` plus that map's own node words.
+/// Oracle-verified (OTP 29.1.1 / erts-17.1) on `maps:from_list([{I,I} || I <-
+/// lists:seq(1,N)])`:
+///
+/// ```text
+/// N  size_shared  size/flat_size
+/// 33         180            123
+/// 34         184            126
+/// 40         216            148
+/// 100        528            364
+/// ```
+///
+/// and the same `+node words` delta holds with tuple- or list-valued maps (33 keys
+/// with `{I,I}` values: 279 vs 222). [`SharedOnce`] applies exactly that doubling, so
+/// this BIF reproduces the oracle's number for every map shape.
+///
 /// # The one unrepresentable half: literal areas
 ///
 /// The C also skips any subterm that lives in a **literal area**
@@ -331,7 +352,8 @@ fn set_internal_state_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eter
 /// ever skipped for that reason and a term the oracle keeps in a literal area is
 /// counted here exactly as the oracle counts the same term built at run time. Every
 /// **run-time-built** term — the whole graph a program can actually construct through
-/// BIFs — agrees, which is what the module tests pin against the oracle.
+/// BIFs — agrees, which is what the module tests and
+/// `tests/debugger_constants_oracle.rs` pin against the oracle.
 ///
 /// # Errors
 ///
@@ -352,6 +374,10 @@ fn size_shared_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// one object are the same word. `is_shared` is only ever called by the sizing walk
 /// for a non-immediate ([`beam_term::size`]'s `needs_visit`), so an immediate can
 /// never enter the set.
+///
+/// It also reproduces the one per-shape quirk `size_shared` differs from
+/// [`size_object`](beam_term::size::size_object) in: a **hash-map interior node** is
+/// priced **twice** (see [`size_shared_1`]'s "hash-map nodes" note).
 struct SharedOnce {
     seen: RefCell<HashSet<Eterm>>,
 }
@@ -369,8 +395,26 @@ impl SizingPolicy for SharedOnce {
         // `true` = already counted through another reference: price 0, do not descend.
         !self.seen.borrow_mut().insert(t)
     }
-}
 
+    fn object_words(&self, header: Eterm, payload: *const Eterm) -> Option<usize> {
+        // The canonical per-shape pricing, reached through the trait's **safe** default
+        // method (`SizingPolicy::object_words`), so this module never touches a raw
+        // pointer itself.
+        let words = DefaultSizingPolicy.object_words(header, payload)?;
+        // The C's `size_shared` charges a HAMT node's own words twice (`copy.c:459-472`
+        // plus the node reached again through the queue), which is why the oracle's
+        // `size_shared` of a >32-key map is `size/1` plus that map's node words
+        // (oracle-verified: 33 keys ⇒ 180 vs 123, 40 ⇒ 216 vs 148, 100 ⇒ 528 vs 364;
+        // same delta with tuple- or list-valued maps). `size_object_x` prices a node
+        // once (`copy.c:192-214`), so the doubling happens here rather than in the
+        // shared walk. `access::is_hashmap_node_header` is a pure header-word test.
+        Some(if access::is_hashmap_node_header(header) {
+            words * 2
+        } else {
+            words
+        })
+    }
+}
 /// `erts_debug:copy_shared/2` — a sharing-preserving copy of `Term`.
 ///
 /// Ground truth: `../../erts/emulator/beam/beam_debug.c:168-190`
@@ -763,14 +807,29 @@ mod tests {
     /// The types this module owns are exactly [`REAL_BIFS`], and every one of them is
     /// actually registered by [`register`].
     #[test]
-    fn real_bifs_is_the_single_key_and_is_registered() {
+    fn real_bifs_is_the_fourteen_real_keys_and_is_registered() {
         assert_eq!(
             REAL_BIFS,
             &[
+                ("erts_debug", "copy_shared", 2),
+                ("erts_debug", "disassemble", 1),
+                ("erts_debug", "get_internal_state", 1),
+                ("erts_debug", "interpreter_size", 0),
+                ("erts_debug", "lcnt_clear", 0),
+                ("erts_debug", "lcnt_collect", 0),
+                ("erts_debug", "lcnt_control", 1),
+                ("erts_debug", "lcnt_control", 2),
                 ("erts_debug", "map_info", 1),
-                ("erts_debug", "unaligned_bitstring", 2)
+                ("erts_debug", "set_internal_state", 2),
+                ("erts_debug", "size_shared", 1),
+                ("erts_debug", "unaligned_bitstring", 2),
+                ("erts_literal_area_collector", "send_copy_request", 3),
+                ("erts_trace_cleaner", "send_trace_clean_signal", 1),
             ]
         );
+        let mut sorted = REAL_BIFS.to_vec();
+        sorted.sort_unstable();
+        assert!(sorted.iter().eq(REAL_BIFS.iter()), "REAL_BIFS is not sorted");
         let mut reg = BifRegistry::new();
         super::register(&mut reg);
         for &(module, function, arity) in REAL_BIFS {
@@ -778,11 +837,15 @@ mod tests {
                 reg.contains(module, function, arity),
                 "{module}:{function}/{arity} must be registered by this module"
             );
+            // …and none of them reads the `RuntimeHooks` seam any more.
+            assert!(
+                !crate::hook_sets::needs_runtime_hooks(module, function, arity),
+                "{module}:{function}/{arity} is a real BIF but still sits in the seam roster"
+            );
         }
-        // Swapping a seam key for a real one must not change the family's key count.
-        assert_eq!(reg.len(), 18, "the erts_debug key count");
-    }
-    /// Every valid call returns the source's own bits at the source's own bit size —
+        // 14 real keys + the 6 remaining `runtime_bif!` seam keys.
+        assert_eq!(reg.len(), 20, "the erts_debug/collector key count");
+    }    /// Every valid call returns the source's own bits at the source's own bit size —
     /// the C's sub-bit view starts at the very `offset` the bits were copied to, so
     /// the `offset` leading bits are unobservable (oracle: `=:= the source`).
     #[test]
@@ -858,35 +921,405 @@ mod tests {
         }
     }
 
-    /// Every other key stays seam-backed: with no `RuntimeHooks` installed a call
-    /// answers the typed capability gap rather than a fabricated value.
-    #[test]
-    fn registers_and_gaps_without_a_hook() {
+    /// The atom table every probe in this section runs over: the constants a key answers
+    /// with, the gate's verbs, and the argument atoms the probes use.
+    fn probe_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed([
+            "false",
+            "true",
+            "error",
+            "undef",
+            "notsup",
+            "badarg",
+            "unsupported_bif",
+            "memory",
+            "available_internal_state",
+            "reds_left",
+            "clear",
+            "lists",
+            "a",
+            "b",
+            "c",
+            "foo",
+            "atom",
+            // `map_info/1`'s tags.
+            "depth",
+            "arrays",
+            "collisions",
+            "bitmaps",
+            "leafs",
+            "badmap",
+        ]);
+        atoms
+    }
+
+    /// One call of `module:function/arity` over a fresh heap and [`probe_atoms`], with
+    /// the outcome rendered as a stable label so it can outlive the call's heap.
+    ///
+    /// The labels are the oracle shapes: a value prints `atom(false)` / `int(0)`, an
+    /// ordinary argument failure `badarg`, and a raise `error:<reason atom>` — i.e. the
+    /// `{Class,Reason}` the oracle's `try … catch C:R -> {C,R} end` probe prints.
+    fn observe_args(
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> String {
         let mut reg = BifRegistry::new();
         super::register(&mut reg);
-        assert!(reg.contains("erts_debug", "interpreter_size", 0));
-        assert!(reg.contains("erts_debug", "set_internal_state", 2));
-
-        let mut heap = Heap::new(8).expect("test heap");
-        let atoms = AtomTable::new();
+        let mut heap = Heap::new(1 << 12).expect("test heap");
+        let atoms = probe_atoms();
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
-        match reg.call("erts_debug", "interpreter_size", 0, &mut ctx, &[]) {
-            Err(BeamError::Raise(r)) => {
-                assert_eq!(r.reason, ExitReason::atom("unsupported_bif"));
+        match reg.call(module, function, arity, &mut ctx, args) {
+            Ok(term) => {
+                if access::is_atom(term) {
+                    let name = atoms.name(atom_val(term)).unwrap_or("?").to_string();
+                    format!("atom({name})")
+                } else if access::is_small(term) {
+                    format!("int({})", signed_value(term))
+                } else {
+                    format!("term({:#x})", term.raw())
+                }
             }
-            other => panic!("expected unsupported_bif, got {other:?}"),
-        }
-        // `size_shared/1` stays a gap on purpose: the sharing it measures is
-        // unrepresentable here, so any answer would be a fabricated value (in
-        // particular never a constant `0`).
-        match reg.call("erts_debug", "size_shared", 1, &mut ctx, &[make_small(7)]) {
-            Err(BeamError::Raise(r)) => {
-                assert_eq!(r.reason, ExitReason::atom("unsupported_bif"));
-            }
-            other => panic!("expected unsupported_bif, got {other:?}"),
+            Err(BeamError::BadArg) => "badarg".to_string(),
+            Err(BeamError::Raise(raise)) => match raise.reason.as_atom() {
+                Some(name) => format!("error:{name}"),
+                None => format!("raise({:?})", raise.reason),
+            },
+            Err(other) => format!("err({other:?})"),
         }
     }
 
+    /// [`observe_args`] for an `erts_debug` key.
+    fn observe(function: &str, arity: u32, args: &[Eterm]) -> String {
+        observe_args("erts_debug", function, arity, args)
+    }
+
+    /// The atom `name` as a term over [`probe_atoms`].
+    fn atom_of(name: &str) -> Eterm {
+        make_atom(probe_atoms().lookup(name).expect("seeded"))
+    }
+
+    /// The two-element list `[X, Y]` on `heap`.
+    fn list2(heap: &mut Heap, x: Eterm, y: Eterm) -> Eterm {
+        let tail = heap.cons(y, NIL).expect("the tail fits");
+        heap.cons(x, tail).expect("the cons fits")
+    }
+
+    /// `interpreter_size/0`, `disassemble/1` and the `lcnt` constants are the answers a
+    /// build without the interpreter/lock-count facilities gives. Oracle-verified
+    /// (OTP 29.1.1 / erts-17.1): `0`, `false`, `error`, and `badarg` for *every*
+    /// `lcnt_control` argument.
+    #[test]
+    fn the_constant_bundle_matches_the_oracle() {
+        assert_eq!(observe("interpreter_size", 0, &[]), "int(0)");
+
+        let mfa = {
+            let mut heap = Heap::new(64).expect("test heap");
+            let atoms = probe_atoms();
+            let module = make_atom(atoms.lookup("lists").expect("seeded"));
+            let function = make_atom(atoms.lookup("a").expect("seeded"));
+            heap.tuple(&[module, function, make_small(2)])
+                .expect("the tuple fits")
+        };
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = probe_atoms();
+        let lists = make_atom(atoms.lookup("lists").expect("seeded"));
+        let nomod = make_atom(atoms.lookup("foo").expect("seeded"));
+        let a = make_atom(atoms.lookup("a").expect("seeded"));
+        let b = make_atom(atoms.lookup("b").expect("seeded"));
+        let list = list2(&mut heap, a, b);
+        for (label, arg) in [
+            ("{lists,a,2}", mfa),
+            ("lists", lists),
+            ("an unloaded atom", nomod),
+            ("42", make_small(42)),
+            ("[a,b]", list),
+        ] {
+            assert_eq!(
+                observe("disassemble", 1, &[arg]),
+                "atom(false)",
+                "disassemble({label})"
+            );
+        }
+
+        assert_eq!(observe("lcnt_clear", 0, &[]), "atom(error)");
+        assert_eq!(observe("lcnt_collect", 0, &[]), "atom(error)");
+
+        let tuple_clear = heap.tuple(&[atom_of("clear"), NIL]).expect("the tuple fits");
+        let single = heap.cons(atom_of("a"), NIL).expect("the cons fits");
+        for (label, arg) in [
+            ("clear", atom_of("clear")),
+            ("{clear,[]}", tuple_clear),
+            ("[a]", single),
+            ("42", make_small(42)),
+        ] {
+            assert_eq!(observe("lcnt_control", 1, &[arg]), "badarg", "lcnt_control({label})");
+        }
+        for (label, args) in [
+            ("(clear,[])", vec![atom_of("clear"), NIL]),
+            ("(a,b)", vec![atom_of("a"), atom_of("b")]),
+            ("(42,43)", vec![make_small(42), make_small(43)]),
+        ] {
+            assert_eq!(observe("lcnt_control", 2, &args), "badarg", "lcnt_control{label}");
+        }
+    }
+
+    /// `copy_shared/2` inspects its **flag** first (a non-boolean is `badarg` whatever the
+    /// term is) and then returns the term — this runtime has no literal areas, so the
+    /// term already *is* the copy (see the BIF's docs). Oracle: `copy_shared(foo, atom |
+    /// 1 | [])` ⇒ `{error,badarg}`; `copy_shared([a,b], true | false)` ⇒ `[a,b]`;
+    /// `copy_shared(a)` ⇒ `a`.
+    #[test]
+    fn copy_shared_checks_its_flag_first_and_returns_the_term() {
+        let foo = atom_of("foo");
+        for flag in [atom_of("atom"), make_small(1), NIL] {
+            assert_eq!(observe("copy_shared", 2, &[foo, flag]), "badarg");
+        }
+        let mut heap = Heap::new(8).expect("test heap");
+        let a = atom_of("a");
+        let b = atom_of("b");
+        let list = list2(&mut heap, a, b);
+        for flag in [atom_of("true"), atom_of("false")] {
+            assert_eq!(observe("copy_shared", 2, &[list, flag]), format!("term({:#x})", list.raw()));
+        }
+        // An immediate comes back as itself.
+        assert_eq!(observe("copy_shared", 2, &[a, atom_of("true")]), "atom(a)");
+    }
+
+    /// The two collector keys are the `notsup` protocol stubs: the C restricts them to
+    /// the emulator's own processes and raises `EXC_NOTSUP` before any argument check, so
+    /// every argument shape answers `error:notsup`. Oracle-verified for `1`, `[]`,
+    /// `self()` and `a` (cleaner) and `(1,2,3)`, `([],[],[])`, `(a,b,c)` (literal-area
+    /// collector).
+    #[test]
+    fn the_collector_protocol_stubs_answer_error_notsup() {
+        let mut heap = Heap::new(8).expect("test heap");
+        let pid = ProcessId::new(1, 0).to_eterm();
+        let single = heap.cons(atom_of("a"), NIL).expect("the cons fits");
+        for (label, arg) in [
+            ("1", make_small(1)),
+            ("[]", NIL),
+            ("self()", pid),
+            ("a", atom_of("a")),
+        ] {
+            assert_eq!(
+                observe_args("erts_trace_cleaner", "send_trace_clean_signal", 1, &[arg]),
+                "error:notsup",
+                "send_trace_clean_signal({label})"
+            );
+        }
+        for (label, args) in [
+            ("(1,2,3)", vec![make_small(1), make_small(2), make_small(3)]),
+            ("([],[],[])", vec![NIL, NIL, NIL]),
+            ("(a,b,c)", vec![atom_of("a"), atom_of("b"), atom_of("c")]),
+            ("([a],a,a)", vec![single, atom_of("a"), atom_of("a")]),
+        ] {
+            assert_eq!(
+                observe_args("erts_literal_area_collector", "send_copy_request", 3, &args),
+                "error:notsup",
+                "send_copy_request{label}"
+            );
+        }
+    }
+
+    /// The `available_internal_state` gate is a **process-global** static, so every test
+    /// that touches it serialises on this lock and restores it through [`GateOff`] — a
+    /// leaked "on" gate would silently turn the *other* tests' `undef` answers into the
+    /// typed gap.
+    static GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the gate to off when dropped, panicking test or not.
+    struct GateOff;
+
+    impl Drop for GateOff {
+        fn drop(&mut self) {
+            AVAILABLE_INTERNAL_STATE.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The gate matrix, oracle-verified (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// get_internal_state(memory)                            => {error,undef}   (gate off)
+    /// set_internal_state(available_internal_state,true)     => false           (first enable)
+    /// set_internal_state(available_internal_state,true)     => true            (already on)
+    /// set_internal_state(available_internal_state,false)    => true            (disable)
+    /// set_internal_state(available_internal_state,42)       => {error,undef}
+    /// get_internal_state(memory)                            => the real value on the
+    ///                                                          oracle; the typed
+    ///                                                          `unsupported_bif` gap
+    ///                                                          here (gate on)
+    /// set_internal_state(reds_left,1)                       => likewise (gate on)
+    /// ```
+    ///
+    /// The gate-on arm is a **typed capability gap, not a fabricated value**: `memory`
+    /// would need the `MemoryHook` totals and `reds_left` the scheduler internals.
+    #[test]
+    fn the_internal_state_gate_matches_the_oracle() {
+        let _lock = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        AVAILABLE_INTERNAL_STATE.store(false, Ordering::SeqCst);
+        let _restore = GateOff;
+
+        let memory = atom_of("memory");
+        let available = atom_of("available_internal_state");
+        let true_ = atom_of("true");
+        let false_ = atom_of("false");
+
+        // Gate off: every argument raises the bare atom `undef`.
+        assert_eq!(observe("get_internal_state", 1, &[memory]), "error:undef");
+        assert_eq!(observe("get_internal_state", 1, &[make_small(0)]), "error:undef");
+
+        // The one gate-free arm: it returns the PREVIOUS value.
+        assert_eq!(
+            observe("set_internal_state", 2, &[available, true_]),
+            "atom(false)"
+        );
+        assert!(AVAILABLE_INTERNAL_STATE.load(Ordering::SeqCst));
+        assert_eq!(
+            observe("set_internal_state", 2, &[available, true_]),
+            "atom(true)"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[available, false_]),
+            "atom(true)"
+        );
+        assert!(!AVAILABLE_INTERNAL_STATE.load(Ordering::SeqCst));
+
+        // A non-boolean second argument fails the `am_true`/`am_false` test and therefore
+        // falls through to the gate check ⇒ `undef` while the gate is off.
+        assert_eq!(
+            observe("set_internal_state", 2, &[available, make_small(42)]),
+            "error:undef"
+        );
+
+        // Gate on: the emulator internals this runtime cannot serve are the typed gap.
+        assert_eq!(
+            observe("set_internal_state", 2, &[available, true_]),
+            "atom(false)"
+        );
+        assert!(AVAILABLE_INTERNAL_STATE.load(Ordering::SeqCst));
+        assert_eq!(
+            observe("get_internal_state", 1, &[memory]),
+            "error:unsupported_bif"
+        );
+        assert_eq!(
+            observe("set_internal_state", 2, &[atom_of("reds_left"), make_small(1)]),
+            "error:unsupported_bif"
+        );
+        // …and flipping the gate back off restores `undef`.
+        assert_eq!(
+            observe("set_internal_state", 2, &[available, false_]),
+            "atom(true)"
+        );
+        assert_eq!(observe("get_internal_state", 1, &[memory]), "error:undef");
+    }
+
+    /// `size_shared/1` prices a run-time-built graph once per object and shares by
+    /// identity — `size/1`'s number, oracle-verified (see [`size_shared_1`]):
+    ///
+    /// ```text
+    /// size_shared([L1,L2])       => 12   (two separately built [a,b] lists)
+    /// size_shared([L1,L1])       =>  8   (the same list twice: the second counts 0)
+    /// size_shared(L1)            =>  4
+    /// size_shared(42|foo|[])     =>  0
+    /// ```
+    ///
+    /// (`{}` answers `0` on the oracle only because its empty tuple is a **global
+    /// literal**, which this runtime does not have — see [`size_shared_1`]'s literal-area
+    /// note.)
+    #[test]
+    fn size_shared_prices_a_run_time_built_graph_like_the_oracle() {
+        let mut heap = Heap::new(1 << 12).expect("test heap");
+        let a = atom_of("a");
+        let b = atom_of("b");
+        let l1 = list2(&mut heap, a, b);
+        let l2 = list2(&mut heap, a, b);
+        let distinct = list2(&mut heap, l1, l2);
+        assert_eq!(observe("size_shared", 1, &[l1]), "int(4)");
+        assert_eq!(observe("size_shared", 1, &[distinct]), "int(12)");
+        let shared = list2(&mut heap, l1, l1);
+        assert_eq!(observe("size_shared", 1, &[shared]), "int(8)");
+        // An immediate owns no heap words.
+        assert_eq!(observe("size_shared", 1, &[make_small(42)]), "int(0)");
+        assert_eq!(observe("size_shared", 1, &[a]), "int(0)");
+        assert_eq!(observe("size_shared", 1, &[NIL]), "int(0)");
+    }
+
+    /// A map above `MAP_SMALL_MAP_LIMIT` is the one shape whose `size_shared/1` is **not**
+    /// its `size/1`: the oracle charges a HAMT node's own words twice. Oracle-verified
+    /// (OTP 29.1.1 / erts-17.1) on `maps:from_list([{I,I} || I <- lists:seq(1,N)])`:
+    ///
+    /// ```text
+    ///  index range  size_shared   size/flat_size
+    ///  1..33               180              123
+    ///  1..34               184              126
+    ///  1..40               216              148
+    ///  1..100              528              364
+    /// ```
+    ///
+    /// and `size_shared([M33,M33])` is `184` (`180` + the two cons cells). The flat-size
+    /// assertions keep the two walks tied to the same map layout.
+    #[test]
+    fn size_shared_prices_a_hash_map_node_twice_like_the_oracle() {
+        let mut heap = Heap::new(1 << 18).expect("test heap");
+        for (range, flat, shared) in [
+            (1..=33i64, 123i64, 180i64),
+            (1..=34, 126, 184),
+            (1..=40, 148, 216),
+            (1..=100, 364, 528),
+        ] {
+            let map = int_map(&mut heap, range.clone());
+            assert_eq!(
+                beam_term::size::size_object(map) as i64,
+                flat,
+                "{range:?}: the flat size must match the oracle's erts_debug:size/1"
+            );
+            assert_eq!(
+                observe("size_shared", 1, &[map]),
+                format!("int({shared})"),
+                "{range:?}"
+            );
+            let pair = list2(&mut heap, map, map);
+            assert_eq!(
+                observe("size_shared", 1, &[pair]),
+                format!("int({})", shared + 4),
+                "{range:?} behind two cons cells"
+            );
+        }
+    }
+
+    /// The keys that stay **seam-backed** answer the typed capability gap — never a
+    /// fabricated value, never `undef`.
+    #[test]
+    fn the_remaining_seam_keys_answer_the_typed_gap() {
+        let mut reg = BifRegistry::new();
+        super::register(&mut reg);
+        for &(module, function, arity) in &[
+            ("erts_debug", "breakpoint", 2),
+            ("erts_debug", "dirty", 3),
+            ("erts_debug", "dirty_cpu", 2),
+            ("erts_debug", "dirty_io", 2),
+            ("erts_debug", "dist_ext_to_term", 2),
+            ("erts_debug", "instructions", 0),
+        ] {
+            assert!(
+                reg.contains(module, function, arity),
+                "{module}:{function}/{arity} must be registered"
+            );
+            assert!(
+                crate::hook_sets::needs_runtime_hooks(module, function, arity),
+                "{module}:{function}/{arity} must stay in the RuntimeHooks roster"
+            );
+            let args = vec![make_small(1); arity as usize];
+            assert_eq!(
+                observe_args(module, function, arity, &args),
+                "error:unsupported_bif",
+                "{module}:{function}/{arity}"
+            );
+        }
+    }
     // -----------------------------------------------------------------------
     // map_info/1
     //

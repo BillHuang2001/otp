@@ -692,6 +692,19 @@ pub(crate) fn is_hashmap(x: Eterm) -> bool {
     unsafe { beam_term::is_hashmap(x) }
 }
 
+/// Whether the boxed **header word** `header` heads a hash-map interior node (a HAMT
+/// head-array / head-bitmap / inner-bitmap / collision node) rather than a flat map or a
+/// non-map object.
+///
+/// A pure bit test on the header word — no payload is read — so it is safe to call on
+/// the `(header, payload)` pair a
+/// [`SizingPolicy`](beam_term::size::SizingPolicy) receives.
+#[inline]
+pub(crate) fn is_hashmap_node_header(header: Eterm) -> bool {
+    header.raw() & beam_term::tag::TAG_HEADER_MASK == beam_term::tag::MAP_SUBTAG
+        && !beam_term::is_flatmap_header(header)
+}
+
 /// Builds a flat map from `(key, value)` pairs on `heap`.
 ///
 /// The layout is owned by `beam_term::thing` (`write_flatmap`); the pair order is
