@@ -110,8 +110,9 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `Cranelift` → a typed error); `RunOutcome` (`Returned` / `Wait`), re-exported at the crate root.
 - `drive.rs` — **`Machine::drive`**: owns the `(func, pc)` position *and* the module context those indices belong
   to, folds every `Step` back into that position, and charges **exactly one reduction per interpreted instruction
-  before the instruction's effect** through the defaulted `ExecutionContext::reduce` (the only pre-emption point a
-  non-allocating loop reaches; read back through `Machine::reductions()`/`reset_reductions()`). The charge precedes
+  before the instruction's effect** through the defaulted `ExecutionContext::reduce` (the pre-emption point a
+  non-allocating loop reaches on this tier — the native baseline tier's driver loop charges the same hook once per
+  block entry instead, see `../jit/baseline/CONTEXT.md`; read back through `Machine::reductions()`/`reset_reductions()`). The charge precedes
   the body (C's `DISPATCH` order), so an `Err` from the hook pre-empts the instruction **without applying it**: the
   machine is left parked at that `(func, pc)` — recorded by `Machine::set_current_code` before the charge — and a
   `Machine::resume_outcome` there applies it exactly once. It also latches the **in-machine BIF-dispatch gate**

@@ -27,7 +27,10 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   instruction's effect**, by `Machine::drive` and observed through
   `Machine::reductions()`/`reset_reductions()`; a host pre-empts by returning its own typed error from
   `reduce`, which leaves the instruction unapplied and the machine parked at its `(func, pc)` so a
-  `Machine::resume_outcome` there applies it exactly once.
+  `Machine::resume_outcome` there applies it exactly once. The **native baseline tier's** driver loop charges the
+  same hook **once per driver-loop iteration** — one block entry, *before* `code.enter`, with the position
+  published first — so a compiled loop is pre-emptible at block granularity (a natively linked tail-call chain
+  stays inside one iteration and is priced once per round-trip; `tests/jit_reductions.rs`).
 - **`Step::Enter` crosses the module boundary on every tier.** A raise that lands in a catch frame
   belonging to another module context, a resolved cross-module `call_ext`, and a cross-module
   `return` onto a caller-context continuation all cross the module boundary as `Step::Enter`; the
