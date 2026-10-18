@@ -1195,9 +1195,6 @@ impl<'a> RuntimeContext<'a> {
         // for byte (the result stays on the pooled heap, which is then not rewound).
         let table = mailbox_table.as_deref_mut()?;
         let process = table.get_mut(pid)?;
-        // TEMPORARY (delete): the copy-out entry probe + the periodic summary line.
-        coprobe::copy_out(process.heap_mut().available());
-        coprobe::tick();
         // Spend the hint BEFORE the first attempt, so the copy succeeds on its first pass
         // instead of paying the refusal it would otherwise teach us again.
         hint_grow_gate(process, hint);
@@ -1221,8 +1218,6 @@ impl<'a> RuntimeContext<'a> {
             // graph: `beam_term::size_object(term)` — the obvious alternative — walks it all over
             // again *and* builds a `HashSet` plus a `Vec` on the way.
             Err(error) => {
-                // TEMPORARY (delete).
-                coprobe::refusal();
                 let needed = copy_shortfall_words(&error);
                 // LEARN: remember the graph size this process has proven it builds, so the
                 // next copy-out of the same shape is grown to fit *before* it is attempted.
@@ -1261,8 +1256,6 @@ impl<'a> RuntimeContext<'a> {
         // headroom is a capacity request, not an allocation, and it adds no per-call work.
         #[cfg(test)]
         notes::note_grow();
-        // TEMPORARY (delete).
-        coprobe::refusal_grow();
         let request = needed
             .saturating_mul(GROW_HEADROOM_FACTOR)
             .max(GROW_MIN_WORDS);
@@ -1276,8 +1269,6 @@ impl<'a> RuntimeContext<'a> {
             // nothing, so the retry starts from the identical nursery.
             #[cfg(test)]
             notes::note_grow();
-            // TEMPORARY (delete).
-            coprobe::refusal_grow();
             process.grow_nursery(needed.max(256)).ok()?;
         }
         copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term).ok()
@@ -1720,10 +1711,6 @@ const COPY_OUT_HINT_MIN_WORDS: usize = 8;
 /// own refusal + grow + retry still runs, so a ceiling can only ever cost the pre-copy
 /// opportunity, never the copy.
 fn hint_grow_gate(process: &mut beam_process::Process, hint: usize) {
-    // TEMPORARY (delete): the A/B's BEFORE arm, from the same binary.
-    if coprobe::hint_off() {
-        return;
-    }
     if hint < COPY_OUT_HINT_MIN_WORDS {
         return;
     }
@@ -1733,8 +1720,6 @@ fn hint_grow_gate(process: &mut beam_process::Process, hint: usize) {
     }
     #[cfg(test)]
     notes::note_hint_grow();
-    // TEMPORARY (delete).
-    coprobe::hint_grow();
     if process.grow_nursery(request).is_err() {
         // A `max_heap_size` ceiling: degrade to the bare hint, never a hard failure.
         let _ = process.grow_nursery(hint);
@@ -1913,145 +1898,6 @@ mod notes {
             hash_inserts: WALK_HASH_INSERTS.with(Cell::get),
             spills: WALK_SPILLS.with(Cell::get),
         }
-    }
-}
-
-/// **TEMPORARY MEASUREMENT INSTRUMENTATION — DELETE BEFORE MERGING.**
-///
-/// The process-global (this runtime is single-threaded) counters the copy-out A/B measurement
-/// reads, plus the two environment switches it drives:
-///
-/// * `BEAM_RT_COPY_OUT_STATS` — enable the counters and the periodic `[coprobe]` stderr line.
-/// * `BEAM_RT_COPY_OUT_HINT_OFF` — **skip** [`hint_grow_gate`] entirely, i.e. the BEFORE arm of
-///   the A/B, produced by the **same binary** as the AFTER arm.
-///
-/// Counters: `copy_outs` (one per `move_result_into_process_heap` entry), `refusals` (a first
-/// attempt the nursery refused), `refusal_grows` (`grow_nursery` calls answering one),
-/// `hint_grows` (`grow_nursery` calls the learned-hint gate made), `available_sum/count` (the
-/// free words seen at each copy-out), `contexts` (one per `RuntimeContext` construction) and one
-/// counter per **collection door** so "which door collects" is answerable.
-pub(crate) mod coprobe {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
-    pub(crate) static COPY_OUTS: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) static REFUSALS: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) static REFUSAL_GROWS: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) static HINT_GROWS: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) static AVAILABLE_SUM: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) static AVAILABLE_COUNT: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) static CONTEXTS: AtomicUsize = AtomicUsize::new(0);
-    /// `ensure_heap`'s `collect_or_grow` (the narrow admission door).
-    pub(crate) static DOOR_NARROW: AtomicUsize = AtomicUsize::new(0);
-    /// `ensure_heap_full`'s `collect_or_grow` (the wide admission door).
-    pub(crate) static DOOR_FULL: AtomicUsize = AtomicUsize::new(0);
-    /// `alloc_words_rooted`'s own collecting allocation.
-    pub(crate) static DOOR_ROOTS: AtomicUsize = AtomicUsize::new(0);
-    /// The reduction/yield-boundary door (`gc/reds_door.rs`).
-    pub(crate) static DOOR_REDS: AtomicUsize = AtomicUsize::new(0);
-
-    /// Every how many copy-outs the summary line is written.
-    const DUMP_EVERY: usize = 4096;
-
-    fn flag(name: &str) -> bool {
-        static CACHE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-        let (stats, hint_off) = *CACHE.get_or_init(|| {
-            (
-                std::env::var_os("BEAM_RT_COPY_OUT_STATS").is_some(),
-                std::env::var_os("BEAM_RT_COPY_OUT_HINT_OFF").is_some(),
-            )
-        });
-        if name == "stats" {
-            stats
-        } else {
-            hint_off
-        }
-    }
-
-    /// Whether the counters and the periodic dump are enabled.
-    pub(crate) fn enabled() -> bool {
-        flag("stats")
-    }
-
-    /// Whether [`super::hint_grow_gate`] must behave as if no hint were ever learned.
-    pub(crate) fn hint_off() -> bool {
-        flag("hint_off")
-    }
-
-    fn bump(counter: &AtomicUsize) {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// One `RuntimeContext` construction (a slice, or an `-eval`/`-run` entry).
-    pub(crate) fn context_created() {
-        if enabled() {
-            bump(&CONTEXTS);
-        }
-    }
-
-    /// One copy-out entry, with the destination's free words at that moment.
-    pub(crate) fn copy_out(available: usize) {
-        if enabled() {
-            bump(&COPY_OUTS);
-            AVAILABLE_SUM.fetch_add(available, Ordering::Relaxed);
-            bump(&AVAILABLE_COUNT);
-        }
-    }
-
-    /// One first-attempt refusal.
-    pub(crate) fn refusal() {
-        if enabled() {
-            bump(&REFUSALS);
-        }
-    }
-
-    /// One `grow_nursery` answering a refusal (the fallback path).
-    pub(crate) fn refusal_grow() {
-        if enabled() {
-            bump(&REFUSAL_GROWS);
-        }
-    }
-
-    /// One `grow_nursery` the learned-hint gate made.
-    pub(crate) fn hint_grow() {
-        if enabled() {
-            bump(&HINT_GROWS);
-        }
-    }
-
-    /// One collection through `door`.
-    pub(crate) fn door(door: &AtomicUsize) {
-        if enabled() {
-            bump(door);
-        }
-    }
-
-    /// Writes the summary every [`DUMP_EVERY`] copy-outs; one relaxed load otherwise.
-    pub(crate) fn tick() {
-        if !enabled() {
-            return;
-        }
-        let n = COPY_OUTS.load(Ordering::Relaxed);
-        if n % DUMP_EVERY != 0 {
-            return;
-        }
-        let contexts = CONTEXTS.load(Ordering::Relaxed);
-        let count = AVAILABLE_COUNT.load(Ordering::Relaxed);
-        let mean = if count == 0 {
-            0
-        } else {
-            AVAILABLE_SUM.load(Ordering::Relaxed) / count
-        };
-        eprintln!(
-            "[coprobe] attempts={n} refusals={} refusal_grows={} hint_grows={} mean_available={mean} contexts={contexts} ops_per_ctx={:.2} doors(narrow={},full={},roots={},reds={})",
-            REFUSALS.load(Ordering::Relaxed),
-            REFUSAL_GROWS.load(Ordering::Relaxed),
-            HINT_GROWS.load(Ordering::Relaxed),
-            if contexts == 0 { 0.0 } else { n as f64 / contexts as f64 },
-            DOOR_NARROW.load(Ordering::Relaxed),
-            DOOR_FULL.load(Ordering::Relaxed),
-            DOOR_ROOTS.load(Ordering::Relaxed),
-            DOOR_REDS.load(Ordering::Relaxed),
-        );
     }
 }
 
