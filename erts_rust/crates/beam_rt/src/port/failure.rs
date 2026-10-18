@@ -166,3 +166,7 @@ impl PortRegistry {
 #[cfg(test)]
 #[path = "failure_tests.rs"]
 mod failure_tests;
+
+#[cfg(test)]
+#[path = "failure_e2e_tests.rs"]
+mod failure_e2e_tests;

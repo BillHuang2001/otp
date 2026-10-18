@@ -92,19 +92,17 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use beam_common::BeamError;
-use beam_io::registry::PortRegistry as IoRegistry;
-use beam_io::{Poller, PortNotification};
+use beam_bifs::PortHook;
+use beam_io::PortNotification;
 use beam_process::{MonitorRef, PortId, ProcessId, RefAllocator};
 use beam_term::NIL;
 
-use super::super::{PortSignal, PortSignalKind, PortSignalReason};
-use crate::port::tests::{fixture, Fixture};
+use crate::port::exit::{PortSignal, PortSignalKind, PortSignalReason};
+use crate::port::tests::{assert_badarg, fixture, Fixture};
 use crate::port::RuntimePorts;
 
 /// The process the port belongs to — the recipient of every `'EXIT'`.
-const OWNER: ProcessId = ProcessId::new(11, 0);
-/// The `monitor(port, P)` watcher — the recipient of every `'DOWN'`.
+const OWNER: ProcessId = ProcessId::new(11, 0);/// The `monitor(port, P)` watcher — the recipient of every `'DOWN'`.
 const WATCHER: ProcessId = ProcessId::new(12, 0);
 
 /// The fixture: one driver whose `output` callback closes its own port through the C's
@@ -118,7 +116,7 @@ const FAILURE_C: &str = r#"
 
 #include <errno.h>
 #include <stdint.h>
-
+#include <stdio.h>
 typedef int (*rt_eof_fn)(ErlDrvPort);
 typedef int (*rt_atom_fn)(ErlDrvPort, char *);
 typedef int (*rt_code_fn)(ErlDrvPort, int);
@@ -478,15 +476,12 @@ struct Case {
 
 impl Case {
     /// Takes every published signal (after the failure has been drained).
+    ///
+    /// Taking is destructive, so a row reads **once** and asserts on that one list; there is
+    /// deliberately no second (non-consuming) accessor — [`assert_row`]'s whole-list comparison is
+    /// the assertion for both halves of the oracle table, an owed `'EXIT'` *and* the absence of one.
     fn signals(&mut self) -> Vec<PortSignal> {
         self.fx.registry.borrow_mut().take_port_signals()
-    }
-
-    /// The single `'EXIT'` entry the owner is owed, if any.
-    fn exit_entry(&mut self) -> Option<PortSignal> {
-        self.signals()
-            .into_iter()
-            .find(|signal| signal.kind == PortSignalKind::Exit)
     }
 
     /// Hands the port back and removes the scratch directory.
@@ -495,8 +490,7 @@ impl Case {
     }
 }
 
-/// Opens one port on the fixture driver and installs `monitor(port, P)` from [`WATCHER`].
-///
+/// Opens one port on the fixture driver and installs `monitor(port, P)` from [`WATCHER`].///
 /// The command is `port_command(P, <<opcode>>)`: the driver's `output` callback is what closes the
 /// port, so nothing is drained until [`Case::signals`] is called (the write's own channel drain
 /// publishes the signals).
@@ -513,14 +507,14 @@ fn open_row(stem: &str) -> Option<Case> {
         Ok(id) => id,
         Err(error) => {
             skip(&format!(
-                "driver failure {stem}: the fixture driver did not load ({error})"
+                "driver failure ({}): the fixture driver did not load ({error})",
+                compiled.name
             ));
             compiled.cleanup();
             return None;
         }
     };
-    let reference = RefAllocator::new().next();
-    {
+    let reference = RefAllocator::new().next();    {
         let mut registry = fx.registry.borrow_mut();
         registry
             .port_table_mut()
@@ -580,21 +574,24 @@ fn assert_row(
     };
     let signals = case.signals();
     assert_eq!(signals, expected, "{what}: the published signals");
+    // The oracle's other half: `erlang:port_info(P)` is `undefined` — this runtime's empty item
+    // list is that rendering (see [`crate::port::PortRegistry::info`]).
+    assert!(
+        case.hook
+            .port_info(case.id)
+            .expect("port_info answers for a failed port")
+            .is_empty(),
+        "{what}: a failed port has no port_info/1 items"
+    );
     // ...and the port is as gone as a closed one.
-    let mut registry = case.fx.registry.borrow_mut();
-    assert!(!registry.is_live(case.id), "{what}: the port left the runtime");
+    let mut registry = case.fx.registry.borrow_mut();    assert!(!registry.is_live(case.id), "{what}: the port left the runtime");
     assert!(registry.is_empty(), "{what}: no live port remains");
     assert!(
-        !registry.has_nothing_to_poll() || !owes_exit,
+        registry.has_nothing_to_poll(),
         "{what}: nothing is pending once the signals are taken"
     );
-    assert_eq!(
-        registry.close(case.id),
-        Err(BeamError::BadArg),
-        "{what}: `port_close/1` on the failed port is the oracle's `badarg`"
-    );
+    assert_badarg(registry.close(case.id));
 }
-
 // ---------------------------------------------------------------------------------------------
 // The rows
 // ---------------------------------------------------------------------------------------------
@@ -697,17 +694,9 @@ fn driver_exit_with_zero_owes_the_watcher_a_normal_down_and_the_owner_nothing() 
         return;
     };
     fail(&mut case, 6);
-    assert!(
-        case.exit_entry().is_none(),
-        "driver_exit unlinks the connected process: no 'EXIT' may be published (and the single \
-         entry is consumed, so a second read would be empty)"
-    );
-    assert_row(
-        &mut case,
-        false,
-        PortSignalReason::Normal,
-        "driver_exit(P,0)",
-    );
+    // `owes_exit == false`: the whole-list comparison below is the `unlink_proc` assertion — a
+    // published `'EXIT'` would make the list longer than the watcher's one `'DOWN'`.
+    assert_row(&mut case, false, PortSignalReason::Normal, "driver_exit(P,0)");
     case.finish();
 }
 
@@ -722,10 +711,6 @@ fn driver_exit_with_a_posix_code_owes_the_watcher_an_eacces_down_and_the_owner_n
         return;
     };
     fail(&mut case, 7);
-    assert!(
-        case.exit_entry().is_none(),
-        "driver_exit(P,EACCES) owes the owner no 'EXIT'"
-    );
     assert_row(
         &mut case,
         false,
@@ -734,7 +719,6 @@ fn driver_exit_with_a_posix_code_owes_the_watcher_an_eacces_down_and_the_owner_n
     );
     case.finish();
 }
-
 /// The data-then-failure row: a `driver_output` **before** the failure is delivered ahead of the
 /// port's exit, and exactly one `'EXIT'` (never two) is published.
 ///
@@ -786,14 +770,12 @@ fn a_data_read_before_a_failure_reaches_the_round_ahead_of_one_exit_signal() {
     // the next port-task round reports them exactly once, ahead of the close report.
     let outcome = {
         let registry = &mut *case.fx.registry.borrow_mut();
-        let IoRegistry { .. } = *registry;
         registry
             .registry
             .execute_port_tasks(&mut registry.poller, 1024)
             .expect("the port-task round runs")
     };
-    let reads: Vec<Vec<u8>> = outcome
-        .notifications
+    let reads: Vec<Vec<u8>> = outcome        .notifications
         .iter()
         .filter_map(|notification| match notification {
             PortNotification::Data { port, read } if *port == case.id => Some(read.flattened()),
@@ -810,13 +792,8 @@ fn a_data_read_before_a_failure_reaches_the_round_ahead_of_one_exit_signal() {
         !after.is_live(case.id),
         "the port is gone: the read above and the signals are all that is left of it"
     );
-    assert_eq!(
-        after.close(case.id),
-        Err(BeamError::BadArg),
-        "and `port_close/1` is the oracle's `badarg`"
-    );
-    drop(after);
-    case.finish();
+    assert_badarg(after.close(case.id));
+    drop(after);    case.finish();
 }
 
 /// The driver's `driver_failure*` return value is the host's (`0` — the C's own success code),

@@ -42,12 +42,11 @@
 //!
 //! The **reason mapping** every one of those rows goes through
 //! ([`signal_reason`](super::signal_reason)) and the queue state that keeps a failed port's owed
-//! messages from letting the pump declare quiescence. The end-to-end route — a real `.so` whose
-//! `output` callback calls `driver_failure_atom` through the address handed to it in the loader's
-//! command string — is a follow-up for this node (see `src/port/CONTEXT.md` *Known Issues*): it
-//! needs the driver symbols the `--lib` link does not export, and the fixture that exercises them
-//! lives in `beam_abi`'s own suite (`tests/fixtures/driver_failure.c`), which pins the
-//! `PortFailure` each spelling reaches the host with.
+//! messages from letting the pump declare quiescence.
+//!
+//! The end-to-end route — a real `.so` whose `output` callback calls `driver_failure*` through the
+//! addresses handed to it in the loader's command string — is [`super::failure_e2e_tests`], which
+//! pins each row's published [`PortSignal`] list and the port's own disappearance.
 
 use beam_io::{DriverFailure, FailureReason};
 use beam_process::PortId;
