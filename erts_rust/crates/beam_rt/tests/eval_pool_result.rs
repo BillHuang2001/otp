@@ -31,10 +31,10 @@
 //!    so a rewind that recycled a live word would print garbage;
 //! 2. a run of a **thousand** container BIF calls under a small `+hmax`: each call hands its
 //!    words back, so the pool's high-water stays at one call's worth. This is the case the
-//!    rewind exists for, and it is a real discriminator: the same expression without the
-//!    rewind raises `system_limit` at every cap up to `+hmax 16384` (measured), because the
-//!    pool's frontier marches to the cap instead of returning to the mark;
-//! 3. a container **retained across sub-expressions** while hundreds of later BIF calls rewind
+//!    rewind exists for, and it is a real discriminator: the run's container results total
+//!    ≈ 23 000 words, so a pool that kept each one where it was built would need more than
+//!    `+hmax 16384` — the run would raise `system_limit` there instead of completing under the
+//!    `+hmax 8192` it is pinned to (measured caps and their verdicts: [`HEAP_CAP`]);//! 3. a container **retained across sub-expressions** while hundreds of later BIF calls rewind
 //!    the pool past it.
 //!
 //! Every case is compared with the system Erlang oracle by **trimmed stdout equality plus the
@@ -65,12 +65,24 @@ const CONTAINER_RETAINED: &str = "L = lists:seq(1,30), A = lists:last(L), \
 
 /// The heap cap case 2 runs under: `+hmax N` sizes the pooled BIF heap **and** the store.
 ///
-/// The window is measured, not guessed. Case 2 needs at least `+hmax 4096` on this runtime (at
-/// 2048 the cap binds for an unrelated reason) and the *un-rewound* pool needs more than
-/// `+hmax 16384` to finish the same expression — so 8192 discriminates with a 2× margin on
-/// both sides.
+/// The window is measured, not guessed. Walking the cap down on this runtime (OTP 30 /
+/// erts-17.1 tree, `-eval` of [`MANY_CONTAINER_CALLS`], the runtime built from this tree):
+///
+/// | `+hmax` | result |
+/// |---|---|
+/// | 512, 1024 | exit 3 — the boot's own term construction does not fit a 1024-word pool |
+/// | 1536, 2048 | exit 1, `beam_rt: system_limit` — one call's result no longer fits |
+/// | **2560** | **1000, exit 0 — the smallest cap that completes** |
+/// | 3072 … 16384 | 1000, exit 0 |
+///
+/// so 8192 discriminates with a 3.2× margin below and 2× above. The *un-rewound* pool
+/// would have to hold every one of the run's container results at once — 1000 tuples of 20
+/// elements (21 words each) plus the 1000-element result list, ≈ 23 000 words — i.e. more
+/// than `+hmax 16384`, which is why the cap is a real discriminator and not decoration: with
+/// the pool growth `min(2 × capacity, cap)`, the rewind is the only thing that keeps the run
+/// inside it (`src/context/pool/tests.rs` pins the same discriminator in-node, where the cap
+/// is pinned to the region's own size and the growth branch is thereby disabled outright).
 const HEAP_CAP: &[&str] = &["+hmax", "8192"];
-
 /// Runs `beam_rt -noshell <extra…> -eval <expr>` and returns `(trimmed stdout, exit code)`.
 ///
 /// The invocation is the CLI's documented `-eval` route (contract A.6): the expression is
