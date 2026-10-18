@@ -20,23 +20,19 @@
 
 //! The **accept** state machine of the built-in socket drivers, at the driver boundary: the
 //! `INET_REQ_ACCEPT`(26) guard, the multi-op accept queue it feeds, the asynchronous ids it hands
-//! out, the state bits `INET_REQ_GETSTATUS`(16) reports for the queued operations, the listener's
-//! readiness arming and the teardown drain.
-//!
-//! Everything here goes through the crate's own [`PortRegistry`](crate::PortRegistry) /
-//! [`Poller`](crate::Poller) path — the same [`Rig`] the numeric-opcode suite uses — because the
-//! accept reply is only the *id*: the operation's outcome is a
+//! out, the descriptor-state bits `INET_REQ_GETSTATUS`(16) reports for the queued operations, and
+//! the teardown drain — all through the crate's own [`PortRegistry`](crate::PortRegistry) /
+//! [`Poller`](crate::Poller) path (the [`Rig`] the numeric-opcode suite uses), because an accept's
+//! reply is only the **id**: the outcome is a
 //! [`CompletionEvent::InetAsync`](crate::completion::CompletionEvent::InetAsync) staged on a
 //! **later** port-task round, which is exactly what a live runtime drains.
 //!
-//! The suite is fully **hermetic**: no `erl` oracle, no connecting peer and no sleeps. Every
-//! listener binds `127.0.0.1:0` (so the kernel picks an ephemeral port and nothing is exposed) and
-//! nothing ever connects to it, which is what keeps the accept queue's *outcomes* deterministic:
-//! a long deadline never fires, a zero deadline fires on the next round, and a close drains what
-//! is left. The half that needs a real peer — a completed accept handing over an
-//! [`InetAsyncResult::Accepted`](crate::completion::InetAsyncResult) descriptor, a peer close, and
-//! a single port holding both a pending accept and a pending recv — lives in the sibling
-//! real-socket suites (`tests/inet_async.rs`, `async_tests.rs`), never here.
+//! Fully **hermetic**: no `erl` oracle, no connecting peer, no sleeps. Every listener binds
+//! `127.0.0.1:0` (the kernel picks an ephemeral port, nothing is exposed) and nothing ever
+//! connects, which is what makes the queue's outcomes deterministic — a long deadline never fires,
+//! a zero deadline fires on the next round, and a close drains what is left. The half that needs a
+//! real peer (an `Accepted` descriptor, a peer close, one port holding both a pending accept and a
+//! pending recv) lives in the sibling real-socket suites, never here.
 use super::op_queue::async_ok_reply;
 use super::opcode_tests::{loopback_arg, op, open_arg, Rig};
 use super::wire::{ctl_ok, ctl_xerror, getstatus_reply};
@@ -46,66 +42,47 @@ use super::{
 };
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason};
 
-/// `INET_REQ_OPEN` (`inet_drv.c:11961`).
+// The `erlang:port_control/3` codes this suite drives, under the C's `tcp_inet_ctl`/`inet_ctl`
+// names (`inet_drv.c`): `OPEN`=1, `CLOSE`=2, `BIND`=6, `SETOPTS`=7, `GETOPTS`=8, `GETSTATUS`=16,
+// `ACCEPT`=26, `LISTEN`=27. The arms live in `super`'s `control_opcode` and `super::udp`.
 const OPEN: u32 = 1;
-/// `INET_REQ_CLOSE` (`inet_drv.c:11887`).
 const CLOSE: u32 = 2;
-/// `INET_REQ_BIND` (`inet_drv.c:11409`).
 const BIND: u32 = 6;
-/// `INET_REQ_SETOPTS` (`inet_drv.c:6820`).
 const SETOPTS: u32 = 7;
-/// `INET_REQ_GETOPTS` (`inet_drv.c:9127`).
 const GETOPTS: u32 = 8;
-/// `INET_REQ_GETSTATUS` (`inet_drv.c:11148`).
 const GETSTATUS: u32 = 16;
-/// `INET_REQ_ACCEPT` (`inet_drv.c:12144`).
 const ACCEPT: u32 = 26;
-/// `INET_REQ_LISTEN` (`inet_drv.c:12042`).
 const LISTEN: u32 = 27;
 
-/// `INET_STATE_LISTENING` — a listener with **no** accept queued: `OPEN | INET_F_LISTEN` = `1 | 8`.
+/// A listener with no accept queued: `INET_STATE_LISTENING` = `OPEN | INET_F_LISTEN` = `1 | 8`.
 const LISTENING_STATUS: u32 = 9;
-/// One queued accept: `9 | INET_F_ACC` (`0x0020`) = `0x29`. Measured on the oracle.
+
+/// One queued accept: `9 | INET_F_ACC` (`0x20`) = `0x29`. Measured on the oracle.
 const ONE_ACCEPT_STATUS: u32 = 41;
-/// Two or more queued accepts: `9 | INET_F_ACC | INET_F_MULTI_CLIENT` (`0x0100`) = `0x129`.
+
+/// Two or more queued accepts: `9 | INET_F_ACC | INET_F_MULTI_CLIENT` (`0x100`) = `0x129`.
 /// Measured on the oracle.
 const MULTI_ACCEPT_STATUS: u32 = 297;
 
-/// A 60 000 ms accept deadline: far enough away that no round can reach it, so the queue stays put
-/// while the state bits are inspected.
+/// A 60 000 ms accept deadline: no round can reach it, so the queue stays put.
 const LONG_TIMEOUT: [u8; 4] = [0, 0, 0xea, 0x60];
 
-/// A zero accept deadline — the C's `driver_set_timer(port, 0)`, due at the next round.
+/// A zero deadline — the C's `driver_set_timer(port, 0)`, due at the next round.
 const ZERO_TIMEOUT: [u8; 4] = [0, 0, 0, 0];
 
 /// Asserts a `bind` reply is the C's `[1] ++ port_hi ++ port_lo` and returns the bound port.
 fn bound_port(reply: &[u8]) -> u16 {
-    assert_eq!(
-        reply.len(),
-        3,
-        "`bind` answers `[1, port_hi, port_lo]`, got {reply:?}"
-    );
-    assert_eq!(
-        reply[0], INET_REP_OK,
-        "`bind`'s result tag is `INET_REP_OK`, got {reply:?}"
-    );
+    assert_eq!(reply.len(), 3, "`bind` answers `[1, port_hi, port_lo]`, got {reply:?}");
+    assert_eq!(reply[0], INET_REP_OK, "`bind`'s result tag is `INET_REP_OK`, got {reply:?}");
     u16::from_be_bytes([reply[1], reply[2]])
 }
 
 /// Opens, binds `127.0.0.1:0` (the kernel assigns the port) and listens, returning the bound port.
 fn listening(rig: &mut Rig) -> u16 {
-    assert_eq!(
-        rig.control(&op(OPEN), &open_arg()),
-        ctl_ok(),
-        "`open` on the stream driver answers `[1]`"
-    );
+    assert_eq!(rig.control(&op(OPEN), &open_arg()), ctl_ok(), "`open` answers `[1]`");
     let port = bound_port(&rig.control(&op(BIND), &loopback_arg(0)));
     assert_ne!(port, 0, "the kernel assigned an ephemeral port");
-    assert_eq!(
-        rig.control(&op(LISTEN), &[0, 5]),
-        ctl_ok(),
-        "`listen` with a `[hi, lo]` backlog answers `[1]`"
-    );
+    assert_eq!(rig.control(&op(LISTEN), &[0, 5]), ctl_ok(), "`listen` answers `[1]`");
     port
 }
 
@@ -117,19 +94,22 @@ fn events(rig: &mut Rig) -> Vec<CompletionEvent> {
 
 /// The `{inet_async, Port, Id, {error, timeout}}` completion.
 fn timed_out(id: u16) -> CompletionEvent {
-    CompletionEvent::InetAsync {
-        id,
-        result: InetAsyncResult::Error(InetReason::Timeout),
-    }
+    let result = InetAsyncResult::Error(InetReason::Timeout);
+    CompletionEvent::InetAsync { id, result }
 }
 
-/// The `{inet_async, Port, Id, {error, closed}}` completion a teardown drains a queued operation
-/// with.
+/// The `{inet_async, Port, Id, {error, closed}}` completion a teardown drains an operation with.
 fn closed(id: u16) -> CompletionEvent {
-    CompletionEvent::InetAsync {
-        id,
-        result: InetAsyncResult::Error(InetReason::Closed),
-    }
+    let result = InetAsyncResult::Error(InetReason::Closed);
+    CompletionEvent::InetAsync { id, result }
+}
+
+/// The `getopts` reply a stored `{active, N}` reports: `[1] ++ [code, val_be32]`.
+fn active_reply(value: u32) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.push(INET_LOPT_ACTIVE);
+    reply.extend_from_slice(&value.to_be_bytes());
+    reply
 }
 
 #[test]
@@ -137,42 +117,27 @@ fn accept_on_a_non_listener_answers_einval_in_every_state() {
     let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
 
     // Never opened: the accept guard is the C's combined "not listening **or** bad operand" test
-    // (`inet_drv.c:12160`), and it answers `einval` — never `exbadport` — so a bare port refuses an
-    // otherwise well-formed 4-byte operand this way.
+    // (`inet_drv.c:12160`) and answers `einval` — never `exbadport` — even for a well-formed
+    // 4-byte operand (measured on the oracle in every non-listening state).
     assert_eq!(
         rig.control(&op(ACCEPT), &LONG_TIMEOUT),
         ctl_xerror("einval"),
         "accept on a never-opened port answers `einval`"
     );
-
-    assert_eq!(
-        rig.control(&op(OPEN), &open_arg()),
-        ctl_ok(),
-        "`open` on the stream driver answers `[1]`"
-    );
-    // Opened but not listening: still `einval` (measured on the oracle in every non-listening
-    // state).
+    assert_eq!(rig.control(&op(OPEN), &open_arg()), ctl_ok(), "`open` answers `[1]`");
     assert_eq!(
         rig.control(&op(ACCEPT), &LONG_TIMEOUT),
         ctl_xerror("einval"),
         "accept on an opened, non-listening port answers `einval`"
     );
-
     // Bound but not listening: `bind` does not move the descriptor out of `INET_STATE_OPEN`.
-    let port = bound_port(&rig.control(&op(BIND), &loopback_arg(0)));
-    assert_ne!(port, 0, "the kernel assigned an ephemeral port");
+    assert_ne!(bound_port(&rig.control(&op(BIND), &loopback_arg(0))), 0, "bound port");
     assert_eq!(
         rig.control(&op(ACCEPT), &LONG_TIMEOUT),
         ctl_xerror("einval"),
         "accept on a bound, non-listening port answers `einval`"
     );
-
-    assert_eq!(
-        rig.control(&op(CLOSE), &[]),
-        ctl_ok(),
-        "`close` answers `[1]`, socket-less too"
-    );
-    // Closed: `INET_STATE_CLOSED` is not `INET_STATE_LISTENING` either, so the same guard fires.
+    assert_eq!(rig.control(&op(CLOSE), &[]), ctl_ok(), "`close` answers `[1]`");
     assert_eq!(
         rig.control(&op(ACCEPT), &LONG_TIMEOUT),
         ctl_xerror("einval"),
@@ -185,20 +150,14 @@ fn listen_faults_and_the_accept_guard_order() {
     let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
 
     // `INET_REQ_LISTEN`'s guards run in the C's order: the socket-state guard first, the operand
-    // length last (`inet_drv.c:12042`). A socket-less port therefore reports `exbadport` even for a
+    // length last (`inet_drv.c:12042`), so a socket-less port reports `exbadport` even for a
     // well-formed operand.
     assert_eq!(
         rig.control(&op(LISTEN), &[0, 5]),
         ctl_xerror("exbadport"),
         "`listen` before `open` answers `exbadport` (the state guard comes first)"
     );
-
-    assert_eq!(
-        rig.control(&op(OPEN), &open_arg()),
-        ctl_ok(),
-        "`open` on the stream driver answers `[1]`"
-    );
-    // A 1-byte and a 3-byte operand are both `len != 2` ⇒ `einval`.
+    assert_eq!(rig.control(&op(OPEN), &open_arg()), ctl_ok(), "`open` answers `[1]`");
     assert_eq!(
         rig.control(&op(LISTEN), &[5]),
         ctl_xerror("einval"),
@@ -209,21 +168,17 @@ fn listen_faults_and_the_accept_guard_order() {
         ctl_xerror("einval"),
         "`listen` with a 3-byte operand answers `einval`"
     );
-    assert_eq!(
-        rig.control(&op(LISTEN), &[0, 5]),
-        ctl_ok(),
-        "`listen` with a 2-byte backlog answers `[1]`"
-    );
+    assert_eq!(rig.control(&op(LISTEN), &[0, 5]), ctl_ok(), "a 2-byte backlog is accepted");
 
-    // The accept operand is `Timeout(4)` and nothing else: 0, 3 and 5 bytes are all `len != 4`
-    // ⇒ `einval` on a listener, the same reply the non-listening guard gives — the C folds both
-    // faults into one `if`, so the two are indistinguishable to the caller (measured).
+    // The accept operand is `Timeout(4)` and nothing else: 0, 3 and 5 bytes are all `len != 4`, so
+    // they answer the same `einval` the non-listening guard gives — the C folds both faults into
+    // one `if`, making them indistinguishable to the caller (measured).
     for operand in [&[][..], &[0, 0, 0][..], &[0, 0, 0, 0, 0][..]] {
+        let len = operand.len();
         assert_eq!(
             rig.control(&op(ACCEPT), operand),
             ctl_xerror("einval"),
-            "accept with a {}-byte operand on a listener answers `einval`",
-            operand.len()
+            "accept with a {len}-byte operand on a listener answers `einval`"
         );
     }
     // Only the 4-byte operand queues, and the reply is the id and nothing else.
@@ -238,25 +193,17 @@ fn listen_faults_and_the_accept_guard_order() {
 fn datagram_accept_is_exbadport() {
     let mut rig = Rig::new(make_udp_inet().expect("the udp_inet driver"));
 
-    // `INET_REQ_ACCEPT` is a case of `tcp_inet_ctl` only: the datagram driver's switch has no such
-    // arm, so the number belongs to neither switch and the C answers `[0]exbadport` (measured in
-    // every datagram state).
+    // `INET_REQ_ACCEPT` is a case of `tcp_inet_ctl` only, so the number belongs to neither switch
+    // for the datagram driver and the C answers `[0]exbadport` (measured in every datagram state).
     assert_eq!(
         rig.control(&op(ACCEPT), &LONG_TIMEOUT),
         ctl_xerror("exbadport"),
         "accept on a socket-less udp_inet port answers `exbadport`"
     );
-
-    // The datagram `open` operand names `SOCK_DGRAM` (`INET_TYPE_DGRAM`), the stream shape being
-    // refused with `einval`; an open datagram port is no more acceptable.
-    assert_eq!(
-        rig.control(
-            &op(OPEN),
-            &[INET_AF_INET, INET_TYPE_DGRAM, INET_PROTO_DEFAULT]
-        ),
-        ctl_ok(),
-        "`open` on the datagram driver answers `[1]`"
-    );
+    // The datagram `open` operand names `SOCK_DGRAM` (the stream shape is refused with `einval`),
+    // and an open datagram port is no more acceptable.
+    let dgram = [INET_AF_INET, INET_TYPE_DGRAM, INET_PROTO_DEFAULT];
+    assert_eq!(rig.control(&op(OPEN), &dgram), ctl_ok(), "datagram `open` answers `[1]`");
     assert_eq!(
         rig.control(&op(ACCEPT), &LONG_TIMEOUT),
         ctl_xerror("exbadport"),
@@ -275,22 +222,14 @@ fn a_zero_timeout_completes_exactly_once_and_clears_the_deadline() {
         async_ok_reply(0),
         "a zero-timeout accept answers its id"
     );
-    assert!(
-        rig.next_timeout().is_some(),
-        "the zero deadline arms the port's single `TIMEOUT` task"
-    );
-
+    assert!(rig.next_timeout().is_some(), "the zero deadline arms the port's `TIMEOUT` task");
     rig.round().expect("the round runs");
     assert_eq!(
         events(&mut rig),
         vec![timed_out(0)],
         "a zero deadline completes exactly once with `{{error, timeout}}`"
     );
-    assert_eq!(
-        rig.next_timeout(),
-        None,
-        "the completed operation leaves no deadline behind"
-    );
+    assert_eq!(rig.next_timeout(), None, "the completed operation leaves no deadline behind");
     // The list drained, so the descriptor-state bits go back to a bare listener
     // (`tcp_inet_multi_timeout`, `inet_drv.c:12607`-`:12611`).
     assert_eq!(
@@ -298,13 +237,8 @@ fn a_zero_timeout_completes_exactly_once_and_clears_the_deadline() {
         getstatus_reply(LISTENING_STATUS),
         "a drained accept list reports `INET_STATE_LISTENING` again"
     );
-
     rig.round().expect("the round runs");
-    assert_eq!(
-        events(&mut rig),
-        Vec::new(),
-        "a second round reports nothing: the operation was completed once"
-    );
+    assert_eq!(events(&mut rig), Vec::new(), "a second round reports nothing");
 
     // The id counter keeps advancing across operations (the C's `op_ref++ & 0xffff`).
     assert_eq!(
@@ -325,46 +259,30 @@ fn several_queued_accepts_answer_their_own_id_and_report_the_accept_bits() {
     let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
     listening(&mut rig);
 
-    // `INET_REQ_ACCEPT` uses the C's `enq_multi_op` list, which never refuses (`inet_drv.c:12194`),
-    // so repeats answer their own id — never `ealready` — in enqueue order.
-    assert_eq!(
-        rig.control(&op(ACCEPT), &LONG_TIMEOUT),
-        async_ok_reply(0),
-        "the first queued accept answers id 0"
-    );
+    // `INET_REQ_ACCEPT` uses the C's `enq_multi_op` list, which never refuses
+    // (`inet_drv.c:12194`): repeats answer their own id — never `ealready` — in enqueue order.
+    assert_eq!(rig.control(&op(ACCEPT), &LONG_TIMEOUT), async_ok_reply(0), "first accept id 0");
     assert_eq!(
         rig.control(&op(GETSTATUS), &[]),
         getstatus_reply(ONE_ACCEPT_STATUS),
         "one queued accept reports `INET_STATE_ACCEPTING` (`9 | 0x20`)"
     );
-    assert_eq!(
-        rig.control(&op(ACCEPT), &LONG_TIMEOUT),
-        async_ok_reply(1),
-        "the second queued accept answers id 1"
-    );
+    assert_eq!(rig.control(&op(ACCEPT), &LONG_TIMEOUT), async_ok_reply(1), "second accept id 1");
     assert_eq!(
         rig.control(&op(GETSTATUS), &[]),
         getstatus_reply(MULTI_ACCEPT_STATUS),
         "two queued accepts add `INET_F_MULTI_CLIENT` (`9 | 0x120`)"
     );
-    assert_eq!(
-        rig.control(&op(ACCEPT), &LONG_TIMEOUT),
-        async_ok_reply(2),
-        "the third queued accept answers id 2"
-    );
+    assert_eq!(rig.control(&op(ACCEPT), &LONG_TIMEOUT), async_ok_reply(2), "third accept id 2");
     assert_eq!(
         rig.control(&op(GETSTATUS), &[]),
         getstatus_reply(MULTI_ACCEPT_STATUS),
         "three queued accepts report the same multi-accept bits as two"
     );
 
-    // Nothing connected, so no round can complete one: the long deadline is not due either.
+    // Nothing connected and no due deadline: a round completes nothing.
     rig.round().expect("the round runs");
-    assert_eq!(
-        events(&mut rig),
-        Vec::new(),
-        "a listener with no connection and no due deadline completes nothing"
-    );
+    assert_eq!(events(&mut rig), Vec::new(), "nothing is completable yet");
 
     // The teardown drains every pending accept as `{error, closed}`, in enqueue order, exactly
     // once each (the C's `async_error_am_all(am_closed)`).
@@ -375,62 +293,32 @@ fn several_queued_accepts_answer_their_own_id_and_report_the_accept_bits() {
         "`close` drains the three queued accepts in enqueue order"
     );
     rig.round().expect("the round runs");
-    assert_eq!(
-        events(&mut rig),
-        Vec::new(),
-        "a round after the drain reports nothing"
-    );
+    assert_eq!(events(&mut rig), Vec::new(), "a round after the drain reports nothing");
     assert!(!rig.contains(), "the closed port left the registry");
 }
 
 #[test]
 fn closing_with_pending_accepts_drains_each_exactly_once() {
-    // One pending accept.
     let mut one = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
     listening(&mut one);
-    assert_eq!(
-        one.control(&op(ACCEPT), &LONG_TIMEOUT),
-        async_ok_reply(0),
-        "one accept queues"
-    );
+    assert_eq!(one.control(&op(ACCEPT), &LONG_TIMEOUT), async_ok_reply(0), "one accept queues");
     one.close();
-    assert_eq!(
-        events(&mut one),
-        vec![closed(0)],
-        "one pending accept is drained exactly once"
-    );
-    assert_eq!(
-        events(&mut one),
-        Vec::new(),
-        "the drain is exactly once: a second drain is empty"
-    );
+    assert_eq!(events(&mut one), vec![closed(0)], "one pending accept is drained exactly once");
+    assert_eq!(events(&mut one), Vec::new(), "the drain is exactly once: a second is empty");
     assert!(!one.contains(), "the closed port left the registry");
 
-    // Two pending accepts.
     let mut two = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
     listening(&mut two);
-    assert_eq!(
-        two.control(&op(ACCEPT), &LONG_TIMEOUT),
-        async_ok_reply(0),
-        "the first accept queues"
-    );
-    assert_eq!(
-        two.control(&op(ACCEPT), &LONG_TIMEOUT),
-        async_ok_reply(1),
-        "the second accept queues"
-    );
+    assert_eq!(two.control(&op(ACCEPT), &LONG_TIMEOUT), async_ok_reply(0), "first accept queues");
+    assert_eq!(two.control(&op(ACCEPT), &LONG_TIMEOUT), async_ok_reply(1), "second accept queues");
     two.close();
     assert_eq!(
         events(&mut two),
         vec![closed(0), closed(1)],
         "two pending accepts are drained in enqueue order"
     );
-    assert_eq!(
-        events(&mut two),
-        Vec::new(),
-        "the drain is exactly once: a second drain is empty"
-    );
-    assert!(!two.contains(), "the closed port belongs to the registry no more");
+    assert_eq!(events(&mut two), Vec::new(), "the drain is exactly once: a second is empty");
+    assert!(!two.contains(), "the closed port left the registry");
 }
 
 #[test]
@@ -439,21 +327,15 @@ fn active_does_not_gate_the_accept() {
     listening(&mut rig);
 
     // `{active, true}` — the five-byte `[opt, val_be32]` record `INET_REQ_SETOPTS` walks.
-    let mut record = vec![INET_LOPT_ACTIVE];
-    record.extend_from_slice(&1u32.to_be_bytes());
-    assert_eq!(
-        rig.control(&op(SETOPTS), &record),
-        ctl_ok(),
-        "`{{active,true}}` is set on the listener"
-    );
+    let record = |value: u32| {
+        let mut record = vec![INET_LOPT_ACTIVE];
+        record.extend_from_slice(&value.to_be_bytes());
+        record
+    };
+    assert_eq!(rig.control(&op(SETOPTS), &record(1)), ctl_ok(), "`{{active,true}}` is set");
     assert_eq!(
         rig.control(&op(GETOPTS), &[INET_LOPT_ACTIVE]),
-        {
-            let mut reply = ctl_ok();
-            reply.push(INET_LOPT_ACTIVE);
-            reply.extend_from_slice(&1u32.to_be_bytes());
-            reply
-        },
+        active_reply(1),
         "`getopts` reports the stored `active` value"
     );
 
@@ -472,21 +354,10 @@ fn active_does_not_gate_the_accept() {
     );
 
     // Back to passive: the accept path is unaffected either way.
-    let mut record = vec![INET_LOPT_ACTIVE];
-    record.extend_from_slice(&0u32.to_be_bytes());
-    assert_eq!(
-        rig.control(&op(SETOPTS), &record),
-        ctl_ok(),
-        "`{{active,false}}` is set on the listener"
-    );
+    assert_eq!(rig.control(&op(SETOPTS), &record(0)), ctl_ok(), "`{{active,false}}` is set");
     assert_eq!(
         rig.control(&op(GETOPTS), &[INET_LOPT_ACTIVE]),
-        {
-            let mut reply = ctl_ok();
-            reply.push(INET_LOPT_ACTIVE);
-            reply.extend_from_slice(&0u32.to_be_bytes());
-            reply
-        },
+        active_reply(0),
         "`getopts` reports the cleared `active` value"
     );
     assert_eq!(
@@ -505,6 +376,5 @@ fn active_does_not_gate_the_accept() {
 // A port holding **both** a pending accept and a pending recv is unreachable at this floor and is
 // therefore not fabricated here: the accept guard requires `InetState::Listening` and the receive
 // guard requires `InetState::Connected`, and one descriptor is exactly one of the two. The mixed
-// drain (a close answering both a queued accept and a queued recv) is therefore pinned by the
-// sibling real-socket suites, which can put a connected descriptor into a state that still has
-// operations of both kinds queued.
+// drain is pinned by the sibling real-socket suites, which can queue operations of both kinds on a
+// connected descriptor that is then torn down.
