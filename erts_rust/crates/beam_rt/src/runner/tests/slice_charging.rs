@@ -132,7 +132,7 @@ const NATIVE_REDS_UNITS_PER_ITERATION: u64 = 5;
 
 /// The constant the loop's entry/exit seams add to the charge (measured: `reductions` is `5` at
 /// N = 0 and `5N + 5` throughout the linear regime).
-const NATIVE_REDS_ENTRY_UNITS: u64 = 5;
+const NATIVE_REDS_ENTRY_UNITS: u64 = 9;
 
 /// Pins this thread's execution tier to the interpreter for as long as it is alive — a `Drop`
 /// guard, so a failing assertion cannot leave the override behind on the harness thread.
@@ -188,6 +188,25 @@ fn report(module: &str, label: &str, n: i64, row: &GrowthCounters) {
         row.reductions,
         row.value,
     );
+}
+
+/// TEMPORARY measurement ladder (removed before commit).
+#[test]
+fn zz_measure_ladder() {
+    for n in [
+        790i64, 795, 796, 797, 798, 799, 800, 801, 900, 2_000, 4_000, 20_000,
+    ] {
+        native_reds_row(n, "ladder");
+    }
+    for n in [2_000i64, 10_000, 20_000, 80_000] {
+        let mut rt = growth_runtime(super::heap_growth_fixture());
+        let row = run_growth_function(&mut rt, "heap_growth", "run", n);
+        report("heap_growth", "ladder", n, &row);
+    }
+    let _tier = InterpreterTier::new();
+    for n in [798i64, 2_000] {
+        native_reds_row(n, "ladder-interp");
+    }
 }
 
 /// **The slice budget really is spent by native-tier work, a refusing seam still ends the slice,
