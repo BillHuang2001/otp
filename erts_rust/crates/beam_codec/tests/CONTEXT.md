@@ -44,7 +44,14 @@ the full binary inventory are owned by `../CONTEXT.md` (§Test Strategy) — do 
 - Oracle-dependent cross-checks (live `erl`) live in: `interop.rs`, `property_oracle.rs`,
   `compressed_oracle.rs`, `legacy_scalar_oracle.rs`, `scalar_ext_decode.rs`, `decode_bound_oracle.rs`,
   `export_arity_oracle.rs`, `map_key_order.rs`, `minor_version.rs`, `port_ext_legacy.rs`,
-  `local_fun_encode.rs`, `local_node.rs`, `local_identity_roundtrip.rs`.
+  `local_fun_encode.rs`, `local_node.rs`, `local_identity_roundtrip.rs`, `tag_space_audit.rs`.
+- `tag_space_audit.rs` is the **exhaustive tag-space audit** and is both kinds at once: its dense
+  256-row disposition sweep and its no-panic `[131, byte]` sweep are pure (hand-built images, no
+  oracle), while one test cross-checks every cross-checkable row against a live `erl`
+  (`LOCAL_EXT` / `ATOM_INTERNAL_REF*` / `ATOM_CACHE_REF` rows are excluded: a synthetic
+  `LOCAL_EXT` hash is a per-VM-start secret and the index-carrying forms name different atoms in
+  the two tables). It is the one place a *byte's* disposition is decided, so it is where a new or
+  reclassified tag byte must be added.
 - Pure (no-oracle) wire/layout suites: `roundtrip.rs`, `wire_roundtrip.rs`, `ground_truth.rs`,
   `map_ext_decode.rs`, `refc_decode.rs`, `ref_ext_zero_and_arity.rs`, `record_roundtrip.rs`,
   `internal_ids.rs`, `atom_cache_writer.rs`, `compressed_decode.rs`, `decode_depth.rs`,

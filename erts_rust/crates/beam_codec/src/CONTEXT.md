@@ -93,6 +93,6 @@ map for the source subtree and the notes the child nodes inherit.
 - `compress.rs` → zlib for `COMPRESSED` (`compress`/`decompress`/`decompress_bounded`/`decompress_bounded_used`)
 - `error.rs` → `bad_arg`/`system_limit`, the `unsupported*` reason atoms
 - `prelude.rs` → the downstream glob-import surface
-- `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) and the local-node pid/port/ref **demotion** to the internal form, the active-export gate (`export_gate.rs`), `decode_atom_strict` (the C `dec_atom`: no `NIL_EXT` marker, used by `EXPORT_EXT`/`RECORD_EXT` atoms) vs `decode_node_atom` (the C `dec_sysname`: marker allowed, used for identifier node fields), `decode_term[_with_local_node]`, the `MAX_DECODE_DEPTH` bound
+- `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) and the local-node pid/port/ref **demotion** to the internal form, the active-export gate (`export_gate.rs`), `decode_atom_strict` (the C `dec_atom`: no `NIL_EXT` marker, used by `EXPORT_EXT`'s module/function, `NEW_FUN_EXT`'s module and `RECORD_EXT`'s module/name/key atoms) vs `decode_node_atom` (the C `dec_sysname`: marker allowed, used for identifier node fields), `decode_term[_with_local_node]`, the `MAX_DECODE_DEPTH` bound
 - `encode/` → the `Encoder` state machine, the tag emitters (incl. the internal pid/port/**ref** branches), `encode_term*`
 - `term/` → the **only** `unsafe` subtree: safe forwarding/allocation wrappers over `beam_term` (`binary`/`fun`/`record`/`ref`)

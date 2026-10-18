@@ -60,7 +60,8 @@ use beam_term::prelude::{is_small, signed_value, AtomTable, Eterm};
 use beam_codec::compress::compress;
 use beam_codec::term::big_parts;
 use beam_codec::{
-    decode_term, encode_term, is_unsupported, AtomCache, Decoder, Tag, COMPRESSED_EXT, VERSION_MAGIC,
+    decode_term, encode_term, is_compressed_image, is_unsupported, AtomCache, Decoder, Tag,
+    COMPRESSED_EXT, VERSION_MAGIC,
 };
 
 /// The per-tag minimal images, shared with `tests/tag_coverage.rs` (never re-derived
@@ -224,7 +225,7 @@ const ROWS: &[Row] = &[
     Row { byte: 109, image: &[131, 109, 0, 0, 0, 0], disposition: Disposition::Ok, note: "BINARY_EXT (external.c:4893)" },
     Row { byte: 110, image: &[131, 110, 1, 0, 5], disposition: Disposition::Ok, note: "SMALL_BIG_EXT (external.c:4457)" },
     Row { byte: 111, image: &[131, 111, 0, 0, 0, 1, 0, 5], disposition: Disposition::Ok, note: "LARGE_BIG_EXT (external.c:4457)" },
-    Row { byte: 112, image: &[131, 112, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 119, 1, b'm', 97, 0, 97, 0, 88, 119, 1, b'n', 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 0], disposition: Disposition::Ok, note: "NEW_FUN_EXT, arity 2, num_free 0 (external.c:5102)" },
+    Row { byte: 112, image: &[131, 112, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 119, 1, b'm', 97, 0, 97, 0, 88, 119, 1, b'n', 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 0], disposition: Disposition::Ok, note: "NEW_FUN_EXT, arity 2, num_free 0 (external.c:5102)" },
     Row { byte: 113, image: &[131, 113, 119, 1, b'm', 119, 1, b'f', 97, 1], disposition: Disposition::Ok, note: "EXPORT_EXT m:f/1 (external.c:5006)" },
     Row { byte: 114, image: &[131, 114, 0, 1, 119, 1, b'n', 0, 0, 0, 0, 1], disposition: Disposition::Ok, note: "NEW_REFERENCE_EXT (external.c:4743)" },
     Row { byte: 115, image: &[131, 115, 1, b'a'], disposition: Disposition::Ok, note: "SMALL_ATOM_EXT (external.c:4529)" },
@@ -407,11 +408,24 @@ fn new_heap(words: usize) -> Heap {
 /// `Ok`) — asserting that every byte was consumed (the images are trailing-byte-free,
 /// so this is the same strictness `decode_term` applies).
 ///
+/// A **`COMPRESSED` image** takes the wrapper's own entry point: `COMPRESSED` (`80`) is
+/// handled *outside* the term walker (`external.c:1754-1813`: at top level only, after
+/// `VERSION_MAGIC`, the 4-byte declared size is read and the inflated **body** — which
+/// carries no version byte — is handed to the ordinary term decoder). [`Decoder::new`]
+/// implements exactly that split, so it rejects `80` in tag position (`Tag::Compressed`
+/// ⇒ `badarg`, `src/decode/mod.rs`), while [`decode_term`] is the entry point that
+/// unwraps. Routing the row through `decode_term` therefore exercises the real,
+/// documented behaviour instead of a harness artefact.
+///
 /// The heap and atom table are returned with the term, which borrows their storage.
 fn decode_with_state(image: &[u8]) -> Result<(Heap, AtomTable, Eterm), BeamError> {
     let mut heap = new_heap(1 << 14);
     let mut atoms = AtomTable::new();
     atoms.seed(SEED);
+    if is_compressed_image(image) {
+        let term = decode_term(image, &mut heap, &mut atoms)?;
+        return Ok((heap, atoms, term));
+    }
     let mut cache = AtomCache::new();
     cache.set(0, atoms.lookup("a").expect("seeded"));
     let mut decoder = Decoder::new(image)?.with_atom_cache(&cache);
@@ -447,14 +461,20 @@ fn every_tag_byte_has_exactly_one_decided_disposition() {
         );
     }
 
-    // (b) The disposition follows tag-ness alone: a byte `Tag::from_byte` knows is a
-    //     term, and every other byte is malformed. Neither class may drift.
+    // (b) The disposition follows tag-ness alone: a byte `Tag::covered` is a *term* and
+    //     every other byte is malformed. Neither class may drift.
+    //
+    //     The predicate is `covered()`, not `from_byte(..).is_some()`: three bytes are
+    //     *recognized yet not terms* — `DIST_HEADER` (`68`, transport framing),
+    //     `NEW_CACHE` (`78`, retired under `#if 0`) and `FUN_EXT` (`117`, removed in
+    //     OTP 23) — and the C rejects all three in tag position, so `BadArg` is their
+    //     correct disposition.
     for row in ROWS {
-        let is_tag = Tag::from_byte(row.byte).is_some();
+        let is_tag = Tag::from_byte(row.byte).is_some_and(Tag::covered);
         assert_eq!(
             is_tag,
             row.disposition == Disposition::Ok,
-            "byte {} (`{}`): Tag::from_byte knows it = {is_tag}, but the row says {:?}",
+            "byte {} (`{}`): the tag is a term = {is_tag}, but the row says {:?}",
             row.byte,
             row.note,
             row.disposition
