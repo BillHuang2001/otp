@@ -445,6 +445,26 @@ impl Timers {
         self.refs.contains_key(&reference)
     }
 
+    /// How long is left of the pending timer `reference` identifies — the **read-only** twin of
+    /// [`Timers::cancel`], which is what `erlang:read_timer/1,2` needs.
+    ///
+    /// Returns `Some(remaining)` while the timer is still pending (it keeps its place and will
+    /// still fire), and `None` for a reference that already fired, was already cancelled, or is
+    /// not a timer reference at all — the caller tells the last case apart with
+    /// [`Timers::is_timer_ref`] (the C's `is_not_ref` → `badarg` versus `is_not_internal_ref` →
+    /// `false` split, `erts/emulator/beam/erl_hl_timer.c:2244-2251`).
+    ///
+    /// A deadline that has already passed but has not fired yet answers `Duration::ZERO`, not
+    /// `None`: the timer is still **active**, which is exactly the oracle's `0` versus `false`
+    /// distinction (`get_time_left` clamps to `0`,
+    /// `erts/emulator/beam/erl_hl_timer.c:681-689`; `return_info` answers `false` only when the
+    /// timer is gone, `:1975-1989`).
+    pub(crate) fn remaining(&self, reference: Eterm) -> Option<Duration> {
+        let id = (*self.refs.get(&reference)?)?;
+        let pending = self.pending.get(&id)?;
+        Some(pending.deadline.saturating_duration_since(Instant::now()))
+    }
+
     /// Cancels the pending timer `reference` identifies, answering how long was left.
     ///
     /// Returns `Some(remaining)` when the timer was still pending (it will not fire), and
@@ -732,8 +752,52 @@ mod tests {
         let mut timers = Timers::new();
         assert!(!timers.is_timer_ref(reference(1)));
         assert_eq!(timers.cancel(reference(1)), None);
+        assert_eq!(timers.remaining(reference(1)), None);
     }
 
+    #[test]
+    fn remaining_reads_a_live_timer_without_consuming_it() {
+        let mut timers = Timers::new();
+        let reference = schedule(&mut timers, 3_600_000, 3);
+
+        let remaining = timers.remaining(reference).expect("it is pending");
+        assert!(
+            remaining <= Duration::from_millis(3_600_000),
+            "the remaining time cannot exceed the delay: {remaining:?}"
+        );
+        assert!(
+            remaining > Duration::from_millis(3_000_000),
+            "the reading is the delay that is left, not the elapsed time: {remaining:?}"
+        );
+        // A read is **not** a cancellation: the timer keeps its place and can still be
+        // cancelled for the same order of magnitude, then answers `None` like a fired one.
+        assert_eq!(timers.pending_count(), 1);
+        assert!(timers.next_deadline().is_some());
+        let cancelled = timers.cancel(reference).expect("still pending after a read");
+        assert!(cancelled <= remaining, "a read must not move the deadline");
+        assert_eq!(timers.remaining(reference), None, "cancelled is gone");
+        // Two reads in a row agree, and the value never grows.
+        let second = schedule(&mut timers, 3_600_000, 4);
+        let first_read = timers.remaining(second).expect("pending");
+        let later_read = timers.remaining(second).expect("still pending");
+        assert!(later_read <= first_read, "{later_read:?} > {first_read:?}");
+    }
+
+    #[test]
+    fn a_due_but_unfired_timer_reads_zero_rather_than_none() {
+        // A deadline in the past that the scheduler has not drained yet is still **active** —
+        // the oracle's `0`, not its `false` (`get_time_left` clamps, `return_info` answers
+        // `false` only for a timer that is gone).
+        let mut timers = Timers::new();
+        let reference = schedule(&mut timers, 0, 5);
+        assert_eq!(timers.remaining(reference), Some(Duration::ZERO));
+        assert_eq!(timers.pending_count(), 1, "a read fires nothing");
+
+        // Once it fires it answers `None` while staying a known timer reference.
+        assert_eq!(timers.take_due(Instant::now()).len(), 1);
+        assert_eq!(timers.remaining(reference), None);
+        assert!(timers.is_timer_ref(reference));
+    }
     #[test]
     fn a_huge_delay_saturates_instead_of_overflowing() {
         let mut timers = Timers::new();
