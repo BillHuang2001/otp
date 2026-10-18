@@ -1891,6 +1891,11 @@ impl Driver for TcpInetDriver {
         self.queued_ops().has_pending()
     }
 
+    /// The latched peer close ([`TcpInetDriver::peer_closed`]) — the accessor the runtime reads
+    /// once per round to deliver the oracle's `{tcp_closed, Port}`.
+    fn port_closed(&self) -> bool {
+        self.peer_closed()
+    }
     fn drive_async(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         self.drive_async_ops(ctx)
     }

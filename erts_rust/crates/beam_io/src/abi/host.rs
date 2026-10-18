@@ -498,9 +498,10 @@ impl AbiHost {
     ///
     /// The safe companion of [`DriverHost::set_busy_port`], exactly as [`DriverState::queue_len`] is
     /// the safe companion of [`DriverHost::sizeq`]: the raw hook is a `void`-returning C function
-    /// whose effect (the C's `ERTS_PORT_SFLG_*`) had no reader here, so a caller that needs to know
-    /// the busy state — the port layer behind [`DriverPort::is_busy`](super::port::DriverPort::is_busy)
-    /// — reads it through this accessor. `false` until the driver marks the port busy.
+    /// whose effect (the C's `ERTS_PORT_SFLG_*`) has no return value of its own, so a caller that
+    /// needs to know the busy state — [`DriverPort::is_busy`](super::port::DriverPort::is_busy) and,
+    /// above it, [`crate::Port::is_busy`]/[`crate::PortRegistry::is_busy`] — reads it through this
+    /// accessor. `false` until the driver marks the port busy.
     pub fn is_busy(&self) -> bool {
         self.state.is_busy()
     }
@@ -835,10 +836,10 @@ impl DriverHost for AbiHost {
     ///
     /// The C moves the port's scheduler flags and always answers `0` for a live port
     /// (`io.c:5208-5264`); the busy flag is recorded on the port's [`DriverState`] and read back
-    /// through [`AbiHost::is_busy`]. What the C *additionally* does with the flag — a
-    /// `port_command/2,3` that suspends the caller or answers `false`/`notsup` — is the runtime's
-    /// side of the split and is **not** modelled here (no port-layer reader exists yet), so this
-    /// hook's only observable effect is the flag the C also keeps per port.
+    /// through [`AbiHost::is_busy`], which [`crate::Driver::is_busy`] forwards to
+    /// [`crate::Port::is_busy`] and on to [`crate::PortRegistry::port_command_with`]. The hook's own
+    /// effect is the flag the C also keeps per port; what a command *does* with it is that decision
+    /// table's.
     fn set_busy_port(&mut self, busy: bool) -> c_int {
         self.state.busy = busy;
         0

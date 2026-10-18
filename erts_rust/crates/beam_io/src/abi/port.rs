@@ -290,15 +290,13 @@ impl DriverPort {
     /// (`io.c:5208`).
     ///
     /// The C keeps the flag on the port (`ERTS_PORT_SFLG_*`); here it is the per-port
-    /// [`AbiHost::is_busy`] this delegates to. It is the accessor a port layer consults to decide
+    /// [`AbiHost::is_busy`] this delegates to. It is the accessor the port layer consults to decide
     /// what a `port_command/2,3` on a busy port should do — `false` until a driver calls
     /// `set_busy_port(port, 1)` (from `start`/`output`/`control`/`timeout`, whichever it chooses),
-    /// and back to `false` when it clears the flag.
-    ///
-    /// The caller-blocking half of the C's busy semantics (a `port_command/2,3` that suspends the
-    /// caller, answers `false` for `[nosuspend]` or `{error,notsup}` for `[force]` on a driver
-    /// without `ERL_DRV_FLAG_SOFT_BUSY`) is deliberately **not** part of this crate: it belongs to
-    /// the runtime's `erlang:port_command/2,3`, which is the handoff recorded for `beam_rt`.
+    /// and back to `false` when it clears the flag. [`Driver::is_busy`](crate::Driver::is_busy)
+    /// forwards it to [`crate::Port::is_busy`] and on to
+    /// [`crate::PortRegistry::port_command_with`]'s decision table, which is where the C's
+    /// `false`/suspend/`notsup` answers are decided.
     pub fn is_busy(&self) -> bool {
         self.abi.is_busy()
     }
@@ -622,6 +620,13 @@ impl Driver for DriverPort {
     /// (`call_driver_control`'s first line, `io.c:4034-4036`).
     fn has_control(&self) -> bool {
         self.lib.entry().control.is_some()
+    }
+
+    /// The per-port busy state the C driver last set through `set_busy_port` — the accessor
+    /// [`crate::Port::is_busy`] reads back for the busy half of `erlang:port_command/2,3`.
+    /// Delegates to [`DriverPort::is_busy`].
+    fn is_busy(&self) -> bool {
+        DriverPort::is_busy(self)
     }
     /// `start`: hand the driver the port handle and the command string, and keep its `ErlDrvData`.
     ///

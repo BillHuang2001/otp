@@ -603,6 +603,46 @@ pub trait Driver {
         true
     }
 
+    /// Whether this driver currently has its port marked **busy** — the C's per-port
+    /// `ERTS_PTS_FLG_BUSY_PORT`, moved by `set_busy_port(port, 1|0)`
+    /// (`erts/emulator/beam/io.c:5208-5264`) and read back by every `erts_port_output` busy check
+    /// (`io.c:1763-1769`).
+    ///
+    /// This is the **state** half only. What a command *does* with it — `false` for `[nosuspend]`,
+    /// a caller suspension otherwise, and `[force]` bypassing the state entirely while being
+    /// refused for a driver that does not advertise [`DriverFlags::SOFT_BUSY`] — is the port
+    /// layer's decision table, [`crate::Port::command`] (surfaced as
+    /// [`crate::PortRegistry::port_command_with`]); a driver only reports the state.
+    ///
+    /// The default (`false`) is correct for every driver that never calls `set_busy_port`, which is
+    /// all four built-ins. The C-ABI bridge ([`crate::abi::DriverPort`]) overrides it with
+    /// [`AbiHost::is_busy`](crate::AbiHost::is_busy), the per-port flag its `set_busy_port` hook
+    /// records.
+    fn is_busy(&self) -> bool {
+        false
+    }
+
+    /// Whether the peer/OS side has closed this port's underlying endpoint — a read that found
+    /// end-of-file, a peer close/reset, or an exited child.
+    ///
+    /// This is the accessor a runtime reads **once per port-task round** to deliver the oracle's
+    /// peer-close message (`{tcp_closed, Port}`, `{udp_closed, Port}`, …): the C has no separate
+    /// notification for it either — the driver learns of the close inside its own `ready_input`
+    /// and the emulator turns that into a message (`tcp_inet_input` → `tcp_recv_closed`,
+    /// `erts/emulator/drivers/common/inet_drv.c:13202`).
+    ///
+    /// The answer is **latched and sticky**: once a driver has observed the close it keeps
+    /// answering `true` for the rest of the port's life, because the runtime may drain the round
+    /// that observed it without reporting anything, and a signal that disappeared would leave the
+    /// owner of a dead port waiting forever.
+    ///
+    /// The default (`false`) is the honest answer for a driver that cannot know, and correct for
+    /// every built-in except [`crate::drivers::TcpInetDriver`], which overrides it with its own
+    /// [`TcpInetDriver::peer_closed`](crate::drivers::TcpInetDriver::peer_closed) latch.
+    fn port_closed(&self) -> bool {
+        false
+    }
+
     /// Declares the deadline at which this driver next wants [`Driver::timeout`] to run.
     ///
     /// This is the driver-facing **timer-arming seam**: a driver that needs a port timer (an

@@ -62,7 +62,7 @@ use crate::completion::PortCompletion;
 use crate::driver::{Driver, DriverRegistry, PortExitReason};
 use crate::error;
 use crate::poller::{Event, Poller};
-use crate::port::{Port, PortCommandOptions, PortControl, PortState, DEFAULT_READINESS_RED_BUDGET};
+use crate::port::{Port, PortCommandOptions, PortCommandOutcome, PortControl, DEFAULT_READINESS_RED_BUDGET};
 use crate::port_failure::{DriverFailure, PortFailure};
 use crate::port_task::{
     ActiveInput, LineNotification, PortNotification, PortTaskKind, PortTaskOutcome, Readiness,
@@ -417,33 +417,101 @@ impl PortRegistry {
     /// [`PortRegistry::execute_port_tasks`], or through [`PortRegistry::handle_events`]'s
     /// default round when the port is write-ready).
     ///
+    /// It is [`PortRegistry::port_command_with`] with the options dropped and the outcome folded
+    /// into `Ok(())`: a [`PortCommandOutcome::Busy`] port is `Ok(())` with **nothing queued**, so a
+    /// caller that must distinguish "written" from "the port is busy" (the oracle's `true`/`false`
+    /// for `[nosuspend]`, and the suspension/retry of a plain command) has to call
+    /// `port_command_with` — the runtime does.
+    ///
     /// The `poller` argument is taken for signature symmetry with the registry's other
     /// entry points; this call does not touch the poll set (the write itself belongs to the
     /// port task, which is where any write-readiness arming happens).
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::BadArg` when `id` is not a live, open port.
+    /// Returns `BeamError::BadArg` when `id` is not a live, open port, and the `notsup` raise for a
+    /// `[force]` command on a driver without
+    /// [`DriverFlags::SOFT_BUSY`](crate::DriverFlags::SOFT_BUSY) (see
+    /// [`PortRegistry::port_command_with`]).
     pub fn port_command(
+        &mut self,
+        poller: &mut Poller,
+        id: PortId,
+        data: &[u8],
+        options: PortCommandOptions,
+    ) -> Result<()> {
+        self.port_command_with(poller, id, data, options).map(|_| ())
+    }
+
+    /// Hands `data` to port `id` with `options`, answering what the **busy state** made of it — the
+    /// registry surface of [`Port::command`], which owns the decision table.
+    ///
+    /// The three outcomes a runtime needs for `erlang:port_command/2,3`:
+    ///
+    /// | result | oracle answer |
+    /// |---|---|
+    /// | [`PortCommandOutcome::Done`] | `true` |
+    /// | [`PortCommandOutcome::Busy`] with `[nosuspend]` | `false` |
+    /// | [`PortCommandOutcome::Busy`] without it | the caller **suspends**, then retries (and gets `Done`) |
+    /// | `Err` (`notsup`) for `[force]` on a driver without
+    ///   [`DriverFlags::SOFT_BUSY`](crate::DriverFlags::SOFT_BUSY) | `error:notsup` |
+    /// | `Err` (`BadArg`) for a dead/unknown port | `badarg` |
+    ///
+    /// A `Busy` answer means the bytes were **not** queued: the caller keeps them (and the options)
+    /// and re-issues the command when the driver clears the state, exactly as the C suspends and
+    /// re-runs the BIF (`erts_internal_port_command_3`'s `ERTS_BIF_YIELD3` trap,
+    /// `erl_bif_port.c:211-220`). Nothing here blocks — this layer has no notion of a caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live, open port, and the `notsup` raise for a
+    /// `[force]` command on a driver without
+    /// [`DriverFlags::SOFT_BUSY`](crate::DriverFlags::SOFT_BUSY) (`erl_bif_port.c:195-198`).
+    pub fn port_command_with(
         &mut self,
         _poller: &mut Poller,
         id: PortId,
         data: &[u8],
         options: PortCommandOptions,
-    ) -> Result<()> {
-        let Some(port) = self.ports.get_mut(&id.number()) else {
-            return Err(error::badarg());
-        };
-        if port.state() != PortState::Open {
-            return Err(error::badarg());
+    ) -> Result<PortCommandOutcome> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => port.command(data, options),
+            None => Err(error::badarg()),
         }
-        // `nosuspend`/`force` describe what a *busy* port does with a command; M1 ports are
-        // never busy and never suspend (see `PortCommandOptions`), so the flags are carried
-        // but change no behaviour yet.
-        let _options = options;
-        port.queue_output(data);
-        port.schedule_task(PortTaskKind::Output);
-        Ok(())
+    }
+
+    /// Whether port `id` is currently **busy** — the state its driver last reported through
+    /// `set_busy_port` (see [`Driver::is_busy`] and [`Port::is_busy`]).
+    ///
+    /// This is the registry surface of the C's `ERTS_PTS_FLG_BUSY_PORT`, the same state
+    /// [`PortRegistry::port_command_with`] decides on.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn is_busy(&self, id: PortId) -> Result<bool> {
+        match self.ports.get(&id.number()) {
+            Some(port) => Ok(port.is_busy()),
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// Whether the peer/OS side has closed port `id`'s underlying endpoint — the **latched**
+    /// accessor a runtime reads once per round to deliver the oracle's peer-close message
+    /// (`{tcp_closed, Port}`, …).
+    ///
+    /// See [`Driver::port_closed`] and [`Port::port_closed`]; the answer stays `true` for the rest
+    /// of the port's life once the driver has observed the close, so a runtime cannot miss it by
+    /// draining a round late.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn port_closed(&self, id: PortId) -> Result<bool> {
+        match self.ports.get(&id.number()) {
+            Some(port) => Ok(port.port_closed()),
+            None => Err(error::badarg()),
+        }
     }
 
     /// Delivers a named port-control operation to the port's driver.
@@ -1968,7 +2036,9 @@ mod tests {
         let mut poller = poller();
         let (mut registry, id) = registry_with_pipe(&mut poller);
 
-        let options = PortCommandOptions::new().with_nosuspend(true).with_force(true);
+        // `[nosuspend]` only — `[force]` is refused for a driver that does not advertise
+        // `ERL_DRV_FLAG_SOFT_BUSY`, which no built-in driver does (see `Port::command`).
+        let options = PortCommandOptions::new().with_nosuspend(true);
         registry
             .port_command(&mut poller, id, b"cmd!", options)
             .expect("the command is queued");
@@ -2232,3 +2302,10 @@ mod tests {
 #[cfg(test)]
 #[path = "registry_reply_tests.rs"]
 mod reply_tests;
+
+/// The registry-half of the busy-port / peer-close surfaces (`port_command_with`/`is_busy`/
+/// `port_closed`) — the resource resolution and the unknown-id `BadArg` — lives in its own sibling
+/// for the same reason as `reply_tests`; the decision table itself is `Port::command`'s.
+#[cfg(test)]
+#[path = "registry_busy_tests.rs"]
+mod busy_tests;
