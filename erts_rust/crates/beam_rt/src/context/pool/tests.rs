@@ -705,3 +705,62 @@ fn an_exhausted_pooled_region_is_retired_and_replaced_by_a_wider_frontier() {
         "the frontier serves the next call; the retired region keeps its words untouched"
     );
 }
+
+/// **A non-rewindable table-less call is NOT moved: the store stays out of it.**
+///
+/// On the table-less route the copy exists for exactly one purpose — to license the pool
+/// rewind — so the move is gated by `safe_to_rewind` itself: a call whose hooked seam could have
+/// retained a heap word skips the copy **and** the rewind. The case drives the `dict` arm
+/// (`erlang:get_keys/1` builds its key list on `ctx.heap()`) with **no** scheduled process, and
+/// pins both halves of that decision over 20 rounds:
+///
+/// * the store receives **nothing** — [`Runtime::eval_heap`]'s offset stays `0` — because a copy
+///   into a region that is never reset accumulates one result per call for the run's whole life,
+///   and a long run of such calls exhausts the term-heap arena (`error:system_limit`) for a reason
+///   that has nothing to do with the workload's live set;
+/// * the caller is handed the pool's own word ([`lies_in_the_pool`]), with the correct value, and
+///   the frontier stays **above** the call's mark — the words the seam could have retained are
+///   never handed out again.
+#[test]
+fn a_non_rewindable_table_less_call_is_not_moved_and_the_store_stays_empty() {
+    const ROUNDS: usize = 20;
+    let mut rt = small_region_runtime();
+    // One entry in the runtime's **own** process's dictionary — the process `RuntimeContext::new`
+    // reports as `self` — so `get_keys/1` really builds a one-element list on the call's heap.
+    let pid = rt.self_pid;
+    rt.processes
+        .get_mut(pid)
+        .expect("the runtime always owns its own process")
+        .dict_mut()
+        .put(make_small(7), make_small(11));
+    for round in 0..ROUNDS {
+        let keys = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.call_bif("erlang", "get_keys", 1, &[make_small(11)])
+                .unwrap_or_else(|e| panic!("round {round}: get_keys(11): {e}"))
+        };
+        assert_eq!(
+            (
+                terms::cons_head(keys).expect("a cons cell"),
+                terms::cons_tail(keys).expect("a cons cell"),
+            ),
+            (make_small(7), NIL),
+            "round {round}: the key list is exactly `[7]`"
+        );
+        assert!(
+            lies_in_the_pool(&rt, keys),
+            "round {round}: the `dict` arm is not rewindable, so the move is skipped and the \
+             caller keeps the pool's own word"
+        );
+        assert_eq!(
+            rt.eval_heap.used(),
+            0,
+            "round {round}: the store must receive nothing — a copy here is never reset and only \
+             accumulates"
+        );
+        assert!(
+            frontier_used(&rt) > 0,
+            "round {round}: the call's words stay on the pool, so the frontier is above its mark"
+        );
+    }
+}
