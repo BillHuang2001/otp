@@ -32,6 +32,8 @@
 //! live in [`super`].
 
 use core::sync::atomic::{AtomicI64, Ordering};
+use std::cell::RefCell;
+use std::sync::OnceLock;
 
 use libc::{c_char, c_int, c_void, size_t};
 
@@ -475,18 +477,198 @@ pub unsafe extern "C" fn erl_drv_convert_time_unit(
 // Environment and errno
 // ---------------------------------------------------------------------------------------------
 
-/// `char *erl_errno_id(int error);` — plain-text text for an errno value.
+/// `ERTS_UNKNOWN_ERRNO_BUF_SZ` (`erl_errno_str.c:48`) — the answer buffer's size: "big enough even
+/// if errno should be 64-bit integer". It holds the `errno_<N>` form (at most `errno_` + `-` + ten
+/// digits = 17 bytes), the longest name a C library can report here (`ENOTRECOVERABLE`, 15 bytes)
+/// and the NUL.
+const ERTS_UNKNOWN_ERRNO_BUF_SZ: usize = 30;
+
+thread_local! {
+    /// The errno-answer buffer, one per thread. The C keeps one process-wide set of strings
+    /// (`errno_map` plus a never-shrinking hash table, `erl_errno_str.c:1206-1300`) whose lifetime is
+    /// the runtime's; the documented contract on the answer is only "valid until the next call", so a
+    /// thread-local scratch gives every caller exactly that guarantee without a lock and without
+    /// allocating per call.
+    static ERRNO_ID_BUF: RefCell<[c_char; ERTS_UNKNOWN_ERRNO_BUF_SZ]> =
+        const { RefCell::new([0; ERTS_UNKNOWN_ERRNO_BUF_SZ]) };
+}
+
+/// `const char *strerrorname_np(int)` — the C library's errno-number → errno-*name* lookup, the
+/// primitive the C's `errno_name()` falls back on under `HAVE_STRERRORNAME_NP`
+/// (`erl_errno_str.c:43-45`, `:1106-1108`).
+type StrerrorNameNp = unsafe extern "C" fn(c_int) -> *const c_char;
+
+/// The one-time `dlsym` resolution of [`StrerrorNameNp`]. `None` when this C library exports no such
+/// function, in which case every errno the collision table does not name answers `errno_<N>` — which
+/// is the C's own behaviour when `errno_name()` returns NULL (`erl_errno_str.c:1279-1290`).
+static STRERRORNAME_NP: OnceLock<Option<StrerrorNameNp>> = OnceLock::new();
+
+/// Resolve `strerrorname_np` from the process's dynamic symbol table (cached for the process's
+/// lifetime, so the hot path is a load plus a null check).
 ///
-/// **Documented deviation:** the oracle returns the lowercase POSIX errno *name* (`"enoent"`); this
-/// returns libc `strerror`'s descriptive message (`"No such file or directory"`).
+/// Safe to call: the `dlsym` probe has no preconditions (it is given `RTLD_DEFAULT` and a
+/// NUL-terminated literal, and a symbol found under this name has the C-declared `const char *(int)`
+/// signature), and the result is either `None` or a function pointer the caller only invokes with an
+/// `int`.
+fn strerror_name_np() -> Option<StrerrorNameNp> {
+    *STRERRORNAME_NP.get_or_init(|| {
+        // SAFETY: `RTLD_DEFAULT` is this platform's "global scope" pseudo-handle and the name is a
+        // NUL-terminated literal, so `dlsym` reads only its own arguments.
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"strerrorname_np".as_ptr()) };
+        if sym.is_null() {
+            return None;
+        }
+        // SAFETY: a global symbol named `strerrorname_np` *is* `const char *(*)(int)` (the glibc
+        // declaration the C's configure check probes for), and a `dlsym` result is by contract
+        // convertible to the type the caller knows the symbol to have. Both are one word on LP64.
+        Some(unsafe { core::mem::transmute::<*mut c_void, StrerrorNameNp>(sym) })
+    })
+}
+
+/// The answer for an errno value that carries more than one name — the C has always returned the
+/// same spelling for such a collision, so a fixed table bypasses the C library's possibly-different
+/// choice (`erl_errno_str.c:979-1108`): the switch is consulted *before* `strerrorname_np`, and each
+/// of its guards is "only list this name if the two spellings are distinct values".
+///
+/// On this target (`EAGAIN == EWOULDBLOCK`, `EBUSY != EALREADY`, `EWOULDBLOCK != EDEADLK`) that
+/// leaves `EAGAIN`, `EALREADY`, `EBUSY`, `ECONNREFUSED` and `EDEADLK`, in the C's order.
+fn colliding_errno_name(error: c_int) -> Option<&'static [u8]> {
+    // Written as `if`s rather than a `match`: `EAGAIN` and `EWOULDBLOCK` are the same value here, so
+    // two arms could never both be reachable and one would be flagged as an unreachable pattern.
+    if error == libc::EAGAIN {
+        return Some(b"eagain\0");
+    }
+    if libc::EBUSY != libc::EALREADY && error == libc::EALREADY {
+        return Some(b"ealready\0");
+    }
+    if error == libc::EBUSY {
+        return Some(b"ebusy\0");
+    }
+    if error == libc::ECONNREFUSED {
+        return Some(b"econnrefused\0");
+    }
+    if libc::EWOULDBLOCK != libc::EDEADLK && error == libc::EDEADLK {
+        return Some(b"edeadlk\0");
+    }
+    None
+}
+
+/// Copy `bytes` into the per-thread answer buffer, NUL-terminate it, and return its address.
+///
+/// The address is stable for as long as the calling thread lives; a later call on the same thread
+/// overwrites the text but never moves the buffer, which is the guarantee
+/// [`erl_errno_id`]'s documentation makes.
+fn write_errno_answer(bytes: &[u8]) -> *mut c_char {
+    ERRNO_ID_BUF.with(|cell| {
+        let buf: &mut [c_char] = &mut *cell.borrow_mut();
+        let room = buf.len() - 1; // the last byte is always the NUL
+        let n = bytes.len().min(room);
+        for (dst, &src) in buf.iter_mut().zip(bytes.iter()).take(n) {
+            *dst = src as c_char;
+        }
+        buf[n] = 0;
+        buf.as_mut_ptr()
+    })
+}
+
+/// Copy a C string into the per-thread answer buffer, ASCII-lowercased and NUL-terminated — the C's
+/// `tolower_copy_estring` (`erl_errno_str.c:151-168`) at the point the oracle stores a
+/// `strerrorname_np` answer, which is upper case at the source.
 ///
 /// # Safety
 ///
-/// The result is owned by libc's static message buffer; do not free or mutate it.
+/// `name` must be a NUL-terminated C string readable for the duration of this call.
+unsafe fn write_lowercased(name: *const c_char) -> *mut c_char {
+    let mut lower = [0u8; ERTS_UNKNOWN_ERRNO_BUF_SZ];
+    let mut n = 0;
+    while n < lower.len() - 1 {
+        // SAFETY: `name` is NUL-terminated (caller contract), so the read stays inside its bytes.
+        let c = unsafe { *name.add(n) };
+        if c == 0 {
+            break;
+        }
+        // Bit-preserving for any byte; only ASCII `A`..`Z` are folded (`'A' <= c && c <= 'Z'`).
+        let b = c as u8;
+        lower[n] = if b.is_ascii_uppercase() {
+            b + (b'a' - b'A')
+        } else {
+            b
+        };
+        n += 1;
+    }
+    write_errno_answer(&lower[..n])
+}
+
+/// Render the C's unknown-errno answer — `ERTS_UNKNOWN_ERRNO_FORMAT` `"errno_%d"`
+/// (`erl_errno_str.c:47`, `:203-208`) — into the per-thread answer buffer and return it.
+///
+/// No heap object is allocated: the digits are rendered into a stack array (at most
+/// `errno_` + `-` + ten digits = 17 bytes of the 29 usable ones).
+fn write_unknown_errno(error: c_int) -> *mut c_char {
+    const PREFIX: &[u8] = b"errno_";
+    let mut text = [0u8; ERTS_UNKNOWN_ERRNO_BUF_SZ];
+    text[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut n = PREFIX.len();
+    if error < 0 {
+        text[n] = b'-';
+        n += 1;
+    }
+    // `unsigned_abs` keeps `i32::MIN` from overflowing; the sign is emitted separately, as `%d` does.
+    let mut value = error.unsigned_abs();
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        value /= 10;
+        count += 1;
+        if value == 0 {
+            break;
+        }
+    }
+    while count > 0 {
+        count -= 1;
+        text[n] = digits[count];
+        n += 1;
+    }
+    write_errno_answer(&text[..n])
+}
+
+/// `char *erl_errno_id(int error);` — the errno's **lowercase POSIX name** (`"eacces"`, `"enoent"`,
+/// `"eio"`, `"einval"`) and the form `errno_<N>` for any errno the C library cannot name — including
+/// `0`, which the C maps to `errno_0` because `errno_map[0]` is written with
+/// `write_unknown_errno()` before its name loop starts, so `errno_name(0)` is never consulted
+/// (`erl_errno_str.c:1131-1152`, `:1233-1236`).
+///
+/// The lookup order is the C's `errno_name()` (`erl_errno_str.c:979-1108`): the collision table
+/// first (see [`colliding_errno_name`]), then the C library's `strerrorname_np`, then the
+/// `errno_<N>` form. The answer is ASCII-lowercased, because the oracle lowercases the C library's
+/// upper-case name on the way into its own storage (`tolower_copy_estring`).
+///
+/// # Safety
+///
+/// The returned pointer is NUL-terminated and stays valid and readable until the next
+/// `erl_errno_id` call **on the same thread**; it must not be freed or mutated. A name from the
+/// collision table points at static read-only storage and stays valid for the process's lifetime.
 #[no_mangle]
 pub unsafe extern "C" fn erl_errno_id(error: c_int) -> *mut c_char {
-    // SAFETY: `strerror` accepts any `int`; the returned pointer is valid until the next call.
-    unsafe { libc::strerror(error) }
+    if let Some(name) = colliding_errno_name(error) {
+        // The table holds NUL-terminated literals; the C caller only reads them.
+        return name.as_ptr() as *mut c_char;
+    }
+    // `0` bypasses the name lookup: glibc's `strerrorname_np(0)` answers `"0"`, while the oracle's
+    // `errno_map[0]` is pre-filled with `errno_0` and never asks for a name.
+    if error != 0 {
+        if let Some(lookup) = strerror_name_np() {
+            // SAFETY: `lookup` is the resolved `strerrorname_np`; its answer is NULL or a
+            // NUL-terminated string owned by the C library.
+            let name = unsafe { lookup(error) };
+            if !name.is_null() {
+                // SAFETY: just checked — non-null and NUL-terminated.
+                return unsafe { write_lowercased(name) };
+            }
+        }
+    }
+    write_unknown_errno(error)
 }
 
 /// `int erl_drv_putenv(const char *key, char *value);` — set an environment variable: `0` on success,
@@ -983,14 +1165,101 @@ mod tests {
         assert_eq!(offset_of!(ErlDrvBinary, orig_bytes), 8);
     }
 
+    /// Read an `erl_errno_id` answer as a Rust string (the caller keeps the pointer only until the
+    /// next call, which no test does).
+    fn errno_id(error: c_int) -> String {
+        // SAFETY: `erl_errno_id` accepts any `int` and answers a NUL-terminated string valid until
+        // the next call on this thread.
+        let p = unsafe { erl_errno_id(error) };
+        assert!(!p.is_null(), "erl_errno_id({error}) must never answer NULL");
+        // SAFETY: non-null and NUL-terminated (the documented contract).
+        let bytes = unsafe { CStr::from_ptr(p) }.to_bytes();
+        // The oracle's answers are pure ASCII: the lowercased POSIX name or `errno_<N>`.
+        assert!(
+            bytes.is_ascii() && !bytes.is_empty(),
+            "erl_errno_id({error}) must answer non-empty ASCII, got {bytes:?}"
+        );
+        String::from_utf8(bytes.to_vec()).expect("checked ASCII above")
+    }
+
     #[test]
-    fn errno_id_returns_a_non_empty_message() {
-        // SAFETY: `strerror` accepts any `int` and returns a NUL-terminated static string.
-        let p = unsafe { erl_errno_id(libc::ENOENT) };
-        assert!(!p.is_null());
-        // SAFETY: non-null and NUL-terminated (libc static message buffer).
-        let s = unsafe { CStr::from_ptr(p) }.to_str().expect("ascii message");
-        assert!(!s.is_empty());
+    fn errno_id_answers_the_lowercase_posix_name() {
+        // The oracle's names (`erl_errno_str.c`'s `errno_name()` + `tolower_copy_estring`): the C
+        // library's upper-case symbol, ASCII-lowercased.
+        assert_eq!(errno_id(libc::EACCES), "eacces");
+        assert_eq!(errno_id(libc::ENOENT), "enoent");
+        assert_eq!(errno_id(libc::EINVAL), "einval");
+        // The collision table resolves a value with more than one name to the oracle's spelling:
+        // `EAGAIN` and `EWOULDBLOCK` are the same integer here, and the C has always answered
+        // `eagain` for it.
+        assert_eq!(
+            libc::EAGAIN,
+            libc::EWOULDBLOCK,
+            "the premise of the collision case"
+        );
+        assert_eq!(errno_id(libc::EAGAIN), "eagain");
+        assert_eq!(errno_id(libc::EWOULDBLOCK), "eagain");
+        assert_eq!(errno_id(libc::EBUSY), "ebusy");
+        assert_eq!(errno_id(libc::ECONNREFUSED), "econnrefused");
+        assert_eq!(errno_id(libc::EDEADLK), "edeadlk");
+        assert_eq!(errno_id(libc::EALREADY), "ealready");
+        // Nothing resembling `strerror` prose may survive: no spaces, no upper case.
+        for error in [libc::EACCES, libc::ENOENT, libc::EINVAL, libc::EAGAIN] {
+            let answer = errno_id(error);
+            assert!(
+                answer
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "erl_errno_id({error}) = {answer:?} must be a bare lowercase name"
+            );
+        }
+    }
+
+    #[test]
+    fn errno_id_answers_errno_n_for_anything_unnamed() {
+        // `0` is the C's `errno_map[0]`: written with `write_unknown_errno()` before the name loop,
+        // so it never reaches the lookup (`erl_errno_str.c:1146-1152`).
+        assert_eq!(errno_id(0), "errno_0");
+        // An errno this C library cannot name — the oracle's measured answer for `9999`.
+        assert_eq!(errno_id(9999), "errno_9999");
+        // Negative values take the same route (OTP's own `driver_SUITE_data/erl_errno_id_drv.c`
+        // pins `-4711` and `-1`).
+        assert_eq!(errno_id(-4711), "errno_-4711");
+        assert_eq!(errno_id(-1), "errno_-1");
+        // The extreme still fits the buffer and prints in full.
+        assert_eq!(errno_id(c_int::MIN), format!("errno_{}", c_int::MIN));
+        assert_eq!(errno_id(c_int::MAX), format!("errno_{}", c_int::MAX));
+    }
+
+    #[test]
+    fn errno_id_answers_stay_readable_until_the_next_call() {
+        // The documented `*mut c_char` contract: NUL-terminated, and the text is unchanged while no
+        // further call happens — both for a name the collision table owns (static storage, valid for
+        // the process's lifetime) and for one rendered into the per-thread answer buffer.
+        // SAFETY: any `int` is accepted; each pointer is valid until the next call.
+        let static_name = unsafe { erl_errno_id(libc::EAGAIN) };
+        // SAFETY: as above.
+        let unknown = unsafe { erl_errno_id(9999) };
+        assert_ne!(
+            static_name, unknown,
+            "a table answer lives in static storage, not in the rendered buffer"
+        );
+        // SAFETY: neither answer has been overwritten — no `erl_errno_id` call happened since.
+        assert_eq!(unsafe { CStr::from_ptr(static_name) }.to_bytes(), b"eagain");
+        // SAFETY: `unknown` is still valid — the read above is not a call.
+        assert_eq!(unsafe { CStr::from_ptr(unknown) }.to_bytes(), b"errno_9999");
+        // A further rendered answer overwrites the per-thread buffer's text but never moves it, so
+        // the pointer stays a valid, readable answer.
+        // SAFETY: as above.
+        let reused = unsafe { erl_errno_id(0) };
+        assert_eq!(
+            reused, unknown,
+            "the per-thread answer buffer must not move between calls"
+        );
+        // SAFETY: `reused` is the current answer.
+        assert_eq!(unsafe { CStr::from_ptr(reused) }.to_bytes(), b"errno_0");
+        // SAFETY: the static answer is untouched by any of the calls above.
+        assert_eq!(unsafe { CStr::from_ptr(static_name) }.to_bytes(), b"eagain");
     }
 
     #[test]
