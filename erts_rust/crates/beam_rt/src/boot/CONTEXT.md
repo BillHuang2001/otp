@@ -355,8 +355,13 @@ The native probe reads the *standard OTP installation layout* — `<root>/lib/<a
 source tree's `<root>/lib/<app>/ebin`, and the `erts` application at `<root>/lib/erts-<vsn>/ebin`,
 `<root>/erts-<vsn>/ebin` or `<root>/erts/preloaded/ebin`. A candidate root is accepted only when it really
 holds the probe module (`lists.beam` decides — stdlib is the hard requirement, `kernel`/`erts` are
-best-effort, exactly as in the oracle's answer), and the directories keep the `SYSTEM_APPS` order
-(`stdlib`, `kernel`, `erts`).
+best-effort), so the probe answers the *installation root*; the ebin list it emits is then the
+release-layout derivation of `../codeserver/path.rs` (the `lib/kernel/src/code_server.erl` port:
+`release_ebins` = `choose_bundles`/`make_path` over `list_dir(<root>/lib)` — the highest version per
+application, descending by name — plus `user_lib_ebins` (`$ERL_LIBS`), the prim pair kernel→stdlib and
+`"."`, via `system_path`), never the old fixed `SYSTEM_APPS` list; `SYSTEM_APPS` survives only as the
+`lists.beam` acceptance probe. `../../tests/code_path.rs` pins the emitted list against the oracle's
+own `code:get_path/0` element-wise and in order (36 entries on this host).
 Candidate roots, most specific first: the `erl` on `$PATH` — **resolved to a filesystem path and never
 executed**, so the installation this runtime is meant to be interchangeable with wins — then this
 executable's ancestors (an OTP source tree above `erts_rust/target/…`), then `$ERL_TOP`, then
