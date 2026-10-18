@@ -166,6 +166,20 @@ fn kind_of_driver(driver_name: &str) -> ActivePortKind {
     }
 }
 
+impl PortMeta {
+    /// How this port renders a delivered payload: the `binary`/`list` stream option.
+    ///
+    /// **This is the single call site for the mode** in the active-input channel, and it is the
+    /// seam a `{mode, …}` `setopts` mirror adopts later: `inet:setopts(S, [{mode, list|binary}])`
+    /// never reaches [`beam_io`] (`drivers/inet/CONTEXT.md` §"Shape" — list vs binary is the
+    /// runtime's decision), so a port whose mode changes after `open_port/2` has its new mode
+    /// nowhere but an Erlang-side mirror. When that mirror lands, this method consults it and
+    /// nothing else in this module changes.
+    pub(crate) fn data_mode(&self) -> StreamType {
+        self.stream
+    }
+}
+
 /// One drained `{active, …}` delivery, bound to the port that produced it **and** to everything
 /// its rendering still needs once that port's metadata may be gone.
 ///
@@ -307,9 +321,15 @@ impl RuntimeContext<'_> {
                 let (ip, source_port) = decode_packed_address(&read.header)?;
                 let [a, b, c, d] = ip.map(|byte| make_small(i64::from(byte)));
                 let address = terms_tuple(self, &[a, b, c, d])?;
-                let payload = self.make_payload(
-                    &[],
-                    read.body.as_deref(),
+                // The datagram's payload is the read's **body only** (the header is the source
+                // address, rendered as its own elements above), so it is shaped through the one
+                // stream shaper from a header-less read — never a second byte-list builder.
+                let payload_read = ReadMessage {
+                    header: Vec::new(),
+                    body: read.body.clone(),
+                };
+                let payload = self.make_stream_payload(
+                    &payload_read,
                     packet.data_mode,
                     super::StreamShape::Data,
                 )?;
@@ -334,10 +354,7 @@ impl RuntimeContext<'_> {
     /// The C's `packet_passive_message` (`inet_drv.c:4215`) picks the atom from the socket's
     /// protocol (`tcp_passive` for `IPPROTO_TCP`, `udp_passive` otherwise); the protocol is the
     /// port's driver kind here, which is why the runtime — not `beam_io` — names it.
-    fn active_passive_message(
-        &mut self,
-        packet: &ActiveInputPacket,
-    ) -> beam_common::Result<Eterm> {
+    fn active_passive_message(&mut self, packet: &ActiveInputPacket) -> beam_common::Result<Eterm> {
         let name = match packet.kind {
             ActivePortKind::Tcp => "tcp_passive",
             ActivePortKind::Udp => "udp_passive",
