@@ -133,6 +133,17 @@ shared catch-aware `raise_bif_error`.
   eight comparison BIFs have baseline-JIT inline paths (see `../jit/baseline/emit/`), everything else deopts to
   `jit_step_one` (`../jit/baseline/runtime.rs`), which calls `step_instruction_with_entry`.
 
+## BIF-argument marshalling: what the host actually receives (GC reality)
+The host is handed a **copy** of the argument terms, never a borrow of the `x` file — and the copy lives in no root set.
+- arity `<= STACK_ARGS` (2) → a **stack array** (`EMPTY_ARGS`, `bif.rs:51`), filled from the operands at `bif.rs:88-91` (`gc_bif`/`bif`) or from `x(0..nregs)` at `bif.rs:233-238` (`call_ext*`/local-call route).
+- a wider arity → `Machine::args_scratch`, which `dispatch_wide` **takes out of the machine** (`std::mem::take`, `bif.rs:157`) and reinstalls *empty* at `bif.rs:167` — so during the dispatch the buffer is not reachable from `Machine` at all (`args_scratch` field doc: `machine/mod.rs:375-387`).
+`Machine::with_roots` publishes only `x`/`stack`/`fr` (`machine/mod.rs:643-679`), so neither flavour is a GC root; and `Machine::dispatch_bif_call` takes **`&self`** (`bif.rs:291-305`) while `call_bif_in_machine` gets `&Machine` (`context.rs:413`), so a **collecting** host can neither relocate the argument words nor write relocated words back into `x`. `ExecutionContext::call_bif`/`call_bif_in_machine` state **no GC contract for `args`** (`context.rs:335`, `:413`) — the host rule is that a BIF dispatch must not move the calling process's heap.
+Two further shapes to keep in mind when auditing this seam: `Instr::GcBif`/`Bif`/`Bif0`/`CallExt*` perform **no heap admission** of their own (the compiler's separate `test_heap`/`allocate_heap` is the only admission point), and `read_operand` of a **non-small** `Operand::Integer`/`Character` **allocates** via `ctx.alloc_words` (`operand.rs:69`, `:75` → `terms/number.rs:154`) *between* the reads of successive operands, i.e. inside the marshalling loops at `bif.rs:90`/`:112`, with the already-read terms unpublished. `trace_call` has the same shape: it fills the same taken-out scratch (`trace.rs:186-208`) and passes `&scratch` to `ctx.trace_event` **before** the `call_ext*` dispatch (`dispatch.rs:524-526`, `:541-543`, `:585-587`).
+
+## Execution-position bookkeeping (exactness)
+`Machine::drive` stores the position **before** pricing the instruction (`machine/drive.rs:169`), so a pre-empting `reduce` `Err` (`:181-184`) parks the machine on the NOT-yet-executed instruction; `step_instruction_with_entry` re-stores the same `(func, pc)` at `dispatch.rs:201` before the body (`:202`). The module **context** is switched after the step returns and before the next store (`drive.rs:216-226` → `machine/mod.rs:726`), so `current_code` and `self.context` agree at every charge point and every step entry.
+A suspend is the one place the two positions differ: `step` reports `Step::Wait { func, pc }` = the **resume label** (`families/receive.rs:245-248`), while `current_code` still names the `wait`/`wait_timeout` instruction that suspended.
+
 ## Typed-error inventory (interpreter core)
 Every typed error this core (and the `machine/` machinery it drives) can return is one of three classes; a real
 `erl`-compiled `.beam` never hits classes 1 or 2 as a *divergence* — class 1 is malformed-bytecode robustness, class 2
