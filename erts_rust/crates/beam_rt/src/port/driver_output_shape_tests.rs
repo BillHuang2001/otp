@@ -29,7 +29,7 @@
 //!
 //! # What this suite pins, and where it differs from its two siblings
 //!
-//! [`super::stream_shape_tests`] pins the **builder** (given a [`StreamShape`], the runtime renders
+//! [`super::stream_shape_tests`] pins the **builder** (given a [`ReadMessage`], the runtime renders
 //! the oracle's term) and [`super::ram_file_matrix_tests`] pins the reply **bytes** and the two
 //! `port_info/2` counters row by row. This suite pins the last seam those two cannot see: the
 //! *producer* — a real `{spawn_driver, "ram_file_drv"}` port opened on the **runtime's own**
@@ -38,16 +38,21 @@
 //! rendered matrix — every row's term plus the closing byte counters — is then compared with the
 //! live oracle's output for the very same command sequence, in **both** stream modes.
 //!
+//! [`a_split_read_reaches_the_owner_as_the_cs_terms`] then pins the split itself end to end: a
+//! driver registered on the runtime's own port table hands up `driver_output2`-shaped reads
+//! ([`beam_io::DriverContext::deliver_read`]) through a **real** port-task round, and every one of
+//! the C's four shapes — plus a line frame's header prefix — reaches the owner unchanged.
+//!
 //! # The one residual, named loudly
 //!
-//! `beam_io`'s stream layer folds every `driver_output*` call into one flat byte queue
-//! ([`beam_io::DriverContext::input`]), so the port layer is handed bytes with **no** header/data
-//! split and reports [`StreamShape::DriverOutput`] — "the C's header rendering, split unknown".
-//! That is *exact* for a header-only reply and loses the binary tail of a `DATA` reply
-//! (`driver_output_binary`, `ram_file_drv.c:448`): the oracle delivers `[2,0,0,0,2|<<97,98>>]`, this
-//! runtime `[2,0,0,0,2,97,98]` — the same bytes, as list elements. [`report_residual`] prints those
-//! two rows on every run, and the matrix comparison below is aligned on exactly those two rows
-//! (never silently).
+//! A **built-in driver port**'s reply still arrives through [`beam_io::DriverContext::input`], a
+//! flat byte queue that carries **no** header/data split, so the port layer reports
+//! [`StreamShape::DriverOutput`] — "the C's header rendering, split unknown". That is *exact* for a
+//! header-only reply and loses the binary tail of a `DATA` reply (`driver_output_binary`,
+//! `ram_file_drv.c:448`): the oracle delivers `[2,0,0,0,2|<<97,98>>]`, this runtime
+//! `[2,0,0,0,2,97,98]` — the same bytes, as list elements. [`report_residual`] prints those two
+//! rows on every run, and the matrix comparison below is aligned on exactly those two rows (never
+//! silently).
 use super::ram_file_matrix_tests::oracle_output;
 use super::tests::{counter, erl_bytes, fixture, skip_oracle_check, Fixture};
 use super::*;
@@ -392,9 +397,9 @@ fn aligned_with_this_runtime(oracle: &str) -> String {
 
 /// Prints the residual this suite cannot close, naming every row it covers.
 ///
-/// `beam_io` folds `driver_output2`'s header/body split producer-side (`DriverContext::input()` is
-/// a flat `ByteQueue`, `PortNotification::Data` carries one `Vec<u8>`), so a `DATA` reply's binary
-/// tail is unreachable from this crate; the bytes and both byte counters agree exactly.
+/// An **in-tree driver** hands its bytes up through [`beam_io::DriverContext::input`], a flat byte
+/// queue with no split attached, so a `DATA` reply's binary tail is unreachable from this crate;
+/// the bytes and both byte counters agree exactly.
 fn report_residual() {
     println!("================================================================");
     println!(
@@ -411,8 +416,9 @@ fn report_residual() {
         }
     }
     println!(
-        "  cause: `beam_io`'s stream layer folds `driver_output2`'s header/data split into one \
-         `Vec<u8>` before the port layer sees it; owner: `beam_io`, bytes and counters agree."
+        "  cause: an in-tree driver hands its bytes up through `beam_io`'s flat byte queue \
+         (`DriverContext::input`), which carries no split; owner: `beam_io`, bytes and counters \
+         agree."
     );
     println!("================================================================");
 }
@@ -500,7 +506,7 @@ fn the_builder_renders_a_driver_output_payload_as_list_elements_on_either_stream
             let mut ctx = RuntimeContext::new(&mut rt);
             ctx.port_data_message_shaped(
                 port,
-                &[2, 0, 0, 0, 2, 97, 98],
+                &ReadMessage::body_only(vec![2, 0, 0, 0, 2, 97, 98]),
                 stream,
                 StreamShape::DriverOutput,
             )
@@ -660,4 +666,315 @@ fn a_udp_inet_control_reply_is_an_int_list_on_either_stream() {
         }
         hook.close_port(port).expect("closing the driver port");
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The split **end to end**: a real port-task round carries `driver_output2`'s two halves
+// ---------------------------------------------------------------------------------------
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
+
+use beam_io::Interest;
+
+/// One scripted `driver_output*` call a [`SplitReadDriver`] hands up: the C's `hbuf`/`hlen` pair
+/// and its `buf`/`len` pair (`body: None` is a `NULL` buf — no binary tail at all).
+struct ScriptedRead {
+    /// The row label the assertions name.
+    name: &'static str,
+    /// The call's header bytes.
+    header: &'static [u8],
+    /// The call's data part; `None` is the C's `buf == NULL`.
+    body: Option<&'static [u8]>,
+    /// The owner's rendered `{data, D}` on a `[binary]` port; `None` is **no message at all**.
+    binary: Option<&'static str>,
+    /// ...and on the default `[]` stream.
+    list: Option<&'static str>,
+}
+
+impl ScriptedRead {
+    /// This row's expected rendering on `stream` (`None` = the read produces no message).
+    fn expected(&self, stream: StreamType) -> Option<&'static str> {
+        match stream {
+            StreamType::Binary => self.binary,
+            StreamType::List => self.list,
+        }
+    }
+
+    /// The bytes this call carries: the C's `hlen + len`, the `bytes_in` accounting.
+    fn byte_count(&self) -> usize {
+        self.header.len() + self.body.map_or(0, <[u8]>::len)
+    }
+}
+
+/// The C's four shapes, one row per `driver_output*` call, as a **single** driver callback's script
+/// — so the round below proves both the split and the C's one-message-per-call rule.
+#[rustfmt::skip] // one row per line: the table is read as a table, not as code.
+const SPLIT_READS: &[ScriptedRead] = &[
+    ScriptedRead {
+        name: "header_then_body",
+        header: b"HDR", body: Some(b"abc"),
+        binary: Some("[72,68,82|<<97,98,99>>]"), list: Some("[72,68,82,97,98,99]"),
+    },
+    ScriptedRead {
+        name: "header_only",
+        header: b"HDR", body: None,
+        binary: Some("[72,68,82]"), list: Some("[72,68,82]"),
+    },
+    ScriptedRead {
+        name: "header_then_empty_body",
+        header: b"HDR", body: Some(b""),
+        binary: Some("[72,68,82|<<>>]"), list: Some("[72,68,82]"),
+    },
+    ScriptedRead {
+        name: "body_only",
+        header: b"", body: Some(b"abc"),
+        binary: Some("<<97,98,99>>"), list: Some("[97,98,99]"),
+    },
+    // A read of nothing at all is no message at all (the fold's zero-byte rule) — never `{data,[]}`.
+    ScriptedRead { name: "nothing_at_all", header: b"", body: None, binary: None, list: None },
+];
+
+/// A driver that hands up a script of `driver_output2`-shaped reads in its first `ready_input`.
+///
+/// Read readiness is **real**: [`Driver::start`] registers the read end of a socket pair with the
+/// port's own poller and writes one byte from the peer, so the round that reports the reads is the
+/// same port-task round a live driver's would be — nothing is injected behind [`beam_io`]'s back.
+struct SplitReadDriver {
+    /// The read end the poller watches (the driver owns it, as a real driver owns its descriptor).
+    local: UnixStream,
+    /// The peer's send end, held open so the read end stays readable for the port's lifetime.
+    peer: UnixStream,
+    /// The script of `driver_output*` calls this driver hands up, in arrival order.
+    steps: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Whether the script has been handed up (one callback, then silence).
+    delivered: bool,
+}
+
+impl Driver for SplitReadDriver {
+    fn name(&self) -> &str {
+        "split-read"
+    }
+
+    fn start(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> Result<()> {
+        ctx.register(self.local.as_raw_fd(), Interest::READABLE)?;
+        self.peer.write_all(b"!")?;
+        Ok(())
+    }
+
+    fn output(&mut self, _ctx: &mut beam_io::DriverContext<'_>) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn ready_input(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> Result<()> {
+        let mut sink = [0u8; 1];
+        let mut reader = &self.local;
+        let _drained = reader.read(&mut sink)?;
+        if self.delivered {
+            return Ok(());
+        }
+        self.delivered = true;
+        for (header, body) in &self.steps {
+            ctx.deliver_read(header, body.as_deref())?;
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self, _ctx: &mut beam_io::DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The `port_info/1,2` metadata of a [`SplitReadDriver`]'s port: a `{spawn_driver, _}`-kind port
+/// whose bytes are its own driver's, so the read's split — never a producer rule — shapes the term.
+fn split_meta(stream: StreamType, line: Option<usize>, owner: ProcessId) -> PortMeta {
+    PortMeta {
+        command: "split-read".to_string(),
+        kind: PortName::SpawnDriver,
+        os_pid: None,
+        stream,
+        line,
+        packet: None,
+        notify_exit: false,
+        monitors: Vec::new(),
+        owner,
+        driver_has_control: false,
+        driver_terms: None,
+        driver_atoms: None,
+        driver_control_flags: None,
+        driver_busy: None,
+        driver_monitors: None,
+        input: Cell::new(0),
+        output: Cell::new(0),
+    }
+}
+
+/// A live [`SplitReadDriver`] port on `runtime`'s own table, with `steps` as its script.
+fn open_split_read_port(
+    runtime: &mut Runtime,
+    stream: StreamType,
+    line: Option<usize>,
+    steps: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+) -> PortId {
+    let owner = runtime.self_pid();
+    let (local, peer) = UnixStream::pair().expect("a socket pair");
+    let driver = SplitReadDriver {
+        local,
+        peer,
+        steps,
+        delivered: false,
+    };
+    runtime
+        .ports
+        .borrow_mut()
+        .register(Box::new(driver), split_meta(stream, line, owner))
+        .expect("the split-read port registers")
+}
+
+/// Polls the runtime's own `-eval` route until it has collected `wanted` messages, returning them.
+fn poll_messages(runtime: &mut Runtime, wanted: usize) -> Vec<Eterm> {
+    let deadline = Instant::now() + CHILD_BOUND;
+    let mut messages = Vec::new();
+    while messages.len() < wanted {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {wanted} port messages reached the owner within {CHILD_BOUND:?}: {messages:?}",
+            messages.len()
+        );
+        let round = {
+            let mut ctx = RuntimeContext::new(runtime);
+            ctx.poll_port_messages(POLL_ROUND)
+                .expect("the port poll must not fail")
+        };
+        messages.extend(round);
+    }
+    messages
+}
+
+/// `message`'s `element(2, …)` — the `{data, …}` pair — rendered by the registered `~w` printer.
+fn rendered_data(runtime: &mut Runtime, message: Eterm) -> String {
+    let inner = terms::tuple_element(message, 1).expect("the `{data, …}` element");
+    runtime
+        .format_term_w(inner, None)
+        .unwrap_or_else(|error| panic!("the `~w` printer refused a payload: {error}"))
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+/// **The split reaches the owner**: a driver's `driver_output2` header/body pair, handed up through
+/// [`beam_io::DriverContext::deliver_read`] in a real port-task round, renders the C's four shapes —
+/// and a read of nothing at all produces no message.
+///
+/// The rows are the oracle's table ([`ReadMessage`]'s rustdoc; measured on a real C driver against
+/// erts-17.1 and, for the header-only and `DATA` rows, by
+/// [`a_binary_stream_builtin_driver_reply_is_the_cs_header_list`]): `[72,68,82|<<97,98,99>>]` for a
+/// header **with** a data part, the proper `[72,68,82]` for one **without**, `[72,68,82|<<>>]` for a
+/// present-but-empty data part, the bare `<<97,98,99>>` for a header-less `driver_output`, and the
+/// flat list form on the default stream. Accounting counts `hlen + len` on every carried read.
+#[test]
+fn a_split_read_reaches_the_owner_as_the_cs_terms() {
+    for stream in [StreamType::Binary, StreamType::List] {
+        let mut fx = fixture();
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let mut hook = fx.hook_over(Rc::clone(&runtime.ports), runtime.self_pid());
+        let steps: Vec<(Vec<u8>, Option<Vec<u8>>)> = SPLIT_READS
+            .iter()
+            .map(|read| (read.header.to_vec(), read.body.map(<[u8]>::to_vec)))
+            .collect();
+        let port = open_split_read_port(&mut runtime, stream, None, steps);
+        let wanted = SPLIT_READS
+            .iter()
+            .filter(|read| read.expected(stream).is_some())
+            .count();
+        let messages = poll_messages(&mut runtime, wanted);
+        let rendered: Vec<String> = messages
+            .iter()
+            .map(|message| {
+                assert_eq!(
+                    terms::tuple_element(*message, 0).expect("the `Port` element"),
+                    port.to_eterm(),
+                    "{stream:?}: every message comes from this port"
+                );
+                rendered_data(&mut runtime, *message)
+            })
+            .collect();
+        let expected: Vec<(&str, String)> = SPLIT_READS
+            .iter()
+            .filter_map(|read| {
+                read.expected(stream)
+                    .map(|term| (read.name, format!("{{data,{term}}}")))
+            })
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            expected.len(),
+            "{stream:?}: one message per carried read"
+        );
+        for ((label, wanted), got) in expected.iter().zip(&rendered) {
+            assert_eq!(
+                got, wanted,
+                "{stream:?} row {label:?}: the C's shape for the call that produced it"
+            );
+        }
+        // A read of nothing at all is no message: the next round is silent.
+        let extra = {
+            let mut ctx = RuntimeContext::new(&mut runtime);
+            ctx.poll_port_messages(POLL_ROUND)
+                .expect("the quiet round must not fail")
+        };
+        assert!(
+            extra.is_empty(),
+            "{stream:?}: a zero-length read produces no message, got {extra:?}"
+        );
+        let counted: i64 = SPLIT_READS
+            .iter()
+            .filter(|read| read.expected(stream).is_some())
+            .map(|read| i64::try_from(read.byte_count()).expect("a byte count"))
+            .sum();
+        assert_eq!(
+            counter(&mut fx, &mut hook, port, "input"),
+            counted,
+            "{stream:?}: `port_info(Port, input)` counts hlen + len of every carried read"
+        );
+        hook.close_port(port).expect("closing the split-read port");
+    }
+}
+
+/// A **line frame's header prefix** survives the round: `driver_output2("HDR", 3, "a\nb\n", 4)` on a
+/// `[binary]` line port yields **two** frames, each `{eol, [72,68,82|<<"a">>]}`-shaped — the
+/// producing read's header consed on every frame it completed (`deliver_linebuf_message` →
+/// `deliver_read_message`, `io.c:3454`, `:3416-3428`), while a header-less read stamps none.
+///
+/// The frame's own bytes (not the header, which [`beam_io`] stamps on every frame of one call) are
+/// what `port_info(Port, input)` charges.
+#[test]
+fn a_line_frames_header_prefix_survives_the_round() {
+    let mut fx = fixture();
+    let mut runtime = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let mut hook = fx.hook_over(Rc::clone(&runtime.ports), runtime.self_pid());
+    let port = open_split_read_port(
+        &mut runtime,
+        StreamType::Binary,
+        Some(512),
+        vec![(b"HDR".to_vec(), Some(b"a\nb\n".to_vec()))],
+    );
+    let messages = poll_messages(&mut runtime, 2);
+    let rendered: Vec<String> = messages
+        .iter()
+        .map(|message| rendered_data(&mut runtime, *message))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            "{data,{eol,[72,68,82|<<97>>]}}".to_string(),
+            "{data,{eol,[72,68,82|<<98>>]}}".to_string(),
+        ],
+        "each frame carries the header of the read that produced it"
+    );
+    assert_eq!(
+        counter(&mut fx, &mut hook, port, "input"),
+        2,
+        "the frames' own bytes are charged (the header is not re-charged per frame)"
+    );
+    hook.close_port(port).expect("closing the line-mode port");
 }

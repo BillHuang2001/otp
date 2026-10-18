@@ -192,12 +192,14 @@ fn pump_data(registry: &mut PortRegistry, port: PortId) -> Vec<u8> {
         for event in registry.pump(Duration::from_millis(50)).expect("pump") {
             if let PortEvent::Data {
                 port: source,
-                bytes,
+                read,
                 ..
             } = event
             {
                 if source == port {
-                    return bytes;
+                    // A child's byte stream is a body-only read, so the flat view is the whole
+                    // payload (see [`PortEvent::Data`]).
+                    return read.flattened();
                 }
             }
         }
@@ -240,7 +242,7 @@ fn pump_events_until_exit(
                 );
             }
             match event {
-                PortEvent::Data { bytes, .. } => data.push(bytes),
+                PortEvent::Data { read, .. } => data.push(read.flattened()),
                 PortEvent::Exited { .. } => exited = true,
                 _ => {}
             }
