@@ -131,7 +131,13 @@ Thirteen workloads, split by how the baseline tier lowers them:
   `send` + `receive` round-trip cannot produce.
 - `mod.rs` — the tier seam (`Runner`), the timing loop (`Measurement`) and the reporting
   (`report`/`bench_workload`), plus the two public entry points `assert_tier_agreement()` (fast, the
-  agreement half) and `run_measurement_table()` (the `#[ignore]`d timing table). `Measurement::run`
+  agreement half) and `run_measurement_table()` (the `#[ignore]`d timing table), and the
+  crate-visible `run_workloads_on(tier)` — the **one-tier** driver (every workload on exactly ONE
+  tier, results discarded, no cross-tier comparison, no printing) that a *dynamic* census needs,
+  since `assert_tier_agreement` deliberately runs every tier (twice) and would mix the tiers'
+  instruction mixes into one sample. Its consumer is
+  `../baseline/census.rs::dynamic_execution_census` (the `exec_census` execution ranking, run on the
+  interpreter tier). `Measurement::run`
   installs the workload's cross-module resolver (when it has one) and its mailbox (when it has one)
   right after the BIF hook.
 
