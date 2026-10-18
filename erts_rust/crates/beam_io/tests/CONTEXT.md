@@ -98,7 +98,7 @@ doctests, 2 doctests `ignore`d). Per file:
 | `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 8 |
 | `abi_busy.rs` | 2 | `inet.rs` | 8 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
-| `abi_failure.rs` | 8 | `active_mode.rs` | 9 |
+| `abi_failure.rs` | 11 | `active_mode.rs` | 9 |
 | `port_task.rs` | 5 | `udp_inet.rs` | 6 |
 | | | `port.rs` | 4 |
 
@@ -151,7 +151,7 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   `src/drivers/inet/oracle_dump.rs`) or its replies are re-encoded as ASCII decimal/hex text first —
   never raw bytes split on a delimiter (any byte, `0x7C` included, is legitimate payload).
 
-**`abi_failure.rs` (8)** is the one suite that pins the **`driver_output*` shapes and the
+**`abi_failure.rs` (11)** is the one suite that pins the **`driver_output*` shapes and the
 driver-failure channel** over the scripted-opcode fixture (`output_shape_driver.c`) rather than
 `host_driver.c`: one port per row (the failure rows close their own port, so a shared port would
 answer `badarg` on the next command), one `port_command` = one scripted C call site, and the round
