@@ -278,8 +278,8 @@ Current: **577 passing / 0 failing** in the lib target, **783** tests green in t
 - `src/CONTEXT.md` → the crate source-root node doc (the crate-level I/O core: module wiring + one-liner routing to every module) (child node)
 - `src/poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` fallback), `Token`, `Interest`, `Ready`, `Event`, `Waker`
 - `src/timer.rs` → `Timeout`, `Timer`; `src/queue.rs` → `ByteQueue`
-- `src/port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, the reduction constants, `Readiness`, `PortNotification` (`Data`+`Closed`), `LineNotification`, `PortTaskOutcome`
-- `src/port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, the line-framing state (`set_line_mode`/`line_mode`/`flush_linebuf`/`take_line_frames`); re-exports `PortRegistry`
+- `src/port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, the reduction constants, `Readiness`, `ReadMessage` (the `driver_output*` header/body split), `PortNotification` (`Data`+`Closed`), `LineNotification` (with its per-frame `header`), `PortTaskOutcome`
+- `src/port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, the read-frame state (`pending_reads`, the once-per-harvest frame close, the `DriverContext` read sink), the line-framing state (`set_line_mode`/`line_mode`/`flush_linebuf`/`take_line_frames`); re-exports `PortRegistry`
 - `src/registry.rs` → `PortRegistry` (ids over `beam_process::PortTable`, the live-port map, reactor glue, the timer/exit/eof/async/line seams incl.
   `port_table`/`port_table_mut`, `take_line_notifications`)
 - `src/driver.rs` → `Driver`, `PortExitReason`, `DriverContext`, `DriverFlags`, `DriverRegistry`, `pub(crate) PortArms`, and the emulator `driver_tab` set (`STATIC_SPAWN_DRIVERS`, `is_static_spawn_driver`, `DriverRegistry::{with_static_spawn_drivers,create_static_spawn}`)
