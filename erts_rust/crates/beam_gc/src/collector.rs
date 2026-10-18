@@ -528,6 +528,17 @@ impl HeapObservable for Collector {
         self.nursery.capacity_words() + self.mature.capacity_words()
     }
 
+    /// The words handed out across **every** nursery space — the allocatable current one and
+    /// each space a [`grow_nursery`](Self::grow_nursery) retired — so a chained nursery reports
+    /// its whole occupancy rather than only the space new terms go into.
+    fn heap_used_words(&self) -> usize {
+        self.nursery.used_words()
+    }
+
+    /// The whole nursery chain's occupancy plus the mature generation's, in words.
+    fn total_heap_used_words(&self) -> usize {
+        self.nursery.used_words() + self.mature.used_words()
+    }
     fn heap_policy(&self) -> &HeapPolicy {
         &self.policy
     }

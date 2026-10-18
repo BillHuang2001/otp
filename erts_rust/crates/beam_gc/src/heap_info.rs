@@ -77,12 +77,21 @@ pub struct HeapInfo {
     pub total_heap_size: usize,
 }
 
-/// The observables a collector must expose for [`HeapInfo::of`].
+/// The observables a collector must expose for [`HeapInfo::of`] and
+/// [`HeapFootprint::of`](crate::HeapFootprint::of).
 ///
 /// Implemented by [`Collector`](crate::Collector),
 /// [`GenImmixCollector`](crate::GenImmixCollector) and
 /// [`AnyCollector`](crate::AnyCollector), so `HeapInfo::of` works uniformly over the
 /// configured strategy.
+///
+/// The four size methods come in two pairs: a **capacity** pair
+/// ([`heap_size_words`](Self::heap_size_words) /
+/// [`total_heap_size_words`](Self::total_heap_size_words)) and an **occupancy** pair
+/// ([`heap_used_words`](Self::heap_used_words) /
+/// [`total_heap_used_words`](Self::total_heap_used_words)).
+/// Both members of a pair are summed over the **whole** nursery chain, so the two pairs agree
+/// about what the "young generation" is.
 pub trait HeapObservable {
     /// Minor collections run since the last fullsweep (see [`HeapInfo::minor_gcs`]).
     fn minor_gcs(&self) -> u32;
@@ -90,6 +99,26 @@ pub trait HeapObservable {
     fn heap_size_words(&self) -> usize;
     /// The total heap in words (see [`HeapInfo::total_heap_size`]).
     fn total_heap_size_words(&self) -> usize;
+    /// The **chain-summed** nursery occupancy in words: the words handed out across every
+    /// nursery space, the allocatable current one **and** every space a
+    /// [`grow_nursery`](crate::Collector::grow_nursery) retired.
+    ///
+    /// This is the occupancy counterpart of [`heap_size_words`](Self::heap_size_words), which
+    /// is chain-summed too — so `heap_used_words() <= heap_size_words()` always holds.
+    /// It is **not** a read of the current space only: reading `young().used_words()` silently
+    /// drops every retired space, and each one still holds the live words the mutator allocated
+    /// in it until a collection evacuates the chain.
+    /// A current-space-only figure therefore under-reports the young generation by a whole
+    /// retired space for as long as the chain is alive, which is exactly the hole this accessor
+    /// closes; it is the value an off-heap-aware memory reporter reads.
+    fn heap_used_words(&self) -> usize;
+    /// The nursery chain's occupancy plus the mature generation's, in words —
+    /// [`heap_used_words`](Self::heap_used_words) plus the mature generation's used words.
+    ///
+    /// The occupancy counterpart of [`total_heap_size_words`](Self::total_heap_size_words), and
+    /// the `used` half of a per-process heap report (`beam_rt` computes
+    /// `erlang:memory(processes_used)` from it).
+    fn total_heap_used_words(&self) -> usize;
     /// The heap-size policy whose bounds the item reports.
     fn heap_policy(&self) -> &HeapPolicy;
 }
