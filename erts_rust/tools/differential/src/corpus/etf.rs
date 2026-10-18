@@ -66,6 +66,18 @@
 //! renders an atom as the legacy `ATOM_EXT` (100) inside a compound term; and `{minor_version,2}`
 //! keeps `BIT_BINARY_EXT` (77) for a non-byte-aligned bitstring.
 //!
+//! ## The legacy float dialect: `{minor_version,0}` emits `FLOAT_EXT` (99), byte-exact
+//! Version `0` is the one minor version that changes the **float** tag: `term_to_binary(F,
+//! [{minor_version,0}])` emits the pre-OTP-20 `FLOAT_EXT` (99), whose body is the C
+//! `printf("%.20e")` text of the double NUL-padded to 31 bytes —
+//! `term_to_binary(1.5, [{minor_version,0}])` is `<<131,99,"1.50000000000000000000e+00",
+//! 0,0,0,0,0>>` (33 bytes: `VERSION_MAGIC` + the tag + the 26-character text + five NULs).
+//! Because that body is the encoder's canonical *text* rendering and not a floating-point
+//! payload, the whole image is byte-stable, so it is pinned byte-for-byte —
+//! both standalone and nested in a compound term (where the atom beside it keeps the
+//! default `SMALL_ATOM_UTF8_EXT` (119), since version `1` is what selects the legacy atom
+//! tag). Versions 1 and 2 both emit `NEW_FLOAT_EXT` (70).
+//!
 //! ## The `local` option: the node hash is masked, the rest of the image is pinned
 //! `term_to_binary(Term, [local])` wraps the image in `VERSION_MAGIC` (131) + `LOCAL_EXT` (121)
 //! followed by a **4-byte** payload — the node's `local_node_hash` — and then the ordinary term
@@ -1168,6 +1180,51 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- `{minor_version,0}`: the legacy ASCII FLOAT_EXT (99) dialect, byte-exact -------
+        // `{minor_version,0}` encodes a float as the pre-OTP-20 `FLOAT_EXT` (99): a body of
+        // the C `printf("%.20e")` text NUL-padded to 31 bytes — the 26-character
+        // `1.50000000000000000000e+00` plus five NULs, so the whole image is 33 bytes
+        // (`131,99` + the body). The body is the encoder's canonical rendering, not a
+        // floating-point payload, so it is byte-stable — and a float nested in a compound
+        // term uses the same dialect (the tuple case also shows that the *atom* beside it
+        // stays the default `SMALL_ATOM_UTF8_EXT` (119), since version 1 is what selects the
+        // legacy atom tag).
+        Case {
+            id: "etf/term_to_binary_minor_version_0_float_ext_bytes",
+            description: "a {minor_version,0} float is the legacy ASCII FLOAT_EXT (99): a \
+                          %.20e text body NUL-padded to 31 bytes (a 33-byte image)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(1.5, [{minor_version, 0}])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,99,49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,\
+                     48,101,43,48,48,0,0,0,0,0>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_minor_version_0_nested_legacy_float",
+            description: "a {minor_version,0} compound term nests the legacy FLOAT_EXT (99) \
+                          float while its atom keeps the default SMALL_ATOM_UTF8_EXT (119)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary({1.5, hello}, [{minor_version, 0}])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,104,2,99,49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,\
+                     48,48,48,101,43,48,48,0,0,0,0,0,100,0,5,104,101,108,108,111>>",
+                ),
+                exit_code: 0,
+            },
+        },
         // -- the `local` option: the 4-byte node hash is per-VM-start, so it is masked and the
         // rest of the LOCAL_EXT image is pinned byte-for-byte (see the module docs) --------
         Case {
@@ -1573,6 +1630,64 @@ mod tests {
         assert_eq!(golden.matches("<<131,121,").count(), 3, "{golden}");
         for size in ["{8,", "{25,", "{49,"] {
             assert!(golden.contains(size), "the image length {size} is pinned: {golden}");
+        }
+    }
+
+    /// The `{minor_version,0}` legacy float dialect (A.2): the ASCII `FLOAT_EXT` (99) image is
+    /// the encoder's canonical `%.20e` text NUL-padded to 31 bytes, so it is byte-stable and
+    /// pinned exactly — standalone and nested. Grow this test with the group.
+    #[test]
+    fn the_minor_version_zero_float_dialect_is_pinned_byte_exactly() {
+        let cases = group();
+        for (id, stdout) in [
+            (
+                "etf/term_to_binary_minor_version_0_float_ext_bytes",
+                "ok <<131,99,49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,\
+                 48,101,43,48,48,0,0,0,0,0>>",
+            ),
+            (
+                "etf/term_to_binary_minor_version_0_nested_legacy_float",
+                "ok <<131,104,2,99,49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,\
+                 48,48,48,101,43,48,48,0,0,0,0,0,100,0,5,104,101,108,108,111>>",
+            ),
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), "value", "{id}");
+            assert_eq!(
+                case.golden,
+                Golden {
+                    stdout: Some(stdout),
+                    exit_code: 0
+                },
+                "{id}"
+            );
+            // The image must be the legacy `FLOAT_EXT` (99) tag, never `NEW_FLOAT_EXT` (70).
+            let expr = case.expr().expect("an expression case");
+            assert!(
+                expr.contains("[{minor_version, 0}]"),
+                "case {id} must drive the version-0 encoder: {expr}"
+            );
+            assert!(stdout.contains(",99,"), "case {id} must carry the FLOAT_EXT tag: {stdout}");
+            assert!(
+                !stdout.contains(",70,"),
+                "case {id} must not carry a NEW_FLOAT_EXT tag: {stdout}"
+            );
+        }
+        // The legacy body ends in the five NUL padding bytes of the fixed 31-byte body.
+        for id in [
+            "etf/term_to_binary_minor_version_0_float_ext_bytes",
+            "etf/term_to_binary_minor_version_0_nested_legacy_float",
+        ] {
+            let golden = cases
+                .iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.golden.stdout)
+                .expect("registered");
+            assert!(
+                golden.contains("101,43,48,48,0,0,0,0,0"),
+                "case {id} must pin the `e+00` tail and its NUL padding: {golden}"
+            );
         }
     }
 
