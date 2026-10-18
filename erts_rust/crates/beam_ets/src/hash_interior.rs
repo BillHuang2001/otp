@@ -1200,4 +1200,107 @@ mod tests {
         assert!(dup.insert(k, object(&mut heap, 7, 1), &atoms).unwrap());
         assert_eq!(dup.size(), 2);
     }
+    /// The bucket array gives capacity back as objects leave: a table that grew to
+    /// thousands of objects and then shrank to one rebuilds its buckets down to the
+    /// starting count (never below it), so `ets:info(T, memory)` reports — and the
+    /// interior holds — storage proportional to what it still **stores**.
+    #[test]
+    fn the_bucket_array_shrinks_back_to_the_live_object_count() {
+        let atoms = AtomTable::new();
+        const N: i64 = 3_000;
+        let mut heap = Heap::new(8 * N as usize);
+        let mut t = HashInterior::new(TableKind::Set);
+        let empty = t.memory(&atoms);
+        let objs: Vec<Eterm> = (0..N).map(|i| object(&mut heap, i, i * 2)).collect();
+        for i in 0..N as usize {
+            t.insert(make_small(i as i64), objs[i], &atoms).unwrap();
+        }
+        let populated = t.memory(&atoms);
+        assert!(
+            t.bucket_count() > INITIAL_BUCKETS,
+            "the bucket array grew past its starting count ({})",
+            t.bucket_count()
+        );
+        // Remove all but the last key: the load falls far below 1/8, so the array is
+        // rebuilt at a proportional size.
+        for i in 0..N - 1 {
+            t.delete(make_small(i), &atoms).unwrap();
+        }
+        assert_eq!(t.size(), 1);
+        let one_left = t.memory(&atoms);
+        assert_eq!(
+            t.bucket_count(),
+            INITIAL_BUCKETS,
+            "the bucket array stops at its starting count, never below it"
+        );
+        assert!(
+            one_left < 10_000,
+            "one object left must not keep the {N}-object index ({one_left} words, \
+             populated {populated})"
+        );
+        assert!(
+            one_left * 100 < populated,
+            "the one-object figure is far below the loaded one ({one_left} vs {populated})"
+        );
+        assert!(one_left > empty, "the surviving entry still owns storage");
+        // The surviving key is still reachable — a rebuild must not lose an entry.
+        assert_eq!(t.lookup(make_small(N - 1), &atoms), vec![objs[N as usize - 1]]);
+        // Emptying the interior releases the rest: it is back at (or below) its
+        // starting footprint, with the starting bucket count.
+        t.delete(make_small(N - 1), &atoms).unwrap();
+        assert_eq!(t.bucket_count(), INITIAL_BUCKETS);
+        // The emptied interior is back at its starting allocation (the bucket array
+        // plus whatever the now-empty bucket vectors reserved); the **exact** empty
+        // floor is `Table::release_empty_interior`'s fresh rebuild, pinned by
+        // `tests/ets_capacity.rs`.
+        assert!(
+            t.memory(&atoms) <= empty + 32,
+            "an emptied interior owns no surplus ({} words, fresh floor {empty})",
+            t.memory(&atoms)
+        );
+    }
+    /// A stable-size insert/delete churn must neither grow the interior nor make its
+    /// bucket array shrink and re-grow: the grow (3/4 load) and shrink (1/8 load)
+    /// thresholds leave a 6× hysteresis band the churn never crosses.
+    #[test]
+    fn a_stable_size_churn_neither_grows_nor_thrashes_the_bucket_array() {
+        let atoms = AtomTable::new();
+        const KEYS: i64 = 500;
+        const ROUNDS: usize = 200;
+        let mut heap = Heap::new(4 * KEYS as usize);
+        let mut t = HashInterior::new(TableKind::Set);
+        let objs: Vec<Eterm> = (0..KEYS).map(|i| object(&mut heap, i, i)).collect();
+        let keys: Vec<Eterm> = (0..KEYS).map(make_small).collect();
+        for i in 0..KEYS as usize {
+            t.insert(keys[i], objs[i], &atoms).unwrap();
+        }
+        let base = t.memory(&atoms);
+        let base_buckets = t.bucket_count();
+        let (mut min, mut max) = (base, base);
+        for _ in 0..ROUNDS {
+            // Remove and immediately re-insert every other key: the occupancy never
+            // leaves its steady state, so neither threshold may fire.
+            for (i, key) in keys.iter().enumerate().step_by(2) {
+                t.delete(*key, &atoms).unwrap();
+                t.insert(*key, objs[i], &atoms).unwrap();
+            }
+            let now = t.memory(&atoms);
+            min = min.min(now);
+            max = max.max(now);
+            assert_eq!(t.size(), KEYS as usize, "the round ends at a stable size");
+        }
+        assert!(
+            max <= base,
+            "the churn grew the interior above its warm-up figure (base {base}, max {max})"
+        );
+        assert!(
+            min * 8 >= base * 7,
+            "the churn shrank the interior by more than an eighth (base {base}, min {min})"
+        );
+        assert_eq!(
+            t.bucket_count(),
+            base_buckets,
+            "the bucket array must not shrink/re-grow during a stable-size churn"
+        );
+    }
 }
