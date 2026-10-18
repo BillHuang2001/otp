@@ -94,6 +94,11 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 - `machine/` → `Machine` (registers + the `x_mut`/`fr_mut`/`stack_mut`/`with_roots`/`alloc_rooted`
   root-set hand-off, frames, catch/unwind, run entries, `RunOutcome`, module contexts, driver,
   reduction counter, position introspection) — `machine/CONTEXT.md`
+- `exec_census.rs` → the **dynamic** per-variant execution census (public, NOT `#[cfg(test)]`):
+  thread-local enable flag + `Snapshot { executed, errors, first_error, total_* }`, the two funnel
+  recorders `on_instruction`/`on_error`, `variant_name` (the one variant attribution, re-exported by
+  `jit/baseline/counters.rs`) and `write_dump` (a TSV under the temp dir). Driven from
+  `interpreter/dispatch.rs`'s `step_instruction_inner`; measurement-only, disabled by default
 - `interpreter/` → dispatch loop, BIF arm/raise, `TestKind`, A.8 trace emission — `interpreter/CONTEXT.md`
 - `terms/` → the boxed-term builders/readers (classic + `*_rooted`), `map`, `fun`, `number`,
   `slack`, `sink`, rooted-allocation tests, `test_support` — `terms/CONTEXT.md`
