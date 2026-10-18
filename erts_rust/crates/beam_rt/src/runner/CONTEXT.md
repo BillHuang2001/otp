@@ -348,19 +348,28 @@ five) increasing iteration counts and print a `counter_table`: N vs slices / yie
 collections / major / fallbacks / peak young-nursery geometry / debt boundaries, plus the derived
 per-call ratios — every geometry figure quoted here is re-derived by that line, so read it rather than
 this prose for the mature-space numbers.
-Measured on the native tier: `churn` collections/call 6.996002 / 6.999200 / 6.999800, `major`/call
-1.499250 / 1.499850 / 1.499963 and slices/call 0.449775 / 0.449955 / 0.449913 at N=2 000 / 10 000 /
-40 000 — flat, i.e. `collections == 7N − 1` and `major == 3N / 2` at every N (the iteration's own
-admission collection plus the ones the reduction/yield-boundary door adds *in substitution*, never on
-top — the door's own share is separated below); `heap_growth` collections/call
-1.000600 / 1.000680 / 1.000720 and slices/call ≈0.0008 at N=10 000 / 25 000 / 50 000: the 401-word
-request cannot fit a fresh nursery, so the growth/collection door is reached on **every** iteration,
-which is the derived relation that assertion pins (`collections == N + yields`, exact on all five
-rows).
-In both shapes `peak_young_spaces == 1` and the young capacity plateaus at the collector's floor
-(233 words for `churn`, 610 for `heap_growth`) at every N, so the retired-nursery chain the
-`collection_debt` trigger protects stays collapsed rather than N-dependent, and `yields == slices − 1`
-with `waits == 0` throughout (neither loop ever parks).
+Measured on the native tier (current figures; the same `churn` shape is pinned at *three* counts by
+[`tests/boundary_cost.rs`](tests/boundary_cost.rs)): `churn` collections/call 6.982009 / 6.984002 /
+6.984600, `major`/call 1.497751 / 1.497950 / 1.498025, `reductions`/call 1 808.98 / 1 809.71 /
+1 809.84 and slices/call 0.452274 / 0.452455 / 0.452464 at N=2 000 / 10 000 / 40 000 — flat, and the
+per-iteration rate (13 971 / 2 997 at N=2 000, 27 939 / 5 993 at 4 000, 69 847 / 14 981 at 10 000) is
+6.9855 … 6.9847 collections and 1.4985 … 1.4981 majors per iteration, converging on 7 / 1.5 from
+below. It is **not** the closed form `collections == 7N − 1` / `major == 3N / 2`: the door now pins a
+young-only `CollectionKind::Minor` collection and escalates to an unpinned `collect` only when the
+promotion cannot fit the mature space, and the native tier charges its blocks per block, so the slice
+counts those rates are expressed against moved (both changes postdate the closed form).
+`heap_growth` collections/call 1.001100 / 1.001200 / 1.001220 and slices/call 0.001300 / 0.001280 /
+0.001260 at N=10 000 / 25 000 / 50 000: the 401-word request cannot fit a fresh nursery, so the
+growth/collection door is reached on **every** iteration, which is the derived relation that assertion
+pins (`collections == N + yields`, exact on all five rows — 5 006 / 10 012 / 25 031 / 50 062 / 100 125
+against 6 / 12 / 31 / 62 / 125 yields).
+In both shapes `peak_young_spaces == 1` at every N, so the retired-nursery chain the
+`collection_debt` trigger protects stays collapsed rather than N-dependent; the young capacity
+plateaus at **609** words for `churn` (whose mature generation then sits at 987 words capacity / 880
+used — the 233-word figure older prose quoted is the pre-growth floor, not the plateau) and **233**
+for `heap_growth` (whose 610-word space is its **mature** generation), and `yields == slices − 1` with
+`waits == 0` and `debt_bounds == 0` throughout (neither loop ever parks, and neither leaves an
+un-settled collection debt at a boundary).
 Neither loop's cadence is this node's to set: the door decides *whether* a collection may run (and
 the counters above show it declining nothing), the collector's post-collection nursery sizing decides
 *how often* — see [`../context/IMPLEMENTATION.md`](../context/IMPLEMENTATION.md) *What the doors do
@@ -387,18 +396,29 @@ never pre-empts (so most rows show ≤1 slice for the whole run — the residual
 the interpreter sweep (`BEAM_RT_TIER=interpreter`) is where a compute-bound shape really pre-empts
 every ~4 000-reduction budget, which is the only regime in which the door is reached often.
 
-The retune (`gc_bound` churn, default tier, N = 500 / 2 000 / 10 000): at `7/8` the door is **free on
-the shape that used to pay** — the totals are the door-off counts exactly (`collections == 7N − 1`,
-`major == 3N / 2`; 11 / 47 / 239 door collections out of 95 / 383 / 1 919 checks), a boundary
-collection *substituting for* the heap-admission collection the iteration would have taken rather than
-adding to it, while the door still collapses the retired chain (one young space at the **233**-word
-floor against the door-off **2** spaces / **376** words). At `1/2` it had cost **+0.048
-collections/call (+0.69 %)** with `major`/call **+8.9 %** — ≈13× the collection-rate change, because a
-firing boundary also collected the mature generation on a shape whose iteration had just settled that
-debt. `1/1` (the C-exact "used ≥ capacity") buys nothing over `7/8` (3 instead of 11 firings at
-N = 500, the same counters) and is *not* taken: the nursery grows in place, so an exact
+The retune (`gc_bound` churn, default tier). At `7/8` the door is **free on the shape that used to
+pay**, measured on this tree: the shape's totals stay flat and its retired chain stays collapsed (one
+young space, **609**-word capacity peak, at N = 2 000 / 4 000 / 10 000) while the door fires **105 /
+214 / 533** times out of **904 / 1 809 / 4 524** boundary checks — one in 8.61 / 8.45 / 8.49, i.e.
+0.0525 / 0.0535 / 0.0533 firings per call and **0.75 %** of the run's own 13 971 / 27 939 / 69 847
+collections. At `1/2` it had measured **+0.048 collections/call (+0.69 %)** with `major`/call **+8.9 %**
+against its door-off build; `1/1` (the C-exact "used ≥ capacity") buys nothing over `7/8` (3 instead of
+11 firings at N = 500, the same counters) and is *not* taken: the nursery grows in place, so an exact
 `used == capacity` test is satisfied on consecutive boundaries and could chain majors where `7/8`
 leaves the growth seam room.
+**Explicitly NOT verified here any more — the door-ON vs door-OFF `Δ` and every door-off figure in
+this section** (the "identical totals" at 6.984032 / 6.996002 / 6.999200 collections and 1.497006 /
+1.499250 / 1.499850 majors per call at N = 500 / 2 000 / 10 000, the `7N − 1` / `3N / 2` closed form,
+the door-off `2` spaces / `376` words, and the `1/2`-watermark deltas above). Reproducing them needs a
+door-disabled build — a throwaway `#[cfg(test)]` early return inside
+[`../context/gc/reds_door.rs`](../context/gc/reds_door.rs) — which is outside the scope of the last
+re-derivation, and they were taken on an earlier tree state: N = 2 000 now measures **6.982009**
+collections and **1.497751** majors per call at a **609**-word young space, and the closed form no
+longer holds at all (the door pins a young-only `CollectionKind::Minor` first and escalates only when
+the promotion cannot fit the mature space, so it no longer forces a cadence fullsweep; the native tier
+also charges its blocks per block now, which moved the slice and pre-emption counts). The figures that
+*are* current are the ON-side ones in the paragraph above, printed and pinned by
+`tests/boundary_cost.rs`.
 The two shapes that must **not** be lost to the tighter watermark (interpreter tier): `reds_boundary`
 reports one collection per pre-emption (`yields == collections`) with `major` 1 at a **610**-word
 `heap_size` against the door-off 3 074 841 / 29 485 327 words at N = 2 000 / 20 000, and
@@ -425,28 +445,35 @@ interpreter tier sees 2.005 checks/call whose collections the shape's own door a
 **Nursery resizing is a real effect of one collection**: `heap_growth` on the interpreter tier peaks at
 **843** words with the door on vs **610** off (+38 %), since a boundary collection re-sizes the nursery
 and every later admission keeps that size — `ets_copy` on the interpreter tier and `churn` on the
-default tier go the other way (233 on vs 376 off: the door's own collection collapses the retired
-chain the door-off side retains).
-**Residual (recorded, not taken):** `ets_copy` on the **interpreter** tier still shows `+0.000400`
-collections/call and `major`/call `+0.000600` (down from `+0.000800` at `1/2`) — 16 extra collections
-over 40 000 calls, ~3× the collection-rate change, because a firing boundary also collects the
-**mature** generation: `reds_door.rs:283` drives the *escalating* `beam_process::Process::collect`
-(`beam_gc` escalates to a major whenever `mature.available_words() < nursery.used_words()`).
-Removing it needs a **young-only** collection request this door cannot express —
-`beam_gc::AnyCollector::collect_minor` reports typed heap exhaustion when the mature space cannot
-absorb the whole nursery, and `beam_process`'s rooted-collection seam is private. The handoff is
-`beam_gc::AnyCollector::collect_young(&mut self, roots: &mut [Eterm]) -> Result<Collection>` (never
-escalates; grows/reclaims the mature space instead of a fullsweep; reports `CollectionKind::Minor`)
-plus `beam_process::Process::collect_young(&mut self) -> Result<Collection>`, recorded in
-`../../M1_GAPS.md` *GC / heap model*.
-The door's structure is pinned by [`tests/boundary_cost.rs`](tests/boundary_cost.rs) —
-`the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape` holds
-`door checks == yields`, `door collections` inside the measured `checks / 9 ..= checks / 7` band
-(113/899 = one in 7.96 at N = 2 000, 552/4 499 = one in 8.15 at N = 10 000 — the exact `checks / 8`
-the pre-pricing cadence landed on was a coincidence of that cadence, not an identity),
-`door.unpublished == 0`, `checks/call` in `0.40..=0.50`, the shape's own totals exactly at the
-door-off figures (`collections == 7N − 1`, `major == 3N / 2`), one young space and a bounded capacity
-at N = 2 000 and N = 10 000, so the amplification cannot come back silently.
+default tier go the other way (the door's own collection collapses the retired chain the door-off side
+retains; on this tree `churn`'s peak young capacity is **609** words with the door on, and the `376`
+door-off figure is from that earlier A/B, not re-measured).
+**Residual (recorded, not taken, and — like the rest of the door-off side above — NOT re-measured
+here):** `ets_copy` on the **interpreter** tier still showed `+0.000400` collections/call and
+`major`/call `+0.000600` (down from `+0.000800` at `1/2`) — 16 extra collections over 40 000 calls,
+~3× the collection-rate change, attributed at the time to a firing boundary also collecting the
+**mature** generation. Its *mechanism* sentence is out of date: the door no longer calls the
+escalating `beam_process::Process::collect` as its action
+([`../context/gc/reds_door.rs:306`](../context/gc/reds_door.rs) pins a young-only
+`Process::collect_kind(CollectionKind::Minor)` first and escalates to `collect` only when that minor
+refuses because the promotion cannot fit the mature space), so a cadence fullsweep comes only from a
+mature generation too small to take the promotion. What is *still* missing is a young-only
+collection that **grows** the mature space instead of refusing: `beam_gc::AnyCollector::collect_minor`
+reports typed heap exhaustion when the mature space cannot absorb the whole nursery, so every
+refusal on these shapes escalates. The handoff is `beam_gc::AnyCollector::collect_young(&mut self,
+roots: &mut [Eterm]) -> Result<Collection>` (never escalates; grows/reclaims the mature space instead
+of a fullsweep; reports `CollectionKind::Minor`), recorded in `../../M1_GAPS.md` *GC / heap model*.
+The pinned, current fact is `churn`'s **0.75 %** firing rate at one collapsed 609-word space (next
+paragraph), which is what the ratio above would have to move to matter.
+The door's structure is pinned by [`tests/boundary_cost.rs`](tests/boundary_cost.rs)
+(`the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape`, three measured counts
+N = 2 000 / 4 000 / 10 000): `door checks == yields` at every row, `door collections` inside the
+measured `checks / 9 ..= checks / 7` band (**105/904 = one in 8.61**, **214/1 809 = one in 8.45**,
+**533/4 524 = one in 8.49** — no `checks / 8` law holds, which is why the band, not an identity, is
+what is pinned), `door.unpublished == 0`, `checks/call` in `0.40..=0.50` (measured 0.4518 / 0.4521 /
+0.4524), the shape's own totals as an **exact measured table** (13 971 / 2 997, 27 939 / 5 993,
+69 847 / 14 981 — the closed form `7N − 1` / `3N / 2` is *not* what this tree runs), one young space
+and a capacity ≤ 610 words, so the amplification cannot come back silently.
 The no-admission shape's relations are pinned by [`tests/reds_door.rs`](tests/reds_door.rs)
 (`yields == collections`, the 17..=20 reds/iteration band, `minor == collections − major` = `(8, 88)`
 at N = 2 000 / 20 000, a converged 610-word `heap_size` and one young space).

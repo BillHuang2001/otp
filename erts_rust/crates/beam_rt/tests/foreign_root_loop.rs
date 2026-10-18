@@ -43,9 +43,10 @@
 //!    [`EMULATOR_MIN_HEAP_WORDS`]-word nursery holds [`ITERATIONS_PER_COLLECTION`] of them and the
 //!    run's collection count follows the fill law [`collections_law`] —
 //!    `(N + `[`FILL_OFFSET`]`) / `[`ITERATIONS_PER_COLLECTION`] — as an exact **floor**, plus the
-//!    pre-emption surcharge a boundary collection can add, capped at the measured
-//!    [`SURPLUS_BOUND`] (the style `src/runner/tests.rs`'s `counter_table` uses for its own growth
-//!    shapes); see [`collections_law`] for the surplus's derivation and its measured ladder.
+//!    pre-emption surcharge a boundary collection can add, capped by the measured per-slice rate
+//!    [`surplus_bound`] (`1 + slices / 50`; the style `src/runner/tests.rs`'s `counter_table` uses
+//!    for its own growth shapes). See [`collections_law`] for the surplus's derivation and its
+//!    measured ladder, and [`surplus_bound`] for the rate and how to re-derive it.
 //! 3. **Memory stays bounded.** The process's `heap_size` (the nursery chain's capacity, the
 //!    number `process_info(self(), heap_size)` reports) is flat in `N`: it sits at one of two
 //!    collector-geometry plateaus, never on a curve.
@@ -54,15 +55,25 @@
 //!    must equal `vp:hold/1`'s **exactly**: an inert foreign container neither declines a
 //!    collection nor changes the allocation shape.
 //!
-//! # What this would catch (measured)
+//! # What this would catch — the historical record, and why it is not re-measurable
 //!
 //! With the pre-rework classification — "any container from an unscanned region is a hazard",
 //! `forwards_scanned_word` answering unconditionally — `vp:hold/1`'s statistics tuple froze its
 //! collection count: the *run's own* delta measured **0** collections at every `N`, while its
 //! `heap_size` climbed linearly (121 387 / 318 037 / 2 032 432 words at N = 5 000 / 10 000 /
-//! 100 000), and `vp:control/1` was untouched (294 / 588 / 5 882 collections, a 233-word heap).
-//! Both tests below fail on that behaviour — the "collections grow with N" and the "heap is
-//! bounded" assertions, and the hold-vs-control equality.
+//! 100 000), and `vp:control/1` was untouched.
+//! Those are the **pre-fix tree's** figures and they are not reproducible here: `root_is_unscanned`
+//! / `forwards_scanned_word` (`src/context/gc.rs`) would have to be reverted to the unconditional
+//! hazard test, which is exactly the behaviour the current two-fact valve exists to rule out. The
+//! paragraph is therefore the historical record, not a pinned figure. What the tests below **pin**
+//! today is the same property in its current form, and every figure they quote is one they print:
+//! `vp:hold/1`'s collection count follows the fill law of its own allocation ([`collections_law`]),
+//! it grows with N, the heap stays on its plateau — and `vp:control/1`, the same loop with an
+//! integer accumulator, measures the *identical* counters at every row (294 / 412 / 588 / 1 177 /
+//! 1 765 / 2 942 / 5 885 / 8 828 / 11 771 collections over 9 … 350 slices, a peak `heap_size` of
+//! 233 words — `process_info` itself reads 843 on the two rows whose sample lands on the grown
+//! space) — so a valve that classified the statistics tuple as a hazard would fail that equality
+//! outright.
 //!
 //! # Recording discipline
 //!
@@ -91,16 +102,21 @@ use beam_term::{is_small, make_small, signed_value};
 /// The committed fixture: `hold/1` (the loop that keeps the BIF-heap statistics tuple live) and
 /// `control/1` (the same loop with an integer accumulator).
 const VP_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vp.beam");
-/// The iteration counts each measured shape is driven at. A 20× span, so a count that is
-/// *constant* in `N` (the frozen pre-fix behaviour) cannot be mistaken for a count that grows;
-/// every row is a **multi-slice** run (7, 9, 13, 38 and 126 scheduler slices), so the sample-based
-/// heap assertions below always have a live process to read; and `N = 7 000` / `30 000` are the
-/// rows whose remainder modulo [`ITERATIONS_PER_COLLECTION`] makes the [`FILL_OFFSET`] observable
-/// (`7 006 / 17 = 412` against `7 000 / 17 = 411`, `30 006 / 17 = 1 765` against `30 000 / 17 =
-/// 1 764`), so the phase term is load-bearing rather than absorbed by the floor — the three
-/// original counts (`5 000`, `10 000`, `100 000`, remainders 2 / 4 / 6) all happen to sit on the
-/// same floor with or without it.
-const COUNTS: [i64; 5] = [5_000, 7_000, 10_000, 30_000, 100_000];
+/// The iteration counts each measured shape is driven at, in the order the docs quote them. A 40×
+/// span, so a count that is *constant* in `N` (the frozen pre-fix behaviour) cannot be
+/// mistaken for a count that grows; every row is a **multi-slice** run (9, 13, 18, 35, 53, 88,
+/// 175, 263 and 350 scheduler slices as measured), so the sample-based heap assertions below
+/// always have a live process to read; `N = 7 000` / `30 000` are the rows whose remainder modulo
+/// [`ITERATIONS_PER_COLLECTION`] makes the [`FILL_OFFSET`] observable (`7 006 / 17 = 412` against
+/// `7 000 / 17 = 411`, `30 006 / 17 = 1 765` against `30 000 / 17 = 1 764`), so the phase term is
+/// load-bearing rather than absorbed by the floor; and the tail rows (`100 000` … `200 000`) are
+/// where the pre-emption surcharge [`surplus_bound`] derives actually accumulates, so the bound is
+/// exercised rather than trivially satisfied. The three original counts (`5 000`, `10 000`,
+/// `100 000`, remainders 2 / 4 / 6) all happen to sit on the same floor with or without the phase
+/// term.
+const COUNTS: [i64; 9] = [
+    5_000, 7_000, 10_000, 20_000, 30_000, 50_000, 100_000, 150_000, 200_000,
+];
 /// What a release build's `process_info(P, heap_size)` may report over a whole run: the
 /// collector's two nursery-capacity plateaus, 233 words (the emulator's `min_heap_size`) and
 /// 843 words (that plus a grown space), measured at every slice boundary of every run below.
@@ -286,16 +302,67 @@ const ITERATIONS_PER_COLLECTION: u64 = EMULATOR_MIN_HEAP_WORDS / WORDS_PER_ITERA
 /// and `1` time at `N = 11`, so the first collection lands on iteration
 /// `ITERATIONS_PER_COLLECTION - FILL_OFFSET` = 11).
 const FILL_OFFSET: u64 = 6;
-/// The largest **pre-emption surcharge** the [`COUNTS`] ladder measures over [`collections_law`].
+/// How many scheduler slices one extra unit of the pre-emption surcharge costs, measured.
 ///
-/// The law counts the nursery *fills*; a reduction/yield-boundary collection that fires inside a
-/// fill drains the space early and costs the run one extra count every ~8 such firings, so the
-/// run's total is `law + surplus`. Measured (deterministic): `0` through `N = 15 000` (≤ 19
-/// slices) and `1` from `N = 20 000` on (26 … 251 slices) — see [`collections_law`] for the wider
-/// 13-count probe that reaches `2` at 626 slices and `5` at 1 251. The bound is the **measured
-/// maximum on this ladder**, the tightest form the measurement supports; re-derive it if the
-/// ladder, the door's 7/8 watermark or the slice budget changes.
-const SURPLUS_BOUND: u64 = 1;
+/// See [`surplus_bound`] for the derivation and the measured ladder this figure comes from.
+const SURPLUS_PER_SLICES: u64 = 50;
+/// The pre-emption surcharge's floor: the first extra count is free, because it lands well inside
+/// the ladder's first slice-budget of pre-emptions (measured: surplus `1` at `N = 20 000` / 35
+/// slices while `N = 30 000` / 53 slices measures `0`, and `0` at every row below 20 000).
+const SURPLUS_FLOOR: u64 = 1;
+/// The largest **pre-emption surcharge** a run over [`collections_law`] may carry, as a function
+/// of that run's own scheduler-slice count: `1 + slices / 50`.
+///
+/// # The mechanism
+///
+/// The law counts the nursery *fills*. A reduction/yield-boundary collection
+/// (`src/context/gc/reds_door.rs`) that fires **inside** a fill drains the space early and wastes
+/// the words the fill had left, so the schedule shortens and the run can finish one fill ahead of
+/// the law: the total is `law + surplus`, where the surplus counts the fills a boundary shortened.
+/// How much a firing wastes is bounded by the door's own gate — it refuses to fire below a
+/// seven-eighths-full space, so at most `EMULATOR_MIN_HEAP_WORDS − 7/8 × EMULATOR_MIN_HEAP_WORDS =
+/// 233 − 204 = 29` words of that fill can still be unfilled when it fires, i.e. ~2 of the 17
+/// iterations (the space itself is exhausted at 233 words, which is exactly when the iteration's
+/// own admission door would have collected it). An extra **count** needs the whole fill period
+/// (`ITERATIONS_PER_COLLECTION` = 17 iterations) of shortening, so it takes at least ~9 firings; a
+/// firing can only ever happen at a pre-emption (a slice end, at most one collection per
+/// pre-emption), so the surplus grows with the **pre-emption count** — but not monotonically even
+/// so, because what decides whether a firing costs a count is *where* the pre-emptions land inside
+/// the fill cycle. That is why this is a measured **rate** and not a closed form.
+///
+/// # The measured ladder (deterministic; every row is printed by the tests that drive [`COUNTS`])
+///
+/// | N | slices | collections | law | surplus | bound |
+/// |---|---|---|---|---|---|
+/// | 5 000 | 9 | 294 | 294 | 0 | 1 |
+/// | 7 000 | 13 | 412 | 412 | 0 | 1 |
+/// | 10 000 | 18 | 588 | 588 | 0 | 1 |
+/// | 20 000 | 35 | 1 177 | 1 176 | 1 | 1 |
+/// | 30 000 | 53 | 1 765 | 1 765 | 0 | 2 |
+/// | 50 000 | 88 | 2 942 | 2 941 | 1 | 2 |
+/// | 100 000 | 175 | 5 885 | 5 882 | 3 | 4 |
+/// | 150 000 | 263 | 8 828 | 8 823 | 5 | 6 |
+/// | 200 000 | 350 | 11 771 | 11 765 | 6 | 8 |
+///
+/// Read the `surplus` column both ways: **it is irregular in the slice count** (`N = 30 000` has
+/// 53 slices and no surplus, `N = 20 000` has 35 and one), so no exact `floor(slices / K)` law
+/// exists; and **its worst rate is one count per ~50–58 slices** (6 over 350, 5 over 263, 3 over
+/// 175). `slices / 50` is that measured worst rate with the `+1` floor covering the free first
+/// count, which is why the bound is `1 + slices / 50` rather than a flat figure.
+///
+/// **This replaced a flat `SURPLUS_BOUND = 1`.** That figure described the tree it was measured
+/// on, where the same `N` took fewer pre-emptions (the pre-change table read 126 slices at
+/// N = 100 000 where this ladder reads 175): the reduction cost per iteration moved when the
+/// native baseline tier began charging its blocks per block, so more pre-emptions land inside
+/// fills at the same `N` and the ladder's tail outran a flat bound. The law here is a re-derivation
+/// from this tree's own slice counts, not a relaxation: every row is still compared against the
+/// fill law, and a run that breaches the bound still fails.
+///
+/// **Re-derive it** if the ladder, the door's 7/8 watermark or the slice budget changes: the
+/// surplus is a function of how often a slice ends inside a fill.
+const fn surplus_bound(slices: usize) -> u64 {
+    SURPLUS_FLOOR + (slices as u64) / SURPLUS_PER_SLICES
+}
 /// The collection count one measured run of either shape must report at `N` — the **fill law**,
 /// `(N + `[`FILL_OFFSET`]`) / `[`ITERATIONS_PER_COLLECTION`]`, the exact number of nursery fills,
 /// and therefore of admission collections, the loop's allocation forces.
@@ -312,7 +379,7 @@ const SURPLUS_BOUND: u64 = 1;
 ///   (`the_fill_law_holds_and_its_phase_is_the_entry_frame` pins both sides of the boundary): the
 ///   first collection lands on **iteration 11**, which is what the `+ `[`FILL_OFFSET`]` term
 ///   encodes.
-/// * **The pre-emption surcharge sits on top, bounded by [`SURPLUS_BOUND`].** The
+/// * **The pre-emption surcharge sits on top, bounded by [`surplus_bound`].** The
 ///   reduction/yield-boundary collection door (`src/context/gc/reds_door.rs`) can fire a
 ///   collection the admission points would not have run: its gates are a per-pid reduction
 ///   interval (at most one boundary collection per pre-emption) and a 7/8 young-space occupancy
@@ -322,16 +389,29 @@ const SURPLUS_BOUND: u64 = 1;
 ///   **floor** — every fill is collected — and the run's total is `law + surplus`, where the
 ///   surplus counts only the fills a boundary collection shortened.
 ///
-/// # Measured (deterministic; three identical repetitions of every row)
+/// # Measured (deterministic; every row printed by the tests that drive [`COUNTS`], three
+/// identical repetitions of the whole table)
 ///
-/// This ladder reads surplus **0** at `N = 5 000 / 7 000 / 10 000` (7 / 9 / 13 slices) and **1**
-/// at `N = 30 000 / 100 000` (38 / 126 slices); a wider probe (13 counts up to `N = 1 000 000`)
-/// adds `1` at `N = 15 000 / 20 000 / 50 000 / 70 000 / 130 000 / 200 000`, `2` at `N = 500 000`
-/// (626 slices) and `5` at `N = 1 000 000` (1 251 slices). A surplus therefore costs ~8 early
-/// boundary collections per extra count, so it lags the slice count by an order of magnitude —
-/// which is why a slice-proportional cap would be meaningless here and [`SURPLUS_BOUND`] pins the
-/// measured maximum instead. **Re-derive `SURPLUS_BOUND` if the ladder, the watermark or the slice
-/// budget changes**: the door's firing rate is a function of how often a slice ends inside a fill.
+/// | N | slices | collections | major | law | surplus |
+/// |---|---|---|---|---|---|
+/// | 5 000 | 9 | 294 | 0 | 294 | 0 |
+/// | 7 000 | 13 | 412 | 1 | 412 | 0 |
+/// | 10 000 | 18 | 588 | 1 | 588 | 0 |
+/// | 20 000 | 35 | 1 177 | 1 | 1 176 | 1 |
+/// | 30 000 | 53 | 1 765 | 2 | 1 765 | 0 |
+/// | 50 000 | 88 | 2 942 | 3 | 2 941 | 1 |
+/// | 100 000 | 175 | 5 885 | 5 | 5 882 | 3 |
+/// | 150 000 | 263 | 8 828 | 7 | 8 823 | 5 |
+/// | 200 000 | 350 | 11 771 | 10 | 11 765 | 6 |
+///
+/// Two things to read off it. **The law is exact as a floor** at every row (the collection count is
+/// never below it, and the phase term is what makes `N = 7 000` / `30 000` land on the right side
+/// of their cycle boundaries). **The surplus is small, irregular and bounded by
+/// [`surplus_bound`]**: `0` through `N = 10 000`, then `1 / 0 / 1 / 3 / 5 / 6` — the `0` at
+/// `N = 30 000` (53 slices) next to the `1` at `N = 20 000` (35 slices) is the proof that it is not
+/// a function of the pre-emption count, and the tail rows are why a flat `1` no longer covers it
+/// (see [`surplus_bound`] for the rate and the re-derivation). Nothing here is a per-call cost: the
+/// run's total stays within one count per ~50 slices of the fill law up to 200 000 iterations.
 fn collections_law(n: i64) -> u64 {
     (n as u64 + FILL_OFFSET) / ITERATIONS_PER_COLLECTION
 }
@@ -379,13 +459,16 @@ fn a_loop_holding_the_foreign_statistics_tuple_keeps_collecting() {
              iteration): {row:?}"
         );
         // ... and the run may exceed it only by the pre-emption surcharge `collections_law`
-        // derives: `SURPLUS_BOUND` is the maximum this ladder measures (0 through N = 15 000,
-        // 1 from N = 20 000 on), not a fitted curve.
+        // derives: [`surplus_bound`] is that surcharge's measured rate per scheduler slice
+        // (`1 + slices / 50`), not a fitted curve — and the row's own slice count is the
+        // denominator, so a change to the iteration's reduction price shows up here as a bound
+        // that no longer fits rather than as silently more slack.
         let surplus = row.collections - law;
+        let bound = surplus_bound(row.slices);
         assert!(
-            surplus <= SURPLUS_BOUND,
-            "the pre-emption surcharge over the fill law must stay within {SURPLUS_BOUND} on \
-             this ladder at N={n} (measured {surplus} over {law}, {} slice(s)): {row:?}",
+            surplus <= bound,
+            "the pre-emption surcharge over the fill law must stay within {bound} \
+             (`1 + {} / {SURPLUS_PER_SLICES}`) at N={n} (measured {surplus} over {law}): {row:?}",
             row.slices
         );
     }
