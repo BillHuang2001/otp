@@ -280,20 +280,38 @@ pub(crate) fn collect_at_reds_boundary(
         runtime.halt_process_gc(pid);
         return Ok(());
     }
-    // The action is a **young-only** collection, never `collect_or_grow` and never the
-    // escalating `Process::collect`: `Process::ensure_capacity`'s `nursery.grow` is a no-op when
-    // the current space already has room (so it would leave the retired chain exactly where it
-    // is — the mechanism of the climb this door exists to stop), and the unpinned `collect`
-    // escalates a would-not-fit minor to a **major**, which turns this door's rationed
-    // slice-boundary collection into a fullsweep. `Process::collect_kind(Minor)` evacuates the
-    // nursery only and reports the typed heap exhaustion when the promotion cannot fit, which
-    // the `Err` arm below turns into the same `halt_process_gc` no-op every other refusal takes.
-    match process.collect_kind(CollectionKind::Minor) {
+    // The action is a **young-only** collection first, never `collect_or_grow` and never the
+    // escalating `Process::collect` in the common case: `Process::ensure_capacity`'s
+    // `nursery.grow` is a no-op when the current space already has room (so it would leave the
+    // retired chain exactly where it is — the mechanism of the climb this door exists to stop),
+    // and the unpinned `collect` escalates a would-not-fit minor to a **major**, which turns this
+    // door's rationed slice-boundary collection into a fullsweep.
+    // `Process::collect_kind(Minor)` evacuates the nursery only and reports the typed heap
+    // exhaustion **before copying a word** when the promotion cannot fit the mature space.
+    //
+    // # Why a refused minor escalates instead of halting
+    //
+    // A pinned minor that cannot be promoted is the *normal* state of these shapes: the mature
+    // generation sits on the collector's 233-word floor while the nursery holds tens of thousands
+    // of live words, so `collect_kind(Minor)` refuses at **every** boundary. Halting on that
+    // refusal (`halt_process_gc`) would disable collection for the rest of the process's life —
+    // measured: `reds_boundary:run(2000)` read `collections=0 errors=1` and a nursery chain of
+    // 10 retired spaces / 1 727 361 words, i.e. exactly the unbounded climb this door exists to
+    // stop, only worse (every later boundary also refuses). The refusal is therefore met with the
+    // **escalating** `Process::collect`, which is what a minor reports it cannot do: it grows (and
+    // if needed fullsweeps) the mature generation, so the live set is still evacuated and the
+    // chain still collapses. `beam_gc::AnyCollector::collect_minor` — a young-only collection that
+    // grows the mature space instead of fullsweeping — is the seam that would remove the
+    // escalation (its owner is `beam_gc`).
+    let action = process
+        .collect_kind(CollectionKind::Minor)
+        .or_else(|_| process.collect());
+    match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
-            // The `max_heap_size` verdict this young-only collection latched on the PCB — the
-            // same drain every other collection site runs (see [`drain_max_heap_verdict`]).
+            // The `max_heap_size` verdict this collection latched on the PCB — the same drain
+            // every other collection site runs (see [`drain_max_heap_verdict`]).
             drain_max_heap_verdict(runtime, process, pid);
         }
         Err(_) => {
