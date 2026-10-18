@@ -59,6 +59,10 @@
 //!   [`Machine::current_location`]/[`Machine::current_stacktrace`]), plus the
 //!   parked-`receive` deadline seam
 //!   ([`Machine::wait_deadline`]/[`Machine::timeout_delay`] and [`WaitDeadline`]).
+//! * `offheap` — the off-heap refc-binary **retention seam**
+//!   ([`Machine::off_heap_overhead_bytes`] and [`Machine::retain_refc_binaries`]): the
+//!   reservoir is host-prunable by a reachability predicate, and its backing-store bytes
+//!   are the figure a host prices against `beam_gc`'s off-heap trigger.
 //! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
 //!   symbolic frames, run through real run entries), over the synthetic-module
 //!   scaffolding in `test_support`.
@@ -89,6 +93,7 @@ mod deadline_tests;
 mod drive;
 mod frames;
 mod location;
+mod offheap;
 mod registers;
 mod run;
 #[cfg(test)]
@@ -337,7 +342,10 @@ pub struct Machine {
     /// **Never cleared by [`Machine::reset`].** A returned term may outlive the run
     /// that built it (`Machine::run_export` resets at the start of *every* run, and
     /// a host may consume the returned `Eterm` afterwards), so a reset must not free
-    /// a payload a caller can still read.
+    /// a payload a caller can still read. The reservoir is pruned only by a **host**
+    /// decision — [`Machine::retain_refc_binaries`] (the reachability seam) drops the
+    /// handles the host's predicate does not admit, and
+    /// [`Machine::off_heap_overhead_bytes`] prices what is left.
     pub(crate) refc_binaries: Vec<beam_alloc::RefcBinary>,
     /// The `(payload base, capacity in bytes)` pairs of the off-heap payloads this
     /// machine allocated **for appending** — the `bs_init_writable` accumulator's
@@ -370,7 +378,9 @@ pub struct Machine {
     /// built it (C keeps such a binary in `p->wrt_bins`, writable, until it is pinned),
     /// and a registry entry must never outlive the payload it names — clearing the list
     /// while the payload stays alive would only lose the optimization, so the two
-    /// rosters move together.
+    /// rosters move together. They are pruned together too:
+    /// [`Machine::retain_refc_binaries`] drops every entry whose base no longer names a
+    /// live retained payload.
     pub(crate) writable_payloads: Vec<(usize, usize)>,
     /// A **reusable argument scratch buffer** for the rare wide BIF call.
     ///
@@ -763,7 +773,8 @@ impl Machine {
     /// This is the payload half of the frozen refc-binary representation
     /// ([`beam_term::refc`]): the returned pointer is exactly the value the
     /// `BinRef.val` word of an `[BinRef][ErlSubBits]` term must hold, and it stays
-    /// valid (and unmoved) until this machine is dropped — the machine keeps the
+    /// valid (and unmoved) until this machine is dropped or a host prunes the handle
+    /// with [`Machine::retain_refc_binaries`] — the machine keeps the
     /// [`beam_alloc::RefcBinary`] handle that owns the payload in
     /// [`Machine::refc_binaries`], which [`Machine::reset`] never clears.
     ///
@@ -868,13 +879,28 @@ impl Machine {
     /// A linear scan of a per-process list that holds one entry per live
     /// `bs_init_writable` accumulator (a handful, in practice), so it allocates
     /// nothing and cannot collect.
-    pub(crate) fn writable_capacity(&self, base: *const u8) -> Option<usize> {
+    ///
+    /// Public as a read-only query: after [`Machine::retain_refc_binaries`] a host can
+    /// confirm which of the accumulators it asked to keep are still registered (the
+    /// registry is pruned in lockstep with the payload reservoir).
+    pub fn writable_capacity(&self, base: *const u8) -> Option<usize> {
         let key = base as usize;
         self.writable_payloads
             .iter()
             .rev()
             .find(|(registered, _)| *registered == key)
             .map(|(_, capacity)| *capacity)
+    }
+
+    /// How many writable-append registrations this machine currently holds — the number
+    /// of entries [`Machine::writable_capacity`] can answer for.
+    ///
+    /// One per live `bs_init_writable` accumulator, so a host reads it as "how many
+    /// in-place-appendable payloads does this process own". It moves only with
+    /// [`Machine::mark_writable`] and with the lockstep prune in
+    /// [`Machine::retain_refc_binaries`], never with [`Machine::reset`].
+    pub fn writable_payload_count(&self) -> usize {
+        self.writable_payloads.len()
     }
 
     /// Re-key (and re-size) the writable-payload registry entry that currently names
@@ -1082,7 +1108,9 @@ impl Machine {
     /// after this machine is dropped.
     ///
     /// The slice is **never cleared by [`Machine::reset`]**, so a payload a returned
-    /// term still points at survives the next run.
+    /// term still points at survives the next run. Only a host reachability sweep
+    /// releases a handle ([`Machine::retain_refc_binaries`]), and
+    /// [`Machine::off_heap_overhead_bytes`] prices the reservoir's backing store.
     pub fn refc_binaries(&self) -> &[beam_alloc::RefcBinary] {
         &self.refc_binaries
     }
