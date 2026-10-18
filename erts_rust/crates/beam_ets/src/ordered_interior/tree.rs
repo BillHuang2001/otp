@@ -82,7 +82,7 @@ use beam_term::prelude::*;
 
 use super::iter::LeafIter;
 use super::node::{
-    child_index, search_entries, Entry, Node, NodeId, NodeStore, MIN_OCCUPANCY, ORDER,
+    child_index, search_entries, trim_vec, Entry, Node, NodeId, NodeStore, MIN_OCCUPANCY, ORDER,
 };
 
 /// The ordered index over `beam_term` terms.
@@ -147,6 +147,11 @@ impl Tree {
     /// The number of stored keys.
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_stats(&self) -> String {
+        self.store.debug_stats()
     }
 
     /// An honest word count of the tree's node arena (the `ordered_set` interior
@@ -324,15 +329,24 @@ impl Tree {
     }
 
     /// Remove `key` (and its object); returns whether the key was present.
+    ///
+    /// A removal frees nodes (a merge retires one) and shrinks others, so the arena
+    /// is asked to [compact](NodeStore::compact) afterwards: once its dead slots
+    /// outweigh its live ones it drops them, renumbers densely and releases each
+    /// surviving node's surplus capacity, which is what makes the interior's
+    /// reported memory follow the **live** key count instead of the high-water mark
+    /// a bulk teardown would leave.
     pub(crate) fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> bool {
         if self.len == 0 || !self.delete_rec(self.root, key, atoms) {
             return false;
         }
         self.len -= 1;
         self.collapse_root();
+        if self.store.needs_compaction() {
+            self.store.compact(&mut self.root);
+        }
         true
     }
-
     /// Remove `key`'s object only when it is term-equal to `object`; returns
     /// whether something was removed.
     pub(crate) fn delete_object(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> bool {
@@ -507,7 +521,15 @@ impl Tree {
             if !found {
                 return false;
             }
-            self.store.leaf_mut(id).entries.remove(pos);
+            let leaf = self.store.leaf_mut(id);
+            leaf.entries.remove(pos);
+            // A leaf that kept its entries in a large array now holds one fewer: give
+            // the surplus back once it is down to a quarter of its capacity (the same
+            // hysteresis the sorted-`Vec` interior applies), so the reported memory of
+            // a table that shrank follows its live keys even when the tree *shape* no
+            // longer changes (a single-leaf tree retires no node, so no compaction
+            // would otherwise ever revisit it).
+            trim_vec(&mut leaf.entries);
             return true;
         }
 
@@ -767,6 +789,14 @@ impl Tree {
             height += 1;
         }
         height
+    }
+
+    /// The number of live nodes in the arena (test-only; see
+    /// `NodeStore::live_nodes`). Used to pin that a bulk teardown really compacts
+    /// rather than leaving dead slots behind.
+    #[cfg(test)]
+    pub(crate) fn live_nodes(&self) -> usize {
+        self.store.live_nodes()
     }
 
     /// Walk the whole tree and panic on the first broken invariant (1–5 above).

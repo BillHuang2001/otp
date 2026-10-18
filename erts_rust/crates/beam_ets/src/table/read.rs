@@ -332,9 +332,11 @@ impl Table {
         for &original in &removed {
             self.free_object(original);
         }
+        // A `take` that drained the table releases the index too, exactly like
+        // `delete`/`delete_object` (see `release_empty_interior`).
+        self.release_empty_interior();
         Ok(taken)
     }
-
     /// The number of objects in the table.
     ///
     /// The `ets` accessor is `ets:info(T, size)`; `ets:size/1` does not exist in

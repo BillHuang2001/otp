@@ -193,6 +193,41 @@ fn canonicalize(node: &mut Node) {
     }
 }
 
+/// The capacity below which a node's vectors are never trimmed: a `Vec` hands out
+/// at least four elements, a node holds at most `1 << WIDTH` (32) slots, and a
+/// shrink below this bound would only churn the allocator for a handful of words.
+const TRIM_FLOOR: usize = 8;
+
+/// The hysteresis factor of the per-node trim: a node's vector is released only
+/// once it holds fewer than a quarter of the slots it can, so a steady
+/// insert/delete churn inside one node never reallocates it.
+const TRIM_FACTOR: usize = 4;
+
+/// Give back the surplus slot capacity of a node that a removal left far emptier
+/// than its vectors can hold — the CHAMP half of per-object reclamation, so
+/// `ets:info(Tab, memory)` tracks the **live** slot count instead of the index's
+/// high-water mark.
+///
+/// Only the nodes on the removal path are visited (each `node_remove` level trims
+/// its own node on the way back up), so a delete stays `O(depth)`; a node that
+/// keeps at least a quarter of its capacity is left alone (see [`TRIM_FACTOR`]), so
+/// a churn at a stable size never reallocates.
+fn trim_capacities(node: &mut Node) {
+    match node {
+        Node::Collision(col) => trim_vec(&mut col.entries),
+        Node::Bitmap(bm) => {
+            trim_vec(&mut bm.data);
+            trim_vec(&mut bm.nodes);
+        }
+    }
+}
+
+/// [`trim_capacities`]'s one-vector form (see [`TRIM_FLOOR`]/[`TRIM_FACTOR`]).
+fn trim_vec<T>(slots: &mut Vec<T>) {
+    if slots.capacity() > TRIM_FLOOR && slots.capacity() > TRIM_FACTOR * slots.len() {
+        slots.shrink_to_fit();
+    }
+}
 /// Insert/upsert `(key, object)` into `node`.
 ///
 /// No canonicalization is needed: an insert only ever *adds* entries, so no node
@@ -351,10 +386,10 @@ fn node_remove(
     };
     if removed.is_some() {
         canonicalize(node);
+        trim_capacities(node);
     }
     removed
 }
-
 /// Depth-first walk of `node`, emitting every slot in a deterministic order
 /// (ascending bit position at each level).
 fn collect_into(node: &Node, out: &mut Vec<Slot>) {
@@ -529,7 +564,10 @@ impl Interior for ChampInterior {
 
     fn memory(&self) -> usize {
         // The root is stored inline in the interior; every other node and every
-        // node's vectors are heap-allocated and counted by `heap_words`.
+        // node's vectors are heap-allocated and counted by `heap_words`. A
+        // removal drops the nodes it empties (with their vectors) and trims a
+        // surviving node's over-sized slot vectors (`trim_capacities`), so the
+        // count tracks the live tree rather than its high-water mark.
         words_of::<Node>() + heap_words(&self.root)
     }
 }
@@ -769,5 +807,57 @@ mod tests {
             t.delete(make_small(i), &atoms).unwrap();
         }
         assert!(t.memory() <= prev);
+    }
+    /// A bulk removal gives the CHAMP index's surplus capacity back: an interior that
+    /// grew to thousands of entries and then shrank to one reports a small footprint,
+    /// and an emptied one returns to its fresh floor instead of its high-water mark.
+    #[test]
+    fn memory_falls_with_the_live_entry_count_after_a_bulk_removal() {
+        let atoms = AtomTable::new();
+        const N: i64 = 3_000;
+        let mut heap = Heap::new(8 * N as usize);
+        let mut t = ChampInterior::new();
+        let empty = t.memory();
+        let objs: Vec<Eterm> = (0..N).map(|i| object(&mut heap, i, i * 2)).collect();
+        for i in 0..N as usize {
+            t.insert(make_small(i as i64), objs[i], &atoms).unwrap();
+        }
+        let populated = t.memory();
+        assert!(populated > empty, "inserting grows the index");
+        // Remove all but the last entry: the nodes on the removal path trim their
+        // over-sized slot vectors and the sub-nodes emptied along the way are dropped.
+        for i in 0..N - 1 {
+            t.delete(make_small(i), &atoms).unwrap();
+        }
+        assert_eq!(t.size(), 1);
+        let one_left = t.memory();
+        assert!(
+            one_left < 10_000,
+            "one entry left must not keep the {N}-entry index ({one_left} words, \
+             populated {populated})"
+        );
+        assert!(
+            one_left * 100 < populated,
+            "the one-entry figure is far below the loaded one ({one_left} vs {populated})"
+        );
+        // The survivor is still a member: a trim never drops a live slot.
+        assert_eq!(t.lookup(make_small(N - 1), &atoms), vec![objs[N as usize - 1]]);
+        // `delete_object` is the other removal path and shrinks the same way.
+        t.delete_object(make_small(N - 1), objs[N as usize - 1], &atoms)
+            .unwrap();
+        assert_eq!(t.size(), 0);
+        // The root node survives an emptied interior with its slot vectors (each under
+        // the `TRIM_FLOOR` of 8 slots, so at most a few dozen words); the **exact**
+        // empty floor is `Table::release_empty_interior`'s fresh rebuild, pinned by
+        // `tests/ets_capacity.rs`.
+        assert!(
+            t.memory() <= empty + 64,
+            "an emptied interior keeps only its root node ({} words, fresh floor {empty})",
+            t.memory()
+        );
+        // … and a fresh `insert` after that starts from the same small footprint, so a
+        // delete/re-insert churn cannot accumulate the high-water mark.
+        t.insert(make_small(1), objs[0], &atoms).unwrap();
+        assert!(t.memory() < 10_000, "a refilled interior is small again");
     }
 }

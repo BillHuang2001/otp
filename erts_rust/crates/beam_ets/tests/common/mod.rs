@@ -148,6 +148,21 @@ pub fn whole_object_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
     compile(spec, atoms).expect("the quoted spec compiles")
 }
 
+/// `[{{'$1','_'},[],[{{'$1',0}}]}]` — a **key-keeping** body, the only shape
+/// `ets:select_replace/2` accepts (the C `db_match_keeps_key` static body check):
+/// the replacement keeps the object's key element and rewrites the other element to
+/// `0`.
+pub fn key_keeping_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
+    let dollar1 = interned_atom(atoms, "$1");
+    let underscore = interned_atom(atoms, "_");
+    let inner = heap.tuple(&[dollar1, make_small(0)]).expect("test heap has room");
+    let construction = heap.tuple(&[inner]).expect("test heap has room");
+    let head = heap.tuple(&[dollar1, underscore]).expect("test heap has room");
+    let body = proper_list(heap, &[construction]);
+    let clause = heap.tuple(&[head, NIL, body]).expect("test heap has room");
+    let spec = proper_list(heap, &[clause]);
+    compile(spec, atoms).expect("a valid match spec")
+}
 /// `[{{'$1','_'}, [], ['$1']}]` — bind the key and return it (one small integer
 /// per object).
 pub fn key_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {

@@ -59,6 +59,21 @@ const LOAD_FACTOR_NUM: usize = 3;
 /// Load-factor denominator.
 const LOAD_FACTOR_DEN: usize = 4;
 
+/// The **shrink** threshold's numerator: release bucket capacity while the object
+/// load stays below 1/8 of the bucket count.
+///
+/// The grow threshold is 3/4, so the two leave a **6× band** (1/8 … 3/4) in which
+/// neither happens. That hysteresis is what keeps a steady insert/delete churn at
+/// a stable size from thrashing the bucket array: one delete cannot undo the array
+/// a whole series of inserts paid for, and a rebuild is only ever amortized.
+const SHRINK_NUM: usize = 1;
+/// The **shrink** threshold's denominator (see [`SHRINK_NUM`]).
+const SHRINK_DEN: usize = 8;
+
+/// An entry's object vector is released back to its live length only once it holds
+/// fewer than a quarter of the objects it can — the same hysteresis idea as
+/// [`SHRINK_NUM`], applied to a single key's `bag`/`duplicate_bag` object list.
+const OBJS_SHRINK_FACTOR: usize = 4;
 /// One hash bucket entry: a key and the objects stored under it.
 struct Entry {
     /// The key.
@@ -107,7 +122,8 @@ impl HashInterior {
     }
 
     /// The bucket a key hashes to. `buckets` is never empty (it starts at
-    /// [`INITIAL_BUCKETS`] and only ever doubles), so the modulo is well defined.
+    /// [`INITIAL_BUCKETS`], doubles past the load factor and never shrinks below
+    /// the starting count), so the modulo is well defined.
     fn bucket_index(&self, key: Eterm, atoms: &AtomTable) -> usize {
         (term_hash(key, atoms) as usize) % self.buckets.len()
     }
@@ -130,15 +146,28 @@ impl HashInterior {
 
     /// Double the bucket array and reinsert every entry at its new index.
     fn grow(&mut self, atoms: &AtomTable) {
-        let new_len = self.buckets.len() * 2;
-        let mut grown: Vec<Vec<Entry>> = (0..new_len).map(|_| Vec::new()).collect();
+        self.rehash_into(self.buckets.len() * 2, atoms);
+    }
+
+    /// Build a fresh bucket array of exactly `target` buckets and move every entry
+    /// into it.
+    ///
+    /// A rebuild — rather than an in-place resize — is what makes the interior's
+    /// stored capacity track its **live** contents: the new bucket vector is
+    /// allocated at exactly `target`, and the buckets a stale (now empty) bucket
+    /// vector used to hold are dropped entirely instead of lingering as empty
+    /// minimum-capacity vectors. It serves both directions: [`grow`](Self::grow)
+    /// doubles through it and [`maybe_shrink`](Self::maybe_shrink) halves through it.
+    fn rehash_into(&mut self, target: usize, atoms: &AtomTable) {
+        let mut rebuilt: Vec<Vec<Entry>> = Vec::with_capacity(target);
+        rebuilt.resize_with(target, Vec::new);
         for bucket in self.buckets.drain(..) {
             for entry in bucket {
-                let idx = (term_hash(entry.key, atoms) as usize) % new_len;
-                grown[idx].push(entry);
+                let idx = (term_hash(entry.key, atoms) as usize) % target;
+                rebuilt[idx].push(entry);
             }
         }
-        self.buckets = grown;
+        self.buckets = rebuilt;
     }
 
     /// Grow once the object load factor passes ~3/4. `len` is the object count
@@ -150,6 +179,32 @@ impl HashInterior {
         }
     }
 
+    /// Release bucket-array capacity once the object load has fallen well below it
+    /// (`len / buckets < 1/8`), so a table that grew large and then shrank reports —
+    /// and holds — storage proportional to what it still **stores**, exactly like
+    /// the system `ets` (whose hash tables give their buckets back on deletion).
+    ///
+    /// Only a bucket array above [`INITIAL_BUCKETS`] is a candidate, and the
+    /// hysteresis band documented on [`SHRINK_NUM`] means a stable-size
+    /// insert/delete churn never triggers a rebuild: the array only shrinks after
+    /// live occupancy has fallen to an eighth of it.
+    fn maybe_shrink(&mut self, atoms: &AtomTable) {
+        let buckets = self.buckets.len();
+        if buckets <= INITIAL_BUCKETS {
+            return;
+        }
+        if self.len * SHRINK_DEN >= buckets * SHRINK_NUM {
+            return;
+        }
+        // Halve while the load stays under the threshold, so one long teardown
+        // reaches a bucket count proportional to the surviving objects instead of
+        // paying a rebuild per deletion.
+        let mut target = buckets / 2;
+        while target > INITIAL_BUCKETS && self.len * SHRINK_DEN < target * SHRINK_NUM {
+            target /= 2;
+        }
+        self.rehash_into(target, atoms);
+    }
     // -----------------------------------------------------------------------
     // Inherent operation set (beyond the private `Interior` contract)
     // -----------------------------------------------------------------------
@@ -169,12 +224,12 @@ impl HashInterior {
             Some(pos) => {
                 let entry = self.buckets[bi].remove(pos);
                 self.len -= entry.objs.len();
+                self.maybe_shrink(atoms);
                 entry.objs
             }
             None => Vec::new(),
         }
     }
-
     /// Add integer `incr` (which may be negative, and may be a bignum) to element
     /// `pos` (1-based) of the object stored under `key`, writing the result back,
     /// and return the new counter value. Mirrors `ets:update_counter/3,4` for
@@ -312,8 +367,13 @@ impl HashInterior {
     ///
     /// Counts the bucket array, every bucket's entry vector and each entry's key
     /// plus its object words, all measured at **capacity**, so the figure never
-    /// under-reports what is actually allocated, and it never decreases as objects
-    /// are inserted (the bucket array only doubles and each `Vec` only grows).
+    /// under-reports what is actually allocated. It rises as objects are inserted
+    /// (the bucket array doubles past the load factor and each `Vec` grows) and
+    /// **falls again as they are removed**: a delete that drops live occupancy below
+    /// an eighth of the bucket array rebuilds it at a proportional size, and an
+    /// entry that keeps far fewer objects than it can releases the surplus — so a
+    /// table that grew to N objects and then shrank to one reports storage
+    /// proportional to the one it still holds, not to the high-water N.
     /// `_atoms` is accepted for signature symmetry with the other `&AtomTable`
     /// operations: atom storage is global (the runtime's `AtomTable`), not owned by
     /// the interior, so it contributes no words here.
@@ -413,6 +473,9 @@ impl Interior for HashInterior {
         if let Some(pos) = Self::entry_pos(&self.buckets[bi], key, atoms) {
             let entry = self.buckets[bi].remove(pos);
             self.len -= entry.objs.len();
+            // An object left the index, so the bucket capacity may now be far
+            // larger than the live contents justify (see `maybe_shrink`).
+            self.maybe_shrink(atoms);
         }
         Ok(())
     }
@@ -421,12 +484,13 @@ impl Interior for HashInterior {
         let bi = self.bucket_index(key, atoms);
         if let Some(pos) = Self::entry_pos(&self.buckets[bi], key, atoms) {
             let keypos = self.keypos;
-            let empty = {
+            let (empty, removed) = {
                 let entry = &mut self.buckets[bi][pos];
                 let before = entry.objs.len();
                 let previous_key = entry.key;
                 entry.objs.retain(|o| !eq(*o, object, atoms));
-                self.len -= before - entry.objs.len();
+                let removed = before - entry.objs.len();
+                self.len -= removed;
                 if let Some(&survivor) = entry.objs.first() {
                     // The entry survives on other objects. Its stored key may have
                     // aliased the object just removed (which the caller is about to
@@ -436,18 +500,25 @@ impl Interior for HashInterior {
                     // object is not a tuple and `key_of` cannot derive a key; keep
                     // the existing key term there.
                     entry.key = key_of(survivor, keypos).unwrap_or(previous_key);
+                    // A key that kept many objects now holds far fewer: give the
+                    // surplus words back (hysteresis: only past a 4× ratio).
+                    if entry.objs.capacity() > OBJS_SHRINK_FACTOR * entry.objs.len() {
+                        entry.objs.shrink_to_fit();
+                    }
                 }
-                entry.objs.is_empty()
+                (entry.objs.is_empty(), removed)
             };
             if empty {
                 self.buckets[bi].remove(pos);
+            }
+            if removed > 0 {
+                self.maybe_shrink(atoms);
             }
         }
         Ok(())
     }
 
-    fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm> {
-        let bi = self.bucket_index(key, atoms);
+    fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm> {        let bi = self.bucket_index(key, atoms);
         match Self::entry_pos(&self.buckets[bi], key, atoms) {
             Some(pos) => self.buckets[bi][pos].objs.clone(),
             None => Vec::new(),
@@ -1130,5 +1201,108 @@ mod tests {
         assert!(dup.insert(k, object(&mut heap, 7, 1), &atoms).unwrap());
         assert!(dup.insert(k, object(&mut heap, 7, 1), &atoms).unwrap());
         assert_eq!(dup.size(), 2);
+    }
+    /// The bucket array gives capacity back as objects leave: a table that grew to
+    /// thousands of objects and then shrank to one rebuilds its buckets down to the
+    /// starting count (never below it), so `ets:info(T, memory)` reports — and the
+    /// interior holds — storage proportional to what it still **stores**.
+    #[test]
+    fn the_bucket_array_shrinks_back_to_the_live_object_count() {
+        let atoms = AtomTable::new();
+        const N: i64 = 3_000;
+        let mut heap = Heap::new(8 * N as usize);
+        let mut t = HashInterior::new(TableKind::Set);
+        let empty = t.memory(&atoms);
+        let objs: Vec<Eterm> = (0..N).map(|i| object(&mut heap, i, i * 2)).collect();
+        for i in 0..N as usize {
+            t.insert(make_small(i as i64), objs[i], &atoms).unwrap();
+        }
+        let populated = t.memory(&atoms);
+        assert!(
+            t.bucket_count() > INITIAL_BUCKETS,
+            "the bucket array grew past its starting count ({})",
+            t.bucket_count()
+        );
+        // Remove all but the last key: the load falls far below 1/8, so the array is
+        // rebuilt at a proportional size.
+        for i in 0..N - 1 {
+            t.delete(make_small(i), &atoms).unwrap();
+        }
+        assert_eq!(t.size(), 1);
+        let one_left = t.memory(&atoms);
+        assert_eq!(
+            t.bucket_count(),
+            INITIAL_BUCKETS,
+            "the bucket array stops at its starting count, never below it"
+        );
+        assert!(
+            one_left < 10_000,
+            "one object left must not keep the {N}-object index ({one_left} words, \
+             populated {populated})"
+        );
+        assert!(
+            one_left * 100 < populated,
+            "the one-object figure is far below the loaded one ({one_left} vs {populated})"
+        );
+        assert!(one_left > empty, "the surviving entry still owns storage");
+        // The surviving key is still reachable — a rebuild must not lose an entry.
+        assert_eq!(t.lookup(make_small(N - 1), &atoms), vec![objs[N as usize - 1]]);
+        // Emptying the interior releases the rest: it is back at (or below) its
+        // starting footprint, with the starting bucket count.
+        t.delete(make_small(N - 1), &atoms).unwrap();
+        assert_eq!(t.bucket_count(), INITIAL_BUCKETS);
+        // The emptied interior is back at its starting allocation (the bucket array
+        // plus whatever the now-empty bucket vectors reserved); the **exact** empty
+        // floor is `Table::release_empty_interior`'s fresh rebuild, pinned by
+        // `tests/ets_capacity.rs`.
+        assert!(
+            t.memory(&atoms) <= empty + 32,
+            "an emptied interior owns no surplus ({} words, fresh floor {empty})",
+            t.memory(&atoms)
+        );
+    }
+    /// A stable-size insert/delete churn must neither grow the interior nor make its
+    /// bucket array shrink and re-grow: the grow (3/4 load) and shrink (1/8 load)
+    /// thresholds leave a 6× hysteresis band the churn never crosses.
+    #[test]
+    fn a_stable_size_churn_neither_grows_nor_thrashes_the_bucket_array() {
+        let atoms = AtomTable::new();
+        const KEYS: i64 = 500;
+        const ROUNDS: usize = 200;
+        let mut heap = Heap::new(4 * KEYS as usize);
+        let mut t = HashInterior::new(TableKind::Set);
+        let objs: Vec<Eterm> = (0..KEYS).map(|i| object(&mut heap, i, i)).collect();
+        let keys: Vec<Eterm> = (0..KEYS).map(make_small).collect();
+        for i in 0..KEYS as usize {
+            t.insert(keys[i], objs[i], &atoms).unwrap();
+        }
+        let base = t.memory(&atoms);
+        let base_buckets = t.bucket_count();
+        let (mut min, mut max) = (base, base);
+        for _ in 0..ROUNDS {
+            // Remove and immediately re-insert every other key: the occupancy never
+            // leaves its steady state, so neither threshold may fire.
+            for (i, key) in keys.iter().enumerate().step_by(2) {
+                t.delete(*key, &atoms).unwrap();
+                t.insert(*key, objs[i], &atoms).unwrap();
+            }
+            let now = t.memory(&atoms);
+            min = min.min(now);
+            max = max.max(now);
+            assert_eq!(t.size(), KEYS as usize, "the round ends at a stable size");
+        }
+        assert!(
+            max <= base,
+            "the churn grew the interior above its warm-up figure (base {base}, max {max})"
+        );
+        assert!(
+            min * 8 >= base * 7,
+            "the churn shrank the interior by more than an eighth (base {base}, min {min})"
+        );
+        assert_eq!(
+            t.bucket_count(),
+            base_buckets,
+            "the bucket array must not shrink/re-grow during a stable-size churn"
+        );
     }
 }
