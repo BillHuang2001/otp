@@ -53,6 +53,10 @@ use crate::error::badarg;
 use crate::key::key_of;
 use crate::table::Interior;
 
+/// The capacity-to-length ratio past which a removal releases the entry vector's
+/// surplus (see `SortedOrderedInterior::release_capacity`): a vector is trimmed only
+/// once it holds fewer than a quarter of the entries it can.
+const CAPACITY_SHRINK_FACTOR: usize = 4;
 /// The sorted-`Vec`-backed interior for `ordered_set`.
 ///
 /// One object per key: an insert on an equal key replaces the object,
@@ -86,11 +90,14 @@ impl SortedOrderedInterior {
     /// An honest, non-negative word count of the entry vector — the interior
     /// contribution to `ets:info(Tab, memory)`.
     ///
-    /// Measured at capacity, so it never under-reports what is allocated.
+    /// Measured at capacity, so it never under-reports what is allocated. It rises
+    /// as keys are inserted and **falls again as they are removed**: a delete that
+    /// leaves the vector holding fewer than a quarter of the entries it can releases
+    /// the surplus (see `release_capacity`), so the count tracks the live key count
+    /// rather than the vector's high-water mark.
     pub fn memory(&self) -> usize {
         self.entries.capacity() * words_of::<Entry>()
     }
-
     /// The position of `key` among the sorted entries: `(pos, true)` on a hit,
     /// `(pos, false)` with the ascending insertion point on a miss. Delegates to the
     /// same search the B+-tree leaves use (arithmetic key order, `cmp_arith`).
@@ -199,6 +206,7 @@ impl SortedOrderedInterior {
         let (pos, found) = self.position(key, atoms);
         if found {
             self.entries.remove(pos);
+            self.release_capacity();
             true
         } else {
             false
@@ -211,13 +219,29 @@ impl SortedOrderedInterior {
         let (pos, found) = self.position(key, atoms);
         if found && eq(self.entries[pos].obj, object, atoms) {
             self.entries.remove(pos);
+            self.release_capacity();
             true
         } else {
             false
         }
     }
-}
 
+    /// Give back the entry vector's surplus capacity once a removal has left it
+    /// holding fewer than a quarter of the entries it can — this interior's half of
+    /// per-object reclamation, so `ets:info(Tab, memory)` follows the **live** key
+    /// count instead of the vector's high-water mark.
+    ///
+    /// The 4× ratio is the hysteresis: `Vec` growth doubles, so a vector that just
+    /// grew holds at most twice its length, and a steady insert/delete churn at a
+    /// stable size therefore never reaches the threshold — only a genuine bulk
+    /// teardown reallocates (amortized, since a shrink to `len` must be paid for by
+    /// `len/4` removals).
+    fn release_capacity(&mut self) {
+        if self.entries.capacity() > CAPACITY_SHRINK_FACTOR * self.entries.len() {
+            self.entries.shrink_to_fit();
+        }
+    }
+}
 impl Interior for SortedOrderedInterior {
     fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool> {
         SortedOrderedInterior::insert(self, key, object, atoms);

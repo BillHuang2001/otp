@@ -193,6 +193,11 @@ impl Node {
     }
 }
 
+/// The hysteresis factor of a per-node vector trim: a leaf/branch array is released
+/// only once it holds fewer than a quarter of the entries it can (a leaf holds at
+/// most [`ORDER`] = 32 entries and a `Vec` hands out a 4-element minimum, so a
+/// smaller ratio would only churn the allocator).
+const TRIM_FACTOR: usize = 4;
 /// The node arena: a slot table addressed by [`NodeId`] with a free list, so a
 /// rebalance never relocates a node (and leaves can be chained with plain ids).
 pub(crate) struct NodeStore {
@@ -201,7 +206,6 @@ pub(crate) struct NodeStore {
     /// The retired slot ids, reused by [`NodeStore::alloc`].
     retired: Vec<NodeId>,
 }
-
 impl NodeStore {
     /// A new, empty arena.
     pub(crate) fn new() -> NodeStore {
@@ -350,9 +354,12 @@ impl NodeStore {
     /// `ets:info(Tab, memory)`'s `ordered_set` interior contribution.
     ///
     /// Every array is measured at **capacity**, so the figure never under-reports
-    /// what is actually allocated and never decreases as nodes are inserted (the
-    /// slot table only grows, and a fresh slot reuses a retired id rather than
-    /// shrinking anything). Words are `Eterm`-sized; `slots`/`retired` hold
+    /// what is actually allocated. It rises as nodes are inserted and **falls again
+    /// as keys are deleted**: a tree whose dead slots come to outweigh its live ones
+    /// is [compacted](NodeStore::compact) (retired slots dropped, the arena
+    /// renumbered densely, each surviving node's over-sized vectors released), so the
+    /// count tracks the live tree instead of the high-water mark a bulk teardown
+    /// would otherwise leave behind. Words are `Eterm`-sized; `slots`/`retired` hold
     /// `Option<Node>`/`NodeId` elements, counted by their rounded-up word size.
     pub(crate) fn memory(&self) -> usize {
         let mut words = self.slots.capacity() * words_of::<Option<Node>>();
@@ -372,6 +379,87 @@ impl NodeStore {
             }
         }
         words
+    }
+
+    /// Whether the arena should be [compacted](NodeStore::compact): its retired
+    /// (dead) slots **outnumber** the live ones.
+    ///
+    /// "Dead outweighs live" is the hysteresis that makes compaction amortized
+    /// `O(1)` per removal: a compaction leaves nothing dead, so the next one needs at
+    /// least as many node frees as the arena then held live nodes — and because live
+    /// count *shrinks* under a bulk teardown, each successive compaction is closer to
+    /// the previous one's half, giving a geometric (hence linear-total) sequence.
+    /// A steady insert/delete churn at a stable size reuses a retired slot on the
+    /// very next `alloc`, so its dead-slot count never approaches the live count and
+    /// it never compacts.
+    pub(crate) fn needs_compaction(&self) -> bool {
+        let live = self.slots.len() - self.retired.len();
+        self.retired.len() > live
+    }    /// Compact the arena: drop every retired slot, renumber the live ones densely,
+    /// rewrite every internal id (`root`, branch children, leaf links) through the
+    /// renumbering, and release each surviving node's over-sized vector capacity.
+    ///
+    /// `root` is the tree's root id, which moves with the renumbering — the arena
+    /// cannot know it. Ids are internal to the tree (nothing outside the arena holds
+    /// one across this call), which is why the renumbering is safe.
+    pub(crate) fn compact(&mut self, root: &mut NodeId) {
+        let live = self.slots.len() - self.retired.len();
+        let mut remap: Vec<Option<NodeId>> = Vec::with_capacity(self.slots.len());
+        let mut kept: Vec<Option<Node>> = Vec::with_capacity(live);
+        for slot in self.slots.drain(..) {
+            match slot {
+                Some(node) => {
+                    remap.push(Some(NodeId(kept.len())));
+                    kept.push(Some(node));
+                }
+                None => remap.push(None),
+            }
+        }
+        // Every live node's own id references (a leaf's chain link, a branch's
+        // children) name another *live* node — the tree never links a retired one —
+        // so the remap lookup cannot miss.
+        let relocate = |id: NodeId, remap: &[Option<NodeId>]| -> NodeId {
+            remap[id.index()].expect("a live B+-tree id survives a compaction")
+        };
+        for slot in &mut kept {
+            let Some(node) = slot else { continue };
+            match node {
+                Node::Leaf(leaf) => {
+                    leaf.next = leaf.next.map(|next| relocate(next, &remap));
+                    trim_vec(&mut leaf.entries);
+                }
+                Node::Branch(branch) => {
+                    for child in &mut branch.children {
+                        *child = relocate(*child, &remap);
+                    }
+                    trim_vec(&mut branch.keys);
+                    trim_vec(&mut branch.children);
+                }
+            }
+        }
+        *root = relocate(*root, &remap);
+        // `kept` was allocated at exactly the live count, and the free list is now
+        // empty because no slot is retired.
+        self.slots = kept;
+        self.retired = Vec::new();
+    }
+    #[cfg(test)]
+    pub(crate) fn debug_stats(&self) -> String {
+        let mut out = format!(
+            "slots={} cap={} retired={} rcap={}",
+            self.slots.len(),
+            self.slots.capacity(),
+            self.retired.len(),
+            self.retired.capacity()
+        );
+        for slot in &self.slots {
+            match slot {
+                Some(Node::Leaf(leaf)) => out += &format!(" | leaf {}/{}", leaf.entries.len(), leaf.entries.capacity()),
+                Some(Node::Branch(b)) => out += &format!(" | branch {}/{} ch={}", b.keys.len(), b.keys.capacity(), b.children.capacity()),
+                None => out += " | dead",
+            }
+        }
+        out
     }
 
     /// The number of live nodes — reachable from the root or not. The test suite
@@ -449,4 +537,13 @@ pub(crate) fn child_index(branch: &BranchNode, key: Eterm, atoms: &AtomTable) ->
 /// The number of `Eterm`-sized words a value of type `T` occupies (rounded up).
 pub(crate) fn words_of<T>() -> usize {
     size_of::<T>().div_ceil(size_of::<Eterm>())
+}
+
+/// Release `slots`' surplus capacity once it holds fewer than a quarter of the
+/// entries it can (see [`TRIM_FACTOR`]) — the per-node half of the arena's capacity
+/// release, called from both the leaf-removal path and [`NodeStore::compact`].
+pub(crate) fn trim_vec<T>(slots: &mut Vec<T>) {
+    if slots.capacity() > TRIM_FACTOR * slots.len() {
+        slots.shrink_to_fit();
+    }
 }

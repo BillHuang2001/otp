@@ -1102,3 +1102,4 @@
         assert_eq!(t.last(&atoms), None);
         t.tree.check_invariants(&atoms);
     }
+

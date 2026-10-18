@@ -193,6 +193,41 @@ fn canonicalize(node: &mut Node) {
     }
 }
 
+/// The capacity below which a node's vectors are never trimmed: a `Vec` hands out
+/// at least four elements, a node holds at most `1 << WIDTH` (32) slots, and a
+/// shrink below this bound would only churn the allocator for a handful of words.
+const TRIM_FLOOR: usize = 8;
+
+/// The hysteresis factor of the per-node trim: a node's vector is released only
+/// once it holds fewer than a quarter of the slots it can, so a steady
+/// insert/delete churn inside one node never reallocates it.
+const TRIM_FACTOR: usize = 4;
+
+/// Give back the surplus slot capacity of a node that a removal left far emptier
+/// than its vectors can hold — the CHAMP half of per-object reclamation, so
+/// `ets:info(Tab, memory)` tracks the **live** slot count instead of the index's
+/// high-water mark.
+///
+/// Only the nodes on the removal path are visited (each `node_remove` level trims
+/// its own node on the way back up), so a delete stays `O(depth)`; a node that
+/// keeps at least a quarter of its capacity is left alone (see [`TRIM_FACTOR`]), so
+/// a churn at a stable size never reallocates.
+fn trim_capacities(node: &mut Node) {
+    match node {
+        Node::Collision(col) => trim_vec(&mut col.entries),
+        Node::Bitmap(bm) => {
+            trim_vec(&mut bm.data);
+            trim_vec(&mut bm.nodes);
+        }
+    }
+}
+
+/// [`trim_capacities`]'s one-vector form (see [`TRIM_FLOOR`]/[`TRIM_FACTOR`]).
+fn trim_vec<T>(slots: &mut Vec<T>) {
+    if slots.capacity() > TRIM_FLOOR && slots.capacity() > TRIM_FACTOR * slots.len() {
+        slots.shrink_to_fit();
+    }
+}
 /// Insert/upsert `(key, object)` into `node`.
 ///
 /// No canonicalization is needed: an insert only ever *adds* entries, so no node
@@ -351,10 +386,10 @@ fn node_remove(
     };
     if removed.is_some() {
         canonicalize(node);
+        trim_capacities(node);
     }
     removed
 }
-
 /// Depth-first walk of `node`, emitting every slot in a deterministic order
 /// (ascending bit position at each level).
 fn collect_into(node: &Node, out: &mut Vec<Slot>) {
@@ -529,10 +564,12 @@ impl Interior for ChampInterior {
 
     fn memory(&self) -> usize {
         // The root is stored inline in the interior; every other node and every
-        // node's vectors are heap-allocated and counted by `heap_words`.
+        // node's vectors are heap-allocated and counted by `heap_words`. A
+        // removal drops the nodes it empties (with their vectors) and trims a
+        // surviving node's over-sized slot vectors (`trim_capacities`), so the
+        // count tracks the live tree rather than its high-water mark.
         words_of::<Node>() + heap_words(&self.root)
-    }
-}
+    }}
 
 #[cfg(test)]
 mod tests {
