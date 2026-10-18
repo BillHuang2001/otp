@@ -530,6 +530,24 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - `erl_errno_id` returns `strerror`'s descriptive message (the oracle the lowercase POSIX errno *name*); `erl_drv_time_offset` returns `0` by construction (monotonic time is anchored on the system epoch); `erl_drv_consume_timeslice` always returns `0` (no port-timeslice accounting); `driver_system_info` returns without writing for a null `sip` or an `si_size` shorter than the first field group, where the C calls `erts_exit(ERTS_ERROR_EXIT, …)`.
 - Refusals where the C would fault or over-read: a malformed/out-of-range request (`driver_output_binary`, `offset + len > orig_size`, `driver_outputv`, `skip`, `time_left`, `ErlIOVec`) refused with `-1`; a `NULL` `driver_name` is a typed `BadDriverName`; a `dlopen` failure lands in `Unspecified` carrying the loader's own `dlerror` text (the C renders an `{open_error, N}` code); the `.so` suffix is appended only when absent. No code-server/driver list or reload policy is consulted (only the *entry* validation).
 
+## Handoffs (host halves owned by other nodes)
+- **`DriverHost::output2` adoption — the only remaining step for a loaded C driver's split reply.**
+  All four `driver_output*` thunks now hand the split to `output2`; a host that does not override it
+  gets the default (header-then-body joined into one `output` call), i.e. today's flattened result.
+  Two hosts must implement it:
+  - `beam_io`'s `AbiHost` (`beam_io/src/abi/host.rs`): `output2` = `match
+    self.with_ctx(|ctx| ctx.deliver_read(header, body)) { Some(Ok(())) => 0, _ => -1 }` — the same
+    `DriverContext::deliver_read` seam the in-tree drivers use, so the reply becomes one
+    `port_task::ReadMessage { header, body }` (its `body: None` / `Some(vec![])` distinction is
+    exactly the hook's). Its current `output` (`ctx.input().push`, a flat body-only read) then only
+    serves direct `DriverHost::output` callers.
+  - `beam_rt`'s `DriverPort` (`beam_rt/src/port/driver.rs`, `impl DriverHost for DriverPort`): it
+    records replies in `outputs: Vec<Vec<u8>>` and `DriverPortAdapter::collect_outputs` pushes them
+    through `ctx.input()`, so it must record `(header, Option<body>)` instead and deliver each split
+    through `ctx.deliver_read(header, body)` — otherwise the runtime's loaded-driver path keeps the
+    flattened shape the differential note in `tools/differential/src/corpus/driver_c.rs` records
+    (`[97,98|<<99,100>>]` vs a flat `<<97,98,99,100>>`).
+
 ## Known gaps (honest, never a wrong result)
 - **`enif_alloc_env` answers `NULL`** only with the host's `alloc_env` at its trait default, or with no
   `NifEnv` live (outside a NIF call). `beam_rt`'s `NifHostImpl` implements `alloc_env`/`free_env`/
