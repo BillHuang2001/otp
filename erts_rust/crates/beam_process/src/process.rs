@@ -34,7 +34,9 @@
 
 use beam_alloc::{Heap, RefcBinary};
 use beam_common::{AllocKind, BeamError, Result};
-use beam_gc::{AnyCollector, Collection, HeapPolicy, OffHeap, OffHeapEntry, ReachableObject};
+use beam_gc::{
+    AnyCollector, Collection, CollectionKind, HeapPolicy, OffHeap, OffHeapEntry, ReachableObject,
+};
 use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::{Eterm, HEADER_BIN_REF};
 use std::collections::{HashMap, HashSet};
@@ -1393,6 +1395,46 @@ impl Process {
         self.run_rooted_collection(|collector, roots| collector.collect(roots))
     }
 
+    /// Runs a safepoint collection of **exactly** `kind` over the whole process root set — the
+    /// kind-pinned counterpart of [`Process::collect`]
+    /// ([`beam_gc::AnyCollector::collect_kind`] forwarded for the process's own collector).
+    ///
+    /// [`Process::collect`] lets the collector **choose** the kind (the fullsweep cadence, or a
+    /// mature space too small for a whole nursery promotion) and **escalate** a would-not-fit
+    /// minor to a major. This entry point never chooses and never escalates: on success the
+    /// returned [`Collection::kind`](beam_gc::Collection) is the requested `kind`.
+    ///
+    /// The root set is exactly the one [`Process::run_rooted_collection`] gathers (registers and
+    /// stack plus the host-published extra roots, the message-envelope words, the dictionary, the
+    /// saved BIF/NIF arguments and the pending-signal queue), so a pinned collection relocates and
+    /// writes back every region the unpinned one does, and runs the same off-heap refc-binary
+    /// reclamation afterwards. Live terms therefore survive a pinned minor exactly as they survive
+    /// a policy-chosen one.
+    ///
+    /// A caller that pins the kind is one that must not pay for what a fullsweep costs — an
+    /// unpinned `collect` may turn a cheap young-only evacuation into a whole-heap one — or that
+    /// must observe the minor's **own** outcome: a pinned minor whose promotion cannot fit the
+    /// mature space reports the typed heap exhaustion
+    /// ([`BeamError::Alloc`] with [`AllocKind::Heap`]) **before a single word is copied**, leaving
+    /// the nursery, the mature space and the counters untouched, where the unpinned `collect`
+    /// would have made room by escalating.
+    ///
+    /// A **relocation-exempt** process ([`Process::set_relocation_exempt`]) is refused exactly as
+    /// it is for [`Process::collect`]: the crate root set is incomplete for it, so instead of a
+    /// fabricated [`Collection`](beam_gc::Collection) this returns the typed `relocation_exempt`
+    /// raise and [`Process::run_rooted_collection`] is never entered.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the collector's `BeamError`s (including the typed heap exhaustion of a pinned
+    /// minor that cannot fit); the typed `relocation_exempt` raise for an exempt process.
+    pub fn collect_kind(&mut self, kind: CollectionKind) -> Result<Collection> {
+        if self.relocation_exempt {
+            return Err(error::relocation_exempt("collect_kind"));
+        }
+        self.run_rooted_collection(|collector, roots| collector.collect_kind(kind, roots))
+    }
+
     /// Grows the young heap **on demand** so that a `need_words`-word allocation can proceed —
     /// the sibling of [`Process::collect`] and the runtime's explicit growth seam (the one
     /// [`Process::deliver`] drives on its refusal path).
@@ -1454,10 +1496,12 @@ impl Process {
     }
 
     /// Gathers the process root set, runs `collect` over it and writes every region back — the
-    /// shared body of [`Process::collect`] and [`Process::ensure_capacity`].
+    /// shared body of [`Process::collect`], [`Process::collect_kind`] and
+    /// [`Process::ensure_capacity`].
     ///
     /// `collect` is the collection action: [`beam_gc::AnyCollector::collect`] for a plain
-    /// collection, or [`beam_gc::AnyCollector::ensure_capacity`] for an on-demand nursery growth.
+    /// collection, [`beam_gc::AnyCollector::collect_kind`] for a kind-pinned one, or
+    /// [`beam_gc::AnyCollector::ensure_capacity`] for an on-demand nursery growth.
     /// Every region is written
     /// back **even when the action returned `Err`**: an `ensure_capacity` failure can happen
     /// *after* its collection succeeded (the nursery growth was refused), at which point the
@@ -2210,6 +2254,281 @@ mod tests {
             assert_eq!(tuple_size(extra_after), 2);
             assert_eq!(tuple_element(extra_after, 0), make_small(3));
             assert_eq!(tuple_element(extra_after, 1), make_small(4));
+        }
+    }
+
+    /// The **pin decides the kind, not the policy**: under a `fullsweep_after: 0` policy
+    /// [`Process::collect`] picks a major (the cadence fires on every collection), while
+    /// [`Process::collect_kind`] runs the requested minor — advancing the minor's own counters and
+    /// leaving the major's untouched.
+    #[test]
+    fn collect_kind_pins_a_minor_where_the_policy_chooses_a_major() {
+        let policy = HeapPolicy {
+            fullsweep_after: 0,
+            ..HeapPolicy::default()
+        };
+
+        // `collect` follows the policy: a zero fullsweep cadence makes it pick a major.
+        let mut chosen =
+            Process::with_policy(pid(61), policy.clone()).expect("the default heap allocates");
+        let chosen_extra = chosen
+            .heap_mut()
+            .tuple(&[make_small(3), make_small(4)])
+            .expect("the extra-root tuple fits");
+        chosen.registers_mut().extra_roots_mut().push(chosen_extra);
+        let policy_collection = chosen.collect().expect("the collection succeeds");
+        assert_eq!(
+            policy_collection.kind,
+            CollectionKind::Major,
+            "fullsweep_after = 0 makes the policy pick a major"
+        );
+        assert_eq!(chosen.collector().stats().major_collections, 1);
+        assert_eq!(
+            chosen.collector().minor_gcs(),
+            0,
+            "a major resets the minor count"
+        );
+
+        // `collect_kind(Minor)` ignores that choice and runs a minor.
+        let mut pinned = Process::with_policy(pid(62), policy).expect("the default heap allocates");
+        let pinned_extra = pinned
+            .heap_mut()
+            .tuple(&[make_small(3), make_small(4)])
+            .expect("the extra-root tuple fits");
+        pinned.registers_mut().extra_roots_mut().push(pinned_extra);
+        let collection = pinned
+            .collect_kind(CollectionKind::Minor)
+            .expect("the pinned minor fits");
+        assert_eq!(
+            collection.kind,
+            CollectionKind::Minor,
+            "the pin decides the kind, not the policy"
+        );
+        assert_eq!(
+            collection.stats.words_copied, 3,
+            "the live 3-word tuple was promoted"
+        );
+        assert_eq!(
+            pinned.collector().minor_gcs(),
+            1,
+            "the minor counter advanced"
+        );
+        assert_eq!(pinned.collector().stats().minor_collections, 1);
+        assert_eq!(
+            pinned.collector().stats().major_collections,
+            0,
+            "no major ran under the pin"
+        );
+    }
+
+    /// A pinned minor really **relocates**: the host-published extra root
+    /// ([`Registers::extra_roots`]) is promoted out of the nursery into the mature space, written
+    /// back into its root slot, and still reads as the same value — the gather/scatter contract
+    /// holds under a pinned kind exactly as under a policy-chosen one.
+    #[test]
+    fn a_pinned_minor_relocates_the_extra_root_into_the_mature_space() {
+        let mut process = Process::new(pid(63)).expect("the default heap allocates");
+        let extra = process
+            .heap_mut()
+            .tuple(&[make_small(3), make_small(4)])
+            .expect("the extra-root tuple fits");
+        let before = ptr_val(extra);
+        process.registers_mut().extra_roots_mut().push(extra);
+
+        let collection = process
+            .collect_kind(CollectionKind::Minor)
+            .expect("the pinned minor fits");
+        assert_eq!(collection.kind, CollectionKind::Minor);
+        assert_eq!(collection.stats.words_copied, 3);
+
+        let extra_after = *process
+            .registers()
+            .extra_roots()
+            .first()
+            .expect("the extra root survived the pinned minor");
+        let ptr = ptr_val(extra_after);
+        assert!(
+            process.collector().mature_contains(ptr),
+            "a minor promotes the live set into the mature space"
+        );
+        assert!(
+            !process.collector().young_contains(ptr),
+            "the nursery no longer holds the term"
+        );
+        assert_ne!(
+            ptr, before,
+            "the term really moved (the root slot writes back the relocated word)"
+        );
+        assert_eq!(
+            process.collector().young().used_words(),
+            0,
+            "the pinned minor emptied the nursery"
+        );
+
+        // SAFETY: the assertions above proved `extra_after` points into the live mature space and
+        // it is the 2-tuple allocated above, so slots 0..2 are in bounds.
+        unsafe {
+            assert_eq!(tuple_size(extra_after), 2);
+            assert_eq!(tuple_element(extra_after, 0), make_small(3));
+            assert_eq!(tuple_element(extra_after, 1), make_small(4));
+        }
+    }
+
+    /// `collect_kind` is refused for a **relocation-exempt** process with the same typed
+    /// `relocation_exempt` raise as [`Process::collect`], and the collector is untouched; clearing
+    /// the exemption restores the pinned path.
+    #[test]
+    fn a_relocation_exempt_process_refuses_collect_kind_and_touches_nothing() {
+        use beam_gc::HeapObservable;
+
+        let mut process = Process::new(pid(64)).expect("the default heap allocates");
+        let live = process
+            .heap_mut()
+            .tuple(&[make_small(3), make_small(4)])
+            .expect("the extra-root tuple fits");
+        process.registers_mut().extra_roots_mut().push(live);
+        process.set_relocation_exempt(true);
+
+        let stats_before = process.collector().stats();
+        let heap_before = process.collector().heap_size_words();
+        let total_before = process.collector().total_heap_size_words();
+        let minor_before = process.collector().minor_gcs();
+
+        match process.collect_kind(CollectionKind::Minor) {
+            Err(BeamError::Raise(raise)) => assert_eq!(
+                raise.reason.as_atom(),
+                Some("relocation_exempt: collect_kind"),
+                "collect_kind's refusal carries the typed relocation_exempt reason"
+            ),
+            other => panic!("expected the typed relocation_exempt raise, got {other:?}"),
+        }
+
+        // The refusal is taken before `run_rooted_collection` is entered: no counter, no
+        // nursery/mature resize, nothing relocated.
+        assert_eq!(
+            process.collector().stats(),
+            stats_before,
+            "no counter moved"
+        );
+        assert_eq!(
+            process.collector().heap_size_words(),
+            heap_before,
+            "the nursery was not resized"
+        );
+        assert_eq!(
+            process.collector().total_heap_size_words(),
+            total_before,
+            "the mature space was not resized"
+        );
+        assert_eq!(
+            process.collector().minor_gcs(),
+            minor_before,
+            "no collection ran"
+        );
+        assert_eq!(
+            *process
+                .registers()
+                .extra_roots()
+                .first()
+                .expect("still rooted"),
+            live,
+            "the root slot still holds the same word"
+        );
+
+        // Clearing the exemption restores the pinned path: the same call now runs the minor.
+        process.set_relocation_exempt(false);
+        let collection = process
+            .collect_kind(CollectionKind::Minor)
+            .expect("the pinned minor fits");
+        assert_eq!(collection.kind, CollectionKind::Minor);
+        assert_eq!(process.collector().minor_gcs(), minor_before + 1);
+    }
+
+    /// A pinned minor whose promotion cannot fit the mature space is the typed heap exhaustion —
+    /// **not** an escalation to a major — and it mutates nothing: no counter, no geometry, no
+    /// copied word.
+    #[test]
+    fn a_pinned_minor_that_cannot_fit_is_a_typed_error_and_mutates_nothing() {
+        use beam_gc::HeapObservable;
+
+        // A mature space of 8 words cannot receive this nursery's live set; a 233-word nursery
+        // stays below the immix break-even, so the copying strategy is the one selected.
+        let policy = HeapPolicy {
+            initial_young_words: 233,
+            initial_mature_words: 8,
+            ..HeapPolicy::default()
+        };
+        let mut process = Process::with_policy(pid(65), policy).expect("the heap allocates");
+        assert_eq!(process.collector().young().capacity_words(), 233);
+
+        // 20 cons cells = 40 live words, every one of them rooted in the extra-root slot.
+        for i in 0..20i64 {
+            let cell = process
+                .heap_mut()
+                .cons(make_small(i), NIL)
+                .expect("the cons cell fits the nursery");
+            process.registers_mut().extra_roots_mut().push(cell);
+        }
+        let used = process.collector().young().used_words();
+        assert_eq!(used, 40, "20 cons cells of two words each");
+        assert!(
+            used > process.collector().mature_available_words(),
+            "the promotion really cannot fit the 8-word mature space"
+        );
+
+        let stats_before = process.collector().stats();
+        let heap_before = process.collector().heap_size_words();
+        let total_before = process.collector().total_heap_size_words();
+        let minor_before = process.collector().minor_gcs();
+        let young_capacity = process.collector().young().capacity_words();
+        let spaces = process.collector().young_space_count();
+        let roots_before = process.registers().extra_roots().to_vec();
+
+        match process.collect_kind(CollectionKind::Minor) {
+            Err(BeamError::Alloc(failure)) => {
+                assert_eq!(
+                    failure.kind,
+                    AllocKind::Heap,
+                    "a minor that cannot fit is the heap exhaustion, not a message failure"
+                );
+                assert_eq!(
+                    failure.requested,
+                    used * core::mem::size_of::<Eterm>(),
+                    "the error reports the words the promotion wanted"
+                );
+            }
+            other => panic!("expected the typed heap exhaustion, got {other:?}"),
+        }
+
+        // No escalation, no copy, no counter and no geometry change.
+        assert_eq!(
+            process.collector().stats(),
+            stats_before,
+            "no counter advanced"
+        );
+        assert_eq!(
+            process.collector().heap_size_words(),
+            heap_before,
+            "the nursery capacity is unchanged"
+        );
+        assert_eq!(
+            process.collector().total_heap_size_words(),
+            total_before,
+            "the mature capacity is unchanged"
+        );
+        assert_eq!(process.collector().minor_gcs(), minor_before);
+        assert_eq!(process.collector().young().capacity_words(), young_capacity);
+        assert_eq!(process.collector().young_space_count(), spaces);
+        assert_eq!(
+            process.registers().extra_roots(),
+            roots_before.as_slice(),
+            "every root word was written back unchanged"
+        );
+        for root in &roots_before {
+            assert!(
+                process.collector().young_contains(ptr_val(*root)),
+                "nothing was copied out of the nursery"
+            );
         }
     }
 
