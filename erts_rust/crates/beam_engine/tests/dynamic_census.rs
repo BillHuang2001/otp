@@ -42,7 +42,7 @@
 //! both counted and the unserved ones are printed with their exact typed error — a module
 //! the host cannot serve is **reported, never silently skipped**.
 //!
-//! **(b) — program workloads.** 41 named workloads over the real installed stdlib, each
+//! **(b) — program workloads.** 44 named workloads over the real installed stdlib, each
 //! `module:function(args)` shape copied **verbatim** from an existing oracle-proven suite:
 //! `lists`/`ordsets`/`proplists` (`tests/stdlib_lists.rs`), `string`/`base64`/`io_lib`
 //! (`tests/stdlib_text.rs`), `lists:foldr`/`search` + `ordsets:filter` closures
@@ -52,14 +52,22 @@
 //! the closure-taking `orddict:map`/`lists:zipwith` (`tests/stdlib_more.rs`) and
 //! `ordsets:map` (`tests/stdlib_exports_more.rs`) — the last five drive the
 //! `fixtures/*_harness.beam` wrappers, so they exercise `make_fun3` + `call_fun*` +
-//! cross-module `apply_fun`. The exact catalog (and each shape's provenance comment) is
+//! cross-module `apply_fun`. Three of the 44 are **deliberate clause failures**: a call
+//! whose every head clause fails jumps to the function's `func_label` — the label
+//! *before* `func_info` — so the `FuncInfo` arm executes and raises `function_clause`
+//! (C's `i_func_info_IaaI`). The exact catalog (and each shape's provenance comment) is
 //! [`catalog::WORKLOADS`].
 //!
-//! **(c) — the committed fixtures.** 14 `tests/fixtures/*.beam` (plus the sibling
-//! `beam_loader` crate's `slice.beam`), driven at the entry points read off each
-//! fixture's own `.erl` source: `slice`, `tuples`, `records`, `floats`, `bitstrings`,
-//! `bscreate`, `bsmatch`, `bsstring`, `bignum`, `exceptions`, `catchclasses`, `mapfx`,
-//! `tailcall`, `funs`. Catalog: [`catalog::FIXTURES`].
+//! **(c) — the committed fixtures.** 22 `tests/fixtures/*.beam` entries (plus the sibling
+//! `beam_loader` crate's `slice.beam`) covering `slice`, `tuples`, `records`, `floats`,
+//! `bitstrings`, `bscreate`, `bsmatch`, `bsstring`, `bignum`, `exceptions`, `excpaths`,
+//! `catchtrace`, `stacktrace_frames`, `catchclasses`, `mapfx`, `tailcall`, `funs` and
+//! `atomapply`/`atomtarget` (a runtime-atom `apply/3`), driven at the entry points read
+//! off each fixture's own `.erl` source; catalog [`catalog::FIXTURES`]. The same layer
+//! also drives the one **mailbox-seam** fixture, `recv.beam`, on a [`CensusHost`] (the
+//! only host here that owns a [`Mailbox`]) — nine runs covering `send`,
+//! `loop_rec`/`loop_rec_end`, `remove_message`, `wait`, `wait_timeout`, `timeout` and the
+//! four `recv_marker_*` opcodes; catalog [`catalog::MAILBOX_FIXTURES`].
 //!
 //! # Honest caveats (read these before quoting any number)
 //!
@@ -68,11 +76,19 @@
 //!   dynamic weight comes from layers (b)+(c) — a different workload set would produce a
 //!   different ranking, and `not reached by this workload set` is exactly that: *not
 //!   reached here*, not "unsupported by the engine".
-//! * **Two blind spots of the instrument.** (i) A natively-inlined baseline-JIT
+//! * **Three blind spots of the instrument.** (i) A natively-inlined baseline-JIT
 //!   instruction never passes the interpreter funnel and is therefore unobserved, which
 //!   is why every run here pins [`Tier::Interpreter`]. (ii) A raise caught inside a live
 //!   in-machine `try`/`catch` counts as **executed**, not as an error — only an `Err`
-//!   escaping the funnel is an "error".
+//!   escaping the funnel is an "error" (so e.g. `Raise`/`Badmatch`/`TryCase` carry
+//!   dynamic weight with a zero error count). (iii) The `ModuleHost` BIF floor decides
+//!   which *families* can run at all: `maps:*`, `ets:*`, `re:*` and the
+//!   `unicode`/`binary` NIFs are outside it, so they contribute zero dynamic weight here
+//!   (measured as a `BLOCKED` table with the census **off**, never silently omitted).
+//! * **There are no unexpected errors.** Every raise this run produces is one of the
+//!   declared shapes in [`DECLARED_RAISES`] (three clause failures, the `dict` host gap,
+//!   and the two `recv` shapes that would suspend), and the test fails if anything else
+//!   raises.
 //! * **The `ModuleHost` BIF floor is the ceiling.** `tests/support/bifs.rs` serves a
 //!   small `erlang:*`/`lists:*` set; the `maps:*`, `ets:*` and `re:*` families are not
 //!   served, so they contribute **zero** dynamic weight here. That is measured as a
@@ -85,11 +101,12 @@
 //!
 //! # What is asserted (liveness and honesty only — never a brittle pinned count)
 //!
-//! Load breadth, a large floor on the combined executed count, the computed static
-//! top-10 all executing, a hand-written core-variant slice executing, the
-//! `not reached` list being exactly the corpus-reachable variants with zero dynamic
-//! count, and that every dynamically observed variant name also occurs statically in the
-//! loaded corpus (an instrument-coherence check). No exact count is pinned anywhere.
+//! Load breadth, a large floor on the combined executed count, the **full computed**
+//! static top-10 executing, a hand-written core-variant slice executing, every raise
+//! being a declared shape (and every declared shape really raising), the `not reached`
+//! list being exactly the corpus-reachable variants with zero dynamic count, and that
+//! every dynamically observed variant name also occurs statically in the loaded corpus
+//! (an instrument-coherence check). No exact count is pinned anywhere.
 
 // The workload catalog lives in its own file to keep this driver under the ~1000-line
 // target. `#[path]` is required: this file IS the test-crate root, and rustc resolves a
@@ -146,31 +163,62 @@ const TOP_ROWS: usize = 20;
 const LOADED_FLOOR: usize = 1000;
 
 /// The floor on the combined executed-instruction count: **roughly half** the figure this
-/// suite measured on the reference host (36 836 instructions over the three layers; see the
-/// `TOTAL EXECUTED` line the test prints), so a workload that silently stops running is
-/// caught while normal drift is not.
+/// suite measured on the reference host (**37 159** instructions over the three layers —
+/// see the `TOTAL EXECUTED` line the test prints), so a workload that silently stops
+/// running is caught while normal drift is not.
 const TOTAL_EXECUTED_FLOOR: u64 = 18_000;
 
-/// The static top-10 members allowed to carry **zero** dynamic weight, with the
-/// measurement that justifies each one. Empty in spirit: `FuncInfo` is the single
-/// exception, and it is not a gap in the workload set —
+/// **The declared raise roster**: `(label, class, reason)` for every workload or fixture
+/// run that is *expected* to raise, spelled as `Display for Raise` renders it —
+/// `"{class} {reason}"` (`beam_common/src/error.rs`) — because that is verbatim the
+/// `first_error` text the census records.
 ///
-/// `func_info` is the *function-entry clause check*. The loader keeps both of a
-/// function's labels (`Function.func_label`, the label immediately **before**
-/// `func_info`, and `Function.entry_label`, the label immediately **after** it), but
-/// `Export.label == Function.entry_label` (`beam_loader/src/ir.rs`) — and every engine
-/// entry point resolves through the export table: `run_export` (this suite's layer(a)/(b)
-/// /(c) driver), `resolve_external_call` (the `call_ext*` route) and `apply`. Local
-/// `call`/`call_only`/`call_last` targets are likewise the compiler's entry labels. So no
-/// real program of any shape can enter a `func_info`: it is unreachable **by
-/// construction**, not unexercised. (This is the `FuncInfo` whose 103 749 static
-/// occurrences the crate docs already call out as "never executed".)
+/// Three shapes, and nothing else, may raise:
 ///
-/// The claim is kept honest by an assertion rather than by this comment: layer (a) counts
-/// the corpus's `ExpT` entries and how many of them point at a `func_label`, and the test
-/// requires that count to be **zero** — the day the loader resolves an export onto a
-/// `func_info`, that assertion fires and this exclusion must go.
-const SILENT_TOP_ALLOWED: [&str; 1] = ["FuncInfo"];
+/// * **A deliberate clause failure** (`dict_update_counter_guard_fails`,
+///   `gen_name_pid_guard_fails`, `excpaths:fc/1`): every head clause of the callee fails,
+///   so `func_info` raises class `error` with the bare atom `function_clause`. The engine
+///   carries that atom in the out-of-band live-reason slot (`Raise::live_reason`) while
+///   `ExitReason::Structured` stays fieldless, so `Display` prints the class plus the
+///   reason *placeholder* `<structured reason>` — the exact text
+///   `src/exec_census.rs`'s own unit test pins. The declared `reason` below is therefore
+///   that recorded text, not a re-spelling of the engine's internal reason.
+/// * **A host gap, declared rather than hidden** (`dict_update_counter_hit`):
+///   `dict:update_counter/3` with a *number* increment raises `Badrecord` out of
+///   `dict:get_slot/2` because this host cannot serve the dictionary's map-backed slot
+///   record, so the "hit" arm cannot produce a value here. It is a real finding about the
+///   host, not a shape the workload set can drop.
+/// * **A receive that would suspend** (`recv:wait/0 (empty)`, `recv:aftervar/5`): with an
+///   empty mailbox those two reach `wait`/`wait_timeout`, and the non-blocking
+///   `run_export` answers the engine's typed `error::blocked()` raise
+///   (`unsupported_opcode: run: process blocked (no message available)`).
+///
+/// `BeamError::BadArg` renders as the bare `badarg` with **no** class, so no declared
+/// shape may bottom out in `erlang:error(badarg)`.
+const DECLARED_RAISES: &[(&str, &str, &str)] = &[
+    ("dict_update_counter_hit", "error", "<structured reason>"),
+    ("dict_update_counter_guard_fails", "error", "<structured reason>"),
+    ("gen_name_pid_guard_fails", "error", "<structured reason>"),
+    ("excpaths:fc/1", "error", "<structured reason>"),
+    (
+        "recv:wait/0 (empty)",
+        "error",
+        "unsupported_opcode: run: process blocked (no message available)",
+    ),
+    (
+        "recv:aftervar/5",
+        "error",
+        "unsupported_opcode: run: process blocked (no message available)",
+    ),
+];
+
+/// The declared `(class, reason)` for `label`, when that run is *expected* to raise.
+fn declared_raise(label: &str) -> Option<(&'static str, &'static str)> {
+    DECLARED_RAISES
+        .iter()
+        .find(|(candidate, _, _)| *candidate == label)
+        .map(|(_, class, reason)| (*class, *reason))
+}
 
 /// The `beam_loader::Instr` roster pinned by `tests/census.rs` (108 variants). Quoted for
 /// readability of the "N distinct names out of the 108-variant roster" line only — it is
@@ -259,8 +307,8 @@ fn diff(before: &Snapshot, after: &Snapshot) -> Snapshot {
         let prior = before.errors.get(name).copied().unwrap_or(0);
         if value > prior {
             out.errors.insert(name.clone(), value - prior);
-            // The retained text is the first error this census ever saw for the variant;
-            // with the expected zero-error run there is nothing to attribute.
+            // The retained text is the first error this census ever saw for the variant
+            // (`first_error` is cumulative, so only the declared-raise variants carry one).
             if let Some(text) = after.first_error.get(name) {
                 out.first_error.insert(name.clone(), text.clone());
             }
@@ -308,30 +356,51 @@ fn print_ranking(title: &str, note: &str, snapshot: &Snapshot, limit: Option<usi
     }
 }
 
-/// Print the typed-error map, loudly and under a banner, when it is not empty.
+/// Print one layer's **declared-outcome** split: the raises it produced (declared class /
+/// reason beside the observed text), the per-variant instruction-error map, and — loudly,
+/// under a banner — anything that is not in [`DECLARED_RAISES`].
 ///
-/// The expected state is empty (every layer is a *successful* run and a raise caught
-/// in-machine is not an error), so a non-empty map is a finding, not a pass: it is
-/// printed with each variant's exact first-error text and never hidden.
-fn print_errors(snapshot: &Snapshot) {
-    if snapshot.total_errors == 0 {
-        println!("typed-error map: EMPTY (no instruction returned an error out of the funnel)");
-        return;
+/// The expected state is "no unexpected raises": a declared raise is a *measured* shape
+/// (the workload reached the failure it claims to exercise), while a raise no declaration
+/// covers is a finding, never a pass, and the caller asserts its emptiness.
+fn print_raise_split(snapshot: &Snapshot, raised: &[(&'static str, String)]) {
+    println!("\n===== DECLARED RAISES ({}) =====", raised.len());
+    if raised.is_empty() {
+        println!("no run in this layer raised");
+    } else {
+        println!(
+            "{0:<32} {1:<6} {2:<34} {3}",
+            "run", "class", "declared reason", "observed (Display)"
+        );
+        for (label, observed) in raised {
+            let (class, reason) = declared_raise(label).unwrap_or(("-", "-"));
+            println!("{label:<32} {class:<6} {reason:<34} {observed}");
+        }
     }
-    println!("\n*** CENSUS ERRORS ***");
     println!(
-        "{} instruction(s) returned an error out of the funnel across {} variant(s):",
+        "\ncensus instruction errors: {} across {} variant(s)",
         snapshot.total_errors,
         snapshot.errors.len()
     );
-    println!("{0:<28} {1:>10}  {2}", "variant", "errors", "first error text");
     for (name, errors) in &snapshot.errors {
         let text = snapshot
             .first_error
             .get(name)
             .map(String::as_str)
             .unwrap_or("-");
-        println!("{name:<28} {errors:>10}  {text}");
+        println!("  {name:<28} {errors:>8}  {text}");
+    }
+    let unexpected: Vec<&(&'static str, String)> = raised
+        .iter()
+        .filter(|(label, _)| declared_raise(label).is_none())
+        .collect();
+    if unexpected.is_empty() {
+        println!("UNEXPECTED: none (every raise above is in `DECLARED_RAISES`)");
+    } else {
+        println!("\n*** UNEXPECTED CENSUS ERRORS ***");
+        for (label, text) in unexpected {
+            println!("  {label}: {text}");
+        }
     }
 }
 
@@ -407,6 +476,15 @@ impl CensusHost {
     /// Queues `message` as if it had been sent to this mailbox.
     fn push_message(&mut self, message: Eterm) {
         self.messages.push(message);
+    }
+
+    /// Empties the mailbox and repositions the scan, so each fixture run starts from the
+    /// mailbox state its own comment describes (a queued message from an earlier run — or
+    /// `recv:bomb/1`'s own `self() ! 42` — must not leak into the next one).
+    fn clear_mailbox(&mut self) {
+        self.messages.clear();
+        self.scan = 0;
+        self.markers.clear();
     }
 
     /// The `self()` term (`recv:bomb/1`'s destination).
@@ -751,10 +829,23 @@ fn layer_a(beams: &[support::BeamFile]) -> LayerA {
 /// What a workload layer ran.
 #[derive(Default)]
 struct LayerRuns {
-    /// Workloads that returned a value.
+    /// Runs that returned a value.
     ran: usize,
-    /// `(label, exact typed error)` for each workload that did not.
-    failures: Vec<(&'static str, String)>,
+    /// `(label, exact rendered error)` for every run that raised — declared or not. The
+    /// partitioning into declared vs unexpected is [`print_raise_split`]'s job (over the
+    /// whole run, not per layer), so a raise is never hidden by the layer that saw it.
+    raised: Vec<(&'static str, String)>,
+}
+
+impl LayerRuns {
+    /// Records one run's outcome (`Display`, i.e. exactly the text the census keeps as a
+    /// variant's `first_error`).
+    fn record(&mut self, label: &'static str, outcome: Result<Eterm>) {
+        match outcome {
+            Ok(_) => self.ran += 1,
+            Err(error) => self.raised.push((label, format!("{error}"))),
+        }
+    }
 }
 
 /// Run layer (b): the program workloads over the real stdlib.
@@ -763,16 +854,7 @@ fn layer_b() -> LayerRuns {
     register_harnesses(&mut host);
     let mut out = LayerRuns::default();
     for (label, run) in catalog::WORKLOADS {
-        let before = exec_census::snapshot();
-        match run(&mut host) {
-            Ok(_) => out.ran += 1,
-            Err(error) => out.failures.push((label, format!("{error:?}"))),
-        }
-        let after = exec_census::snapshot();
-        let delta = diff(&before, &after);
-        if delta.total_errors > 0 {
-            println!("DEBUG-PER-RUN {label}: {:?}", delta.first_error);
-        }
+        out.record(label, run(&mut host));
     }
     out
 }
@@ -780,6 +862,10 @@ fn layer_b() -> LayerRuns {
 /// Run layer (c): the committed fixtures, on a fresh host (they shadow stdlib names).
 fn layer_c() -> LayerRuns {
     let mut host = workload_host();
+    // `atomapply:run/3` `apply/3`s a runtime atom naming `atomtarget`, so the *target*
+    // module must be loadable as well — it lives beside `atomapply.beam` in
+    // `tests/fixtures/`, not on the stdlib search path.
+    host.register("atomtarget", fixture_path("atomtarget"));
     let mut out = LayerRuns::default();
     for fixture in catalog::FIXTURES {
         let path = match fixture.path {
@@ -788,24 +874,38 @@ fn layer_c() -> LayerRuns {
         };
         host.register(fixture.module, path);
         for (label, run) in fixture.runs {
-            match run(&mut host) {
-                Ok(_) => out.ran += 1,
-                Err(error) => out.failures.push((label, format!("{error:?}"))),
-            }
+            out.record(label, run(&mut host));
         }
     }
     out
 }
 
-/// Print a workload layer's served/failed split, with the exact typed error per failure.
+/// Run the mailbox-seam fragment of layer (c): [`catalog::MAILBOX_FIXTURES`] on a
+/// [`CensusHost`], the only host in this suite that owns a [`Mailbox`].
+///
+/// The mailbox is cleared before each run so every run starts from the state its own
+/// comment describes; the two shapes that would suspend record the engine's typed
+/// `blocked` raise (declared in [`DECLARED_RAISES`]).
+fn layer_c_mailbox() -> LayerRuns {
+    let mut census = CensusHost::new(workload_host());
+    let mut out = LayerRuns::default();
+    for fixture in catalog::MAILBOX_FIXTURES {
+        census
+            .host()
+            .register(fixture.module, fixture_path(fixture.module));
+        for (label, run) in fixture.runs {
+            census.clear_mailbox();
+            out.record(label, run(&mut census));
+        }
+    }
+    out
+}
+
+/// Print a workload layer's ran/raised split, with the exact rendered error per raise.
 fn print_runs(title: &str, layer: &LayerRuns) {
-    println!(
-        "{title}: {} ran, {} failed",
-        layer.ran,
-        layer.failures.len()
-    );
-    for (label, text) in &layer.failures {
-        println!("  WORKLOAD-FAIL {label}: {text}");
+    println!("{title}: {} ran, {} raised", layer.ran, layer.raised.len());
+    for (label, text) in &layer.raised {
+        println!("  RAISED {label}: {text}");
     }
 }
 
@@ -940,8 +1040,22 @@ fn dynamic_variant_ranking_over_real_compiled_erlang() {
     let layer_b = layer_b();
     let s2 = exec_census::snapshot();
 
-    let layer_c = layer_c();
+    // Layer (c) is TWO fragments inside ONE boundary pair: the `ModuleHost` fixtures and
+    // the mailbox-seam `recv` fixture driven on a `CensusHost`, so `s2..s3` is the layer's
+    // whole weight and the live snapshot after `s3` is still the COMBINED one.
+    let fixture_runs: usize = catalog::FIXTURES.iter().map(|f| f.runs.len()).sum();
+    let mailbox_runs: usize = catalog::MAILBOX_FIXTURES.iter().map(|f| f.runs.len()).sum();
+    let mut layer_c = layer_c();
+    let mailbox = layer_c_mailbox();
+    layer_c.ran += mailbox.ran;
+    layer_c.raised.extend(mailbox.raised);
     let s3 = exec_census::snapshot();
+
+    // Every raise the workload layers produced, in one list: partitioned into declared vs
+    // unexpected below, and printed beside the combined ranking.
+    let mut all_raised: Vec<(&'static str, String)> = Vec::new();
+    all_raised.extend(layer_b.raised.iter().cloned());
+    all_raised.extend(layer_c.raised.iter().cloned());
 
     // ---- the blocked-mechanism probe, with the census OFF ------------------
     exec_census::disable();
@@ -987,7 +1101,7 @@ fn dynamic_variant_ranking_over_real_compiled_erlang() {
         &layer_a_stats,
         Some(TOP_ROWS),
     );
-    print_errors(&layer_a_stats);
+    print_raise_split(&layer_a_stats, &[]);
 
     // ---- layer (b) report -------------------------------------------------
     println!("\n===== LAYER (b): {} program workloads over the real stdlib =====", catalog::WORKLOADS.len());
@@ -998,12 +1112,14 @@ fn dynamic_variant_ranking_over_real_compiled_erlang() {
         &layer_b_stats,
         Some(TOP_ROWS),
     );
-    print_errors(&layer_b_stats);
+    print_raise_split(&layer_b_stats, &layer_b.raised);
 
     // ---- layer (c) report -------------------------------------------------
     println!(
-        "\n===== LAYER (c): {} committed fixtures =====",
-        catalog::FIXTURES.len()
+        "\n===== LAYER (c): {} committed fixture entries ({} runs) + {} mailbox-seam runs =====",
+        catalog::FIXTURES.len(),
+        fixture_runs,
+        mailbox_runs
     );
     print_runs("layer (c) fixtures", &layer_c);
     print_ranking(
@@ -1012,7 +1128,7 @@ fn dynamic_variant_ranking_over_real_compiled_erlang() {
         &layer_c_stats,
         Some(TOP_ROWS),
     );
-    print_errors(&layer_c_stats);
+    print_raise_split(&layer_c_stats, &layer_c.raised);
 
     // ---- the combined report ---------------------------------------------
     print_ranking(
@@ -1021,7 +1137,7 @@ fn dynamic_variant_ranking_over_real_compiled_erlang() {
         &combined,
         None,
     );
-    print_errors(&combined);
+    print_raise_split(&combined, &all_raised);
 
     // ---- the not-reached analysis ----------------------------------------
     let static_reachable: BTreeSet<&String> = layer_a.statics.keys().collect();
@@ -1110,19 +1226,40 @@ fn dynamic_variant_ranking_over_real_compiled_erlang() {
         layer_a.loaded + layer_a.load_failures.len(),
         layer_a.load_failures
     );
+    // The declared-outcome scheme: NOTHING may raise except the shapes in
+    // `DECLARED_RAISES`, and every declared shape must really have raised with exactly
+    // its declared `"{class} {reason}"` text — a declared raise that returned a value
+    // never reached the shape it claims to exercise, so it is a harness bug.
+    let mut unexpected: Vec<(&'static str, String)> = all_raised
+        .iter()
+        .filter(|(label, _)| declared_raise(label).is_none())
+        .cloned()
+        .collect();
+    unexpected.sort();
     assert!(
-        layer_b.failures.is_empty(),
-        "{} of {} layer-(b) workloads failed (each with its exact typed error above): {:?}",
-        layer_b.failures.len(),
-        catalog::WORKLOADS.len(),
-        layer_b.failures
+        unexpected.is_empty(),
+        "{} UNEXPECTED raise(s) over {} runs — every raise must be declared in \
+         `DECLARED_RAISES` with its exact class+reason text: {unexpected:?}",
+        unexpected.len(),
+        catalog::WORKLOADS.len() + fixture_runs + mailbox_runs
     );
-    assert!(
-        layer_c.failures.is_empty(),
-        "{} layer-(c) fixture run(s) failed (each with its exact typed error above): {:?}",
-        layer_c.failures.len(),
-        layer_c.failures
-    );
+    for (label, class, reason) in DECLARED_RAISES {
+        let observed = all_raised
+            .iter()
+            .find(|(candidate, _)| candidate == label)
+            .map(|(_, text)| text.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the declared raise `{label}` did not raise — it returned a value (or \
+                     never ran), so the workload no longer reaches the shape it declares"
+                )
+            });
+        assert_eq!(
+            observed,
+            format!("{class} {reason}"),
+            "the declared raise `{label}` raised with a text other than declared class+reason"
+        );
+    }
     assert!(
         combined.total_executed > TOTAL_EXECUTED_FLOOR,
         "the combined census executed {} instructions — the floor is {TOTAL_EXECUTED_FLOOR}; \
@@ -1137,40 +1274,52 @@ fn dynamic_variant_ranking_over_real_compiled_erlang() {
         layer_a.unserved_samples
     );
 
-    // The computed static top-10 must all carry dynamic weight — bar the documented
-    // `SILENT_TOP_ALLOWED` exceptions, whose unreachability is measured (not asserted away)
-    // right below.
+    // The computed static top-10 must ALL carry dynamic weight. `FuncInfo` is the
+    // interesting one, and the `ExpT` measurement below is its *explanation*:
+    //
+    // `func_info` is the *function-entry clause check*. The loader keeps both of a
+    // function's labels (`Function.func_label`, the label immediately **before**
+    // `func_info`, and `Function.entry_label`, the label immediately **after** it), but
+    // `Export.label == Function.entry_label` (`beam_loader/src/ir.rs`) — and every engine
+    // entry point resolves through the export table: `run_export` (this suite's layer(a)/(b)
+    // /(c) driver), `resolve_external_call` (the `call_ext*` route) and `apply`. Local
+    // `call`/`call_only`/`call_last` targets are likewise the compiler's entry labels. So
+    // no real program enters a `func_info` *through the entry route* — which is why the
+    // `ExpT`-on-`func_label` count is asserted to be **zero**. `FuncInfo` carries dynamic
+    // weight here only because the clause-failure workloads reach a `func_label` through a
+    // FAILED head clause (`i_func_info_IaaI`), the one in-machine route to it.
     println!(
         "\nFUNC-INFO REACHABILITY: {} corpus `ExpT` entries; {} of them point at a \
-         function's `func_label` (the label BEFORE `func_info`) — the only way any export \
-         route could execute a `FuncInfo`",
+         function's `func_label` (the label BEFORE `func_info`) — the export route can \
+         therefore never land on a `FuncInfo`; the clause-failure workloads reach it \
+         through a failed head clause instead",
         layer_a.exports, layer_a.exports_on_func_label
     );
     let top10 = layer_a.top(10);
-    let mut silent_top: Vec<&str> = Vec::new();
+    assert_eq!(
+        top10.len(),
+        10,
+        "the static corpus tally produced only {} distinct variant name(s)",
+        top10.len()
+    );
     for (name, static_count) in &top10 {
         let executed = combined.executed.get(name).copied().unwrap_or(0);
         println!("TOP-10 STATIC {name:<28} static={static_count:>10} executed={executed:>12}");
-        if executed == 0 {
-            silent_top.push(name);
-        }
-    }
-    for name in &silent_top {
         assert!(
-            SILENT_TOP_ALLOWED.contains(name),
-            "the computed static top-10 variant `{name}` executed ZERO times and is not a \
-             documented exception — extend the workload set so a real program of this shape \
-             reaches it (documented exceptions: {SILENT_TOP_ALLOWED:?})"
+            executed > 0,
+            "the computed static top-10 variant `{name}` ({static_count} corpus \
+             occurrences) executed ZERO times — a shape that dense runs on almost every \
+             module, so the workload set has lost it"
         );
     }
-    // The exception's justification, asserted: if the loader ever resolved an export onto a
-    // `func_info` label, `FuncInfo` WOULD be reachable and the exclusion above would be a
-    // lie — so this is the guard that keeps it honest.
+    // The `FuncInfo` explanation's own guard: if the loader ever resolved an export onto a
+    // `func_label`, the entry route WOULD reach a `func_info` and the explanation above
+    // would be wrong.
     assert_eq!(
         layer_a.exports_on_func_label, 0,
         "{} of {} corpus export entries now resolve onto a `func_label`, i.e. onto a \
-         `func_info` — `FuncInfo` is reachable through the export route after all, so the \
-         `SILENT_TOP_ALLOWED` exclusion for it must be removed",
+         `func_info` — the export route DOES reach `FuncInfo` after all, so the \
+         FUNC-INFO REACHABILITY explanation must be rewritten",
         layer_a.exports_on_func_label, layer_a.exports
     );
 
@@ -1220,30 +1369,44 @@ fn dynamic_variant_ranking_over_real_compiled_erlang() {
 /// for whoever extends the catalog), not program logic.
 fn not_reached_reason(variant: &str) -> &'static str {
     match variant {
-        "Send" | "LoopRec" | "LoopRecEnd" | "Wait" | "WaitTimeout" | "Timeout"
-        | "RemoveMessage" | "RecvMarkerReserve" | "RecvMarkerBind" | "RecvMarkerClear"
-        | "RecvMarkerUse" => "needs a mailbox seam (the test host installs none)",
-        "DebugLine" | "ExecutableLine" => "debug/line-coverage codegen (not in this corpus build)",
-        "FuncInfo" => "unreachable by construction: every export entry is the label AFTER \
-                       `func_info` (asserted: 0 exports on a `func_label`)",
-        "Badrecord" => "a record-access failure inside a `try`, i.e. a raise (no workload raises)",
-        "Bif0" => "a 0-arity BIF call whose BIF the test host's BIF floor serves",
         "IntCodeEnd" => "the `int_code_end` trailer of a module's code (never entered)",
-        "BsSkipBits2" | "BsSkipUtf8" | "BsSkipUtf16" | "BsSkipUtf32" | "BsGetUtf16"
-        | "BsGetUtf32" | "BsGetInteger2" | "BsGetBinary2" | "BsMatchString" =>
-            "a bitstring match/skip shape the committed fixtures do not contain",
-        "Test(IsPid)" | "Test(IsPort)" | "Test(IsReference)" | "Test(IsFunction)"
-        | "Test(IsNumber)" | "Test(IsBoolean)" | "Test(IsNe)" | "Test(IsBitstr)" =>
-            "a guard on a value type the named workloads never test for",
-        "ApplyLast" => "a tail-position `apply/3`",
-        "IfEnd" => "an `if` expression with no matching branch (a raise path)",
-        "TryCaseEnd" => "a `try ... of` clause-end (the fixtures use `try ... catch` only)",
-        "PutMapExact" => "a `Map#{K := V}` EXACT update (the fixtures only build with `=>`)",
-        "IsAnyNativeRecord" => "the native-record type test (an OTP-29 shape, static-only here)",
-        "Fdiv" | "Fnegate" => "float division / float negation",
-        "NifStart" | "OnLoad" => "compiled NIF stub body (no NIF library is loaded here)",
-        "RawRaise" | "BuildStacktrace" => "a `raise`/`try ... catch` stacktrace-building shape",
-        "BsInitWritable" => "a writable-binary accumulator (compiler-proven linear append)",
+        "BsSkipBits2" | "BsGetBinary2" | "BsGetInteger2" =>
+            "a sized binary/integer segment match (`<<B:N/binary>>`, `<<I:N>>`); the \
+             committed `bs*` fixtures only read fixed-width and utf segments",
+        "BsSkipUtf8" => "no committed fixture emits it, and no exported corpus function \
+                         contains one (the corpus `bs_skip_utf8` sites are all in \
+                         non-exported helpers)",
+        "Test(IsNe)" => "`is_ne` is emitted only inside non-exported helpers — the one \
+                         exported corpus function with one (`inet_dns_tsig:sign/3`) is \
+                         `kernel`-side, and no fixture guards on `=/=` against a literal",
+        "Test(IsBitstr)" => "`is_bitstr` occurs only in non-exported `io_lib`/`io_lib_pretty` \
+                             helpers, so no exported entry runs one and no fixture uses it",
+        "Test(IsPort)" => "`is_port` occurs only in `win32reg` (a Windows-only stdlib \
+                           application) and `gen_sctp` (which needs real sockets)",
+        "Test(IsBoolean)" => "the exported `is_boolean` guards live in \
+                              `gen:{wait,check,receive}_response/3` (they also need a \
+                              `map_size` guard the BIF floor does not serve) and \
+                              `application:permit/2` (needs the application controller)",
+        "Test(IsReference)" => "the exported `is_reference` guards are in `gen_server`/\
+                                `gen_statem` reply-dispatch paths that need a live server \
+                                process; `recv:marked/0` compares a reference but never \
+                                guards on one",
+        "Test(IsFunction)" => "a guard on a fun value; the exported occurrences are in \
+                               `gen_server`/`gen_statem` reply dispatch (needs a live \
+                               server) and no fixture guards a fun",
+        "ApplyLast" => "a tail-position `apply/3`; the corpus emits it mostly in the \
+                        `*:format_error/1` error formatters (`xref_base`, `qlc`, \
+                        `beam_lib`), which no workload drives",
+        "IfEnd" => "the `if_end` trailer of an `if` whose branch actually matches — the \
+                    fixtures' `if` shapes either select a branch or fail every guard, and \
+                    the failure path re-raises out of `func_info`",
+        "RawRaise" => "the `raw_raise` instruction is only emitted for a re-raise that \
+                       carries an explicit stacktrace/class triple; the fixtures' \
+                       `catchclasses` re-raises go through `erlang:raise/3`'s BIF route",
+        "IsAnyNativeRecord" => "the native-record type test (an OTP-29 shape this corpus \
+                                contains only statically)",
+        "OnLoad" => "the `on_load` stub body of a NIF module (`crypto`, `zstd`, `gl`, \
+                     `dyntrace`, …); no NIF library is loaded here, so no `on_load` runs",
         "SetTupleElement" => "an in-place tuple write (the corpus lowers none)",
         "Deallocate" => "the loader fuses every `deallocate` into `DeallocateReturn`",
         "Generic" => "the loader's residual sentinel (the corpus lowers none)",
