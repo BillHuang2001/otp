@@ -167,8 +167,9 @@
 //!   stripped.
 //! * `INET_REQ_ACCEPT`(26) takes the four-byte `Timeout` and joins the **multi-operation** accept
 //!   list (`enq_multi_op`, `:12194`/`:12209`), so N pending accepts each get their own id, all
-//!   complete in enqueue order, and `INET_REQ_GETSTATUS` reports the C's
-//!   `INET_F_ACC`/`INET_F_MULTI_CLIENT` bits while the list is non-empty.
+//!   complete in enqueue order, and `INET_REQ_GETSTATUS` reports the C's `INET_F_ACC` bit while an
+//!   accept is queued plus the **sticky** `INET_F_MULTI_CLIENT` bit from the second enqueue until
+//!   the list fully drains.
 //!
 //! The id counter is the C's `NEW_ASYNC_ID` (`op_ref++ & 0xffff`, `:1549`): it starts at `0` and
 //! is taken *before* the capacity check, so a refused enqueue still advances it. A completion is
@@ -1779,10 +1780,11 @@ impl TcpInetDriver {
             },
             Opcode::Gettype => Ok(wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
-            // The descriptor state, including the C's `INET_F_ACC`/`INET_F_MULTI_CLIENT` bits
-            // while accept operations are queued (`:1031`-`:1032`, `:11160`). A listener with one
-            // accept pending is `9 | 0x20` = 41 (`[1,0,0,1,41]`, measured on the oracle) and with
-            // two `9 | 0x120` = 297.
+            // The descriptor state, including the C's `INET_F_ACC`/`INET_F_MULTI_CLIENT` state bits
+            // (`:1031`-`:1032`, `:11160`). A listener with one accept pending is `9 | 0x20` = 41
+            // (`[1,0,0,1,41]`, measured on the oracle) and with two `9 | 0x120` = 297 — and the
+            // multi bit is **sticky**: the C restores `INET_STATE_LISTENING` only once the accept
+            // list drains (`:12607`-`:12611`, `:13536`-`:13540`), so a survivor keeps reporting 297.
             Opcode::Getstatus => Ok(wire::getstatus_reply(
                 self.state.state_code() | self.accept_state_bits(),
             )),

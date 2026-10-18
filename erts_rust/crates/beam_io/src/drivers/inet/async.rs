@@ -49,9 +49,14 @@
 //! * **Accepts are a multi-operation list**: `INET_REQ_ACCEPT` (26) uses `enq_multi_op`
 //!   (`:12194`/`:12209`), so N pending accepts each get their own id, all answer `[1] ++ id` and
 //!   complete **in order** as connections arrive. The descriptor state carries the C's
-//!   `INET_F_ACC` (one pending accept) / `INET_F_MULTI_CLIENT` (two or more) bits while that list
-//!   is non-empty (`INET_STATE_ACCEPTING`/`INET_STATE_MULTI_ACCEPTING`, `:1031`-`:1032`), which is
-//!   what `INET_REQ_GETSTATUS` reports ([`AsyncQueue::accept_state_bits`]).
+//!   `INET_F_ACC` (an accept is pending) / `INET_F_MULTI_CLIENT` (a second accept was ever
+//!   enqueued while one was queued) bits (`INET_STATE_ACCEPTING`/`INET_STATE_MULTI_ACCEPTING`,
+//!   `:1031`-`:1032`), which is what `INET_REQ_GETSTATUS` reports
+//!   ([`AsyncQueue::accept_state_bits`]). The multi bit is **sticky**, exactly as it is in the C:
+//!   `desc->inet.state` is set to `INET_STATE_MULTI_ACCEPTING` when the *second* accept is
+//!   enqueued (`:12194`) and restored to `INET_STATE_LISTENING` only once the list has **drained**
+//!   (`:12607`-`:12611`, `:13536`-`:13540`), so a survivor keeps reporting `[1,0,0,1,41]` after
+//!   its sibling timed out or was served (`AsyncQueue::multi`).
 //!   Their timeouts are **per port, not per operation**: each finite deadline becomes one sorted
 //!   `MultiTimerData` (`add_multi_timer`, `:15744`) and the port's single timer is re-armed from
 //!   the earliest one, so its expiry reports the **head** of the accept list — whatever operation's
@@ -182,6 +187,24 @@ pub(super) struct AsyncQueue {
     /// `remove_multi_op(…, NULL, …)` leaves the head's own entry in `mtd`), so an entry whose
     /// operation was removed by *another* entry's firing stays armed and expires the next head.
     accept_timers: Vec<Instant>,
+    /// The C's `INET_F_MULTI_CLIENT` bit of `desc->inet.state` (`inet_drv.c:800`, the
+    /// `INET_STATE_MULTI_ACCEPTING` state at `:1032`), kept **sticky** here beside the list it
+    /// describes so the two cannot desync.
+    ///
+    /// The C sets the state to `INET_STATE_MULTI_ACCEPTING` in the `INET_STATE_ACCEPTING` arm of
+    /// `INET_REQ_ACCEPT` — i.e. exactly when a **second** accept is enqueued while one is queued
+    /// (`enq_multi_op(...); desc->inet.state = INET_STATE_MULTI_ACCEPTING;`, `:12189`-`:12194`) —
+    /// and its third arm (`INET_STATE_MULTI_ACCEPTING`) leaves the state alone (`:12195`-`:12212`).
+    /// It is restored to `INET_STATE_LISTENING` only where the accept list is seen to have
+    /// **drained**: the timeout path (`if (desc->multi_first == NULL) { …; desc->inet.state =
+    /// INET_STATE_LISTENING; /* restore state */ }`, `tcp_inet_multi_timeout`, `:12607`-`:12611`)
+    /// and the successful-accept twin in `tcp_inet_input`'s multi arm (`:13536`-`:13540`). A
+    /// survivor therefore keeps reporting the multi bit after its sibling goes away — measured on
+    /// the oracle (see `accept_tests.rs`).
+    ///
+    /// A whole-descriptor close empties the list through `async_error_am_all` (`:2597`-`:2608`), so
+    /// [`AsyncQueue::take_all`] clears this with the drain.
+    multi: bool,
 }
 
 impl AsyncQueue {
@@ -234,6 +257,12 @@ impl AsyncQueue {
     /// (`mtd` stays `NULL` at the enqueue sites, `:12198`-`:12210`).
     pub(super) fn enqueue_accept(&mut self, op: AcceptOp) {
         self.accepts.push(op);
+        // The C's `INET_STATE_ACCEPTING` arm, which enqueues into the multi list and then sets
+        // `desc->inet.state = INET_STATE_MULTI_ACCEPTING` (`inet_drv.c:12189`-`:12194`): the multi
+        // bit appears with the **second** queued accept.
+        if self.accepts.len() >= 2 {
+            self.multi = true;
+        }
         if let Some(deadline) = op.deadline {
             let at = self
                 .accept_timers
@@ -257,6 +286,12 @@ impl AsyncQueue {
                     self.accept_timers.remove(at);
                 }
             }
+            // `tcp_inet_input`'s multi arm restores the state only once the list is empty:
+            // `if (desc->multi_first == NULL) { sock_select(…,FD_ACCEPT,0); desc->inet.state =
+            // INET_STATE_LISTENING; }` (`inet_drv.c:13536`-`:13540`). A survivor keeps the bit.
+            if self.accepts.is_empty() {
+                self.multi = false;
+            }
             Some(op)
         }
     }
@@ -273,21 +308,22 @@ impl AsyncQueue {
     /// The descriptor-state bits the queued accepts add to `INET_REQ_GETSTATUS`
     /// (`inet_drv.c:1031`-`:1032`, `:11160`).
     ///
-    /// One pending accept is `INET_STATE_ACCEPTING` (`INET_F_LISTEN | INET_F_ACC`) and two or more
-    /// are `INET_STATE_MULTI_ACCEPTING` (adding `INET_F_MULTI_CLIENT`), so a listener with two
-    /// accepts queued reports `[1,0,0,1,41]` — measured on the oracle.
+    /// `INET_STATE_ACCEPTING` (`INET_F_LISTEN | INET_F_ACC`) while an accept is pending, plus
+    /// `INET_F_MULTI_CLIENT` (`INET_STATE_MULTI_ACCEPTING`) once the multi bit has been latched —
+    /// i.e. from the second enqueue until the list **drains**, so a listener with two accepts
+    /// queued reports `[1,0,0,1,41]` (297) and so does one whose sibling timed out or was served.
+    /// Measured on the oracle; see the `multi` field.
     pub(super) fn accept_state_bits(&self) -> u32 {
         /// `INET_F_ACC` (`inet_drv.c:797`).
         const INET_F_ACC: u32 = 0x0020;
         /// `INET_F_MULTI_CLIENT` (`:800`).
         const INET_F_MULTI_CLIENT: u32 = 0x0100;
-        match self.accepts.len() {
-            0 => 0,
-            1 => INET_F_ACC,
-            _ => INET_F_ACC | INET_F_MULTI_CLIENT,
+        match (self.accepts.is_empty(), self.multi) {
+            (true, _) => 0,
+            (false, false) => INET_F_ACC,
+            (false, true) => INET_F_ACC | INET_F_MULTI_CLIENT,
         }
     }
-
     /// The earliest deadline among the pending operations — what the driver declares through
     /// `Driver::next_timeout`, which the port mirrors into its single `TIMEOUT` task.
     ///
@@ -328,6 +364,13 @@ impl AsyncQueue {
         }
         self.accept_timers.remove(0);
         let head = self.accepts.remove(0);
+        // The C restores the state only when the list drains — `if (desc->multi_first == NULL) {
+        // sock_select(INETP(desc),FD_ACCEPT,0); desc->inet.state = INET_STATE_LISTENING; /* restore
+        // state */ }` (`tcp_inet_multi_timeout`, `inet_drv.c:12607`-`:12611`). With a survivor
+        // still queued the multi bit stays, which is the oracle's measured row.
+        if self.accepts.is_empty() {
+            self.multi = false;
+        }
         Some(head.id)
     }
 
@@ -339,6 +382,9 @@ impl AsyncQueue {
             ids.push(op.id);
         }
         self.accept_timers.clear();
+        // The teardown drain (`async_error_am_all`, `inet_drv.c:2597`-`:2608`) empties the list, so
+        // the sticky multi bit goes with it.
+        self.multi = false;
         ids.extend(self.accepts.drain(..).map(|op| op.id));
         ids
     }

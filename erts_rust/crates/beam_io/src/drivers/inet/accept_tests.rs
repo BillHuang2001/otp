@@ -73,8 +73,9 @@ const LISTENING_STATUS: u32 = 9;
 /// One queued accept: `9 | INET_F_ACC` (`0x20`) = `0x29`. Measured on the oracle.
 const ONE_ACCEPT_STATUS: u32 = 41;
 
-/// Two or more queued accepts: `9 | INET_F_ACC | INET_F_MULTI_CLIENT` (`0x100`) = `0x129`.
-/// Measured on the oracle.
+/// The C's `INET_STATE_MULTI_ACCEPTING` state: `9 | INET_F_ACC | INET_F_MULTI_CLIENT` (`0x100`) =
+/// `0x129`. Reported from the **second** enqueue until the list fully drains — sticky across a
+/// sibling's timeout or a successful accept. Measured on the oracle.
 const MULTI_ACCEPT_STATUS: u32 = 297;
 
 /// A 60 000 ms accept deadline: no round can reach it, so the queue stays put.
@@ -653,14 +654,13 @@ fn the_earliest_accept_deadline_reports_the_head_not_the_tail() {
     }
 
     // The C restores `INET_STATE_LISTENING` only when the whole list drains
-    // (`tcp_inet_multi_timeout`, `inet_drv.c:12607`-`:12611`), so the oracle keeps reporting the
-    // multi bit after this timeout (`[1,0,0,1,41]`); `AsyncQueue::accept_state_bits` derives the
-    // bits from the surviving list instead and answers `[1,0,0,0,41]`. That divergence is recorded
-    // in `CONTEXT.md` › *Known Issues* and pinned here so changing it is deliberate.
+    // (`tcp_inet_multi_timeout`, `inet_drv.c:12607`-`:12611`): with a survivor still queued the
+    // sticky `INET_F_MULTI_CLIENT` bit stays, so the oracle reports `[1,0,0,1,41]` — never the
+    // single-accept `[1,0,0,0,41]` a list-length derivation would answer.
     assert_eq!(
         rig.control(&op(GETSTATUS), &[]),
-        getstatus_reply(ONE_ACCEPT_STATUS),
-        "the floor derives the accept bits from the surviving list (the oracle keeps the multi bit)"
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "the surviving accept keeps the sticky multi bit after the head's timeout"
     );
     assert!(rig.contains(), "the listener is still live");
 }
@@ -828,6 +828,225 @@ fn two_finite_deadlines_report_the_head_then_the_survivor() {
         round_events(&mut rig, "after the list drained"),
         Vec::new(),
         "each accept timeout is reported exactly once"
+    );
+    assert!(rig.contains(), "the listener is still live");
+}
+
+// ---------------------------------------------------------------------------
+// The sticky `INET_F_MULTI_CLIENT` bit (`desc->inet.state`)
+// ---------------------------------------------------------------------------
+//
+// The C does **not** derive the accept bits from the queue length: it keeps them in
+// `desc->inet.state` — `INET_STATE_LISTENING` (`INET_STATE_OPEN | INET_F_LISTEN`),
+// `INET_STATE_ACCEPTING` (that `| INET_F_ACC`), `INET_STATE_MULTI_ACCEPTING` (that
+// `| INET_F_MULTI_CLIENT`) (`inet_drv.c:1026`-`:1032`; `INET_F_ACC = 0x0020` at `:797`,
+// `INET_F_MULTI_CLIENT = 0x0100` at `:800`). The multi bit is set where the **second** accept is
+// enqueued (`enq_multi_op(...); desc->inet.state = INET_STATE_MULTI_ACCEPTING;`, `:12189`-`:12194`),
+// left untouched by the third arm (`:12195`-`:12212`), and restored to `INET_STATE_LISTENING` only
+// where the accept list is seen to have **drained** — the timeout path (`tcp_inet_multi_timeout`:
+// `if (desc->multi_first == NULL) { sock_select(inetp, FD_ACCEPT, 0); desc->inet.state =
+// INET_STATE_LISTENING; /* restore state */ }`, `:12607`-`:12611`) and the successful-accept twin in
+// `tcp_inet_input`'s multi arm (`:13536`-`:13540`).
+//
+// A survivor therefore keeps reporting `[1,0,0,1,41]` (297) after its sibling timed out or was
+// served; only a fully drained list reports the bare listener's `[1,0,0,0,9]` (9) or, on the next
+// single enqueue, `[1,0,0,0,41]` (41). Measured on the oracle (OTP 29.1.1 / erts-17.1) with
+// `erlang:port_control(L, 16 + 16#03f1a300, <<>>)` on a
+// `gen_tcp:listen(0,[binary,{active,false},{reuseaddr,true}])` port whose accepts are queued with
+// `erlang:port_control(L, 26 + 16#03f1a300, <<Timeout:32/big>>)`: bare ⇒ 9; one queued ⇒ 41; two
+// queued ⇒ 297; `[inf, 50ms]` after the 50 ms firing ⇒ 297; `[50ms, 500ms]` after id 0's timeout
+// ⇒ 297; two queued with one served by a real connection ⇒ 297; two queued with both served ⇒ 9;
+// `[inf, 50ms]` with the survivor later served ⇒ 9.
+
+/// The multi bit is **sticky**: after a timeout removes the list head, the surviving accept still
+/// reports `INET_STATE_MULTI_ACCEPTING` (297) — for both mixed orders of the operands.
+#[test]
+fn the_multi_accept_bit_is_sticky_while_a_survivor_remains() {
+    // Row (a): an infinite head and a 50 ms tail. The tail's deadline reports the **head** (id 0)
+    // and leaves the infinite id 1 queued with no timer of its own — the state the multi bit has
+    // to survive.
+    let mut infinite_head = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    listening(&mut infinite_head);
+    assert_eq!(
+        infinite_head.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(0),
+        "the infinite accept answers id 0"
+    );
+    assert_eq!(
+        infinite_head.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(1),
+        "the 50 ms accept answers id 1"
+    );
+    assert_eq!(
+        drive_until_timer(&mut infinite_head, "row (a): the infinite head's tail deadline"),
+        vec![timed_out(0)],
+        "row (a): the tail's deadline reports the head and completes nothing else"
+    );
+    assert_eq!(
+        infinite_head.control(&op(GETSTATUS), &[]),
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "row (a): the infinite survivor keeps the sticky multi bit (the oracle answers 297)"
+    );
+
+    // Row (b): the mirror order — the head's own deadline is the earlier one, so it goes away first
+    // and the 500 ms accept survives with the same sticky bit.
+    let mut finite_head = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    listening(&mut finite_head);
+    assert_eq!(
+        finite_head.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(0),
+        "the 50 ms accept answers id 0"
+    );
+    assert_eq!(
+        finite_head.control(&op(ACCEPT), &timeout_operand(500)),
+        async_ok_reply(1),
+        "the 500 ms accept answers id 1"
+    );
+    assert_eq!(
+        drive_until_timer(&mut finite_head, "row (b): the head's own deadline"),
+        vec![timed_out(0)],
+        "row (b): the head reports at its own deadline and completes nothing else"
+    );
+    assert_eq!(
+        finite_head.control(&op(GETSTATUS), &[]),
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "row (b): the 500 ms survivor keeps the sticky multi bit (the oracle answers 297)"
+    );
+}
+
+/// A **successful** accept drains one entry and leaves the survivor queued, so the multi bit keeps
+/// reporting 297: the C's restore in `tcp_inet_input`'s multi arm did not fire
+/// (`inet_drv.c:13536`-`:13540`).
+#[test]
+fn a_surviving_accept_keeps_the_multi_bit_after_a_successful_accept() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let port = listening(&mut rig);
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(0),
+        "the first infinite accept answers id 0"
+    );
+    assert_eq!(
+        rig.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(1),
+        "the second infinite accept answers id 1"
+    );
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "two queued accepts report `INET_STATE_MULTI_ACCEPTING`"
+    );
+
+    let _client = TcpStream::connect(("127.0.0.1", port)).expect("a loopback peer connects");
+    let first = accepted(&mut rig, 0, "the first of two queued accepts");
+    assert_eq!(first.state(), InetState::Connected, "the served accept is a connection");
+
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "row (c): one served of two queued leaves the sticky multi bit (the oracle answers 297)"
+    );
+    assert!(armed(&rig), "the survivor keeps the listener read-armed");
+    assert_eq!(events(&mut rig), Vec::new(), "the served accept is reported exactly once");
+}
+
+/// Only a **fully drained** list clears the bits: two queued accepts both served by real
+/// connections leave a bare listener again.
+#[test]
+fn the_multi_accept_bit_clears_only_when_the_list_drains() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let port = listening(&mut rig);
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(0),
+        "the first infinite accept answers id 0"
+    );
+    assert_eq!(
+        rig.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(1),
+        "the second infinite accept answers id 1"
+    );
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "two queued accepts report `INET_STATE_MULTI_ACCEPTING`"
+    );
+
+    let _client1 = TcpStream::connect(("127.0.0.1", port)).expect("a first loopback peer connects");
+    let first = accepted(&mut rig, 0, "the first of two queued accepts");
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "the survivor still holds the multi bit between the two connections"
+    );
+
+    let _client2 = TcpStream::connect(("127.0.0.1", port)).expect("a second loopback peer connects");
+    let second = accepted(&mut rig, 1, "the second of two queued accepts");
+    assert_ne!(
+        first.socket(),
+        second.socket(),
+        "the two connections are two distinct descriptors"
+    );
+
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(LISTENING_STATUS),
+        "row (d): the drained list reports a bare listener (the oracle answers 9)"
+    );
+    assert!(!armed(&rig), "the drained list disarms the listener");
+    assert_eq!(events(&mut rig), Vec::new(), "each accept is reported exactly once");
+    assert!(rig.contains(), "the listener is still live");
+}
+
+/// Row (f)'s tail: the survivor of a mixed queue takes the later connection, which drains the list
+/// and clears the bit — and the sticky flag must not leak into a later **single** accept, which is
+/// the C's `LISTENING → ACCEPTING` transition and reports `INET_F_ACC` alone (41).
+#[test]
+fn a_single_accept_after_a_full_drain_reports_the_single_accept_state() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let port = listening(&mut rig);
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(0),
+        "the infinite accept answers id 0"
+    );
+    assert_eq!(
+        rig.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(1),
+        "the 50 ms accept answers id 1"
+    );
+    assert_eq!(
+        drive_until_timer(&mut rig, "row (f): the mixed queue's deadline"),
+        vec![timed_out(0)],
+        "the tail's deadline reports the head, leaving the infinite id 1 queued"
+    );
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "row (f): the survivor of the mixed queue keeps the multi bit"
+    );
+
+    let _client = TcpStream::connect(("127.0.0.1", port)).expect("a loopback peer connects");
+    let survivor = accepted(&mut rig, 1, "the surviving infinite accept");
+    assert_eq!(survivor.state(), InetState::Connected, "the survivor takes the later connection");
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(LISTENING_STATUS),
+        "row (f)'s tail: serving the survivor drains the list, so the oracle answers 9"
+    );
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(2),
+        "a later accept answers the next id"
+    );
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(ONE_ACCEPT_STATUS),
+        "a single accept after a full drain reports `INET_F_ACC` with no multi bit (41)"
     );
     assert!(rig.contains(), "the listener is still live");
 }
