@@ -51,6 +51,16 @@ Multi-accept uses an unbounded side list (`multi_first`/`multi_last`, `inet_asyn
 Timers: `driver_set_timer`/`driver_cancel_timer`/`driver_read_timer`; the `timeout` callback fires `tcp_inet_timeout` (`:12547`) or `packet_inet_timeout` (`:15011`) → `{error,timeout}`.
 Caller liveness: `driver_monitor_process`/`driver_demonitor_process` on async connect/accept; `tcp_inet_process_exit` (`:12732`) cancels the pending op and restores listener state.
 
+## Read/delivery data path (line anchors in `inet_drv.c`)
+- `desc->hsz` (the application-level "header" option `INET_LOPT_HEADER`) is written in only two places: init to `0` (`:10922`) and the setopts arm (`:6936`) — it is 0 unless `{header,N}` is set, i.e. TCP does NOT always pass hsz=0.
+- The *packet-framing* header (1/2/4-byte length, line mode, FCGI padding…) is stripped BEFORE the reply functions, by `packet_get_body()` (`../beam/packet_parser.h:152-164`) called from `tcp_reply_data` (`:4285`) and `tcp_reply_binary_data` (`:4314`); `[H1..Hsz | Data]` is therefore the first `hsz` bytes of the *body*, not the framing bytes.
+- `tcp_inet_input` (`:13461`) only dispatches accept / `tcp_recv(desc,0)` (`:13599`) and never touches `hsz`; `tcp_deliver` (`:13042`) loops packet-by-packet calling `tcp_reply_binary_data` (`:13069`) or `tcp_reply_data` (`:13094`).
+- The `(mode == INET_MODE_LIST) || (hsz > len)` short-packet/list arm is duplicated verbatim in `inet_port_data` (`:2760`), `inet_port_binary_data` (`:2779`), `inet_async_data` (`:3182`), `inet_async_binary_data` (`:3951`), `tcp_message` (`:4000`), `tcp_binary_message` (`:4038`), `packet_binary_message` (`:4142`).
+- UDP/SCTP: `packet_inet_input` (`:15361`) reads at most `udesc->read_packets` datagrams per call (`:15367` + `while(packet_count--)` `:15378`; default `INET_PACKET_POLL`=5 `:1072`, set at `:14508`, option `INET_LOPT_UDP_READ_PACKETS` `:7138`) and returns after the first packet in passive mode (`:15570-15574`) ⇒ one datagram per call.
+- Packed address header for IPv4 = 7 bytes (`addrlen` `:1156-1160` = 1 family + 2 port + 4 addr); `inet_get_address` (`:4890`) writes the family byte, then the *host-order* port via `put_int16` (MSB first = big-endian, `../beam/sys.h:1314`), then the raw `sin_addr` bytes in network order. `load_address` (`:1916`) decodes the same layout with `get_int16`.
+- `INET_CHECK_ACTIVE_TO_PASSIVE` (`:1552`) fires **per delivered packet** (call sites `:4302`, `:4329`, `:4352`); `{active,once}` flips to passive silently, `{active,N}` emits `{tcp|udp|sctp}_passive` only when its counter hits 0.
+- Readiness arming = "`active > 0`" (`:7966` setopts, `:12126`/`:14286` tcp connect, `:14621`/`:14682` udp open/fdopen, `:9030` sctp setopts) **or** "an async recv op is queued and hit `EWOULDBLOCK`" (tcp `:12317`, only when `timeout != 0`; udp `:15496` inside `packet_inet_input`).
+
 ## Constraints
 - Never edit the generated `$(TTF_DIR)/driver_tab.c`; regenerate via the `driver_tab.c:` rule in `../Makefile.in:702`.
 - The exported entry symbol is mechanically derived from the object base name (`foo_drv.o` → `foo_driver_entry`); renaming a file here silently breaks the generated table link.
