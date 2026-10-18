@@ -1005,11 +1005,6 @@ impl Machine {
     /// (`len == capacity`, [`Machine::cover_writable_capacity`]) **before** returning, so
     /// the next relocation copies every byte the appender wrote through the payload
     /// pointer.
-    //
-    // Not yet on the append path: `InPlace::grow` is the sink-side half of the capacity
-    // adoption and the writer consult is the follow-up step. The plumbing is exercised by
-    // this module's and `raw.rs`'s unit tests today.
-    #[allow(dead_code)]
     pub(crate) fn grow_writable_payload(
         &mut self,
         base: *mut u8,

@@ -523,3 +523,5 @@ mod float_seg_tests;
 mod le_tests;
 #[cfg(test)]
 mod inplace_tests;
+#[cfg(test)]
+mod grow_tests;
