@@ -177,10 +177,10 @@
 //! * **`erl_drv_time_offset/1`'s absolute value** — the C reports the real monotonic↔system
 //!   offset, the Rust runtime anchors monotonic time on the system clock and so reports `0`; only
 //!   its unit consistency is pinned (`4`, `9`), never the magnitude. Owner: `beam_rt` / `beam_abi`.
-//! * **`driver_async/5`** and `erl_drv_set_os_pid/2` / `erl_drv_init_ack/2` / `driver_exit/2` /
-//!   `driver_failure_*` — the async pool, the OS-pid record and the port-closing slots either have
-//!   no Rust hook or terminate the connected process, so no live-port shape can agree (the first
-//!   is already documented by [`super::driver_abi`]). Owner: `beam_rt` / `beam_io`.
+//! * **`driver_async/5`** and `erl_drv_set_os_pid/2` / `erl_drv_init_ack/2` — the async pool and
+//!   the OS-pid/init-ack records keep the `DriverHost` trait defaults, so no live-port shape can
+//!   agree (the first is already documented by [`super::driver_abi`]). Owner: `beam_rt` /
+//!   `beam_io`.
 //! * **`driver_async_port_key/1`** — the C answers the port's opaque data word (`erl_async.c:518`,
 //!   the driver's own `ErlDrvData`, i.e. a pointer), while the Rust hook keeps the `DriverHost`
 //!   trait default, so the call answers `0`. A fabricated key is not *the* key, so no value is
