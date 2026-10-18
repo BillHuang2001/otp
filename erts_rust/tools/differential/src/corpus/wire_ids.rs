@@ -205,6 +205,33 @@ fn reference_cases() -> Vec<Case> {
     ]
 }
 
+/// The A.2/A.5 **port identity** case: the two shape cases above pin the byte image
+/// (`V4_PORT_EXT` (120), 29 bytes, node-name prefix) and decode it back only as far as
+/// `is_port/1`, so the *value* relation is pinned here — `binary_to_term(term_to_binary(P))`
+/// is the very port `P` (`=:=`, which for a port compares its id and creation, i.e. exactly
+/// the fields the distribution codec transmits), and re-encoding the decoded port reproduces
+/// the image byte for byte (the encoder is deterministic for a live port within one VM start).
+/// Both reduce to booleans, so no per-VM-start id/creation byte can reach the golden.
+fn port_identity_cases() -> Vec<Case> {
+    vec![Case {
+        id: "wire_ids/internal_port_round_trip_identity",
+        description: "binary_to_term(term_to_binary(P)) is the very port P (=:=) and re-encoding \
+                      the decoded port reproduces the V4_PORT_EXT (120) image byte for byte",
+        contracts: LOCAL_ID_CONTRACTS,
+        kind: CaseKind::Eval {
+            expr: "begin P = open_port({spawn,\"cat\"},[binary]), B = term_to_binary(P), \
+                   Obs = {binary_to_term(B) =:= P, term_to_binary(P) =:= B}, port_close(P), Obs \
+                   end",
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok {true,true}"),
+            exit_code: 0,
+        },
+    }]
+}
+
 /// The A.5 node/identity cases -- with **no distribution started**, so the oracle's node is
 /// `nonode@nohost` and every id/creation field stays out of the golden.
 fn node_identity_cases() -> Vec<Case> {
@@ -416,6 +443,7 @@ fn pid_ordering_cases() -> Vec<Case> {
 /// The A.2/A.5 local-pid/port/reference encoding cases and the A.5 node/identity cases.
 pub(crate) fn group() -> Vec<Case> {
     let mut cases = local_id_cases();
+    cases.extend(port_identity_cases());
     cases.extend(reference_cases());
     cases.extend(pid_ordering_cases());
     cases.extend(node_identity_cases());
@@ -424,7 +452,10 @@ pub(crate) fn group() -> Vec<Case> {
 
 #[cfg(test)]
 mod tests {
-    use super::{group, local_id_cases, node_identity_cases, pid_ordering_cases, reference_cases};
+    use super::{
+        group, local_id_cases, node_identity_cases, pid_ordering_cases, port_identity_cases,
+        reference_cases,
+    };
     use crate::corpus::{CaseKind, Contract, Probe};
 
     /// The 15-byte node-name atom (`SMALL_ATOM_UTF8_EXT` 119, length 13, `nonode@nohost`).
@@ -434,14 +465,42 @@ mod tests {
     fn the_group_is_the_local_id_cases_then_the_reference_then_the_node_identity_cases() {
         let ids: Vec<&str> = group().iter().map(|c| c.id).collect();
         let mut expected: Vec<&str> = local_id_cases().iter().map(|c| c.id).collect();
+        expected.extend(port_identity_cases().iter().map(|c| c.id));
         expected.extend(reference_cases().iter().map(|c| c.id));
         expected.extend(pid_ordering_cases().iter().map(|c| c.id));
         expected.extend(node_identity_cases().iter().map(|c| c.id));
         assert_eq!(ids, expected);
         assert_eq!(
             group().len(),
-            2 + 2 + 1 + 19,
-            "two byte-image cases + two reference cases + one pid-ordering case + 19 identity cases"
+            2 + 1 + 2 + 1 + 19,
+            "two byte-image cases + one port-identity case + two reference cases + one \
+             pid-ordering case + 19 identity cases"
+        );
+    }
+
+    /// The A.2/A.5 **port identity** case: the port's byte image is pinned by
+    /// [`local_id_cases`], which decodes it back only as far as `is_port/1`; this pins the
+    /// value relation (`=:=`), so a decoded port that is a *different* port can never agree.
+    /// Both halves reduce to booleans, so no per-VM-start id/creation byte can reach the golden.
+    #[test]
+    fn the_port_identity_case_is_a_boolean_relation_over_a_live_port() {
+        let cases = port_identity_cases();
+        assert_eq!(cases.len(), 1, "the one port-identity case");
+        let case = &cases[0];
+        assert_eq!(case.id, "wire_ids/internal_port_round_trip_identity");
+        assert_eq!(case.contracts, &[Contract::BeamAsm, Contract::Distribution]);
+        assert_eq!(case.kind_label(), "value");
+        assert_eq!(case.golden.stdout, Some("ok {true,true}"));
+        assert_eq!(case.golden.exit_code, 0);
+        let expr = case.expr().expect("an expression case");
+        // The port must be opened and closed inside the expression (a leaked port would keep
+        // the `cat` child alive), and the image must be built from the runtime's own encoder.
+        assert!(expr.contains("open_port({spawn,\"cat\"},[binary])"), "{expr}");
+        assert!(expr.contains("port_close(P)"), "{expr}");
+        assert!(expr.contains("binary_to_term(B) =:= P"), "{expr}");
+        assert!(
+            !expr.contains("binary:at(") && !expr.contains("byte_size("),
+            "the identity case must not pin any per-VM-start byte: {expr}"
         );
     }
 

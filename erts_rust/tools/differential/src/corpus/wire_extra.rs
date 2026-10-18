@@ -172,12 +172,41 @@
 //!   `NEW_PID_EXT` (88) whose node field is not an atom. Each is a plain `badarg` in both
 //!   runtimes.
 //!
+//! * the distribution **send-path** encoder `erlang:term_to_iovec/1,2` — the iovec a message
+//!   is written from. Its only byte-stable property is the relation to `term_to_binary/1,2`:
+//!   `iolist_to_binary(term_to_iovec(T))` is exactly `term_to_binary(T)` (plain, a 70 000-byte
+//!   refc payload, `[compressed]`), the segments are a proper list of binaries, the
+//!   concatenation's byte count is what `binary_to_term/2` `[used]` consumes, and an unknown
+//!   option is `badarg`. No segment *split* is ever asserted — that is the encoder's own
+//!   choice (the oracle emits one segment for a small term and splits a refc payload out; one
+//!   segment is equally correct).
+//!
+//! * **decode refusals over a real image** — the image is built with `term_to_binary/1` and
+//!   then cut (a distribution stream is framed by byte counts, so truncation is the decoder's
+//!   normal failure mode): a one-byte-short image, the empty binary, the bare
+//!   `VERSION_MAGIC` (131) and a `131,104` prefix are all `badarg`.
+//!
+//! * **large / refc payload identities** — `binary_to_term(term_to_binary(T)) =:= T` for a
+//!   70 000-byte (refc) binary, the same under `[compressed]` (whose image is the
+//!   `COMPRESSED` (80) form and under 1 000 bytes), a 500-byte sub-binary of an 80 000-byte
+//!   binary, a 100 000-element list, a 70 000-element `LARGE_TUPLE_EXT` (105) tuple and a
+//!   100-key (HAMT) map — identity, never an image or a size. Plus the encoder's
+//!   `STRING_EXT` (107) → `LIST_EXT` (108) overflow: a 70 000-character string is
+//!   `LIST_EXT` of 70 000 `SMALL_INTEGER_EXT` elements (140 007 bytes), and the decoder's
+//!   trailing-byte tolerance (a flag-free decode ignores what follows the first term, and
+//!   `[used]` over a refc image reports the image length, not the payload length).
+//!
 //! A live handshake and the on-wire `DOP_*`/`DFLAG_*` negotiation are **not**
 //! expressible through a single CLI process (they need two connected nodes) — an
 //! honest, documented gap, not a fabricated case (see `super::wire`); only the
 //! *payload shapes* those messages carry are pinned here, as ordinary ETF terms.
 //!
 //! ## Measured divergences / not covered
+//! * **A deeply nested term's decode is bounded** (measured while adding the large-payload
+//!   cases): a 3 000-deep right-nested list round-trips `=:=` on the oracle under the default
+//!   probe, while the Rust runtime raises `system_limit` (`exception error system_limit`,
+//!   exit 1). A case pinning it would be a `mismatch`, so it stays out of the corpus; owner
+//!   `beam_codec` (the decoder's recursion/nesting bound).
 //! * **A send to a pid on a node with no connection** is unpinned: the oracle *drops* the
 //!   message and answers it to the sender (`Pid ! Msg` → `Msg`,
 //!   `erlang:send(Pid, Msg, [noconnect])` → `Msg`) for a decoded remote pid
@@ -830,6 +859,43 @@ pub(crate) fn group() -> Vec<Case> {
         verr("wire_extra/err_string_ext_length_beyond_buffer_badarg", "a STRING_EXT (107) whose 16-bit length overruns the buffer is badarg", "binary_to_term(<<131,107,0,5,1,2>>)"),
         verr("wire_extra/err_local_ext_without_body_badarg", "a LOCAL_EXT (121) prologue with its 4-byte node hash but no term body is badarg", "binary_to_term(<<131,121,0,0,0,0>>)"),
         verr("wire_extra/err_new_pid_ext_node_not_atom_badarg", "a NEW_PID_EXT (88) whose node field is not an atom tag is badarg", "binary_to_term(<<131,88,97,1,0,0,0,9,0,0,0,0,0,0,0,1>>)"),
+        // -- the distribution **send-path** encoder: `erlang:term_to_iovec/1,2` ---------
+        // A distribution message is handed to the socket as an *iovec* — the control-message
+        // prefix plus the ETF-encoded payload segments — so a refc payload can be written
+        // without first being copied into one contiguous image. `term_to_iovec/1,2` is that
+        // encoder's public entry point, and the only *byte*-stable property it has is the
+        // relation to `term_to_binary/1,2`: the concatenation of its segments
+        // (`iolist_to_binary/1`) must be exactly the canonical image. So every case pins that
+        // relation, never a segment split (which is the encoder's own choice: the oracle emits
+        // `[<<131,…>>]` for a small term and splits a refc payload out, and a runtime that
+        // emits one segment is equally correct).
+        v("wire_extra/iovec_iolist_equals_term_to_binary", "the segments of term_to_iovec/1 concatenate to exactly the term_to_binary/1 image", "iolist_to_binary(term_to_iovec({ok,[1,2,3],<<\"abc\">>})) =:= term_to_binary({ok,[1,2,3],<<\"abc\">>})", "ok true"),
+        v("wire_extra/iovec_roundtrip_identity", "an iovec image decodes back to the encoded term", "binary_to_term(iolist_to_binary(term_to_iovec([{a,1},#{k => <<\"v\">>}]))) =:= [{a,1},#{k => <<\"v\">>}]", "ok true"),
+        v("wire_extra/iovec_compressed_equals_compressed_image", "term_to_iovec/2 carries the [compressed] option through: its segments concatenate to the compressed term_to_binary/2 image of a 32 KiB payload", "begin B = binary:copy(<<\"abcdefgh\">>, 4096), iolist_to_binary(term_to_iovec(B,[compressed])) =:= term_to_binary(B,[compressed]) end", "ok true"),
+        v("wire_extra/iovec_shape_is_a_list_of_binaries", "term_to_iovec/1 answers a proper list whose every segment is a binary (the iovec shape a send path requires)", "begin L = term_to_iovec({ok,42}), {is_list(L), lists:all(fun erlang:is_binary/1, L)} end", "ok {true,true}"),
+        v("wire_extra/iovec_refc_binary_equals_term_to_binary", "a 70 000-byte (refc) binary's iovec segments concatenate to its term_to_binary/1 image", "begin B = binary:copy(<<\"0123456789\">>, 7000), iolist_to_binary(term_to_iovec(B)) =:= term_to_binary(B) end", "ok true"),
+        v("wire_extra/iovec_bytes_are_the_used_image", "the iovec byte count is what binary_to_term/2 [used] consumes over the same image", "begin B = iolist_to_binary(term_to_iovec({ok,1})), binary_to_term(<<B/binary,255>>, [used]) =:= {{ok,1}, byte_size(B)} end", "ok true"),
+        verr("wire_extra/err_iovec_unknown_option_badarg", "term_to_iovec/2 refuses an unknown option exactly like term_to_binary/2 does", "term_to_iovec(hello, [bogus])"),
+        // -- decode refusals over a **real** image (truncation, not a hand-built blob) ---
+        // A distribution stream is framed by byte counts, so a truncated image is the decoder's
+        // normal failure mode. These build the image with `term_to_binary/1` and then cut it, so
+        // the bytes are the runtime's own and only the cut offset is pinned.
+        verr("wire_extra/err_truncated_real_image_last_byte_badarg", "an image truncated by one trailing byte is badarg", "begin B = term_to_binary({hello,<<\"abc\">>,1,2,3}), binary_to_term(binary:part(B,0,byte_size(B)-1)) end"),
+        v("wire_extra/err_truncation_prefixes_are_all_badarg", "the empty binary, the bare VERSION_MAGIC (131) and a VERSION_MAGIC + SMALL_TUPLE_EXT (104) prefix are all badarg", "[try binary_to_term(B) of _ -> ok catch error:E -> E end || B <- [<<>>, <<131>>, <<131,104>>]]", "ok [badarg,badarg,badarg]"),
+        // -- large / refc payload identities -------------------------------------------
+        // `copy_struct` is what carries a message across the copy boundary, so the identity of a
+        // term that does not fit a heap fragment is the property that matters: the decode of the
+        // encode must be `=:=` to the original (identity, never an image, and never a size).
+        v("wire_extra/rt_refc_binary_identity", "a 70 000-byte (> the 64 KiB refc threshold) binary round-trips by identity", "begin B = binary:copy(<<\"0123456789\">>, 7000), binary_to_term(term_to_binary(B)) =:= B end", "ok true"),
+        v("wire_extra/rt_refc_binary_compressed_identity_and_shrinks", "a 70 000-byte repetitive binary round-trips under [compressed], the image really is the COMPRESSED (80) form, and it is smaller than 1 000 bytes", "begin B = binary:copy(<<\"0123456789\">>, 7000), Comp = term_to_binary(B,[compressed]), {binary_to_term(Comp) =:= B, byte_size(Comp) < 1000, binary:at(Comp,1)} end", "ok {true,true,80}"),
+        v("wire_extra/rt_sub_binary_identity", "a 500-byte sub-binary of an 80 000-byte binary encodes only its own bytes and round-trips by identity", "begin Big = binary:copy(<<\"ABCDEFGH\">>, 10000), Sub = binary:part(Big,100,500), binary_to_term(term_to_binary(Sub)) =:= Sub end", "ok true"),
+        v("wire_extra/rt_large_collections_identity", "a 100 000-element list, a 70 000-element (LARGE_TUPLE_EXT) tuple and a 100-key (HAMT) map each round-trip by identity", "begin L = lists:seq(1,100000), T = list_to_tuple(lists:seq(1,70000)), M = maps:from_list([{I,I} || I <- lists:seq(1,100)]), {binary_to_term(term_to_binary(L)) =:= L, binary_to_term(term_to_binary(T)) =:= T, binary_to_term(term_to_binary(M)) =:= M} end", "ok {true,true,true}"),
+        v("wire_extra/rt_long_string_encodes_as_list_ext", "a 70 000-character string exceeds the STRING_EXT (107) 16-bit length, so it encodes as a LIST_EXT (108) of 70 000 SMALL_INTEGER_EXT elements (140 007 bytes)", "begin B = term_to_binary(lists:duplicate(70000,97)), {binary:at(B,1), byte_size(B)} end", "ok {108,140007}"),
+        // -- the decoder's trailing-byte tolerance --------------------------------------
+        // A distribution buffer may hold more than one encoded message, so a decode consumes the
+        // first term and ignores what follows; `[used]` is what reports the consumed count.
+        v("wire_extra/b2t_plain_image_trailing_bytes_are_ignored", "a flag-free decode ignores three trailing garbage bytes, and a two-term buffer decodes to its first term", "begin T = {ok,[1,2,3],<<\"x\">>}, {binary_to_term(<<(term_to_binary(T))/binary,255,0,99>>) =:= T, binary_to_term(<<(term_to_binary(1))/binary,(term_to_binary(2))/binary>>)} end", "ok {true,1}"),
+        v("wire_extra/used_refc_image_byte_count", "[used] over a 70 000-byte binary's image reports exactly the image length, not the payload length", "begin B = term_to_binary(binary:copy(<<\"0123456789\">>, 7000)), element(2, binary_to_term(<<B/binary,7>>, [used])) =:= byte_size(B) end", "ok true"),
     ]
 }
 
@@ -844,7 +910,7 @@ mod tests {
         let cases = group();
         // The exact size is pinned so a case can never vanish from the registry unnoticed;
         // grow this number in the same change that adds cases.
-        assert_eq!(cases.len(), 430, "the expanded A.5 group size");
+        assert_eq!(cases.len(), 446, "the expanded A.5 group size");
         let mut seen = HashSet::new();
         for case in &cases {
             assert!(
@@ -1463,5 +1529,135 @@ mod tests {
             "case {} must ask for the [safe] decode before the flag-free one: {expr}",
             refused.id
         );
+    }
+
+    /// The distribution **send-path** encoder (`erlang:term_to_iovec/1,2`), the refusals over a
+    /// **real** (truncated) image, the large/refc payload identities and the trailing-byte
+    /// tolerance. Every golden is the oracle's own line (re-measured with
+    /// `differential run <id>`), and every case `agree`s — so pin the ids and their goldens to
+    /// stop a silent regression.
+    #[test]
+    fn wire_extra_pins_the_iovec_truncation_and_large_payload_surface() {
+        let cases = group();
+        for (id, golden) in [
+            ("wire_extra/iovec_iolist_equals_term_to_binary", "ok true"),
+            ("wire_extra/iovec_roundtrip_identity", "ok true"),
+            (
+                "wire_extra/iovec_compressed_equals_compressed_image",
+                "ok true",
+            ),
+            ("wire_extra/iovec_shape_is_a_list_of_binaries", "ok {true,true}"),
+            (
+                "wire_extra/iovec_refc_binary_equals_term_to_binary",
+                "ok true",
+            ),
+            ("wire_extra/iovec_bytes_are_the_used_image", "ok true"),
+            (
+                "wire_extra/err_truncation_prefixes_are_all_badarg",
+                "ok [badarg,badarg,badarg]",
+            ),
+            ("wire_extra/rt_refc_binary_identity", "ok true"),
+            (
+                "wire_extra/rt_refc_binary_compressed_identity_and_shrinks",
+                "ok {true,true,80}",
+            ),
+            ("wire_extra/rt_sub_binary_identity", "ok true"),
+            (
+                "wire_extra/rt_large_collections_identity",
+                "ok {true,true,true}",
+            ),
+            (
+                "wire_extra/rt_long_string_encodes_as_list_ext",
+                "ok {108,140007}",
+            ),
+            (
+                "wire_extra/b2t_plain_image_trailing_bytes_are_ignored",
+                "ok {true,1}",
+            ),
+            ("wire_extra/used_refc_image_byte_count", "ok true"),
+        ] {
+            let case = cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the iovec/large-payload case {id}"));
+            assert_eq!(
+                case.golden.stdout,
+                Some(golden),
+                "case {id} must carry the oracle-derived golden"
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {id} golden must exit 0");
+        }
+        for id in [
+            "wire_extra/err_iovec_unknown_option_badarg",
+            "wire_extra/err_truncated_real_image_last_byte_badarg",
+        ] {
+            let case = cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the refusal case {id}"));
+            assert_eq!(
+                case.golden.stdout,
+                Some("exception error badarg"),
+                "case {id} must carry the oracle-derived badarg golden"
+            );
+            assert_eq!(case.golden.exit_code, 1, "case {id} golden must exit 1");
+        }
+
+        let expr = |id: &str| {
+            cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the case {id}"))
+                .expr()
+                .expect("an expression case")
+        };
+        // The iovec cases pin the **relation** to the canonical image, never a segment split:
+        // every one concatenates the segments (`iolist_to_binary/1`) and compares, and none of
+        // them asserts a segment count or renders the iovec itself.
+        for id in [
+            "wire_extra/iovec_iolist_equals_term_to_binary",
+            "wire_extra/iovec_compressed_equals_compressed_image",
+            "wire_extra/iovec_refc_binary_equals_term_to_binary",
+        ] {
+            let expr = expr(id);
+            assert!(
+                expr.contains("iolist_to_binary(term_to_iovec(") && expr.contains("=:= term_to_binary("),
+                "case {id} must pin the iovec's byte relation to term_to_binary: {expr}"
+            );
+            assert!(
+                !expr.contains("length(term_to_iovec") && !expr.contains("hd(term_to_iovec"),
+                "case {id} must not pin a segment split: {expr}"
+            );
+        }
+        // The truncation refusals cut the runtime's **own** image: each builds it with
+        // `term_to_binary/1` (so no hand-written byte blob can drift from the encoder).
+        let truncated = expr("wire_extra/err_truncated_real_image_last_byte_badarg");
+        assert!(
+            truncated.contains("term_to_binary(")
+                && truncated.contains("binary:part(B,0,byte_size(B)-1)"),
+            "the truncation refusal must cut a real image: {truncated}"
+        );
+        // Every large-payload case reduces to booleans / small integers, so no volatile image,
+        // size or per-VM-start value can reach a golden.
+        for id in [
+            "wire_extra/rt_refc_binary_identity",
+            "wire_extra/rt_sub_binary_identity",
+            "wire_extra/rt_large_collections_identity",
+            "wire_extra/b2t_plain_image_trailing_bytes_are_ignored",
+            "wire_extra/used_refc_image_byte_count",
+        ] {
+            let golden = cases
+                .iter()
+                .find(|c| c.id == id)
+                .expect("registered")
+                .golden
+                .stdout
+                .expect("a golden line");
+            assert!(
+                golden == "ok true" || golden == "ok {true,true}" || golden == "ok {true,true,true}"
+                    || golden == "ok {true,1}",
+                "case {id} must reduce to booleans: {golden}"
+            );
+        }
     }
 }
