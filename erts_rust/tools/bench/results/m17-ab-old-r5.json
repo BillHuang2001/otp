@@ -1,0 +1,636 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1792363212405,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "rust",
+      "program": "$TMPDIR/m15-target/release/beam_rt",
+      "version": "30",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "baseline",
+      "runtime": "rust",
+      "category": "startup",
+      "description": "system-ERTS startup latency + fixed compute loop",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 363.911802,
+            "max": 448.296592,
+            "mean": 396.0429839,
+            "p50": 385.09392449999996,
+            "p90": 441.2153272,
+            "p99": 447.58846552
+          }
+        },
+        {
+          "name": "compute_loop_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 5,
+            "min": 423.324196,
+            "max": 470.157097,
+            "mean": 452.086031,
+            "p50": 465.60541700000005,
+            "p90": 468.3593822,
+            "p99": 469.97732552
+          }
+        },
+        {
+          "name": "compute_ops_per_sec",
+          "unit": "ops/s",
+          "value": 2211968.3675870975
+        },
+        {
+          "name": "vm_memory_total_bytes",
+          "unit": "bytes",
+          "value": 13220989.0
+        }
+      ],
+      "peak_memory_bytes": 133218304,
+      "notes": []
+    },
+    {
+      "workload": "list_walk",
+      "runtime": "rust",
+      "category": "compute",
+      "description": "a BIF-free recursive list walk on both runtimes (interpreter ns/element)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_list_walk_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1949.050603,
+            "max": 2071.209472,
+            "mean": 1993.5504426666666,
+            "p50": 1960.391253,
+            "p90": 2049.0458282,
+            "p99": 2068.99310762
+          }
+        },
+        {
+          "name": "case_list_walk_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 395.278878,
+            "max": 398.711019,
+            "mean": 396.5827616666667,
+            "p50": 395.758388,
+            "p90": 398.1204928,
+            "p99": 398.65196638000003
+          }
+        },
+        {
+          "name": "case_list_walk_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 118161408.0,
+            "max": 118386688.0,
+            "mean": 118280192.0,
+            "p50": 118292480.0,
+            "p90": 118367846.4,
+            "p99": 118384803.84
+          }
+        },
+        {
+          "name": "case_list_walk_ns_per_element",
+          "unit": "ns",
+          "value": 31.292657300000002
+        },
+        {
+          "name": "case_list_walk_elements",
+          "unit": "elements",
+          "value": 50000000.0
+        }
+      ],
+      "peak_memory_bytes": 118386688,
+      "notes": [
+        "staged $TMPDIR/bench-scratch-list_walk-1058-0-1792363146648137110/bench_list_walk.beam (embedded source, LEN=1000, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "case list_walk: paired median=1564.633 ms min=1553.772 ms max=1672.498 ms noise=\u00b116.103 ms over 3 round(s)",
+        "observed stdout: list_walk=N*500500=25025000000",
+        "case list_walk: N=50000 walks (rust) at LEN=1000, i.e. 50000000 elements walked",
+        "method: paired startup-cancelled marginal \u2014 every round runs the N-walk pass then the 0-walk pass back to back, and ns/element = median(paired difference) / (N * LEN) * 1e6, withheld below 3x max(1 ms, 1.4826*MAD) of the paired differences; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels inside every pair; the module is BIF-free and builds no term",
+        "note: element count is deterministic and contention-immune; the wall-clock rows move with host load"
+      ]
+    },
+    {
+      "workload": "copy_bound",
+      "runtime": "rust",
+      "category": "messaging",
+      "description": "term-copy/ETF round-trips under each runtime (per-op copy cost)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_etf_roundtrip_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1478.2969679999999,
+            "max": 1701.772725,
+            "mean": 1554.1990633333332,
+            "p50": 1482.527497,
+            "p90": 1657.9236794,
+            "p99": 1697.38782044
+          }
+        },
+        {
+          "name": "case_etf_roundtrip_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 400.50555399999996,
+            "max": 432.23677100000003,
+            "mean": 421.25390466666664,
+            "p50": 431.019389,
+            "p90": 431.9932946,
+            "p99": 432.21242336000006
+          }
+        },
+        {
+          "name": "case_etf_roundtrip_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 459083776.0,
+            "max": 459255808.0,
+            "mean": 459157504.0,
+            "p50": 459132928.0,
+            "p90": 459231232.0,
+            "p99": 459253350.4
+          }
+        },
+        {
+          "name": "case_etf_roundtrip_ns_per_op",
+          "unit": "ns",
+          "value": 2164.0438860000004
+        },
+        {
+          "name": "case_etf_roundtrip_ops",
+          "unit": "ops",
+          "value": 500000.0
+        },
+        {
+          "name": "case_ets_copy_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1348.234346,
+            "max": 1527.4095559999998,
+            "mean": 1411.8395386666664,
+            "p50": 1359.874714,
+            "p90": 1493.9025875999998,
+            "p99": 1524.0588591599999
+          }
+        },
+        {
+          "name": "case_ets_copy_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 407.425192,
+            "max": 490.150872,
+            "mean": 439.50179499999996,
+            "p50": 420.929321,
+            "p90": 476.3065618,
+            "p99": 488.76644097999997
+          }
+        },
+        {
+          "name": "case_ets_copy_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 118259712.0,
+            "max": 118292480.0,
+            "mean": 118280192.0,
+            "p50": 118288384.0,
+            "p90": 118291660.8,
+            "p99": 118292398.08
+          }
+        },
+        {
+          "name": "case_ets_copy_ns_per_op",
+          "unit": "ns",
+          "value": 3709.2200999999995
+        },
+        {
+          "name": "case_ets_copy_ops",
+          "unit": "ops",
+          "value": 250000.0
+        },
+        {
+          "name": "case_send_recv_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1376.319063,
+            "max": 1539.600649,
+            "mean": 1461.7753993333333,
+            "p50": 1469.406486,
+            "p90": 1525.5618164,
+            "p99": 1538.19676574
+          }
+        },
+        {
+          "name": "case_send_recv_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 411.135172,
+            "max": 450.590229,
+            "mean": 427.1464673333333,
+            "p50": 419.714001,
+            "p90": 444.41498340000004,
+            "p99": 449.97270444000003
+          }
+        },
+        {
+          "name": "case_send_recv_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 158314496.0,
+            "max": 158527488.0,
+            "mean": 158425088.0,
+            "p50": 158433280.0,
+            "p90": 158508646.4,
+            "p99": 158525603.84
+          }
+        },
+        {
+          "name": "case_send_recv_ns_per_op",
+          "unit": "ns",
+          "value": 11758.570155555555
+        },
+        {
+          "name": "case_send_recv_ops",
+          "unit": "ops",
+          "value": 90000.0
+        },
+        {
+          "name": "case_send_recv_plain_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1248.047194,
+            "max": 1470.076068,
+            "mean": 1328.4204653333334,
+            "p50": 1267.138134,
+            "p90": 1429.4884812,
+            "p99": 1466.01730932
+          }
+        },
+        {
+          "name": "case_send_recv_plain_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 412.757006,
+            "max": 431.298261,
+            "mean": 421.23017166666665,
+            "p50": 419.635248,
+            "p90": 428.9656584,
+            "p99": 431.06500074
+          }
+        },
+        {
+          "name": "case_send_recv_plain_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 144805888.0,
+            "max": 144973824.0,
+            "mean": 144874154.66666666,
+            "p50": 144842752.0,
+            "p90": 144947609.6,
+            "p99": 144971202.56
+          }
+        },
+        {
+          "name": "case_send_recv_plain_ns_per_op",
+          "unit": "ns",
+          "value": 2786.13291
+        },
+        {
+          "name": "case_send_recv_plain_ops",
+          "unit": "ops",
+          "value": 300000.0
+        }
+      ],
+      "peak_memory_bytes": 459255808,
+      "notes": [
+        "staged $TMPDIR/bench-scratch-copy_bound-1058-1-1792363154014437692/bench_copy_bound.beam (embedded source, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "case etf_roundtrip: paired median=1082.022 ms min=1047.278 ms max=1269.536 ms noise=\u00b151.512 ms over 3 round(s)",
+        "case etf_roundtrip: N=500000 (rust) copy round-trips of the 5-key payload",
+        "case ets_copy: paired median=927.305 ms min=869.724 ms max=1119.984 ms noise=\u00b185.370 ms over 3 round(s)",
+        "case ets_copy: N=250000 (rust) copy round-trips of the 5-key payload",
+        "case send_recv: paired median=1058.271 ms min=925.729 ms max=1119.887 ms noise=\u00b191.351 ms over 3 round(s)",
+        "case send_recv: N=90000 (rust) copy round-trips of the 5-key payload",
+        "case send_recv_plain: paired median=835.840 ms min=828.412 ms max=1057.319 ms noise=\u00b111.013 ms over 3 round(s)",
+        "case send_recv_plain: N=300000 (rust) copy round-trips of the 5-key payload",
+        "observed stdout: etf_roundtrip=500000 ets_copy=250000 send_recv=90000 send_recv_plain=300000 (each case prints N * 1)",
+        "method: ns/op = median(wall at N ops - wall at 0 ops) / N * 1e6, from interleaved paired rounds (each round runs the N-op sample and then the 0-op sample back to back, so a drifting boot cost cancels inside the pair); N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of every pair; the figure is withheld when the median does not clear the noise band; every case validates its copy round-trip with a bound-variable pattern",
+        "note: the op count is deterministic and contention-immune; the wall-clock rows move with host load",
+        "cases: 4 ok, 0 unsupported (of 4)"
+      ]
+    },
+    {
+      "workload": "foreign",
+      "runtime": "rust",
+      "category": "compute",
+      "description": "real Cowboy/EMQX modules run under each runtime (per-call cost + wall latency)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_bstr_to_lower_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1478.3889530000001,
+            "max": 1718.339434,
+            "mean": 1559.1496193333332,
+            "p50": 1480.7204709999999,
+            "p90": 1670.8156414,
+            "p99": 1713.58705474
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 274079744.0,
+            "max": 274325504.0,
+            "mean": 274206720.0,
+            "p50": 274214912.0,
+            "p90": 274303385.6,
+            "p99": 274323292.16
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 410.610902,
+            "max": 462.669824,
+            "mean": 438.187827,
+            "p50": 441.282755,
+            "p90": 458.39241020000003,
+            "p99": 462.24208262
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_ns_per_call",
+          "unit": "ns",
+          "value": 21355.561020000005
+        },
+        {
+          "name": "case_bstr_to_lower_calls",
+          "unit": "calls",
+          "value": 50000.0
+        },
+        {
+          "name": "case_bstr_capitalize_token_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1329.886437,
+            "max": 1380.677267,
+            "mean": 1357.0149253333332,
+            "p50": 1360.481072,
+            "p90": 1376.638028,
+            "p99": 1380.2733431
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 293572608.0,
+            "max": 293683200.0,
+            "mean": 293614933.3333333,
+            "p50": 293588992.0,
+            "p90": 293664358.4,
+            "p99": 293681315.84
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 388.822559,
+            "max": 434.299534,
+            "mean": 409.17674600000004,
+            "p50": 404.408145,
+            "p90": 428.3212562,
+            "p99": 433.70170622
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_ns_per_call",
+          "unit": "ns",
+          "value": 23526.59695
+        },
+        {
+          "name": "case_bstr_capitalize_token_calls",
+          "unit": "calls",
+          "value": 40000.0
+        },
+        {
+          "name": "case_emqx_base62_encode_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1937.9218790000002,
+            "max": 1992.2789939999998,
+            "mean": 1963.535055333333,
+            "p50": 1960.4042929999998,
+            "p90": 1985.9040537999997,
+            "p99": 1991.6414999799997
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 163471360.0,
+            "max": 163561472.0,
+            "mean": 163509589.33333334,
+            "p50": 163495936.0,
+            "p90": 163548364.8,
+            "p99": 163560161.28
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 376.042279,
+            "max": 406.757298,
+            "mean": 391.0890956666667,
+            "p50": 390.46771,
+            "p90": 403.4993804,
+            "p99": 406.43150624
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_ns_per_call",
+          "unit": "ns",
+          "value": 26031.32666666667
+        },
+        {
+          "name": "case_emqx_base62_encode_calls",
+          "unit": "calls",
+          "value": 60000.0
+        },
+        {
+          "name": "case_emqx_base62_decode_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1765.127653,
+            "max": 2838.3280480000003,
+            "mean": 2280.398329666667,
+            "p50": 2237.739288,
+            "p90": 2718.210296,
+            "p99": 2826.3162728
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 323043328.0,
+            "max": 323137536.0,
+            "mean": 323092480.0,
+            "p50": 323096576.0,
+            "p90": 323129344.0,
+            "p99": 323136716.8
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 443.998481,
+            "max": 570.175772,
+            "mean": 499.3922456666667,
+            "p50": 484.00248400000004,
+            "p90": 552.9411144000001,
+            "p99": 568.4523062400001
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_calls",
+          "unit": "calls",
+          "value": 60000.0
+        }
+      ],
+      "peak_memory_bytes": 323137536,
+      "notes": [
+        "staged 4 foreign case(s) from 2 distinct source file(s)",
+        "case bstr_to_lower: per-call marginal paired median=1067.778 ms min=1039.438 ms max=1255.670 ms noise=\u00b142.017 ms over 3 round(s)",
+        "case bstr_to_lower: N=50000 (rust), sources=cowboy/src/cowboy_bstr.erl",
+        "case bstr_capitalize_token: per-call marginal paired median=941.064 ms min=926.182 ms max=976.269 ms noise=\u00b122.065 ms over 3 round(s)",
+        "case bstr_capitalize_token: N=40000 (rust), sources=cowboy/src/cowboy_bstr.erl",
+        "case emqx_base62_encode: per-call marginal paired median=1561.880 ms min=1553.647 ms max=1601.811 ms noise=\u00b112.206 ms over 3 round(s)",
+        "case emqx_base62_encode: N=60000 (rust), sources=emqx/apps/emqx/src/emqx_base62.erl",
+        "case emqx_base62_decode: marginal below timer resolution: paired median=1753.737 ms min=1194.952 ms max=2394.330 ms noise=\u00b1828.455 ms over 3 round(s); no per-call metric",
+        "case emqx_base62_decode: N=60000 (rust), sources=emqx/apps/emqx/src/emqx_base62.erl",
+        "observed stdout: bstr_to_lower=1500000 bstr_capitalize_token=1200000 emqx_base62_encode=960000 emqx_base62_decode=660000",
+        "caveat: on the Rust runtime this per-call metric is N-DEPENDENT (the measured per-call cost grows with N, super-linearly), so case_<name>_ns_per_call is only comparable across runs that used the SAME N; a recalibrated n_rust is a new baseline, so compare only at matched N. See RESULTS.md 3.4.",
+        "method: per-call cost = median of the paired (wall at N iterations - wall at 0 iterations) differences / N; each round samples the N pass and then the 0 pass back to back so a drifting boot cost cancels inside the pair, N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of both sides",
+        "cases: 4 ok, 0 unsupported (of 4)"
+      ]
+    },
+    {
+      "workload": "gc_bound",
+      "runtime": "rust",
+      "category": "gc",
+      "description": "allocate-and-abandon garbage churn under each runtime (per-op GC cost)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_churn_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 1573.259084,
+            "max": 2082.3000700000002,
+            "mean": 1780.0276890000002,
+            "p50": 1684.523913,
+            "p90": 2002.7448386,
+            "p99": 2074.3445468600003
+          }
+        },
+        {
+          "name": "case_churn_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 3,
+            "min": 463.332366,
+            "max": 2152.5300039999997,
+            "mean": 1050.5118526666665,
+            "p50": 535.673188,
+            "p90": 1829.1586407999998,
+            "p99": 2120.19286768
+          }
+        },
+        {
+          "name": "case_churn_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 3,
+            "min": 118140928.0,
+            "max": 118255616.0,
+            "mean": 118205098.66666667,
+            "p50": 118218752.0,
+            "p90": 118248243.2,
+            "p99": 118254878.72
+          }
+        },
+        {
+          "name": "case_churn_ops",
+          "unit": "ops",
+          "value": 10000.0
+        }
+      ],
+      "peak_memory_bytes": 118255616,
+      "notes": [
+        "staged $TMPDIR/bench-scratch-gc_bound-1058-3-1792363203654742027/bench_gc_bound.beam (embedded source, LEN=256, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "case churn: marginal below timer resolution: paired median=1221.192 ms min=-579.271 ms max=1546.627 ms noise=\u00b1482.490 ms over 3 round(s)",
+        "observed stdout: churn=N*1=10000",
+        "case churn: N=10000 churns (rust), each allocating and abandoning a 256-element list, a 256-byte binary and a 256-element tuple",
+        "method: every round runs the program at N churns and then at 0 churns back to back, and ns/op is the median paired difference (wall@N - wall@0) / N * 1e6 \u2014 never two separate means, whose difference absorbs a drifting boot cost instead of cancelling it. N is per runtime so both marginals are measurable, the fixed process startup (incl. the Rust runtime's code-path resolution) cancels inside every pair, and a figure inside the noise band is withheld rather than published",
+        "note: the op count is deterministic and contention-immune; the wall-clock rows move with host load. Whether a runtime's collector actually runs during the loop is its own admission policy \u2014 this row measures the allocate-and-abandon wall time, and claims no collection count"
+      ]
+    }
+  ]
+}
