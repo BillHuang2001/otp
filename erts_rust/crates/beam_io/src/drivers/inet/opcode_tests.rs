@@ -84,9 +84,9 @@ pub(super) fn loopback_arg(port: u16) -> Vec<u8> {
 /// Every method takes `&mut self` because the registry node needs both the poller and the
 /// registry mutably — exactly the pair `beam_rt` holds.
 pub(super) struct Rig {
-    registry: PortRegistry,
-    poller: Poller,
-    id: PortId,
+    pub(super) registry: PortRegistry,
+    pub(super) poller: Poller,
+    pub(super) id: PortId,
 }
 
 impl Rig {

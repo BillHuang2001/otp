@@ -167,8 +167,9 @@
 //!   stripped.
 //! * `INET_REQ_ACCEPT`(26) takes the four-byte `Timeout` and joins the **multi-operation** accept
 //!   list (`enq_multi_op`, `:12194`/`:12209`), so N pending accepts each get their own id, all
-//!   complete in enqueue order, and `INET_REQ_GETSTATUS` reports the C's
-//!   `INET_F_ACC`/`INET_F_MULTI_CLIENT` bits while the list is non-empty.
+//!   complete in enqueue order, and `INET_REQ_GETSTATUS` reports the C's `INET_F_ACC` bit while an
+//!   accept is queued plus the **sticky** `INET_F_MULTI_CLIENT` bit from the second enqueue until
+//!   the list fully drains.
 //!
 //! The id counter is the C's `NEW_ASYNC_ID` (`op_ref++ & 0xffff`, `:1549`): it starts at `0` and
 //! is taken *before* the capacity check, so a refused enqueue still advances it. A completion is
@@ -1176,6 +1177,12 @@ impl TcpInetDriver {
 
     /// The `listen` verb: turns the socket into a listener.
     ///
+    /// The C does **not** arm accept readiness here: its `sock_select(FD_ACCEPT, 1)` happens only
+    /// on the first `INET_REQ_ACCEPT` whose `sock_accept` answered `ERRNO_BLOCK`
+    /// (`inet_drv.c:12224`), and the disarm on the last completion/timeout. This floor's listener
+    /// is already registered [`Interest::READABLE`] by [`TcpInetDriver::adopt`] (via the `open`
+    /// verb), so the arm/disarm pair in the async queue is the whole rule — nothing to do here.
+    ///
     /// # Errors
     ///
     /// `BeamError::BadArg` for an argument that is not a two-byte backlog; `BeamError::Io`
@@ -1585,8 +1592,9 @@ impl TcpInetDriver {
             // guard, so both faults answer `einval`. A well-formed operand joins the C's
             // `enq_multi_op` list and the reply is the asynchronous id —
             // `[1] ++ <<Id:16/big>>` (`:12209`), with the accepted connection delivered later as
-            // `{inet_async, Port, Id, {ok, Descriptor}}`.
-            Opcode::Accept => self.async_accept(arg),
+            // `{inet_async, Port, Id, {ok, Descriptor}}`. Queueing it also arms the listener's
+            // accept (read) readiness (`sock_select(FD_ACCEPT, 1)`, `:12224`).
+            Opcode::Accept => self.async_accept(ctx, arg),
             // `TCP_REQ_RECV` (`:12268`): the whole asynchronous-receive guard ladder — the
             // connection guard (including the C's one-shot `closed`/`econnreset` reply, modelled
             // by [`PeerClose`]), `active || len != 8 ⇒ einval`, the framing/`Length` rule, the
@@ -1781,10 +1789,11 @@ impl TcpInetDriver {
             },
             Opcode::Gettype => Ok(wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
-            // The descriptor state, including the C's `INET_F_ACC`/`INET_F_MULTI_CLIENT` bits
-            // while accept operations are queued (`:1031`-`:1032`, `:11160`). A listener with one
-            // accept pending is `9 | 0x20` = 41 (`[1,0,0,1,41]`, measured on the oracle) and with
-            // two `9 | 0x120` = 297.
+            // The descriptor state, including the C's `INET_F_ACC`/`INET_F_MULTI_CLIENT` state bits
+            // (`:1031`-`:1032`, `:11160`). A listener with one accept pending is `9 | 0x20` = 41
+            // (`[1,0,0,1,41]`, measured on the oracle) and with two `9 | 0x120` = 297 — and the
+            // multi bit is **sticky**: the C restores `INET_STATE_LISTENING` only once the accept
+            // list drains (`:12607`-`:12611`, `:13536`-`:13540`), so a survivor keeps reporting 297.
             Opcode::Getstatus => Ok(wire::getstatus_reply(
                 self.state.state_code() | self.accept_state_bits(),
             )),
@@ -1947,6 +1956,8 @@ mod active;
 
 #[cfg(test)]
 mod active_tests;
+#[cfg(test)]
+mod accept_tests;
 #[cfg(test)]
 mod fdopen_errno_tests;
 #[cfg(test)]

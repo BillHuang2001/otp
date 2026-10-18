@@ -99,6 +99,7 @@ doctests, 2 doctests `ignore`d). Per file:
 | `abi_busy.rs` | 2 | `inet.rs` | 8 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
 | `abi_failure.rs` | 11 | `active_mode.rs` | 9 |
+| `inet_accept.rs` | 7 | | |
 | `port_task.rs` | 5 | `udp_inet.rs` | 6 |
 | | | `port.rs` | 4 |
 
@@ -236,3 +237,11 @@ rot.
   (`abi_failure.rs`)
 - `support/mod.rs`, `cdriver/mod.rs` → the shared toolchain + fixture helpers
 - `fixtures/` → the C driver objects (see above)
+- **`inet_accept.rs` (7)** — the **TCP accept chain** end to end over a foreign `std::net::TcpStream` peer:
+  two successive loopback connections accepted through the multi-op list and adopted (`from_socket`), the
+  completion arriving as `InetAsyncResult::Accepted { fd }`, the sticky `INET_F_MULTI_CLIENT` `GETSTATUS`
+  bits, the `[0]einval` ladder, the per-port accept timer (`[500, 50]` reports id 0 then id 1), and the
+  arm/disarm readiness cycle (`poll` + `handle_events` alone completes a connection that arrived while
+  nothing was queued). Detail: `src/drivers/inet/accept_tests.rs` rustdoc; the runtime's obligations
+  (second port, `{inet_async, Listener, Id, {ok, NewPort}}`, `tcp_inet_copy` inheritance) are the crate
+  doc's *Handoffs* (0).
