@@ -168,7 +168,7 @@ Until that adoption lands no end-to-end figure may be claimed for off-heap reten
 
 ## Test Strategy (implementation side)
 - **Every integration test file under `tests/` carries its own `//!` module doc stating the contract it pins and why** — read the file rather than looking for a per-file inventory here.
-- In-module `#[cfg(test)] mod tests` live in `space`, `policy`, `mso`, `heap_info`, `config`, `selection`, `any_collector`, `collector`, `bounds`, `live`, `bin_vheap`, `immix_collector` (+ `src/immix_collector/{tests,grow_tests}.rs`), `src/nursery/tests.rs` and `src/immix/tests.rs`.
+- In-module `#[cfg(test)] mod tests` live in `space`, `policy`, `mso`, `heap_info`, `footprint`, `config`, `selection`, `any_collector`, `collector`, `bounds`, `live`, `bin_vheap`, `immix_collector` (+ `src/immix_collector/{tests,grow_tests}.rs`), `src/nursery/tests.rs` and `src/immix/tests.rs`.
   `copy.rs` and `offheap.rs` carry none: the copier is pinned by `tests/copy_correctness.rs` (the collector driver by `tests/generations.rs` / `tests/gc_pressure*.rs`) and the off-heap reclaim by `tests/offheap_retention.rs`, with the slot-stability and liveness files beside it.
 - The suite is organised around six invariants:
   - **Exact copy correctness** — structure preserved, roots relocated, exactly the live size retained, off-from-space refs verbatim, per shape (cons/tuples, flat + HAMT maps, the refc pair, all three fun kinds, bignums, a native-record instance, an `ErlSubBits` match context, external ports/refs, a HAMT head node) against each shape's independently measured footprint; `memory_overhead.rs` cross-checks `object_words` against the bump allocator's real consumption.
@@ -202,13 +202,15 @@ Until that adoption lands no end-to-end figure may be claimed for off-heap reten
 - `immix_collector/{tests,grow_tests}.rs` → `GenImmixCollector`'s in-module promotion + `grow_major` tests
 - `any_collector.rs` → `AnyCollector`: the `Copying`/`Immix` dispatch over one API — the drop-in for the concrete `Collector` incl. the kind-pinned `collect_kind`, the mature geometry accessors and the whole-heap enumeration the off-heap seam walks
 - `policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`, `from_spawn_opts`/`fullsweep_due`/`mature_after_fullsweep`/`young_after_collection`/`young_after_fullsweep`, `unbounded`
-- `heap_info.rs` → `HeapInfo`, `HeapObservable`, `GARBAGE_COLLECTION_KEYS`
-- `mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` — the **slot-stable** off-heap list over refcounted large objects **and** refc binaries
+- `heap_info.rs` → `HeapInfo`, `HeapObservable` (the **capacity** pair `heap_size_words`/`total_heap_size_words` and the **occupancy** pair `heap_used_words`/`total_heap_used_words`, every one of them chain-summed over the nursery), `GARBAGE_COLLECTION_KEYS`
+- `footprint.rs` → `HeapFootprint` (`of(&collector, &off_heap)`, `capacity_words`/`used_words`/`capacity_bytes`/`used_bytes`, `heap_bytes` = the allocator-visible subset, `total_bytes` = that plus the roster array) and `WORD_BYTES` — the one-call per-process account of heap + off-heap, with the three-way split (reserved capacity / live payload, already counted by `erlang:memory(binary)` / the roster's slot array, counted by nothing else) documented in its `//!` doc
+- `mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` — the **slot-stable** off-heap list over refcounted large objects **and** refc binaries, plus its retained-array accessors `slot_count`/`slot_bytes` (live payloads stay `overhead_bytes`/`len`)
 - `offheap.rs` → the off-heap reclaim half (the C `sweep_off_heap`): `for_each_reachable_binary_payload` (the read-only walk over reachable `BinRef` payload pointers) and `sweep_unreachable_binaries` (the slot-stable roster sweep, MSO-preserving, release-nothing-on-error)
 - `bin_vheap.rs` → the trigger half (the C `bin_vheap_sz`): `BinVheap::{new, limit_words, triggered, triggered_for, record_collection}` plus the private `do_next_vheap_size`/`next_vheap_size` grow-at-1.618 / halve / hold rule with its non-stagnation guard
 - `stats.rs` → `GcStats`; `error.rs` → `pub(crate)` GC allocation-failure constructors
 - `tests/` → the integration suite; each file's `//!` module doc states the contract it pins
   - `tests/offheap_retention.rs` → the off-heap roster liveness contract: flat-in-N with the trigger + the reachability sweep, one-payload-per-call without the sweep, the walk/sweep agreement, the MSO exemption and slot stability under reclaim
+  - `tests/heap_accounting.rs` → the memory-accounting contract: the chain-summed young occupancy against the current-space read (2 growths, both `AnyCollector` strategies) and the byte figures' honesty invariant (`heap_bytes() <= beam_alloc`'s summed `live_bytes`, band `[0.90, 1.00]`, observed `0.993889`). The two allocating tests serialise on a `SERIAL` mutex because the allocator registry is process-global
 - `../../../erts/emulator/beam/{erl_gc.c,erl_gc.h,copy.c}` → the read-only ground truth (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`/`adjust_after_fullsweep`/`sweep_off_heap`/`do_next_vheap_size`, the `IS_MOVED_*`/`follow_moved` macros, `ERTS_IS_GC_DESIRED_INTERNAL`, `size_object_x`/`copy_struct_x`)
 
 ## See Also
