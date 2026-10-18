@@ -195,6 +195,29 @@ impl Rig {
         got
     }
 
+    /// **One** readiness round, taken as soon as the poller reports an event for this port.
+    ///
+    /// Nothing is drained before it — the poll that observes the edge and the `handle_events`
+    /// that runs the round are one step — so everything the round delivers had arrived by the
+    /// time it ran. That is what makes a "two arrivals, one drain" assertion possible without a
+    /// fixed sleep: the wait is the readiness **condition** under [`GUARD`].
+    fn round_when_ready(&mut self) -> Vec<ActiveInput> {
+        let deadline = Instant::now() + GUARD;
+        loop {
+            let events = self.poller.poll(Some(POLL_WAIT)).expect("the poll runs");
+            if !events.is_empty() {
+                self.registry
+                    .handle_events(&mut self.poller, &events)
+                    .expect("the round runs");
+                return self.registry.take_active_inputs();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the socket never reported readiness"
+            );
+        }
+    }
+
     /// How many bytes sit in the port's **input queue** (the passive channel).
     fn input_len(&mut self) -> usize {
         self.registry.get(self.id).expect("a live port").input_len()
@@ -384,6 +407,73 @@ fn active_n_delivers_n_messages_then_one_passive_event() {
     send(&mut peer, &[0, 1, b'c']);
     let extra = port.quiet(3);
     assert!(extra.is_empty(), "the counter is spent: {extra:?}");
+}
+
+/// Two whole frames that are **already in the socket** when the readiness edge is reported are
+/// both delivered by that one round, in arrival order, into a single drain.
+///
+/// This is `tcp_deliver`'s loop (`inet_drv.c:13067`-`:13130`): as long as a complete packet sits in
+/// the driver's buffer it is delivered, and the loop only reads again when the buffer falls short —
+/// so a callback serves **every** buffered frame, not one per callback. `{active, true}` never
+/// spends its grant, so the burst is the only thing bounding the round.
+#[test]
+fn two_frames_buffered_before_a_round_are_both_delivered_by_it_in_arrival_order() {
+    let Link { mut port, mut peer } = link();
+
+    assert_eq!(port.setopts(&[packet(2), active_true()]), ctl_ok());
+
+    // Two whole frames in **one** write. On loopback the write's bytes are in this socket's
+    // receive queue by the time `write_all` returns, so the first round that runs sees both.
+    send(&mut peer, &[0, 1, b'a', 0, 1, b'b']);
+
+    let delivered = port.round_when_ready();
+    assert_eq!(
+        delivered.len(),
+        2,
+        "one round delivers every buffered frame: {delivered:?}"
+    );
+    assert_eq!(passive_count(&delivered), 0, "`{{active,true}}` never spends its grant");
+    assert!(
+        delivered.iter().all(|input| input.port == port.id),
+        "each delivery names the delivering port"
+    );
+    let reads = payloads(&delivered);
+    assert_eq!(reads[0].body.as_deref(), Some(&b"a"[..]), "the first frame, first");
+    assert_eq!(reads[1].body.as_deref(), Some(&b"b"[..]), "the second frame, second");
+    assert!(
+        reads.iter().all(|read| read.header.is_empty()),
+        "a framing header is not a `{{header, N}}` report header"
+    );
+    assert_eq!(port.input_len(), 0, "an active port never fills the input queue");
+}
+
+/// A grant spent mid-burst **ends** the burst there (`if (! desc->inet.active)`, `inet_drv.c:13108`):
+/// with `{active, 1}` and two frames already buffered, exactly one message is delivered, nothing
+/// announces the flip (unlike `{active, N}`), and the second frame is still there — the next
+/// passive `recv` takes it off the driver's buffer, so it was never consumed, only held.
+#[test]
+fn a_spent_grant_ends_the_burst_and_leaves_the_rest_for_the_passive_path() {
+    let Link { mut port, mut peer } = link();
+
+    assert_eq!(port.setopts(&[packet(2), active_multi(1)]), ctl_ok());
+    send(&mut peer, &[0, 1, b'a', 0, 1, b'b']);
+
+    let delivered = port.until(2);
+    assert_eq!(delivered.len(), 2, "one data message and one passive event");
+    assert_eq!(payloads(&delivered[..1])[0].body.as_deref(), Some(&b"a"[..]));
+    assert!(
+        matches!(delivered[1].event, ActiveInputEvent::Passive),
+        "the credit was spent on the first frame and reported after it"
+    );
+    // The burst stopped with the second frame still buffered: no further delivery, no second
+    // passive event.
+    let extra = port.quiet(3);
+    assert!(extra.is_empty(), "the burst ended at the flip: {extra:?}");
+
+    // ... and the frame is not lost — the passive `recv` verb decodes it out of the driver's own
+    // buffer (`pending_input`) and hands the payload to the port input queue.
+    assert_eq!(port.named("recv", &[]), ctl_ok(), "the passive recv succeeds");
+    assert_eq!(port.take_input(1), b"b".to_vec(), "the frame the burst left behind");
 }
 
 /// `{active, false}`: the bytes take the **passive** path into the port input queue, so the
