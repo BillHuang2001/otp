@@ -71,7 +71,7 @@ use std::sync::{Mutex, MutexGuard};
 use beam_alloc::RefcBinary;
 use beam_gc::prelude::{
     for_each_reachable_binary_payload, sweep_unreachable_binaries, AnyCollector, BinVheap,
-    HeapObservable, HeapPolicy, OffHeap,
+    HeapObservable, HeapPolicy, Mso, OffHeap,
 };
 use beam_term::prelude::{make_small, write_refc_binary, Eterm, ERL_REFC_BITS_SIZE};
 
@@ -692,4 +692,67 @@ fn the_walk_and_the_sweep_agree_on_which_payloads_are_live() {
         0,
         "and nothing becomes garbage merely by moving"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The roster side of the same seam: what a sweep keeps and what it releases
+// ---------------------------------------------------------------------------
+
+/// A sweep is **binary-only**: an [`Mso`](beam_gc::prelude::Mso) entry is kept whatever the walk
+/// reports, because an MSO has no on-heap reference *term* — its safe reference is the slot index
+/// the caller stores in an ordinary term — so this seam must not guess its liveness from a
+/// `BinRef` it will never see.
+#[test]
+fn an_mso_entry_survives_a_binary_sweep() {
+    let _guard = serial();
+
+    let policy = bounded_policy(HeapPolicy::default().min_bin_vheap_words);
+    let mut collector = AnyCollector::new(policy).expect("collector");
+    let payload = RefcBinary::new(b"a reachable off-heap binary").expect("payload");
+
+    let mut roster = OffHeap::new();
+    roster.push(Mso::new(7u32, 128));
+    roster.push(payload.clone());
+    let roots = vec![write_refc(&mut collector, &payload)];
+
+    let released =
+        sweep_unreachable_binaries(&mut roster, &collector, &roots).expect("the sweep completes");
+
+    assert_eq!(
+        released, 0,
+        "the only binary is still named by a live BinRef"
+    );
+    assert_eq!(roster.len(), 2, "the MSO was kept");
+    assert!(
+        roster.get(0).is_some_and(|entry| entry.as_mso().is_some()),
+        "slot 0 still holds the MSO"
+    );
+}
+
+/// An unreachable binary is released **at its own slot**, with exactly one refcount decrement, so
+/// dropping the roster's reference is what frees the off-heap payload.
+#[test]
+fn an_unreachable_binary_is_released_at_its_own_slot() {
+    let _guard = serial();
+
+    let policy = bounded_policy(HeapPolicy::default().min_bin_vheap_words);
+    let collector = AnyCollector::new(policy).expect("collector");
+    let payload = RefcBinary::new(b"nothing will name this one").expect("payload");
+
+    let mut roster = OffHeap::new();
+    let slot = roster.insert(payload.clone());
+    // The root names no off-heap binary at all, so the entry is unreachable from the start.
+    let roots = vec![make_small(1)];
+
+    let released =
+        sweep_unreachable_binaries(&mut roster, &collector, &roots).expect("the sweep completes");
+
+    assert_eq!(released, 1, "the unreferenced payload is released");
+    assert_eq!(roster.len(), 0);
+    assert!(
+        roster.get(slot).is_none(),
+        "the released slot answers None (slot stability)"
+    );
+    // The roster's reference is gone; this test's own handle is the last one.
+    assert_eq!(payload.refcount(), 1);
 }
