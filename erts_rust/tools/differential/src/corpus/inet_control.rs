@@ -83,49 +83,37 @@
 //! The datagram **data** path is one of them, which is why this group pins the framing *mode*
 //! rather than the frame *bytes* (`erlang:decode_packet/3` — the same framing algorithm — is
 //! already pinned byte-exactly by [`super::decode_packet`]). Each item below is a plain Erlang
-//! value/reason, so pinning it would be a `mismatch`; it is reported to the runtime owners
-//! instead. Verified in this environment (oracle OTP 29.1.1 / `erts-17.1`; the built
-//! `beam_rt`) by running the *same* expression under both runtimes:
+//! value/reason (or a typed capability gap), so pinning it would be a `mismatch`; it is
+//! reported to the runtime owners instead. Verified in this environment (oracle OTP 29.1.1 /
+//! `erts-17.1`; the built `beam_rt`) by running the *same* expression under both runtimes:
 //!
-//! * **a datagram send is refused (`beam_rt`).** `gen_udp:send(S, {127,0,0,1}, P, <<"hi">>)`
-//!   answers `ok` under the oracle and `{error, einval}` under `beam_rt` — `prim_inet:sendto/4`
-//!   wraps its `port_command/2` in a `catch` and maps the raise to `einval`, so the send verb
-//!   never reaches the driver. A *successful* send therefore has no pinnable shape, and neither
-//!   has the length header it would write. Owner: `beam_rt` (the built-in-driver
-//!   `port_command` bridge).
+//! * **a datagram send never gets its driver reply (`beam_rt`).** `gen_udp:send(S,
+//!   {127,0,0,1}, P, <<"hi">>)` answers `ok` under the oracle; here `prim_inet:do_sendto/4`'s
+//!   `erlang:port_command/2` answers `true` and the following
+//!   `receive {inet_reply, S, Reply, Ref}` never completes — the `-eval` route exits `3` with
+//!   `beam_rt: unsupported: opcode: run: process blocked (no message available)` and the
+//!   compiled-module route (`beam_rt run`) hangs to its 60 s deadline. A *successful* send
+//!   therefore has no pinnable shape, and neither has the length header it would write. Owner:
+//!   `beam_rt` (the port-task reply bridge).
 //! * **an incoming datagram is never delivered (`beam_rt`).** With a `{active, true}` socket,
 //!   a datagram injected from outside the VM (`os:cmd("printf abc > /dev/udp/127.0.0.1/P")`)
-//!   arrives as `{udp, S, {127,0,0,1}, _, <<"abc">>}` under the oracle and as `none` under
-//!   `beam_rt` within a 2 s guard; `gen_udp:recv(S, 0, 1000)` likewise answers
-//!   `{ok, {{127,0,0,1}, PeerPort, <<"hello">>}}` there and raises
-//!   `error:{case_clause, {ok, []}}` (inside `prim_inet`) here. So no read-path reassembly or
-//!   truncation refusal can be pinned. Owner: `beam_rt` / `beam_io`.
-//! * **`gen_tcp:connect/3` is `badarg` (`beam_rt`).** `gen_tcp:connect({127,0,0,1}, P, [])`
-//!   against a live listener answers `{ok, Socket}` under the oracle and raises
-//!   `exit:badarg` under `beam_rt` — with **every** option list tried (`[]`, `[binary]`,
-//!   `[{active, false}]`, `[{packet, 0}]`). A refused connect (`{error, econnrefused}`) and
-//!   every connected-socket row (send/recv/close on a real connection) are unreachable for the
-//!   same reason. Owner: `beam_rt` / `beam_io` (the `prim_inet` open path).
-//! * **`gen_tcp:listen(0, [binary])` is `{error, einval}` (`beam_rt`)** while
-//!   `[{active, false}]`, `[{packet, 4}]` and `[]` all work — the list/binary *stream mode*
-//!   option is the one the driver refuses, and the same `mode` gap makes
-//!   `inet:getopts(S, [mode])` answer `{error, einval}` on a datagram socket. Owner:
-//!   `beam_io` (the `INET_REQ_SETOPT` `mode` arm).
-//! * **`gen_tcp:send/2` on a listening socket hits the statistics gap (`beam_rt`).** The oracle
-//!   answers `{error, enotconn}`; `beam_rt` reports the typed capability gap
-//!   `beam_rt: unsupported: the C's inet statistics counters (inet_fill_stat) are not tracked
-//!   by this driver` (exit 3), because `prim_inet:close_pend_loop/3` polls
-//!   `getstat(S, [send_pend])`. `prim_inet:send/2` on a datagram socket is the same gap
-//!   (oracle `{error, eafnosupport}`). Owner: `beam_io` (`wire::getstat_reply`).
-//! * **`gen_udp:recv/3`, `gen_udp:open/1` with a negative port, and `gen_tcp:accept/2`** all
-//!   fail inside `prim_inet` on `beam_rt` (`{case_clause, {ok, []}}`, `error:undef`, and a
-//!   `prim_inet:async_accept/2` `case_clause` respectively) where the oracle answers
-//!   `{error, einval}`, opens a port, and answers `{error, timeout}`. Owner: `beam_rt`
-//!   (the `inet:getopts/2` reply shape those callers pattern-match on).
-//! * **`erlang:port_command/2` on a socket-less driver port** is measured and unpinnable rather than
-//!   divergent: the oracle answers `true` and then kills the port (`driver_failure_posix(EINVAL)`,
-//!   a following `port_info/2` is `undefined`), `beam_rt` raises `error:badarg` and leaves the port
-//!   alive. Owner: `beam_rt` / `beam_io` (the port-command bridge).//!
+//!   arrives as `{udp, S, {127,0,0,1}, _, <<"abc">>}` under the oracle and as nothing at all
+//!   under `beam_rt` within a 2 s guard; `gen_udp:recv(S, 0, 300)` likewise answers
+//!   `{error, einval}` there and raises `{case_clause, {ok, …}}` (inside
+//!   `prim_inet:recvfrom0/3`) here. So no read-path reassembly or truncation refusal can be
+//!   pinned. Owner: `beam_rt` / `beam_io`.
+//! * **`gen_tcp:accept/2` on a listening socket (`beam_rt`).** The oracle answers
+//!   `{error, timeout}` for a short accept timeout; here `prim_inet:async_accept/2` fails with a
+//!   `{case_clause, {ok, []}}` — the same `inet:getopts/2` reply shape the other `prim_inet`
+//!   callers pattern-match on. Owner: `beam_rt` (the `inet:getopts/2` reply shape).
+//! * **`gen_tcp:send/2` on a listening socket (`beam_io`).** The oracle answers
+//!   `{error, enotconn}`; `beam_rt` answers `{error, einval}`.
+//! * **`erlang:port_command/2` on a socket-less driver port** is measured and unpinnable rather
+//!   than divergent: the oracle answers `true` and then kills the port
+//!   (`driver_failure_posix(EINVAL)`, a following `port_info/2` is `undefined`), `beam_rt` raises
+//!   `error:badarg` and leaves the port alive. Owner: `beam_rt` / `beam_io` (the port-command
+//!   bridge).
+//!
 //! The structural half of A.4 (that a C translation unit referencing the `driver_*` /
 //! `erl_drv_*` declarations still compiles against the frozen headers) is asserted in
 //! `tests/abi.rs`.
@@ -246,6 +234,22 @@ pub(crate) fn group() -> Vec<Case> {
             "ok {{error,eaddrinuse},{error,enotconn},{error,enotconn},{error,einval},ok,\
              {error,closed},badarg,badarg,badarg,badarg}",
         ),
+        // --- the stream listener's address / option view ---------------------------------------
+        case(
+            "inet_control/tcp_listen_sockname_and_option_shape",
+            "a loopback gen_tcp:listen(0,[{ip,{127,0,0,1}}]) listener is a live port whose inet:port/1 answers an integer, whose inet:sockname/1 answers the loopback address with the ephemeral port reduced to is_integer/1, whose inet:getopts/2 echoes the {active,true}/{packet,0} defaults, and whose unknown-option query is {error,einval}",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]), \
+             {ok, Pn} = inet:port(L), \
+             Sock = case inet:sockname(L) of {ok, {IP, N}} -> {ok, {IP, is_integer(N)}}; \
+                                            Other -> Other end, \
+             Opts = inet:getopts(L, [active, packet]), \
+             Bad = inet:getopts(L, [bogus]), \
+             ok = gen_tcp:close(L), \
+             {is_port(L), is_integer(Pn), Sock, Opts, Bad} end",
+            "ok {true,true,{ok,{{127,0,0,1},true}},{ok,[{active,true},{packet,0}]},\
+             {error,einval}}",
+        ),
         // --- the statically linked driver-name namespace --------------------------------------
         case(
             "inet_control/static_spawn_namespace",
@@ -330,7 +334,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_inet_control_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 6, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 7, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -374,27 +378,27 @@ mod tests {
         );
     }
 
-    /// The shapes that were **measured** to diverge stay out of the group. The datagram *data*
-    /// path is unreachable from Erlang on `beam_rt` (a send is refused with `{error, einval}`
-    /// and an incoming datagram is never delivered), `gen_tcp:connect/3` is `badarg`, and every
-    /// route that goes through the driver's statistics counters or `prim_inet`'s ref-header
-    /// send form is a typed capability gap — pinning any of them would commit a `mismatch`.
-    /// See the module docs for the exact pairs of observations.
+    /// The shapes that were **measured** to diverge stay out of the group: the datagram *data*
+    /// path is unreachable from Erlang on `beam_rt` (a send never receives its `inet_reply` and
+    /// an incoming datagram is never delivered), `gen_tcp:accept/2` fails inside `prim_inet`, and
+    /// `port_command/2` on a socket-less port has no shared observable — pinning any of them
+    /// would commit a `mismatch`. See the module docs for the exact pairs of observations.
+    ///
+    /// The option/address surface of both drivers (including `inet:getstat/1`,
+    /// `gen_tcp:connect/3`, `gen_tcp:listen/2` and the `{mode, list|binary}` store) is served,
+    /// so those verbs are free to appear in a row.
     #[test]
     fn no_case_pins_a_measured_divergence() {
         for case in group() {
             let expr = case.expr().expect("eval case");
             for forbidden in [
-                // The send verb family: refused before it reaches the driver, and its
-                // closing path polls the untracked statistics counters.
+                // The send verb family: its `inet_reply` never reaches the owner, and its
+                // closing path polls the driver's counters.
                 "port_command",
                 "prim_inet",
                 // The only route to a datagram injected from outside the VM.
                 "os:cmd",
-                // The typed statistics gap (`INET_REQ_GETSTAT` with a counter list).
-                "inet:getstat",
-                // A stream send/connect: enotconn under the oracle, the statistics gap or
-                // `badarg` here.
+                // A stream send on a listening socket: enotconn under the oracle, einval here.
                 "gen_tcp:send",
                 "ok = gen_udp:send",
             ] {
@@ -404,19 +408,8 @@ mod tests {
                     case.id
                 );
             }
-            // `gen_tcp:connect/3` is only pinnable on its option-validation refusal: against a
-            // live endpoint the oracle answers `{ok, Socket}` and `beam_rt` raises `badarg`.
-            if expr.contains("gen_tcp:connect") {
-                assert!(
-                    expr.contains("gen_tcp:connect({127, 0, 0, 1}, 9, [bogus])"),
-                    "case {} uses gen_tcp:connect/3 for something other than the \
-                     unknown-option refusal, a measured divergence (see the module docs)",
-                    case.id
-                );
-            }
         }
     }
-
     /// The probe wrapper binds `V`, `C`, `R` and `X`, so an expression that binds one of those
     /// names makes the **oracle** fail to compile the wrapped expression — a guaranteed, silent
     /// false mismatch. Guard the group against a future edit reintroducing one.
