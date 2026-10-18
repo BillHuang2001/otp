@@ -2432,7 +2432,7 @@ fn hook_rosters() -> [HookRoster; 13] {
                 ("erlang", "port_info", 3),
                 ("erlang", "list_to_port", 1),
                 ("erlang", "port_to_list", 1),
-                ("erts_internal", "port_close", 1),
+                ("erts_internal", "port_close", 2),
             ],
         },
         HookRoster {
