@@ -186,9 +186,13 @@ impl<'a> DeflateState<'a> {
                 xbits = u32::from(extra[n as usize - base]);
             }
             let f = u64::from(self.tree(kind)[n as usize].freq);
-            self.opt_len += f * u64::from(bits as u32 + xbits);
+            self.opt_len = self
+                .opt_len
+                .wrapping_add(f.wrapping_mul(u64::from(bits as u32 + xbits)));
             if let Some(stree) = stree {
-                self.static_len += f * u64::from(u32::from(stree[n as usize].1) + xbits);
+                self.static_len = self
+                    .static_len
+                    .wrapping_add(f.wrapping_mul(u64::from(u32::from(stree[n as usize].1) + xbits)));
             }
         }
         if overflow == 0 {
@@ -222,10 +226,12 @@ impl<'a> DeflateState<'a> {
                     continue;
                 }
                 if i32::from(self.tree(kind)[m as usize].len) != bits {
+                    // `s->opt_len += ((ulg)bits - tree[m].Len) * tree[m].Freq;` — the
+                    // unsigned difference wraps when `bits < Len`, which modulo 2^64 is
+                    // the same as the signed difference the `i64` here computes.
                     let delta = i64::from(bits) - i64::from(self.tree(kind)[m as usize].len);
-                    self.opt_len =
-                        (self.opt_len as i64 + delta * i64::from(self.tree(kind)[m as usize].freq))
-                            as u64;
+                    let adj = (delta * i64::from(self.tree(kind)[m as usize].freq)) as u64;
+                    self.opt_len = self.opt_len.wrapping_add(adj);
                     self.tree_mut(kind)[m as usize].len = bits as u16;
                 }
                 n -= 1;
@@ -288,9 +294,15 @@ impl<'a> DeflateState<'a> {
             self.heap[self.heap_len as usize] = node;
             self.tree_mut(kind)[node as usize].freq = 1;
             self.depth[node as usize] = 0;
-            self.opt_len -= 1;
+            // `s->opt_len--; if (stree) s->static_len -= stree[node].Len;` — `opt_len`
+            // and `static_len` are `ulg` (`deflate.h:256`), so both wrap modulo 2^64.
+            // The arithmetic is a ring throughout (`+=`/`-=` and a multiply), and
+            // `_tr_flush_block` only ever shifts the wrapped value, so the wrap is
+            // reproduced rather than "fixed": a small block can drive `opt_len` below
+            // zero here, and the C's final `(opt_len+10)>>3` sees the wrapped total.
+            self.opt_len = self.opt_len.wrapping_sub(1);
             if let Some(stree) = stree {
-                self.static_len -= u64::from(stree[node as usize].1);
+                self.static_len = self.static_len.wrapping_sub(u64::from(stree[node as usize].1));
             }
         }
         self.set_max_code(kind, max_code);
@@ -535,8 +547,9 @@ impl<'a> DeflateState<'a> {
         self.build_tree(TreeKind::Dist);
         let max_blindex = self.build_bl_tree();
 
-        opt_lenb = (self.opt_len + 3 + 7) >> 3;
-        static_lenb = (self.static_len + 3 + 7) >> 3;
+        // `opt_lenb = (s->opt_len+3+7)>>3;` — on the wrapped `ulg` totals (`trees.c:1027`).
+        opt_lenb = self.opt_len.wrapping_add(3 + 7) >> 3;
+        static_lenb = self.static_len.wrapping_add(3 + 7) >> 3;
 
         if static_lenb <= opt_lenb {
             opt_lenb = static_lenb;
@@ -545,10 +558,13 @@ impl<'a> DeflateState<'a> {
         if stored_len + 4 <= opt_lenb && buf.is_some() {
             self.stored_block(buf, stored_len, last);
         } else if static_lenb == opt_lenb {
-            self.send_bits(STATIC_TREES + u32::from(last), 3);
+            // `send_bits(s, (STATIC_TREES<<1)+last, 3)` — the block type sits one bit
+            // above `BFINAL`, so the `<<1` is not decoration: `STATIC_TREES` alone would
+            // clear `BFINAL` and leave the stream unterminated.
+            self.send_bits((STATIC_TREES << 1) + u32::from(last), 3);
             self.compress_block(false);
         } else {
-            self.send_bits(DYN_TREES + u32::from(last), 3);
+            self.send_bits((DYN_TREES << 1) + u32::from(last), 3);
             let (lcodes, dcodes) = (self.lit_max_code + 1, self.dist_max_code + 1);
             self.send_all_trees(lcodes, dcodes, max_blindex + 1);
             self.compress_block(true);
@@ -585,33 +601,59 @@ impl<'a> DeflateState<'a> {
         self.dyn_dtree[d_code(dist)].freq += 1;
         self.sym_next == self.sym_end
     }
+}
 
-    /// The symbol buffer's capacity in symbols — `lit_bufsize`. Exposed so the tests can
-    /// state the block-splitting threshold instead of hard-coding it.
-    #[cfg(test)]
-    pub fn block_symbol_capacity(&self) -> usize {
-        super::state::LIT_BUFSIZE
-    }
+#[cfg(test)]
+mod tests {
+    use super::super::state::{LENGTH_CODES, MAX_MATCH, MIN_MATCH};
+    use super::*;
 
-    /// The length-tree slot of a match length — `_length_code[len] + LITERALS + 1`.
-    /// Exposed so the tests can pin the code tables against the C's.
-    #[cfg(test)]
-    pub fn length_code_slot(len: u32) -> usize {
-        usize::from(LENGTH_CODE[len as usize]) + LITERALS + 1
-    }
+    /// The generated tables must be RFC 1951's: every match length and every distance has
+    /// to fall inside the `base`/`extra_bits` bracket of the code the table maps it to.
+    /// One wrong row changes the bits of every match that reaches it — and, because
+    /// `sym_buf` stores `length - MIN_MATCH` and `distance - 1`, the indices are easy to
+    /// get off by one.
+    ///
+    /// A code with no extra bits sends nothing but itself, so its `base` is the whole
+    /// bracket; the reserved code 285 (`_length_code`'s last entry, `extra_lbits` 0) is the
+    /// one row whose unused `base_length` is 0, and the C never reads it.
+    #[test]
+    fn the_length_and_distance_tables_cover_their_whole_ranges() {
+        let last_length_code = LENGTH_CODES - 1;
+        for len in MIN_MATCH..=MAX_MATCH {
+            let value = len - MIN_MATCH;
+            let code = usize::from(LENGTH_CODE[value as usize]);
+            assert!(code < LENGTH_CODES, "length {len} -> code {code}");
+            let (base, extra) = (u32::from(BASE_LENGTH[code]), EXTRA_LBITS[code]);
+            if extra == 0 {
+                assert!(
+                    base == value || code == last_length_code,
+                    "length {len} -> code {code} with no extra bits, but base {base}"
+                );
+                continue;
+            }
+            let span = 1u32 << extra;
+            assert!(
+                (base..base + span).contains(&value),
+                "length {len} -> code {code}, which covers {base}..{}",
+                base + span
+            );
+        }
+        assert_eq!(
+            usize::from(LENGTH_CODE[(MAX_MATCH - MIN_MATCH) as usize]),
+            last_length_code,
+            "MAX_MATCH is the reserved code"
+        );
 
-    /// The number of length codes. Exposed for the same reason as
-    /// [`Self::length_code_slot`].
-    #[cfg(test)]
-    pub fn length_codes() -> usize {
-        super::state::LENGTH_CODES
-    }
-
-    /// A tree's `(code, len)` pair. Exposed so the tests can compare a built tree against
-    /// the C's static tables.
-    #[cfg(test)]
-    pub fn code_len(&self, kind: TreeKind, c: usize) -> (u16, u16) {
-        let e = self.tree(kind)[c];
-        (e.code, e.len)
+        for dist in 0..=32767u32 {
+            let code = d_code(dist);
+            let (base, extra) = (u32::from(BASE_DIST[code]), EXTRA_DBITS[code]);
+            let span = 1u32 << extra;
+            assert!(
+                (base..base + span).contains(&dist),
+                "distance-1 {dist} -> code {code}, which covers {base}..{}",
+                base + span
+            );
+        }
     }
 }
