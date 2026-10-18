@@ -26,7 +26,7 @@
 //! the declared surface.
 //!
 //! Everything here is *derived from the code*, never restated: the union is built by
-//! iterating the 13 public tables (`beam_bifs::<NAME>_BIFS`), the declared sets come
+//! iterating the 14 public tables (`beam_bifs::<NAME>_BIFS`), the declared sets come
 //! from [`bif_tab::read_real_bif_tab`], and the registry from
 //! [`default_registry`]. The numeric pins below are therefore *witnesses* of the
 //! partition the code produces, and a failing count names the direction that drifted.
@@ -37,9 +37,9 @@
 //! |---|---|---|
 //! | declared (`bif.tab`) | 556 | `bif 476 + ubif 73 + hbif 7` |
 //! | registry | 648 | 556 declared + 92 stdlib fast paths |
-//! | seam union | 241 | the 13 tables, deduped (`245 raw − 4 shared`) |
-//! | declared seam-backed | 211 | union members the table declares |
-//! | declared in-crate | 345 | `556 − 211`, no table lists them |
+//! | seam union | 242 | the 14 tables, deduped (`246 raw − 4 shared`) |
+//! | declared seam-backed | 212 | union members the table declares |
+//! | declared in-crate | 344 | `556 − 212`, no table lists them |
 //! | undeclared seam members | 30 | the union members registered as stdlib fast paths |
 //!
 //! "Adopted" is *not* the same as "registered": a union member returns the typed
@@ -51,18 +51,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use beam_bifs::bif_tab::{self, BifKind, BifTab, Census};
 use beam_bifs::default_registry;
 use beam_bifs::{
-    needs_dict_hook, needs_fun_caller, needs_local_fun_identity, needs_local_node,
-    needs_memory_hook, needs_module_info, needs_nif_loader, needs_persistent_term, needs_port_hook,
-    needs_process_hook, needs_record_source, needs_runtime_hooks, needs_send_hook, DICT_HOOK_BIFS,
-    FUN_CALLER_BIFS, LOCAL_FUN_IDENTITY_BIFS, LOCAL_NODE_BIFS, MEMORY_HOOK_BIFS, MODULE_INFO_BIFS,
-    NIF_LOADER_BIFS, PERSISTENT_TERM_BIFS, PORT_HOOK_BIFS, PROCESS_HOOK_BIFS, RECORD_SOURCE_BIFS,
+    needs_dict_hook, needs_export_gate, needs_fun_caller, needs_local_fun_identity,
+    needs_local_node, needs_memory_hook, needs_module_info, needs_nif_loader,
+    needs_persistent_term, needs_port_hook, needs_process_hook, needs_record_source,
+    needs_runtime_hooks, needs_send_hook, DICT_HOOK_BIFS, EXPORT_GATE_BIFS, FUN_CALLER_BIFS,
+    LOCAL_FUN_IDENTITY_BIFS, LOCAL_NODE_BIFS, MEMORY_HOOK_BIFS, MODULE_INFO_BIFS, NIF_LOADER_BIFS,
+    PERSISTENT_TERM_BIFS, PORT_HOOK_BIFS, PROCESS_HOOK_BIFS, RECORD_SOURCE_BIFS,
     RUNTIME_HOOKS_BIFS, SEND_HOOK_BIFS,
 };
 
 /// A `needs_*` predicate.
 type Pred = fn(&str, &str, u32) -> bool;
 
-/// The 13 exported seam tables with their predicates, in the canonical partition
+/// The 14 exported seam tables with their predicates, in the canonical partition
 /// order: a key listed by two tables is credited to the **first** one here.
 const TABLES: &[(&str, &[(&str, &str, u32)], Pred)] = &[
     ("MEMORY_HOOK_BIFS", MEMORY_HOOK_BIFS, needs_memory_hook),
@@ -80,6 +81,7 @@ const TABLES: &[(&str, &[(&str, &str, u32)], Pred)] = &[
     ("PORT_HOOK_BIFS", PORT_HOOK_BIFS, needs_port_hook),
     ("SEND_HOOK_BIFS", SEND_HOOK_BIFS, needs_send_hook),
     ("NIF_LOADER_BIFS", NIF_LOADER_BIFS, needs_nif_loader),
+    ("EXPORT_GATE_BIFS", EXPORT_GATE_BIFS, needs_export_gate),
     (
         "RECORD_SOURCE_BIFS",
         RECORD_SOURCE_BIFS,
@@ -111,9 +113,9 @@ const FAST_PATHS: usize = 92;
 const MISSING_DECLARED: usize = 0;
 
 /// The seam union and the partition of the declared surface it induces.
-const SEAM_UNION: usize = 241;
-const DECLARED_SEAM_BACKED: usize = 211;
-const DECLARED_IN_CRATE: usize = 345;
+const SEAM_UNION: usize = 242;
+const DECLARED_SEAM_BACKED: usize = 212;
+const DECLARED_IN_CRATE: usize = 344;
 const UNDECLARED_SEAM_MEMBERS: usize = 30;
 /// The keys two tables share — the four external-term encoders, which read the
 /// fun-identity **and** the local-node seams.
@@ -131,6 +133,7 @@ const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("PORT_HOOK_BIFS", 4, 0),
     ("SEND_HOOK_BIFS", 4, 4),
     ("NIF_LOADER_BIFS", 1, 1),
+    ("EXPORT_GATE_BIFS", 1, 1),
     ("RECORD_SOURCE_BIFS", 1, 1),
     ("MODULE_INFO_BIFS", 2, 2),
     ("PERSISTENT_TERM_BIFS", 7, 7),

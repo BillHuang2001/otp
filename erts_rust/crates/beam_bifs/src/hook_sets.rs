@@ -41,6 +41,7 @@
 //! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 4 |
 //! | [`SendHook`] | [`SEND_HOOK_BIFS`] | 4 |
 //! | [`NifLoader`] | [`NIF_LOADER_BIFS`] | 1 |
+//! | [`ExportGate`](beam_codec::ExportGate) | [`EXPORT_GATE_BIFS`] | 1 |
 //! | [`RecordSource`] | [`RECORD_SOURCE_BIFS`] | 1 |
 //! | [`ModuleInfo`] | [`MODULE_INFO_BIFS`] | 2 |
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
@@ -96,6 +97,7 @@
 //! | `RuntimeContext::uses_dict` | [`needs_dict_hook`] |
 //! | `RuntimeContext::uses_process_hook` | [`needs_process_hook`] |
 //! | `RuntimeContext::uses_nif_loader` | [`needs_nif_loader`] |
+//! | — (the export gate is installed unconditionally today) | [`needs_export_gate`] |
 //! | `RuntimeContext::uses_record_source` | [`needs_record_source`] |
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
@@ -231,6 +233,15 @@ pub const SEND_HOOK_BIFS: &[(&str, &str, u32)] = &[
 /// The set is exactly `nif::register`'s roster (one key). Sorted by `(module,
 /// function, arity)`; see [`needs_nif_loader`].
 pub const NIF_LOADER_BIFS: &[(&str, &str, u32)] = &[("erlang", "load_nif", 2)];
+
+/// The registered BIFs that read the [`beam_codec::ExportGate`] seam — the `[safe]`
+/// `EXPORT_EXT` active-export half of `erlang:binary_to_term/2`, the only consumer of
+/// [`BifContext::export_gate`](crate::context::BifContext::export_gate).
+///
+/// `binary_to_term/1` never asks: the gate is inert without the `[safe]` flag (the C
+/// asks only under it, `external.c:5032-5036`), and the flag is a `/2` option. Sorted
+/// by `(module, function, arity)`; see [`needs_export_gate`].
+pub const EXPORT_GATE_BIFS: &[(&str, &str, u32)] = &[("erlang", "binary_to_term", 2)];
 
 /// The registered BIFs that read the [`RecordSource`] seam — `records:get_definition/2`,
 /// the only consumer of
@@ -615,8 +626,18 @@ pub fn needs_nif_loader(module: &str, function: &str, arity: u32) -> bool {
         .is_ok()
 }
 
-/// Whether `(module, function, arity)` is one of the [`RECORD_SOURCE_BIFS`].
+/// Whether `(module, function, arity)` is one of the [`EXPORT_GATE_BIFS`].
 ///
+/// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
+/// call on every BIF dispatch.
+#[must_use]
+pub fn needs_export_gate(module: &str, function: &str, arity: u32) -> bool {
+    EXPORT_GATE_BIFS
+        .binary_search(&(module, function, arity))
+        .is_ok()
+}
+
+/// Whether `(module, function, arity)` is one of the [`RECORD_SOURCE_BIFS`].///
 /// Allocation-free (a `binary_search` over the `&'static` table), so it is safe to
 /// call on every BIF dispatch.
 #[must_use]
@@ -708,6 +729,7 @@ mod tests {
         ("PORT_HOOK_BIFS", PORT_HOOK_BIFS, needs_port_hook),
         ("SEND_HOOK_BIFS", SEND_HOOK_BIFS, needs_send_hook),
         ("NIF_LOADER_BIFS", NIF_LOADER_BIFS, needs_nif_loader),
+        ("EXPORT_GATE_BIFS", EXPORT_GATE_BIFS, needs_export_gate),
         (
             "RECORD_SOURCE_BIFS",
             RECORD_SOURCE_BIFS,
@@ -884,6 +906,14 @@ mod tests {
         assert_eq!(NIF_LOADER_BIFS, &[("erlang", "load_nif", 2)]);
     }
 
+    #[test]
+    fn export_gate_bifs_are_binary_to_term_2_only() {
+        // The gate is inert without `[safe]`, and `[safe]` is a `/2` option, so
+        // `binary_to_term/1` never asks (sorted by `(module, function, arity)`).
+        assert_eq!(EXPORT_GATE_BIFS, &[("erlang", "binary_to_term", 2)]);
+        assert!(!needs_export_gate("erlang", "binary_to_term", 1));
+        assert!(!needs_export_gate("erlang", "term_to_binary", 2));
+    }
     #[test]
     fn record_source_bifs_are_get_definition_2() {
         assert_eq!(RECORD_SOURCE_BIFS, &[("records", "get_definition", 2)]);
@@ -1078,6 +1108,11 @@ mod tests {
                 &[crate::records::register],
             ),
             (
+                "EXPORT_GATE_BIFS",
+                EXPORT_GATE_BIFS,
+                &[crate::binconv::register],
+            ),
+            (
                 "FUN_CALLER_BIFS",
                 FUN_CALLER_BIFS,
                 &[
@@ -1236,8 +1271,8 @@ mod tests {
             "the doc's documented-key total must equal the sum over every exported table"
         );
         assert_eq!(
-            aggregate, 245,
-            "the documented seam surface is 245 keys across the 13 tables; a table \
+            aggregate, 246,
+            "the documented seam surface is 246 keys across the 14 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
         );
     }
