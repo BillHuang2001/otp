@@ -166,10 +166,18 @@ pub(super) fn set(
         // `if (ival < ERL_DRV_BUSY_MSGQ_LIM_MIN || ERL_DRV_BUSY_MSGQ_LIM_MAX < ival) return -1;`
         // (`:7090`-`:7103`). `ERL_DRV_BUSY_MSGQ_LIM_MAX` is `SIZE_MAX - 1`, so on a 32-bit `ival`
         // only the lower bound can ever trip.
+        //
+        // The store itself is the emulator's `erl_drv_busy_msgq_limits`, which **cross-clamps the
+        // pair** exactly as the stream watermarks do (`erts/emulator/beam/erl_port_task.c:800`-
+        // `:820`): writing `high` pulls `low` down to it (`if (low > high) low = high;`) and writing
+        // `low` raises `high` to it (`if (high < low) high = low;`) — so the pair can never invert.
         INET_LOPT_MSGQ_HIWTRMRK => {
             if value < BUSY_MSGQ_LIM_MIN {
                 Step::Refused
             } else {
+                if options.msgq_low > value {
+                    options.msgq_low = value;
+                }
                 options.msgq_high = value;
                 Step::Done(RECORD)
             }
@@ -178,6 +186,9 @@ pub(super) fn set(
             if value < BUSY_MSGQ_LIM_MIN {
                 Step::Refused
             } else {
+                if options.msgq_high < value {
+                    options.msgq_high = value;
+                }
                 options.msgq_low = value;
                 Step::Done(RECORD)
             }
@@ -316,7 +327,9 @@ pub(super) fn get(
         INET_LOPT_TCP_LOWTRMRK if scope.is_stream() => push_record(reply, code, options.low),
         INET_LOPT_TCP_HIWTRMRK | INET_LOPT_TCP_LOWTRMRK => {}
         // `erl_drv_busy_msgq_limits` (`:9209`-`:9228`): stored and reported here, with the C's
-        // own defaults (8192/4096). This floor has no busy-message-queue limit to apply them to.
+        // own defaults (8192/4096). The pair is always stored clamped (`low <= high`), so a read
+        // can never report an inverted pair. This floor has no busy-message-queue limit to apply
+        // them to.
         INET_LOPT_MSGQ_HIWTRMRK => push_record(reply, code, options.msgq_high),
         INET_LOPT_MSGQ_LOWTRMRK => push_record(reply, code, options.msgq_low),
         // The stream-gated send-timeout pair (`:9237`-`:9255`).
