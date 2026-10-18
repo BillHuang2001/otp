@@ -907,15 +907,29 @@ impl TcpInetDriver {
     /// Used after [`TcpInetDriver::deregister`] and by `Drop` (which has no poller to
     /// de-register with). Taking the field first makes it idempotent.
     ///
-    /// A **prebound** descriptor is not this driver's to close: the C's `erl_inet_close`
-    /// (`inet_drv.c:5102`-`:5117`) only drops the select registration for one, leaves `desc->s`
+    /// This is the `erl_inet_close` half of the C's `tcp_desc_close` (`inet_drv.c:5102`-`:5117`,
+    /// reached from `:11932`-`:11939`), and it carries that function's **unconditional**
+    /// `tcp_clear_input` (`:11706`) in front of it: the driver's own framing buffer (`desc->i_buf`
+    /// → [`TcpInetDriver::pending_input`]) belongs to the descriptor's byte stream, so a **partial
+    /// `{packet, N}` frame buffered before the close is dropped by it** — for a prebound
+    /// descriptor too, because `tcp_desc_close` runs `tcp_clear_input` before the ownership test.
+    /// The port's *input queue* is not touched: `tcp_clear_input` clears `desc->i_buf` only, never
+    /// the `ioq` side the port owns.
+    ///
+    /// A **prebound** descriptor is then not this driver's to close: `erl_inet_close` only drops
+    /// the select registration for one (`sock_select(…, 0)` + `event_mask = 0`), leaves `desc->s`
     /// and `desc->state` exactly as they were and issues no `close(2)` at all. The same rule holds
-    /// here — nothing is closed and no field is reset, so the descriptor number stays valid in the
-    /// OS (owned by whoever handed it to `INET_REQ_FDOPEN`) and a post-close
-    /// `GETSTATUS`/`GETFD`/`NAME` still answers what it answered before, which is what the C
-    /// does. `Drop` runs this too, so a prebound descriptor is never closed by a dropped driver
-    /// either.
+    /// here — nothing is closed, the peer/shutdown bookkeeping is left alone and the state is
+    /// **kept**, so the descriptor number stays valid in the OS (owned by whoever handed it to
+    /// `INET_REQ_FDOPEN`) and a post-close `GETSTATUS`/`GETFD`/`NAME`/`GETTYPE` still answers what
+    /// it answered before. That is exactly what the C does and what the oracle reports: measured
+    /// on OTP 29.1.1 / erts-17.1, a prebound port answers `GETSTATUS` `[1,0,0,0,5]` (still
+    /// `INET_STATE_CONNECTED`) and the same `GETFD`/`NAME`/`GETTYPE` bytes after
+    /// `INET_REQ_CLOSE`, where an owned descriptor answers `GETSTATUS` `[1,0,0,0,0]`
+    /// (`INET_STATE_CLOSED`) and `GETFD` `[0]einval`. `Drop` runs this too, so a prebound
+    /// descriptor is never closed by a dropped driver either.
     fn close_socket(&mut self) {
+        self.pending_input.clear();
         if self.prebound {
             return;
         }
@@ -930,6 +944,11 @@ impl TcpInetDriver {
     }
     /// De-registers **and** closes the current socket, returning the de-registration outcome.
     ///
+    /// This is the `erl_inet_close` half of the C's teardown only — it does **not** empty the
+    /// port's output queue. The close path that does is [`TcpInetDriver::desc_close`]; a caller
+    /// that is not a close (the `INET_REQ_CONNECT` failure arm, which the C answers without
+    /// touching the queue at all) keeps this narrower seam.
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::Io` when the poller rejects the de-registration; the descriptor is
@@ -938,6 +957,40 @@ impl TcpInetDriver {
         let result = self.deregister(ctx);
         self.close_socket();
         result
+    }
+
+    /// The C's `tcp_desc_close` (`inet_drv.c:11932`-`:11939`), the body behind both
+    /// `INET_REQ_CLOSE` (`:12258`-`:12266`) and the driver teardown.
+    ///
+    /// ```c
+    /// static void tcp_desc_close(tcp_descriptor* desc)
+    /// {
+    ///     tcp_clear_input(desc);      /* the framing buffer -> close_socket below */
+    ///     tcp_clear_output(desc);     /* driver_deq(ix, driver_sizeq(ix))     */
+    ///     erl_inet_close(INETP(desc));/* -> release_socket                    */
+    /// }
+    /// ```
+    ///
+    /// `tcp_clear_output` (`:11718`-`:11724`) has **no guard whatsoever**: every close discards
+    /// whatever `port_command`/`send` could not push into the socket, and it also runs for a
+    /// **prebound** descriptor, because it sits in front of the ownership test. That is what makes
+    /// a post-close `GETSTAT` `send_pend`/`port_info` `queue_size` report `0` on the oracle instead
+    /// of the stale remainder. Measured on OTP 29.1.1 / erts-17.1: a 53 556-byte remainder on a
+    /// connected `gen_tcp` socket ⇒ `send_pend` 53 556, `INET_REQ_CLOSE` reply `[1]`,
+    /// `send_pend` 0 afterwards.
+    ///
+    /// [`TcpInetDriver::close_socket`] cannot do this (it takes no [`DriverContext`], and `Drop`
+    /// has no port to clear), so the queue half lives here, on the `ctx`-carrying close path.
+    ///
+    /// # Errors
+    ///
+    /// `BeamError::Io` when the poller rejects the de-registration.
+    fn desc_close(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        // `tcp_clear_output` first — the same order the C uses, so a de-registration failure
+        // below still leaves the queue empty rather than reporting bytes that can never move.
+        ctx.output().clear();
+        // Then `tcp_clear_input` (inside `close_socket`) and `erl_inet_close`.
+        self.release_socket(ctx)
     }
 
     /// Reads the socket into the port input queue (the `{packet, raw}` default) or, when the
@@ -1497,7 +1550,9 @@ impl TcpInetDriver {
     /// The `close` verb: de-registers and closes the socket, leaving the port open but idle.
     ///
     /// [`crate::PortControl::CLOSE`] reserves this name at the [`crate::PortRegistry`] level,
-    /// so this verb is reached only by a caller driving the port's driver directly.
+    /// so this verb is reached only by a caller driving the port's driver directly (the
+    /// `erlang:port_control/3` side arrives as the numeric `INET_REQ_CLOSE`). The body is the
+    /// C's `tcp_close_check` followed by `tcp_desc_close` (`inet_drv.c:12258`-`:12266`).
     ///
     /// # Errors
     ///
@@ -1505,9 +1560,9 @@ impl TcpInetDriver {
     fn verb_close(&mut self, ctx: &mut DriverContext<'_>) -> Result<Vec<u8>> {
         // Every queued operation is answered `{error, closed}` first (the C's
         // `tcp_close_check` → `async_error_am_all(am_closed)`, `inet_drv.c:11887`) and only then
-        // does the descriptor go away.
+        // does the descriptor go away — `tcp_desc_close`, which also empties the output queue.
         drain_closed(&mut self.async_ops, ctx)?;
-        self.release_socket(ctx)?;
+        self.desc_close(ctx)?;
         Ok(ctl_ok())
     }
 
@@ -1983,8 +2038,14 @@ impl Driver for TcpInetDriver {
         // Every queued operation is answered with `{error, closed}` **before** the descriptor goes
         // away — the C's `async_error_am_all(am_closed)` (`inet_drv.c:2597`-`:2608`) — and the
         // release outcome is kept: neither half is dropped on the other's failure.
+        //
+        // The teardown runs the same `tcp_desc_close` body as the `close` verb, so the port's
+        // output queue is emptied here too. The C spreads that over two functions —
+        // `tcp_inet_stop` clears the input buffer (`:11904`) and `tcp_inet_flush` discards the
+        // `ioq` (`inet_drv.c:12708`-`:12731`, `tcp_clear_output` at `:12728`) before the port is
+        // freed — so the end state is the same: no queued byte outlives the teardown.
         let drained = drain_closed(&mut self.async_ops, ctx);
-        let released = self.release_socket(ctx);
+        let released = self.desc_close(ctx);
         drained?;
         released
     }
