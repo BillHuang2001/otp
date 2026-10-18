@@ -35,7 +35,8 @@
 use beam_alloc::{Heap, RefcBinary};
 use beam_common::{AllocKind, BeamError, Result};
 use beam_gc::{
-    AnyCollector, Collection, CollectionKind, HeapPolicy, OffHeap, OffHeapEntry, ReachableObject,
+    AnyCollector, Collection, CollectionKind, HeapObservable, HeapPolicy, OffHeap, OffHeapEntry,
+    ReachableObject,
 };
 use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::{Eterm, HEADER_BIN_REF};
@@ -45,6 +46,7 @@ use crate::dict::Dict;
 use crate::error;
 use crate::fragments::SavedArgs;
 use crate::link::Links;
+use crate::max_heap::{HeapLimitVerdict, MaxHeapFlags, MaxHeapSetting, MaxHeapUsage};
 use crate::monitor::{MonitoredBy, Monitors, PortWatch};
 use crate::pid::ProcessId;
 use crate::registers::Registers;
@@ -396,6 +398,28 @@ pub struct Process {
     monitored_by: Vec<MonitoredBy>,
     /// The termination reason, once the process has exited.
     exit_reason: Option<Eterm>,
+    /// This process's `max_heap_size` **policy** ([`crate::max_heap::MaxHeapSetting`]): the word
+    /// bound plus its `kill`/`error_logger`/`include_shared_binaries` flags.
+    ///
+    /// The C keeps the same pair per process (`MAX_HEAP_SIZE_GET(p)` /
+    /// `MAX_HEAP_SIZE_FLAGS_GET(p)`) and replaces it wholesale on
+    /// `erlang:process_flag(max_heap_size, …)`. A process is born
+    /// [`MaxHeapSetting::unlimited`] with [`crate::max_heap::MaxHeapFlags::default`], so a process
+    /// nobody configures behaves exactly as before this policy existed.
+    ///
+    /// Validation is **not** here: the parse and the `size < min_heap_size` floor belong to the
+    /// BIF/`spawn_opt` site ([`MaxHeapSetting::violates_floor`] single-sources the rule).
+    max_heap: MaxHeapSetting,
+    /// The **pending** exceed verdict recorded by the most recent collection/growth decision that
+    /// went over this process's `max_heap_size`, or `None` while the process is within it (or
+    /// unlimited).
+    ///
+    /// It is a **latched notice**, not a decision this crate acts on: a breach never alters a
+    /// collection's result, and `beam_process` never terminates anything. The host drains it
+    /// ([`Process::take_max_heap_verdict`]) and performs the verdict — a `killed` self-exit for
+    /// [`HeapLimitVerdict::Kill`], an `=ERROR REPORT====` for [`HeapLimitVerdict::Log`] — because
+    /// only the host owns the process table.
+    max_heap_verdict: Option<HeapLimitVerdict>,
 }
 
 /// A host-supplied predicate that can **decline a relocating collection** of a receiver's heap.
@@ -500,6 +524,8 @@ impl Process {
             port_monitors: Vec::new(),
             monitored_by: Vec::new(),
             exit_reason: None,
+            max_heap: MaxHeapSetting::unlimited(MaxHeapFlags::default()),
+            max_heap_verdict: None,
         })
     }
 
@@ -1345,6 +1371,127 @@ impl Process {
         self.relocation_exempt || self.state == ProcessState::Running
     }
 
+    /// This process's `max_heap_size` **setting** ([`MaxHeapSetting`]: the word bound plus the
+    /// `kill`/`error_logger`/`include_shared_binaries` flags).
+    ///
+    /// A process is born [`MaxHeapSetting::unlimited`] with [`MaxHeapFlags::default`], so
+    /// `max_heap_size().is_unlimited()` until a caller sets one.
+    pub fn max_heap_size(&self) -> MaxHeapSetting {
+        self.max_heap
+    }
+
+    /// Installs `setting` as this process's `max_heap_size` policy — the PCB half of
+    /// `erlang:process_flag(max_heap_size, Map)` / `spawn_opt(…, [{max_heap_size, Map}])`.
+    ///
+    /// The setting replaces the previous one **wholesale** (bound and all three flags), exactly as
+    /// the C does (`bif.c:2148-2166`). Nothing is validated here: the value's shape (a map with a
+    /// mandatory non-negative-integer `size`, boolean flags, unknown keys ignored) and the
+    /// `size != 0 && size < min_heap_size ⇒ badarg` floor belong to the **parse site** in the BIF
+    /// /`spawn_opt` layer, which single-sources the floor rule through
+    /// [`MaxHeapSetting::violates_floor`]. A `min_heap_size` set *after* a `max_heap_size` is
+    /// deliberately **not** re-validated — the oracle does not reject that direction either.
+    ///
+    /// The bound is enforced at the next collection/growth decision, never per allocation, and only
+    /// as a **recorded verdict** ([`Process::take_max_heap_verdict`]): this crate never terminates
+    /// the process, so a breach cannot be observed as an error from any collection entry point.
+    pub fn set_max_heap_size(&mut self, setting: MaxHeapSetting) {
+        self.max_heap = setting;
+    }
+
+    /// The process's **current** [`MaxHeapUsage`]: the collector's total heap capacity in words
+    /// (nursery chain + mature generation — the `Total Heap Size` the oracle prints) plus the
+    /// payload bytes of the off-heap refc binaries this process has registered
+    /// ([`Process::register_off_heap_binary`]).
+    ///
+    /// Two things a caller must know about the figure:
+    ///
+    /// * A mailbox word is already inside the heap total. This runtime keeps a queued message
+    ///   heap-resident (the copy engine writes it into the receiver's young heap; only an
+    ///   oversized payload a receiver's declined collection refused lives in a
+    ///   [`beam_message::Fragments`] chain), so a queued-message breach **is** charged. The oracle
+    ///   charges the same way, which is why its report shows a huge `Total Heap Size` for a
+    ///   mailbox-bloated process.
+    /// * The off-heap half counts only payloads **this process owns**. A payload that only travels
+    ///   through a message's own off-heap table is not in this list, so
+    ///   `include_shared_binaries` is charged for what the process registered, not for the whole
+    ///   VM's binary population.
+    ///
+    /// This is the *current* usage. The check the oracle performs is on the **prospective
+    /// post-collection capacity**, which is what [`Process::heap_limit_verdict`] takes explicitly
+    /// and what the collection/growth doors record.
+    pub fn max_heap_usage(&self) -> MaxHeapUsage {
+        MaxHeapUsage::new(
+            self.collector.total_heap_size_words(),
+            self.off_heap_binary_bytes(),
+        )
+    }
+
+    /// The [`HeapLimitVerdict`] for a heap that is about to reach `prospective_words` words of
+    /// total capacity — the pure decision, with **no** mutation and no collection.
+    ///
+    /// This is the form a heap-admission door consults when it knows the capacity it is about to
+    /// install: the oracle's check runs against the total heap the collection **decided to
+    /// install** (including the growth the admission needed), not against the current occupied
+    /// size, and a current-size-only check grazes far below the limit and never fires. The current
+    /// off-heap payload bytes are added when the setting's
+    /// [`include_shared_binaries`](MaxHeapFlags::include_shared_binaries) flag is set.
+    ///
+    /// [`Process::current_heap_limit_verdict`] is the same decision over
+    /// [`Process::max_heap_usage`].
+    pub fn heap_limit_verdict(&self, prospective_words: usize) -> HeapLimitVerdict {
+        self.max_heap.verdict(MaxHeapUsage::new(
+            prospective_words,
+            self.off_heap_binary_bytes(),
+        ))
+    }
+
+    /// The [`HeapLimitVerdict`] for the process's **current** usage
+    /// ([`Process::max_heap_usage`]) — the convenience form of
+    /// [`Process::heap_limit_verdict`] for a caller that has just finished a collection and wants
+    /// to judge what it installed.
+    pub fn current_heap_limit_verdict(&self) -> HeapLimitVerdict {
+        self.max_heap.verdict(self.max_heap_usage())
+    }
+
+    /// The pending exceed verdict recorded by the last over-limit collection/growth decision, or
+    /// `None` while the process is within its bound (or unlimited).
+    ///
+    /// A breach is **latched** here and never acted on by this crate: it does not change the
+    /// collection's `Result` and it does not terminate the process. The host drains it with
+    /// [`Process::take_max_heap_verdict`] and performs it — for [`HeapLimitVerdict::Kill`] a
+    /// self-exit with the bare atom `killed` (not `kill`, and not an exception); for
+    /// [`HeapLimitVerdict::Log`] an `=ERROR REPORT====` with
+    /// `Context: maximum heap size reached`, after which the process **keeps running**.
+    pub fn max_heap_verdict(&self) -> Option<HeapLimitVerdict> {
+        self.max_heap_verdict
+    }
+
+    /// Takes (and clears) the pending exceed verdict — the drain the host calls after a collection
+    /// or a heap admission, mirroring the crate's other `take_*` drains.
+    ///
+    /// `Some(verdict)` hands the notice to the caller exactly once; a process that stays over the
+    /// limit re-records it at its **next** collection/growth decision (which is the oracle's own
+    /// cadence: `kill => false` logs on every subsequent collection while over).
+    pub fn take_max_heap_verdict(&mut self) -> Option<HeapLimitVerdict> {
+        self.max_heap_verdict.take()
+    }
+
+    /// Records the pending exceed verdict for the capacity a collection/growth has just installed
+    /// — the private tail every collection door runs.
+    ///
+    /// Only a **breach** is stored: a [`HeapLimitVerdict::Within`] answer needs no notice, and
+    /// storing it would make the latch indistinguishable from "nothing to report". The
+    /// comparison therefore reads the **post-collection** total capacity
+    /// ([`Process::max_heap_usage`]), which is exactly the oracle's prospective figure — by this
+    /// point the nursery has been collapsed/resized and the growth the admission needed is
+    /// installed, so a 1000-word limit fires against the oracle's `Total Heap Size: 1299`, not
+    /// against the pre-collection occupancy.
+    fn record_max_heap_verdict(&mut self) {
+        let verdict = self.current_heap_limit_verdict();
+        if verdict.is_breach() {
+            self.max_heap_verdict = Some(verdict);
+        }
+    }
     /// Runs a safepoint collection over the whole process root set.
     ///
     /// The root set is the registers/stack **plus** the host-published extra roots
@@ -1392,7 +1539,14 @@ impl Process {
         if self.relocation_exempt {
             return Err(error::relocation_exempt("collect"));
         }
-        self.run_rooted_collection(|collector, roots| collector.collect(roots))
+        let result = self.run_rooted_collection(|collector, roots| collector.collect(roots));
+        if result.is_ok() {
+            // The max_heap_size check runs at the collection decision, against the capacity the
+            // collection has just installed (never per allocation). A breach is only *recorded*
+            // (see `record_max_heap_verdict`): it never alters this `Result`.
+            self.record_max_heap_verdict();
+        }
+        result
     }
 
     /// Runs a safepoint collection of **exactly** `kind` over the whole process root set — the
@@ -1432,7 +1586,13 @@ impl Process {
         if self.relocation_exempt {
             return Err(error::relocation_exempt("collect_kind"));
         }
-        self.run_rooted_collection(|collector, roots| collector.collect_kind(kind, roots))
+        let result =
+            self.run_rooted_collection(|collector, roots| collector.collect_kind(kind, roots));
+        if result.is_ok() {
+            // Same tail as `collect`: judge the capacity the pinned collection installed.
+            self.record_max_heap_verdict();
+        }
+        result
     }
 
     /// Grows the young heap **on demand** so that a `need_words`-word allocation can proceed —
@@ -1462,7 +1622,15 @@ impl Process {
         if self.relocation_exempt {
             return Err(error::relocation_exempt("ensure_capacity"));
         }
-        self.run_rooted_collection(|collector, roots| collector.ensure_capacity(need_words, roots))
+        let result = self
+            .run_rooted_collection(|collector, roots| collector.ensure_capacity(need_words, roots));
+        if result.is_ok() {
+            // The growth has been installed, so the prospective capacity this door decided on is
+            // the one the check judges — the site where a *current-size-only* check would miss a
+            // breach the admission itself created.
+            self.record_max_heap_verdict();
+        }
+        result
     }
 
     /// A **no-relocation** growth passthrough: enlarges the young nursery so a `need_words`-word
@@ -1492,6 +1660,9 @@ impl Process {
     /// returned and the collector is left untouched; it is propagated unchanged (never swallowed).
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<usize> {
         self.collector.grow_nursery(need_words)?;
+        // A growth installs a new young capacity with no collection, so it is the other admission
+        // door at which the oracle's check runs (a growth can itself cross the bound).
+        self.record_max_heap_verdict();
         Ok(self.collector.young().capacity_words())
     }
 
@@ -1643,6 +1814,8 @@ impl Process {
             return Ok(false);
         }
         if self.admission_requires_collection(need) {
+            // The collected path records the `max_heap_size` verdict — `collect` is the one door
+            // that decides (and installs) the capacity, so its own tail is the recording site.
             self.collect()?;
             Ok(true)
         } else {
