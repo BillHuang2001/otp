@@ -64,7 +64,14 @@
 //!   16-bit counter, and the whole-reply `[0] ++ "einval"` refusal of an unserved code;
 //! * **the verb refusals** — an unknown verb (a code inside the magic range that no `case`
 //!   matches, the retired request `9`, a raw value *below* the magic, and an out-of-range code)
-//!   answers the C's `[0] ++ "exbadport"` reply, identically for every one of them.
+//!   answers the C's `[0] ++ "exbadport"` reply, identically for every one of them;
+//! * **the pre-adoption `fdopen` ladder** — `INET_REQ_FDOPEN` (13) refuses before it adopts any
+//!   descriptor: an operand length other than `6`/`10` is `[0] ++ "einval"`, a family word other
+//!   than `INET_AF_INET` is `[0] ++ "eafnosupport"`, a refused `type` word is
+//!   `[0] ++ "einval"`, and the 6-byte form (which forces `bound = 1`) on a descriptor number
+//!   closed in **both** processes is `[0] ++ "ebadf"`. The 10-byte `bound == 0` blind-adoption
+//!   form stays out: the C adopts the number without looking at it, so the two runtimes share no
+//!   observable there.
 //!
 //! # Determinism (no socket traffic, no clock, no pid is pinned)
 //!
@@ -85,17 +92,25 @@
 //!
 //! # The datagram *data* path is the remaining capability gap (measured, never allowlisted)
 //!
-//! The control/option verb transport above works on both runtimes; what `beam_rt` still does not
-//! have is the seam between those verbs and the datagram **bytes**. Measured in this environment
-//! (oracle OTP 29.1.1 / `erts-17.1`, and the built `beam_rt`) on a socket the `open`/`bind`
-//! verbs produced:
+//! The control/option verb transport above works on both runtimes, and so does the emulator's
+//! `inet:getstat/1` counter reply. What `beam_rt` still lacks is the bridge that carries the
+//! driver's **send reply** back to the owner, and the datagram **delivery** itself. Measured in
+//! this environment (oracle OTP 29.1.1 / `erts-17.1`, and the built `beam_rt`) on a socket the
+//! `open`/`bind` verbs produced:
 //!
-//! * **a send is a typed capability gap.** `gen_udp:send(S, {127,0,0,1}, P, <<"hi">>)` answers
-//!   `ok` under the oracle, while `beam_rt` aborts the whole run (exit 3) with
-//!   `beam_rt: unsupported: the C's inet statistics counters (inet_fill_stat) are not tracked by
-//!   this driver`; `inet:getstat/1` is the same gap. The read side is unreachable too:
-//!   `gen_udp:recv/3` answers under the oracle and raises `{case_clause, {ok, []}}` inside
-//!   `prim_inet` here, and `{active, true}` delivery never produces a datagram at all.
+//! * **a send never receives its reply.** `gen_udp:send(S, {127,0,0,1}, P, <<"hi">>)` answers
+//!   `ok` under the oracle; here `prim_inet:do_sendto/4`'s `erlang:port_command/2` answers `true`
+//!   and then blocks in its `receive {inet_reply, S, Reply, Ref}`, which no port round ever
+//!   fills — the `-eval` route aborts the whole run (exit 3) with
+//!   `beam_rt: unsupported: opcode: run: process blocked (no message available)`, and the
+//!   compiled-module route (`beam_rt run`) hangs to its 60 s deadline. Owner: `beam_rt` (the
+//!   port-task reply bridge).
+//! * **an incoming datagram is never delivered.** With a `{active, true}` socket a datagram
+//!   injected from outside the VM (`os:cmd("printf abc > /dev/udp/127.0.0.1/P")`) arrives as
+//!   `{udp, S, {127,0,0,1}, _, <<"abc">>}` under the oracle and as nothing at all here;
+//!   `gen_udp:recv/3` answers `{error, einval}` under the oracle and raises
+//!   `{case_clause, {ok, …}}` inside `prim_inet:recvfrom0/3` here. So no read-path reassembly or
+//!   truncation refusal can be pinned. Owner: `beam_rt` / `beam_io`.
 //! * **`erlang:port_command/2` on the socket-less port** (a port whose `INET_REQ_OPEN` was never
 //!   sent) is the sharp edge of the same gap: the oracle answers `true` and then kills the port
 //!   (`init_caller` fails, `driver_failure_posix(EINVAL)`, `inet_drv.c:15055`, so `port_info/2`
@@ -103,13 +118,10 @@
 //!   `error:badarg` and leaves the port **alive** — the two sides share no observable there, so
 //!   this group pins `port_command/2` only on a **closed** port (both sides `badarg`) and the
 //!   socket-less pair is reported to the owner instead.
-//! * **the stream half of the same driver file** is unreachable too: `gen_tcp:connect/3`
-//!   refuses with `badarg` under `beam_rt` where the oracle opens a socket, and
-//!   `gen_tcp:listen/2` refuses the list/binary stream-mode option (`{error, einval}`).
 //!
-//! Owner of all three: `beam_rt` (the built-in-driver `port_command` bridge) / `beam_io` (the
-//! driver's `send`/`recv` verbs). No row below pins any of them; the module docs of
-//! [`super::inet_control`] carry the full measured matrix.
+//! Owner of all three: `beam_rt` (the port-task reply bridge / the built-in-driver
+//! `port_command` bridge) / `beam_io` (the driver's `send`/`recv` verbs). No row below pins any
+//! of them; the module docs of [`super::inet_control`] carry the full measured matrix.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// One A.4 `udp_inet` eval case.
@@ -423,6 +435,26 @@ pub(crate) fn group() -> Vec<Case> {
              erlang:port_close(P), {length(All), hd(All)} end",
             "ok {1,[0,101,120,98,97,100,112,111,114,116]}",
         ),
+        case(
+            "udp/port_control_fdopen_refusal_ladder",
+            "INET_REQ_FDOPEN (13 + 16#03f1a300) answers the driver's pre-adoption refusal ladder on one udp_inet port: an operand length other than 6 or 10 is [0] ++ \"einval\", a family word other than INET_AF_INET (0, 7) is [0] ++ \"eafnosupport\", a refused type word (3, 9) is [0] ++ \"einval\", and the 6-byte form (which forces bound to 1) on descriptor 999999 — closed in both processes — is [0] ++ \"ebadf\"; the 10-byte bound==0 blind-adoption form is left out (the C adopts the number blindly, so there is no shared observable)",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             _ = erlang:port_control(P, 16#03f1a300 + 1, <<1, 2, 0>>), \
+             Len = lists:usort([erlang:port_control(P, 16#03f1a300 + 13, Op) \
+                                || Op <- [<<>>, <<0,0,0,0>>, <<0,0,0,0,0,0,0,0>>, \
+                                          <<0,0,0,0,0,0,0,0,0,0,0>>]]), \
+             Fam = lists:usort([erlang:port_control(P, 16#03f1a300 + 13, <<F, 2, 0,0,0,0>>) \
+                                || F <- [0, 7]]), \
+             Type = lists:usort([erlang:port_control(P, 16#03f1a300 + 13, <<1, T, 0,0,0,0>>) \
+                                 || T <- [3, 9]]), \
+             Fd = lists:usort([erlang:port_control(P, 16#03f1a300 + 13, \
+                                                   <<1, 2, 999999:32>>)]), \
+             erlang:port_close(P), {Len, Fam, Type, Fd} end",
+            "ok {[[0,101,105,110,118,97,108]],\
+             [[0,101,97,102,110,111,115,117,112,112,111,114,116]],\
+             [[0,101,105,110,118,97,108]],[[0,101,98,97,100,102]]}",
+        ),
         // --- the port_info accounting items and the port_command refusal --------------------
         case(
             "udp/port_info_queue_size_and_memory_of_a_fresh_port",
@@ -456,7 +488,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_udp_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 29, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 30, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -501,10 +533,9 @@ mod tests {
     }
 
     /// The shapes that are **measured** to diverge stay out of the group: the datagram *data*
-    /// path (a `gen_udp` send and `inet:getstat` hit the driver's untracked statistics counters,
-    /// an incoming datagram is never delivered, and `gen_tcp:connect/3` refuses), the
-    /// `prim_inet` module whose calls would drive them, and the port-monitor term (see the
-    /// per-item comments below).
+    /// path (a `gen_udp` send never receives its `inet_reply`, an incoming datagram is never
+    /// delivered, and a `gen_udp:recv/3` fails inside `prim_inet`) and the `prim_inet` module
+    /// whose calls would drive them (see the per-item comments below).
     ///
     /// `port_command/2` is pinnable **only on a closed port** (both runtimes answer `badarg`):
     /// on the socket-less port the two runtimes share no observable at all (the oracle answers
@@ -515,21 +546,13 @@ mod tests {
         for case in group() {
             let expr = case.expr().expect("eval case");
             for forbidden in [
-                // A send (and the statistics query) reaches the driver's untracked counters, so
-                // it is a typed `unsupported` (exit 3) rather than an observable.
+                // The send verb: `prim_inet:do_sendto/4` awaits an `{inet_reply, …}` that never
+                // arrives, so it is a typed `unsupported` (exit 3) rather than an observable.
                 "gen_udp:send",
-                "inet:getstat",
                 // The read path: no datagram is ever delivered, so `recv` fails inside
-                // `prim_inet` (`{case_clause, {ok, []}}`) instead of answering.
+                // `prim_inet` (`{case_clause, {ok, …}}`) instead of answering.
                 "gen_udp:recv",
                 "prim_inet",
-                // A stream connect against a live listener is `{ok, Socket}` on the oracle and a
-                // `badarg` raise here.
-                "gen_tcp:",
-                // A port monitor still disagrees on the delivered term: the oracle hands the
-                // trapping evaluator `{'EXIT', P, normal}` while `beam_rt` hands it
-                // `{'DOWN', Ref, port, P, normal}`.
-                "monitor(port",
             ] {
                 assert!(
                     !expr.contains(forbidden),

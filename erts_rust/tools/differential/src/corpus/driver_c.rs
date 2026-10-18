@@ -104,6 +104,69 @@
 //! slot — the driver's `output` callback is the only observable channel — so they are pure
 //! port-lifecycle coverage over the same `.so`.
 //!
+//! # The entry's `control` callback (selectors `20`-`25`, `30`)
+//!
+//! `erlang:port_control/3` reaches the driver entry's `control` slot, which no other corpus group
+//! carries a fixture for. [`CONTROL_DRIVER_C`] answers one verb per reply shape: bytes copied into
+//! the **reply buffer the emulator hands the callback** (a list of byte integers on return), a
+//! `NULL` reply pointer (the empty list), a negative length (`badarg`), a reply that asks for
+//! `PORT_CONTROL_FLAG_BINARY` (a binary), and a reply emitted **together with** a
+//! `driver_output` (both reach the owner). Selector `25` pins the `UINT_MAX` bound on the verb
+//! (`term_to_Uint`, `erl_bif_port.c:334`) and selector `30` the capability gate on the *other*
+//! side: an entry with **no** `control` slot is `badarg` for every verb, before any callback
+//! (`io.c:4035`) — pinned against the echo fixture, whose entry declares none.
+//!
+//! # The widened entry surface (selectors `26`-`29`)
+//!
+//! [`EXTRA_DRIVER_C`] carries the remaining entry/port-state surfaces over one `output` command
+//! byte: `erl_drv_output_term`'s **`ERL_DRV_PID`** operand (the owner receives the connected pid
+//! itself — pinned by **identity**, since a pid's term image is per-VM-start), the driver-entry
+//! list's *"no such entry"* answer (`remove_driver_entry` of an entry that was never added is the
+//! C's `0`), and the port's **busy** state (`set_busy_port` → `port_command/3` with `[nosuspend]`
+//! answers `false`, and the port still closes cleanly). Selector `29` stays on the echo fixture
+//! and pins the port's own byte counters across one round trip (`{input, 5}`/`{output, 5}`).
+//!
+//! # Measured divergences (shapes that must **not** become cases)
+//!
+//! Every shape below was measured on both runtimes while this group was widened; each is a gap,
+//! never an agreement, so it lives here (and in `divergences.md`) rather than in the corpus.
+//!
+//! * **`driver_failure_eof` / `driver_failure_atom` / `driver_failure_posix` / `driver_failure` /
+//!   `driver_exit`** — the port-closing family (`io.c:7193-7280`) is unimplemented in `beam_rt`:
+//!   `DriverHost::failure`/`port_exit` keep the trait's `-1`, so the port never closes and the
+//!   `{'EXIT', Port, Reason}` a trapping owner would see never arrives. Both the return code and
+//!   the exit reason therefore diverge. Owner: `beam_rt` (`DriverHost::failure`/`port_exit`).
+//! * **a control reply from the *request* buffer** (`*rbuf = buf`, verb `3` of the prototype) —
+//!   the oracle frees the reply pointer in `write_port_control_result` (`driver_free(resp_bufp)`,
+//!   `io.c:4170`), and that pointer is the caller's data buffer: the VM dies of SIGSEGV
+//!   (measured, exit `139`). `beam_rt`'s `control_reply` would serve it. Not the oracle's bug to
+//!   work around here — unpinnable, not a divergence.
+//! * **a zero-length `driver_output(port, buf, 0)`** — the oracle delivers `{Port,{data,<<>>}}`;
+//!   `beam_rt` delivers **no** message (its notification fold drops an empty payload). Owner:
+//!   `beam_rt` (`PortRegistry::fold_notifications`).
+//! * **`erl_drv_output_term` with an `ERL_DRV_PORT` operand** — the oracle delivers the port term;
+//!   `beam_rt` delivers nothing (measured: the receiver times out). Owner: `beam_abi`
+//!   (`decode_term_spec`'s port operand).
+//! * **`driver_output2`'s header/body *term shape*** — with a header the oracle delivers
+//!   `[97,98|<<99,100>>]` (an improper list, `deliver_read_message`, `io.c:3404-3435`), `beam_rt`
+//!   the flattened `<<97,98,99,100>>`. The **bytes** agree (the sibling `driver_abi` case pins
+//!   them through `iolist_to_binary/1`), the shape does not. Owner: `beam_rt`/`beam_io`.
+//! * **a plain `port_command/2` on a busy port** — the oracle suspends the caller until the driver
+//!   unmarks the port (a hang once the driver is waiting for that same caller), `beam_rt` reports
+//!   the typed `unsupported` gap. Only the `[nosuspend]` answer is pinnable (selector `28`).
+//!   Owner: `beam_rt`.
+//! * **`driver_caller` after `port_connect/2`** — `beam_rt`'s `caller_pid` answers the port's
+//!   *owner*, so "connected ≠ caller" has no observable that agrees; the connected/caller identity
+//!   is pinned only for an owner-opened port (`driver_abi`, selector `3`). Owner: `beam_rt`.
+//! * **`port_control/3` with non-iodata `Data`** — the oracle exits `1` with **no** stdout and
+//!   `beam_rt` raises `badarg` (a stderr line, exit `1`); a module-run case needs a non-empty
+//!   golden line, so the refusal is pinned only through the verb/port refusals above.
+//! * **`driver_set_port_data`/`driver_get_port_data`** — not slots at all: `erl_driver.h` (OTP 30)
+//!   and the frozen `ErlDrvApi` carry no such entry point.
+//! * **`driver_async`/`driver_async_cancel`** — no async pool in `beam_rt` (`port/driver.rs`), so
+//!   the entry point answers the C's failure code from every fixture; already documented by the
+//!   sibling `driver_abi` group and left out here too.
+//!
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!
 //! A C-compiled fixture needs a C compiler *and* the host `erl_driver.h`; when either is
@@ -185,15 +248,70 @@ classify(N) ->
               yn([echo(P, <<Ch>>) || Ch <- "xyz"] =:= [<<"x">>, <<"y">>, <<"z">>]);
         15 -> P = open(Dir, ""),
               yn(erlang:port_info(P, input) =:= {input, 0}
-                 andalso erlang:port_info(P, output) =:= {output, 0})
+                 andalso erlang:port_info(P, output) =:= {output, 0});
+        %% `20`-`25` drive the driver entry's **`control` callback** behind `port_control/3` — the
+        %% one A.4 slot no other corpus group carries a fixture for. Each answer is the reply the
+        %% owner received (`port_control/3` renders the driver's bytes as a list of byte integers,
+        %% or as a binary once the driver asked for `PORT_CONTROL_FLAG_BINARY`).
+        20 -> P = open(Dir, ""),
+              yn(erlang:port_control(P, 1, <<>>) =:= [97, 98, 99, 100, 101]);
+        21 -> P = open(Dir, ""),
+              yn(erlang:port_control(P, 2, <<>>) =:= []);
+        22 -> P = open(Dir, ""),
+              yn(raises_badarg(fun() -> erlang:port_control(P, 4, <<>>) end));
+        23 -> P = open(Dir, ""),
+              yn(erlang:port_control(P, 5, <<>>) =:= <<"xyz">>);
+        24 -> P = open(Dir, ""),
+              Reply = erlang:port_control(P, 10, <<>>),
+              yn(Reply =:= [111, 107] andalso echoed(P) =:= <<"out">>);
+        %% `25` is the `UINT_MAX` bound `term_to_Uint` puts on the verb: the call is `badarg`
+        %% before any callback runs.
+        25 -> P = open(Dir, ""),
+              yn(raises_badarg(fun() -> erlang:port_control(P, 16#100000000, <<>>) end));
+        %% `26`-`28` widen the *driver entry* surface the port-lifecycle fixture does not reach:
+        %% a term delivered through `erl_drv_output_term`'s `ERL_DRV_PID` operand (the term itself
+        %% is the message, so its per-VM-start image is never pinned — only its identity), the
+        %% driver-entry list's "no such entry" answer, and the port's **busy** state.
+        26 -> P = open(Dir, ""),
+              true = erlang:port_command(P, <<"i">>),
+              receive Term -> yn(Term =:= self()) after 2000 -> 0 end;
+        27 -> registry_answer(open(Dir, ""), <<"r">>,
+                              unsupported_remove_driver_entry_of_an_unlisted_entry);
+        28 -> P = open(Dir, ""),
+              true = erlang:port_command(P, <<"b">>),
+              _ = echoed(P),
+              Busy = erlang:port_command(P, <<"more">>, [nosuspend]),
+              yn(Busy =:= false andalso erlang:port_close(P) =:= true);
+        %% `29` pins the port's own byte counters across one command round trip: `output` counts
+        %% what `port_command/2` handed the driver, `input` what the driver handed back.
+        29 -> P = open(Dir, ""),
+              yn(echo(P, <<"abcde">>) =:= <<"abcde">>
+                 andalso erlang:port_info(P, input) =:= {input, 5}
+                 andalso erlang:port_info(P, output) =:= {output, 5});
+        %% `30` is the capability gate on the *other* side: a driver entry with **no** `control`
+        %% slot is `badarg` for every verb, before any callback runs.
+        30 -> P = open(Dir, ""),
+              yn(raises_badarg(fun() -> erlang:port_control(P, 1, <<>>) end))
     end.
 
 %% Send one payload through the driver and answer the bytes it echoed back (`timeout` when the
 %% driver answered nothing within the module's own 2 s bound, so a case can never hang).
 echo(P, Bin) ->
     true = erlang:port_command(P, Bin),
+    echoed(P).
+%% The next payload the driver answers with on its own (a callback that emits output without a
+%% fresh `port_command/2`, e.g. from inside its `control` callback).
+echoed(P) ->
     receive {P, {data, Bytes}} -> Bytes after 2000 -> timeout end.
 
+%% Whether `F` raises the plain `badarg` the C's port-operand refusals answer with.
+raises_badarg(F) ->
+    try F() of
+        _ -> false
+    catch
+        error:badarg -> true;
+        _:_ -> false
+    end.
 %% Send the fixture's command and classify the one-byte answer it echoes back.
 registry_answer(P, Command, Gap) ->
     true = erlang:port_command(P, Command),
@@ -465,6 +583,193 @@ DRIVER_INIT(host_driver) {
 }
 "#;
 
+/// The **`control`** fixture (selectors `20`-`24`): the entry's `control` callback behind
+/// `erlang:port_control/3`, one verb per reply shape.
+///
+/// `*rbuf`/`rlen` are the reply buffer and its capacity the emulator hands the callback
+/// (`resp_buf`/`resp_size`, `io.c:4336-4354`); the return value is the reply length, or a
+/// negative number for the C's `ERTS_PORT_OP_BADARG` (`io.c:4074`). The five verbs are the five
+/// answer shapes that are reachable on both runtimes:
+///
+/// | verb | the callback does | `port_control/3` answers |
+/// |---|---|---|
+/// | `1` | copies `"abcde"` into `*rbuf`, returns `5` | `[97,98,99,100,101]` (`buf_to_intlist`) |
+/// | `2` | sets `*rbuf = NULL`, returns `0` | `[]` (`write_port_control_result`'s `NIL`) |
+/// | `4` | returns `-1` | `badarg`, before any reply is rendered |
+/// | `5` | `set_port_control_flags(P, PORT_CONTROL_FLAG_BINARY)` + `"xyz"` | `<<"xyz">>` |
+/// | `10` | replies `"ok"` **and** `driver_output`s `"out"` | `[111,107]` and one `{data, <<"out">>}` |
+///
+/// Verb `3` of the prototype was a reply from the **request** buffer (`*rbuf = buf`): the oracle
+/// frees that pointer in `write_port_control_result` (`driver_free(resp_bufp)`, `io.c:4170`) and
+/// the VM dies of SIGSEGV (measured, exit `139`), so no such case can exist — see *measured
+/// divergences* in the module doc.
+const CONTROL_DRIVER_C: &str = r#"/* A real driver .so (contract A.4): the entry's `control` callback, one verb per reply shape. */
+#include <erl_driver.h>
+#include <string.h>
+
+typedef struct {
+    ErlDrvPort port;
+} control_state;
+
+static ErlDrvData control_start(ErlDrvPort port, char *command) {
+    control_state *st;
+    (void) command;
+    st = (control_state *) driver_alloc(sizeof(control_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    return (ErlDrvData) st;
+}
+
+static void control_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+/* `port_control/3`'s callback: `buf`/`len` is the caller's data, `*rbuf`/`rlen` the reply buffer
+ * and its capacity. A negative answer is the C's badarg, nothing is delivered. */
+static ErlDrvSSizeT control_control(ErlDrvData drv_data, unsigned int command,
+                                    char *buf, ErlDrvSizeT len,
+                                    char **rbuf, ErlDrvSizeT rlen) {
+    control_state *st = (control_state *) drv_data;
+    (void) buf;
+    (void) len;
+    if (st == NULL)
+        return -1;
+    switch (command) {
+    case 1:
+        if (rlen < 5)
+            return -1;
+        memcpy(*rbuf, "abcde", 5);
+        return 5;
+    case 2:
+        /* A `NULL` reply pointer is the C's "no reply at all" (`write_port_control_result`). */
+        *rbuf = NULL;
+        return 0;
+    case 4:
+        return -1;
+    case 5:
+        /* Ask for the binary rendering of *this* reply: the emulator reads the flag after the
+         * callback returns (`io.c:4403-4411`), so the very reply asking for it is a binary. */
+        set_port_control_flags(st->port, PORT_CONTROL_FLAG_BINARY);
+        if (rlen < 3)
+            return -1;
+        memcpy(*rbuf, "xyz", 3);
+        return 3;
+    case 10:
+        /* A `control` callback is an ordinary driver callback: what it emits reaches the owner
+         * too, and the reply is returned to the caller. */
+        if (rlen < 2)
+            return -1;
+        memcpy(*rbuf, "ok", 2);
+        (void) driver_output(st->port, "out", 3);
+        return 2;
+    default:
+        return -1;
+    }
+}
+
+static ErlDrvEntry control_entry = {
+    .init = NULL,
+    .start = control_start,
+    .stop = control_stop,
+    .control = control_control,
+    .driver_name = "host_driver",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(host_driver) {
+    return &control_entry;
+}
+"#;
+
+/// The **widened entry** fixture (selectors `26`-`28`): one `output` command per remaining
+/// `ErlDrvEntry`/port-state surface the echo fixture does not carry.
+///
+/// * `"i"` — delivers `ERL_DRV_PID` over `driver_connected/1` through `erl_drv_output_term/3`,
+///   so the owner receives the **pid itself** as the message (`io.c:6162-6176`: the C queues the
+///   decoded term, never a `{Port, Term}` wrapper). Its image is per-VM-start, so the case pins
+///   the term's *identity* (`=:= self()`), never its bytes.
+/// * `"r"` — asks `remove_driver_entry/1` about an entry object that was never added to the
+///   driver list and answers whether the C's `0` ("no such entry", `io.c:7733`) came back.
+/// * `"b"` — marks the port **busy** (`set_busy_port`, the C's `ERTS_PTS_FLG_BUSY_PORT`) and
+///   echoes one byte, so the module knows the state was applied before it probes
+///   `port_command/3`'s `[nosuspend]` answer.
+///
+/// `driver_create_port`'s slot is anchored (never called) for the same reason as
+/// [`REGISTRY_DRIVER_C`]: the `RTLD_NOW` reference keeps the symbol resolved, and calling it with
+/// a driver name the emulator does not know blocks the oracle forever.
+const EXTRA_DRIVER_C: &str = r#"/* A real driver .so (contract A.4): one command per remaining entry / port-state surface. */
+#include <erl_driver.h>
+
+typedef struct {
+    ErlDrvPort port;
+} extra_state;
+
+/* An entry object that is never added to the driver list. */
+static ErlDrvEntry unlisted_entry;
+
+static ErlDrvData extra_start(ErlDrvPort port, char *command) {
+    extra_state *st;
+    (void) command;
+    st = (extra_state *) driver_alloc(sizeof(extra_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    return (ErlDrvData) st;
+}
+
+static void extra_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+static void extra_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    extra_state *st = (extra_state *) drv_data;
+    ErlDrvTermData spec[2];
+    char answer;
+    if (st == NULL || len < 1)
+        return;
+    switch (buf[0]) {
+    case 'i':
+        /* The connected process, as a term: `ERL_DRV_PID` carries term data, not a spec. */
+        spec[0] = ERL_DRV_PID;
+        spec[1] = driver_connected(st->port);
+        (void) erl_drv_output_term(driver_mk_port(st->port), spec, 2);
+        break;
+    case 'r':
+        /* '1' when the answer is the C's 0: the entry is not in the driver list. */
+        answer = (remove_driver_entry(&unlisted_entry) == 0) ? '1' : '0';
+        (void) driver_output(st->port, &answer, 1);
+        break;
+    case 'b':
+        set_busy_port(st->port, 1);
+        answer = '1';
+        (void) driver_output(st->port, &answer, 1);
+        break;
+    default:
+        break;
+    }
+}
+
+static ErlDrvEntry extra_entry = {
+    .init = NULL,
+    .start = extra_start,
+    .stop = extra_stop,
+    .output = extra_output,
+    .driver_name = "host_driver",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(host_driver) {
+    return &extra_entry;
+}
+"#;
+
 /// The registry fixture every selector-`7` case loads.
 const REGISTRY_DRIVER: NifFixture = NifFixture::CompiledLibrary {
     name: "host_driver",
@@ -481,6 +786,18 @@ const LOCK_DRIVER: NifFixture = NifFixture::CompiledLibrary {
 const ENTRY_DRIVER: NifFixture = NifFixture::CompiledLibrary {
     name: "host_driver",
     c_source: ENTRY_DRIVER_C,
+};
+
+/// The `control`-callback fixture the `20`-`24` cases load.
+const CONTROL_DRIVER: NifFixture = NifFixture::CompiledLibrary {
+    name: "host_driver",
+    c_source: CONTROL_DRIVER_C,
+};
+
+/// The widened-entry fixture the `26`-`28` cases load.
+const EXTRA_DRIVER: NifFixture = NifFixture::CompiledLibrary {
+    name: "host_driver",
+    c_source: EXTRA_DRIVER_C,
 };
 
 /// Build one module-run case over [`DRIVER_MODULE_SOURCE`] with `fixture` as its `.so`.
@@ -608,6 +925,75 @@ pub(crate) fn group() -> Vec<Case> {
             &[15],
             HOST_DRIVER,
         ),
+        // --- the entry's `control` callback (`erlang:port_control/3`) -------------------------
+        case(
+            "driver_c/driver_control_replies_from_its_handed_buffer",
+            "port_control/3 hands the driver a reply buffer and returns the bytes it wrote there as a list",
+            &[20],
+            CONTROL_DRIVER,
+        ),
+        case(
+            "driver_c/driver_control_with_a_null_reply_is_the_empty_list",
+            "a control callback that answers a NULL reply pointer makes port_control/3 return []",
+            &[21],
+            CONTROL_DRIVER,
+        ),
+        case(
+            "driver_c/driver_control_negative_result_is_badarg",
+            "a control callback that returns a negative length makes port_control/3 raise badarg",
+            &[22],
+            CONTROL_DRIVER,
+        ),
+        case(
+            "driver_c/driver_control_binary_flag_renders_the_reply_as_a_binary",
+            "set_port_control_flags(P, PORT_CONTROL_FLAG_BINARY) in the callback makes the reply a binary",
+            &[23],
+            CONTROL_DRIVER,
+        ),
+        case(
+            "driver_c/driver_control_output_reaches_the_owner_alongside_the_reply",
+            "a control callback's driver_output reaches the owner while port_control/3 still returns its reply",
+            &[24],
+            CONTROL_DRIVER,
+        ),
+        case(
+            "driver_c/port_control_refuses_a_verb_beyond_uint_max",
+            "port_control/3 raises badarg for a verb above UINT_MAX, before any driver callback",
+            &[25],
+            CONTROL_DRIVER,
+        ),
+        case(
+            "driver_c/port_control_is_badarg_for_a_driver_without_a_control_callback",
+            "port_control/3 raises badarg for every verb on a driver entry with no control slot",
+            &[30],
+            HOST_DRIVER,
+        ),
+        // --- the rest of the entry / port-state surface --------------------------------------
+        case(
+            "driver_c/erl_drv_output_term_delivers_the_connected_pid_operand",
+            "erl_drv_output_term's ERL_DRV_PID operand arrives as the port's connected process itself",
+            &[26],
+            EXTRA_DRIVER,
+        ),
+        case(
+            "driver_c/remove_driver_entry_of_an_unlisted_entry_answers_zero",
+            "remove_driver_entry/1 answers 0 (no such entry) for an entry that is not in the driver list",
+            &[27],
+            EXTRA_DRIVER,
+        ),
+        case(
+            "driver_c/set_busy_port_makes_port_command_nosuspend_report_false",
+            "a busy driver port answers false to port_command/3 with [nosuspend] and still closes cleanly",
+            &[28],
+            EXTRA_DRIVER,
+        ),
+        // --- the port's own byte counters ----------------------------------------------------
+        case(
+            "driver_c/port_info2_counters_follow_one_command_round_trip",
+            "after one port_command/2 round trip port_info/2 reports the payload on both {output, N} and {input, N}",
+            &[29],
+            HOST_DRIVER,
+        ),
     ]
 }
 #[cfg(test)]
@@ -617,13 +1003,32 @@ mod tests {
     //! C fixture, and its golden is an integer. The three registry-family selectors (`7`, `8`,
     //! `9`) each carry their **own** C source, so a case's temp dir holds exactly one `.so`.
 
-    use super::{group, CaseKind, Contract, NifFixture, HOST_DRIVER_C};
+    use super::{
+        group, CaseKind, Contract, NifFixture, CONTROL_DRIVER_C, ENTRY_DRIVER_C, EXTRA_DRIVER_C,
+        HOST_DRIVER_C, LOCK_DRIVER_C, REGISTRY_DRIVER_C,
+    };
     use std::collections::HashSet;
+
+    /// The selectors that own a **dedicated** C source rather than the shared echo fixture. Each
+    /// carries one family's checks, so it must resolve to its family's source and never fall back
+    /// to [`HOST_DRIVER_C`], whose `output` callback only echoes.
+    const OWN_SOURCE_SELECTORS: &[i64] = &[7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28];
+
+    /// The source each own-source selector must carry (its family's fixture).
+    fn family_source(selector: i64) -> Option<&'static str> {
+        match selector {
+            7 => Some(REGISTRY_DRIVER_C),
+            8 => Some(LOCK_DRIVER_C),
+            9 => Some(ENTRY_DRIVER_C),
+            20..=25 => Some(CONTROL_DRIVER_C),
+            26..=28 => Some(EXTRA_DRIVER_C),
+            _ => None,
+        }
+    }
 
     #[test]
     fn every_case_is_a_driver_module_run_over_a_compiled_fixture() {
         let mut selectors = HashSet::new();
-        let mut sources = HashSet::new();
         for case in group() {
             assert!(
                 case.id.starts_with("driver_c/"),
@@ -647,12 +1052,33 @@ mod tests {
                 panic!("case {}: the driver must be a real C-compiled .so", case.id);
             };
             assert_eq!(name, "host_driver", "case {}: the driver name is fixed", case.id);
-            // The registry-family cases must not share a C source: each gets its own `.so` so a
-            // case's temp dir holds exactly one library.
-            if (7..=9).contains(&run.args[0]) {
-                assert!(
-                    sources.insert(c_source),
-                    "case {}: selector {} reuses another case's C source",
+            assert!(
+                [
+                    HOST_DRIVER_C,
+                    REGISTRY_DRIVER_C,
+                    LOCK_DRIVER_C,
+                    ENTRY_DRIVER_C,
+                    CONTROL_DRIVER_C,
+                    EXTRA_DRIVER_C
+                ]
+                .contains(&c_source),
+                "case {}: the fixture is not one of the group's C sources",
+                case.id
+            );
+            if OWN_SOURCE_SELECTORS.contains(&run.args[0]) {
+                // A family fixture must not ride the echo fixture: each case gets its own `.so`,
+                // and a source shared across families would mean one family's checks riding on
+                // another family's callback.
+                assert_eq!(
+                    Some(c_source),
+                    family_source(run.args[0]),
+                    "case {}: selector {} does not carry its family's C source",
+                    case.id,
+                    run.args[0]
+                );
+                assert_ne!(
+                    c_source, HOST_DRIVER_C,
+                    "case {}: selector {} must not ride the echo fixture",
                     case.id,
                     run.args[0]
                 );
@@ -677,12 +1103,7 @@ mod tests {
             );
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
         }
-        assert_eq!(
-            selectors.len(),
-            group().len(),
-            "every selector is distinct"
-        );
-        assert_eq!(selectors.len(), 15, "the group covers fifteen distinct selectors");
-        assert_eq!(sources.len(), 3, "the three registry selectors carry three C sources");
+        assert_eq!(selectors.len(), group().len(), "every selector is distinct");
+        assert_eq!(selectors.len(), 26, "the group covers twenty-six distinct selectors");
     }
 }
