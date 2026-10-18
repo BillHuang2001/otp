@@ -51,6 +51,8 @@ never touched from here.
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine [--test <name>]`.
 
 ## Notes for Agents
+- `beam_engine::exec_census` counts **only** through the interpreter funnel (`Machine::step_instruction`): a natively-inlined baseline-JIT instruction is invisible to it, so any run whose counts are meant to be complete must pin `Tier::Interpreter` (`run_export`/`ModuleHost::call` already are that path). Its `Snapshot::first_error` stores the error's `Display`, so a **structured raise renders as `error <structured reason>`** — the true class/reason rides `Raise::live_reason` as a term, not in the text, so never key an assertion on the raise text beyond that placeholder.
+- The `dynamic_census` driver keeps its error map honest by classifying every run as a value or a **declared** raise; an error from an undeclared run is printed under `*** UNEXPECTED CENSUS ERRORS ***` and fails the test.
 - `TEST_NOTES.md` (crate-root, not owned here) is the authoritative per-suite enumeration; do not
   duplicate it here.
 - A suite needing the system toolchain (a real `.beam`, the `erl` oracle, or an `erlc` fixture
