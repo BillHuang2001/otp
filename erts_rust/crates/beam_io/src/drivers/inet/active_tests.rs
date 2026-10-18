@@ -412,9 +412,10 @@ fn active_n_delivers_n_messages_then_one_passive_event() {
 /// Two whole frames that are **already in the socket** when the readiness edge is reported are
 /// both delivered by that one round, in arrival order, into a single drain.
 ///
-/// This is `tcp_deliver`'s loop (`inet_drv.c:13067`-`:13130`): as long as a complete packet sits in
-/// the driver's buffer it is delivered, and the loop only reads again when the buffer falls short —
-/// so a callback serves **every** buffered frame, not one per callback. `{active, true}` never
+/// This is `tcp_deliver`'s loop (`inet_drv.c:13042`-`:13127`, `while (len > 0)` at `:13061`): as
+/// long as a complete packet sits in the driver's buffer it is delivered, and the loop only reads
+/// again when the buffer falls short — so a callback serves **every** buffered frame, not one per
+/// callback. `{active, true}` never
 /// spends its grant, so the burst is the only thing bounding the round.
 #[test]
 fn two_frames_buffered_before_a_round_are_both_delivered_by_it_in_arrival_order() {
@@ -447,7 +448,7 @@ fn two_frames_buffered_before_a_round_are_both_delivered_by_it_in_arrival_order(
     assert_eq!(port.input_len(), 0, "an active port never fills the input queue");
 }
 
-/// A grant spent mid-burst **ends** the burst there (`if (! desc->inet.active)`, `inet_drv.c:13108`):
+/// A grant spent mid-burst **ends** the burst there (`if (! desc->inet.active)`, `inet_drv.c:13107`):
 /// with `{active, 1}` and two frames already buffered, exactly one message is delivered, nothing
 /// announces the flip (unlike `{active, N}`), and the second frame is still there — the next
 /// passive `recv` takes it off the driver's buffer, so it was never consumed, only held.

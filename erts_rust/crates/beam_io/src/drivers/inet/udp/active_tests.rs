@@ -77,7 +77,8 @@ const INET_REQ_SETOPTS: u32 = 7;
 const INET_REQ_GETOPTS: u32 = 8;
 /// `INET_REQ_GETSTAT` (`:11550`).
 const INET_REQ_GETSTAT: u32 = 11;
-/// `INET_REQ_NAME` (`inet_drv.c:11329`) — the port's own endpoint as a packed address.
+/// `INET_REQ_NAME` (`inet_drv.c:809`, the `sockname` arm at `:11360`) — the port's own endpoint as
+/// a packed address.
 const INET_REQ_NAME: u32 = 5;
 /// The C's `INET_STAT_RECV_CNT` counter op (a 5-byte `[op, u32_be]` record).
 const INET_STAT_RECV_CNT: u8 = 1;
@@ -409,7 +410,7 @@ fn an_active_port_delivers_the_datagram_with_its_packed_source_address() {
 /// The port is bound to `INADDR_ANY` (`INET_AF_ANY`, the wildcard form of the bind's packed
 /// address), so the receiver's own endpoint is `0.0.0.0:<bound>` and cannot be confused with the
 /// delivered source: the seven packed bytes are `recvfrom(2)`'s `other` address, rendered by
-/// `packet_binary_message` (`inet_drv.c:4110`) in front of the payload. The system driver agrees —
+/// `packet_binary_message` (`inet_drv.c:4106`) in front of the payload. The system driver agrees —
 /// [`the_binary_delivery_shape_agrees_with_the_oracle`] pins the oracle's
 /// `{udp,S,{127,0,0,1},SrcPort,Data}` for a `gen_udp:open/2` socket, whose bind is the wildcard too.
 #[test]
