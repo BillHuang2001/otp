@@ -110,9 +110,9 @@ mod tests {
     }
 
     /// The per-family key counts this module's `CONTEXT.md` states, pinned against the
-    /// actual registrations: `76 + 56 + 18 + 43 = 193` keys registered across the four
-    /// `runtime_bif!` families, of which **172** forward to the `RuntimeHooks` seam (the
-    /// other twenty-one are the families' real `REAL_BIFS`), plus the 2 `MemoryHook`
+    /// actual registrations: `76 + 56 + 20 + 13 + 28 = 193` keys registered across the five
+    /// `runtime_bif!` families, of which **143** forward to the `RuntimeHooks` seam (the
+    /// other **fifty** are the families' real `REAL_BIFS`), plus the 2 `MemoryHook`
     /// (`erlang:memory/0,1`), 13 `atomics`/`counters` and 1 `ddll` real keys — **209**
     /// registered under `runtime/`. A family that drifts must update the doc.
     #[test]
