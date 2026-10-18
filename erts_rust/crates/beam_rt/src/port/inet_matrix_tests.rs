@@ -64,11 +64,12 @@
 //! * [`the_documented_datagram_residuals_stay_typed`] — the rows reached on a `udp_inet` port,
 //!   asserted on **both** sides (the exact oracle output, so the record cannot rot, plus this
 //!   runtime's honest answer): the asynchronous `PACKET_REQ_RECV` op-id (served here as the
-//!   synchronous read-now substitution) and `open` of a non-`AF_INET` family (this floor's own
-//!   `[0]eafnosupport` where the C creates the socket).
+//!   synchronous read-now substitution), `open` of a non-`AF_INET` family (this floor's own
+//!   `[0]eafnosupport` where the C creates the socket) and `INET_REQ_FDOPEN` on a port that already
+//!   holds a socket (this floor's `[0]einval` where the C adopts the operand's descriptor and leaks
+//!   the live socket).
 //! * [`the_residuals_no_oracle_column_can_pin_stay_typed`] — the shapes whose oracle reply depends on
-//!   the oracle **process'** own descriptor table (`INET_REQ_FDOPEN`'s adoption form) or on a state
-//!   the C only reaches through its asynchronous `accept`/`connect` protocol (`ignorefd`,
+//!   a state the C only reaches through its asynchronous `accept`/`connect` protocol (`ignorefd`,
 //!   `tcp_sendfile`, which need a connected stream), so those rows are pinned on this runtime's side
 //!   alone — each asserted to be a typed capability gap naming the request, never a fabricated reply.
 //!
@@ -654,8 +655,9 @@ fn datagram_options() -> Vec<Probe> {
 /// which is `EBADF` in every process — so it is exact. `fdopen_wellformed` names a descriptor both
 /// sides hold and neither can socket-ise — standard output, which [`erl_eval`] pipes for the oracle
 /// and the test harness captures for this runtime — and is compared by shape because the C answers
-/// with *its* `sock_errno()`. (The successful **adoption** form is a typed gap: see
-/// [`the_residuals_no_oracle_column_can_pin_stay_typed`].)
+/// with *its* `sock_errno()`. (The **adoption** form of the same request, on a port that already
+/// holds a socket, is a documented residual: see
+/// [`the_documented_datagram_residuals_stay_typed`].)
 ///
 /// The name-service rows are the same shared arms over the host's services database: the two
 /// `*_wellformed` operands fail the C's operand arithmetic (`einval`) on both sides, and the
@@ -882,8 +884,7 @@ struct ResidualSession {
 /// The `udp` shapes this runtime answers differently, each a **capability gap or a documented
 /// substitution** on the driver side (`beam_io`), never a wrong result.
 ///
-/// Both rows left in this table are the floor's own, and neither is a `beam_io` request that is
-/// merely unimplemented:
+/// All three rows are the floor's own, and none is a `beam_io` request that is merely unimplemented:
 ///
 /// * `PACKET_REQ_RECV`(`60`) is the **synchronous read-now substitution**. The C enqueues an
 ///   asynchronous operation and answers its op id (`[1] ++ async_id_be16`, measured `[1,0,0]`),
@@ -893,6 +894,16 @@ struct ResidualSession {
 ///   `AF_INET6` open is the driver's own `[0]eafnosupport` refusal, where the C creates the socket
 ///   and answers `[1]`. It is probed on a **bare** port: on the C the successful open leaves a
 ///   socket behind, so a following `open` there is `exbadseq`, not a second `[1]`.
+/// * `INET_REQ_FDOPEN`(`13`) on a port that **already holds a socket**: the C overwrites the
+///   descriptor it is using with the operand's (`inet_drv.c:5251`, then `desc->prebound = 1`), so
+///   the request answers `[1]`, the caller's number becomes the port's and the live socket is
+///   leaked; this floor keeps the live socket and refuses with `[0]einval`. The operand's `bound`
+///   word is **zero** — the ten-byte form's un-bound half — because that is what makes the row
+///   pinnable: with `bound` set the C runs its pre-adoption `sock_name(2)` check first, whose answer
+///   is the *probe process'* descriptor table (`[0]ebadf`/`[0]enotsock`/`[1]` depending on whatever
+///   that number happens to name), which no oracle column can pin. The descriptor word is `65535`,
+///   the largest number the emulator admits (so the C's own `driver_select` stays silent on it) and
+///   one no process running this test holds, so the adoption is side-effect free on both sides.
 fn residual_sessions() -> Vec<ResidualSession> {
     vec![
         ResidualSession {
@@ -918,6 +929,28 @@ fn residual_sessions() -> Vec<ResidualSession> {
                 ours: b"\x00eafnosupport",
                 residual: "`INET_REQ_OPEN` of an `AF_INET6` socket is this floor's `eafnosupport` \
                            refusal; the C creates it and answers `[1]`",
+            }],
+        },
+        ResidualSession {
+            what: "the `udp_inet` port that already holds a socket",
+            driver: "udp_inet",
+            // The precondition itself: `INET_REQ_OPEN` really gives the port a descriptor (two
+            // sockets never get the same number, so only its shape is comparable).
+            setup: vec![
+                Probe::exact("open", 1, vec![1, 2, 0]),
+                Probe::prefix("getfd_open", 14, vec![], "[1,0,0,0,"),
+            ],
+            rows: vec![Residual {
+                probe: Probe::exact(
+                    "fdopen_already_open",
+                    13,
+                    vec![1, 2, 0, 0, 255, 255, 0, 0, 0, 0],
+                ),
+                oracle: "[1]",
+                ours: b"\x00einval",
+                residual: "`INET_REQ_FDOPEN` on a port that already holds a socket: the C adopts \
+                           the operand's descriptor and leaks the live socket, this floor keeps the \
+                           live socket and refuses with `einval`",
             }],
         },
     ]
@@ -1006,51 +1039,21 @@ fn assert_typed_gap(what: &str, reply: &Reply, expected: &str) {
 }
 
 /// The typed gaps whose oracle reply **no oracle column can pin**, asserted on this runtime's side
-/// alone — and the one test to read before "fixing" a `[1]` here into a row.
+/// alone.
 ///
-/// Two different reasons put a shape here:
-///
-/// * the reply is the **oracle process' own** descriptor state. `INET_REQ_FDOPEN`'s adoption form
-///   probes a descriptor number *this* process owns (a bound `AF_INET` socket), so the pre-adoption
-///   `sock_name(2)` check the C runs first passes here and would hand the descriptor over
-///   (`inet_drv.c:5266`, `desc->prebound = 1`, then `[1]`), while the same number in the oracle's
-///   descriptor table is an unrelated file and the C answers whatever *its* `sock_name(2)` says
-///   (`enotsock`/`ebadf`, or `[1]` if it happened to be an `AF_INET` socket). Nothing about that
-///   number is a property of the bridge.
-/// * the state is one the C only reaches **asynchronously**. `INET_REQ_IGNOREFD`(`28`) and
-///   `TCP_REQ_SENDFILE`(`45`) are stream-only arms that first require a *connected* socket, and a
-///   `port_control`-only session cannot connect the oracle's driver: the C's `INET_REQ_ACCEPT`
-///   answers the async op id (measured `[1,0,0]`, then `[1,0,1]`) and leaves the driver
-///   `enotconn`, so `ignorefd` there is `[0]enotconn` rather than the `[1]` its body would return.
+/// Both rows name a state the C only reaches **asynchronously**. `INET_REQ_IGNOREFD`(`28`) and
+/// `TCP_REQ_SENDFILE`(`45`) are stream-only arms that first require a *connected* socket, and a
+/// `port_control`-only session cannot connect the oracle's driver: the C's `INET_REQ_ACCEPT`
+/// answers the async op id (measured `[1,0,0]`, then `[1,0,1]`) and leaves the driver `enotconn`,
+/// so `ignorefd` there is `[0]enotconn` rather than the `[1]` its body would return.
 ///
 /// The C's own answers — `[1]` for both, once a stream is connected — are cited above; what is
 /// asserted here is that this floor answers a **typed capability gap naming the request**, never a
-/// fabricated `[1]`.
+/// fabricated `[1]`. Every other divergence of this bridge **is** oracle-pinned: see
+/// [`the_documented_datagram_residuals_stay_typed`].
 #[test]
 fn the_residuals_no_oracle_column_can_pin_stay_typed() {
-    use std::os::unix::io::AsRawFd;
-
     let mut session = Session::new();
-
-    // `INET_REQ_FDOPEN`'s adoption form: the ten-byte operand whose `bound` word is non-zero, over a
-    // descriptor this test really owns and has bound (so the pre-adoption check passes).
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a bound AF_INET descriptor");
-    let mut adopt = vec![1u8, 1]; // INET_AF_INET, INET_TYPE_STREAM
-    adopt.extend_from_slice(&(listener.as_raw_fd() as u32).to_be_bytes());
-    adopt.extend_from_slice(&[0, 0, 0, 1]); // `bound`
-    let udp = session.open("udp_inet");
-    assert_eq!(
-        session
-            .control(udp, &Probe::exact("open", 1, vec![1, 2, 0]))
-            .render(),
-        "[1]",
-        "the datagram session needs the socket `INET_REQ_OPEN` creates"
-    );
-    assert_typed_gap(
-        "INET_REQ_FDOPEN's adoption form",
-        &session.control(udp, &Probe::exact("fdopen_adopt", 13, adopt)),
-        "`fdopen`",
-    );
 
     // `INET_REQ_IGNOREFD`/`TCP_REQ_SENDFILE` on a **connected** stream: open → bind → listen →
     // accept, the accepted connection coming from a plain loopback client of this test.
