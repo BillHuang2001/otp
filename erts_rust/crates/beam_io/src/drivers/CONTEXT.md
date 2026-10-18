@@ -75,26 +75,46 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
 
 ## Known Issues
 - **The C `ram_file_drv` answers its two reply families through two different output calls.** `OK`/`ERROR`/`NUMBER` go through `driver_output2` (a plain byte list) while `DATA` goes through `driver_output_binary` (an improper `[header | binary]` iolist on a `[binary]` port), so an oracle probe that reads the raw port message must normalise with `binary_to_list(iolist_to_binary(D))` before comparing — and `io:format("~p", [D])` on the raw term raises. In this crate both families simply become bytes appended to [`DriverContext::input()`](crate::DriverContext::input), which is what the port delivers to the owner.
-- **`ram_file_drv` is registered as a built-in but no runtime path opens a port on it.** `DriverRegistry::with_builtins()` (in `../driver.rs`) registers `"fd"`/`"efile"`/`"tcp_inet"`/`"udp_inet"`/`"ram_file_drv"`; the driver is also exported (`make_ram_file`, the `DriverFactory` shape) so a host can register it under `DRIVER_NAME`, but `beam_rt` has no `ram_file` port path or `ram_file:*` BIF floor. The port's reserved `"close"` is the teardown op for a raw `open_port` port; the driver's own `"close"` verb exists for a direct caller and is what [`Driver::stop`](crate::Driver::stop) runs.
-- **Line framing (`[line]` / `[binary,{line,N}]`) is implemented at the PORT; the remaining half is upstream in `beam_rt`.** The C splits lines in the port, not the driver (`deliver_linebuf_message`, `io.c:3454`), so `SpawnDriver::ready_input` pushing raw bytes into `ctx.input()` is correct, and `FdDriver` carrying the `line`/`text` framing (`spawn.rs:100` says so explicitly) is a driver-level facility for `fd`/`efile`, not the mechanism the oracle's message shape needs.
-  `LineBuffer` reproduces the C `read_linebuf`/`flush_linebuf` byte stream and its `LINEBUF_EOL`/`LINEBUF_NOEOL` marker (`io.c:3252-3307`) arm-for-arm — the suspected trailing-`\r` divergence is a **non-issue**: the C appends a `\r` exactly when it is followed by a non-`\n` (`LINEBUF_CR_INSIDE`, `io.c:3290`) and `LineBuffer` does the same (`line_buffer.rs:150-154`; `flush_all` restores the held `\r`), verified against the oracle (`abcd\r` then `x` ⇒ one `{noeol,[13,120]}` frame carrying `\r`+`x`).
-  The `{eol|noeol,Data}` wrapper's port half is done: `Port::set_line_mode` drives the framing, the frames ride the separate `PortRegistry::take_line_notifications` channel (`LineNotification`, many per read, empty `eol` frame kept) rather than the raw `PortNotification::Data` one, `take_eof` runs the `driver_eof` flush, and a close never flushes. The whole pinned oracle table is cross-checked byte-for-byte in `tests/spawn.rs::line_framing_matches_the_oracle`.
-  What is still missing is `beam_rt`'s: the `{Port,{data,{eol|noeol,Data}}}` **term rendering**, the `open_port/2` `line`/`{line,N}` **option parsing** and draining `take_line_notifications` after each round (`beam_rt/src/port.rs::port_options` whitelists-but-ignores the options today, so `[line,{packet,2}]` and `[line,stderr_to_stdout,nouse_stdio]` succeed where the oracle raises `error:badarg`), so the gap is **not** end-to-end closable inside `beam_io`.
+- **`ram_file_drv` is a registered built-in with a live runtime path.** `DriverRegistry::with_builtins()`
+  (in `../driver.rs`) registers `"fd"`/`"efile"`/`"tcp_inet"`/`"udp_inet"`/`"ram_file_drv"`, and
+  `beam_rt` opens a port on it through `open_port({spawn_driver,"ram_file_drv"}, …)` (its
+  `src/port/ram_file_matrix_tests.rs` cross-checks this driver's whole command/reply matrix against the
+  live oracle). The port's reserved `"close"` is the teardown op for a raw `open_port` port; the
+  driver's own `"close"` verb exists for a direct caller and is what
+  [`Driver::stop`](crate::Driver::stop) runs.
+- **Line framing (`[line]` / `[binary,{line,N}]`) is applied at the PORT, not in the driver.** The C
+  splits lines in the port, not the driver (`deliver_linebuf_message`, `io.c:3454`), so
+  `SpawnDriver::ready_input` pushing raw bytes into `ctx.input()` is correct, and `FdDriver` carrying
+  the `line`/`text` framing is a driver-level facility for `fd`/`efile`, not the mechanism the oracle's
+  message shape needs.
+  `LineBuffer` reproduces the C `read_linebuf`/`flush_linebuf` byte stream and its
+  `LINEBUF_EOL`/`LINEBUF_NOEOL` marker (`io.c:3252-3307`) arm-for-arm — the trailing-`\r` case needs no
+  divergence: the C appends a `\r` exactly when it is followed by a non-`\n` (`LINEBUF_CR_INSIDE`,
+  `io.c:3290`) and `LineBuffer` does the same (`line_buffer.rs:150-154`; `flush_all` restores the held
+  `\r`), verified against the oracle (`abcd\r` then `x` ⇒ one `{noeol,[13,120]}` frame carrying `\r`+`x`).
+  The port half is [`Port::set_line_mode`](crate::Port::set_line_mode) plus the separate
+  [`PortRegistry::take_line_notifications`](crate::PortRegistry::take_line_notifications) channel
+  (`LineNotification`, many per read, an empty `eol` frame kept) rather than the raw
+  `PortNotification::Data` one; `take_eof` runs the `driver_eof` flush and a close never flushes.
+  `beam_rt` adopts the whole chain (its `open_port/2` option parsing, the `{Port,{data,{eol|noeol,Data}}}`
+  rendering and the per-round drain); the pinned oracle table is cross-checked byte-for-byte in
+  `tests/spawn.rs::line_framing_matches_the_oracle`.
   **Oracle stream (OTP 29 / erts-17.1):** `[line]` `printf 'a\nb\nc\n'` ⇒ `{data,{eol,"a"}}`,`{data,{eol,"b"}}`,`{data,{eol,"c"}}`; `printf 'a\nb'` ⇒ `{eol,"a"}` then `{noeol,"b"}` (the partial flushes at **child EOF**, as `noeol`); `[binary]` ⇒ plain `{data,<<…>>}` (no wrapper); `[binary,{line,4}]` over `abcdefgh\n` ⇒ `{noeol,<<abcd>>}` then `{eol,<<efgh>>}`; a blank line ⇒ `{data,{eol,[]}}`; the `{eol|noeol,_}` wrapper is applied in **both** list and binary mode; the split is state-dependent, not write-chunk-dependent (`\n` alone still completes the pending line as `eol`), and `port_close` does **not** flush (only child EOF does — `io.c:7211`).
 - **`{fd,N}` spawn port holds an `Interest::BOTH` registration for its life.** `arm_output`/
   `disarm_output` are no-ops for `duplex` (`spawn.rs:913-941`), so the single adopted descriptor stays
   registered both ways after read EOF (`release_stdout` is a no-op for duplex). Harmless under the
   edge-triggered poller, but a spurious `OUTPUT` task is scheduled on every write-readiness event.
-- **A command on a socket-less or peerless inet port is a typed `BeamError::BadArg` refusal with the
-  queued bytes retained** — `inet/mod.rs::write_pending` (`connected_socket()?`) and its `udp.rs`
-  counterpart (`socket.filter(state.is_connected())`), reached from both `output` and
+- **A command on a socket-less inet port is a typed `BeamError::BadArg` refusal with the queued bytes
+  retained** — `inet/mod.rs::write_pending` (`connected_socket()?`, the C's `!IS_CONNECTED`) and its
+  `udp.rs` counterpart (a `self.socket`-less `Err`, the C's `!IS_OPEN`), reached from both `output` and
   `ready_output`. Nothing is consumed, so a re-driven `OUTPUT` task refuses identically instead of
   losing data; the `Err` short-circuits `Port::check_write_accounting` and surfaces out of
-  `PortRegistry::execute_port_tasks`, and `erlang:port_command/2` raises. The oracle instead answers
-  `true` and then either delivers `{error,enotconn}` out of band (a caller-ref-prefixed payload) or
-  kills the port (`init_caller`'s `EINVAL`) — neither shape is reachable through the frozen `Driver`
-  trait (no `driver_failure` seam, no asynchronous `{inet_reply,…}` channel). The measured oracle
-  shapes are in `inet/CONTEXT.md` › *Known Issues*.
+  `PortRegistry::execute_port_tasks`, and `erlang:port_command/2` raises. An **open but unconnected**
+  datagram port really sends (the destination rides the command's address field), so only a socket-less
+  one refuses. The oracle instead answers `true` and then either delivers `{error,enotconn}` out of band
+  (a caller-ref-prefixed payload) or kills the port (`init_caller`'s `EINVAL`) — neither shape is
+  reachable through the frozen `Driver` trait (no `driver_failure` seam, no asynchronous
+  `{inet_reply,…}` channel). The measured oracle shapes are in `inet/CONTEXT.md` › *Known Issues*.
 - Non-obvious framing divergences recorded in code: an out-of-range `{packet,N}` code is treated as
   **no framing** where the C's `packet_get_length` `default:` rejects it (`inet/frame.rs:96-105`); an
   unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).
