@@ -881,7 +881,11 @@ pub(crate) fn scatter_roots_full(
 ///   links and monitors). So the notice is **latched** on the runtime
 ///   ([`Runtime::note_max_heap_kill`](crate::runtime::Runtime)) and the runner performs it at its
 ///   next slice boundary, through the ordinary exit-reason path — `{'EXIT', Pid, killed}` for a
-///   trapping linked peer, `'DOWN' … killed` for a monitor, untrappable by the victim.
+///   trapping linked peer, `'DOWN' … killed` for a monitor, untrappable by the victim. A kill
+///   **also logs**: the two flags are independent in the C (`if (max_heap_flags &
+///   MAX_HEAP_SIZE_LOG)` is checked before the kill, `erl_gc.c:3756`), so a breach that kills emits
+///   the `=ERROR REPORT====` with `Kill: true` and then terminates the process — probed against the
+///   oracle, one report *and* the `killed` exit.
 /// * [`HeapLimitVerdict::Log`] — the process keeps running and the ERTS `=ERROR REPORT====` is
 ///   emitted (only when `flags.error_logger` is set), once per over-limit collection, which is the
 ///   oracle's own cadence.
@@ -897,18 +901,49 @@ pub(crate) fn drain_max_heap_verdict(
     use beam_process::HeapLimitVerdict;
     match process.take_max_heap_verdict() {
         None | Some(HeapLimitVerdict::Within) => {}
-        Some(HeapLimitVerdict::Kill) => runtime.note_max_heap_kill(pid),
+        Some(HeapLimitVerdict::Kill) => {
+            // Log **first** (the C's order: the report is built and sent, then the kill flag is
+            // returned), and only then latch the kill for the runner to perform. The report is
+            // emitted **once** per breach — `note_max_heap_kill` answers `true` only when it newly
+            // latched the verdict — because the oracle dies in the very collection that decided
+            // the kill (`erl_gc.c:3744-3803`), while a deferred kill can span several collections
+            // before the runner's slice boundary performs it.
+            if runtime.note_max_heap_kill(pid) {
+                report_max_heap_breach(process, pid);
+            }
+        }
         Some(HeapLimitVerdict::Log) => report_max_heap_breach(process, pid),
     }
 }
 
-/// Emits the ERTS `=ERROR REPORT====` for a `max_heap_size` breach that must **not** kill the
-/// process (`kill => false`, `error_logger => true`) — the C's `error_logger` report from
-/// `erl_gc.c`'s `check_max_heap_size`.
+/// Emits the ERTS `=ERROR REPORT====` for a `max_heap_size` breach (`error_logger => true`) — the
+/// C's `error_logger` report from `erl_gc.c`'s `check_max_heap_size`, for **both** verdicts: a
+/// `Log` breach leaves the process running, a `Kill` breach reports and then dies.
 ///
-/// The report goes to **stderr** (probed: the oracle prints it there, not on stdout) and the
-/// process keeps running. Only the fields this runtime can answer truthfully are printed; the C's
-/// `GC Info`/`Stacktrace` lines are omitted rather than fabricated.
+/// # The block, as this runtime emits it
+///
+/// ```text
+/// =ERROR REPORT====
+///      Process:            <N>
+///      Context:            maximum heap size reached
+///      Max Heap Size:      <the bound in words>
+///      Total Heap Size:    <the capacity the collection installed>
+///      Kill:               <true|false>
+///      Error Logger:       true
+///      Message Queue Len:  <the mailbox length>
+/// ```
+///
+/// The seven leading field names, their order and their spacing are the oracle's own
+/// (`erl_gc.c:3763-3773`) — pinned by `tests/max_heap_flag.rs` against a live `erl`. The C's
+/// trailing `GC Info` and `Stacktrace` fields are **omitted** rather than fabricated: this runtime
+/// has no GC-info proplist in the C's shape and does not walk a stacktrace at a collection.
+///
+/// The stream is **stderr**, and the header carries no timestamp: the oracle's report is a `logger`
+/// message delivered to the default handler, so it lands on **stdout** under `-noshell` and its
+/// header is `=ERROR REPORT==== <timestamp> ===`. This runtime has no `logger` process — the report
+/// is written synchronously from the collection site — so it goes to the diagnostic stream and the
+/// header keeps this runtime's own shape. Pinned as a documented divergence by
+/// `tests/max_heap_flag.rs`.
 fn report_max_heap_breach(process: &beam_process::Process, pid: beam_process::ProcessId) {
     use std::io::Write as _;
 

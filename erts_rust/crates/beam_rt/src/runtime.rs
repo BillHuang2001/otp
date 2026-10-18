@@ -1744,8 +1744,15 @@ impl Runtime {
     /// ([`crate::context::gc::drain_max_heap_verdict`]), which hold the process mutably and
     /// therefore cannot terminate it: termination is the scheduler's, so the notice waits for the
     /// runner's next slice boundary.
-    pub(crate) fn note_max_heap_kill(&mut self, pid: ProcessId) {
-        self.max_heap_kill.insert(pid);
+    ///
+    /// Answers `true` only when this call **newly** latched the verdict — the drain uses it to
+    /// emit the breach report once, exactly as the C does: `reached_max_heap_size` reports and then
+    /// returns the kill flag, so the oracle prints **one** report for a killing breach and dies in
+    /// that same collection (`erl_gc.c:3744-3803`, probed). Here the death is deferred to the slice
+    /// boundary, so a deferred kill can span several collections and would otherwise report at
+    /// each one.
+    pub(crate) fn note_max_heap_kill(&mut self, pid: ProcessId) -> bool {
+        self.max_heap_kill.insert(pid)
     }
     /// Registers one more `{monitor_nodes, Options}` monitor for `pid` under the option
     /// bitmask `key`, answering the **previous** reference count — the C's
