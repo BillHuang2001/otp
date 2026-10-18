@@ -846,6 +846,14 @@ pub struct DriverPort {
     /// [`DriverPort::port_terms`] before the host is boxed into the port lifecycle, exactly like
     /// [`DriverPort::term_queue`]. A host nobody stamped answers `None`, never a fabricated port.
     port_terms: Rc<PortTerms>,
+    /// The port's **driver-failure latch** — where `driver_failure*`/`driver_exit` record their
+    /// port-closing request, and where the port lifecycle drains it into `beam_io`'s failure channel
+    /// (see [`FailureLatch`]).
+    ///
+    /// Shared by `Rc` with the port lifecycle, which seizes it at
+    /// [`DriverPortAdapter::load`] and drains it after every callback
+    /// ([`DriverPortAdapter::settle`]) — the host itself cannot close a port (see [`FailureLatch`]).
+    failures: FailureLatch,
 }
 
 impl DriverPort {
@@ -877,6 +885,9 @@ impl DriverPort {
             // Unpublished until the port lifecycle builds the environment and stamps the pair
             // (`DriverPortAdapter::start`): half a pair must never fabricate the other half.
             port_terms: Rc::new(PortTerms::new()),
+            // No driver has closed this port: the latch is what `driver_failure*`/`driver_exit`
+            // fill and what the port lifecycle drains after each callback (`FailureLatch`).
+            failures: FailureLatch::new(),
         }
     }
     /// Records whether the loaded driver entry declares an [`ErlDrvEntry::process_exit`] slot (see
@@ -931,6 +942,9 @@ impl DriverPort {
     pub fn clear_driver_state(&mut self) {
         self.queue.clear();
         self.port_terms.mark_gone();
+        // A request nobody can drain any more must not outlive the port: the lifecycle is already
+        // tearing the port down (see [`FailureLatch::clear`]).
+        self.failures.clear();
     }
 
     /// The port's [`PortTerms`] handle — the state behind [`DriverHost::port_term`], stamped by the
@@ -990,6 +1004,16 @@ impl DriverPort {
     /// callback; the runtime reads it back to answer `erlang:port_command/2,3`.
     pub fn busy_flag(&self) -> BusyFlag {
         self.busy.clone()
+    }
+    /// The port's **driver-failure latch**, shared with the port lifecycle — the handle
+    /// `driver_failure*`/`driver_exit` record their request on and the port drains into
+    /// [`beam_io::DriverContext::signal_failure`] (see [`FailureLatch`]).
+    ///
+    /// Taken **before** the host is boxed into the port lifecycle, exactly like
+    /// [`DriverPort::busy_flag`]: the boxed driver exposes no host, and the drain has to happen
+    /// after each callback returns.
+    pub fn failures(&self) -> FailureLatch {
+        self.failures.clone()
     }
     /// Records whether the loaded driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY` (see
     /// [`BusyFlag`]).
@@ -1483,6 +1507,62 @@ impl DriverHost for DriverPort {
         0
     }
 
+    /// Records the driver's request to close its own port — the single hook behind the C's whole
+    /// `driver_failure*` family (`io.c:7196-7229`).
+    ///
+    /// A host cannot close a port: it owns no port table and no process table. So the request is
+    /// **latched** here ([`FailureLatch`]) and the port lifecycle hands it to
+    /// [`beam_io::DriverContext::signal_failure`] as this callback returns
+    /// ([`DriverPortAdapter::settle`]), after which `beam_io` reaps the port through its ordinary
+    /// close path — which is what makes the driver's `stop` run, the port leave the live map and
+    /// its owner/watchers receive the reason.
+    ///
+    /// The C flushes the driver's private queue (`prt->ioq`) as part of the same request
+    /// (`driver_failure_term`, `io.c:7220`), and [`DriverPort::queue`] is this host's queue, so it
+    /// is cleared here — a later `driver_deq` on a closing port answers the C's empty-queue value.
+    ///
+    /// `0` is the C's success answer. A **second** request on a port already closing answers `-1`:
+    /// in the C the first call already closed the port, so a second one has nothing left to close
+    /// (see [`FailureLatch::set`]) — never a silently overwritten first reason.
+    fn failure(&mut self, reason: beam_abi::driver::host::PortFailure<'_>) -> c_int {
+        use beam_abi::driver::host::PortFailure;
+        let failure = match reason {
+            // The eof route: reason `normal`, with the line-buffer flush the port owes it.
+            PortFailure::Eof => beam_io::DriverFailure::eof(),
+            PortFailure::Atom(name) => beam_io::DriverFailure::atom(name),
+            PortFailure::Posix(errno) => beam_io::DriverFailure::posix(errno),
+            // `driver_failure(P, 0)` arrives as `Eof` (the C's eof flag is `code == 0`), so this
+            // arm is always a real integer reason.
+            PortFailure::Error(code) => beam_io::DriverFailure::error(code),
+        };
+        self.queue.clear();
+        if self.failures.set(failure) {
+            0
+        } else {
+            -1
+        }
+    }
+
+    /// Records the driver's request to terminate its connected process (`driver_exit`,
+    /// `io.c:7234-7253`).
+    ///
+    /// The C does two things in this order: it **unlinks** the connected process, then closes the
+    /// port. Both facts are carried by the latched request:
+    /// [`beam_io::DriverFailure::exit`] sets `signals_owner = false` (so the close owes no
+    /// `{'EXIT', Port, Reason}` at all) and names the reason — `normal` for `code == 0`, else the
+    /// bare errno atom. Every **monitor** on the port still receives its `'DOWN'`, because the C's
+    /// `erts_deliver_port_exit` covers links and monitors in one path.
+    ///
+    /// `0` is the C's success answer, `-1` a port already closing (see [`DriverHost::failure`]).
+    fn port_exit(&mut self, code: c_int) -> c_int {
+        self.queue.clear();
+        if self.failures.set(beam_io::DriverFailure::exit(code)) {
+            0
+        } else {
+            -1
+        }
+    }
+
     /// The port's **state** stream flags, as `driver_get_port_flags` reports them.
     ///
     /// The C reads the *port state* bits (`ERTS_PORT_SFLG_BINARY_IO` ⇒ `PORT_FLAG_BINARY` (1), else
@@ -1928,6 +2008,14 @@ pub struct DriverPortAdapter {
     /// registration per direction — the single-fd case every `driver_select` user in this runtime
     /// has today (see [`DriverPortAdapter::armed_event`]).
     selected: Vec<Selection>,
+    /// The port's **driver-failure latch**, seized from the host at [`DriverPortAdapter::load`] and
+    /// drained into [`beam_io::DriverContext::signal_failure`] after every callback (see
+    /// [`FailureLatch`] and [`DriverPortAdapter::settle`]).
+    ///
+    /// Held here because the host is boxed inside the `driver` field and its callbacks run against
+    /// a `DriverContext` it cannot name: the request has to outlive the callback and be handed up by
+    /// the port lifecycle, which is the only party that can close a port.
+    failures: FailureLatch,
 }
 
 /// One descriptor a driver selected, with the directions it armed.
@@ -1994,6 +2082,10 @@ impl DriverPortAdapter {
             state.driver_loaded = true;
         }
         Ok(DriverPortAdapter {
+            // Seized **before** the host is moved into the boxed driver (struct-literal evaluation
+            // order is field order, and `driver` takes the host by value): the handle is shared by
+            // `Rc`, so the latch the hooks write is the very one this adapter drains.
+            failures: host.failures(),
             driver: Some(Driver::new(library, host)),
             env: None,
             state: std::ptr::null_mut(),
