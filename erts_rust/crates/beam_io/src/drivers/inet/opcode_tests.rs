@@ -786,7 +786,11 @@ fn numeric_connect_validates_the_six_byte_prefix() {
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
     let target = listener.local_addr().expect("an address").port();
-    let mut arg = vec![0, 0, 0, 0, 0, 0]; // Timeout(4) ++ Port(2), unused by this floor.
+    // `Timeout(4) ++ Address(N)`: the C consumes only the four timeout bytes and hands the rest to
+    // `inet_set_faddress` (`inet_drv.c:12084`-`:12089`), so the two port bytes its `INPUT` comment
+    // names are the address's own port field. Measured against the oracle: two extra port bytes
+    // here make the driver read them as the family tag and answer `[0]eafnosupport`.
+    let mut arg = vec![0, 0, 0, 0];
     arg.extend_from_slice(&loopback_arg(target));
     assert_eq!(
         port.control(&op(3), &arg),

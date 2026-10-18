@@ -24,7 +24,8 @@
 //! verbs are built on — `socket(2)`/`accept(2)`/`bind(2)`/`listen(2)`/`connect(2)`/
 //! `getsockname(2)`/`getsockopt(2)`/`setsockopt(2)`/`shutdown(2)`/`close(2)` — plus the two
 //! kernel state probes the adopted-descriptor path needs ([`is_listening`] over
-//! `SO_ACCEPTCONN` and [`has_peer`] over `getpeername(2)`).
+//! `SO_ACCEPTCONN` and [`has_peer`] over `getpeername(2)`) and the bounded completion wait the
+//! synchronous `connect` substitution uses ([`wait_connected`] over `poll(2)` + `SO_ERROR`).
 //!
 //! Each wrapper carries its own `// SAFETY:` rationale; the driver's *ownership* rules
 //! (which descriptor is closed when, and by whom) stay with the driver in [`super`]. The
@@ -260,6 +261,67 @@ pub(super) fn socket_error(fd: RawFd) -> Result<i32> {
         return Err(error::io(std::io::Error::last_os_error()));
     }
     Ok(err)
+}
+
+/// Waits for a non-blocking `connect(2)` to finish and reports its outcome.
+///
+/// The C answers `INET_REQ_CONNECT` with an **async operation**: `connect(2)` says `EINPROGRESS`,
+/// the descriptor is moved to `INET_STATE_CONNECTING`, write readiness is armed and the reply is
+/// `[1] ++ async_id_be16`; the verdict then arrives later as an `{inet_async, Port, Ref, Result}`
+/// message (`inet_drv.c:12064`-`:12140`). Neither an async-op queue nor a driver→owner message
+/// channel exists in this crate, so the driver's control call **completes the connect here** and
+/// answers the bare `[1]` on success — the substitution `prim_inet:connect_cmd/3` takes the
+/// `{ok, []} -> ok` path for (`erts/preloaded/src/prim_inet.erl:411`-`:437`).
+///
+/// The wait is one `poll(2)` for `POLLOUT` (repeated only when a signal interrupts it, with the
+/// deadline **preserved** — the discipline [`crate::Poller::poll`] uses) followed by
+/// `getsockopt(SO_ERROR)`, which is where the kernel leaves a failed non-blocking connect's errno.
+/// It is safe to block here because the budget is bounded by the caller
+/// ([`super::CONNECT_WAIT_CAP_MS`]) and the control call is already the driver callback the
+/// runtime's single-threaded pump is inside; `EINTR` (`SIGCHLD` from the spawn driver's child, for
+/// one) is a normal outcome of a blocking wait and never restarts `poll(2)` on its own.
+///
+/// `timeout_ms <= 0` polls once without waiting.
+///
+/// Returns `Ok(Some(0))` once the socket is connected, `Ok(Some(errno))` for a connect that failed
+/// with that errno, and `Ok(None)` when the budget ran out first (the socket is then still
+/// connecting). `Err(BeamError::Io)` is reserved for a genuinely unusable descriptor
+/// (`poll(2)`/`getsockopt(2)` failing for anything but `EINTR`).
+///
+/// # Errors
+///
+/// `BeamError::Io` when `poll(2)` fails, or from [`socket_error`] when `getsockopt(2)` does.
+pub(super) fn wait_connected(fd: RawFd, timeout_ms: i32) -> Result<Option<i32>> {
+    let budget = timeout_ms.max(0);
+    let started = std::time::Instant::now();
+    loop {
+        // Recomputed from `started`, so a retried wait can never extend the overall budget.
+        let elapsed = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+        let remaining = budget.saturating_sub(elapsed);
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is one fully initialized `pollfd` and the count is `1`, so `poll(2)`
+        // reads exactly that element and writes at most its `revents` field back into it; the
+        // pointer is never retained past the call.
+        let rc = unsafe { libc::poll(std::ptr::addr_of_mut!(pollfd), 1, remaining) };
+        if rc > 0 {
+            // Ready one way or the other: `SO_ERROR` carries the verdict, `0` meaning the
+            // connection is up. A `POLLERR`/`POLLHUP` on a connecting socket is a failed
+            // connect, so it is read from the same place rather than guessed at from `revents`.
+            return socket_error(fd).map(Some);
+        }
+        if rc == 0 {
+            return Ok(None);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(error::io(err));
+    }
 }
 
 /// The cached socket-type tag of `fd`: `1` ([`super::wire::INET_TYPE_STREAM`]) or `2`

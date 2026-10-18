@@ -45,7 +45,7 @@
 //! | `bind` | `INET_REQ_BIND` (`:11409`) | packed address | `[1, port_hi, port_lo]` |
 //! | `listen` | `INET_REQ_LISTEN` (`:12042`) | `[backlog_hi, backlog_lo]` | `[1]` |
 //! | `accept` | `INET_REQ_ACCEPT` (`:12144`) | — | `[1, fd_be32]`, or `[1]` when nothing is pending |
-//! | `connect` | `INET_REQ_CONNECT` (`:12064`) | packed address | `[1]` |
+//! | `connect` | `INET_REQ_CONNECT` (`:12064`) | `Timeout(4) ++` packed address | `[1]`, or `[0] ++ errno` / `[0]etimedout` |
 //! | `send` | `tcp_inet_command` (`:12629`) | the bytes to send | `[1]` |
 //! | `recv` | `TCP_REQ_RECV` (`:12268`) | — | `[1]` |
 //! | `shutdown` | `TCP_REQ_SHUTDOWN` (`:12339`) | `[how]` | `[1]` |
@@ -271,7 +271,7 @@ use self::opcode::{decode as decode_opcode, Opcode};
 // one place.
 use self::sys::{
     accept_socket, close_fd, has_peer, is_listening, local_port, shutdown_socket, socket_error,
-    socket_fd,
+    socket_fd, wait_connected,
 };
 
 /// The driver's registered name — the C `tcp_inet` entry (`inet_drv.c:1348`), which is also
@@ -281,6 +281,31 @@ pub const DRIVER_NAME: &str = "tcp_inet";
 /// The read buffer size of a single [`Driver::ready_input`] syscall.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// The longest a synchronous `connect` completion waits for the kernel, in milliseconds.
+///
+/// The C's `INET_REQ_CONNECT` is an **async** operation: it hands the request's `Timeout(4)`
+/// operand (`-1`, the C's `INET_INFINITY`, is what `prim_inet:connect/3` sends for `infinity`) to
+/// its async-op queue and returns immediately. This floor completes the connect inside the control
+/// call — there is no async-op queue and no driver→owner message channel — so the timeout becomes a
+/// **blocking** budget, and an infinity (or any other negative value) has to be capped: the
+/// callback runs on the runtime's single-threaded pump, which must never be parked for a silently
+/// dropped SYN (the kernel would retry for minutes).
+const CONNECT_WAIT_CAP_MS: i32 = 30_000;
+
+/// The `poll(2)` budget, in milliseconds, a `connect` request's `Timeout(4)` operand asks for,
+/// clamped to [`CONNECT_WAIT_CAP_MS`].
+///
+/// A negative operand is the C's `INET_INFINITY` and becomes the cap; `0` means "poll once without
+/// waiting" (the C's `timeout == 0` behaviour); a positive one is its own value, clamped.
+const fn connect_wait_ms(timeout_ms: i32) -> i32 {
+    if timeout_ms < 0 {
+        CONNECT_WAIT_CAP_MS
+    } else if timeout_ms < CONNECT_WAIT_CAP_MS {
+        timeout_ms
+    } else {
+        CONNECT_WAIT_CAP_MS
+    }
+}
 /// The lifecycle state of a TCP port.
 ///
 /// It mirrors the shape of the C descriptor's `inet.state` (`INET_STATE_*`): the socket does
@@ -556,14 +581,14 @@ impl TcpInetDriver {
         self.peer_close.seen
     }
 
-    /// The lowercase errno name of an asynchronous `connect` that failed after the control
-    /// call had answered `ok`, if any.
+    /// The lowercase errno name of a `connect` that failed, if one has.
     ///
-    /// The control reply for `connect` is sent as soon as the connection attempt starts (the
-    /// C answers `[1] ++ async_id` then too and reports the outcome as an
-    /// `{inet_async, …}` message), so this is where the runtime reads that outcome from:
-    /// `Some("econnrefused")` for a refused connection. It stays set until the socket is
-    /// replaced or closed.
+    /// A connect is completed **inside** the control call
+    /// (see [`TcpInetDriver::verb_connect`]), so a failure is also answered there as
+    /// `[0] ++ errno`; this accessor is what the runtime reads it back from, and the only path that
+    /// leaves it set *without* a failing reply is the wait budget expiring (`[0]etimedout`) and the
+    /// attempt then failing later, observed through [`Driver::ready_output`]. It stays set until
+    /// the socket is replaced or closed.
     pub fn connect_error(&self) -> Option<&str> {
         self.connect_error.as_deref()
     }
@@ -1019,15 +1044,33 @@ impl TcpInetDriver {
 
     /// The `connect` verb: connects the socket to a literal IPv4 address.
     ///
-    /// A connection that completes immediately arms read readiness and answers `[1]`; one
-    /// that reports `EINPROGRESS` arms **write** readiness, moves to
-    /// [`InetState::Connecting`] and also answers `[1]` — the outcome then arrives through
-    /// [`Driver::ready_output`] (see [`TcpInetDriver::connect_error`]).
+    /// A connection the kernel completes immediately arms read readiness and answers `[1]`. One
+    /// that reports `EINPROGRESS` is **completed synchronously inside this call** by
+    /// [`wait_connected`], under the `poll(2)` budget `timeout_ms` asks for (clamped to
+    /// [`CONNECT_WAIT_CAP_MS`], a negative value being the C's `INET_INFINITY`):
+    ///
+    /// * connected ⇒ [`TcpInetDriver::mark_connected`], read readiness armed, `[1]`;
+    /// * failed ⇒ the descriptor is torn down (the C's `tcp_inet_connect_error` closes it), the
+    ///   errno is recorded in [`TcpInetDriver::connect_error`] and the reply is `[0] ++ errno`;
+    /// * budget spent ⇒ `[0]etimedout` with the socket left in [`InetState::Connecting`] and
+    ///   **write** readiness armed, so a completion that arrives later is still observed through
+    ///   [`Driver::ready_output`] (and [`TcpInetDriver::connect_error`]).
+    ///
+    /// The C never answers a bare `[1]` for the in-progress case: it replies `[1] ++ async_id_be16`
+    /// and delivers `{inet_async, Port, Ref, Status}` — a channel this crate has no seam for, which
+    /// is exactly why the wait above takes its place. A timed-out C operation delivers
+    /// `{inet_async, Port, Ref, {error, etimedout}}` where this answers `[0]etimedout`.
     ///
     /// # Errors
     ///
-    /// `BeamError::BadArg` for a malformed packed address.
-    fn verb_connect(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
+    /// `BeamError::BadArg` for a malformed packed address, or `BeamError::Io` when the socket
+    /// cannot be watched at all.
+    fn verb_connect(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        arg: &[u8],
+        timeout_ms: i32,
+    ) -> Result<Vec<u8>> {
         match self.state {
             InetState::Closed => return Ok(ctl_xerror("exbadport")),
             InetState::Connected => return Ok(ctl_xerror("eisconn")),
@@ -1056,8 +1099,29 @@ impl TcpInetDriver {
         match err.raw_os_error() {
             Some(libc::EINPROGRESS) => {
                 self.state = InetState::Connecting;
-                self.set_interest(ctx, Interest::WRITABLE)?;
-                Ok(ctl_ok())
+                match wait_connected(fd, connect_wait_ms(timeout_ms))? {
+                    // The connection is up: the C's `tcp_inet_connect_ok` moves to
+                    // `INET_STATE_CONNECTED` and switches to read readiness (`:12410`).
+                    Some(0) => {
+                        self.mark_connected();
+                        self.set_interest(ctx, Interest::READABLE)?;
+                        Ok(ctl_ok())
+                    }
+                    // The connect failed: the C's `tcp_inet_connect_error` closes the descriptor
+                    // (`:12422`) and answers the errno through its async reply.
+                    Some(errno) => {
+                        self.release_socket(ctx)?;
+                        self.connect_error = Some(errno_name(errno));
+                        Ok(ctl_error(std::io::Error::from_raw_os_error(errno)))
+                    }
+                    // Nothing happened within the budget: leave the attempt running so a later
+                    // completion is still observed, and report the timeout the async form would
+                    // have reported as a message.
+                    None => {
+                        self.set_interest(ctx, Interest::WRITABLE)?;
+                        Ok(ctl_xerror("etimedout"))
+                    }
+                }
             }
             // `EISCONN` and `EALREADY` are the racy spellings of "it is already connected or
             // connecting"; report them as the C does rather than failing the control call.
@@ -1069,7 +1133,6 @@ impl TcpInetDriver {
             _ => Ok(ctl_error(err)),
         }
     }
-
     /// The `send` verb: queues `arg` for output and drains as much as the kernel accepts.
     ///
     /// This is the `tcp_inet_command` path (`inet_drv.c:12629`), which is the port's *output*
@@ -1381,9 +1444,12 @@ impl TcpInetDriver {
             }
             // `INET_REQ_CONNECT` (`:12064`): the socket-state guards come first
             // (`!IS_OPEN ⇒ exbadport`, `IS_CONNECTED ⇒ eisconn`, `IS_CONNECTING ⇒ einval`) and
-            // only then `len < 6 ⇒ einval`. The six leading operand bytes are the async-connect
-            // timeout and the reply port, neither of which this synchronous floor uses, so only
-            // the address is forwarded.
+            // only then `len < 6 ⇒ einval`. The leading four operand bytes are the async-connect
+            // timeout; everything after them is the packed address, which the C hands straight to
+            // `inet_set_faddress` (`:12084`-`:12089` — the `Port(2)` its comment names is the
+            // address's own port field). The timeout port of the C's `enq_async` is unused: this
+            // floor has no async-op queue to correlate a reply through, so the connect completes
+            // inside the call and the timeout bounds that completion.
             Opcode::Connect => {
                 match self.state {
                     InetState::Closed => return Ok(ctl_xerror("exbadport")),
@@ -1394,7 +1460,8 @@ impl TcpInetDriver {
                 if arg.len() < 6 {
                     return Ok(ctl_xerror("einval"));
                 }
-                self.verb_connect(ctx, &arg[6..])
+                let timeout_ms = i32::from_be_bytes([arg[0], arg[1], arg[2], arg[3]]);
+                self.verb_connect(ctx, &arg[4..], timeout_ms)
             }
             // `INET_REQ_ACCEPT` (`:12144`): one combined "not listening **or** wrong operand"
             // guard, so both faults answer `einval`.
@@ -1651,7 +1718,9 @@ impl Driver for TcpInetDriver {
             "bind" => self.verb_bind(arg),
             "listen" => self.verb_listen(arg),
             "accept" => self.verb_accept(ctx),
-            "connect" => self.verb_connect(ctx, arg),
+            // The named form has no `Timeout(4)` operand (it is this floor's own convenience verb,
+            // not the C request), so it asks for the C's `INET_INFINITY` — i.e. the capped wait.
+            "connect" => self.verb_connect(ctx, arg, INET_INFINITY),
             "send" => self.verb_send(ctx, arg),
             "recv" => self.verb_recv(ctx, arg),
             "shutdown" => self.verb_shutdown(ctx, arg),
