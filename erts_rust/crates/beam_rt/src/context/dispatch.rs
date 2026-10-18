@@ -48,7 +48,7 @@ pub(super) const DISPATCH_MEMO_SLOTS: usize = 8;
 /// memo lookup it indexes. Hashing the **lengths** alone is not enough: any two same-length keys
 /// collide **by construction** (the initial `module.len()`/`function.len()` mix), so the natural
 /// loop `ets:insert/2` · `ets:lookup/2` — which then costs the whole miss prologue (a registry
-/// lookup, the ten `needs_*` `binary_search`es and two `String` allocations) on **every**
+/// lookup, the eleven `needs_*` `binary_search`es and two `String` allocations) on **every**
 /// iteration — is a permanent miss. A collision only ever costs work (a miss recomputes; it can
 /// never change an answer), so spreading same-length keys is behaviour-preserving.
 pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
@@ -97,6 +97,8 @@ pub(super) struct DispatchHooks {
     pub(super) nif_loader: bool,
     /// [`RuntimeContext::uses_record_source`] — the record-source arm.
     pub(super) record_source: bool,
+    /// [`RuntimeContext::uses_export_gate`] — the `[safe]` export-gate arm.
+    pub(super) export_gate: bool,
     /// [`RuntimeContext::uses_send_hook`] — the message-delivery arm.
     pub(super) send_hook: bool,
     /// [`RuntimeContext::uses_module_info`] — the module-info arm.
@@ -119,6 +121,7 @@ impl DispatchHooks {
             RuntimeContext::uses_process_hook(module, function, arity),
             RuntimeContext::uses_nif_loader(module, function, arity),
             RuntimeContext::uses_record_source(module, function, arity),
+            RuntimeContext::uses_export_gate(module, function, arity),
             RuntimeContext::uses_send_hook(module, function, arity),
             RuntimeContext::uses_module_info(module, function, arity),
             RuntimeContext::uses_persistent_term(module, function, arity),
@@ -126,13 +129,14 @@ impl DispatchHooks {
             RuntimeContext::uses_fun_identity(module, function, arity),
             RuntimeContext::uses_memory_hook(module, function, arity),
         ];
-        let [dict, process_hook, nif_loader, record_source, send_hook, module_info, persistent_term, runtime_hooks, fun_identity, memory_hook] =
+        let [dict, process_hook, nif_loader, record_source, export_gate, send_hook, module_info, persistent_term, runtime_hooks, fun_identity, memory_hook] =
             roster;
         DispatchHooks {
             dict,
             process_hook,
             nif_loader,
             record_source,
+            export_gate,
             send_hook,
             module_info,
             persistent_term,
@@ -163,7 +167,7 @@ pub(super) struct DispatchAnswer {
 /// The per-context memo of [`RuntimeContext::dispatch`] answers.
 ///
 /// The memoized answer is the **whole** prologue result — the resolved [`BifFn`] *and* the hook
-/// roster — so a hit skips both halves: the registry lookup and the ten `needs_*`
+/// roster — so a hit skips both halves: the registry lookup and the eleven `needs_*`
 /// `binary_search`es.
 ///
 /// # Why a cached answer can never go stale (the soundness argument)
@@ -344,6 +348,22 @@ impl<'a> RuntimeContext<'a> {
         beam_bifs::needs_record_source(module, function, arity)
     }
 
+    /// Whether `(module, function, arity)` must run against the [`ExportGateBridge`] — the
+    /// `[safe]` `binary_to_term/2` active-export gate.
+    ///
+    /// The bridge borrows the code server's module map **and** the shared
+    /// [`BifRegistry`](beam_bifs::BifRegistry) immutably (`&Runtime` twice over), so it cannot
+    /// co-exist with [`FunBridge`]'s `&mut Runtime` or any `&mut ProcessTable` arm —
+    /// [`Self::call_registered`] installs exactly one of them. `binary_to_term/2` applies no
+    /// fun argument and touches no dictionary, so nothing is lost.
+    ///
+    /// The key set is [`beam_bifs::EXPORT_GATE_BIFS`] — `beam_bifs`' own roster of the BIFs
+    /// that read the [`ExportGate`](beam_codec::ExportGate) seam (one key:
+    /// `erlang:binary_to_term/2`; the `/1` form has no options, so it never asks — the codec
+    /// consults the gate only under `[safe]`).
+    pub(super) fn uses_export_gate(module: &str, function: &str, arity: u32) -> bool {
+        beam_bifs::needs_export_gate(module, function, arity)
+    }
     /// Whether `(module, function, arity)` is a message-sending BIF that must run against the
     /// [`SendBridge`] (the delivery seam).
     ///
@@ -354,7 +374,7 @@ impl<'a> RuntimeContext<'a> {
     /// `unsupported_bif` rather than dropping the message). The bridge borrows the whole
     /// `Runtime` (it delegates to [`RuntimeContext::send_message`]), so it cannot co-exist with
     /// [`FunBridge`]'s borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
-    /// [`Self::call_registered`] installs exactly one of the nine. A `send` applies no fun
+    /// [`Self::call_registered`] installs exactly one of the ten. A `send` applies no fun
     /// argument and touches no dictionary, so nothing is lost.
     ///
     /// The compiled `Dest ! Msg` operator does **not** come through here: the BEAM compiler
