@@ -27,20 +27,32 @@
 //! [`CompletionEvent::InetAsync`](crate::completion::CompletionEvent::InetAsync) staged on a
 //! **later** port-task round, which is exactly what a live runtime drains.
 //!
-//! Fully **hermetic**: no `erl` oracle, no connecting peer, no sleeps. Every listener binds
-//! `127.0.0.1:0` (the kernel picks an ephemeral port, nothing is exposed) and nothing ever
-//! connects, which is what makes the queue's outcomes deterministic — a long deadline never fires,
-//! a zero deadline fires on the next round, and a close drains what is left. The half that needs a
-//! real peer (an `Accepted` descriptor, a peer close, one port holding both a pending accept and a
-//! pending recv) lives in the sibling real-socket suites, never here.
+//! Mostly **hermetic**: no `erl` oracle, no connecting peer, no sleeps. Every listener binds
+//! `127.0.0.1:0` (the kernel picks an ephemeral port, nothing is exposed) and most cases never
+//! connect, which is what makes the queue's outcomes deterministic — a long deadline never fires,
+//! a zero deadline fires on the next round, and a close drains what is left.
+//!
+//! Two families are **not** hermetic, and say so where they are defined: the readiness pair
+//! ([`two_successive_connections_are_both_accepted`] and
+//! [`the_accept_readiness_is_armed_on_enqueue_and_disarmed_when_the_list_drains`]) drives a real
+//! loopback peer through a real [`Poller`](crate::Poller) round, because only a real connection can
+//! prove the listener's read registration is re-armed on enqueue and dropped when the list drains;
+//! and [`the_accept_replies_and_getstatus_rows_agree_with_the_oracle`] compares against the system
+//! `erl`, skipping **loudly** when it is absent.
 use super::op_queue::async_ok_reply;
-use super::opcode_tests::{loopback_arg, op, open_arg, Rig};
+use super::opcode_tests::{
+    assert_agrees, erl_stdout, loopback_arg, op, open_arg, oracle_expression, oracle_replies, Call,
+    Rig, Rule,
+};
 use super::wire::{ctl_ok, ctl_xerror, getstatus_reply};
 use super::{
-    make_tcp_inet, make_udp_inet, INET_AF_INET, INET_LOPT_ACTIVE, INET_PROTO_DEFAULT, INET_REP_OK,
-    INET_TYPE_DGRAM,
+    make_tcp_inet, make_udp_inet, InetState, TcpInetDriver, INET_AF_INET, INET_LOPT_ACTIVE,
+    INET_PROTO_DEFAULT, INET_REP_OK, INET_TYPE_DGRAM,
 };
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason};
+use beam_common::BeamError;
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 // The `erlang:port_control/3` codes this suite drives, under the C's `tcp_inet_ctl`/`inet_ctl`
 // names (`inet_drv.c`): `OPEN`=1, `CLOSE`=2, `BIND`=6, `SETOPTS`=7, `GETOPTS`=8, `GETSTATUS`=16,
@@ -378,3 +390,242 @@ fn active_does_not_gate_the_accept() {
 // guard requires `InetState::Connected`, and one descriptor is exactly one of the two. The mixed
 // drain is pinned by the sibling real-socket suites, which can queue operations of both kinds on a
 // connected descriptor that is then torn down.
+
+/// The wall-clock cap on a loopback connect turning into a completion. A kernel-local connect
+/// completes in microseconds; the cap only stops a genuinely broken round from hanging the suite.
+const ACCEPT_WAIT: Duration = Duration::from_secs(10);
+
+/// One **readiness** round: wait for the poller to report, then let the registry schedule *and*
+/// run the tasks those events name — the loop `beam_rt` runs. Unlike [`Rig::round`] (which calls
+/// `execute_port_tasks` directly, i.e. the `drive_async` poll point) the completion here can only
+/// come from a real readiness event.
+fn poll_round(rig: &mut Rig) {
+    let events = match rig.poller.poll(Some(Duration::from_millis(100))) {
+        Ok(events) => events,
+        Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => return,
+        Err(err) => panic!("the poll failed: {err:?}"),
+    };
+    rig.registry
+        .handle_events(&mut rig.poller, &events)
+        .expect("the ready events are dispatched");
+}
+
+/// Drives readiness rounds until one completion is staged, returning it — a **polled condition**
+/// under [`ACCEPT_WAIT`], never a sleep-then-assert.
+fn drive_until_completion(rig: &mut Rig, label: &str) -> Vec<CompletionEvent> {
+    let deadline = Instant::now() + ACCEPT_WAIT;
+    loop {
+        poll_round(rig);
+        let staged = events(rig);
+        if !staged.is_empty() {
+            return staged;
+        }
+        assert!(Instant::now() < deadline, "{label}: no completion within {ACCEPT_WAIT:?}");
+    }
+}
+
+/// Whether the port's driver currently holds a **read** registration (the `PortArms` mask the
+/// reactor gates an `Input` task on).
+fn armed(rig: &Rig) -> bool {
+    rig.registry.get(rig.id).expect("the port is live").read_armed()
+}
+
+/// Drives readiness until the accept queued as `id` completes, then **adopts** the descriptor it
+/// hands over through [`TcpInetDriver::from_socket`] — the safe consumer of an
+/// [`InetAsyncResult::Accepted`] (`from_socket` probes the kernel's state and the driver then owns
+/// and closes the number). Asserts the classification so an adopted socket can never be silently
+/// misreported.
+fn accepted(rig: &mut Rig, id: u16, label: &str) -> TcpInetDriver {
+    let staged = drive_until_completion(rig, label);
+    assert_eq!(staged.len(), 1, "{label}: exactly one completion, got {staged:?}");
+    match &staged[0] {
+        CompletionEvent::InetAsync { id: got, result: InetAsyncResult::Accepted { fd } } => {
+            assert_eq!(*got, id, "{label}: the completion carries the accept's own id");
+            let driver = TcpInetDriver::from_socket(*fd)
+                .expect("the accepted descriptor is adopted and classified");
+            assert_eq!(
+                driver.socket(),
+                Some(*fd),
+                "{label}: the driver owns the accepted descriptor"
+            );
+            assert_eq!(
+                driver.state(),
+                InetState::Connected,
+                "{label}: an accepted socket is a connected one"
+            );
+            driver
+        }
+        other => panic!("{label}: expected an `Accepted` completion, got {other:?}"),
+    }
+}
+
+/// Two connections in a row are each accepted, which is the observable of the C's re-arm: after a
+/// completion the accept list empties, the listener is deregistered, and queueing the next accept
+/// must register it again — otherwise the second peer would never be reported.
+#[test]
+fn two_successive_connections_are_both_accepted() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let port = listening(&mut rig);
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &LONG_TIMEOUT),
+        async_ok_reply(0),
+        "the first accept queues with id 0"
+    );
+    let _client1 = TcpStream::connect(("127.0.0.1", port)).expect("a loopback peer connects");
+    let first = accepted(&mut rig, 0, "the first accepted connection");
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &LONG_TIMEOUT),
+        async_ok_reply(1),
+        "a second accept queues with the next id"
+    );
+    let _client2 =
+        TcpStream::connect(("127.0.0.1", port)).expect("a second loopback peer connects");
+    let second = accepted(&mut rig, 1, "the second accepted connection");
+
+    assert_eq!(events(&mut rig), Vec::new(), "each accept is reported exactly once");
+    assert!(rig.contains(), "the listener is still live after accepting twice");
+    assert_ne!(
+        first.socket(),
+        second.socket(),
+        "the two connections are two distinct descriptors"
+    );
+}
+
+/// The listener's **read registration** follows the accept list: armed while accepts are queued,
+/// disarmed when the list drains (the C's `sock_select(FD_ACCEPT, 0)`), and re-armed by an enqueue
+/// even when the connection it must serve arrived while nothing was queued.
+#[test]
+fn the_accept_readiness_is_armed_on_enqueue_and_disarmed_when_the_list_drains() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let port = listening(&mut rig);
+
+    assert!(armed(&rig), "a listening port is read-registered from `listen` on");
+
+    assert_eq!(rig.control(&op(ACCEPT), &LONG_TIMEOUT), async_ok_reply(0), "the accept queues");
+    assert!(armed(&rig), "queueing an accept leaves the listener read-armed");
+
+    let _client1 = TcpStream::connect(("127.0.0.1", port)).expect("a loopback peer connects");
+    accepted(&mut rig, 0, "the first accepted connection");
+    assert!(
+        !armed(&rig),
+        "a drained accept list deregisters the listener (`disarm_accepts`)"
+    );
+
+    // A connection that arrives while **nothing** is queued. Without the re-arm on enqueue its
+    // readiness would never be reported again, so this is the state the re-arm exists for.
+    let _client2 =
+        TcpStream::connect(("127.0.0.1", port)).expect("a second loopback peer connects");
+    assert!(!armed(&rig), "an arrived connection does not arm the listener by itself");
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &LONG_TIMEOUT),
+        async_ok_reply(1),
+        "the second accept queues against the disarmed listener"
+    );
+    assert!(armed(&rig), "an enqueue re-arms the listener");
+
+    // Only poll + `handle_events` from here: the completion is a readiness event on the already
+    // arrived connection, never the `drive_async` poll point.
+    let second = accepted(&mut rig, 1, "the already-arrived connection");
+    assert!(!armed(&rig), "the drained list deregisters the listener again");
+
+    // With the list empty and both peers live, the listener reports nothing at all.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        poll_round(&mut rig);
+        assert_eq!(events(&mut rig), Vec::new(), "an empty accept list produces no completion");
+    }
+    assert!(rig.contains(), "the listener is still live");
+    assert_eq!(second.state(), InetState::Connected, "the second connection is connected");
+}
+
+/// The `erl`-oracle matrix for the accept path: the reply ids, the state bits `getstatus` reports
+/// for the queue, and the two bare-port refusals — byte-compared against the system
+/// `tcp_inet`/`udp_inet` drivers (skips **loudly** without `erl`).
+#[test]
+fn the_accept_replies_and_getstatus_rows_agree_with_the_oracle() {
+    // The measured sequence: two queued accepts, each visible in `getstatus`'s state bits —
+    // `41` = listening (9) + `INET_F_ACC` (0x20), `297` = that + `INET_F_MULTI_CLIENT` (0x100).
+    let calls = vec![
+        Call::req(OPEN, open_arg(), Rule::Exact),
+        Call::req(BIND, loopback_arg(0), Rule::BoundPort),
+        Call::req(LISTEN, [0u8, 5], Rule::Exact),
+        Call::req(ACCEPT, LONG_TIMEOUT, Rule::Exact),
+        Call::req(GETSTATUS, Vec::<u8>::new(), Rule::Exact),
+        Call::req(ACCEPT, LONG_TIMEOUT, Rule::Exact),
+        Call::req(GETSTATUS, Vec::<u8>::new(), Rule::Exact),
+    ];
+    let labels = [
+        "open",
+        "bind",
+        "listen",
+        "accept #1",
+        "getstatus with one queued accept",
+        "accept #2",
+        "getstatus with two queued accepts",
+    ];
+
+    let Some(dump) = erl_stdout(&oracle_expression("tcp_inet", &calls)) else {
+        eprintln!("SKIP: no `erl` — the accept/getstatus oracle matrix was not compared");
+        return;
+    };
+    eprintln!("the accept/getstatus oracle dump: {dump}");
+    let oracle = oracle_replies(&dump);
+    assert_eq!(oracle.len(), calls.len(), "the oracle answered every call: {dump:?}");
+
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let rust = rig.run(&calls);
+    for index in 0..calls.len() {
+        assert_agrees(labels[index], calls[index].rule, &oracle[index], &rust[index]);
+    }
+
+    // The same rows spelled out, so a silently loosened rule could not hide a drift.
+    assert_eq!(rust[0], ctl_ok(), "`open` answers `[1]`");
+    assert_eq!(rust[2], ctl_ok(), "`listen` answers `[1]`");
+    assert_eq!(rust[3], async_ok_reply(0), "the first accept answers id 0");
+    assert_eq!(
+        rust[4],
+        getstatus_reply(ONE_ACCEPT_STATUS),
+        "one queued accept sets `INET_F_ACC`"
+    );
+    assert_eq!(rust[5], async_ok_reply(1), "the second accept answers id 1");
+    assert_eq!(
+        rust[6],
+        getstatus_reply(MULTI_ACCEPT_STATUS),
+        "two queued accepts add `INET_F_MULTI_CLIENT`"
+    );
+
+    // On a **bare** port the accept guard answers before any state exists: `einval` on the stream
+    // driver (its combined non-listening/bad-operand test) and `exbadport` on the datagram one,
+    // whose switch does not own the number at all.
+    let bare = vec![Call::req(ACCEPT, LONG_TIMEOUT, Rule::Exact)];
+    let Some(dump) = erl_stdout(&oracle_expression("tcp_inet", &bare)) else {
+        eprintln!("SKIP: no `erl` — the bare-port accept matrix was not compared");
+        return;
+    };
+    eprintln!("the bare `tcp_inet` accept oracle dump: {dump}");
+    let oracle = oracle_replies(&dump);
+    assert_eq!(oracle.len(), 1, "the oracle answered the bare accept: {dump:?}");
+    let mut stream = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let rust = stream.run(&bare);
+    assert_agrees("bare tcp_inet accept", Rule::Exact, &oracle[0], &rust[0]);
+    assert_eq!(rust[0], ctl_xerror("einval"), "a bare `tcp_inet` accept answers `einval`");
+
+    let Some(dump) = erl_stdout(&oracle_expression("udp_inet", &bare)) else {
+        eprintln!("SKIP: no `erl` — the bare-port datagram accept matrix was not compared");
+        return;
+    };
+    eprintln!("the bare `udp_inet` accept oracle dump: {dump}");
+    let oracle = oracle_replies(&dump);
+    assert_eq!(oracle.len(), 1, "the oracle answered the bare datagram accept: {dump:?}");
+    let mut datagram = Rig::new(make_udp_inet().expect("the udp_inet driver"));
+    let rust = datagram.run(&bare);
+    assert_agrees("bare udp_inet accept", Rule::Exact, &oracle[0], &rust[0]);
+    assert_eq!(
+        rust[0],
+        ctl_xerror("exbadport"),
+        "the datagram driver's switch does not own the accept number"
+    );
+}
