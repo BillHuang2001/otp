@@ -458,6 +458,21 @@ Each avoided refusal is worth ≈**4.2 µs**, which is the whole regression.
 
 **Memory is unchanged.** `case_ets_copy_peak_rss_bytes` 118.72 MB → 118.57 MB (0.999×), `churn` 118.54 → 118.40 MB, `etf_roundtrip` 120.21 → 119.87 MB. The growth is a pre-copy `Nursery::grow`, which retires the space it replaces; a collection still collapses the chain, so no space is retained for longer than it was before.
 
+**`perf` attribution, on the raw shape** (`beam_rt -pa <dir> run probe.beam probe:ets_copy/1 250000`, `perf record -F 500`, same probe on both sides — the wall clock is 1 349 ms `BEFORE` → 877 ms `AFTER`, 0.650×, and 877 ms is the diagnosis's `+hms 200000` floor of 816 ms):
+
+| symbol share | `BEFORE` | `AFTER` |
+|---|---:|---:|
+| `RandomState::hash_one::<&usize>` | 11.09 % | — (below the 1.2 % cut) |
+| `SipHasher13::write` | 5.71 % | 1.59 % |
+| `HashMap<usize,()>::insert` | 3.87 % | — |
+| `size_object_bounded_with` | 4.19 % | — |
+| `sizing_walk` | 1.68 % | — |
+| **sizing machinery, total** | **26.5 %** | **~0** |
+| `shallow_unshared::<TrialTarget>` (the copier itself) | 7.91 % | 10.16 % |
+| `RuntimeContext::call_registered` | 7.91 % | 12.42 % |
+
+The refusal machinery is gone from the profile; the new top-share symbols are the two **copies that remain** — `call_registered` 12.42 % and the copier's `shallow_unshared` 10.16 %, beside `beam_ets::TermStore::{alloc_words,copy_term,release}` (3.47 + 2.98 + 2.49 %) and allocator churn. That is the quantified `beam_bifs` double-copy handoff: the registry's own copy onto the pooled BIF heap is still paid on every `ets:lookup`.
+
 **One shape's cadence did move** (wall time unmoved): `gc_bound/churn`'s loop copies out a 257-word `list_to_tuple/1` result, so its growth now happens *before* the copy; one growth = one retired space = one unit of collection debt, so its schedule shifts from 13 971 collections / 2 997 majors to **15 346 / 2 514** at `N` = 2 000 (7.6728 collections per iteration, one major per iteration plus a fixed 514) against a wall change of 1.012×. The `MEASURED` table in `src/runner/tests/boundary_cost.rs` and `src/runner/CONTEXT.md` are re-derived from it; the door's own invariants (`checks == yields`, `unpublished == 0`, the `checks/9 … checks/7` ration, one young space, `capacity ≤ 610`) all still hold, so this is a table move, not a door regression.
 
 **Correctness of the measured side.** `--lib` **1 520 passed / 0 failed / 3 ignored**; `--lib -- runner` 47 / 0; `--lib -- copy_out` 3 / 0 (including the collecting-default-process case and its no-hint control, which refuses again); `--lib -- context::calls` 14 / 0 (1 ignored); `--test max_heap_enforce` 6 / 0, `--test max_heap_flag` 12 / 0, `--test process_info_items` 2 / 0, `--test engine_off_heap_transport` 4 / 0, `--test port_wake` 1 / 0. `build --release -p beam_rt -p bench --all-targets` is **warning-free**.
