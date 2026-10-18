@@ -43,7 +43,12 @@ use beam_term::prelude::*;
 /// (`beam_term::layout`) and re-exported so the copier keeps a single `layout::…` prefix and the
 /// definition lives in one spot. See that module for the per-shape tables and the `# Safety`
 /// contract.
-pub(crate) use beam_term::layout::{for_each_child_slot, for_each_sizing_child_slot, object_words};
+///
+/// The **sizing** child-slot enumerator is deliberately absent: since the destination-pricing walk
+/// became `beam_term::size`'s policy-parameterised walk, the only consumer of the sizing variant is
+/// the retired reference walk (`copy_reference`, `#[cfg(test)]`-gated), which names
+/// `beam_term::layout::for_each_sizing_child_slot` directly.
+pub(crate) use beam_term::layout::{for_each_child_slot, object_words};
 
 /// Whether `header` is the head word of an off-heap reference container.
 pub(crate) fn is_off_heap_container(header: Eterm) -> bool {
