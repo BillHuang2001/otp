@@ -34,9 +34,12 @@
 //! `compile:file/2`'s compiler process, and the caller parks in the receive that waits for it.
 //!
 //! This group is the **evidence scaffold** for that route: six module-run cases whose goldens
-//! are the oracle's own integer lines, plus one expression case whose golden is the source-derived
-//! **export table** of the object code it produced, so each pins a property of the *produced
-//! object code* rather than a mere "it returned".
+//! are the oracle's own integer lines, plus seven **expression** cases — the large-real-module
+//! compile ([`timer_case`]) and six that pin a *relation* of the file-free (`[binary]`) route
+//! (two-run determinism, the artifact-versus-source attributes/chunk set, a sibling header, the
+//! two routes against each other, an extra include directory, and `-include_lib`). Each pins a
+//! property of the *produced object code* rather than a mere "it returned", and no case pins a
+//! compiler-release artifact (see *Why the goldens are comparisons and classified shapes*).
 //!
 //! # The cases
 //!
@@ -90,6 +93,26 @@
 //!   the expression one on cost (see [`SELFHOST_TIMER_EXPR`]): the same compile driven through
 //!   the module-run `run` entry point costs ≈ 43 s on the Rust runtime against ≈ 2.3 s through
 //!   `-eval`.
+//! * [`two_run_case`] — the **reproducibility** relation: `lib/stdlib/src/dets_sup.erl` (42
+//!   source lines) is compiled **twice** with the file-free form, and the two artifacts must
+//!   agree byte-for-byte, chunk-for-chunk and md5-image-for-md5-image, carry no source path,
+//!   and declare exactly the source's export table.
+//! * [`attributes_case`] — the **artifact-versus-source** relation: the produced image's
+//!   `attributes` chunk carries the source's `-behaviour(supervisor)`, and `beam_lib:info/1`
+//!   declares every chunk a loadable `.beam` needs. The compiler-generated `vsn` entry is pinned
+//!   by its presence only.
+//! * [`sibling_header_case`] — the **sibling header**: `lib/ssh/src/ssh_bits.erl` carries
+//!   `-include("ssh.hrl")`, which `epp` reads from the source's own directory through the file
+//!   server; a missing include is a hard compile error, so success proves the read.
+//! * [`two_route_case`] — **route independence**: the E0 route and `compile:file/2`'s own
+//!   compiler process produce the *same* `Code` chunk and export table from the same source, so
+//!   `no_spawn_compiler_process` changes only *where* the work runs.
+//! * [`include_dir_case`] — the **extra include directory**: `{i, "lib/xmerl/include"}` is what
+//!   makes `xmerl_xpath_lib`'s out-of-directory header reachable, so the option is load-bearing
+//!   and the produced export table is the source's.
+//! * [`include_lib_case`] — **`-include_lib`**: `ftp_progress`'s
+//!   `-include_lib("kernel/include/file.hrl")` is located through the installation's own code
+//!   path (`code:lib_dir/1`), the resolution the self-hosted build stands on.
 //!
 //! In every case the compile's own failure is deliberately **not** caught: a runtime that
 //! cannot host the route must raise its typed capability gap (the CLI then exits `3`), never a
@@ -119,17 +142,39 @@
 //!
 //! # Status
 //!
-//! All seven cases **agree** on the Rust runtime: the runtime hosts the E0 route, the
+//! All thirteen cases **agree** on the Rust runtime: the runtime hosts the E0 route, the
 //! scheduled shape, an in-process compile of a real stdlib module, the dependent pair (with
 //! the `code:add_patha/1` + `code:load_file/1` link round trip), a module whose documentation
-//! the compiler reads from a sibling file, the code-path / load-state shapes, and the
-//! in-process compile of `lib/stdlib/src/timer.erl` (1017 lines). Three
+//! the compiler reads from a sibling file, the code-path / load-state shapes, the
+//! in-process compile of `lib/stdlib/src/timer.erl` (1017 lines), and the six file-free
+//! relation cases (two-run determinism, the artifact's attributes and chunk set, a sibling
+//! header, route independence, an extra include directory, `-include_lib`). Three
 //! contracts are in play and exactly two are claimed:
 //! [`Contract::BeamAsm`] (a real `.beam` executes and object code is produced) and
 //! [`Contract::Build`] (the build/bootstrapping route itself). [`Contract::OtpApps`] is
 //! **not** claimed — the routes' whole point is that they reach only `kernel` + `stdlib`, so
 //! nothing about them depends on the wider application surface.
-
+//!
+//! # Measured divergences / not covered
+//!
+//! Two routes belong to this contract but are deliberately **not** corpus cases. Each is a
+//! ledger line, not a golden:
+//!
+//! * **Loading a freshly compiled artifact on the expression route** (compile → load → call,
+//!   which would compare a compiled module's answers with the same function's in a system
+//!   module). The oracle refuses `code:load_binary/3` for a *sticky* stdlib module name with
+//!   `{error,sticky_directory}` and needs `code:delete/1` + `code:purge/1` first — and the Rust
+//!   runtime answers `unsupported: erlang:delete_module/1` there (owner **`beam_rt`**), the
+//!   raise even taking the `code_server` down with it. So the compile-and-**call** dimension
+//!   stays on the module-run route, where [`pair_case`] already pins it through
+//!   `code:add_patha/1` + `code:load_file/1`.
+//! * **The `binary` form against the `{outdir, Dir}` (write-path) form** — the two compile
+//!   entry points' artifacts compared with each other. That comparison needs an outdir, hence
+//!   the module-run argv, and the very same in-process compile costs **≈ 14 s** on the Rust
+//!   runtime there against **≈ 0.34 s** on the oracle (measured while drafting this group),
+//!   which a gate that boots both runtimes for every CLI case cannot carry. The outdir form is
+//!   still pinned against *itself* by [`sched_case`] (two `deterministic` outdir compiles), and
+//!   the file-free form's own reproducibility by [`two_run_case`].
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
 /// The embedded module of the E0 route: `no_spawn_compiler_process`, one integer result.
@@ -1236,8 +1281,228 @@ fn timer_case() -> Case {
     }
 }
 
-/// The A.9 self-hosted-build group: the six in-process compile / link shapes plus the large-real
-/// module expression case.
+/// The **same source twice** relation of the file-free (`[binary]`) compile form.
+///
+/// [`timer_case`] projects *one* compile onto its export table; this case pins that the route is
+/// **reproducible**: the same source compiled twice in the same run yields the same bytes, the
+/// same `Code` chunk and the same `beam_lib:md5/1` image, and each artifact is path-free. Every
+/// clause is either an equality between two artifacts *this run* produced or a documented shape,
+/// so no hash **value** is pinned and the oracle reproduces the golden on any OTP release.
+///
+/// The subject is `lib/stdlib/src/dets_sup.erl` (42 source lines — the smallest stdlib module
+/// carrying a `-behaviour` attribute), addressed repo-relatively because the harness spawns both
+/// runtimes with the repository root as the working directory. Its export table is source-derived
+/// (`-export([start_link/0, init/1])` plus the compiler's `module_info/0,1`), so it is pinned
+/// exactly; the artifact's own bytes never are.
+const SELFHOST_TWO_RUN_EXPR: &str = r#"begin {ok, ModA, First} = compile:file("lib/stdlib/src/dets_sup.erl", [binary, no_spawn_compiler_process, deterministic]), {ok, ModB, Second} = compile:file("lib/stdlib/src/dets_sup.erl", [binary, no_spawn_compiler_process, deterministic]), {ok, {ModA, [{"Code", ChunkA}]}} = beam_lib:chunks(First, ["Code"]), {ok, {ModB, [{"Code", ChunkB}]}} = beam_lib:chunks(Second, ["Code"]), {ok, {ModA, MdA}} = beam_lib:md5(First), {ok, {ModB, MdB}} = beam_lib:md5(Second), {ok, {ModA, [{exports, Exports}]}} = beam_lib:chunks(First, [exports]), (ModA =:= dets_sup) andalso (ModB =:= ModA) andalso (First =:= Second) andalso (ChunkA =:= ChunkB) andalso (MdA =:= MdB) andalso (byte_size(First) > 0) andalso (byte_size(MdA) =:= 16) andalso (Exports =:= lists:sort(Exports)) andalso (Exports =:= lists:sort([{init, 1}, {module_info, 0}, {module_info, 1}, {start_link, 0}])) andalso (binary:match(First, <<"lib/stdlib/src">>) =:= nomatch) end"#;
+
+/// The **artifact-versus-source** relation: the produced object code records the source's own
+/// attributes, and it declares the chunks a loadable `.beam` requires.
+///
+/// Two relations, both release-independent:
+///
+/// * `-behaviour(supervisor)` is a **source** attribute, so the `attributes` chunk of the
+///   produced image must carry `[{behaviour,[supervisor]}]` — an artifact that dropped or
+///   mangled the attribute chunk cannot reproduce it. The compiler-generated `vsn` entry is
+///   pinned by its **presence** only (it is an md5-derived integer, i.e. exactly the
+///   compiler-release artifact the module docs forbid pinning);
+/// * `beam_lib:info/1` of the produced image must declare every chunk the loader needs to
+///   resolve code (`AtU8`, `Code`, `StrT`, `ImpT`, `ExpT`) — the artifact is a real object file,
+///   not merely a binary of the right size. The chunk *sizes*/offsets are never pinned.
+const SELFHOST_ATTRIBUTES_EXPR: &str = r#"begin {ok, Cm, Bin} = compile:file("lib/stdlib/src/dets_sup.erl", [binary, no_spawn_compiler_process, deterministic]), {ok, {dets_sup, [{attributes, Attrs}]}} = beam_lib:chunks(Bin, [attributes]), Info = beam_lib:info(Bin), {chunks, Chs} = lists:keyfind(chunks, 1, Info), Names = [N || {N, _Pos, _Size} <- Chs], (Cm =:= dets_sup) andalso (proplists:get_value(behaviour, Attrs) =:= [supervisor]) andalso (proplists:is_defined(vsn, Attrs)) andalso (proplists:get_value(vsn, Attrs) =/= undefined) andalso (lists:all(fun(Name) -> lists:member(Name, Names) end, ["AtU8", "Code", "StrT", "ImpT", "ExpT"])) end"#;
+
+/// The **sibling-header** relation: a source that `-include`s a header from its **own**
+/// directory only compiles if `epp` really read that header through the file server.
+///
+/// `lib/ssh/src/ssh_bits.erl` (69 source lines) carries `-include("ssh.hrl")`, which `epp`
+/// resolves relative to the compiled file's directory and reads as a plain file (with `epp` an
+/// io-device client, that walk is the io-service read the [`docfile_case`] route pins for a
+/// `-moduledoc({file, …})`). A missing include is a hard compile **error**, so the `{ok, …}`
+/// match below cannot be satisfied by a runtime that skipped the read.
+///
+/// The observable is again a *relation*: the produced image's `Code` chunk, `beam_lib:md5/1`
+/// shape and **export table** (`-export([mpint/1, name_list/1])` + `-export([random/1])` plus
+/// `module_info/0,1`) — all source-derived — and that the image carries no source path. The
+/// `ssh` **application** is not claimed here ([`Contract::OtpApps`] is deliberately absent from
+/// this group): only the source text's include chain is exercised.
+const SELFHOST_SIBLING_HEADER_EXPR: &str = r#"begin {ok, Cm, Bin} = compile:file("lib/ssh/src/ssh_bits.erl", [binary, no_spawn_compiler_process, deterministic]), {ok, {ssh_bits, [{exports, Ex}]}} = beam_lib:chunks(Bin, [exports]), {ok, {ssh_bits, Md}} = beam_lib:md5(Bin), (Cm =:= ssh_bits) andalso (byte_size(Bin) > 0) andalso (byte_size(Md) =:= 16) andalso (Ex =:= lists:sort([{mpint, 1}, {name_list, 1}, {random, 1}, {module_info, 0}, {module_info, 1}])) andalso (binary:match(Bin, <<"lib/ssh/src">>) =:= nomatch) end"#;
+
+/// The **route-independence** relation: the two ways to host the compile produce the *same*
+/// object code.
+///
+/// [`case`] pins the E0 route (`no_spawn_compiler_process`, the compile runs in the calling
+/// process) and [`sched_case`] the default one (`compile:file/2`'s own compiler process, the
+/// caller parked in the receive). Each compares its artifact only against itself, so neither
+/// can tell whether the two routes agree. This case does: the same source is compiled once
+/// through each route with the `binary` (file-free) form, and the two artifacts' `Code` chunks
+/// and export tables must be identical — the relation `no_spawn_compiler_process` only changes
+/// *where* the work runs, never *what* it produces. Both sides of every equality are produced by
+/// the same run, so no compiler release can change the golden.
+///
+/// The subject is the 42-line `lib/stdlib/src/dets_sup.erl` (see [`SELFHOST_TWO_RUN_EXPR`]).
+const SELFHOST_TWO_ROUTE_EXPR: &str = r#"begin {ok, dets_sup, BinE0} = compile:file("lib/stdlib/src/dets_sup.erl", [binary, no_spawn_compiler_process, deterministic]), {ok, dets_sup, BinSched} = compile:file("lib/stdlib/src/dets_sup.erl", [binary, deterministic]), {ok, {dets_sup, [{"Code", CodeE0}]}} = beam_lib:chunks(BinE0, ["Code"]), {ok, {dets_sup, [{"Code", CodeSched}]}} = beam_lib:chunks(BinSched, ["Code"]), {ok, {dets_sup, [{exports, ExE0}]}} = beam_lib:chunks(BinE0, [exports]), {ok, {dets_sup, [{exports, ExSched}]}} = beam_lib:chunks(BinSched, [exports]), (byte_size(BinE0) > 0) andalso (byte_size(BinSched) > 0) andalso (CodeE0 =:= CodeSched) andalso (ExE0 =:= ExSched) end"#;
+
+/// The **extra include directory** relation: `{i, Dir}` is what makes an out-of-directory
+/// header reachable, and `epp` must consult that path list through the file server.
+///
+/// `lib/xmerl/src/xmerl_xpath_lib.erl` (59 source lines) carries `-include("xmerl.hrl")`, and
+/// that header lives in the **application's** `include/` directory, not next to the source — so
+/// the compile succeeds **only** if the `{i, "lib/xmerl/include"}` option is honoured. A runtime
+/// that ignored the option (or could not read a file outside the module's own directory) fails
+/// the compile, which the `{ok, …}` match turns into a raise, never into a plausible value.
+///
+/// The observable is the same source-derived projection as its siblings: the produced image's
+/// export table (`-export([eval/3])` plus `module_info/0,1`), a non-empty image with a 16-byte
+/// `beam_lib:md5/1` image, and no source path in the artifact.
+const SELFHOST_INCLUDE_DIR_EXPR: &str = r#"begin {ok, Cm, Bin} = compile:file("lib/xmerl/src/xmerl_xpath_lib.erl", [binary, no_spawn_compiler_process, deterministic, {i, "lib/xmerl/include"}]), {ok, {xmerl_xpath_lib, [{exports, Ex}]}} = beam_lib:chunks(Bin, [exports]), (Cm =:= xmerl_xpath_lib) andalso (byte_size(Bin) > 0) andalso (Ex =:= lists:sort([{eval, 3}, {module_info, 0}, {module_info, 1}])) andalso (binary:match(Bin, <<"lib/xmerl/src">>) =:= nomatch) end"#;
+
+/// The **`-include_lib`** relation: the header is located through the installation's own code
+/// path (`code:lib_dir(App)`), not through a relative path.
+///
+/// `lib/ftp/src/ftp_progress.erl` (139 source lines) carries
+/// `-include_lib("kernel/include/file.hrl")`, so `epp` must first resolve `kernel`'s lib
+/// directory and then read the header from there — the code-path/lib-dir resolution the
+/// self-hosted build stands on, exercised through the compiler rather than by asking
+/// `code:lib_dir/1` directly. A missing header is a hard compile error, so success proves the
+/// whole chain ran.
+///
+/// The export table (`-export([start_link/1, report/2, stop/1])` + `-export([init/1])` plus
+/// `module_info/0,1`) is source-derived and pinned exactly; the artifact's bytes are not, beyond
+/// being non-empty and carrying no source path.
+const SELFHOST_INCLUDE_LIB_EXPR: &str = r#"begin {ok, Cm, Bin} = compile:file("lib/ftp/src/ftp_progress.erl", [binary, no_spawn_compiler_process, deterministic]), {ok, {ftp_progress, [{exports, Ex}]}} = beam_lib:chunks(Bin, [exports]), (Cm =:= ftp_progress) andalso (byte_size(Bin) > 0) andalso (Ex =:= lists:sort([{init, 1}, {module_info, 0}, {module_info, 1}, {report, 2}, {start_link, 1}, {stop, 1}])) andalso (binary:match(Bin, <<"lib/ftp/src">>) =:= nomatch) end"#;
+
+/// The two-run determinism case: the same source compiled twice, its two artifacts compared.
+fn two_run_case() -> Case {
+    Case {
+        id: "selfhost/binary_form_compile_is_byte_identical_across_two_runs",
+        description: "the A.9 reproducibility relation: compile lib/stdlib/src/dets_sup.erl \
+                      twice in one run with the file-free form (binary, \
+                      no_spawn_compiler_process, deterministic) and report whether the two \
+                      artifacts' bytes, Code chunks and beam_lib:md5/1 images are identical, the \
+                      image is path-free, and the export table is the source's own",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_TWO_RUN_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The artifact-versus-source case: the produced image's attributes and chunk set.
+fn attributes_case() -> Case {
+    Case {
+        id: "selfhost/binary_form_compile_pins_the_source_attributes_and_chunk_set",
+        description: "the A.9 artifact relation: compile lib/stdlib/src/dets_sup.erl in-process \
+                      and report whether the produced image's attributes chunk carries the \
+                      source's -behaviour(supervisor) attribute (plus the compiler's vsn entry) \
+                      and whether beam_lib:info/1 declares the chunks a loadable .beam requires",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_ATTRIBUTES_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The sibling-header case: a source whose `-include` names a header from its own directory.
+fn sibling_header_case() -> Case {
+    Case {
+        id: "selfhost/in_process_compile_reads_a_sibling_header_and_pins_the_export_table",
+        description: "the A.9 sibling-header shape: compile lib/ssh/src/ssh_bits.erl in-process \
+                      (its -include(\"ssh.hrl\") resolves next to the source) and report whether \
+                      the produced image carries a 16-byte beam_lib:md5/1 image, is path-free, \
+                      and declares exactly the source's export table",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_SIBLING_HEADER_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The route-independence case: the E0 and the scheduled-process routes compared against each
+/// other.
+fn two_route_case() -> Case {
+    Case {
+        id: "selfhost/in_process_and_scheduled_compiles_produce_the_same_object_code",
+        description: "the A.9 route-independence relation: compile lib/stdlib/src/dets_sup.erl \
+                      through both routes (no_spawn_compiler_process in the calling process, and \
+                      compile:file/2's own compiler process) with the file-free form and report \
+                      whether the two artifacts' Code chunks and export tables are identical",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_TWO_ROUTE_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The extra-include-directory case: `{i, Dir}` as the load-bearing option.
+fn include_dir_case() -> Case {
+    Case {
+        id: "selfhost/in_process_compile_honours_an_extra_include_directory",
+        description: "the A.9 include-path relation: compile lib/xmerl/src/xmerl_xpath_lib.erl, \
+                      whose header lives in the application's include/ directory, with the \
+                      {i, \"lib/xmerl/include\"} option and report whether the produced image \
+                      declares exactly the source's export table and carries no source path",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_INCLUDE_DIR_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The `-include_lib` case: the header located through the installation's code path.
+fn include_lib_case() -> Case {
+    Case {
+        id: "selfhost/in_process_compile_resolves_an_include_lib_header",
+        description: "the A.9 include-lib relation: compile lib/ftp/src/ftp_progress.erl, whose \
+                      -include_lib(\"kernel/include/file.hrl\") is located through \
+                      code:lib_dir/1, and report whether the produced image declares exactly the \
+                      source's export table and carries no source path",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_INCLUDE_LIB_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The A.9 self-hosted-build group: the six in-process compile / link shapes plus the
+/// large-real-module expression case and the six relation cases the expression route adds
+/// (two-run determinism, artifact-versus-source attributes and chunk set, sibling header,
+/// route independence, an extra include directory, and `-include_lib`).
 pub(crate) fn group() -> Vec<Case> {
     vec![
         case(),
@@ -1247,6 +1512,12 @@ pub(crate) fn group() -> Vec<Case> {
         path_case(),
         docfile_case(),
         timer_case(),
+        two_run_case(),
+        attributes_case(),
+        sibling_header_case(),
+        two_route_case(),
+        include_dir_case(),
+        include_lib_case(),
     ]
 }
 
@@ -1263,13 +1534,13 @@ mod tests {
     }
 
     #[test]
-    fn the_group_is_the_seven_self_hosted_build_shapes() {
+    fn the_group_is_the_six_routes_and_the_seven_expression_cases() {
         let cases = group();
         assert_eq!(
             cases.len(),
-            7,
+            13,
             "the group is the two compile:file/2 routes plus the stdlib, pair, code-path, \
-             file-borne-documentation and large-real-module cases"
+             file-borne-documentation, large-real-module and six file-free relation cases"
         );
         assert_eq!(
             cases[0].id,
@@ -1293,13 +1564,38 @@ mod tests {
             cases[6].id,
             "selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator"
         );
+        assert_eq!(
+            cases[7].id,
+            "selfhost/binary_form_compile_is_byte_identical_across_two_runs"
+        );
+        assert_eq!(
+            cases[8].id,
+            "selfhost/binary_form_compile_pins_the_source_attributes_and_chunk_set"
+        );
+        assert_eq!(
+            cases[9].id,
+            "selfhost/in_process_compile_reads_a_sibling_header_and_pins_the_export_table"
+        );
+        assert_eq!(
+            cases[10].id,
+            "selfhost/in_process_and_scheduled_compiles_produce_the_same_object_code"
+        );
+        assert_eq!(
+            cases[11].id,
+            "selfhost/in_process_compile_honours_an_extra_include_directory"
+        );
+        assert_eq!(
+            cases[12].id,
+            "selfhost/in_process_compile_resolves_an_include_lib_header"
+        );
         for case in &cases {
             assert_eq!(case.contracts, &[Contract::BeamAsm, Contract::Build]);
             assert_eq!(case.golden.exit_code, 0);
         }
-        // The six route cases are module-run cases with integer goldens; the large-real-module
-        // case is the group's one expression case (see its own doc comment for the cost reason).
-        let (routes, timer) = cases.split_at(6);
+        // The six route cases are module-run cases with integer goldens; the seven remaining
+        // cases are expression cases whose golden is a relation (`ok true`) — the large-real
+        // module compile pins its `~w` export list, the six relation cases a boolean.
+        let (routes, exprs) = cases.split_at(6);
         for case in routes {
             assert!(
                 case.golden
@@ -1327,9 +1623,9 @@ mod tests {
             expr,
             extra_argv,
             probe,
-        } = &timer[0].kind
+        } = &exprs[0].kind
         else {
-            panic!("case {} must stay an expression case", timer[0].id);
+            panic!("case {} must stay an expression case", exprs[0].id);
         };
         assert_eq!(*extra_argv, &[] as &[&str], "no CLI flag is pinned");
         assert_eq!(*probe, Probe::Value, "the golden is the `~w` export list");
@@ -1639,7 +1935,13 @@ mod tests {
     #[test]
     fn the_timer_case_compiles_the_repo_stdlib_source_and_pins_the_export_table() {
         let cases = group();
-        let case = cases.last().expect("the group is never empty");
+        // The large-real-module case is the **first** expression case, i.e. the one right after
+        // the six module-run routes.
+        let case = &cases[6];
+        assert_eq!(
+            case.id,
+            "selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator"
+        );
         let CaseKind::Eval {
             expr,
             extra_argv,
@@ -1690,5 +1992,235 @@ mod tests {
             "the export list is complete"
         );
         assert!(!golden.contains('/'), "the golden must not carry a path");
+    }
+
+    /// The expression case at `index`, panicking when it is not an expression case.
+    fn eval_of(cases: &[Case], index: usize) -> (&'static str, &'static [&'static str], Probe) {
+        let CaseKind::Eval {
+            expr,
+            extra_argv,
+            probe,
+        } = &cases[index].kind
+        else {
+            panic!("case {} is not an expression case", cases[index].id);
+        };
+        (*expr, *extra_argv, *probe)
+    }
+    /// The shared guard on the six file-free relation cases: each pins a **relation** of the
+    /// produced object code — its golden is `ok true`, the compile is the file-free `[binary]`
+    /// form, no compiler-release artifact (`erlang:md5/1`, `phash2/1`, a chunk image, a path, a
+    /// clock reading) can reach the observable, and the raise is never caught.
+    #[test]
+    fn the_relation_cases_pin_relations_never_compiler_release_artifacts() {
+        let cases = group();
+        for (index, subject) in [
+            (7usize, "lib/stdlib/src/dets_sup.erl"),
+            (8, "lib/stdlib/src/dets_sup.erl"),
+            (9, "lib/ssh/src/ssh_bits.erl"),
+            (10, "lib/stdlib/src/dets_sup.erl"),
+            (11, "lib/xmerl/src/xmerl_xpath_lib.erl"),
+            (12, "lib/ftp/src/ftp_progress.erl"),
+        ] {
+            let case = &cases[index];
+            assert_eq!(case.golden.stdout, Some("ok true"), "case {}", case.id);
+            let (expr, extra_argv, probe) = eval_of(&cases, index);
+            assert_eq!(extra_argv, &[] as &[&str], "no CLI flag is pinned");
+            assert_eq!(probe, Probe::Value, "the golden is a `~w` value");
+            assert!(
+                expr.contains(&format!("compile:file(\"{subject}\"")),
+                "case {}: the subject is the repo-relative source",
+                case.id
+            );
+            assert!(
+                expr.contains("[binary, no_spawn_compiler_process, deterministic"),
+                "case {}: the route is the file-free in-process form",
+                case.id
+            );
+            // The relation itself: every case is a chain of `=:=`/`andalso` clauses, never a
+            // pinned value of the compiler's output.
+            assert!(
+                expr.contains("andalso"),
+                "case {}: the case is a relation",
+                case.id
+            );
+            assert!(
+                !expr.contains("erlang:md5") && !expr.contains("phash2"),
+                "case {}: no compiler-release hash may reach the golden",
+                case.id
+            );
+            assert!(
+                !expr.contains("catch"),
+                "case {}: the raise must not be caught",
+                case.id
+            );
+            // An expression case has no case directory, so an outdir could only be a temp path.
+            assert!(
+                !expr.contains("{outdir") && !expr.contains("code:which"),
+                "case {}: the expression route writes no artifact",
+                case.id
+            );
+            // No probe-wrapper binding (`V`, `C`, `R`) may be shadowed by the case's own code.
+            for forbidden in [" V", " C", " R"] {
+                assert!(
+                    !expr.contains(&format!("{forbidden} =")),
+                    "case {}: the probe wrapper already binds that variable",
+                    case.id
+                );
+            }
+        }
+    }
+
+    /// The two-run case: the reproducibility relation, and the source-derived export table it
+    /// pins exactly (never the artifact's bytes).
+    #[test]
+    fn the_two_run_case_compares_two_artifacts_of_the_same_source() {
+        let cases = group();
+        let (expr, _, _) = eval_of(&cases, 7);
+        for needle in [
+            "compile:file(\"lib/stdlib/src/dets_sup.erl\", [binary, no_spawn_compiler_process, deterministic])",
+            "beam_lib:chunks(First, [\"Code\"])",
+            "beam_lib:md5(First)",
+            "(First =:= Second)",
+            "(ChunkA =:= ChunkB)",
+            "(MdA =:= MdB)",
+            "(byte_size(MdA) =:= 16)",
+            "(Exports =:= lists:sort([{init, 1}, {module_info, 0}, {module_info, 1}, {start_link, 0}]))",
+            "(binary:match(First, <<\"lib/stdlib/src\">>) =:= nomatch)",
+        ] {
+            assert!(expr.contains(needle), "the relation needs {needle:?}");
+        }
+        // Two compiles of the same source: the case is a comparison, not a single artifact.
+        assert_eq!(
+            expr.matches("compile:file(").count(),
+            2,
+            "the case compiles the source twice"
+        );
+        // No artifact is compared against a literal: only the two runs are compared with each
+        // other, so no compiler-release image can reach the golden.
+        assert!(
+            expr.contains("(MdA =:= MdB)") && !expr.contains("(MdA =:= <<"),
+            "the md5 images are only compared with each other, never pinned"
+        );
+    }
+
+    /// The attributes case: a source attribute (`-behaviour(supervisor)`) read back out of the
+    /// produced image, and the loader's chunk set — the compiler's `vsn` value is never pinned.
+    #[test]
+    fn the_attributes_case_pins_the_source_attribute_and_the_chunk_set() {
+        let cases = group();
+        let (expr, _, _) = eval_of(&cases, 8);
+        for needle in [
+            "beam_lib:chunks(Bin, [attributes])",
+            "(proplists:get_value(behaviour, Attrs) =:= [supervisor])",
+            "(proplists:is_defined(vsn, Attrs))",
+            // The `vsn` value is an md5-derived integer: presence only, never the value.
+            "(proplists:get_value(vsn, Attrs) =/= undefined)",
+            "beam_lib:info(Bin)",
+            "[\"AtU8\", \"Code\", \"StrT\", \"ImpT\", \"ExpT\"]",
+        ] {
+            assert!(expr.contains(needle), "the relation needs {needle:?}");
+        }
+        assert!(
+            !expr.contains("vsn, Attrs) =:= ["),
+            "the compiler's own vsn value must never be pinned"
+        );
+    }
+
+    /// The sibling-header case: a source whose `-include` names a header next to it, so a
+    /// runtime that cannot serve epp's read cannot produce the artifact at all.
+    #[test]
+    fn the_sibling_header_case_compiles_the_ssh_source_and_pins_its_export_table() {
+        let cases = group();
+        let (expr, _, _) = eval_of(&cases, 9);
+        for needle in [
+            "compile:file(\"lib/ssh/src/ssh_bits.erl\"",
+            "(Ex =:= lists:sort([{mpint, 1}, {name_list, 1}, {random, 1}, {module_info, 0}, {module_info, 1}]))",
+            "(byte_size(Md) =:= 16)",
+            "(binary:match(Bin, <<\"lib/ssh/src\">>) =:= nomatch)",
+        ] {
+            assert!(expr.contains(needle), "the relation needs {needle:?}");
+        }
+        // The subject really carries a same-directory `-include`, which is the header read this
+        // case exists to pin.
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../lib/ssh/src/ssh_bits.erl"
+        ))
+        .expect("the ssh source is in the tree");
+        assert!(
+            source.contains("-include(\"ssh.hrl\")."),
+            "the case's subject must include a sibling header"
+        );
+    }
+
+    /// The route-independence case: the E0 and the scheduled-process routes' artifacts compared
+    /// against each other, so a difference between the two compile routes cannot hide.
+    #[test]
+    fn the_two_route_case_compares_the_e0_and_scheduled_artifacts() {
+        let cases = group();
+        let (expr, _, _) = eval_of(&cases, 10);
+        for needle in [
+            "[binary, no_spawn_compiler_process, deterministic]",
+            // The other route: binary form *without* `no_spawn_compiler_process`.
+            "compile:file(\"lib/stdlib/src/dets_sup.erl\", [binary, deterministic])",
+            "(CodeE0 =:= CodeSched)",
+            "(ExE0 =:= ExSched)",
+        ] {
+            assert!(expr.contains(needle), "the relation needs {needle:?}");
+        }
+    }
+
+    /// The extra-include-directory case: `{i, Dir}` is load-bearing (the header is not next to
+    /// the source), so the option cannot be dropped without failing the compile.
+    #[test]
+    fn the_include_dir_case_pins_the_load_bearing_include_option() {
+        let cases = group();
+        let (expr, _, _) = eval_of(&cases, 11);
+        for needle in [
+            "compile:file(\"lib/xmerl/src/xmerl_xpath_lib.erl\"",
+            "{i, \"lib/xmerl/include\"}",
+            "(Ex =:= lists:sort([{eval, 3}, {module_info, 0}, {module_info, 1}]))",
+        ] {
+            assert!(expr.contains(needle), "the relation needs {needle:?}");
+        }
+        // The relation is a relation only while the header is *not* next to the source: the
+        // application's `include/` directory holds it, the `src/` directory does not.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        assert!(
+            std::path::Path::new(&format!("{root}/lib/xmerl/include/xmerl.hrl")).is_file(),
+            "the header must live in the application's include dir"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{root}/lib/xmerl/src/xmerl.hrl")).is_file(),
+            "the header must NOT live next to the source, or the option proves nothing"
+        );
+    }
+
+    /// The `-include_lib` case: the header is located through the installation's code path.
+    #[test]
+    fn the_include_lib_case_pins_the_code_path_header_resolution() {
+        let cases = group();
+        let (expr, _, _) = eval_of(&cases, 12);
+        for needle in [
+            "compile:file(\"lib/ftp/src/ftp_progress.erl\"",
+            "(Ex =:= lists:sort([{init, 1}, {module_info, 0}, {module_info, 1}, {report, 2}, {start_link, 1}, {stop, 1}]))",
+        ] {
+            assert!(expr.contains(needle), "the relation needs {needle:?}");
+        }
+        // No `{i, …}`: the header must be found through `-include_lib` (the code path), not
+        // through a relative include directory.
+        assert!(
+            !expr.contains("{i,"),
+            "the include_lib route must not also pass an include directory"
+        );
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../lib/ftp/src/ftp_progress.erl"
+        ))
+        .expect("the ftp source is in the tree");
+        assert!(
+            source.contains("-include_lib(\"kernel/include/file.hrl\")."),
+            "the case's subject must resolve its header through include_lib"
+        );
     }
 }
