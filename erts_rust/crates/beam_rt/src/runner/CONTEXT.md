@@ -472,10 +472,10 @@ and a capacity ≤ 610 words, so the amplification cannot come back silently.
 The no-admission shape's relations are pinned by [`tests/reds_door.rs`](tests/reds_door.rs)
 (`yields == collections`, the 17..=20 reds/iteration band, `minor == collections − major` = `(8, 88)`
 at N = 2 000 / 20 000, a converged 610-word `heap_size` and one young space).
-**`foreign` per-call cost, with the mechanism that keeps the loops from degenerating.** Measured
-2026-10-17 with the committed driver (`bench run --quick --runtime all --workloads foreign`,
-`taskset -c 3`, 8 rounds, both runtimes paired per round, min over the rounds; host `/proc/loadavg`
-1.0–2.5):
+**`foreign` per-call cost — a dated snapshot at the `loadavg` 1.0–2.5 band, with the mechanism that
+keeps the loops from degenerating.** Measured 2026-10-17 with the committed driver (`bench run --quick
+--runtime all --workloads foreign`, `taskset -c 3`, 8 rounds, both runtimes paired per round, min over
+the rounds; host `/proc/loadavg` 1.0–2.5):
 
 | case (`case_<name>_ns_per_call`) | rust | sys | rust/sys |
 |---|---|---|---|
@@ -483,6 +483,11 @@ at N = 2 000 / 20 000, a converged 610-word `heap_size` and one young space).
 | `bstr_capitalize_token` | 15 255 ns | 317.2 ns | 48.1× |
 | `emqx_base62_encode` | 10 512 ns | 206.3 ns | 51.0× |
 | `emqx_base62_decode` | 10 111 ns | 282.5 ns | 35.8× |
+
+The per-call cost of a build-a-binary loop is **no longer this table's figure** — the per-slice off-heap
+mirror is gone — so the current controlled A/B is [`../../PERF.md`](../../PERF.md) *The per-call cost is
+independent of the iteration count* (`BEFORE` `3aa42c0e41` → `AFTER` `72d778dcf1`:
+`emqx_base62_encode` **138 544.3 → 5 667.6 ns/call** at `loadavg` 18–89, `decode` 20 698.3 → 10 028.7).
 
 The mechanism is the **literal-area tagging**: `Nursery::grow` retires the old space into `retired`
 and only `Nursery::collapse` — reached at a collection — clears it, so a runtime that never collects
@@ -572,9 +577,11 @@ a foreign container that forwards nothing scanned: also inert, so also collected
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like
   on an allocation-shaped loop.** Such a runtime runs **zero** collections — the admission declines and
   the nursery grows instead, ≈150 words/call — whereas this one collects about once per call, so the
-  allocation-shaped `foreign` decode cases read 1.25×–1.60× dearer here at matched N on both the
-  default and the interpreter tier. The difference is the memory management this runtime performs and
-  the unbounded heap the other retains, not dispatch or tier.
+  difference is the memory management this runtime performs and the unbounded heap the other retains,
+  not dispatch or tier. The 1.25×–1.60× band the allocation-shaped `foreign` rows once read here at
+  matched N is a **dated** figure from before the per-slice off-heap mirror was removed (that removal's
+  A/B reads `emqx_base62_decode` 20 698.3 → 10 028.7 ns/call — [`../../PERF.md`](../../PERF.md)), not a
+  current ratio.
 * **A natively executed compiled block is charged at a deopt, a heap-admission point and each **priced**
   BIF/call seam — but only a *refusing* seam can end its slice.** The per-instruction charge belongs to
   the interpreter's loop, so what a native block's budget drains is [`budget`]'s `spend`

@@ -348,8 +348,15 @@ fn the_binary_roster_is_the_engine_reservoir() {
             .processes()
             .get(pid)
             .expect("the parked child stays in the table");
-        assert_eq!(process.state(), ProcessState::Waiting, "parked in its `receive`");
-        (process.off_heap_binary_count(), process.off_heap_binary_bytes())
+        assert_eq!(
+            process.state(),
+            ProcessState::Waiting,
+            "parked in its `receive`"
+        );
+        (
+            process.off_heap_binary_count(),
+            process.off_heap_binary_bytes(),
+        )
     };
     assert_eq!(
         slots, 0,
@@ -384,7 +391,10 @@ fn the_binary_roster_is_the_engine_reservoir() {
         .map(|entry| signed_value(terms::tuple_element(*entry, 1).expect("the size")))
         .collect();
     let reservoir_sizes: Vec<i64> = reservoir.iter().map(|(_, len, _)| *len as i64).collect();
-    assert_eq!(listed, reservoir_sizes, "the sizes agree in reservoir order");
+    assert_eq!(
+        listed, reservoir_sizes,
+        "the sizes agree in reservoir order"
+    );
     assert!(
         listed.contains(&256),
         "the roster carries the 256-byte payload the fixture built: {listed:?}"

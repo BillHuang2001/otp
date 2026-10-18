@@ -1005,13 +1005,19 @@ build_and_park(N) ->
     // ...and the process's own off-heap table was handed out NO slot: nothing is mirrored.
     let (slots, bytes) = {
         let process = rt.processes().get(pid).expect("the parked process");
-        (process.off_heap_binary_count(), process.off_heap_binary_bytes())
+        (
+            process.off_heap_binary_count(),
+            process.off_heap_binary_bytes(),
+        )
     };
     assert_eq!(
         slots, 0,
         "no payload is registered on the PCB: the engine reservoir is the one holder"
     );
-    assert_eq!(bytes, 0, "so the never-compacted off-heap slot space stays empty");
+    assert_eq!(
+        bytes, 0,
+        "so the never-compacted off-heap slot space stays empty"
+    );
 
     // The real observable: `erlang:process_info(Pid, binary)` still lists the payload it built.
     let info = crate::native::test_support::atom(&mut rt, "binary");

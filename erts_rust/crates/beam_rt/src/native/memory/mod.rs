@@ -1136,9 +1136,11 @@ impl RuntimeContext<'_> {
                 None => self.runtime.runner_state(),
             };
             if let Some(binaries) = engines.reservoir_at(pid) {
-                off_heap_binaries.extend(binaries.iter().map(|binary| {
-                    (binary.data_ptr() as usize, binary.len(), binary.refcount())
-                }));
+                off_heap_binaries.extend(
+                    binaries.iter().map(|binary| {
+                        (binary.data_ptr() as usize, binary.len(), binary.refcount())
+                    }),
+                );
             }
         }
         for binary in process.off_heap_binaries() {
