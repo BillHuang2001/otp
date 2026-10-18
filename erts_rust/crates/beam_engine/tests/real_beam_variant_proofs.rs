@@ -125,7 +125,8 @@ mod receive;
 
 /// The per-variant table this suite fills: every variant name from the
 /// formerly-blocked weight ordering that a row here proves on real compiler
-/// output.
+/// output, plus every additional shape a row reaches on the way (`CallOnly`,
+/// `Move`, `Trim`, `GcBif`, `WaitTimeout` and the whole `RecvMarker*` quartet).
 ///
 /// The rows themselves live in the family files (each with its fixture, its
 /// observed census count and its oracle comparison); this constant is the
@@ -144,6 +145,7 @@ pub const RECORDED_PROOFS: &[&str] = &[
     "InitYregs",
     "Bif0",
     "Move",
+    "Trim",
     // data
     "Badrecord",
     "GetHd",
@@ -156,6 +158,7 @@ pub const RECORDED_PROOFS: &[&str] = &[
     "ApplyLast",
     "CallFun",
     "CallFun2",
+    "GcBif",
     "MakeFun3",
     // exceptions
     "Badmatch",
@@ -184,6 +187,7 @@ pub const RECORDED_PROOFS: &[&str] = &[
     "Send",
     "Timeout",
     "Wait",
+    "WaitTimeout",
 ];
 
 /// Audits the checklist above: no duplicate names, and the table is printed so
