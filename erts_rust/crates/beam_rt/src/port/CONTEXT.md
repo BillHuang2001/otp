@@ -50,7 +50,7 @@ A socket driver cannot answer a `port_command/2` (nor a queued async op) in a co
 | `InetAsyncResult::Port(P)` | `{inet_async, Port, Id, {ok, P}}` — the adopted descriptor's new port |
 | `InetAsyncResult::Error(R)` | `{inet_async, Port, Id, {error, R}}` |
 `Id` is the 16-bit id the operation's control-op reply handed out, as a small integer. `decode_caller_tag` (`:435`) decodes the `term_to_binary(Mref,[local])` image through `crate::nif::with_decode_scratch` (the per-thread memoized table image `DriverPort::binary_to_term` uses) and interns any name it appended back into the live table, so a tag that carried a name cannot resolve against a scratch index the runtime does not hold.
-**`Accepted { fd }` adoption.** `PortRegistry::adopt_accepted` (`completion.rs:241`) is the runtime half of the C's `tcp_inet_copy` (`inet_drv.c:11834`), which a driver cannot do here itself: `beam_io::TcpInetDriver::from_socket(fd)` in the same `PortMeta` block `open_port/2`'s built-in arm builds (`PortName::SpawnDriverBuiltin`, no OS child, the driver's own `control` capability, the **listening** port's `stream`/`line` inherited) registered through `PortRegistry::register` (`:281`), the result rewritten to `{ok, Port}` before any term is built. The descriptor is **owned by the completion** from the moment it is staged (`beam_io` neither stores nor closes it), and every path either hands it to a driver (which closes it on teardown) or releases it through `discard_descriptor(fd)` (`:299`, `FdDriver::read_only`; a failed `register` tears its driver down) — **never leaked**. An indescribable descriptor answers `{error, ebadf}`, a table with no port number left `{error, emfile}`, and a completion whose port has neither metadata nor a matching snapshot releases the descriptor and is dropped.
+**`Accepted { fd }` adoption.** `PortRegistry::adopt_accepted` (`completion.rs:241`) is the runtime half of the C's `tcp_inet_copy` (`inet_drv.c:11834`), which a driver cannot do here itself: `beam_io::TcpInetDriver::from_socket(fd)` in the same `PortMeta` block `open_port/2`'s built-in arm builds (`PortName::SpawnDriverBuiltin`, no OS child, the driver's own `control` capability, the **listening** port's `stream`/`line` inherited) registered through `PortRegistry::register` (`:281`). After registration the accepted port's **whole inherited option block** is installed — `data_mode(listener, stream)` resolved first, then `seed_inet_mode(new, mode)` and `inherit_inet_options(listener, new)` (see the `inet_opts.rs` section below) — and a replay the driver rejects closes the new port and fails the accept `{error, einval}` so nothing leaks. the result rewritten to `{ok, Port}` before any term is built. The descriptor is **owned by the completion** from the moment it is staged (`beam_io` neither stores nor closes it), and every path either hands it to a driver (which closes it on teardown) or releases it through `discard_descriptor(fd)` (`:299`, `FdDriver::read_only`; a failed `register` tears its driver down) — **never leaked**. An indescribable descriptor answers `{error, ebadf}`, a table with no port number left `{error, emfile}`, and a completion whose port has neither metadata nor a matching snapshot releases the descriptor and is dropped.
 ### `port/ops.rs` — the port **table** operations (`port_set_data/2`, the name registry, `port_connect/2`)
 `PortExtras` (`pub(crate)`, keyed by **port number** like `meta`) holds the state `open_port/2` does *not* establish: `data` (the C's `prt->data`, `erl_bif_port.c:687-760`; absent means never set, rendered `undefined`), `names` and `links` (the C's `ERTS_P_LINKS(prt)`); `forget_port(number)` drops all three from `PortRegistry::close`, the single place a port leaves the runtime.
 Accessors: `set_port_data`/`port_data` (`badarg` for a port the registry does not hold, `erl_bif_port.c:693-695`), the name entries, `resolve_port` (the C's `lookup_port`, `:126-143`: an internal port term **or** an atom naming a registered port), `extra_links` (`None` = the port's only link is its owner) and `connect_port` — the C's `set_port_connected` (`io.c:2330-2419`) in its non-`!` form, which **adds** a link (the previous owner's stays) and moves `PortMeta::owner`, the one field every delivery site reads.
@@ -77,7 +77,7 @@ Signals are published **straight into the deliverable queue** (`PendingPortSigna
 `PortRegistry::info` chains them after the seven `/1` items.
 ### `port/driver.rs` — the driver C ABI host (A.4)
 `Driver{library, host: Box<DriverPort>}` pairs a loaded driver with the host its callbacks run against (**field order is load-bearing**: the library's `Drop` runs the entry's `finish` before the host drops); `DriverPort` is the concrete `beam_abi::DriverHost` behind the opaque `ErlDrvPort_`, whose handle **is** the per-port `DriverEnv`'s address.
-`load_driver(candidates, name)` delegates to `beam_abi::driver::loader::load` (a real `ErlDrvEntry` loader, distinct from the NIF loader and needing no host), tries each candidate (the loader appends `.so`) and reports the **last** typed error.
+`load_driver(candidates, name)` delegates to `beam_abi::driver::loader::load` (a real `ErlDrvEntry` loader, distinct from the NIF loader and needing no host), tries each candidate and reports the **last** typed error. The loader appends the shared-object suffix to **every** candidate unconditionally (the oracle's `erts_sys_ddll_open` copies `FILE_EXT` after the given name, `erl_unix_sys_ddll.c:104-118`), so `driver.rs::shared_object_stem` strips one trailing `.so` from each candidate first: both the bare `…/t` and the spelled `…/t.so` resolve `…/t.so`, and neither asks for `…/t.so.so`. That normalisation is what keeps the runtime's own documented `{spawn_driver, "…/t.so"}` form (and every fixture that loads its test driver by object path) loadable.
 `binary_to_term` (`erl_drv_binary_to_term`) decodes into a **per-thread memoized image** of the shared table (`crate::nif::with_decode_scratch`, validated in O(1) by an `AtomSnapshot` witness), records an appended name on the pending interner at its predicted index (`intern`, never `intern_atom`, since the interner's `base` is fixed when the host is built), and answers the C's `ERTS_DDT_FAIL` (`None`) for an invalid image, never a raise; the registry hooks carry the C's codes (`add_driver_entry` → `0`, `remove_driver_entry` `1`/`0`/`-1` per `io.c:7698`, `lock_driver` off the load state at `:7324`, `create_port` = the invalid-port sentinel).
 `DriverPort` owns the per-port **driver-private state** the frozen seam has no term/home for, in `driver/state.rs`: the C's `prt->ioq` (`io.c:6790-6919`) byte queue — one enqueue chunk per successful `driver_enq`/`driver_pushq` — behind `enq`/`pushq`/`deq`/`sizeq`/`peekq`, plus the `pdl_created` one-PDL guard, distinct from both `beam_io`'s Erlang→driver output queue (`prt->queue`) and the port's *input* queue.
 `with_port_flags` carries the port's **state** stream bits (`StreamType::port_flags` → `PORT_FLAG_BINARY` (1) for a `binary` port, else `0`), a **different** cell from the `control_flags` `set_control_flags` records (`io.c:5325-5344` vs `:5318`); `clear_driver_state` (from `stop` **and** the adapter's `Drop`) drops the queue so a late drain never reads bytes of a port that has gone away.
@@ -217,6 +217,8 @@ The largest wall-clock cost this layer can impose on a CLI start-up is **not wor
 - `port.rs` → the A.4 `PortHook` provider, the poller/`PortRegistry` (the static spawn-driver registry and the loaded/`dlopen` fallback included), the port-task round, the retained-events lane, the completion-drain points and the message builders; `ops.rs` → `PortExtras`, the name registry, `resolve_port`, `connect_port`/`connect`; `exit.rs` → `capture_port_exit`, `PendingPortSignals`, `report_pending_closes`, the two delivery routes and the signal builders; `info_extras.rs` → the derived `port_info/2` items, their C derivations, and the `awaits_port_reply` poll-budget predicate.
 - `completion.rs` → the driver→owner **completion channel**: `CompletionPacket`/`ClosedPortSnapshot`/`closed_snapshot`, `drain_io_completions` (the one sweep behind the six drain points), `adopt_accepted` + `discard_descriptor` (the `Accepted { fd }` → live `tcp_inet` port, never leaked), and the `{inet_reply, …}`/`{inet_async, …}`/caller-tag builders.
 - `failure.rs` → the driver-failure channel's runtime half: `signal_reason`, `PortRegistry::drain_failures`/`fail_port` and the ready-queue publication. **It is declared inside `exit.rs`** (`#[path = "failure.rs"] pub(crate) mod failure;`, so it is `crate::port::exit::failure` and re-exported as `crate::port::failure`) because it is the port-exit family's *second* closer — load-bearing for anyone adding a module: `src/port.rs` does not declare it.
+- `inet_opts.rs` → the per-port **inet option mirror** and the accepted socket's replayed inherited block: `PortInetOptions`/`InetOptions` (held inside `PortExtras`, dropped by its `forget_port`), `PortRegistry::{note_inet_setopts, inet_options, data_mode, seed_inet_mode, inherit_inet_options}`, the `walk`/`record_len` wire reader and `is_inherited_record`'s copied-code table. It is declared as `crate::port::ops::inet_opts` (`#[path]` from `ops.rs`); its units are `inet_opts_tests.rs` and its end-to-end proof is `accept_inherit_tests.rs` (declared from `completion.rs`).
+- `active_input.rs` → the `{active, …}` input channel's runtime half (`ActiveInputPacket`, `drain_active_inputs`, `decode_packed_address`, the `{tcp,…}`/`{udp,…}`/`{tcp_passive,…}` builders), declared as `crate::port::ops::active_input`; suites `active_input_tests.rs` (the made-up-read matrix) and `active_input_e2e_tests.rs` (real loopback), both declared from `active_input.rs`.
 - `failure_tests.rs` → the reason-mapping units and the queue state; `failure_e2e_tests.rs` → the real-C-`.so` end-to-end rows (see Test Strategy).
 - `driver.rs` → the A.4 host + `beam_io::Driver` lifecycle above; `driver/state.rs` → the per-port `prt->ioq` byte queue; `driver/monitor.rs` → the identity-keyed `DriverMonitors` tree; `watch.rs` → the `os:set_signal/2` delivery half (facility + `SignalWatch` + the `{notify,Signal}` name builder); `tty.rs` → the `prim_tty:tty_select/2` delivery half (the `enif_select` read interest and its dead-owner prune).
 - `driver/{monitor,liveness,fire,hooks,ready_output,control,stop_select,ddll,port_term}_tests.rs` → the A.4 driver suites; `monitor_tests.rs` → the marking sweep; `ram_file_matrix_tests.rs` → the `ram_file_drv` matrix; `spawn_driver_tests.rs` → the `{spawn_driver, Name}` namespace; `control_capability_tests.rs` → the `port_control` capability gate; `inet_matrix_tests.rs` → the numeric inet control-opcode matrix; `stream_shape_tests.rs` → the driver-output term shapes; `driver_output_shape_tests.rs` → those shapes **end to end**; `packet_framing_tests.rs` → the `{packet, N}` framing; `tests.rs`/`test_support.rs` → the provider's unit suite and its fixtures.
@@ -362,3 +364,81 @@ prints `"h"`. Fields are preserved in order and `[list]` mode is exact; closing 
 `beam_io` to carry the raw `hsz` (the seam is not revisable from this crate), and every shape the
 e2e suite exercises has `hsz <= len`, so it is not observable over the wire. Pinned at the
 renderer level by `active_input_tests.rs::a_header_as_wide_as_the_payload_keeps_an_empty_binary_tail`.
+
+## `port/inet_opts.rs` — the accepted socket's inherited option block (A.4)
+`prim_inet:open/6` opens every `inet` driver port with **one** option, `[binary]`
+(`erts/preloaded/src/prim_inet.erl:99-137`), and applies every other socket option afterwards through
+`setopts/2` — an `erlang:port_control/3` call carrying the C's `[opt_code, val_be32]` records. So
+neither `open_port/2`'s options nor `PortMeta::stream` know what the **driver** has been told: a
+`{mode, list}` socket is a `[binary]` port whose driver holds `INET_MODE_LIST`.
+`inet_opts.rs` is that knowledge, per port, keyed by **port number**.
+
+**What is recorded.** Every **successful** `setopts` argument verbatim and in arrival order
+(`PortInetOptions::records`, the replay source) plus the driver's current `{mode, list|binary}`
+(`PortInetOptions::mode`, [`INET_LOPT_MODE`]). One entry point does the recording —
+`PortRegistry::note_inet_setopts(id, arg, ok)` — so a rejected `setopts` can never be inherited: only
+a reply whose leading tag is the C's `INET_REP_OK` is stored. The mirror is held **inside**
+`PortExtras` (`inet: InetOptions`), so a port has exactly one post-`open_port/2` lifecycle and
+`PortExtras::forget_port` drops it with the rest — a recycled port number never inherits a dead
+socket's options.
+
+**The wire reader.** `walk` splits an argument into records while `rest.len() >= RECORD` (5, the C's
+`while (len >= 5)`, `inet_set_opts`, `inet_drv.c:6908`) and answers `None` if **any** byte is left
+over: the C silently ignores a partial trailing record because it has already applied what it
+consumed, but this walker's output is **replayed**, and an argument that is not a whole number of
+records did not come from `prim_inet:encode_opt_val/1` — replaying the subset that happens to parse
+could claim a configuration the listener does not have. `record_len` is the C's per-code span:
+`linger` `RECORD+4`, `multicast_if` the whole `RECORD`, membership `RECORD+12` (IPv4) /
+`RECORD+20` (IPv6) and `None` for any other domain, `{active,N}` `RECORD+2`, `raw`
+`RECORD+8+arg_sz` with `arg_sz` at `RECORD+4..RECORD+8`, `netns`/`bind_to_device` `RECORD+value`.
+
+**What is replayed onto an accepted port.** Exactly the set the C's `tcp_inet_copy` copies into the
+new descriptor (`inet_drv.c:11810-11827`) — `is_inherited_record`: packet type, packet size, header
+size, mode, `deliver`, `exit_on_close`, the buffer size, both TCP watermarks, the send-timeout pair,
+the busy-message-queue pair and the three `tcp_add_flags` bits (`show_econnreset`, `read_ahead`,
+`linger_zero`). Two families are deliberately **not** replayed, each for a reason the C gives:
+`{active, …}` (`tcp_inet_copy` copies no active counter, and `prim_inet:accept_opts/3`
+(`:502-517`) re-applies it from the listener — replaying it would **double-arm** the counter, since
+the C's `INET_LOPT_ACTIVE` arm *adds* its operand, `inet_drv.c:6968-7000`), and the **kernel-backed**
+options (`nodelay`, `keepalive`, `linger`, `reuseaddr`, `priority`, buffers…), which `accept(2)`
+gives the new descriptor anyway and `accept_opts/3` re-applies six of. `{line_delim, …}` is not
+copied for the same reason the C does not copy `desc->delimiter`.
+
+**The mechanism is a replay, not a copy.** `beam_io::TcpInetDriver::from_socket(fd)` takes no option
+set and `beam_io` cannot create a port, so `PortRegistry::inherit_inet_options(from, to)` sends each
+inherited record through the ordinary named `setopts` verb of `PortRegistry::port_control` — the same
+path the original call took, re-recorded onto the destination by the same `note_inet_setopts`. The
+listener's records are snapshotted first (a replay borrows the registry mutably).
+
+**The replay's failure rule.** A record the driver **rejects** cannot be ignored — half a
+configuration is a socket whose `{packet, N}`/`{mode, …}` disagree with the listener's — so
+`adopt_accepted` stops, **closes** the freshly adopted port (whose driver owns the descriptor, so the
+close releases it; nothing leaks) and completes the accept as `{error, einval}`, the errno the driver
+itself answers for a bad option. The C cannot fail here because it copies a struct; a replay can, and
+a typed `{error, einval}` from `gen_tcp:accept/1` is the honest report.
+
+**What an accepted port therefore has, and what it does not.** It has the listener's `{mode, …}`
+(seeded by `seed_inet_mode` before any record lands, so a listener whose mode came from
+`open_port/2`'s own stream option is covered too — `PortRegistry::data_mode(listener, stream)`
+resolves it) and every copied record above, on both the mirror and the **driver**. It does **not**
+carry `{active, …}` (by design, Erlang re-applies it), the kernel `SO_*` state (the kernel's
+`accept`), or `line_delim`. Proven end to end over a real loopback `accept(2)` by
+`accept_inherit_tests.rs` (4 cases): the accepted port's `data_mode`, its mirror, and its **driver's**
+`getopts` answers for packet/packet_size/header/mode all equal the listener's, its active counter is
+**not** doubled, a real `{packet,2}` write is framed off the socket an un-inherited port would not
+frame, a rejected record leaves the mirror untouched, and a poisoned replay closes the port and fails
+the accept — with one case comparing against the live `erl` oracle's own
+`inet:getopts(A,[packet,packet_size,header,mode])`.
+
+**Two residuals, both typed, neither silent.**
+(a) `PortRegistry::note_inet_setopts` has **no call site yet** — the hook belongs in
+`src/port.rs::PortRegistry::port_control` (after the completion drain, on the driver's own reply), which
+is the parent node's file; until it lands the mirror is fed only by the two test suites, which call
+`note_inet_setopts` themselves with the same reply reading (`setopts_succeeded`). Adding the hook makes
+those explicit calls redundant, and `accept_inherit_tests`'s `records().len() == 5` assertion would
+surface a double-record immediately.
+(b) There are **two** mode lookups — `PortMeta::data_mode` (in `active_input.rs`, body =
+`PortMeta::stream`) and `PortRegistry::data_mode(id, fallback)` (the mirror) — and a payload renderer
+must consult the second with the first as the fallback. One seam, two accessors: a caller that reads
+the wrong one renders an `inet` list payload as a binary. `src/port.rs::make_stream_payload`'s callers
+(`port_data_message_shaped`, `port_line_message`) are where the consolidation lands.
