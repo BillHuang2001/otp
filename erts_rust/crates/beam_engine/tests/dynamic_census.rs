@@ -763,9 +763,15 @@ fn layer_b() -> LayerRuns {
     register_harnesses(&mut host);
     let mut out = LayerRuns::default();
     for (label, run) in catalog::WORKLOADS {
+        let before = exec_census::snapshot();
         match run(&mut host) {
             Ok(_) => out.ran += 1,
             Err(error) => out.failures.push((label, format!("{error:?}"))),
+        }
+        let after = exec_census::snapshot();
+        let delta = diff(&before, &after);
+        if delta.total_errors > 0 {
+            println!("DEBUG-PER-RUN {label}: {:?}", delta.first_error);
         }
     }
     out
