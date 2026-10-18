@@ -917,3 +917,44 @@ counter-evidence. This crate's half (the walk, the sweep and the virtual-heap ru
 measured in isolation, but the end-to-end figure stays exactly what the table shows until the owner of
 the per-process roster adopts the seam where its full root set is scanned: **no number above is a
 claim that the runtime no longer retains those payloads.**
+
+## The accounting band (a footprint against the allocator's own live bytes)
+`tests/heap_accounting.rs::accounted_bytes_track_the_allocators_live_bytes` builds a synthetic
+workload — two `grow_nursery` calls over an 8 192-word nursery with 600 + 200 cons cells kept
+live, plus 256 `RefcBinary` payloads of 4 096 B registered in a `beam_gc::OffHeap` — and compares
+`HeapFootprint::heap_bytes()` against `beam_alloc::registry::all_stats()`'s summed `live_bytes`:
+
+| quantity | value |
+|---|---|
+| `young_capacity_words` / `young_used_words` | 120 187 words (961 496 B) / 1 600 words (12 800 B) |
+| `mature_capacity_words` / `mature_used_words` | 8 192 words / 0 |
+| `off_heap_payload_bytes` | 1 048 576 B (256 × 4 096) |
+| `off_heap_slot_bytes` | 16 384 B (256 reserved slots) |
+| `heap_bytes()` | 2 010 072 B |
+| `total_bytes()` | 2 026 456 B |
+| allocator `live_bytes` (all types) | 2 022 432 B |
+| **`heap_bytes() / live_bytes`** | **0.99389** |
+
+The pinned band is **[0.90, 1.00]**: `heap_bytes() <= live_bytes` is the honesty direction (nothing
+this crate accounts for may exceed what the allocators say they hold), and the 90 % floor is what
+catches a silently dropped half. The 12 360 B remainder is entirely allocator-side and is named in
+the test: 12 288 B = 256 × 48 B of `RefcBinary` control header plus size-class rounding (a 4 096 B
+payload measures 4 144 live bytes), and 72 B = the four heap blocks' size-class rounding
+(961 568 live for 961 496 reserved). Both halves are load-bearing: heap capacity is 47.5 % of
+`live_bytes` and the payload is 51.9 %, so neither one alone can pass the 90 % floor.
+**Stability:** five consecutive runs printed bit-identical figures (`heap_bytes=2010072,
+total_bytes=2026456, live=2022432`); the workload tests serialise on a mutex because the allocator
+registry is process-global. **Caveats.** Structural figures only — no wall clock, no RSS, and
+`heap_bytes()` deliberately excludes the roster array (16 384 B here), which no allocator type
+records; `total_bytes()` includes it. `heap_used_words()` counts the chain, so the retired space's
+1 600 live words appear in the footprint where `young().used_words()` alone reports 0.
+
+## What a reported `erlang:memory(total)` actually moved (m16 A/B, runtime-side)
+Two release `beam_rt` binaries (m15-era `a34ca61332` vs that session's HEAD), one `-eval` probe
+each, modal value of 20 / 12 runs: `total` 13 222 861 → 6 788 542 B, of which **`processes`**
+(reserved process-heap capacity) accounts for −6 462 312 B, `code` +27 604 B, `atom` +917 B,
+`emulator` −528 B, `binary` and `ets` unchanged. Both identities (`processes + system = total`,
+`atom + binary + code + ets + emulator = system`) close exactly. The category map, the per-key
+tables and the handoffs live in `src/ACCOUNTING.md`; this section records only the figures. Not a
+crate assertion — these are the runtime's own totals, and the per-key spread across repeated runs
+(`processes` in whole-heap-size steps of 1 872–6 024 B) is why each side is quoted as a modal value.
