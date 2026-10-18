@@ -34,6 +34,7 @@ use crate::driver::DriverRegistry;
 use crate::drivers::inet::{INET_AF_ANY, INET_TYPE_DGRAM, INET_TYPE_STREAM};
 use crate::poller::Poller;
 use crate::port::PortRegistry;
+use beam_process::PortId;
 use beam_common::BeamError;
 use super::super::packet::PacketType;
 use super::super::wire::{ctl_ok, ctl_xerror};
@@ -743,7 +744,17 @@ fn the_kernel_buffer_sizes_round_trip_through_the_kernel() {
             one(INET_LOPT_BUFFER, 500),
             "an explicit `{{buffer, 500}}` pins the size against a later `recbuf`"
         );
-        assert_eq!(replies[12], one(INET_OPT_RCVBUF, 200), "the kernel still doubles it");
+        // Linux doubles a `setsockopt(SO_RCVBUF)` request and then clamps it up to its own
+        // `SOCK_MIN_RCVBUF` floor (`2048 + 256`), so a 100-byte request reports the floor rather
+        // than 200. The rule this pins is that the wire carries the **kernel's** answer, never the
+        // driver's raw request; the exact figure belongs to the kernel and is pinned byte-exactly
+        // against the oracle at the end of this test.
+        let reported = i32::from_be_bytes([replies[12][2], replies[12][3], replies[12][4], replies[12][5]]);
+        assert!(
+            reported >= 200,
+            "the read-back is at least the doubled request, got {reported}"
+        );
+        assert_ne!(reported, 100, "the driver never echoes its own raw request");
         assert_eq!(
             replies[14],
             one(INET_LOPT_BUFFER, 500),
@@ -883,23 +894,35 @@ fn pktoptions_reports_the_received_segments_control_messages() {
         TcpInetDriver::from_socket(server.into_raw_fd()).expect("the driver adopts the socket");
     let mut ports = PortRegistry::new();
     let id = ports.open(&mut poller, Box::new(driver)).expect("the port opens");
-    let mut control = |op: &str, arg: &[u8]| -> Vec<u8> {
+    fn control(
+        ports: &mut PortRegistry,
+        poller: &mut Poller,
+        id: PortId,
+        op: &str,
+        arg: &[u8],
+    ) -> Vec<u8> {
         ports
             .get_mut(id)
             .expect("the port is live")
-            .control(&mut poller, op, arg)
+            .control(poller, op, arg)
             .unwrap_or_else(|err| panic!("the `{op}` verb failed: {err:?}"))
-    };
+    }
 
     // The kernel only stamps the control messages onto a segment it receives while the options are
     // armed, so they must be set **before** the peer writes.
-    assert_eq!(control("setopts", &record(INET_OPT_RECVTOS, 1)), ctl_ok());
-    assert_eq!(control("setopts", &record(INET_OPT_RECVTTL, 1)), ctl_ok());
+    assert_eq!(
+        control(&mut ports, &mut poller, id, "setopts", &record(INET_OPT_RECVTOS, 1)),
+        ctl_ok()
+    );
+    assert_eq!(
+        control(&mut ports, &mut poller, id, "setopts", &record(INET_OPT_RECVTTL, 1)),
+        ctl_ok()
+    );
     peer.write_all(b"X").expect("the peer writes one byte");
 
     let mut got = Vec::new();
     for _ in 0..200 {
-        assert_eq!(control("recv", b""), ctl_ok(), "the `recv` verb");
+        assert_eq!(control(&mut ports, &mut poller, id, "recv", b""), ctl_ok());
         got = ports.get_mut(id).expect("the port is live").drain_input();
         if !got.is_empty() {
             break;
@@ -908,7 +931,7 @@ fn pktoptions_reports_the_received_segments_control_messages() {
     }
     assert_eq!(got, b"X", "the byte reaches the port queue before the read-back");
     assert_eq!(
-        control("getopts", &[INET_OPT_PKTOPTIONS]),
+        control(&mut ports, &mut poller, id, "getopts", &[INET_OPT_PKTOPTIONS]),
         expected,
         "the two control messages of the received segment"
     );
@@ -1077,7 +1100,7 @@ fn the_http_packet_family_is_a_typed_gap_never_a_wrong_frame() {
                 .control(&mut poller, "setopts", &record(INET_LOPT_PACKET, i32::from(packet.code())))
                 .unwrap_or_else(|err| panic!("the `setopts` verb failed: {err:?}")),
             ctl_ok(),
-            "the C accepts the {packet, {:?}} code",
+            "the C accepts the {{packet, {:?}}} code",
             packet
         );
         peer.write_all(b"GET / HTTP/1.0\r\n\r\n")
