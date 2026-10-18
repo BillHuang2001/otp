@@ -44,6 +44,7 @@ use super::opcode_tests::{
     assert_agrees, erl_stdout, loopback_arg, op, open_arg, oracle_expression, oracle_replies, Call,
     Rig, Rule,
 };
+use super::opt::INET_INFINITY;
 use super::wire::{ctl_ok, ctl_xerror, getstatus_reply};
 use super::{
     make_tcp_inet, make_udp_inet, InetState, TcpInetDriver, INET_AF_INET, INET_LOPT_ACTIVE,
@@ -539,6 +540,372 @@ fn the_accept_readiness_is_armed_on_enqueue_and_disarmed_when_the_list_drains() 
     }
     assert!(rig.contains(), "the listener is still live");
     assert_eq!(second.state(), InetState::Connected, "the second connection is connected");
+}
+
+// ---------------------------------------------------------------------------
+// The accept list's timer: the earliest deadline expires the list's **head**
+// ---------------------------------------------------------------------------
+//
+// The port keeps **one** timer, and the C stores one `MultiTimerData` per *finite* accept deadline
+// in a list sorted by `when` (`add_multi_timer`, `inet_drv.c:15744`-`:15790`), arming the port's
+// timer only when the new entry became the head (`if (!s) driver_set_timer(port, timeout)`). Its
+// expiry runs `fire_multi_timers` (`:15650`) → `tcp_inet_multi_timeout` (`:12600`), which removes
+// the **first** entry of the accept list (`remove_multi_op`, `:2379`-`:2405` — the head, since
+// every accept here comes from the one `driver_caller`) and answers *that* id with
+// `{error, timeout}`; it then continues while the earliest remaining deadline is already due and
+// otherwise re-arms from the survivors. An `INET_INFINITY` accept adds **no** entry at all
+// (`mtd` stays `NULL` at the enqueue sites, `:12198`-`:12210`), so it can neither arm the timer nor
+// be the operation a firing reports.
+//
+// Measured on the oracle (OTP 29.1.1 / erts-17.1): `gen_tcp:listen(0,[binary,{active,false},
+// {reuseaddr,true},{backlog,10}])`, one `erlang:port_control(L, 26 + 16#03f1a300, <<Timeout:32>>)`
+// per queued accept, every `{inet_async,_,_,_}` message collected for 4000 ms — `[infinity, 50]`
+// ⇒ `[{inet_async,L,0,{error,timeout}}]`; `[infinity, 50, 60]` ⇒ `[0 timeout, 1 timeout]`;
+// `[50, 500]` ⇒ `[0 timeout, 1 timeout]`.
+
+/// The C's `INET_INFINITY` (`0xffffffff`) accept operand: the operation joins the accept list but
+/// contributes **no** timer.
+const INFINITY: [u8; 4] = INET_INFINITY.to_be_bytes();
+
+/// The `Timeout(4)` operand of `INET_REQ_ACCEPT`(26) for a finite deadline in milliseconds.
+fn timeout_operand(timeout_ms: u32) -> [u8; 4] {
+    timeout_ms.to_be_bytes()
+}
+
+/// One port-task round, returning the completions it staged.
+fn round_events(rig: &mut Rig, label: &str) -> Vec<CompletionEvent> {
+    rig.round()
+        .unwrap_or_else(|err| panic!("{label}: the round failed: {err:?}"));
+    events(rig)
+}
+
+/// Runs port-task rounds until one stages a completion, returning what it staged.
+///
+/// The port's `TIMEOUT` task only becomes runnable once the driver's **earliest** deadline has
+/// passed ([`crate::PortTaskQueue`](crate::port_task::PortTaskQueue)'s `pop_next` leaves a
+/// not-yet-due `TIMEOUT` queued), so the wait polls the **condition** under [`ACCEPT_WAIT`] — never
+/// a wall-clock budget tuned for an idle host.
+fn drive_until_timer(rig: &mut Rig, label: &str) -> Vec<CompletionEvent> {
+    let guard = Instant::now() + ACCEPT_WAIT;
+    loop {
+        let staged = round_events(rig, label);
+        if !staged.is_empty() {
+            return staged;
+        }
+        assert!(
+            Instant::now() < guard,
+            "{label}: no timer completion within {ACCEPT_WAIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The mixed queue's deadline: an **infinite** head and a 50 ms tail. The tail's expiry reports the
+/// **head's** id — the only completion the oracle produces — and leaves the infinite accept queued
+/// with no timer.
+#[test]
+fn the_earliest_accept_deadline_reports_the_head_not_the_tail() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    listening(&mut rig);
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(0),
+        "the infinite accept answers id 0"
+    );
+    assert_eq!(rig.next_timeout(), None, "an `INET_INFINITY` accept arms no timer at all");
+    assert_eq!(
+        rig.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(1),
+        "the 50 ms accept answers id 1"
+    );
+    // The port's single timer comes from the **earliest** deadline in the list (`add_multi_timer`,
+    // `inet_drv.c:15744`), so an infinite head cannot suppress the tail's deadline.
+    assert!(
+        rig.next_timeout().is_some(),
+        "the tail's deadline arms the port's `TIMEOUT` task"
+    );
+
+    // Nothing is completable before the deadline: no peer connected and the timer is still ahead.
+    assert_eq!(
+        round_events(&mut rig, "before the deadline"),
+        Vec::new(),
+        "nothing completes before the 50 ms deadline"
+    );
+
+    // The oracle's one measured completion: the **head's** id — not the id whose deadline fired.
+    assert_eq!(
+        drive_until_timer(&mut rig, "the mixed queue's deadline"),
+        vec![timed_out(0)],
+        "the tail's deadline reports the list head (id 0), never the tail (id 1)"
+    );
+
+    // The infinite survivor is untouched: it declares no deadline, so nothing can fire again.
+    assert_eq!(rig.next_timeout(), None, "the surviving accept declares no deadline");
+    let quiet = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < quiet {
+        assert_eq!(
+            round_events(&mut rig, "after the head's timeout"),
+            Vec::new(),
+            "the infinite survivor never times out, and the timeout is reported exactly once"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The C restores `INET_STATE_LISTENING` only when the whole list drains
+    // (`tcp_inet_multi_timeout`, `inet_drv.c:12607`-`:12611`), so the oracle keeps reporting the
+    // multi bit after this timeout (`[1,0,0,1,41]`); `AsyncQueue::accept_state_bits` derives the
+    // bits from the surviving list instead and answers `[1,0,0,0,41]`. That divergence is recorded
+    // in `CONTEXT.md` › *Known Issues* and pinned here so changing it is deliberate.
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(ONE_ACCEPT_STATUS),
+        "the floor derives the accept bits from the surviving list (the oracle keeps the multi bit)"
+    );
+    assert!(rig.contains(), "the listener is still live");
+}
+
+/// Three queued accepts, two finite deadlines: each firing reports the list **head**, so the
+/// infinite tail's presence is invisible — `[infinity, 50, 60]` reports ids 0 then 1, in list
+/// order, and never id 2.
+#[test]
+fn two_due_deadlines_report_the_list_head_twice_in_order() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    listening(&mut rig);
+
+    assert_eq!(rig.control(&op(ACCEPT), &INFINITY), async_ok_reply(0), "infinite accept id 0");
+    assert_eq!(
+        rig.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(1),
+        "the 50 ms accept answers id 1"
+    );
+    assert_eq!(
+        rig.control(&op(ACCEPT), &timeout_operand(60)),
+        async_ok_reply(2),
+        "the 60 ms accept answers id 2"
+    );
+    assert!(rig.next_timeout().is_some(), "the 50 ms deadline arms the timer");
+
+    // The first firing reports id 0 — the head — although the deadline that fired is id 1's.
+    let mut staged = drive_until_timer(&mut rig, "the 50 ms deadline");
+    assert_eq!(
+        staged[0],
+        timed_out(0),
+        "the earliest deadline reports the list head, not the operation that owns it"
+    );
+
+    // The survivor keeps its own deadline, so a second firing reports the new head (id 1). The
+    // two can land in one round when both deadlines are already past, hence the accumulation.
+    let guard = Instant::now() + ACCEPT_WAIT;
+    while staged.len() < 2 {
+        assert!(
+            Instant::now() < guard,
+            "the 60 ms survivor never fired within {ACCEPT_WAIT:?}: {staged:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        let more = round_events(&mut rig, "the 60 ms deadline");
+        staged.extend(more);
+    }
+    assert_eq!(
+        staged,
+        vec![timed_out(0), timed_out(1)],
+        "the two deadlines report the list head twice, in list order"
+    );
+
+    // Only the infinite id 2 is left: no deadline, so nothing more is ever reported.
+    assert_eq!(rig.next_timeout(), None, "the infinite survivor leaves no deadline");
+    for label in ["after both deadlines", "and again"] {
+        assert_eq!(
+            round_events(&mut rig, label),
+            Vec::new(),
+            "the infinite accept (id 2) is never reported by a timeout"
+        );
+    }
+}
+
+/// The reverse order of [`two_finite_deadlines_report_the_head_then_the_survivor`]: the **head**
+/// owns the *later* deadline. The earliest entry fires first and reports the head; the head's own
+/// entry is not removed by that firing, so it stays armed and later expires the survivor.
+///
+/// Measured on the oracle with operands `<<500:32>>, <<50:32>>`:
+/// `{inet_async, L, 0, {error,timeout}}` at ~51 ms and `{inet_async, L, 1, {error,timeout}}` at
+/// ~501 ms — two distinct firings, never one batch.
+#[test]
+fn a_heads_own_later_timer_still_expires_the_survivor() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    listening(&mut rig);
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &timeout_operand(500)),
+        async_ok_reply(0),
+        "the 500 ms accept answers id 0"
+    );
+    assert_eq!(
+        rig.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(1),
+        "the 50 ms accept answers id 1"
+    );
+
+    assert_eq!(
+        drive_until_timer(&mut rig, "the 50 ms deadline"),
+        vec![timed_out(0)],
+        "the earliest entry fires first and reports the head (id 0), not its own operation"
+    );
+    // `remove_multi_op` was called with `timeout_p == NULL`, so the head's own 500 ms entry is
+    // still in `desc->mtd` and keeps the port's timer armed.
+    assert!(
+        rig.next_timeout().is_some(),
+        "the head's own later timer entry survives the firing that removed it"
+    );
+    assert_eq!(
+        round_events(&mut rig, "between the two firings"),
+        Vec::new(),
+        "the survivor is not reported until that entry expires"
+    );
+    assert_eq!(
+        drive_until_timer(&mut rig, "the head's own 500 ms timer"),
+        vec![timed_out(1)],
+        "the head's own entry expires the survivor, with the survivor's id"
+    );
+    assert_eq!(rig.next_timeout(), None, "the drained list leaves no timer armed");
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(LISTENING_STATUS),
+        "a fully drained accept list reports a bare listener again"
+    );
+}
+
+/// Two finite deadlines: the head reports at its **own** deadline and the survivor at its own, one
+/// completion per firing, and the drained list leaves a bare listener again.
+#[test]
+fn two_finite_deadlines_report_the_head_then_the_survivor() {
+    let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    listening(&mut rig);
+
+    assert_eq!(
+        rig.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(0),
+        "the 50 ms accept answers id 0"
+    );
+    assert_eq!(
+        rig.control(&op(ACCEPT), &timeout_operand(500)),
+        async_ok_reply(1),
+        "the 500 ms accept answers id 1"
+    );
+
+    assert_eq!(
+        drive_until_timer(&mut rig, "the 50 ms deadline"),
+        vec![timed_out(0)],
+        "the 50 ms deadline reports the head and leaves the survivor queued"
+    );
+    // The survivor's own deadline is still 450 ms away, so it cannot be due in this round: the
+    // second completion is a separate firing, never a batch (`fire_multi_timers` re-arms with
+    // `next_timeout > 0`).
+    assert!(
+        rig.next_timeout().is_some(),
+        "the survivor re-arms the port's timer from its own deadline"
+    );
+    assert_eq!(
+        round_events(&mut rig, "between the two deadlines"),
+        Vec::new(),
+        "the survivor is not reported before its own deadline"
+    );
+    assert_eq!(
+        drive_until_timer(&mut rig, "the 500 ms deadline"),
+        vec![timed_out(1)],
+        "the survivor reports at its own deadline, with its own id"
+    );
+    assert_eq!(rig.next_timeout(), None, "an empty accept list declares no deadline");
+
+    // The whole list drained, which is exactly the case where the C restores
+    // `INET_STATE_LISTENING` (`tcp_inet_multi_timeout`, `inet_drv.c:12607`-`:12611`).
+    assert_eq!(
+        rig.control(&op(GETSTATUS), &[]),
+        getstatus_reply(LISTENING_STATUS),
+        "a fully drained accept list reports a bare listener again"
+    );
+    assert_eq!(
+        round_events(&mut rig, "after the list drained"),
+        Vec::new(),
+        "each accept timeout is reported exactly once"
+    );
+    assert!(rig.contains(), "the listener is still live");
+}
+
+/// An `INET_INFINITY` accept that outlives the head's timeout still takes the later connection —
+/// the fix must report the head **without** dropping the survivor.
+///
+/// Measured rows: `[infinity, 50]` with a connect at 120 ms and `[50, infinity]` with one at 200 ms
+/// both answer `[0 timeout, 1 {ok, Port}]`.
+#[test]
+fn an_infinite_accept_survives_the_heads_timeout_and_takes_the_later_connection() {
+    // Row 4: the infinite op is the **head**, the finite one is the tail.
+    let mut mixed = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let port = listening(&mut mixed);
+    assert_eq!(
+        mixed.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(0),
+        "the infinite accept answers id 0"
+    );
+    assert_eq!(
+        mixed.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(1),
+        "the finite accept answers id 1"
+    );
+    assert_eq!(
+        drive_until_timer(&mut mixed, "the mixed queue's deadline"),
+        vec![timed_out(0)],
+        "the tail's deadline reports the head (id 0)"
+    );
+    // The surviving op keeps its place in the list but its timer entry was consumed by that firing
+    // (`remove_multi_op` with `timeout_p == NULL`), so the port declares no deadline at all —
+    // measured: `[infinity, 50]` answers exactly one `{error, timeout}` and nothing later.
+    assert_eq!(
+        mixed.next_timeout(),
+        None,
+        "the firing consumed the survivor's timer entry, so no deadline is armed"
+    );
+    let _client = TcpStream::connect(("127.0.0.1", port)).expect("a loopback peer connects");
+    let from_mixed = accepted(&mut mixed, 1, "the surviving infinite accept");
+    assert_eq!(
+        from_mixed.state(),
+        InetState::Connected,
+        "the surviving accept takes the later connection"
+    );
+    assert_eq!(
+        round_events(&mut mixed, "after the survivor was accepted"),
+        Vec::new(),
+        "the accepted operation is reported exactly once"
+    );
+    assert!(mixed.contains(), "the listener is still live after serving both");
+
+    // Row 2, the mirror image: the finite op is the head and the infinite one the tail.
+    let mut mirrored = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+    let port = listening(&mut mirrored);
+    assert_eq!(
+        mirrored.control(&op(ACCEPT), &timeout_operand(50)),
+        async_ok_reply(0),
+        "the finite accept answers id 0"
+    );
+    assert_eq!(
+        mirrored.control(&op(ACCEPT), &INFINITY),
+        async_ok_reply(1),
+        "the infinite accept answers id 1"
+    );
+    assert_eq!(
+        drive_until_timer(&mut mirrored, "the head's deadline"),
+        vec![timed_out(0)],
+        "the head reports at its own deadline"
+    );
+
+    let _client = TcpStream::connect(("127.0.0.1", port)).expect("a loopback peer connects");
+    let from_mirror = accepted(&mut mirrored, 1, "the infinite tail");
+    assert_eq!(
+        from_mirror.state(),
+        InetState::Connected,
+        "the infinite tail survives the head's timeout and is accepted later"
+    );
+    assert!(mirrored.contains(), "the listener is still live after the mirror row");
 }
 
 /// The `erl`-oracle matrix for the accept path: the reply ids, the state bits `getstatus` reports

@@ -52,6 +52,10 @@
 //!   `INET_F_ACC` (one pending accept) / `INET_F_MULTI_CLIENT` (two or more) bits while that list
 //!   is non-empty (`INET_STATE_ACCEPTING`/`INET_STATE_MULTI_ACCEPTING`, `:1031`-`:1032`), which is
 //!   what `INET_REQ_GETSTATUS` reports ([`AsyncQueue::accept_state_bits`]).
+//!   Their timeouts are **per port, not per operation**: each finite deadline becomes one sorted
+//!   `MultiTimerData` (`add_multi_timer`, `:15744`) and the port's single timer is re-armed from
+//!   the earliest one, so its expiry reports the **head** of the accept list — whatever operation's
+//!   deadline fired (`tcp_inet_multi_timeout`, `:12600`; [`AsyncQueue::accept_timeout_due`]).
 //!
 //! # The id counter
 //!
@@ -69,9 +73,12 @@
 //!
 //! 1. **socket readiness** — `Driver::ready_input`, with read readiness armed while an operation is
 //!    pending (the C's `sock_select(FD_READ, 1)`);
-//! 2. **the port timer** — `Driver::next_timeout` arms the port's `TIMEOUT` task from the
-//!    operation's deadline and `Driver::timeout` then reports `{error, timeout}` (the C's
-//!    `driver_set_timer` + `tcp_inet_recv_timeout`, `:12480`);
+//! 2. **the port timer** — `Driver::next_timeout` arms the port's `TIMEOUT` task from the earliest
+//!    pending deadline (for accepts: the earliest deadline in the accept list) and
+//!    `Driver::timeout` then reports `{error, timeout}` for the receive slot's own operation or, for
+//!    accepts, for the **head** of the accept list (the C's `driver_set_timer` +
+//!    `tcp_inet_recv_timeout`, `:12480`, and `fire_multi_timers` → `tcp_inet_multi_timeout`,
+//!    `:15650`/`:12600`);
 //! 3. **the round's async drive point** — `Driver::drive_async`, which retries an operation against
 //!    data that is already buffered (`desc->i_buf`, a decoded `{packet, N}` frame, a datagram
 //!    already sitting in the socket). Without it an operation whose data arrived **before** it was
@@ -137,19 +144,24 @@ impl RecvOp {
 }
 
 /// One queued `accept` operation (the C's `enq_multi_op` list).
+///
+/// A queued accept's own deadline decides **when** the port's single timer fires, never **which**
+/// operation is reported: the C keeps one `MultiTimerData` per finite deadline in a list sorted by
+/// `when` ([`AsyncQueue::accept_timers`], `add_multi_timer`, `inet_drv.c:15744`), and a firing
+/// reports the head of the accept list whatever deadline woke it (`tcp_inet_multi_timeout` →
+/// `remove_multi_op`, `:12600`). See [`AsyncQueue::accept_timeout_due`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct AcceptOp {
     /// The 16-bit id the control reply carried.
     pub(super) id: u16,
     /// The operation's deadline, or `None` for the C's `INET_INFINITY`.
+    ///
+    /// This is the operation's **own** timer entry (the C's `opp->op.tmo.mtd`), which only a
+    /// *successful* completion cancels (`deq_multi_op` + `remove_multi_timer`, `:13553`-`:13559`);
+    /// a firing reports the list head and leaves the head's own entry armed
+    /// (`remove_multi_op` with `timeout_p == NULL`, `:12603`). The timer list itself is
+    /// [`AsyncQueue::accept_timers`].
     pub(super) deadline: Option<Instant>,
-}
-
-impl AcceptOp {
-    /// Whether this operation's deadline has passed at `now`.
-    fn is_due(self, now: Instant) -> bool {
-        self.deadline.is_some_and(|deadline| now >= deadline)
-    }
 }
 
 /// The async-operation queue of one socket descriptor.
@@ -161,6 +173,15 @@ pub(super) struct AsyncQueue {
     recv: Option<RecvOp>,
     /// The C's `enq_multi_op` accept list, in enqueue order.
     accepts: Vec<AcceptOp>,
+    /// The C's `desc->mtd`: **one entry per finite enqueued accept deadline**, sorted by `when`
+    /// (`add_multi_timer`, `inet_drv.c:15744`-`:15790`).
+    ///
+    /// Deliberately separate from the operations' own [`AcceptOp::deadline`]s, because the C's
+    /// bookkeeping is: a firing pops the **earliest entry** and removes the list **head**
+    /// (`fire_multi_timers` `:15650` → `tcp_inet_multi_timeout` `:12600`, whose
+    /// `remove_multi_op(…, NULL, …)` leaves the head's own entry in `mtd`), so an entry whose
+    /// operation was removed by *another* entry's firing stays armed and expires the next head.
+    accept_timers: Vec<Instant>,
 }
 
 impl AsyncQueue {
@@ -207,20 +228,43 @@ impl AsyncQueue {
         &self.accepts
     }
 
-    /// Appends an accept operation — the C's `enq_multi_op`, which never refuses (`:12194`).
+    /// Appends an accept operation — the C's `enq_multi_op`, which never refuses (`:12194`) — and
+    /// registers its timer: an accept whose operand is **not** `INET_INFINITY` gets one sorted
+    /// `MultiTimerData` (`add_multi_timer`, `:15744`-`:15790`), an infinite one gets none at all
+    /// (`mtd` stays `NULL` at the enqueue sites, `:12198`-`:12210`).
     pub(super) fn enqueue_accept(&mut self, op: AcceptOp) {
         self.accepts.push(op);
+        if let Some(deadline) = op.deadline {
+            let at = self
+                .accept_timers
+                .iter()
+                .position(|when| *when > deadline)
+                .unwrap_or(self.accept_timers.len());
+            self.accept_timers.insert(at, deadline);
+        }
     }
 
-    /// Takes the oldest queued accept operation.
+    /// Takes the oldest queued accept operation **and cancels its own timer** — the C's successful
+    /// completion path: `deq_multi_op(…, &timeout, …)` followed by `remove_multi_timer`
+    /// (`inet_drv.c:13553`-`:13559`).
     pub(super) fn take_accept(&mut self) -> Option<AcceptOp> {
         if self.accepts.is_empty() {
             None
         } else {
-            Some(self.accepts.remove(0))
+            let op = self.accepts.remove(0);
+            if let Some(deadline) = op.deadline {
+                if let Some(at) = self.accept_timers.iter().position(|when| *when == deadline) {
+                    self.accept_timers.remove(at);
+                }
+            }
+            Some(op)
         }
     }
 
+    /// The C's `desc->mtd`: the armed accept timers, earliest first.
+    fn first_accept_timer(&self) -> Option<Instant> {
+        self.accept_timers.first().copied()
+    }
     /// Whether any operation is pending on either queue.
     pub(super) fn has_pending(&self) -> bool {
         self.recv.is_some() || !self.accepts.is_empty()
@@ -246,22 +290,55 @@ impl AsyncQueue {
 
     /// The earliest deadline among the pending operations — what the driver declares through
     /// `Driver::next_timeout`, which the port mirrors into its single `TIMEOUT` task.
+    ///
+    /// For accepts it is the **first armed timer entry** (the C's `desc->mtd->when`), which is what
+    /// the port's one timer is armed from — not the accept list head's own deadline.
     pub(super) fn next_deadline(&self) -> Option<Instant> {
+        let accept = self.first_accept_timer();
         let recv = self.recv.and_then(|op| op.deadline);
-        self.accepts
-            .iter()
-            .filter_map(|op| op.deadline)
-            .chain(recv)
-            .min()
+        accept.into_iter().chain(recv).min()
+    }
+
+    /// Whether the port's accept timer has expired at `now` — the C's `fire_multi_timers`
+    /// condition (`desc->mtd->when - erl_drv_monotonic_time(...) <= 0`) over the **earliest** armed
+    /// accept timer, not over the accept list head's own deadline.
+    ///
+    /// The C arms the port's one timer from the **first** entry of `desc->mtd`, an accept-timer
+    /// list kept sorted by `when` (`add_multi_timer`, `inet_drv.c:15744`-`:15790`), where an
+    /// `INET_INFINITY` accept contributes **no** entry at all. The timer's expiry therefore means
+    /// "the earliest armed accept deadline is due" — and `tcp_inet_multi_timeout` then reports the
+    /// **head** of the accept list, not the operation whose deadline fired (`:12600`-`:12615`).
+    pub(super) fn accept_timeout_due(&self, now: Instant) -> bool {
+        !self.accepts.is_empty() && self.first_accept_timer().is_some_and(|deadline| now >= deadline)
+    }
+
+    /// One `fire_multi_timers` iteration: consumes the earliest armed accept timer, removes the
+    /// accept list's **head** and answers that operation's id (the caller reports it as
+    /// `{error, timeout}`).
+    ///
+    /// The C's exact bookkeeping: `fire_multi_timers` (`inet_drv.c:15650`) pops the head of
+    /// `desc->mtd` and calls `tcp_inet_multi_timeout` (`:12600`), whose
+    /// `remove_multi_op(desc, &id, &req, caller, NULL, &monitor)` walks the multi-op list for the
+    /// first entry of that caller (`:2379`-`:2405`) — the head — *without* removing that
+    /// operation's own timer entry, which stays armed and expires the next head. `None` when the
+    /// timer has not expired at `now` or no accept is queued.
+    pub(super) fn expire_accept(&mut self, now: Instant) -> Option<u16> {
+        if !self.accept_timeout_due(now) {
+            return None;
+        }
+        self.accept_timers.remove(0);
+        let head = self.accepts.remove(0);
+        Some(head.id)
     }
 
     /// Every pending operation's id — the receive slot first, then the accepts in enqueue order —
-    /// leaving the queue empty.
+    /// leaving the queue (and its timers) empty.
     pub(super) fn take_all(&mut self) -> Vec<u16> {
         let mut ids = Vec::new();
         if let Some(op) = self.recv.take() {
             ids.push(op.id);
         }
+        self.accept_timers.clear();
         ids.extend(self.accepts.drain(..).map(|op| op.id));
         ids
     }
@@ -438,6 +515,14 @@ impl TcpInetDriver {
     /// of an already-`READABLE` registration), which re-reports a connection that arrived while no
     /// accept was queued; the last completion/timeout disarms it
     /// ([`TcpInetDriver::disarm_accepts`]).
+    ///
+    /// A **finite** `Timeout(4)` operand also joins the descriptor's timer set: the C stores one
+    /// `MultiTimerData` per finite deadline, sorted by `when`, and arms the port's single timer
+    /// from the earliest (`add_multi_timer`, `inet_drv.c:15744`-`:15790`); an `INET_INFINITY`
+    /// operand adds **no** entry (`mtd` stays `NULL`, `:12198`-`:12210`). What the port declares
+    /// through `Driver::next_timeout` is therefore the **earliest** deadline of the list, and its
+    /// expiry reports the list's **head**
+    /// ([`AsyncQueue::accept_timeout_due`] and [`TcpInetDriver::async_timeout`]).
     ///
     /// # Errors
     ///
@@ -639,6 +724,16 @@ impl TcpInetDriver {
     /// the receive at enqueue time, so bytes that are already there are delivered rather than
     /// reported as a timeout (which is exactly what makes a zero timeout see pending data instead
     /// of `{error, timeout}`).
+    ///
+    /// The **accept** half reports the **head** of the multi-op list, not the operation whose
+    /// deadline fired: the port keeps one timer, armed from the earliest entry of the accept-timer
+    /// list (`add_multi_timer`, `inet_drv.c:15744`-`:15790`), and its expiry runs
+    /// `fire_multi_timers` (`:15650`) → `tcp_inet_multi_timeout` (`:12600`), whose
+    /// `remove_multi_op` takes the first entry of the accept list — for a single caller that is its
+    /// head (`:2379`-`:2405`) — and answers *that* id with `{error, timeout}`
+    /// (`send_async_error(…, am_timeout)`). It then loops while the earliest remaining timer entry
+    /// is already due (`next_timeout <= 0`) and otherwise re-arms from the survivors, so one call
+    /// may report several heads, always in list order.
     pub(super) fn async_timeout(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         let now = Instant::now();
         if self.async_ops.recv().is_some_and(|op| op.is_due(now))
@@ -651,20 +746,14 @@ impl TcpInetDriver {
                 })?;
             }
         }
-        loop {
-            let due = self
-                .async_ops
-                .accepts()
-                .first()
-                .copied()
-                .filter(|op| op.is_due(now));
-            let Some(op) = due else { break };
-            self.async_ops.take_accept();
+        // The C's `fire_multi_timers` loop: consume the earliest armed accept timer, report the
+        // accept list's head, and go on while the next armed timer is already due.
+        while let Some(id) = self.async_ops.expire_accept(now) {
             // The C's `tcp_inet_multi_timeout` disarms only once the list is empty
             // (`inet_drv.c:12607-12611`): survivors keep the socket armed.
             self.disarm_accepts(ctx)?;
             ctx.deliver_completion(CompletionEvent::InetAsync {
-                id: op.id,
+                id,
                 result: InetAsyncResult::Error(InetReason::Timeout),
             })?;
         }
