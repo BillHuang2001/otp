@@ -40,27 +40,41 @@
 //!      silently;
 //!    * **(c) GENUINE-GAP** — the engine did **not** demonstrate the declared
 //!      behaviour: a capability diagnostic (`unsupported_opcode: …`) or an outcome
-//!      contradicting the row's declaration. The **un-converted** rows (round 2, still
-//!      driven with the legacy degenerate operands) are also bucketed here — the
-//!      conservative side — and their detail is marked `ROUND-2`, because a typed
-//!      error from a degenerate operand is *not yet* evidence of a gap;
+//!      contradicting the row's declaration. The bucket is **empty at this revision**
+//!      and its pin is kept, so a regression re-enters it instead of hiding;
 //!    * **(d) UNCLAIMED** — the reason carries the sentinel [`UNCLAIMED_PREFIX`] that
 //!      `families::dispatch` returns for an instruction **no** core arm and **no**
 //!      family claims.
 //!
 //!    The census asserts (d) is **empty**: every one of the 108 variants is owned.
-//!    At this revision the measured dynamic split is **44 EXECUTED + 7 ZERO-CORPUS +
-//!    57 GENUINE-GAP + 0 UNCLAIMED** (pinned below as `EXECUTED_VARIANTS` /
-//!    `ZERO_CORPUS_VARIANTS` / `GENUINE_GAP_VARIANTS`). **Two** rows are so far
-//!    driven with valid operands and a real expectation (`Call`, `CallExt` — the two
-//!    mechanics every other conversion builds on: a local call through an aux leaf
-//!    block, and an import dispatched to a host `bif` hook); both reach their declared
-//!    outcome. The converted roster lives in [`support::rows`], one file per
-//!    instruction group; a group that returns an empty `Vec` leaves its variants on
-//!    the legacy degenerate-operand path. The remaining 57 GENUINE-GAP rows are
-//!    **round 2**: earlier investigation showed every one of them executes under
-//!    valid operands, so the bucket is where the ratchet starts, not a claim that 57
-//!    opcodes are missing. The real capability gaps are named in `tests/gaps.rs`.
+//!    At this revision the measured dynamic split is **95 EXECUTED + 13 ZERO-CORPUS +
+//!    0 GENUINE-GAP + 0 UNCLAIMED** (pinned below as `EXECUTED_VARIANTS` /
+//!    `ZERO_CORPUS_VARIANTS` / `GENUINE_GAP_VARIANTS`): **all 108 variants demonstrate
+//!    their declared behaviour**, and the 13 are re-bucketed only because real
+//!    compiler output never emits them.
+//!
+//!    **64** rows are probe-driven with valid operands and a declared expectation:
+//!    every one of the 59 variants that an earlier revision reported `CLAIMED-BLOCKED`,
+//!    plus 5 whose required shape the degenerate-operand module already happened to
+//!    satisfy. They live in [`support::rows`], one file per instruction group
+//!    (`core`, `data`, `exceptions`, `receive`, `bitstrings`), and each supplies the
+//!    minimum operands under which its instruction *performs its operation* instead
+//!    of rejecting them — a real tuple/list/map/binary/bitstring subject, an
+//!    `allocate`d frame for a `deallocate`, an installed mailbox for the
+//!    `RecvMarker*` family, a BIF/apply hook, a resolvable local or cross-module
+//!    callee, a match context for the `Bs*` matching family, the module's own
+//!    `funs`/`recs`. The remaining **44** rows are the already-executing ones, kept on
+//!    the compact degenerate-operand module: their declared outcome is exactly "runs
+//!    without a typed diagnostic", which is what a census measures. Per-operand
+//!    semantics for them are pinned by the family suites (`tests/opcodes.rs`,
+//!    `tests/receive.rs`, `tests/records.rs`, `tests/exceptions.rs`,
+//!    `tests/bitstrings*.rs`, …), not here.
+//!
+//!    A row whose valid shape still hit a capability error would stay in GENUINE-GAP
+//!    with its exact typed error named in the detail column — that is the real
+//!    implementation work a later pass picks up. There is none today: the only typed
+//!    `unsupported` left in this instruction surface is `put_record/6`'s create form
+//!    for a **foreign** module's record id (see `tests/gaps.rs`), which no row needs.
 //!
 //! 2. [`interpreter_execution_census_over_every_test_kind`] does the same for all
 //!    25 [`TestKind`]s packed into one `Instr::Test` each; all **25/25** execute
@@ -110,7 +124,9 @@
 //! `src/families/**`.
 //! `Instr::Generic` is the residual-opcode sentinel: it is handled by
 //! `src/generic.rs` (`error::unsupported(op.name())`), which is core, so it is
-//! classed EXECUTED here with its typed error recorded in the detail column.
+//! classed EXECUTED here with its typed diagnostic recorded in the detail column —
+//! and then re-bucketed to ZERO-CORPUS by the forward-compat pin, because no already
+//! modelled opcode lowers to it.
 //!
 //! # Why the rosters live here
 //!
@@ -159,23 +175,24 @@ const INSTR_VARIANTS: usize = 108;
 const TEST_KINDS: usize = 25;
 
 /// The measured **dynamic** classification of the [`INSTR_VARIANTS`] variants at
-/// this census's revision: **44** reached their declared behaviour and are not
-/// forward-compat rows (class EXECUTED), **7** executed but real compiler output
-/// never emits them (class ZERO-CORPUS), **57** did not demonstrate a declared
-/// behaviour (class GENUINE-GAP — the un-converted round-2 rows included), and **0**
-/// are unclaimed.
+/// this census's revision: **95** reached their declared behaviour and are not
+/// forward-compat rows (class EXECUTED), **13** executed but real compiler output
+/// never emits them (class ZERO-CORPUS), **0** did not demonstrate a declared
+/// behaviour (class GENUINE-GAP), and **0** are unclaimed.
 ///
 /// These are the *dynamic* counts, not the *static* family assignment (31 core arms
-/// + 77 family-owned). The counts are pinned so a change of classification — a real
-/// regression, or a newly executed variant — fails the build. Converting a round-2
-/// row moves it **out of** GENUINE-GAP into EXECUTED (or ZERO-CORPUS); a conversion
-/// that instead *reveals* a real engine limitation keeps it in GENUINE-GAP with an
-/// `ENGINE-DIAGNOSTIC` detail.
-const EXECUTED_VARIANTS: usize = 44;
+/// + 77 family-owned), and the three buckets partition the roster
+/// (`executed + zero_corpus + gaps + unclaimed == INSTR_VARIANTS`). The counts are
+/// pinned so a change of classification — a real regression, or a newly executed
+/// variant — fails the build: converting a row moves it **out of** GENUINE-GAP into
+/// EXECUTED (or ZERO-CORPUS), while a regression *into* a typed error moves it back
+/// with an `ENGINE-DIAGNOSTIC` detail. `GENUINE_GAP_VARIANTS == 0` is therefore the
+/// claim "every variant demonstrates its declared behaviour", not an empty pin.
+const EXECUTED_VARIANTS: usize = 95;
 /// The executed variants that real compiler output never emits ([`ZERO_CORPUS`]).
-const ZERO_CORPUS_VARIANTS: usize = 7;
+const ZERO_CORPUS_VARIANTS: usize = 13;
 /// See [`EXECUTED_VARIANTS`]; class GENUINE-GAP.
-const GENUINE_GAP_VARIANTS: usize = 57;
+const GENUINE_GAP_VARIANTS: usize = 0;
 
 /// The 13 variants the engine executes (or models) that real compiler output never
 /// emits — measured over the whole installed OTP by [`corpus_reachability_census`],
@@ -264,14 +281,14 @@ fn class_of_text(text: &str) -> Class {
     }
 }
 
-/// Classify one **legacy** (un-converted, degenerate-operand) run outcome.
+/// Classify one **legacy** (compact degenerate-operand) run outcome.
 ///
 /// `Ok(term)` is EXECUTED. An error is UNCLAIMED when its text carries
-/// [`UNCLAIMED_PREFIX`], else GENUINE-GAP — marked `ROUND-2` because the operand that
-/// produced it is not a valid one, so the row has not been measured yet. The text is
-/// the error's `Debug` plus its BEAM atom name (when it has one), so the sentinel — an
-/// `unsupported_opcode: widened opcode not yet executed: <name>` atom — is always
-/// visible.
+/// [`UNCLAIMED_PREFIX`], else GENUINE-GAP: these rows all executed before the
+/// probe conversion, so a typed error here is a regression, never a probe artifact.
+/// The text is the error's `Debug` plus its BEAM atom name (when it has one), so the
+/// sentinel — an `unsupported_opcode: widened opcode not yet executed: <name>` atom —
+/// is always visible.
 fn classify(result: Result<Eterm>) -> (Class, String) {
     match result {
         Ok(term) => (Class::Executed, format!("returned {term:?}")),
@@ -281,11 +298,7 @@ fn classify(result: Result<Eterm>) -> (Class, String) {
                 text.push_str(" => ");
                 text.push_str(atom);
             }
-            let class = class_of_text(&text);
-            if class == Class::GenuineGap {
-                text = format!("ROUND-2 (degenerate operand, not measured yet): {text}");
-            }
-            (class, text)
+            (class_of_text(&text), text)
         }
     }
 }
@@ -525,9 +538,10 @@ fn run_legacy_row(variant: Instr) -> (Class, String) {
     if is_generic {
         // `src/generic.rs`'s sentinel is core (the documented `unsupported(op.name())`
         // for a residual opcode, never the family-dispatch sentinel): the interpreter
-        // arm is the one that executes, so this is an executed variant.
+        // arm is the one that executes, and its defined outcome IS that diagnostic, so
+        // this row demonstrates its declared behaviour.
         class = Class::Executed;
-        detail = format!("core sentinel — {detail}");
+        detail = format!("core residual-opcode sentinel — its defined outcome is the typed diagnostic: {detail}");
     }
     (class, detail)
 }
