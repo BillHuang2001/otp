@@ -138,7 +138,7 @@ fn data_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<Vec<u8>> {
         .notifications
         .iter()
         .filter_map(|notification| match notification {
-            PortNotification::Data { port, bytes } if *port == id => Some(bytes.clone()),
+            PortNotification::Data { port, read } if *port == id => Some(read.flattened()),
             _ => None,
         })
         .collect()

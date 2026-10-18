@@ -39,7 +39,9 @@
 //!   `INPUT`; writability **or** write-EOF **or** an error schedules `OUTPUT` — a poll
 //!   error re-triggers *every* armed direction, see [`Readiness`]);
 //! * [`PortNotification`] / [`PortTaskOutcome`] — what an execution round reports back to
-//!   the runtime. This is the seam the runtime turns into `{Port, {data, Data}}` messages.
+//!   the runtime. This is the seam the runtime turns into `{Port, {data, Data}}` messages, and
+//!   [`PortNotification::Data`] carries a whole [`ReadMessage`] so the C's `driver_output2`
+//!   header/body split survives up to the term the runtime builds.
 //!
 //! # Reductions
 //!
@@ -393,24 +395,119 @@ impl From<Ready> for Readiness {
     }
 }
 
+/// One completed read a driver handed up, with the C's header/body split preserved.
+///
+/// This is the payload of one `driver_output*` **call**, not one byte chunk: the C delivers
+/// exactly one `{Port, {data, Data}}` message per call (`deliver_read_message`,
+/// `erts/emulator/beam/io.c:3363-3442`), and two calls made inside one driver callback are two
+/// messages. [`header`](ReadMessage::header) is the `hbuf`/`hlen` pair of
+/// `driver_output2`/`driver_output_binary`/`driver_outputv`; [`body`](ReadMessage::body) is
+/// its `buf`/`len` pair, with the C's `buf == NULL` distinction kept as `None`.
+///
+/// The runtime renders the pair into the term the owner sees — this crate only carries the
+/// split, it never builds the term:
+///
+/// * `[list]` port: the header bytes then the body bytes, **flat**, as a proper int list (the
+///   split is not observable at all: `driver_output2("HDR",3,"abc",3)` ⇒ `[72,68,82,97,98,99]`).
+/// * `[binary]` port: the header bytes as **one cons cell per byte** (never one nested binary)
+///   and the body as the improper list's binary tail. A non-empty header with
+///   `body == Some(b)` is `[72,68,82\|<<b>>]`; with `body == None` it is the **proper** list
+///   `[72,68,82]` (the C adds no binary tail at all for a `NULL` body); with an **empty**
+///   header the body is the bare binary (`driver_output("abc",3)` ⇒ `<<97,98,99>>`), and an
+///   empty header with no body is `[]`.
+///
+/// The pinned oracle shapes (system `erl`, OTP 29.1.1/erts-17.1, probed with a real C driver):
+///
+/// | driver call | `[list]` port `Data` | `[binary]` port `Data` |
+/// |---|---|---|
+/// | `driver_output2("HDR",3,"abc",3)` | `[72,68,82,97,98,99]` | `[72,68,82\|<<97,98,99>>]` (improper: `is_list` true, `length/1` `badarg`) |
+/// | `driver_output("abc",3)` | `[97,98,99]` | `<<97,98,99>>` (bare binary) |
+/// | `driver_output2("HDR",3,"abc",0)` | `[72,68,82]` | `[72,68,82\|<<>>]` (empty binary tail) |
+/// | `driver_output2("HDR",3,"",0)` — non-NULL body, length 0 | `[72,68,82]` | `[72,68,82\|<<>>]` |
+/// | `driver_output2("HDR",3,NULL,0)` — **NULL** body | `[72,68,82]` | `[72,68,82]` (proper list) |
+/// | `driver_output2(NULL,0,NULL,0)` | `[]` | `[]` (not `<<>>`) |
+///
+/// So `body: Some(vec![])` and `body: None` are **different** messages, which is why the body
+/// is an `Option` rather than an always-present `Vec`. A header-only read is
+/// `body: None`; [`ReadMessage::body_only`] builds the common `driver_output` shape.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ReadMessage {
+    /// The `driver_output2` `hbuf`/`hlen` bytes — delivered as one cons cell per byte in
+    /// binary mode and as plain ints in list mode, never as one nested binary.
+    pub header: Vec<u8>,
+    /// The `driver_output2` `buf`/`len` bytes. `None` is the C's `buf == NULL`: **no** binary
+    /// tail at all (a header-only proper list), whereas `Some(vec![])` is a present, empty body
+    /// (`<<>>` tail ⇒ `[H…|<<>>]`).
+    pub body: Option<Vec<u8>>,
+}
+
+impl ReadMessage {
+    /// The [`ReadMessage`] of a plain `driver_output(bytes, len)` — all body, no header.
+    pub fn body_only(bytes: Vec<u8>) -> ReadMessage {
+        ReadMessage {
+            header: Vec::new(),
+            body: Some(bytes),
+        }
+    }
+
+    /// The number of bytes this read carries: the C's `bytes_in` accounting for the call
+    /// (`hlen + len`). This is what `port_info(P, input)` counts, header included.
+    pub fn len(&self) -> usize {
+        self.header.len() + self.body.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Whether this read carries no bytes at all (`driver_output2(NULL,0,NULL,0)`, whose
+    /// message is the still-owed `{Port, {data, []}}`).
+    pub fn is_empty(&self) -> bool {
+        self.header.is_empty() && self.body.as_ref().is_none_or(Vec::is_empty)
+    }
+
+    /// Whether the read has a **body** at all — the flag that decides the binary tail: `true`
+    /// (`Some`, empty or not) ⇒ the tail exists, `false` (`None`) ⇒ there is none.
+    pub fn has_body(&self) -> bool {
+        self.body.is_some()
+    }
+
+    /// The read's bytes in one flat sequence: the header bytes, then the body bytes.
+    ///
+    /// This is exactly what an `[list]` port's `Data` is — the split is not observable there
+    /// (`driver_output2("HDR",3,"abc",3)` ⇒ `[72,68,82,97,98,99]`) — and it is the byte stream
+    /// a consumer that does not build a term (an `{packet, N}` framer, a byte counter) wants.
+    /// A `[binary]` port must **not** use it to build its term: there the header is a cons
+    /// prefix and the body the improper tail, so flattening loses the very distinction the C
+    /// makes.
+    pub fn flattened(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.len());
+        bytes.extend_from_slice(&self.header);
+        if let Some(body) = &self.body {
+            bytes.extend_from_slice(body);
+        }
+        bytes
+    }}
+
 /// Something a port produced during an execution round, for its owner.
 ///
 /// This is the crate's notification seam: the runtime turns [`PortNotification::Data`] into
 /// the `{Port, {data, Data}}` message Erlang sees and [`PortNotification::Closed`] into a
 /// `ERL_PORT_EXIT`-style port exit.
 ///
+/// Every [`PortNotification::Data`] is **one driver `driver_output*` call** — a round reports
+/// them in arrival order and there can be several for one port (a driver that answers two
+/// commands in one callback produces two), and two calls are never merged. An explicit empty
+/// read is a real notification: the oracle's `{Port, {data, []}}`.
+///
 /// A `{line, N}` port's input does **not** ride this enum: it is reported on the separate
 /// [`LineNotification`] channel (see there), so this enum keeps exactly its two variants and
 /// an exhaustive consumer keeps compiling unchanged.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PortNotification {
-    /// The port's driver read `bytes`, which belong to the port's owner.
+    /// The port's driver read `read`, which belongs to the port's owner.
     Data {
         /// The port that produced the bytes.
         port: PortId,
-        /// The bytes. A port-task round reports a payload only when it is non-empty, so a
-        /// consumer may rely on this never being empty.
-        bytes: Vec<u8>,
+        /// The call's bytes, split exactly as the driver handed them up (see [`ReadMessage`]
+        /// for the shapes, including the empty one).
+        read: ReadMessage,
     },
     /// The port was closed since the previous execution round.
     Closed {
@@ -418,7 +515,6 @@ pub enum PortNotification {
         port: PortId,
     },
 }
-
 /// One **line-framed** chunk a `{line, N}` port owes its owner.
 ///
 /// This is the `{line, N}` mode (`ERTS_PORT_SFLG_LINEBUF_IO`): the port splits the bytes its
@@ -433,10 +529,22 @@ pub enum PortNotification {
 ///
 /// Unlike [`PortNotification::Data`], an empty payload is a **real** frame here: a blank line
 /// is the oracle's `{Port, {data, {eol, []}}}`.
+///
+/// A frame carries the [`ReadMessage::header`] of the read that produced it in
+/// [`header`](LineNotification::header), because the C prepends the header of **that call** as
+/// cons cells to every frame the call's body completes
+/// (`driver_output2("HDR",3,"a\nb\n",4)` ⇒ two messages, `{eol,[72,68,82|<<"a">>]}` and
+/// `{eol,[72,68,82|<<"b">>]}`). A line that spans two calls therefore gets the header of the
+/// call that **completed** it, a `NULL` body produces no frame at all, and a plain (header-less)
+/// read — or the end-of-file flush — stamps an empty header.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LineNotification {
     /// The port that produced the frame.
     pub port: PortId,
+    /// The per-frame header prefix: the producing read's [`ReadMessage::header`], added as one
+    /// cons cell per byte ahead of the frame's content in binary mode. Empty for a plain read
+    /// and for an end-of-file flush.
+    pub header: Vec<u8>,
     /// The frame's content bytes (the line's terminator is not included); empty for a blank
     /// line.
     pub bytes: Vec<u8>,
@@ -445,7 +553,6 @@ pub struct LineNotification {
     /// end-of-file).
     pub eol: bool,
 }
-
 /// What one [`crate::PortRegistry::execute_port_tasks`] round did.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct PortTaskOutcome {
@@ -461,8 +568,8 @@ pub struct PortTaskOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        PortTaskKind, PortTaskQueue, Readiness, CONTEXT_REDS, PORT_REDS_EXECUTE, PORT_REDS_INPUT,
-        PORT_REDS_OUTPUT, PORT_REDS_TIMEOUT,
+        PortTaskKind, PortTaskQueue, ReadMessage, Readiness, CONTEXT_REDS, PORT_REDS_EXECUTE,
+        PORT_REDS_INPUT, PORT_REDS_OUTPUT, PORT_REDS_TIMEOUT,
     };
     use crate::driver::{Driver, DriverContext};
     use crate::drivers::FdDriver;
@@ -473,7 +580,136 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    /// A driver that arms **both** poll directions on one borrowed descriptor.
+    #[test]
+    fn body_only_is_the_plain_driver_output_shape() {
+        let read = ReadMessage::body_only(b"abc".to_vec());
+        assert!(read.header.is_empty(), "no header: never one nested binary");
+        assert_eq!(read.body.as_deref(), Some(&b"abc"[..]));
+        assert_eq!(read.len(), 3);
+        assert!(!read.is_empty());
+        assert!(read.has_body(), "a body-only read still has its binary tail");
+    }
+
+    #[test]
+    fn len_is_the_cs_bytes_in_accounting_header_included() {
+        // `bytes_in` (`io.c:3363-3442`) counts `hlen + len`, which is what
+        // `port_info(P, input)` reports.
+        let split = ReadMessage {
+            header: b"HDR".to_vec(),
+            body: Some(b"abc".to_vec()),
+        };
+        assert_eq!(split.len(), 6, "hlen + len");
+        let header_only = ReadMessage {
+            header: b"HDR".to_vec(),
+            body: None,
+        };
+        assert_eq!(header_only.len(), 3, "a NULL body contributes nothing");
+        let empty_body = ReadMessage {
+            header: b"HDR".to_vec(),
+            body: Some(Vec::new()),
+        };
+        assert_eq!(empty_body.len(), 3, "a present but empty body adds no bytes");
+        assert_eq!(ReadMessage::default().len(), 0);
+    }
+
+    #[test]
+    fn an_empty_body_differs_from_a_null_body() {
+        // `driver_output2("HDR",3,"abc",0)` ⇒ `[72,68,82|<<>>]`; the same call with a NULL
+        // body ⇒ the *proper* list `[72,68,82]`. Both carry 3 bytes, so only `has_body`
+        // distinguishes them — it is the flag that decides whether the binary tail exists.
+        let empty = ReadMessage {
+            header: b"HDR".to_vec(),
+            body: Some(Vec::new()),
+        };
+        let null = ReadMessage {
+            header: b"HDR".to_vec(),
+            body: None,
+        };
+        assert_eq!(empty.len(), null.len());
+        assert!(empty.has_body() && !null.has_body());
+        assert!(
+            !empty.is_empty() && !null.is_empty(),
+            "the 3 header bytes are bytes: neither message is empty"
+        );
+        // …whereas the body-less, header-less read really carries nothing.
+        assert!(ReadMessage::default().is_empty());
+    }
+
+    #[test]
+    fn a_null_read_is_empty_but_still_a_reportable_message() {
+        // `driver_output2(NULL,0,NULL,0)` is the oracle's `{Port, {data, []}}`: no bytes at
+        // all, yet still one message owed to the owner.
+        let empty = ReadMessage::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert!(empty.header.is_empty() && !empty.has_body());
+    }
+
+    #[test]
+    fn flattened_is_the_list_mode_byte_sequence() {
+        // The `[list]` port's `Data` is header then body, flat — the split is invisible there.
+        let split = ReadMessage {
+            header: b"HDR".to_vec(),
+            body: Some(b"abc".to_vec()),
+        };
+        assert_eq!(split.flattened(), b"HDRabc".to_vec());
+        assert_eq!(
+            ReadMessage::body_only(b"abc".to_vec()).flattened(),
+            b"abc".to_vec()
+        );
+        assert_eq!(
+            ReadMessage {
+                header: b"HDR".to_vec(),
+                body: None,
+            }
+            .flattened(),
+            b"HDR".to_vec()
+        );
+        assert!(ReadMessage::default().flattened().is_empty());
+    }
+    #[test]
+    fn the_pinned_oracle_rows_map_onto_the_header_body_split() {
+        // One [`ReadMessage`] per `driver_output*` call, in the order the header table in
+        // `ReadMessage`'s docs lists them: the split (not the rendering) is this crate's
+        // half, so the rows are pinned as `(header, body, has_body, len)`.
+        let rows = [
+            // driver_output2("HDR",3,"abc",3)
+            (
+                ReadMessage {
+                    header: b"HDR".to_vec(),
+                    body: Some(b"abc".to_vec()),
+                },
+                true,
+                6,
+            ),
+            // driver_output("abc",3)
+            (ReadMessage::body_only(b"abc".to_vec()), true, 3),
+            // driver_output2("HDR",3,"abc",0) — non-NULL, empty body
+            (
+                ReadMessage {
+                    header: b"HDR".to_vec(),
+                    body: Some(Vec::new()),
+                },
+                true,
+                3,
+            ),
+            // driver_output2("HDR",3,NULL,0) — NULL body: no binary tail
+            (
+                ReadMessage {
+                    header: b"HDR".to_vec(),
+                    body: None,
+                },
+                false,
+                3,
+            ),
+            // driver_output2(NULL,0,NULL,0)
+            (ReadMessage::default(), false, 0),
+        ];
+        for (read, has_body, len) in rows {
+            assert_eq!(read.has_body(), has_body, "{read:?}");
+            assert_eq!(read.len(), len, "{read:?}");
+        }
+    }    /// A driver that arms **both** poll directions on one borrowed descriptor.
     ///
     /// [`FdDriver::pipe`] arms only `READABLE` (it registers its write fd only once there is
     /// something to flush), so it cannot express "a port whose write direction is armed" — the

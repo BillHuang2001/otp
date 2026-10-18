@@ -34,16 +34,17 @@
 //! `.so` cannot implement a Rust trait, so a later adapter implements [`Driver`] over an
 //! `ErlDrvEntry` function table (see the crate `CONTEXT.md`, Design Decisions).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::RawFd;
 use std::time::Instant;
 
 use beam_common::Result;
 use beam_process::PortId;
 
+use crate::error;
 use crate::poller::{Interest, Poller, Token};
+use crate::port_task::ReadMessage;
 use crate::queue::ByteQueue;
-
 /// Why a port is exiting, as reported to a driver through [`Driver::port_exit`].
 ///
 /// This is a small, closed vocabulary — deliberately *not* an Erlang term — because it is the
@@ -159,13 +160,20 @@ pub struct DriverContext<'a> {
     /// The registrations this driver holds, so the reactor knows which directions it can
     /// serve (see [`PortArms`]).
     arms: &'a mut PortArms,
+    /// The port's sink for **completed reads** (see [`DriverContext::deliver_read`]), or
+    /// `None` in a bare test context — a driver that asks for the split shape without a sink
+    /// gets the typed `unsupported` instead of a silently flattened read.
+    reads: Option<&'a mut VecDeque<ReadMessage>>,
 }
 
 impl<'a> DriverContext<'a> {
     /// Builds a context for `port` over the given disjoint poller/queue/arming borrows.
     ///
     /// Called by [`crate::port::Port`] after it has destructured itself into disjoint
-    /// fields, so the driver and its context borrow separate members of the `Port`.
+    /// fields, so the driver and its context borrow separate members of the `Port`. A context
+    /// built here has **no** read sink, so [`DriverContext::deliver_read`] answers the typed
+    /// `unsupported`; [`crate::port::Port`] installs one with
+    /// [`DriverContext::with_reads`] at every driver callback.
     pub(crate) fn new(
         port: PortId,
         poller: &'a mut Poller,
@@ -179,9 +187,21 @@ impl<'a> DriverContext<'a> {
             input,
             output,
             arms,
+            reads: None,
         }
     }
 
+    /// Installs `reads` as this context's completed-read sink (chainable).
+    ///
+    /// Every driver callback a [`crate::port::Port`] dispatches gets one, so a driver may
+    /// call [`DriverContext::deliver_read`] from any of them.
+    pub(crate) fn with_reads(
+        mut self,
+        reads: &'a mut VecDeque<ReadMessage>,
+    ) -> DriverContext<'a> {
+        self.reads = Some(reads);
+        self
+    }
     /// The port this context belongs to.
     pub fn port(&self) -> PortId {
         self.port
@@ -224,11 +244,54 @@ impl<'a> DriverContext<'a> {
     }
 
     /// The port's input queue, which the driver appends bytes it read to.
+    ///
+    /// Bytes pushed here are **one body-only read** at the next frame close — a
+    /// [`ReadMessage`] with no header and the bytes as its body
+    /// ([`ReadMessage::body_only`]) — reported to the owner after every byte the driver
+    /// banked before it. It is the plain `driver_output(bytes, len)` shape; a driver that has
+    /// a header apart from its body (the C's `driver_output2`) must use
+    /// [`DriverContext::deliver_read`] instead, because a flattened push cannot express the
+    /// split.
     pub fn input(&mut self) -> &mut ByteQueue {
         self.input
     }
 
-    /// The port's output queue, which the driver drains bytes waiting to be written from.
+    /// Hands one completed read up to the port owner, header apart from body.
+    ///
+    /// This is the C's `driver_output2(ix, hbuf, hlen, buf, len)` —
+    /// `driver_output_binary`/`driver_outputv` have the same shape — as seen from a driver:
+    /// **one** read message per call, [`header`](ReadMessage::header) the `hbuf`/`hlen` bytes
+    /// and [`body`](ReadMessage::body) the `buf`/`len` bytes, with `body == None` meaning the
+    /// C's `buf == NULL` (no binary tail at all, rather than an empty one). See
+    /// [`ReadMessage`] for the pinned oracle shapes and how a runtime renders them.
+    ///
+    /// Ordering: bytes the driver banked on [`DriverContext::input`] are closed into their
+    /// own body-only read **first**, so a `push` followed by a `deliver_read` inside one
+    /// callback delivers the two messages in that order (the C delivers synchronously, so the
+    /// order is observable). Two calls are never merged, and an empty read
+    /// (`deliver_read(&[], None)`) is still one message — the oracle's `{Port, {data, []}}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed `unsupported` diagnostic when this context has **no** read sink: a
+    /// bare context (a unit test, or a driver driven outside a port) cannot report the split,
+    /// and flattening it into [`DriverContext::input`] would report the wrong shape rather
+    /// than a degraded one.
+    pub fn deliver_read(&mut self, header: &[u8], body: Option<&[u8]>) -> Result<()> {
+        let Some(reads) = self.reads.as_mut() else {
+            return Err(error::unsupported(
+                "a driver handed up a split read (driver_output2) outside a port: no read sink is installed",
+            ));
+        };
+        // Close whatever the driver banked before this call, so arrival order is preserved.
+        // The close itself lives in `Port` (one implementation, see `close_input_frame`).
+        crate::port::close_input_frame(self.input, reads);
+        reads.push_back(ReadMessage {
+            header: header.to_vec(),
+            body: body.map(<[u8]>::to_vec),
+        });
+        Ok(())
+    }    /// The port's output queue, which the driver drains bytes waiting to be written from.
     pub fn output(&mut self) -> &mut ByteQueue {
         self.output
     }
@@ -664,6 +727,7 @@ mod tests {
     use crate::queue::ByteQueue;
     use beam_common::{BeamError, Result};
     use beam_process::PortId;
+    use std::collections::VecDeque;
     use std::process::Command;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -818,6 +882,77 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------------------------
+    // The completed-read sink (`driver_output2`'s header/body split)
+    // -------------------------------------------------------------------------------------------
+
+    #[test]
+    fn deliver_read_without_a_sink_is_the_typed_unsupported_never_a_flattening() {
+        // A bare context (a unit test, or a driver driven outside a port) cannot carry the
+        // split, and reporting a header/body pair as one flat `input()` blob would be the
+        // *wrong shape* rather than a degraded one — so it is a typed error, not a fallback.
+        let mut poller = Poller::new().expect("a poll set");
+        let mut input = ByteQueue::new();
+        let mut output = ByteQueue::new();
+        let mut arms = PortArms::default();
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut poller,
+            &mut input,
+            &mut output,
+            &mut arms,
+        );
+        let error = ctx
+            .deliver_read(b"HDR", Some(b"abc"))
+            .expect_err("no sink is installed");
+        assert!(
+            error.to_string().contains("no read sink"),
+            "the diagnostic names the missing sink: {error}"
+        );
+        assert!(
+            ctx.input().is_empty(),
+            "the refused read is never silently flattened into the input queue"
+        );
+    }
+
+    #[test]
+    fn deliver_read_pushes_one_message_and_closes_the_banked_frame_first() {
+        let mut poller = Poller::new().expect("a poll set");
+        let mut input = ByteQueue::new();
+        let mut output = ByteQueue::new();
+        let mut arms = PortArms::default();
+        let mut reads = VecDeque::new();
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut poller,
+            &mut input,
+            &mut output,
+            &mut arms,
+        )
+        .with_reads(&mut reads);
+
+        // Banked bytes first, then the split read: the bank is closed into its own body-only
+        // message ahead of it (the C delivers synchronously, so the order is observable).
+        ctx.input().push(b"banked");
+        ctx.deliver_read(b"HDR", Some(b"abc"))
+            .expect("the sink is installed");
+        // An explicit empty read is still one message, and a `None` body differs from `Some([])`
+        // — which is why the caller passes an `Option`.
+        ctx.deliver_read(b"", None).expect("one empty message");
+
+        let pushed: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+            reads.drain(..).map(|read| (read.header, read.body)).collect();
+        assert_eq!(
+            pushed,
+            vec![
+                (Vec::new(), Some(b"banked".to_vec())),
+                (b"HDR".to_vec(), Some(b"abc".to_vec())),
+                (Vec::new(), None),
+            ]
+        );
+        assert!(input.is_empty(), "the banked frame was drained, not copied");
+    }
+
     #[test]
     fn port_exit_reason_is_a_closed_copyable_vocabulary() {
         let all = [
@@ -825,8 +960,7 @@ mod tests {
             PortExitReason::OwnerExited,
             PortExitReason::Normal,
         ];
-        for (i, a) in all.iter().enumerate() {
-            for (j, b) in all.iter().enumerate() {
+        for (i, a) in all.iter().enumerate() {            for (j, b) in all.iter().enumerate() {
                 assert_eq!(a == b, i == j);
             }
             // `Copy`: a by-value use does not move out of the array.

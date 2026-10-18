@@ -45,21 +45,24 @@ out of a read as `{eol | noeol, Data}` inside `{Port, {data, …}}` (`deliver_li
   byte-only views (`take_lines`/`drain`/`flush_all`) are the same frames with the marker dropped and
   are what the out-of-scope `drivers/binary_io.rs` still uses. The byte stream itself is unchanged
   from before the marker was added.
-- `port_task.rs` → `LineNotification { port, bytes, eol }` — a **separate** struct, deliberately
+- `port_task.rs` → `LineNotification { port, header, bytes, eol }` — a **separate** struct, deliberately
   **not** a third `PortNotification` variant (a line-mode port's input never rides the raw
   `{Port, {data, Data}}` channel, and `PortNotification` keeps exactly its two variants so an
   exhaustive consumer stays exhaustive). Unlike `Data`, an **empty payload is a real frame**
-  here — a blank line is `{data, {eol, []}}`.
+  here — a blank line is `{data, {eol, []}}`. `header` is the `driver_output2` header of the read
+  that **completed** the line (a per-frame cons prefix, empty for a plain read or an EOF flush).
 - `port.rs` → `Port::set_line_mode(Option<usize>)` / `line_mode()` (the `SFLG` bit + `linebuf->max_len`;
   `Some(0)` = no length limit), `Port::flush_linebuf()` (the C `flush_linebuf_messages`), and
-  `take_input_notifications()` (raw mode: 0/1 `Data`; line mode: **no** notification, the frames are
-  staged and drained by `take_line_frames()`).
+  `take_input_notifications()` (raw mode: **one `Data` per completed read message**; line mode:
+  **no** notification, the frames are staged and drained by `take_line_frames()`).
   `Port::take_eof()` is the crate's **`driver_eof` observation point** and runs the flush.
 - `registry.rs` → `PortRegistry::set_line_mode(id, Option<usize>)` / `flush_linebuf(id)` (the runtime's
   adoption seams) plus `take_line_notifications()` (drains every port's staged frames in port-number
-  order — the accessor style of `take_eof`/`take_closed_notifications`); `execute_port_tasks` still
-  harvests one `PortNotification` per port and its `notifications` carry only `PortNotification`s,
-  so a single read can stage many frames (597 bytes at `{line,4}` ⇒ 150, on the line channel).
+  order — the accessor style of `take_eof`/`take_closed_notifications`); `execute_port_tasks`
+  harvests every pending read of every port and its `notifications` carry only
+  `PortNotification`s, so one round can yield several `Data` (one per `driver_output*` call,
+  `io.c:3363-3442`) and a single read can stage many frames (597 bytes at `{line,4}` ⇒ 150, on the
+  line channel).
 
 ### A driver's write path — the reply round trip and a refused command
 `PortRegistry::port_command` only **queues** the bytes and schedules one `Output` task; the write
@@ -67,9 +70,15 @@ belongs to the round (`execute_port_tasks` → `run_scheduled_tasks` → `Port::
 `Port::ready_output`, whose `Driver` default forwards to `output`). Whatever a driver pushes onto
 `ctx.input()` — a built-in driver's `port_command` reply, or a `driver_output` made from
 `start`/`control`/`timeout`/`output` — is harvested for **every** live port after the round and
-reported as **exactly one** `PortNotification::Data`, drained once per byte (no double report on a
-later round; a port in `{line, N}` mode reports through the separate `LineNotification` channel
-instead). A `ram_file_drv` port needs no descriptor, so the whole chain is testable with no
+reported as **one `PortNotification::Data` per completed read message**, drained once per byte (no
+double report on a later round; a port in `{line, N}` mode reports through the separate
+`LineNotification` channel instead).
+`DriverContext::deliver_read(header, body)` is the same path for a **split** read (the C's
+`driver_output2`/`driver_output_binary`/`driver_outputv`): one `ReadMessage { header, body }`, the
+header kept apart from the body because a `[binary]` port renders `[H1,…,Hn | <<Body>>]` while a
+`[list]` port flattens both into ints. `body: None` is the C's `buf == NULL` (no binary tail at
+all), `Some(vec![])` a present empty body (`<<>>` tail). A `Data` payload is therefore legitimately
+empty: an explicit empty read IS the oracle's `{Port,{data,[]}}`. A `ram_file_drv` port needs no descriptor, so the whole chain is testable with no
 child process and no poller wait.
 A driver that **refuses** a write (`Err(BeamError::BadArg)` from `output`/`ready_output`, e.g. an
 `inet` port whose socket is not open) is surfaced as that error: it short-circuits
@@ -137,7 +146,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   `registry_reply_tests.rs` — a sibling module declared from `registry.rs` as
   `#[cfg(test)] #[path = "registry_reply_tests.rs"] mod reply_tests;` so that 1960-line file does not
   grow: one `ram_file_drv` port, `port_command [1,0,0,0,3,97,98,99]` ⇒ **one**
-  `execute_port_tasks` round reports exactly one `Data { bytes: [3,0,0,0,0] }` with `output_len()`
+  `execute_port_tasks` round reports exactly one `Data { read: ReadMessage::body_only([3,0,0,0,0]) }` with `output_len()`
   and `input_len()` back to `0` and no task left pending, a second round reports nothing; plus a
   `RefusingWriteDriver` whose `output`/`ready_output` answer `Err(BadArg)` — `Port::output`,
   `Port::ready_output` and `execute_port_tasks` each surface `BadArg` with the bytes still queued.
@@ -151,12 +160,13 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` regular-file fallback), `Token`, `Interest`, `Ready`, `Event`, `Waker`
-- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`
+- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`) and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`
 - `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`)
+- `driver_output2.rs` (`../tests/`) → the split-read pin over a real `PortRegistry`/`Poller`: one `Data` per call, header/body exact, `Some(vec![])` vs `None`, `input_len` = `hlen+len`, no re-report on a second round
 - `registry_reply_tests.rs` → the write-path pin: the reply round trip (`port_command` ⇒ one `Data`) and the refused-command propagation (`Err(BadArg)` out of `execute_port_tasks`), a `#[path]` test module of `registry.rs`
-- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `PortNotification` (`Data` + `Closed`), `LineNotification` (the separate `{line,N}` channel), `PortTaskOutcome`
+- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`
-- `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async`/`take_exit_status`/`take_eof`), `DriverContext`, `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
+- `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async`/`take_exit_status`/`take_eof`), `DriverContext` (incl. the read sink: `with_reads` + `deliver_read(header, body)`), `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors
 - `signal.rs` → `Signal`/`Disposition`/`SignalFacility`; `cpu_time.rs` → `CpuTimes`/`RuntimeClock`; `ddll.rs` → `DynLib`/`DllError`
 - `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site), `access` (`Result<bool>`, refusal ⇒ `false`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>`)

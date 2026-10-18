@@ -121,9 +121,9 @@ fn pump_notifications(
             .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
             .expect("port tasks run");
         for notification in outcome.notifications {
-            if let PortNotification::Data { port, bytes } = notification {
+            if let PortNotification::Data { port, read } = notification {
                 if port == id {
-                    received.extend(bytes);
+                    received.extend(read.flattened());
                 }
             }
         }
@@ -1444,7 +1444,7 @@ fn message_round(
         .notifications
         .into_iter()
         .filter_map(|notification| match notification {
-            PortNotification::Data { port, bytes } if port == id => Some((None, bytes)),
+            PortNotification::Data { port, read } if port == id => Some((None, read.flattened())),
             _ => None,
         })
         .collect();
