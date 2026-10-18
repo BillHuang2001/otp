@@ -73,6 +73,34 @@
 //!   refusals a hand-written `nif_init` can provoke — version too old (`2.5`), version too new
 //!   (with its `min_erts`) and a foreign `vm_variant`.
 //!
+//! # The second block: real data through the ABI (ids `nif_rt/…`)
+//!
+//! The `nif_so/…` cases above pin *that* a library binds and calls; the `nif_rt/…` cases pin
+//! what the `enif_*` accessors do with **real, non-trivial data**: a >32-key map (a hash-array
+//! mapped trie, not a flatmap) built by `enif_make_map_from_arrays` and by 40 incremental
+//! `enif_make_map_put`s, looked up by `enif_get_map_value` and summed by the
+//! `enif_map_iterator_*` walk — both on a map the C built and on one the **Erlang** side built;
+//! a deep mixed **iolist** flattened by `enif_inspect_iolist_as_binary` and checked byte for
+//! byte against `iolist_to_binary/1`; a 40-element **cons list** walked with
+//! `enif_get_list_cell`; the **ETF** round trip (`enif_term_to_binary` /
+//! `enif_binary_to_term`) of a compound term, cross-checked against the module's own
+//! `term_to_binary/1` image; the ETF image of the calling process's own **pid**
+//! (`enif_self` + `enif_make_pid`) against `term_to_binary(self())`; and a 40-element list
+//! built by `enif_make_list_from_array`.
+//!
+//! A `nif_rt/…` case is a module-run case over the second embedded module (`nif_rt`, library
+//! `nif_rt`): `classify(N)` loads the library next to its `.beam` and each `N` reduces one
+//! observation to a single integer (`1` when the C's observation matches what the module knows
+//! independently, `0` when it does not, `81`/`82` for a raise, so a surprise stays a diffable
+//! integer). The `classify(50)` case instead loads a **`load`-callback-raising** library: the C
+//! `nif_load_nif` never consults the callback's `env` exception slot (`erl_nif.c:5001-5008`),
+//! so a `enif_raise_exception` in `load` is swallowed and the load still succeeds (`1`).
+//!
+//! Every `nif_rt/…` golden is the integer the **oracle** prints, verified per case with
+//! `differential run <id>`. The stateful families the A.3 C ABI also offers — `enif_send` to
+//! another process, `enif_monitor_process`, `enif_select` on a real fd, and the destructor of a
+//! term-exposed resource — were measured and are **not** cases: see the honest handoff below.
+//!
 //! # Reachability rules this group depends on
 //!
 //! * `erlang:load_nif/2` must be called from the NIF module itself — the oracle refuses it
@@ -125,6 +153,36 @@
 //!   clause instead of an `erlang:nif_error/1` stub is *accepted* by both.) Owning crates:
 //!   `beam_abi` (the loader, which would need the module's code) and `beam_rt` (which has it
 //!   and could hand it over).
+//!
+//! The stateful families of the A.3 C ABI, measured the same way with a scratch library (each
+//! is a *plain value* difference, so a case would be a `mismatch` — every one is reported
+//! rather than pinned):
+//!
+//! * **`enif_send` to another Erlang process.** The oracle answers `1` and the message really
+//!   arrives; the Rust runtime answers `0` and nothing is delivered, because `NifHost::send`
+//!   is left at its `None` default by `beam_rt`'s `NifHostImpl` (owner: `beam_rt`).
+//! * **`enif_monitor_process` of a *live* pid.** Oracle `0` (monitor established), Rust `1`
+//!   (the documented "cannot establish" substitute), because the `monitor_process` /
+//!   `demonitor_process` hooks are unimplemented (owner: `beam_rt`).
+//! * **`enif_select` on a real pipe fd.** Oracle `0` (poll interest registered), Rust `-1`
+//!   (the `select` hook is unimplemented; owner: `beam_rt`).
+//! * **the destructor of a resource exposed as a term.** After `enif_make_resource` +
+//!   `enif_release_resource` and an `erlang:garbage_collect/0`, the oracle runs the type's
+//!   destructor exactly once; the Rust runtime never does (it has no "the term died" signal)
+//!   — a bounded, deliberate leak (owner: `beam_abi`, `nif/enif/resources.rs`).
+//! * **`enif_make_map_from_arrays` with duplicate keys.** Oracle refuses (the C's
+//!   `THE_NON_VALUE`, `erl_map.c:673-710`); the Rust runtime deduplicates last-value-wins and
+//!   returns a map (owner: `beam_abi`, `nif/enif/map.rs`).
+//! * **`enif_binary_to_term` over an image with trailing bytes.** Oracle decodes the first
+//!   term and reports the *consumed* byte count; the Rust runtime answers `0` (its host hook
+//!   decodes the whole slice strictly, so trailing bytes fail the decode). Owner: `beam_abi`
+//!   (`nif/enif/mem.rs` hands the whole slice to `NifHost::binary_to_term`) / `beam_rt`
+//!   (`NifHostImpl`'s codec call).
+//! * **`enif_term_to_binary` of a *local* fun.** Oracle encodes the module's `NEW_FUN_EXT`
+//!   image; the Rust runtime answers the C failure code `0` (its ETF encoder declines a
+//!   compiled local fun), which surfaces as `badarg` from `enif_term_to_binary`. The
+//!   *external* fun image (`EXPORT_EXT`) does agree and is pinned, inside the compound-term
+//!   encode case. Owner: `beam_rt` (`NifHostImpl::term_to_binary`) / `beam_codec`.
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 use crate::module_build::NifFixture;
 
@@ -458,6 +516,481 @@ const REAL_NIF: NifFixture = NifFixture::CompiledLibrary {
     c_source: REAL_NIF_C,
 };
 
+/// The embedded module of the **real-data** block (ids `nif_rt/…`): one stub per `ErlNifFunc`
+/// entry of [`NIF_RT_C`] plus the `classify/1` driver.
+///
+/// Each `classify(N)` branch reduces one C observation to a **single integer**: `1` when the
+/// observation matches a value the module computes independently in Erlang, `0` when it does
+/// not, `81`/`82` when the call raised. Every golden is therefore a VM-stable integer line.
+/// `classify(50)` is the one case that loads a *different* library — the `load`-callback-raising
+/// fixture [`NIF_RT_RAISE_C`] — so it is matched before the ordinary branch.
+const NIF_RT_MODULE_SOURCE: &str = r#"-module(nif_rt).
+-export([classify/1, probe/1, probe_term/2, encode/1, mk_hamt/0, mk_hamt_put/0, mk_list/0,
+         self_etf/0]).
+
+%% One stub per entry in the library's ErlNifFunc table: erlang:load_nif/2 refuses a library
+%% whose functions do not exist (and are not exported) in the loading module.
+probe(_) -> erlang:nif_error(not_loaded).
+probe_term(_, _) -> erlang:nif_error(not_loaded).
+encode(_) -> erlang:nif_error(not_loaded).
+mk_hamt() -> erlang:nif_error(not_loaded).
+mk_hamt_put() -> erlang:nif_error(not_loaded).
+mk_list() -> erlang:nif_error(not_loaded).
+self_etf() -> erlang:nif_error(not_loaded).
+
+%% The `load`-callback case loads its own library (the only fixture in that case's dir), so it
+%% must be matched before the ordinary branch.
+classify(50) ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    raise_code(erlang:load_nif(Dir ++ "/nif_rt_raise", 0));
+classify(N) ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    case erlang:load_nif(Dir ++ "/nif_rt", 0) of
+        ok -> run(N);
+        {error, {Reason, _Text}} -> reason_code(Reason)
+    end.
+
+%% Every branch answers an integer, so the golden is a VM-stable integer line. The explicit
+%% catch clauses keep a surprising failure a diffable integer rather than an escaping raise.
+run(N) ->
+    try dispatch(N) of
+        I when is_integer(I) -> I;
+        _ -> 90
+    catch
+        error:badarg -> 81;
+        error:_ -> 82
+    end.
+
+%% A >32-key map is a hash-array-mapped trie, so `hamt_shape/0` is what a size-preserving,
+%% value-preserving build and walk must report: 40 entries whose values sum to 7800.
+dispatch(1) -> bool(nif_rt:probe(1) =:= hamt_shape());
+dispatch(2) -> bool(nif_rt:probe(2) =:= hamt_shape());
+%% Five keys spread over the trie plus one absent key that must be refused (mask 63).
+dispatch(3) -> bool(nif_rt:probe(3) =:= all_keys());
+dispatch(4) -> bool(nif_rt:probe_term(4, hamt_map()) =:= all_keys());
+dispatch(5) -> bool(nif_rt:probe_term(5, hamt_map()) =:= hamt_shape());
+%% A deep mixed iolist must flatten to exactly the bytes iolist_to_binary/1 produces.
+dispatch(6) -> Iolist = deep_iolist(),
+              Bin = iolist_to_binary(Iolist),
+              bool(nif_rt:probe_term(6, Iolist) =:= byte_size(Bin) * 1000000 + fnv(Bin));
+%% A 40-element cons list is several heap blocks: the cell walk must see all of it.
+dispatch(7) -> List = lists:seq(1, 40),
+              bool(nif_rt:probe_term(7, List) =:= length(List) * 1000000 + lists:sum(List));
+%% ETF: encode, decode-and-re-encode, and encode-then-decode, each against Erlang's own view.
+dispatch(8) -> T = compound(),
+              bool(nif_rt:encode(T) =:= term_to_binary(T));
+dispatch(9) -> T = compound(),
+              bool(nif_rt:probe_term(8, term_to_binary(T)) =:= 1);
+dispatch(10) -> T = compound(),
+              bool(nif_rt:probe_term(9, T) =:= 1);
+%% The calling process's own pid, encoded by the library, against the module's own encoding.
+dispatch(11) -> bool(nif_rt:self_etf() =:= term_to_binary(self()));
+%% The C-built HAMTs must be the *same* map as maps:from_list/1 builds, image included.
+dispatch(12) -> M = nif_rt:mk_hamt(),
+              bool(maps:size(M) =:= 40 andalso M =:= hamt_map()
+                   andalso term_to_binary(M) =:= term_to_binary(hamt_map()));
+dispatch(13) -> M = nif_rt:mk_hamt_put(),
+              bool(maps:size(M) =:= 40 andalso M =:= hamt_map()
+                   andalso term_to_binary(M) =:= term_to_binary(hamt_map()));
+dispatch(14) -> bool(nif_rt:mk_list() =:= lists:seq(1, 40));
+%% Atom keys live in the runtime's atom table, which the C-side map accessors do not receive.
+dispatch(15) -> bool(nif_rt:probe_term(15, #{alpha => 1, beta => 2}) =:= atom_keys()).
+
+%% A raise inside the `load` callback is *not* a refusal: the C's nif_load_nif never consults
+%% the callback env's exception slot (erl_nif.c:5001-5008), so the load still returns `ok`.
+raise_code(ok) -> 1;
+raise_code({error, {load, _Text}}) -> 2;
+raise_code({error, {bad_lib, _Text}}) -> 3;
+raise_code(_) -> 4.
+
+bool(true) -> 1;
+bool(false) -> 0.
+
+hamt_shape() -> 40 * 10000 + 7800.
+all_keys() -> 63.
+atom_keys() -> 7.
+
+hamt_map() -> maps:from_list([{I, I * 10} || I <- lists:seq(0, 39)]).
+
+deep_iolist() ->
+    [<<"deep">>, [1, 2, [3, [4, [5]]]], <<1:8>>, [], [[[<<255, 0>>]]]].
+
+%% A compound term the ETF encoder must reproduce exactly: a non-Latin-1 atom name, a bignum, a
+%% float, a binary key, a nested map and an external fun (`EXPORT_EXT`).
+compound() ->
+    #{alpha => 1,
+      <<"beta">> => [1, 2, 3],
+      'γ' => {2.5, -17, 1 bsl 70, fun lists:reverse/1},
+      <<1, 2, 3>> => #{nested => #{deep => []}},
+      "list" => <<"bin">>}.
+
+%% FNV-1a over the bytes, folded to 31 bits — the same fold the library computes, so the two
+%% sides' checksums are comparable without the module knowing the C's byte order.
+fnv(Bin) -> fnv(Bin, 2166136261).
+fnv(<<>>, H) -> H band 16#7fffffff;
+fnv(<<B, Rest/binary>>, H) -> fnv(Rest, ((H bxor B) * 16777619) band 16#ffffffff).
+
+%% Only the reason *tag* leaves this function: the `Text` of a failure embeds the absolute
+%% temp-dir path, which would make the golden drift on every run.
+reason_code(ok) -> 0;
+reason_code(load_failed) -> 1;
+reason_code(bad_lib) -> 2;
+reason_code(reload) -> 3;
+reason_code(_) -> 9.
+"#;
+
+/// The C library of the real-data block: the `enif_*` accessors driven with **real data** — a
+/// >32-key HAMT map, a deep iolist, a long cons list and the ETF round trip.
+///
+/// Every `enif_*` here is a symbol the Rust runtime really exports; nothing C-variadic is
+/// referenced. Each `probe*` branch returns one integer, and the module decides whether it
+/// matches what Erlang independently knows.
+const NIF_RT_C: &str = r#"/* A real NIF driving the enif_* term surface with real data (contract A.3). */
+#include <erl_nif.h>
+#include <string.h>
+#include <stdint.h>
+
+/* More than 32 keys, so every map built here is a hash-array-mapped trie rather than a
+   flatmap: the build, the lookup and the iterator walks are all the hash ones. */
+#define HAMT_N 40
+
+/* The load callback: succeeds and stores no private state. */
+static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
+    (void) env;
+    (void) load_info;
+    *priv = NULL;
+    return 0;
+}
+
+/* FNV-1a over the bytes, folded to 31 bits, so the module can recompute it in Erlang. */
+static unsigned int fnv(const unsigned char* p, size_t n) {
+    uint32_t h = 2166136261u;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return (unsigned int) (h & 0x7fffffffu);
+}
+
+/* key i -> value i*10 for i in 0..39, built in one call. The C returns 0 when the arrays are
+   refused (the non-value); no probe here hands it duplicate keys. */
+static ERL_NIF_TERM hamt_from_arrays(ErlNifEnv* env) {
+    ERL_NIF_TERM keys[HAMT_N], vals[HAMT_N], map = 0;
+    int i;
+    for (i = 0; i < HAMT_N; i++) {
+        keys[i] = enif_make_int(env, i);
+        vals[i] = enif_make_int(env, i * 10);
+    }
+    if (!enif_make_map_from_arrays(env, keys, vals, HAMT_N, &map))
+        return 0;
+    return map;
+}
+
+/* The same map built by 40 incremental puts, so the flatmap -> HAMT transition is walked. */
+static ERL_NIF_TERM hamt_by_put(ErlNifEnv* env) {
+    ERL_NIF_TERM map = enif_make_new_map(env), next;
+    int i;
+    for (i = 0; i < HAMT_N; i++) {
+        if (!enif_make_map_put(env, map, enif_make_int(env, i), enif_make_int(env, i * 10), &next))
+            return 0;
+        map = next;
+    }
+    return map;
+}
+
+/* size * 10000 + (the iterator's value sum mod 10000) — 400000 + 7800 for the map above. */
+static int map_shape(ErlNifEnv* env, ERL_NIF_TERM map, int* out) {
+    ErlNifMapIterator iter;
+    ERL_NIF_TERM k, v;
+    size_t size = 0;
+    long sum = 0;
+    if (!enif_get_map_size(env, map, &size))
+        return 0;
+    if (!enif_map_iterator_create(env, map, &iter, ERL_NIF_MAP_ITERATOR_FIRST))
+        return 0;
+    while (enif_map_iterator_get_pair(env, &iter, &k, &v)) {
+        int iv;
+        if (!enif_get_int(env, v, &iv)) {
+            enif_map_iterator_destroy(env, &iter);
+            return 0;
+        }
+        sum += iv;
+        enif_map_iterator_next(env, &iter);
+    }
+    enif_map_iterator_destroy(env, &iter);
+    *out = (int) (size * 10000 + (sum % 10000));
+    return 1;
+}
+
+/* A bit per key of 0/7/17/32/39 whose value is the expected one, plus bit 5 when the absent key
+   (40) is refused: 63 when every lookup behaves. */
+static int all_keys_mask(ErlNifEnv* env, ERL_NIF_TERM map) {
+    static const int keys[] = {0, 7, 17, 32, 39};
+    ERL_NIF_TERM v;
+    int mask = 0, i, iv;
+    for (i = 0; i < 5; i++) {
+        if (enif_get_map_value(env, map, enif_make_int(env, keys[i]), &v) &&
+            enif_get_int(env, v, &iv) && iv == keys[i] * 10)
+            mask |= 1 << i;
+    }
+    if (!enif_get_map_value(env, map, enif_make_int(env, 40), &v))
+        mask |= 1 << 5;
+    return mask;
+}
+
+/* The atom-key variant: bits for alpha=1, beta=2 and the refused gamma. */
+static int atom_keys_mask(ErlNifEnv* env, ERL_NIF_TERM map) {
+    ERL_NIF_TERM v;
+    int mask = 0, iv;
+    if (enif_get_map_value(env, map, enif_make_atom(env, "alpha"), &v) &&
+        enif_get_int(env, v, &iv) && iv == 1)
+        mask |= 1;
+    if (enif_get_map_value(env, map, enif_make_atom(env, "beta"), &v) &&
+        enif_get_int(env, v, &iv) && iv == 2)
+        mask |= 2;
+    if (!enif_get_map_value(env, map, enif_make_atom(env, "gamma"), &v))
+        mask |= 4;
+    return mask;
+}
+
+static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    int sel;
+    if (argc != 1 || !enif_get_int(env, argv[0], &sel))
+        return enif_make_badarg(env);
+    switch (sel) {
+    case 1: {
+        ERL_NIF_TERM map = hamt_from_arrays(env);
+        int shape;
+        if (map == 0 || !map_shape(env, map, &shape))
+            return enif_make_int(env, -1);
+        return enif_make_int(env, shape);
+    }
+    case 2: {
+        ERL_NIF_TERM map = hamt_by_put(env);
+        int shape;
+        if (map == 0 || !map_shape(env, map, &shape))
+            return enif_make_int(env, -1);
+        return enif_make_int(env, shape);
+    }
+    case 3: {
+        ERL_NIF_TERM map = hamt_from_arrays(env);
+        if (map == 0)
+            return enif_make_int(env, -1);
+        return enif_make_int(env, all_keys_mask(env, map));
+    }
+    default:
+        break;
+    }
+    return enif_make_int(env, -1);
+}
+
+static ERL_NIF_TERM probe_term(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    int sel;
+    ERL_NIF_TERM term;
+    if (argc != 2 || !enif_get_int(env, argv[0], &sel))
+        return enif_make_badarg(env);
+    term = argv[1];
+    switch (sel) {
+    case 4:
+        if (!enif_is_map(env, term))
+            return enif_make_int(env, -2);
+        return enif_make_int(env, all_keys_mask(env, term));
+    case 5: {
+        int shape;
+        if (!map_shape(env, term, &shape))
+            return enif_make_int(env, -2);
+        return enif_make_int(env, shape);
+    }
+    case 6: {
+        ErlNifBinary bin;
+        if (!enif_inspect_iolist_as_binary(env, term, &bin))
+            return enif_make_int(env, -2);
+        return enif_make_int(env, (int) (bin.size * 1000000 + fnv(bin.data, bin.size)));
+    }
+    case 7: {
+        ERL_NIF_TERM head, tail = term;
+        long count = 0, sum = 0;
+        while (enif_get_list_cell(env, tail, &head, &tail)) {
+            int v;
+            if (!enif_get_int(env, head, &v))
+                return enif_make_int(env, -2);
+            count++;
+            sum += v;
+        }
+        if (!enif_is_empty_list(env, tail))
+            return enif_make_int(env, -3);
+        return enif_make_int(env, (int) (count * 1000000 + sum));
+    }
+    case 8: {
+        /* decode the module's own image, then re-encode it: a byte-identical image means the
+           decoder resolved every tag the encoder writes (and vice versa). */
+        ErlNifBinary in, out;
+        ERL_NIF_TERM decoded;
+        if (!enif_inspect_binary(env, term, &in))
+            return enif_make_int(env, -2);
+        if (enif_binary_to_term(env, in.data, in.size, &decoded, 0) == 0)
+            return enif_make_int(env, -3);
+        if (!enif_term_to_binary(env, decoded, &out))
+            return enif_make_int(env, -4);
+        if (out.size != in.size || memcmp(out.data, in.data, in.size) != 0)
+            return enif_make_int(env, 2);
+        return enif_make_int(env, 1);
+    }
+    case 9: {
+        ErlNifBinary bin;
+        ERL_NIF_TERM decoded;
+        if (!enif_term_to_binary(env, term, &bin))
+            return enif_make_int(env, -2);
+        if (enif_binary_to_term(env, bin.data, bin.size, &decoded, 0) == 0)
+            return enif_make_int(env, -3);
+        return enif_make_int(env, enif_is_identical(term, decoded) ? 1 : 2);
+    }
+    case 15:
+        return enif_make_int(env, atom_keys_mask(env, term));
+    default:
+        break;
+    }
+    return enif_make_int(env, -1);
+}
+
+/* A term's canonical ETF image, handed back as a binary. */
+static ERL_NIF_TERM encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifBinary bin;
+    ERL_NIF_TERM out;
+    unsigned char* p;
+    if (argc != 1 || !enif_term_to_binary(env, argv[0], &bin))
+        return enif_make_badarg(env);
+    p = enif_make_new_binary(env, bin.size, &out);
+    if (p == NULL || bin.size == 0)
+        return out;
+    memcpy(p, bin.data, bin.size);
+    return out;
+}
+
+static ERL_NIF_TERM mk_hamt(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    return hamt_from_arrays(env);
+}
+
+static ERL_NIF_TERM mk_hamt_put(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    return hamt_by_put(env);
+}
+
+/* A 40-element list built from an array, so a multi-block list is constructed through the ABI. */
+static ERL_NIF_TERM mk_list(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM elems[HAMT_N];
+    int i;
+    (void) argc;
+    (void) argv;
+    for (i = 0; i < HAMT_N; i++)
+        elems[i] = enif_make_int(env, i + 1);
+    return enif_make_list_from_array(env, elems, HAMT_N);
+}
+
+/* The ETF image of the calling process's own pid (enif_self + enif_make_pid). */
+static ERL_NIF_TERM self_etf(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid self;
+    ErlNifBinary bin;
+    ERL_NIF_TERM out;
+    unsigned char* p;
+    (void) argc;
+    (void) argv;
+    if (!enif_self(env, &self))
+        return enif_make_int(env, -1);
+    if (!enif_term_to_binary(env, enif_make_pid(env, &self), &bin))
+        return enif_make_int(env, -2);
+    p = enif_make_new_binary(env, bin.size, &out);
+    if (p == NULL || bin.size == 0)
+        return out;
+    memcpy(p, bin.data, bin.size);
+    return out;
+}
+
+static ErlNifFunc nif_rt_funcs[] = {
+    {"probe", 1, probe, 0},
+    {"probe_term", 2, probe_term, 0},
+    {"encode", 1, encode, 0},
+    {"mk_hamt", 0, mk_hamt, 0},
+    {"mk_hamt_put", 0, mk_hamt_put, 0},
+    {"mk_list", 0, mk_list, 0},
+    {"self_etf", 0, self_etf, 0}
+};
+
+/* `ERL_NIF_INIT` seeds ErlNifEntry.name with the stringified module name (`nif_rt`), so this
+   library may only be loaded as `nif_rt`. */
+ERL_NIF_INIT(nif_rt, nif_rt_funcs, load, NULL, NULL, NULL)
+"#;
+
+/// A real NIF whose **`load` callback raises** an exception (`enif_raise_exception`) and
+/// returns no veto. The C's `nif_load_nif` calls the callback, then reads only the callback's
+/// *return value* — never the callback env's exception slot (`erl_nif.c:5001-5008`) — so the
+/// raise is swallowed and `erlang:load_nif/2` still answers `ok`.
+///
+/// The file is named `nif_rt_raise` while its entry is named `nif_rt`: `ERL_NIF_INIT`'s first
+/// argument only stringifies into `ErlNifEntry.name`, which the loader compares against the
+/// *calling* module, so the stem of the file and the entry name are independent.
+const NIF_RT_RAISE_C: &str = r#"/* A NIF whose load callback raises an exception (not a veto). */
+#include <erl_nif.h>
+
+/* The function table names the module's existing, exported stub; it is never called. */
+static ERL_NIF_TERM noop(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    return enif_make_badarg(env);
+}
+
+static int raise_load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
+    (void) priv;
+    (void) load_info;
+    enif_raise_exception(env, enif_make_atom(env, "boom"));
+    return 0;   /* no veto: the raise is the only thing the callback did */
+}
+
+static ErlNifFunc raise_funcs[] = {{"probe", 1, noop, 0}};
+
+ERL_NIF_INIT(nif_rt, raise_funcs, raise_load, NULL, NULL, NULL)
+"#;
+
+/// The real-data library every `nif_rt/…` case except the `load`-callback one loads.
+const NIF_RT: NifFixture = NifFixture::CompiledLibrary {
+    name: "nif_rt",
+    c_source: NIF_RT_C,
+};
+
+/// Build one real-data module-run case over [`NIF_RT_MODULE_SOURCE`].
+///
+/// `selector` is the single integer argument (`classify(N)`); `nif` is the fixture the harness
+/// materializes next to the compiled `.beam` (the shared library, or the raising one).
+fn rt_case(
+    id: &'static str,
+    description: &'static str,
+    selector: &'static [i64],
+    golden: &'static str,
+    nif: NifFixture,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[Contract::NifAbi, Contract::BeamAsm],
+        kind: CaseKind::Module(ModuleRun {
+            source: NIF_RT_MODULE_SOURCE,
+            module: "nif_rt",
+            function: "classify",
+            arity: 1,
+            args: selector,
+            nif: Some(nif),
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+
 /// Build one module-run case over [`NIF_MODULE_SOURCE`].
 ///
 /// `selector` is the single integer argument (`classify(N)`); `nif` is the fixture the
@@ -631,12 +1164,140 @@ pub(crate) fn group() -> Vec<Case> {
             // No fixture: no library is loaded, so this case runs without a C toolchain.
             None,
         ),
+        // === real data through the ABI (the `nif_rt/…` block) ==============================
+        // A >32-key map is a HAMT, so these pin the *hash* build/lookup/iterate paths, not the
+        // flatmap ones: 40 entries whose values sum to 7800 (`hamt_shape/0`).
+        rt_case(
+            "nif_rt/hamt_map_from_arrays_shape",
+            "enif_make_map_from_arrays builds a 40-pair HAMT whose size and iterated value sum are right",
+            &[1],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/hamt_map_put_shape",
+            "40 incremental enif_make_map_put calls build the same HAMT across the flatmap->HAMT transition",
+            &[2],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/hamt_map_from_arrays_lookups",
+            "enif_get_map_value finds five keys spread over the HAMT and refuses an absent one",
+            &[3],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/hamt_get_map_value_on_erlang_map",
+            "enif_get_map_value resolves keys of a >32-key map the Erlang side built",
+            &[4],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/hamt_map_iterator_on_erlang_map",
+            "the enif_map_iterator_* walk visits every entry of a >32-key Erlang map exactly once",
+            &[5],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/map_get_map_value_atom_keys",
+            "enif_get_map_value resolves atom keys (alpha/beta) and refuses a missing atom key",
+            &[15],
+            "1",
+            NIF_RT,
+        ),
+        // The byte-level containers: a deep iolist and a multi-block cons list.
+        rt_case(
+            "nif_rt/iolist_deep_flatten_bytes",
+            "enif_inspect_iolist_as_binary flattens a deep mixed iolist to exactly iolist_to_binary/1's bytes",
+            &[6],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/list_cell_walk_long_list",
+            "enif_get_list_cell walks a 40-element cons list to the terminating [] and sums every head",
+            &[7],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/make_list_from_array_identity",
+            "enif_make_list_from_array builds the list lists:seq(1,40) describes",
+            &[14],
+            "1",
+            NIF_RT,
+        ),
+        // The ETF round trip, cross-checked against the module's own term_to_binary/1.
+        rt_case(
+            "nif_rt/etf_encode_matches_term_to_binary",
+            "enif_term_to_binary's image of a compound term equals the module's term_to_binary/1 image",
+            &[8],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/etf_decode_reencode_equals_erlang_image",
+            "enif_binary_to_term then enif_term_to_binary reproduces the module's image byte for byte",
+            &[9],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/etf_term_roundtrip_identity",
+            "enif_term_to_binary then enif_binary_to_term yields a term identical to the original",
+            &[10],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/self_pid_etf_image",
+            "the ETF image of the pid from enif_self/enif_make_pid equals term_to_binary(self())",
+            &[11],
+            "1",
+            NIF_RT,
+        ),
+        // A C-built HAMT must be the very map maps:from_list/1 builds — image included.
+        rt_case(
+            "nif_rt/hamt_map_from_arrays_identity",
+            "the HAMT built by enif_make_map_from_arrays is maps:from_list/1's map, image included",
+            &[12],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/hamt_map_put_identity",
+            "the HAMT built by incremental puts is maps:from_list/1's map, image included",
+            &[13],
+            "1",
+            NIF_RT,
+        ),
+        // A raise inside the `load` callback is swallowed: the load still succeeds.
+        rt_case(
+            "nif_rt/load_callback_raise_is_not_a_refusal",
+            "an enif_raise_exception inside the load callback does not refuse the library (load returns ok)",
+            &[50],
+            "1",
+            NifFixture::CompiledLibrary {
+                name: "nif_rt_raise",
+                c_source: NIF_RT_RAISE_C,
+            },
+        ),
     ]
-}#[cfg(test)]
+}
+
+#[cfg(test)]
 mod tests {
     //! Invariants of the A.3 end-to-end group: every case is a module-run case claiming
-    //! [`Contract::NifAbi`], it runs the shared module through `classify/1`, and its golden is
-    //! the integer the oracle prints for that selector.
+    //! [`Contract::NifAbi`], it runs one of the two embedded modules through `classify/1`, and
+    //! its golden is the integer the oracle prints for that selector.
+    //!
+    //! The group carries **two** modules — `nif_so` (the load/call/refusal block, ids
+    //! `nif_so/…`) and `nif_rt` (the real-data block, ids `nif_rt/…`) — so selector uniqueness
+    //! is enforced **per module**: the two `classify/1` tables are unrelated.
 
     use super::{group, CaseKind, Contract, NifFixture};
     use std::collections::HashSet;
@@ -645,9 +1306,14 @@ mod tests {
     fn every_case_is_a_nif_module_run_classifying_one_selector() {
         let mut selectors = HashSet::new();
         for case in group() {
+            let expected_module = if case.id.starts_with("nif_rt/") {
+                "nif_rt"
+            } else {
+                "nif_so"
+            };
             assert!(
-                case.id.starts_with("nif_so/"),
-                "case {} is outside the nif_so group",
+                case.id.starts_with("nif_so/") || case.id.starts_with("nif_rt/"),
+                "case {} is outside a known A.3 group prefix",
                 case.id
             );
             assert!(
@@ -664,15 +1330,16 @@ mod tests {
             let CaseKind::Module(run) = case.kind else {
                 panic!("case {}: an A.3 case must be a module-run case", case.id);
             };
-            assert_eq!(run.module, "nif_so", "case {}", case.id);
+            assert_eq!(run.module, expected_module, "case {}", case.id);
             assert_eq!(run.function, "classify", "case {}", case.id);
             assert_eq!(run.arity, 1, "case {}", case.id);
             assert_eq!(run.args.len(), 1, "case {}", case.id);
             assert!(
-                selectors.insert(run.args[0]),
-                "case {}: selector {} is used twice",
+                selectors.insert((run.module, run.args[0])),
+                "case {}: selector {} is used twice in module {}",
                 case.id,
-                run.args[0]
+                run.args[0],
+                run.module
             );
             assert!(
                 case.golden
@@ -706,7 +1373,11 @@ mod tests {
                 panic!("case {}: expected a module-run case", case.id);
             };
             let needs_cc = matches!(run.nif, Some(NifFixture::CompiledLibrary { .. }));
-            let loads_a_compiled_library = !matches!(run.args[0], 5 | 6 | 15);            assert_eq!(
+            // In the `nif_rt` block every case loads a C-compiled library; in `nif_so` only
+            // selector 5 (missing library) and 6 (a text file) do not.
+            let loads_a_compiled_library =
+                run.module == "nif_rt" || !matches!(run.args[0], 5 | 6 | 15);
+            assert_eq!(
                 needs_cc, loads_a_compiled_library,
                 "case {}: exactly the cases that load a C-compiled library need the C toolchain",
                 case.id
@@ -720,4 +1391,5 @@ mod tests {
             "the group must keep cases that run without a C toolchain (the missing-library and \
              text-file shapes)"
         );
-    }}
+    }
+}
