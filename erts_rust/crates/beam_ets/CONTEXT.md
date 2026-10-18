@@ -211,7 +211,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `{keypos, N}` keys live inside the stored tuple; `compressed` is parsed/reported with no storage effect.
 
 ## Test Strategy
-- **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets --offline --no-fail-fast` — **646 passed / 0 failed / 1 ignored across all binaries (incl. 10 doctests, 6 `compile_fail`)**.
+- **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets --offline --no-fail-fast` — **648 passed / 0 failed / 1 ignored across all binaries (incl. 10 doctests, 6 `compile_fail`)**.
   The ignored test is the randomised `ordered_set` differential, which must pass under `--ignored`.
 - **Unit tests** per module (`#[cfg(test)]`; big siblings `store/tests.rs`, `kind/tests.rs`, `table/tests.rs`, `table/view/tests.rs`, `ordered_interior/tests.rs`, `hash_interior/{tests,capacity}.rs`, plus the `interior_parity.rs`/`interior_bench.rs` pair): kind/options, key validation, store copy/free/reuse/relinquish, table insert/take accounting, hash-interior ops + shrink policy, CHAMP ops (round-trip, churn, collision node, canonicalization, memory), B+-tree invariants incl. 10 000-key churn, the sorted-`Vec` interior, select compile/execute, info, owner-death, the heir forms/reclaim, the `duplicate_bag` `select_replace` floor, and the guard-scoped views.
 - **Cross-interior equivalence + defaults** (`interior_parity.rs`): a shared LCG script drives chained vs CHAMP (identical traces) and B+-tree vs sorted `Vec` (order-sensitive tail), pins the default selectors and the `cmp`→`cmp_arith` arithmetic-key behaviour.
