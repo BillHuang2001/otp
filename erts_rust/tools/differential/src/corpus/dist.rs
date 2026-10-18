@@ -64,6 +64,44 @@
 //! line by **hard-coding** it — not an oracle observation — so pinning them as corpus cases
 //! would be a tautology. They are exercised directly against the helper by the node-local
 //! integration test `tests/dist_probe_contract.rs` instead.
+//!
+//! ## Live **cross-runtime** traffic (measured): deliberately not a corpus case
+//!
+//! The strongest A.5 evidence would be traffic *between* the Rust runtime and the system
+//! `erl` — connect/handshake, `send`/`register`/`spawn` over the wire, monitor/demonitor,
+//! link/exit propagation. It was measured (both runtimes driven by hand, one node per side)
+//! and it is **not** expressible as a case here, for two independent reasons:
+//!
+//! 1. **Structural: the two sides never coexist.** [`CaseKind::Command`] runs its sides
+//!    *sequentially* — `harness::execute` completes the oracle child, then spawns the Rust
+//!    side — and the only compared observables are each child's own stdout + exit status. No
+//!    case can therefore carry a message from one runtime to the other: an oracle script
+//!    printing such a golden could only *hard-code* it (the tautology the `Command`-kind rule
+//!    forbids), and letting the oracle child spawn `beam_rt` would need the build artifact's
+//!    path baked into an argv — exactly what `runtime::resolve_rust`'s `$BEAM_RT`-else-
+//!    workspace-relative resolution exists to avoid (a tree holds only `target/release` or
+//!    only `target/debug`, so a baked path is a `skipped`/`mismatch` on the other tree).
+//! 2. **Capability: the live link works in one direction only.** Measured:
+//!    * **Rust → ERTS completes.** `beam_rt -noshell -sname <name> -eval
+//!      'net_adm:ping(<peer>@<host>)'` answers `pong`, and the system `erl` really sees the
+//!      link: with `net_kernel:verbose(3)` it logs
+//!      `{net_kernel,{nodeup,<name>@<host>,<net_address>,hidden,false}}` and, when the Rust
+//!      side halts, `{net_kernel,{nodedown,<name>@<host>,up,normal}}`. The Rust node is
+//!      **hidden**, so neither side's `nodes/0` lists it (the correct OTP answer for a hidden
+//!      node — `nodes(hidden)` is what would list it, not a divergence).
+//!    * **ERTS → Rust does not complete.** With `beam_rt -noshell -sname <name>` bound and
+//!      published to `epmd` (its `DistNode`), the system side's `net_adm:ping/1` of that name
+//!      answers `pang` after the ~7 s setup timeout
+//!      (`{net_kernel,{nodedown,<name>,pending,setup_timer_timeout}}`), while the peer's
+//!      30-byte `'n'` name message sits **unread** in the Rust side's socket receive queue
+//!      (`ss -tn` shows `Recv-Q 30` on the accepted link) — the accepting half never reads
+//!      it, so no `'N'` reply is ever sent. Owner: `beam_rt` (`crates/beam_rt/src/dist.rs`,
+//!      the accept/`'N'` path).
+//!
+//! So even a case that could coordinate with a Rust node would observe the link in one
+//! direction only. What the group *does* pin below is the **parallel** wire-level check: the
+//! oracle's own two nodes and the helper's own two endpoints each run the same `epmd` + v6
+//! handshake + term exchange, and their observables must agree.
 
 use super::{Case, CaseKind, CommandProgram, CommandRun, CommandSpec, Contract, Golden};
 
