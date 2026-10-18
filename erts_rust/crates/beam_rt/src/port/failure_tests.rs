@@ -136,7 +136,7 @@ fn only_the_failure_family_signals_the_owner() {
 #[test]
 fn a_published_failure_is_pending_work_and_an_empty_one_is_not() {
     let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
-    let mut ports = PortRegistry::new();
+    let mut ports = PortRegistry::new().expect("a port registry");
     assert!(ports.has_nothing_to_poll(), "a fresh registry is quiescent");
 
     ports.push_port_signals(Vec::new());
