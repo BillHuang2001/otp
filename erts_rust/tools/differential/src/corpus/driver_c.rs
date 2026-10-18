@@ -126,16 +126,55 @@
 //! answers `false`, and the port still closes cleanly). Selector `29` stays on the echo fixture
 //! and pins the port's own byte counters across one round trip (`{input, 5}`/`{output, 5}`).
 //!
-//! # The driver's own port-closing family (selectors `40`-`47`)
+//! # The driver's own port-closing family (selectors `40`-`52`)
 //!
 //! [`FAILURE_DRIVER_C`] closes the port from inside its `output` callback, one command byte per
 //! C entry point: `driver_failure(P, 0)` (the eof flag ⇒ reason `normal`),
-//! `driver_failure_atom(P, "boom")`, `driver_failure_posix(P, EACCES)`,
-//! `driver_failure(P, 7)` (the bare integer) and `driver_exit(P, 0)`. Each reason is pinned on a
-//! **trapping** owner (`{'EXIT', P, Reason}`), a **monitor** is pinned for the atom and for
-//! `driver_exit` (`{'DOWN', Ref, port, P, Reason}` — `driver_exit` unlinks the owner first, so
-//! selector `44` pins that the owner receives *nothing*), and selector `46` pins the dead port's
-//! `port_info/1,2` ⇒ `undefined` together with a second `port_close/1` ⇒ `badarg`.
+//! `driver_failure_atom(P, "boom")`, `driver_failure_posix(P, EACCES)` and the same entry point
+//! with `ENOENT` (so the errno→**name** mapping is pinned on more than one errno, never a
+//! hardcoded `eacces`), `driver_failure(P, 7)` (the bare integer) and `driver_exit(P, 0)`. Each
+//! reason is pinned on a **trapping** owner (`{'EXIT', P, Reason}`) *and* — for the atom, the
+//! posix pairs, the integer, the eof flag and `driver_exit` — on a **port monitor**
+//! (`{'DOWN', Ref, port, P, Reason}`). `driver_exit` unlinks the owner first, so selector `44`
+//! pins that the owner receives *nothing* while `47` pins the monitor that still is told; selector
+//! `50` pins the two signals arriving for one failure with the very same reason; and selector `46`
+//! pins the dead port's `port_info/1,2` ⇒ `undefined` together with a second `port_close/1` ⇒
+//! `badarg`.
+//!
+//! # The split reply and the off-heap payload (selectors `31`-`36`)
+//!
+//! [`SPLIT_DRIVER_C`] answers through `driver_output2`, whose header/body split is a **term**
+//! property, not a byte property: the C renders the header bytes as list *elements* and the body
+//! as the tail of the same list (`deliver_read_message`, `io.c:3404-3435`), so a present body, a
+//! `NULL` body and a non-`NULL` zero-length body are three structurally different
+//! `{Port, {data, D}}` terms. The three cases compare `D` itself (`[104,100|<<"body">>]`,
+//! `[104,100]`, `[104,100|<<>>]`) because `iolist_to_binary/1` would flatten all three to
+//! `<<"hdbody">>`.
+//!
+//! Selectors `34`-`36` widen the same channels to an **off-heap** payload: a 1000-byte (refc)
+//! binary reaches the `control` callback whole and comes back as a binary reply (selector `34`,
+//! which also pins `PORT_CONTROL_FLAG_BINARY`), a `control` callback answers a binary reply *and*
+//! a 128-byte `driver_output` at once (selector `35`), and the plain `output` callback echoes a
+//! 1000-byte payload back byte for byte (selector `36`).
+//!
+//! # The driver-monitor family's success path and `process_exit` (selectors `60`-`64`)
+//!
+//! `driver_abi`'s `70`-`72` can only pin the family's **refusal**, because their fixture entry
+//! declares no `process_exit` slot and the C refuses to arm a monitor without one
+//! (`do_driver_monitor_process`, `io.c:7020-7021`). [`MONITOR_DRIVER_C`] declares the slot, so the
+//! success path is reachable: `driver_monitor_process` → `0`, `driver_get_monitored_process`
+//! naming the watched process, `driver_demonitor_process` → `0`, one handle comparing equal to
+//! itself, two handles on one process comparing distinct, and a second `driver_demonitor_process`
+//! of a released handle answering `1` ("no such monitor").
+//!
+//! Selector `64` is the callback that family exists for. A helper process opens a **second** port,
+//! so the driver learns a pid other than its observer's through `driver_connected/1`; the
+//! observer port arms a monitor on it and keeps the handle; the helper dies; and the observer
+//! answers, on a later `output` command, whether `process_exit` fired **exactly once** and with
+//! **that** handle (`driver_compare_monitors` of the two). The two runtimes notice the death at
+//! different points (the C from its monitor-signal path, this runtime from its scheduler-pass
+//! sweep), so the answer is polled with a bounded retry — never an unbounded wait, and never a
+//! rendered pid/ref image.
 //!
 //! # Measured divergences (shapes that must **not** become cases)
 //!
@@ -167,7 +206,13 @@
 //!   and the frozen `ErlDrvApi` carry no such entry point.
 //! * **`driver_async`/`driver_async_cancel`** — no async pool in `beam_rt` (`port/driver.rs`), so
 //!   the entry point answers the C's failure code from every fixture; already documented by the
-//!   sibling `driver_abi` group and left out here too.
+//!   sibling `driver_abi` group and left out here too. Measured directly while this group was
+//!   widened (a fixture whose `output` callback calls
+//!   `driver_async(port, &key, invoke, data, NULL)` and answers the acceptance as one byte): the
+//!   oracle accepts the job and the probe answers `49` (`'1'`, the async id was allocated),
+//!   `beam_rt` answers `-1` and the probe answers `48` (`'0'`), i.e. a **capability gap** and never
+//!   a corpus case. Owner: `beam_abi` (the `driver_async` slot) / `beam_rt` (no async pool ⇒ no
+//!   `ready_async` either).
 //!
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!
@@ -294,6 +339,42 @@ classify(N) ->
         %% slot is `badarg` for every verb, before any callback runs.
         30 -> P = open(Dir, ""),
               yn(raises_badarg(fun() -> erlang:port_control(P, 1, <<>>) end));
+        %% `31`-`33` pin `driver_output2`'s **header/body split** through the driver's `output`
+        %% callback: the C renders the header bytes as list *elements* and the body as the tail of
+        %% the same term (`deliver_read_message`, `io.c:3404-3435`), so the body's three placements
+        %% are three distinct terms. `iolist_to_binary/1` flattens all three to `<<"hdbody">>`, so
+        %% each case compares the delivered term itself, never its bytes.
+        31 -> P = open(Dir, ""),
+              true = erlang:port_command(P, <<"s">>),
+              yn(echoed(P) =:= [104, 100 | <<"body">>]);
+        32 -> P = open(Dir, ""),
+              true = erlang:port_command(P, <<"n">>),
+              yn(echoed(P) =:= [104, 100]);
+        33 -> P = open(Dir, ""),
+              true = erlang:port_command(P, <<"e">>),
+              yn(echoed(P) =:= [104, 100 | <<>>]);
+        %% `34`/`35` widen the entry's `control` callback to a **refc-allocated** payload and to a
+        %% multi-word output emitted beside the reply: the caller's data is the C's `buf`/`len`
+        %% operand pair, so an off-heap (1000-byte) binary must arrive whole, and a reply that asks
+        %% for `PORT_CONTROL_FLAG_BINARY` is rendered as a binary on the way out.
+        34 -> P = open(Dir, ""),
+              Payload = binary:copy(<<"0123456789">>, 100),
+              Sum = lists:sum(binary_to_list(Payload)),
+              Reply = erlang:port_control(P, 11, Payload),
+              yn(byte_size(Payload) =:= 1000 andalso Reply =:= <<1000:32, Sum:32>>);
+        35 -> P = open(Dir, ""),
+              Reply = erlang:port_control(P, 12, <<>>),
+              Out = echoed(P),
+              yn(Reply =:= <<"ok">>
+                 andalso iolist_to_binary(Out) =:= binary:copy(<<"x">>, 128));
+        %% `36` drives the `output` callback with an **off-heap** payload: the C's `len` operand is
+        %% the caller's data in full, and the bytes the driver hands back through `driver_output`
+        %% are the same 1000 bytes (a refc binary on the way in and on the way out).
+        36 -> P = open(Dir, ""),
+              Payload = binary:copy(<<"abcdefghij">>, 100),
+              Echo = echo(P, Payload),
+              yn(byte_size(Payload) =:= 1000
+                 andalso iolist_to_binary(Echo) =:= Payload);
         %% `40`-`43` drive the C's `driver_failure*` family: the driver closes its own port from
         %% inside its `output` callback, and the reason it asked for reaches the **trapping**
         %% owner as a plain `{'EXIT', P, Reason}` message. `driver_failure(P, 0)` is the C's eof
@@ -319,7 +400,33 @@ classify(N) ->
               yn(erlang:port_info(P, name) =:= undefined
                  andalso erlang:port_info(P) =:= undefined
                  andalso raises_badarg(fun() -> erlang:port_close(P) end));
-        47 -> monitored_exit(Dir, <<"x">>, normal)
+        47 -> monitored_exit(Dir, <<"x">>, normal);
+        %% `48`-`50` close the remaining sides of the port-closing family: the `posix` and bare
+        %% integer reasons reaching a **port monitor** (the atom and `driver_exit` monitors are
+        %% `45`/`47`), and one case pinning that a single failed port tells *both* its trapping
+        %% owner and its monitor the very same reason.
+        48 -> monitored_exit(Dir, <<"p">>, eacces);
+        49 -> monitored_exit(Dir, <<"7">>, 7);
+        50 -> both_signals(Dir, <<"a">>, boom);
+        %% `51` completes the family's watcher matrix: the **eof** flag's `normal` reason reaching a
+        %% port monitor (its owner's side is `40`).
+        51 -> monitored_exit(Dir, <<"z">>, normal);
+        %% `52` pins the errno *name* mapping on a second errno, so a runtime that hardcoded
+        %% `EACCES` (or answered the errno number) is a visible difference rather than a coincidence.
+        52 -> trapping_exit(Dir, <<"q">>, enoent);
+        %% `60`-`63` drive the **success** path of the driver-monitor family: `driver_abi`'s
+        %% `70`-`72` can only pin the refusal because their fixture declares no `process_exit`
+        %% slot (the C's `!prt->drv_ptr->process_exit` gate, `io.c:7020`). A fixture that declares
+        %% one arms a monitor, names the watched process, compares two handles and releases the
+        %% watch — each answer echoed back as one status byte.
+        60 -> registry_answer(open(Dir, ""), <<"t">>, unsupported_driver_monitor_process);
+        61 -> registry_answer(open(Dir, ""), <<"q">>, unsupported_driver_compare_monitors);
+        62 -> registry_answer(open(Dir, ""), <<"d">>, unsupported_driver_compare_monitors);
+        63 -> registry_answer(open(Dir, ""), <<"w">>, unsupported_driver_demonitor_process);
+        %% `64` is the callback itself: the driver watches a **helper** process and reports the
+        %% firing on a later `output` command, so the observable is "`process_exit` ran exactly
+        %% once, for the monitor this driver armed" — never a pid/ref/monitor image.
+        64 -> process_exit_firing(Dir)
     end.
 
 %% Send one payload through the driver and answer the bytes it echoed back (`timeout` when the
@@ -365,6 +472,55 @@ monitored_exit(Dir, Command, Reason) ->
     Ref = erlang:monitor(port, P),
     true = erlang:port_command(P, Command),
     receive {'DOWN', Ref, port, P, Got} -> yn(Got =:= Reason) after 2000 -> 0 end.
+
+%% One failed port tells **both** of its watchers, each with the driver's own reason: the trapping
+%% owner's link signal and the monitor's `'DOWN'`. The two arrive in the emulator's own order, so
+%% each is awaited in its own bounded receive rather than a single selective one.
+both_signals(Dir, Command, Reason) ->
+    process_flag(trap_exit, true),
+    P = open(Dir, ""),
+    Ref = erlang:monitor(port, P),
+    true = erlang:port_command(P, Command),
+    Exit = receive {'EXIT', P, Got1} -> Got1 after 2000 -> timeout end,
+    Down = receive {'DOWN', Ref, port, P, Got2} -> Got2 after 2000 -> timeout end,
+    yn(Exit =:= Reason andalso Down =:= Reason).
+
+%% The `process_exit` firing, end to end: a helper process opens a **second** port, so the driver
+%% learns a pid other than the observer's through `driver_connected/1`; the observer port arms a
+%% monitor on it, the helper dies, and the observer port's driver reports whether `process_exit`
+%% fired for the very monitor it armed. Polled with a bounded retry because the two runtimes notice
+%% the death at different points (the C from its monitor-signal path, this runtime from its
+%% scheduler-pass sweep), never with an unbounded wait.
+process_exit_firing(Dir) ->
+    Self = self(),
+    Helper = spawn(fun() ->
+            Port = open(Dir, ""),
+            true = erlang:port_command(Port, <<"ha">>),
+            Self ! {helper_ready, Port},
+            receive stop -> ok end
+        end),
+    Observer = open(Dir, ""),
+    Ready = receive {helper_ready, _Port} -> true after 2000 -> false end,
+    Ref = erlang:monitor(process, Helper),
+    Armed = case Ready of
+                true ->
+                    true = erlang:port_command(Observer, <<"a">>),
+                    echoed(Observer);
+                false ->
+                    <<"0">>
+            end,
+    Helper ! stop,
+    receive {'DOWN', Ref, process, Helper, _} -> ok after 2000 -> ok end,
+    yn(Armed =:= <<"1">> andalso poll_fired(Observer, 300) =:= <<"1">>).
+
+poll_fired(_P, 0) ->
+    <<"0">>;
+poll_fired(P, Tries) ->
+    true = erlang:port_command(P, <<"c">>),
+    case echoed(P) of
+        <<"1">> -> <<"1">>;
+        _ -> receive after 10 -> ok end, poll_fired(P, Tries - 1)
+    end.
 yn(true) -> 1;
 yn(_) -> 0.
 
@@ -643,6 +799,8 @@ DRIVER_INIT(host_driver) {
 /// | `4` | returns `-1` | `badarg`, before any reply is rendered |
 /// | `5` | `set_port_control_flags(P, PORT_CONTROL_FLAG_BINARY)` + `"xyz"` | `<<"xyz">>` |
 /// | `10` | replies `"ok"` **and** `driver_output`s `"out"` | `[111,107]` and one `{data, <<"out">>}` |
+/// | `11` | sums a (possibly off-heap) `Data` payload: `{Length, Sum}` as two BE words, binary reply | `<<Len:32, Sum:32>>` |
+/// | `12` | a binary reply `"ok"` **and** a 128-byte `driver_output` | `<<"ok">>` and one `{data, …}` |
 ///
 /// Verb `3` of the prototype was a reply from the **request** buffer (`*rbuf = buf`): the oracle
 /// frees that pointer in `write_port_control_result` (`driver_free(resp_bufp)`, `io.c:4170`) and
@@ -709,6 +867,40 @@ static ErlDrvSSizeT control_control(ErlDrvData drv_data, unsigned int command,
         memcpy(*rbuf, "ok", 2);
         (void) driver_output(st->port, "out", 3);
         return 2;
+    case 11: {
+        /* The caller's `Data` may be an off-heap binary: answer its length and the sum of its
+         * bytes as two big-endian words, in the binary reply form, so a truncated or re-allocated
+         * payload is a wrong number rather than a hidden one. */
+        unsigned char *out = (unsigned char *) *rbuf;
+        unsigned long sum = 0;
+        ErlDrvSizeT i;
+        set_port_control_flags(st->port, PORT_CONTROL_FLAG_BINARY);
+        if (rlen < 8)
+            return -1;
+        for (i = 0; i < len; i++)
+            sum += (unsigned long) (unsigned char) buf[i];
+        out[0] = (unsigned char) ((len >> 24) & 0xff);
+        out[1] = (unsigned char) ((len >> 16) & 0xff);
+        out[2] = (unsigned char) ((len >> 8) & 0xff);
+        out[3] = (unsigned char) (len & 0xff);
+        out[4] = (unsigned char) ((sum >> 24) & 0xff);
+        out[5] = (unsigned char) ((sum >> 16) & 0xff);
+        out[6] = (unsigned char) ((sum >> 8) & 0xff);
+        out[7] = (unsigned char) (sum & 0xff);
+        return 8;
+    }
+    case 12: {
+        /* A binary-rendered reply *plus* a multi-word driver_output beside it: both halves of a
+         * `control` callback are observable at once. */
+        static char block[128];
+        set_port_control_flags(st->port, PORT_CONTROL_FLAG_BINARY);
+        if (rlen < 2)
+            return -1;
+        memcpy(*rbuf, "ok", 2);
+        memset(block, 'x', sizeof(block));
+        (void) driver_output(st->port, block, sizeof(block));
+        return 2;
+    }
     default:
         return -1;
     }
@@ -826,6 +1018,7 @@ DRIVER_INIT(host_driver) {
 /// | `'z'` | `driver_failure(port, 0)` (`io.c:7258`, eof flag) | `normal` |
 /// | `'a'` | `driver_failure_atom(port, "boom")` (`io.c:7263`) | `boom` |
 /// | `'p'` | `driver_failure_posix(port, EACCES)` (`io.c:7273`) | `eacces` |
+/// | `'q'` | `driver_failure_posix(port, ENOENT)` | `enoent` |
 /// | `'7'` | `driver_failure(port, 7)` | the bare integer `7` |
 /// | `'x'` | `driver_exit(port, 0)` (`io.c:7234-7255`) | `normal`, and **no** signal at all |
 ///
@@ -874,6 +1067,9 @@ static void failure_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     case 'p':
         (void) driver_failure_posix(st->port, EACCES);
         break;
+    case 'q':
+        (void) driver_failure_posix(st->port, ENOENT);
+        break;
     case '7':
         (void) driver_failure(st->port, 7);
         break;
@@ -898,6 +1094,251 @@ static ErlDrvEntry failure_entry = {
 
 DRIVER_INIT(host_driver) {
     return &failure_entry;
+}
+"#;
+
+/// The **split-reply** fixture (selectors `31`-`33`): `driver_output2`'s header/body split in the
+/// three placements the C distinguishes.
+///
+/// The C renders the header bytes as list *elements* and the body as the tail of the same term
+/// (`deliver_read_message`, `io.c:3404-3435`), and a **`NULL`** body leaves no tail at all while a
+/// non-`NULL` zero-length body leaves an empty binary one — so the three commands below are three
+/// structurally different `{Port, {data, D}}` terms:
+///
+/// | command | the callback calls | `D` on a `[binary]` port |
+/// |---|---|---|
+/// | `'s'` | `driver_output2(P, "hd", 2, "body", 4)` | `[104,100\|<<"body">>]` |
+/// | `'n'` | `driver_output2(P, "hd", 2, NULL, 0)` | `[104,100]` |
+/// | `'e'` | `driver_output2(P, "hd", 2, "", 0)` | `[104,100\|<<>>]` |
+const SPLIT_DRIVER_C: &str = r#"/* A real driver .so (contract A.4): `driver_output2`'s header/body split, three placements. */
+#include <erl_driver.h>
+
+typedef struct {
+    ErlDrvPort port;
+} split_state;
+
+static ErlDrvData split_start(ErlDrvPort port, char *command) {
+    split_state *st;
+    (void) command;
+    st = (split_state *) driver_alloc(sizeof(split_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    return (ErlDrvData) st;
+}
+
+static void split_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+/* Answer with a header/body split: the header is always "hd", the body is what the command
+ * selects (present, absent or empty). */
+static void split_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    split_state *st = (split_state *) drv_data;
+    char empty[1];
+    if (st == NULL || len < 1)
+        return;
+    empty[0] = 0;
+    switch (buf[0]) {
+    case 's':
+        (void) driver_output2(st->port, "hd", 2, "body", 4);
+        break;
+    case 'n':
+        /* A `NULL` body: the C prepends the header to the NIL tail, a *proper* list. */
+        (void) driver_output2(st->port, "hd", 2, NULL, 0);
+        break;
+    case 'e':
+        /* A non-`NULL` zero-length body: an empty binary tail, not NIL. */
+        (void) driver_output2(st->port, "hd", 2, empty, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+static ErlDrvEntry split_entry = {
+    .init = NULL,
+    .start = split_start,
+    .stop = split_stop,
+    .output = split_output,
+    .driver_name = "host_driver",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(host_driver) {
+    return &split_entry;
+}
+"#;
+
+/// The **driver-monitor** fixture (selectors `60`-`64`): the one thing `driver_abi`'s `70`-`72`
+/// cannot reach, because those selectors ride a fixture whose entry declares **no**
+/// `process_exit` slot — and the C's `do_driver_monitor_process` refuses to arm a monitor without
+/// one (`io.c:7020-7021`).
+///
+/// With the slot declared the whole family is reachable:
+///
+/// | command | the callback answers `'1'` when … |
+/// |---|---|
+/// | `'t'` | `driver_monitor_process` → 0, `driver_get_monitored_process` names the connected pid, `driver_demonitor_process` → 0 |
+/// | `'q'` | `driver_compare_monitors` reports one handle equal to itself |
+/// | `'d'` | two monitors armed on one pid compare as **distinct** |
+/// | `'w'` | a second `driver_demonitor_process` of the same handle answers `1` (no such monitor) |
+/// | `'ha'` | the port's connected pid is recorded (the *helper* port tells the driver a foreign pid) |
+/// | `'a'` | a monitor is armed on the recorded pid, and the handle kept for the callback |
+/// | `'c'` | `process_exit` has fired exactly once, and with **this** monitor handle |
+///
+/// `process_exit` is the callback under test: it compares the handle the emulator hands it with
+/// the one the driver armed, so the observable is a real identity, never a rendered ref.
+const MONITOR_DRIVER_C: &str = r#"/* A real driver .so (contract A.4): the driver-monitor family's success path and the
+ * `process_exit` callback it exists for. */
+#include <erl_driver.h>
+#include <string.h>
+
+typedef struct {
+    ErlDrvPort port;
+} monitor_state;
+
+/* The pid the helper port's connected process reports, and the monitor armed on it. */
+static ErlDrvTermData monitor_target;
+static int monitor_target_known;
+static ErlDrvMonitor monitor_armed;
+static int monitor_armed_known;
+/* What the `process_exit` callback observed. */
+static int monitor_firings;
+static int monitor_fired_with_armed;
+
+static ErlDrvData monitor_start(ErlDrvPort port, char *command) {
+    monitor_state *st;
+    (void) command;
+    st = (monitor_state *) driver_alloc(sizeof(monitor_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    return (ErlDrvData) st;
+}
+
+static void monitor_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+static void monitor_answer(monitor_state *st, int ok) {
+    char answer = ok ? '1' : '0';
+    (void) driver_output(st->port, &answer, 1);
+}
+
+/* The callback the whole family exists for: it runs once per monitored process death, with the
+ * very monitor handle `driver_monitor_process` handed out. */
+static void monitor_process_exit(ErlDrvData drv_data, ErlDrvMonitor *monitor) {
+    monitor_state *st = (monitor_state *) drv_data;
+    if (st == NULL)
+        return;
+    monitor_firings++;
+    if (monitor_armed_known && driver_compare_monitors(&monitor_armed, monitor) == 0)
+        monitor_fired_with_armed = 1;
+}
+
+static void monitor_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    monitor_state *st = (monitor_state *) drv_data;
+    ErlDrvMonitor a, b;
+    if (st == NULL || len < 1)
+        return;
+    switch (buf[0]) {
+    case 't':
+        memset(&a, 0, sizeof(a));
+        if (driver_monitor_process(st->port, driver_connected(st->port), &a) != 0) {
+            monitor_answer(st, 0);
+            break;
+        }
+        if (driver_get_monitored_process(st->port, &a) != driver_connected(st->port)) {
+            (void) driver_demonitor_process(st->port, &a);
+            monitor_answer(st, 0);
+            break;
+        }
+        monitor_answer(st, driver_demonitor_process(st->port, &a) == 0);
+        break;
+    case 'q':
+        memset(&a, 0, sizeof(a));
+        if (driver_monitor_process(st->port, driver_connected(st->port), &a) != 0) {
+            monitor_answer(st, 0);
+            break;
+        }
+        monitor_answer(st, driver_compare_monitors(&a, &a) == 0);
+        (void) driver_demonitor_process(st->port, &a);
+        break;
+    case 'd':
+        memset(&a, 0, sizeof(a));
+        memset(&b, 0, sizeof(b));
+        if (driver_monitor_process(st->port, driver_connected(st->port), &a) != 0) {
+            monitor_answer(st, 0);
+            break;
+        }
+        if (driver_monitor_process(st->port, driver_connected(st->port), &b) != 0) {
+            (void) driver_demonitor_process(st->port, &a);
+            monitor_answer(st, 0);
+            break;
+        }
+        monitor_answer(st, driver_compare_monitors(&a, &b) != 0);
+        (void) driver_demonitor_process(st->port, &a);
+        (void) driver_demonitor_process(st->port, &b);
+        break;
+    case 'w':
+        memset(&a, 0, sizeof(a));
+        if (driver_monitor_process(st->port, driver_connected(st->port), &a) != 0) {
+            monitor_answer(st, 0);
+            break;
+        }
+        if (driver_demonitor_process(st->port, &a) != 0) {
+            monitor_answer(st, 0);
+            break;
+        }
+        /* The handle is gone: the C's second answer is 1, "no such monitor". */
+        monitor_answer(st, driver_demonitor_process(st->port, &a) == 1);
+        break;
+    case 'h':
+        /* This port's connected process: a pid the *observer* port can be told about. */
+        monitor_target = driver_connected(st->port);
+        monitor_target_known = 1;
+        monitor_answer(st, 1);
+        break;
+    case 'a':
+        if (!monitor_target_known) {
+            monitor_answer(st, 0);
+            break;
+        }
+        memset(&monitor_armed, 0, sizeof(monitor_armed));
+        if (driver_monitor_process(st->port, monitor_target, &monitor_armed) != 0) {
+            monitor_answer(st, 0);
+            break;
+        }
+        monitor_armed_known = 1;
+        monitor_answer(st, 1);
+        break;
+    case 'c':
+        monitor_answer(st, monitor_firings == 1 && monitor_fired_with_armed);
+        break;
+    default:
+        break;
+    }
+}
+
+static ErlDrvEntry monitor_entry = {
+    .init = NULL,
+    .start = monitor_start,
+    .stop = monitor_stop,
+    .output = monitor_output,
+    .process_exit = monitor_process_exit,
+    .driver_name = "host_driver",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(host_driver) {
+    return &monitor_entry;
 }
 "#;
 
@@ -931,10 +1372,22 @@ const EXTRA_DRIVER: NifFixture = NifFixture::CompiledLibrary {
     c_source: EXTRA_DRIVER_C,
 };
 
-/// The port-closing fixture the `40`-`47` cases load.
+/// The port-closing fixture the `40`-`50` cases load.
 const FAILURE_DRIVER: NifFixture = NifFixture::CompiledLibrary {
     name: "host_driver",
     c_source: FAILURE_DRIVER_C,
+};
+
+/// The split-reply fixture the `31`-`33` cases load.
+const SPLIT_DRIVER: NifFixture = NifFixture::CompiledLibrary {
+    name: "host_driver",
+    c_source: SPLIT_DRIVER_C,
+};
+
+/// The driver-monitor fixture the `60`-`64` cases load.
+const MONITOR_DRIVER: NifFixture = NifFixture::CompiledLibrary {
+    name: "host_driver",
+    c_source: MONITOR_DRIVER_C,
 };
 
 /// Build one module-run case over [`DRIVER_MODULE_SOURCE`] with `fixture` as its `.so`.
@@ -1180,6 +1633,106 @@ pub(crate) fn group() -> Vec<Case> {
             &[46],
             FAILURE_DRIVER,
         ),
+        // --- the rest of the port-closing family (monitors + the two signals together) ---------
+        case(
+            "driver_c/driver_failure_posix_reaches_a_port_monitor",
+            "driver_failure_posix(P, EACCES) tells a port monitor too: {'DOWN', Ref, port, P, eacces}",
+            &[48],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_failure_code_reaches_a_port_monitor",
+            "driver_failure(P, 7) tells a port monitor the bare integer: {'DOWN', Ref, port, P, 7}",
+            &[49],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/a_failed_port_signals_its_owner_and_its_monitor_with_one_reason",
+            "one driver failure reaches both a trapping owner ({'EXIT', P, boom}) and a port monitor ({'DOWN', Ref, port, P, boom})",
+            &[50],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_failure_posix_names_each_errno_it_is_given",
+            "driver_failure_posix(P, ENOENT) closes the port with that errno's own name: {'EXIT', P, enoent}",
+            &[52],
+            FAILURE_DRIVER,
+        ),
+        case(
+            "driver_c/driver_failure_eof_reaches_a_port_monitor",
+            "driver_failure(P, 0) is the eof flag: a port monitor's {'DOWN', Ref, port, P, normal} carries it too",
+            &[51],
+            FAILURE_DRIVER,
+        ),
+        // --- `driver_output2`'s header/body split, in the three placements the C distinguishes -
+        case(
+            "driver_c/driver_output2_split_reply_is_an_improper_list",
+            "driver_output2/5 delivers the header as list elements and the body as the tail: [104,100|<<\"body\">>]",
+            &[31],
+            SPLIT_DRIVER,
+        ),
+        case(
+            "driver_c/driver_output2_with_a_null_body_is_a_proper_list",
+            "driver_output2/5 with a NULL body leaves no tail at all: the header alone, [104,100]",
+            &[32],
+            SPLIT_DRIVER,
+        ),
+        case(
+            "driver_c/driver_output2_with_an_empty_body_keeps_the_empty_binary_tail",
+            "driver_output2/5 with a non-NULL zero-length body delivers [104,100|<<>>], not the NIL tail",
+            &[33],
+            SPLIT_DRIVER,
+        ),
+        // --- the `control` callback over an off-heap payload --------------------------------
+        case(
+            "driver_c/driver_control_reads_a_refc_binary_payload",
+            "port_control/3 hands the driver's control callback a 1000-byte off-heap binary whole, and its binary reply carries the length and byte sum",
+            &[34],
+            CONTROL_DRIVER,
+        ),
+        case(
+            "driver_c/driver_control_binary_reply_with_a_multi_word_output_beside_it",
+            "a control callback answers a binary reply and emits 128 bytes at once; both reach the caller",
+            &[35],
+            CONTROL_DRIVER,
+        ),
+        case(
+            "driver_c/driver_output_echoes_a_refc_binary_payload",
+            "port_command/2 hands the driver's output callback a 1000-byte off-heap binary whole, and driver_output returns the same bytes",
+            &[36],
+            HOST_DRIVER,
+        ),
+        // --- the driver-monitor family's success path (an entry that declares `process_exit`) ---
+        case(
+            "driver_c/driver_monitor_process_arms_names_and_releases_a_monitor",
+            "with a process_exit slot declared, driver_monitor_process/3 arms a monitor, driver_get_monitored_process/2 names the watched process and driver_demonitor_process/2 releases it",
+            &[60],
+            MONITOR_DRIVER,
+        ),
+        case(
+            "driver_c/driver_compare_monitors_equates_one_armed_monitor_with_itself",
+            "driver_compare_monitors/2 reports one armed monitor handle equal to itself",
+            &[61],
+            MONITOR_DRIVER,
+        ),
+        case(
+            "driver_c/driver_compare_monitors_distinguishes_two_armed_monitors",
+            "driver_compare_monitors/2 reports two monitors armed on one process as distinct handles",
+            &[62],
+            MONITOR_DRIVER,
+        ),
+        case(
+            "driver_c/driver_demonitor_process_of_a_released_monitor_answers_no_such_monitor",
+            "a second driver_demonitor_process/2 of the same handle answers 1: the monitor is already gone",
+            &[63],
+            MONITOR_DRIVER,
+        ),
+        case(
+            "driver_c/process_exit_fires_once_with_the_monitor_the_driver_armed",
+            "a monitored process's death fires the driver's process_exit callback exactly once, with the very monitor handle driver_monitor_process handed out",
+            &[64],
+            MONITOR_DRIVER,
+        ),
     ]
 }
 #[cfg(test)]
@@ -1191,7 +1744,8 @@ mod tests {
 
     use super::{
         group, CaseKind, Contract, NifFixture, CONTROL_DRIVER_C, ENTRY_DRIVER_C, EXTRA_DRIVER_C,
-        FAILURE_DRIVER_C, HOST_DRIVER_C, LOCK_DRIVER_C, REGISTRY_DRIVER_C,
+        FAILURE_DRIVER_C, HOST_DRIVER_C, LOCK_DRIVER_C, MONITOR_DRIVER_C, REGISTRY_DRIVER_C,
+        SPLIT_DRIVER_C,
     };
     use std::collections::HashSet;
 
@@ -1199,7 +1753,8 @@ mod tests {
     /// carries one family's checks, so it must resolve to its family's source and never fall back
     /// to [`HOST_DRIVER_C`], whose `output` callback only echoes.
     const OWN_SOURCE_SELECTORS: &[i64] = &[
-        7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 40, 41, 42, 43, 44, 45, 46, 47,
+        7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33, 34, 35, 40, 41, 42, 43, 44, 45,
+        46, 47, 48, 49, 50, 51, 52, 60, 61, 62, 63, 64,
     ];
 
     /// The source each own-source selector must carry (its family's fixture).
@@ -1210,7 +1765,10 @@ mod tests {
             9 => Some(ENTRY_DRIVER_C),
             20..=25 => Some(CONTROL_DRIVER_C),
             26..=28 => Some(EXTRA_DRIVER_C),
-            40..=47 => Some(FAILURE_DRIVER_C),
+            31..=33 => Some(SPLIT_DRIVER_C),
+            34..=35 => Some(CONTROL_DRIVER_C),
+            40..=52 => Some(FAILURE_DRIVER_C),
+            60..=64 => Some(MONITOR_DRIVER_C),
             _ => None,
         }
     }
@@ -1249,7 +1807,9 @@ mod tests {
                     ENTRY_DRIVER_C,
                     CONTROL_DRIVER_C,
                     EXTRA_DRIVER_C,
-                    FAILURE_DRIVER_C
+                    FAILURE_DRIVER_C,
+                    SPLIT_DRIVER_C,
+                    MONITOR_DRIVER_C
                 ]
                 .contains(&c_source),
                 "case {}: the fixture is not one of the group's C sources",
@@ -1296,22 +1856,23 @@ mod tests {
         assert_eq!(selectors.len(), group().len(), "every selector is distinct");
         assert_eq!(
             selectors.len(),
-            34,
-            "the group covers thirty-four distinct selectors"
+            50,
+            "the group covers fifty distinct selectors"
         );
     }
 
-    /// The port-closing family pins one selector per C entry point, and the fixture really calls
-    /// it: a fixture that stopped calling `driver_failure_posix` (say) would leave its selector
-    /// pinning nothing at all, and a selector with no case is coverage that silently vanished.
+    /// The port-closing family pins one selector per C entry point *and* per watcher kind, and the
+    /// fixture really calls each entry point: a fixture that stopped calling `driver_failure_posix`
+    /// (say) would leave its selector pinning nothing at all, and a selector with no case is
+    /// coverage that silently vanished.
     #[test]
     fn the_port_closing_family_covers_each_entry_point() {
-        // The selectors `40`-`47` all ride the one failure fixture.
+        // The selectors `40`-`52` all ride the one failure fixture.
         for case in group() {
             let CaseKind::Module(run) = case.kind else {
                 panic!("case {} is not a module-run case", case.id);
             };
-            if !(40..=47).contains(&run.args[0]) {
+            if !(40..=52).contains(&run.args[0]) {
                 continue;
             }
             assert_eq!(
@@ -1327,16 +1888,17 @@ mod tests {
         let failure_cases = group()
             .into_iter()
             .filter(|case| match case.kind {
-                CaseKind::Module(run) => (40..=47).contains(&run.args[0]),
+                CaseKind::Module(run) => (40..=52).contains(&run.args[0]),
                 _ => false,
             })
             .count();
-        assert_eq!(failure_cases, 8, "the family is eight selectors");
+        assert_eq!(failure_cases, 13, "the family is thirteen selectors");
         // Every C entry point of the family is really called by the fixture.
         for entry_point in [
             "driver_failure(st->port, 0)",
             "driver_failure_atom(st->port, \"boom\")",
             "driver_failure_posix(st->port, EACCES)",
+            "driver_failure_posix(st->port, ENOENT)",
             "driver_failure(st->port, 7)",
             "driver_exit(st->port, 0)",
         ] {
