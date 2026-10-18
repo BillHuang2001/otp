@@ -97,8 +97,11 @@ mod tests {
         let err = BeamError::Io(std::io::Error::from_raw_os_error(libc::ENOTSOCK));
         assert_eq!(adoption_reply(&err), Some(ctl_xerror("enotsock")));
 
+        // `wire::errno_name` is this floor's table of the codes a socket can raise, and `EPERM`
+        // is not one of them; the C's `errno_<N>` fallback (`ERTS_UNKNOWN_ERRNO_FORMAT`) still
+        // **names** it, which is what matters here — the reply never collapses into `einval`.
         let err = BeamError::Io(std::io::Error::from_raw_os_error(libc::EPERM));
-        assert_eq!(adoption_reply(&err), Some(ctl_xerror("eperm")));
+        assert_eq!(adoption_reply(&err), Some(ctl_xerror("errno_1")));
     }
 
     #[test]

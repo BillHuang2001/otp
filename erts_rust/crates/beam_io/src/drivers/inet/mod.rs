@@ -1913,6 +1913,8 @@ pub fn make_tcp_inet() -> Result<Box<dyn Driver>> {
 }
 
 #[cfg(test)]
+mod fdopen_errno_tests;
+#[cfg(test)]
 mod frame_tests;
 #[cfg(test)]
 mod opcode_tests;
