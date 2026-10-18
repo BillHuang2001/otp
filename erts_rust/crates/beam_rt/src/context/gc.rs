@@ -158,7 +158,7 @@ use crate::RuntimeContext;
 ///
 /// It is re-exported here (rather than called by its own path at each site) so the three
 /// admission-point call sites and the runner's park arm cannot drift onto different valves.
-pub(crate) use super::gc_walk::{any_root_is_unscanned, valve_verdict};
+pub(crate) use super::gc_walk::{any_root_is_unscanned, reaches_an_unscanned_word, valve_verdict};
 mod reds_door;
 /// The **reduction/yield-boundary** collection point — the slice-end door a workload whose loop
 /// reaches no heap-admission point still gets collected at (see the module docs of

@@ -110,10 +110,61 @@
 //!   handles into the escaped store on the way out); such a machine is never parked, so this point
 //!   never sees it. Its reservoir dies with it, which is the pre-existing behaviour.
 //!
-//! The `refcount() > 1` guard in step 5 is the **belt for anything the four findings above do not
-//! cover**: a payload some other owner already cloned is retained whatever this process's roots say,
-//! so the pruner never has to model every secondary owner. A false accept is a leak; a false reject
-//! remains impossible.
+//! The `refcount() > 1` guard in the release predicate is the **belt for anything the four
+//! findings above do not cover**: a payload some other owner already cloned is retained whatever
+//! this process's roots say, so the pruner never has to model every secondary owner. A false accept
+//! is a leak; a false reject remains impossible.
+//!
+//! # The prune's own valve, and why it is strictly stronger than the collection's
+//!
+//! The reachability walk this point leans on ([`beam_gc::for_each_reachable_binary_payload`]) is
+//! the **collector's** own enumeration, so it enters a term only when that term addresses a
+//! **from-space** word of the process's heap (`beam_gc::reachable`, the copier's `Target::Foreign`
+//! rule). Everything else — the pointer-stable arena (`Runtime::alloc_words`, the fallback the
+//! heap-admission doors take when the nursery cannot grow: `+hmax`, the term-heap cap), the pooled
+//! BIF heaps, the `-eval` heap, a message fragment — is skipped **whole**, so a
+//! `[BinRef][ErlSubBits]` pair living there names a payload the walk reports as dead. The existing
+//! [collection valve](super::valve_verdict) does not catch that shape, and must not: its hazard
+//! test is "a foreign container that **forwards** a word a relocation would move", while
+//! `BinRef.val` points at an **off-heap payload** that no collection ever moves. So a foreign
+//! container of a foreign `BinRef` pair is inert to every collection and lethal to this prune.
+//!
+//! [`reclaim`] therefore runs a **second, prune-only** valve
+//! ([`super::reaches_an_unscanned_word`]) after the collection one: it declines when *any* root
+//! word, or *any* child slot of any object reachable from the roots through the collector's
+//! scanned graph, is pointer-bearing and lies in a region the collector does not scan. That is a
+//! **strict superset** of the collection valve's decline set — dropping the forwarding test can
+//! only add declines — and the asymmetry is deliberate:
+//!
+//! > a **false accept** frees a payload a live `BinRef` still names; a **false reject** keeps a
+//! > payload that is already garbage.
+//!
+//! A false accept is a leak; a false reject is a **dangling pointer**, read later through the
+//! frozen term layout. Every decline here opens the per-pid descent latch
+//! ([`Runtime::note_foreign_reachable`]) exactly as the collection valve's does, so a process that
+//! later drops the offending term also gets its collections back on the fast path.
+//!
+//! # What the unit suite can and cannot construct (read before "fixing" a case)
+//!
+//! A machine driven **outside** the runner's armed latch (`RuntimeContext::for_process`, which is
+//! what a unit-level fixture has) routes every allocation to the runtime's pointer-stable arena:
+//! measured, `process.heap_used_words()` is `0` after `ogcbuild:build/2` runs, and the returned
+//! tuple — with the `[BinRef][ErlSubBits]` pair inside it — is classified
+//! [`WordRegion::Foreign`](super::WordRegion). So the *fixture's own* returned term is a decline,
+//! not a retention (see `a_live_term_the_collector_cannot_scan_declines_the_prune`), and the
+//! original reading of this module's positive case — "the returned `{Sum, <<7:…>>}` is what the
+//! prune retains" — was simply false in this harness. The two positive halves are therefore pinned
+//! by roots the suite installs itself: an empty register file + stack for the **release**
+//! (`a_prune_with_clean_roots_releases_every_payload_nothing_reaches`) and an on-heap
+//! `[BinRef][ErlSubBits]` pair written on the **process's own** young heap for the **retention**
+//! (`a_payload_a_scanned_root_reaches_is_retained`). Two declines are pinned as well — the foreign
+//! *root* and the foreign *child of a scanned root*, the latter asserting that the collection valve
+//! passes exactly what the prune refuses.
+//!
+//! What is still owed is the **end-to-end** witness: a real `.beam` run through the real scheduler,
+//! where the machine's live terms really are on the process heap and the park arm publishes them,
+//! showing `erlang:memory(binary)` (and RSS) staying flat across a build-a-binary loop. That belongs
+//! in `crates/beam_rt/tests/` as an integration suite, not here.
 //!
 //! # Why the valve is NOT `Process::has_unpublished_roots`
 //!
@@ -279,7 +330,10 @@ impl OffHeapReclaimer {
 /// 5. the **unscanned-root valve** ([`super::valve_verdict`]) — a root that reaches a container in
 ///    a region the collector does not scan may hold a `BinRef` the walk cannot see, and a false
 ///    reject here is a dangling pointer;
-/// 6. the **reachability walk** itself ([`beam_gc::for_each_reachable_binary_payload`]) — a walk
+/// 6. the **prune-only valve** ([`super::reaches_an_unscanned_word`]) — the strictly stronger
+///    criterion this point needs: *any* pointer-bearing word a root or a scanned-graph child names
+///    in a region the collector does not scan (see the module docs' *the prune's own valve*);
+/// 7. the **reachability walk** itself ([`beam_gc::for_each_reachable_binary_payload`]) — a walk
 ///    that cannot complete declines rather than reporting "nothing is live".
 ///
 /// The release is [`Machine::retain_refc_binaries`](beam_engine::Machine::retain_refc_binaries) with
@@ -351,6 +405,20 @@ pub(crate) fn reclaim(
     let descend = runtime.foreign_reachable(pid);
     let verdict = super::valve_verdict(runtime.walk_scratch(), process, roots.iter(), descend);
     if verdict.declined {
+        runtime.note_foreign_reachable(pid);
+        return Ok(0);
+    }
+    // The **prune-only** valve: strictly stronger than the collection valve above, because the
+    // prune frees the **off-heap** payload a `BinRef.val` names — a target no relocation would
+    // move, so the collection valve (whose hazard test is "a foreign container that forwards a
+    // word a collection would relocate") legitimately ignores it. The reachability walk below runs
+    // the collector's own admission rule, so a `[BinRef][ErlSubBits]` pair in a region the
+    // collector does not scan is *invisible* to it: freeing on that silence is a dangling pointer.
+    // See [`super::reaches_an_unscanned_word`] for the criterion and why it declines strictly more
+    // often than the collection does.
+    let unscanned =
+        super::reaches_an_unscanned_word(runtime.walk_scratch(), process, roots.iter());
+    if unscanned {
         runtime.note_foreign_reachable(pid);
         return Ok(0);
     }
@@ -585,9 +653,17 @@ build(N, Size, Sum) ->
     build(N - 1, Size, Sum + byte_size(Bin)).
 ";
 
-    /// Runs the fixture on a machine this test owns and publishes the machine's root set into
-    /// `pid`, exactly as the park arm does (`RootSet::ALL_LIVE`, no FR words) — returning the
-    /// machine so the caller can prune it.
+    /// Runs the fixture on a machine this test owns, returning it with one payload per iteration
+    /// plus the returned one in its reservoir. **Nothing is published**: each case below installs
+    /// the root set it wants to reason about.
+    ///
+    /// The machine's own register file is deliberately *not* used as a positive root set here. A
+    /// machine driven outside the runner's armed latch routes every allocation to the runtime's
+    /// pointer-stable arena (measured: `process.heap_used_words()` is `0` after the run), so the
+    /// returned tuple — and the `[BinRef][ErlSubBits]` pair inside it — lands in a region the
+    /// process collector never scans. That is precisely the shape the prune's own valve declines
+    /// (see the module docs and `a_live_term_the_collector_cannot_scan_declines_the_prune`), and it
+    /// is why the positive release/retain cases install their roots by hand.
     fn machine_that_built_payloads(
         rt: &mut Runtime,
         table: &mut ProcessTable,
@@ -622,7 +698,12 @@ build(N, Size, Sum) ->
                 )
                 .expect("the fixture runs");
         }
-        // The park's publication, verbatim: the machine's whole root set into the process.
+        machine
+    }
+
+    /// Publishes the machine's **whole** root set into `pid`, exactly as the park arm does
+    /// (`RootSet::ALL_LIVE`, no FR words).
+    fn publish_machine_roots(machine: &mut Machine, table: &mut ProcessTable, pid: ProcessId) {
         let process = table.get_mut(pid).expect("the process");
         machine.with_roots(beam_engine::context::RootSet::ALL_LIVE, |roots| {
             assert!(
@@ -630,85 +711,203 @@ build(N, Size, Sum) ->
                 "the machine's root set publishes into the process"
             );
         });
-        machine
     }
 
+    /// Parks a machine that holds **nothing**: an empty register file, an empty stack and no FR
+    /// word — the root set of a slice that returned an immediate. No root word is pointer-bearing,
+    /// so neither valve can see a payload through them and the prune is free to reason about the
+    /// reservoir alone.
+    fn publish_empty_roots(table: &mut ProcessTable, pid: ProcessId) {
+        let process = table.get_mut(pid).expect("the process");
+        let regs = process.registers_mut();
+        regs.stack_mut().clear();
+        regs.x_mut().set_live(0).expect("an empty register file");
+    }
+
+    /// Installs `terms` as `pid`'s **only** roots, in `x(0..terms.len())`.
+    fn root_in_registers(table: &mut ProcessTable, pid: ProcessId, terms: &[Eterm]) {
+        let process = table.get_mut(pid).expect("the process");
+        let regs = process.registers_mut();
+        regs.stack_mut().clear();
+        regs.x_mut().set_live(terms.len()).expect("the live prefix");
+        for (index, &term) in terms.iter().enumerate() {
+            regs.x_mut().set(index, term).expect("a live slot");
+        }
+    }
+
+    /// The process's gathered root set, exactly as [`reclaim`] gathers it (minus the mailbox /
+    /// dictionary / saved-argument / signal families, which these cases leave empty).
+    fn gathered_roots(table: &ProcessTable, pid: ProcessId) -> Vec<Eterm> {
+        let mut roots: Vec<Eterm> = Vec::new();
+        table
+            .get(pid)
+            .expect("the process")
+            .registers()
+            .gather_roots(&mut roots);
+        roots
+    }
+
+    /// Writes the on-heap `[BinRef][ErlSubBits]` pair naming `data_ptr` on the process's **own**
+    /// young heap and returns the tagged root (the `ErlSubBits`).
+    ///
+    /// # Safety
+    ///
+    /// `data_ptr` must be a live, word-aligned payload of `len` bytes that outlives the returned
+    /// term — here the machine's reservoir owns it, and the prune never moves a payload.
+    #[allow(unsafe_code)]
+    unsafe fn pair_on_the_process_heap(
+        process: &mut Process,
+        data_ptr: *mut u8,
+        len: usize,
+    ) -> Eterm {
+        // SAFETY: the caller keeps the payload alive for the returned term's lifetime, and
+        // `data_ptr` is word-aligned (`beam_alloc` hands out `base + HEADER_SIZE`, a unit), so
+        // `write_refc_binary`'s flag-bit assert holds. The 8-word pair is allocated on the
+        // process's young heap, i.e. inside the region its collector scans.
+        unsafe {
+            let hp = process
+                .heap_mut()
+                .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
+                .expect("the pair fits the nursery");
+            beam_term::refc::write_refc_binary(
+                hp,
+                data_ptr as *mut Eterm,
+                core::ptr::null_mut(),
+                data_ptr,
+                0,
+                len * 8,
+            )
+        }
+    }
+
+    /// **(ii), pinned — the cause of the original failure.** The machine's returned tuple is live
+    /// and named by the parked register file, yet it lives in a region the process collector does
+    /// not scan, so the collector's own reachability walk — the one [`reclaim`] leans on — reports
+    /// none of the payloads those roots name. The collection valve passes it (its hazard test is
+    /// "forwards a word a relocation would move", and `BinRef.val` names an **off-heap** payload no
+    /// collection moves); the prune's own valve declines it.
     #[test]
-    fn a_parked_process_releases_the_payloads_its_roots_no_longer_reach() {
+    fn a_live_term_the_collector_cannot_scan_declines_the_prune() {
         let mut rt = runtime();
         let mut table = table();
         let pid = table.spawn_default().expect("a fresh process");
         let mut machine = machine_that_built_payloads(&mut rt, &mut table, pid, 6, 512);
         if machine.refc_binaries().is_empty() {
-            // The loud skip above returned an empty machine.
-            return;
+            return; // the loud skip above
+        }
+        let before = machine.refc_binaries().len();
+        // (a) the residual x file after `run_export_outcome`: the machine still names live terms.
+        let x_words: Vec<Eterm> = machine
+            .with_roots(beam_engine::context::RootSet::ALL_LIVE, |roots| roots.x.to_vec());
+        let process = table.get(pid).expect("the process");
+        // (c) the process heap is untouched: this harness never allocates on it.
+        assert_eq!(
+            process.heap_used_words(),
+            0,
+            "a machine driven outside the runner's armed latch allocates on the pointer-stable \
+             arena, not on the process heap"
+        );
+        // (b) at least one root word is a live container *outside* every scanned region.
+        let unscanned: Vec<Eterm> = x_words
+            .iter()
+            .copied()
+            .filter(|word| {
+                super::super::word_region_exactly(process, *word)
+                    == Some(super::super::WordRegion::Foreign)
+            })
+            .collect();
+        assert!(
+            !unscanned.is_empty(),
+            "the fixture's returned term must be in a region the collector does not scan"
+        );
+        for word in &unscanned {
+            assert!(
+                super::super::outside_scanned_exactly(
+                    process.collector(),
+                    beam_term::list::ptr_val(*word) as usize
+                ),
+                "the exact per-region test agrees: no scanned region contains it"
+            );
+        }
+        // The park, verbatim: the machine's whole root set into the process.
+        publish_machine_roots(&mut machine, &mut table, pid);
+        let roots = gathered_roots(&table, pid);
+        let process = table.get(pid).expect("the process");
+        // The collection valve passes these roots...
+        let collection = super::super::valve_verdict(
+            rt.walk_scratch(),
+            process,
+            roots.iter(),
+            /* descend */ true,
+        );
+        assert!(
+            !collection.declined,
+            "no foreign container here forwards a word a collection would move"
+        );
+        // ...and the collector's own walk reports nothing, which is what made the release unsafe.
+        let mut reported: Vec<usize> = Vec::new();
+        beam_gc::for_each_reachable_binary_payload(process.collector(), &roots, |payload| {
+            reported.push(payload)
+        })
+        .expect("the walk runs");
+        assert!(
+            reported.is_empty(),
+            "the payload walk admits only from-space objects, so a live term in the arena is \
+             invisible to it (a false reject if trusted)"
+        );
+        // The prune's own valve declines, and the prune therefore releases nothing.
+        let mut slot: Option<OffHeapReclaimer> = Some(OffHeapReclaimer::new(&impatient_policy()));
+        let released = reclaim(&mut rt, &mut table, pid, &mut machine, &mut slot)
+            .expect("a decline is not an error");
+        assert_eq!(released, 0, "a decline releases nothing");
+        assert_eq!(
+            machine.refc_binaries().len(),
+            before,
+            "the whole reservoir is retained"
+        );
+        assert!(
+            rt.foreign_reachable(pid),
+            "the decline opens the pid's descent latch, exactly as the collection valve's does"
+        );
+    }
+
+    /// **The positive release path.** With roots that hold nothing (an empty register file, an
+    /// empty stack) the prune runs its walk and releases **every** payload: nothing is live, so
+    /// nothing survives, and the process's off-heap byte figure is republished as `0`.
+    #[test]
+    fn a_prune_with_clean_roots_releases_every_payload_nothing_reaches() {
+        let mut rt = runtime();
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+        let mut machine = machine_that_built_payloads(&mut rt, &mut table, pid, 6, 512);
+        if machine.refc_binaries().is_empty() {
+            return; // the loud skip above
         }
         let before = machine.refc_binaries().len();
         assert!(
             before >= 7,
             "the fixture must build one payload per iteration plus the returned one, got {before}"
         );
-        // The returned `<<7:Size/unit:8>>` is a big-endian integer segment: `Size-1` zero bytes
-        // and a trailing `7` (the oracle's own reading — `hd(binary_to_list(<<7:512/unit:8>>))`
-        // is `0`). The discarded loop payloads are the all-zero `<<0:Size/unit:8>>` ones.
-        let returns_seven = |bytes: &[u8]| {
-            bytes.last() == Some(&7) && bytes[..bytes.len() - 1].iter().all(|byte| *byte == 0)
-        };
-        let live_payload = machine
-            .refc_binaries()
-            .iter()
-            .find(|binary| returns_seven(binary.as_bytes()))
-            .map(|binary| binary.data_ptr())
-            .expect("the returned <<7:Size/unit:8>> is in the reservoir");
+        publish_empty_roots(&mut table, pid);
         let mut slot: Option<OffHeapReclaimer> = Some(OffHeapReclaimer::new(&impatient_policy()));
         let released = reclaim(&mut rt, &mut table, pid, &mut machine, &mut slot)
             .expect("the reclamation does not fail");
-        let after = machine.refc_binaries().len();
+        assert_eq!(released, before, "nothing is reachable, so everything goes");
+        assert!(
+            machine.refc_binaries().is_empty(),
+            "the reservoir is empty afterwards"
+        );
+        let process = table.get(pid).expect("the process");
         assert_eq!(
-            released,
-            before - after,
-            "the count released is exactly the handles the reservoir lost"
+            process.off_heap_binary_bytes(),
+            0,
+            "the published off-heap byte figure is the survivors'"
         );
-        assert!(
-            released >= before - 2,
-            "every discarded loop payload must go (the register file may keep one live word), \
-             released {released} of {before}"
-        );
-        assert!(after >= 1, "the reachable payload is retained");
-        // The retained live payload is the very same block, unmoved: `retain_refc_binaries`
-        // compacts handles, never payloads, so no on-heap `BinRef.val` is invalidated.
-        assert!(
-            machine
-                .refc_binaries()
-                .iter()
-                .any(|binary| binary.data_ptr() == live_payload),
-            "the reachable payload keeps its exact data_ptr"
-        );
-        assert!(
-            machine
-                .refc_binaries()
-                .iter()
-                .any(|binary| returns_seven(binary.as_bytes())),
-            "and it is still readable"
-        );
-        // The process's off-heap byte figure is republished from the same reading, so
-        // `max_heap_size`'s `include_shared_binaries` charge sees the truth.
-        let published = table
-            .get(pid)
-            .expect("the process")
-            .off_heap_binary_bytes();
-        assert_eq!(published, machine.off_heap_overhead_bytes());
-        assert!(
-            published > 0 && published < 512 * before,
-            "the published figure is the survivors', not the whole history's ({published})"
-        );
-        // The budget was re-sized from the survivors and is now primed at the real count.
+        // The budget was re-sized from the survivors and is primed at the real count, so the next
+        // park pays the `O(1)` observation rather than a second derivation.
         let mut reclaimer = slot.expect("the reclaimer");
         assert!(reclaimer.limit_words() >= 1);
-        assert_eq!(
-            reclaimer.observe(&machine),
-            machine.off_heap_overhead_bytes()
-        );
+        assert_eq!(reclaimer.observe(&machine), 0);
         assert_eq!(
             reclaimer.rederivations(),
             2,
@@ -716,6 +915,155 @@ build(N, Size, Sum) ->
         );
     }
 
+    /// **The positive retention path, at unit level.** A payload an on-heap `[BinRef][ErlSubBits]`
+    /// pair on the **process's own heap** names is reachable from a root, so the collector's walk
+    /// reports it, the prune retains it, and every other payload is released. The retained payload
+    /// keeps its exact `data_ptr` — `retain_refc_binaries` compacts handles, never payloads, so no
+    /// on-heap `BinRef.val` is invalidated.
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_payload_a_scanned_root_reaches_is_retained() {
+        let mut rt = runtime();
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+        let mut machine = machine_that_built_payloads(&mut rt, &mut table, pid, 6, 512);
+        if machine.refc_binaries().is_empty() {
+            return; // the loud skip above
+        }
+        let before = machine.refc_binaries().len();
+        // A payload the loop discarded: the pair this case writes names it, which is what makes it
+        // reachable — the reservoir's handle alone does not.
+        let (data_ptr, len) = machine
+            .refc_binaries()
+            .iter()
+            .find(|binary| binary.as_bytes().iter().all(|byte| *byte == 0))
+            .map(|binary| (binary.data_ptr(), binary.as_bytes().len()))
+            .expect("a discarded loop payload is in the reservoir");
+        let kept = data_ptr as usize;
+        let root = {
+            let process = table.get_mut(pid).expect("the process");
+            // SAFETY: the reservoir owns `data_ptr` for the whole case and never moves it.
+            unsafe { pair_on_the_process_heap(process, data_ptr, len) }
+        };
+        root_in_registers(&mut table, pid, &[root]);
+        // The root is inside a region the collector scans: neither valve may decline.
+        let roots = gathered_roots(&table, pid);
+        let process = table.get(pid).expect("the process");
+        assert_eq!(
+            super::super::word_region_exactly(process, root),
+            Some(super::super::WordRegion::Scanned),
+            "the pair was written on the process's own young heap"
+        );
+        assert!(
+            !super::super::reaches_an_unscanned_word(rt.walk_scratch(), process, roots.iter()),
+            "a scanned root holding a scanned pair is not a decline"
+        );
+        let mut reported: Vec<usize> = Vec::new();
+        beam_gc::for_each_reachable_binary_payload(process.collector(), &roots, |payload| {
+            reported.push(payload)
+        })
+        .expect("the walk runs");
+        assert_eq!(
+            reported,
+            vec![kept],
+            "the collector's walk reports exactly the named payload"
+        );
+        let mut slot: Option<OffHeapReclaimer> = Some(OffHeapReclaimer::new(&impatient_policy()));
+        let released = reclaim(&mut rt, &mut table, pid, &mut machine, &mut slot)
+            .expect("the reclamation does not fail");
+        assert_eq!(
+            released,
+            before - 1,
+            "every payload but the reached one is released"
+        );
+        let surviving = machine.refc_binaries();
+        assert_eq!(surviving.len(), 1, "exactly the reached payload survives");
+        assert_eq!(
+            surviving[0].data_ptr() as usize,
+            kept,
+            "the retained payload keeps its exact data_ptr"
+        );
+        assert_eq!(surviving[0].as_bytes().len(), len, "and its bytes are intact");
+        let process = table.get(pid).expect("the process");
+        assert_eq!(
+            process.off_heap_binary_bytes(),
+            machine.off_heap_overhead_bytes(),
+            "the published figure is the survivors'"
+        );
+        assert!(
+            process.off_heap_binary_bytes() > 0,
+            "the survivor is charged, not the whole history"
+        );
+    }
+
+    /// **The prune declines strictly more often than the collection does.** A scanned root whose
+    /// *child* is a pointer-bearing word in a region the collector does not scan: a collection
+    /// passes it (that container forwards nothing a relocation would move), while the prune must
+    /// decline — a `[BinRef][ErlSubBits]` pair inside it would name a payload the walk cannot see,
+    /// and freeing that payload is a dangling pointer.
+    #[test]
+    fn a_foreign_child_of_a_scanned_root_declines_the_prune() {
+        let mut rt = runtime();
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+        let mut machine = machine_that_built_payloads(&mut rt, &mut table, pid, 4, 512);
+        if machine.refc_binaries().is_empty() {
+            return; // the loud skip above
+        }
+        let before = machine.refc_binaries().len();
+        // A container in a region outside the process's collector (`beam_term::heap` is the
+        // test-only host this crate keeps for exactly that), holding immediates only — so a
+        // *collection* has nothing to complain about.
+        let mut foreign_heap = beam_term::heap::Heap::new(64);
+        let foreign = foreign_heap
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("a foreign tuple");
+        // The scanned root: a cons cell on the process's own heap whose car is that container.
+        let root = {
+            let process = table.get_mut(pid).expect("the process");
+            process
+                .heap_mut()
+                .cons(foreign, beam_term::prelude::NIL)
+                .expect("the cons fits the nursery")
+        };
+        root_in_registers(&mut table, pid, &[root]);
+        let roots = gathered_roots(&table, pid);
+        let process = table.get(pid).expect("the process");
+        assert_eq!(
+            super::super::word_region_exactly(process, root),
+            Some(super::super::WordRegion::Scanned),
+            "the root itself is scanned"
+        );
+        assert_eq!(
+            super::super::word_region_exactly(process, foreign),
+            Some(super::super::WordRegion::Foreign),
+            "its child is not"
+        );
+        let collection =
+            super::super::valve_verdict(rt.walk_scratch(), process, roots.iter(), /* descend */ true);
+        assert!(
+            !collection.declined,
+            "a collection may proceed: nothing this container forwards would be relocated"
+        );
+        assert!(
+            super::super::reaches_an_unscanned_word(rt.walk_scratch(), process, roots.iter()),
+            "the prune must decline: a `BinRef` pair inside that child would name a payload the \
+             payload walk can never report"
+        );
+        let mut slot: Option<OffHeapReclaimer> = Some(OffHeapReclaimer::new(&impatient_policy()));
+        let released = reclaim(&mut rt, &mut table, pid, &mut machine, &mut slot)
+            .expect("a decline is not an error");
+        assert_eq!(released, 0, "the whole reservoir is retained");
+        assert_eq!(machine.refc_binaries().len(), before);
+        assert!(
+            rt.foreign_reachable(pid),
+            "and the pid's descent latch is opened"
+        );
+    }
+
+    /// The `refcount > 1` **belt**: a payload another owner already cloned is retained whatever
+    /// this process's roots say. The roots here hold nothing (`publish_empty_roots`), so every
+    /// payload the roots do not name is released — except the one the clone owns.
     #[test]
     fn a_payload_another_handle_holds_survives_the_prune() {
         let mut rt = runtime();
@@ -725,6 +1073,7 @@ build(N, Size, Sum) ->
         if machine.refc_binaries().is_empty() {
             return; // the loud skip above
         }
+        let before = machine.refc_binaries().len();
         // Clone the handle of an **unreachable** (discarded loop) payload: the clone bumps the
         // payload's refcount, which is what the send path, the escaped runtime store and a
         // writable accumulator all do. The belt must retain it whatever the roots say.
@@ -736,10 +1085,15 @@ build(N, Size, Sum) ->
             .expect("a discarded loop payload is in the reservoir");
         assert!(other_owner.refcount() > 1, "the clone is a second owner");
         let kept = other_owner.data_ptr();
+        publish_empty_roots(&mut table, pid);
         let mut slot: Option<OffHeapReclaimer> = Some(OffHeapReclaimer::new(&impatient_policy()));
         let released = reclaim(&mut rt, &mut table, pid, &mut machine, &mut slot)
             .expect("the reclamation does not fail");
-        assert!(released > 0, "the other discarded payloads are released");
+        assert_eq!(
+            released,
+            before - 1,
+            "every other discarded payload is released"
+        );
         assert!(
             machine
                 .refc_binaries()

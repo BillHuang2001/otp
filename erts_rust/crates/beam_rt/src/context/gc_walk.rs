@@ -301,7 +301,7 @@ where
     // per-word classification: hygiene, not a claimed win (the whole valve is 0.40 % of samples
     // in a `beam_gc` peer's profile), but it keeps one decision on one geometry.
     let bounds = process.collector().scanned_bounds();
-    let mut walk = Walk::begin(scratch, bounds);
+    let mut walk = Walk::begin(scratch, bounds, Criterion::Collection);
     for &word in machine_roots {
         walk.seed(process, word);
         if walk.hit {
@@ -334,6 +334,67 @@ pub(crate) fn process_roots_are_unscanned(
     descend: bool,
 ) -> bool {
     any_root_is_unscanned(scratch, process, std::iter::empty::<&Eterm>(), descend)
+}
+
+/// Whether the **off-heap payload prune** ([`super::gc::bin_vheap::reclaim`]) must decline —
+/// the prune's own, strictly stronger valve over the same descent.
+///
+/// # Why the collection valve is not enough
+///
+/// [`valve_verdict`] answers a **relocation** question: is a container in a region the collector
+/// does not scan holding a word a collection would move? Its hazard test is therefore
+/// [`forwards_scanned_word`] — a foreign container that forwards nothing a relocation follows is
+/// inert, which is what keeps a program holding a `make_ref/0` block or an all-immediate
+/// reference block collectable.
+///
+/// The prune asks a different question with a **different failure mode**. It frees the payload an
+/// on-heap `BinRef.val` names, and that target sits **off the heap** — no relocation would ever
+/// move it, so the collection valve legitimately ignores it. A `[BinRef][ErlSubBits]` pair inside
+/// a foreign container is therefore invisible to a collection and lethal to a prune: the walk
+/// [`beam_gc::for_each_reachable_binary_payload`] runs the collector's own admission rule (a term
+/// is entered only when it addresses a **from-space** word), so it can never report a payload named
+/// from a region the collector does not scan. Freeing on that silence is a **dangling pointer** —
+/// a later read through the frozen term layout reads released memory.
+///
+/// # The criterion (a strict superset of the collection valve's decline set)
+///
+/// Decline when **any root word**, or **any child slot of any object reachable from the roots
+/// through the collector's scanned graph**, is pointer-bearing ([`super::gc::is_pointer_bearing`])
+/// **and** lies in a region the process's collector does not scan
+/// ([`WordRegion::Foreign`]). The descent is otherwise the collection valve's — the same
+/// [`WalkScratch`], the same visited set, the same `beam_term::layout::for_each_child_slot`
+/// enumeration — restricted to the **scanned** graph, because that is exactly the graph the
+/// payload walk follows.
+///
+/// It is a superset because every word the collection valve calls a hit is either a root word
+/// that is foreign, or a child slot of a scanned-graph-reachable object that is foreign: the
+/// forwarding test only refines *which* foreign words matter, so dropping it can only add
+/// declines. It is **strictly** stronger — the prune declines cases the collection allows — and
+/// that asymmetry is the whole point: a false accept is a leak, a false reject is a dangling
+/// pointer.
+///
+/// `descend` is deliberately **not** a parameter here, unlike [`valve_verdict`]'s: the per-pid
+/// latch is opened by the events that can put a *scanned-forwarding* foreign container into the
+/// graph, and a foreign `BinRef` pair need not open it (it forwards nothing a relocation follows).
+/// The prune runs only on a triggered binary virtual heap, i.e. never on the per-slice path, so it
+/// always descends rather than trusting a hint that cannot answer its question.
+pub(crate) fn reaches_an_unscanned_word<'a, I>(
+    scratch: &mut WalkScratch,
+    process: &Process,
+    roots: I,
+) -> bool
+where
+    I: IntoIterator<Item = &'a Eterm>,
+{
+    let bounds = process.collector().scanned_bounds();
+    let mut walk = Walk::begin(scratch, bounds, Criterion::PayloadPrune);
+    for &word in roots {
+        walk.seed(process, word);
+        if walk.hit {
+            return true;
+        }
+    }
+    walk.run(process)
 }
 
 /// The **one** per-runtime cell holding the pids whose descent latch is open.
@@ -476,15 +537,31 @@ impl RuntimeCollectionGate {
     }
 }
 
+/// Which hazard a walk looks for. One traversal, two questions — so the prune's criterion and the
+/// collection doors' can never drift apart on *which words* an object forwards or on *which*
+/// region a word lives in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Criterion {
+    /// A collection ([`valve_verdict`]): a container in a region the collector does not scan that
+    /// **forwards** a word into one it does.
+    Collection,
+    /// The off-heap payload prune ([`reaches_an_unscanned_word`]): **any** pointer-bearing word in
+    /// a region the collector does not scan, whether or not it forwards anything.
+    PayloadPrune,
+}
+
 /// The walk's mutable state: the reused scratch, the scanned geometry the whole walk classifies
-/// against, and whether a hazard (a hit) or any foreign container at all has been reached.
+/// against, which hazard it looks for, and whether a hazard (a hit) or any foreign container at
+/// all has been reached.
 struct Walk<'a> {
     scratch: &'a mut WalkScratch,
     /// The collector's aggregate scanned geometry, read once by the caller
     /// ([`valve_verdict`]) and reused for every word of this walk.
     bounds: ScannedBounds,
-    /// A hazard was reached: a foreign container forwarding a scanned word — or a root that is
-    /// one.
+    /// The hazard this walk answers for (see [`Criterion`]).
+    criterion: Criterion,
+    /// A hazard was reached: a foreign container forwarding a scanned word (a collection), or any
+    /// foreign pointer-bearing word at all (the prune) — or a root that is one.
     hit: bool,
     /// A container in a region the collector does not scan was reached at all (hazardous or not).
     /// This is what an admission point that handed over its whole root set needs in order to
@@ -667,13 +744,15 @@ impl Visited {
 }
 
 impl<'a> Walk<'a> {
-    /// Starts a walk over `scratch` against `bounds`, resetting the reused state in `O(1)`.
-    fn begin(scratch: &'a mut WalkScratch, bounds: ScannedBounds) -> Walk<'a> {
+    /// Starts a walk over `scratch` against `bounds` and `criterion`, resetting the reused state in
+    /// `O(1)`.
+    fn begin(scratch: &'a mut WalkScratch, bounds: ScannedBounds, criterion: Criterion) -> Walk<'a> {
         scratch.pending.clear();
         scratch.visited.begin();
         Walk {
             scratch,
             bounds,
+            criterion,
             hit: false,
             foreign_reached: false,
         }
@@ -704,11 +783,19 @@ impl<'a> Walk<'a> {
     }
 
     /// Records a container in a region the collector does not scan and decides what it means: a
-    /// hazard when it forwards a word into a region the collector **does** scan (a collection
-    /// would relocate that word without updating the container), otherwise a container to expand
-    /// so a foreign → foreign → scanned chain is still found.
+    /// hazard when the criterion says so — a collection's when it forwards a word into a region
+    /// the collector **does** scan (a collection would relocate that word without updating the
+    /// container), the prune's whenever it is a pointer-bearing word at all (see
+    /// [`reaches_an_unscanned_word`]) — otherwise a container to expand so a foreign →
+    /// foreign → scanned chain is still found.
     fn reach_foreign(&mut self, process: &Process, word: Eterm) {
         self.foreign_reached = true;
+        if self.criterion == Criterion::PayloadPrune {
+            // The prune frees off-heap payloads, and a foreign container may name one through a
+            // `BinRef` the collector's own walk can never see — whatever else it forwards.
+            self.hit = true;
+            return;
+        }
         if forwards_scanned_word(process, &self.bounds, word) {
             self.hit = true;
             return;
