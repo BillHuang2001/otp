@@ -149,9 +149,10 @@ modules above), an end-to-end suite in `run_tests.rs` through `Machine::run_labe
 toolchain is absent).
 Every expected byte vector in the newer suites was taken from the system `erl`
 (OTP 29.1.1 / erts-17.1) — never invented.
-Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
---lib families::bitstrings` (green: 104 tests) and the whole crate
-`... -p beam_engine --no-fail-fast` (1595 passed / 0 failed across 74 targets); the build
+Gate: the whole-crate suite is authoritative —
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --offline
+--no-fail-fast` must stay green (currently 1634 passed / 0 failed / 4 ignored across every target).
+This family's subset is `... -p beam_engine --offline --lib families::bitstrings`, and the build
 `... -p beam_engine --all-targets` is warning-free. Re-run these for the live counts.
 **Differential evidence:** the project gate `erts_rust/tools/differential` was run
 per-case over the whole `binary/` group plus every bitstring/binary-shaped corpus id
@@ -225,13 +226,29 @@ refc binary with `start == 0` over a payload the machine registered through
 own window end and publishes the **same** `Eterm` with a widened `ErlSubBits.end`
 (`raw::set_ctx_end`) — C's `erts_bs_private_append_checked` writable arm (`erl_bits.c:1943-2020`).
 
-Promotion, not failure, covers the two bounds: a write that would leave the payload's capacity, and
-a segment source that **overlaps** the payload, both copy the already-written prefix out
-(`raw::InPlace::into_bytes`) and continue in `Dest::Vec`, so the result is byte-identical to the
-copy-rebuild path and the accumulator's window is left unbumped. A **failed** build never bumps
-`end` at all (stricter than C, which bumps in its sizing pass, `erl_bits.c:1975`). `push_bits_from`
-fast-paths whole bytes when both the source offset and the write position are byte-aligned and
-stays bit-exact per-bit otherwise.
+Growth keeps a build in place when it outgrows the payload. The payload itself is allocated by
+`Machine::alloc_refc_binary_with_capacity` (`beam_alloc::RefcBinary::with_capacity`: a
+`round_up_unit(capacity * DEFAULT_RESERVATION_FACTOR)` = 4x reservation, with the handle's
+`len == capacity` so a relocation copies every written byte), so most appends land in spare
+reservation. A write past the capacity asks the payload to widen (`raw::InPlace::grow` ->
+`Machine::grow_writable_payload` -> `beam_alloc::RefcBinary::ensure_capacity`): an `InPlace { .. }`
+outcome commits capacity inside the existing reservation, so the sink's cached capacity moves and it
+keeps writing at the same base (the
+registry entry's capacity is refreshed); a `Moved(rel)` outcome reallocates at `rel.to()`,
+`raw::republish_over` rewrites the accumulator's own `[BinRef][ErlSubBits]` pair over the new base
+(the same `Eterm`, the same `start`/`end` window) and the registry is re-keyed
+(`Machine::rekey_writable`). The door is consulted **only on a shortfall** (it scans the machine's
+payload roster), and `compact()` is deliberately not on the append path.
+
+Promotion, not failure, covers what growth cannot do. A payload `beam_alloc` will not relocate (a
+shared handle — C's `erts_pin_writable_binary` situation — or the `max_capacity` cap), a payload a
+second on-heap pair in this machine also names (`raw::payload_aliased_elsewhere`: a move frees the
+old block, so such a word would dangle), and a segment source that **overlaps** the payload all copy
+the already-written prefix out (`raw::InPlace::into_bytes`) and continue in `Dest::Vec`, so the result
+is byte-identical to the copy-rebuild path and the accumulator's window is left unbumped. A **failed**
+build never bumps `end` at all (stricter than C, which bumps in its sizing pass, `erl_bits.c:1975`).
+`push_bits_from` fast-paths whole bytes when both the source offset and the write position are
+byte-aligned and stays bit-exact per-bit otherwise.
 
 Two properties make the mutation unobservable outside the accumulator, both pinned by
 `create/inplace_tests.rs`: writes land at bit offsets `>= end`, so a shorter window over the same
@@ -240,8 +257,14 @@ payload (an earlier alias) reads exactly its own bits; and writability is **per 
 writes the creator's payload (C's `erts_pin_writable_binary` "an escaped writable binary is no
 longer writable").
 
-Residual (documented, owner `beam_alloc`/`beam_rt`): the payload never *grows*, so a loop that
-outgrows the `bs_init_writable` capacity falls back to the copy-rebuild form and stays O(n²);
-C's `GROW_PROC_BIN_SIZE` (`erl_bits.c:70-73`) + `apparent_size`, the
-`BIN_FLAG_WRITABLE`/`ACTIVE_WRITER` observables and `binary:referenced_byte_size/1`'s
-capacity-vs-size answer are unmodelled — see `../../HANDOFF_bs_init_writable.md`.
+The amortisation is pinned structurally by `create/grow_tests.rs` from
+`RefcBinary::growth_counters`: 64 KiB of 512-byte appends from a 1 KiB hint costs 2 in-place grows +
+4 moves and copies 61 440 bytes in total (the doubling schedule's 4096 + 8192 + 16384 + 32768) —
+against ~128 moves for a rebuild.
+
+What stays unmodelled (typed results only, never a wrong value):
+`BIN_FLAG_WRITABLE`/`BIN_FLAG_ACTIVE_WRITER` are not term flags, `binary:referenced_byte_size/1`'s
+capacity-vs-size answer (C's `apparent_size`) is absent, a copy-rebuild result is an ordinary
+non-writable refc binary (so only an in-place result stays writable through the registry), and the
+payload's `as_bytes()` reports the whole reservation rather than the bytes written — a `beam_alloc`
+`set_len_written`/high-water-word API would close that.

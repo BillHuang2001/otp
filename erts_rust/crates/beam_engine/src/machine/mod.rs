@@ -343,11 +343,13 @@ pub struct Machine {
     /// machine allocated **for appending** — the `bs_init_writable` accumulator's
     /// backing store (C's `BIN_FLAG_WRITABLE` binary).
     ///
-    /// **Why a side list.** The frozen term layout carries no capacity word (C keeps
-    /// it in the out-of-heap `Binary.intern.apparent_size`/`orig_size`, which
-    /// `beam_alloc::RefcBinary` does not expose and this crate cannot add), so the one
-    /// fact an in-place `private_append` needs — "this payload is ours, it is writable,
-    /// and it is `n` bytes wide" — has to live beside the machine. The list is keyed by
+    /// **Why a side list.** The frozen `[BinRef][ErlSubBits]` pair records only a pointer
+    /// and a logical bit window, so the one fact an in-place `private_append` needs on its
+    /// fast path — "this payload is ours, it is writable, and it is `n` bytes wide" — has to
+    /// live beside the machine. [`beam_alloc::RefcBinary`] now carries `capacity`,
+    /// `reserved_bytes` and `max_capacity` in its private header, so this registry is not
+    /// standing in for a missing word: it caches the payload's **real** capacity in bytes,
+    /// so an in-place append that already fits needs no header read at all. The list is keyed by
     /// the payload's **first data byte** (`beam_alloc::RefcBinary::data_ptr`, exactly
     /// the value the term's `BinRef.val` word holds), and only entries deposited by
     /// [`Machine::mark_writable`] are considered writable: a payload built by
@@ -766,16 +768,78 @@ impl Machine {
     /// [`Machine::refc_binaries`], which [`Machine::reset`] never clears.
     ///
     /// The payload is `beam_alloc`'s `binary_alloc` allocation. It is **immutable by
-    /// default**: there is no in-place growth, so a caller that needs a larger binary
-    /// builds a new one. The one exception is a payload the caller then hands to
-    /// [`Machine::mark_writable`] (the `bs_init_writable` accumulator), which the
-    /// bitstring family appends into **up to its capacity** — never past it, and never
-    /// at a bit offset below the accumulator's own window end.
+    /// default**: it is allocated with no spare room (`len == capacity`), so a caller
+    /// that needs a larger binary builds a new one. The one exception is a payload the
+    /// caller then hands to [`Machine::mark_writable`] (the `bs_init_writable`
+    /// accumulator), which the bitstring family appends into **up to its capacity** —
+    /// never past it, and never at a bit offset below the accumulator's own window end —
+    /// and may widen through [`Machine::grow_writable_payload`]. That growth door is why
+    /// an *accumulator* payload is allocated by
+    /// [`Machine::alloc_refc_binary_with_capacity`] instead: only a capacity-carrying
+    /// payload (spare reservation included) can grow.
     pub(crate) fn alloc_refc_binary(&mut self, bytes: &[u8]) -> Result<*mut u8> {
         let binary = beam_alloc::RefcBinary::new(bytes)?;
         let data = binary.data_ptr();
         self.refc_binaries.push(binary);
         Ok(data)
+    }
+
+    /// Allocate a **capacity-carrying** off-heap binary payload for appending and return
+    /// `(first data byte, capacity in bytes)` — the writable-accumulator constructor
+    /// (`bs_init_writable`; its consumer is
+    /// `families::bitstrings::raw::make_writable`).
+    ///
+    /// Unlike [`Machine::alloc_refc_binary`] — which copies `bytes` into an
+    /// exactly-sized, **immutable** payload (`len == capacity == reserved`) — this
+    /// allocates through [`beam_alloc::RefcBinary::with_capacity`]: the writable capacity
+    /// is `capacity` bytes, backed by a reservation of
+    /// `round_up_unit(capacity * DEFAULT_RESERVATION_FACTOR)` (4x, clamped to
+    /// `MAX_PAYLOAD_BYTES`). That capacity word is exactly what makes an appending
+    /// `private_append` loop **amortised linear** instead of O(n²): the sink writes into
+    /// the spare reservation and [`Machine::grow_writable_payload`] only buys memory at
+    /// the reservation's edge.
+    ///
+    /// The payload is returned **fully live** (`len == capacity`, zero-filled): an
+    /// appender writes through the payload pointer rather than through the handle, so a
+    /// handle whose `len` lagged behind the written bytes would lose them on a relocation
+    /// ([`Machine::cover_writable_capacity`] has the argument and the C correspondence —
+    /// `bin_size` is the whole backing store, `apparent_size` is the term's window, which
+    /// for a fresh `bs_init_writable` accumulator is 0 bits).
+    ///
+    /// `capacity == 0` is legal and needs no clamp: `RefcBinary::ensure_capacity(1)`
+    /// makes progress from a zero capacity (`grow_span(0) == 0`, but the request itself
+    /// is the target, so the payload is relocated to a `UNIT_SIZE` reservation and the
+    /// capacity rises to 1) — verified against `beam_alloc/src/binary/growth.rs`, so no
+    /// zero-progress hazard exists on the growth path.
+    ///
+    /// The returned capacity is the payload's **real** capacity, read back from its
+    /// control header rather than echoing the requested hint, so a caller that keys the
+    /// writable registry on it (`Machine::mark_writable`) can never disagree with what
+    /// the payload actually offers. `RefcBinary::with_capacity` currently sets
+    /// `capacity() == capacity`, so this is an invariant check as much as a read.
+    ///
+    /// The handle joins [`Machine::refc_binaries`] (which [`Machine::reset`] never
+    /// clears), so the payload stays alive and address-stable until the machine drops.
+    pub(crate) fn alloc_refc_binary_with_capacity(
+        &mut self,
+        capacity: usize,
+    ) -> Result<(*mut u8, usize)> {
+        let mut binary = beam_alloc::RefcBinary::with_capacity(capacity)?;
+        let real_capacity = binary.capacity();
+        debug_assert_eq!(
+            real_capacity, capacity,
+            "`with_capacity` hands back the capacity it was asked for"
+        );
+        // The whole backing store is live from the start (C's `bin_size`), so a later
+        // relocation copies every byte an appender writes through the payload pointer,
+        // and `as_bytes()` never exposes uninitialised off-heap memory. See
+        // [`Machine::cover_writable_capacity`] for the whole argument.
+        if real_capacity > 0 {
+            binary.set_len(real_capacity)?;
+        }
+        let data = binary.data_ptr();
+        self.refc_binaries.push(binary);
+        Ok((data, real_capacity))
     }
 
     /// Record that the off-heap payload starting at `base` was allocated **for
@@ -811,6 +875,188 @@ impl Machine {
             .rev()
             .find(|(registered, _)| *registered == key)
             .map(|(_, capacity)| *capacity)
+    }
+
+    /// Re-key (and re-size) the writable-payload registry entry that currently names
+    /// `old_base`, so it names `new_base` with `capacity_bytes`.
+    ///
+    /// The registry's `(base, capacity in bytes)` shape and its **newest-entry-preferred**
+    /// lookup are unchanged — only the matching entry's two words move — so a payload
+    /// whose block was reallocated (a [`PayloadGrowOutcome::Moved`],
+    /// [`Machine::grow_writable_payload`]) stays the one writable payload it was, and a
+    /// stale key can never linger to answer for a freed block.
+    ///
+    /// `false` means there was no entry for `old_base` at all (the payload was never
+    /// registered for appending), in which case nothing is inserted: this is a *re-key*,
+    /// never a registration.
+    fn rekey_writable(
+        &mut self,
+        old_base: *mut u8,
+        new_base: *mut u8,
+        capacity_bytes: usize,
+    ) -> bool {
+        let key = old_base as usize;
+        // Newest-entry-preferred, exactly like `writable_capacity`, so the re-key and
+        // the lookup can never pick different entries.
+        match self
+            .writable_payloads
+            .iter_mut()
+            .rev()
+            .find(|(registered, _)| *registered == key)
+        {
+            Some(entry) => {
+                entry.0 = new_base as usize;
+                entry.1 = capacity_bytes;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Declare the **whole capacity** of the writable payload whose first data byte is
+    /// `base` live (`len == capacity`) — the length invariant a writable accumulator's
+    /// payload carries, restored after every growth.
+    ///
+    /// # Why `len` must cover the capacity
+    ///
+    /// `beam_alloc`'s relocation copies exactly `RefcBinary::len()` payload bytes
+    /// (`binary/growth.rs::relocate`), and `RefcBinary::as_bytes()` exposes exactly that
+    /// many. An appender writes **through the payload pointer** (`InPlace` holds no
+    /// handle), so the handle's own `len` never follows those writes by itself: without
+    /// this invariant a move would silently drop everything the appender wrote, and
+    /// `as_bytes()` would under-report the bytes the payload really holds (`beam_gc`'s
+    /// reachability accounting reads it).
+    ///
+    /// `len == capacity` is C's `bin_size` — the whole backing store of a *writable*
+    /// binary (`erl_bits.c:2023`), as opposed to the term's `apparent_size` (the
+    /// `ErlSubBits` window, which is what actually bounds the visible bits). The region
+    /// `[0, capacity)` is therefore always initialised: zero-filled here, then written by
+    /// the appender.
+    ///
+    /// [`RefcBinary::set_len`](beam_alloc::RefcBinary::set_len) zero-fills the range it
+    /// newly exposes, so a caller may only extend over bytes **no writer has reached**.
+    /// Both call sites satisfy that by construction: at construction the payload is empty,
+    /// and after a growth the exposed range is exactly the capacity just committed — an
+    /// appender can only write past the *previous* capacity once that growth returned.
+    ///
+    /// Returns `Ok(false)` — nothing changed — when `base` names no payload of this
+    /// machine, or one it never registered for appending (the same refusals
+    /// [`Machine::grow_writable_payload`] documents: only this machine's own writable
+    /// accumulators have their length managed here).
+    ///
+    /// # Errors
+    ///
+    /// The typed error `beam_alloc` reports when the payload is still **shared**
+    /// ([`RefcBinary::set_len`](beam_alloc::RefcBinary::set_len)'s uniqueness
+    /// precondition). Only [`Machine::grow_writable_payload`] can observe it, and it folds
+    /// it into its documented `Ok(None)`; the construction-time call cannot (the machine
+    /// holds the only handle).
+    pub(crate) fn cover_writable_capacity(&mut self, base: *mut u8) -> Result<bool> {
+        let Some(index) = self
+            .refc_binaries
+            .iter()
+            .position(|binary| binary.data_ptr() == base)
+        else {
+            return Ok(false);
+        };
+        if self.writable_capacity(base).is_none() {
+            return Ok(false);
+        }
+        let binary = &mut self.refc_binaries[index];
+        let capacity = binary.capacity();
+        if binary.len() == capacity {
+            return Ok(true);
+        }
+        binary.set_len(capacity)?;
+        Ok(true)
+    }
+
+    /// Grow the **writable** off-heap payload whose first data byte is `base` so that it
+    /// offers at least `wanted_bytes` writable bytes, re-keying the writable registry to
+    /// whatever the growth did.
+    ///
+    /// This is the payload half of the capacity adoption: the engine's writable sink
+    /// ([`crate::families::bitstrings::raw::InPlace`]) asks for room, `beam_alloc` decides
+    /// in place vs. move (`RefcBinary::ensure_capacity`'s `GROW_PROC_BIN_SIZE` schedule),
+    /// and this door keeps the machine's own two books straight:
+    ///
+    /// * [`PayloadGrowOutcome::InPlace`] — the payload's address is unchanged, so only the
+    ///   registry's cached capacity moves. `data_ptr()` stayed put, so **no term needs
+    ///   republishing** and every `BinRef.val` is still valid.
+    /// * [`PayloadGrowOutcome::Moved`] — the payload was reallocated and its old block
+    ///   **freed**, so the registry is re-keyed to [`PayloadRelocation::to`] and that new
+    ///   address is returned. Republishing the on-heap `[BinRef][ErlSubBits]` pair(s) over
+    ///   it is the *caller's* job (it owns the term; this door is safe Rust and never
+    ///   dereferences a term) — see `InPlace::grow`'s `SAFETY` contract.
+    ///
+    /// Returns `Ok(Some((base, capacity_bytes)))` when the payload now offers
+    /// `wanted_bytes`. Returns `Ok(None)` — "cannot grow, fall back to the copy-rebuild
+    /// form" — for **every** refusal, each of which is a legitimate runtime condition
+    /// rather than a programming error:
+    ///
+    /// * `base` names no payload in [`Machine::refc_binaries`] (not ours — e.g. a payload
+    ///   built by another machine or by a host);
+    /// * `base` names a payload that was **not** registered for appending
+    ///   ([`Machine::writable_capacity`] is `None`), so its immutability is untouched;
+    /// * `beam_alloc` refused the growth: the payload is **shared**
+    ///   (`refcount() != 1` — a host or another process adopted a handle, exactly the
+    ///   situation C resolves with `erts_pin_writable_binary`), or the request exceeds the
+    ///   payload's `max_capacity` (typed `AllocKind::LargeObject`), or the allocator could
+    ///   not serve the block.
+    ///
+    /// The copy-rebuild form is always byte-correct, so a refusal costs performance only.
+    /// No `Err` is produced for any of those: a payload that cannot grow is a *runtime
+    /// condition*, not an internal fault, and the caller already owns the correct fallback
+    /// for everything this door reports. The single `?` is [`Machine::cover_writable_capacity`]'s
+    /// uniqueness error, which cannot fire right after `ensure_capacity` required a unique
+    /// handle — it is surfaced rather than swallowed because reaching it would mean an
+    /// internal invariant broke, and the old block is already gone by then.
+    ///
+    /// Both outcomes also restore the writable-payload length invariant
+    /// (`len == capacity`, [`Machine::cover_writable_capacity`]) **before** returning, so
+    /// the next relocation copies every byte the appender wrote through the payload
+    /// pointer.
+    pub(crate) fn grow_writable_payload(
+        &mut self,
+        base: *mut u8,
+        wanted_bytes: usize,
+    ) -> Result<Option<(*mut u8, usize)>> {
+        let Some(index) = self
+            .refc_binaries
+            .iter()
+            .position(|binary| binary.data_ptr() == base)
+        else {
+            return Ok(None);
+        };
+        if self.writable_capacity(base).is_none() {
+            return Ok(None);
+        }
+        let outcome = match self.refc_binaries[index].ensure_capacity(wanted_bytes) {
+            Ok(outcome) => outcome,
+            // Shared payload / `max_capacity` cap / allocation failure: the payload is
+            // unchanged (`ensure_capacity`'s documented guarantee), so the caller's
+            // copy-rebuild fallback is the only remaining route.
+            Err(_) => return Ok(None),
+        };
+        let capacity = self.refc_binaries[index].capacity();
+        let new_base = match outcome {
+            beam_alloc::PayloadGrowOutcome::InPlace { .. } => base,
+            beam_alloc::PayloadGrowOutcome::Moved(relocation) => relocation.to(),
+        };
+        // Re-key first, so the invariant door below finds the payload under the address it
+        // now has.
+        self.rekey_writable(base, new_base, capacity);
+        // Restore the writable-payload length invariant *before* returning: the bytes an
+        // appender has already written live at `[0, min(written, previous capacity))`, and
+        // a `Moved` relocation just copied exactly `len() == previous capacity` bytes, so
+        // they survived. Extending the length over the capacity this growth just committed
+        // only zero-fills a region no writer can have reached yet (the appender writes past
+        // the previous capacity only after this call returns) — see
+        // [`Machine::cover_writable_capacity`]. Its uniqueness error cannot fire here:
+        // `ensure_capacity` just required the same unique handle.
+        let covered = self.cover_writable_capacity(new_base)?;
+        debug_assert!(covered, "the payload this door just grew is registered writable");
+        Ok(Some((new_base, capacity)))
     }
 
     /// The **off-heap ref-counted binary payload handles** this machine keeps alive

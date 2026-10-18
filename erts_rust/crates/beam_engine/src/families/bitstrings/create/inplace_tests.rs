@@ -218,7 +218,8 @@ fn the_accumulator_loop_appends_in_place_and_allocates_once() {
 
 /// The same bits through the in-place and the copy-rebuild route are **byte-identical**
 /// at every shape: byte-aligned, a 4-bit offset, the capacity boundary, an overflow
-/// (which promotes mid-build), a 0-bit append, and a source that is not the accumulator.
+/// (which grows the payload in place), a 0-bit append, and a source that is not the
+/// accumulator.
 ///
 /// Oracle: `erl -noshell -eval 'io:format("~p~n",[<< <<1,2,3>>/bitstring, 3:4, 5:4 >>]),halt().'`
 /// ⇒ `<<1,2,3,53>>` — the `4-bit offset` row below.
@@ -286,9 +287,10 @@ fn in_place_and_copy_rebuild_agree_byte_for_byte() {
     }
 }
 
-/// A build that exactly fills the payload stays in place; **one more bit** promotes to
-/// the copy-rebuild form and the promoted result is still byte-identical to the
-/// copy-rebuild path (the promotion copies the already-written bits out).
+/// A build that exactly fills the payload stays in place; **one more byte** outgrows it,
+/// so the writer asks the capacity-adoption door for room ([`BitWriter::ensure_room`] ->
+/// [`raw::InPlace::grow`]), which widens the payload instead of promoting — the build
+/// stays in place, publishes the **same** term, and the grown bytes are exact.
 #[test]
 fn an_append_at_and_past_the_capacity_boundary_is_exact() {
     let module = seg_module();
@@ -310,24 +312,27 @@ fn an_append_at_and_past_the_capacity_boundary_is_exact() {
     assert_eq!(window(full).2, 64, "the window is the whole payload");
     assert_eq!(ctx.rooted_calls, 1, "no allocation at the boundary");
 
-    // One more byte outgrows the payload: the writer promotes mid-build.
+    // One more byte outgrows the payload: the writer grows it and keeps appending.
     machine.set_x(0, full).expect("x(0)");
     let mut over = append_segment(&module, "private_append");
     over.extend(int_segment(&module, 0xCD, 8));
-    let promoted = assemble(&mut machine, &module, &LabelMap::default(), NO_FAIL, &over, &mut ctx)
+    let grown = assemble(&mut machine, &module, &LabelMap::default(), NO_FAIL, &over, &mut ctx)
         .expect("assemble")
         .expect("the build succeeds");
-    assert!(
-        matches!(promoted, Built::Bytes(..)),
-        "an overflowing build promotes to the copy-rebuild form"
+    let Built::Term(grown_term) = grown else {
+        panic!("an overflowing build grows the payload instead of promoting");
+    };
+    assert_eq!(
+        grown_term, acc,
+        "the grown build publishes the accumulator term itself"
     );
-    let (bytes, nbits) = built_bytes(promoted);
+    let (bytes, nbits) = bytes_of(grown_term);
     assert_eq!(nbits, 72);
     let mut expected = vec![0xABu8; 8];
     expected.push(0xCD);
-    assert_eq!(bytes, expected, "the promoted bytes are the copy-rebuild's");
-    // The accumulator's own window is UNBUMPED: the promotion publishes a new term.
-    assert_eq!(window(full).2, 64, "the source window was left unbumped");
+    assert_eq!(bytes, expected, "the grown payload holds the appended bytes");
+    // The append is visible: the same term's window now covers the grown bytes.
+    assert_eq!(window(full).2, 72, "the source window was bumped by the append");
 }
 
 // ---------------------------------------------------------------------------

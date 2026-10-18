@@ -62,12 +62,23 @@
 //!   with `start == 0` over a payload this machine allocated *for appending*
 //!   ([`raw::writable_append_target`], the writable-payload registry on
 //!   [`Machine::mark_writable`](crate::machine::Machine)) is written **in place** by
-//!   [`raw::InPlace`]: no `Vec`, no fresh payload, no `[BinRef][ErlSubBits]` reservation,
-//!   and `exec` writes the **same** term back to `dst` with a wider `ErlSubBits.end`;
-//! * when the build outgrows the payload's capacity, or a segment source aliases the
-//!   payload, the writer **promotes** to the copy-rebuild form — the bits already written
-//!   are copied out and the build continues in a `Vec` — so the result is byte-identical
-//!   to the copy-rebuild path and the accumulator's window is left unbumped;
+//!   [`raw::InPlace`]: no `Vec`, no new `[BinRef][ErlSubBits]` reservation, and `exec`
+//!   writes the **same** term back to `dst` with a wider `ErlSubBits.end`;
+//! * a write past the payload's capacity first asks the payload to **widen**
+//!   ([`raw::InPlace::grow`] → `Machine::grow_writable_payload` →
+//!   [`beam_alloc::RefcBinary::ensure_capacity`]): an in-place grow commits capacity
+//!   inside the reservation and the sink keeps writing at the same base, a relocation
+//!   reallocates at the new block and the accumulator's own `[BinRef][ErlSubBits]` pair
+//!   is republished over it (same `Eterm`, same window) with the writable registry
+//!   re-keyed;
+//! * when the payload cannot be widened — a handle `beam_alloc` will not relocate
+//!   (shared with a host or another process, C's `erts_pin_writable_binary` situation,
+//!   or past `max_capacity`) — or a second on-heap pair in this machine names the same
+//!   payload (`raw::payload_aliased_elsewhere`, since a move frees the old block), or a
+//!   segment source aliases it, the writer **promotes** to the copy-rebuild form — the
+//!   bits already written are copied out and the build continues in a `Vec` — so the
+//!   result is byte-identical to the copy-rebuild path and the accumulator's window is
+//!   left unbumped;
 //! * everything else — a plain `append`, an appending segment in a later position, a
 //!   source that is not a writable refc binary (a heap binary, a sub-binary, an ordinary
 //!   refc binary) — keeps the copy-rebuild route: seed a bit vector with the source's bits
@@ -81,21 +92,29 @@
 //! partial writes stay invisible — deliberately stricter than C, which bumps the window
 //! in its sizing pass before writing anything (`erl_bits.c:1975`).
 //!
-//! # Remaining capacity gap (a documented handoff, not implemented here)
+//! # Capacity growth
 //!
-//! The in-place arm covers the `bs_init_writable` capacity and nothing more. C *grows*
-//! the payload when the build outgrows it (`GROW_PROC_BIN_SIZE`, `erl_bits.c:70-73`:
-//! double, or 1.2x past 16 MB) and tracks the used size in
-//! `Binary.intern.apparent_size`; [`beam_alloc::RefcBinary`] is immutable and offers no
-//! grow operation, so past the initial capacity this build falls back to the
-//! copy-rebuild form and an append loop that outgrows the writable capacity stays
-//! O(n²). Closing that needs payload growth, which is `beam_alloc`/`beam_rt` ownership —
-//! see `HANDOFF_bs_init_writable.md`. Three further C observables stay unmodelled:
+//! C grows the writable binary in place (`GROW_PROC_BIN_SIZE`, `erl_bits.c:70-73`: double, or
+//! 1.2x past 16 MB) and rebuilds only when the binary is pinned. The engine's counterpart is
+//! [`raw::InPlace::grow`] → `Machine::grow_writable_payload` →
+//! [`beam_alloc::RefcBinary::ensure_capacity`], with the copy-rebuild form as the promoted
+//! fallback. `bs_init_writable`'s payload is allocated by
+//! `Machine::alloc_refc_binary_with_capacity` (`RefcBinary::with_capacity`, a 4x
+//! `DEFAULT_RESERVATION_FACTOR` reservation), so most appends land in spare reservation, and
+//! the growth door is consulted **only on a shortfall** — it scans the machine's payload
+//! roster, so a per-append call would itself be an O(#payloads) regression. The resulting
+//! curve is amortised, not quadratic: 64 KiB of 512-byte appends from a 1 KiB hint costs 2
+//! in-place grows + 4 moves and copies 61 440 bytes in total (`create/grow_tests.rs`).
+//! `compact()` is deliberately not on the append path — there is no "accumulator finished"
+//! signal, and compacting per append would re-introduce the quadratic behaviour.
+//!
+//! What stays unmodelled (typed results only, never a wrong value):
 //! `BIN_FLAG_WRITABLE`/`BIN_FLAG_ACTIVE_WRITER` introspection,
-//! `binary:referenced_byte_size/1`'s "capacity vs size" answer, and the fact that a
-//! copy-rebuild result is an ordinary, non-writable refc binary (so the *next* append of
-//! it starts a fresh rebuild; an in-place result stays writable through the same
-//! registry).
+//! `binary:referenced_byte_size/1`'s "capacity vs size" answer (C's `apparent_size`), the fact
+//! that a copy-rebuild result is an ordinary, non-writable refc binary (so only an in-place
+//! result stays writable through the registry), and the payload's `as_bytes()`, which reports
+//! the whole reservation rather than the bytes written — a `beam_alloc`
+//! `set_len_written`/high-water-word API would close that.
 //!
 //! # `BS_FAIL_INFO`: why a segment failure raises a bare reason atom
 //!
@@ -103,7 +122,7 @@
 //! (`emu/bs_instrs.tab:347`) runs `erts_prepare_bs_construct_fail_info` and then
 //! `$FAIL_HEAD_OR_BODY($Fail)` (`emu/macros.tab:266`) — **not** the bare `$FAIL`
 //! the matching opcodes use. A live fail label is `$FAIL($Fail)`, a branch to it
-//! (the guard case); `{f,0}` ([`NO_FAIL`]) takes the `goto find_func_info` arm, a
+//! (the guard case); `{f,0}` (`beam_loader::NO_FAIL`) takes the `goto find_func_info` arm, a
 //! real raise whose reason is exactly the atom `BS_FAIL_INFO` left in
 //! `c_p->freason` — the bare `badarg` for every `i_bs_create_bin` call site, or
 //! `system_limit` from the size validation's `BS_FAIL_INFO_SYSTEM_LIMIT`
@@ -270,13 +289,13 @@ fn assemble(
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
                 if nbits > 64 || raw::big_parts_safe(value).is_some() {
-                    push_wide_int(&mut writer, value, nbits, flags & BSF_LITTLE != 0)?;
+                    push_wide_int(&mut writer, value, nbits, flags & BSF_LITTLE != 0, machine)?;
                 } else if let Some(raw_value) = small_value(value) {
                     if flags & BSF_LITTLE != 0 {
-                        writer.push_uint_le(raw_value as u64, nbits);
+                        writer.push_uint_le(raw_value as u64, nbits, machine)?;
                     } else {
                         // `erts_bs_put_integer_*` masks the value into the field width.
-                        writer.push_uint(raw_value as u64, nbits);
+                        writer.push_uint(raw_value as u64, nbits, machine)?;
                     }
                 } else {
                     // Unreachable: `predicates::is_integer` above is exactly
@@ -318,7 +337,7 @@ fn assemble(
                 if nbits > src_bits {
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
-                writer.push_bits_from(bytes, src_off, nbits);
+                writer.push_bits_from(bytes, src_off, nbits, machine)?;
             }
             // `string Unit Fs Offset Size` — append a constant byte string from the
             // module's `StrT` table (`BS_LOAD_STRING_SRC`/`erts_bs_put_string`,
@@ -330,7 +349,7 @@ fn assemble(
             // failure is possible here, so this segment never branches to `fail`.
             "string" => {
                 let bytes = string_source(module, value_op, size_op, machine, ctx)?;
-                writer.push_bits_from(bytes, 0, bytes.len() * 8);
+                writer.push_bits_from(bytes, 0, bytes.len() * 8, machine)?;
             }
 
             // `float Unit Fs Value Size` — write a 16/32/64-bit float
@@ -366,7 +385,7 @@ fn assemble(
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 };
                 let bytes = put_float(f, nbits, flags & BSF_LITTLE != 0);
-                writer.push_bits_from(&bytes, 0, nbits);
+                writer.push_bits_from(&bytes, 0, nbits, machine)?;
             }
 
             // `utf8`/`utf16`/`utf32` — the codepoint is variable-width; the
@@ -381,7 +400,7 @@ fn assemble(
                     _ => None,
                 };
                 match encoded {
-                    Some(bytes) => writer.push_bits_from(&bytes, 0, bytes.len() * 8),
+                    Some(bytes) => writer.push_bits_from(&bytes, 0, bytes.len() * 8, machine)?,
                     None => return fail_seg(machine, module, labels, fail, SegReason::BadArg),
                 }
             }
@@ -432,7 +451,7 @@ fn assemble(
                     }
                 }
                 let (bytes, src_off) = raw::subject_bytes(value)?;
-                writer.push_bits_from(bytes, src_off, src_bits);
+                writer.push_bits_from(bytes, src_off, src_bits, machine)?;
             }
             other => {
                 return Err(error::unsupported(&format!(
@@ -523,3 +542,5 @@ mod float_seg_tests;
 mod le_tests;
 #[cfg(test)]
 mod inplace_tests;
+#[cfg(test)]
+mod grow_tests;

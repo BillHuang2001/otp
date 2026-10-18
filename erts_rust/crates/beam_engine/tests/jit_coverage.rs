@@ -485,8 +485,11 @@ fn the_append_segment_agrees_on_both_tiers() {
     let module = load();
     let mut ctx = context();
     // The clause body builds `<<Rest/binary, H:8>>` via an `append` segment the
-    // bitstring family supports (a copy-rebuild); both tiers must produce the
-    // rotated bytes `<<2,3,1>>` and agree with the interpreter.
+    // bitstring family supports: a first-position `private_append` over a writable
+    // payload writes **in place**, and grows the payload when the bytes would not fit
+    // (the copy-rebuild form is only the fallback when growth is refused or the source
+    // aliases the payload). Both tiers must produce the rotated bytes `<<2,3,1>>` and
+    // agree with the interpreter.
     let binary = terms::make_heap_binary(&mut ctx, &[1, 2, 3]).expect("binary");
     let result = agree(&mut ctx, &module, "bits", &[binary]);
     assert_eq!(

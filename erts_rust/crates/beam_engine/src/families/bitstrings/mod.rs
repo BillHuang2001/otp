@@ -450,7 +450,9 @@ pub(super) fn push_wide_int(
     value: Eterm,
     nbits: usize,
     little: bool,
+    machine: &mut Machine,
 ) -> Result<()> {
+    writer.ensure_room(machine, nbits)?;
     let num_bytes = nbits.div_ceil(8);
     let (negative, mut bytes) = integer_magnitude_bytes(value, num_bytes)?;
     if negative {
@@ -573,12 +575,15 @@ pub(super) enum Built {
 ///
 /// # Promotion
 ///
-/// The in-place destination is bounded by the payload capacity and can be invalidated by
-/// a segment source that aliases the payload. In both cases the writer **promotes**: the
-/// written prefix is copied out ([`raw::InPlace::into_bytes`]) and the build continues in
-/// [`Dest::Vec`]. Promotion is exact — the bits already written are the same bits — so the
-/// final result is byte-identical to the copy-rebuild path, and the accumulator's window
-/// is left unbumped.
+/// The in-place destination is bounded by the payload capacity, which
+/// [`raw::InPlace::grow`] widens when it can, and can be invalidated by a segment source
+/// that aliases the payload. When the payload cannot grow (a shared handle, or the
+/// `max_capacity` cap), when a second on-heap pair in this machine names it
+/// (`raw::payload_aliased_elsewhere`), or when the source overlaps it
+/// ([`raw::InPlace::overlaps`]), the writer **promotes**: the written prefix is copied out
+/// ([`raw::InPlace::into_bytes`]) and the build continues in [`Dest::Vec`]. Promotion is
+/// exact — the bits already written are the same bits — so the final result is
+/// byte-identical to the copy-rebuild path, and the accumulator's window is left unbumped.
 pub(super) struct BitWriter {
     dest: Dest,
 }
@@ -614,6 +619,26 @@ impl BitWriter {
         };
         let (bytes, nbits) = sink.into_bytes();
         self.dest = Dest::Vec { bytes, nbits };
+    }
+
+    /// Make room for `bits` more bits, growing the writable accumulator's payload when it
+    /// no longer fits (C's `GROW_PROC_BIN_SIZE` arm, `erl_bits.c:1965-1976`) and falling back
+    /// to the copy-rebuild form when the payload cannot grow.
+    ///
+    /// The growth door is consulted ONLY on a shortfall: it scans the machine's payload
+    /// roster, so a per-append call would be an O(#payloads) regression on exactly the
+    /// workload this exists to speed up.
+    fn ensure_room(&mut self, machine: &mut Machine, bits: usize) -> Result<()> {
+        let Dest::InPlace(sink) = &mut self.dest else {
+            return Ok(());
+        };
+        if sink.remaining_bits() >= bits {
+            return Ok(());
+        }
+        if !sink.grow(machine, bits)? {
+            self.promote();
+        }
+        Ok(())
     }
 
     /// The bits written so far — the **whole** result's bit count (for an in-place build,
@@ -656,10 +681,17 @@ impl BitWriter {
         }
     }
     /// Append the low `width` bits of `value`, most-significant bit first.
-    pub(super) fn push_uint(&mut self, value: u64, width: usize) {
+    pub(super) fn push_uint(
+        &mut self,
+        value: u64,
+        width: usize,
+        machine: &mut Machine,
+    ) -> Result<()> {
+        self.ensure_room(machine, width)?;
         for k in (0..width).rev() {
             self.push_bit(((value >> k) & 1) as u8);
         }
+        Ok(())
     }
 
     /// Append the low `width` bits of `value` in little-endian **bit** order
@@ -673,12 +705,19 @@ impl BitWriter {
     /// written bit-granularly rather than truncated to whole bytes. The rule itself
     /// is shared with the bignum writer [`push_wide_int`] through
     /// [`BitWriter::push_le_groups`].
-    pub(super) fn push_uint_le(&mut self, value: u64, width: usize) {
+    pub(super) fn push_uint_le(
+        &mut self,
+        value: u64,
+        width: usize,
+        machine: &mut Machine,
+    ) -> Result<()> {
+        self.ensure_room(machine, width)?;
         let mut bytes = [0u8; 8];
         for (j, byte) in bytes.iter_mut().enumerate() {
             *byte = ((value >> (8 * j)) & 0xFF) as u8;
         }
         self.push_le_groups(&bytes, width);
+        Ok(())
     }
 
     /// Append `nbits` bits of the little-endian byte sequence `bytes` in
@@ -711,10 +750,19 @@ impl BitWriter {
     /// boundary) copies whole bytes — the fast path a `binary`/`append`/`string`
     /// segment of real data always takes — and only the trailing partial byte goes
     /// through the per-bit writer, which keeps every unaligned case bit-exact.
-    pub(super) fn push_bits_from(&mut self, src: &[u8], start: usize, count: usize) {
+    pub(super) fn push_bits_from(
+        &mut self,
+        src: &[u8],
+        start: usize,
+        count: usize,
+        machine: &mut Machine,
+    ) -> Result<()> {
+        // ORDER IS LOAD-BEARING: the aliasing check promotes (copying the payload out)
+        // before any growth can move it, so no live `&[u8]` ever names a relocated payload.
         if self.source_overlaps(src) {
             self.promote();
         }
+        self.ensure_room(machine, count)?;
         let mut done = 0usize;
         if start % 8 == 0 && self.bit_len() % 8 == 0 {
             let whole = count / 8;
@@ -728,6 +776,7 @@ impl BitWriter {
             let bit = (src[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
             self.push_bit(bit);
         }
+        Ok(())
     }
 
     /// Append `bytes` verbatim to a byte-aligned destination.
@@ -844,7 +893,10 @@ mod tests {
     fn push_uint_le_writes_a_bit_granular_little_endian_field() {
         let le = |value: u64, width: usize| {
             let mut writer = BitWriter::default();
-            writer.push_uint_le(value, width);
+            let mut machine = Machine::new();
+            writer
+                .push_uint_le(value, width, &mut machine)
+                .expect("the copy-rebuild destination never refuses room");
             writer.finish()
         };
         assert_eq!(le(0x0102, 12), (vec![0x02, 0x10], 12));
