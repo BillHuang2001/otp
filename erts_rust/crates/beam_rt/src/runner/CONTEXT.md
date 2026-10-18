@@ -66,13 +66,15 @@ characterisation and figures are in `PERF.md`).
   rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
   (the exit path) — whether the process **built** it or **received** it.
   The machine's `refc_binaries()` reservoir is **not** copied onto the running process: it is the one
-  holder of every payload the process's own compiled bitstring code built (it is append-only and
-  `Machine::reset` never clears it), so `erlang:process_info(Pid, binary)` reads it straight through
-  `RunnerState::reservoir_at(pid)` and the process's own off-heap table stays empty. That is what keeps
-  `beam_gc::OffHeap`'s never-compacted slot space out of the per-call path — mirroring the reservoir
-  onto the PCB handed that space a slot per payload per slice, and the O(slots)
-  `overhead_bytes`/`sweep` walks it implies made a build-a-binary loop quadratic in its own iteration
-  count. `Runtime::eval_off_heap` is likewise not attributed to any process: it is the pid-less
+  holder of every payload the process's own compiled bitstring code built, so
+  `erlang:process_info(Pid, binary)` reads it straight through `RunnerState::reservoir_at(pid)` and the
+  process's own off-heap table stays empty. That is what keeps `beam_gc::OffHeap`'s never-compacted slot
+  space out of the per-call path — mirroring the reservoir onto the PCB hands that space a slot per
+  payload per slice, and the O(slots) `overhead_bytes`/`sweep` walks it implies make a build-a-binary
+  loop quadratic in its own iteration count. The reservoir is **pruned, not accumulated**: the `Yield`
+  arm reclaims every payload the parked process's roots no longer reach once its binary virtual heap
+  triggers (see *The off-heap refc-binary reclamation at the slice boundary*).
+  `Runtime::eval_off_heap` is likewise not attributed to any process: it is the pid-less
   `-eval` store.
 * [`budget`] — the slice's reduction budget and the wrapper context that charges it: `BudgetProbe`
   with **two** charging primitives, `charge()` (the **refusing** one: spends a unit or hands back the
