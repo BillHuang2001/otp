@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use crate::workload::Workload;
 
 pub mod baseline;
+pub mod binary_append;
 pub mod copy_bound;
 pub mod cowboy;
 pub mod elixir_compiler;
@@ -129,6 +130,7 @@ pub fn registry() -> Vec<Box<dyn Workload>> {
         Box::new(list_walk::ListWalk),
         Box::new(copy_bound::CopyBound),
         Box::new(gc_bound::GcBound),
+        Box::new(binary_append::BinaryAppend),
     ]
 }
 
@@ -207,7 +209,8 @@ mod tests {
                 "foreign",
                 "list_walk",
                 "copy_bound",
-                "gc_bound"
+                "gc_bound",
+                "binary_append"
             ]
         );
     }

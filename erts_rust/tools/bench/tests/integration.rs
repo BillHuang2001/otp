@@ -131,8 +131,8 @@ fn comparison_flags_presence_and_status_changes() {
 /// `rust` runtime) and keep declaring the contracts it exercises. If it is ever flipped
 /// back to `SysOnly` or removed, this fails loudly — no silent loss of Rust coverage.
 ///
-/// The same guard covers the three other cross-runtime signals: `list_walk` (compute),
-/// `copy_bound` (messaging/copy) and `gc_bound` (GC).
+/// The same guard covers the four other cross-runtime signals: `list_walk` (compute),
+/// `copy_bound` (messaging/copy), `gc_bound` (GC) and `binary_append` (binary building).
 #[test]
 fn a_real_foreign_workload_is_measured_under_both_runtimes() {
     let foreign = workload::find("foreign").expect("the `foreign` workload must be registered");
@@ -217,5 +217,25 @@ fn a_real_foreign_workload_is_measured_under_both_runtimes() {
     assert!(
         rust_capable.contains(&"gc_bound"),
         "the rust-schedulable workload set must include `gc_bound`; got {rust_capable:?}"
+    );
+
+    // `binary_append` is the binary-append (writable-accumulator) signal: same guard.
+    let binary_append =
+        workload::find("binary_append").expect("the `binary_append` workload must be registered");
+    assert!(
+        matches!(binary_append.runtimes(), Runtimes::Both),
+        "`binary_append` must run under both runtimes, got {:?}",
+        binary_append.runtimes()
+    );
+    assert_eq!(binary_append.category(), Category::Compute);
+    assert!(
+        binary_append.contracts().contains(&"A.1")
+            && binary_append.contracts().contains(&"A.2"),
+        "contracts: {:?}",
+        binary_append.contracts()
+    );
+    assert!(
+        rust_capable.contains(&"binary_append"),
+        "the rust-schedulable workload set must include `binary_append`; got {rust_capable:?}"
     );
 }
