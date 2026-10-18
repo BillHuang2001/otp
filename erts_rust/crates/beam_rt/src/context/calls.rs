@@ -1029,7 +1029,9 @@ impl<'a> RuntimeContext<'a> {
             }
         }
         false
-    }    /// Moves a container a **scratch region** owns onto a region that **outlives the call**,
+    }
+
+    /// Moves a container a **scratch region** owns onto a region that **outlives the call**,
     /// returning the term Erlang code must see instead — or the term unchanged when it is an
     /// immediate, a literal, or a container the copier refused (in which case the scratch region
     /// is latched unrecyclable, see [`Runtime::taint_info_scratch`]).
