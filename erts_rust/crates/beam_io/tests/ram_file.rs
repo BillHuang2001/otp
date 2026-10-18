@@ -928,6 +928,10 @@ fn oracle_expression(sessions: &[OracleSession]) -> String {
 
 /// Parses one oracle session line (`3 0 0 0 0|1 101 98 97 100 102|…`) into the reply bytes of
 /// each command, with `None` for a `TIMEOUT` (no reply arrived).
+///
+/// The `|` delimiter cannot collide with a reply: `ToStr/1` re-encodes every reply as
+/// space-separated decimal-ASCII byte texts (or the literal `TIMEOUT`), so a literal `0x7C` never
+/// reaches the dump.
 fn parse_oracle_session(line: &str) -> Vec<Option<Vec<u8>>> {
     line.trim()
         .split('|')

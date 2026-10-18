@@ -130,6 +130,34 @@ exhaustive):
 Contract: **drain after every round** (line-frames style), a control op's return value is never a
 completion, and each completion is reported exactly once.
 
+### The driver→owner `{active, …}` input channel (`port_task.rs`'s `ActiveInput`)
+An `{active, true|N|once}` socket owes its owner **incoming-message** notifications that are
+neither `{Port, {data, …}}` (the passive read path) nor the answer to a call (a completion): the
+`{tcp, S, Data}` of `tcp_message` (`inet_drv.c:3979`), its `{packet,N}` shape
+`packet_binary_message` (`:4110`), and `{tcp_passive, S}`/`{udp_passive, S}` from
+`packet_passive_message` (`:4215`). Built exactly like the two precedents (separate struct, separate
+drain — `PortNotification` keeps its two variants and `CompletionEvent` gains no variant):
+- `port_task.rs` → `ActiveInput { port, event }` with `ActiveInputEvent { Data(ReadMessage),
+  Passive }`. `Data` is one delivered input with the header/body split kept (`header` = the
+  `{packet,N}` framing header of a stream port, empty for `{packet,0}`, or the 7-byte packed source
+  address of a datagram port), never merged with another and never also reported as a `Data`
+  notification; an empty body is still a real delivery. `Passive` is atom-free — the runtime picks
+  `{tcp_passive,_}` vs `{udp_passive,_}` from the port's driver name.
+- `driver.rs` → `DriverContext::deliver_active_input(event)` (+ the chainable
+  `with_active(&mut VecDeque<ActiveInput>)`). It **stamps `ctx.port()` itself**, answers the typed
+  `unsupported` with no sink, and refuses after a failure latched in the same callback — the same
+  rules `deliver_read`/`deliver_completion` follow.
+- `port.rs` → the `active_inputs: VecDeque<ActiveInput>` stage + `Port::take_active_inputs()`. The
+  sink is installed at **every** driver interaction point (`open`/`output`/`ready_input`/
+  `ready_output`/`control`/`timeout`/`drive_async`/`notify_exit`/`close`), like the other three.
+- `registry.rs` → `PortRegistry::take_active_inputs()` drains every live port in **port-number
+  order** (each port's own deliveries in delivery order), then the deliveries harvested from ports
+  closed since the last drain (`close` copies them into `closed_active` before dropping the `Port`).
+  Contract: **drain after every round and after every `close`**; draining is what removes them.
+  Closed-port numbers keep the existing rule (retired only by the `Closed` report).
+- **Who produces on it:** the `tcp_inet`/`udp_inet` drivers' `{active,…}` arms (their node), and
+  `beam_rt` renders the messages (`{tcp,S,Data}`/`{udp,S,IP,Port,Data}`/`{tcp_passive,S}`/
+  `{udp_passive,S}`). This node owns only the channel.
 ## Known Issues (durable gotchas — not fixed by changing this file)
 - **A `PortNotification::Closed` names a number that is retired *with the report*.** `PortRegistry::close`
   queues the id in `self.closed` and keeps it **allocated** in `ids`; the reporting round
@@ -213,6 +241,16 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   waits for the `Closed` report; a second drain is empty; and `deliver_completion` with **no** sink
   is the typed `unsupported` naming the missing sink. `Port` here is the bare port (no registry) in
   the no-sink case, which is exactly the driver-driven-outside-a-port shape.
+- **The `{active, …}` input channel** is pinned structurally in `active_input_tests.rs` — a sibling
+  `#[path]` module of `port.rs` (10 tests, no `erl` needed): a hook driver stages a delivery from each
+  of the nine interaction points and all nine reach `Port::take_active_inputs` exactly once, in call
+  order, each stamped with the port's own id; a `Passive` event crosses unchanged; an empty payload is
+  still a delivery; `deliver_active_input` stamps its own port, never merges two calls, answers the
+  typed `unsupported` with no sink and refuses after a latched failure; `execute_port_tasks` reports
+  what a round staged; two ports drain in port-number order and a second drain is empty; a delivery
+  staged before/during `close` is reported once afterwards while the number waits for the `Closed`
+  report; and one test is a **coherence** pin — `PortNotification` still has exactly two variants (a
+  two-arm `match` with no wildcard).
 - **The static-driver set** is pinned in `driver.rs` both ways (each of the three constructs through
   `create_static_spawn` and reports its own `Driver::name()`; `fd`/`efile` are `BadArg` there while
   still constructing through `with_builtins()`; `STATIC_SPAWN_DRIVERS` is sorted and agrees with
@@ -223,13 +261,14 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` regular-file fallback), `Token`, `Interest`, `Ready`, `Event`, `Waker`
-- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`), the completion stage (`completions` + `take_completions`), and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`
-- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`, `take_completions` + the `closed_completions` harvest)
+- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`), the completion stage (`completions` + `take_completions`), the `{active,…}` stage (`active_inputs` + `take_active_inputs`), and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`
+- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`, `take_completions` + the `closed_completions` harvest, `take_active_inputs` + the `closed_active` harvest)
 - `completion.rs` → the driver→owner completion side channel: `CompletionEvent` (`InetReply { caller_ref: Option<Vec<u8>>, reply }` / `InetAsync { id, result }`), `InetReply` (`Ok`/`Error(InetReason)`), `InetAsyncResult` (`Ok`/`Data`/`Port`/`Error`), `InetReason` (`Closed`/`Timeout`/`Errno` + `from_errno`/`atom_name`) and the port-stamped `PortCompletion { port, event }`
+- `active_input_tests.rs` → the `{active,…}` channel's structural suite (10 tests), a `#[path]` test module of `port.rs`
 - `completion_tests.rs` → the channel's structural suite (11 tests), a `#[path]` test module of `completion.rs`: all nine interaction points, the timer-only route, both round drivers, port-number ordering, the close harvest, exactly-once, and the no-sink `unsupported`
 - `driver_output2.rs` (`../tests/`) → the split-read pin over a real `PortRegistry`/`Poller`: one `Data` per call, header/body exact, `Some(vec![])` vs `None`, `input_len` = `hlen+len`, no re-report on a second round
 - `registry_reply_tests.rs` → the write-path pin: the reply round trip (`port_command` ⇒ one `Data`) and the refused-command propagation (`Err(BadArg)` out of `execute_port_tasks`), a `#[path]` test module of `registry.rs`
-- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `PortTaskOutcome`
+- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `ActiveInput`/`ActiveInputEvent` (the separate `{active,…}` channel), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`
 - `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async`/`take_exit_status`/`take_eof`), `DriverContext` (incl. the read sink: `with_reads` + `deliver_read(header, body)`, and the completion sink: `with_completions` + `deliver_completion(event)` — which stamps `ctx.port()` itself and answers a typed `unsupported` with no sink), `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors

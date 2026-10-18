@@ -53,6 +53,9 @@
 //!   `udp_inet` driver through `erl` (`open_port({spawn_driver, "udp_inet"}, [binary])` +
 //!   `port_control`, as `prim_inet.erl:103` does) and the reply bytes are compared. Only the
 //!   `bind` reply is shape-compared — the two runs bind *different* ephemeral ports.
+//! * `an_explicit_bind_port_whose_low_byte_is_the_old_delimiter_agrees_byte_exactly` — the dump
+//!   **framing** regression: both sides bind the *same* explicit port, so the `bind` reply's
+//!   `[1, hi, lo]` is compared byte-exactly, low byte `0x7C` (`|`) included.
 //! * `recv` (the crate-local verb, `../src/drivers/inet/udp.rs`) reads a datagram **now** and
 //!   reports its source on the same reply: `[1] ++ src_address` with a datagram pending, the bare
 //!   `[1]` when none is.
@@ -853,6 +856,76 @@ fn the_covered_control_replies_agree_with_the_erl_oracle() {
         "an unserved `setopts` code"
     );
     assert_eq!(oracle[11], vec![INET_REP_OK], "INET_REQ_CLOSE replies ok");
+}
+
+/// The dump **framing** regression, end to end: both sides bind the **same** explicit port, whose
+/// low byte is `0x7C` (`|`) — the delimiter this suite's dump used to be split on. So both answer
+/// `[INET_REP_OK, hi, 0x7C]`, and the payload byte a delimiter split silently truncated (leaving a
+/// two-byte `bind` reply) is compared **byte-exactly**.
+///
+/// A candidate the host has taken — or that gets taken between the two runs — **moves to the next
+/// one**: an allocation retry only, never an assertion retry. When every candidate is in use, or
+/// `erl` is absent, the check **skips loudly**.
+#[test]
+fn an_explicit_bind_port_whose_low_byte_is_the_old_delimiter_agrees_byte_exactly() {
+    // Explicit loopback ports whose low byte is the old dump's delimiter and whose high byte is
+    // not — all above 1024 and below the kernel's ephemeral range (32768 on Linux).
+    const CANDIDATES: [u16; 4] = [0x7D7C, 0x7E7C, 0x3F7C, 0x2C7C];
+    let mut refusal = "no candidate port was tried";
+    for port in CANDIDATES {
+        let [hi, lo] = port.to_be_bytes();
+        assert_eq!(lo, 0x7C, "every candidate's low byte is the old delimiter");
+        // ---- the Rust side: `open`, bind the explicit port, `close` — the numeric route, which
+        // is what `erlang:port_control/3` sends ----
+        let mut poller = poller();
+        let (mut ports, id) = udp_port(&mut poller);
+        let opened = control_code(&mut ports, &mut poller, id, INET_REQ_OPEN, &open_arg());
+        let bound = control_code(&mut ports, &mut poller, id, INET_REQ_BIND, &loopback_arg(port));
+        let closed = control(&mut ports, &mut poller, id, "close", b"");
+        ports.close(&mut poller, id).expect("closes the port");
+        if bound.first() != Some(&INET_REP_OK) {
+            eprintln!("note: candidate port {port} is taken here ({bound:02x?}) — next candidate");
+            refusal = "every candidate port is bound on this host";
+            continue;
+        }
+        // The port is released again, so the oracle can bind the very same one.
+        let calls = vec![
+            (INET_REQ_OPEN, open_arg().to_vec()),
+            (INET_REQ_BIND, loopback_arg(port)),
+            (INET_REQ_CLOSE, vec![]),
+        ];
+        let Some(dump) = erl_stdout(&oracle_expression(&calls)) else {
+            eprintln!("SKIP: no `erl` on PATH — skipping the 0x7C bind-reply framing check");
+            return;
+        };
+        let Some(oracle) = parse_reply_dump(&dump) else {
+            panic!("could not parse the oracle reply dump: {dump:02x?}");
+        };
+        assert_eq!(oracle.len(), calls.len(), "one reply per call: dump={dump:02x?}");
+        if oracle[1].first() != Some(&INET_REP_OK) {
+            eprintln!("note: the oracle could not bind {port} ({:02x?}) — next", oracle[1]);
+            refusal = "every candidate port was bound by the oracle run";
+            continue;
+        }
+        // The framed dump keeps the delimiter byte as payload, so the reply is byte-exact...
+        assert_eq!(
+            bound, oracle[1],
+            "the explicit bind replies disagree for port {port} (0x{hi:02X}0x{lo:02X}): \
+             rust(bind)={bound:02x?} oracle(bind)={:02x?} dump={dump:02x?}",
+            oracle[1],
+        );
+        // ... and its shape is pinned too, so the row is stronger than a length check.
+        assert_eq!(bound, vec![INET_REP_OK, hi, lo], "the reply is `[1, hi, lo]`: {bound:02x?}");
+        assert_eq!(
+            u16::from_be_bytes([bound[1], bound[2]]),
+            port,
+            "the reply names the requested port: {bound:02x?}",
+        );
+        assert_eq!(opened, oracle[0], "the open replies: {opened:02x?} / {:02x?}", oracle[0]);
+        assert_eq!(closed, oracle[2], "the close replies: {closed:02x?} / {:02x?}", oracle[2]);
+        return;
+    }
+    eprintln!("SKIP: {refusal} — the 0x7C bind-reply framing check did not run");
 }
 
 /// The code-60 oracle: the async receive ladder and one completed receive, measured on a real raw

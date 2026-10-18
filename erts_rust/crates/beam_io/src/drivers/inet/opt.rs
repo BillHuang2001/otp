@@ -499,6 +499,30 @@ pub(super) fn set_options(
     fd: Option<RawFd>,
     arg: &[u8],
 ) -> Result<Vec<u8>> {
+    let mut ignored = false;
+    set_options_tracked(options, scope, fd, arg, &mut ignored)
+}
+
+/// [`set_options`], additionally reporting whether an `{active, N}` record drove the counter to
+/// **zero** — the one condition under which `inet_set_opts` emits `{tcp_passive,S}`/
+/// `{udp_passive,S}` itself (`inet_drv.c:6995`-`:6998`), from the option walk and never from a
+/// delivery.
+///
+/// Nothing else produces that message: `{active, false}` zeroes the counter silently (`:6999`) and
+/// `{active, once}`'s flip happens per delivered packet, not here. The walk is the **only** place
+/// that knows which record the request carried — the record lengths are code-dependent, so a
+/// caller cannot re-walk the payload on its own — which is why the fact is reported out of it.
+///
+/// `landed_at_zero` is set, never cleared, so a request carrying several `{active, …}` records
+/// reports every one that landed on zero, exactly as the C emits the message inside the walk
+/// (a later record that re-arms the port does not retract it).
+pub(super) fn set_options_tracked(
+    options: &mut SocketOptions,
+    scope: impl Into<OptScope>,
+    fd: Option<RawFd>,
+    arg: &[u8],
+    landed_at_zero: &mut bool,
+) -> Result<Vec<u8>> {
     let scope = scope.into();
     // The C's `while (len >= 5)` (`inet_set_opts`, `inet_drv.c:6908`): a trailing partial record
     // is the remainder and is ignored.
@@ -515,10 +539,21 @@ pub(super) fn set_options(
             Step::Refused
         };
         match step {
+            // A refused record is the C's `return -1`, which precedes the passive-message block
+            // (`:6985`), so it can never land the counter on zero.
             Step::Refused => return Ok(ctl_xerror("einval")),
             // `get` is total over the served codes, so a wrong count can only mean a bug here;
             // draining the cursor is the safe answer rather than a panic.
-            Step::Done(consumed) => rest = rest.get(consumed..).unwrap_or(&[]),
+            Step::Done(consumed) => {
+                if code == INET_LOPT_ACTIVE && value == INET_MULTI && options.active == INET_PASSIVE
+                {
+                    // The multi arm's `active_count == 0` ⇒ passive + `packet_passive_message`
+                    // (`:6993`-`:6998`). `{active,false}`/`{active,true}` cannot reach this: they
+                    // zero the counter without ever making `active` `INET_MULTI`.
+                    *landed_at_zero = true;
+                }
+                rest = rest.get(consumed..).unwrap_or(&[]);
+            }
         }
     }
     Ok(ctl_ok())

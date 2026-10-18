@@ -482,6 +482,10 @@ fn oracle_expression() -> String {
 }
 
 /// Parses the oracle's `a,b,c|d,e|…` reply dump into one byte vector per reply.
+///
+/// The `|` delimiter cannot collide with a reply: `S/1` re-encodes every reply as decimal-ASCII
+/// byte texts, so a literal `0x7C` never reaches the dump (the `udp_inet` suite's raw-byte dump
+/// is length-framed instead — `udp_inet.rs::parse_reply_dump`).
 fn parse_reply_dump(stdout: &str) -> Option<Vec<Vec<u8>>> {
     let line = stdout.lines().find(|line| line.contains('|'))?;
     let mut replies = Vec::new();

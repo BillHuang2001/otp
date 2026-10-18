@@ -41,8 +41,12 @@
 //! * [`PortNotification`] / [`PortTaskOutcome`] — what an execution round reports back to
 //!   the runtime. This is the seam the runtime turns into `{Port, {data, Data}}` messages, and
 //!   [`PortNotification::Data`] carries a whole [`ReadMessage`] so the C's `driver_output2`
-//!   header/body split survives up to the term the runtime builds.
-//!
+//!   header/body split survives up to the term the runtime builds;
+//! * [`ActiveInput`] / [`ActiveInputEvent`] — the **`{active, …}` input** channel, a separate
+//!   struct with its own drain ([`crate::PortRegistry::take_active_inputs`]) exactly like
+//!   [`LineNotification`]: an active-mode socket's incoming message is a message to the *owner*
+//!   (`{tcp, S, Data}` / `{udp_passive, S}` / …), never `{Port, {data, …}}`, so it does not ride
+//!   [`PortNotification`] and that enum keeps its two variants.//!
 //! # Reductions
 //!
 //! Running a task costs reductions, with the C's per-kind constants:
@@ -497,13 +501,13 @@ impl ReadMessage {
 /// read is a real notification: the oracle's `{Port, {data, []}}`.
 ///
 /// A `{line, N}` port's input does **not** ride this enum: it is reported on the separate
-/// [`LineNotification`] channel (see there), so this enum keeps exactly its two variants and
-/// an exhaustive consumer keeps compiling unchanged.
+/// [`LineNotification`] channel (see there), and an `{active, …}` socket's incoming message on
+/// the separate [`ActiveInput`] channel — neither is `{Port, {data, …}}` — so this enum keeps
+/// exactly its two variants and an exhaustive consumer keeps compiling unchanged.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PortNotification {
     /// The port's driver read `read`, which belongs to the port's owner.
-    Data {
-        /// The port that produced the bytes.
+    Data {        /// The port that produced the bytes.
         port: PortId,
         /// The call's bytes, split exactly as the driver handed them up (see [`ReadMessage`]
         /// for the shapes, including the empty one).
@@ -552,6 +556,64 @@ pub struct LineNotification {
     /// `false` the `noeol` one (a length-limited chunk, or the partial line flushed at
     /// end-of-file).
     pub eol: bool,
+}
+/// One `{active, …}` delivery from a socket driver's read-readiness callback.
+///
+/// This is the channel an `{active, true}` / `{active, N}` / `{active, once}` socket reports
+/// **incoming input** on. It is deliberately a **separate struct with its own registry drain**
+/// ([`crate::PortRegistry::take_active_inputs`]), exactly like [`LineNotification`] and
+/// [`crate::PortCompletion`]: an active-mode delivery is
+///
+/// * **not** `{Port, {data, …}}` — the C sends a *message to the owner*
+///   (`tcp_message`, `erts/emulator/drivers/common/inet_drv.c:3979`), so it must never ride
+///   [`PortNotification`], which keeps exactly its two variants for its exhaustive consumers;
+/// * **not** a completion — it is inbound data and an active-mode counter transition, not the
+///   answer to something the owner asked for ([`crate::CompletionEvent`] gains no variant).
+///
+/// A raw-mode (`{active, false}`, the default) socket reports nothing here: its bytes wait in
+/// the port's input queue for the owner's next read, which is the
+/// [`PortNotification::Data`] path. The message is stamped with the port by the port itself
+/// ([`DriverContext::deliver_active_input`](crate::DriverContext::deliver_active_input)), so a
+/// driver cannot attribute a delivery to another port.
+///
+/// The two things a delivered [`ActiveInput`] can be are [`ActiveInputEvent`]'s.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ActiveInput {
+    /// The port that produced the delivery.
+    pub port: PortId,
+    /// What the socket driver reported.
+    pub event: ActiveInputEvent,
+}
+/// The two things an `{active, …}` socket reports on [`ActiveInput`].
+///
+/// Honest scoping: this vocabulary stops at the *term-free* shape. Which message an event
+/// becomes depends on the driving port's driver name (`tcp_inet` vs `udp_inet`), which the
+/// runtime owns.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ActiveInputEvent {
+    /// `{tcp, S, Data}` / `{udp, S, IP, Port, Data}`: one delivered input.
+    ///
+    /// `read.header` is the bytes the runtime renders *before* the payload — the `{packet, N}`
+    /// framing header for a stream port (empty for `{packet, 0}`), the 7-byte packed source
+    /// address for a datagram port (`wire::pack_address`) — and `read.body` the payload
+    /// (`None` = the C's `buf == NULL`).
+    ///
+    /// Two deliveries are **never merged** into one event (the C sends one message per
+    /// `driver_output*`-shaped delivery: `tcp_message` at `inet_drv.c:3979`,
+    /// `packet_binary_message` at `:4110`), and an event is **never** additionally reported as a
+    /// [`PortNotification::Data`] — an active-mode socket's bytes do not also sit in the port's
+    /// input queue. A delivery whose payload is empty is still a **real** delivery: a zero-length
+    /// `{packet, 0}` read or an empty datagram is the oracle's `{tcp, S, <<>>}` /
+    /// `{udp, S, IP, Port, <<>>}`.
+    Data(ReadMessage),
+    /// `{tcp_passive, S}` / `{udp_passive, S}`: an `{active, N}` counter reached zero. The C's
+    /// `packet_passive_message` (`erts/emulator/drivers/common/inet_drv.c:4215`).
+    ///
+    /// This carries **no** atom: which pair the runtime renders is resolved from the driving
+    /// port's driver name (`tcp_inet` ⇒ `{tcp_passive, S}`, `udp_inet` ⇒ `{udp_passive, S}`), so
+    /// the channel stays term-free and a driver cannot spell a message name this layer would have
+    /// to validate.
+    Passive,
 }
 /// What one [`crate::PortRegistry::execute_port_tasks`] round did.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]

@@ -1000,6 +1000,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Parses the escript's `op rendering` lines into `op -> rendering`.
+///
+/// The space separator cannot collide with a field: the rendering is lowercase hex (`hex/1`), an
+/// `atom_to_list` name or a decimal integer, so no raw reply byte — `0x20` included — reaches the
+/// dump.
 fn parse_oracle_rows(stdout: &str) -> Vec<(u8, String)> {
     stdout
         .lines()

@@ -1471,6 +1471,12 @@ impl TcpInetDriver {
     ///
     /// Never for a served option (a rejected `setsockopt(2)` is not propagated, as in the C);
     /// `BeamError::BadArg` for a truncated `{active, N}` record.
+    ///
+    /// This is the **ctx-free** half of the request: the port's two wire forms go through
+    /// [`TcpInetDriver::setopts_with_delivery`], which is this walk plus the tail of
+    /// `inet_set_opts` (the passive message and the inline read). Kept as the reference the
+    /// suite pins that tail against, byte for byte.
+    #[allow(dead_code)]
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
         let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_TCP);
         set_options(&mut self.options, scope, self.socket, arg)
@@ -1546,7 +1552,10 @@ impl TcpInetDriver {
                 }
                 self.verb_bind(arg)
             }
-            Opcode::Setopts => self.verb_setopts(arg),
+            // `INET_REQ_SETOPTS` (`:11127`-`:11150`): the reply comes from `inet_set_opts`, whose
+            // own tail may arm read readiness and, for `{active, once}`/`{active, N}`, trigger an
+            // **inline** read (`sres == 2`). Both side effects are `setopts_with_delivery`'s.
+            Opcode::Setopts => self.setopts_with_delivery(ctx, arg),
             Opcode::Getopts => self.verb_getopts(arg),
             // `INET_REQ_LISTEN` (`:12042`): the state guard comes first, the operand length last.
             Opcode::Listen => {
@@ -1833,13 +1842,27 @@ impl Driver for TcpInetDriver {
     }
 
     fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        // A listener serves its queued `accept` operations here; a connection completes its
-        // pending `recv` — the C's `tcp_inet_input`/`tcp_inet_accept` dispatch
-        // ([`TcpInetDriver::async_ready_input`]). Without a queued operation the bytes take the
-        // passive path into the port input queue.
-        self.async_ready_input(ctx)
+        // One readiness event, **one** reading of it — the C's `tcp_inet_input` dispatch
+        // (`inet_drv.c:13461`), which is on the descriptor's state and not on its mode: a
+        // listener takes the accept ladder (`:13469`/`:13529`), and a connected socket gets
+        // exactly one `tcp_recv(desc, 0)` (`:13598`-`:13600`) whose delivery then splits on
+        // `desc->inet.active` — passive ⇒ `inet_async_data` onto the port input queue
+        // (`tcp_reply_data`, `:4294`-`:4295`), otherwise `tcp_message` to the owner (`:4296`-
+        // `:4297`). So an `{active, …}` connection delivers through the **active-input channel**
+        // (one `{tcp, S, Data}` per delivered unit, never the port input queue) and never through
+        // both:
+        //
+        // * [`TcpInetDriver::owns_readiness_for_active`] is the C's connected-and-active arm —
+        //   [`TcpInetDriver::active_delivery`] owns the socket's read;
+        // * everything else (a listener's queued `accept`, a queued `TCP_REQ_RECV`, or a passive
+        //   connection's bytes into the port input queue) stays with
+        //   [`TcpInetDriver::async_ready_input`].
+        if self.owns_readiness_for_active() {
+            self.active_delivery(ctx)
+        } else {
+            self.async_ready_input(ctx)
+        }
     }
-
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if self.state == InetState::Connecting {
             self.finish_connect(ctx)?;
@@ -1891,7 +1914,7 @@ impl Driver for TcpInetDriver {
             "recv" => self.verb_recv(ctx, arg),
             "shutdown" => self.verb_shutdown(ctx, arg),
             "close" => self.verb_close(ctx),
-            "setopts" => self.verb_setopts(arg),
+            "setopts" => self.setopts_with_delivery(ctx, arg),
             "getopts" => self.verb_getopts(arg),
             _ => Err(error::badarg()),
         }
@@ -1926,6 +1949,13 @@ pub fn make_tcp_inet() -> Result<Box<dyn Driver>> {
     Ok(Box::new(TcpInetDriver::new()))
 }
 
+// The `{active, true|once|N}` delivery path — the C's `tcp_deliver`/`tcp_recv`
+// (`inet_drv.c:13045`-`:13260`) that sends the owner a `{tcp, S, Data}` message instead of
+// filling the port input queue.
+mod active;
+
+#[cfg(test)]
+mod active_tests;
 #[cfg(test)]
 mod accept_tests;
 #[cfg(test)]
@@ -1944,3 +1974,9 @@ mod opcode_tests_udp;
 mod stat_tests;
 #[cfg(test)]
 mod tests;
+
+/// The **length-framed** wire format the `erl`-oracle dumps use (a 4-byte big-endian byte count
+/// per reply) — the Rust half of the framing the suites' oracle expressions write, so the two
+/// halves state the format in one place.
+#[cfg(test)]
+mod oracle_dump;

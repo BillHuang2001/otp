@@ -159,7 +159,7 @@ use crate::error;
 use crate::poller::{Interest, Token};
 
 use super::adopt_probe::adoption_reply;
-use super::opt::{get_options, set_options, OptScope, SocketOptions};
+use super::opt::{get_options, OptScope, SocketOptions};
 use super::opcode::{decode as decode_opcode, Opcode};
 use super::sys::{
     bind_socket, close_fd, connect_socket, dgram_socket_fd, has_peer, hostname, local_port,
@@ -178,6 +178,9 @@ use super::InetState;
 /// reuses is driver-agnostic; `async` is a reserved word, hence the module rename.
 #[path = "udp/async.rs"]
 mod op_queue;
+/// The driver's **`{active, …}`** half — the datagram-delivery burst and the `{active, N}`
+/// state machine behind the [`crate::port_task::ActiveInput`] channel.
+mod active;
 /// The driver's registered name — the C `udp_inet` entry (`inet_drv.c:1406`), which is also what
 /// the oracle reports from `port_info(Port, name)` for a `gen_udp:open/1` socket.
 pub const UDP_DRIVER_NAME: &str = "udp_inet";
@@ -954,28 +957,9 @@ pub struct UdpInetDriver {
         Ok(ctl_ok())
     }
 
-    /// The `setopts` verb: applies the C's `INET_REQ_SETOPTS` option records.
-    ///
-    /// The shared [`super::opt`] store is driven with this port's **cached** socket type
-    /// ([`UdpInetDriver::stype`]), exactly as the C reads `desc->stype` — so the datagram-gated
-    /// code `{read_packets, N}` is served once `open` has cached `SOCK_DGRAM` and ignored before
-    /// that, while the ungated codes (`{mode, …}`/`{deliver, …}` and the stream-gated
-    /// `send_timeout` pair) behave the same as on `tcp_inet`. The UDP-relevant syscall codes
-    /// (`reuseaddr`/`keepalive`/`broadcast`/`sndbuf`/`recbuf`/`ttl`) are served and the rest
-    /// answer the C's `[0] ++ "einval"`.
-    ///
-    /// # Errors
-    ///
-    /// `BeamError::BadArg` for a truncated `{active, N}` record (never for a served option — a
-    /// rejected `setsockopt(2)` is not propagated, mirroring the C's `propagate = 0`).
-    fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_UDP);
-        set_options(&mut self.options, scope, self.socket, arg)
-    }
-
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
     ///
-    /// Driven with the same cached socket type as [`UdpInetDriver::verb_setopts`], so
+    /// Driven with the same cached socket type as the `setopts` verb, so
     /// `{read_packets, N}` is reported by a port that has opened a datagram socket — including
     /// after a `close`, which never clears `desc->stype` — and contributes no record before
     /// that. A code the store does not serve is the C's whole-reply `[0] ++ "einval"`.
@@ -1080,7 +1064,7 @@ pub struct UdpInetDriver {
                     Err(name) => Ok(ctl_xerror(name)),
                 }
             }
-            Opcode::Setopts => self.verb_setopts(arg),
+            Opcode::Setopts => self.setopts_with_effects(ctx, arg),
             Opcode::Getopts => self.verb_getopts(arg),
             Opcode::Close => self.verb_close(ctx),
             // `packet_inet_ctl`'s `INET_REQ_CONNECT` (`:14712`) guards in this order: `!IS_OPEN ⇒
@@ -1389,14 +1373,15 @@ impl Driver for UdpInetDriver {
     }
 
     fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        // With an asynchronous receive queued this is its completion point. With **none** queued
-        // it stays the passive no-op: a datagram's source address has no channel in this crate's
-        // `Driver`/`PortNotification` seam (the port input queue is byte-only and
-        // `PortNotification` keeps exactly its two variants for an outside crate to match
+        // A queued asynchronous receive (`PACKET_REQ_RECV`) is completed first and owns the socket.
+        self.async_ready_input(ctx)?;
+        // Then the `{active, …}` half: an armed port delivers the datagrams it finds to the
+        // owner through the active-input channel, and a passive one stays the floor it always
+        // was — a datagram's source address has no channel in this crate's byte-only input queue
+        // (`PortNotification` keeps exactly its two variants for an outside crate to match
         // exhaustively), so a passive port is served by the runtime issuing the `recv` verb.
-        self.async_ready_input(ctx)
+        self.active_delivery(ctx)
     }
-
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         self.write_command(ctx)
     }
@@ -1419,7 +1404,7 @@ impl Driver for UdpInetDriver {
             "send" => self.verb_send(arg),
             "recv" => self.verb_recv(ctx, arg),
             "close" => self.verb_close(ctx),
-            "setopts" => self.verb_setopts(arg),
+            "setopts" => self.setopts_with_effects(ctx, arg),
             "getopts" => self.verb_getopts(arg),
             _ => Err(error::badarg()),
         }
@@ -1515,3 +1500,6 @@ mod udp_tests;
 
 #[cfg(test)]
 mod async_tests;
+
+#[cfg(test)]
+mod active_tests;

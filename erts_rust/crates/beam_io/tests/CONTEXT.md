@@ -82,10 +82,16 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
+<<<<<<< .merge_file_g5iYoV
 bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **229
 passing / 0 failing** (no `#[ignore]`d case anywhere in `tests/`); the whole `-p beam_io` run is
 **989 passed / 2 ignored** (757 lib + 229 integration + 3 doctests passed; 2 doctests `ignore`d). Per
 file:
+=======
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **232
+passing / 0 failing**; the whole `-p beam_io` run is **1032** (797 lib + 232 integration + 3
+doctests, 2 doctests `ignore`d). Per file:
+>>>>>>> .merge_file_G0C2Wx
 
 | Suite | Tests | Suite | Tests |
 |---|---|---|---|
@@ -99,10 +105,32 @@ file:
 | `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 8 |
 | `abi_busy.rs` | 2 | `inet.rs` | 8 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
+<<<<<<< .merge_file_g5iYoV
 | `abi_failure.rs` | 11 | `udp_inet.rs` | 5 |
 | `port_task.rs` | 5 | `port.rs` | 4 |
 | `inet_accept.rs` | 7 | | |
+=======
+| `abi_failure.rs` | 11 | `active_mode.rs` | 9 |
+| `port_task.rs` | 5 | `udp_inet.rs` | 6 |
+| | | `port.rs` | 4 |
+>>>>>>> .merge_file_G0C2Wx
 
+`active_mode.rs` (9) is the **`{active, …}` input channel** through a real `PortRegistry` port and a
+real `Poller` round, with the traffic supplied by an **external** `std::net::UdpSocket`/
+`std::net::TcpStream` (never a second VM): ports open through `PortRegistry::open_named`, verbs go
+through the numeric `prim_inet` opcodes (`Op + 0x03f1a300`) — plus the named `accept` verb for the
+stream half — and every round is `poll` → `handle_events` → `execute_port_tasks` →
+`take_active_inputs`/`take_completions`. Rows: `{active,true}` UDP with the sender's seven-byte
+packed address as the read header and the payload as the body; `{active,false}` reporting nothing
+while `PACKET_REQ_RECV`(60) still completes with the same datagram (the passive-path regression
+pin, incl. its `[0]einval` operand guard); `{active,once}` delivering one datagram, silently, with
+no `Passive`; `{active,2}` delivering two datagrams then exactly one `Passive` and nothing more;
+passive→`{active,true}` delivering the already-buffered datagram (the re-arm's synthesized edge);
+`{active,true}` TCP delivering the peer's bytes with an **empty** header; `{packet,2}` TCP
+delivering the **stripped** body; two armed datagram ports reported in **port-number order** by one
+destructive drain; and the channel staying empty for a passive port and after a close. Waits are
+conditions (one bounded poll slice per round under a 10 s hang guard), never wall-clock budgets, and
+assertions are on content/sets, never on round counts.
 Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channel** end-to-end
 (`PortRegistry::take_completions` after every round, the recipe `beam_rt` follows):
 
@@ -118,7 +146,7 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   `an_accept_completion_hands_over_a_descriptor_the_runtime_can_adopt` (the descriptor hand-off;
   `INET_REQ_FDOPEN` adoption is a crate-local route to the same state the C reaches internally) and
   `port_notifications_stay_exactly_two_variants` (the compile-time two-arm match).
-- **`udp_inet.rs` (5)** — `the_code_60_recv_is_an_async_request_completed_by_a_later_round` is the
+- **`udp_inet.rs` (6)** — `the_code_60_recv_is_an_async_request_completed_by_a_later_round` is the
   datagram half, byte-compared against a real raw `udp_inet` port on every run-specific-independent
   row: the `[1,0,0]` id reply with nothing staged, `[0]ealready` for a second concurrent receive
   (which still consumes an id, so the next request is `[1,0,2]`), `[0]exbadport` socket-less,
@@ -127,9 +155,16 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   address prefix is shape-compared, each side checking its own sender's port), and `{error, closed}`
   exactly once for a receive pending at close. The file's other oracle case
   (`the_covered_control_replies_agree_with_the_erl_oracle`) is the open/bind/setopts/getopts/close
-  gate.
+  gate. `an_explicit_bind_port_whose_low_byte_is_the_old_delimiter_agrees_byte_exactly` is the
+  **dump-framing** row: both sides bind the **same** explicit port, low byte `0x7C` (`|`), so the
+  `bind` reply `[1, hi, 0x7C]` is compared byte-exactly; the candidate-port loop retries
+  allocation only.
+  **Framing rule for every oracle dump in `tests/`:** a raw-byte dump is **length-framed**
+  (`<<(byte_size(X)):32/big, X/binary>>` + `parse_reply_dump`, as here and in
+  `src/drivers/inet/oracle_dump.rs`) or its replies are re-encoded as ASCII decimal/hex text first —
+  never raw bytes split on a delimiter (any byte, `0x7C` included, is legitimate payload).
 
-**`abi_failure.rs` (8)** is the one suite that pins the **`driver_output*` shapes and the
+**`abi_failure.rs` (11)** is the one suite that pins the **`driver_output*` shapes and the
 driver-failure channel** over the scripted-opcode fixture (`output_shape_driver.c`) rather than
 `host_driver.c`: one port per row (the failure rows close their own port, so a shared port would
 answer `badarg` on the next command), one `port_command` = one scripted C call site, and the round
@@ -173,7 +208,8 @@ rot.
   real `PortRegistry`: one driver call = one `ReadMessage { header, body }` notification, the empty
   header vs `body: None` distinction, two calls in one callback = two messages in arrival order,
   `input_len` counting the header, the `{line, N}` frame header stamp, and the flat
-  `DriverContext::input()` view- `abi_busy.rs` → the `set_busy_port` state half (the raw API-table hook + the fixture's `busy`
+  `DriverContext::input()` view
+- `abi_busy.rs` → the `set_busy_port` state half (the raw API-table hook + the fixture's `busy`
   token and verbs 25/26)
 - `abi_async.rs`, `abi_vector.rs`, `abi_lifecycle.rs`, `abi_start_failure.rs` → the `driver_async`
   completion arms, the `outputv`-only entry, the port-exit adapter, a failing `start`
@@ -210,7 +246,15 @@ rot.
   `erl`-oracle cross-check over the reply bytes that skips loudly without `erl`. `udp_inet` also
   pins the **`PACKET_REQ_RECV`(60) asynchronous** receive (id reply, `ealready`/`exbadport`/`einval`
   ladder, the `Data` completion with the packed source address as the read's header, the
-  `{error, closed}` teardown) against the real datagram driver
+  `{error, closed}` teardown) against the real datagram driver, and the **length-framed dump** with
+  an explicit low-byte-`0x7C` bind compared byte-exactly
+- `active_mode.rs` → the **`{active, …}` input channel** (`ActiveInput`/`ActiveInputEvent`) at the
+  reactor + registry level, armed through `setopts` and fed by an external `std::net` peer:
+  `{active,true}`/`{active,once}`/`{active,2}` on `udp_inet` (packed source-address header, the one
+  `Passive` of a spent counter, the silent `once` flip), the passive floor + its `PACKET_REQ_RECV`(60)
+  regression pin, the passive→active re-arm, `tcp_inet` `{active,true}` and `{packet,2}` (empty header,
+  stripped body), two-port port-number ordering with a destructive drain, and the empty channel for a
+  passive port and after a close
 - `signal.rs`, `cpu_time.rs`, `ddll.rs` → the OS-signal facility, the CPU-time facility, `dlopen`
 - `fixture_builds.rs` → builds + loads the `host_driver`-family fixtures (the base, the two
   `ready_async`/`process_exit` variants, the `vector` and `both` write-side shapes) plus the

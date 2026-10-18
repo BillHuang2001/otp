@@ -723,8 +723,15 @@ fn erl_stdout(expr: &str) -> Option<Vec<u8>> {
 }
 
 /// The `erl` expression driving an oracle `udp_inet` port: open the driver port, run `calls`
-/// (each `(request code, argument bytes)`) through `port_control`, and print the raw reply bytes
-/// joined by `|` so the caller can compare them byte for byte.
+/// (each `(request code, argument bytes)`) through `port_control`, and write every reply as raw
+/// bytes prefixed by its **big-endian length** (`oracle_dump::ERL_FRAME_ELEMENT`, spliced from
+/// there so the Erlang framing and its Rust parser state the format once).
+///
+/// The replies are **length-framed**, never delimiter-separated: a reply's payload can contain
+/// any byte — an ephemeral port, an errno name, a stored option value — so no single byte can
+/// separate two replies. A `|` (`0x7C`) separator used to lose exactly one `bind` reply in ~256
+/// runs, when the kernel assigned a port whose low byte was `0x7C`
+/// (`super::super::oracle_dump`).
 ///
 /// `standard_io` is switched to `latin1` first: with the default (`unicode`) encoding,
 /// `io:format("~s", …)` would UTF-8-encode any byte above `127` — and a `bind` reply carries the
@@ -732,30 +739,37 @@ fn erl_stdout(expr: &str) -> Option<Vec<u8>> {
 /// longer be the driver's raw reply bytes.
 fn oracle_expression(calls: &[(u32, Vec<u8>)]) -> String {
     let mut body = String::new();
-    for (code, arg) in calls {
+    for (index, (code, arg)) in calls.iter().enumerate() {
         let arg_list = arg
             .iter()
             .map(|b| b.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        body.push_str(&format!(
-            "erlang:port_control(P, {code} + {CONTROL_MAGIC}, <<{arg_list}>>) ++ \"|\" ++ "
-        ));
+        if index > 0 {
+            body.push_str(", ");
+        }
+        body.push_str(&format!("F({code}, <<{arg_list}>>)"));
     }
+    let frame_element = super::super::oracle_dump::ERL_FRAME_ELEMENT;
     format!(
-        "P = open_port({{spawn_driver, \"udp_inet\"}}, [binary]), \
+        "M = {CONTROL_MAGIC}, \
+         P = open_port({{spawn_driver, \"udp_inet\"}}, [binary]), \
+         F = fun(C, A) -> iolist_to_binary(erlang:port_control(P, C + M, A)) end, \
+         R = [{body}], \
          io:setopts(standard_io, [{{encoding, latin1}}]), \
-         io:format(\"~s\", [{body}\"\"]), \
+         Out = iolist_to_binary([{frame_element} || X <- R]), \
+         io:format(\"~s\", [Out]), \
          erlang:port_close(P)"
     )
 }
 
-/// Splits the oracle's `A|B|C` raw-byte dump into the reply byte strings.
+/// Parses the oracle's `[len_be32][bytes]…` dump into the reply byte strings — a thin wrapper
+/// over [`super::super::oracle_dump::decode`], so the Erlang framing above and this parser state
+/// the wire format once. A dump that is not framed is a harness defect, not an empty answer.
 fn oracle_replies(dump: &[u8]) -> Vec<Vec<u8>> {
-    dump.split(|b| *b == b'|')
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_vec())
-        .collect()
+    super::super::oracle_dump::decode(dump).unwrap_or_else(|| {
+        panic!("the oracle dump is not length-framed (`[len_be32][bytes]…`): {dump:02x?}")
+    })
 }
 
 /// The **compatibility gate** for the datagram control verbs: the same `open`/`bind`/`close`
@@ -775,18 +789,70 @@ fn the_control_replies_agree_with_the_erl_oracle() {
         return;
     };
     let oracle = oracle_replies(&dump);
-    assert_eq!(oracle.len(), 3, "the oracle answered every call: {dump:?}");
+    // Every assertion below names which of the three calls it is about (`open` / `bind` /
+    // `close`) and prints both sides in **hex**: a reply carries bytes above `127` (an ephemeral
+    // port, an errno name), so a decimal rendering would be unreadable.
+    assert_eq!(
+        oracle.len(),
+        3,
+        "the oracle answered all three calls (open / bind / close): \
+         dump={dump:02x?}, parsed={oracle:02x?}",
+    );
 
     // The Rust side: the same calls, byte for byte (the bind reply's ephemeral port is the one
     // value that legitimately differs, so only its shape is compared).
     let mut rig = Rig::new();
     let opened = rig.control("open", &open_arg()).expect("open");
-    assert_eq!(opened, oracle[0], "open agrees with the oracle");
+    assert_eq!(
+        opened,
+        oracle[0],
+        "open reply disagrees: rust(open)={opened:02x?} oracle(open)={:02x?} dump={dump:02x?}",
+        oracle[0],
+    );
     let bound = rig.control("bind", &[INET_AF_ANY, 0, 0]).expect("bind");
-    assert_eq!(bound.len(), oracle[1].len(), "bind reply length agrees");
-    assert_eq!(bound[0], oracle[1][0], "bind result tag agrees");
+    assert_eq!(
+        bound.len(),
+        oracle[1].len(),
+        "bind reply length disagrees: rust(bind)={bound:02x?} oracle(bind)={:02x?} dump={dump:02x?}",
+        oracle[1],
+    );
+    assert_eq!(
+        bound[0],
+        oracle[1][0],
+        "bind result tag disagrees: rust(bind)={bound:02x?} oracle(bind)={:02x?} dump={dump:02x?}",
+        oracle[1],
+    );
+    // The ephemeral port itself legitimately differs between the two runs, so shape plus result
+    // tag is the strongest honest comparison — but the shape is still pinned exactly: a successful
+    // bind answers `[INET_REP_OK, port_hi, port_lo]`, a real (non-zero) big-endian port.
+    assert_eq!(
+        bound.len(),
+        3,
+        "the bind reply is `[INET_REP_OK, hi, lo]`: rust(bind)={bound:02x?} \
+         oracle(bind)={:02x?} dump={dump:02x?}",
+        oracle[1],
+    );
+    assert_eq!(
+        bound[0],
+        INET_REP_OK,
+        "the bind reply reports success: rust(bind)={bound:02x?} oracle(bind)={:02x?} \
+         dump={dump:02x?}",
+        oracle[1],
+    );
+    assert_ne!(
+        u16::from_be_bytes([bound[1], bound[2]]),
+        0,
+        "the bind reply names the kernel-assigned port: rust(bind)={bound:02x?} \
+         oracle(bind)={:02x?} dump={dump:02x?}",
+        oracle[1],
+    );
     let closed = rig.control("close", &[]).expect("close");
-    assert_eq!(closed, oracle[2], "close agrees with the oracle");
+    assert_eq!(
+        closed,
+        oracle[2],
+        "close reply disagrees: rust(close)={closed:02x?} oracle(close)={:02x?} dump={dump:02x?}",
+        oracle[2],
+    );
 }
 
 /// The Rust side of an oracle comparison driven the way the runtime drives it: a **real**
@@ -888,13 +954,19 @@ fn the_mode_deliver_and_read_packets_rows_agree_with_the_erl_oracle() {
         return;
     };
     let oracle = oracle_replies(&dump);
-    assert_eq!(oracle.len(), calls.len(), "the oracle answered every call: {dump:?}");
+    assert_eq!(
+        oracle.len(),
+        calls.len(),
+        "the oracle answered every call ({} expected): dump={dump:02x?}, parsed={oracle:02x?}",
+        calls.len(),
+    );
     for (index, ((code, arg), (rust_reply, oracle_reply))) in
         calls.iter().zip(rust.iter().zip(oracle.iter())).enumerate()
     {
         assert_eq!(
             rust_reply, oracle_reply,
-            "reply {index} (request code {code}, argument {arg:?}) disagrees",
+            "reply {index} (request code {code}, argument {arg:02x?}) disagrees: \
+             rust={rust_reply:02x?} oracle={oracle_reply:02x?} dump={dump:02x?}",
         );
     }
 }
@@ -1544,3 +1616,10 @@ fn the_queued_command_delivery_agrees_with_the_erl_oracle() {
         "the payload alone is counted"
     );
 }
+
+/// The oracle dump's **framing** suite — an explicit `bind` port whose low byte is the byte an
+/// unframed dump used to delimit on, and an ephemeral bind's shape — lives in this sibling file
+/// so this 1500-line suite does not grow a second undeclared case set.
+#[cfg(test)]
+#[path = "oracle_dump_tests.rs"]
+mod oracle_dump_tests;
