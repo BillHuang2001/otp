@@ -217,7 +217,7 @@ The node's newer suites are `#[path]` submodules of `tests.rs` (so they keep `te
 **A test-only static + dynamic deopt census** ranks which `beam_loader::Instr` opcodes the
 tier still fails to lower — the evidence a widening of the inline set is chosen from
 (no production cost: both modules are `#[cfg(test)]`, and every call site is individually
-`#[cfg(test)]`-gated). Three independent views:
+`#[cfg(test)]`-gated). Four independent views:
 - **Static** (`census.rs::the_static_deopt_census_over_the_corpus_is_printed`): scores the
   **compile-time** dispatch decision deterministically. `counters.rs::record_instr_instance`
   (the emitter loop's top, `emit/block.rs`) counts every instruction the lowering dispatch
