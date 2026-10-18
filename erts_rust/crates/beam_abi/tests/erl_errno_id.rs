@@ -265,8 +265,8 @@ fn a_real_c_driver_sees_the_posix_name_from_this_crates_erl_errno_id() {
     // The same answers, reached in-crate (no `.so` in the way), so the fixture's route and the direct
     // call cannot drift apart.
     for (error, expected) in CASES {
-        // SAFETY: `erl_errno_id` accepts any `int` and answers a NUL-terminated string valid until
-        // the next call on this thread.
+        // SAFETY: `erl_errno_id` accepts any `int` and answers a NUL-terminated string that stays
+        // valid and unchanged for the rest of the process's lifetime (permanent storage).
         let p = unsafe { beam_abi::driver::drv::erl_errno_id(error) };
         assert!(!p.is_null());
         // SAFETY: non-null and NUL-terminated (the documented contract); read immediately.

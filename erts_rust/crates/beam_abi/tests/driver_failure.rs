@@ -297,11 +297,11 @@ fn link_the_families() {
 
 /// The `erl_errno_id` answer for `errno`, as an owned string.
 ///
-/// Read immediately: the answer is NUL-terminated and valid only until the next `erl_errno_id` call
-/// on this thread (`src/driver/drv/mem.rs`).
+/// The answer is NUL-terminated and permanently stored (`src/driver/drv/mem/errno.rs`), so a caller
+/// may keep several answers and read them later; this helper copies it out anyway.
 fn errno_name(errno: c_int) -> String {
-    // SAFETY: `erl_errno_id` accepts any `c_int` and answers a non-null, NUL-terminated string
-    // valid until the next call on this thread.
+    // SAFETY: `erl_errno_id` accepts any `c_int` and answers a non-null, NUL-terminated string that
+    // stays valid for the rest of the process's lifetime (permanent storage).
     let p = unsafe { beam_abi::driver::drv::erl_errno_id(errno) };
     assert!(!p.is_null(), "erl_errno_id always answers a string");
     // SAFETY: non-null and NUL-terminated (the documented contract); read immediately.
