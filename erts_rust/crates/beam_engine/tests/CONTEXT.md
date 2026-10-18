@@ -27,7 +27,7 @@ never touched from here.
 - Failures are typed `beam_common::BeamError` values; never `unwrap()` engine runtime data;
   a harness-only invariant may panic with a message.
 - Every `.rs` carries the OTP Apache-2.0 `// %CopyrightBegin% … // %CopyrightEnd%` header block;
-  files target ~1000 lines. Eighteen suites are above that target, each one cohesive harness rather
+  files target ~1000 lines. Seventeen suites are above that target, each one cohesive harness rather
   than a mix of subjects (splitting any of them is a parity-neutral refactor): `jit_cranelift.rs`
   (4298), `opcodes.rs` (2761), `jit.rs` (2701), `exceptions.rs` (1523), `engine_bench.rs` (1482),
   `census.rs` (1462), `dynamic_census.rs` (1415), `jit_cranelift_real.rs` (1423),
@@ -37,6 +37,11 @@ never touched from here.
   (1002). `raise_rooting.rs`'s cohesion is spelled out in the routing table below; `census.rs`'s
   is the hand-maintained exhaustive `Instr`/`TestKind` rosters, which only make the "108 rows / 108
   distinct names" completeness assertion real if they live beside the census that consumes them.
+  Three further oversized files under `tests/` are support/data halves rather than suites, each kept
+  whole for one reason: `dynamic_census/catalog.rs` (1198) is the workload/fixture data table kept
+  apart from its driver, `support/probe/mod.rs` (1117) is the single probe builder every probe row
+  shares, and `support/bifs.rs` (1013) is the single host BIF floor every suite's `ModuleHost`
+  shares.
 - `dynamic_census.rs` is one instrument split by role, not by subject: that file is the driver
   (three layers, one `reset()` + boundary snapshots, the ranking / declared-raise / blocked-mechanism
   rendering, every assertion) and `dynamic_census/catalog.rs` (1198) is its data half (the named

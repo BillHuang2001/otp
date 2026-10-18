@@ -40,23 +40,23 @@
 //!      silently;
 //!    * **(c) GENUINE-GAP** — the engine did **not** demonstrate the declared
 //!      behaviour: a capability diagnostic (`unsupported_opcode: …`) or an outcome
-//!      contradicting the row's declaration. The bucket is **empty at this revision**
+//!      contradicting the row's declaration. The bucket is **empty**
 //!      and its pin is kept, so a regression re-enters it instead of hiding;
 //!    * **(d) UNCLAIMED** — the reason carries the sentinel [`UNCLAIMED_PREFIX`] that
 //!      `families::dispatch` returns for an instruction **no** core arm and **no**
 //!      family claims.
 //!
 //!    The census asserts (d) is **empty**: every one of the 108 variants is owned.
-//!    At this revision the measured dynamic split is **95 EXECUTED + 13 ZERO-CORPUS +
-//!    0 GENUINE-GAP + 0 UNCLAIMED** (pinned below as `EXECUTED_VARIANTS` /
+//!    The measured split is **95 EXECUTED + 13 ZERO-CORPUS + 0 GENUINE-GAP +
+//!    0 UNCLAIMED** (pinned below as `EXECUTED_VARIANTS` /
 //!    `ZERO_CORPUS_VARIANTS` / `GENUINE_GAP_VARIANTS`): **all 108 variants demonstrate
 //!    their declared behaviour**, and the 13 are re-bucketed only because real
 //!    compiler output never emits them.
 //!
 //!    **64** rows are probe-driven with valid operands and a declared expectation:
-//!    every one of the 59 variants that an earlier revision reported `CLAIMED-BLOCKED`,
-//!    plus 5 whose required shape the degenerate-operand module already happened to
-//!    satisfy. They live in [`support::rows`], one file per instruction group
+//!    every one of the 59 variants the degenerate-operand module cannot demonstrate,
+//!    plus 5 whose required shape it already happens to satisfy. They live in
+//!    [`support::rows`], one file per instruction group
 //!    (`core`, `data`, `exceptions`, `receive`, `bitstrings`), and each supplies the
 //!    minimum operands under which its instruction *performs its operation* instead
 //!    of rejecting them — a real tuple/list/map/binary/bitstring subject, an

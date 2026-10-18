@@ -18,9 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! **Real-`.beam` proofs for every instruction variant that used to be recorded as
-//! "CLAIMED-BLOCKED"** — the suite that replaces synthetic-IR evidence with real
-//! compiler output and the real ERTS oracle.
+//! **Real-`.beam` proofs for the weight-ordering instruction variants** — the suite
+//! that puts real compiler output and the real ERTS oracle behind the synthetic-IR
+//! evidence.
 //!
 //! # What this suite proves, and why it exists
 //!
