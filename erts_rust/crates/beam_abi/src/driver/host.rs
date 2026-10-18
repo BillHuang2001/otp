@@ -1317,10 +1317,18 @@ mod tests {
     }
 
     #[test]
-    fn from_port_of_null_is_none() {
-        // SAFETY: a null pointer is explicitly allowed by the contract.
-        let recovered = unsafe { DriverEnv::from_port(std::ptr::null_mut()) };
-        assert!(recovered.is_none());
+    fn from_port_of_null_or_the_invalid_port_sentinel_is_none() {
+        // Both operands name no environment: `NULL` (which the C does not even test for — it faults)
+        // and the C's invalid-port sentinel (`erl_port.h:60-67`), through the one shared predicate.
+        // SAFETY: both are explicitly allowed by the contract and are never dereferenced.
+        for operand in [
+            std::ptr::null_mut(),
+            crate::driver::types::ERTS_INVALID_ERL_DRV_PORT,
+        ] {
+            let recovered = unsafe { DriverEnv::from_port(operand) };
+            assert!(recovered.is_none(), "{operand:?} names no environment");
+            assert!(is_invalid_port_handle(operand));
+        }
     }
 
     #[test]
