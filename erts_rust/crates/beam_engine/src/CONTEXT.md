@@ -121,9 +121,17 @@ That workload set is the in-crate tier set, not the OTP corpus, so the corpus-sc
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`
-(`machine/mod.rs:632`), `Machine::alloc_rooted` (`:690`, → `ExecutionContext::alloc_words_rooted`) and
+(`machine/mod.rs:643`), `Machine::alloc_rooted` (`:701`, → `ExecutionContext::alloc_words_rooted`) and
 `Machine::ensure_heap`/`allocate_heap` → `ExecutionContext::ensure_heap_full`
 (`machine/frames.rs:283`).
+`with_roots` hands over the **whole** three files — `&mut self.x` (all `max_register` slots),
+`&mut self.stack` (every Y slot) and `&mut self.fr` (all `MAX_FLOAT_REGISTER`) — plus `live`, which is
+**only a hint** (`RootSet::live_len()` clamps it, `context.rs:241`): a host that scans just
+`x[..live_len()]` leaves any word above `live` unrelocated, so the hint's provenance is a contract:
+the two **heap** doors pass the instruction's own `Live` operand verbatim
+(`interpreter/dispatch.rs:623`/`:628` ← `beam_loader`'s `TestHeap`/`AllocateHeap` operand), while
+**every** `alloc_rooted` caller passes `RootSet::ALL_LIVE` (`terms/slack.rs:170`, the one production
+caller). The engine computes no liveness of its own.
 Their call sites, exactly: `alloc_words_rooted` has **one** production caller — `terms/slack.rs:170`
 (`terms::reserve`, hence `reserve_slack` and every `*_rooted` builder), reached **per built term**
 (each `put_list`/`put_tuple2`/`make_fun3`/`put_map_assoc`/record/bitstring node), with
