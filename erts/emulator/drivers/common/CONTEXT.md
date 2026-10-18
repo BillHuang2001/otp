@@ -82,6 +82,8 @@ Caller liveness: `driver_monitor_process`/`driver_demonitor_process` on async co
 - The socket `driver_select` event is the OS fd on unix and a Winsock event handle on win32 (`inet_descriptor.event`, `:1225`), so event-based reasoning differs per platform.
 - `INET_MAX_ASYNC` is 1 (one outstanding async op per descriptor); a descriptor running multi-accept keeps additional ops in a separate list.
 - `driver_output_term` is never used; term replies all go through `erl_drv_send_term`.
+- `{active,N}` with an overflowing/underflowing sum returns `-1` (⇒ `EINVAL` to Erlang) at `:6985` *after* `desc->active` has already been set to `INET_MULTI` at `:6974`, so the descriptor is left in active mode with the old counter. A negative-but-representable result is instead clamped to 0 (`:6993`) and immediately flips to passive with a passive message (`:6995-6998`). `{active,true}`/`{active,false}` zero the counter (`:7000`).
+- A UDP `{active,false}` → `{active,true}` setopts arms read (`:7966`) but delivers **nothing** during that call: `inet_set_opts` returns 1/2 only for `SOCK_STREAM` (`:7950`/`:7970-7985`), so `inet_ctl` (`:11130`) just replies ok. Already-buffered datagrams are delivered by the next poll-driven `packet_inet_drv_input` (`:15352`), not inside setopts — the two `UDP sockets could also trigger immediate read here NIY` comments (`:7949`, `:7969`) mark this gap. TCP, by contrast, does deliver synchronously inside the setopts ctl (`tcp_deliver` `:11137`, `tcp_recv`+re-arm `:11145-11146`).
 
 ## Dependencies
 - POSIX/Winsock sockets, `netdb`/resolv; SCTP via headers+`-lsctp` (`LIBSCTP`) or runtime `dlopen`.
