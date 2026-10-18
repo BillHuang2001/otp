@@ -187,8 +187,9 @@ pub struct UdpInetDriver {
     /// [`InetState::Connected`] after a successful `connect`, [`InetState::Closed`] otherwise.
     state: InetState,
     /// The driver-state socket options the `setopts`/`getopts` verbs store and report
-    /// ([`SocketOptions`]). The driver's socket is always a datagram socket, so the shared
-    /// store is always driven with its stream gate off.
+    /// ([`SocketOptions`]). The shared store is driven with this port's cached [`Self::stype`],
+    /// so the datagram-gated `{read_packets, N}` (code `33`) follows the C's
+    /// `desc->stype == SOCK_DGRAM` test rather than a fixed socket type.
     options: SocketOptions,
     /// The C descriptor's **cached** address family (`desc->sfamily`) as a wire tag, `0` meaning
     /// "unset". `INET_REQ_GETTYPE` reports this cache rather than probing the socket
@@ -831,30 +832,34 @@ impl UdpInetDriver {
 
     /// The `setopts` verb: applies the C's `INET_REQ_SETOPTS` option records.
     ///
-    /// The shared [`super::opt`] store is driven with its stream gate **off** (this driver's
-    /// socket is always a datagram socket), so the UDP-relevant syscall codes
-    /// (`reuseaddr`/`keepalive`/`broadcast`/`sndbuf`/`recbuf`/`ttl`) and the datagram
-    /// driver-state codes (`{mode, …}`/`{deliver, …}`/`{read_packets, …}`) are served and the
-    /// rest answer the C's `[0] ++ "einval"`.
+    /// The shared [`super::opt`] store is driven with this port's **cached** socket type
+    /// ([`UdpInetDriver::stype`]), exactly as the C reads `desc->stype` — so the datagram-gated
+    /// code `{read_packets, N}` is served once `open` has cached `SOCK_DGRAM` and ignored before
+    /// that, while the ungated codes (`{mode, …}`/`{deliver, …}` and the stream-gated
+    /// `send_timeout` pair) behave the same as on `tcp_inet`. The UDP-relevant syscall codes
+    /// (`reuseaddr`/`keepalive`/`broadcast`/`sndbuf`/`recbuf`/`ttl`) are served and the rest
+    /// answer the C's `[0] ++ "einval"`.
     ///
     /// # Errors
     ///
     /// `BeamError::BadArg` for a truncated `{active, N}` record (never for a served option — a
     /// rejected `setsockopt(2)` is not propagated, mirroring the C's `propagate = 0`).
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, false, self.socket, arg)
+        set_options(&mut self.options, self.stype, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
     ///
-    /// Driven with the same stream gate off as [`UdpInetDriver::verb_setopts`]; a code the
-    /// datagram store does not serve is the C's whole-reply `[0] ++ "einval"`.
+    /// Driven with the same cached socket type as [`UdpInetDriver::verb_setopts`], so
+    /// `{read_packets, N}` is reported by a port that has opened a datagram socket — including
+    /// after a `close`, which never clears `desc->stype` — and contributes no record before
+    /// that. A code the store does not serve is the C's whole-reply `[0] ++ "einval"`.
     ///
     /// # Errors
     ///
     /// `BeamError::Io` when a served option's `getsockopt(2)` fails on a live socket.
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, false, self.socket, arg)
+        get_options(&self.options, self.stype, self.socket, arg)
     }
 
     /// The `INET_REQ_NAME` reply (`inet_drv.c:11329`).

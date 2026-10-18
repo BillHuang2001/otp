@@ -28,7 +28,10 @@
 //! numbers are the C's `INET_REQ_*`/`PACKET_REQ_RECV`) and compare the reply bytes to the
 //! driver's. Every oracle case **skips loudly** when `erl` is not on `PATH`.
 
-use super::super::opt::{INET_OPT_BROADCAST, INET_OPT_REUSEADDR, INET_OPT_TTL};
+use super::super::opt::{
+    INET_LOPT_DELIVER, INET_LOPT_MODE, INET_LOPT_UDP_READ_PACKETS, INET_OPT_BROADCAST,
+    INET_OPT_REUSEADDR, INET_OPT_TTL,
+};
 use super::super::wire::{ctl_ok, ctl_xerror, split_caller_ref, ETF_VERSION_MAGIC};
 use super::super::{INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_TYPE_DGRAM, INET_REP_OK};
 use super::{UdpInetDriver, UDP_DRIVER_NAME};
@@ -51,6 +54,10 @@ const INET_REQ_OPEN: u32 = 1;
 const INET_REQ_CLOSE: u32 = 2;
 /// `INET_REQ_BIND` (`inet_drv.c:810`).
 const INET_REQ_BIND: u32 = 6;
+/// `INET_REQ_SETOPTS` (`inet_drv.c:811`).
+const INET_REQ_SETOPTS: u32 = 7;
+/// `INET_REQ_GETOPTS` (`inet_drv.c:812`).
+const INET_REQ_GETOPTS: u32 = 8;
 
 /// Wall-clock budget for the `erl` oracle before the affected check is skipped.
 const ERL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -504,33 +511,94 @@ fn an_unserved_option_code_is_einval() {
     );
 }
 
+/// A five-byte `[opt, val_be32]` `setopts` record.
+fn record(code: u8, value: i32) -> Vec<u8> {
+    let mut record = vec![code];
+    record.extend_from_slice(&value.to_be_bytes());
+    record
+}
+
+/// `{mode, …}` (`24`) and `{deliver, …}` (`25`) are **ungated** — the C's `inet_set_opts`
+/// (`inet_drv.c:6939`-`:6956`) and `inet_fill_opts` (`:9168`-`:9175`) carry no `stype` test — so
+/// the datagram driver serves both exactly as `tcp_inet` does, in every socket state.
+/// `{read_packets, N}` (`33`) is the datagram-gated one: it is served once `open` has cached
+/// `SOCK_DGRAM`, ignored before that (still answering `[1]`), and the C's `ival <= 0` refusal
+/// applies only inside the gate.
 #[test]
 fn the_datagram_driver_state_options_are_served() {
     let mut rig = Rig::new();
-    rig.open();
-    // `{mode, list}` (24) = 0, `{deliver, term}` (25) = 1, `{read_packets, }` (33) = 5.
-    let defaults = rig.control("getopts", &[24, 25, 33]).expect("getopts");
-    assert_eq!(
-        defaults,
-        vec![INET_REP_OK, 24, 0, 0, 0, 0, 25, 0, 0, 0, 1, 33, 0, 0, 0, 5],
-    );
-    // A non-positive `read_packets` is the C's `[0]einval`.
-    let mut set = vec![33];
-    set.extend_from_slice(&0i32.to_be_bytes());
-    assert_eq!(
-        rig.control("setopts", &set).expect("setopts"),
-        ctl_xerror("einval"),
-    );
-}
-
-#[test]
-fn read_packets_is_dropped_before_a_socket_exists() {
-    let mut rig = Rig::new();
+    // ---- no socket yet: `inet.stype` is -1, so 33 is gated out ----
     let reply = rig.control("getopts", &[24, 25, 33]).expect("getopts");
     assert_eq!(
         reply,
         vec![INET_REP_OK, 24, 0, 0, 0, 0, 25, 0, 0, 0, 1],
         "code 33 contributes nothing while there is no datagram socket",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(24, 1)).expect("setopts"),
+        ctl_ok(),
+        "a `mode` = binary store is accepted before a socket exists",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(25, 0)).expect("setopts"),
+        ctl_ok(),
+        "a `deliver` = port store is accepted before a socket exists",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(33, 7)).expect("setopts"),
+        ctl_ok(),
+        "a gated-out read_packets store still answers `[1]`",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(33, 0)).expect("setopts"),
+        ctl_ok(),
+        "the `ival <= 0` refusal is inside the datagram gate",
+    );
+    assert_eq!(
+        rig.control("getopts", &[24, 25, 33]).expect("getopts"),
+        vec![INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0],
+        "both ungated records read back, the gated one still contributes nothing",
+    );
+
+    // ---- an opened datagram socket: the gated code comes alive ----
+    rig.open();
+    let defaults = rig.control("getopts", &[24, 25, 33]).expect("getopts");
+    assert_eq!(
+        defaults,
+        vec![INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0, 33, 0, 0, 0, 5],
+        "`mode`/`deliver` keep their stored values and `read_packets` reports its default",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(33, 7)).expect("setopts"),
+        ctl_ok(),
+    );
+    assert_eq!(
+        rig.control("getopts", &[33]).expect("getopts"),
+        vec![INET_REP_OK, 33, 0, 0, 0, 7],
+        "a positive read_packets stores and reads back",
+    );
+    // A non-positive `read_packets` is the C's `[0]einval` — inside the datagram gate.
+    assert_eq!(
+        rig.control("setopts", &record(33, 0)).expect("setopts"),
+        ctl_xerror("einval"),
+    );
+    assert_eq!(
+        rig.control("getopts", &[33]).expect("getopts"),
+        vec![INET_REP_OK, 33, 0, 0, 0, 7],
+        "a refused record leaves the stored value alone",
+    );
+
+    // ---- after `close`: the cached `SOCK_DGRAM` keeps the read-back alive ----
+    assert_eq!(rig.control("close", &[]).expect("close"), ctl_ok());
+    assert_eq!(
+        rig.control("getopts", &[24, 25, 33]).expect("getopts"),
+        vec![INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0, 33, 0, 0, 0, 7],
+        "a close never clears `desc->stype`, so code 33 is still reported",
+    );
+    assert_eq!(
+        rig.control("setopts", &record(33, 0)).expect("setopts"),
+        ctl_xerror("einval"),
+        "the gate is still open after a close",
     );
 }
 
@@ -624,6 +692,116 @@ fn the_control_replies_agree_with_the_erl_oracle() {
     assert_eq!(bound[0], oracle[1][0], "bind result tag agrees");
     let closed = rig.control("close", &[]).expect("close");
     assert_eq!(closed, oracle[2], "close agrees with the oracle");
+}
+
+/// The Rust side of an oracle comparison driven the way the runtime drives it: a **real**
+/// `PortRegistry` port on the numeric `erlang:port_control/3` route (the decimal
+/// `code + ERTS_INET_DRV_CONTROL_MAGIC_NUMBER` string the `opcode.rs` bridge decodes).
+fn port_replies(calls: &[(u32, Vec<u8>)]) -> Vec<Vec<u8>> {
+    let mut poller = Poller::new().expect("a poll set");
+    let registry = crate::driver::DriverRegistry::with_builtins();
+    let driver = registry
+        .create(UDP_DRIVER_NAME)
+        .expect("the built-in udp_inet driver is registered");
+    let mut ports = crate::port::PortRegistry::new();
+    let id = ports.open(&mut poller, driver).expect("the port opens");
+    let replies = calls
+        .iter()
+        .map(|(code, arg)| {
+            ports
+                .port_control(&mut poller, id, &(code + CONTROL_MAGIC).to_string(), arg)
+                .unwrap_or_else(|err| panic!("request {code} failed: {err:?}"))
+        })
+        .collect();
+    ports.close(&mut poller, id).expect("closes the port");
+    replies
+}
+
+/// The datagram driver's `{mode, …}`/`{deliver, …}`/`{read_packets, N}` matrix against the live
+/// oracle, over the three states a port can be in (no socket, an opened datagram socket, after a
+/// `close`).
+///
+/// Codes `24`/`25` are ungated in the C (`inet_set_opts`, `inet_drv.c:6939`-`:6956`;
+/// `inet_fill_opts`, `:9168`-`:9175`), so they answer identically in every state; code `33` is
+/// gated on the **cached** `SOCK_DGRAM` (`:7138`-`:7146`, `:9258`-`:9270`), so it is ignored
+/// before `open` (still answering `[1]`) and still reported after a `close`.
+///
+/// **Skips loudly** when `erl` is not on `PATH`.
+#[test]
+fn the_mode_deliver_and_read_packets_rows_agree_with_the_erl_oracle() {
+    let three = || vec![INET_LOPT_MODE, INET_LOPT_DELIVER, INET_LOPT_UDP_READ_PACKETS];
+    let calls = vec![
+        // ---- no socket yet ----
+        (INET_REQ_GETOPTS, three()),
+        (INET_REQ_SETOPTS, record(INET_LOPT_MODE, 1)),
+        (INET_REQ_SETOPTS, record(INET_LOPT_DELIVER, 0)),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 7)),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 0)),
+        (INET_REQ_GETOPTS, three()),
+        // ---- an opened datagram socket ----
+        (
+            INET_REQ_OPEN,
+            vec![INET_AF_INET, INET_TYPE_DGRAM, super::super::INET_PROTO_DEFAULT],
+        ),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 9)),
+        (INET_REQ_GETOPTS, three()),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 0)),
+        // ---- after a `close`: the cached stype survives ----
+        (INET_REQ_CLOSE, vec![]),
+        (INET_REQ_GETOPTS, three()),
+        (INET_REQ_SETOPTS, record(INET_LOPT_UDP_READ_PACKETS, 0)),
+    ];
+
+    let rust = port_replies(&calls);
+    assert_eq!(rust.len(), calls.len(), "one reply per call");
+    assert_eq!(
+        rust[0],
+        vec![INET_REP_OK, 24, 0, 0, 0, 0, 25, 0, 0, 0, 1],
+        "before `open` code 33 is gated out; 24/25 report their defaults",
+    );
+    assert_eq!(rust[1], ctl_ok(), "`{{mode, binary}}` before `open`");
+    assert_eq!(rust[2], ctl_ok(), "`{{deliver, port}}` before `open`");
+    assert_eq!(rust[3], ctl_ok(), "a gated-out `read_packets` store is `[1]`");
+    assert_eq!(rust[4], ctl_ok(), "the `ival <= 0` refusal is inside the gate");
+    assert_eq!(
+        rust[5],
+        vec![INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0],
+        "both ungated values read back, code 33 still contributes nothing",
+    );
+    assert_eq!(rust[6], ctl_ok(), "`open`");
+    assert_eq!(rust[7], ctl_ok(), "a positive `read_packets` on a datagram socket");
+    assert_eq!(
+        rust[8],
+        vec![
+            INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0, 33, 0, 0, 0, 9,
+        ],
+        "all three read back once the socket is a datagram",
+    );
+    assert_eq!(rust[9], ctl_xerror("einval"), "a non-positive `read_packets`");
+    assert_eq!(rust[10], ctl_ok(), "`close`");
+    assert_eq!(
+        rust[11],
+        vec![
+            INET_REP_OK, 24, 0, 0, 0, 1, 25, 0, 0, 0, 0, 33, 0, 0, 0, 9,
+        ],
+        "a close never clears `desc->stype`, so code 33 is still reported",
+    );
+    assert_eq!(rust[12], ctl_xerror("einval"), "the gate is still open after a close");
+
+    let Some(dump) = erl_stdout(&oracle_expression(&calls)) else {
+        eprintln!("SKIP: no `erl` on PATH — skipping the udp_inet option-gate oracle check");
+        return;
+    };
+    let oracle = oracle_replies(&dump);
+    assert_eq!(oracle.len(), calls.len(), "the oracle answered every call: {dump:?}");
+    for (index, ((code, arg), (rust_reply, oracle_reply))) in
+        calls.iter().zip(rust.iter().zip(oracle.iter())).enumerate()
+    {
+        assert_eq!(
+            rust_reply, oracle_reply,
+            "reply {index} (request code {code}, argument {arg:?}) disagrees",
+        );
+    }
 }
 
 /// The oracle's `port_info(Port, name)` — the registered driver name, which is the one value
