@@ -162,12 +162,13 @@
 //!
 //! * **Loading a freshly compiled artifact on the expression route** (compile → load → call,
 //!   which would compare a compiled module's answers with the same function's in a system
-//!   module). The oracle refuses `code:load_binary/3` for a *sticky* stdlib module name with
-//!   `{error,sticky_directory}` and needs `code:delete/1` + `code:purge/1` first — and the Rust
-//!   runtime answers `unsupported: erlang:delete_module/1` there (owner **`beam_rt`**), the
-//!   raise even taking the `code_server` down with it. So the compile-and-**call** dimension
-//!   stays on the module-run route, where [`pair_case`] already pins it through
-//!   `code:add_patha/1` + `code:load_file/1`.
+//!   module). The load is refused by `code`'s own *sticky directory* policy for a stdlib module
+//!   name, and the refusal survives the removal route: measured on **both** runtimes,
+//!   `erlang:delete_module(lists)` answers `true` and the following
+//!   `code:load_binary(lists, …, Bin)` still answers `{error, sticky_directory}` (with
+//!   `code:delete(lists)` answering `false`), so there is no load to compare either way. So the
+//!   compile-and-**call** dimension stays on the module-run route, where [`pair_case`] already
+//!   pins it through `code:add_patha/1` + `code:load_file/1`.
 //! * **The `binary` form against the `{outdir, Dir}` (write-path) form** — the two compile
 //!   entry points' artifacts compared with each other. That comparison needs an outdir, hence
 //!   the module-run argv, and the very same in-process compile costs **≈ 14 s** on the Rust

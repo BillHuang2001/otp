@@ -28,6 +28,11 @@
 //! rendered) and the *fired* timer (`bifs/timer_apply_after_message_is_delivered` — the
 //! message `timer:apply_after/4` sends is really delivered to the receiving process, under an
 //! `after` guard so a lost message is an observation, not a hang).
+//!
+//! The **code-store removal** surface (`erlang:delete_module/1`, `code:purge/1`,
+//! `code:soft_purge/1` and `erts_internal:purge_module/2`) is pinned only where the two runtimes
+//! agree — see the block comment above those cases for what is deliberately left unpinned (the
+//! post-delete store shape, which honestly differs because this runtime has no old-code slot).
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.7 cases: core BIFs plus the `lists` and `maps` stdlib surface (the `bifs/`, `lists/` and
@@ -1925,13 +1930,7 @@ pub(crate) fn group() -> Vec<Case> {
         //   `badarg`: the interior walk only exists above the HAMT threshold);
         // * `erts_debug:ln/1` (`error:undef` on the oracle — not a declared `bif.tab` entry)
         //   and `erts_debug:unaligned_bitstring/2` (both sides answer `badarg` for a
-        //   non-bitstring first argument: a refusal, not the transformation);
-        // * `erlang:delete_module/1` — this runtime answers the typed capability gap for every
-        //   argument (so a case would be `unsupported`, never an agreement), and the oracle's
-        //   *relation* is not the naive one either: after `code:ensure_loaded(lists)` it answers
-        //   `{true,true,true}` — the delete demotes to the old-code slot, so `module_loaded/1`
-        //   and `check_old_code/1` both stay `true`, which a runtime without an old-code slot
-        //   cannot reproduce.
+        //   non-bitstring first argument: a refusal, not the transformation).
         // ---------------------------------------------------------------------------------
         Case {
             id: "bifs/erts_debug_same_is_raw_word_identity",
@@ -2032,6 +2031,202 @@ pub(crate) fn group() -> Vec<Case> {
             golden: Golden {
                 stdout: Some("ok {{error,undef},{error,undef}}"),
                 exit_code: 0,
+            },
+        },
+        // ---------------------------------------------------------------------------------
+        // The **code-store removal** surface: `erlang:delete_module/1`, the two `code:` purge
+        // queries and the `erts_internal:purge_module/2` primitive. Every golden below was
+        // measured on the oracle and is the oracle's exact single-line answer.
+        //
+        // What is pinned is only the part the two runtimes **agree** on, and it is a real
+        // agreement, not a coincidence: `delete_module/1` validates its argument the same way
+        // in both (a non-atom is `badarg`), answers the atom **`undefined`** — not `false` —
+        // for a name the code store does not hold (a fresh name is unheld in *both* stores,
+        // since neither interns a name it never loaded), and answers `true` for a held module
+        // while leaving the runtime usable. The purge queries are the no-old-code constants:
+        // `code:purge/1` is `false` and `code:soft_purge/1` is `true` for a module with no old
+        // code — loaded *or* unloaded; both guard on `is_atom/1` in `code.erl` first, so a
+        // non-atom is the bare `error:function_clause`. And `erts_internal:purge_module/2` is
+        // OTP 29's unconditional `i_notsup` stub, raising `error:notsup` **before** it inspects
+        // either argument.
+        //
+        // What stays **unpinned** is the post-delete code-store shape, because it honestly
+        // differs: the oracle's delete only *retires* a module into its old-code slot (so its
+        // `module_loaded/1` and `check_old_code/1` stay `true` and a **second** delete raises
+        // `badarg`), while this runtime has no old-code slot and really unloads (so the same
+        // observables answer `false` and a second delete answers `undefined`). No case here
+        // observes `module_loaded/1`, `code:is_loaded/1` or `check_old_code/1` **after** a
+        // delete, and no case deletes twice — the pre-state is asserted from
+        // `erlang:module_loaded/1` (an explicit `code:ensure_loaded/1` makes the load state a
+        // fact of the expression rather than something inherited from the boot).
+        // ---------------------------------------------------------------------------------
+        Case {
+            id: "bifs/delete_module_of_a_non_atom_is_badarg",
+            description: "erlang:delete_module/1 refuses a non-atom with badarg before touching the code store",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The argument check precedes the lookup, so the class+reason pair is the
+                // observable (the bare atom `badarg`, never a richer structure).
+                expr: "erlang:delete_module(42)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "bifs/delete_module_of_an_unheld_name_is_undefined",
+            description: "erlang:delete_module/1 answers the atom undefined — not false — for a name the code store does not hold",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `nosuchmod` is never loaded (no OTP application is named that), so the
+                // answer is the *unheld* atom `undefined`; the golden spelling distinguishes
+                // it from the `false` a runtime that models "delete failed" would answer.
+                expr: "erlang:delete_module(nosuchmod)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok undefined"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/delete_module_of_a_held_module_is_true",
+            description: "erlang:delete_module/1 answers true for a held module and the runtime keeps evaluating afterwards",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The pre-state is made explicit: `code:ensure_loaded/1` really loads
+                // `lists` (its success shape is `{module, lists}`) and `module_loaded/1`
+                // then reports `true`. The second tuple element is a following BIF call that
+                // must still answer, so a delete that took the runtime down is an observation
+                // rather than a hang or an empty line.
+                expr: "begin {module,lists} = code:ensure_loaded(lists), \
+                       true = erlang:module_loaded(lists), \
+                       D = erlang:delete_module(lists), {D, length([a,b,c])} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,3}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/delete_module_keeps_the_path_based_code_which_answer",
+            description: "after erlang:delete_module/1 the path-based code:which/1 still names the on-disk object code",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `code:which/1` is answered from the code path, not from the load state, so
+                // it is the one post-delete query both stores agree on. Its value is a path —
+                // classified into a boolean, never rendered.
+                expr: "begin {module,lists} = code:ensure_loaded(lists), \
+                       true = erlang:module_loaded(lists), \
+                       D = erlang:delete_module(lists), {D, is_list(code:which(lists))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/code_purge_without_old_code_answers_false_and_true",
+            description: "code:purge/1 answers false and code:soft_purge/1 true for a loaded module with no old code",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A loaded module (`code:ensure_loaded/1` makes that explicit) is the case a
+                // purge would have to kill a process for if old code existed; with none, the
+                // pair is the no-old-code constant `{false,true}`.
+                expr: "begin {module,lists} = code:ensure_loaded(lists), \
+                       {code:purge(lists), code:soft_purge(lists)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {false,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/code_purge_of_an_unheld_module_is_the_no_old_code_pair",
+            description: "the purge queries answer the same no-old-code pair for a module that was never loaded",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The same answers for a name the code store has never held, so the pair does
+                // not depend on the load state at all.
+                expr: "{code:purge(nosuchmod), code:soft_purge(nosuchmod)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {false,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/code_purge_of_a_non_atom_is_function_clause",
+            description: "code:purge/1 guards on is_atom/1 in code.erl, so a non-atom is the bare error:function_clause",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "code:purge(42)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error function_clause"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "bifs/code_soft_purge_of_a_non_atom_is_function_clause",
+            description: "code:soft_purge/1 carries the same is_atom/1 guard, so a non-atom is error:function_clause too",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "code:soft_purge(42)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error function_clause"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "bifs/erts_internal_purge_module_is_notsup",
+            description: "erts_internal:purge_module/2 raises error:notsup for a direct caller (OTP 29 removed code purging)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The BIF is the `i_notsup` stub, so a plain (non-`erts_code_purger`) caller
+                // raises whatever module it names — no effect, just the raise.
+                expr: "erts_internal:purge_module(lists, [])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error notsup"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "bifs/erts_internal_purge_module_raises_notsup_before_inspecting_its_arguments",
+            description: "erts_internal:purge_module/2 raises notsup before any argument check, so a non-atom module is notsup and not badarg",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A garbage module and a garbage second argument are indistinguishable from a
+                // well-formed call: `notsup` precedes the argument validation (exactly as the
+                // C does), which is what makes `badarg` here a divergence rather than a
+                // judgement call.
+                expr: "erts_internal:purge_module(42, x)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error notsup"),
+                exit_code: 1,
             },
         },
     ]
@@ -2333,6 +2528,104 @@ mod tests {
         // every other case in the block is an ordinary `ok …` line with exit 0.
         for case in group().into_iter().filter(|c| c.id.contains("erts_debug_lcnt_control")) {
             assert_eq!(case.golden.exit_code, 1, "case {}", case.id);
+        }
+    }
+    /// The code-store removal block: `erlang:delete_module/1`, the two `code:` purge queries and
+    /// `erts_internal:purge_module/2`. Each golden is the oracle's own single line
+    /// (re-measured with `differential run <id>`).
+    #[test]
+    fn the_code_store_removal_families_pin_the_oracle_lines() {
+        let golden = |id: &str| {
+            group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .golden
+                .stdout
+                .expect("a golden")
+        };
+        for (id, stdout) in [
+            (
+                "bifs/delete_module_of_a_non_atom_is_badarg",
+                "exception error badarg",
+            ),
+            (
+                "bifs/delete_module_of_an_unheld_name_is_undefined",
+                "ok undefined",
+            ),
+            ("bifs/delete_module_of_a_held_module_is_true", "ok {true,3}"),
+            (
+                "bifs/delete_module_keeps_the_path_based_code_which_answer",
+                "ok {true,true}",
+            ),
+            (
+                "bifs/code_purge_without_old_code_answers_false_and_true",
+                "ok {false,true}",
+            ),
+            (
+                "bifs/code_purge_of_an_unheld_module_is_the_no_old_code_pair",
+                "ok {false,true}",
+            ),
+            (
+                "bifs/code_purge_of_a_non_atom_is_function_clause",
+                "exception error function_clause",
+            ),
+            (
+                "bifs/code_soft_purge_of_a_non_atom_is_function_clause",
+                "exception error function_clause",
+            ),
+            (
+                "bifs/erts_internal_purge_module_is_notsup",
+                "exception error notsup",
+            ),
+            (
+                "bifs/erts_internal_purge_module_raises_notsup_before_inspecting_its_arguments",
+                "exception error notsup",
+            ),
+        ] {
+            assert_eq!(golden(id), stdout, "case {id}");
+        }
+        // The `exception …` cases exit 1 and the `ok …` cases exit 0 — the probe protocol.
+        for case in group().into_iter().filter(|c| c.id.starts_with("bifs/delete_module")
+            || c.id.contains("purge"))
+        {
+            let expected = i32::from(
+                case.golden
+                    .stdout
+                    .is_some_and(|line| line.starts_with("exception ")),
+            );
+            assert_eq!(case.golden.exit_code, expected, "case {}", case.id);
+        }
+        // No case may observe the post-delete code-store shape: the oracle retires a module
+        // into its old-code slot where this runtime really unloads it, so those observables
+        // honestly differ (and a case pinning one would be a mismatch, never a gap).
+        for case in group().into_iter().filter(|c| c.id.starts_with("bifs/delete_module")) {
+            let expr = case.expr().expect("eval case");
+            for banned in ["check_old_code", "code:is_loaded", "code:all_loaded"] {
+                assert!(
+                    !expr.contains(banned),
+                    "case {}: `{banned}` observes the post-delete store shape: {expr}",
+                    case.id
+                );
+            }
+            // `module_loaded/1` is allowed only as the *pre*-delete precondition, i.e. it must
+            // appear before the delete in the expression text.
+            if let (Some(loaded_at), Some(delete_at)) =
+                (expr.find("module_loaded"), expr.find("delete_module"))
+            {
+                assert!(
+                    loaded_at < delete_at,
+                    "case {}: `module_loaded/1` must be a precondition: {expr}",
+                    case.id
+                );
+            }
+            // At most one delete per expression: a second one is `undefined` here and
+            // `badarg` on the oracle.
+            assert!(
+                expr.matches("delete_module").count() <= 1,
+                "case {}: a second delete_module/1 is not an agreeing observable: {expr}",
+                case.id
+            );
         }
     }
 }
