@@ -123,6 +123,7 @@ The served / closable-on-a-condition / not-closable roster and its oracle answer
 * **Return-based errors, no silent swallowing** ([`../../../CONTEXT.md`](../../../CONTEXT.md) §3): every fallible helper returns `beam_common::Result`; no `panic!`/`unwrap()` on runtime data.
 * **Call down, never duplicate**: a BIF is served by `beam_bifs`/the native floor, never re-implemented here.
 * **Never fabricate a value**: a seam answer is either real state or the typed gap — `NodeIdentity`'s creation stays the truthful `0`, and the node hash is a genuine per-process computation, never a constant.
+* **A reclamation is an optimization, never a correctness lever**: every gate of the off-heap prune declines rather than guessing, so its residual is a leak — never a payload freed while a live `BinRef` still names it.
 * **A lent `&mut TableRegistry` is exclusive by construction**; the shared cell is never consulted while one is lent, and `try_borrow_mut` (never `borrow_mut`) is the only way this node touches it.
 * **Dispatch cost is first-class**: every handle built in `call_bif`/`call_registered` must be gated by its own `uses_*`/`needs_*` predicate, and every per-call input the prologue derives belongs in the `dispatch` memo (an input that can change during a run — the NIF registry — must stay out).
   Measure with [`../../examples/perf_call.rs`](../../examples/perf_call.rs) (figures in [`../../PERF.md`](../../PERF.md)); `../../examples/perf_bif.rs`'s `pc:*` fixture lowers to an inlined `gc_bif` and **cannot** measure registry dispatch.
