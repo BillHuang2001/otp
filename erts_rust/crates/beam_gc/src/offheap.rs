@@ -164,7 +164,6 @@ pub fn sweep_unreachable_binaries(
     live.sort_unstable();
 
     let released = off_heap.sweep(|entry| match entry {
-        // A binary is live iff a reachable `BinRef` names its payload.
         OffHeapEntry::Binary(binary) => live.binary_search(&(binary.data_ptr() as usize)).is_ok(),
         // An MSO has no `BinRef`-shaped reference; this seam never reclaims one.
         OffHeapEntry::Mso(_) => true,
