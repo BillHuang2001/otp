@@ -69,12 +69,16 @@
 //! The snapshot is per **recipient**, so a route that can only observe its own mailbox takes
 //! its own entries and leaves the rest queued for the route that can deliver them.
 //!
-//! # What is honest about the reason
+//! # The reason a signal carries
 //!
-//! `port_close/1` is this runtime's only closer and always closes with the reason `normal`
-//! (the oracle's own reason for it), so the reason is not carried in the snapshot. A future
-//! closer with another reason (`exit_status`-driven death, an owner-death cascade) must add
-//! it as a field rather than special-casing the builder.
+//! [`PortSignalReason`] rides every [`PortSignal`], so the `'EXIT'` **and** the `'DOWN'` of one
+//! close render the same reason — the C's single `erts_deliver_port_exit(prt, id, reason, 0, 0)`
+//! path. `port_close/1` always closes with [`PortSignalReason::Normal`] (the oracle's own reason
+//! for it); a driver that closes its own port through the `driver_failure*` family supplies its
+//! own ([`super::failure`]) — an atom name, an errno's POSIX name, or a bare integer — and that
+//! reason also decides the fate of a **non-trapping** linked owner: `normal` is ignored (it
+//! survives), anything else terminates it with that reason, which is `beam_process`'s
+//! `exit_policy` in the link family.
 //!
 //! # Known divergence
 //!
@@ -110,12 +114,38 @@ pub(crate) enum PortSignalKind {
     Down(MonitorRef),
 }
 
+/// The **reason** a port's exit signal carries.
+///
+/// `port_close/1` always closes with [`Normal`](Self::Normal) — the oracle's own reason for it —
+/// while a driver that closes its own port through the `driver_failure*` family supplies its own
+/// ([`super::failure`]): an atom name (a literal one, or an errno's POSIX name) or a bare
+/// integer. Carried on the signal rather than special-cased at delivery so the `'EXIT'` **and**
+/// the `'DOWN'` of one close render the same reason, which is the C's single
+/// `erts_deliver_port_exit(prt, id, reason, 0, 0)` path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PortSignalReason {
+    /// The atom `normal`.
+    Normal,
+    /// The atom of this name (interned in the runtime's one shared table at delivery).
+    Atom(String),
+    /// A bare small integer — what `driver_failure(port, N)` sends.
+    Integer(i32),
+}
+
+impl PortSignalReason {
+    /// Whether this is the `normal` reason, the one the C's link family **ignores** for a
+    /// non-trapping peer instead of terminating it.
+    pub(crate) fn is_normal(&self) -> bool {
+        *self == PortSignalReason::Normal
+    }
+}
+
 /// One message a closing port owes **one** process.
 ///
 /// Per recipient rather than per port so that a route which can only observe its own mailbox
 /// (the `-eval` evaluator) can take exactly its own entries and leave the rest for the route
 /// that owns a process table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PortSignal {
     /// The port that closed — the source term of the message, and the `'DOWN'` target.
     pub(crate) port: PortId,
@@ -123,6 +153,8 @@ pub(crate) struct PortSignal {
     pub(crate) to: ProcessId,
     /// Which message it is.
     pub(crate) kind: PortSignalKind,
+    /// The reason both message shapes render.
+    pub(crate) reason: PortSignalReason,
 }
 
 /// The two-stage queue of a closing port's signals (see the module docs).
@@ -155,6 +187,17 @@ impl PendingPortSignals {
     /// Records the messages the close of `port` owes.
     fn stash(&mut self, port: PortId, signals: Vec<PortSignal>) {
         self.unreported.insert(port.number(), signals);
+    }
+
+    /// Appends entries that are deliverable **now**, without a close report to wait for.
+    ///
+    /// The failure channel's half: [`PortRegistry::drain_failures`](super::PortRegistry) is handed
+    /// a port `beam_io` has already closed *and* reported (`take_failures` is drained after the
+    /// round that minted its `PortNotification::Closed`), so its signals need no second stage. An
+    /// empty list adds nothing — a `driver_exit` port with no monitors owes no message, and its
+    /// number was retired by the very round that reaped it.
+    fn push_ready(&mut self, signals: Vec<PortSignal>) {
+        self.ready.extend(signals);
     }
 
     /// Moves one port's snapshot into the deliverable queue — the `Closed` report's half.
@@ -222,20 +265,46 @@ impl PortRegistry {
     /// [`Runtime::deliver_port_signals`]) and on whether the recipient is still alive; neither
     /// is readable here (this registry holds no process table).
     pub(super) fn capture_port_exit(&mut self, id: PortId) {
+        let signals = self.port_exit_signals(id, PortSignalReason::Normal, true);
+        if !signals.is_empty() {
+            self.pending_port_signals.stash(id, signals);
+        }
+    }
+
+    /// The `'EXIT'`/`'DOWN'` messages the close of `id` owes, with `reason` on every one of them,
+    /// read from the still-live metadata/link/monitor state.
+    ///
+    /// `signals_owner` is the C's own distinction: the `driver_failure*` family delivers a
+    /// port-exit signal to the connected process, while `driver_exit` runs `unlink_proc` first
+    /// (`io.c:7244`), so **no** `'EXIT'` is owed — but every monitor still gets its `'DOWN'`, the
+    /// C's one `erts_deliver_port_exit` path covering links and monitors alike.
+    ///
+    /// An empty answer means the port owes nothing (or no longer has metadata), never a
+    /// fabricated message.
+    pub(super) fn port_exit_signals(
+        &self,
+        id: PortId,
+        reason: PortSignalReason,
+        signals_owner: bool,
+    ) -> Vec<PortSignal> {
         let Some(owner) = self.meta.get(&id.number()).map(|meta| meta.owner) else {
-            return;
+            return Vec::new();
         };
-        let links = match self.extra_links(id.number()) {
-            Some(links) => links.to_vec(),
-            None => vec![owner],
-        };
-        let mut signals = Vec::with_capacity(links.len() + 1);
-        for to in links {
-            signals.push(PortSignal {
-                port: id,
-                to,
-                kind: PortSignalKind::Exit,
-            });
+        let mut signals = Vec::new();
+        if signals_owner {
+            let links = match self.extra_links(id.number()) {
+                Some(links) => links.to_vec(),
+                None => vec![owner],
+            };
+            signals.reserve(links.len() + 1);
+            for to in links {
+                signals.push(PortSignal {
+                    port: id,
+                    to,
+                    kind: PortSignalKind::Exit,
+                    reason: reason.clone(),
+                });
+            }
         }
         // The `'EXIT'` entries come first because that is the order the oracle delivers them
         // in: a process that is both linked and watching sees the exit before the `'DOWN'`
@@ -245,11 +314,16 @@ impl PortRegistry {
                 port: id,
                 to: monitor.watcher,
                 kind: PortSignalKind::Down(monitor.reference),
+                reason: reason.clone(),
             });
         }
-        if !signals.is_empty() {
-            self.pending_port_signals.stash(id, signals);
-        }
+        signals
+    }
+
+    /// Publishes already-final signals straight into the deliverable queue — the failure
+    /// channel's route (see [`PendingPortSignals::push_ready`]).
+    pub(super) fn push_port_signals(&mut self, signals: Vec<PortSignal>) {
+        self.pending_port_signals.push_ready(signals);
     }
 
     /// Mints the close reports of every port whose `Closed` notification is still
@@ -402,9 +476,21 @@ impl RuntimeContext<'_> {
         for signal in signals {
             match signal.kind {
                 // `normal` in the link family is ignored by a non-trapping peer (the C's
-                // `exit_policy`); nothing is delivered and nothing is terminated.
-                PortSignalKind::Exit if !trapping => continue,
-                PortSignalKind::Exit => messages.push(self.port_closed_message(signal.port)?),
+                // `exit_policy`); anything else terminates it with that reason.
+                PortSignalKind::Exit if !trapping => {
+                    if signal.reason.is_normal() {
+                        continue;
+                    }
+                    let reason = {
+                        let mut ctx = RuntimeContext::new(self.runtime);
+                        ctx.port_exit_reason_term(&signal.reason)?
+                    };
+                    self.process_table_mut().terminate(pid, reason)?;
+                    continue;
+                }
+                PortSignalKind::Exit => {
+                    messages.push(self.port_closed_message(signal.port, &signal.reason)?)
+                }
                 PortSignalKind::Down(reference) => {
                     // The port's death resolves the watcher's outgoing half (see
                     // [`Runtime::deliver_port_signals`]).
@@ -413,11 +499,37 @@ impl RuntimeContext<'_> {
                             .port_monitors_mut()
                             .retain(|watch| watch.reference != reference);
                     }
-                    messages.push(self.port_down_message(signal.port, reference)?);
+                    messages.push(self.port_down_message(
+                        signal.port,
+                        reference,
+                        &signal.reason,
+                    )?);
                 }
             }
         }
         Ok(messages)
+    }
+
+    /// The reason a port-exit signal carries, as an Erlang term.
+    ///
+    /// [`PortSignalReason::Normal`]/[`Atom`](PortSignalReason::Atom) intern their name in the
+    /// runtime's **one shared** table (so a `receive` clause can match it); an
+    /// [`Integer`](PortSignalReason::Integer) is a bare small integer, which is what the oracle
+    /// sends for `driver_failure(P, 7)`.
+    ///
+    /// # Errors
+    ///
+    /// [`beam_common::BeamError::SystemLimit`] for an integer that is not a small integer (it
+    /// cannot be, for a `c_int`, but the conversion is checked rather than truncated).
+    pub(crate) fn port_exit_reason_term(&mut self, reason: &PortSignalReason) -> Result<Eterm> {
+        match reason {
+            PortSignalReason::Normal => Ok(intern(self, "normal")),
+            PortSignalReason::Atom(name) => Ok(intern(self, name)),
+            PortSignalReason::Integer(value) => {
+                beam_term::try_make_small(i64::from(*value))
+                    .map_err(|_| beam_common::BeamError::SystemLimit)
+            }
+        }
     }
 
     /// `{'EXIT', Port, normal}` — a closing port's exit as a linked process sees it.
@@ -430,10 +542,10 @@ impl RuntimeContext<'_> {
     /// # Errors
     ///
     /// The arena's allocation failure when the tuple does not fit.
-    fn port_closed_message(&mut self, port: PortId) -> Result<Eterm> {
+    fn port_closed_message(&mut self, port: PortId, reason: &PortSignalReason) -> Result<Eterm> {
         let tag = intern(self, "EXIT");
-        let normal = intern(self, "normal");
-        terms::make_tuple(self, &[tag, port.to_eterm(), normal])
+        let reason = self.port_exit_reason_term(reason)?;
+        terms::make_tuple(self, &[tag, port.to_eterm(), reason])
     }
 
     /// `{'DOWN', Reference, port, Port, normal}` — a closing port's death as its watcher sees
@@ -447,12 +559,17 @@ impl RuntimeContext<'_> {
     ///
     /// The arena's allocation failure, the reference thing's encoding refusal (an id that
     /// does not fit), and the pooled BIF heap's allocation failure.
-    fn port_down_message(&mut self, port: PortId, reference: MonitorRef) -> Result<Eterm> {
+    fn port_down_message(
+        &mut self,
+        port: PortId,
+        reference: MonitorRef,
+        reason: &PortSignalReason,
+    ) -> Result<Eterm> {
         let tag = intern(self, "DOWN");
         let kind = intern(self, "port");
-        let normal = intern(self, "normal");
+        let reason = self.port_exit_reason_term(reason)?;
         let reference = monitor_reference_term(self, reference)?;
-        terms::make_tuple(self, &[tag, reference, kind, port.to_eterm(), normal])
+        terms::make_tuple(self, &[tag, reference, kind, port.to_eterm(), reason])
     }
 }
 
@@ -473,7 +590,18 @@ fn deliver_signal(
     };
     let trapping = recipient.is_trapping_exit();
     match signal.kind {
-        PortSignalKind::Exit if !trapping => return Ok(false),
+        PortSignalKind::Exit if !trapping && signal.reason.is_normal() => return Ok(false),
+        PortSignalKind::Exit if !trapping => {
+            // A non-`normal` reason in the link family terminates the non-trapping peer with
+            // that very reason (measured: `driver_failure_atom(P,"boom")` kills a non-trapping
+            // owner with `boom`), and no `'EXIT'` message is owed to a process that is dying.
+            let reason = {
+                let mut ctx = RuntimeContext::new(runtime);
+                ctx.port_exit_reason_term(&signal.reason)?
+            };
+            table.terminate(signal.to, reason)?;
+            return Ok(true);
+        }
         PortSignalKind::Exit => {}
         PortSignalKind::Down(reference) => {
             if let Some(watcher) = table.get_mut(signal.to) {
@@ -489,8 +617,10 @@ fn deliver_signal(
     let message = {
         let mut ctx = RuntimeContext::new(runtime);
         match signal.kind {
-            PortSignalKind::Exit => ctx.port_closed_message(signal.port)?,
-            PortSignalKind::Down(reference) => ctx.port_down_message(signal.port, reference)?,
+            PortSignalKind::Exit => ctx.port_closed_message(signal.port, &signal.reason)?,
+            PortSignalKind::Down(reference) => {
+                ctx.port_down_message(signal.port, reference, &signal.reason)?
+            }
         }
     };
     let from = signal.port.to_eterm();
@@ -543,6 +673,7 @@ mod tests {
             port: PortId::new(port),
             to: ProcessId::new(to, 0),
             kind: PortSignalKind::Exit,
+            reason: PortSignalReason::Normal,
         }
     }
 
