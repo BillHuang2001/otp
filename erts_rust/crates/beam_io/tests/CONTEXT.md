@@ -82,8 +82,8 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 24 suites, **222
-passing / 0 failing**; the whole `-p beam_io` run is **967** (742 lib + 222 integration + 3
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **228
+passing / 0 failing**; the whole `-p beam_io` run is **983** (752 lib + 228 integration + 5
 doctests, 2 doctests `ignore`d). Per file:
 
 | Suite | Tests | Suite | Tests |
@@ -100,6 +100,7 @@ doctests, 2 doctests `ignore`d). Per file:
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
 | `abi_failure.rs` | 8 | `udp_inet.rs` | 5 |
 | `port_task.rs` | 5 | `port.rs` | 4 |
+| `inet_accept.rs` | 6 | | |
 
 Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channel** end-to-end
 (`PortRegistry::take_completions` after every round, the recipe `beam_rt` follows):
@@ -186,6 +187,14 @@ rot.
 - `inet_async.rs` → the `tcp_inet` **asynchronous-op queue + completion channel** through
   `PortRegistry` (numeric opcodes, the single receive slot, the caller tag, the accept hand-off and
   its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases
+- `inet_accept.rs` → the **TCP accept chain at the driver boundary** (contract A.4's
+  `gen_tcp:accept/2` data path) with a foreign `std::net::TcpStream` peer: the whole chain
+  (accept-reply-is-only-the-id → one `Accepted { fd }` completion → **both** adoption routes →
+  `TCP_REQ_RECV` data → `port_command` bytes back with the caller-tag `InetReply`), a listener that
+  keeps accepting with distinct fds, the 50 ms deadline completing `{error, timeout}` exactly once,
+  two queued accepts with ids in order and the `9`/`41`/`297` `GETSTATUS` bits, the
+  `[0]einval`/`[0]exbadport` refusals plus the pending accept drained `{error, closed}` once, and
+  the frozen two-variant `PortNotification`/`CompletionEvent` channels
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
 - `udp_inet.rs`, `ram_file.rs` → the other two built-ins through the real port layer
