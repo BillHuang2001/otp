@@ -78,7 +78,10 @@
 //!   (valid operands, per-probe module extras, hooks, an installed mailbox and a
 //!   declared [`Expect`]), the generated two-sink probe module, the [`ProbeMailbox`]
 //!   receive seam, and [`ProbeRun::verdict`] — the *measured* answer to "did this
-//!   instruction do what the row declared?". `tests/census.rs` is its consumer.
+//!   instruction do what the row declared?". Its [`rows`](probe::rows) child holds
+//!   the **converted roster**, one file per instruction group (`rows::core`,
+//!   `rows::data`, `rows::exceptions`, `rows::receive`, `rows::bitstrings`), and
+//!   `rows::all_rows` is their union. `tests/census.rs` is its consumer.
 
 mod assertions;
 mod atoms;

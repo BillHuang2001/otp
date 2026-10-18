@@ -24,46 +24,57 @@
 //! separate 25-kind `TestKind`). This file turns "is every variant reachable on a
 //! real execution path?" into an executable claim instead of an untested assertion:
 //!
-//! 1. [`interpreter_execution_census_over_every_instr_variant`] builds a synthetic
-//!    one-function module `[Label(1), <variant>, Label(2), return, Label(3),
-//!    func_info, return]` for **every** variant, drives it through the real public
-//!    entry point ([`Machine::run_label`]) with a [`MinimalContext`], and classifies
-//!    the outcome:
-//!    * **(a) EXECUTED** — the instruction produced a `Step` / a returned term
-//!      (the module reached `Label(2)` and its `return`);
-//!    * **(b) CLAIMED-BLOCKED** — a typed [`beam_common::BeamError`] that is **not**
-//!      the unclaimed sentinel (a core arm's or a family's own capability error:
-//!      `bad_register`, `badarg`, a `unsupported_opcode: <seam method>`, …) ⇒ some
-//!      core arm or instruction family owns the variant;
-//!    * **(c) UNCLAIMED** — the reason carries the sentinel
-//!      [`UNCLAIMED_PREFIX`] that `families::dispatch` returns for an instruction
-//!      **no** core arm and **no** family claims.
+//! 1. [`interpreter_execution_census_over_every_instr_variant`] drives **every**
+//!    variant through the real public entry point
+//!    ([`Machine::run_label_outcome`]) and classifies the outcome:
+//!    * **(a) EXECUTED** — the instruction did what its row *declared*: it fell
+//!      through to the success sink, took its own `fail`/branch sink, suspended and
+//!      resumed, or raised its **own** defined BEAM exception. A converted row is
+//!      driven by the [`support::probe`] harness with **valid operands** (a BIF hook,
+//!      a stack frame, atom operands, module `funs`/`recs`, a live catch frame, an
+//!      installed mailbox, a match context) and a declared
+//!      [`support::Expect`](support::Expect);
+//!    * **(b) ZERO-CORPUS** — the instruction executed, but real compiler output
+//!      never emits it (the pinned [`ZERO_CORPUS`] set). A forward-compatibility row:
+//!      executed on purpose, so a toolchain that starts emitting it cannot regress
+//!      silently;
+//!    * **(c) GENUINE-GAP** — the engine did **not** demonstrate the declared
+//!      behaviour: a capability diagnostic (`unsupported_opcode: …`) or an outcome
+//!      contradicting the row's declaration. The **un-converted** rows (round 2, still
+//!      driven with the legacy degenerate operands) are also bucketed here — the
+//!      conservative side — and their detail is marked `ROUND-2`, because a typed
+//!      error from a degenerate operand is *not yet* evidence of a gap;
+//!    * **(d) UNCLAIMED** — the reason carries the sentinel [`UNCLAIMED_PREFIX`] that
+//!      `families::dispatch` returns for an instruction **no** core arm and **no**
+//!      family claims.
 //!
-//!    The census asserts (c) is **empty**: every one of the 108 variants is owned.
-//!    At this revision the measured dynamic split is **49 EXECUTED + 59
-//!    CLAIMED-BLOCKED + 0 UNCLAIMED** (pinned below as `EXECUTED_VARIANTS` /
-//!    `CLAIMED_BLOCKED_VARIANTS`). Many CLAIMED-BLOCKED rows are **probe artifacts**,
-//!    not real gaps: the roster drives every atom-ish operand as the degenerate
-//!    `Operand::Nil` (a real operand the family then rejects with a typed error), so
-//!    e.g. `IsNativeRecord`/`IsRecordAccessible` report `… : module`/`… : scope`
-//!    because the family correctly requires an atom the probe never supplies, and
-//!    `PutRecord`'s `id: nil()` probe is neither an atom nor a `{Module,Name}` pair.
-//!    Those variants have zero corpus occurrences (the installed toolchain does not
-//!    enable the `native_record` feature); the real capability gaps are named in
-//!    `tests/gaps.rs`.
+//!    The census asserts (d) is **empty**: every one of the 108 variants is owned.
+//!    At this revision the measured dynamic split is **44 EXECUTED + 7 ZERO-CORPUS +
+//!    57 GENUINE-GAP + 0 UNCLAIMED** (pinned below as `EXECUTED_VARIANTS` /
+//!    `ZERO_CORPUS_VARIANTS` / `GENUINE_GAP_VARIANTS`). **Two** rows are so far
+//!    driven with valid operands and a real expectation (`Call`, `CallExt` — the two
+//!    mechanics every other conversion builds on: a local call through an aux leaf
+//!    block, and an import dispatched to a host `bif` hook); both reach their declared
+//!    outcome. The converted roster lives in [`support::rows`], one file per
+//!    instruction group; a group that returns an empty `Vec` leaves its variants on
+//!    the legacy degenerate-operand path. The remaining 57 GENUINE-GAP rows are
+//!    **round 2**: earlier investigation showed every one of them executes under
+//!    valid operands, so the bucket is where the ratchet starts, not a claim that 57
+//!    opcodes are missing. The real capability gaps are named in `tests/gaps.rs`.
 //!
 //! 2. [`interpreter_execution_census_over_every_test_kind`] does the same for all
 //!    25 [`TestKind`]s packed into one `Instr::Test` each; all **25/25** execute
-//!    (0 claimed-blocked, 0 unclaimed).
+//!    (0 genuine-gap, 0 unclaimed).
 //!
 //! 3. [`corpus_reachability_census`] loads **every** `.beam` of the whole installed
 //!    OTP (the generic `support::all_otp_beams` walk — every application, its `ebin`
 //!    modules plus any compiled examples it ships), walks every lowered instruction
 //!    of every function, and counts occurrences per variant — the quantitative
 //!    evidence for which variants real compiler output actually emits. It asserts
-//!    that every variant with a non-zero corpus count is class (a) or (b) (nothing
-//!    the corpus reaches may be unclaimed) and names the zero-occurrence variants
-//!    explicitly. (This is the same file set `tests/stdlib_sweep.rs` proves loads in
+//!    that nothing the corpus reaches is unclaimed, and — the [`ZERO_CORPUS`]
+//!    **forward-compat pin** — that the live zero-occurrence set is *exactly* the
+//!    pinned one, so a variant the toolchain starts (or stops) emitting cannot pass
+//!    unnoticed. (This is the same file set `tests/stdlib_sweep.rs` proves loads in
 //!    full — currently ≈1366 `.beam` over ≈34 applications.)
 //!
 //! # Synthetic-module mechanics
@@ -83,6 +94,13 @@
 //! bounded number of steps. Nothing here panics or hangs: a typed error is a
 //! *result*, not a failure.
 //!
+//! A **converted** row does not use that module at all: it is built by the
+//! [`support::probe`] harness, whose generated module has the same entry label and
+//! the same two-sink shape — but with a `fail` sink that returns a *distinct* mark
+//! atom (so a declared `fail` branch is observable), a prologue/epilogue the row
+//! supplies, its own aux blocks (`aux_label(n)`) and the hooks/atoms/mailbox it
+//! declares.
+//!
 //! Family assignment (static, from the crate sources): **31** variants are executed
 //! by core arms of `src/interpreter.rs` (`Label, Line, IntCodeEnd, ExecutableLine,
 //! DebugLine, NifStart, OnLoad, FuncInfo, Move, Swap, Test, SelectVal, Jump, GcBif,
@@ -94,15 +112,22 @@
 //! `src/generic.rs` (`error::unsupported(op.name())`), which is core, so it is
 //! classed EXECUTED here with its typed error recorded in the detail column.
 //!
-//! # Why one long file
+//! # Why the rosters live here
 //!
-//! The rosters ([`all_instr_variants`], [`the_test_kinds`]) are a hand-maintained
-//! one-to-one mirror of a closed enum — 108 `Instr` constructions and 25 `TestKind`s
-//! whose value *is* that they are exhaustive. They must live beside the census that
-//! consumes them, and they cannot be factored into `tests/support/` (a shared module
-//! owned by another test file); keeping every census artifact in this one file is
+//! The **legacy** rosters ([`all_instr_variants`], [`the_test_kinds`]) are a
+//! hand-maintained one-to-one mirror of a closed enum — 108 `Instr` constructions and
+//! 25 `TestKind`s whose value *is* that they are exhaustive. They must live beside
+//! the census that consumes them, and they cannot be factored into `tests/support/`
+//! (a shared module owned by another test file); keeping them in this one file is
 //! what makes the "108 rows / 108 distinct names" assertion a real completeness
 //! check rather than a claim split across modules.
+//!
+//! The **converted** rows are the opposite: they are per-instruction research and
+//! belong next to the harness that drives them, so they live in
+//! [`support::rows`] — one file per instruction group, each owning a disjoint set of
+//! variant names. [`probe_rows`] keys them by the variant name **derived** from the
+//! constructed [`Instr`] (never spelled), so a probe row can override a legacy row
+//! but never introduce a name the roster does not have.
 
 mod support;
 
@@ -116,7 +141,7 @@ use beam_loader::{
     UpdateRecordIdArgs,
 };
 use beam_term::{Atom, Eterm};
-use support::{all_otp_beams, skip_reason};
+use support::{all_otp_beams, skip_reason, Probe, ProbeAtoms, ProbeRun, Verdict};
 
 /// The sentinel `beam_engine::families::dispatch` returns for an instruction that
 /// **no** core arm and **no** instruction family claims.
@@ -134,38 +159,80 @@ const INSTR_VARIANTS: usize = 108;
 const TEST_KINDS: usize = 25;
 
 /// The measured **dynamic** classification of the [`INSTR_VARIANTS`] variants at
-/// this census's revision: the probe reached a `Step`/return for **49** of them
-/// (class (a) EXECUTED) and observed a typed, owned capability error for **59**
-/// (class (b) CLAIMED-BLOCKED); **0** are unclaimed.
+/// this census's revision: **44** reached their declared behaviour and are not
+/// forward-compat rows (class EXECUTED), **7** executed but real compiler output
+/// never emits them (class ZERO-CORPUS), **57** did not demonstrate a declared
+/// behaviour (class GENUINE-GAP — the un-converted round-2 rows included), and **0**
+/// are unclaimed.
 ///
 /// These are the *dynamic* counts, not the *static* family assignment (31 core arms
-/// + 77 family-owned): a family-owned variant whose degenerate probe happens to
-/// execute classifies as EXECUTED — `SelectTupleArity` on a non-tuple takes the
-/// `fail` branch, exactly like an unmatched arity, and `GetRecordElements`/
-/// `GetRecordElementsId`/`GetRecordField`/`UpdateRecordId` branch to `fail` on a
-/// non-record source. `Deallocate` and `DeallocateReturn` both pop the probe's only
-/// (zero-Y) bottom frame, so the following `return` finds no frame — a probe
-/// artifact that classes both CLAIMED-BLOCKED. `SetTupleElement` is CLAIMED-BLOCKED
-/// because the probe passes the degenerate `Operand::Nil` as the tuple, so the
-/// family's write-target check raises `{badmatch, Nil}`. The counts are pinned so a
-/// change of classification (a real regression, or a newly executed variant) fails
-/// the build.
-const EXECUTED_VARIANTS: usize = 49;
-/// See [`EXECUTED_VARIANTS`]; class (b) CLAIMED-BLOCKED.
-const CLAIMED_BLOCKED_VARIANTS: usize = 59;
+/// + 77 family-owned). The counts are pinned so a change of classification — a real
+/// regression, or a newly executed variant — fails the build. Converting a round-2
+/// row moves it **out of** GENUINE-GAP into EXECUTED (or ZERO-CORPUS); a conversion
+/// that instead *reveals* a real engine limitation keeps it in GENUINE-GAP with an
+/// `ENGINE-DIAGNOSTIC` detail.
+const EXECUTED_VARIANTS: usize = 44;
+/// The executed variants that real compiler output never emits ([`ZERO_CORPUS`]).
+const ZERO_CORPUS_VARIANTS: usize = 7;
+/// See [`EXECUTED_VARIANTS`]; class GENUINE-GAP.
+const GENUINE_GAP_VARIANTS: usize = 57;
+
+/// The 13 variants the engine executes (or models) that real compiler output never
+/// emits — measured over the whole installed OTP by [`corpus_reachability_census`],
+/// which asserts the live zero-occurrence set equals this set **exactly**.
+///
+/// Why each is never emitted:
+/// * `Deallocate` — the loader fuses every `deallocate` into `DeallocateReturn`
+///   (`lower::fuse`), so the bare variant has no producer;
+/// * `SetTupleElement` — never lowered: the corpus's in-place tuple write does not
+///   occur (a `setelement/3` call builds a fresh tuple);
+/// * the seven `native_record` opcodes (`IsNativeRecord`, `PutRecord`,
+///   `IsRecordAccessible`, `GetRecordElements`, `GetRecordField`,
+///   `GetRecordElementsId`, `UpdateRecordId`) — an OTP-29 feature this toolchain
+///   does not enable for these shapes (`IsAnyNativeRecord` IS emitted);
+/// * `BsTestTail2` — the loader has no lowering site for it in this corpus;
+/// * `ExecutableLine` / `DebugLine` — line metadata the installed toolchain does not
+///   emit into these modules;
+/// * `Generic` — the residual-opcode sentinel, which an already-modelled opcode
+///   never lowers to.
+///
+/// Every member is a legitimate instruction the engine must keep executing; none of
+/// them can be *exercised by* real compiler output, so the census drives them
+/// synthetically and this pin is the only live evidence that the set has not
+/// drifted.
+const ZERO_CORPUS: &[&str] = &[
+    "Deallocate",
+    "SetTupleElement",
+    "IsNativeRecord",
+    "GetRecordElements",
+    "PutRecord",
+    "IsRecordAccessible",
+    "GetRecordField",
+    "GetRecordElementsId",
+    "UpdateRecordId",
+    "BsTestTail2",
+    "ExecutableLine",
+    "DebugLine",
+    "Generic",
+];
 
 // ---------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------
 
-/// The three census buckets.
+/// The four census buckets.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
-    /// (a) The instruction produced a `Step` / the module returned a term.
+    /// The instruction did what its row declared.
     Executed,
-    /// (b) A typed error that is **not** the unclaimed sentinel ⇒ someone owns it.
-    ClaimedBlocked,
-    /// (c) The `families::dispatch` "no core arm, no family" sentinel.
+    /// The instruction executed, but real compiler output never emits it
+    /// ([`ZERO_CORPUS`]): a forward-compatibility row.
+    ZeroCorpus,
+    /// The engine did **not** demonstrate the declared behaviour — a capability
+    /// diagnostic, or an outcome contradicting the row's declaration, or a
+    /// round-2 row still driven with degenerate operands.
+    GenuineGap,
+    /// The `families::dispatch` "no core arm, no family" sentinel.
     Unclaimed,
 }
 
@@ -173,7 +240,8 @@ impl Class {
     fn label(self) -> &'static str {
         match self {
             Class::Executed => "EXECUTED",
-            Class::ClaimedBlocked => "CLAIMED-BLOCKED",
+            Class::ZeroCorpus => "ZERO-CORPUS",
+            Class::GenuineGap => "GENUINE-GAP",
             Class::Unclaimed => "UNCLAIMED",
         }
     }
@@ -186,12 +254,24 @@ struct Row {
     detail: String,
 }
 
-/// Classify one run outcome.
+/// The bucket a run's text implies: the family sentinel is [`Class::Unclaimed`], any
+/// other typed failure is (conservatively) a [`Class::GenuineGap`].
+fn class_of_text(text: &str) -> Class {
+    if text.contains(UNCLAIMED_PREFIX) {
+        Class::Unclaimed
+    } else {
+        Class::GenuineGap
+    }
+}
+
+/// Classify one **legacy** (un-converted, degenerate-operand) run outcome.
 ///
-/// `Ok(term)` is (a). An error is (c) when its text carries [`UNCLAIMED_PREFIX`],
-/// else (b). The text is the error's `Debug` plus its BEAM atom name (when it has
-/// one), so the sentinel — an `unsupported_opcode: widened opcode not yet executed:
-/// <name>` atom — is always visible.
+/// `Ok(term)` is EXECUTED. An error is UNCLAIMED when its text carries
+/// [`UNCLAIMED_PREFIX`], else GENUINE-GAP — marked `ROUND-2` because the operand that
+/// produced it is not a valid one, so the row has not been measured yet. The text is
+/// the error's `Debug` plus its BEAM atom name (when it has one), so the sentinel — an
+/// `unsupported_opcode: widened opcode not yet executed: <name>` atom — is always
+/// visible.
 fn classify(result: Result<Eterm>) -> (Class, String) {
     match result {
         Ok(term) => (Class::Executed, format!("returned {term:?}")),
@@ -201,14 +281,32 @@ fn classify(result: Result<Eterm>) -> (Class, String) {
                 text.push_str(" => ");
                 text.push_str(atom);
             }
-            let class = if text.contains(UNCLAIMED_PREFIX) {
-                Class::Unclaimed
-            } else {
-                Class::ClaimedBlocked
-            };
+            let class = class_of_text(&text);
+            if class == Class::GenuineGap {
+                text = format!("ROUND-2 (degenerate operand, not measured yet): {text}");
+            }
             (class, text)
         }
     }
+}
+
+/// Classify one **converted** (probe-driven) run against its declared expectation.
+///
+/// The rule is the row's declaration: `Verdict::Matched` is EXECUTED, anything else is
+/// GENUINE-GAP (an engine diagnostic always wins inside [`ProbeRun::verdict`], so an
+/// engine limitation can never satisfy a declaration). The sentinel check comes first so
+/// an unclaimed variant is never folded into the gap bucket.
+fn classify_probe(run: ProbeRun) -> (Class, String) {
+    let class = if run.is_unclaimed() {
+        Class::Unclaimed
+    } else {
+        match run.verdict(&run.expect) {
+            Verdict::Matched => Class::Executed,
+            Verdict::Diagnostic | Verdict::Contradicted => Class::GenuineGap,
+        }
+    };
+    let text = format!("[expects {}] {}", run.expect.describe(), run.report());
+    (class, text)
 }
 
 // ---------------------------------------------------------------------------
@@ -329,12 +427,93 @@ fn census_module(variant: &Instr) -> Module {
     module
 }
 
-/// Drive `variant` through the real public execution entry and classify the
-/// outcome.
+/// The **converted** rows, keyed by variant name (see [`support::rows`]).
 ///
-/// The `MinimalContext` (no BIF hook beyond the default rejecting one, no mailbox)
-/// is alive for the whole call, including the formatting of the outcome.
-fn run_row(name: String, variant: Instr) -> Row {
+/// A probe row *overrides* the legacy [`all_instr_variants`] row of the same name:
+/// the legacy roster stays as the fallback for the not-yet-converted variants, so
+/// the census always drives all [`INSTR_VARIANTS`] regardless of how many groups have
+/// been converted.
+///
+/// The map is keyed by `&'static str` so a lookup never allocates per row; the
+/// variant name is a closed-set property of the constructed [`Instr`], so it is
+/// **derived** here (never spelled) and leaked once per converted row.
+///
+/// Two harness invariants are asserted here, so every caller gets them for free:
+/// * a probe that names a variant outside the legacy roster is a harness bug (a
+///   typo, or a row that was renamed), and
+/// * two groups may not claim the same variant (their rows would silently shadow
+///   each other).
+fn probe_rows(atoms: &ProbeAtoms) -> BTreeMap<&'static str, Probe> {
+    let legacy: BTreeSet<String> = all_instr_variants()
+        .iter()
+        .map(|variant| variant_name(variant))
+        .collect();
+    let mut rows: BTreeMap<&'static str, Probe> = BTreeMap::new();
+    for probe in support::rows::all_rows(atoms) {
+        let name = variant_name(&probe.instr);
+        assert!(
+            legacy.contains(&name),
+            "a probe row names the variant {name:?}, which is not in the census roster"
+        );
+        let key: &'static str = Box::leak(name.into_boxed_str());
+        let previous = rows.insert(key, probe);
+        assert!(
+            previous.is_none(),
+            "two probe rows claim the variant {key} — a variant belongs to exactly one group"
+        );
+    }
+    rows
+}
+
+/// Take the probe row registered for `name` out of the map, if any.
+///
+/// A linear scan over the (closed, at most [`INSTR_VARIANTS`]-entry) converted
+/// roster: a `Borrow`-based lookup on a `&'static str` key is not available, and a
+/// `Probe` is consumed by its run, so the row is removed rather than borrowed.
+fn take_probe(probes: &mut BTreeMap<&'static str, Probe>, name: &str) -> Option<Probe> {
+    let key = probes.keys().copied().find(|key| *key == name)?;
+    probes.remove(key)
+}
+
+/// Drive one row and classify the outcome.
+///
+/// A **converted** variant runs through the [`Probe`] harness (valid operands, a
+/// declared [`support::Expect`]) and is classed against that declaration by
+/// [`classify_probe`]; an un-converted one falls back to the legacy degenerate-operand
+/// module and [`classify`].
+fn run_row(
+    name: String,
+    variant: Instr,
+    atoms: &ProbeAtoms,
+    probes: &mut BTreeMap<&'static str, Probe>,
+) -> Row {
+    let (mut class, detail) = match take_probe(probes, &name) {
+        Some(probe) => {
+            assert_eq!(
+                variant_name(&probe.instr),
+                name,
+                "the probe row taken for {name} drives a different variant"
+            );
+            classify_probe(probe.run(atoms))
+        }
+        None => run_legacy_row(variant),
+    };
+    // A variant the engine executes but real compiler output never emits is a
+    // **forward-compat** row, not an execution claim: re-bucket it. The set is the
+    // measured [`ZERO_CORPUS`] pin (asserted live by `corpus_reachability_census`).
+    if class == Class::Executed && ZERO_CORPUS.contains(&name.as_str()) {
+        class = Class::ZeroCorpus;
+    }
+    Row {
+        name,
+        class,
+        detail,
+    }
+}
+
+/// The legacy path: `variant` in the degenerate-operand census module, driven
+/// through [`Machine::run_label`].
+fn run_legacy_row(variant: Instr) -> (Class, String) {
     let is_generic = matches!(variant, Instr::Generic { .. });
     let module = census_module(&variant);
 
@@ -350,43 +529,51 @@ fn run_row(name: String, variant: Instr) -> Row {
         class = Class::Executed;
         detail = format!("core sentinel — {detail}");
     }
-    Row {
-        name,
-        class,
-        detail,
-    }
+    (class, detail)
 }
 
 /// The census over every [`Instr`] variant, in the enum's own order.
-fn variant_census() -> Vec<Row> {
-    all_instr_variants()
+fn variant_census(atoms: &ProbeAtoms) -> Vec<Row> {
+    let mut probes = probe_rows(atoms);
+    let rows: Vec<Row> = all_instr_variants()
         .into_iter()
         .map(|variant| {
             let name = variant_name(&variant);
-            run_row(name, variant)
+            run_row(name, variant, atoms, &mut probes)
         })
-        .collect()
+        .collect();
+    // Every converted row is part of the roster above, so a leftover is a row whose
+    // instruction names a variant the roster does not construct.
+    assert!(
+        probes.is_empty(),
+        "{} probe row(s) were never driven: {:?}",
+        probes.len(),
+        probes.keys().collect::<Vec<_>>()
+    );
+    rows
 }
-
 // ---------------------------------------------------------------------------
 // Test 1 — the per-variant execution census
 // ---------------------------------------------------------------------------
 
 #[test]
 fn interpreter_execution_census_over_every_instr_variant() {
-    let rows = variant_census();
+    let atoms = ProbeAtoms::new();
+    let rows = variant_census(&atoms);
 
     let mut executed = 0usize;
-    let mut blocked = 0usize;
+    let mut zero_corpus = 0usize;
+    let mut gaps = 0usize;
     let mut unclaimed = 0usize;
     for row in &rows {
         match row.class {
             Class::Executed => executed += 1,
-            Class::ClaimedBlocked => blocked += 1,
+            Class::ZeroCorpus => zero_corpus += 1,
+            Class::GenuineGap => gaps += 1,
             Class::Unclaimed => unclaimed += 1,
         }
         println!(
-            "CENSUS-INSTR {:<22} {:<16} {}",
+            "CENSUS-INSTR {:<22} {:<14} {}",
             row.name,
             row.class.label(),
             row.detail
@@ -394,10 +581,11 @@ fn interpreter_execution_census_over_every_instr_variant() {
     }
 
     println!(
-        "CENSUS: variants={} executed={} claimed-blocked={} unclaimed={}",
+        "CENSUS: variants={} executed={} zero-corpus={} genuine-gap={} unclaimed={}",
         rows.len(),
         executed,
-        blocked,
+        zero_corpus,
+        gaps,
         unclaimed
     );
 
@@ -438,12 +626,16 @@ fn interpreter_execution_census_over_every_instr_variant() {
         "the census executed {executed} variants, expected {EXECUTED_VARIANTS}"
     );
     assert_eq!(
-        blocked, CLAIMED_BLOCKED_VARIANTS,
-        "the census found {blocked} CLAIMED-BLOCKED variants, expected \
-         {CLAIMED_BLOCKED_VARIANTS}"
+        zero_corpus, ZERO_CORPUS_VARIANTS,
+        "the census found {zero_corpus} ZERO-CORPUS variants, expected \
+         {ZERO_CORPUS_VARIANTS}"
     );
     assert_eq!(
-        executed + blocked + unclaimed,
+        gaps, GENUINE_GAP_VARIANTS,
+        "the census found {gaps} GENUINE-GAP variants, expected {GENUINE_GAP_VARIANTS}"
+    );
+    assert_eq!(
+        executed + zero_corpus + gaps + unclaimed,
         INSTR_VARIANTS,
         "the census classes must partition all {INSTR_VARIANTS} variants"
     );
@@ -473,31 +665,36 @@ fn interpreter_execution_census_over_every_test_kind() {
                     fail: Label(2),
                     args,
                 },
+                &ProbeAtoms::new(),
+                &mut BTreeMap::new(),
             )
         })
         .collect();
 
     let mut executed = 0usize;
-    let mut blocked = 0usize;
+    let mut gaps = 0usize;
     let mut unclaimed = 0usize;
     for row in &rows {
         match row.class {
             Class::Executed => executed += 1,
-            Class::ClaimedBlocked => blocked += 1,
+            Class::GenuineGap => gaps += 1,
             Class::Unclaimed => unclaimed += 1,
+            Class::ZeroCorpus => {
+                panic!("{} is a TestKind row, not an Instr row", row.name);
+            }
         }
         println!(
-            "CENSUS-KIND {:<22} {:<16} {}",
+            "CENSUS-KIND {:<22} {:<14} {}",
             row.name,
             row.class.label(),
             row.detail
         );
     }
     println!(
-        "CENSUS-TESTKIND: kinds={} executed={} claimed-blocked={} unclaimed={}",
+        "CENSUS-TESTKIND: kinds={} executed={} genuine-gap={} unclaimed={}",
         rows.len(),
         executed,
-        blocked,
+        gaps,
         unclaimed
     );
 
@@ -512,7 +709,7 @@ fn interpreter_execution_census_over_every_test_kind() {
          {unclaimed_names:?}"
     );
 
-    // The roster must cover every kind, and all 25/25 must execute (0 claimed-blocked,
+    // The roster must cover every kind, and all 25/25 must execute (0 genuine-gap,
     // 0 unclaimed): the interpreter's test evaluation owns every `TestKind`.
     assert_eq!(
         rows.len(),
@@ -524,7 +721,7 @@ fn interpreter_execution_census_over_every_test_kind() {
         executed, TEST_KINDS,
         "only {executed} of {TEST_KINDS} TestKind(s) executed — every kind must"
     );
-    assert_eq!(blocked, 0, "{blocked} TestKind(s) are CLAIMED-BLOCKED");
+    assert_eq!(gaps, 0, "{gaps} TestKind(s) are GENUINE-GAP");
 }
 
 /// The `(name, operands)` pair per [`TestKind`], with a correct operand count so the
@@ -629,7 +826,8 @@ fn corpus_reachability_census() {
         per_app.len()
     );
 
-    let rows = variant_census();
+    let atoms = ProbeAtoms::new();
+    let rows = variant_census(&atoms);
     let classes: BTreeMap<&str, Class> = rows
         .iter()
         .map(|row| (row.name.as_str(), row.class))
@@ -683,6 +881,36 @@ fn corpus_reachability_census() {
         "CENSUS-CORPUS-ZERO-KINDS ({}): {}",
         zero_kinds.len(),
         zero_kinds.join(", ")
+    );
+
+    // The **dual** summary: the census rows by bucket, and — beside it — how many of
+    // them the corpus actually reaches. The zero-corpus bucket is the one the
+    // `ZERO_CORPUS` pin below is measured from.
+    let bucket = |class: Class| rows.iter().filter(|row| row.class == class).count();
+    println!(
+        "CENSUS-CORPUS-SUMMARY: rows={} executed(excluding zero-corpus)={} \
+         zero-corpus={} genuine-gap={} unclaimed={}",
+        rows.len(),
+        bucket(Class::Executed),
+        bucket(Class::ZeroCorpus),
+        bucket(Class::GenuineGap),
+        bucket(Class::Unclaimed)
+    );
+
+    // The **forward-compat pin**: the live zero-occurrence set must equal [`ZERO_CORPUS`]
+    // exactly. Nothing else is allowed to silently drop out of (or into) the corpus —
+    // a newly emitted variant would retire a forward-compat row, and a variant the
+    // toolchain stopped emitting would make one stale. Either way the pin must be
+    // re-measured rather than quietly kept.
+    let live_zero: BTreeSet<&str> = zero.iter().copied().collect();
+    let pinned: BTreeSet<&str> = ZERO_CORPUS.iter().copied().collect();
+    assert!(
+        live_zero == pinned,
+        "the live zero-occurrence variant set drifted from the pinned `ZERO_CORPUS`: \
+         re-measure the corpus and update the pin (and `ZERO_CORPUS_VARIANTS`).\n  \
+         live   ({}): {live_zero:?}\n  pinned ({}): {pinned:?}",
+        live_zero.len(),
+        pinned.len()
     );
 
     // Nothing the corpus reaches may be unclaimed.

@@ -30,6 +30,28 @@
 //! declared [`Expect`] — and [`Probe::run`] reports whether the engine did exactly
 //! what the row declared.
 //!
+//! # File layout
+//!
+//! This harness was split from a single ~1100-line file into a directory module.
+//! The **public surface is preserved exactly** — every item is re-exported from
+//! here, so `support::X` (and any `support::<item>` path a test already uses) still
+//! resolves unchanged:
+//! * this file ([`probe`](self)) — the harness itself: [`ProbeAtoms`], [`Probe`],
+//!   [`ProbeRun`], [`Expect`]/[`Observed`]/[`Verdict`], the generated two-sink
+//!   probe module, the fixed [`ENTRY_LABEL`]/[`SUCCESS_LABEL`]/[`FAIL_SINK_LABEL`]
+//!   labels and [`aux_label`], the [`ProbeMailbox`] receive seam, and the term
+//!   renderers.
+//! * [`rows`] — the **converted roster**, one file per instruction group
+//!   (`rows::core`, `rows::data`, `rows::exceptions`, `rows::receive`,
+//!   `rows::bitstrings`), each exposing `pub fn rows(atoms: &ProbeAtoms) ->
+//!   Vec<Probe>`. [`rows::all_rows`] is the union. A group file owns a disjoint set
+//!   of variant names, so a row can be added or rewritten without touching another
+//!   group (or this file).
+//!
+//! `tests/census.rs` is the consumer: it keys [`rows::all_rows`] by variant name,
+//! overrides the legacy roster entry of the same name, and buckets the run by its
+//! [`Verdict`].
+//!
 //! # The generated module
 //!
 //! ```text
@@ -78,6 +100,8 @@
 //! [`Eterm`]s: every term in [`Observed`] points into that context's arena (or into
 //! the module's literal area), so the run object must outlive any assertion on them.
 //! Never copy an `Eterm` out of a `ProbeRun` that has been dropped.
+
+pub mod rows;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
