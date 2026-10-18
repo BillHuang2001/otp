@@ -408,49 +408,63 @@ fn the_send_path_echoes_the_caller_tag_verbatim() {
     assert_eq!(&buf[..len], b"dg3");
 }
 
+/// A **correction**: a queued command carrying **no** caller-reference prefix closes the port
+/// instead of being written. `init_caller` runs on every `erlang:port_command/2` command from an
+/// internal pid (`inet_drv.c:15054`, rule `:1820`-`:1890`) and its rule is **size-only**, so the
+/// address's `[INET_AF_INET(1), port_hi]` head reads as a 16-bit tag length (>= 384 for any
+/// ephemeral port) the command cannot satisfy ⇒ `FALSE` ⇒ `driver_failure_posix(port, EINVAL)`
+/// (`:15063`), which the registry reaps after the round.
+///
+/// Measured on OTP 29.1.1: `port_command(P, <<1,0,0,0,0,0,0,0,0,0,0>>)` answers `true`, the owner
+/// gets `{'EXIT',P,einval}` and `port_info(P,name)` is `undefined`. So nothing is written, no
+/// `{inet_reply, …}` is staged, and the peer receives no datagram — the assertions below.
 #[test]
-fn a_command_without_a_caller_tag_stages_no_reply() {
+fn a_command_without_a_caller_tag_closes_the_port_and_stages_no_reply() {
     let (mut port, _bound) = bound_port();
     let peer = UdpSocket::bind("127.0.0.1:0").expect("a peer socket");
     let target = peer.local_addr().expect("the peer address");
     let std::net::IpAddr::V4(address) = target.ip() else {
         panic!("an IPv4 peer");
     };
-
-    // A **plain** command: no `[n:be16][tag]` prefix at all.
     let mut command = pack_address(target.port(), address.octets());
     command.extend_from_slice(&0u32.to_be_bytes());
     command.extend_from_slice(b"plain");
-    port.command(&command).expect("the command is written");
-
+    port.command(&command)
+        .expect("`erlang:port_command/2` answers `true`: the callback returns normally");
     let events = port.completions();
     assert!(
         events
             .iter()
             .all(|event| !matches!(event.event, CompletionEvent::InetReply { .. })),
-        "the C's `inet_reply_finish` sends nothing without a caller: {events:?}"
+        "a malformed command has no caller reference to answer: {events:?}"
     );
-    assert!(port.contains(), "the port stays alive");
-
-    let mut buf = [0u8; 64];
-    peer.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let (len, _from) = peer.recv_from(&mut buf).expect("the datagram arrives");
-    assert_eq!(&buf[..len], b"plain");
-}
-
-#[test]
-fn a_socket_less_command_still_keeps_its_bytes_queued() {
-    let mut port = bare_port();
-    let error = port
-        .command(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-        .expect_err("a socket-less port refuses the command");
     assert!(
-        matches!(error, beam_common::BeamError::BadArg),
-        "the honest refusal, not a fabricated reply: {error:?}"
+        !port.contains(),
+        "`driver_failure_posix(EINVAL)` is reaped into the owner's `{{'EXIT',P,einval}}`"
     );
-    assert!(port.contains(), "the port stays alive");
+    peer.set_read_timeout(Some(Duration::from_millis(200))).ok();
+    let mut buf = [0u8; 64];
+    assert!(
+        matches!(peer.recv_from(&mut buf), Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock),
+        "and the operand was never parsed, so no datagram went out"
+    );
 }
-
+/// A **correction**: a socket-less `port_command/2` no longer keeps its bytes. The bare payload
+/// `init_caller` rejects kills the port (`inet_drv.c:15054`/`:15063`) and the command is charged
+/// whole, so the port leaves the registry with nothing queued rather than staying alive behind a
+/// typed [`beam_common::BeamError::BadArg`]. The well-formed-prefix row — accepted, answered
+/// `{error, einval}` out of band, port **alive** — is
+/// [`a_socket_less_tagged_command_answers_einval`](super::udp_tests).
+#[test]
+fn a_socket_less_command_closes_the_port() {
+    let mut port = bare_port();
+    port.command(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .expect("the C accepts the command and charges it");
+    assert!(
+        !port.contains(),
+        "the reaped port is gone: `driver_failure_posix(EINVAL)`"
+    );
+}
 /// A **zero-length** caller tag (`[0,0]`) is a well-formed prefix `init_caller` consumes
 /// (`inet_drv.c:1854`-`:1881`): the two length bytes come off the queue and the peer receives the
 /// payload alone — and, because `inet_reply_finish` has no tag to append, **no** `{inet_reply,…}`
