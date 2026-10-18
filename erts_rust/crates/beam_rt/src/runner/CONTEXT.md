@@ -657,6 +657,7 @@ dispatch — the invariant `../context/position.rs:67-69` relies on.
 | `../context/gc.rs:1034` `ensure_heap` (narrow) | **no engine call site** (`gc.rs:1807`) | `x[..live]` + stack, **no FR file**; float-guarded | `armed` |
 | `../context/gc/reds_door.rs:176` `collect_at_reds_boundary` | `run.rs:1249` (the `Yield` arm only) | `RootSet::ALL_LIVE`: **all 1024 x slots** + whole stack + `fr[..fr_count]` (`reds_door.rs:279` → `gc.rs:786`) | `run.rs:337 parked_published`, `gc_process_enabled`, 4 000-red interval, `is_relocation_exempt`, 7/8 occupancy or `collection_debt`, valve |
 | `../context/gc.rs:1465` `alloc_words` | anywhere | **never collects** (grow + retry, else arena) | — |
+The slice-boundary off-heap prune is **not** a collection site and gets no row: it relocates nothing and publishes nothing of its own, it runs immediately after `collect_at_reds_boundary` on the same `Yield` park, and it prunes the machine's payload reservoir rather than a heap — see *The off-heap refc-binary reclamation at the slice boundary*.
 Out of slice, `ProcessTable::deliver`/`enqueue_exit_signal`/`grow_receiver_for_signal` relocate a
 **non-running** receiver only (`beam_process/src/ptab.rs:197`, `:243`, `:2661`, `:2715` all refuse on
 `has_unpublished_roots()`, which is `relocation_exempt || Running`), so they cannot touch a running
