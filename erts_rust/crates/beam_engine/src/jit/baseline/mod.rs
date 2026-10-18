@@ -885,7 +885,16 @@ fn drive(
     // default `false` keeps the plain `call_bif` path byte-identical. (The traced early
     // return above delegates to `Machine::drive`, which latches the gate itself.)
     machine.bif_in_machine_on = ctx.wants_bif_in_machine();
-    // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
+    // Latch the per-run reduction-hook gate too, exactly as `Machine::drive` does:
+    // this driver **is** one scheduling slice, so the host's
+    // [`ExecutionContext::wants_reduce`] answer decides whether its `reduce` hook is
+    // offered the per-block charge below (a host whose hook is the default no-op pays
+    // one `bool` load per block and nothing else), and the engine-side slice counter
+    // starts at zero here for the same reason (and with the same meaning) as the
+    // interpreter's: what this slice charged, read back through `Machine::reductions`.
+    machine.reduce_on = ctx.wants_reduce();
+    let reduce_on = machine.reduce_on;
+    machine.reductions = 0;    // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.
     let x_regs: *mut Eterm = machine.x.as_mut_ptr();
@@ -945,6 +954,53 @@ fn drive(
     rt.refresh_literals();
 
     loop {
+        // ── The block-entry reduction charge: the native tier's pre-emption point ──
+        //
+        // A compiled block runs natively and never crosses the per-instruction
+        // [`ExecutionContext::reduce`] hook, so without this charge a
+        // BIF-and-call-only loop on this tier can only be pre-empted at a
+        // heap-admission door it never reaches (see the `reduce` seam docs). One
+        // charge per **driver-loop iteration** closes that: an iteration is one block
+        // entry — a natively executed block, or the per-instruction interpreter step
+        // this driver takes for an address the artifact compiled no block for — i.e.
+        // exactly the granularity at which `Machine::current_code` is published on
+        // this tier and at which a pre-empted machine is re-entered.
+        //
+        // # Why charging HERE is sound, and charging from inside a call/BIF seam is not
+        //
+        // The runner parks an exhausted machine at `Machine::current_code` and
+        // re-enters there, so a refusal is only safe where the published position
+        // **is** the thing about to run and nothing of it has run yet. Both hold
+        // here: the position is `(func, pc)` — the address about to be entered — and
+        // the block has not executed at all, so a resume re-enters the block entry
+        // with **no prefix replay**. Charging from a call-resolution or BIF seam
+        // would instead refuse with the block's *entry* position still current after
+        // a prefix of the block had already executed, and the resume would replay
+        // that prefix (a second `send`/`put/2`/ETS write — measured, not inferred:
+        // `-eval 'halt(0).'` then dies with `unsupported: opcode: run: process
+        // blocked`). This is why the charge precedes `code.enter` rather than pricing
+        // the work from inside it.
+        //
+        // The gate is the same latched [`ExecutionContext::wants_reduce`] answer
+        // `Machine::drive` uses (`Machine::reduce_on`), so a host whose `reduce` is
+        // the default no-op pays one `bool` load per iteration and nothing else and
+        // stays byte-identical.
+        //
+        // SAFETY: `machine_ptr`/`ctx_ptr` point at the driver's live, distinct
+        // objects (`Machine` and the `ExecutionContext`); the loop head is only
+        // reached between block calls, so no native code is running and neither
+        // borrow is outstanding.
+        unsafe {
+            (*machine_ptr).set_current_code(func, pc);
+            // The engine-side slice counter, bumped in the same step as the hook so
+            // the two always agree (the interpreter driver's invariant).
+            (*machine_ptr).reductions = (*machine_ptr).reductions.saturating_add(1);
+        }
+        if reduce_on {
+            // SAFETY: as above — no native code is running and the context is live
+            // for the whole loop.
+            unsafe { (*ctx_ptr).reduce(1) }?;
+        }
         // Native entry for the ACTIVE module: the caller-owned artifact in context
         // `0`, the callee's blocks (if the tier has any) in a non-entry context.
         let native = match state.active {
