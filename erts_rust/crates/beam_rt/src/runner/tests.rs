@@ -33,7 +33,7 @@ use beam_engine::machine::WaitDeadline;
 use beam_engine::{terms, Machine, Mailbox, MinimalContext, RunOutcome as EngineOutcome, Tier};
 use beam_loader::{Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand};
 use beam_process::{
-    ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms,
+    ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms,
     DEFAULT_REDUCTIONS_PER_SLICE,
 };
 use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm, NIL};
@@ -43,9 +43,8 @@ use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
 use super::run::{
-    park_publish_counters, publish_parked_roots, registered_payload_total,
-    reset_park_publish_counters,
-    reset_registered_payload_total, reset_run_slice_counters, run_slice_counters, RuntimeRunner,
+    park_publish_counters, publish_parked_roots, reset_park_publish_counters,
+    reset_run_slice_counters, run_slice_counters, RuntimeRunner,
 };
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
 mod boundary_cost;
@@ -936,21 +935,25 @@ run() ->
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **A running process comes to OWN the off-heap refc binaries its engine built.**
+/// **A running process's off-heap refc binaries are its engine's reservoir — nothing is
+/// mirrored onto the PCB.**
 ///
-/// `erlang:process_info(Pid, binary)` reads its roster from `beam_process::Process`'s off-heap
-/// table, whose only in-production producer is [`RuntimeRunner`]'s per-slice registration seam:
-/// a payload built by compiled bitstring code is held by the machine's `Machine::refc_binaries`
-/// reservoir, and the runner copies the whole reservoir onto the process's table at the end of
-/// every slice. This pins **both** halves for a process parked at a `receive` **after** building
-/// a runtime-sized (off-heap, above the 64-byte on-heap limit) binary: the machine's reservoir is
-/// non-empty *and* the process's own roster is non-empty.
+/// `erlang:process_info(Pid, binary)` reports the payloads a process built. The one holder of
+/// them is the machine's `Machine::refc_binaries` reservoir (append-only, never cleared by
+/// `Machine::reset`), which the runner leaves where it is: it reads them back through
+/// `RunnerState::reservoir_at`. The process's **own** off-heap table is therefore handed out
+/// **no slot at all** — which is the whole point, because `beam_gc::OffHeap`'s slot space is
+/// never compacted, so a slot per payload per slice made the O(slots) `overhead_bytes`/`sweep`
+/// walks quadratic in the number of iterations a build-a-binary loop had run.
 ///
-/// The fixture is deliberately a real compile of `<<0:N/unit:8>>` with a **variable** size, so
-/// the compiler lowers it to `bs_create_bin` (unit 8 → `N` **bytes**, not `N` bits) →
-/// [`make_binary`](beam_engine) → `alloc_refc_binary`, which is exactly the production route. The
-/// reservoir assertion above the roster assertion is load-bearing: it fails loudly if the fixture
-/// ever stops building off-heap, so the roster assertion can never be satisfied vacuously.
+/// This pins all three halves for a process parked at a `receive` **after** building a
+/// runtime-sized (off-heap, above the 64-byte on-heap limit) binary: the reservoir is non-empty,
+/// the process's own table is empty, and the real observable — `erlang:process_info(Pid, binary)`
+/// — still lists the payload. The fixture is a real compile of `<<0:N/unit:8>>` with a
+/// **variable** size, so the compiler lowers it to `bs_create_bin` (unit 8 → `N` **bytes**) →
+/// `alloc_refc_binary`, which is exactly the production route. The reservoir assertion is
+/// load-bearing: it fails loudly if the fixture ever stops building off-heap, so the roster
+/// assertion can never be satisfied vacuously.
 #[test]
 fn a_process_building_an_off_heap_binary_comes_to_own_it() {
     let source = "\
@@ -967,96 +970,119 @@ build_and_park(N) ->
 
     let mut rt = runtime();
     rt.add_code_path(&dir);
-    let mut state = RunnerState::default();
-    let mut table = table();
-    let pid = table.spawn_default().expect("a fresh process");
-    let module =
-        Arc::new(beam_loader::load_file(dir.join("ohb.beam")).expect("load the compiled module"));
-    let build = module
-        .atom_table
-        .lookup("build_and_park")
-        .expect("build_and_park/1 is interned");
-    state.spawn(
-        pid,
-        ProcessEntry::Export {
-            module,
-            function: build,
-            arity: 1,
-        },
-        // 256 bytes > `ERL_ONHEAP_BINARY_LIMIT` (64), so the result is an off-heap refc binary.
-        vec![make_small(256)],
-    );
-
-    let outcome = {
-        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
-        runner
-            .run(pid, &mut table, 1_000)
-            .expect("the slice runs")
-    };
+    // Loaded through the runtime's code server (not `beam_loader::load_file`), so the child
+    // shares the runtime's one atom table and both live in the runtime's own process table and
+    // engine state — which is what makes the `erlang:process_info/2` read below the real path.
+    rt.load_module(dir.join("ohb.beam"))
+        .expect("the compiled module loads");
+    let pid = rt
+        .spawn_process("ohb", "build_and_park", vec![make_small(256)])
+        .expect("spawn ohb:build_and_park/1");
     assert_eq!(
-        outcome,
-        ProcOutcome::Wait,
+        rt.run_one_slice().expect("one slice"),
+        1,
+        "the child ran in exactly one slice"
+    );
+    assert_eq!(
+        rt.processes()
+            .get(pid)
+            .expect("the parked child stays in the table")
+            .state(),
+        ProcessState::Waiting,
         "the bare `receive` parks the process after it builds the binary"
     );
 
     // The fixture really builds off-heap: the machine's never-cleared reservoir holds the payload.
-    let engine = state.engines.get(&pid).expect("the parked engine");
+    let reservoir = rt
+        .runner_state()
+        .reservoir_at(pid)
+        .expect("the parked child has an engine");
     assert!(
-        !engine.machine.refc_binaries().is_empty(),
+        !reservoir.is_empty(),
         "the fixture must build its binary off-heap (a runtime-sized `<<0:N/unit:8>>`, N = 256)"
     );
 
-    // ...and the per-slice registration seam made the *process* come to own it.
+    // ...and the process's own off-heap table was handed out NO slot: nothing is mirrored.
+    let (slots, bytes) = {
+        let process = rt.processes().get(pid).expect("the parked process");
+        (process.off_heap_binary_count(), process.off_heap_binary_bytes())
+    };
+    assert_eq!(
+        slots, 0,
+        "no payload is registered on the PCB: the engine reservoir is the one holder"
+    );
+    assert_eq!(bytes, 0, "so the never-compacted off-heap slot space stays empty");
+
+    // The real observable: `erlang:process_info(Pid, binary)` still lists the payload it built.
+    let info = crate::native::test_support::atom(&mut rt, "binary");
+    let reply = crate::native::test_support::call(
+        &mut rt,
+        "erlang",
+        "process_info",
+        &[pid.to_eterm(), info],
+    )
+    .expect("erlang:process_info/2 binary");
+    assert_eq!(terms::tuple_arity(reply).expect("a tuple"), 2);
+    let roster = terms::tuple_element(reply, 1).expect("the item's value");
+    let entries = terms::list_elements(roster).expect("the roster is a list");
     assert!(
-        table
-            .get(pid)
-            .expect("the parked process")
-            .off_heap_binary_count()
-            >= 1,
-        "the runner registers the machine's reservoir onto the process's own off-heap table"
+        !entries.is_empty(),
+        "a process holding an off-heap refc binary must not report `[]`"
+    );
+    let sizes: Vec<i64> = entries
+        .iter()
+        .map(|entry| signed_value(terms::tuple_element(*entry, 1).expect("the size")))
+        .collect();
+    assert!(
+        sizes.contains(&256),
+        "the roster carries the 256-byte payload the fixture built: {sizes:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **The per-slice registration walks only the not-yet-registered suffix of the machine's
-/// reservoir, so a multi-slice process registers each distinct payload exactly ONCE.**
+/// **A process never hands out an off-heap slot, no matter how many slices it runs.**
 ///
-/// This is the deterministic regression pin for the Θ(N³) `foreign`/`enc` blow-up. The old seam
-/// re-offered the **whole** append-only `Machine::refc_binaries` reservoir on *every* slice, so a
-/// long-lived process paid `Σ_k |reservoir_k|` registration calls — quadratic-to-cubic in the
-/// payloads it built — while each call also paid an O(slots) `owned_binary_slot` scan inside
-/// `Process::register_off_heap_binary`. The cursor reduces that to `|reservoir|` (linear).
+/// The deterministic mechanism pin for the quadratic `foreign`/`enc` regression. The removed
+/// seam mirrored the machine's append-only `Machine::refc_binaries` reservoir onto the
+/// process's own off-heap table once per slice; `beam_gc::OffHeap` never compacts, so the slot
+/// vector only ever grew and every `Process::grow_nursery` / `ensure_capacity` /
+/// `sweep_off_heap_binaries` then walked all of it — O(reservoir) work per call, i.e. quadratic
+/// in the loop count.
 ///
-/// The pin drives a tail loop that builds a fresh runtime-sized (off-heap) binary per iteration
-/// across several slices and reads a **per-thread** count of the payloads the runner actually
-/// registered ([`registered_payload_total`]), then asserts that total never exceeds the number of
-/// distinct payloads the reservoir holds (`≤`, with equality the cursor's signature — the counts
-/// telescope to `|reservoir|`). Under the old walk the total is `Σ_k |reservoir_k|`, which
-/// exceeds the reservoir on any multi-slice run whose reservoir is non-empty, so this fails
-/// loudly there.
+/// The pin drives a tail loop that builds runtime-sized (off-heap) binaries across several
+/// slices and asserts, **after every slice**:
+///
+///   * the process's own off-heap table is still empty — **no** slot was ever handed out
+///     (`off_heap_binary_count() == 0`), so no O(slots) scan can exist, and
+///     `off_heap_binary_bytes() == 0` measures that same (never-compacted) slot space;
+///   * the engine reservoir grew by a **whole number of iterations**, with an iteration always
+///     building the same number of payloads: the per-iteration count `K` is measured from the
+///     first slice that grew and every later slice's growth is checked against it. `K = 2` here
+///     (the fixture builds two binaries per iteration), so the divisibility has teeth.
 ///
 /// The pin cannot pass vacuously:
 ///   * the loop is long and the reduction budget tiny (`JitMode::Interpreter` charges **every**
-///     instruction), so the process really pre-empts and the test **asserts** several slices ran;
-///   * the fixture builds the binary from a **variable** size (`<<0:Size/unit:8>>`, `Size = 256`,
-///     passed as an argument), so the compiler cannot fold it to a literal and every iteration
-///     really reaches `alloc_refc_binary`; the reservoir is asserted to hold **≥ 2** payloads and
-///     its growth **across** slices is asserted, so an inert fixture (no off-heap build) fails
-///     rather than passing trivially.
+///     instruction), so the process really pre-empts and every slice is asserted to pre-empt;
+///   * the fixture builds its binaries from a **variable** size (`<<0:Size/unit:8>>`,
+///     `Size = 256`, passed as an argument), so the compiler cannot fold them to literals and
+///     every iteration really reaches `alloc_refc_binary`; the reservoir is asserted to hold
+///     **≥ 2** payloads and to grow **across** slices, so an inert fixture (no off-heap build)
+///     fails rather than passing trivially.
 #[test]
-fn a_process_registers_each_off_heap_payload_exactly_once_across_slices() {
+fn a_process_never_hands_out_off_heap_slots_across_slices() {
     let source = "\
 -module(ohb_loop).
 -export([loop/2]).
 loop(N, Size) -> loop(N, Size, 0).
 loop(0, _Size, Acc) -> Acc;
 loop(N, Size, Acc) ->
-    Bin = <<0:Size/unit:8>>,
-    loop(N - 1, Size, Acc + byte_size(Bin)).
+    A = <<0:Size/unit:8>>,
+    B = <<1:Size/unit:8>>,
+    loop(N - 1, Size, Acc + byte_size(A) + byte_size(B)).
 ";
     let Some(dir) = compile_modules("offheap_cursor", &[("ohb_loop", source)]) else {
-        eprintln!("SKIP: no system `erlc` on PATH -- the registration-cursor pin is skipped");
+        eprintln!("SKIP: no system `erlc` on PATH -- the off-heap slot-space pin is skipped");
         return;
     };
 
@@ -1072,7 +1098,7 @@ loop(N, Size, Acc) ->
         beam_loader::load_file(dir.join("ohb_loop.beam")).expect("load the compiled module"),
     );
     let loop_fun = module.atom_table.lookup("loop").expect("loop/2 is interned");
-    // 50 iterations, each building a 256-byte (off-heap) binary: far more than the slices driven
+    // 50 iterations of two 256-byte (off-heap) binaries each: far more than the slices driven
     // below can finish, so the process is still pre-empting when the test stops.
     state.spawn(
         pid,
@@ -1084,13 +1110,14 @@ loop(N, Size, Acc) ->
         vec![make_small(50), make_small(256)],
     );
 
-    reset_registered_payload_total();
-
-    // Drive ten small slices; each must pre-empt (the loop is far from done).
-    const SLICES: usize = 10;
+    // Drive small slices; each must pre-empt (the loop is far from done).
+    const SLICES: usize = 50;
     const SLICE_BUDGET: u32 = 8;
     let mut reservoir = 0;
     let mut first_slice_reservoir = 0;
+    // The payloads one iteration builds, measured from the first slice that grew. `None` until
+    // then: a slice can end mid-iteration, so a zero delta is legitimate.
+    let mut per_iteration: Option<usize> = None;
     for slice in 0..SLICES {
         let outcome = {
             let mut runner = RuntimeRunner::new(&mut rt, &mut state);
@@ -1103,29 +1130,65 @@ loop(N, Size, Acc) ->
             ProcOutcome::Yield,
             "the tiny budget pre-empts the loop long before its 50 iterations finish"
         );
-        let engine = state
-            .engines
-            .get(&pid)
-            .expect("the pre-empted engine is parked");
-        reservoir = engine.machine.refc_binaries().len();
-        // The cursor round-trips: the engine taken out at the top of the slice and re-inserted at
-        // the park arm is the **same** value, so its cursor is advanced to the reservoir length
-        // and observed here from a *later* slice — a cursor reset to `0` per slice would make the
-        // registration total exceed the reservoir below.
+        let (slots, bytes, length) = {
+            let engine = state
+                .engines
+                .get(&pid)
+                .expect("the pre-empted engine is parked");
+            let process = table.get(pid).expect("the pre-empted process");
+            (
+                process.off_heap_binary_count(),
+                process.off_heap_binary_bytes(),
+                engine.machine.refc_binaries().len(),
+            )
+        };
+        // (a) The process's own off-heap table was handed out no slot, in this slice or any
+        // earlier one — the never-compacted slot space stays empty, so no O(slots) scan exists.
         assert_eq!(
-            engine.registered_payloads, reservoir,
-            "the cursor advances to the whole reservoir by the end of every slice"
+            slots, 0,
+            "slice {slice}: no off-heap slot is ever handed out (the engine reservoir holds them)"
         );
-        if slice == 0 {
-            first_slice_reservoir = reservoir;
+        assert_eq!(
+            bytes, 0,
+            "slice {slice}: the never-compacted off-heap slot space stays empty"
+        );
+        // (b) The reservoir only ever grows by whole iterations, each building `K` payloads.
+        let delta = length - reservoir;
+        match per_iteration {
+            Some(k) => assert_eq!(
+                delta % k,
+                0,
+                "slice {slice}: {delta} new payloads is not a whole number of {k}-payload \
+                 iterations"
+            ),
+            None => {
+                if delta > 0 {
+                    per_iteration = Some(delta);
+                }
+            }
         }
+        if slice == 0 {
+            first_slice_reservoir = length;
+        }
+        reservoir = length;
     }
 
-    let registered = registered_payload_total();
+    let per_iteration = per_iteration.expect(
+        "the fixture must build off-heap payloads in at least one slice (two runtime-sized \
+         `<<N:Size/unit:8>>` constructions per iteration)",
+    );
+    assert_eq!(
+        per_iteration, 2,
+        "an iteration builds exactly two off-heap payloads (the fixture's two constructions)"
+    );
+    assert_eq!(
+        reservoir % per_iteration,
+        0,
+        "{reservoir} payloads is not a whole number of {per_iteration}-payload iterations"
+    );
 
     // Non-vacuity: the fixture really built off-heap payloads, and built MORE of them by the end
-    // than it owned after the first slice (so the reservoir grew across slices and a
-    // whole-reservoir re-walk has something real to re-walk).
+    // than it held after the first slice (so the reservoir grew across slices).
     assert!(
         reservoir >= 2,
         "the fixture must build multiple off-heap binaries across the slices (got {reservoir})"
@@ -1133,20 +1196,12 @@ loop(N, Size, Acc) ->
     assert!(
         reservoir > first_slice_reservoir,
         "the reservoir must GROW across slices (first slice {first_slice_reservoir}, final \
-         {reservoir}) so a whole-reservoir re-walk would re-register already-owned payloads"
-    );
-
-    // The cursor's signature: each distinct payload is registered once, so the total number of
-    // registration calls over the process's life never exceeds the reservoir size. The old
-    // whole-reservoir walk gives `Σ_k |reservoir_k|` over `SLICES` slices, which is ≫ `reservoir`.
-    assert!(
-        registered <= reservoir,
-        "each payload is registered once: {registered} registration calls for {reservoir} \
-         payloads over {SLICES} slices (a whole-reservoir re-walk would give several times this)"
+         {reservoir})"
     );
     assert!(
-        registered > 0,
-        "the seam really ran: at least one payload was registered"
+        reservoir / per_iteration >= 2,
+        "the slices really completed several iterations (got {} of them)",
+        reservoir / per_iteration
     );
 
     let _ = std::fs::remove_dir_all(&dir);

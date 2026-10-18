@@ -181,20 +181,6 @@ pub(super) struct ProcessEngine {
     /// [`Tier::Interpreter`] (its first entry overwrites it), which is also the always-correct
     /// value if a tier were ever read before that entry.
     pub(super) tier: Tier,
-    /// How many of the machine's `refc_binaries` — in reservoir order — have already been
-    /// registered onto this process's own off-heap table.
-    ///
-    /// [`Machine::refc_binaries`](beam_engine::Machine::refc_binaries) is **append-only** and is
-    /// never cleared by [`Machine::reset`](beam_engine::Machine::reset), so the reservoir a later
-    /// slice sees is the earlier slice's reservoir plus whatever that slice built. This cursor
-    /// records the prefix already copied onto the process, so each slice registers only its
-    /// **not-yet-registered suffix** instead of re-walking the whole reservoir.
-    ///
-    /// The value is a *count of reservoir slots* (`0..=all.len()`), held on the engine that is
-    /// removed from and re-inserted into [`RunnerState::engines`](RunnerState::engines) across a
-    /// park/resume, so it survives the whole life of the process. It starts at `0` on a fresh
-    /// engine and only ever grows; the reservoir never shrinks, so the cursor is never stale.
-    pub(super) registered_payloads: usize,
 }
 
 /// The per-pid engine state and recorded outcomes of every process the runtime spawned.
@@ -260,8 +246,6 @@ impl RunnerState {
                 // Only a placeholder: the process's first entry selects the real tier and
                 // writes it here (see the field docs).
                 tier: Tier::Interpreter,
-                // A fresh machine's reservoir is empty, so nothing has been registered yet.
-                registered_payloads: 0,
             },
         );
     }
@@ -307,6 +291,33 @@ impl RunnerState {
             ProcessEntry::Export { module, .. } => Some((module, &engine.machine)),
             ProcessEntry::Fun { .. } => None,
         }
+    }
+
+    /// `pid`'s off-heap refc-binary **reservoir**, when this runtime holds an engine for it.
+    ///
+    /// [`Machine::refc_binaries`] is the one holder of the off-heap payloads a process's
+    /// compiled bitstring code builds: the engine appends every binary it materializes above
+    /// [`ERL_ONHEAP_BINARY_LIMIT`](beam_term::refc::ERL_ONHEAP_BINARY_LIMIT) and
+    /// [`Machine::reset`] never clears them, so the reservoir is the process's cumulative
+    /// off-heap payload roster. It is what `erlang:process_info(Pid, binary)` reports
+    /// ([`crate::native::memory`]) — read here rather than mirrored onto the process, because
+    /// the PCB's own off-heap table is a never-compacted slot space whose per-call scans
+    /// would otherwise grow with every payload the process ever built.
+    ///
+    /// Unlike [`RunnerState::engine_at`], which declines a fun-bodied process (it has no
+    /// module to name an execution position from), this answers for **any** entry shape: the
+    /// reservoir is per-machine state, independent of what the machine was entered as.
+    ///
+    /// `None` for a pid this runtime spawned no engine for (the root `-eval` process, a
+    /// foreign pid), and for the process whose machine a scheduler pass is *currently*
+    /// executing: a pass takes that one engine **out** of this map to drive it (see the module
+    /// docs), so it is absent for the whole slice. Its payloads are owned either way — by the
+    /// reservoir the running machine itself holds — so the worst a query about that one pid can
+    /// do is omit an entry, never dangle one.
+    pub(crate) fn reservoir_at(&self, pid: ProcessId) -> Option<&[beam_alloc::RefcBinary]> {
+        self.engines
+            .get(&pid)
+            .map(|engine| engine.machine.refc_binaries())
     }
 
     /// `pid`'s executing module and machine for the **execution-position items**, plus

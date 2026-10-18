@@ -65,21 +65,15 @@ characterisation and figures are in `PERF.md`).
   off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is therefore copied
   rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
   (the exit path) — whether the process **built** it or **received** it.
-  The same `engine.machine.refc_binaries()` reservoir is also copied onto the **running process's**
-  own off-heap table once per slice, on every slice outcome (`Process::register_off_heap_binary`, no
-  matter whether the slice pre-empted, parked, returned or raised), so a process that has built a
-  payload above the on-heap limit comes to *own* it for `erlang:process_info(Pid, binary)`; the
-  population is dedup-by-`data_ptr`/idempotent, so its over-report (a payload an earlier reachability
-  sweep pruned) mirrors the oracle, while `Runtime::eval_off_heap` is deliberately left out as the
-  pid-less `-eval` store.
-  Because that reservoir is **append-only** and never cleared, the seam advances a per-engine cursor —
-  `ProcessEngine::registered_payloads`, the count of reservoir slots already registered — and each slice
-  copies only its **not-yet-registered suffix** (`min`-clamped against the reservoir length), so a
-  payload becomes owned at the end of the first slice that built it and the total registration work over
-  a process's life is linear in the payloads it built, rather than re-walking the whole reservoir (and
-  paying an O(slots) slot scan) on every slice.
-  The cursor rides the `ProcessEngine`, which is removed from and re-inserted into `RunnerState::engines`
-  at every slice boundary, so it survives a pre-emption and a `receive` park.
+  The machine's `refc_binaries()` reservoir is **not** copied onto the running process: it is the one
+  holder of every payload the process's own compiled bitstring code built (it is append-only and
+  `Machine::reset` never clears it), so `erlang:process_info(Pid, binary)` reads it straight through
+  `RunnerState::reservoir_at(pid)` and the process's own off-heap table stays empty. That is what keeps
+  `beam_gc::OffHeap`'s never-compacted slot space out of the per-call path — mirroring the reservoir
+  onto the PCB handed that space a slot per payload per slice, and the O(slots)
+  `overhead_bytes`/`sweep` walks it implies made a build-a-binary loop quadratic in its own iteration
+  count. `Runtime::eval_off_heap` is likewise not attributed to any process: it is the pid-less
+  `-eval` store.
 * [`budget`] — the slice's reduction budget and the wrapper context that charges it: `BudgetProbe`
   with **two** charging primitives, `charge()` (the **refusing** one: spends a unit or hands back the
   typed `preemption: …` error, the runner's `Yield` signal) and `spend()` (**pricing, never
@@ -122,8 +116,8 @@ characterisation and figures are in `PERF.md`).
   only at a slice boundary (a pre-emption/`receive` park ends the slice) or at the two nested-context
   sites (`FunBridge::nested`, `SendBridge`, both in `src/context/bridges.rs`). The `RuntimeContext`/
   `BudgetContext`/`BudgetProbe` construction is **stack-only** (no `Vec`/`String`/`Rc` on the hot path);
-  the only per-slice heap work below the outcome match is the off-heap-payload registration suffix
-  (`payload.clone()` on `Process::register_off_heap_binary`, once per *new* payload the machine built).
+  the only per-slice heap work below the outcome match is the machine's own off-heap reservoir, which
+  is left where it is (no registration, no slot handed out).
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
   `env_default()` (the memoized unset-variable default) and `select_entry_tier(...)` — the single
@@ -132,7 +126,7 @@ characterisation and figures are in `PERF.md`).
   deadline recovery now lives in the engine (`Machine::wait_deadline`/`Machine::timeout_delay`), so no
   duplicated delay decoding remains here.
 * [`perf`] — the `+JPperf` code-map feed (contract A.8).
-* [`run`]'s `#[cfg(test)]` slice/park accounting — `RUN_SLICE_COUNTERS` (a per-thread `Cell<RunSliceCounters>`, mirroring the file's existing `REGISTERED_PAYLOAD_TOTAL`), read through `run_slice_counters()` and zeroed by `reset_run_slice_counters()`: `note_slice_entered()` counts one `RuntimeRunner::run` call (one reduction slice) and `note_slice_parked(preempted)` counts one slice that handed the machine back (the `Yield` pre-emption arm, or the `receive` `Wait` arm). The increments are `#[cfg(test)]`-only, so an untested build is byte-identical to before.
+* [`run`]'s `#[cfg(test)]` slice/park accounting — `RUN_SLICE_COUNTERS` (a per-thread `Cell<RunSliceCounters>`), read through `run_slice_counters()` and zeroed by `reset_run_slice_counters()`: `note_slice_entered()` counts one `RuntimeRunner::run` call (one reduction slice) and `note_slice_parked(preempted)` counts one slice that handed the machine back (the `Yield` pre-emption arm, or the `receive` `Wait` arm). The increments are `#[cfg(test)]`-only, so an untested build is byte-identical to before.
 
 ## The `BEAM_RT_TIER` modes (`mode_from_value` is the single definition)
 | value | mode | meaning |
@@ -283,9 +277,10 @@ per-iteration):
   (`min(x.len(), MAX_REG)` = up to 1024 words, `beam_process::registers::MAX_REG`) plus the whole
   Erlang stack plus the live FR prefix onto the process's root set. An exempt window — the `Wait`
   arm, and a `Yield` arm whose slice ended with a live FR prefix — skips the copy entirely.
-* **Amortized O(1):** the off-heap registration loop (`run.rs:760-769`) walks only the
-  not-yet-registered reservoir suffix (`ProcessEngine::registered_payloads`), so a loop that builds
-  no off-heap binary pays one comparison.
+* **Amortized O(1):** nothing — the off-heap payloads a machine builds need no per-slice work at all:
+  its `Machine::refc_binaries` reservoir is the roster `process_info(Pid, binary)` reads
+  (`RunnerState::reservoir_at`), so no slot is ever handed out on the process's own (never-compacted)
+  off-heap table.
 * **First entry / flag-gated only:** `record_baseline_code` (`run.rs:692-694`, `+JPperf` only), the
   `Arc::clone` of the entry module (`run.rs:413-420`), and `describe_site` (debug-trace only).
   `source_payloads` (`run.rs:840-842`/`970-971`) runs only on the terminating `Returned`/`Err` arms.
@@ -655,9 +650,9 @@ term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mail
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
   `RuntimeRunner`).
 * `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`, the park's published
-  FR-prefix count `fr_published`, the park's publish/skip flag `parked_published`, and the registration
-  cursor `registered_payloads`) + `RunnerState`
-  (the `jit_mode` field and the `jit_mode()` accessor).
+  FR-prefix count `fr_published` and the park's publish/skip flag `parked_published`) + `RunnerState`
+  (the `jit_mode` field, the `jit_mode()` accessor and the `reservoir_at(pid)` read-only off-heap
+  roster seam).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
   parked-machine root hand-off (`park_machine` → `publish_parked_roots`/`resume_from_process_roots`,
   whose `fr_count` argument is the live prefix `Machine::fr_mark()` — the value that also opens the

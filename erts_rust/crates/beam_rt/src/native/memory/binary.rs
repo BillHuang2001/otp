@@ -21,21 +21,29 @@
 //! The `binary` item of `erlang:process_info/2` — a process's off-heap refc binaries.
 //!
 //! The oracle answers `[{Ptr, Size, Refc}, …]`: one 3-tuple per off-heap reference-counted
-//! binary the process owns, in the off-heap table's slot order, and `[]` when it owns none.
-//! `Ptr` is the payload's own pointer as an integer, `Size` its byte length and `Refc` its
-//! total reference count — exactly the three observables
+//! binary the process owns, in the order the payloads were allocated, and `[]` when it owns
+//! none. `Ptr` is the payload's own pointer as an integer, `Size` its byte length and `Refc`
+//! its total reference count — exactly the three observables
 //! [`RefcBinary`](beam_alloc::RefcBinary) exposes (`data_ptr`/`len`/`refcount`).
 //!
-//! The roster is read from [`Process::off_heap_binaries`] — the process's **live owned**
-//! payloads, released slots skipped — by the parent module's
-//! [`snapshot`](super::RuntimeContext::snapshot), which copies the three figures out (the
-//! process table borrow must end before a reply is built on the engine heap). This module
-//! only materializes the value, so it owns no state and touches no runtime table.
+//! The roster is read by the parent module's [`snapshot`](super::RuntimeContext::snapshot),
+//! which extracts the three figures out (the process table borrow must end before a reply is
+//! built on the engine heap). That roster is the **deduped union** of the target's **engine
+//! reservoir** — [`Machine::refc_binaries`], the one holder of the payloads the process's own
+//! compiled bitstring code built, read through
+//! [`RunnerState::reservoir_at`](crate::runner::RunnerState::reservoir_at) — and the process's
+//! own off-heap table ([`Process::off_heap_binaries`], which stays the path for a host that
+//! registers a payload on the PCB directly; nothing in production does). A payload the running
+//! process built from **inside** its current slice is absent from the reservoir a query reads
+//! (the pass holds that engine out of the table for the whole slice) — an omission, never a
+//! dangle, since the reservoir owns the payload either way. This module only materializes the
+//! value, so it owns no state and touches no runtime table.
 //!
 //! Each of the three integers is built with [`terms::make_integer`], so a payload pointer
 //! outside the 60-bit small range materializes as an **exact bignum** rather than being
 //! truncated to a wrong-sized integer.
 //!
+//! [`Machine::refc_binaries`]: beam_engine::Machine::refc_binaries
 //! [`Process::off_heap_binaries`]: beam_process::Process::off_heap_binaries
 
 use beam_common::Result;
