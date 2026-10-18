@@ -35,6 +35,16 @@
 //! * a **boxed object** → `arity + 1` words (header + payload), **plus** the
 //!   sizes of any nested terms it contains.
 //!
+//! The single exception is the **global empty-tuple literal** (`tuple0()`), which
+//! costs `0` words (`copy.c:125-140`): it is `ERTS_GLOBAL_LIT_EMPTY_TUPLE`, one
+//! process-wide constant a copy never materialises, and the C recognises it by
+//! identity — an arity-0 `ARITYVAL` header whose `ASSERT` excludes a record header
+//! (`copy.c:128`). So the rule is exactly "arity-0 `ARITYVAL` **and**
+//! `TAG_LITERAL_PTR`" (`crate::literal::is_literal`); a zero-arity **`RECORD`**
+//! header is not the empty tuple and prices its structural `arity + 1 == 1`, as does
+//! an untagged hand-built arity-0 tuple. Under-counting a destination is the
+//! dangerous direction, so no shape is ever priced below its structural size.
+//!
 //! so `size_object(42) == 0`, `size_object([1]) == 2`,
 //! `size_object({1,2,3}) == 4`, and `size_object([1,2,3]) == 6`.
 //!
@@ -110,7 +120,8 @@ use crate::eterm::Eterm;
 use crate::immediate::is_immediate;
 use crate::layout::{for_each_sizing_child_slot, object_words};
 use crate::list::{is_list, list_val};
-use crate::tag::{is_term_word, ARITYVAL_SUBTAG, RECORD_SUBTAG, TAG_HEADER_MASK};
+use crate::literal::is_literal;
+use crate::tag::{is_term_word, ARITYVAL_SUBTAG, TAG_HEADER_MASK};
 
 /// Whether a word can contribute heap words, so the walk must enter it: a term word
 /// that is not an immediate.
@@ -240,11 +251,20 @@ enum Step {
 /// Classifies a word the walk must enter into a [`Frame`], or `None` when it contributes
 /// no heap words and exposes no child.
 ///
-/// `None` covers exactly two cases: the shared **zero-arity tuple literal**
-/// (`tuple0()`), which the C also skips (its `arity == 0` guard sits *outside* the
-/// `litopt` block, `copy.c:127-137`, so it stays a representation invariant here and is
-/// checked **before** the policy), and a policy
-/// [`object_words`](SizingPolicy::object_words) of `None` (0 words, no descent).
+/// `None` covers exactly two cases:
+///
+/// 1. the **global empty-tuple literal** (`tuple0()`) — the C's `arity == 0` guard
+///    (`copy.c:125-140`), which sits *outside* the `litopt` block and is therefore
+///    checked **before** the policy. It is the one object the C prices at nothing, and
+///    it recognises it by *identity*: an arity-0 `ARITYVAL` header **and** the
+///    `TAG_LITERAL_PTR` bit ([`is_literal`], this crate's analogue of the C
+///    `erts_is_literal`). The C's `ASSERT(arity > 0 || !is_record_header(hdr))`
+///    (`copy.c:128`) states the complement: a zero-arity **`RECORD`** header is *not*
+///    the empty tuple (every record instance is `make_record_header(n + 1)`,
+///    `crate::record`, so its arity is `>= 1`) and it prices its structural
+///    `arity + 1 == 1` through the policy — as does an untagged, hand-built arity-0
+///    tuple block the C asserts cannot exist. Neither case can ever **under**-count;
+/// 2. a policy [`object_words`](SizingPolicy::object_words) of `None` (0 words, no descent).
 ///
 /// The child slots always come from [`crate::layout::for_each_sizing_child_slot`]: a
 /// policy overrides the *pricing*, never the interior layout.
@@ -273,10 +293,11 @@ unsafe fn classify(t: Eterm, policy: &dyn SizingPolicy) -> Option<Frame> {
     let p = boxed_val(t);
     // SAFETY: `t` is a live boxed term, so `p` addresses its header word.
     let header = unsafe { *p };
-    if matches!(header.raw() & TAG_HEADER_MASK, ARITYVAL_SUBTAG | RECORD_SUBTAG)
+    if header.raw() & TAG_HEADER_MASK == ARITYVAL_SUBTAG
         && header_arity(header) == 0
+        && is_literal(t)
     {
-        // The shared zero-arity tuple is the global literal: 0 words.
+        // The global empty-tuple literal (`tuple0()`): 0 words (`copy.c:125-140`).
         return None;
     }
     // The policy prices the object; `None` means it contributes nothing and exposes no
@@ -383,7 +404,7 @@ fn sizing_walk(root: Eterm, limit: usize, policy: &dyn SizingPolicy) -> Sizing {
                 }
                 // SAFETY: `t` is a live word that is not an immediate.
                 let Some(frame) = (unsafe { classify(t, policy) }) else {
-                    // A shared empty-tuple literal, or a policy that prices it at nothing.
+                    // The global empty-tuple literal, or a policy pricing it at nothing.
                     continue;
                 };
                 let has_children = frame.has_children();

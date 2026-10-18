@@ -78,10 +78,14 @@
 //!   [`ERL_SUB_BITS_SIZE`] words and forwards the `orig` word, which copies the 3-word
 //!   `BinRef` as its own child (the C `copy_struct_x` protocol, `copy.c:1677-1700`).
 //! * **The empty-tuple literal is the caller's special case.** `object_words` returns
-//!   `arity + 1` uniformly, so the shared zero-arity tuple (`tuple0()`) reports `1`
-//!   word; the `size_object_x` walk special-cases it to `0` because it is a global
-//!   literal. Callers that must reproduce `size_object` therefore skip it before
-//!   calling `object_words` (as [`crate::size`] and the `beam_message` copier do).
+//!   `arity + 1` uniformly for `ARITYVAL_SUBTAG`/`RECORD_SUBTAG`, so the shared
+//!   zero-arity tuple (`tuple0()`) reports `1` word **and so does a zero-arity
+//!   `RECORD` header**. The `size_object_x` walk prices `0` for exactly one object: a
+//!   **literal-tagged** arity-0 `ARITYVAL` — the global empty tuple
+//!   (`ERTS_GLOBAL_LIT_EMPTY_TUPLE`, `copy.c:125-140`), whose `ASSERT` there explicitly
+//!   excludes a record header (`copy.c:128`). Callers that must reproduce
+//!   `size_object` therefore skip that one literal before calling `object_words` (as
+//!   [`crate::size`] and the `beam_message` copier do).
 //!
 //! # The child-slot enumerators
 //!
@@ -793,10 +797,11 @@ mod tests {
     /// **sizing** child slots — the walk `size_object` performs, built from the
     /// per-object API instead of `size.rs`'s private model.
     ///
-    /// `size.rs`'s conventions are reproduced: a cons cell is `2` words, the shared
-    /// zero-arity tuple literal contributes `0`, and a non-term/immediate contributes
-    /// nothing. An explicit DFS keeps a path set, so a shared subterm is counted per
-    /// occurrence (like `size_object`) and an accidental cycle terminates.
+    /// `size.rs`'s conventions are reproduced: a cons cell is `2` words, the global
+    /// empty-tuple literal (a literal-tagged arity-0 `ARITYVAL`, `copy.c:125-140`)
+    /// contributes `0`, and a non-term/immediate contributes nothing. An explicit DFS
+    /// keeps a path set, so a shared subterm is counted per occurrence (like
+    /// `size_object`) and an accidental cycle terminates.
     fn sum_object_words(root: Eterm) -> usize {
         enum Step {
             Enter(Eterm),
@@ -831,10 +836,11 @@ mod tests {
                     let p = boxed_val(t);
                     // SAFETY: `t` is a live boxed term, so `p` heads it.
                     let header = unsafe { *p };
-                    if matches!(header.raw() & TAG_HEADER_MASK, ARITYVAL_SUBTAG | RECORD_SUBTAG)
+                    if header.raw() & TAG_HEADER_MASK == ARITYVAL_SUBTAG
                         && header_arity(header) == 0
+                        && crate::literal::is_literal(t)
                     {
-                        // The shared empty-tuple literal.
+                        // The global empty-tuple literal (`copy.c:125-140`).
                         continue;
                     }
                     // SAFETY: `header`/`p` head a live object.
