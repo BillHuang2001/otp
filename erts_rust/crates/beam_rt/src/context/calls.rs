@@ -918,44 +918,65 @@ impl<'a> RuntimeContext<'a> {
     /// enumeration, the same one the copier and the unscanned-root valve drive — over an explicit
     /// worklist, with each object's address visited once so a shared or cyclic subgraph costs one
     /// visit. Literals are skipped: a frozen code constant lives in the literal area and can name
-    /// nothing on this heap.
+    /// nothing on this heap. So is every word that is **not a readable term** (see *Safety*).
     ///
     /// # Safety
     ///
-    /// `term` must be a **live** container the caller just received from a registered BIF, so
-    /// every object the walk reaches is a readable, aligned, well-formed term word.
+    /// The walk reads only a word that is a term word
+    /// ([`beam_term::tag::is_term_word`]) and is either a boxed term
+    /// ([`beam_term::boxed::is_boxed_term`]) or a `LIST` word, whose object pointer is non-null
+    /// and aligned ([`super::gc::dereferenceable_pointer`]).
+    /// Any other word — the C ABI's `THE_NON_VALUE`, a bare header word, an immediate, a literal,
+    /// a `NULL`- or mis-aligned address — is **skipped**, never dereferenced: its children are
+    /// unknown, so it contributes no reference finding, and the caller then attempts the re-home
+    /// itself and lets the copier refuse.
     #[allow(unsafe_code)]
     fn graph_holds_reference(term: Eterm) -> bool {
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut work: Vec<Eterm> = vec![term];
         while let Some(item) = work.pop() {
-            // A literal is a frozen code constant (never on this heap) and an immediate is
-            // neither boxed nor a cons: neither can reach a word here.
+            // Three words can reach the worklist without being a readable container, and each is
+            // skipped here so nothing below ever dereferences it.
+            //
+            // * A literal is a frozen code constant, which lives in the literal area and can name
+            //   nothing on this heap.
+            // * An immediate is neither boxed nor a cons.
+            // * A word whose primary tag is `HEADER` is **not a term at all**
+            //   ([`beam_term::tag::is_term_word`]): the frozen `is_boxed`/`is_list` bit tricks are
+            //   also true for it, and `boxed_val`/`ptr_val` of one is `NULL` — the C ABI's
+            //   `THE_NON_VALUE` (`make_header(0, 0)`) is exactly such a word, and it is a shape a
+            //   registered BIF may legitimately return.
             if beam_term::literal::is_literal(item)
-                || !(beam_term::prelude::is_boxed(item) || beam_term::prelude::is_list(item))
+                || !beam_term::tag::is_term_word(item)
+                || !(beam_term::boxed::is_boxed_term(item) || beam_term::prelude::is_list(item))
             {
                 continue;
             }
+            // The address `item`'s pointer bits name, or `None` when no live term can be there —
+            // the same guard the unscanned-root valve applies
+            // ([`super::gc::dereferenceable_pointer`]), so the two walks cannot disagree about
+            // which words are readable.
+            let Some(address) = super::gc::dereferenceable_pointer(item) else {
+                continue;
+            };
+            let address = address as *const Eterm;
+            if !seen.insert(address as usize) {
+                continue;
+            }
             if beam_term::prelude::is_list(item) {
-                // SAFETY: `item` is a live cons cell reachable from the BIF's own result, so the
-                // two words at its address are its live `car` and `cdr`.
+                // SAFETY: `item` is a term word with the `LIST` primary tag whose cell pointer is
+                // non-null and aligned, so the two words at that address are its live `car` and
+                // `cdr`.
                 unsafe {
-                    let address = beam_term::list::ptr_val(item) as *const Eterm;
-                    if !seen.insert(address as usize) {
-                        continue;
-                    }
                     work.push(*address);
                     work.push(*address.add(1));
                 }
                 continue;
             }
-            // SAFETY: `item` is a live boxed term, so its header word is a readable, aligned term
-            // word at the address the term's pointer bits name.
+            // SAFETY: `item` is a boxed **term** word ([`beam_term::boxed::is_boxed_term`]) whose
+            // object pointer is non-null and aligned, so the word at that address is its live
+            // header.
             unsafe {
-                let address = beam_term::boxed::boxed_val(item) as *const Eterm;
-                if !seen.insert(address as usize) {
-                    continue;
-                }
                 let header = *address;
                 if beam_term::boxed::is_ref_thing_header(header)
                     || beam_term::boxed::is_external_ref_header(header)

@@ -550,8 +550,12 @@ fn is_pointer_bearing(word: Eterm) -> bool {
 /// aligned address is mapped, let alone a term, is not decidable without faulting. The C runtime
 /// faults there too, and this valve inherits that bound; what it no longer does is fault on the
 /// one word the C ABI defines as "not a term at all".
+///
+/// `pub(super)` because it is the node's **one** address guard: the unscanned-root valve
+/// ([`word_region`]) and the BIF-result reference walk
+/// (`RuntimeContext::graph_holds_reference`) both apply it before reading a pointer-bearing word.
 #[inline]
-fn dereferenceable_pointer(word: Eterm) -> Option<usize> {
+pub(super) fn dereferenceable_pointer(word: Eterm) -> Option<usize> {
     let ptr = beam_term::list::ptr_val(word) as usize;
     if ptr == 0 || ptr % core::mem::align_of::<Eterm>() != 0 {
         return None;
