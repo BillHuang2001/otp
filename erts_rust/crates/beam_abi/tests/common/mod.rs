@@ -354,8 +354,12 @@ pub struct TestDriverHost {
     connected: Option<Eterm>,
     /// The value [`DriverHost::caller_pid`] reports.
     caller: Option<Eterm>,
+    /// The port id term [`DriverHost::port_term`] reports for a live handle (`None` = "no such
+    /// handle" — the trait default's answer).
+    port_term: Option<Eterm>,
+    /// Every handle [`DriverHost::port_term`] was asked about, in call order.
+    port_handles: Vec<ErlDrvPort>,
 }
-
 impl TestDriverHost {
     /// A host with a comfortably sized heap and an empty atom table.
     pub fn new() -> Self {
@@ -371,9 +375,10 @@ impl TestDriverHost {
             timer_left: None,
             connected: None,
             caller: None,
+            port_term: None,
+            port_handles: Vec::new(),
         }
     }
-
     /// Intern `name` and return the atom term.
     pub fn atom(&mut self, name: &str) -> Eterm {
         make_atom(self.atoms.intern(name))
@@ -427,6 +432,16 @@ impl TestDriverHost {
     /// Set the value [`DriverHost::caller_pid`] returns.
     pub fn set_caller(&mut self, pid: Option<Eterm>) {
         self.caller = pid;
+    }
+
+    /// Set the port id term [`DriverHost::port_term`] reports for a live handle.
+    pub fn set_port_term(&mut self, term: Option<Eterm>) {
+        self.port_term = term;
+    }
+
+    /// Every handle [`DriverHost::port_term`] was asked about, in call order.
+    pub fn port_handles(&self) -> &[ErlDrvPort] {
+        &self.port_handles
     }
 }
 
@@ -487,5 +502,21 @@ impl DriverHost for TestDriverHost {
 
     fn caller_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
         self.caller
+    }
+
+    /// Answer the configured port id term for a **live** handle only.
+    ///
+    /// A live handle is the [`beam_abi::DriverEnv`] pointer handed to the driver, i.e. non-null and
+    /// 8-aligned, while a real internal port term always has its low bits set — the same
+    /// disambiguation the decoder relies on. Any other word is "no such handle" (`None`), which is
+    /// what keeps a malformed `ERL_DRV_PORT` operand refused.
+    fn port_term(&mut self, port: ErlDrvPort) -> Option<Eterm> {
+        self.port_handles.push(port);
+        let aligned = (port as usize) & (core::mem::align_of::<usize>() - 1) == 0;
+        if !port.is_null() && aligned {
+            self.port_term
+        } else {
+            None
+        }
     }
 }
