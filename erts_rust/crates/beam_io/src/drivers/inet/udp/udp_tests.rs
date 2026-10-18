@@ -29,7 +29,7 @@
 //! driver's. Every oracle case **skips loudly** when `erl` is not on `PATH`.
 
 use super::super::opt::{INET_OPT_BROADCAST, INET_OPT_REUSEADDR, INET_OPT_TTL};
-use super::super::wire::{ctl_ok, ctl_xerror};
+use super::super::wire::{ctl_ok, ctl_xerror, split_caller_ref, ETF_VERSION_MAGIC};
 use super::super::{INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_TYPE_DGRAM, INET_REP_OK};
 use super::{UdpInetDriver, UDP_DRIVER_NAME};
 use crate::driver::{Driver, DriverContext, PortArms};
@@ -643,5 +643,234 @@ fn the_oracle_reports_the_registered_driver_name() {
     assert!(
         dump.contains("udp_inet"),
         "the oracle's udp_inet port reports its name: {dump:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The `prim_inet` caller-reference prefix (`init_caller`, `inet_drv.c:1820-1890`)
+// ---------------------------------------------------------------------------
+/// The `prim_inet` caller-reference tag as it looks on the wire: `term_to_binary(Mref, [local])`
+/// for `Mref = monitor(port, S)` (`prim_inet.erl:575`-`:620`) always starts with the ETF
+/// `VERSION_MAGIC` (131) and the rest is opaque to the driver, so a hand-built tag of four-plus
+/// bytes exercises the same strip path a real monitor reference does.
+const CALLER_REF_TAG: &[u8] = &[131, 100, 0, 8, b'r', b'e', b'f', b'0'];
+
+/// The `prim_inet` command wire form:
+/// `[tag_len:be16][tag_bytes][address][anc_len:be32][anc_data][data]`
+/// (`prim_inet:send/3` + `do_sendto/4`, `erts/preloaded/src/prim_inet.erl:575`-`:700`).
+fn prefixed_command(port: u16, anc: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut arg = Vec::new();
+    arg.extend_from_slice(&(CALLER_REF_TAG.len() as u16).to_be_bytes());
+    arg.extend_from_slice(CALLER_REF_TAG);
+    arg.extend_from_slice(&loopback_arg(port));
+    arg.extend_from_slice(&(anc.len() as u32).to_be_bytes());
+    arg.extend_from_slice(anc);
+    arg.extend_from_slice(payload);
+    arg
+}
+
+/// A real `std::net::UdpSocket` on loopback — an independent receiver, so the assertions below
+/// are on the bytes that reach the wire rather than on this driver's own queue.
+///
+/// The read timeout is a **hang guard** (the shape the spawn suite uses), never a latency budget.
+fn udp_receiver() -> std::net::UdpSocket {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback datagram receiver");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+    socket
+}
+
+/// Receives exactly one datagram from `socket`.
+fn receive_one(socket: &std::net::UdpSocket) -> Vec<u8> {
+    let mut buf = [0u8; 1024];
+    let (len, _from) = socket.recv_from(&mut buf).expect("the receiver gets a datagram");
+    buf[..len].to_vec()
+}
+
+/// The reason atom of a typed error, so the `unsupported`-vs-`badarg` distinction is asserted
+/// rather than assumed.
+fn reason_of(err: BeamError) -> String {
+    err.into_raise()
+        .expect("a typed raise, not a generic failure")
+        .reason
+        .as_atom()
+        .expect("an atom reason")
+        .to_string()
+}
+
+#[test]
+fn the_caller_reference_discriminator_accepts_only_a_fitting_etf_tag() {
+    // A well-formed prefix is stripped, exactly `2 + n` bytes.
+    let mut arg = vec![0, 4, ETF_VERSION_MAGIC, 1, 2, 7];
+    arg.extend_from_slice(&loopback_arg(9));
+    assert_eq!(
+        split_caller_ref(&arg),
+        Some(&arg[6..]),
+        "a well-formed prefix is stripped and the rest returned",
+    );
+    // `n == 0` carries no caller reference (`init_caller`'s `*size_p < 2` guard).
+    assert_eq!(split_caller_ref(&[0, 0, ETF_VERSION_MAGIC, 1]), None);
+    // A truncated prefix (`2 + n` overruns the argument) is not stripped.
+    assert_eq!(split_caller_ref(&[0, 9, ETF_VERSION_MAGIC, 1, 2]), None);
+    // The tag's first byte must be the ETF version byte.
+    assert_eq!(split_caller_ref(&[0, 3, 100, 1, 2, 9, 9]), None);
+    // A plain address-first payload is never stripped: an `INET_AF_INET`/`_ANY`/`_LOOPBACK`
+    // lead byte with a port number whose low byte is not 131 is not a caller reference.
+    for tag in [INET_AF_INET, INET_AF_ANY, INET_AF_LOOPBACK] {
+        let mut plain = vec![tag, 0x04, 210];
+        plain.extend_from_slice(&[127, 0, 0, 1, b'h', b'i']);
+        assert_eq!(split_caller_ref(&plain), None, "tag {tag} is not a caller reference");
+    }
+}
+
+#[test]
+fn the_caller_reference_prefix_is_stripped_from_a_datagram_command() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    let arg = prefixed_command(target, &[], b"prefixed");
+    assert_eq!(
+        rig.control("send", &arg).expect("send"),
+        ctl_ok(),
+        "a well-formed caller-reference command is accepted",
+    );
+    assert_eq!(
+        receive_one(&receiver),
+        b"prefixed",
+        "the receiver sees exactly the payload — no prefix, ancillary word or address bytes",
+    );
+}
+
+#[test]
+fn a_caller_reference_command_with_ancillary_data_is_the_typed_unsupported() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    // `anc_len != 0` is the C's `sendmsg(2)`-with-cmsgs arm (`inet_drv.c:15220`), which this
+    // floor has no seam for: a typed raise, never a send with the ancillary bytes dropped (or
+    // mistaken for payload).
+    let arg = prefixed_command(target, &[1, 2, 3, 4], b"payload");
+    let reason = reason_of(rig.control("send", &arg).expect_err("ancillary data is not served"));
+    assert_eq!(
+        reason,
+        "unsupported: udp ancillary data (sendmsg cmsg) is not served by this driver floor",
+    );
+}
+
+#[test]
+fn a_caller_reference_command_with_a_truncated_ancillary_length_is_einval() {
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    // The C's `if (len < 4) goto return_einval` (`inet_drv.c:15205`): two bytes where the
+    // ancillary-length word needs four.
+    let mut arg = Vec::new();
+    arg.extend_from_slice(&(CALLER_REF_TAG.len() as u16).to_be_bytes());
+    arg.extend_from_slice(CALLER_REF_TAG);
+    arg.extend_from_slice(&loopback_arg(9));
+    arg.extend_from_slice(&[0, 0]);
+    assert_eq!(
+        rig.control("send", &arg).expect("send"),
+        ctl_xerror("einval"),
+        "a truncated ancillary-length word is the C's einval reply",
+    );
+}
+
+#[test]
+fn a_caller_reference_length_that_does_not_fit_falls_back_to_the_plain_parse() {
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    // `n = 16` with only four tag bytes present: not a caller reference at all, so the plain
+    // grammar runs — and its lead byte is `0x00`, which is no address tag (1/3/4). Nothing is
+    // sent: the command is a plain argument fault.
+    let arg = vec![0, 16, ETF_VERSION_MAGIC, 1, 2, 3];
+    assert!(
+        matches!(rig.control("send", &arg), Err(BeamError::BadArg)),
+        "a non-fitting prefix is not a caller reference and the plain parse refuses it",
+    );
+}
+
+#[test]
+fn the_plain_datagram_command_form_still_sends_unchanged() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+    let reply = rig.send(target, b"plain");
+    assert_eq!(reply, ctl_ok(), "the plain [address][payload] form still answers [1]");
+    assert_eq!(receive_one(&receiver), b"plain", "the payload is delivered unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// The plain form is authoritative (regression: the old caller-reference-first order)
+// ---------------------------------------------------------------------------
+
+/// A loopback datagram receiver bound to a port whose **low byte is `0x83`** (131, the ETF
+/// `VERSION_MAGIC`) — the byte the old caller-reference-**first** discriminator mistook for a tag.
+///
+/// Port 131 itself needs privilege, so every `0xNN83` candidate is tried in turn; `None` means the
+/// host refused them all and the check **skips loudly** rather than flaking.
+fn udp_receiver_on_a_0x83_port() -> Option<(std::net::UdpSocket, u16)> {
+    for high in std::iter::once(0u16).chain(1..=0xfe) {
+        let port = (high << 8) | u16::from(ETF_VERSION_MAGIC);
+        let Ok(socket) = std::net::UdpSocket::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        // A hang guard, never a latency budget (the shape `udp_receiver` uses).
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("a read timeout");
+        return Some((socket, port));
+    }
+    None
+}
+
+/// A plain `[address][payload]` command whose **target** port low byte is `0x83` used to be read
+/// as a `prim_inet` caller reference: `split_caller_ref` takes `n = 0x0100 + target_port_hi` from
+/// the address's tag/first port byte and then keys on `arg[2] = target_port_lo == 0x83`, so the
+/// tail was re-parsed as a datagram operand. The plain form is now tried first, so the whole
+/// payload must reach the receiver unchanged.
+#[test]
+fn a_plain_command_with_a_0x83_low_port_byte_is_not_read_as_a_caller_reference() {
+    let Some((receiver, target)) = udp_receiver_on_a_0x83_port() else {
+        eprintln!(
+            "SKIP: no loopback UDP port with low byte 0x83 could be bound — skipping the \
+             plain-form-wins regression check"
+        );
+        return;
+    };
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
+
+    // The argument's shape is exactly the one the old order misread: `n = 0x0100 + target_hi`
+    // and `arg[2] = target_lo = 0x83` satisfy `split_caller_ref`'s three conditions, and a
+    // 512-byte payload makes `2 + n` fit for every candidate port (`n <= 0x0100 + 0xfe`), so the
+    // old rule really would have stripped it (and then refused the tail as `badarg`, sending
+    // nothing). The payload byte at `2 + n` is `0xAB` — no address tag — which is what pinned the
+    // mistake to a refusal rather than a send to the wrong endpoint.
+    let payload = vec![0xABu8; 512];
+    let mut arg = loopback_arg(target);
+    assert_eq!(arg[0], INET_AF_INET, "the plain form leads with the address tag");
+    assert_eq!(arg[2], ETF_VERSION_MAGIC, "the target port's low byte is 0x83");
+    let n = usize::from(u16::from_be_bytes([arg[0], arg[1]]));
+    arg.extend_from_slice(&payload);
+    assert!(
+        arg.len() >= 2 + n,
+        "the argument is long enough for the old prefix rule to have fired (len {}, 2 + n {})",
+        arg.len(),
+        2 + n,
+    );
+
+    assert_eq!(
+        rig.control("send", &arg).expect("the plain command is accepted"),
+        ctl_ok(),
+        "the plain form is authoritative: the command is sent, not stripped",
+    );
+    assert_eq!(
+        receive_one(&receiver),
+        payload,
+        "the receiver sees the whole payload — the address was consumed and nothing was stripped",
     );
 }
