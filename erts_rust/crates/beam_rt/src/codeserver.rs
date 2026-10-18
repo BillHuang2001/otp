@@ -684,13 +684,29 @@ impl CodeServer {
         self.fun_snapshot_rebuilds.get()
     }
 
-    /// Loads `name` (memoized): the cached module, or `<name>.beam` from the code path.
+    /// Loads `name` (memoized) from the code path: the cached module, or `<name>.beam` whose
+    /// own module name **is** `name`.
+    ///
+    /// # The expected-name check (the C's `beam_load.c`)
+    ///
+    /// Every **name-based** route ends here — `code:load_file/1`,
+    /// `code:ensure_loaded/1`, `code:ensure_modules_loaded/1`, the boot script's
+    /// `{primLoad,…}` directives and the on-demand load of an external call — so this is the
+    /// **one** place that reproduces the loader's expected-name check: `beam_load.c`
+    /// (`check_module_name`) compares the module name in the object code with the name the
+    /// load was asked for and refuses the image when the two differ. A `<name>.beam` found on
+    /// the code path that really holds another module is therefore a **load failure**
+    /// ([`error::bad_object_module_name`]), never a load under the file's own name: the image
+    /// is not cached under either name and no part of it becomes visible (the oracle:
+    /// `code:load_file(bogus)` ⇒ `{error,badfile}`, `erlang:module_loaded(realname)` ⇒
+    /// `false`). The callers fold that refusal into the oracle's single `badfile` reason.
     ///
     /// # Errors
     ///
     /// The bare `error:undef` raise when `<name>.beam` is on no code-path directory (the
     /// oracle's reason for a call to a module the release does not have — see
-    /// [`CodeServer::not_found`]), plus the loader's own error for a malformed `.beam`.
+    /// [`CodeServer::not_found`]), the loader's own error for a malformed `.beam`, and
+    /// [`error::bad_object_module_name`] when the image's own module name is not `name`.
     pub fn load(&mut self, name: &str) -> Result<Arc<Module>> {
         if let Some(module) = self.modules.get(name) {
             return Ok(module.clone());
@@ -698,13 +714,20 @@ impl CodeServer {
         let path = self
             .find_file(name)
             .ok_or_else(|| self.not_found())?;
-        self.load_path(&path)
+        let (module, image_name) = self.read_image(&path)?;
+        if image_name != name {
+            return Err(error::bad_object_module_name(name, &image_name));
+        }
+        Ok(self.insert_from_file(image_name, module, &path))
     }
 
     /// Loads the `.beam` at `path` and caches it under the module's **own** name.
     ///
     /// This is the explicit-file entry point (the CLI's `run` action and the slice
-    /// fixture): the file need not be on the code path.
+    /// fixture): the file need not be on the code path, and — unlike
+    /// [`CodeServer::load`] — no requested name exists to check the image's own name
+    /// against, so the image is always taken under the name it carries. A route that *has*
+    /// a requested name must go through [`CodeServer::load`].
     ///
     /// # Errors
     ///
@@ -712,6 +735,21 @@ impl CodeServer {
     /// diagnostic when the image has no resolvable module name.
     pub fn load_path(&mut self, path: impl AsRef<Path>) -> Result<Arc<Module>> {
         let path = path.as_ref();
+        let (module, name) = self.read_image(path)?;
+        Ok(self.insert_from_file(name, module, path))
+    }
+
+    /// Reads and decodes the `.beam` at `path`, answering the image together with its
+    /// **own** module name.
+    ///
+    /// Reading and decoding are pure: nothing is cached, so a caller that then refuses the
+    /// image ([`CodeServer::load`]'s expected-name check) leaves the code server untouched.
+    ///
+    /// # Errors
+    ///
+    /// A read error for `path`, the loader's error for a malformed image, or a diagnostic
+    /// when the image has no resolvable module name.
+    fn read_image(&mut self, path: &Path) -> Result<(Module, String)> {
         let bytes = std::fs::read(path).map_err(|source| {
             error::message(format!("cannot read {}: {source}", path.display()))
         })?;
@@ -720,15 +758,20 @@ impl CodeServer {
             .atom_name(module.name)
             .ok_or_else(|| error::message(format!("{} has no module name", path.display())))?
             .to_string();
+        Ok((module, name))
+    }
+
+    /// Caches the decoded `module` under `name`, recording `path` as the `.beam` file it was
+    /// loaded from — the shared tail of the two file-load entry points.
+    fn insert_from_file(&mut self, name: String, module: Module, path: &Path) -> Arc<Module> {
         let module = Arc::new(module);
         self.modules.insert(name.clone(), module.clone());
         self.module_paths.insert(name, path.to_path_buf());
         // The loaded-module set changed — a new module, or a reload that replaced one — so the
         // cached fun-resolution snapshot is invalidated (see `fun_module_snapshot`).
         self.loaded_generation += 1;
-        Ok(module)
+        module
     }
-
     /// Registers an already-decoded module image under `name`, recording `recorded` as the
     /// filename `code:which/1`/`code:is_loaded/1` report — `code:load_binary/3`'s load.
     ///

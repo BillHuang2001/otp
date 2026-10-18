@@ -48,7 +48,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-
+use std::sync::atomic::{AtomicU64, Ordering};
 /// The fixture source: a module that is neither preloaded nor under a sticky directory.
 ///
 /// Kept trivially small and free of library calls so the only thing under test is the
@@ -83,7 +83,25 @@ io:format(\"~p~n\", [{code:load_file(mymod), code:load_file(mymod), \
 code:load_file(bogus)}]), halt(0).";
 const FIXTURE_EXPECTED: &str = "{{module,mymod},{module,mymod},{error,badfile}}";
 
-// ---------------------------------------------------------------------------------------
+/// The name-mismatch program: `mismatch.beam` is a **well-formed** image of `mymod`, so the
+/// loader's expected-name check (the C's `beam_load.c`) is the only thing that can refuse it.
+/// `{error,badfile}` — and **nothing** is loaded: neither the requested name nor the image's
+/// own (`mymod` is still unloaded when the load_file/1 call has been made, which is why the
+/// second element re-asks `mymod`'s own load state); `which/1` stays path-based, so the last
+/// element proves the file **was** found (the refusal is the name check, not `{error,nofile}`).
+const EXPR_MISMATCH: &str = "\
+io:format(\"~p~n\", [{code:load_file(mismatch), erlang:module_loaded(mismatch), \
+erlang:module_loaded(mymod), code:is_loaded(mismatch), \
+code:which(mismatch) =/= non_existing}]), halt(0).";
+const MISMATCH_EXPECTED: &str = "{{error,badfile},false,false,false,true}";
+
+/// The same refusal on the whole-list route: `code:ensure_modules_loaded/1` reports the failed
+/// module as `{mismatch,badfile}` (never `nofile`) and still loads the **matching** name.
+const EXPR_ENSURE_MISMATCH: &str = "\
+io:format(\"~p~n\", [{code:ensure_modules_loaded([mismatch]), \
+erlang:module_loaded(mismatch), erlang:module_loaded(mymod), \
+code:ensure_modules_loaded([mymod])}]), halt(0).";
+const ENSURE_MISMATCH_EXPECTED: &str = "{{error,[{mismatch,badfile}]},false,false,ok}";// ---------------------------------------------------------------------------------------
 // Running the two runtimes
 // ---------------------------------------------------------------------------------------
 
@@ -187,12 +205,37 @@ fn resolve_erlc() -> Option<PathBuf> {
     support::find_on_path("erlc")
 }
 
+/// The scratch directory of **one** `build_fixture` call.
+///
+/// Unique per call: two tests in this suite can hold their own fixtures at the same time, and a
+/// shared `{pid}`-only name would let one test's `Drop` delete the other's directory mid-run
+/// (which surfaces as a spurious `{error,nofile}`).
+fn fixture_dir() -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "beam_rt_code_load_file_{}_{sequence}",
+        std::process::id()
+    ))
+}
+
 /// Compiles the fixture (and writes the corrupt `bogus.beam`) into a fresh scratch
 /// directory, or `None` after a loud skip when the toolchain cannot do it.
 fn build_fixture(erlc: &Path) -> Option<Fixture> {
-    let dir = std::env::temp_dir().join(format!("beam_rt_code_load_file_{}", std::process::id()));
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        support::skip_loudly(
+    let dir = fixture_dir();
+    // A stale directory from a killed run must not decide the result: start clean.
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            support::skip_loudly(
+                "code_load_file",
+                &format!("cannot clear {}: {error}", dir.display()),
+            );
+            return None;
+        }
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {        support::skip_loudly(
             "code_load_file",
             &format!("cannot prepare {}: {error}", dir.display()),
         );
@@ -233,9 +276,29 @@ fn build_fixture(erlc: &Path) -> Option<Fixture> {
         );
         return None;
     }
+    // A **well-formed** image under a name its object code does not carry: `mismatch.beam` is
+    // `mymod`'s own bytes, so the loader's expected-name check is the only thing that can
+    // refuse it (never a malformed container, never a missing file).
+    match std::fs::read(dir.join("mymod.beam")) {
+        Ok(image) => {
+            if let Err(error) = std::fs::write(dir.join("mismatch.beam"), &image) {
+                support::skip_loudly(
+                    "code_load_file",
+                    &format!("cannot write mismatch.beam: {error}"),
+                );
+                return None;
+            }
+        }
+        Err(error) => {
+            support::skip_loudly(
+                "code_load_file",
+                &format!("cannot read mymod.beam back: {error}"),
+            );
+            return None;
+        }
+    }
     Some(Fixture { dir })
 }
-
 // ---------------------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------------------
@@ -284,5 +347,39 @@ fn a_user_module_loads_from_a_pa_directory_and_matches_the_oracle() {
         EXPR_FIXTURE,
         FIXTURE_EXPECTED,
         "code:load_file/1 from a -pa directory",
+    );
+}
+
+/// The loader's expected-name check (the C's `beam_load.c`) on the **file** route: a
+/// well-formed `mismatch.beam` whose object code declares `mymod` is `{error,badfile}` and
+/// loads under **neither** name, while `which/1` still finds the file — so the refusal is
+/// provably the name check rather than `{error,nofile}`. `code:ensure_modules_loaded/1` folds
+/// the same refusal into `{error,[{mismatch,badfile}]}`, and the **matching** name still loads
+/// (`ok`). Both answers are the oracle's own, re-measured on every run.
+#[test]
+fn an_image_whose_object_code_names_another_module_is_refused_on_both_file_routes() {
+    let Some(oracle) = support::require_oracle("code_load_file") else {
+        return;
+    };
+    let Some(erlc) = resolve_erlc() else {
+        support::skip_loudly("code_load_file", "no `erlc` on $PATH");
+        return;
+    };
+    let Some(fixture) = build_fixture(&erlc) else {
+        return;
+    };
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_MISMATCH,
+        MISMATCH_EXPECTED,
+        "code:load_file/1 of an image whose object code names another module",
+    );
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_ENSURE_MISMATCH,
+        ENSURE_MISMATCH_EXPECTED,
+        "code:ensure_modules_loaded/1 of an image whose object code names another module",
     );
 }

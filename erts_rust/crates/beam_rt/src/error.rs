@@ -176,8 +176,33 @@ pub(crate) fn message(text: impl Into<String>) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(text.into())))
 }
 
-/// The reason of a [`BeamError::Raise`], as an atom name, when there is one.
+/// The `undef`-style diagnostic of a `.beam` whose **object code names another module**.
 ///
+/// This is the loader's expected-name check — the C's `beam_load.c:186`
+/// (`check_module_name`, `make_descriptor`): the object code declares one module name and the
+/// load was asked for another, so the image is refused. Every name-based load route
+/// ([`CodeServer::load`](crate::CodeServer::load)) raises this, and its callers fold it into
+/// the oracle's single `badfile` reason (`code:load_file/1` ⇒ `{error,badfile}`,
+/// `code:ensure_modules_loaded/1` ⇒ `{error,[{Name,badfile}]}`).
+///
+/// The message names **both** modules so a CLI diagnostic (`beam_rt: error …`) is as
+/// informative as the C's log line. A bare atom cannot carry it (the harness compares reasons
+/// exactly, so only the `code:*` return value — `badfile` — is part of the contract).
+///
+/// # Accepted residual
+///
+/// The oracle additionally **logs** an
+/// `=ERROR REPORT==== … ===` / `beam/beam_load.c(186): Error loading module <requested>:`
+/// / `  module name in object code is <actual>` block on its default logger handler. This
+/// runtime has no logger, so it emits no report — only the refusal itself, never a
+/// fabricated one.
+pub(crate) fn bad_object_module_name(requested: &str, actual: &str) -> BeamError {
+    message(format!(
+        "module name in object code is {actual}, not {requested}"
+    ))
+}
+
+/// The reason of a [`BeamError::Raise`], as an atom name, when there is one.///
 /// Reads through [`ExitReason::as_atom`], which — unlike
 /// [`BeamError::as_atom`] — also sees atoms backed by an owned `String` (every
 /// message this module builds). Every other error is `None`.
