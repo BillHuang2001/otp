@@ -145,6 +145,14 @@
 //!   index form is unaffected by `[safe]` (asserted through the `[safe,used]`
 //!   consumed-byte count, since the index→atom mapping is bootstrap-order dependent).
 //!
+//! * the `[safe]`-vs-`EXPORT_EXT` surface — `[safe]` refuses an export image naming a function
+//!   with no *active* export entry (`fun lists:no_such_fun_xyz/1` ⇒ `badarg`) while the
+//!   flag-free decode of the same image yields the (still-introspectable) external fun, and it
+//!   keeps accepting an image that names a real function (`fun lists:map/2`). Both halves ride
+//!   one expression, the refusal measured **first** because the flag-free decode is what
+//!   activates the entry; the goldens reduce to atoms/booleans/small integers via
+//!   `fun_info/1,2` and never render the fun itself.
+//!
 //! * the **`{minor_version, N}` id/float matrix** — `term_to_binary/2`'s legacy dialects
 //!   (`0`/`1`/`2`) do **not** downgrade the external-id tags (a pid stays `NEW_PID_EXT`
 //!   (88), a reference `NEWER_REFERENCE_EXT` (90), an internal port `V4_PORT_EXT` (120)
@@ -720,6 +728,18 @@ pub(crate) fn group() -> Vec<Case> {
         v("wire_extra/b2t_safe_export_fun_image", "[safe] accepts an EXPORT_EXT (113) external-fun image", "binary_to_term(term_to_binary(fun lists:reverse/1), [safe])", "ok fun lists:reverse/1"),
         t("wire_extra/b2t_safe_export_fun_is_function1", "[safe] on an external-fun image yields a callable fun of arity 1", "is_function(binary_to_term(term_to_binary(fun lists:reverse/1), [safe]), 1)", "ok <<131,119,4,116,114,117,101>>"),
         v("wire_extra/b2t_safe_export_fun_call", "[safe] on an external-fun image yields a fun that calls through", "begin F = binary_to_term(term_to_binary(fun lists:reverse/1), [safe]), F([1,2,3]) end", "ok [3,2,1]"),
+        // -- `[safe]` and an EXPORT_EXT image naming a *non-existent* function ------------
+        // `[safe]` refuses an export image whose module/function/arity has no *active* export
+        // entry (`erts_active_export_entry` in the decoder), while the flag-free decode of the
+        // very same image succeeds -- it creates the stub entry and answers a fun whose
+        // `fun_info/1` is still well defined (calling it would be `badfun`). Both halves are
+        // pinned in one expression, and the refusal is measured **first**, because the flag-free
+        // decode is what activates the entry: decoding without the flag and then asking for the
+        // `[safe]` decode of the same image is *accepted* by the oracle. Neither golden renders
+        // the fun itself (a fun image is VM-coupled); every field is an atom, a boolean or a
+        // small integer, reduced through `fun_info/1,2`.
+        v("wire_extra/b2t_safe_refuses_a_missing_fun_while_the_plain_decode_succeeds", "[safe] refuses an EXPORT_EXT image naming a function that does not exist, while the flag-free decode of the same image yields a 1-arity external fun", "begin B = term_to_binary(fun lists:no_such_fun_xyz/1), Refused = try binary_to_term(B, [safe]) of F1 -> accepted catch error:badarg -> refused end, Free = try F2 = binary_to_term(B), {is_function(F2,1), erlang:fun_info(F2, arity), erlang:fun_info(F2, type)} of Res -> Res catch error:_ -> free_failed end, {Refused, Free} end", "ok {refused,{true,{arity,1},{type,external}}}"),
+        v("wire_extra/b2t_safe_accepts_an_existing_fun_lists_map", "[safe] keeps accepting an EXPORT_EXT image naming a function that does exist (fun lists:map/2 has an active export entry)", "begin Cc = term_to_binary(fun lists:map/2), F = binary_to_term(Cc, [safe]), {accepted, is_function(F, 2), erlang:fun_info(F, module)} end", "ok {accepted,true,{module,lists}}"),
         t("wire_extra/b2t_used_compressed_bytes_is_full_image", "[used] over a compressed image reports the whole image's byte count", "begin T = lists:duplicate(200, 122), B = term_to_binary(T,[compressed]), {T2,U} = binary_to_term(B,[used]), (T2 =:= T) andalso (U =:= byte_size(B)) end", "ok <<131,119,4,116,114,117,101>>"),
         t("wire_extra/b2t_safe_external_pid_image_accept", "[safe] accepts an external NEW_PID_EXT (88) image", "is_pid(binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,7,0,0,0,0,0,0,0,3>>, [safe]))", "ok <<131,119,4,116,114,117,101>>"),
         t("wire_extra/b2t_safe_external_ref_image_accept", "[safe] accepts an external NEWER_REFERENCE_EXT (90) image", "is_reference(binary_to_term(<<131,90,0,1,119,5,111,116,104,101,114,0,0,0,0,0,2,35,202,0,0,0,7>>, [safe]))", "ok <<131,119,4,116,114,117,101>>"),
@@ -824,7 +844,7 @@ mod tests {
         let cases = group();
         // The exact size is pinned so a case can never vanish from the registry unnoticed;
         // grow this number in the same change that adds cases.
-        assert_eq!(cases.len(), 428, "the expanded A.5 group size");
+        assert_eq!(cases.len(), 430, "the expanded A.5 group size");
         let mut seen = HashSet::new();
         for case in &cases {
             assert!(
@@ -1200,7 +1220,8 @@ mod tests {
             ("wire_extra/b2t_empty_options_same_as_one_arg", "ok 1"),
             ("wire_extra/b2t_safe_export_fun_call", "ok [3,2,1]"),
             ("wire_extra/b2t_safe_export_fun_image", "ok fun lists:reverse/1"),
-            ("wire_extra/b2t_safe_export_fun_is_function1", "ok <<131,119,4,116,114,117,101>>"),
+            ("wire_extra/b2t_safe_accepts_an_existing_fun_lists_map", "ok {accepted,true,{module,lists}}"),
+            ("wire_extra/b2t_safe_refuses_a_missing_fun_while_the_plain_decode_succeeds", "ok {refused,{true,{arity,1},{type,external}}}"),            ("wire_extra/b2t_safe_export_fun_is_function1", "ok <<131,119,4,116,114,117,101>>"),
             ("wire_extra/b2t_safe_external_pid_image_accept", "ok <<131,119,4,116,114,117,101>>"),
             ("wire_extra/b2t_safe_external_ref_image_accept", "ok <<131,119,4,116,114,117,101>>"),
             ("wire_extra/b2t_safe_used_mv1_atom_bytes", "ok {hello,9}"),
@@ -1392,5 +1413,55 @@ mod tests {
                 "case {id} must sweep all three minor versions: {expr}"
             );
         }
+    }
+
+    /// The two `[safe]`-vs-`EXPORT_EXT` cases: `[safe]` refuses an export image whose
+    /// module/function/arity has no *active* export entry while the flag-free decode of the same
+    /// image succeeds, and it keeps accepting an image that names a real function. Pin both
+    /// goldens, pin that neither renders the fun itself (a fun image is VM-coupled), and pin the
+    /// measurement order — the flag-free decode must come **second**, because it is what
+    /// activates the export entry, after which the oracle accepts the same image under `[safe]`.
+    #[test]
+    fn wire_extra_pins_the_safe_export_fun_surface_without_a_fun_image() {
+        let cases = group();
+        let find = |id: &str| {
+            cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the [safe] export-fun case {id}"))
+        };
+        let refused =
+            find("wire_extra/b2t_safe_refuses_a_missing_fun_while_the_plain_decode_succeeds");
+        let accepted = find("wire_extra/b2t_safe_accepts_an_existing_fun_lists_map");
+        assert_eq!(
+            refused.golden.stdout,
+            Some("ok {refused,{true,{arity,1},{type,external}}}"),
+            "the oracle refuses the missing function under [safe] and decodes it without the flag"
+        );
+        assert_eq!(
+            accepted.golden.stdout,
+            Some("ok {accepted,true,{module,lists}}"),
+            "the oracle keeps accepting an existing function under [safe]"
+        );
+        for case in [refused, accepted] {
+            assert_eq!(case.golden.exit_code, 0, "{}", case.id);
+            assert_eq!(case.contracts, &[Contract::Distribution], "{}", case.id);
+            let golden = case.golden.stdout.expect("a golden line");
+            assert!(
+                !golden.contains("fun ") && !golden.contains("#Fun<"),
+                "case {} must not pin a fun image (VM-coupled): {golden}",
+                case.id
+            );
+        }
+        let expr = refused.expr().expect("an expression case");
+        let safe_at = expr.find("[safe]").expect("the safe decode");
+        let plain_at = expr
+            .find("binary_to_term(B),")
+            .expect("the flag-free decode");
+        assert!(
+            safe_at < plain_at,
+            "case {} must ask for the [safe] decode before the flag-free one: {expr}",
+            refused.id
+        );
     }
 }
