@@ -79,9 +79,12 @@
 //! `beam_codec`) and a reason is carried as the atom *name* it must become. The runtime builds
 //! the actual message tuples.
 
+use std::os::unix::io::RawFd;
+
 use beam_process::PortId;
 
 use crate::error;
+use crate::port_task::ReadMessage;
 
 /// The inet driver's `{error, Reason}` atom family — *why* a socket operation failed.
 ///
@@ -148,14 +151,58 @@ pub enum InetReply {
 
 /// The result half of a [`CompletionEvent::InetAsync`] — the C's `send_async_*` family's fourth
 /// tuple element.
+///
+/// # The data plane is a [`ReadMessage`], not a byte vector
+///
+/// [`InetAsyncResult::Data`] carries the crate's existing read shape rather than a flat `Vec<u8>`
+/// because the C's `inet_async_data` (`inet_drv.c:3162`) builds a *term* whose element count
+/// depends on a header/body split:
+///
+/// * **TCP, `[binary]` mode, `hsz == 0`** (the default — `desc->inet.hsz` is only ever set by
+///   `{header, N}`): the payload is one binary, i.e. `header` empty and `body = Some(payload)`.
+/// * **TCP, `[list]` mode**: the C takes its `hsz > len` branch, `LOAD_STRING`, and the owner sees
+///   a **flat** int list — the runtime renders `read.flattened()`.
+/// * **UDP**: `packet_inet_input` splits the received bytes into `nsz` address bytes and `len`
+///   payload bytes (`:15560`), so `header` is the packed source address
+///   ([`pack_address`](crate::drivers::inet::wire)) and `body` is the datagram. In `[list]` mode
+///   the result is one flat list with the address first; in `[binary]` mode it is the **improper**
+///   list `[AF, PortHi, PortLo, A, B, C, D | <<Payload>>]`.
+///
+/// Which of the two the owner sees is decided above this crate (the port's `{mode, list|binary}`
+/// option); this crate only carries the split, exactly as it does for
+/// [`ReadMessage`](crate::port_task::ReadMessage) on the `{Port, {data, …}}` path.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InetAsyncResult {
     /// `ok` (`send_async_ok`, `inet_drv.c:2493-2508`).
     Ok,
-    /// `{ok, Data}`: the bytes the operation received (a `recv`/`accept` payload).
-    Data(Vec<u8>),
-    /// `{ok, Port2}`: the second port an operation created (`send_async_ok_port`, `:2513-2534`;
-    /// the `accept` path's new connection port).
+    /// `{ok, Data}`: one completed read, with the C's header/body split preserved.
+    Data(ReadMessage),
+    /// `{ok, NewPort}`: the **descriptor** of a connection an `accept` operation took off a
+    /// listening socket, handed to the runtime so it can open the second port itself.
+    ///
+    /// The C creates that port inside the driver (`tcp_inet_copy`, `inet_drv.c:11834`) and answers
+    /// `{ok, Port2}` through `async_ok_port` (`:2513-2534`); a driver in this crate cannot create a
+    /// port, so the descriptor crosses the channel and the runtime performs the adoption
+    /// (`TcpInetDriver::from_socket`, or the already-served `INET_REQ_FDOPEN` request).
+    ///
+    /// # Ownership (the hand-off rule)
+    ///
+    /// The descriptor is **the consumer's** the moment the completion is staged: the accepting
+    /// driver hands it straight to
+    /// [`DriverContext::deliver_completion`](crate::driver::DriverContext::deliver_completion)
+    /// without ever storing it, so nothing remembers it, and no teardown path
+    /// ([`Driver::stop`](crate::driver::Driver::stop), `Drop`) can ever `close(2)` it. The owner
+    /// must either adopt it (the runtime's job) or close it; it is never closed here. A completion
+    /// that reports a failure instead ([`InetAsyncResult::Error`], e.g. `{error, timeout}`) carries
+    /// no descriptor because none was ever taken off the listening socket.
+    Accepted {
+        /// The accepted, **non-blocking** connection descriptor, owned by the completion's
+        /// consumer.
+        fd: RawFd,
+    },
+    /// `{ok, Port2}`: the second port an operation created (`send_async_ok_port`, `:2513-2534`).
+    /// The C's own shape; no driver in this crate produces it (see
+    /// [`InetAsyncResult::Accepted`] for what a Rust `accept` reports).
     Port(PortId),
     /// `{error, Reason}` (`send_async_error`, `:2539-2562`).
     Error(InetReason),

@@ -45,7 +45,7 @@ use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply,
 use crate::driver::{Driver, DriverContext};
 use crate::poller::Poller;
 use crate::port::{Port, PortCommandOptions, DEFAULT_READINESS_RED_BUDGET};
-use crate::port_task::PortNotification;
+use crate::port_task::{PortNotification, ReadMessage};
 use crate::queue::ByteQueue;
 use crate::registry::PortRegistry;
 use crate::driver::PortArms;
@@ -588,7 +588,7 @@ fn the_async_results_carry_their_payloads() {
     let port = PortId::new(9);
     let results = [
         InetAsyncResult::Ok,
-        InetAsyncResult::Data(b"payload".to_vec()),
+        InetAsyncResult::Data(ReadMessage::body_only(b"payload".to_vec())),
         InetAsyncResult::Port(port),
         InetAsyncResult::Error(InetReason::from_errno(libc::ECONNRESET)),
     ];
@@ -599,7 +599,7 @@ fn the_async_results_carry_their_payloads() {
     }
     assert_eq!(
         results[1],
-        InetAsyncResult::Data(b"payload".to_vec()),
+        InetAsyncResult::Data(ReadMessage::body_only(b"payload".to_vec())),
         "the received bytes ride the result"
     );
     assert_eq!(
