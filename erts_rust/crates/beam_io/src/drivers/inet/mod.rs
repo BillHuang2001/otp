@@ -2079,6 +2079,9 @@ mod active_tests;
 #[cfg(test)]
 mod accept_tests;
 #[cfg(test)]
+#[path = "close_tests.rs"]
+mod close_tests;
+#[cfg(test)]
 mod fdopen_errno_tests;
 #[cfg(test)]
 mod frame_tests;
