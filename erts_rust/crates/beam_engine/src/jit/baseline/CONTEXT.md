@@ -240,6 +240,17 @@ tier still fails to lower — the evidence a widening of the inline set is chose
   `crate::jit::bench::assert_tier_agreement()` with recording on and dumps the per-variant
   `Counters::deopts_by_variant` the executed blocks produced — which un-lowered opcodes
   dominate the **hot** shapes.
+- **Dynamic per-variant execution** (same test, immediately after its deopt ranking):
+  `crate::jit::bench::run_workloads_on(Tier::Interpreter)` with `crate::exec_census` recording on —
+  the **executed** population itself (per `Instr` variant, plus the typed errors per variant with the
+  first error text) over the same in-crate workload set. It runs on the **interpreter** tier on
+  purpose: a native tier emits a lowered instruction as native code, so its funnel only sees the
+  steps it deopted (exactly the population the deopt ranking already covers). The caveat the section
+  documents: this is the in-crate tier workload set, **not** the OTP corpus (a corpus-scale dynamic
+  view is a `tests/` sweep's business). Asserts only liveness/consistency (non-empty map, both
+  totals = their map's sum, a first-error text per erroring variant, non-empty variant keys, a
+  ranking that faithfully re-orders the map) and writes its own `exec_census::write_dump("dynamic")`
+  TSV, tolerating a write failure like the deopt dump.
 - **Emitted byte size** (`census.rs::the_per_kind_emitted_code_size_table_is_printed`): for the
   in-block lowerings already present (`Move` incl. the literal-area source, the Y-operand
   `test`/`select_val`/`select_tuple_arity` shapes, `Call`, the unlinked `CallLast` tail exit, the
@@ -249,7 +260,7 @@ tier still fails to lower — the evidence a widening of the inline set is chose
   60 B per-occurrence deopt sequence). Per-kind attribution is exact because each shape compiles as
   its own single-block function; it also prints the whole-artifact `code_len` of the committed
   fixtures.
-All three write a machine-readable TSV to `std::env::temp_dir()` and assert only liveness/consistency
+All four write a machine-readable TSV to `std::env::temp_dir()` and assert only liveness/consistency
 (never a threshold), so the printed rankings are the evidence and the tests pass as the inline set
 changes. Run the static census with
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_static_deopt_census_over_the_corpus_is_printed -- --nocapture`
