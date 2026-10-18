@@ -95,9 +95,12 @@ const FIXTURE_IMPORTS: [&str; 11] = [
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path [`load`] takes: the compiled `.so` **without** its extension, which the loader appends
+/// itself (`erts_sys_ddll_open` copies `FILE_EXT` unconditionally,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so a path that already named the object
+/// would resolve `<path>.so.so`. `None` (after a loud skip) when the path is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -155,7 +158,7 @@ fn compile_fixture() -> Option<PathBuf> {
 /// Compile an inline C source naming a driver nothing may be loaded as `t`.
 fn compile_bad(stem: &str, source: &str) -> Option<String> {
     let so = compile_so(stem, source)?;
-    so_path(&so)
+    load_path(&so)
 }
 
 /// Read the atom/tuple `{t, 1}` a `send_term` recorded, proving the term-data path built it.
@@ -239,7 +242,7 @@ fn loads_and_drives_a_real_c_driver() {
     assert!(driver_api_table().driver_alloc.is_some());
 
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // --- the `.so` really imports `driver_*` (bound at load time, not at link time) -------------
     match all_symbols_are_undefined_imports(&so, &FIXTURE_IMPORTS) {

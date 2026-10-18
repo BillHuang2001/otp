@@ -62,16 +62,19 @@
 //!
 //! # Documented deviations from the C
 //!
-//! 1. **The `.so` suffix is appended only when absent** (the C appends `FILE_EXT` before `dlopen`),
-//!    the same rule [`crate::nif::loader`] uses.
-//! 2. **A `dlopen` failure lands in [`DriverLoadError::Unspecified`], carrying the dynamic loader's
+//! 1. **A `dlopen` failure lands in [`DriverLoadError::Unspecified`], carrying the dynamic loader's
 //!    own `dlerror` text.** The C returns a `dynamic_error`-offset code with no atom in
 //!    `errcode_tab`, rendered as `{open_error, N}`; that shape has no variant here.
-//! 3. **A `NULL` `driver_name` is a typed [`DriverLoadError::BadDriverName`]**; the C's
+//! 2. **A `NULL` `driver_name` is a typed [`DriverLoadError::BadDriverName`]**; the C's
 //!    `sys_strcmp(name, dp->driver_name)` would fault on it.
-//! 4. **No code server / driver list is consulted.** The C's global driver list, per-handle
+//! 3. **No code server / driver list is consulted.** The C's global driver list, per-handle
 //!    reference counts and reload/pending protocol are all `DE_Handle` state; [`load`] performs only
 //!    the *entry* validation, leaving registration and reload policy to the runtime.
+//!
+//! The path rule is **not** a deviation: the shared-object suffix is appended unconditionally, so a
+//! path already ending in `.so` opens `<path>.so`, exactly like `erts_sys_ddll_open`
+//! (`erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`, `FILE_EXT`), and the diagnostic names the
+//! suffixed path.
 //!
 //! # Ownership
 //!
@@ -432,8 +435,10 @@ impl Drop for DriverLibrary {
 /// Load a driver shared object and validate it in the oracle's exact order
 /// (`erl_bif_ddll.c:1466-1533`).
 ///
-/// `path` is as passed to `erlang:load_driver/2`; the shared-object suffix (`.so`) is appended when
-/// absent. `name` is the registered driver name, which the entry's `driver_name` must equal.
+/// `path` is as passed to `erlang:load_driver/2`; the shared-object suffix (`.so`) is appended
+/// **unconditionally**, so a path that already names a shared object resolves `<path>.so` (the
+/// oracle appends `FILE_EXT` the same way, `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`).
+/// `name` is the registered driver name, which the entry's `driver_name` must equal.
 ///
 /// The returned [`DriverLibrary`] owns the `dlopen` handle and closes it on drop (after running the
 /// entry's `finish` callback).
@@ -537,13 +542,11 @@ fn driver_version_accepted(major: c_int, minor: c_int) -> bool {
 // Helpers (deliberate mirrors of `crate::nif::loader`'s private helpers — see the module docs)
 // ---------------------------------------------------------------------------------------------
 
-/// `path` with the shared-object suffix appended when absent.
+/// `path` with the shared-object suffix appended — unconditionally, as the oracle does
+/// (`erts_sys_ddll_open` copies `FILE_EXT` after the given name,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so `"/x/foo.so"` opens `"/x/foo.so.so"`.
 fn shared_object_path(path: &str) -> String {
-    if path.ends_with(SHARED_OBJECT_SUFFIX) {
-        path.to_string()
-    } else {
-        format!("{path}{SHARED_OBJECT_SUFFIX}")
-    }
+    format!("{path}{SHARED_OBJECT_SUFFIX}")
 }
 
 /// Read a NUL-terminated C string, returning `None` for a null pointer.
@@ -654,11 +657,15 @@ mod tests {
         DriverLibrary { handle: core::ptr::null_mut(), entry: entry as *mut ErlDrvEntry, name: "t".to_string() }
     }
 
+    /// The oracle appends `FILE_EXT` unconditionally (`erl_unix_sys_ddll.c:104-118`), so an
+    /// already-suffixed path resolves `<path>.so.so` — the measured OTP behaviour of
+    /// `erlang:load_driver("/nonexistent/foo.so", [])`.
     #[test]
-    fn shared_object_path_appends_the_suffix_only_when_absent() {
+    fn shared_object_path_appends_the_suffix_unconditionally() {
         assert_eq!(shared_object_path("/tmp/x"), "/tmp/x.so");
-        assert_eq!(shared_object_path("/tmp/x.so"), "/tmp/x.so");
+        assert_eq!(shared_object_path("/tmp/x.so"), "/tmp/x.so.so");
         assert_eq!(shared_object_path("x"), "x.so");
+        assert_eq!(shared_object_path(""), ".so");
     }
 
     #[test]

@@ -115,9 +115,12 @@ const MONITOR_BYTES: usize = 4 * std::mem::size_of::<*mut c_void>();
 // Helpers (the same idiom as `tests/driver_end_to_end.rs`)
 // ---------------------------------------------------------------------------------------------
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path [`load`] takes: the compiled `.so` **without** its extension, which the loader appends
+/// itself (`erts_sys_ddll_open` copies `FILE_EXT` unconditionally,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so a path that already named the object
+/// would resolve `<path>.so.so`. `None` (after a loud skip) when the path is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -390,7 +393,7 @@ fn loads_and_drives_a_real_c_driver_through_the_pdl_family() {
     assert!(driver_api_table().driver_pdl_create.is_some());
 
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // --- the `.so` really imports this family (bound at load time, not at link time) ------------
     match all_symbols_are_undefined_imports(&so, &FIXTURE_IMPORTS) {

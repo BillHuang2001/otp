@@ -1800,10 +1800,21 @@ impl<'a> BifContext<'a> {
 
     /// A tuple of `elems` built on the context heap.
     ///
+    /// An empty slice yields the shared `{}` **literal** ([`beam_term::tuple0`]), not a
+    /// zero-word heap block: that is the term the loader hands an `{tuple,0}` literal and the
+    /// term the oracle's own builders answer for an empty tuple (`list_to_tuple([])`,
+    /// `bif.c:3804-3806`, and a flat map's key tuple, `MAP_HEADER`'s `TUPLE0`,
+    /// `erl_term.h:1320-1325`). A heap arity-0 block is a different term: it prices 1 word in
+    /// `erts_debug:flat_size/1` (`copy.c:124-140` exempts only the literal, i.e.
+    /// `ERTS_GLOBAL_LIT_EMPTY_TUPLE`).
+    ///
     /// # Errors
     ///
     /// Propagates the heap's allocation failure.
     pub fn tuple(&mut self, elems: &[Eterm]) -> Result<Eterm> {
+        if elems.is_empty() {
+            return Ok(beam_term::tuple0());
+        }
         self.heap.tuple(elems)
     }
 
@@ -1925,6 +1936,34 @@ mod tests {
         let float = ctx.make_float(1.5).expect("fits");
         assert!(crate::access::is_float(float));
         assert_eq!(crate::access::float_value(float), 1.5);
+    }
+
+    /// An empty slice is the shared `{}` **literal** — never a zero-word heap block.
+    ///
+    /// The distinction is observable: the loader's `{tuple,0}` literal and the oracle's
+    /// `list_to_tuple([])`/`map_to_tuple_keys(#{})` both answer `ERTS_GLOBAL_LIT_EMPTY_TUPLE`,
+    /// which `erts_debug:flat_size/1` prices 0; a heap arity-0 block prices 1
+    /// (`copy.c:124-140`). The empty tuple also costs no heap words here, matching the C's
+    /// `BIF_RET(ERTS_GLOBAL_LIT_EMPTY_TUPLE)` (`bif.c:3804-3806`).
+    #[test]
+    fn an_empty_tuple_slice_is_the_shared_literal() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        let before = ctx.heap().available();
+        let empty = ctx.tuple(&[]).expect("the empty tuple");
+        assert_eq!(empty, beam_term::tuple0(), "`ctx.tuple(&[])` must be the `{{}}` literal");
+        assert!(beam_term::literal::is_literal(empty), "the literal-area bit must be set");
+        assert_eq!(ctx.heap().available(), before, "the shared literal allocates nothing");
+        assert!(crate::access::is_tuple(empty));
+        assert_eq!(crate::access::tuple_size(empty), 0);
+
+        // A non-empty slice is still a fresh heap tuple.
+        let pair = ctx.tuple(&[make_small(1), make_small(2)]).expect("fits");
+        assert_ne!(pair, empty);
+        assert!(!beam_term::literal::is_literal(pair));
+        assert_eq!(crate::access::tuple_size(pair), 2);
     }
 
     /// A minimal `FunCaller` test double: it recognises a *sentinel* fun term (the

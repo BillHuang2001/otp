@@ -243,9 +243,12 @@ impl DriverHost for CloseHost {
 // Helpers (the idiom of `tests/driver_port_term.rs` / `tests/erl_errno_id.rs`)
 // ---------------------------------------------------------------------------------------------
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path [`load`] takes: the compiled `.so` **without** its extension, which the loader appends
+/// itself (`erts_sys_ddll_open` copies `FILE_EXT` unconditionally,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so a path that already named the object
+/// would resolve `<path>.so.so`. `None` (after a loud skip) when the path is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -347,7 +350,7 @@ fn a_real_c_driver_hands_every_spelling_to_one_host_hook() {
         return;
     };
     assert_undefined_imports(&so);
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = CloseHost::new(0);
     let lib = load_fixture(&path);
@@ -461,7 +464,7 @@ fn a_host_without_the_close_hooks_answers_minus_one_for_every_spelling() {
     let Some(so) = compile_fixture() else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // The trait defaults for `failure`/`port_exit` answer `-1` — the C's failure code. The codes
     // the fixture returns must therefore be the *host's*, not a hardcoded success: with the hooks

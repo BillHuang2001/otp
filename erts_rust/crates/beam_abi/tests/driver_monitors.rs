@@ -131,9 +131,12 @@ const MONITOR_BYTES: usize = 4 * std::mem::size_of::<*mut c_void>();
 // Helpers (the same idiom as `tests/driver_pdl.rs`)
 // ---------------------------------------------------------------------------------------------
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path [`load`] takes: the compiled `.so` **without** its extension, which the loader appends
+/// itself (`erts_sys_ddll_open` copies `FILE_EXT` unconditionally,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so a path that already named the object
+/// would resolve `<path>.so.so`. `None` (after a loud skip) when the path is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -375,7 +378,7 @@ fn with_session<R>(
 ) -> Option<R> {
     link_the_family();
     let so = compile_fixture()?;
-    let path = so_path(&so)?;
+    let path = load_path(&so)?;
     let lib = load(&path, FIXTURE_NAME)
         .expect("a real driver must load: its driver_*/enif_* imports resolve from the test binary");
     assert_eq!(lib.name(), FIXTURE_NAME);

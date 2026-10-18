@@ -188,11 +188,26 @@ fn so_path(so: &Path) -> Option<String> {
     }
 }
 
-/// Compile an inline fixture and return its `.so` path; `None` (after a loud skip) when the
-/// toolchain is absent.
+/// The path [`load`] takes: the compiled `.so` **without** its extension, which the loader appends
+/// itself (`erts_sys_ddll_open` copies `FILE_EXT` unconditionally,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so a path that already named the object
+/// would resolve `<path>.so.so`.
+fn load_path(so: &Path) -> Option<String> {
+    let stem = so.with_extension("");
+    match stem.to_str() {
+        Some(path) => Some(path.to_string()),
+        None => {
+            skip("compiled .so path is not valid UTF-8");
+            None
+        }
+    }
+}
+
+/// Compile an inline fixture and return the path [`load`] takes (see [`load_path`]); `None` (after
+/// a loud skip) when the toolchain is absent.
 fn compile(stem: &str, source: &str) -> Option<String> {
     let so = compile_so(stem, source)?;
-    so_path(&so)
+    load_path(&so)
 }
 
 /// Load `path`, require the oracle's `Reason` reason-atom `atom` and its text, and return the error.

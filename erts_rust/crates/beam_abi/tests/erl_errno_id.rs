@@ -114,9 +114,12 @@ const CASES: [(c_int, &str); 11] = [
 // Helpers (the idiom of `tests/driver_port_term.rs`)
 // ---------------------------------------------------------------------------------------------
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path [`load`] takes: the compiled `.so` **without** its extension, which the loader appends
+/// itself (`erts_sys_ddll_open` copies `FILE_EXT` unconditionally,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so a path that already named the object
+/// would resolve `<path>.so.so`. `None` (after a loud skip) when the path is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -185,7 +188,7 @@ fn a_real_c_driver_sees_the_posix_name_from_this_crates_erl_errno_id() {
         ),
         None => skip("no nm/readelf: cannot inspect the fixture's dynamic symbols"),
     }
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // --- dlopen(RTLD_NOW) + the `ErlDrvEntry` validation ---------------------------------------
     let lib = load(&path, FIXTURE_NAME)

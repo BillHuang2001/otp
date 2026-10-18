@@ -207,7 +207,11 @@ fn a_real_c_driver_async_job_runs_through_the_safe_runner() {
     let Some(so) = compile_so("driver_async_job", FIXTURE_C) else {
         return; // no C compiler / no OTP include dir: `compile_so` printed the SKIP banner
     };
-    let path = so.to_str().expect("the scratch path is UTF-8");
+    // `load` appends the shared-object suffix itself (`erts_sys_ddll_open` copies `FILE_EXT`
+    // unconditionally, `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so hand it the stem:
+    // a path that already named the object would resolve `<path>.so.so`.
+    let stem = so.with_extension("");
+    let path = stem.to_str().expect("the scratch path is UTF-8");
     let lib = load(path, "tasync").expect("the fixture driver must load and validate");
 
     let mut host = InlineAsyncHost::new();
