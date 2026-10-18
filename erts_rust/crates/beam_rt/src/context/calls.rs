@@ -380,8 +380,10 @@ impl<'a> RuntimeContext<'a> {
         let install_tables = !reentrant || Self::tables_capable(module, function, arity);
         // Whether the pooled BIF heap may be **rewound** to this call's `mark` after the result has
         // been moved off it — the tail of this method (see [`Self::rehome_container_result`]). It
-        // gates the rewind only; the **move** of an `Ok` container result off the pool happens
-        // either way, because a container left on the pool is reachable from a heap object.
+        // gates the rewind, and it gates the **move** too on the table-less route, where the move
+        // exists only to license the rewind; a **process route** moves an `Ok` container result
+        // either way, because there the move is what makes the result collectable and a container
+        // left on the pool is reachable from a heap object.
         //
         // Six of the `DispatchHooks` arms ([`super::dispatch`]) each let a term the BIF built on
         // `ctx.heap()` **escape** into state that outlives the call, which is exactly what a
@@ -774,33 +776,46 @@ impl<'a> RuntimeContext<'a> {
                 invoke_registered(bif, arity, &mut context, args)
             }
         };
-        // The result is still on the pooled BIF heap. A **container** result must not stay there:
-        // the pool is a region no process collector scans, so Erlang code that stores such a result
-        // inside a heap object (a tuple, a map, a longer list) leaves a live heap object pointing
-        // into a recyclable region — and the container's own elements, young-generation addresses
-        // the collector relocated, are then never forwarded and dangle with it.
+        // The result is still on the pooled BIF heap. A **container** result must not stay there on
+        // a **process route**: the pool is a region no process collector scans, so Erlang code that
+        // stores such a result inside a heap object (a tuple, a map, a longer list) leaves a live
+        // heap object pointing into a recyclable region — and the container's own elements,
+        // young-generation addresses the collector relocated, are then never forwarded and dangle
+        // with it.
         //
-        // So the **move** is unconditional for an `Ok` container result: it goes onto a region that
-        // outlives the call — the running process's own young heap (a scanned region) when there is
-        // one, the runtime's `-eval` store on the table-less route
-        // ([`Self::rehome_container_result`]). It is deliberately **not** gated on `safe_to_rewind`,
-        // which answers a different question — may this call's heap words be *recycled* — and
-        // answers `false` for a reentrant call (a fun-applying BIF), because the nested run can push
-        // an argument that lives on this very heap into a seam that outlives the call.
+        // So a **process route** (`self.mailbox_table.is_some()`) moves an `Ok` container result
+        // unconditionally, onto that process's own young heap ([`Self::rehome_container_result`]).
+        // The move is what makes the result **collectable** — a scanned region the process's
+        // collector walks and relocates — and it is what licenses the pool **rewind** below, which
+        // is only sound once the words it frees have a copy that outlives the call.
         //
-        // A container holding a **reference** is the one exception ([`Self::graph_holds_reference`]):
-        // a reference is identified by its address, so a copy would no longer be the timer/monitor
-        // it names and `erlang:cancel_timer/1,2` would refuse it. Such a result stays on the pool
-        // and the call does not rewind — the same residual as a failed move, below.
+        // The **table-less** route (`RuntimeContext::new`: the `-eval` evaluator, `-s`/`-run` and
+        // the single-pass `run_*` entries) keeps the move gated on `safe_to_rewind`, because
+        // neither reason applies there: the route owns no process table, so no collector ever
+        // scans its results (`super::gc`'s doors require a `mailbox_table` and a `current_module`),
+        // and a call with `safe_to_rewind == false` never rewinds. An unconditional move on this
+        // route only **duplicates** the result into the runtime's `-eval` store — a region that is
+        // never reset — so a long run of escaping calls (the installed compiler reaches
+        // `file_server_2` through `gen_server` for every module it compiles) grows the store until
+        // the term-heap arena is exhausted, which surfaces as a `system_limit` unrelated to the
+        // workload's live set.
         //
-        // The **rewind** below is what stays gated, on all of:
+        // A container holding a **reference** is the one shape never moved, on either route
+        // ([`Self::graph_holds_reference`]): a reference is identified by its address, so a copy
+        // would no longer be the timer/monitor it names and `erlang:cancel_timer/1,2` would refuse
+        // it. Such a result stays on the pool and the call does not rewind — the same residual as a
+        // failed move, below.
+        //
+        // The **rewind** below is what is gated, on all of:
         //
         // * `safe_to_rewind` — no seam can have retained a heap word (see its definition above);
         // * an **`Ok`** result — a raise may carry a live reason term
         //   ([`beam_common::Raise::live_reason`], the `{badkey,K}`/`{case_clause,V}` shapes) that
         //   points into this heap, so the error path never rewinds;
-        // * a move that **succeeded** — a graph the copier refuses, a destination that cannot be
-        //   grown and a nursery that cannot be grown all leave the result exactly where it is.
+        // * a move that was **attempted** and **succeeded** — the table-less route does not even
+        //   attempt one for a non-rewindable call (`move_container`), and a graph the copier
+        //   refuses, a destination that cannot be grown and a nursery that cannot be grown all
+        //   leave the result exactly where it is.
         //
         // Only a container is moved: an immediate is neither boxed nor a cons and a literal lives in
         // the frozen literal area, so neither can reach a word on this heap, and skipping the copy
@@ -816,6 +831,7 @@ impl<'a> RuntimeContext<'a> {
         // `reset_to(mark)` frees exactly this call's words `[mark..used)` and leaves the ones a
         // previous caller still owns below `mark` untouched (see `mark` above). For a heap taken
         // clean (`mark == 0`) that is byte for byte the `reset()` it replaces.
+        let move_container = self.mailbox_table.is_some() || safe_to_rewind;
         let mut rewind = false;
         if let Ok(term) = result {
             if !Self::result_is_foreign_container(term) {
@@ -827,9 +843,13 @@ impl<'a> RuntimeContext<'a> {
                 // would be a different term, so the result stays where it is and the pool is
                 // not rewound.
                 rewind = false;
-            } else if let Some(copied) = self.rehome_container_result(term) {
-                result = Ok(copied);
-                rewind = safe_to_rewind;
+            } else if move_container {
+                // The copy first and, only once it succeeded, the rewind: a refused copy leaves
+                // both the result and the pool exactly as they were.
+                if let Some(copied) = self.rehome_container_result(term) {
+                    result = Ok(copied);
+                    rewind = safe_to_rewind;
+                }
             }
         }
         // The BIF (and any NIF a bridge ran) is done and every borrow released, so commit the
@@ -1004,9 +1024,8 @@ impl<'a> RuntimeContext<'a> {
     /// * nothing (`RuntimeContext::new` — the `-eval` evaluator, `-s`/`-run` and the single-pass
     ///   `run_*` entries) → the runtime's long-lived `-eval` store
     ///   ([`Self::move_result_into_runtime_store`], the table-less arm in
-    ///   [`super::pool`]). Without that arm nothing rewinds the pool on this route, so its
-    ///   frontier marched through every region for the run's whole life and each fresh page it
-    ///   crossed was first-touched — a per-call page-fault tax that grew with the call count.
+    ///   [`super::pool`]), a destination reached only for a call whose pool may be rewound: on that
+    ///   route the copy exists to license the rewind, and the store it lands in is never reset.
     fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
         if self.mailbox_table.is_some() {
             self.move_result_into_process_heap(term)

@@ -6220,21 +6220,33 @@ fn an_immediate_result_rewinds_the_pool_without_a_copy() {
     );
 }
 
-/// **An ESCAPING arm neither moves the result nor rewinds the pool.**
+/// **An ESCAPING arm moves the result onto the process's scanned heap and never rewinds the pool.**
 ///
 /// The seven-arm `safe_to_rewind` gate exists because six of the `DispatchHooks` arms let a term
-/// the BIF built on `ctx.heap()` escape into state that outlives the call. The case drives one of
-/// them — the process-dictionary arm — with a BIF that **does** allocate on the BIF heap:
-/// `erlang:get_keys/1` builds its key list there. The stored term (`7`) is a small integer, so
-/// the observable proof is the *result*: it stays on the pooled heap — its address is outside
-/// every region the process's collector scans — and the pool's `used()` is **not** reset.
+/// the BIF built on `ctx.heap()` escape into state that outlives the call, which a
+/// `reset_to(mark)` would recycle. The case drives one of them — the process-dictionary arm — with
+/// a BIF that **does** allocate on the BIF heap: `erlang:get_keys/1` builds its key list there.
 ///
-/// The witness is the result's **region**, not `root_is_unscanned`'s verdict: the key list is a
-/// cons of immediates and so, under the valve's forwarding fact, it is an *inert* foreign
-/// container that never declines a collection by itself. What must not happen is the copy-out —
-/// a moved result would sit in the process's young space instead.
+/// Two independent decisions meet at the call's tail, and the case pins both:
+///
+/// * the **move** happens on a **process route** whatever `safe_to_rewind` answers, because its
+///   destination is the process's own young heap — a region its collector **scans** and
+///   relocates — so the result the caller receives is the moved copy: the same value, at an
+///   address inside the process's young nursery, and therefore real garbage-collectable state
+///   rather than a heap object pointing into a region no collector walks. This is where the
+///   table-less route differs: there `safe_to_rewind == false` also skips the move (its store is
+///   never reset, so a copy would only accumulate);
+/// * the **rewind** stays gated on `safe_to_rewind`: the escaping arm forbids it, so the pooled
+///   heap's `used()` is still above this call's `mark` and the words the seam could have retained
+///   are not handed out again.
+///
+/// The derivation of the region witness: `[7]` is a cons of immediates, so under the valve's
+/// forwarding fact a *copy* changes nothing about collectability — the address is the witness, and
+/// it is what distinguishes a moved result (young space, scanned) from one left on the pool. The
+/// forced admission-point collection at the end is the positive half: the moved result is really
+/// relocated by the collector and still reads back `[7]`.
 #[test]
-fn an_escaping_arm_neither_moves_the_result_nor_rewinds_the_pool() {
+fn an_escaping_arm_moves_the_result_onto_the_scanned_heap_and_never_rewinds_the_pool() {
     let (mut rt, mut table, pid) = gc_root_set_rig();
     // The process dictionary holds one pair, so `get_keys/1` really builds a one-element list.
     table
@@ -6242,14 +6254,12 @@ fn an_escaping_arm_neither_moves_the_result_nor_rewinds_the_pool() {
         .expect("the process")
         .dict_mut()
         .put(make_small(7), make_small(11));
-
     let keys = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
         ctx.call_bif("erlang", "get_keys", 1, &[make_small(11)])
             .expect("get_keys(11)")
     };
-
-    // The result is the key list `[7]` — a cons cell built on the pooled BIF heap.
+    // The move does not change the VALUE: a copy of a cons reads back the same head and tail.
     assert!(
         beam_term::list::is_list(keys),
         "get_keys/1 builds a list on `ctx.heap()`"
@@ -6260,27 +6270,52 @@ fn an_escaping_arm_neither_moves_the_result_nor_rewinds_the_pool() {
         NIL,
         "the key list is exactly `[7]`"
     );
-
-    let process = table.get(pid).expect("the process");
-    // The witness is the result's REGION, not `root_is_unscanned`'s verdict: `[7]` is a cons of
-    // immediates, so under the valve's forwarding fact it is an *inert* foreign container and
-    // never declines a collection by itself. A copy-out would instead have put it in the
-    // process's young space.
-    assert!(
-        !process
-            .collector()
-            .young_contains(beam_term::list::ptr_val(keys) as *const Eterm),
-        "the `dict` arm is an escaping seam, so the result must NOT have been moved onto the \
-         process's scanned heap"
-    );
+    {
+        let process = table.get(pid).expect("the process");
+        assert!(
+            process
+                .collector()
+                .young_contains(beam_term::list::ptr_val(keys) as *const Eterm),
+            "a process route moves the result onto the process's young nursery whatever the \
+             escaping arm answers about the rewind"
+        );
+        assert!(
+            !super::gc::root_is_unscanned(process, keys),
+            "the moved result must live in a region the collector scans"
+        );
+    }
     assert!(
         rt.bif_heaps.first().expect("the pool owns a heap").used() > 0,
         "the pooled heap must NOT be rewound: the escaping arm forbids it"
     );
-    // The term the arm let escape is still valid (nothing was rewound).
+    // The positive half: the moved result is the collector's real state — a forced collection at
+    // the admission point relocates it (the counter moves) and it still reads back `[7]`.
+    let mut x = [keys, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert!(
+        after.collections > before.collections,
+        "the forced collection must RUN — the moved result is on the scanned heap, so the \
+         unscanned-root valve has nothing to decline; {after:?}"
+    );
     assert_eq!(
-        terms::cons_head(keys).expect("the cons cell is still readable"),
-        make_small(7)
+        terms::cons_head(x[0]).expect("the relocated cons cell"),
+        make_small(7),
+        "the relocated result still reads back `[7]`"
+    );
+    assert_eq!(
+        terms::cons_tail(x[0]).expect("the relocated cons cell"),
+        NIL
     );
 }
 
@@ -6365,8 +6400,15 @@ fn a_partially_used_pool_is_rewound_to_the_callers_mark() {
 /// The seven-arm `safe_to_rewind` gate exists because six of the `DispatchHooks` arms let a term
 /// the BIF built on `ctx.heap()` escape into state that outlives the call, which a
 /// `reset_to(mark)` would recycle just as a `reset()` would. The case drives the `dict` arm
-/// (`erlang:get_keys/1` builds its key list on the pool) over a pool that is **partially used**
-/// — a retained `{1,2}` below the mark — and asserts the offset stays **above** the mark.
+/// (`erlang:get_keys/1` builds its key list on the pool) over a pool that is **partially used** —
+/// a retained `{1,2}` below the mark — and asserts the offset stays **above** the mark.
+///
+/// The move is unaffected by the arm and by the dirty pool, as on the clean-pool twin
+/// ([`an_escaping_arm_moves_the_result_onto_the_scanned_heap_and_never_rewinds_the_pool`]): the
+/// key list the caller receives is the copy on the process's own **young nursery**, with its value
+/// unchanged, while the words below the mark stay another caller's. That is the whole content of
+/// the rule: a process route copies the container out of the pool and the escaping arm withholds
+/// only the rewind.
 #[test]
 fn an_escaping_arm_does_not_rewind_a_partially_used_pool() {
     let (mut rt, mut table, pid) = gc_root_set_rig();
@@ -6378,46 +6420,47 @@ fn an_escaping_arm_does_not_rewind_a_partially_used_pool() {
         .expect("the pooled BIF heap builds the retained tuple");
     let mark = rt.bif_heaps.first().expect("the pool owns a heap").used();
     assert_eq!(mark, 3, "a `{{1,2}}` tuple is a header word plus two element words");
-
     // The process dictionary holds one pair, so `get_keys/1` really builds a one-element list.
     table
         .get_mut(pid)
         .expect("the process")
         .dict_mut()
         .put(make_small(7), make_small(11));
-
     let keys = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
         ctx.call_bif("erlang", "get_keys", 1, &[make_small(11)])
             .expect("get_keys(11)")
     };
-
-    // The result is the key list `[7]` — a cons cell built on the pooled BIF heap.
+    // The result is the key list `[7]` — a cons cell built on the pooled BIF heap and then copied
+    // out, so its value reads back unchanged from the copy.
     assert!(
         beam_term::list::is_list(keys),
         "get_keys/1 builds a list on `ctx.heap()`"
     );
-    let process = table.get(pid).expect("the process");
-    // As above: the region is the witness, not the valve's verdict — `[7]` forwards no scanned
-    // word, so an inert foreign cons can never decline a collection on its own.
-    assert!(
-        !process
-            .collector()
-            .young_contains(beam_term::list::ptr_val(keys) as *const Eterm),
-        "the `dict` arm is an escaping seam, so the result must NOT have been moved onto the \
-         process's scanned heap"
-    );
-    assert!(
-        rt.bif_heaps.first().expect("the pool owns a heap").used() > mark,
-        "the escaping arm must NOT rewind — not even to the caller's mark"
-    );
-    // Both the escaped term and the retained words are still valid.
     assert_eq!(terms::cons_head(keys).expect("the cons cell"), make_small(7));
     assert_eq!(
         terms::cons_tail(keys).expect("a cons cell"),
         NIL,
         "the key list is exactly `[7]`"
     );
+    {
+        let process = table.get(pid).expect("the process");
+        assert!(
+            process
+                .collector()
+                .young_contains(beam_term::list::ptr_val(keys) as *const Eterm),
+            "the result must have been moved onto the process's scanned young nursery"
+        );
+        assert!(
+            !super::gc::root_is_unscanned(process, keys),
+            "the moved result must live in a region the collector scans"
+        );
+    }
+    assert!(
+        rt.bif_heaps.first().expect("the pool owns a heap").used() > mark,
+        "the escaping arm must NOT rewind — not even to the caller's mark"
+    );
+    // The retained words below the mark are still valid and still that caller's.
     assert_eq!(
         terms::tuple_arity(retained).expect("the retained tuple is still readable"),
         2
