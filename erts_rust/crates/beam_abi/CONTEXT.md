@@ -590,6 +590,13 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - **The `driver_binary_*_refc` trio refuses a NULL/foreign operand with `-1`** where the C would recover
   a bogus `Binary*` and crash (the count itself is oracle-exact).
 - **`enif_ioq_is_empty` does not exist in this OTP tree** (`enif_ioq_*`, `api.rs`, `ioq.rs`, `enif_inspect_iovec`, `enif_free_iovec`).
+- **Header names deliberately not declared** (audited against the three headers): `DO_READ`/`DO_WRITE`
+  (deprecated aliases of `ERL_DRV_READ`/`ERL_DRV_WRITE`), `ERL_DRV_ERROR_{GENERAL,ERRNO,BADARG}_INT_`
+  (the pointer-cast form is declared instead, `layout.rs:595`), `ERL_NAPI_SINT64_{MAX,MIN}__` (only
+  `ERTS_NAPI_TIME_ERROR = i64::MIN` is declared), and the C macro machinery `ERL_NIF_INIT*` /
+  `ERL_NAPI_ATTR_*` / `ERL_NAPI_EXPORT` / `ERL_NIF_API_FUNC_{DECL,MACRO}` (no Rust analogue). The
+  `enif_make_{tuple,list}1..9`, `enif_make_pid`, `enif_compare_pids` and `enif_select_{read,write,error}`
+  macros expand onto declared slots, so they need no extra symbol.
 - `driver_select`/`driver_set_timer`/`driver_cancel_timer`/`driver_read_timer`/`driver_async` forward to
   `DriverHost`, whose **defaults** report "unsupported" (`-1`/`None`): a host only records the request,
   so "the OS poller really woke the port" is a `beam_io`/`beam_rt` concern.
