@@ -541,10 +541,10 @@ a foreign container that forwards nothing scanned: also inert, so also collected
   limit, pinned rather than papered over).
 * **The slice budget's pricing** is its own suite, [`tests/slice_charging.rs`](tests/slice_charging.rs)
   (`the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice`), over the committed
-  `tests/fixtures/native_reds.{erl,beam}` fixture: the exact `reductions == 5N + 5` charge on the native
-  tier plus its saturation at `DEFAULT_REDUCTIONS_PER_SLICE`, the bounded-iterations-per-slice
+  `tests/fixtures/native_reds.{erl,beam}` fixture: the exact `reductions == 5N + 9` charge on the native
+  tier to the derived budget boundary (N = 798 charges 3 999 in one slice, N = 799 charges 4 004 and needs two) and its flat **4 006** ceiling above it (`budget` 4 000 + a measured 6-unit epilogue), the bounded-iterations-per-slice
   pre-emption of the allocating shape (`yields + 1 == slices`, `slices == ceil(reductions / budget)`),
-  and the residual tuple `(slices, yields, waits, collections, major) == (1, 0, 0, 0, 0)` with its
+  and the residual tuple `(slices, yields, waits, collections, major) == (2, 1, 0, 1, 1)` with its
   interpreter-tier control. It asserts the default tier (and fails loudly if `BEAM_RT_TIER` pins the
   interpreter), never a wall clock.
 * The park hand-off and its exempt-window short-circuit:
@@ -585,16 +585,22 @@ a foreign container that forwards nothing scanned: also inert, so also collected
   the interpreter's loop, so what a native block's budget drains is [`budget`]'s `spend`
   (`call_bif`/`call_bif_in_machine` after the dispatch, `resolve_external_call`/`resolve_local_call`
   before the forward) plus the two `ensure_heap` doors and any deopt.
-  **Measured**: the non-allocating BIF-and-call fixture prices exactly `reductions == 5N + 5` (5 units
-  per iteration + 5 for the entry/exit seams, at N = 10/100/400) and saturates at exactly
-  `DEFAULT_REDUCTIONS_PER_SLICE` above the budget — it was **0** before the pricing; the allocating
-  `heap_growth` shape pre-empts into `slices` 15/60, `yields` 14/59 and `collections` 20 014/80 059 at
-  N = 20 000/80 000, a bounded 1333.0..=1334.0 iterations per slice.
-  **Residual**: a **non-allocating BIF-and-call-only loop still ends no slice** on the native tier
-  (`slices=1 yields=0 waits=0 collections=0 major=0`, its `heap_size` still tracking N at ≈1.5k words
-  per iteration), so the boundary collection door stays unreachable for it; the interpreter-tier
-  control on the same fixture at N = 2 000 reads 10 slices / 9 yields / 9 collections / 1 major /
-  `heap_size` 233.
+  **Measured**: the non-allocating BIF-and-call fixture prices exactly `reductions == 5N + 9` (5 units
+  per iteration + a constant 9 for the entry/epilogue seams, at N = 0/10/100/400/700/798 — the N = 0
+  row is that constant alone) and above the budget it saturates at exactly **4 006** (`budget` 4 000 +
+  the epilogue's measured 6) — it was **0** before the pricing; the allocating
+  `heap_growth` shape charges `reductions == 5N + 5` and pre-empts into `slices` 3/13/26/101, `yields`
+  2/12/25/100 and `collections` 2 002/10 012/20 025/80 100 at N = 2 000/10 000/20 000/80 000 — a bounded
+  **800** iterations per 4 000-unit slice (`collections == N + yields`: one admission collection per
+  iteration plus one boundary collection per pre-emption).
+  **Residual**: a **non-allocating BIF-and-call-only loop still ends no slice of its own** on the native
+  tier — `spend` never refuses and is a silent no-op once the budget is gone, so the *single* `Yield`
+  those rows read is the run's **epilogue** seam (a same-shape fixture with no epilogue ends **zero**
+  slices: `slices=1 yields=0 reductions=4 000` at N = 8 000) and the boundary collection door stays
+  unreachable for the loop. Only the memory half of the old residual has closed: that one `Yield` does
+  collect, so `heap_size` sits on the collector's floor (233) instead of tracking N. The
+  interpreter-tier control on the same fixture at N = 2 000 reads 10 slices / 9 yields / 9 collections
+  / 1 major / `reductions` 36 018 / `heap_size` 233.
   A **refusing** charge cannot be taken at a call seam today: the native tier publishes
   `machine.current_code` at **block** granularity (`crates/beam_engine/src/jit/baseline/runtime.rs:993`)
   and its call paths consult the seam before storing any position of their own
