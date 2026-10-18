@@ -74,8 +74,13 @@ non_trapping(Dir, Name, Op) ->
     Self = self(),
     {_H, _M} = spawn_monitor(fun() ->
                                      P = open(Dir, Name),
-                                     true = port_command(P, <<Op>>),
+                                     %% Reported **before** the command: a non-`normal` reason
+                                     %% kills this owner from inside `port_command/2`, so a send
+                                     %% after it would race the kill (it is never reached on the
+                                     %% oracle and is reached on a runtime that defers the
+                                     %% signal). The row is about termination, not that race.
                                      Self ! {opened, P},
+                                     true = port_command(P, <<Op>>),
                                      timer:sleep(400),
                                      Self ! alive
                              end),
