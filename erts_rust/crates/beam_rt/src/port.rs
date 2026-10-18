@@ -4040,3 +4040,9 @@ mod driver_output_shape_tests;
 /// framing matrix does not grow this one.
 #[cfg(test)]
 mod packet_framing_tests;
+/// The driver→owner **completion** builder/render matrix: the `{inet_reply, …}` and
+/// `{inet_async, …}` terms the runtime owes a port's owner, and the drain-time owner/stream
+/// snapshot that keeps them deliverable across a close (see `src/port/completion_tests.rs`). A
+/// separate file so the matrix does not grow this one.
+#[cfg(test)]
+mod completion_tests;
