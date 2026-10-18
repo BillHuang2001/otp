@@ -368,6 +368,12 @@ The committed record `erts_rust/tools/bench/results/m16-ab-{old,new}-r{1,2,3}.js
 sides for `copy_bound` (old 3 111.0/3 229.4/2 445.3 ns `ets_copy`, 1 749.5/1 796.6/1 421.1 ns
 `etf_roundtrip`; new 5 714.3/5 056.5/4 777.8 and 2 683.9/2 451.0/2 174.9) — this cut's `etf_roundtrip`
 figures sit at or below the fast end of the *old* side's own spread.
+A **second, independent confirmation** on the merged tree (3 rounds, `taskset -c 7`, `/proc/loadavg`
+17–42, both binaries re-measured inside the same window) puts the two ratios at **`ets_copy` 1.55×** and
+**`etf_roundtrip` 1.10×** against the pre-regression binary (which itself reproduced its cited 3 552 /
+1 743 ns in that window), so the `etf_roundtrip` residual reads 1.10–1.15× depending on the window —
+inside this host's own ±10–20 % spread — while `ets_copy` stays at ≈1.5× for the sibling-crate reason
+below.
 
 ### Honest scope
 
@@ -376,9 +382,10 @@ figures sit at or below the fast end of the *old* side's own spread.
   per object — 28 visits per `etf_roundtrip` op — which cannot be dropped: a reference's identity is
   its address, so a container holding one must be *known* before it is moved, and the only alternative
   (copy, then check the copy) cannot be sound.
-- **The `ets_copy` remainder is NOT this node's.** After this cut `ets_copy` is still 1.511× the
+- **The `ets_copy` remainder is NOT this node's.** After this cut `ets_copy` is still ≈1.51–1.56× the
   pre-regression binary; that residual is `crates/beam_message`'s destination-pricing walk
-  (`src/destination_pricing.rs`, commit `f6fcc227d2`), a sibling crate — reported, not touched here.
+  (`src/copy.rs`'s `preflight_words`/`CopyPricing` over `beam_term::size::SizingPolicy`, commit
+  `f6fcc227d2`), a sibling crate — reported, not touched here.
 - **Nothing else was made dearer.** The counters are `#[cfg(test)]` only (no release-build cost), and the
   walk is a strict constant-factor improvement of one predicate: `send_recv_plain`, which never reaches
   it, is unchanged (0.975× / 0.989× — two independent estimates of the noise floor).
