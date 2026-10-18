@@ -211,10 +211,13 @@ impl PortRegistry {
     /// driver returns — including the typed accounting diagnostic a driver produces by
     /// reporting a byte count it did not consume (see [`Port::output`]).
     pub fn output(&mut self, poller: &mut Poller, id: PortId, data: &[u8]) -> Result<usize> {
-        match self.ports.get_mut(&id.number()) {
+        let result = match self.ports.get_mut(&id.number()) {
             Some(port) => port.output(poller, data),
             None => Err(error::badarg()),
-        }
+        };
+        // A driver that closed its port from inside `output` is torn down here, even when the
+        // callback itself also failed: the reason the driver reported is queued either way.
+        self.after_driver_call(poller, result)
     }
 
     /// Schedules the port tasks a batch of poller events implies, runs what it scheduled, and
@@ -457,10 +460,11 @@ impl PortRegistry {
             self.close(poller, id)?;
             return Ok(Vec::new());
         }
-        match self.ports.get_mut(&id.number()) {
+        let result = match self.ports.get_mut(&id.number()) {
             Some(port) => port.control(poller, op, arg),
             None => Err(error::badarg()),
-        }
+        };
+        self.after_driver_call(poller, result)
     }
 
     /// Drives port `id`'s asynchronous driver completions, returning how many were processed.
@@ -476,10 +480,11 @@ impl PortRegistry {
     /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the port's driver
     /// returns from [`Driver::drive_async`].
     pub fn drive_async(&mut self, poller: &mut Poller, id: PortId) -> Result<usize> {
-        match self.ports.get_mut(&id.number()) {
+        let result = match self.ports.get_mut(&id.number()) {
             Some(port) => port.drive_async(poller),
             None => Err(error::badarg()),
-        }
+        };
+        self.after_driver_call(poller, result)
     }
 
     /// Takes the reaped exit status of the OS child behind port `id`, once.
@@ -698,10 +703,11 @@ impl PortRegistry {
         id: PortId,
         reason: PortExitReason,
     ) -> Result<()> {
-        match self.ports.get_mut(&id.number()) {
+        let result = match self.ports.get_mut(&id.number()) {
             Some(port) => port.notify_exit(poller, reason),
             None => Err(error::badarg()),
-        }
+        };
+        self.after_driver_call(poller, result)
     }
 
     /// Runs the tasks scheduled on every port until `reds_budget` is exhausted.
@@ -861,6 +867,26 @@ impl PortRegistry {
         match first_error {
             Some(err) => Err(err),
             None => Ok(()),
+        }
+    }
+
+    /// Runs the failure sweep after a driver callback and returns that callback's own outcome.
+    ///
+    /// The four single-port entry points ([`PortRegistry::output`],
+    /// [`PortRegistry::port_control`], [`PortRegistry::drive_async`],
+    /// [`PortRegistry::notify_port_exit`]) drive one driver directly, so each is a place a driver
+    /// can close its own port. The sweep runs whatever the callback answered — a driver that
+    /// failed *and* returned an error still gets torn down — and the callback's own error is the
+    /// one reported, because that is the answer to the operation the caller asked for.
+    fn after_driver_call<T>(
+        &mut self,
+        poller: &mut Poller,
+        result: Result<T>,
+    ) -> Result<T> {
+        let reaped = self.reap_failures(poller);
+        match result {
+            Err(err) => Err(err),
+            Ok(value) => reaped.map(|()| value),
         }
     }
 

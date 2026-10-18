@@ -80,7 +80,7 @@ use std::time::{Duration, Instant};
 use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
 use beam_abi::common::SysIOVec;
-use beam_abi::driver::host::DriverHost;
+use beam_abi::driver::host::{DriverHost, PortFailure as AbiFailure};
 use beam_abi::driver::types::{
     ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT,
     ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
@@ -94,6 +94,7 @@ use crate::abi::job::AsyncJobs;
 use crate::abi::DriverTable;
 use crate::driver::DriverContext;
 use crate::poller::{Interest, Token};
+use crate::port_failure::DriverFailure;
 use crate::queue::ByteQueue;
 
 /// The word capacity of the term heap handed to a driver through
@@ -563,9 +564,70 @@ impl DriverHost for AbiHost {
     /// deliberate: the C's `driver_output` reaches the owner whatever made it, so the report is
     /// gated on the queue being non-empty and not on an `INPUT` task having run.
     fn output(&mut self, _port: ErlDrvPort, data: &[u8]) -> c_int {
-        match self.with_ctx(|ctx| ctx.input().push(data)) {
-            Some(()) => 0,
-            None => -1,
+        // The C's `driver_output(ix, buf, len)` *is* `driver_output2(ix, NULL, 0, buf, len)`
+        // (`io.c:6405-6415`): the bytes are the read's **body**, never its header, and the call is
+        // one read message of its own. Banked on `DriverContext::input` they would instead
+        // coalesce with everything else the callback pushed and close as a single message — which
+        // is why the pinned oracle shape for two `driver_output` calls in one callback is **two**
+        // `{Port, {data, _}}` messages, delivered from `deliver_read`.
+        match self.with_ctx(|ctx| ctx.deliver_read(&[], Some(data))) {
+            Some(Ok(())) => 0,
+            _ => -1,
+        }
+    }
+
+    /// `driver_output2`: deliver one read with its header apart from its body.
+    ///
+    /// The C's `driver_output2(ix, hbuf, hlen, buf, len)` (`io.c:6387-6438`) —
+    /// `driver_output_binary`/`driver_outputv` have the same shape — keeps the boundary: the
+    /// `hbuf`/`hlen` bytes are a list prefix and `buf`/`len` is the tail, which becomes a binary
+    /// in `[binary]` port mode. `body == None` is the C's `buf == NULL` (**no** tail at all, not an
+    /// empty one), which is why the split is carried through
+    /// [`ReadMessage`](crate::port_task::ReadMessage) rather than flattened here: with
+    /// `[binary]`, `driver_output2(p, "hdr", 3, "", 0)` is `[104,100,114|<<>>]` while
+    /// `driver_output2(p, "hdr", 3, NULL, 0)` is the proper list `"hdr"`.
+    fn output2(&mut self, _port: ErlDrvPort, header: &[u8], body: Option<&[u8]>) -> c_int {
+        match self.with_ctx(|ctx| ctx.deliver_read(header, body)) {
+            Some(Ok(())) => 0,
+            _ => -1,
+        }
+    }
+
+    /// `driver_failure*`: close the port with `reason`, clearing the driver queue.
+    ///
+    /// The whole family funnels through the C's `driver_failure_term`, which drops the port's
+    /// `ioq` (`prt->ioq.size = 0`, `io.c:7220`) before delivering the exit signal — so the bytes
+    /// the driver queued itself are gone, while whatever it already handed up with
+    /// `driver_output*` has been delivered and survives. The latch itself is the port's; the
+    /// registry reaps it after the callback returns (see
+    /// [`DriverContext::signal_failure`](crate::DriverContext::signal_failure)).
+    fn failure(&mut self, reason: AbiFailure<'_>) -> c_int {
+        let failure = match reason {
+            AbiFailure::Eof => DriverFailure::eof(),
+            AbiFailure::Atom(name) => DriverFailure::atom(name),
+            AbiFailure::Posix(errno) => DriverFailure::posix(errno),
+            AbiFailure::Error(code) => DriverFailure::error(code),
+        };
+        self.state.ioq.clear();
+        match self.with_ctx(|ctx| ctx.signal_failure(failure)) {
+            Some(Ok(())) => 0,
+            _ => -1,
+        }
+    }
+
+    /// `driver_exit`: terminate the connected process with `code`.
+    ///
+    /// Modelled as the port-closing request the C really performs, with
+    /// [`DriverFailure::exit`]'s `signals_owner == false`: `driver_exit` runs
+    /// `unlink_proc(prt, connected)` **before** it closes anything (`io.c:7244`), so the owner
+    /// receives no `'EXIT'` — a runtime that rendered one would invent a message the oracle never
+    /// sends. `code == 0` is the flush-less `normal` shape, anything else the errno's name.
+    fn port_exit(&mut self, code: c_int) -> c_int {
+        let failure = DriverFailure::exit(code);
+        self.state.ioq.clear();
+        match self.with_ctx(|ctx| ctx.signal_failure(failure)) {
+            Some(Ok(())) => 0,
+            _ => -1,
         }
     }
 
