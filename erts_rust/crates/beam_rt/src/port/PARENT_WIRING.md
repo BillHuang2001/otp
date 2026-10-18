@@ -416,61 +416,25 @@ if ops::inet_opts::is_setopts_control(op) {
 
 ---
 
-## 6. Companion test-helper changes required (OUT of this node's write scope — `.rs` test files)
+## 6. Companion test-helper changes required — only ONE remains
 
-The patch is **production-correct**; three test files were written with explicit calls that
-**emulate** the hooks this patch installs. Once the hooks are live, those stand-ins must be removed,
-otherwise they collide. This was proven empirically: applying only the core patch and running the
-suites yields **10 failures in `port::ops::active_input`** and **1 in
-`port::completion::accept_inherit`**; neutralizing the stand-ins (below) makes both green
-(**25/25**, **4/4**).
+The patch is **production-correct**. Three test files were written while the hooks did not exist and
+used explicit calls to emulate them, so applying the core patch alone collides with those stand-ins
+(measured on a throwaway copy: **10 failures in `port::ops::active_input`**, **1 in
+`port::completion::accept_inherit`**).
 
-The module docs themselves say so: `accept_inherit_tests.rs:199-201` calls `setopts` "the documented
-stand-in for the (not yet wired, `src/port.rs`-owned) `note_inet_setopts` hook", and
-`active_input_e2e_tests.rs:63-70` says "When the hook lands these explicit calls become redundant,
-not wrong."
+**Already resolved inside this node — nothing for the patch's author to do:**
+* `src/port/accept_inherit_tests.rs::setopts` and
+* `src/port/active_input_e2e_tests.rs::Session::setopts`
 
-### 6.1 `src/port/accept_inherit_tests.rs:202-207` — the `setopts` helper double-records
+both **detect** the `note_inet_setopts` hook instead of assuming its absence: each reads the port's
+recorded count across the control call (`PortRegistry::inet_options(id).records().len()`) and records
+the argument itself only when the reply succeeded and nothing was recorded. They are therefore no-ops
+the day H6 lands, and they cannot double-record. The three remaining explicit `note_inet_setopts`
+calls in `accept_inherit_tests.rs` (the refused/truncated/poisoned setup rows) are **intentional** and
+must stay: they synthesise a mirror state a real successful `setopts` cannot produce.
 
-```rust
-// CURRENT (double-records with H6 live)
-fn setopts(reg: &mut PortRegistry, id: PortId, arg: &[u8]) -> Vec<u8> {
-    let reply = control(reg, id, &setopts_op(), arg);
-    let ok = setopts_succeeded(&reply);
-    reg.note_inet_setopts(id, arg, ok);
-    reply
-}
-// REQUIRED after H6
-fn setopts(reg: &mut PortRegistry, id: PortId, arg: &[u8]) -> Vec<u8> {
-    control(reg, id, &setopts_op(), arg)
-}
-```
-(The other three explicit `note_inet_setopts` calls in this file — lines `637`, `656`, `705` — must
-**stay**: each drives a *refused* `setopts` through raw `control(...)`, so production records nothing
-for them, and they assert the `note_inet_setopts` API itself.)
-
-Symptom if not changed: `an_accepted_socket_inherits_the_listeners_option_block` panics at
-`accept_inherit_tests.rs:478` — `left: 10, right: 5` (each of the five listener records stored
-twice).
-
-### 6.2 `src/port/active_input_e2e_tests.rs:389-397` — the same `setopts` stand-in
-
-```rust
-// CURRENT
-fn setopts(&mut self, arg: &[u8]) -> Vec<u8> {
-    let reply = self.control(&setopts_op(), arg);
-    let ok = setopts_succeeded(&reply);
-    let port = self.port;
-    self.rt.ports.borrow_mut().note_inet_setopts(port, arg, ok);
-    reply
-}
-// REQUIRED after H6
-fn setopts(&mut self, arg: &[u8]) -> Vec<u8> {
-    self.control(&setopts_op(), arg)
-}
-```
-
-### 6.3 Reading delivered packets — the `drain_active_inputs()` assertions become `pending_events` reads
+### 6.3 The ONE remaining test change — the `drain_active_inputs()` assertions become `PortEvent::ActiveInput` reads
 
 The suites assumed the provider drained nothing, so they called `PortRegistry::drain_active_inputs()`
 **directly** after `write_command`/`pump`. With H4–H9 live, the staging sites consume the delivery

@@ -385,18 +385,42 @@ impl Session {
     }
 
     /// Applies a `setopts` record list through the numeric request and mirrors the reply into the
-    /// port's option table — the documented stand-in for the (not yet wired, `src/port.rs`-owned)
-    /// `note_inet_setopts` hook. Returns the driver's reply.
+    /// port's option table.
+    ///
+    /// The mirror is fed by production code once `src/port.rs::PortRegistry::port_control` calls
+    /// `note_inet_setopts` on the driver's own reply; until then it is fed here. The stand-in
+    /// detects the hook (the recorded count is read across the control call) so it becomes a no-op
+    /// the day the hook lands, instead of double-recording. Returns the driver's reply.
     fn setopts(&mut self, arg: &[u8]) -> Vec<u8> {
+        let port = self.port;
+        let before = self.recorded();
         let reply = self.control(&setopts_op(), arg);
         let ok = setopts_succeeded(&reply);
-        let port = self.port;
-        self.rt.ports.borrow_mut().note_inet_setopts(port, arg, ok);
+        if ok && self.recorded() == before {
+            self.rt.ports.borrow_mut().note_inet_setopts(port, arg, ok);
+        }
         reply
+    }
+
+    /// How many `setopts` records the port's mirror holds — the hook-detection witness
+    /// [`Session::setopts`] reads across the control call.
+    fn recorded(&self) -> usize {
+        let port = self.port;
+        self.rt
+            .ports
+            .borrow()
+            .inet_options(port)
+            .map_or(0, |options| options.records().len())
     }
 
     /// One pump round followed by a drain of the active-input channel — the two steps a consuming
     /// route performs, in the order `src/port.rs` performs them.
+    ///
+    /// While `src/port.rs` does not yet drain this channel, `pump` reports no event and the drain
+    /// below is what answers. The day a `PortEvent` arm exists for these packets, `pump` consumes
+    /// them into its own pending lane and this direct drain answers nothing — a **test-harness**
+    /// staleness, not a runtime defect (a passive socket's bytes legitimately ride the ordinary
+    /// `PortEvent::Data` lane, so an event here is not evidence either way).
     fn round(&mut self) -> Vec<ActiveInputPacket> {
         {
             let mut registry = self.rt.ports.borrow_mut();

@@ -431,12 +431,14 @@ the accept — with one case comparing against the live `erl` oracle's own
 `inet:getopts(A,[packet,packet_size,header,mode])`.
 
 **Two residuals, both typed, neither silent.**
-(a) `PortRegistry::note_inet_setopts` has **no call site yet** — the hook belongs in
-`src/port.rs::PortRegistry::port_control` (after the completion drain, on the driver's own reply), which
-is the parent node's file; until it lands the mirror is fed only by the two test suites, which call
-`note_inet_setopts` themselves with the same reply reading (`setopts_succeeded`). Adding the hook makes
-those explicit calls redundant, and `accept_inherit_tests`'s `records().len() == 5` assertion would
-surface a double-record immediately.
+(a) `PortRegistry::note_inet_setopts` has **no production call site yet** — the hook belongs in
+`src/port.rs::PortRegistry::port_control`, after the completion drain, gated on
+`inet_opts::is_setopts_control(op)` and `setopts_succeeded(reply)`; that file is the parent node's.
+Until it lands the mirror is fed only by the two test suites, whose `setopts` helpers **detect** the
+hook (the recorded count is read across the control call, and the argument is recorded only when the
+reply succeeded and nothing was recorded), so they become no-ops the day it lands rather than
+double-recording. The patch text, its rationale per hunk and its verification recipe are in
+[`PARENT_WIRING.md`](PARENT_WIRING.md).
 (b) There are **two** mode lookups — `PortMeta::data_mode` (in `active_input.rs`, body =
 `PortMeta::stream`) and `PortRegistry::data_mode(id, fallback)` (the mirror) — and a payload renderer
 must consult the second with the first as the fallback. One seam, two accessors: a caller that reads

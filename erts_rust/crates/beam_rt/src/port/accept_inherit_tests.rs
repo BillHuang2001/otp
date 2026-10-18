@@ -195,15 +195,31 @@ fn control(reg: &mut PortRegistry, id: PortId, op: &str, arg: &[u8]) -> Vec<u8> 
         .unwrap_or_else(|error| panic!("the {op} control op on {id:?}: {error}"))
 }
 
-/// Runs a `setopts` op and mirrors the reply into the port's option table — the documented
-/// stand-in for the (not yet wired, `src/port.rs`-owned) `note_inet_setopts` hook.
+/// Runs a `setopts` op and mirrors the reply into the port's option table.
+///
+/// The mirror is fed by production code once `src/port.rs::PortRegistry::port_control` calls
+/// [`PortRegistry::note_inet_setopts`] on the driver's own reply; until that hook exists it is fed
+/// here. The stand-in therefore **detects** the hook rather than assuming its absence: the port's
+/// recorded count is read across the control call, and the argument is recorded only when the reply
+/// succeeded and nothing was recorded — so this helper is a no-op the day the hook lands, instead of
+/// double-recording every option and breaking the inheritance assertions for a reason that is not a
+/// defect.
 ///
 /// Returns the driver's reply, so a caller can assert on `[1]`/`[0]einval`.
 fn setopts(reg: &mut PortRegistry, id: PortId, arg: &[u8]) -> Vec<u8> {
+    let before = recorded(reg, id);
     let reply = control(reg, id, &setopts_op(), arg);
     let ok = setopts_succeeded(&reply);
-    reg.note_inet_setopts(id, arg, ok);
+    if ok && recorded(reg, id) == before {
+        reg.note_inet_setopts(id, arg, ok);
+    }
     reply
+}
+
+/// How many `setopts` records the port's mirror holds — the hook-detection witness
+/// [`setopts`] reads across the control call.
+fn recorded(reg: &PortRegistry, id: PortId) -> usize {
+    reg.inet_options(id).map_or(0, |options| options.records().len())
 }
 
 /// The driver's reply to a `getopts` request for `code`, as raw bytes.
