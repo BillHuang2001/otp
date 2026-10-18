@@ -203,9 +203,10 @@ fn compile_fixture() -> Option<PathBuf> {
     compile_so(MODULE, FIXTURE_C)
 }
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -247,7 +248,7 @@ fn invalid_event_code() -> Eterm {
 #[test]
 fn existing_atom_hit_miss_and_len_through_a_real_c_nif() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let (mut host, lib) = loaded(&path, None, false);
     let mut env = NifEnv::new(&mut host);
@@ -297,7 +298,7 @@ fn existing_atom_hit_miss_and_len_through_a_real_c_nif() {
 #[test]
 fn select_reproduces_the_cs_invalid_event_and_failure_codes() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // A host that cannot service select (the trait default) => every valid request is -1.
     let (mut host, lib) = loaded(&path, None, false);
@@ -346,7 +347,7 @@ fn select_reproduces_the_cs_invalid_event_and_failure_codes() {
 #[test]
 fn priv_data_is_the_library_pointer_and_the_host_is_the_no_call_fallback() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // The fixture's `load` callback stored `&priv_marker`, so inside a call `enif_priv_data` answers
     // that pointer — `env->mod_nif->priv_data` — whatever the host hook says.
@@ -395,7 +396,7 @@ fn priv_data_is_the_library_pointer_and_the_host_is_the_no_call_fallback() {
 #[test]
 fn alloc_env_reaches_the_current_host_through_a_real_c_nif() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // A host with NO `alloc_env` support: `enif_alloc_env()` is NULL inside the call too.
     let mut host = EnvHost::new(None, false);

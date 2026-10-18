@@ -129,9 +129,10 @@ fn compile_fixture() -> Option<PathBuf> {
     compile_so(MODULE, FIXTURE_C)
 }
 
-/// The `.so` path as a `&str`, or `None` (after a loud skip) when it is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -301,7 +302,7 @@ impl NifHost for DeferredHost {
 #[test]
 fn the_fixed_order_points_round_trip_through_a_real_c_nif() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     // Intern the probe atoms *before* the env borrows the host, so `enif_compare` can resolve their
@@ -347,7 +348,7 @@ fn the_fixed_order_points_round_trip_through_a_real_c_nif() {
 #[test]
 fn the_same_fixture_agrees_under_the_erl_oracle() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // This runtime's answers, rendered exactly as the oracle's `~w` renders them.
     let mut host = TestHost::new();
@@ -390,7 +391,7 @@ fn the_same_fixture_agrees_under_the_erl_oracle() {
 #[test]
 fn atoms_interned_inside_the_nif_are_ordered_by_name() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // The deferred host cannot resolve *any* atom name (`atom_name` always misses, nothing is ever
     // committed), so the pair can be ordered by name only through the env's per-call atom record.
@@ -436,7 +437,7 @@ fn atoms_interned_inside_the_nif_are_ordered_by_name() {
 #[test]
 fn a_nested_atom_pair_orders_by_name() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     // Intern `beta` FIRST: the two atoms then have an index order opposite to their name order, so a

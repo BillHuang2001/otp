@@ -170,6 +170,12 @@ fn so_path(so: &std::path::Path) -> Option<String> {
     }
 }
 
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &std::path::Path) -> Option<String> {
+    so_path(&so.with_extension(""))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------------------------
@@ -222,7 +228,7 @@ fn call_reports_unknown_functions_and_raised_exceptions() {
     let Some(so) = compile_so("loader_echo", ECHO_ONLY) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let lib = load(&path, "t", &mut host, Eterm::nil()).expect("the fixture NIF library must load");
@@ -277,7 +283,7 @@ fn rejects_a_library_that_needs_a_newer_runtime() {
     ) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let err = load(&path, "t", &mut host, Eterm::nil()).expect_err("must be rejected");
@@ -305,7 +311,7 @@ fn rejects_an_old_library_version() {
     ) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let err = load(&path, "t", &mut host, Eterm::nil()).expect_err("must be rejected");
@@ -333,7 +339,7 @@ fn rejects_a_mismatched_vm_variant() {
     ) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let err = load(&path, "t", &mut host, Eterm::nil()).expect_err("must be rejected");
@@ -361,7 +367,7 @@ fn rejects_a_mismatched_module_name() {
     ) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let err = load(&path, "t", &mut host, Eterm::nil()).expect_err("must be rejected");
@@ -377,7 +383,7 @@ fn rejects_a_library_without_an_init_function() {
     let Some(so) = compile_so("loader_noinit", NO_INIT) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let err = load(&path, "t", &mut host, Eterm::nil()).expect_err("must be rejected");
@@ -412,7 +418,7 @@ fn reports_a_vetoing_load_callback() {
     ) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let err = load(&path, "t", &mut host, Eterm::nil()).expect_err("must be rejected");
@@ -452,6 +458,18 @@ fn reports_a_failed_dlopen() {
         "the loader's message names the path: {}",
         err.text()
     );
+    // The shared-object suffix is appended **unconditionally** (`erts_sys_ddll_open` copies
+    // `FILE_EXT` after the given name, `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so a
+    // path that already ends in `.so` resolves `<path>.so.so` and the message names that doubled
+    // suffix. Measured on the oracle (OTP 29.1.1):
+    // `erlang:load_nif("/nonexistent/foo.so", [])` reports
+    // `'/nonexistent/foo.so.so: cannot open …'`.
+    assert!(
+        err.text()
+            .contains(&format!("{}.so", missing.display())),
+        "the message names the appended suffix (`<path>.so`): {}",
+        err.text()
+    );
 }
 
 #[test]
@@ -472,7 +490,7 @@ fn malformed_entries_are_rejected_without_panicking() {
     ) else {
         return;
     };
-    let Some(path) = so_path(&null_funcs) else {
+    let Some(path) = load_path(&null_funcs) else {
         return;
     };
     let mut host = TestHost::new();
@@ -500,7 +518,7 @@ fn malformed_entries_are_rejected_without_panicking() {
     ) else {
         return;
     };
-    let Some(path) = so_path(&null_name) else {
+    let Some(path) = load_path(&null_name) else {
         return;
     };
     let err = load(&path, "t", &mut host, Eterm::nil()).expect_err("a NULL name must be rejected");
@@ -527,7 +545,7 @@ fn malformed_entries_are_rejected_without_panicking() {
     ) else {
         return;
     };
-    let Some(path) = so_path(&ok) else { return };
+    let Some(path) = load_path(&ok) else { return };
     let lib = load(&path, "t", &mut host, Eterm::nil()).expect("a well-formed table must load");
     assert_eq!(lib.funcs(), &[("one".to_string(), 1)]);
 }

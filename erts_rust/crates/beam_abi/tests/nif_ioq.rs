@@ -88,9 +88,10 @@ fn compile_fixture() -> Option<PathBuf> {
     compile_so(MODULE, FIXTURE_C)
 }
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -168,7 +169,7 @@ fn binaries_of_list(t: Eterm) -> Vec<Vec<u8>> {
 #[test]
 fn a_fresh_queue_is_empty_through_every_accessor() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -189,7 +190,7 @@ fn a_fresh_queue_is_empty_through_every_accessor() {
 #[test]
 fn a_null_queue_handle_yields_the_cs_failure_codes_instead_of_faulting() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -213,7 +214,7 @@ fn a_null_queue_handle_yields_the_cs_failure_codes_instead_of_faulting() {
 #[test]
 fn enq_binary_queues_the_bytes_after_the_skip_and_reports_them() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -245,7 +246,7 @@ fn enq_binary_queues_the_bytes_after_the_skip_and_reports_them() {
 #[test]
 fn enqv_queues_the_vectors_bytes_after_the_skip() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -278,7 +279,7 @@ fn enqv_queues_the_vectors_bytes_after_the_skip() {
 #[test]
 fn the_peek_view_has_one_vector_per_enqueued_buffer_and_a_head_binary() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -304,7 +305,7 @@ fn the_peek_view_has_one_vector_per_enqueued_buffer_and_a_head_binary() {
 #[test]
 fn deq_drops_from_the_head_in_fifo_order_including_a_partial_buffer() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -347,7 +348,7 @@ fn deq_drops_from_the_head_in_fifo_order_including_a_partial_buffer() {
 #[test]
 fn inspect_iovec_cuts_the_list_after_max_elements_and_reports_the_tail() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -376,7 +377,7 @@ fn inspect_iovec_cuts_the_list_after_max_elements_and_reports_the_tail() {
 #[test]
 fn inspect_iovec_with_a_null_env_owns_its_storage_and_free_iovec_releases_it() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -393,7 +394,7 @@ fn inspect_iovec_with_a_null_env_owns_its_storage_and_free_iovec_releases_it() {
 #[test]
 fn inspect_iovec_uses_a_caller_provided_preallocated_struct() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 

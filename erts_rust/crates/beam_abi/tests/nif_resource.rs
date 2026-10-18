@@ -199,9 +199,10 @@ fn tuple_ints(t: Eterm) -> Vec<i64> {
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -245,7 +246,7 @@ fn resource_family_end_to_end() {
     std::hint::black_box(enif_api_table());
 
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = ResourceHost::new();
     // The host outlives the library (drop order), which is what the library's `unload` callback and
