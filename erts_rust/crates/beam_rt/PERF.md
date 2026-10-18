@@ -425,6 +425,49 @@ The differential cases `gc/process_info_gc_key_set_is_stable`, `gc/process_info_
 **Residual, owned by other nodes.** The engine reservoir is itself an append-only accumulator that is never cleared, so a build-a-binary loop still retains every payload it ever built — a **memory ceiling**, not a per-call cost, and bounding it needs a `beam_engine` liveness/reset seam.
 And `beam_process::sweep_off_heap_binaries` still walks its whole slot space even when `dead_binaries` is empty — harmless while that space stays empty, but it is the same defect any other registrant of that space would hit.
 
+### The copy-out's learned size hint — `copy_bound/ets_copy` (`BEFORE` `56683d2982` → `AFTER` `ead363d2a5`)
+
+**Sides.** `AFTER` is `beam_rt` built from the committed tree at `ead363d2a5`; `BEFORE` is the **pristine pre-fix tree** at `56683d2982`, so this A/B isolates the copy-out's growth policy and nothing else. Both sides are driven by the **same `bench` binary** (the harness crate is unchanged across the window). The system side (`sys`) is `erl` on `PATH` — **OTP 29.1.1 / erts-17.1**.
+Host: Linux `x86_64`, `nproc` = **14**, shared — 1-min `/proc/loadavg` **2.06 → 1.12** during the paired rounds (an earlier pre-fix baseline at load 18–31 published the same shape: `ets_copy` 4 064 / 4 076 / 4 769 ns/op, median 4 076).
+
+**The one mechanism the A/B isolates.** A registered BIF's container result is re-homed onto the process's own scanned young heap (`src/context/calls.rs::move_result_into_process_heap` → `copy_result_fresh`). The default nursery is 233 words (`beam_gc::DEFAULT_MIN_HEAP_WORDS`) and `Nursery::collapse` re-installs a *demand*-sized space after every collection, so the space is small again on the next op. `BEFORE` learned the payload's size only from a **refusal**: `try_copy_fast` ran out of words, and the copier's preflight then walked the payload five times (three of them hashing — `size_object_bounded_with`'s SipHash path set, `is_acyclic`'s two sets) purely to produce a word count the exhaustion error already carried, before growing and retrying. `AFTER` **learns that count and spends it**: `RuntimeContext::copy_out_hint` is `max(hint, copy_shortfall_words(err))`, and `hint_grow_gate` grows the nursery through the no-relocation `Process::grow_nursery` seam **before** the attempt when `available() < hint + max(hint/4, 32)`, so the successful first attempt is the common path and the sizing walk never runs. `hint == 0` reproduces `BEFORE` exactly, and the whole refusal fallback stays behind it (fresh per-attempt destination table, permanent-non-exhaustion short-circuit, `safe_to_rewind`, and the `max_heap_words` ceiling refusing a headroom request → bare-shortfall fallback).
+
+**Cadence, on the compiled `ets_copy` shape** (250 000 ops, `taskset -c 3`, 3 alternating paired rounds, same binary with the hint disabled vs enabled):
+
+| counter | `BEFORE` | `AFTER` |
+|---|---:|---:|
+| refusals | 83 067 (**0.332 /op**) | 754 (**0.003 /op**) |
+| copy attempts | 1.016 /op | 1.016 /op |
+| hint-driven grows | 0 | 83 387 |
+| collections /op | 0.33–0.34 (`ensure_heap_full` 83 289, reds door 160) | 0.33–0.34 (`ensure_heap_full` 84 158, reds door 162) |
+| mean `available()` at the copy-out | 277 words | 190 words |
+
+Each avoided refusal is worth ≈**4.2 µs**, which is the whole regression.
+
+**Paired `bench` A/B** — `bench run --quick --runtime rust --workloads copy_bound,gc_bound,slice`, **3 rounds, alternating sides per round**, medians:
+
+| case | `BEFORE` (ns) | `AFTER` (ns) | B/A |
+|---|---:|---:|---:|
+| `copy_bound/ets_copy` | 3 586.5 | **2 171.4** | **0.605×** |
+| `copy_bound/etf_roundtrip` | 1 419.5 | 1 405.2 | 0.990× |
+| `copy_bound/send_recv` | 8 149.7 | 7 875.5 | 0.966× |
+| `copy_bound/send_recv_plain` | 1 886.3 | 1 872.9 | 0.993× |
+| `gc_bound/churn` | 65 497.8 | 66 275.0 | 1.012× |
+
+`ets_copy` is **−39.5 %** and now sits at **0.67×** of the m15-era figure (3 229 ns/op) it had regressed *from* — i.e. below the pre-regression floor rather than merely back on it. Every sibling case is inside its own noise band.
+
+**Memory is unchanged.** `case_ets_copy_peak_rss_bytes` 118.72 MB → 118.57 MB (0.999×), `churn` 118.54 → 118.40 MB, `etf_roundtrip` 120.21 → 119.87 MB. The growth is a pre-copy `Nursery::grow`, which retires the space it replaces; a collection still collapses the chain, so no space is retained for longer than it was before.
+
+**One shape's cadence did move** (wall time unmoved): `gc_bound/churn`'s loop copies out a 257-word `list_to_tuple/1` result, so its growth now happens *before* the copy; one growth = one retired space = one unit of collection debt, so its schedule shifts from 13 971 collections / 2 997 majors to **15 346 / 2 514** at `N` = 2 000 (7.6728 collections per iteration, one major per iteration plus a fixed 514) against a wall change of 1.012×. The `MEASURED` table in `src/runner/tests/boundary_cost.rs` and `src/runner/CONTEXT.md` are re-derived from it; the door's own invariants (`checks == yields`, `unpublished == 0`, the `checks/9 … checks/7` ration, one young space, `capacity ≤ 610`) all still hold, so this is a table move, not a door regression.
+
+**Correctness of the measured side.** `--lib` **1 520 passed / 0 failed / 3 ignored**; `--lib -- runner` 47 / 0; `--lib -- copy_out` 3 / 0 (including the collecting-default-process case and its no-hint control, which refuses again); `--lib -- context::calls` 14 / 0 (1 ignored); `--test max_heap_enforce` 6 / 0, `--test max_heap_flag` 12 / 0, `--test process_info_items` 2 / 0, `--test engine_off_heap_transport` 4 / 0, `--test port_wake` 1 / 0. `build --release -p beam_rt -p bench --all-targets` is **warning-free**.
+
+**Residual / owned by other nodes.**
+The hint is **per `RuntimeContext`**, so the first copy of each context still learns by refusing: **754 refusals per 250 000 ops ≈ 13 ns/op (0.4 %)**. Removing it needs a `Runtime`-owned pid→hint map with cleanup on process death (this crate, next pass).
+The `beam_term::size` hashing walk is now **off this shape's critical path** (it was the #1 `perf` symbol at ~8 % while refusals ran at 0.332/op) — what remains of it is that 0.4 %.
+The registry's own copy is untouched: every `ets:lookup` result is still copied twice (`beam_bifs::ets::copy_out` onto the pooled BIF heap, then `copy_result_fresh` onto the process heap; `shallow_unshared::<TrialTarget>` was 5.7–8.1 % of the run) — that is a `beam_bifs`/pool-rewind contract change, not expressible here.
+A deeper `beam_gc` fix (feed the collapse the post-copy live demand so a no-relocation growth survives a collection) would make the growth permanent instead of per-space, and `+hmax` still does not bound the growth-retired nursery chain.
+
 ### Caveats that invalidate a comparison (`CURRENT`)
 
 - **Absolute latencies are load-polluted**, and this pass ran in a **light window** (≈ 0.8–14 versus
