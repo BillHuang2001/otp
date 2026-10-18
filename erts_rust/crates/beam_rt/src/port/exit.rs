@@ -103,6 +103,17 @@ use crate::error;
 use crate::Runtime;
 
 use super::{PortEvent, PortRegistry};
+/// The **driver-failure channel**'s runtime half — the port-exit family's *other* closer.
+///
+/// A port leaves this runtime through exactly two closers: [`PortRegistry::close`] (the Erlang
+/// side's `port_close/1`, whose signals [`capture_port_exit`] snapshots) and a driver closing its
+/// own port from inside a callback (the C's `driver_failure*` family and `driver_exit`, whose
+/// signals [`failure::PortRegistry::drain_failures`] publishes). Both owe the same two messages
+/// with the same policy, both carry the [`PortSignalReason`] vocabulary defined below, and both
+/// publish through [`PendingPortSignals`], so the second closer is declared here as this family's
+/// other half rather than beside the port's independent submodules.
+#[path = "failure.rs"]
+pub(crate) mod failure;
 
 /// Which of the two messages a closing port owes one recipient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

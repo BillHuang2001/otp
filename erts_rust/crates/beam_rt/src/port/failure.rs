@@ -86,8 +86,9 @@
 use beam_io::{DriverFailure, FailureReason, InetReason, PortFailure};
 use beam_process::PortId;
 
-use super::exit::PortSignalReason;
-use super::PortRegistry;
+use super::PortSignalReason;
+use crate::port::completion::ClosedPortSnapshot;
+use crate::port::PortRegistry;
 
 /// The [`PortSignalReason`] a driver-declared failure becomes.
 ///
@@ -111,6 +112,10 @@ impl PortRegistry {
     /// Takes every port a driver closed through its own callback and finishes the teardown the
     /// runtime owes it, publishing the `'EXIT'`/`'DOWN'` messages it owes.
     ///
+    /// Answers the [`ClosedPortSnapshot`] of each such port so the completion sweep that follows
+    /// ([`PortRegistry::drain_io_completions`], the one entry point both channels share) can
+    /// still attribute an operation the teardown answered through `async_error_am_all`.
+    ///
     /// Drained at **every** site a driver callback can run, exactly as the completion channel is
     /// (see [`super::completion`]): `beam_io`'s own sweep has already closed the port and minted
     /// its report before any of them returns, so a drain is always safe and never sees a live
@@ -119,15 +124,21 @@ impl PortRegistry {
     /// Infallible: a failure owes at most two messages, and building the signals cannot fail.
     /// Everything that *can* fail about a closing port (a completion's rendering, a recipient's
     /// own delivery) is reported at that later step, never swallowed here.
-    pub(super) fn drain_failures(&mut self) {
+    pub(in crate::port) fn drain_failures(&mut self) -> Vec<ClosedPortSnapshot> {
+        let mut snapshots = Vec::new();
         for PortFailure { port, failure } in self.registry.take_failures() {
-            self.fail_port(port, failure);
+            snapshots.extend(self.fail_port(port, failure));
         }
+        snapshots
     }
 
     /// Closes the runtime's side of a port a driver already closed: the exact bookkeeping of
     /// [`PortRegistry::close`](super::PortRegistry), minus the two steps `beam_io` has done.
-    fn fail_port(&mut self, id: PortId, failure: DriverFailure) {
+    fn fail_port(
+        &mut self,
+        id: PortId,
+        failure: DriverFailure,
+    ) -> Option<ClosedPortSnapshot> {
         // A completion staged around the teardown still needs its recipient, and the metadata is
         // about to be removed (see [`super::completion::ClosedPortSnapshot`]).
         let snapshot = self.closed_snapshot(id);
@@ -148,8 +159,7 @@ impl PortRegistry {
         self.pending_events
             .retain(|event| event.port() != Some(id));
         self.push_port_signals(signals);
-        let completions = self.drain_io_completions(snapshot);
-        self.pending_events.extend(completions);
+        snapshot
     }
 }
 
