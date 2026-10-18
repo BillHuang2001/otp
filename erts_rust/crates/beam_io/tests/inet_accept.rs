@@ -771,6 +771,95 @@ fn an_accept_deadline_completes_exactly_once_through_the_registry() {
     ports.close(&mut poller, listener).expect("closes the listener");
 }
 // ---------------------------------------------------------------------------
+// The mixed accept queue: the C reports the **head**, and this driver does not
+// ---------------------------------------------------------------------------
+/// **The C's mixed-queue deadline reports the head of the accept list** — `{error, timeout}` for
+/// the *first* queued accept when the port's timer expires, even though that one was queued with
+/// `INET_INFINITY` and only the second carries a 50 ms deadline.
+///
+/// Measured on the oracle (this host), accept #0 at `INET_INFINITY` then accept #1 at 50 ms:
+/// `mixed_a1=[1,0,0] mixed_a2=[1,0,1] mixed_done={0,{error,timeout}}` — exactly one report, for the
+/// **head**, and nothing else. The C's multi-timer is per **port**, not per operation:
+/// `inet_multi_timeout` re-arms from the earliest pending deadline (`inet_drv.c:12600`) and
+/// `tcp_inet_multi_timeout` then removes the head of the caller's accept list (`remove_multi_op`,
+/// `:12606`).
+///
+/// **Ignored: a driver-side divergence, not a suite bug.** `AsyncQueue::async_timeout`
+/// (`src/drivers/inet/async.rs:654`) gates its completion loop on the **head** op being due, so a
+/// queue whose head carries no deadline (or a later one) completes *nothing*: the tail's 50 ms
+/// deadline expires unreported, where the oracle reports `{error, timeout}` for the head. Closing
+/// that gap is a `src/` change (out of this suite's scope), so the case is pinned here — un-ignore
+/// it once the driver completes the head, and it must stay green.
+#[test]
+#[ignore = "driver-side divergence: an accept list whose head has no deadline never completes \
+            (src/drivers/inet/async.rs:654 gates on the head being due); the oracle reports \
+            {error,timeout} for the head"]
+fn a_mixed_accept_queue_times_out_the_head_like_the_oracle() {
+    match erl_stdout(MIXED_DEADLINE_EXPRESSION) {
+        Some(stdout) => {
+            eprintln!("oracle mixed-accept row: {}", stdout.trim());
+            assert_eq!(
+                oracle_field(&stdout, "mixed_done="),
+                Some("{0,{error,timeout}}"),
+                "the oracle reports the head of the accept list, not the due tail: {stdout:?}"
+            );
+        }
+        None => return, // the oracle is unavailable; the check skipped loudly above
+    }
+
+    let mut poller = poller();
+    let mut ports = PortRegistry::new();
+    let listener = open_tcp(&mut ports, &mut poller);
+    listen_on_loopback(&mut poller, &mut ports, listener);
+    assert_eq!(
+        control(
+            &mut ports,
+            &mut poller,
+            listener,
+            INET_REQ_ACCEPT,
+            &accept_operand(INET_INFINITY)
+        ),
+        vec![1, 0, 0],
+        "the head accept answers id 0 with no deadline"
+    );
+    assert_eq!(
+        control(
+            &mut ports,
+            &mut poller,
+            listener,
+            INET_REQ_ACCEPT,
+            &accept_operand(50)
+        ),
+        vec![1, 0, 1],
+        "the second accept answers id 1 with a 50 ms deadline"
+    );
+
+    let done = only_completion(
+        await_completions(&mut poller, &mut ports, &[listener], "the mixed queue reports the head"),
+        "the mixed queue reports the head",
+    );
+    assert_eq!(
+        done.event,
+        CompletionEvent::InetAsync {
+            id: 0,
+            result: InetAsyncResult::Error(InetReason::Timeout),
+        },
+        "the head of the accept list times out, as the oracle's multi-timer does"
+    );
+    assert_no_completion_within(
+        &mut poller,
+        &mut ports,
+        POLL_SLICE * 5,
+        "the surviving accept is not reported again",
+    );
+    assert_eq!(
+        status_of(&mut ports, &mut poller, listener),
+        ONE_ACCEPT_STATUS,
+        "the survivor keeps the listener armed (one accept still queued)"
+    );
+    ports.close(&mut poller, listener).expect("closes the listener");
+}
+// ---------------------------------------------------------------------------
 // Two queued accepts: ids in enqueue order, and the descriptor-state bits
 // ---------------------------------------------------------------------------
 /// **Two queued accepts answer their own ids in enqueue order and report the C's state bits**, and
@@ -1248,6 +1337,20 @@ const TIMEOUT_EXPRESSION: &str = "M = 16#03f1a300, \
  {Id, Reason} = case DRAIN() of {I0, {error, R0}} -> {I0, R0}; Other -> Other end, \
  S = fun(Ls) -> lists:flatten(lists:join(\",\", [integer_to_list(B) || B <- Ls])) end, \
  io:format(\"timeout_reply=~s timeout_id=~p timeout_reason=~p~n\", [S(REPLY), Id, Reason])";
+/// The mixed accept-queue row: accept #0 with `INET_INFINITY`, accept #1 with 50 ms, one listener.
+/// Measured (this host): `mixed_a1=[1,0,0] mixed_a2=[1,0,1] mixed_done={0,{error,timeout}}` — the
+/// **head** times out and nothing else is reported (see
+/// [`a_mixed_accept_queue_times_out_the_head_like_the_oracle`]).
+const MIXED_DEADLINE_EXPRESSION: &str = "M = 16#03f1a300, \
+ P = open_port({spawn_driver, \"tcp_inet\"}, [binary]), \
+ F = fun(C, A) -> binary_to_list(iolist_to_binary(erlang:port_control(P, C + M, A))) end, \
+ _ = F(1, <<1,1,0>>), \
+ _ = F(6, <<4,0,0>>), \
+ _ = F(27, <<0,5>>), \
+ A1 = F(26, <<-1:32>>), \
+ A2 = F(26, <<50:32>>), \
+ DRAIN = fun Dr() -> receive {inet_async, _, I, R} -> {I, R}; _ -> Dr() after 2000 -> none end end, \
+ io:format(\"mixed_a1=~p mixed_a2=~p mixed_done=~p~n\", [A1, A2, DRAIN()])";
 /// The contract-level `gen_tcp:accept/2` shapes the rows above translate into, measured on the
 /// system runtime: an expired accept, an accept on a **closed** listener, and an accept on a
 /// **connected** (non-listening) socket.

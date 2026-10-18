@@ -83,8 +83,8 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
 bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **228
-passing / 0 failing**; the whole `-p beam_io` run is **983** (752 lib + 228 integration + 5
-doctests, 2 doctests `ignore`d). Per file:
+passing / 0 failing** (plus 1 `#[ignore]`d case, see below); the whole `-p beam_io` run is **983
+passed / 3 ignored** (752 lib + 228 integration + 3 doctests passed; 2 doctests `ignore`d). Per file:
 
 | Suite | Tests | Suite | Tests |
 |---|---|---|---|
@@ -194,7 +194,12 @@ rot.
   keeps accepting with distinct fds, the 50 ms deadline completing `{error, timeout}` exactly once,
   two queued accepts with ids in order and the `9`/`41`/`297` `GETSTATUS` bits, the
   `[0]einval`/`[0]exbadport` refusals plus the pending accept drained `{error, closed}` once, and
-  the frozen two-variant `PortNotification`/`CompletionEvent` channels
+  the frozen two-variant `PortNotification`/`CompletionEvent` channels. One `#[ignore]`d case
+  records a **driver-side divergence**: with accept #0 at `INET_INFINITY` and accept #1 at 50 ms
+  queued, the oracle reports `{0,{error,timeout}}` (the C's multi-timer removes the *head* of the
+  caller's accept list, `inet_drv.c:12606`) while `AsyncQueue::async_timeout` gates on the head
+  being due and so completes nothing (`src/drivers/inet/async.rs:654`) — un-ignore the case once
+  the driver completes the head
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
 - `udp_inet.rs`, `ram_file.rs` → the other two built-ins through the real port layer
