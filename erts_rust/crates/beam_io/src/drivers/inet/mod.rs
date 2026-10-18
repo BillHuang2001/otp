@@ -157,7 +157,8 @@
 //! connection) is not there yet — so they are request/reply exchanges: the reply is an **id**
 //! (`[1] ++ <<Id:16/big>>`) and the outcome arrives later through the crate's
 //! [`completion`](crate::completion) channel as `{inet_async, Port, Id, Result}`. That queue is
-//! implemented for **both** numeric requests ([`self::op_queue`]):
+//! implemented for **both** numeric requests ([`self::op_queue`], with the accept list itself in
+//! [`self::accept`]):
 //!
 //! * `TCP_REQ_RECV`(42) takes the C's `Timeout(4), Length(4)` operand and occupies the
 //!   **single** receive slot (`INET_MAX_ASYNC = 1`, `:1069`), so a second concurrent receive is
@@ -169,7 +170,7 @@
 //!   list (`enq_multi_op`, `:12194`/`:12209`), so N pending accepts each get their own id, all
 //!   complete in enqueue order, and `INET_REQ_GETSTATUS` reports the C's `INET_F_ACC` bit while an
 //!   accept is queued plus the **sticky** `INET_F_MULTI_CLIENT` bit from the second enqueue until
-//!   the list fully drains.
+//!   the list fully drains ([`self::accept`]).
 //!
 //! The id counter is the C's `NEW_ASYNC_ID` (`op_ref++ & 0xffff`, `:1549`): it starts at `0` and
 //! is taken *before* the capacity check, so a refused enqueue still advances it. A completion is
@@ -256,6 +257,10 @@ use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
 
+// The TCP accept state machine (`INET_REQ_ACCEPT`'s multi-operation list, its per-port timer
+// entries, the sticky `INET_F_MULTI_CLIENT` bit and the listener's readiness arming), split out of
+// the shared async-op queue it plugs into. Its own module doc is `src/drivers/inet/accept.rs`.
+mod accept;
 mod adopt_probe;
 mod frame;
 mod opcode;
@@ -314,9 +319,10 @@ use self::packet::PacketType;
 // decoded here into the same verbs the named ones reach.
 use self::opcode::{decode as decode_opcode, Opcode};
 
-// The asynchronous-operation queue of this descriptor — the C's `enq_async` slot plus its
-// `enq_multi_op` accept list, the `NEW_ASYNC_ID` counter and the completion production points
-// (`ready_input`/`timeout`/`drive_async`). Its own module doc is `src/drivers/inet/async.rs`.
+// The asynchronous-operation queue of this descriptor — the C's `enq_async` slot (with the
+// `enq_multi_op` accept list its sibling `accept` module owns), the `NEW_ASYNC_ID` counter and the
+// completion production points (`ready_input`/`timeout`/`drive_async`). Its own module doc is
+// `src/drivers/inet/async.rs`.
 use self::op_queue::{drain_closed, AsyncQueue};
 // The raw `libc` socket wrappers (`socket`/`accept`/`bind`/`listen`/`getsockopt`/`shutdown`/
 // `close`) live in the private `sys` submodule, so every `unsafe` block of the driver sits in
@@ -545,8 +551,8 @@ pub struct TcpInetDriver {
     /// (`open`/`accept`/[`TcpInetDriver::from_socket`]) clears it.
     prebound: bool,
     /// The descriptor's **asynchronous-operation queue** — the C's single `enq_async` receive slot
-    /// plus its `enq_multi_op` accept list, and the `NEW_ASYNC_ID` counter behind both
-    /// ([`AsyncQueue`], `src/drivers/inet/async.rs`).
+    /// plus its `enq_multi_op` accept list (the latter in `src/drivers/inet/accept.rs`), and the
+    /// `NEW_ASYNC_ID` counter behind both ([`AsyncQueue`], `src/drivers/inet/async.rs`).
     ///
     /// A queued operation is answered by its control op with `[1] ++ <<Id:16/big>>` and completed
     /// later through the driver→owner completion channel
