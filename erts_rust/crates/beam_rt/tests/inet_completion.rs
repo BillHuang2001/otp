@@ -53,13 +53,18 @@
 //!
 //! # The peer is never Erlang
 //!
-//! `gen_tcp:connect/2,3,4` is blocked inside this runtime (`erlang:read_timer/1` has no host
-//! hook) and `gen_tcp:accept/1,2` reaches `prim_inet:accept_opts/3`, whose `getopts` list
-//! (`delay_send`, `priority`, `linger`, `tos`, `recvtos`, `recvttl`) this runtime's `inet` driver
-//! does not resolve. Both fixtures therefore work at the `prim_inet` level — `async_accept/2`,
-//! `recv/3` and an explicit `erlang:port_command/2` with `prim_inet:send/3`'s own caller-tag
-//! prefix — and every *peer* is a std [`UdpSocket`]/[`TcpStream`] owned by the test, so no Erlang
-//! node is needed to drive this runtime's blocking path.
+//! `gen_tcp:accept/1,2` reaches `prim_inet:accept_opts/3`, whose `getopts` list (`delay_send`,
+//! `priority`, `linger`, `tos`, `recvtos`, `recvttl`) this runtime's `inet` driver does not
+//! resolve. Both fixtures therefore work at the `prim_inet` level — `async_accept/2`, `recv/3` and
+//! an explicit `erlang:port_command/2` with `prim_inet:send/3`'s own caller-tag prefix — and every
+//! *peer* is a std [`UdpSocket`]/[`TcpStream`] owned by the test, so no Erlang node is needed to
+//! drive this runtime's blocking path.
+//!
+//! `gen_tcp:connect/2,3,4` is **not** blocked any more: `erlang:read_timer/1`, the hook its
+//! `prim_inet` polling loop needs, is implemented (`src/context/runtime_hooks.rs`), and a connect
+//! to a closed port named by IP tuple answers the oracle's own `{error,econnrefused}` (measured on
+//! both runtimes). The tests still drive their peers with std sockets, because the *string*-host
+//! form resolves through `inet_gethost`, which answers `{error,nxdomain}` here.
 //!
 //! # Bounds and skips
 //!
@@ -123,10 +128,12 @@ go() ->
     io:format("tcp_port=~p~n", [ListenPort]),
     {id, ListenId} = erlang:port_info(L, id),
     io:format("listen_id=~p~n", [ListenId]),
+    io:format("listen_port=~p~n", [L]),
     {ok, AcceptRef} = prim_inet:async_accept(L, -1),
     Sock = receive {inet_async, L, AcceptRef, {ok, S}} -> S end,
     {id, SockId} = erlang:port_info(Sock, id),
     io:format("sock_id=~p~n", [SockId]),
+    io:format("sock_port=~p~n", [Sock]),
     R = prim_inet:recv(Sock, 0, 5000),
     io:format("sock_recv=~p~n", [R]),
     Mref = erlang:monitor(port, Sock),
@@ -521,6 +528,19 @@ fn number_after(line: &str, prefix: &str) -> Option<i64> {
     line.strip_prefix(prefix)?.trim().parse().ok()
 }
 
+/// The `~p` image a `<prefix>#Port<0.N>` line carries (`listen_port=#Port<0.0>` ⇒ `#Port<0.0>`).
+///
+/// This runtime renders a port as the internal-port immediate it is, so the printed form is the
+/// port table's own number — the second, independent observable `port_info(Port, id)` is compared
+/// against (`port_info`'s `id` is the same slot number: `src/port.rs`).
+fn port_term_text(line: &str) -> String {
+    line.strip_prefix("listen_port=")
+        .or_else(|| line.strip_prefix("sock_port="))
+        .unwrap_or_else(|| panic!("the fixture printed {line:?}, not `<prefix>#Port<0.N>`"))
+        .trim()
+        .to_string()
+}
+
 /// The oracle's `~p` image of `{ok, {{127,0,0,1}, PeerPort, <<"hi">>}}` — the answer a completed
 /// `gen_udp:recv/3` prints once the datagram the test sent has been received.
 ///
@@ -751,8 +771,20 @@ fn an_accepted_descriptor_is_adopted_and_its_command_is_replied() {
     let listen_id = number_after(&listen_id_line, "listen_id=")
         .unwrap_or_else(|| panic!("the fixture printed {listen_id_line:?}, not `listen_id=<id>`"));
 
-    // The accept only completes once a peer connects, so the test connects — a std socket, because
-    // `gen_tcp:connect/3` needs `erlang:read_timer/1` inside this runtime.
+    // The same port as a term: the printer's `#Port<0.N>` carries the port-table number `id` names.
+    let listen_port_line = run.expect_line(
+        |line| line.starts_with("listen_port="),
+        LINE_TIMEOUT,
+        "the fixture never printed `listen_port=…` (its own `io:format(\"~p\", [Listen])` did not \
+         answer)",
+    );
+    let listen_term = port_term_text(&listen_port_line);
+
+    // The accept only completes once a peer connects, so the test connects — a std socket: this
+    // runtime's `gen_tcp:connect/3` resolves a *string* host through `inet_gethost`, which answers
+    // `{error,nxdomain}` here, while the IP-tuple form answers the oracle's own
+    // `{error,econnrefused}` (so the connect path is no longer blocked by a missing
+    // `erlang:read_timer/1` hook — it is implemented).
     let mut peer = TcpStream::connect(("127.0.0.1", listen_port as u16)).unwrap_or_else(|error| {
         panic!(
             "the test cannot connect to the fixture's listening port {listen_port}: {error}\n{}",
@@ -770,12 +802,34 @@ fn an_accepted_descriptor_is_adopted_and_its_command_is_replied() {
     );
     let sock_id = number_after(&sock_id_line, "sock_id=")
         .unwrap_or_else(|| panic!("the fixture printed {sock_id_line:?}, not `sock_id=<id>`"));
-    // `port_info(Port, id)` of a live port is a small positive integer; the load-bearing assertion
-    // is that the two ids differ.
-    assert!(
-        listen_id > 0 && sock_id > 0,
-        "the two port ids must be positive (`port_info(Port, id)`), got listen_id={listen_id} \
-         sock_id={sock_id}"
+    let sock_port_line = run.expect_line(
+        |line| line.starts_with("sock_port="),
+        LINE_TIMEOUT,
+        "the fixture never printed `sock_port=…` (its own `io:format(\"~p\", [Sock])` did not \
+         answer)",
+    );
+    let sock_term = port_term_text(&sock_port_line);
+
+    // `erlang:port_info(Port, id)` is the port's own **port-table number** — a bare small integer
+    // (`src/port.rs`'s `id` pair; the oracle's `internal_port_index`, `erl_bif_info.c:3681-3698`),
+    // never the port term — but the number space belongs to each runtime: this one allocates from
+    // 0 and reuses a released slot LIFO (`beam_process::PortTable::alloc`), so a run's first port
+    // can legitimately answer `0` (measured: `#Port<0.0>` ⇒ `{id,0}`), where the oracle's first
+    // listen port answers a table index of its own (`{id,24}`). A numeric floor here would only
+    // encode where some *other*, short-lived port happened to land, so the two independent
+    // observables are cross-checked instead: the id must be the number the port term itself
+    // carries, and the adopted descriptor must be a **different** port (the load-bearing claim).
+    assert_eq!(
+        listen_term,
+        format!("#Port<0.{listen_id}>"),
+        "`port_info(Listen, id)` must name the listening port's own port-table number\n{}",
+        run.report()
+    );
+    assert_eq!(
+        sock_term,
+        format!("#Port<0.{sock_id}>"),
+        "`port_info(Sock, id)` must name the accepted port's own port-table number\n{}",
+        run.report()
     );
     assert_ne!(
         sock_id,

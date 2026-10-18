@@ -862,7 +862,7 @@ impl RuntimeContext<'_> {
     // -- erlang:system_info/1 -------------------------------------------------
 
     /// `erlang:system_info(Key)`: materialize the runtime introspection key (contract
-    /// A.8) on the runtime's scratch info heap.
+    /// A.8) and **relocate it off the scratch heap** before handing it to Erlang code.
     ///
     /// The key is read as an atom from the shared atom table; the value comes from
     /// [`Runtime::system_info`](crate::Runtime::system_info), the single source of
@@ -874,17 +874,23 @@ impl RuntimeContext<'_> {
     /// `{allocator, A}` and `{wordsize, internal|external}`, are routed to
     /// [`crate::info::tuple_key_value`] (the `beam_alloc` adoption; anything outside those
     /// two is the oracle's `badarg`).
-    /// The report is materialized on the same info heap `Runtime::system_info` uses, so
-    /// the returned term has the identical lifetime contract as an atom-key answer.
+    /// Both arms materialize on `Runtime::info_heap`, the **scratch** region the next
+    /// `system_info`/`format_term` call resets, so the value is relocated here
+    /// ([`RuntimeContext::relocate_off_scratch`]) onto a region that outlives the call: the
+    /// running process's scanned young heap, or the runtime's never-reset store. Without that
+    /// step a retained result — `A = erlang:system_info(otp_release),
+    /// erlang:system_info(machine), io:format("~p~n", [A])`, which is the shape
+    /// `epp:predef_macros/2` has — reads recycled words: a **wrong value**, or the
+    /// term-integrity abort `beam_term::ops::class` raises on a recycled header word.
     fn system_info_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let key_term = *args.first().ok_or(BeamError::BadArg)?;
-        if terms::tuple_arity(key_term).is_ok() {
-            return self.system_info_tuple(key_term);
-        }
-        let key = self
-            .atom_name(key_term)
-            .ok_or(BeamError::BadArg)?;
-        self.runtime.system_info(&key)
+        let term = if terms::tuple_arity(key_term).is_ok() {
+            self.system_info_tuple(key_term)?
+        } else {
+            let key = self.atom_name(key_term).ok_or(BeamError::BadArg)?;
+            self.runtime.system_info(&key)?
+        };
+        Ok(self.relocate_off_scratch(term))
     }
 
     /// The `{allocator, A}` / `{wordsize, W}` form of `erlang:system_info/1`.
@@ -906,15 +912,16 @@ impl RuntimeContext<'_> {
             .atom_name(terms::tuple_element(key_term, 1)?)
             .ok_or(BeamError::BadArg)?;
         let value = crate::info::tuple_key_value(&tag, &argument)?;
-        // Materialize on the runtime's own info heap — the same snippet
+        // Materialize on the runtime's own scratch info heap — the same snippet
         // `Runtime::system_info` uses (the tuple path cannot call it, which takes a
-        // `&str` key).
+        // `&str` key). The reset goes through the scratch gate so a term the scratch
+        // region still owns can never be recycled.
+        self.runtime.reset_info_scratch();
         let crate::Runtime {
             info_heap,
             code_server,
             ..
-        } = self.runtime;
-        info_heap.reset();
+        } = &mut *self.runtime;
         value.to_eterm(info_heap, code_server.atoms())
     }
 
@@ -991,9 +998,11 @@ impl RuntimeContext<'_> {
 
     /// A term rendered by the registered `io:format` printer, using `format`'s control.
     ///
-    /// The scratch heap is reset first, so the text — not any term — is the result.
+    /// The scratch heap is rewound first (through the scratch gate,
+    /// [`Runtime::reset_info_scratch`](crate::Runtime::reset_info_scratch)), so the text — not
+    /// any term — is the result.
     fn render(&mut self, term: Eterm, control: &[u8]) -> Result<String> {
-        self.runtime.info_heap.reset();
+        self.runtime.reset_info_scratch();
         let runtime = &mut self.runtime;
         format::term_to_string_with(
             &runtime.registry,
@@ -1828,22 +1837,35 @@ mod tests {
             is_small(remaining),
             "cancel_timer/1 answers the remaining milliseconds for a pending timer"
         );
-        // An unclaimed key of the same family still resolves as the typed capability gap
-        // (exit 3), not the bare `undef` the `erlang`-namespace fallback raises for an
-        // unknown name. `read_timer/1` is a key of `beam_bifs`' `RUNTIME_HOOKS_BIFS`
-        // roster, so the `RuntimeHooksBridge` — installed for the whole roster — answers
-        // it, naming the key in its typed gap rather than the defaulted seam's bare `bif`.
-        let error = call(
+        // `read_timer/1,2` is a key of the same `beam_bifs` `RUNTIME_HOOKS_BIFS` roster and
+        // the `RuntimeHooksBridge` — installed for the whole roster — serves it: reading a
+        // live timer answers the remaining milliseconds **without** cancelling it.
+        let reference = call(
             &mut runtime,
             "erlang",
-            "read_timer",
-            &[make_small(0)],
+            "send_after",
+            &[make_small(60_000), me, msg, NIL],
         )
-        .expect_err("read_timer/1 has no host hook installed");
+        .expect("erlang:send_after/4 for the read");
+        let read = call(&mut runtime, "erlang", "read_timer", &[reference])
+            .expect("erlang:read_timer/1 reads a live timer");
+        assert!(
+            is_small(read),
+            "read_timer/1 answers the remaining milliseconds for a pending timer"
+        );
+        assert!(
+            !error::is_known_unimplemented_bif(&runtime.registry, "read_timer", 1),
+            "erlang:read_timer/1 must not be classified as a curated gap"
+        );
+        // A **non-reference** argument is the oracle's `badarg` — the C's `is_not_ref` arm —
+        // never the typed capability gap (exit 3) and never the bare `undef` the
+        // `erlang`-namespace fallback raises for a name no one claims.
+        let error = call(&mut runtime, "erlang", "read_timer", &[make_small(0)])
+            .expect_err("a small integer is not a reference");
         assert_eq!(
-            error::unsupported_reason(&error).as_deref(),
-            Some("erlang:read_timer/1"),
-            "read_timer/1 is the bridge's typed capability gap: {error}"
+            error::unsupported_reason(&error),
+            None,
+            "a badarg is not an `unsupported` capability gap: {error}"
         );
     }
 
@@ -1883,5 +1905,74 @@ mod tests {
             "the empty string is a valid (if useless) command"
         );
     }
-
+    // -- erlang:system_info/1: the scratch-term lifetime ----------------------
+    //
+    // `Runtime::info_heap` is the **reset-per-call scratch** region, and
+    // `erlang:system_info/1` is the one value materialized there and handed to Erlang code.
+    // A retained result must therefore be **relocated** off it by the BIF route
+    // (`RuntimeContext::relocate_off_scratch`) before the next `system_info`/`format_term`
+    // call resets the region. The two cases below are the shapes that were **wrong** (the
+    // first aborted the process on a recycled header word, the second printed a silently
+    // wrong value) and both are stated in terms of the values themselves, so neither depends
+    // on the release string this tree happens to carry.
+    /// The retained `otp_release` string must still read as a **digit string** after another
+    /// `system_info` call has taken the scratch region.
+    ///
+    /// Before the relocation this read `otp_release` and then `allocated_areas` (a list of
+    /// 2-tuples), which recycled the retained list's cells; reading it back walked a cons cell
+    /// whose `car` was a tuple pointer and the process aborted on the recycled header word
+    /// (`beam_term::ops::class: invalid boxed header subtag`).
+    #[test]
+    fn a_retained_system_info_string_survives_a_later_scratch_reset() {
+        let mut runtime = runtime();
+        let otp_release = atom(&mut runtime, "otp_release");
+        let retained =
+            call(&mut runtime, "erlang", "system_info", &[otp_release]).expect("otp_release");
+        let before = string_of(retained);
+        assert!(
+            !before.is_empty() && before.bytes().all(|byte| byte.is_ascii_digit()),
+            "the release string is the digits of the OTP version, got {before:?}"
+        );
+        // The shape `epp:predef_macros/2` has: a second key read while the first is retained.
+        let allocated_areas = atom(&mut runtime, "allocated_areas");
+        let areas =
+            call(&mut runtime, "erlang", "system_info", &[allocated_areas]).expect("areas");
+        assert!(
+            beam_term::is_list(areas),
+            "the value that overwrites the scratch region must be a container, otherwise this \
+             case proves nothing"
+        );
+        assert_eq!(
+            string_of(retained),
+            before,
+            "a retained system_info value must be relocated off the reset-per-call scratch \
+             region, not left in it"
+        );
+    }
+    /// A retained `version` string must survive a `system_info` sequence that also reads an
+    /// **immediate** key — the shape that printed a *stale-but-well-formed* wrong value (the
+    /// atom the third call answered, where the version string was expected).
+    #[test]
+    fn a_retained_system_info_string_is_not_overwritten_by_a_later_key() {
+        let mut runtime = runtime();
+        let keys = ["version", "allocated_areas", "machine"];
+        let version = atom(&mut runtime, keys[0]);
+        let retained = call(&mut runtime, "erlang", "system_info", &[version]).expect("version");
+        let before = string_of(retained);
+        assert!(
+            before.contains('.'),
+            "`version` is the erts version string, got {before:?}"
+        );
+        for key in &keys[1..] {
+            let key = atom(&mut runtime, key);
+            call(&mut runtime, "erlang", "system_info", &[key])
+                .unwrap_or_else(|error| panic!("system_info({key:?}) failed: {error}"));
+        }
+        assert_eq!(
+            string_of(retained),
+            before,
+            "a retained system_info value must not be overwritten by a later key's \
+             materialization"
+        );
+    }
 }

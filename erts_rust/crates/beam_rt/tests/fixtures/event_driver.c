@@ -56,11 +56,13 @@
  *      operand — which is delivered to the port's **owner**.
  *   3  the same term, delivered with `erl_drv_send_term` to `driver_connected`'s pid — the
  *      **explicit** destination.
+ *   4  `output` answers through `driver_output2` — a **header** list prefix plus a data tail — so
+ *      the owner sees the C's split (`[h…|<<tail>>]`) rather than one flat byte string.
  *
  * The name a mode declares must equal the stem it is compiled under: the runtime derives the
  * driver name from the loaded path's stem (`beam_rt::port::driver_lookup`), and the loader rejects
  * an entry whose `driver_name` differs (`bad_driver_name`). Mode 0's stem is therefore `event`,
- * mode 1's `eventv`, mode 2's `eventt` and mode 3's `eventp`.
+ * mode 1's `eventv`, mode 2's `eventt`, mode 3's `eventp` and mode 4's `eventsplit`.
  */
 #ifndef EVENT_DRIVER_MODE
 #define EVENT_DRIVER_MODE 0
@@ -73,6 +75,8 @@
 #define EVENT_DRIVER_NAME "eventt"
 #elif EVENT_DRIVER_MODE == 3
 #define EVENT_DRIVER_NAME "eventp"
+#elif EVENT_DRIVER_MODE == 4
+#define EVENT_DRIVER_NAME "eventsplit"
 #else
 #define EVENT_DRIVER_NAME "event"
 #endif
@@ -257,10 +261,36 @@ static void event_output_term(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
 }
 #endif
 
+/* ---------------------------------------------------------------------------------------------
+ * Mode 4: the split reply (`driver_output2`)
+ * ---------------------------------------------------------------------------------------------
+ *
+ * `port_command` reaches `event_output_split`, which answers the C's `driver_output2(port, hbuf,
+ * hlen, buf, len)` (`io.c:6387`) — and the same shape as `driver_output_binary`/`driver_outputv` —
+ * so the owner must see the **header/body boundary**, not a flattened byte string: on a `[binary]`
+ * port the reply is the improper list `[72,68,82|<<…>>]` (`"HDR"` as the list prefix, the echoed
+ * `port_command` payload as the binary tail). A host that joins the two halves would deliver
+ * `<<72,68,82,…>>`, a different term.
+ *
+ * The header is deliberately non-empty and the tail is the command's own bytes, so the test can
+ * name both halves and their order.
+ */
+#if EVENT_DRIVER_MODE == 4
+static void event_output_split(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    event_state *st = (event_state *) drv_data;
+    if (st == NULL || buf == NULL || len == 0)
+        return;
+    st->reads++;
+    (void) driver_output2(st->port, "HDR", 3, buf, len);
+}
+#endif
 /* The entry's `output`/`outputv` pair per mode (mode 0 keeps the committed event/timer callbacks). */
 #if EVENT_DRIVER_MODE == 1
 #define EVENT_OUTPUT NULL
 #define EVENT_OUTPUTV event_outputv
+#elif EVENT_DRIVER_MODE == 4
+#define EVENT_OUTPUT event_output_split
+#define EVENT_OUTPUTV NULL
 #elif EVENT_DRIVER_MODE == 2 || EVENT_DRIVER_MODE == 3
 #define EVENT_OUTPUT event_output_term
 #define EVENT_OUTPUTV NULL

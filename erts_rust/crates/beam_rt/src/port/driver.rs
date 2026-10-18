@@ -49,7 +49,12 @@
 //! `driver_alloc`, its `output` callback echoes through `driver_output`, and the bytes land in
 //! [`DriverPort::outputs`]. [`DriverPortAdapter`] then routes those bytes end to end: a
 //! `{spawn_driver, Name}` port queued from Erlang reaches the driver's `output` callback through
-//! `port_command`, and the echo comes back to the owner as `{Port, {data, Data}}`. The driver's
+//! `port_command`, and the echo comes back to the owner as `{Port, {data, Data}}`. A driver that
+//! answers through one of the **split** entry points (`driver_output2`/`driver_output_binary`/
+//! `driver_outputv`) keeps the C's header/body boundary all the way into that term: the host records
+//! both halves ([`DriverHost::output2`]) and the adapter hands them up to
+//! [`beam_io::DriverContext::deliver_read`] as **one** read, so `[h…|<<tail>>]` reaches Erlang as
+//! the improper list the oracle produces rather than a flattened binary. The driver's
 //! `driver_*` imports are left **undefined** by the linker and
 //! bind at `dlopen(RTLD_NOW)` out of the loading process's **dynamic symbol table**
 //! (`build.rs`'s `-Wl,--export-dynamic`, anchored by
@@ -79,7 +84,7 @@
 //! (the `DriverHost` seam is frozen and the opaque `ErlDrvPort` is the *only* thing a callback
 //! receives), so the two share one [`DriverControl`]: a callback records what it asked for and the
 //! adapter applies it as soon as the callback returns — exactly the pattern
-//! [`DriverPort::take_outputs`] already uses for `driver_output` bytes. A host that no port
+//! [`DriverPort::take_outputs`] already uses for `driver_output*` bytes. A host that no port
 //! lifecycle has claimed (a bare [`Driver`] driven by a test) therefore answers the C's failure
 //! code rather than recording a request nobody would ever apply.
 //!
@@ -593,8 +598,17 @@ pub struct DriverPort {
     interner: DriverAtoms,
     /// The process the port belongs to — what `driver_connected` / `driver_caller` report.
     owner: ProcessId,
-    /// Every `driver_output` / `erl_drv_output` payload, in call order.
-    outputs: Vec<Vec<u8>>,
+    /// Every `driver_output*` / `erl_drv_output*` payload, in call order, **header apart from body**.
+    ///
+    /// The pair is the C's own split: `.0` is `driver_output2`'s `hbuf`/`hlen` list prefix and `.1`
+    /// is its `buf`/`len` tail, where `None` means the C's `buf == NULL` — no tail at all, rather
+    /// than an empty one (`io.c:3363-3442`). A plain `driver_output` (`io.c:6387`'s sibling
+    /// `driver_output(buf, len)`) is the header-less shape `(Vec::new(), Some(data))`.
+    ///
+    /// The split is load-bearing: `[h…|<<tail>>]` is a different term from the flattened
+    /// `<<h…tail>>`, so [`DriverPortAdapter::collect_outputs`] hands it to
+    /// [`beam_io::DriverContext::deliver_read`] unchanged.
+    outputs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     /// Every decoded term handed to `send_term` (`erl_drv_output_term` / `erl_drv_send_term`),
     /// with the destination (`None` = the port owner).
     ///
@@ -811,8 +825,11 @@ impl DriverPort {
         self.owner
     }
 
-    /// Every captured `driver_output` payload, in call order.
-    pub fn outputs(&self) -> &[Vec<u8>] {
+    /// Every captured `driver_output*` payload, in call order, as `(header, body)`.
+    ///
+    /// `body == None` is the C's `buf == NULL` (the header-only, **proper**-list reply); a plain
+    /// `driver_output` records an empty header with `Some(data)`.
+    pub fn outputs(&self) -> &[(Vec<u8>, Option<Vec<u8>>)] {
         &self.outputs
     }
 
@@ -821,12 +838,13 @@ impl DriverPort {
         &self.sent
     }
 
-    /// Takes every captured `driver_output` / `erl_drv_output` payload out, in call order.
+    /// Takes every captured `driver_output*` / `erl_drv_output*` payload out, in call order.
     ///
     /// The port lifecycle drains them after each driver interaction
-    /// ([`DriverPortAdapter::output`]) and queues them as the port's input; the
-    /// [`DriverPort::outputs`] accessor is the accumulate-only view the unit tests read.
-    pub fn take_outputs(&mut self) -> Vec<Vec<u8>> {
+    /// ([`DriverPortAdapter::output`]) and hands them up as the port's reads with the C's
+    /// header/body split intact; the [`DriverPort::outputs`] accessor is the accumulate-only view
+    /// the unit tests read.
+    pub fn take_outputs(&mut self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         std::mem::take(&mut self.outputs)
     }
 
@@ -1325,8 +1343,32 @@ impl DriverHost for DriverPort {
 
     /// Captures the port's output bytes (`driver_output` / `erl_drv_output`). Always succeeds: the
     /// bytes are the driver's own and a capture cannot fail.
+    ///
+    /// The C's `driver_output(buf, len)` has **no** header: this is the header-less shape
+    /// `(header = [], body = Some(data))`, which the owner renders as `{Port, {data, Data}}` with
+    /// `Data` the bare binary/int list (never an improper list).
     fn output(&mut self, _port: ErlDrvPort, data: &[u8]) -> c_int {
-        self.outputs.push(data.to_vec());
+        self.outputs.push((Vec::new(), Some(data.to_vec())));
+        0
+    }
+    /// Captures a **split** read — the C's `driver_output2(hbuf, hlen, buf, len)` (`io.c:6387`),
+    /// and the same shape as `driver_output_binary` (`io.c:6339`) and `driver_outputv`
+    /// (`io.c:6448`).
+    ///
+    /// The pair is recorded verbatim, because the boundary is observable in Erlang:
+    ///
+    /// * `body: None` — the C's `buf == NULL`: the owner gets the **proper** list `[h…]`
+    ///   (`io.c:3372` tests `buf != NULL`, never `len != 0`).
+    /// * `body: Some(&[])` — a present, empty tail: the improper list `[h…|<<>>]`
+    ///   (`io.c:3373-3375`).
+    /// * `body: Some(tail)` — the improper list `[h…|<<tail>>]` in `binary` port mode, or the flat
+    ///   int list `[h…, t…]` in `list` mode (`deliver_read_message`, `io.c:3363-3442`).
+    ///
+    /// Overriding this hook is what keeps the split: the seam's default would join the two halves
+    /// and make exactly one flattened [`DriverHost::output`] call, which is the pre-hook behaviour.
+    /// `0` = accepted, as every `driver_output*` answers.
+    fn output2(&mut self, _port: ErlDrvPort, header: &[u8], body: Option<&[u8]>) -> c_int {
+        self.outputs.push((header.to_vec(), body.map(<[u8]>::to_vec)));
         0
     }
     /// Captures the decoded term (`erl_drv_output_term` / `erl_drv_send_term`).
@@ -1782,25 +1824,36 @@ impl DriverPortAdapter {
             .collect()
     }
     /// Moves whatever the driver's just-finished callback asked of its port into the port itself:
-    /// the `driver_select` requests are applied to the poll set and the `driver_output` payloads
-    /// queued as the port's input (which is what reaches Erlang as `{Port, {data, Data}}`).
+    /// the `driver_select` requests are applied to the poll set and the `driver_output*` payloads
+    /// handed up as the port's reads with the C's header/body split intact (which is what reaches
+    /// Erlang as `{Port, {data, Data}}`).
     ///
     /// Called right after **every** driver interaction, so a request is never left unapplied.
     fn settle(&mut self, ctx: &mut DriverContext<'_>) -> beam_common::Result<()> {
-        self.collect_outputs(ctx);
+        self.collect_outputs(ctx)?;
         self.apply_selects(ctx)
     }
 
-    /// Queues every captured `driver_output` / `erl_drv_output` payload as this port's input.
-    fn collect_outputs(&mut self, ctx: &mut DriverContext<'_>) {
+    /// Hands every captured `driver_output*` / `erl_drv_output*` payload up as this port's reads,
+    /// one read per call and **header apart from body**
+    /// ([`beam_io::DriverContext::deliver_read`]).
+    ///
+    /// The split is the C's (`deliver_read_message`, `io.c:3363-3442`): flattening the halves would
+    /// report `[h…|<<tail>>]` as `<<h…tail>>`, a *different* term rather than a degraded one.
+    /// `deliver_read` closes any bytes the driver banked on its own input queue into their own
+    /// body-only read first, so arrival order is preserved across the two producers.
+    ///
+    /// A refused split (a context with no read sink) is the typed capability gap `deliver_read`
+    /// returns — propagated, never swallowed, exactly like [`DriverPortAdapter::apply_selects`].
+    fn collect_outputs(&mut self, ctx: &mut DriverContext<'_>) -> beam_common::Result<()> {
         let Some(driver) = self.driver.as_mut() else {
-            return;
+            return Ok(());
         };
-        for chunk in driver.host_mut().take_outputs() {
-            ctx.input().push(&chunk);
+        for (header, body) in driver.host_mut().take_outputs() {
+            ctx.deliver_read(&header, body.as_deref())?;
         }
+        Ok(())
     }
-
     /// Applies every `driver_select` request recorded during the last callback.
     fn apply_selects(&mut self, ctx: &mut DriverContext<'_>) -> beam_common::Result<()> {
         let requests = match self.control.try_borrow_mut() {
@@ -2804,7 +2857,8 @@ mod tests {
         let atoms = Rc::new(AtomTable::new());
         let mut host = host(&atoms);
         assert_eq!(host.output(std::ptr::null_mut(), b"hi"), 0);
-        assert_eq!(host.outputs(), &[b"hi".to_vec()]);
+        // `driver_output(buf, len)` is the header-less shape: no `hbuf` prefix, body present.
+        assert_eq!(host.outputs(), &[(Vec::new(), Some(b"hi".to_vec()))]);
         assert!(host.sent().is_empty());
 
         // The owner answers both `driver_*` pid queries with this runtime's pid term.

@@ -206,6 +206,16 @@ machine's `initial_call` is the process's **entry MFA**, where the oracle answer
 fun-applied run started inside the published window reads the **outer** machine's position for the
 same pid, because the published slot is runtime-wide rather than per-`RuntimeContext`.
 
+* `rescan.beam` is the **mailbox scan-position / re-scan** image (`tests/mailbox_rescan.rs`):
+  `parked/0` is `spawn(fun() -> Self ! 42 end)` followed by a plain `receive` (the receiver
+  parks on an **empty** mailbox and takes the next message), `marked/0` is the same shape with
+  a `recv_marker_reserve`/`_bind`/`_use` prologue (it matches on a reference created just
+  before the receive), `junk_then_ref/0` queues a non-matching message **before** the
+  reference so the marker anchor sits behind it, `two_receives/0` shares one reference across
+  two receives (so the second `recv_marker_use` runs against a queue the first receive shrank),
+  `timed/0` (`after 20`, nothing matches) fires the timeout clause, and `timedhit/0` (same
+  deadline, a message arrives first) must **cancel** it.
+
 ## Regeneration
 
 `mailbox`, `sched`, `port_recv`, `raise_structured` and `function_clause_fixture` are compiled
@@ -249,6 +259,12 @@ cp function_clause_fixture.erl "$SCRATCH/fcgen/"
 ( cd "$SCRATCH/fcgen" && erlc +deterministic function_clause_fixture.erl )
 cp "$SCRATCH/fcgen/function_clause_fixture.beam" function_clause_fixture.beam
 
+# rescan.beam (1660 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_rescan_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp rescan.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic rescan.erl )
+cp "$SCRATCH/gen/rescan.beam" rescan.beam
 # recv_after.beam (824 bytes) — same deterministic scratch-dir recipe
 SCRATCH="$TMPDIR/beam_rt_recv_after_fix"
 rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
@@ -493,6 +509,12 @@ Each rebuilt `.beam` must be **force-added** (`git add -f gc_loop.beam`), like t
 | `mailbox:selfsend/0` | `mailbox:selfsend()` | `hello` |
 | `mailbox:scan/0` | `mailbox:scan()` | `7` |
 | `mailbox:wait/0` | `mailbox:wait()` | blocks (empty mailbox) |
+| `rescan:parked/0` | `rescan:parked()` | `42` |
+| `rescan:marked/0` | `rescan:marked()` | `done` |
+| `rescan:junk_then_ref/0` | `rescan:junk_then_ref()` | `7` |
+| `rescan:two_receives/0` | `rescan:two_receives()` | `3` |
+| `rescan:timed/0` | `rescan:timed()` | `timeout` (after ≈ 20 ms) |
+| `rescan:timedhit/0` | `rescan:timedhit()` | `done` (the deadline is cancelled) |
 | `sched:send2/2` | a receiver matching `{bar, X}` after `sched:send2(R, 0)` | `7` |
 | `sched:send2/2` | `sched:send2(R, N)` | returns `ok` |
 | `port_recv:recv/0` | `port_recv:recv()` | `<<"hi\n">>` |

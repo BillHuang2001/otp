@@ -241,8 +241,26 @@ pub struct Runtime {
     /// The **process-heap collection** state: the per-module float guard, the pin/halt sets,
     /// the global escape-store valve and the measured counters (see [`crate::runtime::gc`]).
     gc: GcState,
-    /// The scratch heap for `system_info`/`format_term`, reset per call.
+    /// The scratch heap for `system_info`/`format_term`, reset per call
+    /// ([`Runtime::reset_info_scratch`]).
+    ///
+    /// A term materialized here is a **scratch** term: it is valid only until the next
+    /// `system_info`/`format_term` call, because that call resets the region. Anything that hands
+    /// such a term to Erlang code must therefore move it onto a region that outlives the call
+    /// first ([`RuntimeContext::relocate_off_scratch`](crate::context::RuntimeContext)) — the
+    /// `erlang:system_info/1` route does exactly that, so no live term is ever left in this
+    /// region.
     pub(crate) info_heap: Heap,
+    /// One-way **valve**: set once a term materialized on [`Runtime::info_heap`] could not be
+    /// relocated off it, which makes the region unrecyclable from then on.
+    ///
+    /// [`Runtime::reset_info_scratch`] is a no-op while this is set, so the un-relocated term's
+    /// words are never handed to a later `to_eterm` — the alternative is a dangling term, which is
+    /// far worse than a scratch region that only grows. The valve is unreachable in practice (a
+    /// refusal means the copier rejected a graph this runtime itself just built, or a destination
+    /// that could not be grown) and the cost if it ever fires is bounded by the size of the
+    /// `system_info`/printed values a run produces.
+    info_heap_tainted: bool,
     /// The long-lived heap for terms the `-eval` evaluator must build on a
     /// [`beam_alloc::Heap`] rather than the engine arena — today a non-byte-aligned
     /// bitstring, which [`beam_codec::term::make_bitstring`] materializes.
@@ -970,6 +988,7 @@ impl Runtime {
             arena: MinimalContext::new(),
             gc: GcState::with_latch(foreign_latch),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
+            info_heap_tainted: false,
             eval_heap: Heap::new(heap_words)?,
             eval_off_heap: beam_message::OffHeapTable::new(),
             eval_heap_retired: Vec::new(),
@@ -1309,6 +1328,42 @@ impl Runtime {
     /// own docs and [`crate::native::prim_tty`].
     pub(crate) fn prim_tty_handles_mut(&mut self) -> &mut HashMap<u64, i32> {
         &mut self.prim_tty_handles
+    }
+
+    /// Rewinds the **scratch** heap [`Runtime::info_heap`] to its base for the next
+    /// `system_info`/`format_term` call — unless the valve
+    /// [`Runtime::info_heap_tainted`] is set, in which case a live term still lives there and the
+    /// region must never be recycled again.
+    ///
+    /// # Why this is not `info_heap.reset()` at the call sites
+    ///
+    /// Every `system_info`/`format_term` entry point used to reset the region directly. That is
+    /// only sound while **nothing** the runtime handed to Erlang code lives there, and one thing
+    /// does: `erlang:system_info/1` materializes its value here
+    /// ([`Runtime::system_info`]). Retaining that value across another `system_info` (or a printed
+    /// term) is ordinary Erlang — `epp:predef_macros/2` reads two keys in a row — and a reset
+    /// between the two turns the retained term into a **dangling** pointer whose `boxed_val` reads
+    /// whatever the next value wrote: a wrong result, or the term-integrity abort
+    /// `beam_term::ops::class` raises on a recycled header word.
+    ///
+    /// So a caller that hands a scratch term out relocates it first
+    /// ([`RuntimeContext::relocate_off_scratch`](crate::context::RuntimeContext)), and this
+    /// function is the single gate that keeps the region from being recycled under a term that
+    /// could not be relocated ([`Runtime::taint_info_scratch`]).
+    pub(crate) fn reset_info_scratch(&mut self) {
+        if !self.info_heap_tainted {
+            self.info_heap.reset();
+        }
+    }
+
+    /// Latches [`Runtime::info_heap_tainted`]: a term materialized on the scratch heap is still
+    /// live there and could not be moved off it, so the region must never be reset again.
+    ///
+    /// Sound by construction — a region that is never recycled cannot dangle — and honest: it is
+    /// recorded rather than silently trading a dangling word for "the scratch heap does not
+    /// shrink any more".
+    pub(crate) fn taint_info_scratch(&mut self) {
+        self.info_heap_tainted = true;
     }
 
     /// Takes a heap for one BIF call out of the pool.
@@ -2819,9 +2874,12 @@ impl Runtime {
 
     /// `system_info/1` (contract A.8) materialized as a term.
     ///
-    /// The term is built on the runtime's **scratch heap**, which is reset at the start
-    /// of every `system_info`/`format_term` call: a returned term is valid **until the
-    /// next such call**.
+    /// The term is built on the runtime's **scratch heap**, so it is valid until the next
+    /// `system_info`/`format_term` call ([`Runtime::reset_info_scratch`]). The
+    /// `erlang:system_info/1` **BIF route** therefore relocates the value onto a region that
+    /// outlives the call before it returns it to Erlang code
+    /// ([`RuntimeContext::relocate_off_scratch`](crate::context::RuntimeContext)); a direct caller
+    /// of this method inside the runtime must not retain the term across another such call.
     ///
     /// # Errors
     ///
@@ -2829,7 +2887,7 @@ impl Runtime {
     /// the materialization errors of [`InfoValue::to_eterm`].
     pub fn system_info(&mut self, key: &str) -> Result<Eterm> {
         let value = self.system_info_value(key)?;
-        self.info_heap.reset();
+        self.reset_info_scratch();
         let Runtime {
             info_heap,
             code_server,
@@ -3006,7 +3064,7 @@ impl Runtime {
         module: Option<&Module>,
         control: &[u8],
     ) -> Result<String> {
-        self.info_heap.reset();
+        self.reset_info_scratch();
         let Runtime {
             info_heap,
             code_server,
