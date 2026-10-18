@@ -26,7 +26,11 @@
 //! atoms, binaries, tuples), across the sizes `10`, `1e3`, `1e5` (and `1e6` on
 //! demand), and reports the interior's own **bytes per entry**
 //! ([`Interior::memory`], the index footprint only — key terms are shared by both
-//! interiors, so they cancel out).
+//! interiors, so they cancel out). The ordered family also prints that figure as a
+//! raw **word count**, which is timer-free (load-independent) evidence, and every
+//! cell asserts the index stays **bounded per entry** ([`MAX_INDEX_WORDS_PER_ENTRY`])
+//! so an index whose memory grows per insert fails the run instead of merely
+//! looking slow.
 //!
 //! Two families are measured:
 //! * `interior_microbenchmark` — the `set` interiors, chained
@@ -75,6 +79,16 @@ use crate::hash_interior::HashInterior;
 use crate::kind::TableKind;
 use crate::ordered_interior::{OrderedSetInterior, SortedOrderedInterior};
 use crate::table::Interior;
+
+/// The upper bound an interior's index footprint may cost **per stored object**,
+/// asserted after every insert phase (words, not bytes).
+///
+/// It is deliberately loose — `64` words = `512` B/entry, versus the measured
+/// `~2.6–5.3` words/entry of the two ordered interiors and `~24` words/entry of the
+/// node-based hash (`set`) interiors at `n = 1000`. Its job is to catch a
+/// regression that makes index memory grow *per insert* — the "unbounded words
+/// moved per op" failure mode — not to pin the current layout.
+const MAX_INDEX_WORDS_PER_ENTRY: usize = 64;
 
 /// The measured key shapes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -334,6 +348,10 @@ struct Metrics {
     miss_ns: f64,
     iter_ns: f64,
     delete_ns: f64,
+    /// The interior's own word count ([`Interior::memory`]) with all `n` keys
+    /// stored — **deterministic**, so it is load-independent evidence and the
+    /// memory-growth-per-insert curve is read from it rather than from a timer.
+    words: usize,
     bytes_per_entry: f64,
 }
 
@@ -352,6 +370,7 @@ impl Metrics {
             miss_ns: self.miss_ns.min(other.miss_ns),
             iter_ns: self.iter_ns.min(other.iter_ns),
             delete_ns: self.delete_ns.min(other.delete_ns),
+            words: self.words.min(other.words),
             bytes_per_entry: self.bytes_per_entry.min(other.bytes_per_entry),
         }
     }
@@ -420,6 +439,19 @@ fn measure<I: Interior>(
     assert_eq!(iterated, n, "iteration must visit every stored object");
 
     let bytes_per_entry = interior.memory() as f64 * 8.0 / nf;
+    // The same figure as a raw word count, taken while all `n` keys are stored.
+    // Deterministic (no timer involved), so it is the load-independent half of the
+    // report — and it is asserted to stay **bounded per entry**, which is what
+    // rules out an unbounded bytes-moved-per-insert curve.
+    let words = interior.memory();
+    assert!(
+        words >= n,
+        "an index needs at least one word per stored object"
+    );
+    assert!(
+        words <= n * MAX_INDEX_WORDS_PER_ENTRY + 4096,
+        "index memory per entry is unbounded: {words} words for {n} keys"
+    );
 
     let start = Instant::now();
     for &key in present {
@@ -460,6 +492,7 @@ fn measure<I: Interior>(
         miss_ns,
         iter_ns,
         delete_ns,
+        words,
         bytes_per_entry,
     }
 }
@@ -485,10 +518,11 @@ fn print_row(shape: Shape, index: &str, n: usize, m: &Metrics) {
     );
 }
 
-/// Print one ordered-benchmark row: the `set` columns plus the driven key order.
+/// Print one ordered-benchmark row: the `set` columns plus the driven key order
+/// and the interior's deterministic word count with all `n` keys stored.
 fn print_ordered_row(shape: Shape, order: Order, index: &str, n: usize, m: &Metrics) {
     println!(
-        "{:<9} {:>9} {:<11} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10.1}",
+        "{:<9} {:>9} {:<11} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10.1}",
         shape.name(),
         n,
         order.name(),
@@ -499,6 +533,7 @@ fn print_ordered_row(shape: Shape, order: Order, index: &str, n: usize, m: &Metr
         ns(m.miss_ns),
         ns(m.iter_ns),
         ns(m.delete_ns),
+        m.words,
         m.bytes_per_entry,
     );
 }
@@ -506,7 +541,7 @@ fn print_ordered_row(shape: Shape, order: Order, index: &str, n: usize, m: &Metr
 /// Print one `sorted/tree` ratio row for the ordered benchmark.
 fn print_ordered_ratio(shape: Shape, order: Order, n: usize, sorted: &Metrics, tree: &Metrics) {
     println!(
-        "{:<9} {:>9} {:<11} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+        "{:<9} {:>9} {:<11} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
         shape.name(),
         n,
         order.name(),
@@ -517,6 +552,7 @@ fn print_ordered_ratio(shape: Shape, order: Order, n: usize, sorted: &Metrics, t
         ratio(sorted.miss_ns, tree.miss_ns),
         ratio(sorted.iter_ns, tree.iter_ns),
         ratio(sorted.delete_ns, tree.delete_ns),
+        ratio(sorted.words as f64, tree.words as f64),
         ratio(sorted.bytes_per_entry, tree.bytes_per_entry),
     );
 }
@@ -618,7 +654,10 @@ fn ordered_interior_microbenchmark() {
     println!("# beam_ets ordered_set-interior microbenchmark: B+-tree (OrderedSetInterior) vs sorted Vec (SortedOrderedInterior)");
     println!("# cells: ns per operation; keys are driven in each `order` (BEAM_ETS_BENCH_ORDER=shuffled|ascending|descending|all)");
     println!(
-        "{:<9} {:>9} {:<11} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "# `words`/`B/entry` are the interior's own Interior::memory() — deterministic, timer-free"
+    );
+    println!(
+        "{:<9} {:>9} {:<11} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "shape",
         "n",
         "order",
@@ -629,6 +668,7 @@ fn ordered_interior_microbenchmark() {
         "miss",
         "iter",
         "delete",
+        "words",
         "B/entry"
     );
 

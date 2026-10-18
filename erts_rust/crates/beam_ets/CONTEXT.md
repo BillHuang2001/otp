@@ -358,7 +358,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `cmp_arith`. Insert is `O(log n)` node visits amortized (worst case `O(log² n)` on a cascading root
   split); delete is `O(log² n)` node visits but only `O(log n)` term comparisons — see
   `src/ordered_interior/CONTEXT.md`. The sorted-`Vec` interior stays selectable (`OrderedInterior::Sorted`)
-  as a comparison index; the interior shape is unpinned and the measured numbers are in `PERF.md`.
+  as a comparison index; the interior shape is unpinned, and the measured comparison (`PERF.md` §3) is
+  settled in the tree's favour: the `Vec` reaches write parity only below ≈1 200–1 600 keys and costs
+  **3.5×/3.2×** at 10 000 keys and **29.5×/23.7×** at 100 000 (worst case 116×), buying back ≤ 2.59×
+  index memory and ≤ 81 ns per lookup.
 - **`set` defaults to CHAMP; `bag`/`duplicate_bag` stay chained.** Measurement-driven (index only): CHAMP
   wins on insert, iteration and index bytes/entry (2–7× fewer), is comparable on lookup-hit, and loses on
   delete (canonicalization) — the insert/iterate/memory profile ETS is optimised for. `SetInterior::
@@ -496,7 +499,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   plus the ordered interior's **key-order** dimension via
   `BEAM_ETS_BENCH_ORDER=shuffled|ascending|descending|all` (default `shuffled`) — the order is
   irrelevant to the B+-tree and decisive for the sorted `Vec`, so both interiors' best *and* worst cases
-  get measured. The measured outcomes live in `PERF.md` (§3 for the ordered interior).
+  get measured. Every cell also reports the interior's timer-free `words`/`B/entry` (load-independent
+  evidence), and the run asserts the index stays bounded per entry (≤ 64 words), so a per-insert memory
+  regression fails the bench instead of merely looking slow. The measured outcomes live in `PERF.md`
+  (§3 for the ordered interior).
 - Crate-level integration over the **public API**: `tests/ets_*.rs`, `tests/select.rs`,
   `tests/match_spec_run.rs`, helpers from `tests/common/` and the live-`erl` plumbing in
   `tests/common/oracle.rs`. Reclamation/accounting files:
