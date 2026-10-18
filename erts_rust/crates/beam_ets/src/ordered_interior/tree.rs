@@ -82,7 +82,7 @@ use beam_term::prelude::*;
 
 use super::iter::LeafIter;
 use super::node::{
-    child_index, search_entries, Entry, Node, NodeId, NodeStore, MIN_OCCUPANCY, ORDER,
+    child_index, search_entries, trim_vec, Entry, Node, NodeId, NodeStore, MIN_OCCUPANCY, ORDER,
 };
 
 /// The ordered index over `beam_term` terms.
@@ -132,6 +132,25 @@ enum InsertStep {
     },
 }
 
+/// One level of the tree's occupancy profile (see [`Tree::occupancy_profile`]).
+/// Test-only: the structural evidence that `delete` rebalances.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LevelOccupancy {
+    /// `0` for the root's level, `1` for its children's, …
+    pub(crate) depth: usize,
+    /// How many nodes sit at this level.
+    pub(crate) nodes: usize,
+    /// The smallest occupancy at this level (leaf entries / branch children).
+    pub(crate) min: usize,
+    /// The largest occupancy at this level.
+    pub(crate) max: usize,
+    /// How many nodes at this level hold fewer than [`MIN_OCCUPANCY`]
+    /// entries/children. The root is exempt from the minimum, so a shallow tree's
+    /// depth-0 row may report one.
+    pub(crate) underfilled: usize,
+}
+
 impl Tree {
     /// A new, empty tree: a single empty root leaf (invariant 3's empty case).
     pub(crate) fn new() -> Tree {
@@ -147,6 +166,11 @@ impl Tree {
     /// The number of stored keys.
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_stats(&self) -> String {
+        self.store.debug_stats()
     }
 
     /// An honest word count of the tree's node arena (the `ordered_set` interior
@@ -324,15 +348,24 @@ impl Tree {
     }
 
     /// Remove `key` (and its object); returns whether the key was present.
+    ///
+    /// A removal frees nodes (a merge retires one) and shrinks others, so the arena
+    /// is asked to [compact](NodeStore::compact) afterwards: once its dead slots
+    /// outweigh its live ones it drops them, renumbers densely and releases each
+    /// surviving node's surplus capacity, which is what makes the interior's
+    /// reported memory follow the **live** key count instead of the high-water mark
+    /// a bulk teardown would leave.
     pub(crate) fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> bool {
         if self.len == 0 || !self.delete_rec(self.root, key, atoms) {
             return false;
         }
         self.len -= 1;
         self.collapse_root();
+        if self.store.needs_compaction() {
+            self.store.compact(&mut self.root);
+        }
         true
     }
-
     /// Remove `key`'s object only when it is term-equal to `object`; returns
     /// whether something was removed.
     pub(crate) fn delete_object(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> bool {
@@ -507,7 +540,15 @@ impl Tree {
             if !found {
                 return false;
             }
-            self.store.leaf_mut(id).entries.remove(pos);
+            let leaf = self.store.leaf_mut(id);
+            leaf.entries.remove(pos);
+            // A leaf that kept its entries in a large array now holds one fewer: give
+            // the surplus back once it is down to a quarter of its capacity (the same
+            // hysteresis the sorted-`Vec` interior applies), so the reported memory of
+            // a table that shrank follows its live keys even when the tree *shape* no
+            // longer changes (a single-leaf tree retires no node, so no compaction
+            // would otherwise ever revisit it).
+            trim_vec(&mut leaf.entries);
             return true;
         }
 
@@ -769,6 +810,85 @@ impl Tree {
         height
     }
 
+    /// The number of live nodes in the arena (test-only; see
+    /// `NodeStore::live_nodes`). Used to pin that a bulk teardown really compacts
+    /// rather than leaving dead slots behind.
+    #[cfg(test)]
+    pub(crate) fn live_nodes(&self) -> usize {
+        self.store.live_nodes()
+    }
+
+    /// The arena's `(slots, retired, live)` counts (test-only): how far the slot
+    /// table ever grew, how many of those slots are on the free list, and how many
+    /// are occupied. A dense tree keeps `slots` close to `live`.
+    #[cfg(test)]
+    pub(crate) fn arena_stats(&self) -> (usize, usize, usize) {
+        (
+            self.store.slot_count(),
+            self.store.retired_count(),
+            self.store.live_nodes(),
+        )
+    }
+
+    /// The number of leaves reachable from the root (test-only): the length of the
+    /// leaf chain, which is the denominator of the tree's leaf density.
+    #[cfg(test)]
+    pub(crate) fn leaf_count(&self) -> usize {
+        let mut leaves = 0;
+        let mut walk = Some(self.leftmost_leaf());
+        while let Some(id) = walk {
+            leaves += 1;
+            walk = self.store.leaf(id).next;
+        }
+        leaves
+    }
+
+    /// The per-level occupancy profile of the tree, the root's level first.
+    ///
+    /// Test-only. It is what makes the **density** half of invariant 3 observable:
+    /// every level below the root must report `underfilled == 0` and
+    /// `min >= MIN_OCCUPANCY`, which is the property a missing or non-firing merge
+    /// would break — a sparse tree still answers every lookup correctly, so only a
+    /// structural probe can see it.
+    #[cfg(test)]
+    pub(crate) fn occupancy_profile(&self) -> Vec<LevelOccupancy> {
+        let mut levels: Vec<LevelOccupancy> = Vec::new();
+        let mut queue = vec![(self.root, 0usize)];
+        let mut cursor = 0usize;
+        while cursor < queue.len() {
+            let (id, depth) = queue[cursor];
+            cursor += 1;
+            let node = self.store.node(id);
+            let occupancy = node.occupancy();
+            if levels.len() == depth {
+                levels.push(LevelOccupancy {
+                    depth,
+                    nodes: 0,
+                    min: occupancy,
+                    max: occupancy,
+                    underfilled: 0,
+                });
+            }
+            let level = &mut levels[depth];
+            level.nodes += 1;
+            level.min = level.min.min(occupancy);
+            level.max = level.max.max(occupancy);
+            // Counted against the *contract* ([`MIN_OCCUPANCY`]) rather than
+            // through `Node::is_underfull`, so the profile reports what the tree
+            // must look like and not merely what the rebalance's own threshold
+            // currently demands.
+            if occupancy < MIN_OCCUPANCY {
+                level.underfilled += 1;
+            }
+            if let Node::Branch(branch) = node {
+                for &child in &branch.children {
+                    queue.push((child, depth + 1));
+                }
+            }
+        }
+        levels
+    }
+
     /// Walk the whole tree and panic on the first broken invariant (1–5 above).
     ///
     /// Test-only: it is `O(n)` and exists so the suite can assert the structural
@@ -834,6 +954,24 @@ impl Tree {
             }
         }
         assert_eq!(chained_keys, self.len, "the leaf chain covers every key");
+
+        // Invariant 3 has an *aggregate* half as well as the per-node one
+        // `check_subtree` asserts: with every non-root leaf holding at least
+        // `MIN_OCCUPANCY` entries, the leaf chain cannot be longer than
+        // `len / MIN_OCCUPANCY`. Stating it separately is what makes a teardown that
+        // left under-filled leaves behind (a sparse tree that still answers every
+        // lookup and every walk correctly — it only wastes memory) fail here rather
+        // than pass unnoticed.
+        if leaves.len() > 1 {
+            assert!(
+                leaves.len() * MIN_OCCUPANCY <= self.len,
+                "the leaf chain is sparse: {} leaves for {} keys, under the \
+                 {MIN_OCCUPANCY}-density floor (every non-root leaf may hold at \
+                 least {MIN_OCCUPANCY} of at most {ORDER} entries)",
+                leaves.len(),
+                self.len
+            );
+        }
     }
 
     /// Check the subtree at `id` and return

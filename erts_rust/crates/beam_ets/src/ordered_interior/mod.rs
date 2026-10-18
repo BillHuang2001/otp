@@ -138,9 +138,12 @@ impl OrderedSetInterior {
     /// An honest, non-negative word count of the B+-tree node arena — the
     /// `ordered_set` interior contribution to `ets:info(Tab, memory)`.
     ///
-    /// Measured at capacity (the node arena's honest allocation), so it is strictly
-    /// positive even when empty (the root leaf exists), never decreases as keys are
-    /// inserted, and is at least one word per stored object.
+    /// The node arena's honest allocation: strictly positive even when empty (the
+    /// root leaf exists) and at least one word per stored object. It tracks the
+    /// live tree — a removal retires nodes, and once `NodeStore::needs_compaction`
+    /// sees more retired slots than live ones the arena is renumbered densely and
+    /// every surviving node's vector capacity released — so the count falls as
+    /// keys leave instead of holding the tree's high-water mark.
     pub fn memory(&self) -> usize {
         self.tree.memory()
     }

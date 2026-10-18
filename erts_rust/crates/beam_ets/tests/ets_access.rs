@@ -1454,19 +1454,6 @@ fn outcome(result: beam_common::Result<()>) -> &'static str {
     }
 }
 
-/// The `[{{'$1','_'},[],[{{'$1',0}}]}]` spec: a key-keeping body, the only shape
-/// `ets:select_replace/2` accepts (the C `db_match_keeps_key` static body check).
-fn key_keeping_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
-    let dollar1 = make_atom(atoms.intern("$1"));
-    let underscore = interned_atom(atoms, "_");
-    let inner = heap.tuple(&[dollar1, make_small(0)]).expect("test heap has room");
-    let construction = heap.tuple(&[inner]).expect("test heap has room");
-    let head = heap.tuple(&[dollar1, underscore]).expect("test heap has room");
-    let body = proper_list(heap, &[construction]);
-    let clause = heap.tuple(&[head, NIL, body]).expect("test heap has room");
-    let spec = proper_list(heap, &[clause]);
-    compile(spec, atoms).expect("a valid match spec")
-}
 
 /// Parse an oracle program's `key -> value` lines into a map.
 fn parse_facts(stdout: &[u8]) -> HashMap<String, String> {
@@ -1615,7 +1602,7 @@ fn all_ops() -> Vec<(&'static str, OpGate, Box<OpProbe>)> {
                 .map(|_| ())
         })),
         ("w_select_replace", write, Box::new(|t, r, atoms, a, o| {
-            let spec = key_keeping_spec(a, atoms);
+            let spec = common::key_keeping_spec(a, atoms);
             t.as_requester(r)
                 .select_replace(&spec, atoms, o)
                 .map(|_| ())

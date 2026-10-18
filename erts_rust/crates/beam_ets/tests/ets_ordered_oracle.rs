@@ -165,6 +165,18 @@ const VALUES: u64 = 6;
 /// the trace asserts it exceeds it, so leaves really split and internal nodes form.
 const ORDER: usize = 32;
 
+/// The density hook's fixed allowance (words) for a seed's final footprint, on top of
+/// [`FOOTPRINT_PER_KEY`] words per live key — see the assertion in the test. The trace
+/// is small (65-odd keys at its peak), so this is a *coarse* guard: measured
+/// footprints are `(12 keys, 94 words)`, `(53, 467)` and `(67, 533)`, i.e. ~8 words per
+/// key, and the bound leaves a 4× margin. It catches a footprint that keeps growing
+/// per live key (a leak or a tree of half-empty nodes), not the last few nodes: the
+/// exact per-node occupancy floor is asserted in-crate, where the tree is visible
+/// (`src/ordered_interior/tests.rs::assert_occupancy_floor`).
+const FOOTPRINT_FLOOR: usize = 1_024;
+/// The density hook's per-live-key allowance (words).
+const FOOTPRINT_PER_KEY: usize = 16;
+
 /// The 1-based element position the element-update/element-read operations target:
 /// the value of a `{Key, Value}` object (`keypos + 1`).
 const VALUE_POS: usize = 2;
@@ -394,6 +406,9 @@ struct TraceRun {
     walked: usize,
     /// The longest single walk.
     max_walk: usize,
+    /// `(live keys, interior words)` at the end of each seed's sweep: the observable
+    /// *density* of the tree the trace left behind (see the test's density hook).
+    footprints: Vec<(usize, usize)>,
 }
 
 impl Trace<'_> {
@@ -721,6 +736,7 @@ fn trace() -> TraceRun {
 
     let mut facts = BTreeMap::new();
     let mut peak_live = 0usize;
+    let mut footprints = Vec::new();
     let mut op_hits = [0usize; NUM_OPS as usize];
     for seed in SEEDS {
         // The default `ordered_set` interior is the K-ary B+-tree; assert it so a
@@ -755,6 +771,7 @@ fn trace() -> TraceRun {
                 ),
             );
         }
+        footprints.push((table.size(), table.memory()));
     }
     TraceRun {
         facts,
@@ -762,6 +779,7 @@ fn trace() -> TraceRun {
         op_hits,
         walked: trace.walked,
         max_walk: trace.max_walk,
+        footprints,
     }
 }
 
@@ -976,6 +994,27 @@ fn randomised_ordered_set_trace_matches_the_live_oracle() {
     }
     // The walks must really traverse: at least one walk must cross the fan-out, so
     // the walk dimension exercises a split (multi-leaf) structure, not a lone leaf.
+    // Density hook: a delete that failed to borrow-or-merge would leave under-full
+    // leaves behind, and because the sweep's delete churn is heavy (a third of the op
+    // slots remove) that sparsity would show up in the *footprint*:
+    // `Table::memory` (node arena + stored objects) would grow per live key instead of
+    // tracking the live key count. The bound is deliberately loose — the arena keeps
+    // its slots' spare capacity between the delete that shrank a leaf and the
+    // whole-arena compaction that releases it — but a tree with half-empty leaves
+    // (twice the nodes, each with its own `Vec`) sits far above it.
+    for (seed, &(size, words)) in run.footprints.iter().enumerate() {
+        assert!(
+            words <= FOOTPRINT_FLOOR + FOOTPRINT_PER_KEY * size,
+            "seed {seed}'s sweep left a sparse tree: {words} words for {size} live keys \
+             (allowed {FOOTPRINT_FLOOR} + {FOOTPRINT_PER_KEY} per key), so the delete \
+             path is not keeping every node at or above its occupancy floor"
+        );
+    }
+    println!(
+        "[ordered trace] per-seed footprints (live keys, words): {:?}",
+        run.footprints
+    );
+
     assert!(
         run.max_walk > ORDER,
         "the longest walk yielded {} keys, not more than the B+-tree fan-out ({ORDER}); \

@@ -677,9 +677,12 @@ impl Table {
     /// memory)` returns *exactly* to the empty-table figure after the key set has
     /// been deleted (`set`/`bag`/`duplicate_bag` 306 words, `ordered_set` 140 words —
     /// the same figures as a freshly created table), so the oracle keeps no index
-    /// storage for an empty table. The interiors' `memory` counts the index's
-    /// *capacity* (a CHAMP root's slot vectors, a chained index's bucket array, the
-    /// ordered arena's nodes), which only a rebuilt interior gives back.
+    /// storage for an empty table. The interiors shrink their index storage as
+    /// objects leave (see each interior's `memory`), but a *downsized* index is not
+    /// the same thing as a **fresh** one — a `set`'s bucket array stops at its
+    /// starting count, not at the exact words of a new one — so the emptied case
+    /// still rebuilds, which is what makes a delete-it-all trajectory land on the
+    /// empty floor exactly rather than approximately.
     ///
     /// Only a removal that actually happened calls this, so a `delete` of an absent
     /// key — a common no-op — never churns the index.

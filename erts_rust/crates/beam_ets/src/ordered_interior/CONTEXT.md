@@ -26,7 +26,10 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
    makes a split amortized `O(1)` — one split per `ORDER/2` inserts), and every node below the root
    holds within `[MIN_OCCUPANCY=16, ORDER=32]`; the root leaf may be empty, a root branch keeps `>= 2`
    children. Both arms assert the upper bound explicitly, so an unbounded-node-size regression fails
-   `check_invariants` loudly.
+   `check_invariants` loudly. The bound has an **aggregate** half the same checker asserts: with every
+   non-root leaf at `>= MIN_OCCUPANCY`, a multi-leaf tree's chain is at most `len / MIN_OCCUPANCY`
+   long, so a delete that left under-occupied leaves behind fails even though each leaf alone would
+   still be structurally legal.
 4. All leaves are at the same depth. 5. The leaf chain visits every leaf exactly once, left to right.
 
 ## Design Decisions
@@ -41,9 +44,16 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
   `branch.keys`.
 - `child_index` **binary-searches** the strictly-ascending separators (a hand-rolled lower bound: the
   first separator `>= key`, clamped to the last child) — the tree's hottest helper.
-- Split at `ORDER+1`, cut at `ORDER/2` (16/17); rebalance borrows from a sibling with `> MIN`
-  occupancy or merges (siblings then sum to `<= ORDER`), so occupancy stays bounded and the height
-  changes only at the root, which collapses when it drops to a single child.
+- Split at `ORDER+1`, cut at `ORDER/2` (16/17); `delete_rec` rebalances on the unwind: a child that
+  fell below `MIN_OCCUPANCY` **borrows one entry/child** from the left sibling (preferred) or the right
+  one when that sibling holds more than `MIN_OCCUPANCY`, else **merges** with one of them (both then
+  hold at most `MIN_OCCUPANCY`, so the sum fits in `ORDER`), which drops a separator and can
+  under-fill the parent in turn — the cascade continues up the spine, and the root collapses when it
+  drops to a single child. A borrow re-materialises the giving sibling's separator, a merge lets the
+  caller re-derive the merged node's, so occupancy stays in `[MIN_OCCUPANCY, ORDER]` at every level
+  below the root and the height changes only at the root. There is no deferred/lazy variant: the
+  invariant holds after **every** `delete`, not only after a later whole-arena compaction (which only
+  reclaims the arena's dead *slots* and spare `Vec` capacity).
 - A same-`cmp_arith`-key insert replaces **both** the object and the stored key term (the oracle's
   key-follows-object rule; probed against OTP 29).
 - **The evidence suite is tuned to hit the split/merge boundary, and says so.** The randomised trace
@@ -92,8 +102,23 @@ periodically re-asserts `check_invariants`, checks membership/`lookup` and
 re-checks membership + the walk, re-inserts everything, walks again, then drains back to empty — all
 with immediates (no `Heap`), so it measures the index alone (~0.4 s). `tests.rs` tests cover the empty
 case, replace/`insert_new`/`delete_object`, mixed key classes, present/absent/boundary navigation, the
-replace-key-term rule, and memory monotonicity; both interiors are driven through the `Interior` seam
-by shared helpers. `../interior_parity.rs` proves the B+-tree and the sorted `Vec` produce identical
+replace-key-term rule, and memory accounting across churn; both interiors are driven through the `Interior` seam
+by shared helpers.
+
+**The occupancy floor is asserted directly, not only implied.** The test-only seams
+`Tree::occupancy_profile` (per-level `nodes`/`min`/`max`/`underfilled`, root first),
+`Tree::leaf_count` and `Tree::arena_stats` (`slots`/`retired`/`live`) let `tests.rs::assert_occupancy_floor`
+check the *density* half of invariant 3 from outside the tree: no node below the root under
+`MIN_OCCUPANCY`, none over `ORDER`, the aggregate `leaves * MIN_OCCUPANCY <= len` chain bound, a root
+branch with `>= 2` children, and an arena whose free list never outgrows its live nodes
+(`slots == retired + live`, `retired <= live`). It is asserted at every sampled step of a
+`10 000 -> 1`-key **ascending** bulk teardown (`a_bulk_teardown_keeps_every_node_at_or_above_the_occupancy_floor`,
+which also pins the footprint falling with the key count and the final `slots=1, retired=0, live=1`),
+and through a scattered teardown to 1 % of the keys plus ten rounds of half-the-keys churn
+(`the_occupancy_floor_survives_a_scattered_teardown_and_ten_thousand_key_churn`). Weakening the
+rebalance (firing at `MIN_OCCUPANCY / 2`) turns both RED with under-full leaves at every level that
+stays sparse; disabling it entirely makes leaves empty, so `NodeStore::subtree_max_key`'s
+"a leaf is never empty" assertion trips. `../interior_parity.rs` proves the B+-tree and the sorted `Vec` produce identical
 observable traces. End-to-end `ordered_set` behaviour is oracle-differential-tested in
 `../tests/differential/` (navigation, 10 001-key, matchspec, ...). No `#[ignore]` in `tests.rs` or
 `interior_parity.rs`, and no self-comparison tautologies.
@@ -115,7 +140,12 @@ sides agree on. 3 seeds × 600 steps = **1800 compared steps**, zero divergence,
 longest single walk **67** keys — the trace is required to cross `ORDER = 32` and to record a walk
 longer than `ORDER` (the test asserts its own peak and that every new slot fired) so a future op-mix
 change cannot silently stop exercising node splits, the merge-on-delete churn, or a `next`/`prev` walk
-across a split boundary.
+across a split boundary. It also carries a **footprint (density) hook**: each seed's final
+`(live keys, Table::memory words)` is recorded and bounded (`FOOTPRINT_FLOOR` + `FOOTPRINT_PER_KEY` per
+live key) and printed, so a delete path that stopped rebalancing would show up as words-per-live-key
+growing instead of tracking the key count. The trace is small (measured `(12, 94)`, `(53, 467)`,
+`(67, 533)` words), so that bound is a coarse guard — the exact per-node occupancy floor is asserted
+in-crate, where the tree is visible.
 
 A deterministic, always-on counterpart lives in `../tests/ets_fixtable.rs`: a `first`+`next` /
 `last`+`prev` chain over 100 keys (strictly > 2 × `ORDER`) interleaved with inserts/deletes — including
@@ -151,7 +181,7 @@ run's `/proc/loadavg` are in `../../PERF.md` §3.
 
 ## Routing Table
 - `mod.rs` → `OrderedSetInterior` (B+-tree facade + `Interior` impl); declares `mod tests;` → `tests.rs` (the crate's biggest test module)
-- `tree.rs` → `Tree`: insert/split, delete/borrow-or-merge, navigation, `check_invariants`
+- `tree.rs` → `Tree`: insert/split, delete/borrow-or-merge, navigation, `check_invariants`, and the test-only `occupancy_profile`/`leaf_count`/`arena_stats` density seams
 - `node.rs` → `Node`/`LeafNode`/`BranchNode`/`Entry`, the `NodeStore` arena, `search_entries`, `child_index`, `ORDER`/`MIN_OCCUPANCY`
 - `iter.rs` → `LeafIter` (the leaf-chain ordered iterator)
 - `sorted.rs` → `SortedOrderedInterior` (the sorted-`Vec` alternative) + its tests
