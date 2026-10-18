@@ -24,9 +24,10 @@
  * `start(port, command)` parses a simple, whitespace/comma separated command string:
  *
  *   * `fd=<n>`   — the descriptor the port will `driver_select` on (default: none, `-1`);
- *   * `log=<path>` — a file every callback appends a line to (`start`, `output`, `stop`),
- *     so a host can observe the *order* in which the driver's callbacks ran; when absent no
- *     file is ever touched (the pre-existing tests are unaffected);
+ *   * `log=<path>` — an **absolute** file path every callback appends a line to (`start`,
+ *     `output`, `stop`), so a host can observe the *order* in which the driver's callbacks ran;
+ *     when absent, or relative, no file is ever touched (nothing this fixture writes may land
+ *     relative to the process's working directory);
  *   * `upper`     — a mode token: `output` upper-cases the bytes it echoes back.
  *   * `hdl`       — a mode token: every callback that runs while it is set additionally appends
  *     `handle=<%p>` (the `ErlDrvPort` the driver stashed at `start`), so a host can assert the
@@ -42,14 +43,15 @@
  *
  * ## The callback log
  *
- * When `log=<path>` is given, `start`, `output` and `stop` each append one line (`"start"`,
- * `"output"`, `"stop"`) to that file, in the order they ran. That is the observable evidence
- * a port created from the process-global driver table really ran the driver's `start`/`stop`
- * callbacks, in order, around its data path. `async_invoke` (the worker-thread job body),
- * `ready_async` and `async_free` append `"async_invoke"`/`"ready_async …"`/`"async_free"` through
- * the same path, so both the job's completion on its worker and the arm its completion was handed
- * to are observable too. (An `async_invoke`/`async_free` line is written from the async worker
- * thread; every append opens, writes and closes the file, so the lines never interleave.)
+ * When an absolute `log=<path>` is given, `start`, `output` and `stop` each append one line
+ * (`"start"`, `"output"`, `"stop"`) to that file, in the order they ran. That is the observable
+ * evidence a port created from the process-global driver table really ran the driver's
+ * `start`/`stop` callbacks, in order, around its data path. `async_invoke` (the worker-thread job
+ * body), `ready_async` and `async_free` append
+ * `"async_invoke"`/`"ready_async …"`/`"async_free"` through the same path, so both the job's
+ * completion on its worker and the arm its completion was handed to are observable too. (An
+ * `async_invoke`/`async_free` line is written from the async worker thread; every append opens,
+ * writes and closes the file, so the lines never interleave.)
  *
  * ## The port-exit notifications
  *
@@ -146,9 +148,8 @@
  * to it. A test therefore drives one port at a time.
  *
  * `host_async_free(void *data)` *is* handed the `driver_async` `async_data` (this port's state),
- * so it logs through that state's own path. It therefore requires the port's `stop` **not** to
- * have run — the release tests drop the port instead of closing it (a closed port has freed the
- * state, and the release still has to be delivered).
+ * so it logs through that state's own path. It may run **after** the port's `stop` (the host drains
+ * the job set at teardown), which is why the state is never freed — see `host_stop`.
  *
  * ## The variant builds
  *
@@ -221,7 +222,7 @@
 #else
 #define HOST_DRIVER_OUTPUTV_SLOT NULL
 #endif
-/* Private per-port state, allocated in `start` and freed in `stop`. */
+/* Private per-port state, allocated in `start` and intentionally **never freed** (see `host_stop`). */
 typedef struct {
     ErlDrvPort port;   /* the port handle `output`/`timeout` need (they get no port argument) */
     int fd;            /* the descriptor `driver_select` is armed on, or -1 when none given */
@@ -237,10 +238,13 @@ typedef struct {
  * header), so the path is published process-wide by the most recent `start` instead. */
 static char g_stop_select_log[512] = "";
 
-/* Append `what` as one line to the per-port log file, if the command asked for one. */
+/* Append `what` as one line to the per-port log file, if the command asked for one.
+ *
+ * Only an absolute `log=` path is honoured, so nothing this fixture writes can land relative to the
+ * process's working directory. */
 static void log_event(const host_state *st, const char *what) {
     FILE *f;
-    if (st == NULL || st->log[0] == '\0')
+    if (st == NULL || st->log[0] != '/')
         return;
     f = fopen(st->log, "a");
     if (f == NULL)
@@ -255,7 +259,7 @@ static void log_event(const host_state *st, const char *what) {
  * still accepts that pointer later, which the data paths prove). */
 static void log_handle(const host_state *st) {
     FILE *f;
-    if (st == NULL || st->log[0] == '\0' || !st->log_handle)
+    if (st == NULL || st->log[0] != '/' || !st->log_handle)
         return;
     f = fopen(st->log, "a");
     if (f == NULL)
@@ -423,7 +427,10 @@ static void host_stop(ErlDrvData drv_data) {
     if (st == NULL)
         return;
     log_event(st, "stop");
-    driver_free(drv_data);
+    /* No `driver_free` here, on purpose: a `driver_async` job still in flight reaches
+     * `host_async_free` from the host's teardown, i.e. **after** this `stop` has run, and that
+     * callback logs through the same per-port path. Freeing would hand it a dangling log path, so
+     * the state lives as long as the process (a test fixture's process ends with the test). */
 }
 
 /* The `ERL_DRV_USE` release callback (`stop_select`): the driver is told a `driver_select`ed
@@ -434,7 +441,7 @@ static void host_stop_select(ErlDrvEvent event, void *reserved) {
     FILE *f;
     (void) event;
     (void) reserved;
-    if (g_stop_select_log[0] == '\0')
+    if (g_stop_select_log[0] != '/')
         return;
     f = fopen(g_stop_select_log, "a");
     if (f == NULL)
@@ -605,8 +612,8 @@ static void host_ready_async(ErlDrvData drv_data, ErlDrvThreadData thread_data) 
 
 /* The driver's `async_free`: releases `async_data` (this port's state) when no `ready_async` will
  * run for the job — the port-gone path and the no-`ready_async` entry. It logs through the async
- * data's own path, which is why the tests that observe it drop the port instead of closing it (a
- * closed port has already freed the state, and the release still has to be delivered). */
+ * data's own path, which stays valid even when the port was closed first: the state is never freed
+ * (see `host_stop`), so this release can be delivered after `stop` without a dangling path. */
 static void host_async_free(void *data) {
     host_state *st = (host_state *) data;
     if (st == NULL)

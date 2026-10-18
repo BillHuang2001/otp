@@ -213,11 +213,29 @@ impl fmt::Debug for OwnedFd {
 
 #[cfg(test)]
 mod tests {
+    //! # Why no test re-closes a descriptor number it just released
+    //!
+    //! `close(2)` answers `EBADF` for a released number **only while that number is still free**.
+    //! Cargo runs a lib's tests on several threads of one process, so the moment a test closes `N`
+    //! the kernel may hand `N` to another test's `UnixStream`/`File`/port — and a "second close is
+    //! `EBADF`" assertion would then close *that* owner's descriptor. Measured: the process aborts
+    //! with `fatal runtime error: IO Safety violation: owned file descriptor already closed`, i.e.
+    //! one test's harness destroys another test's descriptor (std's `OwnedFd::drop` finds `EBADF`).
+    //!
+    //! The wrapper's documented guarantee — an `EBADF` is **reported**, never swallowed — is
+    //! therefore pinned on descriptor numbers that can never be allocated (`-1`, and a value above
+    //! any `RLIMIT_NOFILE` the kernel will ever grant), and every "the descriptor really went away"
+    //! claim is pinned on the deterministic peer observation (`EPIPE`), never on a re-close.
     use super::{close_fd, OwnedFd};
     use beam_common::BeamError;
     use std::io::{ErrorKind, Write};
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
+
+    /// A number `close(2)` always refuses and no allocation can ever produce: descriptor numbers are
+    /// `int`s below the process's `RLIMIT_NOFILE`, which the kernel caps well under this one, so no
+    /// thread can turn it into a live descriptor while a test asserts `EBADF` on it.
+    const UNALLOCATABLE_FD: RawFd = RawFd::MAX - 1;
 
     /// A `socketpair(2)` whose first end is returned as a bare descriptor number
     /// (`std::mem::forget` keeps the `UnixStream` from closing it) plus the surviving peer.
@@ -225,7 +243,7 @@ mod tests {
     /// The second end is the crate-independent closure probe: writing to it fails with `EPIPE`
     /// exactly when the first end's descriptor has been released, which lets a test observe the
     /// close without a second syscall wrapper (`fcntl(2)`/`dup(2)`) of its own.
-    fn pair() -> (std::os::unix::io::RawFd, UnixStream) {
+    fn pair() -> (RawFd, UnixStream) {
         let (owned, peer) = UnixStream::pair().expect("a socketpair");
         let fd = owned.as_raw_fd();
         std::mem::forget(owned);
@@ -256,22 +274,24 @@ mod tests {
     }
 
     #[test]
-    fn a_real_descriptor_closes_once_and_the_second_close_reports_ebadf() {
+    fn a_real_descriptor_closes_once_and_the_peer_observes_the_release() {
         let (fd, mut peer) = pair();
         assert!(!peer_sees_closed(&mut peer), "the peer starts out open");
 
         close_fd(fd).expect("the first close succeeds");
         assert!(peer_sees_closed(&mut peer), "the peer saw the close");
-
-        // The second close is not a silent success: the kernel says `EBADF` and it is reported.
-        let again = close_fd(fd).expect_err("a re-close is not a success");
-        assert_eq!(errno(&again), Some(libc::EBADF), "a re-close reports EBADF");
     }
 
     #[test]
     fn a_descriptor_that_was_never_open_reports_ebadf_instead_of_succeeding() {
         // -1 is the conventional "no descriptor" value; `close(2)` refuses it with `EBADF`.
         let err = close_fd(-1).expect_err("closing -1 cannot succeed");
+        assert_eq!(errno(&err), Some(libc::EBADF));
+
+        // The same refusal on a *plausible-looking* number that no allocation can ever produce, so
+        // the reported `EBADF` comes from the wrapper's own error path and not from a number that
+        // some other test happened to leave closed (see the module docs).
+        let err = close_fd(UNALLOCATABLE_FD).expect_err("an unallocatable number cannot be closed");
         assert_eq!(errno(&err), Some(libc::EBADF));
     }
 
@@ -304,13 +324,10 @@ mod tests {
             peer_sees_closed(&mut peer),
             "Drop must close the descriptor"
         );
-        // Exactly once: the number is gone, so an explicit close afterwards is `EBADF` (a
-        // second, accidental close by `Drop` would have reported the same — what proves it did
-        // not happen is that the peer was closed by the first, and that `Drop` cannot run twice).
-        assert_eq!(
-            errno(&close_fd(fd).expect_err("already closed")),
-            Some(libc::EBADF)
-        );
+        // Exactly once: `Drop` runs once (the handle is consumed by it, never cloned), and the
+        // single `close(2)` it made is what the peer observed above. A second `close(2)` cannot be
+        // asked for: the number is free for another test to allocate, so re-closing it would close
+        // that test's descriptor instead (see the module docs).
     }
 
     #[test]
@@ -324,27 +341,20 @@ mod tests {
             "Debug shows it"
         );
 
+        // `close(self)` takes the handle by value, so a second close of *this* owner is not
+        // expressible; the release itself is observed through the peer.
         owned.close().expect("the explicit close succeeds");
         assert!(peer_sees_closed(&mut peer), "the descriptor is gone");
-        // No second close happened behind our back: the number is free, and the next `close(2)`
-        // on it is the honest `EBADF` a re-close always reports.
-        assert_eq!(
-            errno(&close_fd(fd).expect_err("already closed")),
-            Some(libc::EBADF)
-        );
     }
 
     #[test]
     fn a_negative_descriptor_is_a_badarg_rather_than_a_wrapped_handle() {
         assert!(matches!(OwnedFd::from_raw(-1), Err(BeamError::BadArg)));
         // The value is not probed otherwise: ownership is a caller contract, so a plausible
-        // number is accepted and its close reports whatever the kernel says.
-        let (fd, _peer) = pair();
-        close_fd(fd).expect("close the descriptor first");
+        // number is accepted, and closing it really releases the descriptor it names.
+        let (fd, mut peer) = pair();
         let owned = OwnedFd::from_raw(fd).expect("ownership is a caller contract");
-        assert_eq!(
-            errno(&owned.close().expect_err("a closed number is EBADF")),
-            Some(libc::EBADF)
-        );
+        owned.close().expect("the accepted number closes once");
+        assert!(peer_sees_closed(&mut peer), "that close released the fd");
     }
 }

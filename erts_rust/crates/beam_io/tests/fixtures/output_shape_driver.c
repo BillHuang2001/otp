@@ -60,9 +60,22 @@
  * ## The callback log
  *
  * `start(port, command)` parses `log=<path>` out of the whitespace/comma separated command
- * string; when it is present every callback appends its lines to that file (append mode, one
- * `fopen`/`fprintf`/`fclose` per line so the lines never interleave). With no `log=` token no
- * file is ever touched.
+ * string; when it is an **absolute** path every callback appends its lines to that file (append
+ * mode, one `fopen`/`fprintf`/`fclose` per line so the lines never interleave). With no `log=`
+ * token, or a relative one, no file is ever touched — the only path this fixture may ever write is
+ * the one its caller named, never one relative to the process's working directory.
+ *
+ * ## Why the per-port state is never freed
+ *
+ * `driver_failure*`/`driver_exit` tear the port down **synchronously, from inside the call**
+ * (`driver_failure_term`, `io.c:7196-7280`, runs the driver's `stop` itself), and the post-failure
+ * rows (`13`, `14`) make one more `driver_output*` and log its return code *after* that. A `stop`
+ * that freed the per-port state would therefore have the next `log_call` read freed memory, and
+ * since the log path is the first thing it reads, the write would name a file built from whatever
+ * bytes the allocator left in that block — created relative to the process's working directory
+ * (measured: a `HX\025l\216W`-style name, one per leaked row). The state is consequently allocated
+ * in `start` and deliberately **never freed**: the process this fixture runs in ends with the test,
+ * and a well-defined write through a live path is worth 600 bytes of test-process memory.
  *
  * ## The failure rows and the port owner
  *
@@ -83,17 +96,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Private per-port state, allocated in `start` and freed in `stop`. */
+/* Private per-port state, allocated in `start` and intentionally **never freed** (see the file
+ * header: a post-failure callback still logs through it after `stop` has run). */
 typedef struct {
     ErlDrvPort port; /* the handle `output` needs (it gets no port argument) */
-    char log[512];   /* path every callback appends its lines to ("" when none) */
+    char log[512];   /* absolute path every callback appends its lines to ("" when none) */
 } shape_state;
 
-/* Append `text` as one line to the per-port log file, if the command asked for one. */
+/* Append `text` as one line to the per-port log file, if the command asked for one.
+ *
+ * Only an absolute `log=` path is honoured, so nothing this fixture ever writes can land relative
+ * to the process's working directory — the integration test runs `escript` from its own cwd, which
+ * is where a stray write would otherwise appear. */
 static void log_line(const shape_state *st, const char *text) {
     FILE *f;
 
-    if (st == NULL || st->log[0] == '\0')
+    if (st == NULL || st->log[0] != '/')
         return;
     f = fopen(st->log, "a");
     if (f == NULL)
@@ -156,7 +174,10 @@ static void shape_stop(ErlDrvData drv_data) {
     if (st == NULL)
         return;
     log_line(st, "stop");
-    driver_free(drv_data);
+    /* No `driver_free` here, on purpose: the C runs this `stop` from **inside**
+     * `driver_failure*`/`driver_exit` (`io.c:7196-7280`), and the post-failure rows make one more
+     * `driver_output*` — with its `log_call` — after it returns. Freeing would hand that write a
+     * dangling log path. See the file header. */
 }
 
 /* The scripted `driver_output*`/`driver_failure*` calls the command byte names — see the file

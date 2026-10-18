@@ -444,8 +444,9 @@ pub fn await_log_line(path: &Path, wanted: &str, timeout: Duration) -> Vec<Strin
     }
 }
 
-/// A socket-pair descriptor a driver has been told to `driver_select`, kept **alive** (both ends
-/// owned, not just their numbers) for the whole test that owns it.
+/// One fixture port's whole test-side setup: the scratch log path its `log=<path>` argument points
+/// at, the `fd=<n> log=<path>` command string, and the socket pair whose read end is the descriptor
+/// the fixture `driver_select`s.
 ///
 /// The read end of a socket pair stands in for the descriptor a driver would select on, and it is
 /// non-blocking for the same reason the `ready_input` tests need it (the fixture's `ready_input`
@@ -454,8 +455,16 @@ pub fn await_log_line(path: &Path, wanted: &str, timeout: Duration) -> Vec<Strin
 /// thread's short-lived descriptor recycle that number while the driver calls
 /// `driver_select`/`select(2)` on it, which is `EBADF` under the parallel test runner. This value
 /// must be held for the duration of the test.
+///
+/// It also **owns the log path's lifetime**: the scratch directory is created here and removed by
+/// [`Drop`], so the only file a round can write is one the test itself cleans up afterwards. Every
+/// log read (`log_lines`/`await_log_line`/`settle_log`) must therefore happen while the value is
+/// alive, which is what every test does (the log is read before the port value goes out of scope).
 pub struct LoggedPort {
-    /// The scratch log path the fixture's `log=<path>` argument points at.
+    /// The scratch directory holding [`LoggedPort::log`], removed when this value drops.
+    dir: PathBuf,
+    /// The scratch log path the fixture's `log=<path>` argument points at (absolute: the fixture
+    /// honours only absolute paths, so nothing it writes can land in the process's cwd).
     pub log: PathBuf,
     /// The `fd=<n> log=<path>` command string the port is started with.
     pub command: String,
@@ -465,12 +474,25 @@ pub struct LoggedPort {
     pub _write_end: std::os::unix::net::UnixStream,
 }
 
+impl Drop for LoggedPort {
+    fn drop(&mut self) {
+        // Best effort: a teardown problem leaves a scratch directory behind, it must never turn a
+        // finished assertion into a panic (a panic in `drop` during an unwinding test aborts).
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// A fresh scratch log path (the directory is created so the fixture's append can succeed) bundled
 /// with the command string and the still-open, non-blocking descriptor to select on.
 pub fn logged_port_command(stem: &str) -> LoggedPort {
     let dir = scratch_dir(stem);
     std::fs::create_dir_all(&dir).expect("a scratch dir is creatable");
     let log = dir.join("events.log");
+    assert!(
+        log.is_absolute(),
+        "the fixture only honours an absolute `log=` path, got {}",
+        log.display()
+    );
     let (read_end, write_end) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
     read_end
         .set_nonblocking(true)
@@ -478,6 +500,7 @@ pub fn logged_port_command(stem: &str) -> LoggedPort {
     let fd = read_end.as_raw_fd();
     let command = format!("fd={fd} log={}", log.display());
     LoggedPort {
+        dir,
         log,
         command,
         _read_end: read_end,

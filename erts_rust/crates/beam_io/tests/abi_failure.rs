@@ -644,12 +644,183 @@ fn a_delivery_after_a_failure_answers_the_c_zero_and_reaches_nobody() {
     }
 }
 
+/// No callback of this fixture may ever write outside the `log=` path it was given — the guard for
+/// the leak class a freed log path produced.
+///
+/// The C runs a port's `stop` **synchronously inside** `driver_failure*`/`driver_exit`
+/// (`io.c:7196-7280`), and the post-failure rows (`13`, `14`) then make one more `driver_output*`
+/// whose `call=` line is logged *after* that. A fixture whose `stop` freed its per-port state made
+/// that write read freed memory, and since the log path is the first thing it reads, the file it
+/// created was named after whatever bytes the allocator had left there — measured at HEAD: a
+/// `HX\025l\216W`-style name (non-UTF-8) dropped into the process's working directory on every
+/// oracle run. The fixture now keeps its state for the process's lifetime (see its file header) and
+/// honours only absolute paths, so this test asserts both halves of the observable contract: the
+/// post-failure line lands in the file the command named, and the crate root — the working
+/// directory of this test binary — gains nothing at all.
+///
+/// The oracle-side half of the same guard is the empty-sandbox assertion in
+/// `the_rendered_rows_match_the_erl_oracle`, where the real runtime is the one running `stop`.
+#[test]
+fn a_failure_never_writes_outside_the_log_path_the_command_named() {
+    let Some(so) = shape_fixture_so() else {
+        return;
+    };
+
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let before = dir_entries(crate_root);
+
+    // Every opcode that closes the port from inside the callback, plus the two rows that make one
+    // more delivery afterwards (and so log after the port began to tear down).
+    let rows: [(u8, Option<&str>); 8] = [
+        (6, None),
+        (7, None),
+        (8, None),
+        (9, None),
+        (10, None),
+        (11, None),
+        (13, Some("call=driver_output2_after_failure rc=0")),
+        (14, Some("call=driver_output_after_failure rc=0")),
+    ];
+
+    for (op, post_failure_call) in rows {
+        let driven = drive(&so, op, None);
+        assert_eq!(
+            driven.log.first().map(String::as_str),
+            Some("start"),
+            "op {op}: the fixture logged its `start` through the path the command named"
+        );
+        if let Some(call) = post_failure_call {
+            let index = driven.log.iter().position(|line| line == call);
+            let Some(index) = index else {
+                panic!(
+                    "op {op}: the post-failure delivery must log `{call}` to the *same* file the \
+                     failure call logged to, so the path outlived the teardown; the log holds {:?}",
+                    driven.log
+                );
+            };
+            assert!(
+                driven.log.iter().skip(index + 1).any(|line| line == "stop"),
+                "op {op}: the post-failure line is logged before the ordinary close's `stop`, got \
+                 {:?}",
+                driven.log
+            );
+        }
+    }
+
+    assert_eq!(
+        dir_entries(crate_root),
+        before,
+        "a callback wrote outside the `log=` path it was given: a post-teardown write through a \
+         freed path buffer creates a file named after garbage bytes, in the process's working \
+         directory (this test binary's cwd is the crate root)"
+    );
+}
+
+/// A `log=` path that is not absolute is ignored outright, so the fixture can never write a file
+/// relative to the process's working directory — the other half of the `HX\025l\216W`-class guard
+/// (a garbage path buffer is essentially never absolute).
+#[test]
+fn a_relative_log_path_is_ignored() {
+    let Some(so) = shape_fixture_so() else {
+        return;
+    };
+
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let relative = format!("beam-io-relative-log-{}.log", std::process::id());
+    let stray = crate_root.join(&relative);
+    assert!(
+        !stray.exists(),
+        "the scratch name {relative} must not exist before the row runs"
+    );
+    let before = dir_entries(crate_root);
+
+    let (host, _state) = TestPortHost::new();
+    let (mut poller, mut registry, id) =
+        open_named_port(&so, DRIVER, &format!("log={relative}"), host);
+    registry
+        .port_command(&mut poller, id, &[0], PortCommandOptions::EMPTY)
+        .expect("the port accepts the command byte");
+    registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the port-task round runs");
+    registry.close(&mut poller, id).expect("the port closes");
+
+    assert!(
+        !stray.exists(),
+        "a relative `log=` path was honoured: the fixture created {}",
+        stray.display()
+    );
+    assert_eq!(
+        dir_entries(crate_root),
+        before,
+        "a relative `log=` path created an entry in the working directory"
+    );
+}
+
+/// The fixture must keep its per-port state for the process's lifetime: `driver_failure*` runs the
+/// port's `stop` *synchronously* (`io.c:7196-7280`) and the post-failure rows then log one more
+/// `call=` line, so a `driver_free` in `stop` reintroduces the use-after-free this fixture was fixed
+/// for.
+///
+/// This half is a **source** assertion because the defect is unobservable through the `Driver` seam:
+/// the crate's teardown runs `stop` *after* the callback has returned, so the dangling write only
+/// happens under the real runtime (the oracle sandbox in `the_rendered_rows_match_the_erl_oracle`
+/// is the dynamic half). Checking the one callback body that could free the state pins the invariant
+/// on both sides, cheaply and deterministically.
+#[test]
+fn the_shape_fixture_keeps_its_per_port_state_across_a_failure() {
+    let source = std::fs::read_to_string(shape_fixture_source())
+        .expect("the committed shape fixture is readable");
+    let body = shape_stop_body(&source);
+    assert!(
+        !strip_c_comments(body).contains("driver_free"),
+        "the fixture's `stop` must not free the per-port state: the C runs it from inside \
+         `driver_failure*`, and the post-failure `driver_output*` then logs through the freed \
+         state's path buffer (creating a file named after allocator garbage). Body was:\n{body}"
+    );
+}
+
+/// The body of the fixture's `shape_stop` callback: from its definition to the next column-0 `}`.
+fn shape_stop_body(source: &str) -> &str {
+    let start = source
+        .find("static void shape_stop")
+        .expect("the fixture defines a shape_stop callback");
+    let rest = &source[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("shape_stop is a complete function body");
+    &rest[..end]
+}
+
+/// `source` with its C comments removed, so a comment that merely *names* a call cannot satisfy (or
+/// trip) a check for that call.
+fn strip_c_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i = match source[i + 2..].find("*/") {
+                Some(end) => i + 2 + end + 2,
+                None => bytes.len(),
+            };
+        } else if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i = source[i..].find('\n').map_or(bytes.len(), |end| i + end);
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------------------------
 // The live oracle cross-check
 // ---------------------------------------------------------------------------------------------
-
 /// Runs the compiled fixture under the **system** Erlang and returns one `op rendering` line per
-/// scripted opcode.
+/// scripted opcode. The session runs with `cwd` as its working directory, so a callback that wrote
+/// outside the `log=` path it was given would leave its file there (the caller hands in an empty
+/// sandbox and asserts it stays empty — see `the_rendered_rows_match_the_erl_oracle`).
 ///
 /// The escript loads the object with `erl_ddll:load_driver/2`, opens one
 /// `open_port({spawn_driver, Name}, [binary])` per opcode, sends the opcode byte with
@@ -666,12 +837,17 @@ fn a_delivery_after_a_failure_answers_the_c_zero_and_reaches_nobody() {
 ///
 /// `is_list/1` is a *shallow* test (a cons whose tail is a binary answers `true`), so the
 /// proper/improper distinction is the walk, not the guard.
-fn oracle_stdout(script: &Path, so: &Path) -> Option<String> {
+fn oracle_stdout(script: &Path, so: &Path, cwd: &Path) -> Option<String> {
     let script = script.to_path_buf();
     let so = so.to_path_buf();
+    let cwd = cwd.to_path_buf();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let out = Command::new("escript").arg(&script).arg(&so).output();
+        let out = Command::new("escript")
+            .arg(&script)
+            .arg(&so)
+            .current_dir(&cwd)
+            .output();
         let _ = tx.send(out);
     });
 
@@ -841,6 +1017,27 @@ fn parse_oracle_rows(stdout: &str) -> Vec<(u8, String)> {
         .collect()
 }
 
+/// The names of the entries directly inside `dir`, sorted (a file-name listing, never a recursive
+/// walk: only a *new* entry in the directory is interesting).
+///
+/// A non-UTF-8 name is rendered lossily, which is the point here: the leak this guards against
+/// created files whose names were raw allocator bytes (`HX\025l\216W`), and a `String`-only listing
+/// would have to skip exactly the names it is looking for.
+fn dir_entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("the directory {} is listable: {err}", dir.display()))
+        .map(|entry| {
+            entry
+                .expect("a readable directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Writes the oracle escript into a fresh scratch directory and answers its path.
 fn write_oracle_escript() -> PathBuf {
     let dir = support::scratch_dir("abi-failure-oracle");
@@ -892,7 +1089,22 @@ fn the_rendered_rows_match_the_erl_oracle() {
     }
 
     let script = write_oracle_escript();
-    let Some(stdout) = oracle_stdout(&script, &so) else {
+    // The oracle session runs from an **empty** sandbox, and it must still be empty afterwards: the
+    // fixture may only ever write the `log=` path a caller named, never a path of its own. That is
+    // the regression guard for the class this fixture used to leak — a post-`stop` `log_call` (the
+    // C runs `stop` *inside* `driver_failure*`) reading a freed path buffer and creating a file
+    // named after whatever garbage bytes it found, in the process's working directory.
+    let sandbox = support::scratch_dir("abi-failure-oracle-cwd");
+    std::fs::create_dir_all(&sandbox).expect("a scratch working directory is creatable");
+    let stdout = oracle_stdout(&script, &so, &sandbox);
+    let stray = dir_entries(&sandbox);
+    let _ = std::fs::remove_dir_all(&sandbox);
+    assert!(
+        stray.is_empty(),
+        "the fixture wrote outside the `log=` path it was given: {stray:?} appeared in the oracle \
+         session's working directory"
+    );
+    let Some(stdout) = stdout else {
         return; // the oracle is unavailable; the skip was printed loudly above
     };
     let oracle_rows = parse_oracle_rows(&stdout);

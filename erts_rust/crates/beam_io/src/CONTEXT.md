@@ -159,14 +159,12 @@ completion, and each completion is reported exactly once.
   `PortRegistry::take_completions` in the round it ran. A drain deferred past a later
   `PortRegistry::open` that reused the number would report a stale completion under a live port's
   id (the `Closed` report's own rule is unchanged and documented on `PortRegistry::close`).
-- **The completion reason table is the crate's general errno table, not the socket one.**
-  `InetReason::atom_name` renders an errno through `error::errno_atom`, whose table is the
-  `fork`/`exec`/`access` set; the inet subtree's own broader socket table
-  (`drivers/inet/wire.rs`'s `errno_name`, `econnreset`, `enotconn`, `eaddrnotavail`, …) is
-  `pub(super)` there. A socket-only errno therefore renders as the C's `errno_<N>` fallback rather
-  than its POSIX name today. Consolidating the two into one `pub(crate)` table in `error.rs` (and
-  having both call it) is the open refactor — a producer-side concern, so it belongs with the inet
-  driver's adoption of this channel.
+- **One errno table: `error::ERRNO_NAMES` (61 rows).** `InetReason::atom_name`,
+  `FailureReason::atom_name` and `drivers/inet/wire.rs::errno_name` all read it —
+  `error::errno_atom` is the `Option` form (unrecognised ⇒ `None`, never an invented atom),
+  `error::errno_name` the `[0] ++ Name` form with the C's `errno_<N>` fallback, and
+  `wire.rs::errno_name` is a `pub(super) use crate::error::errno_name;` re-export, not a second
+  table.
 
 ## Test Strategy
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
@@ -198,7 +196,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   close-does-not-flush rule, skipping **loudly** when `erl` is absent.
 - **The write path** is pinned hermetically (no `erl`, no child, no sleep) in
   `registry_reply_tests.rs` — a sibling module declared from `registry.rs` as
-  `#[cfg(test)] #[path = "registry_reply_tests.rs"] mod reply_tests;` so that 1960-line file does not
+  `#[cfg(test)] #[path = "registry_reply_tests.rs"] mod reply_tests;` so that 2184-line file does not
   grow: one `ram_file_drv` port, `port_command [1,0,0,0,3,97,98,99]` ⇒ **one**
   `execute_port_tasks` round reports exactly one `Data { read: ReadMessage::body_only([3,0,0,0,0]) }` with `output_len()`
   and `input_len()` back to `0` and no task left pending, a second round reports nothing; plus a
