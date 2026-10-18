@@ -1963,3 +1963,9 @@ mod opcode_tests_udp;
 mod stat_tests;
 #[cfg(test)]
 mod tests;
+
+/// The **length-framed** wire format the `erl`-oracle dumps use (a 4-byte big-endian byte count
+/// per reply) — the Rust half of the framing the suites' oracle expressions write, so the two
+/// halves state the format in one place.
+#[cfg(test)]
+mod oracle_dump;
