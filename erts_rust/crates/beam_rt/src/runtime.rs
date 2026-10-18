@@ -127,6 +127,27 @@ fn term_heap_words(config: &RuntimeConfig) -> usize {
     }
 }
 
+/// The heap policy the runtime gives the processes it starts **for itself** — the `init` root,
+/// the `erl_prim_loader`/`file_server_2` service stand-ins and every server a boot script
+/// starts — for `config`.
+///
+/// It is the emulator's own policy ([`RuntimeConfig::heap_options`], so `+hms`/`+hmbs` and the
+/// `+hmax*` flag word all still apply) with the `+hmax` **size** deliberately left unbounded.
+///
+/// `+hmax N` is a per-**process** maximum heap size: it bounds the heap of a process running
+/// user code, which is why the oracle's own `+hmax 8192` cannot run a `code_server`. The
+/// processes the runtime starts for itself are not user code — a boot-time `code_server`
+/// needs more than 8192 words to answer a single `lists:reverse/1` — so the size is not handed
+/// to them: a small `+hmax` must not be able to kill the boot half-way. What it *does* bound
+/// is everything a user's code runs in: the `-eval`/`-s`/`-run` action process and every
+/// `erlang:spawn*` child ([`Runtime::default_spawn_policy`]), plus the runtime's internal
+/// term-construction heaps ([`term_heap_words`], so `tests/heap_limits.rs`'s
+/// `+hmax 1000000` still raises `error:system_limit`).
+fn system_spawn_policy(config: &RuntimeConfig) -> HeapPolicy {
+    let mut policy = config.heap.policy().clone();
+    policy.max_heap_words = 0;
+    policy
+}
 /// A process an `erlang:spawn*` created **from inside a scheduler slice**, waiting for the
 /// pass to register and enqueue it.
 ///
@@ -373,7 +394,18 @@ pub struct Runtime {
     cpu_clock: RefCell<beam_io::cpu_time::RuntimeClock>,
     /// Whether [`Runtime::boot`] has run.
     booted: bool,
-    /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
+    /// Whether a **boot script is being executed** right now.
+    ///
+    /// `+hmax` is a per-*process* maximum heap size — the heap of a process running *user*
+    /// code — so it must not be handed to the processes the runtime starts **for itself**
+    /// while it boots: the preloaded/boot-script system servers (`kernel_sup`, `code_server`,
+    /// `application_controller`, `logger_server`, …). Those are runtime infrastructure, not
+    /// user processes, and a small `+hmax` (8192 words, say) is smaller than a `code_server`
+    /// needs to serve a single `lists:reverse/1`. Bounding them made the boot die half-way and
+    /// — because the boot drive then finds nothing left that could wake its `{apply, …}`
+    /// directive — report the misleading `unsupported: … process blocked` capability gap
+    /// instead of a genuine runtime error (see [`Runtime::default_spawn_policy`]).
+    booting: bool,    /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
     pub(crate) halt: Option<i32>,
     /// The **sequential-tracing** state (contract A.8): the per-process trace tokens
     /// `erlang:seq_trace/2` maintains, the node-global serial clock a token's `Serial` is
@@ -440,25 +472,49 @@ pub struct Runtime {
     /// like [`Runtime::mailboxes`].
     pub(crate) async_dist: FastHashSet<ProcessId>,
     /// The pids that replaced their `max_heap_size` setting through
-    /// `erlang:process_flag(max_heap_size, …)` — the C's per-process
-    /// `MAX_HEAP_SIZE_GET(p)`/`MAX_HEAP_SIZE_FLAGS_GET(p)` pair (`bif.c:2148-2166`).
+    /// `erlang:process_flag(max_heap_size, …)` / `spawn_opt`'s `{max_heap_size, …}` — the C's
+    /// per-process `MAX_HEAP_SIZE_GET(p)`/`MAX_HEAP_SIZE_FLAGS_GET(p)` pair
+    /// (`bif.c:2148-2166`).
     ///
-    /// `beam_process::Process`/`beam_gc::AnyCollector` expose the heap policy a process was
-    /// **created** with but no setter, so (like [`Runtime::async_dist`]) the runtime keeps the
-    /// flag's value in its own per-pid store. It is the **one** source of truth every reader
-    /// shares: the `beam_bifs` `process_flag/2` bridge
-    /// ([`crate::context::process_bridge`]) writes it, and `erlang:process_info/2`'s
-    /// `max_heap_size` / `garbage_collection` items ([`crate::native::memory`]) read it. A pid
-    /// absent from the store reports the setting it was born with — the policy's
-    /// `max_heap_words` plus the emulator's `+hmax*` flags ([`crate::config::MaxHeapSetting`]).
+    /// The **value** lives on the process itself
+    /// ([`Process::max_heap_size`](beam_process::Process::max_heap_size), installed with
+    /// [`Process::set_max_heap_size`](beam_process::Process::set_max_heap_size)) and is what
+    /// the collection doors enforce. This set records only the *provenance*: a pid here has an
+    /// **explicit** setting, while a pid absent from it still reports the one it was born with
+    /// — the policy's `max_heap_words` plus the emulator's `+hmax*` flags
+    /// ([`crate::config::MaxHeapSetting`]) — which the PCB cannot distinguish from an explicit
+    /// `#{size => 0}` ("no upper bound", `erl_gc.c:3807-3822`).
+    ///
+    /// The `beam_bifs` `process_flag/2` bridge ([`crate::context::process_bridge`]) writes it,
+    /// the `spawn_opt` path writes it ([`crate::native::process`]) and
+    /// `erlang:process_info/2`'s `max_heap_size` / `garbage_collection` items
+    /// ([`crate::native::memory`]) read it.
     ///
     /// As with [`Runtime::group_leaders`], a terminated process leaves its entry behind,
     /// which is harmless: a pid's serial is bumped when its table slot is reused, so the stale
     /// key names no process that can ever be observed again.
     ///
-    /// Keyed by the whole [`ProcessId`] and only ever `get`/`insert`ed (never iterated), so it
-    /// probes with the crate's own [`FastHashMap`] over [`crate::hasher`].
-    pub(crate) max_heap: FastHashMap<ProcessId, MaxHeapSetting>,
+    /// Keyed by the whole [`ProcessId`] and only ever `contains`/`insert`ed (never iterated),
+    /// so it probes with the crate's own [`FastHashSet`] over [`crate::hasher`].
+    pub(crate) max_heap_set: FastHashSet<ProcessId>,
+    /// The pids whose last collection/growth decision **breached** their `max_heap_size` with
+    /// `kill => true`, waiting for the runner to terminate them with the bare atom `killed`
+    /// ([`Runtime::take_max_heap_kill`]).
+    ///
+    /// A collection door cannot terminate a process itself: it holds the process mutably and
+    /// the termination is the scheduler's (`ProcessTable::terminate` is what propagates the
+    /// exit to links and monitors). So the verdict is **latched** here — exactly as
+    /// `beam_process` latches it on the PCB — and drained by the runner at its next slice
+    /// boundary, which returns `RunOutcome::Exit(killed)` through the existing exit path.
+    ///
+    /// `kill` is **not** trappable by the victim (the reason is `killed`, not `kill`): the
+    /// runner exits the process directly, so no signal round-trip is involved and the victim's
+    /// own `trap_exit` flag never sees it. A linked peer or a monitor observes the ordinary
+    /// `terminate` propagation (`{'EXIT', Pid, killed}` / `'DOWN' … killed`).
+    ///
+    /// Keyed by the whole [`ProcessId`] and only ever `insert`/`remove`d, so it probes with the
+    /// crate's own [`FastHashSet`] over [`crate::hasher`].
+    pub(crate) max_heap_kill: FastHashSet<ProcessId>,
     /// The `{monitor_nodes, Options}` registrations of every process — the C's
     /// `ERTS_MON_TYPE_NODES` monitor chain (`dist.c:6754-6868`).
     ///
@@ -770,8 +826,7 @@ impl Runtime {
         // The runtime's own root process carries the emulator's default heap policy — the
         // same one `erlang:spawn` gives a child — so `process_info(Pid, min_heap_size | …)`
         // reports the oracle's figures for it too (see [`Runtime::default_spawn_policy`]).
-        let self_pid = processes.spawn(config.heap.policy().clone())?;
-        // The runtime's own root process stands in for OTP's `init`: it is the process the
+        let self_pid = processes.spawn(system_spawn_policy(&config))?;        // The runtime's own root process stands in for OTP's `init`: it is the process the
         // runtime boots and runs the start action as, and the one `erlang:group_leader/0`
         // already reports (`src/native/process.rs`). Registering the name is what makes
         // `erlang:whereis(init)` answer that live pid — the oracle answers `<0.0.0>` — and
@@ -805,8 +860,7 @@ impl Runtime {
         // so nothing in `bootstrap/bin/start.boot` registers the name and the registration is
         // valid on **every** route that builds a runtime. Only the `-version` action builds none
         // (it prints the banner and exits), so it never has a name registry to answer from.
-        let loader = processes.spawn(config.heap.policy().clone())?;
-        let loader_name = code_server.atoms_mut().intern("erl_prim_loader");
+        let loader = processes.spawn(system_spawn_policy(&config))?;        let loader_name = code_server.atoms_mut().intern("erl_prim_loader");
         processes.register(loader_name, loader).map_err(|_| {
             error::message("boot: the `erl_prim_loader` name is already registered")
         })?;
@@ -828,16 +882,15 @@ impl Runtime {
         let file_services = if config.drives_a_boot_script() {
             crate::native::file_server::FileServices::start_unclaimed(
                 &mut processes,
-                config.heap.policy().clone(),
+                system_spawn_policy(&config),
             )?
         } else {
             crate::native::file_server::FileServices::start(
                 &mut processes,
                 code_server.atoms_mut(),
-                config.heap.policy().clone(),
+                system_spawn_policy(&config),
             )?
-        };
-        // A zero-word heap can hold nothing, so the configured size is floored — and a
+        };        // A zero-word heap can hold nothing, so the configured size is floored — and a
         // `+hmax` the emulator was given is the ceiling (see `term_heap_words`).
         let heap_words = term_heap_words(&config);
         // A configured node name (`-name`/`-sname`) makes this a **distributed node**:
@@ -936,13 +989,14 @@ impl Runtime {
             io_counters,
             cpu_clock: RefCell::new(beam_io::cpu_time::RuntimeClock::new()),
             booted: false,
-            halt: None,
+            booting: false,            halt: None,
             seq_trace: SeqTrace::new(),
             refs: RefAllocator::new(),
             references: HashMap::new(),
             group_leaders: FastHashMap::default(),
             async_dist: FastHashSet::default(),
-            max_heap: FastHashMap::default(),
+            max_heap_set: FastHashSet::default(),
+            max_heap_kill: FastHashSet::default(),
             monitor_nodes: FastHashMap::default(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
@@ -1681,15 +1735,53 @@ impl Runtime {
         }
     }
 
-    /// `pid`'s own `max_heap_size` setting, or `None` when it still has the one it was born
-    /// with (see [`Runtime::max_heap`]).
-    pub(crate) fn max_heap_setting(&self, pid: ProcessId) -> Option<MaxHeapSetting> {
-        self.max_heap.get(&pid).copied()
+    /// Whether `pid` carries an **explicitly set** `max_heap_size` — the provenance bit behind
+    /// [`Runtime::max_heap_set`]. The setting's value is the process's own
+    /// ([`Process::max_heap_size`](beam_process::Process::max_heap_size)); a pid absent from the
+    /// set still reports the emulator's birth default, which is what
+    /// [`Runtime::birth_max_heap_setting`] names.
+    pub(crate) fn max_heap_was_set(&self, pid: ProcessId) -> bool {
+        self.max_heap_set.contains(&pid)
     }
-    /// Replaces `pid`'s `max_heap_size` setting — the store behind
-    /// `erlang:process_flag(max_heap_size, …)` (see [`Runtime::max_heap`]).
-    pub(crate) fn set_max_heap_setting(&mut self, pid: ProcessId, setting: MaxHeapSetting) {
-        self.max_heap.insert(pid, setting);
+    /// The `max_heap_size` setting a process that never called
+    /// `erlang:process_flag(max_heap_size, …)` reports: the emulator's `+hmax` bound (the heap
+    /// policy's `max_heap_words`) with the `+hmax*` flag word.
+    ///
+    /// `policy` is the **process's own** heap policy, so a `spawn_opt(…, [{max_heap_size,
+    /// N}])` child (whose bound is its explicit setting, not the policy) is unaffected, while a
+    /// process created under `+hmax N` still reports `N` — the value the oracle's
+    /// `process_info(P, max_heap_size)` answers.
+    pub(crate) fn birth_max_heap_setting(&self, policy: &beam_gc::HeapPolicy) -> MaxHeapSetting {
+        MaxHeapSetting {
+            size: policy.max_heap_words,
+            flags: self.config().heap_options().max_heap_flags(),
+        }
+    }
+    /// Records that `pid` now carries an explicit `max_heap_size` setting (see
+    /// [`Runtime::max_heap_set`]). The value itself is installed on the process with
+    /// [`Process::set_max_heap_size`](beam_process::Process::set_max_heap_size).
+    pub(crate) fn note_max_heap_set(&mut self, pid: ProcessId) {
+        self.max_heap_set.insert(pid);
+    }
+    /// Takes `pid`'s latched `max_heap_size` **kill** verdict — the drain the runner performs at
+    /// its slice boundary (see [`Runtime::max_heap_kill`]).
+    pub(crate) fn take_max_heap_kill(&mut self, pid: ProcessId) -> bool {
+        self.max_heap_kill.remove(&pid)
+    }
+    /// Latches `pid`'s `max_heap_size` **kill** verdict for the runner to perform (see
+    /// [`Runtime::max_heap_kill`]). Called by the collection doors' drain
+    /// ([`crate::context::gc::drain_max_heap_verdict`]), which hold the process mutably and
+    /// therefore cannot terminate it: termination is the scheduler's, so the notice waits for the
+    /// runner's next slice boundary.
+    ///
+    /// Answers `true` only when this call **newly** latched the verdict — the drain uses it to
+    /// emit the breach report once, exactly as the C does: `reached_max_heap_size` reports and then
+    /// returns the kill flag, so the oracle prints **one** report for a killing breach and dies in
+    /// that same collection (`erl_gc.c:3744-3803`, probed). Here the death is deferred to the slice
+    /// boundary, so a deferred kill can span several collections and would otherwise report at
+    /// each one.
+    pub(crate) fn note_max_heap_kill(&mut self, pid: ProcessId) -> bool {
+        self.max_heap_kill.insert(pid)
     }
     /// Registers one more `{monitor_nodes, Options}` monitor for `pid` under the option
     /// bitmask `key`, answering the **previous** reference count — the C's
@@ -1901,10 +1993,16 @@ impl Runtime {
         // the path, so `init:restart/0` can re-run the very script the system booted from.
         self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         self.boot_script_path = Some(path.as_ref().to_path_buf());
-        bootscript::execute(self, &script)?;
+        // While the script runs, every process it starts is a system server of this runtime,
+        // not user code: it gets the unbounded system heap policy (see
+        // [`Runtime::default_spawn_policy`]). Restored on every exit path, including a
+        // directive that raises.
+        self.booting = true;
+        let executed = bootscript::execute(self, &script);
+        self.booting = false;
+        executed?;
         Ok(script)
     }
-
     /// Reads the OTP **boot script** at `path` and executes it, **reporting the exact
     /// directive the boot stopped at** ([`crate::boot::bootscript::BootStop`]).
     ///
@@ -1942,9 +2040,13 @@ impl Runtime {
         };
         self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         self.boot_script_path = Some(path.as_ref().to_path_buf());
-        bootscript::execute_reporting(self, &script)
+        // Every process the script starts is a system server of this runtime, not user code —
+        // see [`Runtime::boot_from_script`] and [`Runtime::default_spawn_policy`].
+        self.booting = true;
+        let executed = bootscript::execute_reporting(self, &script);
+        self.booting = false;
+        executed
     }
-
     /// The path of the boot script this runtime has **loaded**, if any — the source of
     /// [`Runtime::restart`]'s re-run (and the file whose header `init:script_id/0` reports).
     ///
@@ -2137,10 +2239,20 @@ impl Runtime {
     /// (`erl_process.c:12242-12248`, `12567-12572`) — so both the runtime's root process
     /// and every plain `spawn*` child report the `min_heap_size` /
     /// `min_bin_vheap_size` / `fullsweep_after` / `max_heap_size` the oracle does.
+    ///
+    /// The one exception is a spawn **while a boot script is running**
+    /// ([`Runtime::booting`]): everything started there is the runtime's own system server
+    /// (`kernel_sup`, `code_server`, `application_controller`, `logger_server`, …), not user
+    /// code, so the `+hmax` **size** is not applied to it — see [`system_spawn_policy`] for
+    /// why a small `+hmax` must not be able to kill the boot. `+hms`/`+hmbs` and the
+    /// `+hmax*` flag word still apply (they pick the emulator's *defaults*, not a limit).
     pub(crate) fn default_spawn_policy(&self) -> HeapPolicy {
-        self.config.heap.policy().clone()
+        if self.booting {
+            system_spawn_policy(&self.config)
+        } else {
+            self.config.heap.policy().clone()
+        }
     }
-
     /// Opens the **spawn-argument** descent gate for a freshly created child.
     ///
     /// A child's *first* root set is the argument list a spawn path hands

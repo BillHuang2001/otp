@@ -50,33 +50,38 @@
 //!
 //! The families are the `udp/*` corpus surface `beam_io` reports (its
 //! `drivers/inet/opcode_tests_udp.rs::oracle_matrix` plus the option store): the bare
-//! (socket-less) refusals and fake addresses, the datagram lifecycle, the connected/peer half, the
-//! opcode-scope rules, the option store, the shared `inet_ctl` arms (`subscribe`, a pre-adoption
-//! `fdopen`, the `getservby*` name service, the `getopts` truncate-and-continue rule), the interface
-//! requests (`getiflist`/`ifget`/`ifset`/`getifaddrs`), and the `tcp_inet` bare refusals of the same
-//! bridge.
+//! (socket-less) refusals and fake addresses, the datagram lifecycle, the asynchronous receive
+//! slot, the connected/peer half, the opcode-scope rules, the option store, the shared `inet_ctl`
+//! arms (`subscribe`, a pre-adoption `fdopen`, the `getservby*` name service, the `getopts`
+//! truncate-and-continue rule), the interface requests (`getiflist`/`ifget`/`ifset`/`getifaddrs`),
+//! and the `tcp_inet` half of the same bridge: its bare refusals and the listening stream whose
+//! accept is still queued.
 //!
-//! # The residual tables
+//! # The residual table
 //!
 //! What this driver floor still answers differently from C ERTS is a **capability gap or a
-//! documented substitution**, never a wrong result, and lives in two tables:
+//! documented substitution**, never a wrong result:
 //!
-//! * [`the_documented_datagram_residuals_stay_typed`] — the rows reached on a `udp_inet` port,
-//!   asserted on **both** sides (the exact oracle output, so the record cannot rot, plus this
-//!   runtime's honest answer): the asynchronous `PACKET_REQ_RECV` op-id (served here as the
-//!   synchronous read-now substitution), `open` of a non-`AF_INET` family (this floor's own
-//!   `[0]eafnosupport` where the C creates the socket) and `INET_REQ_FDOPEN` on a port that already
-//!   holds a socket (this floor's `[0]einval` where the C adopts the operand's descriptor and leaks
-//!   the live socket).
-//! * [`the_residuals_no_oracle_column_can_pin_stay_typed`] — the shapes whose oracle reply depends on
-//!   a state the C only reaches through its asynchronous `accept`/`connect` protocol (`ignorefd`,
-//!   `tcp_sendfile`, which need a connected stream), so those rows are pinned on this runtime's side
-//!   alone — each asserted to be a typed capability gap naming the request, never a fabricated reply.
+//! [`the_documented_datagram_residuals_stay_typed`] — the rows reached on a `udp_inet` port,
+//! asserted on **both** sides (the exact oracle output, so the record cannot rot, plus this
+//! runtime's honest answer): `open` of a non-`AF_INET` family (this floor's own `[0]eafnosupport`
+//! where the C creates the socket) and `INET_REQ_FDOPEN` on a port that already holds a socket
+//! (this floor's `[0]einval` where the C adopts the operand's descriptor and leaks the live
+//! socket).
+//!
+//! The asynchronous `PACKET_REQ_RECV` op-id used to be the table's third row — served here as a
+//! synchronous read-now substitution, answering the bare `[1]` — until `beam_io` grew the async-op
+//! queue and the driver→owner completion channel. Both sides now answer
+//! `[1] ++ <<Id:16/big>>`, so the shape is an ordinary agreement row
+//! ([`the_datagram_async_receive_slot_matches_the_oracle`]). Its stream sibling
+//! ([`the_queued_accept_stream_matches_the_oracle`]) is pinned the same way: a queued
+//! `INET_REQ_ACCEPT` keeps the port a listener, and the rows read in that state — the
+//! `GETSTATUS` bit set and the two stream-only requests — agree with the oracle.
 //!
 //! # Layout
 //!
 //! The file is deliberately one **matrix**: a builder per port-state sequence, the shared
-//! [`Probe`]/[`Rule`]/[`Session`] comparison machinery, and the two residual tables, because every
+//! [`Probe`]/[`Rule`]/[`Session`] comparison machinery, and the residual table, because every
 //! sequence is read against the same vocabulary and against each other. It is a table, not a
 //! subsystem, so it is kept whole rather than split into sibling files; the capability-gate matrix
 //! over the same bridge is the sibling `control_capability_tests`.
@@ -562,6 +567,28 @@ fn datagram_lifecycle() -> Vec<Probe> {
     ]
 }
 
+/// The **asynchronous receive slot** on a fresh datagram socket: `PACKET_REQ_RECV`(60) with the
+/// C's full eight-byte `Timeout(4), Length(4)` operand joins the driver's async queue and answers
+/// `[1] ++ <<Id:16/big>>` (`inet_drv.c:15001`-`:15010`), the first operation on a fresh port taking
+/// id `0`; the datagram itself is delivered later as an `{inet_async, …}` message to the port's
+/// owner, which is `port_control/3`'s business only through that reply.
+///
+/// This row used to be the table's first residual — this floor read the socket *now* and answered
+/// the bare `[1]`, because no driver→owner path existed to carry the operation's result. The
+/// async queue and the completion channel removed that limitation, so the row is pinned against
+/// the oracle like every other agreement row.
+///
+/// Only the **first** operation is probed. A second one in the same session is not comparable: the
+/// oracle frees the slot as soon as the zero-timeout operation completes with `{error, timeout}`
+/// (between two `port_control/3` calls), while this runtime's driver advances at its pump points,
+/// so the two sides would be reading different queue states rather than different op ids.
+fn datagram_async_receive() -> Vec<Probe> {
+    vec![
+        Probe::exact("open_r", 1, vec![1, 2, 0]),
+        Probe::exact("recv_wellformed", 60, vec![0; 8]),
+    ]
+}
+
 /// The connected half: a real datagram `connect(2)` installs a default peer (no listener needed and
 /// nothing is sent), `SETPEER` overlays a *fake* peer that only `PEER` sees while `GETPADDRS` keeps
 /// reporting the real one, and the close leaves the driver's cached socket **kind** behind.
@@ -729,6 +756,46 @@ fn bare_stream() -> Vec<Probe> {
     ]
 }
 
+/// The **listening stream with its accept still queued** — the state the stream-only requests are
+/// reached in, and the replacement for the pre-async `INET_STATE_CONNECTED` row.
+///
+/// `INET_REQ_ACCEPT`(26) joins the driver's multi-operation accept list (`enq_multi_op`,
+/// `inet_drv.c:12194`) and answers `[1] ++ <<Id:16/big>>`; the connection it eventually takes is
+/// delivered to the port's **owner** as `{inet_async, Port, Id, {ok, Descriptor}}`, never installed
+/// as this port's own descriptor. The port therefore stays a listener: `INET_REQ_GETSTATUS`(16)
+/// reports the C's `INET_STATE_ACCEPTING` — `INET_STATE_LISTENING`(`9`) `|` `INET_F_ACC`(`0x20`),
+/// `inet_drv.c:1031`, read out at `:11160` — `[1,0,0,0,41]` — and the two stream-only requests
+/// probed on it (`INET_REQ_IGNOREFD`(28), `TCP_REQ_SENDFILE`(45)) answer the C's `[0]enotconn`,
+/// their `IS_CONNECTED` guard (`:11461`, `:12386`).
+///
+/// The accept's operand is a **two-second** timeout (`<<0,0,7,208>>`) rather than the C's "do not
+/// wait" zero: a zero makes the oracle's operation expire between two `port_control/3` calls and
+/// report the state *after* the queue drained (`[1,0,0,0,9]`), which is a different row. Two
+/// seconds cannot expire inside this session, so both sides read the queue while it is non-empty.
+///
+/// This sequence used to be pinned on this runtime's side alone, as
+/// `INET_STATE_CONNECTED`(`[1,0,0,0,5]`) plus two typed capability gaps: the pre-async floor
+/// *substituted* a synchronous accept that took the connection here, so `ignorefd`/`sendfile`
+/// reached their "connected stream" arms. No `port_control/3`-only session can reach a connected
+/// stream on either runtime — a peer pending when the driver's round runs completes the C's accept
+/// but still leaves the port listening (`[1,0,0,0,9]`, measured) — so the connected-stream
+/// capability gaps of those two requests belong to `beam_io`, whose driver-seam suite pins them
+/// (`drivers/inet/opcode_tests.rs`, the `not_served` rows).
+fn queued_accept_stream() -> Vec<Probe> {
+    let mut sendfile = vec![0x7fu8, 0xff, 0xff, 0xff]; // an out-of-range file descriptor
+    sendfile.extend_from_slice(&0u64.to_be_bytes()); // offset
+    sendfile.extend_from_slice(&0u64.to_be_bytes()); // count
+    vec![
+        Probe::exact("open_l", 1, vec![1, 1, 0]),
+        Probe::req("bind_l", 6, vec![4, 0, 0], Rule::BoundPort),
+        Probe::exact("listen_l", 27, vec![0, 5]),
+        Probe::exact("accept_queued", 26, vec![0, 0, 7, 208]),
+        Probe::exact("getstatus_queued", 16, vec![]),
+        Probe::exact("ignorefd_queued", 28, vec![1]),
+        Probe::exact("tcp_sendfile_queued", 45, sendfile),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------
@@ -771,6 +838,14 @@ fn the_headline_numeric_shapes_answer_without_an_oracle() {
         session.control(udp, &Probe::exact("listen", 27, vec![])).render(),
         render_bytes(EXBADPORT)
     );
+    // `PACKET_REQ_RECV` allocates the queued operation's id — the row this suite used to record as
+    // the synchronous read-now substitution (the bare `[1]`, with no async queue to answer for).
+    assert_eq!(
+        session.control(udp, &Probe::exact("recv", 60, vec![0; 8])).render(),
+        "[1,0,0]",
+        "PACKET_REQ_RECV answers `[1] ++ <<Id:16/big>>`"
+    );
+
     // A bare (magic-less) operation never reaches `INET_REQ_OPEN`: the C's unsigned subtraction
     // wraps past every `case`, so the answer is the driver's `exbadport`.
     for code in [1u64, 8, 15, 24, 99] {
@@ -791,6 +866,33 @@ fn the_headline_numeric_shapes_answer_without_an_oracle() {
         session.control(tcp, &Probe::exact("getstatus", 16, vec![])).render(),
         "[1,0,0,0,0]"
     );
+    // A queued `INET_REQ_ACCEPT` on a listening stream: the operation gets an id and the port stays
+    // a **listener** (`INET_STATE_ACCEPTING`) — the state this suite used to read as
+    // `INET_STATE_CONNECTED` through the synchronous-accept substitution.
+    assert_eq!(
+        session.control(tcp, &Probe::exact("open", 1, vec![1, 1, 0])).render(),
+        "[1]"
+    );
+    let bound = session.control(tcp, &Probe::req("bind", 6, vec![4, 0, 0], Rule::BoundPort));
+    assert_eq!(
+        bound.bytes("bind").len(),
+        3,
+        "a bound stream reports `[1] ++ port_hi ++ port_lo`"
+    );
+    assert_eq!(
+        session.control(tcp, &Probe::exact("listen", 27, vec![0, 5])).render(),
+        "[1]"
+    );
+    assert_eq!(
+        session.control(tcp, &Probe::exact("accept", 26, vec![0, 0, 7, 208])).render(),
+        "[1,0,0]",
+        "INET_REQ_ACCEPT answers its async op id instead of taking the connection"
+    );
+    assert_eq!(
+        session.control(tcp, &Probe::exact("getstatus", 16, vec![])).render(),
+        "[1,0,0,0,41]",
+        "a listener with one queued accept reports INET_STATE_ACCEPTING, never INET_STATE_CONNECTED"
+    );
 }
 
 /// The bare (socket-less) datagram port, whole-session against the oracle.
@@ -805,6 +907,15 @@ fn the_datagram_lifecycle_and_address_shapes_match_the_oracle() {
     run_family("the `udp_inet` lifecycle", "udp_inet", &datagram_lifecycle());
 }
 
+/// The asynchronous receive slot: `PACKET_REQ_RECV`'s op id, which both runtimes allocate now.
+#[test]
+fn the_datagram_async_receive_slot_matches_the_oracle() {
+    run_family(
+        "the `udp_inet` async receive slot",
+        "udp_inet",
+        &datagram_async_receive(),
+    );
+}
 /// The connected/peer half and the post-close cached-kind residual.
 #[test]
 fn the_connected_datagram_half_matches_the_oracle() {
@@ -849,6 +960,16 @@ fn the_bare_stream_port_refusals_match_the_oracle() {
     run_family("the bare `tcp_inet` port", "tcp_inet", &bare_stream());
 }
 
+/// The listening stream with a queued accept: the op id the accept allocates, the state bits the
+/// queue reports, and the two stream-only requests probed in that state.
+#[test]
+fn the_queued_accept_stream_matches_the_oracle() {
+    run_family(
+        "the `tcp_inet` listening stream with a queued accept",
+        "tcp_inet",
+        &queued_accept_stream(),
+    );
+}
 // ---------------------------------------------------------------------------
 // The documented residuals
 // ---------------------------------------------------------------------------
@@ -884,12 +1005,8 @@ struct ResidualSession {
 /// The `udp` shapes this runtime answers differently, each a **capability gap or a documented
 /// substitution** on the driver side (`beam_io`), never a wrong result.
 ///
-/// All three rows are the floor's own, and none is a `beam_io` request that is merely unimplemented:
+/// Both rows are the floor's own, and neither is a `beam_io` request that is merely unimplemented:
 ///
-/// * `PACKET_REQ_RECV`(`60`) is the **synchronous read-now substitution**. The C enqueues an
-///   asynchronous operation and answers its op id (`[1] ++ async_id_be16`, measured `[1,0,0]`),
-///   delivering the datagram later as an `{inet_async, …}` message; with no driver→owner message
-///   path this floor reads now and answers the bare OK tag.
 /// * `open` of a **non-`AF_INET`** family: this floor's sockets are `AF_INET` only, so an
 ///   `AF_INET6` open is the driver's own `[0]eafnosupport` refusal, where the C creates the socket
 ///   and answers `[1]`. It is probed on a **bare** port: on the C the successful open leaves a
@@ -904,21 +1021,11 @@ struct ResidualSession {
 ///   that number happens to name), which no oracle column can pin. The descriptor word is `65535`,
 ///   the largest number the emulator admits (so the C's own `driver_select` stays silent on it) and
 ///   one no process running this test holds, so the adoption is side-effect free on both sides.
+///
+/// `PACKET_REQ_RECV`'s op id was the table's third row until the async-op queue landed; it is an
+/// agreement row now ([`datagram_async_receive`]).
 fn residual_sessions() -> Vec<ResidualSession> {
     vec![
-        ResidualSession {
-            what: "the open `udp_inet` port",
-            driver: "udp_inet",
-            setup: vec![Probe::exact("open", 1, vec![1, 2, 0])],
-            rows: vec![Residual {
-                probe: Probe::exact("recv_wellformed", 60, vec![0; 8]),
-                oracle: "[1,0,0]",
-                ours: &[1],
-                residual: "PACKET_REQ_RECV is the synchronous read-now substitution (the bare `[1]` \
-                           with no datagram pending) instead of the C's asynchronous \
-                           `[1] ++ async_id_be16`",
-            }],
-        },
         ResidualSession {
             what: "the bare `udp_inet` port",
             driver: "udp_inet",
@@ -1023,84 +1130,3 @@ fn run_residual_session(session: &ResidualSession) {
     }
 }
 
-/// Asserts `reply` is a typed capability gap naming `expected`, never a fabricated reply.
-fn assert_typed_gap(what: &str, reply: &Reply, expected: &str) {
-    match reply {
-        Reply::Gap(message) => assert!(
-            message.starts_with("error unsupported:") && message.contains(expected),
-            "{what}: expected a typed capability gap naming {expected}, got {message:?}"
-        ),
-        other => panic!(
-            "{what}: expected a typed capability gap, got {} — a residual must never be a \
-             fabricated reply",
-            other.render()
-        ),
-    }
-}
-
-/// The typed gaps whose oracle reply **no oracle column can pin**, asserted on this runtime's side
-/// alone.
-///
-/// Both rows name a state the C only reaches **asynchronously**. `INET_REQ_IGNOREFD`(`28`) and
-/// `TCP_REQ_SENDFILE`(`45`) are stream-only arms that first require a *connected* socket, and a
-/// `port_control`-only session cannot connect the oracle's driver: the C's `INET_REQ_ACCEPT`
-/// answers the async op id (measured `[1,0,0]`, then `[1,0,1]`) and leaves the driver `enotconn`,
-/// so `ignorefd` there is `[0]enotconn` rather than the `[1]` its body would return.
-///
-/// The C's own answers — `[1]` for both, once a stream is connected — are cited above; what is
-/// asserted here is that this floor answers a **typed capability gap naming the request**, never a
-/// fabricated `[1]`. Every other divergence of this bridge **is** oracle-pinned: see
-/// [`the_documented_datagram_residuals_stay_typed`].
-#[test]
-fn the_residuals_no_oracle_column_can_pin_stay_typed() {
-    let mut session = Session::new();
-
-    // `INET_REQ_IGNOREFD`/`TCP_REQ_SENDFILE` on a **connected** stream: open → bind → listen →
-    // accept, the accepted connection coming from a plain loopback client of this test.
-    let tcp = session.open("tcp_inet");
-    assert_eq!(
-        session
-            .control(tcp, &Probe::exact("tcp_open", 1, vec![1, 1, 0]))
-            .render(),
-        "[1]",
-        "the stream session needs the socket `INET_REQ_OPEN` creates"
-    );
-    let bound = session.control(tcp, &Probe::req("tcp_bind", 6, vec![4, 0, 0], Rule::BoundPort));
-    let bytes = bound.bytes("tcp_bind");
-    let bound_port = u16::from_be_bytes([bytes[1], bytes[2]]);
-    assert_eq!(
-        session
-            .control(tcp, &Probe::exact("tcp_listen", 27, vec![0, 5]))
-            .render(),
-        "[1]",
-        "the stream session needs a listening socket"
-    );
-    let _client = std::net::TcpStream::connect(("127.0.0.1", bound_port))
-        .expect("a loopback client for the listening port");
-    let accepted = session.control(tcp, &Probe::exact("accept", 26, vec![0, 0, 0, 0]));
-    assert_eq!(
-        accepted.bytes("accept")[0],
-        1,
-        "`INET_REQ_ACCEPT` takes the queued connection"
-    );
-    assert_eq!(
-        session
-            .control(tcp, &Probe::exact("getstatus", 16, vec![]))
-            .render(),
-        "[1,0,0,0,5]",
-        "the port reports the C's connected state (INET_STATE_CONNECTED, 5)"
-    );
-    assert_typed_gap(
-        "INET_REQ_IGNOREFD on a connected stream",
-        &session.control(tcp, &Probe::exact("ignorefd_stream", 28, vec![1])),
-        "`ignorefd`",
-    );
-    let mut sendfile = vec![0x7fu8, 0xff, 0xff, 0xff]; // an out-of-range file descriptor
-    sendfile.extend_from_slice(&0u64.to_be_bytes()); // offset
-    sendfile.extend_from_slice(&0u64.to_be_bytes()); // count
-    assert_typed_gap(
-        "TCP_REQ_SENDFILE on a connected stream",
-        &session.control(tcp, &Probe::exact("tcp_sendfile_stream", 45, sendfile)),
-        "`tcp_sendfile`",
-    );
-}

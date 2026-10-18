@@ -63,7 +63,8 @@ Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle
 
 `tests/compile_file.rs::a_scheduled_process_parses_a_source_file_like_the_oracle` drives the
 `epp:parse_file/3` read path from a **scheduled `run`** process, which is the route on which a
-delivery-driven collection of the parked receiver used to corrupt its live scan options:
+delivery-driven collection of the parked receiver is declined by the runner's park-window
+relocation exemption instead of moving the receiver's live scan options:
 
 * `epp_forms.erl` is the **driver**: `go/1` takes the input source file as a char list, runs
   `epp:parse_file(File, [], [])` and answers `{length(Forms), [element(1, F) || F <- Forms]}` — a
@@ -457,19 +458,21 @@ These eight are committed oracle fixtures for the process-heap collector
   §6.7 grew roughly linearly), and the deterministic companion asserts
   `Runtime::gc_stats().collections > 0` for a scheduled run.
 
-* `vp.beam` — the **unscanned-root valve** witness (`tests/foreign_root_loop.rs`): `hold/1`
-  keeps the 3-tuple `erlang:statistics(garbage_collection)` returns — a `RuntimeHooks`-served
-  BIF's result, so it lives on the pooled BIF heap, a region the collector does not scan — as
-  its own accumulator for a whole loop, and `control/1` is the same loop reading only
-  `element(1, ...)` (a small integer, so no foreign container is ever a root). Both throw away a
-  fresh runtime-valued `junk/1` term per iteration, which is what gives the loop a
-  heap-admission point at all. The tuple's three elements are small integers, so it forwards no
-  word a relocation would follow or update: it is **inert**, so the loop must keep collecting
-  (`collections == N / 17` — 13 words of `junk` per iteration against a 233-word nursery), its
-  `heap_size` must stay on the collector's geometry plateau, and `hold` must be
-  indistinguishable from `control`. With the pre-rework "any foreign container is a hazard"
-  classification the same fixture reports **0** collections and a heap that grows linearly with
-  `N` (121 387 / 318 037 / 2 032 432 words at N = 5 000 / 10 000 / 100 000).
+* `vp.beam` — the **copy-out fill-law** witness (`tests/foreign_root_loop.rs`): `hold/1`
+  keeps the 3-tuple `erlang:statistics(garbage_collection)` returns — a registered BIF's
+  result, which the copy-out puts on the process's own **scanned** young heap, so a collection
+  relocates it like any other heap object — as its own accumulator for a whole loop, and
+  `control/1` is the same loop reading only `element(1, ...)` (a small integer, so no container
+  is ever a root). Both throw away a fresh runtime-valued `junk/1` term per iteration, which is
+  what gives the loop a heap-admission point at all. Heap use is **17 words per iteration** — 13
+  for `junk/1` plus 4 for the `{Collections, WordsReclaimed, 0}` tuple (1 header + 3 small
+  integers) — so one 233-word nursery space holds **13** iterations and the first collection
+  lands at **iteration 8**. The law is the exact floor `(N + 4) / 13` with a measured surplus of
+  at most **1** (601 consecutive rows `N = 0 … 600`, one fresh runtime each, plus a wide ladder to
+  `N = 1 000 000`); `major` sits in a measured **32…37** minors-per-major band because the held
+  tuple is promoted on every minor. `heap_size` stays on the collector's geometry plateau and
+  `hold` is otherwise indistinguishable from `control`. `vp.erl`'s comment-only rewrite
+  regenerates a **byte-identical** `vp.beam` (md5 `9802066cd17933629b1279484cf7a66c`).
 All eight are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
 
 ```sh

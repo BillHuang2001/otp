@@ -4,12 +4,10 @@ Sibling-owned dossier for the A.9 **scheduled (`run`) route** — the two differ
 `selfhost/in_process_compile_file_no_spawn_deterministic` (E0:
 `compile:file(Source, [no_spawn_compiler_process, deterministic, {outdir, Dir}])`) and
 `selfhost/scheduled_process_compile_file_deterministic` (the default shape through `compile:file/2`'s
-own compiler process). Both **agree** with the oracle on both execution tiers; the corpus is
-`total=1868 agree=1866 mismatch=0 unsupported=2`. Present state, not a history. The current picture:
-the `beam_process` signal-driven collection site that would relocate a woken monitor watcher's heap
-against an incomplete root set is **declined by the host collection gate** the `ptab.rs` signal sites
-consult (`beam_rt`'s `RuntimeCollectionGate`), with the runner's park-window relocation exemption as
-the complementary mitigation.
+own compiler process).
+The gate is authoritative and re-run, never quoted here: both cases agree with the oracle on both execution tiers — each prints `1` and exits 0.
+Present state, not a history.
+The current picture: the `beam_process` signal-driven collection site that would relocate a woken monitor watcher's heap against an incomplete root set is **declined by the host collection gate** the `ptab.rs` signal sites consult (`beam_rt`'s `RuntimeCollectionGate`), with the runner's park-window relocation exemption as the complementary mitigation.
 
 ## 1. The pinned mover — the monitor-DOWN branch of the process-termination cascade
 A heap-move trace that watches the **mature base** (not only the nursery) pins the move to the
@@ -77,6 +75,13 @@ The regression is `tests/compile_file.rs::a_scheduled_process_compiles_a_source_
 The seam is pinned by
 `context::tests::the_installed_gate_declines_a_signal_driven_relocation_of_a_foreign_reachable_receiver`
 and `runner::tests::a_parked_process_stays_relocation_exempt_for_its_parked_window`.
+
+**The durable invariant behind the E0 shape.** A registered BIF's container result is never left on the recyclable pooled BIF heap while running Erlang code can store it in a heap object.
+On a process route the copy-out moves such a result onto the process's own **scanned young heap**, where the engine's ordinary root set already publishes it (it lands in `x(0)` on return) and a later collection relocates it like any other heap object.
+The pool rewind that follows stays gated on `safe_to_rewind`: only a call the six escaping `DispatchHooks` seams and reentrancy cannot have run on, with an `Ok` result, is rewound to its own start offset.
+A graph that holds a reference is neither moved nor rewound — a reference's identity is its address.
+The table-less `-eval` route keeps the older gated move: it has no collector, so the copy lands on the pointer-stable, never-reset runtime store (`Runtime::eval_heap` + `Runtime::eval_off_heap`) instead of an object a collection would relocate.
+The invariant is [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md)'s and [`src/context/calls.rs`](src/context/calls.rs) implements it.
 
 ## 4. Where the refusal lives
 `crates/beam_process/src/ptab.rs` owns the seam: `ProcessTable::set_collection_gate` /

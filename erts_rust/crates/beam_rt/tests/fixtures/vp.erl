@@ -1,19 +1,19 @@
-%% The unscanned-root valve's end-to-end witness (`tests/foreign_root_loop.rs`).
+%% The BIF-result copy-out's end-to-end witness (`tests/foreign_root_loop.rs`).
 %%
-%% `hold/1` keeps the 3-tuple `erlang:statistics(garbage_collection)` returns live as its
-%% own accumulator for the whole loop. That tuple is built by a `RuntimeHooks`-served BIF, so
-%% it lives on the pooled BIF heap — a region the copying collector does not scan — and is
-%% therefore the foreign container the valve has to classify at every heap-admission point
-%% the loop reaches. Its three elements are small integers, so it forwards **no** word a
-%% relocation would have to follow or update: it is inert, and the loop must keep collecting.
+%% `hold/1` keeps the 3-tuple `erlang:statistics(garbage_collection)` returns live as its own
+%% accumulator throughout. The copy-out moves an `Ok` container result onto the **running
+%% process's own young heap** (`src/context/calls.rs::call_registered`), so the loop allocates
+%% the tuple's 4 words (header + 3 small integers) here every iteration: 13 words of `junk` +
+%% 4 = 17 per iteration against a 233-word nursery, i.e. one collection every 13 iterations.
+%% The tuple is an ordinary scanned root: the loop must keep collecting at that fill law.
 %%
 %% `junk/1` is what gives each iteration a heap-admission point at all: it builds a fresh
-%% 401-word-block-free but genuinely heap-resident term (a 3-tuple holding a 3-element list
-%% and a 2-tuple) out of the runtime value `N`, and the loop throws it away. It is an
-%% argument of the tail call, so no compiler pass can discard it.
+%% heap-resident term (a 3-tuple holding a 3-element list and a 2-tuple) out of the runtime
+%% value `N`, and the loop throws it away. It is an argument of the tail call, so no compiler
+%% pass can discard it.
 %%
-%% `control/1` is the same loop reading only `element(1, ...)` — a small integer — so no
-%% foreign container is ever a root. It is the baseline the `hold/1` counts are read against.
+%% `control/1` is the same loop reading only `element(1, ...)` — a small integer — so it pays
+%% the same copy-out but retains no container: identical collections, far fewer fullsweeps.
 -module(vp).
 
 -export([hold/1, control/1]).

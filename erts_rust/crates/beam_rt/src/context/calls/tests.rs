@@ -500,6 +500,117 @@ fn a_refused_copy_out_leaves_the_pooled_bif_heap_unrewound() {
     );
 }
 
+/// The frozen M1 internal-reference block (`[make_header(3, REF_SUBTAG), 0, 0, id]` — exactly what
+/// [`beam_term::boxed::write_internal_ref`] writes) for `id`, through the safe initialised-prefix
+/// view ([`beam_alloc::Heap::used_words_mut`]) the way [`off_heap_container`] writes its header, so
+/// this crate's `#![deny(unsafe_code)]` holds.
+fn internal_reference(heap: &mut beam_alloc::Heap, id: i64) -> Eterm {
+    let words = beam_term::prelude::INTERNAL_REF_WORDS;
+    heap.tuple(&vec![beam_term::prelude::NIL; words - 1])
+        .expect("the reference's words fit");
+    let base = {
+        let block = heap.used_words_mut();
+        assert_eq!(
+            block.len(),
+            words,
+            "the reference block is the whole used prefix"
+        );
+        block[0] = beam_term::prelude::make_header(words - 1, beam_term::prelude::REF_SUBTAG);
+        block[1] = make_small(0); // node: the local node
+        block[2] = make_small(0); // serial: one id space in M1
+        block[3] = make_small(id); // id
+        block.as_mut_ptr()
+    };
+    beam_term::prelude::make_boxed(base)
+}
+
+/// **The copy-out's reference walk never dereferences a word that is not a readable term.**
+///
+/// The frozen tag predicates are the C's own bit tricks: `is_boxed` is `(x & 0x1) == 0` and
+/// `is_list` is `(x & 0x2) == 0`, so **both** accept every `HEADER`-tagged word — the words that
+/// are not terms at all. The C ABI's `THE_NON_VALUE` (`make_header(0, 0)`) is one, and its pointer
+/// is `NULL`, so an unguarded walk aborts the whole test binary with `null pointer dereference
+/// occurred`; [`refused_result`] above is a registered BIF that returns exactly that word. Every
+/// other unreadable word is skipped the same way: a bare header naming a non-zero aligned
+/// "address", an immediate, `NIL`, and a `LIST`-tagged word whose cell pointer is `NULL`.
+///
+/// The positive controls keep the reference finding itself honest: the walk still **finds** a
+/// reference at the root, one level down a tuple, in a cons cell's car and through a nested
+/// container, so the guards above reject only words that are not readable terms.
+#[test]
+fn the_reference_walk_skips_words_that_are_not_readable_terms() {
+    let mut heap = beam_alloc::Heap::new(64).expect("the term heap");
+    // `THE_NON_VALUE`: not a term word, yet both frozen container tricks accept it.
+    let the_non_value = make_header(0, 0);
+    assert!(
+        beam_term::prelude::is_boxed(the_non_value) && beam_term::prelude::is_list(the_non_value),
+        "the frozen bit tricks cannot tell the non-value from a container"
+    );
+    assert!(!beam_term::tag::is_term_word(the_non_value));
+    assert!(
+        !RuntimeContext::graph_holds_reference(the_non_value),
+        "the non-value is skipped, never dereferenced"
+    );
+    // A bare header word: `HEADER`-tagged, so `boxed_val` names a plausible non-zero, aligned
+    // address that belongs to nothing.
+    assert!(
+        !RuntimeContext::graph_holds_reference(make_header(3, 0)),
+        "a bare header word is skipped, never dereferenced"
+    );
+    // A `LIST`-tagged word whose cell pointer is `NULL`.
+    assert_eq!(beam_term::list::ptr_val(Eterm::from_raw(1)) as usize, 0);
+    assert!(
+        !RuntimeContext::graph_holds_reference(Eterm::from_raw(1)),
+        "a list word with a NULL cell pointer is skipped, never dereferenced"
+    );
+    // An immediate and `NIL` are neither boxed nor cons cells.
+    assert!(!RuntimeContext::graph_holds_reference(make_small(7)));
+    assert!(!RuntimeContext::graph_holds_reference(
+        beam_term::prelude::NIL
+    ));
+    // A real container of immediates holds no reference at all …
+    let tuple = heap
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("a 2-tuple of immediates");
+    assert!(!RuntimeContext::graph_holds_reference(tuple));
+    // … and a non-term word *inside* a real container is skipped when the walk reaches it.
+    let cons = heap
+        .cons(make_small(1), the_non_value)
+        .expect("a cons cell over the non-value");
+    assert!(
+        !RuntimeContext::graph_holds_reference(cons),
+        "an unreadable child contributes no reference finding"
+    );
+    // The positive controls: the findings the walk exists for are unchanged.
+    let mut ref_heap = beam_alloc::Heap::new(64).expect("the reference heap");
+    let reference = internal_reference(&mut ref_heap, 7);
+    assert!(
+        RuntimeContext::graph_holds_reference(reference),
+        "the reference block itself is a reference"
+    );
+    let tuple_over_ref = ref_heap
+        .tuple(&[make_small(4), reference])
+        .expect("a tuple over the reference");
+    assert!(
+        RuntimeContext::graph_holds_reference(tuple_over_ref),
+        "a reference one level down a tuple is found"
+    );
+    let cons_over_ref = ref_heap
+        .cons(reference, beam_term::prelude::NIL)
+        .expect("a cons over the reference");
+    assert!(
+        RuntimeContext::graph_holds_reference(cons_over_ref),
+        "a reference in a cons cell's car is found"
+    );
+    let nested = ref_heap
+        .tuple(&[tuple_over_ref])
+        .expect("a tuple over the reference-holding tuple");
+    assert!(
+        RuntimeContext::graph_holds_reference(nested),
+        "a reference found through a nested container is found"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // The table-less (`-eval`) route's pooled BIF heap — counters first.
 //

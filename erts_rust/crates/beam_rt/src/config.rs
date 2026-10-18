@@ -67,61 +67,17 @@ pub type EmulatorConfig = beam_common::RuntimeConfig;
 /// `beam_rt -noshell -eval 'halt().'` peak RSS is unchanged (~17.8 MB).
 pub const DEFAULT_HEAP_WORDS: usize = 1 << 24;
 
-/// The `+hmax*` boolean flags — the C `H_MAX_FLAGS` word (`erl_init.c:814-815`,
-/// `erl_init.c:1592-1624`).
+/// The `+hmax*` boolean flags and the per-process `max_heap_size` **setting** are owned by
+/// [`beam_process`], the crate that stores one setting per PCB and decides the exceed verdict
+/// (`beam_process::max_heap::MaxHeapFlags`/`MaxHeapSetting`). They are re-exported here
+/// because `beam_rt`'s heap options, CLI parsing and introspection items are this crate's
+/// readers of them (and because `crate::config::MaxHeapSetting` is the path the existing
+/// importers use) — the *policy* is not restated, so the two sides cannot drift.
 ///
-/// They only change the flag **map** `erlang:process_info(Pid, garbage_collection)`
-/// reports for the `max_heap_size` item, not the limit itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MaxHeapFlags {
-    /// `+hmaxk true|false` — kill the process at the limit (the C
-    /// `MAX_HEAP_SIZE_KILL`; default `true`).
-    pub kill: bool,
-    /// `+hmaxel true|false` — log an error report at the limit (the C
-    /// `MAX_HEAP_SIZE_LOG`; default `true`).
-    pub error_logger: bool,
-    /// `+hmaxib true|false` — count off-heap binaries towards the limit (the C
-    /// `MAX_HEAP_SIZE_INCLUDE_OH_BINS`; default `false`).
-    pub include_shared_binaries: bool,
-}
-
-impl Default for MaxHeapFlags {
-    /// The emulator defaults (`erl_init.c:814-815`): kill and error-logger on, shared
-    /// binaries excluded.
-    fn default() -> Self {
-        MaxHeapFlags {
-            kill: true,
-            error_logger: true,
-            include_shared_binaries: false,
-        }
-    }
-}
-
-/// One process's `max_heap_size` **setting**: the word bound plus its three flags.
-///
-///
-/// This is the value the C keeps per process (`MAX_HEAP_SIZE_GET(p)` /
-/// `MAX_HEAP_SIZE_FLAGS_GET(p)`) and renders as the four-key map
-/// `#{error_logger => B, include_shared_binaries => B, kill => B, size => N}`
-/// (`erl_gc.c:3807-3822`). A process starts with the emulator's `+hmax`/`+hmax*` values
-/// ([`HeapOptions::policy`]'s `max_heap_words` and [`HeapOptions::max_heap_flags`]) and
-/// replaces them whole through `erlang:process_flag(max_heap_size, …)` (`bif.c:2148-2166`).
-///
-/// `size == 0` is the C's "no upper bound".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MaxHeapSetting {
-    /// The word bound (`0` = unlimited).
-    pub size: usize,
-    /// The `kill`/`error_logger`/`include_shared_binaries` flags.
-    pub flags: MaxHeapFlags,
-}
-impl MaxHeapSetting {
-    /// The setting an emulator with `flags` gives a process with no explicit bound.
-    pub fn unlimited(flags: MaxHeapFlags) -> MaxHeapSetting {
-        MaxHeapSetting { size: 0, flags }
-    }
-}
-
+/// `beam_rt`'s own contribution is only the emulator switch word: [`HeapOptions`] keeps the
+/// `+hmaxk`/`+hmaxel`/`+hmaxib` values a process with no explicit setting is born with (see
+/// [`HeapOptions::max_heap_flags`]).
+pub use beam_process::{MaxHeapFlags, MaxHeapSetting};
 /// The heap-size emulator options — `+hms`, `+hmbs` and the `+hmax*` family — as the
 /// [`HeapPolicy`] the runtime's GC introspection reports.
 ///

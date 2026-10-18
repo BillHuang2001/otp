@@ -104,6 +104,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::codeserver::CodeServer;
 use crate::error;
 use crate::runtime::Runtime;
 use crate::timers::{self, TimerTarget};
@@ -294,17 +295,13 @@ impl<'a> RuntimeHooksBridge<'a> {
         // A negative arity can never match an export or a built-in, so it answers `false`
         // (the oracle does the same — it is a valid small integer, not an error).
         let arity = u32::try_from(signed_value(arity_term)).unwrap_or(u32::MAX);
-        let exported = is_builtin(
-            declared_bif_tab(),
+        let exported = is_active_export(
+            &self.runtime.code_server,
             &self.runtime.registry,
             module,
             function,
             arity,
-        ) || self
-            .runtime
-            .code_server
-            .module(module)
-            .is_some_and(|loaded| module_exports(loaded, function, arity));
+        );
         let _ = heap;
         atom_term(atoms, if exported { "true" } else { "false" })
     }
@@ -1555,6 +1552,30 @@ fn module_exports(module: &beam_loader::Module, function: &str, arity: u32) -> b
     module.exports.iter().any(|export| {
         export.arity == arity && module.atom_name(export.function) == Some(function)
     })
+}
+
+/// Whether `M:F/A` is exported by code this runtime **can run right now** — the emulator
+/// builtin half plus the loaded-module half, and the *one* implementation of that pair.
+///
+/// Two answers are built from it, and they differ deliberately:
+///
+/// * `erlang:function_exported/3` ([`RuntimeHooksBridge::function_exported`]) uses it as-is;
+/// * the `[safe]` `binary_to_term/2` active-export gate
+///   ([`ExportGateBridge`](super::ExportGateBridge)) additionally accepts a key the
+///   `beam_bifs` registry implements, because this code server holds far fewer modules than a
+///   booted OTP node (see that module's docs). Sharing this half is what keeps the two from
+///   drifting on the builtin/loaded-module rules.
+pub(super) fn is_active_export(
+    code_server: &CodeServer,
+    registry: &BifRegistry,
+    module: &str,
+    function: &str,
+    arity: u32,
+) -> bool {
+    is_builtin(declared_bif_tab(), registry, module, function, arity)
+        || code_server
+            .module(module)
+            .is_some_and(|loaded| module_exports(loaded, function, arity))
 }
 
 /// An interned atom's term, resolved by **name** through `atoms`.

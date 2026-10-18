@@ -478,7 +478,16 @@ impl Runtime {
             if let Some(error) = self.take_process_error(pid) {
                 return Err(error);
             }
-            if Instant::now() >= deadline {
+            // A target the runtime terminated **itself** — the `max_heap_size` kill drain
+            // (`crate::runner::RuntimeRunner`'s slice-boundary drain) is the only such case
+            // today — neither returned nor raised, so without this arm the pump would fall
+            // through to the quiescence test and report the honest-but-wrong `blocked`
+            // capability gap. Its recorded exit reason is what the process really exited with
+            // (`killed`), so it is reported as that raise.
+            if let Some(reason) = self.process_exit(pid) {
+                let text = self.format_term_w(reason, None)?;
+                return Err(error::message(text.trim_end_matches('\n')));
+            }            if Instant::now() >= deadline {
                 return Err(error::message(format!(
                     "run: {name}:{function}/{arity} did not terminate within {} ms",
                     RUN_DEADLINE.as_millis()

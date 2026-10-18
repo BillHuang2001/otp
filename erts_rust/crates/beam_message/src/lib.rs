@@ -48,6 +48,8 @@
 //! at each call site.
 
 pub mod copy;
+#[cfg(test)]
+mod copy_reference; // the retired destination-pricing walk, kept only as the equivalence oracle
 mod error; // pub(crate) copy-failure constructors — NOT public
 pub mod fragment;
 mod layout; // pub(crate) layout helpers — NOT part of the public API

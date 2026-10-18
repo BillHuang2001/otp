@@ -42,7 +42,7 @@ use crate::runtime::Runtime;
 use super::budget::{BudgetContext, BudgetProbe};
 use super::entry::{ProcessEngine, ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
-use super::reason::{exit_reason, normal};
+use super::reason::{exit_reason, killed, normal};
 use super::tier::select_entry_tier;
 
 // The number of off-heap payloads this thread's slices have registered onto a process's
@@ -365,6 +365,45 @@ impl<'a> RuntimeRunner<'a> {
             note_boundary_door_collection();
         }
         outcome
+    }
+
+    /// Drains `pid`'s latched `max_heap_size` **kill** — the runner's half of the verdict the
+    /// collection sites latch ([`crate::context::gc::drain_max_heap_verdict`]).
+    ///
+    /// A collection door cannot terminate a process: it holds the process mutably and the
+    /// termination is the scheduler's (`ProcessTable::terminate` is what propagates the exit to
+    /// links and monitors). So a breach with `kill => true` is left as a latch on the runtime
+    /// ([`Runtime::max_heap_kill`]) and performed **here**, at the slice boundary, by returning
+    /// the ordinary exit outcome — never a new termination path.
+    ///
+    /// The reason is the **bare atom `killed`**, which is the C's `ERTS_MAX_HEAP_SIZE_KILL`
+    /// self-exit: the process dies without receiving a signal, so its own `trap_exit` flag never
+    /// sees it, while a linked peer that traps exits observes `{'EXIT', Pid, killed}` and a
+    /// monitor `'DOWN' … killed` — exactly the propagation `ProcessTable::terminate` performs.
+    ///
+    /// # Residual
+    ///
+    /// The kill is performed at the **next** slice boundary, so a process can run the remainder
+    /// of the slice in which it breached its bound. The oracle kills at the collection itself;
+    /// this runtime cannot (the door holds the process, the scheduler owns the termination), and
+    /// the deferral is bounded by one slice budget, which is why the observable exit reason and
+    /// its propagation — not the exact instruction — are what is pinned.
+    fn take_max_heap_kill(&mut self, pid: ProcessId) -> Option<RunOutcome> {
+        if !self.runtime.take_max_heap_kill(pid) {
+            return None;
+        }
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "process {pid:?} terminated: max_heap_size reached (kill)"
+            ));
+        }
+        let reason = killed(self.runtime);
+        // Recorded exactly as an abnormal exit is, so `process_exit/1` reports the real reason
+        // a caller can observe after the pass (a killed `run`-route target must not look like a
+        // process that simply vanished). No `state.errors` entry: this is not a raise, and a
+        // capability-gap error of the same slice must keep its own classification.
+        self.state.exits.insert(pid, reason);
+        Some(RunOutcome::Exit(reason))
     }
 }
 /// Resolves a process engine's **current execution site** for the debug trace —
@@ -1208,6 +1247,15 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // park outright (nothing was published for that window, so the machine stays the
             // authoritative root set). See `RuntimeRunner::collect_at_reds_boundary`.
             self.collect_at_reds_boundary(table, pid, &mut engine, fr_count, used)?;
+            // A `max_heap_size` **kill** either collection point above latched on the PCB is
+            // performed here, at the slice boundary the latch was designed for: the process is
+            // terminated through the ordinary exit path (`RunOutcome::Exit`), so the scheduler's
+            // `terminate` propagates `{'EXIT', Pid, killed}` to a trapping linked peer and
+            // `'DOWN' … killed` to a monitor. The engine is deliberately **not** stored back: the
+            // pid will never be resumed.
+            if let Some(outcome) = self.take_max_heap_kill(pid) {
+                return Ok(outcome);
+            }
             self.state.engines.insert(pid, engine);            // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended at
             // the `Yield` (pre-emption) arm.
             #[cfg(test)]
@@ -1217,6 +1265,12 @@ impl ProcessRunner for RuntimeRunner<'_> {
 
         match outcome {
             Ok(EngineRunOutcome::Returned(value)) => {
+                // A `max_heap_size` kill latched inside this slice is performed **before** the
+                // value is recorded: the process is dead either way, and a killed process must
+                // not also answer with a result (the oracle never reaches the return).
+                if let Some(outcome) = self.take_max_heap_kill(pid) {
+                    return Ok(outcome);
+                }
                 // `x(0)`, not an exit reason: copy it onto the runtime's pointer-stable
                 // arena (so it outlives the process, whose own heap dies with it) and
                 // record it, then terminate the process normally.
@@ -1241,6 +1295,13 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 Ok(RunOutcome::Exit(normal(self.runtime)))
             }
             Ok(EngineRunOutcome::Wait { func, pc }) => {
+                // A `max_heap_size` kill latched inside this slice never lets the process park:
+                // it is performed here, before the machine is stored back for the resume (so the
+                // scheduler terminates it through the ordinary exit path and no engine is left
+                // behind for a pid that will not run again).
+                if let Some(outcome) = self.take_max_heap_kill(pid) {
+                    return Ok(outcome);
+                }
                 if crate::debug_trace::enabled() {
                     let entry = engine
                         .entry
@@ -1337,7 +1398,17 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 Ok(RunOutcome::Wait)
             }
             Err(error) => {
-                let reason = exit_reason(self.runtime, &error);
+                // A `max_heap_size` kill latched in the same slice the process raised is
+                // **performed**, so the exit reason and its propagation are the real ones. The
+                // raise is *also* recorded (`state.errors` below), so the CLI's classification of
+                // a capability gap is never masked by the kill — a `killed` reason replacing an
+                // `unsupported` one would hide a runtime defect from the differential gate.
+                let kill = self.runtime.take_max_heap_kill(pid);
+                let reason = if kill {
+                    killed(self.runtime)
+                } else {
+                    exit_reason(self.runtime, &error)
+                };
                 if crate::debug_trace::enabled() {
                     let entry = engine
                         .entry

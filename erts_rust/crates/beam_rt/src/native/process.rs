@@ -116,6 +116,13 @@ struct SpawnOptions {
     fullsweep_after: Option<u32>,
     /// `{max_heap_size, Size | Map}` — the child's maximum heap size, in words.
     max_heap_words: Option<usize>,
+    /// `{max_heap_size, Size | Map}` as the **whole** setting (the bound plus its
+    /// `kill`/`error_logger`/`include_shared_binaries` flags), installed on the child's PCB
+    /// after it is created. The bound also lands in the child's [`HeapPolicy`] (through
+    /// [`Self::max_heap_words`]/[`Self::policy`]), which is the growth clamp; the setting is
+    /// the *enforcement* policy the collection doors drain
+    /// ([`beam_process::Process::set_max_heap_size`]) — the two are independent limits.
+    max_heap: Option<MaxHeapSetting>,
     /// `{message_queue_data, on_heap | off_heap}` — parsed and **accepted** (the oracle
     /// takes both), but with no representation here: this runtime's message queue is always
     /// heap-resident, which is the `on_heap` the `message_queue_data` `process_info` item
@@ -603,11 +610,13 @@ impl RuntimeContext<'_> {
                     // exactly as it is there; only a negative value is rejected.
                     parsed.fullsweep_after = Some(self.spawn_words(value)? as u16 as u32);
                 }
-                // Only the bound is carried into the child's policy; the parsed flags are
-                // dropped on this path, which has no per-process flag store to keep them in
-                // (they are the emulator's `+hmax*` word — see `SpawnOptions::policy`).
+                // The whole setting is carried (bound **and** flags): the bound also feeds the
+                // child's `HeapPolicy` (the growth clamp), while the setting itself is the
+                // enforcement policy installed on the child's PCB after it is created.
                 Some("max_heap_size") => {
-                    parsed.max_heap_words = Some(self.max_heap_setting(value)?.size)
+                    let setting = self.max_heap_setting(value)?;
+                    parsed.max_heap_words = Some(setting.size);
+                    parsed.max_heap = Some(setting);
                 }
                 Some("message_queue_data") => match self.atom_name(value).as_deref() {
                     Some("off_heap") | Some("on_heap") => parsed.message_queue_data = true,
@@ -640,8 +649,8 @@ impl RuntimeContext<'_> {
         // comparison cannot drift from the growth table. Oracle (OTP 29.1.1): `{min_heap_size,
         // 100}, {max_heap_size, 233}` spawns, 232 is `badarg`; `{min_heap_size, 1000},
         // {max_heap_size, 1597}` is `badarg`, 1598 spawns.
-        if let Some(max) = parsed.max_heap_words {
-            if max != 0 && max < parsed.policy().min_heap_words {
+        if let Some(max) = parsed.max_heap {
+            if max.violates_floor(parsed.policy().min_heap_words) {
                 return Err(BeamError::BadArg);
             }
         }
@@ -820,6 +829,18 @@ impl RuntimeContext<'_> {
         // `on_heap` its `message_queue_data` item reports. The parsed flag is read here so
         // the accepted option is never left silently unexamined.
         let _accepted_queue_placement = options.message_queue_data;
+        // `{max_heap_size, Map}` is the child's enforcement policy, installed on its own PCB
+        // (the C's `MAX_HEAP_SIZE_SET(p, …)`, `erl_process.c:12429`) and marked explicit so
+        // `process_info(P, max_heap_size)` reports it rather than the birth default. The child
+        // cannot run between its creation and this point (the runtime is single-threaded and
+        // this whole BIF is one uninterrupted invocation), so nothing can observe it
+        // half-configured.
+        if let Some(setting) = options.max_heap {
+            if let Some(process) = self.process_table_mut().get_mut(child) {
+                process.set_max_heap_size(setting);
+            }
+            self.runtime.note_max_heap_set(child);
+        }
         if options.link {
             self.process_table_mut().link(parent, child)?;
         }

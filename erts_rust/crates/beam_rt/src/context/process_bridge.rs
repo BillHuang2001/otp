@@ -59,7 +59,6 @@ use beam_common::{BeamError, Result};
 use beam_process::{PortId, Priority, ProcessId, ProcessTable};
 use beam_term::{is_atom, is_small, make_atom, signed_value, Atom, AtomTable, Eterm};
 
-use crate::config::MaxHeapSetting;
 use crate::error;
 use crate::port::PortRegistry;
 use crate::runner::RunnerState;
@@ -412,29 +411,39 @@ impl ProcessHook for ProcessBridge<'_> {
             // ([`Runtime::max_heap`](crate::Runtime::max_heap)), which is what the
             // `process_info` items read.
             //
-            // Residuum: the recorded bound is **not enforced** — no `error_logger` report and no
-            // kill at the limit — because neither `beam_process::Process` nor
-            // `beam_gc::AnyCollector` exposes a policy setter, so the `beam_gc` ceiling a
-            // process was born with cannot be replaced (see `M1_GAPS.md` *Heap switches*).
+            // Residuum: the recorded bound is now enforced by the collection doors
+            // ([`crate::context::gc`] drains `Process::take_max_heap_verdict`), which either
+            // terminate the process with the bare atom `killed` or emit the ERTS
+            // `=ERROR REPORT====` — never both, never an exception.
             "max_heap_size" => {
                 // The floor is the process's own stored `min_heap_size` (the C's
-                // `MIN_HEAP_SIZE(BIF_P)`), and the current setting is what it reports right
-                // now; both are read off the PCB we already hold, then the borrow ends.
+                // `MIN_HEAP_SIZE(BIF_P)`), the setting it reports right now is its PCB's, and
+                // the emulator's birth default needs the process's own policy snapshot — all
+                // three are read off the PCB we already hold, and that borrow **ends** at the
+                // last read below so the runtime can be read (and the table re-borrowed) after
+                // it.
                 let floor = process.collector().policy().min_heap_words;
-                let born_with = process.collector().policy().max_heap_words;
-                let current = self.runtime.max_heap_setting(pid).unwrap_or_else(|| {
-                    MaxHeapSetting {
-                        size: born_with,
-                        flags: self.runtime.config().heap_options().max_heap_flags(),
-                    }
-                });
+                let policy = process.collector().policy().clone();
+                let recorded = process.max_heap_size();
+                let current = if self.runtime.max_heap_was_set(pid) {
+                    recorded
+                } else {
+                    self.runtime.birth_max_heap_setting(&policy)
+                };
                 let Ok(setting) = self.with_ctx(|ctx| ctx.max_heap_setting(value)) else {
                     return Ok(None);
                 };
-                if setting.size != 0 && setting.size < floor {
+                if setting.violates_floor(floor) {
                     return Ok(None);
                 }
-                self.runtime.set_max_heap_setting(pid, setting);
+                // The PCB value first, then the runtime's provenance bit — two disjoint owners,
+                // so the table borrow is taken again here (the process borrow above is spent).
+                match self.table_mut().get_mut(pid) {
+                    Some(process) => process.set_max_heap_size(setting),
+                    // The subject terminated under us: no flag to set, so no previous value.
+                    None => return Ok(None),
+                }
+                self.runtime.note_max_heap_set(pid);
                 let previous = self.with_ctx(|ctx| ctx.max_heap_size_map(current))?;
                 Ok(Some(previous))
             }
