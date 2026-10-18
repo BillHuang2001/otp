@@ -127,6 +127,27 @@ fn term_heap_words(config: &RuntimeConfig) -> usize {
     }
 }
 
+/// The heap policy the runtime gives the processes it starts **for itself** — the `init` root,
+/// the `erl_prim_loader`/`file_server_2` service stand-ins and every server a boot script
+/// starts — for `config`.
+///
+/// It is the emulator's own policy ([`RuntimeConfig::heap_options`], so `+hms`/`+hmbs` and the
+/// `+hmax*` flag word all still apply) with the `+hmax` **size** deliberately left unbounded.
+///
+/// `+hmax N` is a per-**process** maximum heap size: it bounds the heap of a process running
+/// user code, which is why the oracle's own `+hmax 8192` cannot run a `code_server`. The
+/// processes the runtime starts for itself are not user code — a boot-time `code_server`
+/// needs more than 8192 words to answer a single `lists:reverse/1` — so the size is not handed
+/// to them: a small `+hmax` must not be able to kill the boot half-way. What it *does* bound
+/// is everything a user's code runs in: the `-eval`/`-s`/`-run` action process and every
+/// `erlang:spawn*` child ([`Runtime::default_spawn_policy`]), plus the runtime's internal
+/// term-construction heaps ([`term_heap_words`], so `tests/heap_limits.rs`'s
+/// `+hmax 1000000` still raises `error:system_limit`).
+fn system_spawn_policy(config: &RuntimeConfig) -> HeapPolicy {
+    let mut policy = config.heap.policy().clone();
+    policy.max_heap_words = 0;
+    policy
+}
 /// A process an `erlang:spawn*` created **from inside a scheduler slice**, waiting for the
 /// pass to register and enqueue it.
 ///
@@ -373,7 +394,18 @@ pub struct Runtime {
     cpu_clock: RefCell<beam_io::cpu_time::RuntimeClock>,
     /// Whether [`Runtime::boot`] has run.
     booted: bool,
-    /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
+    /// Whether a **boot script is being executed** right now.
+    ///
+    /// `+hmax` is a per-*process* maximum heap size — the heap of a process running *user*
+    /// code — so it must not be handed to the processes the runtime starts **for itself**
+    /// while it boots: the preloaded/boot-script system servers (`kernel_sup`, `code_server`,
+    /// `application_controller`, `logger_server`, …). Those are runtime infrastructure, not
+    /// user processes, and a small `+hmax` (8192 words, say) is smaller than a `code_server`
+    /// needs to serve a single `lists:reverse/1`. Bounding them made the boot die half-way and
+    /// — because the boot drive then finds nothing left that could wake its `{apply, …}`
+    /// directive — report the misleading `unsupported: … process blocked` capability gap
+    /// instead of a genuine runtime error (see [`Runtime::default_spawn_policy`]).
+    booting: bool,    /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
     pub(crate) halt: Option<i32>,
     /// The **sequential-tracing** state (contract A.8): the per-process trace tokens
     /// `erlang:seq_trace/2` maintains, the node-global serial clock a token's `Serial` is
@@ -794,8 +826,7 @@ impl Runtime {
         // The runtime's own root process carries the emulator's default heap policy — the
         // same one `erlang:spawn` gives a child — so `process_info(Pid, min_heap_size | …)`
         // reports the oracle's figures for it too (see [`Runtime::default_spawn_policy`]).
-        let self_pid = processes.spawn(config.heap.policy().clone())?;
-        // The runtime's own root process stands in for OTP's `init`: it is the process the
+        let self_pid = processes.spawn(system_spawn_policy(&config))?;        // The runtime's own root process stands in for OTP's `init`: it is the process the
         // runtime boots and runs the start action as, and the one `erlang:group_leader/0`
         // already reports (`src/native/process.rs`). Registering the name is what makes
         // `erlang:whereis(init)` answer that live pid — the oracle answers `<0.0.0>` — and
@@ -829,8 +860,7 @@ impl Runtime {
         // so nothing in `bootstrap/bin/start.boot` registers the name and the registration is
         // valid on **every** route that builds a runtime. Only the `-version` action builds none
         // (it prints the banner and exits), so it never has a name registry to answer from.
-        let loader = processes.spawn(config.heap.policy().clone())?;
-        let loader_name = code_server.atoms_mut().intern("erl_prim_loader");
+        let loader = processes.spawn(system_spawn_policy(&config))?;        let loader_name = code_server.atoms_mut().intern("erl_prim_loader");
         processes.register(loader_name, loader).map_err(|_| {
             error::message("boot: the `erl_prim_loader` name is already registered")
         })?;
@@ -852,16 +882,15 @@ impl Runtime {
         let file_services = if config.drives_a_boot_script() {
             crate::native::file_server::FileServices::start_unclaimed(
                 &mut processes,
-                config.heap.policy().clone(),
+                system_spawn_policy(&config),
             )?
         } else {
             crate::native::file_server::FileServices::start(
                 &mut processes,
                 code_server.atoms_mut(),
-                config.heap.policy().clone(),
+                system_spawn_policy(&config),
             )?
-        };
-        // A zero-word heap can hold nothing, so the configured size is floored — and a
+        };        // A zero-word heap can hold nothing, so the configured size is floored — and a
         // `+hmax` the emulator was given is the ceiling (see `term_heap_words`).
         let heap_words = term_heap_words(&config);
         // A configured node name (`-name`/`-sname`) makes this a **distributed node**:
@@ -960,7 +989,7 @@ impl Runtime {
             io_counters,
             cpu_clock: RefCell::new(beam_io::cpu_time::RuntimeClock::new()),
             booted: false,
-            halt: None,
+            booting: false,            halt: None,
             seq_trace: SeqTrace::new(),
             refs: RefAllocator::new(),
             references: HashMap::new(),
@@ -1964,10 +1993,16 @@ impl Runtime {
         // the path, so `init:restart/0` can re-run the very script the system booted from.
         self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         self.boot_script_path = Some(path.as_ref().to_path_buf());
-        bootscript::execute(self, &script)?;
+        // While the script runs, every process it starts is a system server of this runtime,
+        // not user code: it gets the unbounded system heap policy (see
+        // [`Runtime::default_spawn_policy`]). Restored on every exit path, including a
+        // directive that raises.
+        self.booting = true;
+        let executed = bootscript::execute(self, &script);
+        self.booting = false;
+        executed?;
         Ok(script)
     }
-
     /// Reads the OTP **boot script** at `path` and executes it, **reporting the exact
     /// directive the boot stopped at** ([`crate::boot::bootscript::BootStop`]).
     ///
@@ -2005,9 +2040,13 @@ impl Runtime {
         };
         self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         self.boot_script_path = Some(path.as_ref().to_path_buf());
-        bootscript::execute_reporting(self, &script)
+        // Every process the script starts is a system server of this runtime, not user code —
+        // see [`Runtime::boot_from_script`] and [`Runtime::default_spawn_policy`].
+        self.booting = true;
+        let executed = bootscript::execute_reporting(self, &script);
+        self.booting = false;
+        executed
     }
-
     /// The path of the boot script this runtime has **loaded**, if any — the source of
     /// [`Runtime::restart`]'s re-run (and the file whose header `init:script_id/0` reports).
     ///
@@ -2200,10 +2239,20 @@ impl Runtime {
     /// (`erl_process.c:12242-12248`, `12567-12572`) — so both the runtime's root process
     /// and every plain `spawn*` child report the `min_heap_size` /
     /// `min_bin_vheap_size` / `fullsweep_after` / `max_heap_size` the oracle does.
+    ///
+    /// The one exception is a spawn **while a boot script is running**
+    /// ([`Runtime::booting`]): everything started there is the runtime's own system server
+    /// (`kernel_sup`, `code_server`, `application_controller`, `logger_server`, …), not user
+    /// code, so the `+hmax` **size** is not applied to it — see [`system_spawn_policy`] for
+    /// why a small `+hmax` must not be able to kill the boot. `+hms`/`+hmbs` and the
+    /// `+hmax*` flag word still apply (they pick the emulator's *defaults*, not a limit).
     pub(crate) fn default_spawn_policy(&self) -> HeapPolicy {
-        self.config.heap.policy().clone()
+        if self.booting {
+            system_spawn_policy(&self.config)
+        } else {
+            self.config.heap.policy().clone()
+        }
     }
-
     /// Opens the **spawn-argument** descent gate for a freshly created child.
     ///
     /// A child's *first* root set is the argument list a spawn path hands
