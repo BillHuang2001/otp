@@ -1102,4 +1102,132 @@
         assert_eq!(t.last(&atoms), None);
         t.tree.check_invariants(&atoms);
     }
+    /// A bulk teardown gives the B+-tree's node arena back: a tree that grew to
+    /// thousands of keys and then shrank to one reports a small footprint, and the
+    /// **retired slots are gone** (the arena compacts once its dead slots outnumber
+    /// its live ones), so the reported words follow the live key count instead of the
+    /// high-water mark a plain teardown would leave behind.
+    #[test]
+    fn a_bulk_teardown_compacts_the_node_arena_and_releases_capacity() {
+        let atoms = AtomTable::new();
+        const N: i64 = 2_000;
+        let mut heap = Heap::new(8 * N as usize);
+        let mut t = OrderedSetInterior::new();
+        let empty = t.memory();
+        let objs: Vec<Eterm> = (0..N).map(|i| object(&mut heap, i, i * 2)).collect();
+        for i in 0..N as usize {
+            assert!(t.insert_new(make_small(i as i64), objs[i], &atoms).unwrap());
+        }
+        let populated = t.memory();
+        assert!(
+            t.tree.height() >= 2,
+            "the arena has split into several nodes (height {})",
+            t.tree.height()
+        );
+        let nodes_populated = t.tree.live_nodes();
+        assert!(nodes_populated > 1, "a split tree owns several live nodes");
 
+        // Remove all but the last key: every merge retires a node, so the arena ends
+        // up mostly dead and must compact (dropping those slots and trimming each
+        // surviving node's entry vector).
+        for i in 0..N - 1 {
+            t.delete(make_small(i), &atoms).unwrap();
+        }
+        assert_eq!(t.size(), 1);
+        let one_left = t.memory();
+        let stats = t.tree.debug_stats();
+        println!(
+            "[ordered_interior] 2000 -> 1 key: memory {empty} (empty) / {populated} (loaded) / \
+             {one_left} (one left); live nodes {nodes_populated} -> {}: {stats}",
+            t.tree.live_nodes()
+        );
+        assert!(
+            one_left < 10_000,
+            "one key left must not keep the {N}-key arena ({one_left} words, \
+             populated {populated})"
+        );
+        assert!(
+            one_left * 100 < populated,
+            "the one-key figure is far below the loaded one ({one_left} vs {populated})"
+        );
+        // The compaction reclaimed the retired slots: the arena holds no dead slot, and
+        // what it holds is a single root leaf.
+        assert!(
+            stats.contains("retired=0"),
+            "the arena still holds retired slots after the teardown: {stats}"
+        );
+        assert!(
+            !stats.contains("dead"),
+            "the arena still holds a dead slot after the teardown: {stats}"
+        );
+        assert_eq!(t.tree.live_nodes(), 1, "only the root leaf survives");
+        // The survivor is intact and the invariants still hold after the compaction
+        // (the renumbering rewrote every id the tree holds).
+        assert_eq!(t.lookup(make_small(N - 1), &atoms), vec![objs[N as usize - 1]]);
+        t.tree.check_invariants(&atoms);
+        // Removing the last key collapses back to the fresh single-leaf arena.
+        t.delete(make_small(N - 1), &atoms).unwrap();
+        assert_eq!(t.size(), 0);
+        // The compacted arena is *tighter* than a freshly grown one (it holds exactly
+        // one slot), so the emptied tree is at or below the fresh floor. The exact
+        // empty floor a table reports is `Table::release_empty_interior`'s rebuild,
+        // pinned by `tests/ets_capacity.rs`.
+        assert!(
+            t.memory() <= empty,
+            "an emptied tree owns no surplus ({} words, fresh floor {empty})",
+            t.memory()
+        );
+        t.tree.check_invariants(&atoms);
+    }
+
+    /// The sorted-`Vec` `ordered_set` interior releases its entry vector's surplus
+    /// capacity once a removal leaves it holding a quarter of what it can, so its
+    /// reported memory follows the live keys too.
+    #[test]
+    fn the_sorted_interior_releases_its_vector_capacity() {
+        let atoms = AtomTable::new();
+        const N: i64 = 2_000;
+        let mut heap = Heap::new(8 * N as usize);
+        let mut t = SortedOrderedInterior::new();
+        assert_eq!(t.memory(), 0, "an empty sorted interior owns no vector");
+        let objs: Vec<Eterm> = (0..N).map(|i| object(&mut heap, i, i * 2)).collect();
+        for i in 0..N as usize {
+            assert!(t.insert_new(make_small(i as i64), objs[i], &atoms));
+        }
+        let populated = t.memory();
+        assert!(populated > 0);
+        for i in 0..N - 1 {
+            assert!(t.delete(make_small(i), &atoms));
+        }
+        assert_eq!(t.len(), 1);
+        let one_left = t.memory();
+        assert!(
+            one_left < 1_000,
+            "one key left must not keep the {N}-key vector ({one_left} words, \
+             populated {populated})"
+        );
+        assert!(
+            one_left * 100 < populated,
+            "the one-key figure is far below the loaded one ({one_left} vs {populated})"
+        );
+        // The other removal path releases the same way, down to the empty vector.
+        assert!(t.delete_object(make_small(N - 1), objs[N as usize - 1], &atoms));
+        assert!(t.is_empty());
+        assert_eq!(t.memory(), 0, "an emptied sorted interior owns no vector");
+        // A stable-size churn never reallocates: the 4× slack is not reached.
+        for i in 0..N as usize {
+            assert!(t.insert_new(make_small(i as i64), objs[i], &atoms));
+        }
+        let base = t.memory();
+        for _ in 0..100 {
+            for i in (0..N as usize).step_by(2) {
+                assert!(t.delete(make_small(i as i64), &atoms));
+                assert!(t.insert_new(make_small(i as i64), objs[i], &atoms));
+            }
+            assert!(
+                t.memory() <= base,
+                "the churn grew the entry vector (base {base}, now {})",
+                t.memory()
+            );
+        }
+    }

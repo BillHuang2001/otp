@@ -791,6 +791,14 @@ impl Tree {
         height
     }
 
+    /// The number of live nodes in the arena (test-only; see
+    /// `NodeStore::live_nodes`). Used to pin that a bulk teardown really compacts
+    /// rather than leaving dead slots behind.
+    #[cfg(test)]
+    pub(crate) fn live_nodes(&self) -> usize {
+        self.store.live_nodes()
+    }
+
     /// Walk the whole tree and panic on the first broken invariant (1–5 above).
     ///
     /// Test-only: it is `O(n)` and exists so the suite can assert the structural
