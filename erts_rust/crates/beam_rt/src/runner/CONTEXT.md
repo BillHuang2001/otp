@@ -344,15 +344,21 @@ collections / major / fallbacks / peak young-nursery geometry / debt boundaries,
 per-call ratios — every geometry figure quoted here is re-derived by that line, so read it rather than
 this prose for the mature-space numbers.
 Measured on the native tier (current figures; the same `churn` shape is pinned at *three* counts by
-[`tests/boundary_cost.rs`](tests/boundary_cost.rs)): `churn` collections/call 6.982009 / 6.984002 /
-6.984600, `major`/call 1.497751 / 1.497950 / 1.498025, `reductions`/call 1 808.98 / 1 809.71 /
-1 809.84 and slices/call 0.452274 / 0.452455 / 0.452464 at N=2 000 / 10 000 / 40 000 — flat, and the
-per-iteration rate (13 971 / 2 997 at N=2 000, 27 939 / 5 993 at 4 000, 69 847 / 14 981 at 10 000) is
-6.9855 … 6.9847 collections and 1.4985 … 1.4981 majors per iteration, converging on 7 / 1.5 from
-below. It is **not** the closed form `collections == 7N − 1` / `major == 3N / 2`: the door now pins a
-young-only `CollectionKind::Minor` collection and escalates to an unpinned `collect` only when the
-promotion cannot fit the mature space, and the native tier charges its blocks per block, so the slice
-counts those rates are expressed against moved (both changes postdate the closed form).
+[`tests/boundary_cost.rs`](tests/boundary_cost.rs)): `churn` collections/call 7.669165 / 7.672033 /
+7.672758, `major`/call 1.256372 / 1.051295 / 1.012825, `reductions`/call 1 808.98 / 1 809.71 /
+1 809.84 and slices/call 0.452274 / 0.452455 / 0.452464 at N=2 000 / 10 000 / 40 000. The
+**collection** rate is flat: per iteration (15 346 / 76 728 / 306 918 over 2 000 / 10 000 / 40 000
+iterations) it reads 7.6730 / 7.6728 / 7.6730, so the per-call figure only closes the fixed offset.
+The **majors are not flat**: they are exactly one per iteration plus a fixed 514 (2 514 = 2 000 +
+514, 10 514 = 10 000 + 514, 40 514 = 40 000 + 514), so the per-iteration rate is 1.2570 / 1.0514 /
+1.0129 and falls toward **1** from above — it does not converge on 1.5. Neither total is the closed
+form `collections == 7N − 1` / `major == 3N / 2`: the door pins a young-only
+`CollectionKind::Minor` collection and escalates to an unpinned `collect` only when the promotion
+cannot fit the mature space, the native tier charges its blocks per block (which sets the slice
+counts these rates are expressed against), and the BIF-result copy-out's learned hint grows the
+nursery **before** each copy (`RuntimeContext::copy_out_hint` + `hint_grow_gate`,
+`../context/calls.rs`) — one growth event retires a nursery space, i.e. adds one unit of collection
+debt per iteration, which is what sets this shape's collection schedule.
 `heap_growth` collections/call 1.001100 / 1.001200 / 1.001220 and slices/call 0.001300 / 0.001280 /
 0.001260 at N=10 000 / 25 000 / 50 000: the 401-word request cannot fit a fresh nursery, so the
 growth/collection door is reached on **every** iteration, which is the derived relation that assertion
@@ -360,11 +366,11 @@ pins (`collections == N + yields`, exact on all five rows — 5 006 / 10 012 / 2
 against 6 / 12 / 31 / 62 / 125 yields).
 In both shapes `peak_young_spaces == 1` at every N, so the retired-nursery chain the
 `collection_debt` trigger protects stays collapsed rather than N-dependent; the young capacity
-plateaus at **609** words for `churn` (whose mature generation then sits at 987 words capacity / 880
-used — the 233-word figure older prose quoted is the pre-growth floor, not the plateau) and **233**
-for `heap_growth` (whose 610-word space is its **mature** generation), and `yields == slices − 1` with
-`waits == 0` and `debt_bounds == 0` throughout (neither loop ever parks, and neither leaves an
-un-settled collection debt at a boundary).
+plateaus at **609** words for `churn` (whose mature generation then sits at 1 598 words capacity /
+1 508 used — the 233-word figure older prose quoted is the pre-growth floor, not the plateau) and
+**233** for `heap_growth` (whose 610-word space is its **mature** generation), and
+`yields == slices − 1` with `waits == 0` and `debt_bounds == 0` throughout (neither loop ever parks,
+and neither leaves an un-settled collection debt at a boundary).
 Neither loop's cadence is this node's to set: the door decides *whether* a collection may run (and
 the counters above show it declining nothing), the collector's post-collection nursery sizing decides
 *how often* — see [`../context/IMPLEMENTATION.md`](../context/IMPLEMENTATION.md) *What the doors do
@@ -392,28 +398,28 @@ the interpreter sweep (`BEAM_RT_TIER=interpreter`) is where a compute-bound shap
 every ~4 000-reduction budget, which is the only regime in which the door is reached often.
 
 The retune (`gc_bound` churn, default tier). At `7/8` the door is **free on the shape that used to
-pay**, measured on this tree: the shape's totals stay flat and its retired chain stays collapsed (one
-young space, **609**-word capacity peak, at N = 2 000 / 4 000 / 10 000) while the door fires **105 /
-214 / 533** times out of **904 / 1 809 / 4 524** boundary checks — one in 8.61 / 8.45 / 8.49, i.e.
-0.0525 / 0.0535 / 0.0533 firings per call and **0.75 %** of the run's own 13 971 / 27 939 / 69 847
-collections. At `1/2` it had measured **+0.048 collections/call (+0.69 %)** with `major`/call **+8.9 %**
-against its door-off build; `1/1` (the C-exact "used ≥ capacity") buys nothing over `7/8` (3 instead of
-11 firings at N = 500, the same counters) and is *not* taken: the nursery grows in place, so an exact
-`used == capacity` test is satisfied on consecutive boundaries and could chain majors where `7/8`
-leaves the growth seam room.
+pay**, measured on this tree: the shape's per-iteration collection rate stays flat and its retired
+chain stays collapsed (one young space, **609**-word capacity peak, at N = 2 000 / 4 000 / 10 000)
+while the door fires **113 / 230 / 571** times out of **904 / 1 809 / 4 524** boundary checks — one in
+8.00 / 7.87 / 7.92, i.e. 0.0565 / 0.0575 / 0.0571 firings per call and **0.74 %** of the run's own
+15 346 / 30 691 / 76 728 collections. At `1/2` it had measured **+0.048 collections/call (+0.69 %)**
+with `major`/call **+8.9 %** against its door-off build; `1/1` (the C-exact "used ≥ capacity") buys
+nothing over `7/8` (3 instead of 11 firings at N = 500, the same counters) and is *not* taken: the
+nursery grows in place, so an exact `used == capacity` test is satisfied on consecutive boundaries and
+could chain majors where `7/8` leaves the growth seam room.
 **Explicitly NOT verified here any more — the door-ON vs door-OFF `Δ` and every door-off figure in
 this section** (the "identical totals" at 6.984032 / 6.996002 / 6.999200 collections and 1.497006 /
 1.499250 / 1.499850 majors per call at N = 500 / 2 000 / 10 000, the `7N − 1` / `3N / 2` closed form,
 the door-off `2` spaces / `376` words, and the `1/2`-watermark deltas above). Reproducing them needs a
 door-disabled build — a throwaway `#[cfg(test)]` early return inside
 [`../context/gc/reds_door.rs`](../context/gc/reds_door.rs) — which is outside the scope of the last
-re-derivation, and they were taken on an earlier tree state: N = 2 000 now measures **6.982009**
-collections and **1.497751** majors per call at a **609**-word young space, and the closed form no
-longer holds at all (the door pins a young-only `CollectionKind::Minor` first and escalates only when
-the promotion cannot fit the mature space, so it no longer forces a cadence fullsweep; the native tier
-also charges its blocks per block now, which moved the slice and pre-emption counts). The figures that
-*are* current are the ON-side ones in the paragraph above, printed and pinned by
-`tests/boundary_cost.rs`.
+re-derivation, and they were taken on an earlier tree state: N = 2 000 measures **7.669165**
+collections and **1.256372** majors per call at a **609**-word young space, and the closed form does
+not hold at all (the door pins a young-only `CollectionKind::Minor` first and escalates only when
+the promotion cannot fit the mature space, so it does not force a cadence fullsweep; the native tier
+charges its blocks per block, and the BIF-result copy-out's learned hint grows the nursery before each
+copy). The figures that *are* current are the ON-side ones in the paragraph above, printed and pinned
+by `tests/boundary_cost.rs`.
 The two shapes that must **not** be lost to the tighter watermark (interpreter tier): `reds_boundary`
 reports one collection per pre-emption (`yields == collections`) with `major` 1 at a **610**-word
 `heap_size` against the door-off 3 074 841 / 29 485 327 words at N = 2 000 / 20 000, and
@@ -458,16 +464,16 @@ reports typed heap exhaustion when the mature space cannot absorb the whole nurs
 refusal on these shapes escalates. The handoff is `beam_gc::AnyCollector::collect_young(&mut self,
 roots: &mut [Eterm]) -> Result<Collection>` (never escalates; grows/reclaims the mature space instead
 of a fullsweep; reports `CollectionKind::Minor`), recorded in `../../M1_GAPS.md` *GC / heap model*.
-The pinned, current fact is `churn`'s **0.75 %** firing rate at one collapsed 609-word space (next
+The pinned, current fact is `churn`'s **0.74 %** firing rate at one collapsed 609-word space (next
 paragraph), which is what the ratio above would have to move to matter.
 The door's structure is pinned by [`tests/boundary_cost.rs`](tests/boundary_cost.rs)
 (`the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape`, three measured counts
 N = 2 000 / 4 000 / 10 000): `door checks == yields` at every row, `door collections` inside the
-measured `checks / 9 ..= checks / 7` band (**105/904 = one in 8.61**, **214/1 809 = one in 8.45**,
-**533/4 524 = one in 8.49** — no `checks / 8` law holds, which is why the band, not an identity, is
+measured `checks / 9 ..= checks / 7` band (**113/904 = one in 8.00**, **230/1 809 = one in 7.87**,
+**571/4 524 = one in 7.92** — no `checks / 8` law holds, which is why the band, not an identity, is
 what is pinned), `door.unpublished == 0`, `checks/call` in `0.40..=0.50` (measured 0.4518 / 0.4521 /
-0.4524), the shape's own totals as an **exact measured table** (13 971 / 2 997, 27 939 / 5 993,
-69 847 / 14 981 — the closed form `7N − 1` / `3N / 2` is *not* what this tree runs), one young space
+0.4524), the shape's own totals as an **exact measured table** (15 346 / 2 514, 30 691 / 4 514,
+76 728 / 10 514 — the closed form `7N − 1` / `3N / 2` is *not* what this tree runs), one young space
 and a capacity ≤ 610 words, so the amplification cannot come back silently.
 The no-admission shape's relations are pinned by [`tests/reds_door.rs`](tests/reds_door.rs)
 (`yields == collections`, the 17..=20 reds/iteration band, `minor == collections − major` = `(8, 88)`
@@ -576,7 +582,8 @@ a foreign container that forwards nothing scanned: also inert, so also collected
 ## Known Issues / Handoffs
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like
   on an allocation-shaped loop.** Such a runtime runs **zero** collections — the admission declines and
-  the nursery grows instead, ≈150 words/call — whereas this one collects about once per call, so the
+  the nursery grows instead, ≈150 words/call — whereas this one collects several times per call (7.67
+  collections and 1.26 majors per call on the `churn` proxy), so the
   difference is the memory management this runtime performs and the unbounded heap the other retains,
   not dispatch or tier. The 1.25×–1.60× band the allocation-shaped `foreign` rows once read here at
   matched N is a **dated** figure from before the per-slice off-heap mirror was removed (that removal's
