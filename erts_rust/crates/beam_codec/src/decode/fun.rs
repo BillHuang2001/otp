@@ -45,14 +45,23 @@ impl<'a> Decoder<'a> {
     /// (`external.c:5006-5040`).
     ///
     /// The module and function atoms are decoded **in stream order** (so atom
-    /// interning follows the wire order) and the arity is a *normal* decoded term:
+    /// interning follows the wire order) through [`Decoder::decode_atom_strict`] — the C
+    /// `dec_atom`, which has no `NIL_EXT` case, so the internal-node marker is `BadArg`
+    /// here even under `LOCAL_EXT` mode. The arity is a *normal* decoded term:
     /// the C requires it to be a small (`is_small(temp)`) whose value is `>= 0`
     /// (`external.c:5025-5031`), so a negative or non-small arity is `BadArg`. The
     /// result is a [`FunKind::External`](crate::FunKind) fun with an empty
     /// environment — the inlined-descriptor replacement for the C `Export`
     /// (`num_free == 0`).
     ///
-    /// **The arity is also bounded by a 32-bit field.** The C reads the arity as a
+    /// **Under `[safe]` the export must be active.** With the `binary_to_term/2 [safe]`
+    /// flag installed *and* an [`ExportGate`](crate::ExportGate) host attached
+    /// ([`Decoder::with_export_gate`]), an `M:F/A` that is not exported by a loaded
+    /// module is `BadArg` — the C's `if (flags & ERTS_DIST_EXT_BTT_SAFE) { if
+    /// (!erts_active_export_entry(mod, name, arity)) goto error; }` (`external.c:5032-5036`),
+    /// asked with the **32-bit-truncated** arity. With no gate the check is skipped, so
+    /// decoding is unchanged; neither the distribution decode nor `NEW_FUN_EXT` asks.
+    ///    /// **The arity is also bounded by a 32-bit field.** The C reads the arity as a
     /// 64-bit `Sint` (`Sint arity = signed_val(temp);`, `external.c:5028`) and passes
     /// it to `erts_export_get_or_make_stub(Eterm, Eterm, unsigned)`
     /// (`export.h:137`), so it is truncated to its low 32 bits before it is stored in
@@ -77,8 +86,11 @@ impl<'a> Decoder<'a> {
     /// therefore materialized faithfully (modulo the 32-bit truncation above): there
     /// is no `SystemLimit` on this path.
     pub(super) fn decode_export(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
-        let module = self.decode_node_atom(heap, atoms)?;
-        let function = self.decode_node_atom(heap, atoms)?;
+        // C `dec_atom`, **not** `dec_sysname`: `EXPORT_EXT`'s two atoms tolerate no
+        // `NIL_EXT` internal-node marker even in `LOCAL_EXT` mode (`external.c:5008-5013`,
+        // `dec_atom`'s `default:` at `:3100-3105`).
+        let module = self.decode_atom_strict(heap, atoms)?;
+        let function = self.decode_atom_strict(heap, atoms)?;
         let arity = self.decode(heap, atoms)?;
         if !is_small(arity) {
             return Err(bad_arg());
@@ -95,9 +107,30 @@ impl<'a> Decoder<'a> {
         // (`external.c:4000`/`:5912`). Verified against erts-17.1: `2^32` ⇒ 0,
         // `2^32 + 7` ⇒ 7, `3 * 2^31` ⇒ `0x8000_0000`, `2^32 - 1` ⇒ `0xFFFF_FFFF`.
         let arity = arity & 0xFFFF_FFFF;
+        // Under `binary_to_term/2 [safe]` the export must also be **active** — the C's
+        // `if (flags & ERTS_DIST_EXT_BTT_SAFE) { if (!erts_active_export_entry(mod,
+        // name, arity)) goto error; }` (`external.c:5032-5036`). The registry is the
+        // host's ([`ExportGate`]), so with no gate installed the check is skipped and
+        // the decode is unchanged; the distribution decode and `NEW_FUN_EXT` never ask.
+        if self.safe {
+            if let Some(gate) = self.export_gate {
+                let active = match (
+                    atoms.name(atom_val(module)),
+                    atoms.name(atom_val(function)),
+                ) {
+                    (Some(module_name), Some(function_name)) => {
+                        gate.is_export_active(module_name, function_name, arity as u32)
+                    }
+                    // A name that is not valid UTF-8 cannot be an active export.
+                    _ => false,
+                };
+                if !active {
+                    return Err(bad_arg());
+                }
+            }
+        }
         crate::term::make_fun_external(heap, arity, atom_val(module), atom_val(function))
     }
-
     /// Decodes `NEW_FUN_EXT` (`112`):
     /// `[size:4 BE][arity:1][uniq:16][index:4 BE][num_free:4 BE][module atom]
     /// [old_index term][old_uniq term][creator pid term][env…]`
@@ -105,6 +138,10 @@ impl<'a> Decoder<'a> {
     ///
     /// * `size` is **read and ignored**: since OTP 23 the C writes a total size that
     ///   may be wrong (`external.c:5115`), so it is not validated.
+    /// * the module atom goes through [`Decoder::decode_atom_strict`] — the C
+    ///   `dec_atom` (`external.c:5130`), which has no `NIL_EXT` case, so the
+    ///   `[local]` internal-node marker is `BadArg` here even under `LOCAL_EXT` mode
+    ///   (it is legal only as an identifier's node field, `dec_sysname`).
     /// * `old_index`/`old_uniq` must decode to **smalls** (`external.c:5139-5151`);
     ///   their value is stored as the fun's `u32` descriptor fields.
     /// * `num_free > MAX_ARG` (255) cannot fit the header's 8-bit `num_free` field
@@ -130,7 +167,12 @@ impl<'a> Decoder<'a> {
         if num_free > MAX_ARG {
             return Err(bad_arg());
         }
-        let module = self.decode_node_atom(heap, atoms)?;
+        // C `dec_atom`, **not** `dec_sysname`: C routes `NEW_FUN_EXT`'s module through
+        // `dec_atom` (`external.c:5130`), whose `switch` has no `NIL_EXT` case, so the
+        // `[local]` internal-node marker is `BadArg` here — reusing the node helper
+        // would build a fun whose module is `atom_val(NIL)`, i.e. whatever atom sits at
+        // table index 0 (a wrong value).
+        let module = self.decode_atom_strict(heap, atoms)?;
         let old_index = self.decode_small_u32(heap, atoms)?;
         let old_uniq = self.decode_small_u32(heap, atoms)?;
         let creator = self.decode_creator_pid(heap, atoms)?;
@@ -269,8 +311,7 @@ mod tests {
     #[test]
     fn export_ext_decodes_to_an_external_fun() {
         // `fun lists:reverse/1` shape: module `lists`, function `reverse`, arity 1.
-        let mut image = vec![131, EXPORT_EXT];
-        image.extend_from_slice(&[119, 5, b'l', b'i', b's', b't', b's']);
+        let mut image = vec![131, EXPORT_EXT];        image.extend_from_slice(&[119, 5, b'l', b'i', b's', b't', b's']);
         image.extend_from_slice(&[119, 7, b'r', b'e', b'v', b'e', b'r', b's', b'e']);
         image.push(97);
         image.push(1);
@@ -438,5 +479,124 @@ mod tests {
         not_small.extend_from_slice(&[119, 2, b'n', b'1']);
         not_small.extend_from_slice(&[0u8; 12]);
         assert_bad_arg(&not_small);
+    }
+
+    /// Decodes `image` with the `LOCAL_EXT` internal-node mode armed by a matching node
+    /// hash (`Decoder::with_local_node_hash`), returning the heap and atom table the term
+    /// points into (as `decode` does — the term borrows their storage) or the error.
+    #[allow(clippy::type_complexity)]
+    fn decode_in_internal_node_mode(
+        image: &[u8],
+        hash: u32,
+    ) -> Result<(Heap, AtomTable, Eterm)> {
+        let mut heap = Heap::new(256).expect("a heap");
+        let mut atoms = AtomTable::new();
+        let mut decoder = Decoder::new(image)?.with_local_node_hash(hash);
+        let term = decoder.decode(&mut heap, &mut atoms)?;
+        decoder.finish()?;
+        Ok((heap, atoms, term))
+    }
+    /// `EXPORT_EXT`'s two atoms go through C `dec_atom`, **not** `dec_sysname`: the
+    /// `NIL_EXT` (106) internal-node marker is accepted only as an identifier's node
+    /// field, so a `NIL` module/function is `badarg` (`external.c:5008-5013`;
+    /// `dec_atom`'s `default:` at `:3100-3105`) — never a fun built from the `[]`
+    /// sentinel masquerading as an atom.
+    #[test]
+    fn export_ext_rejects_the_internal_node_marker_as_an_atom() {
+        const HASH: u32 = 0xDEAD_BEEF;
+        // `[LOCAL_EXT][hash:4][EXPORT_EXT][NIL_EXT module][maps][2]`.
+        let mut nil_module = vec![131u8, 121];
+        nil_module.extend_from_slice(&HASH.to_be_bytes());
+        nil_module.push(EXPORT_EXT);
+        nil_module.push(106); // NIL_EXT in the module position
+        nil_module.extend_from_slice(&[119, 4, b'm', b'a', b'p', b's']);
+        nil_module.extend_from_slice(&[97, 2]);
+        assert!(
+            matches!(
+                decode_in_internal_node_mode(&nil_module, HASH),
+                Err(beam_common::BeamError::BadArg)
+            ),
+            "a NIL module must be badarg"
+        );
+
+        // The same with the marker in the *function* position.
+        let mut nil_function = vec![131u8, 121];
+        nil_function.extend_from_slice(&HASH.to_be_bytes());
+        nil_function.push(EXPORT_EXT);
+        nil_function.extend_from_slice(&[119, 4, b'm', b'a', b'p', b's']);
+        nil_function.push(106);
+        nil_function.extend_from_slice(&[97, 2]);
+        assert!(
+            matches!(
+                decode_in_internal_node_mode(&nil_function, HASH),
+                Err(beam_common::BeamError::BadArg)
+            ),
+            "a NIL function must be badarg"
+        );
+
+        // A normal `EXPORT_EXT` still decodes — with and without internal-node mode.
+        let mut plain = vec![131u8, EXPORT_EXT];
+        plain.extend_from_slice(&[119, 4, b'm', b'a', b'p', b's']);
+        plain.extend_from_slice(&[119, 3, b'g', b'e', b't']);
+        plain.extend_from_slice(&[97, 2]);
+        let (_h, atoms, term) = decode(&plain);
+        assert_eq!(atoms.name(fun_module(term).unwrap()), Some("maps"));
+        assert_eq!(atoms.name(fun_function(term).unwrap()), Some("get"));
+        assert_eq!(fun_true_arity_term(term).unwrap(), 2);
+
+        let mut wrapped = vec![131u8, 121];
+        wrapped.extend_from_slice(&HASH.to_be_bytes());
+        wrapped.extend_from_slice(&plain[1..]); // the same body, behind `LOCAL_EXT`
+        let (_h, atoms, term) =
+            decode_in_internal_node_mode(&wrapped, HASH).expect("a plain export decodes");
+        assert_eq!(atoms.name(fun_module(term).unwrap()), Some("maps"));
+        assert_eq!(fun_kind_term(term).unwrap(), FunKind::External);
+        assert_eq!(fun_true_arity_term(term).unwrap(), 2);    }
+
+    /// `NEW_FUN_EXT`'s module atom goes through C `dec_atom` too (`external.c:5130`), so
+    /// the `NIL_EXT` (106) internal-node marker is `badarg` in that position — never a
+    /// fun built from `atom_val(NIL)`, which is whatever atom happens to sit at table
+    /// index 0 (a wrong value, not an error).
+    #[test]
+    fn new_fun_ext_rejects_the_internal_node_marker_as_an_atom() {
+        const HASH: u32 = 0xDEAD_BEEF;
+
+        /// `[VERSION_MAGIC][LOCAL_EXT][hash:4][NEW_FUN_EXT …]` with `module` as the
+        /// module-atom bytes and `num_free = 0`.
+        fn local_new_fun(hash: u32, module: &[u8]) -> Vec<u8> {
+            let mut image = vec![131u8, 121];
+            image.extend_from_slice(&hash.to_be_bytes());
+            image.push(NEW_FUN_EXT);
+            image.extend_from_slice(&[0, 0, 0, 0]); // size (read and ignored)
+            image.push(2); // arity (8-bit header field)
+            image.extend_from_slice(&[0u8; 16]); // uniq
+            image.extend_from_slice(&[0, 0, 0, 0]); // index
+            image.extend_from_slice(&[0, 0, 0, 0]); // num_free
+            image.extend_from_slice(module);
+            image.extend_from_slice(&[97, 0]); // old_index (small)
+            image.extend_from_slice(&[97, 0]); // old_uniq (small)
+            image.extend_from_slice(&[88]); // creator pid: NEW_PID_EXT
+            image.extend_from_slice(&[119, 1, b'n']); // node
+            image.extend_from_slice(&[0, 0, 0, 10, 0, 0, 0, 20]);
+            image.extend_from_slice(&[0, 0, 0, 0]); // creation
+            image
+        }
+
+        // The `NIL` marker in the module position is malformed.
+        assert!(
+            matches!(
+                decode_in_internal_node_mode(&local_new_fun(HASH, &[106]), HASH),
+                Err(beam_common::BeamError::BadArg)
+            ),
+            "a NIL module must be badarg"
+        );
+
+        // The same image with a real atom module still decodes, and the marker stays
+        // legal in an identifier's *node* field (the creator pid above is unaffected).
+        let (_h, atoms, term) =
+            decode_in_internal_node_mode(&local_new_fun(HASH, &[119, 1, b'm']), HASH)
+                .expect("a plain NEW_FUN_EXT decodes behind LOCAL_EXT");
+        assert_eq!(fun_kind_term(term).unwrap(), FunKind::Imported);
+        assert_eq!(atoms.name(fun_module(term).unwrap()), Some("m"));
     }
 }

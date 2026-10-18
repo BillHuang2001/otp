@@ -32,6 +32,11 @@ map for the source subtree and the notes the child nodes inherit.
   `beam_term`'s — never redefine a layout here.
 - Every identity-gated change must stay **additive and inert** with no local node
   installed (the distribution path is untouched).
+- Same rule for the **active-export gate**: it is consulted only under the `[safe]`
+  flag and only by `decode_export`, and with no `ExportGate` installed the check is
+  skipped — so every pre-existing entry point is byte-for-byte unchanged. The
+  registry (loaded modules + their exports) is the host's (`beam_rt`), never this
+  crate's.
 
 ## Notes for Agents
 - Oracle: the system `erl`/`erlc` on `$PATH` (skip loudly if absent).
@@ -49,7 +54,11 @@ map for the source subtree and the notes the child nodes inherit.
   installs `Decoder::with_local_node` (via `BifContext::local_node`) and the
   identity-aware entry point for the compressed path, so `binary_to_term` demotes a
   local identifier end-to-end. The `LOCAL_EXT` node hash is still not installed by any
-  host (consumed unchecked) — a `beam_rt`/`beam_bifs` call.
+  host (consumed unchecked) — a `beam_rt`/`beam_bifs` call. Likewise the `[safe]`
+  active-export check: the codec's half (the seam + the `safe`-gated call site in
+  `decode_export`) is complete and the gate-aware entry points exist, but no host
+  installs an `ExportGate` yet — `beam_bifs::binconv::decode_term_bif` /
+  `beam_rt`'s loaded-module registry still owe that wiring.
 
 ## Known Issues
 - **A foreign local reference can exceed the M1 id space.** The packed id is 18+14+32
@@ -80,9 +89,10 @@ map for the source subtree and the notes the child nodes inherit.
 - `reader.rs`/`writer.rs` → bounds-checked BE cursor / growable sink (safe Rust)
 - `atom_cache.rs` → `AtomCache` + the `AtomCacheWriter` hook trait
 - `off_heap.rs` → `OffHeapBinaries` host trait
+- `decode/export_gate.rs` → the `ExportGate` host trait (the `[safe]` active-export predicate)
 - `compress.rs` → zlib for `COMPRESSED` (`compress`/`decompress`/`decompress_bounded`/`decompress_bounded_used`)
 - `error.rs` → `bad_arg`/`system_limit`, the `unsupported*` reason atoms
 - `prelude.rs` → the downstream glob-import surface
-- `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) and the local-node pid/port/ref **demotion** to the internal form, `decode_term[_with_local_node]`, the `MAX_DECODE_DEPTH` bound
+- `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) and the local-node pid/port/ref **demotion** to the internal form, the active-export gate (`export_gate.rs`), `decode_atom_strict` (the C `dec_atom`: no `NIL_EXT` marker, used by `EXPORT_EXT`'s module/function, `NEW_FUN_EXT`'s module and `RECORD_EXT`'s module/name/key atoms) vs `decode_node_atom` (the C `dec_sysname`: marker allowed, used for identifier node fields), `decode_term[_with_local_node]`, the `MAX_DECODE_DEPTH` bound
 - `encode/` → the `Encoder` state machine, the tag emitters (incl. the internal pid/port/**ref** branches), `encode_term*`
 - `term/` → the **only** `unsafe` subtree: safe forwarding/allocation wrappers over `beam_term` (`binary`/`fun`/`record`/`ref`)
