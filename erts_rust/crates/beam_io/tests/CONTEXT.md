@@ -82,8 +82,8 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 24 suites, **222
-passing / 0 failing**; the whole `-p beam_io` run is **967** (742 lib + 222 integration + 3
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **231
+passing / 0 failing**; the whole `-p beam_io` run is **1019** (785 lib + 231 integration + 3
 doctests, 2 doctests `ignore`d). Per file:
 
 | Suite | Tests | Suite | Tests |
@@ -98,9 +98,26 @@ doctests, 2 doctests `ignore`d). Per file:
 | `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 8 |
 | `abi_busy.rs` | 2 | `inet.rs` | 8 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
-| `abi_failure.rs` | 8 | `udp_inet.rs` | 5 |
-| `port_task.rs` | 5 | `port.rs` | 4 |
+| `abi_failure.rs` | 8 | `active_mode.rs` | 9 |
+| `port_task.rs` | 5 | `udp_inet.rs` | 5 |
+| | | `port.rs` | 4 |
 
+`active_mode.rs` (9) is the **`{active, …}` input channel** through a real `PortRegistry` port and a
+real `Poller` round, with the traffic supplied by an **external** `std::net::UdpSocket`/
+`std::net::TcpStream` (never a second VM): ports open through `PortRegistry::open_named`, verbs go
+through the numeric `prim_inet` opcodes (`Op + 0x03f1a300`) — plus the named `accept` verb for the
+stream half — and every round is `poll` → `handle_events` → `execute_port_tasks` →
+`take_active_inputs`/`take_completions`. Rows: `{active,true}` UDP with the sender's seven-byte
+packed address as the read header and the payload as the body; `{active,false}` reporting nothing
+while `PACKET_REQ_RECV`(60) still completes with the same datagram (the passive-path regression
+pin, incl. its `[0]einval` operand guard); `{active,once}` delivering one datagram, silently, with
+no `Passive`; `{active,2}` delivering two datagrams then exactly one `Passive` and nothing more;
+passive→`{active,true}` delivering the already-buffered datagram (the re-arm's synthesized edge);
+`{active,true}` TCP delivering the peer's bytes with an **empty** header; `{packet,2}` TCP
+delivering the **stripped** body; two armed datagram ports reported in **port-number order** by one
+destructive drain; and the channel staying empty for a passive port and after a close. Waits are
+conditions (one bounded poll slice per round under a 10 s hang guard), never wall-clock budgets, and
+assertions are on content/sets, never on round counts.
 Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channel** end-to-end
 (`PortRegistry::take_completions` after every round, the recipe `beam_rt` follows):
 
@@ -195,6 +212,13 @@ rot.
   pins the **`PACKET_REQ_RECV`(60) asynchronous** receive (id reply, `ealready`/`exbadport`/`einval`
   ladder, the `Data` completion with the packed source address as the read's header, the
   `{error, closed}` teardown) against the real datagram driver
+- `active_mode.rs` → the **`{active, …}` input channel** (`ActiveInput`/`ActiveInputEvent`) at the
+  reactor + registry level, armed through `setopts` and fed by an external `std::net` peer:
+  `{active,true}`/`{active,once}`/`{active,2}` on `udp_inet` (packed source-address header, the one
+  `Passive` of a spent counter, the silent `once` flip), the passive floor + its `PACKET_REQ_RECV`(60)
+  regression pin, the passive→active re-arm, `tcp_inet` `{active,true}` and `{packet,2}` (empty header,
+  stripped body), two-port port-number ordering with a destructive drain, and the empty channel for a
+  passive port and after a close
 - `signal.rs`, `cpu_time.rs`, `ddll.rs` → the OS-signal facility, the CPU-time facility, `dlopen`
 - `fixture_builds.rs` → builds + loads the `host_driver`-family fixtures (the base, the two
   `ready_async`/`process_exit` variants, the `vector` and `both` write-side shapes) plus the
