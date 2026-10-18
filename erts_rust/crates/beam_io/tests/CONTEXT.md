@@ -82,16 +82,9 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-<<<<<<< .merge_file_g5iYoV
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **229
-passing / 0 failing** (no `#[ignore]`d case anywhere in `tests/`); the whole `-p beam_io` run is
-**989 passed / 2 ignored** (757 lib + 229 integration + 3 doctests passed; 2 doctests `ignore`d). Per
-file:
-=======
 bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **232
 passing / 0 failing**; the whole `-p beam_io` run is **1032** (797 lib + 232 integration + 3
 doctests, 2 doctests `ignore`d). Per file:
->>>>>>> .merge_file_G0C2Wx
 
 | Suite | Tests | Suite | Tests |
 |---|---|---|---|
@@ -105,15 +98,10 @@ doctests, 2 doctests `ignore`d). Per file:
 | `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 8 |
 | `abi_busy.rs` | 2 | `inet.rs` | 8 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
-<<<<<<< .merge_file_g5iYoV
-| `abi_failure.rs` | 11 | `udp_inet.rs` | 5 |
-| `port_task.rs` | 5 | `port.rs` | 4 |
-| `inet_accept.rs` | 7 | | |
-=======
 | `abi_failure.rs` | 11 | `active_mode.rs` | 9 |
+| `inet_accept.rs` | 7 | | |
 | `port_task.rs` | 5 | `udp_inet.rs` | 6 |
 | | | `port.rs` | 4 |
->>>>>>> .merge_file_G0C2Wx
 
 `active_mode.rs` (9) is the **`{active, …}` input channel** through a real `PortRegistry` port and a
 real `Poller` round, with the traffic supplied by an **external** `std::net::UdpSocket`/
@@ -224,21 +212,7 @@ rot.
 - `inet_async.rs` → the `tcp_inet` **asynchronous-op queue + completion channel** through
   `PortRegistry` (numeric opcodes, the single receive slot, the caller tag, the accept hand-off and
   its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases
-- `inet_accept.rs` → the **TCP accept chain at the driver boundary** (contract A.4's
-  `gen_tcp:accept/2` data path) with a foreign `std::net::TcpStream` peer: the whole chain
-  (accept-reply-is-only-the-id → one `Accepted { fd }` completion → **both** adoption routes →
-  `TCP_REQ_RECV` data → `port_command` bytes back with the caller-tag `InetReply`), a listener that
-  keeps accepting with distinct fds, the 50 ms deadline completing `{error, timeout}` exactly once,
-  two queued accepts with ids in order and the `9`/`41`/`297` `GETSTATUS` bits, the
-  `[0]einval`/`[0]exbadport` refusals plus the pending accept drained `{error, closed}` once, and
-  the frozen two-variant `PortNotification`/`CompletionEvent` channels. One case pins the **mixed
-  accept queue** (`[INET_INFINITY, 50ms]`): the port's one timer is armed from the *earliest finite*
-  entry of its sorted accept-timer list (`add_multi_timer`, `inet_drv.c:15744`) and its expiry
-  reports the list **head** (`tcp_inet_multi_timeout` → `remove_multi_op(desc, multi_first)`,
-  `:12600`), so `{0,{error,timeout}}` is reported although only accept #1 carried a deadline; an
-  infinite head contributes no timer entry, so the firing also consumes the tail's only entry and the
-  survivor stays queued with no timer at all — a real connection then completes it as
-  `{1,{ok,fd}}`, and nothing further is owed for id 0- `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
+- `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
 - `udp_inet.rs`, `ram_file.rs` → the other two built-ins through the real port layer
   (`DriverRegistry::with_builtins` + `PortRegistry` + `Poller`): a loopback UDP datagram round trip
@@ -263,3 +237,11 @@ rot.
   (`abi_failure.rs`)
 - `support/mod.rs`, `cdriver/mod.rs` → the shared toolchain + fixture helpers
 - `fixtures/` → the C driver objects (see above)
+- **`inet_accept.rs` (7)** — the **TCP accept chain** end to end over a foreign `std::net::TcpStream` peer:
+  two successive loopback connections accepted through the multi-op list and adopted (`from_socket`), the
+  completion arriving as `InetAsyncResult::Accepted { fd }`, the sticky `INET_F_MULTI_CLIENT` `GETSTATUS`
+  bits, the `[0]einval` ladder, the per-port accept timer (`[500, 50]` reports id 0 then id 1), and the
+  arm/disarm readiness cycle (`poll` + `handle_events` alone completes a connection that arrived while
+  nothing was queued). Detail: `src/drivers/inet/accept_tests.rs` rustdoc; the runtime's obligations
+  (second port, `{inet_async, Listener, Id, {ok, NewPort}}`, `tcp_inet_copy` inheritance) are the crate
+  doc's *Handoffs* (0).
