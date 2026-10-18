@@ -74,12 +74,18 @@
 //!   `integer_to_list/1`, `list_to_atom/1`, `lists:keyfind/3`, and the typed
 //!   `persistent_term:get/1,2` refusal).
 //! * [`assertions`] — the shared term builders/asserters.
+//! * [`probe`] — the **census probe harness**: one [`Probe`] per `Instr` under test
+//!   (valid operands, per-probe module extras, hooks, an installed mailbox and a
+//!   declared [`Expect`]), the generated two-sink probe module, the [`ProbeMailbox`]
+//!   receive seam, and [`ProbeRun::verdict`] — the *measured* answer to "did this
+//!   instruction do what the row declared?". `tests/census.rs` is its consumer.
 
 mod assertions;
 mod atoms;
 mod bifs;
 mod discovery;
 mod host;
+mod probe;
 
 // The facade re-exports the harness's **full** public surface at its original
 // `support::X` paths. Each integration test crate is compiled separately and
@@ -96,3 +102,5 @@ pub use bifs::*;
 pub use discovery::*;
 #[allow(unused_imports)]
 pub use host::*;
+#[allow(unused_imports)]
+pub use probe::*;
