@@ -130,7 +130,7 @@ pub(super) struct RecvOp {
 
 impl RecvOp {
     /// Whether this operation's deadline has passed at `now`.
-    fn is_due(self, now: Instant) -> bool {
+    pub(super) fn is_due(self, now: Instant) -> bool {
         self.deadline.is_some_and(|deadline| now >= deadline)
     }
 }

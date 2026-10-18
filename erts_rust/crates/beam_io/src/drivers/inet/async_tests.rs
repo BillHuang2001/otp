@@ -49,8 +49,8 @@
 //!   from the wire bytes and echoed **verbatim** in the `{inet_reply, …}` completion, while a
 //!   zero-length tag stages no completion at all.
 //!
-//! The `udp_inet` half is untouched by this suite: `PACKET_REQ_RECV`(60) is still a synchronous
-//! read-now verb on that driver (see `src/drivers/inet/CONTEXT.md`).
+//! The `udp_inet` half has its own suite (`udp/async_tests.rs`); it reuses the same queue
+//! machinery and adds the datagram shapes.
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{IntoRawFd, RawFd};

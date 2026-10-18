@@ -146,6 +146,7 @@
 //! the Erlang half `erts/preloaded/src/prim_inet.erl`.
 
 use std::os::unix::io::RawFd;
+use std::time::Instant;
 
 use beam_common::{BeamError, Result};
 
@@ -167,6 +168,12 @@ use super::wire::{
 };
 use super::InetState;
 
+/// The datagram driver's asynchronous-operation half — `PACKET_REQ_RECV`(60), its
+/// `{inet_async, Port, Id, Result}` completions and the send path's `{inet_reply, …}`. It lives in
+/// its own file (the `tcp_inet` half's `super::op_queue` pattern) because the queue machinery it
+/// reuses is driver-agnostic; `async` is a reserved word, hence the module rename.
+#[path = "udp/async.rs"]
+mod op_queue;
 /// The driver's registered name — the C `udp_inet` entry (`inet_drv.c:1406`), which is also what
 /// the oracle reports from `port_info(Port, name)` for a `gen_udp:open/1` socket.
 pub const UDP_DRIVER_NAME: &str = "udp_inet";
@@ -226,8 +233,25 @@ pub struct UdpInetDriver {
     /// Every route that installs a driver-**owned** socket (`open`/[`UdpInetDriver::from_socket`])
     /// clears it.
     prebound: bool,
-}
-impl UdpInetDriver {
+    /// The C's asynchronous-operation queue (`desc->op_ref`, the single `INET_MAX_ASYNC` receive
+    /// slot, the multi-op accept list): the id counter `PACKET_REQ_RECV` hands out and the
+    /// operations still waiting for a datagram. Shared machinery with the stream driver —
+    /// [`super::op_queue::AsyncQueue`] — with the datagram-specific body in [`self::op_queue`].
+    async_ops: super::op_queue::AsyncQueue,
+    /// The `prim_inet` caller reference of the command currently being written — the tag bytes of
+    /// `init_caller`'s `[n:be16][tag]` prefix (`inet_drv.c:1820`-`:1890`), kept **verbatim** so the
+    /// later `{inet_reply, S, Reply, Tag}` echoes exactly what the caller sent. `None` when the
+    /// command carries no prefix. Taken by `inet_reply_finish`'s counterpart when the command is
+    /// written.
+    caller_ref: Option<Vec<u8>>,
+    /// Whether the current command's caller prefix has already been examined, so a short write's
+    /// remainder is never re-prefixed (the C strips once per `port_command`, not once per write).
+    caller_stripped: bool,
+    /// The `errno` of a datagram send that failed after its command was accepted, reported as the
+    /// C's `{inet_reply, S, {error, Reason}, Tag}` (`inet_reply_error`, `:2539`) when the command is
+    /// settled. `None` while the send is healthy.
+    send_error: Option<i32>,
+}impl UdpInetDriver {
     /// A UDP driver with no socket yet: the state a freshly opened port starts in.
     ///
     /// The socket is created by the `open` verb (or adopted by
@@ -248,9 +272,12 @@ impl UdpInetDriver {
             peer_addr: None,
             stat: super::stat::InetStat::default(),
             prebound: false,
+            async_ops: super::op_queue::AsyncQueue::new(),
+            caller_ref: None,
+            caller_stripped: false,
+            send_error: None,
         }
-    }
-    /// Adopts an existing datagram socket, taking ownership of `fd` (closed on
+    }    /// Adopts an existing datagram socket, taking ownership of `fd` (closed on
     /// `stop`/`close`/`Drop`).
     ///
     /// The socket's state is read from the kernel, exactly as the C's `INET_REQ_FDOPEN` does
@@ -284,6 +311,10 @@ impl UdpInetDriver {
             peer_addr: None,
             stat: super::stat::InetStat::default(),
             prebound: false,
+            async_ops: super::op_queue::AsyncQueue::new(),
+            caller_ref: None,
+            caller_stripped: false,
+            send_error: None,
         })
     }
     /// The socket this port owns, if one has been opened.
@@ -564,6 +595,9 @@ impl UdpInetDriver {
                         break;
                     }
                     Some(libc::ECONNREFUSED) | Some(libc::ECONNRESET) | Some(libc::EPIPE) => {
+                        // Remember the errno so a tagged command is answered
+                        // `{inet_reply, S, {error, Reason}, Tag}` (`:15170`) instead of `ok`.
+                        self.send_error = err.raw_os_error();
                         // The destination's port is gone (an `ICMP` port-unreachable surfaces as
                         // `ECONNREFUSED` on a connected datagram socket): the C's UDP send path
                         // reports the errno, so the queued remainder is dropped and the caller
@@ -1043,25 +1077,12 @@ impl UdpInetDriver {
                     Err(name) => Ok(ctl_xerror(name)),
                 }
             }
-            // `PACKET_REQ_RECV` is `packet_inet_ctl`'s own receive: it requires a socket
-            // (`!IS_OPEN ⇒ `[0]exbadport`, `:14981`) and an eight-byte `Timeout(4), Length(4)`
-            // payload (`:14988`).
-            //
-            // **Documented divergence:** the C enqueues an async operation and answers the
-            // three-byte op id `[1] ++ async_id_be16` (measured `[1,0,0]`), the datagram arriving
-            // later as an `{inet_async, …}` message. This floor has no driver→owner message path,
-            // so `recv` is a synchronous read-now: it answers `[1] ++ source_address` with a
-            // datagram (or the bare `[1]`) and never an op id. The operand is validated and then
-            // ignored.
-            Opcode::PacketRecv => {
-                if self.socket.is_none() {
-                    return Ok(ctl_xerror("exbadport"));
-                }
-                if arg.len() != 8 {
-                    return Ok(ctl_xerror("einval"));
-                }
-                self.verb_recv(ctx, &[])
-            }
+            // `PACKET_REQ_RECV` (`packet_inet_ctl`, `:14968`-`:15010`): the datagram driver's
+            // **asynchronous** receive. It is not answered here — the guard ladder lives in
+            // [`UdpInetDriver::async_packet_recv`], which queues the operation and answers the
+            // three-byte `[1] ++ async_id_be16`, and the datagram arrives later as an
+            // `{inet_async, Port, Ref, Result}` completion (`self::op_queue`).
+            Opcode::PacketRecv => self.async_packet_recv(ctx, arg),
             // The shared-`inet_ctl` replies both drivers build identically.
             Opcode::Peer => self.peer_reply(),
             Opcode::Name => self.name_reply(),
@@ -1325,21 +1346,20 @@ impl Driver for UdpInetDriver {
     }
 
     fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
-        self.write_pending(ctx)
+        self.write_command(ctx)
     }
 
-    fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
-        // A deliberate no-op: a datagram's source address has no channel in this crate's
+    fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        // With an asynchronous receive queued this is its completion point. With **none** queued
+        // it stays the passive no-op: a datagram's source address has no channel in this crate's
         // `Driver`/`PortNotification` seam (the port input queue is byte-only and
         // `PortNotification` keeps exactly its two variants for an outside crate to match
-        // exhaustively), so reception is verb-driven — the runtime observes this readiness
-        // event and issues the `recv` verb, which performs the `recvfrom(2)` and reports the
-        // source in its own reply (see the module docs).
-        Ok(())
+        // exhaustively), so a passive port is served by the runtime issuing the `recv` verb.
+        self.async_ready_input(ctx)
     }
 
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
-        self.write_pending(ctx)
+        self.write_command(ctx)
     }
 
     fn control(
@@ -1366,8 +1386,30 @@ impl Driver for UdpInetDriver {
         }
     }
 
+    fn timeout(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        self.async_timeout(ctx)
+    }
+
+    fn next_timeout(&self) -> Option<Instant> {
+        self.async_ops.next_deadline()
+    }
+
+    fn has_pending_async(&self) -> bool {
+        self.async_ops.has_pending()
+    }
+
+    fn drive_async(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        self.drive_async_ops(ctx)
+    }
+
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        self.release_socket(ctx)
+        // The C's `packet_inet_stop` (`:14548`): every pending operation is answered
+        // `{error, closed}` **before** the descriptor goes away, so the owner is never left
+        // waiting. The completions are harvested by the registry's close path.
+        let drained = self.drain_pending_closed(ctx);
+        let released = self.release_socket(ctx);
+        drained?;
+        released
     }
 }
 
@@ -1449,3 +1491,6 @@ pub fn make_udp_inet() -> Result<Box<dyn Driver>> {
 
 #[cfg(test)]
 mod udp_tests;
+
+#[cfg(test)]
+mod async_tests;
