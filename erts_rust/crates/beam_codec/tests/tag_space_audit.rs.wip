@@ -1,0 +1,861 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
+//! **The exhaustive tag-space audit.** The central claim it pins is that the
+//! disposition of *every* tag byte is **decided, not accidental**: no byte can be
+//! silently added, dropped or reclassified later.
+//!
+//! Part 1 (the dense 256-byte sweep) is one table with **exactly one row per byte
+//! `0..=255`, in ascending order** — the table's density and sortedness are asserted,
+//! which is what makes the sweep closed. For each row the exact image is decoded and
+//! the **exact** outcome class asserted (`Ok` / `BadArg` / `Unsupported` /
+//! `SystemLimit` — never a class swap), and for an `Ok` row the term is re-encoded:
+//! byte-identically for the tags whose minimal wire form is canonical, and to a
+//! *different* canonical image for the decode-only / legacy / compressed / cached
+//! forms (asserted both ways, so no tag can silently change side). A second,
+//! independent assertion decodes `[131, byte]` for all 256 bytes: it must return a
+//! term or a typed error and **never panic** — the "no accidental fall-through" check
+//! `src/tag.rs`'s sample test cannot give.
+//!
+//! Part 2 pins only the edge/malformed rows **not already pinned** by
+//! `tests/tag_coverage.rs`, `tests/scalar_ext_decode.rs`, `tests/compressed_decode.rs`,
+//! `tests/legacy_scalar_oracle.rs`, `tests/decode_bound_oracle.rs`,
+//! `tests/refc_decode.rs` and `tests/map_ext_decode.rs` (see §"Already pinned
+//! elsewhere" below — the audit's dedup record).
+//!
+//! Part 3 is the live cross-check: the system `erl`'s `binary_to_term/1` must classify
+//! every cross-checkable image the same way we do. Images holding a `LOCAL_EXT` (`121`)
+//! wrapper, an `ATOM_INTERNAL_REF2`/`_REF3` (`73`/`75`) or an `ATOM_CACHE_REF` (`82`)
+//! are **excluded** — see [`oracle_class_of`].
+//!
+//! **Why this file is long:** the 256-row table is data, one row per byte, written out
+//! literally so a reviewer can diff a changed disposition byte by byte. The per-tag
+//! minimal images themselves are *not* re-derived here: they are
+//! [`tag_images::minimal_image`]'s, shared with `tests/tag_coverage.rs`.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use beam_alloc::Heap;
+use beam_common::BeamError;
+use beam_term::prelude::{is_small, signed_value, AtomTable, Eterm};
+
+use beam_codec::compress::compress;
+use beam_codec::term::big_parts;
+use beam_codec::{
+    decode_term, encode_term, is_unsupported, AtomCache, Decoder, Tag, COMPRESSED_EXT, VERSION_MAGIC,
+};
+
+/// The per-tag minimal images, shared with `tests/tag_coverage.rs` (never re-derived
+/// here: a second copy would be free to drift from the one that suite pins).
+mod tag_images;
+
+use tag_images::minimal_image;
+
+// ===========================================================================
+// Part 1 — the dense 256-byte sweep
+// ===========================================================================
+
+/// What a decoder must do with a byte in tag position.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Disposition {
+    /// A term is produced.
+    Ok,
+    /// Malformed input: the C `B2TBadArg` class (`external.c:1989-1991`).
+    BadArg,
+    /// A *capability* gap: a term kind the wire carries but this crate refuses
+    /// (`error::UNSUPPORTED_REASON`). Unreachable from a tag byte alone — no row uses
+    /// it, and the sweep asserts that.
+    Unsupported,
+    /// A resource bound, not malformed input (only a nesting depth past
+    /// `MAX_DECODE_DEPTH`). Also unreachable from a tag byte alone.
+    SystemLimit,
+}
+
+/// One row of the sweep: the byte in tag position, the minimal image that carries it,
+/// the **exact** expected outcome class, and the C/`external.h` reference.
+struct Row {
+    byte: u8,
+    image: &'static [u8],
+    disposition: Disposition,
+    note: &'static str,
+}
+
+/// The row every byte that is **not** a term tag gets: `[VERSION_MAGIC][byte]`, which
+/// the term walker can only reject.
+const NOT_A_TAG: &str = "no term tag at this byte (external.h), so badarg";
+
+/// Exactly one row per byte `0..=255`, ascending.
+///
+/// The 37 tag bytes are `external.h`'s term tags (`Tag::from_byte`); every other byte
+/// — including `VERSION_MAGIC` (`131`) itself, the transport's `'D'`/`'E'`/`'F'`/`'H'`
+/// framing bytes and the internal-tag-only `'J'`/`'L'`/`'N'` — is not a term tag and is
+/// a typed `BadArg` in tag position.
+#[rustfmt::skip]
+const ROWS: &[Row] = &[
+    Row { byte: 0, image: &[131, 0], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 1, image: &[131, 1], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 2, image: &[131, 2], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 3, image: &[131, 3], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 4, image: &[131, 4], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 5, image: &[131, 5], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 6, image: &[131, 6], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 7, image: &[131, 7], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 8, image: &[131, 8], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 9, image: &[131, 9], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 10, image: &[131, 10], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 11, image: &[131, 11], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 12, image: &[131, 12], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 13, image: &[131, 13], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 14, image: &[131, 14], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 15, image: &[131, 15], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 16, image: &[131, 16], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 17, image: &[131, 17], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 18, image: &[131, 18], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 19, image: &[131, 19], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 20, image: &[131, 20], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 21, image: &[131, 21], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 22, image: &[131, 22], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 23, image: &[131, 23], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 24, image: &[131, 24], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 25, image: &[131, 25], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 26, image: &[131, 26], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 27, image: &[131, 27], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 28, image: &[131, 28], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 29, image: &[131, 29], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 30, image: &[131, 30], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 31, image: &[131, 31], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 32, image: &[131, 32], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 33, image: &[131, 33], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 34, image: &[131, 34], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 35, image: &[131, 35], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 36, image: &[131, 36], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 37, image: &[131, 37], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 38, image: &[131, 38], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 39, image: &[131, 39], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 40, image: &[131, 40], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 41, image: &[131, 41], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 42, image: &[131, 42], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 43, image: &[131, 43], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 44, image: &[131, 44], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 45, image: &[131, 45], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 46, image: &[131, 46], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 47, image: &[131, 47], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 48, image: &[131, 48], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 49, image: &[131, 49], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 50, image: &[131, 50], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 51, image: &[131, 51], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 52, image: &[131, 52], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 53, image: &[131, 53], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 54, image: &[131, 54], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 55, image: &[131, 55], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 56, image: &[131, 56], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 57, image: &[131, 57], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 58, image: &[131, 58], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 59, image: &[131, 59], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 60, image: &[131, 60], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 61, image: &[131, 61], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 62, image: &[131, 62], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 63, image: &[131, 63], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 64, image: &[131, 64], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 65, image: &[131, 65], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 66, image: &[131, 66], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    // ---- `'C'` .. `'Z'` — the first tag band -----------------------------
+    Row { byte: 67, image: &[131, 67, 0, 0, 0, 0, 0, 119, 1, b'm', 119, 1, b'r'], disposition: Disposition::Ok, note: "RECORD_EXT, 0 fields, flags 0 (external.c:5257)" },
+    Row { byte: 68, image: &[131, 68], disposition: Disposition::BadArg, note: "DIST_HEADER is transport framing, not a term (external.c:6464)" },
+    Row { byte: 69, image: &[131, 69], disposition: Disposition::BadArg, note: "DIST_FRAG_HEADER is transport framing, not a term (external.h:96)" },
+    Row { byte: 70, image: &[131, 70, 63, 248, 0, 0, 0, 0, 0, 0], disposition: Disposition::Ok, note: "NEW_FLOAT_EXT 1.5 (external.c:4667)" },
+    Row { byte: 71, image: &[131, 71], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 72, image: &[131, 72], disposition: Disposition::BadArg, note: "HOPEFUL_DATA is transport framing, not a term (external.h:98)" },
+    Row { byte: 73, image: &[131, 73, 0, 5], disposition: Disposition::Ok, note: "ATOM_INTERNAL_REF2, index 5 of the seeded table (external.c:5177)" },
+    Row { byte: 74, image: &[131, 74], disposition: Disposition::BadArg, note: "BINARY_INTERNAL_REF is internal-tags-only (external.c:2885)" },
+    Row { byte: 75, image: &[131, 75, 0, 0, 5], disposition: Disposition::Ok, note: "ATOM_INTERNAL_REF3, index 5 of the seeded table (external.c:5177)" },
+    Row { byte: 76, image: &[131, 76], disposition: Disposition::BadArg, note: "BITSTRING_INTERNAL_REF is internal-tags-only (external.c:3633)" },
+    Row { byte: 77, image: &[131, 77, 0, 0, 0, 1, 1, 128], disposition: Disposition::Ok, note: "BIT_BINARY_EXT, 1 byte with 1 significant bit (external.c:4893)" },
+    Row { byte: 78, image: &[131, 78], disposition: Disposition::BadArg, note: "NEW_CACHE is dead (#if 0) / MAGIC_REF_INTERNAL_REF is internal-only (external.h:77-81)" },
+    Row { byte: 79, image: &[131, 79], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 80, image: &[131, 80, 0, 0, 0, 2, 120, 156, 75, 100, 0, 0, 0, 196, 0, 98], disposition: Disposition::Ok, note: "COMPRESSED wrapping the 2-byte body [97,0] (external.c:1759)" },
+    Row { byte: 81, image: &[131, 81], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 82, image: &[131, 82, 0], disposition: Disposition::Ok, note: "ATOM_CACHE_REF, index 0 of an installed cache (external.c:4500)" },
+    Row { byte: 83, image: &[131, 83], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 84, image: &[131, 84], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 85, image: &[131, 85], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 86, image: &[131, 86], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 87, image: &[131, 87], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 88, image: &[131, 88, 119, 1, b'n', 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 0], disposition: Disposition::Ok, note: "NEW_PID_EXT (external.c:3141)" },
+    Row { byte: 89, image: &[131, 89, 119, 1, b'n', 0, 0, 0, 7, 0, 0, 0, 0], disposition: Disposition::Ok, note: "NEW_PORT_EXT (external.c:4685)" },
+    Row { byte: 90, image: &[131, 90, 0, 1, 119, 1, b'n', 0, 0, 0, 0, 0, 0, 0, 1], disposition: Disposition::Ok, note: "NEWER_REFERENCE_EXT (external.c:4795)" },
+    Row { byte: 91, image: &[131, 91], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 92, image: &[131, 92], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 93, image: &[131, 93], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 94, image: &[131, 94], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 95, image: &[131, 95], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 96, image: &[131, 96], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    // ---- `'a'` .. `'y'` — the second tag band (`Tag::from_byte` covers all 25) ----
+    Row { byte: 97, image: &[131, 97, 0], disposition: Disposition::Ok, note: "SMALL_INTEGER_EXT (external.c:4430)" },
+    Row { byte: 98, image: &[131, 98, 0, 0, 0, 1], disposition: Disposition::Ok, note: "INTEGER_EXT (external.c:4418)" },
+    Row { byte: 99, image: &[131, 99, b'1', b'.', b'0', b'e', b'+', b'0', b'0', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], disposition: Disposition::Ok, note: "FLOAT_EXT, 31-byte text field (external.c:3840)" },
+    Row { byte: 100, image: &[131, 100, 0, 1, b'a'], disposition: Disposition::Ok, note: "ATOM_EXT (external.c:4529)" },
+    Row { byte: 101, image: &[131, 101, 119, 1, b'n', 0, 0, 0, 42, 0], disposition: Disposition::Ok, note: "REFERENCE_EXT (external.c:4743)" },
+    Row { byte: 102, image: &[131, 102, 119, 1, b'n', 0, 0, 0, 7, 0], disposition: Disposition::Ok, note: "PORT_EXT (external.c:4685)" },
+    Row { byte: 103, image: &[131, 103, 119, 1, b'n', 0, 0, 0, 10, 0, 0, 0, 20, 0], disposition: Disposition::Ok, note: "PID_EXT (external.c:3141)" },
+    Row { byte: 104, image: &[131, 104, 0], disposition: Disposition::Ok, note: "SMALL_TUPLE_EXT (external.c:4965)" },
+    Row { byte: 105, image: &[131, 105, 0, 0, 0, 0], disposition: Disposition::Ok, note: "LARGE_TUPLE_EXT (external.c:4965)" },
+    Row { byte: 106, image: &[131, 106], disposition: Disposition::Ok, note: "NIL_EXT (external.c:4970)" },
+    Row { byte: 107, image: &[131, 107, 0, 0], disposition: Disposition::Ok, note: "STRING_EXT (external.c:5391)" },
+    Row { byte: 108, image: &[131, 108, 0, 0, 0, 1, 97, 1, 106], disposition: Disposition::Ok, note: "LIST_EXT (external.c:5401)" },
+    Row { byte: 109, image: &[131, 109, 0, 0, 0, 0], disposition: Disposition::Ok, note: "BINARY_EXT (external.c:4893)" },
+    Row { byte: 110, image: &[131, 110, 1, 0, 5], disposition: Disposition::Ok, note: "SMALL_BIG_EXT (external.c:4457)" },
+    Row { byte: 111, image: &[131, 111, 0, 0, 0, 1, 0, 5], disposition: Disposition::Ok, note: "LARGE_BIG_EXT (external.c:4457)" },
+    Row { byte: 112, image: &[131, 112, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 119, 1, b'm', 97, 0, 97, 0, 88, 119, 1, b'n', 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 0], disposition: Disposition::Ok, note: "NEW_FUN_EXT, arity 2, num_free 0 (external.c:5102)" },
+    Row { byte: 113, image: &[131, 113, 119, 1, b'm', 119, 1, b'f', 97, 1], disposition: Disposition::Ok, note: "EXPORT_EXT m:f/1 (external.c:5006)" },
+    Row { byte: 114, image: &[131, 114, 0, 1, 119, 1, b'n', 0, 0, 0, 0, 1], disposition: Disposition::Ok, note: "NEW_REFERENCE_EXT (external.c:4743)" },
+    Row { byte: 115, image: &[131, 115, 1, b'a'], disposition: Disposition::Ok, note: "SMALL_ATOM_EXT (external.c:4529)" },
+    Row { byte: 116, image: &[131, 116, 0, 0, 0, 0], disposition: Disposition::Ok, note: "MAP_EXT, 0 pairs (external.c:6311)" },
+    Row { byte: 117, image: &[131, 117], disposition: Disposition::BadArg, note: "FUN_EXT was removed in OTP 23 (external.c:6399-6404)" },
+    Row { byte: 118, image: &[131, 118, 0, 1, b'a'], disposition: Disposition::Ok, note: "ATOM_UTF8_EXT (external.c:4529)" },
+    Row { byte: 119, image: &[131, 119, 1, b'a'], disposition: Disposition::Ok, note: "SMALL_ATOM_UTF8_EXT (external.c:4529)" },
+    Row { byte: 120, image: &[131, 120, 119, 1, b'n', 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0], disposition: Disposition::Ok, note: "V4_PORT_EXT (external.c:4685)" },
+    Row { byte: 121, image: &[131, 121, 0, 0, 0, 0, 97, 7], disposition: Disposition::Ok, note: "LOCAL_EXT: the 4-byte hash is consumed unchecked with no identity installed (external.c:5250)" },
+    Row { byte: 122, image: &[131, 122], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 123, image: &[131, 123], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 124, image: &[131, 124], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 125, image: &[131, 125], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 126, image: &[131, 126], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 127, image: &[131, 127], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 128, image: &[131, 128], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 129, image: &[131, 129], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 130, image: &[131, 130], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 131, image: &[131, 131], disposition: Disposition::BadArg, note: "VERSION_MAGIC is not a term tag: it never starts a term payload (external.h:31)" },
+    Row { byte: 132, image: &[131, 132], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 133, image: &[131, 133], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 134, image: &[131, 134], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 135, image: &[131, 135], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 136, image: &[131, 136], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 137, image: &[131, 137], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 138, image: &[131, 138], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 139, image: &[131, 139], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 140, image: &[131, 140], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 141, image: &[131, 141], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 142, image: &[131, 142], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 143, image: &[131, 143], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 144, image: &[131, 144], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 145, image: &[131, 145], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 146, image: &[131, 146], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 147, image: &[131, 147], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 148, image: &[131, 148], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 149, image: &[131, 149], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 150, image: &[131, 150], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 151, image: &[131, 151], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 152, image: &[131, 152], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 153, image: &[131, 153], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 154, image: &[131, 154], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 155, image: &[131, 155], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 156, image: &[131, 156], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 157, image: &[131, 157], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 158, image: &[131, 158], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 159, image: &[131, 159], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 160, image: &[131, 160], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 161, image: &[131, 161], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 162, image: &[131, 162], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 163, image: &[131, 163], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 164, image: &[131, 164], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 165, image: &[131, 165], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 166, image: &[131, 166], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 167, image: &[131, 167], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 168, image: &[131, 168], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 169, image: &[131, 169], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 170, image: &[131, 170], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 171, image: &[131, 171], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 172, image: &[131, 172], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 173, image: &[131, 173], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 174, image: &[131, 174], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 175, image: &[131, 175], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 176, image: &[131, 176], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 177, image: &[131, 177], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 178, image: &[131, 178], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 179, image: &[131, 179], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 180, image: &[131, 180], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 181, image: &[131, 181], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 182, image: &[131, 182], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 183, image: &[131, 183], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 184, image: &[131, 184], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 185, image: &[131, 185], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 186, image: &[131, 186], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 187, image: &[131, 187], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 188, image: &[131, 188], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 189, image: &[131, 189], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 190, image: &[131, 190], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 191, image: &[131, 191], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 192, image: &[131, 192], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 193, image: &[131, 193], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 194, image: &[131, 194], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 195, image: &[131, 195], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 196, image: &[131, 196], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 197, image: &[131, 197], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 198, image: &[131, 198], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 199, image: &[131, 199], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 200, image: &[131, 200], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 201, image: &[131, 201], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 202, image: &[131, 202], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 203, image: &[131, 203], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 204, image: &[131, 204], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 205, image: &[131, 205], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 206, image: &[131, 206], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 207, image: &[131, 207], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 208, image: &[131, 208], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 209, image: &[131, 209], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 210, image: &[131, 210], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 211, image: &[131, 211], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 212, image: &[131, 212], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 213, image: &[131, 213], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 214, image: &[131, 214], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 215, image: &[131, 215], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 216, image: &[131, 216], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 217, image: &[131, 217], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 218, image: &[131, 218], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 219, image: &[131, 219], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 220, image: &[131, 220], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 221, image: &[131, 221], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 222, image: &[131, 222], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 223, image: &[131, 223], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 224, image: &[131, 224], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 225, image: &[131, 225], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 226, image: &[131, 226], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 227, image: &[131, 227], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 228, image: &[131, 228], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 229, image: &[131, 229], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 230, image: &[131, 230], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 231, image: &[131, 231], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 232, image: &[131, 232], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 233, image: &[131, 233], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 234, image: &[131, 234], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 235, image: &[131, 235], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 236, image: &[131, 236], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 237, image: &[131, 237], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 238, image: &[131, 238], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 239, image: &[131, 239], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 240, image: &[131, 240], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 241, image: &[131, 241], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 242, image: &[131, 242], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 243, image: &[131, 243], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 244, image: &[131, 244], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 245, image: &[131, 245], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 246, image: &[131, 246], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 247, image: &[131, 247], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 248, image: &[131, 248], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 249, image: &[131, 249], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 250, image: &[131, 250], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 251, image: &[131, 251], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 252, image: &[131, 252], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 253, image: &[131, 253], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 254, image: &[131, 254], disposition: Disposition::BadArg, note: NOT_A_TAG },
+    Row { byte: 255, image: &[131, 255], disposition: Disposition::BadArg, note: NOT_A_TAG },
+];
+
+/// The tags whose **minimal wire form is the canonical encoding** of the term it
+/// decodes to, so the re-encode must reproduce the image byte for byte.
+///
+/// Every other `Ok` row is a *non-canonical* wire form — the decoder accepts it and the
+/// canonical encoder rewrites it — for one of five documented reasons:
+///
+/// * a **legacy identifier form** the encoder always modernizes (`89`/`101`/`102`/`103`/
+///   `114` → `120`/`90`/`88`);
+/// * a **legacy scalar/atom form** (`98` → `97` when the value is `< 256`, `99` → `70`,
+///   `100`/`115`/`118` → `119`, `105` → `104` for an arity `< 256`, `107` → `106` for an
+///   empty list, `108` → `107` for a byte list, `110`/`111` → `97` for a small-fitting
+///   magnitude) — the `{minor_version, N}` flavours are what make those forms
+///   *producible*, never the default flavour;
+/// * a **compression/cache wrapper** that materializes no term of its own (`80`, `82`);
+/// * an **identity-by-index form** (`73`/`75`);
+/// * a term whose **wire form carries state the term cannot hold** (`112`'s
+///   `size`/`old_index`/`old_uniq` and the `make_fun3`-less `uniq` are the runtime's fun
+///   entry's, so the canonical image is re-derived rather than copied; `121` is the
+///   `[local]` wrapper, which the canonical encoder emits only for a runtime that owns a
+///   node hash).
+const CANONICAL: &[u8] = &[67, 70, 77, 88, 90, 97, 104, 106, 109, 113, 116, 119, 120];
+
+/// The atom names the sweep seeds once: `minimal_image` needs `a`, `m`, `r` and `f`,
+/// and `ATOM_INTERNAL_REF2`/`_REF3` name an atom by **index**, so the table carries a
+/// sixth name (`indexed`, index 5) for those two rows.
+const SEED: [&str; 6] = ["a", "m", "r", "f", "nil", "indexed"];
+
+/// A decode heap of `words` term words.
+fn new_heap(words: usize) -> Heap {
+    Heap::new(words).expect("the carrier allocator never fails for these sizes")
+}
+
+/// Decodes `image` with the sweep's fixed decoder state — the [`SEED`] atom table plus
+/// an [`AtomCache`] whose index 0 is the atom `a` (so the `ATOM_CACHE_REF` row can be
+/// `Ok`) — asserting that every byte was consumed (the images are trailing-byte-free,
+/// so this is the same strictness `decode_term` applies).
+///
+/// The heap and atom table are returned with the term, which borrows their storage.
+fn decode_with_state(image: &[u8]) -> Result<(Heap, AtomTable, Eterm), BeamError> {
+    let mut heap = new_heap(1 << 14);
+    let mut atoms = AtomTable::new();
+    atoms.seed(SEED);
+    let mut cache = AtomCache::new();
+    cache.set(0, atoms.lookup("a").expect("seeded"));
+    let mut decoder = Decoder::new(image)?.with_atom_cache(&cache);
+    let term = decoder.decode(&mut heap, &mut atoms)?;
+    decoder.finish()?;
+    Ok((heap, atoms, term))
+}
+
+/// The disposition a decode **outcome** is — the inverse of a row's expectation, so a
+/// class swap (`BadArg` vs `Unsupported` vs `SystemLimit`) is a mismatch rather than a
+/// pass. Any other error class is a finding, not a row.
+fn classify(outcome: &Result<(Heap, AtomTable, Eterm), BeamError>) -> Disposition {
+    match outcome {
+        Ok(_) => Disposition::Ok,
+        Err(BeamError::BadArg) => Disposition::BadArg,
+        Err(BeamError::SystemLimit) => Disposition::SystemLimit,
+        Err(other) if is_unsupported(other) => Disposition::Unsupported,
+        Err(other) => panic!("an unexpected error class for a tag byte: {other:?}"),
+    }
+}
+
+/// **The sweep.** Every byte's disposition is decided, and the table that decides it is
+/// dense, sorted, and consistent with `Tag::from_byte` in both directions.
+#[test]
+fn every_tag_byte_has_exactly_one_decided_disposition() {
+    // (a) The table is closed: exactly one row per byte, ascending.
+    assert_eq!(ROWS.len(), 256, "the sweep must carry one row per byte, 0..=255");
+    for (i, row) in ROWS.iter().enumerate() {
+        assert_eq!(
+            usize::from(row.byte), i,
+            "row {i} carries byte {} (`{}`): the table must be dense and sorted",
+            row.byte, row.note
+        );
+    }
+
+    // (b) The disposition follows tag-ness alone: a byte `Tag::from_byte` knows is a
+    //     term, and every other byte is malformed. Neither class may drift.
+    for row in ROWS {
+        let is_tag = Tag::from_byte(row.byte).is_some();
+        assert_eq!(
+            is_tag,
+            row.disposition == Disposition::Ok,
+            "byte {} (`{}`): Tag::from_byte knows it = {is_tag}, but the row says {:?}",
+            row.byte,
+            row.note,
+            row.disposition
+        );
+    }
+
+    // (c) The literal images are the *shared* table's, not a second derivation: for every
+    //     tag `tag_images::minimal_image` has an image for, the row must carry exactly it.
+    //     The five contextual tags it returns `None` for (73/75/80/82/121) supply decoder
+    //     state instead, so their rows are written out here.
+    for row in ROWS {
+        let Some(tag) = Tag::from_byte(row.byte) else {
+            continue;
+        };
+        let Some(shared) = minimal_image(tag) else {
+            continue;
+        };
+        assert_eq!(
+            row.image,
+            shared.as_slice(),
+            "byte {} (`{}`): the row must carry `tag_images::minimal_image`'s image for \
+             {tag:?}, so the two suites cannot drift apart",
+            row.byte,
+            row.note
+        );
+    }
+
+    // (d) The exact class every row produces, plus its re-encode behaviour.
+    let (mut ok, mut bad_arg) = (0usize, 0usize);
+    let mut canonical = 0usize;
+    for row in ROWS {
+        let byte = row.byte;
+        let note = row.note;
+        let outcome = decode_with_state(row.image);
+        assert_eq!(
+            classify(&outcome),
+            row.disposition,
+            "byte {byte} (`{note}`): image {:?}",
+            row.image
+        );
+        if row.disposition != Disposition::Ok {
+            bad_arg += 1;
+            continue;
+        }
+        ok += 1;
+        let (_heap, atoms, term) = outcome.expect("an Ok row decodes");
+        let encoded = encode_term(term, &atoms)
+            .unwrap_or_else(|e| panic!("byte {byte} (`{note}`): the term must re-encode: {e:?}"));
+        if CANONICAL.contains(&byte) {
+            canonical += 1;
+            assert_eq!(
+                encoded, row.image,
+                "byte {byte} (`{note}`): a canonical image must re-encode byte-identically"
+            );
+        } else {
+            assert_ne!(
+                encoded, row.image,
+                "byte {byte} (`{note}`): listed as a non-canonical wire form but re-encoded \
+                 byte-identically — move it into `CANONICAL` (or fix the row)"
+            );
+        }
+        // Canonicalization is idempotent: the re-encoded image decodes to a term whose
+        // canonical encoding is that same image.
+        let (_h2, a2, t2) = decode_with_state(&encoded)
+            .unwrap_or_else(|e| panic!("byte {byte} (`{note}`): the re-encoded {encoded:?} must decode: {e:?}"));
+        assert_eq!(
+            encode_term(t2, &a2).expect("the twice-decoded term re-encodes"),
+            encoded,
+            "byte {byte} (`{note}`): canonicalization must be idempotent"
+        );
+    }
+    assert_eq!(ok + bad_arg, 256);
+    assert_eq!(ok, 34, "the covered tag count changed — the audit table must be updated");
+    assert_eq!(bad_arg, 222);
+    assert_eq!(canonical, CANONICAL.len());
+    eprintln!(
+        "[beam_codec tag_space_audit] the 256-byte sweep: {ok} Ok ({canonical} canonical, \
+         {} canonicalizing), {bad_arg} BadArg, 0 Unsupported, 0 SystemLimit",
+        ok - canonical
+    );
+}
+
+/// The independent "no accidental fall-through" check: `[VERSION_MAGIC][byte]` must
+/// return a term or a typed error for **every** byte and never panic (a panic aborts the
+/// test process). Exactly one tag is self-contained — `NIL_EXT` (`106`) has no operand
+/// — so every other bare byte is a typed `BadArg`.
+#[test]
+fn no_bare_tag_byte_panics_or_falls_through() {
+    let mut self_contained = Vec::new();
+    for byte in 0u16..=255 {
+        let byte = byte as u8;
+        let image = [VERSION_MAGIC, byte];
+        let mut heap = new_heap(1 << 12);
+        let mut atoms = AtomTable::new();
+        match decode_term(&image, &mut heap, &mut atoms) {
+            Ok(_) => self_contained.push(byte),
+            Err(BeamError::BadArg) => {}
+            Err(other) => panic!("bare byte {byte}: expected a term or BadArg, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        self_contained,
+        vec![106u8],
+        "exactly `NIL_EXT` is self-contained (every other tag needs an operand)"
+    );
+    eprintln!("[beam_codec tag_space_audit] every bare tag byte returned, none panicked");
+}
+
+// ===========================================================================
+// Part 2 — edge/malformed rows NOT already pinned elsewhere
+// ===========================================================================
+//
+// Already pinned elsewhere (checked row by row, not re-asserted here):
+//
+// * `FLOAT_EXT`'s grammar — the accepted `,` radix (`"1,5"` ⇒ 1.5) and the rejected
+//   `inf`/`-inf`/`nan`/`infinity`/`1e5` (no radix)/`1.`/`.5`/`" 1.0"`/`0x1p3`/`"1.5x"`/
+//   `""` — `tests/legacy_scalar_oracle.rs::float_corpus` (offline-pinned *and* live).
+// * `NEW_FLOAT_EXT` `inf`/`-inf`/`nan`/signaling-nan ⇒ `badarg` —
+//   `tests/scalar_ext_decode.rs::scalar_wire_rules_are_applied` (and
+//   `tests/tag_coverage.rs`'s `new_float_infinity`/`new_float_nan`).
+// * Bignum sign bytes **1** and **2** (and `5`, `200`) ⇒ negative —
+//   `tests/scalar_ext_decode.rs`'s corpus; `255` was the one value missing (below).
+// * `BIT_BINARY_EXT` trailing-bit count 0/9/255, `len 0`, and the last byte's unused
+//   low bits being zeroed — `src/decode/tests.rs::malformed_binaries_and_bit_strings_are_bad_arg`
+//   and `::binary_and_bit_binary_decode`.
+// * `MAP_EXT` bit-31 pair count, a duplicate key, and `1`/`1.0` both surviving —
+//   `tests/tag_coverage.rs` (`map_pair_count_bit31`, `map_duplicate_key`) and
+//   `tests/map_ext_decode.rs::integer_and_float_keys_stay_distinct`.
+// * `EXPORT_EXT`'s non-small arity — `src/decode/fun.rs::export_ext_decodes_to_an_external_fun`.
+// * `RECORD_EXT` flags byte `2` — `tests/tag_coverage.rs::record_bad_flags_byte`.
+// * `NEW_FUN_EXT` `num_free = 256` — `tests/tag_coverage.rs::new_fun_num_free_256`.
+// * Tiny creation `3` vs `4` — `tests/legacy_scalar_oracle.rs` (a `NEW_FUN_EXT`
+//   creator's legacy `PID_EXT`, live-checked) and `tests/tag_coverage.rs`
+//   (`reference_ext_creation_4`/`port_ext_creation_4`/`pid_ext_creation_4`).
+// * `NEWER_REFERENCE_EXT` id count 6 — `tests/tag_coverage.rs::newer_reference_len_6`.
+// * The six C `dec_atom` positions rejecting the `NIL_EXT` marker behind `LOCAL_EXT` —
+//   `tests/tag_coverage.rs`'s `local_*_nil` rows, `src/decode/{fun,record}.rs`'s unit
+//   tests.
+
+/// Builds `[VERSION_MAGIC][COMPRESSED][size:4 BE][zlib(body)]`, declaring `declared`
+/// as the inflated length (which a caller can get wrong).
+fn compressed_image(body: &[u8], declared: u32) -> Vec<u8> {
+    let zlib = compress(body, 6).expect("zlib of a tiny body");
+    let mut image = vec![VERSION_MAGIC, COMPRESSED_EXT];
+    image.extend_from_slice(&declared.to_be_bytes());
+    image.extend_from_slice(&zlib);
+    image
+}
+
+/// Asserts a decay is exactly `BadArg` (never a panic, never `Ok`, never another class).
+fn assert_bad_arg(image: &[u8]) {
+    match decode_with_state(image) {
+        Err(BeamError::BadArg) => {}
+        Ok(_) => panic!("expected BadArg for {image:?}, got a term"),
+        Err(other) => panic!("expected BadArg for {image:?}, got {other:?}"),
+    }
+}
+
+/// `SMALL_BIG_EXT` from a **little-endian** magnitude (the wire's digit order).
+fn small_big(negative: bool, magnitude_le: &[u8]) -> Vec<u8> {
+    let mut image = vec![VERSION_MAGIC, 110, magnitude_le.len() as u8, u8::from(negative)];
+    image.extend_from_slice(magnitude_le);
+    image
+}
+
+/// `2^59 - 1` (`MAX_SMALL`) and `2^59` in little-endian base-256.
+const MAX_SMALL_LE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07];
+/// `2^59` little-endian: one more than `MAX_SMALL`.
+const TWO_POW_59_LE: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0x08];
+/// `2^59 + 1` little-endian.
+const TWO_POW_59_PLUS_1_LE: [u8; 8] = [1, 0, 0, 0, 0, 0, 0, 0x08];
+
+/// A bignum's **sign byte** is a boolean in the C (`neg = get_int8(ep)` is only tested
+/// for zero-ness, `big.c:3446-3448`), so `255` negates exactly like `1` and `2` — the
+/// values `tests/scalar_ext_decode.rs` pins.
+#[test]
+fn a_bignum_sign_byte_of_255_negates() {
+    assert_bad_arg(&[VERSION_MAGIC, 110, 1, 255]); // truncated magnitude, not a value
+    let (_heap, _atoms, term) =
+        decode_with_state(&[VERSION_MAGIC, 110, 1, 255, 42]).expect("sign 255 decodes");
+    assert!(is_small(term), "a 1-byte magnitude is a small");
+    assert_eq!(signed_value(term), -42, "any non-zero sign byte means negative");
+}
+
+/// The 60-bit small range on the wire: the C's `bytes_to_big` returns a small exactly
+/// when the magnitude fits **and** `IS_USMALL(sgn, d)` holds — `d <= MAX_SMALL` for a
+/// positive value but `d <= MAX_SMALL + 1` for a negative one (`big.h:76`), so `-2^59`
+/// is `MIN_SMALL` (a small) while `+2^59` is a bignum. Decoding a magnitude through
+/// `SMALL_BIG_EXT` must split at that same boundary in both directions.
+#[test]
+fn the_bignum_small_range_boundary_is_exact() {
+    let (_h, _a, at_max) = decode_with_state(&small_big(false, &MAX_SMALL_LE)).expect("2^59-1");
+    assert!(is_small(at_max), "2^59-1 is MAX_SMALL, a small");
+    assert_eq!(signed_value(at_max), (1i64 << 59) - 1);
+
+    let (_h, _a, over) = decode_with_state(&small_big(false, &TWO_POW_59_LE)).expect("2^59");
+    assert!(!is_small(over), "2^59 is one past MAX_SMALL, so a bignum");
+    let (negative, digits) = big_parts(over).expect("a bignum");
+    assert!(!negative);
+    assert_eq!(digits, &[1u64 << 59], "2^59 as a single digit");
+
+    let (_h, _a, min_small) = decode_with_state(&small_big(true, &TWO_POW_59_LE)).expect("-2^59");
+    assert!(is_small(min_small), "-2^59 is MIN_SMALL, a small");
+    assert_eq!(signed_value(min_small), -(1i64 << 59));
+
+    let (_h, _a, neg_over) =
+        decode_with_state(&small_big(true, &TWO_POW_59_PLUS_1_LE)).expect("-(2^59+1)");
+    assert!(!is_small(neg_over), "-(2^59+1) is past MIN_SMALL, so a bignum");
+    let (negative, digits) = big_parts(neg_over).expect("a bignum");
+    assert!(negative);
+    assert_eq!(digits, &[(1u64 << 59) + 1], "-(2^59+1) as a single digit");
+}
+
+/// The `COMPRESSED` (`80`) rows `tests/compressed_decode.rs` does not already pin. That
+/// suite covers a declared size that is too small/too large (1 and 7 against a 6-byte
+/// body), a valid stream of an *empty* body, a non-term body, a non-zlib payload, a
+/// truncated/corrupt stream, and `COMPRESSED` as a nested **term** tag; what is left is
+/// the 1-byte body at both ends of the size field, a body that begins with the version
+/// byte, and a body that is itself a `COMPRESSED` wrapper (the wrapper is
+/// top-level-only, so a nested wrapper must not be unwrapped).
+#[test]
+fn compressed_rows_not_pinned_by_the_specialised_suite() {
+    // A one-byte body that is *not* a whole term, with the declared size at both ends.
+    assert_bad_arg(&compressed_image(&[97], 0));
+    assert_bad_arg(&compressed_image(&[97], 2));
+
+    // A body that re-introduces `VERSION_MAGIC`: the inflated bytes are a *body*, never
+    // an image, so `131` is not a tag there (`external.c:1759` unwraps exactly once).
+    assert_bad_arg(&compressed_image(&[VERSION_MAGIC, 97, 0], 3));
+
+    // A body that is itself a `COMPRESSED` wrapper: accepted only as the outer wrapper.
+    let inner = compressed_image(&[97, 0], 2);
+    assert_bad_arg(&compressed_image(&inner, inner.len() as u32));
+
+    // The same body without the extra layer really does decode, so the rows above fail
+    // for the wrapper and not for the body.
+    let (.., term) = decode_with_state(&compressed_image(&[97, 0], 2)).expect("a plain wrapper");
+    assert!(is_small(term) && signed_value(term) == 0);
+}
+
+// ===========================================================================
+// Part 3 — the live oracle cross-check
+// ===========================================================================
+
+/// Resolve the oracle: `$ERTS_ORACLE` if it is an existing executable, else `erl` on
+/// `$PATH` (the policy of `tests/interop.rs` and `tools/differential`).
+fn resolve_oracle() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+        let program = PathBuf::from(&value);
+        if program.is_file() {
+            return Some(program);
+        }
+        eprintln!(
+            "[beam_codec tag_space_audit] $ERTS_ORACLE='{}' is not an existing executable — \
+             treating it as no oracle.",
+            program.display()
+        );
+        return None;
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("erl"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The oracle, or a **loud** skip (never a silent pass).
+fn oracle_or_skip(test: &str) -> Option<PathBuf> {
+    match resolve_oracle() {
+        Some(oracle) => Some(oracle),
+        None => {
+            eprintln!(
+                "[beam_codec tag_space_audit] {test}: SKIPPED — no `erl`/`$ERTS_ORACLE` on this \
+                 machine; the live tag-space cross-check did not run (NOT a pass). \
+                 ($ERTS_ORACLE unset or not executable, and no `erl` on $PATH)."
+            );
+            None
+        }
+    }
+}
+
+fn run_erl(oracle: &Path, eval: &str) -> String {
+    let out = Command::new(oracle)
+        .arg("-noshell")
+        .arg("-eval")
+        .arg(eval)
+        .arg("-s")
+        .arg("init")
+        .arg("stop")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn the oracle");
+    assert!(
+        out.status.success(),
+        "the oracle exited {:?}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("the oracle prints UTF-8")
+}
+
+/// `<<b0,b1,…>>` — the Erlang binary literal the oracle's `-eval` accepts.
+fn erl_binary(bytes: &[u8]) -> String {
+    let joined = bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+    format!("<<{joined}>>")
+}
+
+/// The oracle's class for each image, in one batched `erl` spawn: `ok` when
+/// `binary_to_term/1` returns, `badarg` when it raises.
+fn oracle_classes(oracle: &Path, images: &[Vec<u8>]) -> Vec<String> {
+    let list = images.iter().map(|b| erl_binary(b)).collect::<Vec<_>>().join(",");
+    let eval = format!(
+        "F = fun(B) -> try binary_to_term(B), ok catch _:_ -> badarg end end, \
+         io:format(\"~w~n\", [[F(B) || B <- [{list}]]])"
+    );
+    let out = run_erl(oracle, &eval);
+    let inner = out
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("unparsable oracle output: {out:?}"));
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner.split(',').map(|t| t.trim().to_string()).collect()
+}
+
+/// The oracle's expected class for a row, or `None` when the row is **not
+/// cross-checkable**:
+///
+/// * `LOCAL_EXT` (`121`) — the 4-byte node hash is a per-VM-start secret of the
+///   oracle's, so it rejects every synthetic `[local]` image for the *hash*;
+/// * `ATOM_INTERNAL_REF2`/`_REF3` (`73`/`75`) — they name an atom by **index**, and the
+///   two atom tables hold different atoms at index 5;
+/// * `ATOM_CACHE_REF` (`82`) — the index only resolves against a distribution atom cache
+///   the oracle has not installed in a plain `-eval`.
+fn oracle_class_of(byte: u8) -> Option<&'static str> {
+    match byte {
+        73 | 75 | 82 | 121 => None,
+        _ if ROWS[usize::from(byte)].disposition == Disposition::Ok => Some("ok"),
+        _ => Some("badarg"),
+    }
+}
+
+/// The oracle agrees with the sweep — for every cross-checkable byte — and with the
+/// Part-2 edge images. Skips loudly without an oracle.
+#[test]
+fn the_oracle_agrees_with_the_tag_space() {
+    let Some(oracle) = oracle_or_skip("the_oracle_agrees_with_the_tag_space") else {
+        return;
+    };
+
+    let mut labels: Vec<String> = Vec::new();
+    let mut images: Vec<Vec<u8>> = Vec::new();
+    let mut expected: Vec<&'static str> = Vec::new();
+    for row in ROWS {
+        let Some(class) = oracle_class_of(row.byte) else {
+            continue;
+        };
+        labels.push(format!("byte {}", row.byte));
+        images.push(row.image.to_vec());
+        expected.push(class);
+    }
+    let sweep_rows = images.len();
+
+    // The Part-2 edge images: the sign-byte and small-range rows are `ok`, the
+    // `COMPRESSED` rows are `badarg` (all verified against erts-17.1).
+    for (label, image, class) in [
+        ("sign_255", small_big_flipped(42), "ok"),
+        ("2_pow_59_minus_1", small_big(false, &MAX_SMALL_LE), "ok"),
+        ("2_pow_59", small_big(false, &TWO_POW_59_LE), "ok"),
+        ("minus_2_pow_59", small_big(true, &TWO_POW_59_LE), "ok"),
+        ("minus_2_pow_59_plus_1", small_big(true, &TWO_POW_59_PLUS_1_LE), "ok"),
+        ("compressed_size_0_for_a_1_byte_body", compressed_image(&[97], 0), "badarg"),
+        ("compressed_size_2_for_a_1_byte_body", compressed_image(&[97], 2), "badarg"),
+        ("compressed_body_starts_with_131", compressed_image(&[VERSION_MAGIC, 97, 0], 3), "badarg"),
+        ("compressed_body_is_a_wrapper", compressed_image(&[97, 0], 2), "ok"),
+    ] {
+        labels.push(label.to_string());
+        images.push(image);
+        expected.push(class);
+    }
+
+    let theirs = oracle_classes(&oracle, &images);
+    assert_eq!(theirs.len(), images.len(), "the oracle classified every row");
+    for ((label, want), got) in labels.iter().zip(&expected).zip(&theirs) {
+        assert_eq!(
+            got, want,
+            "{label}: the oracle says {got:?}, we say {want:?} — a real divergence"
+        );
+    }
+    eprintln!(
+        "[beam_codec tag_space_audit] the oracle agreed on {sweep_rows} cross-checkable tag \
+         bytes and {} edge images ({} rows skipped: LOCAL_EXT/ATOM_INTERNAL_REF*/ATOM_CACHE_REF)",
+        images.len() - sweep_rows,
+        ROWS.len() - sweep_rows
+    );
+}
+
+/// A `SMALL_BIG_EXT` image with sign byte `255` and magnitude `42` — the negation value
+/// `tests/scalar_ext_decode.rs` does not pin.
+fn small_big_flipped(value: u8) -> Vec<u8> {
+    vec![VERSION_MAGIC, 110, 1, 255, value]
+}

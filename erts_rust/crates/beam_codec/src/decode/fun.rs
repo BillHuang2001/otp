@@ -138,6 +138,10 @@ impl<'a> Decoder<'a> {
     ///
     /// * `size` is **read and ignored**: since OTP 23 the C writes a total size that
     ///   may be wrong (`external.c:5115`), so it is not validated.
+    /// * the module atom goes through [`Decoder::decode_atom_strict`] — the C
+    ///   `dec_atom` (`external.c:5130`), which has no `NIL_EXT` case, so the
+    ///   `[local]` internal-node marker is `BadArg` here even under `LOCAL_EXT` mode
+    ///   (it is legal only as an identifier's node field, `dec_sysname`).
     /// * `old_index`/`old_uniq` must decode to **smalls** (`external.c:5139-5151`);
     ///   their value is stored as the fun's `u32` descriptor fields.
     /// * `num_free > MAX_ARG` (255) cannot fit the header's 8-bit `num_free` field
@@ -163,7 +167,12 @@ impl<'a> Decoder<'a> {
         if num_free > MAX_ARG {
             return Err(bad_arg());
         }
-        let module = self.decode_node_atom(heap, atoms)?;
+        // C `dec_atom`, **not** `dec_sysname`: C routes `NEW_FUN_EXT`'s module through
+        // `dec_atom` (`external.c:5130`), whose `switch` has no `NIL_EXT` case, so the
+        // `[local]` internal-node marker is `BadArg` here — reusing the node helper
+        // would build a fun whose module is `atom_val(NIL)`, i.e. whatever atom sits at
+        // table index 0 (a wrong value).
+        let module = self.decode_atom_strict(heap, atoms)?;
         let old_index = self.decode_small_u32(heap, atoms)?;
         let old_uniq = self.decode_small_u32(heap, atoms)?;
         let creator = self.decode_creator_pid(heap, atoms)?;
@@ -543,4 +552,51 @@ mod tests {
         assert_eq!(atoms.name(fun_module(term).unwrap()), Some("maps"));
         assert_eq!(fun_kind_term(term).unwrap(), FunKind::External);
         assert_eq!(fun_true_arity_term(term).unwrap(), 2);    }
+
+    /// `NEW_FUN_EXT`'s module atom goes through C `dec_atom` too (`external.c:5130`), so
+    /// the `NIL_EXT` (106) internal-node marker is `badarg` in that position — never a
+    /// fun built from `atom_val(NIL)`, which is whatever atom happens to sit at table
+    /// index 0 (a wrong value, not an error).
+    #[test]
+    fn new_fun_ext_rejects_the_internal_node_marker_as_an_atom() {
+        const HASH: u32 = 0xDEAD_BEEF;
+
+        /// `[VERSION_MAGIC][LOCAL_EXT][hash:4][NEW_FUN_EXT …]` with `module` as the
+        /// module-atom bytes and `num_free = 0`.
+        fn local_new_fun(hash: u32, module: &[u8]) -> Vec<u8> {
+            let mut image = vec![131u8, 121];
+            image.extend_from_slice(&hash.to_be_bytes());
+            image.push(NEW_FUN_EXT);
+            image.extend_from_slice(&[0, 0, 0, 0]); // size (read and ignored)
+            image.push(2); // arity (8-bit header field)
+            image.extend_from_slice(&[0u8; 16]); // uniq
+            image.extend_from_slice(&[0, 0, 0, 0]); // index
+            image.extend_from_slice(&[0, 0, 0, 0]); // num_free
+            image.extend_from_slice(module);
+            image.extend_from_slice(&[97, 0]); // old_index (small)
+            image.extend_from_slice(&[97, 0]); // old_uniq (small)
+            image.extend_from_slice(&[88]); // creator pid: NEW_PID_EXT
+            image.extend_from_slice(&[119, 1, b'n']); // node
+            image.extend_from_slice(&[0, 0, 0, 10, 0, 0, 0, 20]);
+            image.extend_from_slice(&[0, 0, 0, 0]); // creation
+            image
+        }
+
+        // The `NIL` marker in the module position is malformed.
+        assert!(
+            matches!(
+                decode_in_internal_node_mode(&local_new_fun(HASH, &[106]), HASH),
+                Err(beam_common::BeamError::BadArg)
+            ),
+            "a NIL module must be badarg"
+        );
+
+        // The same image with a real atom module still decodes, and the marker stays
+        // legal in an identifier's *node* field (the creator pid above is unaffected).
+        let (_h, atoms, term) =
+            decode_in_internal_node_mode(&local_new_fun(HASH, &[119, 1, b'm']), HASH)
+                .expect("a plain NEW_FUN_EXT decodes behind LOCAL_EXT");
+        assert_eq!(fun_kind_term(term).unwrap(), FunKind::Imported);
+        assert_eq!(atoms.name(fun_module(term).unwrap()), Some("m"));
+    }
 }
