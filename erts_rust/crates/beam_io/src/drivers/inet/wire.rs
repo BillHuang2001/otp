@@ -609,12 +609,19 @@ pub(super) const ETF_VERSION_MAGIC: u8 = 131;
 /// Returns the bytes **after** the prefix, or `None` when `arg` is not in that form (the caller
 /// then falls back to the plain `[address][data]` grammar).
 ///
-/// # The one residual ambiguity
+/// # Only a fallback — the plain form is authoritative
 ///
-/// A *plain* command whose first two bytes happen to satisfy this shape (a 16-bit length that
-/// fits, followed by `0x83`) is read as a caller-reference form. For a plain UDP command that
-/// means byte 0 would have to be `0x00` (n = 1..255) and byte 2 = `0x83`, i.e. an address family
-/// tag of `0x00` — never a valid address tag (1/3/4), so no *valid* plain command is misparsed.
+/// A plain command's first byte is an address family tag and byte 2 is the target port's **low**
+/// byte, so a plain command *can* satisfy this shape (e.g. `n` = `0x0100 + port_hi` with
+/// `port_lo == 0x83`). [`UdpInetDriver::verb_send`](super::udp) therefore tries the plain
+/// `[address][data]` grammar **first** and only calls this function when that refuses; a genuinely
+/// prefixed command always survives that order because a `prim_inet` tag's 16-bit length has a
+/// zero high byte (`term_to_binary/1` of a monitor reference is ~15 bytes), never a valid address
+/// tag (1/3/4).
+///
+/// Residual: a *prefixed* command whose tag length is ≥ 256 would have a first byte of 1/3/4 and
+/// be read as plain. `prim_inet:send/3`'s reference tag is far smaller, so that cannot arise from
+/// the protocol this function exists for.
 pub(super) fn split_caller_ref(arg: &[u8]) -> Option<&[u8]> {
     let n = usize::from(u16::from_be_bytes([*arg.first()?, *arg.get(1)?]));
     // `init_caller`'s `*size_p < 2` / `*size_p < n` guards: a zero-length or otherwise
