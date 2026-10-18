@@ -37,9 +37,9 @@
 //! |---|---|---|
 //! | declared (`bif.tab`) | 556 | `bif 476 + ubif 73 + hbif 7` |
 //! | registry | 648 | 556 declared + 92 stdlib fast paths |
-//! | seam union | 242 | the 14 tables, deduped (`246 raw − 4 shared`) |
-//! | declared seam-backed | 212 | union members the table declares |
-//! | declared in-crate | 344 | `556 − 212`, no table lists them |
+//! | seam union | 217 | the 14 tables, deduped (`221 raw − 4 shared`) |
+//! | declared seam-backed | 187 | union members the table declares |
+//! | declared in-crate | 369 | `556 − 187`, no table lists them |
 //! | undeclared seam members | 30 | the union members registered as stdlib fast paths |
 //!
 //! "Adopted" is *not* the same as "registered": a union member returns the typed
@@ -113,9 +113,9 @@ const FAST_PATHS: usize = 92;
 const MISSING_DECLARED: usize = 0;
 
 /// The seam union and the partition of the declared surface it induces.
-const SEAM_UNION: usize = 242;
-const DECLARED_SEAM_BACKED: usize = 212;
-const DECLARED_IN_CRATE: usize = 344;
+const SEAM_UNION: usize = 217;
+const DECLARED_SEAM_BACKED: usize = 187;
+const DECLARED_IN_CRATE: usize = 369;
 const UNDECLARED_SEAM_MEMBERS: usize = 30;
 /// The keys two tables share — the four external-term encoders, which read the
 /// fun-identity **and** the local-node seams.
@@ -130,7 +130,7 @@ const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("LOCAL_FUN_IDENTITY_BIFS", 4, 4),
     ("DICT_HOOK_BIFS", 7, 7),
     ("PROCESS_HOOK_BIFS", 11, 11),
-    ("PORT_HOOK_BIFS", 4, 0),
+    ("PORT_HOOK_BIFS", 8, 4),
     ("SEND_HOOK_BIFS", 4, 4),
     ("NIF_LOADER_BIFS", 1, 1),
     ("EXPORT_GATE_BIFS", 1, 1),
@@ -139,7 +139,7 @@ const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("PERSISTENT_TERM_BIFS", 7, 7),
     ("FUN_CALLER_BIFS", 24, 0),
     ("LOCAL_NODE_BIFS", 6, 2),
-    ("RUNTIME_HOOKS_BIFS", 172, 172),
+    ("RUNTIME_HOOKS_BIFS", 143, 143),
 ];
 
 /// The declared entries per module, recomputed from the parsed table and pinned in
@@ -391,9 +391,11 @@ fn the_undeclared_seam_members_are_stdlib_fast_paths() {
             key.2
         );
     }
-    // Exactly the three wholly-undeclared tables contribute: the memory pair, the four
-    // `erlang` port operations (the table declares the `erts_internal` ones) and the
-    // fun-taking surface.
+    // Exactly the three wholly-undeclared tables contribute: the memory pair, the port
+    // operations (of which the table declares only the four `erts_internal:` spellings,
+    // not the four `erlang:` ones) and the fun-taking surface. Each table's rows are
+    // filtered through the parsed table, so a *declared* row simply is not an undeclared
+    // member — the expected set stays a construction, never a hand-written list.
     let expected: BTreeSet<(String, String, u32)> = [
         ("MEMORY_HOOK_BIFS", MEMORY_HOOK_BIFS),
         ("PORT_HOOK_BIFS", PORT_HOOK_BIFS),
@@ -401,11 +403,26 @@ fn the_undeclared_seam_members_are_stdlib_fast_paths() {
     ]
     .iter()
     .flat_map(|(_, table)| {
-        table
-            .iter()
-            .map(|&(m, f, a)| (m.to_string(), f.to_string(), a))
+        table.iter().filter_map(|&(m, f, a)| {
+            let key = (m.to_string(), f.to_string(), a);
+            (!is_declared(&tab, &key)).then_some(key)
+        })
     })
     .collect();
+    // The one declared/fast-path split inside a contributing table, pinned explicitly:
+    // of `PORT_HOOK_BIFS`' eight rows exactly the four `erts_internal:` ones are
+    // declared (the C spellings `bif.tab` lists) and the four `erlang:` ones are this
+    // crate's fast paths over the same seam.
+    let port_declared: Vec<&str> = PORT_HOOK_BIFS
+        .iter()
+        .filter(|&&(m, f, a)| is_declared(&tab, &(m.to_string(), f.to_string(), a)))
+        .map(|(m, _, _)| *m)
+        .collect();
+    assert_eq!(
+        port_declared,
+        vec!["erts_internal"; 4],
+        "the port table's declared rows must be exactly its four `erts_internal:` keys"
+    );
     let actual: BTreeSet<(String, String, u32)> = undeclared.into_iter().cloned().collect();
     assert_eq!(
         actual, expected,
@@ -419,6 +436,66 @@ fn the_undeclared_seam_members_are_stdlib_fast_paths() {
             reg.contains(module, function, *arity),
             "{module}:{function}/{arity} reads a seam but is not registered"
         );
+    }
+}
+
+/// The `PortHook` gate covers the port operations in **both** spellings: the four
+/// `erts_internal:` keys `bif.tab` declares (the C bodies
+/// `erts_internal_port_close_1`/`_port_info_1,2`/`_open_port_2`) and the four
+/// `erlang:` keys the `erlang.erl` wrappers expose (this crate's stdlib fast paths,
+/// which the table does not declare). Both spellings read the single seam, so a host
+/// gating its port bridge through [`needs_port_hook`] must build it for either.
+///
+/// The two *pure* textual conversions (`erlang:list_to_port/1`,
+/// `erlang:port_to_list/1`) render `#Port<0.Num>` without touching a port, so they are
+/// deliberately outside the gate.
+#[test]
+fn the_port_hook_gate_covers_both_spellings() {
+    let Some((tab, _)) = census_or_skip() else {
+        return;
+    };
+
+    let declared = [
+        ("erts_internal", "open_port", 2),
+        ("erts_internal", "port_close", 1),
+        ("erts_internal", "port_info", 1),
+        ("erts_internal", "port_info", 2),
+    ];
+    let fast_paths = [
+        ("erlang", "open_port", 2),
+        ("erlang", "port_close", 1),
+        ("erlang", "port_info", 1),
+        ("erlang", "port_info", 2),
+    ];
+    for (module, function, arity) in declared {
+        assert!(
+            tab.contains(module, function, arity),
+            "`bif.tab` must declare the C spelling {module}:{function}/{arity}"
+        );
+        assert!(
+            needs_port_hook(module, function, arity),
+            "{module}:{function}/{arity} reads the PortHook seam"
+        );
+    }
+    for (module, function, arity) in fast_paths {
+        assert!(
+            !tab.contains(module, function, arity),
+            "{module}:{function}/{arity} is this crate's fast path, not a declared entry"
+        );
+        assert!(
+            needs_port_hook(module, function, arity),
+            "{module}:{function}/{arity} reads the PortHook seam"
+        );
+    }
+
+    // The pure textual pair is outside the gate (and registered all the same).
+    let reg = default_registry();
+    for (module, function) in [("erlang", "list_to_port"), ("erlang", "port_to_list")] {
+        assert!(
+            !needs_port_hook(module, function, 1),
+            "{module}:{function}/1 is pure — no PortHook"
+        );
+        assert!(reg.contains(module, function, 1), "{module}:{function}/1");
     }
 }
 

@@ -27,8 +27,7 @@
 //! `../../erts/emulator/beam/bif.tab` that this crate does not implement
 //! natively: they all need the **running** runtime, which lives in other crates
 //! of the workspace and is unreachable from a BIF. The port machinery (`port_call/3`,
-//! `port_command/3`, `port_control/3`, `port_close/1`, `port_connect/2`,
-//! `port_info/1,2`, `open_port/2`), process control (`suspend_process/2`,
+//! `port_command/3`, `port_control/3`, `port_connect/2`), process control (`suspend_process/2`,
 //! `process_flag/3`, `process_display/2`, `processes_next/1`, `system_check/1`,
 //! `scheduler_wall_time/1`, `is_process_alive/2`, `is_system_process/1`,
 //! `spawn_request/4`, `spawn_system_process/3`, `dist_spawn_request/4`,
@@ -48,7 +47,7 @@
 //!
 //! # One seam, one honest gap
 //!
-//! Of the 56 keys, **54** resolve through the **single**
+//! Of the 56 keys, **50** resolve through the **single**
 //! [`RuntimeHooks`](crate::context::RuntimeHooks) dispatcher (via
 //! [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif)),
 //! which is handed the `(module, function, arity)` identity verbatim so the
@@ -57,13 +56,23 @@
 //! (the function *is* a declared BIF; only its runtime provider is missing),
 //! never a fabricated value (workspace `CONTEXT.md` §3).
 //!
-//! The other **two** keys — `ets_raw_first/1` and `ets_raw_next/2` — are served
-//! **for real** ([`REAL_BIFS`]): the C declares them as plain aliases of
-//! `ets:first/1` and `ets:next/2`, *not* a storage-order walk
-//! (`../../erts/emulator/beam/erl_db_hash.c:4188` — "raw_first same as first";
-//! `../../erts/emulator/beam/erl_db_tree.c:539` — "raw_next same as next"), so
-//! they **delegate** to this crate's own `ets` family ([`ets_registry`]) and
-//! therefore cannot drift from `ets:first/1`/`ets:next/2`.
+//! The other **six** keys are served **for real** ([`REAL_BIFS`]):
+//!
+//! * `ets_raw_first/1` and `ets_raw_next/2`: the C declares them as plain aliases of
+//!   `ets:first/1` and `ets:next/2`, *not* a storage-order walk
+//!   (`../../erts/emulator/beam/erl_db_hash.c:4188` — "raw_first same as first";
+//!   `../../erts/emulator/beam/erl_db_tree.c:539` — "raw_next same as next"), so they
+//!   **delegate** to this crate's own `ets` family ([`ets_registry`]) and therefore
+//!   cannot drift from `ets:first/1`/`ets:next/2`;
+//! * `port_close/1`, `port_info/1,2` and `open_port/2`: the C's port quartet
+//!   (`erts_internal_port_close_1`/`_port_info_1,2`/`_open_port_2`), implemented over
+//!   the [`PortHook`](crate::context::PortHook) seam on the machinery
+//!   [`crate::port`] shares with the `erlang:` wrappers' spellings. Their **returned
+//!   atoms are values, not exceptions** (`badarg`/`badtype`/`undefined` — the C's
+//!   `BIF_RET(retval)`), which is what distinguishes them from the raising
+//!   `erlang:port_close/1`/`port_info/1,2`; `open_port/2` is the one that stays the
+//!   typed gap, because the C answers a `#Ref<…>` init ack for a driver with
+//!   `ERL_DRV_FLAG_USE_INIT_ACK` (the `spawn` driver — every `{spawn, Cmd}`).
 //!
 //! A few of these names are additionally intercepted natively by `beam_rt`
 //! *before* the registry is consulted (the runtime's own fast paths); that is
@@ -90,13 +99,21 @@ use crate::runtime::runtime_bif;
 /// The `(module, function, arity)` keys this module registers **for real** (not
 /// through the `RuntimeHooks` seam).
 ///
-/// Sorted by `(module, function, arity)`. These are the two `ets`-interior
-/// navigation keys, whose C implementations are plain aliases of `ets:first/1` and
-/// `ets:next/2`; [`register`] asserts every one of them is actually present after
+/// Sorted by `(module, function, arity)`. Two `ets`-interior navigation keys, whose C
+/// implementations are plain aliases of `ets:first/1` and `ets:next/2`, and the four
+/// port keys, whose C bodies are `erts_internal_port_{close_1,info_1,info_2}` and
+/// `erts_internal_open_port_2` and which are implemented over the
+/// [`PortHook`](crate::context::PortHook) seam here (see [`crate::port`] for the shared
+/// machinery); [`open_port/2`](erts_port_open_2) is the one of the four that is the
+/// typed gap. [`register`] asserts every one of them is actually present after
 /// registration.
 pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
     ("erts_internal", "ets_raw_first", 1),
     ("erts_internal", "ets_raw_next", 2),
+    ("erts_internal", "open_port", 2),
+    ("erts_internal", "port_close", 1),
+    ("erts_internal", "port_info", 1),
+    ("erts_internal", "port_info", 2),
 ];
 
 /// The `ets:*` family, registered once.
@@ -125,6 +142,186 @@ fn ets_raw_first_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// "raw_next same as next").
 fn ets_raw_next_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ets_registry().call("ets", "next", 2, ctx, args)
+}
+
+/// One of the C's static status atoms (`true`, `badarg`, `badtype`, `undefined`),
+/// resolved through this crate's atom table.
+///
+/// `intern_atom`, not `atom`: `badtype` is a C static atom a host's seed may
+/// legitimately lack, and the C always has it. An already-present name never reaches
+/// the interner, so the ordinary path stays a single table lookup.
+fn status_atom(ctx: &mut BifContext<'_>, name: &str) -> Result<Eterm> {
+    ctx.intern_atom(name)
+}
+
+/// `erts_internal:port_close/1` — the C `erts_internal_port_close_1`
+/// (`../../erts/emulator/beam/erl_bif_port.c:384-430`), which `erlang:port_close/1`'s
+/// `erlang.erl` wrapper calls.
+///
+/// # The shapes the C produces (measured on OTP 29.1.1 / erts-17.1)
+///
+/// * a live, internal port ⇒ the atom `true` after the hook's synchronous close;
+/// * a port the runtime no longer holds ⇒ the atom `badarg` **as a value** — the C does
+///   `BIF_RET(retval)` with `retval = am_badarg`, so
+///   `catch erts_internal:port_close(P)` is `badarg`, *not* `{'EXIT',{badarg,_}}`;
+/// * a non-port, non-atom argument (a pid, an integer, a list, …) ⇒ `badarg`, also as a
+///   value, and **before** the seam is consulted;
+/// * an atom ⇒ the C resolves it as a *registered name*
+///   (`erts_whereis_name_to_id`): `badarg` for a name no port holds, `true` for one that
+///   does. The [`PortHook`](crate::context::PortHook) seam has no name lookup, so this is
+///   the typed `unsupported_bif` capability gap — never a fabricated `badarg`, which is
+///   the *wrong* answer for a registered name.
+///
+/// A `#Ref<…>` (the C's `ERTS_PORT_OP_SCHEDULED` arm, which the `erlang:` wrapper
+/// receives `{Ref, Result}` for) is not producible: the seam closes synchronously.
+fn erts_port_close_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let port = match crate::port::port_argument(args[0]) {
+        crate::port::PortArgument::Port(port) => port,
+        crate::port::PortArgument::Name => {
+            return Err(crate::error::unsupported_bif());
+        }
+        crate::port::PortArgument::External | crate::port::PortArgument::Other => {
+            return status_atom(ctx, "badarg");
+        }
+    };
+    match ctx.close_port(port) {
+        Ok(()) => status_atom(ctx, "true"),
+        // The C's `ERTS_PORT_OP_BADARG`/`ERTS_PORT_OP_DROPPED` arms: the port is gone, so
+        // the answer is the atom `badarg` rather than an exception.
+        Err(beam_common::BeamError::BadArg) => status_atom(ctx, "badarg"),
+        // Anything else is the hook's own failure (the typed capability gap for a nested
+        // port-table borrow, an I/O error) and stays a raise.
+        Err(other) => Err(other),
+    }
+}
+
+/// `erts_internal:port_info/1` — the C `erts_internal_port_info_1`
+/// (`../../erts/emulator/beam/erl_bif_port.c:486-536`).
+///
+/// # The shapes the C produces (measured on OTP 29.1.1 / erts-17.1)
+///
+/// For a **live internal port** the answer is the C's `ERTS_PORT_INFO_1_ITEMS` list
+/// (`erl_port.h:100-108`): `registered_name` **first** — and only when the port holds a
+/// name, the C skipping the slot when its value is `undefined` — then `name`, `links`,
+/// `id`, `connected`, `input`, `output`, `os_pid`:
+///
+/// ```text
+/// [{registered_name,myp},{name,"sleep 5"},{links,[<0.10.0>]},{id,24},
+///  {connected,<0.10.0>},{input,0},{output,0},{os_pid,65}]
+/// ```
+///
+/// Every `/2`-only item is absent. So the hook's pairs go through
+/// [`crate::port::port_info_roster`], the same split the `erlang:` spelling uses.
+///
+/// The value-shaped failures:
+///
+/// * a port the runtime no longer holds ⇒ `undefined` (the C's `!prt` arm). An **empty**
+///   hook pair list is that case: a live port always reports at least the seven roster
+///   items, so a host that reports none is reporting a port it does not hold;
+/// * a non-port, non-atom argument ⇒ `badarg` (note: `/1` says `badarg` where `/2` says
+///   `badtype`), before the seam is consulted;
+/// * an **external** port ⇒ `badarg` (the C's remote-dist-entry arm);
+/// * an atom ⇒ a *name*, answered `undefined` when no port holds it. The name lookup is
+///   not on the [`PortHook`](crate::context::PortHook) seam, so an atom is the typed
+///   `unsupported_bif` capability gap for both arities.
+fn erts_port_info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let port = match crate::port::port_argument(args[0]) {
+        crate::port::PortArgument::Port(port) => port,
+        crate::port::PortArgument::Name => {
+            return Err(crate::error::unsupported_bif());
+        }
+        crate::port::PortArgument::External | crate::port::PortArgument::Other => {
+            return status_atom(ctx, "badarg");
+        }
+    };
+    let pairs = ctx.port_info(port)?;
+    if pairs.is_empty() {
+        return status_atom(ctx, crate::port::UNDEFINED_ATOM);
+    }
+    let roster = crate::port::port_info_roster(ctx.atoms(), pairs);
+    let mut tuples = Vec::with_capacity(roster.items.len() + 1);
+    if let Some(name) = roster.registered_name {
+        let item = status_atom(ctx, crate::port::REGISTERED_NAME_ITEM)?;
+        tuples.push(ctx.tuple(&[item, name])?);
+    }
+    for (item, value) in roster.items {
+        tuples.push(ctx.tuple(&[item, value])?);
+    }
+    ctx.list(&tuples)
+}
+
+/// `erts_internal:port_info/2` — the C `erts_internal_port_info_2`
+/// (`../../erts/emulator/beam/erl_bif_port.c:543-580`).
+///
+/// # The shapes the C produces (measured on OTP 29.1.1 / erts-17.1)
+///
+/// * a live internal port and an item it reports ⇒ `{Item, Value}` — every `/2` item,
+///   including the ones `/1` omits (`memory`, `queue_size`, `monitors`, `monitored_by`,
+///   `locking`, `parallelism`);
+/// * the item `registered_name` on a live port with **no** name ⇒ the bare empty list
+///   `[]` (the C's `erts_bld_port_info` returns `NIL` for that slot, not a pair — an
+///   `{registered_name, _}` pair cannot carry it);
+/// * any other item the port does not report ⇒ the atom `badarg` **as a value** (the C's
+///   `ERTS_PORT_OP_BADARG` arm);
+/// * a port the runtime no longer holds ⇒ `undefined`, for **every** item, including
+///   `registered_name`;
+/// * a non-port, non-atom argument ⇒ `badtype` — `/2`'s own class, where `/1` says
+///   `badarg` — before the seam is consulted;
+/// * an atom ⇒ the same typed name-resolution gap as [`erts_port_info_1`].
+fn erts_port_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let item = args[1];
+    let port = match crate::port::port_argument(args[0]) {
+        crate::port::PortArgument::Port(port) => port,
+        crate::port::PortArgument::Name => {
+            return Err(crate::error::unsupported_bif());
+        }
+        crate::port::PortArgument::External | crate::port::PortArgument::Other => {
+            return status_atom(ctx, "badtype");
+        }
+    };
+    let pairs = ctx.port_info(port)?;
+    if pairs.is_empty() {
+        return status_atom(ctx, crate::port::UNDEFINED_ATOM);
+    }
+    let pair = crate::port::find_info_pair(ctx.atoms(), &pairs, item);
+    // The C's one bare-list answer: `registered_name` on a port with no name is `NIL`,
+    // not a pair — and it is the *only* item that gets that treatment.
+    let bare_registered_name = pair.is_none()
+        && crate::port::item_name(ctx.atoms(), item) == Some(crate::port::REGISTERED_NAME_ITEM);
+    match pair {
+        Some((key, value)) => ctx.tuple(&[key, value]),
+        None if bare_registered_name => ctx.list(&[]),
+        None => status_atom(ctx, "badarg"),
+    }
+}
+
+/// `erts_internal:open_port/2` — the C `erts_internal_open_port_2`
+/// (`../../erts/emulator/beam/erl_bif_port.c:60-119`), which `erlang:open_port/2`'s
+/// wrapper calls.
+///
+/// # Why this is the typed gap, not a forwarding BIF
+///
+/// The C's answer is a **port id only for a driver without
+/// `ERL_DRV_FLAG_USE_INIT_ACK`**. A driver that has the flag — the `spawn` driver, which
+/// backs `{spawn, Cmd}` (`../../erts/emulator/sys/unix/sys_drivers.c:251`) — makes the
+/// C answer a **`#Ref<…>`** instead and then asynchronously deliver `{Ref, Port}` to the
+/// caller, which `erlang.erl`'s wrapper receives:
+///
+/// ```text
+/// 1> erts_internal:open_port({spawn,"true"}, []).
+/// #Ref<0.495230390.3888381956.5565>
+/// ```
+///
+/// The [`PortHook`](crate::context::PortHook) seam opens synchronously and answers the
+/// `PortId`, with no way to hand a message back to the calling process — so returning
+/// the port here would be a **wrong result** for every `{spawn, …}`/`{spawn_executable,
+/// …}` name (the most common ones), while returning a reference nobody ever answers
+/// would hang the `erlang.erl` wrapper. The typed `unsupported_bif` gap is the honest
+/// answer until the seam can express the ack (see this crate's `CONTEXT.md` handoffs:
+/// `PortHook::open_port` needs an ack-ref + deferred `{Ref, Port}` delivery, or the
+/// runtime must claim the `erts_internal:` spelling).
+fn erts_port_open_2(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    Err(crate::error::unsupported_bif())
 }
 
 /// Registers this family's BIFs.
@@ -169,14 +366,14 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     runtime_bif!(reg, "erts_internal", new_connection, 1);
     runtime_bif!(reg, "erts_internal", no_aux_work_threads, 0);
     runtime_bif!(reg, "erts_internal", notify_breakpoint_hit, 3);
-    runtime_bif!(reg, "erts_internal", open_port, 2);
+    reg.register("erts_internal", "open_port", 2, erts_port_open_2);
     runtime_bif!(reg, "erts_internal", port_call, 3);
-    runtime_bif!(reg, "erts_internal", port_close, 1);
+    reg.register("erts_internal", "port_close", 1, erts_port_close_1);
     runtime_bif!(reg, "erts_internal", port_command, 3);
     runtime_bif!(reg, "erts_internal", port_connect, 2);
     runtime_bif!(reg, "erts_internal", port_control, 3);
-    runtime_bif!(reg, "erts_internal", port_info, 1);
-    runtime_bif!(reg, "erts_internal", port_info, 2);
+    reg.register("erts_internal", "port_info", 1, erts_port_info_1);
+    reg.register("erts_internal", "port_info", 2, erts_port_info_2);
     runtime_bif!(reg, "erts_internal", prepare_loading, 2);
     runtime_bif!(reg, "erts_internal", process_display, 2);
     runtime_bif!(reg, "erts_internal", processes_next, 1);
@@ -244,6 +441,11 @@ mod tests {
     /// [`super::REAL_BIFS`] lists exactly the keys this module serves with a real
     /// implementation instead of the `RuntimeHooks` seam, and every one of them is
     /// registered by [`super::register`] (the two must never drift apart).
+    ///
+    /// The six are the two `ets`-interior aliases (delegating to the `ets` family) and
+    /// the four C port spellings (implemented over the `PortHook` seam; three real, one
+    /// — `open_port/2` — a documented typed gap whose key still belongs here because its
+    /// implementation is this crate's, not a `RuntimeHooks` forward).
     #[test]
     fn real_bifs_lists_the_keys_this_module_serves_for_real() {
         let mut reg = BifRegistry::new();
@@ -253,6 +455,10 @@ mod tests {
             &[
                 ("erts_internal", "ets_raw_first", 1),
                 ("erts_internal", "ets_raw_next", 2),
+                ("erts_internal", "open_port", 2),
+                ("erts_internal", "port_close", 1),
+                ("erts_internal", "port_info", 1),
+                ("erts_internal", "port_info", 2),
             ]
         );
         for (module, function, arity) in super::REAL_BIFS {

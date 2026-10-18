@@ -19,7 +19,8 @@
 // %CopyrightEnd%
 
 //! Port BIFs for `erlang`: `open_port/2`, `port_close/1`, `port_info/1,2`,
-//! `list_to_port/1` and `port_to_list/1`.
+//! `list_to_port/1` and `port_to_list/1` — plus the shared machinery the
+//! `erts_internal:` spellings of the same operations use.
 //!
 //! Ground truth (read-only): the `open_port/2`, `port_close/1`, `port_info/1,2`,
 //! `list_to_port/1` and `port_to_list/1` roster in
@@ -29,6 +30,28 @@
 //! (`erts_internal_open_port_2`/`erts_internal_port_close_1`/
 //! `erts_internal_port_info_1,2`) and `../../erts/emulator/beam/bif.c`
 //! (`port_to_list_1`/`list_to_port_1`).
+//!
+//! # The C spelling and the `erlang:` wrappers are two different BIFs
+//!
+//! `bif.tab` declares only the `erts_internal:` names; `erlang:open_port/2`,
+//! `erlang:port_close/1` and `erlang:port_info/1,2` are `erlang.erl` **wrappers** over
+//! them (`erts/preloaded/src/erlang.erl:8051`, `:12171`, `:12323`, `:12377`) that
+//! consume the C's value-shaped failures and re-raise them:
+//!
+//! * the C *returns* the atoms `badarg`/`badtype`/`undefined` (it does **not** raise —
+//!   `BIF_RET(retval)`), and the wrapper turns `badarg`/`badtype` into
+//!   `error:badarg`;
+//! * the C may answer a `#Ref<…>` when the operation had to be scheduled onto the
+//!   port's scheduler (or, for `open_port/2`, when the driver takes an init ack), and
+//!   the wrapper receives `{Ref, Result}` and returns `Result`.
+//!
+//! So `erlang:port_info/1,2` and `erlang:port_close/1` raise `badarg` (this module's
+//! `erlang:` [`port_close`]/[`port_info_1`]/[`port_info_2`], unchanged), while the
+//! `erts_internal:` [spellings](crate::runtime::erts_internal) answer the atom. Both
+//! spellings are built on **one** set of helpers here — [`port_argument`] (the C's
+//! `lookup_port` argument classification), [`port_info_roster`] (the `/1` roster) and
+//! [`find_info_pair`] (the `/2` `=:=` item search) — so the item vocabulary, its order
+//! and its `registered_name` rule exist once.
 //!
 //! # A port is runtime machinery, not a BIF
 //!
@@ -60,7 +83,7 @@
 use beam_common::Result;
 use beam_process::PortId;
 use beam_term::compare;
-use beam_term::{atom_val, signed_value, Eterm, PORT_DATA_SIZE};
+use beam_term::{atom_val, signed_value, AtomTable, Eterm, PORT_DATA_SIZE};
 
 use crate::access;
 use crate::context::BifContext;
@@ -93,11 +116,13 @@ fn port_close(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.boolean(true)
 }
 
-/// The `Item` keys `erlang:port_info/1` reports — the oracle's `port_info/1` roster.
+/// The `Item` keys the C's `port_info/1` roster reports, in the C's order
+/// (`ERTS_PORT_INFO_1_ITEMS`, `../../erts/emulator/beam/erl_port.h:100-108`).
 ///
-/// `erts_internal:port_info/1` emits exactly these seven pairs; every other port item
-/// (e.g. `monitors`) is reachable only through `/2`.
-const PORT_INFO_1_ITEMS: [&str; 7] = [
+/// `registered_name` is deliberately **absent**: the C treats it as a separate
+/// *leading* slot that is skipped when the runtime holds no name for the port, so it
+/// is [`REGISTERED_NAME_ITEM`] and [`port_info_roster`]'s business, not a roster entry.
+pub(crate) const PORT_INFO_1_ITEMS: [&str; 7] = [
     "name",
     "links",
     "id",
@@ -107,26 +132,139 @@ const PORT_INFO_1_ITEMS: [&str; 7] = [
     "os_pid",
 ];
 
+/// The `Item` atom of the C's dropped-when-absent leading `/1` slot
+/// (`am_registered_name`, `erl_port.h:101`).
+pub(crate) const REGISTERED_NAME_ITEM: &str = "registered_name";
+
+/// The atom `undefined` — the `os_pid` value of a port with no OS process, and the
+/// `registered_name` value the C's `/1` roster skips (`io.c:4813`).
+pub(crate) const UNDEFINED_ATOM: &str = "undefined";
+
+/// The name of a hook pair's item key — `None` for a key that is not an atom, or whose
+/// atom this runtime's table does not hold (neither can name an item).
+pub(crate) fn item_name<'a>(atoms: &'a AtomTable, key: Eterm) -> Option<&'a str> {
+    if access::is_atom(key) {
+        atoms.name(atom_val(key))
+    } else {
+        None
+    }
+}
+
+/// Whether `term` is the atom `undefined` (`is_nil`-free: by name, through `atoms`).
+fn is_undefined(atoms: &AtomTable, term: Eterm) -> bool {
+    item_name(atoms, term) == Some(UNDEFINED_ATOM)
+}
+
+/// A [`PortHook`](crate::context::PortHook) pair list seen the way the C's `/1` roster
+/// sees it.
+///
+/// The C builds the eight `ERTS_PORT_INFO_1_ITEMS` items, **drops the leading
+/// `registered_name` slot when its value is `undefined`** (`io.c:4808-4816`) and emits
+/// the rest in that fixed roster order. This type is that split: the surviving
+/// `registered_name` value (if any) and the roster pairs, already ordered
+/// [`PORT_INFO_1_ITEMS`]'s way — never the hook's order, so both BIF spellings agree.
+#[derive(Debug, Default)]
+pub(crate) struct PortInfoRoster {
+    /// The port's registered name, when the runtime holds one.
+    pub(crate) registered_name: Option<Eterm>,
+    /// The `/1` roster pairs, in the C's order; an item the hook did not report is
+    /// absent (the C would report every one, so a gap here is a host gap).
+    pub(crate) items: Vec<(Eterm, Eterm)>,
+}
+
+/// Splits a hook pair list into the `/1` roster ([`PortInfoRoster`]).
+///
+/// Every pair whose key is not one of the seven roster items (a `/2`-only item such as
+/// `monitors`/`queue_size`/`memory`, or a non-atom key) is dropped, and a duplicated
+/// item keeps its **first** pair — the C builds each item exactly once.
+pub(crate) fn port_info_roster(atoms: &AtomTable, pairs: Vec<(Eterm, Eterm)>) -> PortInfoRoster {
+    let mut slots: [Option<(Eterm, Eterm)>; PORT_INFO_1_ITEMS.len()] =
+        [None; PORT_INFO_1_ITEMS.len()];
+    let mut registered_name = None;
+    for (key, value) in pairs {
+        let Some(name) = item_name(atoms, key) else {
+            continue;
+        };
+        if name == REGISTERED_NAME_ITEM {
+            if !is_undefined(atoms, value) {
+                registered_name = Some(value);
+            }
+            continue;
+        }
+        let Some(index) = PORT_INFO_1_ITEMS.iter().position(|item| *item == name) else {
+            continue;
+        };
+        if slots[index].is_none() {
+            slots[index] = Some((key, value));
+        }
+    }
+    PortInfoRoster {
+        registered_name,
+        items: slots.into_iter().flatten().collect(),
+    }
+}
+
+/// The pair of `pairs` whose item is `=:=` `item` — the C's `erts_bld_port_info` item
+/// match, which accepts every item the port reports (`/2`-only ones included) and
+/// nothing else.
+pub(crate) fn find_info_pair(
+    atoms: &AtomTable,
+    pairs: &[(Eterm, Eterm)],
+    item: Eterm,
+) -> Option<(Eterm, Eterm)> {
+    pairs
+        .iter()
+        .find(|(key, _)| compare::eq(*key, item, atoms))
+        .copied()
+}
+
+/// How the C's `lookup_port` (`erl_bif_port.c:124-136`) classifies a port argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortArgument {
+    /// An internal port id — the only form this crate can resolve itself.
+    Port(PortId),
+    /// An atom: the **name** a registered port holds (the C's
+    /// `erts_whereis_name_to_id`). Resolving it needs the runtime's name registry,
+    /// which the [`PortHook`](crate::context::PortHook) seam does not expose.
+    Name,
+    /// An external (remote-node) port id. It can never name a port of *this* node's
+    /// table: a term naming this node decodes to an **internal** id (the codec's
+    /// internal-node marker), so every external id this runtime can materialize is
+    /// another node's.
+    External,
+    /// Anything else — a pid, an integer, a tuple, ….
+    Other,
+}
+
+/// Classifies a port argument the way the C's `lookup_port` does.
+pub(crate) fn port_argument(term: Eterm) -> PortArgument {
+    if let Ok(port) = PortId::from_eterm(term) {
+        PortArgument::Port(port)
+    } else if access::is_atom(term) {
+        PortArgument::Name
+    } else if access::is_external_port(term) {
+        PortArgument::External
+    } else {
+        PortArgument::Other
+    }
+}
+
 /// The `erlang:port_info/1` BIF: the seven `/1`-item `{Item, Value}` pairs.
 ///
-/// The oracle's `port_info/1` is *not* the whole `/2` item set — it reports only
-/// `name`, `links`, `id`, `connected`, `input`, `output` and `os_pid`. So the hook's
-/// pair list is filtered: a pair survives iff its key is an atom naming one of those
-/// seven items; every other pair (a `/2`-only item such as `monitors`, or a non-atom
-/// key) is dropped. The surviving pairs keep their hook order.
+/// The oracle's `port_info/1` is *not* the whole `/2` item set — the C reports only
+/// `name`, `links`, `id`, `connected`, `input`, `output` and `os_pid`
+/// ([`PORT_INFO_1_ITEMS`]), so every other hook pair is dropped and the survivors are
+/// emitted in that roster order (the C's, never the hook's).
+///
+/// `registered_name` is dropped too: the C's leading slot belongs to the
+/// `erts_internal:` spelling ([`crate::runtime::erts_internal`]), and the `erlang:`
+/// wrapper's own answer for a registered port comes from the runtime's floor.
 fn port_info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let port = PortId::from_eterm(args[0])?;
     let pairs = ctx.port_info(port)?;
-    let mut tuples = Vec::with_capacity(pairs.len());
-    for (item, value) in pairs {
-        let keep = access::is_atom(item)
-            && ctx
-                .atoms()
-                .name(atom_val(item))
-                .is_some_and(|name| PORT_INFO_1_ITEMS.contains(&name));
-        if !keep {
-            continue;
-        }
+    let roster = port_info_roster(ctx.atoms(), pairs);
+    let mut tuples = Vec::with_capacity(roster.items.len());
+    for (item, value) in roster.items {
         tuples.push(ctx.tuple(&[item, value])?);
     }
     ctx.list(&tuples)
@@ -143,12 +281,8 @@ fn port_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let port = PortId::from_eterm(args[0])?;
     let item = args[1];
     let pairs = ctx.port_info(port)?;
-    for (key, value) in pairs {
-        if compare::eq(key, item, ctx.atoms()) {
-            return ctx.tuple(&[key, value]);
-        }
-    }
-    Err(badarg())
+    let (key, value) = find_info_pair(ctx.atoms(), &pairs, item).ok_or_else(badarg)?;
+    ctx.tuple(&[key, value])
 }
 
 /// The largest internal port number — the C's `ERTS_MAX_INTERNAL_PORT_NUMBER`

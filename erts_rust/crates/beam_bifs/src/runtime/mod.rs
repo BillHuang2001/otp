@@ -35,6 +35,7 @@ use crate::registry::BifRegistry;
 
 pub(crate) mod atomics;
 pub(crate) mod ddll;
+pub(crate) mod debugger;
 pub(crate) mod erlang;
 pub(crate) mod erts_debug;
 pub(crate) mod erts_internal;
@@ -72,6 +73,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     erlang::register(reg);
     erts_internal::register(reg);
     erts_debug::register(reg);
+    debugger::register(reg);
     other::register(reg);
     // The real `atomics`/`counters` resource objects and the real `erl_ddll` error
     // table register LAST so their keys are the ones the registry answers for (the
@@ -108,9 +110,9 @@ mod tests {
     }
 
     /// The per-family key counts this module's `CONTEXT.md` states, pinned against the
-    /// actual registrations: `76 + 56 + 18 + 43 = 193` keys registered across the four
-    /// `runtime_bif!` families, of which **172** forward to the `RuntimeHooks` seam (the
-    /// other twenty-one are the families' real `REAL_BIFS`), plus the 2 `MemoryHook`
+    /// actual registrations: `76 + 56 + 20 + 13 + 28 = 193` keys registered across the five
+    /// `runtime_bif!` families, of which **143** forward to the `RuntimeHooks` seam (the
+    /// other **fifty** are the families' real `REAL_BIFS`), plus the 2 `MemoryHook`
     /// (`erlang:memory/0,1`), 13 `atomics`/`counters` and 1 `ddll` real keys — **209**
     /// registered under `runtime/`. A family that drifts must update the doc.
     #[test]
@@ -126,20 +128,22 @@ mod tests {
             56,
             "runtime/erts_internal.rs"
         );
-        assert_eq!(count(super::erts_debug::register), 18, "runtime/erts_debug.rs");
-        assert_eq!(count(super::other::register), 43, "runtime/other.rs");
+        assert_eq!(count(super::erts_debug::register), 20, "runtime/erts_debug.rs");
+        assert_eq!(count(super::debugger::register), 13, "runtime/debugger.rs");
+        assert_eq!(count(super::other::register), 28, "runtime/other.rs");
         assert_eq!(count(super::memory::register), 2, "runtime/memory.rs");
         assert_eq!(count(super::atomics::register), 13, "runtime/atomics.rs");
         assert_eq!(count(super::ddll::register), 1, "runtime/ddll.rs");
 
-        let family = 76 + 56 + 18 + 43;
-        assert_eq!(family, 193, "the four runtime_bif! families' registered keys");
+        let family = 76 + 56 + 20 + 13 + 28;
+        assert_eq!(family, 193, "the five runtime_bif! families' registered keys");
         // The subset of those keys that really forwards to the `RuntimeHooks` seam is
         // `family` minus every family's real `REAL_BIFS`; it must equal the authoritative
         // `crate::hook_sets::RUNTIME_HOOKS_BIFS` roster.
         let seam = family
             - super::erlang::REAL_BIFS.len()
             - super::erts_debug::REAL_BIFS.len()
+            - super::debugger::REAL_BIFS.len()
             - super::erts_internal::REAL_BIFS.len()
             - super::other::REAL_BIFS.len();
         assert_eq!(

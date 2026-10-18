@@ -38,7 +38,7 @@
 //! | [`LocalFunIdentity`] | [`LOCAL_FUN_IDENTITY_BIFS`] | 4 |
 //! | [`DictHook`] | [`DICT_HOOK_BIFS`] | 7 |
 //! | [`ProcessHook`] | [`PROCESS_HOOK_BIFS`] | 11 |
-//! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 4 |
+//! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 8 |
 //! | [`SendHook`] | [`SEND_HOOK_BIFS`] | 4 |
 //! | [`NifLoader`] | [`NIF_LOADER_BIFS`] | 1 |
 //! | [`ExportGate`](beam_codec::ExportGate) | [`EXPORT_GATE_BIFS`] | 1 |
@@ -47,7 +47,7 @@
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 24 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 172 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 143 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -102,7 +102,7 @@
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
 //! | `RuntimeContext::uses_persistent_term` | [`needs_persistent_term`] |
-//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 172-key seam) |
+//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 143-key seam) |
 //! | — (the port hook is installed unconditionally today) | [`needs_port_hook`] |
 //! | — (the fun caller is gated by `reentrancy_capable(args)` today) | [`needs_fun_caller`] |
 //! | — (the local node is installed unconditionally today) | [`needs_local_node`] |
@@ -188,19 +188,31 @@ pub const PROCESS_HOOK_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "whereis", 1),
 ];
 
-/// The registered BIFs that read the [`PortHook`] seam — the four `src/port.rs`
-/// operations that consult the driver (open a port, close it, read its info).
+/// The registered BIFs that read the [`PortHook`] seam — the port operations that
+/// consult the driver (open a port, close it, read its info), in **both** of the
+/// spellings the C has for them.
 ///
 /// `erlang:port_close/1` returns `true`, and `port_info/1,2` render the hook's
-/// `{Item, Value}` pairs; `erlang:list_to_port/1`/`port_to_list/1` are **pure**
-/// (`#Port<0.Num>` text) and do not read the seam, so they are deliberately absent
-/// even though `port::register` installs them. Sorted by `(module, function,
-/// arity)`; see [`needs_port_hook`].
+/// `{Item, Value}` pairs. The `erts_internal:` keys are the *C* spellings of the same
+/// three operations (`bif.tab` declares only those; `erlang:`'s are `erlang.erl`
+/// wrappers) — they answer the C's value-shaped atoms (`badarg`/`badtype`/`undefined`)
+/// where the `erlang:` spellings raise, and they read the very same seam, prefixed by
+/// this crate's own argument-shape classification. `erts_internal:open_port/2` is here
+/// too even though it is the typed gap: a gap is not a *different* seam, it is a
+/// documented inability to use this one (the C answers a `#Ref<…>` init ack for a
+/// driver with `ERL_DRV_FLAG_USE_INIT_ACK`).
+/// `erlang:list_to_port/1`/`port_to_list/1` are **pure** (`#Port<0.Num>` text) and do
+/// not read the seam, so they are deliberately absent even though `port::register`
+/// installs them. Sorted by `(module, function, arity)`; see [`needs_port_hook`].
 pub const PORT_HOOK_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "open_port", 2),
     ("erlang", "port_close", 1),
     ("erlang", "port_info", 1),
     ("erlang", "port_info", 2),
+    ("erts_internal", "open_port", 2),
+    ("erts_internal", "port_close", 1),
+    ("erts_internal", "port_info", 1),
+    ("erts_internal", "port_info", 2),
 ];
 
 /// The registered BIFs that read the [`SendHook`] seam — `erlang:send/2`, its quoted
@@ -349,17 +361,24 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 /// through the `runtime_bif!` macro in `src/runtime/`, each bridging to
 /// [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif).
 ///
-/// The union of the four `runtime_bif!` family modules: `runtime/erlang.rs` (76),
-/// `runtime/erts_internal.rs` (56), `runtime/erts_debug.rs` (18) and
-/// `runtime/other.rs` (43) = **193** registered keys, of which **172** forward to the
-/// seam — the twenty-one keys with real implementations (`erlang:is_builtin/3`,
-/// `erlang:term_to_iovec/1,2`, `erts_debug:map_info/1`,
-/// `erts_debug:unaligned_bitstring/2`, `erts_internal:ets_raw_first/1`,
-/// `erts_internal:ets_raw_next/2`, the eight `re:*` keys served by `crate::re` and the
+/// The union of the five `runtime_bif!` family modules: `runtime/erlang.rs` (76),
+/// `runtime/erts_internal.rs` (56), `runtime/erts_debug.rs` (20),
+/// `runtime/debugger.rs` (13) and `runtime/other.rs` (28) = **193** registered keys,
+/// of which **143** forward to the seam — the fifty keys with real implementations
+/// (`erlang:is_builtin/3`, `erlang:term_to_iovec/1,2`, the twelve `erts_debug` /
+/// `erts_trace_cleaner` / `erts_literal_area_collector` constants and term walks
+/// (`copy_shared/2`, `disassemble/1`, `get_internal_state/1`, `interpreter_size/0`,
+/// `lcnt_clear/0`, `lcnt_collect/0`, `lcnt_control/1,2`, `map_info/1`,
+/// `set_internal_state/2`, `size_shared/1`, `unaligned_bitstring/2`,
+/// `erts_trace_cleaner:send_trace_clean_signal/1`,
+/// `erts_literal_area_collector:send_copy_request/3`), the whole thirteen-key
+/// `erl_debugger` family, `erts_internal:ets_raw_first/1`,
+/// `erts_internal:ets_raw_next/2`, the `erts_internal:` port quartet
+/// (`open_port/2`, `port_close/1`, `port_info/1,2` — which read the separate
+/// [`PORT_HOOK_BIFS`] seam instead), the eight `re:*` keys served by `crate::re` and the
 /// six `erl_ddll` keys (`demonitor/1`, `info/2`, `loaded_drivers/0`, `monitor/2`,
 /// `try_load/3`, `try_unload/2`) served by `crate::runtime::ddll::{live,info,monitor}`;
-/// the `REAL_BIFS` of those four families) never read it
-/// and are therefore not here.
+/// the `REAL_BIFS` of those five families) never read it and are therefore not here.
 /// The `erlang:memory/0,1` pair in
 /// `runtime/memory.rs` is registered against the separate [`MEMORY_HOOK_BIFS`] seam,
 /// the 13 `atomics`/`counters` resource-object keys are real implementations
@@ -382,19 +401,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("code", "get_debug_info", 1),
     ("code", "reset_coverage", 1),
     ("code", "set_coverage_mode", 1),
-    ("erl_debugger", "breakpoint", 3),
-    ("erl_debugger", "breakpoints", 1),
-    ("erl_debugger", "breakpoints", 3),
-    ("erl_debugger", "instrumentations", 0),
-    ("erl_debugger", "peek_stack_frame_slot", 4),
-    ("erl_debugger", "peek_xreg", 3),
-    ("erl_debugger", "register", 1),
-    ("erl_debugger", "stack_frames", 2),
-    ("erl_debugger", "supported", 0),
-    ("erl_debugger", "toggle_instrumentations", 1),
-    ("erl_debugger", "unregister", 2),
-    ("erl_debugger", "whereis", 0),
-    ("erl_debugger", "xregs_count", 1),
     ("erlang", "alias", 1),
     ("erlang", "bump_reductions", 1),
     ("erlang", "call_on_load_function", 1),
@@ -470,21 +476,11 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "unlink", 1),
     ("error_logger", "warning_map", 0),
     ("erts_debug", "breakpoint", 2),
-    ("erts_debug", "copy_shared", 2),
     ("erts_debug", "dirty", 3),
     ("erts_debug", "dirty_cpu", 2),
     ("erts_debug", "dirty_io", 2),
-    ("erts_debug", "disassemble", 1),
     ("erts_debug", "dist_ext_to_term", 2),
-    ("erts_debug", "get_internal_state", 1),
     ("erts_debug", "instructions", 0),
-    ("erts_debug", "interpreter_size", 0),
-    ("erts_debug", "lcnt_clear", 0),
-    ("erts_debug", "lcnt_collect", 0),
-    ("erts_debug", "lcnt_control", 1),
-    ("erts_debug", "lcnt_control", 2),
-    ("erts_debug", "set_internal_state", 2),
-    ("erts_debug", "size_shared", 1),
     ("erts_internal", "abort_pending_connection", 2),
     ("erts_internal", "beamfile_chunk", 2),
     ("erts_internal", "beamfile_module_md5", 1),
@@ -509,14 +505,10 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_internal", "new_connection", 1),
     ("erts_internal", "no_aux_work_threads", 0),
     ("erts_internal", "notify_breakpoint_hit", 3),
-    ("erts_internal", "open_port", 2),
     ("erts_internal", "port_call", 3),
-    ("erts_internal", "port_close", 1),
     ("erts_internal", "port_command", 3),
     ("erts_internal", "port_connect", 2),
     ("erts_internal", "port_control", 3),
-    ("erts_internal", "port_info", 1),
-    ("erts_internal", "port_info", 2),
     ("erts_internal", "prepare_loading", 2),
     ("erts_internal", "process_display", 2),
     ("erts_internal", "process_flag", 3),
@@ -540,9 +532,7 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_internal", "trace_session_create", 3),
     ("erts_internal", "trace_session_destroy", 1),
     ("erts_literal_area_collector", "release_area_switch", 0),
-    ("erts_literal_area_collector", "send_copy_request", 3),
     ("erts_trace_cleaner", "check", 0),
-    ("erts_trace_cleaner", "send_trace_clean_signal", 1),
     ("ets", "internal_request_all", 0),
     ("net_kernel", "dflag_unicode_io", 1),
     ("os", "set_signal", 2),
@@ -872,8 +862,9 @@ mod tests {
     }
 
     #[test]
-    fn port_hook_bifs_are_the_four_driver_operations() {
-        // `list_to_port/1` and `port_to_list/1` are pure and deliberately absent.
+    fn port_hook_bifs_are_the_driver_operations_in_both_spellings() {
+        // `list_to_port/1` and `port_to_list/1` are pure and deliberately absent; the
+        // `erts_internal:` keys are the C spellings of the same three operations.
         assert_eq!(
             PORT_HOOK_BIFS,
             &[
@@ -881,6 +872,10 @@ mod tests {
                 ("erlang", "port_close", 1),
                 ("erlang", "port_info", 1),
                 ("erlang", "port_info", 2),
+                ("erts_internal", "open_port", 2),
+                ("erts_internal", "port_close", 1),
+                ("erts_internal", "port_info", 1),
+                ("erts_internal", "port_info", 2),
             ]
         );
     }
@@ -1096,7 +1091,11 @@ mod tests {
                 LOCAL_FUN_IDENTITY_BIFS,
                 &[crate::binconv::register, crate::term_conv::register],
             ),
-            ("PORT_HOOK_BIFS", PORT_HOOK_BIFS, &[crate::port::register]),
+            (
+                "PORT_HOOK_BIFS",
+                PORT_HOOK_BIFS,
+                &[crate::port::register, crate::runtime::register],
+            ),
             (
                 "SEND_HOOK_BIFS",
                 SEND_HOOK_BIFS,
@@ -1153,16 +1152,17 @@ mod tests {
     }
 
     /// The strongest guard: [`RUNTIME_HOOKS_BIFS`] is asserted **equal** to the roster
-    /// of `src/runtime/`'s four `runtime_bif!` families, so the table is provably
+    /// of `src/runtime/`'s five `runtime_bif!` families, so the table is provably
     /// complete, not merely sound.
     ///
     /// `runtime::register` additionally installs the `erlang:memory/0,1` pair (which
     /// reads the separate [`MemoryHook`] seam), the 13 real `atomics`/`counters`
     /// resource-object keys and the real `erl_ddll:format_error_int/1` (which do not
     /// go through the `RuntimeHooks` seam at all), plus — inside the families
-    /// themselves — the twenty-one keys with real implementations that never read the seam
-    /// (`crate::runtime::{erlang,erts_debug,erts_internal,other}::REAL_BIFS`, where
-    /// `other`'s roster covers the eight `crate::re` keys and the six
+    /// themselves — the forty-six keys with real implementations that never read the seam
+    /// (`crate::runtime::{erlang,erts_debug,debugger,erts_internal,other}::REAL_BIFS`,
+    /// where `debugger`'s roster is the whole `erl_debugger` family and `other`'s
+    /// covers the eight `crate::re` keys and the six
     /// `crate::runtime::ddll::{live,info,monitor}` keys), so every
     /// one of those groups is filtered out first.
     #[test]
@@ -1180,6 +1180,9 @@ mod tests {
         });
         expected.retain(|(m, f, a)| {
             !crate::runtime::erts_debug::REAL_BIFS.contains(&(m.as_str(), f.as_str(), *a))
+        });
+        expected.retain(|(m, f, a)| {
+            !crate::runtime::debugger::REAL_BIFS.contains(&(m.as_str(), f.as_str(), *a))
         });
         expected.retain(|(m, f, a)| {
             !crate::runtime::erts_internal::REAL_BIFS.contains(&(m.as_str(), f.as_str(), *a))
@@ -1200,7 +1203,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 172);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 143);
     }
 
     /// The module-doc table at the top of this file is the human-readable record of the
@@ -1271,8 +1274,8 @@ mod tests {
             "the doc's documented-key total must equal the sum over every exported table"
         );
         assert_eq!(
-            aggregate, 246,
-            "the documented seam surface is 246 keys across the 14 tables; a table \
+            aggregate, 221,
+            "the documented seam surface is 221 keys across the 14 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
         );
     }
@@ -1376,7 +1379,8 @@ mod tests {
                     // `list_to_port/1`/`port_to_list/1` are pure: no PortHook.
                     ("erlang", "list_to_port", 1),
                     ("erlang", "port_to_list", 1),
-                    ("erts_internal", "port_close", 1), // the runtime-hooks seam
+                    ("erts_internal", "port_close", 2), // wrong arity
+                    ("erts_internal", "port_command", 3), // a different port operation
                 ],
             ),
             (
