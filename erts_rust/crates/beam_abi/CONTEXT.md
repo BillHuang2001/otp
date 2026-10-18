@@ -153,7 +153,9 @@ The *internal* boundary the `driver_*` bodies are written against (source `src/d
   **defaulted** (`-1`, `None`): `output2(port, header: &[u8], body: Option<&[u8]>) -> c_int` (the
   split-reply hook every `driver_output*` thunk routes through — see *The split hook*),
   `select`, `set_timer`, `cancel_timer`, `read_timer`, `r#async`,
-  `connected_pid`, `caller_pid`, `binary_to_term` (the ETF decode behind `ERL_DRV_EXT2TERM`), the
+  `connected_pid`, `caller_pid`, `port_term` (an `ErlDrvPort` handle → the port's **id term**;
+  `io.c:7295-7303` `prt->common.id` — the hook that closes the `ERL_DRV_PORT` term-data operand,
+  see *Driver host layer*), `binary_to_term` (the ETF decode behind `ERL_DRV_EXT2TERM`), the
   port-queue hooks `enq`/`pushq`/`deq`/`sizeq`/`peekq`, the attribute hooks
   `set_busy_port`/`set_control_flags`/`get_port_flags`, the failure/lifecycle hooks
   `failure`/`port_exit`/`busy_msgq_limits`/`init_ack`/`set_os_pid`/`async_port_key`, the monitor hooks
@@ -524,14 +526,32 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 
 ### Documented deviations from the oracle
 (each site's module docs carry the full rationale)
-- `driver_mk_atom` returns the **name pointer** (the `ERL_DRV_ATOM` operand `decode_term_spec` interns), the C a pre-interned atom handle; `driver_mk_port` returns the **port handle pointer** (the `erl_drv_output_term`/`erl_drv_send_term` encoding), the C the port's id term (each pair round-trips).
-- `driver_mk_port(NULL)` returns `driver_term_nil` (is safe); the oracle does **not** null-check the operand and its VM exits on the spot (exit signal, empty stdout) — a deliberate, retained divergence, since that behaviour is an unpinnable probe hazard (`src/driver/drv/port.rs`).
+- `driver_mk_atom` returns the **name pointer** (the `ERL_DRV_ATOM` operand `decode_term_spec` interns), the C a pre-interned atom handle; `driver_mk_port` returns the **port handle pointer** (the `erl_drv_output_term`/`erl_drv_send_term` **port parameter** encoding), the C the port's id term (each pair round-trips). The **operand** form is no longer a deviation: a `{ERL_DRV_PORT, driver_mk_port(port)}` operand is resolved back to the port's id term through `DriverHost::port_term`, so the C idiom delivers the port term.- `driver_mk_port(NULL)` returns `driver_term_nil` (is safe); the oracle does **not** null-check the operand and its VM exits on the spot (exit signal, empty stdout) — a deliberate, retained divergence, since that behaviour is an unpinnable probe hazard (`src/driver/drv/port.rs`).
 - `driver_output_term`/`driver_send_term`/`erl_drv_output_term`/`erl_drv_send_term` return the host's code (`0` = delivered), the C `1`/`0`; the documented `< 0` idiom sees identical behaviour.
 - `erl_errno_id` returns `strerror`'s descriptive message (the oracle the lowercase POSIX errno *name*); `erl_drv_time_offset` returns `0` by construction (monotonic time is anchored on the system epoch); `erl_drv_consume_timeslice` always returns `0` (no port-timeslice accounting); `driver_system_info` returns without writing for a null `sip` or an `si_size` shorter than the first field group, where the C calls `erts_exit(ERTS_ERROR_EXIT, …)`.
 - Refusals where the C would fault or over-read: a malformed/out-of-range request (`driver_output_binary`, `offset + len > orig_size`, `driver_outputv`, `skip`, `time_left`, `ErlIOVec`) refused with `-1`; a `NULL` `driver_name` is a typed `BadDriverName`; a `dlopen` failure lands in `Unspecified` carrying the loader's own `dlerror` text (the C renders an `{open_error, N}` code); the `.so` suffix is appended only when absent. No code-server/driver list or reload policy is consulted (only the *entry* validation).
 
 ## Handoffs (host halves owned by other nodes)
-- **`DriverHost::output2` adoption — the only remaining step for a loaded C driver's split reply.**
+- **`DriverHost::port_term` adoption — the last step for the `ERL_DRV_PORT` operand on a live
+  runtime.** `decode_term_spec`'s `ERL_DRV_PORT` arm keeps the C's own path (`is_internal_port`
+  ⇒ push the operand unchanged, `io.c:5744-5747`/`5969-5972`) and otherwise resolves the operand as
+  an `ErlDrvPort` **handle** through the additive, defaulted `DriverHost::port_term(port) ->
+  Option<Eterm>` hook (`None` = unknown handle ⇒ the spec is refused, the trait default). The two
+  encodings are disjoint (a live handle is a non-null 8-aligned pointer, low bits 0, while
+  `is_internal_port` is `x & 0xF == 0x7`), so resolution is unambiguous and safe. Both hosts must
+  implement it, mapping a live handle to the port's id term:
+  - `beam_rt`'s `DriverPort` (`beam_rt/src/port/driver.rs`, whose `impl DriverHost` also owns the
+    driver-registry slots) — a `beam_process`/`beam_term` internal port term for the registered port.
+  - `beam_io`'s `AbiHost` (`beam_io/src/abi/host.rs`) — likewise, over its `PortRegistry`.
+  Until one does, a loaded C driver written the C way still delivers nothing on that runtime
+  (measured: the receiver times out); the `beam_abi` half is complete and pinned
+  (`tests/driver_port_term.rs`, `tests/fixtures/driver_port_term.c`). Measured against the real
+  system ERTS (OTP 29.1.1 / erts-17.1) with that fixture: `erl_drv_output_term` with the operand ⇒
+  **`1`** and the owner receives **the port term itself** (`is_port(T), T =:= Port`),
+  `erl_drv_send_term` ⇒ **`1`** and the connected process receives it, both nested in a tuple
+  (`{tag, Port}`) ⇒ **`1`**, and a non-port operand (`1`) ⇒ **`-1`** with nothing delivered. This
+  crate's host seam answers `0` for "delivered" (the documented deviation with the same `< 0`
+  predicate), and the delivered terms are identical.- **`DriverHost::output2` adoption — the only remaining step for a loaded C driver's split reply.**
   All four `driver_output*` thunks now hand the split to `output2`; a host that does not override it
   gets the default (header-then-body joined into one `output` call), i.e. today's flattened result.
   Two hosts must implement it:
