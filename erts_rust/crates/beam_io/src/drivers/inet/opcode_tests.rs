@@ -637,23 +637,29 @@ fn numeric_getstatus_reports_the_c_state_bits() {
 }
 
 /// `INET_REQ_GETSTAT`(11) answers the bare success tag for an **empty** request — nothing
-/// requested, nothing appended — and a typed gap for a counter request.
+/// requested, nothing appended — and the C's `badarg` for an out-of-range `INET_STAT_*` byte:
+/// `inet_fill_stat`'s `default: return -1` (`inet_drv.c:10786`) makes the driver's `control`
+/// callback return negative, which `erlang:port_control/3` raises as the bare atom (measured),
+/// discarding the whole reply — so a request that starts with valid ops and then hits a bad one
+/// is a plain `badarg`, never a partial reply.
 ///
-/// Divergence from the C: `inet_fill_stat` answers `badarg` for an out-of-range `INET_STAT_*`
-/// byte (`inet_drv.c:10732`, measured as a `badarg` raise in the oracle), while this floor has no
-/// statistics counters at all and reports the whole family as the typed `unsupported` reason
-/// rather than fabricating a zeroed counter. The assertion below pins the implemented answer.
+/// The record rendering itself (the counter blocks, the 32-/64-bit widths and the per-driver
+/// accounting) is pinned by the sibling [`stat_tests`](super::stat_tests) suite.
 #[test]
-fn numeric_getstat_is_ok_when_empty_and_a_typed_gap_otherwise() {
+fn numeric_getstat_is_ok_when_empty_and_badarg_for_an_unknown_counter() {
     let mut port = opened_port();
     assert_eq!(port.control(&op(11), &[]), ctl_ok(), "INET_REQ_GETSTAT");
 
-    let err = port
-        .try_control(&op(11), &[99])
-        .expect_err("a counter request is a typed gap");
     assert!(
-        reason_of(err).starts_with("unsupported: the C's inet statistics counters"),
-        "the gap names the missing counters"
+        matches!(port.try_control(&op(11), &[99]), Err(BeamError::BadArg)),
+        "an unknown counter op is the C's `-1`"
+    );
+    assert!(
+        matches!(
+            port.try_control(&op(11), &[1, 99]),
+            Err(BeamError::BadArg)
+        ),
+        "the whole reply is discarded, not just the bad record"
     );
 }
 

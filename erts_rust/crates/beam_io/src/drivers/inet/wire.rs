@@ -340,25 +340,65 @@ pub(super) fn errno_name(errno: i32) -> String {
 // once per driver. Each builder is a faithful port of the corresponding C arm; where this floor
 // cannot produce the C's payload it is a typed error, never a fabricated reply.
 
-/// The `INET_REQ_GETSTAT` reply (the C's `inet_fill_stat`, `inet_drv.c:10732`).
+/// The `INET_REQ_GETSTAT` reply (the C's `inet_fill_stat`, `inet_drv.c:10732`-`:10792`).
+///
+/// The reply is the leading [`INET_REP_OK`] tag followed by one record per requested
+/// `INET_STAT_*` op byte **in request order**: the op byte itself, then the counter. Ops 9
+/// (`recv_oct`) and 10 (`send_oct`) carry a big-endian **64-bit** value (`put_int64`, the
+/// `ARCH_64` path at `:10768`-`:10785`); every other op carries the C's `put_int32` big-endian
+/// **32-bit** value (`:10788`), which truncates the running doubles (`(unsigned long)
+/// desc->recv_avg`, `(unsigned long) fabs(desc->recv_dvi)`) and the peak sizes.
+///
+/// `send_pend` (op 8) is the C's `driver_sizeq(desc->port)` — the port's **current** output-queue
+/// byte count, which the caller reads off the [`crate::DriverContext`] rather than off the
+/// counter block.
 ///
 /// An **empty** request answers the bare success tag — the C's `fill_stat` writes a record only
 /// for each requested counter, so nothing requested means nothing appended (measured `[1]` on
-/// both drivers' bare ports).
+/// both drivers' bare ports). There is **no `IS_OPEN` guard**: a socket-less port answers fully
+/// zeroed counters.
 ///
 /// # Errors
 ///
-/// [`beam_common::BeamError`] carrying the typed "not served" reason for a non-empty request: the
-/// C's statistics counters (`recv_cnt`/`send_cnt`/`recv_oct`/`send_oct`/…) live on the driver's
-/// descriptor and are not tracked by this floor, and answering a zeroed counter would be a wrong
-/// value rather than a missing one.
-pub(super) fn getstat_reply(arg: &[u8]) -> Result<Vec<u8>> {
-    if arg.is_empty() {
-        return Ok(ctl_ok());
+/// [`beam_common::BeamError::BadArg`] for a request containing an op byte outside 1-10: the C's
+/// `inet_fill_stat` `default: return -1` (`:10786`) makes the driver's `control` callback return
+/// negative, which `erlang:port_control/3` raises as the bare atom `badarg` — the whole reply is
+/// discarded, so nothing partial escapes.
+pub(super) fn getstat_reply(
+    arg: &[u8],
+    stats: &super::stat::InetStat,
+    send_pend: usize,
+) -> Result<Vec<u8>> {
+    let mut reply = ctl_ok();
+    for &op in arg {
+        // The C's `put_int32` copies the low 32 bits (`sys.h:1286`), so every 32-bit record
+        // truncates rather than saturating — `as u32` on an integer is that same truncation.
+        let word: u32 = match op {
+            1 => stats.recv_cnt as u32,
+            2 => stats.recv_max as u32,
+            3 => stats.recv_avg as u32,
+            4 => stats.recv_dvi.abs() as u32,
+            5 => stats.send_cnt as u32,
+            6 => stats.send_max as u32,
+            7 => stats.send_avg as u32,
+            8 => send_pend as u32,
+            9 => {
+                reply.push(op);
+                reply.extend_from_slice(&stats.recv_oct.to_be_bytes());
+                continue;
+            }
+            10 => {
+                reply.push(op);
+                reply.extend_from_slice(&stats.send_oct.to_be_bytes());
+                continue;
+            }
+            // The C's `default: return -1` — propagated as `badarg` by `port_control/3`.
+            _ => return Err(error::badarg()),
+        };
+        reply.push(op);
+        reply.extend_from_slice(&word.to_be_bytes());
     }
-    Err(error::unsupported(
-        "the C's inet statistics counters (inet_fill_stat) are not tracked by this driver",
-    ))
+    Ok(reply)
 }
 
 /// The `INET_REQ_GETTYPE` reply: the descriptor's **cached** `{Family, Type}` pair
