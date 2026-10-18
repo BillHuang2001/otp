@@ -832,6 +832,12 @@ impl TcpInetDriver {
     /// nothing is stripped and the command's bytes stay queued), or the typed `unsupported` of a
     /// context with no completion sink.
     pub(super) fn write_command(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        // A re-driven `OUTPUT` task with nothing queued is not a command: the C is only ever
+        // handed one (`tcp_inet_commandv`'s `ev->size`), and `init_caller` on an empty buffer is
+        // its `size < 2` FALSE — which would kill the port over a write that already finished.
+        if ctx.output().is_empty() {
+            return Ok(0);
+        }
         // The C's `init_caller` runs first, before the connection state is looked at
         // (`tcp_inet_commandv`, `inet_drv.c:12656`-`:12667`), and its failure kills the port.
         let Some(stripped) = self.strip_command_prefix(ctx) else {

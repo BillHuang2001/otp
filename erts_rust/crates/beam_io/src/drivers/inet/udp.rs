@@ -572,9 +572,12 @@ pub struct UdpInetDriver {
     /// # Errors
     ///
     /// [`beam_common::BeamError::BadArg`] for a port with no socket (`:15068`) or a command in
-    /// neither wire form, as above — the queued bytes stay queued, never silently dropped — and
-    /// the typed `unsupported` raise for ancillary data. `BeamError::Io` when a send fails
-    /// irrecoverably.
+    /// neither wire form; both leave the queue untouched, so nothing is silently dropped. The
+    /// queued route turns the second into the C's `inet_reply_error(EINVAL)`
+    /// ([`UdpInetDriver::write_command`], which is also why the socket-less arm is unreachable
+    /// from there): the C's `packet_inet_command` never reaches this grammar with `!IS_OPEN`.
+    /// The typed `unsupported` raise for ancillary data is not converted — it is a capability
+    /// gap, not the C's `return_einval`. `BeamError::Io` when a send fails irrecoverably.
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if ctx.output().is_empty() {
             return Ok(0);
@@ -1505,9 +1508,10 @@ fn decode_queued_command(front: &[u8]) -> Result<(InetAddr, &[u8])> {
 /// Folds [`DatagramCommand::Einval`] into the typed argument fault this path reports and yields
 /// the address/payload pair of a real send.
 ///
-/// `Einval` is the C's `return_einval` (`inet_drv.c:15155`/`:15158`), which the `port_control`
-/// route renders as a `[0]einval` reply and the queued route — having no reply channel — reports
-/// as [`beam_common::BeamError::BadArg`].
+/// `Einval` is the C's `return_einval` (`inet_drv.c:15155`/`:15158`): the `port_control` route
+/// renders it as a `[0]einval` control reply, and the queued route as the C's out-of-band
+/// `{inet_reply, Port, {error, einval}, Tag}` ([`UdpInetDriver::write_command`]) — the reason it
+/// travels up as a [`beam_common::BeamError::BadArg`] is that the decode itself is term-free.
 fn as_datagram(command: DatagramCommand<'_>) -> Result<(InetAddr, &[u8])> {
     match command {
         DatagramCommand::Send(address, payload) => Ok((address, payload)),
