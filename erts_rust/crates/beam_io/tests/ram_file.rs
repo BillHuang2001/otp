@@ -275,9 +275,9 @@ fn reply_bytes(notifications: Vec<PortNotification>, id: PortId) -> Vec<u8> {
     let mut reply = Vec::new();
     for notification in notifications {
         match notification {
-            PortNotification::Data { port, bytes } => {
+            PortNotification::Data { port, read } => {
                 assert_eq!(port, id, "the reply names the command's own port");
-                reply.extend_from_slice(&bytes);
+                reply.extend_from_slice(&read.flattened());
             }
             PortNotification::Closed { port } => {
                 panic!("port {port:?} closed during a command round")
@@ -522,7 +522,10 @@ fn the_opcode_grammar_surfaces_its_replies_as_port_data() {
         if index == 0 {
             assert_eq!(
                 notifications,
-                vec![PortNotification::Data { port: id, bytes: vec![3, 0, 0, 0, 0] }],
+                vec![PortNotification::Data {
+                    port: id,
+                    read: ReadMessage::body_only(vec![3, 0, 0, 0, 0]),
+                }],
                 "`open` answers `NUMBER 0` as the bytes of one Data notification"
             );
         }

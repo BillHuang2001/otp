@@ -322,7 +322,7 @@ fn a_datagram_from_a_second_socket_surfaces_through_the_reactor() {
         harvest(&mut poller, &mut ports),
         vec![PortNotification::Data {
             port: id,
-            bytes: b"ping".to_vec(),
+            read: ReadMessage::body_only(b"ping".to_vec()),
         }],
         "the datagram reaches the port's owner through the Data channel"
     );
@@ -442,7 +442,7 @@ fn the_read_and_write_readiness_rounds_behave_for_a_datagram_socket() {
         harvest(&mut poller, &mut ports),
         vec![PortNotification::Data {
             port: id,
-            bytes: b"echo".to_vec(),
+            read: ReadMessage::body_only(b"echo".to_vec()),
         }],
         "the echoed datagram reaches the owner"
     );
@@ -462,7 +462,7 @@ fn the_read_and_write_readiness_rounds_behave_for_a_datagram_socket() {
         harvest(&mut poller, &mut ports),
         vec![PortNotification::Data {
             port: id,
-            bytes: b"full".to_vec(),
+            read: ReadMessage::body_only(b"full".to_vec()),
         }]
     );
 
@@ -890,7 +890,7 @@ fn the_recv_verb_is_the_documented_divergence_from_the_oracles_code_60() {
         harvest(&mut poller, &mut ports),
         vec![PortNotification::Data {
             port: id,
-            bytes: b"x".to_vec(),
+            read: ReadMessage::body_only(b"x".to_vec()),
         }]
     );
 

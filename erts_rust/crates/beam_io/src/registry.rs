@@ -792,7 +792,7 @@ mod tests {
     use crate::poller::{Event, Interest, Poller, Ready, Token, WAKER_KEY};
     use crate::port::{PortCommandOptions, PortControl, PortState, DEFAULT_READINESS_RED_BUDGET};
     use crate::port_task::{
-        LineNotification, PortNotification, PortTaskKind, Readiness, PORT_REDS_INPUT,
+        LineNotification, PortNotification, PortTaskKind, ReadMessage, Readiness, PORT_REDS_INPUT,
         PORT_REDS_TIMEOUT,
     };
     use beam_common::{BeamError, Result};
@@ -1096,7 +1096,7 @@ mod tests {
             outcome.notifications,
             vec![PortNotification::Data {
                 port: id,
-                bytes: b"hi".to_vec()
+                read: ReadMessage::body_only(b"hi".to_vec())
             }]
         );
         assert_eq!(
@@ -1112,6 +1112,7 @@ mod tests {
     fn line(port: PortId, bytes: &[u8], eol: bool) -> LineNotification {
         LineNotification {
             port,
+            header: Vec::new(),
             bytes: bytes.to_vec(),
             eol,
         }
@@ -1351,7 +1352,7 @@ mod tests {
             round(&mut poller, &mut registry),
             vec![PortNotification::Data {
                 port: id,
-                bytes: b"a\nb\n".to_vec()
+                read: ReadMessage::body_only(b"a\nb\n".to_vec())
             }],
             "with line mode off the whole read crosses as one Data notification"
         );

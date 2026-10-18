@@ -138,7 +138,7 @@ fn scheduled_output_and_input_tasks_end_to_end() {
         read_round.notifications,
         vec![PortNotification::Data {
             port: id,
-            bytes: b"ping".to_vec()
+            read: ReadMessage::body_only(b"ping".to_vec())
         }]
     );
 
@@ -336,7 +336,7 @@ fn a_port_data_notification_wakes_a_blocked_process() {
         .expect("the INPUT task reads the bytes back");
     assert_eq!(read_round.ran, 1);
     let (port, bytes) = match read_round.notifications.as_slice() {
-        [PortNotification::Data { port, bytes }] => (*port, bytes.clone()),
+        [PortNotification::Data { port, read }] => (*port, read.flattened()),
         other => panic!("expected exactly one Data notification, got {other:?}"),
     };
     assert_eq!(port, id, "the notification names the port that produced it");

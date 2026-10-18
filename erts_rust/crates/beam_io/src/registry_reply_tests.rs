@@ -53,7 +53,7 @@ use beam_process::PortId;
 use crate::driver::{Driver, DriverContext, DriverRegistry};
 use crate::poller::Poller;
 use crate::port::{Port, PortCommandOptions, DEFAULT_READINESS_RED_BUDGET};
-use crate::port_task::{PortNotification, PortTaskKind};
+use crate::port_task::{PortNotification, PortTaskKind, ReadMessage};
 use crate::registry::PortRegistry;
 
 /// The exact `port_command` payload the divergence record measured: `ram_file_drv`'s `open`
@@ -139,7 +139,7 @@ fn a_built_in_drivers_reply_reaches_the_owner_as_one_data_notification() {
         round.notifications,
         vec![PortNotification::Data {
             port: id,
-            bytes: OPEN_READ_WRITE_ABC_REPLY.to_vec(),
+            read: ReadMessage::body_only(OPEN_READ_WRITE_ABC_REPLY.to_vec()),
         }],
         "exactly one notification, naming that port, carrying the driver's reply bytes"
     );

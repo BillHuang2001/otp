@@ -68,7 +68,8 @@ use crate::drivers::line_buffer::LineBuffer;
 use crate::error;
 use crate::poller::Poller;
 use crate::port_task::{
-    LineNotification, PortNotification, PortTask, PortTaskKind, PortTaskQueue, PORT_REDS_EXECUTE,
+    LineNotification, PortNotification, PortTask, PortTaskKind, PortTaskQueue, ReadMessage,
+    PORT_REDS_EXECUTE,
 };
 use crate::queue::ByteQueue;
 
@@ -124,6 +125,13 @@ pub struct Port {
     /// The line accumulator used in line mode (the C's `allocate_linebuf` state; untouched
     /// while [`Port::line_mode`] is `None`).
     line: LineBuffer,
+    /// The **completed read messages** the driver handed up and the owner has not been told
+    /// about yet, in arrival order: one [`ReadMessage`] per driver `driver_output*` call (see
+    /// [`DriverContext::deliver_read`]) plus, once a frame is closed
+    /// ([`Port::close_input_frame`]), one body-only message per batch of [`Port::input`]
+    /// bytes. A [`PortNotification::Data`] (raw mode) and the line frames (line mode) are
+    /// both produced from this queue, in this order.
+    pending_reads: VecDeque<ReadMessage>,
     /// The line frames staged for the owner in line mode, in arrival order. Populated by
     /// [`Port::take_input_notifications`] (which frames the buffered input) and drained by
     /// [`Port::take_line_frames`] — the separate channel a `{line, N}` port reports through,
@@ -147,10 +155,10 @@ impl Port {
             exit_notified: false,
             line_mode: None,
             line: LineBuffer::new(0),
+            pending_reads: VecDeque::new(),
             pending_lines: VecDeque::new(),
         }
     }
-
     /// This port's id.
     pub fn id(&self) -> PortId {
         self.id
@@ -167,22 +175,76 @@ impl Port {
     }
 
     /// The number of bytes currently buffered in the input queue.
+    ///
+    /// This is **all** the input the port owes its owner, in arrival order: every completed
+    /// read message's bytes (its header bytes included — the C's `bytes_in`) followed by the
+    /// bytes banked in the open frame's accumulator. It is what the oracle's
+    /// `port_info(P, input)` counts, header included and undelivered bytes included.
     pub fn input_len(&self) -> usize {
-        self.input.len()
+        self.pending_reads.iter().map(ReadMessage::len).sum::<usize>() + self.input.len()
     }
 
     /// Copies up to `out.len()` buffered input bytes into `out`, returning how many were
     /// copied.
+    ///
+    /// The bytes are taken in arrival order (completed read messages first, then the open
+    /// frame's accumulator) and consumed, exactly as [`Port::drain_input`] does; only the
+    /// header/body split is dropped by this flat view.
     pub fn read_input(&mut self, out: &mut [u8]) -> usize {
-        self.input.read_into(out)
+        let mut written = 0;
+        while written < out.len() {
+            let Some(read) = self.pending_reads.front_mut() else {
+                break;
+            };
+            let room = out.len() - written;
+            if !read.header.is_empty() {
+                let n = read.header.len().min(room);
+                out[written..written + n].copy_from_slice(&read.header[..n]);
+                read.header.drain(..n);
+                written += n;
+                continue;
+            }
+            match read.body.as_mut() {
+                Some(body) if body.is_empty() => {
+                    // A zero-byte message (an explicit empty read): nothing to copy.
+                    self.pending_reads.pop_front();
+                }
+                Some(body) => {
+                    let n = body.len().min(room);
+                    out[written..written + n].copy_from_slice(&body[..n]);
+                    body.drain(..n);
+                    written += n;
+                }
+                None => {
+                    // A header-only read whose header was just consumed.
+                    self.pending_reads.pop_front();
+                }
+            }
+        }
+        if written < out.len() {
+            written += self.input.read_into(&mut out[written..]);
+        }
+        written
     }
 
-    /// Removes and returns every buffered input byte.
+    /// Removes and returns every buffered input byte, in arrival order.
+    ///
+    /// This is the flat view of [`Port::input_len`]: every completed read message (header
+    /// bytes first, then the body) followed by the accumulator, so a caller that only wants
+    /// the byte stream — the built-in drivers' tests, `{packet, N}` framing, … — sees exactly
+    /// the concatenation of everything the driver handed up.
     pub fn drain_input(&mut self) -> Vec<u8> {
-        let queue = std::mem::replace(&mut self.input, ByteQueue::new());
-        queue.front().to_vec()
+        let mut out = Vec::with_capacity(self.input_len());
+        for read in self.pending_reads.drain(..) {
+            out.extend_from_slice(&read.header);
+            if let Some(body) = read.body {
+                out.extend_from_slice(&body);
+            }
+        }
+        out.extend_from_slice(self.input.front());
+        self.input.clear();
+        out
     }
-
     /// The number of bytes currently buffered in the output queue.
     pub fn output_len(&self) -> usize {
         self.output.len()
@@ -206,9 +268,11 @@ impl Port {
                 input,
                 output,
                 arms,
+                pending_reads,
                 ..
             } = self;
-            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            let mut ctx =
+                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
             driver.start(&mut ctx)
         };
         self.refresh_timeout();
@@ -273,9 +337,11 @@ impl Port {
                 input,
                 output,
                 arms,
+                pending_reads,
                 ..
             } = self;
-            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            let mut ctx =
+                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
             driver.output(&mut ctx)
         };
         self.refresh_timeout();
@@ -447,37 +513,91 @@ impl Port {
         if self.line_mode.is_none() {
             return;
         }
-        // Any bytes the driver banked but the harvest has not framed yet must join the
-        // accumulator first, so an end-of-file flush never loses them.
-        if !self.input.is_empty() {
-            let bytes = self.drain_input();
-            self.line.push(&bytes);
-        }
+        // Any reads the driver handed up (and any bytes it banked) must be framed first, so
+        // an end-of-file flush keeps its frames behind them in arrival order.
+        self.stage_line_frames();
         self.line.flush_into_ready();
+        // The flushed partial line is the C's `{noeol, "abc"}` — no header, it never came from
+        // a `driver_output2` call of its own.
+        let port = self.id;
+        self.pending_lines
+            .extend(self.line.take_frames().into_iter().map(|frame| {
+                LineNotification {
+                    port,
+                    header: Vec::new(),
+                    bytes: frame.bytes,
+                    eol: frame.eol,
+                }
+            }));
     }
 
     /// Whether this port is holding input bytes it owes its owner.
     ///
-    /// The buffered input queue is the single source of truth for a
-    /// [`PortNotification::Data`] report (see [`Port::take_input_notifications`]): every byte a
-    /// driver hands up — whether from an `INPUT` task's `ready_input` **or** from a
-    /// `driver_output` inside `start`/`control`/`timeout`/`output` — lands in this queue, and the
-    /// port-task round reports whatever is there.
+    /// This covers both halves of the port's input state — the completed read messages and the
+    /// open frame's accumulator — and is what decides whether a [`PortNotification::Data`] (or
+    /// a line frame) is owed (see [`Port::take_input_notifications`]).
     pub(crate) fn has_input(&self) -> bool {
-        !self.input.is_empty()
+        !self.pending_reads.is_empty() || !self.input.is_empty()
     }
 
-    /// Takes the input notifications this port owes, if any.
+    /// Closes the **open input frame**: the bytes the driver banked on
+    /// [`DriverContext::input`] become one body-only [`ReadMessage`], so they are reported
+    /// before anything the driver hands up afterwards.
     ///
-    /// In raw mode ([`Port::line_mode`] is `None`) this is **at most one**
-    /// [`PortNotification::Data`]: the buffered input bytes are drained out of the input queue,
-    /// so a report happens **exactly once per byte**. An empty read reports nothing.
+    /// This is the Rust analogue of the C delivering a `driver_output` the moment the driver
+    /// calls it: [`DriverContext::deliver_read`] runs it before pushing its own read (so a
+    /// banked push followed by a split read keeps their call order), and
+    /// [`Port::take_input_notifications`] runs it once per harvest. An empty accumulator opens
+    /// no frame at all, so no empty message is ever minted here.
+    fn close_input_frame(&mut self) {
+        close_input_frame(&mut self.input, &mut self.pending_reads);
+    }
+
+    /// Feeds every pending read through the line accumulator, stamping each frame it produces
+    /// with that read's header, and stages the frames on the [`Port::take_line_frames`]
+    /// channel.
+    ///
+    /// This is the line-mode half of [`Port::take_input_notifications`], shared with
+    /// [`Port::flush_linebuf`]. Only a read's **body** is framed — the C's header is a cons
+    /// prefix of the resulting message, not line content — and a read with no body (`None`)
+    /// produces no frame at all.
+    fn stage_line_frames(&mut self) {
+        self.close_input_frame();
+        let port = self.id;
+        while let Some(read) = self.pending_reads.pop_front() {
+            let Some(body) = read.body else {
+                continue;
+            };
+            self.line.push(&body);
+            let header = read.header;
+            self.pending_lines
+                .extend(self.line.take_frames().into_iter().map(|frame| {
+                    LineNotification {
+                        port,
+                        header: header.clone(),
+                        bytes: frame.bytes,
+                        eol: frame.eol,
+                    }
+                }));
+        }
+    }
+
+    /// Takes the input notifications this port owes, in arrival order.
+    ///
+    /// In raw mode ([`Port::line_mode`] is `None`) this is **one [`PortNotification::Data` per
+    /// read message**: the C delivers one `{Port, {data, Data}}` per `driver_output*` call
+    /// (`deliver_read_message`, `io.c:3363-3442`), so two calls inside one callback are two
+    /// notifications and a header/body pair is exactly one — never two, never merged. Each
+    /// message is drained out of the port, so a report happens **exactly once per byte**. An
+    /// explicit empty read is still reported (the oracle's `{Port, {data, []}}`); the
+    /// accumulator is closed into a body-only message first, so nothing is stranded.
     ///
     /// In line mode this returns **no** notification: the whole buffered input is fed through
-    /// the line accumulator and every resulting frame is staged on the [`Port::take_line_frames`]
-    /// channel instead, so a single read can yield many frames (a 601-byte `[line,4]` chunk is
-    /// 150 of them: 149 `noeol` + 1 `eol`). An empty frame is **not** dropped here: a blank line
-    /// is the oracle's `{Port, {data, {eol, []}}}`.
+    /// the line accumulator and every resulting frame is staged on the
+    /// [`Port::take_line_frames`] channel instead, so a single read can yield many frames (a
+    /// 601-byte `[line,4]` chunk is 150 of them: 149 `noeol` + 1 `eol`) — each stamped with the
+    /// header of the read that completed it. An empty frame is **not** dropped here: a blank
+    /// line is the oracle's `{Port, {data, {eol, []}}}`.
     ///
     /// The condition is the *queue* (and, in line mode, the line accumulator), not "an `INPUT`
     /// task ran": the legacy C delivers `driver_output` to the port owner as soon as the driver
@@ -495,30 +615,17 @@ impl Port {
             if !self.has_input() {
                 return Vec::new();
             }
-            let bytes = self.drain_input();
-            if bytes.is_empty() {
-                return Vec::new();
-            }
-            return vec![PortNotification::Data {
-                port: self.id,
-                bytes,
-            }];
+            self.close_input_frame();
+            let port = self.id;
+            return self
+                .pending_reads
+                .drain(..)
+                .map(|read| PortNotification::Data { port, read })
+                .collect();
         }
-        if !self.input.is_empty() {
-            let bytes = self.drain_input();
-            self.line.push(&bytes);
-        }
-        let port = self.id;
-        let frames = self.line.take_frames();
-        self.pending_lines
-            .extend(frames.into_iter().map(|frame| LineNotification {
-                port,
-                bytes: frame.bytes,
-                eol: frame.eol,
-            }));
+        self.stage_line_frames();
         Vec::new()
     }
-
     /// Takes the line frames this port owes, in arrival order.
     ///
     /// This is the drain side of the `{line, N}` channel: the frames
@@ -546,9 +653,11 @@ impl Port {
                 input,
                 output,
                 arms,
+                pending_reads,
                 ..
             } = self;
-            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            let mut ctx =
+                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
             driver.ready_input(&mut ctx)
         };
         self.refresh_timeout();
@@ -582,9 +691,11 @@ impl Port {
                 input,
                 output,
                 arms,
+                pending_reads,
                 ..
             } = self;
-            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            let mut ctx =
+                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
             driver.ready_output(&mut ctx)
         };
         self.refresh_timeout();
@@ -650,9 +761,11 @@ impl Port {
                 input,
                 output,
                 arms,
+                pending_reads,
                 ..
             } = self;
-            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            let mut ctx =
+                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
             driver.timeout(&mut ctx)
         };
         self.refresh_timeout();
@@ -676,9 +789,11 @@ impl Port {
                 input,
                 output,
                 arms,
+                pending_reads,
                 ..
             } = self;
-            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            let mut ctx =
+                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
             driver.control(&mut ctx, command, arg)
         };
         self.refresh_timeout();
@@ -713,9 +828,11 @@ impl Port {
                 input,
                 output,
                 arms,
+                pending_reads,
                 ..
             } = self;
-            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            let mut ctx =
+                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
             driver.drive_async(&mut ctx)
         };
         self.refresh_timeout();
@@ -788,9 +905,10 @@ impl Port {
             input,
             output,
             arms,
+            pending_reads,
             ..
         } = self;
-        let mut ctx = DriverContext::new(id, poller, input, output, arms);
+        let mut ctx = DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
         driver.port_exit(&mut ctx, reason)
     }
 
@@ -808,9 +926,11 @@ impl Port {
                 input,
                 output,
                 arms,
+                pending_reads,
                 ..
             } = self;
-            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            let mut ctx =
+                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
             driver.stop(&mut ctx)
         };
         // The port is closed either way; a teardown failure must not leave it looking
@@ -818,6 +938,22 @@ impl Port {
         self.state = PortState::Closed;
         result
     }
+}
+
+/// Closes the **open input frame**: the bytes banked in `input` become one body-only
+/// [`ReadMessage`] pushed onto `reads`.
+///
+/// This is the single implementation of "the driver's plain `driver_output` bytes are now one
+/// complete read", shared by [`Port::close_input_frame`] (the once-per-harvest close) and by
+/// [`DriverContext::deliver_read`] (which closes the frame before its own split read, so the
+/// C's synchronous delivery order survives). An empty accumulator closes nothing: an empty
+/// read message is only ever minted by an explicit `deliver_read(&[], None)`.
+pub(crate) fn close_input_frame(input: &mut ByteQueue, reads: &mut VecDeque<ReadMessage>) {
+    if input.is_empty() {
+        return;
+    }
+    let bytes = std::mem::replace(input, ByteQueue::new());
+    reads.push_back(ReadMessage::body_only(bytes.front().to_vec()));
 }
 
 /// The **reserved** port-control operation namespace.
@@ -970,14 +1106,15 @@ mod tests {
     /// [`PortNotification::Data`] chunk, `Some(eol)` a [`LineNotification`] frame.
     ///
     /// A round harvests both channels: [`Port::take_input_notifications`] reports the raw
-    /// payloads (and stages the line frames), [`Port::take_line_frames`] drains the staged
-    /// line frames. A port is in exactly one mode, so the two never mix.
+    /// payloads (one per read message — a port can owe **several**, one per driver
+    /// `driver_output*` call — and stages the line frames), [`Port::take_line_frames`] drains
+    /// the staged line frames. A port is in exactly one mode, so the two never mix.
     fn frames(port: &mut Port) -> Vec<(Option<bool>, Vec<u8>)> {
         let mut frames: Vec<(Option<bool>, Vec<u8>)> = port
             .take_input_notifications()
             .into_iter()
             .map(|notification| match notification {
-                PortNotification::Data { bytes, .. } => (None, bytes),
+                PortNotification::Data { read, .. } => (None, read.flattened()),
                 other => panic!("the port reported an unexpected notification: {other:?}"),
             })
             .collect();
@@ -1058,6 +1195,290 @@ mod tests {
             frames(&mut port),
             vec![(None, b"a\nb".to_vec())],
             "raw mode is untouched by the line flush"
+        );
+    }
+    // -----------------------------------------------------------------------------------
+    // The `driver_output2` header/body split (contract A.4)
+    // -----------------------------------------------------------------------------------
+    // The oracle pins one `{Port, {data, Data}}` message per driver `driver_output*` CALL
+    // (`deliver_read_message`, `../../../erts/emulator/beam/io.c:3363-3442`): a header/body
+    // pair is one message, two calls are two, and a `NULL` body (no binary tail at all) is
+    // distinguishable from a present-but-empty one. This crate's half is the split carried on
+    // [`ReadMessage`]; building `[H1,H2,H3|<<Body>>]` out of it is the runtime's.
+
+    /// One scripted step a [`ReadScriptDriver`] performs in its single `ready_input`.
+    enum ScriptStep {
+        /// A `driver_output2(hbuf,hlen,buf,len)`-shaped read (a `NULL` `buf` is `None`).
+        Split {
+            header: &'static [u8],
+            body: Option<&'static [u8]>,
+        },
+        /// A plain `driver_output(buf,len)`: bytes banked on [`DriverContext::input`].
+        Bank(&'static [u8]),
+    }
+
+    /// A driver that replays a script of read hand-ups in one `ready_input`, then reports
+    /// nothing more (so a second round is silent).
+    struct ReadScriptDriver {
+        steps: Vec<ScriptStep>,
+        fed: bool,
+    }
+
+    impl Driver for ReadScriptDriver {
+        fn name(&self) -> &str {
+            "read-script-test"
+        }
+
+        fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+            if self.fed {
+                return Ok(());
+            }
+            self.fed = true;
+            for step in &self.steps {
+                match step {
+                    ScriptStep::Split { header, body } => ctx.deliver_read(header, *body)?,
+                    ScriptStep::Bank(bytes) => ctx.input().push(bytes),
+                }
+            }
+            Ok(())
+        }
+
+        fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A port whose driver replays `steps` on its first `ready_input`.
+    fn scripted_port(steps: Vec<ScriptStep>) -> (Poller, Port) {
+        let poller = Poller::new().expect("a poll set");
+        let port = Port::new(
+            PortId::new(1),
+            Box::new(ReadScriptDriver { steps, fed: false }),
+        );
+        (poller, port)
+    }
+
+    /// The exact `(header, body)` pairs a raw-mode port owes, in arrival order.
+    fn reads(port: &mut Port) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        port.take_input_notifications()
+            .into_iter()
+            .map(|notification| match notification {
+                PortNotification::Data { read, .. } => (read.header, read.body),
+                other => panic!("the port reported an unexpected notification: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_split_read_is_one_notification_with_its_header_apart() {
+        let (mut poller, mut port) = scripted_port(vec![ScriptStep::Split {
+            header: b"HDR",
+            body: Some(b"abc"),
+        }]);
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert_eq!(
+            reads(&mut port),
+            vec![(b"HDR".to_vec(), Some(b"abc".to_vec()))],
+            "header apart from body, never flattened into one buffer"
+        );
+        assert!(reads(&mut port).is_empty(), "reported once, never twice");
+    }
+
+    #[test]
+    fn one_notification_per_driver_output_call_and_never_merged() {
+        // The five rows of `ReadMessage`'s pinned table, in one callback: each call is its own
+        // message, in call order, and the banked bytes are closed into a body-only read where
+        // they were `push`ed — before the split read that followed them.
+        let (mut poller, mut port) = scripted_port(vec![
+            ScriptStep::Split {
+                header: b"HDR",
+                body: Some(b"abc"),
+            },
+            ScriptStep::Split {
+                header: b"HDR",
+                body: Some(b""),
+            },
+            ScriptStep::Split {
+                header: b"HDR",
+                body: None,
+            },
+            ScriptStep::Split {
+                header: b"",
+                body: Some(b"abc"),
+            },
+            ScriptStep::Bank(b"bank"),
+            ScriptStep::Split {
+                header: b"",
+                body: None,
+            },
+        ]);
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert_eq!(
+            reads(&mut port),
+            vec![
+                (b"HDR".to_vec(), Some(b"abc".to_vec())),
+                // `driver_output2("HDR",3,"abc",0)`: a present, empty body (`[H|<<>>]`).
+                (b"HDR".to_vec(), Some(Vec::new())),
+                // `driver_output2("HDR",3,NULL,0)`: no binary tail at all (the proper list).
+                (b"HDR".to_vec(), None),
+                // `driver_output("abc",3)`: all body.
+                (Vec::new(), Some(b"abc".to_vec())),
+                // Bytes banked on `ctx.input()`, closed when the next split read arrived.
+                (Vec::new(), Some(b"bank".to_vec())),
+                // `driver_output2(NULL,0,NULL,0)`: a real, empty message.
+                (Vec::new(), None),
+            ],
+            "one notification per call, arrival order kept, nothing merged"
+        );
+        assert!(
+            reads(&mut port).is_empty(),
+            "a second round re-reports nothing"
+        );
+    }
+
+    #[test]
+    fn banked_bytes_alone_are_closed_into_one_body_only_read() {
+        // The plain `driver_output` shape with no explicit split read: the harvest closes the
+        // open frame, so a `push`-only driver keeps working exactly as before.
+        let (mut poller, mut port) = scripted_port(vec![
+            ScriptStep::Bank(b"a"),
+            ScriptStep::Bank(b"bc"),
+        ]);
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert_eq!(
+            reads(&mut port),
+            vec![(Vec::new(), Some(b"abc".to_vec()))],
+            "a bank is one read once the frame closes"
+        );
+    }
+
+    #[test]
+    fn the_input_byte_view_keeps_the_split_messages_in_arrival_order() {
+        let (mut poller, mut port) = scripted_port(vec![
+            ScriptStep::Split {
+                header: b"HDR",
+                body: Some(b"abc"),
+            },
+            ScriptStep::Bank(b"tail"),
+        ]);
+        port.ready_input(&mut poller).expect("the read succeeds");
+        // The header bytes count towards the C's `bytes_in` (what `port_info(P,input)` shows),
+        // and the open frame's accumulator counts too.
+        assert_eq!(port.input_len(), 3 + 3 + 4);
+        assert!(port.has_input());
+        // A flat read sees everything in order, header first.
+        let mut first = [0u8; 4];
+        assert_eq!(port.read_input(&mut first), 4);
+        assert_eq!(&first, b"HDRa");
+        assert_eq!(port.input_len(), 6, "the consumed prefix is gone");
+        assert_eq!(port.drain_input(), b"bctail".to_vec());
+        assert_eq!(port.input_len(), 0);
+        assert!(!port.has_input());
+        assert_eq!(port.drain_input(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn every_line_frame_carries_the_header_of_the_read_that_completed_it() {
+        // `driver_output2("HDR",3,"a\nb\n",4)` ⇒ two messages, each with the header prefix:
+        // `{eol,[72,68,82|<<"a">>]}` and `{eol,[72,68,82|<<"b">>]}`.
+        let (mut poller, mut port) = scripted_port(vec![ScriptStep::Split {
+            header: b"HDR",
+            body: Some(b"a\nb\n"),
+        }]);
+        port.set_line_mode(Some(0));
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert!(
+            port.take_input_notifications().is_empty(),
+            "line mode reports through the line channel only"
+        );
+        let staged = port.take_line_frames();
+        assert_eq!(staged.len(), 2, "one frame per completed line");
+        assert_eq!(
+            staged
+                .iter()
+                .map(|f| (f.header.clone(), f.bytes.clone(), f.eol))
+                .collect::<Vec<_>>(),
+            vec![
+                (b"HDR".to_vec(), b"a".to_vec(), true),
+                (b"HDR".to_vec(), b"b".to_vec(), true),
+            ],
+            "each frame carries the header of the read that produced it"
+        );
+    }
+
+    #[test]
+    fn a_line_spanning_two_reads_gets_the_header_of_the_read_that_completed_it() {
+        let (mut poller, mut port) = scripted_port(vec![
+            ScriptStep::Split {
+                header: b"A",
+                body: Some(b"par"),
+            },
+            ScriptStep::Split {
+                header: b"B",
+                body: Some(b"tial\n"),
+            },
+        ]);
+        port.set_line_mode(Some(0));
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert!(port.take_input_notifications().is_empty());
+        let staged = port.take_line_frames();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            (staged[0].header.clone(), staged[0].bytes.clone()),
+            (b"B".to_vec(), b"partial".to_vec()),
+            "the completing read's header, not the first one's"
+        );
+    }
+
+    #[test]
+    fn a_null_body_stages_no_line_frame_and_the_eof_flush_has_no_header() {
+        let (mut poller, mut port) = scripted_port(vec![
+            // A NULL body produces no frame (there are no body bytes to split into lines), and
+            // it must not disturb the partial line already held.
+            ScriptStep::Split {
+                header: b"HDR",
+                body: None,
+            },
+            ScriptStep::Split {
+                header: b"HDR",
+                body: Some(b"par"),
+            },
+            ScriptStep::Split {
+                header: b"HDR",
+                body: None,
+            },
+        ]);
+        port.set_line_mode(Some(0));
+        port.ready_input(&mut poller).expect("the read succeeds");
+        assert!(port.take_input_notifications().is_empty());
+        assert!(
+            port.take_line_frames().is_empty(),
+            "a `NULL` body stages no frame; the partial line is still held"
+        );
+        // The end-of-file flush releases the partial line as `{noeol, "par"}` — with no header
+        // of its own.
+        port.flush_linebuf();
+        let staged = port.take_line_frames();
+        assert_eq!(
+            staged
+                .iter()
+                .map(|f| (f.header.clone(), f.bytes.clone(), f.eol))
+                .collect::<Vec<_>>(),
+            vec![(Vec::new(), b"par".to_vec(), false)],
+            "the flushed partial line carries an empty header"
+        );
+        port.flush_linebuf();
+        assert!(
+            port.take_line_frames().is_empty(),
+            "a repeated flush stages nothing"
         );
     }
 }
