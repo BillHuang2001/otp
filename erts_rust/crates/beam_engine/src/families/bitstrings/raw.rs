@@ -443,9 +443,34 @@ pub(super) fn make_binary(
 /// `capacity`-byte payload, which the first `bs_create_bin` `append`/`private_append`
 /// segment then extends.
 ///
+/// # The payload carries a capacity, not a length
+///
+/// The payload is allocated by [`Machine::alloc_refc_binary_with_capacity`]
+/// (`beam_alloc::RefcBinary::with_capacity`): its writable capacity is the requested
+/// `capacity` bytes, on top of a 4x reservation (`DEFAULT_RESERVATION_FACTOR`, clamped to
+/// `MAX_PAYLOAD_BYTES`). That is the shape C's `bin_size = capacity` allocation has
+/// (`erl_bits.c:2023`), and it is what lets the sink write several rounds straight into
+/// the reservation before [`InPlace::grow`] has to ask for more. The machine records the
+/// payload's **real** capacity in the writable registry ([`Machine::mark_writable`]),
+/// never the hint.
+///
+/// The *visible* bits are the term's window — zero of them here (C's `apparent_size = 0`)
+/// — while the payload's own logical length is its whole capacity, zero-filled
+/// ([`Machine::cover_writable_capacity`]). That length is not a length of *content*: it
+/// is the extent of the initialised backing store, and it is what makes a later
+/// relocation lossless, because `beam_alloc` copies exactly `len()` bytes when it moves a
+/// payload. A payload whose handle claimed `len == 0` would lose every byte the sink had
+/// written the first time the reservation ran out.
+///
+/// `capacity == 0` (the `x(0)` hint really can be a non-negative small integer zero,
+/// and C then allocates `bin_size = 0`) is reproduced as a zero-capacity payload; see
+/// [`Machine::alloc_refc_binary_with_capacity`] for why growth from it still makes
+/// progress.
+///
 /// The 8-word `[BinRef][ErlSubBits]` pair is reserved **rooted** first, then the
 /// off-heap payload is allocated and the pair written (the frozen
-/// reserve-then-write ordering; the payload is off-heap and never moves).
+/// reserve-then-write ordering; the payload is off-heap and never moves *here* — a
+/// later growth may relocate it, which [`InPlace::grow`] republishes).
 pub(super) fn make_writable(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
@@ -457,12 +482,12 @@ pub(super) fn make_writable(
         beam_term::refc::ERL_REFC_BITS_SIZE,
         RootSet::ALL_LIVE,
     )?;
-    let data = machine.alloc_refc_binary(&vec![0u8; capacity])?;
+    let (data, real_capacity) = machine.alloc_refc_binary_with_capacity(capacity)?;
     // The payload is the accumulator's backing store: register it so a following
     // `private_append` can write into it in place ([`writable_append_target`]), exactly
     // as C's `build_writable_bitstring` sets `BIN_FLAG_WRITABLE|BIN_FLAG_ACTIVE_WRITER`
     // and threads the binary onto `p->wrt_bins` (`erl_bits.c:1684-1720`).
-    machine.mark_writable(data, capacity);
+    machine.mark_writable(data, real_capacity);
     // SAFETY: as `make_binary` — 8 exclusively-owned words for the pair, a live
     // `UNIT_SIZE`-aligned off-heap payload owned by `machine`, and a 0-bit window
     // (`start = end = 0`).
@@ -518,6 +543,130 @@ pub(super) fn writable_append_target(
     Some((base as *mut u8, capacity_bits, size))
 }
 
+// ---------------------------------------------------------------------------
+// Growth support: the alias guard and the republish
+// ---------------------------------------------------------------------------
+
+/// The `(payload base, on-heap owner block)` pair a **live boxed term** names, when the
+/// term is an off-heap-binary shape.
+///
+/// Three shapes name an off-heap payload:
+///
+/// * a bare `BinRef` (`HEADER_BIN_REF`) — its `val` word is the payload's first data
+///   byte, and the block itself is the owner identity;
+/// * a full refc binary (`ErlSubBits` over a `BinRef`) — the window base and `val` are
+///   the same payload, the `ErlSubBits` block is the owner identity;
+/// * a **match context** `ErlSubBits` over an off-heap base — its `base_flags` word *is*
+///   the payload pointer (flags masked off), so it names the payload too, and it is the
+///   one shape whose base word is not routed through a `BinRef`.
+///
+/// An on-heap `ErlHeapBits` names no off-heap payload (its data lives in the heap block
+/// itself) and yields `None`.
+fn payload_named_by(t: Eterm) -> Option<(*const u8, *mut Eterm)> {
+    if !beam_term::is_boxed(t) {
+        return None;
+    }
+    // SAFETY: `t` is boxed, so `boxed_val(t)` is a live block whose header word is
+    // initialised — the same one-word read `beam_term`'s own predicates make.
+    let root = boxed_val(t);
+    let header = unsafe { *root };
+    if header == HEADER_BIN_REF {
+        // SAFETY: the header word says `BinRef`, so words 1 and 2 are initialised.
+        let (val, _next) = unsafe { beam_term::refc::bin_ref_parts(t) };
+        return Some((val as *const u8, root));
+    }
+    if header != HEADER_SUB_BITS {
+        return None;
+    }
+    // SAFETY: the header word says `ErlSubBits`, so words 1..4 are initialised; word 1
+    // is `base_flags`, whose low `ERL_SUB_BITS_FLAG_MASK` bits are flags and not part of
+    // the pointer.
+    let (base_flags, _start, _end, _orig) = unsafe { beam_term::bitstring::sub_bits_parts(t) };
+    let base = (base_flags.raw() & !beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK) as *const u8;
+    Some((base, root))
+}
+
+/// Whether any term the machine's **root set** holds names the payload at `base` through
+/// a *different* on-heap pair than `own`'s — the guard a payload relocation must pass
+/// before `beam_alloc` frees the old block.
+///
+/// # Why this is required
+///
+/// [`beam_alloc::RefcBinary::ensure_capacity`] refuses to grow a payload that any other
+/// *handle* shares (`refcount() != 1`), which covers every **escaped** copy: a message
+/// or a runtime store adopts a cloned handle, so the payload can only be relocated while
+/// this machine holds the only handle. What that check cannot see is a **second on-heap
+/// pair in this very machine** naming the same payload without a handle of its own — a
+/// GC copy of the pair taken in an earlier collection, a bare `BinRef` a family built, or
+/// a match context whose `base_flags` is this payload. A move frees the old block, so
+/// such a pair's word would dangle: a **use-after-free**, not merely a stale value.
+///
+/// # Scope
+///
+/// The scan covers the three files a collection relocates — the x-register file, the FR
+/// file and the whole Erlang stack — plus the parked raise reason
+/// ([`Machine::pending_exception`]). Those are the terms this machine can reach; a term
+/// already handed to a host is covered by the refcount gate above, not by this scan.
+///
+/// Refusing costs only performance: the caller promotes to the copy-rebuild form, which
+/// is always byte-correct. A *false* refusal is therefore safe, which is why the scan
+/// over-approximates (a dead-but-uncleared word only makes it refuse).
+fn payload_aliased_elsewhere(machine: &Machine, base: *const u8, own: Eterm) -> bool {
+    // The accumulator's own two blocks — its `ErlSubBits` root (the term itself) and the
+    // `BinRef` that root points at — are the pair being relocated, not aliases of it.
+    // SAFETY: `own` is the caller's live refc-binary accumulator, so its `orig` slot is
+    // the live `BinRef` of the same pair.
+    let (_flags, _start, _end, orig) = unsafe { beam_term::bitstring::sub_bits_parts(own) };
+    let own_blocks = [boxed_val(own), boxed_val(orig)];
+    let aliases = |t: Eterm| match payload_named_by(t) {
+        Some((named, block)) => named == base && !own_blocks.contains(&block),
+        None => false,
+    };
+    let parked = machine.pending_exception.map(|(_class, reason)| reason);
+    machine.x.iter().copied().any(aliases)
+        || machine.fr.iter().copied().any(aliases)
+        || machine.stack.iter().copied().any(aliases)
+        || parked.is_some_and(aliases)
+}
+
+/// Republish the accumulator's `[BinRef][ErlSubBits]` pair over the payload's **new**
+/// address after a relocation, preserving its window (`start`/`end`) and its
+/// `BinRef.next` chain word.
+///
+/// Only the two words that name the payload change — `BinRef.val` (word 1 of the pair)
+/// and the `ErlSubBits.base_flags` word (which *is* the payload pointer, `erl_bits.h:95`)
+/// — because `beam_term::refc::write_refc_binary` rewrites the whole pair from the
+/// arguments and `beam_term` owns that frozen layout, so this never hand-rolls it. The
+/// pair's address and the returned `Eterm` are unchanged: every alias of the *term* (the
+/// same `Eterm` in a register, a Y slot, a copied pair) reads the new payload.
+fn republish_over(src: Eterm, new_base: *mut u8) {
+    // SAFETY: `src` is a live refc-binary pair (the caller's accumulator), so its
+    // `ErlSubBits` words 1..4 are initialised: `orig` is the live `BinRef` of the pair and
+    // its 8 words (`ERL_REFC_BITS_SIZE`) are the exclusively-owned block
+    // `write_refc_binary` rewrites. `new_base` is the payload the machine's own handle now
+    // names, `UNIT_SIZE`-aligned (so the flag bits are clear) and covering the same window
+    // the pair already had (a relocation copies the live bytes and never changes the
+    // window).
+    unsafe {
+        let (_base_flags, start, end, orig) = beam_term::bitstring::sub_bits_parts(src);
+        let (_val, next) = beam_term::refc::bin_ref_parts(orig);
+        let (start, end) = (start.raw(), end.raw());
+        let pair = boxed_val(orig);
+        let republished = beam_term::refc::write_refc_binary(
+            pair,
+            new_base.cast::<Eterm>(),
+            next,
+            new_base,
+            start,
+            end - start,
+        );
+        debug_assert_eq!(
+            republished, src,
+            "a republish keeps the pair's address and its `ErlSubBits` root"
+        );
+    }
+}
+
 /// An **in-place bit sink** over a writable accumulator payload — C's writable
 /// `private_append` arm (`erts_bs_private_append_checked`, `erl_bits.c:1943-2020`),
 /// which bumps `sb->end` to the new position instead of copying.
@@ -533,13 +682,27 @@ pub(super) fn writable_append_target(
 ///
 /// Writes always land at bit offsets `>= start` — the accumulator's `end` at the time
 /// the sink was created — and never past the payload's capacity
-/// ([`InPlace::remaining_bits`]; the writer **promotes** to the copy-rebuild form when
-/// the next write would not fit). Every alias of the payload (a term copied before the
-/// append, another process's `ErlSubBits` over the same payload, a message's shared
-/// binary) has a window ending at or before that offset, so it reads exactly the bytes
-/// it read before. The only term whose *window* changes is the accumulator itself,
-/// whose `end` is bumped on success — precisely C's `sb->end = new_position`.
+/// ([`InPlace::remaining_bits`]). The capacity is **growable**
+/// ([`InPlace::grow`], the `beam_alloc` capacity word), so a build that outgrows the
+/// current capacity either widens the payload (in place, or by a relocation the sink
+/// republishes) or **promotes** to the copy-rebuild form when the payload cannot be
+/// grown. Every alias of the payload (a term copied before the append, another
+/// process's `ErlSubBits` over the same payload, a message's shared binary) has a window
+/// ending at or before that offset, so it reads exactly the bytes it read before. The
+/// only term whose *window* changes is the accumulator itself, whose `end` is bumped on
+/// success — precisely C's `sb->end = new_position`.
 ///
+/// # The relocation guard (the one case where a byte buffer moves)
+///
+/// [`beam_alloc::RefcBinary`]'s growth refuses to touch a payload any other **handle**
+/// shares (`refcount() == 1` is required), which already covers every payload that
+/// escaped this machine: a message, a send, or a runtime store adopts a *clone* of the
+/// handle. What that gate cannot see is a second on-heap **pair** in this machine naming
+/// the same payload (a GC copy of the pair, a bare `BinRef`, a match context whose
+/// `base_flags` is this payload). A move frees the old block, so such a word would be a
+/// use-after-free; [`InPlace::grow`] therefore scans the machine's root set
+/// ([`payload_aliased_elsewhere`]) and refuses the move (promoting instead) when one
+/// exists. See that function for the scope and why an over-approximation is safe.///
 /// # Safety / aliasing contract (a deliberate, scoped relaxation)
 ///
 /// [`beam_alloc::RefcBinary`] documents its payload as immutable, and this sink writes
@@ -593,6 +756,76 @@ impl InPlace {
         self.capacity.saturating_sub(self.cur)
     }
 
+    /// Widen the payload so that this sink can write `need_bits` **more** bits in place,
+    /// returning whether it can.
+    ///
+    /// `false` is the writer's "promote to the copy-rebuild form" signal — it is the
+    /// always-available fallback, so a refusal never loses bytes. Growth is refused when
+    ///
+    /// * `beam_alloc` will not relocate the payload (it is **shared**: some host or
+    ///   another process adopted a handle, C's `erts_pin_writable_binary` situation;
+    ///   or the request exceeds the payload's `max_capacity`; or the allocator could not
+    ///   serve the block) — [`Machine::grow_writable_payload`] folds all three into
+    ///   `Ok(None)`; or
+    /// * the payload is **aliased inside this machine** by a second on-heap pair
+    ///   ([`payload_aliased_elsewhere`]), which a move would leave dangling.
+    ///
+    /// # `Moved` — the republish
+    ///
+    /// `beam_alloc` frees the old block on a move, so the accumulator's own pair is
+    /// rewritten over the new address ([`republish_over`]): the `BinRef.val` word and the
+    /// `ErlSubBits.base_flags` pointer word move, the pair's address, its `start`/`end`
+    /// window and the returned `Eterm` (it is `self.src`, untouched) do not. `self.base`
+    /// follows, and `self.capacity` is re-read from the bytes `beam_alloc` reports, so the
+    /// invariant below holds for the widened payload too.
+    ///
+    /// The bytes this sink already wrote survive the move because the machine keeps the
+    /// payload's logical length at its whole capacity
+    /// ([`Machine::cover_writable_capacity`]) — a relocation copies exactly `len()` bytes,
+    /// and here `len()` is the entire backing store, of which the written prefix is a
+    /// part.    ///
+    /// # Safety
+    ///
+    /// The republish writes through `self.src`'s frozen pair, and it is sound for exactly
+    /// the reasons the payload mutation is (see the struct's `SAFETY` section), plus two
+    /// more this method establishes: (a) the pair is the accumulator's own — its `ErlSubBits`
+    /// root and `BinRef` block are the ones `InPlace` was built for, so the write touches
+    /// no other term's words, and (b) no **other** on-heap pair names the old payload
+    /// ([`payload_aliased_elsewhere`] over the machine's root set), so no word outside this
+    /// pair is left pointing at the block `beam_alloc` freed.
+    ///
+    /// # `need_bits == 0`
+    ///
+    /// A zero-growth request that already fits is answered `true` without touching the
+    /// payload, so a caller may consult the sink unconditionally.
+    //
+    // Not yet consulted by `BitWriter`: promoting on a shortfall is still the write path's
+    // only answer, so the growth door lands ahead of its caller. The plumbing is covered by
+    // this module's unit tests.
+    #[allow(dead_code)]
+    pub(super) fn grow(&mut self, machine: &mut Machine, need_bits: usize) -> Result<bool> {
+        let wanted_bits = self.cur.saturating_add(need_bits);
+        if wanted_bits <= self.capacity {
+            return Ok(true);
+        }
+        let wanted_bytes = wanted_bits.div_ceil(8);
+        if payload_aliased_elsewhere(machine, self.base, self.src) {
+            return Ok(false);
+        }
+        let Some((new_base, capacity_bytes)) = machine.grow_writable_payload(self.base, wanted_bytes)?
+        else {
+            return Ok(false);
+        };
+        self.capacity = capacity_bytes.saturating_mul(8);
+        if new_base != self.base {
+            self.base = new_base;
+            republish_over(self.src, new_base);
+        }
+        // `wanted_bytes == ceil(wanted_bits / 8)` and `capacity_bytes >= wanted_bytes`, so
+        // this only fails on a saturating multiply; refuse rather than write past the
+        // capacity.
+        Ok(wanted_bits <= self.capacity)
+    }
     /// Whether the byte range `[ptr, ptr + len)` overlaps this payload.
     ///
     /// A segment source that overlaps the accumulator is the one shape that would read
@@ -913,10 +1146,392 @@ mod tests {
             handles[0].clone()
         }; // the machine is dropped here, releasing its own handle.
 
-        assert_eq!(handle.len(), 65);
-        assert_eq!(handle.as_bytes(), vec![0u8; 65].as_slice());
+        // The writable accumulator's payload is **capacity-carrying** with its whole
+        // backing store live (`len == capacity`, the C's `bin_size`): the accumulator
+        // covers no *bits* (the term's window is 0 bits), but every byte the payload
+        // offers is initialised, because that is what makes a later relocation copy the
+        // bytes an appender wrote through the payload pointer.
+        assert_eq!(
+            handle.len(),
+            handle.capacity(),
+            "the whole backing store is live"
+        );
+        assert_eq!(handle.capacity(), 65, "the capacity is the requested hint");
+        assert!(
+            handle.reserved_bytes() >= handle.capacity(),
+            "the payload reserves at least its capacity"
+        );
+        assert_eq!(
+            handle.as_bytes(),
+            &[0u8; 65][..],
+            "the live bytes are zero-filled, never uninitialised"
+        );
+        drop(handle);
     }
 
+    // -----------------------------------------------------------------------
+    // The capacity-carrying writable payload (`bs_init_writable`) and its growth
+    // -----------------------------------------------------------------------
+
+    /// `make_writable` builds a **capacity-carrying** payload: its capacity is the
+    /// requested byte count, its reservation covers that capacity (`beam_alloc`'s 4x
+    /// policy) and carries the growth slack, its *live* length is that whole capacity
+    /// (zero-filled — the initialised backing store a relocation copies), the writable
+    /// registry answers that *real* capacity in bytes, and the term is still the frozen
+    /// 0-bit refc window over that payload.
+    #[test]
+    fn make_writable_builds_a_capacity_carrying_live_payload() {
+        for hint in [0usize, 1, 8, 256, 1024] {
+            let mut machine = Machine::new();
+            let mut ctx = MinimalContext::new();
+            let term = make_writable(&mut machine, &mut ctx, hint).unwrap();
+
+            let handles = machine.refc_binaries();
+            assert_eq!(handles.len(), 1, "one payload backs the accumulator");
+            let payload = &handles[0];
+            assert_eq!(
+                payload.len(),
+                payload.capacity(),
+                "hint {hint}: the whole backing store is live"
+            );
+            assert_eq!(payload.capacity(), hint, "hint {hint}: the capacity is the hint");
+            assert!(
+                payload.reserved_bytes() >= payload.capacity(),
+                "hint {hint}: the reservation covers the capacity"
+            );
+            assert!(
+                payload.reserved_bytes() >= hint.saturating_mul(beam_alloc::DEFAULT_RESERVATION_FACTOR)
+                    || payload.reserved_bytes() == beam_alloc::MAX_PAYLOAD_BYTES,
+                "hint {hint}: the reservation carries the accumulator's growth slack"
+            );
+            assert!(
+                payload.as_bytes().iter().all(|byte| *byte == 0),
+                "hint {hint}: the live bytes are zero-filled"
+            );
+            // The registry is keyed on the payload, and answers its real capacity in bytes.
+            assert_eq!(
+                machine.writable_capacity(payload.data_ptr()),
+                Some(payload.capacity()),
+                "hint {hint}: the registry answers the payload's capacity"
+            );
+
+            // The term is the frozen 0-bit window over that payload.
+            // SAFETY: `term` is the live refc binary `make_writable` just built.
+            assert!(unsafe { beam_term::refc::is_refc_binary(term) });
+            // SAFETY: as above — a live bitstring term.
+            let (base, start, size) = unsafe { beam_term::bitstring_parts(term) };
+            assert_eq!(
+                base,
+                payload.data_ptr() as *const u8,
+                "hint {hint}: the window's base is the payload"
+            );
+            assert_eq!((start, size), (0, 0), "hint {hint}: a 0-bit window");
+        }
+    }
+
+    /// An in-place grow keeps the payload's address and raises the registry's cached
+    /// capacity to what `beam_alloc` committed; a request past the reservation **moves**
+    /// the payload and re-keys the registry, leaving no stale key behind.
+    #[test]
+    fn grow_writable_payload_grows_in_place_then_moves_and_rekeys() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let _term = make_writable(&mut machine, &mut ctx, 8).unwrap();
+        let base = machine.refc_binaries()[0].data_ptr();
+        let reserved = machine.refc_binaries()[0].reserved_bytes();
+        assert!(reserved >= 8, "the reservation covers the hint");
+
+        // (a) Still inside the reservation: same address, raised capacity.
+        let committed = reserved.min(20).max(9);
+        let (in_place_base, in_place_capacity) = machine
+            .grow_writable_payload(base, committed)
+            .unwrap()
+            .expect("a request inside the reservation grows in place");
+        assert_eq!(in_place_base, base, "an in-place grow does not move the payload");
+        assert!(
+            in_place_capacity >= committed,
+            "the committed capacity covers the request"
+        );
+        assert_eq!(in_place_capacity, machine.refc_binaries()[0].capacity());
+        assert_eq!(
+            machine.refc_binaries()[0].len(),
+            in_place_capacity,
+            "the growth keeps the whole (now wider) backing store live"
+        );
+        assert_eq!(
+            machine.writable_capacity(base),
+            Some(in_place_capacity),
+            "the registry's cached capacity followed the grow"
+        );
+
+        // (b) Past the reservation: the payload is reallocated and the registry re-keyed.
+        let wanted = reserved + 1024;
+        let (moved_base, moved_capacity) = machine
+            .grow_writable_payload(base, wanted)
+            .unwrap()
+            .expect("a request past the reservation still grows");
+        assert_ne!(moved_base, base, "the payload was relocated");
+        assert!(moved_capacity >= wanted, "the new capacity covers the request");
+        assert_eq!(
+            machine.refc_binaries()[0].data_ptr(),
+            moved_base,
+            "the machine's handle names the new block"
+        );
+        assert_eq!(
+            machine.refc_binaries()[0].len(),
+            moved_capacity,
+            "the relocated payload's whole backing store is live"
+        );
+        assert_eq!(
+            machine.writable_capacity(moved_base),
+            Some(moved_capacity),
+            "the registry was re-keyed to the new base"
+        );
+        assert_eq!(
+            machine.writable_capacity(base),
+            None,
+            "no stale key is left naming the freed block"
+        );
+    }
+
+    /// A zero capacity hint is reproduced faithfully (C's `erl_bits.c:2023` really does
+    /// allocate `bin_size = 0`), and such a payload still makes **progress**: growing it
+    /// asks for one byte, which exceeds a zero reservation, so `beam_alloc` relocates it to
+    /// a `UNIT_SIZE` reservation with a one-byte capacity — never a zero-progress loop.
+    #[test]
+    fn a_zero_capacity_writable_payload_grows_monotonically() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let _term = make_writable(&mut machine, &mut ctx, 0).unwrap();
+        let base = machine.refc_binaries()[0].data_ptr();
+        assert_eq!(machine.refc_binaries()[0].capacity(), 0);
+        assert_eq!(machine.refc_binaries()[0].len(), 0);
+        assert_eq!(machine.refc_binaries()[0].reserved_bytes(), 0);
+
+        let (new_base, capacity) = machine
+            .grow_writable_payload(base, 1)
+            .unwrap()
+            .expect("a zero-capacity payload can still grow");
+        assert_ne!(new_base, base, "a zero reservation cannot grow in place");
+        assert!(capacity >= 1, "the first growth buys at least the requested byte");
+        assert_eq!(machine.refc_binaries()[0].capacity(), capacity);
+        assert_eq!(
+            machine.refc_binaries()[0].len(),
+            capacity,
+            "the first growth makes its whole backing store live"
+        );
+        assert_eq!(machine.writable_capacity(new_base), Some(capacity));
+    }
+
+    /// A grow is refused — `Ok(None)`, never an error — for a payload the machine does not
+    /// own, for one it never registered as writable, and for a **shared** one (a second
+    /// handle exists, exactly C's `erts_pin_writable_binary` condition). The payload and
+    /// the registry are unchanged by every refusal.
+    #[test]
+    fn grow_writable_payload_refuses_what_it_cannot_grow() {
+        // (a) An ordinary (non-writable) refc binary: never a growth target.
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let bytes = vec![7u8; 80];
+        let _ordinary = make_binary(&mut machine, &mut ctx, &bytes, 640).unwrap();
+        let ordinary_base = machine.refc_binaries()[0].data_ptr();
+        assert_eq!(
+            machine.grow_writable_payload(ordinary_base, 4096).unwrap(),
+            None,
+            "an ordinary binary's payload keeps its immutability"
+        );
+        assert_eq!(machine.refc_binaries()[0].capacity(), 80);
+        assert_eq!(machine.writable_capacity(ordinary_base), None);
+
+        // (b) A base no handle of this machine names.
+        assert_eq!(
+            machine.grow_writable_payload(core::ptr::null_mut(), 16).unwrap(),
+            None
+        );
+
+        // (c) A *shared* writable payload: cloning the handle makes the refcount 2, which
+        //     `beam_alloc` refuses to grow (a host adopted the payload).
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let _acc = make_writable(&mut machine, &mut ctx, 8).unwrap();
+        let shared_base = machine.refc_binaries()[0].data_ptr();
+        let adopted = machine.refc_binaries()[0].clone();
+        assert_eq!(machine.refc_binaries()[0].refcount(), 2);
+        assert_eq!(
+            machine.grow_writable_payload(shared_base, 8192).unwrap(),
+            None,
+            "a payload another handle shares is never relocated"
+        );
+        assert_eq!(
+            machine.refc_binaries()[0].data_ptr(),
+            shared_base,
+            "the shared payload did not move"
+        );
+        assert_eq!(machine.refc_binaries()[0].capacity(), 8, "nor did it grow");
+        assert_eq!(
+            machine.refc_binaries()[0].len(),
+            8,
+            "nor did its length move"
+        );
+        assert_eq!(
+            machine.writable_capacity(shared_base),
+            Some(8),
+            "the registry entry is unchanged"
+        );
+        drop(adopted);
+    }
+
+    /// The **republish**: when the sink's growth relocates the payload, the accumulator's
+    /// `[BinRef][ErlSubBits]` pair is rewritten over the new block — same `Eterm`, same
+    /// window (`start`/`end`), same bytes — and the registry follows it.
+    #[test]
+    fn a_relocation_republishes_the_accumulator_pair() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let acc = make_writable(&mut machine, &mut ctx, 8).unwrap();
+
+        // Seed three bytes through the sink (in place: 24 bits of a 64-bit capacity).
+        let (base, capacity_bits, end_bits) = writable_append_target(&machine, acc).expect("writable");
+        let mut sink = InPlace::new(base, capacity_bits, end_bits, acc);
+        sink.copy_bytes(&[1, 2, 3]);
+        let acc = sink.finish();
+        let size_before = beam_term::size::size_object(acc);
+
+        // Grow well past the 8-byte capacity / 32-byte reservation: the payload moves.
+        let (base, capacity_bits, end_bits) = writable_append_target(&machine, acc).expect("writable");
+        let mut sink = InPlace::new(base, capacity_bits, end_bits, acc);
+        assert!(
+            sink.grow(&mut machine, 64 * 8).unwrap(),
+            "the sink grew past its reservation"
+        );
+        assert_ne!(sink.base, base, "the payload was relocated");
+        assert!(
+            sink.remaining_bits() >= 64 * 8,
+            "the refreshed capacity is in bits"
+        );
+        sink.copy_bytes(&[4, 5, 6]);
+        let grown = sink.finish();
+        assert_eq!(grown, acc, "the republish keeps the accumulator's term");
+
+        // The pair now names the NEW payload, with the same window start.
+        let new_base = machine.refc_binaries()[0].data_ptr();
+        assert_ne!(new_base, base);
+        // SAFETY: `grown` is the live refc-binary accumulator.
+        let (window_base, start, size) = unsafe { beam_term::bitstring_parts(grown) };
+        assert_eq!(window_base, new_base as *const u8, "the pair names the new block");
+        assert_eq!(start, 0, "the republish preserved the window start");
+        assert_eq!(size, 48, "and the written bits");
+        // The pair's `orig` slot still points at its own `BinRef`, whose `val` word now
+        // carries the new payload address.
+        // SAFETY: `grown` is the live refc-binary pair, so its `orig` slot is the live
+        // `BinRef` of that same pair.
+        let (orig, val) = unsafe {
+            let orig = *boxed_val(grown).add(4);
+            let (val, _next) = beam_term::refc::bin_ref_parts(orig);
+            (orig, val)
+        };
+        assert_eq!(
+            val as *const u8, new_base,
+            "the `BinRef.val` word names the new block"
+        );
+        assert_eq!(
+            boxed_val(orig),
+            boxed_val(grown).wrapping_sub(beam_term::ERL_BIN_REF_SIZE),
+            "and it is still this pair's own `BinRef`, at its fixed offset"
+        );
+        assert_eq!(
+            machine.writable_capacity(new_base),
+            Some(machine.refc_binaries()[0].capacity()),
+            "the registry followed the move"
+        );
+        assert_eq!(machine.writable_capacity(base), None, "no stale key");
+
+        // The bytes are the ones written, before and after the move.
+        assert_eq!(subject_bytes(grown).unwrap(), (&[1u8, 2, 3, 4, 5, 6][..], 0));
+        // The move copied them because the payload's logical length is its whole capacity
+        // (`beam_alloc`'s relocation copies exactly `len()` bytes), and the live prefix is
+        // the accumulator's written bytes.
+        let payload = &machine.refc_binaries()[0];
+        assert_eq!(
+            payload.len(),
+            payload.capacity(),
+            "the whole backing store is live, so a relocation copies the written bytes"
+        );
+        assert_eq!(
+            &payload.as_bytes()[..6],
+            &[1u8, 2, 3, 4, 5, 6],
+            "the relocated payload carries the bytes written before the move"
+        );
+        // The accumulator's on-heap size is the fixed pair, unchanged by the growth: the
+        // payload's capacity and reservation never enter the term's size.
+        assert_eq!(beam_term::size::size_object(grown), size_before);
+        assert_eq!(size_before, beam_term::refc::ERL_REFC_BITS_SIZE);
+    }
+
+    /// A second on-heap pair over the **same** payload (a GC copy, a family-built
+    /// `BinRef`, a match context) makes the relocation refuse — the old block would be
+    /// freed under it — while the accumulator's **own** pair never blocks its growth.
+    #[test]
+    fn a_second_pair_over_the_payload_refuses_the_move() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let acc = make_writable(&mut machine, &mut ctx, 8).unwrap();
+        let (base, capacity_bits, _end) = writable_append_target(&machine, acc).expect("writable");
+
+        // A second `[BinRef][ErlSubBits]` pair over the very same payload, parked in a
+        // register — the shape a GC copy of the pair leaves behind.
+        let hp = reserve(
+            &mut machine,
+            &mut ctx,
+            beam_term::refc::ERL_REFC_BITS_SIZE,
+            RootSet::ALL_LIVE,
+        )
+        .unwrap();
+        // SAFETY: `hp` is 8 exclusively-owned words; `base` is the live payload the machine
+        // keeps alive; the alias covers a 0-bit window at the payload's start.
+        let alias = unsafe {
+            beam_term::refc::write_refc_binary(
+                hp,
+                base.cast::<Eterm>(),
+                core::ptr::null_mut(),
+                base,
+                0,
+                0,
+            )
+        };
+        machine.set_x(1, alias).unwrap();
+
+        // `cur == capacity`, so the next bit needs a growth the move would have to serve.
+        let mut sink = InPlace::new(base, capacity_bits, capacity_bits, acc);
+        assert!(
+            !sink.grow(&mut machine, 8).unwrap(),
+            "an aliased payload must not be relocated"
+        );
+        assert_eq!(sink.base, base, "the refusal left the sink on the old block");
+        assert_eq!(
+            machine.refc_binaries()[0].data_ptr(),
+            base,
+            "the payload did not move"
+        );
+        assert_eq!(
+            machine.writable_capacity(base),
+            Some(8),
+            "the registry entry is unchanged"
+        );
+
+        // The accumulator's OWN pair anywhere in the root set is not an alias.
+        machine.set_x(1, beam_term::NIL).unwrap();
+        machine.set_x(0, acc).unwrap();
+        let mut sink = InPlace::new(base, capacity_bits, capacity_bits, acc);
+        assert!(
+            sink.grow(&mut machine, 8).unwrap(),
+            "the accumulator's own pair never blocks growth"
+        );
+        assert_eq!(
+            sink.base, base,
+            "8 bytes + 8 bits still fits the 32-byte reservation"
+        );
+    }
     /// A test context whose heap is **one pre-filled block**: every allocation returns
     /// the same `words`-word buffer, every byte of which already holds `0xFF`.
     ///
