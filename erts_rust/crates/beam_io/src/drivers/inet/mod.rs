@@ -1176,6 +1176,12 @@ impl TcpInetDriver {
 
     /// The `listen` verb: turns the socket into a listener.
     ///
+    /// The C does **not** arm accept readiness here: its `sock_select(FD_ACCEPT, 1)` happens only
+    /// on the first `INET_REQ_ACCEPT` whose `sock_accept` answered `ERRNO_BLOCK`
+    /// (`inet_drv.c:12224`), and the disarm on the last completion/timeout. This floor's listener
+    /// is already registered [`Interest::READABLE`] by [`TcpInetDriver::adopt`] (via the `open`
+    /// verb), so the arm/disarm pair in the async queue is the whole rule — nothing to do here.
+    ///
     /// # Errors
     ///
     /// `BeamError::BadArg` for an argument that is not a two-byte backlog; `BeamError::Io`
@@ -1576,8 +1582,9 @@ impl TcpInetDriver {
             // guard, so both faults answer `einval`. A well-formed operand joins the C's
             // `enq_multi_op` list and the reply is the asynchronous id —
             // `[1] ++ <<Id:16/big>>` (`:12209`), with the accepted connection delivered later as
-            // `{inet_async, Port, Id, {ok, Descriptor}}`.
-            Opcode::Accept => self.async_accept(arg),
+            // `{inet_async, Port, Id, {ok, Descriptor}}`. Queueing it also arms the listener's
+            // accept (read) readiness (`sock_select(FD_ACCEPT, 1)`, `:12224`).
+            Opcode::Accept => self.async_accept(ctx, arg),
             // `TCP_REQ_RECV` (`:12268`): the whole asynchronous-receive guard ladder — the
             // connection guard (including the C's one-shot `closed`/`econnreset` reply, modelled
             // by [`PeerClose`]), `active || len != 8 ⇒ einval`, the framing/`Length` rule, the

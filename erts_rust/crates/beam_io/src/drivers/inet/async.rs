@@ -430,7 +430,23 @@ impl TcpInetDriver {
     /// be the four-byte timeout, both answering `[0]einval` (`inet_drv.c:12160`-`:12170`) — and the
     /// operation joins the multi-op accept list (`enq_multi_op`, `:12194`/`:12209`), so repeats
     /// never answer `ealready`.
-    pub(super) fn async_accept(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
+    ///
+    /// Queueing an accept also **arms accept readiness** on the listener: the C's
+    /// `sock_select(INETP(desc), FD_ACCEPT, 1)` on the accept whose `sock_accept` answered
+    /// `ERRNO_BLOCK` (`inet_drv.c:12224`), and `FD_ACCEPT` is `ERL_DRV_READ` (`:631`), i.e. the
+    /// listener's *read* readiness. It is issued on **every** enqueue (an `epoll_ctl(MOD)` re-arm
+    /// of an already-`READABLE` registration), which re-reports a connection that arrived while no
+    /// accept was queued; the last completion/timeout disarms it
+    /// ([`TcpInetDriver::disarm_accepts`]).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the poller answers when the readiness arm fails.
+    pub(super) fn async_accept(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        arg: &[u8],
+    ) -> Result<Vec<u8>> {
         if !self.state.is_listening() || arg.len() != 4 {
             return Ok(ctl_xerror("einval"));
         }
@@ -442,7 +458,28 @@ impl TcpInetDriver {
             id,
             deadline: deadline_for(timeout_ms),
         });
+        self.set_interest(ctx, Interest::READABLE)?;
         Ok(async_ok_reply(id))
+    }
+
+    /// Disarms accept readiness once the multi-accept list has drained — the C's
+    /// `if (desc->multi_first == NULL) { sock_select(INETP(desc), FD_ACCEPT, 0);
+    /// desc->inet.state = INET_STATE_LISTENING; }` after a successful accept
+    /// (`inet_drv.c:13559`-`:13562`, single-accept twin `:13538`-`:13545`) and after a due accept
+    /// timeout (`tcp_inet_multi_timeout`, `:12607`-`:12611`).
+    ///
+    /// Guarded on [`InetState::is_listening`] so it can never disturb a connected socket's read
+    /// interest or a [`InetState::Connecting`] socket's write interest. While accepts remain
+    /// queued nothing is issued: the registration is still `READABLE` for the survivors.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the poller answers when the de-registration fails.
+    fn disarm_accepts(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        if self.async_ops.accepts().is_empty() && self.state.is_listening() {
+            self.deregister(ctx)?;
+        }
+        Ok(())
     }
 
     /// Accepts one connection if the listener has one, completing the oldest queued accept.
@@ -451,6 +488,10 @@ impl TcpInetDriver {
     /// mode and handed to the runtime **inside the completion**
     /// ([`InetAsyncResult::Accepted`]): this driver never stores it, so no teardown path can close
     /// it twice.
+    ///
+    /// Every completion dequeues its operation and then re-checks the listener's arming
+    /// ([`TcpInetDriver::disarm_accepts`]); an `EAGAIN` (the C's "ghost trigger") changes nothing,
+    /// exactly like the `goto done` in `tcp_inet_input`.
     ///
     /// # Errors
     ///
@@ -465,6 +506,7 @@ impl TcpInetDriver {
         match accept_socket(listener) {
             Ok(fd) => {
                 self.async_ops.take_accept();
+                self.disarm_accepts(ctx)?;
                 if let Err(err) = set_nonblocking(fd) {
                     // Nothing can be handed over: close what we took and report the errno, the
                     // C's `inet_async_error` shape (`:2539`).
@@ -492,6 +534,7 @@ impl TcpInetDriver {
                 // A real accept failure: the C completes the operation with the errno
                 // (`async_error(desc, err)`) and leaves the descriptor listening.
                 self.async_ops.take_accept();
+                self.disarm_accepts(ctx)?;
                 let reason = InetReason::from_errno(err.raw_os_error().unwrap_or(libc::EINVAL));
                 ctx.deliver_completion(CompletionEvent::InetAsync {
                     id: op.id,
@@ -617,6 +660,9 @@ impl TcpInetDriver {
                 .filter(|op| op.is_due(now));
             let Some(op) = due else { break };
             self.async_ops.take_accept();
+            // The C's `tcp_inet_multi_timeout` disarms only once the list is empty
+            // (`inet_drv.c:12607-12611`): survivors keep the socket armed.
+            self.disarm_accepts(ctx)?;
             ctx.deliver_completion(CompletionEvent::InetAsync {
                 id: op.id,
                 result: InetAsyncResult::Error(InetReason::Timeout),
