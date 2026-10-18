@@ -57,7 +57,7 @@ Success ⇒ one line `ok <repr>`, exit `0`; failure ⇒ `exception <class> <reas
 ## Status
 - **Corpus:** 3122 cases covering all nine contracts; live sweep `total=3122 agree=3121 mismatch=0
   unsupported=1 skipped=0 errors=0` (a 16-way `differential run` sweep; the serial `gate.sh` route boots
-  every CLI case, so the parallel sweep is the practical authoritative route). The single non-agreeing case is the allowlisted `wire/new_fun_ext_encode`.
+  every CLI case, so the parallel sweep is the practical authoritative route). The single non-agreeing case is the allowlisted `wire/new_fun_ext_encode`. Do **not** read the total from `../../out/report.json`: that tracked file is a stale suite artifact (`summary.total` 645) from an older corpus revision — the committed `GAPS.md` header and this line are the current figures, and `differential list` is authoritative for ids.
 - **Deterministic:** every case's oracle side reproduces its golden without depending on an oracle
   crash — the A.4 `erts_ioq_pushqv` hazard is avoided by the fixture's binary-backed vector (see *Known
   Issues*).
