@@ -98,6 +98,7 @@ use beam_common::Result;
 
 use super::accept::AcceptQueue;
 use super::frame;
+use super::stat;
 use super::wire::{ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
 use super::{Interest, TcpInetDriver};
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply};
@@ -376,8 +377,19 @@ impl TcpInetDriver {
             };
             let framed = self.framed().is_some();
             // Is the operation satisfiable from what is already buffered?
+            //
+            // The framed branch also does its accounting: `stat::take_frame` credits the **whole
+            // frame** (framing header included), which is `tcp_deliver`'s
+            // `inet_input_count(INETP(desc), len)` with `len` = `packet_get_length`'s total packet
+            // length (`inet_drv.c:12967`/`:13064`). The raw branches count the delivered bytes
+            // below — `tcp_deliver(desc, request_len)` for an exact-length receive (`:13162`) and
+            // the whole input buffer for `tcp_deliver(desc, 0)` on a raw socket.
             let payload = if framed {
-                match frame::extract(&mut self.pending_input, &frame::options(&self.options)) {
+                match stat::take_frame(
+                    &mut self.stat,
+                    &mut self.pending_input,
+                    &frame::options(&self.options),
+                ) {
                     Ok(frame) => frame,
                     Err(err) => {
                         // The buffered bytes can never be a frame for this option set: report the
@@ -400,9 +412,11 @@ impl TcpInetDriver {
             };
             if let Some(payload) = payload {
                 self.async_ops.take_recv();
-                // `inet_input_count(desc, len)` (`inet_drv.c:13064`, `tcp_deliver`): the delivered
-                // payload, the framing header already stripped.
-                self.stat.input(payload.len());
+                if !framed {
+                    // A raw delivery counts exactly the bytes it hands over — no header exists to
+                    // add, so this is the C's `len` too.
+                    self.stat.input(payload.len());
+                }
                 ctx.deliver_completion(CompletionEvent::InetAsync {
                     id: op.id,
                     result: InetAsyncResult::Data(ReadMessage::body_only(payload)),
@@ -590,11 +604,12 @@ impl TcpInetDriver {
     pub(super) fn verb_recv_framed(&mut self, ctx: &mut DriverContext<'_>) -> Result<Vec<u8>> {
         let framing = frame::options(&self.options);
         loop {
-            match frame::extract(&mut self.pending_input, &framing)? {
+            match stat::take_frame(&mut self.stat, &mut self.pending_input, &framing)? {
                 Some(payload) => {
-                    // `inet_input_count(desc, len)` at `inet_drv.c:13064` (`tcp_deliver`): the
-                    // **delivered payload** length — the framing header already stripped.
-                    self.stat.input(payload.len());
+                    // The count is [`stat::take_frame`]'s: `tcp_deliver` charges
+                    // `inet_input_count(INETP(desc), len)` with the frame's **total packet
+                    // length** (`inet_drv.c:12967`/`:13064`), the framing header included —
+                    // not the stripped payload pushed onto the input queue below.
                     ctx.input().push(&payload);
                     return Ok(ctl_ok());
                 }

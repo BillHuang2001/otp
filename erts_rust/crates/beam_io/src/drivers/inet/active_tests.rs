@@ -311,7 +311,9 @@ fn passive_count(inputs: &[ActiveInput]) -> usize {
 // -----------------------------------------------------------------------
 
 /// `{active, true}`: one read burst is one `{tcp, S, Data}`, with an empty `{header, N}` split and
-/// `recv_oct` advanced by the delivered payload (`inet_input_count`, `inet_drv.c:13064`).
+/// `recv_oct` advanced by the delivered bytes — under `{packet, raw}` that **is** the counted
+/// length, since `packet_get_length` over a `TCP_PB_RAW` buffer answers the whole buffer
+/// (`inet_input_count`, `inet_drv.c:13064`).
 #[test]
 fn active_true_delivers_one_data_message_and_counts_the_bytes() {
     let Link { mut port, mut peer } = link();
@@ -332,9 +334,16 @@ fn active_true_delivers_one_data_message_and_counts_the_bytes() {
 
 /// `{packet, 2}`: the framing header is **stripped before delivery**
 /// (`packet_get_body`, called from `tcp_reply_data`, `inet_drv.c:4285`), so the body is `abc`.
+///
+/// The counters credit the **whole frame** even though only the payload is delivered:
+/// `tcp_deliver` charges `inet_input_count(INETP(desc), len)` (`:13064`) with `len` from
+/// `tcp_remain(desc, &len)` (`:12967`/`:13052`), i.e. `packet_get_length`'s total packet length —
+/// the two-byte header included. Measured on the oracle for one `<<0,3,"abc">>` frame under
+/// `{packet,2},{active,true}`: `recv_max = 5`, `recv_oct = 5`.
 #[test]
 fn a_packet_framed_delivery_strips_the_framing_header() {
     let Link { mut port, mut peer } = link();
+    assert_eq!(port.octets(), (0, 0), "a fresh port has counted nothing");
 
     assert_eq!(port.setopts(&[packet(2), active_true()]), ctl_ok());
     send(&mut peer, &[0, 3, b'a', b'b', b'c']);
@@ -344,6 +353,19 @@ fn a_packet_framed_delivery_strips_the_framing_header() {
     let read = &payloads(&delivered)[0];
     assert!(read.header.is_empty(), "the framing header is not a report header");
     assert_eq!(read.body.as_deref(), Some(&b"abc"[..]), "the 2-byte header is gone");
+    assert_eq!(
+        port.octets().0,
+        5,
+        "recv_oct counts the whole frame: three payload octets plus the two-byte header"
+    );
+    // `INET_STAT_RECV_MAX` (op 2) is the largest counted length, so it is 5 and not 3.
+    let max = port.numbered(GETSTAT, &[2]);
+    assert_eq!(max.len(), 6, "[1] ++ [2, u32_be]");
+    assert_eq!(
+        u32::from_be_bytes(max[2..6].try_into().expect("four octets")),
+        5,
+        "recv_max is the whole frame's length"
+    );
 }
 
 /// `{header, 2}`: the read's `header` is the `{header, N}` option (`desc->hsz`,

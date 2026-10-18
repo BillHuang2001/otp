@@ -20,7 +20,7 @@
 
 //! The `INET_REQ_GETSTAT`(11) suite for **both** socket drivers: the reply shape the C's
 //! `inet_fill_stat` builds (`inet_drv.c:10732`-`:10792`) and the accounting that feeds it
-//! (`inet_input_count`/`inet_output_count`, `:11560`-`:11623`).
+//! (`inet_input_count`/`inet_output_count`, `:11560`-`:11617`).
 //!
 //! Every case is driven through the runtime's own `erlang:port_control/3` route
 //! ([`crate::PortRegistry::port_control`]) with the decimal command a live `beam_rt` forwards — so
@@ -284,11 +284,20 @@ fn a_tcp_recv_moves_the_input_counters() {
     );
 }
 
-/// Under `{packet, 2}` the send counter counts the payload **plus** its length header
-/// (`inet_output_count(desc, len + h_len)`), while the receive counter counts only the delivered
-/// payload — the header is stripped by the frame decoder before delivery.
+/// Under `{packet, 2}` **both** directions count the framing header.
+///
+/// * output: `inet_output_count(desc, len + h_len)` — the C's `tcp_send` (`inet_drv.c:13763`;
+///   its vector twin is `:13879`), where `h_len` is the 1/2/4-byte header the send path prepends;
+/// * input: `inet_input_count(INETP(desc), len)` inside `tcp_deliver` (`:13064`), whose `len` came
+///   out of `tcp_remain(desc, &len)` (`:12967`/`:13052`) as `packet_get_length`'s **total packet
+///   length** —
+///   so the *whole frame* is counted and only the payload is delivered
+///   (`packet_get_body`/`packet_parser.h:152`).
+///
+/// Measured on the oracle for exactly this traffic (`{packet,2}`, one `<<0,3,"abc">>` in each
+/// direction): `send_oct = 5`, `recv_oct = 5`, `recv_max = 5`.
 #[test]
-fn a_framed_tcp_command_counts_its_length_header() {
+fn a_framed_tcp_read_and_write_count_the_framing_header() {
     let mut pair = TcpPair::new();
     // `INET_REQ_SETOPTS`(7) with the `{packet, 2}` record: code 23 = `INET_LOPT_PACKET`, value 2
     // (the C's `TCP_PB_2`, which is what `prim_inet` encodes for `{packet,2}`).
@@ -314,11 +323,263 @@ fn a_framed_tcp_command_counts_its_length_header() {
         .expect("the peer writes one framed message");
     pair.recv_until(3);
     assert_eq!(pair.port.take_input(3), vec![10, 11, 12], "the payload");
-    assert_eq!(stat32(&mut pair.port, RECV_MAX), 3, "the header is stripped");
-    assert_eq!(stat64(&mut pair.port, RECV_OCT), 3);
+    assert_eq!(
+        stat32(&mut pair.port, RECV_MAX),
+        5,
+        "the whole frame counts: three payload octets plus the two-byte header"
+    );
+    assert_eq!(stat64(&mut pair.port, RECV_OCT), 5);
     assert_eq!(stat32(&mut pair.port, RECV_CNT), 1);
+    assert_eq!(stat32(&mut pair.port, RECV_AVG), 5, "the mean of one frame");
+    assert_eq!(stat32(&mut pair.port, RECV_DVI), 0, "one sample, no deviation");
 }
 
+// -----------------------------------------------------------------------
+// The framing-inclusive recv counters, against the oracle
+// -----------------------------------------------------------------------
+
+/// The five receive counters (`INET_STAT_*` ops 1, 2, 3, 4 and 9), in the C's op order.
+const RECV_COUNTER_OPS: [u8; 5] = [RECV_CNT, RECV_MAX, RECV_AVG, RECV_DVI, RECV_OCT];
+
+/// This floor's values for `ops`, read one `INET_REQ_GETSTAT` record at a time.
+fn counters(port: &mut Rig, ops: &[u8]) -> Vec<u32> {
+    ops.iter()
+        .map(|&code| {
+            if code == RECV_OCT {
+                stat64(port, code) as u32
+            } else {
+                stat32(port, code)
+            }
+        })
+        .collect()
+}
+
+/// The `[V || {_,V} <- Stat]` list the oracle expressions below print, parsed back into numbers.
+///
+/// `None` — after [`super::opcode_tests::erl_stdout`]'s own loud `SKIP:` banner — when `erl` is
+/// absent or does not answer in time. A non-empty but unparsable dump is a bug in the probe and
+/// fails the test.
+fn oracle_counters(expression: &str) -> Option<Vec<u32>> {
+    let Some(dump) = super::opcode_tests::erl_stdout(expression) else {
+        return None;
+    };
+    let inner = dump
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(list, _)| list)
+        .unwrap_or_else(|| panic!("no counter list in the oracle's dump {dump:?}"));
+    Some(
+        inner
+            .split(',')
+            .map(|number| {
+                number
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_else(|_| panic!("an unparsable counter in {dump:?}"))
+            })
+            .collect(),
+    )
+}
+
+/// Two `{packet, 2}` frames count their **whole** length on both sides of the wire, and the
+/// running mean/deviation are the C's (`inet_input_count`, `inet_drv.c:11585`-`:11617`).
+///
+/// The oracle drives the same byte sequence — `<<0,3,"abc">>` then `<<0,7,"defghij">>`, one
+/// `gen_tcp:recv/3` each — and reads `inet:getstat(S, [recv_cnt, recv_max, recv_avg, recv_dvi,
+/// recv_oct])`. Both sides must answer `2, 9, 7, 1, 14`:
+///
+/// * `recv_oct` = 5 + 9 (the frame lengths, header included), `recv_max` = 9 (the larger frame);
+/// * `recv_avg` `= 5 + (9 - 5)/2 = 7`;
+/// * `recv_dvi` `= 0 + ((9 - 7) - 0)/2 = 1` — rendered through the C's `(unsigned long)
+///   fabs(desc->recv_dvi)` (`inet_fill_stat`, `:10754`), so a negative deviation is its absolute
+///   value.
+///
+/// This is the row the payload-only accounting used to report as `2, 7, 5, 1, 14` (a *well-formed
+/// wrong value*, not a typed gap): the `{packet,N}` header is part of what the C counts.
+#[test]
+fn a_framed_tcp_recv_counts_the_whole_frame_like_the_oracle() {
+    let mut pair = TcpPair::new();
+    let mut setopts = vec![23u8];
+    setopts.extend_from_slice(&2i32.to_be_bytes());
+    assert_eq!(pair.port.control(&op(7), &setopts), ctl_ok(), "the `packet`/2 option");
+
+    use std::io::Write;
+    pair.peer
+        .write_all(&[0, 3, b'a', b'b', b'c'])
+        .expect("the peer writes the first frame");
+    pair.peer
+        .write_all(&[0, 7, b'd', b'e', b'f', b'g', b'h', b'i', b'j'])
+        .expect("the peer writes the second frame");
+    pair.recv_until(3);
+    assert_eq!(pair.port.take_input(3), b"abc".to_vec(), "the first payload");
+    pair.recv_until(7);
+    assert_eq!(
+        pair.port.take_input(7),
+        b"defghij".to_vec(),
+        "the second payload"
+    );
+
+    let rust = counters(&mut pair.port, &RECV_COUNTER_OPS);
+    assert_eq!(
+        rust,
+        vec![2, 9, 7, 1, 14],
+        "cnt, max, avg, dvi, oct: the whole frames, header included"
+    );
+
+    let Some(oracle) = oracle_counters(
+        "{ok,L}=gen_tcp:listen(0,[binary,{active,false},{packet,2},{ip,{127,0,0,1}}]), \
+         {ok,P}=inet:port(L), \
+         {ok,C}=gen_tcp:connect({127,0,0,1},P,[binary,{active,false},{packet,2}]), \
+         {ok,S}=gen_tcp:accept(L), \
+         ok=gen_tcp:send(C,<<\"abc\">>), \
+         ok=gen_tcp:send(C,<<\"defghij\">>), \
+         {ok,<<\"abc\">>}=gen_tcp:recv(S,0,5000), \
+         {ok,<<\"defghij\">>}=gen_tcp:recv(S,0,5000), \
+         {ok,St}=inet:getstat(S,[recv_cnt,recv_max,recv_avg,recv_dvi,recv_oct]), \
+         io:format(\"~w|\",[[V || {_,V} <- St]]), \
+         gen_tcp:close(S), gen_tcp:close(C), gen_tcp:close(L)",
+    ) else {
+        return;
+    };
+    assert_eq!(oracle, rust, "the oracle's framed counters");
+}
+
+/// A raw (`{packet, raw}`) read counts exactly the bytes it delivers — the C's `tcp_deliver`
+/// over a `TCP_PB_RAW` buffer, whose `packet_get_length` answers "the whole buffer"
+/// (`packet_parser.c:259`-`:264`).
+///
+/// Cross-checked against the oracle for the same three writes read as one burst.
+#[test]
+fn a_raw_tcp_recv_counts_the_delivered_bytes_like_the_oracle() {
+    let mut pair = TcpPair::new();
+    use std::io::Write;
+    pair.peer.write_all(b"abc").expect("the peer writes");
+    pair.recv_until(3);
+    assert_eq!(pair.port.take_input(3), b"abc".to_vec());
+    let rust = counters(&mut pair.port, &RECV_COUNTER_OPS);
+    assert_eq!(rust, vec![1, 3, 3, 0, 3], "cnt, max, avg, dvi, oct");
+
+    let Some(oracle) = oracle_counters(
+        "{ok,L}=gen_tcp:listen(0,[binary,{active,false},{packet,0},{ip,{127,0,0,1}}]), \
+         {ok,P}=inet:port(L), \
+         {ok,C}=gen_tcp:connect({127,0,0,1},P,[binary,{active,false},{packet,0}]), \
+         {ok,S}=gen_tcp:accept(L), \
+         ok=gen_tcp:send(C,<<\"abc\">>), \
+         {ok,_}=gen_tcp:recv(S,3,5000), \
+         {ok,St}=inet:getstat(S,[recv_cnt,recv_max,recv_avg,recv_dvi,recv_oct]), \
+         io:format(\"~w|\",[[V || {_,V} <- St]]), \
+         gen_tcp:close(S), gen_tcp:close(C), gen_tcp:close(L)",
+    ) else {
+        return;
+    };
+    assert_eq!(oracle, rust, "the oracle's raw counters");
+}
+
+// -----------------------------------------------------------------------
+// send_pend — the port's output-queue depth (the C's `driver_sizeq`)
+// -----------------------------------------------------------------------
+
+/// `send_pend` (op 8) is the C's `driver_sizeq(desc->port)` (`inet_fill_stat`, `:10766`) — the
+/// bytes still queued for the socket — which is this floor's `ctx.output().len()`
+/// ([`super::wire::getstat_reply`]'s `send_pend` argument).
+///
+/// A command larger than the connection can absorb stalls: the peer never reads, so the kernel's
+/// send buffer plus the peer's receive window fill up and the remainder stays in the port's output
+/// queue (a short write, the C's `driver_enqv(ix, ev, n)` at the end of `tcp_send`). `send_pend`
+/// must then be exactly that remainder, while `send_oct`/`send_max` already count the **whole**
+/// command (`inet_output_count` runs at issue time, before anything is written).
+#[test]
+fn send_pend_reports_the_command_bytes_still_queued() {
+    let mut pair = TcpPair::new();
+    assert_eq!(stat32(&mut pair.port, SEND_PEND), 0, "nothing queued yet");
+
+    // 16 MiB can never fit in the socket's send buffer *and* the peer's receive window, so a
+    // non-reading peer guarantees a remainder — no timing involved.
+    let payload = vec![0u8; 16 * 1024 * 1024];
+    let mut setopts = vec![23u8];
+    setopts.extend_from_slice(&2i32.to_be_bytes());
+    assert_eq!(pair.port.control(&op(7), &setopts), ctl_ok(), "the `packet`/2 option");
+    assert_eq!(
+        pair.port.control("send", &payload),
+        ctl_ok(),
+        "the send verb queues what the socket cannot take"
+    );
+
+    let id = pair.port.id;
+    let queued = pair
+        .port
+        .registry
+        .get(id)
+        .expect("a live port")
+        .output_len();
+    assert!(queued > 0, "the kernel could not take the whole command");
+    assert!(
+        queued < payload.len() + 2,
+        "a strict remainder of the command is queued ({queued} of {})",
+        payload.len() + 2
+    );
+    assert_eq!(
+        stat32(&mut pair.port, SEND_PEND) as usize,
+        queued,
+        "`send_pend` is the port's output-queue depth"
+    );
+    assert_eq!(
+        stat64(&mut pair.port, SEND_OCT),
+        (payload.len() + 2) as u64,
+        "the whole command was counted at issue, header included"
+    );
+    assert_eq!(stat32(&mut pair.port, SEND_MAX) as usize, payload.len() + 2);
+    assert_eq!(stat32(&mut pair.port, SEND_CNT), 1);
+}
+
+/// The oracle's `driver_sizeq` and this floor's `ctx.output().len()` describe the same state: a
+/// 16 MiB `{packet,2}` command to a peer that never reads leaves a non-empty queue on both sides,
+/// and both count the command's **whole** length (payload + header) as output at issue time.
+///
+/// The remainder itself is whatever the kernel took, so only the invariants are compared — the
+/// exact `send_pend` is *not* a portable number (measured on this host: 14 188 546 of 16 777 218).
+#[test]
+fn send_pend_agrees_with_the_oracle() {
+    let Some(oracle) = oracle_counters(
+        "{ok,L}=gen_tcp:listen(0,[binary,{active,false},{packet,2},{ip,{127,0,0,1}}]), \
+         {ok,P}=inet:port(L), \
+         {ok,C}=gen_tcp:connect({127,0,0,1},P,[binary,{active,false},{packet,2}]), \
+         {ok,S}=gen_tcp:accept(L), \
+         Big=binary:copy(<<0>>,16*1024*1024), \
+         ok=gen_tcp:send(S,Big), \
+         {ok,St}=inet:getstat(S,[send_pend,send_oct,send_max,send_cnt]), \
+         io:format(\"~w|\",[[V || {_,V} <- St]]), \
+         gen_tcp:close(S), gen_tcp:close(C), gen_tcp:close(L)",
+    ) else {
+        return;
+    };
+    let [oracle_pend, oracle_oct, oracle_max, oracle_cnt] = oracle[..] else {
+        panic!("the oracle answered {} counters, not four", oracle.len());
+    };
+    let whole: usize = 16 * 1024 * 1024 + 2;
+    assert_eq!(oracle_oct, whole as u32, "the oracle counted the whole command");
+    assert_eq!(oracle_max, whole as u32);
+    assert_eq!(oracle_cnt, 1);
+    assert!(oracle_pend > 0, "the oracle's queue kept a remainder");
+    assert!(
+        (oracle_pend as usize) < whole,
+        "and it is a strict remainder"
+    );
+
+    // The same traffic through this floor, whose `send_pend` is its own output-queue depth.
+    let mut pair = TcpPair::new();
+    let mut setopts = vec![23u8];
+    setopts.extend_from_slice(&2i32.to_be_bytes());
+    assert_eq!(pair.port.control(&op(7), &setopts), ctl_ok(), "the `packet`/2 option");
+    assert_eq!(pair.port.control("send", &vec![0u8; 16 * 1024 * 1024]), ctl_ok());
+    let id = pair.port.id;
+    let queued = pair.port.registry.get(id).expect("a live port").output_len();
+    assert!(queued > 0 && queued < whole, "the same strict remainder");
+    assert_eq!(stat32(&mut pair.port, SEND_PEND) as usize, queued);
+    assert_eq!(stat64(&mut pair.port, SEND_OCT), whole as u64);
+    assert_eq!(stat32(&mut pair.port, SEND_MAX) as usize, whole);
+    assert_eq!(stat32(&mut pair.port, SEND_CNT), 1);
+}
 // -----------------------------------------------------------------------
 // The udp_inet accounting
 // -----------------------------------------------------------------------

@@ -106,6 +106,7 @@ use crate::port_task::{ActiveInputEvent, ReadMessage};
 
 use super::frame;
 use super::opt::{set_options_tracked, OptScope};
+use super::stat;
 use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, TcpInetDriver};
 
 impl TcpInetDriver {
@@ -204,11 +205,13 @@ impl TcpInetDriver {
     fn deliver_framed(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         loop {
             let framing = frame::options(&self.options);
-            match frame::extract(&mut self.pending_input, &framing)? {
+            match stat::take_frame(&mut self.stat, &mut self.pending_input, &framing)? {
                 Some(payload) => {
-                    // `inet_input_count(INETP(desc), len)` (`:13064`): the bytes **delivered**,
-                    // i.e. the payload with the framing header already stripped.
-                    self.stat.input(payload.len());
+                    // The count is [`stat::take_frame`]'s, not this loop's: `tcp_deliver`
+                    // credits `inet_input_count(INETP(desc), len)` with `len` =
+                    // `packet_get_length`'s **total packet length** (`:12967`/`:13064`), so a
+                    // framed delivery counts the framing header too even though the payload
+                    // handed to the owner has it stripped.
                     self.deliver_data(ctx, payload)?;
                     // `if (! desc->inet.active)` (`:13108`): the mode the last delivery spent
                     // ends the burst here.
