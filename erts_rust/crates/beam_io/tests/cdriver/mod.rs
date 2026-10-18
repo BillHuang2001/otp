@@ -128,6 +128,14 @@ pub fn vector_fixture_source() -> PathBuf {
 pub fn both_fixture_source() -> PathBuf {
     fixture_dir().join("host_driver_both.c")
 }
+
+/// The committed **shape** fixture (`output_shape_driver.c`): a self-contained driver whose
+/// `output` callback makes the `driver_output*`/`driver_failure*` call that the **first command
+/// byte** names (its opcode table is in the fixture's own file header). It is the object
+/// `tests/abi_failure.rs` drives the output-shape and failure-channel rows with.
+pub fn shape_fixture_source() -> PathBuf {
+    fixture_dir().join("output_shape_driver.c")
+}
 /// Compile the fixture into a loadable `.so`, or print a loud `SKIP:` and answer `None` when the
 /// toolchain is unavailable (never a silent pass, never a failure for a missing toolchain).
 pub fn fixture_so() -> Option<PathBuf> {
@@ -162,6 +170,12 @@ pub fn vector_fixture_so() -> Option<PathBuf> {
 /// The same for the both-write-callbacks fixture (`host_driver_both.c`).
 pub fn both_fixture_so() -> Option<PathBuf> {
     compile_fixture(&both_fixture_source(), "host_driver_both")
+}
+
+/// The same for the shape fixture (`output_shape_driver.c`), whose entry's `driver_name` is
+/// `output_shape_driver`.
+pub fn shape_fixture_so() -> Option<PathBuf> {
+    compile_fixture(&shape_fixture_source(), "output_shape_driver")
 }
 /// Compile `src` into `<scratch>/<stem>.so`, skipping loudly when `cc`/`erl_driver.h` are absent.
 fn compile_fixture(src: &Path, stem: &str) -> Option<PathBuf> {
@@ -267,7 +281,13 @@ pub fn open_named_port(
 // Driving the port
 // ---------------------------------------------------------------------------------------------
 
-/// The `Data` payloads a port-task round reported for `id`.
+/// The `Data` payloads a port-task round reported for `id`, flattened exactly as a `[list]` port's
+/// `{Port, {data, Data}}` would carry them (`ReadMessage::flattened`).
+///
+/// One element per driver `driver_output*` call, in arrival order: the C delivers one
+/// `{Port, {data, _}}` message per call (`deliver_read_message`, `io.c:3363-3442`), so two calls
+/// inside one callback are **two** elements — they are never merged into one (which is the
+/// coalescing bug the assertions this helper is used by were corrected for).
 pub fn data_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<Vec<u8>> {
     outcome
         .notifications
@@ -279,8 +299,41 @@ pub fn data_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Runs one port-task round and returns the bytes of the single [`PortNotification::Data`] it
+/// The **full** [`ReadMessage`]s a port-task round reported for `id`, in arrival order.
+///
+/// This is the split-preserving companion of [`data_of`]: the header stays apart from the body and
+/// a `None` body stays distinguishable from an empty one, which is what the `driver_output2`
+/// shape rows are about.
+pub fn reads_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<ReadMessage> {
+    outcome
+        .notifications
+        .iter()
+        .filter_map(|notification| match notification {
+            PortNotification::Data { port, read } if *port == id => Some(read.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many `PortNotification::Closed` reports a round minted for `id`.
+///
+/// A close is reported **exactly once** — the report is also what retires the port's number — so a
+/// count above one would mean a second, independent death report for a port that can only die once.
+pub fn closed_of(outcome: &PortTaskOutcome, id: PortId) -> usize {
+    outcome
+        .notifications
+        .iter()
+        .filter(|notification| matches!(notification, PortNotification::Closed { port } if *port == id))
+        .count()
+}
+
+/// Runs one port-task round and returns the bytes of the **only** [`PortNotification::Data`] it
 /// reported for `id`, or `None` when the round reported no data for that port.
+///
+/// The `only` is the **call site's** expectation, not a rule of the round: a round reports one
+/// `Data` per driver `driver_output*` call, so a callback making two calls reports two messages
+/// and a round may carry several for one port. Every caller of this helper is a single-call case;
+/// a multi-call one must use [`data_of`]/[`reads_of`] and assert the whole vector instead.
 pub fn round_data(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> Option<Vec<u8>> {
     let outcome = registry
         .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
@@ -289,7 +342,9 @@ pub fn round_data(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) 
     let first = data.next();
     assert!(
         data.next().is_none(),
-        "one port-task round reports at most one Data notification per port"
+        "this round must report exactly one Data notification for the port: the driver made \
+         exactly one driver_output* call (a second one would mean two calls were coalesced, or \
+         this call site now makes more than one)"
     );
     first
 }

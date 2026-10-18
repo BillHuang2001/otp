@@ -144,8 +144,12 @@ fn data_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Runs one port-task round and returns the bytes of the single [`PortNotification::Data`] it
+/// Runs one port-task round and returns the bytes of the **only** [`PortNotification::Data`] it
 /// reported for `id`, or `None` when the round reported no data for that port.
+///
+/// A round reports one `Data` per driver `driver_output*` call (never one coalesced message), so
+/// the `only` here is this call site's expectation — every caller makes a single-call case. A
+/// two-call case must use [`data_of`] and assert the whole vector.
 fn round_data(poller: &mut Poller, ports: &mut PortRegistry, id: PortId) -> Option<Vec<u8>> {
     let outcome = ports
         .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
@@ -154,7 +158,8 @@ fn round_data(poller: &mut Poller, ports: &mut PortRegistry, id: PortId) -> Opti
     let first = data.next();
     assert!(
         data.next().is_none(),
-        "one port-task round reports at most one Data notification per port"
+        "this round must report exactly one Data notification for the port: the driver made \
+         exactly one driver_output* call"
     );
     first
 }
@@ -420,6 +425,9 @@ fn a_registry_created_port_drives_through_the_ordinary_reactor_path() {
     // `port_command` queues the bytes and schedules an OUTPUT task, which runs the port's
     // `ready_output` seam: the C-ABI adapter writes the queued bytes through the fixture's `output`
     // callback (which echoes them) and then runs the entry's `ready_output` slot (which emits "W").
+    // Both echoes are separate `driver_output` calls, so the owner gets **two** messages in that
+    // order — one `{Port,{data,_}}` per call (the corrected expectation: the coalesced `"helloW"`
+    // this assertion used to expect was the port's old bug, not the oracle).
     ports
         .port_command(&mut poller, id, b"hello", PortCommandOptions::EMPTY)
         .expect("the command is queued");
@@ -429,8 +437,9 @@ fn a_registry_created_port_drives_through_the_ordinary_reactor_path() {
     assert_eq!(outcome.ran, 1, "the queued command schedules one task");
     assert_eq!(
         data_of(&outcome, id),
-        vec![b"helloW".to_vec()],
-        "the OUTPUT task wrote the bytes through output and then ran the driver's ready_output"
+        vec![b"hello".to_vec(), b"W".to_vec()],
+        "the OUTPUT task wrote the bytes through output and then ran the driver's ready_output — \
+         two driver_output calls, two messages"
     );
     // A poll with a bounded timeout is the ordinary drive point and must not error.
     let events = poller

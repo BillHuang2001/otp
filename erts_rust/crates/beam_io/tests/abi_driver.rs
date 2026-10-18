@@ -134,8 +134,13 @@ fn the_drivers_output_callback_echoes_bytes_back_to_the_owner() {
 /// `output`/`outputv`, `io.c:1782`/`io.c:1517`) and, when the entry also declares `ready_output`,
 /// that slot then runs as the C's write-readiness notification (the `ERTS_PORT_TASK_OUTPUT` arm,
 /// `erl_port_task.c:1793-1797`). The fixture echoes the bytes its `output` receives and emits `"W"`
-/// from `ready_output`, both through `driver_output`, so the owner sees `"hello"` then `"W"` — the
-/// order in which the C performs them, coalesced by the port's single input queue.
+/// from `ready_output`, both through separate `driver_output` calls, so the owner sees **two**
+/// `{Port,{data,_}}` messages — `"hello"` then `"W"`, the order in which the C performs them.
+///
+/// The one-message-per-call shape is the corrected expectation: `driver_output` is
+/// `driver_output2(ix, NULL, 0, buf, len)` (`io.c:6405-6415`) and each call delivers its own
+/// message (`deliver_read_message`, `io.c:3363-3442`), so the two bytes never merge — the earlier
+/// `vec![b"helloW".to_vec()]` here asserted the port's old coalescing bug, not the oracle.
 #[test]
 fn a_port_command_write_readiness_task_reaches_ready_output() {
     let Some(so) = fixture_so() else {
@@ -155,10 +160,10 @@ fn a_port_command_write_readiness_task_reaches_ready_output() {
     // outcome's notifications (a second round would find the port's input queue already drained).
     assert_eq!(
         data_of(&outcome, id),
-        vec![b"helloW".to_vec()],
+        vec![b"hello".to_vec(), b"W".to_vec()],
         "the OUTPUT task writes the queued bytes through the driver's output callback, then runs \
-         its ready_output notification — both echo through driver_output into the port's input \
-         queue, so the owner sees them coalesced in that order"
+         its ready_output notification — the two driver_output calls are two messages, delivered \
+         in that order (never merged into one)"
     );
 
     registry.close(&mut poller, id).expect("the port closes");
@@ -1111,12 +1116,15 @@ fn an_entry_with_outputv_and_output_prefers_outputv_then_runs_ready_output() {
         .expect("the OUTPUT task runs");
     assert_eq!(outcome.ran, 1, "the queued command schedules one task");
 
-    // `outputv` echoes `hello` and `ready_output` emits `W`, coalesced by the port's input queue in
-    // that order — the write happened first, the readiness notification after it.
+    // `outputv` echoes `hello` and `ready_output` emits `W` through two separate `driver_output`
+    // calls, so the owner gets two messages in that order — the write happened first, the readiness
+    // notification after it. (One message per call; the coalesced `"helloW"` this assertion used to
+    // expect was the port's old bug, not the oracle — `driver_output`, `io.c:6405-6415`.)
     assert_eq!(
         data_of(&outcome, id),
-        vec![b"helloW".to_vec()],
-        "the vector write ran, then the entry's write-readiness notification"
+        vec![b"hello".to_vec(), b"W".to_vec()],
+        "the vector write ran, then the entry's write-readiness notification — two calls, two \
+         messages"
     );
 
     let lines = log_lines(&probe.log);
