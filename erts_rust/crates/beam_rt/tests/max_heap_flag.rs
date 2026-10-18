@@ -43,17 +43,18 @@
 //! 6. the flag is **per-process**: a child spawned *after* the caller set one is born with the
 //!    default map, not with the caller's.
 //!
-//! # The bound itself is **not** enforced here (documented residual)
+//! # The bound **is** enforced — but no verdict can be drained on this route
 //!
-//! Neither `beam_process::Process` nor `beam_gc::AnyCollector` exposes a policy setter, so the
-//! recorded bound is not acted upon: this runtime never kills a process at its limit and never
-//! emits the `error_logger` report. That is the documented residual (`M1_GAPS.md` *Heap
-//! switches*), and it is why every probe below picks a `size` far beyond the eval process's
-//! reach. It is not cosmetic: the **oracle does** enforce the bound, and a small one kills its
-//! own `-eval` process mid-probe — measured, `process_flag(max_heap_size, #{size => 1000})`
-//! followed by an `io:format` exits **1** with no output at all, because the process exceeds
-//! 1000 words while building the call. A test that exercised the bound would therefore compare
-//! a successful run against a killed one; the kill is not what this suite asserts.
+//! A collection records the verdict on the PCB and the runtime **latches** a `kill` for the
+//! runner's next slice boundary (`src/context/gc.rs::drain_max_heap_verdict` →
+//! `src/runner/run.rs::take_max_heap_kill`); the `-eval` action process is never enqueued, so a
+//! verdict latched on it is never performed — the documented residual (`M1_GAPS.md` *Heap
+//! switches*). That is why every probe below picks a `size` far beyond the eval process's reach:
+//! a small one is **observed** as a kill by the oracle, which enforces in the collecting thread
+//! (measured: `process_flag(max_heap_size, #{size => 1000})` followed by an `io:format` exits
+//! **1** with no output), while this route would keep running. The enforcement contract itself is
+//! pinned by the sibling `tests/max_heap_enforce.rs` on the scheduler `run` route, which does
+//! drain the latch.
 //!
 //! # Why the probes never print the flag map as a term
 //!
@@ -154,7 +155,7 @@ const SELF_MAP: &str = "element(2, process_info(self(), max_heap_size))";
 ///
 /// Each `size` is orders of magnitude beyond what the eval process allocates, so the **oracle's**
 /// enforcement of the bound never fires (see the module docs) and the comparison stays
-/// apples-to-apples with this runtime, which does not enforce it.
+/// apples-to-apples with this runtime, whose `-eval` route cannot drain a latched verdict.
 fn probes() -> [(&'static str, String, &'static str); 5] {
     [
         (
