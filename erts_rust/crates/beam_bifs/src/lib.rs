@@ -57,10 +57,11 @@
 //!   is an on-heap `Ref` thing (the M1 substitution for a real `tid()`).
 //! * [`hook_sets`] — the curated "hook-needed" BIF sets (one authoritative table +
 //!   allocation-free predicate per optional seam: `MemoryHook`, `LocalFunIdentity`,
-//!   `DictHook`, `ProcessHook`, `PortHook`, `SendHook`, `NifLoader`, `RecordSource`,
-//!   `ModuleInfo`, `PersistentTerm`, `FunCaller`, `LocalNode`, `RuntimeHooks`), so a
-//!   host gates a seam off the authoritative list instead of a privately re-derived
-//!   copy. (`AtomInterner` has no bounded consumer set and is deliberately absent.)
+//!   `DictHook`, `ProcessHook`, `PortHook`, `SendHook`, `NifLoader`, `ExportGate`,
+//!   `RecordSource`, `ModuleInfo`, `PersistentTerm`, `FunCaller`, `LocalNode`,
+//!   `RuntimeHooks`), so a host gates a seam off the authoritative list instead of a
+//!   privately re-derived copy. (`AtomInterner` has no bounded consumer set and is
+//!   deliberately absent.)
 
 #![deny(unsafe_code)]
 
@@ -120,11 +121,12 @@ pub use crate::context::{
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
 pub use crate::hook_sets::{
-    needs_dict_hook, needs_fun_caller, needs_local_fun_identity, needs_local_node,
-    needs_memory_hook, needs_module_info, needs_nif_loader, needs_persistent_term, needs_port_hook,
-    needs_process_hook, needs_record_source, needs_runtime_hooks, needs_send_hook, DICT_HOOK_BIFS,
-    FUN_CALLER_BIFS, LOCAL_FUN_IDENTITY_BIFS, LOCAL_NODE_BIFS, MEMORY_HOOK_BIFS, MODULE_INFO_BIFS,
-    NIF_LOADER_BIFS, PERSISTENT_TERM_BIFS, PORT_HOOK_BIFS, PROCESS_HOOK_BIFS, RECORD_SOURCE_BIFS,
+    needs_dict_hook, needs_export_gate, needs_fun_caller, needs_local_fun_identity,
+    needs_local_node, needs_memory_hook, needs_module_info, needs_nif_loader,
+    needs_persistent_term, needs_port_hook, needs_process_hook, needs_record_source,
+    needs_runtime_hooks, needs_send_hook, DICT_HOOK_BIFS, EXPORT_GATE_BIFS, FUN_CALLER_BIFS,
+    LOCAL_FUN_IDENTITY_BIFS, LOCAL_NODE_BIFS, MEMORY_HOOK_BIFS, MODULE_INFO_BIFS, NIF_LOADER_BIFS,
+    PERSISTENT_TERM_BIFS, PORT_HOOK_BIFS, PROCESS_HOOK_BIFS, RECORD_SOURCE_BIFS,
     RUNTIME_HOOKS_BIFS, SEND_HOOK_BIFS,
 };
 pub use crate::reason::{exit_reason_from_term, reason_term_from_exit_reason};
@@ -142,11 +144,11 @@ pub mod prelude {
         DictHook, FunCaller, LocalFunIdentity, LocalNode, MemoryHook, ModuleInfo, NifLoadError,
         NifLoader, NullSink, OutputSink, PersistentTerm, PortHook, ProcessHook, ProcessInfoItem,
         RecordDefinitionView, RecordFieldView, RecordSource, RuntimeHooks, SendHook, SendOptions,
-        SendOutcome, StdoutSink, TableRegistry, needs_dict_hook, needs_fun_caller,
-        needs_local_fun_identity,
+        SendOutcome, StdoutSink, TableRegistry, needs_dict_hook, needs_export_gate,
+        needs_fun_caller, needs_local_fun_identity,
         needs_local_node, needs_memory_hook, needs_module_info, needs_nif_loader,
         needs_persistent_term, needs_port_hook, needs_process_hook, needs_record_source,
-        needs_runtime_hooks, needs_send_hook, DICT_HOOK_BIFS, FUN_CALLER_BIFS,
+        needs_runtime_hooks, needs_send_hook, DICT_HOOK_BIFS, EXPORT_GATE_BIFS, FUN_CALLER_BIFS,
         LOCAL_FUN_IDENTITY_BIFS, LOCAL_NODE_BIFS, MEMORY_HOOK_BIFS, MODULE_INFO_BIFS,
         NIF_LOADER_BIFS, PERSISTENT_TERM_BIFS, PORT_HOOK_BIFS, PROCESS_HOOK_BIFS,
         RECORD_SOURCE_BIFS, RUNTIME_HOOKS_BIFS, SEND_HOOK_BIFS,

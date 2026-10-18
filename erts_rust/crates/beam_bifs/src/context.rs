@@ -46,11 +46,14 @@
 //!   `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2` and
 //!   `group_leader/0`), a [`PersistentTerm`] (the node-global persistent-term store
 //!   behind the seven `persistent_term:*` BIFs), a [`MemoryHook`] (the node's memory
-//!   accounting behind `erlang:memory/0,1`) and a [`RuntimeHooks`] (the single
+//!   accounting behind `erlang:memory/0,1`), a [`RuntimeHooks`] (the single
 //!   dispatcher behind every `bif.tab` entry that only the *running* runtime can
 //!   answer — process control, timers, code loading, system/nodes introspection,
 //!   the `atomics`/`counters` stores, the ETS C interior, `erts_debug`/
-//!   `erl_debugger`, `re`, `erl_ddll` and distribution).
+//!   `erl_debugger`, `re`, `erl_ddll` and distribution) and a
+//!   [`beam_codec::ExportGate`] (the active-export registry the `[safe]`
+//!   `binary_to_term/2` decode consults before it accepts an `EXPORT_EXT` fun — a
+//!   *shared* reference, because the codec lends it to the decoder unchanged).
 //!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
 //!   concrete implementations; an unset seam means `io:format` writes to stdout
 //!   and the `send`/`ets`/`call_fun`/port/dict/nif/process BIFs report
@@ -932,6 +935,7 @@ pub struct BifContext<'a> {
     nif_loader: Option<&'a mut dyn NifLoader>,
     record_source: Option<&'a mut dyn RecordSource>,
     local_node: Option<&'a mut dyn LocalNode>,
+    export_gate: Option<&'a dyn beam_codec::ExportGate>,
     fun_identity: Option<&'a mut dyn LocalFunIdentity>,
     module_info: Option<&'a mut dyn ModuleInfo>,
     process: Option<&'a mut dyn ProcessHook>,
@@ -959,6 +963,7 @@ impl<'a> BifContext<'a> {
             nif_loader: None,
             record_source: None,
             local_node: None,
+            export_gate: None,
             fun_identity: None,
             module_info: None,
             process: None,
@@ -1035,6 +1040,20 @@ impl<'a> BifContext<'a> {
         self
     }
 
+    /// Installs the active-export registry the `[safe]` `binary_to_term/2` decode
+    /// consults before it accepts an `EXPORT_EXT` fun.
+    ///
+    /// The seam is [`beam_codec::ExportGate`], the codec's own host trait: the codec
+    /// owns the *check site* (`decode/fun.rs::decode_export`, the C's
+    /// `external.c:5032-5036`), the runtime owns the *registry* — "is `M:F/A`
+    /// exported by a module loaded right now?" (`erts_active_export_entry`). It is a
+    /// **shared** reference ([`BifContext::export_gate`] hands it back unchanged and
+    /// the codec lends it to one decoder), not a `&mut` like the other seams, so the
+    /// host may hold it across a dispatch without a borrow conflict.
+    pub fn with_export_gate(mut self, gate: &'a dyn beam_codec::ExportGate) -> Self {
+        self.export_gate = Some(gate);
+        self
+    }
     /// Installs the local-fun-identity hook used when encoding a local
     /// (`make_fun3`) fun with `term_to_binary`.
     pub fn with_local_fun_identity(mut self, hook: &'a mut dyn LocalFunIdentity) -> Self {
@@ -1210,6 +1229,24 @@ impl<'a> BifContext<'a> {
         }
     }
 
+    /// The host's code-server view for the `[safe]` `EXPORT_EXT` check, if one is
+    /// installed.
+    ///
+    /// With an [`ExportGate`](beam_codec::ExportGate) installed, `binary_to_term/2`
+    /// hands it to the codec, which asks `is_export_active(module, function, arity)`
+    /// for an `EXPORT_EXT` (`113`) fun under the `[safe]` flag and answers `badarg`
+    /// when the gate refuses (C `external.c:5032-5036`). With none installed the
+    /// check is skipped — the codec's honest default, where `[safe]` still resolves
+    /// the two wire atoms by *lookup* but does not verify the export is active.
+    ///
+    /// The returned reference carries the context's own lifetime (`&'a dyn
+    /// ExportGate`) rather than the accessor's borrow: the field is a shared
+    /// reference, so reading it copies the reference out and the borrow of `self`
+    /// ends at the call. That is what lets [`crate::binconv`] hold the gate across the
+    /// later `&mut self` use ([`BifContext::atom_and_heap`]).
+    pub fn export_gate(&self) -> Option<&'a dyn beam_codec::ExportGate> {
+        self.export_gate
+    }
     /// The loaded module `module`'s introspection item `item`, built on the
     /// context heap — the seam behind `erlang:get_module_info/1,2`.
     ///
