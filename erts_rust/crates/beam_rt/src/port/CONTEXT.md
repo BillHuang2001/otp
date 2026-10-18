@@ -116,6 +116,43 @@ The busy check precedes the iodata conversion (`io.c:1760-1764`), so a busy port
 - The `SignalFacility` is a `thread_local` (not a `Runtime` field) because the runtime is single-threaded (`!Send`), so the slot *is* the process's one facility.
 - Never a fabricated success: failures are typed `BeamError`s, and a state/lifecycle it cannot serve returns the C's own failure code; the `Rc<RefCell<..>>` handles are the ETS pattern so a port operation never needs a runtime borrow a `fun` argument already holds — a nested borrow is a typed gap, never a panic.
 - A payload is credited where it is harvested and the queue it came from is empty afterwards (`fold_notifications` + `drain_pending_events` for the data lane, `PortNotification::Closed` for the signal lane).
+## Measured — the poll budget a pass hands this layer (`startup_ms`)
+The largest wall-clock cost this layer imposes on a CLI start-up is **not work**: it is the
+*blocking budget* a zero-slice scheduler pass hands [`PortRegistry::pump`]. Read this before touching
+`PORT_POLL_SLICE`, `pump`'s wait clamp, or `has_nothing_to_poll`.
+
+- **Today that budget is paid in full.** `PORT_POLL_SLICE` is 25 ms and doubles as *both* the
+  poller's inner clamp *and* the `port_timeout` a pass that ran no slice passes in
+  (`../runtime/scheduler.rs::scheduler_pass`). A live-but-idle port therefore costs one whole
+  `epoll_wait(…, 25)` per such pass: `strace -f -w` reports five
+  `epoll_wait(3, [], 1024, 25) = 0` at 25.07–26.2 ms each (**~127 ms**) for a single
+  `beam_rt -noshell -eval 'halt().'`.
+- **Every one of them comes from the boot drive.** Counting each non-zero `port_timeout` gives
+  **8 blocking rounds per run**, all under `TimerWait::ImminentWithin(100 ms)` — i.e. all from
+  `boot::drive::drive_scheduler` (`../boot/drive.rs`), whose loop stops on `ran == 0` and so pays a
+  full slice on the trailing pump of every invocation.
+- **It cannot simply be zeroed: that poll is what resolves the kernel's `inet_gethost` round trip.**
+  With the budget forced to zero `drive_scheduler` returns `0` on its first pump, so the
+  `{apply,{application,start_boot,…}}` directive folds to
+  `unsupported: opcode: run: process blocked` (exit 3 — measured).
+- **The predicate that separates the two cases already lives in this layer**: the per-port byte
+  counters kept for `port_info(Port, input)`/`output` (`PortMeta::{input, output}`). A port with
+  `output > input` has bytes written to it that it has not answered, so the wait is justified; a port
+  that has answered everything (the boot's `inet_gethost` child, idle for the rest of the run) cannot
+  speak again until it is written to, so waiting on it is pure sleep. A `PortRegistry` predicate over
+  exactly that, gating the boot drive's budget, measures: blocking rounds **8 → 1**, wall
+  **447.3 → 332.2 ms** median, CPU **307.0 → 307.9 ms** (12 alternating `taskset -c 3` rounds,
+  m15-era binary 339.6/319.6, loadavg 10.6 → 13.5). The lookup itself is unchanged: **98** `.beam`
+  opens (`inet_gethost_native` included) and exactly one `execve` of `<erts>/bin/inet_gethost`.
+- **The rule for any future change**: a pass may block on the poller only when something can actually
+  answer — a port with a reply in flight, an armed driver deadline
+  ([`beam_io::PortRegistry::next_deadline`], already clamped) or an armed `tty_select/2` interest.
+  Blocking merely because a port is *live* costs a slice per pass for ever.
+- **Re-measure with deterministic counters, not timings**: non-zero `port_timeout` rounds per run
+  (**8**, target 1), `strace -f -c -w`'s `epoll_wait` total, the `.beam` openat count (**98**) and
+  `execve` of `<erts>/bin/inet_gethost` (**exactly 1**).
+- **The gate is not applied in this tree**: its call site is `../runtime/scheduler.rs` and its
+  predicate body `port.rs`, both outside this node — see *Handoffs*.
 ## Known Issues (this is a floor, not the full C `io.c`)
 - **`erlang:port_control/3` is live end to end, behind the **driver-entry capability gate** stated in the API Surface** (`PortRegistry::has_driver_control`): the reply renders as a **list of byte integers** at every length, and as a **binary** only once the driver set `PORT_CONTROL_FLAG_BINARY` through `set_port_control_flags` (a per-port flag persisting across calls), a `NULL` reply pointer being the C's `NIL` (the bare `[]`, `io.c:4126`); the residual is a reply the driver answers from **its own** memory, the typed *unsupported* (Handoffs).
 - **The one `port_command/2,3` divergence: a plain command on a busy port.** The C **suspends** the caller (`erts_suspend` + `ERTS_BIF_YIELD3`, `erl_bif_port.c:211-220`) until the port goes idle and re-runs the BIF, so the oracle eventually answers `true`; this runtime's BIF seam has no block channel, so that arm raises the typed capability gap (exit 3, reason naming the busy state); every other arm (`true`, `false`, both `notsup`s) matches the oracle.
