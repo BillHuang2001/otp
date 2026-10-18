@@ -1001,3 +1001,9 @@ impl DriverHost for AbiHost {
 #[cfg(test)]
 #[path = "host_tests.rs"]
 mod tests;
+
+/// The `driver_output*` → port-owner path's suite, split out of [`tests`] so neither file grows
+/// past the workspace's ~1000-line convention (see `host_output_tests.rs`).
+#[cfg(test)]
+#[path = "host_output_tests.rs"]
+mod host_output_tests;
