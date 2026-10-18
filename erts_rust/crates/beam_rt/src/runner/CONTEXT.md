@@ -505,8 +505,8 @@ the rounds; host `/proc/loadavg` 1.0–2.5):
 | `emqx_base62_encode` | 10 512 ns | 206.3 ns | 51.0× |
 | `emqx_base62_decode` | 10 111 ns | 282.5 ns | 35.8× |
 
-The per-call cost of a build-a-binary loop is **no longer this table's figure** — the per-slice off-heap
-mirror is gone — so the current controlled A/B is [`../../PERF.md`](../../PERF.md) *The per-call cost is
+The per-call cost of a build-a-binary loop is **not** this table's figure — there is no per-slice
+off-heap mirror — so the controlled A/B is [`../../PERF.md`](../../PERF.md) *The per-call cost is
 independent of the iteration count* (`BEFORE` `3aa42c0e41` → `AFTER` `72d778dcf1`:
 `emqx_base62_encode` **138 544.3 → 5 667.6 ns/call** at `loadavg` 18–89, `decode` 20 698.3 → 10 028.7).
 
