@@ -121,9 +121,17 @@ That workload set is the in-crate tier set, not the OTP corpus, so the corpus-sc
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`
-(`machine/mod.rs:632`), `Machine::alloc_rooted` (`:690`, → `ExecutionContext::alloc_words_rooted`) and
+(`machine/mod.rs:643`), `Machine::alloc_rooted` (`:701`, → `ExecutionContext::alloc_words_rooted`) and
 `Machine::ensure_heap`/`allocate_heap` → `ExecutionContext::ensure_heap_full`
 (`machine/frames.rs:283`).
+`with_roots` hands over the **whole** three files — `&mut self.x` (all `max_register` slots),
+`&mut self.stack` (every Y slot) and `&mut self.fr` (all `MAX_FLOAT_REGISTER`) — plus `live`, which is
+**only a hint** (`RootSet::live_len()` clamps it, `context.rs:241`): a host that scans just
+`x[..live_len()]` leaves any word above `live` unrelocated, so the hint's provenance is a contract:
+the two **heap** doors pass the instruction's own `Live` operand verbatim
+(`interpreter/dispatch.rs:623`/`:628` ← `beam_loader`'s `TestHeap`/`AllocateHeap` operand), while
+**every** `alloc_rooted` caller passes `RootSet::ALL_LIVE` (`terms/slack.rs:170`, the one production
+caller). The engine computes no liveness of its own.
 Their call sites, exactly: `alloc_words_rooted` has **one** production caller — `terms/slack.rs:170`
 (`terms::reserve`, hence `reserve_slack` and every `*_rooted` builder), reached **per built term**
 (each `put_list`/`put_tuple2`/`make_fun3`/`put_map_assoc`/record/bitstring node), with
@@ -133,9 +141,9 @@ The classic unrooted builders (`make_tuple`/`make_cons`/… in `terms/construct.
 `ExecutionContext::alloc_words` directly, with neither a root set nor an admission point; **every in-crate
 construction arm** uses a `*_rooted` twin instead. That rule — not a census of `alloc_words` callers — is what a
 new engine-side build must follow.
-`ensure_heap_full` is reached **only** from `Instr::TestHeap` (`interpreter/dispatch.rs:586`) and
-`Instr::AllocateHeap` (`:581`) plus their baseline-JIT twins (`jit/baseline/runtime.rs:1407`/`:1443`),
-so it is a **per-`test_heap`** door, never a per-allocation one; `Instr::Allocate` (`:569-574`) pushes
+`ensure_heap_full` is reached **only** from `Instr::TestHeap` (`interpreter/dispatch.rs:628`) and
+`Instr::AllocateHeap` (`:623`) plus their baseline-JIT twins (`jit/baseline/runtime.rs:1407`/`:1443`),
+so it is a **per-`test_heap`** door, never a per-allocation one; `Instr::Allocate` (`:611-617`) pushes
 the frame with **no** admission.
 `ExecutionContext::heap_available` has **no** call site anywhere in the crate (introspection only).
 Every other engine→host call carries **no** root set, so a host that
@@ -148,11 +156,14 @@ state each holds in a Rust local across the call:
   call, so a move in the seam would dangle both.
 - `ExecutionContext::apply_fun` (`:558`, the `Ok(None)` fallback) — the same `fun`/`args`; protection
   here is the host's `with_relocation_exempt`, not publication.
-- `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments live in the
-  `EMPTY_ARGS` stack array (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch`
-  (`machine/mod.rs:385`); **neither is in any `RootSet`**. The in-machine twin
-  (`ExecutionContext::call_bif_in_machine`, reached through the single `Machine::dispatch_bif_call`
-  funnel) carries the same arguments and the same constraint.
+- `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments are **copies** living in the
+  `EMPTY_ARGS` stack array (`interpreter/bif.rs:50-53`, `:88-93`, `:232-238`) or `Machine.args_scratch`
+  (`machine/mod.rs:387`, **taken out of the machine** for the whole dispatch — `bif.rs:157`, restored
+  `:167` — so it is not even reachable from `Machine` while the terms are live); **neither is in any
+  `RootSet`**. The in-machine twin `ExecutionContext::call_bif_in_machine` (`bif.rs:301`) is reached
+  from `Machine::dispatch_bif_call`, which takes **`&self`** — so at that door a host can neither see the
+  arguments in a root set NOR write a relocated word back into `x`: a collection during it leaves both
+  the copy and the register file dangling. The trait documents no GC contract for `args`.
 
 **Verified: no admission point can intervene on the `call_fun`/`call_fun2` path with the shipped host.**
 `BudgetContext::resolve_local_fun` (`beam_rt/src/runner/budget.rs:220`) forwards **without** arming, and
@@ -176,8 +187,33 @@ by `Machine::with_roots` for the duration of every hand-off and re-seated from t
 relocates them with no host-side change; the supplied-trace latches are `Vec<StackFrame>` metadata and
 need no rooting. `Machine::pending_exception` (`machine/catch.rs`) is the remaining engine-held live
 reason `Eterm`: it is rooted **host-side** by `beam_rt` via `Registers::extra_roots` (the write accessor a
-collecting host needs, `Machine::pending_exception_mut`, exists). The other Rust-local vectors are
+collecting host needs, `Machine::pending_exception_mut`, exists). The complete set of `Eterm`-typed
+`Machine` fields is `x`/`fr`/`stack` (the `RootSet`), `pending_exception`, `class_atoms: [Eterm; 3]`
+(atom **immediates** only — never a heap pointer, so no rooting needed), the two parked raise latches and
+`args_scratch` (empty outside a dispatch). Everything else on the machine is `u32`/`bool`/`usize`
+metadata or an `Arc<Module>` handle, so `current_code`, `raise_snapshot`, `entry_call`, the frame and
+catch-frame stacks and the supplied-trace latches carry no heap term. The other Rust-local vectors are
 recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
+
+## Execution position (`Machine::current_code`) — the complete store set
+The single writer is `Machine::set_current_code` (`machine/location.rs:160-162`). Every store is an
+instruction boundary, but **not** every store happens before the thing it names runs:
+- Interpreter: `Machine::drive` stores **before** the charge and the body (`machine/drive.rs:169` →
+  `reduce` `:183` → step `:185`), so a `reduce` refusal parks on the **not-yet-executed** instruction;
+  `step_instruction_with_entry` re-stores the same address (`interpreter/dispatch.rs:201`).
+- Native baseline tier, driver head: `jit/baseline/mod.rs:994` (also before `reduce` `:997-1002` and
+  `code.enter` `:1012`).
+- Native block prologue: the **block's entry** pc (`jit/baseline/emit/prologue.rs:84-88` →
+  `jit_set_position`/`jit_publish_y`, `jit/baseline/runtime.rs:993`/`:1027`), so mid-block the position is
+  a block entry and a resume from it **re-executes the block prefix**.
+- Exact per-instruction helpers: `jit_step_ext` `runtime.rs:576`, `jit_family` `family.rs:85`,
+  `jit_test` `test_helper.rs:121`, the frame/heap helpers `runtime.rs:1247/1276/1318/1361/1404/1442/1475`.
+- **Seam routes that store NOTHING**, so the host hook runs with a stale (block-entry-or-earlier)
+  position: `jit_ext_call` (`resolve_external_call` at `runtime.rs:818`), `jit_local_call`
+  (`local_call_seam` at `runtime.rs:948`), and a served `Instr::Call` / `call_only` / `call_last`
+  (seam at `jit/baseline/call.rs:210`; `set_current_code` appears only in the declined arm, `:232`).
+  This is why `run_baseline_cached_resume_outcome` must not assume an exact instruction position on a
+  suspended cross-module/local-call frame.
 
 ## Long files (role-justified, beyond the ~1000-line guideline)
 Each file below is one cohesive unit — a seam module, a dispatch loop, or a comprehensive test
