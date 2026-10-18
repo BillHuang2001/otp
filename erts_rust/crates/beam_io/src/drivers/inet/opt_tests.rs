@@ -30,7 +30,9 @@
 
 use super::*;
 use crate::driver::DriverRegistry;
-use crate::drivers::inet::{INET_AF_ANY, INET_AF_INET, INET_PROTO_DEFAULT};
+use crate::drivers::inet::{
+    INET_AF_ANY, INET_AF_INET, INET_PROTO_DEFAULT, INET_TYPE_DGRAM, INET_TYPE_STREAM,
+};
 use crate::poller::Poller;
 use crate::port::PortRegistry;
 use beam_common::BeamError;

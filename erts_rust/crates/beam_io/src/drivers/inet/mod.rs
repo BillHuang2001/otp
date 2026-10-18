@@ -298,7 +298,7 @@ pub use self::opt::{
     INET_MULTI, INET_ONCE, INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PASSIVE,
     TCP_OPT_NODELAY,
 };
-use self::opt::{get_options, set_options, SocketOptions};
+use self::opt::{get_options, set_options, OptScope, SocketOptions};
 
 // The read-path framing glue (the bridge from the stored socket options to the pure decoder in
 // `packet`) lives in the private `frame` submodule.
@@ -1444,7 +1444,8 @@ impl TcpInetDriver {
     /// Never for a served option (a rejected `setsockopt(2)` is not propagated, as in the C);
     /// `BeamError::BadArg` for a truncated `{active, N}` record.
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_TCP);
+        set_options(&mut self.options, scope, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
@@ -1461,7 +1462,8 @@ impl TcpInetDriver {
     /// `BeamError::Io` is **not** raised for a failed `getsockopt(2)` on a live socket: that
     /// record is dropped and the search continues, as in the C (see [`self::opt`]).
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_TCP);
+        get_options(&self.options, scope, self.socket, arg)
     }
 
     /// Routes one decoded numeric control opcode (`inet_drv.c`'s `INET_REQ_*` numbers) to the verb

@@ -106,14 +106,16 @@
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`.
 
+#[path = "opt_state.rs"]
 mod opt_state;
+#[path = "opt_sys.rs"]
 mod opt_sys;
 
 use std::os::unix::io::RawFd;
 
 use beam_common::Result;
 
-use super::wire::{ctl_ok, ctl_xerror, INET_TYPE_DGRAM, INET_TYPE_STREAM};
+use super::wire::{ctl_ok, ctl_xerror};
 
 /// One step of the wire walk: how many request bytes the code consumed, or the C's
 /// `return -1`, which replaces the **whole** reply with `[0]einval`.
@@ -133,7 +135,7 @@ pub(super) enum Step {
 /// a bare port, exactly as the C's `-1` sentinels do (`inet_drv.c:10925`-`:10932`).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct OptScope {
-    /// The cached socket type ([`INET_TYPE_STREAM`]/[`INET_TYPE_DGRAM`], `0` = none).
+    /// The cached socket type (`INET_TYPE_STREAM`/`INET_TYPE_DGRAM`, `0` = none).
     pub(super) stype: u16,
     /// The cached address family (`1` = `INET_AF_INET`, `0` = none).
     pub(super) family: u16,
