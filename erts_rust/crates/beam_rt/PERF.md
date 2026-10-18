@@ -15,7 +15,7 @@ A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at 
 Every `startup_ms` figure in this file and in [`PERF_HISTORY.md`](PERF_HISTORY.md) is **that snapshot's own** preloaded-only-slice measurement (the ≈ 14–18 ms band) and its ratio to the oracle is that snapshot's; those numbers do not describe the current whole-process wall.
 The present whole-process wall is **CPU-bound and carries no fixed waits**: `strace -f -c -w` over a whole run shows **0 `clock_nanosleep`** calls and **≈ 4 ms** of `epoll_wait` in total, so a blocked round returns instead of sleeping and the residual wall is engine work (the oracle's own `erl -noshell -eval 'halt(0).'` boot is ≈ 0.12–0.15 s here).
 The wait a *blocked* pass pays is mechanism-agnostic, so read it as a property — bounded, never a spin — not as one syscall name: with a port live in the table (a booted kernel keeps the `inet_gethost` helper child open, which makes `PortRegistry::has_nothing_to_poll()` false from directive 18 on) the wait is that port's poll, its blocking form is taken only while a port **owes a reply**, and only by a round that ran **zero** slices — the rule and its measured figures are in *The boot path's one live-but-idle port, and the poll budget* below.
-Because that wall is now this runtime's own CPU cost rather than a fixed sleep, **no startup ratio measured against the oracle was re-recorded at this HEAD** — the committed `startup` ratios belong to the dated snapshots in [`PERF_HISTORY.md`](PERF_HISTORY.md) — so the `startup_ms` metric should be **re-recorded at the next benchmark milestone** before any current startup advantage or loss is quoted.
+Because that wall is this runtime's own CPU cost rather than a fixed sleep, the cross-runtime `startup_ms` ratio is **recorded at the head of *The boot path's one live-but-idle port, and the poll budget*** below: **2.649** against the oracle (`rust` 298.6 ms vs `sys` 112.7 ms, median of 3 alternating `--quick` `--workloads baseline` rounds), and **2.089** for the boot-dominated `slice` workload's summed per-case wall. Every other `startup` ratio in this file and in [`PERF_HISTORY.md`](PERF_HISTORY.md) belongs to its own dated snapshot.
 The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 0.35 s boot, so those rows measure the loop against a far larger whole-process wall than the dated snapshots in [`PERF_HISTORY.md`](PERF_HISTORY.md) record.
 
 ## The boot path's one live-but-idle port, and the poll budget
@@ -37,7 +37,15 @@ Paired medians of 12 alternating rounds (`taskset -c 3`, `getrusage(RUSAGE_CHILD
 | this tree, blocking poll on the idle port | 328.5 | 471.9 | 1.330 |
 | this tree, gate on | 328.5 | 340.5 | **0.959** |
 
-The oracle side is not part of this table: `sys` (OTP 29.1.1 / erts-17.1) boots its own release's script, and no `rust`/`sys` startup ratio was re-recorded at this tree (see *Current startup regime*), so the columns above compare this runtime against its own baseline.
+The oracle side is not part of that table — it boots its own release's script — so the cross-runtime figure is recorded here, through the bench driver with the same binary pair (`BEAM_RT` selects the side), 3 alternating `--quick` `--workloads baseline` rounds under `taskset -c 0-3` (`startup_ms` p50 per round, median of the round p50s; 1-min `/proc/loadavg` 24.96 before / 18.78 after):
+| side | `startup_ms` p50 rounds (ms) | median of rounds (ms) |
+|---|---|---|
+| this tree, gate **off** | 421.7, 418.6, 445.7 | 421.7 |
+| this tree, gate **on** | 296.1, 298.6, 298.7 | **298.6** |
+| oracle (OTP 29.1.1 / erts-17.1) | 112.7, 127.4, 109.2 | 112.7 |
+
+So gate off → on is **0.708×** (the regression the gate removes is 29 % of the whole-process wall) and the oracle ratio goes **3.741× → 2.649×**.
+The boot-dominated `slice` workload (one call per process, so its per-case wall is almost entirely boot) confirms it: summed per-case `_wall_ms`, median of 2 rounds, same hosts and binary pair — gate off **3880.2 ms**, gate on **2625.2 ms**, oracle **1256.6 ms**, i.e. **0.677×** off → on and **3.088× → 2.089×** against the oracle; every one of the nine cases moves by 0.64–0.74× (e.g. `case_fib_wall_ms` 431.8 → 279.0 for 140.6 on the oracle).
 
 Deterministic counters (`strace -f -c -w <bin> -noshell -eval 'halt().'`), gate off → gate on: `epoll_wait` total **130.8 ms → 4.1 ms** over the same **15** calls (the five 25 ms timeouts are exactly what the gate removes: the 2 + 2 + 1 zero-slice boot-drive steps of directives 18/19/20), `read` total 233 ms → 104 ms, `execve` **2** either way (the helper is still spawned exactly once), `clone3` **1**, exit code **0**, stdout and stderr **empty**, and the boot still reads **98** `.beam` files.
 The lookup's own wake is not what the gate touches: a reply still in flight keeps `output > input`, so the poll that delivers it blocks exactly as before.
