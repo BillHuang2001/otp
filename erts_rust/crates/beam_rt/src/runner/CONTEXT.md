@@ -679,7 +679,8 @@ term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mail
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
   `RuntimeRunner`).
 * `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`, the park's published
-  FR-prefix count `fr_published` and the park's publish/skip flag `parked_published`) + `RunnerState`
+  FR-prefix count `fr_published`, the park's publish/skip flag `parked_published` and the per-process
+  binary virtual heap `off_heap: Option<OffHeapReclaimer>`) + `RunnerState`
   (the `jit_mode` field, the `jit_mode()` accessor and the `reservoir_at(pid)` read-only off-heap
   roster seam).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
