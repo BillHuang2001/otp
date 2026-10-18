@@ -44,6 +44,7 @@ use beam_process::PortId;
 use crate::completion::{CompletionEvent, PortCompletion};
 use crate::error;
 use crate::poller::{Interest, Poller, Token};
+use crate::port_failure::DriverFailure;
 use crate::port_task::ReadMessage;
 use crate::queue::ByteQueue;
 /// Why a port is exiting, as reported to a driver through [`Driver::port_exit`].
@@ -170,6 +171,15 @@ pub struct DriverContext<'a> {
     /// `None` in a bare test context, where a driver that hands one up gets the typed
     /// `unsupported` instead of the completion being dropped.
     completions: Option<&'a mut Vec<PortCompletion>>,
+    /// The port's latch for a **failure** — the C's `driver_failure*` family and `driver_exit`,
+    /// which close the port from inside a callback (see [`DriverContext::signal_failure`]) — or
+    /// `None` in a bare test context, where a driver that reports one gets the typed
+    /// `unsupported` instead of the request being dropped.
+    ///
+    /// The slot is shared with the [`crate::Port`], so [`DriverContext::deliver_read`] and
+    /// [`DriverContext::deliver_completion`] can see a failure latched earlier in the same
+    /// callback and refuse to hand data up from a port that is on its way out.
+    failure: Option<&'a mut Option<DriverFailure>>,
 }
 
 impl<'a> DriverContext<'a> {
@@ -179,9 +189,12 @@ impl<'a> DriverContext<'a> {
     /// fields, so the driver and its context borrow separate members of the `Port`. A context
     /// built here has **no** read sink and **no** completion sink, so
     /// [`DriverContext::deliver_read`] and [`DriverContext::deliver_completion`] answer the typed
-    /// `unsupported`; [`crate::port::Port`] installs both with
-    /// [`DriverContext::with_reads`]/[`DriverContext::with_completions`] at every driver
-    /// callback.
+    /// Built here has **no** read sink, **no** completion sink and **no** failure latch, so
+    /// [`DriverContext::deliver_read`], [`DriverContext::deliver_completion`] and
+    /// [`DriverContext::signal_failure`] answer the typed `unsupported`; [`crate::port::Port`]
+    /// installs all three with
+    /// [`DriverContext::with_reads`]/[`DriverContext::with_completions`]/
+    /// [`DriverContext::with_failure`] at every driver callback.
     pub(crate) fn new(
         port: PortId,
         poller: &'a mut Poller,
@@ -197,6 +210,7 @@ impl<'a> DriverContext<'a> {
             arms,
             reads: None,
             completions: None,
+            failure: None,
         }
     }
 
@@ -225,6 +239,17 @@ impl<'a> DriverContext<'a> {
         completions: &'a mut Vec<PortCompletion>,
     ) -> DriverContext<'a> {
         self.completions = Some(completions);
+        self
+    }
+
+    /// Installs `failure` as this context's failure latch (chainable).
+    ///
+    /// Every driver callback a [`crate::port::Port`] dispatches gets one, so a driver may close
+    /// its own port ([`DriverContext::signal_failure`]) from any of them — the C's
+    /// `driver_failure*` family and `driver_exit` are callable wherever a driver holds an
+    /// `ErlDrvPort`.
+    pub(crate) fn with_failure(mut self, failure: &'a mut Option<DriverFailure>) -> DriverContext<'a> {
+        self.failure = Some(failure);
         self
     }
 
@@ -304,6 +329,11 @@ impl<'a> DriverContext<'a> {
     /// and flattening it into [`DriverContext::input`] would report the wrong shape rather
     /// than a degraded one.
     pub fn deliver_read(&mut self, header: &[u8], body: Option<&[u8]>) -> Result<()> {
+        if self.failure_latched() {
+            return Err(error::unsupported(
+                "a driver handed up a read after signalling a port failure: the port is closing",
+            ));
+        }
         let Some(reads) = self.reads.as_mut() else {
             return Err(error::unsupported(
                 "a driver handed up a split read (driver_output2) outside a port: no read sink is installed",
@@ -343,6 +373,11 @@ impl<'a> DriverContext<'a> {
     /// and dropping the completion silently would lose a reply the owner is blocked on — so it is
     /// a typed error, never a no-op.
     pub fn deliver_completion(&mut self, event: CompletionEvent) -> Result<()> {
+        if self.failure_latched() {
+            return Err(error::unsupported(
+                "a driver handed up a completion ({inet_reply,…}/{inet_async,…}) after signalling a port failure: the port is closing",
+            ));
+        }
         let port = self.port;
         let Some(completions) = self.completions.as_mut() else {
             return Err(error::unsupported(
@@ -351,6 +386,48 @@ impl<'a> DriverContext<'a> {
         };
         completions.push(PortCompletion::new(port, event));
         Ok(())
+    }
+
+    /// Closes this context's port, with `failure` as the reason — the C's `driver_failure*`
+    /// family and `driver_exit`, which a driver calls from inside a callback to take its own port
+    /// down ([`crate::port_failure`] carries the whole mapping).
+    ///
+    /// This is a **request**, not a teardown: nothing closes here, because the driver is still
+    /// running inside one of its own callbacks and the port must not drop it from under itself.
+    /// The failure is latched into the port ([`crate::Port::take_failure`]), which the registry
+    /// reaps after the round ([`crate::PortRegistry::reap_failures`]) through the ordinary close
+    /// path — so the driver's `stop` still runs, the port leaves the live map, and its number is
+    /// retired only when the deferred [`PortNotification::Closed`](crate::PortNotification::Closed)
+    /// is minted, exactly as for a caller-initiated close.
+    ///
+    /// **Exactly one** failure is latched: a driver that reports a second one (a
+    /// `driver_failure_posix` followed by a `driver_exit`, say) is accepted and ignored, because
+    /// in the C the first call has already closed the port. Once latched,
+    /// [`DriverContext::deliver_read`] and [`DriverContext::deliver_completion`] refuse — the Rust
+    /// counterpart of the C's `-1` from `driver_output*` on a dying port — and only the bytes that
+    /// were handed up **before** the failure reach the owner (the pinned
+    /// `driver_output`-then-`driver_failure_posix` row).
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed `unsupported` diagnostic when this context has **no** failure latch: a
+    /// bare context (a unit test, or a driver driven outside a port) has no port to close, and
+    /// swallowing the request would strand the owner of a port the driver believes it closed.
+    pub fn signal_failure(&mut self, failure: DriverFailure) -> Result<()> {
+        let Some(slot) = self.failure.as_mut() else {
+            return Err(error::unsupported(
+                "a driver signalled a port failure (driver_failure*/driver_exit) outside a port: no failure sink is installed",
+            ));
+        };
+        if slot.is_none() {
+            **slot = Some(failure);
+        }
+        Ok(())
+    }
+
+    /// Whether this port has already latched a failure, so the delivery seams must refuse.
+    fn failure_latched(&self) -> bool {
+        self.failure.as_ref().is_some_and(|slot| slot.is_some())
     }
 
     /// The port's output queue, which the driver drains bytes waiting to be written from.
