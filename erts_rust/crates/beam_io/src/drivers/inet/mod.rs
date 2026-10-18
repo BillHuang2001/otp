@@ -44,14 +44,19 @@
 //! | `open` | `INET_REQ_OPEN` (`:11961`) | `[AF, TYPE, PROTO]` (3 bytes) | `[1]` |
 //! | `bind` | `INET_REQ_BIND` (`:11409`) | packed address | `[1, port_hi, port_lo]` |
 //! | `listen` | `INET_REQ_LISTEN` (`:12042`) | `[backlog_hi, backlog_lo]` | `[1]` |
-//! | `accept` | `INET_REQ_ACCEPT` (`:12144`) | — | `[1, fd_be32]`, or `[1]` when nothing is pending |
+//! | `accept` | `INET_REQ_ACCEPT` (`:12144`) | — | `[1, fd_be32]`, or `[1]` when nothing is pending † |
 //! | `connect` | `INET_REQ_CONNECT` (`:12064`) | `Timeout(4) ++` packed address | `[1]`, or `[0] ++ errno` / `[0]etimedout` |
 //! | `send` | `tcp_inet_command` (`:12629`) | the bytes to send | `[1]` |
-//! | `recv` | `TCP_REQ_RECV` (`:12268`) | — | `[1]` |
+//! | `recv` | `TCP_REQ_RECV` (`:12268`) | — | `[1]` † |
 //! | `shutdown` | `TCP_REQ_SHUTDOWN` (`:12339`) | `[how]` | `[1]` |
 //! | `close` | `INET_REQ_CLOSE` (`:12259`) | — | `[1]` |
 //! | `setopts` | `INET_REQ_SETOPTS` (`:11111`) | option records `[opt, val_be32]*` | `[1]`, or `[0] ++ "einval"` |
 //! | `getopts` | `INET_REQ_GETOPTS` (`:11046`) | option codes `[opt]*` | `[1] ++ [opt, val_be32]*`, or `[0] ++ "einval"` |
+//!
+//! † The rows marked with a dagger describe the **named** verbs, this floor's own read-now
+//! vocabulary for a direct caller. The **numeric** C requests `INET_REQ_ACCEPT`(26) and
+//! `TCP_REQ_RECV`(42) are asynchronous: they answer `[1] ++ <<Id:16/big>>` and complete later
+//! through the completion channel — see *The asynchronous-operation queue* below.
 //!
 //! A reply is the C's `ctl_reply` shape: a one-byte result tag ([`INET_REP_OK`] or
 //! [`INET_REP_ERROR`], `:869-871`) followed by a payload — `ctl_reply`/`ctl_reply_ok`/
@@ -125,38 +130,59 @@
 //!   and `tpkt` (`9`) — `line` delivers the delimiter (`gen_tcp:recv`'s behaviour, the C's
 //!   `packet_get_body` "as is"). **Absent by design** (a typed error, never a wrong frame): the
 //!   HTTP family `http`/`httph`/`http_bin`/`httph_bin` (`10`/`11`/`13`/`14`) and `ssl_tls`
-//!   (`12`), whose bodies need the C's term-building `PacketCallbacks`; and `TCP_REQ_RECV`'s
-//!   length argument, which the async-op queue below would carry.
-//! * **Per-operation timeouts** — `TCP_REQ_RECV`'s 4-byte timeout (`:12277`) and
-//!   `send_timeout`/`send_timeout_close` (`INET_LOPT_TCP_SEND_TIMEOUT`(`:30`)/
-//!   `_CLOSE`(`:35`)). Both options are **stored and reported** (on a stream socket, the gate
-//!   the C applies) but not acted on: the C arms a driver multi-timer
-//!   (`add_multi_timer(..., &tcp_inet_send_timeout)`, `:13789`) that fires while output is
-//!   queued and answers an **asynchronous** `inet_reply`-shaped `{error, timeout}` (closing the
-//!   socket under `send_timeout_close`, `:12458`-`:12482`). This port owns exactly one
-//!   `TIMEOUT` task and no async reply channel — the synchronous `send` verb has already
-//!   answered by the time a timeout could fire — so the deadline is recorded for `getopts`
-//!   (byte-exact against the oracle) and any `{error, timeout}` reply is a handoff.
-//!   `TCP_REQ_RECV`'s own timeout is likewise not honored: this floor's `recv` is a synchronous
-//!   read-now verb.
+//!   (`12`), whose bodies need the C's term-building `PacketCallbacks`.
+//! * **Per-operation send timeouts** — `send_timeout`/`send_timeout_close`
+//!   (`INET_LOPT_TCP_SEND_TIMEOUT`(`:30`)/`_CLOSE`(`:35`)). Both options are **stored and
+//!   reported** (on a stream socket, the gate the C applies) but not acted on: the C arms a
+//!   driver multi-timer (`add_multi_timer(..., &tcp_inet_send_timeout)`, `:13789`) that fires
+//!   while output is queued and answers an **asynchronous** `inet_reply`-shaped
+//!   `{error, timeout}` (closing the socket under `send_timeout_close`, `:12458`-`:12482`). The
+//!   deadline is recorded for `getopts` (byte-exact against the oracle) and any such
+//!   `{error, timeout}` reply is a handoff. A **receive** request's own `Timeout(4)` operand
+//!   (`:12277`) *is* honoured: it is the deadline of the asynchronous operation (see *The
+//!   asynchronous-operation queue* below), and `TCP_REQ_RECV`'s `Length(4)` operand is honoured
+//!   for the raw header type — "exactly `n` bytes".
 //! * **`controlling_process`** is **not** driver state: `inet:tcp_controlling_process/2`
 //!   (`lib/kernel/src/inet.erl:4848`) is `erlang:port_connect(S, NewOwner)` plus an Erlang-side
 //!   drain of already-buffered `{tcp, S, Data}`/`{inet_async, …}` messages. There is no
 //!   `INET_REQ_*` for it, and the [`crate::Driver`] seam has no notion of an owner — see the
 //!   handoff note in the crate `CONTEXT.md`.
-//! * **The async-op queue** — `INET_MAX_ASYNC = 1` (`:1069`), `enq_async`, and the
-//!   `[1] ++ async_id_be16` reply plus the later `{inet_async, Port, Ref, Result}` message. The
-//!   C's `connect`/`recv`/`accept` are asynchronous request/reply exchanges through it; this
-//!   floor's `recv` is a **synchronous** read-now verb (empty argument, `[1]` reply; the raw
-//!   bytes — or, under `{packet, N}`, one decoded frame's payload — into the port input queue)
-//!   and its `accept`/`connect` transfer or complete in place. The numeric `TCP_REQ_RECV`(42)
-//!   therefore validates the C's 8-byte `Timeout(4), Length(4)` payload **after** its connection
-//!   and `active` guards (`:12268`-`:12296`), exactly as the C orders them, and then forwards an
-//!   empty operand to that synchronous verb; only the **named** `recv` verb keeps the `BadArg`
-//!   contract for a non-empty argument.//! * **IPv6, UDP, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
+//! * **IPv6, UDP, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
 //!   `AF_INET`/`SOCK_STREAM` (`:11961`-`:11990`) and `bind`/`connect` only the packed
 //!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms (`:4795`); any other family tag is `BadArg`.
-//! * **Multi-accept** — see the accept divergence below.
+//!
+//! # The asynchronous-operation queue
+//!
+//! The C's `recv`/`accept` cannot be answered by their control call — the data (or the
+//! connection) is not there yet — so they are request/reply exchanges: the reply is an **id**
+//! (`[1] ++ <<Id:16/big>>`) and the outcome arrives later through the crate's
+//! [`completion`](crate::completion) channel as `{inet_async, Port, Id, Result}`. That queue is
+//! implemented for **both** numeric requests ([`self::op_queue`]):
+//!
+//! * `TCP_REQ_RECV`(42) takes the C's `Timeout(4), Length(4)` operand and occupies the
+//!   **single** receive slot (`INET_MAX_ASYNC = 1`, `:1069`), so a second concurrent receive is
+//!   the C's `[0]ealready`. The data is delivered as
+//!   [`InetAsyncResult::Data`](crate::completion::InetAsyncResult::Data) — one
+//!   [`ReadMessage`](crate::port_task::ReadMessage) per read, the `{packet, N}` header already
+//!   stripped.
+//! * `INET_REQ_ACCEPT`(26) takes the four-byte `Timeout` and joins the **multi-operation** accept
+//!   list (`enq_multi_op`, `:12194`/`:12209`), so N pending accepts each get their own id, all
+//!   complete in enqueue order, and `INET_REQ_GETSTATUS` reports the C's
+//!   `INET_F_ACC`/`INET_F_MULTI_CLIENT` bits while the list is non-empty.
+//!
+//! The id counter is the C's `NEW_ASYNC_ID` (`op_ref++ & 0xffff`, `:1549`): it starts at `0` and
+//! is taken *before* the capacity check, so a refused enqueue still advances it. A completion is
+//! produced at exactly three points — socket readiness ([`Driver::ready_input`]), the port timer
+//! ([`Driver::next_timeout`]/[`Driver::timeout`], armed from the operation's deadline), and the
+//! round's async drive point ([`Driver::drive_async`], which serves data that arrived *before* the
+//! operation was enqueued) — never inside the control call. A close drains every pending
+//! operation with `{error, closed}` (`async_error_am_all`, `:2597`-`:2608`) before the descriptor
+//! goes away. A command's `[n:be16][n ETF bytes]` **caller tag** is likewise answered through it
+//! (`{inet_reply, Port, Reply, Tag}`, `inet_reply_finish` `:2614`-`:2637`).
+//!
+//! **Divergence:** the C addresses a completion to `desc->caller`; the frozen [`crate::Driver`]
+//! seam has no caller notion, so a completion is reported to the **port's owner** (see the crate
+//! `CONTEXT.md`).
 //!
 //! # Readiness and flow control
 //!
@@ -189,20 +215,28 @@
 //!
 //! The C's `INET_REQ_ACCEPT` creates a **second** Erlang port for the accepted socket
 //! (`tcp_inet_copy` + `driver_create_port` + `async_ok_port`, `:12236`-`:12252`) and answers
-//! the control call with a two-byte async id. Milestone-1's driver seam has no
-//! port-creation capability — one [`crate::Driver`] is one port — so `accept` **transfers this
-//! port to the connection**: the listener is deregistered and closed, the accepted descriptor
-//! becomes the port's socket (registered [`Interest::READABLE`]) and the reply carries the
-//! **new descriptor** (`[1] ++ fd_be32`) where the C carries the async id. The driver keeps
-//! ownership of that descriptor; it is reported for correlation only. Multi-accept (one
-//! listener serving many connections) is therefore deferred — it needs the async-op queue and
-//! the port-creation capability listed in the section above.
+//! the control call with a two-byte async id. A [`crate::Driver`] cannot create a port, so the
+//! **numeric** request queues on the multi-operation accept list and reports what it took off the
+//! listener inside its completion
+//! ([`InetAsyncResult::Accepted`](crate::completion::InetAsyncResult::Accepted) — the
+//! descriptor, put into non-blocking mode). The runtime opens the second port itself
+//! ([`TcpInetDriver::from_socket`], or the already-served `INET_REQ_FDOPEN`); the descriptor is
+//! handed over **owned**, so the driver never stores it, no teardown path ([`Driver::stop`],
+//! `Drop`) can close it, and the listener keeps accepting.
+//!
+//! The **named** `accept` verb is the older, this floor's own shape: it **transfers this port to
+//! the connection** (the listener is deregistered and closed, the accepted descriptor becomes the
+//! port's socket, registered [`Interest::READABLE`], and the reply is `[1] ++ fd_be32`). It exists
+//! for a direct caller that wants a read-now answer; `{inet_async, …}` is never produced by it.
 //!
 //! # Ownership
 //!
 //! The driver **owns** its descriptors: [`TcpInetDriver::from_socket`] adopts a caller's
-//! socket, `open`/`accept` create their own, and every one of them is closed on `stop`, on the
-//! `close` verb and on `Drop`; nothing else may close them. All raw socket syscalls
+//! socket, `open` creates its own, the named `accept` verb adopts the connection it took, and
+//! every one of them is closed on `stop`, on the `close` verb and on `Drop`; nothing else may
+//! close them. The **one** exception is a descriptor handed over by a numeric `accept`
+//! completion: it belongs to the completion's consumer from the moment it is reported, and no
+//! path here closes it. All raw socket syscalls
 //! (`socket`/`bind`/`listen`/`accept`/`connect`/`getsockname`/`getsockopt`/`setsockopt`/`read`/
 //! `send`/`shutdown`/`close`) live in the private `sys` submodule, and every `unsafe` block
 //! carries a `// SAFETY:` rationale.
@@ -298,11 +332,11 @@ const READ_CHUNK: usize = 64 * 1024;
 ///
 /// The C's `INET_REQ_CONNECT` is an **async** operation: it hands the request's `Timeout(4)`
 /// operand (`-1`, the C's `INET_INFINITY`, is what `prim_inet:connect/3` sends for `infinity`) to
-/// its async-op queue and returns immediately. This floor completes the connect inside the control
-/// call — there is no async-op queue and no driver→owner message channel — so the timeout becomes a
-/// **blocking** budget, and an infinity (or any other negative value) has to be capped: the
-/// callback runs on the runtime's single-threaded pump, which must never be parked for a silently
-/// dropped SYN (the kernel would retry for minutes).
+/// its async-op queue and returns immediately. Connect is the one request this floor still answers
+/// inline rather than through the async queue (see *The asynchronous-operation queue* in the module
+/// docs), so the timeout becomes a **blocking** budget, and an infinity (or any other negative
+/// value) has to be capped: the callback runs on the runtime's single-threaded pump, which must
+/// never be parked for a silently dropped SYN (the kernel would retry for minutes).
 const CONNECT_WAIT_CAP_MS: i32 = 30_000;
 
 /// The `poll(2)` budget, in milliseconds, a `connect` request's `Timeout(4)` operand asks for,
@@ -1160,9 +1194,10 @@ impl TcpInetDriver {
     ///   **write** readiness armed, so a completion that arrives later is still observed through
     ///   [`Driver::ready_output`] (and [`TcpInetDriver::connect_error`]).
     ///
-    /// The C never answers a bare `[1]` for the in-progress case: it replies `[1] ++ async_id_be16`
-    /// and delivers `{inet_async, Port, Ref, Status}` — a channel this crate has no seam for, which
-    /// is exactly why the wait above takes its place. A timed-out C operation delivers
+    /// The C never answers a bare `[1]` for the in-progress case: it rewrites the request into an
+    /// async operation, replies `[1] ++ async_id_be16` and delivers `{inet_async, Port, Ref,
+    /// Status}` — connect is the one family this floor still completes inline instead, which is
+    /// exactly why the wait above takes its place. A timed-out C operation delivers
     /// `{inet_async, Port, Ref, {error, etimedout}}` where this answers `[0]etimedout`.
     ///
     /// # Errors
@@ -1498,9 +1533,9 @@ impl TcpInetDriver {
             // only then `len < 6 ⇒ einval`. The leading four operand bytes are the async-connect
             // timeout; everything after them is the packed address, which the C hands straight to
             // `inet_set_faddress` (`:12084`-`:12089` — the `Port(2)` its comment names is the
-            // address's own port field). The timeout port of the C's `enq_async` is unused: this
-            // floor has no async-op queue to correlate a reply through, so the connect completes
-            // inside the call and the timeout bounds that completion.
+            // address's own port field). The C also ports the request onto the async queue; this
+            // floor answers connect inline (the one family that does), so the timeout bounds the
+            // completion inside the call instead of arming an operation.
             Opcode::Connect => {
                 match self.state {
                     InetState::Closed => return Ok(ctl_xerror("exbadport")),
