@@ -41,6 +41,34 @@
 //! property of the *produced object code* rather than a mere "it returned", and no case pins a
 //! compiler-release artifact (see *Why the goldens are comparisons and classified shapes*).
 //!
+//! The **artifact block** appended to the group (thirteen more cases, [`group`] indices 13–25)
+//! deepens exactly that claim: those cases assert on what the compiler really emits — the
+//! produced `.beam`'s `Code` chunk, `beam_lib:md5/1` image, `abstract_code`/`attributes` chunks,
+//! and `beam_lib:info/1` chunk view — and on the compiled module's **behaviour** once the
+//! artifact is loaded and called:
+//!
+//! * [`debug_info_case`] — the file route's `debug_info` matrix (default and `no_debug_info`
+//!   carry no abstract code, `debug_info` carries the source's forms);
+//! * [`deterministic_case`] — `[deterministic]` leaves the object code (the `Code` chunk and
+//!   the whole md5 image) unchanged while stripping the source path from the bytes;
+//! * [`parse_forms_case`] — the `epp` front end on a real stdlib source (module attribute,
+//!   sorted `-export` list, no error forms, the trailing `{eof, _}`);
+//! * [`forms_load_case`] — `compile:forms/2` end to end: hand-written forms, the artifact's
+//!   export table, `code:load_binary/3`, and the produced code **executed**;
+//! * [`real_module_exec_case`] — a real `lib/stdlib/src/ordsets.erl` parsed, compiled
+//!   in-process, loaded and ten of its exported functions called;
+//! * [`forms_debug_info_case`] — the `debug_info` chunk is *exactly* the input form list;
+//! * [`attributes_roundtrip_case`] — an explicit `-vsn("3.1")` and a `-behaviour(gen_server)`
+//!   are what the artifact's `attributes` chunk carries;
+//! * [`warnings_case`] / [`warnings_as_errors_case`] / [`error_diagnostics_case`] — the
+//!   diagnostic surface: `return_warnings`, `nowarn_unused_function`,
+//!   `warnings_as_errors`, and the `{error, [{File, [{Line, Mod, Desc}]}], []}` shape;
+//! * [`chunk_view_case`] — `beam_lib:info/1` and `beam_lib:chunks/2` agree about the image;
+//! * [`write_route_case`] — the `[binary]` and `{outdir, Dir}` routes produce identical
+//!   object code (the module-run route, where an outdir exists at all);
+//! * [`macro_case`] — `{d, 'SELFHOST_BRANCH', 1}` changes the compiled code, and the artifact
+//!   the define produced is the one that runs (the module-run route).
+//!
 //! # The cases
 //!
 //! Each embedded module self-locates its temp dir (`filename:dirname(code:which(?MODULE))`),
@@ -142,13 +170,17 @@
 //!
 //! # Status
 //!
-//! All thirteen cases **agree** on the Rust runtime: the runtime hosts the E0 route, the
+//! All twenty-six cases **agree** on the Rust runtime: the runtime hosts the E0 route, the
 //! scheduled shape, an in-process compile of a real stdlib module, the dependent pair (with
 //! the `code:add_patha/1` + `code:load_file/1` link round trip), a module whose documentation
 //! the compiler reads from a sibling file, the code-path / load-state shapes, the
 //! in-process compile of `lib/stdlib/src/timer.erl` (1017 lines), and the six file-free
 //! relation cases (two-run determinism, the artifact's attributes and chunk set, a sibling
-//! header, route independence, an extra include directory, `-include_lib`). Three
+//! header, route independence, an extra include directory, `-include_lib`). On top of those,
+//! the thirteen **artifact** cases all agree too: the produced `.beam`'s chunk contents and
+//! image relations hold on both sides, and the two module-run route cases (`{outdir, Dir}`
+//! against `[binary]`, and the `{d, …}` define that changes the compiled branch and is then
+//! executed) reproduce the oracle's integer. Three
 //! contracts are in play and exactly two are claimed:
 //! [`Contract::BeamAsm`] (a real `.beam` executes and object code is produced) and
 //! [`Contract::Build`] (the build/bootstrapping route itself). [`Contract::OtpApps`] is
@@ -157,25 +189,28 @@
 //!
 //! # Measured divergences / not covered
 //!
-//! Two routes belong to this contract but are deliberately **not** corpus cases. Each is a
+//! One route belongs to this contract but is deliberately **not** a corpus case; it is a
 //! ledger line, not a golden:
 //!
-//! * **Loading a freshly compiled artifact on the expression route** (compile → load → call,
-//!   which would compare a compiled module's answers with the same function's in a system
-//!   module). The load is refused by `code`'s own *sticky directory* policy for a stdlib module
-//!   name, and the refusal survives the removal route: measured on **both** runtimes,
+//! * **Loading a freshly compiled artifact under a *stdlib module name*** — i.e. compile →
+//!   load → call where the compiled module keeps its own name. The load is refused by `code`'s
+//!   own *sticky directory* policy for a module name the installation owns, and the refusal
+//!   survives the removal route: measured on **both** runtimes,
 //!   `erlang:delete_module(lists)` answers `true` and the following
 //!   `code:load_binary(lists, …, Bin)` still answers `{error, sticky_directory}` (with
-//!   `code:delete(lists)` answering `false`), so there is no load to compare either way. So the
-//!   compile-and-**call** dimension stays on the module-run route, where [`pair_case`] already
-//!   pins it through `code:add_patha/1` + `code:load_file/1`.
-//! * **The `binary` form against the `{outdir, Dir}` (write-path) form** — the two compile
-//!   entry points' artifacts compared with each other. That comparison needs an outdir, hence
-//!   the module-run argv, and the very same in-process compile costs **≈ 14 s** on the Rust
-//!   runtime there against **≈ 0.34 s** on the oracle (measured while drafting this group),
-//!   which a gate that boots both runtimes for every CLI case cannot carry. The outdir form is
-//!   still pinned against *itself* by [`sched_case`] (two `deterministic` outdir compiles), and
-//!   the file-free form's own reproducibility by [`two_run_case`].
+//!   `code:delete(lists)` answering `false`). The compile-and-**call** dimension is therefore
+//!   pinned the two ways that *do* load: on the module-run route through
+//!   `code:add_patha/1` + `code:load_file/1` of a module of the case's own name
+//!   ([`pair_case`], [`macro_case`]), and on the expression route by **renaming** the module
+//!   attribute in the parsed form stream before `compile:forms/2` ([`real_module_exec_case`]) or
+//!   by handing the compiler forms for a name no installation owns ([`forms_load_case`]).
+//!
+//! The `binary` form against the `{outdir, Dir}` (write-path) form **is** pinned — by
+//! [`write_route_case`], on a two-line staged source: both routes must yield the same bytes,
+//! the same `Code` chunk and the same `beam_lib:md5/1` image. What stays out of the corpus is
+//! the same comparison for a **large** source (an `ordsets`-sized stdlib module costs ≈ 7.6 s
+//! on the Rust runtime through the module-run argv against ≈ 0.8 s through `-eval`), which is
+//! the reason [`timer_case`] and the file-free relation cases live on the expression route.
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
 /// The embedded module of the E0 route: `no_spawn_compiler_process`, one integer result.
@@ -1500,10 +1535,550 @@ fn include_lib_case() -> Case {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The **artifact** cases: what the compiler's real output is, not just its exit status.
+//
+// Every expression below asserts on the produced `.beam` — its `Code` image, its
+// `abstract_code`/`attributes` chunks, its `beam_lib:md5/1` image, its `beam_lib:info/1` chunk
+// view — or on the compiled module's *behaviour* once the artifact is loaded and called. As
+// everywhere else in this group the observable is a **relation the oracle independently
+// holds** (two artifacts of the same run compared with each other, an artifact compared with
+// the forms handed to the compiler, a source-derived export table, a diagnostic list), never a
+// pinned hash or byte length: those are compiler-release artifacts and this corpus' oracle is
+// whichever OTP release the host installed (see the module docs).
+// ---------------------------------------------------------------------------
+
+/// The `debug_info` matrix of the **file** route: the default carries **no** abstract code,
+/// `debug_info` adds the source forms, `no_debug_info` strips them again.
+///
+/// Shape rules, all load-bearing:
+///
+/// * the "default" clause uses `compile:noenv_file/2`, which does **not** consult
+///   `ERL_COMPILER_OPTIONS` — so the default really is `no_debug_info` whatever the ambient
+///   environment holds (the compile is deterministic and the observable host-independent);
+/// * the `debug_info` image's chunk is decoded (`beam_lib:chunks(Bin, [abstract_code])`), and
+///   the *source's own* attributes are found in it — the module attribute and
+///   `-behaviour(supervisor)` — so a chunk that merely exists (an empty or truncated abstract
+///   form list) cannot answer the relation. The `behaviour` value is accepted in both shapes
+///   the parser produces for a single attribute argument (the atom and the one-element list),
+///   so the case does not pin an `erl_parse`/`erl_lint` representation detail of the oracle's
+///   release;
+/// * `compile:file/2` (which *does* consult the ambient options) is used only for the two
+///   clauses that pass `debug_info`/`no_debug_info` **explicitly**, where the environment
+///   cannot change the outcome.
+const SELFHOST_DEBUG_INFO_EXPR: &str = r#"begin Src = "lib/stdlib/src/dets_sup.erl", Opts = [binary, no_spawn_compiler_process, deterministic], {ok, dets_sup, NoDebug} = compile:noenv_file(Src, Opts), {ok, dets_sup, WithDebug} = compile:file(Src, [debug_info | Opts]), {ok, dets_sup, ExplicitNone} = compile:file(Src, [no_debug_info | Opts]), {ok, {dets_sup, [{abstract_code, None}]}} = beam_lib:chunks(NoDebug, [abstract_code]), {ok, {dets_sup, [{abstract_code, With}]}} = beam_lib:chunks(WithDebug, [abstract_code]), {ok, {dets_sup, [{abstract_code, Explicit}]}} = beam_lib:chunks(ExplicitNone, [abstract_code]), {raw_abstract_v1, Forms} = With, (None =:= no_abstract_code) andalso (Explicit =:= no_abstract_code) andalso (lists:any(fun({attribute, _, module, M}) -> M =:= dets_sup; (_) -> false end, Forms)) andalso (lists:any(fun({attribute, _, behaviour, B}) -> (B =:= supervisor) orelse (B =:= [supervisor]); (_) -> false end, Forms)) end"#;
+
+/// `deterministic` changes the artifact's **path-bearing** chunks only: the object code (the
+/// `Code` chunk and the whole `beam_lib:md5/1` image) is identical with and without it, while
+/// the bytes and the size are not — the deterministic image has the source path stripped.
+///
+/// Every clause compares two artifacts of the **same run** or reads the produced image for its
+/// own source path, so no compiler-release value is pinned. The plain image is produced with
+/// `compile:noenv_file/2` so the ambient `ERL_COMPILER_OPTIONS` cannot perturb the comparison.
+const SELFHOST_DETERMINISTIC_EXPR: &str = r#"begin Src = "lib/stdlib/src/dets_sup.erl", Opts = [binary, no_spawn_compiler_process], {ok, dets_sup, Deterministic} = compile:file(Src, [deterministic | Opts]), {ok, dets_sup, Plain} = compile:noenv_file(Src, Opts), {ok, {dets_sup, Md5Deterministic}} = beam_lib:md5(Deterministic), {ok, {dets_sup, Md5Plain}} = beam_lib:md5(Plain), {ok, {dets_sup, [{"Code", CodeDeterministic}]}} = beam_lib:chunks(Deterministic, ["Code"]), {ok, {dets_sup, [{"Code", CodePlain}]}} = beam_lib:chunks(Plain, ["Code"]), (byte_size(Md5Deterministic) =:= 16) andalso (Md5Deterministic =:= Md5Plain) andalso (CodeDeterministic =:= CodePlain) andalso (Deterministic =/= Plain) andalso (byte_size(Deterministic) < byte_size(Plain)) andalso (binary:match(Deterministic, <<"dets_sup.erl">>) =:= nomatch) andalso (binary:match(Plain, <<"dets_sup.erl">>) =/= nomatch) end"#;
+
+/// The **front-end** (`epp`) stage of the route, observed on a real stdlib source: parsing
+/// `lib/stdlib/src/ordsets.erl` yields exactly one module attribute, exactly the source's
+/// `-export` attributes (sorted, so the answer is the source's function list and nothing
+/// else), no `{error, _}` form, and the trailing `{eof, _}` marker the compiler consumes.
+///
+/// `epp` is an io-device client, so this is the read path the self-hosted build stands on
+/// (`epp:parse_file/2` opens the file and streams it through the file server).
+const SELFHOST_PARSE_FORMS_EXPR: &str = r#"begin {ok, Forms} = epp:parse_file("lib/stdlib/src/ordsets.erl", []), Expected = [{add_element, 2}, {del_element, 2}, {filter, 2}, {filtermap, 2}, {fold, 3}, {from_list, 1}, {intersection, 1}, {intersection, 2}, {is_disjoint, 2}, {is_element, 2}, {is_empty, 1}, {is_equal, 2}, {is_set, 1}, {is_subset, 2}, {map, 2}, {new, 0}, {size, 1}, {subtract, 2}, {to_list, 1}, {union, 1}, {union, 2}], Exported = lists:sort(lists:append([E || {attribute, _, export, E} <- Forms])), [Module] = [M || {attribute, _, module, M} <- Forms], (Exported =:= Expected) andalso (Module =:= ordsets) andalso ([F || F <- Forms, element(1, F) =:= error] =:= []) andalso (element(1, lists:last(Forms)) =:= eof) end"#;
+
+/// The **`compile:forms/2`** route end to end: hand-written abstract forms are compiled, the
+/// artifact's export table and `beam_lib:md5/1` shape are read back, the image is loaded with
+/// `code:load_binary/3` and the produced code is **called** — an arithmetic function and a
+/// guard-bearing three-clause function.
+///
+/// The forms are the input, so every observable is source-derived: the values (`42`, `zero`,
+/// `positive`, `negative`) are what the forms compute, and the export table is
+/// `-export` plus the compiler's `module_info/0,1`. The artifact must also be path-free (the
+/// `deterministic` stripping), which the last clause pins.
+const SELFHOST_FORMS_LOAD_EXPR: &str = r#"begin Forms = [{attribute, 1, module, selfhost_forms_mod}, {attribute, 2, export, [{add, 2}, {classify, 1}]}, {function, 3, add, 2, [{clause, 3, [{var, 3, 'A'}, {var, 3, 'B'}], [], [{op, 3, '+', {var, 3, 'A'}, {var, 3, 'B'}}]}]}, {function, 8, classify, 1, [{clause, 8, [{integer, 8, 0}], [], [{atom, 8, zero}]}, {clause, 9, [{var, 9, 'N'}], [[{op, 9, '>', {var, 9, 'N'}, {integer, 9, 0}}]], [{atom, 9, positive}]}, {clause, 10, [{var, 10, 'N'}], [[{op, 10, '<', {var, 10, 'N'}, {integer, 10, 0}}]], [{atom, 10, negative}]}]}], {ok, selfhost_forms_mod, Bin} = compile:forms(Forms, [binary, no_spawn_compiler_process, deterministic]), {ok, {selfhost_forms_mod, [{exports, Exports}]}} = beam_lib:chunks(Bin, [exports]), {ok, {selfhost_forms_mod, Md5}} = beam_lib:md5(Bin), {module, selfhost_forms_mod} = code:load_binary(selfhost_forms_mod, "nofile", Bin), {selfhost_forms_mod:add(19, 23), selfhost_forms_mod:classify(0), selfhost_forms_mod:classify(7), selfhost_forms_mod:classify(-3), lists:sort(Exports), byte_size(Md5) =:= 16, binary:match(Bin, <<"nofile">>) =:= nomatch} end"#;
+
+/// A **real stdlib module** compiled in-process and then **executed**: `lib/stdlib/src/ordsets.erl`
+/// is parsed with `epp`, its module attribute is renamed in the form stream (the compiled
+/// module must not shadow the installation's own `ordsets`), the forms are compiled with
+/// `compile:forms/2`, the artifact is loaded with `code:load_binary/3`, and ten of the
+/// module's exported functions are called through the freshly compiled code.
+///
+/// The rename is the only edit to the source's forms, and it is needed because
+/// `code:load_binary/3` refuses a module name the installation owns (the sticky-directory
+/// policy), while the code between the attributes and the runner is the stdlib source itself.
+/// The observable is a tuple of the *answers* (the ordered-set semantics: `from_list` sorts and
+/// de-duplicates, `union`/`intersection`/`subtract` merge, `is_set` is the invariant,
+/// `fold`/`filtermap` take funs), so this is a genuine end-to-end "the compiler built a working
+/// module" assertion, plus a projection of the artifact: its export table (the 21 `-export`
+/// entries the source declares plus the compiler's `module_info/0,1`) and its atom chunk, which
+/// must carry the **renamed** module name (so a compile that ignored the form edit cannot pass
+/// — and note the artifact is deliberately *not* pinned path-free: the parsed form stream
+/// carries `epp`'s own `file` attribute, so the source path legitimately reaches the image, and
+/// `deterministic` does not strip a `file` attribute that came from the input forms).
+const SELFHOST_REAL_MODULE_EXEC_EXPR: &str = r#"begin {ok, Forms0} = epp:parse_file("lib/stdlib/src/ordsets.erl", []), Forms = [case Form of {attribute, Anno, module, ordsets} -> {attribute, Anno, module, selfhost_real_ordsets}; _ -> Form end || Form <- Forms0], {ok, selfhost_real_ordsets, Bin} = compile:forms(Forms, [binary, no_spawn_compiler_process, deterministic]), {ok, {selfhost_real_ordsets, [{exports, Exports}]}} = beam_lib:chunks(Bin, [exports]), {ok, {selfhost_real_ordsets, [{"AtU8", Atoms}]}} = beam_lib:chunks(Bin, ["AtU8"]), {module, selfhost_real_ordsets} = code:load_binary(selfhost_real_ordsets, "nofile", Bin), {selfhost_real_ordsets:from_list([3, 1, 2, 2]), selfhost_real_ordsets:union([1, 3], [2, 3]), selfhost_real_ordsets:intersection([1, 2, 3], [2, 3, 4]), selfhost_real_ordsets:subtract([1, 2, 3, 4], [2, 4]), selfhost_real_ordsets:is_element(b, selfhost_real_ordsets:from_list([a, b, c])), selfhost_real_ordsets:is_set([1, 2, 3]), selfhost_real_ordsets:is_set([2, 1]), selfhost_real_ordsets:fold(fun erlang:'+'/2, 0, [1, 2, 3, 4]), selfhost_real_ordsets:filtermap(fun(N) -> case N rem 2 of 0 -> {true, N div 2}; 1 -> false end end, [2, 4, 5, 6, 8, 9]), (byte_size(Bin) > 0) andalso (binary:match(Atoms, <<"selfhost_real_ordsets">>) =/= nomatch) andalso (length(Exports) =:= 23) andalso (lists:member({from_list, 1}, Exports)) andalso (lists:member({module_info, 1}, Exports))} end"#;
+
+/// The **`debug_info` chunk is the input**: compiling a form list with `debug_info` makes the
+/// produced artifact's `abstract_code` chunk *exactly* `{raw_abstract_v1, Forms}` — the very
+/// forms handed to the compiler, annotations included — while the default and `no_debug_info`
+/// carry `no_abstract_code`.
+///
+/// Both sides of the equality are produced inside this one run (the input term and the chunk
+/// read back out of the artifact), so no compiler release can move the golden.
+const SELFHOST_FORMS_DEBUG_INFO_EXPR: &str = r#"begin Forms = [{attribute, 1, module, dbg_mod}, {attribute, 2, export, [{f, 1}]}, {function, 3, f, 1, [{clause, 3, [{var, 3, 'N'}], [], [{op, 3, '*', {var, 3, 'N'}, {integer, 3, 2}}]}]}], Opts = [binary, no_spawn_compiler_process, deterministic], {ok, dbg_mod, Default} = compile:forms(Forms, Opts), {ok, dbg_mod, WithDebug} = compile:forms(Forms, [debug_info | Opts]), {ok, dbg_mod, NoDebug} = compile:forms(Forms, [no_debug_info | Opts]), {ok, {dbg_mod, [{abstract_code, DefaultCode}]}} = beam_lib:chunks(Default, [abstract_code]), {ok, {dbg_mod, [{abstract_code, WithCode}]}} = beam_lib:chunks(WithDebug, [abstract_code]), {ok, {dbg_mod, [{abstract_code, NoCode}]}} = beam_lib:chunks(NoDebug, [abstract_code]), {DefaultCode, NoCode, WithCode =:= {raw_abstract_v1, Forms}} end"#;
+
+/// The **attribute round trip**: the source attributes handed to the compiler — an explicit
+/// `-vsn("3.1")` and a `-behaviour(gen_server)` — are what the produced artifact's
+/// `attributes` chunk carries.
+///
+/// The explicit `vsn` is load-bearing: without it the compiler generates an md5-derived
+/// integer (exactly the release-dependent value this group forbids pinning), so an artifact
+/// that lost the source attribute would answer a *different* chunk. The chunk's string is a
+/// list of code points, i.e. source-derived (`"3.1"` = `[51, 46, 49]`).
+const SELFHOST_ATTRIBUTES_ROUNDTRIP_EXPR: &str = r#"begin Forms = [{attribute, 1, module, attr_mod}, {attribute, 2, vsn, "3.1"}, {attribute, 3, behaviour, gen_server}, {attribute, 4, export, [{f, 0}]}, {function, 5, f, 0, [{clause, 5, [], [], [{atom, 5, ok}]}]}], {ok, attr_mod, Bin} = compile:forms(Forms, [binary, no_spawn_compiler_process, deterministic]), {ok, {attr_mod, [{attributes, Attrs}]}} = beam_lib:chunks(Bin, [attributes]), {lists:sort(Attrs), proplists:get_value(vsn, Attrs), proplists:get_value(behaviour, Attrs)} end"#;
+
+/// The **warning surface**: `return_warnings` reports the compiler's diagnostics for the forms
+/// (`erl_lint`'s unused variable and unused function), and `nowarn_unused_function` suppresses
+/// exactly the second one — while the produced **object code** stays identical, so the option
+/// changes the diagnostic list and nothing else.
+///
+/// Only the diagnostics' `{Module, Description}` pairs are pinned (the line numbers are the
+/// input forms' annotations, and the file element is the empty string for a form list), so no
+/// per-release `{File, [{Line, …}]}` wrapper shape is asserted. The `Code`-chunk equality is a
+/// relation between two artifacts of this run.
+const SELFHOST_WARNINGS_EXPR: &str = r#"begin Forms = [{attribute, 1, module, warn_mod}, {attribute, 2, export, [{kept, 0}]}, {function, 3, kept, 0, [{clause, 3, [], [], [{match, 4, {var, 4, 'Y'}, {integer, 4, 1}}, {atom, 4, ok}]}]}, {function, 6, unused, 0, [{clause, 6, [], [], [{atom, 6, ok}]}]}], Opts = [binary, no_spawn_compiler_process, deterministic, return_warnings], {ok, warn_mod, BinWarned, Warned} = compile:forms(Forms, Opts), {ok, warn_mod, BinQuiet, Quiet} = compile:forms(Forms, [nowarn_unused_function | Opts]), {ok, {warn_mod, [{"Code", CodeWarned}]}} = beam_lib:chunks(BinWarned, ["Code"]), {ok, {warn_mod, [{"Code", CodeQuiet}]}} = beam_lib:chunks(BinQuiet, ["Code"]), {byte_size(BinWarned) > 0, CodeWarned =:= CodeQuiet, [{Mod, Desc} || {_File, Diags} <- Warned, {_Line, Mod, Desc} <- Diags], [{Mod, Desc} || {_File, Diags} <- Quiet, {_Line, Mod, Desc} <- Diags]} end"#;
+
+/// **`warnings_as_errors`** turns the same warning into a *failed* compile: the identical
+/// diagnostic comes back in the `{error, [], Warnings}` slot and no artifact is produced,
+/// while the flag-free compile of the same forms does produce one.
+///
+/// The comparison is between the flag-free run's warning list and the flagged run's error list
+/// — both produced here — so the golden holds on any release whose lint warnings pass through
+/// this option, without pinning a diagnostic *format*.
+const SELFHOST_WARNINGS_AS_ERRORS_EXPR: &str = r#"begin Forms = [{attribute, 1, module, wae_mod}, {attribute, 2, export, [{kept, 0}]}, {function, 3, kept, 0, [{clause, 3, [], [], [{match, 4, {var, 4, 'Y'}, {integer, 4, 1}}, {atom, 4, ok}]}]}], Opts = [binary, no_spawn_compiler_process, deterministic, return_errors, return_warnings], {ok, wae_mod, Bin, Warned} = compile:forms(Forms, Opts), Descs = fun(Diags) -> [{Mod, Desc} || {_File, Items} <- Diags, {_Line, Mod, Desc} <- Items] end, case compile:forms(Forms, [warnings_as_errors | Opts]) of {error, [], AsErrors} -> {byte_size(Bin) > 0, Descs(Warned), Descs(AsErrors)}; Other -> Other end end"#;
+
+/// The **error-diagnostic** surface: a form list with an unbound variable is refused with the
+/// documented `{error, [{File, [{Line, Module, Description}]}], []}` shape, the diagnostic
+/// naming `erl_lint` and the unbound variable, and the reported **line is the form's own
+/// annotation** (so the value is input-derived, not a compiler-release constant).
+///
+/// The `return` shorthand is compiled too, and must produce the identical error list — the two
+/// option spellings differ only in what they *also* return for warnings.
+const SELFHOST_ERROR_DIAGNOSTICS_EXPR: &str = r#"begin Forms = [{attribute, 1, module, err_mod}, {attribute, 2, export, [{f, 0}]}, {function, 9, f, 0, [{clause, 9, [], [], [{var, 9, 'X'}]}]}], {error, ViaReturnErrors, []} = compile:forms(Forms, [binary, return_errors]), {error, ViaReturn, []} = compile:forms(Forms, [binary, return]), {error, [{File, Diags}], []} = compile:forms(Forms, [binary, return_errors]), {File =:= "", ViaReturn =:= ViaReturnErrors, [{Line, Mod, Desc} || {Line, Mod, Desc} <- Diags]} end"#;
+
+/// The **chunk view** of a produced artifact: `beam_lib:info/1`'s chunk list and
+/// `beam_lib:chunks/2` must agree about the file they describe.
+///
+/// Four properties, none of them a release constant: the chunk ids are unique, their file
+/// positions ascend (an artifact whose tables were written out of order cannot make both
+/// views agree), every chunk the loader needs to resolve code is listed, and **every** listed
+/// chunk is actually extractable from the image (the listing is not a stale or partial index).
+/// The chunk *count* and the per-chunk sizes are deliberately not pinned.
+const SELFHOST_CHUNK_VIEW_EXPR: &str = r#"begin Forms = [{attribute, 1, module, chunks_mod}, {attribute, 2, export, [{f, 0}]}, {function, 3, f, 0, [{clause, 3, [], [], [{atom, 3, ok}]}]}], {ok, chunks_mod, Bin} = compile:forms(Forms, [binary, no_spawn_compiler_process, deterministic]), {chunks, Chunks} = lists:keyfind(chunks, 1, beam_lib:info(Bin)), Names = [Name || {Name, _Pos, _Size} <- Chunks], Positions = [Pos || {_Name, Pos, _Size} <- Chunks], (byte_size(Bin) > 0) andalso (lists:sort(Names) =:= lists:usort(Names)) andalso (lists:sort(Positions) =:= Positions) andalso (lists:all(fun(Required) -> lists:member(Required, Names) end, ["AtU8", "Code", "StrT", "ImpT", "ExpT"])) andalso (lists:all(fun(Name) -> case beam_lib:chunks(Bin, [Name]) of {ok, {chunks_mod, [{_, Value}]}} -> Value =/= undefined; _ -> false end end, Names)) end"#;
+
+/// The embedded module of the **write-route** case: one source compiled twice, once with the
+/// file-free `binary` form and once with `{outdir, Dir}` — the two artifacts must be the same
+/// object code.
+///
+/// Shape rules, all load-bearing:
+///
+/// * the source is staged **write-first** through the runtime's own file-server write path
+///   (like every sibling route), and it is a module of its own (`selfhost_write_lib`), so the
+///   `{outdir, Dir}` write cannot overwrite the module running the case;
+/// * both compiles are `no_spawn_compiler_process` + `deterministic`, so the two artifacts are
+///   comparable byte-for-byte and the `{outdir, Dir}` file is path-free;
+/// * the observable is a chain of equalities between the **two artifacts of this run** —
+///   the returned binary against the file the compiler wrote, both `beam_lib:md5/1` images,
+///   both `Code` chunks — plus the 16-byte md5 shape and the produced file's path-freedom.
+///   No byte length or hash value is pinned, so no compiler release can move the golden.
+const SELFHOST_WRITE_SOURCE: &str = r#"-module(selfhost_write).
+-export([compile_self/0]).
+
+%% A.9: compile ONE staged source through BOTH write routes — the file-free `binary` form and
+%% the `{outdir, Dir}` (file-writing) form — and require the same object code from each. `1`
+%% iff the returned binary equals the file the compiler wrote, both `beam_lib:md5/1` images and
+%% both `Code` chunks agree, the md5 is the documented 16 bytes, and the produced file carries
+%% no occurrence of the case directory.
+compile_self() ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    Source = filename:join(Dir, "selfhost_write_lib.erl"),
+    ok = file:write_file(Source, lib_source()),
+    Opts = [no_spawn_compiler_process, deterministic],
+    {ok, selfhost_write_lib, FromBinary} = compile:file(Source, [binary | Opts]),
+    {ok, selfhost_write_lib} = compile:file(Source, [{outdir, Dir} | Opts]),
+    Beam = filename:join(Dir, "selfhost_write_lib.beam"),
+    {ok, FromFile} = file:read_file(Beam),
+    {ok, {selfhost_write_lib, Md5Binary}} = beam_lib:md5(FromBinary),
+    {ok, {selfhost_write_lib, Md5File}} = beam_lib:md5(FromFile),
+    {ok, {selfhost_write_lib, [{"Code", CodeBinary}]}} = beam_lib:chunks(FromBinary, ["Code"]),
+    {ok, {selfhost_write_lib, [{"Code", CodeFile}]}} = beam_lib:chunks(FromFile, ["Code"]),
+    case {FromBinary =:= FromFile, Md5Binary =:= Md5File, CodeBinary =:= CodeFile,
+          byte_size(Md5Binary) =:= 16, binary:match(FromFile, list_to_binary(Dir))} of
+        {true, true, true, true, nomatch} -> 1;
+        _ -> 2
+    end.
+
+%% The source both routes compile: a two-line module with one pure function.
+lib_source() ->
+    <<"-module(selfhost_write_lib).\n-export([double/1]).\ndouble(X) -> 2 * X.\n">>.
+"#;
+
+/// The embedded module of the **macro-definition** case: one staged source with an `-ifdef`,
+/// compiled twice — with `{d, 'SELFHOST_BRANCH', 1}` and without — and then *executed* from
+/// the artifact the define produced.
+///
+/// Shape rules, all load-bearing:
+///
+/// * the source is staged **write-first**, and the two compiles use the file-free `binary` form
+///   (no outdir), so the case never relies on a second write;
+/// * the `-ifdef('SELFHOST_BRANCH')` body and its `-else` branch return different values, so a
+///   runtime that dropped the `{d, …}` option, or that applied it to the wrong branch, cannot
+///   produce both observables;
+/// * the two artifacts' `Code` chunks (and their bytes) must **differ** — the option really
+///   changed the compiled code — while `common/0`, which sits outside the conditional, is
+///   exported and callable from the loaded artifact either way;
+/// * the branch that is *executed* is the **defined** one: the artifact written to the case
+///   dir is the one compiled with `{d, 'SELFHOST_BRANCH', 1}`, and it is loaded through
+///   `code:add_patha/1` + `code:load_file/1` (the path-loading route the self-hosted build
+///   uses) and called. So `1` asserts both "the option was honoured" and "the compiled code
+///   runs", not merely that two compiles returned `{ok, _}`.
+const SELFHOST_MACRO_SOURCE: &str = r#"-module(selfhost_macro).
+-export([compile_self/0]).
+
+%% A.9: compile ONE staged source twice — with the `{d, 'SELFHOST_BRANCH', 1}` define and
+%% without it — require the two object codes to DIFFER, then write the defined variant's
+%% artifact, load it through the code path and call it: `1` iff the executed branch is the
+%% defined one (`branch/0` returns 1) and the unconditional function still works.
+compile_self() ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    Source = filename:join(Dir, "selfhost_macro_lib.erl"),
+    ok = file:write_file(Source, lib_source()),
+    Opts = [binary, no_spawn_compiler_process, deterministic],
+    {ok, selfhost_macro_lib, Defined} = compile:file(Source, [{d, 'SELFHOST_BRANCH', 1} | Opts]),
+    {ok, selfhost_macro_lib, Undefined} = compile:file(Source, Opts),
+    {ok, {selfhost_macro_lib, [{"Code", CodeDefined}]}} = beam_lib:chunks(Defined, ["Code"]),
+    {ok, {selfhost_macro_lib, [{"Code", CodeUndefined}]}} = beam_lib:chunks(Undefined, ["Code"]),
+    ok = file:write_file(filename:join(Dir, "selfhost_macro_lib.beam"), Defined),
+    true = code:add_patha(Dir),
+    {module, selfhost_macro_lib} = code:load_file(selfhost_macro_lib),
+    case {CodeDefined =/= CodeUndefined, Defined =/= Undefined,
+          selfhost_macro_lib:branch(), selfhost_macro_lib:common()} of
+        {true, true, 1, ok} -> 1;
+        _ -> 2
+    end.
+
+%% The source both compiles see: the conditional body is the observable, the unconditional one
+%% proves the artifact links either way.
+lib_source() ->
+    <<"-module(selfhost_macro_lib).\n-export([branch/0, common/0]).\n"
+      "-ifdef('SELFHOST_BRANCH').\nbranch() -> 1.\n-else.\nbranch() -> 2.\n-endif.\n"
+      "common() -> ok.\n">>.
+"#;
+
+/// The `debug_info` matrix of the **file** route: default without abstract code,
+/// `debug_info` with the source forms, `no_debug_info` without.
+fn debug_info_case() -> Case {
+    Case {
+        id: "selfhost/compile_file_default_omits_abstract_code_and_debug_info_adds_the_forms",
+        description: "the A.9 debug-info matrix of the file route: the default (via \
+                      compile:noenv_file/2, so the ambient ERL_COMPILER_OPTIONS cannot \
+                      perturb it) and [no_debug_info] carry no abstract code, while \
+                      [debug_info] carries the source's forms — pinned by finding the module \
+                      attribute and -behaviour(supervisor) inside the decoded chunk",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_DEBUG_INFO_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The `deterministic` relation: same object code, path stripped.
+fn deterministic_case() -> Case {
+    Case {
+        id: "selfhost/deterministic_keeps_the_object_code_but_strips_the_source_path",
+        description: "the A.9 option effect on the artifact: lib/stdlib/src/dets_sup.erl \
+                      compiled with and without [deterministic] yields the same Code chunk and \
+                      the same beam_lib:md5/1 image (the object code is unchanged) but \
+                      different bytes — the deterministic image is smaller and carries no \
+                      occurrence of the source name, the plain one does",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_DETERMINISTIC_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The `epp` front-end case: a real stdlib source parsed into forms.
+fn parse_forms_case() -> Case {
+    Case {
+        id: "selfhost/epp_parse_file_reads_a_real_stdlib_source_into_forms",
+        description: "the A.9 front-end stage: epp:parse_file/2 of lib/stdlib/src/ordsets.erl \
+                      yields exactly one module attribute, exactly the source's sorted -export \
+                      list, no {error, _} form and the trailing {eof, _} marker",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_PARSE_FORMS_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The `compile:forms/2` case: build, load and *call* a module from hand-written forms.
+fn forms_load_case() -> Case {
+    Case {
+        id: "selfhost/compile_forms_produces_a_loadable_module_and_executes_it",
+        description: "the A.9 forms route end to end: compile hand-written abstract forms with \
+                      compile:forms/2, read the artifact's export table and 16-byte \
+                      beam_lib:md5/1 image, load the image with code:load_binary/3 and call \
+                      the produced arithmetic and guard-bearing functions",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_FORMS_LOAD_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some(
+                "ok {42,zero,positive,negative,[{add,2},{classify,1},{module_info,0},\
+                 {module_info,1}],true,true}",
+            ),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The real-stdlib execute case: `ordsets` compiled in-process, loaded and called.
+fn real_module_exec_case() -> Case {
+    Case {
+        id: "selfhost/in_process_compile_of_a_real_stdlib_module_executes_its_functions",
+        description: "the A.9 compile-and-execute shape: parse lib/stdlib/src/ordsets.erl with \
+                      epp, rename its module attribute (so the artifact can be loaded rather \
+                      than shadow the installation's own module), compile the forms in-process, \
+                      load the image with code:load_binary/3 and call ten of the module's \
+                      exported functions through the freshly compiled code",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_REAL_MODULE_EXEC_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some(
+                "ok {[1,2,3],[1,2,3],[2,3],[1,3],true,true,false,10,[1,2,3,4],true}",
+            ),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The forms `debug_info` case: the chunk carries exactly the input forms.
+fn forms_debug_info_case() -> Case {
+    Case {
+        id: "selfhost/debug_info_chunk_carries_the_input_forms",
+        description: "the A.9 round trip: compiling a form list with [debug_info] makes the \
+                      produced artifact's abstract_code chunk exactly {raw_abstract_v1, Forms} \
+                      — the forms handed to the compiler — while the default and \
+                      [no_debug_info] carry no abstract code",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_FORMS_DEBUG_INFO_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok {no_abstract_code,no_abstract_code,true}"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The attribute round-trip case: an explicit `-vsn` and a `-behaviour` in the artifact.
+fn attributes_roundtrip_case() -> Case {
+    Case {
+        id: "selfhost/explicit_vsn_and_behaviour_attributes_reach_the_attributes_chunk",
+        description: "the A.9 artifact/source relation: an explicit -vsn(\"3.1\") and an \
+                      -behaviour(gen_server) handed to compile:forms/2 are what the produced \
+                      artifact's attributes chunk carries — the explicit vsn replaces the \
+                      compiler's md5-derived integer, so the chunk value is source-derived",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_ATTRIBUTES_ROUNDTRIP_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok {[{behaviour,[gen_server]},{vsn,[51,46,49]}],[51,46,49],[gen_server]}"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The warning case: diagnostics reported, the unused-function one suppressible, object code
+/// unchanged.
+fn warnings_case() -> Case {
+    Case {
+        id: "selfhost/warning_diagnostics_and_nowarn_unused_function",
+        description: "the A.9 diagnostic surface: [return_warnings] reports erl_lint's \
+                      {unused_var, 'Y'} and {unused_function, {unused, 0}} for the forms, \
+                      [nowarn_unused_function] suppresses exactly the second, and the produced \
+                      Code chunk is identical either way (the option changes the diagnostic \
+                      list, not the object code)",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_WARNINGS_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some(
+                "ok {true,true,[{erl_lint,{unused_var,'Y'}},{erl_lint,{unused_function,{unused,0}}}],\
+                 [{erl_lint,{unused_var,'Y'}}]}",
+            ),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The `warnings_as_errors` case: the same warning becomes a failed compile.
+fn warnings_as_errors_case() -> Case {
+    Case {
+        id: "selfhost/warnings_as_errors_turns_a_warning_into_a_compile_error",
+        description: "the A.9 option effect on the compile result: with [warnings_as_errors] \
+                      the same forms are refused as {error, [], Warnings} carrying the very \
+                      diagnostic the flag-free compile reported as a warning, and no artifact \
+                      is produced",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_WARNINGS_AS_ERRORS_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok {true,[{erl_lint,{unused_var,'Y'}}],[{erl_lint,{unused_var,'Y'}}]}"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The error-diagnostic case: the `{error, [{File, Diags}], []}` shape, the lint
+/// description, the form's own line, and the `return`/`return_errors` equivalence.
+fn error_diagnostics_case() -> Case {
+    Case {
+        id: "selfhost/error_diagnostics_report_the_lint_error_and_its_line",
+        description: "the A.9 error surface: a form list with an unbound variable is refused \
+                      with {error, [{File, [{Line, Module, Description}]}], []} — the empty file \
+                      element, the form's own annotation line, and erl_lint's unbound_var — and \
+                      the [return] shorthand produces the identical error list",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_ERROR_DIAGNOSTICS_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok {true,true,[{9,erl_lint,{unbound_var,'X'}}]}"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The chunk-view case: `beam_lib:info/1` and `beam_lib:chunks/2` agree about the image.
+fn chunk_view_case() -> Case {
+    Case {
+        id: "selfhost/beam_lib_info_and_chunks_agree_on_the_produced_artifact",
+        description: "the A.9 artifact structure: beam_lib:info/1 of a produced image lists \
+                      unique chunk ids in ascending file positions, includes every chunk the \
+                      loader needs (AtU8/Code/StrT/ImpT/ExpT), and every listed chunk is \
+                      actually extractable with beam_lib:chunks/2",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Eval {
+            expr: SELFHOST_CHUNK_VIEW_EXPR,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some("ok true"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The write-route case: `[binary]` and `{outdir, Dir}` produce the same object code.
+fn write_route_case() -> Case {
+    Case {
+        id: "selfhost/binary_and_outdir_compile_routes_produce_identical_object_code",
+        description: "the A.9 write-route relation: one staged source compiled with the \
+                      file-free [binary] form and with {outdir, Dir} yields the same bytes, the \
+                      same Code chunk and the same beam_lib:md5/1 image, and the produced file \
+                      is path-free",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Module(ModuleRun {
+            source: SELFHOST_WRITE_SOURCE,
+            module: "selfhost_write",
+            function: "compile_self",
+            arity: 0,
+            args: &[],
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some("1"),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The macro-definition case: `{d, Macro, Value}` selects the compiled branch, and that branch
+/// is the one that runs.
+fn macro_case() -> Case {
+    Case {
+        id: "selfhost/macro_definition_selects_the_compiled_branch",
+        description: "the A.9 option effect on the object code: one staged -ifdef source \
+                      compiled with and without {d, 'SELFHOST_BRANCH', 1} yields different Code \
+                      chunks, and the artifact the define produced — loaded through \
+                      code:add_patha/1 + code:load_file/1 — executes the defined branch",
+        contracts: &[Contract::BeamAsm, Contract::Build],
+        kind: CaseKind::Module(ModuleRun {
+            source: SELFHOST_MACRO_SOURCE,
+            module: "selfhost_macro",
+            function: "compile_self",
+            arity: 0,
+            args: &[],
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some("1"),
+            exit_code: 0,
+        },
+    }
+}
+
 /// The A.9 self-hosted-build group: the six in-process compile / link shapes plus the
 /// large-real-module expression case and the six relation cases the expression route adds
 /// (two-run determinism, artifact-versus-source attributes and chunk set, sibling header,
 /// route independence, an extra include directory, and `-include_lib`).
+///
+/// The trailing thirteen cases are the **artifact** block: the compiler's real output observed
+/// on the produced `.beam` (the `debug_info` matrix, the `deterministic` option effect, the
+/// `epp` front end, the `compile:forms/2` route — loaded and executed — a real stdlib module
+/// compiled in-process and executed, the `debug_info` chunk round trip, the attribute round
+/// trip, the warning/error diagnostic surfaces, the chunk view, and the two write routes) plus
+/// the two module-run route cases (`{outdir, Dir}` versus `[binary]`, and the `{d, …}` define).
 pub(crate) fn group() -> Vec<Case> {
     vec![
         case(),
@@ -1519,6 +2094,19 @@ pub(crate) fn group() -> Vec<Case> {
         two_route_case(),
         include_dir_case(),
         include_lib_case(),
+        debug_info_case(),
+        deterministic_case(),
+        parse_forms_case(),
+        forms_load_case(),
+        real_module_exec_case(),
+        forms_debug_info_case(),
+        attributes_roundtrip_case(),
+        warnings_case(),
+        warnings_as_errors_case(),
+        error_diagnostics_case(),
+        chunk_view_case(),
+        write_route_case(),
+        macro_case(),
     ]
 }
 
@@ -1535,13 +2123,14 @@ mod tests {
     }
 
     #[test]
-    fn the_group_is_the_six_routes_and_the_seven_expression_cases() {
+    fn the_group_is_the_six_routes_the_seven_relations_and_the_thirteen_artifact_cases() {
         let cases = group();
         assert_eq!(
             cases.len(),
-            13,
+            26,
             "the group is the two compile:file/2 routes plus the stdlib, pair, code-path, \
-             file-borne-documentation, large-real-module and six file-free relation cases"
+             file-borne-documentation, large-real-module and six file-free relation cases, plus \
+             the thirteen artifact cases appended after them"
         );
         assert_eq!(
             cases[0].id,
@@ -2222,6 +2811,216 @@ mod tests {
         assert!(
             source.contains("-include_lib(\"kernel/include/file.hrl\")."),
             "the case's subject must resolve its header through include_lib"
+        );
+    }
+
+    /// The **artifact** block: thirteen cases appended after the group's original thirteen, all
+    /// asserting on the compiler's real output (the produced `.beam`) or on the compiled
+    /// module's behaviour, and none of them on a compiler-release constant.
+    #[test]
+    fn the_artifact_cases_pin_the_produced_beam_and_never_a_release_constant() {
+        let cases = group();
+        let block = &cases[13..];
+        assert_eq!(block.len(), 13, "the artifact block is thirteen cases");
+        for (index, id) in [
+            (
+                13usize,
+                "selfhost/compile_file_default_omits_abstract_code_and_debug_info_adds_the_forms",
+            ),
+            (
+                14,
+                "selfhost/deterministic_keeps_the_object_code_but_strips_the_source_path",
+            ),
+            (
+                15,
+                "selfhost/epp_parse_file_reads_a_real_stdlib_source_into_forms",
+            ),
+            (
+                16,
+                "selfhost/compile_forms_produces_a_loadable_module_and_executes_it",
+            ),
+            (
+                17,
+                "selfhost/in_process_compile_of_a_real_stdlib_module_executes_its_functions",
+            ),
+            (18, "selfhost/debug_info_chunk_carries_the_input_forms"),
+            (
+                19,
+                "selfhost/explicit_vsn_and_behaviour_attributes_reach_the_attributes_chunk",
+            ),
+            (20, "selfhost/warning_diagnostics_and_nowarn_unused_function"),
+            (
+                21,
+                "selfhost/warnings_as_errors_turns_a_warning_into_a_compile_error",
+            ),
+            (
+                22,
+                "selfhost/error_diagnostics_report_the_lint_error_and_its_line",
+            ),
+            (
+                23,
+                "selfhost/beam_lib_info_and_chunks_agree_on_the_produced_artifact",
+            ),
+            (
+                24,
+                "selfhost/binary_and_outdir_compile_routes_produce_identical_object_code",
+            ),
+            (25, "selfhost/macro_definition_selects_the_compiled_branch"),
+        ] {
+            assert_eq!(cases[index].id, id, "the artifact block keeps its order");
+        }
+        // The eleven expression cases: the file-free route (no case directory), a relation or a
+        // source-derived projection as the golden, and never a compiler-release artifact.
+        for index in 13..24 {
+            let case = &cases[index];
+            let (expr, extra_argv, probe) = eval_of(&cases, index);
+            assert_eq!(extra_argv, &[] as &[&str], "case {}: no CLI flag", case.id);
+            assert_eq!(probe, Probe::Value, "case {}: the golden is a `~w` value", case.id);
+            assert!(
+                !expr.contains("catch"),
+                "case {}: the raise must not be caught",
+                case.id
+            );
+            assert!(
+                !expr.contains("erlang:md5") && !expr.contains("phash2"),
+                "case {}: no compiler-release hash may reach the golden",
+                case.id
+            );
+            assert!(
+                !expr.contains("{outdir") && !expr.contains("code:which"),
+                "case {}: an expression case writes no artifact",
+                case.id
+            );
+            for forbidden in [" V", " C", " R"] {
+                assert!(
+                    !expr.contains(&format!("{forbidden} =")),
+                    "case {}: the probe wrapper already binds that variable",
+                    case.id
+                );
+            }
+            // Each case observes a distinct property of what the compiler produced or returned.
+            let (_, observation) = [
+                (13usize, "beam_lib:chunks(WithDebug, [abstract_code])"),
+                (14, "beam_lib:md5(Deterministic)"),
+                (15, "epp:parse_file(\"lib/stdlib/src/ordsets.erl\", [])"),
+                (16, "code:load_binary(selfhost_forms_mod"),
+                (17, "code:load_binary(selfhost_real_ordsets"),
+                (18, "beam_lib:chunks(WithDebug, [abstract_code])"),
+                (19, "beam_lib:chunks(Bin, [attributes])"),
+                (20, "beam_lib:chunks(BinWarned, [\"Code\"])"),
+                (21, "{error, [], AsErrors}"),
+                (22, "{error, [{File, Diags}], []}"),
+                (23, "beam_lib:info(Bin)"),
+            ][index - 13];
+            assert!(
+                expr.contains(observation),
+                "case {}: the case needs {observation:?}",
+                case.id
+            );
+        }
+        // The two module-run route cases: an integer golden, its own module (so the temp dirs
+        // never collide), the staged-source write before the compile it feeds, and no `catch`.
+        for index in 24..26 {
+            let case = &cases[index];
+            assert_eq!(case.golden.stdout, Some("1"), "case {}", case.id);
+            assert_eq!(case.kind_label(), "module-run");
+            let run = run_of(case);
+            assert_eq!(run.function, "compile_self");
+            assert_eq!(run.arity as usize, run.args.len());
+            assert!(run.nif.is_none(), "the routes need no C/NIF fixture");
+            assert!(
+                !run.source.contains("catch"),
+                "case {}: the raise must not be caught",
+                case.id
+            );
+            assert!(
+                run.source.contains("compile:file(") && run.source.contains("beam_lib:"),
+                "case {}: the case compiles and reads the artifact back",
+                case.id
+            );
+        }
+        assert_eq!(run_of(&cases[24]).module, "selfhost_write");
+        assert_eq!(run_of(&cases[25]).module, "selfhost_macro");
+        for (index, write_needle, compile_needle) in [
+            (24usize, "file:write_file(Source, lib_source())", "compile:file(Source,"),
+            (25, "file:write_file(Source, lib_source())", "compile:file(Source,"),
+        ] {
+            let source = run_of(&cases[index]).source;
+            let write = source.find(write_needle).expect("staging write");
+            let compile = source.find(compile_needle).expect("compile");
+            assert!(
+                write < compile,
+                "case {}: the route is staged write-first",
+                cases[index].id
+            );
+        }
+    }
+
+    /// The write-route relation: both compile entry points compared against **each other**, and
+    /// the `{outdir, Dir}` write preceded by the file-free compile it is compared with.
+    #[test]
+    fn the_write_route_case_compares_the_binary_and_outdir_artifacts() {
+        let cases = group();
+        let source = run_of(&cases[24]).source;
+        for needle in [
+            "compile:file(Source, [binary | Opts])",
+            "compile:file(Source, [{outdir, Dir} | Opts])",
+            "file:read_file(Beam)",
+            "beam_lib:md5(FromBinary)",
+            "beam_lib:md5(FromFile)",
+            "beam_lib:chunks(FromBinary, [\"Code\"])",
+            "beam_lib:chunks(FromFile, [\"Code\"])",
+            "FromBinary =:= FromFile",
+            "Md5Binary =:= Md5File",
+            "CodeBinary =:= CodeFile",
+            "binary:match(FromFile, list_to_binary(Dir))",
+        ] {
+            assert!(source.contains(needle), "the relation needs {needle:?}");
+        }
+        // The subject must be a module of its own: writing the `{outdir, Dir}` artifact under
+        // the case module's own name would overwrite the module running the case.
+        assert!(
+            source.contains("-module(selfhost_write_lib).\\n-export([double/1])."),
+            "the staged subject is a distinct module"
+        );
+        assert!(!source.contains("phash2"), "no compiler-release hash");
+    }
+
+    /// The macro case: the `{d, …}` define must change the object code, and the executed branch
+    /// must be the defined one.
+    #[test]
+    fn the_macro_case_pins_the_define_effect_and_the_executed_branch() {
+        let cases = group();
+        let source = run_of(&cases[25]).source;
+        for needle in [
+            "compile:file(Source, [{d, 'SELFHOST_BRANCH', 1} | Opts])",
+            "compile:file(Source, Opts)",
+            "CodeDefined =/= CodeUndefined",
+            "Defined =/= Undefined",
+            "selfhost_macro_lib:branch()",
+            "selfhost_macro_lib:common()",
+            "true = code:add_patha(Dir)",
+            "{module, selfhost_macro_lib} = code:load_file(selfhost_macro_lib)",
+            "-ifdef('SELFHOST_BRANCH').",
+            "-else.",
+            "-endif.",
+        ] {
+            assert!(source.contains(needle), "the route needs {needle:?}");
+        }
+        // The two compiles must be the file-free form (no second write is needed), and the
+        // artifact that is *loaded* must be the one the define produced.
+        assert!(
+            source.contains("[binary, no_spawn_compiler_process, deterministic]"),
+            "both compiles are the file-free in-process form"
+        );
+        let write = source
+            .find("file:write_file(filename:join(Dir, \"selfhost_macro_lib.beam\"), Defined)")
+            .expect("the defined artifact is written");
+        let load = source.find("code:load_file").expect("load");
+        let branch = source.find("selfhost_macro_lib:branch()").expect("call");
+        assert!(
+            write < load && load < branch,
+            "the defined artifact is written, loaded, then called"
         );
     }
 }
