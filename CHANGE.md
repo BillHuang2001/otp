@@ -8,6 +8,117 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-17 — Milestone 15: the refc-binary growth policy, the `SizingPolicy` seam, off-heap reclamation + `BinVheap`, the copy-out's learned size hint, empty-destination copy-out, and the active-input driver channel
+
+Scope: the milestone that closed the measurement-led backlog from Milestone 14 and turned three
+"one-walk-too-many" costs into structures. The headline **algorithmic/data-structure** changes are
+(a) `RefcBinary` became **capacity-carrying** (`GrowOutcome::{InPlace, Moved}`), so a repeated append
+grows in place instead of reallocating on every call; (b) object sizing got a **policy seam**
+(`SizingPolicy`/`size_object_with`) so the copier, the gate and the collector can price different
+destination models from one traversal; (c) the off-heap **`BinVheap`** replaced the per-slice
+`mso::OffHeap` walk, making `erlang:memory(binary)` an O(reachable) chain sum rather than an O(slots)
+scan of never-compacted slots; (d) the BIF-result copy-out **learns the payload's size from its own
+exhaustion error** and grows the nursery *before* copying (`copy_out_hint` + `hint_grow_gate`); and
+(e) the collector publishes a **chain-summed `HeapFootprint`**, so `erlang:memory/1`'s nine keys are
+read from one structure instead of re-derived. Run `tools/differential/gate.sh` (or the 16-way
+per-case sweep) for the live figure; the recorded state is `total=3156 agree=3155 mismatch=0
+unsupported=1 skipped=0` with the single allowlisted gap `wire/new_fun_ext_encode` (A.5).
+
+- **Area:** `erts_rust/crates/beam_alloc` (`src/refc.rs`) — **data structure, the append hot path**
+- **Change:** `RefcBinary` now carries an explicit **capacity** in a 32-byte header and a growth entry
+  point that reports `GrowOutcome::{InPlace, Moved}`: a binary with spare capacity is extended where it
+  lives (the handle's base address is unchanged, so live term references stay valid), and only a
+  capacity-exhausted grow allocates and copies. A repeated `binary:copy`-style append loop is therefore
+  **amortized linear** instead of quadratic. Measured **87.7×** (in-place path) and **106.2×** (whole
+  workload, including the copy-out) on the paired A/B. Pinned by `tests/refc_growth.rs`.
+- **Area:** `erts_rust/crates/beam_term` — **pluggable object pricing**
+- **Change:** Object sizing moved behind a `SizingPolicy` seam (`size_object_with`,
+  `size_object_bounded_with`): the *walk* is shared and the *price of a destination shape* is the
+  policy's. This is what lets `beam_message`'s copier price a cross-process destination differently
+  from an in-process one without a second traversal — the two were mutation-proven to be different cost
+  models, not a duplicated walk (`beam_message`'s copier dropped 963 → 782 lines by adopting the seam).
+  Two pricing defects were found and fixed against the C while doing it: a zero-arity `RECORD` priced
+  `0` words (must be `1`), and `make_pid_data`'s header handling.
+- **Area:** `erts_rust/crates/beam_term` — **comparison totality**
+- **Change:** Cross-node term comparison now takes a `LocalNodeId { sysname, creation }` (`cmp_with_local_node`)
+  instead of assuming the local node is the atom `nonode@nohost`, and the whole **header space** is
+  tabulated for `size_object` (not just the tags the corpus happened to reach). The compare ladder is
+  pinned by **459 oracle verdicts** (values *and* orderings), not by assertions written from the code.
+- **Area:** `erts_rust/crates/beam_gc` — **the off-heap accounting model**
+- **Change:** Added `src/bin_vheap.rs` (a per-process virtual binary heap over refc-binary payloads),
+  `src/offheap.rs` (the reclamation seam: a rooted set in ⇒ a retain predicate out) and
+  `src/footprint.rs` (`HeapFootprint`: chain-summed young/old/mso/off-heap occupancy). The collector
+  publishes one footprint per collection, so `erlang:memory/1`'s nine keys cost one read.
+  `src/ACCOUNTING.md` now documents all nine keys and which of them are *accounting* rather than
+  footprint (see the caveat below). Heap sizing became **two-step fullsweep** (a full sweep that finds
+  the heap still above a watermark resizes once more rather than converging one collection per step).
+  The generational Cheney collector, `GenImmix` mature-generation option and the barrier-free
+  young/mso split keep their existing contracts.
+- **Area:** `erts_rust/crates/beam_process` — **a heap-limit verdict type**
+- **Change:** Max-heap enforcement returns a typed `HeapLimitVerdict { Within, Kill, Log }` computed
+  from a `MaxHeapSetting` (`Unlimited | Words(n) | BytesPerProcess(n)`), and collection decisions are
+  carried by a `collect_kind` result instead of re-tested booleans. `record_max_heap_verdict` now
+  **early-returns when the limit is unlimited** — it had been walking the off-heap slot table on every
+  slice, which is what made `emqx_base62:encode` super-linear (see the runtime entry).
+- **Area:** `erts_rust/crates/beam_engine` — **the execution-engine IR seam, measured**
+- **Change:** An exhaustive census of the 108 `Instr` variants found **95 EXECUTED + 13 zero-corpus +
+  0 genuine gaps** (the previously "blocked" 59 were degenerate `Operand::Nil` probes, already
+  implemented) — the interpreter's opcode surface is complete for the whole-OTP `.beam` census.
+  Arithmetic `private_append` now appends in place (interpreter **1.31×**, baseline JIT **1.79×**), and
+  the native tier charges **block-entry reductions** once per block rather than once per instruction.
+  The `(func, pc)` compiled-block cache key became durable so a re-entry does not recompile.
+- **Area:** `erts_rust/crates/beam_io` — **the driver→owner completion channel and the active-input channel**
+- **Change:** A driver callback that completes asynchronously now hands its result to the owner through
+  an explicit completion channel drained at one point (`drain_io_completions`), with an async-op queue
+  (`INET_MAX_ASYNC = 1`, an `ealready` answer instead of a drop), `driver_output2` adopted end to end
+  (the split read now crosses the whole stack), `close_fd`/`OwnedFd`, and **one** 61-row
+  `ERRNO_NAMES` table (the per-call tables had drifted; `enotsup` was wrong). Active mode gained a real
+  input channel (`{tcp,S,Data}` / `{udp,S,IP,Port,Data}` / `{tcp|udp_passive,S}`) and the accept path
+  became a state machine (`src/drivers/inet/accept.rs`) with `tcp_inet_copy` option inheritance.
+- **Area:** `erts_rust/crates/beam_abi` — **the driver C ABI's remaining hooks**
+- **Change:** The driver port pointer gained a real `ERL_DRV_PORT` operand, `driver_failure(P, 0)`
+  closes the port with `eof` (the zero-length reason is not a message), `erl_errno_id` became a
+  **permanent** store (a driver may read it after the failing call returns), and `DriverHost::output2`
+  defaulted so an embedder that does not implement the split read still links.
+- **Area:** `erts_rust/crates/beam_ets` — **reclamation**
+- **Change:** An index's capacity is reclaimed when its table shrinks (measured 138 → 38 words on the
+  churn shape), and the access/concurrency audit confirmed the semantics the C enforces
+  (`protected`/`private`/`public` × `read_concurrency`/`write_concurrency`) rather than adding a guard.
+  `ordered_set`'s interior was re-verified to be a **K-ary B+-tree**, not the AVL tree Milestone 1
+  shipped — the deletion rebalance included.
+- **Area:** `erts_rust/crates/beam_rt` — **two real memory-safety defects, found by cross-checks**
+- **Change:** (1) `erlang:system_info/1` handed out a value that lived on the **reset-per-call scratch
+  region**, so a retained value was silently wrong (a well-formed `"BEAM"` for `version`) or a
+  dangling pointer (SIGSEGV) — hit by `epp:predef_macros/2` on *every* compile. The scratch region's
+  rewind now refuses to recycle a region a live term may occupy, and the handed-out value is copied out
+  (`info_heap_tainted` valve + `relocate_off_scratch`). (2) The BIF-result copy-out could leave the
+  destination table pointing at rewind-unsafe memory: a copy-out is now gated on `safe_to_rewind` (the
+  defect aborted 3 runs in 6 with `external_term`/SIGABRT).
+- **Area:** `erts_rust/crates/beam_rt` — **the copy-out learns a size, and the off-heap mirror is gone**
+- **Change:** `RuntimeContext::copy_out_hint` is the copier's **own** reported shortfall (the exhaustion
+  error carries it, so no second traversal), and `hint_grow_gate` spends it on a no-relocation
+  `Process::grow_nursery` whenever the young space's available words fall below the hint plus a margin.
+  The *successful first attempt* is now the common path instead of a refused attempt plus a
+  five-traversal sizing walk (three of them hashing): `copy_bound/ets_copy` **0.605×**, refusals
+  **0.332 → 0.003 per op**. Separately, a per-slice mirror of `mso::OffHeap` was made live and then
+  walked once per slice by max-heap accounting; deleting it took the published
+  `emqx_base62:encode` benchmark from **7.14× → 0.265×** of the oracle — a quadratic, not an
+  interpreter, regression.
+- **Area:** `erts_rust/crates/beam_rt` — **A.9 self-hosted breadth**
+- **Change:** The in-process compile sweep reached **520 of 772** sources measured with **502
+  byte-identical**, and a staged `epp → erl_scan → erl_lint → compile` chain (the compiler compiling
+  the compiler) is **byte-identical** in 532 s. The 14 breadth failures still open have one cause
+  (`code:get_path/0` returns 5 entries where the oracle returns 36); 1 more is `zlib:compress/1` not
+  being libz-byte-exact.
+- **Area:** `erts_rust/crates/beam_loader`
+- **Change:** 13 additional `.beam` validation checks (malformed atom/literal/fun chunks are rejected
+  with a typed error rather than lowering to a nonsense IR), pinned by 61 new tests.
+- **Area:** `erts_rust/tools/differential`, `erts_rust/tools/bench`
+- **Change:** The conformance corpus grew **2967 → 3156** cases across all nine contracts (still
+  `0` mismatches, the one allowlisted A.5 gap). The benchmark driver gained matched A/B rounds pinned
+  to one core with both sides named (`m16`, `m17` records): a published regression inside a round
+  carried its own attribution, and the two-sided numbers are recorded with the host's load average.
+
 ## 2026-10-16 — Milestone 14: the A.9 in-process-compile sweep reaching 86/86, the `Nursery::contains` O(#spaces) admission walk, a durable compiled-block cache key, two more built-in drivers, and the `eval` bit-string closure
 Scope: the milestone that finished the A.9 in-process-compiler route (every `lib/stdlib/src/*.erl` the
 oracle can compile in-process now compiles here **byte-identically**), and then removed the runtime-wide
