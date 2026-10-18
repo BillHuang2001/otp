@@ -24,10 +24,12 @@
 %% can be compared directly.
 %%
 %% Nothing here blocks: the datagram is sent before the receive is entered, so the answer is
-%% a fact about the socket pair, not about a parked process. The printed term is fully
+%% a fact about the socket pair, not about a parked process. The printed terms are
 %% **normalised** — the ephemeral ports differ between runs by construction, so the fixture
-%% compares them itself and prints booleans:
+%% never compares them textually; the harness pairs the two lines up instead:
 %%
+%%   udp_ports=[PA,PB]          the two bound ports, which the harness maps to placeholders
+%%                              (that is the only run-dependent text either side prints)
 %%   parity={payload_ok,true}   the datagram arrived, intact, from socket B's own port
 -module(cpl_parity).
 -export([go/0]).
@@ -37,6 +39,7 @@ go() ->
     {ok, PA} = inet:port(A),
     {ok, B} = gen_udp:open(0, [binary, {active, false}]),
     {ok, PB} = inet:port(B),
+    io:format("udp_ports=~p~n", [[PA, PB]]),
     ok = gen_udp:send(B, {127, 0, 0, 1}, PA, <<"hi">>),
     R = gen_udp:recv(A, 0, 5000),
     gen_udp:close(A),
