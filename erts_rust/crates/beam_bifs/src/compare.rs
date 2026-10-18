@@ -37,6 +37,23 @@
 //! `==`/`/=` and `<` `>` `=<` `>=` order, where `1 == 1.0`). This crate never
 //! re-derives term order (crate `CONTEXT.md`, Constraints).
 //!
+//! # ... but the local node is supplied, never assumed
+//!
+//! A mixed **internal/external** `pid`, `port` or `ref` pair carries its node
+//! implicitly on the internal side, so the C compares the pair field by field with
+//! `erts_this_node` substituted ([`cmp_arith_with_local_node`] /
+//! [`cmp_with_local_node`]). The context-free [`cmp`]/[`cmp_arith`] have no
+//! "this node" to substitute, so they fall back to a documented class ladder — a
+//! **no-context convention**, not the oracle's answer. Every ordering BIF here
+//! therefore goes through [`cmp_arith_node`]/[`cmp_exact_node`], which install the
+//! node the context reports ([`local_node_id`], the [`BifContext::local_node`] seam
+//! — `nonode@nohost` / creation 0 with no hook) *only* for a pair
+//! [`access::is_mixed_identity_pair`] recognises. That keeps the hot path
+//! byte-identical (`local_node_id` costs an atom-table lookup or a hook call, and
+//! almost no comparison is such a pair) while making the mixed pairs agree with the
+//! oracle: `<0.10.0> =:= <0.10.0>` decoded from a `NEW_PID_EXT` naming the local
+//! node is `true`, and `nonode@nohost` vs `zzz@host` is ordered by **name**.
+//!
 //! # Hashing is never re-implemented here either
 //!
 //! The two hashes are *term identity* siblings of the ordering above (all three are
@@ -71,58 +88,135 @@
 use core::cmp::Ordering;
 
 use beam_common::{BeamError, Result};
-use beam_term::compare::{cmp, cmp_arith};
+use beam_term::compare::{
+    cmp, cmp_arith, cmp_arith_with_local_node, cmp_with_local_node, LocalNodeId,
+};
 use beam_term::hashing::{make_hash, make_hash2};
 use beam_term::{AtomTable, Eterm, TermError};
 
+use crate::access;
 use crate::arith;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 use crate::registry::BifRegistry;
 
+// ---------------------------------------------------------------------------
+// The local-node seam, resolved once per BIF call
+// ---------------------------------------------------------------------------
+
+/// The runtime's own node as the [`LocalNodeId`] a mixed internal/external
+/// `pid`/`port`/`ref` comparison substitutes for the internal operand's implicit
+/// node — or `None` when the context cannot name one (no [`crate::LocalNode`] hook
+/// installed and the `nonode@nohost` atom absent from this context's atom table).
+///
+/// The value is `Copy`, so every caller resolves it **once**, before taking
+/// [`BifContext::atoms`], and threads it through its whole comparison (a sort's
+/// every element, a list walk's every iteration).
+///
+/// [`LocalNodeId::sysname`] is an atom **term** (the C's `CMP_NODES` orders node
+/// names with `erts_cmp_atoms`, i.e. lexicographically over the name bytes), so the
+/// `Atom` the seam reports is converted with [`beam_term::make_atom`] — the frozen
+/// immediate encoding, not a re-derivation.
+pub(crate) fn local_node_id(ctx: &mut BifContext<'_>) -> Option<LocalNodeId> {
+    let (node, creation) = ctx.local_node()?;
+    Some(LocalNodeId::new(beam_term::make_atom(node), creation))
+}
+
+/// The **arithmetic** (`==`) term order the `<` `>` `=<` `>=` operators and the
+/// ordering `lists` functions use — node-aware for a mixed internal/external
+/// `pid`/`port`/`ref` pair, otherwise exactly [`cmp_arith`].
+///
+/// The node is consulted only when [`access::is_mixed_identity_pair`] says the pair
+/// can possibly be decided by it, so a comparison of two numbers (or two atoms, or
+/// two tuples, …) takes the very same path it always did. With `local == None`
+/// (a context that cannot name its node) every pair keeps the documented
+/// class-ladder convention.
+pub(crate) fn cmp_arith_node(
+    a: Eterm,
+    b: Eterm,
+    local: Option<LocalNodeId>,
+    atoms: &AtomTable,
+) -> Ordering {
+    match local {
+        Some(local) if access::is_mixed_identity_pair(a, b) => {
+            cmp_arith_with_local_node(a, b, local, atoms)
+        }
+        _ => cmp_arith(a, b, atoms),
+    }
+}
+
+/// The **exact** (`=:=`) term order — the node-aware twin of [`cmp_arith_node`],
+/// for `=:=`/`=/=` and `erts_internal:cmp_term/2`.
+///
+/// `==` and `=:=` agree in every mixed internal/external arm (they compare
+/// `serial`/`number`/node and ref ids, where the two orders do not diverge), so the
+/// two helpers differ only where [`cmp`] and [`cmp_arith`] always did.
+pub(crate) fn cmp_exact_node(
+    a: Eterm,
+    b: Eterm,
+    local: Option<LocalNodeId>,
+    atoms: &AtomTable,
+) -> Ordering {
+    match local {
+        Some(local) if access::is_mixed_identity_pair(a, b) => {
+            cmp_with_local_node(a, b, local, atoms)
+        }
+        _ => cmp(a, b, atoms),
+    }
+}
+
 /// `A == B` — arithmetic order.
 fn eq_arith(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    ctx.boolean(cmp_arith(args[0], args[1], ctx.atoms()) == Ordering::Equal)
+    let local = local_node_id(ctx);
+    ctx.boolean(cmp_arith_node(args[0], args[1], local, ctx.atoms()) == Ordering::Equal)
 }
 
 /// `A /= B` — arithmetic order.
 fn ne_arith(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    ctx.boolean(cmp_arith(args[0], args[1], ctx.atoms()) != Ordering::Equal)
+    let local = local_node_id(ctx);
+    ctx.boolean(cmp_arith_node(args[0], args[1], local, ctx.atoms()) != Ordering::Equal)
 }
 
 /// `A =:= B` — exact order.
 fn eq_exact(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    ctx.boolean(cmp(args[0], args[1], ctx.atoms()) == Ordering::Equal)
+    let local = local_node_id(ctx);
+    ctx.boolean(cmp_exact_node(args[0], args[1], local, ctx.atoms()) == Ordering::Equal)
 }
 
 /// `A =/= B` — exact order.
 fn ne_exact(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    ctx.boolean(cmp(args[0], args[1], ctx.atoms()) != Ordering::Equal)
+    let local = local_node_id(ctx);
+    ctx.boolean(cmp_exact_node(args[0], args[1], local, ctx.atoms()) != Ordering::Equal)
 }
 
 /// `A < B` — arithmetic order.
 fn lt(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    ctx.boolean(cmp_arith(args[0], args[1], ctx.atoms()) == Ordering::Less)
+    let local = local_node_id(ctx);
+    ctx.boolean(cmp_arith_node(args[0], args[1], local, ctx.atoms()) == Ordering::Less)
 }
 
 /// `A > B` — arithmetic order.
 fn gt(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    ctx.boolean(cmp_arith(args[0], args[1], ctx.atoms()) == Ordering::Greater)
+    let local = local_node_id(ctx);
+    ctx.boolean(cmp_arith_node(args[0], args[1], local, ctx.atoms()) == Ordering::Greater)
 }
 
 /// `A =< B` — arithmetic order.
 fn le(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    ctx.boolean(cmp_arith(args[0], args[1], ctx.atoms()) != Ordering::Greater)
+    let local = local_node_id(ctx);
+    ctx.boolean(cmp_arith_node(args[0], args[1], local, ctx.atoms()) != Ordering::Greater)
 }
 
 /// `A >= B` — arithmetic order.
 fn ge(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    ctx.boolean(cmp_arith(args[0], args[1], ctx.atoms()) != Ordering::Less)
+    let local = local_node_id(ctx);
+    ctx.boolean(cmp_arith_node(args[0], args[1], local, ctx.atoms()) != Ordering::Less)
 }
 
 /// `erts_internal:cmp_term(A, B)` ⇒ `-1 | 0 | 1` in the *exact* order.
 fn cmp_term(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = match cmp(args[0], args[1], ctx.atoms()) {
+    let local = local_node_id(ctx);
+    let value = match cmp_exact_node(args[0], args[1], local, ctx.atoms()) {
         Ordering::Less => -1,
         Ordering::Equal => 0,
         Ordering::Greater => 1,

@@ -25,6 +25,7 @@
 //! `use super::*;` reaches every private item of the provider.
 use super::*;
 use std::cell::Cell;
+use std::collections::VecDeque;
 use beam_io::signal::{Disposition, Signal};
 use beam_io::DriverContext;
 use beam_process::{ProcessState, SignalAtoms};
@@ -192,12 +193,14 @@ fn pump_data(registry: &mut PortRegistry, port: PortId) -> Vec<u8> {
         for event in registry.pump(Duration::from_millis(50)).expect("pump") {
             if let PortEvent::Data {
                 port: source,
-                bytes,
+                read,
                 ..
             } = event
             {
                 if source == port {
-                    return bytes;
+                    // A child's byte stream is a body-only read, so the flat view is the whole
+                    // payload (see [`PortEvent::Data`]).
+                    return read.flattened();
                 }
             }
         }
@@ -240,7 +243,7 @@ fn pump_events_until_exit(
                 );
             }
             match event {
-                PortEvent::Data { bytes, .. } => data.push(bytes),
+                PortEvent::Data { read, .. } => data.push(read.flattened()),
                 PortEvent::Exited { .. } => exited = true,
                 _ => {}
             }
@@ -298,6 +301,9 @@ fn test_meta(command: &str) -> PortMeta {
         driver_monitors: None,
         input: Cell::new(0),
         output: Cell::new(0),
+        exit_status_taken: Cell::new(false),
+        held_lines: VecDeque::new(),
+        held_since: Cell::new(None),
     }
 }
 
@@ -3219,6 +3225,168 @@ fn the_trailing_noeol_flush_is_delivered_after_the_exit_status() {
         ),
         None => skip_oracle_check("the `exit_status`/`noeol` delivery order"),
     }
+}
+
+/// The metadata of a **child** port in `{line, 512}` mode — the state the exit-status deferral
+/// reads ([`PortMeta::owes_exit_status`]).
+///
+/// `exit_status` models the `exit_status` **option** plus the OS child it applies to: a port
+/// opened without the option (`false`) and a port with no child at all (an `{fd, N}` or a driver
+/// port, modelled by [`child_meta_without_child`]) both owe nothing, so neither can ever hold a
+/// frame back.
+fn child_meta(exit_status: bool) -> PortMeta {
+    let mut meta = test_meta("printf 'xx'");
+    meta.line = Some(512);
+    if exit_status {
+        meta.notify_exit = true;
+        meta.os_pid = Some(4242);
+    }
+    meta
+}
+
+/// The same child metadata as [`child_meta`], but for a port that asked for `exit_status` while
+/// owning **no** OS child (the `{fd, N}` / driver-port shape): the option is set, so a `naive`
+/// "does it want a status" test would be true, and the port would hold its frames forever.
+fn child_meta_without_child() -> PortMeta {
+    let mut meta = child_meta(false);
+    meta.notify_exit = true;
+    meta
+}
+
+/// One `noeol` line frame for port `number`, as the round's harvest builds it.
+fn noeol_frame(number: u64, bytes: &[u8]) -> PortEvent {
+    PortEvent::Line {
+        port: PortId::new(number),
+        header: Vec::new(),
+        bytes: bytes.to_vec(),
+        eol: false,
+        stream: StreamType::Binary,
+        owner: OWNER,
+    }
+}
+
+/// A child port that still **owes** its `{Port, {exit_status, _}}` does not release an
+/// end-of-stream line frame before that status is reported — the deliverable half of the C's
+/// `dd->alive == 1` deferral (`erts/emulator/sys/unix/sys_drivers.c:1230-1244`), and the reason the
+/// delivery order does not depend on whether the poller surfaced the child's read-EOF and its reap
+/// in the same round or in adjacent ones.
+///
+/// This is the unit-level counterpart of
+/// [`the_trailing_noeol_flush_is_delivered_after_the_exit_status`], which pins the same rule
+/// end-to-end against a real child and the oracle.
+#[test]
+fn a_child_port_holds_a_line_frame_until_the_exit_status_is_reported() {
+    let mut registry = PortRegistry::new().expect("a port registry");
+    let number = 9;
+    registry.meta.insert(number, child_meta(true));
+
+    // The round's harvest: the port still owes its status, so the frame is held back instead of
+    // reaching the owner, and the grace clock starts.
+    let mut events = Vec::new();
+    registry.hold_or_report_line(number, noeol_frame(number, b"xx"), &mut events);
+    assert!(
+        events.is_empty(),
+        "a child's trailing frame must not be delivered before its exit status"
+    );
+    assert_eq!(registry.meta[&number].held_lines.len(), 1);
+    assert!(
+        registry.meta[&number].held_since.get().is_some(),
+        "the deferral's grace clock starts with the first held frame"
+    );
+
+    // The status is reported: the frame becomes deliverable at once, and stays in arrival order.
+    registry
+        .meta
+        .get_mut(&number)
+        .expect("the port is live")
+        .exit_status_taken
+        .set(true);
+    registry.release_held_lines(&mut events);
+    assert_eq!(events.len(), 1, "the held frame is released exactly once");
+    assert!(
+        matches!(
+            &events[0],
+            PortEvent::Line { port, bytes, eol: false, .. }
+                if *port == PortId::new(number) && bytes == b"xx"
+        ),
+        "the released event is the held frame itself"
+    );
+    assert!(
+        registry.meta[&number].held_lines.is_empty(),
+        "a released frame is never delivered twice"
+    );
+    assert!(
+        registry.meta[&number].held_since.get().is_none(),
+        "the grace clock is cleared when the frames are released"
+    );
+
+    // A second release reports nothing.
+    registry.release_held_lines(&mut events);
+    assert_eq!(events.len(), 1, "exactly once");
+}
+
+/// A port that owes **no** `exit_status` never holds anything back: no `exit_status` option (the
+/// common case), and the `exit_status`-without-a-child shape (`{fd, N}`, a driver port), where a
+/// naive "was the option asked for" test would defer the frame forever.
+#[test]
+fn a_port_that_owes_no_exit_status_reports_its_line_frame_at_once() {
+    for (label, meta) in [
+        ("without the `exit_status` option", child_meta(false)),
+        ("with `exit_status` but no OS child", child_meta_without_child()),
+    ] {
+        let mut registry = PortRegistry::new().expect("a port registry");
+        let number = 4;
+        registry.meta.insert(number, meta);
+        let mut events = Vec::new();
+        registry.hold_or_report_line(number, noeol_frame(number, b""), &mut events);
+        assert_eq!(events.len(), 1, "{label}: the frame is reported in the round that read it");
+        assert!(
+            registry.meta[&number].held_lines.is_empty(),
+            "{label}: nothing is held back"
+        );
+        assert!(
+            registry.meta[&number].held_since.get().is_none(),
+            "{label}: no grace clock is started"
+        );
+    }
+}
+
+/// The deferral is **bounded**: a frame held for the whole [`EXIT_STATUS_FLUSH_GRACE`] is delivered
+/// even though the status is still owed, so a child that closes its own stdout and keeps running
+/// (which this runtime's port never kills, unlike the oracle's
+/// `driver_failure_eof` → `erts_deliver_port_exit`) can never strand its trailing frame.
+#[test]
+fn a_held_line_frame_is_released_once_the_grace_expires() {
+    let mut registry = PortRegistry::new().expect("a port registry");
+    let number = 11;
+    registry.meta.insert(number, child_meta(true));
+    let mut events = Vec::new();
+    registry.hold_or_report_line(number, noeol_frame(number, b"xx"), &mut events);
+    assert!(events.is_empty());
+
+    // Inside the grace the frame is still held, and the grace is measured from the first hold.
+    registry.release_held_lines(&mut events);
+    assert!(events.is_empty(), "the grace has not elapsed yet");
+
+    let expired = Instant::now()
+        .checked_sub(EXIT_STATUS_FLUSH_GRACE + Duration::from_millis(1))
+        .expect("the grace window fits inside the monotonic clock");
+    registry
+        .meta
+        .get_mut(&number)
+        .expect("the port is live")
+        .held_since
+        .set(Some(expired));
+    registry.release_held_lines(&mut events);
+    assert_eq!(
+        events.len(),
+        1,
+        "the frame is never stranded: the bound releases it anyway"
+    );
+    assert!(
+        registry.meta[&number].owes_exit_status(),
+        "the status is still owed — it would now be delivered after the frame"
+    );
 }
 
 /// `[binary, line]` sets **both** state bits, so each frame's payload is a binary where the/// list stream's is a char list — the frame boundaries are identical.

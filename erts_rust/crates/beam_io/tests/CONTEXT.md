@@ -62,8 +62,50 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 21 suites, 197
-passing; the full crate total is in the parent node's *Test Strategy*.
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 23 suites, **211
+passing / 0 failing**; the whole `-p beam_io` run is **876** (662 lib + 211 integration + 3
+doctests, 2 doctests `ignore`d). Per file:
+
+| Suite | Tests | Suite | Tests |
+|---|---|---|---|
+| `abi_driver.rs` | 21 | `spawn.rs` | 30 |
+| `abi_async.rs` | 8 | `signal.rs` | 21 |
+| `abi_vector.rs` | 7 | `efile.rs` | 16 |
+| `driver_output2.rs` | 6 | `ram_file.rs` | 12 |
+| `driver_table.rs` | 5 | `ddll.rs` | 11 |
+| `driver_seams.rs` | 7 | `poller.rs` | 11 |
+| `abi_lifecycle.rs` | 3 | `cpu_time.rs` | 8 |
+| `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 8 |
+| `abi_busy.rs` | 2 | `inet.rs` | 8 |
+| `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
+| `port_task.rs` | 5 | `udp_inet.rs` | 5 |
+| `port.rs` | 4 | | |
+
+Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channel** end-to-end
+(`PortRegistry::take_completions` after every round, the recipe `beam_rt` follows):
+
+- **`inet_async.rs` (8)** — the `tcp_inet` asynchronous-op queue over real loopback sockets. Rows
+  cross-checked against the `erl` oracle: `the_receive_guard_ladder_agrees_with_the_erl_oracle`
+  (six `TCP_REQ_RECV` replies byte-compared, the oracle's asynchronous connect offsetting the ids),
+  `the_caller_tag_round_trip_agrees_with_the_erl_oracle` (the oracle's own
+  `term_to_binary(make_ref(), [local])` tag, both peer reads, the 4-tuple `{inet_reply,_,ok,Ref}`
+  and the silent zero-length tag) and `closing_a_port_with_an_operation_pending_completes_it_once`
+  (the oracle's reason; its message *count* is a probe property and stays unasserted). Rows that are
+  structural-only (no oracle column): `a_receive_hands_out_an_id_and_the_completion_never_rides_the_reply`,
+  `a_receive_completes_at_the_rounds_async_drive_point`,
+  `an_accept_completion_hands_over_a_descriptor_the_runtime_can_adopt` (the descriptor hand-off;
+  `INET_REQ_FDOPEN` adoption is a crate-local route to the same state the C reaches internally) and
+  `port_notifications_stay_exactly_two_variants` (the compile-time two-arm match).
+- **`udp_inet.rs` (5)** — `the_code_60_recv_is_an_async_request_completed_by_a_later_round` is the
+  datagram half, byte-compared against a real raw `udp_inet` port on every run-specific-independent
+  row: the `[1,0,0]` id reply with nothing staged, `[0]ealready` for a second concurrent receive
+  (which still consumes an id, so the next request is `[1,0,2]`), `[0]exbadport` socket-less,
+  `[0]einval` for a `len != 8` operand, one `InetAsyncResult::Data` completion at the
+  `execute_port_tasks` drive point with `read.flattened()` = `[1,PortHi,PortLo,A,B,C,D,…data]` (the
+  address prefix is shape-compared, each side checking its own sender's port), and `{error, closed}`
+  exactly once for a receive pending at close. The file's other oracle case
+  (`the_covered_control_replies_agree_with_the_erl_oracle`) is the open/bind/setopts/getopts/close
+  gate.
 
 ## Known Issues / Notes for Agents
 - `driver_peekq`/`driver_peekqv` report `vlen == 1` on the Rust host (`AbiHost` publishes the whole
@@ -74,25 +116,39 @@ passing; the full crate total is in the parent node's *Test Strategy*.
 - The fixture's per-callback `log=<path>` is append-mode and per-run scratch directories keep runs
   isolated; `stop_select` cannot see `ErlDrvData`, so it uses a file-scope log path — one port per
   test.
-
+- **An `erl` oracle probe must talk to the driver port it opened.** A `tcp_inet` probe that queues
+  `INET_REQ_ACCEPT` has to connect its peer to the port's *own* `bind` reply, not to a `gen_tcp`
+  listener — otherwise the accept never completes and the probe exits. Read exactly the one message
+  each step owes (the accept's `{inet_async, _, _, {ok, Port2}}` first, then the command's
+  `{inet_reply, _, ok, Ref}`), and on `port_close` skip the ownership `{'EXIT', Port, normal}` that
+  may precede the pending operation's `{inet_async, _, _, {error, closed}}`.
 ## Routing Table
 - `abi_driver.rs` → the end-to-end C-driver path (incl. the driver-queue family round-trip, the
   `outputv`-over-`output` preference, the empty-queue write-readiness case, the `NULL`-`*rbuf`
   `control` reply and the silent-driver output pin)
-- `abi_busy.rs` → the `set_busy_port` state half (the raw API-table hook + the fixture's `busy`
+- `driver_output2.rs` → the `driver_output2`/`driver_output_binary` **header/body split** through a
+  real `PortRegistry`: one driver call = one `ReadMessage { header, body }` notification, the empty
+  header vs `body: None` distinction, two calls in one callback = two messages in arrival order,
+  `input_len` counting the header, the `{line, N}` frame header stamp, and the flat
+  `DriverContext::input()` view- `abi_busy.rs` → the `set_busy_port` state half (the raw API-table hook + the fixture's `busy`
   token and verbs 25/26)
 - `abi_async.rs`, `abi_vector.rs`, `abi_lifecycle.rs`, `abi_start_failure.rs` → the `driver_async`
   completion arms, the `outputv`-only entry, the port-exit adapter, a failing `start`
 - `driver_table.rs`, `driver_registry_slots.rs` → the process-global driver registry
 - `poller.rs`, `port.rs`, `port_task.rs`, `driver_seams.rs` → the reactor, the port, port-task
   scheduling, the driver-declared timer/port-exit seams
+- `inet_async.rs` → the `tcp_inet` **asynchronous-op queue + completion channel** through
+  `PortRegistry` (numeric opcodes, the single receive slot, the caller tag, the accept hand-off and
+  its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
 - `udp_inet.rs`, `ram_file.rs` → the other two built-ins through the real port layer
   (`DriverRegistry::with_builtins` + `PortRegistry` + `Poller`): a loopback UDP datagram round trip
   (`udp_inet`) and the packed opcode/`control` command grammar (`ram_file_drv`), each with an
-  `erl`-oracle cross-check over the reply bytes that skips loudly without `erl`
-  (`udp_inet` also records the documented `recv` divergence from the oracle's async code-60 path)
+  `erl`-oracle cross-check over the reply bytes that skips loudly without `erl`. `udp_inet` also
+  pins the **`PACKET_REQ_RECV`(60) asynchronous** receive (id reply, `ealready`/`exbadport`/`einval`
+  ladder, the `Data` completion with the packed source address as the read's header, the
+  `{error, closed}` teardown) against the real datagram driver
 - `signal.rs`, `cpu_time.rs`, `ddll.rs` → the OS-signal facility, the CPU-time facility, `dlopen`
 - `fixture_builds.rs` → builds + loads every `fixtures/*.c` (a broken fixture is a hard failure)
 - `support/mod.rs`, `cdriver/mod.rs` → the shared toolchain + fixture helpers

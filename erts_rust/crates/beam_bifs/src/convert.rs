@@ -94,11 +94,11 @@ use core::cmp::Ordering;
 
 use beam_codec::term as codec_term;
 use beam_common::{AtomName, BeamError, ExceptionClass, Result, SourceLocation, StackFrame, StackTrace};
-use beam_term::compare::cmp_arith;
 use beam_term::{atom_val, is_byte, make_atom, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access;
 use crate::arith;
+use crate::compare::{cmp_arith_node, local_node_id};
 use crate::context::BifContext;
 use crate::error::{
     badarg, raise_error, raise_exit, raise_term, raise_throw, system_limit, unsupported_bif,
@@ -392,17 +392,25 @@ fn list_to_existing_atom_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<E
 
 /// `min(A, B)` — `min(A, B) when A > B -> B; min(A, _) -> A.` in `erlang.erl`,
 /// with the arithmetic term order (`min(1.0, 1)` is `1.0`).
+///
+/// The order is [`cmp_arith_node`], the crate's node-aware arithmetic order: a mixed
+/// internal/external `pid`/`port`/`ref` pair is decided field by field with the
+/// runtime's own node ([`local_node_id`] resolved once, here), exactly as the
+/// oracle's `lists:min/1`/`erlang:min/2` do.
 fn min_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    if cmp_arith(args[0], args[1], ctx.atoms()) == Ordering::Greater {
+    let local = local_node_id(ctx);
+    if cmp_arith_node(args[0], args[1], local, ctx.atoms()) == Ordering::Greater {
         Ok(args[1])
     } else {
         Ok(args[0])
     }
 }
 
-/// `max(A, B)` — `max(A, B) when A < B -> B; max(A, _) -> A.`, arithmetic order.
+/// `max(A, B)` — `max(A, B) when A < B -> B; max(A, _) -> A.`, arithmetic order
+/// (node-aware, as [`min_2`]).
 fn max_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    if cmp_arith(args[0], args[1], ctx.atoms()) == Ordering::Less {
+    let local = local_node_id(ctx);
+    if cmp_arith_node(args[0], args[1], local, ctx.atoms()) == Ordering::Less {
         Ok(args[1])
     } else {
         Ok(args[0])

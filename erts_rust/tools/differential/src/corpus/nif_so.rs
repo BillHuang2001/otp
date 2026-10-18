@@ -48,9 +48,30 @@
 //! **absolute temp-dir path** of the library — a golden that printed it would drift on every
 //! run (and the corpus requires a module-run golden to be a plain integer line). The module
 //! therefore returns only the **reason tag**, mapped to an integer by `reason_code/1`:
-//! `ok -> 0`, `load_failed -> 1`, `bad_lib -> 2`, `reload -> 3`, anything else `-> 9`. The
-//! goldens below are the integers the **oracle** actually prints (verified per case with
-//! `differential run <id>`).
+//! `ok -> 0`, `load_failed -> 1`, `bad_lib -> 2`, `reload -> 3`, `load -> 4`, anything else
+//! `-> 9`. The goldens below are the integers the **oracle** actually prints (verified per case
+//! with `differential run <id>`).
+//!
+//! The refusals whose message carries **no path** are pinned one step further, by
+//! `fail_code/1`: `reason_code * 10 + text_class`, where `text_class/2` is `1` only when the
+//! `Text` equals the word-for-word string the oracle composes (`erl_nif.c`) and `0` otherwise.
+//! Each such golden therefore pins the reason **and** the exact message class (e.g. `21` =
+//! `bad_lib` with the expected text), while still being a plain integer line: a reworded
+//! runtime shows up as a drift instead of a silent pass.
+//!
+//! # What this group covers
+//!
+//! * the **call** path of a real library — `add/2` (`enif_get_int`/`enif_make_int`),
+//!   `reverse/1` (`enif_make_reverse_list`), `hello/0` (`enif_make_atom`) and a NIF raise
+//!   (`enif_make_badarg`) — and the `LoadInfo` hand-off (`load_info_reaches_the_load_callback`:
+//!   the term the module passes reaches the library's `load` callback verbatim);
+//! * the **`erlang:load_nif/2` path-type contract** (`non_string_path_is_a_catchable_badarg`):
+//!   a non-string path is a catchable `badarg`, a binary path reaches the loader;
+//! * the **loader refusal shapes**: a missing library, a plain text file named `<name>.so`, a
+//!   `.so` without `_nif_init`, a second load of the same module (`reload`), a **`load`
+//!   callback veto**, an entry naming **another module**, and the three **entry-header**
+//!   refusals a hand-written `nif_init` can provoke — version too old (`2.5`), version too new
+//!   (with its `min_erts`) and a foreign `vm_variant`.
 //!
 //! # Reachability rules this group depends on
 //!
@@ -64,19 +85,23 @@
 //!   intercepts a NIF at external dispatch, so a *local* call would keep running the
 //!   `erlang:nif_error/0` stub.
 //! * the C source may only use `enif_*` functions the Rust runtime exports (`enif_get_int`,
-//!   `enif_make_int`, `enif_make_atom`, `enif_make_reverse_list`, `enif_make_badarg`, …) and
-//!   never a C-variadic one (`enif_make_tuple`, `enif_make_list`, `enif_fprintf`,
-//!   `enif_set_option`): those table slots are unpopulated, so the symbol is not exported and
-//!   `dlopen(RTLD_NOW)` would fail.
+//!   `enif_make_int`, `enif_make_atom`, `enif_make_reverse_list`, `enif_make_badarg`,
+//!   `enif_get_tuple`, `enif_is_identical`, …) and never a C-variadic one (`enif_make_tuple`,
+//!   `enif_make_list`, `enif_fprintf`, `enif_set_option`): those table slots are unpopulated,
+//!   so the symbol is not exported and `dlopen(RTLD_NOW)` would fail.
+//! * the hand-written-entry fixtures export their own `nif_init` (the symbol
+//!   `erts_sys_ddll_load_nif_init` resolves) instead of using `ERL_NIF_INIT`, so they can
+//!   declare an `ErlNifEntry` the macros would never produce.
 //!
 //! # Skip policy (contract A.3 needs host tools)
 //!
 //! A case whose fixture is compiled from C needs a C compiler *and* the host `erl_nif.h`;
 //! when either is missing the harness reports `Verdict::Skipped` with a loud reason
 //! ([`crate::module_build::MISSING_CC_REASON`] / `MISSING_ERL_NIF_REASON`) — never a pass,
-//! never a crash. `nif_so/load_missing_library` deliberately carries **no** fixture: it only
-//! checks the failure path for a suffix-less path that names nothing, so it runs even where
-//! no C compiler exists.
+//! never a crash. Two cases deliberately carry **no** fixture: `nif_so/load_missing_library`
+//! (the failure path for a suffix-less path that names nothing) and
+//! `nif_so/non_string_path_is_a_catchable_badarg` (the path-type contract), so they run even
+//! where no C compiler exists.
 //!
 //! # Honest handoff: observed divergences that are deliberately NOT cases
 //!
@@ -89,7 +114,17 @@
 //!   the Rust runtime de-duplicates the suffix and loads the library (`ok`). Observed:
 //!   oracle `1`, Rust runtime `0` for the same module and fixture. The `.so` path rule
 //!   (`beam_abi`) is the divergence, not the corpus.
-
+//! * **the function-table checks after the name check** — `beam_abi`'s loader performs the
+//!   entry's version / variant / module-name validation but not the four checks the C runs
+//!   against the *calling module's* code (it cannot reach that code). Measured with a scratch
+//!   module against this host: a library declaring a function the module does not export
+//!   (`Function not found nif_gap:add/3`) and one declaring an out-of-range `flags` field
+//!   (`Illegal flags field value 99 for NIF nif_gap:notify/0`) are both refused by the oracle
+//!   with `bad_lib` while the Rust runtime answers `ok` — so no case pins either (a pinned one
+//!   would be a `mismatch`). (A library declaring a function whose Erlang body is a plain
+//!   clause instead of an `erlang:nif_error/1` stub is *accepted* by both.) Owning crates:
+//!   `beam_abi` (the loader, which would need the module's code) and `beam_rt` (which has it
+//!   and could hand it over).
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 use crate::module_build::NifFixture;
 
@@ -100,7 +135,7 @@ use crate::module_build::NifFixture;
 /// the oracle accepts the library at all, and they are **exported** for the same reason. Each
 /// `classify/1` branch returns an integer, so the golden is a VM-stable integer line.
 const NIF_MODULE_SOURCE: &str = r#"-module(nif_so).
--export([classify/1, add/2, hello/0, reverse/1, raise_badarg/0]).
+-export([classify/1, add/2, hello/0, reverse/1, raise_badarg/0, load_info_probe/0]).
 
 %% One stub per entry in the library's ErlNifFunc table: `erlang:load_nif/2` refuses a
 %% library whose functions do not exist (and are not exported) in the loading module.
@@ -108,6 +143,7 @@ add(_, _) -> erlang:nif_error(not_loaded).
 hello() -> erlang:nif_error(not_loaded).
 reverse(_) -> erlang:nif_error(not_loaded).
 raise_badarg() -> erlang:nif_error(not_loaded).
+load_info_probe() -> erlang:nif_error(not_loaded).
 
 classify(N) ->
     Dir = filename:dirname(code:which(?MODULE)),
@@ -119,10 +155,22 @@ classify(N) ->
         5 -> reason_code(load(Dir ++ "/nif_so_missing"));
         6 -> reason_code(load(Dir ++ "/nif_so_text"));
         7 -> reason_code(load(Dir ++ "/nif_so_bad"));
-        8 -> ok = load(Dir ++ "/nif_so"), reason_code(load(Dir ++ "/nif_so"))
+        8 -> ok = load(Dir ++ "/nif_so"), reason_code(load(Dir ++ "/nif_so"));
+        %% The refusals below keep the `Text` as well: every one of them is path-free, so
+        %% `fail_code/1` pins the exact message class instead of only the reason tag.
+        9 -> fail_code(erlang:load_nif(Dir ++ "/nif_so_veto", 0));
+        10 -> fail_code(erlang:load_nif(Dir ++ "/nif_so_othername", 0));
+        11 -> fail_code(erlang:load_nif(Dir ++ "/nif_so_oldver", 0));
+        12 -> fail_code(erlang:load_nif(Dir ++ "/nif_so_newver", 0));
+        13 -> fail_code(erlang:load_nif(Dir ++ "/nif_so_variant", 0));
+        %% The `LoadInfo` term reaches the library's `load` callback verbatim: the callback
+        %% recorded whether it was handed exactly the tuple this branch passes.
+        14 -> ok = erlang:load_nif(Dir ++ "/nif_so", {nif_so_load_info, 7}),
+              nif_so:load_info_probe();
+        %% The path argument's own type contract (no library involved).
+        15 -> path_type_codes(Dir)
     end.
-
-%% Only the reason *tag* leaves this function: the `Text` of a failure embeds the absolute
+%% Only the reason *tag* leaves this function: the `Text` of these failures embeds the absolute
 %% temp-dir path, which would make the golden drift on every run.
 load(Path) ->
     case erlang:load_nif(Path, 0) of
@@ -131,12 +179,49 @@ load(Path) ->
         Other -> Other
     end.
 
+%% Reduce the whole `{error, {Reason, Text}}` result to one integer — `reason_code * 10` plus
+%% `text_class` — so a case pins the reason *and* the message class while the golden stays a
+%% plain integer line.
+fail_code(ok) -> 0;
+fail_code({error, {Reason, Text}}) ->
+    reason_code(Reason) * 10 + text_class(Reason, iolist_to_binary(Text));
+fail_code(_) -> 900.
+
+%% `erlang:load_nif/2`'s path argument: anything that is neither a byte-sized character list nor
+%% a binary is a *catchable* `badarg` (never a `load_failed`), while a binary path is accepted and
+%% reaches the loader — which then fails to open the missing library. Returns
+%% 1 (integer path) + 2 (tuple path) + 10 (binary path -> load_failed) = 13.
+path_type_codes(Dir) ->
+    catch_badarg(123) + catch_badarg({nif_so, path}) * 2 + binary_path_code(Dir) * 10.
+
+catch_badarg(Path) ->
+    try erlang:load_nif(Path, 0) of
+        _ -> 0
+    catch
+        error:badarg -> 1;
+        _:_ -> 0
+    end.
+
+binary_path_code(Dir) ->
+    case erlang:load_nif(list_to_binary(Dir ++ "/nif_so_missing"), 0) of
+        {error, {Reason, _Text}} -> reason_code(Reason);
+        _ -> 900
+    end.
+%% The exact `Text` of a path-free refusal, as the oracle words it (`erl_nif.c`): 1 when it
+%% matches, 0 when it does not — so a reworded runtime is a visible drift, never a silent pass.
+text_class(bad_lib, <<"Library module name 'nif_so_other' does not match calling module 'nif_so'">>) -> 1;
+text_class(bad_lib, <<"That old NIF library (2.5) is not compatible with this erts runtime (2.18). Try recompile the NIF lib.">>) -> 1;
+text_class(bad_lib, <<"That 'nif_so' NIF library needs erts-99.0 or newer. Either try to recompile the NIF lib or use a newer erts runtime.">>) -> 1;
+text_class(bad_lib, <<"Library (erl_prim.example) not compiled for this vm variant (beam.vanilla).">>) -> 1;
+text_class(load, <<"Library load-call unsuccessful (1).">>) -> 1;
+text_class(_, _) -> 0.
+
 reason_code(ok) -> 0;
 reason_code(load_failed) -> 1;
 reason_code(bad_lib) -> 2;
 reason_code(reload) -> 3;
+reason_code(load) -> 4;
 reason_code(_) -> 9.
-
 hello_code(hello) -> 1;
 hello_code(_) -> 0.
 
@@ -160,14 +245,29 @@ badarg_code() ->
 const REAL_NIF_C: &str = r#"/* A real NIF: the shared library the `nif_so` module loads with erlang:load_nif/2. */
 #include <erl_nif.h>
 
-/* `load` succeeds and stores no private state. */
+/* Whether the load callback was handed exactly the `{nif_so_load_info, 7}` tuple, i.e. whether
+   the `LoadInfo` argument of `erlang:load_nif/2` reaches the library verbatim. */
+static int load_info_seen = 0;
+
+/* `load` succeeds, stores no private state and records the `load_info` term it was handed. */
 static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
-    (void)env;
-    (void)load_info;
+    const ERL_NIF_TERM* tup;
+    int arity = 0, seven = 0;
     *priv = NULL;
+    load_info_seen = 0;
+    if (enif_get_tuple(env, load_info, &arity, &tup) && arity == 2 &&
+        enif_is_identical(enif_make_atom(env, "nif_so_load_info"), tup[0]) &&
+        enif_get_int(env, tup[1], &seven) && seven == 7)
+        load_info_seen = 1;
     return 0;
 }
 
+/* The recorded `load_info` observation: 1 when the callback saw the expected tuple. */
+static ERL_NIF_TERM load_info_probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
+    return enif_make_int(env, load_info_seen);
+}
 /* add/2 -> A + B, or badarg when handed anything else. */
 static ERL_NIF_TERM add(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     int a, b;
@@ -202,9 +302,9 @@ static ErlNifFunc nif_so_funcs[] = {
     {"add", 2, add, 0},
     {"hello", 0, hello, 0},
     {"reverse", 1, reverse, 0},
-    {"raise_badarg", 0, raise_badarg, 0}
+    {"raise_badarg", 0, raise_badarg, 0},
+    {"load_info_probe", 0, load_info_probe, 0}
 };
-
 /* `ERL_NIF_INIT` seeds ErlNifEntry.name with the stringified module name (`nif_so`), so this
    library may only be loaded as `nif_so`. */
 ERL_NIF_INIT(nif_so, nif_so_funcs, load, NULL, NULL, NULL)
@@ -220,6 +320,138 @@ int not_a_nif(void) { return 0; }
 /// failure is `load_failed` without any C compiler being involved.
 const TEXT_SO_CONTENTS: &str = "this file is named like a NIF library but is plain text\n";
 
+/// A real NIF whose **`load` callback vetoes**: the entry is named `nif_so` (so the module-name
+/// check passes) and its function table names the module's own stubs (so the function-table checks
+/// pass), but `load` returns a nonzero code. The oracle then refuses the library with the
+/// `load` reason (`{error, {load, "Library load-call unsuccessful (1)."}}`).
+///
+/// The file is named `nif_so_veto` while its entry is named `nif_so`: `ERL_NIF_INIT`'s first
+/// argument only stringifies into `ErlNifEntry.name`, so the stem of the file the module loads and
+/// the module name the entry must match are independent.
+const VETO_NIF_C: &str = r#"/* A NIF whose load callback vetoes the load. */
+#include <erl_nif.h>
+
+/* The function table must name the module's existing, exported stubs — the veto is the *only*
+   reason this library is refused. The pointers are never called. */
+static ERL_NIF_TERM noop(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
+    return enif_make_badarg(env);
+}
+
+static int veto_load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
+    (void)env;
+    (void)priv;
+    (void)load_info;
+    return 1;   /* nonzero: refuse the library */
+}
+
+static ErlNifFunc veto_funcs[] = {
+    {"add", 2, noop, 0},
+    {"hello", 0, noop, 0},
+    {"reverse", 1, noop, 0},
+    {"raise_badarg", 0, noop, 0},
+    {"load_info_probe", 0, noop, 0}
+};
+
+ERL_NIF_INIT(nif_so, veto_funcs, veto_load, NULL, NULL, NULL)
+"#;
+
+/// A real NIF whose **entry names another module**: `ERL_NIF_INIT(nif_so_other, …)` sets
+/// `ErlNifEntry.name` to `nif_so_other`, which the loader compares against the *calling* module
+/// (`nif_so`) before it looks at anything else. The oracle refuses it with
+/// `{error, {bad_lib, "Library module name 'nif_so_other' does not match calling module 'nif_so'"}}`.
+const OTHER_NAME_NIF_C: &str = r#"/* A NIF whose entry names a module other than the one loading it. */
+#include <erl_nif.h>
+
+static ERL_NIF_TERM noop(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
+    return enif_make_badarg(env);
+}
+
+static ErlNifFunc other_funcs[] = {{"add", 2, noop, 0}};
+
+ERL_NIF_INIT(nif_so_other, other_funcs, NULL, NULL, NULL, NULL)
+"#;
+
+/// The **entry contract** without `ERL_NIF_INIT`: the library exports the `nif_init` symbol the
+/// loader looks for and answers its own `ErlNifEntry`. This one declares a version **older** than
+/// this runtime supports (`2.5`, the experimental-maps release), which `erts` refuses with
+/// `{error, {bad_lib, "That old NIF library (2.5) is not compatible with this erts runtime
+/// (2.18). Try recompile the NIF lib."}}` — before it ever looks at the name or the function
+/// table, which is why the entry carries neither.
+const OLD_VERSION_NIF_C: &str = r#"/* The entry contract by hand: a NIF entry with an unsupported (too old) version. */
+#include <erl_nif.h>
+
+static ErlNifEntry old_entry = {
+    .major = 2,
+    .minor = 5,
+    .name = "nif_so",
+    .num_of_funcs = 0,
+    .funcs = 0,
+    .load = 0,
+    .reload = 0,
+    .upgrade = 0,
+    .unload = 0,
+    .vm_variant = ERL_NIF_VM_VARIANT,
+    .options = 0,
+    .sizeof_ErlNifResourceTypeInit = sizeof(ErlNifResourceTypeInit),
+    .min_erts = "erts-99.0"
+};
+
+ErlNifEntry* nif_init(void) { return &old_entry; }
+"#;
+
+/// A hand-written entry whose version is **newer** than this runtime supports, so the loader
+/// refuses it with the `min_erts` message it carries:
+/// `{error, {bad_lib, "That 'nif_so' NIF library needs erts-99.0 or newer. …"}}`.
+const NEW_VERSION_NIF_C: &str = r#"/* The entry contract by hand: a NIF entry with an unsupported (too new) version. */
+#include <erl_nif.h>
+
+static ErlNifEntry new_entry = {
+    .major = 2,
+    .minor = 99,
+    .name = "nif_so",
+    .num_of_funcs = 0,
+    .funcs = 0,
+    .load = 0,
+    .reload = 0,
+    .upgrade = 0,
+    .unload = 0,
+    .vm_variant = ERL_NIF_VM_VARIANT,
+    .options = 0,
+    .sizeof_ErlNifResourceTypeInit = sizeof(ErlNifResourceTypeInit),
+    .min_erts = "erts-99.0"
+};
+
+ErlNifEntry* nif_init(void) { return &new_entry; }
+"#;
+
+/// A hand-written entry with a supported version but a **foreign vm variant**, which the loader
+/// refuses with `{error, {bad_lib, "Library (erl_prim.example) not compiled for this vm variant
+/// (beam.vanilla)."}}`.
+const WRONG_VARIANT_NIF_C: &str = r#"/* The entry contract by hand: a NIF entry compiled for another vm variant. */
+#include <erl_nif.h>
+
+static ErlNifEntry variant_entry = {
+    .major = 2,
+    .minor = ERL_NIF_MINOR_VERSION,
+    .name = "nif_so",
+    .num_of_funcs = 0,
+    .funcs = 0,
+    .load = 0,
+    .reload = 0,
+    .upgrade = 0,
+    .unload = 0,
+    .vm_variant = "erl_prim.example",
+    .options = 0,
+    .sizeof_ErlNifResourceTypeInit = sizeof(ErlNifResourceTypeInit),
+    .min_erts = "erts-99.0"
+};
+
+ErlNifEntry* nif_init(void) { return &variant_entry; }
+"#;
 /// The real library every round-trip case (and the `reload` case) loads.
 const REAL_NIF: NifFixture = NifFixture::CompiledLibrary {
     name: "nif_so",
@@ -324,10 +556,83 @@ pub(crate) fn group() -> Vec<Case> {
             "3",
             Some(REAL_NIF),
         ),
+        // --- the load-callback and entry-contract refusals (reason *and* message class) -----
+        case(
+            "nif_so/load_callback_veto",
+            "a library whose load callback returns nonzero is refused with the `load` reason",
+            &[9],
+            // reason `load` (4) * 10 + the exact `Library load-call unsuccessful (1).` text (1).
+            "41",
+            Some(NifFixture::CompiledLibrary {
+                name: "nif_so_veto",
+                c_source: VETO_NIF_C,
+            }),
+        ),
+        case(
+            "nif_so/load_library_name_mismatch",
+            "a library whose entry names another module is refused with bad_lib and the name-mismatch text",
+            &[10],
+            // reason `bad_lib` (2) * 10 + the exact name-mismatch text (1).
+            "21",
+            Some(NifFixture::CompiledLibrary {
+                name: "nif_so_othername",
+                c_source: OTHER_NAME_NIF_C,
+            }),
+        ),
+        case(
+            "nif_so/load_entry_version_too_old",
+            "a hand-written entry header with version 2.5 is refused with bad_lib and the too-old text",
+            &[11],
+            // reason `bad_lib` (2) * 10 + the exact "(2.5) … (2.18)" text (1).
+            "21",
+            Some(NifFixture::CompiledLibrary {
+                name: "nif_so_oldver",
+                c_source: OLD_VERSION_NIF_C,
+            }),
+        ),
+        case(
+            "nif_so/load_entry_version_too_new",
+            "a hand-written entry header newer than the runtime is refused with bad_lib and its min_erts text",
+            &[12],
+            // reason `bad_lib` (2) * 10 + the exact "needs erts-99.0 or newer" text (1).
+            "21",
+            Some(NifFixture::CompiledLibrary {
+                name: "nif_so_newver",
+                c_source: NEW_VERSION_NIF_C,
+            }),
+        ),
+        case(
+            "nif_so/load_entry_wrong_vm_variant",
+            "a hand-written entry compiled for a foreign vm variant is refused with bad_lib and the variant text",
+            &[13],
+            // reason `bad_lib` (2) * 10 + the exact "not compiled for this vm variant" text (1).
+            "21",
+            Some(NifFixture::CompiledLibrary {
+                name: "nif_so_variant",
+                c_source: WRONG_VARIANT_NIF_C,
+            }),
+        ),
+        // --- the LoadInfo hand-off ---------------------------------------------------------
+        case(
+            "nif_so/load_info_reaches_the_load_callback",
+            "the LoadInfo term of erlang:load_nif/2 reaches the library's load callback verbatim",
+            &[14],
+            // The callback saw exactly `{nif_so_load_info, 7}` and the module read its own NIF back.
+            "1",
+            Some(REAL_NIF),
+        ),
+        // --- the path argument's type contract (no library needed) --------------------------
+        case(
+            "nif_so/non_string_path_is_a_catchable_badarg",
+            "a non-string path to load_nif/2 is a catchable badarg, while a binary path reaches the loader",
+            &[15],
+            // 1 (integer path refused) + 2 (tuple path refused) + 10 (binary path -> load_failed).
+            "13",
+            // No fixture: no library is loaded, so this case runs without a C toolchain.
+            None,
+        ),
     ]
-}
-
-#[cfg(test)]
+}#[cfg(test)]
 mod tests {
     //! Invariants of the A.3 end-to-end group: every case is a module-run case claiming
     //! [`Contract::NifAbi`], it runs the shared module through `classify/1`, and its golden is
@@ -392,8 +697,8 @@ mod tests {
     fn only_a_c_compiled_fixture_needs_the_c_toolchain() {
         // A case with a `CompiledLibrary` fixture needs `cc` + `erl_nif.h` (it skips loudly
         // without them); the text fixture and the no-fixture case must not, so they still run
-        // on a machine with no C toolchain. Selectors 1-4 load the real library, 7 loads a
-        // compiled non-NIF `.so`, and 8 reloads the real one — all need the C toolchain;
+        // on a machine with no C toolchain. Every case that builds a library — the real one, the
+        // non-NIF `.so`, and the veto / name / entry-header refusals — needs the C toolchain;
         // 5 (no fixture) and 6 (a text file named `<name>.so`) do not.
         let mut without_cc = 0;
         for case in group() {
@@ -401,8 +706,7 @@ mod tests {
                 panic!("case {}: expected a module-run case", case.id);
             };
             let needs_cc = matches!(run.nif, Some(NifFixture::CompiledLibrary { .. }));
-            let loads_a_compiled_library = matches!(run.args[0], 1 | 2 | 3 | 4 | 7 | 8);
-            assert_eq!(
+            let loads_a_compiled_library = !matches!(run.args[0], 5 | 6 | 15);            assert_eq!(
                 needs_cc, loads_a_compiled_library,
                 "case {}: exactly the cases that load a C-compiled library need the C toolchain",
                 case.id
@@ -416,5 +720,4 @@ mod tests {
             "the group must keep cases that run without a C toolchain (the missing-library and \
              text-file shapes)"
         );
-    }
-}
+    }}

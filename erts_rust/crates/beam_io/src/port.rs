@@ -63,6 +63,7 @@ use std::time::Instant;
 use beam_common::Result;
 use beam_process::PortId;
 
+use crate::completion::PortCompletion;
 use crate::driver::{Driver, DriverContext, PortArms, PortExitReason};
 use crate::drivers::line_buffer::LineBuffer;
 use crate::error;
@@ -137,6 +138,13 @@ pub struct Port {
     /// [`Port::take_line_frames`] — the separate channel a `{line, N}` port reports through,
     /// so its input never rides [`PortNotification`].
     pending_lines: VecDeque<LineNotification>,
+    /// The **completions** the driver handed up and the owner has not been told about yet, in
+    /// delivery order — the driver→owner message side channel (`{inet_reply, …}` /
+    /// `{inet_async, …}`), staged by [`DriverContext::deliver_completion`] and drained by
+    /// [`Port::take_completions`]. A separate channel, exactly like
+    /// [`Port::take_line_frames`]'s: a completion is a *message to the owner*, not
+    /// `{Port, {data, Data}}`, so it never rides [`PortNotification`].
+    completions: Vec<PortCompletion>,
 }
 
 impl Port {
@@ -157,6 +165,7 @@ impl Port {
             line: LineBuffer::new(0),
             pending_reads: VecDeque::new(),
             pending_lines: VecDeque::new(),
+            completions: Vec::new(),
         }
     }
     /// This port's id.
@@ -269,10 +278,12 @@ impl Port {
                 output,
                 arms,
                 pending_reads,
+                completions,
                 ..
             } = self;
-            let mut ctx =
-                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+            let mut ctx = DriverContext::new(id, poller, input, output, arms)
+                .with_reads(pending_reads)
+                .with_completions(completions);
             driver.start(&mut ctx)
         };
         self.refresh_timeout();
@@ -338,10 +349,12 @@ impl Port {
                 output,
                 arms,
                 pending_reads,
+                completions,
                 ..
             } = self;
-            let mut ctx =
-                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+            let mut ctx = DriverContext::new(id, poller, input, output, arms)
+                .with_reads(pending_reads)
+                .with_completions(completions);
             driver.output(&mut ctx)
         };
         self.refresh_timeout();
@@ -637,6 +650,27 @@ impl Port {
         self.pending_lines.drain(..).collect()
     }
 
+    /// Takes the **completions** this port's driver handed up, in delivery order.
+    ///
+    /// This is the drain side of the driver→owner message side channel (see
+    /// [`crate::completion`]): the `{inet_reply, Port, Reply[, Tag]}` answers to commands and the
+    /// `{inet_async, Port, Id, Result}` completions of queued asynchronous operations, staged by
+    /// [`DriverContext::deliver_completion`] from **any** driver callback — `start`, `output`,
+    /// `ready_input`, `ready_output`, `control`, `timeout`, `drive_async`, `stop`.
+    ///
+    /// Every staged completion is returned exactly once and the queue is emptied, so a caller must
+    /// drain after every round (and after every explicit driver interaction), exactly as it must
+    /// poll [`Port::take_line_frames`]/[`crate::PortRegistry::take_line_notifications`]. A
+    /// completion is **never** a control op's return value and never rides
+    /// [`PortNotification`]: it is a message the owner receives, not the answer to its call.
+    ///
+    /// A port that has staged nothing — the common case for every non-socket driver — always
+    /// returns an empty `Vec`, so a caller can poll unconditionally. The port's own
+    /// [`PortId`] is stamped on each one, so a consumer never has to guess which port spoke.
+    pub fn take_completions(&mut self) -> Vec<PortCompletion> {
+        std::mem::take(&mut self.completions)
+    }
+
     /// Dispatches read readiness to the driver's `ready_input`.
     ///
     /// The port's `TIMEOUT` task is re-armed from [`Driver::next_timeout`] afterwards (see
@@ -654,10 +688,12 @@ impl Port {
                 output,
                 arms,
                 pending_reads,
+                completions,
                 ..
             } = self;
-            let mut ctx =
-                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+            let mut ctx = DriverContext::new(id, poller, input, output, arms)
+                .with_reads(pending_reads)
+                .with_completions(completions);
             driver.ready_input(&mut ctx)
         };
         self.refresh_timeout();
@@ -692,10 +728,12 @@ impl Port {
                 output,
                 arms,
                 pending_reads,
+                completions,
                 ..
             } = self;
-            let mut ctx =
-                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+            let mut ctx = DriverContext::new(id, poller, input, output, arms)
+                .with_reads(pending_reads)
+                .with_completions(completions);
             driver.ready_output(&mut ctx)
         };
         self.refresh_timeout();
@@ -762,10 +800,12 @@ impl Port {
                 output,
                 arms,
                 pending_reads,
+                completions,
                 ..
             } = self;
-            let mut ctx =
-                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+            let mut ctx = DriverContext::new(id, poller, input, output, arms)
+                .with_reads(pending_reads)
+                .with_completions(completions);
             driver.timeout(&mut ctx)
         };
         self.refresh_timeout();
@@ -790,10 +830,12 @@ impl Port {
                 output,
                 arms,
                 pending_reads,
+                completions,
                 ..
             } = self;
-            let mut ctx =
-                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+            let mut ctx = DriverContext::new(id, poller, input, output, arms)
+                .with_reads(pending_reads)
+                .with_completions(completions);
             driver.control(&mut ctx, command, arg)
         };
         self.refresh_timeout();
@@ -829,10 +871,12 @@ impl Port {
                 output,
                 arms,
                 pending_reads,
+                completions,
                 ..
             } = self;
-            let mut ctx =
-                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+            let mut ctx = DriverContext::new(id, poller, input, output, arms)
+                .with_reads(pending_reads)
+                .with_completions(completions);
             driver.drive_async(&mut ctx)
         };
         self.refresh_timeout();
@@ -906,9 +950,12 @@ impl Port {
             output,
             arms,
             pending_reads,
+            completions,
             ..
         } = self;
-        let mut ctx = DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+        let mut ctx = DriverContext::new(id, poller, input, output, arms)
+            .with_reads(pending_reads)
+            .with_completions(completions);
         driver.port_exit(&mut ctx, reason)
     }
 
@@ -927,10 +974,12 @@ impl Port {
                 output,
                 arms,
                 pending_reads,
+                completions,
                 ..
             } = self;
-            let mut ctx =
-                DriverContext::new(id, poller, input, output, arms).with_reads(pending_reads);
+            let mut ctx = DriverContext::new(id, poller, input, output, arms)
+                .with_reads(pending_reads)
+                .with_completions(completions);
             driver.stop(&mut ctx)
         };
         // The port is closed either way; a teardown failure must not leave it looking

@@ -323,9 +323,13 @@ fn numeric_getladdrs_and_getpaddrs_fall_back_to_the_socket() {
     );
 }
 
-/// `TCP_REQ_UNRECV`(43) pushes its operand back to the front of the driver's input, and the next
-/// `recv` delivers those bytes **before** anything the socket holds (`tcp_push_buffer`,
+/// `TCP_REQ_UNRECV`(43) pushes its operand back to the front of the driver's input, and the queued
+/// receive delivers those bytes **before** anything the socket holds (`tcp_push_buffer`,
 /// `inet_drv.c:12326`-`:12338`).
+///
+/// The receive itself is the C's asynchronous one: the control call answers `[1] ++ <<Id:16/big>>`
+/// and the data arrives later, as `{inet_async, Port, Id, {ok, Data}}` — here the round's async
+/// drive point ([`Driver::drive_async`]) completes it from the buffer the `unrecv` pushed.
 #[test]
 fn numeric_tcp_unrecv_pushes_the_bytes_back_in_front() {
     // The `Connection` is held for the whole test: dropping it would close the far end and the
@@ -338,15 +342,35 @@ fn numeric_tcp_unrecv_pushes_the_bytes_back_in_front() {
     );
     assert_eq!(
         conn.port.control(&op(42), &[0u8; 8]),
-        ctl_ok(),
-        "the synchronous recv reads what was pushed"
+        vec![1, 0, 0],
+        "the async recv answers [1] ++ <<Id:16/big>>"
     );
-    assert_eq!(
-        conn.port.take_input(8),
-        b"abc",
-        "the pushed bytes came out first"
+    assert!(
+        conn.port.completions().is_empty(),
+        "the control reply comes first; the completion is produced by a later round"
     );
-    assert_eq!(conn.port.input_len(), 0, "and the queue is drained again");
+    conn.port.round().expect("a port-task round");
+    let completions = conn.port.completions();
+    assert_eq!(completions.len(), 1, "exactly one completion: {completions:?}");
+    match &completions[0].event {
+        crate::completion::CompletionEvent::InetAsync { id, result } => {
+            assert_eq!(*id, 0, "the id the control reply carried");
+            match result {
+                crate::completion::InetAsyncResult::Data(read) => {
+                    assert_eq!(read.body.as_deref(), Some(&b"abc"[..]), "the pushed bytes");
+                    assert!(read.header.is_empty(), "no header on a TCP payload");
+                }
+                other => panic!("expected the pushed bytes, got {other:?}"),
+            }
+        }
+        other => panic!("expected an {{inet_async, …}} completion, got {other:?}"),
+    }
+    assert_eq!(conn.port.input_len(), 0, "the port input queue is untouched");
+    conn.port.round().expect("a port-task round");
+    assert!(
+        conn.port.completions().is_empty(),
+        "and the completion is reported exactly once"
+    );
 }
 
 // -----------------------------------------------------------------------

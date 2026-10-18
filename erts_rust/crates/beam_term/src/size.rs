@@ -46,6 +46,32 @@
 //! this module holds only the DFS that drives it, never a second copy of the
 //! interior layout.
 //!
+//! # Sizing policies
+//!
+//! The C original is already parameterised: [`size_object`] is `size_object_x(t,
+//! NULL)` (`global.h:1135`) and the destination-pricing form is
+//! `size_object_litopt(t, area)` == `size_object_x(t, litopt)` (`global.h:1136`),
+//! whose non-`NULL` `litopt` skips a literal-area subterm (`copy.c:99` for
+//! `TAG_PRIMARY_LIST`, `copy.c:119` for `TAG_PRIMARY_BOXED`) — the count
+//! `erl_message.c:771,839` uses to price a message onto another heap. This crate
+//! ported only the `litopt == NULL` (source-occupancy) form, so
+//! [`size_object_with`]/[`size_object_bounded_with`] take a [`SizingPolicy`] that
+//! generalises that one bit into two **independent** axes:
+//!
+//! 1. **sharing** — [`SizingPolicy::is_shared`] prices a subterm the consumer reuses
+//!    by *identity* (the C's literal-area skip) at `0` words and does not descend
+//!    into it;
+//! 2. **per-object pricing** — [`SizingPolicy::object_words`] overrides what one
+//!    boxed object contributes (a copier that materialises a flattened window for a
+//!    refc binary whose payload no source off-heap handle owns prices it
+//!    `heap_bits_size_words(end - start)`, `copy.c:232-239`, not the 8-word on-heap
+//!    `[BinRef][ErlSubBits]` pair `size_object_x` counts).
+//!
+//! A policy never changes the *interior* — which payload words are children stays
+//! [`crate::layout::for_each_sizing_child_slot`]'s answer. [`DefaultSizingPolicy`]
+//! (both trait defaults) reproduces [`size_object`]/[`size_object_bounded`] exactly
+//! (`size_object_x(t, NULL)`), so nothing that calls those two can observe the seam.
+//!
 //! # Bounded, cycle-safe sizing
 //!
 //! `size_object_x` walks the graph **unconditionally**: it recurses per occurrence
@@ -96,6 +122,65 @@ use crate::tag::{is_term_word, ARITYVAL_SUBTAG, RECORD_SUBTAG, TAG_HEADER_MASK};
 fn needs_visit(t: Eterm) -> bool {
     is_term_word(t) && !is_immediate(t)
 }
+
+/// A **sizing policy**: how a consumer prices the term graph it is about to
+/// copy/hold, i.e. the caller-supplied half of the C's `size_object_x(t, litopt)`
+/// ([`size_object_litopt`], `global.h:1136`).
+///
+/// The two axes are independent; see the [module docs](self#sizing-policies) for the
+/// rationale and the C citations. Both methods are defaulted, so implementing only
+/// the axis a consumer cares about is enough, and [`DefaultSizingPolicy`] — no
+/// overrides — is the `size_object_x(t, NULL)` source-occupancy pricing that
+/// [`size_object`] publishes.
+///
+/// Object-safe (`dyn`-dispatched) and stateless in the canonical form, so a caller
+/// holds a `&dyn SizingPolicy` and the walk stays one code path.
+pub trait SizingPolicy {
+    /// Whether `t` is shared **as-is** by the consumer, so it costs the destination
+    /// nothing and the consumer never descends into it.
+    ///
+    /// Default: `false` (every word is priced) — the `size_object_x(t, NULL)` form.
+    /// The C equivalent is the `litopt` literal-area skip (`copy.c:99`, `copy.c:119`).
+    fn is_shared(&self, t: Eterm) -> bool {
+        let _ = t;
+        false
+    }
+
+    /// The words the boxed object headed by `header` at `payload` contributes —
+    /// header word included — or `None` for "prices nothing and exposes no child".
+    /// Default: the canonical [`crate::layout::object_words`] answer, i.e. the
+    /// `size_object_x` per-shape table.
+    ///
+    /// The walk only ever calls this with a live, initialized object of `header`'s
+    /// shape (the same invariant [`crate::layout::object_words`] documents), so an
+    /// implementation may read `payload`'s words for that shape and must not assume
+    /// anything else.
+    ///
+    /// An implementation that has to reason about the *term* (rather than the raw
+    /// header/payload pair) may reconstruct it with `make_boxed(payload)`: a
+    /// literal-tagged word is already filtered out by [`is_shared`](Self::is_shared)
+    /// on the destination-pricing path, so the reconstruction is faithful there.
+    #[allow(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "the sizing walk is the only caller and guarantees `payload` heads a \
+                  live object of `header`'s shape (the `object_words` caller contract); \
+                  making the method `unsafe` would push that same block onto every \
+                  implementation's signature without adding information"
+    )]
+    fn object_words(&self, header: Eterm, payload: *const Eterm) -> Option<usize> {
+        // SAFETY: the walk guarantees `payload` heads a live object of `header`'s
+        // shape, which is exactly `object_words`'s caller contract.
+        Some(unsafe { object_words(header, payload) })
+    }
+}
+
+/// The canonical policy: [`size_object`]/[`size_object_bounded`]'s own pricing, i.e.
+/// the C `size_object_x(t, NULL)` source-occupancy count. Both trait defaults, so it
+/// shares nothing and prices every object by [`crate::layout::object_words`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DefaultSizingPolicy;
+
+impl SizingPolicy for DefaultSizingPolicy {}
 
 /// One compound object a walk enters: the address that identifies it on a DFS path and
 /// its **sizing** child slots.
@@ -155,9 +240,14 @@ enum Step {
 /// Classifies a word the walk must enter into a [`Frame`], or `None` when it contributes
 /// no heap words and exposes no child.
 ///
-/// `None` covers exactly the one navigable word `size_object_x` never descends into:
-/// the shared **zero-arity tuple literal** (`tuple0()`), which the C also skips (its
-/// `arity == 0` guard).
+/// `None` covers exactly two cases: the shared **zero-arity tuple literal**
+/// (`tuple0()`), which the C also skips (its `arity == 0` guard sits *outside* the
+/// `litopt` block, `copy.c:127-137`, so it stays a representation invariant here and is
+/// checked **before** the policy), and a policy
+/// [`object_words`](SizingPolicy::object_words) of `None` (0 words, no descent).
+///
+/// The child slots always come from [`crate::layout::for_each_sizing_child_slot`]: a
+/// policy overrides the *pricing*, never the interior layout.
 ///
 /// # Safety
 ///
@@ -168,7 +258,7 @@ enum Step {
 /// `HEADER`-tagged word is rejected upstream by `is_term_word`, but a
 /// `BOXED`/`LIST`-tagged word pointing outside any heap is not) is outside what a crate
 /// without a heap registry can detect.
-unsafe fn classify(t: Eterm) -> Option<Frame> {
+unsafe fn classify(t: Eterm, policy: &dyn SizingPolicy) -> Option<Frame> {
     if is_list(t) {
         // A cons cell is a header-less 2-word object.
         let p = list_val(t);
@@ -189,10 +279,9 @@ unsafe fn classify(t: Eterm) -> Option<Frame> {
         // The shared zero-arity tuple is the global literal: 0 words.
         return None;
     }
-    // SAFETY: `header`/`p` head a live boxed object; the canonical layout knows which
-    // payload words each shape may read (a flatmap's `size` word, a sub-bits
-    // `start`/`end`/`orig`).
-    let words = unsafe { object_words(header, p) };
+    // The policy prices the object; `None` means it contributes nothing and exposes no
+    // child (so the walk neither counts it nor descends into it).
+    let words = policy.object_words(header, p)?;
     let mut base: *mut Eterm = p;
     let mut count = 0usize;
     // SAFETY: `header`/`p` head a live object whose sizing child slots are live. The
@@ -212,7 +301,6 @@ unsafe fn classify(t: Eterm) -> Option<Frame> {
         count,
     })
 }
-
 /// Pushes every navigable sizing child of `frame` onto a DFS `stack`.
 fn push_frame_children(frame: &Frame, stack: &mut Vec<Step>) {
     match frame {
@@ -270,7 +358,11 @@ enum Sizing {
 ///
 /// The walk is iterative — a deep list cannot overflow the native stack — and uses
 /// `O(visited compound objects)` stack/`on_path` memory.
-fn sizing_walk(root: Eterm, limit: usize) -> Sizing {
+///
+/// `policy` prices every object and decides what is shared (see the
+/// [module docs](self#sizing-policies)); the sharing check is at the single entry point
+/// ([`Step::Enter`]), so no other site filters.
+fn sizing_walk(root: Eterm, limit: usize, policy: &dyn SizingPolicy) -> Sizing {
     let mut total = 0usize;
     let mut on_path: HashSet<usize> = HashSet::new();
     let mut stack: Vec<Step> = vec![Step::Enter(root)];
@@ -285,9 +377,13 @@ fn sizing_walk(root: Eterm, limit: usize) -> Sizing {
                     // An immediate / non-term: 0 words.
                     continue;
                 }
+                if policy.is_shared(t) {
+                    // The consumer reuses this subterm by identity: 0 words, no descent.
+                    continue;
+                }
                 // SAFETY: `t` is a live word that is not an immediate.
-                let Some(frame) = (unsafe { classify(t) }) else {
-                    // The shared empty-tuple literal: 0 words.
+                let Some(frame) = (unsafe { classify(t, policy) }) else {
+                    // A shared empty-tuple literal, or a policy that prices it at nothing.
                     continue;
                 };
                 let has_children = frame.has_children();
@@ -324,7 +420,11 @@ fn sizing_walk(root: Eterm, limit: usize) -> Sizing {
 /// on the happy path. It is what lets [`TermError::TermGraphCyclic`] win over
 /// [`TermError::TermGraphTooLarge`] even when the limit is hit before the cycle-closing
 /// edge is reached.
-fn is_acyclic(root: Eterm) -> bool {
+///
+/// It takes the same `policy` as the sizing walk, so a graph a policy declares shared is
+/// not descended into here either (a shared subterm can never close a cycle the consumer
+/// would traverse).
+fn is_acyclic(root: Eterm, policy: &dyn SizingPolicy) -> bool {
     let mut on_path: HashSet<usize> = HashSet::new();
     let mut done: HashSet<usize> = HashSet::new();
     let mut stack: Vec<Step> = vec![Step::Enter(root)];
@@ -339,8 +439,12 @@ fn is_acyclic(root: Eterm) -> bool {
                 if !needs_visit(t) {
                     continue;
                 }
+                if policy.is_shared(t) {
+                    // Not descended into, so it cannot be on this walk's path.
+                    continue;
+                }
                 // SAFETY: `t` is a live word that is not an immediate.
-                let Some(frame) = (unsafe { classify(t) }) else {
+                let Some(frame) = (unsafe { classify(t, policy) }) else {
                     continue;
                 };
                 if frame.has_children() {
@@ -380,14 +484,27 @@ fn is_acyclic(root: Eterm) -> bool {
 /// cycle (the cycle-closing object is not counted a second time). That number is
 /// deliberately **not** a meaningful size: it exists so this function is total and
 /// never hangs. Use [`size_object_bounded`] to learn that a graph is cyclic.
+///
+/// This is [`size_object_with`] under [`DefaultSizingPolicy`].
 pub fn size_object(a: Eterm) -> usize {
+    size_object_with(a, &DefaultSizingPolicy)
+}
+
+/// [`size_object`] under a caller-supplied [`SizingPolicy`] — the C
+/// `size_object_x(a, litopt)` form, i.e. the count for a consumer that prices the graph
+/// its own way (shares some subterms, materialises some objects differently).
+///
+/// With `&DefaultSizingPolicy` it is byte-for-byte [`size_object`]. Everything
+/// [`size_object`] documents holds unchanged: non-terms are `0` words, sharing between
+/// sibling positions is counted once per occurrence, and a cyclic graph yields the
+/// defined partial count.
+pub fn size_object_with(a: Eterm, policy: &dyn SizingPolicy) -> usize {
     // The unbounded walk: only `Complete` and `Cyclic` can come back (the saturated
     // total of a real graph is `<= usize::MAX == limit`).
-    match sizing_walk(a, usize::MAX) {
+    match sizing_walk(a, usize::MAX, policy) {
         Sizing::Complete(words) | Sizing::OverLimit(words) | Sizing::Cyclic(words) => words,
     }
 }
-
 /// [`size_object`] with an explicit word budget, and with the reason a graph cannot
 /// be sized reported as a typed error instead of a count.
 ///
@@ -410,13 +527,31 @@ pub fn size_object(a: Eterm) -> usize {
 /// forged cyclic graph is a typed error, never a hang. "Visited" counts
 /// *occurrences*, not distinct objects: like `size_object_x`, a subterm a valid graph
 /// shares between two sibling positions is sized once per occurrence.
+///
+/// This is [`size_object_bounded_with`] under [`DefaultSizingPolicy`].
 pub fn size_object_bounded(a: Eterm, limit: usize) -> Result<usize, TermError> {
-    match sizing_walk(a, limit) {
+    size_object_bounded_with(a, limit, &DefaultSizingPolicy)
+}
+
+/// [`size_object_bounded`] under a caller-supplied [`SizingPolicy`] — the C
+/// `size_object_x(a, litopt)` form with the same budget/error policy.
+///
+/// With `&DefaultSizingPolicy` it is byte-for-byte [`size_object_bounded`]. A policy
+/// changes only *how the words are priced*, never the verdict machinery: `Cyclic` still
+/// wins over `OverLimit` (the acyclicity re-pass takes the same policy), and a subterm
+/// the policy declares shared is neither priced nor descended into — so it can never
+/// contribute a cycle of its own.
+pub fn size_object_bounded_with(
+    a: Eterm,
+    limit: usize,
+    policy: &dyn SizingPolicy,
+) -> Result<usize, TermError> {
+    match sizing_walk(a, limit, policy) {
         Sizing::Complete(words) => Ok(words),
         // The back-edge was reached before the budget: unambiguously cyclic.
         Sizing::Cyclic(_) => Err(TermError::TermGraphCyclic),
         Sizing::OverLimit(_) => {
-            if is_acyclic(a) {
+            if is_acyclic(a, policy) {
                 Err(TermError::TermGraphTooLarge)
             } else {
                 Err(TermError::TermGraphCyclic)
@@ -424,7 +559,6 @@ pub fn size_object_bounded(a: Eterm, limit: usize) -> Result<usize, TermError> {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

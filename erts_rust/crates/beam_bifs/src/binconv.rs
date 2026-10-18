@@ -92,7 +92,11 @@
 //!   comes straight from `beam_codec`'s
 //!   [`decode_term_with_options_used`]). Under `safe` the codec itself refuses a
 //!   wire atom name that is not already interned — a `badarg` raised **before** any
-//!   interning, so nothing reaches the receiving node's atom table.
+//!   interning, so nothing reaches the receiving node's atom table — and, when the
+//!   host installed an [`ExportGate`](beam_codec::ExportGate) through
+//!   [`BifContext::with_export_gate`], it also refuses an `EXPORT_EXT` fun whose
+//!   `M:F/A` is not an active export (`erts_active_export_entry`); with no gate
+//!   installed that half is unchecked, the codec's honest default.
 //!
 //! # The `term_to_binary/2` options
 //!
@@ -221,8 +225,8 @@ use std::cell::RefCell;
 
 use beam_codec::compress::compress as zlib_compress;
 use beam_codec::{
-    decode_term_with_options_used, DecodeOptions, Encoder, MinorVersion, COMPRESSED_EXT,
-    VERSION_MAGIC,
+    decode_term_with_options_and_gate_used, decode_term_with_options_used, DecodeOptions, Encoder,
+    MinorVersion, COMPRESSED_EXT, VERSION_MAGIC,
 };
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Atom, AtomTable, Eterm, NIL};
@@ -1684,6 +1688,18 @@ mod scratch_pins {
 /// atom table cannot grow. The flag-free path is unchanged: the names the decoder
 /// appends to the scratch are still committed to the shared table afterwards.
 ///
+/// The other `[safe]` half — the C's `EXPORT_EXT` **active-export** check
+/// (`if (flags & ERTS_DIST_EXT_BTT_SAFE) { if (!erts_active_export_entry(mod, name,
+/// arity)) goto error; }`, `external.c:5032-5036`) — is decided by the host's
+/// [`ExportGate`](beam_codec::ExportGate) through [`BifContext::export_gate`]. The
+/// **check site** is the codec's (`decode_export`); this function only routes: with a
+/// gate installed it decodes through the codec's gate-aware `[used]` entry point
+/// ([`decode_term_with_options_and_gate_used`]), and with none it calls
+/// [`decode_term_with_options_used`] exactly as before, so an un-gated runtime keeps
+/// the previous behaviour (the atoms are still resolved by lookup, the export's
+/// activity is not checked). The gate is installed unconditionally on the gate-aware
+/// path — the codec consults it **only** under `safe` and **only** for
+/// `EXPORT_EXT`, so the flag-free decode never asks.///
 /// The context's local node identity ([`BifContext::local_node`]) is installed on the
 /// decoder, so a wire pid/port/reference whose node atom and creation name this node
 /// materializes as this runtime's **internal** form — the C's `dec_is_this_node`
@@ -1699,11 +1715,13 @@ mod scratch_pins {
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary, a
-/// malformed/truncated image, an unknown option, or `safe` with a wire atom name that
-/// is not already interned; the codec's `unsupported_external_term` raise for a tag
-/// it cannot build (funs, exports, records, `LOCAL`). A local reference id that
-/// does not fit the M1 internal-ref block's 60-bit slot is not an error: the
-/// decoder keeps the faithful external reference form for it.
+/// malformed/truncated image, an unknown option, `safe` with a wire atom name that
+/// is not already interned, or `safe` with an `EXPORT_EXT` whose active-export gate
+/// (when one is installed) refuses the `M:F/A`; the codec's
+/// `unsupported_external_term` raise for a tag it cannot build (funs, exports,
+/// records, `LOCAL`). A local reference id that does not fit the M1 internal-ref
+/// block's 60-bit slot is not an error: the decoder keeps the faithful external
+/// reference form for it.
 fn decode_term_bif(
     ctx: &mut BifContext<'_>,
     input: Eterm,
@@ -1718,6 +1736,12 @@ fn decode_term_bif(
     // the decode unchanged. `local_hash` stays `None`: the 4-byte `LOCAL_EXT` node hash
     // is runtime state with no seam in this crate (see the docs above).
     let identity = ctx.local_node();
+    // Read the `[safe]` active-export gate *before* `ctx.atom_and_heap()` too: the
+    // accessor borrows `&self`, so a reference taken afterwards could not outlive the
+    // heap borrow. It is a **shared** reference carrying the context's own lifetime, so
+    // holding it across the mutable heap borrow is sound and the borrow of `ctx` ends at
+    // the call. `None` (no gate installed) keeps the decode byte-for-byte unchanged.
+    let gate = ctx.export_gate();
     // Feed `[safe]` (and the resolved identity) into the codec: under `safe` a wire atom
     // **name** that is not already interned is `BadArg` *from the codec* and **nothing is
     // interned** (C `erts_atom_get`), so the fresh-name commit below is unreachable under
@@ -1740,7 +1764,18 @@ fn decode_term_bif(
             // `[safe]` refusal — and, unlike the `finish()`-ing `decode_term` pair, it
             // tolerates trailing bytes, matching the oracle's `binary_to_term/2`. With
             // `safe` false its decode is byte-for-byte the flag-free/identity-aware twins'.
-            let decoded = decode_term_with_options_used(&data, heap, scratch, &options);
+            //
+            // With a host gate installed we decode through the gate-aware twin, which is the
+            // same entry point plus the `[safe]` `EXPORT_EXT` active-export check (the gate is
+            // installed unconditionally and consulted only under `safe` + `EXPORT_EXT`, so the
+            // flag-free decode is unaffected); without one we call the un-gated entry point
+            // exactly as before.
+            let decoded = match gate {
+                Some(gate) => {
+                    decode_term_with_options_and_gate_used(&data, heap, scratch, &options, gate)
+                }
+                None => decode_term_with_options_used(&data, heap, scratch, &options),
+            };
             // A failed decode leaves the scratch possibly ahead of the shared table (the
             // next call's `prefix_matches` rebuilds it); nothing is committed.
             let fresh: Vec<String> = if decoded.is_ok() {
@@ -3592,6 +3627,155 @@ halt()."#;
             let safe_used = atom_options(ctx, "safe", "used");
             assert_badarg(binary_to_term_2(ctx, &[bin(NEW_ATOM_IMAGE), safe_used]));
             assert_eq!(ctx.atoms().len(), NAMES.len(), "the shared table grew");
+        });
+    }
+
+    // -- the `[safe]` export gate ----------------------------------------
+
+    /// `EXPORT_EXT` (`113`) for `hello:a/2`, built by hand so the test does not depend
+    /// on how this tree encodes a fun: `[131][113][ATOM_EXT "hello"][ATOM_EXT "a"]
+    /// [SMALL_INTEGER_EXT 2]`. Both atoms are in every seeded table, so under `[safe]`
+    /// the *atom* half is satisfied and only the **export** half is under test.
+    const EXPORT_IMAGE: &[u8] = &[
+        131, 113, // version, EXPORT_EXT
+        100, 0, 5, 104, 101, 108, 108, 111, // ATOM_EXT "hello"
+        100, 0, 1, 97, // ATOM_EXT "a"
+        97, 2, // SMALL_INTEGER_EXT 2 (the arity is a full term)
+    ];
+
+    /// A recording [`ExportGate`](beam_codec::ExportGate) test double: it logs every
+    /// `M:F/A` it is asked about and answers a fixed verdict.
+    struct StubGate {
+        active: bool,
+        calls: RefCell<Vec<(String, String, u32)>>,
+    }
+
+    impl StubGate {
+        fn new(active: bool) -> StubGate {
+            StubGate {
+                active,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Every question the decoder asked, in order.
+        fn calls(&self) -> Vec<(String, String, u32)> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl beam_codec::ExportGate for StubGate {
+        fn is_export_active(&self, module: &str, function: &str, arity: u32) -> bool {
+            self.calls
+                .borrow_mut()
+                .push((module.to_string(), function.to_string(), arity));
+            self.active
+        }
+    }
+
+    /// Runs `f` over a fresh context with `gate` installed (and the full seeded table,
+    /// so the `[safe]` atom half never masks the export half).
+    fn with_gate<R>(gate: &StubGate, f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
+        let mut heap = heap();
+        let atoms = table();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_export_gate(gate);
+        f(&mut ctx)
+    }
+
+    #[test]
+    fn binary_to_term_safe_accepts_an_export_the_gate_reports_active() {
+        let gate = StubGate::new(true);
+        with_gate(&gate, |ctx| {
+            let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
+            let term = binary_to_term_2(ctx, &[bin(EXPORT_IMAGE), safe])
+                .expect("an active export decodes under [safe]");
+            // The `EXPORT_EXT` materialized as the `External` fun `hello:a/2`.
+            assert_eq!(
+                beam_codec::term::fun_kind_term(term).expect("a fun"),
+                beam_codec::FunKind::External
+            );
+            assert_eq!(
+                beam_codec::term::fun_module(term).expect("a fun"),
+                ctx.atoms().lookup("hello").expect("seeded")
+            );
+            assert_eq!(
+                beam_codec::term::fun_function(term).expect("a fun"),
+                ctx.atoms().lookup("a").expect("seeded")
+            );
+            assert_eq!(beam_codec::term::fun_arity_term(term).expect("a fun"), 2);
+        });
+        assert_eq!(
+            gate.calls(),
+            vec![("hello".to_string(), "a".to_string(), 2u32)],
+            "the gate must be asked exactly once, with name-resolved atoms and the arity"
+        );
+    }
+
+    #[test]
+    fn binary_to_term_safe_refuses_an_export_the_gate_denies() {
+        // The oracle: `binary_to_term(term_to_binary(fun lists:no_such_fun_xyz/1),
+        // [safe])` is `error:badarg` (C `external.c:5032-5036`), while the flag-free
+        // decode of the same image succeeds.
+        let gate = StubGate::new(false);
+        with_gate(&gate, |ctx| {
+            let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
+            assert_badarg(binary_to_term_2(ctx, &[bin(EXPORT_IMAGE), safe]));
+            // `[safe, used]` is the `_and_gate_used` entry point's other arm: same refusal,
+            // never a `{Term, N}` tuple.
+            let safe_used = atom_options(ctx, "safe", "used");
+            assert_badarg(binary_to_term_2(ctx, &[bin(EXPORT_IMAGE), safe_used]));
+        });
+        assert_eq!(
+            gate.calls(),
+            vec![
+                ("hello".to_string(), "a".to_string(), 2u32),
+                ("hello".to_string(), "a".to_string(), 2u32),
+            ],
+            "both `[safe]` arms consult the gate"
+        );
+    }
+
+    #[test]
+    fn a_flag_free_decode_never_asks_the_export_gate() {
+        // The C asks only under `ERTS_DIST_EXT_BTT_SAFE`, so a refusing gate must not
+        // change the flag-free decode at all — the same zero-call proof `[used]` gets.
+        let gate = StubGate::new(false);
+        with_gate(&gate, |ctx| {
+            let term = binary_to_term_1(ctx, &[bin(EXPORT_IMAGE)])
+                .expect("the flag-free decode of an EXPORT_EXT is unchanged by a gate");
+            assert_eq!(
+                beam_codec::term::fun_kind_term(term).expect("a fun"),
+                beam_codec::FunKind::External
+            );
+            let used = used_option(ctx);
+            let wrapped = binary_to_term_2(ctx, &[bin(EXPORT_IMAGE), used])
+                .expect("`[used]` alone is ungated too");
+            assert_eq!(
+                int_of(access::tuple_element(wrapped, 1)),
+                EXPORT_IMAGE.len() as i64
+            );
+        });
+        assert!(
+            gate.calls().is_empty(),
+            "the gate must never be consulted without `[safe]`, got {:?}",
+            gate.calls()
+        );
+    }
+
+    #[test]
+    fn binary_to_term_safe_without_a_gate_keeps_the_ungated_decode() {
+        // No gate installed is the codec's honest default: under `[safe]` the two wire
+        // atoms are still resolved by *lookup*, but the export's activity is not checked,
+        // so an M:F/A no loaded module exports still decodes — today's behaviour, pinned.
+        with_ctx(|ctx| {
+            let safe = ctx.list(&[ctx.atom("safe").expect("seeded")]).expect("fits");
+            let term = binary_to_term_2(ctx, &[bin(EXPORT_IMAGE), safe])
+                .expect("no gate means no active-export check");
+            assert_eq!(
+                beam_codec::term::fun_kind_term(term).expect("a fun"),
+                beam_codec::FunKind::External
+            );
         });
     }
 

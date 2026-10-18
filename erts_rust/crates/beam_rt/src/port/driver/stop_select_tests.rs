@@ -520,9 +520,9 @@ fn a_use_deselect_runs_stop_select_with_the_selected_event() {
     // ...and its `driver_output` reached the owner's side of the port.
     let mut data = Vec::new();
     for notification in &outcome.notifications {
-        if let beam_io::PortNotification::Data { port, bytes } = notification {
+        if let beam_io::PortNotification::Data { port, read } = notification {
             if *port == id {
-                data.extend_from_slice(bytes);
+                data.extend_from_slice(&read.flattened());
             }
         }
     }
@@ -557,8 +557,11 @@ fn a_plain_deselect_does_not_run_stop_select() {
         "a plain deselect must not run `stop_select`"
     );
     for notification in &outcome.notifications {
-        if let beam_io::PortNotification::Data { port, bytes } = notification {
-            assert!(*port != id || bytes.is_empty(), "no callback output: {bytes:?}");
+        if let beam_io::PortNotification::Data { port, read } = notification {
+            assert!(
+                *port != id || read.flattened().is_empty(),
+                "no callback output: {read:?}"
+            );
         }
     }
 

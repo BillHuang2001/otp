@@ -271,6 +271,42 @@ pub(crate) fn is_reference(x: Eterm) -> bool {
     is_internal_ref(x) || is_external_ref(x)
 }
 
+/// `true` iff `a`/`b` are an **internal/external pair of the same category**: a pid
+/// against an external pid, a port against an external port, or a reference against
+/// an external reference — in either operand order.
+///
+/// These are the *only* pairs whose ordering a local node changes.
+/// [`beam_term::compare::cmp_with_local_node`] /
+/// [`beam_term::compare::cmp_arith_with_local_node`] differ from the context-free
+/// [`beam_term::compare::cmp`] / [`beam_term::compare::cmp_arith`] exactly on the
+/// mixed arms of `erts_cmp_compound` (`utils.c:1751-1811`, `:2219-2308`), where the
+/// runtime's own node is substituted for the internal operand's *implicit* node;
+/// every other pair is ranked/field-walked identically. So this is the cheap
+/// pre-test that decides whether a caller must pay for the local node at all
+/// (`crate::compare::local_node_id`, which costs an atom-table lookup or a hook
+/// call) — and 99.99% of comparisons can never be a mixed identity pair.
+///
+/// The category must match: an internal pid against an external *port* is not a
+/// mixed pair (they are different term classes, decided by the class ladder as
+/// before).
+///
+/// # Caller invariant
+///
+/// As [`is_tuple`]: if a word is a boxed term, its header word must be a live,
+/// aligned term word. A word that is not a term at all (a bare header word, e.g.
+/// the ABI's `THE_NON_VALUE`) is `false` from every predicate below — never a
+/// dereference — so it is `false` here too, which is exactly what a caller wants
+/// (such a word is not an identity pair).
+#[inline]
+pub(crate) fn is_mixed_identity_pair(a: Eterm, b: Eterm) -> bool {
+    (is_internal_pid(a) && is_external_pid(b))
+        || (is_external_pid(a) && is_internal_pid(b))
+        || (is_internal_port(a) && is_external_port(b))
+        || (is_external_port(a) && is_internal_port(b))
+        || (is_internal_ref(a) && is_external_ref(b))
+        || (is_external_ref(a) && is_internal_ref(b))
+}
+
 // ---------------------------------------------------------------------------
 // Structure (each dereferences the boxed word)
 // ---------------------------------------------------------------------------
@@ -1132,7 +1168,74 @@ mod tests {
         assert!(is_integer(make_small(1)));
         assert!(is_atom(beam_term::make_atom(beam_term::Atom::from_raw(0))));
     }
+    /// [`is_mixed_identity_pair`] recognises exactly the three internal/external
+    /// pairs `beam_term::compare`'s node-aware entry points decide differently, in
+    /// **both** operand orders — and nothing else. Every term below is built with the
+    /// safe `beam_codec::term` writers (the same frozen layouts the oracle's
+    /// `binary_to_term` produces), so this pins the pre-test at term-shape level.
+    #[test]
+    fn mixed_identity_pair_is_exactly_the_three_internal_external_pairs() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let remote = beam_term::make_atom(beam_term::Atom::from_raw(7));
+        let internal_pid = ProcessId::new(10, 0).to_eterm();
+        let external_pid = beam_codec::term::make_external_pid(&mut heap, remote, 10, 0, 0)
+            .expect("the external pid block fits");
+        let internal_port = beam_term::make_internal_port(beam_term::make_port_data(3));
+        let external_port = beam_codec::term::make_external_port(&mut heap, remote, 3, 0)
+            .expect("the external port block fits");
+        let internal_ref = beam_codec::make_internal_ref(&mut heap, 9).expect("the ref fits");
+        let external_ref = beam_codec::term::make_external_ref(&mut heap, remote, &[9], 0)
+            .expect("the external ref block fits");
 
+        let pairs = [
+            ("pid", internal_pid, external_pid),
+            ("port", internal_port, external_port),
+            ("ref", internal_ref, external_ref),
+        ];
+        for (label, internal, external) in pairs {
+            assert!(is_mixed_identity_pair(internal, external), "{label}, internal first");
+            assert!(is_mixed_identity_pair(external, internal), "{label}, external first");
+        }
+
+        // The categories must match: an internal pid against an external *port* is not
+        // the pair (the two are different term classes, decided by the class ladder).
+        let cross = [
+            ("pid/port", internal_pid, external_port),
+            ("pid/ref", internal_pid, external_ref),
+            ("port/pid", internal_port, external_pid),
+            ("port/ref", internal_port, external_ref),
+            ("ref/pid", internal_ref, external_pid),
+            ("ref/port", internal_ref, external_port),
+        ];
+        for (label, a, b) in cross {
+            assert!(!is_mixed_identity_pair(a, b), "cross-category {label}");
+            assert!(!is_mixed_identity_pair(b, a), "cross-category {label}, reversed");
+        }
+
+        // Two internals, two externals, and anything that is not an identity term at all.
+        let non_pairs = [
+            ("internal/internal", internal_pid, internal_port),
+            ("external/external", external_pid, external_port),
+            ("same internal pid", internal_pid, internal_pid),
+            ("same external pid", external_pid, external_pid),
+            ("pid/int", internal_pid, make_small(1)),
+            ("pid/atom", external_pid, remote),
+            ("port/nil", internal_port, NIL),
+            ("ref/tuple", internal_ref, heap.tuple(&[make_small(1)]).expect("fits")),
+        ];
+        for (label, a, b) in non_pairs {
+            assert!(!is_mixed_identity_pair(a, b), "not a mixed pair: {label}");
+            assert!(!is_mixed_identity_pair(b, a), "not a mixed pair: {label}, reversed");
+        }
+
+        // A word that is not a term at all (the ABI's `THE_NON_VALUE` is `0`, a bare
+        // header word) is `false` from every boxed predicate, hence `false` here too —
+        // never a dereference.
+        let non_value = Eterm::from_raw(0);
+        assert!(!is_mixed_identity_pair(non_value, internal_pid));
+        assert!(!is_mixed_identity_pair(internal_pid, non_value));
+        assert!(!is_mixed_identity_pair(non_value, non_value));
+    }
     #[test]
     fn heap_bitstring_has_the_frozen_header_and_layout() {
         let mut heap = Heap::new(64).expect("test heap");

@@ -66,15 +66,17 @@
 //! is never handed a non-term; `NifHost::make_copy` gaining an implementation flips the case to
 //! `agree` with no fixture change.
 //!
-//! One further verification is *not* pinned: a resource's **destructor** is **asynchronous** in
-//! the oracle: `erts` schedules it on a misc aux-work thread (`nif_resource_dtor_prologue` →
-//! `erts_schedule_misc_aux_work`, `erl_nif.c`), so a `dtor_count` read inside the same NIF call,
-//! right after the final `enif_release_resource`, is still `0` there — while the Rust runtime runs
-//! the destructor synchronously on the releasing thread and reports `1`. The count is not
-//! observable within the NIF call on the oracle side, so no case pins it. (The related
-//! `enif_monitor_process` follow-up is likewise unpinnable: both runtimes answer `0` because the
-//! monitor is not established, so it would pin no behaviour.)
-//!
+//! One further verification is pinned only through its **settled** value: a resource's
+//! **destructor** is asynchronous in the oracle — `erts` schedules it on a misc aux-work thread
+//! (`nif_resource_dtor_prologue` → `erts_schedule_misc_aux_work`, `erl_nif.c`), so a count read
+//! inside the same NIF call, right after the final `enif_release_resource`, is still `0` there
+//! while the Rust runtime runs the destructor synchronously on the releasing thread and reports
+//! `1`. *When* it ran is therefore not comparable, but *whether* it ran is:
+//! `destructor_runs_once_the_last_reference_goes` and
+//! `keep_holds_the_object_before_the_last_release` read the count through a settle loop
+//! (`settle_dtor/1` — a bounded `receive after` wait), so both runtimes agree on the count the
+//! destructor owes. (The related `enif_monitor_process` follow-up is likewise unpinnable: both
+//! runtimes answer `0` because the monitor is not established, so it would pin no behaviour.)//!
 //! # The sync family is completed (cond / rwlock / tsd / threads / names)
 //!
 //! The `mutex_*` + `enif_thread_self` pair above is joined by the rest of the `erl_drv_thread`
@@ -135,12 +137,43 @@
 //! * `env_clear_env_stays_usable` — `enif_clear_env` on a live message env: atoms built on that
 //!   env afterwards are atoms, and they are the *global* atoms the call env also makes.
 //!
+//! # The third wave: the resource **lifetime** shapes
+//!
+//! * `destructor_runs_once_the_last_reference_goes` — a resource that is allocated and released
+//!   to zero **without ever being exposed as a term** runs its type's destructor exactly once;
+//!   the module reads the count through `settle_dtor/1`, so the oracle's aux-work deferral and
+//!   the Rust runtime's inline run both settle on `1`.
+//! * `keep_holds_the_object_before_the_last_release` — `enif_keep_resource` really is a
+//!   reference: `alloc → keep → release` leaves the object alive (the destructor must not have
+//!   run yet, observed *in-call* as `0`), and the following release reaches zero. Golden
+//!   `10 * in-call count + settled count`.
+//! * `get_resource_refuses_a_non_resource_term` — `enif_get_resource` resolves a term to a
+//!   resource of **that** type only: a small integer, a binary and a resource term of the
+//!   module's *other* type are all refused.
+//! * `open_resource_type_flag_matrix` — the flags of `enif_open_resource_type`, each on a fresh
+//!   name at load time: `TAKEOVER` alone has nothing to take over (`NULL`, and `tried` reports
+//!   the requested flag), `CREATE|TAKEOVER` creates and reports `CREATE`, and a flags value of
+//!   `0` is refused and reports `0`.
+//!
+//! Two resource shapes remain **unpinnable** (both are `beam_abi` deviations, reported rather
+//! than pinned):
+//!
+//! * the destructor of a **term-exposed** resource. `enif_make_resource` takes a reference for
+//!   the term, and the C drops it when the term is garbage-collected; `beam_abi` has no
+//!   "term died" signal, so that reference is never dropped and the destructor never runs for
+//!   such an object (a bounded, deliberate leak). The oracle destroys the object after a
+//!   `erlang:garbage_collect/0`, so a case that observed the count would be a `mismatch`.
+//!   Owning crate: `beam_abi` (`nif/enif/resources.rs`).
+//! * a **second** `enif_open_resource_type` of a name created by the *same* `load` callback.
+//!   In the C a type created during `load` is published only after the callback returns, so the
+//!   second open does not find it (`NULL`); `beam_abi` has no load session boundary and answers
+//!   the live type. Owning crate: `beam_abi` (same file).
+//!
 //! One further slot is **not** pinned because the two runtimes disagree on it today:
 //! `enif_priv_data` answers the pointer the load callback stored (`erl_nif.c:609`) under the
 //! oracle, while the Rust runtime leaves the `NifHost::priv_data` hook at its default and answers
 //! `NULL`. That is an observable difference, so no case pins it; it becomes pinnable the moment
 //! the host hook is implemented.
-
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 use crate::module_build::NifFixture;
 
@@ -156,8 +189,8 @@ const NIF_RES_MODULE_SOURCE: &str = r#"-module(nif_res).
          itype_sizeof/0, xtype_sizeof/0, resource_binary_probe/0,
          ioq_enqv_skip_probe/0, ioq_peek_head_probe/0, ioq_deq_partial_probe/0,
          ioq_empty_probe/0, mutex_trylock_probe/0, rwlock_tryrlock_probe/0,
-         cond_broadcast_probe/0, thread_exit_probe/0, getenv_probe/0, env_clear_probe/0]).
-
+         cond_broadcast_probe/0, thread_exit_probe/0, getenv_probe/0, env_clear_probe/0,
+         dtor_alloc_release/0, dtor_count/0, keep_probe/0, refuse_probe/0, flags_probe/0]).
 res_size() -> erlang:nif_error(not_loaded).
 ioq_size() -> erlang:nif_error(not_loaded).
 sync_roundtrip() -> erlang:nif_error(not_loaded).
@@ -184,7 +217,11 @@ cond_broadcast_probe() -> erlang:nif_error(not_loaded).
 thread_exit_probe() -> erlang:nif_error(not_loaded).
 getenv_probe() -> erlang:nif_error(not_loaded).
 env_clear_probe() -> erlang:nif_error(not_loaded).
-
+dtor_alloc_release() -> erlang:nif_error(not_loaded).
+dtor_count() -> erlang:nif_error(not_loaded).
+keep_probe() -> erlang:nif_error(not_loaded).
+refuse_probe() -> erlang:nif_error(not_loaded).
+flags_probe() -> erlang:nif_error(not_loaded).
 classify(N) ->
     Dir = filename:dirname(code:which(?MODULE)),
     case erlang:load_nif(Dir ++ "/nif_res", 0) of
@@ -215,12 +252,25 @@ classify(N) ->
                 23 -> nif_res:cond_broadcast_probe();
                 24 -> nif_res:thread_exit_probe();
                 25 -> nif_res:getenv_probe();
-                26 -> nif_res:env_clear_probe()
+                26 -> nif_res:env_clear_probe();
+                27 -> 0 = nif_res:dtor_alloc_release(), settle_dtor(50);
+                28 -> Pre = nif_res:keep_probe(), Pre * 10 + settle_dtor(50);
+                29 -> nif_res:refuse_probe();
+                30 -> nif_res:flags_probe()
             end;
         {error, {Reason, _Text}} ->
             reason_code(Reason)
     end.
 
+%% The oracle runs a resource destructor on a misc aux-work thread, so it is observable only once
+%% a scheduler gets to it; the Rust runtime runs it inline. *Waiting* for the count makes the two
+%% comparable without the corpus pinning *when* it ran: the settled count is the same integer.
+settle_dtor(0) -> nif_res:dtor_count();
+settle_dtor(N) ->
+    case nif_res:dtor_count() of
+        0 -> receive after 20 -> settle_dtor(N - 1) end;
+        Count -> Count
+    end.
 %% The extra-environment probes answer the atom `ok` when the runtime does the whole idiom, and
 %% the capability-gap atom `unsupported_enif_alloc_env` when it cannot (a `NULL` `enif_alloc_env`,
 %% or an `enif_make_copy` that answers the ABI's non-value). Either gap atom raises the documented
@@ -257,17 +307,24 @@ typedef struct { int value; } res_t;
    backs a binary with, plus a scalar field. */
 typedef struct { unsigned char buf[8]; int value; } xres_t;
 
-static int dtor_count = 0;
+static int dtor_runs = 0;
 static ErlNifResourceType* res_type = NULL;
 static ErlNifResourceType* itype = NULL;
 static ErlNifResourceType* xtype = NULL;
 static ErlNifResourceFlags itype_tried = 0;
 static ErlNifResourceFlags xtype_tried = 0;
-
+/* The `enif_open_resource_type` flag matrix: three *fresh* names, one per flag combination, opened
+   by the load callback (the oracle only allows an open while the module is loading). */
+static ErlNifResourceFlags takeover_only_tried = 99;
+static ErlNifResourceFlags create_takeover_tried = 99;
+static ErlNifResourceFlags no_flags_tried = 99;
+static ErlNifResourceType* takeover_only_type = NULL;
+static ErlNifResourceType* create_takeover_type = NULL;
+static ErlNifResourceType* no_flags_type = NULL;
 static void res_dtor(ErlNifEnv* env, void* obj) {
     (void) env;
     (void) obj;
-    dtor_count++;
+    dtor_runs++;
 }
 
 /* The second and third types are opened here, during the load callback, because the C may only
@@ -292,10 +349,20 @@ static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
     xtype_init.members = 3;
     xtype = enif_open_resource_type_x(env, "nif_res_xtype", &xtype_init,
                                       ERL_NIF_RT_CREATE, &xtype_tried);
+    /* The flag matrix, each on a *fresh* name: TAKEOVER alone has nothing to take over, the two
+       flags together create, and no flag at all is refused. `try_flags` records what each open
+       reported through `tried`. */
+    takeover_only_type = enif_open_resource_type(env, NULL, "nif_res_takeover_only", res_dtor,
+                                                 ERL_NIF_RT_TAKEOVER, &takeover_only_tried);
+    create_takeover_type = enif_open_resource_type(env, NULL, "nif_res_create_takeover", res_dtor,
+                                                   (ErlNifResourceFlags) (ERL_NIF_RT_CREATE
+                                                                         | ERL_NIF_RT_TAKEOVER),
+                                                   &create_takeover_tried);
+    no_flags_type = enif_open_resource_type(env, NULL, "nif_res_no_flags", res_dtor,
+                                            (ErlNifResourceFlags) 0, &no_flags_tried);
     *priv = (void*) res_type;
     return 0;
 }
-
 /* The resource-type family: allocate a resource, keep it (refcount 2), ask for its size,
    then release it twice. Returns sizeof(res_t) = 4. */
 static ERL_NIF_TERM res_size(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
@@ -979,10 +1046,94 @@ static ERL_NIF_TERM env_clear_probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM
     return enif_make_int(env, code);
 }
 
-static ErlNifFunc nif_res_funcs[] = {
-    {"res_size", 0, res_size, 0},
-    {"ioq_size", 0, ioq_size, 0},
-    {"sync_roundtrip", 0, sync_roundtrip, 0},
+/* ---- The resource lifetime family ------------------------------------------------------ */
+
+/* Allocate a resource and drop the allocator's reference — to zero, because the object is never
+   exposed as a term — so the type's destructor must run, exactly once. Returns 0 when the release
+   happened at all; the module settles `dtor_count` afterwards (see `settle_dtor/1`). */
+static ERL_NIF_TERM dtor_alloc_release(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    res_t* r = (res_t*) enif_alloc_resource(res_type, sizeof(res_t));
+    if (r == NULL)
+        return enif_make_int(env, -1);
+    r->value = 11;
+    enif_release_resource(r);
+    return enif_make_int(env, 0);
+}
+
+/* How many times the type's destructor has run in this VM. */
+static ERL_NIF_TERM dtor_count(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    return enif_make_int(env, dtor_runs);
+}
+
+/* alloc (refcount 1) -> enif_keep_resource (2) -> enif_release_resource (1): the object is still
+   referenced, so the destructor must NOT have run yet. Returns that in-call count (0 expected) and
+   leaves the release that reaches zero to the end of the call, so the module's settled count is
+   the single run the destructor owes. */
+static ERL_NIF_TERM keep_probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    res_t* r = (res_t*) enif_alloc_resource(res_type, sizeof(res_t));
+    int seen;
+    if (r == NULL)
+        return enif_make_int(env, -1);
+    r->value = 12;
+    enif_keep_resource(r);
+    enif_release_resource(r);
+    seen = dtor_runs;              /* a `keep` is outstanding: still alive, no destructor */
+    enif_release_resource(r);      /* the release that reaches zero */
+    return enif_make_int(env, seen);
+}
+
+/* `enif_get_resource` resolves a term to a resource of *this* type only: a small integer, a binary
+   and a resource term of the module's **other** type are all refused. Returns 1 + 2 + 4 = 7 when
+   every refusal held. The resource term is minted and its native reference released, so the term
+   (not the allocator) is what keeps that object alive while it is tested. */
+static ERL_NIF_TERM refuse_probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    res_t* other;
+    ERL_NIF_TERM res_term, binary;
+    unsigned char* p;
+    void* got = NULL;
+    int code = 0;
+    if (xtype == NULL)
+        return enif_make_int(env, -1);
+    other = (res_t*) enif_alloc_resource(res_type, sizeof(res_t));
+    if (other == NULL)
+        return enif_make_int(env, -1);
+    other->value = 5;
+    res_term = enif_make_resource(env, other);
+    enif_release_resource(other);
+    p = enif_make_new_binary(env, 1, &binary);
+    p[0] = 'x';
+    if (!enif_get_resource(env, enif_make_int(env, 3), xtype, &got))
+        code += 1;
+    if (!enif_get_resource(env, binary, xtype, &got))
+        code += 2;
+    if (!enif_get_resource(env, res_term, xtype, &got))
+        code += 4;
+    return enif_make_int(env, code);
+}
+
+/* The `enif_open_resource_type` flag matrix, one fresh name per combination (both runtimes only
+   allow the open while the module is loading, so the callback did it): TAKEOVER without CREATE has
+   nothing to take over and is refused while reporting the requested flag (1); CREATE|TAKEOVER on a
+   fresh name creates it and reports CREATE (10); a flags value of 0 is refused and reports 0
+   (100). Returns 111 when all three held. */
+static ERL_NIF_TERM flags_probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    int code = 0;
+    if (takeover_only_type == NULL && takeover_only_tried == ERL_NIF_RT_TAKEOVER)
+        code += 1;
+    if (create_takeover_type != NULL && create_takeover_tried == ERL_NIF_RT_CREATE)
+        code += 10;
+    if (no_flags_type == NULL && no_flags_tried == (ErlNifResourceFlags) 0)
+        code += 100;
+    return enif_make_int(env, code);
+}
+
+static ErlNifFunc nif_res_funcs[] = {    {"res_size", 0, res_size, 0},
+    {"ioq_size", 0, ioq_size, 0},    {"sync_roundtrip", 0, sync_roundtrip, 0},
     {"res_roundtrip", 0, res_roundtrip, 0},
     {"self_alive", 0, self_alive, 0},
     {"alloc_env_probe", 0, alloc_env_probe, 0},
@@ -1005,9 +1156,13 @@ static ErlNifFunc nif_res_funcs[] = {
     {"cond_broadcast_probe", 0, cond_broadcast_probe, 0},
     {"thread_exit_probe", 0, thread_exit_probe, 0},
     {"getenv_probe", 0, getenv_probe, 0},
-    {"env_clear_probe", 0, env_clear_probe, 0}
+    {"env_clear_probe", 0, env_clear_probe, 0},
+    {"dtor_alloc_release", 0, dtor_alloc_release, 0},
+    {"dtor_count", 0, dtor_count, 0},
+    {"keep_probe", 0, keep_probe, 0},
+    {"refuse_probe", 0, refuse_probe, 0},
+    {"flags_probe", 0, flags_probe, 0}
 };
-
 /* `ERL_NIF_INIT` seeds ErlNifEntry.name with the stringified module name (`nif_res`), so this
    library may only be loaded as `nif_res`. */
 ERL_NIF_INIT(nif_res, nif_res_funcs, load, NULL, NULL, NULL)
@@ -1230,9 +1385,36 @@ pub(crate) fn group() -> Vec<Case> {
             // 1 (atom) + 10 (identical to the call env's atom) + 100 (distinct from the pre-clear one).
             "111",
         ),
+        case(
+            "nif_res/destructor_runs_once_the_last_reference_goes",
+            "a resource released to zero (never exposed as a term) runs its type's destructor exactly once",
+            &[27],
+            // The settled `dtor_count`: one object, one destructor run.
+            "1",
+        ),
+        case(
+            "nif_res/keep_holds_the_object_before_the_last_release",
+            "enif_keep_resource keeps an object alive across a release, and only the release reaching zero destroys it",
+            &[28],
+            // 10 * (the in-call count after the balanced keep/release: 0) + 1 (the settled count).
+            "1",
+        ),
+        case(
+            "nif_res/get_resource_refuses_a_non_resource_term",
+            "enif_get_resource refuses a small int, a binary and a resource term of another type",
+            &[29],
+            // 1 (int) + 2 (binary) + 4 (a resource of the other type).
+            "7",
+        ),
+        case(
+            "nif_res/open_resource_type_flag_matrix",
+            "enif_open_resource_type refuses TAKEOVER alone and no flags, and CREATE|TAKEOVER creates and reports CREATE",
+            &[30],
+            // 1 (TAKEOVER refused) + 10 (CREATE|TAKEOVER created) + 100 (no flags refused).
+            "111",
+        ),
     ]
 }
-
 #[cfg(test)]
 mod tests {
     //! Invariants of the A.3 resource/ioq/sync group.
@@ -1281,8 +1463,7 @@ mod tests {
             );
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
         }
-        assert_eq!(selectors.len(), 26, "the group covers twenty-six distinct selectors");
-    }
+        assert_eq!(selectors.len(), 30, "the group covers thirty distinct selectors");    }
 
     #[test]
     fn the_c_library_references_the_extra_environment_probe() {

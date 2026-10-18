@@ -166,9 +166,48 @@ impl Rig {
             bytes,
             crate::port::PortCommandOptions::EMPTY,
         )?;
+        self.round()
+    }
+
+    /// Runs exactly **one** port-task round — [`crate::PortRegistry::execute_port_tasks`] under the
+    /// default readiness budget — with no command queued first.
+    ///
+    /// This is the point an asynchronous socket operation's completion is produced: the round
+    /// drives [`Driver::drive_async`], so a queued `recv`/`accept` that the socket can already
+    /// satisfy is answered here, never inside its control call. A driver that refuses the write it
+    /// was handed reports it as an error, exactly as `erlang:port_command/2` would.
+    pub(super) fn round(&mut self) -> Result<()> {
         self.registry
             .execute_port_tasks(&mut self.poller, crate::port::DEFAULT_READINESS_RED_BUDGET)
             .map(|_round| ())
+    }
+
+    /// Drains every completion the drivers staged during the last round — the messages the runtime
+    /// turns into `{inet_async, …}`/`{inet_reply, …}` (see [`crate::completion`]).
+    pub(super) fn completions(&mut self) -> Vec<crate::completion::PortCompletion> {
+        self.registry.take_completions()
+    }
+
+    /// The port's declared timer deadline ([`Driver::next_timeout`]), which the registry mirrors
+    /// into the port's single `TIMEOUT` task.
+    pub(super) fn next_timeout(&self) -> Option<std::time::Instant> {
+        self.registry
+            .get(self.id)
+            .expect("a live port")
+            .next_timeout()
+    }
+
+    /// Closes the port — [`crate::PortRegistry::close`], the teardown that runs the driver's
+    /// [`Driver::stop`] and harvests whatever it staged.
+    pub(super) fn close(&mut self) {
+        self.registry
+            .close(&mut self.poller, self.id)
+            .expect("the port closes");
+    }
+
+    /// Whether the port is still live in the registry.
+    pub(super) fn contains(&self) -> bool {
+        self.registry.contains(self.id)
     }
 }
 /// How a matrix reply is compared, chosen by whether it can be deterministic in the first place.
@@ -711,10 +750,12 @@ fn numeric_peer_is_enotconn_until_the_socket_is_connected() {
 /// comes first (so a wrong-length operand on a port with no peer is the C's `enotconn`), and only a
 /// connected socket reaches the `len != 8 ⇒ einval` check.
 ///
-/// Divergence from the C, recorded here rather than asserted away: on a connected socket the C
-/// enqueues an asynchronous receive and answers `[1] ++ async_id_be16` (measured `[1,0,1]`), while
-/// this floor's `recv` is a synchronous read-now verb and answers the bare `[1]` (see the
-/// async-op-queue entry in the crate `CONTEXT.md`).
+/// A well-formed operand on a connected socket enqueues an asynchronous receive and answers
+/// `[1] ++ async_id_be16` — the C's `ctl_reply_ok` of a two-byte buffer (`inet_drv.c:12319`),
+/// measured as `[1,0,1]` on a descriptor whose id counter has already advanced once; a fresh one
+/// answers `[1,0,0]` ([`async_ok_reply`](super::async_ok_reply)). The data itself arrives later as
+/// `{inet_async, Port, Id, {ok, Data}}` — see the sibling
+/// [`async_tests`](super::async_tests) suite.
 #[test]
 fn numeric_tcp_recv_validates_the_eight_byte_operand() {
     let mut connected = connection();
@@ -725,8 +766,8 @@ fn numeric_tcp_recv_validates_the_eight_byte_operand() {
     );
     assert_eq!(
         connected.port.control(&op(42), &[0, 0, 0, 0, 0, 0, 0, 0]),
-        ctl_ok(),
-        "the synchronous floor's bare `[1]` (the C would answer [1] ++ async_id_be16)"
+        vec![1, 0, 0],
+        "the asynchronous receive answers [1] ++ <<Id:16/big>>, id 0 on a fresh descriptor"
     );
 
     let mut bare = bare_port();
@@ -749,12 +790,10 @@ fn numeric_tcp_recv_validates_the_eight_byte_operand() {
     );
 }
 
-/// `INET_REQ_ACCEPT`(26) requires the C's four-byte `Timeout` operand.
-///
-/// Divergence from the C: with a four-byte operand the C enqueues an asynchronous accept and
-/// answers the three-byte op id `[1] ++ async_id_be16` (measured `[1,0,0]`); this floor's accept
-/// is synchronous, so it answers the bare `[1]` when nothing is pending. Only the malformed
-/// operand is compared against the oracle (below).
+/// `INET_REQ_ACCEPT`(26) requires the C's four-byte `Timeout` operand, and a well-formed one joins
+/// the multi-op accept list: the reply is the three-byte async id `[1] ++ <<Id:16/big>>`
+/// (`inet_drv.c:12194`/`:12209`), never `ealready` — measured `[1,0,0]` on a fresh listener, with
+/// the connection delivered later as `{inet_async, Port, Id, {ok, Descriptor}}`.
 #[test]
 fn numeric_accept_requires_the_four_byte_timeout() {
     let (mut listening, _port) = listening_port();
@@ -765,8 +804,8 @@ fn numeric_accept_requires_the_four_byte_timeout() {
     );
     assert_eq!(
         listening.control(&op(26), &[0, 0, 0, 0]),
-        ctl_ok(),
-        "a synchronous accept with nothing pending answers the bare [1]"
+        vec![1, 0, 0],
+        "a queued accept answers [1] ++ <<Id:16/big>>, id 0 on a fresh descriptor"
     );
 
     // With no listener at all the verb's own state check refuses the call.
@@ -937,9 +976,10 @@ fn an_unserved_numeric_opcode_is_a_typed_gap() {
 // -----------------------------------------------------------------------
 
 /// The named and the numeric route reach the same verbs, so their replies must be identical —
-/// the one exception being `close`, whose name the registry reserves
-/// ([`crate::PortControl::CLOSE`]) and whose numeric form is the driver's own
-/// `INET_REQ_CLOSE` verb.
+/// with two documented exceptions: `close`, whose name the registry reserves
+/// ([`crate::PortControl::CLOSE`]) and whose numeric form is the driver's own `INET_REQ_CLOSE`
+/// verb, and `accept`, whose named form is this floor's synchronous port-transferring convenience
+/// verb while the numeric `INET_REQ_ACCEPT` is the C's queued asynchronous operation.
 #[test]
 fn the_named_and_the_numeric_route_reply_identically() {
     let mut named = bare_port();
@@ -975,12 +1015,19 @@ fn the_named_and_the_numeric_route_reply_identically() {
         numeric.control(&op(8), &[INET_OPT_KEEPALIVE]),
         "getopts vs INET_REQ_GETOPTS"
     );
-    // The named `accept` takes no operand; the numeric one carries the C's four-byte timeout.
-    // Both reach the same synchronous accept with nothing pending.
+    // The named `accept` takes no operand and stays this floor's **synchronous** convenience verb
+    // (it transfers the port to the connection); the numeric one carries the C's four-byte timeout
+    // and queues an asynchronous operation, answering `[1] ++ <<Id:16/big>>`. That is the one
+    // deliberate divergence between the two routes, so it is asserted as such.
     assert_eq!(
         named.control("accept", &[]),
+        ctl_ok(),
+        "the named `accept` still answers the bare [1] when nothing is pending"
+    );
+    assert_eq!(
         numeric.control(&op(26), &[0, 0, 0, 0]),
-        "accept vs INET_REQ_ACCEPT"
+        vec![1, 0, 0],
+        "INET_REQ_ACCEPT queues an async accept and answers the id"
     );
     assert_eq!(
         named.control("open", &open_arg()),

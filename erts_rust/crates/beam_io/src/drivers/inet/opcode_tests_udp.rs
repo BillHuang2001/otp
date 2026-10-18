@@ -241,12 +241,9 @@ fn numeric_peer_name_and_getstat_on_a_datagram_port() {
 
 /// `PACKET_REQ_RECV`(60) is `packet_inet_ctl`'s own receive: it needs a socket **first** (the
 /// C's `!IS_OPEN ⇒ `[0]exbadport`) and only then the eight-byte `Timeout(4), Length(4)` operand.
-///
-/// Divergence from the C, recorded instead of asserted away: with a well-formed operand the C
-/// enqueues an asynchronous receive and answers the three-byte op id `[1] ++ async_id_be16`
-/// (measured `[1,0,0]`), the datagram arriving later as an `{inet_async, …}` message. This floor
-/// has no driver→owner message path, so its `recv` is the synchronous read-now substitution: the
-/// **bare** `[1]` when no datagram is pending, `[1] ++ source_address` when one is.
+/// A well-formed operand enqueues an asynchronous receive and answers the three-byte op id
+/// `[1] ++ async_id_be16` (measured `[1,0,0]`), the datagram arriving later as an
+/// `{inet_async, …}` completion — [`crate::PortRegistry::take_completions`].
 #[test]
 fn numeric_packet_recv_validates_its_operand_and_needs_a_socket() {
     let mut bare = bare_port();
@@ -269,8 +266,17 @@ fn numeric_packet_recv_validates_its_operand_and_needs_a_socket() {
     );
     assert_eq!(
         port.control(&op(60), &[0u8; 8]),
-        ctl_ok(),
-        "the synchronous floor's bare [1]: no datagram is pending"
+        vec![1, 0, 0],
+        "a well-formed operand answers the async id [1] ++ <<Id:16/big>>"
+    );
+    assert!(
+        port.completions().is_empty(),
+        "the datagram (or its failure) is a later completion, never the reply"
+    );
+    assert_eq!(
+        port.control(&op(60), &[0u8; 8]),
+        ctl_xerror("ealready"),
+        "the single receive slot is taken (`INET_MAX_ASYNC`)"
     );
 }
 
@@ -894,12 +900,19 @@ fn the_named_and_the_numeric_route_reply_identically() {
         numeric.control(&op(8), &[INET_OPT_BROADCAST]),
         "getopts vs INET_REQ_GETOPTS"
     );
-    // The named `recv` takes no operand; the numeric `PACKET_REQ_RECV` carries the C's
-    // `Timeout(4), Length(4)`. With nothing pending both reach the same read-now.
+    // `recv` is the one row where the two routes deliberately diverge: the **named** verb is this
+    // floor's synchronous read-now convenience (the C has no such control op at all), while the
+    // numeric `PACKET_REQ_RECV` is the C's own asynchronous queue and answers
+    // `[1] ++ <<Id:16/big>>`, its datagram arriving as a later completion.
     assert_eq!(
         named.control("recv", &[]),
+        ctl_ok(),
+        "the named read-now verb finds nothing pending"
+    );
+    assert_eq!(
         numeric.control(&op(60), &[0u8; 8]),
-        "recv vs PACKET_REQ_RECV"
+        vec![1, 0, 0],
+        "recv vs PACKET_REQ_RECV: the numeric route queues and answers an id"
     );
 
     // A command that is not a decimal integer still takes the named path, where an unknown verb
@@ -1035,14 +1048,15 @@ fn oracle_matrix() -> Vec<Call> {
 /// the real system `udp_inet` port and against this crate's port over `port_control`.
 ///
 /// The matrix carries only rows both sides can reproduce **byte for byte**. Three families are
-/// deliberately left to the non-oracle tests above: the well-formed `PACKET_REQ_RECV` and the
-/// `subscribe`/`getservby*`/`getif*` bodies (this floor's synchronous read-now substitution, and
-/// the typed capability gaps — a gap raises rather than replying, so it cannot ride a
-/// `port_control` matrix at all), the well-formed `fdopen` adoption (a descriptor number means
-/// something else in the oracle, so it is compared Rust-side only), and the `getiflist` reply (a
-/// host-dependent `getifaddrs(3)` interface table). Everything else — including the post-close
-/// `GETTYPE` row and the `{eol}`-free refusal rows — is compared exactly, with the
-/// ephemeral-port/descriptor rows compared shape-wise by [`Rule`].
+/// deliberately left out: the `subscribe`/`getservby*`/`getif*` bodies (the typed capability gaps —
+/// a gap raises rather than replying, so it cannot ride a `port_control` matrix at all), the
+/// well-formed `fdopen` adoption (a descriptor number means something else in the oracle, so it is
+/// compared Rust-side only), and the `getiflist` reply (a host-dependent `getifaddrs(3)` interface
+/// table). The well-formed `PACKET_REQ_RECV`(60) rows are compared against the oracle in the
+/// dedicated asynchronous suite (`udp/async_tests.rs`), which drives the reply, the completion, the
+/// deadline and the teardown end to end — this matrix keeps only its refusal rows.
+/// Everything else — including the post-close `GETTYPE` row and the `{eol}`-free refusal rows — is
+/// compared exactly, with the ephemeral-port/descriptor rows compared shape-wise by [`Rule`].
 ///
 /// **Skips loudly** when `erl` is not on `PATH`.
 #[test]

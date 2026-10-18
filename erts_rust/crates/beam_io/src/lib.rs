@@ -56,6 +56,15 @@
 //! [`port_task`] (per-port task scheduling: the ERTS port-task queue, its reduction costs
 //! and the notification seam a task round reports through).
 //!
+//! The [`completion`] module is the **driver→owner message side channel** — the
+//! `{inet_reply, Port, Reply[, Tag]}` answers to `erlang:port_command/2` and the
+//! `{inet_async, Port, Id, Result}` completions of queued asynchronous operations, i.e. the C's
+//! `erl_drv_send_term`/`driver_send_term` path (`inet_reply_am`/`inet_reply_finish`,
+//! `inet_drv.c:2606-2680`; `send_async_ok`/`send_async_ok_port`/`send_async_error`,
+//! `:2493-2562`). A driver stages one with [`DriverContext::deliver_completion`] and the runtime
+//! drains it with [`PortRegistry::take_completions`], exactly as it drains the `{line, N}`
+//! channel — a **third** side channel, deliberately not a [`PortNotification`] variant, so an
+//! exhaustive consumer stays exhaustive.//!
 //! The [`signal`] module is the **OS-signal facility** — the unsafe `sigaction(2)`/signal
 //! work `beam_rt` (which denies `unsafe_code`) cannot do itself: a self-pipe plus an
 //! async-signal-safe trampoline backing `os:set_signal/2`.
@@ -118,6 +127,7 @@
 #![warn(missing_docs)]
 
 pub mod abi;
+pub mod completion;
 pub mod cpu_time;
 pub mod ddll;
 pub mod driver;
@@ -135,6 +145,7 @@ pub mod timer;
 mod error; // `pub(crate)` constructors only — NOT public
 
 pub use crate::abi::*;
+pub use crate::completion::*;
 pub use crate::cpu_time::*;
 pub use crate::ddll::*;
 pub use crate::driver::*;
@@ -154,7 +165,9 @@ pub use crate::timer::*;
 /// [`Ready`], [`Event`], [`Waker`]), the port ([`Port`], [`PortState`],
 /// [`PortRegistry`], [`PortControl`], [`PortCommandOptions`]), the port-task machinery
 /// ([`PortTaskKind`], [`PortTask`], [`PortTaskQueue`], [`PortNotification`],
-/// [`PortTaskOutcome`], [`Readiness`]) the driver seam ([`Driver`], [`DriverContext`],
+/// [`PortTaskOutcome`], [`Readiness`]) and the driver→owner completion channel
+/// ([`PortCompletion`], [`CompletionEvent`], [`InetReply`], [`InetAsyncResult`],
+/// [`InetReason`]) the driver seam ([`Driver`], [`DriverContext`],
 /// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`PortExitReason`],
 /// the emulator's statically-linked driver set ([`STATIC_SPAWN_DRIVERS`],
 /// [`is_static_spawn_driver`]), [`FdDriver`],
@@ -171,6 +184,7 @@ pub use crate::timer::*;
 /// [`try_access`], [`path_access`], [`process_credentials`]) into scope.
 pub mod prelude {
     pub use crate::abi::*;
+    pub use crate::completion::*;
     pub use crate::cpu_time::*;
     pub use crate::ddll::*;
     pub use crate::driver::*;

@@ -41,6 +41,7 @@ use std::time::Instant;
 use beam_common::Result;
 use beam_process::PortId;
 
+use crate::completion::{CompletionEvent, PortCompletion};
 use crate::error;
 use crate::poller::{Interest, Poller, Token};
 use crate::port_task::ReadMessage;
@@ -164,6 +165,11 @@ pub struct DriverContext<'a> {
     /// `None` in a bare test context — a driver that asks for the split shape without a sink
     /// gets the typed `unsupported` instead of a silently flattened read.
     reads: Option<&'a mut VecDeque<ReadMessage>>,
+    /// The port's sink for **completions** — the `{inet_reply, …}`/`{inet_async, …}` messages a
+    /// socket driver owes the port's owner (see [`DriverContext::deliver_completion`]) — or
+    /// `None` in a bare test context, where a driver that hands one up gets the typed
+    /// `unsupported` instead of the completion being dropped.
+    completions: Option<&'a mut Vec<PortCompletion>>,
 }
 
 impl<'a> DriverContext<'a> {
@@ -171,9 +177,11 @@ impl<'a> DriverContext<'a> {
     ///
     /// Called by [`crate::port::Port`] after it has destructured itself into disjoint
     /// fields, so the driver and its context borrow separate members of the `Port`. A context
-    /// built here has **no** read sink, so [`DriverContext::deliver_read`] answers the typed
-    /// `unsupported`; [`crate::port::Port`] installs one with
-    /// [`DriverContext::with_reads`] at every driver callback.
+    /// built here has **no** read sink and **no** completion sink, so
+    /// [`DriverContext::deliver_read`] and [`DriverContext::deliver_completion`] answer the typed
+    /// `unsupported`; [`crate::port::Port`] installs both with
+    /// [`DriverContext::with_reads`]/[`DriverContext::with_completions`] at every driver
+    /// callback.
     pub(crate) fn new(
         port: PortId,
         poller: &'a mut Poller,
@@ -188,6 +196,7 @@ impl<'a> DriverContext<'a> {
             output,
             arms,
             reads: None,
+            completions: None,
         }
     }
 
@@ -202,6 +211,23 @@ impl<'a> DriverContext<'a> {
         self.reads = Some(reads);
         self
     }
+
+    /// Installs `completions` as this context's completion sink (chainable).
+    ///
+    /// Every driver callback a [`crate::port::Port`] dispatches gets one — `start`, `output`,
+    /// `ready_input`, `ready_output`, `control`, `timeout`, `drive_async` and `stop` — so a
+    /// driver may hand a completion up (and must be able to) from any of them: an
+    /// `{inet_reply, …}` staged from `timeout` is the *only* way a timer-driven `{error,
+    /// timeout}` can reach the owner, because [`Driver::timeout`]'s own return value is
+    /// discarded by the port task that runs it.
+    pub(crate) fn with_completions(
+        mut self,
+        completions: &'a mut Vec<PortCompletion>,
+    ) -> DriverContext<'a> {
+        self.completions = Some(completions);
+        self
+    }
+
     /// The port this context belongs to.
     pub fn port(&self) -> PortId {
         self.port
@@ -290,6 +316,40 @@ impl<'a> DriverContext<'a> {
             header: header.to_vec(),
             body: body.map(<[u8]>::to_vec),
         });
+        Ok(())
+    }
+
+    /// Hands one **completion** up to the port's owner.
+    ///
+    /// This is the C's `driver_send_term`/`erl_drv_send_term` message path — the only way a
+    /// driver can tell its owner something that is *not* the return value of the operation the
+    /// owner called. The inet driver uses it for the two families
+    /// [`CompletionEvent`] models: the `{inet_reply, Port, Reply[, Tag]}` answer to a
+    /// `port_command` (`inet_reply_am`/`inet_reply_error_am`/`inet_reply_finish`,
+    /// `erts/emulator/drivers/common/inet_drv.c:2606-2680`) and the
+    /// `{inet_async, Port, Id, Result}` completion of a queued asynchronous operation
+    /// (`send_async_ok`/`send_async_ok_port`/`send_async_error`, `:2493-2562`). See the
+    /// [`crate::completion`] module docs for the channel's contract.
+    ///
+    /// The completion is **stamped with this context's own port** ([`DriverContext::port`]), so
+    /// a driver cannot attribute a completion to another port; the runtime drains it after the
+    /// round with [`crate::PortRegistry::take_completions`]. Deliveries are queued in call order
+    /// and each is reported exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed `unsupported` diagnostic when this context has **no** completion sink: a
+    /// bare context (a unit test, or a driver driven outside a port) has no owner to report to,
+    /// and dropping the completion silently would lose a reply the owner is blocked on — so it is
+    /// a typed error, never a no-op.
+    pub fn deliver_completion(&mut self, event: CompletionEvent) -> Result<()> {
+        let port = self.port;
+        let Some(completions) = self.completions.as_mut() else {
+            return Err(error::unsupported(
+                "a driver handed up a completion ({inet_reply,…}/{inet_async,…}) outside a port: no completion sink is installed",
+            ));
+        };
+        completions.push(PortCompletion::new(port, event));
         Ok(())
     }
 

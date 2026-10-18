@@ -145,10 +145,40 @@
 //!   index form is unaffected by `[safe]` (asserted through the `[safe,used]`
 //!   consumed-byte count, since the index→atom mapping is bootstrap-order dependent).
 //!
+//! * the **`{minor_version, N}` id/float matrix** — `term_to_binary/2`'s legacy dialects
+//!   (`0`/`1`/`2`) do **not** downgrade the external-id tags (a pid stays `NEW_PID_EXT`
+//!   (88), a reference `NEWER_REFERENCE_EXT` (90), an internal port `V4_PORT_EXT` (120)
+//!   under all three), while they *do* select the float dialect: `FLOAT_EXT` (99, the
+//!   ASCII body) only under version `0`, `NEW_FLOAT_EXT` (70) under 1 and 2. Each case
+//!   reduces the per-VM-start image to its tag byte; the version-`0` Latin-1 atom golden
+//!   (`ATOM_EXT` (100) with the latin-1 bytes) is VM-stable, and the decode direction
+//!   pins that a latin-1 `ATOM_EXT` name re-encodes as the UTF-8 `SMALL_ATOM_UTF8_EXT`
+//!   (119) image of the *same* atom. Every bit width a non-byte-aligned bitstring can
+//!   take (1..15) round-trips, and ±2^128 pin the 17-digit `SMALL_BIG_EXT` (110) pair
+//!   (`110,17,Sign,D0..D15`), differing only in the sign byte.
+//!
+//! * the **remaining decode refusals** — a `MAP_EXT` (116) naming the same key twice, a
+//!   map pair count / `LARGE_TUPLE_EXT` (105) arity of 2^32-1, an `ATOM_CACHE_REF` (82)
+//!   (distribution-internal, meaningless standalone), a `STRING_EXT` (107) length prefix
+//!   that overruns the buffer, a `LOCAL_EXT` (121) prologue with no term body, and a
+//!   `NEW_PID_EXT` (88) whose node field is not an atom. Each is a plain `badarg` in both
+//!   runtimes.
+//!
 //! A live handshake and the on-wire `DOP_*`/`DFLAG_*` negotiation are **not**
 //! expressible through a single CLI process (they need two connected nodes) — an
 //! honest, documented gap, not a fabricated case (see `super::wire`); only the
 //! *payload shapes* those messages carry are pinned here, as ordinary ETF terms.
+//!
+//! ## Measured divergences / not covered
+//! * **A send to a pid on a node with no connection** is unpinned: the oracle *drops* the
+//!   message and answers it to the sender (`Pid ! Msg` → `Msg`,
+//!   `erlang:send(Pid, Msg, [noconnect])` → `Msg`) for a decoded remote pid
+//!   (`NEW_PID_EXT` naming `other`), while the Rust runtime raises a plain (not
+//!   `unsupported`-prefixed) reason — `distribution: this runtime is not a distributed
+//!   node (no -name/-sname)` off the `-name`/`-sname` path and
+//!   `beam_rt: error distribution: no established connection to node …` under `-sname`.
+//!   A case pinning it would be a `mismatch`, so it stays out of the corpus; owner
+//!   `beam_rt` (the distribution send path).
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -744,6 +774,42 @@ pub(crate) fn group() -> Vec<Case> {
         v("wire_extra/dist_unlink_id_tag_35_bytes", "the DOP_UNLINK_ID (35) control tuple round-trips with the node atoms and atom payloads", "{35, node(), node(), someid}", "ok {35,nonode@nohost,nonode@nohost,someid}"),
         v("wire_extra/dist_unlink_id_ack_tag_36_bytes", "the DOP_UNLINK_ID_ACK (36) control tuple round-trips with the node atoms and atom payloads", "{36, node(), node(), someid}", "ok {36,nonode@nohost,nonode@nohost,someid}"),
         v("wire_extra/dist_altact_sig_send_tag_37_tag_and_size", "the DOP_ALTACT_SIG_SEND (37) control tuple keeps its tag and its arity", "{element(1, {37, node(), node(), normal}), tuple_size({37, node(), node(), normal})}", "ok {37,4}"),
+        // -- the `{minor_version, N}` id/float format matrix ---------------------------
+        // `term_to_binary/2`'s `{minor_version, N}` option chooses the *legacy* dialects for
+        // floats and atoms, but it does **not** downgrade the external-id tags: a pid is
+        // `NEW_PID_EXT` (88), a reference `NEWER_REFERENCE_EXT` (90) and an internal port
+        // `V4_PORT_EXT` (120) under all three versions, while a float is the legacy ASCII
+        // `FLOAT_EXT` (99) only under version 0 and `NEW_FLOAT_EXT` (70) under 1 and 2. Each
+        // case reduces a per-VM-start image to its tag byte (or to a `binary_to_term`-free
+        // stable byte image), so no per-VM id/creation/serial value is ever pinned.
+        v("wire_extra/mv_pid_tag_is_new_pid_ext_for_every_minor_version", "a pid encodes as NEW_PID_EXT (88) under {minor_version,0}, 1 and 2 alike", "[binary:at(term_to_binary(self(),[{minor_version,N}]),1) || N <- [0,1,2]]", "ok [88,88,88]"),
+        v("wire_extra/mv_ref_tag_is_newer_reference_for_every_minor_version", "a local reference encodes as NEWER_REFERENCE_EXT (90) under {minor_version,0}, 1 and 2 alike", "[binary:at(term_to_binary(make_ref(),[{minor_version,N}]),1) || N <- [0,1,2]]", "ok [90,90,90]"),
+        v("wire_extra/mv_port_tag_is_v4_port_for_every_minor_version", "an internal port encodes as V4_PORT_EXT (120) under {minor_version,0}, 1 and 2 alike", "begin Port = open_port({spawn,\"cat\"},[binary]), Tags = [binary:at(term_to_binary(Port,[{minor_version,N}]),1) || N <- [0,1,2]], port_close(Port), Tags end", "ok [120,120,120]"),
+        v("wire_extra/mv_float_tag_is_legacy_only_at_minor_version_0", "a float is the legacy ASCII FLOAT_EXT (99) under {minor_version,0} and NEW_FLOAT_EXT (70) under 1 and 2", "[binary:at(term_to_binary(1.5,[{minor_version,N}]),1) || N <- [0,1,2]]", "ok [99,70,70]"),
+        v("wire_extra/mv0_nonlatin_atom_latin1_bytes", "under {minor_version,0} a Latin-1 atom encodes as ATOM_EXT (100) with its latin-1 bytes, not UTF-8", "term_to_binary(list_to_atom([252,98,101,114]),[{minor_version,0}])", "ok <<131,100,0,4,252,98,101,114>>"),
+        // -- a latin-1 atom *name* decodes to the same atom as its UTF-8 spelling --------
+        // `ATOM_EXT` (100) carries a latin-1 name, so the byte 233 names `é`; the decode
+        // re-encodes canonically as `SMALL_ATOM_UTF8_EXT` (119) with the two UTF-8 bytes.
+        t("wire_extra/at_decode_100_latin1_reencodes_utf8", "a Latin-1 ATOM_EXT (100) name decodes and re-encodes as the UTF-8 SMALL_ATOM_UTF8_EXT (119) image", "binary_to_term(<<131,100,0,1,233>>)", "ok <<131,119,2,195,169>>"),
+        // -- BIT_BINARY_EXT (77): every width at once -----------------------------------
+        t("wire_extra/bit_all_fifteen_widths_roundtrip", "every non-byte-aligned bitstring width 1..15 round-trips through term_to_binary/binary_to_term", "lists:all(fun(N) -> binary_to_term(term_to_binary(<<5:N>>)) =:= <<5:N>> end, lists:seq(1,15))", TRUE),
+        // -- SMALL_BIG_EXT (110) at 128 bits, both signs --------------------------------
+        // A 128-bit magnitude is 16 little-endian digits plus the sign byte, so the image is
+        // `110,17,Sign,D0..D15` with the high digit (`1`) last.
+        v("wire_extra/ie_small_big_128_bits_both_signs", "±2^128 encode as 17-digit SMALL_BIG_EXT (110) images differing only in the sign byte", "{term_to_binary(1 bsl 128), term_to_binary(-(1 bsl 128))}", "ok {<<131,110,17,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1>>,<<131,110,17,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1>>}"),
+        // -- decode refusals the tag-level matrix added ---------------------------------
+        // Each is a plain `badarg` the runtime must reproduce: a duplicate map key, an
+        // ATOM_CACHE_REF (82) (distribution-internal, meaningless in a standalone image), a
+        // 32-bit arity/count field no term can satisfy, a length prefix that overruns the
+        // buffer, a `LOCAL_EXT` (121) with no body, and an external id whose node field is
+        // not an atom.
+        verr("wire_extra/err_map_duplicate_key_badarg", "a MAP_EXT (116) image that names the same key twice is badarg", "binary_to_term(<<131,116,0,0,0,2,119,1,97,97,1,119,1,97,97,2>>)"),
+        verr("wire_extra/err_map_pair_count_overflow_badarg", "a MAP_EXT (116) declared pair count of 2^32-1 with no pairs is badarg", "binary_to_term(<<131,116,255,255,255,255>>)"),
+        verr("wire_extra/err_atom_cache_ref_badarg", "an ATOM_CACHE_REF (82) tag is distribution-internal, so a standalone binary_to_term/1 refuses it with badarg", "binary_to_term(<<131,82,0>>)"),
+        verr("wire_extra/err_large_tuple_arity_overflow_badarg", "a LARGE_TUPLE_EXT (105) declared arity of 2^32-1 with no elements is badarg", "binary_to_term(<<131,105,255,255,255,255>>)"),
+        verr("wire_extra/err_string_ext_length_beyond_buffer_badarg", "a STRING_EXT (107) whose 16-bit length overruns the buffer is badarg", "binary_to_term(<<131,107,0,5,1,2>>)"),
+        verr("wire_extra/err_local_ext_without_body_badarg", "a LOCAL_EXT (121) prologue with its 4-byte node hash but no term body is badarg", "binary_to_term(<<131,121,0,0,0,0>>)"),
+        verr("wire_extra/err_new_pid_ext_node_not_atom_badarg", "a NEW_PID_EXT (88) whose node field is not an atom tag is badarg", "binary_to_term(<<131,88,97,1,0,0,0,9,0,0,0,0,0,0,0,1>>)"),
     ]
 }
 
@@ -756,11 +822,9 @@ mod tests {
     #[test]
     fn wire_extra_cases_are_well_formed() {
         let cases = group();
-        assert!(
-            cases.len() >= 100,
-            "the expanded A.5 group should be broad (got {})",
-            cases.len()
-        );
+        // The exact size is pinned so a case can never vanish from the registry unnoticed;
+        // grow this number in the same change that adds cases.
+        assert_eq!(cases.len(), 428, "the expanded A.5 group size");
         let mut seen = HashSet::new();
         for case in &cases {
             assert!(
@@ -1240,6 +1304,93 @@ mod tests {
                 "case {id} must carry the oracle-derived badarg golden"
             );
             assert_eq!(case.golden.exit_code, 1, "case {id} golden must exit 1");
+        }
+    }
+
+    /// The `{minor_version, N}` id/float matrix, the latin-1 atom-name round trip, the
+    /// every-width bitstring round trip, the 128-bit bignum pair and the decode refusals
+    /// they added. Every golden is the oracle's own line and the Rust runtime reproduces it
+    /// (each case `agree`s), so pin the ids and their goldens here to stop a silent
+    /// regression — and pin that **no** new case asserts a per-VM-start byte sequence.
+    #[test]
+    fn wire_extra_covers_the_minor_version_matrix_and_the_new_refusals() {
+        let cases = group();
+        for (id, golden) in [
+            ("wire_extra/mv_pid_tag_is_new_pid_ext_for_every_minor_version", "ok [88,88,88]"),
+            ("wire_extra/mv_ref_tag_is_newer_reference_for_every_minor_version", "ok [90,90,90]"),
+            ("wire_extra/mv_port_tag_is_v4_port_for_every_minor_version", "ok [120,120,120]"),
+            ("wire_extra/mv_float_tag_is_legacy_only_at_minor_version_0", "ok [99,70,70]"),
+            (
+                "wire_extra/mv0_nonlatin_atom_latin1_bytes",
+                "ok <<131,100,0,4,252,98,101,114>>",
+            ),
+            (
+                "wire_extra/at_decode_100_latin1_reencodes_utf8",
+                "ok <<131,119,2,195,169>>",
+            ),
+            ("wire_extra/bit_all_fifteen_widths_roundtrip", TRUE),
+            (
+                "wire_extra/ie_small_big_128_bits_both_signs",
+                "ok {<<131,110,17,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1>>,\
+                 <<131,110,17,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1>>}",
+            ),
+        ] {
+            let case = cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the minor-version case {id}"));
+            assert_eq!(
+                case.golden.stdout,
+                Some(golden),
+                "case {id} must carry the oracle-derived golden"
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {id} golden must exit 0");
+        }
+        for id in [
+            "wire_extra/err_map_duplicate_key_badarg",
+            "wire_extra/err_map_pair_count_overflow_badarg",
+            "wire_extra/err_atom_cache_ref_badarg",
+            "wire_extra/err_large_tuple_arity_overflow_badarg",
+            "wire_extra/err_string_ext_length_beyond_buffer_badarg",
+            "wire_extra/err_local_ext_without_body_badarg",
+            "wire_extra/err_new_pid_ext_node_not_atom_badarg",
+        ] {
+            let case = cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the decode-refusal case {id}"));
+            assert_eq!(
+                case.golden.stdout,
+                Some("exception error badarg"),
+                "case {id} must carry the oracle-derived badarg golden"
+            );
+            assert_eq!(case.golden.exit_code, 1, "case {id} golden must exit 1");
+        }
+
+        // The minor-version id cases must reduce the per-VM image to its tag byte: none of
+        // them may decode a raw `NEW_PID_EXT`/`V4_PORT_EXT`/`NEWER_REFERENCE_EXT` blob, whose
+        // id/serial/creation/node bytes belong to the VM that produced it.
+        for id in [
+            "wire_extra/mv_pid_tag_is_new_pid_ext_for_every_minor_version",
+            "wire_extra/mv_ref_tag_is_newer_reference_for_every_minor_version",
+            "wire_extra/mv_port_tag_is_v4_port_for_every_minor_version",
+            "wire_extra/mv_float_tag_is_legacy_only_at_minor_version_0",
+        ] {
+            let expr = cases
+                .iter()
+                .find(|c| c.id == id)
+                .expect("registered")
+                .expr()
+                .expect("an expression case");
+            assert!(
+                expr.contains("binary:at(term_to_binary("),
+                "case {id} must reduce the image to its tag byte: {expr}"
+            );
+            assert!(
+                expr.contains("[{minor_version,N}]) for N <- [0,1,2]")
+                    || expr.contains("[{minor_version,N}]),1) || N <- [0,1,2]]"),
+                "case {id} must sweep all three minor versions: {expr}"
+            );
         }
     }
 }

@@ -499,17 +499,21 @@ fn row_w(name: &str, reply: &[i64], input: i64, output: i64) -> String {
     format!("{{{name},{},{input},{output}}}", erl_bytes(reply))
 }
 
-/// The `Data` payload [`RuntimeContext::port_data_message_shaped`] builds for `bytes` on `stream`
+/// The `Data` payload [`RuntimeContext::port_data_message_shaped`] builds for `read` on `stream`
 /// with `shape`, rendered by the registered `~w` printer — the oracle's own control, so the two
 /// renderings are compared as text (`[2,0,0,0,2|<<97,98>>]`).
 ///
+/// `read` is one driver output call's bytes with the C's header/body split intact, so the goldens
+/// below are the same terms they always were: only the driving input changed (a `ReadMessage`
+/// instead of a `(bytes, clamp)` guess).
+///
 /// The runtime owns the heap the term is built on, so it is borrowed for the whole read.
-fn built_reply(rt: &mut Runtime, bytes: &[u8], stream: StreamType, shape: StreamShape) -> String {
+fn built_reply(rt: &mut Runtime, read: &ReadMessage, stream: StreamType, shape: StreamShape) -> String {
     let port = PortId::new(9001);
     let message = {
         let mut ctx = RuntimeContext::new(&mut *rt);
-        ctx.port_data_message_shaped(port, bytes, stream, shape)
-            .unwrap_or_else(|error| panic!("a message for {bytes:?} ({shape:?}): {error}"))
+        ctx.port_data_message_shaped(port, read, stream, shape)
+            .unwrap_or_else(|error| panic!("a message for {read:?} ({shape:?}): {error}"))
     };
     let inner = terms::tuple_element(message, 1).expect("the `{data, …}` tuple");
     let payload = terms::tuple_element(inner, 1).expect("the data payload");
@@ -517,6 +521,25 @@ fn built_reply(rt: &mut Runtime, bytes: &[u8], stream: StreamType, shape: Stream
         .format_term_w(payload, None)
         .unwrap_or_else(|error| panic!("the `~w` printer refused a built message: {error}"));
     rendered.trim_end_matches('\n').to_string()
+}
+
+/// A `driver_output2(hbuf, hlen, NULL, 0)`-shaped read: the whole reply is the header and there is
+/// **no** body at all (the C's `NULL` `buf`), which is what renders the proper header list.
+fn header_only(bytes: &[u8]) -> ReadMessage {
+    ReadMessage {
+        header: bytes.to_vec(),
+        body: None,
+    }
+}
+
+/// A `driver_output_binary(hbuf, hlen, bin, off, len)`-shaped read: `header_len` leading bytes are
+/// the header, the rest is the data body (`Some`, empty or not — the C's non-`NULL` `buf`).
+fn header_then_body(bytes: &[u8], header_len: usize) -> ReadMessage {
+    assert!(header_len <= bytes.len(), "a header longer than the reply");
+    ReadMessage {
+        header: bytes[..header_len].to_vec(),
+        body: Some(bytes[header_len..].to_vec()),
+    }
 }
 
 /// `bytes` as an Erlang binary literal: `<<1,0,0,0,3,97,98,99>>`.
@@ -839,18 +862,20 @@ fn closing_a_ram_file_port_refuses_later_commands_like_the_oracle() {
 ///
 /// # End to end: the header lists, and the one residual
 ///
-/// A **built-in driver port** reports [`StreamShape::DriverOutput`] when it folds the driver's output
-/// (the `beam_io` seam carries no header/data split), and that shape renders the bytes as list
-/// elements on **either** stream — the C's header rendering — so a `[binary]` port's header-only
-/// replies (`OK`/`NUMBER`/`ERROR`) arrive as the oracle's proper lists. Every row is therefore
-/// asserted **non-binary** below.
+/// A **built-in driver port** reports [`StreamShape::DriverOutput`] when it hands its bytes up
+/// through a flat byte queue, and that shape renders a header-less read as list elements on
+/// **either** stream — the C's header rendering — so a `[binary]` port's header-only replies
+/// (`OK`/`NUMBER`/`ERROR`) arrive as the oracle's proper lists. Every row is therefore asserted
+/// **non-binary** below.
 ///
-/// The one row no delivery path can render as the oracle does is `DATA`: the oracle's
-/// `driver_output_binary` renders `[2,0,0,0,2|<<97,98>>]`, and `beam_io`'s stream layer folds that
-/// header/body split away producer-side ([`beam_io::DriverContext::input`] is a flat queue), so this
-/// runtime delivers the same bytes as a proper list — bytes and both `port_info` counters exact, the
-/// term shape the documented residual. [`super::driver_output_shape_tests`] pins the end-to-end matrix
-/// and names that residual loudly; closing it is a `beam_io` change (this node's `CONTEXT.md`,
+/// The one row this delivery path cannot render as the oracle does is `DATA`: the oracle's
+/// `driver_output_binary` renders `[2,0,0,0,2|<<97,98>>]`, while this runtime's in-tree
+/// `ram_file_drv` pushes its reply through [`beam_io::DriverContext::input`] — a flat queue with no
+/// split — so the reply arrives as one header-less read and is delivered as a proper list. Bytes and
+/// both `port_info` counters are exact; the term shape is the documented residual, and the builder
+/// side of it (given a read that *does* carry the split) is asserted below and in
+/// [`super::stream_shape_tests`]. [`super::driver_output_shape_tests`] pins the end-to-end matrix and
+/// names that residual loudly; closing it is a `beam_io` change (this node's `CONTEXT.md`,
 /// *Handoffs*), not something this test may paper over.
 #[test]
 fn a_binary_stream_port_delivers_the_oracles_header_lists() {
@@ -899,76 +924,89 @@ fn a_binary_stream_port_delivers_the_oracles_header_lists() {
 
     // ...and the runtime's **builder** renders each of those terms, from the bytes this session
     // really received, shaped by the driver output call that carried them.
-    let shapes: [(&str, StreamShape, &str, &str); 6] = [
-        // `numeric_reply` — `driver_output2(buf, len, NULL, 0)`.
-        ("open_fresh", StreamShape::Header, "[3,0,0,0,0]", "[3,0,0,0,0]"),
-        // `READ` — `driver_output_binary(port, hdr, 5, bin, 0, n)`.
+    let shapes: [(&str, ReadMessage, &str, &str); 6] = [
+        // `numeric_reply` — `driver_output2(buf, len, NULL, 0)`: the whole reply is the header.
+        (
+            "open_fresh",
+            header_only(&[3, 0, 0, 0, 0]),
+            "[3,0,0,0,0]",
+            "[3,0,0,0,0]",
+        ),
+        // `READ` — `driver_output_binary(port, hdr, 5, bin, 0, n)`: a 5-byte header, a data body.
         (
             "read_data",
-            StreamShape::HeaderThenData { len: 5 },
+            header_then_body(&[2, 0, 0, 0, 2, 97, 98], 5),
             "[2,0,0,0,2|<<97,98>>]",
             "[2,0,0,0,2,97,98]",
         ),
-        ("size", StreamShape::Header, "[3,0,0,0,3]", "[3,0,0,0,3]"),
+        (
+            "size",
+            header_only(&[3, 0, 0, 0, 3]),
+            "[3,0,0,0,3]",
+            "[3,0,0,0,3]",
+        ),
         (
             "truncate_seek",
-            StreamShape::Header,
+            header_only(&[3, 0, 0, 0, 1]),
             "[3,0,0,0,1]",
             "[3,0,0,0,1]",
         ),
         // `reply` — the bare `OK` byte.
-        ("truncate", StreamShape::Header, "[0]", "[0]"),
+        ("truncate", header_only(&[0]), "[0]", "[0]"),
         (
             "get",
-            StreamShape::HeaderThenData { len: 5 },
+            header_then_body(&[2, 0, 0, 0, 1, 97], 5),
             "[2,0,0,0,1|<<97>>]",
             "[2,0,0,0,1,97]",
         ),
     ];
-    for (name, shape, binary_term, list_term) in shapes {
+    for (name, read, binary_term, list_term) in shapes {
         let bytes: Vec<u8> = session
             .reply(name)
             .into_iter()
             .map(|byte| u8::try_from(byte).expect("a reply byte"))
             .collect();
         assert_eq!(
-            built_reply(&mut session.runtime, &bytes, StreamType::Binary, shape),
-            binary_term,
-            "row {name:?}: a `[binary]` port renders `{shape:?}` as the oracle's term"
+            read.flattened(),
+            bytes,
+            "row {name:?}: the shaped read carries exactly the bytes the session received"
         );
         assert_eq!(
-            built_reply(&mut session.runtime, &bytes, StreamType::List, shape),
+            built_reply(&mut session.runtime, &read, StreamType::Binary, StreamShape::Data),
+            binary_term,
+            "row {name:?}: a `[binary]` port renders the read's own split as the oracle's term"
+        );
+        assert_eq!(
+            built_reply(&mut session.runtime, &read, StreamType::List, StreamShape::Data),
             list_term,
             "row {name:?}: the default `list` stream renders the same bytes without a binary tail"
         );
     }
     // The two shapes no session row reaches: a zero-length `DATA` (a read at end of file) and an
     // `ERROR` reply — both measured above, both the builder's to reproduce.
-    for (bytes, shape, oracle_term) in [
+    for (read, oracle_term) in [
         (
-            &[2u8, 0, 0, 0, 0][..],
-            StreamShape::HeaderThenData { len: 5 },
+            header_then_body(&[2u8, 0, 0, 0, 0], 5),
             "[2,0,0,0,0|<<>>]",
         ),
         (
-            &[1u8, 101, 105, 110, 118, 97, 108][..],
-            StreamShape::Header,
+            header_only(&[1u8, 101, 105, 110, 118, 97, 108]),
             "[1,101,105,110,118,97,108]",
         ),
     ] {
         assert_eq!(
-            built_reply(&mut session.runtime, bytes, StreamType::Binary, shape),
+            built_reply(&mut session.runtime, &read, StreamType::Binary, StreamShape::Data),
             oracle_term,
-            "{bytes:?} on a `[binary]` port renders `{shape:?}` as the oracle's term"
+            "{read:?} on a `[binary]` port renders the oracle's term"
         );
     }
     // The default stream's own measured form of a `DATA` reply: every byte a list element.
     assert_eq!(
         built_reply(
             &mut session.runtime,
-            &[2, 0, 0, 0, 2, 97, 98],
+            &header_then_body(&[2, 0, 0, 0, 2, 97, 98], 5),
             StreamType::List,
-            StreamShape::HeaderThenData { len: 5 },
+            StreamShape::Data,
         ),
         "[2,0,0,0,2,97,98]",
         "the default `list` stream is a proper list of the header and the data"

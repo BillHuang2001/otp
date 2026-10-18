@@ -268,10 +268,11 @@ pub(super) fn socket_error(fd: RawFd) -> Result<i32> {
 /// The C answers `INET_REQ_CONNECT` with an **async operation**: `connect(2)` says `EINPROGRESS`,
 /// the descriptor is moved to `INET_STATE_CONNECTING`, write readiness is armed and the reply is
 /// `[1] ++ async_id_be16`; the verdict then arrives later as an `{inet_async, Port, Ref, Result}`
-/// message (`inet_drv.c:12064`-`:12140`). Neither an async-op queue nor a driver→owner message
-/// channel exists in this crate, so the driver's control call **completes the connect here** and
-/// answers the bare `[1]` on success — the substitution `prim_inet:connect_cmd/3` takes the
-/// `{ok, []} -> ok` path for (`erts/preloaded/src/prim_inet.erl:411`-`:437`).
+/// message (`inet_drv.c:12064`-`:12140`). Connect is the one request family this driver still
+/// answers inline instead of through its async-operation queue (`super::async`), so the driver's
+/// control call **completes the connect here** and answers the bare `[1]` on success — the
+/// substitution `prim_inet:connect_cmd/3` takes the `{ok, []} -> ok` path for
+/// (`erts/preloaded/src/prim_inet.erl:411`-`:437`).
 ///
 /// The wait is one `poll(2)` for `POLLOUT` (repeated only when a signal interrupts it, with the
 /// deadline **preserved** — the discipline [`crate::Poller::poll`] uses) followed by

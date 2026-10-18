@@ -35,6 +35,7 @@ use super::super::opt::{
 use super::super::wire::{ctl_ok, ctl_xerror, split_caller_ref, ETF_VERSION_MAGIC};
 use super::super::{INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_TYPE_DGRAM, INET_REP_OK};
 use super::{UdpInetDriver, UDP_DRIVER_NAME};
+use crate::completion::{CompletionEvent, InetReply, PortCompletion};
 use crate::driver::{Driver, DriverContext, PortArms};
 use crate::poller::Poller;
 use crate::queue::ByteQueue;
@@ -75,12 +76,17 @@ fn loopback_arg(port: u16) -> Vec<u8> {
 
 /// A driver plus the port state a `DriverContext` needs, so a verb can be driven directly
 /// without a `PortRegistry` (the same shape `super::super::tests`' rig uses).
+///
+/// Every context carries the **completion sink** the port installs at each driver interaction
+/// point, so the send path's `{inet_reply, …}` is observable here exactly as it is through
+/// [`crate::PortRegistry::take_completions`].
 struct Rig {
     driver: UdpInetDriver,
     poller: Poller,
     input: ByteQueue,
     output: ByteQueue,
     arms: PortArms,
+    completions: Vec<PortCompletion>,
 }
 
 impl Rig {
@@ -92,6 +98,7 @@ impl Rig {
             input: ByteQueue::new(),
             output: ByteQueue::new(),
             arms: PortArms::default(),
+            completions: Vec::new(),
         };
         rig.start().expect("start");
         rig
@@ -105,7 +112,8 @@ impl Rig {
             &mut self.input,
             &mut self.output,
             &mut self.arms,
-        );
+        )
+        .with_completions(&mut self.completions);
         self.driver.start(&mut ctx)
     }
 
@@ -117,8 +125,14 @@ impl Rig {
             &mut self.input,
             &mut self.output,
             &mut self.arms,
-        );
+        )
+        .with_completions(&mut self.completions);
         self.driver.control(&mut ctx, command, arg)
+    }
+
+    /// The completions staged since the last drain, in delivery order.
+    fn take_completions(&mut self) -> Vec<PortCompletion> {
+        std::mem::take(&mut self.completions)
     }
 
     /// The bytes the driver has read into the port input queue, consumed.
@@ -173,7 +187,8 @@ impl Rig {
             &mut self.input,
             &mut self.output,
             &mut self.arms,
-        );
+        )
+        .with_completions(&mut self.completions);
         self.driver.output(&mut ctx)
     }
 }
@@ -872,8 +887,16 @@ fn the_caller_reference_discriminator_accepts_only_a_fitting_etf_tag() {
         Some(&arg[6..]),
         "a well-formed prefix is stripped and the rest returned",
     );
-    // `n == 0` carries no caller reference (`init_caller`'s `*size_p < 2` guard).
-    assert_eq!(split_caller_ref(&[0, 0, ETF_VERSION_MAGIC, 1]), None);
+    // A **zero-length** tag is a prefix too: `init_caller` consumes the two length bytes even when
+    // `n == 0`, so the payload starts right after them (measured on the oracle:
+    // `port_command(P, <<0:16,"raw">>)` delivers exactly `"raw"`).
+    assert_eq!(
+        split_caller_ref(&[0, 0, ETF_VERSION_MAGIC, 1]),
+        Some(&[ETF_VERSION_MAGIC, 1][..]),
+    );
+    assert_eq!(split_caller_ref(&[0, 0]), Some(&[][..]), "a bare length word");
+    // One byte is not even a length word: nothing is stripped.
+    assert_eq!(split_caller_ref(&[0]), None);
     // A truncated prefix (`2 + n` overruns the argument) is not stripped.
     assert_eq!(split_caller_ref(&[0, 9, ETF_VERSION_MAGIC, 1, 2]), None);
     // The tag's first byte must be the ETF version byte.
@@ -1070,15 +1093,33 @@ fn send_counters(rig: &mut Rig) -> (u32, u64) {
     (cnt, oct)
 }
 
+/// The `(caller tag, reply)` pairs of the `{inet_reply, …}` completions staged since the last
+/// drain, in delivery order — the C's `inet_reply_finish` (`inet_drv.c:2614`), which `prim_inet`
+/// blocks on after a `gen_udp:send/4`.
+fn caller_replies(rig: &mut Rig) -> Vec<(Option<Vec<u8>>, InetReply)> {
+    rig.take_completions()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            CompletionEvent::InetReply { caller_ref, reply } => Some((caller_ref, reply)),
+            CompletionEvent::InetAsync { .. } => None,
+        })
+        .collect()
+}
+
+/// The `(caller tag, reply)` pair the prefixed command's tag must produce.
+fn prefixed_reply(reply: InetReply) -> Vec<(Option<Vec<u8>>, InetReply)> {
+    vec![(Some(CALLER_REF_TAG.to_vec()), reply)]
+}
+
 /// A **caller-reference-prefixed** queued command on an **open but unconnected** socket reaches the
-/// address the command carries: `packet_inet_command` parses
-/// `[address][anc_len:be32][anc_data][data]` on every command, connected or not
+/// address the command carries: `packet_inet_command` parses/// `[address][anc_len:be32][anc_data][data]` on every command, connected or not
 /// (`inet_drv.c:15139`-`:15158`), and `sendto(2)`s it when the socket has no default peer
 /// (`:15174`-`:15182`). That is the path `prim_inet:sendto/4` (`prim_inet.erl:652`-`:700`) —
 /// `gen_udp:send/4` — drives, which is why refusing it made a plain datagram send fail.
 ///
 /// The queue is drained whole (the command's prefix/address/ancillary-length bytes have no
-/// counterpart on the wire) and the statistics see the payload **only**.
+/// counterpart on the wire) and the statistics see the payload **only**; the caller tag is
+/// answered with one `{inet_reply, Port, ok, Tag}` completion.
 #[test]
 fn an_unconnected_queued_command_is_sent_to_the_address_it_carries() {
     let receiver = udp_receiver();
@@ -1095,6 +1136,11 @@ fn an_unconnected_queued_command_is_sent_to_the_address_it_carries() {
         "the whole command (prefix, address, ancillary-length word and payload) is consumed",
     );
     assert_eq!(rig.output_len(), 0, "the queue is drained");
+    assert_eq!(
+        caller_replies(&mut rig),
+        prefixed_reply(InetReply::Ok),
+        "the caller tag is answered (the C's `inet_reply_finish`)",
+    );
     let mut buf = [0u8; 64];
     let (len, from) = receiver
         .recv_from(&mut buf)
@@ -1142,6 +1188,7 @@ fn a_connected_queued_command_ignores_the_address_it_carries() {
             .expect("a connected socket sends the command"),
         command.len(),
     );
+    assert_eq!(caller_replies(&mut rig), prefixed_reply(InetReply::Ok));
     let mut buf = [0u8; 64];
     let (len, from) = peer
         .recv_from(&mut buf)
@@ -1194,7 +1241,9 @@ fn a_queued_command_without_the_ancillary_length_word_is_refused_and_keeps_its_b
 
 /// A non-zero ancillary length is the C's `sendmsg(2)`-with-cmsgs arm (`inet_drv.c:15220`-`:15230`),
 /// which this floor has no seam for: the typed `unsupported` raise, never a send with the ancillary
-/// bytes dropped or mistaken for payload. The queued bytes stay queued.
+/// bytes dropped or mistaken for payload. The **command** bytes stay queued — only the
+/// caller-reference prefix, which the C's `init_caller` strips before it parses anything, has come
+/// off the queue — and the caller is answered nothing (a refused command never settles).
 #[test]
 fn a_queued_command_with_ancillary_data_is_the_typed_unsupported() {
     let receiver = udp_receiver();
@@ -1214,8 +1263,12 @@ fn a_queued_command_with_ancillary_data_is_the_typed_unsupported() {
     );
     assert_eq!(
         rig.output_len(),
-        command.len(),
-        "the bytes are never consumed"
+        command.len() - (2 + CALLER_REF_TAG.len()),
+        "the command is never consumed (only `init_caller`'s prefix came off)",
+    );
+    assert!(
+        caller_replies(&mut rig).is_empty(),
+        "a refused command settles no reply",
     );
     assert_eq!(
         send_counters(&mut rig),
@@ -1252,9 +1305,9 @@ fn a_plain_queued_command_carries_the_ancillary_length_word() {
 
 /// The oracle's side of the same path: `gen_udp:send/4` → `prim_inet:sendto/4`
 /// (`erts/preloaded/src/prim_inet.erl:652`-`:700`), which queues the caller-reference-prefixed
-/// command and waits for the `{inet_reply, …}` message. Only the **observable datagram** is
-/// compared — its payload and the source port the oracle's own socket reports — because the reply
-/// message is the `driver_caller`-gated shape this crate cannot send (see the module docs).
+/// command and waits for the `{inet_reply, …}` message. The **observable datagram** is compared —
+/// its payload and the source port the oracle's own socket reports — and the Rust side additionally
+/// pins the reply it owes that caller (one `{inet_reply, Port, ok, Tag}`, the tag echoed verbatim).
 ///
 /// **Skips loudly** when `erl` is not on `PATH`.
 #[test]
@@ -1313,8 +1366,13 @@ fn the_queued_command_delivery_agrees_with_the_erl_oracle() {
         source_port,
         "from the bound port, as the oracle's comes from its socket's port",
     );
-    // The reply differs by construction: the oracle's `ok` is the `{inet_reply, …}` message, which
-    // needs a driver→owner channel; here the drain's byte count is the whole observable outcome.
+    // The reply fits the same shape: the oracle's `ok` is the `{inet_reply, Port, ok, Tag}` message
+    // it blocks on, which is the completion this port stages for the same command.
+    assert_eq!(
+        caller_replies(&mut rig),
+        prefixed_reply(InetReply::Ok),
+        "the caller tag is answered, as the oracle's `ok` reply is",
+    );
     assert_eq!(
         send_counters(&mut rig),
         (1, 6),
