@@ -58,6 +58,7 @@ use std::time::Instant;
 use beam_common::Result;
 use beam_process::{PortId, PortTable};
 
+use crate::completion::PortCompletion;
 use crate::driver::{Driver, DriverRegistry, PortExitReason};
 use crate::error;
 use crate::poller::{Event, Poller};
@@ -98,6 +99,16 @@ pub struct PortRegistry {
     /// the close is actually reported (see [`PortRegistry::take_closed_notifications`]), so a
     /// deferred report can never name a number a later [`PortRegistry::open`] reused.
     closed: Vec<PortId>,
+    /// The **completions** of ports that were closed before their owner was told about them,
+    /// harvested by [`PortRegistry::close`] in close order.
+    ///
+    /// A [`Port`] is dropped by a close, which would drop whatever its driver had already staged
+    /// — including the `{inet_reply, S, {error, closed}}` / `{inet_async, S, Id, {error, closed}}`
+    /// a socket driver hands up while it is being torn down (the C's `async_error_am_all`,
+    /// `erts/emulator/drivers/common/inet_drv.c:2597-2608`). Harvesting them here is what lets
+    /// that reply still reach the owner, exactly once, after the port is gone; the queue is
+    /// drained by [`PortRegistry::take_completions`].
+    closed_completions: Vec<PortCompletion>,
     /// Keeps this type single-threaded (`Cell` is neither `Send` nor `Sync`).
     single_threaded: PhantomData<Cell<()>>,
 }
@@ -109,6 +120,7 @@ impl PortRegistry {
             ids: PortTable::new(),
             ports: HashMap::new(),
             closed: Vec::new(),
+            closed_completions: Vec::new(),
             single_threaded: PhantomData,
         }
     }
@@ -525,6 +537,48 @@ impl PortRegistry {
         frames
     }
 
+    /// Drains the **completions** every port's driver handed up, in **port-number order**, plus
+    /// the ones a closed port left behind.
+    ///
+    /// This is the runtime entry point of the driver→owner message side channel (see
+    /// [`crate::completion`]): the `{inet_reply, Port, Reply[, Tag]}` answers to
+    /// `erlang:port_command/2` and the `{inet_async, Port, Id, Result}` completions of queued
+    /// asynchronous operations, which a driver stages from any of its callbacks
+    /// ([`DriverContext::deliver_completion`](crate::driver::DriverContext::deliver_completion))
+    /// and which are **never** a control op's return value.
+    ///
+    /// The accessor style is [`PortRegistry::take_line_notifications`]'s — drain after **every**
+    /// round (and after every explicit driver interaction), or the completions are lost, since
+    /// draining is what removes them. The order is:
+    ///
+    /// 1. each **live** port's completions, ports visited in ascending port-number order and each
+    ///    port's own completions in delivery order, then
+    /// 2. the completions harvested from ports **closed** since the last drain
+    ///    ([`PortRegistry::close`]), in close order — the C's `async_error_am_all` teardown
+    ///    flush.
+    ///
+    /// A port with nothing staged — every non-socket driver — contributes nothing, so a caller
+    /// can poll unconditionally.
+    ///
+    /// # Port numbers of closed ports
+    ///
+    /// A harvested completion still names the number of the port it was staged for. The number
+    /// stays reserved until the `Closed` report retires it (see [`PortRegistry::close`]), and the
+    /// number can be handed to a **new** port only by a later [`PortRegistry::open`], so a caller
+    /// that drains in the round it ran cannot mis-attribute one. Once the number has been reused,
+    /// a stale completion would name the new port — which is why the drain is mandatory after
+    /// every round rather than optional.
+    pub fn take_completions(&mut self) -> Vec<PortCompletion> {
+        let mut completions = Vec::new();
+        for key in self.sorted_keys() {
+            if let Some(port) = self.ports.get_mut(&key) {
+                completions.extend(port.take_completions());
+            }
+        }
+        completions.append(&mut self.closed_completions);
+        completions
+    }
+
     /// Releases port `id`'s pending partial line as `noeol` frame(s) for the next harvest.
     ///
     /// This is the C's `flush_linebuf_messages`: it is what [`PortRegistry::take_eof`] runs when
@@ -672,6 +726,18 @@ impl PortRegistry {
     /// port. A caller that closes a port and never runs another round therefore keeps the number
     /// allocated — the round is what retires it.
     ///
+    /// # Completions survive the close
+    ///
+    /// A port's driver may hand a completion up while it is being torn down — the C's
+    /// `async_error_am_all` answers every queued asynchronous operation with
+    /// `{error, closed}` when the port closes (`erts/emulator/drivers/common/inet_drv.c:2597-2608`)
+    /// — and may already have staged one for a command the owner is blocked on. Dropping the
+    /// `Port` here would drop both, so this method harvests its staged completions into the
+    /// registry ([`PortRegistry::take_completions`] reports them exactly once afterwards,
+    /// after the live ports'). The `Closed` report keeps its own rule: the port's **number**
+    /// stays allocated until the reporting round mints it — a completion never keeps a dead
+    /// number alive, because the harvest copies the completions out rather than holding the port.
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's
@@ -682,6 +748,10 @@ impl PortRegistry {
             return Err(error::badarg());
         };
         let result = port.close(poller);
+        // Harvest whatever the driver staged before and during its teardown: the port is gone,
+        // so these can only be reported from here.
+        self.closed_completions
+            .append(&mut port.take_completions());
         // The port is gone from the registry either way, so its close is queued (and its number
         // retired by the reporting round) even if the driver's teardown reports a failure.
         self.closed.push(id);
