@@ -76,41 +76,53 @@ unsafe fn read_bytes<'a>(ptr: *const u8, len: ErlDrvSizeT) -> Option<&'a [u8]> {
     Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
-/// Deliver `hlen` header bytes at `hbuf` followed by `body` to `port` (the `driver_output*` family).
+/// The C's `buf != NULL` distinction (`deliver_read_message`, `io.c:3372`; `deliver_vec_message`,
+/// `io.c:3502`) — the decisive test is the **pointer**, never `len != 0`.
 ///
-/// Returns the C's `-1` when the port is null (its `ERTS_INVALID_ERL_DRV_PORT` path) or the header
-/// is malformed, else the host's [`DriverHost::output`](crate::driver::host::DriverHost::output) code. The header and the body are joined
-/// into one buffer because the seam hands the host a single byte slice.
+/// The outer `None` is malformed (a null `buf` with a non-zero `len`, which the C would deref); the
+/// inner `None` is the C's `buf == NULL` — **no tail at all** — while `Some(&[])` is a present,
+/// empty tail (the C's `<<>>`). The two must stay distinct: `[h…]` and `[h… | <<>>]` are different
+/// terms.
 ///
 /// # Safety
 ///
-/// `hbuf` must be null or point at `hlen` readable bytes, and `port` must be null or a live port
-/// handle.
-unsafe fn output_pieces(
-    port: ErlDrvPort,
-    hbuf: *const c_char,
-    hlen: ErlDrvSizeT,
-    body: &[u8],
-) -> c_int {
-    // SAFETY: `hbuf`/`hlen` are the caller's header buffer (contract above).
-    let Some(header) = (unsafe { read_bytes(hbuf as *const u8, hlen) }) else {
-        return -1;
-    };
-    // SAFETY: `port` is null or a live handle (contract above).
-    let Some(env) = (unsafe { env_for(port) }) else {
-        return -1;
-    };
-    if header.is_empty() {
-        return env.host().output(port, body);
+/// `buf` must be null or point at `len` readable bytes.
+unsafe fn tail_bytes<'a>(buf: *const c_char, len: ErlDrvSizeT) -> Option<Option<&'a [u8]>> {
+    if buf.is_null() {
+        return if len == 0 { Some(None) } else { None };
     }
-    let mut joined = Vec::with_capacity(header.len() + body.len());
-    joined.extend_from_slice(header);
-    joined.extend_from_slice(body);
-    env.host().output(port, &joined)
+    // SAFETY: the caller guarantees `len` readable bytes at `buf`.
+    Some(Some(unsafe {
+        core::slice::from_raw_parts(buf as *const u8, len)
+    }))
+}
+
+/// Hand a **split** reply to the port owner through the
+/// [`DriverHost::output2`](crate::driver::host::DriverHost::output2) seam: `header` is the C's
+/// `hbuf`/`hlen` list prefix and `body` its `buf`/`len` tail (`None` = `buf == NULL`).
+///
+/// Nothing is joined here — preserving the split is the point of the hook. Returns the C's `-1` when
+/// the port is null (its `ERTS_INVALID_ERL_DRV_PORT` path), else the host's code.
+///
+/// # Safety
+///
+/// `port` must be null or a live port handle.
+unsafe fn deliver_split(port: ErlDrvPort, header: &[u8], body: Option<&[u8]>) -> c_int {
+    // SAFETY: `port` is null or a live handle (contract above).
+    match unsafe { env_for(port) } {
+        Some(env) => env.host().output2(port, header, body),
+        None => -1,
+    }
 }
 
 /// `int driver_output(ErlDrvPort port, char *buf, ErlDrvSizeT len);` — send `len` bytes at `buf` to
-/// the port owner (`io.c:6442`, which is `driver_output2` with a null header).
+/// the port owner (`io.c:6442`, which is literally `driver_output2(ix, NULL, 0, buf, len)`).
+///
+/// There is no header, and `buf`'s pointer — not `len` — decides whether the reply carries a tail:
+/// a null `buf` sends the header-only (proper, empty) list, a non-null `buf` with `len == 0` sends a
+/// present, empty tail (`<<>>` in `[binary]` port mode). Both reach the host as such through
+/// [`DriverHost::output2`](crate::driver::host::DriverHost::output2). A null `buf` with a non-zero
+/// `len` is refused with `-1` instead of being dereferenced.
 ///
 /// # Safety
 ///
@@ -122,15 +134,20 @@ pub unsafe extern "C" fn driver_output(
     len: ErlDrvSizeT,
 ) -> c_int {
     // SAFETY: `buf`/`len` are the caller's output buffer (contract above).
-    let Some(body) = (unsafe { read_bytes(buf as *const u8, len) }) else {
+    let Some(body) = (unsafe { tail_bytes(buf, len) }) else {
         return -1;
     };
     // SAFETY: `port` is null or a live handle, and there is no header (contract above).
-    unsafe { output_pieces(port, core::ptr::null(), 0, body) }
+    unsafe { deliver_split(port, &[], body) }
 }
 
 /// `int driver_output2(ErlDrvPort port, char *hbuf, ErlDrvSizeT hlen, char *buf, ErlDrvSizeT len);`
-/// — send a header followed by body data (`io.c:6387`; the header goes out as a list prefix).
+/// — send a header followed by body data (`io.c:6387`; the header goes out as a list prefix and the
+/// body as the tail, `[H1,H2,H3 | T]` per the C's own comment).
+///
+/// The header stays a prefix and the body a tail: `buf`'s pointer decides whether a tail exists at
+/// all (a null `buf` is the C's `buf == NULL`, a header-only reply), so nothing is joined. A null
+/// `buf` with a non-zero `len` is refused with `-1` instead of being dereferenced.
 ///
 /// # Safety
 ///
@@ -144,12 +161,16 @@ pub unsafe extern "C" fn driver_output2(
     buf: *mut c_char,
     len: ErlDrvSizeT,
 ) -> c_int {
-    // SAFETY: `buf`/`len` are the caller's body buffer (contract above).
-    let Some(body) = (unsafe { read_bytes(buf as *const u8, len) }) else {
+    // SAFETY: `hbuf`/`hlen` are the caller's header buffer (contract above).
+    let Some(header) = (unsafe { read_bytes(hbuf as *const u8, hlen) }) else {
         return -1;
     };
-    // SAFETY: `hbuf`/`hlen` are the caller's header buffer and `port` its handle (contract above).
-    unsafe { output_pieces(port, hbuf, hlen, body) }
+    // SAFETY: `buf`/`len` are the caller's body buffer (contract above).
+    let Some(body) = (unsafe { tail_bytes(buf, len) }) else {
+        return -1;
+    };
+    // SAFETY: `port` is null or a live handle (contract above).
+    unsafe { deliver_split(port, header, body) }
 }
 
 /// The `len` bytes at byte `offs` inside a driver binary (`None` when malformed).
@@ -189,6 +210,11 @@ unsafe fn binary_payload_bytes<'a>(
 /// ErlDrvSizeT offset, ErlDrvSizeT len);` — send a header plus a sub-range of a driver binary
 /// (`io.c:6339`).
 ///
+/// The sub-range is always a **present** body (the payload of a driver binary is never the C's
+/// `buf == NULL`), so a zero-length sub-range reaches the host as `Some(&[])` — the C's `<<>>` in
+/// `[binary]` mode — not as a header-only reply. A null binary or an out-of-range sub-range is
+/// refused with `-1` (see [`binary_payload_bytes`]).
+///
 /// # Safety
 ///
 /// `port` must be null or a live port handle; `hbuf` must be null or point at `hlen` readable bytes;
@@ -202,26 +228,47 @@ pub unsafe extern "C" fn driver_output_binary(
     offs: ErlDrvSizeT,
     len: ErlDrvSizeT,
 ) -> c_int {
+    // SAFETY: `hbuf`/`hlen` are the caller's header buffer (contract above).
+    let Some(header) = (unsafe { read_bytes(hbuf as *const u8, hlen) }) else {
+        return -1;
+    };
     // SAFETY: `bin`/`offs`/`len` are the caller's driver binary and its sub-range (contract above).
     let Some(body) = (unsafe { binary_payload_bytes(bin, offs, len) }) else {
         return -1;
     };
-    // SAFETY: `hbuf`/`hlen` are the caller's header buffer and `port` its handle (contract above).
-    unsafe { output_pieces(port, hbuf, hlen, body) }
+    // SAFETY: `port` is null or a live handle (contract above).
+    unsafe { deliver_split(port, header, Some(body)) }
 }
 
-/// The bytes of `ev`'s vectors with the first `skip` bytes dropped, gathered into one buffer.
+/// The body of a `driver_outputv` reply: `ev`'s vectors **after** the C's `skip` stripping, with the
+/// last remaining vector as the improper tail (`deliver_vec_message`, `io.c:3502-3621`).
+enum VecBody<'a> {
+    /// The C's `vec->size <= skip` early return — `return driver_output2(ix, hbuf, hlen, NULL, 0)`
+    /// (`io.c:6469`): a header and **no** tail at all (the proper list `[h…]`), which is *not* the
+    /// same term as an empty-binary tail.
+    NoTail,
+    /// The remaining vectors: `prefix` are the ones before the last (in order) and `tail` is the
+    /// last one, which the C leaves as the improper tail of the reply. `prefix` is empty for the
+    /// single-vector case, which is byte-for-byte (and shape-for-shape) the C.
+    Vectors {
+        prefix: Vec<&'a [u8]>,
+        tail: &'a [u8],
+    },
+}
+
+/// Strip the first `skip` bytes off `ev`'s vectors exactly as `driver_outputv` does
+/// (`io.c:6448-6504`) and split what remains into the C's header part and its improper tail.
 ///
-/// The C walks the [`SysIOVec`](crate::common::SysIOVec) array and hands the remaining vectors
-/// straight to the port (`io.c:6448-6504`); this seam takes one contiguous slice, so the bytes are
-/// copied. `skip >= size` yields an empty body — the C's early return, which sends the header alone.
-/// A `skip` past the vectors' declared lengths is malformed (`None`), never a partial body.
+/// The C's stripping loop is a `do { … } while (skip > 0)` (`io.c:6478-6493`), so it runs **at least
+/// once**: with `skip == 0` it still consumes a single leading zero-length vector. That is
+/// reproduced here. A `skip` past the vectors' declared lengths is malformed (`None`), never a
+/// partial body.
 ///
 /// # Safety
 ///
 /// `ev` must be null or point at a live [`ErlIOVec`] whose `iov` array holds `vsize` readable
 /// `SysIOVec` entries, each heading `iov_len` readable bytes.
-unsafe fn gather_iovec(ev: *const ErlIOVec, skip: ErlDrvSizeT) -> Option<Vec<u8>> {
+unsafe fn split_iovec<'a>(ev: *const ErlIOVec, skip: ErlDrvSizeT) -> Option<VecBody<'a>> {
     if ev.is_null() {
         return None;
     }
@@ -231,43 +278,81 @@ unsafe fn gather_iovec(ev: *const ErlIOVec, skip: ErlDrvSizeT) -> Option<Vec<u8>
         return None;
     }
     if size <= skip {
-        return Some(Vec::new()); // The C's `vec->size <= skip`: header only.
+        return Some(VecBody::NoTail); // The C's `vec->size <= skip`: header only.
     }
     if iov.is_null() {
         return None;
     }
     // SAFETY: the caller guarantees `vsize` readable `SysIOVec` entries at `iov`.
     let entries = unsafe { core::slice::from_raw_parts(iov, vsize as usize) };
-    let mut out = Vec::new();
+
+    // The C's `do { … } while (skip > 0)` (`io.c:6478-6493`): `idx` walks past fully-skipped
+    // vectors, and `offset` is how far into the first *remaining* vector the view starts.
+    let mut idx = 0usize;
+    let mut offset = 0usize;
     let mut left = skip;
-    for entry in entries {
+    loop {
+        let Some(entry) = entries.get(idx) else {
+            return None; // `skip` ran past the vectors' declared lengths: malformed.
+        };
         let len = entry.iov_len;
-        if left >= len {
+        if len <= left {
             left -= len;
+            idx += 1;
+            if left == 0 {
+                break; // `while (skip > 0)`: no skip remains, the loop ends.
+            }
+        } else {
+            offset = left;
+            break;
+        }
+    }
+    let mut remaining = Vec::with_capacity(entries.len().saturating_sub(idx));
+    for (i, entry) in entries[idx..].iter().enumerate() {
+        let start = if i == 0 { offset } else { 0 };
+        let len = entry.iov_len;
+        if len <= start {
+            remaining.push(&[] as &[u8]);
             continue;
         }
         // SAFETY: `iov_base` heads `iov_len` readable bytes (caller contract); the view starts
-        // `left` bytes in and runs to the entry's end.
-        let bytes = unsafe {
-            core::slice::from_raw_parts((entry.iov_base as *const u8).add(left), len - left)
-        };
-        out.extend_from_slice(bytes);
-        left = 0;
+        // `start` bytes in and runs to the entry's end.
+        remaining.push(unsafe {
+            core::slice::from_raw_parts((entry.iov_base as *const u8).add(start), len - start)
+        });
     }
-    if left != 0 {
-        return None; // `skip` ran past the vectors' declared lengths: malformed.
-    }
-    Some(out)
+    let Some((tail, prefix)) = remaining.split_last() else {
+        return None; // `size > skip` guarantees at least one remaining vector.
+    };
+    Some(VecBody::Vectors {
+        prefix: prefix.to_vec(),
+        tail,
+    })
 }
-
 /// `int driver_outputv(ErlDrvPort port, char *hbuf, ErlDrvSizeT hlen, ErlIOVec *ev,
 /// ErlDrvSizeT skip);` — send a header plus a scatter/gather vector with the first `skip` bytes
 /// dropped (`io.c:6448`).
 ///
+/// After the C's skipping, the vectors are handed to `deliver_vec_message` (`io.c:3502-3621`), which
+/// makes each remaining vector its own binary cons cell and leaves the **last** one as the improper
+/// tail: `[h… | <<v0>>, <<v1>>, …, <<vlast>>]` in `[binary]` port mode (an int list in `[list]`
+/// mode). This seam carries one header byte stream plus one tail, so:
+///
+/// * the **last** remaining vector is the tail (`body`) and `hbuf` plus every preceding remaining
+///   vector's bytes (in order) are the header — for the single-vector case, which is every inet
+///   driver read path, that is byte-for-byte *and* shape-for-shape the C (`[h… | <<v0>>]`);
+/// * for more than one remaining vector the flattened byte sequence (and `[list]` mode entirely) is
+///   identical, but the **nesting of the earlier vectors** differs: the C makes each of them its own
+///   binary cons cell while this seam folds their bytes into the header's int list
+///   (`[h…, v0 bytes… | <<vlast>>]`). That is a seam-width residual (the host hook carries one
+///   header stream and one tail), never a byte difference — see
+///   [`DriverHost::output2`](crate::driver::host::DriverHost::output2).
+/// * `ev->size <= skip` is the C's header-only reply (`body: None`), not an empty tail.
+///
 /// # Safety
 ///
 /// `port` must be null or a live port handle; `hbuf` must be null or point at `hlen` readable bytes;
-/// `ev` must be null or a live vector as required by [`gather_iovec`].
+/// `ev` must be null or a live vector as required by [`split_iovec`].
 #[no_mangle]
 pub unsafe extern "C" fn driver_outputv(
     port: ErlDrvPort,
@@ -277,11 +362,31 @@ pub unsafe extern "C" fn driver_outputv(
     skip: ErlDrvSizeT,
 ) -> c_int {
     // SAFETY: `ev`/`skip` are the caller's vector and its skip count (contract above).
-    let Some(body) = (unsafe { gather_iovec(ev, skip) }) else {
+    let Some(body) = (unsafe { split_iovec(ev, skip) }) else {
         return -1;
     };
-    // SAFETY: `hbuf`/`hlen` are the caller's header buffer and `port` its handle (contract above).
-    unsafe { output_pieces(port, hbuf, hlen, &body) }
+    // SAFETY: `hbuf`/`hlen` are the caller's header buffer (contract above).
+    let Some(header) = (unsafe { read_bytes(hbuf as *const u8, hlen) }) else {
+        return -1;
+    };
+    match body {
+        // SAFETY: `port` is null or a live handle (contract above).
+        VecBody::NoTail => unsafe { deliver_split(port, header, None) },
+        VecBody::Vectors { prefix, tail } if prefix.is_empty() => {
+            // SAFETY: `port` is null or a live handle (contract above).
+            unsafe { deliver_split(port, header, Some(tail)) }
+        }
+        VecBody::Vectors { prefix, tail } => {
+            let extra: usize = prefix.iter().map(|piece| piece.len()).sum();
+            let mut joined = Vec::with_capacity(header.len() + extra);
+            joined.extend_from_slice(header);
+            for piece in &prefix {
+                joined.extend_from_slice(piece);
+            }
+            // SAFETY: `port` is null or a live handle (contract above).
+            unsafe { deliver_split(port, &joined, Some(tail)) }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

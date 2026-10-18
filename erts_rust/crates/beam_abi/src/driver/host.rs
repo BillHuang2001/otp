@@ -125,6 +125,44 @@ pub trait DriverHost {
     /// Deliver `data` to the port owner (`driver_output`/`erl_drv_output`). `0` = ok, `-1` = fail.
     fn output(&mut self, port: ErlDrvPort, data: &[u8]) -> c_int;
 
+    /// Deliver a **split** read to the port owner — the C's `driver_output2` (`io.c:6387`) /
+    /// `driver_output_binary` (`io.c:6339`) / `driver_outputv` (`io.c:6448`) shape.
+    ///
+    /// The C does not hand the owner one flat byte string: it builds the reply as
+    /// `{Port,{data, Reply}}` where `Reply` is `[header bytes | Body]` — `header` is the `hbuf`/`hlen`
+    /// list prefix (`deliver_read_message`, `io.c:3363-3442`; `deliver_vec_message`, `io.c:3502`) and
+    /// `body` is the `buf`/`len` tail, which becomes a binary in `[binary]` port mode or an int list
+    /// otherwise. The header/body boundary is therefore *observable* to Erlang code: with
+    /// `port_command`-style `[binary]` options, `[h… | <<tail>>]` is not the same term as
+    /// `[h… | <<head>>, <<tail>>]` or a fully flattened list. This hook is that boundary.
+    ///
+    /// * `body: None` — the C's `buf == NULL`: **no tail at all**, i.e. the reply is the proper list
+    ///   `[h…]`. The C tests `buf != NULL` (`io.c:3372`), never `len != 0`, so a null buffer with a
+    ///   zero length is a *header-only* reply.
+    /// * `body: Some(&[])` — a **present, empty** tail: the C's `buf != NULL && len == 0`, which
+    ///   builds `<<>>` (`io.c:3373-3375`), i.e. the improper list `[h… | <<>>]`.
+    ///
+    /// The default is byte-identical to the pre-hook behaviour: it concatenates `header` then `body`
+    /// (`None` counted as empty) and makes exactly one [`output`](Self::output) call with the joined
+    /// bytes — the single call the `driver_output*` implementations made before this hook existed, so
+    /// a host that overrides only `output` keeps that (flattened) result. Overriding this hook is
+    /// what preserves the split. Every `output2` call makes **exactly one** `output` call; no
+    /// allocation happens when either side is empty.
+    ///
+    /// `0` = ok, `-1` = fail.
+    fn output2(&mut self, port: ErlDrvPort, header: &[u8], body: Option<&[u8]>) -> c_int {
+        let body = body.unwrap_or(&[]);
+        if header.is_empty() {
+            return self.output(port, body);
+        }
+        if body.is_empty() {
+            return self.output(port, header);
+        }
+        let mut joined = Vec::with_capacity(header.len() + body.len());
+        joined.extend_from_slice(header);
+        joined.extend_from_slice(body);
+        self.output(port, &joined)
+    }
     /// Deliver a decoded term (`erl_drv_output_term`/`erl_drv_send_term`): to the port owner when
     /// `to` is `None`, else to that specific process. `0` = ok, `-1` = fail.
     fn send_term(&mut self, port: ErlDrvPort, to: Option<Eterm>, term: Eterm) -> c_int;

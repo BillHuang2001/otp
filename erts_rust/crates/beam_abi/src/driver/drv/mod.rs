@@ -79,7 +79,11 @@
 //! delegate to the [`DriverHost`](crate::driver::host::DriverHost) seam:
 //!
 //! * **output** — [`driver_output`], [`driver_output2`], [`driver_output_binary`],
-//!   [`driver_outputv`]: they gather the header/body bytes and call [`DriverHost::output`](crate::driver::host::DriverHost::output).
+//!   [`driver_outputv`]: they hand the header/body bytes to [`DriverHost::output2`](crate::driver::host::DriverHost::output2),
+//!   which keeps the C's split (`[hbuf… | body]`) intact — the header stays a list prefix and the
+//!   body a tail, with a null `buf` distinguished from an empty one. `output2`'s default
+//!   concatenates them and makes one [`DriverHost::output`](crate::driver::host::DriverHost::output) call, so an
+//!   `output`-only host sees the pre-hook (flattened) bytes.
 //! * **term data** — [`driver_output_term`], [`driver_send_term`], [`erl_drv_output_term`],
 //!   [`erl_drv_send_term`]: they decode the `ErlDrvTermData[]` spec with
 //!   [`decode_term_spec`](crate::driver::host::decode_term_spec) and
@@ -134,9 +138,13 @@
 //! * [`driver_output_term`]/[`driver_send_term`]/[`erl_drv_output_term`]/[`erl_drv_send_term`] return
 //!   the host's code (`0` = delivered) where the C returns `1` for a delivered term and `0` for an
 //!   undeliverable one; a driver following the documented idiom of testing `< 0` sees identical
-//!   behaviour. The header/body split of `driver_output*` is likewise joined into one byte slice,
-//!   since [`DriverHost::output`](crate::driver::host::DriverHost::output) takes a single slice (the C can keep the header out as a list
-//!   prefix).
+//!   behaviour. The header/body split of `driver_output*` **is** preserved — the thunks hand the two
+//!   pieces to [`DriverHost::output2`](crate::driver::host::DriverHost::output2), whose default joins
+//!   them into one [`DriverHost::output`](crate::driver::host::DriverHost::output) call (a host that
+//!   overrides only `output` therefore sees the flattened bytes, as before), while a split-aware host
+//!   keeps the C's `[hbuf… | body]` shape. One residual remains for a multi-vector
+//!   [`driver_outputv`]: the seam carries one header stream and one tail, so with more than one
+//!   remaining vector only the **last** one stays a separate tail (see that function's docs).
 //! * A malformed or out-of-range request is **refused** (`-1`) where the C would read past the end of
 //!   a caller buffer: `driver_output_binary`'s `offset + len > orig_size`, a `driver_outputv` `skip`
 //!   past the vector's declared lengths, and a null `time_left`/`data`/`ErlIOVec`.

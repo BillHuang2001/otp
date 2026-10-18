@@ -49,6 +49,9 @@ struct TestDriverHost {
     heap: Heap,
     atoms: AtomTable,
     output: Vec<u8>,
+    /// How many times [`DriverHost::output`] was called (`output` itself only concatenates, so the
+    /// call *count* is what distinguishes one joined delivery from several).
+    calls: usize,
     sent: Vec<(Option<Eterm>, Eterm)>,
     selected: Vec<(usize, c_int, c_int)>,
     timers_set: Vec<c_ulong>,
@@ -65,6 +68,7 @@ impl TestDriverHost {
             heap: Heap::new(1024).expect("a small test heap is allocatable"),
             atoms: AtomTable::new(),
             output: Vec::new(),
+            calls: 0,
             sent: Vec::new(),
             selected: Vec::new(),
             timers_set: Vec::new(),
@@ -95,6 +99,7 @@ impl DriverHost for TestDriverHost {
     }
 
     fn output(&mut self, _port: ErlDrvPort, data: &[u8]) -> c_int {
+        self.calls += 1;
         self.output.extend_from_slice(data);
         0
     }
@@ -194,6 +199,50 @@ impl DriverHost for MinimalDriverHost {
 
     fn output(&mut self, _port: ErlDrvPort, _data: &[u8]) -> c_int {
         -1
+    }
+
+    fn send_term(&mut self, _port: ErlDrvPort, _to: Option<Eterm>, _term: Eterm) -> c_int {
+        -1
+    }
+}
+
+/// A host that overrides the **split** seam ([`DriverHost::output2`]) and records every reply as
+/// `(header, body)`; anything that reached the *unsplit* hook is recorded separately, so a test can
+/// assert the reply was never flattened.
+struct SplitHost {
+    heap: Heap,
+    splits: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    flattened: Vec<Vec<u8>>,
+}
+
+impl SplitHost {
+    fn new() -> SplitHost {
+        SplitHost {
+            heap: Heap::new(1024).expect("a small test heap is allocatable"),
+            splits: Vec::new(),
+            flattened: Vec::new(),
+        }
+    }
+}
+
+impl DriverHost for SplitHost {
+    fn heap(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    fn intern_atom(&mut self, _name: &str) -> Option<Eterm> {
+        None
+    }
+
+    fn output(&mut self, _port: ErlDrvPort, data: &[u8]) -> c_int {
+        self.flattened.push(data.to_vec());
+        0
+    }
+
+    fn output2(&mut self, _port: ErlDrvPort, header: &[u8], body: Option<&[u8]>) -> c_int {
+        self.splits
+            .push((header.to_vec(), body.map(<[u8]>::to_vec)));
+        0
     }
 
     fn send_term(&mut self, _port: ErlDrvPort, _to: Option<Eterm>, _term: Eterm) -> c_int {
@@ -743,4 +792,228 @@ fn driver_term_data_round_trips_through_the_table() {
     let rc = unsafe { output_term(port_id, spec.as_ptr() as *mut ErlDrvTermData, 2) };
     assert_eq!(rc, 0);
     assert_eq!(host.sent, vec![(None, make_atom(host.atoms.intern("x")))]);
+}
+// The split seam (`DriverHost::output2`): a header prefix plus a *distinguishable* body tail.
+
+/// The C's `(buf, len)` operand pair — `None` is a **null** `buf` with `len == 0`, the case the seam
+/// must keep distinct from an empty one.
+fn body_operand(body: Option<&mut [u8]>) -> (*mut c_char, ErlDrvSizeT) {
+    match body {
+        Some(bytes) => (bytes.as_mut_ptr() as *mut c_char, bytes.len()),
+        None => (core::ptr::null_mut(), 0),
+    }
+}
+
+/// `driver_output(port, buf, len)` over the operand pair.
+fn call_output(port: ErlDrvPort, body: Option<&mut [u8]>) -> c_int {
+    let (ptr, len) = body_operand(body);
+    // SAFETY: `port` is a live env handle and the buffer, when present, declares its own length.
+    unsafe { driver_output(port, ptr, len) }
+}
+
+/// `driver_output2(port, hbuf, hlen, buf, len)` over the operand pairs.
+fn call_output2(port: ErlDrvPort, header: &mut [u8], body: Option<&mut [u8]>) -> c_int {
+    let (ptr, len) = body_operand(body);
+    // SAFETY: `port` is live and both buffers declare their own lengths.
+    unsafe { driver_output2(port, header.as_mut_ptr() as *mut c_char, header.len(), ptr, len) }
+}
+
+/// `driver_output_binary(port, hbuf, hlen, bin, offs, len)` over the operand pairs.
+fn call_output_binary(
+    port: ErlDrvPort,
+    header: &mut [u8],
+    bin: *mut ErlDrvBinary,
+    offs: ErlDrvSizeT,
+    len: ErlDrvSizeT,
+) -> c_int {
+    let head = (header.as_mut_ptr() as *mut c_char, header.len());
+    // SAFETY: `port` is live, `header` declares its own length and `bin` covers `offs + len`.
+    unsafe { driver_output_binary(port, head.0, head.1, bin, offs, len) }
+}
+
+/// `driver_outputv(port, hbuf, hlen, ev, skip)` over the operand pair and a live vector.
+fn call_outputv(port: ErlDrvPort, header: &mut [u8], ev: &mut ErlIOVec, skip: ErlDrvSizeT) -> c_int {
+    // SAFETY: `port` is live, `header` declares its own length and `ev` describes live buffers.
+    unsafe { driver_outputv(port, header.as_mut_ptr() as *mut c_char, header.len(), ev, skip) }
+}
+
+/// An [`ErlIOVec`] over `iov`, declaring `size` bytes in total (the C's `vec->size`).
+fn iovec(iov: &mut [libc::iovec], size: ErlDrvSizeT) -> ErlIOVec {
+    ErlIOVec {
+        vsize: iov.len() as c_int,
+        size,
+        iov: iov.as_mut_ptr(),
+        binv: core::ptr::null_mut(),
+    }
+}
+
+/// The C's `[hbuf… | body]` boundary, which only `output2` can carry, survives `driver_output2`: the
+/// header stays a prefix, a null body buffer stays "no tail at all" and a non-null empty one stays a
+/// present, empty tail (`<<>>` in `[binary]` port mode) — three different terms.
+#[test]
+fn driver_output2_keeps_the_header_and_body_split() {
+    let mut host = SplitHost::new();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+    let mut head = *b"HDR";
+    let mut body = *b"abc";
+
+    assert_eq!(call_output2(port, &mut head, Some(&mut body[..])), 0);
+    assert_eq!(host.splits, vec![(b"HDR".to_vec(), Some(b"abc".to_vec()))]);
+    assert!(host.flattened.is_empty(), "a split-aware host never joins");
+
+    // A null body buffer is the C's `buf == NULL`: a header and **no** tail.
+    host.splits.clear();
+    let mut head = *b"HH";
+    assert_eq!(call_output2(port, &mut head, None), 0);
+    assert_eq!(host.splits, vec![(b"HH".to_vec(), None)]);
+
+    // A non-null buffer with a zero length is a **present, empty** tail.
+    host.splits.clear();
+    assert_eq!(call_output2(port, &mut head, Some(&mut body[..0])), 0);
+    assert_eq!(host.splits, vec![(b"HH".to_vec(), Some(Vec::new()))]);
+
+    // A null body buffer with a non-zero length is refused, never dereferenced.
+    host.splits.clear();
+    let (null, three) = (core::ptr::null_mut(), 3);
+    // SAFETY: the null buffer is checked before any read.
+    let rc =
+        unsafe { driver_output2(port, head.as_mut_ptr() as *mut c_char, head.len(), null, three) };
+    assert_eq!(rc, -1);
+    assert!(host.splits.is_empty());
+
+    // Two replies in one callback are two records, never merged.
+    let mut more = *b"H2";
+    assert_eq!(call_output2(port, &mut head, Some(&mut body[..1])), 0);
+    assert_eq!(call_output2(port, &mut more, Some(&mut body[..1])), 0);
+    assert_eq!(
+        host.splits,
+        vec![
+            (b"HH".to_vec(), Some(b"a".to_vec())),
+            (b"H2".to_vec(), Some(b"a".to_vec())),
+        ]
+    );
+}
+
+/// `driver_output` is `driver_output2(ix, NULL, 0, buf, len)` (`io.c:6442`): no header, and the buf
+/// **pointer** — never `len` — decides whether a tail exists.
+#[test]
+fn driver_output_distinguishes_a_null_buffer_from_an_empty_one() {
+    let mut host = SplitHost::new();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+    let mut body = *b"abc";
+
+    assert_eq!(call_output(port, Some(&mut body[..])), 0);
+    assert_eq!(host.splits, vec![(Vec::new(), Some(b"abc".to_vec()))]);
+
+    // `driver_output(port, NULL, 0)`: no header, no tail — the proper empty list.
+    host.splits.clear();
+    assert_eq!(call_output(port, None), 0);
+    assert_eq!(host.splits, vec![(Vec::new(), None)]);
+
+    // Non-null with a zero length: a present, empty tail — a *different* reply.
+    host.splits.clear();
+    assert_eq!(call_output(port, Some(&mut body[..0])), 0);
+    assert_eq!(host.splits, vec![(Vec::new(), Some(Vec::new()))]);
+}
+
+/// `driver_output_binary`'s payload sub-range is always a present body, so a zero-length range is
+/// `Some(&[])` (the C's `<<>>`), not a header-only reply; an out-of-range one stays refused.
+#[test]
+fn driver_output_binary_keeps_the_header_split() {
+    let mut host = SplitHost::new();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+    // SAFETY: the driver-binary allocator is a malloc wrapper; `bin` is freed below.
+    let bin = unsafe { driver_alloc_binary(8) };
+    binary_payload(bin, 8).copy_from_slice(b"abcdefgh");
+    let mut head = *b"H";
+
+    assert_eq!(call_output_binary(port, &mut head, bin, 2, 3), 0);
+    assert_eq!(host.splits, vec![(b"H".to_vec(), Some(b"cde".to_vec()))]);
+
+    host.splits.clear();
+    assert_eq!(call_output_binary(port, &mut head, bin, 8, 0), 0);
+    assert_eq!(host.splits, vec![(b"H".to_vec(), Some(Vec::new()))]);
+
+    // A sub-range past the payload is refused (the C would read past it).
+    host.splits.clear();
+    assert_eq!(call_output_binary(port, &mut head, bin, 6, 3), -1);
+    assert!(host.splits.is_empty());
+
+    // SAFETY: `bin` came from `driver_alloc_binary` and is freed exactly once.
+    unsafe { driver_free_binary(bin) };
+}
+
+/// `driver_outputv`'s **last** remaining vector is the improper tail (`deliver_vec_message`,
+/// `io.c:3502-3621`) and every preceding one belongs to the header; `size <= skip` is the C's
+/// header-only reply, *not* an empty tail.
+#[test]
+fn driver_outputv_keeps_the_last_vector_as_the_tail() {
+    let mut host = SplitHost::new();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+    let mut head = *b"H";
+    let mut first = *b"abcd";
+    let mut second = *b"efgh";
+    let mut iov = [
+        libc::iovec { iov_base: first.as_mut_ptr() as *mut c_void, iov_len: 4 },
+        libc::iovec { iov_base: second.as_mut_ptr() as *mut c_void, iov_len: 4 },
+    ];
+    let mut ev = iovec(&mut iov, 8);
+
+    assert_eq!(call_outputv(port, &mut head, &mut ev, 0), 0);
+    assert_eq!(
+        host.splits,
+        vec![(b"Habcd".to_vec(), Some(b"efgh".to_vec()))],
+        "the last vector is the tail, the earlier one joins the header"
+    );
+
+    host.splits.clear();
+    assert_eq!(call_outputv(port, &mut head, &mut ev, 5), 0);
+    assert_eq!(host.splits, vec![(b"H".to_vec(), Some(b"fgh".to_vec()))]);
+
+    // `skip == size`: the C's early `driver_output2(ix, hbuf, hlen, NULL, 0)` — no tail at all.
+    host.splits.clear();
+    assert_eq!(call_outputv(port, &mut head, &mut ev, 8), 0);
+    assert_eq!(host.splits, vec![(b"H".to_vec(), None)]);
+
+    // A trailing zero-length vector is a present, empty tail (the C's `<<>>`).
+    let mut short = *b"ab";
+    let mut iov = [
+        libc::iovec { iov_base: short.as_mut_ptr() as *mut c_void, iov_len: 2 },
+        libc::iovec { iov_base: short.as_mut_ptr() as *mut c_void, iov_len: 0 },
+    ];
+    let mut ev = iovec(&mut iov, 2);
+    host.splits.clear();
+    assert_eq!(call_outputv(port, &mut head, &mut ev, 0), 0);
+    assert_eq!(host.splits, vec![(b"Hab".to_vec(), Some(Vec::new()))]);
+}
+
+/// The default [`DriverHost::output2`] is byte-identical to the pre-hook behaviour: for every
+/// header/body shape it makes **exactly one** [`DriverHost::output`] call carrying header-then-body,
+/// so a `driver_output*` thunk and a direct `output2` reply with the same single call.
+#[test]
+fn the_default_output2_makes_exactly_one_output_call() {
+    let mut host = TestDriverHost::new();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+    let mut head = *b"HDR";
+    let mut body = *b"abc";
+
+    assert_eq!(call_output2(port, &mut head, Some(&mut body[..])), 0);
+    assert_eq!(host.output2(port, b"HDR", Some(b"abc")), 0);
+    assert_eq!(host.calls, 2);
+    assert_eq!(host.output, b"HDRabcHDRabc");
+
+    // Each remaining shape is one call too, and an empty side never adds bytes.
+    host.output.clear();
+    host.calls = 0;
+    assert_eq!(host.output2(port, b"", Some(b"b")), 0);
+    assert_eq!(host.output2(port, b"HDR", None), 0);
+    assert_eq!(host.output2(port, b"", None), 0);
+    assert_eq!(host.output2(port, b"HDR", Some(b"")), 0);
+    assert_eq!(host.calls, 4);
+    assert_eq!(host.output, b"bHDRHDR");
 }
