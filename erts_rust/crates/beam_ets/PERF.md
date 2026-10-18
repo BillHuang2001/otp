@@ -90,41 +90,71 @@ high-water policy (shrink-on-idle, or a per-call nursery cap) and not an ETS cos
 ## 2. Per-object reclamation versus the oracle (`tests/ets_reclamation_oracle.rs`)
 
 `ets:info(T, memory)` is a word count on both sides, but the crate counts the table's own
-store **plus the index's capacity**, while the oracle's figure tracks live data on a small
-fixed base — so the absolute values are not comparable (loaded 100 keys: crate
-`set/chained` 3468 words vs oracle `set` 1606 words). What is comparable, and what the test
-asserts, is the **contract**. Oracle figures (`escript`, `/proc/loadavg` `2.93 4.63 5.79` for
-the delete family and the progression, `2.60 4.12 5.50` for the last run):
+store **plus the index's allocated capacity** (which can fall with occupancy, below), while the
+oracle's figure tracks live data on a small fixed base — so the absolute values are not comparable
+(loaded 100 keys: crate `set/chained` 3468 words vs oracle `set` 1606 words). What is comparable,
+and what the test asserts, is the **contract**. Oracle figures (`escript`, `/proc/loadavg`
+`2.93 4.63 5.79` for the delete family and the progression, `2.60 4.12 5.50` for the last run):
 
 | family | oracle | crate |
 |---|---|---|
-| `delete/2`, `delete_object/2`, `delete_all_objects/1` each return a 100-object table to the **empty** floor | `set`/`bag`/`duplicate_bag` 306 → 1606 → **306**; `ordered_set` 140 → 1540 → **140**; `size` → 0 | every shape: 3 cycles land on one stable floor, strictly below the loaded figure and never below the empty table's; `delete_all_objects` and (after the fix below) a per-key emptying return **exactly** to the empty figure |
+| `delete/2`, `delete_object/2`, `delete_all_objects/1` each return a 100-object table to the **empty** floor | `set`/`bag`/`duplicate_bag` 306 → 1606 → **306**; `ordered_set` 140 → 1540 → **140**; `size` → 0 | every shape: 3 cycles land on one stable floor, strictly below the loaded figure and `==` the empty table's own; both `delete_all_objects` and a per-key emptying return **exactly** to the empty figure (the interior is rebuilt when it empties — see below) |
 | overwrite of an existing key (`m3` vs `m2`) | `set`/`ordered_set` **flat** (`m3 == m2`); `bag`/`duplicate_bag` grow by one object | same classification, exactly |
-| `delete_object/2` of the overwritten object (`m4`) | returns exactly to the pre-overwrite figure (`m1` on the upsert kinds, `m2` on the multi kinds) | direction verified (`m4 < m3`, `m4 >= m0`); on a chained index the *bucket array capacity* grown by the second key is retained until the table empties, so `m4` can sit above `m1` (measured 71 words vs `m1` = 55 at `/proc/loadavg` `2.70 4.01 5.43`) |
-| the removal path's endpoint (`m6` vs `m0`) | exactly `m0` (`m6_eq_m0` true for every kind) | `<= m0`, and `== m0` once the interior is released (see below) |
+| `delete_object/2` of the overwritten object (`m4`) | returns exactly to the pre-overwrite figure (`m1` on the upsert kinds, `m2` on the multi kinds) | direction verified (`m4 < m3`, `m4 >= m0`); on a chained index an emptied bucket keeps its minimum `Vec<Entry>` allocation (and an entry its `objs` vector) — the bucket *array* itself shrinks back — so `m4` can sit above `m1` (measured 71 words vs `m1` = 55 at `/proc/loadavg` `34.65 34.28 18.42`) |
+| the removal path's endpoint (`m6` vs `m0`) | exactly `m0` (`m6_eq_m0` true for every kind) | `== m0` for every shape: the emptied interior is rebuilt (`release_empty_interior`) |
 | heir gift data | `{heir, self(), {a_gift, [1..8]}}` costs **+23** words; `{heir, self(), undefined}` costs **+0**; 2000 set/clear rounds land on the cleared figure | +19 words for an equally shaped gift; arity-2 and `ClearHeir` return exactly to the base figure; 2000 rounds flat |
 | `give_away/3` | owner moves, `memory` **unchanged**, `size` unchanged | same |
 | heir transfer on owner death | table survives, owner = heir, heir **kept installed**, `memory` does not fall | same (`memory` unchanged, gift copy retained, reclaimed exactly on `ClearHeir`) |
 
-### Fix made: an emptied interior now releases its index storage
+### Index storage follows live occupancy (`tests/ets_capacity.rs`)
 
-The oracle keeps **no** index storage for an empty table (`delete/2` and
-`delete_object/2` put `ets:info(T, memory)` back on the empty figure), but the crate's
-`delete`/`delete_object` left the interior's capacity in place: after deleting every key of
-a 100-object table the crate reported 2368 words (chained) / 135 words (CHAMP) / 184 words
-(B+-tree) against its own empty figure of 24 / 7 / 24. `Table::delete`/`delete_object` now
-route through a new private `Table::release_empty_interior`, which rebuilds the interior once
-the last object has left it — the same `build_interior` operation `delete_all_objects` already
-used, so the two removal paths now converge and the figure returns to the empty-table floor.
-Only a removal that actually happened calls it, so `delete` of an absent key never churns the
-index.
+Every interior releases index capacity as objects leave, so the reported figure tracks live
+occupancy instead of the high-water mark a grow-then-teardown leaves behind. Word counts are
+load-independent, so no `/proc/loadavg` is recorded for this table. `Table::memory()` words at
+**empty / 10 000 inserted / 1 left after deleting 9 999 / after `delete_all_objects`**:
 
-The residual, still-documented difference is **capacity vs live data**: the crate's
-`memory()` counts the index's allocated capacity, so an index that has shrunk to *one* object
-still reports the bucket array/nodes it grew (the `m4` row above). Making the hash interiors
-release capacity per bucket (ERTS's "free an empty bucket") and the ordered arena shrink on
-delete is the natural follow-up; it is a throughput/accounting refinement, not a leak —
-`tests/ets_reclamation.rs` pins that every removal path's floor is stable across churn.
+| shape | empty | 10 000 inserted | 1 left | after `delete_all_objects` |
+|---|---|---|---|---|
+| `set` (CHAMP, default) | 7 | 90 775 | **38** | 7 |
+| `ordered_set` (B+-tree, default) | 24 | 81 480 | **11** | 24 |
+| `bag` / `duplicate_bag` / `set`-chained | 24 | 259 152 | **45** | 24 |
+| `ordered_set` (sorted `Vec`) | 0 | 62 768 | **9** | 0 |
+
+Each shape's trigger, with its own hysteresis so a stable-size churn never reallocates: the chained
+index rebuilds its bucket array through `HashInterior::rehash_into` once the object load falls below
+an eighth (`maybe_shrink`; never below `INITIAL_BUCKETS` = 8, halving while it stays under 1/8 — a 6×
+band under the 3/4 grow threshold) and trims an entry's object vector past 4× slack; the CHAMP `set`
+trims every node a removal walked once `capacity > 8 && capacity > 4 * len`; the B+-tree compacts its
+node arena when retired slots outnumber live ones (`NodeStore::needs_compaction`/`compact`, a dense
+renumbering that re-trims each surviving node) and trims each leaf's entry vector on removal; the
+sorted `Vec` releases past `CAPACITY_SHRINK_FACTOR` = 4.
+
+The oracle's side of the same trajectory makes the **direction** comparable and the absolute values
+not: its `ordered_set` tracks live data almost exactly (140 words empty → 148 with one object left)
+while its hash `set` only returns toward a small floor (306 → 2 624). The interior layout is not
+externally pinned, so the crate's contract is the **shape** — the figure falls with live data, no
+per-removal churn, and the empty floor is exact — not the oracle's word counts.
+
+The empty floor needs its own path, because a *downsized* index is not a *fresh* one (a chained
+index's bucket array stops at its starting count, a compacted arena keeps its root): `Table::delete`/
+`delete_object`/`take` route through the private `Table::release_empty_interior`, which rebuilds the
+interior once the last object has left it — the same `build_interior` operation `delete_all_objects`
+uses — so a delete-it-all trajectory lands on the empty figure **exactly**. Only a removal that
+actually happened calls it, so `delete` of an absent key never churns the index.
+
+The residual is therefore **one slack allocation per interior, at the interior's own shrink factor**,
+not a per-object high-water mark: a `set` that held 10 000 objects and holds one reports 38 words
+(its empty floor is 7), the chained kinds 45 (floor 24), the sorted `Vec` 9 (floor 0), and the B+-tree
+11 — *under* its own 24-word fresh floor, because a compacted arena's slot vector is allocated at
+exactly the live node count while a freshly built tree reserves its initial arena. A stable-size
+churn does not trade that back and forth: 200 rounds of 1 000 keys, deleting half and re-inserting
+half each round, keep `max == base` (or below) for every shape — no
+growth and no shrink/re-grow thrash, which is what the test asserts alongside the trajectory.
+
+Reproduce: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets
+--test ets_capacity -- --nocapture`. `ets:safe_fixtable/2` is the one deliberate exception in the
+figures above: while a table is fixed, a removed object's storage waits in `deferred_frees`, so memory
+falls at unfix rather than per removal (`ets_fixtable.rs`).
 
 ## 3. The `ordered_set` interior: B+-tree versus the sorted `Vec`
 

@@ -38,7 +38,7 @@ Three owners exist:
 | `first/1`, `next/2`, `last/1`, `prev/2` | implemented | `beam_ets::Table` (`first`/`next`/`last`/`prev`, `Option::None` ⇒ `'$end_of_table'`). For the **hash kinds** (`set`/`bag`/`duplicate_bag`) `last` **is** `first` and `prev` **is** `next` (`erl_db_hash.c:853-856`) — no backward walk; only `ordered_set` has the real arithmetic order. An absent anchor is `badarg` for a hash kind (an `ordered_set` reads it as a range bound) |
 | `member/2` | implemented | `beam_ets::Table::member` |
 | `tab2list/1` | implemented | `beam_ets::Table::tab2list` |
-| `slot/2` | implemented here; **BIF adoption pending** | `beam_ets::Table::slot(slot: i64, atoms) -> Result<Option<Vec<Eterm>>>` (0-based; `Ok(None)` ⇒ `'$end_of_table'`; an out-of-range **or negative** slot ⇒ `badarg`) and the **read**-gated `TableAccess::slot` (the oracle's `erl_db.c:3744` `ets_slot_2` takes a `DB_READ` gate). An `ordered_set` slot is **exact** — the object with the (n+1)-th smallest key (`erl_db_tree.c:1139` `db_slot_tree_common`), `size` = EOT, `> size` = `badarg`; a hash-kind slot is a hash **bucket** (`erl_db_hash.c:1733` `db_slot_hash`), so only the contract is pinned (slots `0..nactive-1` partition every object, `nactive` = EOT, `> nactive` = `badarg`). `beam_bifs::runtime::other` still answers the typed `unsupported_bif` (§7) |
+| `slot/2` | implemented here; **BIF adoption pending** | `beam_ets::Table::slot(slot: i64, atoms) -> Result<Option<Vec<Eterm>>>` (0-based; `Ok(None)` ⇒ `'$end_of_table'`; an out-of-range **or negative** slot ⇒ `badarg`) and the **read**-gated `TableAccess::slot` (the oracle's `erl_db.c:3744` `ets_slot_2` takes a `DB_READ` gate). An `ordered_set` slot is **exact** — the object with the (n+1)-th smallest key (`erl_db_tree.c:1139` `db_slot_tree_common`), `size` = EOT, `> size` = `badarg`; a hash-kind slot is a hash **bucket** (`erl_db_hash.c:1733` `db_slot_hash`), so only the contract is pinned (slots `0..nactive-1` partition every object, `nactive` = EOT, `> nactive` = `badarg`). `nactive` is this interior's own bucket count, and it shrinks back toward `INITIAL_BUCKETS` as objects leave (see §8), so a `slot` boundary is a snapshot of the current count, never a high-water mark. `beam_bifs::runtime::other` still answers the typed `unsupported_bif` (§7) |
 | `first_lookup/1`, `last_lookup/1`, `next_lookup/2`, `prev_lookup/2` | implemented | `beam_bifs::ets::nav` (**read**-gated) over the table's `first`/`last`/`next`/`prev` |
 | `foldl/3`, `foldr/3` | implemented | `beam_bifs::ets::adopt::{foldl_3, foldr_3}` (**read**-gated) — the per-object fun is applied through `BifContext::call_fun` (the `FunCaller` seam), so a non-empty fold with no `FunCaller` hook is the typed `unsupported_bif`; an empty table returns `Acc0` without ever calling the fun |
 | `take/2` | implemented | `beam_ets::Table::take` (checked-out copies; the stored originals are reclaimed) |
@@ -254,9 +254,11 @@ These are the reference answers, each compared against the live `erl` (`tests/di
    safe views instead of the raw read family. `Table::set_owner` **is** called (at `ets:new/2`, §7.2).
    `take/2` carries a storage-lifetime consequence of its own: `Table::take` hands back table-owned
    `Eterm`s and `relinquish`es each checked-out copy, so `store.words()`/`Table::memory`/`size` drop by
-   exactly the object's word count (flat across a take + re-insert churn) while the words stay valid and
-   are never returned to the free lists — a repeated take churn grows the store's block count (bounded
-   only by the total taken volume) until `delete_all_objects/1`'s `reset()` or the table drop. Inherent
+   exactly the object's word count, and a `take` that drains the table releases the interior as well
+   (`Table::take` calls `release_empty_interior`, so the emptied table reports its exact fresh floor).
+   The relinquished words stay valid and are never returned to the free lists — a repeated take churn
+   grows the store's block count (bounded only by the total taken volume) until
+   `delete_all_objects/1`'s `reset()` or the table drop. Inherent
    to `take` returning a live checked-out term; reproduced by
    `tests/ets_reclamation.rs::take_style_relinquish_churn_retains_its_arena_until_the_store_is_reset`.
 7. **Match-spec arithmetic operators default to the small-int/float subset.** `src/select/expr/arith.rs`'s
@@ -289,3 +291,22 @@ These are the reference answers, each compared against the live `erl` (`tests/di
   The branch descent is a lower bound and binary-searches the strictly ascending separators.
   Covered by `tests/ets_reclamation.rs` (focused reproductions + memory-accounting stress across every
   kind and interior shape).
+* **An interior's index storage follows live occupancy.** `ets:info(T, memory)` is the table-owned term
+  storage plus the index storage, and every interior now releases that storage as objects leave
+  instead of holding its high-water allocation: the chained hash index (`bag`/`duplicate_bag`, opt-in
+  `set`) rebuilds its bucket array through `HashInterior::rehash_into` once the object load falls below
+  an eighth (`maybe_shrink`, never below `INITIAL_BUCKETS` = 8, halving while it stays under 1/8 — a
+  6× band below the 3/4 grow threshold) and trims an entry's object vector past 4× slack; the CHAMP
+  `set` runs `trim_capacities` over the nodes a removal walked, releasing a slot vector once
+  `capacity > 8 && capacity > 4 * len`; the `ordered_set` B+-tree compacts its node arena once retired
+  slots outnumber live ones (`NodeStore::needs_compaction`/`compact` — a dense renumbering that
+  re-trims each surviving node) and trims each leaf's entry vector on removal; the sorted-`Vec`
+  `ordered_set` releases past `CAPACITY_SHRINK_FACTOR` = 4. An interior that empties is still rebuilt
+  (`Table::release_empty_interior`, reached from `delete`/`delete_object`/`take` and
+  `delete_all_objects`), so the **empty floor is exact**; at small sizes the residual is one slack
+  allocation per the interior's own factor. The interior layout is not externally pinned
+  (`../CONTEXT.md` §2), so the contract is the **shape** — memory falls with live data, no
+  per-removal churn (a stable-size insert/delete churn keeps its maximum at the base), the exact empty
+  floor — and the word counts themselves are this crate's own (measured trajectory in `PERF.md` §2;
+  pinned by `tests/ets_capacity.rs`). `ets:safe_fixtable/2` is the one deliberate exception: while a
+  table is fixed, removed storage waits in `deferred_frees`, so memory falls at unfix.

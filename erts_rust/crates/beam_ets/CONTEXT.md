@@ -108,7 +108,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   / `lookup_element_or(key, pos, default)` (scalar; `unsupported` raise for the multi kinds),
   `lookup_element_all(key, pos) -> Vec<Eterm>` / `lookup_element_all_or(..) -> Option<Vec<Eterm>>` (the
   multi kinds' list result), `slot(slot, atoms) -> Result<Option<Vec<Eterm>>>` (`ets:slot/2`: 0-based;
-  `None` ⇒ `'$end_of_table'`; negative/out-of-range ⇒ `badarg`), `memory()`, `size()` (objects, not
+  `None` ⇒ `'$end_of_table'`; negative/out-of-range ⇒ `badarg`), `memory()` (words: the table-owned
+  store **plus** the index storage, which the interiors release as occupancy falls — see Design
+  Decisions, "Every interior releases index capacity"), `size()` (objects, not
   keys, for bag/dup_bag), `is_empty()`, `tab2list()` (ordered for ordered_set).
 - **Element updates:** `update_counter(key, op)`, `update_counter_with(key, op, default)`,
   `update_element(key, &[(pos, term)]) -> bool`.
@@ -126,10 +128,13 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `Table::set_fixation(bool)` / `is_fixed()` / `deferred_objects()` — `ets:safe_fixtable/2`.
 - `pub fn match_spec_run(list, spec, atoms, heap) -> Result<Vec<Eterm>>` (`run.rs`) — the
   table-independent `ets:match_spec_run/2` runner.
-- **`release_empty_interior`** (private) — called after a `delete`/`delete_object` that removed
-  something; when the interior is now empty it rebuilds it through `build_interior`, dropping the
-  index's grown capacity so `Table::memory()` returns to the empty-table floor (`delete_all_objects`
-  already resets). A removal that did not happen never churns the index.
+- **`release_empty_interior`** (private) — called after a `delete`/`delete_object`/`take` that removed
+  the last object; when the interior is now empty it rebuilds it through `build_interior`, so
+  `Table::memory()` lands on the **exact** empty-table floor (`delete_all_objects` resets the same
+  way). A downsized index is not a *fresh* one (a chained index's bucket array stops at its starting
+  count, a compacted arena keeps its root), so the emptied case rebuilds rather than trusting the
+  shrink policy. A removal that did not happen never churns the index, and `Table::take` reaches the
+  same release, so a table drained by `take/2` returns to its fresh floor too.
 - `pub(crate) trait Interior` — the internal dispatch seam (`insert`/`insert_new`/`delete`/
   `delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/`iter_objects`/
   `iter_objects_rev`/`keys`/`take`/`slot`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
@@ -249,11 +254,17 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `last_key`/`prev_key`/`iter_objects_rev` apply the hash-kind aliasing. **Delete canonicalization**: a
   removal canonicalizes bottom-up — a sub-node holding exactly one entry is **inlined** into its parent
   as an inline slot (a sub-node is indexed by the *next* 5 hash bits, so promoting a multi-entry
-  sub-node wholesale would break routing).
+  sub-node wholesale would break routing). **A removal also gives capacity back**: `node_remove` runs
+  `trim_capacities` over the nodes its canonicalization walked (recursing the touched subtree),
+  shrinking a slot vector once `capacity > 8 && capacity > 4 * len`, so `memory()` follows the live
+  slot count instead of the high-water mark.
 
 ### `hash_interior.rs` — chained hash-index interior (`bag`/`duplicate_bag`; opt-in `set`)
 - `pub struct HashInterior`: buckets `Vec<Vec<Entry>>` (`Entry { key, objs: Vec<Eterm> }`), lookup by
-  `term_hash(key) % buckets` then `eq`; doubles + rehashes past a load factor. `set` keeps ≤ 1 object
+  `term_hash(key) % buckets` then `eq`; `maybe_grow` doubles + rehashes past a 3/4 load factor, and
+  `maybe_shrink` rebuilds the bucket array through `rehash_into` once the load falls below 1/8 (never
+  below `INITIAL_BUCKETS`, halving while it stays under 1/8), trimming an entry's `objs` past 4×
+  slack. `set` keeps ≤ 1 object
   per key; `bag` rejects a duplicate *object* within a key (its `insert` returns `false`, so the caller
   reclaims the rejected copy); `duplicate_bag` keeps a multiset. `delete_object` removes **every** equal
   object (the oracle). Public API for testing/reuse: `new(kind)`, `take(key, atoms)`,
@@ -265,14 +276,21 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `next`/`prev`, `next_from(bound, inclusive)`/`prev_from(bound, inclusive)`, all via
   `beam_term::compare::cmp_arith` (`erl_db_tree.c` `cmp_key_eq`, `CMP = erts_cmp(a, b, 0, 0)`), so `1`
   and `1.0` are the same key; whole-object identity (`delete_object/2`) stays the exact `compare::eq`.
-  Plus its `Interior` impl; the node arena **is** counted by `memory()`.
+  Plus its `Interior` impl; the node arena **is** counted by `memory()`, and it is released as keys
+  leave (compaction + per-leaf trim), so the figure follows the live key count.
 - `sorted.rs` — `SortedOrderedInterior`: the same semantics over one sorted `Vec` (O(log n) lookup via
-  the shared `node::search_entries`, O(n) insert/remove), same navigation, capacity-based `memory()`;
+  the shared `node::search_entries`, O(n) insert/remove), same navigation, `memory()` measured at
+  capacity but given back through `release_capacity` (`CAPACITY_SHRINK_FACTOR = 4`) as entries leave;
   selectable via `OrderedInterior::Sorted`.
 - `node.rs` — the arena node layout, `ORDER`/`MIN_OCCUPANCY`, the `NodeStore` (`NodeId` slots + free
-  list; nodes never relocate), the shared `Entry` record, `search_entries`, `words_of`.
+  list; nodes never relocate), the shared `Entry` record, `search_entries`, `words_of`, and the
+  capacity-release pair: `needs_compaction()` (`retired.len() > live`) and `compact(&mut root)`, a
+  dense arena renumbering that relocates every `leaf.next`/`branch.children`/the root and `trim_vec`s
+  each surviving node before dropping the retired slots.
 - `tree.rs` — insert/lookup/delete with split + borrow-or-merge rebalance, the replace-key-term rule,
-  the separator invariant `keys[i] == max(child[i])`. `iter.rs` — the leaf-chain ordered iterator.
+  the separator invariant `keys[i] == max(child[i])`; `delete` runs `NodeStore::compact` after
+  `collapse_root()` and every leaf removal trims that leaf's own entry vector (a single-leaf tree
+  retires no node, so nothing else would revisit it). `iter.rs` — the leaf-chain ordered iterator.
 
 ### `select/` — the match-spec compiler + executor
 - `mod.rs` — `pub type SelectPredicate<'a> = dyn FnMut(&[Eterm]) -> bool + 'a;`
@@ -373,12 +391,37 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   (freeing first would let a later same-size `copy` reuse the words the caller holds), and each returned
   copy is `relinquish`ed: valid for the table's lifetime, never handed out again, no longer counted
   toward `memory()`.
-- **An emptied interior releases its index storage.** Once the last object has left, `delete`/
-  `delete_object` rebuild the interior through the private `release_empty_interior` — the same operation
-  `delete_all_objects` uses — so `ets:info(T, memory)` returns to the empty-table floor the oracle
-  reports. Residual (capacity vs live data): an index shrunk to **one** object still reports the bucket
-  array/nodes it grew; per-bucket capacity release (hash kinds) and an ordered-arena shrink on delete are
-  the follow-up — a throughput/accounting refinement, not a leak. See `PERF.md` §2.
+- **Every interior releases index capacity as occupancy falls.** An interior's `memory()` is measured at
+  capacity but shrinks that capacity back deterministically, so `ets:info(T, memory)` tracks the
+  **live** key/object count instead of the high-water allocation a bulk teardown would leave. Four
+  homes, each with its own hysteresis so a stable-size churn never reallocates:
+  - `hash_interior` (`bag`/`duplicate_bag`, opt-in `set`): `maybe_shrink` — called from the inherent
+    `take`, `Interior::delete` and `Interior::delete_object`, and only when something was actually
+    removed — rebuilds the bucket array through `rehash_into` once `buckets > INITIAL_BUCKETS` (8) and
+    `len * 8 < buckets`, halving while the load stays under 1/8. That is a 6× band against the 3/4 grow
+    threshold, and a bucket entry's `objs` vector is `shrink_to_fit` past 4× slack.
+  - `champ_interior` (default `set`): `trim_capacities` runs on every node a successful `node_remove`
+    touched, recursing over the subtree the removal walked, and releases a slot vector once
+    `capacity > 8 && capacity > 4 * len`.
+  - `ordered_interior/node.rs` + `tree.rs` (default `ordered_set` B+-tree): `Tree::delete` runs
+    `NodeStore::compact` after `collapse_root()` when `needs_compaction()` (`retired.len() > live`) —
+    a dense arena renumbering that relocates every `leaf.next`/`branch.children`/the root and
+    `trim_vec`s each surviving node — and every leaf removal trims that leaf's own entry vector, so a
+    single-leaf tree (which retires no node) still releases capacity.
+  - `ordered_interior/sorted.rs` (the sorted-`Vec` alternative): `release_capacity`
+    (`CAPACITY_SHRINK_FACTOR = 4`) from `delete`/`delete_object`.
+  Measured `Table::memory()` words along the empty → 10 000 inserted → 1 left after deleting 9 999 →
+  `delete_all_objects` trajectory: `set` (CHAMP) 7 / 90 775 / **38** / 7; `ordered_set` (B+-tree)
+  24 / 81 480 / **11** / 24; `bag`/`duplicate_bag`/`set`-chained 24 / 259 152 / **45** / 24;
+  `ordered_set` (sorted `Vec`) 0 / 62 768 / **9** / 0. The **contract is the shape** — memory falls
+  with live data, no per-removal churn (a 200-round stable-size churn at 1 000 keys, deleting half and
+  re-inserting half each round, keeps `max == base`: neither growth nor shrink/re-grow thrash), and
+  the empty floor is exact (see `release_empty_interior`) — **not** the oracle's word counts: the
+  oracle's `ordered_set` tracks live data almost exactly (140 → 148 words with one object left) while
+  its hash `set` only returns toward a small floor (306 → 2 624), so the interior layout stays this
+  crate's choice (`../CONTEXT.md` §2). `ets:safe_fixtable/2`'s fixation is the one deliberate
+  exception: while a table is fixed, a removed object's storage waits in `deferred_frees`, so memory
+  falls at unfix rather than per removal.
 - **An interior's stored key term aliases a live, table-owned object.** `key_of(object, keypos)` returns
   a pointer *into* the object's table-owned `TermStore` storage, so an interior that keeps a key must
   re-point it whenever it replaces or removes the object it aliased: on a `set` upsert
@@ -483,7 +526,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `table/tests.rs`, `table/view/tests.rs`, `ordered_interior/tests.rs` hold the big ones;
   `interior_parity.rs`/`interior_bench.rs` are `#[cfg(test)]` siblings). Coverage: kind/options, key
   validation, store copy/free/reuse/relinquish, table insert/take accounting, hash-interior ops, CHAMP
-  ops (round-trip, 2000-key churn, collision node, canonicalization, memory monotonicity), B+-tree
+  ops (round-trip, 2000-key churn, collision node, canonicalization, memory accounting across churn),
+  B+-tree
   invariants (incl. 10 000-key churn), the sorted-`Vec` interior, select compile/execute, info,
   owner-death, the heir forms/reclaim, the duplicate_bag `select_replace` rebuild storage floor, and the
   guard-scoped views (incl. the aliasing defence).
@@ -515,6 +559,18 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
     oracle-identical with a flat `Table::memory`; `ets_slot.rs` pins `Table::slot`'s ordered-exact /
     hash-contract split, its read gate and the guard-scoped `TableRead::slot`; `ets_info.rs` the
     `size`/`memory` counters (incl. the `ordered_set` node-arena share and `safe_fixtable`'s held memory).
+  - `ets_capacity.rs` → the **index-capacity release** trajectory per interior shape (`set`-CHAMP,
+    `ordered_set` B+-tree, `ordered_set`-sorted, `bag`/`duplicate_bag`/`set`-chained): empty → 10 000
+    inserted → 1 left after deleting 9 999 → `delete_all_objects`, asserting `Table::memory()` falls to
+    a small figure at 1-left and lands on the **exact** empty floor; plus a 200-round stable-size churn
+    (1 000 keys, delete half + re-insert half each round) asserting no growth and no shrink/re-grow
+    thrash. Its live-oracle cross-check asserts **direction and rough magnitude only** — the interior
+    layout is unpinned, so each shape's word count is this crate's own.
+  - The same triggers are pinned per interior by unit tests: `src/hash_interior.rs` (`maybe_shrink`'s
+    1/8 `rehash_into` rebuild and the `objs` trim), `src/champ_interior.rs` (`trim_capacities`'s
+    4×-slack/8-slot gate over the touched subtree) and `src/ordered_interior/tests.rs`
+    (`NodeStore::needs_compaction`/`compact`'s dense renumbering, the per-leaf trim, and
+    `SortedOrderedInterior::release_capacity`).
 - **Access enforcement, per-operation, against the live oracle.** `tests/ets_access.rs`
   (`every_read_and_write_op_of_the_access_matrix_matches_the_live_oracle`) drives **every** read, every
   write, every `ets:info` field, every ownership op and the four continuation resumes, under owner +
@@ -576,8 +632,6 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   (`WriteConcurrency::Auto`/`FixedLocks(n)`); what remains host-side is the *rendering* (the `auto` atom
   / the normalized lock tuple comes from the `beam_bifs` `TableProfile` sidecar). Fine-grained locking
   is a **throughput** workstream, never a correctness gap.
-- **Indices report allocated capacity, not live data.** An index shrunk to one object still reports the
-  bucket array/nodes it grew (see the emptied-interior Design Decision and `PERF.md` §2).
 - **The owner-death transition's runtime caller reclaims named and unnamed tables alike.** `Table::owner_died`
   is driven by `beam_rt::runtime::ets_owner::drain_ets_owner_exits` (over the `EtsExitObserver` on the
   `ProcessTable`), and `beam_bifs`'s `ets:new/2` records the owner. The set of tables a dead owner owned
@@ -630,7 +684,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   and a malformed `ErlSubBits`. Evidence: `src/store/tests.rs`, `tests/ets_store_terms.rs`.
 - **`ets:take/2` retains the checked-out object's arena until the table is dropped.** `Table::take`
   deep-copies the removed object out and `relinquish`es the copy: `store.words()` drops by exactly the
-  object's word count (so `Table::memory`/`size` stay correct and flat across a take + re-insert churn),
+  object's word count (so `Table::size` falls by one and `Table::memory`'s table-owned share by exactly
+  those words; a take that *drains* the table releases the index as well, see
+  `release_empty_interior`),
   but the words stay **valid** and never return to the free lists, so a repeated take churn grows the
   store's `blocks` (bounded by the total taken volume) until `store.reset()`
   (`ets:delete_all_objects/1`) or the table is dropped — a checked-out term must stay valid and `take`
@@ -701,7 +757,7 @@ rendering stays host-side (`TableInfo::write_concurrency` is a `bool`).
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/access_audit/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/reclamation_oracle/memory/copy_oracle/concurrency/slot/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/access_audit/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/reclamation_oracle/capacity/memory/copy_oracle/concurrency/slot/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups)
 - `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace (60-slot op space incl. a `next`/`prev` walk + key-boundary dimension) vs the live oracle (`#[ignore]`d; run with `--ignored`)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
