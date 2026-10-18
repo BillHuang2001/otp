@@ -505,11 +505,12 @@ fn unknown_verbs_and_malformed_arguments_are_bad_arg() {
     assert!(matches!(verb("listen", &[9]), Err(BeamError::BadArg)));
     assert!(matches!(verb("bind", &[]), Err(BeamError::BadArg)));
     assert!(matches!(verb("connect", b""), Err(BeamError::BadArg)));
-    // A second `open` is the operational `einval` (the C would leak the first socket
-    // here, so this floor refuses instead).
+    // A second `open` is the C's sequence error (`inet_ctl_open`'s
+    // `state != INET_STATE_CLOSED ⇒ ctl_xerror(EXBADSEQ)`, `inet_drv.c:5130`-`:5131`),
+    // and a live socket is never replaced (so never leaked).
     assert_eq!(
         verb("open", &open_arg()).expect("a reply"),
-        b"\x00einval".to_vec()
+        b"\x00exbadseq".to_vec()
     );
     registry.close(&mut poller, id).expect("closes");
 }

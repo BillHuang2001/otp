@@ -1379,6 +1379,22 @@ impl TcpInetDriver {
 
     /// The `open` verb: creates the socket and registers it for read readiness.
     ///
+    /// A port that is **not** `Closed` answers the C's sequence error, not an argument fault:
+    /// `inet_ctl_open` opens with
+    /// `if (desc->state != INET_STATE_CLOSED) return ctl_xerror(EXBADSEQ, rbuf, rsize);`
+    /// (`inet_drv.c:5130`-`:5131`), i.e. `[0] ++ "exbadseq"` — measured on OTP 29.1.1 /
+    /// erts-17.1 as `[0,101,120,98,97,100,115,101,113]` for a second `INET_REQ_OPEN` on an
+    /// opened, a listening and a connected port alike. The C's operand decoding runs *before*
+    /// that guard (`tcp_inet_ctl`, `:11968`-`:11995`), so a malformed operand still answers its
+    /// own refusal; the numeric route does that in
+    /// [`control_opcode`](Self::control_opcode) before reaching here.
+    ///
+    /// A live descriptor **is** a non-`Closed` state on this floor (an owned close takes the
+    /// descriptor away and sets [`InetState::Closed`]; a `prebound` `INET_REQ_FDOPEN` one keeps
+    /// both across a close, exactly as `erl_inet_close`'s prebound arm does), so the guard is
+    /// [`has_socket`](Self::has_socket) — which also means a live socket is never leaked by
+    /// replacing it.
+    ///
     /// # Errors
     ///
     /// [`beam_common::BeamError::BadArg`] for an argument that is not the three-byte
@@ -1386,9 +1402,7 @@ impl TcpInetDriver {
     /// created.
     fn verb_open(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
         if self.has_socket() {
-            // The C has no such guard (its OPEN would leak the old socket); this floor
-            // refuses to replace a live socket with the operational-error reply instead.
-            return Ok(ctl_xerror("einval"));
+            return Ok(ctl_xerror("exbadseq"));
         }
         let [family, kind, protocol] = arg else {
             return Err(error::badarg());
