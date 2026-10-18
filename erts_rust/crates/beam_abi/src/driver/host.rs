@@ -884,7 +884,16 @@ pub fn decode_term_spec(env: &mut DriverEnv, spec: &[ErlDrvTermData]) -> Option<
                     // id term through the host. The two encodings are disjoint: a live handle is a
                     // non-null 8-aligned pointer (low bits 0) and can never satisfy
                     // `is_internal_port`'s `x & 0xF == 0x7`.
-                    stack.push(env.host().port_term(operand as usize as ErlDrvPort)?);
+                    let term = env.host().port_term(operand as usize as ErlDrvPort)?;
+                    // The hook's answer is an invariant, not a hint: the C's slot only ever holds an
+                    // internal port (`io.c:5744-5747`), so a host that answers a non-port term is
+                    // refused exactly as the C refuses a non-port operand — `ERTS_DDT_FAIL` (the
+                    // whole spec is `None`, `-1` returned, nothing delivered) rather than a wrong
+                    // term delivered where the ABI requires a port.
+                    if !prelude::is_internal_port(term) {
+                        return None;
+                    }
+                    stack.push(term);
                 }
             }
             ERL_DRV_PID => {
@@ -1502,6 +1511,23 @@ mod tests {
         // term, so a host without the `port_term` hook — this one is at the trait default — refuses
         // it. `7` above passes only because it satisfies `is_internal_port`.
         assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(0x1000)]), None);
+    }
+
+    #[test]
+    fn a_port_term_hook_answering_a_non_port_is_refused() {
+        // The `ERL_DRV_PORT` slot only ever holds an internal port in the C (`io.c:5744-5747`), so
+        // the hook's answer is validated rather than trusted: a host that answers a non-port term
+        // gets the C's `ERTS_DDT_FAIL` — the whole spec is `None` (`-1` to the caller, nothing
+        // delivered) — instead of a wrong term delivered where the ABI requires a port.
+        let handle = 0x1000usize as ErlDrvPort;
+        let mut host = PortTermHost::new(handle, make_small(42));
+        let mut env = DriverEnv::new(&mut host);
+        assert_eq!(
+            decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(handle as usize)]),
+            None,
+            "a hook answer that is not an internal port fails the whole spec"
+        );
+        assert_eq!(host.asked, vec![handle], "the hook was consulted exactly once");
     }
 
     #[test]

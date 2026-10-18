@@ -581,6 +581,16 @@ pub unsafe extern "C" fn driver_mk_atom(string: *mut c_char) -> ErlDrvTermData {
 /// # Safety
 ///
 /// `port` must be null or a live port handle (it is only compared, never dereferenced).
+///
+/// # The nil answer is not a port operand
+///
+/// A null `handle` answers [`driver_term_nil`] — `NIL`'s word, a non-null pointer-sized value whose
+/// low nibble is **not** the port tag. That value is **not** a valid first argument to
+/// `erl_drv_output_term`/`erl_drv_send_term` (the C shape `f(driver_mk_port(ix), ...)`): the term
+/// data travels back through `port_from_term_data` -> `env_for` ->
+/// [`DriverEnv::from_port`](crate::driver::host::DriverEnv::from_port), which would dereference it as
+/// a handle. Only the non-nil answer is a live handle; a driver that may fail to get a port must pass
+/// a real one (or skip the call), never the nil word.
 #[no_mangle]
 pub unsafe extern "C" fn driver_mk_port(port: ErlDrvPort) -> ErlDrvTermData {
     if port.is_null() {
