@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1792329488789,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    },
+    {
+      "kind": "rust",
+      "program": "erts_rust/target/release/beam_rt",
+      "version": "30",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "baseline",
+      "runtime": "sys",
+      "category": "startup",
+      "description": "system-ERTS startup latency + fixed compute loop",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 104.198798,
+            "max": 107.159509,
+            "mean": 105.6024827,
+            "p50": 105.76309,
+            "p90": 106.4659501,
+            "p99": 107.09015311
+          }
+        },
+        {
+          "name": "compute_loop_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 5,
+            "min": 161.294694,
+            "max": 165.555985,
+            "mean": 163.87676539999998,
+            "p50": 164.071833,
+            "p90": 165.205359,
+            "p99": 165.5209224
+          }
+        },
+        {
+          "name": "compute_ops_per_sec",
+          "unit": "ops/s",
+          "value": 6102146.314391435
+        },
+        {
+          "name": "vm_memory_total_bytes",
+          "unit": "bytes",
+          "value": 36196312.0
+        }
+      ],
+      "peak_memory_bytes": 135180288,
+      "notes": []
+    },
+    {
+      "workload": "baseline",
+      "runtime": "rust",
+      "category": "startup",
+      "description": "system-ERTS startup latency + fixed compute loop",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 394.277152,
+            "max": 396.359208,
+            "mean": 395.5550843,
+            "p50": 395.81860800000004,
+            "p90": 396.30076379999997,
+            "p99": 396.35336358
+          }
+        },
+        {
+          "name": "compute_loop_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 5,
+            "min": 461.987753,
+            "max": 465.897934,
+            "mean": 464.1029132,
+            "p50": 464.677684,
+            "p90": 465.7550128,
+            "p99": 465.88364188
+          }
+        },
+        {
+          "name": "compute_ops_per_sec",
+          "unit": "ops/s",
+          "value": 2154694.5118378545
+        },
+        {
+          "name": "vm_memory_total_bytes",
+          "unit": "bytes",
+          "value": 6788542.0
+        }
+      ],
+      "peak_memory_bytes": 171462656,
+      "notes": []
+    }
+  ]
+}

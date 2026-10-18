@@ -72,7 +72,7 @@ when an older `dotnet` is first on `PATH`, from the store `dotnet-sdk-9.0.318` v
 `dotnet` is **store state, not repo state**: PLB needs a ≥ 9.0 SDK, and `command_for_min` finds it wherever it lives (a store entry realized with `nix build --no-link nixpkgs#dotnet-sdk_9`, or a ≥ 9.0 `dotnet` on `PATH`). If no such SDK is reachable, `plb` is either `skipped(dotnet-absent)` or — when an older `dotnet` resolves but none is ≥ 9 — a genuine `failed(plb-build-failed)` with the rejected-candidate notes attached, recorded honestly, never papered over.
 **Flake NOTE (do NOT edit `../../flake.nix`):** it lists `rebar3` in `oracleDeps` but no .NET SDK; adding one there would make `plb` reproducible.
 The sandbox record of what each tool-driven target actually does here is `results/m14-tool-targets-notes.md`;
-the current session's own record is `results/m15-load-record.md`.
+the current session's own record is `results/m16-load-record.md`.
 
 ### `beam_rt` is a REAL runtime (self-checked)
 `beam_rt` is a working Rust runtime (real `-eval` evaluator, a global-atom `code:*`/`init:*` floor, native
@@ -137,6 +137,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 | `list_walk` | compute | in-tree embedded `bench_list_walk` module (BIF-free recursive `sum/1` list walk), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent` |
 | `copy_bound` | messaging | in-tree embedded `bench_copy_bound` module (ETF / ETS / two-process copy round-trips, with and without the codec in the receiver), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `module-compile-failed`, `runtime-unsupported` |
 | `gc_bound` | gc | in-tree embedded `bench_gc_bound` module (allocate-and-abandon garbage churn), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `module-compile-failed`, `runtime-unsupported` |
+| `binary_append` | compute | in-tree embedded `bench_binary_append` module (16 KiB → 64 KiB byte-quadrupling `<<B/binary,…>>` comprehension = 16 384 appends into one writable payload), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `module-compile-failed`, `unsupported-case-set`, `runtime-unsupported` |
 
 - `baseline` (always-on): N runs of `<erl> -noshell -eval 'halt().'` ⇒ startup-latency `Summary` (p50/p99);
   a fixed in-VM compute loop `-eval 'S = lists:sum(lists:seq(1,1000000)), io:format("~p~n",[S]), halt().'`
@@ -243,6 +244,18 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 - `copy_bound`: **the messaging / term-copy-bound metric** — the term-copy boundary run under *both* runtimes. One embedded `bench_copy_bound` module (generated from the crate's constants, so Rust and Erlang cannot drift) with four cases, each copying the **same structured payload** (a 5-key map) and validating the round-trip with a bound-variable pattern (a real equality test that raises on a corrupted copy): `etf_roundtrip` (`term_to_binary/1` + `binary_to_term/1` — the External Term Format wire codec, contract A.5); `ets_copy` (`ets:insert/2` + `ets:lookup/2` — the ETS copy boundary, one table+key per process so the measured work is the copy, not table growth); `send_recv` (a term sent to a second process, round-tripped through `term_to_binary/1` there, and sent back — **both directions** of the process copy boundary, with an `after` guard so a missing reply fails loudly, never hangs); and `send_recv_plain` — the **delivery-only (no-ETF) attribution case**: the identical two-process shape, but the worker replies the payload *directly* (`From ! {self(), T}`) with **no** `term_to_binary`/`binary_to_term` in the receiver, so `send_recv − send_recv_plain` attributes the ETF codec component *inside* the two-process path (the `beam_process`/`beam_message` delivery shape the sibling crates asked for). It uses the shared paired per-op recipe (every round samples the `N`-op pass then the `0`-op pass back to back, with a per-case per-runtime `N`; `etf_roundtrip` 500 000/1 500 000, `ets_copy` 250 000/2 000 000, `send_recv` 90 000/500 000, `send_recv_plain` 300 000/1 000 000 rust/sys — the rust `N` is set by the loop-count rule in Constraints; `--quick` ⇒ 3 rounds/case, `--full` ⇒ 10), reporting `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, `case_<name>_ns_per_op` (median of the paired `(wall@N − wall@0)` differences / `N` × 1e6, withheld as `marginal below timer resolution` unless it clears `3 × max(1 ms, 1.4826·MAD)`) and the deterministic, contention-immune `case_<name>_ops` = `N`. A Rust exit `3` records the capability gap and emits **no** timing; an embedded-module compile failure is `failed(module-compile-failed)` (the source is ours), never a skip; `probe()` ⇒ `skipped(erlc-absent)` via the shared `slice::resolve_erlc()` lookup. **Attribution caveat:** `payload/0` is rebuilt inside every iteration, and each iteration also runs the bound-variable equality match, so the `etf_roundtrip` per-op figure is the *whole iteration* (payload construction + `term_to_binary`/`binary_to_term` + the structural equality test), **not the codec alone** — the same shape holds for `ets_copy`/`send_recv`/`send_recv_plain`, and both runtimes pay the identical per-iteration setup.
 - `gc_bound`: **the GC-bound metric** — allocate-and-abandon garbage churn under *both* runtimes. One embedded `bench_gc_bound` module whose single `churn/1` case, per iteration, builds and abandons three `LEN`=256-sized structures — a pure-Erlang recursion list (`build_list/2`, *not* a native `lists:seq/2`), a 256-byte binary built from an Erlang-level char list, and a tuple built from another Erlang list — then checks the two O(1)-checkable ones (`byte_size`/`tuple_size`) so a silently-dropped allocation fails loudly. It uses the same shared paired per-op recipe (every round samples the `N`-churn pass then the `0`-churn pass back to back; `n_rust` = 10 000, `n_sys` = 200 000; `--quick` ⇒ 3 rounds, `--full` ⇒ 10), reporting `case_churn_wall_ms`, `case_churn_startup_ms`, `case_churn_peak_rss_bytes`, `case_churn_ns_per_op` (median of the paired `(wall@N − wall@0)` differences / `N` × 1e6, withheld unless it clears `3 × max(1 ms, 1.4826·MAD)`) and the deterministic, contention-immune `case_churn_ops` = `N`. The row measures the allocate-and-abandon wall time and **claims no collection count** (whether a runtime's collector runs during the loop is its own admission policy); a Rust exit `3` ⇒ an honest `skipped(unsupported-case)` with **no** timing, and a compile failure is `failed(module-compile-failed)`; `probe()` ⇒ `skipped(erlc-absent)` via `slice::resolve_erlc()`.
 
+- `binary_append`: **the binary-append (writable-accumulator) metric** — the in-place binary growth path run
+  under *both* runtimes. One embedded `bench_binary_append` module (generated from the crate's constants:
+  `INPUT_ARG` = 8 KiB ⇒ 16 KiB in, `OUT_BYTES_PER_CALL` = 65 536 out) whose `expand/1` is the compiler's
+  writable-accumulator squeeze — `<< <<C:8,C:8,C:8,C:8>> || <<C:8>> <= Bin >>`, i.e. 16 384 four-byte segments
+  appended into **one** writable payload — and whose `run(N)` calls it `N` times, returning the deterministic
+  `N × 65 536`. Metrics: `case_binary_append_wall_ms`, `_startup_ms`, `_peak_rss_bytes`,
+  `case_binary_append_ns_per_call` (the shared paired median, withheld in the noise band) and the
+  deterministic companions `case_binary_append_calls` = `N` and `case_binary_append_bytes` = `N × 65 536`.
+  The row measures the **append path**, not a series of copies: each call's payload is grown in place and the
+  deterministic stdout proves neither side dropped an append. `n_rust` = 2 000 is **capped by `beam_rt`'s own
+  60 s `run`-action deadline** (≈3.2–4.9 ms/call), which is also why the interpreter tier cannot measure this
+  case at the calibrated `N` and reports `failed(no-binary-append-run)` rather than a number.
 ### Result JSON schema (stable — `SCHEMA_VERSION = 1`)
 Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in **milliseconds** (f64).
 ```jsonc
@@ -322,14 +335,17 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `tests/oracle_smoke.rs` → `baseline` smoke test against the real oracle (no-op skip when unresolved).
 - `RESULTS.md` → the definitive results summary (per-category tables, both sides named, the load record, the
   reproduction commands, the still-open items, honesty caveats).
-- `results/` → committed raw `Report` JSON + supporting artifacts. `m15-*` = the **current** run (2026-10-17,
-  load ≈2–5): `m15-bench-xrun.json` (the full cross-runtime report), the two `--quick` tier controls
-  `m15-bench-xrun-{interp,quick}.json`, the external report `m15-bench-external.json`, the PLB row
-  `m15-bench-plb.json` and the EMQX skip row `m15-bench-emqx.json`, the
-  `m15-compare-{cross-runtime,tier-effect-quick,vs-m14-xrun,vs-m14-external}.txt` diffs, the
-  `m15-{xrun,tier,ext}-load.log` records and `m15-load-record.md` (which also records the superseded
-  pre-recalibration primary pass). History: `m14-*` (its `copy_bound`/`gc_bound`/`foreign` per-unit figures are
-  superseded by the paired estimator — see `RESULTS.md` §3.4; the `m14-ab-*` interleaved A/B set +
+- `results/` → committed raw `Report` JSON + supporting artifacts. `m16-*` = the **current** run (2026-10-18,
+  1-min load 3–76, every A/B pinned with `taskset -c 3`): `m16-bench-xrun.json` (the primary `--full --runtime
+  all` report, 14/14 rows `ok`), the **matched cross-runtime rounds** `m16-xab-{rust,sys}-r{1,2,3}.json` (the
+  source of the headline ratios), the **binary A/B** `m16-ab-{new,old}-r{1,2,3}.json` (HEAD vs the m15-era
+  runtime `a34ca61332`, alternating order, rust-only), `m16-bench-xrun-interp.json` (tier control),
+  `m16-bench-{external,plb,emqx}.json`, the pinning control `m16-pin-control-{pinned,unpinned}.json`, the
+  `m16-compare-{cross-runtime,tier-effect-quick,vs-m15-xrun,vs-m15-external,ab-binary}.txt` diffs, the
+  `m16-{xrun,xab,ab,ext}-load.log` records and `m16-load-record.md` (which also holds the append ladder).
+  History: `m15-*` (its per-unit rows are superseded by m16 — different load band, and the m16 binary A/B is
+  now the only valid "changed since" evidence), `m14-*` (its `copy_bound`/`gc_bound`/`foreign` per-unit figures
+  are withdrawn by the paired estimator — see `RESULTS.md` §3.3; the `m14-ab-*` interleaved A/B set +
   `m14-ab-summary.csv` and `m14-recalibration.{md,csv}` remain the evidence behind those decisions),
   `m13-*`/`m12-*`/`m11-*`/`m10-*`/`m9-*`/`m6-*`/`m5-*`/`m4-*` (regression baselines; the `m13-*` group also
   holds `m13-cli-probe.csv` and `m13-foreign-ladder.csv`, `m9-*` the post-fix tool-resolution smokes), the
@@ -348,10 +364,13 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   normalization — never compare raw `wall_ms` across two sides with different `N`; every row also emits the
   deterministic `case_*_ops`/`case_*_calls`/`case_*_elements` companion so the `N` behind each figure is in the
   report.
-  Current counts (rust/sys, m15): `list_walk` 50 000/100 000; `foreign` `bstr_to_lower` 50 000/1.5 M,
+  Current counts (rust/sys, m16): `list_walk` 50 000/100 000; `foreign` `bstr_to_lower` 50 000/1.5 M,
   `bstr_capitalize_token` 40 000/1.5 M, `emqx_base62_encode` 60 000/3 M, `emqx_base62_decode` 60 000/3 M;
   `copy_bound` `etf_roundtrip` 500 000/1.5 M, `ets_copy` 250 000/2 M, `send_recv` 90 000/0.5 M,
-  `send_recv_plain` 300 000/1 M; `gc_bound` `churn` 10 000/200 000.
+  `send_recv_plain` 300 000/1 M; `gc_bound` `churn` 10 000/200 000; `binary_append` 2 000/50 000 calls.
+  `binary_append`'s rust count is additionally **capped by `beam_rt`'s 60 s `run`-action deadline** (its
+  ≈3.2–4.9 ms/call is ~3 orders of magnitude dearer than the other cases), so its loop work is ≈6.5 s and its
+  pinning test bounds the work from above as well as below.
   **Maintenance rule: when a case's measured per-unit cost changes materially, re-derive that case's `n_rust`
   so the loop work stays ≥0.5 s and re-pin it** in the file's
   `the_rust_loop_count(s)_clear_the_boot_jitter_band` test (which also fails when a case is added without a

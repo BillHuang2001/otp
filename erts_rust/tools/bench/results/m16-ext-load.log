@@ -1,0 +1,8 @@
+tier control: BEAM_RT_TIER=interpreter, rust-only --quick, taskset -c 3
+2026-10-18 22:30:44 loadavg=7.01 7.95 14.42 2/864 4
+interp exit=0 loadavg=3.04 4.86 11.20 1/842 1103
+external targets: sys-only --full, UNPINNED (no A/B; m15 comparability)
+2026-10-18 22:36:02 loadavg=3.04 4.86 11.20 1/842 1105
+external exit=0 loadavg=8.94 7.48 11.11 3/854 12076
+plb exit=0 loadavg=4.66 6.50 10.41 2/882 16232
+emqx exit=0 loadavg=4.66 6.50 10.41 2/882 16427

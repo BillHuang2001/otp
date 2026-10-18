@@ -1,0 +1,27 @@
+matched cross-runtime A/B: rust-only and sys-only --quick passes alternating per round, taskset -c 3, workloads=baseline,slice,foreign,list_walk,copy_bound,gc_bound,binary_append
+2026-10-18 22:13:23 round= side=rust loadavg=6.61 28.00 27.83 3/887 4
+  -> exit=0 loadavg=6.17 20.91 25.25 15/960 1133
+2026-10-18 22:15:22 round= side=sys loadavg=6.17 20.91 25.25 28/960 1135
+  -> exit=0 loadavg=8.21 19.22 24.45 2/850 9746
+2026-10-18 22:16:12 round= side=sys loadavg=8.21 19.22 24.45 3/850 9748
+  -> exit=0 loadavg=8.21 17.61 23.63 3/874 18359
+2026-10-18 22:17:02 round= side=rust loadavg=8.21 17.61 23.63 3/874 18361
+  -> exit=0 loadavg=9.31 14.93 21.89 4/912 19490
+2026-10-18 22:19:07 round= side=rust loadavg=9.31 14.93 21.89 5/907 19492
+  -> exit=0 loadavg=8.93 13.79 20.69 3/867 20621
+2026-10-18 22:21:08 round= side=sys loadavg=8.93 13.79 20.69 3/867 20623
+  -> exit=0 loadavg=6.97 12.50 19.88 13/916 29234
+
+rerun with per-round file names
+2026-10-18 22:22:02 round=1 side=rust loadavg=7.62 12.54 19.86 16/916 4
+  -> exit=0 loadavg=8.25 11.16 18.46 3/847 1133
+2026-10-18 22:24:02 round=1 side=sys loadavg=8.25 11.16 18.46 3/847 1135
+  -> exit=0 loadavg=9.13 11.05 18.04 6/899 9746
+2026-10-18 22:24:51 round=2 side=sys loadavg=9.13 11.05 18.04 5/899 9748
+  -> exit=0 loadavg=8.01 10.49 17.49 3/872 18359
+2026-10-18 22:25:41 round=2 side=rust loadavg=8.01 10.49 17.49 3/872 18361
+  -> exit=0 loadavg=7.99 9.39 16.22 9/857 19490
+2026-10-18 22:27:41 round=3 side=rust loadavg=7.99 9.39 16.22 19/873 19492
+  -> exit=0 loadavg=4.98 7.75 14.78 3/824 20621
+2026-10-18 22:29:40 round=3 side=sys loadavg=4.98 7.75 14.78 3/825 20623
+  -> exit=0 loadavg=8.63 8.30 14.63 2/862 29234
