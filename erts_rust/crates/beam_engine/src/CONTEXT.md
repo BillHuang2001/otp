@@ -156,11 +156,14 @@ state each holds in a Rust local across the call:
   call, so a move in the seam would dangle both.
 - `ExecutionContext::apply_fun` (`:558`, the `Ok(None)` fallback) — the same `fun`/`args`; protection
   here is the host's `with_relocation_exempt`, not publication.
-- `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments live in the
-  `EMPTY_ARGS` stack array (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch`
-  (`machine/mod.rs:385`); **neither is in any `RootSet`**. The in-machine twin
-  (`ExecutionContext::call_bif_in_machine`, reached through the single `Machine::dispatch_bif_call`
-  funnel) carries the same arguments and the same constraint.
+- `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments are **copies** living in the
+  `EMPTY_ARGS` stack array (`interpreter/bif.rs:50-53`, `:88-93`, `:232-238`) or `Machine.args_scratch`
+  (`machine/mod.rs:387`, **taken out of the machine** for the whole dispatch — `bif.rs:157`, restored
+  `:167` — so it is not even reachable from `Machine` while the terms are live); **neither is in any
+  `RootSet`**. The in-machine twin `ExecutionContext::call_bif_in_machine` (`bif.rs:301`) is reached
+  from `Machine::dispatch_bif_call`, which takes **`&self`** — so at that door a host can neither see the
+  arguments in a root set NOR write a relocated word back into `x`: a collection during it leaves both
+  the copy and the register file dangling. The trait documents no GC contract for `args`.
 
 **Verified: no admission point can intervene on the `call_fun`/`call_fun2` path with the shipped host.**
 `BudgetContext::resolve_local_fun` (`beam_rt/src/runner/budget.rs:220`) forwards **without** arming, and
