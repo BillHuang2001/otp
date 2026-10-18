@@ -7,7 +7,7 @@ Three **optional host seams** keep it wire-compatible without owning runtime sta
 Ground truth = legacy C `../../erts/emulator/beam/external.c` (`erts_encode_ext`/`erts_decode_ext`, `enc_term`/`dec_term`) plus `external.h` (tags), `erl_term.h`/`erl_map.h` (layouts) and `../../erts/doc/guides/erl_ext_dist.md`; every tag value and encoding is **wire-frozen** — read the C, never modify it.
 ## Status
 **Implemented.** Every module (list in §API Surface) carries real bodies, incl. `decode/local_node.rs`, `decode/options.rs`, and the `term` forwarding layer (over `beam_term::{thing,fun,bitstring,refc,record,hashing}`).
-Test count at this HEAD: **473 tests across 32 targets** (lib unit + 30 `tests/` binaries + doc-test), 0 failures (`../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast`).
+Test count at this HEAD: **479 tests across 32 targets** (lib unit + 30 `tests/` binaries + doc-test), 0 failures (`../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast`).
 Differential gate: **`total=2925 agree=2924 mismatch=0 unsupported=1 skipped=0`**, exit **0** — the sole allowlisted gap is `wire/new_fun_ext_encode` (the unclosable `erl_eval` lambda; re-run `../tools/differential/gate.sh` for the live split).
 ## API Surface (FROZEN — dependents route here)
 Signatures only; the wire rules and C ground truth live below. All fallible calls return `beam_common::Result<_>`; a violated precondition is `BadArg` (§Constraints). Re-exported at the crate root and via `beam_codec::prelude::*`.
