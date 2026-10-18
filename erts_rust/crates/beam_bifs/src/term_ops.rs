@@ -75,24 +75,48 @@ fn element_index(n: Eterm, tuple: Eterm) -> Result<usize> {
     Ok(index as usize - 1)
 }
 
+/// Counts a proper list, rejecting a non-list or an improper tail.
+///
+/// The count is the whole of `length/1`, so this walk allocates nothing and never
+/// materializes the elements.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `t` is not a proper
+/// list.
+fn proper_list_len(t: Eterm) -> Result<usize> {
+    let mut len = 0usize;
+    let mut tail = t;
+    while access::is_list(tail) {
+        len += 1;
+        tail = access::cdr(tail);
+    }
+    if access::is_nil(tail) {
+        Ok(len)
+    } else {
+        Err(badarg())
+    }
+}
+
 /// Walks a proper list into a `Vec`, rejecting a non-list or an improper tail.
+///
+/// The count pass reserves the element buffer at the list's *exact* length, so the
+/// fill is a single allocation instead of a doubling sequence, and a rejected list
+/// allocates nothing at all (the failure is found before the buffer exists).
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `t` is not a proper
 /// list.
 fn proper_list(t: Eterm) -> Result<Vec<Eterm>> {
-    let mut elems = Vec::new();
+    let len = proper_list_len(t)?;
+    let mut elems = Vec::with_capacity(len);
     let mut tail = t;
     while access::is_list(tail) {
         elems.push(access::car(tail));
         tail = access::cdr(tail);
     }
-    if access::is_nil(tail) {
-        Ok(elems)
-    } else {
-        Err(badarg())
-    }
+    Ok(elems)
 }
 
 /// `element(N, Tuple)`.
@@ -140,8 +164,8 @@ fn list_to_tuple(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `length(List)`.
 fn length(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let elems = proper_list(args[0])?;
-    ctx.int(elems.len() as i64)
+    let len = proper_list_len(args[0])?;
+    ctx.int(i64::try_from(len).map_err(|_| system_limit())?)
 }
 
 /// `hd(List)`.

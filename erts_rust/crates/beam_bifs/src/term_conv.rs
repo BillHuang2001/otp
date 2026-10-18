@@ -108,8 +108,8 @@
 
 use beam_common::{BeamError, Result};
 use beam_codec::term as codec_term;
-use beam_process::{PortId, ProcessId, MAX_PROCESS_NUMBER, MAX_PROCESS_SERIAL};
-use beam_term::prelude::signed_value;
+use beam_process::{PortId, ProcessId};
+use beam_term::prelude::{signed_value, try_make_pid_data};
 use beam_term::{atom_val, Eterm, ERL_ONHEAP_BITS_LIMIT, NIL};
 
 use crate::access;
@@ -839,11 +839,15 @@ fn parse_digits(field: &str) -> Result<u64> {
 ///
 /// The grammar is the C's: a leading `<`, three non-empty decimal fields separated
 /// by `.`, a trailing `>`, and nothing else. The channel must be the local node's
-/// (`0`); the number and serial must fit the internal pid immediate
-/// (`beam_process::{MAX_PROCESS_NUMBER, MAX_PROCESS_SERIAL}`), the C's
-/// `ERTS_MAX_INTERNAL_PID_NUMBER`/`_SERIAL` checks, so `<0.268435456.0>` and
-/// `<0.0.4294967296>` are `badarg`. Leading zeros are accepted (`<0.01.0>` ⇒
-/// `<0.1.0>`), as in the C.
+/// (`0`); the number and serial must fit the internal pid immediate, the C's
+/// `ERTS_MAX_INTERNAL_PID_NUMBER`/`_SERIAL` check before `make_pid_data`
+/// (`bif.c:4578-4581`), so `<0.268435456.0>` and `<0.0.4294967296>` are `badarg`.
+/// Leading zeros are accepted (`<0.01.0>` ⇒ `<0.1.0>`), as in the C.
+///
+/// That check is **not** re-derived here: it is
+/// [`beam_term::prelude::try_make_pid_data`], the one definition of the two limits
+/// (lifted from the same C call site), so this crate carries no second copy of
+/// `(1 << 28) - 1` / `(1 << 32) - 1`.
 ///
 /// # Errors
 ///
@@ -861,9 +865,18 @@ fn parse_pid_text(bytes: &[u8]) -> Result<ProcessId> {
     if fields.next().is_some() || channel != LOCAL_NODE_NUMBER {
         return Err(badarg());
     }
-    if number > MAX_PROCESS_NUMBER || serial > MAX_PROCESS_SERIAL {
-        return Err(badarg());
-    }
+    // The C's range check (`bif.c:4578-4581`) tests the serial first, then the
+    // number, before combining them — after `make_pid_data` an out-of-range number
+    // carries into the serial field and a bad field is no longer distinguishable.
+    // `TermError::PidIdOutOfRange` describes exactly this condition (and reconciles
+    // to the same `badarg` upstream); it is mapped explicitly so this BIF's class
+    // cannot drift, and it is deliberately *not* `system_limit`: the oracle answers
+    // `badarg` for `<0.268435456.0>`.
+    try_make_pid_data(serial, number).map_err(|_| badarg())?;
+    // Both fields are now provably in range, and `ProcessId::to_eterm` is their only
+    // encoder (`make_internal_pid(make_pid_data(serial, number))` — the C macro that
+    // is unchecked *by contract*, the caller owning the check done above), so no
+    // second bound is needed on this path.
     Ok(ProcessId::new(number, serial))
 }
 

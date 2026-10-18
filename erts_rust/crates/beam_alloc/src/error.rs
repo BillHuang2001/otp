@@ -68,6 +68,51 @@ pub(crate) fn heap_exhausted(words: usize) -> BeamError {
     )
 }
 
+/// The payload limits a caller asked for are not self-consistent.
+///
+/// A [`crate::binary::RefcBinary`] payload keeps three capacity words with the fixed
+/// ordering `len <= capacity <= reserved <= max_capacity`, and `reserved` must also stay
+/// within the allocator's real single-block ceiling
+/// ([`crate::binary::MAX_PAYLOAD_BYTES`]). A request that violates any of those relations
+/// can never be satisfied, so it is rejected before a single byte is allocated
+/// ([`BeamError::BadArg`] carries no payload, hence the debug log).
+pub(crate) fn bad_payload_limits(
+    capacity: usize,
+    reserved: usize,
+    max_capacity: usize,
+) -> BeamError {
+    beam_common::beam_debug!(
+        "beam_alloc: invalid refc-binary payload limits \
+         (capacity {capacity}, reserved {reserved}, max {max_capacity})"
+    );
+    BeamError::BadArg
+}
+
+/// Growth was requested on a payload that more than one handle still shares.
+///
+/// The C ground truth asserts the same precondition (`ASSERT(erts_refc_read(
+/// &refc_binary->intern.refc, 1) == 1)`, `erts/emulator/beam/erl_bits.c:1968`): a shared
+/// payload cannot be reallocated without every other handle's `BinRef.val` going stale, so
+/// the request is refused ([`BeamError::BadArg`]) instead of silently corrupting them.
+pub(crate) fn payload_shared(refcount: usize) -> BeamError {
+    beam_common::beam_debug!(
+        "beam_alloc: refusing to grow a refc-binary payload shared by {refcount} handles"
+    );
+    BeamError::BadArg
+}
+
+/// A requested payload length does not fit the payload's current capacity.
+///
+/// Growing the capacity is the caller's explicit step
+/// ([`crate::binary::RefcBinary::ensure_capacity`]); `set_len` must never write past the
+/// reserved capacity, so an over-long request is [`BeamError::BadArg`].
+pub(crate) fn payload_len_exceeds_capacity(len: usize, capacity: usize) -> BeamError {
+    beam_common::beam_debug!(
+        "beam_alloc: payload length {len} exceeds the payload capacity {capacity}"
+    );
+    BeamError::BadArg
+}
+
 /// An allocation requested an alignment the allocator cannot satisfy.
 ///
 /// [`BeamError::BadArg`] carries no payload, so the offending alignment is only

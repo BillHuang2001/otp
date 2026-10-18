@@ -343,12 +343,16 @@ fn the_chain_collapses_to_one_space_and_young_contains_covers_every_space() {
 // 4. A capped heap leaves the collector untouched
 // ---------------------------------------------------------------------------
 
+/// `max_heap_words` bounds the chain's **summed** capacity, so the ceiling has to leave room for
+/// the space a growth installs *on top of* the 51-word nursery the collector starts with: 51 + 90
+/// = 141 words is the chain after the small request below, so a 200-word budget admits it while
+/// still refusing 4096.
 #[test]
 fn grow_nursery_leaves_the_collector_untouched_when_the_ceiling_cannot_reach() {
     for kind in [MatureKind::Copying, MatureKind::Immix] {
         let policy = HeapPolicy {
             initial_young_words: 51,
-            max_heap_words: 100,
+            max_heap_words: 200,
             ..HeapPolicy::default()
         };
         let mut c = any_for(kind, policy);
@@ -359,7 +363,7 @@ fn grow_nursery_leaves_the_collector_untouched_when_the_ceiling_cannot_reach() {
         let used_before = c.young().used_words();
         let stats_before = c.stats();
 
-        // 4096 words can never be reached with a 100-word ceiling: a typed error, no panic.
+        // 4096 words can never be reached with a 200-word chain ceiling: a typed error, no panic.
         let err = c.grow_nursery(4096).expect_err("growth is capped");
         assert!(matches!(err, BeamError::Alloc(_)), "{kind:?}: got {err:?}");
         assert_eq!(err.as_atom(), Some("out_of_memory"), "{kind:?}");

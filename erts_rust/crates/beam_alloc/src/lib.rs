@@ -76,7 +76,15 @@ pub use crate::allocator::{
     AllocRef, Allocator, AllocatorConfig, AllocatorConfigBuilder, CarrierAllocator, MIN_ALIGN,
     WORD_ALIGN,
 };
-pub use crate::binary::RefcBinary;
+// The refc-payload growth protocol. The outcome enum is exported as
+// `PayloadGrowOutcome` because `GrowOutcome` at the crate root (and in the prelude) is
+// `reserved_heap::GrowOutcome` — the *heap* growth verdict — and those two must not be
+// confused: one grows an off-heap binary payload, the other a per-process term heap.
+pub use crate::binary::{
+    payload_capacity, GrowOutcome as PayloadGrowOutcome, GrowthCounters, RefcBinary,
+    Relocation as PayloadRelocation, DEFAULT_RESERVATION_FACTOR, GROW_DOUBLING_LIMIT_BYTES,
+    MAX_PAYLOAD_BYTES,
+};
 pub use crate::heap::Heap;
 pub use crate::policy::{CarrierPolicy, PolicyOptionKind};
 pub use crate::refcount::RefCount;
@@ -95,7 +103,11 @@ pub mod prelude {
     pub use crate::allocator::{
         Allocator, AllocRef, AllocatorConfig, CarrierAllocator, MIN_ALIGN, WORD_ALIGN,
     };
-    pub use crate::binary::RefcBinary;
+    pub use crate::binary::{
+        payload_capacity, GrowOutcome as PayloadGrowOutcome, GrowthCounters, RefcBinary,
+        Relocation as PayloadRelocation, DEFAULT_RESERVATION_FACTOR, GROW_DOUBLING_LIMIT_BYTES,
+        MAX_PAYLOAD_BYTES,
+    };
     pub use crate::heap::Heap;
     pub use crate::refcount::RefCount;
     pub use crate::registry::{all_stats, allocator, default_allocator, AllocType};

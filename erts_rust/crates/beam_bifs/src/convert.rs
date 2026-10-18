@@ -1298,6 +1298,10 @@ mod tests {
     // -- float_to_list / list_to_float ------------------------------------
 
     #[test]
+    // `3.14159` is a six-digit *float* (the oracle renders
+    // `"3.14158999999999988262e+00"`), not `f64::consts::PI` — the literal is the
+    // subject under test, so it must not be swapped for the constant.
+    #[allow(clippy::approx_constant)]
     fn float_to_list_default_is_scientific_20() {
         with_ctx(|ctx| {
             for (value, expected) in [

@@ -67,7 +67,7 @@ use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm
 use crate::boot::bootscript::{self, BootScript, BootStop};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
-use crate::config::{strategy_env_default, ArgTerm, InitArgs, RuntimeConfig};
+use crate::config::{strategy_env_default, ArgTerm, InitArgs, MaxHeapSetting, RuntimeConfig};
 use crate::context::gc_walk::{ForeignLatch, RuntimeCollectionGate};
 use crate::context::{PersistentTermStore, RuntimeContext};
 use crate::dist::{resolve_cookie, DistNode, NONODE_NAME};
@@ -439,6 +439,26 @@ pub struct Runtime {
     /// iterated), so it probes with the crate's own [`FastHashSet`] over [`crate::hasher`],
     /// like [`Runtime::mailboxes`].
     pub(crate) async_dist: FastHashSet<ProcessId>,
+    /// The pids that replaced their `max_heap_size` setting through
+    /// `erlang:process_flag(max_heap_size, …)` — the C's per-process
+    /// `MAX_HEAP_SIZE_GET(p)`/`MAX_HEAP_SIZE_FLAGS_GET(p)` pair (`bif.c:2148-2166`).
+    ///
+    /// `beam_process::Process`/`beam_gc::AnyCollector` expose the heap policy a process was
+    /// **created** with but no setter, so (like [`Runtime::async_dist`]) the runtime keeps the
+    /// flag's value in its own per-pid store. It is the **one** source of truth every reader
+    /// shares: the `beam_bifs` `process_flag/2` bridge
+    /// ([`crate::context::process_bridge`]) writes it, and `erlang:process_info/2`'s
+    /// `max_heap_size` / `garbage_collection` items ([`crate::native::memory`]) read it. A pid
+    /// absent from the store reports the setting it was born with — the policy's
+    /// `max_heap_words` plus the emulator's `+hmax*` flags ([`crate::config::MaxHeapSetting`]).
+    ///
+    /// As with [`Runtime::group_leaders`], a terminated process leaves its entry behind,
+    /// which is harmless: a pid's serial is bumped when its table slot is reused, so the stale
+    /// key names no process that can ever be observed again.
+    ///
+    /// Keyed by the whole [`ProcessId`] and only ever `get`/`insert`ed (never iterated), so it
+    /// probes with the crate's own [`FastHashMap`] over [`crate::hasher`].
+    pub(crate) max_heap: FastHashMap<ProcessId, MaxHeapSetting>,
     /// The `{monitor_nodes, Options}` registrations of every process — the C's
     /// `ERTS_MON_TYPE_NODES` monitor chain (`dist.c:6754-6868`).
     ///
@@ -922,6 +942,7 @@ impl Runtime {
             references: HashMap::new(),
             group_leaders: FastHashMap::default(),
             async_dist: FastHashSet::default(),
+            max_heap: FastHashMap::default(),
             monitor_nodes: FastHashMap::default(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
@@ -1660,6 +1681,16 @@ impl Runtime {
         }
     }
 
+    /// `pid`'s own `max_heap_size` setting, or `None` when it still has the one it was born
+    /// with (see [`Runtime::max_heap`]).
+    pub(crate) fn max_heap_setting(&self, pid: ProcessId) -> Option<MaxHeapSetting> {
+        self.max_heap.get(&pid).copied()
+    }
+    /// Replaces `pid`'s `max_heap_size` setting — the store behind
+    /// `erlang:process_flag(max_heap_size, …)` (see [`Runtime::max_heap`]).
+    pub(crate) fn set_max_heap_setting(&mut self, pid: ProcessId, setting: MaxHeapSetting) {
+        self.max_heap.insert(pid, setting);
+    }
     /// Registers one more `{monitor_nodes, Options}` monitor for `pid` under the option
     /// bitmask `key`, answering the **previous** reference count — the C's
     /// `erts_monitor_nodes` `on == true` arm (`dist.c:6827-6845`).

@@ -56,6 +56,7 @@
 //! ever asserted.
 
 use core::ptr::addr_of;
+use std::sync::LazyLock;
 
 use beam_common::BeamError;
 use beam_gc::prelude::{
@@ -64,16 +65,16 @@ use beam_gc::prelude::{
 };
 use beam_term::prelude::{make_small, ptr_val, Eterm};
 
-/// The capacity of **every** space of the capped test chain, in term words — also the capped
-/// policy's `max_heap_words` ceiling.
-///
-/// With the ceiling fixed at the current capacity a growth is clamped to a space of exactly the
-/// size it replaces, so the chain can be made arbitrarily long **through the growth seam
-/// alone** — the pathological *long* chain a buggy heap would hand the range test.
+/// The capacity of the **first** space of the budgeted test chain, in term words.
 const CAP: usize = 90;
 
-/// Retired spaces the long chain holds.
-const RETIRED: usize = 1024;
+/// The chain's **summed-capacity budget**, in term words — the policy's `max_heap_words`.
+///
+/// A chain can no longer be made arbitrarily long by pinning the ceiling to one space's size:
+/// the ceiling bounds `capacity_words()`, the *sum* over the chain, so a growth may only claim
+/// the budget the chain has left and an allocate-and-abandon loop ends in the typed refusal. The
+/// longest reachable chain is therefore `O(log(budget))` links — see [`LONGEST`].
+const BUDGET: usize = 200_000;
 
 /// One term word, in bytes — address arithmetic below is word-granular.
 const WORD: usize = core::mem::size_of::<Eterm>();
@@ -81,11 +82,11 @@ const WORD: usize = core::mem::size_of::<Eterm>();
 /// A half-open address interval `[lo, hi)` in byte addresses.
 type Region = (usize, usize);
 
-/// The capped policy every long chain is built under: every space is exactly [`CAP`] words, so
-/// a growth always retires one and installs one of the same size.
-fn capped() -> HeapPolicy {
+/// The budgeted policy every chain is built under: a [`CAP`]-word first space under a
+/// [`BUDGET`]-word ceiling over the chain's summed capacity.
+fn budgeted() -> HeapPolicy {
     HeapPolicy {
-        max_heap_words: CAP,
+        max_heap_words: BUDGET,
         initial_young_words: CAP,
         initial_mature_words: CAP,
         ..HeapPolicy::default()
@@ -101,19 +102,47 @@ fn uncapped() -> HeapPolicy {
 
 /// An [`AnyCollector`] for `kind`.
 fn any_for(kind: MatureKind) -> AnyCollector {
-    AnyCollector::from_config(&GcConfig::new(capped()).with_mature(kind)).expect("collector")
+    AnyCollector::from_config(&GcConfig::new(budgeted()).with_mature(kind)).expect("collector")
 }
 
 /// How the driver asks for the next growth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Grow {
-    /// A constant [`CAP`] request the capped policy can never enlarge past — the long-chain
-    /// recipe (every growth retires and installs a same-size space).
-    Capped,
+    /// One word more than the current space can ever hold: the plain one-step rule fires (never
+    /// the doubling) and the chain climbs one curated step per call — the longest chain a
+    /// budgeted policy can build, which is what [`LONGEST`] measures.
+    Outgrowing,
     /// One word more than the current space has left, so an uncapped policy climbs its growth
     /// table and the chain mixes capacities.
     Filling,
 }
+
+/// The longest chain [`BUDGET`] allows through the growth seam, discovered rather than assumed:
+/// the ladder is the policy's growth table, so a table change moves this number instead of
+/// breaking the corpus.
+static LONGEST: LazyLock<usize> = LazyLock::new(|| {
+    let mut c = Collector::new(budgeted()).expect("collector");
+    let mut count = 0usize;
+    loop {
+        match grow_once(&mut c, count, Grow::Outgrowing) {
+            Ok(()) => count += 1,
+            Err(err) => {
+                assert_eq!(
+                    err.as_atom(),
+                    Some("out_of_memory"),
+                    "the chain must end in the typed refusal, not another error"
+                );
+                break;
+            }
+        }
+        assert!(count < 4096, "the growth ladder must terminate");
+    }
+    assert!(
+        count >= 8,
+        "the budget must yield a chain long enough to be adversarial, got {count}"
+    );
+    count
+});
 
 /// The reserved extent `[base, base + capacity)` of a space, in byte addresses — what the
 /// aggregate is built from.
@@ -231,9 +260,27 @@ impl BoundsDoor for GenImmixCollector {
 /// The growth request `grow` implies for the current state of `c`.
 fn grow_request<C: BoundsDoor>(c: &C, grow: Grow) -> usize {
     match grow {
-        Grow::Capped => CAP,
+        Grow::Outgrowing => c.young().capacity_words().saturating_add(1),
         Grow::Filling => c.young().available_words().saturating_add(1),
     }
+}
+
+/// Grows `c` once, after handing the mutator `0..=3` words — the shape a growth is called in (the
+/// mutator has outgrown the space).
+fn grow_once<C: BoundsDoor>(c: &mut C, i: usize, grow: Grow) -> Result<(), BeamError> {
+    // Hand the mutator `0..=3` words, so the spaces' live occupancies differ — the aggregate is
+    // built from the reserved extent, so this must not change it.
+    let elems: Vec<Eterm> = (0..(i % 4)).map(|k| make_small(k as i64)).collect();
+    c.young_mut()
+        .heap_mut()
+        .tuple(&elems)
+        .unwrap_or_else(|e| panic!("round {i}: the tuple fits the fresh space: {e:?}"));
+    let need = grow_request(c, grow);
+    assert!(
+        c.young().available_words() < need,
+        "round {i}: the request really outgrows the space"
+    );
+    c.grow_nursery(need)
 }
 
 /// Builds `count` retired spaces, reporting the **reserved extent** of every space of the chain
@@ -242,20 +289,7 @@ fn grow_request<C: BoundsDoor>(c: &C, grow: Grow) -> usize {
 fn build_chain<C: BoundsDoor>(c: &mut C, count: usize, grow: Grow) -> Vec<Region> {
     let mut extents = vec![reserved_extent(c.young())];
     for i in 0..count {
-        // Hand the mutator `0..=3` words, so the spaces' live occupancies differ — the aggregate
-        // is built from the reserved extent, so this must not change it.
-        let elems: Vec<Eterm> = (0..(i % 4)).map(|k| make_small(k as i64)).collect();
-        c.young_mut()
-            .heap_mut()
-            .tuple(&elems)
-            .unwrap_or_else(|e| panic!("round {i}: the tuple fits the fresh space: {e:?}"));
-        let need = grow_request(c, grow);
-        assert!(
-            c.young().available_words() < need,
-            "round {i}: the request really outgrows the space"
-        );
-        c.grow_nursery(need)
-            .unwrap_or_else(|e| panic!("round {i}: the growth: {e:?}"));
+        grow_once(c, i, grow).unwrap_or_else(|e| panic!("round {i}: the growth: {e:?}"));
         extents.push(reserved_extent(c.young()));
     }
     extents
@@ -403,29 +437,43 @@ fn check<C: BoundsDoor>(label: &str, mut c: C, count: usize, grow: Grow) {
 // 1. The safety property at every chain length, both strategies, both policies
 // ---------------------------------------------------------------------------
 
-/// The long chain: a growth that can never enlarge its space, so the chain reaches a length no
-/// hand-written case would build. The aggregate must stay exact and must stay safe.
+/// The long chain: the longest a budgeted policy allows — a growth that climbs one curated step
+/// per call until the chain's summed capacity can no longer grow. The aggregate must stay exact
+/// and must stay safe at that length, and the page also pins that the chain ends in the typed
+/// refusal rather than an unbounded append.
 #[test]
-fn the_aggregate_is_safe_and_exact_for_a_chain_of_a_thousand_spaces() {
+fn the_aggregate_is_safe_and_exact_for_the_longest_chain_the_budget_allows() {
+    let count = *LONGEST;
     for kind in [MatureKind::Copying, MatureKind::Immix] {
         check(
-            &format!("AnyCollector/{kind:?}/capped"),
+            &format!("AnyCollector/{kind:?}/budgeted"),
             any_for(kind),
-            RETIRED,
-            Grow::Capped,
+            count,
+            Grow::Outgrowing,
         );
     }
     check(
-        "Collector/capped",
-        Collector::new(capped()).expect("collector"),
-        RETIRED,
-        Grow::Capped,
+        "Collector/budgeted",
+        Collector::new(budgeted()).expect("collector"),
+        count,
+        Grow::Outgrowing,
     );
     check(
-        "GenImmixCollector/capped",
-        GenImmixCollector::from_policy(capped()).expect("collector"),
-        RETIRED,
-        Grow::Capped,
+        "GenImmixCollector/budgeted",
+        GenImmixCollector::from_policy(budgeted()).expect("collector"),
+        count,
+        Grow::Outgrowing,
+    );
+
+    // The refusal that ends the chain is the typed heap exhaustion, and the chain it leaves
+    // behind is still inside the ceiling.
+    let mut c = Collector::new(budgeted()).expect("collector");
+    build_chain(&mut c, count, Grow::Outgrowing);
+    let err = grow_once(&mut c, count, Grow::Outgrowing).expect_err("the budget is spent");
+    assert_eq!(err.as_atom(), Some("out_of_memory"));
+    assert!(
+        c.young_space_count() == count + 1,
+        "a refused growth retires nothing"
     );
 }
 
@@ -433,13 +481,17 @@ fn the_aggregate_is_safe_and_exact_for_a_chain_of_a_thousand_spaces() {
 /// geometry alone, so a length-dependent answer cannot satisfy all of them.
 #[test]
 fn the_aggregate_is_the_same_predicate_at_every_chain_length() {
-    for count in [1usize, 2, 3, 8, 64, RETIRED] {
+    let mut lengths = vec![1usize, 2, 3, 8];
+    if *LONGEST > 8 {
+        lengths.push(*LONGEST);
+    }
+    for count in lengths {
         for kind in [MatureKind::Copying, MatureKind::Immix] {
             check(
-                &format!("AnyCollector/{kind:?}/capped/{count}"),
+                &format!("AnyCollector/{kind:?}/budgeted/{count}"),
                 any_for(kind),
                 count,
-                Grow::Capped,
+                Grow::Outgrowing,
             );
         }
     }
@@ -514,7 +566,7 @@ fn growth_retire_and_collapse_move_the_bounds_and_the_epoch_together() {
         let mut prev = fresh;
         for i in 0..8usize {
             c.young_mut().heap_mut().tuple(&[]).expect("a tuple");
-            let need = grow_request(&c, Grow::Capped);
+            let need = grow_request(&c, Grow::Outgrowing);
             c.grow_nursery(need)
                 .unwrap_or_else(|e| panic!("{kind:?} round {i}: the growth: {e:?}"));
             let bounds = c.scanned_bounds();
@@ -580,8 +632,8 @@ fn growth_retire_and_collapse_move_the_bounds_and_the_epoch_together() {
 #[test]
 fn a_mature_replacement_moves_the_aggregate_and_the_epoch() {
     // The copying collector replaces its mature space on every fullsweep.
-    let mut copying = Collector::new(capped()).expect("collector");
-    build_chain(&mut copying, 3, Grow::Capped);
+    let mut copying = Collector::new(budgeted()).expect("collector");
+    build_chain(&mut copying, 3, Grow::Outgrowing);
     let before = copying.scanned_bounds();
     let old_mature = copying.mature_extent();
     copying.collect_major(&mut []).expect("the fullsweep");
@@ -672,7 +724,7 @@ fn any_collector_forwards_the_selected_strategys_bounds() {
             ),
         };
         check_forwarding(&any);
-        build_chain(&mut any, 4, Grow::Capped);
+        build_chain(&mut any, 4, Grow::Outgrowing);
         check_forwarding(&any);
         any.collect(&mut []).expect("the collection");
         check_forwarding(&any);
@@ -686,7 +738,7 @@ fn any_collector_forwards_the_selected_strategys_bounds() {
 fn addresses_outside_the_aggregate_are_rejected_by_the_exact_tests_too() {
     for kind in [MatureKind::Copying, MatureKind::Immix] {
         let mut c = any_for(kind);
-        build_chain(&mut c, 3, Grow::Capped);
+        build_chain(&mut c, 3, Grow::Outgrowing);
         let bounds = c.scanned_bounds();
 
         for addr in [

@@ -1461,6 +1461,11 @@ mod tests {
     }
 
     #[test]
+    // The `expected` column is the oracle's `float_to_list(V, [short])` text, so the
+    // values stay literals: `3.14159` is a six-digit float whose shortest render is
+    // `"3.14159"` (not `f64::consts::PI`), and `3.141592653589793` is pinned by its
+    // decimal render, not by the constant it happens to equal.
+    #[allow(clippy::approx_constant)]
     fn floats_render_as_float_to_list_short() {
         with_ctx(|ctx| {
             // The oracle (`erl -noshell -eval 'io:format("~w~n",[V])'`) renders

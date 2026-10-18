@@ -50,6 +50,7 @@ use super::run::{
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
 mod boundary_cost;
 mod reds_door;
+mod slice_charging;
 use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
@@ -2773,6 +2774,13 @@ struct GrowthCounters {
     yields: usize,
     /// Slices that ended at the `receive` `Wait` arm.
     waits: usize,
+    /// The reduction units the run's slices charged — the delta of
+    /// `erlang:statistics(reductions)`'s total across the run, i.e. exactly the sum of the
+    /// [`BudgetProbe::used`](super::budget::BudgetProbe) figures
+    /// [`RuntimeRunner::run`](super::run::RuntimeRunner) hands to `Runtime::note_reductions`.
+    /// A **deterministic** count (the seams each instruction reaches are fixed by the
+    /// bytecode), never a timing.
+    reductions: u64,
     /// Process-heap collections the runtime ran during this run.
     collections: u64,
     /// How many of [`GrowthCounters::collections`] were fullsweeps.
@@ -2800,11 +2808,30 @@ struct GrowthCounters {
 /// which is the only window a process's collector is readable from outside: a terminated
 /// process is removed from the table, so the peak over the run can only be observed *during* it.
 fn run_growth_counted(rt: &mut Runtime, module: &str, n: i64) -> GrowthCounters {
+    run_growth_function(rt, module, "run", n)
+}
+
+/// [`run_growth_counted`] with the **entry function** named by the caller, so a fixture whose
+/// loop is exported under another name (or reports something of its own instead of the
+/// iteration count) can be driven by the same harness.
+///
+/// The row's `value` is whatever the entry returned — for a `run/1` fixture the iteration count
+/// `n`, for a fixture that reports its own `heap_size` that figure. A boundary sample only
+/// exists for a run that **ends a slice**; a shape that completes inside its first slice leaves
+/// the geometry peaks at `0` and so has to report any heap figure itself (see
+/// [`slice_charging`], which does exactly that).
+fn run_growth_function(
+    rt: &mut Runtime,
+    module: &str,
+    function: &str,
+    n: i64,
+) -> GrowthCounters {
     let before = rt.gc_stats();
+    let reductions_before = rt.reductions_statistics(false).0;
     reset_run_slice_counters();
     let pid = rt
-        .spawn_process(module, "run", vec![make_small(n)])
-        .unwrap_or_else(|err| panic!("{module}:run/1 must spawn: {err}"));
+        .spawn_process(module, function, vec![make_small(n)])
+        .unwrap_or_else(|err| panic!("{module}:{function}/1 must spawn: {err}"));
     let mut peak_young_spaces = 0usize;
     let mut peak_young_capacity = 0usize;
     let mut peak_mature_capacity = 0usize;
@@ -2814,7 +2841,7 @@ fn run_growth_counted(rt: &mut Runtime, module: &str, n: i64) -> GrowthCounters 
     while rt.process_result(pid).is_none() {
         assert!(
             Instant::now() < deadline,
-            "{module}:run/1 with N={n} did not terminate within {}s",
+            "{module}:{function}/1 with N={n} did not terminate within {}s",
             COUNTER_RUN_DEADLINE.as_secs()
         );
         rt.run_one_slice().expect("a scheduler slice runs");
@@ -2836,6 +2863,7 @@ fn run_growth_counted(rt: &mut Runtime, module: &str, n: i64) -> GrowthCounters 
         slices: counters.slices,
         yields: counters.yields,
         waits: counters.waits,
+        reductions: rt.reductions_statistics(false).0 - reductions_before,
         collections: after.collections - before.collections,
         major: after.major - before.major,
         fallbacks: after.fallbacks - before.fallbacks,
@@ -2887,20 +2915,21 @@ fn counter_table(
         })
         .collect();
     eprintln!(
-        "counter_table {module} (N : slices yields waits collections major fallbacks \
+        "counter_table {module} (N : slices yields waits reductions collections major fallbacks \
          peak_spaces peak_cap peak_mature_cap peak_mature_used debt_bounds | \
          slices/call collections/call)"
     );
     for (n, row) in &rows {
         let calls = (*n as f64) + 1.0;
         eprintln!(
-            "counter_table {module} N={n} : slices={} yields={} waits={} collections={} \
-             major={} fallbacks={} peak_spaces={} peak_cap={} peak_mature_cap={} \
+            "counter_table {module} N={n} : slices={} yields={} waits={} reductions={} \
+             collections={} major={} fallbacks={} peak_spaces={} peak_cap={} peak_mature_cap={} \
              peak_mature_used={} debt_bounds={} | \
              slices/call={:.6} collections/call={:.6}",
             row.slices,
             row.yields,
             row.waits,
+            row.reductions,
             row.collections,
             row.major,
             row.fallbacks,

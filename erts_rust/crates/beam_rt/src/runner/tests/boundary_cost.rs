@@ -33,12 +33,13 @@
 //!
 //! * **one check per pre-emption** — the door is handed exactly one boundary per `Yield` park
 //!   (`door.checks == yields`), never one per instruction;
-//! * **the seven-eighths watermark rations it to one boundary in eight** —
-//!   `door.collections == door.checks / 8`, exactly: the shape's own heap-admission door settles
-//!   its collection debt on every iteration, so the nursery is nearly exhausted (seven eighths
-//!   used, the C's `ERTS_VBUMP_ALLOC_REDS` moment) at only every eighth slice end, and a boundary
-//!   collection that owns the collector's 233-word floor leaves the boundaries after it below
-//!   the watermark.
+//! * **the seven-eighths watermark rations it to about one boundary in eight** —
+//!   `door.checks / 9 <= door.collections <= door.checks / 7`: the shape's own heap-admission
+//!   door settles its collection debt on every iteration, so the nursery is nearly exhausted
+//!   (seven eighths used, the C's `ERTS_VBUMP_ALLOC_REDS` moment) at only every ~eighth slice
+//!   end, and a boundary collection leaves the boundaries after it below the watermark. The
+//!   exact `checks / 8` the pre-pricing cadence landed on was a coincidence of that cadence,
+//!   not an identity — see the pin below for the measured rates.
 //!
 //! Together they bound the door's contribution: at most one collection per eight pre-emptions,
 //! which on this shape is **nothing at all** — measured against a door-disabled build of the same
@@ -88,6 +89,7 @@ impl Run {
 /// collector is readable from outside the runner.
 fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
     let before = rt.gc_stats();
+    let reductions_before = rt.reductions_statistics(false).0;
     reset_boundary_door_counters();
     super::super::run::reset_run_slice_counters();
     let pid = rt
@@ -125,6 +127,7 @@ fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
             slices: slices.slices,
             yields: slices.yields,
             waits: slices.waits,
+            reductions: rt.reductions_statistics(false).0 - reductions_before,
             collections: after.collections - before.collections,
             major: after.major - before.major,
             fallbacks: after.fallbacks - before.fallbacks,
@@ -147,11 +150,16 @@ fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
 ///
 /// * **one boundary check per pre-emption** — `door.checks == yields`, exactly: the door is
 ///   reached from the runner's `Yield` arm and nowhere else, so its check count is the shape's
-///   own pre-emption count (∈ [0.19, 0.20] per call) and cannot grow with anything else;
-/// * **the seven-eighths watermark rations it to one boundary in eight** —
-///   `door.collections == door.checks / 8`, exactly (a floor): the nursery is nearly exhausted at
-///   only every eighth slice end, so the door's own hit rate is **0.024 collections per call** on
-///   a shape that does ≈7.
+///   own pre-emption count (∈ [0.44, 0.45] per call since the slice began pricing the loop's
+///   `call`/`call_only` resolutions and BIF dispatches — one unit each, so a 4 000-reduction
+///   slice now holds ~2.2 iterations instead of ~5.3; before that pricing the figure was
+///   [0.19, 0.20]) and cannot grow with anything else;
+/// * **the seven-eighths watermark rations it to between one boundary in seven and one in
+///   nine** — `door.checks / 9 <= door.collections <= door.checks / 7`: the nursery is nearly
+///   exhausted at only every ~eighth slice end. It is a *rate*, not an identity: measured
+///   113/899 = one in 7.96 at N=2 000 and 552/4 499 = one in 8.15 at N=10 000, where the
+///   pre-pricing cadence happened to land the boundary exactly on `checks / 8`; the door's own
+///   hit rate is **~0.056 collections per call** on a shape that does ≈7.
 ///
 /// The measured consequence, taken against a door-disabled build of the same tree, is **nothing**:
 /// the shape's totals are the door-off figures *exactly* — `collections == 7N - 1` and
@@ -204,23 +212,26 @@ fn the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape() {
         (0, 0),
         "every churn park publishes its root set: {r1:?} {r2:?}"
     );
-    // 2. The seven-eighths watermark rations the door to one boundary in eight (a floor).
-    assert_eq!(
-        (r1.door.collections, r2.door.collections),
-        (r1.door.checks / 8, r2.door.checks / 8),
-        "the nursery is nearly exhausted at only every eighth slice end, and the boundary that \
-         collected leaves the space at its floor: {r1:?} {r2:?}"
-    );
     // The bounds that follow hold at both counts: no per-call cost growth, and the shape's own
     // collection totals left exactly where a door-disabled build of this tree measures them.
     for (n, run) in [rows[0], rows[1]] {
         let calls = Run::calls(n);
         let checks_per_call = run.door.checks as f64 / calls;
         let door_per_call = run.door.collections as f64 / calls;
+        // A 4 000-reduction slice over an iteration that now prices its `call`/`call_only`
+        // resolutions and BIF dispatches (~1 800 reds/iteration measured): ~2.2 calls/slice.
         assert!(
-            (0.15..0.25).contains(&checks_per_call),
-            "one boundary per ~5 calls (a 4 000-reduction slice over a ~20-reduction \
+            (0.40..0.50).contains(&checks_per_call),
+            "one boundary per ~2 calls (a 4 000-reduction slice over a ~1 800-reduction \
              iteration): N={n} {checks_per_call:.6}/call"
+        );
+        assert!(
+            run.door.collections * 9 >= run.door.checks
+                && run.door.collections * 7 <= run.door.checks,
+            "the watermark rations the door to one boundary in 7..9 slice ends: N={n} \
+             {}/{}",
+            run.door.collections,
+            run.door.checks
         );
         assert!(
             door_per_call <= checks_per_call,

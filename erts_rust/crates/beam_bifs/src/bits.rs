@@ -143,6 +143,21 @@ pub(crate) fn bytes(term: Eterm) -> Result<Vec<u8>> {
     access::binary_bytes(term)
 }
 
+/// Hands the bytes of a binary to `body` **without copying them out of the term**.
+///
+/// The borrowing form of [`bytes`]: the slice is lent to `body` for the duration of
+/// the call (a closure scope, since a returned `&[u8]` is not expressible — see
+/// [`crate::access::with_binary_bytes`]), which is what lets a caller append a binary
+/// element straight into its destination instead of through a per-element temporary.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a byte-aligned binary; otherwise whatever
+/// `body` returns.
+pub(crate) fn with_bytes<R>(term: Eterm, body: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+    access::with_binary_bytes(term, body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

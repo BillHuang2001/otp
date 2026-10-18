@@ -46,6 +46,14 @@
 //! where the `big_*` helpers compute on `ErtsDigit`s and `big_norm`/
 //! `normalize_big` fold the result back into a small integer when it fits.
 //!
+//! `+ - *` add one shortcut in front of that: when **both** operands are small
+//! integers the operation is computed in machine arithmetic (`i64`, with
+//! `checked_*` so it is total), and the result becomes an immediate when it fits
+//! the 60-bit range — that is, the widened `Big` is never built. An out-of-range
+//! result goes through [`int_from_i64`], i.e. the same promotion the widened path
+//! would have done, so the value is identical either way; only the allocation
+//! disappears (`tests/arith_alloc.rs` pins the figures).
+//!
 //! Mixed int/float arithmetic still promotes to a float. An integer operand is
 //! converted with the same correctly-rounded, ties-to-even conversion as the C
 //! `big_to_double` ([`Big::to_f64`]), failure mode included: an operand whose
@@ -173,6 +181,21 @@ fn number_or(t: Eterm, non_number: BeamError) -> Result<Num> {
     }
 }
 
+/// The `i64` value of `t` when it is a 60-bit small integer, else `None` — the
+/// cheap classification the `+ - *` fast path takes before it decides whether the
+/// widened path is needed at all.
+///
+/// Unlike [`number`] it reads the immediate straight out of the machine word
+/// ([`signed_value`]), so it allocates nothing; a bignum or a float answers
+/// `None` and falls through to the classification that widens it.
+fn small_operand(t: Eterm) -> Option<i64> {
+    if access::is_small(t) {
+        Some(signed_value(t))
+    } else {
+        None
+    }
+}
+
 /// Classifies `t` as an **integer** operand (the `div`/`rem` domain).
 ///
 /// # Errors
@@ -225,6 +248,25 @@ fn int_term(ctx: &mut BifContext<'_>, value: &Big) -> Result<Eterm> {
     match value.small_value() {
         Some(small) => ctx.int(small),
         None => beam_codec::term::make_big(ctx.heap(), value.negative, &value.mag),
+    }
+}
+
+/// Materializes an exact integer result that was computed in machine arithmetic.
+///
+/// `value` must be the operation's **exact** mathematical result — never a
+/// wrapped or truncated one — which is what makes the machine path
+/// indistinguishable from the widened one:
+///
+/// * inside `MIN_SMALL..=MAX_SMALL` the result is the immediate `value`, built
+///   without touching the allocator ([`BifContext::int`] is `try_make_small`);
+/// * anything else is handed to [`int_from_i64`], i.e. the very [`Big`] promotion
+///   the fast path short-circuits, so a promoted result is bit-for-bit what the
+///   widened path produces.
+fn int_from_machine(ctx: &mut BifContext<'_>, value: i64) -> Result<Eterm> {
+    if (MIN_SMALL..=MAX_SMALL).contains(&value) {
+        ctx.int(value)
+    } else {
+        int_from_i64(ctx, value)
     }
 }
 
@@ -356,7 +398,26 @@ fn shift_mag_right(mag: &mut Vec<u64>, bits: usize) {
 }
 
 /// `A + B`.
+///
+/// # The small-integer fast path
+///
+/// Two 60-bit small integers are within `±2^59`, so their exact sum is within
+/// `±2^60`: it cannot overflow an `i64`, but — the only real question — it can
+/// still leave the 60-bit *small* range, which [`int_from_machine`] routes to the
+/// bignum path. `checked_add` is therefore never `None` here; it is used so the
+/// arithmetic is total by construction instead of by an argument the compiler
+/// cannot check, and its `None` arm falls through to the widened route, which
+/// computes the same value.
+///
+/// When either operand is not a small integer the classification below widens it
+/// exactly as before, so a bignum or a float operand keeps the widened path's
+/// result (and its `badarith` for a non-number).
 fn add(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    if let (Some(x), Some(y)) = (small_operand(args[0]), small_operand(args[1])) {
+        if let Some(sum) = x.checked_add(y) {
+            return int_from_machine(ctx, sum);
+        }
+    }
     match (number(args[0])?, number(args[1])?) {
         (Num::Int(x), Num::Int(y)) => int_term(ctx, &x.add(&y)),
         (x, y) => ctx.make_float(finite(as_float(&x)? + as_float(&y)?)?),
@@ -374,7 +435,16 @@ pub(crate) fn add_terms(ctx: &mut BifContext<'_>, a: Eterm, b: Eterm) -> Result<
 }
 
 /// `A - B`.
+///
+/// The same small-integer fast path as [`add`]: two 60-bit smalls differ by at
+/// most `2^60`, so the exact difference fits an `i64` and only the 60-bit *small*
+/// range can be left ([`int_from_machine`] promotes such a result).
 fn sub(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    if let (Some(x), Some(y)) = (small_operand(args[0]), small_operand(args[1])) {
+        if let Some(difference) = x.checked_sub(y) {
+            return int_from_machine(ctx, difference);
+        }
+    }
     match (number(args[0])?, number(args[1])?) {
         (Num::Int(x), Num::Int(y)) => int_term(ctx, &x.sub(&y)),
         (x, y) => ctx.make_float(finite(as_float(&x)? - as_float(&y)?)?),
@@ -382,7 +452,21 @@ fn sub(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `A * B`.
+///
+/// # The small-integer fast path
+///
+/// Unlike `+`/`-`, the product of two 60-bit smalls needs up to 118 bits, so it
+/// genuinely can overflow an `i64`: `checked_mul` is the **required** guard, and
+/// its `None` arm falls through to the widened [`Big`] multiplication, which
+/// computes the exact product (`MAX_SMALL * MAX_SMALL` ⇒ `2^118 - 2^60 + 1`). A
+/// product that fits an `i64` still leaves the 60-bit small range well before
+/// that, and [`int_from_machine`] promotes it.
 fn mul(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    if let (Some(x), Some(y)) = (small_operand(args[0]), small_operand(args[1])) {
+        if let Some(product) = x.checked_mul(y) {
+            return int_from_machine(ctx, product);
+        }
+    }
     match (number(args[0])?, number(args[1])?) {
         (Num::Int(x), Num::Int(y)) => int_term(ctx, &x.mul(&y)),
         (x, y) => ctx.make_float(finite(as_float(&x)? * as_float(&y)?)?),

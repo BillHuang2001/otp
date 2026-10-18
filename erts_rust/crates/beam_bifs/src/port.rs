@@ -60,7 +60,7 @@
 use beam_common::Result;
 use beam_process::PortId;
 use beam_term::compare;
-use beam_term::{atom_val, signed_value, Eterm};
+use beam_term::{atom_val, signed_value, Eterm, PORT_DATA_SIZE};
 
 use crate::access;
 use crate::context::BifContext;
@@ -151,12 +151,17 @@ fn port_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Err(badarg())
 }
 
-/// The largest internal port number.
+/// The largest internal port number — the C's `ERTS_MAX_INTERNAL_PORT_NUMBER`
+/// (`erl_node_container_utils.h:250`, `(1 << _PORT_NUM_SIZE) - 1`).
 ///
-/// Ports spend their whole 60-bit payload on the number
-/// (`_PORT_NUM_SIZE == _PORT_DATA_SIZE` in `erl_term.h`), so anything above this
-/// cannot be encoded as an internal port and must not be accepted.
-const MAX_INTERNAL_PORT_NUMBER: u64 = (1 << 60) - 1;
+/// Ports spend their whole payload on the number (`_PORT_NUM_SIZE ==
+/// _PORT_DATA_SIZE` in `erl_term.h`), so anything above this cannot be encoded as
+/// an internal port and must not be accepted. The width itself is
+/// [`PORT_DATA_SIZE`]'s, from `beam_term` (the owner of the frozen layout), not a
+/// literal repeated here; `beam_term` has no *checked* port constructor yet, so
+/// [`make_port_data`](beam_term::make_port_data)'s mask is only guarded by this
+/// check on the paths below.
+const MAX_INTERNAL_PORT_NUMBER: u64 = (1u64 << PORT_DATA_SIZE) - 1;
 
 /// The node number of the `nonode@nohost` node — the only node Milestone-1 ever is
 /// (`../../erts/emulator/beam/bif.c` compares the parsed node against the local
@@ -434,6 +439,26 @@ mod tests {
             parse_port_text(b"#Port<0.0>").expect("port 0 is valid"),
             PortId::new(0)
         );
+
+        // The number bound is the layout's own width (`ERTS_MAX_INTERNAL_PORT_NUMBER`
+        // = `(1 << _PORT_NUM_SIZE) - 1`, `erl_node_container_utils.h:250`): the
+        // largest 60-bit value parses, one past it is `badarg` — where
+        // `make_port_data`'s mask would silently wrap it to port `0`. Pinned against
+        // the oracle: `erl -noshell -eval
+        // 'io:format("~p~n",[catch erlang:list_to_port("#Port<0.1152921504606846976>")])'`
+        // ⇒ `badarg`, while `#Port<0.1152921504606846975>` ⇒ `#Port<0.1152921504606846975>`.
+        assert_eq!(MAX_INTERNAL_PORT_NUMBER, (1u64 << 60) - 1);
+        assert_eq!(MAX_INTERNAL_PORT_NUMBER, (1u64 << PORT_DATA_SIZE) - 1);
+        let largest = format!("#Port<0.{MAX_INTERNAL_PORT_NUMBER}>");
+        assert_eq!(
+            parse_port_text(largest.as_bytes()).expect("the largest internal port"),
+            PortId::new(MAX_INTERNAL_PORT_NUMBER)
+        );
+        let past = format!("#Port<0.{}>", MAX_INTERNAL_PORT_NUMBER + 1);
+        assert!(matches!(
+            parse_port_text(past.as_bytes()),
+            Err(BeamError::BadArg)
+        ));
     }
 
     #[test]

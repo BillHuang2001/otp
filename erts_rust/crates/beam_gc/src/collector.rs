@@ -185,6 +185,41 @@ impl Collector {
         Ok(Collection { kind, stats })
     }
 
+    /// Runs a collection of **exactly** `kind` — the kind-pinned counterpart of
+    /// [`collect`](Self::collect).
+    ///
+    /// [`collect`](Self::collect) *chooses* the kind (the fullsweep cadence, or a mature space
+    /// too small for a whole nursery promotion) and **escalates** a would-not-fit minor to a
+    /// major. This entry point never chooses and never escalates:
+    /// [`CollectionKind::Minor`] runs [`collect_minor`](Self::collect_minor) and
+    /// [`CollectionKind::Major`] runs [`collect_major`](Self::collect_major), so on success the
+    /// returned [`Collection::kind`] is the requested `kind`.
+    ///
+    /// The difference is observable exactly when a minor would not fit its destination:
+    /// `collect` would run a major instead, while `collect_kind(CollectionKind::Minor)` returns
+    /// the typed heap-exhaustion [`BeamError`](beam_common::BeamError) **before a single word is
+    /// copied**, leaving the nursery and the mature space untouched (never a half-forwarded
+    /// heap, and no counter advanced).
+    ///
+    /// This is a thin dispatch: the collection logic, the heap sizing and the counters all stay
+    /// in the two `collect_*` methods.
+    ///
+    /// # Errors
+    ///
+    /// The selected collection's own `BeamError` — the typed heap exhaustion above for a minor
+    /// that cannot fit, or an allocation failure. A `Minor` failure is never masked by a major.
+    pub fn collect_kind(
+        &mut self,
+        kind: CollectionKind,
+        roots: &mut [Eterm],
+    ) -> Result<Collection> {
+        let stats = match kind {
+            CollectionKind::Minor => self.collect_minor(roots)?,
+            CollectionKind::Major => self.collect_major(roots)?,
+        };
+        Ok(Collection { kind, stats })
+    }
+
     /// Runs a minor collection: evacuate the nursery's live terms into the mature space.
     ///
     /// The destination must fit the whole nursery up front (immediate promotion, no
@@ -316,8 +351,17 @@ impl Collector {
     /// [`max_heap_words`](HeapPolicy::max_heap_words) (or the growth table's ceiling) makes
     /// the request unreachable, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned instead — the collector is left
-    /// consistent (never a half-forwarded heap) and, for an unreachable request, untouched.
-    /// The work is bounded, so this never loops forever.
+    /// consistent (never a half-forwarded heap) and, for a request the growth table itself
+    /// cannot reach, untouched. The work is bounded, so this never loops forever.
+    ///
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) bounds the nursery chain's **summed**
+    /// capacity, which is what the explicit [`grow_nursery`](Self::grow_nursery) step enforces:
+    /// a request the remaining budget cannot reach is refused there. That refusal comes *after*
+    /// the collection — deliberately, because the collection collapses the chain and therefore
+    /// gives the budget back, so pre-checking the chain before collecting would refuse requests
+    /// a collection makes reachable. Only the growth table's own ceiling (the single-space
+    /// `next_words` rule, which no collection can change) is checked up front, which is why the
+    /// fast path below reads a per-space size and not the chain.
     pub fn ensure_capacity(
         &mut self,
         need_words: usize,
@@ -344,6 +388,13 @@ impl Collector {
     /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
     /// cannot reach the request, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
+    ///
+    /// The ceiling bounds the chain's **summed** capacity ([`heap_size_words`](Self::heap_size_words)),
+    /// not each individual space, so the fresh space may only claim the budget the chain has left
+    /// and `heap_size_words() <= max_heap_words` after every successful growth — a growth loop can
+    /// no longer append one ceiling-sized space per call. A retired space a previous growth left
+    /// provably **empty** (`used_words() == 0`) is re-adopted instead of replaced, which consumes
+    /// no budget at all.
     pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
         self.nursery.grow(&self.policy, need_words)
     }
@@ -479,5 +530,174 @@ impl HeapObservable for Collector {
 
     fn heap_policy(&self) -> &HeapPolicy {
         &self.policy
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The kind-pinned collection entry point: [`Collector::collect_kind`] runs **exactly** the
+    //! requested [`CollectionKind`] — no policy choice and no minor→major escalation — whether or
+    //! not the policy would have picked a major, and a minor whose promotion cannot fit the
+    //! mature space reports the typed heap exhaustion with every counter and both spaces
+    //! untouched (never a half-forwarded heap, never a silent fullsweep).
+    //!
+    //! `unsafe` below only reads words this test allocated itself or that a collection just
+    //! relocated; every block carries a `// SAFETY:` rationale.
+
+    use super::*;
+    use beam_common::BeamError;
+    use beam_term::prelude::{arityval, boxed_val, is_arity_value, make_small, signed_value};
+
+    /// Allocates the 2-tuple `{1,2}` in the nursery.
+    fn build_tuple(c: &mut Collector) -> Eterm {
+        c.young_mut()
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("the tuple fits the nursery")
+    }
+
+    /// Asserts the relocated root is a live 2-tuple `{1,2}` in the mature space.
+    fn assert_tuple_preserved(c: &Collector, root: Eterm) {
+        assert!(
+            c.mature().contains_term(root),
+            "the root must be resident in the mature space"
+        );
+        assert!(
+            !c.young().contains_term(root),
+            "the root must no longer be in the nursery"
+        );
+        // SAFETY: `root` is a live 2-element tuple in the mature space (asserted above).
+        unsafe {
+            let header = *boxed_val(root);
+            assert!(is_arity_value(header));
+            assert_eq!(arityval(header), 2);
+            assert_eq!(signed_value(*boxed_val(root).add(1)), 1);
+            assert_eq!(signed_value(*boxed_val(root).add(2)), 2);
+        }
+    }
+
+    /// `fullsweep_after: 0` makes the cadence fire on every collection, so
+    /// [`Collector::collect`] picks a major; `collect_kind(Minor)` still runs a minor — the pin
+    /// is what decides, not the policy — and the live term survives relocation.
+    #[test]
+    fn collect_kind_minor_runs_a_minor_even_when_the_policy_forces_a_major() {
+        let policy = HeapPolicy {
+            fullsweep_after: 0,
+            ..HeapPolicy::default()
+        };
+
+        // `collect` (unchanged) selects a major under this policy.
+        let mut chosen = Collector::new(policy.clone()).expect("collector");
+        let chosen_root = build_tuple(&mut chosen);
+        let mut chosen_roots = [chosen_root];
+        let chosen_collection = chosen.collect(&mut chosen_roots).expect("collect");
+        assert_eq!(
+            chosen_collection.kind,
+            CollectionKind::Major,
+            "fullsweep_after = 0 makes the policy pick a major"
+        );
+
+        // `collect_kind(Minor)` ignores that choice and runs a minor.
+        let mut c = Collector::new(policy).expect("collector");
+        let root = build_tuple(&mut c);
+        let mut roots = [root];
+        let pinned = c
+            .collect_kind(CollectionKind::Minor, &mut roots)
+            .expect("the pinned minor fits");
+
+        assert_eq!(pinned.kind, CollectionKind::Minor, "the kind is pinned");
+        assert_eq!(pinned.stats.words_copied, 3, "the tuple is 3 words");
+        assert_eq!(c.minor_gcs(), 1, "the minor counter advanced");
+        // The returned `stats` is the copier's per-collection delta, whose collection counters
+        // stay 0; the counters themselves accumulate on the collector's own `stats()`.
+        assert_eq!(c.stats().minor_collections, 1);
+        assert_eq!(c.stats().major_collections, 0, "no major ran");
+        assert_eq!(c.young().used_words(), 0, "the nursery is emptied");
+        assert_tuple_preserved(&c, roots[0]);
+    }
+
+    /// `collect_kind(Major)` runs a fullsweep, and a fullsweep resets `minor_gcs` to 0 (the C
+    /// `GEN_GCS` reset) while advancing the major counters.
+    #[test]
+    fn collect_kind_major_runs_a_fullsweep_and_resets_minor_gcs() {
+        let mut c = Collector::new(HeapPolicy::default()).expect("collector");
+        let root = build_tuple(&mut c);
+        let mut roots = [root];
+
+        let minor = c
+            .collect_kind(CollectionKind::Minor, &mut roots)
+            .expect("pinned minor");
+        assert_eq!(minor.kind, CollectionKind::Minor);
+        assert_eq!(c.minor_gcs(), 1);
+
+        let major = c
+            .collect_kind(CollectionKind::Major, &mut roots)
+            .expect("pinned major");
+        assert_eq!(major.kind, CollectionKind::Major);
+        assert_eq!(major.stats.words_copied, 3, "the live 3-word tuple");
+        assert_eq!(c.stats().major_collections, 1);
+        assert_eq!(c.stats().minor_collections, 1, "no extra minor ran");
+        assert_eq!(c.minor_gcs(), 0, "a major resets the minor count");
+        assert_tuple_preserved(&c, roots[0]);
+    }
+
+    /// A pinned minor whose promotion cannot fit the mature space returns the typed
+    /// heap-exhaustion error — it is **not** escalated to a major (which would make room) — and
+    /// leaves every counter and both spaces exactly as they were.
+    #[test]
+    fn collect_kind_minor_never_escalates_and_leaves_the_heap_untouched() {
+        // A mature space of 8 words cannot receive a 233-word nursery's promotion.
+        let policy = HeapPolicy {
+            initial_young_words: 233,
+            initial_mature_words: 8,
+            ..HeapPolicy::default()
+        };
+        let mut c = Collector::new(policy).expect("collector");
+
+        let heap = c.young_mut().heap_mut();
+        let mut live = Vec::new();
+        for i in 0..20i64 {
+            live.push(
+                heap.cons(make_small(i), beam_term::prelude::NIL)
+                    .expect("cell"),
+            );
+        }
+        let mut roots = live.clone();
+        assert!(
+            c.young().used_words() > c.mature().available_words(),
+            "the promotion really cannot fit"
+        );
+
+        let stats_before = c.stats();
+        let young_capacity = c.young().capacity_words();
+        let mature_capacity = c.mature().capacity_words();
+        let mature_used = c.mature().used_words();
+        let spaces = c.young_space_count();
+
+        let err = c
+            .collect_kind(CollectionKind::Minor, &mut roots)
+            .expect_err("the pinned minor must not fit");
+        assert!(matches!(err, BeamError::Alloc(_)), "got {err:?}");
+
+        // No escalation, no copy, no counter and no geometry change.
+        assert_eq!(c.stats(), stats_before, "no counter advanced");
+        assert_eq!(c.minor_gcs(), 0);
+        assert_eq!(c.young().capacity_words(), young_capacity);
+        assert_eq!(c.mature().capacity_words(), mature_capacity);
+        assert_eq!(c.mature().used_words(), mature_used, "nothing was copied");
+        assert_eq!(c.young_space_count(), spaces);
+        for root in &roots {
+            assert!(
+                c.young().contains_term(*root),
+                "every root is still in the nursery"
+            );
+        }
+
+        // The same collector *does* make room when the caller asks for a major.
+        let escalated = c
+            .collect_kind(CollectionKind::Major, &mut roots)
+            .expect("the major makes room");
+        assert_eq!(escalated.kind, CollectionKind::Major);
+        assert_eq!(c.stats().major_collections, 1);
     }
 }

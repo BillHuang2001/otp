@@ -1083,6 +1083,116 @@ fn list_to_pid_parses_and_round_trips() {
 }
 
 #[test]
+fn list_to_pid_bounds_each_field_at_beam_terms_single_limit() {
+    // ORACLE (OTP 29.1.1 / erts-17.1), one probe per line:
+    //   erl -noshell -eval 'io:format("~p~n",[catch erlang:list_to_pid("<0.268435455.4294967295>")])'
+    //     => <0.268435455.4294967295>            (both fields at their maximum)
+    //   ... "<0.268435456.0>"                    => badarg  (number = 2^28)
+    //   ... "<0.268435456.1>"                    => badarg  (an odd serial, so the
+    //                                              answer cannot be an artefact of the
+    //                                              number carrying into the serial)
+    //   ... "<0.268435455.4294967296>"           => badarg  (serial = 2^32)
+    //   ... "<0.99999999999999999999.0>"         => badarg  (a field past `u64`: the
+    //                                              C's `Uint` accumulator wraps and
+    //                                              then still fails the number check,
+    //                                              `parse_digits` rejects the overflow
+    //                                              — same class either way)
+    // The class is `badarg`, never `system_limit`: `bif.c:4578-4581` jumps to `bad`
+    // (then `BIF_ERROR(…, BADARG)`) when `c > ERTS_MAX_INTERNAL_PID_SERIAL || b >
+    // ERTS_MAX_INTERNAL_PID_NUMBER`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+
+    // This BIF now reads **`beam_term`'s** two limits only (through
+    // `beam_term::prelude::try_make_pid_data`). `beam_process` keeps its own literal
+    // copy for its table sizing, while the packing `ProcessId::to_eterm` performs is
+    // `beam_term`'s `make_pid_data`; if the two sets ever diverge this bound and the
+    // encoder would disagree, so pin them equal.
+    assert_eq!(
+        beam_process::MAX_PROCESS_NUMBER,
+        beam_term::MAX_INTERNAL_PID_NUMBER,
+        "beam_process's pid-number limit must match the layout's"
+    );
+    assert_eq!(
+        beam_process::MAX_PROCESS_SERIAL,
+        beam_term::MAX_INTERNAL_PID_SERIAL,
+        "beam_process's pid-serial limit must match the layout's"
+    );
+
+    let max_number = beam_term::MAX_INTERNAL_PID_NUMBER;
+    let max_serial = beam_term::MAX_INTERNAL_PID_SERIAL;
+
+    // Every corner of the box is accepted and lands in exactly those fields.
+    for (number, serial) in [
+        (max_number, max_serial),
+        (max_number, 0),
+        (0, max_serial),
+        (0, 0),
+    ] {
+        let expected = format!("<0.{number}.{serial}>");
+        let text = chars(&mut ctx, &expected);
+        let pid = call(&reg, &mut ctx, "erlang", "list_to_pid", 1, &[text])
+            .unwrap_or_else(|e| panic!("{expected} must be accepted, got {e:?}"));
+        let decoded = ProcessId::from_eterm(pid).expect("an internal pid");
+        assert_eq!(
+            (decoded.number(), decoded.serial()),
+            (number, serial),
+            "{expected} must decode to the fields it names"
+        );
+        let rendered = call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[pid]).expect("a pid");
+        assert_eq!(text_bytes(rendered), expected.into_bytes());
+    }
+
+    // One past either limit is `badarg`. An unchecked `(ser << 28) | num` pack would
+    // instead carry into the serial field and fabricate a pid (`<0.268435456.0>`
+    // would come back as `<0.0.1>`), which is exactly what the boundary must prevent.
+    for bad in [
+        format!("<0.{}.0>", max_number + 1),
+        format!("<0.{}.1>", max_number + 1),
+        format!("<0.0.{}>", max_serial + 1),
+        format!("<0.{max_number}.{}>", max_serial + 1),
+        "<0.99999999999999999999.0>".to_string(),
+    ] {
+        let text = chars(&mut ctx, &bad);
+        assert!(
+            matches!(
+                call(&reg, &mut ctx, "erlang", "list_to_pid", 1, &[text]),
+                Err(BeamError::BadArg)
+            ),
+            "{bad:?} must be badarg"
+        );
+    }
+}
+
+#[test]
+fn list_to_ref_bounds_the_id_at_the_oracles_max_reference() {
+    // ORACLE (OTP 29.1.1 / erts-17.1):
+    //   erlang:list_to_ref("#Ref<0.0.0.262143>") => #Ref<0.0.0.262143>
+    //   erlang:list_to_ref("#Ref<0.0.0.262144>") => error:badarg
+    // `bif.c:4777` is `if (refn[0] >= MAX_REFERENCE) goto bad;` with `MAX_REFERENCE =
+    // 1 << _REF_NUM_SIZE = 1 << 18` (`erl_term.h:768,771`), i.e. the bound is the
+    // oracle's, exclusive — and `badarg`, never `system_limit`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+
+    let text = chars(&mut ctx, "#Ref<0.0.0.262143>");
+    let reference = call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[text])
+        .expect("the largest id the oracle accepts");
+    let rendered = call(&reg, &mut ctx, "erlang", "ref_to_list", 1, &[reference]).expect("a ref");
+    assert_eq!(text_bytes(rendered), b"#Ref<0.0.0.262143>");
+
+    let text = chars(&mut ctx, "#Ref<0.0.0.262144>");
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[text]),
+        Err(BeamError::BadArg)
+    ));
+}
+
+#[test]
 fn ref_to_list_renders_the_m1_ref_shape() {
     // ORACLE:
     //   erlang:ref_to_list(erlang:list_to_ref("#Ref<0.0.0.7>"))  => "#Ref<0.0.0.7>"
@@ -1138,10 +1248,7 @@ fn ref_to_list_renders_a_runtime_built_reference() {
     let name = ctx.atom("bogus").expect("seeded");
     let tid = call(&reg, &mut ctx, "ets", "new", 2, &[name, NIL]).expect("a table is created");
     assert!(
-        matches!(
-            call(&reg, &mut ctx, "erlang", "is_reference", 1, &[tid]),
-            Ok(_)
-        ),
+        call(&reg, &mut ctx, "erlang", "is_reference", 1, &[tid]).is_ok(),
         "the tid is a reference"
     );
 
@@ -1269,17 +1376,7 @@ fn the_to_binary_variants_return_the_list_bytes() {
     let as_binary = call(&reg, &mut ctx, "erlang", "port_to_binary", 1, &[port]).expect("a port");
     // The oracle's `#Port<0.3>` for `erlang:port_to_list(open_port({spawn,"true"},[]))`.
     assert_eq!(binary_text(as_binary), b"#Port<0.3>");
-    assert!(matches!(
-        call(
-            &reg,
-            &mut ctx,
-            "erlang",
-            "port_to_list",
-            1,
-            &[port]
-        ),
-        Ok(_)
-    ));
+    assert!(call(&reg, &mut ctx, "erlang", "port_to_list", 1, &[port]).is_ok());
 
     // Each variant still type-checks its one argument.
     let five = small(&mut ctx, 5);

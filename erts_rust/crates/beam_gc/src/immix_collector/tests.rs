@@ -377,3 +377,133 @@ fn collect_minor_reports_exhaustion_before_copying_anything() {
     );
     assert!(roots.iter().all(|r| c.young().contains_term(*r)));
 }
+
+// --- the kind-pinned entry point -------------------------------------------------------
+//
+// [`GenImmixCollector::collect_kind`] runs **exactly** the requested [`CollectionKind`]: no
+// policy choice and no [`PromoteOutcome::WouldNotFit`] escalation. The distinguishing case is a
+// minor whose promotion the mature region cannot receive — `collect` reclaims in place by
+// running a major, `collect_kind(Minor)` reports the typed exhaustion instead, with the nursery
+// byte-identical and the mature region untouched.
+
+#[test]
+fn collect_kind_minor_runs_a_minor_even_when_the_policy_forces_a_major() {
+    let policy = HeapPolicy {
+        fullsweep_after: 0, // the cadence fires on every collection
+        ..HeapPolicy::default()
+    };
+
+    // `collect` (unchanged) picks the major the policy asks for.
+    let mut chosen = GenImmixCollector::from_policy(policy.clone()).expect("collector");
+    let (chosen_root, _atom) = build_graph(&mut chosen);
+    let mut chosen_roots = [chosen_root];
+    let chosen_collection = chosen.collect(&mut chosen_roots).expect("collect");
+    assert_eq!(
+        chosen_collection.kind,
+        CollectionKind::Major,
+        "fullsweep_after = 0 makes the policy pick a major"
+    );
+
+    // `collect_kind(Minor)` pins the minor.
+    let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+    let (outer, atom) = build_graph(&mut c);
+    let mut roots = [outer];
+    let pinned = c
+        .collect_kind(CollectionKind::Minor, &mut roots)
+        .expect("the pinned minor fits");
+
+    assert_eq!(pinned.kind, CollectionKind::Minor, "the kind is pinned");
+    assert_eq!(pinned.stats.words_copied, 13, "only the live words move");
+    assert_eq!(c.stats().minor_collections, 1);
+    assert_eq!(c.stats().major_collections, 0);
+    assert_eq!(c.minor_gcs(), 1);
+    assert_eq!(c.young().used_words(), 0, "the nursery is emptied");
+    assert_graph_preserved(&c, roots[0], atom);
+}
+
+#[test]
+fn collect_kind_major_runs_a_fullsweep_and_resets_minor_gcs() {
+    let mut c = GenImmixCollector::from_policy(HeapPolicy::default()).expect("collector");
+    let (outer, atom) = build_graph(&mut c);
+    let mut roots = [outer];
+
+    let minor = c
+        .collect_kind(CollectionKind::Minor, &mut roots)
+        .expect("pinned minor");
+    assert_eq!(minor.kind, CollectionKind::Minor);
+    assert_eq!(c.minor_gcs(), 1);
+
+    let major = c
+        .collect_kind(CollectionKind::Major, &mut roots)
+        .expect("pinned major");
+    assert_eq!(major.kind, CollectionKind::Major);
+    assert_eq!(c.stats().major_collections, 1);
+    assert_eq!(c.stats().minor_collections, 1, "no extra minor ran");
+    assert_eq!(c.minor_gcs(), 0, "a major resets the minor count");
+    assert!(
+        c.last_immix_stats().is_some(),
+        "the mature reclaim is observable"
+    );
+    assert_graph_preserved(&c, roots[0], atom);
+}
+
+#[test]
+fn collect_kind_minor_reports_exhaustion_instead_of_escalating() {
+    // The scenario of `a_minor_that_would_not_fit_escalates_to_a_major`, with the kind pinned:
+    // a single-block mature region (16 lines) holding 12 promoted lines cannot receive an
+    // 8-line promotion, and `collect_kind(Minor)` reports that instead of running the major
+    // `collect` would.
+    let policy = HeapPolicy {
+        initial_mature_words: 1,
+        initial_young_words: 233,
+        ..HeapPolicy::default()
+    };
+    let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+
+    let heap = c.young_mut().heap_mut();
+    let mut first_roots: Vec<Eterm> = Vec::new();
+    for i in 0..12i64 {
+        first_roots.push(heap.cons(make_small(i), NIL).expect("cell"));
+    }
+    let mut roots = first_roots.clone();
+    c.collect_kind(CollectionKind::Minor, &mut roots)
+        .expect("the first promotion fits");
+    assert_eq!(c.mature().used_lines(), 12);
+
+    // A fresh 8-line nursery graph that the first roots cannot reach: only the major's in-place
+    // reclaim makes room for it.
+    let heap = c.young_mut().heap_mut();
+    let mut second: Vec<Eterm> = Vec::new();
+    for i in 100..108i64 {
+        second.push(heap.cons(make_small(i), NIL).expect("cell"));
+    }
+    let mut roots = second.clone();
+
+    let stats_before = c.stats();
+    let spaces_before = c.young_space_count();
+    let young_capacity = c.young().capacity_words();
+    let err = c
+        .collect_kind(CollectionKind::Minor, &mut roots)
+        .expect_err("the pinned minor must not fit");
+    assert!(matches!(err, BeamError::Alloc(_)), "got {err:?}");
+
+    // No escalation, no copy, no counter and no geometry change.
+    assert_eq!(c.stats(), stats_before, "no counter advanced");
+    assert_eq!(c.minor_gcs(), 1);
+    assert_eq!(c.mature().used_lines(), 12, "nothing was promoted");
+    assert!(c.young().used_words() > 0, "the nursery is untouched");
+    assert_eq!(c.young().capacity_words(), young_capacity);
+    assert_eq!(c.young_space_count(), spaces_before);
+    assert!(roots.iter().all(|r| c.young().contains_term(*r)));
+
+    // The same collector DOES make room when the caller asks for the major.
+    let escalated = c
+        .collect_kind(CollectionKind::Major, &mut roots)
+        .expect("the major makes room");
+    assert_eq!(escalated.kind, CollectionKind::Major);
+    assert_eq!(c.stats().major_collections, 1);
+    assert_eq!(c.mature().used_lines(), 8, "the dead graph was reclaimed");
+    for root in &roots {
+        assert!(c.mature().contains_term(*root));
+    }
+}

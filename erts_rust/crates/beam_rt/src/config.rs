@@ -97,6 +97,31 @@ impl Default for MaxHeapFlags {
     }
 }
 
+/// One process's `max_heap_size` **setting**: the word bound plus its three flags.
+///
+///
+/// This is the value the C keeps per process (`MAX_HEAP_SIZE_GET(p)` /
+/// `MAX_HEAP_SIZE_FLAGS_GET(p)`) and renders as the four-key map
+/// `#{error_logger => B, include_shared_binaries => B, kill => B, size => N}`
+/// (`erl_gc.c:3807-3822`). A process starts with the emulator's `+hmax`/`+hmax*` values
+/// ([`HeapOptions::policy`]'s `max_heap_words` and [`HeapOptions::max_heap_flags`]) and
+/// replaces them whole through `erlang:process_flag(max_heap_size, …)` (`bif.c:2148-2166`).
+///
+/// `size == 0` is the C's "no upper bound".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxHeapSetting {
+    /// The word bound (`0` = unlimited).
+    pub size: usize,
+    /// The `kill`/`error_logger`/`include_shared_binaries` flags.
+    pub flags: MaxHeapFlags,
+}
+impl MaxHeapSetting {
+    /// The setting an emulator with `flags` gives a process with no explicit bound.
+    pub fn unlimited(flags: MaxHeapFlags) -> MaxHeapSetting {
+        MaxHeapSetting { size: 0, flags }
+    }
+}
+
 /// The heap-size emulator options — `+hms`, `+hmbs` and the `+hmax*` family — as the
 /// [`HeapPolicy`] the runtime's GC introspection reports.
 ///
