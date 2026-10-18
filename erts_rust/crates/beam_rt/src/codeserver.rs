@@ -45,10 +45,11 @@
 //! # The code path
 //!
 //! [`CodeServer::find_file`] searches, in order: the `-pa` directories (head, in reverse
-//! command-line order), the **system** `ebin` directories (stdlib, kernel, erts, …)
-//! resolved from the running Erlang installation at start-up, and finally the `-pz`
-//! directories (tail) — the order the oracle's `code_server.erl` builds
-//! (`add_loader_path/2` over `add_pa_pz/3`).
+//! command-line order), the **system** `ebin` directories (the prim pair — kernel, stdlib —
+//! then the `$ERL_LIBS` directories, then every application of the release's `<lib>`), and
+//! finally the `-pz` directories (tail) — the order the oracle's `code_server.erl` builds
+//! (`add_loader_path/2` over `make_path`/`get_user_lib_dirs`/`merge_path`/`add_pa_pz`). The
+//! release-layout half is [`path`]'s.
 //!
 //! Those directories are located **from the filesystem** — `$ERTS_STDLIB_DIR` when set, else the
 //! standard OTP installation layout under the `erl` on `$PATH` (resolved to a path, never
@@ -83,6 +84,10 @@ use beam_term::AtomTable;
 
 use crate::context::PendingInterner;
 use crate::error;
+
+/// The release-layout code-path derivation (the oracle's `<lib>` bundle scan): a thin child
+/// module so this file stays the code server's public surface — see [`path`].
+mod path;
 
 /// The filename a module loaded **from memory** was registered with — `code:load_binary/3`'s
 /// `File` argument.
@@ -321,21 +326,28 @@ impl CodeServer {
         self.paths = self.default_paths.clone();
     }
 
-    /// Appends the **system** `ebin` directories (stdlib, kernel and erts) to the code
-    /// path, followed by the [`EXTRA_CODE_PATH_APPS`] applications (today just `compiler`).
+    /// Appends the **system** half of the code path to the code path: the prim pair (kernel,
+    /// then stdlib), the `$ERL_LIBS` `ebin` directories, every application of the release's
+    /// `<lib>` and, last, the current directory `"."` — see [`path::system_path`], which is
+    /// the oracle's `code_server.erl` derivation and which this method only *installs*.
     ///
     /// The base directories are resolved once per process (see [`system_ebins`]) from
     /// `$ERTS_STDLIB_DIR`, from the installation's own filesystem layout, or — as a last
     /// resort — from the system `erl`. A failure here is a hard error: running without a
-    /// standard library is never silent. The extras are then located from those *resolved*
-    /// directories ([`extra_app_ebins`]), so the acceptance rule — and `system_ebins()`
-    /// itself — is untouched; an application this host does not have is simply not added
-    /// (a path is never fabricated).
+    /// standard library is never silent. The release derivation then works from those
+    /// *resolved* directories and the `<lib>` root they prove
+    /// ([`resolved_lib_root`]), so the acceptance rule — and `system_ebins()` itself — is
+    /// untouched; an application this host does not have is simply not added (a path is never
+    /// fabricated), and a directory that is not there is never listed.
     ///
     /// They are *boot-time default* entries ([`CodeServer::add_default_path`]), so a later
     /// [`CodeServer::reset_paths_to_defaults`] keeps them, and the base directories are the
     /// input [`CodeServer::lib_root`] records the installation's `<lib>` from
     /// ([`resolved_lib_root`]).
+    ///
+    /// Running on **every** `code:get_path/0`, it must not re-read the filesystem, so the
+    /// derivation itself is cached ([`path::cached_system_path`]) exactly as the base
+    /// resolution is ([`system_ebins`]).
     ///
     /// # Errors
     ///
@@ -348,23 +360,18 @@ impl CodeServer {
         // [`CodeServer::lib_root`] the consumed installation's root: the code path itself also
         // carries the user's `-pa`/`-pz` directories, which must never repoint it.
         self.system_lib_root = resolved_lib_root(&base);
-        for dir in &base {
-            self.add_default_path(dir.clone());
-        }
-        // Applications the code path needs *beyond* the acceptance probe. `system_ebins()`
-        // keeps its exact meaning (stdlib/kernel/erts, with `lists.beam` the hard
-        // requirement), so root acceptance is unchanged; the extras are located from the
-        // *resolved* base directories, whatever their source (`native_system_ebins` or the
-        // `erl` fallback).
-        for dir in extra_app_ebins(self.system_lib_root.as_deref()) {
+        // The whole system half in the oracle's order — prim pair, `$ERL_LIBS`, the release's
+        // applications, `"."` (see [`path::system_path`]). `system_ebins()` keeps its exact
+        // meaning (stdlib/kernel/erts, with `lists.beam` the hard requirement), so root
+        // acceptance is unchanged whatever the resolution's source
+        // (`native_system_ebins` or the `erl` fallback).
+        for dir in path::cached_system_path(self.system_lib_root.as_deref(), &base) {
             self.add_default_path(dir);
         }
-        // The **current directory** `"."`, which the oracle's code path carries between the
-        // system directories and the `-pz` tail (see [`CodeServer::set_configured_paths`]).
-        self.add_default_path(PathBuf::from("."));
-        // The `-pz` tail goes **after** the system directories (the oracle's
+        // The `-pz` tail goes **after** the system half, i.e. after `"."` (the oracle's
         // `add_pa_pz/3`), so a `-pz` directory never shadows an installed module.
-        let tail = self.tail_paths.clone();        for dir in tail {
+        let tail = self.tail_paths.clone();
+        for dir in tail {
             self.add_default_path(dir);
         }
         Ok(())
@@ -1155,25 +1162,20 @@ fn erl_system_ebins() -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-/// The system applications whose `ebin` directories make up the default code path, in the
-/// order they are searched (and the order [`system_apps_eval`] asks the system `erl` for
-/// them), each paired with a module the directory must contain (the resolver's proof that it
-/// is the real thing).
+/// The system applications whose `ebin` directories are the **acceptance probe** of a candidate
+/// installation root, in the order [`system_apps_eval`] asks the system `erl` for them, each
+/// paired with a module the directory must contain (the resolver's proof that it is the real
+/// thing).
 ///
 /// `erts` holds the **preloaded** modules' `.beam` files (`init`, `persistent_term`,
-/// `prim_*`, …): they ship in `<lib>/erts-<vsn>/ebin`, not in stdlib or kernel, so the
-/// code path must include that directory for the loader to resolve them.
-const SYSTEM_APPS: &[(&str, &str)] = &[("stdlib", "lists"), ("kernel", "kernel"), ("erts", "init")];
-
-/// Applications appended to the resolved system code path **beyond** the [`SYSTEM_APPS`]
-/// acceptance probe, each paired with a module its `ebin` must contain.
+/// `prim_*`, …): they ship in `<lib>/erts-<vsn>/ebin` in an installed release (and in
+/// `<root>/erts/preloaded/ebin` in a source tree), not in stdlib or kernel, so it must be
+/// resolvable for the loader to find them.
 ///
-/// `compiler` is what the in-process `compile:file/2` path (contract A.9, self-hosted build)
-/// needs: the OTP compiler's public API lives in `<lib>/compiler-<vsn>/ebin`. Keeping it out
-/// of [`SYSTEM_APPS`] is deliberate — that list *is* the candidate-root acceptance probe
-/// (stdlib/`lists.beam` is the hard requirement), so adding an optional application there
-/// would change which installation roots are usable.
-const EXTRA_CODE_PATH_APPS: &[(&str, &str)] = &[("compiler", "compile")];
+/// This list is **only** the probe: which directories actually go on the code path is the
+/// release derivation's answer ([`path::system_path`]), which adds every application of the
+/// installation — `compiler`, `eunit`, `syntax_tools`, … — not just these three.
+const SYSTEM_APPS: &[(&str, &str)] = &[("stdlib", "lists"), ("kernel", "kernel"), ("erts", "init")];
 
 /// The `erl -eval` program that prints the [`SYSTEM_APPS`] directories, one per line.
 ///
@@ -1301,30 +1303,6 @@ fn find_sibling_ebin(lib_root: &Path, prefix: &str, module: &str) -> Option<Path
     candidates
         .iter()
         .find_map(|candidate| app_ebin(candidate, module))
-}
-
-/// The `ebin` directories of the [`EXTRA_CODE_PATH_APPS`] applications, located from the
-/// **resolved** installation's `<lib>` root ([`resolved_lib_root`] over the base `ebin`
-/// directories, i.e. the same root [`CodeServer::lib_root`] records).
-///
-/// Each extra application is looked up first in the versioned installed layout
-/// (`<lib>/<app>-<vsn>/ebin`, via [`find_sibling_ebin`]) and then in the source-tree
-/// unversioned layout (`<lib>/<app>/ebin`, via [`app_ebin`]).
-///
-/// A directory is returned only when it really holds the application's probe module, so a
-/// path is **never fabricated**; the result is empty when the base directories carry no lib
-/// root (an `$ERTS_STDLIB_DIR` pointing straight at an `ebin`, a runtime with only explicit
-/// `-pa` directories) or when the host does not have the application installed.
-fn extra_app_ebins(lib_root: Option<&Path>) -> Vec<PathBuf> {
-    let Some(root) = lib_root else {
-        return Vec::new();
-    };
-    EXTRA_CODE_PATH_APPS
-        .iter()
-        .filter_map(|(app, module)| {
-            find_sibling_ebin(root, app, module).or_else(|| app_ebin(&root.join(app), module))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1864,16 +1842,29 @@ mod tests {
         assert_eq!(resolved_lib_root(&[root.clone()]), None);
         assert_eq!(resolved_lib_root(&[]), None);
 
-        // `compiler` is located under that root in the unversioned layout, and the versioned
-        // installed layout wins where both exist.
+        // The release derivation reaches `compiler` under that root in the unversioned layout,
+        // and the versioned installed layout wins where both exist (the bundle sort's version
+        // component decides, `code_server.erl`'s `choose_bundles/1`).
         let unversioned = lib.join("compiler").join("ebin");
         touch(&unversioned, "compile");
-        assert_eq!(extra_app_ebins(Some(&lib)), vec![unversioned.clone()]);
+        assert_eq!(
+            path::release_ebins(&lib),
+            vec![stdlib.clone(), unversioned.clone()],
+            "the unversioned `<lib>/<app>/ebin` layout is a release layout too"
+        );
         let versioned = installed_ebin(&root, "compiler");
         touch(&versioned, "compile");
-        assert_eq!(extra_app_ebins(Some(&lib)), vec![versioned]);
-        // With no root (an `$ERTS_STDLIB_DIR` pointing straight at an `ebin`): nothing is
-        // fabricated.
-        assert!(extra_app_ebins(None).is_empty());
+        assert_eq!(
+            path::release_ebins(&lib),
+            vec![stdlib.clone(), versioned],
+            "the installed `<app>-<vsn>` copy is the one that wins"
+        );
+        // With no root (an `$ERTS_STDLIB_DIR` pointing straight at an `ebin`, so no `<lib>` can
+        // be derived): the system half is exactly the resolved base plus `"."` — nothing is
+        // fabricated and no release list is invented.
+        assert_eq!(
+            path::system_path(None, std::slice::from_ref(&stdlib)),
+            vec![stdlib, PathBuf::from(".")]
+        );
     }
 }

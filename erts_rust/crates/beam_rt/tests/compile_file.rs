@@ -23,13 +23,14 @@
 //!
 //! # What this suite is for
 //!
-//! `beam_rt` resolves the system code path natively ([`CodeServer::add_system_paths`]) and — since
-//! [`EXTRA_CODE_PATH_APPS`] — also appends the `compiler` application's `ebin`, so `compile:*` is
-//! loadable from the same installation the oracle uses. This suite is the **compatibility gate**
-//! for that: it runs the real compiler under `beam_rt` and under the system `erl`, and compares.
+//! `beam_rt` resolves the system code path natively ([`CodeServer::add_system_paths`]) with the
+//! release-layout derivation the oracle's `code_server.erl` performs, so every application of the
+//! installation — the `compiler` application included — has its `ebin` on the path and
+//! `compile:*` is loadable from the same installation the oracle uses. This suite is the
+//! **compatibility gate** for that: it runs the real compiler under `beam_rt` and under the
+//! system `erl`, and compares.
 //!
 //! [`CodeServer::add_system_paths`]: beam_rt::CodeServer::add_system_paths
-//! [`EXTRA_CODE_PATH_APPS`]: (crate-internal) `codeserver::EXTRA_CODE_PATH_APPS`
 //!
 //! # What this suite asserts
 //!
