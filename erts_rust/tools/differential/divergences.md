@@ -542,3 +542,105 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   order and the oracle's own flatmap/HAMT order varies between VM starts for the same map, so the
   corpus classifies a map-valued result into sorted key/pair lists and probes with `Probe::Value`.
   An encoding-order choice, not a semantic divergence. Owner: `beam_codec` / `beam_bifs`.
+
+## A.3 — NIF C ABI: the stateful `enif_*` family (owner: `beam_rt` NifHost / `beam_abi`)
+Measured with a real `cc`-built `.so`, oracle OTP 29.1.1 / erts-17.1, while the `nif_rt/…` block was
+added. Each is a plain-value difference, so a case pinning one would be a `mismatch`.
+- **`enif_send` to another Erlang process never delivers.** Both the `NULL`-env and the `msg_env`
+  form: the oracle answers `1` and the message really reaches the target's mailbox; `beam_rt`
+  answers `0` and nothing is delivered — `NifHost::send` is left at its `None` default in
+  `NifHostImpl`. Owner: `beam_rt` (`crates/beam_rt/src/nif.rs`).
+- **`enif_monitor_process` of a live pid cannot be established.** The oracle answers `0` (the monitor
+  arms and a `'DOWN'` fires when the process dies); `beam_rt` answers `1` (it cannot establish it).
+  Owner: `beam_rt` (no `monitor_process` hook in `NifHostImpl`).
+- **`enif_select` on a real pipe fd registers nothing.** The oracle answers `0` (the interest is
+  registered and a `{select, …}` message is delivered); `beam_rt` answers `-1` (the hook is
+  unimplemented). Owner: `beam_rt`.
+- **A term-exposed resource's destructor never runs.** `enif_make_resource` +
+  `enif_release_resource` + a forced `erlang:garbage_collect/0`: the oracle's destructor count is
+  `1`, `beam_rt`'s `0` — a bounded, deliberate leak, because the runtime has no "the term died"
+  signal. Owner: `beam_abi` (`crates/beam_abi/src/nif/enif/resources.rs`).
+- **`enif_make_map_from_arrays` with duplicate keys builds a map where the oracle refuses.** The
+  oracle's C answers `THE_NON_VALUE` (`erts/emulator/beam/erl_map.c:673-710`); `beam_rt` dedups
+  last-value-wins and returns a map. Owner: `beam_abi` (`crates/beam_abi/src/nif/enif/map.rs`).
+- **`enif_binary_to_term` over an image with trailing bytes answers `0`.** The oracle decodes the
+  first term and reports the **consumed** byte count; `beam_rt`'s host hook strict-decodes the whole
+  slice and answers `0`. Owners: `beam_abi` (`crates/beam_abi/src/nif/enif/mem.rs`) / `beam_rt`
+  (`NifHostImpl::binary_to_term`).
+- **`enif_term_to_binary` of a local fun (a closure) fails.** The oracle emits `NEW_FUN_EXT`;
+  `beam_rt` returns the C failure code `0`, which surfaces as `badarg`. The **external**-fun
+  `EXPORT_EXT` image agrees and is pinned (`nif_rt/…`). Owners: `beam_rt`
+  (`NifHostImpl::term_to_binary`) / `beam_codec`.
+
+## A.4 — driver C ABI: the async pool and the empty-payload delivery (owner: `beam_abi` / `beam_rt`)
+- **`driver_async` schedules nothing, so `ready_async` never fires.** A fixture whose `output`
+  callback calls `driver_async(port, &key, invoke, data, NULL)` and answers the acceptance as one
+  byte: the oracle accepts the job — the reply byte decodes to `49` (`'1'`) and the allocated async
+  id is > 0 — and later runs the job on a driver thread; `beam_rt` answers `-1` (reply byte `48`,
+  `'0'`), because there is no async pool, hence no `ready_async` either. Owners: `beam_abi` (the
+  `driver_async`/`driver_async_cancel` slot) / `beam_rt` (`crates/beam_rt/src/port/driver.rs`,
+  "What is NOT wired yet").
+- **`driver_output2(NULL,0,NULL,0)`'s zero-length delivery is dropped by the Rust runtime, so it
+  stays unpinned.** Re-confirmed as the reason that candidate case was not added: the oracle delivers
+  `{Port,{data,<<>>}}` where `beam_rt`'s `PortRegistry::fold_notifications` folds an empty payload
+  away. Owner: `beam_rt`.
+
+## A.5 — distribution / ETF wire (owner: `beam_rt`, `beam_codec`)
+
+### Live cross-runtime traffic (measured)
+One Rust node and one system node were driven by hand (a `beam_rt -sname <name>` runtime and a
+system `erl -sname <peer>`), `net_kernel:verbose(3)` on the system side, `epmd -names` and `ss -tn`
+for the transport state.
+- **The Rust → ERTS direction completes.** `beam_rt -sname <name> -eval 'net_adm:ping(<peer>@<host>)'`
+  answers `pong`; the oracle's `verbose(3)` logs `{net_kernel,{accept,…}}` →
+  `{dist_ctrlr,…,<peer-node>,<pid>}` → `{nodeup,…}`, and on halt `{nodedown,…,normal}`. The Rust
+  node connects as **hidden**, so it appears in no side's `nodes/0` — the correct OTP answer for a
+  hidden node (`nodes(hidden)` would list it), not a divergence.
+- **The ERTS → Rust direction never completes.** With `beam_rt -noshell -sname <name>` bound and
+  published to `epmd` (confirmed by `epmd -names` and a LISTEN socket), the system side's
+  `net_adm:ping/1` answers **`pang` after ~7.15 s**; `verbose(3)` shows `{init_setup_check,…}` →
+  `{setup,…}` → `{conn_own_exit,…,setup_timer_timeout}` →
+  `{nodedown,…,pending,setup_timer_timeout}`, and `ss -tn` shows the peer's 30-byte `'n'` name
+  message sitting **unread** (Recv-Q 30) on the accepted link — no `'N'` reply is ever sent. Owner:
+  `beam_rt` (`crates/beam_rt/src/dist.rs`, the accept / `'N'` path).
+- **No corpus case can express cross-runtime traffic — two independent reasons.** (a) *Structural*:
+  `harness::execute` runs the oracle side to completion **first**, then the Rust side, and compares
+  each child's own stdout + exit status, so the two VMs never coexist; a `Command` oracle script
+  could only **hard-code** a cross-runtime observation (exactly the tautology the `Command`-kind rule
+  forbids), and making the oracle child spawn `beam_rt` would bake an artifact path into an argv —
+  against `runtime::resolve_rust`'s `$BEAM_RT`-else-workspace-relative resolution, since a tree holds
+  only one of `target/release`/`target/debug`. (b) *Capability*: the ERTS → Rust direction cannot
+  reach `nodeup`, so a case pinning it would be a permanent `mismatch`, and admitting it as
+  `unsupported` would open a second ratchet gap.
+- **Further A.5 capability gaps measured while probing** (each exits `3`, so an honest gap, never a
+  `mismatch`): `erlang:monitor_node/2` → `beam_rt: unsupported: erlang:monitor_node/2`;
+  `erlang:send/2` to a remote registered name → `beam_rt: unsupported: … distributed send is not
+  implemented`; `net_kernel:node()` → `undef`. Owner: `beam_rt`. The adjacent shapes agree and are
+  pinned: off the `-sname`/`-name` path `node()` is `nonode@nohost`, `is_alive()` is `false` and
+  `nodes()` is `[]`, and with `-sname` the node-name/aliveness shapes agree.
+
+### ETF decode bound (measured)
+- **A 3 000-deep nested list decodes on the oracle and raises here.**
+  `binary_to_term(term_to_binary(T))` of a 3 000-deep right-nested list is `ok true` under the
+  oracle and `exception error system_limit` in the Rust runtime. A case pinning it would be a
+  `mismatch`, so it stays out of the corpus. Owner: `beam_codec` (the decoder's nesting bound).
+
+## A.9 — in-process compile: measured routes that cannot be cases (owner: `beam_bifs`, `beam_engine`/`beam_rt`)
+Each route below was measured while the `selfhost` artifact block was added. None is a divergence:
+both sides matched, and the route was not turned into a case for the reason given.
+- **`compile:string/2,3` and `compile:forms(…, [report])` are `undef` on both sides** — no such export
+  exists in the installed OTP 29 stdlib — so there is no observable at all. Nothing to close; the
+  owner-if-closed is `beam_bifs`.
+- **A `{outdir,…}` + `-include` of a kernel/stdlib header is `{badmatch,error}` on both sides
+  *without* `{i,…}`.** With `[{i,"lib/kernel/include"},{d,'BEFORE_REWRITE',true}]` both sides compile
+  (≈16 s each) and produce **identical** export tables, so there is no discriminating observable; it
+  was dropped for cost. Owner of the cost: `beam_engine`/`beam_rt` (the freshly spawned compiler
+  process path).
+- **A "path-free artifact" assertion is false on both sides.** `binary:match(Bin, <<"lib/stdlib/src">>)`
+  finds the `epp`-injected `file` attribute at offset 4963, and `deterministic` does **not** strip an
+  input `file` attribute; likewise two independently compiled artifacts differ in `byte_size` even
+  under `deterministic`, so only structural identities are usable as a relation. Owner-if-ever:
+  `beam_bifs` (the compile surface).
+- **`compile:forms/2` IS supported by `beam_rt`** — the two landed cases compile *and execute*
+  through it — so the "measure first, drop if unsupported" rule did not bite there (recorded so a
+  future pass does not re-measure it as a gap).
