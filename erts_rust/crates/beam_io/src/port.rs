@@ -956,7 +956,8 @@ pub(crate) fn close_input_frame(input: &mut ByteQueue, reads: &mut VecDeque<Read
     reads.push_back(ReadMessage::body_only(bytes.front().to_vec()));
 }
 
-/// The **reserved** port-control operation namespace.///
+/// The **reserved** port-control operation namespace.
+///
 /// [`PortRegistry::port_control`] forwards every operation name it is handed **verbatim** to
 /// the port's driver: the driver's `control` vocabulary (`"line"`/`"noline"`/`"binary"`/
 /// `"text"`/`"getopts"` for the built-in `fd` driver, plus the `efile` family's
@@ -1108,7 +1109,8 @@ mod tests {
     /// payloads (one per read message — a port can owe **several**, one per driver
     /// `driver_output*` call — and stages the line frames), [`Port::take_line_frames`] drains
     /// the staged line frames. A port is in exactly one mode, so the two never mix.
-    fn frames(port: &mut Port) -> Vec<(Option<bool>, Vec<u8>)> {        let mut frames: Vec<(Option<bool>, Vec<u8>)> = port
+    fn frames(port: &mut Port) -> Vec<(Option<bool>, Vec<u8>)> {
+        let mut frames: Vec<(Option<bool>, Vec<u8>)> = port
             .take_input_notifications()
             .into_iter()
             .map(|notification| match notification {

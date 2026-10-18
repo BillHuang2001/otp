@@ -483,8 +483,8 @@ impl ReadMessage {
             bytes.extend_from_slice(body);
         }
         bytes
-    }}
-
+    }
+}
 /// Something a port produced during an execution round, for its owner.
 ///
 /// This is the crate's notification seam: the runtime turns [`PortNotification::Data`] into
@@ -709,7 +709,9 @@ mod tests {
             assert_eq!(read.has_body(), has_body, "{read:?}");
             assert_eq!(read.len(), len, "{read:?}");
         }
-    }    /// A driver that arms **both** poll directions on one borrowed descriptor.
+    }
+
+    /// A driver that arms **both** poll directions on one borrowed descriptor.
     ///
     /// [`FdDriver::pipe`] arms only `READABLE` (it registers its write fd only once there is
     /// something to flush), so it cannot express "a port whose write direction is armed" — the

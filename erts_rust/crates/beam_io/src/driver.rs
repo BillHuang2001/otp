@@ -291,7 +291,9 @@ impl<'a> DriverContext<'a> {
             body: body.map(<[u8]>::to_vec),
         });
         Ok(())
-    }    /// The port's output queue, which the driver drains bytes waiting to be written from.
+    }
+
+    /// The port's output queue, which the driver drains bytes waiting to be written from.
     pub fn output(&mut self) -> &mut ByteQueue {
         self.output
     }
@@ -960,7 +962,8 @@ mod tests {
             PortExitReason::OwnerExited,
             PortExitReason::Normal,
         ];
-        for (i, a) in all.iter().enumerate() {            for (j, b) in all.iter().enumerate() {
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
                 assert_eq!(a == b, i == j);
             }
             // `Copy`: a by-value use does not move out of the array.
