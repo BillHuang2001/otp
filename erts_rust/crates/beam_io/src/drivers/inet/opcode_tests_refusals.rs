@@ -42,11 +42,9 @@
 //! The helpers (`Rig`, the oracle plumbing, the reply builders) are shared from the two dispatch
 //! suites rather than copied.
 use super::opcode_tests::{
-    assert_outcomes_agree_with_the_oracle, erl_stdout, not_served_reason, op,
-    open_arg as tcp_open_arg, oracle_expression, oracle_replies, reason_of, bare_port as tcp_bare_port,
-    Call, Rig, Rule,
-};
-use super::opcode_tests_udp::{bare_port as udp_bare_port, open_arg as udp_open_arg};
+    assert_outcomes_agree_with_the_oracle, bare_port as tcp_bare_port, erl_stdout, op,
+    open_arg as tcp_open_arg, oracle_expression, oracle_replies, Call, Rig, Rule,
+};use super::opcode_tests_udp::{bare_port as udp_bare_port, open_arg as udp_open_arg};
 use super::wire::{ctl_ok, ctl_xerror};
 use super::{INET_AF_INET, INET_REP_OK, INET_TYPE_DGRAM, INET_TYPE_STREAM};
 use std::os::unix::io::AsRawFd;
@@ -166,20 +164,19 @@ fn fdopen_bound_operands_answer_the_c_pre_adoption_refusals() {
             case.name
         );
 
-        // A real `AF_INET` socket: the pre-adoption check passes and the C would hand the
-        // descriptor to the port (`desc->prebound = 1`), which is exactly what this floor cannot
-        // do — adopting would let the port's `stop`/`Drop` close a descriptor the caller owns.
+        // A real `AF_INET` socket passes the pre-adoption ladder, so the C reaches the adoption —
+        // but this port **already holds a socket**, and the C's arm would overwrite `desc->s`
+        // without closing it (`inet_drv.c:5267`), leaking the previous one. This floor refuses a
+        // second adoption instead and leaves the live socket untouched; the adoption **success**
+        // path from a socket-less port is
+        // [`fdopen_adopts_a_bound_stream_socket_with_the_c_prebound_semantics`].
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback datagram socket");
-        let err = port
-            .try_control(&op(13), &bound_operand(type_byte, socket.as_raw_fd()))
-            .expect_err("an AF_INET socket reaches the adoption, which is the typed gap");
         assert_eq!(
-            reason_of(err),
-            not_served_reason("fdopen", "inet_ctl"),
-            "{}: the gap names the request and its switch",
+            port.control(&op(13), &bound_operand(type_byte, socket.as_raw_fd())),
+            ctl_xerror("einval"),
+            "{}: a port that already holds a socket refuses a second adoption",
             case.name
         );
-
         // A real `AF_INET6` socket: a different family from the IPv4 tag the operand carries, i.e.
         // the C's `name.sa.sa_family != domain ⇒ ctl_error(EINVAL)`.
         match std::net::UdpSocket::bind("[::1]:0") {
@@ -197,39 +194,38 @@ fn fdopen_bound_operands_answer_the_c_pre_adoption_refusals() {
     }
 }
 
-/// The `bound == 0` form of `INET_REQ_FDOPEN`(13) — the one operand that reaches the C's **blind**
-/// adoption, i.e. the surviving typed gap of this arm.
+/// The `bound == 0` form of `INET_REQ_FDOPEN`(13) — the operand that reaches the C's **blind**
+/// adoption.
 ///
 /// With a ten-byte operand whose `bound` word is zero the C takes the descriptor over with **no
-/// syscall at all** (`inet_drv.c:5264`-`:5266`), which is why the reply is `[1]` even for a
-/// garbage number (measured `[1]` for `<<1,2,0,0,0,9,0,0,0,0>>`). This floor answers the typed gap
-/// instead of fabricating that `[1]`.
+/// syscall at all** (`inet_drv.c:5264`-`:5266`), which is why it answers `[1]` even for a garbage
+/// number (measured `[1]` for `<<1,2,0,0,0,9,0,0,0,0>>`). This floor adopts on the same terms now
+/// (the prebound path), but the descriptor still has to reach the poller, so a number that is not
+/// open at all is a **typed error** rather than a fabricated `[1]` — the honest answer, and the
+/// one thing this row pins: a blind adoption never invents a success.
 ///
-/// **Rust-side only**: the same operand against the oracle adopts a descriptor the C then holds in
-/// `desc->inet.s`, and its port shutdown path works on it, which leaves the `erl` expression
-/// unable to close its port cleanly — a corpus hazard rather than a behavioural question, so the
-/// row is pinned here and stated in the subtree docs instead.
+/// The refusal rows of the same arm (a closed number with `bound != 0` ⇒ `[0]ebadf`, a
+/// non-socket ⇒ `[0]enotsock`) live in
+/// [`fdopen_bound_operands_answer_the_c_pre_adoption_refusals`]; the **success** path lives in
+/// [`fdopen_adopts_a_bound_stream_socket_with_the_c_prebound_semantics`].
 #[test]
-fn a_fdopen_with_bound_zero_is_still_the_adoption_gap() {
+fn a_fdopen_with_bound_zero_never_fabricates_an_adoption_reply() {
     for case in cases() {
-        let mut port = opened(&case);
+        // A **socket-less** port, so the "already holds a socket" refusal cannot mask the answer.
+        let mut port = (case.bare)();
         for type_byte in case.types {
             let mut operand = vec![INET_AF_INET, *type_byte];
             operand.extend_from_slice(&CLOSED_FD.to_be_bytes());
             operand.extend_from_slice(&0i32.to_be_bytes());
-            let err = port
-                .try_control(&op(13), &operand)
-                .expect_err("a `bound == 0` descriptor is adopted blind, which this floor cannot do");
-            assert_eq!(
-                reason_of(err),
-                not_served_reason("fdopen", "inet_ctl"),
-                "{}: type {type_byte}",
+            assert!(
+                port.try_control(&op(13), &operand).is_err(),
+                "{}: a `bound == 0` adoption of a descriptor that is not open is a typed error, \
+                 never a fabricated `[1]`",
                 case.name
             );
         }
     }
 }
-
 /// The process-independent half of the `fdopen` ladder, compared with the real system driver.
 ///
 /// Every row here either carries no descriptor at all (the `len`/family/type guards refuse the
@@ -711,4 +707,356 @@ fn ifset_answers_the_measured_refusals_like_the_oracle() {
         );
         assert_outcomes_agree_with_the_oracle(case.name, &calls, case.bare);
     }
+}
+
+// -----------------------------------------------------------------------
+// `INET_REQ_FDOPEN`(13) — the prebound **adoption** success path
+// -----------------------------------------------------------------------
+//
+// The C's adoption body is `inet_ctl_fdopen` (`inet_drv.c:5223`-`:5282`): it stores the caller's
+// descriptor, registers it, sets `INET_STATE_OPEN` (promoted to `INET_STATE_CONNECTED` when a
+// `SOCK_STREAM` adoption answers `sock_peer`), records `desc->stype`/`desc->sfamily`, and sets
+// `desc->prebound = 1` so the descriptor is **never** `close(2)`d — a prebound close only drops the
+// select registration (`erl_inet_close`, `:5102`-`:5117`).
+//
+// Every row below mints its own descriptor **with an owning socket object held for the whole test**
+// and hands the driver `as_raw_fd()`, so the assertions about "the caller's descriptor is still
+// open" are observable through [`super::sys`] rather than inferred.
+//
+// The sockets are declared **before** the `Rig` in each test so they outlive the port: locals drop
+// in reverse declaration order, so the driver is dropped (with its prebound-aware `Drop`) before the
+// descriptor's owner closes it.
+
+/// The `fdopen` operand of an **explicitly bound** descriptor: `[af, type, fd_be32, bound_be32]`.
+///
+/// [`bound_operand`] is the `bound = 1` case of this; the helper stays separate because the
+/// refusal suite only ever needs that one form.
+fn fdopen_bound_operand(type_byte: u8, fd: i32, bound: i32) -> Vec<u8> {
+    let mut operand = vec![INET_AF_INET, type_byte];
+    operand.extend_from_slice(&fd.to_be_bytes());
+    operand.extend_from_slice(&bound.to_be_bytes());
+    operand
+}
+
+/// `INET_REQ_GETTYPE`(15)'s reply for a socket of `stype`: `[1] ++ af_be32 ++ stype_be32`
+/// (`inet_drv.c:11165`-`:11203`).
+fn gettype_reply(stype: u8) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&u32::from(INET_AF_INET).to_be_bytes());
+    reply.extend_from_slice(&u32::from(stype).to_be_bytes());
+    reply
+}
+
+/// `INET_REQ_GETSTATUS`(16)'s reply for a lifecycle state: `[1] ++ state_be32`
+/// (`inet_drv.c:11128`). The code is [`super::InetState::state_code`], i.e. the C's `INET_STATE_*`
+/// bit set, so the expected values are spelled as states rather than as magic numbers — measured
+/// against the oracle: `Open` ⇒ 1, `Connected` ⇒ 5, `Listening` ⇒ 9.
+fn getstatus_reply(state: super::InetState) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&state.state_code().to_be_bytes());
+    reply
+}
+/// `INET_REQ_NAME`(5)/`INET_REQ_PEER`(4)'s reply for `127.0.0.1:port`: the packed
+/// `[1, INET_AF_INET, port_hi, port_lo, 127, 0, 0, 1]`.
+fn loopback_endpoint(port: u16) -> Vec<u8> {
+    let [hi, lo] = port.to_be_bytes();
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&[INET_AF_INET, hi, lo, 127, 0, 0, 1]);
+    reply
+}
+
+/// Asserts that `fd` is still a live, bound `AF_INET` socket listening on `bound` — i.e. that
+/// nothing in this crate issued a `close(2)` on the caller's descriptor.
+fn assert_still_open_and_bound(fd: std::os::unix::io::RawFd, bound: u16, label: &str) {
+    let family = super::sys::socket_family(fd)
+        .unwrap_or_else(|err| panic!("{label}: the caller's descriptor is still a socket: {err}"));
+    assert_eq!(
+        libc::c_int::from(family),
+        libc::AF_INET,
+        "{label}: the caller's descriptor is still an AF_INET socket"
+    );
+    assert_eq!(
+        super::sys::local_port(fd).unwrap_or_else(|err| panic!(
+            "{label}: the caller's descriptor still answers getsockname(2): {err}"
+        )),
+        bound,
+        "{label}: the caller's descriptor is still bound to its own port"
+    );
+}
+
+/// `INET_REQ_FDOPEN`(13) on a **bound, unconnected** `AF_INET`/`SOCK_STREAM` descriptor — the C's
+/// adoption success path and the state it leaves behind.
+///
+/// `inet_ctl_fdopen` registers the descriptor, caches `sfamily = AF_INET`, `stype = SOCK_STREAM`
+/// (`:5265`) and probes `sock_peer` (`:5252`-`:5260`): a bound socket with no peer answers
+/// `INET_STATE_OPEN`, measured `[1,0,0,0,1]`, and `NAME` then names the caller's real endpoint.
+/// `LISTEN` on the adopted descriptor really listens — it is the caller's socket, so the syscall
+/// lands on it.
+///
+/// **Rust-side only**: the operand names a descriptor **this** process owns, so an `erl` probe (a
+/// second process) cannot see it. The process-independent rows of the same arm are compared with
+/// the oracle in [`the_fdopen_operand_refusals_agree_with_the_oracle`].
+#[test]
+fn fdopen_adopts_a_bound_stream_socket_with_the_c_prebound_semantics() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let bound = listener.local_addr().expect("the listener's address").port();
+    let fd = listener.as_raw_fd();
+
+    let mut port = tcp_bare_port();
+    // The six-byte form: `len == 6 ⇒ bound = 1` (`:5264`), so `sock_name(2)` runs first.
+    let mut operand = vec![INET_AF_INET, INET_TYPE_STREAM];
+    operand.extend_from_slice(&fd.to_be_bytes());
+    assert_eq!(
+        port.control(&op(13), &operand),
+        ctl_ok(),
+        "INET_REQ_FDOPEN adopts the caller's descriptor"
+    );
+    // `GETTYPE` reports the cache the adoption wrote — a stream socket of the IPv4 family.
+    assert_eq!(
+        port.control(&op(15), &[]),
+        gettype_reply(INET_TYPE_STREAM),
+        "the adopted descriptor's cached type"
+    );
+    // No peer: the C's `sock_peer` probe fails, so the lifecycle state stays `INET_STATE_OPEN`.
+    assert_eq!(
+        port.control(&op(16), &[]),
+        getstatus_reply(super::InetState::Open),
+        "a bound, unconnected adoption is Open"
+    );
+    // The descriptor is the caller's own socket, so `NAME` asks the kernel and reports its real
+    // bound endpoint rather than a fabricated one.
+    assert_eq!(
+        port.control(&op(5), &[]),
+        loopback_endpoint(bound),
+        "the adopted descriptor's real local endpoint"
+    );
+    // `LISTEN` really listens on it, exactly as the C's `INET_REQ_LISTEN` would.
+    assert_eq!(port.control(&op(27), &[0, 5]), ctl_ok(), "INET_REQ_LISTEN on the adoption");
+    assert_eq!(
+        port.control(&op(16), &[]),
+        getstatus_reply(super::InetState::Listening),
+        "after LISTEN the port reports INET_STATE_LISTENING"
+    );
+    // The caller's descriptor is untouched by all of that.
+    assert_still_open_and_bound(fd, bound, "after a successful adoption");
+}
+
+/// `INET_REQ_FDOPEN`(13) on an **accepted connection** — the C's `INET_STATE_CONNECTED` branch.
+///
+/// The only difference from the bound case is the `sock_peer` probe: it succeeds, so
+/// `inet_ctl_fdopen` promotes the state to `INET_STATE_CONNECTED` (`:5247`-`:5260`), measured
+/// `[1,0,0,0,5]`, and `PEER` reports the real far end.
+#[test]
+fn fdopen_adopts_a_connected_stream_socket_as_connected() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let peer = std::net::TcpStream::connect(listener.local_addr().expect("an address"))
+        .expect("the far end connects");
+    let (server, peer_addr) = listener.accept().expect("the port's end is accepted");
+    let fd = server.as_raw_fd();
+    let bound = server.local_addr().expect("the accepted socket's address").port();
+
+    let mut port = tcp_bare_port();
+    assert_eq!(
+        port.control(&op(13), &bound_operand(INET_TYPE_STREAM, fd)),
+        ctl_ok(),
+        "INET_REQ_FDOPEN adopts the accepted connection"
+    );
+    assert_eq!(
+        port.control(&op(16), &[]),
+        getstatus_reply(super::InetState::Connected),
+        "a connected adoption is INET_STATE_CONNECTED"
+    );
+    assert_eq!(
+        port.control(&op(4), &[]),
+        loopback_endpoint(peer_addr.port()),
+        "PEER reports the real far end"
+    );
+    assert_eq!(
+        port.control(&op(5), &[]),
+        loopback_endpoint(bound),
+        "NAME reports the real local end"
+    );
+    drop(peer);
+    assert_still_open_and_bound(fd, bound, "after adopting a connection");
+}
+
+/// The **prebound invariant**: neither the driver's own `close` verb nor `Drop` may close a
+/// descriptor the caller handed over.
+///
+/// The C's `erl_inet_close` (`inet_drv.c:5102`-`:5117`) is explicit about it — for a prebound
+/// descriptor it only drops the select registration (`sock_select(..., 0)`), leaves `desc->s` and
+/// `desc->state` alone and issues no `close(2)`. This test drives the numeric `INET_REQ_CLOSE`(2)
+/// (the **name** `"close"` is reserved by [`crate::PortControl`] for teardown, so it never reaches
+/// the verb), then drops the whole registry — the driver's `Drop` — and checks the descriptor
+/// after each step.
+#[test]
+fn a_prebound_descriptor_is_never_closed_by_the_close_verb_or_by_drop() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let bound = listener.local_addr().expect("the listener's address").port();
+    let fd = listener.as_raw_fd();
+
+    {
+        let mut port = tcp_bare_port();
+        assert_eq!(
+            port.control(&op(13), &bound_operand(INET_TYPE_STREAM, fd)),
+            ctl_ok(),
+            "INET_REQ_FDOPEN adopts the caller's descriptor"
+        );
+        assert_eq!(
+            port.control(&op(2), &[]),
+            ctl_ok(),
+            "INET_REQ_CLOSE answers [1] for a prebound descriptor"
+        );
+        // The descriptor is the caller's, so it survived the close...
+        assert_still_open_and_bound(fd, bound, "after the close verb");
+        // ...and the port kept its state (`desc->state` is untouched by a prebound close), which is
+        // why `GETSTATUS` still reports the same code.
+        assert_eq!(
+            port.control(&op(16), &[]),
+            getstatus_reply(super::InetState::Open),
+            "a prebound close leaves the lifecycle state alone"
+        );
+    }
+    // Dropping the `Rig` drops the `PortRegistry`, the `Port` and finally the driver, whose `Drop`
+    // runs the same prebound-aware teardown.
+    assert_still_open_and_bound(fd, bound, "after the driver was dropped");
+
+    // The strongest form of the invariant: the caller's socket is still fully usable — the kernel
+    // completes a connection to it, which it could not do for a closed or unlistening descriptor.
+    let peer = std::net::TcpStream::connect(listener.local_addr().expect("an address"))
+        .expect("the caller's listener still accepts connections");
+    drop(peer);
+}
+
+/// A second `INET_REQ_FDOPEN` on a port that **already holds a socket** is refused, and the live
+/// socket is left untouched.
+///
+/// The C's arm assigns `desc->s = s` with no `desc_close(desc)` first (`:5267`), so a second
+/// adoption overwrites — and leaks — the first descriptor. Refusing loudly is the honest
+/// alternative: `[0]einval`, with the existing socket still answering for the port.
+#[test]
+fn fdopen_on_a_port_that_already_has_a_socket_is_refused() {
+    for case in cases() {
+        let mut port = opened(&case);
+        let before = port.control(&op(16), &[]);
+        let socket =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback datagram socket");
+
+        assert_eq!(
+            port.control(&op(13), &bound_operand(case.types[0], socket.as_raw_fd())),
+            ctl_xerror("einval"),
+            "{}: a port that already holds a socket refuses a second adoption",
+            case.name
+        );
+        // The live socket still answers for the port — its state did not move and it still reports
+        // its own cached type.
+        assert_eq!(
+            port.control(&op(16), &[]),
+            before,
+            "{}: the existing socket's state is untouched",
+            case.name
+        );
+        assert_eq!(
+            port.control(&op(15), &[]),
+            gettype_reply(case.types[0]),
+            "{}: the existing socket's cached type is untouched",
+            case.name
+        );
+    }
+}
+
+/// `INET_REQ_FDOPEN`(13) on a `udp_inet` port: the adopted datagram descriptor is wired into the
+/// data path, so the driver's own `send`/`recv` verbs move real datagrams across it.
+///
+/// This is what separates a real adoption from a fabricated `[1]`: the port's socket **is** the
+/// caller's descriptor, so a datagram the driver sends arrives at the far end coming from the
+/// caller's bound port, and one the far end sends back is read by the driver's `recv` verb
+/// (payload into the port input queue, source address in the reply).
+#[test]
+fn fdopen_adopts_a_datagram_socket_that_carries_real_data() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback datagram socket");
+    let local = socket.local_addr().expect("the adopted socket's address");
+    let far = std::net::UdpSocket::bind("127.0.0.1:0").expect("a second loopback datagram socket");
+    let far_addr = far.local_addr().expect("the far address");
+    let fd = socket.as_raw_fd();
+
+    let mut port = udp_bare_port();
+    // The ten-byte form with an explicit `bound` word of 1: the same `sock_name(2)`/family ladder
+    // as the six-byte form.
+    assert_eq!(
+        port.control(&op(13), &fdopen_bound_operand(INET_TYPE_DGRAM, fd, 1)),
+        ctl_ok(),
+        "udp_inet INET_REQ_FDOPEN adopts the caller's descriptor"
+    );
+    assert_eq!(
+        port.control(&op(15), &[]),
+        gettype_reply(INET_TYPE_DGRAM),
+        "the adopted descriptor's cached type is the datagram one"
+    );
+    // The C probes `sock_peer` only for a `SOCK_STREAM` adoption (`:5252`), so a datagram socket is
+    // always `INET_STATE_OPEN` here — never `Connected`, even though a datagram socket may have a
+    // default peer.
+    assert_eq!(
+        port.control(&op(16), &[]),
+        getstatus_reply(super::InetState::Open),
+        "a datagram adoption is Open"
+    );
+    // `NAME` asks the kernel through the adopted descriptor.
+    assert_eq!(
+        port.control(&op(5), &[]),
+        loopback_endpoint(local.port()),
+        "the adopted datagram socket's real local endpoint"
+    );
+
+    // The send path: the `send` verb's `[packed address][payload]` grammar, through the adopted
+    // descriptor.
+    let mut datagram = vec![INET_AF_INET];
+    datagram.extend_from_slice(&far_addr.port().to_be_bytes());
+    datagram.extend_from_slice(&[127, 0, 0, 1]);
+    datagram.extend_from_slice(b"hello");
+    assert_eq!(
+        port.control("send", &datagram),
+        ctl_ok(),
+        "the send verb writes through the adopted descriptor"
+    );
+    let mut buf = [0u8; 32];
+    let (len, from) = far.recv_from(&mut buf).expect("the far end receives it");
+    assert_eq!(&buf[..len], b"hello", "the payload crossed the adopted descriptor");
+    assert_eq!(
+        from.port(),
+        local.port(),
+        "it came from the caller's own bound port"
+    );
+
+    // The receive path: the `recv` verb reads through the adopted descriptor, reports the source
+    // and hands the payload to the port's input queue.
+    far.send_to(b"world", local).expect("the far end sends back");
+    let reply = port.control("recv", &[]);
+    assert_eq!(
+        reply.len(),
+        8,
+        "a received datagram answers [1] ++ its 8-byte source address: {reply:?}"
+    );
+    assert_eq!(reply[0], INET_REP_OK, "the result tag: {reply:?}");
+    assert_eq!(reply[1], INET_AF_INET, "the source family tag: {reply:?}");
+    assert_eq!(
+        u16::from_be_bytes([reply[2], reply[3]]),
+        far_addr.port(),
+        "the source port: {reply:?}"
+    );
+    assert_eq!(&reply[4..8], &[127, 0, 0, 1], "the source octets: {reply:?}");
+    assert_eq!(
+        port.take_input(5),
+        b"world",
+        "the datagram's payload rides the port input queue"
+    );
+
+    // The refused type byte keeps its exact refusal on a **socket-less** port (the ladder runs
+    // before the adoption, so nothing was ever adopted here).
+    let mut bare = udp_bare_port();
+    assert_eq!(
+        bare.control(&op(13), &bound_operand(3, fd)),
+        ctl_xerror("einval"),
+        "a type tag the datagram switch does not admit"
+    );
 }
