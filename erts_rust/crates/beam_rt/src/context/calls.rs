@@ -1193,11 +1193,48 @@ impl<'a> RuntimeContext<'a> {
         };
         // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
         // and moves no live term, so the copy can simply be re-attempted from the fresh space's
-        // base — `needed` is the copier's exact flat word count, so the retry fits. The floor of
-        // 256 keeps a small result from landing exactly on the new space's edge.
+        // base.
+        //
+        // The request carries **headroom**, never the copier's bare shortfall. Growing by
+        // `needed` alone leaves the fresh destination barely larger than the graph that forced
+        // it, so the next result of the same size refuses again and pays the whole sizing path of
+        // a refused copy (`try_copy_fast` → `preflight_words` → the bounded sizing walk →
+        // `size_object_with`) for one more table step. Asking for
+        // `needed * GROW_HEADROOM_FACTOR` instead (floored at `GROW_MIN_WORDS`) makes **one**
+        // growth serve many copies: 1024 words is already past the growth table's 987→1598 step
+        // ([`HeapPolicy::next_words`](beam_gc::HeapPolicy::next_words) over the C `heap_sizes[]`,
+        // `erl_gc.c:262-291`), so the installed young space is ≥1598 words — one step up and with
+        // room to spare for the next ~20 results of the `copy_bound` shape.
+        //
+        // That is the discipline the C runtime applies to its own heaps: a collection never
+        // installs `size_before` but `next_heap_size(p, size_before, 0)`, i.e. **the next table
+        // size at or above the requirement**, and when that would not actually grow the heap it
+        // steps one entry further (`next_heap_size(p, HEAP_SIZE(p), 1)`,
+        // `erts/emulator/beam/erl_gc.c:1879-1888`). `Nursery::grow` rounds the request the same
+        // way and, when the one-step size would not enlarge the current space, at least doubles
+        // it — so a growth request is never "the shortfall, exactly".
+        //
+        // `Nursery::grow` may satisfy the whole request for free by re-adopting an already
+        // retired space nothing was ever allocated in (`empty_retired_for`), and the spaces it
+        // does retire are only reclaimed by a later **collection** (`Nursery::collapse`): the
+        // headroom is a capacity request, not an allocation, and it adds no per-call work.
         #[cfg(test)]
         notes::note_grow();
-        process.grow_nursery(needed.max(256)).ok()?;
+        let request = needed
+            .saturating_mul(GROW_HEADROOM_FACTOR)
+            .max(GROW_MIN_WORDS);
+        if process.grow_nursery(request).is_err() {
+            // A configured `max_heap_size` (`+hmax`, `spawn_opt`'s `{max_heap_size,…}`) bounds
+            // the nursery chain's **summed** capacity, and `Nursery::grow` refuses a request its
+            // remaining budget cannot reach (`crates/beam_gc/src/nursery.rs:339-345`). The
+            // headroom request could therefore be refused where the bare shortfall still fits, so
+            // fall back to exactly that — the smallest growth the copier provably needs — rather
+            // than turning a growth that was reachable into a hard failure. A refusal retires
+            // nothing, so the retry starts from the identical nursery.
+            #[cfg(test)]
+            notes::note_grow();
+            process.grow_nursery(needed.max(256)).ok()?;
+        }
         copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term).ok()
     }
 
@@ -1578,6 +1615,23 @@ impl Walklist {
         Some(self.inline[self.len])
     }
 }
+
+/// The multiple of a refused copy's own shortfall that [`RuntimeContext::move_result_into_process_heap`]
+/// asks the nursery to grow by.
+///
+/// A refusal is expensive (a second sizing traversal) while a growth is not, so the request is
+/// deliberately several times the graph that forced it. See the growth block in
+/// [`RuntimeContext::move_result_into_process_heap`] for the measurement and the C rule it matches.
+const GROW_HEADROOM_FACTOR: usize = 4;
+
+/// The floor, in term words, of a copy-out's growth request.
+///
+/// 1024 is the smallest request whose [`HeapPolicy::next_words`](beam_gc::HeapPolicy::next_words)
+/// target clears the growth table's `987` entry, so the installed young space is always ≥1598
+/// words — the size a `copy_bound`-shaped result (≈73 words) fits about twenty times over, one
+/// table step above the `376` a bare-shortfall growth installs from the default 233-word nursery
+/// (`erl_gc.c:262-291`).
+const GROW_MIN_WORDS: usize = 1024;
 
 /// The flat word count a refused copy reported it could not fit.
 ///
