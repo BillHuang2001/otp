@@ -926,6 +926,9 @@ fn erl_stdout(expr: &str) -> Option<String> {
     }
 }
 /// Parses the oracle's `a,b,c|d,e|…` reply dump into one byte vector per reply.
+///
+/// The `|` delimiter cannot collide with a reply: every expression above re-encodes its replies as
+/// decimal-ASCII byte texts (`S/1`), so a literal `0x7C` never reaches the dump.
 fn parse_reply_dump(stdout: &str) -> Option<Vec<Vec<u8>>> {
     let line = stdout.lines().find(|line| line.contains('|'))?;
     let mut replies = Vec::new();

@@ -82,8 +82,8 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **231
-passing / 0 failing**; the whole `-p beam_io` run is **1019** (785 lib + 231 integration + 3
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **232
+passing / 0 failing**; the whole `-p beam_io` run is **1032** (797 lib + 232 integration + 3
 doctests, 2 doctests `ignore`d). Per file:
 
 | Suite | Tests | Suite | Tests |
@@ -99,7 +99,7 @@ doctests, 2 doctests `ignore`d). Per file:
 | `abi_busy.rs` | 2 | `inet.rs` | 8 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
 | `abi_failure.rs` | 8 | `active_mode.rs` | 9 |
-| `port_task.rs` | 5 | `udp_inet.rs` | 5 |
+| `port_task.rs` | 5 | `udp_inet.rs` | 6 |
 | | | `port.rs` | 4 |
 
 `active_mode.rs` (9) is the **`{active, …}` input channel** through a real `PortRegistry` port and a
@@ -133,7 +133,7 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   `an_accept_completion_hands_over_a_descriptor_the_runtime_can_adopt` (the descriptor hand-off;
   `INET_REQ_FDOPEN` adoption is a crate-local route to the same state the C reaches internally) and
   `port_notifications_stay_exactly_two_variants` (the compile-time two-arm match).
-- **`udp_inet.rs` (5)** — `the_code_60_recv_is_an_async_request_completed_by_a_later_round` is the
+- **`udp_inet.rs` (6)** — `the_code_60_recv_is_an_async_request_completed_by_a_later_round` is the
   datagram half, byte-compared against a real raw `udp_inet` port on every run-specific-independent
   row: the `[1,0,0]` id reply with nothing staged, `[0]ealready` for a second concurrent receive
   (which still consumes an id, so the next request is `[1,0,2]`), `[0]exbadport` socket-less,
@@ -142,7 +142,14 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   address prefix is shape-compared, each side checking its own sender's port), and `{error, closed}`
   exactly once for a receive pending at close. The file's other oracle case
   (`the_covered_control_replies_agree_with_the_erl_oracle`) is the open/bind/setopts/getopts/close
-  gate.
+  gate. `an_explicit_bind_port_whose_low_byte_is_the_old_delimiter_agrees_byte_exactly` is the
+  **dump-framing** row: both sides bind the **same** explicit port, low byte `0x7C` (`|`), so the
+  `bind` reply `[1, hi, 0x7C]` is compared byte-exactly; the candidate-port loop retries
+  allocation only.
+  **Framing rule for every oracle dump in `tests/`:** a raw-byte dump is **length-framed**
+  (`<<(byte_size(X)):32/big, X/binary>>` + `parse_reply_dump`, as here and in
+  `src/drivers/inet/oracle_dump.rs`) or its replies are re-encoded as ASCII decimal/hex text first —
+  never raw bytes split on a delimiter (any byte, `0x7C` included, is legitimate payload).
 
 **`abi_failure.rs` (8)** is the one suite that pins the **`driver_output*` shapes and the
 driver-failure channel** over the scripted-opcode fixture (`output_shape_driver.c`) rather than
@@ -211,7 +218,8 @@ rot.
   `erl`-oracle cross-check over the reply bytes that skips loudly without `erl`. `udp_inet` also
   pins the **`PACKET_REQ_RECV`(60) asynchronous** receive (id reply, `ealready`/`exbadport`/`einval`
   ladder, the `Data` completion with the packed source address as the read's header, the
-  `{error, closed}` teardown) against the real datagram driver
+  `{error, closed}` teardown) against the real datagram driver, and the **length-framed dump** with
+  an explicit low-byte-`0x7C` bind compared byte-exactly
 - `active_mode.rs` → the **`{active, …}` input channel** (`ActiveInput`/`ActiveInputEvent`) at the
   reactor + registry level, armed through `setopts` and fed by an external `std::net` peer:
   `{active,true}`/`{active,once}`/`{active,2}` on `udp_inet` (packed source-address header, the one
