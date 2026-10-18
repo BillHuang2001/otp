@@ -671,6 +671,8 @@ fn a_udp_inet_control_reply_is_an_int_list_on_either_stream() {
 // ---------------------------------------------------------------------------------------
 // The split **end to end**: a real port-task round carries `driver_output2`'s two halves
 // ---------------------------------------------------------------------------------------
+use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -806,6 +808,9 @@ fn split_meta(stream: StreamType, line: Option<usize>, owner: ProcessId) -> Port
         driver_monitors: None,
         input: Cell::new(0),
         output: Cell::new(0),
+        exit_status_taken: Cell::new(false),
+        held_lines: VecDeque::new(),
+        held_since: Cell::new(None),
     }
 }
 

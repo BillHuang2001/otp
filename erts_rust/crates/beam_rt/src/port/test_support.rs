@@ -39,6 +39,7 @@
 //! [`PortRegistry::close`] like any other.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
@@ -248,6 +249,9 @@ fn register_driver_port(
         driver_monitors,
         input: Cell::new(0),
         output: Cell::new(0),
+        exit_status_taken: Cell::new(false),
+        held_lines: VecDeque::new(),
+        held_since: Cell::new(None),
     };
     let mut registry = runtime
         .ports

@@ -163,7 +163,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell, RefMut};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -219,6 +219,24 @@ const PORT_HEAP_WORDS: usize = 4_096;
 /// driver-declared timer fires at its deadline rather than up to a slice late.
 pub(crate) const PORT_POLL_SLICE: Duration = Duration::from_millis(25);
 
+/// How long a child port's **line frames** may be held back while the port still owes its
+/// `{Port, {exit_status, Status}}` (see [`PortRegistry::hold_or_report_line`]).
+///
+/// The C does not flush a child's trailing partial line while the child is still alive and an
+/// exit status is still owed: `port_inp_failure` sees `dd->alive == 1` at the end of the
+/// stream and returns **before** `driver_failure_eof`, and the flush happens later from the
+/// `ready_input` call the child's exit triggers
+/// (`erts/emulator/sys/unix/sys_drivers.c:1232-1252`), i.e. after `driver_report_exit`. That
+/// deferral is what makes the status the first of the two messages.
+///
+/// It is unbounded in the C because the C is guaranteed to end it: a port whose input stream
+/// ends is terminated (`driver_failure_eof` → `erts_deliver_port_exit`), which stops the child
+/// and so always produces the status. This runtime keeps a child's port open until an explicit
+/// close, so a child that closes its own stdout and keeps running would strand its trailing
+/// frame — hence the bound: a frame held this long is delivered anyway (and the status, if it
+/// ever comes, after it). Every real child reaps within one [`PORT_POLL_SLICE`], so the bound
+/// is only reachable by a child that never exits.
+pub(crate) const EXIT_STATUS_FLUSH_GRACE: Duration = Duration::from_secs(1);
 /// The atom vocabulary `port_info/1,2` can emit.
 ///
 /// [`PortRegistry::info`] resolves each of these through the runtime's **one shared**
@@ -605,8 +623,27 @@ struct PortMeta {
     /// node-global [`IoCounters::output`], so it counts what `port_command/2,3` handed the port
     /// exactly as the oracle's own `output` item does.
     output: Cell<u64>,
+    /// Whether the child's `{Port, {exit_status, Status}}` has already been reported.
+    ///
+    /// [`beam_io::PortRegistry::take_exit_status`] hands a status out **once** and answers
+    /// `Ok(None)` forever after, so "does this port still owe a status" cannot be asked of
+    /// `beam_io`: it needs this latch. It is what
+    /// [`PortMeta::owes_exit_status`] reads, and it is set at the one place a status is taken
+    /// ([`PortRegistry::take_due_exit_statuses`]).
+    exit_status_taken: Cell<bool>,
+    /// The **line frames held back** because this port still owed its `exit_status` when they
+    /// were harvested, in arrival order — the deliverable half of the C's `dd->alive == 1`
+    /// deferral (`erts/emulator/sys/unix/sys_drivers.c:1232-1240`; see
+    /// [`EXIT_STATUS_FLUSH_GRACE`] and [`PortMeta::owes_exit_status`]).
+    ///
+    /// [`PortRegistry::release_held_lines`] empties it — after the status has been reported, or
+    /// once the frame has been held for the whole grace — into the round's events, so a held
+    /// frame is delivered exactly once and the port's own frame order (arrival order) is kept.
+    held_lines: VecDeque<PortEvent>,
+    /// When the **first** frame currently in [`PortMeta::held_lines`] was held back — the grace's
+    /// clock, cleared when the frames are released.
+    held_since: Cell<Option<Instant>>,
 }
-
 impl PortMeta {
     /// Whether this port's driver declares a **`control` callback** — the C's
     /// `prt->drv_ptr->control != NULL` test (`../../erts/emulator/beam/io.c:4035`), which is what
@@ -628,8 +665,21 @@ impl PortMeta {
             PortName::Spawn | PortName::SpawnExecutable | PortName::Fd => false,
         }
     }
-}
-/// A message a live port has produced: the child's stream bytes, or its reaped exit status.
+
+    /// Whether the owner is still **owed** this port's `{Port, {exit_status, Status}}`.
+    ///
+    /// This is the C's `dd->alive == 1` state — `exit_status` requested, a child that exists, and
+    /// no status reported yet (`erts/emulator/sys/unix/sys_drivers.c:371` sets `alive` from the
+    /// option, `:744` clears it when the child is reaped). It gates two things that must agree:
+    /// the deferral of this port's line frames ([`PortMeta::held_lines`]) and, through it, the
+    /// order in which the two messages of one child are delivered.
+    ///
+    /// A port with **no child** (a driver port, an `{fd, N}` port) never owes a status, so its
+    /// frames are never held: `os_pid` is the truthful "this port owns an OS child" fact.
+    fn owes_exit_status(&self) -> bool {
+        self.notify_exit && self.os_pid.is_some() && !self.exit_status_taken.get()
+    }
+}/// A message a live port has produced: the child's stream bytes, or its reaped exit status.
 ///
 /// This is [`PortRegistry::pump`]'s report, and the seam between the port poller and the
 /// two things that turn it into an Erlang term: the scheduler path
@@ -1660,10 +1710,20 @@ impl PortRegistry {
             // `flush_linebuf_messages`, `erts/emulator/sys/unix/sys_drivers.c:1250-1252`), both
             // from the one `ready_input` call the child's exit triggers. Taking the status before
             // the flush is what keeps the two messages of one round in that order instead of
-            // appending the status after the frames this very round just flushed — the two
-            // orderings a naive round would race between, depending on whether the child happened
-            // to be reaped before the poll or during it.
+            // appending the status after the frames this very round just flushed.
+            //
+            // The mid-round check alone is **not** enough: the kernel can surface the child's
+            // read-EOF and make it reapable in either order (the pipe's write end closes earlier
+            // in `do_exit` than the zombie transition that `waitpid` reports), so a round can
+            // observe the end of the stream while the status is still `None`. That is why the
+            // frames a round harvests are **held** while their port still owes an `exit_status`
+            // (see [`PortRegistry::hold_or_report_line`]): the status is then the first of the
+            // two messages whether the two observations land in this round or in adjacent ones.
             events.extend(self.take_due_exit_statuses()?);
+            // A port that stopped owing its status since the last round (either check) releases
+            // its held frames here — before this round's own frames, so a port's frames stay in
+            // arrival order.
+            self.release_held_lines(&mut events);
             // The end-of-stream flush releases a trailing partial line as a `noeol` frame (the
             // C's `driver_eof` → `flush_linebuf_messages`).
             self.flush_line_stream_ends()?;
@@ -1684,20 +1744,24 @@ impl PortRegistry {
                     // ...and for this port's own `port_info(Port, input)`.
                     meta.input
                         .set(meta.input.get().saturating_add(frame.bytes.len() as u64));
-                    events.push(PortEvent::Line {
+                    let event = PortEvent::Line {
                         port: frame.port,
                         header: frame.header,
                         bytes: frame.bytes,
                         eol: frame.eol,
                         stream: meta.stream,
                         owner: meta.owner,
-                    });
+                    };
+                    self.hold_or_report_line(frame.port.number(), event, &mut events);
                 }
             }
             self.fold_notifications(outcome.notifications, &mut events)?;
             events.extend(self.take_driver_outputs());
             events.extend(self.take_driver_terms());
             events.extend(self.take_due_exit_statuses()?);
+            // A status taken by that last check releases the frames this very round harvested
+            // and held: the status still comes first, in this same round.
+            self.release_held_lines(&mut events);
             if !events.is_empty() || Instant::now() >= deadline {
                 return Ok(events);
             }
@@ -2058,7 +2122,9 @@ impl PortRegistry {
     ///
     /// Only a port opened with the `exit_status` option is consulted, and
     /// [`beam_io::PortRegistry::take_exit_status`] hands each status out exactly once, so a
-    /// second round cannot report the same exit twice.
+    /// second round cannot report the same exit twice. Taking one is what settles
+    /// [`PortMeta::owes_exit_status`] — the fact the round's frame deferral reads — so the latch
+    /// is set here, at the **only** place a status is taken.
     ///
     /// # Errors
     ///
@@ -2075,6 +2141,7 @@ impl PortRegistry {
             let port = PortId::new(number);
             if let Some(status) = self.registry.take_exit_status(port)? {
                 if let Some(meta) = self.meta.get(&number) {
+                    meta.exit_status_taken.set(true);
                     events.push(PortEvent::Exited {
                         port,
                         status,
@@ -2086,6 +2153,72 @@ impl PortRegistry {
         Ok(events)
     }
 
+    /// Records one harvested **line frame**: delivered now, or held back while its port still
+    /// owes an `exit_status` (the C's `dd->alive == 1` deferral, [`PortMeta::held_lines`]).
+    ///
+    /// The C's `port_inp_failure` does not release a child's trailing partial line while the
+    /// child is still alive and its status is still owed: it returns **before**
+    /// `driver_failure_eof` and flushes only on the later `ready_input` the child's exit
+    /// triggers, so the status is the first of the two messages
+    /// (`erts/emulator/sys/unix/sys_drivers.c:1230-1252`). Holding the frame is this runtime's
+    /// equivalent, and it is what makes the order independent of whether the poller surfaced
+    /// the child's read-EOF and its reap in the same round or in adjacent ones.
+    ///
+    /// Holding is bounded by [`EXIT_STATUS_FLUSH_GRACE`], so a child that closes its own stdout
+    /// and never exits cannot strand its trailing frame.
+    fn hold_or_report_line(&mut self, number: u64, frame: PortEvent, events: &mut Vec<PortEvent>) {
+        let Some(meta) = self.meta.get_mut(&number) else {
+            // The port's metadata is gone (it was closed while the frame was queued): the frame
+            // has no recipient and is dropped, the rule every other arm follows.
+            return;
+        };
+        if !meta.owes_exit_status() {
+            events.push(frame);
+            return;
+        }
+        if meta.held_since.get().is_none() {
+            meta.held_since.set(Some(Instant::now()));
+        }
+        meta.held_lines.push_back(frame);
+    }
+
+    /// Moves every held line frame that may now be delivered into `events`, in arrival order.
+    ///
+    /// A frame becomes deliverable when its port **no longer owes** its `exit_status` (the status
+    /// has been reported, so the round's frame drain may proceed — the C's later `ready_input`
+    /// flush) or when it has been held for the whole [`EXIT_STATUS_FLUSH_GRACE`] (a child that
+    /// closed its stdout and never exited, which the oracle's own driver cannot produce because
+    /// it terminates the port at end-of-stream). Both halves keep the port's own frame order:
+    /// `held_lines` is a FIFO and is drained whole.
+    ///
+    /// The ports are visited in **port-number order** so that a round holding frames for several
+    /// children releases them deterministically.
+    fn release_held_lines(&mut self, events: &mut Vec<PortEvent>) {
+        let mut numbers: Vec<u64> = self
+            .meta
+            .iter()
+            .filter(|(_, meta)| !meta.held_lines.is_empty())
+            .map(|(number, _)| *number)
+            .collect();
+        if numbers.is_empty() {
+            return;
+        }
+        numbers.sort_unstable();
+        for number in numbers {
+            let Some(meta) = self.meta.get_mut(&number) else {
+                continue;
+            };
+            let expired = meta
+                .held_since
+                .get()
+                .is_some_and(|since| since.elapsed() >= EXIT_STATUS_FLUSH_GRACE);
+            if meta.owes_exit_status() && !expired {
+                continue;
+            }
+            events.extend(meta.held_lines.drain(..));
+            meta.held_since.set(None);
+        }
+    }
     /// The `{notify, Signal}` notifications of the **handled** signals caught since the last
     /// drain — the delivery half of `os:set_signal/2` (contract A.8).
     ///
@@ -2848,6 +2981,11 @@ impl PortHook for RuntimePorts {
                     driver_monitors: None,
                     input: Cell::new(0),
                     output: Cell::new(0),
+                    // Nothing to reap, so nothing is ever owed — see
+                    // [`PortMeta::owes_exit_status`].
+                    exit_status_taken: Cell::new(true),
+                    held_lines: VecDeque::new(),
+                    held_since: Cell::new(None),
                 };
                 return registry.register(driver, meta);
             }
@@ -2933,6 +3071,11 @@ impl PortHook for RuntimePorts {
                 driver_monitors: Some(driver_monitors),
                 input: Cell::new(0),
                 output: Cell::new(0),
+                // Nothing to reap, so nothing is ever owed — see
+                // [`PortMeta::owes_exit_status`].
+                exit_status_taken: Cell::new(true),
+                held_lines: VecDeque::new(),
+                held_since: Cell::new(None),
             };
             return registry.register(Box::new(adapter), meta);
         }
@@ -2973,6 +3116,12 @@ impl PortHook for RuntimePorts {
             driver_monitors: None,
             input: Cell::new(0),
             output: Cell::new(0),
+            // A child port owes its status from the start and stops owing it when the status is
+            // taken — even a port opened **without** `exit_status`, whose `notify_exit` is what
+            // makes the debt exist in the first place (see [`PortMeta::owes_exit_status`]).
+            exit_status_taken: Cell::new(false),
+            held_lines: VecDeque::new(),
+            held_since: Cell::new(None),
         };
         // The registry stays borrowed across `register`: starting a port cannot re-enter a
         // port operation, and a nested borrow is a typed error rather than a panic.
