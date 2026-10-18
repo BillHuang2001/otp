@@ -78,7 +78,10 @@
 //! # Skip policy
 //!
 //! No `erl` on `$PATH`, no `cc`, or no `erl_driver.h` is a **loud** skip per test, never a
-//! silent pass.
+//! silent pass. A missing **committed** probe image is *not* a toolchain absence though: it is
+//! a repository defect, so it **fails** ([`require_probe_beam`], pinned by
+//! [`the_probe_image_is_committed`]) instead of letting all nine rows skip without a single
+//! oracle comparison.
 #![deny(unsafe_code)]
 mod support;
 use std::path::{Path, PathBuf};
@@ -181,8 +184,37 @@ impl Fixture {
         self.dir.to_str().expect("a UTF-8 scratch path")
     }
 }
+/// Fails the calling test unless the **committed** probe image is present and non-empty.
+///
+/// A missing committed fixture is a **repository defect**, not a toolchain absence, so it must
+/// never take the loud-skip arm: a suite that skipped on it would report green while no oracle
+/// comparison ran at all. This is the convention the sibling suites already follow
+/// (`mailbox_rescan.rs`'s `Scratch::new`, `bif_entry_spawn.rs`'s staging and
+/// `live_inbound.rs`'s `the_fixture_beam_is_present` all panic on a missing image), and the
+/// reminder in the message is the regeneration recipe `tests/fixtures/README.md` documents.
+fn require_probe_beam() {
+    match std::fs::metadata(PROBE_BEAM) {
+        Ok(meta) if meta.len() > 0 => {}
+        Ok(_) => panic!(
+            "the committed fixture {PROBE_BEAM} is empty — regenerate it from port_failure.erl \
+             (tests/fixtures/README.md: `erlc +deterministic port_failure.erl` in a $TMPDIR \
+             scratch dir) and `git add -f` it"
+        ),
+        Err(error) => panic!(
+            "the committed fixture {PROBE_BEAM} is missing ({error}) — regenerate it from \
+             port_failure.erl (tests/fixtures/README.md: `erlc +deterministic port_failure.erl` \
+             in a $TMPDIR scratch dir) and `git add -f` it; without it every port_failure row \
+             would skip instead of comparing against the oracle"
+        ),
+    }
+}
 /// Compiles the driver and stages the probe, or `None` after a **loud** skip.
+///
+/// The probe image itself is a prerequisite, not a toolchain question: [`require_probe_beam`]
+/// fails when it is absent, so every skip arm below means "this host has no `erl`/`cc`/
+/// `erl_driver.h`" and nothing else.
 fn fixture(label: &str) -> Option<Fixture> {
+    require_probe_beam();
     let Some(include) = erl_include_dir() else {
         support::skip_loudly(
             "port_failure",
@@ -212,11 +244,10 @@ fn fixture(label: &str) -> Option<Fixture> {
         return None;
     }
     if let Err(error) = std::fs::copy(PROBE_BEAM, dir.join("port_failure.beam")) {
-        support::skip_loudly(
-            "port_failure",
-            &format!("port_failure/{label}: cannot stage the probe: {error}"),
+        panic!(
+            "cannot stage the committed fixture {PROBE_BEAM} into {}: {error}",
+            dir.display()
         );
-        return None;
     }
     let output = Command::new(cc())
         .arg("-shared")
@@ -337,6 +368,21 @@ fn agrees_on_the_run_route(fixture: &Fixture, oracle: &Path, function: &str, op:
         ours, expected,
         "the run route must print what the oracle prints for {spec} (op {op})"
     );
+}
+// ---------------------------------------------------------------------------------------
+// The committed probe image
+// ---------------------------------------------------------------------------------------
+/// The probe image is a **committed** artifact — `tests/fixtures/port_failure.beam`, the
+/// `+deterministic` compilation of `port_failure.erl` (2 656 bytes, recipe in
+/// `tests/fixtures/README.md`), force-added because the repo-root `.gitignore` drops `*.beam`.
+///
+/// It is pinned as its own test because a missing image must fail **whatever** the
+/// environment: otherwise all nine rows below take the "cannot stage the probe" arm and report
+/// green without a single oracle comparison — the exact defect this pin exists to prevent. A
+/// missing *toolchain* still skips loudly; only the repository defect fails here.
+#[test]
+fn the_probe_image_is_committed() {
+    require_probe_beam();
 }
 // ---------------------------------------------------------------------------------------
 // Row 1 — the ordering residual: the read arrives BEFORE the exit signal

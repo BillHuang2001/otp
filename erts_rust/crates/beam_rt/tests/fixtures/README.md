@@ -712,7 +712,7 @@ port raises the typed capability gap (exit 3) rather than fabricating a `true`.
 The suite needs the C compiler, the host `erl_driver.h`, `erlc` and the oracle `erl`. A missing one
 prints a loud `SKIP` banner and returns — it is never a silent pass.
 
-## Driver-failure fixtures (`port_failure_driver.c` / `port_failure.erl` — the `.so` compiled at test time)
+## Driver-failure fixtures (`port_failure_driver.c` + `port_failure.erl` → committed `port_failure.beam`; the `.so` compiled at test time)
 
 The pair behind `tests/port_failure.rs` (contract A.4's `driver_failure*`/`driver_exit` family): a
 driver that closes its **own** port from inside its `output` callback, and the consumer that reports
@@ -768,28 +768,45 @@ symbol from the loading process's dynamic symbol table — no driver may referen
 
 ### The artifacts
 
-The driver is compiled at **test time** into a per-test scratch directory, and the probe image is
-staged beside it — that one directory is both the runtime's `-pa` and the path `erl_ddll:try_load/3`
-searches:
+Two artifacts, with two different lifetimes: the driver **`.so`** is compiled at test time, the
+probe **`.beam`** is committed. `tests/port_failure.rs` stages both into one per-test scratch
+directory — that directory is both the runtime's `-pa` and the path `erl_ddll:try_load/3` searches
+— by copying the committed image in and running `$CC` beside it.
+
+**Committed: `port_failure.beam` (2 656 bytes)** — `port_failure.erl` compiled with
+`+deterministic`, so the image is path-free and byte-stable (md5
+`1044dd92b5f9472f169213ba0eab206e`; regenerating in two different scratch directories yields the
+identical file). Compile it in a neutral `$TMPDIR` scratch dir, like every other committed fixture:
 
 ```sh
-D="$TMPDIR/beam_rt_port_failure"
-ERL=$(readlink -f "$(command -v erl)"); INC="$(dirname "$(dirname "$ERL")")/include"
-cc -shared -fPIC -I"$INC" -o "$D/port_failure_driver.so" port_failure_driver.c
-( cd "$D" && erlc +deterministic port_failure.erl )     # → $D/port_failure.beam (2 656 bytes)
+SCRATCH="$TMPDIR/beam_rt_port_failure_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp port_failure.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic port_failure.erl )
+cp "$SCRATCH/gen/port_failure.beam" port_failure.beam    # 2 656 bytes
+git add -f port_failure.beam
 ```
 
-`port_failure.beam` is the probe image: `port_failure.erl` compiled with `+deterministic` (the
-recipe above, so it stays path-free) and force-added like every other fixture, because the repo-root
-`.gitignore` drops `*.beam`. `tests/port_failure.rs` stages that image — it copies
-`tests/fixtures/port_failure.beam` into the scratch directory — while the C side is compiled with
-`$CC` (or `cc`) against the host `erl_driver.h`, whose directory is resolved from the
+The repo-root `.gitignore` drops `*.beam` globally, so the image must be **force-added** like the
+other committed fixtures. It is a **prerequisite of the suite, not a toolchain question**: its
+absence is a repository defect and fails (`require_probe_beam` / the dedicated
+`the_probe_image_is_committed` test), never a skip — otherwise all nine rows would report green
+without one oracle comparison.
+
+**Compiled at test time: `port_failure_driver.so`** — the C side, built with `$CC` (or `cc`)
+against the host `erl_driver.h`, whose directory is resolved from the
 **canonicalized `erl` sibling** (`…/erts-<vsn>/include`, i.e. `erts-<vsn>` is the grandparent of the
 real `erl` binary), then `$ERL_TOP`, then the standard install roots (`/usr/lib/erlang`,
 `/usr/local/lib/erlang`, `/usr/lib64/erlang`, `/opt/erlang`) — each tried directly as
 `<root>/include` and `<root>/lib/erlang/include`, and then as the first `erts-*/include` naming the
 header. The suite does not consult `code:lib_dir(erts,include)`, which names a path that does
-**not** exist in the Nix store layout.
+**not** exist in the Nix store layout. The equivalent hand-built recipe:
+
+```sh
+D="$TMPDIR/beam_rt_port_failure"
+ERL=$(readlink -f "$(command -v erl)"); INC="$(dirname "$(dirname "$ERL")")/include"
+cc -shared -fPIC -I"$INC" -o "$D/port_failure_driver.so" port_failure_driver.c
+```
 
 ### Oracle values (`erl -noshell`, erts-17.1 / OTP 29.1.1)
 
@@ -867,5 +884,10 @@ argument (a charlist), the driver name as a bare atom and the row as an integer
 ### Skip-loudly rule
 
 Each test skips **loudly** (a `beam_rt port_failure SKIPPED` banner and a return, never a silent
-pass) when the oracle `erl` is absent, when no `erl_driver.h` include directory is found, when the C
-compiler is missing or fails, or when the probe image cannot be staged.
+pass) when the oracle `erl` is absent, when no `erl_driver.h` include directory is found, or when
+the C compiler is missing or fails — a **toolchain** absence, which the host may legitimately have.
+
+A missing **committed** probe image is not a skip: `tests/fixtures/port_failure.beam` is a
+repository artifact, so `require_probe_beam` panics with the regeneration recipe (and
+`the_probe_image_is_committed` fails alongside it), because skipping there would report nine green
+rows that compared nothing.

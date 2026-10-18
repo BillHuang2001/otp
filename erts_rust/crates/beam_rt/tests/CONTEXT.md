@@ -6,7 +6,7 @@ Two drivers are used throughout, and they are NOT interchangeable:
 * `Runtime::eval` / the CLI `-eval` action (`beam_rt -noshell -eval '<expr>'`) — the **single-pass** evaluator route; no scheduler slice.
 * the CLI `run <file.beam> <mod>:<fun>/<arity> [args]` action (`Runtime::run_scheduled`) — a **scheduled process** on the real scheduler/poller/runner; also `runtime.run_function`/`run_module` (single-pass, `context.run_export`, caller-owned output sink).
 
-Most suites run **both** runtimes (this one and the system `erl`/`erlc` oracle) and compare observable output; the oracle is the expected value. A missing toolchain is always a **loud skip**, never a silent pass (`support/mod.rs`).
+Most suites run **both** runtimes (this one and the system `erl`/`erlc` oracle) and compare observable output; the oracle is the expected value. A missing toolchain is always a **loud skip**, never a silent pass (`support/mod.rs`). A missing **committed fixture** is the other class — a repository defect, not a toolchain absence — and **fails** (`mailbox_rescan.rs`'s `Scratch::new`, `bif_entry_spawn.rs`'s staging, `port_failure.rs`'s `require_probe_beam`/`the_probe_image_is_committed`, `live_inbound.rs`'s `the_fixture_beam_is_present`), because a skip there would report green rows that compared nothing.
 
 ## Running
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt [--test <suite>] [--no-fail-fast]`
