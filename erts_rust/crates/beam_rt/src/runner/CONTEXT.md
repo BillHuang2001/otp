@@ -593,6 +593,7 @@ a foreign container that forwards nothing scanned: also inert, so also collected
   show at least one — the run route's "never sleep while it has work" half and the anti-spin half. The
   syscall test skips loudly without `strace`; the value test skips loudly without an oracle.
 * Crate gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt`.
+  The off-heap prune's own suite lives with its module ([`../context/gc/bin_vheap.rs`](../context/gc/bin_vheap.rs)); what this node must keep true around it is the park contract — a non-publishing window is refused before any work, and the call sits after the boundary collection and before the heap-kill drain.
 
 ## Known Issues / Handoffs
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like
