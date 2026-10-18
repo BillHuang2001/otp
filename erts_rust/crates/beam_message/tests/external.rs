@@ -24,13 +24,14 @@
 //! per node identity `(node atom, creation)` (`erts_ref_node_entry`, `copy.c:882`), and copies the
 //! thing's words verbatim.
 //!
-//! # Why not `beam_term::compare::eq`
+//! # Structural equality
 //!
-//! `compare` has no layout-aware arm for external pid/port/reference: its documented deterministic
-//! fallback orders two boxed terms of the same class by **raw term word**, i.e. by heap address, so
-//! a copy is never `=:=` its original. Structural equality is therefore asserted through the
-//! layout accessors (`external_*_parts`) and the node identity — see the crate `CONTEXT.md`
-//! `Known Issues` (fixing `compare` belongs to `beam_term`).
+//! `beam_term::compare` has a layout-aware arm for every external class, so a copy **is** `=:=`
+//! its original: `cmp_impl` dispatches `TermClass::ExternalPid`/`ExternalPort`/`ExternalRef` to
+//! `cmp_external_pids`/`cmp_external_ports`/`cmp_external_refs` (`compare.rs`), each comparing the
+//! node `(sysname atom, creation)` and the thing's own identity fields — never the off-heap `next`
+//! linkage word the copy rewrites. Every test below therefore asserts `compare::eq` alongside the
+//! layout accessors (`external_*_parts`) and the node identity.
 
 use beam_alloc::Heap;
 use beam_message::off_heap::OffHeapTable;
