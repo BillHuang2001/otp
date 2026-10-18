@@ -53,9 +53,12 @@
 //! retain one payload per call until the nursery happens to fill. The C's answer is this
 //! budget: the payload the process is charged for, compared with a limit that shrinks back
 //! toward the surviving live set, so the collection cadence tracks the payload volume rather
-//! than the term volume. This crate's half is the *accounting*; the runtime's half is to consult
-//! [`BinVheap::triggered_for`] at a heap-admission door and then collect + sweep
-//! ([`crate::sweep_unreachable_binaries`]).
+//! than the term volume. This crate's half is the *accounting*; its production consumer is
+//! `beam_rt`'s per-process `OffHeapReclaimer` (`beam_rt/src/context/gc/bin_vheap.rs`), which
+//! compares the observed overhead at the process's slice-boundary park and prunes the engine's
+//! payload reservoir ([`crate::for_each_reachable_binary_payload`] →
+//! `Machine::retain_refc_binaries`), then re-seeds this limit through
+//! [`BinVheap::record_collection`].
 //!
 //! The floor is [`HeapPolicy::min_bin_vheap_words`], the C `p->min_vheap_size`
 //! (`BIN_VH_MIN_SIZE`, which the oracle reports as `min_bin_vheap_size` = 46422 words), so a
