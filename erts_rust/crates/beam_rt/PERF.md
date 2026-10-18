@@ -385,7 +385,7 @@ The system side (`sys`) is `erl` on `PATH` — **OTP 29.1.1 / erts-17.1** — an
 Host: Linux `x86_64`, `nproc` = **14**, **shared and heavily loaded** — the 1-min `/proc/loadavg` read **18–89** during these runs — so **ratios and the per-`N` shape are the evidence, never the absolute wall time**.
 Every measured run was pinned with `taskset -c 3`, and every `/proc/loadavg` reading was recorded **before and after** each run.
 
-**The one mechanism the A/B isolates.** `BEFORE` mirrors the engine's append-only `Machine::refc_binaries` reservoir onto the running process at the end of every slice, and `beam_gc::OffHeap` is a slot-stable, never-compacted slot vector, so that mirror hands out one slot per payload per slice for the life of the process and puts three `O(off-heap slots)` scans on the per-call path — the eager `max_heap_size` usage figure that `Process::grow_nursery`/`ensure_capacity` read, and `Process::sweep_off_heap_binaries` at every rooted collection.
+**The one mechanism the A/B isolates.** `BEFORE` mirrors the engine's `Machine::refc_binaries` reservoir onto the running process at the end of every slice, and `beam_gc::OffHeap` is a slot-stable, never-compacted slot vector, so that mirror hands out one slot per payload per slice for the life of the process and puts three `O(off-heap slots)` scans on the per-call path — the eager `max_heap_size` usage figure that `Process::grow_nursery`/`ensure_capacity` read, and `Process::sweep_off_heap_binaries` at every rooted collection.
 `AFTER` keeps the roster on the reservoir itself (`RunnerState::reservoir_at`, unioned with any payload a host registers on the PCB), so the PCB's off-heap table stays **empty** and all three scans walk an empty vector.
 
 **The ladder** — `(wall − boot_baseline) / N`, the boot baseline being the median of 3 `N = 0` runs; the real `emqx_base62.erl` plus a driver loop, `taskset -c 3 <beam_rt> -pa <dir> run <drv.beam> b62drv:<fn>/1 <N>`; 3 rounds, **alternating `BEFORE`/`AFTER`**; every `N` produced **identical checksums on both sides**, so the two sides do the same work:
@@ -416,14 +416,15 @@ Every measured run was pinned with `taskset -c 3`, and every `/proc/loadavg` rea
 **The defect was not `encode`-specific.** Any loop whose iteration builds an **off-heap refc binary from compiled code** accumulated into the mirror: a second `bstr_to_lower` ladder reads `BEFORE` **11 905 → 26 024 ns/call** from `N` = 10 000 to 60 000 and `AFTER` **flat in a 9 829–11 119 ns/call band** across the same range.
 The three non-`encode` paired rows above therefore carry the same shape — a real `BEFORE` value and a flat `AFTER` one — at their own `N`.
 
-**Memory is unchanged by the A/B.** Peak RSS on both sides is the same within the noise band — the reservoir retains every payload either way, so the mirror was pure per-call cost, never a memory win.
+**The A/B moves per-call cost, not memory.** Peak RSS on both sides is the same within the noise band — the roster is a machine-level handle list either way, so the difference was per-call work, never a memory win.
 
 **Correctness of the measured side.** `--lib -- runner::tests` **46 passed / 0 failed**, `--lib -- native::memory` **34 passed / 0 failed**, `--test process_info_items` **4 / 0**, `--test engine_off_heap_transport` **6 / 0**.
 The re-pointed path was probed directly — a compiled `<<0:N/unit:8>>` held live by a parked child, then `erlang:process_info(P, binary)` → `{1,true}` — and agrees with the system runtime.
 The differential cases `gc/process_info_gc_key_set_is_stable`, `gc/process_info_memory_is_positive_integer` and `system_info/process_info_bulk_returns_list` all report `[AGREE]`; **no corpus case exercises the `binary` item**, which `tools/differential/src/corpus/gc.rs` documents as a deliberate capability gap.
 
-**Residual, owned by other nodes.** The engine reservoir is itself an append-only accumulator that is never cleared, so a build-a-binary loop still retains every payload it ever built — a **memory ceiling**, not a per-call cost, and bounding it needs a `beam_engine` liveness/reset seam.
-And `beam_process::sweep_off_heap_binaries` still walks its whole slot space even when `dead_binaries` is empty — harmless while that space stays empty, but it is the same defect any other registrant of that space would hit.
+**Where the memory ceiling is bounded.** The reservoir is not an accumulator: the runner's `Yield` arm prunes it at the slice boundary whenever the process's binary virtual heap is over its budget, releasing every payload its just-published roots no longer reach (`src/context/gc/bin_vheap.rs`), so `erlang:memory(binary)` is flat in the iteration count — the figures, the sawtooth envelope, the disabled-site A/B and the retained-payload half are [`CONTEXT.md`](CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, measured by `tests/off_heap_reclaim.rs`.
+The residuals are that prune's own (a `Wait` park, a declined gate, an un-pre-empted slice, the `-eval` route) — a leak, never a dangle: [`src/context/CONTEXT.md`](src/context/CONTEXT.md) *The off-heap refc-binary reclamation*.
+`Process::sweep_off_heap_binaries` returns before touching the roster when nothing was declared dead, so an empty slot space costs nothing on the per-call path.
 
 ### The copy-out's learned size hint — `copy_bound/ets_copy` (`BEFORE` `56683d2982` → `AFTER` `ead363d2a5`)
 

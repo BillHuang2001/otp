@@ -939,9 +939,10 @@ run() ->
 /// mirrored onto the PCB.**
 ///
 /// `erlang:process_info(Pid, binary)` reports the payloads a process built. The one holder of
-/// them is the machine's `Machine::refc_binaries` reservoir (append-only, never cleared by
-/// `Machine::reset`), which the runner leaves where it is: it reads them back through
-/// `RunnerState::reservoir_at`. The process's **own** off-heap table is therefore handed out
+/// them is the machine's `Machine::refc_binaries` reservoir (never cleared by `Machine::reset`;
+/// pruned at the slice boundary once the process's binary virtual heap triggers, see
+/// `RuntimeRunner::reclaim_off_heap_binaries`), which the runner keeps where it is rather than
+/// mirroring it: it reads them back through `RunnerState::reservoir_at`. The process's **own** off-heap table is therefore handed out
 /// **no slot at all** — which is the whole point, because `beam_gc::OffHeap`'s slot space is
 /// never compacted, so a slot per payload per slice made the O(slots) `overhead_bytes`/`sweep`
 /// walks quadratic in the number of iterations a build-a-binary loop had run.
@@ -1158,7 +1159,9 @@ loop(N, Size, Acc) ->
             bytes, 0,
             "slice {slice}: the never-compacted off-heap slot space stays empty"
         );
-        // (b) The reservoir only ever grows by whole iterations, each building `K` payloads.
+        // (b) This fixture stays below the bin-vheap trigger (its ~25 KB of payloads against the
+        // 46 422-word budget), so no slice-boundary prune runs and the reservoir grows by whole
+        // iterations, each building `K` payloads.
         let delta = length - reservoir;
         match per_iteration {
             Some(k) => assert_eq!(
