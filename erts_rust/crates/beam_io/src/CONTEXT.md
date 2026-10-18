@@ -264,13 +264,16 @@ OTP 29.1.1 pins, per `open_port` option set:
 | two `driver_output` in one callback | **two** `{data,`_`}` messages | two | one `noeol` frame once the buffer passes its limit |
 
 So an empty `driver_output` **is** delivered in raw mode (both port modes) and never in line
-mode, and two calls are two messages. `Port::take_input_notifications` used to gate on
-`has_input()`, which also asks the open frame's accumulator, so a staged zero-byte read was
-silently dropped; it now closes the frame first and gates on `pending_reads` alone. Still owed
-(a runtime/ABI edit, not this module's): `AbiHost::output` pushes plain `driver_output` bytes onto
-the accumulator instead of calling `DriverContext::deliver_read(&[], Some(data))`, so two calls
-inside one callback still coalesce into one `{data,_}` (the "helloW" assertions in
-`tests/abi_driver.rs`).
+mode, and two calls are two messages. Both halves of that rule live in the port layer now:
+`Port::take_input_notifications` closes the open frame first and then gates on `pending_reads`
+alone (so a staged zero-byte read is reported, and `Port::has_input` is a test-only observation
+helper nothing may gate on), and a loaded C driver's `driver_output*` hooks stage through
+`DriverContext::deliver_read` — `output` is `deliver_read(&[], Some(data))` (one body-only read per
+call, never banked on the accumulator, so two calls in one callback are two `{data,_}` messages) and
+`output2` forwards the header/body split with the C's `buf == NULL` kept as `body: None`. Pinned
+in-module by `src/abi/host_tests.rs` (`driver_output_stages_one_body_only_read_per_call`,
+`driver_output2_keeps_the_header_apart_and_the_null_body_distinct`,
+`the_host_output_path_reaches_the_port_owner_one_message_per_call`).
 
 Driver failures, measured the same way after `driver_failure*`/`driver_exit` from `output`:
 
