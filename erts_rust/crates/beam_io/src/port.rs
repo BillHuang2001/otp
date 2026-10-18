@@ -70,10 +70,9 @@ use crate::error;
 use crate::poller::Poller;
 use crate::port_failure::DriverFailure;
 use crate::port_task::{
-    LineNotification, PortNotification, PortTask, PortTaskKind, PortTaskQueue, ReadMessage,
-    PORT_REDS_EXECUTE,
-};
-use crate::queue::ByteQueue;
+    ActiveInput, LineNotification, PortNotification, PortTask, PortTaskKind, PortTaskQueue,
+    ReadMessage, PORT_REDS_EXECUTE,
+};use crate::queue::ByteQueue;
 
 // The registry lives in the sibling [`crate::registry`] module; re-export it here so the
 // in-crate `crate::port::PortRegistry` path (used by the built-in drivers) keeps resolving.
@@ -154,8 +153,18 @@ pub struct Port {
     /// failure is a *port-closing request*, not data and not a message, so it never rides
     /// [`PortNotification`].
     failure: Option<DriverFailure>,
+    /// The **`{active, …}` deliveries** the driver handed up and the owner has not been told
+    /// about yet, in delivery order — the active-mode input side channel (`{tcp, S, Data}` /
+    /// `{udp, S, IP, Port, Data}` / `{tcp_passive, S}` / `{udp_passive, S}`), staged by
+    /// [`DriverContext::deliver_active_input`] and drained by [`Port::take_active_inputs`].
+    ///
+    /// A **fifth** channel for the same reason [`Port::take_completions`] is a third: an
+    /// active-mode delivery is a *message to the owner*, not `{Port, {data, Data}}`, so it never
+    /// rides [`PortNotification`] (which keeps exactly its two variants) — and not a completion
+    /// either, because it is inbound data rather than the answer to the owner's call. A port
+    /// whose driver never enables active mode stages nothing here.
+    active_inputs: VecDeque<ActiveInput>,
 }
-
 impl Port {
     /// Builds a port in the [`PortState::Opening`] state around `driver`.
     ///
@@ -176,9 +185,9 @@ impl Port {
             pending_lines: VecDeque::new(),
             completions: Vec::new(),
             failure: None,
+            active_inputs: VecDeque::new(),
         }
-    }
-    /// This port's id.
+    }    /// This port's id.
     pub fn id(&self) -> PortId {
         self.id
     }
@@ -290,11 +299,13 @@ impl Port {
                 pending_reads,
                 completions,
                 failure,
+                active_inputs,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
                 .with_completions(completions)
+                .with_active(active_inputs)
                 .with_failure(failure);
             driver.start(&mut ctx)
         };
@@ -363,11 +374,13 @@ impl Port {
                 pending_reads,
                 completions,
                 failure,
+                active_inputs,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
                 .with_completions(completions)
+                .with_active(active_inputs)
                 .with_failure(failure);
             driver.output(&mut ctx)
         };
@@ -699,6 +712,25 @@ impl Port {
         std::mem::take(&mut self.completions)
     }
 
+    /// Takes the **`{active, …}` deliveries** this port's driver handed up, in delivery order.
+    ///
+    /// This is the drain side of the active-mode input side channel (see [`ActiveInput`]): the
+    /// `{tcp, S, Data}` / `{udp, S, IP, Port, Data}` messages of an `{active, true|N|once}` socket
+    /// and the `{tcp_passive, S}` / `{udp_passive, S}` transition of a spent `{active, N}`
+    /// counter, staged by [`DriverContext::deliver_active_input`] from **any** driver callback.
+    ///
+    /// Every staged delivery is returned exactly once and the queue is emptied, so a caller must
+    /// drain after every round (and after every explicit driver interaction), exactly as it must
+    /// poll [`Port::take_completions`]/[`Port::take_line_frames`]. A delivery is **never**
+    /// `{Port, {data, Data}}` (that is [`PortNotification`]) and never a completion: it is a
+    /// message the owner receives, not the answer to its call.
+    ///
+    /// A port that has staged nothing — every passive-mode port, and every non-socket driver —
+    /// always returns an empty `Vec`, so a caller can poll unconditionally. The port's own
+    /// [`PortId`] is stamped on each delivery, so a consumer never has to guess which port spoke.
+    pub(crate) fn take_active_inputs(&mut self) -> Vec<ActiveInput> {
+        self.active_inputs.drain(..).collect()
+    }
     /// Takes the **failure** this port's driver latched, if any, once.
     ///
     /// A driver closes its own port through [`DriverContext::signal_failure`] (the C's
@@ -733,11 +765,13 @@ impl Port {
                 pending_reads,
                 completions,
                 failure,
+                active_inputs,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
                 .with_completions(completions)
+                .with_active(active_inputs)
                 .with_failure(failure);
             driver.ready_input(&mut ctx)
         };
@@ -775,11 +809,13 @@ impl Port {
                 pending_reads,
                 completions,
                 failure,
+                active_inputs,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
                 .with_completions(completions)
+                .with_active(active_inputs)
                 .with_failure(failure);
             driver.ready_output(&mut ctx)
         };
@@ -849,11 +885,13 @@ impl Port {
                 pending_reads,
                 completions,
                 failure,
+                active_inputs,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
                 .with_completions(completions)
+                .with_active(active_inputs)
                 .with_failure(failure);
             driver.timeout(&mut ctx)
         };
@@ -881,11 +919,13 @@ impl Port {
                 pending_reads,
                 completions,
                 failure,
+                active_inputs,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
                 .with_completions(completions)
+                .with_active(active_inputs)
                 .with_failure(failure);
             driver.control(&mut ctx, command, arg)
         };
@@ -924,11 +964,13 @@ impl Port {
                 pending_reads,
                 completions,
                 failure,
+                active_inputs,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
                 .with_completions(completions)
+                .with_active(active_inputs)
                 .with_failure(failure);
             driver.drive_async(&mut ctx)
         };
@@ -1005,11 +1047,13 @@ impl Port {
             pending_reads,
             completions,
             failure,
+            active_inputs,
             ..
         } = self;
         let mut ctx = DriverContext::new(id, poller, input, output, arms)
             .with_reads(pending_reads)
             .with_completions(completions)
+            .with_active(active_inputs)
             .with_failure(failure);
         driver.port_exit(&mut ctx, reason)
     }
@@ -1031,11 +1075,13 @@ impl Port {
                 pending_reads,
                 completions,
                 failure,
+                active_inputs,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
                 .with_completions(completions)
+                .with_active(active_inputs)
                 .with_failure(failure);
             driver.stop(&mut ctx)
         };
@@ -1588,3 +1634,11 @@ mod tests {
         );
     }
 }
+
+// The `{active, …}` input channel's structural suite: the sink's installation at every driver
+// interaction point, the port's drain and the registry's port-number-ordered one. A `#[path]`
+// sibling, the same pattern as `completion_tests.rs`/`port_failure_tests.rs`, so the source half
+// stays near the workspace's ~1000-line convention.
+#[cfg(test)]
+#[path = "active_input_tests.rs"]
+mod active_input_tests;
