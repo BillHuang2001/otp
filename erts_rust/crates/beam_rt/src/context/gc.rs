@@ -1140,6 +1140,10 @@ pub(crate) fn ensure_heap(
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
+            // The `max_heap_size` verdict the collection/growth just latched on the PCB
+            // ([`drain_max_heap_verdict`]): a `Kill` is latched on the runtime for the runner's
+            // next slice boundary, a `Log` emits the ERTS report now.
+            drain_max_heap_verdict(runtime, process, pid);
             #[cfg(test)]
             valve_counters::note_collected(valve_counters::Door::EnsureHeap);
         }
@@ -1354,6 +1358,9 @@ pub(crate) fn ensure_heap_full(
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
+            // The `max_heap_size` verdict, drained exactly as the narrow door's does (see
+            // [`drain_max_heap_verdict`]).
+            drain_max_heap_verdict(runtime, process, pid);
             #[cfg(test)]
             valve_counters::note_collected(valve_counters::Door::EnsureHeapFull);
         }
@@ -1707,6 +1714,9 @@ pub(crate) fn alloc_words_rooted(
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
+            // The `max_heap_size` verdict, drained exactly as the two heap-admission doors'
+            // (see [`drain_max_heap_verdict`]).
+            drain_max_heap_verdict(runtime, process, pid);
             #[cfg(test)]
             valve_counters::note_collected(valve_counters::Door::AllocWordsRooted);
         }

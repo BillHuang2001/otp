@@ -57,7 +57,10 @@ use beam_engine::context::RootSet;
 use beam_gc::CollectionKind;
 use beam_process::ProcessTable;
 use crate::RuntimeContext;
-use super::{machine_root_bounds, publish_roots_full, scatter_roots_full, valve_verdict};
+use super::{
+    drain_max_heap_verdict, machine_root_bounds, publish_roots_full, scatter_roots_full,
+    valve_verdict,
+};
 /// How many reductions must have accumulated since this process's last boundary collection
 /// before the next pre-emption may collect.
 ///
@@ -289,6 +292,9 @@ pub(crate) fn collect_at_reds_boundary(
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
+            // The `max_heap_size` verdict this young-only collection latched on the PCB — the
+            // same drain every other collection site runs (see [`drain_max_heap_verdict`]).
+            drain_max_heap_verdict(runtime, process, pid);
         }
         Err(_) => {
             runtime.halt_process_gc(pid);

@@ -560,6 +560,10 @@ impl Runtime {
             Ok(collection) => {
                 self.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
                 self.note_gc_reclaimed(collection.stats.words_reclaimed);
+                // The `max_heap_size` verdict this requested collection latched on the PCB is
+                // drained exactly as the heap-admission points' is (see
+                // [`crate::context::gc::drain_max_heap_verdict`]).
+                crate::context::gc::drain_max_heap_verdict(self, process, pid);
                 #[cfg(test)]
                 crate::context::gc::valve_counters::note_collected(
                     crate::context::gc::valve_counters::Door::ServeGcRequest,
@@ -575,13 +579,20 @@ impl Runtime {
 
     /// Drops the per-process GC state of processes `table` no longer holds: the forced-GC
     /// requests a terminated process never reached a collection site for — its heap is gone —
-    /// and the **foreign-reachability gate** of a pid that no longer exists.
+    /// the **foreign-reachability gate** of a pid that no longer exists, and a latched
+    /// `max_heap_size` **kill** the runner can never perform (a process that terminated before
+    /// its kill was drained; see [`Runtime::max_heap_kill`](crate::Runtime)).
     ///
     /// A process that terminated with a request still pending (it reached no heap-admission
     /// point and no park after asking) can never be served — its heap is gone — so the entry
     /// is noise that would otherwise accumulate for the runtime's whole lifetime, one per
     /// such process. The scheduler pass prunes at its boundary, where the pass's own table
     /// holds exactly the live processes.
+    ///
+    /// A latched kill is the same kind of noise and is pruned the same way: the runner performs
+    /// a kill at its next slice boundary, so a pid the table no longer holds will never be
+    /// scheduled again and its latch can never be honoured. Pruning it is not swallowing a
+    /// verdict — the process is already gone, so there is nothing left to terminate.
     ///
     /// An **asynchronous** request ([`Runtime::request_gc_async`]) that is pruned here is not
     /// silently forgotten: the completion it owes its requester reports the target as gone
@@ -596,6 +607,9 @@ impl Runtime {
         }
         if !self.gc.foreign.borrow().is_empty() {
             self.gc.foreign.borrow_mut().retain(|pid| table.contains(*pid));
+        }
+        if !self.max_heap_kill.is_empty() {
+            self.max_heap_kill.retain(|pid| table.contains(*pid));
         }
     }
     /// Adds `reds` to the reductions `pid` has accumulated since its last

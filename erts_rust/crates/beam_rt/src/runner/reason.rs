@@ -36,6 +36,18 @@ pub(super) fn normal(runtime: &mut Runtime) -> Eterm {
     runtime.intern("normal")
 }
 
+/// The **bare atom `killed`** — the reason a process terminated by its `max_heap_size` bound
+/// exits with.
+///
+/// This is the C's `ERTS_MAX_HEAP_SIZE_KILL` self-exit (`erl_gc.c`'s `check_max_heap_size`
+/// kills the process with the atom `killed`, **not** `kill`): the termination is performed by
+/// the runner through the ordinary exit path (the ordinary `ProcessTable::terminate`), so it is
+/// untrappable by the victim — no `{'EXIT', …}` signal is delivered to it — while a linked peer
+/// that traps exits observes `{'EXIT', Pid, killed}` and a monitor `'DOWN' … killed`.
+pub(super) fn killed(runtime: &mut Runtime) -> Eterm {
+    runtime.intern("killed")
+}
+
 /// The exit-reason **term** for a `BeamError` raised while running a process.
 ///
 /// An error that carries an atom reason — the standard `badarg`/`badarith`/… atoms, or a

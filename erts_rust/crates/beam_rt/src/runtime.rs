@@ -482,7 +482,8 @@ pub struct Runtime {
     ///
     /// Keyed by the whole [`ProcessId`] and only ever `insert`/`remove`d, so it probes with the
     /// crate's own [`FastHashSet`] over [`crate::hasher`].
-    pub(crate) max_heap_kill: FastHashSet<ProcessId>,    /// The `{monitor_nodes, Options}` registrations of every process — the C's
+    pub(crate) max_heap_kill: FastHashSet<ProcessId>,
+    /// The `{monitor_nodes, Options}` registrations of every process — the C's
     /// `ERTS_MON_TYPE_NODES` monitor chain (`dist.c:6754-6868`).
     ///
     /// The undocumented `erlang:process_flag(monitor_nodes, Bool)` /
