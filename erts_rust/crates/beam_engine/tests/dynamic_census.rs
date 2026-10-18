@@ -105,9 +105,9 @@ use std::path::PathBuf;
 
 use beam_common::{BeamError, Result};
 use beam_engine::exec_census::{self, Snapshot};
-use beam_engine::{ExecutionContext, Machine, Tier};
+use beam_engine::{ExecutionContext, Machine, Mailbox, Tier};
 use beam_loader::Label;
-use beam_term::Eterm;
+use beam_term::{is_small, make_small, Eterm};
 
 use support::ModuleHost;
 
@@ -357,16 +357,150 @@ fn print_errors(snapshot: &Snapshot) {
 /// stdlib suite.
 struct CensusHost {
     inner: ModuleHost,
+    /// The queued messages, in arrival order — the [`Mailbox`] seam's storage.
+    messages: Vec<Eterm>,
+    /// The scan position: `loop_rec` peeks here, `LoopRecEnd` advances it.
+    scan: usize,
+    /// The reserved receive markers: `(marker term, bound reference, position)`.
+    markers: Vec<(Eterm, Option<Eterm>, usize)>,
+    /// Distinguishes consecutive reserved markers.
+    next_marker: i64,
+    /// What `receive_marker_reserve` answers for an **empty** queue (the C `undefined`).
+    undefined: Eterm,
+    /// The fresh value `erlang:make_ref/0` hands out (`recv:marked/0` only compares it).
+    next_ref: i64,
+    /// The `self()` atom — a send destination this mailbox ignores.
+    self_atom: Eterm,
+    /// Every [`Machine`] `call` ran, kept alive so an off-heap result outlives the run
+    /// (the same rationale as `ModuleHost`'s own `machines` field, which is private).
+    machines: Vec<Machine>,
 }
 
 impl CensusHost {
     fn new(inner: ModuleHost) -> CensusHost {
-        CensusHost { inner }
+        let mut inner = inner;
+        let undefined = inner.intern("undefined");
+        let self_atom = inner.intern("self");
+        CensusHost {
+            inner,
+            messages: Vec::new(),
+            scan: 0,
+            markers: Vec::new(),
+            next_marker: 0,
+            undefined,
+            next_ref: 100,
+            self_atom,
+            machines: Vec::new(),
+        }
     }
 
     /// The wrapped host (module loading and interning are host operations).
     fn host(&mut self) -> &mut ModuleHost {
         &mut self.inner
+    }
+
+    /// Interns `name` in the layer's one shared atom table.
+    fn intern(&mut self, name: &str) -> Eterm {
+        self.inner.intern(name)
+    }
+
+    /// Queues `message` as if it had been sent to this mailbox.
+    fn push_message(&mut self, message: Eterm) {
+        self.messages.push(message);
+    }
+
+    /// The `self()` term (`recv:bomb/1`'s destination).
+    fn self_term(&self) -> Eterm {
+        self.self_atom
+    }
+
+    /// Runs `module:function(args)` on a fresh machine whose context is **this host**,
+    /// so the run sees the mailbox (`ModuleHost::call` would run it on the plain host).
+    fn call(&mut self, module: &str, function: &str, args: &[Eterm]) -> Result<Eterm> {
+        let module = self.inner.load(module)?;
+        let function_atom = module
+            .atom_table
+            .lookup(function)
+            .ok_or(BeamError::BadArg)?;
+        let mut machine = Machine::new();
+        let result = machine.run_export(&module, function_atom, args.len() as u32, args, self);
+        self.machines.push(machine);
+        result
+    }
+}
+
+/// The engine's mailbox seam over a `Vec<Eterm>` plus a saturating scan position —
+/// the shape `support::ProbeMailbox` and `tests/receive.rs`'s `TestMailbox` use (the
+/// C contract at `../../erts/emulator/beam/erl_proc_sig_queue.h:2225-2394`).
+impl Mailbox for CensusHost {
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        let _ = to;
+        self.push_message(message);
+        Ok(())
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        Ok(self.messages.get(self.scan).copied())
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        self.scan += 1;
+        Ok(())
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        if self.scan < self.messages.len() {
+            self.messages.remove(self.scan);
+        }
+        self.scan = 0;
+        Ok(())
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        self.scan = 0;
+        Ok(())
+    }
+
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        if self.messages.is_empty() {
+            return Ok(self.undefined);
+        }
+        let term = make_small(9000 + self.next_marker);
+        self.next_marker += 1;
+        self.markers.push((term, None, self.scan));
+        Ok(term)
+    }
+
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+        if !is_small(marker) {
+            return Ok(());
+        }
+        if let Some(entry) = self.markers.iter_mut().find(|(term, _, _)| *term == marker) {
+            entry.1 = Some(reference);
+        }
+        Ok(())
+    }
+
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+        if let Some((_, _, position)) = self
+            .markers
+            .iter()
+            .find(|(_, bound, _)| *bound == Some(reference))
+        {
+            self.scan = *position;
+        }
+        Ok(())
+    }
+
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+        if let Some(index) = self
+            .markers
+            .iter()
+            .position(|(_, bound, _)| *bound == Some(reference))
+        {
+            self.markers.remove(index);
+        }
+        Ok(())
     }
 }
 
@@ -381,6 +515,15 @@ impl ExecutionContext for CensusHost {
         match (module, function, arity) {
             ("erlang", "get_module_info", 1) => args.first().copied().ok_or(BeamError::BadArg),
             ("erlang", "get_module_info", 2) => args.get(1).copied().ok_or(BeamError::BadArg),
+            // `recv:marked/0`'s two prologue BIFs: a stand-in reference (the fixture only
+            // compares it for equality) and `self()`. Exactly the two hooks
+            // `tests/receive.rs::context` installs.
+            ("erlang", "make_ref", 0) => {
+                let value = make_small(self.next_ref);
+                self.next_ref += 1;
+                Ok(value)
+            }
+            ("erlang", "self", 0) => Ok(self.self_atom),
             _ => self.inner.call_bif(module, function, arity, args),
         }
     }
@@ -401,6 +544,44 @@ impl ExecutionContext for CensusHost {
 
     fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         self.inner.apply_fun(fun, args)
+    }
+
+    // The nine receive/message seam methods, forwarded to this host's `Mailbox`
+    // (`ModuleHost` has none, so the wrapper is the only route).
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        Mailbox::send_message(self, to, message)
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        Mailbox::receive_next(self)
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        Mailbox::receive_skip(self)
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        Mailbox::receive_remove(self)
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        Mailbox::receive_reset(self)
+    }
+
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        Mailbox::receive_marker_reserve(self)
+    }
+
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+        Mailbox::receive_marker_bind(self, marker, reference)
+    }
+
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+        Mailbox::receive_marker_use(self, reference)
+    }
+
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+        Mailbox::receive_marker_clear(self, reference)
     }
 }
 

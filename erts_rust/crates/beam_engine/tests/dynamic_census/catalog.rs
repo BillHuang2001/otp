@@ -368,6 +368,43 @@ fn harness_ordsets_map_double(h: &mut ModuleHost) -> Result<Eterm> {
     h.call("stdlib_exports_harness", "ordsets_map_double", &[set])
 }
 
+// --- deliberate clause failures + guard kinds ------------------------------
+//
+// These are the shapes that reach `func_info`: a call whose **every head clause
+// fails** jumps to the function's `func_label` (the label immediately *before*
+// `func_info`), and the `FuncInfo` arm then raises class `error` with the bare
+// atom `function_clause` — C's `i_func_info_IaaI`
+// (`../../erts/emulator/beam/emu/beam_emu.c`). Each of them therefore executes
+// `FuncInfo` exactly once **and** executes the failing guard's `Test(<Kind>)`.
+// Ground truth: `erl -noshell -eval 'catch dict:update_counter(a, x, d())'` →
+// `{'EXIT',{function_clause,…}}` (a real `function_clause`, not `badarg`).
+
+/// `dict:update_counter/3` with a **number** increment — the guard matches.
+fn dict_update_counter_hit(h: &mut ModuleHost) -> Result<Eterm> {
+    // `tests/stdlib_collections.rs` drives `dict` (a hash dictionary); here the
+    // third argument is never inspected, only the `is_number(Incr)` guard is.
+    let key = h.intern("a");
+    h.call("dict", "update_counter", &[key, make_small(1), make_small(0)])
+}
+
+/// `dict:update_counter/3` with a **non-number** increment — `is_number` fails,
+/// every clause is exhausted, `func_info` raises `function_clause`.
+fn dict_update_counter_guard_fails(h: &mut ModuleHost) -> Result<Eterm> {
+    // `dict.erl:554` — `update_counter(Key, Incr, D0) when is_number(Incr)` is the
+    // function's only clause, so the failed guard lands on `func_info`.
+    let key = h.intern("a");
+    let not_a_number = h.intern("not_a_number");
+    h.call("dict", "update_counter", &[key, not_a_number, make_small(0)])
+}
+
+/// `gen:name/1` with an argument matching no clause but the last, whose guard is
+/// `is_pid(Pid)` — so `Test(IsPid)` runs and then `func_info` raises.
+fn gen_name_pid_guard_fails(h: &mut ModuleHost) -> Result<Eterm> {
+    // `gen.erl:644-647` — `name(Pid) when is_pid(Pid) -> Pid.` is the last clause;
+    // the three tuple clauses above it fail on their tag tests.
+    h.call("gen", "name", &[make_small(42)])
+}
+
 /// **Layer (b)** — the program workloads. Every shape is copied from an existing
 /// oracle-proven suite (named in each workload's comment).
 pub const WORKLOADS: &[Workload] = &[
@@ -412,6 +449,9 @@ pub const WORKLOADS: &[Workload] = &[
     ("harness_lists_zipwith_add", harness_lists_zipwith_add),
     ("harness_orddict_map", harness_orddict_map),
     ("harness_ordsets_map_double", harness_ordsets_map_double),
+    ("dict_update_counter_hit", dict_update_counter_hit),
+    ("dict_update_counter_guard_fails", dict_update_counter_guard_fails),
+    ("gen_name_pid_guard_fails", gen_name_pid_guard_fails),
 ];
 
 // ---------------------------------------------------------------------------
@@ -836,4 +876,323 @@ pub const FIXTURES: &[Fixture] = &[
             ("funs:dynamic/4", funs_dynamic),
         ],
     },
+    // --- the widened export sets -------------------------------------------
+    //
+    // A fixture is registered once per module file; these entries drive the
+    // **additional** exports of modules the roster above already registers (the
+    // `register`/`load` pair is memoized by module name, so a second entry costs
+    // nothing). Every one of them is an export an existing suite already drives,
+    // and each was chosen because it is the only shape in the fixture that emits
+    // the variant named in its comment.
+    Fixture {
+        module: "floats",
+        path: None,
+        runs: &[
+            // `fixtures/floats.erl`: `divide/2` → `fdiv` (the only `fdiv` in the corpus
+            // of committed fixtures), `negate/1` → `fnegate`.
+            ("floats:divide/2", floats_divide),
+            ("floats:negate/1", floats_negate),
+        ],
+    },
+    Fixture {
+        module: "mapfx",
+        path: None,
+        runs: &[
+            // `fixtures/mapfx.erl`: `exact/1` and `assoc_exact/1` are the `Map#{K := V}`
+            // **exact** update shapes → `put_map_exact`.
+            ("mapfx:exact/1", mapfx_exact),
+            ("mapfx:assoc_exact/1", mapfx_assoc_exact),
+        ],
+    },
+    Fixture {
+        module: "bsmatch",
+        path: None,
+        runs: &[
+            // `fixtures/bsmatch.erl`: `strlong/1` is the only export with a
+            // `{test,bs_match_string,…}` instruction → `BsMatchString`; `sk16/1` and
+            // `sk32/1` are the `bs_skip_utf16`/`bs_skip_utf32` shapes, `u16/1`/`u32/1`
+            // the `bs_get_utf16`/`bs_get_utf32` ones.
+            ("bsmatch:strlong/1", bsmatch_strlong),
+            ("bsmatch:sk16/1", bsmatch_sk16),
+            ("bsmatch:sk32/1", bsmatch_sk32),
+            ("bsmatch:u16/1", bsmatch_u16),
+            ("bsmatch:u32/1", bsmatch_u32),
+        ],
+    },
+    Fixture {
+        module: "exceptions",
+        path: None,
+        runs: &[
+            // `fixtures/exceptions.erl`: the `if`/`try`-of/guard-`try` clause failures,
+            // every one of them **caught inside the module** (so they count as
+            // executed, not as an error — the census semantics).
+            ("exceptions:if_clause/1", exceptions_if_clause),
+            ("exceptions:try_clause/1", exceptions_try_clause),
+            ("exceptions:guard_badarith/1", exceptions_guard_badarith),
+            ("exceptions:deep/1", exceptions_deep),
+        ],
+    },
+    Fixture {
+        // `fixtures/excpaths.erl`: the whole `try … catch` path matrix. `fc/1` fails
+        // every clause of its own function (`func_info` → `function_clause`), and the
+        // `catch_*` entries swallow the same shapes in a live `try`.
+        module: "excpaths",
+        path: None,
+        runs: &[
+            ("excpaths:fc/1", excpaths_fc),
+            ("excpaths:catch_fc/1", excpaths_catch_fc),
+            ("excpaths:catch_bm/1", excpaths_catch_bm),
+        ],
+    },
+    Fixture {
+        // `fixtures/catchtrace.erl`: the `try … catch C:R:S` shapes that cook the
+        // raise-time snapshot → `build_stacktrace`.
+        module: "catchtrace",
+        path: None,
+        runs: &[
+            ("catchtrace:run/0", catchtrace_run),
+            ("catchtrace:run2/0", catchtrace_run2),
+        ],
+    },
+    Fixture {
+        // `fixtures/stacktrace_frames.erl`: a raise re-raised through nested frames.
+        module: "stacktrace_frames",
+        path: None,
+        runs: &[
+            ("stacktrace_frames:t0/0", stacktrace_frames_t0),
+            ("stacktrace_frames:t3/0", stacktrace_frames_t3),
+        ],
+    },
+    Fixture {
+        // `fixtures/atomapply.erl` → `fixtures/atomtarget.erl`: a fully dynamic
+        // `apply/3` on runtime **atom** targets (the `atom_name` seam route).
+        module: "atomapply",
+        path: None,
+        runs: &[("atomapply:run/3", atomapply_run)],
+    },
 ];
+
+// The layer-(c) fns appended above (Rust does not care about declaration order).
+
+fn floats_divide(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/floats.erl`: `divide/2` → `fdiv`; oracle: `floats:divide(6.0,2.0)` → 3.0.
+    let a = terms::make_float(h, 6.0)?;
+    let b = terms::make_float(h, 2.0)?;
+    h.call("floats", "divide", &[a, b])
+}
+
+fn floats_negate(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/floats.erl`: `negate/1` → `fnegate`; oracle: `floats:negate(2.5)` → -2.5.
+    let value = terms::make_float(h, 2.5)?;
+    h.call("floats", "negate", &[value])
+}
+
+fn mapfx_exact(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/mapfx.erl`: `exact/1` — `Map#{a := _}` (`put_map_exact`).
+    let a = h.intern("a");
+    let map = terms::make_flatmap(h, &[(a, make_small(1))])?;
+    h.call("mapfx", "exact", &[map])
+}
+
+fn mapfx_assoc_exact(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/mapfx.erl`: `assoc_exact/1` — a mixed `=>`/`:=` update.
+    let a = h.intern("a");
+    let map = terms::make_flatmap(h, &[(a, make_small(1))])?;
+    h.call("mapfx", "assoc_exact", &[map])
+}
+
+fn bsmatch_strlong(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/bsmatch.erl`: `strlong/1` (`{test,bs_match_string,…}`) — needs the
+    // full 10-byte literal to succeed.
+    let bin = terms::make_heap_binary(h, b"abcdefghij")?;
+    h.call("bsmatch", "strlong", &[bin])
+}
+
+fn bsmatch_sk16(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/bsmatch.erl`: `sk16/1` (`bs_skip_utf16`) over `<<0,65,66>>`.
+    let bin = terms::make_heap_binary(h, &[0x00, 0x41, 0x42])?;
+    h.call("bsmatch", "sk16", &[bin])
+}
+
+fn bsmatch_sk32(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/bsmatch.erl`: `sk32/1` (`bs_skip_utf32`) over `<<0,0,0,65>>`.
+    let bin = terms::make_heap_binary(h, &[0x00, 0x00, 0x00, 0x41, 0x42])?;
+    h.call("bsmatch", "sk32", &[bin])
+}
+
+fn bsmatch_u16(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/bsmatch.erl`: `u16/1` (`bs_get_utf16`) over `<<0,65>>`.
+    let bin = terms::make_heap_binary(h, &[0x00, 0x41])?;
+    h.call("bsmatch", "u16", &[bin])
+}
+
+fn bsmatch_u32(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/bsmatch.erl`: `u32/1` (`bs_get_utf32`) over `<<0,0,0,65>>`.
+    let bin = terms::make_heap_binary(h, &[0x00, 0x00, 0x00, 0x41])?;
+    h.call("bsmatch", "u32", &[bin])
+}
+
+fn exceptions_if_clause(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/exceptions.erl`: `if_clause(2)` → the `if` has no true branch.
+    h.call("exceptions", "if_clause", &[make_small(2)])
+}
+
+fn exceptions_try_clause(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/exceptions.erl`: `try_clause(2)` → `try … of` has no matching clause.
+    h.call("exceptions", "try_clause", &[make_small(2)])
+}
+
+fn exceptions_guard_badarith(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/exceptions.erl`: `guard_badarith(0)` → a guard's `1/X`.
+    h.call("exceptions", "guard_badarith", &[make_small(0)])
+}
+
+fn exceptions_deep(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/exceptions.erl`: `deep(2)` → a raise four frames down, caught above.
+    h.call("exceptions", "deep", &[make_small(2)])
+}
+
+fn excpaths_fc(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/excpaths.erl`: `fc(b)` — every clause of `fc/1` fails, so `func_info`
+    // raises `function_clause` (declared raise; the oracle agrees).
+    let b = h.intern("b");
+    h.call("excpaths", "fc", &[b])
+}
+
+fn excpaths_catch_fc(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/excpaths.erl`: `catch_fc(b)` — the same failure, caught in-module.
+    let b = h.intern("b");
+    h.call("excpaths", "catch_fc", &[b])
+}
+
+fn excpaths_catch_bm(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/excpaths.erl`: `catch_bm(b)` — a `badmatch` caught in-module.
+    let b = h.intern("b");
+    h.call("excpaths", "catch_bm", &[b])
+}
+
+fn catchtrace_run(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/catchtrace.erl`: `run/0` — `try … catch C:R:S` (`build_stacktrace`).
+    h.call("catchtrace", "run", &[])
+}
+
+fn catchtrace_run2(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/catchtrace.erl`: `run2/0` — the second stacktrace-cooking shape.
+    h.call("catchtrace", "run2", &[])
+}
+
+fn stacktrace_frames_t0(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/stacktrace_frames.erl`: `t0/0`.
+    h.call("stacktrace_frames", "t0", &[])
+}
+
+fn stacktrace_frames_t3(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/stacktrace_frames.erl`: `t3/0` — three nested frames.
+    h.call("stacktrace_frames", "t3", &[])
+}
+
+fn atomapply_run(h: &mut ModuleHost) -> Result<Eterm> {
+    // `fixtures/atomapply.erl`: `run/3` → `apply(M, F, Args)` on runtime atoms.
+    let module = h.intern("atomtarget");
+    let function = h.intern("target_fun");
+    let empty = terms::make_list(h, &[])?;
+    h.call("atomapply", "run", &[module, function, empty])
+}
+
+// ---------------------------------------------------------------------------
+// Layer (c), the mailbox-seam fixture: `recv.beam`
+// ---------------------------------------------------------------------------
+
+/// One layer-(c) run that needs the engine's `Mailbox` seam.
+///
+/// [`crate::CensusHost`] is the host that owns a mailbox (it mirrors the
+/// `ProbeMailbox`/`TestMailbox` shape the receive suites use), so these bodies
+/// take it rather than the plain [`ModuleHost`].
+pub type MailboxRun = (&'static str, fn(&mut crate::CensusHost) -> Result<Eterm>);
+
+/// One mailbox-seam fixture and the exports driven on it.
+pub struct MailboxFixture {
+    /// The module name the fixture is registered under.
+    pub module: &'static str,
+    /// The exports driven on the fixture.
+    pub runs: &'static [MailboxRun],
+}
+
+/// `recv:wait/0` with one queued message: `loop_rec` + `remove_message`.
+fn recv_wait_queued(h: &mut crate::CensusHost) -> Result<Eterm> {
+    let hello = h.intern("hello");
+    h.push_message(hello);
+    h.call("recv", "wait", &[])
+}
+
+/// `recv:wait/0` on an **empty** mailbox: `loop_rec` then `wait`, which suspends —
+/// the non-blocking entry folds that into the engine's typed `blocked` error.
+fn recv_wait_empty(h: &mut crate::CensusHost) -> Result<Eterm> {
+    h.call("recv", "wait", &[])
+}
+
+/// `recv:sel/0` with a non-atom message: the catch-all clause binds it.
+fn recv_sel(h: &mut crate::CensusHost) -> Result<Eterm> {
+    h.push_message(make_small(99));
+    h.call("recv", "sel", &[])
+}
+
+/// `recv:scan/0` with `42` ahead of `{bar,7}`: `42` fails both clauses and reaches
+/// `loop_rec_end`, then `{bar,7}` matches.
+fn recv_scan(h: &mut crate::CensusHost) -> Result<Eterm> {
+    let bar = h.intern("bar");
+    let pair = terms::make_tuple(h, &[bar, make_small(7)])?;
+    h.push_message(make_small(42));
+    h.push_message(pair);
+    h.call("recv", "scan", &[])
+}
+
+/// `recv:afterzero/0` on an empty mailbox: `loop_rec` then `timeout`.
+fn recv_afterzero(h: &mut crate::CensusHost) -> Result<Eterm> {
+    h.call("recv", "afterzero", &[])
+}
+
+/// `recv:aftervar(0)` on an empty mailbox: a **runtime** zero reaches
+/// `wait_timeout`, which falls through to `timeout`.
+fn recv_aftervar_zero(h: &mut crate::CensusHost) -> Result<Eterm> {
+    h.call("recv", "aftervar", &[make_small(0)])
+}
+
+/// `recv:aftervar(5)` on an empty mailbox: `wait_timeout` suspends (declared raise).
+fn recv_aftervar_blocks(h: &mut crate::CensusHost) -> Result<Eterm> {
+    h.call("recv", "aftervar", &[make_small(5)])
+}
+
+/// `recv:marked/0`: the whole `recv_marker_*` prologue (`reserve`/`bind`/`use`/
+/// `clear`) around a `self() ! {Ref, 7}`.
+fn recv_marked(h: &mut crate::CensusHost) -> Result<Eterm> {
+    h.call("recv", "marked", &[])
+}
+
+/// `recv:bomb/1`: the `send` opcode (`Pid ! 42`).
+fn recv_bomb(h: &mut crate::CensusHost) -> Result<Eterm> {
+    let destination = h.self_term();
+    h.call("recv", "bomb", &[destination])
+}
+
+/// **Layer (c), the mailbox-seam fixture.** `fixtures/recv.erl` is the one fixture
+/// whose exports need the `Mailbox` seam, so it is driven on the census host.
+pub const MAILBOX_FIXTURES: &[MailboxFixture] = &[MailboxFixture {
+    module: "recv",
+    runs: &[
+        ("recv:wait/0 (queued)", recv_wait_queued),
+        ("recv:wait/0 (empty)", recv_wait_empty),
+        ("recv:sel/0", recv_sel),
+        ("recv:scan/0", recv_scan),
+        ("recv:afterzero/0", recv_afterzero),
+        ("recv:aftervar/0", recv_aftervar_zero),
+        ("recv:aftervar/5", recv_aftervar_blocks),
+        ("recv:marked/0", recv_marked),
+        ("recv:bomb/1", recv_bomb),
+    ],
+}];
+
+/// The index `tests/receive.rs` seeds for each of the entries above is 0- or
+/// 1-based in the same way: a receive on an empty mailbox is the only shape that
+/// reaches `wait`/`wait_timeout` (a queued message matches at `loop_rec`).
+const _SEEDING_NOTE: () = ();
