@@ -1797,20 +1797,50 @@ fn scan_skips_a_non_matching_head_and_keeps_it_queued() {
 }
 
 #[test]
-fn a_marker_reserved_on_an_empty_queue_is_the_shared_undefined_atom() {
+fn a_marker_reserved_on_an_empty_queue_still_repositions_the_scan() {
+    // The marker contract of `../mailbox.rs` ("The marker anchor"): `reserve` **always**
+    // mints a small-integer marker, even on an empty queue, where it records the anchor
+    // `0`. The C's `am_undefined` shortcut is only equivalent *at that instant*; an
+    // explicit anchor stays usable afterwards, which is what this test discriminates.
     let mut rt = runtime();
-    // The atom `receive_marker_reserve` interns is the C `am_undefined`.
-    let undefined = rt.intern("undefined");
+    let pid = self_term(&rt);
     let mut ctx = RuntimeContext::new(&mut rt);
 
     let marker = ctx.receive_marker_reserve().expect("reserve");
-    assert_eq!(marker, undefined, "an empty queue has no position to record");
-    assert!(!is_small(marker), "`undefined` is an atom, not a marker id");
+    assert!(
+        is_small(marker),
+        "an empty queue still yields a small-integer marker, never the `undefined` atom"
+    );
+    ctx.receive_marker_bind(marker, make_small(7)).unwrap();
 
-    // Binding it is a silent no-op, and using the reference cannot move the scan.
-    ctx.receive_marker_bind(marker, make_small(1)).unwrap();
-    ctx.receive_marker_use(make_small(1)).unwrap();
-    assert_eq!(ctx.receive_next().unwrap(), None);
+    // A message arrives *after* the reserve and the scan runs past it: the `wait` shape
+    // leaves the cursor past the end of the queue it last scanned.
+    ctx.send_message(pid, make_small(5)).unwrap();
+    ctx.receive_skip().unwrap();
+    assert_eq!(
+        ctx.receive_next().unwrap(),
+        None,
+        "the cursor was advanced past the newly queued message"
+    );
+
+    ctx.receive_marker_use(make_small(7)).unwrap();
+    assert_eq!(
+        ctx.receive_next().unwrap(),
+        Some(make_small(5)),
+        "the marker reserved on the empty queue re-anchored the scan onto the message \
+         that arrived while the receive was parked"
+    );
+
+    // It is also releasable: after `recv_marker_clear` the marker no longer moves the
+    // scan, so a receive that resets still sees the message at the front of the queue.
+    ctx.receive_marker_clear(make_small(7)).unwrap();
+    ctx.receive_reset().unwrap();
+    ctx.receive_marker_use(make_small(7)).unwrap();
+    assert_eq!(
+        ctx.receive_next().unwrap(),
+        Some(make_small(5)),
+        "a cleared marker no longer repositions the scan"
+    );
 }
 
 #[test]
@@ -1862,9 +1892,15 @@ fn for_process_resolves_the_mailbox_against_the_supplied_table() {
 
     let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
     assert_eq!(ctx.pid(), pid);
-    // Empty: `Ok(None)` from the external table's process, `undefined` marker.
+    // Empty: `Ok(None)` from the external table's process, and — because `reserve` always
+    // mints a marker — a usable small integer rather than the atom `undefined`.
     assert_eq!(ctx.receive_next().unwrap(), None);
-    assert_eq!(ctx.receive_marker_reserve().unwrap(), undefined);
+    let marker = ctx.receive_marker_reserve().unwrap();
+    assert!(is_small(marker), "an empty queue yields a small-integer marker");
+    assert_ne!(
+        marker, undefined,
+        "the empty-queue marker is no longer the `undefined` atom"
+    );
 
     // A self-delivery lands in the external table's process mailbox.
     ctx.send_message(pid.to_eterm(), make_small(5)).unwrap();
