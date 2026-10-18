@@ -45,7 +45,7 @@
 //!
 //! | verb | C request | argument | reply |
 //! |---|---|---|---|
-//! | `open` | `INET_REQ_OPEN` (`:14577`) | `[AF, TYPE, PROTO]` (3 bytes) | `[1]`, `[0] ++ "eafnosupport"`, `[0] ++ "einval"` or `[0] ++ "eprotonosupport"` |
+//! | `open` | `INET_REQ_OPEN` (`:14577`) | `[AF, TYPE, PROTO]` (3 bytes) | `[1]`, `[0] ++ "eafnosupport"`, `[0] ++ "einval"`, `[0] ++ "eprotonosupport"`, or `[0] ++ "exbadseq"` on a port that is not `Closed` (`inet_ctl_open`, `:5130`) |
 //! | `bind` | `INET_REQ_BIND` (`:11409`) | packed address | `[1, port_hi, port_lo]` |
 //! | `connect` | `INET_REQ_CONNECT` (`:14710`) | packed address (the C's 4-byte timeout prefix is accepted and skipped) | `[1]`, or `[0] ++ errno` |
 //! | `send` | `packet_inet_command` (`:15037`) | `[address][anc_len:be32][data]`, optionally behind a `prim_inet` caller-reference prefix `[n:be16][tag]` | `[1]`, or `[0] ++ errno` |
@@ -123,10 +123,6 @@
 //!
 //! # Deliberate non-mirrors
 //!
-//! * **`open` of a second socket on a live port** answers `[0]einval` where the C's
-//!   `inet_ctl_open` answers `[0]exbadseq` (`:5130`); the same choice
-//!   [`super::TcpInetDriver`] makes, so both drivers refuse identically instead of leaking the
-//!   previous socket.
 //! * **`open` accepts only the datagram type.** The C's `packet_inet_ctl` accepts
 //!   `INET_TYPE_STREAM` for *either* entry point (it is one driver file), so the oracle's
 //!   `udp_inet` port answers `[1]` to `open [AF_INET, SOCK_STREAM, …]`. This floor's
@@ -648,7 +644,16 @@ pub struct UdpInetDriver {
     /// Mirrors the C's `INET_REQ_OPEN` decode (`packet_inet_ctl`, `:14577`-`:14617`): a
     /// non-`AF_INET` family is `[0] ++ "eafnosupport"` (`:14593`), a non-datagram type
     /// `[0] ++ "einval"` (`:14604`), and a protocol that is neither default nor UDP
-    /// `[0] ++ "eprotonosupport"` (`:14614`).
+    /// `[0] ++ "eprotonosupport"` (`:14614`) — and those decode refusals come **before** the
+    /// state guard, because the C reaches `inet_ctl_open` (`:14617`) only after them.
+    ///
+    /// A port that already holds a socket is not `INET_STATE_CLOSED`, so the C answers its
+    /// sequence error, `ctl_xerror(EXBADSEQ)` (`inet_ctl_open`, `:5130`-`:5131`) — the datagram
+    /// driver calls the very same function, so the reply is identical to
+    /// [`TcpInetDriver::verb_open`](super::TcpInetDriver)'s. Measured on OTP 29.1.1 / erts-17.1:
+    /// a second `INET_REQ_OPEN` on an opened `udp_inet` port answers
+    /// `[0,101,120,98,97,100,115,101,113]` (`[0] ++ "exbadseq"`), and a `close` + `open` answers
+    /// `[1]` again.
     ///
     /// # Errors
     ///
@@ -657,10 +662,7 @@ pub struct UdpInetDriver {
     /// created.
     fn verb_open(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
         if self.has_socket() {
-            // The C's `inet_ctl_open` answers `[0]exbadseq` here (`:5130`); this floor refuses
-            // to replace a live socket with the ordinary operational error instead — the same
-            // choice `TcpInetDriver::verb_open` makes (see the module docs).
-            return Ok(ctl_xerror("einval"));
+            return Ok(ctl_xerror("exbadseq"));
         }
         let [family, kind, protocol] = arg else {
             return Err(error::badarg());

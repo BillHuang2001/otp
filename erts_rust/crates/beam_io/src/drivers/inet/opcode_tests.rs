@@ -1031,12 +1031,12 @@ fn the_named_and_the_numeric_route_reply_identically() {
     );
     assert_eq!(
         named.control("open", &open_arg()),
-        ctl_xerror("einval"),
+        ctl_xerror("exbadseq"),
         "a second `open` on a live socket is refused on both routes"
     );
     assert_eq!(
         numeric.control(&op(1), &open_arg()),
-        ctl_xerror("einval"),
+        ctl_xerror("exbadseq"),
         "and the numeric route agrees"
     );
 

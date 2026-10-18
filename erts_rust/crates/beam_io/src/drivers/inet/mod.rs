@@ -48,7 +48,7 @@
 //! | `connect` | `INET_REQ_CONNECT` (`:12064`) | `Timeout(4) ++` packed address | `[1]`, or `[0] ++ errno` / `[0]etimedout` |
 //! | `send` | `tcp_inet_command` (`:12629`) | the bytes to send | `[1]` |
 //! | `recv` | `TCP_REQ_RECV` (`:12268`) | — | `[1]` † |
-//! | `shutdown` | `TCP_REQ_SHUTDOWN` (`:12339`) | `[how]` | `[1]` |
+//! | `shutdown` | `TCP_REQ_SHUTDOWN` (`:12339`) | `[how]` | `[1]`, or `[0]enotconn` / `[0]einval` |
 //! | `close` | `INET_REQ_CLOSE` (`:12259`) | — | `[1]` |
 //! | `setopts` | `INET_REQ_SETOPTS` (`:11111`) | option records `[opt, val_be32]*` | `[1]`, or `[0] ++ "einval"` |
 //! | `getopts` | `INET_REQ_GETOPTS` (`:11046`) | option codes `[opt]*` | `[1] ++ [opt, val_be32]*`, or `[0] ++ "einval"` |
@@ -65,7 +65,10 @@
 //! lowercase errno name the oracle uses (`erl_errno_id`, `:2249`), while a **malformed
 //! argument** or an **unknown verb** is [`beam_common::BeamError::BadArg`] — the crate's
 //! argument-fault convention. The C reports the former as `ctl_error(EINVAL)`; this floor
-//! reports it as `BadArg`.
+//! reports it as `BadArg` — **except** where the C's own arm answers a `ctl_error` for the same
+//! operand fault, which is then reproduced as the reply: `TCP_REQ_SHUTDOWN`'s `len != 1` is
+//! `ctl_error(EINVAL)` (`:12352`), so a wrong-length shutdown operand is `[0]einval`, and after
+//! its connection guard (`:12349`).
 //!
 //! # The packed address
 //!
@@ -1379,6 +1382,22 @@ impl TcpInetDriver {
 
     /// The `open` verb: creates the socket and registers it for read readiness.
     ///
+    /// A port that is **not** `Closed` answers the C's sequence error, not an argument fault:
+    /// `inet_ctl_open` opens with
+    /// `if (desc->state != INET_STATE_CLOSED) return ctl_xerror(EXBADSEQ, rbuf, rsize);`
+    /// (`inet_drv.c:5130`-`:5131`), i.e. `[0] ++ "exbadseq"` — measured on OTP 29.1.1 /
+    /// erts-17.1 as `[0,101,120,98,97,100,115,101,113]` for a second `INET_REQ_OPEN` on an
+    /// opened, a listening and a connected port alike. The C's operand decoding runs *before*
+    /// that guard (`tcp_inet_ctl`, `:11968`-`:11995`), so a malformed operand still answers its
+    /// own refusal; the numeric route does that in
+    /// [`control_opcode`](Self::control_opcode) before reaching here.
+    ///
+    /// A live descriptor **is** a non-`Closed` state on this floor (an owned close takes the
+    /// descriptor away and sets [`InetState::Closed`]; a `prebound` `INET_REQ_FDOPEN` one keeps
+    /// both across a close, exactly as `erl_inet_close`'s prebound arm does), so the guard is
+    /// [`has_socket`](Self::has_socket) — which also means a live socket is never leaked by
+    /// replacing it.
+    ///
     /// # Errors
     ///
     /// [`beam_common::BeamError::BadArg`] for an argument that is not the three-byte
@@ -1386,9 +1405,7 @@ impl TcpInetDriver {
     /// created.
     fn verb_open(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
         if self.has_socket() {
-            // The C has no such guard (its OPEN would leak the old socket); this floor
-            // refuses to replace a live socket with the operational-error reply instead.
-            return Ok(ctl_xerror("einval"));
+            return Ok(ctl_xerror("exbadseq"));
         }
         let [family, kind, protocol] = arg else {
             return Err(error::badarg());
@@ -1684,30 +1701,47 @@ impl TcpInetDriver {
 
     /// The `shutdown` verb: shuts one or both directions of the connection down.
     ///
+    /// The C's `TCP_REQ_SHUTDOWN` arm (`inet_drv.c:12339`-`:12370`) runs the **connection** guard
+    /// first — `!IS_CONNECTED ⇒ ctl_error(ENOTCONN)` (`:12349`) — and the operand-length guard
+    /// only afterwards — `len != 1 ⇒ ctl_error(EINVAL)` (`:12352`, `:12355`). Both are `[0]`-tagged
+    /// **replies**, never an argument raise, and the order is observable: a port with no peer
+    /// answers `[0]enotconn` whatever the operand's length is, while a **connected** one answers
+    /// `[0]einval`. Measured on OTP 29.1.1 against a raw `{spawn_driver,"tcp_inet"}` port:
+    /// `port_control(P, 44+magic, <<>>)` is `[0]"einval"` when connected and `[0]"enotconn"`
+    /// otherwise, and a valid one-byte operand on a connected port is `[1]`.
+    ///
     /// A `SHUT_WR`/`SHUT_RDWR` with output still queued is **deferred** until the queue drains
-    /// (the C's `TCP_ADDF_PENDING_SHUT_WR`/`TCP_ADDF_PENDING_SHUT_RDWR`), so no queued byte is
-    /// silently dropped.
+    /// (the C's `TCP_ADDF_PENDING_SHUT_WR`/`TCP_ADDF_PENDING_SHUT_RDWR`, `:12356`-`:12363`), so no
+    /// queued byte is silently dropped. Exactly as in the C, the deferral is gated on
+    /// `how != TCP_SHUT_RD` — a read-side shutdown is applied at once — and on `how` being one of
+    /// the two write values: any other byte falls through to `shutdown(2)`, which answers the
+    /// kernel's `EINVAL` as `[0]einval`.
     ///
     /// # Errors
     ///
-    /// `BeamError::BadArg` for an argument that is not a single `how` byte.
+    /// Never for an operand the C's arm replies to: a wrong length is the `[0]einval` reply and a
+    /// failing `shutdown(2)` is `[0] ++ errno`. Only a state contradiction (connected with no
+    /// descriptor) stays typed.
     fn verb_shutdown(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
         }
         let [how] = arg else {
-            return Err(error::badarg());
+            // `if (len != 1) return ctl_error(EINVAL, rbuf, rsize)` (`inet_drv.c:12352`) — the
+            // C's `ctl_error(EINVAL)`, i.e. the `[0] ++ "einval"` reply.
+            return Ok(ctl_xerror("einval"));
         };
+        let how = *how;
         let fd = self.connected_socket()?;
-        if *how != TCP_SHUT_RD && !ctx.output().is_empty() {
-            if *how == TCP_SHUT_WR || *how == TCP_SHUT_RDWR {
-                self.pending_shutdown = Some(*how);
+        if how != TCP_SHUT_RD && !ctx.output().is_empty() {
+            if how == TCP_SHUT_WR || how == TCP_SHUT_RDWR {
+                self.pending_shutdown = Some(how);
                 return Ok(ctl_ok());
             }
         }
-        match shutdown_socket(fd, *how) {
+        match shutdown_socket(fd, how) {
             Ok(()) => {
-                if *how == TCP_SHUT_WR || *how == TCP_SHUT_RDWR {
+                if how == TCP_SHUT_WR || how == TCP_SHUT_RDWR {
                     self.shutdown_wr_done = true;
                 }
                 Ok(ctl_ok())
