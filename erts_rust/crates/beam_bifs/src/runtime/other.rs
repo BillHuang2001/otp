@@ -68,21 +68,6 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     // `src/ets/` (`ets:slot/2` included).
     crate::runtime::runtime_bif!(reg, "ets", internal_request_all, 0);
 
-    // `erl_debugger` -- the interpreter-level debugger tools.
-    crate::runtime::runtime_bif!(reg, "erl_debugger", breakpoints, 1);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", breakpoints, 3);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", breakpoint, 3);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", instrumentations, 0);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", peek_stack_frame_slot, 4);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", peek_xreg, 3);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", register, 1);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", stack_frames, 2);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", supported, 0);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", toggle_instrumentations, 1);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", unregister, 2);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", whereis, 0);
-    crate::runtime::runtime_bif!(reg, "erl_debugger", xregs_count, 1);
-
     // `re` -- the 8 regular-expression keys are now real implementations served by
     // the in-crate engine (`crate::re`), not `RuntimeHooks` seam keys.
     crate::re::register(reg);
@@ -106,13 +91,14 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "code", reset_coverage, 1);
     crate::runtime::runtime_bif!(reg, "code", set_coverage_mode, 1);
 
-    // `erts_trace_cleaner` -- the trace-state cleanup signal machinery.
+    // `erts_trace_cleaner` -- the trace-state cleanup entry points the *collector
+    // process itself* would serve; `send_trace_clean_signal/1` is a real `notsup` stub
+    // in `src/runtime/erts_debug.rs`.
     crate::runtime::runtime_bif!(reg, "erts_trace_cleaner", check, 0);
-    crate::runtime::runtime_bif!(reg, "erts_trace_cleaner", send_trace_clean_signal, 1);
 
-    // `erts_literal_area_collector` -- literal-area copy/switch protocol.
+    // `erts_literal_area_collector` -- literal-area copy/switch protocol;
+    // `send_copy_request/3` is a real `notsup` stub in `src/runtime/erts_debug.rs`.
     crate::runtime::runtime_bif!(reg, "erts_literal_area_collector", release_area_switch, 0);
-    crate::runtime::runtime_bif!(reg, "erts_literal_area_collector", send_copy_request, 3);
 
     // `prim_file` -- the filename normalizer (needs the C NFC tables).
     crate::runtime::runtime_bif!(reg, "prim_file", internal_normalize_utf8, 1);

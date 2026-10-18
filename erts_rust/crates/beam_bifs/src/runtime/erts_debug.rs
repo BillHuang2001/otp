@@ -18,82 +18,107 @@
 //
 // %CopyrightEnd%
 
-//! The `erts_debug`/`erl_debugger` runtime-coupled BIFs (the internal debugger tools).
+//! The `erts_debug`/`erts_trace_cleaner`/`erts_literal_area_collector` BIFs (the
+//! internal debugging tools).
 //!
-//! Every key below is a declared `bif.tab` entry.
+//! Every key below is a declared `bif.tab` entry. Most of them are **host-independent
+//! constants or pure term operations**, and those are implemented here **for real**
+//! (see `REAL_BIFS`): `unaligned_bitstring/2` (a bitstring-to-bitstring
+//! transformation), `map_info/1` (a walk of a HAMT map's node interiors), the
+//! `lcnt`/`interpreter_size`/`disassemble` constants, the `get_internal_state` /
+//! `set_internal_state` gate, `size_shared/1` and `copy_shared/2` (term walks), and
+//! the two `notsup` protocol stubs of the trace/literal-area collectors.
 //!
-//! `unaligned_bitstring/2` and `map_info/1` are implemented here **for real** — the
-//! former a pure term transformation over the shared [`crate::access`] bitstring
-//! surface, the latter a walk of a hash map's HAMT node interiors over the
-//! [`crate::access`] node accessors (see `REAL_BIFS`).
-//!
-//! Every other key requires the *running* runtime (VM introspection, the distribution
-//! codec, lock-counter bookkeeping, the internal-state knobs). Each is registered
+//! The rest require the *running* runtime (VM introspection, the distribution codec,
+//! lock-counter bookkeeping, the dirty-scheduler probes). Each of those is registered
 //! through the single [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so with no
 //! hook installed a call answers the typed `unsupported_bif` capability gap — never
-//! `undef`, never a fabricated value (e.g. a constant `0` for
-//! `interpreter_size/0`).
-//!
-//! `size_shared/1` stays such a gap, and not for want of a hook: the oracle's
-//! `size_shared` (`../../erts/emulator/beam/copy.c:319`) counts the words a term
-//! **shares** with other terms — the literal-area subterms handed out to a module's
-//! code. This runtime models no shared/literal-area subterms at all (every term a BIF
-//! sees is built fresh on a process heap), so no term here can share storage with
-//! another and the oracle's **non-zero** results are unreachable: it could only ever
-//! answer `0`, which for a sharing-measuring BIF is a fabricated value rather than an
-//! answer. `copy_shared/2` is blocked on the same missing model.
+//! `undef`, never a fabricated value.
 
-use beam_common::{BeamError, Result};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use beam_common::{BeamError, ExitReason, Result};
 use beam_term::prelude::signed_value;
-use beam_term::{Eterm, NIL};
+use beam_term::size::{size_object_with, SizingPolicy};
+use beam_term::{atom_val, Eterm, NIL};
 
 use crate::access;
 use crate::arith;
 use crate::context::BifContext;
-use crate::error::{badarg, structured_error};
+use crate::error::{badarg, raise_error, structured_error, system_limit, undefined_bif};
+use crate::error::unsupported_bif;
 use crate::registry::BifRegistry;
 
 /// The `(module, function, arity)` keys this module implements **for real** (rather
 /// than forwarding to the [`RuntimeHooks`](crate::context::RuntimeHooks) seam).
 ///
-/// Sorted by `(module, function, arity)`. A follow-up task (the `hook_sets` pass)
-/// consumes this list to drop the matching `runtime_bif!` key from the
-/// `RUNTIME_HOOKS_BIFS` roster of `src/hook_sets.rs`; until then it is the single
-/// source of truth for which keys the real implementations own, and [`register`]
-/// asserts every one of them is actually present after registration.
+/// Sorted by `(module, function, arity)`. `src/hook_sets.rs`'s `RUNTIME_HOOKS_BIFS`
+/// roster is asserted **equal** to the seam roster, so a key listed here must not be
+/// there; [`register`] asserts every one of them is actually present.
 pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
+    ("erts_debug", "copy_shared", 2),
+    ("erts_debug", "disassemble", 1),
+    ("erts_debug", "get_internal_state", 1),
+    ("erts_debug", "interpreter_size", 0),
+    ("erts_debug", "lcnt_clear", 0),
+    ("erts_debug", "lcnt_collect", 0),
+    ("erts_debug", "lcnt_control", 1),
+    ("erts_debug", "lcnt_control", 2),
     ("erts_debug", "map_info", 1),
+    ("erts_debug", "set_internal_state", 2),
+    ("erts_debug", "size_shared", 1),
     ("erts_debug", "unaligned_bitstring", 2),
+    ("erts_literal_area_collector", "send_copy_request", 3),
+    ("erts_trace_cleaner", "send_trace_clean_signal", 1),
 ];
 
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "erts_debug", breakpoint, 2);
-    crate::runtime::runtime_bif!(reg, "erts_debug", copy_shared, 2);
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty, 3);
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty_cpu, 2);
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty_io, 2);
-    crate::runtime::runtime_bif!(reg, "erts_debug", disassemble, 1);
     crate::runtime::runtime_bif!(reg, "erts_debug", dist_ext_to_term, 2);
-    crate::runtime::runtime_bif!(reg, "erts_debug", get_internal_state, 1);
     crate::runtime::runtime_bif!(reg, "erts_debug", instructions, 0);
-    crate::runtime::runtime_bif!(reg, "erts_debug", interpreter_size, 0);
-    crate::runtime::runtime_bif!(reg, "erts_debug", lcnt_clear, 0);
-    crate::runtime::runtime_bif!(reg, "erts_debug", lcnt_collect, 0);
-    crate::runtime::runtime_bif!(reg, "erts_debug", lcnt_control, 1);
-    crate::runtime::runtime_bif!(reg, "erts_debug", lcnt_control, 2);
-    // `map_info/1` summarises a HAMT map's node interior (depth, arrays, collisions,
-    // bitmaps, leafs); the walk is implemented below over the `crate::access` HAMT
-    // node accessors.
-    crate::runtime::runtime_bif!(reg, "erts_debug", map_info, 1);
-    crate::runtime::runtime_bif!(reg, "erts_debug", set_internal_state, 2);
-    // A gap on purpose — the sharing it measures is unrepresentable here (see the
-    // module docs), so a value would be fabricated.
-    crate::runtime::runtime_bif!(reg, "erts_debug", size_shared, 1);
-    // Implemented for real (a pure bitstring-to-bitstring transformation).
-    reg.register("erts_debug", "unaligned_bitstring", 2, unaligned_bitstring);
-    // Implemented for real (a read-only walk of the frozen HAMT node interiors).
+
+    // The host-independent keys, implemented below. `map_info/1` summarises a HAMT
+    // map's node interior; `unaligned_bitstring/2` is a bitstring-to-bitstring
+    // transformation; the `lcnt`/`interpreter_size`/`disassemble` keys are the
+    // constants a build without those facilities answers; the internal-state pair is
+    // the `available_internal_state` gate; `size_shared`/`copy_shared` are term walks;
+    // and the two collector keys are `notsup` stubs (their machinery does not exist in
+    // this runtime at all — see the module docs on each).
+    reg.register("erts_debug", "copy_shared", 2, copy_shared_2);
+    reg.register("erts_debug", "disassemble", 1, disassemble_1);
+    reg.register("erts_debug", "get_internal_state", 1, get_internal_state_1);
+    reg.register("erts_debug", "interpreter_size", 0, interpreter_size_0);
+    reg.register("erts_debug", "lcnt_clear", 0, lcnt_clear_0);
+    reg.register("erts_debug", "lcnt_collect", 0, lcnt_collect_0);
+    reg.register("erts_debug", "lcnt_control", 1, lcnt_control_1);
+    reg.register("erts_debug", "lcnt_control", 2, lcnt_control_2);
     reg.register("erts_debug", "map_info", 1, map_info_1);
+    reg.register(
+        "erts_debug",
+        "set_internal_state",
+        2,
+        set_internal_state_2,
+    );
+    reg.register("erts_debug", "size_shared", 1, size_shared_1);
+    reg.register("erts_debug", "unaligned_bitstring", 2, unaligned_bitstring);
+    reg.register(
+        "erts_literal_area_collector",
+        "send_copy_request",
+        3,
+        send_copy_request_3,
+    );
+    reg.register(
+        "erts_trace_cleaner",
+        "send_trace_clean_signal",
+        1,
+        send_trace_clean_signal_1,
+    );
     // `REAL_BIFS` is the declared roster; keep it honest against what was registered.
     debug_assert!(
         REAL_BIFS
@@ -101,6 +126,336 @@ pub(crate) fn register(reg: &mut BifRegistry) {
             .all(|(module, function, arity)| reg.contains(module, function, *arity)),
         "REAL_BIFS lists a key that this module does not register"
     );
+}
+
+/// `erts_debug:interpreter_size/0` — the size of the BEAM interpreter's instruction
+/// dispatch table in words.
+///
+/// Ground truth: `../../erts/emulator/beam/beam_debug.c:517-532`
+/// (`erts_debug_interpreter_size_0`). A `BEAMASM` build (which is every default
+/// OTP) has no interpreter to measure and answers `make_small(0)`; the
+/// `#ifndef BEAMASM` arm measures `high - low` over the opcode addresses. This
+/// runtime keeps no such table, so the `BEAMASM` answer is the faithful one.
+/// Oracle-verified: the integer `0` (not the atom `false`).
+///
+/// # Errors
+///
+/// Propagates nothing: `0` is always a small integer.
+fn interpreter_size_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    ctx.int(0)
+}
+
+/// `erts_debug:disassemble/1` — disassemble the code at an address or `MFA`.
+///
+/// Ground truth: `../../erts/emulator/beam/beam_debug.c:396-515`
+/// (`erts_debug_disassemble_1`). Its `BEAMASM` arm is a bare `BIF_RET(am_false)`
+/// *before* the argument is looked at, so every argument — a loaded module name, an
+/// unloaded atom, an integer, a list — answers `false`. Oracle-verified for
+/// `{lists,map,2}`, `lists`, `no_such_module_xyz`, `42` and `[a,b]`.
+///
+/// # Errors
+///
+/// [`BeamError::TermNotFound`](beam_common::BeamError::TermNotFound) when the atom
+/// `false` is neither interned nor internable — unreachable in a real runtime.
+fn disassemble_1(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    ctx.boolean(false)
+}
+
+/// `erts_debug:lcnt_clear/0` — clear the lock-counter samples.
+///
+/// Ground truth: `../../erts/emulator/beam/erl_bif_info.c:6311-6320`. Without
+/// `ERTS_ENABLE_LOCK_COUNT` (every default build) it is a bare `BIF_RET(am_error)`;
+/// with it, `am_ok`. Oracle-verified on OTP 29.1.1: the atom `error`.
+///
+/// # Errors
+///
+/// [`BeamError::TermNotFound`](beam_common::BeamError::TermNotFound) when the atom
+/// `error` is neither interned nor internable.
+fn lcnt_clear_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    ctx.atom("error")
+}
+
+/// `erts_debug:lcnt_collect/0` — collect the lock-counter samples.
+///
+/// Ground truth: `../../erts/emulator/beam/erl_bif_info.c:6322-6355`: without
+/// `ERTS_ENABLE_LOCK_COUNT` a bare `BIF_RET(am_error)`. Oracle-verified: the atom
+/// `error` — not a `{ok, {locks, []}}` shape.
+///
+/// # Errors
+///
+/// [`BeamError::TermNotFound`](beam_common::BeamError::TermNotFound) when the atom
+/// `error` is neither interned nor internable.
+fn lcnt_collect_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    ctx.atom("error")
+}
+
+/// `erts_debug:lcnt_control/1` — read the lock-counter category mask.
+///
+/// Ground truth: `../../erts/emulator/beam/erl_bif_info.c:6357-6382`. The whole body
+/// sits under `#ifdef ERTS_ENABLE_LOCK_COUNT`; without it the function falls through
+/// to the trailing `BIF_ERROR(BIF_P, BADARG)` for **every** argument. Oracle-verified
+/// for `clear`, `{clear,[]}`, `[a]` and `42`.
+///
+/// # Errors
+///
+/// Always [`BeamError::BadArg`](beam_common::BeamError::BadArg).
+fn lcnt_control_1(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    Err(badarg())
+}
+
+/// `erts_debug:lcnt_control/2` — set the lock-counter category mask / `copy_save`.
+///
+/// Ground truth: `../../erts/emulator/beam/erl_bif_info.c:6384-6418`: without
+/// `ERTS_ENABLE_LOCK_COUNT` the trailing `BIF_ERROR(BIF_P, BADARG)` is the only
+/// reachable outcome. Oracle-verified for `clear`, `a`, and `42,43`.
+///
+/// # Errors
+///
+/// Always [`BeamError::BadArg`](beam_common::BeamError::BadArg).
+fn lcnt_control_2(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    Err(badarg())
+}
+
+/// The `available_internal_state` gate (`erl_bif_info.c:4341`,
+/// `erts_bif_info_init` at `:6459` initialises it to `0`).
+///
+/// A fresh VM has it **off**, and off means `erts_debug:get_internal_state/1` and
+/// `erts_debug:set_internal_state/2` raise `EXC_UNDEF` — the bare atom `undef`, which
+/// is why the oracle's answer to a gate-off call is `{error,undef}` and not a
+/// `badarg` for a bogus argument. The one gate-*free* arm is
+/// `set_internal_state(available_internal_state, Bool)`, which flips the gate and
+/// returns its previous value.
+///
+/// The gate is process-global (as in ERTS) and lives here as a single atomic; it is
+/// per-VM state, so it is deliberately not per-`BifContext`.
+static AVAILABLE_INTERNAL_STATE: AtomicBool = AtomicBool::new(false);
+
+/// `erts_debug:get_internal_state/1` — the emulator's internal state.
+///
+/// Ground truth: `../../erts/emulator/beam/erl_bif_info.c:4346-4349`: the *first*
+/// thing the BIF does is
+///
+/// ```text
+/// if (!erts_atomic_read_nob(&available_internal_state)) BIF_ERROR(BIF_P, EXC_UNDEF);
+/// ```
+///
+/// so with the gate off (a fresh VM) **every** argument — `memory`,
+/// `available_internal_state`, or garbage — raises the bare atom `undef`.
+/// Oracle-verified.
+///
+/// With the gate **on** the oracle serves real introspection (`memory` answers the
+/// allocator totals, a bogus argument answers `badarg`), and none of those values can
+/// be computed by this runtime (the same `erlang:memory/0` shape is a `MemoryHook`
+/// seam, and the rest is scheduler/process-table internals) — so a gate-on call
+/// answers the typed [`unsupported_bif`] capability gap: a real function the host has
+/// not provided, never a fabricated value and never `undef`.
+///
+/// # Errors
+///
+/// `error:undef` while the gate is off (see above), the typed `unsupported_bif` raise
+/// while it is on.
+fn get_internal_state_1(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    if AVAILABLE_INTERNAL_STATE.load(Ordering::SeqCst) {
+        Err(unsupported_bif())
+    } else {
+        Err(undefined_bif())
+    }
+}
+
+/// `erts_debug:set_internal_state/2` — set the emulator's internal state.
+///
+/// Ground truth: `../../erts/emulator/beam/erl_bif_info.c:5040-5071`. The
+/// **gate-free** arm comes first and is the only one reachable while the gate is off:
+///
+/// ```text
+/// if (ERTS_IS_ATOM_STR("available_internal_state", BIF_ARG_1)
+///     && (BIF_ARG_2 == am_true || BIF_ARG_2 == am_false)) {
+///     ... erts_atomic_xchg_nob(&available_internal_state, on) ...
+///     BIF_RET(prev_on ? am_true : am_false);
+/// }
+/// if (!erts_atomic_read_nob(&available_internal_state)) BIF_ERROR(BIF_P, EXC_UNDEF);
+/// ```
+///
+/// So `set_internal_state(available_internal_state, true|false)` returns the
+/// **previous** boolean and needs no gate, while anything else — including
+/// `set_internal_state(available_internal_state, 42)`, whose second argument fails the
+/// `am_true`/`am_false` test and therefore falls through to the gate check — raises
+/// the bare atom `undef` while the gate is off. Oracle-verified: `false` on the first
+/// enable, `true` on the second, `true` on the disable, and `{error,undef}` for the
+/// non-boolean.
+///
+/// With the gate on, the remaining arms (`reds_left`, `next_pid`, `block`, …) are
+/// emulator internals this runtime cannot serve, so they answer the typed
+/// [`unsupported_bif`] gap.
+///
+/// # Errors
+///
+/// `error:undef` while the gate is off and the first argument is not the
+/// `available_internal_state` pair; the typed `unsupported_bif` raise while it is on.
+fn set_internal_state_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    if atom_is(ctx, args[0], "available_internal_state") {
+        if let Some(on) = boolean_of(ctx, args[1]) {
+            let previous = AVAILABLE_INTERNAL_STATE.swap(on, Ordering::SeqCst);
+            return ctx.boolean(previous);
+        }
+    }
+    if AVAILABLE_INTERNAL_STATE.load(Ordering::SeqCst) {
+        Err(unsupported_bif())
+    } else {
+        Err(undefined_bif())
+    }
+}
+
+/// `erts_debug:size_shared/1` — the words of `Term`'s graph, each distinct object
+/// counted once.
+///
+/// Ground truth: `size_shared(obj)` in `../../erts/emulator/beam/copy.c:315-345`
+/// whose own comment says "This currently returns the same as `erts_debug:size/1`.
+/// It is argued whether the size of subterms in constant pools should be counted or
+/// not." The algorithm is `size_object`'s per-shape word count (the same
+/// [`beam_term::layout::object_words`] table this runtime already uses for
+/// `erts_debug:flat_size/1` and the copy engines), walked with a **visited set**:
+/// an object reached a second time contributes `0` and is not descended into.
+///
+/// `beam_term` exposes exactly that as a [`SizingPolicy`], so the dedup is the
+/// policy's [`is_shared`](SizingPolicy::is_shared) and the walk stays the canonical
+/// one ([`size_object_with`]).
+///
+/// # The one unrepresentable half: literal areas
+///
+/// The C also skips any subterm that lives in a **literal area**
+/// (`erts_is_literal`, `COUNT_OFF_HEAP == 0`, `copy.c:330-333`), which is why a
+/// *constant* such as `[a,b]` compiled into a module answers `0` there while
+/// `erts_debug:size/1` answers `4`. This runtime has no literal areas at all (every
+/// term a BIF sees is built on a process heap, see `crate::bits`), so no subterm is
+/// ever skipped for that reason and a term the oracle keeps in a literal area is
+/// counted here exactly as the oracle counts the same term built at run time. Every
+/// **run-time-built** term — the whole graph a program can actually construct through
+/// BIFs — agrees, which is what the module tests pin against the oracle.
+///
+/// # Errors
+///
+/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) if the count does
+/// not fit a small integer (unreachable: a heap that large cannot exist), or a heap
+/// failure from materialising the integer.
+fn size_shared_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let words = i64::try_from(size_object_with(args[0], &SharedOnce::new()))
+        .map_err(|_| system_limit())?;
+    arith::int_from_i64(ctx, words)
+}
+
+/// The `size_shared/1` pricing policy: an object is priced (and descended into) the
+/// **first** time it is reached and contributes nothing afterwards.
+///
+/// The identity is the term word itself — for every non-immediate the frozen `Eterm`
+/// layout carries the object's heap address (`beam_term` §2), so two references to
+/// one object are the same word. `is_shared` is only ever called by the sizing walk
+/// for a non-immediate ([`beam_term::size`]'s `needs_visit`), so an immediate can
+/// never enter the set.
+struct SharedOnce {
+    seen: RefCell<HashSet<Eterm>>,
+}
+
+impl SharedOnce {
+    fn new() -> Self {
+        SharedOnce {
+            seen: RefCell::new(HashSet::new()),
+        }
+    }
+}
+
+impl SizingPolicy for SharedOnce {
+    fn is_shared(&self, t: Eterm) -> bool {
+        // `true` = already counted through another reference: price 0, do not descend.
+        !self.seen.borrow_mut().insert(t)
+    }
+}
+
+/// `erts_debug:copy_shared/2` — a sharing-preserving copy of `Term`.
+///
+/// Ground truth: `../../erts/emulator/beam/beam_debug.c:168-190`
+/// (`erts_debug_copy_shared_2`). The **second** argument is inspected first and must
+/// be exactly `true` (`copy_literals = 1`) or `false` (`0`); anything else is
+/// `badarg` *before* `Term` is looked at — oracle-verified with `atom`, `1` and `[]`
+/// as the second argument of `copy_shared(foo, _)`, all `{error,badarg}`.
+///
+/// # What the copy is here
+///
+/// `copy_literals` selects whether subterms living in a module's **literal area** are
+/// copied onto the process heap or left shared: `erts_debug:same(copy_shared(Lit,
+/// false), Lit)` is `true` on the oracle while `copy_shared(Lit, true)` returns a
+/// fresh graph. This runtime has no literal areas (see
+/// [`size_shared_1`]'s note), so every term, `Term` included, already lives on a
+/// process heap and is already "the copy": the BIF returns `Term` itself. Structurally
+/// it is `=:=` to the oracle's result for every argument (oracle-verified for a
+/// literal list, a heap tuple, a 1000-byte refc binary, a 40-key map and an external
+/// fun), and its sharing structure is preserved — only `erts_debug:same/2` against the
+/// original cannot see the fresh address the oracle's `copy_literals = true` copy
+/// gets, which is precisely the literal-area model this runtime does not have.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a second argument that is
+/// not the atom `true` or `false`.
+fn copy_shared_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // The C switches on `BIF_ARG_2` first, so an invalid flag wins over any `Term`.
+    if boolean_of(ctx, args[1]).is_none() {
+        return Err(badarg());
+    }
+    Ok(args[0])
+}
+
+/// `erts_trace_cleaner:send_trace_clean_signal/1` — the trace-session cleanup RPC.
+///
+/// Ground truth: `../../erts/emulator/beam/erl_bif_trace.c:649-657`: the BIF is
+/// restricted to the emulator's own `erts_trace_cleaner` process and raises
+/// `EXC_NOTSUP` otherwise — before the target argument is inspected. This runtime has
+/// no such process (nor a trace-session cleaner), so `notsup` is the faithful answer
+/// for every argument. Oracle-verified for `1`, `[]`, `self()` and `a`.
+///
+/// # Errors
+///
+/// Always `error:notsup`.
+fn send_trace_clean_signal_1(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    Err(notsup())
+}
+
+/// `erts_literal_area_collector:send_copy_request/3` — the copy-literals request.
+///
+/// Ground truth: `../../erts/emulator/beam/beam_bif_load.c:1749-1759`: restricted to
+/// the emulator's own `erts_literal_area_collector` process, `EXC_NOTSUP` otherwise
+/// and before any argument check. This runtime has no literal areas, so no such
+/// collector process exists and `notsup` is the faithful answer for every argument.
+/// Oracle-verified for `(1,2,3)`, `([],[],[])` and `(a,b,c)`.
+///
+/// # Errors
+///
+/// Always `error:notsup`.
+fn send_copy_request_3(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    Err(notsup())
+}
+
+/// The `EXC_NOTSUP` raise (`erts/emulator/beam/erl_term.h`'s `am_notsup`): an
+/// `error`-class raise whose reason is the bare atom `notsup`.
+fn notsup() -> BeamError {
+    raise_error(ExitReason::atom("notsup"))
+}
+
+/// Whether `term` is the atom `name`.
+fn atom_is(ctx: &BifContext<'_>, term: Eterm, name: &str) -> bool {
+    access::is_atom(term) && ctx.atoms().name(atom_val(term)) == Some(name)
+}
+
+/// The boolean `term` denotes, or `None` when it is neither the atom `true` nor the
+/// atom `false` (the C's `BIF_ARG_2 == am_true || BIF_ARG_2 == am_false` test).
+fn boolean_of(ctx: &BifContext<'_>, term: Eterm) -> Option<bool> {
+    if atom_is(ctx, term, "true") {
+        Some(true)
+    } else if atom_is(ctx, term, "false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// `erts_debug:unaligned_bitstring(Bitstring, Offset)`.
