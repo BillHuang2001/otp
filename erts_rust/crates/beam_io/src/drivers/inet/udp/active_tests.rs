@@ -88,9 +88,13 @@ const INET_MODE_BINARY: i32 = 1;
 /// readiness callback may take.
 const INET_PACKET_POLL: i32 = 5;
 /// `INT16_MAX`: the `{active, N}` counter's ceiling (`:6975`).
-const ACTIVE_COUNT_MAX: i32 = i16::MAX as i32;
+const ACTIVE_COUNT_MAX: i16 = i16::MAX;
 /// The `{active, 2}` credit the multi cases arm with.
-const ACTIVE_MULTI_CREDIT: i32 = 2;
+const ACTIVE_MULTI_CREDIT: i16 = 2;
+/// The bytes of one `{active, N}` record: the five-byte `[opt, INET_MULTI_be32]` record plus the
+/// trailing big-endian 16-bit counter (`Sint16`, `inet_drv.c:1256`, `:6977`) — see
+/// [`Rig::multi_record`].
+const ACTIVE_MULTI_RECORD: usize = 7;
 /// One round's poll budget. Every wait in this suite is a *condition* under [`HANG_GUARD`], so
 /// this only paces the rounds; a starved host cannot fail a case with it.
 const ROUND_BUDGET: Duration = Duration::from_millis(100);
@@ -171,6 +175,15 @@ impl Rig {
             .unwrap_or_else(|err| panic!("the `{command}` control call failed: {err:?}"))
     }
 
+    /// One `INET_REQ_SETOPTS` carrying `records` **verbatim**.
+    ///
+    /// The record shapes are code-dependent — `{active, N}` is a seven-byte record, every other
+    /// option here a five-byte one — so the byte-level form is this suite's primitive and
+    /// [`Rig::set_options`] is the five-byte convenience on top of it.
+    fn set_records(&mut self, records: &[u8]) -> Vec<u8> {
+        self.control(op(INET_REQ_SETOPTS), records)
+    }
+
     /// One `INET_REQ_SETOPTS` carrying `records` (`[code, value_be32]*`).
     fn set_options(&mut self, records: &[(u8, i32)]) -> Vec<u8> {
         let mut arg = Vec::with_capacity(records.len() * 5);
@@ -178,7 +191,37 @@ impl Rig {
             arg.push(*code);
             arg.extend_from_slice(&value.to_be_bytes());
         }
-        self.control(op(INET_REQ_SETOPTS), &arg)
+        self.set_records(&arg)
+    }
+
+    /// The **`{active, N}`** record: the option code, the value [`INET_MULTI`], then a trailing
+    /// big-endian 16-bit counter.
+    ///
+    /// This — not a bare `[INET_LOPT_ACTIVE, 0, 0, 0, N]` — is how `prim_inet` spells a counter:
+    /// `inet:setopts(S, [{active, N}])` encodes the value as `INET_MULTI` and appends `N`
+    /// (`inet_drv.c:6977`), and `opt_state.rs::set_active` reads it back out of
+    /// `rest[RECORD..RECORD + ACTIVE_COUNTER]`, taking the multi path **only** when the value is
+    /// [`INET_MULTI`]. A bare five-byte record whose value is `N` is therefore a *different*
+    /// option — the wire values are `0`/`1`/`2` for `{active, false|true|once}` and `3` for the
+    /// multi form whose counter must follow — so `[…, 0, 0, 0, 2]` is `{active, once}` (a silent
+    /// flip with no counter at all) and `[…, 0, 0, 0, 3]` a multi whose counter is missing (the
+    /// typed `badarg`).
+    fn multi_record(n: i16) -> Vec<u8> {
+        let mut record = Vec::with_capacity(ACTIVE_MULTI_RECORD);
+        record.push(INET_LOPT_ACTIVE);
+        record.extend_from_slice(&INET_MULTI.to_be_bytes());
+        record.extend_from_slice(&n.to_be_bytes());
+        record
+    }
+
+    /// `{active, N}` — [`Rig::multi_record`] over `INET_REQ_SETOPTS`.
+    fn set_multi(&mut self, n: i16) -> Vec<u8> {
+        self.set_records(&Self::multi_record(n))
+    }
+
+    /// `{active, N}`, asserting the walk accepted it.
+    fn arm_multi(&mut self, n: i16) {
+        assert_eq!(self.set_multi(n), ctl_ok(), "{{active,{n}}} is accepted");
     }
 
     /// `{active, value}` — the one option this whole suite turns on.
@@ -412,10 +455,10 @@ fn an_active_once_port_flips_silently_after_one_delivery() {
 #[test]
 fn an_active_n_port_delivers_n_datagrams_then_one_passive_message() {
     let mut rig = Rig::new();
-    rig.arm(ACTIVE_MULTI_CREDIT);
+    rig.arm_multi(ACTIVE_MULTI_CREDIT);
     assert_eq!(
         rig.active_state(),
-        (INET_MULTI, Some(2)),
+        (INET_MULTI, Some(ACTIVE_MULTI_CREDIT)),
         "the counter is the credit"
     );
     for index in 1..=3 {
@@ -458,14 +501,32 @@ fn an_active_n_port_delivers_n_datagrams_then_one_passive_message() {
     assert!(after.inputs.is_empty(), "a passive port delivers nothing");
 }
 
+/// The `{active, N}` record's wire form, and the three-bare-values trap it avoids.
+#[test]
+fn a_multi_record_is_the_seven_byte_prim_inet_form() {
+    // `[opt, INET_MULTI_be32, counter_be16]` — what `inet:setopts(S,[{active,2}])` puts on the
+    // wire (`inet_drv.c:6977`), read back by `opt_state.rs::set_active`.
+    assert_eq!(
+        Rig::multi_record(2),
+        vec![INET_LOPT_ACTIVE, 0, 0, 0, 3, 0, 2],
+        "the seven-byte `{{active,2}}` record"
+    );
+    assert_eq!(
+        Rig::multi_record(-1),
+        vec![INET_LOPT_ACTIVE, 0, 0, 0, 3, 0xff, 0xff],
+        "a negative credit is the Sint16 two's complement"
+    );
+    assert_eq!(Rig::multi_record(2).len(), ACTIVE_MULTI_RECORD);
+}
+
 /// `{active, 2}`'s value — the suite's constant for "two credits".
 #[test]
 fn the_active_n_counter_accumulates_and_is_reset_by_the_other_modes() {
     // `{active, 1}` twice: the C's `ac = active_count; ac += nval` (`:6975`) accumulates.
     let mut rig = Rig::new();
-    rig.arm(1);
+    rig.arm_multi(1);
     assert_eq!(rig.active_state(), (INET_MULTI, Some(1)));
-    rig.arm(1);
+    rig.arm_multi(1);
     assert_eq!(
         rig.active_state(),
         (INET_MULTI, Some(2)),
@@ -479,14 +540,14 @@ fn the_active_n_counter_accumulates_and_is_reset_by_the_other_modes() {
     assert_eq!(passive_count(&drained.inputs), 1, "then one passive message");
     // `{active, false}` zeroes the counter (and is not multi, so no counter is reported).
     let mut rig = Rig::new();
-    rig.arm(7);
+    rig.arm_multi(7);
     rig.arm(INET_PASSIVE);
     assert_eq!(
         rig.active_state(),
         (INET_PASSIVE, None),
         "{{active,false}} zeroes the counter"
     );
-    rig.arm(4);
+    rig.arm_multi(4);
     assert_eq!(
         rig.active_state(),
         (INET_MULTI, Some(4)),
@@ -501,15 +562,20 @@ fn the_active_n_counter_accumulates_and_is_reset_by_the_other_modes() {
     );
     // The counter's `INT16` ceiling (`:6975`): `ac > INT16_MAX` is refused with `[0]einval`.
     let mut rig = Rig::new();
-    rig.arm(ACTIVE_COUNT_MAX);
+    rig.arm_multi(ACTIVE_COUNT_MAX);
     assert_eq!(
-        rig.set_active(ACTIVE_COUNT_MAX),
+        rig.active_state(),
+        (INET_MULTI, Some(ACTIVE_COUNT_MAX)),
+        "the ceiling itself is accepted"
+    );
+    assert_eq!(
+        rig.set_multi(ACTIVE_COUNT_MAX),
         ctl_xerror("einval"),
         "the sum overflows the C's Sint16"
     );
     assert_eq!(
         rig.active_state(),
-        (INET_MULTI, Some(i16::MAX)),
+        (INET_MULTI, Some(ACTIVE_COUNT_MAX)),
         "the refused record left the counter where it was (no rollback, `:6975`)"
     );
 }
@@ -519,10 +585,10 @@ fn an_active_n_reaching_zero_inside_setopts_reports_one_passive_message() {
     // No datagram is involved at all: `{active,1}` then `{active,-1}` sums to 0, which the option
     // walk turns into `active = INET_PASSIVE` + `packet_passive_message` (`:6993`-`:6998`).
     let mut rig = Rig::new();
-    rig.arm(1);
+    rig.arm_multi(1);
     let before = rig.registry.take_active_inputs();
     assert!(before.is_empty(), "arming reports nothing");
-    assert_eq!(rig.set_active(-1), ctl_ok(), "a negative credit is accepted");
+    assert_eq!(rig.set_multi(-1), ctl_ok(), "a negative credit is accepted");
     // The control call itself staged the message — no round, no poll, no datagram.
     let staged = rig.registry.take_active_inputs();
     assert_eq!(staged.len(), 1, "exactly one delivery from the setopts path");
@@ -620,6 +686,25 @@ fn a_datagram_buffered_while_passive_is_delivered_after_arming() {
 // ---------------------------------------------------------------------------
 // The channel is term-free: `[list]` and `[binary]` deliver the same read
 // ---------------------------------------------------------------------------
+/// The read the driver handed up, with the packed **source port** field masked out of its header.
+///
+/// The two modes are exercised by two independent [`Rig`]s — two `udp_inet` sockets bound to two
+/// different ephemeral port numbers — and each injects from its own fresh external sender, so the
+/// two deliveries necessarily name two different source ports. That field is the *sender's*
+/// ephemeral port, not anything the driver derives; it is pinned per mode by
+/// [`Rig::inject`]'s sender in the loop below. Masking it lets everything the driver **does**
+/// control — the family tag, the four address octets and the whole body — still be compared byte
+/// for byte, which is the point of the comparison.
+fn without_source_port(read: &ReadMessage) -> ReadMessage {
+    let (addr, _source) = split_packed(&read.header);
+    let mut header = vec![INET_AF_INET, 0, 0];
+    header.extend_from_slice(&addr);
+    ReadMessage {
+        header,
+        body: read.body.clone(),
+    }
+}
+
 #[test]
 fn the_delivery_shape_is_the_same_in_list_and_binary_mode() {
     let mut reads = Vec::new();
@@ -650,8 +735,10 @@ fn the_delivery_shape_is_the_same_in_list_and_binary_mode() {
         reads.push(read);
     }
     assert_eq!(
-        reads[0], reads[1],
-        "the driver's read carries no term shape, so the two modes agree byte for byte"
+        without_source_port(&reads[0]),
+        without_source_port(&reads[1]),
+        "the driver's read carries no term shape, so the two modes agree byte for byte (the \
+         ephemeral source port is the sender's own, pinned per mode above, and masked here)"
     );
 }
 
@@ -778,22 +865,80 @@ fn multi_probe() -> String {
     )
 }
 
+/// The Rust side of [`multi_probe`], rendered exactly as that probe prints: the deliveries in
+/// delivery order, `{data,<<"dN">>}` for each and `passive` for the `{udp_passive, S}`.
+///
+/// The readback through `getopts` is asserted first, so the row this renders is provably a
+/// **genuine** `{active, 2}` — `opt_state.rs` reports the counter only for `INET_MULTI`, the wire
+/// value `prim_inet` uses — and never the five-byte record that decodes as `{active, once}`.
+fn rust_multi_rendering(rig: &mut Rig) -> String {
+    rig.arm_multi(ACTIVE_MULTI_CREDIT);
+    assert_eq!(
+        rig.active_state(),
+        (INET_MULTI, Some(ACTIVE_MULTI_CREDIT)),
+        "the Rust side drives a genuine {{active,{ACTIVE_MULTI_CREDIT}}}"
+    );
+    for index in 1..=3 {
+        rig.inject(format!("d{index}").as_bytes());
+    }
+    let drained = rig.drain_until_quiet();
+    let rendered: Vec<String> = drained
+        .inputs
+        .iter()
+        .map(|input| match &input.event {
+            ActiveInputEvent::Data(read) => format!(
+                "{{data,<<\"{}\">>}}",
+                String::from_utf8_lossy(read.body.as_deref().unwrap_or_default())
+            ),
+            ActiveInputEvent::Passive => "passive".to_string(),
+        })
+        .collect();
+    format!("[{}]", rendered.join(","))
+}
+
+/// The Rust side of [`once_probe`], rendered as that probe prints it:
+/// `{<<"one">>,<what the second datagram left behind>,none | passive}`.
+///
+/// The middle field is the number of messages the second injection produced — the same witness as
+/// the oracle's `message_queue_len`, which it reads after the same second injection.
+fn rust_once_rendering(rig: &mut Rig) -> String {
+    rig.arm(INET_ONCE);
+    rig.inject(b"one");
+    let first = rig.drain_until_quiet();
+    let delivered = data_of(&first.inputs);
+    assert_eq!(delivered.len(), 1, "the armed delivery");
+    let payload =
+        String::from_utf8_lossy(delivered[0].body.as_deref().unwrap_or_default()).to_string();
+    rig.inject(b"two");
+    let second = rig.drain_until_quiet();
+    let passive = if passive_count(&second.inputs) == 0 {
+        "none"
+    } else {
+        "passive"
+    };
+    format!("{{<<\"{payload}\">>,{},{passive}}}", second.inputs.len())
+}
+
 #[test]
 fn the_once_and_multi_rows_agree_with_the_oracle() {
     let Some(once) = erl_stdout(&once_probe()) else {
         return;
     };
+    let mut rig = Rig::new();
+    let rust_once = rust_once_rendering(&mut rig);
     assert_eq!(
         once.trim(),
-        r#"{<<"one">>,0,none}"#,
+        rust_once,
         "the oracle flips silently after one delivery and never sends {{udp_passive,S}}"
     );
     let Some(multi) = erl_stdout(&multi_probe()) else {
         return;
     };
+    let mut rig = Rig::new();
+    let rust_multi = rust_multi_rendering(&mut rig);
     assert_eq!(
         multi.trim(),
-        r#"[{data,<<"d1">>},{data,<<"d2">>},passive]"#,
+        rust_multi,
         "two deliveries then one passive message, the third datagram undelivered"
     );
 }
