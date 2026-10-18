@@ -479,9 +479,9 @@ fn open_port(fixture: &Fixture, stem: &str) -> (Poller, PortRegistry, PortId) {
 fn delivered(notifications: &[PortNotification], id: PortId) -> Vec<u8> {
     let mut data = Vec::new();
     for notification in notifications {
-        if let PortNotification::Data { port, bytes } = notification {
+        if let PortNotification::Data { port, read } = notification {
             if *port == id {
-                data.extend_from_slice(bytes);
+                data.extend_from_slice(&read.flattened());
             }
         }
     }

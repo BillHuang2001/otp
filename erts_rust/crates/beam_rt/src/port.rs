@@ -1798,7 +1798,8 @@ impl PortRegistry {
     ) -> Result<()> {
         for notification in notifications {
             match notification {
-                PortNotification::Data { port, bytes } => {
+                PortNotification::Data { port, read } => {
+                    let bytes = read.flattened();
                     if bytes.is_empty() {
                         continue;
                     }
