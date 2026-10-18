@@ -150,7 +150,9 @@ The *internal* boundary the `enif_*` bodies are written against (not part of the
 The *internal* boundary the `driver_*` bodies are written against (source `src/driver/host.rs`).
 - `pub trait DriverHost` — **required** `heap() -> &mut beam_alloc::Heap`, `intern_atom(&str) ->
   Option<Eterm>`, `output(port, &[u8]) -> c_int`, `send_term(port, Option<Eterm>, Eterm) -> c_int`;
-  **defaulted** (`-1`, `None`): `select`, `set_timer`, `cancel_timer`, `read_timer`, `r#async`,
+  **defaulted** (`-1`, `None`): `output2(port, header: &[u8], body: Option<&[u8]>) -> c_int` (the
+  split-reply hook every `driver_output*` thunk routes through — see *The split hook*),
+  `select`, `set_timer`, `cancel_timer`, `read_timer`, `r#async`,
   `connected_pid`, `caller_pid`, `binary_to_term` (the ETF decode behind `ERL_DRV_EXT2TERM`), the
   port-queue hooks `enq`/`pushq`/`deq`/`sizeq`/`peekq`, the attribute hooks
   `set_busy_port`/`set_control_flags`/`get_port_flags`, the failure/lifecycle hooks
