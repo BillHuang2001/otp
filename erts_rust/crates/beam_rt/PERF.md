@@ -5,7 +5,7 @@ Every number in this file is **measured, never modelled**: nothing here is fabri
 It is **not** a change log — [`../../../CHANGE.md`](../../../CHANGE.md) records what changed, this file records what it cost.
 This file owns the **`CURRENT` snapshot** and the standing *Current startup regime* note that qualifies every `startup_ms` figure in the crate.
 The rest of the record lives in two siblings: [`PERF_HISTORY.md`](PERF_HISTORY.md) holds the dated **`BEFORE` → `AFTER`** snapshots (the historical baselines and the delta between them), and [`PERF_DISPATCH.md`](PERF_DISPATCH.md) holds the per-call **`DISPATCH-CUT`** / **`COPY-OUT-CUT`** analyses.
-Route by question: today's cross-runtime figures and the execution-tier effect → this file; a dated baseline or a `BEFORE`→`AFTER` delta → `PERF_HISTORY.md`; registered-BIF per-call cost, the dispatch prologue or the BIF-result copy-out → `PERF_DISPATCH.md`.
+Route by question: today's cross-runtime figures and the execution-tier effect → this file; a dated baseline or a whole-suite `BEFORE`→`AFTER` snapshot → `PERF_HISTORY.md`; a **controlled A/B at one change**, carrying its own two HEADs → this file's `CURRENT` region (the per-instruction reduction charge, and the per-call cost's independence from `N`); registered-BIF per-call cost, the dispatch prologue or the BIF-result copy-out → `PERF_DISPATCH.md`.
 The measurement narrative lives in [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md); the bench driver's own environment record, per-target tables and methodology are [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md), which this file links to and does not reproduce.
 
 ## Current startup regime (read before quoting any `startup_ms` figure)
@@ -327,6 +327,54 @@ the other three `foreign` shapes; on the **default baseline-JIT** tier the hook 
 mid-block, so this cost is specific to the interpreter path and no startup-dominated or
 copy/GC-dominated row resolves it at N = 5. Nothing here changes the pre-emption property the charge
 exists for (see `src/runner/budget.rs`) — it only prices it.
+
+### The per-call cost is independent of the iteration count — the per-slice off-heap mirror (`BEFORE` `3aa42c0e41` → `AFTER` `72d778dcf1`)
+
+**Sides.** `AFTER` is `beam_rt` built from the committed tree at `72d778dcf1`; `BEFORE` is the **same harness** built from `3aa42c0e41`, the commit immediately before it, so this A/B isolates one mechanism and nothing else.
+It is, like the reduction-charge A/B above, a controlled A/B carrying its own two HEADs rather than a re-run of the `CURRENT` snapshot's `--full` pass.
+The system side (`sys`) is `erl` on `PATH` — **OTP 29.1.1 / erts-17.1** — and did not change between the two sides.
+Host: Linux `x86_64`, `nproc` = **14**, **shared and heavily loaded** — the 1-min `/proc/loadavg` read **18–89** during these runs — so **ratios and the per-`N` shape are the evidence, never the absolute wall time**.
+Every measured run was pinned with `taskset -c 3`, and every `/proc/loadavg` reading was recorded **before and after** each run.
+
+**The one mechanism the A/B isolates.** `BEFORE` mirrors the engine's append-only `Machine::refc_binaries` reservoir onto the running process at the end of every slice, and `beam_gc::OffHeap` is a slot-stable, never-compacted slot vector, so that mirror hands out one slot per payload per slice for the life of the process and puts three `O(off-heap slots)` scans on the per-call path — the eager `max_heap_size` usage figure that `Process::grow_nursery`/`ensure_capacity` read, and `Process::sweep_off_heap_binaries` at every rooted collection.
+`AFTER` keeps the roster on the reservoir itself (`RunnerState::reservoir_at`, unioned with any payload a host registers on the PCB), so the PCB's off-heap table stays **empty** and all three scans walk an empty vector.
+
+**The ladder** — `(wall − boot_baseline) / N`, the boot baseline being the median of 3 `N = 0` runs; the real `emqx_base62.erl` plus a driver loop, `taskset -c 3 <beam_rt> -pa <dir> run <drv.beam> b62drv:<fn>/1 <N>`; 3 rounds, **alternating `BEFORE`/`AFTER`**; every `N` produced **identical checksums on both sides**, so the two sides do the same work:
+
+| `N` | enc `BEFORE` (ns/call) | enc `AFTER` (ns/call) | B/A | dec `BEFORE` (ns/call) | dec `AFTER` (ns/call) | B/A |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 000 | 16 287.5 | 7 371.4 | 2.21× | 4 029.6 | 2 852.8 | 1.41× |
+| 20 000 | 30 235.7 | 6 418.3 | 4.71× | 5 088.1 | 4 204.4 | 1.21× |
+| 40 000 | 78 509.7 | 6 096.0 | 12.88× | 12 656.3 | 6 377.9 | 1.98× |
+| 60 000 | 127 050.9 | 4 684.2 | 27.12× | 16 931.6 | 7 377.0 | 2.30× |
+| 120 000 | 377 725.2 | 6 581.7 | 57.39× | 31 904.1 | 7 559.4 | 4.22× |
+
+**Reading the ladder.** `BEFORE`'s per-call cost grows **23.2× over a 12× `N` range** (16 287.5 → 377 725.2 ns/call from `N` = 10 000 to 120 000) — super-linear, which is the per-slice `O(slots)` mirror priced per iteration.
+`AFTER` is **flat within a noise band** (4 684.2–7 371.4 ns/call across the same 12× range, with no monotone trend), so the per-call cost is **independent of `N`** and the total is linear in the iteration count.
+`decode` has the same shape — **7.9× growth → flat** (4 029.6 → 31 904.1 ns/call under `BEFORE`, 2 852.8–7 559.4 under `AFTER`).
+
+**Paired `bench` A/B** — `bench run --quick --runtime all --workloads foreign`, **3 alternating rounds**, medians of the `rust` rows; the `sys` row is that A/B's own noise floor at **0.88–0.92×**, so only a rust-side move outside that band is the change:
+
+| case | `BEFORE` (ns/call) | `AFTER` (ns/call) | B/A |
+|---|---:|---:|---:|
+| `emqx_base62_encode` | 138 544.3 | 5 667.6 | 24.44× |
+| `emqx_base62_decode` | 20 698.3 | 10 028.7 | 2.06× |
+| `bstr_to_lower` | 18 504.0 | 8 607.9 | 2.15× |
+| `bstr_capitalize_token` | 21 656.3 | 10 485.8 | 2.07× |
+
+**As a multiple of the system ERTS measured in the same rounds**, the `rust` side moved from **392–563×** to **19.3×** (`encode`), **47–64×** to **23.9×** (`decode`), **37–53×** to **19.6×** (`bstr_to_lower`) and **41–59×** to **24.2×** (`bstr_capitalize_token`).
+
+**The defect was not `encode`-specific.** Any loop whose iteration builds an **off-heap refc binary from compiled code** accumulated into the mirror: a second `bstr_to_lower` ladder reads `BEFORE` **11 905 → 26 024 ns/call** from `N` = 10 000 to 60 000 and `AFTER` **flat in a 9 829–11 119 ns/call band** across the same range.
+The three non-`encode` paired rows above therefore carry the same shape — a real `BEFORE` value and a flat `AFTER` one — at their own `N`.
+
+**Memory is unchanged by the A/B.** Peak RSS on both sides is the same within the noise band — the reservoir retains every payload either way, so the mirror was pure per-call cost, never a memory win.
+
+**Correctness of the measured side.** `--lib -- runner::tests` **46 passed / 0 failed**, `--lib -- native::memory` **34 passed / 0 failed**, `--test process_info_items` **4 / 0**, `--test engine_off_heap_transport` **6 / 0**.
+The re-pointed path was probed directly — a compiled `<<0:N/unit:8>>` held live by a parked child, then `erlang:process_info(P, binary)` → `{1,true}` — and agrees with the system runtime.
+The differential cases `gc/process_info_gc_key_set_is_stable`, `gc/process_info_memory_is_positive_integer` and `system_info/process_info_bulk_returns_list` all report `[AGREE]`; **no corpus case exercises the `binary` item**, which `tools/differential/src/corpus/gc.rs` documents as a deliberate capability gap.
+
+**Residual, owned by other nodes.** The engine reservoir is itself an append-only accumulator that is never cleared, so a build-a-binary loop still retains every payload it ever built — a **memory ceiling**, not a per-call cost, and bounding it needs a `beam_engine` liveness/reset seam.
+And `beam_process::sweep_off_heap_binaries` still walks its whole slot space even when `dead_binaries` is empty — harmless while that space stays empty, but it is the same defect any other registrant of that space would hit.
 
 ### Caveats that invalidate a comparison (`CURRENT`)
 
