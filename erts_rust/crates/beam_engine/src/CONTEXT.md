@@ -141,9 +141,9 @@ The classic unrooted builders (`make_tuple`/`make_cons`/… in `terms/construct.
 `ExecutionContext::alloc_words` directly, with neither a root set nor an admission point; **every in-crate
 construction arm** uses a `*_rooted` twin instead. That rule — not a census of `alloc_words` callers — is what a
 new engine-side build must follow.
-`ensure_heap_full` is reached **only** from `Instr::TestHeap` (`interpreter/dispatch.rs:586`) and
-`Instr::AllocateHeap` (`:581`) plus their baseline-JIT twins (`jit/baseline/runtime.rs:1407`/`:1443`),
-so it is a **per-`test_heap`** door, never a per-allocation one; `Instr::Allocate` (`:569-574`) pushes
+`ensure_heap_full` is reached **only** from `Instr::TestHeap` (`interpreter/dispatch.rs:628`) and
+`Instr::AllocateHeap` (`:623`) plus their baseline-JIT twins (`jit/baseline/runtime.rs:1407`/`:1443`),
+so it is a **per-`test_heap`** door, never a per-allocation one; `Instr::Allocate` (`:611-617`) pushes
 the frame with **no** admission.
 `ExecutionContext::heap_available` has **no** call site anywhere in the crate (introspection only).
 Every other engine→host call carries **no** root set, so a host that
