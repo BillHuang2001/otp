@@ -62,13 +62,52 @@
 //! Only a **non-empty off-heap table** keeps the sized path, because rolling *that* back would
 //! discard entries that are not this copy's to release.
 //!
+//! # The sizing walk is a *destination-pricing* cost model, not a second source sizing
+//!
+//! [`bounded_words`] counts what [`shallow`]/[`copy_refc_binary`] will **write into the
+//! destination**. That is a different question from the one `beam_term::size` answers, and the walk
+//! is therefore **not** a duplicate to be delegated: it is the `litopt != NULL` half of the C's
+//! `size_object_x(obj, litopt)` (`erts/emulator/beam/copy.c:105,119` — the list and boxed arms skip a
+//! literal-area subterm only when a literal area is passed). `size_object(t)` is
+//! `size_object_x(t, NULL)` (`erts/emulator/beam/global.h:1135`) — the *source occupancy* count that
+//! `beam_term::size_object` reproduces — while the **message-heap charge** uses the
+//! `litopt`-carrying form `size_object_litopt` (`global.h:1136`; `erl_message.c:771,839`, whose
+//! reduction charge follows at `erl_message.c:881` on the `do_send` path of `bif.c`). Two
+//! load-bearing semantic deltas make the two answers differ, and a delegation would be wrong in a
+//! different direction for each:
+//!
+//! 1. **Literal-area subterms cost zero destination words.** [`copy_struct`] shares a literal by
+//!    identity ([`is_shared`]), so it writes nothing for it, whereas `beam_term::size::needs_visit`
+//!    (`is_term_word(t) && !is_immediate(t)`) descends *into* the literal and reports its interior.
+//!    Delegating would **over**-count, so the preflight would demand words the copy never writes and
+//!    refuse copies that succeed today (a literal root costs 0 destination words;
+//!    `tests/copy.rs::literal_compound_is_shared_not_copied` and
+//!    `tests/destination_pricing.rs` pin it).
+//! 2. **A refc binary whose payload no source off-heap handle owns costs its flattened window.**
+//!    `beam_term::size::classify` prices the 8-word `[BinRef(3)][ErlSubBits(5)]` pair
+//!    unconditionally, but [`copy_refc_binary`] finds no payload to share and **flattens** the
+//!    window ([`copy_match_context`]), so the copier's price is [`refc_binary_words`] —
+//!    `heap_bits_size_words(end - start)`, typically far larger. Delegating would **under**-count, so
+//!    the preflight would admit a graph the copy cannot finish: the sized path would reserve too few
+//!    words and fail *mid-copy* as a bare heap failure after a partial write, breaking the "a
+//!    refusal writes no destination word" invariant that `tests/sizing.rs` and
+//!    `tests/destination_pricing.rs` pin. That price depends on [`CopyContext`]'s **source off-heap
+//!    table**, which no term-only walk is given.
+//!
+//! The walk therefore lives here, beside the copy it prices. Unifying it with `beam_term::size`
+//! would need a bounded walk parameterized by (a) a **literal-sharing policy** and (b) a
+//! **per-object cost override** (here `refc_binary_words`, which needs the copy boundary) — i.e. a
+//! `beam_term` API change. No such entry point exists today, so the unification is deliberately not
+//! attempted from this crate.
+//!
 //! # Cycle guard on the preflight
 //!
 //! A term the engine builds is always acyclic, but a *forged* term (a raw write into the heap)
-//! can point back at one of its own ancestors. `beam_term::size_object` — the obvious way to size
-//! the destination — walks a graph with an unbounded worklist, so such a cycle would loop forever
-//! (or exhaust memory). The copy path therefore never calls `size_object` on an unproven graph:
-//! [`preflight_words`] first runs a **bounded** walk of the copy engine's own sizing, and only if
+//! can point back at one of its own ancestors. `beam_term::size_object` — the source-count entry
+//! point, and so the wrong tool for a destination gate — walks a graph with an unbounded worklist,
+//! so such a cycle would loop forever (or exhaust memory). The copy path therefore never calls
+//! `size_object` on an unproven graph: [`preflight_words`] first runs a **bounded** walk of the copy
+//! engine's own sizing, and only if
 //! that walk shows the graph does not fit does it (a) reject a cyclic graph with a typed
 //! [`BeamError::BadArg`](beam_common::BeamError::BadArg) via [`is_acyclic`], or (b) re-run the same
 //! sizing walk unbounded on a graph now known to be acyclic. A cyclic graph is therefore always a
@@ -267,24 +306,36 @@ fn push_fixup(work: &mut Vec<Fixup>, slot: *mut Eterm, child: Eterm) {
 /// Whether a word contributes a destination object the copier must descend into: a compound term
 /// that is **not** shared as-is. Immediates, literal-area terms (shared verbatim) and non-term
 /// (bare header) words are all skipped — they write no destination word and expose no child.
+///
+/// This is the **destination-pricing** visit predicate — the `litopt != NULL` policy of the C
+/// `size_object_x` (`copy.c:105,119`), where a literal-area subterm is skipped. It is deliberately
+/// narrower than `beam_term::size::needs_visit`, which descends *into* literals because it counts
+/// the **source** graph's occupancy; see the module docs for the two deltas that follow from this.
 #[inline]
 fn needs_visit(term: Eterm) -> bool {
     !is_shared(term) && is_term_word(term)
 }
 
-/// The number of destination words the copier writes for `term` — the copy engine's **own**
-/// sizing, so it is exact and a sound preflight — or `None` as soon as the running total exceeds
-/// `limit`.
+/// The number of **destination** words the copier writes for `term` — the copy engine's own
+/// destination-pricing cost model (the C `size_object_litopt` analogue), exact and therefore a sound
+/// preflight — or `None` as soon as the running total exceeds `limit`.
+///
+/// It is **not** a second copy of `beam_term`'s source sizing and must not be delegated to it: for
+/// a literal-area subterm this walk counts **0** words (the copy shares it by identity) while
+/// `beam_term::size_object` counts its interior, and for a refc binary no source handle owns it
+/// counts the flattened window while `beam_term` counts the 8-word pair. Both deltas, their C
+/// ground truth and the `beam_term` API that would be needed to unify them are in the module docs.
 ///
 /// It mirrors [`shallow`]/[`copy_refc_binary`]'s allocation exactly: `2` words per cons cell,
 /// [`ERL_BIN_REF_SIZE`] for an off-heap MSO container, [`refc_binary_words`] for a refc binary
 /// (the 8-word `[BinRef][ErlSubBits]` pair when the source holds its payload handle, the flattened
 /// window's `heap_bits_size_words` when it does not — see that function), nothing for the shared
-/// zero-arity-tuple literal, and the canonical `beam_term::layout::object_words` for every other
-/// boxed object (walking its child slots with `beam_term::layout::for_each_sizing_child_slot`). A
-/// `SUB_BITS` **match context** is one of those "other" objects: `beam_term::layout::object_words`
-/// returns the `heap_bits_size_words(size)` block [`copy_match_context`] writes and the sizing
-/// enumerator yields no child, so this walk sizes it exactly as the copy writes it.
+/// zero-arity-tuple literal, nothing for a shared literal-area subterm, and the canonical
+/// `beam_term::layout::object_words` for every other boxed object (walking its child slots with
+/// `beam_term::layout::for_each_sizing_child_slot`). A `SUB_BITS` **match context** is one of those
+/// "other" objects: `beam_term::layout::object_words` returns the `heap_bits_size_words(size)` block
+/// [`copy_match_context`] writes and the sizing enumerator yields no child, so this walk sizes it
+/// exactly as the copy writes it.
 ///
 /// The `limit` is what makes it cycle-safe: a forged cyclic graph revisits its own objects, so its
 /// count grows without bound and the walk stops at `limit` instead of looping forever. Every
@@ -450,10 +501,13 @@ fn is_acyclic(term: Eterm) -> bool {
     true
 }
 
-/// Sizes the destination for a copy of `term` against a destination holding `limit` free words,
-/// returning the flat word count to reserve.
+/// Sizes the **destination** for a copy of `term` against a destination holding `limit` free words,
+/// returning the flat word count to reserve — the copy engine's destination-capacity gate.
 ///
-/// The cycle-safe replacement for a bare `beam_term::size_object` preflight:
+/// It is built on [`bounded_words`], the copier's own destination-pricing cost model (the C
+/// `size_object_litopt` analogue), **not** on `beam_term::size_object`, which sizes the *source*
+/// graph and would mis-price a shared literal-area subterm and a no-handle refc binary in opposite
+/// directions (see the module docs). That walk is also bounded and cycle-safe:
 ///
 /// * a graph whose copy fits `limit` is sized by [`bounded_words`] — an exact, bounded,
 ///   allocation-free walk that cannot hang;
@@ -816,8 +870,9 @@ pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Res
     // surfacing mid-copy as a bare heap failure — and so a graph too large for `to` is refused
     // **before** any word is written (the destination is left untouched).
     //
-    // `preflight_words` is the cycle-safe form of `beam_term::size_object`: it bounds its own walk
-    // by `to`'s capacity, so a forged cyclic graph is a typed error instead of an unbounded walk.
+    // `preflight_words` walks the copier's own destination-pricing cost model — not
+    // `beam_term::size_object`, which sizes the source graph — and bounds that walk by `to`'s
+    // capacity, so a forged cyclic graph is a typed error instead of an unbounded walk.
     let needed = preflight_words(term, to.available(), ctx)?;
     if to.available() < needed {
         return Err(crate::error::heap_exhausted(needed));
@@ -843,10 +898,16 @@ pub fn copy_struct_simple(term: Eterm, to: &mut Heap) -> Result<Eterm> {
     copy_struct(term, to, &mut ctx)
 }
 
-/// The flat word count [`copy_struct`] preflights against [`Heap::available`].
+/// The flat **source** word count of `term`'s graph — `beam_term::size_object`'s answer via a thin
+/// forwarder (the `size_object_x` port, i.e. the `litopt == NULL` source-occupancy count); exposed so
+/// callers and tests can size a destination heap without re-deriving it.
 ///
-/// A thin forwarder to `beam_term::size_object` (the `size_object_x` port); exposed so callers
-/// and tests can size a destination heap without re-deriving it.
+/// This is what a destination needs when the copier's destination-pricing walk agrees with it, which
+/// holds for a graph with no literal-area subterm and no refc binary whose payload no source handle
+/// owns (`tests/sizing.rs`'s corpus). It is **not** the copier's own price for either of those two
+/// shapes — a shared literal costs 0 destination words here and a no-handle refc binary costs its
+/// flattened window — so the copy engine prices through [`preflight_words`] instead, never through
+/// this function. `tests/destination_pricing.rs` pins the divergence.
 pub fn size_of_copy(term: Eterm) -> usize {
     beam_term::size_object(term)
 }
