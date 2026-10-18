@@ -1853,6 +1853,13 @@ mod notes {
         WALK_VISITS.with(|c| c.set(c.get() + 1));
     }
 
+    /// This thread's count of **learned-hint** growths ([`note_hint_grow`]), i.e. of copies the
+    /// gate pre-empted a refusal for. Read next to [`snapshot`], whose second element counts the
+    /// growths that *answered* a refusal.
+    pub(super) fn hint_grows() -> usize {
+        HINT_GROWS.with(Cell::get)
+    }
+
     /// Records one hashed bookkeeping insert the reference walk performed.
     ///
     /// Nothing in the walk charges it: the walk is hash-free by construction ([`Walklist`]), so

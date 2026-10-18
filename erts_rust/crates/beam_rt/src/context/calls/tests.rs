@@ -389,6 +389,226 @@ fn a_ceiling_that_refuses_the_headroom_request_still_grows_by_the_shortfall() {
     );
 }
 
+/// The structural outcome of [`drive_admission_cadence`], one field per counter the pin reads.
+struct Cadence {
+    /// Copy-outs that ran (== the loop count).
+    copies: usize,
+    /// Copy attempts the copier made: `copies + refusals`, since every refusal buys exactly one
+    /// retry.
+    attempts: usize,
+    /// Expensive first attempts: `attempts - copies`.
+    refusals: usize,
+    /// `Process::grow_nursery` calls that **answered** a refusal (the fallback path).
+    refusal_grows: usize,
+    /// `Process::grow_nursery` calls the learned-hint gate made **before** an attempt.
+    hint_grows: usize,
+    /// Real collections the modelled admission door ran.
+    collections: usize,
+}
+
+impl Cadence {
+    /// Refusals per copy-out — the figure the pin bounds.
+    fn refusals_per_op(&self) -> f64 {
+        self.refusals as f64 / self.copies as f64
+    }
+}
+
+/// Drives `ops` copy-outs of the [`bench_shaped_result`] container against a **default-policy**
+/// process while modelling the runtime's own heap-admission **cadence** between them.
+///
+/// The cadence is the /point/ of this helper: the synthetic long-run tests above never collect,
+/// so the nursery they grow is never collapsed and they pass even when the copy-out refuses on
+/// every op. Here, after each copy-out, the process's own admission predicate
+/// ([`beam_process::Process::collect_if_needed`] — the OR of the occupancy test and the
+/// collector's `collection_debt`, exactly what the engine's `ensure_heap`/`ensure_heap_full`
+/// doors consult) runs with a payload-sized request, so a nursery the copy-out grew is
+/// **collapsed back to the `233`-word floor** and the next copy-out meets a part-full node again.
+/// That is the measured `copy_bound/ets_copy` regime: one collection per ~3 ops, and the
+/// destination barely large enough.
+///
+/// `clear_hint_every_op` zeroes the context's [`RuntimeContext::copy_out_hint`] before each copy,
+/// i.e. it reproduces what the copy-out did **before** the hint existed. It is the control that
+/// keeps this pin honest: the same cadence must then refuse on a large fraction of the ops.
+fn drive_admission_cadence(clear_hint_every_op: bool, ops: usize) -> Cadence {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    {
+        let registry = Rc::get_mut(&mut rt.registry)
+            .expect("the runtime holds the only handle to its registry");
+        let _ = registry.register("copy_out_fixture", "bench_shaped", 0, bench_shaped_result);
+    }
+    assert_eq!(
+        table
+            .get(pid)
+            .expect("the spawned process")
+            .collector()
+            .young()
+            .capacity_words(),
+        beam_gc::DEFAULT_MIN_HEAP_WORDS,
+        "the cadence is about the DEFAULT nursery"
+    );
+    // The 73-word payload is what the next admission must make room for — the same figure the
+    // engine's `test_heap` carries into the door.
+    const ADMISSION_NEED_WORDS: usize = 73;
+    // The loop's **own** term construction between copies: the `copy_bound` payload is a 5-key
+    // flat map over a 10-cell list, a 3-tuple, a 12-byte binary and a char list — ≈60 flat words,
+    // modelled here as 30 cons cells of `NIL`. This is what makes the loop refill the nursery
+    // between copy-outs, and it is why the real case refuses at all: 3 × 73 words alone still fit
+    // a 233-word nursery, 60 + 73 does twice and not three times.
+    const PAYLOAD_BUILD_CELLS: usize = 40;
+    let mut collections = 0usize;
+    let mut copies = 0usize;
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        for op in 0..ops {
+            if clear_hint_every_op {
+                // Reproduce the pre-hint copy-out: nothing is ever learned, so the gate never
+                // runs.
+                ctx.copy_out_hint = 0;
+            }
+            {
+                let process = ctx
+                    .process_table_mut()
+                    .get_mut(pid)
+                    .expect("the spawned process");
+                let mut built = beam_term::prelude::NIL;
+                for _ in 0..PAYLOAD_BUILD_CELLS {
+                    match process.heap_mut().cons(beam_term::prelude::NIL, built) {
+                        Ok(list) => built = list,
+                        // The nursery filled mid-construction: the engine's own admission door
+                        // would have collected first, and the collection below is the same door.
+                        Err(_) => break,
+                    }
+                }
+            }
+            let copied = ctx
+                .call_bif("copy_out_fixture", "bench_shaped", 0, &[])
+                .expect("the fixture BIF returns");
+            copies += 1;
+            assert!(
+                beam_term::prelude::is_boxed(copied) && !beam_term::literal::is_literal(copied),
+                "op {op}: the bench-shaped container is re-homed onto the process's own heap"
+            );
+            let collected = ctx
+                .process_table_mut()
+                .get_mut(pid)
+                .expect("the spawned process")
+                .collect_if_needed(ADMISSION_NEED_WORDS)
+                .expect("the admission collection");
+            if collected {
+                collections += 1;
+            }
+        }
+    }
+    let (attempts, refusal_grows, empties) = notes::snapshot();
+    assert_eq!(
+        empties, attempts,
+        "every attempt — refused or not — is handed a fully empty destination table"
+    );
+    assert!(
+        attempts >= copies,
+        "the copier cannot make fewer attempts than there are copy-outs"
+    );
+    Cadence {
+        copies,
+        attempts,
+        refusals: attempts - copies,
+        refusal_grows,
+        hint_grows: notes::hint_grows(),
+        collections,
+    }
+}
+
+/// **The copy-out must not refuse against a default-policy process that really collects.**
+///
+/// This is the `copy_bound/ets_copy` regression pin that the synthetic no-collect loops above
+/// cannot make: with the nursery collapsed to its `233`-word floor between copies and a 73-word
+/// result to re-home, the destination is under the result's size often enough that the pre-hint
+/// copy-out refused on ≈1 of every 3 ops (measured: 0.332 refusals/op over 250 000 ops). Every
+/// refusal pays the copier's whole sizing path (`try_copy_fast` → `preflight_words` → the bounded
+/// `size_object_bounded_with` walk → the acyclicity check → `size_object_with`), so the loop was
+/// paying ~4.2 µs per op for nothing.
+///
+/// The pin: the **learned hint** (`RuntimeContext::copy_out_hint` + `hint_grow_gate`) makes the
+/// first attempt fit, so refusals collapse to at most one per context (the call that teaches the
+/// hint) — asserted as `refusals * 8 <= copies`, i.e. 1 in 8, well inside the measured ≤1 per
+/// run. A regression that removes the gate (or stops learning the hint) puts the refusal rate
+/// back to ≈1 in 3 and fails here.
+#[test]
+fn a_collecting_default_process_copies_every_result_without_refusing() {
+    /// Long enough for ~100 modelled collections, short enough to stay a unit test.
+    const OPS: usize = 300;
+
+    notes::reset();
+    let cadence = drive_admission_cadence(false, OPS);
+    assert!(
+        cadence.collections * 4 > OPS,
+        "the cadence must really collect ({} collections over {OPS} ops), else this pin measures \
+         the no-collect regime the synthetic loops already cover",
+        cadence.collections
+    );
+    assert!(
+        cadence.hint_grows > 0,
+        "the learned-hint gate must be what serves the copies (0 hint growths over {} ops)",
+        cadence.copies
+    );
+    assert!(
+        cadence.refusals * 8 <= cadence.copies,
+        "the copy-out refused {} times over {} copies ({:.3} per op, {} attempts): the learned \
+         hint is not pre-growing the destination, so the copy-bound loop is back to paying the \
+         copier's whole sizing walk on a large fraction of its ops",
+        cadence.refusals,
+        cadence.copies,
+        cadence.refusals_per_op(),
+        cadence.attempts
+    );
+    assert_eq!(
+        cadence.refusal_grows, cadence.refusals,
+        "every refusal is answered by exactly one growth (the fallback), and no more"
+    );
+}
+
+/// **The hint is what keeps the refusal rate down — the control for the pin above.**
+///
+/// The same cadence with [`RuntimeContext::copy_out_hint`] zeroed before every copy (i.e. the
+/// pre-hint behaviour) must refuse on a large fraction of the ops: the nursery is back at its
+/// `233`-word floor after each collection and the 73-word result meets a destination that is
+/// often too small. That is what the measured `0.332` refusals/op looked like, and asserting it
+/// here means the pin above cannot be satisfied by anything other than the hint: if the gate ever
+/// stops being the mechanism (e.g. the growth policy alone starts sizing the nursery large enough
+/// to survive the collection), this control fails and the claim is re-examined.
+#[test]
+fn without_the_learned_hint_the_same_cadence_refuses_again() {
+    /// Same cadence as the pin above, so the two are directly comparable.
+    const OPS: usize = 300;
+
+    notes::reset();
+    let cadence = drive_admission_cadence(true, OPS);
+    assert!(
+        cadence.collections * 4 > OPS,
+        "the control runs the same collecting cadence ({} collections)",
+        cadence.collections
+    );
+    assert_eq!(
+        cadence.hint_grows, 0,
+        "with no hint ever learned the gate must never grow the destination"
+    );
+    assert!(
+        cadence.refusals * 2 >= cadence.copies,
+        "the pre-hint copy-out must refuse on a large fraction of the ops: only {} refusals over \
+         {} copies ({:.3} per op) — the cadence no longer reproduces the copy-bound regime, so \
+         the pin above asserts nothing",
+        cadence.refusals,
+        cadence.copies,
+        cadence.refusals_per_op()
+    );
+    assert_eq!(
+        cadence.refusal_grows, cadence.refusals,
+        "each refusal is answered by exactly one growth (or two under a ceiling)"
+    );
+}
+
 /// The copy-out's destination off-heap table is **fresh and empty per attempt**, so
 /// `beam_message`'s copier takes its single-traversal fast path even when the runtime's
 /// escaped-payload store ([`crate::runtime::Runtime::eval_off_heap`]) is already populated by an
