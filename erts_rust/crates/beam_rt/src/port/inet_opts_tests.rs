@@ -70,17 +70,57 @@ fn the_variable_length_records_step_over_their_payloads() {
     let mut device = rec(INET_OPT_BIND_TO_DEVICE, 4);
     device.extend_from_slice(b"eth0");
     assert_eq!(walk(&device).expect("bind_to_device walks")[0].bytes.len(), 9);
-    // raw: 5 + level(4) + len(4) + payload.
+    // raw: 5 + type(4) + len(4) + payload. The *second* extra word is the length word, so a
+    // one-byte payload is `RECORD + 8 + 1`.
     let mut raw = rec(INET_OPT_RAW, 6);
     raw.extend_from_slice(&0u32.to_be_bytes());
     raw.extend_from_slice(&1u32.to_be_bytes());
+    raw.push(0x01);
     assert_eq!(walk(&raw).expect("raw walks")[0].bytes.len(), RECORD + 8 + 1);
+    // Reading the length word at the right offset is what distinguishes the two: a large `type`
+    // (the first extra word) with an empty payload is still `RECORD + 8`, not `RECORD + 8 + 99`.
+    let mut empty_raw = rec(INET_OPT_RAW, 6);
+    empty_raw.extend_from_slice(&99u32.to_be_bytes());
+    empty_raw.extend_from_slice(&0u32.to_be_bytes());
+    assert_eq!(
+        walk(&empty_raw).expect("empty raw walks")[0].bytes.len(),
+        RECORD + 8
+    );
+    // multicast_if is not variable-length at all — the C's arm re-reads the value it already has
+    // and steps over nothing — so it must leave the next record at the very next byte.
+    let mif = [rec(INET_OPT_MULTICAST_IF, 0x7f00_0001), rec(INET_LOPT_PACKET, 2)].concat();
+    let mif_records = walk(&mif).expect("multicast_if walks");
+    assert_eq!(mif_records.len(), 2);
+    assert_eq!(mif_records[0].bytes.len(), RECORD);
+    assert_eq!(mif_records[1].code, INET_LOPT_PACKET);
+    // The membership payload is the record's own domain: 12 bytes for inet, 20 for inet6.
+    let mut mreq4 = rec(INET_OPT_ADD_MEMBERSHIP, INET_AF_INET as u32);
+    mreq4.extend_from_slice(&[0; 12]);
+    assert_eq!(
+        walk(&mreq4).expect("ipv4 membership walks")[0].bytes.len(),
+        RECORD + 12
+    );
+    let mut mreq6 = rec(INET_OPT_DROP_MEMBERSHIP, INET_AF_INET6 as u32);
+    mreq6.extend_from_slice(&[0; 20]);
+    assert_eq!(
+        walk(&mreq6).expect("ipv6 membership walks")[0].bytes.len(),
+        RECORD + 20
+    );
+    // ... so 12 bytes suffice for inet but truncate an inet6 membership record, and a domain the
+    // driver itself rejects leaves the span undeterminable.
+    let mut short6 = rec(INET_OPT_ADD_MEMBERSHIP, INET_AF_INET6 as u32);
+    short6.extend_from_slice(&[0; 12]);
+    assert!(walk(&short6).is_none());
+    assert!(walk(&rec(INET_OPT_ADD_MEMBERSHIP, 7)).is_none());
 }
 
 #[test]
 fn a_truncated_argument_walks_to_nothing_rather_than_a_mis_split_list() {
     // A fixed record with its value word cut short.
     assert!(walk(&[INET_LOPT_PACKET, 0, 0]).is_none());
+    // A whole record followed by a 3-byte tail: the tail cannot be attributed to a record, so the
+    // argument is refused rather than the head record being recorded on its own.
+    assert!(walk(&[rec(INET_LOPT_PACKET, 2), vec![INET_LOPT_HEADER, 0, 0]].concat()).is_none());
     // A length-word record whose payload is absent.
     assert!(walk(&rec(INET_OPT_BIND_TO_DEVICE, 9)).is_none());
     // A negative length word.
