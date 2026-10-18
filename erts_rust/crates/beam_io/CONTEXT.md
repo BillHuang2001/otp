@@ -179,7 +179,7 @@ Current (measured): lib **761** tests, integration **229** over **25** binaries,
 - `src/abi/` → the driver C-ABI host layer (child node `src/abi/CONTEXT.md`)
 - `src/io_device/` → the io-device request layer: `IoDevice`/`Encoding`/`ByteSource`/`SliceSource`/`EmptySource` + the `Continuation` seam (`ContData`/`Applied`/`Leftover`/`NoEngineContinuation`)/`read_size`; sub-files `mod.rs`/`device.rs`/`encoding.rs`/`source.rs`/`continuation.rs`/`tests.rs` (child node `src/io_device/CONTEXT.md`)
 
-### Integration tests (`tests/`) — 219 tests over 24 binaries
+### Integration tests (`tests/`) — 229 tests over 25 binaries
 `tests/CONTEXT.md` → the integration-test node doc (the fixture/test vocabulary, the loud-skip policy) (child node).
 - Core/reactor: `poller.rs` (11) the reactor gate on real pipes/socketpairs (`key`/no-events/`reregister`-flip/`deregister`/double-register, timeout/waker, `EINTR`); `port.rs` (4) · `port_task.rs` (5) · `driver_seams.rs` (7) → the port round-trip, `close` id release, the receive-wake path (`Data` → `deliver_simple` → `Scheduler::resume_woken`), the driver-declared timer, the once-only `notify_port_exit`.
 - Facilities: `signal.rs` (21) the real-signal gate (12-signal set, coalescing, the async-signal-safe trampoline, `Drop` restore); `cpu_time.rs` (8) the `statistics(runtime)` floor; `ddll.rs` (11) `dlopen`/`dlsym`/`dlclose` round-trips + the hermetic undefined-symbol case.
