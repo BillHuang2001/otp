@@ -877,22 +877,27 @@ fn a_wrapped_or_unassigned_numeric_command_is_exbadport() {
 /// raise whose reason names the request and the switch that owns it, never a fabricated reply.
 ///
 /// Each row below is the *one* state in which the C succeeds, i.e. the refusal-only arms
-/// (`fdopen`, `ignorefd`, `tcp_sendfile`) have already answered their exact C refusal for every
-/// other operand/state and only their success path is missing.
+/// (`ignorefd`, `tcp_sendfile`) have already answered their exact C refusal for every other
+/// operand/state and only their success path is missing. (`fdopen` used to be on this list; its
+/// adoption now **works** — the prebound path — so it is asserted against its own refusal there.)
 #[test]
 fn an_unserved_numeric_opcode_is_a_typed_gap() {
     // The `fdopen` form that reaches the C's **blind** adoption: a ten-byte operand whose
     // `bound` word is zero makes `inet_ctl_fdopen` take the descriptor over with no syscall at
-    // all (`:5264`-`:5266`), which is the one state the refusal ladder cannot answer.
+    // all (`:5264`-`:5266`). That path exists here now (a prebound adoption), so this operand on
+    // a port that already holds a socket is the C-conflict refusal instead — the C would
+    // overwrite `desc->s` at `:5267` without closing it, which this floor refuses to do. The
+    // adoption success path from a socket-less port is pinned in
+    // `opcode_tests_refusals::fdopen_adopts_a_bound_stream_socket_with_the_c_prebound_semantics`.
     let mut port = opened_port();
-    let err = port
-        .try_control(
+    assert_eq!(
+        port.control(
             &op(13),
-            &[INET_AF_INET, INET_TYPE_STREAM, 0, 0, 0, 0, 0, 0, 0, 0],
-        )
-        .expect_err("FDOPEN adopts a caller's descriptor, which the Driver seam cannot express");
-    assert_eq!(reason_of(err), not_served_reason("fdopen", "inet_ctl"));
-    // The name-service lookups are served, not gapped: an empty name/protocol pair is a lookup
+            &[INET_AF_INET, INET_TYPE_STREAM, 0, 0, 0, 0, 0, 0, 0, 0]
+        ),
+        ctl_xerror("einval"),
+        "a port that already holds a socket refuses a second adoption"
+    );    // The name-service lookups are served, not gapped: an empty name/protocol pair is a lookup
     // the services database does not answer, i.e. the C's `ctl_error(EINVAL)`.
     assert_eq!(
         port.control(&op(17), &[0, 0]),

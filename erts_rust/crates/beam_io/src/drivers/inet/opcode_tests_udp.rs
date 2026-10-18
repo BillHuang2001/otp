@@ -25,7 +25,9 @@
 //! rig and the oracle plumbing are shared from that file rather than copied.
 use super::opcode_tests::{
     assert_agrees, assert_outcomes_agree_with_the_oracle, erl_stdout, loopback_arg, op,
-    oracle_expression, oracle_replies, reason_of, Call, Rig, Rule, CONTROL_MAGIC,};use super::opt::{INET_OPT_BROADCAST, INET_OPT_REUSEADDR};
+    oracle_expression, oracle_replies, Call, Rig, Rule, CONTROL_MAGIC,
+};
+use super::opt::{INET_OPT_BROADCAST, INET_OPT_REUSEADDR};
 use super::wire::{ctl_ok, ctl_xerror};
 use super::{
     UdpInetDriver, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_REP_OK,
@@ -88,17 +90,6 @@ fn connected_port() -> (Rig, u16) {
     (port, bound)
 }
 
-/// Asserts that `code` is still one of this floor's **typed** "not served" gaps — a capability
-/// whose body the C has and this driver does not, never a fabricated reply.
-pub(super) fn assert_typed_gap(port: &mut Rig, code: u32, arg: &[u8], label: &str) {
-    match port.try_control(&op(code), arg) {
-        Ok(reply) => panic!("{label}: expected the typed gap, got {reply:?}"),
-        Err(err) => assert!(
-            reason_of(err).starts_with("unsupported: control opcode"),
-            "{label}: not the typed not-served gap"
-        ),
-    }
-}
 // -----------------------------------------------------------------------
 // The numeric lifecycle verbs
 // -----------------------------------------------------------------------
@@ -321,34 +312,40 @@ fn a_wrapped_or_unassigned_numeric_command_on_the_datagram_port_is_exbadport() {
     }
 }
 
-/// The opcodes that stay **typed gaps** on this driver — a capability the C has and this floor
-/// does not, answered with a typed error rather than a fabricated reply.
+/// `INET_REQ_FDOPEN`(13) is **not** one of this driver's typed gaps: the well-formed operand
+/// adopts the caller's descriptor with the C's `prebound` semantics (the success path is pinned in
+/// [`opcode_tests_refusals::fdopen_adopts_a_datagram_socket_that_carries_real_data`]). On a port
+/// that **already holds a socket** the arm answers the C's own refusal — `[0]einval` — and leaves
+/// the live socket untouched, because `inet_ctl_fdopen` would overwrite `desc->s` with the new
+/// number and leak the old one (`inet_drv.c:5267`).
 ///
-/// The one survivor is `INET_REQ_FDOPEN`(13) with the operand that reaches the C's **blind**
-/// adoption: a ten-byte form whose `bound` word is zero makes `inet_ctl_fdopen` take the
-/// descriptor over with no syscall at all (`inet_drv.c:5264`-`:5266`). Adopting a caller's
-/// descriptor number would mean taking ownership of an fd handed in from Erlang, which no
-/// `DriverFactory` ctor can express (and which the C deliberately never closes,
-/// `desc->prebound = 1`). Everything else in the `inet_ctl` arm is served: the name-service
-/// lookups (`GETSERVBYNAME`/`GETSERVBYPORT`), the interface family
+/// Every other arm of the datagram switch is served too: the name-service lookups
+/// (`GETSERVBYNAME`/`GETSERVBYPORT` answer their length refusals and `[0]einval` for an entry the
+/// services database does not have), the interface family
 /// (`GETIFLIST`/`IFGET`/`IFSET`/`GETIFADDRS`) and `INET_REQ_SUBSCRIBE`(24).
-///
-/// The failure shapes around the gap are the C's own `ctl_error(EINVAL)`/`ctl_xerror(EXBADPORT)`
-/// refusals.
 #[test]
-fn the_surviving_numeric_opcodes_on_the_datagram_port_are_typed_gaps() {
+fn a_fdopen_on_a_datagram_port_holding_a_socket_is_the_c_refusal() {
     let mut port = opened_port();
-    assert_typed_gap(
-        &mut port,
-        13,
-        &[1, 2, 0, 0, 0, 1, 0, 0, 0, 0],
-        "a well-formed INET_REQ_FDOPEN",
-    );
-    assert_typed_gap(
-        &mut port,
-        13,
-        &[1, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-        "a stream FDOPEN",
+    for (arg, label) in [
+        (
+            &[1u8, 2, 0, 0, 0, 1, 0, 0, 0, 0][..],
+            "a datagram FDOPEN on an open port",
+        ),
+        (
+            &[1u8, 1, 0, 0, 0, 1, 0, 0, 0, 0][..],
+            "a stream FDOPEN on an open port",
+        ),
+    ] {
+        assert_eq!(
+            port.control(&op(13), arg),
+            ctl_xerror("einval"),
+            "{label}"
+        );
+    }
+    assert_eq!(
+        port.control(&op(16), &[]),
+        vec![INET_REP_OK, 0, 0, 0, 1],
+        "the socket the port already held is untouched"
     );
 
     // The name-service lookups are served (they are shared `inet_ctl` arms); a missing entry is
@@ -592,7 +589,9 @@ fn numeric_gethostname_reports_the_local_host_name() {
 
 /// `packet_inet_ctl`'s `INET_REQ_FDOPEN`(13, `:14639`) validates in the C's order: the 6/10-byte
 /// length (`:14647`), the family tag (`⇒ eafnosupport`, `:14659`), then the socket type
-/// (`⇒ EINVAL`, `:14671`). Only the well-formed adopt itself stays a gap.
+/// (`⇒ EINVAL`, `:14671`). The well-formed operand goes on to the adoption itself, which on a port
+/// that already holds a socket is the `[0]einval` refusal pinned in
+/// [`a_fdopen_on_a_datagram_port_holding_a_socket_is_the_c_refusal`].
 #[test]
 fn numeric_fdopen_refuses_a_bad_length_family_and_type() {
     let mut port = opened_port();
@@ -613,14 +612,13 @@ fn numeric_fdopen_refuses_a_bad_length_family_and_type() {
         ctl_xerror("einval"),
         "type 9 is neither SOCK_STREAM nor SOCK_DGRAM"
     );
-    // The well-formed adopt is the typed gap. The `bound == 0` form is used because it is the one
-    // that reaches the gap without a descriptor probe: any fd this test could name is either not a
-    // socket or not bound, so the `bound = 1` ladder would refuse first.
-    assert_typed_gap(
-        &mut port,
-        13,
-        &[1, 2, 0, 0, 0, 1, 0, 0, 0, 0],
-        "a well-formed unbound FDOPEN",
+    // The well-formed adopt reaches the `inet_ctl_fdopen` body; on a port that already holds a
+    // socket that body is refused with the C's `EINVAL` (`:5267` overwrites `desc->s` and would
+    // leak the old descriptor, so this floor refuses instead).
+    assert_eq!(
+        port.control(&op(13), &[1, 2, 0, 0, 0, 1, 0, 0, 0, 0]),
+        ctl_xerror("einval"),
+        "a well-formed unbound FDOPEN on a socket-holding port"
     );
 }
 
@@ -1038,12 +1036,13 @@ fn oracle_matrix() -> Vec<Call> {
 ///
 /// The matrix carries only rows both sides can reproduce **byte for byte**. Three families are
 /// deliberately left to the non-oracle tests above: the well-formed `PACKET_REQ_RECV` and the
-/// `subscribe`/`fdopen`/`getservby*`/`getif*` bodies (this floor's synchronous read-now
-/// substitution, and the typed capability gaps — a gap raises rather than replying, so it cannot
-/// ride a `port_control` matrix at all), and the `getiflist` reply (a host-dependent
-/// `getifaddrs(3)` interface table). Everything else — including the post-close `GETTYPE` row and
-/// the `{eol}`-free refusal rows — is compared exactly, with the ephemeral-port/descriptor rows
-/// compared shape-wise by [`Rule`].
+/// `subscribe`/`getservby*`/`getif*` bodies (this floor's synchronous read-now substitution, and
+/// the typed capability gaps — a gap raises rather than replying, so it cannot ride a
+/// `port_control` matrix at all), the well-formed `fdopen` adoption (a descriptor number means
+/// something else in the oracle, so it is compared Rust-side only), and the `getiflist` reply (a
+/// host-dependent `getifaddrs(3)` interface table). Everything else — including the post-close
+/// `GETTYPE` row and the `{eol}`-free refusal rows — is compared exactly, with the
+/// ephemeral-port/descriptor rows compared shape-wise by [`Rule`].
 ///
 /// **Skips loudly** when `erl` is not on `PATH`.
 #[test]

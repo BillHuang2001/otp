@@ -490,6 +490,14 @@ pub struct TcpInetDriver {
     /// delivered to the port (input) or a command is issued (output), and rendered by
     /// `INET_REQ_GETSTAT`. Zeroed by construction, as `inet_init_desc` leaves it.
     stat: stat::InetStat,
+    /// The C's `desc->prebound` flag (`inet_drv.c:5266`): set by the `INET_REQ_FDOPEN` adoption,
+    /// which takes a **caller-owned** descriptor over. A prebound descriptor is never `close(2)`d
+    /// — the C's `erl_inet_close` only drops the select registration for one and leaves
+    /// `desc->s`/`desc->state` untouched (`:5102`-`:5117`) — so neither a close nor a `Drop` may
+    /// release it (see [`TcpInetDriver::adopt_prebound`] and
+    /// [`TcpInetDriver::close_socket`]). Every route that installs a driver-**owned** socket
+    /// (`open`/`accept`/[`TcpInetDriver::from_socket`]) clears it.
+    prebound: bool,
 }
 
 impl TcpInetDriver {
@@ -516,6 +524,7 @@ impl TcpInetDriver {
             name_addr: None,
             peer_addr: None,
             stat: stat::InetStat::default(),
+            prebound: false,
         }
     }
 
@@ -558,6 +567,7 @@ impl TcpInetDriver {
             name_addr: None,
             peer_addr: None,
             stat: stat::InetStat::default(),
+            prebound: false,
         })
     }
 
@@ -565,7 +575,6 @@ impl TcpInetDriver {
     pub fn socket(&self) -> Option<RawFd> {
         self.socket
     }
-
     /// The lifecycle state.
     pub fn state(&self) -> InetState {
         self.state
@@ -638,6 +647,10 @@ impl TcpInetDriver {
                 // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close.
                 self.family = u16::from(INET_AF_INET);
                 self.stype = u16::from(INET_TYPE_STREAM);
+                // An `open`/`accept` descriptor is the driver's own: it is closed on teardown, so
+                // this port is no longer (or never was) holding a caller's `INET_REQ_FDOPEN`
+                // descriptor.
+                self.prebound = false;
                 Ok(())
             }
             Err(err) => {
@@ -647,6 +660,67 @@ impl TcpInetDriver {
         }
     }
 
+    /// Adopts a **caller-owned** descriptor: the C's `inet_ctl_fdopen`
+    /// (`inet_drv.c:5223`-`:5282`), the body behind `tcp_inet_ctl`'s `INET_REQ_FDOPEN` arm.
+    ///
+    /// This is [`TcpInetDriver::adopt`]'s prebound twin, and the difference is **ownership**: the
+    /// descriptor belongs to whoever handed it to `INET_REQ_FDOPEN`, so it is never closed here —
+    /// not on a failed `set_nonblocking(2)`, not on a failed poller registration, not by
+    /// [`TcpInetDriver::close_socket`] and not by `Drop`. `prebound` records that, exactly as the
+    /// C's `desc->prebound = 1` does (`:5266`), which its close path honours by only dropping the
+    /// select registration (`erl_inet_close`, `:5102`-`:5117`).
+    ///
+    /// `stype` is the `INET_TYPE_*` tag the request's operand carried (the caller has already run
+    /// the length/family/type ladder and the `sock_name(2)` pre-check, [`wire::fdopen_precheck`]).
+    /// The lifecycle state is the C's: [`InetState::Open`], promoted to
+    /// [`InetState::Connected`] when a `SOCK_STREAM` adoption has a peer — the C's `sock_peer`
+    /// probe (`:5252`-`:5260`) — which is why an adopted bound socket reports `INET_STATE_OPEN`
+    /// (`GETSTATUS` `[1,0,0,0,1]`) and an adopted accepted connection
+    /// `INET_STATE_CONNECTED` (`[1,0,0,0,5]`).
+    ///
+    /// # Errors
+    ///
+    /// `BeamError::Io` when `fd` cannot be put into non-blocking mode, when the `getpeername(2)`
+    /// probe fails for a reason other than "not connected", or when the poller rejects it. The
+    /// descriptor is **not** closed on any of those paths, and the driver is left untouched when
+    /// one of them fires.
+    fn adopt_prebound(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        fd: RawFd,
+        stype: u16,
+    ) -> Result<()> {
+        set_nonblocking(fd)?;
+        // The C's `sock_peer` probe for a stream (`:5252`-`:5260`), taken **before** any field is
+        // touched so a failing probe leaves the driver exactly as it was.
+        let connected = stype == u16::from(INET_TYPE_STREAM) && has_peer(fd)?;
+        let token = match ctx.register(fd, Interest::READABLE) {
+            Ok(token) => token,
+            // Deliberately **no** `close_fd`: the descriptor is the caller's (see the docs above),
+            // which is the one behavioural difference from [`TcpInetDriver::adopt`].
+            Err(err) => return Err(err),
+        };
+        self.socket = Some(fd);
+        self.token = Some(token);
+        self.interest = Interest::READABLE;
+        self.read_eof = false;
+        self.peer_close = PeerClose::default();
+        self.connect_error = None;
+        // A fresh socket starts a fresh byte stream: any partial frame buffered for the previous
+        // socket no longer belongs to this one.
+        self.pending_input.clear();
+        self.state = if connected {
+            InetState::Connected
+        } else {
+            InetState::Open
+        };
+        // `desc->prebound = 1; desc->stype = type; desc->sfamily = domain` (`:5266`-`:5269`).
+        self.prebound = true;
+        self.stream = stype == u16::from(INET_TYPE_STREAM);
+        self.family = u16::from(INET_AF_INET);
+        self.stype = stype;
+        Ok(())
+    }
     /// Marks the socket as a fresh, usable connection.
     ///
     /// A `connect`/`accept` that succeeded replaces whatever the previous socket was doing, so
@@ -690,7 +764,19 @@ impl TcpInetDriver {
     ///
     /// Used after [`TcpInetDriver::deregister`] and by `Drop` (which has no poller to
     /// de-register with). Taking the field first makes it idempotent.
+    ///
+    /// A **prebound** descriptor is not this driver's to close: the C's `erl_inet_close`
+    /// (`inet_drv.c:5102`-`:5117`) only drops the select registration for one, leaves `desc->s`
+    /// and `desc->state` exactly as they were and issues no `close(2)` at all. The same rule holds
+    /// here — nothing is closed and no field is reset, so the descriptor number stays valid in the
+    /// OS (owned by whoever handed it to `INET_REQ_FDOPEN`) and a post-close
+    /// `GETSTATUS`/`GETFD`/`NAME` still answers what it answered before, which is what the C
+    /// does. `Drop` runs this too, so a prebound descriptor is never closed by a dropped driver
+    /// either.
     fn close_socket(&mut self) {
+        if self.prebound {
+            return;
+        }
         if let Some(fd) = self.socket.take() {
             close_fd(fd);
         }
@@ -700,7 +786,6 @@ impl TcpInetDriver {
         self.pending_input.clear();
         self.state = InetState::Closed;
     }
-
     /// De-registers **and** closes the current socket, returning the de-registration outcome.
     ///
     /// # Errors
@@ -1586,7 +1671,10 @@ impl TcpInetDriver {
             }
             // `INET_REQ_FDOPEN` (`:12003`): the length/family/type refusals are exact, and so is
             // the pre-adoption `sock_name`/family check of a `bound` descriptor
-            // ([`wire::fdopen_precheck`]). Adopting the caller's descriptor stays a typed gap.
+            // ([`wire::fdopen_precheck`]). Once that ladder passes, the descriptor is adopted
+            // **prebound** ([`TcpInetDriver::adopt_prebound`], the C's `inet_ctl_fdopen`,
+            // `:5223`-`:5282`): the port uses it for its whole life but never closes it, because
+            // it belongs to the caller. A port that already holds a socket is refused instead.
             Opcode::Fdopen => {
                 if arg.len() != 6 && arg.len() != 10 {
                     return Ok(ctl_xerror("einval"));
@@ -1598,8 +1686,27 @@ impl TcpInetDriver {
                     return Ok(ctl_xerror("einval"));
                 }
                 match wire::fdopen_precheck(arg) {
-                    // The C would hand the descriptor to `inet_ctl_fdopen` and answer `[1]`.
-                    Ok(()) => Err(op.not_served()),
+                    Ok(()) => {
+                        let [a, b, c, d] = [arg[2], arg[3], arg[4], arg[5]];
+                        let fd = RawFd::from_be_bytes([a, b, c, d]);
+                        // A negative word cannot name a descriptor; the C would cast it to an
+                        // unsigned `SOCKET` and fail later, so refuse it as the `EBADF` it is
+                        // instead of handing it to the poller.
+                        if fd < 0 {
+                            return Ok(ctl_xerror("ebadf"));
+                        }
+                        if self.socket.is_some() {
+                            // The C overwrites `desc->s` here and leaks the previous socket (no
+                            // `desc_close` first, `:5267`). Refusing loudly is the honest choice:
+                            // the existing socket is left **untouched** and keeps serving the port.
+                            return Ok(ctl_xerror("einval"));
+                        }
+                        // The `bound` word of the ten-byte form is already accounted for: a
+                        // non-zero one made `fdopen_precheck` run `sock_name(2)` and the family
+                        // comparison, so there is nothing left to check and nothing to skip.
+                        self.adopt_prebound(ctx, fd, u16::from(INET_TYPE_STREAM))?;
+                        Ok(ctl_ok())
+                    }
                     Err(reply) => Ok(reply),
                 }
             }
