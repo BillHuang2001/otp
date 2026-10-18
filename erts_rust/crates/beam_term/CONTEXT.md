@@ -67,7 +67,7 @@ Pointer-derived classes use a documented deterministic substitute (the C hash mi
 ### `layout.rs` — canonical per-object layout (single source of truth)
 How many heap words an object occupies and which payload words a copier must forward; `size.rs` consumes it, `beam_message::layout` re-exports the walk, and `beam_gc::copy::move_size` is `object_words` plus the copy-specific `ErlSubBits` override.
 - `object_words(header, ptr)` (header included): tuple/record `arity + 1`; fun `1 + fun_desc_words(kind) + fun_num_free`; flatmap `size + 3`; HAMT node `1 + header_arity + popcount(MAP_HEADER_VAL)`; other things `thing_arityval + 1`; `ErlSubBits` → `ERL_REFC_BITS_SIZE` (8) when `orig` is a `BinRef`, `heap_bits_size_words(end - start)` for a match context, else `ERL_SUB_BITS_SIZE` (5).
-  `tuple0()` is the caller's special case.
+  `object_words` is **purely structural**; the one pre-policy skip a sizer must apply is the literal-tagged empty tuple (`tuple0()`), which reports `1` here but `0` from `size_object` (the global literal, `copy.c:125-140`). A zero-arity `RECORD` header is **not** that literal (the C `ASSERT` at `copy.c:128` excludes it) and reports `1` in both places.
 - `for_each_sizing_child_slot` and `for_each_child_slot` differ **only** for `ErlSubBits`: the sizer gets no child (descending into `orig` would double-count), the copier gets its `orig` word (`SUB_BITS_ORIG_WORD` = 4) because the term must be forwarded (`copy.c:219-242` vs `:1677-1700`).
 
 ### `size.rs`
