@@ -104,11 +104,16 @@
 //! * **`INET_REQ_PEER` (code `4`)** — the UDP half does not implement the peer query, so it is
 //!   not a verb here at all (it is reached only through the control code, which this node does
 //!   not decode).
-//! * **The `{inet_reply, S, Reply, Ref}` echo of the caller reference** — `send` **accepts** the
-//!   `prim_inet` caller-reference prefix and strips it (see
-//!   [`UdpInetDriver::verb_send`]), but the C echoes the tag back as that message's fourth
-//!   element (`inet_reply_caller_ref`, `:2610`-`:2660`), which needs a driver→owner message
-//!   channel this crate does not have. The reply stays the synchronous `ctl_reply` bytes.
+//! * **The `{inet_reply, S, Reply, Ref}` message** — the C reports a queued command's outcome
+//!   that way, echoing the tag bytes of the `prim_inet` caller-reference prefix
+//!   (`inet_reply_caller_ref`, `:2610`-`:2660`), which needs a driver→owner message channel this
+//!   crate does not have. Both write paths **accept and strip** that prefix (the `send` verb,
+//!   [`UdpInetDriver::verb_send`], and the queued `port_command` path,
+//!   [`UdpInetDriver::write_pending`]), so the datagram itself is delivered; what is missing is
+//!   the reply, so a `prim_inet` caller that waits for it after a successful `port_command`
+//!   (`do_sendto/4`, `erts/preloaded/src/prim_inet.erl:678`-`:683`) has no counterpart here. The
+//!   verb's own answer stays the synchronous `ctl_reply` bytes, and a refused queued command
+//!   surfaces as a typed error instead of that message.
 //! * **IPv6, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
 //!   `AF_INET`/`SOCK_DGRAM` and `bind`/`connect`/`send` only the packed
 //!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms.
@@ -142,7 +147,7 @@
 
 use std::os::unix::io::RawFd;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 
 use crate::driver::{Driver, DriverContext};
 use crate::drivers::fd::set_nonblocking;
@@ -433,51 +438,119 @@ impl UdpInetDriver {
         result
     }
 
-    /// Drains the port's output queue to the socket as datagrams, returning the number of bytes
-    /// written.
+    /// Counts and sends one datagram: the C's `inet_output_count(desc, len)` at
+    /// `inet_drv.c:15163` followed by its `INET_F_ACTIVE` split (`:15164`-`:15182`).
     ///
-    /// This is the port's *output* callback (the C's `packet_inet_command`), reached only when
-    /// something queued bytes and scheduled an `OUTPUT` task. A datagram send is atomic, so a
-    /// "short write" cannot occur — but the queue may still hold more than one command, and each
-    /// iteration sends the contiguous remainder as one datagram.
-    ///
-    /// Only a **connected** socket can be written from a queue: a datagram needs a destination,
-    /// and the unconnected case carries it in the `send` verb's argument (see
-    /// [`UdpInetDriver::verb_send`], which calls `sendto(2)` directly and never queues). So a
-    /// queued command on a socket-less or unconnected port is a **refusal**, not a silent success:
-    /// the C's `packet_inet_command` guards the send with `!IS_OPEN` and fails the port
-    /// (`inet_drv.c:15051`), and its queue-draining form expects the `[address][data]` grammar —
-    /// a bare port command carries no address at all, so nothing in the queue can name a peer.
-    /// **The queued bytes are never consumed** on that path: the caller learns the command was
-    /// refused, and the queue keeps exactly what it was given.
+    /// The counters see the **payload only** — never a caller-reference prefix, the packed
+    /// address or the ancillary-length word — and are advanced at issue time, before the syscall,
+    /// so a failed send still counted it. A **connected** socket sends with `send(2)` and ignores
+    /// `address`; an unconnected one `sendto(2)`s to it. Both the `send` verb
+    /// ([`UdpInetDriver::verb_send`]) and the queued write path
+    /// ([`UdpInetDriver::write_pending`]) go through here, so the two cannot diverge.
     ///
     /// # Errors
     ///
-    /// [`beam_common::BeamError::BadArg`] when the port has no socket, or has one that is not
-    /// connected (`inet_drv.c:15051`) — the queued bytes stay queued, never silently dropped.
-    /// `BeamError::Io` when a send fails irrecoverably.
+    /// The raw `send(2)`/`sendto(2)` failure — the caller decides whether it is a `[0]`-tagged
+    /// reply (the verb) or a retry/keep-the-remainder case (the queue). A datagram send is atomic,
+    /// so a successful call reports the whole `payload.len()`.
+    fn send_datagram(
+        &mut self,
+        fd: RawFd,
+        address: InetAddr,
+        payload: &[u8],
+    ) -> std::io::Result<usize> {
+        self.stat.output(payload.len());
+        if self.state.is_connected() {
+            send_connected(fd, payload)
+        } else {
+            send_to(fd, payload, &address)
+        }
+    }
+
+    /// Drains the port's output queue to the socket as datagrams, returning how many bytes were
+    /// taken off the **queue**.
+    ///
+    /// This is the port's *output* callback (the C's `packet_inet_command`,
+    /// `inet_drv.c:15037`-`:15260`), reached when something queued bytes and scheduled an
+    /// `OUTPUT` task — in practice `erlang:port_command/2`, which is what `prim_inet:send/3` and
+    /// `prim_inet:do_sendto/4` issue (`erts/preloaded/src/prim_inet.erl:575`-`:700`).
+    ///
+    /// # The queued bytes are the C's datagram command, not a bare payload
+    ///
+    /// The C parses the buffer it is handed, and so does this: `[address][anc_len:be32]
+    /// [anc_data][data]`, optionally behind the `prim_inet` caller-reference prefix
+    /// `[tag_len:be16][tag_bytes]`. The address is **always** parsed and must parse, even on a
+    /// connected socket, which then ignores it — the C's own comment at `:15142`-`:15145` ("Even
+    /// if it is connected, there is an address prefix here -- ignored for connected sockets").
+    /// [`decode_queued_command`] carries the wire forms and why the plain one is tried first.
+    ///
+    /// # Connected vs unconnected (the C's `INET_F_ACTIVE` split)
+    ///
+    /// An **open** socket is enough: one with a default peer sends with `send(2)`
+    /// (`:15164`-`:15173`), one without `sendto(2)`s to the address the command carries
+    /// (`:15174`-`:15182`) — which is exactly what the address prefix is for. The C's only state
+    /// guard is `!IS_OPEN` (`:15068`-`:15077`), so a port with **no socket** is the one state that
+    /// refuses the command.
+    ///
+    /// # Refusals
+    ///
+    /// A socket-less port (the C's `!IS_OPEN`), an operand in neither wire form, the C's two
+    /// `return_einval` guards (`:15155`/`:15158`) and an unparsable address (its
+    /// `inet_set_faddress` failure, `:15146`-`:15150`) are the typed
+    /// [`beam_common::BeamError::BadArg`]; a non-zero ancillary length is the typed `unsupported`
+    /// raise (the C's `sendmsg` cmsg arm, `:15220`, which this floor has no seam for). In every
+    /// case the **queued bytes are never consumed**, so the caller learns the command was refused
+    /// instead of losing it. The C answers an `{inet_reply, S, {error, Reason}, Ref}` message
+    /// instead, which needs a driver→owner message channel this crate does not have (see the
+    /// module docs).
+    ///
+    /// # Accounting and what the return value means
+    ///
+    /// The statistics see the **payload only** ([`UdpInetDriver::send_datagram`]); the returned
+    /// count is a different quantity — how many bytes were taken off the **output queue**, which
+    /// is the whole command, prefix/address/ancillary-length word included, because
+    /// [`crate::Port::check_write_accounting`] verifies exactly that against the queue.
+    ///
+    /// A datagram send is atomic, so a short write cannot occur. The queue does concatenate
+    /// commands, though, and [`crate::ByteQueue::front`] is a single contiguous run, so two
+    /// commands queued before the same round go out as **one** datagram — a limitation of the
+    /// byte-only queue (the C is handed one command per callback), not something a driver can
+    /// correct here.
+    ///
+    /// # Errors
+    ///
+    /// [`beam_common::BeamError::BadArg`] for a port with no socket (`:15068`) or a command in
+    /// neither wire form, as above — the queued bytes stay queued, never silently dropped — and
+    /// the typed `unsupported` raise for ancillary data. `BeamError::Io` when a send fails
+    /// irrecoverably.
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if ctx.output().is_empty() {
             return Ok(0);
         }
-        // No socket, or a socket with no default peer: the queue holds a bare command with no
-        // destination, which the C refuses (`:15051`). Nothing is consumed.
-        let Some(fd) = self.socket.filter(|_| self.state.is_connected()) else {
+        // The C's `!IS_OPEN` guard (`:15068`): with no socket there is no destination at all,
+        // not even one the command could name. Nothing is consumed.
+        let Some(fd) = self.socket else {
             return Err(error::badarg());
         };
-        let mut written = 0usize;
+        let mut consumed = 0usize;
         loop {
             let front = ctx.output().front();
-            let len = front.len();
-            if len == 0 {
+            let command_len = front.len();
+            if command_len == 0 {
                 break;
             }
-            match send_connected(fd, front) {
-                Ok(n) => {
-                    // A datagram send is all-or-nothing, so `n` is the whole `len`; consuming it
-                    // keeps the queue's invariant (front is always the contiguous remainder).
-                    ctx.output().consume(n);
-                    written += n;
+            // Every command the C is handed goes through this grammar (`:15139`-`:15230`), and a
+            // refused one keeps its bytes.
+            let (address, payload) = decode_queued_command(front)?;
+            let sent = self.send_datagram(fd, address, payload);
+            // `payload` borrows the queue, so the outcome is matched once that borrow is over.
+            match sent {
+                Ok(_) => {
+                    // The whole command is done with: its prefix/address/ancillary-length bytes
+                    // have no counterpart on the wire and the payload left in one atomic
+                    // datagram, so the queue's single contiguous run is consumed whole.
+                    ctx.output().consume(command_len);
+                    consumed += command_len;
                 }
                 Err(err) => match err.raw_os_error() {
                     Some(libc::EINTR) => continue,
@@ -490,7 +563,7 @@ impl UdpInetDriver {
                         break;
                     }
                     Some(libc::ECONNREFUSED) | Some(libc::ECONNRESET) | Some(libc::EPIPE) => {
-                        // The peer's port is gone (an `ICMP` port-unreachable surfaces as
+                        // The destination's port is gone (an `ICMP` port-unreachable surfaces as
                         // `ECONNREFUSED` on a connected datagram socket): the C's UDP send path
                         // reports the errno, so the queued remainder is dropped and the caller
                         // learns from the reply.
@@ -504,7 +577,7 @@ impl UdpInetDriver {
         if ctx.output().is_empty() && self.interest.is_writable() {
             self.set_interest(ctx, Interest::READABLE)?;
         }
-        Ok(written)
+        Ok(consumed)
     }
 
     /// The `open` verb: creates the datagram socket and registers it for read readiness.
@@ -725,9 +798,10 @@ impl UdpInetDriver {
     /// has no driver→owner message channel — and this floor's `send` is a **synchronous** reply
     /// (see the module docs on the async-op queue) — so that message is not sent. The reply here
     /// is the C's `ctl_reply` bytes, which is what a `port_control` caller reads; the
-    /// `{inet_reply, …}` shape stays a runtime-side gap. The CLI `gen_udp:send` path is not
-    /// touched by this verb at all: a queued `port_command` reaches
-    /// [`UdpInetDriver::write_pending`] instead, which still requires a connected socket.
+    /// `{inet_reply, …}` shape stays a runtime-side gap. The queued `port_command` path does
+    /// **not** use this verb: it reaches [`UdpInetDriver::write_pending`], which parses the C's
+    /// queued grammar itself and accepts the same caller-reference prefix (see
+    /// [`decode_queued_command`] for its own order and residual).
     ///
     /// # Errors
     ///
@@ -757,17 +831,9 @@ impl UdpInetDriver {
             },
         };
         // `inet_output_count(desc, len)` at `inet_drv.c:15163` (`packet_inet_command`, the
-        // empty-ancillary-data arm; `:15220` is the ancillary one): only the **payload** is
-        // counted — never the caller-reference prefix, the packed address or the ancillary
-        // length word — and it is counted at issue time, before the `send(2)`/`sendto(2)`
-        // attempt, so a failed send still counted it.
-        self.stat.output(payload.len());
-        let outcome = if self.state.is_connected() {
-            send_connected(fd, payload)
-        } else {
-            send_to(fd, payload, &address)
-        };
-        match outcome {
+        // empty-ancillary-data arm; `:15220` is the ancillary one) and the `INET_F_ACTIVE` split
+        // (`:15164`-`:15182`) live in `send_datagram`, shared with the queued write path.
+        match self.send_datagram(fd, address, payload) {
             Ok(_) => Ok(ctl_ok()),
             Err(err) => Ok(ctl_error(err)),
         }
@@ -1307,6 +1373,64 @@ impl Drop for UdpInetDriver {
         // `PortRegistry::open`, for instance). A `Drop` cannot report anything, so the
         // descriptor is simply released — the same rule `TcpInetDriver`/`FdDriver` follow.
         self.close_socket();
+    }
+}
+
+/// Decodes one queued `port_command` payload with the C's datagram grammar
+/// (`packet_inet_command`, `inet_drv.c:15037`-`:15260`), returning the destination address and
+/// the payload that follows the ancillary-length word.
+///
+/// The C strips the `prim_inet` caller-reference prefix first (`init_caller`, `:15055`-`:15065`)
+/// and then **always** parses `[address][anc_len:be32][anc_data][data]`
+/// (`:15139`-`:15230`). This crate's [`Driver`]/[`DriverContext`] seam carries no
+/// `driver_caller(port)`, so the prefix has to be recognised from the payload alone (see
+/// [`split_caller_ref`]), and the two wire forms are tried **plain first**:
+///
+/// 1. **plain form, tried first** — `[address][anc_len:be32][anc_data][data]`, i.e.
+///    [`split_datagram`] on the queue bytes directly;
+/// 2. **caller-reference form, only when rule 1 refuses** — [`split_caller_ref`], then
+///    [`split_datagram`] on the bytes after the prefix.
+///
+/// **Why the plain form can come first here.** Unlike [`UdpInetDriver::verb_send`]'s
+/// `port_control` convenience grammar, the queued form *is* the C's grammar, so there is no
+/// `[address][data]`-without-an-ancillary-length shape to protect: a plain command leads with an
+/// address tag (1, 3 or 4), while a caller-reference prefix leads with the high byte of its
+/// 16-bit tag length — `0` for every realistic `term_to_binary/1` tag (far below 256), never a
+/// valid address tag — so a prefixed command always fails rule 1 and is stripped by rule 2. The
+/// residual runs the other way and is the one [`split_caller_ref`] already documents: a prefixed
+/// command whose tag length is 256 or more begins with 1/3/4 and is taken as plain.
+///
+/// Rule 2 is only attempted for a **grammar** refusal. An `unsupported` outcome already matched
+/// the plain grammar (a parsable address plus an ancillary-length word) and *is* the command — the
+/// C's sendmsg arm — so retrying it as a prefixed command could only misroute bytes.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] for a command in neither form, or for the C's two
+/// `return_einval` guards (`:15155`/`:15158`, which [`split_datagram`] reports as
+/// [`DatagramCommand::Einval`]); the typed `unsupported` raise for a non-zero ancillary length.
+fn decode_queued_command(front: &[u8]) -> Result<(InetAddr, &[u8])> {
+    match split_datagram(front) {
+        Ok(command) => as_datagram(command),
+        Err(BeamError::BadArg) => match split_caller_ref(front) {
+            Some(rest) => split_datagram(rest).and_then(as_datagram),
+            // Not in the prefixed form either: rule 1's own reason stands.
+            None => Err(error::badarg()),
+        },
+        Err(other) => Err(other),
+    }
+}
+
+/// Folds [`DatagramCommand::Einval`] into the typed argument fault this path reports and yields
+/// the address/payload pair of a real send.
+///
+/// `Einval` is the C's `return_einval` (`inet_drv.c:15155`/`:15158`), which the `port_control`
+/// route renders as a `[0]einval` reply and the queued route — having no reply channel — reports
+/// as [`beam_common::BeamError::BadArg`].
+fn as_datagram(command: DatagramCommand<'_>) -> Result<(InetAddr, &[u8])> {
+    match command {
+        DatagramCommand::Send(address, payload) => Ok((address, payload)),
+        DatagramCommand::Einval => Err(error::badarg()),
     }
 }
 
