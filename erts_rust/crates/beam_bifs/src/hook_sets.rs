@@ -38,7 +38,7 @@
 //! | [`LocalFunIdentity`] | [`LOCAL_FUN_IDENTITY_BIFS`] | 4 |
 //! | [`DictHook`] | [`DICT_HOOK_BIFS`] | 7 |
 //! | [`ProcessHook`] | [`PROCESS_HOOK_BIFS`] | 11 |
-//! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 4 |
+//! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 8 |
 //! | [`SendHook`] | [`SEND_HOOK_BIFS`] | 4 |
 //! | [`NifLoader`] | [`NIF_LOADER_BIFS`] | 1 |
 //! | [`ExportGate`](beam_codec::ExportGate) | [`EXPORT_GATE_BIFS`] | 1 |
@@ -47,7 +47,7 @@
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 24 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 147 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 143 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -102,7 +102,7 @@
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
 //! | `RuntimeContext::uses_persistent_term` | [`needs_persistent_term`] |
-//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 147-key seam) |
+//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 143-key seam) |
 //! | — (the port hook is installed unconditionally today) | [`needs_port_hook`] |
 //! | — (the fun caller is gated by `reentrancy_capable(args)` today) | [`needs_fun_caller`] |
 //! | — (the local node is installed unconditionally today) | [`needs_local_node`] |
@@ -188,19 +188,31 @@ pub const PROCESS_HOOK_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "whereis", 1),
 ];
 
-/// The registered BIFs that read the [`PortHook`] seam — the four `src/port.rs`
-/// operations that consult the driver (open a port, close it, read its info).
+/// The registered BIFs that read the [`PortHook`] seam — the port operations that
+/// consult the driver (open a port, close it, read its info), in **both** of the
+/// spellings the C has for them.
 ///
 /// `erlang:port_close/1` returns `true`, and `port_info/1,2` render the hook's
-/// `{Item, Value}` pairs; `erlang:list_to_port/1`/`port_to_list/1` are **pure**
-/// (`#Port<0.Num>` text) and do not read the seam, so they are deliberately absent
-/// even though `port::register` installs them. Sorted by `(module, function,
-/// arity)`; see [`needs_port_hook`].
+/// `{Item, Value}` pairs. The `erts_internal:` keys are the *C* spellings of the same
+/// three operations (`bif.tab` declares only those; `erlang:`'s are `erlang.erl`
+/// wrappers) — they answer the C's value-shaped atoms (`badarg`/`badtype`/`undefined`)
+/// where the `erlang:` spellings raise, and they read the very same seam, prefixed by
+/// this crate's own argument-shape classification. `erts_internal:open_port/2` is here
+/// too even though it is the typed gap: a gap is not a *different* seam, it is a
+/// documented inability to use this one (the C answers a `#Ref<…>` init ack for a
+/// driver with `ERL_DRV_FLAG_USE_INIT_ACK`).
+/// `erlang:list_to_port/1`/`port_to_list/1` are **pure** (`#Port<0.Num>` text) and do
+/// not read the seam, so they are deliberately absent even though `port::register`
+/// installs them. Sorted by `(module, function, arity)`; see [`needs_port_hook`].
 pub const PORT_HOOK_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "open_port", 2),
     ("erlang", "port_close", 1),
     ("erlang", "port_info", 1),
     ("erlang", "port_info", 2),
+    ("erts_internal", "open_port", 2),
+    ("erts_internal", "port_close", 1),
+    ("erts_internal", "port_info", 1),
+    ("erts_internal", "port_info", 2),
 ];
 
 /// The registered BIFs that read the [`SendHook`] seam — `erlang:send/2`, its quoted
@@ -352,7 +364,7 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 /// The union of the five `runtime_bif!` family modules: `runtime/erlang.rs` (76),
 /// `runtime/erts_internal.rs` (56), `runtime/erts_debug.rs` (20),
 /// `runtime/debugger.rs` (13) and `runtime/other.rs` (28) = **193** registered keys,
-/// of which **147** forward to the seam — the forty-six keys with real implementations
+/// of which **143** forward to the seam — the fifty keys with real implementations
 /// (`erlang:is_builtin/3`, `erlang:term_to_iovec/1,2`, the twelve `erts_debug` /
 /// `erts_trace_cleaner` / `erts_literal_area_collector` constants and term walks
 /// (`copy_shared/2`, `disassemble/1`, `get_internal_state/1`, `interpreter_size/0`,
@@ -361,7 +373,9 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 /// `erts_trace_cleaner:send_trace_clean_signal/1`,
 /// `erts_literal_area_collector:send_copy_request/3`), the whole thirteen-key
 /// `erl_debugger` family, `erts_internal:ets_raw_first/1`,
-/// `erts_internal:ets_raw_next/2`, the eight `re:*` keys served by `crate::re` and the
+/// `erts_internal:ets_raw_next/2`, the `erts_internal:` port quartet
+/// (`open_port/2`, `port_close/1`, `port_info/1,2` — which read the separate
+/// [`PORT_HOOK_BIFS`] seam instead), the eight `re:*` keys served by `crate::re` and the
 /// six `erl_ddll` keys (`demonitor/1`, `info/2`, `loaded_drivers/0`, `monitor/2`,
 /// `try_load/3`, `try_unload/2`) served by `crate::runtime::ddll::{live,info,monitor}`;
 /// the `REAL_BIFS` of those five families) never read it and are therefore not here.
@@ -491,14 +505,10 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_internal", "new_connection", 1),
     ("erts_internal", "no_aux_work_threads", 0),
     ("erts_internal", "notify_breakpoint_hit", 3),
-    ("erts_internal", "open_port", 2),
     ("erts_internal", "port_call", 3),
-    ("erts_internal", "port_close", 1),
     ("erts_internal", "port_command", 3),
     ("erts_internal", "port_connect", 2),
     ("erts_internal", "port_control", 3),
-    ("erts_internal", "port_info", 1),
-    ("erts_internal", "port_info", 2),
     ("erts_internal", "prepare_loading", 2),
     ("erts_internal", "process_display", 2),
     ("erts_internal", "process_flag", 3),
@@ -852,8 +862,9 @@ mod tests {
     }
 
     #[test]
-    fn port_hook_bifs_are_the_four_driver_operations() {
-        // `list_to_port/1` and `port_to_list/1` are pure and deliberately absent.
+    fn port_hook_bifs_are_the_driver_operations_in_both_spellings() {
+        // `list_to_port/1` and `port_to_list/1` are pure and deliberately absent; the
+        // `erts_internal:` keys are the C spellings of the same three operations.
         assert_eq!(
             PORT_HOOK_BIFS,
             &[
@@ -861,6 +872,10 @@ mod tests {
                 ("erlang", "port_close", 1),
                 ("erlang", "port_info", 1),
                 ("erlang", "port_info", 2),
+                ("erts_internal", "open_port", 2),
+                ("erts_internal", "port_close", 1),
+                ("erts_internal", "port_info", 1),
+                ("erts_internal", "port_info", 2),
             ]
         );
     }
@@ -1076,7 +1091,11 @@ mod tests {
                 LOCAL_FUN_IDENTITY_BIFS,
                 &[crate::binconv::register, crate::term_conv::register],
             ),
-            ("PORT_HOOK_BIFS", PORT_HOOK_BIFS, &[crate::port::register]),
+            (
+                "PORT_HOOK_BIFS",
+                PORT_HOOK_BIFS,
+                &[crate::port::register, crate::runtime::register],
+            ),
             (
                 "SEND_HOOK_BIFS",
                 SEND_HOOK_BIFS,
@@ -1184,7 +1203,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 147);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 143);
     }
 
     /// The module-doc table at the top of this file is the human-readable record of the
@@ -1360,7 +1379,8 @@ mod tests {
                     // `list_to_port/1`/`port_to_list/1` are pure: no PortHook.
                     ("erlang", "list_to_port", 1),
                     ("erlang", "port_to_list", 1),
-                    ("erts_internal", "port_close", 1), // the runtime-hooks seam
+                    ("erts_internal", "port_close", 2), // wrong arity
+                    ("erts_internal", "port_command", 3), // a different port operation
                 ],
             ),
             (
