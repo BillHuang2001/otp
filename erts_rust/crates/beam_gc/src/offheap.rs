@@ -47,7 +47,7 @@
 //! # Why this lives in `beam_gc` and not in its callers
 //!
 //! Every host that owns a process (an owning `beam_process::Process`, the runtime) needs this
-//! exact test, and each of them used to hand-roll it — `beam_process/src/process.rs:176-199`
+//! exact test, and each host otherwise hand-holds its own copy — `beam_process/src/process.rs:176-199`
 //! (`reachable_bin_ref_payload`) is the surviving private copy this module is the lowest
 //! common ancestor of. Duplicating the *subtag test plus payload word index* in every host is
 //! precisely the "no duplication across crates" hazard the crate-layer contracts forbid: a
@@ -164,6 +164,7 @@ pub fn sweep_unreachable_binaries(
     live.sort_unstable();
 
     let released = off_heap.sweep(|entry| match entry {
+        // A binary is live iff a reachable `BinRef` names its payload.
         OffHeapEntry::Binary(binary) => live.binary_search(&(binary.data_ptr() as usize)).is_ok(),
         // An MSO has no `BinRef`-shaped reference; this seam never reclaims one.
         OffHeapEntry::Mso(_) => true,
