@@ -176,7 +176,9 @@
 //! `fullsweep_after` come from the **emulator's** heap-size options — the
 //! `+hms`/`+hmbs`/`+hmax*`-configured policy the process was seeded with
 //! ([`crate::info::effective_policy`]), so `+hms 1000 +hmbs 5000` reports 1598 / 6772 — and
-//! `minor_gcs` is the collector's real counter (today always `0`: this runtime runs no GC).
+//! `minor_gcs` is the collector's live `minor_since_major` counter (`Collector::minor_gcs()`),
+//! i.e. minors **since the last fullsweep** — it resets to `0` on every fullsweep, so it is never
+//! a collection total; the monotone totals are `Runtime::gc_stats().collections`.
 //! Nothing here is hardcoded from the oracle.
 //!
 //! # Documented divergences (correct-but-different-by-construction)
