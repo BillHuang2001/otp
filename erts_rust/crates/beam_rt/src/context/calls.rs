@@ -378,10 +378,10 @@ impl<'a> RuntimeContext<'a> {
         // `beam_bifs`) rather than blanket-enabling every reentrant call, which would break
         // `lists:map(fun(X) -> ets:lookup(T, X) end, L)` by blocking that nested call.
         let install_tables = !reentrant || Self::tables_capable(module, function, arity);
-        // Whether the BIF's result may be **moved out of the pooled BIF heap onto a region that
-        // outlives the call** (the running process's young heap, or the runtime's `-eval` store on
-        // the table-less route) and the pooled heap then **rewound** — the tail of this method
-        // (see [`Self::rehome_container_result`]).
+        // Whether the pooled BIF heap may be **rewound** to this call's `mark` after the result has
+        // been moved off it — the tail of this method (see [`Self::rehome_container_result`]). It
+        // gates the rewind only; the **move** of an `Ok` container result off the pool happens
+        // either way, because a container left on the pool is reachable from a heap object.
         //
         // Six of the `DispatchHooks` arms ([`super::dispatch`]) each let a term the BIF built on
         // `ctx.heap()` **escape** into state that outlives the call, which is exactly what a
@@ -395,8 +395,8 @@ impl<'a> RuntimeContext<'a> {
         // * `runtime_hooks` — the timer heap / reference space / link set
         //   ([`RuntimeHooksBridge`]).
         //
-        // A **reentrant** call (a fun-applying BIF) is excluded outright: the nested run can push
-        // an argument that lives on this very heap into any of those seams. The remaining arms —
+        // A **reentrant** call (a fun-applying BIF) is excluded too: the nested run can push an
+        // argument that lives on this very heap into any of those seams. The remaining arms —
         // `record_source`, `module_info` and the `fun_identity`/`memory_hook` build gates — are
         // pure reads of loader/runtime state, and the output sink is pure output, so none of them
         // retains a heap word.
@@ -774,44 +774,62 @@ impl<'a> RuntimeContext<'a> {
                 invoke_registered(bif, arity, &mut context, args)
             }
         };
-        // The result is still on the pooled BIF heap. Left there it is a container in a region
-        // the running process's copying collector does **not** scan, so the unscanned-root valve
-        // ([`super::gc::root_is_unscanned`]) declines every collection while it is live in an x
-        // register — and a churn loop that keeps such a result alive then grows peak memory with
-        // its iteration count. Move it onto a region that outlives the call — the running
-        // process's own young heap (a scanned region) when there is one, the runtime's `-eval`
-        // store on the table-less route ([`Self::rehome_container_result`]) — and rewind the pool
-        // **to this call's `mark`**, so the result is collectable and the words this call handed
-        // out are given back.
+        // The result is still on the pooled BIF heap. A **container** result must not stay there:
+        // the pool is a region no process collector scans, so Erlang code that stores such a result
+        // inside a heap object (a tuple, a map, a longer list) leaves a live heap object pointing
+        // into a recyclable region — and the container's own elements, young-generation addresses
+        // the collector relocated, are then never forwarded and dangle with it.
         //
-        // The rewind happens only when the move is both **safe** and **complete**:
+        // So the **move** is unconditional for an `Ok` container result: it goes onto a region that
+        // outlives the call — the running process's own young heap (a scanned region) when there is
+        // one, the runtime's `-eval` store on the table-less route
+        // ([`Self::rehome_container_result`]). It is deliberately **not** gated on `safe_to_rewind`,
+        // which answers a different question — may this call's heap words be *recycled* — and
+        // answers `false` for a reentrant call (a fun-applying BIF), because the nested run can push
+        // an argument that lives on this very heap into a seam that outlives the call.
+        //
+        // A container holding a **reference** is the one exception ([`Self::graph_holds_reference`]):
+        // a reference is identified by its address, so a copy would no longer be the timer/monitor
+        // it names and `erlang:cancel_timer/1,2` would refuse it. Such a result stays on the pool
+        // and the call does not rewind — the same residual as a failed move, below.
+        //
+        // The **rewind** below is what stays gated, on all of:
         //
         // * `safe_to_rewind` — no seam can have retained a heap word (see its definition above);
         // * an **`Ok`** result — a raise may carry a live reason term
         //   ([`beam_common::Raise::live_reason`], the `{badkey,K}`/`{case_clause,V}` shapes) that
         //   points into this heap, so the error path never rewinds;
-        // * a **container** result — an immediate is neither boxed nor a cons and a literal lives
-        //   in the frozen literal area, so neither can reach a word on this heap; skipping the
-        //   copy keeps the arithmetic/immediate hot path free (dispatch cost is measured —
-        //   see `TRACE_AND_PERF.md`);
         // * a move that **succeeded** — a graph the copier refuses, a destination that cannot be
-        //   grown, and a nursery that cannot be grown all leave the result where it is.
+        //   grown and a nursery that cannot be grown all leave the result exactly where it is.
+        //
+        // Only a container is moved: an immediate is neither boxed nor a cons and a literal lives in
+        // the frozen literal area, so neither can reach a word on this heap, and skipping the copy
+        // keeps the arithmetic/immediate hot path free (dispatch cost is measured — see
+        // `TRACE_AND_PERF.md`).
+        //
+        // A **failed** move is the residual: the container stays on the pool, and because a later
+        // call's `mark` sits above its words no later rewind can reclaim them — only
+        // [`Self::take_bif_frontier`] retiring the region ends their life. So such a call must not
+        // rewind either: the words above `mark` are still handed out to the caller.
         //
         // A **partially used** pool is no obstacle: `mark` was taken before the call, so
         // `reset_to(mark)` frees exactly this call's words `[mark..used)` and leaves the ones a
         // previous caller still owns below `mark` untouched (see `mark` above). For a heap taken
         // clean (`mark == 0`) that is byte for byte the `reset()` it replaces.
         let mut rewind = false;
-        if safe_to_rewind {
-            if let Ok(term) = result {
-                if !Self::result_is_foreign_container(term) {
-                    // Nothing reachable lives on this heap, so no byte of it was handed out for
-                    // anything that survives the call: rewinding disturbs nothing.
-                    rewind = true;
-                } else if let Some(copied) = self.rehome_container_result(term) {
-                    result = Ok(copied);
-                    rewind = true;
-                }
+        if let Ok(term) = result {
+            if !Self::result_is_foreign_container(term) {
+                // Nothing reachable lives on this heap, so no byte of it was handed out for
+                // anything that survives the call: rewinding disturbs nothing.
+                rewind = safe_to_rewind;
+            } else if Self::graph_holds_reference(term) {
+                // A reference's identity **is** its address (see the comment above): the copy
+                // would be a different term, so the result stays where it is and the pool is
+                // not rewound.
+                rewind = false;
+            } else if let Some(copied) = self.rehome_container_result(term) {
+                result = Ok(copied);
+                rewind = safe_to_rewind;
             }
         }
         // The BIF (and any NIF a bridge ran) is done and every borrow released, so commit the
@@ -876,6 +894,84 @@ impl<'a> RuntimeContext<'a> {
             && !beam_term::literal::is_literal(term)
     }
 
+    /// Whether anything in the graph rooted at `term` is a **reference** term — the one shape that
+    /// must never be moved off the pooled heap.
+    ///
+    /// # Why a reference is exempt from the move
+    ///
+    /// A reference's identity is its **address**: the M1 internal reference is a four-word
+    /// `[make_header(3, REF_SUBTAG), node, serial, id]` block whose payload words are all
+    /// immediates (`beam_term::boxed::write_internal_ref`), so a copy is a *different term* at a
+    /// different address. Everything that resolves a reference here keys on the term itself —
+    /// [`Runtime::references`](crate::Runtime::references) is a `HashMap<Eterm, _>`,
+    /// [`Timers`](crate::timers::Timers) answers [`Timers::is_timer_ref`] by the same key, and the
+    /// process table's monitor/alias references resolve the same way. A copied reference would
+    /// therefore stop being the timer/monitor it names: `erlang:cancel_timer/1,2` refuses it with
+    /// `badarg`, which `gen_server:cancel_timer/1` turns into a `kernel_sup` crash.
+    ///
+    /// So a reference-containing result is **not** moved. That is the residual this function
+    /// documents at its call site: the graph keeps its pool words, and the call does not rewind.
+    ///
+    /// # The walk
+    ///
+    /// [`beam_term::layout::for_each_child_slot`] — the workspace's canonical per-shape child
+    /// enumeration, the same one the copier and the unscanned-root valve drive — over an explicit
+    /// worklist, with each object's address visited once so a shared or cyclic subgraph costs one
+    /// visit. Literals are skipped: a frozen code constant lives in the literal area and can name
+    /// nothing on this heap.
+    ///
+    /// # Safety
+    ///
+    /// `term` must be a **live** container the caller just received from a registered BIF, so
+    /// every object the walk reaches is a readable, aligned, well-formed term word.
+    #[allow(unsafe_code)]
+    fn graph_holds_reference(term: Eterm) -> bool {
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut work: Vec<Eterm> = vec![term];
+        while let Some(item) = work.pop() {
+            // A literal is a frozen code constant (never on this heap) and an immediate is
+            // neither boxed nor a cons: neither can reach a word here.
+            if beam_term::literal::is_literal(item)
+                || !(beam_term::prelude::is_boxed(item) || beam_term::prelude::is_list(item))
+            {
+                continue;
+            }
+            if beam_term::prelude::is_list(item) {
+                // SAFETY: `item` is a live cons cell reachable from the BIF's own result, so the
+                // two words at its address are its live `car` and `cdr`.
+                unsafe {
+                    let address = beam_term::list::ptr_val(item) as *const Eterm;
+                    if !seen.insert(address as usize) {
+                        continue;
+                    }
+                    work.push(*address);
+                    work.push(*address.add(1));
+                }
+                continue;
+            }
+            // SAFETY: `item` is a live boxed term, so its header word is a readable, aligned term
+            // word at the address the term's pointer bits name.
+            unsafe {
+                let address = beam_term::boxed::boxed_val(item) as *const Eterm;
+                if !seen.insert(address as usize) {
+                    continue;
+                }
+                let header = *address;
+                if beam_term::boxed::is_ref_thing_header(header)
+                    || beam_term::boxed::is_external_ref_header(header)
+                {
+                    return true;
+                }
+                // SAFETY: `address` heads the live object `header` names, so `for_each_child_slot`
+                // visits exactly that shape's term-reference slots — offsets relative to the
+                // header word, every one in bounds and live.
+                beam_term::layout::for_each_child_slot(header, address, |offset| {
+                    work.push(*address.add(offset));
+                });
+            }
+        }
+        false
+    }
     /// Copies a container result off the pooled BIF heap onto a region that **outlives the call**,
     /// returning the copy — or `None` when it cannot be re-homed, in which case the caller leaves
     /// both the result and the pool exactly as they were.
