@@ -187,7 +187,12 @@ by `Machine::with_roots` for the duration of every hand-off and re-seated from t
 relocates them with no host-side change; the supplied-trace latches are `Vec<StackFrame>` metadata and
 need no rooting. `Machine::pending_exception` (`machine/catch.rs`) is the remaining engine-held live
 reason `Eterm`: it is rooted **host-side** by `beam_rt` via `Registers::extra_roots` (the write accessor a
-collecting host needs, `Machine::pending_exception_mut`, exists). The other Rust-local vectors are
+collecting host needs, `Machine::pending_exception_mut`, exists). The complete set of `Eterm`-typed
+`Machine` fields is `x`/`fr`/`stack` (the `RootSet`), `pending_exception`, `class_atoms: [Eterm; 3]`
+(atom **immediates** only — never a heap pointer, so no rooting needed), the two parked raise latches and
+`args_scratch` (empty outside a dispatch). Everything else on the machine is `u32`/`bool`/`usize`
+metadata or an `Arc<Module>` handle, so `current_code`, `raise_snapshot`, `entry_call`, the frame and
+catch-frame stacks and the supplied-trace latches carry no heap term. The other Rust-local vectors are
 recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
 
 ## Long files (role-justified, beyond the ~1000-line guideline)
