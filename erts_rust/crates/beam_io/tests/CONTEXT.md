@@ -141,6 +141,14 @@ runtime and compares it with the crate's own rendering, so the table in the test
 rot.
 
 ## Known Issues / Notes for Agents
+- **A `driver_async` job's frames are an asynchronous delivery, so their *count* at a call site is
+  not fixed.** The fixture's worker thread `driver_output`s `"A"` and its `ready_async`
+  `driver_output`s `"H"`; a worker-thread delivery only lands when it coincides with a driver
+  callback's installed port context, so how many of the two are owed after a drive point varies run
+  to run (both is legitimate — the C delivers from any thread, `erts/emulator/beam/io.c:6387-6446`).
+  Assert the **sequence** (`drain_data`/`await_trailing_data` + `is_async_job_frame`), never the
+  count; `round_data`'s "exactly one" assert belongs to call sites that make one `driver_output*`
+  call themselves.
 - `driver_peekq`/`driver_peekqv` report `vlen == 1` on the Rust host (`AbiHost` publishes the whole
   contiguous queue as one iovec entry) where the oracle counts one entry per `driver_enq`.
 - `AbiHost::pushq` flattens the queue (`front()` + clear + push), so byte order after a
