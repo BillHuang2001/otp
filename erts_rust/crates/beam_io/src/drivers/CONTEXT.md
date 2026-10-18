@@ -51,8 +51,21 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   runtime's. A number no table entry matches — including a case of the other driver's switch, and
   every op below the magic (`"1"`, `"99"`) — answers the C's `[0]exbadport`; an opcode the C serves
   but this floor does not is the typed `Opcode::not_served()` unsupported raise. `inet/CONTEXT.md`
-  carries the full served-vs-refused opcode table. A command on a socket-less or peerless port is the
-  typed `BeamError::BadArg` refusal of *Known Issues* below.
+  carries the full served-vs-refused opcode table. A **control** verb on a socket-less or peerless
+  port answers the C's control reply — `[0]enotconn` on a stream port (`tcp_inet`'s `send`/`recv`/
+  `shutdown`/`accept`), `[0]einval` on a datagram one — never a typed refusal; the
+  `erlang:port_command/2` write path is the separate, `init_caller`-shaped one of *Known Issues*
+  below.
+  `setopts`/`getopts` serve the C's whole option surface in two families — `opt_state.rs` (the codes
+  the `inet`/`tcp`/`udp` descriptor keeps: `active`, `packet`, `mode`, `deliver`, the watermarks,
+  `delay_send`, `send_timeout*`, `show_econnreset`, `read_ahead`, `read_packets`, `netns`,
+  `line_delim`, the membership pair) and `opt_sys.rs` (everything that reaches
+  `setsockopt(2)`/`getsockopt(2)`, incl. `linger`'s `struct linger` shapes, `bind_to_device`, `raw`,
+  `pktoptions`, `multicast_if`) — so `prim_inet:accept_opts/3`, the `getopts`+`setopts` pair a
+  `gen_tcp:accept/1` ends in, completes. Every code is byte-compared against the oracle per port
+  state — no socket, open stream, open datagram, post-`close`, bound-and-listening — plus the
+  datagram `post-close` twin (`opt_state_tests.rs`/`opt_sys_tests.rs`; `opt_oracle.rs` is the one
+  shared harness).
 - `line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `binary_io.rs` → `Phase`, `PhaseChange`.
 - `mod.rs` → module wiring/re-exports only.
 
@@ -104,20 +117,42 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   `disarm_output` are no-ops for `duplex` (`spawn.rs:913-941`), so the single adopted descriptor stays
   registered both ways after read EOF (`release_stdout` is a no-op for duplex). Harmless under the
   edge-triggered poller, but a spurious `OUTPUT` task is scheduled on every write-readiness event.
-- **A command on a socket-less inet port is a typed `BeamError::BadArg` refusal with the queued bytes
-  retained** — `inet/mod.rs::write_pending` (`connected_socket()?`, the C's `!IS_CONNECTED`) and its
-  `udp.rs` counterpart (a `self.socket`-less `Err`, the C's `!IS_OPEN`), reached from both `output` and
-  `ready_output`. Nothing is consumed, so a re-driven `OUTPUT` task refuses identically instead of
-  losing data; the `Err` short-circuits `Port::check_write_accounting` and surfaces out of
-  `PortRegistry::execute_port_tasks`, and `erlang:port_command/2` raises. An **open but unconnected**
-  datagram port really sends (the destination rides the command's address field), so only a socket-less
-  one refuses. The oracle instead answers `true` and then either delivers `{error,enotconn}` out of band
-  (a caller-ref-prefixed payload) or kills the port (`init_caller`'s `EINVAL`) — neither shape is
-  reachable through the frozen `Driver` trait: there is no `driver_failure` seam, and answering the
-  C's way would mean accepting the command and reporting its bytes consumed for a write that never
-  happened. The `{inet_reply,…}` completion itself *is* expressible
-  (`DriverContext::deliver_completion`); what is missing is the C's accept-then-fail sequence. The
-  measured oracle shapes are in `inet/CONTEXT.md` › *Known Issues*.
+- **The `port_command/2` write path reproduces the C's `init_caller` split, failure kill included.**
+  Both inet drivers run `init_caller`/`init_caller_iov` (`inet_drv.c:1820`-`:1890`) on every queued
+  command **before** they look at the socket, with the C's **size-only** rule: the first two bytes
+  are a big-endian 16-bit tag length `n`, `n` tag bytes must follow, and the tag's content is never
+  inspected (so a *plain* payload reads as a huge length). The strip runs **once per command**, never
+  per short write, and the four rows are each oracle-measured:
+  (a) **malformed** (too short for the length word, or an `n` that does not fit) ⇒ the queue is
+  consumed and charged (`prt->bytes_out += size`), nothing is written, and
+  `DriverContext::signal_failure(DriverFailure::posix(EINVAL))` is latched — the C's
+  `driver_failure_posix(EINVAL)` (`:12634`/`:12667` tcp, `:15063` udp) — so `PortRegistry`'s
+  `reap_failures` closes the port after the round: `erlang:port_command/2` still answers `true`, the
+  owner's exit reason is `einval`, and every later command is the oracle's `badarg`;
+  (b) a **well-formed** prefix on a socket-less or unconnected port ⇒ consumed and answered out of
+  band with `InetReply::Error(ENOTCONN)` for `tcp_inet` (`:12674`-`:12683`), and on a **socket-less**
+  `udp_inet` with `Error(EINVAL)` (its `!IS_OPEN` arm, `:15068`-`:15077`) — an open-but-unconnected
+  datagram port really sends, since the destination rides the command — the port **staying alive**;
+  `udp_inet`'s operand grammar answers `Error(EINVAL)` the same way for its own `return_einval`
+  refusals (a truncated ancillary-length word);
+  (c) an **empty** output queue (`init_caller` would read `size < 2`) is `Ok(0)` and latches
+  nothing, so a re-driven `OUTPUT` task after a finished write cannot kill the port;
+  (d) a tag that is **empty** or not ETF-led is consumed but stages **no** reply
+  (`echoable_caller_tag` — the C's `erl_drv_send_term` cannot decode it).
+  Residuals, each a typed error rather than a wrong result: `udp_inet`'s **ancillary data**
+  (`anc_len != 0`, the C's `sendmsg`-with-cmsgs arm) is the typed `unsupported` with the command
+  left queued, and a tag of **≥ 256 bytes** would be read as a plain command (impossible for
+  `prim_inet:send/3`, whose `term_to_binary/1` reference is tens of bytes).
+- **A driver closes its own port through the failure channel, never by panicking or returning an
+  error.** `DriverContext::signal_failure(DriverFailure)` latches the C's `driver_failure*`/`driver_exit`
+  request from inside a callback (exactly one latch; later deliveries from the same callback are
+  refused, the C's `-1`); `PortRegistry::reap_failures` then tears the port down through the ordinary
+  close path after the round, and the runtime renders the owner's reason from
+  `PortRegistry::take_failures()` (`FailureReason::atom_name`/`code`, gated on
+  `DriverFailure::signals_owner`). `src/port_failure.rs` carries the whole mapping; the loaded-C-driver
+  half (the `driver_failure*`/`driver_exit` hooks) is `../abi/`'s. Adopted in this node: `tcp_inet`
+  and `udp_inet` latch `posix(EINVAL)` for a malformed `port_command/2` (the bullet above), so that
+  path never answers a typed `BadArg` where the oracle kills or keeps the port.
 - Non-obvious framing divergences recorded in code: an out-of-range `{packet,N}` code is treated as
   **no framing** where the C's `packet_get_length` `default:` rejects it (`inet/frame.rs:96-105`); an
   unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).
@@ -135,9 +170,9 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   in-module helpers `WAIT_HANG_GUARD`, `drive_to_eof` (end-of-file latch) and `wait_for_exit_status`
   (once-only status) end the instant the condition holds, so a loaded host cannot fail them; the guard
   only stops a genuinely broken driver from hanging the suite. A fixed 5-second cap of exactly that
-  shape is what made the `a_bad_cd…` / `a_file_with_no_executable_format…` tests flaky under load — on
-  a starved host the child needed just over 5 s to be scheduled, run and be reaped. Keep the `EINTR`
-  retry in the poll loop (`SIGCHLD` deliveries make it a normal outcome).
+  shape makes those two cases flaky under load — a starved host needs just over 5 s to schedule, run
+  and reap the child. Keep the `EINTR` retry in the poll loop (`SIGCHLD` deliveries make it a normal
+  outcome).
 - `EfileDriver` composes an `FdDriver`; a read+write `open` attaches **two** `dup(2)` descriptors (one
   per slot), each closed exactly once (`efile.rs:383-401`).
 - The `line` control argument accepts the `getopts` reply shape (`line,<N>`) as well as a bare decimal.
@@ -169,7 +204,15 @@ The crate-level integration suites for this node are the sibling `../../tests/` 
   constants (the in-memory command-driven file driver); its suite is the sibling `ram_file_tests.rs`
   (`#[cfg(test)] #[path = "ram_file_tests.rs"] mod tests;`, the `inet/` split pattern)
 - `line_buffer.rs` → `LineBuffer`; `binary_io.rs` → `Phase`/`PhaseChange`
-- `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers, the numeric `erlang:port_control/3` opcode bridge (`opcode.rs` — the `0x03f1a300` magic, wrapping unsigned subtraction, the C's three switches), and `{packet, N}` framing (read + send path) (child node `src/drivers/inet/CONTEXT.md`)
+- `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers; the option vocabulary
+  (`opt.rs` — the five-byte/one-byte record walk over `Step`, the `SocketOptions` store, the
+  `OptScope { stype, family, protocol }` gates — split into `opt_state.rs`'s driver-state codes and
+  `opt_sys.rs`'s syscall-backed codes, incl. `linger`/`bind_to_device`/`raw`/`pktoptions` and the
+  `propagate = 1` nine), `sys.rs`'s `get_socket_linger`/`set_socket_linger`/`get_socket_bytes`/
+  `set_socket_bytes`, `adopt_probe.rs`'s `INET_REQ_FDOPEN` errno rendering, the numeric
+  `erlang:port_control/3` opcode bridge (`opcode.rs` — the `0x03f1a300` magic, wrapping unsigned
+  subtraction, the C's three switches), and `{packet, N}` framing (read + send path); the option
+  surface is oracle-pinned byte-for-byte (child node `src/drivers/inet/CONTEXT.md`)
 - `../abi/` → the driver C-ABI host layer (sibling child node, not a built-in driver)
 
 ## See Also

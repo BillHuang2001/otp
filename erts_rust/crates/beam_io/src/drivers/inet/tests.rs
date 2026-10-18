@@ -32,9 +32,11 @@ use super::{
     INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT, INET_REP_OK,
     INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
+use crate::completion::{CompletionEvent, InetReason, InetReply, PortCompletion};
 use crate::driver::{Driver, DriverContext, DriverFlags, PortArms};
 use crate::poller::Poller;
 use crate::port::{PortRegistry, PortState};
+use crate::port_failure::DriverFailure;
 use crate::port_task::{PortTaskKind, Readiness};
 use crate::queue::ByteQueue;
 use beam_common::{BeamError, Result};
@@ -70,6 +72,21 @@ fn open_arg() -> [u8; 3] {
 fn loopback_arg(port: u16) -> Vec<u8> {
     let [hi, lo] = port.to_be_bytes();
     vec![INET_AF_LOOPBACK, hi, lo]
+}
+
+/// A golden `term_to_binary(Mref, [local])` caller tag — the shape `prim_inet:send/3` prefixes
+/// (`erts/preloaded/src/prim_inet.erl:575`-`:700`) and the image `inet_reply_finish` echoes back
+/// through `erl_drv_send_term`'s `LOAD_EXT` (`inet_drv.c:2614`-`:2637`), which can only decode an
+/// external-term image.
+const CALLER_REF_TAG: &[u8] = &[131, 100, 0, 8, b'r', b'e', b'f', b'0'];
+
+/// The `port_command/2` command wire form the C's `init_caller` (`inet_drv.c:1820`-`:1890`)
+/// expects from every internal-pid caller: `[tag_len:be16][tag][payload]`.
+fn prefixed_command(tag: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut arg = (tag.len() as u16).to_be_bytes().to_vec();
+    arg.extend_from_slice(tag);
+    arg.extend_from_slice(payload);
+    arg
 }
 
 /// A copy of `fd` (`dup(2)`), so the driver and the test each own a descriptor.
@@ -952,12 +969,20 @@ fn the_option_verbs_on_a_socket_less_port_match_the_oracle() {
 ///
 /// The context is rebuilt for every call: it borrows the rig's fields, and a driver never holds
 /// one across calls anyway (`crate::port::Port` builds one per driver interaction).
+///
+/// Every context carries the three side-channel sinks [`crate::Port`] installs at each driver
+/// callback — the completed-read sink, the completion sink (**required** now that a queued command
+/// answers its caller tag: without it `deliver_completion` is the typed `unsupported`) and the
+/// failure latch (without it `signal_failure`, the C's `driver_failure*`, is the typed
+/// `unsupported`).
 struct Rig {
     driver: TcpInetDriver,
     poller: Poller,
     input: ByteQueue,
     output: ByteQueue,
     arms: PortArms,
+    completions: Vec<PortCompletion>,
+    failure: Option<DriverFailure>,
 }
 
 impl Rig {
@@ -969,6 +994,8 @@ impl Rig {
             input: ByteQueue::new(),
             output: ByteQueue::new(),
             arms: PortArms::default(),
+            completions: Vec::new(),
+            failure: None,
         }
     }
 
@@ -998,7 +1025,9 @@ impl Rig {
             &mut self.input,
             &mut self.output,
             &mut self.arms,
-        );
+        )
+        .with_completions(&mut self.completions)
+        .with_failure(&mut self.failure);
         self.driver.start(&mut ctx)
     }
 
@@ -1010,7 +1039,9 @@ impl Rig {
             &mut self.input,
             &mut self.output,
             &mut self.arms,
-        );
+        )
+        .with_completions(&mut self.completions)
+        .with_failure(&mut self.failure);
         self.driver.control(&mut ctx, command, arg)
     }
 
@@ -1022,7 +1053,9 @@ impl Rig {
             &mut self.input,
             &mut self.output,
             &mut self.arms,
-        );
+        )
+        .with_completions(&mut self.completions)
+        .with_failure(&mut self.failure);
         self.driver.output(&mut ctx)
     }
 
@@ -1039,7 +1072,9 @@ impl Rig {
             &mut self.input,
             &mut self.output,
             &mut self.arms,
-        );
+        )
+        .with_completions(&mut self.completions)
+        .with_failure(&mut self.failure);
         self.driver.ready_output(&mut ctx)
     }
 
@@ -1058,6 +1093,32 @@ impl Rig {
     /// How many bytes are waiting in the port output queue.
     fn output_len(&self) -> usize {
         self.output.len()
+    }
+
+    /// The completions staged since the last drain, in delivery order — the `{inet_reply, …}` a
+    /// queued command's caller tag produces (`inet_reply_finish`, `inet_drv.c:2614`).
+    fn take_completions(&mut self) -> Vec<PortCompletion> {
+        std::mem::take(&mut self.completions)
+    }
+
+    /// The `(caller tag, reply)` pairs of those completions, so a test asserts the reply without
+    /// matching the enum.
+    fn caller_replies(&mut self) -> Vec<(Option<Vec<u8>>, InetReply)> {
+        self.take_completions()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                CompletionEvent::InetReply { caller_ref, reply } => Some((caller_ref, reply)),
+                CompletionEvent::InetAsync { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The failure the driver latched through
+    /// [`DriverContext::signal_failure`](crate::DriverContext::signal_failure) — the C's
+    /// `driver_failure*`/`driver_exit` request — and forgets it, as
+    /// [`crate::Port::take_failure`] does for the registry.
+    fn take_failure(&mut self) -> Option<DriverFailure> {
+        self.failure.take()
     }
 }
 
@@ -1367,63 +1428,118 @@ fn a_shutdown_on_a_not_connected_port_is_enotconn() {
 }
 
 // -----------------------------------------------------------------------
-// A socket-less / unconnected port command is refused (`inet_drv.c:12629`)
+// A socket-less / unconnected port command: the C's `init_caller` split
 // -----------------------------------------------------------------------
 
-/// **A `port_command/2` on a port with no socket is refused, and the queued bytes survive.**
+/// **A `port_command/2` whose bytes carry no caller-reference prefix closes the port**, and the
+/// command's bytes are **accounted for** instead of being left queued.
 ///
-/// The C has two ways to reject a command here: with a well-formed caller-ref prefix its
-/// `tcp_inet_command` answers `inet_reply_error(ENOTCONN)` for a socket it cannot write
-/// (`inet_drv.c:12645` — the caller still gets `true` from `port_command/2` and learns the
-/// outcome from the later `{inet_reply, S, {error, enotconn}}` message), while a bare
-/// `port_command/2` payload carries no caller-ref prefix at all, so `init_caller` (`:1854`)
-/// rejects it and the driver fails the port (`driver_failure_posix(EINVAL)`, `:12634`).
+/// A **correction** of a previously-wrong expectation: this driver used to answer a typed
+/// [`BeamError::BadArg`] and keep the bytes. The C runs `init_caller`
+/// (`inet_drv.c:1820`-`:1890`) *before* it looks at the connection at all, and that call is
+/// **size-only** — the first two bytes are a 16-bit tag length and `len - 2` must hold that many
+/// tag bytes. `<<1,2,3>>` reads as a 258-byte tag and does not fit, so `init_caller` answers
+/// `FALSE`, which `tcp_inet_commandv` (`:12667`) turns into
+/// `driver_failure_posix(port, EINVAL)` (`io.c:7273`) — while `erlang:port_command/2` still
+/// answers `true` and the C charges the whole command (`prt->bytes_out += size`).
 ///
-/// This driver has neither seam — the frozen [`Driver`] trait has no `driver_failure` and no
-/// asynchronous reply channel — so it reports the same condition as a typed
-/// [`BeamError::BadArg`] and never touches the queue: `Port::output`/`Port::ready_output`
-/// propagate the error up to `erlang:port_command/2`'s caller instead of silently dropping the
-/// command. The refusal is **idempotent**: the write-readiness re-drive refuses identically and
-/// still leaves every byte queued.
-/// [`the_socket_less_command_sequence_matches_the_erl_oracle`] pins the oracle's own sequence.
+/// Measured on OTP 29.1.1 against a bare `{spawn_driver,"tcp_inet"}` port:
+/// `port_command(P, <<"hello">>)` ⇒ `true`, the owner receives `{'EXIT',P,einval}`, and
+/// `port_info(P,name)` is `undefined`. The registry half of that row (the reaped port, the
+/// `badarg` on every later command) is pinned by
+/// [`a_socket_less_command_closes_the_port`](super::async_tests::a_socket_less_command_closes_the_port),
+/// and the oracle sequence itself by
+/// [`the_socket_less_command_sequence_matches_the_erl_oracle`].
 #[test]
-fn a_socket_less_port_command_is_refused_and_keeps_its_bytes() {
+fn a_socket_less_malformed_command_closes_the_port_with_einval() {
     let mut rig = Rig::new(TcpInetDriver::new());
     rig.start().expect("a socket-less driver registers nothing");
 
     rig.queue_output(b"\x01\x02\x03");
     assert_eq!(rig.output_len(), 3, "the command is queued");
-    assert!(
-        matches!(rig.drain_output(), Err(BeamError::BadArg)),
-        "`Driver::output` refuses a command it has no socket for"
+    assert_eq!(
+        rig.drain_output()
+            .expect("the C accepts the command and charges it"),
+        3,
+        "every queued byte is accounted for — the C's `prt->bytes_out += size`"
     );
     assert_eq!(
         rig.output_len(),
-        3,
-        "the refused command's bytes are never consumed"
+        0,
+        "the command is consumed, never left behind"
     );
-
+    assert_eq!(
+        rig.take_failure(),
+        Some(DriverFailure::posix(libc::EINVAL)),
+        "`driver_failure_posix(EINVAL)` — the reason the owner's `{{'EXIT',P,einval}}` renders \
+         from"
+    );
     assert!(
-        matches!(rig.ready_output(), Err(BeamError::BadArg)),
-        "the write-readiness re-drive refuses the same command the same way"
+        rig.caller_replies().is_empty(),
+        "a malformed command has no caller reference to answer"
     );
-    assert_eq!(rig.output_len(), 3, "still never consumed");
     assert_eq!(
         rig.driver.state(),
         InetState::Closed,
-        "a refusal is not a state change: the port is still socket-less"
+        "the latch is a request: nothing is torn down inside the callback"
+    );
+    assert_eq!(
+        rig.ready_output().expect("a re-driven OUTPUT task with nothing queued"),
+        0,
+        "the write-readiness re-drive finds no command to examine: `init_caller` on an empty \
+         buffer is the C's `size < 2` FALSE, which would otherwise latch a second failure"
+    );
+    assert_eq!(
+        rig.take_failure(),
+        None,
+        "so the empty re-drive latches nothing"
     );
 }
 
-/// The same refusal on an **opened but unconnected** socket: `open` + `bind` leaves the driver in
-/// [`InetState::Open`], which is still not `IS_CONNECTED` (`inet_drv.c:1037`), so the C's
-/// `tcp_inet_command` answers `enotconn` there too (`:12645`) — a bound socket with no peer cannot
-/// write.
+/// A re-driven `OUTPUT` task on a port with **nothing queued** is not a command, so it writes
+/// nothing and latches nothing.
 ///
-/// The socket really exists here, so this is the shape that could otherwise silently drop bytes:
-/// the refusal must still leave them queued.
+/// The C is only ever handed a command (`ev->size`), and `init_caller` on an empty buffer is its
+/// `size < 2` `FALSE` (`inet_drv.c:1834`) — which `tcp_inet_commandv` (`:12667`) would turn into
+/// `driver_failure_posix(port, EINVAL)` and kill the port over a write that already finished. The
+/// guard has to come **before** the connection test and the prefix strip, so it holds on a
+/// socket-less port too: the first branch of
+/// [`TcpInetDriver::write_command`] is that guard.
 #[test]
-fn an_unconnected_socket_refuses_a_port_command_and_keeps_its_bytes() {
+fn an_empty_queue_re_drive_writes_nothing_and_latches_nothing() {
+    let mut rig = Rig::new(TcpInetDriver::new());
+    rig.start().expect("a socket-less driver registers nothing");
+    assert_eq!(rig.output_len(), 0, "nothing was ever queued");
+    assert_eq!(
+        rig.drain_output().expect("an empty re-drive"),
+        0,
+        "`output` on an empty queue is the C's `size < 2` shortcut, i.e. no bytes"
+    );
+    assert_eq!(
+        rig.ready_output().expect("an empty write-readiness re-drive"),
+        0,
+        "and so is a `ready_output` round on the same empty queue"
+    );
+    assert_eq!(rig.take_failure(), None, "the port stays alive");
+    assert_eq!(rig.driver.state(), InetState::Closed, "the state never moved");
+    assert!(
+        rig.caller_replies().is_empty(),
+        "there is no caller to answer"
+    );
+}
+/// The other side of the split: on an **opened but unconnected** socket a *well-formed* command is
+/// accepted, never written, and answered out of band with `{error, enotconn}` — the C's
+/// `!IS_CONNECTED` arm (`tcp_inet_commandv`, `inet_drv.c:12674`-`:12683`), reachable only once
+/// `init_caller` has accepted the prefix (`:12656`-`:12667`).
+///
+/// A **correction** of a previously-wrong expectation, which reported the same typed `BadArg`
+/// refusal as the malformed case: the oracle distinguishes them. Measured on OTP 29.1.1 —
+/// `port_command(P, <<Len:16, Mref/binary>>)` on a socket-less port answers `true`, then
+/// `{inet_reply,P,{error,enotconn},Mref}` reaches the owner, and `port_info(P,name)` is still
+/// `"tcp_inet"`. `open` + `bind` leaves exactly the state the C's `IS_CONNECTED` test rejects
+/// (`:1037`), so the arm is the same one.
+#[test]
+fn an_unconnected_socket_answers_a_tagged_command_with_enotconn() {
     let mut rig = Rig::new(TcpInetDriver::new());
     rig.start().expect("the driver starts");
 
@@ -1438,22 +1554,37 @@ fn an_unconnected_socket_refuses_a_port_command_and_keeps_its_bytes() {
     assert_eq!(rig.driver.state(), InetState::Open);
     assert!(rig.driver.socket().is_some(), "the socket exists");
 
-    rig.queue_output(b"\x01\x02\x03");
-    assert!(
-        matches!(rig.drain_output(), Err(BeamError::BadArg)),
-        "a command on a socket with no peer is refused"
+    let command = prefixed_command(CALLER_REF_TAG, b"payload");
+    rig.queue_output(&command);
+    assert_eq!(
+        rig.drain_output()
+            .expect("an untagged-by-connection command is accepted"),
+        command.len(),
+        "the prefix and the payload are both charged"
     );
-    assert_eq!(rig.output_len(), 3, "the bytes are never consumed");
-    assert!(
-        matches!(rig.ready_output(), Err(BeamError::BadArg)),
-        "and the write-readiness re-drive refuses it too"
+    assert_eq!(rig.output_len(), 0, "the command is consumed");
+    assert_eq!(
+        rig.caller_replies(),
+        vec![(
+            Some(CALLER_REF_TAG.to_vec()),
+            InetReply::Error(InetReason::from_errno(libc::ENOTCONN)),
+        )],
+        "`inet_reply_error(ENOTCONN)` — the oracle's `{{inet_reply,P,{{error,enotconn}},Mref}}` \
+         with the tag echoed verbatim"
     );
-    assert_eq!(rig.output_len(), 3, "still never consumed");
+    assert_eq!(rig.take_failure(), None, "the port stays alive");
+    assert_eq!(rig.driver.state(), InetState::Open, "still no peer");
+    assert!(rig.driver.socket().is_some(), "and the socket is untouched");
 }
 
-/// **A connected socket still writes** — the shape this driver must keep working. The queued
-/// command is drained to the socket, `Driver::output` reports exactly the queued count (what the
-/// port charges as written) and the output queue is left empty.
+/// **A connected socket still writes** — the shape this driver must keep working. A queued
+/// command's caller prefix is stripped by `init_caller`, the payload is drained to the socket,
+/// `Driver::output` reports exactly the queued count (what the port charges as written) and the
+/// caller tag is answered with the C's `{inet_reply, Port, ok, Tag}` (`inet_reply_finish`,
+/// `inet_drv.c:2614`-`:2637`).
+///
+/// The prefix is mandatory in the C too: `tcp_inet_commandv` runs `init_caller` on every
+/// `port_command/2` command, so a bare payload is the *malformed* row above, not a write.
 #[test]
 fn a_connected_socket_drains_a_queued_port_command() {
     let (mut rig, mut client) = Rig::connected();
@@ -1461,24 +1592,33 @@ fn a_connected_socket_drains_a_queued_port_command() {
         .set_read_timeout(Some(WAIT))
         .expect("a read timeout");
 
-    rig.queue_output(b"hello");
-    assert_eq!(rig.output_len(), 5);
+    let command = prefixed_command(CALLER_REF_TAG, b"hello");
+    rig.queue_output(&command);
+    assert_eq!(rig.output_len(), command.len());
     assert_eq!(
         rig.drain_output().expect("the output callback"),
-        5,
-        "the drained command is reported byte for byte"
+        command.len(),
+        "the drained command is reported byte for byte, prefix included"
     );
     assert_eq!(rig.output_len(), 0, "the queue is empty after the write");
     assert!(
         !rig.driver.interest.is_writable(),
         "a fully drained queue leaves write readiness unarmed"
     );
+    assert_eq!(
+        rig.caller_replies(),
+        vec![(Some(CALLER_REF_TAG.to_vec()), InetReply::Ok)],
+        "`inet_reply_finish`'s `ok`, with the tag echoed verbatim"
+    );
 
     let mut buf = [0u8; 5];
     client
         .read_exact(&mut buf)
         .expect("the peer reads the command");
-    assert_eq!(&buf, b"hello", "the bytes really reached the peer");
+    assert_eq!(
+        &buf, b"hello",
+        "the payload — and only the payload — reached the peer: the prefix never goes on the wire"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -1739,18 +1879,19 @@ fn the_half_close_and_peer_close_semantics_agree_with_the_erl_oracle() {
 /// (caught here as an exit-shaped term, hence the `contains` check rather than equality with the
 /// bare atom).
 ///
-/// That sequence is the **caller-ref grammar**, not the socket state: `tcp_inet_command` fails
-/// through `init_caller` (`inet_drv.c:1854`) whenever the payload is too short to carry the
-/// two-byte length + caller-ref tag a distribution-style command prefixes, and then runs
-/// `driver_failure_posix(EINVAL)` (`:12634`). The same probe with a well-formed prefix
-/// (`<<0,0,1>>`, a zero-length ref) answers `true` **and leaves the port alive**
-/// (`{name,"tcp_inet"}`), the C replying `{error, enotconn}` out of band (`:12645`).
+/// That sequence is the **caller-ref grammar**, not the socket state: `tcp_inet_commandv` fails
+/// through `init_caller` (`inet_drv.c:12667`) whenever the payload is too short to carry the
+/// two-byte length + caller-ref tag a `prim_inet` command prefixes — the rule is **size-only**,
+/// the tag's bytes are never inspected (`:1820`-`:1890`) — and then runs
+/// `driver_failure_posix(EINVAL)` (`io.c:7273`). The same probe with a well-formed prefix
+/// (`<<0:16,1>>`, a zero-length ref) answers `true` **and leaves the port alive**
+/// (`{name,"tcp_inet"}`), the C replying `{error, enotconn}` out of band (`:12674`-`:12683`).
 ///
-/// The residual difference is deliberate and asserted, not glossed over: the frozen [`Driver`]
-/// trait has neither a `driver_failure` seam nor an asynchronous `{inet_reply, …}` channel, so
-/// the Rust side refuses the **first** delivered round with a typed [`BeamError::BadArg`] and
-/// keeps the bytes. Neither oracle shape is compared against our reply — only the sequence
-/// (first command accepted, port unusable afterwards) is pinned.
+/// Both oracle rows are now reproduced, not just the sequence: this driver adopted
+/// [`DriverContext::signal_failure`] (the C's `driver_failure*`, latched and reaped by the
+/// registry) and [`DriverContext::deliver_completion`] (the C's `{inet_reply, …}`). The Rust half
+/// below therefore asserts the row itself — the command is **accepted and charged**, the port
+/// latches `einval`, and nothing is left queued.
 ///
 /// **Skips loudly** when `erl` is not on `PATH`.
 #[test]
@@ -1774,16 +1915,26 @@ fn the_socket_less_command_sequence_matches_the_erl_oracle() {
         "the oracle refuses every command after the port died (a caught, exit-shaped badarg \
          raise): {dump:?}"
     );
-
-    // Our side of the same port state: the first delivered round is refused and the bytes stay
-    // queued, so a caller learns about the refusal instead of losing its command.
+    // Our side of the same port state: `init_caller` rejects the bare payload, so the command is
+    // charged whole (`prt->bytes_out += size`) and the port latches `driver_failure_posix(EINVAL)`.
     let mut rig = Rig::new(TcpInetDriver::new());
     rig.start().expect("a socket-less driver registers nothing");
     rig.queue_output(b"\x01");
-    assert!(
-        matches!(rig.drain_output(), Err(BeamError::BadArg)),
-        "the Rust side refuses the first round (the oracle answers `true` and kills the port — \
-         a `driver_failure` seam this driver has no access to)"
+    assert_eq!(
+        rig.drain_output()
+            .expect("`erlang:port_command/2` answers `true`: the callback returns normally"),
+        1,
+        "the whole command is charged — the C's `prt->bytes_out += size`"
     );
-    assert_eq!(rig.output_len(), 1, "and the refused bytes stay queued");
+    assert_eq!(rig.output_len(), 0, "and nothing is left queued");
+    assert_eq!(
+        rig.take_failure(),
+        Some(DriverFailure::posix(libc::EINVAL)),
+        "the port latches `driver_failure_posix(EINVAL)`, which the registry reaps into the \
+         owner's `{{'EXIT',P,einval}}`"
+    );
+    assert!(
+        rig.caller_replies().is_empty(),
+        "a malformed command has no caller reference to answer"
+    );
 }

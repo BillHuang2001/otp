@@ -87,6 +87,21 @@
 //! [`process_credentials`], the raw work `beam_rt`'s native `file`/`filelib` floor cannot do
 //! itself.
 //!
+//! The [`port_failure`] module is the **driver-failure channel** — the C's `driver_failure*`
+//! family and `driver_exit` seen as what they are: a driver *closing its own port* with a reason
+//! ([`FailureReason`]). A driver latches one through
+//! [`DriverContext::signal_failure`], the port collects it ([`Port::take_failure`]), and
+//! [`PortRegistry::reap_failures`] runs its teardown before [`PortRegistry::take_failures`] hands
+//! the reasons to the runtime. A **fourth** side channel, for the same reason [`completion`] is a
+//! third: a failure is neither data nor a message, and it must not widen
+//! [`PortNotification`].
+//!
+//! The [`close_fd`] module is the **descriptor-close facility** — a safe `close(2)` floor
+//! ([`close_fd()`]) plus the [`OwnedFd`] RAII wrapper (closed exactly once, on `close(self)` or
+//! `Drop`), the raw work the runtime needs to discard a descriptor it decided not to adopt (an
+//! [`InetAsyncResult::Accepted`] socket). Wrapping a descriptor in an [`OwnedFd`] while a driver
+//! also owns that number double-closes it — see the module docs.
+//!
 //! The [`io_device`] module is the **io-device request layer** — the DEVICE SIDE of the
 //! incremental `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` request of the `io`
 //! protocol: [`IoDevice`] reproduces `file_io_server`'s read loop (read sizes, the
@@ -127,6 +142,7 @@
 #![warn(missing_docs)]
 
 pub mod abi;
+pub mod close_fd;
 pub mod completion;
 pub mod cpu_time;
 pub mod ddll;
@@ -136,6 +152,7 @@ pub mod fs_access;
 pub mod io_device;
 pub mod poller;
 pub mod port;
+pub mod port_failure;
 pub mod port_task;
 pub mod queue;
 pub mod registry;
@@ -145,6 +162,7 @@ pub mod timer;
 mod error; // `pub(crate)` constructors only — NOT public
 
 pub use crate::abi::*;
+pub use crate::close_fd::*;
 pub use crate::completion::*;
 pub use crate::cpu_time::*;
 pub use crate::ddll::*;
@@ -154,6 +172,7 @@ pub use crate::fs_access::*;
 pub use crate::io_device::*;
 pub use crate::poller::*;
 pub use crate::port::*;
+pub use crate::port_failure::*;
 pub use crate::port_task::*;
 pub use crate::queue::*;
 pub use crate::signal::*;
@@ -167,7 +186,8 @@ pub use crate::timer::*;
 /// ([`PortTaskKind`], [`PortTask`], [`PortTaskQueue`], [`PortNotification`],
 /// [`PortTaskOutcome`], [`Readiness`]) and the driver→owner completion channel
 /// ([`PortCompletion`], [`CompletionEvent`], [`InetReply`], [`InetAsyncResult`],
-/// [`InetReason`]) the driver seam ([`Driver`], [`DriverContext`],
+/// [`InetReason`]), the driver-failure channel ([`FailureReason`], [`DriverFailure`],
+/// [`PortFailure`]) the driver seam ([`Driver`], [`DriverContext`],
 /// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`PortExitReason`],
 /// the emulator's statically-linked driver set ([`STATIC_SPAWN_DRIVERS`],
 /// [`is_static_spawn_driver`]), [`FdDriver`],
@@ -181,9 +201,11 @@ pub use crate::timer::*;
 /// [`DynLibFlags`], [`DllError`], [`DllErrorKind`], [`ERRCODE_TAB`], [`format_error_text`])
 /// and the CPU-time facility ([`CpuTimes`], [`process_cpu_times`], [`thread_cpu_times`],
 /// [`RuntimeClock`]) and the filesystem-access facility ([`AccessMode`], [`access`],
-/// [`try_access`], [`path_access`], [`process_credentials`]) into scope.
+/// [`try_access`], [`path_access`], [`process_credentials`]) and the descriptor-close facility
+/// ([`close_fd()`], [`OwnedFd`]) into scope.
 pub mod prelude {
     pub use crate::abi::*;
+    pub use crate::close_fd::*;
     pub use crate::completion::*;
     pub use crate::cpu_time::*;
     pub use crate::ddll::*;
@@ -193,6 +215,7 @@ pub mod prelude {
     pub use crate::io_device::*;
     pub use crate::poller::*;
     pub use crate::port::*;
+    pub use crate::port_failure::*;
     pub use crate::port_task::*;
     pub use crate::queue::*;
     pub use crate::signal::*;

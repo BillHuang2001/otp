@@ -117,19 +117,18 @@ impl InetReason {
 
     /// The **atom name** this reason becomes in Erlang.
     ///
-    /// `Closed`/`Timeout` are their own names; an errno is the lowercase POSIX name from the
-    /// crate's single errno→atom table ([`crate::error::errno_atom`], the `erl_errno_id` rule of
-    /// `erts/emulator/beam/erl_errno_str.c`), and an errno that table does not name falls back to
-    /// the C's own `errno_<N>` format (`ERTS_UNKNOWN_ERRNO_FORMAT`, `erl_errno_str.c:47`), so a
-    /// reason is never silently dropped.
+    /// `Closed`/`Timeout` are their own names; an errno is spelled by the crate's single
+    /// errno→name function ([`crate::error::errno_name`], the one reader of the `ERRNO_NAMES`
+    /// table — the `erl_errno_id` rule of `erts/emulator/beam/erl_errno_str.c`), which also carries
+    /// the C's own `errno_<N>` fallback for a code the table does not name
+    /// (`ERTS_UNKNOWN_ERRNO_FORMAT`), so a reason is never silently dropped. Nothing here spells an
+    /// errno name of its own: there is exactly one such place in the crate
+    /// ([`crate::error`]).
     pub fn atom_name(&self) -> String {
         match self {
             InetReason::Closed => "closed".to_string(),
             InetReason::Timeout => "timeout".to_string(),
-            InetReason::Errno(errno) => match error::errno_atom(*errno) {
-                Some(name) => name.to_string(),
-                None => format!("errno_{errno}"),
-            },
+            InetReason::Errno(errno) => error::errno_name(*errno),
         }
     }
 }

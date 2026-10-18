@@ -68,6 +68,7 @@ use crate::driver::{Driver, DriverContext, PortArms, PortExitReason};
 use crate::drivers::line_buffer::LineBuffer;
 use crate::error;
 use crate::poller::Poller;
+use crate::port_failure::DriverFailure;
 use crate::port_task::{
     LineNotification, PortNotification, PortTask, PortTaskKind, PortTaskQueue, ReadMessage,
     PORT_REDS_EXECUTE,
@@ -145,6 +146,14 @@ pub struct Port {
     /// [`Port::take_line_frames`]'s: a completion is a *message to the owner*, not
     /// `{Port, {data, Data}}`, so it never rides [`PortNotification`].
     completions: Vec<PortCompletion>,
+    /// The **failure** the driver latched and the owner has not been told about yet — the C's
+    /// `driver_failure*` family and `driver_exit`, which close the port from inside a callback.
+    /// Staged by [`DriverContext::signal_failure`] into the port's latch and harvested by
+    /// [`Port::take_failure`], which [`crate::PortRegistry::reap_failures`] runs before closing
+    /// the port. A fourth channel, for the same reason [`Port::take_completions`] is a third: a
+    /// failure is a *port-closing request*, not data and not a message, so it never rides
+    /// [`PortNotification`].
+    failure: Option<DriverFailure>,
 }
 
 impl Port {
@@ -166,6 +175,7 @@ impl Port {
             pending_reads: VecDeque::new(),
             pending_lines: VecDeque::new(),
             completions: Vec::new(),
+            failure: None,
         }
     }
     /// This port's id.
@@ -279,11 +289,13 @@ impl Port {
                 arms,
                 pending_reads,
                 completions,
+                failure,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
-                .with_completions(completions);
+                .with_completions(completions)
+                .with_failure(failure);
             driver.start(&mut ctx)
         };
         self.refresh_timeout();
@@ -350,11 +362,13 @@ impl Port {
                 arms,
                 pending_reads,
                 completions,
+                failure,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
-                .with_completions(completions);
+                .with_completions(completions)
+                .with_failure(failure);
             driver.output(&mut ctx)
         };
         self.refresh_timeout();
@@ -544,11 +558,16 @@ impl Port {
             }));
     }
 
-    /// Whether this port is holding input bytes it owes its owner.
+    /// Whether this port is holding input bytes it owes its owner — the **test-only** observation
+    /// helper.
     ///
-    /// This covers both halves of the port's input state — the completed read messages and the
-    /// open frame's accumulator — and is what decides whether a [`PortNotification::Data`] (or
-    /// a line frame) is owed (see [`Port::take_input_notifications`]).
+    /// It covers both halves of the port's input state: the completed read messages and the open
+    /// frame's accumulator. Nothing in the harvest path may gate on it: the report condition is the
+    /// completed-read queue alone (`Port::take_input_notifications`), because a read carrying
+    /// **zero** bytes is still owed as a `{Port, {data, []}}` (see the comment there). Keeping the
+    /// helper test-only is what stops that gate from being reintroduced — it exists so the suite can
+    /// assert "nothing is owed" as one predicate over both halves.
+    #[cfg(test)]
     pub(crate) fn has_input(&self) -> bool {
         !self.pending_reads.is_empty() || !self.input.is_empty()
     }
@@ -625,10 +644,19 @@ impl Port {
     /// before the frames can be drained with [`Port::take_line_frames`].
     pub(crate) fn take_input_notifications(&mut self) -> Vec<PortNotification> {
         if self.line_mode.is_none() {
-            if !self.has_input() {
+            // Close the accumulator **first**, then decide on the completed reads alone: a
+            // staged read is owed to the owner even when it carries **zero** bytes, because the
+            // C delivers one message per `driver_output*` call and an empty call is the oracle's
+            // `{Port, {data, []}}` (`deliver_read_message` builds the reply from the call, never
+            // from a byte count — `io.c:3372` tests `buf != NULL`, not `len != 0`). Gating on
+            // `has_input()` (which also asks the accumulator) silently dropped such a read. The
+            // "a driver that made no `driver_output*` call is owed nothing" invariant is kept by
+            // the `pending_reads` test below: an empty accumulator mints no read, so a silent
+            // port stays silent.
+            self.close_input_frame();
+            if self.pending_reads.is_empty() {
                 return Vec::new();
             }
-            self.close_input_frame();
             let port = self.id;
             return self
                 .pending_reads
@@ -671,6 +699,21 @@ impl Port {
         std::mem::take(&mut self.completions)
     }
 
+    /// Takes the **failure** this port's driver latched, if any, once.
+    ///
+    /// A driver closes its own port through [`DriverContext::signal_failure`] (the C's
+    /// `driver_failure*` family and `driver_exit`); the request lands here rather than being acted
+    /// on inside the driver's callback, and [`crate::PortRegistry::reap_failures`] is what turns
+    /// it into the port's teardown — so the driver's `stop` still runs and the port leaves the
+    /// live map through the ordinary close path.
+    ///
+    /// Taking it is what **consumes** it: the port is not closed by this call, and a second
+    /// `take_failure` answers `None`. Only one failure is ever latched (the C's first call has
+    /// already closed the port, so a later one is meaningless) — [`DriverContext::signal_failure`]
+    /// keeps the first.
+    pub fn take_failure(&mut self) -> Option<DriverFailure> {
+        self.failure.take()
+    }
     /// Dispatches read readiness to the driver's `ready_input`.
     ///
     /// The port's `TIMEOUT` task is re-armed from [`Driver::next_timeout`] afterwards (see
@@ -689,11 +732,13 @@ impl Port {
                 arms,
                 pending_reads,
                 completions,
+                failure,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
-                .with_completions(completions);
+                .with_completions(completions)
+                .with_failure(failure);
             driver.ready_input(&mut ctx)
         };
         self.refresh_timeout();
@@ -729,11 +774,13 @@ impl Port {
                 arms,
                 pending_reads,
                 completions,
+                failure,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
-                .with_completions(completions);
+                .with_completions(completions)
+                .with_failure(failure);
             driver.ready_output(&mut ctx)
         };
         self.refresh_timeout();
@@ -801,11 +848,13 @@ impl Port {
                 arms,
                 pending_reads,
                 completions,
+                failure,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
-                .with_completions(completions);
+                .with_completions(completions)
+                .with_failure(failure);
             driver.timeout(&mut ctx)
         };
         self.refresh_timeout();
@@ -831,11 +880,13 @@ impl Port {
                 arms,
                 pending_reads,
                 completions,
+                failure,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
-                .with_completions(completions);
+                .with_completions(completions)
+                .with_failure(failure);
             driver.control(&mut ctx, command, arg)
         };
         self.refresh_timeout();
@@ -872,11 +923,13 @@ impl Port {
                 arms,
                 pending_reads,
                 completions,
+                failure,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
-                .with_completions(completions);
+                .with_completions(completions)
+                .with_failure(failure);
             driver.drive_async(&mut ctx)
         };
         self.refresh_timeout();
@@ -951,11 +1004,13 @@ impl Port {
             arms,
             pending_reads,
             completions,
+            failure,
             ..
         } = self;
         let mut ctx = DriverContext::new(id, poller, input, output, arms)
             .with_reads(pending_reads)
-            .with_completions(completions);
+            .with_completions(completions)
+            .with_failure(failure);
         driver.port_exit(&mut ctx, reason)
     }
 
@@ -975,11 +1030,13 @@ impl Port {
                 arms,
                 pending_reads,
                 completions,
+                failure,
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms)
                 .with_reads(pending_reads)
-                .with_completions(completions);
+                .with_completions(completions)
+                .with_failure(failure);
             driver.stop(&mut ctx)
         };
         // The port is closed either way; a teardown failure must not leave it looking

@@ -134,8 +134,13 @@ fn the_drivers_output_callback_echoes_bytes_back_to_the_owner() {
 /// `output`/`outputv`, `io.c:1782`/`io.c:1517`) and, when the entry also declares `ready_output`,
 /// that slot then runs as the C's write-readiness notification (the `ERTS_PORT_TASK_OUTPUT` arm,
 /// `erl_port_task.c:1793-1797`). The fixture echoes the bytes its `output` receives and emits `"W"`
-/// from `ready_output`, both through `driver_output`, so the owner sees `"hello"` then `"W"` — the
-/// order in which the C performs them, coalesced by the port's single input queue.
+/// from `ready_output`, both through separate `driver_output` calls, so the owner sees **two**
+/// `{Port,{data,_}}` messages — `"hello"` then `"W"`, the order in which the C performs them.
+///
+/// The one-message-per-call shape is the corrected expectation: `driver_output` is
+/// `driver_output2(ix, NULL, 0, buf, len)` (`io.c:6405-6415`) and each call delivers its own
+/// message (`deliver_read_message`, `io.c:3363-3442`), so the two bytes never merge — the earlier
+/// `vec![b"helloW".to_vec()]` here asserted the port's old coalescing bug, not the oracle.
 #[test]
 fn a_port_command_write_readiness_task_reaches_ready_output() {
     let Some(so) = fixture_so() else {
@@ -155,10 +160,10 @@ fn a_port_command_write_readiness_task_reaches_ready_output() {
     // outcome's notifications (a second round would find the port's input queue already drained).
     assert_eq!(
         data_of(&outcome, id),
-        vec![b"helloW".to_vec()],
+        vec![b"hello".to_vec(), b"W".to_vec()],
         "the OUTPUT task writes the queued bytes through the driver's output callback, then runs \
-         its ready_output notification — both echo through driver_output into the port's input \
-         queue, so the owner sees them coalesced in that order"
+         its ready_output notification — the two driver_output calls are two messages, delivered \
+         in that order (never merged into one)"
     );
 
     registry.close(&mut poller, id).expect("the port closes");
@@ -368,9 +373,9 @@ fn a_selected_descriptor_routes_input_through_ready_input() {
 /// `drive_async` is called, and once the completion is observed the worker has finished, so the
 /// port keeps working.
 ///
-/// The fixture's entry leaves `ready_async` **and** `async_free` `NULL`, so the observable result
-/// of the drive point is that the job is drained and reported as processed rather than that a
-/// callback runs.
+/// The number of `Data` frames the job owes on its own is **not** fixed — see the comment at the
+/// drain site below — so the sequence is asserted, not the count: the port's own echo is the last
+/// frame and every frame before it is one of the job's ([`is_async_job_frame`]).
 #[test]
 fn an_async_job_is_scheduled_and_its_completion_is_driven() {
     let Some(so) = fixture_so() else {
@@ -405,18 +410,73 @@ fn an_async_job_is_scheduled_and_its_completion_is_driven() {
         "the driver_async job completed but its completion was never drained by `drive_async`"
     );
 
-    // The completion proved the worker finished; drop whatever the worker's driver_output left
-    // (Milestone-1 has no installed port context on a worker thread, so it may be nothing at all),
-    // then prove the port still moves data.
-    let _drained = round_data(&mut poller, &mut registry, id);
-    registry
+    // Drop whatever the job's own callbacks left — **however many frames that is**. The job emits
+    // `"A"` from its worker thread and `"H"` from the entry's `ready_async` on the port thread
+    // (`tests/fixtures/host_driver.c`), and a worker-thread `driver_output` is an *asynchronous*
+    // delivery: in the C the call takes the port lock and delivers to the connected owner whatever
+    // thread made it (one `{Port, {data, _}}` per call, `erts/emulator/beam/io.c:6387-6446`), so it
+    // is ordered against this thread's own callbacks by nothing at all. The frame *count* here is
+    // therefore not a property of the driver — only "each call is one frame" is — which is why this
+    // site drains instead of demanding exactly one.
+    let drained = drain_data(&mut poller, &mut registry, id);
+    for frame in &drained {
+        assert!(
+            is_async_job_frame(frame),
+            "only the async job's own frames may be owed before the port's next echo, got {frame:?} \
+             (all of them: {drained:?})"
+        );
+    }
+    for payload in ASYNC_JOB_FRAMES {
+        assert!(
+            drained
+                .iter()
+                .filter(|frame| frame.as_slice() == payload)
+                .count()
+                <= 1,
+            "the job hands each of its frames up at most once — one driver_output* call is one \
+             message, never a duplicated one; the port reported {drained:?}"
+        );
+    }
+    let written = registry
         .output(&mut poller, id, b"still-alive")
         .expect("the driver's output callback still runs");
     assert_eq!(
-        round_data(&mut poller, &mut registry, id).expect("the port still moves data"),
-        b"still-alive".to_vec(),
-        "the port keeps working after an async job"
+        written,
+        b"still-alive".len(),
+        "the driver consumes the whole output buffer"
     );
+
+    // The port still moves data: its echo closes the sequence, and anything the async job still owed
+    // precedes it (call order is preserved — the C delivers in call order, so a job frame can never
+    // arrive *after* a later call's). Exactly one echo: one `driver_output*` call, one message.
+    let frames = await_trailing_data(
+        &mut poller,
+        &mut registry,
+        id,
+        b"still-alive",
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        frames.last().map(Vec::as_slice),
+        Some(b"still-alive".as_slice()),
+        "the port keeps working after an async job; the round reported {frames:?}"
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.as_slice() == b"still-alive")
+            .count(),
+        1,
+        "the port echoes the command exactly once — one driver_output* call is one message, never \
+         a coalesced or duplicated one; the rounds reported {frames:?}"
+    );
+    for frame in &frames[..frames.len() - 1] {
+        assert!(
+            is_async_job_frame(frame),
+            "every frame before the port's echo must be the async job's own, got {frame:?} \
+             (all of them: {frames:?})"
+        );
+    }
 
     registry.close(&mut poller, id).expect("the port closes");
 }
@@ -1111,12 +1171,15 @@ fn an_entry_with_outputv_and_output_prefers_outputv_then_runs_ready_output() {
         .expect("the OUTPUT task runs");
     assert_eq!(outcome.ran, 1, "the queued command schedules one task");
 
-    // `outputv` echoes `hello` and `ready_output` emits `W`, coalesced by the port's input queue in
-    // that order — the write happened first, the readiness notification after it.
+    // `outputv` echoes `hello` and `ready_output` emits `W` through two separate `driver_output`
+    // calls, so the owner gets two messages in that order — the write happened first, the readiness
+    // notification after it. (One message per call; the coalesced `"helloW"` this assertion used to
+    // expect was the port's old bug, not the oracle — `driver_output`, `io.c:6405-6415`.)
     assert_eq!(
         data_of(&outcome, id),
-        vec![b"helloW".to_vec()],
-        "the vector write ran, then the entry's write-readiness notification"
+        vec![b"hello".to_vec(), b"W".to_vec()],
+        "the vector write ran, then the entry's write-readiness notification — two calls, two \
+         messages"
     );
 
     let lines = log_lines(&probe.log);

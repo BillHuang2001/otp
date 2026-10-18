@@ -62,6 +62,7 @@ use super::super::wire::{ctl_ok, ctl_xerror};
 use super::super::{TcpInetDriver, INET_ACTIVE, INET_PASSIVE};
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply, PortCompletion};
 use crate::port_task::ReadMessage;
+use beam_common::BeamError;
 
 /// `INET_REQ_SETOPTS` (`inet_drv.c:805`-`:847`): the option-record request.
 const INET_REQ_SETOPTS: u32 = 7;
@@ -933,5 +934,39 @@ fn a_zero_length_caller_tag_is_consumed_and_stages_no_reply() {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
         ),
         "the socket carries no trailing bytes: {err:?}"
+    );
+}
+/// The **registry** half of the socket-less kill row: `init_caller`'s `FALSE` (`tcp_inet_command`
+/// `inet_drv.c:12634`, `tcp_inet_commandv` `:12667`) is only a **request**
+/// (`driver_failure_posix`, `io.c:7273`) — the port is reaped after the round, so
+/// `erlang:port_command/2` still answers `true` and every later command on the number is the
+/// oracle's `badarg`.
+///
+/// The driver-level half (the charged bytes, the latched `posix(einval)`, nothing written) is
+/// [`a_socket_less_malformed_command_closes_the_port_with_einval`](super::tests); the oracle
+/// sequence is [`the_socket_less_command_sequence_matches_the_erl_oracle`](super::tests).
+#[test]
+fn a_socket_less_command_closes_the_port() {
+    let mut port = bare_port();
+    port.command(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        .expect("the C accepts the command and charges it: `port_command/2` answers `true`");
+    assert!(
+        !port.contains(),
+        "`driver_failure_posix(EINVAL)` is reaped into the owner's `{{'EXIT',P,einval}}`"
+    );
+    assert!(
+        port.completions().is_empty(),
+        "a malformed command has no caller reference to answer"
+    );
+    assert!(
+        matches!(port.command(&[1]), Err(BeamError::BadArg)),
+        "every later command on the dead port is the oracle's `badarg`"
+    );
+    assert!(
+        matches!(
+            port.try_control(&op(INET_REQ_GETSTATUS), &[]),
+            Err(BeamError::BadArg)
+        ),
+        "and so is every later control call"
     );
 }

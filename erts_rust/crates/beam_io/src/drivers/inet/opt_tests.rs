@@ -29,48 +29,12 @@
 //! **skips loudly** when `erl` is not on `PATH` and never asserts a wall-clock value.
 
 use super::*;
+use super::oracle::*;
 use crate::driver::DriverRegistry;
-use crate::drivers::inet::{INET_AF_ANY, INET_AF_INET, INET_PROTO_DEFAULT};
+use crate::drivers::inet::{INET_AF_ANY, INET_TYPE_DGRAM, INET_TYPE_STREAM};
 use crate::poller::Poller;
 use crate::port::PortRegistry;
 use beam_common::BeamError;
-use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
-
-/// The C request numbers of the verbs the cross-check drives (`inet_drv.c:805`-`:847`) and
-/// the magic offset the Erlang side adds (`prim_inet.erl:2969`,
-/// `ERTS_INET_DRV_CONTROL_MAGIC_NUMBER`).
-const INET_REQ_OPEN: u32 = 1;
-const INET_REQ_CLOSE: u32 = 2;
-const INET_REQ_SETOPTS: u32 = 7;
-const INET_REQ_GETOPTS: u32 = 8;
-const INET_REQ_BIND: u32 = 6;
-const INET_REQ_LISTEN: u32 = 27;
-const CONTROL_MAGIC: u32 = 0x03f1_a300;
-
-/// Wall-clock budget for the `erl` oracle before the affected check is skipped.
-const ERL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The packed `open` argument: `[AF_INET, SOCK_STREAM, default protocol]`.
-fn open_arg() -> Vec<u8> {
-    vec![INET_AF_INET, INET_TYPE_STREAM, INET_PROTO_DEFAULT]
-}
-
-/// The verb name the driver's [`TcpInetDriver`](super::super::TcpInetDriver) `control` entry
-/// answers for a C request code.
-fn verb_name(code: u32) -> &'static str {
-    match code {
-        INET_REQ_OPEN => "open",
-        INET_REQ_CLOSE => "close",
-        INET_REQ_SETOPTS => "setopts",
-        INET_REQ_GETOPTS => "getopts",
-        INET_REQ_BIND => "bind",
-        INET_REQ_LISTEN => "listen",
-        other => panic!("no control verb for request code {other}"),
-    }
-}
 
 /// The sequence both sides run: `(request code, payload)` pairs.
 ///
@@ -172,137 +136,6 @@ fn mode_deliver_read_packets_sequence() -> Vec<(u32, Vec<u8>)> {
         (INET_REQ_GETOPTS, vec![33]),
         (INET_REQ_GETOPTS, vec![24]),
     ]
-}
-
-/// The Erlang side of the cross-check: it opens a **real** `"tcp_inet"` port with
-/// `open_port({spawn_driver, …})` (exactly as `prim_inet.erl:103` does) and runs the same
-/// sequence, printing each reply as comma-separated bytes separated by `|`.
-fn oracle_expression(sequence: &[(u32, Vec<u8>)]) -> String {
-    let calls: Vec<String> = sequence
-        .iter()
-        .map(|(code, arg)| {
-            let bytes: Vec<String> = arg.iter().map(u8::to_string).collect();
-            format!("F({code}, <<{}>>)", bytes.join(","))
-        })
-        .collect();
-    format!(
-        "M = {CONTROL_MAGIC}, \
-         P = open_port({{spawn_driver, \"tcp_inet\"}}, [binary]), \
-         F = fun(C, A) -> binary_to_list(iolist_to_binary(erlang:port_control(P, C + M, A))) end, \
-         R = [{}], \
-         S = fun(L) -> lists:flatten(lists:join(\",\", [integer_to_list(B) || B <- L])) end, \
-         io:format(\"~s~n\", [lists:flatten(lists:join(\"|\", [S(L) || L <- R]))])",
-        calls.join(", ")
-    )
-}
-
-/// The Rust side: the identical sequence driven through a real port over the reactor.
-fn rust_replies(sequence: &[(u32, Vec<u8>)]) -> Vec<Vec<u8>> {
-    let mut poller = Poller::new().expect("a poll set");
-    let registry = DriverRegistry::with_builtins();
-    let driver = registry
-        .create(super::super::DRIVER_NAME)
-        .expect("the built-in tcp_inet driver is registered");
-    let mut ports = PortRegistry::new();
-    let id = ports.open(&mut poller, driver).expect("the port opens");
-
-    let replies = sequence
-        .iter()
-        .map(|(code, arg)| {
-            let verb = verb_name(*code);
-            ports
-                .get_mut(id)
-                .expect("the port is live")
-                .control(&mut poller, verb, arg)
-                .unwrap_or_else(|err| panic!("the `{verb}` verb failed: {err:?}"))
-        })
-        .collect();
-
-    ports.close(&mut poller, id).expect("closes the port");
-    replies
-}
-
-/// Runs `<expr>, halt(0).` under the system `erl` and returns its stdout, or `None` — after a
-/// loud skip message — when `erl` cannot be spawned or does not answer in time.
-fn erl_stdout(expr: &str) -> Option<String> {
-    let code = format!("{expr}, halt(0).");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(
-            Command::new("erl")
-                .arg("-noshell")
-                .arg("-eval")
-                .arg(&code)
-                .output(),
-        );
-    });
-
-    match rx.recv_timeout(ERL_TIMEOUT) {
-        Err(_) => {
-            eprintln!("skipping oracle check: `erl` did not answer within {ERL_TIMEOUT:?}");
-            None
-        }
-        Ok(Err(err)) => {
-            eprintln!("skipping oracle check: could not spawn `erl` ({err}); is Erlang on PATH?");
-            None
-        }
-        Ok(Ok(out)) => {
-            assert!(
-                out.status.success(),
-                "the oracle expression failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            Some(String::from_utf8_lossy(&out.stdout).into_owned())
-        }
-    }
-}
-
-/// Parses the oracle's `a,b,c|d,e|…` reply dump into one byte vector per reply.
-fn parse_reply_dump(stdout: &str) -> Option<Vec<Vec<u8>>> {
-    let line = stdout.lines().find(|line| line.contains('|'))?;
-    let mut replies = Vec::new();
-    for field in line.trim().split('|') {
-        let mut bytes = Vec::new();
-        for part in field.split(',') {
-            if part.is_empty() {
-                continue;
-            }
-            bytes.push(part.trim().parse::<u8>().ok()?);
-        }
-        replies.push(bytes);
-    }
-    Some(replies)
-}
-
-/// Compares `rust` against the oracle reply for reply, or **skips loudly** when `erl` is absent.
-fn assert_agrees_with_oracle(sequence: &[(u32, Vec<u8>)], rust: &[Vec<u8>]) {
-    let Some(stdout) = erl_stdout(&oracle_expression(sequence)) else {
-        return; // the oracle is unavailable; the check skipped loudly above
-    };
-    let Some(oracle) = parse_reply_dump(&stdout) else {
-        panic!("could not parse the oracle reply dump: {stdout:?}");
-    };
-    assert_eq!(oracle.len(), sequence.len(), "one reply per step: {oracle:?}");
-
-    eprintln!("oracle option replies: {oracle:?}");
-    eprintln!("rust option replies:   {rust:?}");
-
-    for (index, ((code, arg), (rust_reply, oracle_reply))) in
-        sequence.iter().zip(rust.iter().zip(oracle.iter())).enumerate()
-    {
-        assert_eq!(
-            rust_reply, oracle_reply,
-            "reply {index} (`{}` of {arg:?}, request code {code}) disagrees",
-            verb_name(*code)
-        );
-    }
-}
-
-/// A zeroed `[opt, val_be32]` record for `code`, with `value` in the four payload bytes.
-fn record(code: u8, value: i32) -> Vec<u8> {
-    let mut record = vec![code];
-    record.extend_from_slice(&value.to_be_bytes());
-    record
 }
 
 /// The driver-state defaults are the C descriptor's own initial values
@@ -608,7 +441,7 @@ fn a_truncated_active_multi_record_is_bad_arg() {
 #[test]
 fn the_option_code_replies_agree_with_the_erl_oracle() {
     let sequence = option_sequence();
-    let rust = rust_replies(&sequence);
+    let rust = rust_replies(crate::drivers::inet::DRIVER_NAME, &sequence);
     assert_eq!(rust.len(), sequence.len(), "one reply per step");
 
     // The measured bytes, on the record: the driver-state defaults, the `stype` gate, the
@@ -655,7 +488,7 @@ fn the_option_code_replies_agree_with_the_erl_oracle() {
         "`close` does not clear `stype`"
     );
 
-    assert_agrees_with_oracle(&sequence, &rust);
+    assert_agrees_with_oracle(crate::drivers::inet::DRIVER_NAME, &sequence, &rust);
 }
 
 /// The `{mode, …}`/`{deliver, …}`/`{read_packets, N}` matrix against the live oracle: every row
@@ -667,7 +500,7 @@ fn the_option_code_replies_agree_with_the_erl_oracle() {
 #[test]
 fn the_mode_deliver_and_read_packets_rows_agree_with_the_erl_oracle() {
     let sequence = mode_deliver_read_packets_sequence();
-    let rust = rust_replies(&sequence);
+    let rust = rust_replies(crate::drivers::inet::DRIVER_NAME, &sequence);
     assert_eq!(rust.len(), sequence.len(), "one reply per step");
 
     // The exact bytes, on the record, for the three states.
@@ -711,7 +544,7 @@ fn the_mode_deliver_and_read_packets_rows_agree_with_the_erl_oracle() {
     assert_eq!(rust[21], ctl_ok(), "(c) `getopts` of 33 after a close");
     assert_eq!(rust[22], vec![1, 24, 0, 0, 0, 1], "(c) the value survives a close");
 
-    assert_agrees_with_oracle(&sequence, &rust);
+    assert_agrees_with_oracle(crate::drivers::inet::DRIVER_NAME, &sequence, &rust);
 }
 
 /// The `gen_tcp:listen(0, [binary])` shape, end to end: `gen_tcp:listen` opens a `tcp_inet`

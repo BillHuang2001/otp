@@ -128,6 +128,14 @@ pub fn vector_fixture_source() -> PathBuf {
 pub fn both_fixture_source() -> PathBuf {
     fixture_dir().join("host_driver_both.c")
 }
+
+/// The committed **shape** fixture (`output_shape_driver.c`): a self-contained driver whose
+/// `output` callback makes the `driver_output*`/`driver_failure*` call that the **first command
+/// byte** names (its opcode table is in the fixture's own file header). It is the object
+/// `tests/abi_failure.rs` drives the output-shape and failure-channel rows with.
+pub fn shape_fixture_source() -> PathBuf {
+    fixture_dir().join("output_shape_driver.c")
+}
 /// Compile the fixture into a loadable `.so`, or print a loud `SKIP:` and answer `None` when the
 /// toolchain is unavailable (never a silent pass, never a failure for a missing toolchain).
 pub fn fixture_so() -> Option<PathBuf> {
@@ -162,6 +170,12 @@ pub fn vector_fixture_so() -> Option<PathBuf> {
 /// The same for the both-write-callbacks fixture (`host_driver_both.c`).
 pub fn both_fixture_so() -> Option<PathBuf> {
     compile_fixture(&both_fixture_source(), "host_driver_both")
+}
+
+/// The same for the shape fixture (`output_shape_driver.c`), whose entry's `driver_name` is
+/// `output_shape_driver`.
+pub fn shape_fixture_so() -> Option<PathBuf> {
+    compile_fixture(&shape_fixture_source(), "output_shape_driver")
 }
 /// Compile `src` into `<scratch>/<stem>.so`, skipping loudly when `cc`/`erl_driver.h` are absent.
 fn compile_fixture(src: &Path, stem: &str) -> Option<PathBuf> {
@@ -267,7 +281,13 @@ pub fn open_named_port(
 // Driving the port
 // ---------------------------------------------------------------------------------------------
 
-/// The `Data` payloads a port-task round reported for `id`.
+/// The `Data` payloads a port-task round reported for `id`, flattened exactly as a `[list]` port's
+/// `{Port, {data, Data}}` would carry them (`ReadMessage::flattened`).
+///
+/// One element per driver `driver_output*` call, in arrival order: the C delivers one
+/// `{Port, {data, _}}` message per call (`deliver_read_message`, `io.c:3363-3442`), so two calls
+/// inside one callback are **two** elements — they are never merged into one (which is the
+/// coalescing bug the assertions this helper is used by were corrected for).
 pub fn data_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<Vec<u8>> {
     outcome
         .notifications
@@ -279,8 +299,41 @@ pub fn data_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Runs one port-task round and returns the bytes of the single [`PortNotification::Data`] it
+/// The **full** [`ReadMessage`]s a port-task round reported for `id`, in arrival order.
+///
+/// This is the split-preserving companion of [`data_of`]: the header stays apart from the body and
+/// a `None` body stays distinguishable from an empty one, which is what the `driver_output2`
+/// shape rows are about.
+pub fn reads_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<ReadMessage> {
+    outcome
+        .notifications
+        .iter()
+        .filter_map(|notification| match notification {
+            PortNotification::Data { port, read } if *port == id => Some(read.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many `PortNotification::Closed` reports a round minted for `id`.
+///
+/// A close is reported **exactly once** — the report is also what retires the port's number — so a
+/// count above one would mean a second, independent death report for a port that can only die once.
+pub fn closed_of(outcome: &PortTaskOutcome, id: PortId) -> usize {
+    outcome
+        .notifications
+        .iter()
+        .filter(|notification| matches!(notification, PortNotification::Closed { port } if *port == id))
+        .count()
+}
+
+/// Runs one port-task round and returns the bytes of the **only** [`PortNotification::Data`] it
 /// reported for `id`, or `None` when the round reported no data for that port.
+///
+/// The `only` is the **call site's** expectation, not a rule of the round: a round reports one
+/// `Data` per driver `driver_output*` call, so a callback making two calls reports two messages
+/// and a round may carry several for one port. Every caller of this helper is a single-call case;
+/// a multi-call one must use [`data_of`]/[`reads_of`] and assert the whole vector instead.
 pub fn round_data(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> Option<Vec<u8>> {
     let outcome = registry
         .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
@@ -289,9 +342,101 @@ pub fn round_data(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) 
     let first = data.next();
     assert!(
         data.next().is_none(),
-        "one port-task round reports at most one Data notification per port"
+        "this round must report exactly one Data notification for the port: the driver made \
+         exactly one driver_output* call (a second one would mean two calls were coalesced, or \
+         this call site now makes more than one)"
     );
     first
+}
+
+/// The data frames the fixture's **`driver_async` job path** may hand up on its own, i.e. besides
+/// whatever the test's own call produced.
+///
+/// * `b"A"` — the worker-thread invoke callback (`host_async_invoke`, `tests/fixtures/host_driver.c`)
+///   `driver_output`s it;
+/// * `b"H"` — the completion callback (`host_ready_async`) `driver_output`s it when the entry has a
+///   `ready_async` (the default fixture does; the `host_driver_no_ready_async.c` variant does not).
+///
+/// Both are asynchronous deliveries relative to the caller's own callback — see
+/// [`drain_data`]/[`await_trailing_data`] — so a test must never assume a fixed number of them.
+pub const ASYNC_JOB_FRAMES: [&[u8]; 2] = [b"A", b"H"];
+
+/// Whether `frame` is one of the fixture's own `driver_async`-path frames ([`ASYNC_JOB_FRAMES`]).
+pub fn is_async_job_frame(frame: &[u8]) -> bool {
+    ASYNC_JOB_FRAMES.iter().any(|payload| *payload == frame)
+}
+
+/// How many consecutive rounds [`drain_data`] may run before it declares the port stuck (a driver
+/// that keeps handing up data would otherwise spin forever).
+const MAX_DRAIN_ROUNDS: usize = 16;
+
+/// Runs port-task rounds until a round reports **no** data for `id`, returning every frame the
+/// rounds reported for it, in arrival order.
+///
+/// This is the right shape whenever the port owes a **variable** number of frames — a
+/// `driver_async` job's frames (see [`ASYNC_JOB_FRAMES`]) land on the port's pending-read queue
+/// whenever the worker thread's `driver_output*` happens to coincide with one of the port thread's
+/// driver callbacks, so "how many are owed right now" is not something a call site knows.
+///
+/// Each frame is still **one** `driver_output*` call — the no-coalescing rule [`round_data`]
+/// asserts — only the *count* is open here. A call site that owns its own single driver call keeps
+/// using [`round_data`]; a call site that must prove something about the sequence uses this (or
+/// [`await_trailing_data`]) and asserts the whole vector.
+pub fn drain_data(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    for _ in 0..MAX_DRAIN_ROUNDS {
+        let outcome = registry
+            .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("the port-task round runs");
+        let round = data_of(&outcome, id);
+        if round.is_empty() {
+            return frames;
+        }
+        frames.extend(round);
+    }
+    panic!("the port still reported data after {MAX_DRAIN_ROUNDS} drain rounds: {frames:?}");
+}
+
+/// Runs port-task rounds until the port reports `expected` as its **newest** frame, returning every
+/// frame the rounds reported for it, in arrival order (so the caller can assert that `expected` is
+/// the last one and inspect what led up to it).
+///
+/// The tail semantics are the point: a `driver_async` job's frames ([`ASYNC_JOB_FRAMES`]) are
+/// delivered asynchronously with respect to the caller's own driver call, so the frame `expected`
+/// closes a sequence whose *prefix* is whatever the job still owed — never the other way round, because
+/// the C delivers in call order (one `{Port, {data, _}}` per `driver_output*`, `io.c:6387-6446`).
+///
+/// Panics — never a silent pass — when `expected` does not arrive within `timeout`.
+pub fn await_trailing_data(
+    poller: &mut Poller,
+    registry: &mut PortRegistry,
+    id: PortId,
+    expected: &[u8],
+    timeout: Duration,
+) -> Vec<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let events = poller
+            .poll(Some(Duration::from_millis(5)))
+            .expect("the poll succeeds");
+        registry.schedule_events(&events);
+        let outcome = registry
+            .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("the port-task round runs");
+        frames.extend(data_of(&outcome, id));
+        if frames
+            .last()
+            .is_some_and(|frame| frame.as_slice() == expected)
+        {
+            return frames;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the port never reported {expected:?} as its newest frame within {timeout:?}; \
+             it reported {frames:?}"
+        );
+    }
 }
 
 /// Polls and runs port-task rounds until the driver reports data for `id`, or `timeout` elapses
@@ -389,8 +534,9 @@ pub fn await_log_line(path: &Path, wanted: &str, timeout: Duration) -> Vec<Strin
     }
 }
 
-/// A socket-pair descriptor a driver has been told to `driver_select`, kept **alive** (both ends
-/// owned, not just their numbers) for the whole test that owns it.
+/// One fixture port's whole test-side setup: the scratch log path its `log=<path>` argument points
+/// at, the `fd=<n> log=<path>` command string, and the socket pair whose read end is the descriptor
+/// the fixture `driver_select`s.
 ///
 /// The read end of a socket pair stands in for the descriptor a driver would select on, and it is
 /// non-blocking for the same reason the `ready_input` tests need it (the fixture's `ready_input`
@@ -399,8 +545,16 @@ pub fn await_log_line(path: &Path, wanted: &str, timeout: Duration) -> Vec<Strin
 /// thread's short-lived descriptor recycle that number while the driver calls
 /// `driver_select`/`select(2)` on it, which is `EBADF` under the parallel test runner. This value
 /// must be held for the duration of the test.
+///
+/// It also **owns the log path's lifetime**: the scratch directory is created here and removed by
+/// [`Drop`], so the only file a round can write is one the test itself cleans up afterwards. Every
+/// log read (`log_lines`/`await_log_line`/`settle_log`) must therefore happen while the value is
+/// alive, which is what every test does (the log is read before the port value goes out of scope).
 pub struct LoggedPort {
-    /// The scratch log path the fixture's `log=<path>` argument points at.
+    /// The scratch directory holding [`LoggedPort::log`], removed when this value drops.
+    dir: PathBuf,
+    /// The scratch log path the fixture's `log=<path>` argument points at (absolute: the fixture
+    /// honours only absolute paths, so nothing it writes can land in the process's cwd).
     pub log: PathBuf,
     /// The `fd=<n> log=<path>` command string the port is started with.
     pub command: String,
@@ -410,12 +564,25 @@ pub struct LoggedPort {
     pub _write_end: std::os::unix::net::UnixStream,
 }
 
+impl Drop for LoggedPort {
+    fn drop(&mut self) {
+        // Best effort: a teardown problem leaves a scratch directory behind, it must never turn a
+        // finished assertion into a panic (a panic in `drop` during an unwinding test aborts).
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// A fresh scratch log path (the directory is created so the fixture's append can succeed) bundled
 /// with the command string and the still-open, non-blocking descriptor to select on.
 pub fn logged_port_command(stem: &str) -> LoggedPort {
     let dir = scratch_dir(stem);
     std::fs::create_dir_all(&dir).expect("a scratch dir is creatable");
     let log = dir.join("events.log");
+    assert!(
+        log.is_absolute(),
+        "the fixture only honours an absolute `log=` path, got {}",
+        log.display()
+    );
     let (read_end, write_end) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
     read_end
         .set_nonblocking(true)
@@ -423,6 +590,7 @@ pub fn logged_port_command(stem: &str) -> LoggedPort {
     let fd = read_end.as_raw_fd();
     let command = format!("fd={fd} log={}", log.display());
     LoggedPort {
+        dir,
         log,
         command,
         _read_end: read_end,

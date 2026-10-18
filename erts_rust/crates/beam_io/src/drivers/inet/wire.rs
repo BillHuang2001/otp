@@ -287,49 +287,12 @@ pub(super) fn getservbyport_reply(arg: &[u8]) -> Vec<u8> {
 /// The lowercase name the oracle reports for `errno` (`erl_errno_id`/`errno_str`,
 /// `inet_drv.c:2249`).
 ///
-/// The C asks the libc for the name (`strerrorname_np`/`strerror`) and lowercases it; this
-/// floor keeps a table of the codes a TCP socket can actually raise and renders anything else
-/// as `errno_<N>`, which is exactly the C's fallback format
-/// (`ERTS_UNKNOWN_ERRNO_FORMAT`).
-pub(super) fn errno_name(errno: i32) -> String {
-    let known = match errno {
-        libc::EACCES => Some("eacces"),
-        libc::EADDRINUSE => Some("eaddrinuse"),
-        libc::EADDRNOTAVAIL => Some("eaddrnotavail"),
-        libc::EAFNOSUPPORT => Some("eafnosupport"),
-        libc::EAGAIN => Some("eagain"),
-        libc::EALREADY => Some("ealready"),
-        libc::EBADF => Some("ebadf"),
-        libc::ECONNABORTED => Some("econnaborted"),
-        libc::ECONNREFUSED => Some("econnrefused"),
-        libc::ECONNRESET => Some("econnreset"),
-        libc::EDESTADDRREQ => Some("edestaddrreq"),
-        libc::EHOSTUNREACH => Some("ehostunreach"),
-        libc::EINPROGRESS => Some("einprogress"),
-        libc::EINTR => Some("eintr"),
-        libc::EINVAL => Some("einval"),
-        libc::EIO => Some("eio"),
-        libc::EISCONN => Some("eisconn"),
-        libc::EMSGSIZE => Some("emsgsize"),
-        libc::ENETDOWN => Some("enetdown"),
-        libc::ENETUNREACH => Some("enetunreach"),
-        libc::ENOBUFS => Some("enobufs"),
-        libc::ENOMEM => Some("enomem"),
-        libc::ENOPROTOOPT => Some("enoprotoopt"),
-        libc::ENOTCONN => Some("enotconn"),
-        libc::ENOTSOCK => Some("enotsock"),
-        libc::EOPNOTSUPP => Some("eopnotsupp"),
-        libc::EPIPE => Some("epipe"),
-        libc::EPROTONOSUPPORT => Some("eprotonosupport"),
-        libc::EPROTOTYPE => Some("eprototype"),
-        libc::ETIMEDOUT => Some("etimedout"),
-        _ => None,
-    };
-    match known {
-        Some(name) => name.to_string(),
-        None => format!("errno_{errno}"),
-    }
-}
+/// A **forwarder**: the errno→name mapping lives in one place, [`crate::error::errno_name`]
+/// (the union of the socket codes and the `fork`/`exec`/`pipe`/`access` codes this crate
+/// renders), so this driver and the reply paths above it can never disagree. The rendering is
+/// the C's exactly — the lowercase of the POSIX macro name, and the C's own
+/// `ERTS_UNKNOWN_ERRNO_FORMAT` (`"errno_%d"`) fallback for a code with no name.
+pub(super) use crate::error::errno_name;
 
 // ---------------------------------------------------------------------------
 // The reply shapes of the shared `inet_ctl` arms
@@ -661,6 +624,56 @@ pub(super) fn split_caller_ref_parts(arg: &[u8]) -> Option<(&[u8], &[u8])> {
 /// the protocol this function exists for.
 pub(super) fn split_caller_ref(arg: &[u8]) -> Option<&[u8]> {
     split_caller_ref_parts(arg).map(|(_tag, rest)| rest)
+}
+
+/// Splits the caller-reference prefix off a **`port_command/2` command** with the C's own rule:
+/// the `erlang:port_command/2` counterpart of [`split_caller_ref_parts`], and the seam both
+/// drivers' `write_command` paths use.
+///
+/// The C's `init_caller`/`init_caller_iov` (`inet_drv.c:1820`-`:1890`) reads the first two bytes
+/// as a **16-bit length** and then requires that many tag bytes to follow:
+///
+/// * `len < 2` ⇒ **`FALSE`**, and the caller (`tcp_inet_command` `:12634`,
+///   `tcp_inet_commandv` `:12667`, `packet_inet_command` `:15063`) runs
+///   `driver_failure_posix(port, EINVAL)` — the port dies.
+/// * `len - 2 < n` ⇒ the same `FALSE`/port death.
+/// * otherwise the `n` tag bytes are the caller reference and the rest is the payload.
+///
+/// The rule is **size-only**: the C never inspects the tag's content, so a command whose length
+/// word happens to fit is treated as a prefixed command even when its "tag" is not an ETF blob.
+/// A genuine `prim_inet` command always fits; a *plain* payload (the `<<"hello">>` a bare
+/// `port_command/2` sends) does not, because its first two bytes read as a huge length — which is
+/// exactly why the oracle kills the port for it (measured — see
+/// `tests::a_socket_less_malformed_command_closes_the_port_with_einval` and the datagram twin in
+/// `udp::udp_tests`).
+///
+/// `None` is the C's `FALSE` (the caller must fail the port). `Some((tag, payload))` is the C's
+/// `TRUE`: `tag` is the `n` tag bytes (empty for a zero-length reference, which the C consumes
+/// and then cannot echo — its `driver_send_term` fails to decode an empty EXT, so **no** reply is
+/// ever delivered for it) and `payload` is everything after it.
+pub(super) fn split_command_prefix(arg: &[u8]) -> Option<(&[u8], &[u8])> {
+    let n = usize::from(u16::from_be_bytes([*arg.first()?, *arg.get(1)?]));
+    // `if (*size_p < 2) return FALSE;` then `if (*size_p < n) return FALSE;`.
+    let rest = arg.get(2 + n..)?;
+    Some((&arg[2..2 + n], rest))
+}
+
+/// The **reply-bearing** caller tag of a [`split_command_prefix`] result, if it can be echoed.
+///
+/// The C echoes the tag verbatim through `erl_drv_send_term`'s `LOAD_EXT` (`inet_reply_finish`,
+/// `inet_drv.c:2614`-`:2637`), which **decodes** it: an empty tag (a `[0,0]` reference) or one
+/// that is not an external-term image makes that delivery fail, so the owner receives nothing.
+/// Measured on the oracle: a connected `tcp_inet` port answers nothing for
+/// `port_command(P, <<0:16,"raw">>)` while the peer still receives `"raw"`, and nothing for a
+/// non-ETF two-byte tag either.
+///
+/// So a tag is echoed only when it is non-empty and starts with [`ETF_VERSION_MAGIC`]; anything
+/// else is a reference this floor cannot render and stages no [`InetReply`](crate::InetReply).
+pub(super) fn echoable_caller_tag(tag: &[u8]) -> Option<Vec<u8>> {
+    if tag.first() == Some(&ETF_VERSION_MAGIC) {
+        return Some(tag.to_vec());
+    }
+    None
 }
 
 /// The outcome of decoding the C's datagram command operand,

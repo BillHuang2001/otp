@@ -201,8 +201,12 @@ fn fdopen_bound_operands_answer_the_c_pre_adoption_refusals() {
 /// syscall at all** (`inet_drv.c:5264`-`:5266`), which is why it answers `[1]` even for a garbage
 /// number (measured `[1]` for `<<1,2,0,0,0,9,0,0,0,0>>`). This floor adopts on the same terms now
 /// (the prebound path), but the descriptor still has to reach the poller, so a number that is not
-/// open at all is a **typed error** rather than a fabricated `[1]` — the honest answer, and the
-/// one thing this row pins: a blind adoption never invents a success.
+/// open at all is refused **naming its errno** — `[0]"ebadf"`, the `fcntl(2)` verdict — rather
+/// than the C's fabricated `[1]` (or, as this row asserted before the errno channel existed, a
+/// bare typed error the caller could not name). That is the honest answer and the one thing this
+/// row pins: a blind adoption never invents a success. The measured divergence against the oracle
+/// is pinned in
+/// [`fdopen_errno_tests::the_blind_bound_zero_form_refuses_by_errno_where_the_c_answers_ok`].
 ///
 /// The refusal rows of the same arm (a closed number with `bound != 0` ⇒ `[0]ebadf`, a
 /// non-socket ⇒ `[0]enotsock`) live in
@@ -217,10 +221,11 @@ fn a_fdopen_with_bound_zero_never_fabricates_an_adoption_reply() {
             let mut operand = vec![INET_AF_INET, *type_byte];
             operand.extend_from_slice(&CLOSED_FD.to_be_bytes());
             operand.extend_from_slice(&0i32.to_be_bytes());
-            assert!(
-                port.try_control(&op(13), &operand).is_err(),
-                "{}: a `bound == 0` adoption of a descriptor that is not open is a typed error, \
-                 never a fabricated `[1]`",
+            assert_eq!(
+                port.control(&op(13), &operand),
+                ctl_xerror("ebadf"),
+                "{}: a `bound == 0` adoption of a descriptor that is not open names the \
+                 `fcntl(2)` errno it could not serve, never a fabricated `[1]`",
                 case.name
             );
         }

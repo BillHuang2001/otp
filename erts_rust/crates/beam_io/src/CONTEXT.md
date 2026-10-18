@@ -159,14 +159,12 @@ completion, and each completion is reported exactly once.
   `PortRegistry::take_completions` in the round it ran. A drain deferred past a later
   `PortRegistry::open` that reused the number would report a stale completion under a live port's
   id (the `Closed` report's own rule is unchanged and documented on `PortRegistry::close`).
-- **The completion reason table is the crate's general errno table, not the socket one.**
-  `InetReason::atom_name` renders an errno through `error::errno_atom`, whose table is the
-  `fork`/`exec`/`access` set; the inet subtree's own broader socket table
-  (`drivers/inet/wire.rs`'s `errno_name`, `econnreset`, `enotconn`, `eaddrnotavail`, …) is
-  `pub(super)` there. A socket-only errno therefore renders as the C's `errno_<N>` fallback rather
-  than its POSIX name today. Consolidating the two into one `pub(crate)` table in `error.rs` (and
-  having both call it) is the open refactor — a producer-side concern, so it belongs with the inet
-  driver's adoption of this channel.
+- **One errno table: `error::ERRNO_NAMES` (61 rows).** `InetReason::atom_name`,
+  `FailureReason::atom_name` and `drivers/inet/wire.rs::errno_name` all read it —
+  `error::errno_atom` is the `Option` form (unrecognised ⇒ `None`, never an invented atom),
+  `error::errno_name` the `[0] ++ Name` form with the C's `errno_<N>` fallback, and
+  `wire.rs::errno_name` is a `pub(super) use crate::error::errno_name;` re-export, not a second
+  table.
 
 ## Test Strategy
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
@@ -198,7 +196,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   close-does-not-flush rule, skipping **loudly** when `erl` is absent.
 - **The write path** is pinned hermetically (no `erl`, no child, no sleep) in
   `registry_reply_tests.rs` — a sibling module declared from `registry.rs` as
-  `#[cfg(test)] #[path = "registry_reply_tests.rs"] mod reply_tests;` so that 1960-line file does not
+  `#[cfg(test)] #[path = "registry_reply_tests.rs"] mod reply_tests;` so that 2184-line file does not
   grow: one `ram_file_drv` port, `port_command [1,0,0,0,3,97,98,99]` ⇒ **one**
   `execute_port_tasks` round reports exactly one `Data { read: ReadMessage::body_only([3,0,0,0,0]) }` with `output_len()`
   and `input_len()` back to `0` and no task left pending, a second round reports nothing; plus a
@@ -247,3 +245,41 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   `../../../erts/emulator/sys/common/{erl_poll.c,erl_check_io.c}` → the legacy C ground truth
   (`io.c:3140-3307` the `LineBuf` state machine, `:3454` `deliver_linebuf_message`, `:7211` the
   `driver_eof` flush; `erl_bif_port.c:862-869,986` the `line`/`{line,N}` option decoding).
+
+## Oracle-pinned shapes still owed by the port layer (measured with the system `erl`)
+
+A C driver fixture (`driver_output(port,"",0)`, `driver_output(port,NULL,0)`,
+`driver_output2(port,"hdr",3,{NULL,""},"body",4)`, two calls per callback) run against
+OTP 29.1.1 pins, per `open_port` option set:
+
+| call | `[]` | `[binary]` | `[{line,4}]` |
+|---|---|---|---|
+| `driver_output(p,"",0)` | `{data,[]}` | `{data,<<>>}` | **no message** |
+| `driver_output(p,NULL,0)` | `{data,[]}` | `{data,[]}` (no tail, so no binary) | no message |
+| `driver_output2(p,"hdr",3,NULL,0)` | `{data,"hdr"}` | `{data,"hdr"}` | no message |
+| `driver_output2(p,"hdr",3,"",0)` | `{data,"hdr"}` | `{data,[104,100,114\|<<>>]}` | no message |
+| `driver_output2(p,"hdr",3,"body",4)` | `{data,"hdrbody"}` | `{data,[104,100,114\|<<"body">>]}` | no message |
+| two `driver_output` in one callback | **two** `{data,`_`}` messages | two | one `noeol` frame once the buffer passes its limit |
+
+So an empty `driver_output` **is** delivered in raw mode (both port modes) and never in line
+mode, and two calls are two messages. Both halves of that rule live in the port layer now:
+`Port::take_input_notifications` closes the open frame first and then gates on `pending_reads`
+alone (so a staged zero-byte read is reported, and `Port::has_input` is a test-only observation
+helper nothing may gate on), and a loaded C driver's `driver_output*` hooks stage through
+`DriverContext::deliver_read` — `output` is `deliver_read(&[], Some(data))` (one body-only read per
+call, never banked on the accumulator, so two calls in one callback are two `{data,_}` messages) and
+`output2` forwards the header/body split with the C's `buf == NULL` kept as `body: None`. Pinned
+in-module by `src/abi/host_tests.rs` (`driver_output_stages_one_body_only_read_per_call`,
+`driver_output2_keeps_the_header_apart_and_the_null_body_distinct`,
+`the_host_output_path_reaches_the_port_owner_one_message_per_call`).
+
+Driver failures, measured the same way after `driver_failure*`/`driver_exit` from `output`:
+
+| C call | owner mailbox | `port_info(P,name)` | later `port_command`/`port_control`/`port_close` |
+|---|---|---|---|
+| `driver_failure_posix(p,EINVAL)` | `{'EXIT',P,einval}` | `undefined` | `badarg` |
+| `driver_failure_atom(p,"enospc")` | `{'EXIT',P,enospc}` | `undefined` | `badarg` |
+| `driver_failure(p,42)` | `{'EXIT',P,42}` | `undefined` | `badarg` |
+| `driver_failure_eof(p)` | `{'EXIT',P,normal}` | `undefined` | `badarg` |
+| `driver_exit(p,0)` / `driver_exit(p,ENOSPC)` | **nothing** (the C unlinks first, `io.c:7244`) | `undefined` | `badarg` |
+| `driver_output` then `driver_failure_posix` | `{data,…}` **then** `{'EXIT',P,einval}` | `undefined` | `badarg` |

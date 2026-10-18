@@ -35,8 +35,9 @@ use super::super::opt::{
 use super::super::wire::{ctl_ok, ctl_xerror, split_caller_ref, ETF_VERSION_MAGIC};
 use super::super::{INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_TYPE_DGRAM, INET_REP_OK};
 use super::{UdpInetDriver, UDP_DRIVER_NAME};
-use crate::completion::{CompletionEvent, InetReply, PortCompletion};
+use crate::completion::{CompletionEvent, InetReason, InetReply, PortCompletion};
 use crate::driver::{Driver, DriverContext, PortArms};
+use crate::port_failure::DriverFailure;
 use crate::poller::Poller;
 use crate::queue::ByteQueue;
 use beam_common::{BeamError, Result};
@@ -77,9 +78,11 @@ fn loopback_arg(port: u16) -> Vec<u8> {
 /// A driver plus the port state a `DriverContext` needs, so a verb can be driven directly
 /// without a `PortRegistry` (the same shape `super::super::tests`' rig uses).
 ///
-/// Every context carries the **completion sink** the port installs at each driver interaction
-/// point, so the send path's `{inet_reply, …}` is observable here exactly as it is through
-/// [`crate::PortRegistry::take_completions`].
+/// Every context carries both side-channel sinks the port installs at each driver interaction
+/// point: the **completion sink**, so the send path's `{inet_reply, …}` is observable here exactly
+/// as it is through [`crate::PortRegistry::take_completions`], and the **failure latch**, so the
+/// C's `driver_failure_posix` (a request, not a teardown — `crate::PortRegistry::reap_failures`
+/// reaps it after the round) is observable as [`Rig::take_failure`].
 struct Rig {
     driver: UdpInetDriver,
     poller: Poller,
@@ -87,6 +90,7 @@ struct Rig {
     output: ByteQueue,
     arms: PortArms,
     completions: Vec<PortCompletion>,
+    failure: Option<DriverFailure>,
 }
 
 impl Rig {
@@ -99,6 +103,7 @@ impl Rig {
             output: ByteQueue::new(),
             arms: PortArms::default(),
             completions: Vec::new(),
+            failure: None,
         };
         rig.start().expect("start");
         rig
@@ -113,7 +118,8 @@ impl Rig {
             &mut self.output,
             &mut self.arms,
         )
-        .with_completions(&mut self.completions);
+        .with_completions(&mut self.completions)
+        .with_failure(&mut self.failure);
         self.driver.start(&mut ctx)
     }
 
@@ -126,13 +132,22 @@ impl Rig {
             &mut self.output,
             &mut self.arms,
         )
-        .with_completions(&mut self.completions);
+        .with_completions(&mut self.completions)
+        .with_failure(&mut self.failure);
         self.driver.control(&mut ctx, command, arg)
     }
 
     /// The completions staged since the last drain, in delivery order.
     fn take_completions(&mut self) -> Vec<PortCompletion> {
         std::mem::take(&mut self.completions)
+    }
+
+    /// The failure the driver latched through
+    /// [`DriverContext::signal_failure`](crate::DriverContext::signal_failure) — the C's
+    /// `driver_failure*`/`driver_exit` request — and forgets it, as [`crate::Port::take_failure`]
+    /// does for the registry.
+    fn take_failure(&mut self) -> Option<DriverFailure> {
+        self.failure.take()
     }
 
     /// The bytes the driver has read into the port input queue, consumed.
@@ -188,49 +203,123 @@ impl Rig {
             &mut self.output,
             &mut self.arms,
         )
-        .with_completions(&mut self.completions);
+        .with_completions(&mut self.completions)
+        .with_failure(&mut self.failure);
         self.driver.output(&mut ctx)
     }
 }
 
 // ---------------------------------------------------------------------------
-// A socket-less port refuses a port command (the C's `!IS_OPEN`, `inet_drv.c:15068`)
+// A socket-less port command: the C's `init_caller` split (`inet_drv.c:15054`-`:15068`)
 // ---------------------------------------------------------------------------
-
-/// A `port_command/2` on a port with **no socket** is refused, and the queued bytes survive: the
-/// C's `packet_inet_command` guards on `!IS_OPEN` (`inet_drv.c:15068`-`:15077`) before it looks at
-/// the operand at all, because a socket-less port has no destination a command could name.
+/// **A `port_command/2` whose bytes carry no caller-reference prefix closes the port**, and the
+/// command's bytes are **accounted for** instead of being left queued.
 ///
-/// The driver-side contract is a typed `BeamError::BadArg` with the bytes **never consumed**.
-/// The oracle's own first command answers `true` *and kills the port* (`driver_failure_posix`),
-/// which needs a `driver_failure` seam this crate's `Driver` trait does not have; see
-/// `the_socket_less_command_sequence_matches_the_oracle`.
+/// A **correction** of a previously-wrong expectation: this driver used to answer a typed
+/// [`BeamError::BadArg`] and keep the bytes. `packet_inet_command` runs `init_caller`
+/// (`inet_drv.c:15054`, whose rule is `:1820`-`:1890`) *before* its `!IS_OPEN` guard
+/// (`:15068`-`:15077`), and that call is **size-only** — the first two bytes are a 16-bit tag
+/// length and the rest must hold that many tag bytes. `<<1,2,3>>` reads as a 258-byte tag and does
+/// not fit, so `init_caller` answers `FALSE` at `:15063`, which is
+/// `driver_failure_posix(port, EINVAL)` (`io.c:7273`) — while `erlang:port_command/2` still
+/// answers `true` and the emulator charges the whole command (`prt->bytes_out += size`).
+///
+/// Measured on OTP 29.1.1 against a bare `{spawn_driver,"udp_inet"}` port: the owner receives
+/// `{'EXIT',P,einval}` and `port_info(P,name)` is `undefined`. The registry half of that row (the
+/// reaped port, the `badarg` on every later command) is pinned by
+/// [`a_socket_less_command_closes_the_port`](super::async_tests::a_socket_less_command_closes_the_port),
+/// and the oracle sequence itself by
+/// [`the_socket_less_command_sequence_matches_the_oracle`].
 #[test]
-fn a_socket_less_port_command_is_refused_and_keeps_its_bytes() {
+fn a_socket_less_malformed_command_closes_the_port_with_einval() {
     let mut rig = Rig::new();
     rig.queue_output(b"\x01\x02\x03");
     assert_eq!(rig.output_len(), 3, "the command is queued");
-    assert!(
-        matches!(rig.drain_output(), Err(BeamError::BadArg)),
-        "a socket-less datagram command is refused"
-    );
     assert_eq!(
-        rig.output_len(),
+        rig.drain_output()
+            .expect("the C accepts the command and charges it"),
         3,
-        "the refused command's bytes are never consumed"
+        "every queued byte is accounted for — the C's `prt->bytes_out += size`"
+    );
+    assert_eq!(rig.output_len(), 0, "the command is consumed");
+    assert_eq!(
+        rig.take_failure(),
+        Some(DriverFailure::posix(libc::EINVAL)),
+        "`driver_failure_posix(EINVAL)` — the reason the owner's `{{'EXIT',P,einval}}` renders from"
+    );
+    assert!(
+        caller_replies(&mut rig).is_empty(),
+        "a malformed command has no caller reference to answer"
+    );
+    assert!(
+        rig.driver.socket().is_none(),
+        "the latch is a request: nothing is torn down inside the callback"
     );
 }
-
-/// The oracle's side of the same situation, pinned as a **sequence**: on a fresh bare port the
-/// first `port_command/2` answers `true` and the port is then dead (`port_info(P, name)` is
+/// A re-driven `OUTPUT` task on a port with **nothing queued** is not a command, so it writes
+/// nothing and latches nothing.
+///
+/// `packet_inet_command` is only ever handed a command (`len`), and `init_caller` on an empty
+/// buffer is its `size < 2` `FALSE` (`inet_drv.c:1834`) — which `:15063` would turn into
+/// `driver_failure_posix(port, EINVAL)` and kill the port over a write that already finished. The
+/// guard precedes both the prefix strip and the `!IS_OPEN` arm, so it holds on a socket-less port
+/// too ([`UdpInetDriver::write_command`]'s first branch).
+#[test]
+fn an_empty_queue_re_drive_writes_nothing_and_latches_nothing() {
+    let mut rig = Rig::new();
+    assert_eq!(rig.output_len(), 0, "nothing was ever queued");
+    assert_eq!(
+        rig.drain_output().expect("an empty re-drive"),
+        0,
+        "`output` on an empty queue is the C's `size < 2` shortcut, i.e. no bytes"
+    );
+    assert_eq!(rig.output_len(), 0, "and nothing was consumed");
+    assert_eq!(rig.take_failure(), None, "the port stays alive");
+    assert!(
+        rig.driver.socket().is_none(),
+        "the socket-less state never moved"
+    );
+    assert!(
+        caller_replies(&mut rig).is_empty(),
+        "there is no caller to answer"
+    );
+}
+/// The other side of the split: a **well-formed** caller prefix on a socket-less port is accepted
+/// and answered out of band with `{error, einval}` — the C's `!IS_OPEN` arm
+/// (`inet_drv.c:15068`-`:15077`, `inet_reply_error(desc, EINVAL)`), reachable only once
+/// `init_caller` has accepted the prefix.
+///
+/// A **correction** of a previously-wrong expectation, which reported the same typed `BadArg`
+/// refusal as the malformed case: the oracle distinguishes them. Measured on OTP 29.1.1 —
+/// `port_command(P, <<Len:16, Mref/binary>>)` answers `true`, then
+/// `{inet_reply,P,{error,einval},Mref}` reaches the owner and `port_info(P,name)` is still
+/// `"udp_inet"` (the datagram arm reports `einval`, the stream driver's `enotconn`).
+#[test]
+fn a_socket_less_tagged_command_answers_einval_and_stays_alive() {
+    let mut rig = Rig::new();
+    let command = prefixed_command(0, &[], b"");
+    rig.queue_output(&command);
+    assert_eq!(
+        rig.drain_output().expect("the C accepts the command"),
+        command.len(),
+        "the prefix and the payload are both charged"
+    );
+    assert_eq!(rig.output_len(), 0, "the command is consumed");
+    assert_eq!(
+        caller_replies(&mut rig),
+        prefixed_reply(InetReply::Error(InetReason::from_errno(libc::EINVAL))),
+        "`inet_reply_error(EINVAL)` — the oracle's `{{inet_reply,P,{{error,einval}},Mref}}`"
+    );
+    assert_eq!(rig.take_failure(), None, "the port stays alive");
+}
+/// The oracle's side of both rows, pinned as a **sequence**: on a fresh bare port the first
+/// `port_command/2` answers `true` and the port is then dead (`port_info(P, name)` is
 /// `undefined`, the C's `driver_failure_posix(EINVAL)`), after which every command raises
 /// `badarg`.
 ///
-/// The residual difference is deliberate and asserted, not glossed over: reproducing the port
-/// kill needs a `driver_failure` seam this crate does not have, so the Rust side refuses the
-/// **first** delivered round with a typed `BeamError::BadArg` and keeps the bytes. The oracle's
-/// `true` is therefore **not** compared to our reply — only the sequence (first command accepted,
-/// port afterwards unusable) is pinned.
+/// Our side of the same port state is now the row itself, not a weakened stand-in: this driver
+/// adopted [`DriverContext::signal_failure`], so the command is **accepted and charged** and the
+/// port latches `einval` for the registry to reap.
 ///
 /// **Skips loudly** when `erl` is not on `PATH`.
 #[test]
@@ -255,18 +344,24 @@ fn the_socket_less_command_sequence_matches_the_oracle() {
         "the oracle refuses every command after the port died (measured: a caught, \
          exit-shaped badarg raise): {dump:?}"
     );
-
-    // Our side: the very first delivered round is refused, and the bytes stay queued.
+    // Our side: `init_caller` rejects the bare payload, so the command is charged whole
+    // (`prt->bytes_out += size`) and the port latches `driver_failure_posix(EINVAL)`.
     let mut rig = Rig::new();
     rig.queue_output(b"\x01");
-    assert!(
-        matches!(rig.drain_output(), Err(BeamError::BadArg)),
-        "the Rust side refuses the first round (the oracle answers `true` and kills the port — \
-         a `driver_failure` seam this driver has no access to)"
+    assert_eq!(
+        rig.drain_output()
+            .expect("`erlang:port_command/2` answers `true`: the callback returns normally"),
+        1,
+        "the whole command is charged"
     );
-    assert_eq!(rig.output_len(), 1, "and the refused bytes stay queued");
+    assert_eq!(rig.output_len(), 0, "and nothing is left queued");
+    assert_eq!(
+        rig.take_failure(),
+        Some(DriverFailure::posix(libc::EINVAL)),
+        "the port latches `driver_failure_posix(EINVAL)`, which the registry reaps into the \
+         owner's `{{'EXIT',P,einval}}`"
+    );
 }
-
 // ---------------------------------------------------------------------------
 // The control verbs over real loopback datagram sockets
 // ---------------------------------------------------------------------------
@@ -859,6 +954,22 @@ fn udp_receiver() -> std::net::UdpSocket {
     socket
 }
 
+/// How long a **negative** probe waits for a datagram that must never arrive. Only the
+/// "nothing reached the wire" assertions pay it.
+const PROBE_WAIT: Duration = Duration::from_millis(200);
+/// `Some(payload)` if a datagram arrives within [`PROBE_WAIT`], `None` if none does — the negative
+/// counterpart of [`receive_one`], for a row where the send never happened.
+fn receive_within(socket: &std::net::UdpSocket) -> Option<Vec<u8>> {
+    socket
+        .set_read_timeout(Some(PROBE_WAIT))
+        .expect("a probe read timeout");
+    let mut buf = [0u8; 1024];
+    match socket.recv_from(&mut buf) {
+        Ok((len, _from)) => Some(buf[..len].to_vec()),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(err) => panic!("the probe read failed: {err}"),
+    }
+}
 /// Receives exactly one datagram from `socket`.
 fn receive_one(socket: &std::net::UdpSocket) -> Vec<u8> {
     let mut buf = [0u8; 1024];
@@ -1202,43 +1313,85 @@ fn a_connected_queued_command_ignores_the_address_it_carries() {
     );
 }
 
-/// The queued form **is** the C's grammar, so the ancillary-length word is mandatory: a command in
-/// the `send` verb's `[address][data]` convenience shape is the C's `return_einval`
-/// (`inet_drv.c:15155`, `len < 4` after the address, or `:15158`, `len < anc_len`) — a typed
-/// `BeamError::BadArg` here, with the bytes left queued so nothing is lost.
+/// A queued command in the `send` verb's `[address][data]` convenience shape — i.e. **without** a
+/// caller-reference prefix — closes the port: `init_caller` (`inet_drv.c:15054`, rule at
+/// `:1820`-`:1890`) reads the address's first two bytes (`[INET_AF_INET(1), port_hi]`) as a 16-bit
+/// tag length, and that can never fit inside the command (`port_hi >= 0x80` for the ephemeral
+/// ports a test binds, so the length is >= 384 against a 16-byte command). So the answer is the C's
+/// `FALSE` ⇒ `driver_failure_posix(port, EINVAL)` (`:15063`, `io.c:7273`).
+///
+/// A **correction** of a previously-wrong expectation, which claimed this shape reaches the
+/// operand grammar and is refused with a typed `BadArg` while keeping its bytes: the oracle never
+/// gets that far — the command dies in `init_caller` first. The operand grammar's own
+/// `return_einval` is pinned, through a well-formed prefix, by
+/// [`a_tagged_command_with_a_truncated_ancillary_length_word_answers_einval`].
 #[test]
-fn a_queued_command_without_the_ancillary_length_word_is_refused_and_keeps_its_bytes() {
+fn a_plain_queued_command_closes_the_port_before_the_operand_is_parsed() {
     let receiver = udp_receiver();
     let target = receiver.local_addr().expect("an address").port();
     let mut rig = Rig::new();
     rig.bind_ephemeral();
 
-    // `[address][payload]` — the verb's shape. Its first payload byte reads as an ancillary length
-    // no payload can satisfy, which is `split_datagram`'s `DatagramCommand::Einval`.
     let mut command = loopback_arg(target);
     command.extend_from_slice(b"hi");
     rig.queue_output(&command);
-    assert!(
-        matches!(rig.drain_output(), Err(BeamError::BadArg)),
-        "the C's einval guard is a typed refusal here",
-    );
     assert_eq!(
-        rig.output_len(),
+        rig.drain_output()
+            .expect("the C accepts the command and charges it"),
         command.len(),
-        "the bytes are never consumed"
+        "every queued byte is accounted for — the C's `prt->bytes_out += size`"
+    );
+    assert_eq!(rig.output_len(), 0, "the command is consumed");
+    assert_eq!(
+        rig.take_failure(),
+        Some(DriverFailure::posix(libc::EINVAL)),
+        "`driver_failure_posix(EINVAL)` — the owner's `{{'EXIT',P,einval}}`"
     );
     assert!(
-        matches!(rig.drain_output(), Err(BeamError::BadArg)),
-        "a re-driven round refuses identically instead of losing the bytes",
+        caller_replies(&mut rig).is_empty(),
+        "a malformed command has no caller reference to answer"
     );
-    assert_eq!(rig.output_len(), command.len());
     assert_eq!(
         send_counters(&mut rig),
         (0, 0),
-        "a refused command never reaches the counters",
+        "nothing reached the wire: the operand was never parsed"
     );
 }
+/// The operand grammar's own `return_einval` (`inet_drv.c:15155`, `len < 4` after the address):
+/// a **well-formed** caller prefix whose address is not followed by the full four-byte
+/// ancillary-length word. The C answers `inet_reply_error(desc, EINVAL)` — the port stays alive and
+/// the command is consumed — so the caller tag is answered `{error, einval}` verbatim.
+#[test]
+fn a_tagged_command_with_a_truncated_ancillary_length_word_answers_einval() {
+    let receiver = udp_receiver();
+    let target = receiver.local_addr().expect("an address").port();
+    let mut rig = Rig::new();
+    rig.bind_ephemeral();
 
+    let mut command = (CALLER_REF_TAG.len() as u16).to_be_bytes().to_vec();
+    command.extend_from_slice(CALLER_REF_TAG);
+    command.extend_from_slice(&loopback_arg(target));
+    command.extend_from_slice(&[0, 0]);
+    rig.queue_output(&command);
+    assert_eq!(
+        rig.drain_output()
+            .expect("the C answers the caller instead of failing the port"),
+        command.len(),
+        "the whole command is consumed"
+    );
+    assert_eq!(rig.output_len(), 0);
+    assert_eq!(
+        caller_replies(&mut rig),
+        prefixed_reply(InetReply::Error(InetReason::from_errno(libc::EINVAL))),
+        "`inet_reply_error(EINVAL)` with the tag echoed verbatim"
+    );
+    assert_eq!(rig.take_failure(), None, "the port stays alive");
+    assert_eq!(
+        send_counters(&mut rig),
+        (0, 0),
+        "and nothing was sent to the truncated address"
+    );
+}
 /// A non-zero ancillary length is the C's `sendmsg(2)`-with-cmsgs arm (`inet_drv.c:15220`-`:15230`),
 /// which this floor has no seam for: the typed `unsupported` raise, never a send with the ancillary
 /// bytes dropped or mistaken for payload. The **command** bytes stay queued — only the
@@ -1277,10 +1430,18 @@ fn a_queued_command_with_ancillary_data_is_the_typed_unsupported() {
     );
 }
 
-/// A plain (un-prefixed) queued command is the same grammar without the caller-reference tag, which
-/// is what a direct `erlang:port_command/2` on a `udp_inet` port carries.
+/// **Correction**: a plain (un-prefixed) queued command is *not* the C's grammar. `init_caller`
+/// runs on every `erlang:port_command/2` command from an internal pid (`inet_drv.c:15054`) and its
+/// rule is **size-only**, so the address's `[INET_AF_INET, port_hi]` head is read as a 16-bit tag
+/// length (>= 384 for any ephemeral port) that the command cannot satisfy ⇒ `FALSE` ⇒
+/// `driver_failure_posix(port, EINVAL)` (`:15063`, `io.c:7273`). The datagram is never parsed, so
+/// the receiver must get **nothing**.
+///
+/// The prefixed form is what really delivers a datagram
+/// ([`an_unconnected_queued_command_is_sent_to_the_address_it_carries`] and
+/// [`the_queued_command_delivery_agrees_with_the_erl_oracle`]).
 #[test]
-fn a_plain_queued_command_carries_the_ancillary_length_word() {
+fn a_plain_queued_command_never_reaches_the_wire() {
     let receiver = udp_receiver();
     let target = receiver.local_addr().expect("an address").port();
     let mut rig = Rig::new();
@@ -1292,17 +1453,21 @@ fn a_plain_queued_command_carries_the_ancillary_length_word() {
     rig.queue_output(&command);
     assert_eq!(
         rig.drain_output()
-            .expect("a plain queued command is accepted"),
+            .expect("the C accepts the command and charges it"),
         command.len(),
     );
-    assert_eq!(receive_one(&receiver), b"plain");
+    assert_eq!(rig.output_len(), 0, "the command is consumed");
     assert_eq!(
-        send_counters(&mut rig),
-        (1, 5),
-        "the payload alone is counted"
+        rig.take_failure(),
+        Some(DriverFailure::posix(libc::EINVAL)),
+        "`init_caller` read the address head as a tag length and rejected it"
+    );
+    assert_eq!(send_counters(&mut rig), (0, 0), "no send was issued");
+    assert!(
+        receive_within(&receiver).is_none(),
+        "and the receiver got no datagram"
     );
 }
-
 /// The oracle's side of the same path: `gen_udp:send/4` → `prim_inet:sendto/4`
 /// (`erts/preloaded/src/prim_inet.erl:652`-`:700`), which queues the caller-reference-prefixed
 /// command and waits for the `{inet_reply, …}` message. The **observable datagram** is compared —

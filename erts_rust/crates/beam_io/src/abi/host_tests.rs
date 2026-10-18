@@ -35,6 +35,7 @@ use beam_abi::driver::types::{
 use beam_process::PortId;
 use beam_term::prelude::{is_atom, make_atom, AtomTable};
 use libc::c_int;
+use std::collections::VecDeque;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,11 +45,14 @@ use std::time::Duration;
 use crate::abi::DriverTable;
 use crate::driver::PortArms;
 use crate::poller::{Interest, Poller};
+use crate::port_task::ReadMessage;
 use crate::queue::ByteQueue;
 use crate::DriverContext;
 
 /// A fresh host over a private atom table.
-fn new_host() -> AbiHost {
+///
+/// Shared with the sibling [`super::host_output_tests`] suite, which is why it is `pub(super)`.
+pub(super) fn new_host() -> AbiHost {
     AbiHost::new(Box::new(LocalAtomPortHost::new())).expect("a driver heap")
 }
 
@@ -58,7 +62,9 @@ fn event_for(fd: RawFd) -> ErlDrvEvent {
 }
 
 /// A fresh poll set plus the two port queues and the arming record one context needs.
-fn new_context_parts() -> (Poller, ByteQueue, ByteQueue, PortArms) {
+///
+/// Shared with the sibling [`super::host_output_tests`] suite, which is why it is `pub(super)`.
+pub(super) fn new_context_parts() -> (Poller, ByteQueue, ByteQueue, PortArms) {
     (
         Poller::new().expect("a poll set"),
         ByteQueue::new(),
@@ -127,39 +133,6 @@ fn set_busy_port_records_and_clears_the_busy_flag() {
     assert_eq!(DriverHost::set_busy_port(&mut host, true), 0);
     assert_eq!(DriverHost::set_busy_port(&mut host, true), 0);
     assert!(host.is_busy());
-}
-#[test]
-fn driver_output_lands_in_the_port_input_queue() {
-    let mut host = new_host();
-    let (mut poller, mut input, mut output, mut arms) = new_context_parts();
-    let mut ctx = DriverContext::new(
-        PortId::new(0),
-        &mut poller,
-        &mut input,
-        &mut output,
-        &mut arms,
-    );
-    host.install(&mut ctx);
-
-    assert_eq!(
-        DriverHost::output(&mut host, core::ptr::null_mut(), b"hi"),
-        0
-    );
-    assert_eq!(ctx.input().front(), b"hi");
-    assert_eq!(
-        DriverHost::output(&mut host, core::ptr::null_mut(), b"!"),
-        0
-    );
-    assert_eq!(ctx.input().front(), b"hi!");
-    // Nothing was queued for the device: `driver_output` is owner-bound.
-    assert_eq!(ctx.output().len(), 0);
-    host.clear();
-
-    // With the context cleared the same call is refused, never a null dereference.
-    assert_eq!(
-        DriverHost::output(&mut host, core::ptr::null_mut(), b"x"),
-        -1
-    );
 }
 
 #[test]
@@ -685,60 +658,79 @@ fn the_queue_head_accessor_is_the_safe_peekq_view() {
 #[test]
 fn the_queue_hooks_hold_the_drivers_own_queue() {
     let mut host = new_host();
-    let (mut poller, mut input, mut output, mut arms) = new_context_parts();
-    let mut ctx = DriverContext::new(
-        PortId::new(0),
-        &mut poller,
-        &mut input,
-        &mut output,
-        &mut arms,
+    let mut reads: VecDeque<ReadMessage> = VecDeque::new();
+    {
+        let (mut poller, mut input, mut output, mut arms) = new_context_parts();
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut poller,
+            &mut input,
+            &mut output,
+            &mut arms,
+        )
+        .with_reads(&mut reads);
+        host.install(&mut ctx);
+
+        // An untouched queue: `driver_sizeq` is `0` and `driver_peekq` reports the C's NULL view.
+        assert_eq!(DriverHost::sizeq(&mut host), 0);
+        assert_eq!(peeked_bytes(&mut host), None);
+        assert_eq!(host.state().queue_len(), 0);
+
+        // `driver_enq` appends (`io.c:6790`), and the three ways of reading the queue agree.
+        assert_eq!(DriverHost::enq(&mut host, b"ab", false), 0);
+        assert_eq!(DriverHost::enq(&mut host, b"cd", false), 0);
+        assert_eq!(DriverHost::sizeq(&mut host), 4);
+        assert_eq!(host.state().queue_len(), 4);
+        assert_eq!(peeked_bytes(&mut host), Some(b"abcd".to_vec()));
+
+        // `driver_pushq` prepends (`io.c:6800`) ...
+        assert_eq!(DriverHost::pushq(&mut host, b"xy", false), 0);
+        assert_eq!(peeked_bytes(&mut host), Some(b"xyabcd".to_vec()));
+        // ... and an empty one is the C's `len == 0` early return, not a no-op reordering.
+        assert_eq!(DriverHost::pushq(&mut host, b"", false), 0);
+        assert_eq!(peeked_bytes(&mut host), Some(b"xyabcd".to_vec()));
+
+        // `driver_deq`: a zero drop reports an unchanged queue, a partial one drops from the head.
+        assert_eq!(DriverHost::deq(&mut host, 0), 0);
+        assert_eq!(host.state().queue_len(), 6);
+        assert_eq!(DriverHost::deq(&mut host, 2), 2);
+        assert_eq!(host.state().queue_len(), 4);
+        assert_eq!(peeked_bytes(&mut host), Some(b"abcd".to_vec()));
+
+        // `driver_output` is the *other* direction: it stages a read for the port's owner (see
+        // `driver_output_stages_one_body_only_read_per_call`) instead of touching either queue.
+        assert_eq!(
+            DriverHost::output(&mut host, core::ptr::null_mut(), b"hi"),
+            0
+        );
+        assert!(
+            ctx.input().front().is_empty(),
+            "nothing is banked on the accumulator"
+        );
+        assert_eq!(
+            ctx.output().len(),
+            0,
+            "nothing reached the port's output queue"
+        );
+        assert_eq!(host.state().queue_len(), 4, "the driver queue is untouched");
+
+        // The documented deviation: an over-long `driver_deq` clamps rather than failing (`-1`), so
+        // the queue ends up empty instead of holding bytes the caller believes it dropped.
+        assert_eq!(DriverHost::deq(&mut host, 100), 4);
+        assert_eq!(DriverHost::sizeq(&mut host), 0);
+        assert_eq!(peeked_bytes(&mut host), None);
+        // A negative length is impossible through the C API (its operand is an `ErlDrvSizeT`) and
+        // is refused rather than silently treated as a drain.
+        assert_eq!(DriverHost::deq(&mut host, -1), -1);
+        host.clear();
+    }
+    assert_eq!(
+        reads,
+        VecDeque::from([ReadMessage::body_only(b"hi".to_vec())]),
+        "`driver_output` stages one read of its own for the owner"
     );
-    host.install(&mut ctx);
-
-    // An untouched queue: `driver_sizeq` is `0` and `driver_peekq` reports the C's NULL view.
-    assert_eq!(DriverHost::sizeq(&mut host), 0);
-    assert_eq!(peeked_bytes(&mut host), None);
-    assert_eq!(host.state().queue_len(), 0);
-
-    // `driver_enq` appends (`io.c:6790`), and the three ways of reading the queue agree.
-    assert_eq!(DriverHost::enq(&mut host, b"ab", false), 0);
-    assert_eq!(DriverHost::enq(&mut host, b"cd", false), 0);
-    assert_eq!(DriverHost::sizeq(&mut host), 4);
-    assert_eq!(host.state().queue_len(), 4);
-    assert_eq!(peeked_bytes(&mut host), Some(b"abcd".to_vec()));
-
-    // `driver_pushq` prepends (`io.c:6800`) ...
-    assert_eq!(DriverHost::pushq(&mut host, b"xy", false), 0);
-    assert_eq!(peeked_bytes(&mut host), Some(b"xyabcd".to_vec()));
-    // ... and an empty one is the C's `len == 0` early return, not a no-op reordering.
-    assert_eq!(DriverHost::pushq(&mut host, b"", false), 0);
-    assert_eq!(peeked_bytes(&mut host), Some(b"xyabcd".to_vec()));
-
-    // `driver_deq`: a zero drop reports an unchanged queue, a partial one drops from the head.
-    assert_eq!(DriverHost::deq(&mut host, 0), 0);
-    assert_eq!(host.state().queue_len(), 6);
-    assert_eq!(DriverHost::deq(&mut host, 2), 2);
-    assert_eq!(host.state().queue_len(), 4);
-    assert_eq!(peeked_bytes(&mut host), Some(b"abcd".to_vec()));
-
-    // `driver_output` is the *other* direction: it lands in the port's input queue while the
-    // driver queue keeps its bytes.
-    assert_eq!(DriverHost::output(&mut host, core::ptr::null_mut(), b"hi"), 0);
-    assert_eq!(ctx.input().front(), b"hi");
-    assert_eq!(host.state().queue_len(), 4, "the driver queue is untouched");
-    assert_eq!(ctx.output().len(), 0, "nothing reached the port's output queue");
-
-    // The documented deviation: an over-long `driver_deq` clamps rather than failing (`-1`), so
-    // the queue ends up empty instead of holding bytes the caller believes it dropped.
-    assert_eq!(DriverHost::deq(&mut host, 100), 4);
-    assert_eq!(DriverHost::sizeq(&mut host), 0);
-    assert_eq!(peeked_bytes(&mut host), None);
-    // A negative length is impossible through the C API (its operand is an `ErlDrvSizeT`) and is
-    // refused rather than silently treated as a drain.
-    assert_eq!(DriverHost::deq(&mut host, -1), -1);
 
     // The queue is the host's own state, so it is reachable with no callback context installed.
-    host.clear();
     assert_eq!(DriverHost::enq(&mut host, b"z", false), 0);
     assert_eq!(peeked_bytes(&mut host), Some(b"z".to_vec()));
 }

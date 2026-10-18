@@ -40,6 +40,11 @@
 //! nothing) rather than dereferencing a null pointer — a driver that calls `driver_output` outside
 //! a callback (e.g. from its own worker thread) gets the C's failure code.
 //!
+//! The `driver_output*` **return code** is the C's own, which has two distinct answers a driver can
+//! observe: `0` for a port that is closing (bytes dropped) and `-1` only for a handle that no longer
+//! names a port. A driver that failed its own port therefore gets `0` from a later `driver_output*`
+//! in the same callback — see [`AbiHost::deliver_output`].
+//!
 //! # What lives in the host
 //!
 //! The port's *persistent* C-ABI state is [`DriverState`]: the `driver_select` registration map
@@ -80,7 +85,7 @@ use std::time::{Duration, Instant};
 use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
 use beam_abi::common::SysIOVec;
-use beam_abi::driver::host::DriverHost;
+use beam_abi::driver::host::{DriverHost, PortFailure as AbiFailure};
 use beam_abi::driver::types::{
     ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT,
     ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
@@ -94,6 +99,7 @@ use crate::abi::job::AsyncJobs;
 use crate::abi::DriverTable;
 use crate::driver::DriverContext;
 use crate::poller::{Interest, Token};
+use crate::port_failure::DriverFailure;
 use crate::queue::ByteQueue;
 
 /// The word capacity of the term heap handed to a driver through
@@ -395,6 +401,18 @@ pub struct AbiHost {
     /// The [`DriverContext`](crate::driver::DriverContext) installed for the duration of one
     /// driver callback, or null outside a callback. See [`AbiHost::with_ctx`].
     ctx: Cell<*mut c_void>,
+    /// Whether this port has taken itself down from inside one of its callbacks — the C's
+    /// `driver_failure_term` (`io.c:7196-7224`) path, which leaves the port `EXITING` and headed for
+    /// teardown. Set by [`DriverHost::failure`] and [`DriverHost::port_exit`].
+    ///
+    /// It exists for the `driver_output*` return code only: the C answers **`0`** to a delivery on
+    /// a port that is closing or already dead (`io.c:6400-6401`, `io.c:6351-6352`,
+    /// `io.c:6473-6474`) and reserves **`-1`** for a handle that no longer resolves at all
+    /// (`erts_drvport2port_state` → `ERTS_INVALID_ERL_DRV_PORT`, `erl_port.h:739-766`). A port whose
+    /// driver just failed still resolves (it is `EXITING`, not yet `FREE`/`INITIALIZING`), so a
+    /// `driver_output*` after a `driver_failure*` in the same callback must report success and reach
+    /// nobody — see [`AbiHost::deliver_output`].
+    closing: bool,
 }
 
 impl AbiHost {
@@ -415,6 +433,7 @@ impl AbiHost {
             state: DriverState::new(),
             driver: None,
             ctx: Cell::new(core::ptr::null_mut()),
+            closing: false,
         })
     }
 
@@ -513,6 +532,52 @@ impl AbiHost {
         &mut self.state
     }
 
+    /// The shared delivery path of `driver_output`/`driver_output2`: one read for the port owner,
+    /// answered with the C's own return code.
+    ///
+    /// The C's gate order is the whole contract (`io.c:6387-6439`, `driver_output2` — and
+    /// `driver_output` is literally `driver_output2(ix, NULL, 0, buf, len)`, `io.c:6442-6446`;
+    /// `driver_output_binary` `io.c:6339-6372` and `driver_outputv` `io.c:6448-6474` add nothing):
+    ///
+    /// 1. `prt == ERTS_INVALID_ERL_DRV_PORT` ⇒ **`-1`** (`io.c:6396-6397`). `erts_drvport2port_state`
+    ///    yields that sentinel only for a handle whose port is `ERTS_PORT_SFLGS_DEAD`
+    ///    (`FREE|INITIALIZING`) or `ERTS_PORT_SFLG_INVALID` (`erl_port.h:739-766`, `:352-358`) —
+    ///    a handle that no longer names a port at all.
+    /// 2. `state & ERTS_PORT_SFLG_CLOSING` ⇒ **`0`**, the bytes dropped (`io.c:6400-6401`; the same
+    ///    short-circuit for `driver_output_binary` at `io.c:6351-6352` and `driver_outputv` at
+    ///    `io.c:6473-6474`). This is the **post-failure** answer: a driver that called
+    ///    `driver_failure*`/`driver_exit` (`io.c:7196-7255`) has put its port on the way out, so a
+    ///    later delivery in the same callback reports success and reaches nobody. Measured against
+    ///    the system runtime (OTP 29.1.1 / erts-17.1): `driver_failure_posix(P, EINVAL)` followed by
+    ///    `driver_output2(P, "h", 1, "b", 1)` logs `rc=0`, and `driver_failure_atom(P,"enospc")`
+    ///    followed by `driver_output(P, "x", 1)` logs `rc=0`, with no `{Port,{data,_}}` delivered.
+    /// 3. otherwise the read is delivered and the call answers **`0`** (`io.c:6438`).
+    ///
+    /// Here arm 1 is the *host*'s: with no installed context (a driver calling in from outside its
+    /// own callback, so no live port to name) the C's invalid-handle code is the honest answer, and
+    /// a context with no read sink (a bare [`DriverContext`](crate::DriverContext), i.e. one not
+    /// attached to a port) has no owner to report to — refusing beats flattening the read into the
+    /// accumulator. Arm 2 is [`AbiHost::closing`]. The order is the C's: the handle is resolved
+    /// first, so a delivery made **outside** any callback stays `-1` even on a failed port.
+    fn deliver_output(&mut self, header: &[u8], body: Option<&[u8]>) -> c_int {
+        if !self.has_ctx() {
+            // `erts_drvport2port_state` ⇒ `ERTS_INVALID_ERL_DRV_PORT` (the C's `-1`).
+            return -1;
+        }
+        if self.closing {
+            // The C's `ERTS_PORT_SFLG_CLOSING` short-circuit: drop the bytes, report success.
+            return 0;
+        }
+        match self.with_ctx(|ctx| ctx.deliver_read(header, body)) {
+            Some(Ok(())) => 0,
+            _ => -1,
+        }
+    }    /// Whether a port context is installed right now — i.e. whether the `driver_*` call arrived
+    /// from **inside** one of the driver's own callbacks (see [`AbiHost::install`]).
+    fn has_ctx(&self) -> bool {
+        !self.ctx.get().is_null()
+    }
+
     /// Runs `f` against the installed port context, or returns `None` when none is installed.
     fn with_ctx<R>(&self, f: impl FnOnce(&mut DriverContext<'_>) -> R) -> Option<R> {
         let ptr = self.ctx.get();
@@ -562,13 +627,85 @@ impl DriverHost for AbiHost {
     /// (which is Erlang→driver). Nothing here knows which callback it was called from, which is
     /// deliberate: the C's `driver_output` reaches the owner whatever made it, so the report is
     /// gated on the queue being non-empty and not on an `INPUT` task having run.
+    ///
+    /// The return code is the C's, including its post-failure answer (`0`), and the bytes are the
+    /// read's **body** — [`AbiHost::deliver_output`] carries both.
     fn output(&mut self, _port: ErlDrvPort, data: &[u8]) -> c_int {
-        match self.with_ctx(|ctx| ctx.input().push(data)) {
-            Some(()) => 0,
-            None => -1,
+        // The C's `driver_output(ix, buf, len)` *is* `driver_output2(ix, NULL, 0, buf, len)`
+        // (`io.c:6442-6446`): the bytes are the read's **body**, never its header, and the call is
+        // one read message of its own. Banked on `DriverContext::input` they would instead
+        // coalesce with everything else the callback pushed and close as a single message — which
+        // is why the pinned oracle shape for two `driver_output` calls in one callback is **two**
+        // `{Port, {data, _}}` messages, delivered from `deliver_read`.
+        self.deliver_output(&[], Some(data))
+    }
+
+    /// `driver_output2`: deliver one read with its header apart from its body.
+    ///
+    /// The C's `driver_output2(ix, hbuf, hlen, buf, len)` (`io.c:6387-6439`) —
+    /// `driver_output_binary`/`driver_outputv` have the same shape — keeps the boundary: the
+    /// `hbuf`/`hlen` bytes are a list prefix and `buf`/`len` is the tail, which becomes a binary
+    /// in `[binary]` port mode. `body == None` is the C's `buf == NULL` (**no** tail at all, not an
+    /// empty one), which is why the split is carried through
+    /// [`ReadMessage`](crate::port_task::ReadMessage) rather than flattened here: with
+    /// `[binary]`, `driver_output2(p, "hdr", 3, "", 0)` is `[104,100,114|<<>>]` while
+    /// `driver_output2(p, "hdr", 3, NULL, 0)` is the proper list `"hdr"`.
+    fn output2(&mut self, _port: ErlDrvPort, header: &[u8], body: Option<&[u8]>) -> c_int {
+        self.deliver_output(header, body)
+    }
+    /// `driver_failure*`: close the port with `reason`, clearing the driver queue.
+    ///
+    /// The whole family funnels through the C's `driver_failure_term`, which drops the port's
+    /// `ioq` (`prt->ioq.size = 0`, `io.c:7220`) before delivering the exit signal — so the bytes
+    /// the driver queued itself are gone, while whatever it already handed up with
+    /// `driver_output*` has been delivered and survives. The latch itself is the port's; the
+    /// registry reaps it after the callback returns (see
+    /// [`DriverContext::signal_failure`](crate::DriverContext::signal_failure)).
+    ///
+    /// An accepted failure also puts this host in its **closing** state, which is what makes a
+    /// later `driver_output*` answer the C's `0` instead of `-1` (see
+    /// [`AbiHost::deliver_output`]): in the C the port is `EXITING` — headed for teardown but still
+    /// a resolvable handle — so a delivery on it is dropped with a success report, exactly as
+    /// `driver_failure*` itself answers `0` (`io.c:7223`).
+    fn failure(&mut self, reason: AbiFailure<'_>) -> c_int {
+        let failure = match reason {
+            AbiFailure::Eof => DriverFailure::eof(),
+            AbiFailure::Atom(name) => DriverFailure::atom(name),
+            AbiFailure::Posix(errno) => DriverFailure::posix(errno),
+            AbiFailure::Error(code) => DriverFailure::error(code),
+        };
+        self.state.ioq.clear();
+        match self.with_ctx(|ctx| ctx.signal_failure(failure)) {
+            Some(Ok(())) => {
+                self.closing = true;
+                0
+            }
+            _ => -1,
         }
     }
 
+    /// `driver_exit`: terminate the connected process with `code`.
+    ///
+    /// Modelled as the port-closing request the C really performs, with
+    /// [`DriverFailure::exit`]'s `signals_owner == false`: `driver_exit` runs
+    /// `unlink_proc(prt, connected)` **before** it closes anything (`io.c:7234-7255`), so the owner
+    /// receives no `'EXIT'` — a runtime that rendered one would invent a message the oracle never
+    /// sends. `code == 0` is the flush-less `normal` shape, anything else the errno's name.
+    ///
+    /// Like [`DriverHost::failure`], an accepted `driver_exit` leaves the host **closing**: it is
+    /// `driver_failure_term` that does the closing (`io.c:7245-7253`), so a delivery afterwards
+    /// answers the C's `0`, not `-1`.
+    fn port_exit(&mut self, code: c_int) -> c_int {
+        let failure = DriverFailure::exit(code);
+        self.state.ioq.clear();
+        match self.with_ctx(|ctx| ctx.signal_failure(failure)) {
+            Some(Ok(())) => {
+                self.closing = true;
+                0
+            }
+            _ => -1,
+        }
+    }
     fn send_term(&mut self, _port: ErlDrvPort, to: Option<Eterm>, term: Eterm) -> c_int {
         if self.port_host.send_term(to, term) {
             0
@@ -939,3 +1076,9 @@ impl DriverHost for AbiHost {
 #[cfg(test)]
 #[path = "host_tests.rs"]
 mod tests;
+
+/// The `driver_output*` → port-owner path's suite, split out of [`tests`] so neither file grows
+/// past the workspace's ~1000-line convention (see `host_output_tests.rs`).
+#[cfg(test)]
+#[path = "host_output_tests.rs"]
+mod host_output_tests;

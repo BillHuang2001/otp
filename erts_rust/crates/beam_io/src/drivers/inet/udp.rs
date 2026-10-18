@@ -113,10 +113,10 @@
 //!   **owner** as a [`PortCompletion`](crate::completion::PortCompletion). Both write paths accept
 //!   and strip the `prim_inet` caller-reference prefix (the `send` verb,
 //!   [`UdpInetDriver::verb_send`], and the queued `port_command` path,
-//!   [`UdpInetDriver::write_pending`]), and a command with no prefix — or the C's zero-length tag
-//!   — stages **no** reply, exactly as `inet_reply_finish` does with a `NULL` caller. The `send`
-//!   verb's own answer stays the synchronous `ctl_reply` bytes, which is what a `port_control`
-//!   caller reads.
+//!   [`UdpInetDriver::write_command`]'s prefix strip), and a command with no prefix — or the C's
+//!   zero-length tag — stages **no** reply, exactly as `inet_reply_finish` does with a `NULL`
+//!   caller. The `send` verb's own answer stays the synchronous `ctl_reply` bytes, which is what
+//!   a `port_control` caller reads.
 //! * **IPv6, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
 //!   `AF_INET`/`SOCK_DGRAM` and `bind`/`connect`/`send` only the packed
 //!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms.
@@ -151,14 +151,15 @@
 use std::os::unix::io::RawFd;
 use std::time::Instant;
 
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 
 use crate::driver::{Driver, DriverContext};
 use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
 
-use super::opt::{get_options, set_options, SocketOptions};
+use super::adopt_probe::adoption_reply;
+use super::opt::{get_options, set_options, OptScope, SocketOptions};
 use super::opcode::{decode as decode_opcode, Opcode};
 use super::sys::{
     bind_socket, close_fd, connect_socket, dgram_socket_fd, has_peer, hostname, local_port,
@@ -296,6 +297,12 @@ pub struct UdpInetDriver {
     /// Returns `BeamError::Io` when `getpeername(2)` fails for a reason other than "not
     /// connected" (i.e. when `fd` is not a usable socket), or when the kernel cannot report its
     /// `SO_TYPE`.
+    ///
+    /// The errno is the failing `getpeername(2)`/`getsockopt(2)` one and is **preserved** (never
+    /// rewritten into [`beam_common::BeamError::BadArg`]): unlike [`UdpInetDriver::adopt_prebound`],
+    /// this entry point has **no** control reply channel to answer through — the runtime calls it
+    /// for an `inet_async` `Accepted { fd }` hand-off ([`crate::InetAsyncResult::Accepted`]), whose
+    /// failure is the caller's to report — so the typed I/O error is the honest outcome.
     pub fn from_socket(fd: RawFd) -> Result<UdpInetDriver> {
         let state = if has_peer(fd)? {
             InetState::Connected
@@ -382,6 +389,14 @@ pub struct UdpInetDriver {
     /// probe fails for a reason other than "not connected", or when the poller rejects it. The
     /// descriptor is **not** closed on any of those paths, and the driver is left untouched when
     /// one of them fires.
+    ///
+    /// Every one of those failures carries the failing syscall's **errno** (`fcntl(2)`'s `EBADF`
+    /// for a number that is not open, `getpeername(2)`'s `ENOTSOCK` for a descriptor that is not a
+    /// socket, the poller's own errno), which is what the `INET_REQ_FDOPEN` arm renders as the C's
+    /// `ctl_error(sock_errno())` reply (`inet_ctl_fdopen`, `inet_drv.c:5253`/`:5260`) instead of
+    /// raising — see [`super::adopt_probe::adoption_reply`]. The single failure with **no** errno is
+    /// the poller's exhausted token space ([`beam_common::BeamError::SystemLimit`]); that one keeps
+    /// the typed error, because the C has no errno to name there either.
     fn adopt_prebound(
         &mut self,
         ctx: &mut DriverContext<'_>,
@@ -515,9 +530,11 @@ pub struct UdpInetDriver {
     /// The C parses the buffer it is handed, and so does this: `[address][anc_len:be32]
     /// [anc_data][data]`, optionally behind the `prim_inet` caller-reference prefix
     /// `[tag_len:be16][tag_bytes]`. The address is **always** parsed and must parse, even on a
+    /// even on a
     /// connected socket, which then ignores it — the C's own comment at `:15142`-`:15145` ("Even
     /// if it is connected, there is an address prefix here -- ignored for connected sockets").
-    /// [`decode_queued_command`] carries the wire forms and why the plain one is tried first.
+    /// [`decode_queued_command`] runs the grammar; the caller-reference prefix is already off the
+    /// buffer by then ([`UdpInetDriver::strip_command_prefix`], one strip per command).
     ///
     /// # Connected vs unconnected (the C's `INET_F_ACTIVE` split)
     ///
@@ -557,9 +574,12 @@ pub struct UdpInetDriver {
     /// # Errors
     ///
     /// [`beam_common::BeamError::BadArg`] for a port with no socket (`:15068`) or a command in
-    /// neither wire form, as above — the queued bytes stay queued, never silently dropped — and
-    /// the typed `unsupported` raise for ancillary data. `BeamError::Io` when a send fails
-    /// irrecoverably.
+    /// neither wire form; both leave the queue untouched, so nothing is silently dropped. The
+    /// queued route turns the second into the C's `inet_reply_error(EINVAL)`
+    /// ([`UdpInetDriver::write_command`], which is also why the socket-less arm is unreachable
+    /// from there): the C's `packet_inet_command` never reaches this grammar with `!IS_OPEN`.
+    /// The typed `unsupported` raise for ancillary data is not converted — it is a capability
+    /// gap, not the C's `return_einval`. `BeamError::Io` when a send fails irrecoverably.
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if ctx.output().is_empty() {
             return Ok(0);
@@ -949,7 +969,8 @@ pub struct UdpInetDriver {
     /// `BeamError::BadArg` for a truncated `{active, N}` record (never for a served option — a
     /// rejected `setsockopt(2)` is not propagated, mirroring the C's `propagate = 0`).
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_UDP);
+        set_options(&mut self.options, scope, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
@@ -963,7 +984,8 @@ pub struct UdpInetDriver {
     ///
     /// `BeamError::Io` when a served option's `getsockopt(2)` fails on a live socket.
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_UDP);
+        get_options(&self.options, scope, self.socket, arg)
     }
 
     /// The `INET_REQ_NAME` reply (`inet_drv.c:11329`).
@@ -1148,8 +1170,21 @@ pub struct UdpInetDriver {
                         }
                         // The operand's own type tag is what the C stores as `desc->stype`
                         // (`:5268`), so it is passed through rather than assumed to be a datagram.
-                        self.adopt_prebound(ctx, fd, u16::from(arg[1]))?;
-                        Ok(ctl_ok())
+                        //
+                        // An adoption failure is the C's **reply**, never a raise: the C's
+                        // `inet_ctl_fdopen` answers `ctl_error(sock_errno())` for every failure
+                        // inside it (`:5253`, `:5260`), so the errno the failing probe already
+                        // carries (`fcntl`/`getpeername`/the poller) becomes `[0] ++ errno_name`
+                        // ([`super::adopt_probe::adoption_reply`]). Only a failure with **no**
+                        // errno — an internal limit, never a descriptor verdict — keeps the typed
+                        // error.
+                        match self.adopt_prebound(ctx, fd, u16::from(arg[1])) {
+                            Ok(()) => Ok(ctl_ok()),
+                            Err(err) => match adoption_reply(&err) {
+                                Some(reply) => Ok(reply),
+                                None => Err(err),
+                            },
+                        }
                     }
                     Err(reply) => Ok(reply),
                 }
@@ -1431,53 +1466,35 @@ impl Drop for UdpInetDriver {
 /// (`packet_inet_command`, `inet_drv.c:15037`-`:15260`), returning the destination address and
 /// the payload that follows the ancillary-length word.
 ///
-/// The C strips the `prim_inet` caller-reference prefix first (`init_caller`, `:15055`-`:15065`)
-/// and then **always** parses `[address][anc_len:be32][anc_data][data]`
-/// (`:15139`-`:15230`). This crate's [`Driver`]/[`DriverContext`] seam carries no
-/// `driver_caller(port)`, so the prefix has to be recognised from the payload alone (see
-/// [`split_caller_ref`]), and the two wire forms are tried **plain first**:
+/// The C runs `init_caller` once (`:15055`-`:15065`) and then parses
+/// `[address][anc_len:be32][anc_data][data]` (`:15139`-`:15230`) — **once**, on the bytes the
+/// prefix strip left behind. That is exactly the split here: the strip is
+/// [`UdpInetDriver::strip_command_prefix`], which [`UdpInetDriver::write_command`] runs before it
+/// calls [`UdpInetDriver::write_pending`] (the only path to this decoder), so the buffer this
+/// function sees is address-led and the plain grammar is the *only* rule.
 ///
-/// 1. **plain form, tried first** — `[address][anc_len:be32][anc_data][data]`, i.e.
-///    [`split_datagram`] on the queue bytes directly;
-/// 2. **caller-reference form, only when rule 1 refuses** — [`split_caller_ref`], then
-///    [`split_datagram`] on the bytes after the prefix.
-///
-/// **Why the plain form can come first here.** Unlike [`UdpInetDriver::verb_send`]'s
-/// `port_control` convenience grammar, the queued form *is* the C's grammar, so there is no
-/// `[address][data]`-without-an-ancillary-length shape to protect: a plain command leads with an
-/// address tag (1, 3 or 4), while a caller-reference prefix leads with the high byte of its
-/// 16-bit tag length — `0` for every realistic `term_to_binary/1` tag (far below 256), never a
-/// valid address tag — so a prefixed command always fails rule 1 and is stripped by rule 2. The
-/// residual runs the other way and is the one [`split_caller_ref`] already documents: a prefixed
-/// command whose tag length is 256 or more begins with 1/3/4 and is taken as plain.
-///
-/// Rule 2 is only attempted for a **grammar** refusal. An `unsupported` outcome already matched
-/// the plain grammar (a parsable address plus an ancillary-length word) and *is* the command — the
-/// C's sendmsg arm — so retrying it as a prefixed command could only misroute bytes.
+/// No caller-reference rule is retried here. [`split_caller_ref`] belongs to
+/// [`UdpInetDriver::verb_send`] — the `erlang:port_control/3` convenience route, whose
+/// `[address][data]`/prefixed discrimination it performs — and re-testing the already-stripped
+/// bytes would be a second `init_caller` the C never runs (it would accept a contrived
+/// double-prefixed command the oracle refuses).
 ///
 /// # Errors
 ///
-/// [`beam_common::BeamError::BadArg`] for a command in neither form, or for the C's two
+/// [`beam_common::BeamError::BadArg`] for a command that is not the grammar, or for the C's two
 /// `return_einval` guards (`:15155`/`:15158`, which [`split_datagram`] reports as
 /// [`DatagramCommand::Einval`]); the typed `unsupported` raise for a non-zero ancillary length.
 fn decode_queued_command(front: &[u8]) -> Result<(InetAddr, &[u8])> {
-    match split_datagram(front) {
-        Ok(command) => as_datagram(command),
-        Err(BeamError::BadArg) => match split_caller_ref(front) {
-            Some(rest) => split_datagram(rest).and_then(as_datagram),
-            // Not in the prefixed form either: rule 1's own reason stands.
-            None => Err(error::badarg()),
-        },
-        Err(other) => Err(other),
-    }
+    as_datagram(split_datagram(front)?)
 }
 
 /// Folds [`DatagramCommand::Einval`] into the typed argument fault this path reports and yields
 /// the address/payload pair of a real send.
 ///
-/// `Einval` is the C's `return_einval` (`inet_drv.c:15155`/`:15158`), which the `port_control`
-/// route renders as a `[0]einval` reply and the queued route — having no reply channel — reports
-/// as [`beam_common::BeamError::BadArg`].
+/// `Einval` is the C's `return_einval` (`inet_drv.c:15155`/`:15158`): the `port_control` route
+/// renders it as a `[0]einval` control reply, and the queued route as the C's out-of-band
+/// `{inet_reply, Port, {error, einval}, Tag}` ([`UdpInetDriver::write_command`]) — the reason it
+/// travels up as a [`beam_common::BeamError::BadArg`] is that the decode itself is term-free.
 fn as_datagram(command: DatagramCommand<'_>) -> Result<(InetAddr, &[u8])> {
     match command {
         DatagramCommand::Send(address, payload) => Ok((address, payload)),

@@ -53,15 +53,18 @@
 
 use std::time::Instant;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 
 use super::super::op_queue::{
     async_ok_reply, deadline_for, drain_closed, parse_recv_operand, RecvOp,
 };
-use super::super::wire::{ctl_xerror, pack_address, split_caller_ref_parts};
+use super::super::wire::{
+    ctl_xerror, echoable_caller_tag, pack_address, split_command_prefix,
+};
 use super::{UdpInetDriver, DATAGRAM_CHUNK};
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply};
 use crate::driver::DriverContext;
+use crate::port_failure::DriverFailure;
 use crate::poller::Interest;
 use crate::port_task::ReadMessage;
 
@@ -270,56 +273,120 @@ impl UdpInetDriver {
     /// the command the socket accepted — which is what [`crate::Port`]'s write-accounting contract
     /// compares against the queue's shrinkage.
     ///
+    /// Every outcome the C answers out of band is staged here rather than raised:
+    /// `init_caller`'s `FALSE` latches `driver_failure_posix(EINVAL)`
+    /// ([`UdpInetDriver::fail_malformed_command`]), the `!IS_OPEN` arm and the operand grammar's
+    /// `return_einval` both answer `{inet_reply, Port, {error, einval}, Tag}`, and a written
+    /// command answers `ok`. The port survives all of them except the first, which the registry
+    /// reaps after the round.
+    ///
     /// # Errors
     ///
-    /// Whatever [`UdpInetDriver::write_pending`] reports (the socket-less refusal is unchanged:
-    /// nothing is stripped and the command's bytes stay queued), or the typed `unsupported` of a
-    /// context with no completion sink.
+    /// Only a genuine capability gap: the typed `unsupported` of a context with no completion
+    /// sink, of ancillary data (`sendmsg` cmsgs, `udp/udp_tests.rs`'s residual) — or whatever
+    /// [`UdpInetDriver::write_pending`] reports as an I/O failure.
     pub(super) fn write_command(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
-        let stripped = self.strip_caller_prefix(ctx);
-        let written = self.write_pending(ctx)?;
+        // A re-driven `OUTPUT` task with nothing queued is not a command: the C is only ever
+        // handed one (`packet_inet_command`'s `len`), and `init_caller` on an empty buffer is its
+        // `size < 2` FALSE — which would kill the port over a write that already finished.
+        if ctx.output().is_empty() {
+            return Ok(0);
+        }
+        // The C's `init_caller` runs first, before `!IS_OPEN` is looked at
+        // (`packet_inet_command`, `inet_drv.c:15054`-`:15068`), and its failure kills the port.
+        let Some(stripped) = self.strip_command_prefix(ctx) else {
+            return self.fail_malformed_command(ctx);
+        };
+        if self.socket.is_none() {
+            // The C's `!IS_OPEN` arm (`:15068`-`:15077`): the command is accepted (the port
+            // charged its bytes) but no destination exists, so `inet_reply_error(EINVAL)` answers
+            // the caller — a `{inet_reply, Port, {error,einval}, Tag}` staged only when a tag can
+            // be echoed.
+            let discarded = ctx.output().len();
+            ctx.output().consume(discarded);
+            self.caller_stripped = false;
+            if let Some(tag) = self.caller_ref.take() {
+                ctx.deliver_completion(CompletionEvent::InetReply {
+                    caller_ref: Some(tag),
+                    reply: InetReply::Error(InetReason::from_errno(libc::EINVAL)),
+                })?;
+            }
+            return Ok(stripped + discarded);
+        }
+        let written = match self.write_pending(ctx) {
+            Ok(written) => written,
+            // The C's `return_einval` (`:15205`/`:15212`): a command whose operand is not the
+            // `[address][anc_len:be32][anc][data]` grammar, or one whose ancillary-length word
+            // runs past it, is answered `inet_reply_error(EINVAL)` — the port stays **alive** and
+            // the command is consumed (the emulator frees what a callback accepted).
+            Err(BeamError::BadArg) => {
+                let discarded = ctx.output().len();
+                ctx.output().consume(discarded);
+                self.caller_stripped = false;
+                self.send_error = None;
+                if let Some(tag) = self.caller_ref.take() {
+                    ctx.deliver_completion(CompletionEvent::InetReply {
+                        caller_ref: Some(tag),
+                        reply: InetReply::Error(InetReason::from_errno(libc::EINVAL)),
+                    })?;
+                }
+                return Ok(stripped + discarded);
+            }
+            Err(err) => return Err(err),
+        };
         self.settle_command(ctx)?;
         Ok(stripped + written)
     }
 
+    /// The C's `driver_failure_posix(port, EINVAL)` for a command `init_caller` rejects
+    /// (`inet_drv.c:15063`): the whole command is **accounted for**, nothing is sent, and the port
+    /// is closed with the `einval` reason. The latch is a request — the registry reaps the port
+    /// after the round ([`crate::PortRegistry::reap_failures`]) — so this callback returns
+    /// normally and `erlang:port_command/2`'s caller sees the oracle's `true`.
+    fn fail_malformed_command(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        self.caller_ref = None;
+        self.caller_stripped = false;
+        self.send_error = None;
+        let discarded = ctx.output().len();
+        ctx.output().consume(discarded);
+        ctx.signal_failure(DriverFailure::posix(libc::EINVAL))?;
+        Ok(discarded)
+    }
+
     /// Strips **one** leading caller tag from the head of the output queue, returning how many
-    /// bytes it consumed (`0` when there was nothing to strip).
+    /// bytes it consumed (`0` when this command's prefix is already off).
     ///
     /// The C's `init_caller`/`init_caller_iov` (`inet_drv.c:1820`-`:1890`): the wire form is
-    /// `[n:be16][tag][command]`, the tag being `term_to_binary(Mref, [local])`. The tag is kept so
-    /// the later `{inet_reply, S, Reply, Tag}` can echo it **verbatim** — this crate never decodes
-    /// the ETF image — and the command is left in the queue to be written.
+    /// `[n:be16][tag][command]`, and the rule is [`split_command_prefix`]'s **size-only** one — the
+    /// tag's content is never inspected. The tag is kept so the later
+    /// `{inet_reply, S, Reply, Tag}` can echo it **verbatim** — this crate never decodes the ETF
+    /// image — and the command is left in the queue to be written.
     ///
     /// It runs **once per command**, not once per write attempt, so a short write's remainder is
     /// never re-prefixed; [`UdpInetDriver::caller_stripped`] records that, and
     /// [`UdpInetDriver::settle_command`] clears it when the command is done with.
     ///
-    /// A **zero-length** tag (`[0,0]`) is a well-formed prefix the C consumes too
-    /// ([`split_caller_ref_parts`]): the two length bytes come off the queue and **no**
-    /// [`InetReply`] is staged for it, because the C's `inet_reply_finish` has no tag to append.
-    /// A payload carrying no prefix at all is written verbatim and likewise produces no
-    /// completion, and a socket-less port is not inspected at all, so its refusal keeps every byte
-    /// queued.
-    fn strip_caller_prefix(&mut self, ctx: &mut DriverContext<'_>) -> usize {
-        if self.caller_stripped || self.socket.is_none() {
-            return 0;
+    /// A **zero-length** tag (`[0,0]`) is a well-formed prefix the C consumes too: the two length
+    /// bytes come off the queue and **no** [`InetReply`] is staged for it, because the C's
+    /// `inet_reply_finish` cannot decode an empty EXT. `None` is the C's `FALSE` — too short for a
+    /// length word, or a length that does not fit — which kills the port.
+    fn strip_command_prefix(&mut self, ctx: &mut DriverContext<'_>) -> Option<usize> {
+        if self.caller_stripped {
+            return Some(0);
         }
         self.caller_stripped = true;
         let (prefix, tag) = {
             let front = ctx.output().front();
-            match split_caller_ref_parts(front) {
+            match split_command_prefix(front) {
                 Some((tag, rest)) => (front.len() - rest.len(), tag.to_vec()),
-                None => return 0,
+                None => return None,
             }
         };
-        if prefix == 0 {
-            return 0;
+        self.caller_ref = echoable_caller_tag(&tag);
+        if prefix > 0 {
+            ctx.output().consume(prefix);
         }
-        // An empty tag means "no caller": the C stages nothing for it, so the reply state stays
-        // `None` while the consumed prefix is still counted.
-        self.caller_ref = if tag.is_empty() { None } else { Some(tag) };
-        ctx.output().consume(prefix);
-        prefix
+        Some(prefix)
     }
 
     /// Finishes the command whose bytes have just been written: once nothing of it is left queued,

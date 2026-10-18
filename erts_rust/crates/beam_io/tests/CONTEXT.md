@@ -10,12 +10,19 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## API Surface (node-local)
 - `support/mod.rs` — toolchain discovery and the loud-skip policy: `erl_include_dir()`,
-  `cc_available()`, `skip()`, `probe_driver_name()` (a `libc`-only `dlopen` + `driver_init` read,
-  used where a `beam_abi` dependency is not available to the test).
-- `cdriver/mod.rs` — the shared C-driver helpers: `compile_fixture`/`fixture_so`/`load_driver`/
-  `open_port`/`round_data`/`await_log_line`/`logged_port_command`/`LoggedPort` and the fixture
-  builders (`variant_fixture_*`, `no_process_exit_variant_fixture_*`, `vector_fixture_so`,
-  `both_fixture_so`).
+  `cc_available()`, `compile_so()`, `scratch_dir()`, `skip()`, `probe_driver_name()` (a
+  `libc`-only `dlopen` + `driver_init` read, used where a `beam_abi` dependency is not available
+  to the test).
+- `cdriver/mod.rs` — the shared C-driver helpers: `load_driver`/`load_named_driver`/`open_port`/
+  `open_named_port`/`round_data`/`data_of`/`reads_of`/`closed_of`/`await_data`/`drain_data`/
+  `await_trailing_data`/`ASYNC_JOB_FRAMES`/`is_async_job_frame`/`drive_until`/
+  `await_log_line`/`logged_port_command`/`LoggedPort` and the fixture builders
+  (`fixture_so`, `variant_fixture_*`, `no_process_exit_variant_fixture_*`, `vector_fixture_so`,
+  `both_fixture_so`, `shape_fixture_*`).
+  `round_data` asserts a round reported **exactly one** `Data` (the no-coalescing rule for a
+  call site that makes one `driver_output*` call); `drain_data` returns every frame the rounds
+  report until a round reports none, and `await_trailing_data` collects frames until `expected`
+  is the **newest** one — the shape a `driver_async` site needs (see *Known Issues*).
 - `fixtures/*.c` — the C driver objects. `host_driver.c` is the base; the others `#include` it
   after defining a `HOST_DRIVER_*_SLOT` override macro, so one file carries the whole vocabulary.
 
@@ -43,11 +50,24 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
   the C's `outputv`-over-`output` preference (`../../../../erts/emulator/beam/io.c:1782`) is about.
   `host_outputv` logs `outputv`, `host_output` logs `output`, `host_ready_output` emits `"W"` — so
   which callback ran, and in which order, is observable from the log + the port data.
+- **`output_shape_driver.c`** (`driver_name = "output_shape_driver"`) — the **scripted-opcode**
+  fixture: its `output` callback reads the *first command byte* as an opcode and makes the
+  `driver_output*`/`driver_failure*` call that opcode names (the whole 0…15 table is in the file
+  header), so one `port_command` drives exactly one scripted C call site and the resulting
+  `{Port,{data,_}}` / port-exit pair is the observable. It logs `output op=<n>` plus one
+  `call=<name> rc=<n>` line per C call, so a *refused* call (`rc=-1`) is distinguishable from a
+  delivered one. Rows 0–4 are the read **shapes** (`""`/`NULL`/header-only/header+empty
+  body/header+body), 5 is two calls in one callback, 6–9 the four `driver_failure*` reasons,
+  10–11 the two `driver_exit` codes, 12–14 the ordering/refusal rows, 15 a single six-byte read
+  (the `{line,4}` over-limit row). Its escript probe is generated per run by
+  `write_oracle_escript()` and needs `escript` as well as `erl`.
 
 ## Constraints
 - **Skip loudly, never fail on a missing toolchain.** A suite needing `cc`/`erl_driver.h`/`erl`
   prints a `SKIP:` banner and returns; a *load* failure is never a skip (it means the `driver_*`
-  symbols are missing from the test binary's dynamic symbol table).
+  symbols are missing from the test binary's dynamic symbol table). The `shape_fixture_so()` builder
+  follows the same rule (`SKIP:` without `cc`/`erl_driver.h`), and the one escript-based oracle case
+  additionally needs `escript` on `PATH`.
 - **A C-driver test binary must force the `driver_*` symbols into its own `.dynsym`**
   (`force_driver_symbols_link()` / a `driver_api_table()` reference) *and* rely on `build.rs`'s
   `-Wl,--export-dynamic`; either one alone makes `dlopen(RTLD_NOW)` fail with
@@ -62,8 +82,8 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 23 suites, **211
-passing / 0 failing**; the whole `-p beam_io` run is **876** (662 lib + 211 integration + 3
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 24 suites, **222
+passing / 0 failing**; the whole `-p beam_io` run is **967** (742 lib + 222 integration + 3
 doctests, 2 doctests `ignore`d). Per file:
 
 | Suite | Tests | Suite | Tests |
@@ -78,8 +98,8 @@ doctests, 2 doctests `ignore`d). Per file:
 | `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 8 |
 | `abi_busy.rs` | 2 | `inet.rs` | 8 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
-| `port_task.rs` | 5 | `udp_inet.rs` | 5 |
-| `port.rs` | 4 | | |
+| `abi_failure.rs` | 8 | `udp_inet.rs` | 5 |
+| `port_task.rs` | 5 | `port.rs` | 4 |
 
 Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channel** end-to-end
 (`PortRegistry::take_completions` after every round, the recipe `beam_rt` follows):
@@ -107,7 +127,28 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   (`the_covered_control_replies_agree_with_the_erl_oracle`) is the open/bind/setopts/getopts/close
   gate.
 
+**`abi_failure.rs` (8)** is the one suite that pins the **`driver_output*` shapes and the
+driver-failure channel** over the scripted-opcode fixture (`output_shape_driver.c`) rather than
+`host_driver.c`: one port per row (the failure rows close their own port, so a shared port would
+answer `badarg` on the next command), one `port_command` = one scripted C call site, and the round
+is inspected through `reads_of`/`closed_of` plus `PortRegistry::take_failures`. It asserts the
+split (`body: None` ≠ `Some(vec![])`, two calls in one callback = two messages), the `{line,4}`
+column, every `FailureReason` and its `{'EXIT',·,Reason}`-equivalent, `driver_exit`'s
+`signals_owner == false`, the data-before-failure ordering, a delivery after a failure being
+refused with the bytes reaching nobody, and the reaped port's number being released.
+`the_rendered_rows_match_the_erl_oracle` re-derives the whole 16-row table live from the system
+runtime and compares it with the crate's own rendering, so the table in the test's header cannot
+rot.
+
 ## Known Issues / Notes for Agents
+- **A `driver_async` job's frames are an asynchronous delivery, so their *count* at a call site is
+  not fixed.** The fixture's worker thread `driver_output`s `"A"` and its `ready_async`
+  `driver_output`s `"H"`; a worker-thread delivery only lands when it coincides with a driver
+  callback's installed port context, so how many of the two are owed after a drive point varies run
+  to run (both is legitimate — the C delivers from any thread, `erts/emulator/beam/io.c:6387-6446`).
+  Assert the **sequence** (`drain_data`/`await_trailing_data` + `is_async_job_frame`), never the
+  count; `round_data`'s "exactly one" assert belongs to call sites that make one `driver_output*`
+  call themselves.
 - `driver_peekq`/`driver_peekqv` report `vlen == 1` on the Rust host (`AbiHost` publishes the whole
   contiguous queue as one iovec entry) where the oracle counts one entry per `driver_enq`.
 - `AbiHost::pushq` flattens the queue (`front()` + clear + push), so byte order after a
@@ -134,6 +175,11 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   token and verbs 25/26)
 - `abi_async.rs`, `abi_vector.rs`, `abi_lifecycle.rs`, `abi_start_failure.rs` → the `driver_async`
   completion arms, the `outputv`-only entry, the port-exit adapter, a failing `start`
+- `abi_failure.rs` → the `driver_output*` shapes + the driver-failure channel over
+  `fixtures/output_shape_driver.c` (one `ReadMessage` per call, the `body: None`/`Some([])`
+  distinction, every `FailureReason`, `driver_exit`'s no-signal shape, the
+  data-before-close ordering, the post-failure refusal, the id release, and the live 16-row
+  oracle table)
 - `driver_table.rs`, `driver_registry_slots.rs` → the process-global driver registry
 - `poller.rs`, `port.rs`, `port_task.rs`, `driver_seams.rs` → the reactor, the port, port-task
   scheduling, the driver-declared timer/port-exit seams
@@ -150,6 +196,10 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   ladder, the `Data` completion with the packed source address as the read's header, the
   `{error, closed}` teardown) against the real datagram driver
 - `signal.rs`, `cpu_time.rs`, `ddll.rs` → the OS-signal facility, the CPU-time facility, `dlopen`
-- `fixture_builds.rs` → builds + loads every `fixtures/*.c` (a broken fixture is a hard failure)
+- `fixture_builds.rs` → builds + loads the `host_driver`-family fixtures (the base, the two
+  `ready_async`/`process_exit` variants, the `vector` and `both` write-side shapes) plus the
+  negative cases (a `cc` failure is reported, a missing object is an error, the OTP header is
+  locatable); a broken fixture is a hard failure. `output_shape_driver.c` is built by its own suite
+  (`abi_failure.rs`)
 - `support/mod.rs`, `cdriver/mod.rs` → the shared toolchain + fixture helpers
 - `fixtures/` → the C driver objects (see above)
