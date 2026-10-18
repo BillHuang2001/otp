@@ -296,6 +296,12 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `erlang:port_command/2` on that same connected port answers `{inet_reply,Port,ok,Tag}` on **both**
   sides, so the bytes and the tagged reply shape are in place and the blocked wait is in the
   stdlib send path above it.
+- **A datagram injected from outside the VM is never delivered** (owner `beam_rt` / `beam_io`): a
+  `gen_udp` socket opened `[binary,{active,true}]` on a fixed port answers `timeout` to a 3 s receive
+  where the oracle delivers `{udp, S, {127,0,0,1}, FromPort, <<"abc">>}` (measured with the datagram
+  sent from a separate OS process). The **in-VM** loopback pair agrees — `gen_udp:send/4` to the
+  socket's own port then `gen_udp:recv/3` returns `{ok, <<"hi">>}` on both sides — so the write path
+  and the `inet_reply` bridge are in place and the missing half is the external read path.
 - The `{fd,…}` port grammar is disjoint: `open_port({fd,1,1},[out])` opens under the oracle and is
   `error:badarg` under `beam_rt`, `open_port({fd,1},[out])` the reverse (measured:
   `{port,{exit,badarg}}` on the oracle against `{{exit,badarg},port}` on the runtime). `eof` is never
@@ -406,6 +412,13 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   unpinned (the allowed half and the ungated `ets:info/1,2` surface are pinned).
   Owner: `beam_bifs` / `beam_ets`.
 - `erlang:module_loaded/1`: `module_loaded(lists)` is `true` vs `false`.
+- `erlang:delete_module/1` has no provider in the Rust runtime (the BIF seam answers the typed
+  `unsupported: erlang:delete_module/1`, so any invoking expression exits `3`), and the oracle's own
+  relation is no `true`→`false` transition: after `erlang:delete_module(lists)` both
+  `erlang:module_loaded(lists)` and `erlang:check_old_code(lists)` still answer `true` (the pair
+  before/after is `{true, true}`) because the C demotes curr→old on a staged code index. A runtime
+  without an old-code slot cannot reproduce that, so the shape is unpinned and no case probes it.
+  Owner: `beam_bifs` / `beam_rt`.
 - `code:is_loaded/1` answers out of the code server's **load state** in both runtimes — the
   `{file, Path}` pair for a loaded module, the atom `false` for one that exists on the code path but
   was never loaded (`code:is_loaded(dets)` and `code:is_loaded(lists)` are both `false` in the rust
