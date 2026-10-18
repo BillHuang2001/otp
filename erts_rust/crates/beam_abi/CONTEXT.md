@@ -369,7 +369,14 @@ Every C enum-with-values type (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMa
   `Session` therefore owns the host (boxed), the loaded library and the term.
 - In-module `#[cfg(test)]` unit tests: `src/nif/enif/tests.rs`, `src/nif/enif/process_tests.rs`,
   `src/nif/enif/mapiter_tests.rs`, `src/nif/enif/resources_tests.rs`, `src/driver/drv/port_tests.rs`,
-  `src/sync/tests.rs`.
+  `src/sync/tests.rs`. `port_tests.rs` carries both halves of the `output2` contract: a `SplitHost`
+  (overrides `output2`, records `(header, body)`; its `output` records a "must stay empty" list) pins
+  the split per entry point — `driver_output2` (three body shapes + a refused null-with-length + two
+  replies staying two records), `driver_output` (null vs empty buffer), `driver_output_binary`
+  (`H`+`cde`, zero-length range, over-read refusal), `driver_outputv` (last vector as tail, `skip`
+  0/5/8, a trailing zero-length vector ⇒ `Some(&[])`) — while `TestDriverHost` (no `output2`
+  override, an `output` call counter) pins the **default** as byte-identical: exactly one `output`
+  call carrying header-then-body for every shape.
 - Gate: `../scripts/cargo.sh test -p beam_abi` and `../scripts/cargo.sh build --workspace` GREEN
   (warning-free); behavioural cross-checking against real ERTS is `../../tools/differential`'s job
   (sibling — read-only, escalate writes to `..`).
