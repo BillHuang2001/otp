@@ -261,23 +261,25 @@ impl Machine {
         }
     }
 
-    /// The number of interpreted instructions charged in the current (or most
-    /// recently finished) [`Machine::drive`] slice.
+    /// The number of charges the current (or most recently finished) slice took, in that
+    /// tier's unit.
     ///
-    /// One `drive` call — a run, or a resume of a suspended process — is one
-    /// scheduling slice, and the counter is zeroed at its start, so this is that
-    /// slice's work in the unit the runtime prices pre-emption in. It is the
-    /// **engine-side twin** of [`ExecutionContext::reduce`]: every charge bumps both,
-    /// so the count always includes the last charge the hook saw — the one a host
-    /// pre-empted on included — and a raising instruction (the charge precedes the
-    /// body). The hook lets a host act *during* the slice; this accessor lets it
-    /// observe *after* the slice returns (`RunOutcome::Wait` included) without
-    /// keeping its own tally.
+    /// One `drive` call — a run, or a resume of a suspended process — is one scheduling
+    /// slice, and the counter is zeroed at its start by **both** drivers (this one and the
+    /// native baseline tier's driver loop), so this is that slice's work in the unit the
+    /// runtime prices pre-emption in. It is the **engine-side twin** of
+    /// [`ExecutionContext::reduce`]: every charge bumps both, so the count always includes
+    /// the last charge the hook saw — the one a host pre-empted on included — and a raising
+    /// unit (the charge precedes the body). The hook lets a host act *during* the slice;
+    /// this accessor lets it observe *after* the slice returns (`RunOutcome::Wait`
+    /// included) without keeping its own tally.
     ///
-    /// Honest by construction: only the interpreter's dispatch loop charges, so
-    /// under the baseline JIT tier — where a natively executed block bypasses
-    /// `step_instruction` — the count is a **lower bound** (each deopt still
-    /// charges). Never fabricated, never negative.
+    /// Honest by construction: the unit is the **charging tier's**. This dispatch loop
+    /// charges one per interpreted instruction; the native baseline tier's driver charges
+    /// one per **driver-loop iteration** — one block entry, or the per-instruction step it
+    /// takes for an address no compiled block covers — so a slice that ran natively reports
+    /// block entries (a lower bound in instructions, and a natively linked chain pays once
+    /// per round-trip). Never fabricated, never negative.
     pub fn reductions(&self) -> u64 {
         self.reductions
     }

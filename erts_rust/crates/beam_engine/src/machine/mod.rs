@@ -471,9 +471,10 @@ pub struct Machine {
     /// derived [`Machine::current_function`]/[`Machine::current_location`]/
     /// [`Machine::current_stacktrace`]). Every **blocking** instruction
     /// (`wait`/`wait_timeout`) is interpreted rather than inlined by a native
-    /// tier, so the recorded address is exact at every suspension point; a
-    /// natively-executed JIT block does not update it, so mid-block it is the
-    /// *last interpreted* instruction (documented, never invented).
+    /// tier, so the recorded address is exact at every suspension point; on the
+    /// native baseline tier the driver publishes each **block entry** before it is
+    /// entered, so mid-block the recorded address is that block's entry (the address a
+    /// pre-empted machine resumes at), never a fabricated mid-block one.
     pub(crate) current_code: Option<(u32, u32)>,
     /// The `(function index, arity)` this run was **entered** at — the engine's
     /// analogue of ERTS's `$initial_call`.
@@ -483,15 +484,15 @@ pub struct Machine {
     /// which clears it) and read back by [`Machine::initial_call`]. `None` before
     /// any run.
     pub(crate) entry_call: Option<(u32, u32)>,
-    /// The number of **interpreted instructions charged in the current scheduling
-    /// slice** — the engine half of the runtime's *reduction* accounting.
+    /// The number of **charges the current scheduling slice took** — the engine half of
+    /// the runtime's *reduction* accounting, in the charging tier's own unit.
     ///
-    /// Zeroed at every [`Machine::drive`](crate::machine::Machine) entry (one `drive`
-    /// call is one run or one resume, i.e. one slice) and incremented once per
-    /// instruction the driver prices — i.e. **before** the instruction's body runs —
-    /// so [`Machine::reductions`](crate::machine::Machine) read when the slice ends is
-    /// that slice's instruction count, the raising instruction and the charge a host
-    /// pre-empted on included.
+    /// Zeroed at every slice entry — both drivers ([`Machine::drive`](crate::machine::Machine)
+    /// and the native baseline tier's driver loop) do it, since one `drive` call is one
+    /// run or one resume, i.e. one slice — and incremented in the same step as the host
+    /// hook, **before** the thing being priced runs, so
+    /// [`Machine::reductions`](crate::machine::Machine) read when the slice ends is that
+    /// slice's count with the raising unit and the charge a host pre-empted on included.
     ///
     /// The engine's other charging point is
     /// [`ensure_heap`](crate::ExecutionContext::ensure_heap) (reached by
@@ -501,10 +502,16 @@ pub struct Machine {
     /// [`reduce`](crate::ExecutionContext::reduce) and may pre-empt there; it never
     /// has to poll this field mid-run.
     ///
-    /// Only the **interpreter's** dispatch loop
-    /// ([`Machine::drive`](crate::machine::Machine)) charges: a natively executed JIT
-    /// block bypasses `step_instruction`, so this is a lower bound under the baseline
-    /// tier (documented, never a fabricated count).
+    /// Both tiers' drivers charge, each in its own unit. The **interpreter's** dispatch
+    /// loop ([`Machine::drive`](crate::machine::Machine)) charges once per interpreted
+    /// instruction; the **native baseline tier's** driver loop charges once per
+    /// driver-loop iteration — one block entry, or the per-instruction interpreter step
+    /// it takes for an address no compiled block covers — *before* the block is entered,
+    /// so a refusing charge parks the machine at that block entry and the resume replays
+    /// no prefix of it. A natively **linked** chain (a tail-call loop) therefore pays once
+    /// per driver round-trip rather than per iteration: the count is exact in each tier's
+    /// unit, a lower bound in *instructions* under the native tier, and never a fabricated
+    /// number. The hook always sees the same charge (`tests/jit_reductions.rs`).
     pub(crate) reductions: u64,
 }
 

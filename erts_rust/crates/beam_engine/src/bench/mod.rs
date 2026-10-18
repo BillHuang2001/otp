@@ -165,9 +165,10 @@ fn foreign_bstr_to_lower_decomposition() {
         EXPECTED.len()
     );
     println!("beam = {}", beam.display());
-    println!("note = instr_per_call is the INTERPRETER's reduce-hook count; the native baseline");
-    println!("note = tier makes no reduce call at all, so the same figure is reported for both");
-    println!("note = tiers (it is a property of the code, not of the tier).");
+    println!("note = instr_per_call is the INTERPRETER's reduce-hook count (one charge per");
+    println!("note = interpreted instruction); the native tier offers the same hook once per");
+    println!("note = driver-loop iteration (a block entry), so the instruction figure -- a");
+    println!("note = property of the code -- is reported for both tiers.");
     println!("note = every *_per_call count is deterministic (a host-side tally); min/median");
     println!("note = ns_per_call are wall clock on a shared host -- compare ratios, not absolutes.");
 
