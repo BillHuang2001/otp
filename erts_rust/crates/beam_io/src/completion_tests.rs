@@ -580,6 +580,30 @@ fn a_reason_renders_as_the_error_atom_it_must_become() {
     // An errno the crate's table does not name keeps the C's `errno_<N>` spelling rather than
     // being dropped: 4711 has no POSIX name at all.
     assert_eq!(InetReason::from_errno(4711).atom_name(), "errno_4711");
+    // Both halves of the crate's errno set — the general POSIX/file codes and the socket ones —
+    // render through the **one** table ([`crate::error::errno_name`]), so this accessor cannot
+    // drift from the inet driver's `ctl_error` payloads. (`EPERM` is the case that used to slip
+    // through a socket-only copy as `errno_1`.)
+    for errno in [
+        libc::EPERM,
+        libc::EBADF,
+        libc::EAGAIN,
+        libc::ECONNRESET,
+        libc::ENOTCONN,
+        libc::ENOTSOCK,
+        4711,
+    ] {
+        assert_eq!(
+            InetReason::from_errno(errno).atom_name(),
+            crate::error::errno_name(errno),
+            "an errno reason is spelled by the crate's single errno table ({errno})"
+        );
+    }
+    assert_eq!(InetReason::from_errno(libc::EPERM).atom_name(), "eperm");
+    assert_eq!(
+        InetReason::from_errno(libc::ECONNRESET).atom_name(),
+        "econnreset"
+    );
 }
 
 /// The four `{inet_async, …}` results are distinct and carry their payloads.

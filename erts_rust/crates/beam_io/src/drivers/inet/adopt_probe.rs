@@ -67,7 +67,8 @@ pub(super) fn adoption_errno(err: &BeamError) -> Option<i32> {
 /// errno, `None` when it does not (so the caller keeps the typed error).
 ///
 /// `Some(reply)` is exactly `ctl_error(sock_errno())`: the one-byte `[INET_REP_ERROR]` tag
-/// followed by the lowercase errno name (`wire::errno_name`, the C's `erl_errno_id`), with its
+/// followed by the lowercase errno name (`wire::errno_name`, a forwarder to the crate's **single**
+/// errno table [`crate::error::errno_name`] / `ERRNO_NAMES`, i.e. the C's `erl_errno_id`), with its
 /// `errno_<N>` fallback for a code the table does not name. Measured against the system
 /// `tcp_inet`/`udp_inet` driver in this floor's own process (a descriptor this process owns can
 /// never be named to a second process): a closed descriptor is `[0]"ebadf"`, a non-socket
@@ -97,11 +98,14 @@ mod tests {
         let err = BeamError::Io(std::io::Error::from_raw_os_error(libc::ENOTSOCK));
         assert_eq!(adoption_reply(&err), Some(ctl_xerror("enotsock")));
 
-        // `wire::errno_name` is this floor's table of the codes a socket can raise, and `EPERM`
-        // is not one of them; the C's `errno_<N>` fallback (`ERTS_UNKNOWN_ERRNO_FORMAT`) still
-        // **names** it, which is what matters here — the reply never collapses into `einval`.
+        // `EPERM` is named by the crate's **one** errno table (`src/error.rs`'s `ERRNO_NAMES`,
+        // which `wire::errno_name` is a forwarder for), so the reply spells `eperm` — the same
+        // rendering the C's `erl_errno_id` gives it. The `errno_<N>` fallback for a code the table
+        // does *not* name is pinned by its own test below; what matters here is that the reply
+        // never collapses into `einval` (or into a raise).
         let err = BeamError::Io(std::io::Error::from_raw_os_error(libc::EPERM));
-        assert_eq!(adoption_reply(&err), Some(ctl_xerror("errno_1")));
+        assert_eq!(errno_name(libc::EPERM), "eperm");
+        assert_eq!(adoption_reply(&err), Some(ctl_xerror("eperm")));
     }
 
     #[test]

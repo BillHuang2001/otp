@@ -558,11 +558,16 @@ impl Port {
             }));
     }
 
-    /// Whether this port is holding input bytes it owes its owner.
+    /// Whether this port is holding input bytes it owes its owner — the **test-only** observation
+    /// helper.
     ///
-    /// This covers both halves of the port's input state — the completed read messages and the
-    /// open frame's accumulator — and is what decides whether a [`PortNotification::Data`] (or
-    /// a line frame) is owed (see [`Port::take_input_notifications`]).
+    /// It covers both halves of the port's input state: the completed read messages and the open
+    /// frame's accumulator. Nothing in the harvest path may gate on it: the report condition is the
+    /// completed-read queue alone (`Port::take_input_notifications`), because a read carrying
+    /// **zero** bytes is still owed as a `{Port, {data, []}}` (see the comment there). Keeping the
+    /// helper test-only is what stops that gate from being reintroduced — it exists so the suite can
+    /// assert "nothing is owed" as one predicate over both halves.
+    #[cfg(test)]
     pub(crate) fn has_input(&self) -> bool {
         !self.pending_reads.is_empty() || !self.input.is_empty()
     }

@@ -21,9 +21,16 @@
 //! Descriptor-close facility — a safe `close(2)` floor plus the [`OwnedFd`] RAII wrapper.
 //!
 //! A descriptor the *runtime* decides not to adopt has to be released, and `beam_rt` denies
-//! `unsafe_code`, so the raw syscall cannot live there. This module is the crate's one
-//! `close(2)` call site behind a safe API — the same role [`crate::fs_access`] plays for
-//! `access(2)`/`geteuid(2)` and [`crate::cpu_time`] for `getrusage(2)`.
+//! `unsafe_code`, so the raw syscall cannot live there. This module is the crate's **safe, public**
+//! close primitive — the same role [`crate::fs_access`] plays for `access(2)`/`geteuid(2)` and
+//! [`crate::cpu_time`] for `getrusage(2)`.
+//!
+//! It is deliberately *not* the crate's only `close(2)`: the drivers close the descriptors **they**
+//! own in their own modules (`drivers/fd.rs`, `drivers/efile.rs`, `drivers/spawn.rs`,
+//! `drivers/inet/sys.rs`, `poller.rs`, `signal.rs`), exactly as the C drivers close their own
+//! descriptors. What this module owns is the *hand-off* case — a descriptor arriving from outside a
+//! driver ([`InetAsyncResult::Accepted`]) that the runtime must either adopt or release, with no
+//! `unsafe` of its own.
 //!
 //! # Why the runtime needs it
 //!
@@ -36,6 +43,14 @@
 //! runtime just to reach `close(2)`.
 //!
 //! [`InetAsyncResult::Accepted`]: crate::completion::InetAsyncResult::Accepted
+//!
+//! # See also
+//!
+//! `drivers/inet/sys.rs` has a **private** helper of the same name (`fn close_fd`, used for the
+//! socket descriptors that driver owns — `close(2)` plus the `EBADF`-tolerant error mapping the
+//! driver's teardown needs). The two are intentionally distinct: that one is an internal detail of
+//! the inet driver, this one is the crate's public seam. Do not confuse them, and do not call the
+//! private one from outside `drivers::inet`.
 //!
 //! # Two ways to use it
 //!
@@ -68,7 +83,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use beam_common::{BeamError, Result};
 
-/// Close `fd` — the crate's one `close(2)` call site, errno-preserving.
+/// Close `fd` — the crate's **safe, public** `close(2)` primitive, errno-preserving.
+///
+/// This is the form a caller outside the drivers uses (the runtime, for a descriptor it owns or
+/// decided not to adopt); a driver closes the descriptors it owns inside its own module (see the
+/// module docs, and `drivers/inet/sys.rs`'s private same-named helper).
 ///
 /// The descriptor is released whatever this returns (a failed `close(2)` still drops the
 /// process's reference to the file description on every unix this crate targets), so a caller
