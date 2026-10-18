@@ -287,49 +287,12 @@ pub(super) fn getservbyport_reply(arg: &[u8]) -> Vec<u8> {
 /// The lowercase name the oracle reports for `errno` (`erl_errno_id`/`errno_str`,
 /// `inet_drv.c:2249`).
 ///
-/// The C asks the libc for the name (`strerrorname_np`/`strerror`) and lowercases it; this
-/// floor keeps a table of the codes a TCP socket can actually raise and renders anything else
-/// as `errno_<N>`, which is exactly the C's fallback format
-/// (`ERTS_UNKNOWN_ERRNO_FORMAT`).
-pub(super) fn errno_name(errno: i32) -> String {
-    let known = match errno {
-        libc::EACCES => Some("eacces"),
-        libc::EADDRINUSE => Some("eaddrinuse"),
-        libc::EADDRNOTAVAIL => Some("eaddrnotavail"),
-        libc::EAFNOSUPPORT => Some("eafnosupport"),
-        libc::EAGAIN => Some("eagain"),
-        libc::EALREADY => Some("ealready"),
-        libc::EBADF => Some("ebadf"),
-        libc::ECONNABORTED => Some("econnaborted"),
-        libc::ECONNREFUSED => Some("econnrefused"),
-        libc::ECONNRESET => Some("econnreset"),
-        libc::EDESTADDRREQ => Some("edestaddrreq"),
-        libc::EHOSTUNREACH => Some("ehostunreach"),
-        libc::EINPROGRESS => Some("einprogress"),
-        libc::EINTR => Some("eintr"),
-        libc::EINVAL => Some("einval"),
-        libc::EIO => Some("eio"),
-        libc::EISCONN => Some("eisconn"),
-        libc::EMSGSIZE => Some("emsgsize"),
-        libc::ENETDOWN => Some("enetdown"),
-        libc::ENETUNREACH => Some("enetunreach"),
-        libc::ENOBUFS => Some("enobufs"),
-        libc::ENOMEM => Some("enomem"),
-        libc::ENOPROTOOPT => Some("enoprotoopt"),
-        libc::ENOTCONN => Some("enotconn"),
-        libc::ENOTSOCK => Some("enotsock"),
-        libc::EOPNOTSUPP => Some("eopnotsupp"),
-        libc::EPIPE => Some("epipe"),
-        libc::EPROTONOSUPPORT => Some("eprotonosupport"),
-        libc::EPROTOTYPE => Some("eprototype"),
-        libc::ETIMEDOUT => Some("etimedout"),
-        _ => None,
-    };
-    match known {
-        Some(name) => name.to_string(),
-        None => format!("errno_{errno}"),
-    }
-}
+/// A **forwarder**: the errno→name mapping lives in one place, [`crate::error::errno_name`]
+/// (the union of the socket codes and the `fork`/`exec`/`pipe`/`access` codes this crate
+/// renders), so this driver and the reply paths above it can never disagree. The rendering is
+/// the C's exactly — the lowercase of the POSIX macro name, and the C's own
+/// `ERTS_UNKNOWN_ERRNO_FORMAT` (`"errno_%d"`) fallback for a code with no name.
+pub(super) use crate::error::errno_name;
 
 // ---------------------------------------------------------------------------
 // The reply shapes of the shared `inet_ctl` arms

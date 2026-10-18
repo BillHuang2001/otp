@@ -87,6 +87,12 @@
 //! [`process_credentials`], the raw work `beam_rt`'s native `file`/`filelib` floor cannot do
 //! itself.
 //!
+//! The [`close_fd`] module is the **descriptor-close facility** — a safe `close(2)` floor
+//! ([`close_fd()`]) plus the [`OwnedFd`] RAII wrapper (closed exactly once, on `close(self)` or
+//! `Drop`), the raw work the runtime needs to discard a descriptor it decided not to adopt (an
+//! [`InetAsyncResult::Accepted`] socket). Wrapping a descriptor in an [`OwnedFd`] while a driver
+//! also owns that number double-closes it — see the module docs.
+//!
 //! The [`io_device`] module is the **io-device request layer** — the DEVICE SIDE of the
 //! incremental `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` request of the `io`
 //! protocol: [`IoDevice`] reproduces `file_io_server`'s read loop (read sizes, the
@@ -127,6 +133,7 @@
 #![warn(missing_docs)]
 
 pub mod abi;
+pub mod close_fd;
 pub mod completion;
 pub mod cpu_time;
 pub mod ddll;
@@ -145,6 +152,7 @@ pub mod timer;
 mod error; // `pub(crate)` constructors only — NOT public
 
 pub use crate::abi::*;
+pub use crate::close_fd::*;
 pub use crate::completion::*;
 pub use crate::cpu_time::*;
 pub use crate::ddll::*;
@@ -181,9 +189,11 @@ pub use crate::timer::*;
 /// [`DynLibFlags`], [`DllError`], [`DllErrorKind`], [`ERRCODE_TAB`], [`format_error_text`])
 /// and the CPU-time facility ([`CpuTimes`], [`process_cpu_times`], [`thread_cpu_times`],
 /// [`RuntimeClock`]) and the filesystem-access facility ([`AccessMode`], [`access`],
-/// [`try_access`], [`path_access`], [`process_credentials`]) into scope.
+/// [`try_access`], [`path_access`], [`process_credentials`]) and the descriptor-close facility
+/// ([`close_fd()`], [`OwnedFd`]) into scope.
 pub mod prelude {
     pub use crate::abi::*;
+    pub use crate::close_fd::*;
     pub use crate::completion::*;
     pub use crate::cpu_time::*;
     pub use crate::ddll::*;
