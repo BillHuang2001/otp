@@ -27,15 +27,22 @@ never touched from here.
 - Failures are typed `beam_common::BeamError` values; never `unwrap()` engine runtime data;
   a harness-only invariant may panic with a message.
 - Every `.rs` carries the OTP Apache-2.0 `// %CopyrightBegin% … // %CopyrightEnd%` header block;
-  files target ~1000 lines. Sixteen suites are above that target, each one cohesive harness rather
+  files target ~1000 lines. Eighteen suites are above that target, each one cohesive harness rather
   than a mix of subjects (splitting any of them is a parity-neutral refactor): `jit_cranelift.rs`
   (4298), `opcodes.rs` (2761), `jit.rs` (2701), `exceptions.rs` (1523), `engine_bench.rs` (1482),
-  `census.rs` (1462), `jit_cranelift_real.rs` (1423), `call_ext_apply.rs` (1333), `jit_compare.rs`
+  `census.rs` (1462), `dynamic_census.rs` (1415), `jit_cranelift_real.rs` (1423),
+  `call_ext_apply.rs` (1333), `jit_compare.rs`
   (1319), `bitstrings_extra_big.rs` (1204), `records.rs` (1191), `raise_rooting.rs` (1098),
   `trace.rs` (1079), `stdlib_text.rs` (1016), `jit_linking.rs` (1009), `stdlib_exports_more.rs`
   (1002). `raise_rooting.rs`'s cohesion is spelled out in the routing table below; `census.rs`'s
   is the hand-maintained exhaustive `Instr`/`TestKind` rosters, which only make the "108 rows / 108
   distinct names" completeness assertion real if they live beside the census that consumes them.
+- `dynamic_census.rs` is one instrument split by role, not by subject: that file is the driver
+  (three layers, one `reset()` + boundary snapshots, the ranking / declared-raise / blocked-mechanism
+  rendering, every assertion) and `dynamic_census/catalog.rs` (1198) is its data half (the named
+  workload closures + the fixture entry points, each carrying its provenance comment). The catalog is
+  reached by `#[path = "dynamic_census/catalog.rs"] mod catalog;` — a **directory** under `tests/` is
+  not compiled as a test target, while a second top-level `.rs` would become one.
 - One support module is past that target: `support/probe/mod.rs` (1117) is the single probe builder
   (atoms, mailbox, hooks, `Expect`/`Verdict`, the generated module and the run/verdict funnel) that
   every probe row in `support/probe/rows/` is written against — splitting it would duplicate the
@@ -44,6 +51,8 @@ never touched from here.
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine [--test <name>]`.
 
 ## Notes for Agents
+- `beam_engine::exec_census` counts **only** through the interpreter funnel (`Machine::step_instruction`): a natively-inlined baseline-JIT instruction is invisible to it, so any run whose counts are meant to be complete must pin `Tier::Interpreter` (`run_export`/`ModuleHost::call` already are that path). Its `Snapshot::first_error` stores the error's `Display`, so a **structured raise renders as `error <structured reason>`** — the true class/reason rides `Raise::live_reason` as a term, not in the text, so never key an assertion on the raise text beyond that placeholder.
+- The `dynamic_census` driver keeps its error map honest by classifying every run as a value or a **declared** raise; an error from an undeclared run is printed under `*** UNEXPECTED CENSUS ERRORS ***` and fails the test.
 - `TEST_NOTES.md` (crate-root, not owned here) is the authoritative per-suite enumeration; do not
   duplicate it here.
 - A suite needing the system toolchain (a real `.beam`, the `erl` oracle, or an `erlc` fixture
@@ -66,6 +75,7 @@ never touched from here.
 - `raise_rooting.rs` → the raise-window counterpart: a hand-built `function_clause` raise driven through a semi-space **moving** mock collector (`MovingContext`, which relocates every term it is handed and poisons the region it vacated), proving the parked `raise_function_clause_args` latch rides `Machine::with_roots`'s published root set. One cohesive file by design (~1100 lines): the single mock collector, the single raise fixture and every latch-survival shape (parked vs unparked hand-off, cooked vs uncaught trace, post-move assertions) share that one harness, so splitting it would duplicate the collector per fragment.
 - `type_sizes.rs` → observes the frozen IR size guards (`Instr` ≤ 64 / `Operand` ≤ 16 / `HeapNeed` ≤ 24) over the public types (authoritative pins are the compile-time asserts in `beam_loader/src/instr.rs`)
 - `census.rs` → the `Instr`-variant / `TestKind` execution census + whole-OTP corpus reachability. Four buckets (`EXECUTED` / `ZERO-CORPUS` forward-compat / `GENUINE-GAP` / `UNCLAIMED`) partition the 108-variant roster, pinned by `EXECUTED_VARIANTS` / `ZERO_CORPUS_VARIANTS` / `GENUINE_GAP_VARIANTS`; 64 rows are probe-driven with valid operands and a declared `Expect`, the other 44 keep the compact degenerate-operand module. `ZERO_CORPUS` is the 13-name forward-compat pin, asserted **equal** to the live zero-occurrence set measured over the whole installed OTP, so a variant the toolchain starts or stops emitting fails the build
+- `dynamic_census.rs` + `dynamic_census/catalog.rs` → the **dynamic** per-variant ranking: one serialized test drives real compiled Erlang on `Tier::Interpreter` over three layers (the whole-OTP `module_info/0,1` sweep, the named stdlib workload catalog, the committed fixtures incl. a mailbox-driven `recv` section), attributes weight per layer from boundary snapshots of `beam_engine::exec_census`, and reports the combined ranking, the DECLARED-raise vs UNEXPECTED error split, the blocked-mechanism table, the computed not-reached list and the TSV dump. `catalog.rs` holds only the workload/fixture data
 - `reductions.rs` → per-instruction reduction charging (exactly-once, host pre-emption) and the suspend/resume slice boundary
 - `gc_roots.rs`, `gc_arena.rs`, `bif_alloc.rs` → GC root-set hand-off, the region heap, BIF-driven allocation
 - `jit.rs`, `jit_real_module.rs` → native baseline tier equivalence (synthetic + real-`erlc` modules); `jit_linking.rs`, `jit_cache.rs`, `jit_code_map.rs`, `jit_compare.rs`, `jit_coverage.rs` → block linking, the cross-run cache, the host code map, and baseline-vs-interpreter coverage; `jit_bench.rs` → the thin driver over the `crate::jit::bench` measurement harness; `jit_cranelift.rs`, `jit_cranelift_real.rs` → the feature-gated Cranelift hot tier
