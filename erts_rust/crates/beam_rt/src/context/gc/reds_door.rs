@@ -277,9 +277,14 @@ pub(crate) fn collect_at_reds_boundary(
         runtime.halt_process_gc(pid);
         return Ok(());
     }
-    // The action is a plain collection, never `collect_or_grow`: `Process::ensure_capacity`'s
-    // `nursery.grow` is a no-op when the current space already has room, so it would leave the
-    // retired chain exactly where it is — the mechanism of the climb this door exists to stop.
+    // The action is a **young-only** collection, never `collect_or_grow` and never the
+    // escalating `Process::collect`: `Process::ensure_capacity`'s `nursery.grow` is a no-op when
+    // the current space already has room (so it would leave the retired chain exactly where it
+    // is — the mechanism of the climb this door exists to stop), and the unpinned `collect`
+    // escalates a would-not-fit minor to a **major**, which turns this door's rationed
+    // slice-boundary collection into a fullsweep. `Process::collect_kind(Minor)` evacuates the
+    // nursery only and reports the typed heap exhaustion when the promotion cannot fit, which
+    // the `Err` arm below turns into the same `halt_process_gc` no-op every other refusal takes.
     match process.collect_kind(CollectionKind::Minor) {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));

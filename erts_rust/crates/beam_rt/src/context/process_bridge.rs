@@ -412,29 +412,29 @@ impl ProcessHook for ProcessBridge<'_> {
             // ([`Runtime::max_heap`](crate::Runtime::max_heap)), which is what the
             // `process_info` items read.
             //
-            // Residuum: the recorded bound is **not enforced** — no `error_logger` report and no
-            // kill at the limit — because neither `beam_process::Process` nor
-            // `beam_gc::AnyCollector` exposes a policy setter, so the `beam_gc` ceiling a
-            // process was born with cannot be replaced (see `M1_GAPS.md` *Heap switches*).
+            // Residuum: the recorded bound is now enforced by the collection doors
+            // ([`crate::context::gc`] drains `Process::take_max_heap_verdict`), which either
+            // terminate the process with the bare atom `killed` or emit the ERTS
+            // `=ERROR REPORT====` — never both, never an exception.
             "max_heap_size" => {
                 // The floor is the process's own stored `min_heap_size` (the C's
                 // `MIN_HEAP_SIZE(BIF_P)`), and the current setting is what it reports right
                 // now; both are read off the PCB we already hold, then the borrow ends.
                 let floor = process.collector().policy().min_heap_words;
-                let born_with = process.collector().policy().max_heap_words;
-                let current = self.runtime.max_heap_setting(pid).unwrap_or_else(|| {
-                    MaxHeapSetting {
-                        size: born_with,
-                        flags: self.runtime.config().heap_options().max_heap_flags(),
-                    }
-                });
+                let current = if self.runtime.max_heap_was_set(pid) {
+                    process.max_heap_size()
+                } else {
+                    self.runtime
+                        .birth_max_heap_setting(process.collector().policy())
+                };
                 let Ok(setting) = self.with_ctx(|ctx| ctx.max_heap_setting(value)) else {
                     return Ok(None);
                 };
-                if setting.size != 0 && setting.size < floor {
+                if setting.violates_floor(floor) {
                     return Ok(None);
                 }
-                self.runtime.set_max_heap_setting(pid, setting);
+                process.set_max_heap_size(setting);
+                self.runtime.note_max_heap_set(pid);
                 let previous = self.with_ctx(|ctx| ctx.max_heap_size_map(current))?;
                 Ok(Some(previous))
             }

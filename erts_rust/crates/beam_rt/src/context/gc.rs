@@ -867,6 +867,70 @@ pub(crate) fn scatter_roots_full(
 /// The collection's own error. The caller halts collection for that process
 /// ([`Runtime::halt_process_gc`](crate::runtime::gc)) and reports success, leaving the
 /// allocation to fall back to the arena exactly as it did before.
+/// Hands the `max_heap_size` verdict a collection or growth has **latched** on the process to the
+/// runtime — the drain every collection site runs right after its collection succeeds.
+///
+/// `beam_process` records the verdict at the collection decision (the capacity the collection has
+/// just installed, plus — with `include_shared_binaries` — the off-heap binary payload), and never
+/// acts on it: it neither changes the collection's `Result` nor terminates anything. Acting is the
+/// host's job and this is it:
+///
+/// * [`HeapLimitVerdict::Kill`] — the process must **self-exit with the bare atom `killed`** (not
+///   `kill`, and not an exception). A door cannot terminate: it holds the process mutably and the
+///   termination is the scheduler's (`ProcessTable::terminate` is what propagates the exit to
+///   links and monitors). So the notice is **latched** on the runtime
+///   ([`Runtime::note_max_heap_kill`](crate::runtime::Runtime)) and the runner performs it at its
+///   next slice boundary, through the ordinary exit-reason path — `{'EXIT', Pid, killed}` for a
+///   trapping linked peer, `'DOWN' … killed` for a monitor, untrappable by the victim.
+/// * [`HeapLimitVerdict::Log`] — the process keeps running and the ERTS `=ERROR REPORT====` is
+///   emitted (only when `flags.error_logger` is set), once per over-limit collection, which is the
+///   oracle's own cadence.
+///
+/// Nothing here is swallowed: [`HeapLimitVerdict::Within`] is the only answer that needs no notice,
+/// and a `Kill` that cannot be performed (a pid the runner never schedules again) stays latched and
+/// is pruned at the pass boundary rather than silently dropped.
+pub(crate) fn drain_max_heap_verdict(
+    runtime: &mut crate::runtime::Runtime,
+    process: &mut beam_process::Process,
+    pid: beam_process::ProcessId,
+) {
+    use beam_process::HeapLimitVerdict;
+    match process.take_max_heap_verdict() {
+        None | Some(HeapLimitVerdict::Within) => {}
+        Some(HeapLimitVerdict::Kill) => runtime.note_max_heap_kill(pid),
+        Some(HeapLimitVerdict::Log) => report_max_heap_breach(process, pid),
+    }
+}
+
+/// Emits the ERTS `=ERROR REPORT====` for a `max_heap_size` breach that must **not** kill the
+/// process (`kill => false`, `error_logger => true`) — the C's `error_logger` report from
+/// `erl_gc.c`'s `check_max_heap_size`.
+///
+/// The report goes to **stderr** (probed: the oracle prints it there, not on stdout) and the
+/// process keeps running. Only the fields this runtime can answer truthfully are printed; the C's
+/// `GC Info`/`Stacktrace` lines are omitted rather than fabricated.
+fn report_max_heap_breach(process: &beam_process::Process, pid: beam_process::ProcessId) {
+    use std::io::Write as _;
+
+    if !process.max_heap_size().flags.error_logger {
+        return;
+    }
+    let setting = process.max_heap_size();
+    let usage = process.max_heap_usage();
+    let queue_len = process.mailbox().len();
+    // A best-effort diagnostic: a failed stderr write is not recoverable and must never turn a
+    // surviving process into a failing one (the oracle's error_logger has the same property).
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "=ERROR REPORT====");
+    let _ = writeln!(err, "     Process:            <{}>", pid.number());
+    let _ = writeln!(err, "     Context:            maximum heap size reached");
+    let _ = writeln!(err, "     Max Heap Size:      {}", setting.size);
+    let _ = writeln!(err, "     Total Heap Size:    {}", usage.heap_words);
+    let _ = writeln!(err, "     Kill:               {}", setting.flags.kill);
+    let _ = writeln!(err, "     Error Logger:       {}", setting.flags.error_logger);
+    let _ = writeln!(err, "     Message Queue Len:  {queue_len}");
+}
+
 fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> {
     let need = heap_need as usize;
     let growable = process.collector().policy().next_words(need, 0) >= need;

@@ -1140,14 +1140,16 @@ impl RuntimeContext<'_> {
             reductions: process.reductions(),
             minor_gcs: process.collector().minor_gcs(),
             policy: process.collector().policy().clone(),
-            // The process's own flag store wins; a process that never called
-            // `process_flag(max_heap_size, …)` reports the setting it was born with.
-            max_heap: self.runtime.max_heap_setting(pid).unwrap_or_else(|| {
-                MaxHeapSetting {
-                    size: process.collector().policy().max_heap_words,
-                    flags: self.runtime.config().heap_options().max_heap_flags(),
-                }
-            }),
+            // The setting lives on the process itself (the PCB is what the collection doors
+            // enforce); `max_heap_was_set` distinguishes an **explicit** `#{size => 0}`
+            // ("no upper bound") from a process that never set one and still reports the
+            // emulator's `+hmax` birth default.
+            max_heap: if self.runtime.max_heap_was_set(pid) {
+                process.max_heap_size()
+            } else {
+                self.runtime
+                    .birth_max_heap_setting(process.collector().policy())
+            },
             off_heap_bytes: process.off_heap().overhead_bytes(),
             off_heap_binaries: process
                 .off_heap_binaries()

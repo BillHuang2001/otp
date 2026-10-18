@@ -1738,6 +1738,14 @@ impl Runtime {
     pub(crate) fn take_max_heap_kill(&mut self, pid: ProcessId) -> bool {
         self.max_heap_kill.remove(&pid)
     }
+    /// Latches `pid`'s `max_heap_size` **kill** verdict for the runner to perform (see
+    /// [`Runtime::max_heap_kill`]). Called by the collection doors' drain
+    /// ([`crate::context::gc::drain_max_heap_verdict`]), which hold the process mutably and
+    /// therefore cannot terminate it: termination is the scheduler's, so the notice waits for the
+    /// runner's next slice boundary.
+    pub(crate) fn note_max_heap_kill(&mut self, pid: ProcessId) {
+        self.max_heap_kill.insert(pid);
+    }
     /// Registers one more `{monitor_nodes, Options}` monitor for `pid` under the option
     /// bitmask `key`, answering the **previous** reference count — the C's
     /// `erts_monitor_nodes` `on == true` arm (`dist.c:6827-6845`).
