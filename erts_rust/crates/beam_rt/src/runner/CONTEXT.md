@@ -690,7 +690,8 @@ term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mail
   the
   return-value / exit-reason stabilization (whose `SourcePayloads` come from
   `Runtime::source_payloads` — the machine's handles unioned with the pid's retained mailbox
-  off-heap families).
+  off-heap families), and the `Yield` arm's slice-boundary off-heap prune
+  (`reclaim_off_heap_binaries`).
 * `budget.rs` → the reduction budget + the charging wrapper context: `BudgetProbe::charge` (the
   **refusing** primitive — one charge per interpreted instruction and per `ensure_heap` door, the only
   charge a native block's *slice* can end on) and `BudgetProbe::spend` (the **pricing**, never-refusing
