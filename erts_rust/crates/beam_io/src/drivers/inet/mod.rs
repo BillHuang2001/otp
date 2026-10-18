@@ -83,13 +83,15 @@
 //! (on Linux a doubled request: 4096 reads back as 8192, exactly as the oracle reports it).
 //!
 //! The **driver-state** options — `{active, …}` (`22`), `{packet, …}` (`23`),
-//! `{send_timeout, …}` (`30`), `{packet_size, …}` (`32`), `{send_timeout_close, …}` (`35`) and
+//! `{mode, …}` (`24`), `{deliver, …}` (`25`), `{send_timeout, …}` (`30`),
+//! `{packet_size, …}` (`32`), `{read_packets, N}` (`33`), `{send_timeout_close, …}` (`35`) and
 //! `{line_delim, …}` (`40`) — are stored and reported with the oracle's defaults and byte-exact
 //! read-backs. `{packet, …}`/`{packet_size, …}`/`{line_delim, …}` are now **acted on** on the
 //! read path (see the framing bullet below); the remaining behaviours behind these options
 //! (active-mode delivery, the asynchronous send-timeout reply) remain the handoffs named below.
 //! `{line_delim, …}` is **set-only** — `getopts` of `40` is the C's `[0]einval`, which replaces
-//! the whole reply exactly as the oracle does.
+//! the whole reply exactly as the oracle does. `{mode, …}` is *stored and reported* only: the
+//! term a consumer builds from it (`{Port, {data, Binary | List}}`) is the runtime's to render.
 //!
 //! Any other code is the C's `[0] ++ "einval"` — see [`self::opt`] for the exact served set.
 //!
@@ -463,11 +465,6 @@ pub struct TcpInetDriver {
     /// data. A switch **to** [`PacketType::Raw`] therefore delivers the whole retained buffer
     /// (plus everything after it) verbatim, so raw mode stays authoritative for queued bytes.
     pending_input: Vec<u8>,
-    /// Whether the socket's type is `SOCK_STREAM` — the C's `inet.stype`, set by `open`
-    /// (`inet_drv.c:5215`) and never cleared by `close`, with `-1` before the first `open`
-    /// (`:10925`). It gates the `send_timeout`/`send_timeout_close` options, which the C stores
-    /// and reports only on a stream socket (`:7104`/`:7115`, `:9237`/`:9247`).
-    stream: bool,
     /// The C descriptor's cached address family (`inet.sfamily`, `inet_drv.c:10925`), as the
     /// wire's [`INET_AF_INET`] tag, with `0` meaning "unset". Set by `open`/`fdopen` and
     /// **never** cleared by a close, which is why `INET_REQ_GETTYPE` still answers after one.
@@ -518,7 +515,6 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
-            stream: false,
             family: 0,
             stype: 0,
             name_addr: None,
@@ -561,7 +557,6 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
-            stream: true,
             family: u16::from(INET_AF_INET),
             stype: sys::socket_type(fd)?,
             name_addr: None,
@@ -640,11 +635,10 @@ impl TcpInetDriver {
                 // A fresh socket starts a fresh byte stream: any partial frame buffered for
                 // the previous socket no longer belongs to this one.
                 self.pending_input.clear();
-                // `open`/`accept` hand the driver a `SOCK_STREAM` socket: the C's `inet.stype`
-                // is `SOCK_STREAM` from `open` on (`inet_drv.c:5215`), never cleared by `close`.
-                self.stream = true;
-                // The C's `inet_ctl_open` records the family and type here too
-                // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close.
+                // The C's `inet_ctl_open` records the family and type here
+                // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close: `inet.stype`
+                // is `SOCK_STREAM` from `open` on, which is what gates the `send_timeout`
+                // codes and the datagram-only `{read_packets, N}`.
                 self.family = u16::from(INET_AF_INET);
                 self.stype = u16::from(INET_TYPE_STREAM);
                 // An `open`/`accept` descriptor is the driver's own: it is closed on teardown, so
@@ -716,7 +710,6 @@ impl TcpInetDriver {
         };
         // `desc->prebound = 1; desc->stype = type; desc->sfamily = domain` (`:5266`-`:5269`).
         self.prebound = true;
-        self.stream = stype == u16::from(INET_TYPE_STREAM);
         self.family = u16::from(INET_AF_INET);
         self.stype = stype;
         Ok(())
@@ -1483,15 +1476,17 @@ impl TcpInetDriver {
     ///
     /// Like the C (`inet_drv.c:11111`, which has no `IS_OPEN` guard), a port that has no socket
     /// yet still validates the codes, stores the driver-state options and answers `[1]` — a
-    /// `setopts` before `open` is not an error, exactly as the oracle behaves (only the two
-    /// `send_timeout` codes, which the C gates on a stream socket, are then ignored).
+    /// `setopts` before `open` is not an error, exactly as the oracle behaves (only the gates the
+    /// C reads off the cached `inet.stype` then keep their values out: the two `send_timeout`
+    /// codes because there is no stream socket yet, and `{read_packets, N}` because there is no
+    /// datagram one — either still answering `[1]`).
     ///
     /// # Errors
     ///
     /// Never for a served option (a rejected `setsockopt(2)` is not propagated, as in the C);
     /// `BeamError::BadArg` for a truncated `{active, N}` record.
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, self.stream, self.socket, arg)
+        set_options(&mut self.options, self.stype, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
@@ -1508,7 +1503,7 @@ impl TcpInetDriver {
     /// `BeamError::Io` is **not** raised for a failed `getsockopt(2)` on a live socket: that
     /// record is dropped and the search continues, as in the C (see [`self::opt`]).
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, self.stream, self.socket, arg)
+        get_options(&self.options, self.stype, self.socket, arg)
     }
 
     /// Routes one decoded numeric control opcode (`inet_drv.c`'s `INET_REQ_*` numbers) to the verb
@@ -1751,7 +1746,7 @@ impl TcpInetDriver {
                 if !self.state.is_connected() {
                     return Ok(ctl_xerror("enotconn"));
                 }
-                if !self.stream {
+                if self.stype != u16::from(INET_TYPE_STREAM) {
                     return Ok(ctl_xerror("einval"));
                 }
                 Err(op.not_served())
