@@ -494,7 +494,10 @@ impl RuntimeContext<'_> {
 /// # Errors
 ///
 /// The arena's allocation failure when the tuple does not fit.
-fn terms_tuple(ctx: &mut RuntimeContext<'_>, elements: &[Eterm]) -> beam_common::Result<Eterm> {
+pub(super) fn terms_tuple(
+    ctx: &mut RuntimeContext<'_>,
+    elements: &[Eterm],
+) -> beam_common::Result<Eterm> {
     beam_engine::terms::make_tuple(ctx, elements)
 }
 
