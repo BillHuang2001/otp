@@ -4,12 +4,10 @@ Sibling-owned dossier for the A.9 **scheduled (`run`) route** — the two differ
 `selfhost/in_process_compile_file_no_spawn_deterministic` (E0:
 `compile:file(Source, [no_spawn_compiler_process, deterministic, {outdir, Dir}])`) and
 `selfhost/scheduled_process_compile_file_deterministic` (the default shape through `compile:file/2`'s
-own compiler process). Both **agree** with the oracle on both execution tiers; the corpus is
-`total=1868 agree=1866 mismatch=0 unsupported=2`. Present state, not a history. The current picture:
-the `beam_process` signal-driven collection site that would relocate a woken monitor watcher's heap
-against an incomplete root set is **declined by the host collection gate** the `ptab.rs` signal sites
-consult (`beam_rt`'s `RuntimeCollectionGate`), with the runner's park-window relocation exemption as
-the complementary mitigation.
+own compiler process).
+The gate is authoritative and re-run, never quoted here: `selfhost/scheduled_process_compile_file_deterministic` agrees with the oracle on both execution tiers, while `selfhost/in_process_compile_file_no_spawn_deterministic` **still mismatches** — the E0 shape dies inside a heap-admission collection on the scheduled route (§5).
+Present state, not a history.
+The current picture: the `beam_process` signal-driven collection site that would relocate a woken monitor watcher's heap against an incomplete root set is **declined by the host collection gate** the `ptab.rs` signal sites consult (`beam_rt`'s `RuntimeCollectionGate`), with the runner's park-window relocation exemption as the complementary mitigation.
 
 ## 1. The pinned mover — the monitor-DOWN branch of the process-termination cascade
 A heap-move trace that watches the **mature base** (not only the nursery) pins the move to the
@@ -84,3 +82,17 @@ and `runner::tests::a_parked_process_stays_relocation_exempt_for_its_parked_wind
 private `declines_signal_collection(pid)` OR-s that gate with the crate's `has_unpublished_roots` at
 every signal site. The host half is `RuntimeCollectionGate`; the runner's park-window exemption
 remains the narrower, complementary cover for the host-held-outside-roots hazard described above.
+
+## 5. The open defect: the E0 shape dies in an admission collection
+`selfhost/in_process_compile_file_no_spawn_deterministic` — the `compile:file/2` shape with `no_spawn_compiler_process` — is the one open differential defect: the Rust side aborts (SIGABRT, `unsupported: external_term` at exit) instead of matching the oracle.
+A/B: bypassing the `src/context/gc.rs::ensure_heap_full` heap-admission door makes the abort vanish (2/2); disabling the reduction-interval boundary door (`src/context/gc/reds_door.rs`) does not.
+The stale term is the third element `{outdir, Dir}` of `compile:expand_opts/1`'s option list — it survives a collection whose relocation freed its payload.
+Instrumentation (`BEAM_RT_GC_LOG`) shows the fatal action is a full **Major** with the nursery chain **collapsed** (young_spaces 2→1) and **zero** un-relocated roots reported across all ~724 collections in the run.
+That is a root-set **coverage** hole, not a bound bug.
+Ruled out by code inspection: `RuntimeContext::run_export` IS already guarded — `src/context/pump.rs::run_export_blocking` wraps the nested run in `with_relocation_exempt`, nested-safe.
+A door audit logged ~700 door-collect events, all `state=Running exempt=false`, plus ~465 `exempt=true` events with **zero** collections among them.
+A latent invariant gap worth knowing (not established as this defect's cause): the three heap-admission doors consult only the `gc_armed` latch, `current_module`, occupancy/debt and the unscanned-root valve — never `process.is_relocation_exempt()`; only `gc/reds_door.rs` does.
+It is sound today only because `BudgetContext` arms the latch immediately before forwarding and each door `mem::take`s it first.
+The next experiment: instrument `src/context/calls.rs::invoke_registered` (the `BifFn` call) to classify every `args[i]` immediately before invoking the BIF.
+On the first unclassifiable arg, print once the raw word, whether it lies inside `process.collector().scanned_bounds()`, the last 8 door-collect events for that pid (kind/base/limit), `current_module` and `is_relocation_exempt()`.
+Inside a live range ⇒ a published-root hole; outside every live range ⇒ an object reachable only from a host-side store (`dispatch_memo` slots, `lent_tables`, `Runtime::eval_off_heap`/`open_files`/`timers`; the process dictionary is NOT the hole — `Process::gather_roots` includes `dict`).
