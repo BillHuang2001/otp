@@ -2122,8 +2122,28 @@ impl DriverPortAdapter {
     /// Erlang as `{Port, {data, Data}}`).
     ///
     /// Called right after **every** driver interaction, so a request is never left unapplied.
+    ///
+    /// The **output comes first, then the failure request**, and that order is forced from both
+    /// sides: `beam_io` refuses a read (and a completion) once a failure is latched
+    /// ([`beam_io::DriverContext::deliver_read`]), so handing the failure up first would turn a
+    /// legitimate data-then-failure into a capability gap; and it is the delivered order the
+    /// oracle pins — `driver_output("hi",2)` then `driver_failure(P,9)` reaches the owner as
+    /// `{Port,{data,"hi"}}` **then** `{'EXIT',P,9}`, which is also the order `beam_io`'s
+    /// `take_reaped_notifications` re-prepends.
+    ///
+    /// A refused hand-off is **not** dropped: the request is put back in the latch so the next
+    /// callback retries it, because the alternative — forgetting a port-closing request — is a
+    /// port that outlives the driver that closed it. Once the request is handed up the selects
+    /// still apply: `beam_io` closes the port when the callback returns, and the poller key goes
+    /// with it, so an arm here is deregistered rather than stranded.
     fn settle(&mut self, ctx: &mut DriverContext<'_>) -> beam_common::Result<()> {
         self.collect_outputs(ctx)?;
+        if let Some(failure) = self.failures.take() {
+            if let Err(err) = ctx.signal_failure(failure.clone()) {
+                self.failures.set(failure);
+                return Err(err);
+            }
+        }
         self.apply_selects(ctx)
     }
 
