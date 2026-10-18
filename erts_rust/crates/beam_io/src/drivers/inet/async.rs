@@ -98,8 +98,9 @@ use beam_common::Result;
 
 use super::accept::AcceptQueue;
 use super::frame;
+use super::stat;
 use super::wire::{ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
-use super::{Interest, TcpInetDriver};
+use super::{Interest, ReadReport, TcpInetDriver};
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply};
 use crate::driver::DriverContext;
 use crate::port_failure::DriverFailure;
@@ -376,8 +377,19 @@ impl TcpInetDriver {
             };
             let framed = self.framed().is_some();
             // Is the operation satisfiable from what is already buffered?
+            //
+            // The framed branch also does its accounting: `stat::take_frame` credits the **whole
+            // frame** (framing header included), which is `tcp_deliver`'s
+            // `inet_input_count(INETP(desc), len)` with `len` = `packet_get_length`'s total packet
+            // length (`inet_drv.c:12967`/`:13064`). The raw branches count the delivered bytes
+            // below — `tcp_deliver(desc, request_len)` for an exact-length receive (`:13162`) and
+            // the whole input buffer for `tcp_deliver(desc, 0)` on a raw socket.
             let payload = if framed {
-                match frame::extract(&mut self.pending_input, &frame::options(&self.options)) {
+                match stat::take_frame(
+                    &mut self.stat,
+                    &mut self.pending_input,
+                    &frame::options(&self.options),
+                ) {
                     Ok(frame) => frame,
                     Err(err) => {
                         // The buffered bytes can never be a frame for this option set: report the
@@ -400,9 +412,11 @@ impl TcpInetDriver {
             };
             if let Some(payload) = payload {
                 self.async_ops.take_recv();
-                // `inet_input_count(desc, len)` (`inet_drv.c:13064`, `tcp_deliver`): the delivered
-                // payload, the framing header already stripped.
-                self.stat.input(payload.len());
+                if !framed {
+                    // A raw delivery counts exactly the bytes it hands over — no header exists to
+                    // add, so this is the C's `len` too.
+                    self.stat.input(payload.len());
+                }
                 ctx.deliver_completion(CompletionEvent::InetAsync {
                     id: op.id,
                     result: InetAsyncResult::Data(ReadMessage::body_only(payload)),
@@ -415,7 +429,10 @@ impl TcpInetDriver {
             // Not enough buffered bytes: read what the socket has and try once more.
             let before = self.pending_input.len();
             let mut bytes = Vec::new();
-            self.read_bytes(ctx, &mut bytes)?;
+            // The queued operation is the party that consumes a discovery this read makes: it is
+            // answered right below from the `peer_close` latch (`async_error_am_all(am_closed)`,
+            // `inet_drv.c:12829`), so the receive ladder stays unarmed.
+            self.read_bytes(ctx, &mut bytes, ReadReport::Answered)?;
             self.pending_input.extend_from_slice(&bytes);
             if self.pending_input.len() == before {
                 // `EAGAIN`: no progress, so the operation waits for the next readiness edge.
@@ -423,12 +440,20 @@ impl TcpInetDriver {
             }
         }
         if self.async_ops.recv().is_some() && self.peer_close.seen {
-            // The peer went away with the operation pending: the C's `tcp_recv_closed` answers
-            // `async_error_am(am_closed)` (`inet_drv.c:13180`).
+            // The peer went away with the operation pending: the C answers the pending operation
+            // from the discovery site — `tcp_recv_closed` with `async_error_am(am_closed)`
+            // (`inet_drv.c:12829`) for an end-of-file, and `tcp_recv_error` with
+            // `async_error_am_all(desc, error_atom(err))` (`:12877`) for a reset under
+            // `{show_econnreset,true}`, which is how the oracle reports `{error,econnreset}`.
+            let reason = if self.peer_close.reset {
+                InetReason::from_errno(libc::ECONNRESET)
+            } else {
+                InetReason::Closed
+            };
             if let Some(op) = self.async_ops.take_recv() {
                 ctx.deliver_completion(CompletionEvent::InetAsync {
                     id: op.id,
-                    result: InetAsyncResult::Error(InetReason::Closed),
+                    result: InetAsyncResult::Error(reason),
                 })?;
                 completed = true;
             }
@@ -497,7 +522,12 @@ impl TcpInetDriver {
             self.try_complete_recv(ctx)?;
             return Ok(());
         }
-        self.read_available(ctx).map(|_read| ())
+        // No operation is queued, so nothing can be answered here: a close this read discovers is
+        // owed to the user's next `recv` (see [`ReadReport`]). The C never reads in this state at
+        // all — read interest is armed only by a queued `TCP_REQ_RECV` (`:12315`) — which is why
+        // the reply has to be deferred rather than dropped.
+        self.read_available(ctx, ReadReport::OwedToNextRecv)
+            .map(|_read| ())
     }
 }
 
@@ -554,11 +584,15 @@ impl TcpInetDriver {
         if self.framed().is_some() {
             return self.verb_recv_framed(ctx);
         }
-        let read = self.read_available(ctx)?;
+        // This caller answers a close its own read discovers (below), so the receive ladder is not
+        // armed by it.
+        let read = self.read_available(ctx, ReadReport::Answered)?;
         if read == 0 && self.peer_close.seen {
-            // This read is what found the peer gone, so it answers `closed` itself.
-            self.peer_close.recv_reported = true;
-            return Ok(ctl_xerror("closed"));
+            // This read is what found the peer gone, so it answers the close itself: `closed` for
+            // an end-of-file, `econnreset` when the read's error was a reset under
+            // `{show_econnreset,true}` (`tcp_recv_closed` vs `tcp_recv_error`,
+            // `inet_drv.c:13185`-`:13196`).
+            return Ok(ctl_xerror(self.peer_close.observed_atom()));
         }
         Ok(ctl_ok())
     }
@@ -590,23 +624,28 @@ impl TcpInetDriver {
     pub(super) fn verb_recv_framed(&mut self, ctx: &mut DriverContext<'_>) -> Result<Vec<u8>> {
         let framing = frame::options(&self.options);
         loop {
-            match frame::extract(&mut self.pending_input, &framing)? {
+            match stat::take_frame(&mut self.stat, &mut self.pending_input, &framing)? {
                 Some(payload) => {
-                    // `inet_input_count(desc, len)` at `inet_drv.c:13064` (`tcp_deliver`): the
-                    // **delivered payload** length — the framing header already stripped.
-                    self.stat.input(payload.len());
+                    // The count is [`stat::take_frame`]'s: `tcp_deliver` charges
+                    // `inet_input_count(INETP(desc), len)` with the frame's **total packet
+                    // length** (`inet_drv.c:12967`/`:13064`), the framing header included —
+                    // not the stripped payload pushed onto the input queue below.
                     ctx.input().push(&payload);
                     return Ok(ctl_ok());
                 }
                 None => {
                     // Not a whole frame yet: refill the framing buffer from the socket (in a
                     // framing mode `read_available` appends there) and try to decode again.
-                    let read = self.read_available(ctx)?;
+                    //
+                    // A close discovered here is answered by this verb below, so it owes no
+                    // receive one-shot.
+                    let read = self.read_available(ctx, ReadReport::Answered)?;
                     if read == 0 {
                         if self.peer_close.seen {
-                            // This read is what found the peer gone, so it answers `closed`.
-                            self.peer_close.recv_reported = true;
-                            return Ok(ctl_xerror("closed"));
+                            // This read is what found the peer gone (see [`verb_recv`]):
+                            // `closed`, or `econnreset` for a reset under
+                            // `{show_econnreset,true}`.
+                            return Ok(ctl_xerror(self.peer_close.observed_atom()));
                         }
                         // The socket is drained but the frame is still partial: deliver nothing
                         // and keep the buffered bytes for the next `recv`.
@@ -621,6 +660,21 @@ impl TcpInetDriver {
 // ---------------------------------------------------------------------------
 // The send path's caller tag — `init_caller` + `inet_reply_finish`
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The send path's caller tag — `init_caller` + `inet_reply_finish`
+// ---------------------------------------------------------------------------
+
+/// The error half of the `{inet_reply, Port, Reply[, Tag]}` message for one of [`PeerClose`]'s
+/// ladder names: `{error,econnreset}`, `{error,enotconn}` or `{error,closed}`
+/// (`inet_reply_error`/`inet_reply_error_am`, `inet_drv.c:12681`-`:12692`, `:13664`-`:13669`).
+fn close_reason(name: &str) -> InetReason {
+    match name {
+        "econnreset" => InetReason::from_errno(libc::ECONNRESET),
+        "enotconn" => InetReason::from_errno(libc::ENOTCONN),
+        _ => InetReason::Closed,
+    }
+}
 
 impl TcpInetDriver {
     /// The `erlang:port_command/2` write path: strip one caller tag, write, then answer the
@@ -655,7 +709,21 @@ impl TcpInetDriver {
         let Some(stripped) = self.strip_command_prefix(ctx) else {
             return self.fail_malformed_command(ctx);
         };
-        if !self.state.is_connected() {
+        // The C's ladder is keyed on `!IS_CONNECTED` (`:12681`), and the C **is** in that state
+        // once a close has been latched: a passive close with the default
+        // `{exit_on_close,true}` ends the socket through `tcp_desc_close` → `erl_inet_close` →
+        // `desc_close`, whose `desc->state &= ~INET_STATE_CONNECTED` (`:5079`) is followed by
+        // `desc->state = INET_STATE_CLOSED` (`:5106`) — the comment at `:5078`-`:5079` names
+        // exactly this reply ("Next write to socket should produce {error, enotconn}").
+        //
+        // This floor keeps the descriptor for the port's whole life — [`Self::latch_peer_close`]
+        // releases the poller registration instead of closing the socket — so `state` alone can no
+        // longer answer the C's question: without the latched close in this guard, a command issued
+        // *after* the peer's close would be handed to [`Self::write_pending`], which refuses to
+        // touch a dead socket (`self.peer_close.seen`, `mod.rs`) and leaves the payload queued with
+        // **no** reply at all, where the C answers `{error, closed}`/`{error, enotconn}` from the
+        // send ladder below. The two conditions are therefore one arm, not two.
+        if !self.state.is_connected() || self.peer_close.seen {
             // The C's `!IS_CONNECTED` arm (`:12674`-`:12683`): the command is accepted (the port
             // charged `prt->bytes_out += size` for it) but never written, and the caller learns
             // the outcome from `inet_reply_error(ENOTCONN)` — a `{inet_reply, Port,
@@ -663,17 +731,31 @@ impl TcpInetDriver {
             let discarded = ctx.output().len();
             ctx.output().consume(discarded);
             self.caller_stripped = false;
+            // The C's `!IS_CONNECTED` arm first consults the send ladder
+            // (`tcp_inet_commandv`, `inet_drv.c:12681`-`:12692`): a latched `closed`/`econnreset`
+            // one-shot is what the caller is answered with, and only an unarmed ladder is the
+            // bare `enotconn`.
+            let reply = match self.peer_close.send_reply() {
+                Some(name) => InetReply::Error(close_reason(name)),
+                None => InetReply::Error(InetReason::from_errno(libc::ENOTCONN)),
+            };
             if let Some(tag) = self.caller_ref.take() {
                 ctx.deliver_completion(CompletionEvent::InetReply {
                     caller_ref: Some(tag),
-                    reply: InetReply::Error(InetReason::from_errno(libc::ENOTCONN)),
+                    reply,
                 })?;
             }
             return Ok(stripped + discarded);
         }
-        let written = self.write_pending(ctx)?;
+        let queued = ctx.output().len();
+        let _written = self.write_pending(ctx)?;
         self.settle_command(ctx)?;
-        Ok(stripped + written)
+        // Report what actually **left** the output queue, not just what the socket accepted: a
+        // write that discovered the peer's close drops the bytes that can never be delivered
+        // (`latch_peer_close` → `tcp_clear_output`, `inet_drv.c:12786`) and the C charges the
+        // whole command to `prt->bytes_out` there anyway (`:12690`). The port's write accounting
+        // compares the count against the queue, so the dropped remainder is part of it.
+        Ok(stripped + queued.saturating_sub(ctx.output().len()))
     }
 
     /// The C's `driver_failure_posix(port, EINVAL)` for a command `init_caller` rejects
@@ -746,12 +828,13 @@ impl TcpInetDriver {
         let Some(tag) = self.caller_ref.take() else {
             return Ok(());
         };
-        let reply = if self.peer_close.seen {
-            // `tcp_send_error`/the delayed-close arm: the peer is gone, so the command that was
-            // accepted into the queue never reached it (`inet_reply_error_am(…, am_closed)`).
-            InetReply::Error(InetReason::Closed)
-        } else {
-            InetReply::Ok
+        let reply = match self.peer_close.send_reply() {
+            // The command itself (or a previous one) found the peer gone: the C answers the
+            // caller with the send ladder's reply — `inet_reply_error`/`inet_reply_error_am`,
+            // `inet_drv.c:12689`-`:12692` and `:13664`-`:13669` — and with `{error,enotconn}`
+            // once that one-shot is spent.
+            Some(name) => InetReply::Error(close_reason(name)),
+            None => InetReply::Ok,
         };
         ctx.deliver_completion(CompletionEvent::InetReply {
             caller_ref: Some(tag),
