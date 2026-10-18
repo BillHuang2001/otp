@@ -343,6 +343,10 @@ pub const INET_LOPT_DEBUG: u8 = 99;
 ///
 /// Every field here is **stored and reported** faithfully; acting on one is the [`super`] node's
 /// documented handoff (active-mode delivery, the send timeouts, the watermarks, `netns`).
+///
+/// The store is also where an **accepted** socket's inheritance from its listener lives: see
+/// [`SocketOptions::inherited_from`] (the C's `tcp_inet_copy` copy list), pinned by the pure unit
+/// suite in `inherit_tests.rs`.
 #[derive(Clone, Debug)]
 pub(super) struct SocketOptions {
     /// `{active, …}` (code [`INET_LOPT_ACTIVE`]) — the C's `inet.active`.
@@ -422,6 +426,122 @@ impl Default for SocketOptions {
             send_timeout_close: 0,
             line_delim: DEFAULT_LINE_DELIM,
             read_packets: INET_PACKET_POLL,
+        }
+    }
+}
+
+impl SocketOptions {
+    /// The options an **accepted** socket inherits from the listener that accepted it: the C's
+    /// `tcp_inet_copy` copy list (`inet_drv.c:11814`-`:11831`), field for field.
+    ///
+    /// `self` is the store a fresh adoption starts from (`SocketOptions::default()`, i.e.
+    /// `prep_tcp_inet_start`'s own field initializers, `inet_drv.c:11757`-`:11784`); the result is
+    /// `self` with **exactly** the fields of the table below overwritten from `parent`, and every
+    /// other field left alone. It is a pure function of the two stores — no syscall, no side
+    /// effect, and no access to the descriptors — which is why the whole mapping is unit-testable
+    /// without a socket (the pure unit suite `inherit_tests.rs`).
+    ///
+    /// | C field (`tcp_inet_copy`) | here | `getopts` code | line |
+    /// |---|---|---|---|
+    /// | `inet.mode` | [`SocketOptions::mode`] | [`INET_LOPT_MODE`] (24) | `:11815` |
+    /// | `inet.exitf` | [`SocketOptions::exit_on_close`] | [`INET_LOPT_EXITONCLOSE`] (26) | `:11816` |
+    /// | `inet.deliver` | [`SocketOptions::deliver`] | [`INET_LOPT_DELIVER`] (25) | `:11817` |
+    /// | `inet.htype` | [`SocketOptions::packet`] | [`INET_LOPT_PACKET`] (23) | `:11818` |
+    /// | `inet.psize` | [`SocketOptions::packet_size`] | [`INET_LOPT_PACKET_SIZE`] (32) | `:11819` |
+    /// | `inet.stype` | [`super::TcpInetDriver`]'s `stype` | — (copied by the caller) | `:11820` |
+    /// | `inet.sfamily` | [`super::TcpInetDriver`]'s `family` | — (copied by the caller) | `:11821` |
+    /// | `inet.hsz` | [`SocketOptions::header`] | [`INET_LOPT_HEADER`] (21) | `:11822` |
+    /// | `inet.bufsz` | [`SocketOptions::buffer_size`] | [`INET_LOPT_BUFFER`] (20) | `:11823` |
+    /// | `desc->high` | [`SocketOptions::high`] | [`INET_LOPT_TCP_HIWTRMRK`] (27) | `:11824` |
+    /// | `desc->low` | [`SocketOptions::low`] | [`INET_LOPT_TCP_LOWTRMRK`] (28) | `:11825` |
+    /// | `desc->send_timeout` | [`SocketOptions::send_timeout`] | [`INET_LOPT_TCP_SEND_TIMEOUT`] (30) | `:11826` |
+    /// | `desc->send_timeout_close` | [`SocketOptions::send_timeout_close`] | [`INET_LOPT_TCP_SEND_TIMEOUT_CLOSE`] (35) | `:11827` |
+    /// | `tcp_add_flags & TCP_ADDF_SHOW_ECONNRESET` | [`SocketOptions::show_econnreset`] | [`INET_LOPT_TCP_SHOW_ECONNRESET`] (39) | `:11829`-`:11831` |
+    /// | `tcp_add_flags & TCP_ADDF_NO_READ_AHEAD` | [`SocketOptions::read_ahead`] (negated) | [`INET_LOPT_TCP_READ_AHEAD`] (49) | `:11829`-`:11831` |
+    /// | the parent's busy-msgq limits (`erl_drv_busy_msgq_limits`) | [`SocketOptions::msgq_high`] | [`INET_LOPT_MSGQ_HIWTRMRK`] (36) | `:11842` |
+    /// | the parent's busy-msgq limits (`erl_drv_busy_msgq_limits`) | [`SocketOptions::msgq_low`] | [`INET_LOPT_MSGQ_LOWTRMRK`] (37) | `:11844` |
+    ///
+    /// The two cached socket tags the C also copies (`inet.stype`/`inet.sfamily`) are
+    /// [`super::TcpInetDriver`] fields rather than option records, so they are copied by the
+    /// caller ([`super::TcpInetDriver::from_accepted`]).
+    ///
+    /// Not inherited — each absent from the copy list, and each reset by `inet_start`
+    /// (`inet_drv.c:10890`-`:10978`) or set outside it, so an accepted socket starts from the
+    /// default:
+    ///
+    /// * [`SocketOptions::active`] — `inet_start` sets `INET_PASSIVE` (`:10932`) and the copy list
+    ///   omits it: an accepted socket starts **passive**, deliberately (the Erlang half,
+    ///   `prim_inet:accept_opts/3`, is what re-applies `{active, …}`).
+    /// * [`SocketOptions::active_count`] — reset to `0` right beside it (`:10933`), same reason.
+    /// * [`SocketOptions::debug`] — `inet_start` sets `DDBG_DEFAULT` (`:10975`), not copied.
+    /// * [`SocketOptions::netns`] — `inet_start` sets `NULL` (`:10970`); a network namespace is a
+    ///   property of the socket the adapter created, not of the accepted connection.
+    /// * [`SocketOptions::read_packets`] — a `udp_descriptor` field (`:1536`) initialised by
+    ///   `prep_udp_inet_start` (`:14508`), so `tcp_inet_copy` never sees it and a TCP accept has no
+    ///   value to inherit.
+    /// * [`SocketOptions::line_delim`] — `inet_start` sets `'\n'` (`:10934`); `desc->delimiter` is
+    ///   not in the copy list.
+    /// * [`SocketOptions::buffer_set`] — the C's `INET_FLG_BUFFER_SET` (`:1013`) lives in
+    ///   `desc->flags`, which `inet_start` zeroes (`:10967`) and the copy list omits: the accepted
+    ///   socket inherits `bufsz` but a later `{recbuf, N}` may raise it again (`:7326`).
+    ///
+    /// `delay_send` (`TCP_ADDF_DELAY_SEND`) is **also** not part of the mask: the driver-level copy
+    /// leaves it `false`, and the `true` a `gen_tcp:accept/1` shows is applied by the Erlang half
+    /// (`erts/preloaded/src/prim_inet.erl:503`-`:517`), which must not be duplicated here.
+    /// Kernel-level socket options (`sndbuf`, `recbuf`, `nodelay`, `keepalive`, `linger`, …) are
+    /// inherited by the **kernel** across `accept(2)`; this copy never touches them.
+    pub(super) fn inherited_from(&self, parent: &SocketOptions) -> SocketOptions {
+        SocketOptions {
+            // `inet.htype` (`:11818`) — the `{packet, …}` framing of the accepted socket.
+            packet: parent.packet,
+            // `inet.psize` (`:11819`) — the frame size limit.
+            packet_size: parent.packet_size,
+            // `inet.hsz` (`:11822`) — the `{header, N}` prefix length.
+            header: parent.header,
+            // `inet.mode` (`:11815`) — `{mode, list | binary}`.
+            mode: parent.mode,
+            // `inet.deliver` (`:11817`).
+            deliver: parent.deliver,
+            // `inet.exitf` (`:11816`) — `{exit_on_close, …}`.
+            exit_on_close: parent.exit_on_close,
+            // `inet.bufsz` (`:11823`) — the driver's read buffer.
+            buffer_size: parent.buffer_size,
+            // `desc->high` (`:11824`) — `{high_watermark, …}`.
+            high: parent.high,
+            // `desc->low` (`:11825`) — `{low_watermark, …}`.
+            low: parent.low,
+            // `desc->send_timeout` (`:11826`).
+            send_timeout: parent.send_timeout,
+            // `desc->send_timeout_close` (`:11827`).
+            send_timeout_close: parent.send_timeout_close,
+            // `tcp_add_flags & TCP_ADDF_SHOW_ECONNRESET` (`:11829`-`:11831`).
+            show_econnreset: parent.show_econnreset,
+            // `tcp_add_flags & TCP_ADDF_NO_READ_AHEAD` (`:11829`-`:11831`), kept as the negated
+            // `{read_ahead, …}` boolean.
+            read_ahead: parent.read_ahead,
+            // The parent's busy-msgq limits, read out of the parent port and written verbatim to
+            // the child (`:11842`/`:11844`).
+            msgq_high: parent.msgq_high,
+            msgq_low: parent.msgq_low,
+            // Not inherited: `inet_start` sets `INET_PASSIVE` (`:10932`) and the copy list omits it,
+            // so an accepted socket starts passive.
+            active: self.active,
+            // Not inherited: reset to `0` beside `active` (`:10933`).
+            active_count: self.active_count,
+            // Not inherited: `inet_start` sets `DDBG_DEFAULT` (`:10975`).
+            debug: self.debug,
+            // Not inherited: `inet_start` sets `NULL` (`:10970`).
+            netns: self.netns.clone(),
+            // Not inherited: a `udp_descriptor` field (`:1536`) `tcp_inet_copy` never touches.
+            read_packets: self.read_packets,
+            // Not inherited: `inet_start` sets `'\n'` (`:10934`), not in the copy list.
+            line_delim: self.line_delim,
+            // Not inherited: `INET_FLG_BUFFER_SET` (`:1013`) lives in `desc->flags`, zeroed at
+            // `:10967`.
+            buffer_set: self.buffer_set,
+            // Not inherited either: `TCP_ADDF_DELAY_SEND` is outside the mask (`:11829`-`:11831`) —
+            // `prim_inet:accept_opts/3` applies it on the Erlang side.
+            delay_send: self.delay_send,
         }
     }
 }
