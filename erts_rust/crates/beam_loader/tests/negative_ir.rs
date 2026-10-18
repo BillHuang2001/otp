@@ -109,13 +109,21 @@ fn rewrap(chunks: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
     let mut body = Vec::new();
     for (id, payload) in chunks {
         body.extend_from_slice(id);
-        body.extend_from_slice(&u32::try_from(payload.len()).expect("chunk fits").to_be_bytes());
+        body.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("chunk fits")
+                .to_be_bytes(),
+        );
         body.extend_from_slice(payload);
         body.extend(std::iter::repeat_n(0u8, (4 - (payload.len() % 4)) % 4));
     }
     let mut image = Vec::with_capacity(body.len() + 12);
     image.extend_from_slice(b"FOR1");
-    image.extend_from_slice(&u32::try_from(body.len() + 4).expect("form fits").to_be_bytes());
+    image.extend_from_slice(
+        &u32::try_from(body.len() + 4)
+            .expect("form fits")
+            .to_be_bytes(),
+    );
     image.extend_from_slice(b"BEAM");
     image.extend_from_slice(&body);
     image
@@ -196,8 +204,13 @@ fn decoded(image: &[u8]) -> Decoded {
     for name in &chunks.atoms[1..] {
         atoms.push(table.intern(name));
     }
-    let instrs = decode_stream(chunks.code_stream, &atoms, &chunks.code_version, &chunks.types)
-        .expect("the fixture decodes");
+    let instrs = decode_stream(
+        chunks.code_stream,
+        &atoms,
+        &chunks.code_version,
+        &chunks.types,
+    )
+    .expect("the fixture decodes");
     Decoded {
         instrs,
         label_count: chunks.code_version.label_count,
@@ -256,7 +269,11 @@ fn the_unmutated_fixtures_load() {
     // The control every case below is paired with: all three fixtures are well-formed
     // and load through the public pipeline, so a rejection below can only come from
     // the mutated field.
-    for (name, image) in [("slice", SLICE), ("coverage", COVERAGE), ("linecov", LINECOV)] {
+    for (name, image) in [
+        ("slice", SLICE),
+        ("coverage", COVERAGE),
+        ("linecov", LINECOV),
+    ] {
         let module = load(image).unwrap_or_else(|error| panic!("{name} must load: {error:?}"));
         assert!(!module.functions.is_empty(), "{name} has functions");
     }
@@ -270,7 +287,11 @@ fn rejects_a_label_definition_of_zero() {
     // label" sentinel and can never be defined. `slice.beam`'s first instruction is
     // `label 1` (`u,1` = `0x10`), so its operand byte is stream offset 1.
     let stream = stream_of(SLICE);
-    assert_eq!(stream[0], Opcode::label.as_u8(), "the first instruction is `label`");
+    assert_eq!(
+        stream[0],
+        Opcode::label.as_u8(),
+        "the first instruction is `label`"
+    );
     assert_eq!(stream[1], 0x10, "the first label is 1 (the `u,1` form)");
     assert_eq!(decoded(SLICE).instrs[0].operands.len(), 1);
     assert_rejected(
@@ -441,7 +462,11 @@ fn rejects_a_line_index_past_the_line_table() {
         .find(|instr| instr.opcode == Opcode::line)
         .expect("a line instruction");
     let at = line.offset as usize + 1;
-    assert_eq!(stream_of(SLICE)[at], 0x10, "the fixture's first line is item 1");
+    assert_eq!(
+        stream_of(SLICE)[at],
+        0x10,
+        "the fixture's first line is item 1"
+    );
     assert_rejected(
         SLICE,
         || patch_stream(SLICE, at, &[0x10], &[0xF0]),
@@ -463,7 +488,10 @@ fn rejects_an_executable_line_index_past_the_line_table() {
         .expect("an executable_line");
     let stream = stream_of(LINECOV);
     let location_at = operand_offsets(&stream, executable)[0];
-    assert_eq!(stream[location_at], 0x10, "the fixture's first location is item 1");
+    assert_eq!(
+        stream[location_at], 0x10,
+        "the fixture's first location is item 1"
+    );
     assert_rejected(
         LINECOV,
         || patch_stream(LINECOV, location_at, &[0x10], &[0x70]),

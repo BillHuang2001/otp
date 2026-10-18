@@ -278,10 +278,7 @@ mod tests {
             validate_code(&functions, header(3, 1), &LineTable::default(), 0).unwrap_err(),
             BeamError::BadArg
         ));
-        let control = vec![function(vec![
-            Instr::Label(Label(2)),
-            func_info(0),
-        ])];
+        let control = vec![function(vec![Instr::Label(Label(2)), func_info(0)])];
         validate_code(&control, header(3, 1), &LineTable::default(), 0).unwrap();
     }
 
