@@ -35,14 +35,13 @@
 //!
 //! The oracle rows are measured on OTP 29.1.1 / erts-17.1 and quoted at the assertion that uses
 //! them; the `erl` cross-check skips **loudly** when the oracle is absent.
-use super::opcode_tests::{connection, erl_stdout, op, Rig, CONTROL_MAGIC, ERL_TIMEOUT};
+use super::opcode_tests::{connection, erl_stdout, op, Rig, CONTROL_MAGIC};
 use super::wire::{ctl_ok, ctl_xerror};
-use super::{InetState, TcpInetDriver, INET_AF_INET, INET_TYPE_STREAM};
-use crate::driver::Driver;
+use super::{InetState, INET_AF_INET, INET_TYPE_STREAM};
 use crate::poller::Poller;
 use crate::port::{Port, PortCommandOptions};
 use beam_process::PortId;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 /// The C request numbers this suite drives (`inet_drv.c`'s `INET_REQ_*` enum).

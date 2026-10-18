@@ -653,8 +653,9 @@ fn numeric_replies(driver: &str, sequence: &[(u32, Vec<u8>)]) -> Vec<Vec<u8>> {
 
 /// Asserts the numeric opcode route answers **byte-for-byte** what the named verbs answer, then
 /// byte-compares the named replies with the live oracle — whose own side already sends
-/// `port_control(P, C + M, A)`, i.e. the numeric route, so the pair is pinned against it.
-fn check_numeric(driver: &str, sequence: &[(u32, Vec<u8>)]) {
+/// `port_control(P, C + M, A)`, i.e. the numeric route, so the pair is pinned against it. Returns
+/// the named replies so a caller can still assert row by row.
+fn check_numeric(driver: &str, sequence: &[(u32, Vec<u8>)]) -> Vec<Vec<u8>> {
     let named = rust_replies(driver, sequence);
     let numeric = numeric_replies(driver, sequence);
     assert_eq!(
@@ -662,6 +663,7 @@ fn check_numeric(driver: &str, sequence: &[(u32, Vec<u8>)]) {
         "the numeric `port_control/3` route must answer the named verbs' replies on {driver}"
     );
     assert_agrees_with_oracle(driver, sequence, &named);
+    named
 }
 
 /// The two `(driver, open request)` pairs every round-trip row below runs over.
@@ -1039,12 +1041,7 @@ fn the_variable_length_records_answer_the_same_on_the_numeric_opcode_route() {
             (INET_REQ_GETOPTS, vec![INET_OPT_ADD_MEMBERSHIP]),
             (INET_REQ_GETOPTS, vec![INET_OPT_DROP_MEMBERSHIP]),
         ];
-        let named = rust_replies(driver, &sequence);
-        let numeric = numeric_replies(driver, &sequence);
-        assert_eq!(
-            named, numeric,
-            "the numeric opcode route must answer the named replies on {driver}"
-        );
+        let named = check_numeric(driver, &sequence);
         assert_eq!(named[0], ctl_ok(), "`open` on {driver}");
         assert_eq!(named[1], ctl_ok(), "the membership write on {driver}");
         assert_eq!(named[2], ctl_ok(), "the membership drop on {driver}");
@@ -1056,7 +1053,6 @@ fn the_variable_length_records_answer_the_same_on_the_numeric_opcode_route() {
         assert_eq!(named[8], netns_reply, "the refused write stored nothing on {driver}");
         assert_eq!(named[9], ctl_xerror("einval"), "`getopts` of 14 on {driver}");
         assert_eq!(named[10], ctl_xerror("einval"), "`getopts` of 15 on {driver}");
-        assert_agrees_with_oracle(driver, &sequence, &named);
     }
 }
 

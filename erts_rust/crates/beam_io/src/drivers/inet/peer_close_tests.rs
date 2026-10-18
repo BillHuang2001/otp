@@ -37,13 +37,8 @@
 //!
 //! Every wait is **condition-based under a hang guard** (the RST is awaited with `poll(2)` on the
 //! port's own descriptor), never a wall-clock budget tuned for an idle host.
-use super::opcode_tests::{erl_stdout, op, opened_port, oracle_replies, loopback_arg, Rig};
+use super::opcode_tests::{loopback_arg, op, opened_port, Rig};
 use super::wire::{ctl_ok, ctl_xerror};
-use super::TcpInetDriver;
-use crate::driver::Driver;
-use crate::poller::Poller;
-use crate::port::PortRegistry;
-use beam_process::PortId;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
