@@ -248,8 +248,9 @@ fn locals_table_is_parsed_from_the_loct_chunk() {
 
 #[test]
 fn a_container_without_a_loct_chunk_has_no_locals() {
-    // A minimal valid container: `AtU8` (one module-name atom) plus a bare `Code`
-    // header, and no `LocT` chunk — `chunks.locals` must be empty, not an error.
+    // A minimal valid container: `AtU8` (one module-name atom), a bare `Code` header and
+    // the two mandatory tables (`ImpT`/`ExpT`, both empty — `beam_load.c:155-169`), and
+    // no `LocT` chunk — `chunks.locals` must be empty, not an error.
     let mut body = Vec::new();
     body.extend_from_slice(b"AtU8");
     body.extend_from_slice(&6u32.to_be_bytes());
@@ -264,6 +265,11 @@ fn a_container_without_a_loct_chunk_has_no_locals() {
     body.extend_from_slice(&181u32.to_be_bytes()); // max_opcode
     body.extend_from_slice(&0u32.to_be_bytes()); // label_count
     body.extend_from_slice(&0u32.to_be_bytes()); // function_count
+    for id in [b"ImpT", b"ExpT"] {
+        body.extend_from_slice(id);
+        body.extend_from_slice(&4u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes()); // count = 0
+    }
     let mut image = Vec::new();
     image.extend_from_slice(b"FOR1");
     image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
@@ -274,6 +280,8 @@ fn a_container_without_a_loct_chunk_has_no_locals() {
     assert!(container.find(ChunkId::LOCT).is_none());
     let chunks = chunk::parse(&container).expect("chunk::parse");
     assert!(chunks.locals.is_empty());
+    assert!(chunks.imports.is_empty());
+    assert!(chunks.exports.is_empty());
 }
 
 #[test]

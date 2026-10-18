@@ -381,12 +381,19 @@ fn wrap(body: Vec<u8>) -> Vec<u8> {
 /// `Code` header takes `max_opcode` / `label_count`; `extras` appends further chunks
 /// (`Type`, `LitT`, …) verbatim. Only the bytes a case varies differ between it and
 /// its control, so each rejection comes from the operand (or header field) under test.
+///
+/// The prologue defines labels 1 and 2, so `label_count` is widened to hold them:
+/// `lower::build_module` rejects a label definition outside `0 < label < label_count`
+/// (`jit/asm_load.c:512-521`), and a header too small for its own labels would fail
+/// every case for that reason instead of the one under test. A dedicated label-bound
+/// case builds its header explicitly (`tests/negative_ir.rs`).
 fn image_with_body(
     body: &[u8],
     max_opcode: u32,
     label_count: u32,
     extras: &[(&[u8; 4], &[u8])],
 ) -> Vec<u8> {
+    let label_count = label_count.max(3);
     let mut code = Vec::new();
     code.extend_from_slice(&16u32.to_be_bytes()); // head_size
     code.extend_from_slice(&0u32.to_be_bytes()); // format_number
@@ -409,6 +416,10 @@ fn image_with_body(
     let mut chunks = Vec::new();
     push_chunk(&mut chunks, b"AtU8", &atoms);
     push_chunk(&mut chunks, b"Code", &code);
+    // `ImpT`/`ExpT` are mandatory chunks (`beam_load.c:155-169`); empty tables keep the
+    // image structurally complete so each case fails for the operand under test.
+    push_chunk(&mut chunks, b"ImpT", &0u32.to_be_bytes());
+    push_chunk(&mut chunks, b"ExpT", &0u32.to_be_bytes());
     for (id, payload) in extras {
         push_chunk(&mut chunks, id, payload);
     }
@@ -534,7 +545,7 @@ fn rejects_an_out_of_range_label_index() {
     // code->label_count)` for every non-zero `f` operand (`beam_file.c:2324-2331`).
     let op = Opcode::is_eq_exact.as_u8();
     let mut body = vec![op];
-    body.extend(tagged(5, 2)); // Fail = `f,2` — NOT below `label_count` 2
+    body.extend(tagged(5, 3)); // Fail = `f,3` — NOT below `label_count` 3
     body.extend(tagged(3, 0));
     body.extend(tagged(3, 0));
     let mut control = vec![op];

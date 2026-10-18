@@ -31,9 +31,20 @@
 //!
 //! These are the *raw* wire forms (still atom **indices**, not interned atoms);
 //! [`crate::lower`] maps them onto the IR using the atom table.
-use beam_common::Result;
+//!
+//! Both readers enforce the two structural bounds the C reader applies to every entry:
+//! an arity outside `0..=MAX_ARG` (`beam_file.c:335` for imports, `beam_file.c:373` for
+//! exports/locals) and a negative export label (`beam_file.c:374`).
+use beam_common::{BeamError, Result};
 
 use crate::error::bad_file;
+
+/// The emulator's maximum function arity (`MAX_ARG`, `erts/emulator/beam/erl_vm.h:48`).
+///
+/// `parse_import_chunk` and `parse_export_table` both assert
+/// `arity >= 0 && arity <= MAX_ARG`, so an arity above this (or a negative one, which
+/// the wire can express because the field is a signed `i32`) is a corrupt table.
+const MAX_ARG: i32 = 255;
 
 /// Reads a table's leading `i32` entry count, rejecting a negative value.
 ///
@@ -45,6 +56,20 @@ fn read_count(reader: &mut beam_codec::Reader<'_>) -> Result<usize> {
         return Err(bad_file("negative table count"));
     }
     Ok(raw as usize)
+}
+
+/// Reads one `i32` function-arity field, rejecting a value outside `0..=MAX_ARG`.
+///
+/// `LoadAssert(arity >= 0 && arity <= MAX_ARG)` (`beam_file.c:335` imports,
+/// `beam_file.c:373` exports/locals). The bound is a scaling limit on the function
+/// itself, so it is the crate's documented [`BeamError::SystemLimit`] (the C reports
+/// the table as corrupt; the Erlang-observable class is `badfile` either way).
+fn read_arity(reader: &mut beam_codec::Reader<'_>) -> Result<u32> {
+    let raw = reader.u32be()? as i32;
+    if !(0..=MAX_ARG).contains(&raw) {
+        return Err(BeamError::SystemLimit);
+    }
+    Ok(raw as u32)
 }
 
 /// A raw `ExpT` entry (atom indices, not interned atoms).
@@ -95,12 +120,17 @@ pub fn parse_exports(data: &[u8]) -> Result<Vec<RawExport>> {
     for _ in 0..count {
         // Each entry is `{ i32 function_atom, i32 arity, i32 label }`.
         let function = reader.u32be()?;
-        let arity = reader.u32be()?;
-        let label = reader.u32be()?;
+        let arity = read_arity(&mut reader)?;
+        // `LoadAssert(label >= 0)` (`beam_file.c:374`): a negative label is corrupt,
+        // never the wrapped `Label(4294967295)`.
+        let label = reader.u32be()? as i32;
+        if label < 0 {
+            return Err(bad_file("negative export label"));
+        }
         exports.push(RawExport {
             function,
             arity,
-            label,
+            label: label as u32,
         });
     }
     Ok(exports)
@@ -133,7 +163,7 @@ pub fn parse_imports(data: &[u8]) -> Result<Vec<RawImport>> {
         // Each entry is `{ i32 module_atom, i32 function_atom, i32 arity }`.
         let module = reader.u32be()?;
         let function = reader.u32be()?;
-        let arity = reader.u32be()?;
+        let arity = read_arity(&mut reader)?;
         imports.push(RawImport {
             module,
             function,

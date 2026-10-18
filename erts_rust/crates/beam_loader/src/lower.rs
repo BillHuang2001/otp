@@ -34,6 +34,7 @@
 //! Every fallible step reports `BeamError::BadArg` through [`crate::error::bad_file`]
 //! (or `BeamError::SystemLimit` for a size bound); the module never panics and never
 //! `unwrap()`s file data.
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use beam_common::{BeamError, Result};
@@ -44,12 +45,13 @@ use crate::chunk::Chunks;
 use crate::decoded::DecodedTerm;
 use crate::decode::RawInstr;
 use crate::error::bad_file;
-use crate::ir::{Export, Function, FunDescriptor, Import, Module, RecordDefinition, RecordField};
+use crate::ir::{Export, FunDescriptor, Import, Module, RecordDefinition, RecordField};
 use crate::literal::LiteralArea;
 use crate::operand::{Label, Operand};
 
 mod group;
 mod instr;
+mod validate;
 pub mod fuse;
 
 pub use group::{build_blocks, group_functions};/// Assembles the IR [`Module`] from the parsed chunks and the decoded instructions.
@@ -138,13 +140,34 @@ pub fn build_module(
 
     let functions = group_functions(raw_instrs)?;
 
+    // The `Code` header's declared label/function counts and the `Line`/`ImpT` tables
+    // bound what the assembled code may reference (`jit/asm_load.c`): a defined label
+    // must lie in the declared label space and be defined once, there must be exactly
+    // `function_count` functions, a `func_info` arity must fit `MAX_ARG`, and every
+    // import index and line-item reference must resolve. Accept/reject-only, exactly as
+    // the C validates while it emits code — see `lower/validate.rs`.
+    let line = chunks.line.clone().unwrap_or_default();
+    validate::validate_code(&functions, chunks.code_version, &line, imports.len())?;
+
     // `FunT` carries wire atom indices; the fun-table index (`make_fun3`'s operand)
     // is the entry's *position*, so file order is preserved.
     let mut funs = Vec::with_capacity(chunks.funs.len());
+    // One lambda per label: the C keeps a single `lambda_index` slot per label and
+    // refuses a second entry for it (`jit/asm_load.c:150-165`, "lambda already defined
+    // for label %i").
+    let mut fun_labels: BTreeSet<u32> = BTreeSet::new();
     for raw in &chunks.funs {
         let label = Label(raw.label);
-        if !has_label(&functions, label) {
+        // `beam_file.c:429`'s `LoadAssert(label > 0 && label < label_count)`: label 0 is
+        // the "no label" sentinel, never a lambda body.
+        if raw.label == 0 {
+            return Err(bad_file("fun descriptor label is zero"));
+        }
+        if !validate::is_defined_label(&functions, label) {
             return Err(bad_file("fun descriptor label is not a label in the module"));
+        }
+        if !fun_labels.insert(raw.label) {
+            return Err(bad_file("lambda already defined for label"));
         }
         funs.push(FunDescriptor {
             function: atom_at(&atoms, raw.function)?,
@@ -210,7 +233,7 @@ pub fn build_module(
         records,
         code_version: chunks.code_version,
         types: chunks.types.clone(),
-        line: chunks.line.clone().unwrap_or_default(),
+        line,
         literals,
         strings: chunks.strings.clone(),
         attributes: chunks.attributes.clone(),
@@ -221,16 +244,6 @@ pub fn build_module(
         meta_table: Arc::new(meta_table),
         checksum,
     })
-}
-
-/// Whether `label` is a code label defined in one of the module's functions.
-///
-/// The `FunT` labels address lambda bodies, which are ordinary labelled blocks, so a
-/// descriptor whose label exists nowhere in the code is a malformed table.
-fn has_label(functions: &[Function], label: Label) -> bool {
-    functions
-        .iter()
-        .any(|function| function.labels.contains_key(&label))
 }
 
 /// Resolves a wire atom index through the module's `atoms` map.
@@ -479,7 +492,7 @@ mod tests {
 
     use super::instr::lower_instr;
     use super::*;
-    use crate::chunk::table::{RawExport, RawFun};
+    use crate::chunk::table::{RawExport, RawFun, RawImport};
     use crate::ir::{
         BsGetArgs, CodeVersion, ImportRef, Instr, MapWriteArgs, TypeTable, UpdateRecordArgs,
     };
@@ -1660,13 +1673,21 @@ mod tests {
 
     /// A minimal chunk set holding one 0-arity function, used to drive
     /// [`build_module`] with a chosen `FunT` / `LitT` table.
+    ///
+    /// The `ImpT` carries one entry (`m:f/0`) so a synthetic stream may name import
+    /// index 0: `build_module` rejects an `ImportRef` past the import table
+    /// (`jit/asm_load.c:532-548`), which a hand-built stream would otherwise trip.
     fn minimal_chunks(funs: Vec<RawFun>, literals: Vec<Vec<u8>>) -> Chunks<'static> {
         Chunks {
             atoms: vec![String::new(), "m".to_string(), "f".to_string()],
             code: None,
             exports: Vec::new(),
             locals: Vec::new(),
-            imports: Vec::new(),
+            imports: vec![RawImport {
+                module: 1,   // "m"
+                function: 2, // "f"
+                arity: 0,
+            }],
             funs,
             records: Vec::new(),
             line: None,
@@ -1718,9 +1739,14 @@ mod tests {
         let chunks = coverage_chunks();
         assert_eq!(chunks.literals.len(), 3);
         // Isolate the literal table: the fixture's fun descriptor addresses label 37,
-        // which `minimal_stream` does not define (see the fun test below).
+        // which `minimal_stream` does not define (see the fun test below). The `Code`
+        // header's own label/function counts are dropped with it — they describe the
+        // fixture's 675-byte instruction stream, not this stand-in, and `build_module`
+        // rejects a stream whose `func_info` count disagrees with a non-zero header
+        // (`jit/asm_load.c:625-629,737-743`).
         let chunks = Chunks {
             funs: Vec::new(),
+            code_version: CodeVersion::default(),
             ..chunks
         };
         let (_, table) = coverage_atoms(&chunks);
@@ -1781,6 +1807,12 @@ mod tests {
             },
             raw(Opcode::r#return, vec![]),
         ];
+        // The `Code` header describes the fixture's own stream (12 functions, labels
+        // 1..37), not this stand-in — see the comment in the literals test above.
+        let chunks = Chunks {
+            code_version: CodeVersion::default(),
+            ..chunks
+        };
         let module = build_module(&chunks, &instrs, table).unwrap();
 
         assert_eq!(module.funs().len(), 1);
