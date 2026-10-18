@@ -191,8 +191,8 @@ pub(crate) const BAD_OBJECT_MODULE_NAME_PREFIX: &str = "module name in object co
 /// This is the loader's expected-name check — the C's `beam_load.c:186`
 /// (`check_module_name`, `make_descriptor`): the object code declares one module name and the
 /// load was asked for another, so the image is refused. Every name-based load route
-/// ([`CodeServer::load`](crate::CodeServer::load)) raises this, and its callers fold it into
-/// the oracle's single `badfile` reason (`code:load_file/1` ⇒ `{error,badfile}`,
+/// ([`CodeServer::load`](crate::CodeServer::load)) raises this, and its **`code:*`** callers
+/// fold it into the oracle's single `badfile` reason (`code:load_file/1` ⇒ `{error,badfile}`,
 /// `code:ensure_modules_loaded/1` ⇒ `{error,[{Name,badfile}]}`).
 ///
 /// The message names **both** modules so a CLI diagnostic (`beam_rt: error …`) is as
@@ -204,8 +204,9 @@ pub(crate) const BAD_OBJECT_MODULE_NAME_PREFIX: &str = "module name in object co
 /// A `code:*` caller *returns* `badfile`; an **on-demand load performed by a call** (an
 /// `M:F/A` external call to a not-yet-loaded module) does not return anything — the oracle
 /// raises `undef`, exactly as it does for a module with no `.beam` at all (measured on OTP
-/// 29.1.1 / erts-17.1: uncaught `mismatch:id(7)` with a `mismatch.beam` really holding
-/// `mymod` ⇒ exit 1, empty stdout/stderr; `catch mismatch:id(7)` ⇒
+/// 29.1.1 / erts-17.1 with a `mismatch.beam` really holding `mymod`: uncaught
+/// `mismatch:id(7)` ⇒ exit 1, empty stdout, and the node's crash report on stderr naming
+/// `({undef,[{mismatch,id,[7],[]}, …]})`; `catch mismatch:id(7)` ⇒
 /// `{'EXIT',{undef,[{mismatch,id,[7],[]}, …]}}`). The call site discriminates the two with
 /// [`is_bad_object_module_name`] and raises [`undef`] — see
 /// [`call_load_failure`], the single mapping.
@@ -245,7 +246,8 @@ pub(crate) fn is_bad_object_module_name(error: &BeamError) -> bool {
 /// image alike. Measured on OTP 29.1.1 / erts-17.1 with a `-pa` directory holding a
 /// `mismatch.beam` whose object code declares `mymod`:
 ///
-/// * uncaught `mismatch:id(7)` ⇒ exit 1, empty stdout, empty stderr;
+/// * uncaught `mismatch:id(7)` ⇒ exit 1, empty stdout, and a crash report on stderr naming
+///   `({undef,[{mismatch,id,[7],[]}, …]})` — the same for `nosuchmod_xyz:f(1)`;
 /// * `catch mismatch:id(7)` ⇒ `{'EXIT',{undef,[{mismatch,id,[7],[]}, {erl_eval,…}, …]}}`,
 ///   i.e. the reason is the bare atom `undef`, byte-identical to the same call against
 ///   `nosuchmod_xyz` (a module with no file).
