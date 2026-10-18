@@ -39,7 +39,6 @@
 use super::opcode_tests::{erl_stdout, loopback_arg, open_arg, op};
 use super::wire::ctl_ok;
 use super::TcpInetDriver;
-use crate::driver::Driver;
 use crate::poller::Poller;
 use crate::port::PortRegistry;
 use crate::port_task::{ActiveInput, ActiveInputEvent, ReadMessage};

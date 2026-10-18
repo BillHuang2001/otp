@@ -261,13 +261,14 @@ impl UdpInetDriver {
     /// The `setopts` control verb **with** its post-walk effects: the option walk plus
     /// [`UdpInetDriver::after_setopts`].
     ///
-    /// [`UdpInetDriver::verb_setopts`]'s body is exactly the walk (kept separate because it has
-    /// no context to report a delivery through); this is the pair the two control routes use.
+    /// The walk itself is [`set_options_tracked`], which needs no context; this is the pair the
+    /// two control routes (`Opcode::Setopts` and the named `"setopts"` verb) both call, so the
+    /// numeric and named replies stay byte-identical.
     ///
     /// # Errors
     ///
-    /// [`UdpInetDriver::verb_setopts`]'s argument faults, plus
-    /// [`UdpInetDriver::after_setopts`]'s.
+    /// The walk's own argument faults (the typed `BadArg` of a truncated `{active, N}` record),
+    /// plus [`UdpInetDriver::after_setopts`]'s.
     pub(super) fn setopts_with_effects(
         &mut self,
         ctx: &mut DriverContext<'_>,

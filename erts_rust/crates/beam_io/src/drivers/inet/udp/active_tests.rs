@@ -62,7 +62,6 @@ use super::super::wire::{
     ctl_ok, ctl_xerror, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_TYPE_DGRAM,
 };
 use super::UdpInetDriver;
-use crate::driver::Driver;
 use crate::poller::Poller;
 use crate::port::PortRegistry;
 use crate::port_task::{ActiveInput, ActiveInputEvent, ReadMessage};
@@ -89,7 +88,7 @@ const INET_MODE_BINARY: i32 = 1;
 /// readiness callback may take.
 const INET_PACKET_POLL: i32 = 5;
 /// `INT16_MAX`: the `{active, N}` counter's ceiling (`:6975`).
-const ACTIVE_COUNT_MAX: i32 = i32::from(i16::MAX);
+const ACTIVE_COUNT_MAX: i32 = i16::MAX as i32;
 /// The `{active, 2}` credit the multi cases arm with.
 const ACTIVE_MULTI_CREDIT: i32 = 2;
 /// One round's poll budget. Every wait in this suite is a *condition* under [`HANG_GUARD`], so
@@ -340,7 +339,7 @@ fn an_active_port_delivers_the_datagram_with_its_packed_source_address() {
     let data = data_of(&drained.inputs);
     assert_eq!(data.len(), 1, "exactly one delivery: {:?}", drained.per_round);
     assert_eq!(
-        *drained.inputs[0].port, rig.id,
+        drained.inputs[0].port, rig.id,
         "the delivery names the delivering port"
     );
     let read = data[0];
@@ -528,7 +527,7 @@ fn an_active_n_reaching_zero_inside_setopts_reports_one_passive_message() {
     let staged = rig.registry.take_active_inputs();
     assert_eq!(staged.len(), 1, "exactly one delivery from the setopts path");
     assert_eq!(staged[0].event, ActiveInputEvent::Passive);
-    assert_eq!(*staged[0].port, rig.id);
+    assert_eq!(staged[0].port, rig.id);
     assert_eq!(rig.active_state(), (INET_PASSIVE, None));
     // Draining is idempotent: the message is reported exactly once.
     rig.inject(b"x");

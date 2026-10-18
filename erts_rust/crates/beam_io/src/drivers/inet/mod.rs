@@ -1469,7 +1469,7 @@ impl TcpInetDriver {
     /// [`TcpInetDriver::setopts_with_delivery`], which is this walk plus the tail of
     /// `inet_set_opts` (the passive message and the inline read). Kept as the reference the
     /// suite pins that tail against, byte for byte.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
         let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_TCP);
         set_options(&mut self.options, scope, self.socket, arg)
