@@ -419,10 +419,64 @@ fn a_reactor_observed_peer_close_releases_the_registration_and_reports_closed() 
     ports.close(&mut poller, id).expect("closes the port");
 }
 
+/// `PortRegistry::port_closed` reports the driver's **latched** peer close (`Driver::port_closed`,
+/// the `TcpInetDriver::peer_closed` latch), not a guess from the descriptor or the byte queues.
+///
+/// A freshly opened, connected port answers `false`; once the peer half-closes and the driver reads
+/// the end-of-file (`read_bytes` → `latch_peer_close`) the answer is `true` and stays `true` for the
+/// rest of the port's life — a runtime scans the probe once per round to deliver
+/// `{tcp_closed, Port}`, so a latch that flipped back would leave the owner of a dead port waiting.
+/// The round is driven by the reactor plus the `recv` verb (either observes the end-of-file), never
+/// by a fixed sleep, so a slow host cannot make the assertion vacuous or flaky.
+#[test]
+fn port_closed_reports_the_drivers_latched_peer_close() {
+    let mut poller = poller();
+    let (mut ports, id) = tcp_port(&mut poller);
+    let port = listen_on_loopback(&mut poller, &mut ports, id);
+    let client = TcpStream::connect(("127.0.0.1", port)).expect("the client connects");
+    accept(&mut poller, &mut ports, id);
+
+    assert!(
+        !ports.port_closed(id).expect("the port is live"),
+        "a live connection has no peer close to report"
+    );
+
+    // The peer closes its write end; the end-of-file reaches the driver through a read, which is
+    // what the reactor's `ready_input` and the `recv` verb both do.
+    client.shutdown(Shutdown::Write).expect("the peer half-closes");
+    let deadline = Instant::now() + WAIT;
+    while !ports.port_closed(id).expect("the port is live") {
+        let events = match poller.poll(Some(Duration::from_millis(20))) {
+            Ok(events) => events,
+            Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => panic!("poll failed: {err:?}"),
+        };
+        ports
+            .handle_events(&mut poller, &events)
+            .expect("dispatch the ready events");
+        let _ = control(&mut ports, &mut poller, id, "recv", b"");
+        assert!(
+            Instant::now() < deadline,
+            "the peer's close was never latched by the driver"
+        );
+    }
+    assert!(
+        ports.port_closed(id).expect("the port is live"),
+        "the latch is sticky: it survives the round that observed it"
+    );
+
+    // An id no port was ever opened under is the registry's usual `badarg`.
+    assert!(matches!(
+        ports.port_closed(PortId::new(9999)),
+        Err(BeamError::BadArg)
+    ));
+
+    ports.close(&mut poller, id).expect("closes the port");
+}
+
 // ---------------------------------------------------------------------------
 // The oracle cross-check (skips loudly when `erl` is absent)
 // ---------------------------------------------------------------------------
-
 /// Runs `<expr>, halt(0).` under the system `erl` and returns its stdout.
 ///
 /// `None` — after printing a clear skip message — when `erl` cannot be spawned or does not

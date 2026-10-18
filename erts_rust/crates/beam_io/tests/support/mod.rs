@@ -233,6 +233,21 @@ pub fn compile_so(src: &Path, out: &Path, include: &Path) -> bool {
     }
 }
 
+/// The path to hand [`beam_abi::driver::loader::load`] for the compiled fixture at `artifact`.
+///
+/// The loader appends the shared-object suffix **unconditionally** — `load("/x/foo.so", …)` opens
+/// `/x/foo.so.so`, the measured behaviour of `erlang:load_driver/2`
+/// (`erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`) — while [`compile_so`] produces the
+/// artifact *with* its `.so`. A test that wants the artifact it just compiled therefore hands the
+/// loader the path **without** the suffix; passing the artifact path straight through fails the load
+/// with a diagnostic naming `<path>.so.so`, so this helper panics rather than returning a wrong
+/// string.
+pub fn load_path(artifact: &Path) -> &str {
+    let path = artifact.to_str().expect("the fixture path is valid UTF-8");
+    path.strip_suffix(".so")
+        .unwrap_or_else(|| panic!("the compiled fixture path ends in `.so`, got {path}"))
+}
+
 /// A **fresh** scratch directory under [`std::env::temp_dir`] (`$TMPDIR`), unique per stem +
 /// process + call, so parallel test binaries do not collide.
 ///

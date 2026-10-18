@@ -51,7 +51,7 @@ mod support;
 
 use std::path::PathBuf;
 
-use support::{cc_available, compile_so, erl_include_dir, probe_driver_name, scratch_dir, skip};
+use support::{cc_available, compile_so, erl_include_dir, load_path, probe_driver_name, scratch_dir, skip};
 
 /// The committed C fixture.
 fn fixture_source() -> PathBuf {
@@ -86,6 +86,14 @@ fn vector_fixture_source() -> PathBuf {
 /// loaded under `"host_driver"`.
 fn both_fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver_both.c")
+}
+/// The committed `ERL_DRV_FLAG_SOFT_BUSY` fixture (`host_driver_soft_busy.c`): `host_driver.c`
+/// with the entry's `driver_flags` set to `ERL_DRV_FLAG_SOFT_BUSY`, the other side of
+/// `port_command/3`'s `[force]` branch (the base fixture's `driver_flags` is `0`, which is the
+/// `error:notsup` side). Its entry keeps `host_driver.c`'s `driver_name`, so it is loaded under
+/// `"host_driver"`.
+fn soft_busy_fixture_source() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver_soft_busy.c")
 }
 /// Force the `#[no_mangle]` `driver_*` host symbols into this test binary's **dynamic** symbol
 /// table (see `tests/abi_driver.rs`, which carries the long explanation).
@@ -130,7 +138,7 @@ fn build_and_load(src: PathBuf, stem: &str, name: &str) {
     // `driver_*` import must be resolvable from the loading process, so a failure here is a wiring
     // gap (the host symbols are not exported), never a fixture bug — and never something to skip.
     force_driver_symbols_link();
-    let path = so.to_str().expect("the fixture path is valid UTF-8");
+    let path = load_path(&so);
     match beam_abi::driver::loader::load(path, name) {
         Ok(library) => assert_eq!(
             library.name(),
@@ -193,6 +201,17 @@ fn host_driver_no_process_exit_variant_builds_and_loads() {
 #[test]
 fn host_driver_both_variant_builds_and_loads() {
     build_and_load(both_fixture_source(), "host_driver_both", "host_driver");
+}
+
+/// The same for the `ERL_DRV_FLAG_SOFT_BUSY` fixture: it must stay buildable and loadable, so
+/// `tests/abi_busy.rs`'s `[force]`-bypasses-the-busy-state test can rely on it.
+#[test]
+fn host_driver_soft_busy_variant_builds_and_loads() {
+    build_and_load(
+        soft_busy_fixture_source(),
+        "host_driver_soft_busy",
+        "host_driver",
+    );
 }
 
 /// The include-directory helper must return a directory that really holds the driver header (the

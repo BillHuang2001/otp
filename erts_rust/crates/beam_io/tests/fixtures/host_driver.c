@@ -166,6 +166,11 @@
  * (which also sets `HOST_DRIVER_HAS_OUTPUTV`). `host_driver_both.c` sets the slot to
  * `host_outputv`, so its entry is the one build that declares all three at once — the shape the
  * C's `outputv`-over-`output` preference (`io.c:1782`) is about.
+ *
+ * The entry's `driver_flags` bitfield is `0` in the base build and has the same override:
+ * `host_driver_soft_busy.c` defines `HOST_DRIVER_DRIVER_FLAGS_SLOT` to
+ * `ERL_DRV_FLAG_SOFT_BUSY`, the flag that makes `port_command/3`'s `[force]` bypass a busy port
+ * instead of being refused with `error:notsup`.
  */
 /* The fixture uses the POSIX `nanosleep` (the slow async job) and `read`/`close`, which a strict
  * `-std=c99` compilation does not expose without a feature-test macro; ask for POSIX.1-2008
@@ -221,6 +226,17 @@
 #define HOST_DRIVER_HAS_OUTPUTV 1
 #else
 #define HOST_DRIVER_OUTPUTV_SLOT NULL
+#endif
+
+/* The entry's `driver_flags` bitfield: `0` in the base fixture (the driver advertises no flag, so
+ * `erlang:port_command/3`'s `[force]` is the oracle's `error:notsup` for it) and
+ * `ERL_DRV_FLAG_SOFT_BUSY` in the variant that asks for it (`host_driver_soft_busy.c`), where a
+ * forced command bypasses the busy state instead of being refused. Same `_SLOT` override pattern as
+ * the callback slots above: a variant defines the macro before including this file. */
+#ifdef HOST_DRIVER_DRIVER_FLAGS_SLOT
+/* Defined by a variant — respect its choice. */
+#else
+#define HOST_DRIVER_DRIVER_FLAGS_SLOT 0
 #endif
 /* Private per-port state, allocated in `start` and intentionally **never freed** (see `host_stop`). */
 typedef struct {
@@ -820,7 +836,7 @@ static ErlDrvEntry host_driver_entry = {
     .extended_marker = ERL_DRV_EXTENDED_MARKER,
     .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
     .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
-    .driver_flags = 0,
+    .driver_flags = HOST_DRIVER_DRIVER_FLAGS_SLOT,
     .handle2 = NULL,
     .process_exit = HOST_DRIVER_PROCESS_EXIT_SLOT,
     .stop_select = host_stop_select,
