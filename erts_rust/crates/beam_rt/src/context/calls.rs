@@ -935,10 +935,19 @@ impl<'a> RuntimeContext<'a> {
     /// # The walk
     ///
     /// [`beam_term::layout::for_each_child_slot`] — the workspace's canonical per-shape child
-    /// enumeration, the same one the copier and the unscanned-root valve drive — over an explicit
-    /// worklist, with each object's address visited once so a shared or cyclic subgraph costs one
-    /// visit. Literals are skipped: a frozen code constant lives in the literal area and can name
-    /// nothing on this heap. So is every word that is **not a readable term** (see *Safety*).
+    /// enumeration, the same one the copier and the unscanned-root valve drive — over a
+    /// **hash-free** worklist ([`Walklist`]): an inline buffer of [`WALK_INLINE_ITEMS`] words plus a
+    /// spill `Vec` allocated only when a graph really is wider than that, so an ordinary result
+    /// allocates **nothing** and pays no per-object bookkeeping. The walk therefore keeps **no
+    /// visited set** — a well-formed BEAM term graph is acyclic, so a plain worklist terminates —
+    /// and is bounded instead by [`WALK_VISIT_BUDGET`]: a **forged** cycle exhausts the budget and
+    /// answers `true`, i.e. "assume it holds a reference", which only *declines the move* (the
+    /// result stays on the pooled heap and the call does not rewind — the residual this function
+    /// documents at its call site), never a wrong move. A *shared* subgraph is re-walked once per
+    /// parent, which costs a bounded constant factor and no allocation.
+    ///
+    /// Literals are skipped: a frozen code constant lives in the literal area and can name nothing
+    /// on this heap. So is every word that is **not a readable term** (see *Safety*).
     ///
     /// # Safety
     ///
@@ -952,8 +961,11 @@ impl<'a> RuntimeContext<'a> {
     /// itself and lets the copier refuse.
     #[allow(unsafe_code)]
     fn graph_holds_reference(term: Eterm) -> bool {
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut work: Vec<Eterm> = vec![term];
+        #[cfg(test)]
+        notes::note_walk_call();
+        let mut work = Walklist::new();
+        let mut budget = WALK_VISIT_BUDGET;
+        work.push(term);
         while let Some(item) = work.pop() {
             // Three words can reach the worklist without being a readable container, and each is
             // skipped here so nothing below ever dereferences it.
@@ -980,9 +992,14 @@ impl<'a> RuntimeContext<'a> {
                 continue;
             };
             let address = address as *const Eterm;
-            if !seen.insert(address as usize) {
-                continue;
+            #[cfg(test)]
+            notes::note_walk_visit();
+            // The budget is the only bound the walk has (see *The walk*): a forged cycle would
+            // otherwise spin here forever.
+            if budget == 0 {
+                return true;
             }
+            budget -= 1;
             if beam_term::prelude::is_list(item) {
                 // SAFETY: `item` is a term word with the `LIST` primary tag whose cell pointer is
                 // non-null and aligned, so the two words at that address are its live `car` and
@@ -1012,8 +1029,7 @@ impl<'a> RuntimeContext<'a> {
             }
         }
         false
-    }
-    /// Moves a container a **scratch region** owns onto a region that **outlives the call**,
+    }    /// Moves a container a **scratch region** owns onto a region that **outlives the call**,
     /// returning the term Erlang code must see instead — or the term unchanged when it is an
     /// immediate, a literal, or a container the copier refused (in which case the scratch region
     /// is latched unrecyclable, see [`Runtime::taint_info_scratch`]).
@@ -1500,6 +1516,67 @@ pub(super) fn copy_result_fresh(
     outcome
 }
 
+/// The inline capacity of [`RuntimeContext::graph_holds_reference`]'s worklist.
+///
+/// The walk never holds more than a handful of pending children (it pushes a container's slots and
+/// pops them immediately), so an ordinary BIF result — the `copy_bound` payload is 27 objects topped
+/// by a 5-key flat map — stays inside this buffer and the walk allocates nothing at all.
+const WALK_INLINE_ITEMS: usize = 64;
+
+/// The visit budget of [`RuntimeContext::graph_holds_reference`]'s walk.
+///
+/// The walk keeps no visited set (a well-formed BEAM term graph is acyclic, so a plain worklist
+/// terminates), so this is its only bound: a **forged** cycle exhausts it and the walk answers
+/// `true` — "assume it holds a reference". That answer only *declines the move* (the result keeps
+/// its pooled words and the call does not rewind), never a wrong move.
+const WALK_VISIT_BUDGET: usize = 1 << 20;
+
+/// The worklist [`RuntimeContext::graph_holds_reference`] walks a result graph with: an inline
+/// buffer of [`WALK_INLINE_ITEMS`] terms plus a spill `Vec` that is allocated **only** when a graph
+/// is genuinely wider than that.
+///
+/// `Eterm` is `Copy`, so a push costs one word and no reference counting, and the whole structure is
+/// stack-resident in the common case — which is what replaced a `HashSet` (SipHash) plus a growing
+/// `Vec` per call, the per-object bookkeeping this walk must not pay on the hot path of every
+/// container-returning BIF.
+struct Walklist {
+    inline: [Eterm; WALK_INLINE_ITEMS],
+    len: usize,
+    spill: Vec<Eterm>,
+}
+
+impl Walklist {
+    /// An empty worklist: the inline buffer unread, the spill not yet allocated (`Vec::new`).
+    fn new() -> Self {
+        Self {
+            inline: [beam_term::prelude::NIL; WALK_INLINE_ITEMS],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// Pushes one term to visit, spilling only once the inline buffer is full.
+    fn push(&mut self, item: Eterm) {
+        if self.len < WALK_INLINE_ITEMS {
+            self.inline[self.len] = item;
+            self.len += 1;
+        } else {
+            #[cfg(test)]
+            notes::note_walk_spill();
+            self.spill.push(item);
+        }
+    }
+
+    /// Pops the next term to visit — the spill first, so the inline buffer stays the common path.
+    fn pop(&mut self) -> Option<Eterm> {
+        if let Some(item) = self.spill.pop() {
+            return Some(item);
+        }
+        self.len = self.len.checked_sub(1)?;
+        Some(self.inline[self.len])
+    }
+}
+
 /// The flat word count a refused copy reported it could not fit.
 ///
 /// [`beam_message`]'s **message-heap exhaustion** ([`beam_message::is_message_heap_exhaustion`])
@@ -1545,7 +1622,8 @@ fn invoke_registered(
     }
     bif(context, args)
 }
-/// Test-only structural counters for the copy-out (`RuntimeContext::move_result_into_process_heap`).
+/// Test-only structural counters for the copy-out (`RuntimeContext::move_result_into_process_heap`)
+/// and for the reference walk it runs first (`RuntimeContext::graph_holds_reference`).
 ///
 /// **Thread-local**, so a test that drives the copy-out reads only the counts *it* produced and the
 /// crate's parallel unit tests cannot perturb them (each `cargo test` case runs on its own thread).
@@ -1556,6 +1634,8 @@ fn invoke_registered(
 /// * `empty_destination_attempts` — one per attempt whose destination table was **fully empty** as
 ///   handed to the copier, i.e. the copier's single-traversal fast path was eligible. Computed from
 ///   the table's **public** API (the same three-list test `is_fast_path_eligible` makes).
+/// * [`WalkCounts`] — the reference walk's own counters ([`snapshot`] keeps its three-tuple shape and
+///   meaning; [`walk_snapshot`] reads the walk's).
 #[cfg(test)]
 mod notes {
     use core::cell::Cell;
@@ -1564,6 +1644,28 @@ mod notes {
         static COPY_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
         static GROW_RETRIES: Cell<usize> = const { Cell::new(0) };
         static EMPTY_DESTINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static WALK_CALLS: Cell<usize> = const { Cell::new(0) };
+        static WALK_VISITS: Cell<usize> = const { Cell::new(0) };
+        static WALK_HASH_INSERTS: Cell<usize> = const { Cell::new(0) };
+        static WALK_SPILLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The reference walk's counters, in one value so a test can assert them as a unit.
+    ///
+    /// * `calls` — one per [`RuntimeContext::graph_holds_reference`] invocation.
+    /// * `visits` — one per **dereferenced object** visited (an object whose word passed every
+    ///   readability guard and whose address resolved), i.e. the walk's real work.
+    /// * `hash_inserts` — one per **hashed** bookkeeping insert the walk performs. The walk is
+    ///   hash-free by construction, so this is `0`; the counter exists to keep that a pinned
+    ///   property instead of a comment (a walk that reintroduces a `HashSet` must charge it).
+    /// * `spills` — one per worklist item that did **not** fit the walklist's inline buffer (and so
+    ///   forced the lazily allocated spill). `0` for every ordinary result.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct WalkCounts {
+        pub(super) calls: usize,
+        pub(super) visits: usize,
+        pub(super) hash_inserts: usize,
+        pub(super) spills: usize,
     }
 
     /// Records one copy attempt against the destination table `destination`, classifying it as an
@@ -1583,11 +1685,41 @@ mod notes {
         GROW_RETRIES.with(|c| c.set(c.get() + 1));
     }
 
+    /// Records one [`RuntimeContext::graph_holds_reference`] invocation.
+    pub(super) fn note_walk_call() {
+        WALK_CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one **dereferenced object** the reference walk visited.
+    pub(super) fn note_walk_visit() {
+        WALK_VISITS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one hashed bookkeeping insert the reference walk performed.
+    ///
+    /// Nothing in the walk charges it: the walk is hash-free by construction ([`Walklist`]), so
+    /// `hash_inserts` is `0` — the counter and its setter exist so the walk's own suite asserts that
+    /// as a **pinned property** and so a walk that reintroduces a `HashSet` has the one obvious
+    /// place to charge it.
+    #[allow(dead_code)]
+    pub(super) fn note_walk_hash_insert() {
+        WALK_HASH_INSERTS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one worklist item the reference walk had to spill off its inline buffer.
+    pub(super) fn note_walk_spill() {
+        WALK_SPILLS.with(|c| c.set(c.get() + 1));
+    }
+
     /// Zeroes this thread's counters, so a test measures only its own work.
     pub(super) fn reset() {
         COPY_ATTEMPTS.with(|c| c.set(0));
         GROW_RETRIES.with(|c| c.set(0));
         EMPTY_DESTINATION_ATTEMPTS.with(|c| c.set(0));
+        WALK_CALLS.with(|c| c.set(0));
+        WALK_VISITS.with(|c| c.set(0));
+        WALK_HASH_INSERTS.with(|c| c.set(0));
+        WALK_SPILLS.with(|c| c.set(0));
     }
 
     /// This thread's `(copy_attempts, grow_retries, empty_destination_attempts)`.
@@ -1597,6 +1729,16 @@ mod notes {
             GROW_RETRIES.with(Cell::get),
             EMPTY_DESTINATION_ATTEMPTS.with(Cell::get),
         )
+    }
+
+    /// This thread's [`WalkCounts`] — the reference walk's own counters.
+    pub(super) fn walk_snapshot() -> WalkCounts {
+        WalkCounts {
+            calls: WALK_CALLS.with(Cell::get),
+            visits: WALK_VISITS.with(Cell::get),
+            hash_inserts: WALK_HASH_INSERTS.with(Cell::get),
+            spills: WALK_SPILLS.with(Cell::get),
+        }
     }
 }
 

@@ -612,6 +612,96 @@ fn the_reference_walk_skips_words_that_are_not_readable_terms() {
 }
 
 // ---------------------------------------------------------------------------------------
+// The reference walk's cost, pinned by deterministic counters (never a wall time)
+// ---------------------------------------------------------------------------------------
+
+/// The `copy_bound` benchmark's payload — the 5-key map `payload/0` builds in
+/// `tools/bench/src/workloads/copy_bound.rs`, reconstructed here from that file's constants: a
+/// 10-element list, `{ok, <<"hello world">>, 3.5}`, a 12-byte binary, `"a char list"` and `-42`.
+///
+/// An 11- and a 12-byte binary both stay **on** the heap
+/// ([`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] = 64 bytes), so the graph is exactly the
+/// `etf_roundtrip` case's copy boundary: 27 dereferenceable objects.
+fn bench_payload(
+    ctx: &mut RuntimeContext<'_>,
+    keys: [Eterm; 5],
+    ok: Eterm,
+    atoms: &beam_term::AtomTable,
+) -> Result<Eterm> {
+    let cells: Vec<Eterm> = (1..=10).map(make_small).collect();
+    let list = beam_engine::terms::make_list(ctx, &cells)?;
+    let hello = beam_engine::terms::make_heap_binary(ctx, b"hello world")?;
+    let float = beam_engine::terms::make_float(ctx, 3.5)?;
+    let tuple = beam_engine::terms::make_tuple(ctx, &[ok, hello, float])?;
+    let bytes: Vec<u8> = (1..=12).collect();
+    let binary = beam_engine::terms::make_heap_binary(ctx, &bytes)?;
+    let chars: Vec<Eterm> = "a char list".chars().map(|c| make_small(c as i64)).collect();
+    let chunk = beam_engine::terms::make_list(ctx, &chars)?;
+    let pairs = [
+        (keys[0], list),
+        (keys[1], tuple),
+        (keys[2], binary),
+        (keys[3], chunk),
+        (keys[4], make_small(-42)),
+    ];
+    beam_engine::terms::make_map(ctx, &pairs, atoms)
+}
+
+/// **One registered-BIF container result costs one walk call, 27 visits, no hashing, no spill.**
+///
+/// The graph walked is the one `binary_to_term/1` **rebuilds** on the pooled BIF heap from
+/// `term_to_binary/1`'s image — the `etf_roundtrip` benchmark case's own round-trip — so the
+/// counted objects are the ones the copy boundary really moves: the flat-map block, the key tuple
+/// the flat map wraps its five keys in, the ten cons cells of `[1..10]`, the `{ok, …}` tuple, its
+/// on-heap binary and its float, the 12-byte binary, and the eleven cons cells of `"a char list"`
+/// (`1 + 1 + 10 + 1 + 1 + 1 + 1 + 11 = 27`).
+///
+/// The three bookkeeping counters are the point of the test: the walk must dereference each object
+/// once (`visits`), must do **no** hashed bookkeeping (`hash_inserts == 0` — the walk keeps no
+/// visited set) and must never leave its inline worklist (`spills == 0`), so an ordinary BIF call
+/// allocates nothing for it.
+#[test]
+fn the_reference_walk_visits_a_bench_shaped_payload_without_hashing_or_spilling() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    let (mut table, pid) = process_table(&mut rt);
+    let keys = ["a", "b", "c", "d", "e"].map(|name| rt.intern(name));
+    let ok = rt.intern("ok");
+    let atoms = rt.code_server().atoms_handle();
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    let payload = bench_payload(&mut ctx, keys, ok, &atoms).expect("the bench payload");
+    let image = ctx
+        .call_bif("erlang", "term_to_binary", 1, &[payload])
+        .expect("term_to_binary/1 of the payload");
+    // Only the `binary_to_term/1` call is measured: its result is the container the copy-out
+    // re-homes, and therefore the graph the walk sees.
+    notes::reset();
+    let rebuilt = ctx
+        .call_bif("erlang", "binary_to_term", 1, &[image])
+        .expect("binary_to_term/1 of the image");
+    let counts = notes::walk_snapshot();
+    assert_eq!(
+        counts,
+        notes::WalkCounts {
+            calls: 1,
+            visits: 27,
+            hash_inserts: 0,
+            spills: 0
+        },
+        "one container result: one walk, one visit per object, hash-free, spill-free"
+    );
+    // The walk saw the real payload: re-encoding the rebuilt graph reproduces the image byte for
+    // byte, i.e. every object the walk visited is the payload's own object.
+    let re_encoded = ctx
+        .call_bif("erlang", "term_to_binary", 1, &[rebuilt])
+        .expect("term_to_binary/1 of the rebuilt payload");
+    assert_eq!(
+        beam_engine::terms::binary_bytes(re_encoded).expect("a binary"),
+        beam_engine::terms::binary_bytes(image).expect("a binary"),
+        "the round-trip rebuilt the payload unchanged"
+    );
+}
+// ---------------------------------------------------------------------------------------
 // The table-less (`-eval`) route's pooled BIF heap — counters first.
 //
 // The rewind above needs a destination for a container result. With no process
