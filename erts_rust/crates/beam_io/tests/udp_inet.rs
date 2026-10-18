@@ -45,10 +45,10 @@
 //!   read direction). The real write path is the `send` verb, which writes synchronously and
 //!   leaves the output queue empty.
 //! * `an_unknown_verb_is_a_bad_arg_and_the_reserved_close_op_closes_the_port` — the port layer's
-//!   verb dispatch: an unknown verb is `BeamError::BadArg` (never a silently-accepted no-op), the
-//!   reserved `"close"` op closes the port with an empty reply, and the close is reported
-//!   **exactly once** as a `PortNotification::Closed`.
-//! * `the_covered_control_replies_agree_with_the_erl_oracle` — the **compatibility gate** for the
+//!   verb dispatch: an unknown verb is `BeamError::BadArg` (never a silently-accepted no-op), a
+//!   second `open` on the live port is the C's `[0]exbadseq` sequence error (cross-checked against
+//!   the oracle's own second `open` reply), the reserved `"close"` op closes the port with an empty
+//!   reply, and the close is reported **exactly once** as a `PortNotification::Closed`.//! * `the_covered_control_replies_agree_with_the_erl_oracle` — the **compatibility gate** for the
 //!   verbs this floor covers: the same control sequence is run against the *real* system
 //!   `udp_inet` driver through `erl` (`open_port({spawn_driver, "udp_inet"}, [binary])` +
 //!   `port_control`, as `prim_inet.erl:103` does) and the reply bytes are compared. Only the
@@ -511,10 +511,42 @@ fn the_read_and_write_readiness_rounds_behave_for_a_datagram_socket() {
     ports.close(&mut poller, id).expect("closes the port");
 }
 
-/// The port layer's verb dispatch: an unknown verb is the crate's argument fault, the registry's
-/// one reserved control name closes the port, and the close is reported exactly once.
+/// The port layer's verb dispatch: an unknown verb is the crate's argument fault, a second `open`
+/// on the live port is the C's sequence error (measured against the oracle), the registry's one
+/// reserved control name closes the port, and the close is reported exactly once.
 #[test]
 fn an_unknown_verb_is_a_bad_arg_and_the_reserved_close_op_closes_the_port() {
+    // The oracle's row first: the same `open` twice on a real `"udp_inet"` port. On an unavailable
+    // oracle this is the loud skip, and every Rust row below still runs.
+    let oracle_second_open = match erl_stdout(&oracle_expression(
+        UDP_DRIVER_NAME,
+        &[
+            (INET_REQ_OPEN, open_arg().to_vec()),
+            (INET_REQ_OPEN, open_arg().to_vec()),
+        ],
+    )) {
+        Some(dump) => {
+            let replies = parse_reply_dump(&dump)
+                .unwrap_or_else(|| panic!("could not parse the oracle reply dump: {dump:02x?}"));
+            assert_eq!(replies.len(), 2, "one reply per `open`: {replies:02x?}");
+            assert_eq!(
+                replies[0],
+                vec![INET_REP_OK],
+                "the oracle's first `open` succeeds"
+            );
+            eprintln!(
+                "oracle second-open reply: {:02x?} ({:?})",
+                replies[1],
+                String::from_utf8_lossy(&replies[1])
+            );
+            Some(replies[1].clone())
+        }
+        None => {
+            eprintln!("SKIP: no `erl` on PATH — skipping the udp_inet second-open oracle check");
+            None
+        }
+    };
+
     let mut poller = poller();
     let (mut ports, id) = udp_port(&mut poller);
     open_and_bind_ephemeral(&mut poller, &mut ports, id);
@@ -534,19 +566,27 @@ fn an_unknown_verb_is_a_bad_arg_and_the_reserved_close_op_closes_the_port() {
         "the refused verb did not disturb the port"
     );
 
-    // A second `open` on the live port is refused rather than replacing the socket — the C's
-    // `[0]exbadseq` is this floor's `[0]einval` (the same choice `TcpInetDriver::verb_open` makes).
+    // A second `open` on the live port is refused rather than replacing the socket. The C's
+    // `inet_ctl_open` starts with `if (desc->state != INET_STATE_CLOSED) return
+    // ctl_xerror(EXBADSEQ, rbuf, rsize);` (`inet_drv.c:5119`-`:5126`) and **both** drivers'
+    // `INET_REQ_OPEN` arms route into it (`tcp_inet_ctl` `:11997`, `packet_inet_ctl` `:14617`), so a
+    // live port — opened, bound, listening or connected — answers `[0]exbadseq`, not the generic
+    // `[0]einval` an argument fault would. The row is measured, not assumed: the reply must be the
+    // one the system driver answered above.
+    let second_open = control(&mut ports, &mut poller, id, "open", &open_arg());
     assert_eq!(
-        control(
-            &mut ports,
-            &mut poller,
-            id,
-            "open",
-            &[INET_AF_INET, INET_TYPE_DGRAM, INET_PROTO_DEFAULT]
-        ),
-        ctl_xerror("einval"),
-        "a live port refuses a second socket"
+        second_open,
+        ctl_xerror("exbadseq"),
+        "a live port refuses a second socket with the C's sequence error"
     );
+    if let Some(oracle) = &oracle_second_open {
+        assert_eq!(
+            &second_open, oracle,
+            "the second-open reply agrees with the oracle's: rust={second_open:02x?} \
+             oracle={oracle:02x?}"
+        );
+    }
+
     // The explicit UDP protocol is accepted on a **fresh** port (`udp::verb_open` serves both
     // `INET_PROTO_DEFAULT` and `INET_PROTO_UDP`), so the refusal above is about the live socket,
     // not the protocol.
@@ -625,9 +665,10 @@ fn erl_stdout(expr: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// The `erl` expression driving an oracle `udp_inet` port: open the driver port, run `calls`
-/// (each `(request code, argument bytes)`) through `port_control`, and write every reply as
-/// raw bytes prefixed by its big-endian length.
+/// The `erl` expression driving an oracle `<driver>` port (`"udp_inet"` from this suite, and any
+/// other built-in driver a cross-check names): open the driver port, run `calls` (each `(request
+/// code, argument bytes)`) through `port_control`, and write every reply as raw bytes prefixed by
+/// its big-endian length.
 ///
 /// The replies are **length-framed** rather than `|`-separated: a reply's payload can contain any
 /// byte — an ephemeral port, an errno name — so a one-byte separator would be ambiguous. The
@@ -636,7 +677,7 @@ fn erl_stdout(expr: &str) -> Option<Vec<u8>> {
 /// `standard_io` is switched to `latin1` first: with the default (`unicode`) encoding,
 /// `io:format("~s", …)` would UTF-8-encode any byte above `127`, so the dump would no longer be
 /// the driver's raw reply bytes.
-fn oracle_expression(calls: &[(u32, Vec<u8>)]) -> String {
+fn oracle_expression(driver: &str, calls: &[(u32, Vec<u8>)]) -> String {
     let mut calls_src = String::new();
     for (index, (code, arg)) in calls.iter().enumerate() {
         let arg_list = arg
@@ -651,7 +692,7 @@ fn oracle_expression(calls: &[(u32, Vec<u8>)]) -> String {
     }
     format!(
         "M = {CONTROL_MAGIC}, \
-         P = open_port({{spawn_driver, \"udp_inet\"}}, [binary]), \
+         P = open_port({{spawn_driver, \"{driver}\"}}, [binary]), \
          F = fun(C, A) -> iolist_to_binary(erlang:port_control(P, C + M, A)) end, \
          R = [{calls_src}], \
          Out = iolist_to_binary([<<(byte_size(X)):32/big, X/binary>> || X <- R]), \
@@ -715,7 +756,7 @@ fn the_covered_control_replies_agree_with_the_erl_oracle() {
         (INET_REQ_SETOPTS, vec![INET_OPT_UNSERVED, 0, 0, 0, 1]),
         (INET_REQ_CLOSE, vec![]),
     ];
-    let Some(dump) = erl_stdout(&oracle_expression(&calls)) else {
+    let Some(dump) = erl_stdout(&oracle_expression(UDP_DRIVER_NAME, &calls)) else {
         eprintln!("SKIP: no `erl` on PATH — skipping the udp_inet control-reply oracle check");
         return;
     };
@@ -894,7 +935,7 @@ fn an_explicit_bind_port_whose_low_byte_is_the_old_delimiter_agrees_byte_exactly
             (INET_REQ_BIND, loopback_arg(port)),
             (INET_REQ_CLOSE, vec![]),
         ];
-        let Some(dump) = erl_stdout(&oracle_expression(&calls)) else {
+        let Some(dump) = erl_stdout(&oracle_expression(UDP_DRIVER_NAME, &calls)) else {
             eprintln!("SKIP: no `erl` on PATH — skipping the 0x7C bind-reply framing check");
             return;
         };

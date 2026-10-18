@@ -34,8 +34,12 @@
 //!   readiness is armed (a forged write-ready event then schedules an `OUTPUT` task, which
 //!   only happens for a direction the driver actually armed); an unknown verb is the crate's
 //!   `BeamError::BadArg`;
-//! * `the_covered_control_replies_agree_with_the_erl_oracle` — the **compatibility gate** for
-//!   the verbs this floor covers: the same control sequence is run against the *real* system
+//! * `a_second_open_on_a_live_port_answers_the_oracles_sequence_error` — the C's `exbadseq` row
+//!   through the end-to-end `PortRegistry` route: an `INET_REQ_OPEN` on a port that already holds
+//!   its socket answers `[0] ++ "exbadseq"` (`inet_ctl_open`'s `state != INET_STATE_CLOSED`
+//!   guard), the socket survives it, and the reply is the one the oracle's own second `open`
+//!   gives. If `erl` is absent the check **skips loudly**, never fails.
+//! * `the_covered_control_replies_agree_with_the_erl_oracle` — the **compatibility gate** for//!   the verbs this floor covers: the same control sequence is run against the *real* system
 //!   `tcp_inet` driver through `erl` and the reply bytes are compared. The oracle's own reply
 //!   encodings are the C's `ctl_reply`/`ctl_reply_ok`/`ctl_error` (`inet_drv.c:2260`-`:2311`)
 //!   and its verb integers are the `INET_REQ_*`/`TCP_REQ_*` constants, so this pins the
@@ -319,9 +323,95 @@ fn a_stalled_write_arms_write_readiness_and_an_unknown_verb_is_bad_arg() {
 }
 
 // ---------------------------------------------------------------------------
-// The peer's close
+// A second `open` on a live port
 // ---------------------------------------------------------------------------
 
+/// The Erlang side of the second-`open` cross-check: it opens a real `"tcp_inet"` port
+/// (`open_port({spawn_driver, …})`, as `prim_inet.erl:103` does), issues `INET_REQ_OPEN` twice —
+/// the second on a port that already holds its socket — and prints both replies as
+/// comma-separated bytes separated by `|`.
+fn oracle_second_open_expression() -> String {
+    format!(
+        "M = {CONTROL_MAGIC}, \
+         P = open_port({{spawn_driver, \"tcp_inet\"}}, [binary]), \
+         F = fun(C, A) -> binary_to_list(iolist_to_binary(erlang:port_control(P, C + M, A))) end, \
+         R = [F({INET_REQ_OPEN}, <<1,1,0>>), \
+              F({INET_REQ_OPEN}, <<1,1,0>>)], \
+         S = fun(L) -> lists:flatten(lists:join(\",\", [integer_to_list(B) || B <- L])) end, \
+         io:format(\"~s~n\", [lists:flatten(lists:join(\"|\", [S(L) || L <- R]))]), \
+         erlang:port_close(P)"
+    )
+}
+
+/// **A second `INET_REQ_OPEN` on a live `tcp_inet` port is the C's sequence error**, and the
+/// socket it already holds survives the refusal.
+///
+/// `inet_ctl_open` (`inet_drv.c:5119`-`:5126`) starts with
+/// `if (desc->state != INET_STATE_CLOSED) return ctl_xerror(EXBADSEQ, rbuf, rsize);`, so an
+/// `open` on a port that already holds a socket answers `[0] ++ "exbadseq"` — not the generic
+/// `[0] ++ "einval"` an argument fault would, and not a replaced (or closed) descriptor.
+///
+/// Nothing is hard-coded: the oracle's own two `open` replies are read first
+/// ([`oracle_second_open_expression`]) and this floor's pair is compared against them, with the
+/// two encodings asserted separately so the measured row is on the record.
+///
+/// If `erl` is absent the check **skips loudly**, never fails.
+#[test]
+fn a_second_open_on_a_live_port_answers_the_oracles_sequence_error() {
+    let oracle = match erl_stdout(&oracle_second_open_expression()) {
+        Some(stdout) => match parse_reply_dump(&stdout) {
+            Some(oracle) => {
+                assert_eq!(oracle.len(), 2, "two replies: {oracle:?}");
+                eprintln!("oracle second-open replies: {oracle:?}");
+                Some(oracle)
+            }
+            None => panic!("could not parse the oracle reply dump: {stdout:?}"),
+        },
+        None => {
+            eprintln!("SKIP: no `erl` on PATH — skipping the tcp_inet second-open oracle check");
+            None
+        }
+    };
+
+    // The Rust side runs the identical sequence through the port layer.
+    let mut poller = poller();
+    let (mut ports, id) = tcp_port(&mut poller);
+    let first = control(&mut ports, &mut poller, id, "open", &open_arg());
+    let second = control(&mut ports, &mut poller, id, "open", &open_arg());
+    eprintln!("rust second-open replies: [{first:?}, {second:?}]");
+
+    // The first `open` made the socket, the second is the C's sequence error.
+    assert_eq!(first, vec![INET_REP_OK], "the first `open` answers ok");
+    assert_eq!(
+        second,
+        ctl_xerror("exbadseq"),
+        "a live port refuses a second socket with the C's sequence error"
+    );
+    // The refusal did not disturb the socket the first `open` made: it still binds.
+    let bound = control(&mut ports, &mut poller, id, "bind", &loopback_arg(0));
+    assert_eq!(bound[0], INET_REP_OK, "the port's own socket survived: {bound:?}");
+    assert_ne!(
+        u16::from_be_bytes([bound[1], bound[2]]),
+        0,
+        "the surviving socket bound a kernel-assigned port"
+    );
+    ports.close(&mut poller, id).expect("closes the port");
+
+    if let Some(oracle) = oracle {
+        assert_eq!(first, oracle[0], "the first `open` reply agrees with the oracle");
+        assert_eq!(
+            second, oracle[1],
+            "the second `open` reply is the oracle's: rust={second:?} oracle={oracle:?}"
+        );
+        // The oracle's own bytes, on the record: `[INET_REP_OK]`, then the nine-byte
+        // `[0] ++ "exbadseq"`.
+        assert_eq!(oracle[1], ctl_xerror("exbadseq"), "the oracle's second `open`");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The peer's close
+// ---------------------------------------------------------------------------
 /// **The connection follows the socket.** When the peer shuts its end down, the driver latches
 /// the close: the `recv` that observes it answers the C's `[0] ++ "closed"`, every later one
 /// `[0] ++ "enotconn"`, and `send` reports the close once too — the oracle's `R,R,S,S ->
