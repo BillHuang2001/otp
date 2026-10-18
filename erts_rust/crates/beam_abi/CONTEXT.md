@@ -193,6 +193,10 @@ The *internal* boundary the `driver_*` bodies are written against (source `src/d
   pointer** (the `NifEnv` analogue); plus `pub fn decode_term_spec(&mut DriverEnv, &[ErlDrvTermData])
   -> Option<Eterm>`, the reverse-Polish term-data decoder behind `erl_drv_output_term`/
   `erl_drv_send_term`.
+- `pub fn is_invalid_port_handle(ErlDrvPort) -> bool` — the **one** non-handle predicate (`NULL` or
+  the C's `ERTS_INVALID_ERL_DRV_PORT` sentinel), consulted by `DriverEnv::from_port` **and**
+  `drv::env_for` so no C entry point dereferences either operand; the failure value the entry point
+  then returns is the C's (`-1`/`0`).
 - **Current-driver-host publication (`driver::current_host`).** `add_driver_entry`/`remove_driver_entry`
   carry no port operand, so `DriverEnv::from_port` cannot recover a host for them (they are meaningful
   only inside a driver callback); `beam_io` publishes the host for one callback via `pub fn
@@ -513,7 +517,7 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - **`queues`** — `driver_vec_to_buf`, `driver_enq`, `driver_pushq`, `driver_deq`, `driver_sizeq`, `driver_enq_bin`, `driver_pushq_bin`, `driver_peekq`, `driver_peekqv`, `driver_enqv`, `driver_pushqv`, `DriverHost` Oracle-measured return codes: `driver_deq` returns the **remaining** count, `(ErlDrvSizeT)-1` when over-dequeued; `driver_sizeq`'s `NOT_A_SIZE` sentinel **is** `(ErlDrvSizeT)-1` (`ErlDrvSizeT::MAX`, `queues.rs`), which the C returns only for a `NULL` queue — so an empty allocated queue must make the **host** answer `0` (`beam_rt`/`beam_io`).
 - **`threads`** — `erl_drv_*`, `crate::sync`, `ErlDrvPort`, `DriverHost`
 - **`pdl`** — `driver_pdl_create`, `lock`, `unlock`, `get_refc`, `inc_refc`, `dec_refc`, `driver_monitor_process`, `demonitor_process`, `get_monitored_process`, `compare_monitors`, `driver_get_now` `driver_compare_monitors` is **host-free and complete** (a 24-byte `memcmp` = `ERTS_REF_THING_SIZE(3)*8`, C `io.c:7142-7146`); the five refc slots never touch the host (crate-owned `PdlState`); only `driver_pdl_create` delegates — and the host must return a **per-port-stable** handle (C `pp->port_data_lock`; a second create on the same port ⇒ `NULL`). `driver_monitor_process` reaches the host through the three-way `DriverHost::monitor_process_result` and maps `MonitorResult::{Ok,NotAlive,Error}` onto the C's `0`/`1`/`-1` (its signs pinned by `const _: () = assert!(…)`); its `names_a_process` gate answers `1` for an operand that cannot name a process. It also exposes the **safe** accessors [`monitor_identity(*const ErlDrvMonitor) -> Option<[u8; 24]>`] / [`monitor_from_identity([u8; 24]) -> ErlDrvMonitor`] (crate-root re-exports) so a `#![deny(unsafe_code)]` host can key its monitor tree on a monitor's bytes; `REF_THING_COMPARE_BYTES` (`= ERTS_REF_THING_SIZE(3) * size_of::<Eterm>()` = 24) is the single width shared with `driver_compare_monitors`, the bytes stay opaque (no encoding invented), and `monitor_identity` answers `None` for a null pointer under the `src/driver/loader.rs` wrapper convention.
-- **`lifecycle`** — `driver_failure_eof`, `_atom`, `_posix`, `driver_failure`, `driver_exit`, `DriverHost::failure`, `port_exit`, `set_busy_port`, `set_port_control_flags`, `get_port_flags`, `erl_drv_busy_msgq_limits`, `erl_drv_init_ack`, `erl_drv_set_os_pid`, `driver_async_port_key`
+- **`lifecycle`** — `driver_failure_eof`, `_atom`, `_posix`, `driver_failure`, `driver_exit`, `DriverHost::failure`, `port_exit`, `set_busy_port`, `set_port_control_flags`, `get_port_flags`, `erl_drv_busy_msgq_limits`, `erl_drv_init_ack`, `erl_drv_set_os_pid`, `driver_async_port_key`. Every port-carrying slot recovers its env through `env_for`, so a `NULL`/sentinel operand answers the C's failure value un-dereferenced; `driver_failure(P,0)` reaches `failure` as `PortFailure::Eof` (the C's eof route), not `Error(0)`.
 - **`registry`** — `add_driver_entry`, `remove_driver_entry`, `with_current_host`, `-1`, `0`, `driver_lock_driver`, `driver_create_port`, `env_for` Ground truth `io.c:7640`/`7698`/`7324`/`786`.
 
 ### The safe async-job runner (`src/driver/async_job.rs`)
@@ -562,24 +566,25 @@ seam's UTF-8-only `PortFailure::Atom(&str)` is a real, documented divergence.
 (`erl_port.h:60-67`: "It would have been preferred to use NULL … not backward compatible").
 Measured: `driver_failure_eof(NULL)`/`_atom`/`_posix`/`driver_failure(NULL,·)`/`driver_exit(NULL,·)`
 each **SIGSEGV the VM deterministically (3/3)** — only `ERTS_INVALID_ERL_DRV_PORT (-1)` returns `-1`
-(deterministic, port untouched). So this crate's `env_for`/`DriverEnv::from_port` mapping *null* to
-"the C's invalid-port path" (and its `-1` return) is a deliberate **safety divergence**, not ABI
-fidelity; the real sentinel `(void*)-1` is **not** recognized (`from_port` accepts it and dereferences
-`-1`, i.e. UB). A stale handle from a fully-terminated port returns `-1` deterministically (3/3) when
-called from a *different* live port's callback, but calling a second `driver_failure_*` on a
+(deterministic, port untouched). The one shared predicate `driver::host::is_invalid_port_handle` is
+what both recovery sites (`DriverEnv::from_port`, `drv::env_for`) consult, so **both** operands answer
+the C's failure value without a dereference: for the sentinel that is ABI fidelity (the C's own early
+return), for `NULL` it is a deliberate **safety divergence** (the C faults; a library function must
+not crash its host process). A stale handle from a fully-terminated port returns `-1` deterministically
+(3/3) when called from a *different* live port's callback, but calling a second `driver_failure_*` on a
 just-terminated port from the **same** callback **segfaults 3 of 4 runs** (`erl_port.h:735-747`
 documents the `ERTS_PORT_SFLGS_INVALID_DRIVER_LOOKUP` guard, but the state word is read out of freed
 memory) — both shapes are use-after-free and therefore **unpinnable**.
 ### Status of this crate's half
 `lifecycle.rs` models every spelling onto `DriverHost::failure`/`port_exit` with the C's return codes
-(`0`/`-1`) and never touches a null port. Four contract defects remain (all in *this* crate, no host
-needed): (1) `PortFailure::Posix`/`Error`'s doc comments claim the reason is `{error,·}` — the oracle's
-is the bare atom / bare int; (2) `driver_failure(P, 0)` reaches the seam as `PortFailure::Error(0)`,
-losing the `eof` flag — it must map to `PortFailure::Eof` (behaviourally identical in the C); (3) the
-`(void*)-1` sentinel must be rejected alongside `NULL`; (4) no production host implements
-`failure`/`port_exit` (`beam_rt`'s `DriverPort` and `beam_io`'s `AbiHost` leave both trait defaults), so
-a loaded driver's `driver_failure_*` answers `-1` and nothing closes — the `{'EXIT',Port,Reason}` /
-`{'DOWN',…}` / `{Port,eof}` observables above are the contract that host must reproduce.
+(`0`/`-1`) and never touches a `NULL`/sentinel port. The seam's reasons are the C's own: `Eof` is the
+**eof route** — `driver_failure_eof` *and* `driver_failure(P, 0)` (the C's `eof` flag is `code == 0`,
+so the term is discarded) — and `Atom`/`Posix`/`Error` carry the **bare** atom / bare lowercase
+POSIX-name atom / bare integer the owner observes, never `{error,·}`. One gap remains, and it is the
+host's, not this crate's: no production host implements `failure`/`port_exit` (`beam_rt`'s `DriverPort`
+and `beam_io`'s `AbiHost` leave both trait defaults), so a loaded driver's `driver_failure_*` answers
+`-1` and nothing closes — the `{'EXIT',Port,Reason}` / `{'DOWN',…}` / `{Port,eof}` observables above
+are the contract that host must reproduce.
 `port_info`-side note: a `control` callback returning `< 0` (the documented
 `return ERL_DRV_ERROR_GENERAL` idiom) makes `port_control/3` raise `badarg` and leaves the port
 **alive**; `output`/`ready_input` are `void`-returning in erts-17.1, so that idiom now applies only to
@@ -735,7 +740,7 @@ a loaded driver's `driver_failure_*` answers `-1` and nothing closes — the `{'
 - `src/nif/loader.rs` → the dynamic NIF loader: `NifLibrary`, `NifLoadError`/`NifCallError`, `load()` (dlopen/dlsym + oracle-order validation), `NifLibrary::call` (also the `priv_data` publication behind `enif_priv_data`), `Drop` (unload + dlclose)
 - `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`) + `ERTS_INVALID_ERL_DRV_PORT` (the invalid-port sentinel, pointer `-1`)
 - `src/driver/api.rs` → `ErlDrvApi` (111-entry `driver_*`/`erl_drv_*` function table) + `ErlDrvApi::empty()`
-- `src/driver/host.rs` → the driver host seam: `DriverHost` (incl. the defaulted `output2` split hook) + `DriverEnv` (`*mut ErlDrvPort_`, `as_port`, `from_port`) + the three-way `MonitorResult`/`monitor_process_result` monitor hook + `decode_term_spec` + the `with_current_host` re-export
+- `src/driver/host.rs` → the driver host seam: `DriverHost` (incl. the defaulted `output2` split hook and the `failure`/`port_exit` port-closing contract) + `DriverEnv` (`*mut ErlDrvPort_`, `as_port`, `from_port`) + `is_invalid_port_handle` (the shared `NULL`/sentinel guard) + the `PortFailure` reason set (`Eof` = the C's eof route) + the three-way `MonitorResult`/`monitor_process_result` monitor hook + `decode_term_spec` + the `with_current_host` re-export
 - `src/driver/current_host.rs` → the thread-local **current-driver-host** publication: `with_current_host(host, f)` (scoped, restores the previous host on exit, nesting-safe) plus the `pub(crate)` reader the two port-free entry-list slots use
 - `src/driver/async_job.rs` → the **safe async-job runner** (`AsyncJob`/`AsyncCallback`, crate-root re-exports): the single `unsafe` `new` constructor plus the safe `invoke`/`finish`/`data`/`has_invoke`/`has_free`; `Drop` frees a held job without invoking it, `Debug` never dereferences
 - `src/driver/drv/` → **one file per driver family** (`mem`, `port`, `queues`, `threads`, `pdl`, `lifecycle`, `registry`), each owning its `pub(super) const fn populate`; `mod.rs` holds the module docs, the shared `env_for` helper, the `#[used] static DRIVER_API` table + `driver_api_table()`, the `driver_term_nil` data symbol and `binary_payload`; `port_tests.rs` is the path-included child of `port`

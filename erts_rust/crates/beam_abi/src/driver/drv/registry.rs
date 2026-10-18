@@ -154,11 +154,12 @@ pub unsafe extern "C" fn remove_driver_entry(de: *mut ErlDrvEntry) -> c_int {
 /// `int driver_lock_driver(ErlDrvPort ix);` — lock the driver behind `ix`'s **own** loaded shared
 /// object for the rest of the machine's lifetime (`io.c:7324`).
 ///
-/// `-1` for a null port (the C's `ERTS_INVALID_ERL_DRV_PORT` early return) or a host without the hook
-/// (the trait default) — which is also the C's answer when the port's driver has no `dlopen` handle
-/// (`(dh = prt->drv_ptr->handle) == NULL`, `io.c:7337`, a statically linked driver) — else the host's
-/// code (`0` = locked). The C consults the port's own `drv_ptr->handle`, never a global lookup by
-/// name.
+/// `-1` for an operand that names no port — the C's invalid-port sentinel
+/// `ERTS_INVALID_ERL_DRV_PORT` (its early return) or `NULL` (refused here rather than faulted) — or a
+/// host without the hook (the trait default) — which is also the C's answer when the port's driver has
+/// no `dlopen` handle (`(dh = prt->drv_ptr->handle) == NULL`, `io.c:7337`, a statically linked
+/// driver) — else the host's code (`0` = locked). The C consults the port's own `drv_ptr->handle`,
+/// never a global lookup by name.
 ///
 /// # Safety
 ///
@@ -177,8 +178,9 @@ pub unsafe extern "C" fn driver_lock_driver(ix: ErlDrvPort) -> c_int {
 /// selects the driver to instantiate, `connected` becomes the new port's owner/caller, `drv_data` its
 /// driver-private data.
 ///
-/// Returns the new port handle, or the invalid-port sentinel [`ERTS_INVALID_ERL_DRV_PORT`] for a null
-/// `creator_port` or any host failure — the C's single failure answer (`erl_port.h:67`).
+/// Returns the new port handle, or the invalid-port sentinel [`ERTS_INVALID_ERL_DRV_PORT`] for a
+/// `creator_port` that names no port (`NULL`, or the sentinel itself) or for any host failure — the
+/// C's single failure answer (`erl_port.h:67`).
 ///
 /// # Safety
 ///

@@ -71,7 +71,9 @@ use std::process::Command;
 use beam_abi::driver::drv::driver_api_table;
 use beam_abi::driver::host::PortFailure;
 use beam_abi::driver::loader::{load, DriverLibrary};
-use beam_abi::driver::types::{ErlDrvData, ErlDrvEntry, ErlDrvPort, ErlDrvSizeT, ErlDrvTermData};
+use beam_abi::driver::types::{
+    ErlDrvData, ErlDrvEntry, ErlDrvPort, ErlDrvSizeT, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT,
+};
 use beam_abi::{with_current_host, DriverEnv, DriverHost};
 use beam_term::atom::AtomTable;
 use beam_term::prelude::{make_atom, Eterm};
@@ -610,13 +612,17 @@ fn loads_and_drives_a_real_c_driver_through_the_lifecycle_family() {
         "every driver_failure* spelling must return 0 for a valid port"
     );
     assert_eq!(command(&lib, data, 16), 1, "driver_exit returns 0 for a valid port");
+    // `driver_failure(st->port, 0)` is the C's **eof route** (`driver_failure_term(ix,
+    // make_small(0), code == 0)`, `io.c:7258`): the reason term is discarded, so the port owner
+    // observes the measured reason `normal` — identical to `driver_failure_eof`, and hence `Eof` on
+    // the seam, never `Error(0)`.
     assert_eq!(
         host.failures,
         [
             "Eof".to_string(),
             "Atom(\"enoent\")".to_string(),
             format!("Posix({})", libc::ENOENT),
-            "Error(0)".to_string(),
+            "Eof".to_string(),
             "Error(7)".to_string(),
         ],
         "each C entry point must land on the one `failure` hook with its own reason, in order"
@@ -720,4 +726,100 @@ fn a_host_without_the_hooks_still_survives_the_whole_fixture() {
     // SAFETY: `data` is the live state from `start` and `stop` has not run yet.
     lib.stop(data).expect("the fixture implements stop");
     drop(lib);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The eof route and the invalid-port operand, driven through the frozen table's function pointers
+// ---------------------------------------------------------------------------------------------
+
+/// `driver_failure(P, 0)` and `driver_failure_eof(P)` are the **same request** to the C:
+/// `driver_failure(ix, code)` is `driver_failure_term(ix, make_small(code), code == 0)`
+/// (`io.c:7258`), and the `eof` branch discards the reason term
+/// (`erts_deliver_port_exit(prt, id, eof ? am_normal : term, …)`), so the port owner observes the
+/// reason `normal` for both (measured with a `trap_exit` owner). The seam must therefore report
+/// `PortFailure::Eof` for a `0` code — never `Error(0)` — while a non-zero code stays the bare
+/// integer.
+#[test]
+fn driver_failure_of_zero_is_the_eof_route_and_a_nonzero_code_stays_an_integer() {
+    let table = driver_api_table();
+    let failure_eof = table.driver_failure_eof.expect("populated");
+    let failure = table.driver_failure.expect("populated");
+    let mut host = LifecycleTestHost::new();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+
+    // SAFETY: `port` came from `DriverEnv::as_port` on a live env.
+    unsafe {
+        assert_eq!(failure_eof(port), 0, "driver_failure_eof accepts a live port");
+        assert_eq!(failure(port, 0), 0, "driver_failure(P, 0) accepts a live port");
+        assert_eq!(failure(port, 7), 0, "driver_failure(P, 7) accepts a live port");
+    }
+    assert_eq!(
+        host.failures,
+        ["Eof".to_string(), "Eof".to_string(), "Error(7)".to_string()],
+        "a 0 code is the eof route (reason `normal`, identical to driver_failure_eof); any other \
+         code is the bare integer the owner observes"
+    );
+}
+
+/// `NULL` is **not** the C's invalid-port path (the real VM faults on it, measured), while the
+/// sentinel `ERTS_INVALID_ERL_DRV_PORT` (`erl_port.h:60-67`) is the C's own "invalid port" operand,
+/// answered with each entry point's failure value. Both must be refused by the one shared
+/// `env_for`/`DriverEnv::from_port` guard *without* reaching the host hook — a dereference of either
+/// would be UB, so passing here is itself the proof.
+#[test]
+fn null_and_the_invalid_port_sentinel_are_refused_before_the_host_hook() {
+    let table = driver_api_table();
+    let failure_eof = table.driver_failure_eof.expect("populated");
+    let failure_atom = table.driver_failure_atom.expect("populated");
+    let failure_posix = table.driver_failure_posix.expect("populated");
+    let failure = table.driver_failure.expect("populated");
+    let exit = table.driver_exit.expect("populated");
+
+    let mut host = LifecycleTestHost::new();
+    let mut env = DriverEnv::new(&mut host);
+    let live = env.as_port();
+    let name = c"enoent";
+
+    for (label, operand) in [
+        ("NULL", core::ptr::null_mut()),
+        ("ERTS_INVALID_ERL_DRV_PORT", ERTS_INVALID_ERL_DRV_PORT),
+    ] {
+        // SAFETY: neither operand names an environment, which is exactly what `env_for` /
+        // `DriverEnv::from_port` document as `None`; `name` is NUL-terminated.
+        unsafe {
+            assert_eq!(failure_eof(operand), -1, "driver_failure_eof({label})");
+            assert_eq!(
+                failure_atom(operand, name.as_ptr() as *mut c_char),
+                -1,
+                "driver_failure_atom({label})"
+            );
+            assert_eq!(
+                failure_posix(operand, libc::ENOENT),
+                -1,
+                "driver_failure_posix({label})"
+            );
+            assert_eq!(failure(operand, 0), -1, "driver_failure({label}, 0)");
+            assert_eq!(failure(operand, 7), -1, "driver_failure({label}, 7)");
+            assert_eq!(exit(operand, 0), -1, "driver_exit({label}, 0)");
+            assert_eq!(exit(operand, 3), -1, "driver_exit({label}, 3)");
+        }
+    }
+    assert!(host.failures.is_empty(), "an absent port must never reach the `failure` hook");
+    assert!(host.exits.is_empty(), "an absent port must never reach the `port_exit` hook");
+
+    // …and the same entries do reach the hook for the live port, so the refusal above is about the
+    // operand, not a dead seam.
+    // SAFETY: `live` came from `DriverEnv::as_port` on a live env; `name` is NUL-terminated.
+    unsafe {
+        assert_eq!(failure_eof(live), 0);
+        assert_eq!(failure_atom(live, name.as_ptr() as *mut c_char), 0);
+        assert_eq!(exit(live, 0), 0);
+    }
+    assert_eq!(
+        host.failures,
+        ["Eof".to_string(), "Atom(\"enoent\")".to_string()],
+        "the live port reaches the hook as its own reason"
+    );
+    assert_eq!(host.exits, [0], "the live port reaches `port_exit` with the raw code");
 }

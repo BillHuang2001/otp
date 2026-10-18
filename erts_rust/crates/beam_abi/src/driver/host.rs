@@ -62,21 +62,58 @@ pub use crate::driver::current_host::with_current_host;
 /// The reason a driver asks for its port to be closed — the C's whole `driver_failure*` family
 /// (`erts/emulator/beam/io.c`) collapsed into one seam hook ([`DriverHost::failure`]).
 ///
-/// The four C entry points differ only in how the reason is expressed, so they model as variants
-/// rather than four hooks.
+/// The C funnels all four `driver_failure*` spellings through one function,
+/// `driver_failure_term(ix, term, eof)` (`io.c:7196-7229`), which closes the port with the reason
+/// `eof ? am_normal : term`. The variants therefore differ only in how the **reason term** is
+/// expressed and in whether the `eof` route is taken, so they model as variants rather than four
+/// hooks:
+///
+/// | variant | C entry point | reason the port owner observes |
+/// |---|---|---|
+/// | [`Eof`](PortFailure::Eof) | `driver_failure_eof` (`io.c:7278`) and `driver_failure(P, 0)` (`io.c:7258`) | `normal` |
+/// | [`Atom`](PortFailure::Atom) | `driver_failure_atom` (`io.c:7263`) | the **bare atom** `string` |
+/// | [`Posix`](PortFailure::Posix) | `driver_failure_posix` (`io.c:7273`) | the **bare atom** `erl_errno_id(error)` — the lowercase POSIX name |
+/// | [`Error`](PortFailure::Error) | `driver_failure(P, code)` with `code != 0` (`io.c:7258`) | the **bare integer** `code` |
+///
+/// None of the reasons is wrapped: a port's exit reason is never `{error, …}` (that shape belongs to
+/// the *BIF* raises a driver can trigger, not to `driver_failure*`).
+///
+/// [`Eof`](PortFailure::Eof) is the **eof route**, not merely "reason `normal`": besides discarding
+/// the reason term, it flushes the port's buffered `[line]` data (a trailing partial line arrives as
+/// `{Port,{data,{noeol,…}}}` *before* the exit — `flush_linebuf_messages`, `io.c:3475-3499`) and, on
+/// a port opened with the `eof` option, takes the **soft-eof** branch: the owner gets `{Port,eof}` and
+/// the port **stays alive** instead of being closed (`ERTS_PORT_SFLG_SOFT_EOF`,
+/// `erl_bif_port.c:996`). Reproducing those consequences is the host's job — see
+/// [`DriverHost::failure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortFailure<'a> {
-    /// `driver_failure_eof(port)` — the connected process reached end of file.
+    /// The **eof route** — `driver_failure_eof(port)` (`io.c:7278`, i.e.
+    /// `driver_failure_term(ix, NIL, 1)`) *and* `driver_failure(port, 0)` (`io.c:7258`, i.e.
+    /// `driver_failure_term(ix, make_small(0), 1)`).
+    ///
+    /// Both are the same request: the C's `eof` flag discards the reason term, so the port closes
+    /// with the atom `normal` and the eof route's extra consequences apply (buffered-line flush,
+    /// `[eof]` soft-eof — see the enum docs). `driver_failure(P, 0)` therefore never arrives as
+    /// `Error(0)`.
     Eof,
-    /// `driver_failure_atom(port, string)` — close with `string` as the reason atom.
+    /// `driver_failure_atom(port, string)` — close with `string` as the **bare** reason atom
+    /// (`io.c:7263`).
     ///
     /// The C operand is a NUL-terminated `char *`; this seam carries the name as a `&str` and the
     /// host interns it, exactly as [`DriverHost::intern_atom`] does for the `ERL_DRV_ATOM`
-    /// term-data operand.
+    /// term-data operand. (The C interns the raw bytes as Latin-1 while this seam requires UTF-8 —
+    /// the one documented divergence, see `lifecycle.rs`.)
     Atom(&'a str),
-    /// `driver_failure_posix(port, error)` — close with `{error, <posix reason for the errno>}`.
+    /// `driver_failure_posix(port, error)` — close with the **bare atom** the errno's lowercase
+    /// POSIX name (`erl_errno_id(error)`, `io.c:7273`; `eacces` for `EACCES`), never `{error, …}`.
+    ///
+    /// `0` names `errno_0` and an errno the runtime does not know names `errno_<n>` (the C's
+    /// `erl_errno_str.c:47` convention). The errno→name mapping itself is the host's.
     Posix(c_int),
-    /// `driver_failure(port, error)` — close with `{error, <errno>}`.
+    /// `driver_failure(port, code)` with `code != 0` — close with the **bare integer** `code`
+    /// (`io.c:7258`), never `{error, code}`.
+    ///
+    /// A `0` code is the eof route instead and arrives as [`Eof`](PortFailure::Eof).
     Error(c_int),
 }
 
@@ -340,6 +377,23 @@ pub trait DriverHost {
 
     /// Close the port with `reason` — the single hook behind the C's `driver_failure*` family.
     /// `0` = ok, `-1` = fail (default: unsupported).
+    ///
+    /// The host owns everything the C's `driver_failure_term(ix, term, eof)` (`io.c:7196-7229`) does
+    /// *after* the variant has chosen the reason, so it must reproduce three things:
+    ///
+    /// 1. **The exit reason the port's owner observes.** For [`PortFailure::Eof`] it is the atom
+    ///    `normal`; otherwise the bare term the variant names — the atom of [`PortFailure::Atom`],
+    ///    the lowercase POSIX-name atom `erl_errno_id` yields for [`PortFailure::Posix`]
+    ///    (`eacces`, or `errno_0`/`errno_<n>` for 0/unknown), and the integer of
+    ///    [`PortFailure::Error`]. Measured against a `trap_exit` owner: `{'EXIT',Port,boom}`,
+    ///    `{'EXIT',Port,eacces}`, `{'EXIT',Port,7}` — never `{error, …}`.
+    /// 2. **The eof route** for [`PortFailure::Eof`]: flush the port's buffered `[line]` data first
+    ///    (the owner sees `{Port,{data,{noeol,Partial}}}` before the exit,
+    ///    `flush_linebuf_messages`, `io.c:3475-3499`), and on a port opened with the `eof` option
+    ///    deliver `{Port,eof}` and **keep the port alive** (`ERTS_PORT_SFLG_SOFT_EOF`,
+    ///    `erl_bif_port.c:996`) rather than closing it.
+    /// 3. **The closed state**: after a real close the port is gone, so `port_info(P, …)` answers
+    ///    `undefined` and `port_close(P)` raises `badarg`, exactly as the C's terminated port does.
     fn failure(&mut self, reason: PortFailure<'_>) -> c_int {
         let _ = reason;
         -1
@@ -347,6 +401,16 @@ pub trait DriverHost {
 
     /// Immediately terminate the port's connected process with exit `code` (`driver_exit`). `0` =
     /// ok, `-1` = fail (default: unsupported).
+    ///
+    /// The C (`io.c:7234-7253`) does two things, in this order, and both are the host's obligation:
+    ///
+    /// 1. **Unlink the connected process *before* closing**, so the close delivers no
+    ///    `{'EXIT',Port,Reason}` message at all — a *monitor* on the port still receives
+    ///    `{'DOWN',Ref,port,Port,Reason}` (measured).
+    /// 2. Close with the atom `normal` for `code == 0`, else with the **bare atom** `erl_errno_id`
+    ///    names (`eacces`; never `{error, …}`).
+    ///
+    /// Afterwards `port_info(P, …)` answers `undefined` and `port_close(P)` raises `badarg`.
     fn port_exit(&mut self, code: c_int) -> c_int {
         let _ = code;
         -1
@@ -556,6 +620,26 @@ pub trait DriverHost {
     }
 }
 
+/// Does `port` name **no** [`DriverEnv`] — is it `NULL` or the C's invalid-port sentinel
+/// [`ERTS_INVALID_ERL_DRV_PORT`] (pointer `-1`, `erts/emulator/beam/erl_port.h:60-67`)?
+///
+/// This is the **single definition** every port-argument recovery site consults
+/// ([`DriverEnv::from_port`] and the `drv` layer's `env_for`), so no C entry point can dereference
+/// either non-handle.
+///
+/// The two operands differ in the C and get the same answer here:
+///
+/// * the **sentinel** is the C's own "invalid port" operand — every port-carrying entry point tests
+///   it and returns its failure value (`-1`, or `0` for the port queries) without dereferencing it,
+///   so refusing it is ABI fidelity;
+/// * a **null** operand is *not* that path: the C does not test for it and the real VM faults
+///   (measured). Refusing it is this crate's deliberate safety divergence — a library function must
+///   not crash its host process (workspace `CONTEXT.md` §3), and the returned failure value is the
+///   one a driver following the documented `< 0` idiom already handles.
+pub fn is_invalid_port_handle(port: ErlDrvPort) -> bool {
+    port.is_null() || port == ERTS_INVALID_ERL_DRV_PORT
+}
+
 /// The concrete per-port driver environment behind the C-facing opaque `*mut ErlDrvPort_`.
 ///
 /// Holds a raw pointer to the host, so the environment itself is lifetime-free and can be recovered
@@ -611,9 +695,11 @@ impl DriverEnv {
     /// # Safety
     ///
     /// `port` must be a pointer previously returned by [`DriverEnv::as_port`] for an env that is
-    /// still alive (and whose host is still alive). Returns `None` for a null pointer.
+    /// still alive (and whose host is still alive). Returns `None` for any operand that names no
+    /// environment — `NULL` and the invalid-port sentinel [`ERTS_INVALID_ERL_DRV_PORT`], the one
+    /// predicate [`is_invalid_port_handle`] — so neither is ever dereferenced.
     pub unsafe fn from_port<'a>(port: ErlDrvPort) -> Option<&'a mut DriverEnv> {
-        if port.is_null() {
+        if is_invalid_port_handle(port) {
             return None;
         }
         // SAFETY: the caller guarantees `port` came from `DriverEnv::as_port` on a live env, i.e. it

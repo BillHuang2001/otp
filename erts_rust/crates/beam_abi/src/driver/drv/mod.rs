@@ -173,7 +173,7 @@ mod threads;
 use beam_term::prelude::NIL;
 
 use crate::driver::api::ErlDrvApi;
-use crate::driver::host::DriverEnv;
+use crate::driver::host::{is_invalid_port_handle, DriverEnv};
 use crate::driver::types::{ErlDrvPort, ErlDrvTermData};
 
 // The glob re-exports below pull the moved functions into the table below and keep them Rust-side
@@ -208,17 +208,26 @@ pub static driver_term_nil: ErlDrvTermData = NIL.raw() as ErlDrvTermData;
 // Shared helper (used by the part-2 port functions)
 // ---------------------------------------------------------------------------------------------
 
-/// The driver environment behind a C-facing port pointer, or `None` for a null pointer.
+/// The driver environment behind a C-facing port pointer, or `None` when the operand names no
+/// environment — it is `NULL` or the C's invalid-port sentinel
+/// [`ERTS_INVALID_ERL_DRV_PORT`](crate::driver::types::ERTS_INVALID_ERL_DRV_PORT) (pointer `-1`).
 ///
 /// The whole of part 2 goes through this one recovery point, so the port-pointer safety contract is
 /// stated once: **[`DriverEnv::as_port`] + [`DriverEnv::from_port`] are the port ABI** (see
-/// [`crate::driver::host`]).
+/// [`crate::driver::host`]). Both non-handle operands are refused through the same shared
+/// [`is_invalid_port_handle`] predicate, so every family answers the C's failure value for the
+/// sentinel (`-1`/`0`, as the C's own early return does) and for `NULL` (refused here instead of
+/// faulted) without dereferencing either.
 ///
 /// # Safety
 ///
-/// `port` must be null or a pointer previously returned by [`DriverEnv::as_port`] for an environment
-/// (and host) that is still alive — exactly [`DriverEnv::from_port`]'s own contract.
+/// `port` must be `NULL`, the invalid-port sentinel, or a pointer previously returned by
+/// [`DriverEnv::as_port`] for an environment (and host) that is still alive — exactly
+/// [`DriverEnv::from_port`]'s own contract.
 unsafe fn env_for<'a>(port: ErlDrvPort) -> Option<&'a mut DriverEnv> {
+    if is_invalid_port_handle(port) {
+        return None; // `NULL` or the sentinel: there is no environment to recover.
+    }
     // SAFETY: the caller's contract is `DriverEnv::from_port`'s contract, restated above.
     unsafe { DriverEnv::from_port(port) }
 }
