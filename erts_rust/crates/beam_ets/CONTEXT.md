@@ -466,8 +466,22 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **`SharedTable`'s coarse lock is the whole story — no lost updates.** One `write()` guard spans a
   whole check-then-act sequence (`insert_new`, `update_counter`, `select_replace`), so concurrent
   writers lose nothing; fine-grained `{write_concurrency}` affects throughput only, never results. A
-  poisoned lock is a typed error. Reads through the handle are guard-scoped (see the guard-scoped-view
-  Design Decision).
+  poisoned lock is the typed error `unsupported_ets: table lock poisoned`. Reads through the handle are
+  guard-scoped (see the guard-scoped-view Design Decision).
+- **`tests/ets_concurrency_locks.rs` is the coarse-lock stress + mutation-verify evidence** (4 tests, all
+  green over 5 consecutive runs): 8×1000 `update_counter` increments of one key total exactly 8000; 16
+  contended `insert_new` calls of one key yield exactly one winner and `size == 1`; 8 threads × 200
+  iterations alternating `select_replace`/`update_element` on one key while each inserts its own key leave
+  `size == 1 + 8` with the shared object present exactly once and the replacement count never short; a
+  thread that panics under `shared.write()` poisons the lock so every later `read()`/`write()` returns that
+  typed error. Mutation-verified twice: (a) making `with_write` take the write guard, drop the view and
+  re-acquire it before running the closure is **inert** (the closure still runs under the lock, so all 4
+  tests stay green — and the literal lost-update mutation is unreachable in safe Rust, since
+  `TableWrite::new` is `pub(in crate::table)` and takes an `RwLockWriteGuard`); (b) handing the closure a
+  *different* table instead of the shared one turns all 4 RED —
+  `exactly one of the 16 contended insert_new calls may win, 16 did (left: 16, right: 1)`,
+  `the counter object is present: BadArg`, `the shared object is never absent`,
+  `a poisoned read must raise rather than hand out the table` — and restoring the file is green again.
 - **`ets:safe_fixtable/2` fixation = deferred reclamation.** While fixed, every removed object's storage
   goes onto `deferred_frees` (and `delete_all_objects` defers each root instead of `reset()`ing);
   unfixing flushes them, so `ets:info(T, memory)` is held while fixed and falls at unfix.
@@ -529,6 +543,45 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `lookup_element` gating-before-scalar-refusal, all 15 `ets:info/2` fields ungated, the stdlib wrapper
   gates `ets:foldl/foldr`/`tab2list`/`match_delete`, and `setopts(T,[])`/`{protection,_}` owner-gating.
   The sibling `beam_bifs` gate assignments were verified correct against the C.
+- **Creation-option validation, both sides** (`tests/ets_access_options.rs`, 5 tests). A pinned
+  `ets:new/2` option matrix (`Case { tag, opts, oracle: Option<Shape>, krate: Crate }`, `Shape` = the
+  crate's primitive projection `{kind, keypos, access, named_table, compressed, write_concurrency,
+  read_concurrency, decentralized_counters, heir_installed}`) probed once against the live oracle and
+  compared per case: the oracle's verdict/shape must be unchanged, and every `Crate::Calls` case must
+  reproduce it through the public builder (`>= 40` modelled cases). The `Crate::Unrepresentable(reason)`
+  half (`>= 15` cases) is where the typed builder *cannot* carry the value, so the `badarg` is the host
+  parser's and each case names the primitive — the test also asserts the named hooks decline an unknown
+  name (`TableKind/Access/WriteConcurrency::from_atom_name("foo") == None`) and that `set_keypos(0)` is
+  the crate's own `badarg`. The C's two post-loop checks stay the parser's (the model is passive):
+  `ordered_set` + the explicit-granularity form is *recorded*, and `FixedLocks` keeps even an
+  out-of-range count (0, 99 999) so the parser can `badarg` it. `private` normalizes the mode off.
+  Lock-count normalisation is the one documented difference: the oracle reports
+  `ets:info(T, write_concurrency)` as `N` rounded **down** to a power of two and clamped **up** to 64
+  (`…locks,8|64|100 -> {debug_hash_fixed_number_of_locks,64}`, `128 -> 128`, `1024 -> 1024`), while
+  `WriteConcurrency::FixedLocks(n)` keeps the **requested** count — the host normalizes when it renders
+  the tuple (`TableInfo::write_concurrency` is a `bool`).
+- **Rights corners: transfer + gate timing** (`tests/ets_access_rights.rs`, 4 tests; one `Verdict
+  { Ok, BadArg }` fold plus `pinned(access) -> [Verdict; 15]`, so a tag can never pass silently on a
+  boolean). The give-away rights matrix is asserted three ways on each of `protected`/`private`/`public`
+  — the live oracle, the pinned row, and the crate trace over `Table::as_requester` — for 15 tags in
+  order (`before.owner_is_self`, `giveaway`, `after.owner_is_child`, then the giver's
+  `insert`/`lookup`/`size`/`delete_key`/`fixtable`/`select_replace`/`setopts`, then the recipient's
+  `insert`/`lookup`/`owner_is_self`/`setopts_ok`/`delete_table`). `ets:give_away/3` never consults
+  `protection` and moves both read and write rights (`protected`: the giver keeps READ, loses WRITE;
+  `private`: loses READ too, but `ets:info(T,size)` stays ungated; `public`: keeps everything);
+  `ets:setopts/2` is owner-gated even on a `public` table (`BadArg` in all three rows);
+  `ets:safe_fixtable/2` is a READ, so `protected` allows it and `private` denies it. `give_away_with_gift`
+  is asserted to return a `Transfer` naming recipient/giver. Gate timing is pinned on a second matrix
+  (`FLIP_TAGS`): a protection flip applies to the **next** op (`protected` non-owner lookup `Ok` →
+  owner `setopts private` → non-owner lookup `BadArg` but non-owner `size` `Ok` and non-owner `setopts`
+  `BadArg` → owner `setopts public` → non-owner `insert` `Ok`), a denied `setopts` leaves `access()`
+  unchanged, and `t.info()` stays readable with **no** requester (ungated introspection). The third test
+  pins that a **denied continuation resume is not consumed**: a `private` non-owner `select_continue` is
+  `BadArg` twice, then the same immutable continuation resumes to the identical `[4,5,6]` chunk after the
+  owner flips back, with `size` still 10. Whole-table `ets:delete/1` is **host-owned** — `HOST_ONLY_DELETE`
+  records `None` on the crate side (there is no whole-table-delete primitive here) with the verdict each
+  case needs: `flip.public.nonowner_delete_table` `Ok`, `del.protected.nonowner` `BadArg`,
+  `del.public.nonowner` `Ok`; exactly one of the 15 matrix tags is host-owned.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **191 cases**
   (15 case-group files under `tests/differential/battery/` plus the shared harness `battery/mod.rs` and
   the embedded oracle program `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 /
@@ -557,10 +610,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not shift the next
   chunk.
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  -p beam_ets --no-fail-fast` is green — **615 passed / 0 failed / 1 ignored across all binaries
-  (incl. 10 doctests, 6 of them `compile_fail`)**. The ignored test is the randomised `ordered_set`
-  differential, which passes under `--ignored`. With the oracle required, the battery emits and compares
-  all **191** cases. Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 … --test differential`.
+  -p beam_ets --offline --no-fail-fast` is green — **636 passed / 0 failed / 1 ignored across all
+  binaries (incl. 10 doctests, 6 of them `compile_fail`)**. The ignored test is the randomised
+  `ordered_set` differential, which passes under `--ignored`. With the oracle required, the battery
+  emits and compares all **191** cases. Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 … --test differential`.
 
 ## Known Issues (honest gaps — not full parity)
 - **The raw `Table`/`TableAccess` read family still returns bare `Eterm`s that alias table storage** —
@@ -591,8 +644,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   the recorded owner pid and the tid reference, so the BIF output matches the oracle.
 - **`ets:setopts/2` is modelled for `{heir, …}` and `{protection, Access}`.** `SetOpt` carries
   `Heir(Heir)`/`ClearHeir`/`Access(Access)`; other options (`safe_fixtable`, `{write_concurrency, _}`,
-  …) are out of scope; `ets:info(T, holder)` is `badarg` in the oracle and none is emitted. The BIF
-  bridge's `{protection, _}` wiring belongs to `beam_bifs`.
+  …) are out of scope and are the `beam_bifs` parser's `badarg`; `ets:info(T, holder)` is `badarg` in the
+  oracle and none is emitted. The `beam_bifs` bridge adopts both modelled forms (see Handoffs).
 - **Scalar `lookup_element` is a deliberate typed refusal for the multi kinds.** `Table::lookup_element`/
   `lookup_element_or` raise the typed `unsupported_ets` for `bag`/`duplicate_bag` — a scalar `Eterm`
   cannot express the oracle's *list* — and the faithful forms are
@@ -672,11 +725,33 @@ rendering stays host-side (`TableInfo::write_concurrency` is a `bool`).
   pid; `BifContext` already carries `self_pid` (see `src/select/CONTEXT.md`).
 - **`beam_bifs` (open):** reject `[]` in `ets:match_spec_compile/1` (the oracle `badarg`s; the select
   family legitimately accepts `[]`).
-- **`beam_bifs` (open) — the `ets:give_away/3` delivery:** `beam_ets` does its half via
-  `Table::give_away_with_gift`; the remaining work is the BIF `beam_bifs::ets::adopt::give_away_3` — read
-  `args[2]`, call it, and deliver `{'ETS-TRANSFER', Tid, FromPid, GiftData}` to the new owner through its
-  `SendHook` (the `Tid`/`FromPid` terms are the host's; there is no pid/ref term here). Differential case
-  to add: `ets/give_away_gift_data_reaches_the_new_owner` (A.1).
+- **`beam_bifs` (adopted, verified) — `ets:give_away/3` gift delivery is implemented:**
+  `beam_bifs/src/ets/adopt.rs::give_away_3` → `beam_ets::TableAccess::give_away_with_gift(Some(caller),
+  gift)`, then builds `{'ETS-TRANSFER', Tid, FromPid, GiftData}` on the caller's heap (`Tid` = the
+  `named_table` name atom from `TableRegistry::name_of`, else the handle reference; `FromPid` =
+  `ctx.self_pid()`) and sends it through the `SendHook`; with **no** `SendHook` installed it is the typed
+  `unsupported_bif`, checked *before* the table is taken (never a half-done transfer). Its gate is
+  `Gate::Write` plus the owner check inside `Table::give_away_with_gift` — which is why `give_away` never
+  consults `protection` while `setopts` stays owner-gated even on a `public` table.
+- **`beam_bifs` (host-owned, verified) — whole-table `ets:delete/1`:**
+  `beam_bifs/src/ets.rs::delete_1` takes the table with `take_table_gated(ctx, handle,
+  resolve::Gate::Write)`, so a non-owner gets `badarg` on `protected`/`private` and may delete a `public`
+  table; `beam_ets` has no whole-table-delete primitive, and the runtime drops it through
+  `TableRegistry::remove`/`forget_profile` (+ `remove_name` for a `named_table`).
+- **`beam_bifs` (verified) — `ets:slot/2` is `resolve::Gate::Read`** (`beam_bifs/src/ets.rs::slot_2`), the
+  correct gate for the measured `protected` non-owner ⇒ bucket list / `private` non-owner ⇒ `badarg`.
+- **`beam_bifs` (verified) — `ets:setopts/2`'s narrow surface is correct:**
+  `beam_bifs/src/ets/adopt.rs::setopts_2` accepts only `{protection, public|protected|private}` and the
+  `{heir, none|Pid|Pid,Data}` forms — everything else (`{write_concurrency,_}`, `{read_concurrency,_}`,
+  `{safe_fixtable,_}`, `{keypos,_}`, `{named_table,_}`, `compressed`, `{decentralized_counters,_}`,
+  `{heir,none,Data}`, `{protection,foo}`, a bare unknown atom) is `badarg` — takes the table with
+  `Gate::Write`, then applies `Table::setopts(Some(owner), SetOpt::Access(_))`, whose owner check is what
+  denies a `public`-table non-owner. So this crate's narrow `SetOpt` surface is the right one.
+- **`beam_bifs` (host rule, verified) — a runtime protection change must NOT re-normalise the
+  fine-locking flags.** Measured: `public` + wc/rc true → `setopts(T,{protection,private})` →
+  `{private, wc true, rc true, dc false}`; and a table created `private` keeps `{false,false,false}` after
+  flipping to `public` — the normalisation is a creation-time property of `TableOptions`, which is why
+  `Table::set_access` never touches it.
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; tests in `src/kind/tests.rs`
@@ -701,7 +776,10 @@ rendering stays host-side (`TableInfo::write_concurrency` is a `bool`).
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/access_audit/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/reclamation_oracle/memory/copy_oracle/concurrency/slot/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/access_audit/access_options/access_rights/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/reclamation_oracle/memory/copy_oracle/concurrency/concurrency_locks/slot/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
+- `tests/ets_access_options.rs` → the pinned `ets:new/2` option-validation matrix (both sides, `Crate::{Calls,Unrepresentable}`, the raw `{write_concurrency,…}` rendering)
+- `tests/ets_access_rights.rs` → the give-away rights matrix per protection, the gate-flip timing, and denied-continuation resumability (vs the live oracle; `HOST_ONLY_DELETE` for the host-owned whole-table `ets:delete/1`)
+- `tests/ets_concurrency_locks.rs` → the `SharedTable` coarse-lock stress (counter/`insert_new`/`select_replace`) + the poisoned-lock typed error; mutation-verified (see the Concurrency section)
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups)
 - `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace (60-slot op space incl. a `next`/`prev` walk + key-boundary dimension) vs the live oracle (`#[ignore]`d; run with `--ignored`)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
