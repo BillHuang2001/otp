@@ -848,36 +848,43 @@ pub trait ExecutionContext {
     fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
         &module.atom_table
     }
-    /// The **per-instruction reduction hook**: charge `n` reductions for the
-    /// instruction the engine is about to execute.
+    /// The **reduction hook**: charge `n` reductions for the work the engine is
+    /// about to execute.
     ///
     /// A BEAM process is pre-emptible because the runtime prices work in
     /// *reductions* and checks its budget at known points. The engine's **only**
     /// other charging point is [`ensure_heap`](ExecutionContext::ensure_heap)
     /// (reached by `test_heap`/`allocate_heap`), which a tight **non-allocating**
     /// loop — the one shape that can monopolise a scheduler — never touches. This
-    /// hook closes that gap: [`Machine::drive`](crate::machine::Machine) calls it
-    /// **once per interpreted instruction** with `n = 1`, **before** the
-    /// instruction's body runs, so a host can price instructions rather than heap
-    /// admissions.
+    /// hook closes that gap at each tier's own granularity:
+    /// [`Machine::drive`](crate::machine::Machine) calls it **once per interpreted
+    /// instruction** with `n = 1`, **before** the instruction's body runs, and the
+    /// native tiers' shared driver (`Tier::BaselineJit` and `Tier::Cranelift` both
+    /// run on it) calls it **once per driver-loop iteration** — a block entry, or the
+    /// per-instruction step it takes for an address no compiled block covers — also
+    /// with `n = 1`, **before** the block is entered. A host therefore prices
+    /// instructions on the interpreter and block entries on the native tiers, rather
+    /// than heap admissions on either; a natively *linked* local tail-call chain
+    /// never returns to the driver and is priced once for the whole chain.
     ///
     /// The default body is a **no-op** ([`Ok`]) — deliberately *not* a typed error:
     /// a host that does not pre-empt simply ignores the hook, so every existing
     /// implementor compiles and behaves byte-identically (it pays only the call).
     /// Returning `Err` propagates out of the run exactly like any other engine
     /// failure, so a host that has exhausted its budget returns **its own** typed
-    /// exhaustion error. Because the charge precedes the body, that error leaves the
-    /// instruction **not applied** and the machine parked at its `(func, pc)`
-    /// ([`Machine::current_code`](crate::machine::Machine::current_code)), so a host
-    /// that pre-empts *by failing* continues the process by re-entering through
+    /// exhaustion error. Because the charge precedes the work, that error leaves the
+    /// instruction (or the block) **not applied** and the machine parked at its
+    /// `(func, pc)` ([`Machine::current_code`](crate::machine::Machine::current_code)),
+    /// so a host that pre-empts *by failing* continues the process by re-entering
+    /// through
     /// [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome) — which
     /// applies that instruction **exactly once** — not by
     /// [`Machine::run_export`](crate::machine::Machine::run_export).
     ///
     /// The engine also counts the same charge in
     /// [`Machine::reductions`](crate::machine::Machine::reductions) — the slice's
-    /// instruction count, readable *after* the slice returns — so a host that
-    /// prefers to poll rather than hook can; see that accessor for the tier caveat.
+    /// reduction count, readable *after* the slice returns — so a host that
+    /// prefers to poll rather than hook can; see that accessor for the per-tier unit.
     fn reduce(&mut self, n: u32) -> Result<()> {
         let _ = n;
         Ok(())
@@ -887,13 +894,15 @@ pub trait ExecutionContext {
     /// be called at all for the process currently running?
     ///
     /// [`Machine::drive`](crate::machine::Machine) charges **one reduction per
-    /// interpreted instruction** (before the instruction's effect), and that charge
-    /// is also offered to the host through [`reduce`](ExecutionContext::reduce). The
+    /// interpreted instruction** (before the instruction's effect) and the native
+    /// tiers' shared driver charges **one per driver-loop iteration** (a block
+    /// entry, before the block is entered), and each charge is also offered to the
+    /// host through [`reduce`](ExecutionContext::reduce). The
     /// hook call is a
     /// `&mut dyn ExecutionContext` vtable crossing the interpreter cannot elide, so
     /// the driver latches this answer **once per run** into the
     /// `Machine::reduce_on` flag and then skips the hook call entirely on a run
-    /// whose host declares it does not need it — the per-instruction hot path pays a
+    /// whose host declares it does not need it — the per-charge hot path pays a
     /// single `bool` load instead.
     ///
     /// **The default is the CONSERVATIVE `true`**: every host keeps receiving every
@@ -904,10 +913,10 @@ pub trait ExecutionContext {
     /// it uses the hook for pre-emption.
     ///
     /// `Machine::reductions` accounting is **unaffected**: the slice counter is
-    /// still bumped on every interpreted instruction, so a host that polls
+    /// still bumped on every charge (one per interpreted instruction, or one per
+    /// driver-loop iteration on the native tiers), so a host that polls
     /// [`Machine::reductions`](crate::machine::Machine::reductions) after the slice
-    /// observes the exact same count either way; only the per-instruction hook *call*
-    /// is skipped.
+    /// observes the exact same count either way; only the hook *call* is skipped.
     ///
     /// Like the A.8 tracing gate, the answer is latched at a run/resume entry, so a
     /// host that flips it mid-run sees the change take effect at the process's next

@@ -261,8 +261,8 @@ impl Machine {
         }
     }
 
-    /// The number of interpreted instructions charged in the current (or most
-    /// recently finished) [`Machine::drive`] slice.
+    /// The number of reductions charged in the current (or most recently
+    /// finished) scheduling slice.
     ///
     /// One `drive` call — a run, or a resume of a suspended process — is one
     /// scheduling slice, and the counter is zeroed at its start, so this is that
@@ -274,10 +274,14 @@ impl Machine {
     /// observe *after* the slice returns (`RunOutcome::Wait` included) without
     /// keeping its own tally.
     ///
-    /// Honest by construction: only the interpreter's dispatch loop charges, so
-    /// under the baseline JIT tier — where a natively executed block bypasses
-    /// `step_instruction` — the count is a **lower bound** (each deopt still
-    /// charges). Never fabricated, never negative.
+    /// The unit is the running tier's: the interpreter's dispatch loop charges one
+    /// per **interpreted instruction**, while the native tiers' shared driver charges
+    /// one per **driver-loop iteration** — a block entry, or the per-instruction step
+    /// it takes for an address no compiled block covers — so the same work reports
+    /// fewer units under the baseline JIT tier, and a natively linked local tail-call
+    /// chain reports one per driver round-trip (`tests/jit_reductions.rs`). Every
+    /// reported count is a real, exactly-once charge on that tier: never fabricated,
+    /// never negative.
     pub fn reductions(&self) -> u64 {
         self.reductions
     }
