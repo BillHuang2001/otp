@@ -14,10 +14,15 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
   `libc`-only `dlopen` + `driver_init` read, used where a `beam_abi` dependency is not available
   to the test).
 - `cdriver/mod.rs` — the shared C-driver helpers: `load_driver`/`load_named_driver`/`open_port`/
-  `open_named_port`/`round_data`/`data_of`/`reads_of`/`closed_of`/`await_data`/`drive_until`/
+  `open_named_port`/`round_data`/`data_of`/`reads_of`/`closed_of`/`await_data`/`drain_data`/
+  `await_trailing_data`/`ASYNC_JOB_FRAMES`/`is_async_job_frame`/`drive_until`/
   `await_log_line`/`logged_port_command`/`LoggedPort` and the fixture builders
   (`fixture_so`, `variant_fixture_*`, `no_process_exit_variant_fixture_*`, `vector_fixture_so`,
   `both_fixture_so`, `shape_fixture_*`).
+  `round_data` asserts a round reported **exactly one** `Data` (the no-coalescing rule for a
+  call site that makes one `driver_output*` call); `drain_data` returns every frame the rounds
+  report until a round reports none, and `await_trailing_data` collects frames until `expected`
+  is the **newest** one — the shape a `driver_async` site needs (see *Known Issues*).
 - `fixtures/*.c` — the C driver objects. `host_driver.c` is the base; the others `#include` it
   after defining a `HOST_DRIVER_*_SLOT` override macro, so one file carries the whole vocabulary.
 
