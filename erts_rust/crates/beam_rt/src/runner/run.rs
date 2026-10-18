@@ -45,45 +45,16 @@ use super::perf::record_baseline_code;
 use super::reason::{exit_reason, killed, normal};
 use super::tier::select_entry_tier;
 
-// The number of off-heap payloads this thread's slices have registered onto a process's
-// off-heap table, for the cursor regression pin (see
-// `super::tests::a_process_registers_each_off_heap_payload_exactly_once_across_slices`).
-//
-// The counter backs a **deterministic** observation of the registration seam: the total number
-// of `register_off_heap_binary` calls the runner makes over a process's whole life is
-// `== the number of distinct payloads it built` under the reservoir cursor, but
-// `>= slices × payloads` under the old whole-reservoir walk. It is **per thread** (not a shared
-// `static`) so a concurrently running unit test's slices cannot perturb this test's count — a
-// shared atomic would make the pin flaky under `cargo test`'s parallel harness.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static REGISTERED_PAYLOAD_TOTAL: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-/// The payloads registered on this thread since the last [`reset_registered_payload_total`].
-#[cfg(test)]
-pub(crate) fn registered_payload_total() -> usize {
-    REGISTERED_PAYLOAD_TOTAL.with(std::cell::Cell::get)
-}
-
-/// Zeroes this thread's registration counter (the pin's "before" reading).
-#[cfg(test)]
-pub(crate) fn reset_registered_payload_total() {
-    REGISTERED_PAYLOAD_TOTAL.with(|counter| counter.set(0));
-}
-
 // The slice/park accounting for this thread's runner, for the **deterministic** counter pin on
 // a growth-shaped workload (see `super::tests`).
 //
-// Like `REGISTERED_PAYLOAD_TOTAL`, these are **per thread** (a `thread_local!`, not a shared
-// static) so a concurrently running unit test's slices cannot perturb this test's counts. They
-// are **structural** facts of the runner — one *slice* is one `RuntimeRunner::run` call, a
-// *park* is a slice that handed the machine back to the scheduler (the `Yield` pre-emption arm
-// or the `receive` `Wait` arm) — never timings, so a per-call ratio derived from them is
-// deterministic on a loaded host. The `ctx/gc` debt pin's sibling
-// (`beam_process::Process::collection_debt`) is the other half: together they say whether the
-// per-call work of a workload is **flat** or **N-dependent**.
+// These are **per thread** (a `thread_local!`, not a shared `static`) so a concurrently running
+// unit test's slices cannot perturb this test's counts. They are **structural** facts of the
+// runner — one *slice* is one `RuntimeRunner::run` call, a *park* is a slice that handed the
+// machine back to the scheduler (the `Yield` pre-emption arm or the `receive` `Wait` arm) —
+// never timings, so a per-call ratio derived from them is deterministic on a loaded host. The
+// `ctx/gc` debt pin's sibling (`beam_process::Process::collection_debt`) is the other half:
+// together they say whether the per-call work of a workload is **flat** or **N-dependent**.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RunSliceCounters {
@@ -1116,80 +1087,16 @@ impl ProcessRunner for RuntimeRunner<'_> {
             record_baseline_code(self.runtime, module);
         }
 
-        // Register the off-heap refc binaries this machine built onto the **running process's**
-        // own off-heap table, so `erlang:process_info(Pid, binary)` has a roster to report.
+        // The off-heap refc binaries this machine built need no registration step.
         //
-        // The real *holders* of those payloads are this machine's never-cleared reservoir
-        // (`Machine::refc_binaries`, appended by `Machine::alloc_refc_binary` whenever compiled
-        // bitstring code materializes a result above the on-heap limit and never emptied by
-        // `Machine::reset`), while the roster `process_info` reads back is
-        // `beam_process::Process`'s own table — the thing
-        // `Process::off_heap_binaries`/`off_heap_binary_count` enumerate — which is empty until
-        // something **registers** them, and nothing else in production does. This seam is what
-        // makes a running process come to *own* what its engine built.
-        //
-        // # Why this can never under-report
-        //
-        // The seam sits on the common path below the slice and above the outcome dispatch, so
-        // it runs on **every** slice outcome — a pre-emption (`Yield`), a `receive` park
-        // (`Wait`), a `Returned` and an `Err` alike (the last two belong to a process that is
-        // about to terminate, so their registration is merely harmless). A process's roster is
-        // therefore a superset of every payload its machine had built when any of its slices
-        // ended. The one window it does not cover is a `process_info(self(), binary)` issued
-        // from **inside** the running slice itself, before that slice reaches this point: the
-        // roster such a process reads back about itself can omit a binary the same slice has
-        // just built. That is safe rather than a lost term — the `Machine::refc_binaries`
-        // reservoir (of which this registration is only a mirror) is what keeps the payload
-        // alive, so a registration that has not happened yet can never *dangle* a payload; the
-        // worst it can do is omit an entry from a roster the process reads back about itself.
-        //
-        // # Why the registration advances a cursor instead of re-walking the reservoir
-        //
-        // The reservoir is **append-only** and never cleared, so a later slice's reservoir is an
-        // earlier slice's reservoir plus whatever that slice built. Re-offering the whole
-        // reservoir on every slice would re-offer every already-registered payload on every later
-        // slice, and each offer costs an O(slots) `owned_binary_slot` scan inside
-        // `Process::register_off_heap_binary` before its idempotent drop — Θ(slices × slots) over a
-        // long-lived process, i.e. the quadratic-to-cubic blow-up the `foreign` `enc` workload
-        // showed. The engine's `ProcessEngine::registered_payloads` records the reservoir prefix
-        // already registered, so each slice registers only its **not-yet-registered suffix** and the
-        // total work over the process's whole life is linear in the number of payloads it built.
-        //
-        // The cursor lives on the `ProcessEngine`, which is removed from and re-inserted into
-        // [`RunnerState::engines`](super::entry::RunnerState) at every slice boundary (both park
-        // arms re-insert the **same** mutated engine), so it survives a pre-emption and a
-        // `receive` park: slices 2..N observe the cursor the earlier slices advanced, not the `0`
-        // of a fresh engine. The `min` against `all.len()` keeps the cursor in range even if the
-        // reservoir were ever rebuilt smaller (it cannot shrink today, since `Machine::reset` does
-        // not clear it), so a stale cursor can only skip work, never index out of bounds or
-        // under-register a payload the suffix walk already covered.
-        //
-        // # Why over-reporting is the safe and faithful direction
-        //
-        // A payload registered at the end of the first slice that built it stays registered: the
-        // cursor never un-registers, so the roster `Process::off_heap_binaries` reads back still
-        // lists a payload that `Process::sweep_off_heap_binaries_reachable` pruned at a later
-        // rooted collection. That is harmless — `register_off_heap_binary` is dedup-by-`data_ptr`
-        // and idempotent, so a repeat drops the surplus handle — and the over-report itself
-        // **mirrors the oracle**, which likewise lists a dropped binary until a GC collects it.
-        // Listing a payload the never-cleared reservoir still owns is therefore both safe and
-        // faithful, never a fabricated entry.
-        //
-        // # Why `Runtime::eval_off_heap` is deliberately NOT registered here
-        //
-        // That store is the **pid-less** home of the `-eval` root process's escaping payloads,
-        // not this machine's work. Attributing it to this process would fabricate a roster entry
-        // for a payload the process never built, so it stays out of this seam entirely.
-        if let Some(process) = table.get_mut(pid) {
-            let all = engine.machine.refc_binaries();
-            let start = engine.registered_payloads.min(all.len());
-            for payload in &all[start..] {
-                process.register_off_heap_binary(payload.clone());
-            }
-            #[cfg(test)]
-            REGISTERED_PAYLOAD_TOTAL.with(|counter| counter.set(counter.get() + (all.len() - start)));
-            engine.registered_payloads = all.len();
-        }
+        // `Machine::refc_binaries` is the one holder of the payloads a process's compiled
+        // bitstring code builds (it is append-only and `Machine::reset` never clears it), so it
+        // already *is* the process's off-heap roster and `erlang:process_info(Pid, binary)` reads
+        // it straight through `RunnerState::reservoir_at`. The process's own off-heap table is
+        // therefore left empty, which is what keeps `beam_gc::OffHeap`'s never-compacted slot
+        // space out of the per-call path: mirroring the reservoir onto it fed that space a slot
+        // per payload on every slice, and the O(slots) `overhead_bytes`/`sweep` walks it implies
+        // made a build-a-binary loop quadratic in its own iteration count.
 
         // Pre-emption: the budget ran out at a charging point of this slicing machine
         // (an interpreted instruction's per-instruction charge, or a heap-admission

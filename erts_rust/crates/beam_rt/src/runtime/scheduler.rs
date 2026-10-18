@@ -541,6 +541,22 @@ impl Runtime {
     /// A port table that cannot be borrowed (a nested borrow) is reported as **not**
     /// quiescent: the pump then keeps stepping rather than declaring a stall it cannot
     /// substantiate.
+    /// Whether some live port owes this runtime an answer — see
+    /// [`PortRegistry::awaits_port_reply`](crate::port::PortRegistry::awaits_port_reply).
+    ///
+    /// This is the *narrow* companion of [`Runtime::is_quiescent`]'s port test: it asks
+    /// whether a driver is mid-exchange with us, not whether the port table is empty. A
+    /// port that has answered every byte written to it can only speak again once this
+    /// runtime writes to it, so a pass with nothing runnable gains nothing by blocking on
+    /// it. A port table that cannot be borrowed is reported as **awaiting**, which keeps
+    /// today's blocking poll: the gate below may only ever shorten a sleep it can justify.
+    fn awaits_port_reply(&self) -> bool {
+        self.ports
+            .try_borrow()
+            .map(|registry| registry.awaits_port_reply())
+            .unwrap_or(true)
+    }
+
     fn is_quiescent(&mut self) -> bool {
         if self.run_queue_len() != 0 {
             return false;
@@ -793,11 +809,23 @@ impl Runtime {
             // act on it immediately, and blocking first only delays it by a whole poll slice. So
             // the port poll below is non-blocking for such a round — it still *polls* (a driver may
             // already have bytes queued) but with a zero timeout — and the timer wait is skipped
-            // (`TimerWait::AtMostWhenIdle`). A round that ran **nothing** still blocks, so a parked
-            // `receive … after T` is still slept to without spinning and a live port whose driver
-            // has not written yet is still waited on.
+            // (`TimerWait::AtMostWhenIdle`).
+            //
+            // A round that ran nothing still blocks on the port half — *unless* no port can
+            // speak unprompted. A driver only produces output on its own schedule (an OS
+            // child writing whenever it likes); a port whose every written byte has already
+            // been answered cannot say anything until this runtime writes to it again
+            // ([`PortRegistry::awaits_port_reply`]), so blocking on it is pure sleep. The
+            // boot drive is where that matters: the kernel start opens the `inet_gethost`
+            // helper port (the oracle does too), answers its one framed request, and leaves
+            // it live-but-idle for the rest of the boot, so each of the drive's zero-slice
+            // steps would burn a whole [`PORT_POLL_SLICE`]. The gate is scoped to the boot
+            // drive's own [`TimerWait::ImminentWithin`] policy: the `run` and `-eval` routes
+            // keep the unconditional blocking poll their workloads rely on.
             let progressed = round_slices > 0;
-            let port_timeout = if progressed {
+            let port_timeout = if progressed
+                || (matches!(wait, TimerWait::ImminentWithin(_)) && !self.awaits_port_reply())
+            {
                 Duration::ZERO
             } else {
                 crate::port::PORT_POLL_SLICE
