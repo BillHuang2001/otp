@@ -530,6 +530,60 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - `erl_errno_id` returns `strerror`'s descriptive message (the oracle the lowercase POSIX errno *name*); `erl_drv_time_offset` returns `0` by construction (monotonic time is anchored on the system epoch); `erl_drv_consume_timeslice` always returns `0` (no port-timeslice accounting); `driver_system_info` returns without writing for a null `sip` or an `si_size` shorter than the first field group, where the C calls `erts_exit(ERTS_ERROR_EXIT, …)`.
 - Refusals where the C would fault or over-read: a malformed/out-of-range request (`driver_output_binary`, `offset + len > orig_size`, `driver_outputv`, `skip`, `time_left`, `ErlIOVec`) refused with `-1`; a `NULL` `driver_name` is a typed `BadDriverName`; a `dlopen` failure lands in `Unspecified` carrying the loader's own `dlerror` text (the C renders an `{open_error, N}` code); the `.so` suffix is appended only when absent. No code-server/driver list or reload policy is consulted (only the *entry* validation).
 
+## Oracle-measured: the port-closing family (`driver_failure*` / `driver_exit`)
+Measured on OTP 29.1.1 / erts-17.1 with a `cc`-built driver `.so` (`erl_ddll:load_driver/2` +
+`open_port({spawn_driver,Name},[])`, owner `process_flag(trap_exit,true)`), read from
+`io.c:7195-7280`'s single `driver_failure_term(ix, term, eof)`:
+| C entry point | `(term, eof)` | reason the owner gets | C return |
+|---|---|---|---|
+| `driver_failure_eof(P)` | `(NIL, 1)` | `normal` | `0` |
+| `driver_failure_atom(P,"boom")` | `(atom, 0)` | `boom` (bare atom) | `0` |
+| `driver_failure_posix(P,EACCES)` | `(atom("eacces"), 0)` | `eacces` (bare atom, **not** `{error,·}`) | `0` |
+| `driver_failure(P,7)` | `(small(7), 0)` | `7` (bare int, **not** `{error,·}`) | `0` |
+| `driver_failure(P,0)` | `(small(0), **1**)` | `normal` — **identical to `driver_failure_eof`** | `0` |
+| `driver_exit(P,0)` | unlink first, then `(am_normal, 0)` | **no** exit message (link removed); a monitor sees `{'DOWN',…,normal}` | `0` |
+| `driver_exit(P,EACCES)` | unlink first, then `(atom("eacces"), 0)` | no exit message; monitor reason `eacces` | `0` |
+`eof=1` does three further things beyond forcing `am_normal`: it acks an async-open port
+(`init_ack_send_reply`), **flushes the line buffer** (`flush_linebuf_messages`, `io.c:3475-3499` — the
+only call site in the emulator; measured: a `[line]` port with a buffered partial line delivers
+`{Port,{data,{noeol,"partial"}}}` *before* the exit), and takes the **soft-eof** branch on a port
+opened with the `eof` option (`ERTS_PORT_SFLG_SOFT_EOF`, `erl_bif_port.c:996`): instead of closing it
+delivers `{Port,eof}` and the port **stays alive** (measured `port_info` intact, `port_close/1` =
+`true`). Every closed port afterwards answers `port_info(P)` = `undefined` and `port_close/1` raises
+`badarg`. `erl_errno_id/1` yields the **lowercase POSIX name** (measured `eacces`/`enoent`/`eio`/
+`einval`; `0` ⇒ `errno_0`, an out-of-range errno ⇒ `errno_9999`, `erl_errno_str.c:47`, `:1158-1180`) —
+so this crate's `erl_errno_id` (which returns `strerror` text, a documented deviation) **cannot** be
+used to build a `Posix` reason. `driver_failure_atom` interns the raw bytes as **Latin-1** (measured:
+the single byte `0xE9` ⇒ `é`, the UTF-8 pair `0xC3 0xA9` ⇒ `'hÃ©llo'`; an empty name ⇒ `''`), i.e. the
+seam's UTF-8-only `PortFailure::Atom(&str)` is a real, documented divergence.
+### The invalid-port operand: `NULL` is a crash, `(void*)-1` is the `-1` path
+`ERTS_INVALID_ERL_DRV_PORT` is **`(struct _erl_drv_port *)(SWord)-1`**, never `NULL`
+(`erl_port.h:60-67`: "It would have been preferred to use NULL … not backward compatible").
+Measured: `driver_failure_eof(NULL)`/`_atom`/`_posix`/`driver_failure(NULL,·)`/`driver_exit(NULL,·)`
+each **SIGSEGV the VM deterministically (3/3)** — only `ERTS_INVALID_ERL_DRV_PORT (-1)` returns `-1`
+(deterministic, port untouched). So this crate's `env_for`/`DriverEnv::from_port` mapping *null* to
+"the C's invalid-port path" (and its `-1` return) is a deliberate **safety divergence**, not ABI
+fidelity; the real sentinel `(void*)-1` is **not** recognized (`from_port` accepts it and dereferences
+`-1`, i.e. UB). A stale handle from a fully-terminated port returns `-1` deterministically (3/3) when
+called from a *different* live port's callback, but calling a second `driver_failure_*` on a
+just-terminated port from the **same** callback **segfaults 3 of 4 runs** (`erl_port.h:735-747`
+documents the `ERTS_PORT_SFLGS_INVALID_DRIVER_LOOKUP` guard, but the state word is read out of freed
+memory) — both shapes are use-after-free and therefore **unpinnable**.
+### Status of this crate's half
+`lifecycle.rs` models every spelling onto `DriverHost::failure`/`port_exit` with the C's return codes
+(`0`/`-1`) and never touches a null port. Four contract defects remain (all in *this* crate, no host
+needed): (1) `PortFailure::Posix`/`Error`'s doc comments claim the reason is `{error,·}` — the oracle's
+is the bare atom / bare int; (2) `driver_failure(P, 0)` reaches the seam as `PortFailure::Error(0)`,
+losing the `eof` flag — it must map to `PortFailure::Eof` (behaviourally identical in the C); (3) the
+`(void*)-1` sentinel must be rejected alongside `NULL`; (4) no production host implements
+`failure`/`port_exit` (`beam_rt`'s `DriverPort` and `beam_io`'s `AbiHost` leave both trait defaults), so
+a loaded driver's `driver_failure_*` answers `-1` and nothing closes — the `{'EXIT',Port,Reason}` /
+`{'DOWN',…}` / `{Port,eof}` observables above are the contract that host must reproduce.
+`port_info`-side note: a `control` callback returning `< 0` (the documented
+`return ERL_DRV_ERROR_GENERAL` idiom) makes `port_control/3` raise `badarg` and leaves the port
+**alive**; `output`/`ready_input` are `void`-returning in erts-17.1, so that idiom now applies only to
+`control`/`call`.
+
 ## Handoffs (host halves owned by other nodes)
 - **`DriverHost::output2` adoption — the only remaining step for a loaded C driver's split reply.**
   All four `driver_output*` thunks now hand the split to `output2`; a host that does not override it
