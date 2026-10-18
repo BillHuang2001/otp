@@ -199,7 +199,7 @@ pub use monitor::DriverMonitors;
 use beam_common::BeamError;
 use beam_alloc::Heap;
 use beam_io::{DriverContext, Interest, Token};
-use beam_process::ProcessId;
+use beam_process::{PortId, ProcessId};
 use beam_term::{make_atom, refc::ERL_ONHEAP_BINARY_LIMIT, Atom, AtomTable, Eterm};
 
 use super::ProcessLiveness;
@@ -574,6 +574,159 @@ impl BusyFlag {
     }
 }
 
+/// The port's **driver-failure latch** — where a driver that closes its own port records the
+/// request, and where the port lifecycle drains it into `beam_io`'s failure channel.
+///
+/// The C's `driver_failure*` family and `driver_exit` (`io.c:7196-7278`) are **port-closing
+/// requests**, not return values: they deliver the port-exit reason to the connected process and
+/// hand the port back to the emulator to be torn down. A [`DriverHost`] cannot close a port — it
+/// owns no port table and no process table — so the request is recorded here, from inside the
+/// callback, and [`DriverPortAdapter::settle`] hands it to
+/// [`beam_io::DriverContext::signal_failure`] on the way out. `beam_io` then reaps the port after
+/// the callback returns (`PortRegistry::reap_failures`), which is what makes the driver's `stop`
+/// run and the port leave the live map through the ordinary close path.
+///
+/// It is a shared handle rather than a host field because the host is boxed inside the port
+/// lifecycle ([`DriverPortAdapter::load`]) and exposes neither itself nor the context its callback
+/// runs against; seizing the latch at load is the same pattern as [`BusyFlag`],
+/// [`DriverMonitors`] and [`super::driver::TermQueue`].
+///
+/// **Exactly one** failure is kept: in the C the first call has already closed the port, so a
+/// second one is meaningless (the measured `driver_failure_atom` then `driver_exit` shape is a
+/// use-after-free *in the C*). A second request is refused with the C's `-1` rather than
+/// overwriting the first, so a driver that reports twice is told its second request did nothing.
+#[derive(Clone, Debug, Default)]
+pub struct FailureLatch {
+    /// The latched request, if a driver has closed its port since the last drain.
+    ///
+    /// `RefCell` rather than `Cell` because [`beam_io::DriverFailure`] is not `Copy` (its
+    /// [`FailureReason::Atom`] carries a name).
+    slot: Rc<RefCell<Option<beam_io::DriverFailure>>>,
+}
+
+impl FailureLatch {
+    /// An empty latch — a fresh port no driver has closed.
+    pub fn new() -> FailureLatch {
+        FailureLatch::default()
+    }
+
+    /// Records `failure`, answering whether it was **this** call that latched it.
+    ///
+    /// `false` means a failure was already latched (the port is already being closed), which the
+    /// C's own "the first call closed it" rule makes the driver's `-1`.
+    pub fn set(&self, failure: beam_io::DriverFailure) -> bool {
+        let mut slot = self.slot.borrow_mut();
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(failure);
+        true
+    }
+
+    /// Takes the latched failure out, if any — the drain half
+    /// ([`DriverPortAdapter::settle`]).
+    pub fn take(&self) -> Option<beam_io::DriverFailure> {
+        self.slot.borrow_mut().take()
+    }
+
+    /// Whether a failure is waiting to be drained.
+    pub fn is_pending(&self) -> bool {
+        self.slot.borrow().is_some()
+    }
+
+    /// Forgets a latched failure — the port is going away, and its teardown
+    /// ([`DriverPortAdapter::stop`]) must not leave a request nobody will ever drain.
+    pub fn clear(&self) {
+        *self.slot.borrow_mut() = None;
+    }
+}
+
+/// The **`ERL_DRV_PORT` resolution state** of one driver port — the two facts a host cannot observe
+/// about itself.
+///
+/// The C idiom for naming a port inside a driver-emitted term is `{ERL_DRV_PORT,
+/// driver_mk_port(port)}` (`erl_driver.h:523`), and its operand is the port's **id term**: the C
+/// decoder checks it with `is_internal_port` (`io.c:5744-5747`) and answers `NIL` for an invalid
+/// handle (`erts_drvport2port`, `io.c:7295-7303`). This crate's `driver_mk_port` answers the
+/// **handle** encoding instead (a port handle here *is* the [`DriverEnv`] address,
+/// [`DriverEnv::as_port`]) because the term-data layer has no port table, so
+/// `decode_term_spec` resolves a non-port operand back through [`DriverHost::port_term`].
+///
+/// The host cannot answer that hook on its own: it is reached *through* the environment and is never
+/// told the environment's address, nor the [`PortId`] the registry allocated for it. Both are known
+/// in exactly one place — `DriverPortAdapter::start`, which builds the environment inside the port's
+/// `beam_io::Driver::start`, where [`beam_io::DriverContext::port`] reports the id. So the state
+/// lives on this shared handle: [`DriverPort::port_terms`] seizes it **before** the host is boxed
+/// into the port lifecycle (the boxed driver exposes no host, exactly like
+/// [`DriverPort::term_queue`] and [`DriverPort::busy_flag`]), the adapter stamps the pair, and the
+/// hook reads it back.
+///
+/// A port that has left the runtime must stop resolving: [`DriverPort::clear_driver_state`] latches
+/// [`PortTerms::mark_gone`], which is what keeps a driver that cached its `ErlDrvPort` in its
+/// private state from turning it back into a dead port's id term. A host nobody stamped — a bare
+/// host in a unit test — answers `None`, and the decoder then refuses the whole spec
+/// (the C's `ERTS_DDT_FAIL`: `-1`, nothing delivered), never a wrong term.
+#[derive(Debug)]
+pub struct PortTerms {
+    /// The environment address this host published as its `ErlDrvPort` (`0` = unpublished).
+    env: Cell<usize>,
+    /// The port id that handle stands for — stamped together with `env`, never alone.
+    port: Cell<Option<PortId>>,
+    /// Whether the port has left the runtime (see [`PortTerms::mark_gone`]).
+    gone: Cell<bool>,
+}
+
+impl PortTerms {
+    /// A fresh, **unpublished** state: no handle, no port id, live. The state of a host the port
+    /// lifecycle has not stamped yet.
+    pub fn new() -> PortTerms {
+        PortTerms {
+            env: Cell::new(0),
+            port: Cell::new(None),
+            gone: Cell::new(false),
+        }
+    }
+
+    /// Publishes the environment address this host's `ErlDrvPort` **is** — the value
+    /// [`DriverEnv::as_port`] answers (`driver/start`, the one place it can be observed).
+    pub fn set_env(&self, env: usize) {
+        self.env.set(env);
+    }
+
+    /// Records the port id that published handle stands for — the [`PortId`] `beam_io` allocated
+    /// before it ran `Driver::start`.
+    pub fn set_port(&self, port: PortId) {
+        self.port.set(Some(port));
+    }
+
+    /// Latches "this port has left the runtime": the handle it published resolves to nothing from
+    /// here on (the C's `NIL`, `erts_drvport2port`, `io.c:7295-7303`). One-way — a port number that
+    /// is later reused belongs to a *different* port with its own state.
+    pub fn mark_gone(&self) {
+        self.gone.set(true);
+    }
+
+    /// The id term for `handle` when it is **this** port's published environment, or `None`.
+    ///
+    /// `handle` is opaque: it is compared against the address this host published and is **never**
+    /// dereferenced — the hook's own contract, and the reason a stale or foreign handle can never
+    /// be mistaken for a port. A null handle, an unpublished host, a host that has only half the
+    /// pair stamped, and a port that has gone away all answer `None`, which the decoder turns into a
+    /// refused spec rather than a fabricated port term.
+    pub fn resolve(&self, handle: usize) -> Option<Eterm> {
+        if handle == 0 || self.gone.get() || handle != self.env.get() {
+            return None;
+        }
+        self.port.get().map(PortId::to_eterm)
+    }
+}
+
+impl Default for PortTerms {
+    fn default() -> PortTerms {
+        PortTerms::new()
+    }
+}
+
 /// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
 ///
 /// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
@@ -684,6 +837,23 @@ pub struct DriverPort {
     /// test, or a port opened before any port round ran — keeps the viewless
     /// [`ProcessLiveness::new`], whose `is_alive` answers `None`.
     liveness: Rc<ProcessLiveness>,
+    /// The port's **`ERL_DRV_PORT` resolution state** — the environment address this host published
+    /// as its `ErlDrvPort` and the [`PortId`] it stands for (see [`PortTerms`]).
+    ///
+    /// Shared by `Rc` between the host (which [`DriverHost::port_term`] reads) and the port
+    /// lifecycle, which stamps the pair from `DriverPortAdapter::start` — the only place the
+    /// environment's address and the registry's port id are both in hand. Seized with
+    /// [`DriverPort::port_terms`] before the host is boxed into the port lifecycle, exactly like
+    /// [`DriverPort::term_queue`]. A host nobody stamped answers `None`, never a fabricated port.
+    port_terms: Rc<PortTerms>,
+    /// The port's **driver-failure latch** — where `driver_failure*`/`driver_exit` record their
+    /// port-closing request, and where the port lifecycle drains it into `beam_io`'s failure channel
+    /// (see [`FailureLatch`]).
+    ///
+    /// Shared by `Rc` with the port lifecycle, which seizes it at
+    /// [`DriverPortAdapter::load`] and drains it after every callback
+    /// ([`DriverPortAdapter::settle`]) — the host itself cannot close a port (see [`FailureLatch`]).
+    failures: FailureLatch,
 }
 
 impl DriverPort {
@@ -712,6 +882,12 @@ impl DriverPort {
             // No observation has been published yet: a host nobody claims answers "monitor anyway"
             // rather than fabricating a `NotAlive` (see [`ProcessLiveness`]).
             liveness: ProcessLiveness::new(),
+            // Unpublished until the port lifecycle builds the environment and stamps the pair
+            // (`DriverPortAdapter::start`): half a pair must never fabricate the other half.
+            port_terms: Rc::new(PortTerms::new()),
+            // No driver has closed this port: the latch is what `driver_failure*`/`driver_exit`
+            // fill and what the port lifecycle drains after each callback (`FailureLatch`).
+            failures: FailureLatch::new(),
         }
     }
     /// Records whether the loaded driver entry declares an [`ErlDrvEntry::process_exit`] slot (see
@@ -758,8 +934,29 @@ impl DriverPort {
 
     /// Drops the per-port driver-private state: the port (and the driver) is going away, so its
     /// queue must not outlive it.
+    ///
+    /// It also latches the port **gone** on the [`PortTerms`] handle, so the environment address
+    /// this host published stops resolving to an id term (the C's `NIL`,
+    /// `erts_drvport2port`, `io.c:7295-7303`). Both callers are teardown
+    /// (a driver port's `stop` and its `Drop`), which is exactly when the C's port struct is gone.
     pub fn clear_driver_state(&mut self) {
         self.queue.clear();
+        self.port_terms.mark_gone();
+        // A request nobody can drain any more must not outlive the port: the lifecycle is already
+        // tearing the port down (see [`FailureLatch::clear`]).
+        self.failures.clear();
+    }
+
+    /// The port's [`PortTerms`] handle — the state behind [`DriverHost::port_term`], stamped by the
+    /// port lifecycle with the environment address and the registry's [`PortId`] (see
+    /// [`PortTerms`]).
+    ///
+    /// Taken **before** the host is boxed into a port (the boxed driver is reached through
+    /// [`beam_io::Driver`], which exposes no host), exactly like [`DriverPort::term_queue`]: the
+    /// stamp lands on this very handle, so the caller observes it without reaching the host — which
+    /// is also how the hook, reached *through* the environment, reads it.
+    pub fn port_terms(&self) -> Rc<PortTerms> {
+        Rc::clone(&self.port_terms)
     }
 
     /// The port's [`TermQueue`] — the handle a driver callback's `erl_drv_output_term` /
@@ -807,6 +1004,16 @@ impl DriverPort {
     /// callback; the runtime reads it back to answer `erlang:port_command/2,3`.
     pub fn busy_flag(&self) -> BusyFlag {
         self.busy.clone()
+    }
+    /// The port's **driver-failure latch**, shared with the port lifecycle — the handle
+    /// `driver_failure*`/`driver_exit` record their request on and the port drains into
+    /// [`beam_io::DriverContext::signal_failure`] (see [`FailureLatch`]).
+    ///
+    /// Taken **before** the host is boxed into the port lifecycle, exactly like
+    /// [`DriverPort::busy_flag`]: the boxed driver exposes no host, and the drain has to happen
+    /// after each callback returns.
+    pub fn failures(&self) -> FailureLatch {
+        self.failures.clone()
     }
     /// Records whether the loaded driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY` (see
     /// [`BusyFlag`]).
@@ -1300,6 +1507,62 @@ impl DriverHost for DriverPort {
         0
     }
 
+    /// Records the driver's request to close its own port — the single hook behind the C's whole
+    /// `driver_failure*` family (`io.c:7196-7229`).
+    ///
+    /// A host cannot close a port: it owns no port table and no process table. So the request is
+    /// **latched** here ([`FailureLatch`]) and the port lifecycle hands it to
+    /// [`beam_io::DriverContext::signal_failure`] as this callback returns
+    /// ([`DriverPortAdapter::settle`]), after which `beam_io` reaps the port through its ordinary
+    /// close path — which is what makes the driver's `stop` run, the port leave the live map and
+    /// its owner/watchers receive the reason.
+    ///
+    /// The C flushes the driver's private queue (`prt->ioq`) as part of the same request
+    /// (`driver_failure_term`, `io.c:7220`), and [`DriverPort::queue`] is this host's queue, so it
+    /// is cleared here — a later `driver_deq` on a closing port answers the C's empty-queue value.
+    ///
+    /// `0` is the C's success answer. A **second** request on a port already closing answers `-1`:
+    /// in the C the first call already closed the port, so a second one has nothing left to close
+    /// (see [`FailureLatch::set`]) — never a silently overwritten first reason.
+    fn failure(&mut self, reason: beam_abi::driver::host::PortFailure<'_>) -> c_int {
+        use beam_abi::driver::host::PortFailure;
+        let failure = match reason {
+            // The eof route: reason `normal`, with the line-buffer flush the port owes it.
+            PortFailure::Eof => beam_io::DriverFailure::eof(),
+            PortFailure::Atom(name) => beam_io::DriverFailure::atom(name),
+            PortFailure::Posix(errno) => beam_io::DriverFailure::posix(errno),
+            // `driver_failure(P, 0)` arrives as `Eof` (the C's eof flag is `code == 0`), so this
+            // arm is always a real integer reason.
+            PortFailure::Error(code) => beam_io::DriverFailure::error(code),
+        };
+        self.queue.clear();
+        if self.failures.set(failure) {
+            0
+        } else {
+            -1
+        }
+    }
+
+    /// Records the driver's request to terminate its connected process (`driver_exit`,
+    /// `io.c:7234-7253`).
+    ///
+    /// The C does two things in this order: it **unlinks** the connected process, then closes the
+    /// port. Both facts are carried by the latched request:
+    /// [`beam_io::DriverFailure::exit`] sets `signals_owner = false` (so the close owes no
+    /// `{'EXIT', Port, Reason}` at all) and names the reason — `normal` for `code == 0`, else the
+    /// bare errno atom. Every **monitor** on the port still receives its `'DOWN'`, because the C's
+    /// `erts_deliver_port_exit` covers links and monitors in one path.
+    ///
+    /// `0` is the C's success answer, `-1` a port already closing (see [`DriverHost::failure`]).
+    fn port_exit(&mut self, code: c_int) -> c_int {
+        self.queue.clear();
+        if self.failures.set(beam_io::DriverFailure::exit(code)) {
+            0
+        } else {
+            -1
+        }
+    }
+
     /// The port's **state** stream flags, as `driver_get_port_flags` reports them.
     ///
     /// The C reads the *port state* bits (`ERTS_PORT_SFLG_BINARY_IO` ⇒ `PORT_FLAG_BINARY` (1), else
@@ -1391,6 +1654,24 @@ impl DriverHost for DriverPort {
     /// one process, so this is the same pid [`DriverPort::connected_pid`] answers with.
     fn caller_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
         Some(self.owner.to_eterm())
+    }
+
+    /// The port's own **id term** — the `ERL_DRV_PORT` term-data operand of
+    /// `{ERL_DRV_PORT, driver_mk_port(port)}` (`erl_driver.h:523`).
+    ///
+    /// The C's operand there is the *id term* (`io.c:5969-5972`) and the decoder checks it with
+    /// `is_internal_port` (`io.c:5744-5747`); `driver_mk_port` here answers the **handle** encoding
+    /// instead (a port handle is the [`DriverEnv`] address, [`DriverEnv::as_port`]), so the decoder
+    /// resolves it back through this hook and refuses the whole spec (`ERTS_DDT_FAIL`, `-1`,
+    /// nothing delivered) unless an internal port comes back.
+    ///
+    /// `port` is **opaque**: it is compared against the address this host published through
+    /// [`PortTerms`] and is never dereferenced — the hook's own contract. `None` (the C's `NIL` via
+    /// `erts_drvport2port`, `io.c:7295-7303`) for any other handle, for a null one, for a host the
+    /// port lifecycle never stamped, and for a port that has gone away
+    /// ([`DriverPort::clear_driver_state`]) — never a fabricated port term.
+    fn port_term(&mut self, port: ErlDrvPort) -> Option<Eterm> {
+        self.port_terms.resolve(port as usize)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1727,6 +2008,14 @@ pub struct DriverPortAdapter {
     /// registration per direction — the single-fd case every `driver_select` user in this runtime
     /// has today (see [`DriverPortAdapter::armed_event`]).
     selected: Vec<Selection>,
+    /// The port's **driver-failure latch**, seized from the host at [`DriverPortAdapter::load`] and
+    /// drained into [`beam_io::DriverContext::signal_failure`] after every callback (see
+    /// [`FailureLatch`] and [`DriverPortAdapter::settle`]).
+    ///
+    /// Held here because the host is boxed inside the `driver` field and its callbacks run against
+    /// a `DriverContext` it cannot name: the request has to outlive the callback and be handed up by
+    /// the port lifecycle, which is the only party that can close a port.
+    failures: FailureLatch,
 }
 
 /// One descriptor a driver selected, with the directions it armed.
@@ -1793,6 +2082,10 @@ impl DriverPortAdapter {
             state.driver_loaded = true;
         }
         Ok(DriverPortAdapter {
+            // Seized **before** the host is moved into the boxed driver (struct-literal evaluation
+            // order is field order, and `driver` takes the host by value): the handle is shared by
+            // `Rc`, so the latch the hooks write is the very one this adapter drains.
+            failures: host.failures(),
             driver: Some(Driver::new(library, host)),
             env: None,
             state: std::ptr::null_mut(),
@@ -1829,8 +2122,28 @@ impl DriverPortAdapter {
     /// Erlang as `{Port, {data, Data}}`).
     ///
     /// Called right after **every** driver interaction, so a request is never left unapplied.
+    ///
+    /// The **output comes first, then the failure request**, and that order is forced from both
+    /// sides: `beam_io` refuses a read (and a completion) once a failure is latched
+    /// ([`beam_io::DriverContext::deliver_read`]), so handing the failure up first would turn a
+    /// legitimate data-then-failure into a capability gap; and it is the delivered order the
+    /// oracle pins — `driver_output("hi",2)` then `driver_failure(P,9)` reaches the owner as
+    /// `{Port,{data,"hi"}}` **then** `{'EXIT',P,9}`, which is also the order `beam_io`'s
+    /// `take_reaped_notifications` re-prepends.
+    ///
+    /// A refused hand-off is **not** dropped: the request is put back in the latch so the next
+    /// callback retries it, because the alternative — forgetting a port-closing request — is a
+    /// port that outlives the driver that closed it. Once the request is handed up the selects
+    /// still apply: `beam_io` closes the port when the callback returns, and the poller key goes
+    /// with it, so an arm here is deregistered rather than stranded.
     fn settle(&mut self, ctx: &mut DriverContext<'_>) -> beam_common::Result<()> {
         self.collect_outputs(ctx)?;
+        if let Some(failure) = self.failures.take() {
+            if let Err(err) = ctx.signal_failure(failure.clone()) {
+                self.failures.set(failure);
+                return Err(err);
+            }
+        }
         self.apply_selects(ctx)
     }
 
@@ -2228,6 +2541,14 @@ impl beam_io::Driver for DriverPortAdapter {
         let mut env = Box::new(driver.host_mut().environment());
         let port = env.as_port();
         self.env = Some(env);
+        // The only place the two facts the `ERL_DRV_PORT` hook needs first coexist: the environment's
+        // own address (what `ErlDrvPort` **is**) and the port id `beam_io` allocated *before* it ran
+        // `Driver::start`. The handle was seized from the host before `load` boxed it, so this write
+        // lands on the very state `DriverPort::port_term` reads. Nothing is stamped when `start`
+        // refuses the port below: a port that never came up publishes no handle.
+        let port_terms = driver.host_mut().port_terms();
+        port_terms.set_env(port as usize);
+        port_terms.set_port(ctx.port());
         let command = std::ffi::CString::new(self.command.as_str()).map_err(|_| BeamError::BadArg)?;
         let data = publishing(driver, |library| {
             library.start(port, command.as_ptr() as *mut std::os::raw::c_char)
@@ -2653,6 +2974,12 @@ mod liveness_tests;
 #[cfg(test)]
 mod ddll_tests;
 
+/// The A.4 **`ERL_DRV_PORT` term-data operand regression suite** for [`DriverPort`]'s
+/// [`beam_abi::DriverHost::port_term`] hook — the C idiom `{ERL_DRV_PORT,
+/// driver_mk_port(port)}`, resolved from the [`PortTerms`] handle the port lifecycle stamps. A
+/// separate file so the C fixture it compiles does not grow this one.
+#[cfg(test)]
+mod port_term_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
