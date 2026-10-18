@@ -1354,9 +1354,16 @@ mod tests {
             );
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
         }
+        // The block exists for three shapes, and losing any of them would silently gut A.3:
+        // selector 1 (`load_and_add`) is a successful load + call, 4 (`load_and_badarg`) a NIF
+        // raise surfacing as a catchable `error:badarg`, and 7 (`load_not_a_nif_library`) a
+        // `bad_lib` refusal. `selectors` is keyed by `(module, selector)` because the group
+        // carries two unrelated `classify/1` tables, so these are the `nif_so` keys.
+        let nif_so_covers = |selector: i64| selectors.contains(&("nif_so", selector));
         assert!(
-            selectors.contains(&1) && selectors.contains(&4) && selectors.contains(&7),
-            "the group must cover a successful load, a NIF raise and a bad_lib refusal"
+            nif_so_covers(1) && nif_so_covers(4) && nif_so_covers(7),
+            "the group must cover a successful load (nif_so 1), a NIF raise (nif_so 4) and a \
+             bad_lib refusal (nif_so 7)"
         );
     }
 
