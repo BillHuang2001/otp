@@ -260,6 +260,17 @@ so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved an
 instead of tripping the valve, whether the process built it or received it; a reason that genuinely
 cannot be copied is still the honest `error:system_limit`, never a stored dangling word.
 
+## The off-heap refc-binary reclamation at the slice boundary
+`run.rs`'s `Yield` arm is the **one** site that prunes the machine's payload reservoir: `RuntimeRunner::reclaim_off_heap_binaries` (`run.rs:367`) → `context::gc::reclaim`, called immediately after `collect_at_reds_boundary` and before `take_max_heap_kill` on the same park (`run.rs:1214`).
+It is here because a prune is sound only against the process's **complete** root set, and the park is the one site holding `&mut Machine` (the runner just drove it), `&mut Process` (through the table) and `&mut Runtime` at once; a heap-admission door runs *inside* a slice, where the engine is held out of `RunnerState::engines` and the `ExecutionContext` seam exposes no `&mut Machine` at all.
+`reclaim_off_heap_binaries` refuses unless `engine.parked_published` — the park's own contract that the machine's whole root set was handed to the process.
+`Process::has_unpublished_roots()` is deliberately **not** the gate: it is `true` for a `Running` process, which a pre-empted process still is.
+The state it needs is per process engine (`ProcessEngine::off_heap`, built lazily from `process.collector().policy()` so a `+hms`/`+hbm*` policy is honoured and dead with the machine), so one call reaches `&mut machine` and `&mut off_heap` without a second table.
+The gates themselves — relocation exemption, `gc_process_enabled`, the bin-vheap trigger, the collection valve, the prune-only valve, the reachability walk — and the release predicate are [`../context/CONTEXT.md`](../context/CONTEXT.md) *The off-heap refc-binary reclamation*; every one of them is a decline, so this call never fails a program.
+Per-slice cost on a non-triggered bin vheap is **one cached observation**: `OffHeapReclaimer::observe` returns the recorded overhead while the reservoir's handle count has not moved, so `Machine::off_heap_overhead_bytes` (`O(reservoir)`) is read only when it moved or once per triggered prune.
+**Residuals — each a leak, never a dangle.** The `Wait` arm does not prune: a `receive` park is relocation-exempt and publishes nothing, so the machine stays the authoritative root set and the process's roots would be stale by construction — a process that blocks forever keeps its reservoir until its machine drops, and one that wakes and yields again prunes then.
+A declined prune retains the whole reservoir, and the `-eval` route never prunes at all (its machine is not in `RunnerState` and allocates on the pointer-stable arena, so its park publishes nothing).
+What is measured, and where the figures live: `erlang:memory(binary)` (`binary_alloc`'s live bytes) and the process's RSS across a build-a-binary loop, against the oracle's — the figures and their caveats are [`../../PERF.md`](../../PERF.md)'s and the bench driver's [`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md).
 ## Per-slice (not per-instruction) host cost
 Beyond the `BudgetContext` charges (a per-instruction `reduce` on the interpreter tier, the two
 `ensure_heap` doors, and a per-BIF/per-call `spend` on the native tier), one slice's prologue/epilogue
