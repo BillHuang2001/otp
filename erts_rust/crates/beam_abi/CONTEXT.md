@@ -160,6 +160,18 @@ The *internal* boundary the `driver_*` bodies are written against (source `src/d
   `monitor_process`/`monitor_process_result`/`demonitor_process`/`get_monitored_process`, the PDL hooks
   `pdl_create`/`pdl_lock`/`pdl_unlock`/`pdl_get_refc`/`pdl_inc_refc`/`pdl_dec_refc`, the
   driver-registry hooks `add_driver_entry`/`remove_driver_entry`/`lock_driver`/`create_port`, `now`.
+- **The split hook (`output2`).** The C never hands the port owner one flat byte string: every
+  `driver_output2`/`driver_output_binary`/`driver_outputv` reply is `{Port,{data,Reply}}` with
+  `Reply = [header | Body]` — the `hbuf`/`hlen` bytes as a list prefix and the `buf`/`len` bytes as
+  the tail (`deliver_read_message`, `io.c:3363-3442`; `deliver_vec_message`, `:3502-3621`), which is
+  observable to Erlang code (`[h…|<<tail>>]` vs a flattened list). `output2(port, header, body)`
+  carries that boundary: `body: None` is the C's `buf == NULL` (**no** tail — a proper header-only
+  list) and `body: Some(&[])` a **present, empty** tail (`<<>>` in `[binary]` port mode) — different
+  terms. The C tests the **pointer**, never `len != 0`.
+  **Default = byte-identical to the pre-hook behaviour:** exactly one `output` call carrying
+  header-then-body (`None` counted as empty), no allocation when either side is empty, so a host
+  that overrides only `output` keeps the old flattened result. Overriding `output2` is what
+  preserves the split. Additive only — no `#[repr(C)]`/table/assert moved.
 - **The three-way monitor hook.** `monitor_process(&mut self, pid) -> Option<ErlDrvMonitor>` is the
   **two-way compatibility subset** (`Some` ⇒ the C's `0`, `None` ⇒ `-1`) kept for source
   compatibility; the full three-way hook is `monitor_process_result(&mut self, pid) -> MonitorResult`
