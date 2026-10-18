@@ -290,10 +290,12 @@ per-iteration):
   (`min(x.len(), MAX_REG)` = up to 1024 words, `beam_process::registers::MAX_REG`) plus the whole
   Erlang stack plus the live FR prefix onto the process's root set. An exempt window — the `Wait`
   arm, and a `Yield` arm whose slice ended with a live FR prefix — skips the copy entirely.
-* **Amortized O(1):** nothing — the off-heap payloads a machine builds need no per-slice work at all:
-  its `Machine::refc_binaries` reservoir is the roster `process_info(Pid, binary)` reads
-  (`RunnerState::reservoir_at`), so no slot is ever handed out on the process's own (never-compacted)
-  off-heap table.
+* **Amortized O(1):** the off-heap trigger — `Machine::off_heap_overhead_bytes` is `O(reservoir)` and is
+  read only when the reservoir's handle count moved, or once per triggered prune, so a slice that built
+  no off-heap payload pays one cached observation; the payloads themselves need no per-slice work at all,
+  since no slot is ever handed out on the process's own (never-compacted) off-heap table, and the
+  reservoir is pruned only on a triggered `Yield` park (see *The off-heap refc-binary reclamation at the
+  slice boundary*).
 * **First entry / flag-gated only:** `record_baseline_code` (`run.rs:692-694`, `+JPperf` only), the
   `Arc::clone` of the entry module (`run.rs:413-420`), and `describe_site` (debug-trace only).
   `source_payloads` (`run.rs:840-842`/`970-971`) runs only on the terminating `Returned`/`Err` arms.
