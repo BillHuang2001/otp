@@ -129,7 +129,7 @@ Bridges the driver's `SocketOptions` to the pure decoder on both paths (the C's 
 - Errors are `beam_common::{Result, BeamError}` only: operational socket failure ⇒ the `[0]`-tagged reply; malformed argument / unknown named verb ⇒ `BeamError::BadArg`; I/O syscall failure ⇒ `BeamError::Io`; undecodable packet type ⇒ the `badarg`/`notsup` raise; a control opcode the C serves but this floor does not ⇒ `Err(Opcode::not_served())`. Never a wrong result, never a panic.
 - **One `Driver` is one port**: no port-creation capability — a numeric `accept` hands its descriptor to the completion's consumer (the runtime opens the second port), only the named verb transfers the port.
 - Safe Rust except `sys.rs`; `unsafe_op_in_unsafe_fn` stays clean; the `Driver`/`DriverContext` seam is frozen.
-- Files target ~1000 lines; a suite (`tests.rs`, `opcode_tests*.rs`, `opt_tests.rs`, `stat_tests.rs`, `frame_tests.rs`, `async_tests.rs`, `active_tests.rs`, `udp/udp_tests.rs`, `udp/async_tests.rs`, `udp/active_tests.rs`) is an in-module test module split from its source half.
+- Files target ~1000 lines; a grown source half splits its suite into a sibling test module (*Known Issues*).
 
 ## Handoffs (out of this node — the cross-crate seams `gen_tcp`/`gen_udp` still need)
 The completion channel's runtime contract (rendering `{inet_reply, …}`/`{inet_async, …}`, decoding `caller_ref`, adopting `Accepted`, draining the registry) is the crate doc's *Handoffs*; only the driver-family seams are here. Each needs a change **outside** `src/drivers/inet/`.
