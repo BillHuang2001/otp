@@ -53,10 +53,19 @@
 //! `lib/compiler/src/v3_core.erl` `raise(Info, Value)` primop — the
 //! `try_exception/2` fallback clause (`v3_core.erl:1424-1441`) and
 //! `after_block/2` (`v3_core.erl:1505-1518`) — which reach `cg_instr(resume, …)`
-//! (`beam_ssa_codegen.erl:2471`) and thence `beam_asm`'s `raise` opcode. A scan of
-//! all 1321 installed `.beam` files finds **zero** occurrences: the OTP library
-//! itself never writes the shape (a `try` whose catch clauses all fail to match),
-//! so the fixture is the only way to reach it on real compiler output.
+//! (`beam_ssa_codegen.erl:2471`) and thence `beam_asm`'s `raise` opcode.
+//! That shape is ordinary OTP-library output, not a fixture-only curiosity:
+//! **1816** static occurrences over the installed corpus (1366 `.beam` under
+//! `code:lib_dir()`), 1811 of them in the 1321 `*/ebin/*.beam` modules alone —
+//! heaviest `crypto.beam` 41 (one is the tail of `crypto:hash_init/1`),
+//! `prim_file.beam` 36, `erlang.beam` 35 — and
+//! `tests/census.rs::corpus_reachability_census` pins the same 1816.
+//! Method, and the trap: `beam_disasm:file/1` renders the opcode as the **5-tuple**
+//! `{bif,raise,{f,0},[R1,R2],{x,0}}` (`beam_disasm.erl:1096`), so a `{raise,_,_}`
+//! pattern — or a filter on the atom table, where an opcode name never appears —
+//! counts zero by construction.
+//! `vb_exc` is used anyway because it isolates one raise per export, so each row's
+//! observable is a single oracle-comparable exception.
 //!
 //! Comparison discipline: a returned value is rendered with
 //! [`render`](crate::harness::render) and compared with

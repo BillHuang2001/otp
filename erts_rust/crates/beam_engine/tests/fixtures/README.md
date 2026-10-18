@@ -590,8 +590,14 @@ One export per exception-family instruction, each with a comparable oracle value
 | `old_catch/1` | `CatchEnd` | `catch erlang:raise(throw, X, [])` | `ball` (`X=ball`) |
 The `raise` opcode (`Instr::Raise`, as opposed to the separate `raw_raise`/`RawRaise`) is emitted
 **only** by a `try … catch` whose clauses do not match (the compiler's fallback clause re-raises the
-pending exception) or by `try … after`; a scan of all 1321 installed OTP `.beam` files finds zero
-occurrences, so this fixture is the only source of real-compiler evidence for it.
+pending exception) or by `try … after`, and that shape is ordinary OTP-library output: **1816** static
+occurrences over the installed corpus (1366 `.beam` under `code:lib_dir()`, 1811 of them in the 1321
+`*/ebin/*.beam` modules), heaviest `crypto.beam` 41, `prim_file.beam` 36, `erlang.beam` 35.
+Counted with `beam_disasm:file/1` as the 5-tuple `{bif,raise,{f,0},_,_}`, which is how
+`beam_disasm.erl:1096` renders the opcode — a `{raise,_,_}` pattern matches nothing.
+`tests/census.rs::corpus_reachability_census` pins the same 1816.
+The fixture is used because it isolates one raise per export, so each row's observable is a single
+oracle-comparable exception.
 ## `vb_bitstr.beam` (`vb_bitstr.erl`) — `tests/real_beam_variant_proofs/bitstrings.rs`
 The bit-syntax **match** surface, one export per instruction: `flat/1` (`<<A:16,B:16,R/binary>>` →
 `bs_match` with an `ensure_at_least` + two `integer` + `get_tail` command list, plus `bs_get_position`),

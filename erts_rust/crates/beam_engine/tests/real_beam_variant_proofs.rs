@@ -93,12 +93,20 @@
 //!   record* opcode family, which this toolchain does not enable.
 //! * `BsTestTail2` — not emitted by the current bit-syntax code generator.
 //!
-//! Two further shapes are reachable only through a freshly compiled fixture, not
-//! through existing fixtures, and that is stated in the rows: `Raise` (the `raise`
-//! opcode, emitted only by a `try … catch` with no matching clause or a
-//! `try … after`; a scan of all 1321 installed OTP `.beam` files finds none) and
-//! the standalone `BsGetTail` (a tail read is normally folded into a `bs_match`
-//! command list). See each row's doc comment for the evidence trail.
+//! One further shape is reachable only through a freshly compiled fixture, not
+//! through existing fixtures, and that is stated in the row: the standalone
+//! `BsGetTail` (a tail read is normally folded into a `bs_match` command list).
+//!
+//! `Raise` is **not** in that group: the `raise` opcode is ordinary compiler
+//! output — **1816** static occurrences over the whole installed corpus (1366
+//! `.beam` under `code:lib_dir()`, counted with `beam_disasm:file/1` as the
+//! 5-tuple `{bif,raise,{f,0},_,_}` that `beam_disasm.erl:1096` renders the opcode
+//! as; a `{raise,_,_}` pattern therefore matches nothing), `crypto.beam` alone 41,
+//! `prim_file.beam` 36, `erlang.beam` 35 — and
+//! `tests/census.rs::corpus_reachability_census` pins the same 1816. The
+//! `exceptions` row drives its own fixture to isolate ONE raise per observable,
+//! not because the corpus lacks the shape. See each row's doc comment for the
+//! evidence trail.
 //!
 //! See [`RECORDED_PROOFS`] for the machine-readable per-variant table this suite's
 //! rows fill in, and `harness` for the shared proof implementation.
