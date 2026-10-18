@@ -1446,7 +1446,10 @@ fn a_shutdown_on_a_not_connected_port_is_enotconn() {
 /// Measured on OTP 29.1.1 against a bare `{spawn_driver,"tcp_inet"}` port:
 /// `port_command(P, <<"hello">>)` ⇒ `true`, the owner receives `{'EXIT',P,einval}`, and
 /// `port_info(P,name)` is `undefined`. The registry half of that row (the reaped port, the
-/// `badarg` on every later command) is pinned by [`super::failure_tests`].
+/// `badarg` on every later command) is pinned by
+/// [`a_socket_less_command_closes_the_port`](super::async_tests::a_socket_less_command_closes_the_port),
+/// and the oracle sequence itself by
+/// [`the_socket_less_command_sequence_matches_the_erl_oracle`].
 #[test]
 fn a_socket_less_malformed_command_closes_the_port_with_einval() {
     let mut rig = Rig::new(TcpInetDriver::new());
@@ -1493,6 +1496,37 @@ fn a_socket_less_malformed_command_closes_the_port_with_einval() {
     );
 }
 
+/// A re-driven `OUTPUT` task on a port with **nothing queued** is not a command, so it writes
+/// nothing and latches nothing.
+///
+/// The C is only ever handed a command (`ev->size`), and `init_caller` on an empty buffer is its
+/// `size < 2` `FALSE` (`inet_drv.c:1834`) — which `tcp_inet_commandv` (`:12667`) would turn into
+/// `driver_failure_posix(port, EINVAL)` and kill the port over a write that already finished. The
+/// guard has to come **before** the connection test and the prefix strip, so it holds on a
+/// socket-less port too: the first branch of
+/// [`TcpInetDriver::write_command`] is that guard.
+#[test]
+fn an_empty_queue_re_drive_writes_nothing_and_latches_nothing() {
+    let mut rig = Rig::new(TcpInetDriver::new());
+    rig.start().expect("a socket-less driver registers nothing");
+    assert_eq!(rig.output_len(), 0, "nothing was ever queued");
+    assert_eq!(
+        rig.drain_output().expect("an empty re-drive"),
+        0,
+        "`output` on an empty queue is the C's `size < 2` shortcut, i.e. no bytes"
+    );
+    assert_eq!(
+        rig.ready_output().expect("an empty write-readiness re-drive"),
+        0,
+        "and so is a `ready_output` round on the same empty queue"
+    );
+    assert_eq!(rig.take_failure(), None, "the port stays alive");
+    assert_eq!(rig.driver.state(), InetState::Closed, "the state never moved");
+    assert!(
+        rig.caller_replies().is_empty(),
+        "there is no caller to answer"
+    );
+}
 /// The other side of the split: on an **opened but unconnected** socket a *well-formed* command is
 /// accepted, never written, and answered out of band with `{error, enotconn}` — the C's
 /// `!IS_CONNECTED` arm (`tcp_inet_commandv`, `inet_drv.c:12674`-`:12683`), reachable only once

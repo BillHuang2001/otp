@@ -643,7 +643,9 @@ pub(super) fn split_caller_ref(arg: &[u8]) -> Option<&[u8]> {
 /// word happens to fit is treated as a prefixed command even when its "tag" is not an ETF blob.
 /// A genuine `prim_inet` command always fits; a *plain* payload (the `<<"hello">>` a bare
 /// `port_command/2` sends) does not, because its first two bytes read as a huge length — which is
-/// exactly why the oracle kills the port for it (measured, see the driver's `failure_tests`).
+/// exactly why the oracle kills the port for it (measured — see
+/// `tests::a_socket_less_malformed_command_closes_the_port_with_einval` and the datagram twin in
+/// `udp::udp_tests`).
 ///
 /// `None` is the C's `FALSE` (the caller must fail the port). `Some((tag, payload))` is the C's
 /// `TRUE`: `tag` is the `n` tag bytes (empty for a zero-length reference, which the C consumes

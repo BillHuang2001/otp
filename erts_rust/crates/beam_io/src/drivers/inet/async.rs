@@ -828,9 +828,13 @@ impl TcpInetDriver {
     ///
     /// # Errors
     ///
-    /// Whatever [`TcpInetDriver::write_pending`] reports (the socket-less refusal is unchanged:
-    /// nothing is stripped and the command's bytes stay queued), or the typed `unsupported` of a
-    /// context with no completion sink.
+    /// Only the typed `unsupported` of a context with no completion sink, or the `BeamError::Io`
+    /// of a failed `send(2)`: every other outcome is the C's own — a malformed command charges
+    /// itself and latches `driver_failure_posix(EINVAL)`, and an unconnected one charges itself and
+    /// stages `{error, enotconn}` instead of failing.
+    /// [`TcpInetDriver::write_pending`] can only be reached from here with a socket that **is**
+    /// connected (the `!is_connected` arm above returns first), so its own `BadArg` refusal is
+    /// unreachable on this path.
     pub(super) fn write_command(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         // A re-driven `OUTPUT` task with nothing queued is not a command: the C is only ever
         // handed one (`tcp_inet_commandv`'s `ev->size`), and `init_caller` on an empty buffer is

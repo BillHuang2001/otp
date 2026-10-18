@@ -364,7 +364,7 @@ const fn connect_wait_ms(timeout_ms: i32) -> i32 {
 /// `connect`/`accept` make it a connection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InetState {
-    /// No socket (the initial state, and the state [`TcpInetDriver::close`] leaves behind).
+    /// No socket (the initial state, and the state the `close` verb leaves behind).
     Closed,
     /// A socket exists but is neither listening nor connected.
     Open,
@@ -1009,10 +1009,10 @@ impl TcpInetDriver {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::BadArg` when the socket is not connected — the C's `tcp_inet_command`
-    /// fails the port on a socket it cannot write (`inet_drv.c:12629`); the queued bytes are
-    /// **not** consumed on that path, so the refusal is visible to the caller rather than silently
-    /// dropping data — or `BeamError::Io` when the write fails irrecoverably.
+    /// `BeamError::Io` when the write fails irrecoverably. The `BeamError::BadArg` of a socket
+    /// that is not connected ([`TcpInetDriver::connected_socket`]) is defensive only: both callers
+    /// — [`TcpInetDriver::write_command`] and [`TcpInetDriver::verb_send`] — test
+    /// [`InetState::is_connected`] first, so no reachable path arrives here unconnected.
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if self.peer_close.seen {
             // The peer is gone: the queued output was dropped when the close was latched and
@@ -1326,13 +1326,15 @@ impl TcpInetDriver {
     /// merely begins with those bytes**. Guessing would corrupt ordinary sends, so this verb
     /// does not guess: a `gen_tcp:send` payload arrives with its prefix intact and is written as
     /// data. Closing the gap needs a caller-carrying seam on `DriverContext` (or the runtime
-    /// pre-stripping the prefix above this crate); the `{inet_reply, …}` echo needs the
-    /// driver→owner message channel this crate does not have either.
+    /// pre-stripping the prefix above this crate). The reply itself is not the gap: an
+    /// `{inet_reply, …}` rides [`DriverContext::deliver_completion`], which is how the
+    /// `erlang:port_command/2` path ([`TcpInetDriver::write_command`]) answers its caller.
     ///
     /// Note also that the `{packet, 1|2|4}` framing described above is applied by **this verb**
     /// only: [`TcpInetDriver::output`]/[`TcpInetDriver::ready_output`] (the
-    /// `erlang:port_command/2` path) go straight to [`TcpInetDriver::write_pending`], which
-    /// writes the queued bytes unframed.    ///
+    /// `erlang:port_command/2` path) go to [`TcpInetDriver::write_command`], whose write of the
+    /// queued bytes is unframed.
+    ///
     /// A `shutdown(SHUT_WR|SHUT_RDWR)` **deferred** because output was still queued
     /// ([`TcpInetDriver::pending_shutdown`]) rejects a further `send`, exactly as the C does:
     /// `tcp_inet_commandv` routes it to `tcp_shutdown_error(desc, EPIPE)` (`inet_drv.c:12695`),
@@ -1342,8 +1344,9 @@ impl TcpInetDriver {
     ///
     /// # Errors
     ///
-    /// `BeamError::BadArg` when the socket is not connected, or the write failure
-    /// [`TcpInetDriver::write_pending`] reports.
+    /// The write failure [`TcpInetDriver::write_pending`] reports — `BeamError::Io`, or the
+    /// `unsupported` raise of a `{packet, …}` code with no decoder. An unconnected port is the
+    /// `[0]enotconn` reply above, never an `Err`.
     fn verb_send(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));

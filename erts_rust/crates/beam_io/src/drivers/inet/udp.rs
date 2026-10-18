@@ -113,10 +113,10 @@
 //!   **owner** as a [`PortCompletion`](crate::completion::PortCompletion). Both write paths accept
 //!   and strip the `prim_inet` caller-reference prefix (the `send` verb,
 //!   [`UdpInetDriver::verb_send`], and the queued `port_command` path,
-//!   [`UdpInetDriver::write_pending`]), and a command with no prefix — or the C's zero-length tag
-//!   — stages **no** reply, exactly as `inet_reply_finish` does with a `NULL` caller. The `send`
-//!   verb's own answer stays the synchronous `ctl_reply` bytes, which is what a `port_control`
-//!   caller reads.
+//!   [`UdpInetDriver::write_command`]'s prefix strip), and a command with no prefix — or the C's
+//!   zero-length tag — stages **no** reply, exactly as `inet_reply_finish` does with a `NULL`
+//!   caller. The `send` verb's own answer stays the synchronous `ctl_reply` bytes, which is what
+//!   a `port_control` caller reads.
 //! * **IPv6, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
 //!   `AF_INET`/`SOCK_DGRAM` and `bind`/`connect`/`send` only the packed
 //!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms.
@@ -151,7 +151,7 @@
 use std::os::unix::io::RawFd;
 use std::time::Instant;
 
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 
 use crate::driver::{Driver, DriverContext};
 use crate::drivers::fd::set_nonblocking;
@@ -530,9 +530,11 @@ pub struct UdpInetDriver {
     /// The C parses the buffer it is handed, and so does this: `[address][anc_len:be32]
     /// [anc_data][data]`, optionally behind the `prim_inet` caller-reference prefix
     /// `[tag_len:be16][tag_bytes]`. The address is **always** parsed and must parse, even on a
+    /// even on a
     /// connected socket, which then ignores it — the C's own comment at `:15142`-`:15145` ("Even
     /// if it is connected, there is an address prefix here -- ignored for connected sockets").
-    /// [`decode_queued_command`] carries the wire forms and why the plain one is tried first.
+    /// [`decode_queued_command`] runs the grammar; the caller-reference prefix is already off the
+    /// buffer by then ([`UdpInetDriver::strip_command_prefix`], one strip per command).
     ///
     /// # Connected vs unconnected (the C's `INET_F_ACTIVE` split)
     ///
@@ -1464,45 +1466,26 @@ impl Drop for UdpInetDriver {
 /// (`packet_inet_command`, `inet_drv.c:15037`-`:15260`), returning the destination address and
 /// the payload that follows the ancillary-length word.
 ///
-/// The C strips the `prim_inet` caller-reference prefix first (`init_caller`, `:15055`-`:15065`)
-/// and then **always** parses `[address][anc_len:be32][anc_data][data]`
-/// (`:15139`-`:15230`). This crate's [`Driver`]/[`DriverContext`] seam carries no
-/// `driver_caller(port)`, so the prefix has to be recognised from the payload alone (see
-/// [`split_caller_ref`]), and the two wire forms are tried **plain first**:
+/// The C runs `init_caller` once (`:15055`-`:15065`) and then parses
+/// `[address][anc_len:be32][anc_data][data]` (`:15139`-`:15230`) — **once**, on the bytes the
+/// prefix strip left behind. That is exactly the split here: the strip is
+/// [`UdpInetDriver::strip_command_prefix`], which [`UdpInetDriver::write_command`] runs before it
+/// calls [`UdpInetDriver::write_pending`] (the only path to this decoder), so the buffer this
+/// function sees is address-led and the plain grammar is the *only* rule.
 ///
-/// 1. **plain form, tried first** — `[address][anc_len:be32][anc_data][data]`, i.e.
-///    [`split_datagram`] on the queue bytes directly;
-/// 2. **caller-reference form, only when rule 1 refuses** — [`split_caller_ref`], then
-///    [`split_datagram`] on the bytes after the prefix.
-///
-/// **Why the plain form can come first here.** Unlike [`UdpInetDriver::verb_send`]'s
-/// `port_control` convenience grammar, the queued form *is* the C's grammar, so there is no
-/// `[address][data]`-without-an-ancillary-length shape to protect: a plain command leads with an
-/// address tag (1, 3 or 4), while a caller-reference prefix leads with the high byte of its
-/// 16-bit tag length — `0` for every realistic `term_to_binary/1` tag (far below 256), never a
-/// valid address tag — so a prefixed command always fails rule 1 and is stripped by rule 2. The
-/// residual runs the other way and is the one [`split_caller_ref`] already documents: a prefixed
-/// command whose tag length is 256 or more begins with 1/3/4 and is taken as plain.
-///
-/// Rule 2 is only attempted for a **grammar** refusal. An `unsupported` outcome already matched
-/// the plain grammar (a parsable address plus an ancillary-length word) and *is* the command — the
-/// C's sendmsg arm — so retrying it as a prefixed command could only misroute bytes.
+/// No caller-reference rule is retried here. [`split_caller_ref`] belongs to
+/// [`UdpInetDriver::verb_send`] — the `erlang:port_control/3` convenience route, whose
+/// `[address][data]`/prefixed discrimination it performs — and re-testing the already-stripped
+/// bytes would be a second `init_caller` the C never runs (it would accept a contrived
+/// double-prefixed command the oracle refuses).
 ///
 /// # Errors
 ///
-/// [`beam_common::BeamError::BadArg`] for a command in neither form, or for the C's two
+/// [`beam_common::BeamError::BadArg`] for a command that is not the grammar, or for the C's two
 /// `return_einval` guards (`:15155`/`:15158`, which [`split_datagram`] reports as
 /// [`DatagramCommand::Einval`]); the typed `unsupported` raise for a non-zero ancillary length.
 fn decode_queued_command(front: &[u8]) -> Result<(InetAddr, &[u8])> {
-    match split_datagram(front) {
-        Ok(command) => as_datagram(command),
-        Err(BeamError::BadArg) => match split_caller_ref(front) {
-            Some(rest) => split_datagram(rest).and_then(as_datagram),
-            // Not in the prefixed form either: rule 1's own reason stands.
-            None => Err(error::badarg()),
-        },
-        Err(other) => Err(other),
-    }
+    as_datagram(split_datagram(front)?)
 }
 
 /// Folds [`DatagramCommand::Einval`] into the typed argument fault this path reports and yields
