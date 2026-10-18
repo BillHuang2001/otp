@@ -308,6 +308,16 @@ fn floor_keys(module: &str) -> Option<&'static [(&'static str, u32)]> {
             ("get_mode", 0),
             ("priv_dir", 1),
             ("where_is_file", 1),
+            // The **purge queries** — `purge/1` and `soft_purge/1`. ERTS' purge only ever acts
+            // on a module's *old code slot* (the `erts_code_purger` process killing whatever
+            // still runs the retired image), and this runtime never holds one
+            // (`erlang:delete_module/1` really unloads), so the floor answers the oracle's own
+            // constants for that state — `false` / `true`. Entering the `code.erl` bodies instead
+            // is a `gen_server:call` the live server answers with
+            // `erts_internal:purge_module/2`'s `error:notsup` raise, which **killed** the server
+            // and took the node down. The bodies live in [`native::code`].
+            ("purge", 1),
+            ("soft_purge", 1),
             // The **path-mutating** half of `code` — see the note on [`floor_keys`]'s `code`
             // arm. The floor owns these so the path this runtime *searches* and the path
             // `code:get_path/0` *reports* are the one [`CodeServer`](crate::CodeServer) store;
@@ -423,6 +433,15 @@ impl RuntimeContext<'_> {
             // path-based and needs no loaded module, so the floor serves it (see
             // [`code`](crate::native::code)).
             ("code", "where_is_file", 1) => Some(self.code_where_is_file(args)),
+            // The two **purge queries** (see [`code`](crate::native::code)): this runtime holds
+            // no old code, so the oracle's own constants for that state are the answer —
+            // `purge/1` ⇒ `false`, `soft_purge/1` ⇒ `true`. Serving them here is also what keeps
+            // the live `code_server` alive: the `code.erl` bodies are `gen_server:call`s that the
+            // server answers with `erts_internal:purge_module/2`, whose `error:notsup` raise
+            // killed the server (and the node with it) for a call that here can only ask about
+            // an absent old-code slot.
+            ("code", "purge", 1) => Some(self.code_purge_1(args)),
+            ("code", "soft_purge", 1) => Some(self.code_soft_purge_1(args)),
             // The **path-mutating** `code:*` entries (see [`floor_keys`]): the floor owns them
             // so this runtime's [`CodeServer`](crate::CodeServer) is the ONE code path — both
             // the store `code:get_path/0` reports and the one `code:load_file/1`,

@@ -832,6 +832,56 @@ impl RuntimeContext<'_> {
         }
     }
 
+    /// `code:purge(Module)`: whether the purge had to **kill** a process still running the
+    /// module's old code.
+    ///
+    /// In ERTS a purge only ever acts on the module's **old code slot**: the `erts_code_purger`
+    /// process scans every process for one executing that retired image (killing them, and
+    /// answering `true`), and answers `false` when nothing referenced it. This runtime has **no
+    /// old-code slot** at all — `erlang:delete_module/1` really
+    /// unloads, and a reload replaces the live entry — so there is never anything to purge and
+    /// no process can ever hold old code. The honest answer is therefore the oracle's own
+    /// constant for the no-old-code state: measured on OTP 29.1.1 / `erts-17.1`,
+    /// `code:purge(lists)` (loaded), `code:purge(no_such_mod_xyz)` (unloaded) and
+    /// `code:purge(pmod)` right after `code:delete(pmod)` (which does retire an image there)
+    /// all answer `false`, with the live `code_server` still registered each time.
+    ///
+    /// Serving it from the floor is also what keeps the live `code_server` **alive**: the
+    /// `code.erl` body (`code.erl:722`) is a `gen_server:call(code_server, {purge, Module})`,
+    /// and the server answers it with `erts_internal:purge_module/2` — the oracle's
+    /// unconditional `error:notsup` raise, because OTP 29 removed code purging. That raise
+    /// lands *inside the server*, which killed this runtime's server and took the node down
+    /// with it, for a call that here can only ever ask about an absent old-code slot.
+    ///
+    /// The wrapper's guard is `is_atom(Module)` (`code.erl:722`): any other term leaves it with
+    /// no matching clause and raises the bare-atom `error:function_clause` — the same class
+    /// [`Self::code_where_is_file`] reports, e.g. `code:purge(42)` and `code:purge([])` both
+    /// raise it on the oracle. The wrapper's `.beam` frames are not reproducible and are
+    /// deliberately not fabricated (see `function_clause` in [`super::prim`]).
+    pub(super) fn code_purge_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(super::prim::function_clause());
+        }
+        self.atom("false")
+    }
+    /// `code:soft_purge(Module)`: whether the module has no old code in use (so a `purge/1`
+    /// would kill nobody).
+    ///
+    /// The soft sibling of [`Self::code_purge_1`] (`code.erl:740`): the same
+    /// `gen_server:call(code_server, {soft_purge, Module})`, the same guard on `is_atom/1`,
+    /// and — for this runtime, which holds no old code ever — the oracle's constant for that
+    /// state, the atom `true`. Measured on OTP 29.1.1 / `erts-17.1`: `code:soft_purge(lists)`,
+    /// `code:soft_purge(no_such_mod_xyz)` and `code:soft_purge(pmod)` after `code:delete(pmod)`
+    /// all answer `true` (the live server surviving each), while `code:soft_purge(42)` and
+    /// `code:soft_purge([])` raise the bare-atom `error:function_clause`.
+    pub(super) fn code_soft_purge_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(super::prim::function_clause());
+        }
+        self.atom("true")
+    }
     /// The Erlang string `term` as a Rust `String`.
     ///
     /// `None` unless `term` is a **proper** list of Unicode scalar code points — the only
@@ -1408,6 +1458,75 @@ mod tests {
         assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
     }
 
+    #[test]
+    fn code_purge_and_soft_purge_answer_the_no_old_code_constants() {
+        // This runtime has no old-code slot, so the purge queries always answer the oracle's
+        // own constants for that state — measured on OTP 29.1.1 / erts-17.1:
+        // `code:purge(lists)` (loaded) and `code:purge(no_such_mod_xyz)` (unloaded) ⇒ `false`,
+        // `code:soft_purge(lists)` / `code:soft_purge(no_such_mod_xyz)` ⇒ `true`. Both are
+        // answered from the floor, so neither asks anything of the code path.
+        let mut runtime = runtime();
+        for name in ["lists", "no_such_mod_xyz"] {
+            let module = atom(&mut runtime, name);
+            let purged = call(&mut runtime, "code", "purge", &[module]).expect("code:purge/1");
+            assert_eq!(
+                runtime.atom_name_of(purged),
+                Some("false"),
+                "code:purge({name}) is the no-old-code answer"
+            );
+            let soft =
+                call(&mut runtime, "code", "soft_purge", &[module]).expect("code:soft_purge/1");
+            assert_eq!(
+                runtime.atom_name_of(soft),
+                Some("true"),
+                "code:soft_purge({name}) is the no-old-code answer"
+            );
+        }
+        // The live-oracle cross-check of those four rows.
+        let Some(answer) = oracle_probe(
+            "io:format(\"~p,~p,~p,~p\",[code:purge(lists),code:purge(no_such_mod_xyz),\
+             code:soft_purge(lists),code:soft_purge(no_such_mod_xyz)])",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(answer, "false,false,true,true", "the oracle's own constants");
+    }
+    #[test]
+    fn code_purge_and_soft_purge_guard_on_an_atom() {
+        // `code.erl:722` / `code.erl:740` guard `is_atom(Module)`: a non-atom leaves the
+        // wrapper with no matching clause, so it raises the bare-atom `error:function_clause`
+        // (measured on the oracle for `42` and for the empty list). Nothing is asked of the
+        // code path, so this holds on a code-path-less runtime.
+        let mut runtime = runtime();
+        for function in ["purge", "soft_purge"] {
+            for argument in [make_small(42), beam_term::NIL] {
+                let error = call(&mut runtime, "code", function, &[argument])
+                    .expect_err("a non-atom does not match the wrapper's guard");
+                assert_eq!(
+                    error.as_atom(),
+                    Some("function_clause"),
+                    "code:{function}({argument:?}): {error}"
+                );
+                assert!(
+                    crate::error::unsupported_reason(&error).is_none(),
+                    "a function_clause raise is a genuine error, not a capability gap: {error}"
+                );
+            }
+        }
+        for function in ["purge", "soft_purge"] {
+            let Some(shape) = oracle_probe(&format!(
+                "try code:{function}(42) catch Class:Reason -> io:format(\"~p:~p\",[Class,Reason]) end"
+            )) else {
+                skip_oracle_loudly();
+                return;
+            };
+            assert_eq!(
+                shape, "error:function_clause",
+                "the oracle's own raise shape for code:{function}/1"
+            );
+        }
+    }
     /// The oracle `erl`: `$ERTS_ORACLE` when it is an executable, else `erl` on `$PATH` (the
     /// convention `tools/differential` uses), resolved **without running** it.
     fn oracle_erl() -> Option<std::path::PathBuf> {
