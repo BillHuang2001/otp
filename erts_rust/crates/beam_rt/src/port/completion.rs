@@ -539,3 +539,13 @@ pub(super) fn terms_tuple(
     beam_engine::terms::make_tuple(ctx, elements)
 }
 
+
+/// The A.4 **accepted-socket option inheritance** suite: a real loopback `accept(2)` whose
+/// descriptor [`PortRegistry::adopt_accepted`] registers, the replayed `tcp_inet_copy` block read
+/// back through the driver's own `getopts`/framed `send`, the negative `setopts` rows, and the
+/// replay-failure rule (`{error, einval}` + nothing leaked) — see
+/// `src/port/accept_inherit_tests.rs`. A separate file so the wire vocabulary it spells does not
+/// grow this one.
+#[cfg(test)]
+#[path = "accept_inherit_tests.rs"]
+mod accept_inherit_tests;
