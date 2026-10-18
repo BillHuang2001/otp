@@ -654,6 +654,59 @@ impl TcpInetDriver {
         })
     }
 
+    /// Adopts the socket `listener` just accepted, **inheriting the listener's options** — the
+    /// C's `tcp_inet_copy` (`inet_drv.c:11795`, copy list `:11814`-`:11831`, busy-msgq limits
+    /// `:11842`/`:11844`).
+    ///
+    /// This is the API a runtime consumer calls instead of [`TcpInetDriver::from_socket`] when it
+    /// adopts an [`crate::InetAsyncResult::Accepted`] `{ fd }` hand-off
+    /// (`{inet_async, Port, Id, {ok, NewPort}}`): the descriptor is adopted exactly as
+    /// `from_socket` does, and the option store plus the two cached socket tags are then taken
+    /// from `listener` through `SocketOptions::inherited_from` (the `opt` module) — `inet.mode`,
+    /// `inet.exitf`,
+    /// `inet.deliver`, `inet.htype`, `inet.psize`, `inet.hsz`, `inet.bufsz`, `high`, `low`,
+    /// `send_timeout`, `send_timeout_close`, the `SHOW_ECONNRESET`/`NO_READ_AHEAD` flags and the
+    /// parent's busy-msgq limits; `inet.stype`/`inet.sfamily` are copied verbatim (the C copies
+    /// them too, overriding [`TcpInetDriver::from_socket`]'s `sys::socket_type` probe).
+    ///
+    /// Everything else is `from_socket`'s behaviour, unchanged: the lifecycle state is read from
+    /// the kernel, so an accepted descriptor is [`InetState::Connected`] (its `getpeername(2)`
+    /// succeeds), `pending_input` starts empty (a fresh connection cannot inherit a partial frame),
+    /// and the async queue and statistics start fresh. The descriptor is **owned**: it is
+    /// `close(2)`d on [`Driver::stop`]/`close`/`Drop`, unlike the **borrowed** `prebound` shape
+    /// `TcpInetDriver::adopt_prebound` installs.
+    ///
+    /// Deliberately **not** inherited, each matching the C: `{active, …}` (and its `{active, N}`
+    /// counter) start **passive** — `inet_start` resets them and the copy list omits them, and
+    /// re-applying them is `prim_inet:accept_opts/3`'s half — as do `debug`, `netns`,
+    /// `read_packets`, `line_delim` and the `{buffer, N}`-was-set flag; `{delay_send, …}` is
+    /// outside the C's mask and is applied by that same Erlang half, not here.
+    ///
+    /// The `INET_REQ_FDOPEN` route gets **no** inheritance hook on purpose: `inet_ctl_fdopen`
+    /// (`inet_drv.c:5223`-`:5282`) copies nothing but `prebound`/`stype`/`sfamily`
+    /// (`:5269`-`:5274`), so `TcpInetDriver::adopt_prebound` stays the plain adoption it is —
+    /// this constructor is the driver's only copy path.
+    ///
+    /// # Errors
+    ///
+    /// The same typed `BeamError::Io` [`TcpInetDriver::from_socket`] returns when `fd` is not a
+    /// usable socket (the failing `getsockopt(2)`/`getpeername(2)` errno, preserved), and
+    /// [`beam_common::BeamError::Io`] for a socket whose type cannot be read. Nothing is inherited
+    /// on that path: a failed adoption produces no driver at all, so `fd` is still the caller's to
+    /// close.
+    ///
+    /// Pinned by the pure unit suite in `inherit_tests.rs`.
+    pub fn from_accepted(fd: RawFd, listener: &TcpInetDriver) -> Result<TcpInetDriver> {
+        let mut accepted = TcpInetDriver::from_socket(fd)?;
+        // The C's copy list over `prep_tcp_inet_start`'s defaults (`:11814`-`:11831`).
+        accepted.options = accepted.options.inherited_from(&listener.options);
+        // `inet.stype`/`inet.sfamily` (`:11820`/`:11821`) — copied verbatim, so the accepted port
+        // reports the listener's cached tags in `INET_REQ_GETTYPE` rather than a fresh probe.
+        accepted.stype = listener.stype;
+        accepted.family = listener.family;
+        Ok(accepted)
+    }
+
     /// The socket this port owns, if one has been opened.
     pub fn socket(&self) -> Option<RawFd> {
         self.socket
@@ -1968,6 +2021,9 @@ mod accept_tests;
 mod fdopen_errno_tests;
 #[cfg(test)]
 mod frame_tests;
+#[cfg(test)]
+#[path = "inherit_tests.rs"]
+mod inherit_tests;
 #[cfg(test)]
 mod opcode_tests;
 #[cfg(test)]
