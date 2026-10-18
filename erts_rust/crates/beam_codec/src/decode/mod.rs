@@ -44,11 +44,11 @@
 //! (`../../erts/emulator/beam/external.c`), which has no explicit depth limit and
 //! relies on the emulator thread's stack.
 
+mod export_gate;
 mod fun;
 mod local_node;
 mod options;
 mod record;
-
 use core::mem::size_of;
 use core::str;
 
@@ -67,8 +67,11 @@ use crate::off_heap::OffHeapBinaries;
 use crate::reader::Reader;
 use crate::tag::{Tag, COMPRESSED_EXT, NIL_EXT, VERSION_MAGIC};
 
-pub use options::{decode_term_with_options, decode_term_with_options_used, DecodeOptions};
-
+pub use export_gate::ExportGate;
+pub use options::{
+    decode_term_with_options, decode_term_with_options_and_gate,
+    decode_term_with_options_and_gate_used, decode_term_with_options_used, DecodeOptions,
+};
 /// The OTP atom-length ceiling, in **characters** (`erts/emulator/beam/erl_term.h`):
 /// a longer name is a `SystemLimit`, never a truncated atom.
 const MAX_ATOM_CHARS: usize = 255;
@@ -165,8 +168,7 @@ pub struct Decoder<'a> {
     /// path (see `decode`), so it tracks the live recursion depth, not the number of
     /// terms decoded.
     depth: usize,
-    /// The C's `ERTS_DIST_EXT_BTT_SAFE` flag: the `binary_to_term/2 [safe]` option.
-    ///
+    /// The C's `ERTS_DIST_EXT_BTT_SAFE` flag: the `binary_to_term/2 [safe]` option.    ///
     /// With it set, an atom **name** on the wire is resolved by *lookup only*
     /// (`erts_atom_get`) and a miss is `BadArg` instead of being interned
     /// (`erts_atom_put`): `external.c:4529-4539` (`dec_term`), `:3073-3082`
@@ -175,8 +177,14 @@ pub struct Decoder<'a> {
     /// *existing* atom, so no lookup happens. `false` — the default — reproduces
     /// today's bytes exactly; see [`Decoder::with_safe`] and [`DecodeOptions`].
     safe: bool,
+    /// The active-export host, when the caller installed one with
+    /// [`Decoder::with_export_gate`]. Consulted **only** under [`Decoder::safe`] and
+    /// **only** by [`Decoder::decode_export`] — the C's
+    /// `erts_active_export_entry(mod, name, arity)` check (`external.c:5032-5036`).
+    /// `None` (the default) skips the check, so decoding is unchanged (see
+    /// [`export_gate`]).
+    export_gate: Option<&'a dyn ExportGate>,
 }
-
 impl<'a> Decoder<'a> {
     /// Creates a decoder for a `term_to_binary` image.
     ///
@@ -196,6 +204,7 @@ impl<'a> Decoder<'a> {
             internal_node: false,
             depth: 0,
             safe: false,
+            export_gate: None,
         })
     }
 
@@ -210,9 +219,9 @@ impl<'a> Decoder<'a> {
             internal_node: false,
             depth: 0,
             safe: false,
+            export_gate: None,
         }
     }
-
     /// Attaches the distribution atom cache used to resolve `ATOM_CACHE_REF` (`82`).
     pub fn with_atom_cache(self, cache: &'a AtomCache) -> Decoder<'a> {
         Decoder { cache: Some(cache), ..self }
@@ -236,6 +245,25 @@ impl<'a> Decoder<'a> {
         Decoder { off_heap: Some(host), ..self }
     }
 
+    /// Attaches the [`ExportGate`] host that decides whether an `EXPORT_EXT` (`113`)
+    /// fun names an export that is **active** on this node.
+    ///
+    /// The gate is consulted only under the `binary_to_term/2 [safe]` flag
+    /// ([`Decoder::with_safe`]) and only for `EXPORT_EXT`, immediately after the wire
+    /// arity has been validated and truncated to 32 bits — the C's
+    /// `if (flags & ERTS_DIST_EXT_BTT_SAFE) { if (!erts_active_export_entry(mod, name,
+    /// arity)) goto error; }` (`external.c:5032-5036`). A `false` answer is
+    /// `BeamError::BadArg` and nothing is materialized.
+    ///
+    /// Without a gate (the default) the check is skipped, so decoding is unchanged —
+    /// the seam is purely additive. Under `[safe]` the two name atoms are resolved by
+    /// **lookup** either way, so an image naming an unknown atom is refused
+    /// independently of the gate; the gate adds the "is `M:F/A` loaded *now*" half that
+    /// needs the host's code server. Neither the distribution decode nor `NEW_FUN_EXT`
+    /// consults it, exactly as in the C.
+    pub fn with_export_gate(self, gate: &'a dyn ExportGate) -> Decoder<'a> {
+        Decoder { export_gate: Some(gate), ..self }
+    }
     /// Decodes the next term into `heap`, interning its atoms into `atoms`.
     ///
     /// Malformed/truncated input, a bad tag, an obsolete tag the C also rejects
@@ -931,9 +959,28 @@ impl<'a> Decoder<'a> {
         Ok(node)
     }
 
-    /// Materializes a reference image, applying the local-node demotion (the C's
-    /// `ref_ext_common`, `external.c:4821-4862`).
+    /// Decodes a nested term and requires it to be an atom — C **`dec_atom`**
+    /// (`external.c:3010-3106`), the resolver `EXPORT_EXT`'s module/function atoms and
+    /// `RECORD_EXT`'s module/name/key atoms use (`external.c:5008-5013`,
+    /// `:5301-5318`).
     ///
+    /// Unlike [`Decoder::decode_node_atom`] this accepts **no** internal-node marker:
+    /// `dec_atom`'s `switch` has no `NIL_EXT` (106) case, so a `NIL` in an atom
+    /// position falls into its `default:` and is an error (`external.c:3100-3105`).
+    /// That matters in `LOCAL_EXT` internal-node mode ([`Decoder::internal_node`]),
+    /// where the marker *is* legal as an identifier's node field (`dec_sysname`,
+    /// `external.c:3114-3122`) — but not here, so reusing the node helper would build a
+    /// fun/record from a `NIL` masquerading as an atom.
+    fn decode_atom_strict(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+        let atom = self.decode(heap, atoms)?;
+        if !is_atom(atom) {
+            return Err(bad_arg());
+        }
+        Ok(atom)
+    }
+
+    /// Materializes a reference image, applying the local-node demotion (the C's
+    /// `ref_ext_common`, `external.c:4821-4862`).    ///
     /// `ids` are the wire numbers in order. When the node is the local node the packed
     /// id materializes as *this* runtime's internal reference — gated on the internal
     /// form's 60-bit id slot being able to hold it

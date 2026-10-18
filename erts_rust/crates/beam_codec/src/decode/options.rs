@@ -37,16 +37,22 @@
 //! (`[used]` is a *return* value, `{minor_version,…}` is an encoder option) needs no
 //! flag.
 //!
-//! ## One remaining degradation (escalation, **not** faked)
+//! ## The `[safe]` active-export half
 //!
 //! C's `EXPORT_EXT` arm additionally requires the export to be **active** under the
 //! flag (`if (!erts_active_export_entry(mod, name, arity)) goto error;`,
-//! `external.c:5032-5036`). That predicate needs the code server's loaded-module
-//! registry, which this codec does not own and must not invent, so it stays
-//! unimplemented: a `safe` decode of an `EXPORT_EXT` checks its two atoms by lookup
-//! (the `dec_atom` half, which *is* implemented) and then accepts any arity. Closing
-//! it requires an active-export equivalent from **`beam_rt`** (which owns the code
-//! server) or a new host seam, and is deliberately left to that owner.
+//! `external.c:5032-5036`). That predicate reads the running node's active export
+//! table, which this codec does not own, so it is an **optional host seam**
+//! ([`ExportGate`], `src/decode/export_gate.rs`): a host installs its code-server view
+//! on the decoder and a refused `M:F/A` becomes `BadArg`; with no gate installed the
+//! check is skipped and decoding is unchanged. Because a borrowed [`Decoder`] cannot
+//! outlive the `COMPRESSED` wrapper's inflated buffer, the two gate-aware free
+//! functions — [`decode_term_with_options_and_gate`] and
+//! [`decode_term_with_options_and_gate_used`] — install the gate on **both** the plain
+//! and the inflated path. The gate is decoder state rather than a [`DecodeOptions`]
+//! field because it borrows live host state (like
+//! [`OffHeapBinaries`](crate::OffHeapBinaries) and [`AtomCache`](crate::AtomCache)),
+//! while `DecodeOptions` is a plain `Copy` configuration value.
 //!
 //! ## Which route a host should use
 //!
@@ -54,10 +60,12 @@
 //!   [`Decoder::new`](super::Decoder::new) +
 //!   [`Decoder::decode`](super::Decoder::decode), or, for a wired option set,
 //!   [`decode_term_with_options`].
-//! * `binary_to_term/2`: [`decode_term_with_options_used`] — it installs `[safe]`
-//!   **and** reports the consumed source bytes exactly like
-//!   [`crate::decode_term_used`]. This is the entry point a
-//!   `beam_bifs::binconv::decode_term_bif` adopting `[safe]` should call.
+//! * `binary_to_term/2` without an active-export registry:
+//!   [`decode_term_with_options_used`] — it installs `[safe]` **and** reports the
+//!   consumed source bytes exactly like [`crate::decode_term_used`].
+//! * `binary_to_term/2` **with** one: the same plus an [`ExportGate`], i.e.
+//!   [`decode_term_with_options_and_gate_used`]. This is the entry point a
+//!   `beam_bifs::binconv::decode_term_bif` adopting the active-export rule should call.
 //!
 //! Every existing free function is untouched: with [`DecodeOptions::default`] (all
 //! fields unset) the option-aware entry points are bit-for-bit the flag-free,
@@ -67,8 +75,8 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::{Atom, AtomTable, Eterm};
 
+use crate::decode::export_gate::ExportGate;
 use crate::decode::{decompress_wrapper, Decoder};
-
 /// The `binary_to_term/2` decode options this codec understands.
 ///
 /// All fields default to "not installed", so `DecodeOptions::default()` decodes
@@ -182,6 +190,92 @@ pub fn decode_term_with_options_used(
         return Ok((term, consumed));
     }
     let mut decoder = apply(Decoder::new(bytes)?, options);
+    let term = decoder.decode(heap, atoms)?;
+    Ok((term, decoder.position()))
+}
+
+/// Installs `gate` on `decoder` — the `[safe]` active-export half of the two
+/// gate-aware entry points.
+///
+/// The gate is installed unconditionally; the decoder consults it only under the
+/// `[safe]` flag and only for `EXPORT_EXT`, so installing it with `options.safe`
+/// false is a no-op (see [`ExportGate`]).
+fn with_gate<'a>(decoder: Decoder<'a>, gate: &'a dyn ExportGate) -> Decoder<'a> {
+    decoder.with_export_gate(gate)
+}
+
+/// Decodes a `term_to_binary` image with an explicit [`DecodeOptions`] **and** an
+/// [`ExportGate`] — the `[safe]` active-export twin of
+/// [`decode_term_with_options`].
+///
+/// Semantics are exactly [`decode_term_with_options`]'s, with one addition: under
+/// `options.safe` an `EXPORT_EXT` (`113`) fun whose `M:F/A` the gate does not report as
+/// active is `BeamError::BadArg` — the C's
+/// `if (flags & ERTS_DIST_EXT_BTT_SAFE) { if (!erts_active_export_entry(mod, name,
+/// arity)) goto error; }` (`external.c:5032-5036`). The gate is asked with the
+/// **32-bit-truncated** arity (the C's `unsigned int` parameter). With `options.safe`
+/// false it is not consulted at all, and neither the distribution decode nor
+/// `NEW_FUN_EXT` ever consults it. A top-level `COMPRESSED` (`80`) wrapper is
+/// unwrapped here — the same reason as [`decode_term_with_options`] — and the gate is
+/// installed on **both** the inflated and the plain path, so compression cannot route
+/// around the check.
+///
+/// # Why the gate is decoder state and not a [`DecodeOptions`] field
+///
+/// The gate is a **borrowed host object**, not a configuration value: like
+/// [`OffHeapBinaries`](crate::OffHeapBinaries) and [`AtomCache`](crate::AtomCache) it
+/// names live runtime state (the caller's code-server view) for the duration of one
+/// decode, with a lifetime tied to the decoder. `DecodeOptions` stays a plain
+/// `Copy` configuration struct of scalars that callers build exhaustively, so adding a
+/// reference-typed field there would both break every struct literal and pretend the
+/// borrow is a value.
+///
+/// # Errors
+///
+/// Every error [`decode_term_with_options`] reports, plus `BeamError::BadArg` for a
+/// `[safe]` `EXPORT_EXT` whose export the gate refuses.
+pub fn decode_term_with_options_and_gate(
+    bytes: &[u8],
+    heap: &mut Heap,
+    atoms: &mut AtomTable,
+    options: &DecodeOptions,
+    gate: &dyn ExportGate,
+) -> Result<Eterm> {
+    if let Some((body, _consumed)) = decompress_wrapper(bytes)? {
+        let mut decoder = with_gate(apply(Decoder::new_body(&body), options), gate);
+        return decoder.decode(heap, atoms);
+    }
+    let mut decoder = with_gate(apply(Decoder::new(bytes)?, options), gate);
+    let term = decoder.decode(heap, atoms)?;
+    decoder.finish()?;
+    Ok(term)
+}
+
+/// Like [`decode_term_with_options_and_gate`], but also reports how many **source**
+/// bytes the image occupied — the gate-aware twin of
+/// [`decode_term_with_options_used`], i.e. `binary_to_term/2` with both `[safe]`
+/// (gated) and `[used]`.
+///
+/// The `used` convention is [`decode_term_with_options_used`]'s: no
+/// [`Decoder::finish`], so trailing bytes are tolerated and uncounted, and a
+/// `COMPRESSED` image reports its header plus the zlib stream.
+///
+/// # Errors
+///
+/// Every error [`decode_term_with_options_and_gate`] reports.
+pub fn decode_term_with_options_and_gate_used(
+    bytes: &[u8],
+    heap: &mut Heap,
+    atoms: &mut AtomTable,
+    options: &DecodeOptions,
+    gate: &dyn ExportGate,
+) -> Result<(Eterm, usize)> {
+    if let Some((body, consumed)) = decompress_wrapper(bytes)? {
+        let mut decoder = with_gate(apply(Decoder::new_body(&body), options), gate);
+        let term = decoder.decode(heap, atoms)?;
+        return Ok((term, consumed));
+    }
+    let mut decoder = with_gate(apply(Decoder::new(bytes)?, options), gate);
     let term = decoder.decode(heap, atoms)?;
     Ok((term, decoder.position()))
 }
