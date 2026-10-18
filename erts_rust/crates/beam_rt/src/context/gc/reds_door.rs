@@ -280,7 +280,7 @@ pub(crate) fn collect_at_reds_boundary(
     // The action is a plain collection, never `collect_or_grow`: `Process::ensure_capacity`'s
     // `nursery.grow` is a no-op when the current space already has room, so it would leave the
     // retired chain exactly where it is — the mechanism of the climb this door exists to stop.
-    match process.collect() {
+    match process.collect_kind(CollectionKind::Minor) {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);

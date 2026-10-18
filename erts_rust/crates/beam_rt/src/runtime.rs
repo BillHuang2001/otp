@@ -440,26 +440,49 @@ pub struct Runtime {
     /// like [`Runtime::mailboxes`].
     pub(crate) async_dist: FastHashSet<ProcessId>,
     /// The pids that replaced their `max_heap_size` setting through
-    /// `erlang:process_flag(max_heap_size, …)` — the C's per-process
-    /// `MAX_HEAP_SIZE_GET(p)`/`MAX_HEAP_SIZE_FLAGS_GET(p)` pair (`bif.c:2148-2166`).
+    /// `erlang:process_flag(max_heap_size, …)` / `spawn_opt`'s `{max_heap_size, …}` — the C's
+    /// per-process `MAX_HEAP_SIZE_GET(p)`/`MAX_HEAP_SIZE_FLAGS_GET(p)` pair
+    /// (`bif.c:2148-2166`).
     ///
-    /// `beam_process::Process`/`beam_gc::AnyCollector` expose the heap policy a process was
-    /// **created** with but no setter, so (like [`Runtime::async_dist`]) the runtime keeps the
-    /// flag's value in its own per-pid store. It is the **one** source of truth every reader
-    /// shares: the `beam_bifs` `process_flag/2` bridge
-    /// ([`crate::context::process_bridge`]) writes it, and `erlang:process_info/2`'s
-    /// `max_heap_size` / `garbage_collection` items ([`crate::native::memory`]) read it. A pid
-    /// absent from the store reports the setting it was born with — the policy's
-    /// `max_heap_words` plus the emulator's `+hmax*` flags ([`crate::config::MaxHeapSetting`]).
+    /// The **value** lives on the process itself
+    /// ([`Process::max_heap_size`](beam_process::Process::max_heap_size), installed with
+    /// [`Process::set_max_heap_size`](beam_process::Process::set_max_heap_size)) and is what
+    /// the collection doors enforce. This set records only the *provenance*: a pid here has an
+    /// **explicit** setting, while a pid absent from it still reports the one it was born with
+    /// — the policy's `max_heap_words` plus the emulator's `+hmax*` flags
+    /// ([`crate::config::MaxHeapSetting`]) — which the PCB cannot distinguish from an explicit
+    /// `#{size => 0}` ("no upper bound", `erl_gc.c:3807-3822`).
+    ///
+    /// The `beam_bifs` `process_flag/2` bridge ([`crate::context::process_bridge`]) writes it,
+    /// the `spawn_opt` path writes it ([`crate::native::process`]) and
+    /// `erlang:process_info/2`'s `max_heap_size` / `garbage_collection` items
+    /// ([`crate::native::memory`]) read it.
     ///
     /// As with [`Runtime::group_leaders`], a terminated process leaves its entry behind,
     /// which is harmless: a pid's serial is bumped when its table slot is reused, so the stale
     /// key names no process that can ever be observed again.
     ///
-    /// Keyed by the whole [`ProcessId`] and only ever `get`/`insert`ed (never iterated), so it
-    /// probes with the crate's own [`FastHashMap`] over [`crate::hasher`].
-    pub(crate) max_heap: FastHashMap<ProcessId, MaxHeapSetting>,
-    /// The `{monitor_nodes, Options}` registrations of every process — the C's
+    /// Keyed by the whole [`ProcessId`] and only ever `contains`/`insert`ed (never iterated),
+    /// so it probes with the crate's own [`FastHashSet`] over [`crate::hasher`].
+    pub(crate) max_heap_set: FastHashSet<ProcessId>,
+    /// The pids whose last collection/growth decision **breached** their `max_heap_size` with
+    /// `kill => true`, waiting for the runner to terminate them with the bare atom `killed`
+    /// ([`Runtime::take_max_heap_kill`]).
+    ///
+    /// A collection door cannot terminate a process itself: it holds the process mutably and
+    /// the termination is the scheduler's (`ProcessTable::terminate` is what propagates the
+    /// exit to links and monitors). So the verdict is **latched** here — exactly as
+    /// `beam_process` latches it on the PCB — and drained by the runner at its next slice
+    /// boundary, which returns `RunOutcome::Exit(killed)` through the existing exit path.
+    ///
+    /// `kill` is **not** trappable by the victim (the reason is `killed`, not `kill`): the
+    /// runner exits the process directly, so no signal round-trip is involved and the victim's
+    /// own `trap_exit` flag never sees it. A linked peer or a monitor observes the ordinary
+    /// `terminate` propagation (`{'EXIT', Pid, killed}` / `'DOWN' … killed`).
+    ///
+    /// Keyed by the whole [`ProcessId`] and only ever `insert`/`remove`d, so it probes with the
+    /// crate's own [`FastHashSet`] over [`crate::hasher`].
+    pub(crate) max_heap_kill: FastHashSet<ProcessId>,    /// The `{monitor_nodes, Options}` registrations of every process — the C's
     /// `ERTS_MON_TYPE_NODES` monitor chain (`dist.c:6754-6868`).
     ///
     /// The undocumented `erlang:process_flag(monitor_nodes, Bool)` /
@@ -942,7 +965,8 @@ impl Runtime {
             references: HashMap::new(),
             group_leaders: FastHashMap::default(),
             async_dist: FastHashSet::default(),
-            max_heap: FastHashMap::default(),
+            max_heap_set: FastHashSet::default(),
+            max_heap_kill: FastHashSet::default(),
             monitor_nodes: FastHashMap::default(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
@@ -1681,15 +1705,38 @@ impl Runtime {
         }
     }
 
-    /// `pid`'s own `max_heap_size` setting, or `None` when it still has the one it was born
-    /// with (see [`Runtime::max_heap`]).
-    pub(crate) fn max_heap_setting(&self, pid: ProcessId) -> Option<MaxHeapSetting> {
-        self.max_heap.get(&pid).copied()
+    /// Whether `pid` carries an **explicitly set** `max_heap_size` — the provenance bit behind
+    /// [`Runtime::max_heap_set`]. The setting's value is the process's own
+    /// ([`Process::max_heap_size`](beam_process::Process::max_heap_size)); a pid absent from the
+    /// set still reports the emulator's birth default, which is what
+    /// [`Runtime::birth_max_heap_setting`] names.
+    pub(crate) fn max_heap_was_set(&self, pid: ProcessId) -> bool {
+        self.max_heap_set.contains(&pid)
     }
-    /// Replaces `pid`'s `max_heap_size` setting — the store behind
-    /// `erlang:process_flag(max_heap_size, …)` (see [`Runtime::max_heap`]).
-    pub(crate) fn set_max_heap_setting(&mut self, pid: ProcessId, setting: MaxHeapSetting) {
-        self.max_heap.insert(pid, setting);
+    /// The `max_heap_size` setting a process that never called
+    /// `erlang:process_flag(max_heap_size, …)` reports: the emulator's `+hmax` bound (the heap
+    /// policy's `max_heap_words`) with the `+hmax*` flag word.
+    ///
+    /// `policy` is the **process's own** heap policy, so a `spawn_opt(…, [{max_heap_size,
+    /// N}])` child (whose bound is its explicit setting, not the policy) is unaffected, while a
+    /// process created under `+hmax N` still reports `N` — the value the oracle's
+    /// `process_info(P, max_heap_size)` answers.
+    pub(crate) fn birth_max_heap_setting(&self, policy: &beam_gc::HeapPolicy) -> MaxHeapSetting {
+        MaxHeapSetting {
+            size: policy.max_heap_words,
+            flags: self.config().heap_options().max_heap_flags(),
+        }
+    }
+    /// Records that `pid` now carries an explicit `max_heap_size` setting (see
+    /// [`Runtime::max_heap_set`]). The value itself is installed on the process with
+    /// [`Process::set_max_heap_size`](beam_process::Process::set_max_heap_size).
+    pub(crate) fn note_max_heap_set(&mut self, pid: ProcessId) {
+        self.max_heap_set.insert(pid);
+    }
+    /// Takes `pid`'s latched `max_heap_size` **kill** verdict — the drain the runner performs at
+    /// its slice boundary (see [`Runtime::max_heap_kill`]).
+    pub(crate) fn take_max_heap_kill(&mut self, pid: ProcessId) -> bool {
+        self.max_heap_kill.remove(&pid)
     }
     /// Registers one more `{monitor_nodes, Options}` monitor for `pid` under the option
     /// bitmask `key`, answering the **previous** reference count — the C's
