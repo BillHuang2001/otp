@@ -176,7 +176,7 @@ pub(crate) fn message(text: impl Into<String>) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(text.into())))
 }
 
-/// The `undef`-style diagnostic of a `.beam` whose **object code names another module**.
+/// The loader's diagnostic for a `.beam` whose **object code names another module**.
 ///
 /// This is the loader's expected-name check — the C's `beam_load.c:186`
 /// (`check_module_name`, `make_descriptor`): the object code declares one module name and the
@@ -202,7 +202,8 @@ pub(crate) fn bad_object_module_name(requested: &str, actual: &str) -> BeamError
     ))
 }
 
-/// The reason of a [`BeamError::Raise`], as an atom name, when there is one.///
+/// The reason of a [`BeamError::Raise`], as an atom name, when there is one.
+///
 /// Reads through [`ExitReason::as_atom`], which — unlike
 /// [`BeamError::as_atom`] — also sees atoms backed by an owned `String` (every
 /// message this module builds). Every other error is `None`.
