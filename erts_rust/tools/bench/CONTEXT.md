@@ -518,12 +518,13 @@ exact `bench run …` commands behind every `results/m16-*` artifact); reproduce
 copy. The shape is: build the driver *and* the runtime once
 (`erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt -p bench` from
 the repo root), then drive the subcommands. Two facts to keep in mind when reproducing:
-- A `--runtime all` report shows a genuine sys-vs-rust row only for the six `Runtimes::Both` workloads
-  (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`); run those as one batch so both
-  sides see the same machine conditions.
+- A `--runtime all` report shows a genuine sys-vs-rust row only for the seven `Runtimes::Both` workloads
+  (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`, `binary_append`); run those as one
+  batch so both sides see the same machine conditions.
 - **Always measure one process at a time on a quiet host** and record `/proc/loadavg` before and after.
   Run order is runtime-major (all `sys` rows, then all `rust`), so a *drifting* load can bias a cross-runtime
-  comparison — use the interleaved A/B for binary-vs-binary claims, and read ratios + the deterministic
+  comparison — take cross-runtime ratios from the **matched rounds** (one rust-only and one sys-only pass per
+  round, alternating), pin binary-vs-binary A/B with `taskset`, and read ratios + the deterministic
   `case_*_ops/calls/elements` counters rather than absolute latencies.
 - Archive the `out/` copies into `results/` with only the two mechanical path normalisations
   (`runtimes[].program` worktree prefix → `erts_rust/target/release/beam_rt`; a scratch `$TMPDIR` prefix in
@@ -559,66 +560,46 @@ the repo root), then drive the subcommands. Two facts to keep in mind when repro
 - Read the older figures from `results/` (`m15-*` and older are history: a different load band and, before
   m15, a different estimator — their per-unit rows are superseded).
 
-## Measured — where the numbers live
+## Reading results — where the numbers live, and what they mean
 **`RESULTS.md` is the authoritative source for every measured number** (per-category tables with both sides
-named, the environment/load record, the reproduction commands, the calibration rule, the still-open items).
-The raw harness behind it is committed under `results/` (`m16-*` current; see the routing-table entry above
-for the file list). This file deliberately restates none of the numbers — read them there, and regenerate via
-the Runbook rather than quoting a stale copy.
+named, the environment/load record, the reproduction commands, the calibration rule, the still-open items); the
+raw reports behind it are committed under `results/`. This file restates no number — read them there and
+regenerate via the Runbook rather than quoting a stale copy.
 
 Structural facts that are not numbers (and so belong here):
-- `--runtime all` yields a genuine sys-vs-rust row only for the seven `Runtimes::Both` workloads
-  (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`, `binary_append`); every other
-  workload is `SysOnly`.
-- `baseline`'s compute loop is dominated by the natively-served `lists:seq/2` + `lists:sum/1`, so a
-  near-parity result reads as the **native floor**, not execution throughput. The per-unit
-  execution-throughput signals are `list_walk` (ns/element) and `foreign` (ns/call of real foreign code).
-- `slice` runs one call per process, while `foreign`/`list_walk`/`copy_bound`/`gc_bound` loop many ops per
-  process at a per-runtime loop count `N`, so peak RSS is like-for-like only for `slice`.
-- **Rust-vs-Rust rows** (the interpreter-pin tier control and the binary-vs-binary A/B) are labelled
-  separately and are **never** a system-ERTS comparison.
+- `baseline`'s compute loop is dominated by the natively-served `lists:seq/2` + `lists:sum/1`, so a near-parity
+  result reads as the **native floor**, not execution throughput. The per-unit execution-throughput signals are
+  `list_walk` (ns/element) and `foreign` (ns/call of real foreign code).
+- `slice` runs one call per process (`N`=1), while `foreign`/`list_walk`/`copy_bound`/`gc_bound`/`binary_append`
+  loop many ops per process at a per-runtime `N`, so peak RSS is like-for-like **only** for `slice`.
+- **Rust-vs-Rust rows** (the interpreter-pin tier control and the binary-vs-binary A/B) are labelled separately
+  and are **never** a system-ERTS comparison.
 
-> **`ERTS_STDLIB_DIR` note (a real `beam_rt` behavior):** the Rust runtime resolves its system `ebin` path with
-> a **native filesystem probe** (`crates/beam_rt/src/codeserver.rs`: `$ERTS_STDLIB_DIR` when set, else the
-> standard OTP installation layout under the `erl` on `$PATH` — *resolved to a path, never executed* — then this
-> executable's ancestors, `$ERL_TOP`, and standard prefixes); the system `erl` is only *run* as a last resort for
-> an installation that layout cannot see. Setting `$ERTS_STDLIB_DIR` still short-circuits the probe.
-> `bench` does **not** set it — the harness is a pure driver/observer and never mutates the runtime's environment
-> beyond argv — and the per-op/per-call/per-element metric cancels any remaining startup cost by construction.
+**The per-unit gaps are real runtime costs, not harness artifacts.** The startup-cancelled metric reproduces with
+a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>`, so CLI re-entry, per-call module
+reloads and per-call GC are all ruled out; what remains is a `beam_rt` per-call host-context cost owned by
+`../../crates/beam_rt/PERF.md` and `CONTEXT.md`, not `bench` output. Startup latency is therefore the trustworthy
+cross-runtime comparison for whole-process cost (and, on `slice`, peak RSS).
 
-## Reading the current sys-vs-rust gap (verified)
-The `foreign` per-call, `list_walk` per-element, and `copy_bound`/`gc_bound` per-op gaps (current values in
-`RESULTS.md` §3) are **real runtime costs, not harness artifacts**. The startup-cancelled metric reproduces
-with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI re-entry,
-per-call module reloads and per-call GC are all ruled out. It is a `beam_rt` per-call host-context cost: the
-engine's dispatch arm is itself O(1) and allocation-free per instruction, and the runtime-side costs behind
-it are `beam_rt` measurements owned by `../../crates/beam_rt/PERF.md` and `../../crates/beam_rt/CONTEXT.md`,
-not `bench` output.
-
-**The `beam_rt` execution tier defaults to the native baseline JIT** (`JitMode::Auto` ⇒ `Tier::BaselineJit`
-on a process's first entry, remembered across pre-emptions and suspends; `BEAM_RT_TIER=interpreter` is the
-only kill switch), and its runtime path compiles **per function, lazily** on a function's first entry — so a
-fresh process pays only for the functions it actually enters, and is **not** paying a whole-module compile.
-The eager whole-module artifact (`JitBackend::compile`/`CodeCache::get_or_compile`) serves the whole-module
-introspection surface and the `beam_engine` `jit_bench` harness only. The one-shot cold-start
-characterisation (a module-graph-heavy `slice` case at **~1.2–1.3×** the interpreter tier) lives in
+**The `beam_rt` execution tier defaults to the native baseline JIT** (`JitMode::Auto` ⇒ `Tier::BaselineJit` on a
+process's first entry, remembered across pre-emptions and suspends; `BEAM_RT_TIER=interpreter` is the only kill
+switch), and its runtime path compiles **per function, lazily**, so a fresh process pays only for the functions it
+enters, never a whole-module compile. The eager whole-module artifact serves the introspection surface and the
+`beam_engine` `jit_bench` harness only; cold-start characterisation (`slice`, ~1.2–1.3× the interpreter) lives in
 `../../crates/beam_engine/MEASURED.md` and `../../crates/beam_rt/PERF.md`.
 
-**The tier effect is also measured here** as two matched-form `--quick` rust-only passes:
-`results/m16-bench-xrun-interp.json` (interpreter) against the default-tier partner
-`results/m16-xab-rust-r{1,2,3}.json` — the same workloads, `--runtime rust` only, with `BEAM_RT_TIER`
-exported (`bench` spawns the runtime with an inherited environment, so the switch reaches every child). They
-have **no `sys` rows**: they are Rust-vs-Rust and must never be read against the system-ERTS column.
-`RESULTS.md` §5 tabulates them off the matched-form pair (`results/m16-compare-tier-effect-quick.txt`). The
-default baseline JIT is cheaper than the interpreter on every case it can measure; `binary_append` cannot be
-measured at the interpreter tier at the calibrated `N` (the 60 s `run` deadline fires), so that row is an
-honest `failed(no-binary-append-run)` in the tier control. Every tier table here is a Rust-vs-Rust
-observation, **NOT** a system-ERTS comparison.
+**The tier effect is measured here** as matched-form `--quick` rust-only passes: the interpreter control
+`results/m16-bench-xrun-interp.json` against the default-tier partner `results/m16-xab-rust-r{1,2,3}.json`, with
+`BEAM_RT_TIER` exported (`bench` spawns the runtime with an inherited environment, so the switch reaches every
+child). They have **no `sys` rows**. `RESULTS.md` §5 tabulates them off
+`results/m16-compare-tier-effect-quick.txt`; the default baseline JIT is cheaper on every case it can measure, and
+`binary_append` is an honest `failed(no-binary-append-run)` there because its calibrated `N` exceeds that tier's
+60 s `run` deadline.
 
-Consequence for reading results: startup latency is the trustworthy cross-runtime comparison for
-whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_bound`/`gc_bound`
-per-call/per-element/per-op rows are snapshots of the term-copy / per-element dispatch / GC cost and should
-be re-run via the Runbook rather than adjusted.
+> **`ERTS_STDLIB_DIR` note:** the Rust runtime resolves its system `ebin` path with a **native filesystem probe**
+> (`crates/beam_rt/src/codeserver.rs`; the system `erl` is *run* only as a last resort for an installation the
+> layout cannot see). `bench` does **not** set it — the harness is a pure driver/observer and never mutates the
+> runtime's environment beyond argv — and the per-unit metric cancels any remaining startup cost by construction.
 
 ## Known Issue — the `foreign` per-call metric is `N`-dependent, and the loop workloads' rust peak RSS is boot-dominated
 
