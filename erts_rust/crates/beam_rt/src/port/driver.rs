@@ -574,6 +574,73 @@ impl BusyFlag {
     }
 }
 
+/// The port's **driver-failure latch** — where a driver that closes its own port records the
+/// request, and where the port lifecycle drains it into `beam_io`'s failure channel.
+///
+/// The C's `driver_failure*` family and `driver_exit` (`io.c:7196-7278`) are **port-closing
+/// requests**, not return values: they deliver the port-exit reason to the connected process and
+/// hand the port back to the emulator to be torn down. A [`DriverHost`] cannot close a port — it
+/// owns no port table and no process table — so the request is recorded here, from inside the
+/// callback, and [`DriverPortAdapter::settle`] hands it to
+/// [`beam_io::DriverContext::signal_failure`] on the way out. `beam_io` then reaps the port after
+/// the callback returns (`PortRegistry::reap_failures`), which is what makes the driver's `stop`
+/// run and the port leave the live map through the ordinary close path.
+///
+/// It is a shared handle rather than a host field because the host is boxed inside the port
+/// lifecycle ([`DriverPortAdapter::load`]) and exposes neither itself nor the context its callback
+/// runs against; seizing the latch at load is the same pattern as [`BusyFlag`],
+/// [`DriverMonitors`] and [`super::driver::TermQueue`].
+///
+/// **Exactly one** failure is kept: in the C the first call has already closed the port, so a
+/// second one is meaningless (the measured `driver_failure_atom` then `driver_exit` shape is a
+/// use-after-free *in the C*). A second request is refused with the C's `-1` rather than
+/// overwriting the first, so a driver that reports twice is told its second request did nothing.
+#[derive(Clone, Debug, Default)]
+pub struct FailureLatch {
+    /// The latched request, if a driver has closed its port since the last drain.
+    ///
+    /// `RefCell` rather than `Cell` because [`beam_io::DriverFailure`] is not `Copy` (its
+    /// [`FailureReason::Atom`] carries a name).
+    slot: Rc<RefCell<Option<beam_io::DriverFailure>>>,
+}
+
+impl FailureLatch {
+    /// An empty latch — a fresh port no driver has closed.
+    pub fn new() -> FailureLatch {
+        FailureLatch::default()
+    }
+
+    /// Records `failure`, answering whether it was **this** call that latched it.
+    ///
+    /// `false` means a failure was already latched (the port is already being closed), which the
+    /// C's own "the first call closed it" rule makes the driver's `-1`.
+    pub fn set(&self, failure: beam_io::DriverFailure) -> bool {
+        let mut slot = self.slot.borrow_mut();
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(failure);
+        true
+    }
+
+    /// Takes the latched failure out, if any — the drain half
+    /// ([`DriverPortAdapter::settle`]).
+    pub fn take(&self) -> Option<beam_io::DriverFailure> {
+        self.slot.borrow_mut().take()
+    }
+
+    /// Whether a failure is waiting to be drained.
+    pub fn is_pending(&self) -> bool {
+        self.slot.borrow().is_some()
+    }
+
+    /// Forgets a latched failure — the port is going away, and its teardown
+    /// ([`DriverPortAdapter::stop`]) must not leave a request nobody will ever drain.
+    pub fn clear(&self) {
+        *self.slot.borrow_mut() = None;
+    }
+}
+
 /// The **`ERL_DRV_PORT` resolution state** of one driver port — the two facts a host cannot observe
 /// about itself.
 ///
