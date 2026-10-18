@@ -18,7 +18,10 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   wrapper that calls `ExecutionContext::alloc_words_rooted`); and the **off-heap refc-binary handle view**
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
   which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc
-  binary's payload by data pointer (a cloned handle's refcount keeps the payload alive past the machine).
+  binary's payload by data pointer (a cloned handle's refcount keeps the payload alive past the machine);
+  with it the **retention seam** `off_heap_overhead_bytes()` (the reservoir's backing-store bytes) and
+  `retain_refc_binaries(keep)` (host-supplied reachability pruning, returning the number of handles
+  released) — see `## The off-heap refc-binary retention seam` and the `offheap.rs` bullet.
   Also on `mod.rs`: **`Machine::register_count()`** — *this* machine's X-register file size
   (`x[0..register_count())`, i.e. the bound `Machine::x` indexes into), which is what a caller that walks
   the argument registers must stop at when the file was narrowed with `Machine::with_max_register`;
@@ -93,6 +96,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   snapshot heuristic when it is armed, and an absent/empty supplied trace leaves every path byte-identical.
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
   `module_context`.
+- `offheap.rs` — the off-heap refc-binary **retention seam**: `Machine::off_heap_overhead_bytes()` (the sum of
+  `RefcBinary::reserved_bytes()` over `refc_binaries`) and
+  `Machine::retain_refc_binaries(keep: FnMut(*const u8) -> bool) -> usize` (drops the handles the predicate
+  rejects, returning how many were released, and prunes `writable_payloads` in lockstep). It is a separate
+  file to keep both modules under the line budget; a child module of `machine` sees the parent's fields.
+  Detail: `## The off-heap refc-binary retention seam`.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
   `initial_call`, `current_stacktrace`, `current_module`/`active_context`) **and** the parked-`receive`
   deadline seam `Machine::wait_deadline`/`timeout_delay` + `WaitDeadline { delay_ms, resume }`: it reads the
@@ -151,7 +160,8 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   trace/reduce gates, but **not** the `refc_binaries` arena, the `writable_payloads` registry, or
   `bif_in_machine_on` (latched per run into the machine by both drivers; only `Machine::new`,
   `machine/mod.rs`, ever sets it); a resume (`resume_outcome`) resets nothing, so the contexts and the raise snapshot
-  both survive it.
+  both survive it. The two off-heap rosters are released only by a host call to
+  `Machine::retain_refc_binaries`.
 
 ## See Also
 - `../interpreter/CONTEXT.md` → the per-instruction dispatcher (`step_instruction_with_entry`, also the JIT deopt
@@ -174,7 +184,10 @@ not in *this* list, so it is never written in place here.
 Only `mark_writable` entries are writable: an ordinary binary's payload length is never taken as a
 capacity (the roster `Machine::refc_binaries` is *not* consulted). The list is **never cleared by
 `Machine::reset`**, for the same reason `refc_binaries` is not — a registry entry must never outlive
-the payload it names.
+the payload it names — and it is pruned only by `Machine::retain_refc_binaries`, which drops every
+entry whose base no longer names a live retained payload **in the same call** that releases the
+handle, so a lookup can never answer with a freed block's address or a stale capacity.
+`Machine::writable_payload_count()` reports how many registrations are live.
 
 **Growth keeps the two books straight.** `Machine::grow_writable_payload(base, wanted_bytes)` is the
 one widening door (`beam_alloc::RefcBinary::ensure_capacity`; C's `GROW_PROC_BIN_SIZE` schedule) and
@@ -187,7 +200,7 @@ is what keeps the appender's bytes alive). Every refusal — an unregistered pay
 is a runtime condition with a correct fallback, not an internal fault. Republishing the accumulator's
 own `[BinRef][ErlSubBits]` pair over a moved base is the *caller's* job (`raw::InPlace::grow`): this
 door is safe Rust and never dereferences a term. It is consulted **only on a shortfall**, since it
-scans the roster; `compact()` is not on the append path.
+scans the roster; `Machine::retain_refc_binaries` is not on the append path.
 
 **A payload another party shares can no longer grow.** `beam_alloc`'s mutators refuse unless
 `refcount() == 1`, so a shared payload is never reallocated behind another handle's back.
@@ -197,3 +210,34 @@ has `refcount() >= 2` and any later append needing growth falls back to the copy
 (byte-correct, amortisation lost). An accumulator whose whole loop stays inside one run keeps growing.
 
 Consumer: `families::bitstrings::raw::{writable_append_target, InPlace, payload_aliased_elsewhere}`.
+
+## The off-heap refc-binary retention seam (`offheap.rs`)
+
+`Machine::refc_binaries` is the machine's off-heap payload reservoir; it keeps every refc binary the
+machine built alive and address-stable, and `Machine::reset` never clears it (a returned term may still
+name a payload after the run that built it). Reclamation is therefore a **host** decision, taken after a
+reachability sweep over the process roots, and the seam is two infallible, allocation-free, panic-free
+`pub` methods:
+
+- `Machine::off_heap_overhead_bytes() -> usize` — the reservoir's **backing-store** bytes: the sum of
+  `beam_alloc::RefcBinary::reserved_bytes()` over the handles. The reservation (not `len()`) is what a
+  host charges for, matching `beam_gc::sweep_unreachable_binaries`/`beam_gc::BinVheap` accounting: an
+  exactly-sized payload has `len() == capacity() == reserved_bytes()`, while a `bs_init_writable`
+  accumulator holds a 4x reservation whose spare room is real memory. The consumer is words-based, so the
+  host converts with `bytes / size_of::<beam_term::Eterm>()` (8, a truncating division) and compares
+  against `beam_gc::BinVheap::triggered`'s floor, the policy's `min_bin_vheap_words`.
+- `Machine::retain_refc_binaries(keep: FnMut(*const u8) -> bool) -> usize` — drops every handle whose
+  payload data pointer the predicate rejects and returns the number of handles **released** (a released
+  handle frees bytes only when it was the last one, `refcount() == 1`). Retained payloads keep their exact
+  `data_ptr`, so compaction never invalidates a live `BinRef.val` (the frozen `beam_term::refc` contract)
+  and never moves a block; payloads are always found by `data_ptr` search
+  (`grow_writable_payload`/`cover_writable_capacity`), so the compaction is invisible to those doors. The
+  same call prunes `writable_payloads` in lockstep (above).
+
+**The predicate is the caller's soundness assertion.** The engine cannot verify it: the reservoir holds
+handles, not roots. A false reject frees a payload a live term still names (a dangling `BinRef.val`); a
+false accept is merely a leak. The intended use is `beam_gc::for_each_reachable_binary_payload`'s
+reachable-pointer set as the predicate, after first **cloning** the handles the host keeps beyond the
+machine into its own off-heap table (the clone bumps the refcount, so the payload survives the drop).
+Pinned by `offheap.rs`'s unit tests (address stability across a retain, released-reservation accounting, a
+shared payload outliving a released handle, writable-registry pruning both ways, the empty no-op).
