@@ -262,13 +262,45 @@ port term): `{active,once}` + `<<"hi">>` ⇒ `{tcp,'#Port<P>',<<"hi">>}`; `[list
 `{udp,'#Port<P>',{127,0,0,1},39846,<<"hi">>}` from a socket bound to 23456 (`0x5BA0`) ⇒ the source
 **port field is big-endian**; UDP `{active,2}` + three datagrams ⇒ two `{udp,…}` then
 `{udp_passive,…}`; an empty datagram is `{udp,'#Port<P>',{127,0,0,1},50339,<<>>}`.
-**These shapes are rendered by `RuntimeContext::active_input_message` but are not yet live in a
-running runtime** — nothing drains or delivers the channel yet; see *Wiring* below.
+**The rendering is proven end to end over real loopback traffic** (`active_input_e2e_tests.rs`);
+what is *not* yet wired is the packet's delivery into the owner's mailbox — see *Wiring* below.
 
 The module is declared from **`ops.rs`** (`#[path = "active_input.rs"] pub(crate) mod
-active_input;`, beside the `#[path]` declaration of `inet_opts`), so it compiles today; its suite
-is its own child (`#[path = "active_input_tests.rs"] mod tests`, 16 cases) and is reached with
-`... -p beam_rt --lib -- active_input`.
+active_input;`, beside the `#[path]` declaration of `inet_opts`). It has two suites, reached with
+`... -p beam_rt --lib -- active_input`: the matrix (`#[path = "active_input_tests.rs"] mod tests`,
+16 cases over made-up reads) and the end-to-end suite (`#[path = "active_input_e2e_tests.rs"] mod
+e2e`, 9 cases, 8 of them real traffic).
+
+**What the end-to-end suite drives, and how far.** Each case opens a real `{spawn_driver,
+"tcp_inet"|"udp_inet"}` port through `RuntimePorts::open_port`, drives the driver's own numeric
+control requests (`INET_REQ_OPEN`/`BIND`/`CONNECT`, `INET_REQ_SETOPTS` with the `INET_LOPT_*`
+records), really connects a `std::net` peer or really sends a datagram to it, then
+`pump` → `drain_active_inputs()` → `RuntimeContext::active_input_message` → the registered `~w`
+printer. That is the whole channel up to the message term; wrapping a packet in a `PortEvent`,
+publishing it and writing the mailbox is `src/port.rs`'s and is not exercised. Asserted against the
+oracle's own printed rendering (one case re-runs every probe live): `{active,once}` binary ⇒ one
+`{tcp,S,<<104,101,108,108,111>>}` per grant, a write under the spent grant ⇒ nothing, a re-arm ⇒
+the next write delivered; `{mode,list}` ⇒ `{tcp,S,[104,101,108,108,111]}`; `{packet,2}` ⇒ the
+frame header stripped; `{header,2}` ⇒ `{tcp,S,[104,101|<<108,108,111>>]}` with the read's own
+`hsz`/body split; `{active,2}` ⇒ two payloads, then exactly one `{tcp_passive,S}` in the same
+drain, then nothing, and a later `{active,false}` owes no second passive message; a passive socket
+⇒ nothing on this channel; a real datagram ⇒ `{udp,S,{127,0,0,1},<client's own port>,<<"hi">>}`
+with the source port decoded big-endian out of the packed address, an empty datagram ⇒ `<<>>`, and
+UDP `{mode,list}` ⇒ `[104,105]`.
+
+**Two measured differences from the oracle, both recorded by the suite.** (a) A write arriving
+while an `{active,once}`/`{active,N}` grant is spent: the C disarms the descriptor
+(`sock_select(desc, FD_READ, 0)`), so the *re-arm's* inline read delivers those bytes; `beam_io`'s
+poller stays armed, so `async_ready_input` harvests them into the port data queue instead and the
+re-arm's inline burst finds the socket empty. The suite asserts only what both sides agree on (a
+spent grant delivers nothing; the write after a re-arm is delivered), and its oracle case prints
+the oracle's own differing value. (b) `{mode,list}`'s effective mode is not in the packet: see the
+`data_mode` seam below.
+
+**Every `setopts` in the e2e suite is followed by an explicit `PortRegistry::note_inet_setopts`
+with the reply's own success tag** — the documented stand-in for the hook `src/port.rs`'s
+`port_control` will make (`accept_inherit_tests.rs`'s pattern). Once that hook lands, the explicit
+calls are redundant, not wrong.
 
 **`ActiveInputPacket { port, owner, data_mode, kind, event }`** mirrors `CompletionPacket`: the
 owner, the stream mode and the port's **kind** are all resolved at **drain** time
@@ -285,11 +317,14 @@ carries the `owner`/`port` it resolved, so nothing can be re-attributed to a lat
 reuses the number, and the draining `Vec` is the only thing that carried it.
 
 **The mode seam is `PortMeta::data_mode`** (`impl PortMeta`, in `active_input.rs`), whose body is
-`self.stream` today: `{mode, list|binary}` never reaches `beam_io` (`drivers/inet/CONTEXT.md`
-§"Shape"), so a post-`open_port/2` mode change has no home but an Erlang-side `{mode,…}` mirror. It
-is the channel's **single** mode call site, so that mirror is adopted there and nothing else
-changes. Do not add a second `PortMeta::data_mode` in `port.rs` — a duplicate
-inherent method is a compile error.
+`self.stream` today — the port's **open-time** stream option. `{mode, list|binary}` never reaches
+`beam_io` (`drivers/inet/CONTEXT.md` §"Shape"), so a post-`open_port/2` mode change lives only in
+the Erlang-side `{mode,…}` mirror (`inet_opts.rs`), and `prim_inet:open/6` always opens `[binary]`:
+a `{mode,list}` socket is a `[binary]` port whose *driver* holds `INET_MODE_LIST`. The effective
+mode is therefore `PortRegistry::data_mode(id, fallback)` (the mirror), and a delivery arm must
+resolve it before rendering — the e2e suite pins both halves (the packet says `Binary`, the
+resolved mode is `List`, and the rendered payload is a char list). Do not add a second
+`PortMeta::data_mode` in `port.rs` — a duplicate inherent method is a compile error.
 
 **One delivered unit is `beam_io`'s decision, not this module's**: under a framing `{packet, N}`
 one delivery is **one frame** with the framing header **already stripped**, under `{packet, raw}`
@@ -305,8 +340,9 @@ consing / improper lists / list flattening cannot drift into a second byte-list 
 header that is not exactly one packed IPv4 record is a typed gap — an address is the one element
 of `{udp,…}` that must never be invented.
 
-**Wiring still owed by the parent node (`src/port.rs`)** — the module compiles and its suite
-passes without any of it, because the drain is called directly by the tests: (a) call
+**Wiring still owed by the parent node (`src/port.rs`)** — the module compiles and both suites
+pass without any of it, because the drain is called directly by the tests; nothing yet delivers a
+packet into its owner's mailbox: (a) call
 `drain_active_inputs()` immediately after each of the six `drain_io_completions(...)` sites
 (`write_command`'s two branches, `port_control`, `close`, `pump`'s round and `pump`'s "nothing
 live to poll" early return) and hold the returned packets as pending work, and (b) the two
@@ -318,9 +354,11 @@ code (10 of the crate's 31 build warnings, the other 21 being `inet_opts`'s);
 `PortRegistry::has_nothing_to_poll` will then need the pending packets counted (they are not a
 `PortEvent` and so are invisible to `pending_events`).
 
-**Known residual — `hsz > len`.** The C's list branch is `(mode == LIST) || (hsz > len)`, so a
-`{header,N}` wider than the payload is one flat string with no binary tail (the oracle's `"h"`).
-`beam_io`'s `split_payload` clamps `hsz` to the payload and hands that case up as a whole-payload
-header with a present-but-empty body, which renders `[104|<<>>]` where the oracle prints `"h"`.
-Fields are preserved in order and `[list]` mode is exact; closing it needs `beam_io` to carry the
-raw `hsz`.
+**Known residual — `hsz > len`, a `beam_io` seam.** The C's list branch is `(mode == LIST) ||
+(hsz > len)`, so a `{header,N}` wider than the payload is one flat string with no binary tail (the
+oracle's `"h"`). `beam_io`'s `split_payload` clamps `hsz` to the payload and hands that case up as
+a whole-payload header with a present-but-empty body, which renders `[104|<<>>]` where the oracle
+prints `"h"`. Fields are preserved in order and `[list]` mode is exact; closing it needs
+`beam_io` to carry the raw `hsz` (the seam is not revisable from this crate), and every shape the
+e2e suite exercises has `hsz <= len`, so it is not observable over the wire. Pinned at the
+renderer level by `active_input_tests.rs::a_header_as_wide_as_the_payload_keeps_an_empty_binary_tail`.
