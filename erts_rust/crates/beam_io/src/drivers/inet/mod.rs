@@ -2266,10 +2266,16 @@ mod opcode_tests_states;
 #[cfg(test)]
 mod opcode_tests_udp;
 #[cfg(test)]
+#[path = "open_reply_tests.rs"]
+mod open_reply_tests;
+#[cfg(test)]
 #[path = "peer_close_tests.rs"]
 mod peer_close_tests;
 #[cfg(test)]
 mod stat_tests;
+#[cfg(test)]
+#[path = "tcp_shutdown_tests.rs"]
+mod tcp_shutdown_tests;
 #[cfg(test)]
 mod tests;
 
