@@ -199,7 +199,7 @@ pub use monitor::DriverMonitors;
 use beam_common::BeamError;
 use beam_alloc::Heap;
 use beam_io::{DriverContext, Interest, Token};
-use beam_process::ProcessId;
+use beam_process::{PortId, ProcessId};
 use beam_term::{make_atom, refc::ERL_ONHEAP_BINARY_LIMIT, Atom, AtomTable, Eterm};
 
 use super::ProcessLiveness;
@@ -574,6 +574,92 @@ impl BusyFlag {
     }
 }
 
+/// The **`ERL_DRV_PORT` resolution state** of one driver port — the two facts a host cannot observe
+/// about itself.
+///
+/// The C idiom for naming a port inside a driver-emitted term is `{ERL_DRV_PORT,
+/// driver_mk_port(port)}` (`erl_driver.h:523`), and its operand is the port's **id term**: the C
+/// decoder checks it with `is_internal_port` (`io.c:5744-5747`) and answers `NIL` for an invalid
+/// handle (`erts_drvport2port`, `io.c:7295-7303`). This crate's `driver_mk_port` answers the
+/// **handle** encoding instead (a port handle here *is* the [`DriverEnv`] address,
+/// [`DriverEnv::as_port`]) because the term-data layer has no port table, so
+/// `decode_term_spec` resolves a non-port operand back through [`DriverHost::port_term`].
+///
+/// The host cannot answer that hook on its own: it is reached *through* the environment and is never
+/// told the environment's address, nor the [`PortId`] the registry allocated for it. Both are known
+/// in exactly one place — `DriverPortAdapter::start`, which builds the environment inside the port's
+/// `beam_io::Driver::start`, where [`beam_io::DriverContext::port`] reports the id. So the state
+/// lives on this shared handle: [`DriverPort::port_terms`] seizes it **before** the host is boxed
+/// into the port lifecycle (the boxed driver exposes no host, exactly like
+/// [`DriverPort::term_queue`] and [`DriverPort::busy_flag`]), the adapter stamps the pair, and the
+/// hook reads it back.
+///
+/// A port that has left the runtime must stop resolving: [`DriverPort::clear_driver_state`] latches
+/// [`PortTerms::mark_gone`], which is what keeps a driver that cached its `ErlDrvPort` in its
+/// private state from turning it back into a dead port's id term. A host nobody stamped — a bare
+/// host in a unit test — answers `None`, and the decoder then refuses the whole spec
+/// (the C's `ERTS_DDT_FAIL`: `-1`, nothing delivered), never a wrong term.
+#[derive(Debug)]
+pub struct PortTerms {
+    /// The environment address this host published as its `ErlDrvPort` (`0` = unpublished).
+    env: Cell<usize>,
+    /// The port id that handle stands for — stamped together with `env`, never alone.
+    port: Cell<Option<PortId>>,
+    /// Whether the port has left the runtime (see [`PortTerms::mark_gone`]).
+    gone: Cell<bool>,
+}
+
+impl PortTerms {
+    /// A fresh, **unpublished** state: no handle, no port id, live. The state of a host the port
+    /// lifecycle has not stamped yet.
+    pub fn new() -> PortTerms {
+        PortTerms {
+            env: Cell::new(0),
+            port: Cell::new(None),
+            gone: Cell::new(false),
+        }
+    }
+
+    /// Publishes the environment address this host's `ErlDrvPort` **is** — the value
+    /// [`DriverEnv::as_port`] answers (`driver/start`, the one place it can be observed).
+    pub fn set_env(&self, env: usize) {
+        self.env.set(env);
+    }
+
+    /// Records the port id that published handle stands for — the [`PortId`] `beam_io` allocated
+    /// before it ran `Driver::start`.
+    pub fn set_port(&self, port: PortId) {
+        self.port.set(Some(port));
+    }
+
+    /// Latches "this port has left the runtime": the handle it published resolves to nothing from
+    /// here on (the C's `NIL`, `erts_drvport2port`, `io.c:7295-7303`). One-way — a port number that
+    /// is later reused belongs to a *different* port with its own state.
+    pub fn mark_gone(&self) {
+        self.gone.set(true);
+    }
+
+    /// The id term for `handle` when it is **this** port's published environment, or `None`.
+    ///
+    /// `handle` is opaque: it is compared against the address this host published and is **never**
+    /// dereferenced — the hook's own contract, and the reason a stale or foreign handle can never
+    /// be mistaken for a port. A null handle, an unpublished host, a host that has only half the
+    /// pair stamped, and a port that has gone away all answer `None`, which the decoder turns into a
+    /// refused spec rather than a fabricated port term.
+    pub fn resolve(&self, handle: usize) -> Option<Eterm> {
+        if handle == 0 || self.gone.get() || handle != self.env.get() {
+            return None;
+        }
+        self.port.get().map(PortId::to_eterm)
+    }
+}
+
+impl Default for PortTerms {
+    fn default() -> PortTerms {
+        PortTerms::new()
+    }
+}
+
 /// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
 ///
 /// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
@@ -684,6 +770,15 @@ pub struct DriverPort {
     /// test, or a port opened before any port round ran — keeps the viewless
     /// [`ProcessLiveness::new`], whose `is_alive` answers `None`.
     liveness: Rc<ProcessLiveness>,
+    /// The port's **`ERL_DRV_PORT` resolution state** — the environment address this host published
+    /// as its `ErlDrvPort` and the [`PortId`] it stands for (see [`PortTerms`]).
+    ///
+    /// Shared by `Rc` between the host (which [`DriverHost::port_term`] reads) and the port
+    /// lifecycle, which stamps the pair from `DriverPortAdapter::start` — the only place the
+    /// environment's address and the registry's port id are both in hand. Seized with
+    /// [`DriverPort::port_terms`] before the host is boxed into the port lifecycle, exactly like
+    /// [`DriverPort::term_queue`]. A host nobody stamped answers `None`, never a fabricated port.
+    port_terms: Rc<PortTerms>,
 }
 
 impl DriverPort {
@@ -712,6 +807,9 @@ impl DriverPort {
             // No observation has been published yet: a host nobody claims answers "monitor anyway"
             // rather than fabricating a `NotAlive` (see [`ProcessLiveness`]).
             liveness: ProcessLiveness::new(),
+            // Unpublished until the port lifecycle builds the environment and stamps the pair
+            // (`DriverPortAdapter::start`): half a pair must never fabricate the other half.
+            port_terms: Rc::new(PortTerms::new()),
         }
     }
     /// Records whether the loaded driver entry declares an [`ErlDrvEntry::process_exit`] slot (see
@@ -758,8 +856,26 @@ impl DriverPort {
 
     /// Drops the per-port driver-private state: the port (and the driver) is going away, so its
     /// queue must not outlive it.
+    ///
+    /// It also latches the port **gone** on the [`PortTerms`] handle, so the environment address
+    /// this host published stops resolving to an id term (the C's `NIL`,
+    /// `erts_drvport2port`, `io.c:7295-7303`). Both callers are teardown
+    /// (a driver port's `stop` and its `Drop`), which is exactly when the C's port struct is gone.
     pub fn clear_driver_state(&mut self) {
         self.queue.clear();
+        self.port_terms.mark_gone();
+    }
+
+    /// The port's [`PortTerms`] handle — the state behind [`DriverHost::port_term`], stamped by the
+    /// port lifecycle with the environment address and the registry's [`PortId`] (see
+    /// [`PortTerms`]).
+    ///
+    /// Taken **before** the host is boxed into a port (the boxed driver is reached through
+    /// [`beam_io::Driver`], which exposes no host), exactly like [`DriverPort::term_queue`]: the
+    /// stamp lands on this very handle, so the caller observes it without reaching the host — which
+    /// is also how the hook, reached *through* the environment, reads it.
+    pub fn port_terms(&self) -> Rc<PortTerms> {
+        Rc::clone(&self.port_terms)
     }
 
     /// The port's [`TermQueue`] — the handle a driver callback's `erl_drv_output_term` /
@@ -1391,6 +1507,24 @@ impl DriverHost for DriverPort {
     /// one process, so this is the same pid [`DriverPort::connected_pid`] answers with.
     fn caller_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
         Some(self.owner.to_eterm())
+    }
+
+    /// The port's own **id term** — the `ERL_DRV_PORT` term-data operand of
+    /// `{ERL_DRV_PORT, driver_mk_port(port)}` (`erl_driver.h:523`).
+    ///
+    /// The C's operand there is the *id term* (`io.c:5969-5972`) and the decoder checks it with
+    /// `is_internal_port` (`io.c:5744-5747`); `driver_mk_port` here answers the **handle** encoding
+    /// instead (a port handle is the [`DriverEnv`] address, [`DriverEnv::as_port`]), so the decoder
+    /// resolves it back through this hook and refuses the whole spec (`ERTS_DDT_FAIL`, `-1`,
+    /// nothing delivered) unless an internal port comes back.
+    ///
+    /// `port` is **opaque**: it is compared against the address this host published through
+    /// [`PortTerms`] and is never dereferenced — the hook's own contract. `None` (the C's `NIL` via
+    /// `erts_drvport2port`, `io.c:7295-7303`) for any other handle, for a null one, for a host the
+    /// port lifecycle never stamped, and for a port that has gone away
+    /// ([`DriverPort::clear_driver_state`]) — never a fabricated port term.
+    fn port_term(&mut self, port: ErlDrvPort) -> Option<Eterm> {
+        self.port_terms.resolve(port as usize)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2228,6 +2362,14 @@ impl beam_io::Driver for DriverPortAdapter {
         let mut env = Box::new(driver.host_mut().environment());
         let port = env.as_port();
         self.env = Some(env);
+        // The only place the two facts the `ERL_DRV_PORT` hook needs first coexist: the environment's
+        // own address (what `ErlDrvPort` **is**) and the port id `beam_io` allocated *before* it ran
+        // `Driver::start`. The handle was seized from the host before `load` boxed it, so this write
+        // lands on the very state `DriverPort::port_term` reads. Nothing is stamped when `start`
+        // refuses the port below: a port that never came up publishes no handle.
+        let port_terms = driver.host_mut().port_terms();
+        port_terms.set_env(port as usize);
+        port_terms.set_port(ctx.port());
         let command = std::ffi::CString::new(self.command.as_str()).map_err(|_| BeamError::BadArg)?;
         let data = publishing(driver, |library| {
             library.start(port, command.as_ptr() as *mut std::os::raw::c_char)
@@ -2653,6 +2795,12 @@ mod liveness_tests;
 #[cfg(test)]
 mod ddll_tests;
 
+/// The A.4 **`ERL_DRV_PORT` term-data operand regression suite** for [`DriverPort`]'s
+/// [`beam_abi::DriverHost::port_term`] hook — the C idiom `{ERL_DRV_PORT,
+/// driver_mk_port(port)}`, resolved from the [`PortTerms`] handle the port lifecycle stamps. A
+/// separate file so the C fixture it compiles does not grow this one.
+#[cfg(test)]
+mod port_term_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
