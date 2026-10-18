@@ -88,6 +88,17 @@ use super::PortRegistry;
 /// `src/port/inet_opts.rs`, beside the rest of the port layer.
 #[path = "inet_opts.rs"]
 pub(crate) mod inet_opts;
+/// The driver→owner **`{active, …}` input channel** — `beam_io`'s term-free active deliveries
+/// turned into the `{tcp, S, Data}` / `{udp, S, IP, Port, Data}` / `{tcp_passive, S}` /
+/// `{udp_passive, S}` messages a socket port's owner is owed.
+///
+/// Declared here, as a child of this module, rather than beside `port.rs`'s other `mod`
+/// declarations: its drain method is a sibling of this module's own post-`open_port/2` port
+/// operations (it binds a delivery to its recipient from the same port metadata they read), and
+/// the `#[path]` keeps the source at `src/port/active_input.rs`, beside the rest of the port
+/// layer.
+#[path = "active_input.rs"]
+pub(crate) mod active_input;
 /// The port state `port_set_data/2`, `register/2` and `port_connect/2` establish after a
 /// port is open — the part of a port that is *not* `open_port/2`'s.
 ///

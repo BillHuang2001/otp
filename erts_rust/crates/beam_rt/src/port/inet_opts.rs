@@ -174,23 +174,36 @@ const INET_LOPT_TCP_READ_AHEAD: u8 = 49;
 
 // The **variable-length** codes: the five-byte record plus a payload. Their lengths are the C's own
 // (`inet_set_opts`), and the walker must step over them exactly or every following record would be
-// mis-parsed.
+// mis-parsed — so each constant below spells out the payload it carries.
 
-/// `INET_OPT_LINGER` (3) — `[opt, val_be32, l_linger_be32]` (`inet_drv.c:877`).
+/// `INET_OPT_LINGER` (3) — `[opt, onoff_be32, l_linger_be32]`, four payload bytes
+/// (`inet_drv.c:877`; the arm at `:7363-7369`).
 const INET_OPT_LINGER: u8 = 3;
-/// `INET_OPT_MULTICAST_IF` (11) — `[opt, val_be32, 12 bytes]` (`inet_drv.c:888`).
+/// `UDP_OPT_MULTICAST_IF` (11) — `[opt, addr_be32]`, a **whole** record (see [`record_len`])
+/// (`inet_drv.c:885`).
 const INET_OPT_MULTICAST_IF: u8 = 11;
-/// `INET_OPT_ADD_MEMBERSHIP` (14) — `[opt, val_be32, 12 bytes]` (`inet_drv.c:894`).
+/// `UDP_OPT_ADD_MEMBERSHIP` (14) — `[opt, domain_be32, payload…]`, the payload's own span being
+/// domain-dependent (`inet_drv.c:888`; the arm at `:7619-7642`).
 const INET_OPT_ADD_MEMBERSHIP: u8 = 14;
-/// `INET_OPT_DROP_MEMBERSHIP` (15) — `[opt, val_be32, 12 bytes]` (`inet_drv.c:895`).
+/// `UDP_OPT_DROP_MEMBERSHIP` (15) — as [`INET_OPT_ADD_MEMBERSHIP`] (`inet_drv.c:889`; the arm at
+/// `:7644-7667`).
 const INET_OPT_DROP_MEMBERSHIP: u8 = 15;
-/// `INET_OPT_RAW` (34) — `[opt, val_be32, level_be32, name_len_be32, name bytes]`
-/// (`inet_drv.c:901`).
+/// `INET_OPT_RAW` (34) — `[opt, proto_be32, type_be32, arg_sz_be32, arg bytes]`
+/// (`inet_drv.c:909`; the arm at `:7825-7845`).
 const INET_OPT_RAW: u8 = 34;
-/// `INET_LOPT_NETNS` (38) — `[opt, len_be32, path bytes]` (`inet_drv.c:914`).
+/// `INET_LOPT_NETNS` (38) — `[opt, len_be32, path bytes]` (`inet_drv.c:913`; the arm at
+/// `:7152-7168`).
 const INET_LOPT_NETNS: u8 = 38;
-/// `INET_OPT_BIND_TO_DEVICE` (42) — `[opt, len_be32, device name bytes]` (`inet_drv.c:912`).
+/// `INET_OPT_BIND_TO_DEVICE` (42) — `[opt, len_be32, device name bytes]` (`inet_drv.c:917`; the
+/// arm at `:7848-7862`).
 const INET_OPT_BIND_TO_DEVICE: u8 = 42;
+
+/// `INET_AF_INET` (1) and `INET_AF_INET6` (2) — the two membership domains, which a membership
+/// record's value word names and which decide that record's payload span
+/// (`inet_drv.c:757-758`, see [`record_len`]).
+const INET_AF_INET: i32 = 1;
+/// See [`INET_AF_INET`].
+const INET_AF_INET6: i32 = 2;
 
 /// `INET_MULTI` (3) — the `{active, N}` value whose record carries the trailing counter
 /// (`inet_drv.c:780`).
@@ -263,10 +276,12 @@ impl InetOptions {
     /// Nothing is stored when
     ///
     /// * the argument is empty (a `setopts` of no options inherits nothing), or
-    /// * the argument cannot be walked into whole records ([`walk`]'s conservative rule): a
+    /// * the argument cannot be walked into whole records ([`walk`]'s conservative rules): a
     ///   truncated or unrecognised variable-length record would make every following record's start
-    ///   ambiguous, and storing a mis-split record list would corrupt the replay. Dropping the
-    ///   whole argument is the only safe answer — the port keeps whatever it already had.
+    ///   ambiguous, and a leftover tail shorter than one record means the argument is not a whole
+    ///   number of records at all. Storing a mis-split record list would corrupt the replay.
+    ///   Dropping the whole argument is the only safe answer — the port keeps whatever it already
+    ///   had.
     fn record(&mut self, number: u64, arg: &[u8]) -> bool {
         if arg.is_empty() {
             return false;
@@ -469,8 +484,8 @@ pub(crate) fn is_setopts_control(op: &str) -> bool {
 ///
 /// The walk is the C's (`inet_set_opts`, `inet_drv.c:6908`): while at least [`RECORD`] bytes remain,
 /// take the code and the big-endian value word, then step over the record's **whole** length —
-/// [`RECORD`] for every fixed-length code and the code-specific payload for the seven variable-length
-/// ones ([`record_len`]).
+/// [`RECORD`] for every fixed-length code and the code-specific payload for the variable-length ones
+/// ([`record_len`]).
 ///
 /// The conservative rule: a record whose length is not determinable from the bytes actually present
 /// (a negative or oversized length word, a truncated payload) makes the walk answer `None`, and
@@ -478,6 +493,23 @@ pub(crate) fn is_setopts_control(op: &str) -> bool {
 /// garbage onto an accepted socket, which is worse than inheriting nothing. The C cannot hit this
 /// from `prim_inet` (it sends whole records), but a driver-level caller can, and a truncated
 /// argument is a value the driver did not fully apply either.
+///
+/// # The tail rule
+///
+/// The C's loop is `while (len >= 5)` (`inet_drv.c:6908`): when fewer than five bytes remain it is
+/// left (`:7943`) and the call still **succeeds** (its final `return 0`, `:7987`), so a trailing
+/// partial record is silently ignored by the driver. The walk is stricter — a non-empty tail after
+/// the loop answers `None`.
+///
+/// The difference is what the answer is *for*. The C has already applied the whole records it
+/// consumed, so ignoring a tail costs it nothing. This walker's output is instead **replayed** onto
+/// another socket, and an argument that is not a whole number of records did not come from the
+/// record encoder (`prim_inet:encode_opt_val/1`, `erts/preloaded/src/prim_inet.erl:2398-2435`,
+/// which emits whole records only): caller and driver disagree about the layout, and what the driver
+/// consumed is not recoverable from what was left — one arm does not even keep the remaining length
+/// honest (`len -= len;` in the IPv6 membership arm, `inet_drv.c:7780`). Replaying the subset that
+/// happens to parse would therefore claim a configuration the listener need not have, so a
+/// truncated argument records **nothing**, exactly as an undeterminable record span does.
 fn walk(arg: &[u8]) -> Option<Vec<RecordBytes<'_>>> {
     let mut rest = arg;
     let mut records = Vec::new();
@@ -495,38 +527,63 @@ fn walk(arg: &[u8]) -> Option<Vec<RecordBytes<'_>>> {
         });
         rest = &rest[step..];
     }
-    Some(records)
+    if rest.is_empty() {
+        Some(records)
+    } else {
+        None
+    }
 }
 
 /// The whole length of the record at the head of `rest`, or `None` when it cannot be determined
 /// from the bytes present.
 ///
-/// The seven variable-length codes and their payloads are the C's own:
+/// `rest` starts at the record's own `[opt, val_be32]`, so every span below is [`RECORD`] plus the
+/// payload, and each is the C's own — read from the arm the code selects inside `inet_set_opts`
+/// (the loop has already consumed the five-byte head, so the arm's `len` is what follows it):
 ///
-/// * `linger` (3) — five plus the four-byte `l_linger` (`inet_drv.c:7004`);
-/// * `multicast_if` (11), `add_membership` (14), `drop_membership` (15) — five plus twelve
-///   (`:7100`, `:7130`);
+/// * `linger` (3) — five plus the four-byte `l_linger` (`inet_drv.c:7363-7369`: `if (len < 4)
+///   return -1`, then `ptr += 4`).
+/// * `add_membership` (14) / `drop_membership` (15) — five plus a **domain-dependent** payload
+///   (`:7668-7801`): twelve for `INET_AF_INET` (ifindex, multiaddr, local address — three
+///   `get_int32`s, `:7703-7711`), twenty for `INET_AF_INET6` (ifindex plus the sixteen-byte group
+///   address, `:7778-7779`). Any other domain is a `-1` from the driver (`:7639-7641`,
+///   `:7664-7666`), so its span is undeterminable and the walk answers `None`; `prim_inet`'s
+///   encoder agrees with both spans (`enc_value_2(membership, …)`,
+///   `erts/preloaded/src/prim_inet.erl:2182-2212`).
 /// * `{active, N}` (22) when the value is `INET_MULTI` (3) — five plus the two-byte counter
-///   (`:6977`);
-/// * `raw` (34) — five plus eight plus the operand's own length word (`:7010`);
-/// * `{netns, …}` (38) and `bind_to_device` (42) — five plus the length word's value (`:7040`,
-///   `:7120`).
+///   (`:6977-6979`).
+/// * `raw` (34) — five plus eight plus the operand's own length word (`:7830-7844`): the arm
+///   reads `proto = ival`, then `type`, then `arg_sz` — so the **second** extra word is the span,
+///   not the first.
+/// * `{netns, …}` (38) and `bind_to_device` (42) — five plus the length word's value (`:7157-7167`,
+///   `:7853-7861`).
+///
+/// `multicast_if` (11) is **not** one of them: it is a whole [`RECORD`], because the C's arm only
+/// re-reads the value it already has (`ival`, the address, `:7589-7617`) and steps over nothing, and
+/// `prim_inet` encodes that address as exactly the four value bytes (`enc_value_2(mif, …)`,
+/// `prim_inet.erl:2178-2181`).
 ///
 /// Every other code occupies exactly [`RECORD`] bytes. A length word that is negative or does not
 /// fit the bytes present answers `None` (see [`walk`]).
 fn record_len(code: u8, value: i32, rest: &[u8]) -> Option<usize> {
     match code {
         INET_OPT_LINGER => Some(RECORD + 4),
-        INET_OPT_MULTICAST_IF | INET_OPT_ADD_MEMBERSHIP | INET_OPT_DROP_MEMBERSHIP => {
-            Some(RECORD + 12)
-        }
+        // A whole record: the arm reads no payload at all.
+        INET_OPT_MULTICAST_IF => Some(RECORD),
+        INET_OPT_ADD_MEMBERSHIP | INET_OPT_DROP_MEMBERSHIP => match value {
+            INET_AF_INET => Some(RECORD + 12),
+            INET_AF_INET6 => Some(RECORD + 20),
+            _ => None,
+        },
         INET_LOPT_ACTIVE if value == INET_MULTI => Some(RECORD + ACTIVE_COUNTER),
         INET_LOPT_NETNS | INET_OPT_BIND_TO_DEVICE => {
             let payload = usize::try_from(value).ok()?;
             RECORD.checked_add(payload)
         }
         INET_OPT_RAW => {
-            let length = rest.get(RECORD..RECORD + 4)?;
+            // `[opt, proto, type, arg_sz, arg…]`: `type` and `arg_sz` are the two extra words, and
+            // the C's `if (len < 8)` (`:7830`) is the same requirement as needing both present.
+            let length = rest.get(RECORD + 4..RECORD + 8)?;
             let operand = u32::from_be_bytes([length[0], length[1], length[2], length[3]]);
             RECORD.checked_add(8)?.checked_add(usize::try_from(operand).ok()?)
         }

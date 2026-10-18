@@ -58,13 +58,20 @@
 //! driver stages a delivery from `output` and one from its `stop`, so both halves run through
 //! production code.
 
-use beam_io::{ActiveInputEvent, Driver, DriverContext, ReadMessage};
+use std::cell::Cell;
+use std::collections::VecDeque;
 
-use super::active_input::{
-    decode_packed_address, kind_of_driver, ActiveInputPacket, ActivePortKind,
-};
-use super::*;
+use beam_common::{BeamError, Result};
+use beam_engine::terms;
+use beam_io::{ActiveInputEvent, Driver, DriverContext, ReadMessage};
+use beam_process::{PortId, ProcessId};
+use beam_term::{make_small, Eterm};
+
+use super::{decode_packed_address, kind_of_driver, ActiveInputPacket, ActivePortKind};
 use crate::config::RuntimeConfig;
+use crate::port::driver_path_name;
+use crate::port::{PortMeta, PortName, PortRegistry, RuntimeContext, StreamType};
+use crate::Runtime;
 
 // -----------------------------------------------------------------------------------------------
 // Helpers shared by both halves
@@ -334,9 +341,9 @@ fn a_udp_delivery_names_the_source_address_as_a_tuple_and_a_big_endian_port() {
         "the address is a 4-element tuple, not a list or a binary"
     );
     assert_eq!(
-        element(message, 3).to_raw() & 0xfff,
-        23456,
-        "the source port is a small integer in big-endian byte order"
+        element(message, 3),
+        make_small(23456),
+        "the source port is the small integer 23456, decoded big-endian (`0x5BA0`)"
     );
     assert_eq!(
         terms::binary_bytes(element(message, 4)).expect("a `[binary]` datagram payload"),
@@ -593,22 +600,11 @@ fn registry_with(
     (registry, id)
 }
 
-/// The active-input packets among `events`, in report order.
-fn packets(events: Vec<PortEvent>) -> Vec<ActiveInputPacket> {
-    events
-        .into_iter()
-        .filter_map(|event| match event {
-            PortEvent::ActiveInput { packet } => Some(packet),
-            _ => None,
-        })
-        .collect()
-}
-
 /// A live port's `{active, …}` delivery is bound to that port's **owner**, **stream mode** and
 /// **socket kind** at drain time.
 ///
 /// This is the ordinary path: a socket driver's read-readiness callback stages the delivery, and
-/// the round's drain (right beside the completion channel's) resolves the recipient while the
+/// the drain's own reader (right beside the completion channel's) resolves the recipient while the
 /// metadata is still readable.
 #[test]
 fn a_live_ports_delivery_is_bound_to_its_owner_mode_and_kind_at_drain_time() {
@@ -622,7 +618,7 @@ fn a_live_ports_delivery_is_bound_to_its_owner_mode_and_kind_at_drain_time() {
     registry
         .write_command(id, b"")
         .expect("the command reaches the driver");
-    let packets = packets(registry.drain_pending_events());
+    let packets = registry.drain_active_inputs();
     assert_eq!(packets.len(), 1, "exactly one delivery, reported once");
     assert_eq!(packets[0].port, id, "the port the driver belongs to");
     assert_eq!(packets[0].owner, OWNER, "the drain binds the port's owner");
@@ -641,6 +637,10 @@ fn a_live_ports_delivery_is_bound_to_its_owner_mode_and_kind_at_drain_time() {
         ActiveInputEvent::Data(read),
         "the driver's own delivery, untouched"
     );
+    assert!(
+        registry.drain_active_inputs().is_empty(),
+        "the delivery is consumed by the drain, never reported twice"
+    );
 }
 
 /// A `udp_inet` port's delivery is bound to the `Udp` kind, so the drain is what decides the
@@ -655,7 +655,7 @@ fn a_udp_ports_delivery_is_bound_to_the_udp_kind() {
         "udp_inet",
     );
     registry.write_command(id, b"").expect("the command");
-    let packets = packets(registry.drain_pending_events());
+    let packets = registry.drain_active_inputs();
     assert_eq!(packets.len(), 1);
     assert_eq!(packets[0].kind, ActivePortKind::Udp);
     assert_eq!(packets[0].data_mode, StreamType::List);
@@ -689,56 +689,70 @@ fn a_delivery_for_a_port_that_has_left_the_runtime_is_dropped_once_and_never_re_
     );
 }
 
-/// A delivery the drain has staged but no pump has reported yet keeps the runtime **polling**: it
-/// is a message its owner is still owed, so [`PortRegistry::has_nothing_to_poll`] answers `false`
-/// until a pump has handed it over.
+/// A delivery the drain has already reported needs **nothing** from the port table: the packet
+/// names its recipient, its stream mode and its socket kind itself, so a close that happens
+/// afterwards cannot strand it or take it back.
 ///
-/// This is what makes an `{active, …}` message deliverable on the scheduler route — a runtime that
-/// decided "nothing is live, nothing to poll" would strand it.
+/// This is what makes a drained delivery *owed work* rather than a cached port read — the caller
+/// holds a message its owner is still due until it delivers it, whatever happens to the port in
+/// the meantime.
 #[test]
-fn a_buffered_active_delivery_keeps_the_runtime_polling() {
-    let mut registry = PortRegistry::new().expect("a port registry");
-    assert!(
-        registry.has_nothing_to_poll(),
-        "an empty registry has nothing to wait on"
+fn a_delivery_drained_before_a_close_is_still_deliverable_after_it() {
+    let mut fixture = Fixture::new();
+    let read = ReadMessage::body_only(b"hi".to_vec());
+    let (mut registry, id) = registry_with(
+        ActiveDriver::delivering(ActiveInputEvent::Data(read)),
+        fixture.owner,
+        StreamType::Binary,
+        "tcp_inet",
     );
-    registry.pending_events.push(PortEvent::ActiveInput {
-        packet: ActiveInputPacket {
-            port: PortId::new(3),
-            owner: OWNER,
-            data_mode: StreamType::Binary,
-            kind: ActivePortKind::Tcp,
-            event: ActiveInputEvent::Passive,
-        },
-    });
+    registry
+        .write_command(id, b"")
+        .expect("the command reaches the driver");
+    let packets = registry.drain_active_inputs();
+    assert_eq!(packets.len(), 1, "the drain reports the staged delivery");
+    registry.close(id).expect("the port closes");
     assert!(
-        !registry.has_nothing_to_poll(),
-        "a buffered active delivery is pending work, not an idle port"
+        registry.drain_active_inputs().is_empty(),
+        "the close staged nothing further: the packet above is the only one"
     );
-    let packets = packets(registry.drain_pending_events());
-    assert_eq!(packets.len(), 1, "the pump reports it exactly once");
-    assert_eq!(packets[0].owner, OWNER);
-    assert!(
-        registry.has_nothing_to_poll(),
-        "and only once it has been reported is there nothing left to poll for"
+    // The reported packet still renders to the oracle's message, naming the port that has just
+    // gone — every fact the rendering needs was resolved by the drain.
+    let message = fixture.message(&packets[0]);
+    assert_eq!(arity(message), 3, "{{tcp, S, Data}} is a 3-tuple");
+    fixture.assert_atom("the tag", element(message, 0), "tcp");
+    assert_eq!(
+        element(message, 1),
+        id.to_eterm(),
+        "the closed port is still the message's `S`, resolved at drain time"
+    );
+    assert_eq!(
+        terms::binary_bytes(element(message, 2)).expect("a `[binary]` delivery is one binary"),
+        b"hi",
+        "and the payload the driver handed up"
     );
 }
 
-/// An active delivery **rides `pending_events` like a completion**, so the close's purge of the
-/// closing port's retained events does not drop it (the recipient is already resolved) — the rule
-/// [`PortEvent::port`] encodes by answering `None` for both.
+/// A packet names its port from **its own** `PortId`, never by looking one up, so no close can
+/// re-attribute or purge a delivery: rendering a packet for a port this runtime has never held
+/// still names that exact port.
 #[test]
-fn an_active_delivery_answers_no_port_so_a_close_cannot_purge_it() {
+fn an_active_packet_names_its_port_from_the_packet_not_a_port_table() {
+    let mut fixture = Fixture::new();
+    let port = PortId::new(9);
     let packet = ActiveInputPacket {
-        port: PortId::new(9),
+        port,
         owner: OWNER,
         data_mode: StreamType::Binary,
         kind: ActivePortKind::Udp,
         event: ActiveInputEvent::Passive,
     };
+    let message = fixture.message(&packet);
+    assert_eq!(arity(message), 2, "{{udp_passive, S}} is a 2-tuple");
+    fixture.assert_atom("the passive tag", element(message, 0), "udp_passive");
     assert_eq!(
-        PortEvent::ActiveInput { packet }.port(),
-        None,
-        "the recipient is resolved at drain time, so there is no port to re-derive"
+        element(message, 1),
+        port.to_eterm(),
+        "the `S` element is the packet's own port id, never one re-derived from a table"
     );
 }

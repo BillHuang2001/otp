@@ -47,10 +47,13 @@
 //!    [`beam_io::PortRegistry::take_active_inputs`] has staged and bind each delivery to the
 //!    facts its rendering still needs (`owner`, the stream mode, the port's **kind**) *now*,
 //!    while the port's metadata is still readable.
-//! 2. Ride [`PortEvent::ActiveInput`](super::PortEvent) through
-//!    [`pending_events`](super::PortRegistry), exactly like
-//!    [`PortEvent::Completion`](super::PortEvent), so both delivery routes and
-//!    [`PortRegistry::has_nothing_to_poll`](super::PortRegistry) see it with no new plumbing.
+//! 2. **Report** ([`PortRegistry::drain_active_inputs`] returns them) — a drained
+//!    [`ActiveInputPacket`] is this module's own term-free output, and the caller (the port
+//!    provider, `crate::port`) wraps each packet in its own event and delivers it to
+//!    `packet.owner`, exactly as it does for a
+//!    [`CompletionPacket`](crate::port::completion::CompletionPacket). Nothing here touches an
+//!    event enum or a `pending_events` queue: the packet already names its recipient, its stream
+//!    mode and its socket kind, so the provider needs no second table read to deliver it.
 //! 3. **Render** ([`RuntimeContext::active_input_message`]) — build the Erlang tuple, after the
 //!    registry's borrow has been released, on the runtime's pointer-stable `-eval` arena and
 //!    through the **same** stream shaper every other port message uses.
@@ -70,18 +73,19 @@
 //! runtime decides list vs binary, and the C's rule is
 //! `(desc->mode == INET_MODE_LIST) || (hsz > len)` ⇒ one flat char list
 //! (`tcp_message`, `inet_drv.c:3985`) — which is exactly
-//! [`RuntimeContext::make_stream_payload`](super::RuntimeContext)'s `[list]` arm, so the shaper
-//! is reused rather than reimplemented.
+//! [`RuntimeContext::make_stream_payload`](crate::port::RuntimeContext)'s `[list]` arm, so the
+//! shaper is reused rather than reimplemented.
 //!
-//! There is exactly **one** call site for the mode ([`PortMeta::data_mode`](super::PortMeta)),
-//! so a `{mode, …}` `setopts` mirror can be adopted there later without touching this module.
+//! There is exactly **one** call site for the mode
+//! ([`PortMeta::data_mode`](crate::port::PortMeta)), so a `{mode, …}` `setopts` mirror can be
+//! adopted there later without touching this module.
 //!
 //! # Where the drain happens
 //!
 //! An active delivery is staged by the same driver callbacks a completion is staged from
 //! (`ready_input`, and a `setopts` control op that reads inline), so the drain follows **every**
 //! point a driver callback can run — immediately beside each
-//! [`PortRegistry::drain_io_completions`](super::PortRegistry) call: [`write_command`]'s two
+//! [`PortRegistry::drain_io_completions`](crate::port::PortRegistry) call: [`write_command`]'s two
 //! branches, [`port_control`], [`close`], [`pump`]'s round and [`pump`]'s "nothing live to poll"
 //! early return. `beam_io` keeps a staged delivery on the port until it is drained and reports
 //! deliveries harvested from ports closed since the last drain
@@ -93,24 +97,23 @@
 //! The owner and the mode are resolved at **drain** time. A delivery whose port has no metadata
 //! any more — the port was closed while its delivery was still staged — has no recoverable
 //! recipient and is dropped, the rule the completion channel applies to a completion with no
-//! recipient and the rule [`PortRegistry::close`](super::PortRegistry) applies to an already
-//! harvested event for the closing port. Because [`PortEvent::ActiveInput`](super::PortEvent)
-//! answers `None` from `PortEvent::port()`, a dropped delivery can never be re-attributed to a
-//! later port that **reuses** that number: the drop is final and the draining `Vec` is what
-//! carried it.
+//! recipient and the rule [`PortRegistry::close`](crate::port::PortRegistry) applies to an already
+//! harvested event for the closing port. And because a packet carries the `owner` it resolved at
+//! drain time, a dropped delivery can never be re-attributed to a later port that **reuses** that
+//! number: the drop is final and the draining `Vec` is what carried it.
 //!
-//! [`write_command`]: super::PortRegistry
-//! [`port_control`]: super::PortRegistry
-//! [`close`]: super::PortRegistry
-//! [`pump`]: super::PortRegistry
+//! [`write_command`]: crate::port::PortRegistry
+//! [`port_control`]: crate::port::PortRegistry
+//! [`close`]: crate::port::PortRegistry
+//! [`pump`]: crate::port::PortRegistry
 
 use beam_io::{ActiveInput, ActiveInputEvent, ReadMessage};
 use beam_process::{PortId, ProcessId};
 use beam_term::{make_atom, make_small, Eterm};
 
-use super::completion::terms_tuple;
-use super::{driver_path_name, PortEvent, PortMeta, PortRegistry, RuntimeContext, StreamType};
 use crate::error;
+use crate::port::completion::terms_tuple;
+use crate::port::{driver_path_name, PortMeta, PortRegistry, RuntimeContext, StreamType};
 
 /// The address tag of an explicit IPv4 address in the packed-address record (`INET_AF_INET`,
 /// `erts/emulator/drivers/common/inet_drv.c:757`) — the only family
@@ -134,8 +137,8 @@ const PACKED_IPV4_ADDRESS_LEN: usize = 7;
 /// `packet_binary_message` at the delivery sites), and a driver cannot spell that: the channel
 /// is deliberately term-free, so `beam_io` hands up one `ActiveInputEvent` vocabulary and the
 /// **runtime** names the message. The kind is therefore resolved here, from the port's driver
-/// name ([`PortMeta::command`](super::PortMeta), whose first blank-separated word is the driver
-/// name — the same rule the driver search applies, [`driver_path_name`]).
+/// name ([`PortMeta::command`](crate::port::PortMeta), whose first blank-separated word is the
+/// driver name — the same rule the driver search applies, [`driver_path_name`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActivePortKind {
     /// A `tcp_inet` port: `{tcp, S, Data}` / `{tcp_passive, S}`.
@@ -183,7 +186,7 @@ impl PortMeta {
 /// One drained `{active, …}` delivery, bound to the port that produced it **and** to everything
 /// its rendering still needs once that port's metadata may be gone.
 ///
-/// Shaped exactly like [`CompletionPacket`](super::completion::CompletionPacket): the
+/// Shaped exactly like [`CompletionPacket`](crate::port::completion::CompletionPacket): the
 /// `owner`/`data_mode`/`kind` triple is resolved at **drain** time
 /// ([`PortRegistry::drain_active_inputs`]) rather than at delivery time, so nothing is read from
 /// a port table the delivering route may no longer hold. It carries no term: the payload travels
@@ -208,8 +211,8 @@ pub(crate) struct ActiveInputPacket {
 
 impl PortRegistry {
     /// Drains every `{active, …}` delivery `beam_io` has staged into term-free
-    /// [`PortEvent::ActiveInput`]s, binding each one's owner, stream mode and socket kind from
-    /// the port's metadata **now**.
+    /// [`ActiveInputPacket`]s, binding each one's owner, stream mode and socket kind from the
+    /// port's metadata **now**.
     ///
     /// A delivery whose port has no metadata (closed while its delivery was still staged) has no
     /// recoverable recipient and is dropped — see the module docs on why that drop is final and
@@ -218,25 +221,24 @@ impl PortRegistry {
     /// Call this immediately after every
     /// [`drain_io_completions`](PortRegistry::drain_io_completions): the two channels are staged
     /// by the same driver callbacks (`ready_input`, a `setopts` control op), so a point that owes
-    /// one owes the other.
-    pub(super) fn drain_active_inputs(&mut self) -> Vec<PortEvent> {
+    /// one owes the other. The packets are term-free on purpose — the caller wraps each one in
+    /// its own event and delivers it to [`ActiveInputPacket::owner`].
+    pub(crate) fn drain_active_inputs(&mut self) -> Vec<ActiveInputPacket> {
         let drained = self.registry.take_active_inputs();
-        let mut events = Vec::with_capacity(drained.len());
+        let mut packets = Vec::with_capacity(drained.len());
         for ActiveInput { port, event } in drained {
             let Some(meta) = self.meta.get(&port.number()) else {
                 continue;
             };
-            events.push(PortEvent::ActiveInput {
-                packet: ActiveInputPacket {
-                    port,
-                    owner: meta.owner,
-                    data_mode: meta.data_mode(),
-                    kind: kind_of_driver(driver_path_name(&meta.command)),
-                    event,
-                },
+            packets.push(ActiveInputPacket {
+                port,
+                owner: meta.owner,
+                data_mode: meta.data_mode(),
+                kind: kind_of_driver(driver_path_name(&meta.command)),
+                event,
             });
         }
-        events
+        packets
     }
 }
 
@@ -293,7 +295,7 @@ impl RuntimeContext<'_> {
     /// `{tcp, S, Data}` / `{udp, S, IP, Port, Data}` — one delivered input in active mode.
     ///
     /// `Data` goes through
-    /// [`make_stream_payload`](super::RuntimeContext) with [`StreamShape::Data`](super::StreamShape),
+    /// [`make_stream_payload`](crate::port::RuntimeContext) with [`StreamShape::Data`](crate::port::StreamShape),
     /// so the C's two rendering rules come from that one shaper and cannot drift: a `[list]` mode
     /// (or a `{header, N}` wider than the payload — `beam_io` hands that case up as a
     /// whole-payload header, which the `list` arm flattens) is one flat char list, and a
@@ -313,7 +315,7 @@ impl RuntimeContext<'_> {
         match packet.kind {
             ActivePortKind::Tcp => {
                 let payload =
-                    self.make_stream_payload(read, packet.data_mode, super::StreamShape::Data)?;
+                    self.make_stream_payload(read, packet.data_mode, crate::port::StreamShape::Data)?;
                 let tag = self.socket_atom("tcp");
                 terms_tuple(self, &[tag, port, payload])
             }
@@ -331,7 +333,7 @@ impl RuntimeContext<'_> {
                 let payload = self.make_stream_payload(
                     &payload_read,
                     packet.data_mode,
-                    super::StreamShape::Data,
+                    crate::port::StreamShape::Data,
                 )?;
                 let tag = self.socket_atom("udp");
                 terms_tuple(
@@ -383,3 +385,10 @@ fn unsupported_kind(packet: &ActiveInputPacket, delivery: &str) -> beam_common::
         packet.port.number()
     ))
 }
+
+/// The channel's matrix suite — the rendered message per event/kind/mode, the packed-address
+/// decoder, and the drain-time owner/mode/kind binding with its drop rule (see
+/// `src/port/active_input_tests.rs`). A separate file so the matrix does not grow this one.
+#[cfg(test)]
+#[path = "active_input_tests.rs"]
+mod tests;
