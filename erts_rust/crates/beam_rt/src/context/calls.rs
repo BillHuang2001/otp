@@ -421,6 +421,7 @@ impl<'a> RuntimeContext<'a> {
                 gc_armed: _,
                 dispatch_memo: _,
                 lent_tables,
+                copy_out_hint: _,
             } = self;
             // The ETS registry this call installs. Two sources, in precedence order:
             //
@@ -1157,10 +1158,34 @@ impl<'a> RuntimeContext<'a> {
     /// resolves — `clone_slot` is `None` ⇒ `bad_term`), so the local table's MSO list is provably
     /// empty on every success and `drain_handles` can never re-slot a container whose on-heap
     /// `val` word would then name the wrong slot.
+    ///
+    /// # The copy is hinted, not guessed
+    ///
+    /// A refusal is by far the most expensive outcome of this function: the copier's fast
+    /// path has already run, so recovering the size means `preflight_words` →
+    /// `beam_term::size::size_object_bounded_with` (a `HashSet`-backed walk) → the
+    /// acyclicity check (two more sets) → `size_object_with`, i.e. five traversals of the
+    /// graph and three hash tables — all to *learn* a number
+    /// [`copy_shortfall_words`] then also reports for free. A copy-bound loop (the
+    /// `copy_bound/ets_copy` benchmark shape) meets that cost on essentially every op,
+    /// because a collection collapses the nursery back to the `233`-word floor while the
+    /// payload in flight is already larger than what a half-full node has free.
+    ///
+    /// So the refusal also **teaches** the context: its own word count becomes
+    /// [`RuntimeContext::copy_out_hint`] (`max`, never a replacement — the hint is a lower
+    /// bound), and every later copy-out **spends** it first — see [`hint_grow_gate`].
+    ///
+    /// The gate is purely additive: with a hint of `0` (a context's first copy-out) this
+    /// function behaves exactly as it did before, and the grow-and-retry below remains the
+    /// fallback for every refusal the gate cannot pre-empt (a result larger than the hint, a
+    /// `max_heap_size` ceiling, a destination that is not an exhaustion).
     fn move_result_into_process_heap(&mut self, term: Eterm) -> Option<Eterm> {
         // `ProcessId` is `Copy`, so read it before the destructure (match ergonomics, as the
-        // dispatch block above does).
+        // dispatch block above does). The hint is `Copy` for the same reason — and reading it
+        // here keeps it a *disjoint field* loan from `runtime`/`mailbox_table`, which is also
+        // what lets the refusal arm below write it back through `self`.
         let pid = self.mailbox_pid;
+        let hint = self.copy_out_hint;
         let RuntimeContext {
             runtime,
             mailbox_table,
@@ -1170,6 +1195,9 @@ impl<'a> RuntimeContext<'a> {
         // for byte (the result stays on the pooled heap, which is then not rewound).
         let table = mailbox_table.as_deref_mut()?;
         let process = table.get_mut(pid)?;
+        // Spend the hint BEFORE the first attempt, so the copy succeeds on its first pass
+        // instead of paying the refusal it would otherwise teach us again.
+        hint_grow_gate(process, hint);
         // One fresh destination table per attempt (see the docs above): a refused attempt's
         // partial state is never rolled into the retry, so both attempts hand the copier an
         // empty destination and take the single-traversal fast path.
@@ -1189,9 +1217,17 @@ impl<'a> RuntimeContext<'a> {
             // `words * size_of::<Eterm>()`), so the growth hint costs no second traversal of the
             // graph: `beam_term::size_object(term)` — the obvious alternative — walks it all over
             // again *and* builds a `HashSet` plus a `Vec` on the way.
-            Err(error) => copy_shortfall_words(&error),
-        };
-        // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
+            Err(error) => {
+                let needed = copy_shortfall_words(&error);
+                // LEARN: remember the graph size this process has proven it builds, so the
+                // next copy-out of the same shape is grown to fit *before* it is attempted.
+                // It is a `max`, so a one-off large result can never shrink what an earlier
+                // one taught, and the write is a disjoint field of the loans destructured
+                // above.
+                self.copy_out_hint = self.copy_out_hint.max(needed);
+                needed
+            }
+        };        // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
         // and moves no live term, so the copy can simply be re-attempted from the fresh space's
         // base.
         //
@@ -1633,6 +1669,63 @@ const GROW_HEADROOM_FACTOR: usize = 4;
 /// (`erl_gc.c:262-291`).
 const GROW_MIN_WORDS: usize = 1024;
 
+/// The floor, in term words, of the headroom [`hint_grow_gate`] adds to a learned hint.
+///
+/// A quarter of the hint is the proportional term, but it is too small to matter at the sizes
+/// that actually refuse: the `copy_bound/ets_copy` payload refuses at ≈73 words, whose quarter
+/// is 18 — barely a fifth of one 73-word result. The floor keeps the pre-copy request a whole
+/// small container ahead, so the grown destination survives the copy-out's own result **and**
+/// the next few of its owner's allocations before the next gate.
+const COPY_OUT_HINT_MARGIN_MIN: usize = 32;
+
+/// The smallest learned hint worth spending a growth on, in term words.
+///
+/// Below this the graph is smaller than a 4-element tuple: it can only refuse onto a nursery
+/// that is essentially full, where the ordinary grow-and-retry would already have to run, so
+/// the gate would add a growth without removing one. It is the "hint is not learned yet"
+/// guard (`0`) plus the trivial sizes, in one test.
+const COPY_OUT_HINT_MIN_WORDS: usize = 8;
+
+/// Spends a learned copy-out hint: grows the destination **before** the copy is attempted, so a
+/// result of a shape this process has already been refused for is copied on its first traversal.
+///
+/// `hint` is [`RuntimeContext::copy_out_hint`] — the flat word count of the largest graph a
+/// refused copy has reported for this context ([`copy_shortfall_words`]) — and the request adds
+/// [`COPY_OUT_HINT_MARGIN_MIN`] (or a quarter of the hint, whichever is larger) so the grown
+/// destination also has room for the copy-out's own result slot and the caller's next few
+/// allocations.
+///
+/// # The growth is the NO-RELOCATION seam, which is why it is legal here
+///
+/// [`Process::grow_nursery`] retires the space it replaces and **moves no live term**, so it is
+/// correct for a host holding an incomplete or unpublished root set — exactly this situation: a
+/// registered BIF runs with the executing machine's x registers and Erlang stack *not*
+/// published ([`RuntimeContext::move_result_into_process_heap`]'s growth block states the same
+/// for its own retry). Collecting here instead would free live terms.
+///
+/// A destination that already has `request` words free is left alone: `Nursery::grow` would
+/// return `Ok` without installing anything, so the test only saves the call.
+///
+/// A refused request (`+hmax` / `spawn_opt`'s `{max_heap_size,…}` bounds the nursery chain's
+/// **summed** capacity) degrades to the bare hint and then simply returns: the ordinary path's
+/// own refusal + grow + retry still runs, so a ceiling can only ever cost the pre-copy
+/// opportunity, never the copy.
+fn hint_grow_gate(process: &mut beam_process::Process, hint: usize) {
+    if hint < COPY_OUT_HINT_MIN_WORDS {
+        return;
+    }
+    let request = hint.saturating_add((hint / 4).max(COPY_OUT_HINT_MARGIN_MIN));
+    if process.heap_mut().available() >= request {
+        return;
+    }
+    #[cfg(test)]
+    notes::note_hint_grow();
+    if process.grow_nursery(request).is_err() {
+        // A `max_heap_size` ceiling: degrade to the bare hint, never a hard failure.
+        let _ = process.grow_nursery(hint);
+    }
+}
+
 /// The flat word count a refused copy reported it could not fit.
 ///
 /// [`beam_message`]'s **message-heap exhaustion** ([`beam_message::is_message_heap_exhaustion`])
@@ -1699,6 +1792,7 @@ mod notes {
     thread_local! {
         static COPY_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
         static GROW_RETRIES: Cell<usize> = const { Cell::new(0) };
+        static HINT_GROWS: Cell<usize> = const { Cell::new(0) };
         static EMPTY_DESTINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
         static WALK_CALLS: Cell<usize> = const { Cell::new(0) };
         static WALK_VISITS: Cell<usize> = const { Cell::new(0) };
@@ -1736,9 +1830,17 @@ mod notes {
         }
     }
 
-    /// Records one `grow_nursery` call.
+    /// Records one `grow_nursery` call answering a refusal (the grow-and-retry fallback and its
+    /// ceiling fallback), i.e. one growth a **refused** copy paid for.
     pub(super) fn note_grow() {
         GROW_RETRIES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one `grow_nursery` call made by the **learned-hint** gate
+    /// ([`hint_grow_gate`]) before a copy attempt, i.e. one growth that pre-empted a refusal
+    /// rather than answering one.
+    pub(super) fn note_hint_grow() {
+        HINT_GROWS.with(|c| c.set(c.get() + 1));
     }
 
     /// Records one [`RuntimeContext::graph_holds_reference`] invocation.
@@ -1771,6 +1873,7 @@ mod notes {
     pub(super) fn reset() {
         COPY_ATTEMPTS.with(|c| c.set(0));
         GROW_RETRIES.with(|c| c.set(0));
+        HINT_GROWS.with(|c| c.set(0));
         EMPTY_DESTINATION_ATTEMPTS.with(|c| c.set(0));
         WALK_CALLS.with(|c| c.set(0));
         WALK_VISITS.with(|c| c.set(0));
