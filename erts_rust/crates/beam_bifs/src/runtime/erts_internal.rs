@@ -441,6 +441,11 @@ mod tests {
     /// [`super::REAL_BIFS`] lists exactly the keys this module serves with a real
     /// implementation instead of the `RuntimeHooks` seam, and every one of them is
     /// registered by [`super::register`] (the two must never drift apart).
+    ///
+    /// The six are the two `ets`-interior aliases (delegating to the `ets` family) and
+    /// the four C port spellings (implemented over the `PortHook` seam; three real, one
+    /// — `open_port/2` — a documented typed gap whose key still belongs here because its
+    /// implementation is this crate's, not a `RuntimeHooks` forward).
     #[test]
     fn real_bifs_lists_the_keys_this_module_serves_for_real() {
         let mut reg = BifRegistry::new();
@@ -450,6 +455,10 @@ mod tests {
             &[
                 ("erts_internal", "ets_raw_first", 1),
                 ("erts_internal", "ets_raw_next", 2),
+                ("erts_internal", "open_port", 2),
+                ("erts_internal", "port_close", 1),
+                ("erts_internal", "port_info", 1),
+                ("erts_internal", "port_info", 2),
             ]
         );
         for (module, function, arity) in super::REAL_BIFS {
