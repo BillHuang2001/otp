@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! A small, in-process **decomposition harness** for one real foreign workload.
+//! A small, in-process **decomposition harness** for real foreign workloads.
 //!
 //! [`foreign_bstr_to_lower_decomposition`] compiles `cowboy_bstr:to_lower/1` with the system
 //! `erlc`, loads the artifact through [`beam_loader`], and runs it on **both** execution tiers
@@ -55,8 +55,16 @@
 //! * `char_to_lower/1` — a 27-clause pure-Erlang `select_val` (no BIF).
 //!
 //! That is why the harness reports zero BIF dispatches: the whole computation is engine-side.
+//!
+//! [`long_append::foreign_long_append_decomposition`] is the second workload: a fixture whose
+//! binary comprehension genuinely **outgrows** its `bs_init_writable` hint (16 KiB in, 64 KiB
+//! out, against a 32-byte hint), so it measures the writable accumulator's payload **growth**
+//! rather than a build that fits the hint. Both workloads share this module's batch loop
+//! ([`run_calls`]), [`measure`] and [`Measurement`]; the fixture-specific parts live in the
+//! sibling file.
 
 mod counting;
+mod long_append;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -144,7 +152,7 @@ const TOP_BIFS: usize = 10;
 #[test]
 #[ignore = "measurement harness"]
 fn foreign_bstr_to_lower_decomposition() {
-    let beam = match compile_fixture() {
+    let beam = match compile_fixture(MODULE, SOURCE, "bstr") {
         Ok(beam) => beam,
         Err(why) => {
             println!("SKIP: {why} -- the cowboy_bstr:to_lower/1 decomposition did not run");
@@ -173,7 +181,18 @@ fn foreign_bstr_to_lower_decomposition() {
 
     let mut measurements = Vec::new();
     for tier in &tiers {
-        measurements.push((*tier, measure(&module, *tier, iters, batch, warmup)));
+        measurements.push((
+            *tier,
+            measure(
+                &module,
+                entry_atom(&module),
+                *tier,
+                iters,
+                batch,
+                warmup,
+                &bstr_input,
+            ),
+        ));
     }
     // The instruction count is a property of the code, not of the tier (see the header note).
     let instr_per_call = match measurements
@@ -190,7 +209,8 @@ fn foreign_bstr_to_lower_decomposition() {
                      (BENCH_TIER did not select the interpreter)"
                 );
             }
-            let (instructions, calls) = interpreter_instruction_count(&module, batch);
+            let (instructions, calls) =
+                interpreter_instruction_count(&module, batch, &bstr_input);
             instructions as f64 / calls as f64
         }
     };
@@ -248,15 +268,16 @@ fn measured_calls(iters: usize) -> usize {
 /// Run the untimed warmup and the measured phase of one tier.
 fn measure(
     module: &Arc<Module>,
+    entry: Atom,
     tier: Tier,
     iters: usize,
     batch: usize,
     warmup: usize,
+    prepare: Prepare<'_>,
 ) -> Measurement {
-    let entry = entry_atom(module);
     // Warmup runs on its own context, so none of its traffic lands in the phase's counters.
     let mut warm = CountingContext::new(Arc::clone(module));
-    run_calls(module, entry, tier, warmup, batch, &mut warm)
+    run_calls(module, entry, tier, warmup, batch, &mut warm, prepare)
         .unwrap_or_else(|error| panic!("warmup on {}: {error:?}", tier.name()));
     drop(warm);
 
@@ -266,7 +287,7 @@ fn measure(
     let mut refc_payloads = 0u64;
     let mut result = NIL;
     for _ in 0..SUB_RUNS {
-        let phase = run_calls(module, entry, tier, per_run, batch, &mut ctx)
+        let phase = run_calls(module, entry, tier, per_run, batch, &mut ctx, prepare)
             .unwrap_or_else(|error| panic!("measure on {}: {error:?}", tier.name()));
         samples.push(ns_per_call(phase.elapsed, per_run));
         refc_payloads += phase.refc_payloads;
@@ -291,10 +312,23 @@ struct Phase {
     result: Eterm,
 }
 
+/// Builds the argument term a batch's timed calls reuse.
+///
+/// It runs **once per batch, before the timed loop**, so fixture setup is never charged to
+/// the engine; the [`Counters`] are parked across it (see [`run_calls`]), so a fixture that
+/// builds its own argument *through the engine* contributes nothing to the tally either.
+type Prepare<'a> = &'a dyn Fn(&mut CountingContext, &mut Machine) -> beam_common::Result<Eterm>;
+
+/// The `cowboy_bstr:to_lower/1` fixture's argument: one 30-byte heap binary from [`INPUT`],
+/// built directly through the inner host (no engine run, so no counter traffic at all).
+fn bstr_input(ctx: &mut CountingContext, _machine: &mut Machine) -> beam_common::Result<Eterm> {
+    make_heap_binary(ctx.inner_mut(), INPUT)
+}
+
 /// Run `calls` calls in batches of `batch`, each batch with a fresh [`Machine`] and a fresh
 /// inner host, and return the time the **call loops** took.
 ///
-/// The reused input term is built once per batch through the inner host, so fixture setup is
+/// The reused input term is built once per batch by `prepare`, so fixture setup is
 /// not charged to the engine and not included in the timing, and the batch's [`Machine`] is
 /// dropped before the next one starts — `Machine::refc_binaries` and the host's region heap
 /// never give memory back, so a single long-lived pair would measure the harness' own growth.
@@ -305,6 +339,7 @@ fn run_calls(
     calls: usize,
     batch: usize,
     ctx: &mut CountingContext,
+    prepare: Prepare<'_>,
 ) -> beam_common::Result<Phase> {
     let batch = batch.max(1);
     let mut elapsed = Duration::ZERO;
@@ -314,21 +349,30 @@ fn run_calls(
     while remaining > 0 {
         let n = remaining.min(batch);
         ctx.reset_inner();
-        let input = make_heap_binary(ctx.inner_mut(), INPUT)?;
         let mut machine = Machine::new();
+        // The argument term is fixture setup. `prepare` may enter the engine (a fixture that
+        // builds its own input), so the whole counter set is parked across it: the tally
+        // below is the timed calls only.
+        let parked = std::mem::take(&mut ctx.counters);
+        let built = prepare(ctx, &mut machine);
+        ctx.counters = parked;
+        let input = built?;
+        // Payloads the `prepare` itself created (a fixture-built input) are not the timed
+        // calls' cost, so the batch's payload count starts here.
+        let payloads_before = machine.refc_binaries().len();
         let start = Instant::now();
         for _ in 0..n {
             match machine.run_export_outcome_with_tier(module, entry, 1, &[input], ctx, tier)? {
                 RunOutcome::Returned(value) => result = value,
                 RunOutcome::Wait { .. } => {
-                    panic!("{} blocked in a receive: to_lower/1 has none", tier.name())
+                    panic!("{} blocked in a receive: this fixture has none", tier.name())
                 }
             }
         }
         elapsed += start.elapsed();
-        // Every batch starts from an empty machine, so its end-of-batch length is exactly the
-        // number of off-heap payloads that batch created.
-        refc_payloads += machine.refc_binaries().len() as u64;
+        // Every batch starts from a fresh machine, so the growth of its payload roster is
+        // exactly the number of off-heap payloads the batch's timed calls created.
+        refc_payloads += (machine.refc_binaries().len() - payloads_before) as u64;
         remaining -= n;
     }
     Ok(Phase {
@@ -339,10 +383,14 @@ fn run_calls(
 }
 
 /// The interpreter's instruction count over `calls` calls (for `BENCH_TIER=baseline`).
-fn interpreter_instruction_count(module: &Arc<Module>, calls: usize) -> (u64, usize) {
+fn interpreter_instruction_count(
+    module: &Arc<Module>,
+    calls: usize,
+    prepare: Prepare<'_>,
+) -> (u64, usize) {
     let entry = entry_atom(module);
     let mut ctx = CountingContext::new(Arc::clone(module));
-    run_calls(module, entry, Tier::Interpreter, calls, calls, &mut ctx)
+    run_calls(module, entry, Tier::Interpreter, calls, calls, &mut ctx, prepare)
         .expect("the interpreter counting pass");
     (ctx.counters.instructions, calls.max(1))
 }
@@ -442,8 +490,16 @@ fn baseline_census(beam: &Path, iters: usize, batch: usize) {
     let mut ctx = CountingContext::new(Arc::clone(&module));
     counters::set_enabled(true);
     counters::reset();
-    let phase = run_calls(&module, entry, Tier::BaselineJit, iters, batch, &mut ctx)
-        .expect("the baseline census pass");
+    let phase = run_calls(
+        &module,
+        entry,
+        Tier::BaselineJit,
+        iters,
+        batch,
+        &mut ctx,
+        &bstr_input,
+    )
+    .expect("the baseline census pass");
     counters::set_enabled(false);
     print_census(counters::snapshot(), iters.max(1), &phase);
 }
@@ -533,30 +589,32 @@ fn selected_tiers() -> Vec<Tier> {
     }
 }
 
-/// Write [`SOURCE`] into a unique temp directory and compile it with the system `erlc`.
+/// Write `source` as `<module>.erl` into a unique temp directory and compile it with the
+/// system `erlc`.
 ///
+/// `tag` only distinguishes one workload's temp directory from another's.
 /// `Err` means "skip": no spawnable `erlc`, or an `erlc` that refused the (valid) source — the
 /// caller prints the reason and returns, which is this crate's skip-loudly convention.
-fn compile_fixture() -> Result<std::path::PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("beam_engine_bench_bstr_{}", std::process::id()));
-    let source = dir.join(format!("{MODULE}.erl"));
+fn compile_fixture(module: &str, source: &str, tag: &str) -> Result<std::path::PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("beam_engine_bench_{tag}_{}", std::process::id()));
+    let path = dir.join(format!("{module}.erl"));
     std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    std::fs::write(&source, SOURCE)
-        .map_err(|error| format!("write {}: {error}", source.display()))?;
+    std::fs::write(&path, source)
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
     let output = Command::new("erlc")
         .arg("+deterministic")
         .arg("-o")
         .arg(&dir)
-        .arg(&source)
+        .arg(&path)
         .output()
         .map_err(|error| format!("no usable `erlc` on PATH ({error})"))?;
     if !output.status.success() {
         return Err(format!(
             "`erlc` exited {} on {}: {}",
             output.status,
-            source.display(),
+            path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(dir.join(format!("{MODULE}.beam")))
+    Ok(dir.join(format!("{module}.beam")))
 }
