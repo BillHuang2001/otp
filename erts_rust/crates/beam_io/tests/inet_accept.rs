@@ -771,29 +771,30 @@ fn an_accept_deadline_completes_exactly_once_through_the_registry() {
     ports.close(&mut poller, listener).expect("closes the listener");
 }
 // ---------------------------------------------------------------------------
-// The mixed accept queue: the C reports the **head**, and this driver does not
+// The mixed accept queue: the timer reports the list **head**
 // ---------------------------------------------------------------------------
 /// **The C's mixed-queue deadline reports the head of the accept list** — `{error, timeout}` for
 /// the *first* queued accept when the port's timer expires, even though that one was queued with
-/// `INET_INFINITY` and only the second carries a 50 ms deadline.
+/// `INET_INFINITY` and only the second carries a 50 ms deadline — and the survivor is left queued
+/// with **no timer at all**, completed only by a real connection.
 ///
-/// Measured on the oracle (this host), accept #0 at `INET_INFINITY` then accept #1 at 50 ms:
-/// `mixed_a1=[1,0,0] mixed_a2=[1,0,1] mixed_done={0,{error,timeout}}` — exactly one report, for the
-/// **head**, and nothing else. The C's multi-timer is per **port**, not per operation:
-/// `inet_multi_timeout` re-arms from the earliest pending deadline (`inet_drv.c:12600`) and
-/// `tcp_inet_multi_timeout` then removes the head of the caller's accept list (`remove_multi_op`,
-/// `:12606`).
+/// Measured on the oracle (this host), accept #0 at `INET_INFINITY` then accept #1 at 50 ms: with no
+/// connection `mixed_a1=[1,0,0] mixed_a2=[1,0,1] mixed_done={0,{error,timeout}}` — exactly one
+/// report, for the **head**, and nothing else; with a connection arriving after that firing
+/// `{0,{error,timeout}}` then `{1,{ok,Port}}`. The C's multi-timer is per **port**, not per
+/// operation: `inet_multi_timeout` re-arms from the earliest pending deadline
+/// (`inet_drv.c:12600`) and `tcp_inet_multi_timeout` then removes the head of the caller's accept
+/// list (`remove_multi_op`, `:12606`).
 ///
-/// **Ignored: a driver-side divergence, not a suite bug.** `AsyncQueue::async_timeout`
-/// (`src/drivers/inet/async.rs:654`) gates its completion loop on the **head** op being due, so a
-/// queue whose head carries no deadline (or a later one) completes *nothing*: the tail's 50 ms
-/// deadline expires unreported, where the oracle reports `{error, timeout}` for the head. Closing
-/// that gap is a `src/` change (out of this suite's scope), so the case is pinned here — un-ignore
-/// it once the driver completes the head, and it must stay green.
+/// The rule this driver now serves, and what the two halves below pin: the port's one timer is armed
+/// from the **earliest finite** entry of its sorted accept-timer list (`add_multi_timer`,
+/// `inet_drv.c:15744`-`:15790`), and its expiry reports the accept list's **head** whatever
+/// operation owned that deadline (`tcp_inet_multi_timeout` → `remove_multi_op(desc, multi_first)`,
+/// `:12600`). An `INET_INFINITY` head contributes **no** timer entry (`mtd` stays `NULL`,
+/// `:12198`-`:12210`), so it is the finite tail's 50 ms deadline that wakes the port — and the
+/// firing consumes that one entry, leaving the infinite survivor queued, untouched, with **no timer
+/// at all**: only a connection (or the listener's teardown) can complete it.
 #[test]
-#[ignore = "driver-side divergence: an accept list whose head has no deadline never completes \
-            (src/drivers/inet/async.rs:654 gates on the head being due); the oracle reports \
-            {error,timeout} for the head"]
 fn a_mixed_accept_queue_times_out_the_head_like_the_oracle() {
     match erl_stdout(MIXED_DEADLINE_EXPRESSION) {
         Some(stdout) => {
@@ -810,7 +811,7 @@ fn a_mixed_accept_queue_times_out_the_head_like_the_oracle() {
     let mut poller = poller();
     let mut ports = PortRegistry::new();
     let listener = open_tcp(&mut ports, &mut poller);
-    listen_on_loopback(&mut poller, &mut ports, listener);
+    let bound = listen_on_loopback(&mut poller, &mut ports, listener);
     assert_eq!(
         control(
             &mut ports,
@@ -856,6 +857,37 @@ fn a_mixed_accept_queue_times_out_the_head_like_the_oracle() {
         status_of(&mut ports, &mut poller, listener),
         ONE_ACCEPT_STATUS,
         "the survivor keeps the listener armed (one accept still queued)"
+    );
+
+    // The survivor: still queued, and with **no timer of its own** — its operand was
+    // `INET_INFINITY` (no entry) and the firing consumed the only entry the timer list had. A real
+    // connection is what completes it now, under its **own** id and as `{ok, Descriptor}`.
+    let _peer = TcpStream::connect(("127.0.0.1", bound)).expect("the surviving accept's peer");
+    let done = only_completion(
+        await_completions(
+            &mut poller,
+            &mut ports,
+            &[listener],
+            "the surviving accept completes on the connection",
+        ),
+        "the surviving accept completes on the connection",
+    );
+    let (id, fd) = accepted(done.event, "the surviving accept completes on the connection");
+    assert_eq!(id, 1, "the survivor completes under its own id, not the fired head's");
+    assert!(fd >= 0, "the survivor's completion carries a real descriptor: {fd}");
+    // The descriptor is handed over **owned**, and this test adopts nothing: close it here so the
+    // number is not leaked (the driver never stores it, so no teardown path can close it twice).
+    close_fd(fd).expect("the handed-over descriptor is closed by its receiver");
+    assert_no_completion_within(
+        &mut poller,
+        &mut ports,
+        POLL_SLICE * 5,
+        "no further completion follows the survivor",
+    );
+    assert_eq!(
+        status_of(&mut ports, &mut poller, listener),
+        LISTENING_STATUS,
+        "the drained accept list is a bare listener again"
     );
     ports.close(&mut poller, listener).expect("closes the listener");
 }
