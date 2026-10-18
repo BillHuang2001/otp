@@ -64,8 +64,9 @@ use crate::error;
 use crate::poller::{Event, Poller};
 use crate::port::{Port, PortCommandOptions, PortControl, PortState, DEFAULT_READINESS_RED_BUDGET};
 use crate::port_failure::{DriverFailure, PortFailure};
-use crate::port_task::{LineNotification, PortNotification, PortTaskKind, PortTaskOutcome, Readiness};
-
+use crate::port_task::{
+    ActiveInput, LineNotification, PortNotification, PortTaskKind, PortTaskOutcome, Readiness,
+};
 /// The set of live ports, keyed by port number, plus the id allocator.
 ///
 /// Ids come from the inner [`PortTable`] (shared with `beam_process`, so `ptab` stays the
@@ -110,7 +111,15 @@ pub struct PortRegistry {
     /// that reply still reach the owner, exactly once, after the port is gone; the queue is
     /// drained by [`PortRegistry::take_completions`].
     closed_completions: Vec<PortCompletion>,
-    /// The **failures** of ports whose driver closed them (the C's `driver_failure*` family and
+    /// The **`{active, …}` deliveries** of ports that were closed before their owner was told
+    /// about them, harvested by [`PortRegistry::close`] in close order.
+    ///
+    /// The same rule [`PortRegistry::closed_completions`] follows, for the same reason: a
+    /// [`Port`] is dropped by a close, so a delivery the driver staged earlier — or one it stages
+    /// **during** its own teardown — would be dropped with it. Harvesting keeps that delivery
+    /// reportable exactly once after the port is gone; the queue is drained by
+    /// [`PortRegistry::take_active_inputs`].
+    closed_active: Vec<ActiveInput>,    /// The **failures** of ports whose driver closed them (the C's `driver_failure*` family and
     /// `driver_exit`), latched by [`DriverContext::signal_failure`](crate::DriverContext::signal_failure)
     /// and harvested by [`PortRegistry::reap_failures`] in port-number order.
     ///
@@ -141,7 +150,7 @@ impl PortRegistry {
             ports: HashMap::new(),
             closed: Vec::new(),
             closed_completions: Vec::new(),
-            failures: Vec::new(),
+            closed_active: Vec::new(),            failures: Vec::new(),
             reaped_notifications: Vec::new(),
             single_threaded: PhantomData,
         }
@@ -616,6 +625,46 @@ impl PortRegistry {
         completions
     }
 
+    /// Drains the **`{active, …}` deliveries** every port's driver handed up, in **port-number
+    /// order**, plus the ones a closed port left behind.
+    ///
+    /// This is the runtime entry point of the active-mode input side channel (see
+    /// [`ActiveInput`]): the `{tcp, S, Data}` / `{udp, S, IP, Port, Data}` messages an
+    /// `{active, true|N|once}` socket sends its owner, and the `{tcp_passive, S}` /
+    /// `{udp_passive, S}` transition of a spent `{active, N}` counter. A driver stages them from
+    /// any of its callbacks
+    /// ([`DriverContext::deliver_active_input`](crate::driver::DriverContext::deliver_active_input));
+    /// they are **never** `{Port, {data, Data}}` and never a completion.
+    ///
+    /// The accessor style is [`PortRegistry::take_completions`]'s — drain after **every** round
+    /// (and after every explicit driver interaction **and after every
+    /// [`PortRegistry::close`]**), or the deliveries are lost, since draining is what removes
+    /// them. The order is:
+    ///
+    /// 1. each **live** port's deliveries, ports visited in ascending port-number order and each
+    ///    port's own deliveries in delivery order, then
+    /// 2. the deliveries harvested from ports **closed** since the last drain
+    ///    ([`PortRegistry::close`]), in close order.
+    ///
+    /// A port with nothing staged — every passive-mode port, and every non-socket driver —
+    /// contributes nothing, so a caller can poll unconditionally.
+    ///
+    /// # Port numbers of closed ports
+    ///
+    /// The same caveat [`PortRegistry::take_completions`] documents applies: a harvested delivery
+    /// still names the number of the port it was staged for, and that number is only retired by
+    /// the deferred [`PortNotification::Closed`] report — so drain in the round you ran rather
+    /// than storing a bare number.
+    pub fn take_active_inputs(&mut self) -> Vec<ActiveInput> {
+        let mut active = Vec::new();
+        for key in self.sorted_keys() {
+            if let Some(port) = self.ports.get_mut(&key) {
+                active.extend(port.take_active_inputs());
+            }
+        }
+        active.append(&mut self.closed_active);
+        active
+    }
     /// Releases port `id`'s pending partial line as `noeol` frame(s) for the next harvest.
     ///
     /// This is the C's `flush_linebuf_messages`: it is what [`PortRegistry::take_eof`] runs when
@@ -790,7 +839,8 @@ impl PortRegistry {
         // so these can only be reported from here.
         self.closed_completions
             .append(&mut port.take_completions());
-        // The port is gone from the registry either way, so its close is queued (and its number
+        self.closed_active
+            .append(&mut port.take_active_inputs());        // The port is gone from the registry either way, so its close is queued (and its number
         // retired by the reporting round) even if the driver's teardown reports a failure.
         self.closed.push(id);
         result
