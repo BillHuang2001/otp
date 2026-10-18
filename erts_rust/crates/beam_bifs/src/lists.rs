@@ -118,6 +118,10 @@
 //! * **Arithmetic** (`==`, [`beam_term::compare::cmp_arith`]): `keyfind/3`
 //!   (`keyfind(1.0, 1, [{1}])` ⇒ `{1}`), `sort/1`, `usort/1`, `max/1`, `min/1`,
 //!   `keysort/2` (`sort([1.0, 1])` ⇒ `[1.0,1]`, `max([1.0,1])` ⇒ `1.0`).
+//!   Those go through [`crate::compare::cmp_arith_node`] — the same arithmetic order,
+//!   node-aware for a mixed internal/external `pid`/`port`/`ref` pair
+//!   (`lists:sort([self(), Ext])` with a `NEW_PID_EXT` external pid orders by node
+//!   name, exactly as the oracle does); the local node is resolved once per call.
 //!
 //! `sort/1`, `usort/1` and `keysort/2` are **stable**: elements that compare equal
 //! keep their input order (`sort([1.0, 1])` ⇒ `[1.0,1]`, `sort([1, 1.0])` ⇒
@@ -184,12 +188,13 @@
 use core::cmp::Ordering;
 
 use beam_common::{BeamError, Result};
-use beam_term::compare::{cmp_arith, eq};
+use beam_term::compare::{eq, LocalNodeId};
 use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access::{
     car, cdr, fun_arity, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
 };
+use crate::compare::{cmp_arith_node, local_node_id};
 use crate::context::BifContext;
 use crate::error::{badarg, function_clause, structured_error, system_limit};
 use crate::print::proper_list;
@@ -276,9 +281,14 @@ fn reverse_with_tail(ctx: &mut BifContext<'_>, elems: &[Eterm], tail: Eterm) -> 
 ///
 /// `slice::sort_by` is stable, which is the `lists:sort/1` contract: two elements
 /// equal under `==` keep their input order.
-fn sort_by_arith(atoms: &AtomTable, elems: &[Eterm]) -> Vec<Eterm> {
+///
+/// `local` is the runtime's own node, resolved **once** by the caller
+/// ([`local_node_id`]) and threaded into the comparator, so a mixed
+/// internal/external `pid`/`port`/`ref` pair is ordered the way the oracle orders it
+/// without paying for the node lookup per element.
+fn sort_by_arith(atoms: &AtomTable, local: Option<LocalNodeId>, elems: &[Eterm]) -> Vec<Eterm> {
     let mut sorted = elems.to_vec();
-    sorted.sort_by(|a, b| cmp_arith(*a, *b, atoms));
+    sorted.sort_by(|a, b| cmp_arith_node(*a, *b, local, atoms));
     sorted
 }
 
@@ -515,12 +525,15 @@ fn keyfind(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(badarg());
     }
     let pos = pos as usize;
+    let local = local_node_id(ctx);
     let mut list = args[2];
     while is_list(list) {
         let elem = car(list);
         list = cdr(list);
         if is_tuple(elem) && pos <= tuple_size(elem) {
-            if cmp_arith(key, tuple_element(elem, pos - 1), ctx.atoms()) == Ordering::Equal {
+            if cmp_arith_node(key, tuple_element(elem, pos - 1), local, ctx.atoms())
+                == Ordering::Equal
+            {
                 return Ok(elem);
             }
         }
@@ -546,12 +559,15 @@ fn keymember(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(badarg());
     }
     let pos = pos as usize;
+    let local = local_node_id(ctx);
     let mut list = args[2];
     while is_list(list) {
         let elem = car(list);
         list = cdr(list);
         if is_tuple(elem) && pos <= tuple_size(elem) {
-            if cmp_arith(key, tuple_element(elem, pos - 1), ctx.atoms()) == Ordering::Equal {
+            if cmp_arith_node(key, tuple_element(elem, pos - 1), local, ctx.atoms())
+                == Ordering::Equal
+            {
                 return ctx.boolean(true);
             }
         }
@@ -574,12 +590,15 @@ fn keysearch(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(badarg());
     }
     let pos = pos as usize;
+    let local = local_node_id(ctx);
     let mut list = args[2];
     while is_list(list) {
         let elem = car(list);
         list = cdr(list);
         if is_tuple(elem) && pos <= tuple_size(elem) {
-            if cmp_arith(key, tuple_element(elem, pos - 1), ctx.atoms()) == Ordering::Equal {
+            if cmp_arith_node(key, tuple_element(elem, pos - 1), local, ctx.atoms())
+                == Ordering::Equal
+            {
                 let tag = ctx.intern_atom("value")?;
                 return ctx.tuple(&[tag, elem]);
             }
@@ -969,11 +988,12 @@ fn extreme(ctx: &mut BifContext<'_>, list: Eterm, better: fn(Ordering) -> bool) 
     if !is_list(list) {
         return Err(function_clause());
     }
+    let local = local_node_id(ctx);
     let mut best = car(list);
     let mut cur = cdr(list);
     while is_list(cur) {
         let candidate = car(cur);
-        if better(cmp_arith(candidate, best, ctx.atoms())) {
+        if better(cmp_arith_node(candidate, best, local, ctx.atoms())) {
             best = candidate;
         }
         cur = cdr(cur);
@@ -1104,10 +1124,11 @@ fn keysort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !is_nil(cur) {
         return Err(function_clause());
     }
+    let local = local_node_id(ctx);
     let sorted = {
         let atoms = ctx.atoms();
         let mut order: Vec<usize> = (0..elems.len()).collect();
-        order.sort_by(|&a, &b| cmp_arith(keys[a], keys[b], atoms));
+        order.sort_by(|&a, &b| cmp_arith_node(keys[a], keys[b], local, atoms));
         order.into_iter().map(|k| elems[k]).collect::<Vec<Eterm>>()
     };
     ctx.list(&sorted)
@@ -1116,18 +1137,20 @@ fn keysort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `sort(List)` — a stable sort in the arithmetic term order.
 fn sort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let elems = proper_list(args[0]).ok_or_else(function_clause)?;
-    let sorted = sort_by_arith(ctx.atoms(), &elems);
+    let local = local_node_id(ctx);
+    let sorted = sort_by_arith(ctx.atoms(), local, &elems);
     ctx.list(&sorted)
 }
 
 /// `usort(List)` — `sort/1` with arithmetically-equal neighbours collapsed.
 fn usort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let elems = proper_list(args[0]).ok_or_else(function_clause)?;
-    let sorted = sort_by_arith(ctx.atoms(), &elems);
+    let local = local_node_id(ctx);
+    let sorted = sort_by_arith(ctx.atoms(), local, &elems);
     let mut unique: Vec<Eterm> = Vec::with_capacity(sorted.len());
     for &elem in &sorted {
         let duplicate = match unique.last() {
-            Some(&previous) => cmp_arith(previous, elem, ctx.atoms()) == Ordering::Equal,
+            Some(&previous) => cmp_arith_node(previous, elem, local, ctx.atoms()) == Ordering::Equal,
             None => false,
         };
         if !duplicate {
