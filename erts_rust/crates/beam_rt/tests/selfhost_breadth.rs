@@ -18,9 +18,11 @@
 //
 // %CopyrightEnd%
 
-//! Contract A.9 (**self-hosted build**) — the **widened** in-process-compile corpus: every
-//! `<root>/lib/*/src/*.erl` source (772 across 34 applications on this checkout), compiled
-//! **in-process** by the Rust runtime and compared byte-for-byte with the system oracle.
+//! Contract A.9 (**self-hosted build**) — the **widened** compile corpus: every
+//! `<root>/lib/*/src/*.erl` source (772 across 34 applications on this checkout), compiled by the
+//! Rust runtime and compared byte-for-byte with the system oracle. The runtime's **in-process**
+//! route is the default; `BEAM_RT_BREADTH_SCHEDULED=1` switches the very same corpus selection to
+//! the **scheduled** route (the two are described under *The runtime's two compile routes* below).
 //!
 //! Where `src/context/pump.rs`'s `every_stdlib_source_compiles_in_process_like_the_oracle` sweeps
 //! **stdlib only** and `tests/selfhost_chain.rs` proves the *chain* for two hand-picked sources,
@@ -28,21 +30,48 @@
 //! filesystem, computes the oracle's own compilable subset at run time, and reports (and asserts)
 //! the runtime's parity on it.
 //!
-//! # The two routes
+//! # The two sides (oracle baseline · runtime)
 //!
 //! * **Oracle baseline** — one `erlc` process per source into that source's own scratch outdir:
-//!   `erlc -o D +no_spawn_compiler_process +deterministic +no_docs [-I …] SRC`. `erlc`'s output is
-//!   byte-identical to the in-VM `compile:file/2` route with the identical option list (the option
-//!   list is what `Dbgi` records, and `{outdir, _}` is not recorded), and one process per source
-//!   makes the failure attribution exact: a source the **oracle** cannot compile with this recipe
-//!   is *excluded from the baseline*, never counted against the runtime. (The 17 such sources on
-//!   this checkout need generated artefacts — `beam_opcodes.hrl`, an ASN.1 `.hrl` set, `-DVSN` —
-//!   which is why the baseline is computed rather than assumed.)
+//!   `erlc -o D +no_spawn_compiler_process +deterministic +no_docs [-I …] SRC` (the
+//!   `+no_spawn_compiler_process` flag is dropped exactly when the runtime's own option is — see
+//!   *The runtime's two compile routes* below). `erlc`'s output is byte-identical to the in-VM
+//!   `compile:file/2` route with the identical option list (the option list is what `Dbgi` records,
+//!   and `{outdir, _}` is not recorded), and one process per source makes the failure attribution
+//!   exact: a source the **oracle** cannot compile with this recipe is *excluded from the
+//!   baseline*, never counted against the runtime. (The 17 such sources on this checkout need
+//!   generated artefacts — `beam_opcodes.hrl`, an ASN.1 `.hrl` set, `-DVSN` — which is why the
+//!   baseline is computed rather than assumed.)
 //! * **The runtime** — one `beam_rt -noshell -eval '<compile:file(…)>'` process per source: the
 //!   real CLI route, so the compile's `epp`/`save_binary` round trips address the booted
 //!   `kernel_sup`'s live `file_server_2` exactly as they do for a user invoking the compiler. The
 //!   option list is the oracle's, plus `{i, Dir}` for **every** `lib/*/include` directory, so a
 //!   source whose headers live outside its own directory is compilable on both sides.
+//!
+//! # The runtime's two compile routes (`BEAM_RT_BREADTH_SCHEDULED`)
+//!
+//! `compile:file/2` has two shapes and OTP selects between them with a **single option**:
+//!
+//! * **in-process** (the default here, and the route `src/context/pump.rs`'s stdlib sweep drives) —
+//!   the option list carries `no_spawn_compiler_process`, so the compile runs in the **calling**
+//!   process;
+//! * **scheduled** (`BEAM_RT_BREADTH_SCHEDULED=1`) — the option is omitted, so OTP's own default
+//!   applies and the compiler **spawns a compiler process**, which this runtime schedules, signals
+//!   and blocks like any other process.
+//!
+//! Both are driven through the *same* `beam_rt -noshell -eval '<compile:file(…)>'` invocation; only
+//! the option list differs. Both are compared **byte-for-byte against the oracle with the identical
+//! option list**: the oracle's `erlc` drops `+no_spawn_compiler_process` exactly when the runtime's
+//! option list does, so each run compares like with like. The option list is also the *only* artifact
+//! difference the switch induces — `Dbgi` records the compile options, so the two routes' artifacts
+//! legitimately differ in that one chunk and (as `beam_lib:cmp/2` confirms) nowhere else. A route's
+//! artifact is therefore only ever compared against the oracle's artifact **for that route**, which
+//! is what the sweep does: one run drives exactly one route, on both sides.
+//!
+//! The route names every per-source report line and the summary line (`[in-process]` /
+//! `[scheduled]`, `breadth sweep (scheduled route): …`), so a captured log can never be mistaken for
+//! the other route — and two runs (one per route) are directly comparable over the same corpus
+//! selection, since the filters and the oracle baseline recipe are identical.
 //!
 //! # Chunk control (all optional; a malformed value is a **loud panic**, never a silently
 //! unfiltered run)
@@ -52,6 +81,7 @@
 //! | `BEAM_RT_BREADTH_APPS=kernel,stdlib` | restrict the run to these applications (an unknown name panics) |
 //! | `BEAM_RT_BREADTH_SHARD=i/n` | keep the sources whose 0-based index in the filtered, sorted list is `i mod n` |
 //! | `BEAM_RT_BREADTH_LIMIT=<n>` | keep the first `n` sources after the two filters above |
+//! | `BEAM_RT_BREADTH_SCHEDULED=1` | drive the **scheduled** (spawn-a-compiler-process) route; `0`/unset is the in-process route; any other value panics |
 //!
 //! The corpus is sorted by application then module, so a shard (or a `LIMIT`) is a stable,
 //! reproducible slice: the shards partition the corpus, and each shard computes its own oracle
@@ -61,23 +91,27 @@
 //!
 //! * **set**: every source the oracle compiles, this runtime compiles too — the *difference* is
 //!   asserted, not just the size, because a count can match while the sets differ;
-//! * **count**: the in-process compile count equals the oracle's compilable count;
+//! * **count**: the route's compile count equals the oracle's compilable count;
 //! * **bytes**: every `.beam` both sides produce is byte-identical.
 //!
 //! # Reporting
 //!
-//! One stderr line per source (`[i/n] app/module: <seconds> s, <bytes> B, byte-identical |
-//! BYTE MISMATCH at <byte> | in-process FAILED: <reason> | oracle FAILED (excluded): <reason>`),
-//! then a `cause × count` failure ledger with one example module per cause, then the failure list,
-//! then the asserts. A count is therefore never a bare number: the ledger *is* the residual
-//! write-up.
+//! One stderr line per source on the selected route (`[<route>] [i/n] app/module: <seconds> s,
+//! <bytes> B, byte-identical | BYTE MISMATCH at <byte> | <route> FAILED: <reason> | oracle FAILED
+//! (excluded): <reason>`), then a `cause × count` failure ledger with one example module per cause,
+//! then the failure list, then the asserts. A count is therefore never a bare number: the ledger
+//! *is* the residual write-up.
 //!
 //! # Scale and cost
 //!
 //! This is a corpus-scale measurement, not an iteration gate — hence `#[ignore]`. The real CLI
 //! start-up is ≈0.44 s per source on top of the compile itself, and the heaviest sources
 //! (`lists.erl`, `calendar.erl`, …) take tens of seconds under a debug build, so the full corpus is
-//! hours of wall time; run a chunk at a time (see the table above) or shard it.
+//! hours of wall time; run a chunk at a time (see the table above) or shard it. The **scheduled**
+//! route costs more per source than the in-process one (the compile's work is a spawned process,
+//! with the scheduling and message round trips that implies), so every timing this suite prints
+//! belongs to a named route and a **shared** host — read it as a route-to-route ratio on one
+//! machine, never as a stable absolute figure.
 //!
 //! The body runs on a dedicated thread with [`SWEEP_STACK_BYTES`], because the deepest sources
 //! recurse further than libtest's 2 MiB test thread allows (the real CLI route runs them on the
@@ -280,6 +314,69 @@ fn limit_selection() -> Option<usize> {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// The route switch (in-process vs scheduled — parsed once, loudly)
+// ---------------------------------------------------------------------------------------
+
+/// Which of the runtime's two `compile:file/2` routes the sweep drives.
+///
+/// Both routes run the *same* `beam_rt -noshell -eval '<compile:file(…)>'` invocation and differ
+/// only in the option list handed to the compiler:
+///
+/// * [`Route::InProcess`] passes `no_spawn_compiler_process`, so the compile runs in the **calling**
+///   process;
+/// * [`Route::Scheduled`] omits it, so OTP's default applies and the compiler **spawns a compiler
+///   process**, which the runtime schedules like any other process.
+///
+/// The option list is recorded in `Dbgi`, so the two routes' artifacts differ in that one chunk and
+/// nowhere else: an artifact is only ever compared against the oracle's *for the same route*, which
+/// [`compile_with_erlc`] guarantees by dropping `+no_spawn_compiler_process` in step with the
+/// runtime's own list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// `compile:file/2` in the calling process (`no_spawn_compiler_process`).
+    InProcess,
+    /// OTP's default: `compile:file/2` spawns a compiler process.
+    Scheduled,
+}
+
+impl Route {
+    /// The label every per-source line and the summary carry, so a captured log names its route.
+    fn name(self) -> &'static str {
+        match self {
+            Route::InProcess => "in-process",
+            Route::Scheduled => "scheduled",
+        }
+    }
+
+    /// Whether the runtime's option list carries `no_spawn_compiler_process` — the oracle's `erlc`
+    /// command line mirrors this answer, so both sides always compile with the identical list.
+    fn compiles_in_calling_process(self) -> bool {
+        matches!(self, Route::InProcess)
+    }
+}
+
+/// `BEAM_RT_BREADTH_SCHEDULED=1`: drive the sweep on the **scheduled** route; `0` (or unset) keeps
+/// the in-process route; any other value is a loud panic ([`route_from`]).
+fn route_selection() -> Route {
+    route_from(std::env::var("BEAM_RT_BREADTH_SCHEDULED").ok().as_deref())
+}
+
+/// The switch's parsing, split out so the unit tests can pin it without a process-wide environment.
+///
+/// A value that is neither `0`/`1` nor unset panics: a typo (`true`, `yes`, an empty string) must
+/// never silently select the other route and turn one route's measurement into the other's.
+fn route_from(value: Option<&str>) -> Route {
+    match value.map(str::trim) {
+        None | Some("0") => Route::InProcess,
+        Some("1") => Route::Scheduled,
+        Some(other) => panic!(
+            "BEAM_RT_BREADTH_SCHEDULED must be `1` (scheduled route) or `0`/unset (in-process \
+             route), got `{other}`"
+        ),
+    }
+}
+
 /// The filtered, sorted selection: application filter, then shard, then limit — in that order, so
 /// `LIMIT` is a prefix of the (sharded) list a reader can replay.
 fn select(corpus: &Corpus) -> Vec<Source> {
@@ -453,17 +550,19 @@ fn path_arg(path: &Path) -> &str {
 }
 
 /// `compile:file(Source, [no_spawn_compiler_process, deterministic, no_docs, {outdir, D} |
-/// [{i, Dir} …]])` — the oracle's option list, plus an include directory per `lib/*/include`.
+/// [{i, Dir} …]])` — the oracle's option list (`no_spawn_compiler_process` is dropped on the
+/// scheduled route), plus an include directory per `lib/*/include`.
 ///
 /// The flat list needs no `++`: both `{outdir, _}` and `{i, _}` are tuple options, so the order does
 /// not matter and the expression stays inside the `-eval` grammar.
-fn compile_expr(source: &Source, corpus: &Corpus, outdir: &Path) -> String {
-    let mut options = vec![
-        "no_spawn_compiler_process".to_string(),
-        "deterministic".to_string(),
-        "no_docs".to_string(),
-        format!("{{outdir, {}}}", literal(outdir)),
-    ];
+fn compile_expr(source: &Source, corpus: &Corpus, outdir: &Path, route: Route) -> String {
+    let mut options = Vec::new();
+    if route.compiles_in_calling_process() {
+        options.push("no_spawn_compiler_process".to_string());
+    }
+    options.push("deterministic".to_string());
+    options.push("no_docs".to_string());
+    options.push(format!("{{outdir, {}}}", literal(outdir)));
     for dir in &corpus.include_dirs {
         options.push(format!("{{i, {}}}", literal(dir)));
     }
@@ -476,21 +575,23 @@ fn compile_expr(source: &Source, corpus: &Corpus, outdir: &Path) -> String {
 
 /// The oracle's artifact for one source, or the reason it could not produce one.
 ///
-/// `erlc`'s command line is the byte-identity recipe: `-o D` plus the three `+` options the
-/// runtime's own option list carries, so both sides record the same option list in `Dbgi`.
+/// `erlc`'s command line is the byte-identity recipe: `-o D` plus the `+` options the runtime's own
+/// option list carries **on the same route** — `+no_spawn_compiler_process` is pushed exactly when
+/// the runtime's list carries `no_spawn_compiler_process` — so both sides record the same option
+/// list in `Dbgi` and the comparison stays within one route.
 fn compile_with_erlc(
     erlc: &Path,
     source: &Source,
     corpus: &Corpus,
     outdir: &Path,
+    route: Route,
 ) -> Result<Vec<u8>, String> {
-    let mut arguments: Vec<&str> = vec![
-        "-o",
-        path_arg(outdir),
-        "+no_spawn_compiler_process",
-        "+deterministic",
-        "+no_docs",
-    ];
+    let mut arguments: Vec<&str> = vec!["-o", path_arg(outdir)];
+    if route.compiles_in_calling_process() {
+        arguments.push("+no_spawn_compiler_process");
+    }
+    arguments.push("+deterministic");
+    arguments.push("+no_docs");
     for dir in &corpus.include_dirs {
         arguments.push("-I");
         arguments.push(path_arg(dir));
@@ -506,13 +607,18 @@ fn compile_with_erlc(
         .map_err(|error| format!("erlc exited 0 but wrote no {}: {error}", artifact.display()))
 }
 
-/// The runtime's artifact for one source, or the reason it could not produce one.
+/// The runtime's artifact for one source — on `route` — or the reason it could not produce one.
 ///
-/// The route is the real CLI: `beam_rt -noshell -eval '<compile:file(…)>'`. The expression is the
-/// compile call and nothing else — the `-eval` action exits 0 on its own and a successful compile
-/// prints nothing, so the artifact on disk is the whole verdict.
-fn compile_in_process(source: &Source, corpus: &Corpus, outdir: &Path) -> Result<Vec<u8>, String> {
-    let expression = compile_expr(source, corpus, outdir);
+/// The invocation is the real CLI in both cases: `beam_rt -noshell -eval '<compile:file(…)>'`. The
+/// expression is the compile call and nothing else — the `-eval` action exits 0 on its own and a
+/// successful compile prints nothing, so the artifact on disk is the whole verdict.
+fn compile_on_route(
+    source: &Source,
+    corpus: &Corpus,
+    outdir: &Path,
+    route: Route,
+) -> Result<Vec<u8>, String> {
+    let expression = compile_expr(source, corpus, outdir, route);
     let probe = run_bounded(
         Path::new(BINARY),
         &["-noshell", "-eval", &expression],
@@ -657,10 +763,11 @@ impl Drop for TempDir {
 // The sweep
 // ---------------------------------------------------------------------------------------
 
-/// The widened A.9 sweep: every discovered source, oracle baseline first, then the in-process
-/// compile, then the byte comparison.
+/// The widened A.9 sweep: every discovered source, oracle baseline first, then the compile on the
+/// route `BEAM_RT_BREADTH_SCHEDULED` selects, then the byte comparison.
 ///
-/// Corpus-scale and therefore `#[ignore]`d. Run a chunk:
+/// Corpus-scale and therefore `#[ignore]`d. Run a chunk (add `BEAM_RT_BREADTH_SCHEDULED=1` for the
+/// scheduled route):
 ///
 /// ```text
 /// BEAM_RT_BREADTH_APPS=parsetools BEAM_RT_BREADTH_LIMIT=3 \
@@ -683,6 +790,10 @@ fn every_app_source_compiles_in_process_like_the_oracle() {
 /// The sweep body: [`every_app_source_compiles_in_process_like_the_oracle`] runs this on a thread of
 /// its own so the recursion depth the corpus needs is available.
 fn sweep_body() {
+    // Parsed **first**, so a malformed value panics on any host (a loud skip for a missing toolchain
+    // must never be able to hide a typo in the switch).
+    let route = route_selection();
+    let route_name = route.name();
     let Some(oracle) = support::require_oracle(BANNER) else {
         return;
     };
@@ -712,8 +823,8 @@ fn sweep_body() {
     }
     let total = sources.len();
     eprintln!(
-        "breadth sweep: {total} sources selected of {} across {} applications; {} include \
-         directories; oracle {} (baseline via {}); {} s per-source deadline",
+        "breadth sweep ({route_name} route): {total} sources selected of {} across {} \
+         applications; {} include directories; oracle {} (baseline via {}); {} s per-source deadline",
         corpus.sources.len(),
         corpus.apps.len(),
         corpus.include_dirs.len(),
@@ -740,28 +851,30 @@ fn sweep_body() {
     // The oracle's compilable set is the baseline: `oracle_ok` is what both counts are measured
     // against, and `excluded` records why a source never entered it.
     let mut oracle_ok: Vec<String> = Vec::new();
-    let mut in_process_ok: Vec<String> = Vec::new();
+    let mut compiled_ok: Vec<String> = Vec::new();
     let mut oracle_only: Vec<String> = Vec::new();
     let mut mismatched: Vec<String> = Vec::new();
     let mut excluded: Vec<String> = Vec::new();
     // cause → the modules that failed that way (the ledger's rows).
     let mut ledger: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // The in-process route's own wall time, summed over its sources (start-up included), so the
-    // `files/s` figure describes this runtime rather than the machine's total occupancy.
-    let mut in_process_wall = Duration::ZERO;
+    // The selected route's own wall time, summed over its sources (start-up included), so the
+    // `files/s` figure describes this runtime on this route rather than the machine's total
+    // occupancy.
+    let mut route_wall = Duration::ZERO;
 
     for (index, source) in sources.iter().enumerate() {
         let label = source.label();
         let position = index + 1;
 
-        // ---- the oracle's own verdict: the baseline ----
+        // ---- the oracle's own verdict: the baseline, compiled with this route's option list ----
         let oracle_out = scratch.outdir(source, "oracle");
         let oracle_started = Instant::now();
-        let reference = match compile_with_erlc(&erlc, source, &corpus, &oracle_out) {
+        let reference = match compile_with_erlc(&erlc, source, &corpus, &oracle_out, route) {
             Ok(bytes) => bytes,
             Err(reason) => {
                 eprintln!(
-                    "[{position}/{total}] {label}: {:.3} s, oracle FAILED (excluded): {reason}",
+                    "[{route_name}] [{position}/{total}] {label}: {:.3} s, oracle FAILED \
+                     (excluded): {reason}",
                     oracle_started.elapsed().as_secs_f64()
                 );
                 excluded.push(format!("{label}: {reason}"));
@@ -770,19 +883,20 @@ fn sweep_body() {
         };
         oracle_ok.push(label.clone());
 
-        // ---- the runtime's verdict, in-process, in a runtime of its own ----
+        // ---- the runtime's verdict, on the selected route, in a runtime of its own ----
         let rust_out = scratch.outdir(source, "rust");
-        let in_process_started = Instant::now();
-        let mine = compile_in_process(source, &corpus, &rust_out);
-        let in_process_elapsed = in_process_started.elapsed();
-        in_process_wall += in_process_elapsed;
+        let route_started = Instant::now();
+        let mine = compile_on_route(source, &corpus, &rust_out, route);
+        let route_elapsed = route_started.elapsed();
+        route_wall += route_elapsed;
 
         let mine = match mine {
             Ok(bytes) => bytes,
             Err(reason) => {
                 eprintln!(
-                    "[{position}/{total}] {label}: {:.3} s, in-process FAILED: {reason}",
-                    in_process_elapsed.as_secs_f64()
+                    "[{route_name}] [{position}/{total}] {label}: {:.3} s, {route_name} FAILED: \
+                     {reason}",
+                    route_elapsed.as_secs_f64()
                 );
                 oracle_only.push(label.clone());
                 ledger
@@ -792,7 +906,7 @@ fn sweep_body() {
                 continue;
             }
         };
-        in_process_ok.push(label.clone());
+        compiled_ok.push(label.clone());
 
         let verdict = if mine == reference {
             "byte-identical".to_string()
@@ -803,7 +917,7 @@ fn sweep_body() {
                 .position(|(ours, theirs)| ours != theirs)
                 .unwrap_or_else(|| mine.len().min(reference.len()));
             mismatched.push(format!(
-                "{label}: first byte difference at {at} of {} (in-process) vs {} (oracle) bytes",
+                "{label}: first byte difference at {at} of {} ({route_name}) vs {} (oracle) bytes",
                 mine.len(),
                 reference.len()
             ));
@@ -814,34 +928,36 @@ fn sweep_body() {
             )
         };
         eprintln!(
-            "[{position}/{total}] {label}: {:.3} s, {} B, {verdict}",
-            in_process_elapsed.as_secs_f64(),
+            "[{route_name}] [{position}/{total}] {label}: {:.3} s, {} B, {verdict}",
+            route_elapsed.as_secs_f64(),
             mine.len()
         );
     }
 
     let elapsed = sweep_started.elapsed();
     eprintln!(
-        "breadth sweep: {total} sources in {:.1} s; oracle compiled {}, in-process compiled {}, \
-         oracle-only {}, byte-mismatched {}, oracle-excluded {}; in-process route {:.1} s → {:.2} \
-         files/s",
+        "breadth sweep ({route_name} route): {total} sources in {:.1} s; oracle compiled {}, \
+         {route_name} compiled {}, oracle-only {}, byte-mismatched {}, oracle-excluded {}; \
+         {route_name} route {:.1} s → {:.2} files/s",
         elapsed.as_secs_f64(),
         oracle_ok.len(),
-        in_process_ok.len(),
+        compiled_ok.len(),
         oracle_only.len(),
         mismatched.len(),
         excluded.len(),
-        in_process_wall.as_secs_f64(),
-        files_per_second(in_process_ok.len(), in_process_wall),
+        route_wall.as_secs_f64(),
+        files_per_second(compiled_ok.len(), route_wall),
     );
 
     // ---- the ledger: cause × count, one example module each ----
     if ledger.is_empty() {
-        eprintln!("failure ledger: empty — every oracle-compilable source compiled in-process");
+        eprintln!(
+            "failure ledger ({route_name} route): empty — every oracle-compilable source compiled"
+        );
     } else {
         let mut rows: Vec<(&String, &Vec<String>)> = ledger.iter().collect();
         rows.sort_by(|(cause_a, a), (cause_b, b)| b.len().cmp(&a.len()).then(cause_a.cmp(cause_b)));
-        eprintln!("failure ledger (cause × count, one example module each):");
+        eprintln!("failure ledger ({route_name} route; cause × count, one example module each):");
         for (cause, modules) in rows {
             eprintln!(
                 "  {:5} × {} — e.g. {}",
@@ -866,16 +982,16 @@ fn sweep_body() {
     // ---- the asserts: set, then count, then bytes ----
     assert!(
         oracle_only.is_empty(),
-        "every source the oracle compiles must compile in-process too; {} did not:\n{}\n\
-         failure ledger:\n{}",
+        "every source the oracle compiles must compile on the {route_name} route too; {} did \
+         not:\n{}\nfailure ledger:\n{}",
         oracle_only.len(),
         oracle_only.join("\n"),
         ledger_summary(&ledger)
     );
     assert_eq!(
-        in_process_ok.len(),
+        compiled_ok.len(),
         oracle_ok.len(),
-        "the in-process compile count must equal the oracle's own compilable count ({}):\n{}\n\
+        "the {route_name} compile count must equal the oracle's own compilable count ({}):\n{}\n\
          failure ledger:\n{}",
         oracle_ok.len(),
         oracle_only.join("\n"),
@@ -883,7 +999,8 @@ fn sweep_body() {
     );
     assert!(
         mismatched.is_empty(),
-        "every `.beam` this runtime writes must be byte-identical to the oracle's; {} differ:\n{}",
+        "every `.beam` this runtime writes on the {route_name} route must be byte-identical to the \
+         oracle's artifact for that route; {} differ:\n{}",
         mismatched.len(),
         mismatched.join("\n")
     );
@@ -970,5 +1087,23 @@ mod tests {
     #[test]
     fn erlang_literals_quote_a_path_the_way_erlang_reads_it() {
         assert_eq!(literal(Path::new("/tmp/a b/out")), "\"/tmp/a b/out\"");
+    }
+
+    #[test]
+    fn the_scheduled_route_switch_is_off_unless_explicitly_on() {
+        assert_eq!(route_from(None), Route::InProcess);
+        assert_eq!(route_from(Some("0")), Route::InProcess);
+        assert_eq!(route_from(Some("1")), Route::Scheduled);
+        // The route names are the report labels, so they cannot drift.
+        assert_eq!(Route::InProcess.name(), "in-process");
+        assert_eq!(Route::Scheduled.name(), "scheduled");
+        // The flag and the label move together: only the in-process route keeps the option.
+        assert!(Route::InProcess.compiles_in_calling_process());
+        assert!(!Route::Scheduled.compiles_in_calling_process());
+        // Anything else is a loud panic, never a silently ignored value.
+        for bogus in ["", "bogus", "true", "2", "-1"] {
+            let panicked = std::panic::catch_unwind(|| route_from(Some(bogus))).is_err();
+            assert!(panicked, "`{bogus}` must panic, not select a route");
+        }
     }
 }
