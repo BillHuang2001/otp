@@ -17,56 +17,14 @@ Re-exported at the crate root and via `beam_engine::prelude::*`.
 The crate embeds NO BIF table: computation goes through `ExecutionContext::call_bif`, and an in-machine callee through the resolver seams (`resolve_external_call`/`resolve_local_fun`, plus `resolve_local_call` which lets a host serve a **local** callee *as* a BIF), with `ExecutionContext::apply`/`apply_fun` the value-returning fallbacks. `ExecutionContext::atom_name` resolves a runtime atom **value** against the host's live atom namespace.
 
 ### The supplied-stacktrace encoder (`src/supplied_stacktrace.rs`)
-The **public** `beam_common::StackTrace` -> `Eterm` encoder, for a host that renders a raise's explicitly **supplied** symbolic frames without a compiled handler (the tree-walking `-eval` route of `beam_rt`). Two entries, one implementation (both are thin wrappers over the engine's single carve, `families::exceptions::stacktrace::carve_supplied_frames`):
-```rust
-pub fn encode_supplied_stacktrace(module: &Module, ctx: &mut dyn ExecutionContext,
-    frames: &StackTrace) -> Result<Eterm>;                       // free fn: builds a scratch Machine
-impl Machine {
-    pub fn encode_supplied_stacktrace(&mut self, module: &Module, ctx: &mut dyn ExecutionContext,
-        frames: &StackTrace) -> Result<Eterm>;                   // the same carve with THIS machine's root set
-}
-```
+The **public** `beam_common::StackTrace` -> `Eterm` encoder, for a host that renders a raise's explicitly **supplied** symbolic frames without a compiled handler (the tree-walking `-eval` route of `beam_rt`).
+Two entries over the engine's single carve (`families::exceptions::stacktrace::carve_supplied_frames`): the free `encode_supplied_stacktrace(module, ctx, frames)` (it builds a scratch `Machine`) and its `Machine::encode_supplied_stacktrace` twin (the same carve with THAT machine's root set).
 Both cook `frames` into the oracle's `[{Module,Function,Arity,Location}]` list (innermost frame first; `A` = the frame's arity, `Location` = `[{file,File},{line,N}]` when the frame has a location else `[]`) as ONE rooted reservation carved node-by-node (moving-collector safe; the machine is only the reservation's root-set carrier). **The atom source is the passed `module`'s atom table, by lookup only** (nothing is interned), so a host whose atoms live in a shared namespace must pass a `Module` carrying that shared table (an `AtomTable` clone preserves every index) and returned atom words are that table's indices; an unresolvable name is the typed `error::unsupported`, never a substituted atom. Pinned (layout, atom source, `erl`-oracle cross-check) by `src/families/exceptions/tests/encoder.rs`.
+
 ### The context seam (`src/context.rs`)
-The frozen seam shape (default bodies shown as comments; the source is authoritative):
-```rust
-pub trait ExecutionContext {
-    fn call_bif(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
-    fn wants_bif_in_machine(&self) -> bool;                                                 // default: false
-    fn call_bif_in_machine(&mut self, machine: &Machine, entry_module: &Module,
-        module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;          // default: forward to call_bif
-    fn ensure_heap(&mut self, heap_need: u32, live: u32, x_regs: &mut [Eterm], stack: &mut [Eterm]) -> Result<()>;
-    fn ensure_heap_full(&mut self, heap_need: u32, roots: RootSet<'_>) -> Result<()>;         // default: forward to narrow ensure_heap
-    fn heap_available(&self) -> usize;                                                       // default: usize::MAX
-    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm>;
-    fn alloc_words_rooted(&mut self, n: usize, roots: RootSet<'_>) -> Result<*mut Eterm>;      // default: forward to alloc_words
-    fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
-    fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm>;
-    // nine defaulted Mailbox twins (send_message / receive_*); see the mailbox section below.
-    fn send_message_with_off_heap(&mut self, to: Eterm, message: Eterm,
-        src_binaries: &[beam_alloc::RefcBinary]) -> Result<()>;                                // default: forward to send_message
-    fn resolve_external_call(&mut self, module: &str, function: &str, arity: u32)
-        -> Result<Option<(Arc<beam_loader::Module>, beam_loader::Label)>>;                      // default: Ok(None)
-    fn resolve_local_fun(&mut self, fun: Eterm, args: &[Eterm])
-        -> Result<Option<(Arc<beam_loader::Module>, beam_loader::Label)>>;                      // default: Ok(None)
-    fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32)
-        -> Result<bool>;                                                                        // default: Ok(false)
-    fn atom_name(&self, module: &Module, atom: Atom) -> Option<String>;                        // default: module's own atom table
-    fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable;                               // default: `&module.atom_table`
-    fn reduce(&mut self, n: u32) -> Result<()>;                                                // default: no-op
-    fn wants_reduce(&self) -> bool;                                                            // default: true (conservative)
-    fn trace_enabled(&self) -> bool;                                                           // default: false (contract A.8)
-    fn trace_event(&mut self, event: TraceEvent<'_>);                                          // default: no-op
-}
-/// The engine's mutable root set -- the hand-off `alloc_words_rooted`/`ensure_heap_full` receive.
-pub struct RootSet<'a> { pub x: &'a mut [Eterm], pub stack: &'a mut [Eterm],
-                         pub fr: &'a mut [Eterm], pub live: u32 }  // `live` clamped; ALL_LIVE = u32::MAX
-pub enum TraceEvent<'a> {
-    Call { module: &'a str, function: &'a str, arity: u32, args: &'a [Eterm] },
-    ReturnFrom { module: &'a str, function: &'a str, arity: u32, value: Eterm },
-    ReturnTo { module: &'a str, function: &'a str, arity: u32 },
-}
-```
+The frozen seam shape is one `pub trait ExecutionContext` of `&mut self` methods over `Eterm`, grouped as: the BIF door `call_bif` plus its in-machine twin pair `wants_bif_in_machine`/`call_bif_in_machine`; the two GC doors `ensure_heap`/`ensure_heap_full` and `alloc_words`/`alloc_words_rooted`; the introspection-only `heap_available`; the value-returning `apply`/`apply_fun`; `send_message_with_off_heap`; the four resolvers `resolve_external_call`/`resolve_local_fun`/`resolve_local_call`/`atom_name`; the atom-namespace `atoms`; the reduction pair `reduce`/`wants_reduce`; and the A.8 pair `trace_enabled`/`trace_event`.
+Every one is `Result`-returning except the pure-`&self` probes; **`src/context.rs` is authoritative for the exact signatures.**
+`RootSet<'a> { x, stack, fr, live }` is the mutable root set the two rooted doors receive (`live` clamped; `ALL_LIVE = u32::MAX`), and `TraceEvent` is the report enum `Call`/`ReturnFrom`/`ReturnTo`.
 - `call_bif` dispatches `module:function/arity`; failure is a return-based `Err(BeamError)` (`BadArith`/`BadArg`/`Raise`/...) the engine turns into a guard branch or a raise, never a panic.
 - **The in-machine BIF-dispatch door (`wants_bif_in_machine` + `call_bif_in_machine`).** A host that returns `true` from the probe is handed the live `Machine` and the run's **entry module** (context `0`) on **every** BIF dispatch, so a BIF implementation can read the running process's position from *inside* the call; it **must** then override `call_bif_in_machine`. The probe is latched once per run into `Machine::bif_in_machine_on` by **both** drivers, and every BIF dispatch goes through the single `Machine::dispatch_bif_call` funnel, so the door behaves identically on every tier; the default `false` keeps the plain `call_bif` path byte-identical. Tier-parity gate: `tests/bif_in_machine.rs`. Detail: `src/machine/CONTEXT.md`.
 - **The GC root-set contract, in two doors.** `ensure_heap(heap_need, live, x_regs, stack)` is the frozen **narrow** admission point; `Machine::ensure_heap` (reached by `test_heap`/`allocate_heap`) calls the defaulted **`ensure_heap_full(heap_need, roots)`** over the whole [`RootSet`] (**including the FR file**, which holds `Eterm` term slots), whose default forwards to the narrow door (byte-identical for a host that predates it). `alloc_words_rooted(n, roots)` is the **term-construction** admission door (`alloc_words` itself has neither an admission point nor roots); its default discards the roots and forwards to `alloc_words`. A collecting host overrides both, relocates every term reachable from the roots, and writes moved terms back through `roots.x`/`roots.stack`/`roots.fr`. The frozen contract: the live roots are `roots.x[..roots.live_len()]`, **the whole** `roots.stack` (no frame liveness maps) and **the whole** `roots.fr`; `live` is only a hint (`RootSet::ALL_LIVE` is always *safe*). Nothing outside the root set survives: a raw `*mut Eterm` from a previous allocation is dead after the next collecting allocation.
@@ -85,19 +43,7 @@ pub enum TraceEvent<'a> {
 
 ### The mailbox seam (`src/context.rs`) -- the receive/message family's host interface
 The mailbox lives in the Stage-5 runtime (`beam_process`/`beam_message`), never here: the host supplies it through this gate.
-```rust
-pub trait Mailbox {
-    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()>;
-    fn receive_next(&mut self) -> Result<Option<Eterm>>;   // candidate at the scan position (None = exhausted)
-    fn receive_skip(&mut self) -> Result<()>;              // loop_rec_end (advance one)
-    fn receive_remove(&mut self) -> Result<()>;            // remove_message (unlink the candidate, reposition at first)
-    fn receive_reset(&mut self) -> Result<()>;             // timeout (reposition at first)
-    fn receive_marker_reserve(&mut self) -> Result<Eterm>;
-    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()>;
-    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()>;
-    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()>;
-}
-```
+`pub trait Mailbox` is exactly nine `Result`-returning methods: `send_message`; the scan position `receive_next` (the candidate at the position, `None` = exhausted), `receive_skip` (`loop_rec_end`, advance one), `receive_remove` (`remove_message`, unlink the candidate then reposition at first) and `receive_reset` (`timeout`, reposition at first); and the four marker calls `receive_marker_reserve`/`receive_marker_bind`/`receive_marker_use`/`receive_marker_clear`.
 - `ExecutionContext` carries the **same nine names as defaulted methods**, each returning the typed `error::unsupported("<method>")`, so every implementor compiles unchanged; `MinimalContext::with_mailbox`/`set_mailbox` install one.
 - **The engine never inspects a message or a marker**: selection is the compiled code's job (the matching instructions between `loop_rec` and `loop_rec_end`), and a marker term is **opaque** (produced by `receive_marker_reserve`, handed back verbatim by `receive_marker_bind`; only a separate *reference* reaches `receive_marker_use`/`receive_marker_clear`). Installing a mailbox does **not** change the non-blocking entries: `run_export`/`run_label` still surface the typed `error::blocked` (Handoff #1).
 - **`send_message_with_off_heap(to, message, src_binaries)`** is the `Instr::Send` arm's entry **and** the `call_ext*` `erlang:send/2`/`'!'/2` case's entry: a tenth defaulted `ExecutionContext` method whose default **forwards to `send_message` and discards `src_binaries`**, so every existing implementor is byte-identical. `src_binaries` is the **source off-heap table** the receiver-side copy needs to resolve an engine-built off-heap (refc) binary in the message (a `bs_init_writable`/`bs_create_bin` result over `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT` bytes). See the off-heap Known-Issues bullet.
@@ -133,18 +79,11 @@ The crate's single point of raw-heap access, over the `alloc_words`/`alloc_words
 
 ### The dynamic execution-census instrument (`src/exec_census.rs`)
 `pub mod exec_census` — a **measurement-only** per-variant counter: it is on no execution path, changes no result, and costs one thread-local `bool` load per hook while disabled.
-```rust
-pub fn enable(); pub fn disable(); pub fn set_enabled(on: bool); pub fn is_enabled() -> bool;
-pub fn reset(); pub fn snapshot() -> Snapshot;              // this thread's counts
-pub fn write_dump(section: &str) -> Option<PathBuf>;        // $TMPDIR/beam_engine_exec_census_<section>.tsv
-pub fn variant_name(instr: &Instr) -> String;               // "Move", "Send", "Test(IsEqExact)", …
-pub struct Snapshot { pub executed: BTreeMap<String, u64>, pub errors: BTreeMap<String, u64>,
-                      pub first_error: BTreeMap<String, String>,
-                      pub total_executed: u64, pub total_errors: u64 }
-```
+Its surface is the gate `enable`/`disable`/`set_enabled`/`is_enabled`, `reset`, `snapshot() -> Snapshot`, `write_dump(section)` (`$TMPDIR/beam_engine_exec_census_<section>.tsv`) and `variant_name(&Instr)` (`"Move"`, `"Send"`, `"Test(IsEqExact)"`, …); `Snapshot` carries the per-variant `executed` and `errors` maps, `first_error` per name, and the two totals.
 - **One recording site.** `Machine::step_instruction_inner` — the single per-instruction funnel the interpreter's `Machine::drive` **and** the native tiers' deopt helper (`jit_step_one`) both pass through — calls `on_instruction` (before the body runs) and `on_error` (only when the instruction returns `Err(BeamError)` out of the funnel).
 - **Read the numbers this way.** A raising instruction is counted as `executed` **and** as an `error` (the maps are not disjoint); a raise caught in a live in-machine `try`/`catch` returns `Ok(..)` from the exceptions family and is therefore **executed, not an error**; a **natively-inlined** baseline-JIT instruction bypasses the funnel and is **not observed** (pin `Tier::Interpreter` for complete counts — the JIT's own structural counters remain the instrument for inlined code); a pre-emption (the host's `reduce` returning `Err`) is counted as an error of the instruction it parked on.
 - **Consumers.** `src/jit/baseline/census.rs`'s runtime census prints it beside the deopt ranking; `tests/dynamic_census.rs` is the corpus-scale ranking and `tests/real_beam_variant_proofs.rs` asserts `executed["<Variant>"] > 0` per real-`.beam` proof. Its 8 lib tests pin the contract (off by default, per-thread, `Test(<Kind>)` keying, first-error retention, the TSV shape).
+
 ### Error interop (`src/error.rs`)
 - Engine error constructors over `beam_common::BeamError` (never a crate-local enum): `unsupported(what: &str)` (a `Raise` with reason atom `unsupported_opcode: <what>`), `bad_register(n: u32)` (`BadArg`), `unknown_label(Label)` (`BadArg`), and `blocked()` = `unsupported("run: process blocked (no message available)")` -- the single definition of the typed error the **non-blocking** entries surface for a `receive` that would suspend.
 - **`Step::Enter` executes on the native baseline tier via a driver-mediated context switch.** `call_ext*` is executed natively by `jit_ext_call` (import resolution through the host seam plus the variant's frame discipline); the cross-module *transfer* is not in the JIT inline set, so the resolved target is handed to the driver as a `Step::Enter` (carried out of a block as the `ENTER` block-ABI word). A **declined** import is not resolved twice (`jit_ext_call` forwards its `None` answer through `jit_step_ext` into the shared `Machine::call_ext_dispatch`). The driver switches module context and re-enters the callee's compiled blocks when the tier has them, else its per-instruction step -- a **driver round-trip by design** (a seal-time cross-module link is unsound: separate executable mappings, buffer-local `rel32` fixups, the entry module baked into `JitRuntime`). The Cranelift tier inherits `module_blocks -> None`, so a cross-module callee runs on its per-instruction step there. Detail: `src/jit/CONTEXT.md`.
@@ -175,8 +114,7 @@ Per-module `#[cfg(test)]` unit tests plus integration tests over committed real 
 `tests/census.rs` gates **108 `beam_loader::Instr` variants = 95 EXECUTED + 13 ZERO-CORPUS + 0 GENUINE-GAP + 0 UNCLAIMED** (`EXECUTED_VARIANTS`/`ZERO_CORPUS_VARIANTS`/`GENUINE_GAP_VARIANTS`; **64** valid-operand probe rows in `tests/support/probe/**`; `TestKind` 25/25), and the whole 1366-`.beam` / 34-application corpus loads with **zero unmodelled opcodes**. The 13 `ZERO_CORPUS` names are the forward-compat pin real compiler output never emits — the seven native-record opcodes, `Deallocate` (fused into `DeallocateReturn` by `beam_loader::lower::fuse`), `BsTestTail2`, `SetTupleElement`, `ExecutableLine`, `DebugLine`, `Generic` — asserted **equal** to the live zero-occurrence set. **No variant is unimplemented**; the one genuine typed residual in the whole instruction surface is `put_record/6`'s create form for a **foreign** module's record id (`tests/gaps.rs`).
 - **Dynamic ranking** (`tests/dynamic_census.rs` over `src/exec_census.rs`, `Tier::Interpreter`): the whole-OTP `module_info` sweep + 44 stdlib workloads + 22 fixture entry points and 9 mailbox-seam runs execute **37 159** instructions over **103** of the 119 corpus-reachable variant names; combined top-10 `Move` 15 760, `Label` 9 178, `CallExtOnly` 8 239, `Line` 377, `GcBif` 340, `Test(IsNonemptyList)` 325, `GetList` 241, `TestHeap` 209, `Return` 185, `Allocate` 181. `total_errors = 4`, all declared (`FuncInfo` 3 head-clause fall-through + `Badrecord` 1 a host gap); **16** corpus-reachable names stay unreached by that workload set (listed in the suite's module doc), each carrying static corpus weight and executed by another suite.
 - **Real-`.beam` proofs** (`tests/real_beam_variant_proofs.rs`, five `vb_*` fixtures): **41** variants of the formerly-blocked weight ordering plus **8** shapes reached en route are proven on real `erlc` output — each row asserts `exec_census` observed the variant **and** that the observable result equals the live `erl` oracle; `Deallocate` is pinned at exactly 0.
-- `MEASURED.md` holds the per-layer dynamic table, the 16 not-reached names, the instrument's three blind spots, the static weight of the formerly-blocked set's top-10, and every performance figure.
-Full detail (census/corpus reachability, `engine_bench` ns/instruction rows, `bif_cost` per-call attribution, `jit_bench` speed-ups and caveats) is in `MEASURED.md`; every remaining execution gap is a typed error pinned in-suite (`tests/gaps.rs` etc.).
+- `MEASURED.md` holds the per-layer dynamic table, the not-reached names, the instrument's three blind spots, the static weight of the formerly-blocked set's top-10, the `engine_bench` ns/instruction rows, the `bif_cost` per-call attribution, the `jit_bench` speed-ups and **every caveat**; every remaining execution gap is a typed error pinned in-suite (`tests/gaps.rs` etc.).
 The baseline tier's **block register cache** (a live-interval-ranked x-register set per block, dirty-set spills, liveness-restricted fill, a per-block variable-length frame and a live-in-only prologue fill) is specified in `src/jit/baseline/emit/regs/CONTEXT.md` + `src/jit/emitter/CONTEXT.md`; the tier-vs-interpreter A/B narratives are in `PERF.md`.
 The baseline tier's **inline set** (authoritative list: `src/jit/CONTEXT.md`) leaves **119 840** of **3 113 483** corpus instruction instances statically deopting — **103 008** the never-executed `FuncInfo` — so the generic inline-set lever is largely spent; the default-tier ÷ `BEAM_RT_TIER=interpreter` ratios reproduce `tools/bench/RESULTS.md` §5; `jit-cranelift` stays **default-OFF**, a correctness-complete mechanism not on `beam_rt`'s path (ratios: `src/jit/cranelift/CONTEXT.md`, `MEASURED.md`).
 
@@ -212,32 +150,23 @@ The full list, each with its ground-truth detail, is in `INSTRUCTION_SURFACE.md`
 - **The engine makes no collection decision.** `arm_gc`, `should_collect` and `collection_debt` have **no occurrence anywhere in this crate** — the latch, the occupancy test and the collector are all `beam_rt`'s (`RuntimeContext::arm_gc`; the runner's `BudgetContext` arms exactly the three doors, taking the latch as the first statement of each). The engine's only capacity input is the `heap_need`/`n` it passes; `heap_available` is never consulted.
 
 ## Handoffs (opcodes/capabilities this crate cannot close alone)
-The execution gaps the standard compiler emits for real OTP modules, plus the host/foundation gaps behind a compiled-vs-oracle divergence; route by owner, and read the full detail in `INSTRUCTION_SURFACE.md` (`## Handoffs`), which carries every item verbatim (the `See Handoff #N` cross-references elsewhere in this file name the items below).
-1. Receive/message + cross-module suspension — owner `beam_rt` (the nine `Mailbox` methods, `RunOutcome::Wait` onto `beam_process`, a host timer for `after`).
-4. A *foreign* `PutRecord` create id — `records:get_definition/2` IS served by `beam_rt`'s `RecordBridge`; the only residual is `put_record/6`'s create form for a **foreign** module's record id, a typed `unsupported` pinned by `tests/gaps.rs`.
-6. `TestKind::TestArity` — behaviourally equivalent to C, NOT a gap.
-7. Map `NO_FAIL` `{badmap,Source}` / `{badkey,Key}` — closed for a seeding host; the residual is the unseeded `beam_loader` path.
-8. JIT `call_ext_last` — executes natively, by design a driver round-trip (residual cost in `src/jit/bench`).
-9. JIT adoption + the A.8 seam — owner `beam_rt`, ADOPTED.
-10. The cross-module call seam (`resolve_external_call`) — owner `beam_rt`, ADOPTED.
-11. The rooted doors (`alloc_words_rooted`/`ensure_heap_full`) — owner `beam_rt`, ADOPTED.
-12. The closure-apply seam (`resolve_local_fun`) — ADOPTED by `beam_rt` (`beam_rt/src/context/execution.rs::resolve_local_fun`, forwarded by `beam_rt/src/runner/budget.rs`).
-13. A built-in / static NIF library via the `resolve_local_call` seam — ADOPTED on both sides (`beam_rt/src/context/execution.rs::resolve_local_call`, forwarded by `beam_rt/src/runner/budget.rs`).
+The execution gaps the standard compiler emits for real OTP modules, plus the host/foundation gaps behind a compiled-vs-oracle divergence, each routed to its owning node; **`INSTRUCTION_SURFACE.md`'s `## Handoffs` is the item-by-item detail**, and the `See Handoff #N` cross-references in this file name its numbering.
+Still open: **#1** receive/message + cross-module suspension (`beam_rt`); **#4** a *foreign* `PutRecord` create id, the one genuine instruction residual (the running module's own records are implemented and `records:get_definition/2` is served by `beam_rt`'s `RecordBridge`); **#6** `TestKind::TestArity`, behaviourally equivalent to C so not a gap; **#7** map `NO_FAIL` `{badmap,Source}`/`{badkey,Key}`, closed for a seeding host with only the unseeded `beam_loader` path remaining; **#8** JIT `call_ext_last`, which executes natively as a by-design driver round-trip.
+**Adopted by `beam_rt`, no engine work outstanding:** #9 the baseline tier + the A.8 seam, #10 `resolve_external_call`, #11 the rooted doors, #12 `resolve_local_fun`, #13 `resolve_local_call`.
 
 ## Routing Table
-- `src/` -> `lib.rs` (crate docs, module wiring, root re-exports, `prelude`), `context.rs` (the `ExecutionContext`/`Mailbox` seams + `RootSet` + `MinimalContext`), `supplied_stacktrace.rs` (the public supplied-stacktrace encoder: the free function + its `Machine` twin, both over `families::exceptions::stacktrace::carve_supplied_frames`), `step.rs`, `operand.rs`, `predicates.rs`, `error.rs`, `generic.rs` (the `Instr::Generic` sentinel), `src/interpreter/{mod,dispatch,bif,test,trace,tests}.rs` (`LabelMap`/label resolution + per-run import table, `Machine::step_instruction` + the run entries, `TestKind` evaluation, the BIF arm, `raise_bif_error`, and `trace.rs` = the A.8 emission).
-- `src/bench/` -> the `#[cfg(test)]`-only in-process foreign-workload decomposition harness (`mod.rs` = fixture/run loop/table, `counting.rs` = the counting `ExecutionContext`); see `src/bench/CONTEXT.md`.
-- `src/machine/{mod,registers,frames,catch,run,location,context,drive}.rs` -> the `Machine` split (`context` = the `ModuleContext`/`Contexts` registry + the `current_context`/`switch_context`/`module_context` accessors; `drive` = the module-context-aware dispatch driver `Machine::drive` + the reduction charge + the raise funnel's second half; `location` = the execution-position introspection accessors; roles in `src/machine/CONTEXT.md`).
-- `src/terms/{mod,construct,read,map,fun,number,slack,sink,alloc_tests,tests}.rs` -> the boxed-term builder/reader over `alloc_words`/`alloc_words_rooted` (the classic builders + the `*_rooted` twins, the `Slack`/`Sink` carve, the moving-collector tests); see `src/terms/CONTEXT.md`.
-- `src/jit/` -> `mod.rs` (tier seam), `cache/{mod.rs,key.rs,tests.rs}` (the cross-run `CodeCache` + thread-local `run_baseline_cached*`/`cached_module_blocks` + `baseline_code_map`; the two-part `CacheKey`; its unit tests), `tiering.rs`, `emitter/*`, `baseline/{mod,runtime,code,tests}.rs` + `baseline/emit/*`, `cranelift/*` (feature-gated), and `bench/` (the `pub mod bench` measurement harness); see `src/jit/CONTEXT.md` (+ `cache/`, `baseline/`, `baseline/emit/`, `cranelift/`, `emitter/`, `bench/` `CONTEXT.md`).
-- `src/families/` -> `mod.rs` (the `dispatch` seam), the flat families `tuples.rs`/`lists.rs`/`receive.rs`, and the directory families `funs/`, `records/*`, `exceptions/*`, `floats/*`, `maps/*`, `bitstrings/*`; see `src/families/CONTEXT.md` and its child nodes.
+The child `CONTEXT.md` files own the per-subsystem detail; this table only routes.
+- `src/` -> `lib.rs` (crate docs, module wiring, root re-exports, `prelude`), `context.rs` (both seams + `RootSet` + `MinimalContext`), `supplied_stacktrace.rs` (the public encoder), `step.rs`, `operand.rs`, `predicates.rs`, `error.rs`, `generic.rs`, `interpreter/`; see `src/CONTEXT.md`.
+- `src/bench/` -> the `#[cfg(test)]`-only in-process foreign-workload decomposition harness; see `src/bench/CONTEXT.md`.
+- `src/machine/` -> the `Machine` split (registers, frames, catch, run, location, context, drive); see `src/machine/CONTEXT.md`.
+- `src/terms/` -> the crate's only raw-heap builder/reader carve (`reserve`/`Slack`/`Sink`); see `src/terms/CONTEXT.md`.
+- `src/jit/` -> the tier seam, `cache/`, `emitter/`, `baseline/`, `cranelift/` (feature-gated) and `bench/`; see `src/jit/CONTEXT.md` and its child nodes.
+- `src/families/` -> the `dispatch` seam plus the nine owning families; see `src/families/CONTEXT.md` and its child nodes.
 - `tests/` -> `support/mod.rs` (the test `ModuleHost`: `SEED_ATOMS`, the host BIF floor) and `fixtures/` (oracle `.beam`s/`.erl` sources/target lists); see `tests/CONTEXT.md`, and the rest are named in `TEST_NOTES.md`.
-- `INSTRUCTION_SURFACE.md` -> the exhaustive execution-engine detail: the frozen execution semantics (frames/dispatch/raise) and the full per-opcode/per-operand/per-family instruction surface, the engine's design decisions, the complete M1 gap list, and the full handoff list.
-- `MEASURED.md` -> measured performance (ns/instruction, per-BIF-call attribution, JIT speed-ups) + execution-coverage detail; `PERF.md` -> execution-tier performance snapshots (per-batch baseline-JIT-vs-interpreter regression narratives); `TEST_NOTES.md` -> the exhaustive test/fixture enumeration.
+- `INSTRUCTION_SURFACE.md` -> the exhaustive instruction surface, execution semantics, design decisions, full known-gap list and full handoff list.
+- `MEASURED.md` -> measured performance + execution-coverage detail; `PERF.md` -> tier performance snapshots; `TEST_NOTES.md` -> the exhaustive test/fixture enumeration.
 
 ## See Also
-- `INSTRUCTION_SURFACE.md` -> the instruction surface + execution semantics, the engine's design decisions, the full known-gaps list and the full handoffs list (this file keeps only summaries).
-- `TEST_NOTES.md` -> the exhaustive test/fixture enumeration; `MEASURED.md` -> the measured figures and their caveats; `PERF.md` -> the execution-tier performance snapshots (per-batch regression narratives and their fixes).
-- `../CONTEXT.md` -> crate-layer contracts, the seam types, the Stage-1/Stage-5 DAG, wave table; `../../CONTEXT.md` sec. 4 -> the engine IR seam and the root-set contract.
-- `../../ERTS_RUST_REWRITE_DEEPDIVE.md` sec. E/sec. F/sec. G -> IR seam, interpreter/JIT trade-offs, tiering rationale.
+- `INSTRUCTION_SURFACE.md` -> the instruction surface + execution semantics, design decisions, full gaps and handoffs (this file keeps only summaries); `TEST_NOTES.md` -> the test/fixture enumeration; `MEASURED.md`/`PERF.md` -> the measured figures and the tier snapshots.
+- `../CONTEXT.md` -> crate-layer contracts, the seam types, the Stage-1/Stage-5 DAG, the wave table; `../../CONTEXT.md` sec. 4 -> the engine IR seam and the root-set contract; `../../ERTS_RUST_REWRITE_DEEPDIVE.md` sec. E/F/G -> IR seam, interpreter/JIT trade-offs, tiering rationale.
 - `../beam_loader/CONTEXT.md` -> the IR types (`Module`/`Function`/`Instr`/`Operand`/`TestKind`/`HeapNeed`/`LiteralArea`); `../beam_term/CONTEXT.md` -> the engine's term API (`Eterm`, `make_small`/`make_atom`/`NIL`, `cmp`/`eq`/`cmp_arith`, `number::big_to_f64`, `map::write_map`).
