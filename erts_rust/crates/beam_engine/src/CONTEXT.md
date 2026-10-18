@@ -195,6 +195,26 @@ metadata or an `Arc<Module>` handle, so `current_code`, `raise_snapshot`, `entry
 catch-frame stacks and the supplied-trace latches carry no heap term. The other Rust-local vectors are
 recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
 
+## Execution position (`Machine::current_code`) — the complete store set
+The single writer is `Machine::set_current_code` (`machine/location.rs:160-162`). Every store is an
+instruction boundary, but **not** every store happens before the thing it names runs:
+- Interpreter: `Machine::drive` stores **before** the charge and the body (`machine/drive.rs:169` →
+  `reduce` `:183` → step `:185`), so a `reduce` refusal parks on the **not-yet-executed** instruction;
+  `step_instruction_with_entry` re-stores the same address (`interpreter/dispatch.rs:201`).
+- Native baseline tier, driver head: `jit/baseline/mod.rs:994` (also before `reduce` `:997-1002` and
+  `code.enter` `:1012`).
+- Native block prologue: the **block's entry** pc (`jit/baseline/emit/prologue.rs:84-88` →
+  `jit_set_position`/`jit_publish_y`, `jit/baseline/runtime.rs:993`/`:1027`), so mid-block the position is
+  a block entry and a resume from it **re-executes the block prefix**.
+- Exact per-instruction helpers: `jit_step_ext` `runtime.rs:576`, `jit_family` `family.rs:85`,
+  `jit_test` `test_helper.rs:121`, the frame/heap helpers `runtime.rs:1247/1276/1318/1361/1404/1442/1475`.
+- **Seam routes that store NOTHING**, so the host hook runs with a stale (block-entry-or-earlier)
+  position: `jit_ext_call` (`resolve_external_call` at `runtime.rs:818`), `jit_local_call`
+  (`local_call_seam` at `runtime.rs:948`), and a served `Instr::Call` / `call_only` / `call_last`
+  (seam at `jit/baseline/call.rs:210`; `set_current_code` appears only in the declined arm, `:232`).
+  This is why `run_baseline_cached_resume_outcome` must not assume an exact instruction position on a
+  suspended cross-module/local-call frame.
+
 ## Long files (role-justified, beyond the ~1000-line guideline)
 Each file below is one cohesive unit — a seam module, a dispatch loop, or a comprehensive test
 suite — and is kept whole; its size is a consequence of that single responsibility, not of
