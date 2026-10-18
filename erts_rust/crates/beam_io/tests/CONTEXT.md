@@ -195,7 +195,8 @@ rot.
   real `PortRegistry`: one driver call = one `ReadMessage { header, body }` notification, the empty
   header vs `body: None` distinction, two calls in one callback = two messages in arrival order,
   `input_len` counting the header, the `{line, N}` frame header stamp, and the flat
-  `DriverContext::input()` view- `abi_busy.rs` → the `set_busy_port` state half (the raw API-table hook + the fixture's `busy`
+  `DriverContext::input()` view
+- `abi_busy.rs` → the `set_busy_port` state half (the raw API-table hook + the fixture's `busy`
   token and verbs 25/26)
 - `abi_async.rs`, `abi_vector.rs`, `abi_lifecycle.rs`, `abi_start_failure.rs` → the `driver_async`
   completion arms, the `outputv`-only entry, the port-exit adapter, a failing `start`
