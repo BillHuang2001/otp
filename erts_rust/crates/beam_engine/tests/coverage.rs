@@ -68,8 +68,9 @@
 //! engine's `src/operand.rs` unit tests.
 //!
 //! `bits/1` builds `<<Rest/binary, H:8>>` via `bs_create_bin` with an **`append`
-//! segment**, which the bitstring family now supports (a copy-rebuild; see
-//! `HANDOFF_bs_init_writable.md`). The match side
+//! segment**, which the bitstring family supports (a plain `append` copy-rebuilds;
+//! only a first-position `private_append` of a writable accumulator is in place).
+//! The match side
 //! (`bs_start_match3`/`bs_match`/`bs_get_position`) also executes, and the `<<>>`
 //! input takes the no-match clause (`bs_set_position`/`bs_get_tail`).
 //!

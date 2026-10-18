@@ -672,7 +672,7 @@ fn republish_over(src: Eterm, new_base: *mut u8) {
 /// which bumps `sb->end` to the new position instead of copying.
 ///
 /// The sink writes bits MSB-first into the payload starting at the accumulator's own
-/// window end ([`InPlace::start_bits`]), exactly like the copy-rebuild writer it
+/// window end (the sink's `start` field), exactly like the copy-rebuild writer it
 /// replaces, but the payload is written **where it already is**: no `Vec`, no fresh
 /// payload, no `[BinRef][ErlSubBits]` reservation, and the produced term is the
 /// **same `Eterm`** the accumulator already was ([`InPlace::finish`] only rewrites the
@@ -702,7 +702,8 @@ fn republish_over(src: Eterm, new_base: *mut u8) {
 /// `base_flags` is this payload). A move frees the old block, so such a word would be a
 /// use-after-free; [`InPlace::grow`] therefore scans the machine's root set
 /// ([`payload_aliased_elsewhere`]) and refuses the move (promoting instead) when one
-/// exists. See that function for the scope and why an over-approximation is safe.///
+/// exists. See that function for the scope and why an over-approximation is safe.
+///
 /// # Safety / aliasing contract (a deliberate, scoped relaxation)
 ///
 /// [`beam_alloc::RefcBinary`] documents its payload as immutable, and this sink writes
@@ -783,7 +784,8 @@ impl InPlace {
     /// payload's logical length at its whole capacity
     /// ([`Machine::cover_writable_capacity`]) — a relocation copies exactly `len()` bytes,
     /// and here `len()` is the entire backing store, of which the written prefix is a
-    /// part.    ///
+    /// part.
+    ///
     /// # Safety
     ///
     /// The republish writes through `self.src`'s frozen pair, and it is sound for exactly

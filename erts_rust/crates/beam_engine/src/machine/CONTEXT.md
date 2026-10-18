@@ -162,13 +162,30 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 A small side list of `(payload base, capacity in bytes)` for the off-heap payloads this machine
 allocated **for appending** (`bs_init_writable`'s backing store, C's `BIN_FLAG_WRITABLE` binary),
 deposited by `Machine::mark_writable(base, capacity)` and queried by
-`Machine::writable_capacity(base) -> Option<usize>` (a linear scan; no BEAM-heap allocation). The
-frozen term layout carries no capacity word and `beam_alloc::RefcBinary` is immutable, so the
-capacity has to live beside the machine; keying it per machine also gives C's
-`erts_pin_writable_binary` property for free — a payload another process's copy points at is not in
-*this* list, so it is never written in place here.
+`Machine::writable_capacity(base) -> Option<usize>` (a linear scan, newest entry preferred; no
+BEAM-heap allocation). The capacity recorded is the payload's **real** one, read back from its control
+header (`RefcBinary::with_capacity` via `Machine::alloc_refc_binary_with_capacity`, a 4x
+`DEFAULT_RESERVATION_FACTOR` reservation), never the `bs_init_writable` hint. The frozen term layout
+carries no capacity word, so the capacity has to live beside the machine; keying it per machine also
+gives C's `erts_pin_writable_binary` property for free — a payload another process's copy points at is
+not in *this* list, so it is never written in place here.
 
 Only `mark_writable` entries are writable: an ordinary binary's payload length is never taken as a
 capacity (the roster `Machine::refc_binaries` is *not* consulted). The list is **never cleared by
 `Machine::reset`**, for the same reason `refc_binaries` is not — a registry entry must never outlive
-the payload it names. Consumer: `families::bitstrings::raw::{writable_append_target, InPlace}`.
+the payload it names.
+
+**Growth keeps the two books straight.** `Machine::grow_writable_payload(base, wanted_bytes)` is the
+one widening door (`beam_alloc::RefcBinary::ensure_capacity`; C's `GROW_PROC_BIN_SIZE` schedule) and
+it re-keys (`rekey_writable`) before returning: an `InPlace` outcome moves only the cached capacity, a
+`Moved` outcome moves the key to `PayloadRelocation::to` so a stale key can never answer for the freed
+block, and both then restore the `len == capacity` handle invariant through
+`Machine::cover_writable_capacity` (C's `bin_size`; a relocation copies exactly `len()` bytes, so this
+is what keeps the appender's bytes alive). Every refusal — an unregistered payload, a shared handle, the
+`max_capacity` cap — folds into `Ok(None)` (the caller promotes to the copy-rebuild form), because each
+is a runtime condition with a correct fallback, not an internal fault. Republishing the accumulator's
+own `[BinRef][ErlSubBits]` pair over a moved base is the *caller's* job (`raw::InPlace::grow`): this
+door is safe Rust and never dereferences a term. It is consulted **only on a shortfall**, since it
+scans the roster; `compact()` is not on the append path.
+
+Consumer: `families::bitstrings::raw::{writable_append_target, InPlace, payload_aliased_elsewhere}`.

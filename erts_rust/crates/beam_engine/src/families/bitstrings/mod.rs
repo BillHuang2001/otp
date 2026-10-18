@@ -575,12 +575,15 @@ pub(super) enum Built {
 ///
 /// # Promotion
 ///
-/// The in-place destination is bounded by the payload capacity and can be invalidated by
-/// a segment source that aliases the payload. In both cases the writer **promotes**: the
-/// written prefix is copied out ([`raw::InPlace::into_bytes`]) and the build continues in
-/// [`Dest::Vec`]. Promotion is exact — the bits already written are the same bits — so the
-/// final result is byte-identical to the copy-rebuild path, and the accumulator's window
-/// is left unbumped.
+/// The in-place destination is bounded by the payload capacity, which
+/// [`raw::InPlace::grow`] widens when it can, and can be invalidated by a segment source
+/// that aliases the payload. When the payload cannot grow (a shared handle, or the
+/// `max_capacity` cap), when a second on-heap pair in this machine names it
+/// (`raw::payload_aliased_elsewhere`), or when the source overlaps it
+/// ([`raw::InPlace::overlaps`]), the writer **promotes**: the written prefix is copied out
+/// ([`raw::InPlace::into_bytes`]) and the build continues in [`Dest::Vec`]. Promotion is
+/// exact — the bits already written are the same bits — so the final result is
+/// byte-identical to the copy-rebuild path, and the accumulator's window is left unbumped.
 pub(super) struct BitWriter {
     dest: Dest,
 }
