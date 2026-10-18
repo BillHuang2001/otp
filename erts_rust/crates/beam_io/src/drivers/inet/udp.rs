@@ -158,7 +158,8 @@ use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
 
-use super::opt::{get_options, set_options, SocketOptions};
+use super::adopt_probe::adoption_reply;
+use super::opt::{get_options, set_options, OptScope, SocketOptions};
 use super::opcode::{decode as decode_opcode, Opcode};
 use super::sys::{
     bind_socket, close_fd, connect_socket, dgram_socket_fd, has_peer, hostname, local_port,
@@ -296,6 +297,12 @@ pub struct UdpInetDriver {
     /// Returns `BeamError::Io` when `getpeername(2)` fails for a reason other than "not
     /// connected" (i.e. when `fd` is not a usable socket), or when the kernel cannot report its
     /// `SO_TYPE`.
+    ///
+    /// The errno is the failing `getpeername(2)`/`getsockopt(2)` one and is **preserved** (never
+    /// rewritten into [`beam_common::BeamError::BadArg`]): unlike [`UdpInetDriver::adopt_prebound`],
+    /// this entry point has **no** control reply channel to answer through — the runtime calls it
+    /// for an `inet_async` `Accepted { fd }` hand-off ([`crate::InetAsyncResult::Accepted`]), whose
+    /// failure is the caller's to report — so the typed I/O error is the honest outcome.
     pub fn from_socket(fd: RawFd) -> Result<UdpInetDriver> {
         let state = if has_peer(fd)? {
             InetState::Connected
@@ -382,6 +389,14 @@ pub struct UdpInetDriver {
     /// probe fails for a reason other than "not connected", or when the poller rejects it. The
     /// descriptor is **not** closed on any of those paths, and the driver is left untouched when
     /// one of them fires.
+    ///
+    /// Every one of those failures carries the failing syscall's **errno** (`fcntl(2)`'s `EBADF`
+    /// for a number that is not open, `getpeername(2)`'s `ENOTSOCK` for a descriptor that is not a
+    /// socket, the poller's own errno), which is what the `INET_REQ_FDOPEN` arm renders as the C's
+    /// `ctl_error(sock_errno())` reply (`inet_ctl_fdopen`, `inet_drv.c:5253`/`:5260`) instead of
+    /// raising — see [`super::adopt_probe::adoption_reply`]. The single failure with **no** errno is
+    /// the poller's exhausted token space ([`beam_common::BeamError::SystemLimit`]); that one keeps
+    /// the typed error, because the C has no errno to name there either.
     fn adopt_prebound(
         &mut self,
         ctx: &mut DriverContext<'_>,
@@ -949,7 +964,8 @@ pub struct UdpInetDriver {
     /// `BeamError::BadArg` for a truncated `{active, N}` record (never for a served option — a
     /// rejected `setsockopt(2)` is not propagated, mirroring the C's `propagate = 0`).
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_UDP);
+        set_options(&mut self.options, scope, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
@@ -963,7 +979,8 @@ pub struct UdpInetDriver {
     ///
     /// `BeamError::Io` when a served option's `getsockopt(2)` fails on a live socket.
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_UDP);
+        get_options(&self.options, scope, self.socket, arg)
     }
 
     /// The `INET_REQ_NAME` reply (`inet_drv.c:11329`).
@@ -1148,8 +1165,21 @@ pub struct UdpInetDriver {
                         }
                         // The operand's own type tag is what the C stores as `desc->stype`
                         // (`:5268`), so it is passed through rather than assumed to be a datagram.
-                        self.adopt_prebound(ctx, fd, u16::from(arg[1]))?;
-                        Ok(ctl_ok())
+                        //
+                        // An adoption failure is the C's **reply**, never a raise: the C's
+                        // `inet_ctl_fdopen` answers `ctl_error(sock_errno())` for every failure
+                        // inside it (`:5253`, `:5260`), so the errno the failing probe already
+                        // carries (`fcntl`/`getpeername`/the poller) becomes `[0] ++ errno_name`
+                        // ([`super::adopt_probe::adoption_reply`]). Only a failure with **no**
+                        // errno — an internal limit, never a descriptor verdict — keeps the typed
+                        // error.
+                        match self.adopt_prebound(ctx, fd, u16::from(arg[1])) {
+                            Ok(()) => Ok(ctl_ok()),
+                            Err(err) => match adoption_reply(&err) {
+                                Some(reply) => Ok(reply),
+                                None => Err(err),
+                            },
+                        }
                     }
                     Err(reply) => Ok(reply),
                 }

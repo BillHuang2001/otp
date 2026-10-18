@@ -247,3 +247,38 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   `../../../erts/emulator/sys/common/{erl_poll.c,erl_check_io.c}` → the legacy C ground truth
   (`io.c:3140-3307` the `LineBuf` state machine, `:3454` `deliver_linebuf_message`, `:7211` the
   `driver_eof` flush; `erl_bif_port.c:862-869,986` the `line`/`{line,N}` option decoding).
+
+## Oracle-pinned shapes still owed by the port layer (measured with the system `erl`)
+
+A C driver fixture (`driver_output(port,"",0)`, `driver_output(port,NULL,0)`,
+`driver_output2(port,"hdr",3,{NULL,""},"body",4)`, two calls per callback) run against
+OTP 29.1.1 pins, per `open_port` option set:
+
+| call | `[]` | `[binary]` | `[{line,4}]` |
+|---|---|---|---|
+| `driver_output(p,"",0)` | `{data,[]}` | `{data,<<>>}` | **no message** |
+| `driver_output(p,NULL,0)` | `{data,[]}` | `{data,[]}` (no tail, so no binary) | no message |
+| `driver_output2(p,"hdr",3,NULL,0)` | `{data,"hdr"}` | `{data,"hdr"}` | no message |
+| `driver_output2(p,"hdr",3,"",0)` | `{data,"hdr"}` | `{data,[104,100,114\|<<>>]}` | no message |
+| `driver_output2(p,"hdr",3,"body",4)` | `{data,"hdrbody"}` | `{data,[104,100,114\|<<"body">>]}` | no message |
+| two `driver_output` in one callback | **two** `{data,`_`}` messages | two | one `noeol` frame once the buffer passes its limit |
+
+So an empty `driver_output` **is** delivered in raw mode (both port modes) and never in line
+mode, and two calls are two messages. `Port::take_input_notifications` used to gate on
+`has_input()`, which also asks the open frame's accumulator, so a staged zero-byte read was
+silently dropped; it now closes the frame first and gates on `pending_reads` alone. Still owed
+(a runtime/ABI edit, not this module's): `AbiHost::output` pushes plain `driver_output` bytes onto
+the accumulator instead of calling `DriverContext::deliver_read(&[], Some(data))`, so two calls
+inside one callback still coalesce into one `{data,_}` (the "helloW" assertions in
+`tests/abi_driver.rs`).
+
+Driver failures, measured the same way after `driver_failure*`/`driver_exit` from `output`:
+
+| C call | owner mailbox | `port_info(P,name)` | later `port_command`/`port_control`/`port_close` |
+|---|---|---|---|
+| `driver_failure_posix(p,EINVAL)` | `{'EXIT',P,einval}` | `undefined` | `badarg` |
+| `driver_failure_atom(p,"enospc")` | `{'EXIT',P,enospc}` | `undefined` | `badarg` |
+| `driver_failure(p,42)` | `{'EXIT',P,42}` | `undefined` | `badarg` |
+| `driver_failure_eof(p)` | `{'EXIT',P,normal}` | `undefined` | `badarg` |
+| `driver_exit(p,0)` / `driver_exit(p,ENOSPC)` | **nothing** (the C unlinks first, `io.c:7244`) | `undefined` | `badarg` |
+| `driver_output` then `driver_failure_posix` | `{data,…}` **then** `{'EXIT',P,einval}` | `undefined` | `badarg` |

@@ -255,6 +255,7 @@ use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
 
+mod adopt_probe;
 mod frame;
 mod opcode;
 mod opt;
@@ -281,6 +282,9 @@ use self::wire::{
     ctl_error, ctl_ok, ctl_xerror, errno_name, parse_address, parse_fake_address, FakeAddress,
     InetAddr,
 };
+// The errno an `INET_REQ_FDOPEN`(13) adoption failure carries, and the C reply it becomes
+// (`adoption_reply`): the two drivers' `Fdopen` arms answer it instead of raising.
+use self::adopt_probe::adoption_reply;
 
 // The built-in datagram driver (the `udp_inet` entry point) is a sibling module that reuses this
 // module's wire vocabulary, option store and `sys` wrappers; its public surface is re-exported
@@ -298,7 +302,7 @@ pub use self::opt::{
     INET_MULTI, INET_ONCE, INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PASSIVE,
     TCP_OPT_NODELAY,
 };
-use self::opt::{get_options, set_options, SocketOptions};
+use self::opt::{get_options, set_options, OptScope, SocketOptions};
 
 // The read-path framing glue (the bridge from the stored socket options to the pure decoder in
 // `packet`) lives in the private `frame` submodule.
@@ -606,6 +610,12 @@ impl TcpInetDriver {
     /// # Errors
     ///
     /// Returns `BeamError::Io` when `fd` is not a usable socket (`getsockopt` fails).
+    ///
+    /// The errno is the failing `getsockopt(2)`/`getpeername(2)` one and is **preserved** (never
+    /// rewritten into [`beam_common::BeamError::BadArg`]): unlike [`TcpInetDriver::adopt_prebound`],
+    /// this entry point has **no** control reply channel to answer through — the runtime calls it
+    /// for an `inet_async` `Accepted { fd }` hand-off ([`crate::InetAsyncResult::Accepted`]), whose
+    /// failure is the caller's to report — so the typed I/O error is the honest outcome.
     pub fn from_socket(fd: RawFd) -> Result<TcpInetDriver> {
         let state = if is_listening(fd)? {
             InetState::Listening
@@ -749,6 +759,14 @@ impl TcpInetDriver {
     /// probe fails for a reason other than "not connected", or when the poller rejects it. The
     /// descriptor is **not** closed on any of those paths, and the driver is left untouched when
     /// one of them fires.
+    ///
+    /// Every one of those failures carries the failing syscall's **errno** (`fcntl(2)`'s `EBADF`
+    /// for a number that is not open, `getpeername(2)`'s `ENOTSOCK` for a descriptor that is not a
+    /// socket, the poller's own errno), which is what the `INET_REQ_FDOPEN` arm renders as the C's
+    /// `ctl_error(sock_errno())` reply (`inet_ctl_fdopen`, `inet_drv.c:5253`/`:5260`) instead of
+    /// raising — see [`adopt_probe::adoption_reply`]. The single failure with **no** errno is the
+    /// poller's exhausted token space ([`beam_common::BeamError::SystemLimit`]); that one keeps the
+    /// typed error, because the C has no errno to name there either.
     fn adopt_prebound(
         &mut self,
         ctx: &mut DriverContext<'_>,
@@ -1444,7 +1462,8 @@ impl TcpInetDriver {
     /// Never for a served option (a rejected `setsockopt(2)` is not propagated, as in the C);
     /// `BeamError::BadArg` for a truncated `{active, N}` record.
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_TCP);
+        set_options(&mut self.options, scope, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
@@ -1461,7 +1480,8 @@ impl TcpInetDriver {
     /// `BeamError::Io` is **not** raised for a failed `getsockopt(2)` on a live socket: that
     /// record is dropped and the search continues, as in the C (see [`self::opt`]).
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_TCP);
+        get_options(&self.options, scope, self.socket, arg)
     }
 
     /// Routes one decoded numeric control opcode (`inet_drv.c`'s `INET_REQ_*` numbers) to the verb
@@ -1643,8 +1663,20 @@ impl TcpInetDriver {
                         // The `bound` word of the ten-byte form is already accounted for: a
                         // non-zero one made `fdopen_precheck` run `sock_name(2)` and the family
                         // comparison, so there is nothing left to check and nothing to skip.
-                        self.adopt_prebound(ctx, fd, u16::from(INET_TYPE_STREAM))?;
-                        Ok(ctl_ok())
+                        //
+                        // An adoption failure is the C's **reply**, never a raise: the C's
+                        // `inet_ctl_fdopen` answers `ctl_error(sock_errno())` for every failure
+                        // inside it (`:5253`, `:5260`), so the errno the failing probe already
+                        // carries (`fcntl`/`getpeername`/the poller) becomes `[0] ++ errno_name`
+                        // ([`adoption_reply`]). Only a failure with **no** errno — an internal
+                        // limit, never a descriptor verdict — keeps the typed error.
+                        match self.adopt_prebound(ctx, fd, u16::from(INET_TYPE_STREAM)) {
+                            Ok(()) => Ok(ctl_ok()),
+                            Err(err) => match adoption_reply(&err) {
+                                Some(reply) => Ok(reply),
+                                None => Err(err),
+                            },
+                        }
                     }
                     Err(reply) => Ok(reply),
                 }
@@ -1882,6 +1914,8 @@ pub fn make_tcp_inet() -> Result<Box<dyn Driver>> {
     Ok(Box::new(TcpInetDriver::new()))
 }
 
+#[cfg(test)]
+mod fdopen_errno_tests;
 #[cfg(test)]
 mod frame_tests;
 #[cfg(test)]
