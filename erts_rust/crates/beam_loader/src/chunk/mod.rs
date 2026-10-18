@@ -112,10 +112,12 @@ pub struct Chunks<'a> {
 
 /// Parses every known chunk out of a parsed container into a [`Chunks`] value.
 ///
-/// Missing optional chunks yield their defaults (`None`/empty); a malformed or
-/// truncated known chunk yields `BeamError::BadArg`.
+/// `AtU8`, `Code`, `ImpT` and `ExpT` are structurally required — the C reader refuses an
+/// image missing any of them (`beam_load.c:155-169`: `MISSING_ATOM_TABLE`,
+/// `MISSING_CODE_CHUNK`, `MISSING_IMPORT_TABLE`, `MISSING_EXPORT_TABLE`) — so their
+/// absence is `BeamError::BadArg`. Every other chunk is optional and yields its default
+/// (`None`/empty); a malformed or truncated known chunk yields `BeamError::BadArg`.
 pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
-    // `AtU8` and `Code` are structurally required; everything else is optional.
     // Duplicate ids keep the first occurrence (`Container::find`).
     let atom_data = chunks
         .find(ChunkId::ATOM)
@@ -136,17 +138,23 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         function_count: header.function_count,
     };
 
-    let imports = match chunks.find(ChunkId::IMPT) {
-        Some(chunk) => table::parse_imports(chunk.data)?,
-        None => Vec::new(),
-    };
-    let exports = match chunks.find(ChunkId::EXPT) {
-        Some(chunk) => table::parse_exports(chunk.data)?,
-        None => Vec::new(),
-    };
+    // `ImpT` and `ExpT` are mandatory (`beam_file.c:1674-1684`): the C reports a
+    // missing chunk before it ever looks at its contents, and an export table is what
+    // makes a module loadable. A zero-length payload is not "missing" for the C either
+    // (`chunks[..].size == 0` is the missing test) — it simply fails as a corrupt table.
+    let imports_data = chunks
+        .find(ChunkId::IMPT)
+        .ok_or_else(|| bad_file("missing ImpT chunk"))?
+        .data;
+    let imports = table::parse_imports(imports_data)?;
+    let exports_data = chunks
+        .find(ChunkId::EXPT)
+        .ok_or_else(|| bad_file("missing ExpT chunk"))?
+        .data;
+    let exports = table::parse_exports(exports_data)?;
     // `LocT` shares the `ExpT` layout; the C parses it with the same reader. It is
     // the JIT-only local-function table, so the interpreter never consults it, but it
-    // is a *recognized* chunk (not silently skipped).
+    // is a *recognized* chunk (not silently skipped) — and, unlike `ExpT`, optional.
     let locals = match chunks.find(ChunkId::LOCT) {
         Some(chunk) => table::parse_locals(chunk.data)?,
         None => Vec::new(),
@@ -374,46 +382,101 @@ mod tests {
         assert!(matches!(err, BeamError::BadArg));
     }
 
-    #[test]
-    fn missing_locals_chunk_yields_an_empty_table() {
-        // A minimal valid container: `AtU8` with the single module-name atom plus a
-        // bare `Code` header, and no `LocT` chunk at all.
-        let mut body = Vec::new();
-        body.extend_from_slice(b"AtU8");
-        body.extend_from_slice(&6u32.to_be_bytes());
-        body.extend_from_slice(&1u32.to_be_bytes()); // count = 1
-        body.extend_from_slice(&[1u8, b'm', 0, 0]); // len 1, "m", 2 pad bytes
-        body.extend_from_slice(b"Code");
-        body.extend_from_slice(&20u32.to_be_bytes());
-        body.extend_from_slice(&16u32.to_be_bytes()); // head_size
-        body.extend_from_slice(&0u32.to_be_bytes()); // format_number
-        body.extend_from_slice(&181u32.to_be_bytes()); // max_opcode
-        body.extend_from_slice(&0u32.to_be_bytes()); // label_count
-        body.extend_from_slice(&0u32.to_be_bytes()); // function_count
+    /// Appends `{(id, payload)}` chunks to a `FOR1`/`BEAM` body, with zero padding.
+    fn push_chunk(body: &mut Vec<u8>, id: &[u8; 4], payload: &[u8]) {
+        body.extend_from_slice(id);
+        body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(payload);
+        body.extend(std::iter::repeat_n(0u8, (4 - payload.len() % 4) % 4));
+    }
+
+    /// Wraps `body` in a `FOR1`/`BEAM` container.
+    fn wrap(body: &[u8]) -> Vec<u8> {
         let mut image = Vec::new();
         image.extend_from_slice(b"FOR1");
         image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
         image.extend_from_slice(b"BEAM");
-        image.extend_from_slice(&body);
+        image.extend_from_slice(body);
+        image
+    }
 
+    /// The `AtU8` payload for the single module-name atom `m`.
+    fn atoms_m() -> Vec<u8> {
+        let mut atoms = Vec::new();
+        atoms.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+        atoms.push(1); // length 1
+        atoms.push(b'm');
+        atoms
+    }
+
+    /// A bare, valid `Code` header with no instruction stream.
+    fn code_header() -> Vec<u8> {
+        let mut code = Vec::new();
+        code.extend_from_slice(&16u32.to_be_bytes()); // head_size
+        code.extend_from_slice(&0u32.to_be_bytes()); // format_number
+        code.extend_from_slice(&181u32.to_be_bytes()); // max_opcode
+        code.extend_from_slice(&0u32.to_be_bytes()); // label_count
+        code.extend_from_slice(&0u32.to_be_bytes()); // function_count
+        code
+    }
+
+    /// A minimal image: `AtU8` + `Code` + empty `ImpT`/`ExpT` (both mandatory), plus
+    /// whichever extra chunks the caller adds.
+    fn minimal_image(extra: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let atoms = atoms_m();
+        let code = code_header();
+        let empty = 0u32.to_be_bytes();
+        let mut body = Vec::new();
+        push_chunk(&mut body, b"AtU8", &atoms);
+        push_chunk(&mut body, b"Code", &code);
+        push_chunk(&mut body, b"ImpT", &empty);
+        push_chunk(&mut body, b"ExpT", &empty);
+        for (id, payload) in extra {
+            push_chunk(&mut body, id, payload);
+        }
+        wrap(&body)
+    }
+
+    #[test]
+    fn missing_locals_chunk_yields_an_empty_table() {
+        // `LocT` is optional: a minimal but complete image (all four mandatory chunks
+        // present) parses with an empty locals table.
+        let image = minimal_image(&[]);
         let container = crate::container::parse(&image).unwrap();
         assert!(container.find(crate::container::ChunkId::LOCT).is_none());
         let chunks = parse(&container).unwrap();
         assert!(chunks.locals.is_empty());
+        assert!(chunks.imports.is_empty());
+        assert!(chunks.exports.is_empty());
+    }
+
+    #[test]
+    fn missing_import_or_export_table_is_rejected() {
+        // `ImpT` and `ExpT` are mandatory (`beam_file.c:1674-1684`). The control image
+        // loads, so each rejection is caused by the removed chunk alone.
+        parse(&crate::container::parse(&minimal_image(&[])).unwrap())
+            .expect("the complete minimal image parses");
+        for id in [crate::container::ChunkId::IMPT, crate::container::ChunkId::EXPT] {
+            let image = minimal_image(&[]);
+            let container = crate::container::parse(&image).unwrap();
+            // Rebuild the container without the chunk under test.
+            let kept: Vec<_> = container.chunks.iter().copied().filter(|c| c.id != id).collect();
+            let filtered = crate::container::Container { chunks: kept };
+            let err = parse(&filtered).unwrap_err();
+            assert!(matches!(err, BeamError::BadArg), "{id:?}");
+        }
     }
 
     #[test]
     fn missing_code_chunk_is_rejected() {
-        // A container with only an `AtU8` chunk holding zero atoms.
+        // A container with an `AtU8` chunk and the two mandatory tables, but no `Code`.
+        let atoms = atoms_m();
+        let empty = 0u32.to_be_bytes();
         let mut body = Vec::new();
-        body.extend_from_slice(b"AtU8");
-        body.extend_from_slice(&4u32.to_be_bytes());
-        body.extend_from_slice(&0u32.to_be_bytes());
-        let mut image = Vec::new();
-        image.extend_from_slice(b"FOR1");
-        image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
-        image.extend_from_slice(b"BEAM");
-        image.extend_from_slice(&body);
+        push_chunk(&mut body, b"AtU8", &atoms);
+        push_chunk(&mut body, b"ImpT", &empty);
+        push_chunk(&mut body, b"ExpT", &empty);
+        let image = wrap(&body);
 
         let container = crate::container::parse(&image).unwrap();
         let err = parse(&container).unwrap_err();

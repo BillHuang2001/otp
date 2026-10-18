@@ -29,8 +29,12 @@
 //! chunk entry * :  u8[4] chunk_id | u32 size | size bytes | (4 - size%4)%4 zero pad
 //! ```
 //!
-//! `"BEAM"` is the form *type*, not a chunk. Chunks parse until EOF; unknown ids
-//! are skipped, duplicate ids keep the first, and chunk order is not significant.
+//! `"BEAM"` is the form *type*, not a chunk. The chunk walk is bounded by
+//! `form_length` — the C reader views exactly the declared form (`iff_init`,
+//! `beam_file.c:2040-2052`) and stops at the end of that view, so bytes trailing the
+//! form are ignored (`read_beam_chunks`, `beam_file.c:1536-1576`). Inside the form,
+//! unknown ids are skipped, duplicate ids keep the first, and chunk order is not
+//! significant.
 //!
 //! Parsing is safe Rust: the byte cursor is [`beam_codec::Reader`], the ETF
 //! codec's bounds-checked big-endian reader (the lowest common ancestor for
@@ -155,8 +159,13 @@ impl<'a> Container<'a> {
 
 /// Parses the `FOR1` header and the chunk directory out of a `.beam` image.
 ///
-/// A missing/bad `FOR1` magic, a bad form type, a chunk size that overruns the file
+/// A missing/bad `FOR1` magic, a bad form type, a chunk size that overruns the form
 /// or a truncated directory each yield `BeamError::BadArg` — never a panic.
+///
+/// The chunk directory is walked **inside the declared `form_length` only**, exactly
+/// as the C reader does (`iff_init` hands `read_beam_chunks` a view of `form_length`
+/// bytes, `beam_file.c:2040-2058`): bytes past the form are ignored, and a chunk whose
+/// padded payload does not fit in what is left of the form is a corrupt image.
 pub fn parse(bytes: &[u8]) -> Result<Container<'_>> {
     // The fixed preamble is `FOR1` + `form_length` + `BEAM`; anything shorter is
     // truncated before it can even be inspected.
@@ -173,9 +182,13 @@ pub fn parse(bytes: &[u8]) -> Result<Container<'_>> {
 
     // `form_length` is the whole form size minus the 8-byte `FOR1`+length prefix;
     // it INCLUDES the 4-byte form type. It bounds the image, so a value that claims
-    // more bytes than the file holds is rejected up front.
-    let form_length = reader.u32be()?;
-    if (form_length as usize).saturating_add(8) > bytes.len() {
+    // more bytes than the file holds is rejected up front, and one that cannot even
+    // hold the form type is structurally invalid.
+    let form_length = reader.u32be()? as usize;
+    if form_length < BEAM_FORM_TYPE.len() {
+        return Err(bad_file("form length smaller than the form type"));
+    }
+    if form_length.saturating_add(8) > bytes.len() {
         return Err(truncated("form length"));
     }
 
@@ -184,9 +197,12 @@ pub fn parse(bytes: &[u8]) -> Result<Container<'_>> {
         return Err(bad_file("bad BEAM form type"));
     }
 
-    // Chunks start right after the 12-byte preamble and run to EOF; unknown ids are
-    // skipped (they simply become `RawChunk`s the caller ignores) and duplicate ids
-    // keep the first (`Container::find`).
+    // Everything after the form type, bounded by the declared form. The C walk
+    // (`read_beam_chunks`) runs to the end of this view: trailing bytes outside the
+    // form are never examined and a chunk must fit, padding included, inside it.
+    let form = reader.bytes(form_length - BEAM_FORM_TYPE.len())?;
+    let mut reader = beam_codec::Reader::new(form);
+
     let mut chunks = Vec::new();
     loop {
         let remaining = reader.remaining();
@@ -202,18 +218,18 @@ pub fn parse(bytes: &[u8]) -> Result<Container<'_>> {
         let id = ChunkId([id_bytes[0], id_bytes[1], id_bytes[2], id_bytes[3]]);
         let size = reader.u32be()? as usize;
 
-        // The payload must fit in what is left after the header.
-        if size > reader.remaining() {
-            return Err(bad_file("chunk size overruns file"));
+        // Chunk storage is padded to the next 4-byte boundary and that padded size
+        // must fit in the rest of the form (`beamreader_test(&reader, storage_size)`,
+        // `beam_file.c:1554`). `size` came from a `u32`, so `size + 3` cannot wrap.
+        let storage = (size + 3) & !3;
+        if storage > reader.remaining() {
+            return Err(bad_file("chunk size overruns form"));
         }
         let data = reader.bytes(size)?;
 
-        // Payloads are padded to a 4-byte boundary with zero bytes.
-        let pad = (4 - (size % 4)) % 4;
-        if reader.remaining() < pad {
-            return Err(truncated("chunk padding"));
-        }
-        reader.bytes(pad)?;
+        // Payloads are padded to a 4-byte boundary with zero bytes (skipped, not
+        // validated).
+        reader.bytes(storage - size)?;
 
         chunks.push(RawChunk { id, data });
     }
@@ -328,10 +344,62 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_chunk_header_is_rejected() {
-        // A trailing 4 bytes that cannot form a full id+size pair.
+    fn form_length_smaller_than_the_form_type_is_rejected() {
+        // The declared form must at least hold the 4-byte form type itself
+        // (`read_beam_chunks` reads it out of the form view, `beam_file.c:1548`).
+        let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        image[4..8].copy_from_slice(&3u32.to_be_bytes());
+        let err = parse(&image).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn incomplete_chunk_header_is_ignored_when_it_lies_past_the_form() {
+        // Four trailing bytes cannot form a full id+size pair, but they lie *outside*
+        // the declared form: the C walk is bounded by `form_length` and never sees
+        // them (`beam_file.c:2040-2058`), so the directory parses unchanged.
+        let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        let form_length = u32::from_be_bytes(image[4..8].try_into().unwrap());
+        image.extend_from_slice(b"XXXX");
+        let container = parse(&image).unwrap();
+        // The form length still describes the same single chunk.
+        assert_eq!(u32::from_be_bytes(image[4..8].try_into().unwrap()), form_length);
+        assert_eq!(container.chunks.len(), 1);
+        assert_eq!(container.chunks[0].id, ChunkId(*b"Test"));
+        assert_eq!(container.chunks[0].data, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn incomplete_chunk_header_inside_the_form_is_rejected() {
+        // The very same trailing 4 bytes, but now *inside* the declared form: the walk
+        // reaches them and cannot form a chunk entry.
         let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
         image.extend_from_slice(b"XXXX");
+        let form_length = u32::from_be_bytes(image[4..8].try_into().unwrap());
+        image[4..8].copy_from_slice(&(form_length + 4).to_be_bytes());
+        let err = parse(&image).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn a_form_that_ends_inside_a_chunk_is_rejected() {
+        // A `form_length` four bytes short of the chunk's padded payload: the C's
+        // `beamreader_test(&reader, storage_size)` fails, so the image is corrupt
+        // rather than silently truncated.
+        let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        let form_length = u32::from_be_bytes(image[4..8].try_into().unwrap());
+        image[4..8].copy_from_slice(&(form_length - 4).to_be_bytes());
+        let err = parse(&image).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn a_chunk_whose_padding_does_not_fit_the_form_is_rejected() {
+        // A 3-byte payload needs one pad byte; the form ends before it
+        // (`storage_size = (size + 3) & ~3`, `beam_file.c:1551-1554`).
+        let mut image = build_image(&[(b"Test", &[1, 2, 3])]);
+        let form_length = u32::from_be_bytes(image[4..8].try_into().unwrap());
+        image[4..8].copy_from_slice(&(form_length - 1).to_be_bytes());
         let err = parse(&image).unwrap_err();
         assert!(matches!(err, BeamError::BadArg));
     }
