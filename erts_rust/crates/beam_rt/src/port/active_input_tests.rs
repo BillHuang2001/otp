@@ -600,12 +600,48 @@ fn registry_with(
     (registry, id)
 }
 
+/// Every `{active, …}` delivery the provider has **staged but not yet reported**: the
+/// [`PortEvent::ActiveInput`](crate::port::PortEvent) entries in the registry's pending lane,
+/// plus anything a direct drain still finds.
+///
+/// The staging sites ([`PortRegistry::write_command`], [`PortRegistry::port_control`],
+/// [`PortRegistry::close`], [`PortRegistry::pump`]) drain the channel beside the completions and
+/// hold each packet as pending work, so this — not a bare
+/// [`drain_active_inputs`](PortRegistry::drain_active_inputs) — is how a delivery is observed
+/// from outside the provider. The trailing direct drain keeps the helper honest for a fixture
+/// that has not gone through a staging site yet; on a registry that has, it answers nothing.
+fn take_active_inputs(registry: &mut PortRegistry) -> Vec<ActiveInputPacket> {
+    let mut out = Vec::new();
+    let mut retained = Vec::new();
+    for event in std::mem::take(&mut registry.pending_events) {
+        match event {
+            crate::port::PortEvent::ActiveInput { packet } => out.push(packet),
+            other => retained.push(other),
+        }
+    }
+    registry.pending_events = retained;
+    out.extend(registry.drain_active_inputs());
+    out
+}
+
+/// How many `{active, …}` deliveries the pending lane currently holds — a **non-consuming**
+/// witness, so a test can assert a staging site produced one *and* keep it for the assertions
+/// that follow.
+fn staged_active_inputs(registry: &PortRegistry) -> usize {
+    registry
+        .pending_events
+        .iter()
+        .filter(|event| matches!(event, crate::port::PortEvent::ActiveInput { .. }))
+        .count()
+}
+
 /// A live port's `{active, …}` delivery is bound to that port's **owner**, **stream mode** and
 /// **socket kind** at drain time.
 ///
 /// This is the ordinary path: a socket driver's read-readiness callback stages the delivery, and
 /// the drain's own reader (right beside the completion channel's) resolves the recipient while the
-/// metadata is still readable.
+/// metadata is still readable. [`PortRegistry::write_command`] is the staging site that drives it
+/// here, so the packet is observed through the provider's own pending lane.
 #[test]
 fn a_live_ports_delivery_is_bound_to_its_owner_mode_and_kind_at_drain_time() {
     let read = ReadMessage::body_only(b"hi".to_vec());
@@ -618,7 +654,12 @@ fn a_live_ports_delivery_is_bound_to_its_owner_mode_and_kind_at_drain_time() {
     registry
         .write_command(id, b"")
         .expect("the command reaches the driver");
-    let packets = registry.drain_active_inputs();
+    assert_eq!(
+        staged_active_inputs(&registry),
+        1,
+        "the command's driver callback stages one delivery and the provider holds it as pending work"
+    );
+    let packets = take_active_inputs(&mut registry);
     assert_eq!(packets.len(), 1, "exactly one delivery, reported once");
     assert_eq!(packets[0].port, id, "the port the driver belongs to");
     assert_eq!(packets[0].owner, OWNER, "the drain binds the port's owner");
@@ -638,7 +679,7 @@ fn a_live_ports_delivery_is_bound_to_its_owner_mode_and_kind_at_drain_time() {
         "the driver's own delivery, untouched"
     );
     assert!(
-        registry.drain_active_inputs().is_empty(),
+        take_active_inputs(&mut registry).is_empty(),
         "the delivery is consumed by the drain, never reported twice"
     );
 }
@@ -655,7 +696,7 @@ fn a_udp_ports_delivery_is_bound_to_the_udp_kind() {
         "udp_inet",
     );
     registry.write_command(id, b"").expect("the command");
-    let packets = registry.drain_active_inputs();
+    let packets = take_active_inputs(&mut registry);
     assert_eq!(packets.len(), 1);
     assert_eq!(packets[0].kind, ActivePortKind::Udp);
     assert_eq!(packets[0].data_mode, StreamType::List);
@@ -680,11 +721,11 @@ fn a_delivery_for_a_port_that_has_left_the_runtime_is_dropped_once_and_never_re_
         "the close removed the metadata a drain would otherwise read"
     );
     assert!(
-        registry.drain_active_inputs().is_empty(),
+        take_active_inputs(&mut registry).is_empty(),
         "a delivery whose port has left the runtime has no recipient and is dropped"
     );
     assert!(
-        registry.drain_active_inputs().is_empty(),
+        take_active_inputs(&mut registry).is_empty(),
         "and the drop is final: the delivery was consumed, never re-reported"
     );
 }
@@ -709,11 +750,11 @@ fn a_delivery_drained_before_a_close_is_still_deliverable_after_it() {
     registry
         .write_command(id, b"")
         .expect("the command reaches the driver");
-    let packets = registry.drain_active_inputs();
+    let packets = take_active_inputs(&mut registry);
     assert_eq!(packets.len(), 1, "the drain reports the staged delivery");
     registry.close(id).expect("the port closes");
     assert!(
-        registry.drain_active_inputs().is_empty(),
+        take_active_inputs(&mut registry).is_empty(),
         "the close staged nothing further: the packet above is the only one"
     );
     // The reported packet still renders to the oracle's message, naming the port that has just

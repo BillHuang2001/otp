@@ -413,22 +413,39 @@ impl Session {
             .map_or(0, |options| options.records().len())
     }
 
-    /// One pump round followed by a drain of the active-input channel — the two steps a consuming
-    /// route performs, in the order `src/port.rs` performs them.
+    /// One pump round followed by a reading of the provider's pending lane — the two steps a
+    /// consuming route performs, in the order `src/port.rs` performs them.
     ///
-    /// While `src/port.rs` does not yet drain this channel, `pump` reports no event and the drain
-    /// below is what answers. The day a `PortEvent` arm exists for these packets, `pump` consumes
-    /// them into its own pending lane and this direct drain answers nothing — a **test-harness**
-    /// staleness, not a runtime defect (a passive socket's bytes legitimately ride the ordinary
-    /// `PortEvent::Data` lane, so an event here is not evidence either way).
+    /// The provider drains the `{active, …}` channel beside every completion drain and holds each
+    /// packet as a [`PortEvent::ActiveInput`](crate::port::PortEvent), so a delivery is observed
+    /// by collecting those events out of `pump`'s own report **and** out of `pending_events` (a
+    /// `write_command`/`port_control` staging site queues there instead). A direct
+    /// [`drain_active_inputs`](crate::port::PortRegistry) is kept as a last resort so the helper
+    /// stays honest for a fixture that takes a path with no staging site.
     fn round(&mut self) -> Vec<ActiveInputPacket> {
-        {
+        let events = {
             let mut registry = self.rt.ports.borrow_mut();
-            let _events = registry
+            registry
                 .pump(PUMP_SLICE)
-                .unwrap_or_else(|error| panic!("the port round: {error}"));
+                .unwrap_or_else(|error| panic!("the port round: {error}"))
+        };
+        let mut packets = Vec::new();
+        for event in events {
+            if let crate::port::PortEvent::ActiveInput { packet } = event {
+                packets.push(packet);
+            }
         }
-        self.rt.ports.borrow_mut().drain_active_inputs()
+        let mut registry = self.rt.ports.borrow_mut();
+        let mut retained = Vec::new();
+        for event in std::mem::take(&mut registry.pending_events) {
+            match event {
+                crate::port::PortEvent::ActiveInput { packet } => packets.push(packet),
+                other => retained.push(other),
+            }
+        }
+        registry.pending_events = retained;
+        packets.extend(registry.drain_active_inputs());
+        packets
     }
 
     /// Pumps until the channel produces a delivery or `bound` expires, returning **everything** the

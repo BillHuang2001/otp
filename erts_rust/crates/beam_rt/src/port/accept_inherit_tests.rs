@@ -683,6 +683,77 @@ fn a_rejected_setopts_never_enters_the_option_mirror() {
 }
 
 // -----------------------------------------------------------------------------------------------
+// Test 2b — the recording hook is *production's*, proved without the harness's stand-in
+// -----------------------------------------------------------------------------------------------
+
+/// The option mirror is fed by `PortRegistry::port_control` itself: one `setopts` control call
+/// populates it, and a refused one leaves it untouched.
+///
+/// Every other case here reaches the mirror through the [`setopts`] helper, which stands in for the
+/// hook when it is absent — so those cases alone cannot tell a live hook from a dead one. This case
+/// calls `port_control` **directly** and reads the mirror, which is the only evidence that the
+/// `src/port.rs` call site exists rather than the harness supplying the state.
+#[test]
+fn a_setopts_control_call_populates_the_option_mirror_from_production_alone() {
+    let Some(mut listener) = Listener::open() else {
+        return;
+    };
+    listener.bind_and_listen();
+    {
+        let reg = listener.reg();
+        assert_eq!(
+            recorded(&reg, listener.id),
+            0,
+            "a freshly opened port has been told no option, so its mirror holds no record"
+        );
+        assert_eq!(
+            reg.data_mode(listener.id, StreamType::Binary),
+            StreamType::Binary,
+            "and its effective data mode is still the open-time `[binary]`"
+        );
+    }
+
+    let arg = listener_options();
+    let records = 5;
+    let reply = control(&mut listener.reg(), listener.id, &setopts_op(), &arg);
+    assert_eq!(reply, vec![1], "the driver accepts the five records");
+    {
+        let reg = listener.reg();
+        assert_eq!(
+            recorded(&reg, listener.id),
+            records,
+            "the control call recorded every accepted record on its own — no caller stood in"
+        );
+        assert_eq!(
+            reg.data_mode(listener.id, StreamType::Binary),
+            StreamType::List,
+            "and the `{{mode,list}}` record moved the port's effective data mode"
+        );
+    }
+
+    // A refused record is a reply (`[0]einval`), not an error, and must record nothing either.
+    let before = {
+        let reg = listener.reg();
+        reg.inet_options(listener.id)
+            .cloned()
+            .expect("the configured listener's mirror")
+    };
+    let unserved = record(200, 1);
+    let reply = control(&mut listener.reg(), listener.id, &setopts_op(), &unserved);
+    assert_eq!(reply, b"\x00einval".to_vec(), "the driver's refusal reply");
+    {
+        let reg = listener.reg();
+        assert_eq!(
+            reg.inet_options(listener.id),
+            Some(&before),
+            "a `[0]` tag is not INET_REP_OK, so production recorded nothing"
+        );
+    }
+
+    listener.close_all(None);
+}
+
+// -----------------------------------------------------------------------------------------------
 // Test 3 — a record the driver rejects *during* the replay fails the whole accept
 // -----------------------------------------------------------------------------------------------
 
