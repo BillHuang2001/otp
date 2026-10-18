@@ -70,6 +70,15 @@
 //!
 //! Nothing else in this test binary allocates through `beam_alloc`, so that difference is the
 //! whole of it.
+//!
+//! **The roster's slot array is observed, not pinned.** The 256 pushes leave the roster's `Vec` at
+//! an *observed* capacity of 256 positions — **16 384** slot bytes on this target, the figure a run
+//! prints — but that capacity is the allocator's growth schedule, not this crate's contract: any
+//! `Vec` growth (doubling, 1.5×, `reserve_exact`) may differ between toolchains. The test therefore
+//! pins the array only as a documented two-sided range — at least one slot position per push, at
+//! most a doubling of the element count — and never as an exact capacity, so a differing growth
+//! schedule cannot turn this test red for a reason unrelated to the accounting contract.
+//!
 //! The band discriminates: deleting **either** half collapses the ratio (payload-only →
 //! 0.5185, capacity-only → 0.4754), which the two "each half is more than a quarter of `live`"
 //! assertions below state explicitly — so the band cannot pass on one half alone.
@@ -314,17 +323,34 @@ fn accounted_bytes_track_the_allocators_live_bytes() {
     assert_eq!(footprint.off_heap_entries, PAYLOAD_COUNT);
 
     // The roster array: one slot per position, none of it in the allocator-visible subset.
-    let slot_bytes_by_position = roster.slot_count() * size_of::<Option<OffHeapEntry>>();
     assert_eq!(
         footprint.off_heap_slot_bytes,
         roster.slot_bytes(),
         "the field is the roster's own reserved array"
     );
     assert_eq!(
-        footprint.off_heap_slot_bytes, slot_bytes_by_position,
-        "{PAYLOAD_COUNT} pushes land the roster at exactly that many slots (a power-of-two \
-         capacity), so one slot is {} bytes on this target",
-        size_of::<Option<OffHeapEntry>>()
+        roster.slot_count(),
+        PAYLOAD_COUNT,
+        "one reserved position per push: the roster is slot-stable, so no position is ever reused"
+    );
+    // The *capacity* of that reserved array is the allocator's business, never this crate's
+    // contract: a `Vec`'s growth schedule (doubling, 1.5×, `reserve_exact`) may differ between
+    // toolchains, so the figure is pinned as a two-sided range of the element count instead of an
+    // exact capacity.
+    let slot_bytes_per_position = size_of::<Option<OffHeapEntry>>();
+    assert!(
+        footprint.off_heap_slot_bytes >= PAYLOAD_COUNT * slot_bytes_per_position,
+        "a Vec never holds more elements than its capacity, so the reserved array is at least one \
+         slot position per push: {} slot bytes for {PAYLOAD_COUNT} slots of {slot_bytes_per_position} \
+         bytes",
+        footprint.off_heap_slot_bytes
+    );
+    assert!(
+        footprint.off_heap_slot_bytes <= 2 * PAYLOAD_COUNT * slot_bytes_per_position,
+        "nor more than a doubling of the element count, the std growth bound — the exact capacity \
+         is the allocator's business, never this crate's contract: {} slot bytes for {PAYLOAD_COUNT} \
+         slots of {slot_bytes_per_position} bytes",
+        footprint.off_heap_slot_bytes
     );
     assert_eq!(
         footprint.total_bytes(),
