@@ -174,6 +174,8 @@ impl<'a> RuntimeContext<'a> {
     /// A context over `runtime`, with the default (stdout) output sink, running as the
     /// runtime's own process.
     pub fn new(runtime: &'a mut Runtime) -> RuntimeContext<'a> {
+        // TEMPORARY (delete): the per-context probe of the copy-out A/B.
+        super::calls::coprobe::context_created();
         let mailbox_pid = runtime.self_pid;
         RuntimeContext {
             runtime,
@@ -192,6 +194,8 @@ impl<'a> RuntimeContext<'a> {
 
     /// A context over `runtime` whose program output goes to `sink`.
     pub fn with_output(runtime: &'a mut Runtime, sink: &'a mut dyn OutputSink) -> RuntimeContext<'a> {
+        // TEMPORARY (delete).
+        super::calls::coprobe::context_created();
         let mailbox_pid = runtime.self_pid;
         RuntimeContext {
             runtime,
@@ -228,6 +232,8 @@ impl<'a> RuntimeContext<'a> {
         table: &'a mut ProcessTable,
         pid: ProcessId,
     ) -> RuntimeContext<'a> {
+        // TEMPORARY (delete).
+        super::calls::coprobe::context_created();
         RuntimeContext {
             runtime,
             output: None,

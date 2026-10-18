@@ -1175,6 +1175,8 @@ pub(crate) fn ensure_heap(
     // [`collect_or_grow`] for why the growth is what keeps a request larger than the nursery
     // on the process's own reclaimable heap, and for the bounded-policy fallback.
     let action = collect_or_grow(process, heap_need);
+    // TEMPORARY (delete): the per-door collection counters of the copy-out A/B.
+    super::calls::coprobe::door(&super::calls::coprobe::DOOR_NARROW);
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
@@ -1393,6 +1395,8 @@ pub(crate) fn ensure_heap_full(
     // The action is the same as the narrow door's: collect, or grow the nursery to fit a
     // request the post-collection nursery cannot hold. See [`collect_or_grow`].
     let action = collect_or_grow(process, heap_need);
+    // TEMPORARY (delete).
+    super::calls::coprobe::door(&super::calls::coprobe::DOOR_FULL);
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
@@ -1751,6 +1755,8 @@ pub(crate) fn alloc_words_rooted(
     }
     match process.collect() {
         Ok(collection) => {
+            // TEMPORARY (delete).
+            super::calls::coprobe::door(&super::calls::coprobe::DOOR_ROOTS);
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
             // The `max_heap_size` verdict, drained exactly as the two heap-admission doors'

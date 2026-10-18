@@ -308,6 +308,8 @@ pub(crate) fn collect_at_reds_boundary(
         .or_else(|_| process.collect());
     match action {
         Ok(collection) => {
+            // TEMPORARY (delete).
+            super::super::calls::coprobe::door(&super::super::calls::coprobe::DOOR_REDS);
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
             // The `max_heap_size` verdict this collection latched on the PCB — the same drain
