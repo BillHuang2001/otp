@@ -263,19 +263,26 @@ port term): `{active,once}` + `<<"hi">>` ⇒ `{tcp,'#Port<P>',<<"hi">>}`; `[list
 **port field is big-endian**; UDP `{active,2}` + three datagrams ⇒ two `{udp,…}` then
 `{udp_passive,…}`; an empty datagram is `{udp,'#Port<P>',{127,0,0,1},50339,<<>>}`.
 **These shapes are rendered by `RuntimeContext::active_input_message` but are not yet live in a
-running runtime** — see *Required wiring at the parent node* below.
+running runtime** — nothing drains or delivers the channel yet; see *Wiring* below.
+
+The module is declared from **`ops.rs`** (`#[path = "active_input.rs"] pub(crate) mod
+active_input;`, beside the `#[path]` declaration of `inet_opts`), so it compiles today; its suite
+is its own child (`#[path = "active_input_tests.rs"] mod tests`, 16 cases) and is reached with
+`... -p beam_rt --lib -- active_input`.
 
 **`ActiveInputPacket { port, owner, data_mode, kind, event }`** mirrors `CompletionPacket`: the
 owner, the stream mode and the port's **kind** are all resolved at **drain** time
 (`PortRegistry::drain_active_inputs`, from `PortMeta`), because a delivery staged around a
-teardown outlives the metadata. `ActivePortKind { Tcp, Udp, Other }` comes from the driver name —
-`driver_path_name(&meta.command)` matched literally against `tcp_inet`/`udp_inet`, the same
-first-blank rule the driver search applies. `Other` is a **typed capability gap** for both events
-(`crate::error::unsupported`, naming the port), never a fabricated `{tcp,…}` and never a silent
-drop. A delivery whose port has already left the runtime is **dropped**, the completion channel's
-rule, and the drop is final: `PortEvent::ActiveInput` answers `None` from `PortEvent::port()` — its
-recipient is already resolved — so `close`'s purge of the closing port's retained events cannot
-drop the deliveries a close produced, and a recycled port number can never inherit one.
+teardown outlives the metadata. `drain_active_inputs` returns `Vec<ActiveInputPacket>` — its own
+term-free type, **not** a `PortEvent`: the packet already names its recipient, so the provider
+needs no event variant to carry it and no second table read to deliver it. `ActivePortKind
+{ Tcp, Udp, Other }` comes from the driver name — `driver_path_name(&meta.command)` matched
+literally against `tcp_inet`/`udp_inet`, the same first-blank rule the driver search applies.
+`Other` is a **typed capability gap** for both events (`crate::error::unsupported`, naming the
+port), never a fabricated `{tcp,…}` and never a silent drop. A delivery whose port has already
+left the runtime is **dropped**, the completion channel's rule, and the drop is final: the packet
+carries the `owner`/`port` it resolved, so nothing can be re-attributed to a later port that
+reuses the number, and the draining `Vec` is the only thing that carried it.
 
 **The mode seam is `PortMeta::data_mode`** (`impl PortMeta`, in `active_input.rs`), whose body is
 `self.stream` today: `{mode, list|binary}` never reaches `beam_io` (`drivers/inet/CONTEXT.md`
@@ -298,16 +305,18 @@ consing / improper lists / list flattening cannot drift into a second byte-list 
 header that is not exactly one packed IPv4 record is a typed gap — an address is the one element
 of `{udp,…}` that must never be invented.
 
-**Required wiring at the parent node (`src/port.rs`)** — this file is written against these and
-does not compile until they exist: `pub(crate) mod active_input;`, `mod active_input_tests;`,
-`PortEvent::ActiveInput { packet }` (plus its `port()` arm answering `None`),
-`events.extend(self.drain_active_inputs())` immediately after each of the six
-`drain_io_completions(...)` calls (`write_command`'s two branches, `port_control`, `close`,
-`pump`'s round and `pump`'s "nothing live to poll" early return), the two delivery arms
-(`Runtime::deliver_port_messages` → `packet.owner` via `deliver_in_table`, so a blocked receiver
-wakes; `RuntimeContext::poll_port_messages` → only `packet.owner == self.pid()`), and
-`RuntimeContext::active_input_message` on the public path. `has_nothing_to_poll` needs **no**
-change: a drained delivery rides `pending_events`, which it already counts.
+**Wiring still owed by the parent node (`src/port.rs`)** — the module compiles and its suite
+passes without any of it, because the drain is called directly by the tests: (a) call
+`drain_active_inputs()` immediately after each of the six `drain_io_completions(...)` sites
+(`write_command`'s two branches, `port_control`, `close`, `pump`'s round and `pump`'s "nothing
+live to poll" early return) and hold the returned packets as pending work, and (b) the two
+delivery arms (`Runtime::deliver_port_messages` → `packet.owner` via `deliver_in_table`, so a
+blocked receiver wakes; `RuntimeContext::poll_port_messages` → only `packet.owner == self.pid()`),
+calling `RuntimeContext::active_input_message` on the public path. Until (a) lands, a staged
+active delivery is never drained, so `src/port.rs` currently reports the module's items as dead
+code (10 of the crate's 31 build warnings, the other 21 being `inet_opts`'s);
+`PortRegistry::has_nothing_to_poll` will then need the pending packets counted (they are not a
+`PortEvent` and so are invisible to `pending_events`).
 
 **Known residual — `hsz > len`.** The C's list branch is `(mode == LIST) || (hsz > len)`, so a
 `{header,N}` wider than the payload is one flat string with no binary tail (the oracle's `"h"`).
