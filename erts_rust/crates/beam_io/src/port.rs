@@ -625,10 +625,19 @@ impl Port {
     /// before the frames can be drained with [`Port::take_line_frames`].
     pub(crate) fn take_input_notifications(&mut self) -> Vec<PortNotification> {
         if self.line_mode.is_none() {
-            if !self.has_input() {
+            // Close the accumulator **first**, then decide on the completed reads alone: a
+            // staged read is owed to the owner even when it carries **zero** bytes, because the
+            // C delivers one message per `driver_output*` call and an empty call is the oracle's
+            // `{Port, {data, []}}` (`deliver_read_message` builds the reply from the call, never
+            // from a byte count — `io.c:3372` tests `buf != NULL`, not `len != 0`). Gating on
+            // `has_input()` (which also asks the accumulator) silently dropped such a read. The
+            // "a driver that made no `driver_output*` call is owed nothing" invariant is kept by
+            // the `pending_reads` test below: an empty accumulator mints no read, so a silent
+            // port stays silent.
+            self.close_input_frame();
+            if self.pending_reads.is_empty() {
                 return Vec::new();
             }
-            self.close_input_frame();
             let port = self.id;
             return self
                 .pending_reads
