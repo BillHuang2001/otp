@@ -14,6 +14,14 @@ Ground truth (read-only): `../../erts/emulator/beam/` (Routing Table files), `..
 The dedup **seam union is 242** = the 14 `hook_sets.rs` tables (246 raw keys − the 4 `LOCAL_FUN_IDENTITY ∩ LOCAL_NODE` keys); **30** union members are *undeclared* (`MEMORY_HOOK_BIFS` 2 ∪ `PORT_HOOK_BIFS` 4 ∪ `FUN_CALLER_BIFS` 24).
 **209** keys are runtime-coupled under `src/runtime/` (`./src/runtime/CONTEXT.md`); there are **no dead registrations**.
 `tests/roster_audit.rs` builds the union from the 14 public tables (never a hard-coded list) and asserts the partition (556 = 212 + 344), the union size, the per-table/per-module declared counts (25 modules) and every union member's `needs_*` predicate.
+
+### The oracle cross-check behind "556 = 556" (the enumeration method)
+`erlang:system_info(bif_list)` is **`badarg`** on OTP 29.1.1 / erts-17.1, so the roster cannot be enumerated that way.
+The working enumeration: `code:all_available()` → `{ModuleName :: string(), File, Location}` (the name is a **string**, not an atom — `list_to_atom/1` it) → `beam_lib:chunks(File, [exports])` for the on-disk modules and `M:module_info(exports)` for the `preloaded` ones → keep the `(M, F, A)` for which `erlang:is_builtin(M, F, A)` is `true`.
+On OTP 29.1.1 that yields **exactly 556 keys over exactly the same 25 modules** as `../../erts/emulator/beam/bif.tab`, i.e. **no missing declaration** and no invented one. The only asymmetries, all version- or instruction-related and none a gap:
+- `erlang:apply/2`, `erlang:apply/3`, `erlang:yield/0` are reported `is_builtin` `true` but have **no `bif.tab` row** in either tree (they are implemented as instructions); `erlang:is_builtin/3` reproduces that trio explicitly (`src/runtime/erlang.rs`, `beam_common.c:2359-2385`).
+- `erlang:pid_to_binary/1`, `erlang:ref_to_binary/1`, `erlang:port_to_binary/1` are OTP-30 additions: declared in this tree's `bif.tab:866-868`, absent (`undef`) on the OTP-29 oracle.
+- the 29 quoted operator rows (`erlang:'+'/2` …) are invisible to an ASCII-only `exports` scan but are present and `is_builtin`-true on both sides.
 Declared `bif.tab` keys per module (sums to 556): `erlang` 268 · `erts_internal` 71 · `ets` 51 · `math` 24 · `binary` 22 · `erts_debug` 20 · `erl_debugger` 13 · `maps` 12 · `os` 10 · `re` 8 · `records` 8 · `atomics`/`code`/`erl_ddll`/`persistent_term` 7 each · `lists` 5 · `prim_file` 4 · `unicode` 3 · `erts_literal_area_collector`/`erts_trace_cleaner` 2 each · `error_logger`/`file`/`io`/`net_kernel`/`string` 1 each.
 Re-derive any split from the registry, never this prose.
 
