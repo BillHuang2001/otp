@@ -78,6 +78,16 @@ use crate::error;
 
 use super::PortRegistry;
 
+/// The per-port **inet option mirror** — what a socket port has been told through
+/// `INET_REQ_SETOPTS`, and what an accepted socket therefore inherits.
+///
+/// Declared here, as a child of this module, rather than beside `port.rs`'s other `mod`
+/// declarations: it is the second post-`open_port/2` side table (after [`PortExtras`]), held
+/// inside it and dropped by its [`PortExtras::forget_port`], so a port has exactly **one**
+/// "not `open_port/2`'s state" lifecycle. The `#[path]` keeps the source at
+/// `src/port/inet_opts.rs`, beside the rest of the port layer.
+#[path = "inet_opts.rs"]
+pub(crate) mod inet_opts;
 /// The port state `port_set_data/2`, `register/2` and `port_connect/2` establish after a
 /// port is open — the part of a port that is *not* `open_port/2`'s.
 ///
@@ -115,6 +125,12 @@ pub(crate) struct PortExtras {
     /// reports (`port_info(P, links)` after connecting a second process is
     /// `[OriginalOwner, NewOwner]`).
     links: HashMap<u64, Vec<ProcessId>>,
+    /// The port's **inet option mirror** — the `setopts` block an accepted socket inherits
+    /// ([`super::inet_opts`]).
+    ///
+    /// Empty for every non-`inet` port; a socket port fills it as `prim_inet` applies its options,
+    /// and [`PortRegistry::close`](super::PortRegistry) drops it with the rest of the port's extras.
+    inet: inet_opts::InetOptions,
 }
 
 impl PortExtras {
@@ -124,10 +140,13 @@ impl PortExtras {
     /// Called from [`PortRegistry::close`](super::PortRegistry) — the single place a port
     /// leaves the runtime — so a closed port's name disappears from `whereis/1` (the oracle's
     /// own answer: `undefined` after `port_close/1`) and a recycled port number starts clean.
+    /// The inet option mirror goes the same way, so a recycled number cannot inherit a dead
+    /// socket's option block.
     pub(crate) fn forget_port(&mut self, number: u64) {
         self.data.remove(&number);
         self.names.remove(&number);
         self.links.remove(&number);
+        self.inet.forget_port(number);
     }
 }
 impl PortRegistry {
