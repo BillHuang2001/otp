@@ -53,6 +53,14 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   but this floor does not is the typed `Opcode::not_served()` unsupported raise. `inet/CONTEXT.md`
   carries the full served-vs-refused opcode table. A command on a socket-less or peerless port is the
   typed `BeamError::BadArg` refusal of *Known Issues* below.
+  `setopts`/`getopts` serve the C's whole option surface in two families — `opt_state.rs` (the codes
+  the `inet`/`tcp`/`udp` descriptor keeps: `active`, `packet`, `mode`, `deliver`, the watermarks,
+  `delay_send`, `send_timeout*`, `show_econnreset`, `read_ahead`, `read_packets`, `netns`,
+  `line_delim`, the membership pair) and `opt_sys.rs` (everything that reaches
+  `setsockopt(2)`/`getsockopt(2)`, incl. `linger`'s `struct linger` shapes, `bind_to_device`, `raw`,
+  `pktoptions`, `multicast_if`) — so `prim_inet:accept_opts/3`, the `getopts`+`setopts` pair a
+  `gen_tcp:accept/1` ends in, completes. 42 codes are byte-compared against the oracle across the
+  three port states (no socket / open stream / post-`close`).
 - `line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `binary_io.rs` → `Phase`, `PhaseChange`.
 - `mod.rs` → module wiring/re-exports only.
 
@@ -111,13 +119,22 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   losing data; the `Err` short-circuits `Port::check_write_accounting` and surfaces out of
   `PortRegistry::execute_port_tasks`, and `erlang:port_command/2` raises. An **open but unconnected**
   datagram port really sends (the destination rides the command's address field), so only a socket-less
-  one refuses. The oracle instead answers `true` and then either delivers `{error,enotconn}` out of band
-  (a caller-ref-prefixed payload) or kills the port (`init_caller`'s `EINVAL`) — neither shape is
-  reachable through the frozen `Driver` trait: there is no `driver_failure` seam, and answering the
-  C's way would mean accepting the command and reporting its bytes consumed for a write that never
-  happened. The `{inet_reply,…}` completion itself *is* expressible
-  (`DriverContext::deliver_completion`); what is missing is the C's accept-then-fail sequence. The
-  measured oracle shapes are in `inet/CONTEXT.md` › *Known Issues*.
+  one refuses. The oracle's two shapes are a caller-ref-prefixed payload (answer `true`, keep the port
+  alive, deliver `{error,enotconn}` out of band) and a prefix-less one (`init_caller` ⇒ the port dies
+  through `driver_failure_posix(EINVAL)`). The second **is** expressible now
+  (`DriverContext::signal_failure`); this driver does not take it — it answers the typed `BadArg`
+  instead, because the first shape is still unreachable (it needs the C's `desc->caller`, i.e. a
+  caller notion on the frozen `Driver`/`DriverContext` seam, not just the owner-addressed completion
+  channel), and a refusal must not count bytes for a write that never happened. The measured oracle
+  shapes are in `inet/CONTEXT.md` › *Known Issues*.
+- **A driver closes its own port through the failure channel, never by panicking or returning an
+  error.** `DriverContext::signal_failure(DriverFailure)` latches the C's `driver_failure*`/`driver_exit`
+  request from inside a callback (exactly one latch; later deliveries from the same callback are
+  refused, the C's `-1`); `PortRegistry::reap_failures` then tears the port down through the ordinary
+  close path after the round, and the runtime renders the owner's reason from
+  `PortRegistry::take_failures()` (`FailureReason::atom_name`/`code`, gated on
+  `DriverFailure::signals_owner`). `src/port_failure.rs` carries the whole mapping; the loaded-C-driver
+  half (the `driver_failure*`/`driver_exit` hooks) is `../abi/`'s.
 - Non-obvious framing divergences recorded in code: an out-of-range `{packet,N}` code is treated as
   **no framing** where the C's `packet_get_length` `default:` rejects it (`inet/frame.rs:96-105`); an
   unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).
@@ -169,7 +186,15 @@ The crate-level integration suites for this node are the sibling `../../tests/` 
   constants (the in-memory command-driven file driver); its suite is the sibling `ram_file_tests.rs`
   (`#[cfg(test)] #[path = "ram_file_tests.rs"] mod tests;`, the `inet/` split pattern)
 - `line_buffer.rs` → `LineBuffer`; `binary_io.rs` → `Phase`/`PhaseChange`
-- `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers, the numeric `erlang:port_control/3` opcode bridge (`opcode.rs` — the `0x03f1a300` magic, wrapping unsigned subtraction, the C's three switches), and `{packet, N}` framing (read + send path) (child node `src/drivers/inet/CONTEXT.md`)
+- `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers; the option vocabulary
+  (`opt.rs` — the five-byte/one-byte record walk over `Step`, the `SocketOptions` store, the
+  `OptScope { stype, family, protocol }` gates — split into `opt_state.rs`'s driver-state codes and
+  `opt_sys.rs`'s syscall-backed codes, incl. `linger`/`bind_to_device`/`raw`/`pktoptions` and the
+  `propagate = 1` nine), `sys.rs`'s `get_socket_linger`/`set_socket_linger`/`get_socket_bytes`/
+  `set_socket_bytes`, `adopt_probe.rs`'s `INET_REQ_FDOPEN` errno rendering, the numeric
+  `erlang:port_control/3` opcode bridge (`opcode.rs` — the `0x03f1a300` magic, wrapping unsigned
+  subtraction, the C's three switches), and `{packet, N}` framing (read + send path); the option
+  surface is oracle-pinned byte-for-byte (child node `src/drivers/inet/CONTEXT.md`)
 - `../abi/` → the driver C-ABI host layer (sibling child node, not a built-in driver)
 
 ## See Also
