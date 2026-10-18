@@ -1013,6 +1013,48 @@ impl<'a> RuntimeContext<'a> {
         }
         false
     }
+    /// Moves a container a **scratch region** owns onto a region that **outlives the call**,
+    /// returning the term Erlang code must see instead — or the term unchanged when it is an
+    /// immediate, a literal, or a container the copier refused (in which case the scratch region
+    /// is latched unrecyclable, see [`Runtime::taint_info_scratch`]).
+    ///
+    /// # Why a scratch term must be relocated
+    ///
+    /// [`Runtime::info_heap`](crate::Runtime::info_heap) is a per-call **scratch** region: the
+    /// next `system_info`/`format_term` call resets it. A value materialized there and handed to
+    /// Erlang code is therefore a **dangling** term the moment anything else needs the scratch —
+    /// an ordinary shape (`epp:predef_macros/2` reads `machine` and then `otp_release`), and the
+    /// one that turns into a wrong result or a term-integrity abort when the recycled words are
+    /// re-read (`beam_term::ops::class` on a header word no constructor wrote).
+    ///
+    /// [`Runtime::system_info`](crate::Runtime::system_info) is the only value the runtime
+    /// materializes there and hands out, so its BIF route
+    /// ([`super::RuntimeContext::system_info_1`](crate::context)) calls this before returning.
+    ///
+    /// # The destination and the refusal
+    ///
+    /// The destination is the same one [`Self::rehome_container_result`] uses — the running
+    /// process's own **scanned** young heap, or the runtime's never-reset store on the table-less
+    /// route — so the relocated value is collectable exactly like a registered BIF's result and
+    /// costs no runtime-lifetime memory. A **refused** copy cannot be papered over: the words stay
+    /// in the scratch region, so the region is latched ([`Runtime::taint_info_scratch`]) and never
+    /// reset again. That is deliberately the honest answer rather than a silently dangling term,
+    /// and it is unreachable in practice — a refusal means the copier rejected a graph this
+    /// runtime itself just built, or a destination that could not be grown.
+    pub(crate) fn relocate_off_scratch(&mut self, term: Eterm) -> Eterm {
+        if !Self::result_is_foreign_container(term) {
+            // An immediate or a frozen literal names nothing on the scratch region.
+            return term;
+        }
+        match self.rehome_container_result(term) {
+            Some(copied) => copied,
+            None => {
+                self.runtime.taint_info_scratch();
+                term
+            }
+        }
+    }
+
     /// Copies a container result off the pooled BIF heap onto a region that **outlives the call**,
     /// returning the copy — or `None` when it cannot be re-homed, in which case the caller leaves
     /// both the result and the pool exactly as they were.
