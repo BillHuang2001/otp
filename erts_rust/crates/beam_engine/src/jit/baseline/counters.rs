@@ -303,22 +303,17 @@ fn variant_at(module: &Module, func: u32, pc: u32) -> String {
 }
 
 /// The variant name of an `Instr`: the leading identifier of its `Debug` rendering
-/// (`Move { .. }` -> `Move`, `Send` -> `Send`). Test-only, so the allocation and the
-/// `Debug` formatting are acceptable.
+/// (`Move { .. }` -> `Move`, `Send` -> `Send`).
 ///
 /// A `Test` is keyed by its **kind** (`Test(IsEqExact)`, `Test(IsTuple)`, …) because the
 /// inline subset decides a `test` predicate by predicate: the per-kind split is what
 /// makes "which `test` shapes still deopt" readable from the counter table.
-pub(crate) fn variant_name(instr: &Instr) -> String {
-    if let Instr::Test { kind, .. } = instr {
-        return format!("Test({kind:?})");
-    }
-    let rendered = format!("{instr:?}");
-    let end = rendered
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(rendered.len());
-    rendered[..end].to_string()
-}
+///
+/// The attribution itself lives one level up, in [`crate::exec_census`], because the
+/// dynamic execution census needs the exact same key; re-exporting it here keeps every
+/// existing call site (`counters::variant_name`) unchanged **and** keeps the two tables
+/// keyed identically — one definition, never a copy.
+pub(crate) use crate::exec_census::variant_name;
 
 /// Attribute a `jit_step_one` deopt to the opcode at `(func, pc)`.
 pub(crate) fn record_step_one(module: &Module, func: u32, pc: u32) {

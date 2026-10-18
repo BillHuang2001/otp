@@ -25,6 +25,12 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   resolved target). `ImportFrame` is `pub(crate)` and re-exported from `mod.rs` as
   `crate::interpreter::ImportFrame` (its variants inherit that visibility, so a sibling module can name
   `crate::interpreter::ImportFrame::Call`).
+  **The dynamic execution census hooks live here.** `step_instruction_inner` looks the instruction up, calls
+  `crate::exec_census::on_instruction(instr)` (**before** the effect), delegates the effect to
+  `step_instruction_body(instr, …)` (the original `match instr` arms, byte-identical — the split exists so that an
+  error propagated by `?` *inside* one arm, which returns from the body rather than falling out of the `match`, is
+  still observed) and then calls `crate::exec_census::on_error(instr, err)` for an `Err` result. Both hooks are one
+  thread-local `bool` load when the census is disabled.
 - `bif.rs` — `exec_bif` (`gc_bif`/`bif`/`bif0` operand marshalling + the fail-label/raise split), `call_import`
   (`call_ext*`), `raise_bif_error` (the catch-aware raise, shared with the families — `families::funs::apply_target`
   for an applied-target host BIF error, and `families::funs::call_fun` for the closure-apply fallback),

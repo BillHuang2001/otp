@@ -234,6 +234,48 @@ impl Machine {
             None => return Err(Box::new(error::unsupported("run: function index out of range"))),
         };
 
+        // The dynamic per-variant execution census (`crate::exec_census`): one count per
+        // instruction entering this funnel, plus one error count for an instruction that
+        // returns a typed error out of it. This is the single funnel the interpreter's
+        // driver and the native tiers' per-instruction deopt helper share, so it is the
+        // only site that observes *execution* (as opposed to the static census, which
+        // counts what a module *contains*). Contract: the count happens **before** the
+        // body runs (a raising instruction is counted as executed AND as an error), only
+        // an `Err` that escapes here is an error (a raise folded into a `Step` by a live
+        // in-machine `try`/`catch` frame is not), and a natively-inlined baseline-JIT
+        // instruction never reaches this point and so is not observable. A disabled
+        // census costs one `bool` load and leaves the result byte-identical.
+        //
+        // The instruction's effect lives in [`Machine::step_instruction_body`] so that
+        // **every** `Err` out of it — including one propagated by `?` inside a single
+        // arm, which returns from the body rather than falling out of the `match` — is
+        // observed here. Every arm is unchanged: the split is a pure wrap.
+        crate::exec_census::on_instruction(instr);
+        let result =
+            self.step_instruction_body(instr, entry_module, module, labels, func, pc, ctx);
+        if let Err(err) = &result {
+            crate::exec_census::on_error(instr, err);
+        }
+        result
+    }
+
+    /// One instruction's effect — [`Machine::step_instruction_inner`]'s body, without the
+    /// dynamic execution census it wraps around the call.
+    ///
+    /// `instr` is the instruction already looked up at `(func, pc)` in `module`; the arms
+    /// below are the original dispatch arms verbatim (a `?` here propagates a typed error
+    /// to the caller, which is exactly what the census needs to see).
+    #[inline]
+    fn step_instruction_body(
+        &mut self,
+        instr: &Instr,
+        entry_module: &Module,
+        module: &Module,
+        labels: &LabelMap,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> StepResult {
         match instr {
             // Metadata / no-ops. `executable_line`/`debug_line` exist for
             // instruction counting and breakpoints (they are `_` in

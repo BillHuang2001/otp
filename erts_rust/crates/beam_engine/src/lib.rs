@@ -97,6 +97,7 @@
 mod bench;
 pub mod context;
 pub mod error;
+pub mod exec_census;
 mod families;
 mod generic;
 pub mod interpreter;
