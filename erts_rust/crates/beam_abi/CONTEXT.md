@@ -549,6 +549,15 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
     (`[97,98|<<99,100>>]` vs a flat `<<97,98,99,100>>`).
 
 ## Known gaps (honest, never a wrong result)
+- **`driver_outputv` with more than one remaining vector — the earlier vectors' nesting, never the
+  bytes.** The seam carries one header byte stream and one tail, so only the **last** remaining
+  vector can be the improper tail (exact, and every inet-driver read path is single-vector). In
+  `[binary]` port mode the C makes each *preceding* vector its own binary cons cell
+  (`[h… | <<v0>>, <<v1>>, …, <<vlast>>]`, `deliver_vec_message`, `io.c:3568-3614`) while this crate
+  folds those bytes into the header's int list (`[h…, v0 bytes… | <<vlast>>`): the flattened byte
+  sequence and `[list]` mode are identical, only the nesting of the earlier vectors differs. A
+  malformed `ErlIOVec` (a declared `size` the vectors cannot satisfy) is refused `-1` instead of the
+  C's over-read, and a null `buf` with a non-zero `len` is refused rather than dereferenced.
 - **`enif_alloc_env` answers `NULL`** only with the host's `alloc_env` at its trait default, or with no
   `NifEnv` live (outside a NIF call). `beam_rt`'s `NifHostImpl` implements `alloc_env`/`free_env`/
   `make_copy` (`beam_rt/src/nif.rs`) over the one shared pooled BIF heap, so the runtime's message-env
