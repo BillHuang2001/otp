@@ -305,8 +305,97 @@ A copy-out change moves terms between heaps, so this is the authoritative check 
 ### `ets_copy` peak RSS (measured 94.68 MiB at N = 100 000, still linear in N) — a structural limit, not the ETS adopt path
 **`ets_copy` peak RSS (measured 94.68 MiB at N = 100 000, still linear in N) — a structural limit, not the ETS adopt path.** The recorded `RESULTS.md` §8 item-5 lead (the ETS adopt path / the rewind guard) is **refuted**: `safe_to_rewind` is already true for `ets:*` and the pooled heap is already rewound. The growth is per-iteration, ≈790 B ≈ 99 words, and it was bisected: a float-free ETS loop of the same shape grows identically, while a float-carrying churn loop with no ETS is flat — so it tracks **BIF calls**, not floats and not ETS table state. Mechanism: almost all of the loop's heap traffic is the BIF-result copy-out, which by design cannot collect (the machine's live x registers / Erlang stack are not published at a BIF call, so a collection there would free live terms); a full nursery is met by `Process::grow_nursery(hint)` (`src/context/calls.rs::move_result_into_process_heap`), and a **retired young space is retained**, so the retained capacity accumulates linearly. On the **default** (native baseline JIT) tier the loop never reaches a real collection either: `ensure_heap_full` returns at `!process.should_collect(heap_need)` (`src/context/gc.rs` → `beam_gc`'s `nursery.current().available_words() < need_words`) because the loop's own `test_heap` prefixes are tiny (a 233-word default nursery, `beam_gc/src/policy.rs`), `alloc_words_rooted` is never entered (the BIF, not the engine, builds the result), and the reduction/yield-boundary door (`src/context/gc/reds_door.rs`) needs a slice to end — which a natively linked block never lets happen. Removing the caller-module float guard at the two FR-publishing GC doors was tried and **reverted**: it changes nothing here (94.68 → 95.02 MiB) and contradicts the pinned float-collection contract. Closing this needs either a **`beam_process`** seam that can shrink/reuse a retired young space (`Process::grow_nursery` retains it) or a **`beam_engine`/runner** seam that publishes the driving machine's roots at the BIF call so the copy-out can collect — both sibling-crate changes, not reachable from `src/context/calls.rs`.
 
-## See Also
+## The reference-walk cut (`WALK-CUT`)
 
+**The copy-out's reference walk is hash-free and allocation-free, and that is worth ≈1.0 µs per
+container-returning BIF call.** `RuntimeContext::graph_holds_reference` (`src/context/calls.rs`) runs
+once per registered-BIF **container** result, before the copy, so it is on the hot path of every
+`ets:lookup/2`, `binary_to_term/1`, `term_to_binary/1`, … It used to walk the whole result graph with a
+`std::collections::HashSet<usize>` (SipHash) **plus** a growing `Vec`, one hashed insert per visited
+object — a second full traversal on top of the copy that follows it. It now walks the same graph with
+an inline 64-word worklist plus a lazily allocated spill, **no visited set** (a well-formed term graph
+is acyclic) and a `1 << 20` visit budget whose exhaustion answers `true` — the *decline*, never a wrong
+move. Every semantic guard, the `for_each_child_slot` child enumeration and the guarantee (**a
+reference-containing container is never moved**, because a reference's identity is its address and
+`Runtime::references`/`Timers` are keyed by the term) are unchanged.
+
+### The deterministic counter (the evidence, not a wall time)
+
+`src/context/calls.rs`'s test-only `notes` module counts the walk; the payload is the `copy_bound`
+benchmark's own 5-key map (`tools/bench/src/workloads/copy_bound.rs`), rebuilt through
+`term_to_binary/1` → `binary_to_term/1` (the `etf_roundtrip` case's copy boundary), and the pinning test
+is `src/context/calls/tests.rs::the_reference_walk_visits_a_bench_shaped_payload_without_hashing_or_spilling`.
+
+| counter | before (the hashed walk) | after |
+|---|---|---|
+| `walk_calls` | 1 | 1 |
+| `walk_visits` | 27 | 27 |
+| `walk_hash_inserts` | **27** | **0** |
+| `walk_spills` | 0 | 0 |
+
+`walk_visits` is identical because the *predicate* is identical: the 27 dereferenceable objects are the
+flat-map block, the key tuple the flat map wraps its five keys in, the ten cons cells of `[1..10]`, the
+`{ok,…}` tuple, its on-heap binary and its float, the 12-byte binary, and the eleven cons cells of
+`"a char list"`. Only the bookkeeping changed.
+
+### What changed in the timings
+
+**(a) Internal paired A/B — the same build tree, one driver, one window.** `BASE` = the hashed walk
+(kept for one throwaway build), `OPT` = this cut; `taskset -c 7`, 3 alternating rounds, `/proc/loadavg`
+21–33 throughout, medians of the driver's per-op marginals:
+
+| case | BASE ns/op | OPT ns/op | OPT/BASE | saved |
+|---|---|---|---|---|
+| `etf_roundtrip` | 3 164.7 | 2 144.9 | **1.475×** | −1 019.8 ns |
+| `ets_copy` | 7 094.0 | 6 044.4 | 1.174× | −1 049.6 ns |
+| `send_recv` | 15 737.9 | 14 767.4 | 1.066× | −970.5 ns |
+| `send_recv_plain` | 3 236.8 | 3 319.4 | 0.975× | +82.6 ns — **noise**, and the negative control: that case's worker replies the payload directly, so it produces no container BIF result at all |
+
+`send_recv_plain` moving by nothing is what makes the other three attributable: the walk is the only
+thing the four cases do not share.
+
+**(b) Cross-build, against the pre-regression binary** (`beam_rt-0579bcb832`, the build the earlier
+attribution used), same driver, `taskset -c 7`, **5** alternating rounds, `/proc/loadavg` 12–34:
+
+| case | this cut | `0579bcb832` (pre-regression) | ratio | ratio before this cut |
+|---|---|---|---|---|
+| `etf_roundtrip` | 1 986 | 1 729 | **1.149×** | 1.75× (3 115.6 / 1 783.4) |
+| `ets_copy` | 5 510 | 3 646 | 1.511× | 1.58× (5 584.5 / 3 529.7) |
+| `send_recv` | 13 765 | 10 672 | 1.290× | — |
+| `send_recv_plain` | 3 206 | 3 241 | 0.989× | — |
+
+The committed record `erts_rust/tools/bench/results/m16-ab-{old,new}-r{1,2,3}.json` names the same two
+sides for `copy_bound` (old 3 111.0/3 229.4/2 445.3 ns `ets_copy`, 1 749.5/1 796.6/1 421.1 ns
+`etf_roundtrip`; new 5 714.3/5 056.5/4 777.8 and 2 683.9/2 451.0/2 174.9) — this cut's `etf_roundtrip`
+figures sit at or below the fast end of the *old* side's own spread.
+
+### Honest scope
+
+- **It recovers the walk's bookkeeping, not the walk.** ≈1.0 µs of the ≈1.4 µs `etf_roundtrip`
+  regression is gone; the residual (≈150–250 ns/op on that case) is the walk's own single dereference
+  per object — 28 visits per `etf_roundtrip` op — which cannot be dropped: a reference's identity is
+  its address, so a container holding one must be *known* before it is moved, and the only alternative
+  (copy, then check the copy) cannot be sound.
+- **The `ets_copy` remainder is NOT this node's.** After this cut `ets_copy` is still 1.511× the
+  pre-regression binary; that residual is `crates/beam_message`'s destination-pricing walk
+  (`src/destination_pricing.rs`, commit `f6fcc227d2`), a sibling crate — reported, not touched here.
+- **Nothing else was made dearer.** The counters are `#[cfg(test)]` only (no release-build cost), and the
+  walk is a strict constant-factor improvement of one predicate: `send_recv_plain`, which never reaches
+  it, is unchanged (0.975× / 0.989× — two independent estimates of the noise floor).
+- **A shared subgraph is now re-walked once per parent** (the visited set that deduplicated it is gone).
+  Term graphs handed back by BIFs are trees, so the extra work is a bounded constant factor and, unlike
+  the `HashSet`, costs no allocation; a genuinely shared graph stays inside the inline worklist.
+
+### Gate
+
+`cargo test -p beam_rt --lib context::calls` → **10 passed, 0 failed, 1 ignored** (the ignored one is the
+`eval_route_pool_costs` measurement harness); `context::pool` 9/9, `copy_out` 2/2, `bif_result` 1/1,
+`context::gc` 25 passed/1 ignored. The behavioural pins are unchanged —
+`the_reference_walk_skips_words_that_are_not_readable_terms` still holds every readability guard, and the
+copy-out/rewind rules (`the_copy_out_always_hands_the_copier_an_empty_destination_table`,
+`a_refused_copy_out_leaves_the_pooled_bif_heap_unrewound`, …) are untouched.
+
+## See Also
 - [`PERF.md`](PERF.md) → the current cross-runtime figures and the execution-tier effect.
 - [`PERF_HISTORY.md`](PERF_HISTORY.md) → the dated `BEFORE`/`AFTER` cross-runtime snapshots and their `nb*` registered-BIF columns.
 - [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) → the `perf_call`/`perf_bif`/`perf_copy_out` harnesses and the dispatch-cost narrative.
