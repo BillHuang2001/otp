@@ -195,6 +195,27 @@ impl PortRegistry {
             .collect()
     }
 
+    /// Whether some live port has been **written to and has not answered yet** — the question a
+    /// poll round's caller asks before it decides to *block*.
+    ///
+    /// [`PortRegistry::has_nothing_to_poll`] is the quiescence test ("is anything live at all?");
+    /// this is the sharper one a scheduler pass needs when it is about to spend wall-clock time
+    /// inside [`PortRegistry::pump`]. A port that has answered everything it was given cannot
+    /// produce a message until it is written to again (a booted kernel's `inet_gethost` child, idle
+    /// for the rest of the run), so waiting on it is pure sleep; a port holding bytes it has not
+    /// answered is the one thing a wait can still deliver from.
+    ///
+    /// The input is the C's own per-port accounting — the pair `port_info(Port, input)`/`output`
+    /// report (`prt->io.input`/`io.output`): [`PortRegistry::write_command`] credits `output` at the
+    /// write instant and the read path credits `input` where it is harvested, so the two are
+    /// comparable byte counters. A port the registry no longer holds contributes nothing. It is
+    /// deliberately **not** a `port_info` item (the C has no such field).
+    pub fn awaits_port_reply(&self) -> bool {
+        self.meta
+            .values()
+            .any(|meta| meta.output.get() > meta.input.get())
+    }
+
     /// The `locking` item's value atom: `port_level` when the port has its own lock,
     /// `driver_level` when all ports of its driver share one. See the module docs.
     pub(super) fn info_locking(&self, port: PortId) -> &'static str {
