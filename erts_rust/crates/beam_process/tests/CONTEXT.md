@@ -551,9 +551,27 @@ SMP pool:
     over the same eight rounds with a nine-space chain — the regression the debt OR removes; and a
     **relocation-exempt** process with debt answers `Ok(false)`, keeps the debt and its two-space
     chain, with `minor_gcs()` `0`. Deterministic, no wall-clock.
+46. `service_signals_fast_path.rs` (6 tests) — the **quiet-process fast path** of the per-schedule-in
+    signal servicing plus the capacity-retaining wake-list hand-over: a quiet schedule-in is a no-op
+    (state, mailbox, links and heap unchanged, no wake queued, no collection), an unknown or **stale**
+    pid is a no-op that does not disturb the process now owning the recycled slot, a queued signal is
+    still applied in full (so the fast path shortcut covers the empty case only), a queued **fatal**
+    signal still drives the whole link cascade (its worklist grows *while servicing*),
+    `drain_woken_into` agrees with the take-based `drain_woken` and clears rather than appends to its
+    reused buffer, and the `Scheduler`'s reusable wake scratch never double-enqueues a woken process.
+47. `max_heap.rs` (11 tests) — the PCB's **`max_heap_size` policy** (`src/max_heap.rs`): the
+    `include_shared_binaries` flag deciding a real `Process`'s verdict at one bound (within without
+    it, `Kill`/`Log` with it — the oracle's decisive probe), the verdict **recorded** by every
+    collection/growth door (`collect`, `collect_kind`, a `deliver`-forced growth, `ensure_capacity`,
+    `grow_nursery`) with the collection's own `Result` untouched and the latch clearable exactly once
+    by `take_max_heap_verdict`, `kill: false` recording `Log` (log-only — nothing killed, nothing
+    raised), the **prospective** rule (an admission that installs a capacity above the bound is
+    recorded while the pre-admission size was within it — the case a current-size-only check misses),
+    an unlimited setting and a comfortably-within process recording nothing, the setting round-tripping
+    wholesale, and the verdict queries never latching. Deterministic — every figure derived from
+    `capacity_words`/`next_heap_size`, no sleeps / wall-clock bounds / oracle.
 
-## Constraints
-- **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
+## Constraints- **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
   `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))` is
   the pool's converging idle wait (it also requires the in-flight count to be zero, so counters read
@@ -570,8 +588,8 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **541 passed, 0 failed, 1 ignored** (180
-  in-module unit tests + 360 across the 44 integration test targets under `tests/` — one per top-level
+  `../../../tools/differential/` harness, not here. Current: **586 passed, 0 failed, 1 ignored** (196
+  in-module unit tests + 389 across the 47 integration test targets under `tests/` — one per top-level
   `tests/*.rs` file; the `common/mod.rs` support module contributes its 4 normalizer unit tests to each
   of its 7 includers — plus 1 doctest; the single ignore is the documented non-yielding-runner hang
   failure mode in `preemption.rs`).
@@ -596,6 +614,9 @@ SMP pool:
   stability, the conservative declared-dead sweep on the collection path, and the
   **reachability-driven** sweep — its root set, its `HEADER_BIN_REF` payload-pointer test, the
   nested-container descent, and its unpublished-roots decline valve)
+- `collection_debt.rs`, `max_heap.rs` → the crate's own heap-admission point (the collector's
+  collection debt) and the PCB's **`max_heap_size` policy** (the setting, the usage it is charged
+  against, and the verdict every collection/growth door records — `src/max_heap.rs` holds the types)
 - `registry_monitors.rs`, `monitor_tag.rs`, `alias.rs`, `capability_inventory.rs`,
   `process_info_source.rs`,
   `spawn_options.rs`, `collector_dispatch.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
@@ -612,6 +633,8 @@ SMP pool:
   `heap_and_mailbox_mut` + `send_fragmented`)
 - `process_exit_observer.rs`, `port_monitor_cleanup.rs` → the process-death observer seam and the
   death-side port-monitor cleanup
+- `service_signals_fast_path.rs` → the quiet-process schedule-in no-op and the capacity-retaining
+  wake-list hand-over
 - `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` /
   an unreachable peer heap must not abort the death; the observer and the port-monitor cleanup still
   run)

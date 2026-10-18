@@ -90,6 +90,7 @@ pub(crate) fn unsupported(what: &str) -> BeamError {
 }
 
 /// The typed diagnostic for a [`Process::collect`](crate::process::Process::collect) /
+/// [`Process::collect_kind`](crate::process::Process::collect_kind) /
 /// [`Process::ensure_capacity`](crate::process::Process::ensure_capacity) that was **refused**
 /// because the process is **relocation-exempt**.
 ///
