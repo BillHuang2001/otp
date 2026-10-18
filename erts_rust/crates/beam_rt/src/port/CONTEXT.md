@@ -235,3 +235,83 @@ The largest wall-clock cost this layer can impose on a CLI start-up is **not wor
 - **`beam_bifs`** — `erlang:read_timer/1,2` was the connects' blocker (`inet:timeout/1` calls it unconditionally, `lib/kernel/src/inet.erl:4953-4957`); it is served now by this crate's `RuntimeHooksBridge`, so the connect path needs nothing further from that crate.
 - **`src/context/**` (sibling node)** — the `-eval` pump cannot resume a parked nested call, so a completion that arrives for a nested `gen_udp:recv/3`/`gen_tcp:accept` has no waiter and the route folds to the typed `blocked()` gap (`../context/pump.rs`); the channel delivers the message, the resume is that node's.
 - **`beam_process` — no seam needed for the marking** (its single exit observer stays `EtsExitObserver`), **but** a tagged port monitor's `'DOWN'` needs that crate to expose the monitor's `{tag, Tag}`, and `ProcessTable::port_closed`'s `PortTable::close`-first order is what keeps the exit signalling out of that crate — an API that snapshots relations without freeing the port number would move the whole obligation there.
+
+## `port/active_input.rs` — the `{active, …}` input channel (A.4)
+`beam_io`'s **active-mode input channel** is the driver→owner path of an `{active, true|once|N}`
+socket: a socket in active mode never parks its input in the port's byte queue, so the driver
+*sends a message to the port's owner* from its read-readiness callback. The driver half
+(`beam_io`'s `drivers/inet/active.rs`, `drivers/inet/udp/active.rs`) is complete and stages one
+`ActiveInput { port: PortId, event: ActiveInputEvent }` per delivered unit through
+`DriverContext::deliver_active_input`; `active_input.rs` is the runtime half, shaped exactly like
+the completion channel beside it.
+
+| event | port kind | message | C |
+|---|---|---|---|
+| `ActiveInputEvent::Data(read)` | `tcp_inet` | `{tcp, S, Data}` | `tcp_message`, `inet_drv.c:3979-4020`; `tcp_binary_message`, `:4022-4055` |
+| `ActiveInputEvent::Data(read)` | `udp_inet` | `{udp, S, IP, Port, Data}` | `packet_binary_message`, `:4105-4160` over `load_address`, `:1916` |
+| `ActiveInputEvent::Passive` | `tcp_inet` | `{tcp_passive, S}` | `packet_passive_message`, `:4215` |
+| `ActiveInputEvent::Passive` | `udp_inet` | `{udp_passive, S}` | the same builder, the other branch |
+
+**Oracle-verified shapes** (OTP 29.1.1 / erts-17.1, real loopback traffic; `#Port<P>` for the
+port term): `{active,once}` + `<<"hi">>` ⇒ `{tcp,'#Port<P>',<<"hi">>}`; `[list]` ⇒
+`{tcp,'#Port<P>',"hi"}`; `{active,1}` + a second datagram ⇒ one `{tcp,…}` then
+`{tcp_passive,'#Port<P>'}`, and re-arming `{active,once}` delivers again; `{packet,2}` strips the
+2-byte frame header ⇒ `{tcp,'#Port<P>',<<"hello">>}`; `{header,2}` over `<<"hello">>` ⇒
+`{tcp,'#Port<P>',[104,101|<<"llo">>]}`, `hsz == len` ⇒ `[…|<<>>]`, `hsz > len` ⇒ the flat `"h"`;
+`{active,false}` delivers nothing here (the bytes stay for `gen_tcp:recv/2`); UDP binary ⇒
+`{udp,'#Port<P>',{127,0,0,1},39846,<<"hi">>}` from a socket bound to 23456 (`0x5BA0`) ⇒ the source
+**port field is big-endian**; UDP `{active,2}` + three datagrams ⇒ two `{udp,…}` then
+`{udp_passive,…}`; an empty datagram is `{udp,'#Port<P>',{127,0,0,1},50339,<<>>}`.
+**These shapes are rendered by `RuntimeContext::active_input_message` but are not yet live in a
+running runtime** — see *Required wiring at the parent node* below.
+
+**`ActiveInputPacket { port, owner, data_mode, kind, event }`** mirrors `CompletionPacket`: the
+owner, the stream mode and the port's **kind** are all resolved at **drain** time
+(`PortRegistry::drain_active_inputs`, from `PortMeta`), because a delivery staged around a
+teardown outlives the metadata. `ActivePortKind { Tcp, Udp, Other }` comes from the driver name —
+`driver_path_name(&meta.command)` matched literally against `tcp_inet`/`udp_inet`, the same
+first-blank rule the driver search applies. `Other` is a **typed capability gap** for both events
+(`crate::error::unsupported`, naming the port), never a fabricated `{tcp,…}` and never a silent
+drop. A delivery whose port has already left the runtime is **dropped**, the completion channel's
+rule, and the drop is final: `PortEvent::ActiveInput` answers `None` from `PortEvent::port()` — its
+recipient is already resolved — so `close`'s purge of the closing port's retained events cannot
+drop the deliveries a close produced, and a recycled port number can never inherit one.
+
+**The mode seam is `PortMeta::data_mode`** (`impl PortMeta`, in `active_input.rs`), whose body is
+`self.stream` today: `{mode, list|binary}` never reaches `beam_io` (`drivers/inet/CONTEXT.md`
+§"Shape"), so a post-`open_port/2` mode change has no home but an Erlang-side `{mode,…}` mirror. It
+is the channel's **single** mode call site, so that mirror is adopted there and nothing else
+changes. Do not add a second `PortMeta::data_mode` in `port.rs` — a duplicate
+inherent method is a compile error.
+
+**One delivered unit is `beam_io`'s decision, not this module's**: under a framing `{packet, N}`
+one delivery is **one frame** with the framing header **already stripped**, under `{packet, raw}`
+one read burst; and a read's `header` is the `{header, N}` option (`desc->hsz`) for a stream port
+and the 7-byte packed source address for a datagram port — never the framing header. So `Data` is
+rendered from the read's own header/body split and nothing is re-framed.
+
+**Payload rendering goes through the one stream shaper**: TCP calls `make_stream_payload(read,
+mode, StreamShape::Data)` directly; UDP decodes the address out of the read's header
+(`decode_packed_address`: `[INET_AF_INET(=1), port_hi, port_lo, a, b, c, d]`, port big-endian) and
+shapes the **body alone** through the same shaper from a header-less `ReadMessage`, so header
+consing / improper lists / list flattening cannot drift into a second byte-list builder. A
+header that is not exactly one packed IPv4 record is a typed gap — an address is the one element
+of `{udp,…}` that must never be invented.
+
+**Required wiring at the parent node (`src/port.rs`)** — this file is written against these and
+does not compile until they exist: `pub(crate) mod active_input;`, `mod active_input_tests;`,
+`PortEvent::ActiveInput { packet }` (plus its `port()` arm answering `None`),
+`events.extend(self.drain_active_inputs())` immediately after each of the six
+`drain_io_completions(...)` calls (`write_command`'s two branches, `port_control`, `close`,
+`pump`'s round and `pump`'s "nothing live to poll" early return), the two delivery arms
+(`Runtime::deliver_port_messages` → `packet.owner` via `deliver_in_table`, so a blocked receiver
+wakes; `RuntimeContext::poll_port_messages` → only `packet.owner == self.pid()`), and
+`RuntimeContext::active_input_message` on the public path. `has_nothing_to_poll` needs **no**
+change: a drained delivery rides `pending_events`, which it already counts.
+
+**Known residual — `hsz > len`.** The C's list branch is `(mode == LIST) || (hsz > len)`, so a
+`{header,N}` wider than the payload is one flat string with no binary tail (the oracle's `"h"`).
+`beam_io`'s `split_payload` clamps `hsz` to the payload and hands that case up as a whole-payload
+header with a present-but-empty body, which renders `[104|<<>>]` where the oracle prints `"h"`.
+Fields are preserved in order and `[list]` mode is exact; closing it needs `beam_io` to carry the
+raw `hsz`.
