@@ -202,6 +202,11 @@ pub struct UdpInetDriver {
     /// [`UdpInetDriver::name_addr`], reported by `INET_REQ_PEER` **after** its connection guard
     /// (`inet_drv.c:11282`-`:11290`).
     peer_addr: Option<InetAddr>,
+    /// The descriptor's statistics counters (the C's `inet_descriptor` block,
+    /// `inet_drv.c:11560`-`:11623`; see [`super::stat::InetStat`]): advanced where a datagram is
+    /// delivered to the port (input) or a command is issued (output), and rendered by
+    /// `INET_REQ_GETSTAT`. Zeroed by construction, as `inet_init_desc` leaves it.
+    stat: super::stat::InetStat,
 }
 
 impl UdpInetDriver {
@@ -223,6 +228,7 @@ impl UdpInetDriver {
             stype: 0,
             name_addr: None,
             peer_addr: None,
+            stat: super::stat::InetStat::default(),
         }
     }
 
@@ -258,6 +264,7 @@ impl UdpInetDriver {
             stype: socket_type(fd)?,
             name_addr: None,
             peer_addr: None,
+            stat: super::stat::InetStat::default(),
         })
     }
 
@@ -597,6 +604,11 @@ impl UdpInetDriver {
             return Ok(ctl_xerror("einval"));
         };
         let (address, payload) = split_address(arg)?;
+        // `inet_output_count(desc, len)` at `inet_drv.c:15163` (`packet_inet_command`, the
+        // empty-ancillary-data arm; `:15220` is the ancillary one): only the **payload** is
+        // counted — never the packed address prefix — and it is counted at issue time, before
+        // the `send(2)`/`sendto(2)` attempt, so a failed send still counted it.
+        self.stat.output(payload.len());
         let outcome = if self.state.is_connected() {
             send_connected(fd, payload)
         } else {
@@ -632,6 +644,9 @@ impl UdpInetDriver {
         loop {
             match recv_from(fd, &mut buf) {
                 Ok((len, source)) => {
+                    // `inet_input_count(desc, n)` at `inet_drv.c:15513`/`:15526` (`udp_deliver`):
+                    // the received **datagram payload** length.
+                    self.stat.input(len);
                     ctx.input().push(&buf[..len]);
                     let mut reply = ctl_ok();
                     reply.extend_from_slice(&pack_address(source.port, source.addr));
@@ -833,7 +848,7 @@ impl UdpInetDriver {
             Opcode::Gettype => Ok(super::wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(super::wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(super::wire::getstatus_reply(self.state.state_code())),
-            Opcode::Getstat => super::wire::getstat_reply(arg),
+            Opcode::Getstat => super::wire::getstat_reply(arg, &self.stat, ctx.output().len()),
             // `INET_REQ_GETHOSTNAME` (`:11219`): `len != 0 ⇒ EINVAL`, else the local
             // `gethostname(2)` payload. `sock_hostname` is a plain syscall — no resolver is
             // involved — so the whole arm is exact (measured `[1] ++ "billmini"`).

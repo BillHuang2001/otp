@@ -222,6 +222,7 @@ mod frame;
 mod opcode;
 mod opt;
 pub mod packet;
+mod stat;
 mod sys;
 mod udp;
 mod wire;
@@ -484,6 +485,11 @@ pub struct TcpInetDriver {
     /// `:11284`-`:11290`) — **after** that request's `INET_F_ACTIVE` guard, so a fake peer on an
     /// unconnected port is still `enotconn`.
     peer_addr: Option<InetAddr>,
+    /// The descriptor's statistics counters (the C's `inet_descriptor` block,
+    /// `inet_drv.c:11560`-`:11623`; see [`stat::InetStat`]): advanced where a payload is
+    /// delivered to the port (input) or a command is issued (output), and rendered by
+    /// `INET_REQ_GETSTAT`. Zeroed by construction, as `inet_init_desc` leaves it.
+    stat: stat::InetStat,
 }
 
 impl TcpInetDriver {
@@ -509,6 +515,7 @@ impl TcpInetDriver {
             stype: 0,
             name_addr: None,
             peer_addr: None,
+            stat: stat::InetStat::default(),
         }
     }
 
@@ -550,6 +557,7 @@ impl TcpInetDriver {
             stype: sys::socket_type(fd)?,
             name_addr: None,
             peer_addr: None,
+            stat: stat::InetStat::default(),
         })
     }
 
@@ -726,6 +734,12 @@ impl TcpInetDriver {
             // `{packet, raw}`: deliver any bytes retained from an earlier framing mode first, so
             // raw mode is authoritative for everything already queued (see the field's note).
             let retained = core::mem::take(&mut self.pending_input);
+            // `inet_input_count(desc, len)` at `inet_drv.c:13064` (`tcp_deliver`): the C counts
+            // the bytes it **delivers** to the port, and in raw mode that is everything pushed
+            // onto the port input queue here — any retained (previously buffered) bytes plus
+            // whatever the read just collected, each counted exactly once.
+            let delivered = retained.len() + bytes.len();
+            self.stat.input(delivered);
             ctx.input().push(&retained);
             ctx.input().push(&bytes);
         }
@@ -1184,10 +1198,17 @@ impl TcpInetDriver {
         // `{packet, 1|2|4}` frames the payload with a length header before the bytes reach the
         // queue; every other code (raw, line, ASN.1/…, the HTTP family) takes the C's `default:`
         // arm and writes no header at all.
+        let mut header_len = 0;
         if let Some(header) = frame::write_header(&self.options, arg.len()) {
+            header_len = header.len();
             ctx.output().push(&header);
         }
         ctx.output().push(arg);
+        // `inet_output_count(desc, len + h_len)` at `inet_drv.c:13763` (`tcp_send`; the
+        // `tcp_sendv` counterpart is `:13879`): the payload **plus** the framing header,
+        // counted once per command at issue time — so a partial write (or a write that then
+        // discovers the peer gone) still counted it, exactly as the C does before it sends.
+        self.stat.output(arg.len() + header_len);
         let _written = self.write_pending(ctx)?;
         if self.peer_close.seen {
             // This write is what found the peer gone, so it answers `closed` itself; the C
@@ -1276,6 +1297,9 @@ impl TcpInetDriver {
         loop {
             match frame::extract(&mut self.pending_input, &framing)? {
                 Some(payload) => {
+                    // `inet_input_count(desc, len)` at `inet_drv.c:13064` (`tcp_deliver`): the
+                    // **delivered payload** length — the framing header already stripped.
+                    self.stat.input(payload.len());
                     ctx.input().push(&payload);
                     return Ok(ctl_ok());
                 }
@@ -1644,7 +1668,7 @@ impl TcpInetDriver {
             Opcode::Gettype => Ok(wire::gettype_reply(self.family, self.stype)),
             Opcode::Getfd => Ok(wire::getfd_reply(self.socket)),
             Opcode::Getstatus => Ok(wire::getstatus_reply(self.state.state_code())),
-            Opcode::Getstat => wire::getstat_reply(arg),
+            Opcode::Getstat => wire::getstat_reply(arg, &self.stat, ctx.output().len()),
             // `INET_REQ_SUBSCRIBE` (`inet_subscribe`, `:10819`): the shared `inet_ctl` arm, so
             // both socket drivers build it through one helper. The reply is exact —
             // `[1] ++ (op ++ be32(outq byte count))*` — and an operand byte that is not
@@ -1764,5 +1788,7 @@ mod opcode_tests_refusals;
 mod opcode_tests_states;
 #[cfg(test)]
 mod opcode_tests_udp;
+#[cfg(test)]
+mod stat_tests;
 #[cfg(test)]
 mod tests;
