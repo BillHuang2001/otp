@@ -94,6 +94,11 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 - `machine/` → `Machine` (registers + the `x_mut`/`fr_mut`/`stack_mut`/`with_roots`/`alloc_rooted`
   root-set hand-off, frames, catch/unwind, run entries, `RunOutcome`, module contexts, driver,
   reduction counter, position introspection) — `machine/CONTEXT.md`
+- `exec_census.rs` → the **dynamic** per-variant execution census (public, NOT `#[cfg(test)]`):
+  thread-local enable flag + `Snapshot { executed, errors, first_error, total_* }`, the two funnel
+  recorders `on_instruction`/`on_error`, `variant_name` (the one variant attribution, re-exported by
+  `jit/baseline/counters.rs`) and `write_dump` (a TSV under the temp dir). Driven from
+  `interpreter/dispatch.rs`'s `step_instruction_inner`; measurement-only, disabled by default
 - `interpreter/` → dispatch loop, BIF arm/raise, `TestKind`, A.8 trace emission — `interpreter/CONTEXT.md`
 - `terms/` → the boxed-term builders/readers (classic + `*_rooted`), `map`, `fun`, `number`,
   `slack`, `sink`, rooted-allocation tests, `test_support` — `terms/CONTEXT.md`
@@ -104,6 +109,15 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   `jit/baseline/emit/CONTEXT.md`, `jit/cranelift/CONTEXT.md`, `jit/bench/CONTEXT.md`
 - Other top-level files: `step.rs` (`Step`), `operand.rs`, `predicates.rs`, `error.rs`
   (`unsupported`/`blocked`/…), `generic.rs` (the `Instr::Generic` sentinel)
+
+## Dynamic execution census (`exec_census`)
+The **dynamic** counterpart of the static corpus census: per-`Instr`-variant counts of what actually *executes* at run time, keyed by `exec_census::variant_name` (a `Test` by its kind), plus per-variant typed-error counts with the exact `Display` text of each variant's first error.
+It is a **public** module (`beam_engine::exec_census`, not `#[cfg(test)]`, following the `jit::bench` precedent) so the `tests/` integration drivers can call `enable`/`disable`/`set_enabled`/`is_enabled`/`reset`/`snapshot`/`write_dump`.
+The recorders are the two `pub(crate)` funnel hooks in `interpreter/dispatch.rs` — `on_instruction` before the instruction's effect, `on_error` for an `Err` out of `step_instruction_body` — each one thread-local `bool` read when disabled; a counted run is byte-identical to an uncounted one (asserted in `exec_census.rs`'s tests).
+Observability limits, honestly: an `Err` escaping the funnel is an error, so a raise folded into a `Step` by a live in-machine `try`/`catch` frame counts as **executed but not error**; and a natively-inlined baseline-JIT instruction never reaches the funnel, so `Tier::Interpreter` is the fully covered tier while a native tier reports only its deopted steps.
+`write_dump(section)` writes `$TMPDIR/beam_engine_exec_census_<section>.tsv` (`variant`, `executed`, `errors`, `first_error`), the machine-readable form of a snapshot.
+The instrument's own ranked view is `jit/baseline/census.rs`'s runtime **execution** census: `Tier::Interpreter` over the `jit::bench` workload set (13 workloads) = **31 720 executed instructions across 35 distinct variants, 0 typed errors**, topped by `GcBif` 6600, `Label` 4135, `Move` 3330, `Bif` 2565.
+That workload set is the in-crate tier set, not the OTP corpus, so the corpus-scale dynamic ranking is a `tests/` driver's job.
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`

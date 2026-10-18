@@ -410,6 +410,36 @@ pub fn assert_tier_agreement() {
     }
 }
 
+/// Run **every** workload on exactly ONE tier, discarding the results — the driver a
+/// *dynamic* per-variant census needs.
+///
+/// [`assert_tier_agreement`] deliberately runs every available tier (twice), so it is
+/// useless as a **single-tier execution sample**: any run-time instrument that counts
+/// what executed (e.g. [`crate::exec_census`], whose funnel only sees instructions the
+/// given tier actually executes) would then mix the tiers' instruction mixes together —
+/// and on a *native* tier most instructions are inlined and never reach the funnel at
+/// all. This entry point fixes the tier for the caller: one
+/// [`Measurement::run`] per workload at [`workloads::AGREEMENT_RUNS`] runs, no cross-tier
+/// comparison, no timing report, no `println!`.
+///
+/// The results are deliberately **not** verified here: correctness of this workload set
+/// is [`assert_tier_agreement`]'s job (and a run that genuinely fails panics inside
+/// [`Measurement::run`]), so this driver exists only to produce an execution sample.
+/// Measurement-only: no behaviour change, and nothing outside the crate can call it.
+#[allow(dead_code)] // consumed by the crate's `#[cfg(test)]` census
+pub(crate) fn run_workloads_on(tier: Tier) {
+    assert!(
+        tier.is_available(),
+        "the workloads can only run on a tier this build reports: {}",
+        tier.name()
+    );
+    for workload in workloads() {
+        // Dropped immediately: `Measurement::run` owns everything the sample needs, and
+        // its context (which owns the arena its terms point into) must not outlive it.
+        let _ = Measurement::run(tier, &workload, workloads::AGREEMENT_RUNS);
+    }
+}
+
 /// The measurement table: `ns/op` + `ops/s` per `(workload, tier)`, plus the speed-up
 /// over the interpreter.
 ///
