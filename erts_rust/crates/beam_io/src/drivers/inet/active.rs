@@ -117,6 +117,43 @@ impl TcpInetDriver {
         self.options.active > INET_PASSIVE
     }
 
+    /// Whether **this driver owns the read readiness** of its socket — the one predicate that
+    /// tells [`Driver::ready_input`](crate::Driver::ready_input) which of its two bodies to run.
+    ///
+    /// The C dispatches `tcp_inet_input` (`inet_drv.c:13461`) on the descriptor's **state**, never
+    /// on the mode: an `INET_STATE_ACCEPTING`/`INET_STATE_MULTI_ACCEPTING` listener takes the
+    /// accept ladder (`:13469`/`:13529`), an `IS_CONNECTED(INETP(desc))` socket goes to exactly
+    /// one call — `tcp_recv(desc, 0)` (`:13598`-`:13600`) — and only the *delivery* inside it
+    /// splits on the mode: `tcp_reply_data` sends the bytes to the port's input queue when
+    /// `desc->inet.active == INET_PASSIVE` (`inet_async_data`, `:4294`-`:4295`) and to the owner
+    /// as a message otherwise (`tcp_message`, `:4296`-`:4297`).
+    ///
+    /// This crate splits that single read path into two bodies —
+    /// [`TcpInetDriver::active_delivery`] (the active channel) and
+    /// [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) (the accept ladder, the queued
+    /// `TCP_REQ_RECV` completion and the passive port-input read) — so the callback has to pick
+    /// the one the C's state arm would have reached. Running both, or the passive one first, would
+    /// let `read_available` drain the socket into the port input queue
+    /// ([`TcpInetDriver::pending_input`](super::TcpInetDriver) under a framing `{packet, N}`)
+    /// before the active half could read a single byte.
+    ///
+    /// `true` exactly in the state [`TcpInetDriver::active_delivery`] can serve: a **connected**
+    /// socket, an **active** mode, and **no** queued `TCP_REQ_RECV` operation (which owns the
+    /// socket and reports through the completion channel).
+    ///
+    /// **Divergence, recorded:** that third condition has no C counterpart — `tcp_recv` never
+    /// consults `desc->inet.opt`, so a receive queued *before* the port went active is simply
+    /// ignored there and the owner gets a `tcp_message` while the operation runs into its own
+    /// `{error, timeout}` (measured: `active_tests.rs`'s
+    /// `the_oracle_lets_the_active_mode_win_over_a_queued_receive`). This floor hands the data to
+    /// the operation the owner queued instead, which loses nothing and cannot deliver the same
+    /// bytes twice; the state is only reachable at all because this driver — unlike the C — does
+    /// not refuse the enqueue's successor, and the C's own ladder refuses a receive on an already
+    /// active port (`:12273`).
+    pub(super) fn owns_readiness_for_active(&self) -> bool {
+        self.state.is_connected() && self.active_mode() && self.async_ops.recv().is_none()
+    }
+
     /// Delivers everything the socket holds on the **active-input channel** — the C's
     /// `tcp_deliver`/`tcp_recv` pair.
     ///
@@ -146,10 +183,7 @@ impl TcpInetDriver {
     /// ([`super::frame::extract`]'s typed `badarg`/`notsup`), or a delivery the port refuses
     /// ([`DriverContext::deliver_active_input`]).
     pub(super) fn active_delivery(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        if !self.state.is_connected() || !self.active_mode() {
-            return Ok(());
-        }
-        if self.async_ops.recv().is_some() {
+        if !self.owns_readiness_for_active() {
             return Ok(());
         }
         if self.framed().is_some() {

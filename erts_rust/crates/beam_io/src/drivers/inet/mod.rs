@@ -1833,18 +1833,26 @@ impl Driver for TcpInetDriver {
     }
 
     fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        // Two mutually exclusive readings of the same readiness event:
+        // One readiness event, **one** reading of it — the C's `tcp_inet_input` dispatch
+        // (`inet_drv.c:13461`), which is on the descriptor's state and not on its mode: a
+        // listener takes the accept ladder (`:13469`/`:13529`), and a connected socket gets
+        // exactly one `tcp_recv(desc, 0)` (`:13598`-`:13600`) whose delivery then splits on
+        // `desc->inet.active` — passive ⇒ `inet_async_data` onto the port input queue
+        // (`tcp_reply_data`, `:4294`-`:4295`), otherwise `tcp_message` to the owner (`:4296`-
+        // `:4297`). So an `{active, …}` connection delivers through the **active-input channel**
+        // (one `{tcp, S, Data}` per delivered unit, never the port input queue) and never through
+        // both:
         //
-        // * an `{active, …}` connection delivers through the **active-input channel** — one
-        //   `{tcp, S, Data}` message per delivered unit, never the port input queue (the C's
-        //   `tcp_inet_input` → `tcp_deliver`, `inet_drv.c:13045`) — see
-        //   [`TcpInetDriver::active_delivery`];
+        // * [`TcpInetDriver::owns_readiness_for_active`] is the C's connected-and-active arm —
+        //   [`TcpInetDriver::active_delivery`] owns the socket's read;
         // * everything else (a listener's queued `accept`, a queued `TCP_REQ_RECV`, or a passive
         //   connection's bytes into the port input queue) stays with
-        //   [`TcpInetDriver::async_ready_input`]. `active_delivery` declines without a connected
-        //   active socket and without a read having happened, so the two never both consume.
-        self.async_ready_input(ctx)?;
-        self.active_delivery(ctx)
+        //   [`TcpInetDriver::async_ready_input`].
+        if self.owns_readiness_for_active() {
+            self.active_delivery(ctx)
+        } else {
+            self.async_ready_input(ctx)
+        }
     }
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         if self.state == InetState::Connecting {

@@ -39,6 +39,7 @@
 use super::opcode_tests::{erl_stdout, loopback_arg, open_arg, op};
 use super::wire::ctl_ok;
 use super::TcpInetDriver;
+use crate::completion::{CompletionEvent, InetAsyncResult};
 use crate::poller::Poller;
 use crate::port::PortRegistry;
 use crate::port_task::{ActiveInput, ActiveInputEvent, ReadMessage};
@@ -65,6 +66,8 @@ const SETOPTS: u32 = 7;
 const GETSTAT: u32 = 11;
 /// `INET_REQ_LISTEN` (`inet_drv.c:12042`).
 const LISTEN: u32 = 27;
+/// `TCP_REQ_RECV` (`inet_drv.c:12268`) — the asynchronous receive.
+const TCP_REQ_RECV: u32 = 42;
 /// `INET_MODE_BINARY` (`inet_drv.c:779`); `INET_MODE_LIST` is `0`.
 const MODE_BINARY: i32 = 1;
 
@@ -401,6 +404,60 @@ fn a_passive_port_reports_nothing_on_the_active_channel() {
     assert_eq!(port.take_input(3), b"abc".to_vec(), "and the owner can recv them");
 }
 
+/// A queued `TCP_REQ_RECV` keeps the socket out of the active channel: the C refuses such an
+/// operation on an active port (`active || len != 8 ⇒ [0]einval`, `inet_drv.c:12273`), so the state
+/// below is only reachable when the option changes **after** the enqueue. There the queued
+/// operation stays authoritative — its answer rides the completion channel and the active channel
+/// stays silent (`TcpInetDriver::owns_readiness_for_active`).
+///
+/// This is a **deliberate divergence**: the C splits on `desc->inet.active` alone
+/// (`tcp_reply_data`, `:4294`-`:4297`), so it sends the owner a `{tcp, S, Data}` and leaves the
+/// operation pending. The measured oracle shape is pinned by the
+/// [`the_oracle_lets_the_active_mode_win_over_a_queued_receive`] case below.
+#[test]
+fn a_queued_receive_owns_the_socket_instead_of_the_active_channel() {
+    let Link { mut port, mut peer } = link();
+
+    // `Timeout = INET_INFINITY` (`-1`), `Length = 0` ("whatever is available"), enqueued while the
+    // port is still passive.
+    let mut operand = (-1i32).to_be_bytes().to_vec();
+    operand.extend_from_slice(&0u32.to_be_bytes());
+    let reply = port.numbered(TCP_REQ_RECV, &operand);
+    assert_eq!(reply.len(), 3, "`[1] ++ <<Id:16/big>>`: {reply:?}");
+    assert_eq!(reply[0], super::INET_REP_OK, "the receive was accepted");
+
+    // `{active, true}` after the enqueue: the option walk only arms read readiness (its
+    // `trigger_recv` half is `{active, once}`/`{active, N}` only, `inet_drv.c:7950`-`:7958`).
+    assert_eq!(port.setopts(&[active_true()]), ctl_ok());
+    send(&mut peer, b"abc");
+
+    let deadline = Instant::now() + GUARD;
+    let mut completions = Vec::new();
+    let mut active = Vec::new();
+    while completions.is_empty() && Instant::now() < deadline {
+        active.extend(port.round());
+        completions = port.registry.take_completions();
+    }
+    assert_eq!(completions.len(), 1, "the queued receive completed: {completions:?}");
+    assert_eq!(completions[0].port, port.id, "stamped with the port's own id");
+    let CompletionEvent::InetAsync { id, result } = &completions[0].event else {
+        panic!("an `{{inet_async, …}}` completion was expected: {:?}", completions[0]);
+    };
+    assert_eq!(*id, u16::from_be_bytes([reply[1], reply[2]]), "the id its reply handed out");
+    match result {
+        InetAsyncResult::Data(read) => {
+            assert_eq!(
+                read.body.as_deref(),
+                Some(&b"abc"[..]),
+                "the bytes went to the operation, not to the active channel"
+            );
+        }
+        other => panic!("a data completion was expected: {other:?}"),
+    }
+    assert!(active.is_empty(), "the active channel stays silent: {active:?}");
+    assert_eq!(port.input_len(), 0, "and the port input queue stays empty");
+}
+
 /// An `{active, N}` that lands on **zero inside the `setopts` walk** emits its passive event from
 /// there, with no state gate and no data involved (`inet_drv.c:6995`-`:6998`).
 #[test]
@@ -667,4 +724,34 @@ fn the_oracle_delivers_a_waiting_byte_inside_the_setopts_call() {
     );
     let Some(out) = erl_stdout(armed) else { return };
     assert_eq!(out.trim(), "N=0|D=<<\"Q\">>", "`{{active,true}}` only arms");
+}
+
+/// The oracle's counterpart of
+/// [`a_queued_receive_owns_the_socket_instead_of_the_active_channel`], and the evidence for the
+/// **deliberate divergence** recorded there: the C's `tcp_reply_data` splits on
+/// `desc->inet.active` alone (`:4294`-`:4297`), so a `TCP_REQ_RECV` queued *before* the port went
+/// active is not consulted — the owner gets the `{tcp, S, Data}` and the waiting
+/// `gen_tcp:recv/3` runs into its own `{{error,timeout}}`.
+#[test]
+fn the_oracle_lets_the_active_mode_win_over_a_queued_receive() {
+    let expr = concat!(
+        "{ok,L} = gen_tcp:listen(0,[binary,{active,false},{reuseaddr,true},{ip,{127,0,0,1}}]), ",
+        "{ok,P} = inet:port(L), ",
+        "{ok,C} = gen_tcp:connect({127,0,0,1},P,[binary,{active,false},{nodelay,true}]), ",
+        "{ok,S} = gen_tcp:accept(L), ",
+        "Self = self(), ",
+        "spawn(fun() -> Self ! {recv, gen_tcp:recv(S, 0, 1000)} end), ",
+        "timer:sleep(100), ",
+        "ok = inet:setopts(S, [{active,true}]), ",
+        "ok = gen_tcp:send(C, \"abc\"), ",
+        "M = receive {tcp,_,B} -> {tcp,B}; Other -> {other,Other} after 2000 -> none end, ",
+        "R = receive Y -> Y after 1500 -> none end, ",
+        "io:format(\"M=~p|R=~p~n\",[M,R])"
+    );
+    let Some(out) = erl_stdout(expr) else { return };
+    assert_eq!(
+        out.trim(),
+        "M={tcp,<<\"abc\">>}|R={recv,{error,timeout}}",
+        "the C delivers actively and leaves the queued receive pending"
+    );
 }
