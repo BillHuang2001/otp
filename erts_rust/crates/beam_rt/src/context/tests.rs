@@ -2233,9 +2233,11 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
     // it is `beam_bifs`' own `RUNTIME_HOOKS_BIFS` roster (every BIF registered through the
     // `runtime_bif!` macro, each reading the single `RuntimeHooks` seam), so the two sides
     // cannot drift. The keys the bridge serves are the timer family, the loaded-export
-    // check, the link set, the dynamic-tracing tag families, the code-store/loading probes,
-    // the internal process predicates and `notsup` probe, the trace-cleaner/error-logger
-    // constants, the `code:*` coverage surface and `erlang:statistics/1`; every other key of
+    // check, the link set, the dynamic-tracing tag families, the code-store/loading probes
+    // (including the real `erlang:delete_module/1` unload and the `notsup`-raising
+    // `erts_internal:purge_module/2`), the internal process predicates and `notsup` probe, the
+    // trace-cleaner/error-logger constants, the `code:*` coverage surface and
+    // `erlang:statistics/1`; every other key of
     // the roster answers the same typed capability gap the *defaulted* seam reports (the
     // served-key behaviour is pinned by the `the_runtime_hooks_bridge_serves_*` tests).
     let served = [
@@ -2258,6 +2260,8 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
         ("erlang", "system_profile", 0),
         ("erlang", "check_old_code", 1),
         ("erlang", "finish_loading", 1),
+        ("erlang", "delete_module", 1),
+        ("erts_internal", "purge_module", 2),
         ("erlang", "call_on_load_function", 1),
         ("erlang", "has_prepared_code_on_load", 1),
         ("erlang", "finish_after_on_load", 2),
@@ -4515,6 +4519,184 @@ fn the_runtime_hooks_bridge_serves_the_code_store_and_loading_probes() {
             .expect_err("the on-load-hook primitives are always badarg");
         assert_eq!(error.as_atom(), Some("badarg"), "{function}/{arity}: {error}");
     }
+}
+
+/// The committed slice fixture (a real `.beam` produced by the system `erlc`), used by the
+/// `erlang:delete_module/1` cases: it is loaded from a real file, so it exercises the
+/// `module_paths` arm of [`crate::CodeServer::forget_module`] as well as the module cache.
+const DELETE_MODULE_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../beam_loader/tests/fixtures/slice.beam"
+);
+
+/// `erlang:delete_module/1` — the oracle's answer set (`badarg` for a non-atom, `undefined`
+/// for an unheld name, `true` for a held one) **and** the real unload behind the `true`.
+///
+/// Oracle-verified (OTP 29.1.1 / `erts-17.1`): `erlang:delete_module(nosuchmod)` ⇒
+/// `undefined`, `delete_module(42)` ⇒ `error:badarg`, and `delete_module(lists)` on a loaded
+/// module ⇒ `true`. The oracle then keeps the module as *old code* (`code:is_loaded` still
+/// `{file, …}`, `module_loaded` still `true`, `check_old_code` ⇒ `true`, a second delete ⇒
+/// `badarg`); this runtime has no old-code slot, so the first delete really removes the module
+/// and every load-state consumer reports that truthfully — the documented divergence in
+/// [`crate::context::runtime_hooks`]'s `delete_module` rustdoc.
+#[test]
+fn the_runtime_hooks_bridge_serves_delete_module_and_really_unloads() {
+    let mut rt = runtime();
+    let undefined = rt.intern("undefined");
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    let nosuch = rt.intern("nosuchmod_xyz");
+    let slice = rt.intern("slice");
+    assert!(!rt.code_server().is_loaded("slice"), "nothing loaded it yet");
+    rt.load_module(DELETE_MODULE_BEAM).expect("the slice fixture loads");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    // A name the code store does not hold is the atom `undefined` — measured, **not** `false`
+    // (that is `check_old_code/1`'s answer).
+    assert_eq!(
+        ctx.call_bif("erlang", "delete_module", 1, &[nosuch])
+            .expect("delete_module(unheld)"),
+        undefined
+    );
+    // Everything that is not an atom is `badarg`. (A *missing* argument never reaches the
+    // bridge: the registered-BIF dispatch checks the arity first and answers `badarity`, the
+    // oracle's own reason for `erlang:delete_module()`.)
+    for args in [vec![make_small(42)], vec![NIL]] {
+        let error = ctx
+            .call_bif("erlang", "delete_module", 1, &args)
+            .expect_err("a non-atom argument is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{args:?}: {error}");
+    }
+    let error = ctx
+        .call_bif("erlang", "delete_module", 1, &[])
+        .expect_err("no argument at all is an arity error");
+    assert_eq!(error.as_atom(), Some("badarity"), "{error}");
+    // A held module answers `true` …
+    assert_eq!(
+        ctx.call_bif("erlang", "delete_module", 1, &[slice])
+            .expect("delete_module(slice)"),
+        true_atom
+    );
+
+    // … and it is really gone: every load-state consumer stops seeing it.
+    assert_eq!(
+        ctx.call_bif("erlang", "module_loaded", 1, &[slice])
+            .expect("module_loaded/1"),
+        false_atom,
+        "the module is no longer loaded"
+    );
+    assert_eq!(
+        ctx.call_bif("code", "is_loaded", 1, &[slice])
+            .expect("code:is_loaded/1"),
+        false_atom,
+        "the code server has no entry for it"
+    );
+    let all_loaded = ctx
+        .call_bif("code", "all_loaded", 0, &[])
+        .expect("code:all_loaded/0");
+    let still_listed = terms::list_elements(all_loaded)
+        .expect("a list")
+        .into_iter()
+        .any(|entry| terms::tuple_element(entry, 0).ok() == Some(slice));
+    assert!(!still_listed, "code:all_loaded/0 no longer lists `slice`");
+    // There is no old-code slot, so `check_old_code/1` cannot start answering `true`.
+    assert_eq!(
+        ctx.call_bif("erlang", "check_old_code", 1, &[slice])
+            .expect("check_old_code/1"),
+        false_atom,
+        "this runtime never retires code into an old-code slot"
+    );
+    // A second delete is the unheld answer (the oracle's `badarg` needs the old-code slot it
+    // retired the module into — the documented divergence).
+    assert_eq!(
+        ctx.call_bif("erlang", "delete_module", 1, &[slice])
+            .expect("delete_module(unheld after the first delete)"),
+        undefined
+    );
+}
+
+/// The removal **invalidates** the cached fun-resolution snapshot: it is stamped with the code
+/// server's loaded-module generation, and [`crate::CodeServer::forget_module`] bumps it.
+#[test]
+fn deleting_a_module_invalidates_the_cached_fun_resolution_snapshot() {
+    let mut rt = runtime();
+    let slice = rt.intern("slice");
+    let true_atom = rt.intern("true");
+    rt.load_module(DELETE_MODULE_BEAM).expect("the slice fixture loads");
+
+    // Warm the cache and prove the next read is a hit (the snapshot is reused, not rebuilt).
+    let _ = rt.code_server().fun_module_snapshot();
+    let settled = rt.code_server().fun_snapshot_rebuilds();
+    let _ = rt.code_server().fun_module_snapshot();
+    assert_eq!(
+        rt.code_server().fun_snapshot_rebuilds(),
+        settled,
+        "an unchanged loaded-module set must reuse the cached snapshot"
+    );
+
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        assert_eq!(
+            ctx.call_bif("erlang", "delete_module", 1, &[slice])
+                .expect("delete_module(slice)"),
+            true_atom
+        );
+    }
+
+    // Asking for the snapshot now is what rebuilds it: the generation moved, so the cached
+    // one is stale and the forgotten module must not appear in the fresh one.
+    let snapshot = rt.code_server().fun_module_snapshot();
+    assert!(
+        rt.code_server().fun_snapshot_rebuilds() > settled,
+        "the removal must invalidate the cached snapshot (its generation moved)"
+    );
+    assert!(
+        snapshot
+            .iter()
+            .all(|(module, _)| module.atom_name(module.name) != Some("slice")),
+        "a forgotten module can no longer contribute a fun identity"
+    );
+}
+
+/// `erts_internal:purge_module/2` raises the oracle's own unconditional `error notsup` — for a
+/// loaded atom, an unloaded atom and a non-atom alike — before inspecting any argument.
+#[test]
+fn the_runtime_hooks_bridge_serves_purge_module_as_the_oracles_notsup_raise() {
+    let mut rt = runtime();
+    let some_atom = rt.intern("some_module");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    // Oracle-verified (OTP 29.1.1 / `erts-17.1`): `purge_module(lists, [])`,
+    // `purge_module(nosuchmod, [])` and `purge_module(42, x)` all raise `error:notsup`,
+    // because OTP 29 removed code purging and the BIF is the `i_notsup` stub. The answer does
+    // not depend on the arguments at all — not even on the second one — so a loaded atom, an
+    // unheld atom and a non-atom in either position take the same raise.
+    for args in [
+        vec![some_atom, NIL],
+        vec![some_atom, make_small(1)],
+        vec![make_small(42), NIL],
+        vec![some_atom, some_atom],
+    ] {
+        let error = ctx
+            .call_bif("erts_internal", "purge_module", 2, &args)
+            .expect_err("purge_module/2 always raises");
+        assert!(
+            crate::error::unsupported_reason(&error).is_none(),
+            "{args:?}: this is the oracle's own raise, not a capability gap: {error}"
+        );
+        let raise = match error.into_raise() {
+            Some(raise) => raise,
+            None => panic!("{args:?}: not a raise"),
+        };
+        assert_eq!(raise.class, beam_common::ExceptionClass::Error);
+        assert_eq!(raise.reason.as_atom(), Some("notsup"), "{args:?}");
+    }
+    // A *missing* argument never reaches the bridge: the registered-BIF dispatch checks the
+    // arity first (`badarity`), so the unconditional raise cannot be mistaken for one that
+    // inspects its arguments.
+    let error = ctx
+        .call_bif("erts_internal", "purge_module", 2, &[])
+        .expect_err("no arguments at all is an arity error");
+    assert_eq!(error.as_atom(), Some("badarity"), "{error}");
 }
 
 /// `erts_internal:is_system_process/1` / `is_process_executing_dirty/1`,

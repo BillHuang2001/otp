@@ -37,6 +37,9 @@
 //! | `erlang:cancel_timer/2` | [`crate::timers`] — the `/1` answers under the option list |
 //! | `erlang:read_timer/1,2` | [`crate::timers`]' pending deadline — the remaining milliseconds without cancelling, `false` for a reference with no live timer, and `{async, boolean()}` for the delayed `{read_timer, TRef, TimeLeft}` reply (`inet:timeout/1`'s primitive) |
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer)'s loaded exports + the **emulator builtins** (the declared `bif.tab` surface plus the `erlang`-namespace registry extras) |
+//! | `erlang:check_old_code/1` | always `false` — this runtime never retires code into an *old code* slot |
+//! | `erlang:delete_module/1` | the [`CodeServer`](crate::CodeServer)'s `forget_module` — `true` for a held module (it is really unloaded; there is no old-code slot), the atom `undefined` for an unheld one, `badarg` for a non-atom |
+//! | `erts_internal:purge_module/2` | the oracle's own unconditional `error notsup` raise (OTP 29 removed code purging) |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set — a **local** pid through [`ProcessTable::link`]/`unlink`, a **remote** pid through [`ProcessTable::link_term`]/`unlink_term` (the remote-link set + the wire `DOP_LINK`/`DOP_UNLINK_ID`) |
 //! | `erlang:port_set_data/2`, `erlang:port_get_data/1` | [`PortRegistry`](crate::port::PortRegistry)'s opaque per-port data term (`prt->data`) |
 //! | `erts_internal:port_connect/2` | [`crate::port::ops::connect`] — the owner transfer, shared with the floor's `erlang:port_connect/2` spelling |
@@ -74,6 +77,16 @@
 //!   tuple list cannot be produced honestly. The switch is recorded (so
 //!   `erts_internal:scheduler_wall_time/1`'s previous-value exchange is faithful) but drives
 //!   no sampling, and the reader never fabricates a figure from it.
+//! * `erlang:delete_module/1` **unloads**, where the oracle only *retires* code. Measured on
+//!   OTP 29.1.1 / `erts-17.1`: `erlang:delete_module(lists)` answers `true` and leaves the
+//!   module in place as **old code** (`code:is_loaded(lists)` is still `{file, …}`,
+//!   `module_loaded(lists)` still `true`, `check_old_code(lists)` is `true`, a second delete
+//!   raises `badarg` with `=ERROR REPORT==== … Module lists must be purged before
+//!   deleting`). This runtime has no old-code slot and does not fake one, so the first
+//!   delete really removes the module (`module_loaded/1` and `code:is_loaded/1` answer
+//!   `false`, `code:all_loaded/0` drops the entry, `check_old_code/1` stays `false`, the
+//!   path-based `code:which/1` still answers the on-disk `.beam`) and a second delete is the
+//!   unheld `undefined`. [`RuntimeHooksBridge::delete_module`] carries the full reasoning.
 //! * `os:set_signal/2` installs the disposition for real (the one process-global
 //!   [`signal`] facility) and the `{notify, Signal}` leg is wired: a caught signal is
 //!   written to the facility's self-pipe, and the port layer's pumps deliver the 2-tuple
@@ -767,6 +780,65 @@ impl<'a> RuntimeHooksBridge<'a> {
         atom_term(atoms, "false")
     }
 
+    /// `erlang:delete_module/1` — drop a module from this runtime's code store.
+    ///
+    /// Oracle-verified (OTP 29.1.1 / `erts-17.1`): a non-atom is `badarg`
+    /// (`delete_module(42)`), and a name the code store does not hold answers the atom
+    /// `undefined` (`delete_module(nosuchmod)`) — **not** `false`. A held module answers
+    /// `true`, so this arm forgets it through [`CodeServer::forget_module`].
+    ///
+    /// # `// documented divergence:` there is no old-code slot, so the first delete really
+    /// unloads
+    ///
+    /// The oracle's delete only *retires* a module: measured, `erlang:delete_module(lists)`
+    /// answers `true` while `code:is_loaded(lists)` stays `{file, …}`, `module_loaded(lists)`
+    /// stays `true`, `check_old_code(lists)` is `true` (the code is now *old* code) and a
+    /// second delete raises `badarg` with an `=ERROR REPORT==== … Module lists must be
+    /// purged before deleting`. This runtime has **no old-code slot** and must not fake one
+    /// with a tombstone set, so the first delete removes the module and every load-state
+    /// consumer reports what this runtime's state really is: `module_loaded/1` and
+    /// `code:is_loaded/1` answer `false`, `code:all_loaded/0` drops the entry,
+    /// `check_old_code/1` stays `false` (it never had old code), the path-based
+    /// `code:which/1` still answers the on-disk `.beam`, and a **second** delete answers
+    /// `undefined` — the truthful analogue of the oracle's not-loaded path rather than a
+    /// synthesized `badarg`. That divergence is the honest shape of a runtime whose code
+    /// store holds exactly one generation; closing it means adding the two-generation code
+    /// store, not special-casing this BIF.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a missing or non-atom argument; the typed capability gap when the
+    /// answer atom (`true`/`undefined`) is not interned — the boot seed
+    /// ([`CORE_ATOMS`](crate::boot::CORE_ATOMS)) interns both, so that arm is unreachable in
+    /// practice.
+    fn delete_module(&mut self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(BeamError::BadArg);
+        }
+        // The name is read off the caller's table. A name the table does not hold cannot be
+        // a name this runtime ever loaded (a module is interned when it is loaded), so it
+        // takes the same unheld answer the cache lookup would give.
+        let held = atoms
+            .name(atom_val(module))
+            .is_some_and(|name| self.runtime.code_server.forget_module(name));
+        atom_term(atoms, if held { "true" } else { "undefined" })
+    }
+
+    /// `erts_internal:purge_module/2` — the code-purging primitive.
+    ///
+    /// Oracle-verified (OTP 29.1.1 / `erts-17.1`): it **raises** `error notsup` for **every**
+    /// argument — a loaded atom (`lists`), an unloaded one (`nosuchmod`) and a non-atom
+    /// (`42`) alike — because OTP 29 removed code purging from the runtime and the BIF is the
+    /// `i_notsup` stub. So `notsup` here is the oracle-exact *raise*, not a fabricated value,
+    /// and it is raised before any argument is inspected (exactly as the C does).
+    ///
+    /// # Errors
+    ///
+    /// Always the `error notsup` raise the oracle produces (see [`Self::notsup`]).
+    fn purge_module(&self) -> Result<Eterm> {
+        self.notsup()
+    }
     /// `erlang:finish_loading/1` — the prepared-code loading primitive.
     ///
     /// Oracle-verified (OTP 29/`erts-17.1`): the empty list answers `ok`; anything else —
@@ -1423,6 +1495,11 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             // The code-store primitives the runtime can answer from its own real state.
             ("erlang", "check_old_code", 1) => self.check_old_code(atoms, args),
             ("erlang", "finish_loading", 1) => self.finish_loading(atoms, args),
+            // `delete_module/1` really drops the module from this runtime's code store (there
+            // is no old-code slot to retire it into), and `purge_module/2` is the oracle's own
+            // unconditional `notsup` raise.
+            ("erlang", "delete_module", 1) => self.delete_module(atoms, args),
+            ("erts_internal", "purge_module", 2) => self.purge_module(),
             ("erlang", "call_on_load_function", 1)
             | ("erlang", "has_prepared_code_on_load", 1)
             | ("erlang", "finish_after_on_load", 2) => self.badarg_always(),

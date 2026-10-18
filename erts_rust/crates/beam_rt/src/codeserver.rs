@@ -130,10 +130,12 @@ pub struct CodeServer {
     /// changes — the invalidation trigger for the cached fun-resolution snapshot
     /// ([`CodeServer::fun_module_snapshot`]).
     ///
-    /// [`CodeServer::load_path`] is the **only** mutation point of that cache (this runtime
-    /// never unloads code), so it is the only place that bumps this; a future unload — or any
-    /// other change to a loaded module's IR, which is what carries its `FunT` fun-table
-    /// identity — must bump it there too, or the snapshot goes stale.
+    /// The bump sites are exactly the three mutations of that cache:
+    /// [`CodeServer::load_path`] and [`CodeServer::insert_loaded`] (a module added or
+    /// replaced) and [`CodeServer::forget_module`] (a module dropped by
+    /// `erlang:delete_module/1`). A future mutation — or any other change to a loaded
+    /// module's IR, which is what carries its `FunT` fun-table identity — must bump it too,
+    /// or the snapshot goes stale.
     loaded_generation: u64,
     /// The **cached** fun-resolution snapshot ([`CodeServer::fun_module_snapshot`]), stamped
     /// with the [`loaded_generation`](CodeServer::loaded_generation) it was built at.
@@ -635,9 +637,11 @@ impl CodeServer {
     /// while building the snapshot is a full walk of the module cache — [`loaded`]'s sorted
     /// `Vec<String>` plus an `Arc` clone and a `PathBuf` per module, ~23 modules after a
     /// boot. The snapshot is therefore built **once per loaded-module generation**: an
-    /// unchanged module set hands every caller the *same* [`Rc`], and only
-    /// [`CodeServer::load_path`]'s bump of [`loaded_generation`](CodeServer::loaded_generation)
-    /// invalidates it, so a mid-run load is always visible to the next call.
+    /// unchanged module set hands every caller the *same* [`Rc`], and only a bump of
+    /// [`loaded_generation`](CodeServer::loaded_generation) — from
+    /// [`CodeServer::load_path`], [`CodeServer::insert_loaded`] or
+    /// [`CodeServer::forget_module`] — invalidates it, so a mid-run load or delete is always
+    /// visible to the next call.
     ///
     /// A module with no known `.beam` path (one supplied in memory) is skipped: its checksum
     /// cannot be derived, so it could never contribute a faithful identity.
@@ -745,6 +749,33 @@ impl CodeServer {
         self.module_files.insert(name.to_string(), recorded);
         self.loaded_generation += 1;
         module
+    }
+
+    /// **Forgets** `name`: drops it from the loaded-module cache and from both location maps,
+    /// answering whether the server held it.
+    ///
+    /// This is the code store's one *removal*, and `erlang:delete_module/1`'s whole effect on
+    /// this runtime (see [`crate::context::runtime_hooks`]). It drops exactly what a load
+    /// recorded — the cached `Arc<Module>` ([`CodeServer::is_loaded`],
+    /// [`CodeServer::module_handle`], [`CodeServer::loaded`]), the `.beam` path a file load
+    /// recorded ([`CodeServer::loaded_path`]) and the filename a
+    /// [`CodeServer::insert_loaded`] load recorded ([`CodeServer::recorded_name`]) — so every
+    /// load-state consumer (`erlang:module_loaded/1`, `code:is_loaded/1`,
+    /// `code:all_loaded/0`) stops seeing the name, while the **path**-based ones
+    /// (`code:which/1`, `code:get_object_code/1`) still find `<name>.beam` on the code path,
+    /// exactly as they do for a module that was never loaded.
+    ///
+    /// The loaded-module generation is bumped when anything was really dropped, so the cached
+    /// fun-resolution snapshot is invalidated ([`CodeServer::fun_module_snapshot`] is stamped
+    /// with that generation) — a forgotten module can no longer contribute a fun identity.
+    pub fn forget_module(&mut self, name: &str) -> bool {
+        let held = self.modules.remove(name).is_some();
+        let path = self.module_paths.remove(name).is_some();
+        let recorded = self.module_files.remove(name).is_some();
+        if held || path || recorded {
+            self.loaded_generation += 1;
+        }
+        held
     }
 
     /// Loads a `.beam` image out of memory into the shared atom table.
