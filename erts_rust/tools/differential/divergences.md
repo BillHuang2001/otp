@@ -62,8 +62,20 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 - The **failure** family — `driver_failure` / `driver_failure_atom` / `_posix` / `_eof`, `driver_exit/2`,
   `erl_drv_set_os_pid/2`, `erl_drv_init_ack/2` — terminates/closes the port in the oracle (the module
   then sees a linked-port exit signal / the `-1` sentinel) while the Rust runtime answers via
-  `DriverHost` defaults; the close reason is a linked-port signal, not a VM-stable observable, so none
-  is pinned. Owner: `crates/beam_rt` / `crates/beam_io`.
+  `DriverHost` defaults and leaves the port open. Measured with one C fixture (`drvfail`, commands
+  `1`…`8` of `crates/beam_abi/tests/fixtures/driver_failure.c`): oracle `{1,0,[],[{exit,normal}],…}`,
+  `{2,0,[],[{exit,boom}],…}`, `{3,0,[],[{exit,eacces}],…}`, `{4,0,[],[{exit,7}],…}`,
+  `{6,0,[],[],…}` and the monitor column `[{down,normal}]`/`[{down,eacces}]`, the port left closed;
+  Rust `{3,0,{error,badarg},[],{name,…},{closed,true}}` — the control return is the `-1` failure code
+  (so `port_control/3` raises `error:badarg`), no message ever arrives and the port closes normally.
+  The close **reason** is a VM-stable observable, so it is not the unpinnable part: `normal` on a
+  plain `port_close/1` is pinned by `driver/port_close_delivers_exit_to_a_trapping_owner` and
+  `driver/port_close_delivers_down_to_a_port_monitor` (16/16 oracle reps, and the runtime agrees on
+  both), and the family's own reasons (`normal` for the eof and `failure(…,0)` routes, an arbitrary
+  atom, the lowercase POSIX name, a bare integer) reproduce 16/16 on the oracle — pinned against the
+  real ERTS by `crates/beam_abi/tests/driver_failure.rs`'s oracle half. What keeps the family out of
+  the corpus is the *close itself*, which the runtime never performs. Owner: `crates/beam_rt` /
+  `crates/beam_io`.
 - `driver_dl_open` + `driver_dl_close` round trip is an **oracle-side hazard** — the system `erl`
   core-dumps on the close (the refusal half is pinned by the `driver_abi` selector 49), so the round
   trip is deliberately not pinned (a harness artifact, never a runtime difference).
@@ -108,8 +120,6 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 - `driver_mk_port(NULL)` returns the nil term in the rust runtime but crashes the **oracle** VM
   (an exit signal with empty stdout) — a probe hazard, unpinnable; excluded from the `driver_extra`
   block.
-- `erl_errno_id/1` returns a short POSIX symbol (`enoent`, `einval`, `errno_0`) in the oracle
-  but `strerror` prose in the rust runtime.
 - `driver_pdl_get_refc(NULL)` SIGSEGVs the oracle, so the `driver_pdl_*` family stays unpinned
   (the PDL calls themselves succeed in both).
 - `driver_async_port_key/1` → oracle `3`, rust `0`; `erl_drv_consume_timeslice/2` → oracle
@@ -284,33 +294,22 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `badarg` — while `beam_rt` still reports the stale `{connected,Pid}` and closes normally. Only the
   `port_connect(P, self())` forms are pinned (`driver/port_connect_answers_true`,
   `driver/erts_internal_port_connect_answers_true`). Owner: `beam_rt`.
-- **A datagram send never receives its driver reply** (no case pins it; owner `beam_rt`, the
-  port-task reply bridge): `gen_udp:send(S,{127,0,0,1},P,<<"hi">>)` answers `ok` under the oracle, but
-  `prim_inet:do_sendto/4`'s `erlang:port_command/2` answers `true` and then blocks in
-  `receive {inet_reply,S,Reply,Ref}`, which no port round ever fills — the `-eval` route exits `3`
-  with `beam_rt: unsupported: opcode: run: process blocked (no message available)`, and the
-  compiled-module route (`beam_rt run`) hangs to its 60 s deadline. The driver's own write path
-  (`beam_io`) is in place; the reply bridge is what is missing.
-- **The datagram read path is still a gap** (owner `beam_io` / `beam_rt`): an incoming datagram is
-  never delivered — a `{active,true}` socket sees `{udp,S,{127,0,0,1},_,<<"abc">>}` under the oracle
-  and nothing under the runtime with a datagram injected from outside the VM, and `gen_udp:recv/3`
-  raises `{case_clause,{ok,…}}` inside `prim_inet:recvfrom0/3` where the oracle answers
-  `{error,einval}`.
-- **`gen_tcp:send/2` on a listening socket** answers `{error,einval}` where the oracle answers
-  `{error,enotconn}` (owner `beam_io`), and **`gen_tcp:accept/2`** with a short timeout fails with
-  `{case_clause,{ok,[]}}` inside `prim_inet:async_accept/2` where the oracle answers
-  `{error,timeout}` (owner `beam_rt`, the `inet:getopts/2` reply shape). The *option/control* half of
-  both drivers agrees and is pinned (`udp/port_control_*`, `inet_control/*`), including
-  `inet:getstat/1`'s counter reply, `gen_tcp:connect/3`, `gen_tcp:listen/2`, the
-  `{mode,list|binary}` store and the `INET_REQ_FDOPEN` pre-adoption ladder
-  (`udp/port_control_fdopen_refusal_ladder`); only the data path waits.
+- **`gen_tcp:send/2` blocks** (owner `beam_rt`, the `tcp_inet` send path's reply wait): on a
+  **listening** socket the oracle answers `{error,enotconn}` and on a **connected** one `ok`, while
+  both shapes make the Rust runtime report
+  `beam_rt: unsupported: opcode: run: process blocked (no message available)`. A raw caller-tagged
+  `erlang:port_command/2` on that same connected port answers `{inet_reply,Port,ok,Tag}` on **both**
+  sides, so the bytes and the tagged reply shape are in place and the blocked wait is in the
+  stdlib send path above it.
 - The `{fd,…}` port grammar is disjoint: `open_port({fd,1,1},[out])` opens under the oracle and is
-  `error:badarg` under `beam_rt`, `open_port({fd,1},[out])` the reverse. `eof` is never delivered by
-  `beam_rt`. A non-iodata `port_command/2` raises `badarg` on **both** sides now, but the oracle
-  additionally writes a racy timestamped `=ERROR REPORT==== … Bad value on output port` line to
-  stdout (measured agreeing on roughly one run in six), so the shape stays unpinned. A missing
-  `{spawn,Cmd}` shell diagnostic differs only in `argv[0]` (`sh:` vs `/bin/sh:`); the exit status
-  `127` agrees.- The **`{line,N}` half now agrees and is pinned**: the runtime reproduces the oracle's line framing
+  `error:badarg` under `beam_rt`, `open_port({fd,1},[out])` the reverse (measured:
+  `{port,{exit,badarg}}` on the oracle against `{{exit,badarg},port}` on the runtime). `eof` is never
+  delivered by `beam_rt`. A non-iodata `port_command/2` raises `badarg` on **both** sides now, but
+  the oracle additionally writes a racy timestamped `=ERROR REPORT==== … Bad value on output port`
+  line to stdout (measured agreeing on roughly one run in six), so the shape stays unpinned. A
+  missing `{spawn,Cmd}` shell diagnostic differs only in `argv[0]` (`sh:` vs `/bin/sh:`); the exit
+  status `127` agrees.
+- The **`{line,N}` half now agrees and is pinned**: the runtime reproduces the oracle's line framing
   exactly — the `{eol, Line}` / `{noeol, Line}` frames, the split at exactly N bytes with no EOL, the
   512-byte default `line` boundary and the EOF no-EOL flush (the CR payload included)
   (`driver/line_option_matrix`, `driver/line_frames_exact_n_noeol_split`,
