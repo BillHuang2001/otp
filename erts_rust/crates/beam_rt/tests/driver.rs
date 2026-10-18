@@ -516,7 +516,7 @@ fn loads_and_drives_a_real_c_driver() {
         .expect("the fixture implements output");
     assert_eq!(
         driver.host().outputs(),
-        &[hello.to_vec()],
+        &[(Vec::new(), Some(hello.to_vec()))],
         "driver_output must deliver the received bytes to this runtime's host"
     );
 
