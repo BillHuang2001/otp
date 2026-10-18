@@ -37,7 +37,7 @@
 //! them; the `erl` cross-check skips **loudly** when the oracle is absent.
 use super::opcode_tests::{connection, erl_stdout, op, Rig, CONTROL_MAGIC};
 use super::wire::{ctl_ok, ctl_xerror};
-use super::{InetState, INET_AF_INET, INET_TYPE_STREAM};
+use super::{InetState, TcpInetDriver, INET_AF_INET, INET_TYPE_STREAM};
 use crate::poller::Poller;
 use crate::port::{Port, PortCommandOptions};
 use beam_process::PortId;
