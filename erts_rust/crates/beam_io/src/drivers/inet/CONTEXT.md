@@ -182,6 +182,11 @@ Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p b
 - `packet.rs` → `PacketType`/`PacketLength`/`PacketOptions`/`DEFAULT_DELIMITER`, the per-type decoders, `payload_range`; `frame.rs` → `options`/`framed`/`write_header`/`extract` + `mod tests` and `frame_tests.rs`
 - `sys.rs` → every raw `libc` socket wrapper (option pairs, the `AF_INET`-only `decode_inet_address`, the datagram family, `wait_connected`, the name-service/interface floors); `oracle_dump.rs` → the length-framed dump format (`ERL_FRAME_ELEMENT`/`decode`/`encode`) with `udp/oracle_dump_tests.rs`
 - `tests.rs` → the in-module suite; `opcode_tests*.rs` → the numeric-opcode suites + the 80-call `erl` `tcp_inet` matrix, the `udp_inet` matrix, the state machine and the refusals (the shared helpers the siblings import)
+- `inherit_tests.rs` (16) → the accepted-socket inheritance suite: `SocketOptions::inherited_from` field-group units + the negative half (`active`/`active_count`/`debug`/`netns`/`read_packets` not inherited) + real-loopback `from_accepted` rows + the measured `prim_inet:accept_opts/3` oracle row
+- `peer_close_tests.rs` (10) → the peer-close ladder: reset vs end-of-file, the three `tcp_add_flags` companions, the two discovery routes (verb vs reactor) via `ReadReport`, and the `port_command`-after-close reply
+- `close_tests.rs` (5) → `desc_close` (`tcp_clear_output`-equivalent) + the prebound `pending_input` clear on the `close_socket` path
+- `open_reply_tests.rs` (9) → `open`(1)'s `exbadseq` reply on **both** drivers for any state but `Closed` (`inet_ctl_open`'s guard)
+- `tcp_shutdown_tests.rs` (7) → `TCP_REQ_SHUTDOWN`(44)'s guard order (`enotconn` first, then `einval` for `len != 1`) and its `[1]` reply
 - `../../../tests/{inet,udp_inet,inet_async,inet_accept}.rs` → the crate-level integration suites (parent node)
 
 ## See Also
