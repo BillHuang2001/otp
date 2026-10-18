@@ -104,7 +104,8 @@ impl Session {
 /// environment problem — the environment was checked first).
 fn call(name: &str, arity: u32, args: &[Eterm]) -> Option<Session> {
     let so = compile_so(MODULE, FIXTURE_C)?;
-    let Some(path) = so.to_str().map(str::to_string) else {
+    // The path `load` takes: the compiled `.so` **without** its suffix (the loader appends it).
+    let Some(path) = so.with_extension("").to_str().map(str::to_string) else {
         skip("compiled .so path is not valid UTF-8");
         return None;
     };

@@ -1378,7 +1378,14 @@ impl RuntimeContext<'_> {
                 crate::debug_trace::trace(format_args!(
                     "UNDEF load {module}:{function}/{arity}: {err}"
                 ));
-                return Err(err);
+                // A **found** `<module>.beam` whose object code names another module is, at a
+                // **call** site, the oracle's bare `error:undef` — the same reason a module with
+                // no file at all gets (measured on OTP 29.1.1 / erts-17.1; see
+                // `error::call_load_failure`). The loader's own diagnostic is the *right* answer
+                // for the `code:*` routes, which fold it into `badfile`, but a call returns no
+                // value: it raises, and the reason term is part of the contract. Every other
+                // load failure keeps its existing diagnostic unchanged.
+                return Err(error::call_load_failure(err));
             }
         };
         self.run_export(&loaded, function, arity, args)

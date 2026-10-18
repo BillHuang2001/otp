@@ -83,9 +83,10 @@ const EXPECTED_FUNCS: [(&str, u32); 5] = [
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -205,7 +206,7 @@ fn loads_and_calls_a_real_c_nif_library() {
     assert!(enif_api_table().enif_alloc.is_some());
 
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // --- the `.so` really imports `enif_*` (they are bound at load time, not at link time) -------
     match all_symbols_are_undefined_imports(&so, &FIXTURE_IMPORTS) {
@@ -280,7 +281,7 @@ fn loads_and_calls_a_real_c_nif_library() {
 #[test]
 fn call_reports_unknown_functions_and_wrong_types_without_panicking() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let lib = load(&path, "test_nif", &mut host, Eterm::nil()).expect("the fixture must load");
@@ -347,7 +348,7 @@ ErlNifEntry* nif_init(void) { return &futuristic_entry; }
     let Some(so) = compile_so("nif_end_to_end_future", FUTURE_C) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let err = load(&path, "futuristic", &mut host, Eterm::nil()).expect_err("must be rejected");
@@ -371,7 +372,7 @@ int beam_abi_not_a_nif_init(void) { return 0; }
     let Some(so) = compile_so("nif_end_to_end_noinit", NO_INIT_C) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let err = load(&path, "test_nif", &mut host, Eterm::nil()).expect_err("must be rejected");

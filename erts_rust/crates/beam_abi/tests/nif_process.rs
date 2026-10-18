@@ -160,9 +160,10 @@ const EXPECTED_FUNCS: [(&str, u32); 12] = [
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -523,7 +524,7 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     let Some(so) = compile_so("nif_process", FIXTURE_C) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // --- the `.so` really imports the process family (bound at load time, not at link time) -------
     // The set is compared exactly: a fixture that imported a slot this crate leaves `None` would make
@@ -759,7 +760,7 @@ fn rejects_the_fixture_when_the_calling_module_differs() {
     let Some(so) = compile_so("nif_process", FIXTURE_C) else {
         return;
     };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // `ERL_NIF_INIT(nif_process, …)` seeds the entry name, so the oracle's check 9
     // (`Library module name '…' does not match calling module '…'`, `erl_nif.c:4841`) rejects any

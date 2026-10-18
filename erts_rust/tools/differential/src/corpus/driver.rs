@@ -1450,6 +1450,120 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // ---------------------------------------------------------------------------------
+        // The `erts_internal:` **port-value** shapes — the C spellings (`erl_bif_port.c`)
+        // `erlang:port_close/1` and `erlang:port_info/1,2` forward to, whose answers are plain
+        // *values* rather than raises, and whose refusals distinguish `/1` from `/2`:
+        // * a non-port, non-atom argument ⇒ `badarg` as a value for `/1` (`port_close/1` and
+        //   `port_info/1` alike) but `badtype` for `/2` (the C's per-arity class);
+        // * an item a live port does not report ⇒ `badarg` as a value (`/2`);
+        // * `registered_name` of a live **unnamed** port ⇒ the bare empty list `[]` (the C's
+        //   `NIL` slot: an `{registered_name, _}` pair cannot carry it), while the port's own
+        //   `name` item is the `{name, Cmd}` pair;
+        // * a port the runtime no longer holds ⇒ `undefined` for `/1` and for every `/2` item.
+        //
+        // Deliberately NOT pinned: an **atom** argument (the C resolves it as a registered
+        // *name*: `undefined` for a name no port holds) — this runtime answers the typed
+        // capability gap there instead, because name resolution is not on its port seam.
+        // ---------------------------------------------------------------------------------
+        Case {
+            id: "driver/erts_internal_port_info_of_a_non_port_is_badarg",
+            description: "erts_internal:port_info/1 answers the badarg value for a non-port argument",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `/1`'s class is `badarg` (`/2`'s is `badtype`), returned as a value — no
+                // raise, so the probe's `ok …` line carries the reason atom itself.
+                expr: "erts_internal:port_info(42)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok badarg"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/erts_internal_port_close_of_a_non_port_is_badarg",
+            description: "erts_internal:port_close/1 answers the badarg value for a non-port argument",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // Same class as `port_info/1`, and also a value: `erlang:port_close/1`'s
+                // wrapper is what turns it into a raise (pinned by `driver_ports`).
+                expr: "erts_internal:port_close(42)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok badarg"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/erts_internal_port_info_of_a_non_port_item_is_badtype",
+            description: "erts_internal:port_info/2 answers badtype for a non-port argument",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `/2`'s own class, checked before the item is looked at (the item here is the
+                // atom `foo`, so the arity's argument-order rule is pinned too).
+                expr: "erts_internal:port_info(42, foo)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok badtype"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/erts_internal_port_info_of_a_live_port_refuses_an_unknown_item",
+            description: "erts_internal:port_info/2 answers the badarg value for an item a live port does not report",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The item is looked up in the port's own pair list, so an item no port reports
+                // (the C's `ERTS_PORT_OP_BADARG` arm) is the value `badarg`, not a raise. The
+                // port is closed inside the expression, so nothing leaks to another case.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), Rep = erts_internal:port_info(P, bogus_item), true = erlang:port_close(P), Rep end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok badarg"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/erts_internal_port_info_registered_name_of_an_unnamed_port",
+            description: "erts_internal:port_info/2 answers [] for registered_name of an unnamed port and the {name, Cmd} pair for name",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The one `/2` item the C answers with a bare list instead of a pair: an
+                // `{registered_name, _}` tuple cannot express "no name". `name` is the port's
+                // program (`{spawn,"cat"}`), rendered by `~w` as the byte list `[99,97,116]`.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), Rep = {erts_internal:port_info(P, registered_name), erts_internal:port_info(P, name)}, true = erlang:port_close(P), Rep end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[],{name,[99,97,116]}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/erts_internal_port_info_of_a_closed_port_is_undefined",
+            description: "erts_internal:port_info/1,2 answer undefined once the runtime no longer holds the port",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The C's `!prt` arm: after the close the port is gone from the table, so `/1`
+                // and every `/2` item — including `registered_name` — answer `undefined`.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), true = erlang:port_close(P), {erts_internal:port_info(P), erts_internal:port_info(P, name)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {undefined,undefined}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -1973,6 +2087,68 @@ mod tests {
             );
             assert_eq!(case.golden.stdout, Some(golden), "case {id}");
             assert_eq!(case.golden.exit_code, 0, "case {id}: an answer exits 0");
+        }
+    }
+
+    /// The `erts_internal:` **port-value** cases: the per-arity refusal class (`badarg` for
+    /// `/1`, `badtype` for `/2`), the unknown-item value, the unnamed port's bare `[]`
+    /// `registered_name` slot, and the `undefined` a closed port answers. Each golden is the
+    /// oracle's own single-line answer (re-measured with `differential run <id>`).
+    const ERTS_INTERNAL_PORT_VALUE_GOLDENS: &[(&str, &str)] = &[
+        (
+            "driver/erts_internal_port_info_of_a_non_port_is_badarg",
+            "ok badarg",
+        ),
+        (
+            "driver/erts_internal_port_close_of_a_non_port_is_badarg",
+            "ok badarg",
+        ),
+        (
+            "driver/erts_internal_port_info_of_a_non_port_item_is_badtype",
+            "ok badtype",
+        ),
+        (
+            "driver/erts_internal_port_info_of_a_live_port_refuses_an_unknown_item",
+            "ok badarg",
+        ),
+        (
+            "driver/erts_internal_port_info_registered_name_of_an_unnamed_port",
+            "ok {[],{name,[99,97,116]}}",
+        ),
+        (
+            "driver/erts_internal_port_info_of_a_closed_port_is_undefined",
+            "ok {undefined,undefined}",
+        ),
+    ];
+
+    /// Every port-value case is a plain A.4 eval case with the measured value golden, exits 0
+    /// (an `erts_internal:` port answer is a *value*, never a raise), and keeps the probe
+    /// wrapper's reserved names untouched.
+    #[test]
+    fn erts_internal_port_value_cases_pin_the_observed_goldens() {
+        for (id, golden) in ERTS_INTERNAL_PORT_VALUE_GOLDENS {
+            let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
+            assert_eq!(case.contracts, &[Contract::DriverAbi], "case {id}: contract");
+            let CaseKind::Eval {
+                expr,
+                extra_argv,
+                probe,
+            } = case.kind
+            else {
+                panic!("case {id} must be a plain eval case");
+            };
+            assert_eq!(probe, Probe::Value, "case {id}: probe");
+            assert!(extra_argv.is_empty(), "case {id}: no extra argv");
+            assert!(!expr.is_empty(), "case {id}: empty expression");
+            let tokens = identifiers(expr);
+            for reserved in ["V", "C", "R"] {
+                assert!(
+                    !tokens.contains(&reserved),
+                    "case {id}: expression must not bind `{reserved}` (probe-wrapper collision)"
+                );
+            }
+            assert_eq!(case.golden.stdout, Some(*golden), "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}: a value answer exits 0");
         }
     }
 }

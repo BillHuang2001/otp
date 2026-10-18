@@ -90,21 +90,16 @@
 //! never by value. Every expression terminates on its own with no `receive`, so there is no
 //! `after` guard to need (and none is missing).
 //!
-//! # The datagram *data* path is the remaining capability gap (measured, never allowlisted)
+//! # The datagram *data* path: the write half agrees, the external read half does not
 //!
 //! The control/option verb transport above works on both runtimes, and so does the emulator's
-//! `inet:getstat/1` counter reply. What `beam_rt` still lacks is the bridge that carries the
-//! driver's **send reply** back to the owner, and the datagram **delivery** itself. Measured in
-//! this environment (oracle OTP 29.1.1 / `erts-17.1`, and the built `beam_rt`) on a socket the
-//! `open`/`bind` verbs produced:
+//! `inet:getstat/1` counter reply. So does the **write** path: `gen_udp:send/4` answers `ok` on
+//! both sides and the in-VM loopback pair (`gen_udp:send/4` to the socket's own port, then
+//! `gen_udp:recv/3`) agrees, so the `inet_reply` bridge is in place. Measured in this
+//! environment (oracle OTP 29.1.1 / `erts-17.1`, and the built `beam_rt`) on a socket the
+//! `open`/`bind` verbs produced, what `beam_rt` still lacks is the datagram **delivery** and the
+//! socket-less port's `port_command/2` grammar:
 //!
-//! * **a send never receives its reply.** `gen_udp:send(S, {127,0,0,1}, P, <<"hi">>)` answers
-//!   `ok` under the oracle; here `prim_inet:do_sendto/4`'s `erlang:port_command/2` answers `true`
-//!   and then blocks in its `receive {inet_reply, S, Reply, Ref}`, which no port round ever
-//!   fills — the `-eval` route aborts the whole run (exit 3) with
-//!   `beam_rt: unsupported: opcode: run: process blocked (no message available)`, and the
-//!   compiled-module route (`beam_rt run`) hangs to its 60 s deadline. Owner: `beam_rt` (the
-//!   port-task reply bridge).
 //! * **an incoming datagram is never delivered.** With a `{active, true}` socket a datagram
 //!   injected from outside the VM (`os:cmd("printf abc > /dev/udp/127.0.0.1/P")`) arrives as
 //!   `{udp, S, {127,0,0,1}, _, <<"abc">>}` under the oracle and as nothing at all here;
@@ -119,9 +114,9 @@
 //!   this group pins `port_command/2` only on a **closed** port (both sides `badarg`) and the
 //!   socket-less pair is reported to the owner instead.
 //!
-//! Owner of all three: `beam_rt` (the port-task reply bridge / the built-in-driver
-//! `port_command` bridge) / `beam_io` (the driver's `send`/`recv` verbs). No row below pins any
-//! of them; the module docs of [`super::inet_control`] carry the full measured matrix.
+//! Owner of both: `beam_rt` (the built-in-driver `port_command` bridge) / `beam_io` (the
+//! driver's `recv` verb). No row below pins either of them; the module docs of
+//! [`super::inet_control`] carry the full measured matrix.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// One A.4 `udp_inet` eval case.
@@ -532,10 +527,11 @@ mod tests {
         );
     }
 
-    /// The shapes that are **measured** to diverge stay out of the group: the datagram *data*
-    /// path (a `gen_udp` send never receives its `inet_reply`, an incoming datagram is never
-    /// delivered, and a `gen_udp:recv/3` fails inside `prim_inet`) and the `prim_inet` module
-    /// whose calls would drive them (see the per-item comments below).
+    /// The shapes that are out of the group stay out: the datagram *data* path (an incoming
+    /// datagram is never delivered, and a `gen_udp:recv/3` fails inside `prim_inet`) and the
+    /// `prim_inet` module whose calls would drive it (see the per-item comments below). The
+    /// datagram *write* path is no longer one of them — `gen_udp:send/4` answers `ok` on both
+    /// sides — so the ban below is simply "no row drives the data path".
     ///
     /// `port_command/2` is pinnable **only on a closed port** (both runtimes answer `badarg`):
     /// on the socket-less port the two runtimes share no observable at all (the oracle answers
@@ -546,8 +542,8 @@ mod tests {
         for case in group() {
             let expr = case.expr().expect("eval case");
             for forbidden in [
-                // The send verb: `prim_inet:do_sendto/4` awaits an `{inet_reply, …}` that never
-                // arrives, so it is a typed `unsupported` (exit 3) rather than an observable.
+                // The send verb: it drives the data path (and its `recv` half), which no row may
+                // pin until the delivered-datagram bridge exists.
                 "gen_udp:send",
                 // The read path: no datagram is ever delivered, so `recv` fails inside
                 // `prim_inet` (`{case_clause, {ok, …}}`) instead of answering.

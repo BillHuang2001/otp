@@ -152,8 +152,19 @@ impl PortRegistry {
         })
     }
 
-    /// Drains every completion `beam_io` has staged into term-free [`PortEvent`]s, adopting any
-    /// accepted descriptor on the way.
+    /// Drains **both** channels a driver callback can hand work up through, at every point a
+    /// callback can run: the driver-failure channel
+    /// ([`PortRegistry::drain_failures`], which finishes the teardown of a port a driver closed
+    /// itself and publishes the `'EXIT'`/`'DOWN'` it owes) and then this one
+    /// ([`PortRegistry::sweep_completions`]).
+    ///
+    /// The two are one entry point rather than two calls because a driver's callback is what
+    /// stages **both** — the C's `driver_failure*` is a port-closing request and a socket
+    /// driver's `{inet_reply, …}` is a message, both from inside `output`/`control`/`ready_*` —
+    /// so every drain point owes both sweeps and no site can forget one. A failure's port is
+    /// gone from [`PortRegistry::meta`] by the time the completion sweep runs, and its
+    /// [`ClosedPortSnapshot`] is folded into the fallback list, so an operation it left queued
+    /// (`async_error_am_all`) still reaches its owner.
     ///
     /// `fallback` is the [`ClosedPortSnapshot`] of the port a caller has just closed: a
     /// completion harvested from a port that is no longer in [`PortRegistry::meta`] is
@@ -161,22 +172,37 @@ impl PortRegistry {
     /// dropped — the rule every other port-event harvest follows for a port that has left the
     /// runtime (and an [`InetAsyncResult::Accepted`] descriptor in that state is **closed**, so
     /// it cannot leak).
+    pub(super) fn drain_io_completions(
+        &mut self,
+        fallback: Option<ClosedPortSnapshot>,
+    ) -> Vec<PortEvent> {
+        let mut fallbacks = self.drain_failures();
+        fallbacks.extend(fallback);
+        self.sweep_completions(&fallbacks)
+    }
+
+    /// Drains every completion `beam_io` has staged into term-free [`PortEvent`]s, adopting any
+    /// accepted descriptor on the way.
+    ///
+    /// `fallbacks` are the [`ClosedPortSnapshot`]s of every port that has just left the runtime
+    /// in this same drain — the one the caller closed, plus every one a driver closed itself
+    /// ([`PortRegistry::drain_failures`]) — because a completion staged around a teardown
+    /// outlives its [`PortMeta`] (the C's `async_error_am_all`). They are matched by port
+    /// **number**, so a recycled number can never inherit one.
     ///
     /// The [`InetAsyncResult::Accepted`] rewrite is the C's `tcp_inet_copy`
     /// (`inet_drv.c:11834`): a driver in this crate cannot create a port, so the descriptor
     /// crosses the channel and the port is opened here
     /// ([`PortRegistry::adopt_accepted`]) — before any term is built.
-    pub(super) fn drain_io_completions(
-        &mut self,
-        fallback: Option<ClosedPortSnapshot>,
-    ) -> Vec<PortEvent> {
+    fn sweep_completions(&mut self, fallbacks: &[ClosedPortSnapshot]) -> Vec<PortEvent> {
         let drained = self.registry.take_completions();
         let mut events = Vec::with_capacity(drained.len());
         for PortCompletion { port, event } in drained {
             let resolved = match self.meta.get(&port.number()) {
                 Some(meta) => Some((meta.owner, meta.stream, meta.line)),
-                None => fallback
-                    .filter(|snapshot| snapshot.port == port)
+                None => fallbacks
+                    .iter()
+                    .find(|snapshot| snapshot.port == port)
                     .map(|snapshot| (snapshot.owner, snapshot.stream, snapshot.line)),
             };
             let Some((owner, stream, line)) = resolved else {

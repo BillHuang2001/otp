@@ -711,3 +711,183 @@ port raises the typed capability gap (exit 3) rather than fabricating a `true`.
 
 The suite needs the C compiler, the host `erl_driver.h`, `erlc` and the oracle `erl`. A missing one
 prints a loud `SKIP` banner and returns — it is never a silent pass.
+
+## Driver-failure fixtures (`port_failure_driver.c` + `port_failure.erl` → committed `port_failure.beam`; the `.so` compiled at test time)
+
+The pair behind `tests/port_failure.rs` (contract A.4's `driver_failure*`/`driver_exit` family): a
+driver that closes its **own** port from inside its `output` callback, and the consumer that reports
+what the port's owner is left with. It is a plain `driver_*`-only object (like
+`beam_io/tests/fixtures/host_driver.c` and `busy_driver.c`), so `dlopen(RTLD_NOW)` resolves every
+symbol from the loading process's dynamic symbol table — no driver may reference an unimplemented
+`driver_*` slot.
+
+### What each half does
+
+* `port_failure_driver.c` — a real driver shared object whose entry declares `driver_name`
+  `port_failure_driver` (also the compiled object's **stem**, since the name
+  `erl_ddll:try_load/3` registers is what `{spawn_driver, Name}` opens), `driver_flags` `0`, and only
+  `start`/`stop`/`output` populated — no `init`, no `control`, no `ready_input`/`ready_output`, no
+  `timeout`, and it never calls `driver_select`. `start` allocates the private state that holds the
+  `ErlDrvPort` handle its own `driver_output`/`driver_failure*` calls need (`ERL_DRV_ERROR_GENERAL` if
+  the allocation fails), `stop` frees it, and `output` dispatches on the command's first byte to one
+  row of the C's port-closing family:
+
+  | command | the C calls | the row |
+  |---|---|---|
+  | `1` | `driver_output(port, "hi", 2)` **then** `driver_failure(port, 9)` | a read, then exit `9` — the **ordering** row |
+  | `2` | `driver_failure_eof(port)` | exit `normal` |
+  | `3` | `driver_failure_atom(port, "boom")` | exit `boom` |
+  | `4` | `driver_failure_posix(port, EACCES)` | exit `eacces` |
+  | `5` | `driver_failure(port, 7)` | exit the **bare integer** `7` |
+  | `6` | `driver_failure(port, 0)` | exit `normal` |
+  | `7` | `driver_exit(port, 0)` | **no** exit signal at all |
+  | `8` | `driver_exit(port, EACCES)` | **no** exit signal at all |
+
+  Rows 7/8 are the C's `signals_owner == false` arm — `driver_exit` unlinks the owner first, so a
+  linked (even trapping) owner is told nothing while a **monitor** is still told.
+
+* `port_failure.erl` — the probing consumer. Its four exports (`trapping/3`, `trapping_monitored/3`,
+  `trapping_list_monitored/3`, `non_trapping/3`) all take the object's directory, its registered name
+  and the row's command byte, so one compiled module serves every row. `open/2` is
+  `{ok, _} = erl_ddll:try_load(Dir, Name, [])` followed by
+  `open_port({spawn_driver, Name}, [binary])` (`open_list/2` passes `[]`, for the list-stream row) —
+  the **same** expression on both runtimes, unlike the busy fixture's per-runtime open. The three
+  trapping rows set `process_flag(trap_exit, true)`, drive one command with
+  `port_command(P, <<Op>>)`, and drain what they receive **in order** — `drain/2` collects at most
+  four messages, each `receive` bounded by `after 300` — and then report
+  `{erlang:port_info(P), try erlang:port_close(P) catch C:R -> {C,R} end}`. `trapping_monitored_with/4`
+  additionally takes `Rf = erlang:monitor(port, P)` after opening and returns `is_reference(Rf)` as a
+  third element. Every message is **normalized** (`shape/1` → `{exit,true,Reason}` /
+  `{down,true,true,Reason}` / `{data,Data}` / `{misc,Other}`), because a `#Port<…>` and a `#Ref<…>`
+  cannot be equal across two runtimes or two OS processes; the *shape* and the **order** are what the
+  two sides must agree on. `non_trapping/3` is the one row that needs a second process: it
+  `spawn_monitor`s a helper that opens the port, reports `{opened, P}` **before** commanding it (a
+  non-`normal` reason kills the owner from inside `port_command/2`, so a send after it would race the
+  kill), then sleeps 400 ms and sends `alive`; the collector drains three messages with `after 700`
+  (`n_shape/1` → `opened_port` / `alive` / `{helper_down,true,Reason}`).
+
+### The artifacts
+
+Two artifacts, with two different lifetimes: the driver **`.so`** is compiled at test time, the
+probe **`.beam`** is committed. `tests/port_failure.rs` stages both into one per-test scratch
+directory — that directory is both the runtime's `-pa` and the path `erl_ddll:try_load/3` searches
+— by copying the committed image in and running `$CC` beside it.
+
+**Committed: `port_failure.beam` (2 656 bytes)** — `port_failure.erl` compiled with
+`+deterministic`, so the image is path-free and byte-stable (md5
+`1044dd92b5f9472f169213ba0eab206e`; regenerating in two different scratch directories yields the
+identical file). Compile it in a neutral `$TMPDIR` scratch dir, like every other committed fixture:
+
+```sh
+SCRATCH="$TMPDIR/beam_rt_port_failure_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp port_failure.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic port_failure.erl )
+cp "$SCRATCH/gen/port_failure.beam" port_failure.beam    # 2 656 bytes
+git add -f port_failure.beam
+```
+
+The repo-root `.gitignore` drops `*.beam` globally, so the image must be **force-added** like the
+other committed fixtures. It is a **prerequisite of the suite, not a toolchain question**: its
+absence is a repository defect and fails (`require_probe_beam` / the dedicated
+`the_probe_image_is_committed` test), never a skip — otherwise all nine rows would report green
+without one oracle comparison.
+
+**Compiled at test time: `port_failure_driver.so`** — the C side, built with `$CC` (or `cc`)
+against the host `erl_driver.h`, whose directory is resolved from the
+**canonicalized `erl` sibling** (`…/erts-<vsn>/include`, i.e. `erts-<vsn>` is the grandparent of the
+real `erl` binary), then `$ERL_TOP`, then the standard install roots (`/usr/lib/erlang`,
+`/usr/local/lib/erlang`, `/usr/lib64/erlang`, `/opt/erlang`) — each tried directly as
+`<root>/include` and `<root>/lib/erlang/include`, and then as the first `erts-*/include` naming the
+header. The suite does not consult `code:lib_dir(erts,include)`, which names a path that does
+**not** exist in the Nix store layout. The equivalent hand-built recipe:
+
+```sh
+D="$TMPDIR/beam_rt_port_failure"
+ERL=$(readlink -f "$(command -v erl)"); INC="$(dirname "$(dirname "$ERL")")/include"
+cc -shared -fPIC -I"$INC" -o "$D/port_failure_driver.so" port_failure_driver.c
+```
+
+### Oracle values (`erl -noshell`, erts-17.1 / OTP 29.1.1)
+
+One fresh port per row, printed with `~w` (`<<104,105>>` is `<<"hi">>`); a `—` is a combination the
+suite does not drive, so nothing pins it:
+
+| row | `trapping/3` | `trapping_monitored/3` | `trapping_list_monitored/3` | `non_trapping/3` |
+|---|---|---|---|---|
+| `1` | `[{data,<<"hi">>},{exit,true,9}]` | `[{data,<<"hi">>},{exit,true,9},{down,true,true,9}]` | `[{data,[104,105]},{exit,true,9},{down,true,true,9}]` | — |
+| `2` | `[{exit,true,normal}]` | — | — | `[opened_port,alive,{helper_down,true,normal}]` (survives) |
+| `3` | `[{exit,true,boom}]` | — | — | `[opened_port,{helper_down,true,boom}]` (terminated) |
+| `4` | `[{exit,true,eacces}]` | — | — | `[opened_port,{helper_down,true,eacces}]` (terminated) |
+| `5` | `[{exit,true,7}]` | — | — | `[opened_port,{helper_down,true,7}]` (terminated) |
+| `6` | `[{exit,true,normal}]` | — | — | `[opened_port,alive,{helper_down,true,normal}]` (survives) |
+| `7` | `[]` | `[{down,true,true,normal}]` | — | `[opened_port,alive,{helper_down,true,normal}]` (survives) |
+| `8` | `[]` | `[{down,true,true,eacces}]` | — | `[opened_port,alive,{helper_down,true,normal}]` (survives) |
+
+Every trapping row's answer is `{Messages, Post}` and every monitored row's `{Messages, Post, true}`,
+where `Post` is the same after every row: `{undefined,{error,badarg}}` — `erlang:port_info/1` answers
+`undefined` and the second `erlang:port_close/1` raises `badarg`. The full printed shapes:
+
+```none
+trapping/3              1  {[{data,<<104,105>>},{exit,true,9}],{undefined,{error,badarg}}}
+                        2  {[{exit,true,normal}],{undefined,{error,badarg}}}
+                        3  {[{exit,true,boom}],{undefined,{error,badarg}}}
+                        4  {[{exit,true,eacces}],{undefined,{error,badarg}}}
+                        5  {[{exit,true,7}],{undefined,{error,badarg}}}
+                        6  {[{exit,true,normal}],{undefined,{error,badarg}}}
+                        7  {[],{undefined,{error,badarg}}}
+                        8  {[],{undefined,{error,badarg}}}
+trapping_monitored/3    1  {[{data,<<104,105>>},{exit,true,9},{down,true,true,9}],
+                            {undefined,{error,badarg}},true}
+                        7  {[{down,true,true,normal}],{undefined,{error,badarg}},true}
+                        8  {[{down,true,true,eacces}],{undefined,{error,badarg}},true}
+trapping_list_monitored/3 1 {[{data,[104,105]},{exit,true,9},{down,true,true,9}],
+                            {undefined,{error,badarg}},true}
+non_trapping/3          2  [opened_port,alive,{helper_down,true,normal}]
+                        6  [opened_port,alive,{helper_down,true,normal}]
+                        7  [opened_port,alive,{helper_down,true,normal}]
+                        8  [opened_port,alive,{helper_down,true,normal}]
+                        3  [opened_port,{helper_down,true,boom}]
+                        4  [opened_port,{helper_down,true,eacces}]
+                        5  [opened_port,{helper_down,true,7}]
+```
+
+The two rules the table encodes: a **trapping** owner gets `{'EXIT',Port,Reason}` for every failure
+reason (a numeric one — `driver_failure(port, 7)` — is the bare integer `7`, never an atom), while a
+**non-trapping** owner is terminated by a non-`normal` reason (its own `'DOWN'` carries that reason)
+and survives `normal`; and `driver_exit` never produces an `'EXIT'` at all, yet its monitor still
+gets a `'DOWN'`.
+
+### What the suite pins, and on which route
+
+Both delivery routes are covered, because they are separate code paths over one policy — the
+**`-eval` route** returns the messages to the evaluator's own `receive`
+(`RuntimeContext::poll_port_messages`) and the **scheduler `run` route** puts them in the recipient's
+mailbox (`Runtime::deliver_port_signals`), so a receiver parked in a compiled `receive` is woken by
+them. Each row is one probe pair: the same expression prints under the oracle and under `beam_rt`,
+and the two stdouts must be equal. The `run` route passes the directory as a double-quoted `run`
+argument (a charlist), the driver name as a bare atom and the row as an integer
+(`beam_rt run port_failure.beam port_failure:<function>/3 "<dir>" port_failure_driver <row>`).
+
+| test | rows |
+|---|---|
+| `a_read_written_before_the_failure_is_delivered_first` | `trapping/3` 1 (the read precedes the exit signal) |
+| `the_run_route_delivers_the_read_before_the_exit` | `trapping/3` 1, on the scheduler route |
+| `a_list_stream_port_renders_the_surviving_read_as_a_charlist` | `trapping_list_monitored/3` 1 |
+| `a_trapping_owner_gets_the_exit_with_the_failures_reason` | `trapping/3` 2–6 |
+| `driver_exit_tells_the_linked_owner_nothing` | `trapping/3` 7, 8 |
+| `the_owner_that_is_only_linked_never_hears_a_driver_exit` | `trapping/3` 8, once |
+| `a_monitor_gets_the_down_in_both_signal_arms` | `trapping_monitored/3` 1, 7, 8 |
+| `a_non_trapping_owner_is_terminated_by_a_non_normal_reason` | `non_trapping/3` 3, 4, 5 |
+| `a_non_trapping_owner_survives_a_normal_reason` | `non_trapping/3` 2, 6, 7 |
+
+### Skip-loudly rule
+
+Each test skips **loudly** (a `beam_rt port_failure SKIPPED` banner and a return, never a silent
+pass) when the oracle `erl` is absent, when no `erl_driver.h` include directory is found, or when
+the C compiler is missing or fails — a **toolchain** absence, which the host may legitimately have.
+
+A missing **committed** probe image is not a skip: `tests/fixtures/port_failure.beam` is a
+repository artifact, so `require_probe_beam` panics with the regeneration recipe (and
+`the_probe_image_is_committed` fails alongside it), because skipping there would report nine green
+rows that compared nothing.

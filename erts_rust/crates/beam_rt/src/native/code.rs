@@ -283,7 +283,13 @@ impl RuntimeContext<'_> {
     /// ⇒ `{error,nofile}`.
     ///
     /// A `.beam` that *is* found but fails to load is **not** reported as `nofile`: the
-    /// loader's own error is propagated rather than hidden behind the not-found shape.
+    /// oracle's `code:ensure_loaded/1` (`code.erl`) folds every load failure into
+    /// `{error, badfile}` — a malformed container, an unreadable file, and a `<Name>.beam`
+    /// whose **object code names another module** (the loader's expected-name check, see
+    /// [`CodeServer::load`](crate::CodeServer::load)) — so this entry answers exactly that
+    /// reason rather than propagating a loader diagnostic the oracle never returns.
+    /// Oracle-verified (OTP 29.1.1 / erts-17.1) with a `bogus.beam` really holding
+    /// `realname`: `code:ensure_loaded(bogus)` ⇒ `{error,badfile}`.
     pub(super) fn code_ensure_loaded(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let name = self
             .atom_name(*args.first().ok_or(BeamError::BadArg)?)
@@ -296,10 +302,11 @@ impl RuntimeContext<'_> {
         if self.module_file(&name).is_none() {
             return self.no_file();
         }
-        self.runtime.code_server.load(&name)?;
-        self.module_pair(&name)
+        match self.runtime.code_server.load(&name) {
+            Ok(_) => self.module_pair(&name),
+            Err(_) => self.error_pair("badfile"),
+        }
     }
-
     /// `code:ensure_modules_loaded(Modules)`: the atom `ok` when every module named is loaded
     /// (or was loadable), or `{error, [{Module, Reason}]}` naming the ones that are not.
     ///
@@ -332,8 +339,12 @@ impl RuntimeContext<'_> {
     /// produces and an unambiguous match for a single failing module, the shape a probe can pin.
     /// The failure **set** is the contract; the order is not (see the tests' order note).
     ///
-    /// **Accepted residual.** For a `<Name>.beam` that *is* on the code path but corrupt, the
-    /// oracle answers `{error,[{Name,badfile}]}` and **also** logs an
+    /// **Accepted residual.** For a `<Name>.beam` that *is* on the code path but corrupt — or
+    /// whose **object code names another module** (the loader's expected-name check,
+    /// [`CodeServer::load`](crate::CodeServer::load); oracle-verified
+    /// `code:ensure_modules_loaded([bogus])` ⇒ `{error,[{bogus,badfile}]}` with a `bogus.beam`
+    /// really holding `realname`) — the oracle answers `{error,[{Name,badfile}]}` and **also**
+    /// logs a
     /// `=ERROR REPORT==== … corrupt file header` line on its default handler; this runtime has no
     /// logger and emits no such line — only the value, never an invented report.
     pub(super) fn code_ensure_modules_loaded(&mut self, args: &[Eterm]) -> Result<Eterm> {
@@ -409,7 +420,11 @@ impl RuntimeContext<'_> {
     /// return value), `code:load_file(no_such_mod_xyz)` ⇒ `{error,nofile}`, a
     /// found-but-corrupt `.beam` ⇒ `{error,badfile}`, and a non-sticky module whose `.beam` is
     /// findable ⇒ `{module, M}` — twice, when called twice (idempotent, answered from the code
-    /// server's cache).
+    /// server's cache). A `<Name>.beam` whose **object code names another module** is the
+    /// oracle's `{error,badfile}` too — the loader's expected-name check
+    /// ([`CodeServer::load`](crate::CodeServer::load)), which refuses the image without
+    /// loading it under its own name either (`code:load_file(bogus)` ⇒ `{error,badfile}`,
+    /// `erlang:module_loaded(realname)` ⇒ `false`).
     ///
     /// A **non-sticky** system module is only reachable when its application directory is on
     /// the code path: this runtime resolves the system path to the `stdlib`/`kernel`/`erts`
@@ -817,6 +832,56 @@ impl RuntimeContext<'_> {
         }
     }
 
+    /// `code:purge(Module)`: whether the purge had to **kill** a process still running the
+    /// module's old code.
+    ///
+    /// In ERTS a purge only ever acts on the module's **old code slot**: the `erts_code_purger`
+    /// process scans every process for one executing that retired image (killing them, and
+    /// answering `true`), and answers `false` when nothing referenced it. This runtime has **no
+    /// old-code slot** at all — `erlang:delete_module/1` really
+    /// unloads, and a reload replaces the live entry — so there is never anything to purge and
+    /// no process can ever hold old code. The honest answer is therefore the oracle's own
+    /// constant for the no-old-code state: measured on OTP 29.1.1 / `erts-17.1`,
+    /// `code:purge(lists)` (loaded), `code:purge(no_such_mod_xyz)` (unloaded) and
+    /// `code:purge(pmod)` right after `code:delete(pmod)` (which does retire an image there)
+    /// all answer `false`, with the live `code_server` still registered each time.
+    ///
+    /// Serving it from the floor is also what keeps the live `code_server` **alive**: the
+    /// `code.erl` body (`code.erl:722`) is a `gen_server:call(code_server, {purge, Module})`,
+    /// and the server answers it with `erts_internal:purge_module/2` — the oracle's
+    /// unconditional `error:notsup` raise, because OTP 29 removed code purging. That raise
+    /// lands *inside the server*, which killed this runtime's server and took the node down
+    /// with it, for a call that here can only ever ask about an absent old-code slot.
+    ///
+    /// The wrapper's guard is `is_atom(Module)` (`code.erl:722`): any other term leaves it with
+    /// no matching clause and raises the bare-atom `error:function_clause` — the same class
+    /// [`Self::code_where_is_file`] reports, e.g. `code:purge(42)` and `code:purge([])` both
+    /// raise it on the oracle. The wrapper's `.beam` frames are not reproducible and are
+    /// deliberately not fabricated (see `function_clause` in [`super::prim`]).
+    pub(super) fn code_purge_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(super::prim::function_clause());
+        }
+        self.atom("false")
+    }
+    /// `code:soft_purge(Module)`: whether the module has no old code in use (so a `purge/1`
+    /// would kill nobody).
+    ///
+    /// The soft sibling of [`Self::code_purge_1`] (`code.erl:740`): the same
+    /// `gen_server:call(code_server, {soft_purge, Module})`, the same guard on `is_atom/1`,
+    /// and — for this runtime, which holds no old code ever — the oracle's constant for that
+    /// state, the atom `true`. Measured on OTP 29.1.1 / `erts-17.1`: `code:soft_purge(lists)`,
+    /// `code:soft_purge(no_such_mod_xyz)` and `code:soft_purge(pmod)` after `code:delete(pmod)`
+    /// all answer `true` (the live server surviving each), while `code:soft_purge(42)` and
+    /// `code:soft_purge([])` raise the bare-atom `error:function_clause`.
+    pub(super) fn code_soft_purge_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(super::prim::function_clause());
+        }
+        self.atom("true")
+    }
     /// The Erlang string `term` as a Rust `String`.
     ///
     /// `None` unless `term` is a **proper** list of Unicode scalar code points — the only
@@ -1393,6 +1458,75 @@ mod tests {
         assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
     }
 
+    #[test]
+    fn code_purge_and_soft_purge_answer_the_no_old_code_constants() {
+        // This runtime has no old-code slot, so the purge queries always answer the oracle's
+        // own constants for that state — measured on OTP 29.1.1 / erts-17.1:
+        // `code:purge(lists)` (loaded) and `code:purge(no_such_mod_xyz)` (unloaded) ⇒ `false`,
+        // `code:soft_purge(lists)` / `code:soft_purge(no_such_mod_xyz)` ⇒ `true`. Both are
+        // answered from the floor, so neither asks anything of the code path.
+        let mut runtime = runtime();
+        for name in ["lists", "no_such_mod_xyz"] {
+            let module = atom(&mut runtime, name);
+            let purged = call(&mut runtime, "code", "purge", &[module]).expect("code:purge/1");
+            assert_eq!(
+                runtime.atom_name_of(purged),
+                Some("false"),
+                "code:purge({name}) is the no-old-code answer"
+            );
+            let soft =
+                call(&mut runtime, "code", "soft_purge", &[module]).expect("code:soft_purge/1");
+            assert_eq!(
+                runtime.atom_name_of(soft),
+                Some("true"),
+                "code:soft_purge({name}) is the no-old-code answer"
+            );
+        }
+        // The live-oracle cross-check of those four rows.
+        let Some(answer) = oracle_probe(
+            "io:format(\"~p,~p,~p,~p\",[code:purge(lists),code:purge(no_such_mod_xyz),\
+             code:soft_purge(lists),code:soft_purge(no_such_mod_xyz)])",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(answer, "false,false,true,true", "the oracle's own constants");
+    }
+    #[test]
+    fn code_purge_and_soft_purge_guard_on_an_atom() {
+        // `code.erl:722` / `code.erl:740` guard `is_atom(Module)`: a non-atom leaves the
+        // wrapper with no matching clause, so it raises the bare-atom `error:function_clause`
+        // (measured on the oracle for `42` and for the empty list). Nothing is asked of the
+        // code path, so this holds on a code-path-less runtime.
+        let mut runtime = runtime();
+        for function in ["purge", "soft_purge"] {
+            for argument in [make_small(42), beam_term::NIL] {
+                let error = call(&mut runtime, "code", function, &[argument])
+                    .expect_err("a non-atom does not match the wrapper's guard");
+                assert_eq!(
+                    error.as_atom(),
+                    Some("function_clause"),
+                    "code:{function}({argument:?}): {error}"
+                );
+                assert!(
+                    crate::error::unsupported_reason(&error).is_none(),
+                    "a function_clause raise is a genuine error, not a capability gap: {error}"
+                );
+            }
+        }
+        for function in ["purge", "soft_purge"] {
+            let Some(shape) = oracle_probe(&format!(
+                "try code:{function}(42) catch Class:Reason -> io:format(\"~p:~p\",[Class,Reason]) end"
+            )) else {
+                skip_oracle_loudly();
+                return;
+            };
+            assert_eq!(
+                shape, "error:function_clause",
+                "the oracle's own raise shape for code:{function}/1"
+            );
+        }
+    }
     /// The oracle `erl`: `$ERTS_ORACLE` when it is an executable, else `erl` on `$PATH` (the
     /// convention `tools/differential` uses), resolved **without running** it.
     fn oracle_erl() -> Option<std::path::PathBuf> {
@@ -2091,6 +2225,35 @@ mod tests {
     }
 
     #[test]
+    fn code_ensure_modules_loaded_maps_a_name_mismatch_to_badfile() {
+        // A `<Name>.beam` that **is** on the code path but whose object code declares another
+        // module is the same `badfile` class — the loader's expected-name check. Oracle-verified
+        // (OTP 29.1.1 / erts-17.1) with a `bogus.beam` really holding `realname`:
+        // `code:ensure_modules_loaded([bogus])` ⇒ `{error,[{bogus,badfile}]}` (the oracle also
+        // logs the `beam_load.c` report — see the residual note on the entry point).
+        let mut runtime = runtime();
+        let Some(_dir) = name_mismatch_dir(&mut runtime, "eml_mismatch") else {
+            return;
+        };
+        let argument = atom_list(&mut runtime, &["bogus"]);
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
+        let pairs = failure_pairs(&mut runtime, answer);
+        assert_eq!(pairs, vec![("bogus".to_string(), "badfile".to_string())]);
+        assert!(
+            !runtime.code_server.is_loaded("bogus") && !runtime.code_server.is_loaded("slice"),
+            "neither name may be cached by a refused load"
+        );
+        // The matching name in the same directory answers the bare atom `ok`.
+        let argument = atom_list(&mut runtime, &["slice"]);
+        let answer = ensure_modules_loaded(&mut runtime, &[argument]).expect("eml/1");
+        assert_eq!(
+            runtime.atom_name_of(answer),
+            Some("ok"),
+            "a loadable module answers `ok`"
+        );
+        assert!(runtime.code_server.is_loaded("slice"));
+    }
+    #[test]
     fn code_ensure_modules_loaded_agrees_with_the_oracle() {
         // The live-oracle cross-check for the answer value and the guard's raise (empty stdout,
         // exit 1) — so the expectations pinned above cannot rot. The failure **order** is not
@@ -2260,8 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn code_load_file_maps_a_corrupt_beam_to_badfile() {
-        let mut runtime = runtime();
+    fn code_load_file_maps_a_corrupt_beam_to_badfile() {        let mut runtime = runtime();
         // A `bogus.beam` of garbage in a scratch `-pa` directory: found on the code path, so
         // the not-found half cannot hide it, and the loader rejects it — the oracle's
         // `{error,badfile}`.
@@ -2281,9 +2443,112 @@ mod tests {
             "a malformed image must not enter the code server's cache"
         );
     }
+
+    // -- the loader's expected-name check (the C's `beam_load.c`) -------------
+
+    /// A scratch code-path directory holding the committed `slice` image under **both** names
+    /// — its own (`slice.beam`) and a different one (`bogus.beam`).
+    ///
+    /// That is the name-mismatch shape: two well-formed, **loadable** images whose object code
+    /// declares `slice`, so every refusal below can only come from the loader's expected-name
+    /// check — never from a malformed container (see the corrupt-`bogus.beam` rows) nor from a
+    /// missing file.
+    fn name_mismatch_dir(
+        runtime: &mut crate::Runtime,
+        label: &str,
+    ) -> Option<crate::context::test_support::FixtureDir> {
+        let dir = scratch_dir(label);
+        let image = slice_image();
+        for file in ["slice.beam", "bogus.beam"] {
+            let path = dir.path().join(file);
+            if std::fs::write(&path, &image).is_err() {
+                eprintln!("SKIP: cannot write {}", path.display());
+                return None;
+            }
+        }
+        runtime.code_server.add_path(dir.path());
+        Some(dir)
+    }
+
     #[test]
-    fn code_all_loaded_pins_the_preloaded_atom_and_the_file_string() {
-        // The oracle's entry shapes: a preloaded module's `Beam` is the **atom**
+    fn code_load_file_refuses_an_image_whose_object_code_names_another_module() {
+        // Oracle-verified (OTP 29.1.1 / erts-17.1) with a `bogus.beam` really holding
+        // `realname`: `code:load_file(bogus)` ⇒ `{error,badfile}`, and **nothing** is loaded —
+        // `erlang:module_loaded(bogus)` and `erlang:module_loaded(realname)` are both `false`
+        // — while `code:which(bogus)` still answers the on-disk path (path-based, unchanged).
+        // `code:load_file(realname)` ⇒ `{module,realname}`: the matching name still works.
+        let mut runtime = runtime();
+        let Some(_dir) = name_mismatch_dir(&mut runtime, "load_file_mismatch") else {
+            return;
+        };
+        let bogus = module_atom(&mut runtime, "bogus");
+        let answer = call(&mut runtime, "code", "load_file", &[bogus]).expect("load_file/1");
+        assert_eq!(
+            error_reason(&mut runtime, answer),
+            "badfile",
+            "an image whose object code names another module is refused"
+        );
+        assert!(
+            !runtime.code_server.is_loaded("bogus"),
+            "the requested name must not enter the module cache"
+        );
+        assert!(
+            !runtime.code_server.is_loaded("slice"),
+            "nor may the image load under its own name instead"
+        );
+        // The file really is found: the refusal is the name check, never `nofile`.
+        let which = call(&mut runtime, "code", "which", &[bogus]).expect("which/1");
+        assert!(
+            string_of(which).ends_with("bogus.beam"),
+            "which/1 stays path-based through the refusal"
+        );
+        // The matching name in the very same directory loads.
+        let slice = module_atom(&mut runtime, "slice");
+        let answer = call(&mut runtime, "code", "load_file", &[slice]).expect("load_file/1");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("module")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("slice")
+        );
+        assert!(
+            runtime.code_server.is_loaded("slice"),
+            "the matching name really loads"
+        );
+    }
+
+    #[test]
+    fn code_ensure_loaded_maps_a_name_mismatch_to_badfile() {
+        // Oracle-verified (OTP 29.1.1 / erts-17.1):
+        // `code:ensure_loaded(bogus)` ⇒ `{error,badfile}` for a `bogus.beam` holding
+        // `realname` — a found-but-refused image is `badfile`, never `nofile`.
+        let mut runtime = runtime();
+        let Some(_dir) = name_mismatch_dir(&mut runtime, "ensure_loaded_mismatch") else {
+            return;
+        };
+        let bogus = module_atom(&mut runtime, "bogus");
+        let answer = call(&mut runtime, "code", "ensure_loaded", &[bogus]).expect("ensure/1");
+        assert_eq!(error_reason(&mut runtime, answer), "badfile");
+        assert!(
+            !runtime.code_server.is_loaded("bogus") && !runtime.code_server.is_loaded("slice"),
+            "neither name may be cached by a refused load"
+        );
+        // The matching name answers `{module,slice}`.
+        let slice = module_atom(&mut runtime, "slice");
+        let answer = call(&mut runtime, "code", "ensure_loaded", &[slice]).expect("ensure/1");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("module")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("slice")
+        );
+    }
+    #[test]
+    fn code_all_loaded_pins_the_preloaded_atom_and_the_file_string() {        // The oracle's entry shapes: a preloaded module's `Beam` is the **atom**
         // `preloaded`, a loaded module's is its `.beam` **path string**.
         // `code:all_loaded()` in the oracle: `[X || {M,X} <- code:all_loaded(), M =:= erlang]`
         // ⇒ `[preloaded]`.

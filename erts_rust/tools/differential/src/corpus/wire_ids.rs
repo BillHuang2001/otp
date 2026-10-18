@@ -60,6 +60,13 @@
 //!    (never a hand-written guess), and includes the exit code -- a pinned `exception ...` line
 //!    exits `1`.
 //!
+//! 3. **Mixed internal/external pid ordering** (A.1/A.2/A.5): hand-built `NEW_PID_EXT` (88)
+//!    images on the foreign node atom `other`, compared against `self()` with `<` in both
+//!    directions and with `=:=`, plus a second decoded external pid. A mixed pair compares field
+//!    by field (serial, then number, then the node name), so the two foreign pids straddle the
+//!    local process by their **serial** field (`0` vs `16#ffffffff`) -- that keeps every boolean
+//!    independent of `self()`'s per-VM-start number/serial, which is never pinned.
+//!
 //! # Deliberately NOT cases (a plain differing value, so each would be a `mismatch`)
 //!
 //! Verified against the live runtimes (oracle OTP 29.1.1 / `erts-17.1`; the built `beam_rt`):
@@ -346,17 +353,78 @@ fn node_identity_cases() -> Vec<Case> {
     ]
 }
 
+/// The contracts a mixed internal/external pid **ordering** case covers: the term-comparison
+/// semantics (A.1), the `NEW_PID_EXT` (88) byte image it decodes (A.2) and the distribution
+/// identity that image carries (A.5).
+const PID_ORDERING_CONTRACTS: &[Contract] = &[
+    Contract::LanguageSemantics,
+    Contract::BeamAsm,
+    Contract::Distribution,
+];
+
+/// One A.1/A.2/A.5 pid-ordering case: a plain value probe over hand-built `NEW_PID_EXT` images.
+fn pid_ordering_case(
+    id: &'static str,
+    description: &'static str,
+    expr: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: PID_ORDERING_CONTRACTS,
+        kind: CaseKind::Eval {
+            expr,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The A.1/A.2/A.5 **mixed internal/external pid ordering** case.
+///
+/// * the ids are **hand-built** `NEW_PID_EXT` (88) images on the foreign node atom `other`
+///   (`[131][88][atom(5) other][number:u32 BE][serial:u32 BE][creation:u32 BE]`), so neither side
+///   depends on this VM's own node name/creation beyond the atom every runtime spells `other`;
+/// * a foreign pid is compared field by field (serial, then number, then the node name), and each
+///   arm is chosen so the answer cannot depend on the **local** process's per-VM-start
+///   number/serial: `Plo` (serial 0, number 0) is below any live local pid, and `Phi` (serial
+///   `16#ffffffff`) is above it, so `Plo < self()` and `self() < Phi` hold and their mirrors do
+///   not, on any run; `Q` (same node/serial, a larger number) pins the external-vs-external arm,
+///   and `=:=` pins that a foreign pid is never the local process while a decoded pid is always
+///   identical to itself.
+fn pid_ordering_cases() -> Vec<Case> {
+    vec![pid_ordering_case(
+        "wire_ids/internal_vs_external_pid_ordering",
+        "a hand-built external NEW_PID_EXT (88) pid orders below / above the local process by its \
+         (serial, number) fields in both directions, is never `=:=` to self(), is identical to \
+         itself and orders against a second decoded external pid",
+        "begin \
+         Plo = binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,0,0,0,0,0,0,0,0,3>>), \
+         Phi = binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,1,255,255,255,255,0,0,0,3>>), \
+         Q = binary_to_term(<<131,88,119,5,111,116,104,101,114,0,0,0,9,0,0,0,0,0,0,0,3>>), \
+         {Plo < self(), self() < Plo, self() < Phi, Phi < self(), \
+          Plo =:= self(), Plo =:= Plo, Plo < Q, Q < Plo, Plo =:= Q} end",
+        "ok {true,false,true,false,false,true,true,false,false}",
+    )]
+}
+
 /// The A.2/A.5 local-pid/port/reference encoding cases and the A.5 node/identity cases.
 pub(crate) fn group() -> Vec<Case> {
     let mut cases = local_id_cases();
     cases.extend(reference_cases());
+    cases.extend(pid_ordering_cases());
     cases.extend(node_identity_cases());
     cases
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{group, local_id_cases, node_identity_cases, reference_cases};
+    use super::{group, local_id_cases, node_identity_cases, pid_ordering_cases, reference_cases};
     use crate::corpus::{CaseKind, Contract, Probe};
 
     /// The 15-byte node-name atom (`SMALL_ATOM_UTF8_EXT` 119, length 13, `nonode@nohost`).
@@ -367,12 +435,13 @@ mod tests {
         let ids: Vec<&str> = group().iter().map(|c| c.id).collect();
         let mut expected: Vec<&str> = local_id_cases().iter().map(|c| c.id).collect();
         expected.extend(reference_cases().iter().map(|c| c.id));
+        expected.extend(pid_ordering_cases().iter().map(|c| c.id));
         expected.extend(node_identity_cases().iter().map(|c| c.id));
         assert_eq!(ids, expected);
         assert_eq!(
             group().len(),
-            2 + 2 + 19,
-            "two byte-image cases + two reference cases + 19 identity cases"
+            2 + 2 + 1 + 19,
+            "two byte-image cases + two reference cases + one pid-ordering case + 19 identity cases"
         );
     }
 
@@ -423,6 +492,59 @@ mod tests {
                 .iter()
                 .all(|c| !c.golden.stdout.is_some_and(|g| g.contains("119,13"))),
             "no reference case may pin the node-name bytes"
+        );
+    }
+
+    /// The A.1/A.2/A.5 mixed internal/external pid ordering case: hand-built `NEW_PID_EXT` images
+    /// compared against `self()`, reduced to booleans. No pid is ever rendered (`~w` of a pid
+    /// carries its per-VM-start number/serial/creation) and no arm may depend on the *local*
+    /// process's own number — the two foreign pids straddle it by their serial field.
+    #[test]
+    fn the_pid_ordering_case_pins_booleans_over_hand_built_images() {
+        let cases = pid_ordering_cases();
+        assert_eq!(cases.len(), 1, "the one pid-ordering case");
+        let case = &cases[0];
+        assert_eq!(case.id, "wire_ids/internal_vs_external_pid_ordering");
+        assert!(!case.description.is_empty());
+        assert_eq!(
+            case.contracts,
+            &[
+                Contract::LanguageSemantics,
+                Contract::BeamAsm,
+                Contract::Distribution
+            ],
+            "the ordering semantics, the NEW_PID_EXT image and the id identity it carries"
+        );
+        assert_eq!(case.kind_label(), "value", "a plain value probe");
+        assert!(
+            matches!(
+                &case.kind,
+                CaseKind::Eval { probe: Probe::Value, extra_argv, .. } if extra_argv.is_empty()
+            ),
+            "a pid-ordering case is a plain value probe"
+        );
+        assert_eq!(case.golden.exit_code, 0);
+        assert_eq!(
+            case.golden.stdout,
+            Some("ok {true,false,true,false,false,true,true,false,false}"),
+            "the oracle's own line"
+        );
+        // The golden is booleans only: no pid/port/ref rendering, no node-name bytes.
+        let golden = case.golden.stdout.expect("a golden line");
+        assert!(
+            !golden.contains('<') && !golden.contains("119,13"),
+            "the golden must not render a pid or pin the node-name bytes: {golden}"
+        );
+        // Both arms are present: a hand-built NEW_PID_EXT image, the local process, and a second
+        // decoded external pid.
+        let expr = case.expr().expect("an expression case");
+        assert!(
+            expr.matches("binary_to_term(<<131,88,").count() >= 3,
+            "the case must decode hand-built NEW_PID_EXT images: {expr}"
+        );
+        assert!(
+            expr.contains("self()") && expr.contains("=:=") && expr.contains('<'),
+            "the case must compare against self() with both < and =:=: {expr}"
         );
     }
 

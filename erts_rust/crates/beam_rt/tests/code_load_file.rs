@@ -48,7 +48,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-
+use std::sync::atomic::{AtomicU64, Ordering};
 /// The fixture source: a module that is neither preloaded nor under a sticky directory.
 ///
 /// Kept trivially small and free of library calls so the only thing under test is the
@@ -83,7 +83,143 @@ io:format(\"~p~n\", [{code:load_file(mymod), code:load_file(mymod), \
 code:load_file(bogus)}]), halt(0).";
 const FIXTURE_EXPECTED: &str = "{{module,mymod},{module,mymod},{error,badfile}}";
 
+/// The name-mismatch program: `mismatch.beam` is a **well-formed** image of `mymod`, so the
+/// loader's expected-name check (the C's `beam_load.c`) is the only thing that can refuse it.
+/// `{error,badfile}` — and **nothing** is loaded: neither the requested name nor the image's
+/// own (`mymod` is still unloaded when the load_file/1 call has been made, which is why the
+/// second element re-asks `mymod`'s own load state); `which/1` stays path-based, so the last
+/// element proves the file **was** found (the refusal is the name check, not `{error,nofile}`).
+const EXPR_MISMATCH: &str = "\
+io:format(\"~p~n\", [{code:load_file(mismatch), erlang:module_loaded(mismatch), \
+erlang:module_loaded(mymod), code:is_loaded(mismatch), \
+code:which(mismatch) =/= non_existing}]), halt(0).";
+const MISMATCH_EXPECTED: &str = "{{error,badfile},false,false,false,true}";
+
+/// The same refusal on the whole-list route: `code:ensure_modules_loaded/1` reports the failed
+/// module as `{mismatch,badfile}` (never `nofile`) and still loads the **matching** name.
+const EXPR_ENSURE_MISMATCH: &str = "\
+io:format(\"~p~n\", [{code:ensure_modules_loaded([mismatch]), \
+erlang:module_loaded(mismatch), erlang:module_loaded(mymod), \
+code:ensure_modules_loaded([mymod])}]), halt(0).";
+const ENSURE_MISMATCH_EXPECTED: &str = "{{error,[{mismatch,badfile}]},false,false,ok}";
+
 // ---------------------------------------------------------------------------------------
+// The **call** route: an on-demand load performs the same expected-name check, but a call
+// does not *return* anything — it raises, and the oracle raises the **bare** `error:undef`
+// (never the loader's message, which is only what the `code:*` routes fold into `badfile`).
+// Measured on OTP 29.1.1 / erts-17.1 with this fixture's `mismatch.beam` (a well-formed image
+// of `mymod`) on a `-pa` directory:
+//
+//   * uncaught `mismatch:id(7)` ⇒ exit 1, empty stdout, and the node's crash report on stderr
+//     naming `({undef,[{mismatch,id,[7],[]}, …]})`;
+//   * `catch mismatch:id(7)` ⇒ `{'EXIT',{undef,[{mismatch,id,[7],[]}, {erl_eval,…}, …]}}`;
+//   * a module with **no file at all** (`nosuchmod_xyz`) behaves identically, byte for byte —
+//     which is the whole point: the reason atom is `undef` either way.
+// ---------------------------------------------------------------------------------------
+
+/// The uncaught call to the mismatching image: the raise escapes the runtime.
+const EXPR_CALL_MISMATCH: &str = "mismatch:id(7).";
+
+/// The control: the very same call against a module no code-path directory holds.
+const EXPR_CALL_NOFILE: &str = "nosuchmod_xyz:id(7).";
+
+/// This runtime's one-line diagnostic for the bare `error:undef` raise (the CLI's
+/// `beam_rt: error <reason>` with exit code 1, the runtime-error code).
+const CALL_UNDEF_STDERR: &str = "beam_rt: error undef";
+
+/// The caught call, pinned exactly: the tree-walker contributes the oracle's innermost
+/// `{Module, Function, ArgList, []}` head item and **no** invented `erl_eval`/`init` frames
+/// (there is no `erl_eval` port here), so only the head item is comparable with the oracle —
+/// which [`EXPR_CALL_MISMATCH_HEAD`] does, oracle-cross-checked.
+const EXPR_CALL_MISMATCH_CAUGHT: &str =
+    "io:format(\"~p~n\",[catch mismatch:id(7)]), halt(0).";
+const CALL_MISMATCH_CAUGHT_EXPECTED: &str = "{'EXIT',{undef,[{mismatch,id,[7],[]}]}}";
+
+/// The **head trace item** of the caught raise, which both runtimes must agree on.
+const EXPR_CALL_MISMATCH_HEAD: &str = "\
+case catch mismatch:id(7) of {'EXIT',{undef,[Head|_]}} -> io:format(\"~p~n\",[Head]); \
+Other -> io:format(\"~p~n\",[Other]) end, halt(0).";
+const CALL_MISMATCH_HEAD_EXPECTED: &str = "{mismatch,id,[7],[]}";
+
+/// The same head item for the no-file control (the shape a missing module gets).
+const EXPR_CALL_NOFILE_HEAD: &str = "\
+case catch nosuchmod_xyz:id(7) of {'EXIT',{undef,[Head|_]}} -> io:format(\"~p~n\",[Head]); \
+Other -> io:format(\"~p~n\",[Other]) end, halt(0).";
+const CALL_NOFILE_HEAD_EXPECTED: &str = "{nosuchmod_xyz,id,[7],[]}";
+
+/// The matching name still loads on demand and runs — the refusal is the expected-name check,
+/// not a blanket refusal of an on-demand load.
+const EXPR_CALL_MATCHING: &str = "io:format(\"~p~n\",[mymod:id(7)]), halt(0).";
+const CALL_MATCHING_EXPECTED: &str = "7";
+
+/// A compiled caller that catches the raise: the **compiled/scheduled** route performs the same
+/// on-demand load (`call_ext` → `resolve_external_call` → `call_bif`), so its `{Class, Reason}`
+/// pair must be the oracle's `{error,undef}` too.
+const CALLER_ERL: &str = r#"%% Generated by `beam_rt/tests/code_load_file.rs` (never committed).
+-module(mismatch_caller).
+-export([run/1, run_missing/1]).
+
+run(X) -> try mismatch:id(X) catch C:R -> {C, R} end.
+run_missing(X) -> try nosuchmod_xyz:id(X) catch C:R -> {C, R} end.
+"#;
+const EXPR_CALLER_MISMATCH: &str =
+    "io:format(\"~p~n\",[mismatch_caller:run(7)]), halt(0).";
+const EXPR_CALLER_NOFILE: &str =
+    "io:format(\"~p~n\",[mismatch_caller:run_missing(7)]), halt(0).";
+/// The reason the oracle reports from compiled code: class `error`, reason atom `undef`.
+const CALLER_EXPECTED: &str = "{error,undef}";
+// ---------------------------------------------------------------------------------------
+// The **`-s`/`-run` action** and the **export spawn** routes: the same load, the same reason
+// ---------------------------------------------------------------------------------------
+//
+// The two remaining routes that *enter* a `Module:Function/Arity` (rather than returning a
+// `code:*` load result) are a `-s`/`-run` action and an `M:F/A` spawn. Both hit
+// `CodeServer::load`'s expected-name check, and both must report the call-site classifier's
+// reason — the bare `undef` — never the loader's `module name in object code is …` message.
+//
+// Measured on OTP 29.1.1 / erts-17.1 with this fixture's `mismatch.beam` (a well-formed image
+// of `mymod`) on a `-pa` directory:
+//
+//   * `erl -noshell -pa DIR -s mismatch id 7 -s init stop` ⇒ exit **1**, empty stdout, empty
+//     stderr, and a crash dump whose slogan names the reason `undef`
+//     (`{undef,[{init,start_it,1,[]},…]}`) — **identical** to the same row against
+//     `nosuchmod_xyz` (a module with no file). `-run` behaves the same way;
+//   * `erl -noshell -pa DIR -eval 'spawn(mismatch,id,[7])'` ⇒ exit **0** and `true` printed:
+//     `spawn/3` does **no** loading at spawn time, so the child dies instead —
+//     `spawn_monitor(mismatch,id,[7])` ⇒ `{'DOWN',…,process,Pid,{undef,[{mismatch,id,[7],[]}]}}`.
+//     The reason is the same atom `undef`; only *where* it surfaces differs, and that residual is
+//     documented on `Runtime::resolve_export_entry` (a lazy, dead-on-arrival export entry plus
+//     the ERTS error-class exit reason are both needed to reproduce it).
+
+/// The `-s`/`-run` row for the name-mismatched image.
+const ACTION_MISMATCH: [&str; 3] = ["mismatch", "id", "7"];
+
+/// The `-s`/`-run` control: the same call against a module no code-path directory holds.
+const ACTION_NOFILE: [&str; 3] = ["nosuchmod_xyz", "id", "7"];
+
+/// The `-s`/`-run` regression control: the module the image really names still runs (exit 0).
+const ACTION_MATCHING: [&str; 3] = ["mymod", "id", "7"];
+
+/// The spawn row: `spawn/3` of the mismatching image.
+const EXPR_SPAWN_MISMATCH: &str =
+    "P = spawn(mismatch,id,[7]), io:format(\"~p~n\",[is_pid(P)]), halt(0).";
+
+/// The spawn control: the same call against a module no code-path directory holds.
+const EXPR_SPAWN_NOFILE: &str =
+    "P = spawn(nosuchmod_xyz,id,[7]), io:format(\"~p~n\",[is_pid(P)]), halt(0).";
+
+/// What the **oracle** prints for [`EXPR_SPAWN_MISMATCH`] / [`EXPR_SPAWN_NOFILE`]: the spawn
+/// really returns a pid (the child dies afterwards).
+const SPAWN_ORACLE_EXPECTED: &str = "true";
+
+/// The oracle's *reason* for that dead child, extracted through `spawn_monitor/3`: the
+/// `'DOWN'` reason is `{undef, [{M,F,Args,[]}]}`, so the head item is what both runtimes can
+/// agree on (this runtime raises the same atom at the spawn instead of after it).
+const EXPR_SPAWN_DOWN_HEAD: &str = "\
+case spawn_monitor(mismatch,id,[7]) of \
+{P, R} when is_pid(P) -> receive {'DOWN',R,process,P,{undef,[Head|_]}} -> \
+io:format(\"~p~n\",[Head]); M -> io:format(\"other ~p~n\",[M]) end end, halt(0).";
+const SPAWN_DOWN_HEAD_EXPECTED: &str = "{mismatch,id,[7],[]}";// ---------------------------------------------------------------------------------------
 // Running the two runtimes
 // ---------------------------------------------------------------------------------------
 
@@ -131,6 +267,36 @@ fn printed(answer: &Output, what: &str) -> String {
     String::from_utf8_lossy(&answer.stdout).trim().to_string()
 }
 
+/// The trimmed stderr of a finished run, with the trailing newline removed so a one-line
+/// diagnostic compares exactly.
+fn diagnosed(answer: &Output) -> String {
+    String::from_utf8_lossy(&answer.stderr).trim().to_string()
+}
+
+/// Runs `expr` under the **oracle** as an ordinary probe (`-noshell [-pa dir] -eval expr`),
+/// answering the raw [`Output`] so a row whose raise *terminates the node* can be measured.
+///
+/// [`support::oracle_eval`] answers only a **successful** run's stdout, which is exactly what a
+/// terminating raise is not — and unlike a `-eval`-only probe this one must also keep the
+/// oracle's crash dump out of the repository working directory: `ERL_CRASH_DUMP` redirects it
+/// into the scratch fixture, which `Fixture::drop` removes.
+fn oracle_probe(oracle: &Path, code_dir: &Path, expr: &str) -> Output {
+    let crash_dump = code_dir.join("erl_crash.dump");
+    let args = [
+        "-noshell",
+        "-pa",
+        &code_dir.display().to_string(),
+        "-eval",
+        expr,
+    ];
+    support::run_bounded_with_env(
+        oracle,
+        &args,
+        &[("ERL_CRASH_DUMP", Some(&crash_dump.display().to_string()))],
+    )
+    .unwrap_or_else(|| panic!("the oracle could not run {expr:?} to completion"))
+}
+
 /// Asserts this runtime prints exactly `expected` for `expr`, and that the live oracle prints
 /// `expected` on a line of its own.
 ///
@@ -151,6 +317,46 @@ fn assert_agrees(oracle: &Path, code_dir: Option<&Path>, expr: &str, expected: &
         ),
         None => eprintln!("warning: the oracle could not answer `{what}` — not compared"),
     }
+}
+
+/// `<beam_rt> -noshell -pa dir <switch> Mod Func [Arg…]` — the CLI **action** route
+/// (`-s`/`-run`), whose module is resolved through the code path rather than from a file
+/// argument.
+fn beam_rt_action(code_dir: &Path, switch: &str, call: &[&str]) -> Output {
+    let mut argv: Vec<String> = vec![
+        "-noshell".to_string(),
+        "-pa".to_string(),
+        code_dir.display().to_string(),
+        switch.to_string(),
+    ];
+    argv.extend(call.iter().map(|part| part.to_string()));
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run(Path::new(env!("CARGO_BIN_EXE_beam_rt")), &args)
+}
+
+/// The oracle's answer to the very same action row (`erl -noshell -pa dir <switch> … -s init
+/// stop`).
+///
+/// `-s init stop` keeps a **succeeding** row from blocking for ever (a bare `-s Mod Func`
+/// leaves the node running), and `ERL_CRASH_DUMP` redirects the crash dump a *failing* row
+/// writes (`Fixture::drop` then removes it) instead of the repository working directory.
+fn oracle_action(oracle: &Path, code_dir: &Path, switch: &str, call: &[&str]) -> Output {
+    let mut argv: Vec<String> = vec![
+        "-noshell".to_string(),
+        "-pa".to_string(),
+        code_dir.display().to_string(),
+        switch.to_string(),
+    ];
+    argv.extend(call.iter().map(|part| part.to_string()));
+    argv.extend(["-s".to_string(), "init".to_string(), "stop".to_string()]);
+    let crash_dump = code_dir.join("erl_crash.dump");
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    support::run_bounded_with_env(
+        oracle,
+        &args,
+        &[("ERL_CRASH_DUMP", Some(&crash_dump.display().to_string()))],
+    )
+    .unwrap_or_else(|| panic!("the oracle could not run the action {call:?} to completion"))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -187,12 +393,37 @@ fn resolve_erlc() -> Option<PathBuf> {
     support::find_on_path("erlc")
 }
 
+/// The scratch directory of **one** `build_fixture` call.
+///
+/// Unique per call: two tests in this suite can hold their own fixtures at the same time, and a
+/// shared `{pid}`-only name would let one test's `Drop` delete the other's directory mid-run
+/// (which surfaces as a spurious `{error,nofile}`).
+fn fixture_dir() -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "beam_rt_code_load_file_{}_{sequence}",
+        std::process::id()
+    ))
+}
+
 /// Compiles the fixture (and writes the corrupt `bogus.beam`) into a fresh scratch
 /// directory, or `None` after a loud skip when the toolchain cannot do it.
 fn build_fixture(erlc: &Path) -> Option<Fixture> {
-    let dir = std::env::temp_dir().join(format!("beam_rt_code_load_file_{}", std::process::id()));
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        support::skip_loudly(
+    let dir = fixture_dir();
+    // A stale directory from a killed run must not decide the result: start clean.
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            support::skip_loudly(
+                "code_load_file",
+                &format!("cannot clear {}: {error}", dir.display()),
+            );
+            return None;
+        }
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {        support::skip_loudly(
             "code_load_file",
             &format!("cannot prepare {}: {error}", dir.display()),
         );
@@ -206,7 +437,24 @@ fn build_fixture(erlc: &Path) -> Option<Fixture> {
         );
         return None;
     }
-    let output = match Command::new(erlc).arg("-o").arg(&dir).arg(&source).output() {
+    // The caller whose own body calls the two absent modules: the **compiled** route's proof
+    // that an on-demand load refusal is the oracle's `{error,undef}` there too. `erlc` warns
+    // (undefined function) and still compiles — the call is exactly what must be measured.
+    let caller = dir.join("mismatch_caller.erl");
+    if let Err(error) = std::fs::write(&caller, CALLER_ERL) {
+        support::skip_loudly(
+            "code_load_file",
+            &format!("cannot write {}: {error}", caller.display()),
+        );
+        return None;
+    }
+    let output = match Command::new(erlc)
+        .arg("-o")
+        .arg(&dir)
+        .arg(&source)
+        .arg(&caller)
+        .output()
+    {
         Ok(output) => output,
         Err(error) => {
             support::skip_loudly("code_load_file", &format!("cannot run `erlc`: {error}"));
@@ -224,6 +472,10 @@ fn build_fixture(erlc: &Path) -> Option<Fixture> {
         support::skip_loudly("code_load_file", "`erlc` produced no mymod.beam");
         return None;
     }
+    if !dir.join("mismatch_caller.beam").is_file() {
+        support::skip_loudly("code_load_file", "`erlc` produced no mismatch_caller.beam");
+        return None;
+    }
     // A found-but-corrupt image: `code:load_file/1` must answer the oracle's `{error,badfile}`
     // rather than the `{error,nofile}` of a missing file or a fabricated reason.
     if let Err(error) = std::fs::write(dir.join("bogus.beam"), b"garbage-not-a-beam") {
@@ -233,9 +485,29 @@ fn build_fixture(erlc: &Path) -> Option<Fixture> {
         );
         return None;
     }
+    // A **well-formed** image under a name its object code does not carry: `mismatch.beam` is
+    // `mymod`'s own bytes, so the loader's expected-name check is the only thing that can
+    // refuse it (never a malformed container, never a missing file).
+    match std::fs::read(dir.join("mymod.beam")) {
+        Ok(image) => {
+            if let Err(error) = std::fs::write(dir.join("mismatch.beam"), &image) {
+                support::skip_loudly(
+                    "code_load_file",
+                    &format!("cannot write mismatch.beam: {error}"),
+                );
+                return None;
+            }
+        }
+        Err(error) => {
+            support::skip_loudly(
+                "code_load_file",
+                &format!("cannot read mymod.beam back: {error}"),
+            );
+            return None;
+        }
+    }
     Some(Fixture { dir })
 }
-
 // ---------------------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------------------
@@ -284,5 +556,390 @@ fn a_user_module_loads_from_a_pa_directory_and_matches_the_oracle() {
         EXPR_FIXTURE,
         FIXTURE_EXPECTED,
         "code:load_file/1 from a -pa directory",
+    );
+}
+
+/// The loader's expected-name check (the C's `beam_load.c`) on the **file** route: a
+/// well-formed `mismatch.beam` whose object code declares `mymod` is `{error,badfile}` and
+/// loads under **neither** name, while `which/1` still finds the file — so the refusal is
+/// provably the name check rather than `{error,nofile}`. `code:ensure_modules_loaded/1` folds
+/// the same refusal into `{error,[{mismatch,badfile}]}`, and the **matching** name still loads
+/// (`ok`). Both answers are the oracle's own, re-measured on every run.
+#[test]
+fn an_image_whose_object_code_names_another_module_is_refused_on_both_file_routes() {
+    let Some(oracle) = support::require_oracle("code_load_file") else {
+        return;
+    };
+    let Some(erlc) = resolve_erlc() else {
+        support::skip_loudly("code_load_file", "no `erlc` on $PATH");
+        return;
+    };
+    let Some(fixture) = build_fixture(&erlc) else {
+        return;
+    };
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_MISMATCH,
+        MISMATCH_EXPECTED,
+        "code:load_file/1 of an image whose object code names another module",
+    );
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_ENSURE_MISMATCH,
+        ENSURE_MISMATCH_EXPECTED,
+        "code:ensure_modules_loaded/1 of an image whose object code names another module",
+    );
+}
+
+/// A **call** to a module whose `.beam` image names another module raises the oracle's
+/// **bare `error:undef`** (exit 1, empty stdout) — never the loader's
+/// `module name in object code is …` diagnostic, which only the `code:*` routes see and fold
+/// into `{error,badfile}`. The same call against a module with **no file at all** is
+/// indistinguishable from it here, which is the contract: at a call site the reason names
+/// nothing, and the callee identity lives in the stacktrace.
+///
+/// Measured on OTP 29.1.1 / erts-17.1 for this fixture (re-probed on every run): both rows
+/// exit 1 with empty stdout, the mismatch row's crash report naming
+/// `({undef,[{mismatch,id,[7],[]}, …]})`, and the caught rows agreeing on the reason atom and
+/// on the innermost trace item. The compiled-caller rows prove the **scheduled/compiled** route
+/// performs the very same on-demand load and reports `{error,undef}` as well, and the last row
+/// re-pins the **explicit file** route's `{error,badfile}` (unchanged by this mapping).
+#[test]
+fn a_call_to_an_image_whose_object_code_names_another_module_raises_the_bare_undef() {
+    let Some(oracle) = support::require_oracle("code_load_file") else {
+        return;
+    };
+    let Some(erlc) = resolve_erlc() else {
+        support::skip_loudly("code_load_file", "no `erlc` on $PATH");
+        return;
+    };
+    let Some(fixture) = build_fixture(&erlc) else {
+        return;
+    };
+
+    // (a) The uncaught call raises the bare `undef` from this runtime: exit 1, empty stdout,
+    // one diagnostic line on stderr naming exactly the atom — no loader message.
+    let mismatch = beam_rt_eval(Some(&fixture.dir), EXPR_CALL_MISMATCH);
+    assert_eq!(
+        mismatch.status.code(),
+        Some(1),
+        "an uncaught `undef` is a genuine runtime error (exit 1) — stderr:\n{}",
+        diagnosed(&mismatch)
+    );
+    assert!(
+        mismatch.stdout.is_empty(),
+        "the raise prints nothing on stdout: {}",
+        String::from_utf8_lossy(&mismatch.stdout)
+    );
+    assert_eq!(
+        diagnosed(&mismatch),
+        CALL_UNDEF_STDERR,
+        "the reason must be the bare atom `undef`, never the loader's name-check message"
+    );
+    assert!(
+        !diagnosed(&mismatch).contains("module name in object code"),
+        "the loader's diagnostic must not be the *call* site's reason"
+    );
+
+    // (b) A module with no `.beam` anywhere is the same shape — byte for byte.
+    let missing = beam_rt_eval(Some(&fixture.dir), EXPR_CALL_NOFILE);
+    assert_eq!(
+        missing.status.code(),
+        Some(1),
+        "the no-file control must also be a runtime error — stderr:\n{}",
+        diagnosed(&missing)
+    );
+    assert!(
+        missing.stdout.is_empty(),
+        "the no-file control prints nothing on stdout: {}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+    assert_eq!(
+        diagnosed(&missing),
+        diagnosed(&mismatch),
+        "a name-mismatch refusal and a missing module are the same raise at a call site"
+    );
+
+    // … and the oracle's own two rows agree with each other in exactly the same way: exit 1,
+    // empty stdout, and a crash report whose reason is `undef` (naming the callee in the
+    // trace, where the oracle puts it too).
+    for (what, expr, head) in [
+        (
+            "the name-mismatch image",
+            EXPR_CALL_MISMATCH,
+            "{undef,[{mismatch,id,[7],[]}",
+        ),
+        (
+            "the absent module",
+            EXPR_CALL_NOFILE,
+            "{undef,[{nosuchmod_xyz,id,[7],[]}",
+        ),
+    ] {
+        let theirs = oracle_probe(&oracle, &fixture.dir, expr);
+        assert_eq!(
+            theirs.status.code(),
+            Some(1),
+            "the oracle must exit 1 for {what} — stderr:\n{}",
+            diagnosed(&theirs)
+        );
+        assert!(
+            theirs.stdout.is_empty(),
+            "the oracle prints nothing on stdout for {what}: {}",
+            String::from_utf8_lossy(&theirs.stdout)
+        );
+        assert!(
+            diagnosed(&theirs).contains(head),
+            "the oracle's reason for {what} must be `undef` — it said:\n{}",
+            diagnosed(&theirs)
+        );
+    }
+
+    // The caught form: this runtime's reason is the bare atom `undef` and the one trace item it
+    // can honestly contribute is the callee head (`{mismatch,id,[7],[]}`); the oracle's
+    // trailing `erl_eval` frames need an `erl_eval` port this runtime does not have, so only the
+    // head item is oracle-cross-checked (next), and this row pins our own exact shape.
+    let caught = beam_rt_eval(Some(&fixture.dir), EXPR_CALL_MISMATCH_CAUGHT);
+    assert_eq!(
+        printed(&caught, "the caught name-mismatch call"),
+        CALL_MISMATCH_CAUGHT_EXPECTED
+    );
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_CALL_MISMATCH_HEAD,
+        CALL_MISMATCH_HEAD_EXPECTED,
+        "the head trace item of a caught call to an image naming another module",
+    );
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_CALL_NOFILE_HEAD,
+        CALL_NOFILE_HEAD_EXPECTED,
+        "the head trace item of a caught call to a module with no file",
+    );
+
+    // (c) No regression: the **matching** name still loads on demand and runs.
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_CALL_MATCHING,
+        CALL_MATCHING_EXPECTED,
+        "an on-demand call to the module the image really names",
+    );
+
+    // The compiled/scheduled route: a `.beam` caller whose own body performs the external call
+    // catches the very same reason — `{error,undef}` — for both rows.
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_CALLER_MISMATCH,
+        CALLER_EXPECTED,
+        "a compiled caller catching the refusal of an image naming another module",
+    );
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_CALLER_NOFILE,
+        CALLER_EXPECTED,
+        "a compiled caller catching a call to a module with no file",
+    );
+
+    // (d) The **explicit** load routes keep their oracle-exact values: the call-site mapping
+    // touches only the raise, never `code:load_file/1`'s `{error,badfile}`.
+    assert_agrees(
+        &oracle,
+        Some(&fixture.dir),
+        EXPR_MISMATCH,
+        MISMATCH_EXPECTED,
+        "code:load_file/1 of an image whose object code names another module",
+    );
+}
+
+/// The **`-s`/`-run` action** and the **`M:F/A` spawn**: both *enter* a module rather than
+/// returning a load result, so both report the call-site classifier's reason — the bare
+/// `undef` — for the name-mismatched image, exactly as they do for a module with no file.
+///
+/// Measured (OTP 29.1.1 / erts-17.1, re-probed on every run):
+///
+/// * `-s`/`-run`: both rows exit **1** with empty stdout and the two are indistinguishable;
+///   this runtime's one diagnostic line is the CLI convention `beam_rt: error undef` — never
+///   the loader's `module name in object code is …`, which only the `code:*` routes see (and
+///   fold into `badfile`);
+/// * `spawn/3`: the oracle's spawn **succeeds** (it does no loading then) and the child dies
+///   with a `{undef, [{mismatch,id,[7],[]}]}` reason; this runtime resolves the entry eagerly,
+///   so the same atom surfaces at the spawn. The two agree on the **reason atom** — asserted
+///   against the oracle's own `'DOWN'` head — and the residual (where it surfaces) is the
+///   documented typed gap on `Runtime::resolve_export_entry`.
+#[test]
+fn the_action_and_spawn_routes_report_the_same_undef_as_a_call_site() {
+    let Some(oracle) = support::require_oracle("code_load_file") else {
+        return;
+    };
+    let Some(erlc) = resolve_erlc() else {
+        support::skip_loudly("code_load_file", "no `erlc` on $PATH");
+        return;
+    };
+    let Some(fixture) = build_fixture(&erlc) else {
+        return;
+    };
+
+    // (a) `-s` / `-run` of the mismatching image: exit 1, empty stdout, and the bare `undef`.
+    for switch in ["-s", "-run"] {
+        let mismatch = beam_rt_action(&fixture.dir, switch, &ACTION_MISMATCH);
+        assert_eq!(
+            mismatch.status.code(),
+            Some(1),
+            "beam_rt {switch} of a mismatched image is a runtime error (exit 1) — stderr:\n{}",
+            diagnosed(&mismatch)
+        );
+        assert!(
+            mismatch.stdout.is_empty(),
+            "beam_rt {switch} of a mismatched image prints nothing on stdout: {}",
+            String::from_utf8_lossy(&mismatch.stdout)
+        );
+        assert_eq!(
+            diagnosed(&mismatch),
+            CALL_UNDEF_STDERR,
+            "the {switch} route's reason must be the bare atom `undef`, never the loader's \
+             name-check message"
+        );
+
+        // The control: a module with no file at all is the same row, byte for byte.
+        let missing = beam_rt_action(&fixture.dir, switch, &ACTION_NOFILE);
+        assert_eq!(missing.status.code(), Some(1), "beam_rt {switch} no-file control");
+        assert!(
+            missing.stdout.is_empty(),
+            "beam_rt {switch} no-file control prints nothing on stdout"
+        );
+        assert_eq!(
+            diagnosed(&missing),
+            diagnosed(&mismatch),
+            "a name-mismatch refusal and a missing module are the same raise on the {switch} \
+             route too"
+        );
+
+        // The oracle's own two rows agree with each other in exactly the same way: exit 1 and
+        // no stdout for both (its crash dump, not stdout, carries the reason).
+        let theirs_mismatch = oracle_action(&oracle, &fixture.dir, switch, &ACTION_MISMATCH);
+        let theirs_missing = oracle_action(&oracle, &fixture.dir, switch, &ACTION_NOFILE);
+        for (what, theirs) in [
+            ("the name-mismatch image", &theirs_mismatch),
+            ("the absent module", &theirs_missing),
+        ] {
+            assert_eq!(
+                theirs.status.code(),
+                Some(1),
+                "the oracle must exit 1 for the {switch} row of {what} — stderr:\n{}",
+                diagnosed(theirs)
+            );
+            assert!(
+                theirs.stdout.is_empty(),
+                "the oracle prints nothing on stdout for the {switch} row of {what}: {}",
+                String::from_utf8_lossy(&theirs.stdout)
+            );
+        }
+
+        // No regression: the module the image really names still runs (its result is
+        // discarded, so a successful row is silent on both runtimes and exits 0).
+        let matching = beam_rt_action(&fixture.dir, switch, &ACTION_MATCHING);
+        assert_eq!(
+            matching.status.code(),
+            Some(0),
+            "beam_rt {switch} of the matching module must succeed — stderr:\n{}",
+            diagnosed(&matching)
+        );
+        let theirs_matching = oracle_action(&oracle, &fixture.dir, switch, &ACTION_MATCHING);
+        assert_eq!(
+            theirs_matching.status.code(),
+            Some(0),
+            "the oracle must exit 0 for the {switch} row of the matching module"
+        );
+    }
+
+    // (b) `spawn(M, F, A)` of the mismatching image: this runtime's reason is the bare `undef`
+    // (the same as the no-file control's)…
+    let spawn_mismatch = beam_rt_eval(Some(&fixture.dir), EXPR_SPAWN_MISMATCH);
+    assert_eq!(
+        spawn_mismatch.status.code(),
+        Some(1),
+        "beam_rt spawn of a mismatched image raises `undef` (exit 1) — stderr:\n{}",
+        diagnosed(&spawn_mismatch)
+    );
+    assert!(
+        spawn_mismatch.stdout.is_empty(),
+        "the refused spawn prints nothing on stdout: {}",
+        String::from_utf8_lossy(&spawn_mismatch.stdout)
+    );
+    assert_eq!(diagnosed(&spawn_mismatch), CALL_UNDEF_STDERR);
+    let spawn_missing = beam_rt_eval(Some(&fixture.dir), EXPR_SPAWN_NOFILE);
+    assert_eq!(
+        diagnosed(&spawn_missing),
+        diagnosed(&spawn_mismatch),
+        "a name-mismatch refusal and a missing module are the same raise for an export spawn"
+    );
+
+    // … and the oracle's two rows agree with each other too: the spawn succeeds and prints
+    // `true` (exit 0) for **both** — the child, not the spawn, carries the `undef`.
+    for (what, expr) in [
+        ("the name-mismatch image", EXPR_SPAWN_MISMATCH),
+        ("the absent module", EXPR_SPAWN_NOFILE),
+    ] {
+        let theirs = oracle_probe(&oracle, &fixture.dir, expr);
+        assert_eq!(
+            theirs.status.code(),
+            Some(0),
+            "the oracle's spawn of {what} must succeed — stderr:\n{}",
+            diagnosed(&theirs)
+        );
+        assert!(
+            String::from_utf8_lossy(&theirs.stdout)
+                .lines()
+                .any(|line| line.trim() == SPAWN_ORACLE_EXPECTED),
+            "the oracle's spawn of {what} prints `{SPAWN_ORACLE_EXPECTED}`; it printed:\n{}",
+            String::from_utf8_lossy(&theirs.stdout)
+        );
+    }
+
+    // The reason the oracle's dead child exits with is `{undef, [{M,F,Args,[]}]}` — the same
+    // atom this runtime raises, so the **reason** (never the place) is cross-checked here.
+    match support::oracle_eval(&oracle, Some(&fixture.dir), EXPR_SPAWN_DOWN_HEAD) {
+        Some(theirs) => assert!(
+            theirs
+                .lines()
+                .any(|line| line.trim() == SPAWN_DOWN_HEAD_EXPECTED),
+            "the oracle's 'DOWN' reason head must be `{SPAWN_DOWN_HEAD_EXPECTED}`; it printed:\n{theirs}"
+        ),
+        None => eprintln!("warning: the oracle could not answer the 'DOWN' probe — not compared"),
+    }
+
+    // The residual, pinned as *this runtime's* own truthful shape: the entry point is resolved
+    // eagerly, so the raise happens **at the spawn** (the oracle's child dies afterwards
+    // instead), with the trace head naming the `erlang:spawn/3` call it was.
+    let caught = |what: &[&str; 3]| {
+        printed(
+            &beam_rt_eval(
+                Some(&fixture.dir),
+                &format!(
+                    "io:format(\"~p~n\",[catch spawn({},{},[7])]), halt(0).",
+                    what[0], what[1]
+                ),
+            ),
+            "the caught mismatched spawn",
+        )
+    };
+    let mismatch_spawn = caught(&["mismatch", "id", "7"]);
+    assert_eq!(
+        mismatch_spawn,
+        "{'EXIT',{undef,[{erlang,spawn,[mismatch,id,[7]],[]}]}}",
+        "the refused spawn's reason is the bare atom `undef`"
+    );
+    // The control is the same raise — `undef`, class `error`, the callee's own args in the one
+    // trace item — and differs only in the module name the call mentioned.
+    assert_eq!(
+        caught(&["nosuchmod_xyz", "id", "7"]),
+        "{'EXIT',{undef,[{erlang,spawn,[nosuchmod_xyz,id,[7]],[]}]}}",
+        "a module with no file is the same raise at an export spawn"
     );
 }

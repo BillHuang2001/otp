@@ -130,10 +130,12 @@ pub struct CodeServer {
     /// changes — the invalidation trigger for the cached fun-resolution snapshot
     /// ([`CodeServer::fun_module_snapshot`]).
     ///
-    /// [`CodeServer::load_path`] is the **only** mutation point of that cache (this runtime
-    /// never unloads code), so it is the only place that bumps this; a future unload — or any
-    /// other change to a loaded module's IR, which is what carries its `FunT` fun-table
-    /// identity — must bump it there too, or the snapshot goes stale.
+    /// The bump sites are exactly the three mutations of that cache:
+    /// [`CodeServer::load_path`] and [`CodeServer::insert_loaded`] (a module added or
+    /// replaced) and [`CodeServer::forget_module`] (a module dropped by
+    /// `erlang:delete_module/1`). A future mutation — or any other change to a loaded
+    /// module's IR, which is what carries its `FunT` fun-table identity — must bump it too,
+    /// or the snapshot goes stale.
     loaded_generation: u64,
     /// The **cached** fun-resolution snapshot ([`CodeServer::fun_module_snapshot`]), stamped
     /// with the [`loaded_generation`](CodeServer::loaded_generation) it was built at.
@@ -635,9 +637,11 @@ impl CodeServer {
     /// while building the snapshot is a full walk of the module cache — [`loaded`]'s sorted
     /// `Vec<String>` plus an `Arc` clone and a `PathBuf` per module, ~23 modules after a
     /// boot. The snapshot is therefore built **once per loaded-module generation**: an
-    /// unchanged module set hands every caller the *same* [`Rc`], and only
-    /// [`CodeServer::load_path`]'s bump of [`loaded_generation`](CodeServer::loaded_generation)
-    /// invalidates it, so a mid-run load is always visible to the next call.
+    /// unchanged module set hands every caller the *same* [`Rc`], and only a bump of
+    /// [`loaded_generation`](CodeServer::loaded_generation) — from
+    /// [`CodeServer::load_path`], [`CodeServer::insert_loaded`] or
+    /// [`CodeServer::forget_module`] — invalidates it, so a mid-run load or delete is always
+    /// visible to the next call.
     ///
     /// A module with no known `.beam` path (one supplied in memory) is skipped: its checksum
     /// cannot be derived, so it could never contribute a faithful identity.
@@ -680,13 +684,29 @@ impl CodeServer {
         self.fun_snapshot_rebuilds.get()
     }
 
-    /// Loads `name` (memoized): the cached module, or `<name>.beam` from the code path.
+    /// Loads `name` (memoized) from the code path: the cached module, or `<name>.beam` whose
+    /// own module name **is** `name`.
+    ///
+    /// # The expected-name check (the C's `beam_load.c`)
+    ///
+    /// Every **name-based** route ends here — `code:load_file/1`,
+    /// `code:ensure_loaded/1`, `code:ensure_modules_loaded/1`, the boot script's
+    /// `{primLoad,…}` directives and the on-demand load of an external call — so this is the
+    /// **one** place that reproduces the loader's expected-name check: `beam_load.c`
+    /// (`check_module_name`) compares the module name in the object code with the name the
+    /// load was asked for and refuses the image when the two differ. A `<name>.beam` found on
+    /// the code path that really holds another module is therefore a **load failure**
+    /// ([`error::bad_object_module_name`]), never a load under the file's own name: the image
+    /// is not cached under either name and no part of it becomes visible (the oracle:
+    /// `code:load_file(bogus)` ⇒ `{error,badfile}`, `erlang:module_loaded(realname)` ⇒
+    /// `false`). The callers fold that refusal into the oracle's single `badfile` reason.
     ///
     /// # Errors
     ///
     /// The bare `error:undef` raise when `<name>.beam` is on no code-path directory (the
     /// oracle's reason for a call to a module the release does not have — see
-    /// [`CodeServer::not_found`]), plus the loader's own error for a malformed `.beam`.
+    /// [`CodeServer::not_found`]), the loader's own error for a malformed `.beam`, and
+    /// [`error::bad_object_module_name`] when the image's own module name is not `name`.
     pub fn load(&mut self, name: &str) -> Result<Arc<Module>> {
         if let Some(module) = self.modules.get(name) {
             return Ok(module.clone());
@@ -694,13 +714,20 @@ impl CodeServer {
         let path = self
             .find_file(name)
             .ok_or_else(|| self.not_found())?;
-        self.load_path(&path)
+        let (module, image_name) = self.read_image(&path)?;
+        if image_name != name {
+            return Err(error::bad_object_module_name(name, &image_name));
+        }
+        Ok(self.insert_from_file(image_name, module, &path))
     }
 
     /// Loads the `.beam` at `path` and caches it under the module's **own** name.
     ///
     /// This is the explicit-file entry point (the CLI's `run` action and the slice
-    /// fixture): the file need not be on the code path.
+    /// fixture): the file need not be on the code path, and — unlike
+    /// [`CodeServer::load`] — no requested name exists to check the image's own name
+    /// against, so the image is always taken under the name it carries. A route that *has*
+    /// a requested name must go through [`CodeServer::load`].
     ///
     /// # Errors
     ///
@@ -708,6 +735,21 @@ impl CodeServer {
     /// diagnostic when the image has no resolvable module name.
     pub fn load_path(&mut self, path: impl AsRef<Path>) -> Result<Arc<Module>> {
         let path = path.as_ref();
+        let (module, name) = self.read_image(path)?;
+        Ok(self.insert_from_file(name, module, path))
+    }
+
+    /// Reads and decodes the `.beam` at `path`, answering the image together with its
+    /// **own** module name.
+    ///
+    /// Reading and decoding are pure: nothing is cached, so a caller that then refuses the
+    /// image ([`CodeServer::load`]'s expected-name check) leaves the code server untouched.
+    ///
+    /// # Errors
+    ///
+    /// A read error for `path`, the loader's error for a malformed image, or a diagnostic
+    /// when the image has no resolvable module name.
+    fn read_image(&mut self, path: &Path) -> Result<(Module, String)> {
         let bytes = std::fs::read(path).map_err(|source| {
             error::message(format!("cannot read {}: {source}", path.display()))
         })?;
@@ -716,15 +758,20 @@ impl CodeServer {
             .atom_name(module.name)
             .ok_or_else(|| error::message(format!("{} has no module name", path.display())))?
             .to_string();
+        Ok((module, name))
+    }
+
+    /// Caches the decoded `module` under `name`, recording `path` as the `.beam` file it was
+    /// loaded from — the shared tail of the two file-load entry points.
+    fn insert_from_file(&mut self, name: String, module: Module, path: &Path) -> Arc<Module> {
         let module = Arc::new(module);
         self.modules.insert(name.clone(), module.clone());
         self.module_paths.insert(name, path.to_path_buf());
         // The loaded-module set changed — a new module, or a reload that replaced one — so the
         // cached fun-resolution snapshot is invalidated (see `fun_module_snapshot`).
         self.loaded_generation += 1;
-        Ok(module)
+        module
     }
-
     /// Registers an already-decoded module image under `name`, recording `recorded` as the
     /// filename `code:which/1`/`code:is_loaded/1` report — `code:load_binary/3`'s load.
     ///
@@ -745,6 +792,33 @@ impl CodeServer {
         self.module_files.insert(name.to_string(), recorded);
         self.loaded_generation += 1;
         module
+    }
+
+    /// **Forgets** `name`: drops it from the loaded-module cache and from both location maps,
+    /// answering whether the server held it.
+    ///
+    /// This is the code store's one *removal*, and `erlang:delete_module/1`'s whole effect on
+    /// this runtime (see [`crate::context::runtime_hooks`]). It drops exactly what a load
+    /// recorded — the cached `Arc<Module>` ([`CodeServer::is_loaded`],
+    /// [`CodeServer::module_handle`], [`CodeServer::loaded`]), the `.beam` path a file load
+    /// recorded ([`CodeServer::loaded_path`]) and the filename a
+    /// [`CodeServer::insert_loaded`] load recorded ([`CodeServer::recorded_name`]) — so every
+    /// load-state consumer (`erlang:module_loaded/1`, `code:is_loaded/1`,
+    /// `code:all_loaded/0`) stops seeing the name, while the **path**-based ones
+    /// (`code:which/1`, `code:get_object_code/1`) still find `<name>.beam` on the code path,
+    /// exactly as they do for a module that was never loaded.
+    ///
+    /// The loaded-module generation is bumped when anything was really dropped, so the cached
+    /// fun-resolution snapshot is invalidated ([`CodeServer::fun_module_snapshot`] is stamped
+    /// with that generation) — a forgotten module can no longer contribute a fun identity.
+    pub fn forget_module(&mut self, name: &str) -> bool {
+        let held = self.modules.remove(name).is_some();
+        let path = self.module_paths.remove(name).is_some();
+        let recorded = self.module_files.remove(name).is_some();
+        if held || path || recorded {
+            self.loaded_generation += 1;
+        }
+        held
     }
 
     /// Loads a `.beam` image out of memory into the shared atom table.

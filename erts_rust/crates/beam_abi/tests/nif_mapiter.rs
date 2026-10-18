@@ -103,9 +103,10 @@ fn compile_fixture() -> Option<PathBuf> {
     compile_so(MODULE, FIXTURE_C)
 }
 
-/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -250,7 +251,7 @@ const FLAT_KEYS: [i64; 6] = [7, 1, 40, 3, 22, 11];
 #[test]
 fn forward_walk_reports_the_storage_order_and_runs_off_into_the_tail() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let list = key_list(&mut host, &FLAT_KEYS);
     let mut env = NifEnv::new(&mut host);
@@ -277,7 +278,7 @@ fn forward_walk_reports_the_storage_order_and_runs_off_into_the_tail() {
 #[test]
 fn backward_walk_from_last_is_the_exact_reverse_order() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let list = key_list(&mut host, &FLAT_KEYS);
     let mut env = NifEnv::new(&mut host);
@@ -302,7 +303,7 @@ fn backward_walk_from_last_is_the_exact_reverse_order() {
 #[test]
 fn empty_map_reports_head_and_tail_without_yielding_a_pair() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -330,7 +331,7 @@ fn empty_map_reports_head_and_tail_without_yielding_a_pair() {
 #[test]
 fn a_non_map_is_refused() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     let mut env = NifEnv::new(&mut host);
 
@@ -349,7 +350,7 @@ fn a_non_map_is_refused() {
 #[test]
 fn hash_map_walk_matches_the_rust_storage_order() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
     // 40 pairs crosses `MAP_SMALL_MAP_LIMIT` (32), so the fixture builds a HAMT/champ map and the
     // iterator takes the hash arm (which caches the storage order at `create`).
@@ -504,7 +505,7 @@ fn oracle_key_order(keys: &[i64]) -> Option<Vec<i64>> {
 #[test]
 fn the_oracle_agrees_on_the_flat_map_key_order() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     // The ground truth first: what does the *real* system ERTS say the key order is?
     let Some(oracle) = oracle_key_order(&FLAT_KEYS) else { return };

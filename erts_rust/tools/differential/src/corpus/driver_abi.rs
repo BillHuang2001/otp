@@ -40,6 +40,11 @@
 //!   `driver_set_timer` shapes and `60..65` the phase-free `erl_drv_monotonic_time` properties;
 //! * `110..115` — the driver *delivers bytes* through `driver_output`/`driver_output2`/
 //!   `driver_output_binary`/`driver_outputv`;
+//! * `116..119` — the degenerate `driver_output2` halves and the single-byte
+//!   `driver_output_binary` windows;
+//! * `120` — the **term shape** of a `driver_output2` header/body reply: the delivered `Data` term
+//!   (an improper list, never the flattened bytes) is the observable, read through
+//!   `classify_shape/1`;
 //! * `130..140` — the driver *delivers a decoded term* through
 //!   `erl_drv_output_term`/`driver_output_term`/`erl_drv_send_term`/`driver_send_term` and emits
 //!   **no** byte payload, so the owner's own message is the whole observable;
@@ -49,10 +54,14 @@
 //!
 //! # The observable (honest, never asserted module-side)
 //!
-//! `classify/1` and `classify_term/1` **return exactly what the driver delivered**, encoded as a
-//! stable integer — they never compare against an expectation and never raise. For a
-//! `driver_output*` byte payload that is the base-256 value of the delivered bytes; for the
-//! `*_output_term`/`*_send_term` delivery family it is the base-256 value of the *delivered term's*
+//! `classify/1`, `classify_term/1` and `classify_shape/1` **return exactly what the driver
+//! delivered**, encoded as a stable integer — they never compare against an expectation and never
+//! raise. For a `driver_output*` byte payload that is the base-256 value of the delivered bytes;
+//! for the *shape* reader (`classify_shape/1`) it is the base-256 value of the delivered `Data`
+//! **term's** canonical `term_to_binary/1` image, so a `driver_output2` header/body split is pinned
+//! as the improper list the oracle builds (`[72,68,82|<<"abc">>]`) rather than as the flattened
+//! bytes an `iolist_to_binary/1` fold cannot tell apart; for the `*_output_term`/`*_send_term`
+//! delivery family it is the base-256 value of the *delivered term's*
 //! canonical `term_to_binary/1` image (the C queues the term itself as the message, never a
 //! `{Port, Term}` wrapper, `io.c:6162-6176`). Nothing arriving within the module's own 2 s bound is
 //! the sentinel `-1`. The **golden is the oracle's own answer**, so the corpus self-tests
@@ -127,7 +136,7 @@ use crate::module_build::NifFixture;
 /// prints a path (the fixture is reached through a name that differs by construction between
 /// the two runtimes).
 const DRIVER_ABI_MODULE_SOURCE: &str = r#"-module(driver_abi).
--export([classify/1, classify_term/1]).
+-export([classify/1, classify_term/1, classify_shape/1]).
 
 %% Send one selector byte to the C fixture and encode the answer it delivered as an integer.
 %%
@@ -169,6 +178,28 @@ classify_term(N) ->
 wait_term(_P) ->
     receive
         Term -> bytes_code(term_to_binary(Term))
+    after 2000 -> -1
+    end.
+
+%% Send one selector byte to the C fixture and encode the **shape** of the delivered `Data` term.
+%%
+%% This is the term-shape reader for the `driver_output*` byte channel: unlike `classify/1`, which
+%% flattens the payload with `iolist_to_binary/1` and so cannot see *how* the driver split it, this
+%% folds the delivered term's own canonical `term_to_binary/1` image into a base-256 integer. A
+%% header/body `driver_output2` reply is delivered by the oracle as the improper list
+%% `[72,68,82|<<"abc">>]` (`deliver_read_message`, `io.c:3404-3435`), whose ETF image differs from
+%% the flattened `<<"HDRabc">>` — so a runtime that collapses the split is a visible divergence
+%% instead of a hidden one. Nothing arriving within the module's own 2 s bound is the sentinel `-1`.
+classify_shape(N) ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    P = open(Dir),
+    true = erlang:port_command(P, <<N>>),
+    wait_shape(P).
+
+wait_shape(P) ->
+    receive
+        {P, {data, Data}} -> bytes_code(term_to_binary(Data));
+        _Other -> wait_shape(P)
     after 2000 -> -1
     end.
 
@@ -1120,6 +1151,9 @@ static void abi_dispatch(abi_state *st, unsigned char sel) {
         }
         break;
     }
+    /* The term-shape selector: a three-byte header and a three-byte body, so the delivered `Data`
+     * term's own shape (an improper list, not the flattened bytes) is the observable. */
+    case 120: (void) driver_output2(st->port, "HDR", 3, "abc", 3); break;
     /* Readiness selectors: arm the mechanism; the callback answers later. */
     case 200: {
         char b = 'x';
@@ -1249,6 +1283,18 @@ fn delivery_case(
     golden: &'static str,
 ) -> Case {
     module_case(id, description, selector, golden, "classify_term")
+}
+
+/// The same over the **term-shape** entry point (`classify_shape/1`): the fixture's selector
+/// emits a header/body `driver_output2` reply and the observable is the ETF image of the delivered
+/// `Data` *term* — never its flattened bytes — so the split's term shape is pinned.
+fn shape_case(
+    id: &'static str,
+    description: &'static str,
+    selector: &'static [i64],
+    golden: &'static str,
+) -> Case {
+    module_case(id, description, selector, golden, "classify_shape")
 }
 
 /// One module-run case over [`DRIVER_ABI_MODULE_SOURCE`] with [`DRIVER_ABI`] as its `.so`.
@@ -1830,6 +1876,12 @@ pub(crate) fn group() -> Vec<Case> {
             &[119],
             "104",
         ),
+        shape_case(
+            "driver_abi/driver_output2_delivers_the_split_term_shape",
+            "driver_output2/5 with a header delivers an improper list, not the flattened bytes",
+            &[120],
+            "750286271459381834992665277785370892214875546211",
+        ),
     ]
 }
 
@@ -1850,6 +1902,10 @@ mod tests {
     /// the fixture emits, never the status byte.
     const PAYLOAD_SELECTORS: std::ops::RangeInclusive<i64> = 110..=119;
 
+    /// The **term-shape** family: the observable is the base-256 value of the ETF image of the
+    /// delivered `Data` *term*, so a runtime that flattens a header/body split is visible.
+    const SHAPE_SELECTORS: std::ops::RangeInclusive<i64> = 120..=120;
+
     /// The **refusal** family: a check whose documented answer is "the ABI refuses" — the C's `0`
     /// status byte, because both runtimes refuse the same call (a driver entry without a
     /// `process_exit` callback cannot arm a monitor; a state read reflects the emulator's own
@@ -1857,10 +1913,13 @@ mod tests {
     const REFUSAL_SELECTORS: std::ops::RangeInclusive<i64> = 70..=73;
 
     /// The module entry point a case drives: `classify/1` for the byte/status families,
-    /// `classify_term/1` for the `ErlDrvTerm` delivery family.
+    /// `classify_term/1` for the `ErlDrvTerm` delivery family and `classify_shape/1` for the
+    /// `driver_output*` term-shape family.
     fn expected_function(selector: i64) -> &'static str {
         if DELIVERY_SELECTORS.contains(&selector) {
             "classify_term"
+        } else if SHAPE_SELECTORS.contains(&selector) {
+            "classify_shape"
         } else {
             "classify"
         }
@@ -1945,6 +2004,7 @@ mod tests {
         let mut payloads = 0;
         let mut deliveries = 0;
         let mut refusals = 0;
+        let mut shapes = 0;
         for case in group() {
             let CaseKind::Module(run) = case.kind else { unreachable!() };
             let golden = case.golden.stdout.unwrap();
@@ -1965,11 +2025,23 @@ mod tests {
                     "case {}: a delivery selector has the delivered term as its payload",
                     case.id
                 );
+            } else if SHAPE_SELECTORS.contains(&run.args[0]) {
+                shapes += 1;
+                assert_ne!(
+                    golden, "49",
+                    "case {}: a shape selector has the delivered payload term as its observable",
+                    case.id
+                );
             } else {
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
         assert_eq!(payloads, 10, "the ten driver_output* byte round trips");
+        assert_eq!(
+            shapes,
+            SHAPE_SELECTORS.count(),
+            "one shape case per driver_output2 split selector"
+        );
         assert_eq!(
             refusals,
             REFUSAL_SELECTORS.count(),
@@ -2032,6 +2104,7 @@ mod tests {
             70, 71, 72, 73, // the process-monitor family and the port control flags
             75, 77, // the two agreeing driver_system_info fields (76 diverges)
             116, 117, 118, 119, // the driver_output2/driver_output_binary edges
+            120, // the driver_output2 header/body term shape
         ] {
             assert!(
                 selectors.contains(&selector),

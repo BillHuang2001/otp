@@ -361,6 +361,22 @@ impl PortName {
         }
     }
 
+    /// The [`StreamShape`] this `Name` form's reads carry — the producer fact a read cannot
+    /// say about itself.
+    ///
+    /// A **built-in** driver port's bytes come up through [`beam_io::DriverContext::input`], a
+    /// flat byte queue that cannot say which `driver_output*` call wrote them, so they render
+    /// the C's header half ([`StreamShape::DriverOutput`]). Every other producer states its own
+    /// header/body split in the read ([`StreamShape::Data`]).
+    fn stream_shape(self) -> StreamShape {
+        match self {
+            PortName::SpawnDriverBuiltin => StreamShape::DriverOutput,
+            PortName::SpawnDriver | PortName::Spawn | PortName::SpawnExecutable | PortName::Fd => {
+                StreamShape::Data
+            }
+        }
+    }
+
     /// Whether the **emulator** owns this port's `{packet, N}` framing — the C's
     /// `prt->opts.packet_bytes`, which only the sys drivers read.
     ///
@@ -679,7 +695,35 @@ impl PortMeta {
     fn owes_exit_status(&self) -> bool {
         self.notify_exit && self.os_pid.is_some() && !self.exit_status_taken.get()
     }
-}/// A message a live port has produced: the child's stream bytes, or its reaped exit status.
+}
+
+/// The recipient facts a surviving read's `{Port, {data, …}}` message needs, captured when a
+/// **driver closed its own port** (`beam_io`'s `driver_failure*`/`driver_exit` family).
+///
+/// A driver delivers `driver_output*` **before** it fails, and `beam_io` re-prepends those bytes
+/// for the port it then reaps ([`beam_io::PortRegistry`]'s `take_reaped_notifications`), so the
+/// read really is reported — after [`PortRegistry::fail_port`] has already removed the port's
+/// [`PortMeta`], which is where a read's recipient normally comes from. The oracle delivers
+/// `{Port, {data, <<"hi">>}}` **then** `{'EXIT', Port, Reason}`, so the recipient is snapshotted
+/// here, before the metadata goes, exactly as the completion channel snapshots its own
+/// ([`completion::ClosedPortSnapshot`]).
+///
+/// Keyed by port **number** in [`PortRegistry::failed_read_recipients`] and consulted only when
+/// the live metadata no longer holds that number, so the read renders exactly as a live port's
+/// would. The entry is dropped when it is used, when the port's `Closed` report is folded (the
+/// same round that retires the number), and when a new port registers under that number — so a
+/// **recycled** number inherits nothing.
+#[derive(Clone, Copy, Debug)]
+struct FailedReadRecipient {
+    /// The process the port belonged to — the recipient of the surviving read.
+    owner: ProcessId,
+    /// Its `binary`/`list` option.
+    stream: StreamType,
+    /// Its producer rendering rule (see [`StreamShape`]).
+    shape: StreamShape,
+}
+
+/// A message a live port has produced: the child's stream bytes, or its reaped exit status.
 ///
 /// This is [`PortRegistry::pump`]'s report, and the seam between the port poller and the
 /// two things that turn it into an Erlang term: the scheduler path
@@ -1028,6 +1072,16 @@ pub struct PortRegistry {
     /// The `'EXIT'`/`'DOWN'` messages a closing port owes its links and monitors — snapshotted
     /// at close and released when the close report is folded (see [`exit`]).
     pending_port_signals: exit::PendingPortSignals,
+    /// Recipient facts for the bytes a **driver-failed** port had already delivered, keyed by
+    /// port number (see [`FailedReadRecipient`]).
+    ///
+    /// [`beam_io`] preserves the reads of a port a driver closed itself and reports them ahead of
+    /// its close report, but [`PortRegistry::fail_port`] removes the port's [`PortMeta`] first —
+    /// so the read would have no recipient. [`PortRegistry::fail_port`] records one here, and
+    /// [`PortRegistry::fold_notifications`]' `Data` arm falls back to it. A port number never
+    /// inherits an entry: it is consumed by the read it was recorded for, dropped when the port's
+    /// `Closed` report is folded, and cleared when a new port registers under that number.
+    failed_read_recipients: HashMap<u64, FailedReadRecipient>,
 }
 
 impl PortRegistry {
@@ -1057,6 +1111,7 @@ impl PortRegistry {
             extras: ops::PortExtras::default(),
             pending_events: Vec::new(),
             pending_port_signals: exit::PendingPortSignals::default(),
+            failed_read_recipients: HashMap::new(),
         })
     }
 
@@ -1182,6 +1237,9 @@ impl PortRegistry {
         if let Some(max_len) = meta.line {
             self.registry.set_line_mode(id, Some(max_len))?;
         }
+        // A number the arena has handed out again starts clean: a surviving read's snapshot from
+        // a previous port under this number is not this port's (see [`FailedReadRecipient`]).
+        self.failed_read_recipients.remove(&id.number());
         self.meta.insert(id.number(), meta);
         Ok(id)
     }
@@ -1924,29 +1982,39 @@ impl PortRegistry {
                         }
                         continue;
                     }
-                    if let Some(meta) = self.meta.get(&port.number()) {
+                    // The read's recipient: a **live** port's metadata, else the snapshot a
+                    // driver failure left ([`FailedReadRecipient`]) — the read a failing callback
+                    // delivered before it closed its own port still reaches the owner, ahead of
+                    // the `'EXIT'`/`'DOWN'` the same failure published (the oracle's
+                    // `{data,<<"hi">>}` **then** `{'EXIT',P,9}`). An entry is consumed here: the
+                    // bytes were harvested exactly once, so nothing else can still be owed them,
+                    // and a port number that has no snapshot at all has no recoverable recipient —
+                    // the read is dropped rather than delivered to a stale owner.
+                    let recipient = match self.meta.get(&port.number()) {
+                        Some(meta) => Some(FailedReadRecipient {
+                            owner: meta.owner,
+                            stream: meta.stream,
+                            shape: meta.kind.stream_shape(),
+                        }),
+                        None => self.failed_read_recipients.remove(&port.number()),
+                    };
+                    if let Some(recipient) = recipient {
                         // The read's bytes are **input** for `erlang:statistics(io)`, counted
                         // where they really arrive — the header included, the C's
-                        // `bytes_in += (hlen + len)` (`io.c:6400`).
+                        // `bytes_in += (hlen + len)` (`io.c:6400`). The node-global counter is
+                        // credited for a failed port too: the bytes really did enter Erlang.
                         self.io_counters.note_input(read.len());
-                        // ...and for this port's own `port_info(Port, input)`.
-                        meta.input.set(meta.input.get().saturating_add(read.len() as u64));
-                        // A **built-in** driver port's bytes are an in-tree driver's reply, handed
-                        // up through a flat byte queue that carries no split, so the C's header
-                        // rendering applies — see [`StreamShape::DriverOutput`]. Everything else on
-                        // this round is a byte stream's own payload (a child's stdout, an `fd`
-                        // port), whose read carries its own (empty) split.
-                        let shape = match meta.kind {
-                            PortName::SpawnDriverBuiltin => StreamShape::DriverOutput,
-                            PortName::SpawnDriver | PortName::Spawn | PortName::SpawnExecutable
-                            | PortName::Fd => StreamShape::Data,
-                        };
+                        // ...and for this port's own `port_info(Port, input)`, which only a live
+                        // port still has to report.
+                        if let Some(meta) = self.meta.get(&port.number()) {
+                            meta.input.set(meta.input.get().saturating_add(read.len() as u64));
+                        }
                         events.push(PortEvent::Data {
                             port,
                             read,
-                            stream: meta.stream,
-                            shape,
-                            owner: meta.owner,
+                            stream: recipient.stream,
+                            shape: recipient.shape,
+                            owner: recipient.owner,
                         });
                     }
                 }
@@ -1955,6 +2023,10 @@ impl PortRegistry {
                     // messages its close owed its links and monitors are released for the
                     // delivery routes to take (see [`exit`]).
                     self.pending_port_signals.report(port);
+                    // ...and this is the round that retires its number (`beam_io` releases the
+                    // id when it mints this report), so a surviving read's snapshot cannot
+                    // outlive the number it names.
+                    self.failed_read_recipients.remove(&port.number());
                 }
             }
         }

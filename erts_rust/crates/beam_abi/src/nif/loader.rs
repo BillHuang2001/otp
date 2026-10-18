@@ -48,15 +48,18 @@
 //! module instance's `nif` pointer, `upgrade` needs a previous module instance, and `old_code`
 //! needs the caller's code area — all module/code-server state that lives outside this crate.
 //!
-//! # Two documented deviations from the C
+//! # One documented deviation from the C
 //!
-//! 1. **The `.so` suffix is appended only when absent** (the C appends `FILE_EXT` unconditionally,
-//!    `erl_unix_sys_ddll.c:107`). A path that already names a shared object is loaded as given.
-//! 2. **The `entry.funcs` table is also bound-checked here.** The C iterates
-//!    `entry->funcs[0..num_of_funcs]` and would fault on a `NULL` table; [`load`] returns a typed
-//!    `bad_lib` instead. The C's checks 9–12 (`Function not found` / `not declared as nif` /
-//!    `Illegal flags field value` / `Duplicate NIF entry`) compare the table against the *calling
-//!    module's* code, which is not reachable from this crate, so they are not performed here.
+//! **The `entry.funcs` table is also bound-checked here.** The C iterates
+//! `entry->funcs[0..num_of_funcs]` and would fault on a `NULL` table; [`load`] returns a typed
+//! `bad_lib` instead. The C's checks 9–12 (`Function not found` / `not declared as nif` /
+//! `Illegal flags field value` / `Duplicate NIF entry`) compare the table against the *calling
+//! module's* code, which is not reachable from this crate, so they are not performed here.
+//!
+//! The path rule is **not** a deviation: the shared-object suffix is appended unconditionally, so
+//! a path already ending in `.so` opens `<path>.so`, exactly like `erts_sys_ddll_open`
+//! (`erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`, `FILE_EXT`), and both the `dlopen` call
+//! and every message name the suffixed path.
 //!
 //! # Ownership
 //!
@@ -388,8 +391,10 @@ impl Drop for NifLibrary {
 /// Load a NIF shared object and validate it in the oracle's exact order (see the crate
 /// `CONTEXT.md` table and the module docs above).
 ///
-/// `path` is as passed to `erlang:load_nif/2`; the shared-object suffix (`.so`) is appended when
-/// absent. `module` is the calling module's name (the oracle derives it from the call site's code
+/// `path` is as passed to `erlang:load_nif/2`; the shared-object suffix (`.so`) is appended
+/// **unconditionally**, so a path that already names a shared object resolves `<path>.so` (the
+/// oracle appends `FILE_EXT` the same way, `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`).
+/// `module` is the calling module's name (the oracle derives it from the call site's code
 /// area; here the caller supplies it). `load_info` is the second argument of `load_nif/2`, handed
 /// verbatim to the library's `load` callback.
 ///
@@ -422,12 +427,13 @@ pub fn load(
     let handle =
         OpenHandle(unsafe { libc::dlopen(c_so_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) });
     if handle.get().is_null() {
-        // `dlopen` failed, so the loader's error slot holds the reason.
+        // `dlopen` failed, so the loader's error slot holds the reason. Both branches name the
+        // *suffixed* path, as the C's `lib_name` does (`erl_nif.c:4802-4807`).
         let errdesc = dl_last_error().unwrap_or_else(|| "unknown dynamic loader error".to_string());
-        let text = if errdesc.contains(path) {
+        let text = if errdesc.contains(&so_path) {
             format!("{LOAD_SLOGAN}: '{errdesc}'")
         } else {
-            format!("{LOAD_SLOGAN} {path}: '{errdesc}'")
+            format!("{LOAD_SLOGAN} {so_path}: '{errdesc}'")
         };
         return Err(NifLoadError::LoadFailed(text));
     }
@@ -570,13 +576,11 @@ fn at_least_version(major: c_int, minor: c_int, req_major: c_int, req_minor: c_i
     major * 0x100 + minor >= req_major * 0x100 + req_minor
 }
 
-/// `path` with the shared-object suffix appended when absent.
+/// `path` with the shared-object suffix appended — unconditionally, as the oracle does
+/// (`erts_sys_ddll_open` copies `FILE_EXT` after the given name,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`), so `"/x/foo.so"` opens `"/x/foo.so.so"`.
 fn shared_object_path(path: &str) -> String {
-    if path.ends_with(SHARED_OBJECT_SUFFIX) {
-        path.to_string()
-    } else {
-        format!("{path}{SHARED_OBJECT_SUFFIX}")
-    }
+    format!("{path}{SHARED_OBJECT_SUFFIX}")
 }
 
 /// Read a NUL-terminated C string, returning `None` for a null pointer.
@@ -708,11 +712,15 @@ mod tests {
         assert_eq!(current_priv_data(), Some(marker(0x11)));
     }
 
+    /// The oracle appends `FILE_EXT` unconditionally (`erl_unix_sys_ddll.c:104-118`), so an
+    /// already-suffixed path resolves `<path>.so.so` — the measured OTP behaviour of
+    /// `erlang:load_nif("/nonexistent/foo.so", [])`.
     #[test]
-    fn shared_object_path_appends_the_suffix_only_when_absent() {
+    fn shared_object_path_appends_the_suffix_unconditionally() {
         assert_eq!(shared_object_path("/tmp/x"), "/tmp/x.so");
-        assert_eq!(shared_object_path("/tmp/x.so"), "/tmp/x.so");
+        assert_eq!(shared_object_path("/tmp/x.so"), "/tmp/x.so.so");
         assert_eq!(shared_object_path("x"), "x.so");
+        assert_eq!(shared_object_path(""), ".so");
     }
 
     #[test]

@@ -287,9 +287,10 @@ answer() -> 42.
 /// (`non_existing`); the real stdlib compile's answer; `code:add_patha/1`; the added directory
 /// on `code:get_path/0`; `code:load_file(ordsets)`'s answer; the real `ordsets` call; the
 /// directory-only compile's answer; its load; whether `code:which/1` now names the artifact
-/// **inside the added directory**; the directory-only module's own value.
+/// **inside the added directory**; the directory-only module's own value; then the served
+/// `erlang:delete_module/1` of a name neither runtime holds (`undefined`).
 const B_EXPECTED: &str = "non_existing|{ok,ordsets}|true|true|{error,sticky_directory}|[1,2,3]\
-                          |{ok,a9_chain_dirprobe}|{module,a9_chain_dirprobe}|true|42";
+                          |{ok,a9_chain_dirprobe}|{module,a9_chain_dirprobe}|true|42|undefined";
 
 /// **The (b) chain.** One `beam_rt` invocation compiles the real `lib/stdlib/src/ordsets.erl`
 /// in process, adds its output directory to the code path, loads a module and **runs** real
@@ -311,24 +312,38 @@ const B_EXPECTED: &str = "non_existing|{ok,ordsets}|true|true|{error,sticky_dire
 /// matches the oracle's (the module would then load from the added directory instead of being
 /// refused) — read the value, not just the assertion, before changing anything.
 ///
-/// # Known gap: the `code:delete/1` route is NOT part of this chain
+/// # `erlang:delete_module/1` is served; the reload after `code:delete/1` is what still
+/// diverges
 ///
-/// The way to get *past* the sticky refusal is `code:unstick_mod/1` + `code:delete/1`, and that
-/// route **diverges today** — a capability gap in `erlang:delete_module/1` (registered as a
-/// known-unimplemented `erlang` BIF, so it raises `unsupported: erlang:delete_module/1`). Measured
-/// on this host with `U = code:unstick_mod(ordsets), D = (catch code:delete(ordsets)),
-/// L = code:load_file(ordsets), W = code:which(ordsets)`:
+/// `erlang:delete_module/1` is served by the runtime's `RuntimeHooks` bridge
+/// (`src/context/runtime_hooks.rs`), which really drops the module from the code server
+/// (`CodeServer::forget_module`): a held name answers `true`, an unheld one the atom
+/// `undefined`, a non-atom `badarg`. The probe below pins that, oracle-cross-checked:
+/// `erlang:delete_module(a9_no_such_module)` ⇒ `undefined` on **both** runtimes. That is a real
+/// assertion, not a formality: a capability gap is uncatchable on the `-eval` route, so before
+/// the BIF was served the whole probe died at that field
+/// (`unsupported: erlang:delete_module/1`, exit 3) instead of printing a value.
+/// (`erts_internal:purge_module/2` is served too — it raises the oracle's own unconditional
+/// `error:notsup` — but its raise is asserted by the crate's own
+/// `the_runtime_hooks_bridge_serves_purge_module_as_the_oracles_notsup_raise` unit test, not
+/// here, because the `-eval` route's `try … catch` does not yet convert a BIF raise into a
+/// catchable class/reason pair.)
 ///
-/// * `beam_rt`: `U` = `true`, then the live `code_server` process **dies** on the raise
-///   (`kernel_sup` logs `child_terminated` → `reached_max_restart_intensity`), the caller's
-///   `catch` yields `D` = `{'EXIT',{'DOWN',code_server,{delete,ordsets}}}`, and `L` stays
-///   `{error,sticky_directory}`;
-/// * system `erl`: `D` = `true` and `L` = `{module,ordsets}`.
+/// The way to get *past* the sticky refusal is `code:unstick_mod/1` + `code:delete/1`, and
+/// that deletion now works here too. Measured on this host with `U = code:unstick_mod(ordsets),
+/// D = (catch code:delete(ordsets)), I = code:is_loaded(ordsets), L = code:load_file(ordsets),
+/// W = code:which(ordsets)`:
+///
+/// * both runtimes: `U` = `true`, `D` = `true`, `I` = `false`, `W` = the `ordsets.beam` path —
+///   the deletion is real under both;
+/// * `L` still diverges: `{module,ordsets}` on the system `erl`, `{error,sticky_directory}`
+///   here — this runtime's `code:*` surface is a native floor (`src/native/code.rs`) whose
+///   sticky check is its **own** state, not the code server's.
 ///
 /// So this suite deliberately pins the **plain** `code:load_file/1` answer (which the two
-/// runtimes share) and never drives `code:delete/1`; the gap is `beam_rt`'s (a `src/` BIF
-/// surface), reported rather than papered over. Adding `code:delete/1` to the probe above would
-/// turn this test red on a real divergence — do that when the BIF is implemented, not before.
+/// runtimes share) and never drives the **reload**; adding `L` to the probe above would turn
+/// this test red on that known floor divergence. Closing it is a `src/native/code.rs` change,
+/// not a BIF one.
 ///
 /// Measured wall time: ~1.5–2.2 s for the whole test on this host — the whole-process start-up
 /// plus the in-process `ordsets.erl` compile, the directory-only compile and both probes — of
@@ -363,8 +378,9 @@ fn b_a_real_stdlib_module_compiles_on_the_code_path_and_runs_in_one_invocation()
              L2 = code:load_file(a9_chain_dirprobe),\n\
              W2 = (code:which(a9_chain_dirprobe) =:= {beam_lit}),\n\
              V2 = a9_chain_dirprobe:answer(),\n\
-             io:format(\"{mark}~p|~p|~p|~p|~p|~p|~p|~p|~p|~p{end}~n\", \
-             [W0, C, A, M, L, R, C2, L2, W2, V2]),\n\
+             DM = erlang:delete_module(a9_no_such_module),\n\
+             io:format(\"{mark}~p|~p|~p|~p|~p|~p|~p|~p|~p|~p|~p{end}~n\", \
+             [W0, C, A, M, L, R, C2, L2, W2, V2, DM]),\n\
              halt(0).",
             stdlib = compile_call(src, &out.0),
             dirprobe = compile_call(&dirprobe, &out.0),

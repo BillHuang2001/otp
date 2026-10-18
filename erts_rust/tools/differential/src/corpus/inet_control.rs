@@ -87,15 +87,10 @@
 //! reported to the runtime owners instead. Verified in this environment (oracle OTP 29.1.1 /
 //! `erts-17.1`; the built `beam_rt`) by running the *same* expression under both runtimes:
 //!
-//! * **a datagram send never gets its driver reply (`beam_rt`).** `gen_udp:send(S,
-//!   {127,0,0,1}, P, <<"hi">>)` answers `ok` under the oracle; here `prim_inet:do_sendto/4`'s
-//!   `erlang:port_command/2` answers `true` and the following
-//!   `receive {inet_reply, S, Reply, Ref}` never completes — the `-eval` route exits `3` with
-//!   `beam_rt: unsupported: opcode: run: process blocked (no message available)` and the
-//!   compiled-module route (`beam_rt run`) hangs to its 60 s deadline. A *successful* send
-//!   therefore has no pinnable shape, and neither has the length header it would write. Owner:
-//!   `beam_rt` (the port-task reply bridge).
-//! * **an incoming datagram is never delivered (`beam_rt`).** With a `{active, true}` socket,
+//! * **an incoming datagram is never delivered (`beam_rt`).** The datagram *write* path agrees:
+//!   `gen_udp:send/4` answers `ok` on both sides and the in-VM loopback pair (`gen_udp:send/4`
+//!   to the socket's own port, then `gen_udp:recv/3`) agrees, so the `inet_reply` bridge is in
+//!   place. What has no pinnable shape is the read half. With a `{active, true}` socket,
 //!   a datagram injected from outside the VM (`os:cmd("printf abc > /dev/udp/127.0.0.1/P")`)
 //!   arrives as `{udp, S, {127,0,0,1}, _, <<"abc">>}` under the oracle and as nothing at all
 //!   under `beam_rt` within a 2 s guard; `gen_udp:recv(S, 0, 300)` likewise answers
@@ -378,11 +373,12 @@ mod tests {
         );
     }
 
-    /// The shapes that were **measured** to diverge stay out of the group: the datagram *data*
-    /// path is unreachable from Erlang on `beam_rt` (a send never receives its `inet_reply` and
-    /// an incoming datagram is never delivered), `gen_tcp:accept/2` fails inside `prim_inet`, and
-    /// `port_command/2` on a socket-less port has no shared observable — pinning any of them
-    /// would commit a `mismatch`. See the module docs for the exact pairs of observations.
+    /// The shapes that were **measured** to diverge stay out of the group: the datagram *read*
+    /// path is unreachable from Erlang on `beam_rt` (an incoming datagram is never delivered),
+    /// `gen_tcp:accept/2` fails inside `prim_inet`, and `port_command/2` on a socket-less port has
+    /// no shared observable — pinning any of them would commit a `mismatch`. See the module docs
+    /// for the exact pairs of observations. (The datagram *write* path is not one of them:
+    /// `gen_udp:send/4` answers `ok` on both sides.)
     ///
     /// The option/address surface of both drivers (including `inet:getstat/1`,
     /// `gen_tcp:connect/3`, `gen_tcp:listen/2` and the `{mode, list|binary}` store) is served,
@@ -392,8 +388,8 @@ mod tests {
         for case in group() {
             let expr = case.expr().expect("eval case");
             for forbidden in [
-                // The send verb family: its `inet_reply` never reaches the owner, and its
-                // closing path polls the driver's counters.
+                // The send verb family: it drives the data path (whose read half has no
+                // delivered-datagram bridge), and its closing path polls the driver's counters.
                 "port_command",
                 "prim_inet",
                 // The only route to a datagram injected from outside the VM.

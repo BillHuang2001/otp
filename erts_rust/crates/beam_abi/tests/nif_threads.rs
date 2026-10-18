@@ -102,9 +102,10 @@ fn compile_fixture() -> Option<PathBuf> {
     compile_so(MODULE, FIXTURE_C)
 }
 
-/// The `.so` path as a `&str`, or `None` (after a loud skip) when it is not valid UTF-8.
-fn so_path(so: &Path) -> Option<String> {
-    match so.to_str() {
+/// The path `load` takes — the compiled `.so` **without** its suffix, which the loader appends
+/// itself — or `None` (after a loud skip) when it is not valid UTF-8.
+fn load_path(so: &Path) -> Option<String> {
+    match so.with_extension("").to_str() {
         Some(path) => Some(path.to_string()),
         None => {
             skip("compiled .so path is not valid UTF-8");
@@ -138,7 +139,7 @@ fn assert_tuple(env: &mut NifEnv, lib: &NifLibrary, name: &str, want: &[i64]) {
 #[test]
 fn the_thread_family_round_trips_through_a_real_c_nif() {
     let Some(so) = compile_fixture() else { return };
-    let Some(path) = so_path(&so) else { return };
+    let Some(path) = load_path(&so) else { return };
 
     let mut host = TestHost::new();
     let lib = load(&path, MODULE, &mut host, Eterm::nil())
