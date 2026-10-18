@@ -2808,8 +2808,9 @@ fn the_published_fr_prefix_round_trips_through_a_moving_collection() {
 /// It is the closest existing fixture to the `foreign` `emqx_base62:encode` loop — a constant
 /// live set with one allocation-heavy call per iteration — and every binary/tuple it keeps comes
 /// from a **registered BIF** (`list_to_binary/1`, `list_to_tuple/1`), so it drives the
-/// BIF-result copy-out path (`RuntimeContext::move_result_into_process_heap`, whose retry grows
-/// the nursery through the no-relocation [`Process::grow_nursery`]).
+/// BIF-result copy-out path (`RuntimeContext::move_result_into_process_heap`, whose learned-hint
+/// growth gate makes the nursery — through the no-relocation [`Process::grow_nursery`] — large
+/// enough for the graph *before* the copy, with the refusal → grow → retry path behind it).
 fn churn_fixture() -> &'static str {
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/churn.beam")
 }

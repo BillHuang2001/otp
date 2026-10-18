@@ -140,6 +140,34 @@ pub struct RuntimeContext<'a> {
     /// the seam), because it must propagate through a reentrant intermediate that installs no
     /// cell (`ets:foldl` fun → `lists:map` fun → `ets:lookup`).
     pub(super) lent_tables: Option<&'a mut TableRegistry>,
+    /// The sticky copy-out size hint, in flat term words: the largest result graph a
+    /// registered BIF has already been **refused** onto this process's nursery for.
+    ///
+    /// It is the one thing a refused copy teaches cheaply — the copier's own preflight
+    /// (`calls.rs::copy_shortfall_words`) reports the word count it could not fit — and
+    /// [`RuntimeContext::move_result_into_process_heap`] spends it *before* the next copy
+    /// attempt: a destination with fewer free words than the hint (plus a small margin) is
+    /// grown with the **no-relocation** `Process::grow_nursery` seam first, so the copy
+    /// succeeds on its **first** attempt instead of paying a refusal.
+    ///
+    /// # Why the hint belongs to a context (one slice), not to the process
+    ///
+    /// A `RuntimeContext` is built per scheduler slice
+    /// ([`crate::runner`]'s `for_process_with_engines`) and per `-eval`/`-run` entry, so this
+    /// field is exactly "what this run has learned so far". That is enough: the refusal it
+    /// removes is worth a *multi-traversal* sizing walk (`try_copy_fast` →
+    /// `preflight_words` → the bounded `size_object_bounded_with` walk with its `HashSet` →
+    /// an acyclicity check → `size_object_with`), roughly six allocations, on **every**
+    /// iteration of a copy-bound loop — so learning it once per slice, rather than once per
+    /// process, already removes all but one refusal per slice. A per-*process* hint (a
+    /// `Runtime`-owned map keyed by pid, outside this node's scope) would remove that last
+    /// one; see the handoff note in [`super::calls`].
+    ///
+    /// A hint is only ever a **lower bound** on the graphs the process builds (`max`), and a
+    /// hint that is too large costs one over-sized nursery, never a wrong copy: the copy is
+    /// re-attempted through the ordinary path either way, and any refusal there still falls
+    /// back to the existing grow-and-retry.
+    pub(super) copy_out_hint: usize,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -158,6 +186,7 @@ impl<'a> RuntimeContext<'a> {
             gc_armed: false,
             dispatch_memo: DispatchMemo::default(),
             lent_tables: None,
+            copy_out_hint: 0,
         }
     }
 
@@ -175,6 +204,7 @@ impl<'a> RuntimeContext<'a> {
             gc_armed: false,
             dispatch_memo: DispatchMemo::default(),
             lent_tables: None,
+            copy_out_hint: 0,
         }
     }
 
@@ -209,6 +239,7 @@ impl<'a> RuntimeContext<'a> {
             gc_armed: false,
             dispatch_memo: DispatchMemo::default(),
             lent_tables: None,
+            copy_out_hint: 0,
         }
     }
 

@@ -188,6 +188,9 @@ impl<'a> FunBridge<'a> {
             may_pump_scheduler: self.may_pump_scheduler,
             current_module: self.current_module.clone(),
             engines: self.engines,
+            // A nested run starts with no copy-out hint: the outer context's learned graph
+            // sizes are the outer process's, and this delivery/apply builds its own results.
+            copy_out_hint: 0,
             // A **nested** run: it must never collect the process heap, because the root set
             // the machine would hand out belongs to the outer machine (see `context::gc`).
             gc_armed: false,
@@ -382,6 +385,7 @@ impl SendHook for SendBridge<'_> {
                         may_pump_scheduler: self.may_pump_scheduler,
                         current_module: self.current_module.clone(),
                         engines: self.engines,
+                        copy_out_hint: 0,
                         // A **nested** run: the delivery itself allocates no roots to
                         // relocate, and the latch must never be inherited (see `context::gc`).
                         gc_armed: false,
@@ -422,6 +426,7 @@ impl SendHook for SendBridge<'_> {
                     may_pump_scheduler: self.may_pump_scheduler,
                     current_module: self.current_module.clone(),
                     engines: self.engines,
+                    copy_out_hint: 0,
                     gc_armed: false,
                     dispatch_memo: super::DispatchMemo::default(),
                     // A remote transmission applies no fun and reads no `TableRegistry`.
