@@ -344,7 +344,8 @@ impl RuntimeContext<'_> {
     /// [`CodeServer::load`](crate::CodeServer::load); oracle-verified
     /// `code:ensure_modules_loaded([bogus])` ⇒ `{error,[{bogus,badfile}]}` with a `bogus.beam`
     /// really holding `realname`) — the oracle answers `{error,[{Name,badfile}]}` and **also**
-    /// logs an    /// `=ERROR REPORT==== … corrupt file header` line on its default handler; this runtime has no
+    /// logs a
+    /// `=ERROR REPORT==== … corrupt file header` line on its default handler; this runtime has no
     /// logger and emits no such line — only the value, never an invented report.
     pub(super) fn code_ensure_modules_loaded(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let modules = *args.first().ok_or(BeamError::BadArg)?;
@@ -423,7 +424,8 @@ impl RuntimeContext<'_> {
     /// oracle's `{error,badfile}` too — the loader's expected-name check
     /// ([`CodeServer::load`](crate::CodeServer::load)), which refuses the image without
     /// loading it under its own name either (`code:load_file(bogus)` ⇒ `{error,badfile}`,
-    /// `erlang:module_loaded(realname)` ⇒ `false`).    ///
+    /// `erlang:module_loaded(realname)` ⇒ `false`).
+    ///
     /// A **non-sticky** system module is only reachable when its application directory is on
     /// the code path: this runtime resolves the system path to the `stdlib`/`kernel`/`erts`
     /// `ebin`s only, so `code:load_file(mnesia)` — `{module,mnesia}` on the oracle, whose code
