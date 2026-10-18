@@ -81,12 +81,19 @@
 //! a `binary` for a `binary`-stream port (a char list otherwise), **at whatever width the
 //! child wrote** (see [`RuntimeContext::port_data_message`]).
 //!
-//! A **built-in driver port**'s replies (`{spawn_driver, "ram_file_drv"}` and friends) are shaped
-//! by the C's driver-output rule instead: a driver output call's **header** bytes are list
-//! elements on either stream, so a `[binary]` port's `{data, D}` is a list of byte integers, not a
-//! binary ([`StreamShape::DriverOutput`]). That is exact for a header-only reply — every
-//! `ram_file_drv` `OK`/`NUMBER`/`ERROR` — and is the documented residual for a reply that carried
-//! a data part, whose binary tail the `beam_io` seam does not carry.
+//! The payload's shape is the C's `driver_output*` **split**, not the bytes: a read carries its
+//! header (`hbuf`) and body (`buf`) apart ([`ReadMessage`]), so a `[binary]` port delivers the bare
+//! binary for a header-less read, the improper `[H1..Hh|<<Data>>]` when the call carried both
+//! halves, the proper `[H1..Hh]` when it carried no body at all, and `[]` for a read of nothing
+//! (`deliver_read_message`, `erts/emulator/beam/io.c:3363-3442`); a `list` stream is every byte as
+//! a char list either way.
+//!
+//! A **built-in driver port**'s replies (`{spawn_driver, "ram_file_drv"}` and friends) come up
+//! through [`beam_io`]'s **flat** byte queue instead, which carries no split, so they are rendered
+//! as list elements on either stream — the C's header rendering ([`StreamShape::DriverOutput`]).
+//! That is exact for a header-only reply — every `ram_file_drv` `OK`/`NUMBER`/`ERROR` — and is the
+//! documented residual for a reply that carried a data part, whose binary tail the `beam_io` seam
+//! does not carry.
 //!
 //! The child's **stderr** follows the oracle exactly: it is *inherited* from the emulator
 //! by default (so it appears on `beam_rt`'s own stderr and is never port data), and the
@@ -176,7 +183,7 @@ use beam_engine::terms;
 use libc::c_int;
 use beam_io::{
     Driver, DriverRegistry, Event, Poller, PortCommandOptions, PortExitReason, PortNotification,
-    PortRegistry as IoPortRegistry, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
+    PortRegistry as IoPortRegistry, ReadMessage, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
     StreamOptions, PORT_REDS_EXECUTE,
 };
 use beam_process::{PortId, PortTable, ProcessId, ProcessTable};
@@ -373,50 +380,52 @@ impl From<StreamType> for SpawnStream {
     }
 }
 
-/// How one driver output call splits the bytes it delivered into the legacy C's `hbuf`/`buf`
-/// halves.
+/// How a delivered read is rendered **beyond** the header/body split it carries itself.
 ///
-/// The C has four output entry points, and its port-message builders
-/// (`deliver_read_message`, `erts/emulator/beam/io.c:3363`, and `deliver_vec_message`, `:3501`)
-/// always render the **header** bytes as list *elements* while the **data** bytes follow the
-/// port's stream bit (`ERTS_PORT_SFLG_BINARY_IO`), a `binary` for a `binary` port and further
-/// list elements for the default `list` one:
+/// The split is the read's: [`ReadMessage`] carries the legacy C's `hbuf`/`hlen` and `buf`/`len`
+/// halves apart (`driver_output2`/`driver_output_binary`/`driver_outputv`), so the payload builder
+/// renders the C's shapes straight from it — the C's port-message builders
+/// (`deliver_read_message`, `erts/emulator/beam/io.c:3363-3442`, and `deliver_vec_message`,
+/// `:3501-3617`) always render the **header** bytes as list *elements* while the **data** bytes
+/// follow the port's stream bit (`ERTS_PORT_SFLG_BINARY_IO`):
 ///
-/// | the driver called | header | data | a `[binary]` port's `{data, D}` |
-/// |---|---|---|---|
-/// | `driver_output(buf, len)` | none | `buf` | `<<Data>>` |
-/// | `driver_output2(hbuf, hlen, NULL, 0)` | `hbuf` | none | `[H1..Hh]` — a **proper** list |
-/// | `driver_output2(hbuf, hlen, buf, len)` | `hbuf` | `buf` | `[H1..Hh\|<<Data>>]` |
-/// | `driver_output_binary(hbuf, hlen, bin, off, len)` | `hbuf` | `bin` | `[H1..Hh\|<<Data>>]` |
-///
-/// So a `binary` port does **not** always deliver a binary: the shape is a function of
-/// `(stream, split)`, never of the bytes themselves. The `list` stream is insensitive to the
-/// split — the header and the data are both list elements there.
+/// | the driver called | `[binary]` port's `{data, D}` | `[list]` port |
+/// |---|---|---|
+/// | `driver_output(buf, len)` (no header, body present) | `<<Data>>` | `[D1..Dn]` |
+/// | `driver_output2(hbuf, hlen, buf, len)` | `[H1..Hh\|<<Data>>]` | `[H1..Hh,D1..Dn]` |
+/// | `driver_output2(hbuf, hlen, buf, 0)` | `[H1..Hh\|<<>>]` | `[H1..Hh]` |
+/// | `driver_output2(hbuf, hlen, NULL, 0)` (no body) | `[H1..Hh]` — a **proper** list | `[H1..Hh]` |
+/// | `driver_output2(NULL, 0, NULL, 0)` | `[]` | `[]` |
 ///
 /// A driver's reply is the interesting case in practice (`rfile_command`'s `numeric_reply` goes
 /// through `driver_output2` and its `DATA` reply through `driver_output_binary`,
 /// `erts/emulator/drivers/common/ram_file_drv.c:197-228,448-489`), while a byte-stream *read* —
 /// a child's stdout, an `fd` port — is header-less and therefore a binary.
 ///
-/// [`beam_io`] folds each of those calls into one flat byte queue
-/// ([`beam_io::DriverContext::input`]), so a payload arrives here as bytes with **no split
-/// attached**. Exactly one shape says so: [`StreamShape::DriverOutput`], which a **built-in
-/// driver port** reports, and which renders every delivered byte as list elements — the C's header
-/// rendering. Every other producer in this runtime (a child's stdout on the port-task round, an
-/// `fd` port, and a `dlopen`ed driver's `driver_output` on the driver's own input queue) reports
-/// [`StreamShape::Data`] and keeps the stream option's own shape.
+/// What a read cannot say is whether its bytes came from a driver output call **at all**: a
+/// **built-in** driver port hands its bytes up through [`beam_io::DriverContext::input`], a flat
+/// byte queue with no split attached, so an in-tree driver's reply arrives as one header-less read.
+/// [`StreamShape::DriverOutput`] says exactly that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum StreamShape {
-    /// `driver_output`: no header — every delivered byte is the driver's data.
+    /// The read's own header/body split decides the term (the table above): the header is a cons
+    /// prefix, the body — present, empty or absent — the tail, and a header-less read with a body
+    /// the bare binary (a char list on the `list` stream).
+    ///
+    /// This is every producer in this runtime except a built-in driver port: a child's stdout on
+    /// the port-task round, an `fd` port, and a `dlopen`ed driver's `driver_output` on the driver's
+    /// own input queue — and every reassembled `{packet, N}` packet, whose framing is the
+    /// emulator's.
     #[default]
     Data,
     /// A **built-in driver port**'s payload: an in-tree driver ([`PortName::SpawnDriverBuiltin`] —
     /// `ram_file_drv`, `tcp_inet`, `udp_inet`) answered through one of the four `driver_output*`
     /// entry points, and [`beam_io`]'s flat byte queue does not say which.
     ///
-    /// It renders as **list elements on either stream** — what the C gives the header half of
-    /// every output call (`deliver_read_message`, `erts/emulator/beam/io.c:3404-3435`), so a
-    /// `[binary]` port's `{data, D}` is a list of byte integers rather than a binary.
+    /// A **header-less** read of such a port renders as **list elements on either stream** — what
+    /// the C gives the header half of every output call (`deliver_read_message`,
+    /// `erts/emulator/beam/io.c:3404-3435`), so a `[binary]` port's `{data, D}` is a list of byte
+    /// integers rather than a binary.
     ///
     /// That rendering is **exact** when the driver answered header-only — `driver_output2(hbuf,
     /// hlen, NULL, 0)`, which is every `ram_file_drv` `OK`/`NUMBER`/`ERROR`
@@ -424,50 +433,14 @@ pub(crate) enum StreamShape {
     /// a **data part** (a `DATA` reply, `driver_output_binary`, `:448`) has its binary tail
     /// rendered as further list elements (`[2,0,0,0,2,97,98]` where the oracle delivers
     /// `[2,0,0,0,2|<<97,98>>]`), and a header-less `driver_output` (an `inet` socket read) is
-    /// rendered as list elements where the oracle delivers a binary. Both residuals are the
-    /// producer's, not the renderer's: distinguishing them needs the header/data split across the
-    /// seam, which is the `beam_io` handoff in this node's `CONTEXT.md`.
-    DriverOutput,
-    // The two header shapes have no producer in this runtime: [`beam_io`] folds every output
-    // call into one flat byte queue (`beam_io::DriverContext::input`), so the port layer cannot
-    // tell which call delivered a payload. They are kept — and pinned by `stream_shape_tests` —
-    // because they are what the message builder must render the moment the input channel carries
-    // the split (the handoff is recorded in this node's `CONTEXT.md`).
-    #[allow(dead_code)]
-    /// `driver_output2(hbuf, hlen, NULL, 0)`: the **whole** delivered payload is the header, so a
-    /// `binary` port renders a proper list of byte integers.
-    Header,
-    #[allow(dead_code)]
-    /// A header followed by a data part — `driver_output2(hbuf, hlen, buf, len)` or
-    /// `driver_output_binary(...)`. The first `len` bytes are the header, the rest the data; the
-    /// data part is **present even when it is empty**, which is why a zero-length `DATA` reply
-    /// renders `[H1..Hh|<<>>]` rather than a bare list.
-    HeaderThenData {
-        /// How many leading bytes of the payload are the header.
-        len: usize,
-    },
-}
-
-impl StreamShape {
-    /// The `(header, data)` halves of a delivered payload, `data` being `Some` exactly when the
-    /// driver's call carried a data part.
+    /// rendered as list elements where the oracle delivers a binary. Closing that residual needs
+    /// an in-tree driver to hand its bytes up through [`beam_io::DriverContext::deliver_read`]
+    /// instead of [`beam_io::DriverContext::input`] — a `beam_io` change, the handoff in this
+    /// node's `CONTEXT.md`.
     ///
-    /// `len` is clamped to the payload: a shape naming a longer header than was delivered would
-    /// otherwise *drop* bytes, and dropping bytes is a wrong result. No bytes are invented
-    /// either — the clamp only ever widens the header to the whole payload.
-    fn split(self, bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
-        match self {
-            StreamShape::Data => (&[], Some(bytes)),
-            // [`StreamShape::DriverOutput`] never reaches here ([`RuntimeContext::make_stream_payload`]
-            // renders it as list elements before the split is asked for); were it reached, every
-            // byte is the header — the same answer as [`StreamShape::Header`].
-            StreamShape::DriverOutput | StreamShape::Header => (bytes, None),
-            StreamShape::HeaderThenData { len } => {
-                let len = len.min(bytes.len());
-                (&bytes[..len], Some(&bytes[len..]))
-            }
-        }
-    }
+    /// A read that **does** carry a header contradicts the flat queue, so its own split wins (see
+    /// [`StreamShape::Data`]): the shape never hides bytes a producer really delivered as a header.
+    DriverOutput,
 }
 
 /// The `port_info/1,2` metadata of one live port — what [`beam_io`] deliberately does not
@@ -664,20 +637,26 @@ impl PortMeta {
 /// `-eval` `receive` path ([`RuntimeContext::poll_port_messages`], which builds it inline).
 #[derive(Debug)]
 enum PortEvent {
-    /// The child wrote `bytes`; the message is `{Port, {data, Data}}` with `Data` shaped by
-    /// `stream` **and** by `shape` — the driver output call that produced the bytes (see
-    /// [`StreamShape`]).
+    /// One driver read, owed to the owner as `{Port, {data, Data}}`: `Data` is shaped by `stream`
+    /// **and** by the read's own `hbuf`/`buf` split (the C's four shapes, [`ReadMessage`]), with
+    /// `shape` naming the one producer fact a read cannot carry (see [`StreamShape`]).
     Data {
-        /// The port the bytes came from.
+        /// The port the read came from.
         port: PortId,
-        /// The bytes one driver read produced.
-        bytes: Vec<u8>,
+        /// One `driver_output*` call's bytes with the C's header/body split intact — `header` is
+        /// `hbuf`/`hlen` and `body` is `buf`/`len`, `None` being a `NULL` body
+        /// (`erts/emulator/beam/io.c:3363-3442`).
+        ///
+        /// One read is **one** message, and its `len()` (header included) is what
+        /// `erlang:statistics(io)` and `port_info(Port, input)` charge for it.
+        read: ReadMessage,
         /// The port's `binary`/`list` option.
         stream: StreamType,
-        /// How the output call that produced `bytes` split them into the C's `hbuf`/`buf` halves:
-        /// [`StreamShape::DriverOutput`] for a built-in driver port's payload (rendered as list
-        /// elements on either stream), [`StreamShape::Data`] for every other producer here (a
-        /// child's stream bytes, an `fd` port, a `dlopen`ed driver's `driver_output`).
+        /// The producer-specific rendering rule: [`StreamShape::DriverOutput`] for a built-in
+        /// driver port's flat payload (rendered as list elements on either stream),
+        /// [`StreamShape::Data`] for every other producer here (a child's stream bytes, an `fd`
+        /// port, a `dlopen`ed driver's `driver_output`) and for every reassembled `{packet, N}`
+        /// packet.
         shape: StreamShape,
         /// The process the message belongs to.
         owner: ProcessId,
@@ -688,10 +667,12 @@ enum PortEvent {
     /// `deliver_linebuf_message` (`erts/emulator/beam/io.c:3454`), whose wrapper
     /// `{Port, {data, {eol|noeol, Data}}}` is built at `io.c:3430-3435`. `eol` means the frame
     /// was terminated by a newline; `noeol` means it was a length-limited `{line, N}` chunk or
-    /// the trailing partial line released at end-of-file. `Data` is shaped by `stream`
-    /// exactly as the raw [`PortEvent::Data`] arm shapes its payload.
+    /// the trailing partial line released at end-of-file. `Data` is shaped by `stream` exactly
+    /// as a raw [`PortEvent::Data`] payload is: the frame's bytes are the **body** and `header`
+    /// is consed in front of them (`deliver_linebuf_message` hands both to
+    /// `deliver_read_message`, `io.c:3464`).
     ///
-    /// Unlike [`PortEvent::Data`] — whose empty payload is dropped, because a driver read of
+    /// Unlike [`PortEvent::Data`] — whose empty read is dropped, because a driver read of
     /// nothing is no message at all — an **empty `bytes` here is a real frame**: a blank line
     /// is the oracle's `{Port, {data, {eol, []}}}`. The line channel
     /// ([`beam_io::PortRegistry::take_line_notifications`]) is what feeds this variant; a
@@ -699,6 +680,12 @@ enum PortEvent {
     Line {
         /// The port the frame came from.
         port: PortId,
+        /// The frame's **header prefix**: the [`ReadMessage::header`] of the read that produced
+        /// this frame, which the C conses in front of every frame that call completed
+        /// (`deliver_read_message`, `erts/emulator/beam/io.c:3416-3428`) — so a
+        /// `driver_output2("HDR",3,"a\nb\n",4)` yields two frames, each carrying `"HDR"`. Empty
+        /// for a plain (header-less) read and for the end-of-file flush.
+        header: Vec<u8>,
         /// The frame's content bytes (its terminator is not included; empty for a blank line).
         bytes: Vec<u8>,
         /// Whether the frame was newline-terminated (`eol`) or not (`noeol`).
@@ -1685,15 +1672,21 @@ impl PortRegistry {
                 // queued) has no recipient and is dropped — the rule the raw `Data` arm
                 // below follows too.
                 if let Some(meta) = self.meta.get(&frame.port.number()) {
-                    // Framed bytes are **input** for `erlang:statistics(io)`, counted where
-                    // they really arrive; a blank line contributes zero bytes, exactly as
-                    // the C's per-read accounting does.
+                    // A frame's **content** bytes are **input** for
+                    // `erlang:statistics(io)`, counted where they really arrive; a blank line
+                    // contributes zero bytes, exactly as the C's per-read accounting does.
+                    //
+                    // The frame's derived **header prefix** is not charged here: the C counts
+                    // `hlen` once per `driver_output*` call, while [`beam_io`] stamps that call's
+                    // header on **every** frame it produced, so charging it per frame would
+                    // multiply it by the frame count.
                     self.io_counters.note_input(frame.bytes.len());
                     // ...and for this port's own `port_info(Port, input)`.
                     meta.input
                         .set(meta.input.get().saturating_add(frame.bytes.len() as u64));
                     events.push(PortEvent::Line {
                         port: frame.port,
+                        header: frame.header,
                         bytes: frame.bytes,
                         eol: frame.eol,
                         stream: meta.stream,
@@ -1750,13 +1743,14 @@ impl PortRegistry {
                 meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
                 events.push(PortEvent::Data {
                     port,
-                    bytes,
-                    stream: meta.stream,
                     // A `dlopen`ed driver's bytes come from its own `output` callback through the
-                    // driver's input queue, and the `beam_abi` host seam does not record **which**
-                    // `driver_output*` entry point it called — so a `.so` driver's payload is
-                    // indistinguishable from `driver_output`'s header-less form, which is a binary
-                    // on a `binary` port. Deliberately unchanged: it is what its corpus cases pin.
+                    // port's **input queue**, which [`beam_io`]'s `Port::drain_input` hands over as
+                    // one flat byte sequence — the `beam_abi` host seam records neither **which**
+                    // `driver_output*` entry point the `.so` called nor its header/data split — so
+                    // the read is body-only and renders the stream's own shape (a binary on a
+                    // `binary` port). Deliberately unchanged: it is what its corpus cases pin.
+                    read: ReadMessage::body_only(bytes),
+                    stream: meta.stream,
                     shape: StreamShape::Data,
                     owner: meta.owner,
                 });
@@ -1799,23 +1793,32 @@ impl PortRegistry {
         for notification in notifications {
             match notification {
                 PortNotification::Data { port, read } => {
-                    let bytes = read.flattened();
-                    if bytes.is_empty() {
+                    // A read of **nothing** is no message at all (a driver read that returned no
+                    // header and no byte), unlike an empty *line* frame. `ReadMessage::is_empty`
+                    // is the C's `hlen == 0 && len == 0`, and it keeps `body: None` (a `NULL`
+                    // body, which renders the proper header list) distinct from a present-but-
+                    // empty one (the `[H1..Hh|<<>>]` binary tail).
+                    if read.is_empty() {
                         continue;
                     }
                     // A `{packet, N}` port reassembles the child's stream into whole packets: the
-                    // bytes are fed to the port's own framer and **one** message is produced per
-                    // completed packet (see [`packet`]). This is the C's `ready_input` packet arm
-                    // (`sys_drivers.c:1393-1447`), including its two edge cases: a packet split
-                    // across several reads is buffered until it completes, and a **zero-length**
-                    // packet is a real `{Port,{data,<<>>}}` message (which is why the empty-payload
-                    // drop above is checked before this arm and not inside it).
+                    // read's flat byte sequence is fed to the port's own framer and **one**
+                    // message is produced per completed packet (see [`packet`]). This is the C's
+                    // `ready_input` packet arm (`sys_drivers.c:1393-1447`), including its two edge
+                    // cases: a packet split across several reads is buffered until it completes,
+                    // and a **zero-length** packet is a real `{Port,{data,<<>>}}` message (which is
+                    // why the empty-read drop above is checked before this arm and not inside it).
+                    //
+                    // The framer is a **byte stream**, so it consumes `flattened()` — for this
+                    // family the read is body-only anyway, because a `{packet, N}` port is opened
+                    // on a child (the spawn/spawn_executable/fd family), never on a driver.
                     let framed = {
                         let mut framed = None;
                         if let Some(meta) = self.meta.get_mut(&port.number()) {
                             if let Some(framing) = meta.packet.as_mut() {
                                 // The framer's refusal (a buffer that cannot grow) is the C's
                                 // `ENOMEM` port death; it is reported, never papered over.
+                                let bytes = read.flattened();
                                 framed = Some((framing.push(&bytes)?, meta.stream, meta.owner));
                             }
                         }
@@ -1824,9 +1827,10 @@ impl PortRegistry {
                     if let Some((packets, stream, owner)) = framed {
                         for payload in packets {
                             // A framed payload is **input** for `erlang:statistics(io)` and for
-                            // this port's own `port_info(Port, input)`, and the header is not
-                            // counted — the oracle reports the delivered bytes (measured: 3 for a
-                            // 7-byte `{packet,4}` wire packet, and 0 for an empty one).
+                            // this port's own `port_info(Port, input)`, and the packet's length
+                            // header is not counted — the oracle reports the delivered bytes
+                            // (measured: 3 for a 7-byte `{packet,4}` wire packet, and 0 for an
+                            // empty one).
                             self.io_counters.note_input(payload.len());
                             if let Some(meta) = self.meta.get(&port.number()) {
                                 meta.input
@@ -1834,10 +1838,10 @@ impl PortRegistry {
                             }
                             events.push(PortEvent::Data {
                                 port,
-                                bytes: payload,
+                                // A reassembled packet is a bare payload: the framing is the
+                                // emulator's ([`packet`]), never a driver's header/body pair.
+                                read: ReadMessage::body_only(payload),
                                 stream,
-                                // A framed payload is the child's own byte stream (the framing is
-                                // the emulator's, [`packet`]), never a driver reply.
                                 shape: StreamShape::Data,
                                 owner,
                             });
@@ -1845,16 +1849,17 @@ impl PortRegistry {
                         continue;
                     }
                     if let Some(meta) = self.meta.get(&port.number()) {
-                        // Bytes a port produced are **input** for `erlang:statistics(io)`,
-                        // counted where they really arrive.
-                        self.io_counters.note_input(bytes.len());
+                        // The read's bytes are **input** for `erlang:statistics(io)`, counted
+                        // where they really arrive — the header included, the C's
+                        // `bytes_in += (hlen + len)` (`io.c:6400`).
+                        self.io_counters.note_input(read.len());
                         // ...and for this port's own `port_info(Port, input)`.
-                        meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
-                        // A **built-in** driver port's bytes are an in-tree driver's reply, and the
-                        // C renders a driver output call's header as list elements on either
-                        // stream — see [`StreamShape::DriverOutput`]. Everything else on this
-                        // round is a byte stream's own payload (a child's stdout, an `fd` port),
-                        // which keeps the stream option's shape.
+                        meta.input.set(meta.input.get().saturating_add(read.len() as u64));
+                        // A **built-in** driver port's bytes are an in-tree driver's reply, handed
+                        // up through a flat byte queue that carries no split, so the C's header
+                        // rendering applies — see [`StreamShape::DriverOutput`]. Everything else on
+                        // this round is a byte stream's own payload (a child's stdout, an `fd`
+                        // port), whose read carries its own (empty) split.
                         let shape = match meta.kind {
                             PortName::SpawnDriverBuiltin => StreamShape::DriverOutput,
                             PortName::SpawnDriver | PortName::Spawn | PortName::SpawnExecutable
@@ -1862,7 +1867,7 @@ impl PortRegistry {
                         };
                         events.push(PortEvent::Data {
                             port,
-                            bytes,
+                            read,
                             stream: meta.stream,
                             shape,
                             owner: meta.owner,
@@ -3159,19 +3164,21 @@ impl Runtime {
                 match &event {
                     PortEvent::Data {
                         port,
-                        bytes,
+                        read,
                         stream,
                         shape,
                         owner,
                     } => (
                         *owner,
                         port.to_eterm(),
-                        ctx.port_data_message_shaped(*port, bytes, *stream, *shape)?,
+                        ctx.port_data_message_shaped(*port, read, *stream, *shape)?,
                     ),
                     // A line-framed read is the same `{Port, {data, …}}` delivery with the
-                    // `{eol|noeol, Data}` body the `line` option selects.
+                    // `{eol|noeol, Data}` body the `line` option selects, and the producing read's
+                    // header as its cons prefix.
                     PortEvent::Line {
                         port,
+                        header,
                         bytes,
                         eol,
                         stream,
@@ -3179,7 +3186,7 @@ impl Runtime {
                     } => (
                         *owner,
                         port.to_eterm(),
-                        ctx.port_line_message(*port, bytes, *eol, *stream)?,
+                        ctx.port_line_message(*port, header, bytes, *eol, *stream)?,
                     ),
                     PortEvent::Exited { port, status, owner } => (
                         *owner,
@@ -3287,20 +3294,21 @@ impl RuntimeContext<'_> {
             match event {
                 PortEvent::Data {
                     port,
-                    bytes,
+                    read,
                     stream,
                     shape,
                     ..
-                } => messages.push(self.port_data_message_shaped(port, &bytes, stream, shape)?),
+                } => messages.push(self.port_data_message_shaped(port, &read, stream, shape)?),
                 // The `line` option's framed shape (see [`PortEvent::Line`]); the evaluator is
                 // the port's owner on this path, so the message is its own.
                 PortEvent::Line {
                     port,
+                    header,
                     bytes,
                     eol,
                     stream,
                     ..
-                } => messages.push(self.port_line_message(port, &bytes, eol, stream)?),
+                } => messages.push(self.port_line_message(port, &header, &bytes, eol, stream)?),
                 PortEvent::Exited { port, status, .. } => {
                     messages.push(self.port_exit_message(port, status)?)
                 }
@@ -3357,12 +3365,16 @@ impl RuntimeContext<'_> {
 
     /// The `{Port, {data, Data}}` message of one port-stream read.
     ///
-    /// `Data` is an Erlang **binary** for a header-less read on a `binary` stream and a char list
-    /// otherwise (the `list` default, `erl`'s own). A driver output call that carried a header
-    /// renders the C's `[H1..Hh | <<Data>>]` shapes instead, which is what
-    /// [`Self::port_data_message_shaped`] is for; this entry point is the split-less form
-    /// ([`StreamShape::Data`]). The `data` atom is interned into the runtime's one shared table,
-    /// so the message is nameable by the printer and matchable by a `receive` clause.
+    /// `Data` is rendered from the read's own `hbuf`/`buf` split ([`ReadMessage`]'s table) and the
+    /// port's stream option: a bare **binary** for a header-less read on a `binary` stream
+    /// (anything else — the `list` default, `erl`'s own — is a char list), the improper
+    /// `[H1..Hh|<<Data>>]` for a call that carried both halves, and the proper `[H1..Hh]` for one
+    /// that carried no body. This entry point is the header-less convenience: a read of nothing but
+    /// a body, which is what a child's byte stream is. [`Self::port_data_message_shaped`] is the
+    /// full form — it also carries the producer rule ([`StreamShape`]) — and is what both delivery
+    /// routes render a [`PortEvent::Data`] through. The `data` atom is interned into the runtime's
+    /// one shared table, so the message is nameable by the printer and matchable by a `receive`
+    /// clause.
     ///
     /// # The binary stream has no width limit
     ///
@@ -3382,8 +3394,8 @@ impl RuntimeContext<'_> {
     /// term the engine arena cannot express — so a delivered message stays valid for the
     /// runtime's lifetime.
     // Both delivery routes render every [`PortEvent::Data`] through
-    // [`Self::port_data_message_shaped`] with the event's own shape; this stays as the split-less
-    // convenience the provider's own suite builds plain byte-stream messages with.
+    // [`Self::port_data_message_shaped`] with the event's own read and shape; this stays as the
+    // header-less convenience the provider's own suite builds plain byte-stream messages with.
     #[allow(dead_code)]
     pub(crate) fn port_data_message(
         &mut self,
@@ -3391,18 +3403,23 @@ impl RuntimeContext<'_> {
         bytes: &[u8],
         stream: StreamType,
     ) -> Result<Eterm> {
-        self.port_data_message_shaped(port, bytes, stream, StreamShape::Data)
+        self.port_data_message_shaped(
+            port,
+            &ReadMessage::body_only(bytes.to_vec()),
+            stream,
+            StreamShape::Data,
+        )
     }
 
-    /// [`Self::port_data_message`] for a driver output call whose **split** is known (or known to
-    /// be unknown).
+    /// [`Self::port_data_message`] with the read's own split and its producer's rendering rule.
     ///
-    /// `shape` is the [`StreamShape`] of the call that produced `bytes`; see that type for the
-    /// C's four output entry points and the term each one renders. The `list` stream ignores it
-    /// (header and data are both list elements there), so this only changes a `binary` port. Both
-    /// delivery routes render a [`PortEvent::Data`] through this entry point with the event's own
-    /// `shape`, so a built-in driver port's replies ([`StreamShape::DriverOutput`]) and a child's
-    /// byte stream ([`StreamShape::Data`]) reach an owner as the C's own terms.
+    /// `read` is one `driver_output*` call's bytes with the C's header/body split intact, and
+    /// `shape` is the [`StreamShape`] of the producer that handed it up; see those two types for
+    /// the C's terms and for the one fact a read cannot carry. The `list` stream ignores the split
+    /// (header and data are both list elements there), so the two only ever change a `binary` port.
+    /// Both delivery routes render a [`PortEvent::Data`] through this entry point with the event's
+    /// own `read`/`shape`, so a driver's `[H1..Hh|<<Data>>]`, a built-in driver port's header list
+    /// and a child's bare binary all reach an owner as the C's own terms.
     ///
     /// # Errors
     ///
@@ -3410,12 +3427,12 @@ impl RuntimeContext<'_> {
     pub(crate) fn port_data_message_shaped(
         &mut self,
         port: PortId,
-        bytes: &[u8],
+        read: &ReadMessage,
         stream: StreamType,
         shape: StreamShape,
     ) -> Result<Eterm> {
         let data = make_atom(self.runtime.code_server.atoms_mut().intern("data"));
-        let payload = self.make_stream_payload(bytes, stream, shape)?;
+        let payload = self.make_stream_payload(read, stream, shape)?;
         let inner = terms::make_tuple(self, &[data, payload])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
     }
@@ -3427,10 +3444,15 @@ impl RuntimeContext<'_> {
     /// `{eol|noeol, Data}` wrapper (`io.c:3430-3435`) and hands it to the port's connected
     /// process as the `{Port, {data, …}}` body. `eol` (the atom `eol`) means the frame was
     /// newline-terminated; `noeol` means a length-limited `{line, N}` chunk or the trailing
-    /// partial line released at end-of-stream. `Data` is shaped by `stream` exactly as
-    /// [`Self::port_data_message`] shapes an unframed read — the split-less [`StreamShape::Data`]
-    /// form, because a frame's bytes come from [`beam_io`]'s line accumulator rather than from one
-    /// driver output call (see [`StreamShape`]).
+    /// partial line released at end-of-stream.
+    ///
+    /// `Data` is built exactly as a raw read's payload is, because that is literally what the C
+    /// does: `deliver_linebuf_message` calls `deliver_read_message` with the frame's bytes as the
+    /// **body** (`io.c:3464`) — which it always is, present even when empty, so a blank line is the
+    /// oracle's `{eol,<<>>}` on a `binary` port — and **conses `header`** in front of it
+    /// (`io.c:3416-3428`), so `driver_output2("HDR",3,"a\nb\n",4)` yields two frames, each
+    /// `{eol,[72,68,82|<<"a">>]}`. An end-of-file flush and a plain (header-less) read stamp an
+    /// empty header.
     ///
     /// Unlike the unframed builder this one is reachable with an **empty** `bytes`: a blank
     /// line is the oracle's `{Port, {data, {eol, []}}}` (and an empty `noeol` frame is
@@ -3438,9 +3460,14 @@ impl RuntimeContext<'_> {
     /// The `data`/`eol`/`noeol` atoms are interned into the runtime's **one shared** table, so
     /// the message is nameable by the printer and matchable by a `receive` clause, and it is
     /// built on the same pointer-stable `-eval` arena as the unframed builder.
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the term does not fit.
     pub(crate) fn port_line_message(
         &mut self,
         port: PortId,
+        header: &[u8],
         bytes: &[u8],
         eol: bool,
         stream: StreamType,
@@ -3450,31 +3477,42 @@ impl RuntimeContext<'_> {
             let atoms = self.runtime.code_server.atoms_mut();
             (make_atom(atoms.intern("data")), make_atom(atoms.intern(tag)))
         };
-        let payload = self.make_stream_payload(bytes, stream, StreamShape::Data)?;
+        // The frame is a read whose body is the frame's bytes and whose header is the producing
+        // read's prefix — the C's own shape (`deliver_linebuf_message` → `deliver_read_message`).
+        let frame = ReadMessage {
+            header: header.to_vec(),
+            body: Some(bytes.to_vec()),
+        };
+        let payload = self.make_stream_payload(&frame, stream, StreamShape::Data)?;
         let framed = terms::make_tuple(self, &[tag, payload])?;
         let inner = terms::make_tuple(self, &[data, framed])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
     }
 
-    /// The `Data` **payload** of a port-stream message, shaped by the port's stream option and by
-    /// the driver output call that produced the bytes.
+    /// The `Data` **payload** of a port-stream message, shaped by the port's stream option, the
+    /// read's own header/body split and the producer rule `shape`.
     ///
     /// Shared by [`Self::port_data_message_shaped`] and [`Self::port_line_message`] so the message
-    /// shapes can never drift. The legacy C renders every delivered chunk in two parts — the
+    /// shapes can never drift. The legacy C renders every delivered read in two parts — the
     /// driver's **header** bytes as list elements and its **data** bytes as the stream asks
     /// (`deliver_read_message`, `erts/emulator/beam/io.c:3404-3435`, and `deliver_vec_message`,
     /// `:3559-3617`) — so:
     ///
     /// * a `list` stream is a char list of **all** the bytes, whatever the split;
-    /// * a `binary` stream is a bare binary for a header-less call ([`StreamShape::Data`]) — built
-    ///   by [`beam_codec::term::make_binary`], see [`Self::port_data_message`] on the width;
-    /// * a `binary` stream is a **proper list** of the byte integers for a header-only call
-    ///   ([`StreamShape::Header`]: `driver_output2(hbuf, hlen, NULL, 0)`, what a `ram_file_drv`
-    ///   `OK`/`NUMBER`/`ERROR` reply makes) and for a **built-in driver port**'s payload
-    ///   ([`StreamShape::DriverOutput`], whose split the seam does not carry — see that variant);
-    /// * a `binary` stream is the **improper** list `[H1..Hh | <<Data>>]` for a header-plus-data
-    ///   call ([`StreamShape::HeaderThenData`]), an empty data part rendering `[...|<<>>]` (a
-    ///   zero-length `DATA` reply, i.e. a read at end-of-file).
+    /// * a `binary` stream is a bare binary when the read carried a body and no header
+    ///   (`driver_output`, built by [`beam_codec::term::make_binary`] — see
+    ///   [`Self::port_data_message`] on the width);
+    /// * a `binary` stream is a **proper list** of the byte integers when the read carried a header
+    ///   and **no** body ([`ReadMessage::body`] is `None`, the C's `NULL` `buf`:
+    ///   `driver_output2(hbuf, hlen, NULL, 0)`, what a `ram_file_drv` `OK`/`NUMBER`/`ERROR` reply
+    ///   makes);
+    /// * a `binary` stream is the **improper** list `[H1..Hh | <<Data>>]` when the read carried
+    ///   both halves, an empty body rendering `[...|<<>>]` (a zero-length `DATA` reply, i.e. a read
+    ///   at end-of-file) — and a read of nothing at all the empty proper list `[]`;
+    /// * a **built-in driver port**'s **header-less** read ([`StreamShape::DriverOutput`]) is list
+    ///   elements on **either** stream — the C's header rendering, and the one shape the producer's
+    ///   flat byte queue cannot carry. A read that does carry a header keeps its own split (see
+    ///   that variant).
     ///
     /// Every block is allocated on the runtime's pointer-stable `-eval` arena.
     ///
@@ -3483,26 +3521,27 @@ impl RuntimeContext<'_> {
     /// The arena's allocation failure when the term does not fit.
     fn make_stream_payload(
         &mut self,
-        bytes: &[u8],
+        read: &ReadMessage,
         stream: StreamType,
         shape: StreamShape,
     ) -> Result<Eterm> {
-        if stream == StreamType::List || shape == StreamShape::DriverOutput {
+        if stream == StreamType::List
+            || (shape == StreamShape::DriverOutput && read.header.is_empty())
+        {
             // The header is list elements too, so the split is invisible on this stream — and a
-            // built-in driver port's payload is rendered as the C's header half on **either**
-            // stream, its split being unknown (see [`StreamShape::DriverOutput`]).
-            return self.bytes_to_list(bytes, NIL);
+            // built-in driver port's flat, header-less payload is rendered as the C's header half
+            // on **either** stream (see [`StreamShape::DriverOutput`]).
+            return self.bytes_to_list(&read.flattened(), NIL);
         }
-        let (header, data) = shape.split(bytes);
-        match data {
-            // No data part: the whole reply is the (already-complete) header list.
-            None => self.bytes_to_list(header, NIL),
-            // Otherwise the data part is the term's tail — a binary, empty or not — and the
-            // header bytes are consed in front of it (an empty header leaves the binary bare,
-            // the header-less `driver_output` shape).
-            Some(data) => {
-                let tail = beam_codec::term::make_binary(self.eval_heap(), data)?;
-                self.bytes_to_list(header, tail)
+        match read.body.as_deref() {
+            // No body part at all: the whole read is the (already-complete) header list.
+            None => self.bytes_to_list(&read.header, NIL),
+            // Otherwise the body is the term's tail — a binary, empty or not — and the header
+            // bytes are consed in front of it (an empty header leaves the binary bare, the
+            // header-less `driver_output` shape).
+            Some(body) => {
+                let tail = beam_codec::term::make_binary(self.eval_heap(), body)?;
+                self.bytes_to_list(&read.header, tail)
             }
         }
     }

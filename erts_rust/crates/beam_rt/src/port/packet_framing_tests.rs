@@ -74,9 +74,11 @@ fn packets(fx: &mut Fixture, port: PortId, bound: Duration) -> Vec<Vec<u8>> {
         let mut saw_exit = false;
         for event in events {
             match event {
-                PortEvent::Data { port: from, bytes, .. } => {
+                PortEvent::Data { port: from, read, .. } => {
                     assert_eq!(from, port, "a message from a foreign port");
-                    out.push(bytes);
+                    // A reassembled packet is a header-less, body-only read (the framing is the
+                    // emulator's), so its flat view is the packet's payload.
+                    out.push(read.flattened());
                 }
                 PortEvent::Exited { .. } => saw_exit = true,
                 _ => {}
@@ -407,8 +409,10 @@ fn a_driver_port_keeps_its_packet_option_for_the_driver() {
         let deadline = Instant::now() + Duration::from_secs(5);
         while reply.is_empty() && Instant::now() < deadline {
             for event in registry.pump(Duration::from_millis(50)).expect("pump") {
-                if let PortEvent::Data { bytes, .. } = event {
-                    reply = bytes;
+                if let PortEvent::Data { read, .. } = event {
+                    // A driver port carries no framing (`PortMeta::packet` is `None`: the option
+                    // belongs to its driver), so this is the driver's own reply, header-less.
+                    reply = read.flattened();
                 }
             }
         }
