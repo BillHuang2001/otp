@@ -257,6 +257,22 @@ pub(crate) fn is_bad_object_module_name(error: &BeamError) -> bool {
 /// one undef constructor, never a second one — and leaves **every** other load failure exactly
 /// as it is (the not-found case is already `undef` from
 /// [`CodeServer::not_found`](crate::CodeServer), a malformed image keeps its own diagnostic).
+///
+/// # The call-like routes this classifier owns
+///
+/// Every site that **enters** a `Module:Function/Arity` rather than *returning* a load result
+/// funnels its load failure through here:
+///
+/// * the in-machine external call (`RuntimeContext::call_bif_routed`, which the compiled
+///   `call_ext` route and the `-eval` tree-walker's call both reach);
+/// * the `-s`/`-run` action ([`Runtime::run_named`](crate::Runtime::run_named)) — the oracle
+///   resolves those as boot-time `{apply, M, F, A}` instructions, and measured, both the
+///   mismatched and the absent row exit **1** with empty stdout (the crash-dump slogan naming
+///   the reason `undef` in both);
+/// * an export **spawn** ([`Runtime::resolve_export_entry`](crate::Runtime), the
+///   `spawn`/`spawn_link`/`spawn_opt` `M:F/A` entry resolution), where the oracle's own child
+///   exit reason is `{undef,[{M,F,Args,[]}]}` — the same atom (that method documents the
+///   residual: the oracle spawns and the child dies, this runtime raises at the spawn).
 pub(crate) fn call_load_failure(error: BeamError) -> BeamError {
     if is_bad_object_module_name(&error) {
         undef()

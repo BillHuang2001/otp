@@ -2215,9 +2215,26 @@ impl Runtime {
     /// This is what `-s`/`-run` use: the module is resolved through the code path
     /// (including the system library directories), not from a file argument.
     ///
+    /// # The reason term of a failed load
+    ///
+    /// `-s`/`-run` is a **call-like** route (the oracle resolves it as a boot-time
+    /// `{apply, M, F, A}`), so a load failure is classified exactly as an in-machine external
+    /// call's is ([`crate::error::call_load_failure`]): a `<name>.beam` whose object code names
+    /// another module raises the **bare `error:undef`**, never the loader's
+    /// `module name in object code is …` diagnostic (which only the `code:*` routes see, folding
+    /// it into `badfile`). Measured on OTP 29.1.1 / erts-17.1 with a `-pa` directory holding a
+    /// `mismatch.beam` that really holds `mymod`: `erl -noshell -pa DIR -s mismatch id 7` exits
+    /// **1** with empty stdout, and so does `-s nosuchmod_xyz id` — the two rows are
+    /// indistinguishable, and the node's crash-dump slogan names the reason `undef`
+    /// (`{undef,[{init,start_it,1,[]},…]}`) in both, as it does for a corrupt image
+    /// (`-s bogus f`). Only the expected-name refusal is remapped here; every other load
+    /// failure keeps whatever reason it already had (`undef` for a corrupt image on this
+    /// runtime's loader path too, which is the same row).
+    ///
     /// # Errors
     ///
-    /// The code server's not-found diagnostic, plus any error the running code raises.
+    /// The code server's not-found diagnostic, [`crate::error::undef`] for a found-but-mismatched
+    /// image (see above), plus any error the running code raises.
     ///
     /// The export runs under the [`RootAction::Module`] **root execution frame**, so a
     /// `process_info(self(), …)` inside it answers the items that root action sources (see
@@ -2239,7 +2256,13 @@ impl Runtime {
         // on first use, so `-s lists …` reaches the real stdlib. A miss here is not
         // fatal: `CodeServer::load` below reports it, naming every directory searched.
         let _ = self.find_module_file(module);
-        let loaded = self.code_server.load(module)?;
+        // A **call-like** route: a found-but-refused image is the bare `error:undef` here too
+        // (the very classifier the in-machine call site uses — see
+        // `error::call_load_failure` and this method's "reason term" section).
+        let loaded = self
+            .code_server
+            .load(module)
+            .map_err(error::call_load_failure)?;
         self.as_action_process(|runtime| {
             let previous = runtime.enter_root_action(RootAction::Module);
             let result = {
@@ -2269,7 +2292,9 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// * the code server's not-found/malformed diagnostic for `module`;
+    /// * the code server's not-found/malformed diagnostic for `module`, and the bare
+    ///   [`crate::error::undef`] for a found-but-mismatched image (the call-site classifier —
+    ///   see [`Runtime::resolve_export_entry`]);
     /// * [`crate::error::undef`] (class `error`, bare reason atom `undef`) when
     ///   `function/arity` is not exported by it — the same raise
     ///   `RuntimeContext::run_export` produces for a call the release does not have
@@ -2391,9 +2416,33 @@ impl Runtime {
     /// [`RuntimeContext::spawn_in_pass`](crate::context::RuntimeContext); the caller owns the
     /// child's pid allocation).
     ///
+    /// # The reason term of a failed load, and the residual
+    ///
+    /// The load failure is classified exactly as an in-machine external call's is
+    /// ([`crate::error::call_load_failure`]): a `<module>.beam` whose object code names another
+    /// module raises the **bare `error:undef`**, the same reason a module with no file at all
+    /// gets, never the loader's `module name in object code is …` diagnostic.
+    ///
+    /// The **residual** is *where* that raise surfaces: this runtime resolves the entry point
+    /// **eagerly**, at the spawn, so the raise reaches the spawning process. The oracle's
+    /// `spawn(M, F, A)` does no loading at spawn time — it spawns and the child applies the MFA,
+    /// so the spawn **succeeds** and the child dies with `{undef,[{M,F,Args,[]}]}` (measured on
+    /// OTP 29.1.1 / erts-17.1: `spawn(mismatch,id,[7])` ⇒ `true` printed, exit 0, the node's
+    /// `beam_load.c` report on stdout; `spawn_monitor(mismatch,id,[7])` ⇒
+    /// `'DOWN' … {undef,[{mismatch,id,[7],[]}]}`). Reproducing that needs two pieces this
+    /// runtime does not have: a **lazily resolved** export entry (a dead-on-arrival child that
+    /// resolves its module at its first slice) and the ERTS **error-class exit reason** — the
+    /// `{Reason, Stacktrace}` pair an uncaught `error`/`exit` gives a terminating process, where
+    /// the runner's exit-reason translation (`src/runner/reason.rs`) can only name the atom
+    /// today. It is
+    /// therefore a documented typed gap, not a fabricated agreement. The same eager resolution
+    /// is what makes `spawn(mymod, nosuchfun, [])` raise here where the oracle spawns and the
+    /// child dies.
+    ///
     /// # Errors
     ///
-    /// * the code server's not-found/malformed diagnostic for `module`;
+    /// * the code server's not-found/malformed diagnostic for `module`, mapped to
+    ///   [`crate::error::undef`] for a found-but-mismatched image (see above);
     /// * [`crate::error::undef`] (class `error`, bare reason atom `undef`) when
     ///   `function/arity` is not exported by it.
     pub(crate) fn resolve_export_entry(
@@ -2410,7 +2459,10 @@ impl Runtime {
         if self.code_server.module(module).is_none() {
             let _ = self.find_module_file(module);
         }
-        let loaded = self.code_server.load(module)?;
+        let loaded = self
+            .code_server
+            .load(module)
+            .map_err(error::call_load_failure)?;
         let function_atom = loaded
             .atom_table
             .lookup(function)
