@@ -264,6 +264,43 @@ so `gen_server:loop_hibernate/4` (`lib/stdlib/src/gen_server.erl:2338`) does not
   `whereis(application_controller)` is a live pid after the last directive. The detail is in
   [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
 
+### Kernel start performs a real native hostname lookup — and every zero-slice drive step pays 25 ms once it has
+Directive **18** (`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`) starts the
+`kernel` application, so `kernel_sup` starts its `inet_db` child (`lib/kernel/src/kernel.erl:211-216`):
+`inet_db:start_link/0` runs `inet_config:init/0` before it answers (`lib/kernel/src/inet_db.erl:121-123`),
+which
+- opens a real UDP socket — `set_hostname/0` → `inet_udp:open(0,[])`
+  (`lib/kernel/src/inet_config.erl:223-231`) — i.e. a `{spawn_driver,"udp_inet"}` port driven through the
+  numeric `INET_REQ_OPEN`/`INET_REQ_GETHOSTNAME` control verbs, and closes it again after
+  `prim_inet:gethostname/1` (`lib/kernel/src/inet.erl:2487`, `erts/preloaded/src/prim_inet.erl:1435-1436`);
+- then, when that short hostname carries no dot (so `inet_db:res_option(domain)` is `""`), `init/0`
+  takes the Linux branch (`inet_config.erl:110-132`) and calls `inet:gethostbyname/1` → the `[native]`
+  lookup backend → `inet_gethost_native:getit/2` (`lib/kernel/src/inet_gethost_native.erl:514-578`),
+  which starts the helper **port program** `<bindir>/erts-17.1/bin/inet_gethost` with
+  `open_port({spawn_executable, Prog}, [overlapped_io,{args,["4"]},{packet,4},eof,binary])`
+  (`:413-429`) and sends the framed request via `port_command`; the answer arrives as
+  `{Port,{data,<<RID:32,Bin>>}}` in the module's `server_init/2` loop.
+  A hostname that *does* carry a dot sets a non-empty `domain`, so the lookup — the helper process and
+  `inet_gethost_native.beam` with it — does not happen at all; the same holds when `inet_udp:open/2`
+  answers an error tuple, because `set_hostname/0` then lands on its `_` arm (`:229-230`) and the hostname
+  becomes `"nohost"` with domain `"nodomain"`.
+- Consequence for the boot drive: **that child is never reaped and never closed**
+  (`inet_gethost_native` passes no `exit_status`, so no round polls or reaps it — see
+  [`../port/CONTEXT.md`](../port/CONTEXT.md)), so from directive 18 on the runtime holds a live, idle
+  port and `PortRegistry::has_nothing_to_poll` never answers `true` again. Every scheduler pass that
+  runs **zero** slices therefore blocks one full `PORT_POLL_SLICE` (25 ms) in the port poll —
+  `../runtime/scheduler.rs:791-804` → `../runtime/scheduler.rs:894` → `../port.rs:1716` (poll at
+  `../port.rs:1775`) — independently of the drive's `TimerWait::ImminentWithin` policy.
+  `apply_boot_call` ends **each** `RunOutcome::Wait` with a terminating `pump_scheduler_boot == 0` step
+  (`drive.rs:397-412` → [`drive_scheduler`] at `:299-314`), and directives 18/19/20 make 2 + 2 + 1 waits
+  (`application_controller:start_boot_application/2` = `application:load` + `start_application`,
+  `lib/kernel/src/application_controller.erl:271-284`; directive 20's `c:erlangrc/0` file-server call),
+  so a bare `-noshell -eval 'halt().'` boot pays **five** such steps ≈ 125 ms of pure polling latency
+  after the lookup — a cost the pre-lookup boot does not have. The `-eval` action itself adds no pass
+  (`erlang:halt` returns the halt through the native floor, no trailing pump).
+  A drive step's port poll is never elided by "nothing else is runnable": `has_nothing_to_poll` is false
+  for the life of any open port, which is what an idle helper child is.
+
 ### The completion-asserting tests (all pass)
 The three `cargo test --lib boot::` tests (`the_real_start_boot_executes_every_directive_to_progress_started`,
 `the_real_start_boot_completes_through_execute_reporting`, `the_real_boot_registers_a_live_logger_process`)
