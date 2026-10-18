@@ -1227,7 +1227,8 @@ impl<'a> RuntimeContext<'a> {
                 self.copy_out_hint = self.copy_out_hint.max(needed);
                 needed
             }
-        };        // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
+        };
+        // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
         // and moves no live term, so the copy can simply be re-attempted from the fresh space's
         // base.
         //
