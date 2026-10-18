@@ -373,9 +373,9 @@ fn a_selected_descriptor_routes_input_through_ready_input() {
 /// `drive_async` is called, and once the completion is observed the worker has finished, so the
 /// port keeps working.
 ///
-/// The fixture's entry leaves `ready_async` **and** `async_free` `NULL`, so the observable result
-/// of the drive point is that the job is drained and reported as processed rather than that a
-/// callback runs.
+/// The number of `Data` frames the job owes on its own is **not** fixed — see the comment at the
+/// drain site below — so the sequence is asserted, not the count: the port's own echo is the last
+/// frame and every frame before it is one of the job's ([`is_async_job_frame`]).
 #[test]
 fn an_async_job_is_scheduled_and_its_completion_is_driven() {
     let Some(so) = fixture_so() else {
@@ -410,18 +410,73 @@ fn an_async_job_is_scheduled_and_its_completion_is_driven() {
         "the driver_async job completed but its completion was never drained by `drive_async`"
     );
 
-    // The completion proved the worker finished; drop whatever the worker's driver_output left
-    // (Milestone-1 has no installed port context on a worker thread, so it may be nothing at all),
-    // then prove the port still moves data.
-    let _drained = round_data(&mut poller, &mut registry, id);
-    registry
+    // Drop whatever the job's own callbacks left — **however many frames that is**. The job emits
+    // `"A"` from its worker thread and `"H"` from the entry's `ready_async` on the port thread
+    // (`tests/fixtures/host_driver.c`), and a worker-thread `driver_output` is an *asynchronous*
+    // delivery: in the C the call takes the port lock and delivers to the connected owner whatever
+    // thread made it (one `{Port, {data, _}}` per call, `erts/emulator/beam/io.c:6387-6446`), so it
+    // is ordered against this thread's own callbacks by nothing at all. The frame *count* here is
+    // therefore not a property of the driver — only "each call is one frame" is — which is why this
+    // site drains instead of demanding exactly one.
+    let drained = drain_data(&mut poller, &mut registry, id);
+    for frame in &drained {
+        assert!(
+            is_async_job_frame(frame),
+            "only the async job's own frames may be owed before the port's next echo, got {frame:?} \
+             (all of them: {drained:?})"
+        );
+    }
+    for payload in ASYNC_JOB_FRAMES {
+        assert!(
+            drained
+                .iter()
+                .filter(|frame| frame.as_slice() == payload)
+                .count()
+                <= 1,
+            "the job hands each of its frames up at most once — one driver_output* call is one \
+             message, never a duplicated one; the port reported {drained:?}"
+        );
+    }
+    let written = registry
         .output(&mut poller, id, b"still-alive")
         .expect("the driver's output callback still runs");
     assert_eq!(
-        round_data(&mut poller, &mut registry, id).expect("the port still moves data"),
-        b"still-alive".to_vec(),
-        "the port keeps working after an async job"
+        written,
+        b"still-alive".len(),
+        "the driver consumes the whole output buffer"
     );
+
+    // The port still moves data: its echo closes the sequence, and anything the async job still owed
+    // precedes it (call order is preserved — the C delivers in call order, so a job frame can never
+    // arrive *after* a later call's). Exactly one echo: one `driver_output*` call, one message.
+    let frames = await_trailing_data(
+        &mut poller,
+        &mut registry,
+        id,
+        b"still-alive",
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        frames.last().map(Vec::as_slice),
+        Some(b"still-alive".as_slice()),
+        "the port keeps working after an async job; the round reported {frames:?}"
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.as_slice() == b"still-alive")
+            .count(),
+        1,
+        "the port echoes the command exactly once — one driver_output* call is one message, never \
+         a coalesced or duplicated one; the rounds reported {frames:?}"
+    );
+    for frame in &frames[..frames.len() - 1] {
+        assert!(
+            is_async_job_frame(frame),
+            "every frame before the port's echo must be the async job's own, got {frame:?} \
+             (all of them: {frames:?})"
+        );
+    }
 
     registry.close(&mut poller, id).expect("the port closes");
 }

@@ -349,6 +349,96 @@ pub fn round_data(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) 
     first
 }
 
+/// The data frames the fixture's **`driver_async` job path** may hand up on its own, i.e. besides
+/// whatever the test's own call produced.
+///
+/// * `b"A"` — the worker-thread invoke callback (`host_async_invoke`, `tests/fixtures/host_driver.c`)
+///   `driver_output`s it;
+/// * `b"H"` — the completion callback (`host_ready_async`) `driver_output`s it when the entry has a
+///   `ready_async` (the default fixture does; the `host_driver_no_ready_async.c` variant does not).
+///
+/// Both are asynchronous deliveries relative to the caller's own callback — see
+/// [`drain_data`]/[`await_trailing_data`] — so a test must never assume a fixed number of them.
+pub const ASYNC_JOB_FRAMES: [&[u8]; 2] = [b"A", b"H"];
+
+/// Whether `frame` is one of the fixture's own `driver_async`-path frames ([`ASYNC_JOB_FRAMES`]).
+pub fn is_async_job_frame(frame: &[u8]) -> bool {
+    ASYNC_JOB_FRAMES.iter().any(|payload| *payload == frame)
+}
+
+/// How many consecutive rounds [`drain_data`] may run before it declares the port stuck (a driver
+/// that keeps handing up data would otherwise spin forever).
+const MAX_DRAIN_ROUNDS: usize = 16;
+
+/// Runs port-task rounds until a round reports **no** data for `id`, returning every frame the
+/// rounds reported for it, in arrival order.
+///
+/// This is the right shape whenever the port owes a **variable** number of frames — a
+/// `driver_async` job's frames (see [`ASYNC_JOB_FRAMES`]) land on the port's pending-read queue
+/// whenever the worker thread's `driver_output*` happens to coincide with one of the port thread's
+/// driver callbacks, so "how many are owed right now" is not something a call site knows.
+///
+/// Each frame is still **one** `driver_output*` call — the no-coalescing rule [`round_data`]
+/// asserts — only the *count* is open here. A call site that owns its own single driver call keeps
+/// using [`round_data`]; a call site that must prove something about the sequence uses this (or
+/// [`await_trailing_data`]) and asserts the whole vector.
+pub fn drain_data(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    for _ in 0..MAX_DRAIN_ROUNDS {
+        let outcome = registry
+            .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("the port-task round runs");
+        let round = data_of(&outcome, id);
+        if round.is_empty() {
+            return frames;
+        }
+        frames.extend(round);
+    }
+    panic!("the port still reported data after {MAX_DRAIN_ROUNDS} drain rounds: {frames:?}");
+}
+
+/// Runs port-task rounds until the port reports `expected` as its **newest** frame, returning every
+/// frame the rounds reported for it, in arrival order (so the caller can assert that `expected` is
+/// the last one and inspect what led up to it).
+///
+/// The tail semantics are the point: a `driver_async` job's frames ([`ASYNC_JOB_FRAMES`]) are
+/// delivered asynchronously with respect to the caller's own driver call, so the frame `expected`
+/// closes a sequence whose *prefix* is whatever the job still owed — never the other way round, because
+/// the C delivers in call order (one `{Port, {data, _}}` per `driver_output*`, `io.c:6387-6446`).
+///
+/// Panics — never a silent pass — when `expected` does not arrive within `timeout`.
+pub fn await_trailing_data(
+    poller: &mut Poller,
+    registry: &mut PortRegistry,
+    id: PortId,
+    expected: &[u8],
+    timeout: Duration,
+) -> Vec<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let events = poller
+            .poll(Some(Duration::from_millis(5)))
+            .expect("the poll succeeds");
+        registry.schedule_events(&events);
+        let outcome = registry
+            .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("the port-task round runs");
+        frames.extend(data_of(&outcome, id));
+        if frames
+            .last()
+            .is_some_and(|frame| frame.as_slice() == expected)
+        {
+            return frames;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the port never reported {expected:?} as its newest frame within {timeout:?}; \
+             it reported {frames:?}"
+        );
+    }
+}
+
 /// Polls and runs port-task rounds until the driver reports data for `id`, or `timeout` elapses
 /// (a panic — never a silent pass).
 ///
