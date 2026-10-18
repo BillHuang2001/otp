@@ -64,9 +64,9 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's own inline `#[cfg(test)]` modules).
 - `src/port.rs` 3 948 production lines of 4 004 (unit suite lives in `port/tests.rs`, 3 824 lines, plus the sibling `port/{ram_file_matrix,monitor,spawn_driver,control_capability}_tests.rs` and `port/test_support.rs`).
 - `src/runtime.rs` 3 980 lines — 3 116 of production, the rest the colocated unit test module (from line 3 117).
-- `src/context/calls.rs` 1 551 lines of production (the BIF-dispatch + BIF-result-copy-out machinery; suite in `context/calls/tests.rs`, 866 lines, after a `#[cfg(test)] mod notes`).
-- `src/native/file_server.rs` 1 207 lines of production (the io-device request dispatch table; suite in `native/file_server/tests.rs`, 1 970 lines).
-- `src/runtime/scheduler.rs` 1 396 lines of production, plus a small inline borrow/quiescence test module (suite in `runtime/scheduler/tests.rs`, 1 225 lines).
+- `src/context/calls.rs` 1 551 lines of production of 1 597 (the BIF-dispatch + BIF-result-copy-out machinery; the tail is the test-only dispatch notes plus the suite in `context/calls/tests.rs`, 866 lines).
+- `src/native/file_server.rs` 1 207 lines of production of 1 209 (the io-device request dispatch table; suite in `native/file_server/tests.rs`, 1 970 lines).
+- `src/runtime/scheduler.rs` 1 396 lines of production of 1 518, plus a small inline borrow/quiescence test module (suite in `runtime/scheduler/tests.rs`, 1 225 lines).
 - `src/context/gc.rs` 3 211 lines, 1 802 of production — the remainder is the test-only counters modules (`valve_counters`/`prefix_counters`) and the inline suites; its unit suite **belongs** in `context/gc/tests.rs` (still owed; the `port.rs`/`port/tests.rs` pattern).
 - `src/context/gc_walk.rs` 1 854 lines: 857 of production (the valved reachability descent, whose module docs carry the soundness argument and the latch-clearing refutation), the test-only `seed_counters` module and the root-set pinning suite, which **must** stay colocated because it drives the module's private `Walk`/`WalkScratch` types.
 - `src/context/runtime_hooks.rs` 1 823 lines of production with no inline tests — the `RuntimeHooks` bridge, whose per-arm rustdoc blocks carry the oracle columns and the served/fixed/gap reasoning (suites `context/tests.rs` and `tests/runtime_hooks.rs`).
