@@ -631,18 +631,14 @@ So the rust `foreign`/`copy_bound` per-case `case_<name>_peak_rss_bytes` is **no
 comparison (loop-length- **and** boot-dependent, `RESULTS.md` §3.2); `slice` (one call per process, `N`=1)
 remains the comparable per-process memory metric.
 
-**Reproducing the counter-level evidence (the driver prints none of it).** A `copy_bound`/`gc_bound` row
-records only `case_<name>_{wall_ms,startup_ms,peak_rss_bytes,ns_per_op,ops}` plus notes — it prints **no**
-`collections`/`minor_gcs`/`heap_size`. Those per-process counters come from a **probe module** of your own
+**Reproducing the counter-level evidence (the driver prints none of it).** A loop row records only
+`case_<name>_{wall_ms,startup_ms,peak_rss_bytes,ns_per_*,ops}` plus notes — never `collections`/`heap_size`.
+Those per-process counters need a probe module of your own
 (`erlang:process_info(self(), heap_size | total_heap_size | garbage_collection)` +
-`erlang:statistics(garbage_collection)`) that calls the staged `bench_copy_bound:<case>/1` and is run through
-the **`run` action** (`beam_rt -pa <dir> run <probe.beam> <probe>:<f>/1 <N>`) — the same route the `rust`
-side of every `Runtimes::Both` loop workload uses, which is what exposes the loop's real scheduled-process
-nursery. The `-eval` route does **not**: there the counters stay at their fresh values (the growth is
-invisible through `process_info(self(), _)`) even though the run's peak RSS still grows, so counter
-measurements must go through `run`. (`heap_size` is `Nursery::capacity_words` — the **sum over retired +
-current** spaces — so it is the retained-capacity signal.) The measured values and root causes are the
-`beam_rt` node's (`../crates/beam_rt/src/context/CONTEXT.md`, `M1_GAPS.md`, `PERF.md`), not this node's.
+`erlang:statistics(garbage_collection)`) calling the staged case function through the **`run` action**
+(`beam_rt -pa <dir> run <probe.beam> <probe>:<f>/1 <N>`); the `-eval` route leaves the counters at their fresh
+values even while peak RSS grows. (`heap_size` is `Nursery::capacity_words` — the sum over retired + current
+spaces — so it is the retained-capacity signal.) The measured values and root causes are the `beam_rt` node's.
 
 ## Honesty audit — measurement-integrity notes (current state)
 No workload returns a hard-coded or estimated metric; a workload that fails to build/run is always
@@ -661,18 +657,14 @@ impossibility guard), not silent error handling.
   matches each newly written `.beam` back to its source by file stem), so a partial `erlc` run cannot overstate
   throughput next to `files_compiled`. The attempted file/LOC totals are still reported, but only in a note.
   `elixir_compiler` likewise uses the produced count.
-- `proc.rs`'s drain-thread join (`h.join().unwrap_or_default()`) is infallible **by construction** — the drain
-  threads run only `read_to_end` + a lossy UTF-8 conversion, neither of which can panic — so the
-  `unwrap_or_default` masks nothing real; the invariant is documented at the call site.
-- `baseline.rs`'s docs correctly state that both runtimes serve `erlang:memory/0,1` (`beam_rt` via its
-  `MemoryHook` seam), recording a real `vm_memory_total_bytes` for `rust`; `is_capability_gap` survives only as a
-  fallback classifier.
+- `proc.rs`'s drain-thread join (`h.join().unwrap_or_default()`) is infallible **by construction** (the threads
+  only `read_to_end` + a lossy UTF-8 conversion, neither of which can panic); the invariant is documented there.
+- `baseline.rs` states correctly that both runtimes serve `erlang:memory/0,1` (`beam_rt` via its `MemoryHook`
+  seam), recording a real `vm_memory_total_bytes` for `rust`; `is_capability_gap` survives only as a fallback.
 
-The `foreign`/`list_walk`/`copy_bound`/`gc_bound` methodology is implemented exactly as `RESULTS.md` states
-(the paired startup-cancelled marginal: each round samples the `N` pass then the `0` pass back to back and the
-figure is the median of the paired differences, withheld inside the noise band; with a per-runtime `N`
-calibrated per the loop-count rule), and the registered-BIF dispatch cost is **not** produced here; it is a
-`beam_rt` measurement (`../../crates/beam_rt/PERF.md`, `TRACE_AND_PERF.md`).
+The loop workloads' methodology is implemented exactly as `RESULTS.md` states (the paired marginal with a
+per-runtime `N` calibrated per the loop-count rule); the registered-BIF dispatch cost is **not** produced here —
+it is a `beam_rt` measurement (`../../crates/beam_rt/PERF.md`, `TRACE_AND_PERF.md`).
 
 ## See Also
 - `RESULTS.md` → the current (m16) results summary (per-category tables, both sides named, the matched-round
