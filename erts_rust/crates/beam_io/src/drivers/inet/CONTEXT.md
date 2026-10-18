@@ -181,6 +181,7 @@ The crate's `-p beam_io` run is **1031 passed / 0 failed**: lib **797**, integra
 - `packet.rs` → `PacketType`/`PacketLength`/`PacketOptions`/`DEFAULT_DELIMITER`, the per-type decoders, `payload_range`; `mod tests`
 - `frame.rs` → `options`/`framed`/`write_header`/`extract`; `mod tests`; suite `frame_tests.rs`
 - `sys.rs` → every raw `libc` socket wrapper (the option pairs, the `AF_INET`-only `decode_inet_address`, the datagram family, `wait_connected`, the name-service and interface floors)
+- `oracle_dump.rs` → the length-framed oracle-dump format (`ERL_FRAME_ELEMENT`, `decode`, `encode`) `udp_tests.rs` and any raw-byte oracle dump use; `udp/oracle_dump_tests.rs` → the framing suite (explicit `0x7C`-port bind byte-exact, ephemeral bind shape)
 - `tests.rs` → the in-module suite; `opcode_tests*.rs` → the numeric-opcode suites + the 80-call `erl` `tcp_inet` matrix, the `udp_inet` matrix, the state machine and the refusals (the shared helpers the siblings import)
 - `../../../tests/{inet,udp_inet,inet_async}.rs` → the crate-level integration suites (the `tcp_inet` round trip + `erl` cross-checks, the datagram one, the completion channel + async-op queue end-to-end over `PortRegistry`) (parent node)
 ## See Also
