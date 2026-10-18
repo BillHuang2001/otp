@@ -94,8 +94,8 @@
 //! toolchain, or a probe that cannot complete, is a **loud skip** — never a silent pass and never
 //! a panic; every runtime assertion above stands on its own.
 use std::cell::RefCell;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Read;
+use std::net::TcpStream;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -243,7 +243,9 @@ enum Adoption {
 struct Listener {
     /// The runtime's port table (the one `RuntimePorts::open_port` registered the port in).
     registry: Rc<RefCell<PortRegistry>>,
-    /// The fixture that owns the term vocabulary and the heap the `Name`/`Options` live on.
+    /// The fixture that owns the term vocabulary and the heap the `Name`/`Options` live on, so it
+    /// must outlive the port (the registered `PortMeta` holds no copy of those terms).
+    #[allow(dead_code)]
     fx: Fixture,
     /// The listening port.
     id: PortId,
