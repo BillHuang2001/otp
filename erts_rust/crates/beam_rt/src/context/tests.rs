@@ -2207,6 +2207,8 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
         ("erlang", "start_timer", 4),
         ("erlang", "send_after", 4),
         ("erlang", "cancel_timer", 2),
+        ("erlang", "read_timer", 1),
+        ("erlang", "read_timer", 2),
         ("erlang", "function_exported", 3),
         ("erlang", "link", 1),
         ("erlang", "unlink", 1),
@@ -2247,10 +2249,7 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
     // Roster keys the bridge does **not** serve are claimed too — that is the point of
     // gating on the whole roster: `beam_bifs` can never route a key through the seam without
     // the bridge being installed. The reasons these are not in `served` are per-key gaps.
-    for (module, function, arity) in [
-        ("erlang", "read_timer", 1),
-        ("erlang", "system_info", 1),
-    ] {
+    for (module, function, arity) in [("erlang", "system_info", 1)] {
         assert!(
             RuntimeContext::uses_runtime_hooks(module, function, arity),
             "{module}:{function}/{arity} reads the seam, so the bridge must be installed"
@@ -2634,20 +2633,83 @@ fn the_runtime_hooks_bridge_serves_the_timer_and_export_families() {
         .expect("function_exported/3"),
         false_atom
     );
+    // `erlang:read_timer/1` is served by this same bridge: the reference above was just
+    // cancelled, so it names no live timer and the read answers the atom `false` (the
+    // oracle's answer for a stale reference) rather than a fabricated remaining time.
+    assert_eq!(
+        ctx.call_bif("erlang", "read_timer", 1, &[reference])
+            .expect("read_timer/1 on a cancelled reference"),
+        false_atom
+    );
     // A key this bridge does **not** serve still answers a typed capability gap — never a
     // fabricated value. The gate claims `beam_bifs`' whole `RUNTIME_HOOKS_BIFS` roster, so
-    // `read_timer/1` reaches the bridge (rather than the registry's defaulted seam) and the
+    // `system_info/1` reaches the bridge (rather than the registry's defaulted seam) and the
     // bridge's fallback arm names the key in the reason instead of the bare `bif`.
     let error = ctx
-        .call_bif("erlang", "read_timer", 1, &[reference])
-        .expect_err("read_timer/1 is not served by this bridge");
+        .call_bif("erlang", "system_info", 1, &[start_timer])
+        .expect_err("system_info/1 is not served by this bridge");
     assert_eq!(
         crate::error::unsupported_reason(&error).as_deref(),
-        Some("erlang:read_timer/1")
+        Some("erlang:system_info/1")
     );
 }
 
-// ---------------------------------------------------------------------------
+/// `erlang:read_timer/1` — the remaining time of a live timer reference, **without**
+/// cancelling it.
+///
+/// Measured against the system `erl` (OTP 29/`erts-17.1`): a live timer reads its remaining
+/// milliseconds, a cancelled/fired reference reads the atom `false`, and a non-reference
+/// first argument is `badarg` (`access_bif_timer`'s `is_not_ref` arm,
+/// `erts/emulator/beam/erl_hl_timer.c:2244-2251`) — never the typed capability gap the
+/// bridge answers for a roster key it does not serve. The `/2` option-list forms are
+/// covered end to end by `tests/read_timer.rs`, where Erlang source builds them.
+#[test]
+fn the_read_timer_bridge_cannot_be_confused_with_a_capability_gap() {
+    let mut rt = runtime();
+    let me = rt.self_pid().to_eterm();
+    let hi = rt.intern("hi");
+    let false_atom = rt.intern("false");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let reference = ctx
+        .call_bif("erlang", "start_timer", 3, &[make_small(60_000), me, hi])
+        .expect("erlang:start_timer/3");
+    // A live timer reads its remaining milliseconds, and the read is **not** a cancellation:
+    // it is repeatable and the timer is still cancellable afterwards.
+    let first = ctx
+        .call_bif("erlang", "read_timer", 1, &[reference])
+        .expect("read_timer/1 on a live timer");
+    assert!(is_small(first), "the reading is a small integer");
+    let first = signed_value(first);
+    assert!(
+        first > 0 && first <= 60_000,
+        "the reading is the time left, not the delay nor the elapsed time: {first}"
+    );
+    let second = signed_value(
+        ctx.call_bif("erlang", "read_timer", 1, &[reference])
+            .expect("a second read"),
+    );
+    assert!(second <= first, "a read never grows the remaining time");
+    // A cancelled reference has no live timer, so it reads `false` rather than a fabricated
+    // remaining time.
+    ctx.call_bif("erlang", "cancel_timer", 1, &[reference])
+        .expect("erlang:cancel_timer/1");
+    assert_eq!(
+        ctx.call_bif("erlang", "read_timer", 1, &[reference])
+            .expect("read_timer/1 on a cancelled reference"),
+        false_atom
+    );
+    // A non-reference is the oracle's `badarg` — and a badarg is **not** an `unsupported`
+    // capability gap (exit 3), so the differential harness cannot mistake the two.
+    let error = ctx
+        .call_bif("erlang", "read_timer", 1, &[make_small(0)])
+        .expect_err("a small integer is not a reference");
+    assert_eq!(
+        crate::error::unsupported_reason(&error),
+        None,
+        "badarg is not a capability gap: {error}"
+    );
+}
+
 // `erlang:link/1` / `erlang:unlink/1`: the pid-taking front door on a **remote** pid.
 // ---------------------------------------------------------------------------
 

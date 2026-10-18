@@ -35,6 +35,7 @@
 //! | `erlang:start_timer/3,4` | [`crate::timers`] — deliver `{timeout, TRef, Msg}`; `/4`'s `{abs, boolean()}` selects a relative time or an absolute Erlang monotonic one |
 //! | `erlang:send_after/4` | [`crate::timers`] — deliver `Msg`, under the same `{abs, boolean()}` option |
 //! | `erlang:cancel_timer/2` | [`crate::timers`] — the `/1` answers under the option list |
+//! | `erlang:read_timer/1,2` | [`crate::timers`]' pending deadline — the remaining milliseconds without cancelling, `false` for a reference with no live timer, and `{async, boolean()}` for the delayed `{read_timer, TRef, TimeLeft}` reply (`inet:timeout/1`'s primitive) |
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer)'s loaded exports + the **emulator builtins** (the declared `bif.tab` surface plus the `erlang`-namespace registry extras) |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set — a **local** pid through [`ProcessTable::link`]/`unlink`, a **remote** pid through [`ProcessTable::link_term`]/`unlink_term` (the remote-link set + the wire `DOP_LINK`/`DOP_UNLINK_ID`) |
 //! | `erlang:port_set_data/2`, `erlang:port_get_data/1` | [`PortRegistry`](crate::port::PortRegistry)'s opaque per-port data term (`prt->data`) |
@@ -96,7 +97,9 @@ use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use beam_io::signal::{Disposition, Signal};
 use beam_process::{PidTarget, ProcessId, ProcessTable};
-use beam_term::prelude::{atom_val, is_atom, is_small, make_small, signed_value, NIL};
+use beam_term::prelude::{
+    atom_val, is_atom, is_small, make_small, signed_value, try_make_small, NIL,
+};
 use beam_term::{AtomTable, Eterm};
 
 use std::cell::Cell;
@@ -252,6 +255,150 @@ impl<'a> RuntimeHooksBridge<'a> {
             let _ = heap;
             err
         })
+    }
+
+    /// `erlang:read_timer/1` — the remaining time of a live timer reference, **without**
+    /// cancelling it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::read_timer`]'s errors.
+    fn read_timer_1(&mut self, heap: &mut Heap, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        self.read_timer(heap, atoms, args, false)
+    }
+
+    /// `erlang:read_timer/2` — the same read under the `{async, boolean()}` option list.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::read_timer`]'s errors, plus [`BeamError::BadArg`] for a malformed
+    /// option list.
+    fn read_timer_2(&mut self, heap: &mut Heap, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let options = *args.get(1).ok_or(BeamError::BadArg)?;
+        let async_ = self.read_timer_options(atoms, options)?;
+        self.read_timer(heap, atoms, args, async_)
+    }
+
+    /// The shared body of `erlang:read_timer/1,2`: **how long is left** of the timer `args[0]`
+    /// identifies.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`, measured against the system `erl`), and exactly
+    /// what this answers:
+    ///
+    /// * the first argument must be a **reference this runtime minted** (a timer reference, a
+    ///   `make_ref/0` reference, a monitor reference) — anything else is `badarg`
+    ///   (`access_bif_timer`'s `is_not_ref` arm, `erts/emulator/beam/erl_hl_timer.c:2244-2251`);
+    /// * a reference whose timer is still **pending** → the remaining milliseconds as an
+    ///   integer, **truncated** (`get_time_left` divides whole clock ticks,
+    ///   `erl_hl_timer.c:681-689`) — the read leaves the timer in place, so it still fires and
+    ///   is still cancellable;
+    /// * a pending timer whose deadline has *passed* but which the scheduler has not drained
+    ///   yet → `0`, not `false` (the C clamps an expired-but-active timer to `0` and answers
+    ///   `false` only when the timer is gone, `return_info`, `erl_hl_timer.c:1975-1989`);
+    /// * a reference that already fired, was cancelled, or never named a timer (`make_ref/0`,
+    ///   a monitor reference) → the atom `false`.
+    ///
+    /// The timer heap is the **runtime's**, not the calling process's: the C keeps one BIF
+    /// timer tree per *scheduler* (`srv->btm_tree`, `access_sched_local_btm`,
+    /// `erl_hl_timer.c:2080-2120`), so reading a timer another process scheduled answers its
+    /// remaining time — measured on the oracle and matched here.
+    ///
+    /// # The `{async, true}` form
+    ///
+    /// `read_timer/2`'s only accepted option is `{async, boolean()}` (`read_timer_2` passes
+    /// `NULL` for both the `info` and the `abs` out-parameters of `parse_bif_timer_options`,
+    /// `erl_hl_timer.c:2352-2396`, so `{info, _}` and `{abs, true}` are `badarg` — measured).
+    /// With `{async, true}` the answer is the atom `ok` and the reading is delivered to the
+    /// caller as the 3-tuple `{read_timer, TRef, TimeLeft}` (`send_async_info`,
+    /// `erl_hl_timer.c:1991-2030`) — a `{read_timer, …}` tuple, never `{cancel_timer, …}`.
+    ///
+    /// The delivery is scheduled on this runtime's timer heap with a **zero** delay rather than
+    /// being pushed into the caller's mailbox inside the BIF, so the reply reaches the mailbox
+    /// at the next scheduler pass instead of already being there when `read_timer/2` returns.
+    /// That is deliberate: a mailbox push from a BIF would copy into the running process's own
+    /// young heap while its x registers/stack are unpublished (the `Target::Foreign` relocation
+    /// hazard `crate::context::gc` documents), whereas the scheduler's own delivery path is the
+    /// one that already handles a running receiver (the exemption plus the heap-fragment
+    /// fallback). The *message* and its contents are the oracle's; only the instant it becomes
+    /// visible may trail by one pass.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a non-reference first argument or a malformed option list —
+    /// a receiver that has since terminated is *not* an error (the delivery simply finds no
+    /// process); plus whatever the storage stabilization of the queued reply reports.
+    fn read_timer(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        args: &[Eterm],
+        async_: bool,
+    ) -> Result<Eterm> {
+        let term = *args.first().ok_or(BeamError::BadArg)?;
+        // A timer reference, or a reference this runtime minted for something else
+        // (`make_ref/0`, a monitor) — anything else is not a reference and is `badarg`, the
+        // same shape/provenance test `erlang:cancel_timer/1,2` applies (see
+        // [`Self::cancel_timer_2`]). The ONE provenance test decides
+        // (`Runtime::is_known_local_reference`); a reference this runtime did not mint answers
+        // `badarg` here where the C answers `false` — the same documented divergence the
+        // cancellation pair carries, and the reason it is stated once, here.
+        let pending = if self.runtime.is_known_local_reference(term) {
+            self.runtime.timers.remaining(term)
+        } else {
+            return Err(BeamError::BadArg);
+        };
+        let answer = match pending {
+            Some(remaining) => {
+                // Whole milliseconds, truncated — the same unit (and the same rounding) the
+                // cancellation pair answers with. A timer this runtime can schedule always
+                // fits a small integer: `timers::timer_delay` refuses a delay no monotonic
+                // deadline can hold (`Instant` tops out around 292 years ≈ 9.2e12 ms, far
+                // below `MAX_SMALL` ≈ 5.8e17).
+                let millis = i64::try_from(remaining.as_millis()).unwrap_or(i64::MAX);
+                try_make_small(millis)?
+            }
+            None => atom_term(atoms, "false")?,
+        };
+        if !async_ {
+            return Ok(answer);
+        }
+        // The asynchronous form: queue `{read_timer, TRef, TimeLeft}` for the caller and answer
+        // `ok`. The tuple is built on the caller's heap and then stabilized, because the
+        // delivery happens long after this call returns (see `Self::schedule`).
+        let message = heap.tuple(&[atom_term(atoms, "read_timer")?, term, answer])?;
+        // The queued reply is its own deadline, so it needs a reference to be the heap's key
+        // and the wake mirror's record. It is never handed to the caller — minting one keeps
+        // `Timers::refs`/`TimerWakes` balanced (every scheduled delivery has exactly one
+        // record), which is what the `run` route's wake predicate relies on.
+        let reference = self.runtime.refs_mut().next().to_eterm(heap)?;
+        self.schedule(Duration::ZERO, TimerTarget::Pid(self.self_pid), message, reference, heap)?;
+        atom_term(atoms, "ok")
+    }
+
+    /// Parses `read_timer/2`'s option list, answering whether the read is asynchronous.
+    ///
+    /// `read_timer/2` accepts **only** `{async, boolean()}` — in any position, with the last
+    /// occurrence winning, exactly as the C's `parse_bif_timer_options` loop does
+    /// (`erts/emulator/beam/erl_hl_timer.c:2352-2396`). `{info, _}` and `{abs, _}` are `badarg`
+    /// because `read_timer_2` passes `NULL` for those out-parameters (`:2666-2672`), which is
+    /// measured on the oracle, and so is every other key; a non-list, an improper list, a
+    /// non-2-tuple element and a non-boolean value are `badarg` too.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a malformed option list.
+    fn read_timer_options(&self, atoms: &AtomTable, options: Eterm) -> Result<bool> {
+        let elements = terms::list_elements(options).map_err(|_| BeamError::BadArg)?;
+        let mut async_ = false;
+        for option in elements {
+            let (key, value) = option_pair(atoms, option)?;
+            let flag = boolean_value(atoms, value)?;
+            match key.as_str() {
+                "async" => async_ = flag,
+                _ => return Err(BeamError::BadArg),
+            }
+        }
+        Ok(async_)
     }
 
     /// `erlang:function_exported/3` — whether a **loaded** module exports `Function/Arity`
@@ -1249,6 +1396,8 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             ("erlang", "start_timer", 4) => self.start_timer_4(heap, atoms, args),
             ("erlang", "send_after", 4) => self.send_after_4(heap, atoms, args),
             ("erlang", "cancel_timer", 2) => self.cancel_timer_2(heap, args),
+            ("erlang", "read_timer", 1) => self.read_timer_1(heap, atoms, args),
+            ("erlang", "read_timer", 2) => self.read_timer_2(heap, atoms, args),
             ("erlang", "function_exported", 3) => self.function_exported(heap, atoms, args),
             ("os", "set_signal", 2) => self.set_signal(atoms, args),
             ("net_kernel", "dflag_unicode_io", 1) => self.dflag_unicode_io(atoms, args),

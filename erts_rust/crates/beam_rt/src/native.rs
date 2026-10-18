@@ -1828,22 +1828,35 @@ mod tests {
             is_small(remaining),
             "cancel_timer/1 answers the remaining milliseconds for a pending timer"
         );
-        // An unclaimed key of the same family still resolves as the typed capability gap
-        // (exit 3), not the bare `undef` the `erlang`-namespace fallback raises for an
-        // unknown name. `read_timer/1` is a key of `beam_bifs`' `RUNTIME_HOOKS_BIFS`
-        // roster, so the `RuntimeHooksBridge` — installed for the whole roster — answers
-        // it, naming the key in its typed gap rather than the defaulted seam's bare `bif`.
-        let error = call(
+        // `read_timer/1,2` is a key of the same `beam_bifs` `RUNTIME_HOOKS_BIFS` roster and
+        // the `RuntimeHooksBridge` — installed for the whole roster — serves it: reading a
+        // live timer answers the remaining milliseconds **without** cancelling it.
+        let reference = call(
             &mut runtime,
             "erlang",
-            "read_timer",
-            &[make_small(0)],
+            "send_after",
+            &[make_small(60_000), me, msg, NIL],
         )
-        .expect_err("read_timer/1 has no host hook installed");
+        .expect("erlang:send_after/4 for the read");
+        let read = call(&mut runtime, "erlang", "read_timer", &[reference])
+            .expect("erlang:read_timer/1 reads a live timer");
+        assert!(
+            is_small(read),
+            "read_timer/1 answers the remaining milliseconds for a pending timer"
+        );
+        assert!(
+            !error::is_known_unimplemented_bif(&runtime.registry, "read_timer", 1),
+            "erlang:read_timer/1 must not be classified as a curated gap"
+        );
+        // A **non-reference** argument is the oracle's `badarg` — the C's `is_not_ref` arm —
+        // never the typed capability gap (exit 3) and never the bare `undef` the
+        // `erlang`-namespace fallback raises for a name no one claims.
+        let error = call(&mut runtime, "erlang", "read_timer", &[make_small(0)])
+            .expect_err("a small integer is not a reference");
         assert_eq!(
-            error::unsupported_reason(&error).as_deref(),
-            Some("erlang:read_timer/1"),
-            "read_timer/1 is the bridge's typed capability gap: {error}"
+            error::unsupported_reason(&error),
+            None,
+            "a badarg is not an `unsupported` capability gap: {error}"
         );
     }
 
