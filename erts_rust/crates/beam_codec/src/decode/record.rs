@@ -81,10 +81,11 @@ impl<'a> Decoder<'a> {
             _ => return Err(bad_arg()),
         };
         // `module` and `name` are atoms; the layout needs the raw `Atom`, so keep the
-        // term (which is `make_atom(atom)`) and unwrap its value below.
-        let module = self.decode_node_atom(heap, atoms)?;
-        let name = self.decode_node_atom(heap, atoms)?;
-
+        // term (which is `make_atom(atom)`) and unwrap its value below. C routes both
+        // through `dec_atom` (`external.c:5301-5313`), which has no `NIL_EXT` case — so
+        // the internal-node marker is `BadArg` here even under `LOCAL_EXT` mode.
+        let module = self.decode_atom_strict(heap, atoms)?;
+        let name = self.decode_atom_strict(heap, atoms)?;
         // A count whose definition arity would not fit the header's arity field is a
         // `BadArg` (the wire can declare more fields than a term can hold): the C
         // routes every decode failure, bounds included, to `B2TBadArg`
@@ -96,15 +97,15 @@ impl<'a> Decoder<'a> {
             return Err(bad_arg());
         }
 
-        // Keys and values are both in declaration order; a key must be an atom.
+        // Keys and values are both in declaration order; a key must be an atom
+        // (`dec_atom` again, `external.c:5314-5321`).
         // Decoding with `Vec::new` (never `with_capacity`) keeps a lying `num_fields`
         // from driving an eager allocation: the reader runs out of bytes first.
         let mut fields: Vec<(Eterm, Eterm)> = Vec::new();
         for _ in 0..num_fields {
-            let key = self.decode_node_atom(heap, atoms)?;
+            let key = self.decode_atom_strict(heap, atoms)?;
             fields.push((key, make_small(0)));
-        }
-        for field in fields.iter_mut() {
+        }        for field in fields.iter_mut() {
             field.1 = self.decode(heap, atoms)?;
         }
 
@@ -280,9 +281,7 @@ mod tests {
 
     #[test]
     fn a_field_count_past_max_arityval_is_bad_arg() {
-        // `record_def_size_words(n) - 1 > MAX_ARITYVAL` — the wire can declare more
-        // fields than the record header's arity field can hold. A wire bound, so the
-        // oracle's `binary_to_term` answers `badarg` (never `system_limit`).
+        // fields than the record header's arity field can hold. A wire bound, so the        // oracle's `binary_to_term` answers `badarg` (never `system_limit`).
         let mut image = vec![131u8, RECORD_EXT];
         image.extend_from_slice(&u32::MAX.to_be_bytes());
         image.push(0);
@@ -294,5 +293,83 @@ mod tests {
             decoder.decode(&mut heap, &mut atoms),
             Err(BeamError::BadArg)
         ));
+    }
+
+    /// `RECORD_EXT`'s module, name and key atoms go through C `dec_atom`
+    /// (`external.c:5301-5321`), which has no `NIL_EXT` case — so the internal-node
+    /// marker is `badarg` in those positions even under `LOCAL_EXT` mode, exactly as in
+    /// `EXPORT_EXT`. Without the marker the record still decodes in internal-node mode.
+    #[test]
+    fn record_ext_rejects_the_internal_node_marker_as_an_atom() {
+        const HASH: u32 = 0x0BAD_F00D;
+        // `[LOCAL_EXT][hash:4][RECORD_EXT][0 fields][flags 0][<module>][<name>]`.
+        let with_module = |module: &[u8]| {
+            let mut image = vec![131u8, 121];
+            image.extend_from_slice(&HASH.to_be_bytes());
+            image.push(RECORD_EXT);
+            image.extend_from_slice(&0u32.to_be_bytes());
+            image.push(0);
+            image.extend_from_slice(module);
+            image.extend_from_slice(&[119, 1, b'r']);
+            image
+        };
+        for (what, module) in [
+            ("module", &[106u8][..]),   // NIL_EXT
+            ("name", &[119, 1, b'm'][..]),
+        ] {
+            let mut image = with_module(module);
+            if what == "name" {
+                // Replace the trailing name with the marker instead.
+                image.truncate(image.len() - 3); // drop `[119,1,'r']`
+                image.push(106);
+            }
+            let mut heap = Heap::new(256).expect("a heap");
+            let mut atoms = AtomTable::new();
+            let mut decoder = Decoder::new(&image)
+                .expect("well-formed image")
+                .with_local_node_hash(HASH);
+            assert!(
+                matches!(decoder.decode(&mut heap, &mut atoms), Err(BeamError::BadArg)),
+                "a NIL {what} must be badarg"
+            );
+        }
+
+        // A key in the marker position is `badarg` too:
+        // `[LOCAL_EXT][hash][RECORD_EXT][1 field][0][module][name][NIL key][value]`.
+        let mut bad_key = vec![131u8, 121];
+        bad_key.extend_from_slice(&HASH.to_be_bytes());
+        bad_key.push(RECORD_EXT);
+        bad_key.extend_from_slice(&1u32.to_be_bytes());
+        bad_key.push(0);
+        bad_key.extend_from_slice(&[119, 1, b'm', 119, 1, b'r']);
+        bad_key.push(106); // NIL_EXT as the key
+        bad_key.extend_from_slice(&[97, 1]); // the value
+        let mut heap = Heap::new(256).expect("a heap");
+        let mut atoms = AtomTable::new();
+        let mut decoder = Decoder::new(&bad_key)
+            .expect("well-formed image")
+            .with_local_node_hash(HASH);
+        assert!(matches!(
+            decoder.decode(&mut heap, &mut atoms),
+            Err(BeamError::BadArg)
+        ));
+
+        // A real record behind a `LOCAL_EXT` wrapper still decodes.
+        let mut good = vec![131u8, 121];
+        good.extend_from_slice(&HASH.to_be_bytes());
+        good.push(RECORD_EXT);
+        good.extend_from_slice(&0u32.to_be_bytes());
+        good.push(0);
+        good.extend_from_slice(&[119, 1, b'm', 119, 1, b'r']);
+        let mut heap = Heap::new(256).expect("a heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(["false", "true"]);
+        let mut decoder = Decoder::new(&good)
+            .expect("well-formed image")
+            .with_local_node_hash(HASH);
+        let term = decoder.decode(&mut heap, &mut atoms).expect("decodes");
+        decoder.finish().expect("no trailing bytes");
+        assert!(is_record(term));
+        assert_eq!(record_field_count(term).unwrap(), 0);
     }
 }
