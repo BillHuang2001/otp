@@ -196,6 +196,19 @@ impl Rig {
             .expect("a live port")
             .next_timeout()
     }
+
+    /// Closes the port — [`crate::PortRegistry::close`], the teardown that runs the driver's
+    /// [`Driver::stop`] and harvests whatever it staged.
+    pub(super) fn close(&mut self) {
+        self.registry
+            .close(&mut self.poller, self.id)
+            .expect("the port closes");
+    }
+
+    /// Whether the port is still live in the registry.
+    pub(super) fn contains(&self) -> bool {
+        self.registry.contains(self.id)
+    }
 }
 /// How a matrix reply is compared, chosen by whether it can be deterministic in the first place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
