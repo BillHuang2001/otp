@@ -140,9 +140,18 @@ tier is not reachable end-to-end and cannot be measured through the runtime. Als
 workload's *interpreter* side carries a known super-linear `beam_rt` pathology owned elsewhere, so it
 is not a clean tier comparison even where reachable.
 
+## Known Issues
+- **A pre-empting host cannot use this tier.** The tier runs through the shared native driver
+  (`../baseline/mod.rs::drive`), so every driver-loop iteration is charged one reduction unit
+  through `ExecutionContext::reduce` (see `../CONTEXT.md`). A host that refuses a charge — the
+  normal scheduler-slice behaviour — parks the machine at that block entry, and
+  `resume_outcome_with_tier(Tier::Cranelift)` has no path to a mid-function `pc` (it reports the
+  typed `unsupported`), so the slice cannot be resumed. `beam_rt` never selects this tier
+  (`BEAM_RT_TIER` maps only to `Interpreter`/`BaselineJit`), and the tier's own tests use
+  non-pre-empting contexts, so nothing on a supported path reaches this.
+
 ## Routing Table
-- `codegen.rs`/`inline.rs`/`shape.rs`/`compare.rs` → the inline set + shape tests; `report.rs` → the introspection report; `tests.rs` → in-module unit tests; `bench.rs` → the `#[ignore]`d ABBA Cranelift-vs-baseline measurement harness (its synthetic-`Module` builder, BIF hook and ns/op primitives are the shared `crate::jit::bench::support`, not a second copy); `mod.rs` → the backend + accessors.
-- Tier equivalence on real modules: crate `tests/jit_cranelift.rs`, `tests/jit_cranelift_real.rs` (see `../CONTEXT.md`).
+- `codegen.rs`/`inline.rs`/`shape.rs`/`compare.rs` → the inline set + shape tests; `report.rs` → the introspection report; `tests.rs` → in-module unit tests; `bench.rs` → the `#[ignore]`d ABBA Cranelift-vs-baseline measurement harness (its synthetic-`Module` builder, BIF hook and ns/op primitives are the shared `crate::jit::bench::support`, not a second copy); `mod.rs` → the backend + accessors.- Tier equivalence on real modules: crate `tests/jit_cranelift.rs`, `tests/jit_cranelift_real.rs` (see `../CONTEXT.md`).
 - `bench.rs` is run with `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --features jit-cranelift --lib -- --ignored --nocapture cl_bench`.
 
 ## Test Strategy
