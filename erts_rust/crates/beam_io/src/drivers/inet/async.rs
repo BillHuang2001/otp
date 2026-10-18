@@ -193,7 +193,8 @@ impl AsyncQueue {
     /// `enq_async` returning `< 0`, which the callers report as `[0]ealready`
     /// (`ctl_error(EALREADY)`, `:12307`, `:15001`).
     pub(super) fn enqueue_recv(&mut self, op: RecvOp) -> bool {
-        if self.recv.is_some() {
+        let pending = usize::from(self.recv.is_some());
+        if pending >= INET_MAX_ASYNC {
             return false;
         }
         self.recv = Some(op);
