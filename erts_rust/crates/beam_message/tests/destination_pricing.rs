@@ -210,8 +210,13 @@ fn a_literal_child_costs_zero_destination_words_although_size_object_counts_its_
         assert_eq!(child.raw(), literal.raw(), "(decoy={decoy}) the child is the shared literal");
         assert!(is_literal(child), "(decoy={decoy}) not a fresh copy of the literal");
         assert!(
-            !dst_off.binaries().is_empty() || !decoy || dst_off.len() == 1,
-            "(decoy={decoy}) no unexpected off-heap artifact"
+            dst_off.binaries().is_empty(),
+            "(decoy={decoy}) a shared literal registers no refc binary"
+        );
+        assert_eq!(
+            dst_off.len(),
+            usize::from(decoy),
+            "(decoy={decoy}) and no MSO slot beyond the decoy"
         );
     }
 }
