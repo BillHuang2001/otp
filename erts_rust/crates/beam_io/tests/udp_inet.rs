@@ -53,12 +53,14 @@
 //!   `udp_inet` driver through `erl` (`open_port({spawn_driver, "udp_inet"}, [binary])` +
 //!   `port_control`, as `prim_inet.erl:103` does) and the reply bytes are compared. Only the
 //!   `bind` reply is shape-compared — the two runs bind *different* ephemeral ports.
-//! * `the_recv_verb_is_the_documented_divergence_from_the_oracles_code_60` — the driver's one
-//!   deliberate divergence (`../src/drivers/inet/udp.rs`, "The reception model"): the oracle's
-//!   `PACKET_REQ_RECV` (code 60) is an **asynchronous** request whose immediate reply is the
-//!   async-op id and whose result arrives later as an `{inet_async, …}` message, while this
-//!   floor's `recv` reads **now** and answers the result (the source address, or the bare `[1]`).
-//!   Only the oracle's *shape* is pinned; nothing is fabricated for the divergent bytes.
+//! * `recv` (the crate-local verb, `../src/drivers/inet/udp.rs`) reads a datagram **now** and
+//!   reports its source on the same reply: `[1] ++ src_address` with a datagram pending, the bare
+//!   `[1]` when none is.
+//! * `the_code_60_recv_is_an_async_request_completed_by_a_later_round` — the C's
+//!   `PACKET_REQ_RECV` (code 60): the reply is the 16-bit async-op id **and nothing else**, and the
+//!   datagram (source address first, payload after) crosses the completion channel at a later
+//!   round. The guard ladder (`[0]exbadport`, `[0]einval`, `[0]ealready`), the id accounting, the
+//!   exactly-once delivery and the `{error, closed}` teardown are pinned against the real driver.
 //!
 //! Every oracle case **skips loudly** (a `SKIP:` banner and a `return`) when `erl` is not on
 //! `PATH`, and never fails for a missing toolchain.
@@ -236,6 +238,43 @@ fn harvest(poller: &mut Poller, ports: &mut PortRegistry) -> Vec<PortNotificatio
         .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
         .expect("the port-task round runs")
         .notifications
+}
+
+/// One control op through the **numeric** opcode route — the form `erlang:port_control/3` sends
+/// (`Op + ERTS_INET_DRV_CONTROL_MAGIC_NUMBER`), which is where the drivers decode the C request
+/// numbers.
+fn control_code(
+    ports: &mut PortRegistry,
+    poller: &mut Poller,
+    id: PortId,
+    code: u32,
+    arg: &[u8],
+) -> Vec<u8> {
+    let op = (u64::from(code) + u64::from(CONTROL_MAGIC)).to_string();
+    control(ports, poller, id, &op, arg)
+}
+
+/// The `Timeout(4), Length(4)` operand of `PACKET_REQ_RECV`(60) (`inet_drv.c:14990`).
+fn recv_operand(timeout_ms: i32, length: u32) -> Vec<u8> {
+    let mut arg = timeout_ms.to_be_bytes().to_vec();
+    arg.extend_from_slice(&length.to_be_bytes());
+    arg
+}
+
+/// The C's `INET_INFINITY` (`inet_drv.c:1043`): the 4-byte timeout meaning "no deadline".
+const INET_INFINITY: i32 = -1;
+
+/// One runtime round of the completion channel's consumers: poll for readiness, dispatch it, run
+/// the port tasks (the round's `drive_async` point) and drain the completions.
+fn round(poller: &mut Poller, ports: &mut PortRegistry) -> Vec<PortCompletion> {
+    let events = poll_once(poller);
+    ports
+        .handle_events(poller, &events)
+        .expect("the ready events are dispatched");
+    ports
+        .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the port tasks run");
+    ports.take_completions()
 }
 
 /// The C's `ctl_xerror(name)` reply: the `[INET_REP_ERROR]` tag followed by the lowercase name
@@ -816,83 +855,289 @@ fn the_covered_control_replies_agree_with_the_erl_oracle() {
     assert_eq!(oracle[11], vec![INET_REP_OK], "INET_REQ_CLOSE replies ok");
 }
 
-/// The driver's one deliberate divergence, measured against the oracle: the C's `recv` is an
-/// **asynchronous** request and this floor's is a **read-now** verb.
+/// The code-60 oracle: the async receive ladder and one completed receive, measured on a real raw
+/// `udp_inet` port.
 ///
-/// The C's `PACKET_REQ_RECV` (code `60`) takes a `Timeout(4), Length(4)` payload, enqueues an
-/// async operation on the descriptor's `INET_MAX_ASYNC = 1` queue and answers the **async-op id**
-/// (`[1] ++ async_id_be16`, three bytes); the datagram itself arrives later as an
-/// `{inet_async, Port, Ref, Result}` message, which a single passively-driven port cannot observe
-/// here. This floor has no driver message path, so `recv` reads one datagram now and answers its
-/// result.
+/// The port binds an ephemeral port (`INET_AF_ANY`, so the kernel picks one and the `bind` reply
+/// names it); a **second** raw `udp_inet` port (socket-less) supplies the `[0]exbadport` row, and a
+/// real `gen_udp` socket sends the datagram. Printed, in order: the socket-less row, the queued
+/// receive's reply, the `ealready` refusal, the short-operand `einval` refusal, the completed
+/// receive's `{Id, Bytes}` (the bytes flattened, as the port's `[binary]` mode delivers them), the
+/// sender's port (so the address prefix can be checked), the next request's id, and the teardown
+/// pair.
+const CODE_60_EXPRESSION: &str = "M = 16#03f1a300, \
+ P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+ F = fun(C, A) -> binary_to_list(iolist_to_binary(erlang:port_control(P, C + M, A))) end, \
+ _ = F(1, <<1,2,0>>), \
+ BP = case F(6, <<3,0,0>>) of [1, BH, BL] -> BH * 256 + BL; _ -> exit(no_bind) end, \
+ Q = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+ G = fun(C, A) -> binary_to_list(iolist_to_binary(erlang:port_control(Q, C + M, A))) end, \
+ Bare = G(60, <<-1:32,0:32>>), \
+ Id1 = F(60, <<-1:32,0:32>>), \
+ Busy = F(60, <<-1:32,0:32>>), \
+ Short = F(60, <<-1:32>>), \
+ {ok, S} = gen_udp:open(0, [binary, {ip,{127,0,0,1}}]), \
+ {ok, SPort} = inet:port(S), \
+ ok = gen_udp:send(S, {127,0,0,1}, BP, \"x\"), \
+ Recv = receive {inet_async, _, IdA, {ok, D}} -> {IdA, binary_to_list(iolist_to_binary(D))}; \
+                Other -> {other, Other} after 5000 -> none end, \
+ Next = F(60, <<-1:32,0:32>>), \
+ port_close(P), \
+ Wait = fun W() -> receive \
+     {inet_async, _, IdT, {error, R}} -> {IdT, atom_to_list(R)}; \
+     {'EXIT', _, _} -> W(); \
+     T -> {other, T} after 1000 -> none end end, \
+ Teardown = Wait(), \
+ S2 = fun(Ls) -> lists:flatten(lists:join(\",\", [integer_to_list(B) || B <- Ls])) end, \
+ io:format(\"bare=~s~n\", [S2(Bare)]), \
+ io:format(\"id1=~s~n\", [S2(Id1)]), \
+ io:format(\"busy=~s~n\", [S2(Busy)]), \
+ io:format(\"short=~s~n\", [S2(Short)]), \
+ io:format(\"next=~s~n\", [S2(Next)]), \
+ io:format(\"recv=~w sport=~w~n\", [Recv, SPort]), \
+ io:format(\"teardown=~p~n\", [Teardown])";
+
+/// The value of a `key=value` field on an oracle output line.
+fn code_60_field<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
+    let start = stdout.find(key)? + key.len();
+    let rest = &stdout[start..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// The code-60 request is the C's **asynchronous** receive: the reply is the async-op id and
+/// nothing else, and the datagram crosses the completion channel at a later round.
 ///
-/// Only the oracle's **shape** is pinned — no expected value is fabricated for bytes the two
-/// designs do not share.
+/// The rows, each the real driver's:
 ///
-/// **Skips loudly** when `erl` is not on `PATH`.
+/// 1. a queued receive answers `[1] ++ <<Id:16/big>>` — `[1,0,0]` — and stages **no** completion;
+/// 2. a second concurrent receive is `[0] ++ "ealready"` (the single `INET_MAX_ASYNC` slot), and
+///    the refused enqueue still consumes an id, because `NEW_ASYNC_ID` is taken *before* the
+///    capacity check (`inet_drv.c:1549`, `:15003`);
+/// 3. a short operand (`len != 8`) is `[0] ++ "einval"` and a socket-less port `[0] ++
+///    "exbadport"` (the C's `!IS_OPEN` arm, `:14980`, which runs before the operand check);
+/// 4. the datagram completes **at `execute_port_tasks`** — no readiness event is needed, the bytes
+///    are already queued in the socket — exactly **once**, as `InetAsyncResult::Data`, whose
+///    `read.flattened()` is the oracle's flat list-mode `[1, PortHi, PortLo, A, B, C, D, …data]`;
+/// 5. closing a port with a receive pending answers it `{error, closed}` exactly once
+///    (`async_error_am_all`, `:2597`-`:2608`).
+///
+/// Rows 1–5's control replies and the id accounting are byte-compared against the real driver when
+/// `erl` is on `PATH` (the ephemeral ports differ between the two runs, so the address *prefix* is
+/// shape-compared and checked against each side's own sender); without the oracle the Rust rows
+/// still run, and the check **skips loudly**.
 #[test]
-fn the_recv_verb_is_the_documented_divergence_from_the_oracles_code_60() {
-    let calls = vec![
-        (
-            INET_REQ_OPEN,
-            vec![INET_AF_INET, INET_TYPE_DGRAM, INET_PROTO_DEFAULT],
-        ),
-        (INET_REQ_BIND, vec![INET_AF_ANY, 0, 0]),
-        (PACKET_REQ_RECV, vec![0u8; 8]),
-    ];
-    let Some(dump) = erl_stdout(&oracle_expression(&calls)) else {
-        eprintln!("SKIP: no `erl` on PATH — skipping the udp_inet recv-divergence oracle check");
-        return;
+fn the_code_60_recv_is_an_async_request_completed_by_a_later_round() {
+    // The oracle's rows first: on an unavailable oracle this is the loud skip.
+    let oracle = match erl_stdout(CODE_60_EXPRESSION) {
+        Some(dump) => {
+            // The probe's output is ASCII (`key=value` lines of decimal byte lists), so a lossy
+            // decode is exact here.
+            let stdout = String::from_utf8_lossy(&dump).into_owned();
+            eprintln!("oracle code-60 report: {}", stdout.trim());
+            Some(stdout)
+        }
+        None => {
+            eprintln!("SKIP: no `erl` on PATH — skipping the udp_inet code-60 oracle cross-check");
+            None
+        }
     };
-    let Some(oracle) = parse_reply_dump(&dump) else {
-        panic!("could not parse the oracle reply dump: {dump:?}");
-    };
-    assert_eq!(oracle.len(), calls.len(), "one reply per call: {oracle:?}");
-
-    // Measured, not assumed: the oracle accepts the code-60 request and answers the async-op id.
-    // (The module doc predicts `[0]einval` there; that holds only for the *empty* argument, which
-    // the C rejects without enqueuing anything.)
-    eprintln!("oracle code-60 reply: {:?}", oracle[2]);
-    assert_eq!(oracle[2][0], INET_REP_OK, "the oracle's async request is queued");
-    assert_eq!(
-        oracle[2].len(),
-        3,
-        "the oracle answers the async-op id, not the datagram: {:?}",
-        oracle[2]
-    );
-
-    // This floor's `recv` reads now. A drained socket answers the bare `[1]` — one byte, and a
-    // different shape from the oracle's async-op id.
+    // -- the socket-less row ------------------------------------------------
     let mut poller = poller();
+    let (mut bare_ports, bare) = udp_port(&mut poller);
+    let bare_reply = control_code(
+        &mut bare_ports,
+        &mut poller,
+        bare,
+        PACKET_REQ_RECV,
+        &recv_operand(INET_INFINITY, 0),
+    );
+    assert_eq!(
+        bare_reply,
+        ctl_xerror("exbadport"),
+        "a socket-less port refuses the request before looking at the operand"
+    );
+    if let Some(stdout) = &oracle {
+        assert_eq!(
+            code_60_field(stdout, "bare="),
+            Some(
+                bare_reply
+                    .iter()
+                    .map(|byte| byte.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .as_str()
+            ),
+            "the socket-less row agrees with the oracle"
+        );
+    }
+    // -- the request, the refused second request, the short operand --------
     let (mut ports, id) = udp_port(&mut poller);
     let port = open_and_bind_ephemeral(&mut poller, &mut ports, id);
-    let empty = recv(&mut poller, &mut ports, id);
-    assert_eq!(empty, vec![INET_REP_OK], "a drained socket answers [1]");
-    assert_ne!(empty, oracle[2], "the same call answers a different shape");
-
-    // With a datagram pending the reply is the result itself — the eight-byte source-carrying
-    // form — which is what the C delivers as the *later* async message instead.
+    let first = control_code(
+        &mut ports,
+        &mut poller,
+        id,
+        PACKET_REQ_RECV,
+        &recv_operand(INET_INFINITY, 0),
+    );
+    assert_eq!(first, vec![INET_REP_OK, 0, 0], "the reply is the id, not the datagram");
+    assert!(
+        ports.take_completions().is_empty(),
+        "a queued receive completes nothing inline"
+    );
+    let second = control_code(
+        &mut ports,
+        &mut poller,
+        id,
+        PACKET_REQ_RECV,
+        &recv_operand(INET_INFINITY, 0),
+    );
+    assert_eq!(
+        second,
+        ctl_xerror("ealready"),
+        "the single async slot refuses a second concurrent receive"
+    );
+    let short = control_code(&mut ports, &mut poller, id, PACKET_REQ_RECV, &recv_operand(INET_INFINITY, 0)[..4]);
+    assert_eq!(
+        short,
+        ctl_xerror("einval"),
+        "the operand must be the eight-byte Timeout(4), Length(4) record"
+    );
+    if let Some(stdout) = &oracle {
+        let row = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| byte.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(code_60_field(stdout, "id1="), Some(row(&first).as_str()), "the id reply");
+        assert_eq!(code_60_field(stdout, "busy="), Some(row(&second).as_str()), "the ealready row");
+        assert_eq!(code_60_field(stdout, "short="), Some(row(&short).as_str()), "the einval row");
+    }
+    // -- the datagram completes at the port-task drive point ---------------
     let sender = UdpSocket::bind("127.0.0.1:0").expect("a second real socket binds");
+    let sender_port = sender
+        .local_addr()
+        .expect("the sender's address")
+        .port();
     sender
         .send_to(b"x", ("127.0.0.1", port))
         .expect("the datagram is sent");
-    let delivered = recv_until_delivered(&mut poller, &mut ports, id);
+    let deadline = Instant::now() + WAIT;
+    let mut completions = Vec::new();
+    let mut rounds = 0u32;
+    while completions.is_empty() {
+        assert!(Instant::now() < deadline, "the queued receive never completed");
+        // Deliberately **no** readiness dispatch: `execute_port_tasks` is the round's async drive
+        // point, and the datagram is already queued in the socket.
+        ports
+            .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("the port tasks run");
+        completions.extend(ports.take_completions());
+        rounds += 1;
+        if rounds > 1000 {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(completions.len(), 1, "exactly one completion: {completions:?}");
+    let completion = &completions[0];
+    assert_eq!(completion.port, id, "the completion names the port that queued it");
+    let (async_id, result) = match &completion.event {
+        CompletionEvent::InetAsync { id, result } => (*id, result.clone()),
+        other => panic!("an {{inet_async, …}} completion, not {other:?}"),
+    };
+    assert_eq!(async_id, 0, "the completion echoes the id its reply handed out");
+    let read = match result {
+        InetAsyncResult::Data(read) => read,
+        other => panic!("a completed receive carries the datagram, not {other:?}"),
+    };
+    // The address is the read's *header* and the datagram its body, so the flat list a `[list]`
+    // port would build is `[1, PortHi, PortLo, A, B, C, D] ++ payload`.
+    let [sender_hi, sender_lo] = sender_port.to_be_bytes();
+    let expected = vec![INET_AF_INET, sender_hi, sender_lo, 127, 0, 0, 1, b'x'];
     assert_eq!(
-        delivered.len(),
-        8,
-        "the read-now reply carries the source address: {delivered:?}"
+        read.header,
+        expected[..7].to_vec(),
+        "the header is the packed source address"
     );
-    assert_ne!(
-        delivered, oracle[2],
-        "the oracle's async-op id is never this floor's reply"
+    assert_eq!(read.body, Some(b"x".to_vec()), "the body is the datagram payload");
+    assert_eq!(
+        read.flattened(),
+        expected,
+        "the flattened read is the oracle's flat list-mode shape"
+    );
+    // Exactly once: a further round reports nothing, and the datagram is not re-delivered.
+    assert!(round(&mut poller, &mut ports).is_empty(), "a completion is never reported twice");
+    // -- the id accounting, and the next request ---------------------------
+    let next = control_code(
+        &mut ports,
+        &mut poller,
+        id,
+        PACKET_REQ_RECV,
+        &recv_operand(INET_INFINITY, 0),
     );
     assert_eq!(
-        harvest(&mut poller, &mut ports),
-        vec![PortNotification::Data {
-            port: id,
-            read: ReadMessage::body_only(b"x".to_vec()),
-        }]
+        next,
+        vec![INET_REP_OK, 0, 2],
+        "the refused enqueue consumed id 1, so the next request is id 2"
     );
-
+    if let Some(stdout) = &oracle {
+        // The oracle's own completed receive: its id, and the same flattened shape with its own
+        // sender's port.
+        let recv_field = code_60_field(stdout, "recv=").expect("the oracle's receive row");
+        let sport = code_60_field(stdout, "sport=")
+            .and_then(|value| value.parse::<u16>().ok())
+            .expect("the oracle's sender port");
+        let [oracle_hi, oracle_lo] = sport.to_be_bytes();
+        let expected_oracle = format!(
+            "{{0,[1,{oracle_hi},{oracle_lo},127,0,0,1,120]}}"
+        );
+        assert_eq!(
+            recv_field, expected_oracle,
+            "the oracle's completed receive is {{Id, [1, PortHi, PortLo, A, B, C, D, …data]}}"
+        );
+        let row = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| byte.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(
+            code_60_field(stdout, "next="),
+            Some(row(&next).as_str()),
+            "the id accounting agrees with the oracle"
+        );
+    }
+    // -- the teardown answers the pending receive `{error, closed}`, once --
     ports.close(&mut poller, id).expect("closes the port");
+    let teardown = ports.take_completions();
+    assert_eq!(teardown.len(), 1, "the pending receive is answered once: {teardown:?}");
+    assert_eq!(teardown[0].port, id, "the dead port's completion still names it");
+    assert_eq!(
+        teardown[0].event,
+        CompletionEvent::InetAsync {
+            id: 2,
+            result: InetAsyncResult::Error(InetReason::Closed),
+        },
+        "the pending receive is completed {{error, closed}}"
+    );
+    assert_eq!(
+        InetReason::Closed.atom_name(),
+        "closed",
+        "the reason renders as the oracle's atom"
+    );
+    assert!(
+        ports.take_completions().is_empty(),
+        "the teardown completion is never re-reported"
+    );
+    if let Some(stdout) = &oracle {
+        assert_eq!(
+            code_60_field(stdout, "teardown="),
+            Some("{2,\"closed\"}"),
+            "the oracle answers its pending receive {{error, closed}} with the same id"
+        );
+    }
 }
