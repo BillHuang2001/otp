@@ -351,11 +351,12 @@ mod tests {
             vec![0x78, 0x9c, 0x63, 0x60, 0x40, 0x05, 0x00, 0x00, 0x10, 0x00, 0x01]
         );
     }
-    /// `longest_match`'s chain walk must never report a match longer than the lookahead,
-    /// and must record the position it found — the invariant the caller's lazy logic
-    /// relies on. A body of 300 `'a'`s gives a long run at distance 1.
+    /// `longest_match` never reports a match longer than `MAX_MATCH` and records the
+    /// position it found — the invariant the caller's lazy logic relies on. A body of 300
+    /// `'a'`s is a run at distance 1, so the walk over-reads its `MAX_MATCH` window and
+    /// stops there, well before the end of the run.
     #[test]
-    fn a_long_run_yields_a_match_clamped_to_the_lookahead() {
+    fn a_long_run_stops_the_match_at_max_match() {
         let body = vec![b'a'; 300];
         let mut st = DeflateState::new(&body);
         st.fill_window();
@@ -366,8 +367,29 @@ mod tests {
         assert_eq!(head, 0);
         st.prev_length = MIN_MATCH - 1;
         let len = st.longest_match(head);
-        assert_eq!(len, MIN_LOOKAHEAD.min(300 - 1));
+        assert_eq!(len, MAX_MATCH);
         assert_eq!(st.match_start, 0);
+    }
+
+    /// The return is clamped to the lookahead even when the window past the current data
+    /// holds bytes that lengthen the match — which is exactly why `fill_window` zeroes
+    /// those bytes (`WIN_INIT`): the C reads them and then clamps rather than refusing to
+    /// look.
+    #[test]
+    fn a_match_reaching_past_the_data_is_clamped_to_the_lookahead() {
+        let body = vec![b'a'; 20];
+        let mut st = DeflateState::new(&body);
+        st.fill_window();
+        assert_eq!(st.lookahead, 20);
+        st.window[20..20 + MAX_MATCH as usize].fill(b'a');
+
+        let head = st.insert_string(0);
+        assert_eq!(head, NIL);
+        let head = st.insert_string(1);
+        assert_eq!(head, 0);
+        st.prev_length = MIN_MATCH - 1;
+        let len = st.longest_match(head);
+        assert_eq!(len, 20, "clamped to the lookahead, not the raw match length");
     }
 
     /// The Huffman tables are shared with `trees.rs`; a literal code must stay inside its
