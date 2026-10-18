@@ -63,6 +63,7 @@ use crate::driver::{Driver, DriverRegistry, PortExitReason};
 use crate::error;
 use crate::poller::{Event, Poller};
 use crate::port::{Port, PortCommandOptions, PortControl, PortState, DEFAULT_READINESS_RED_BUDGET};
+use crate::port_failure::{DriverFailure, PortFailure};
 use crate::port_task::{LineNotification, PortNotification, PortTaskKind, PortTaskOutcome, Readiness};
 
 /// The set of live ports, keyed by port number, plus the id allocator.
@@ -109,6 +110,25 @@ pub struct PortRegistry {
     /// that reply still reach the owner, exactly once, after the port is gone; the queue is
     /// drained by [`PortRegistry::take_completions`].
     closed_completions: Vec<PortCompletion>,
+    /// The **failures** of ports whose driver closed them (the C's `driver_failure*` family and
+    /// `driver_exit`), latched by [`DriverContext::signal_failure`](crate::DriverContext::signal_failure)
+    /// and harvested by [`PortRegistry::reap_failures`] in port-number order.
+    ///
+    /// Drained by [`PortRegistry::take_failures`], which the runtime calls after every round: a
+    /// failure is the *reason* a port disappeared, and rendering it as the owner's
+    /// `{'EXIT', Port, Reason}` signal (or as nothing at all, for `driver_exit`) is the runtime's
+    /// half — see [`PortFailure::failure`](crate::PortFailure::failure).
+    failures: Vec<PortFailure>,
+    /// Input the ports reaped by [`PortRegistry::reap_failures`] had **already** staged for their
+    /// owners, reported in the next round ahead of their [`PortNotification::Closed`].
+    ///
+    /// A driver delivers `driver_output` synchronously, so the bytes of the very callback that
+    /// latched a failure do reach the owner before the port's `Closed` — that is the pinned
+    /// `driver_output`-then-`driver_failure_posix` oracle row (`{data, …}` **then**
+    /// `{'EXIT', P, einval}`). Closing the port would drop the staged reads with it, so they are
+    /// harvested here; [`PortRegistry::take_reaped_notifications`] prepends them to the round's
+    /// notifications.
+    reaped_notifications: Vec<PortNotification>,
     /// Keeps this type single-threaded (`Cell` is neither `Send` nor `Sync`).
     single_threaded: PhantomData<Cell<()>>,
 }
@@ -121,6 +141,8 @@ impl PortRegistry {
             ports: HashMap::new(),
             closed: Vec::new(),
             closed_completions: Vec::new(),
+            failures: Vec::new(),
+            reaped_notifications: Vec::new(),
             single_threaded: PhantomData,
         }
     }
@@ -235,10 +257,13 @@ impl PortRegistry {
     ) -> Result<PortTaskOutcome> {
         self.schedule_events(events);
         let (ran, reds_used) = self.run_scheduled_tasks(poller, DEFAULT_READINESS_RED_BUDGET)?;
+        self.reap_failures(poller)?;
+        let mut notifications = self.take_reaped_notifications();
+        notifications.extend(self.take_closed_notifications());
         Ok(PortTaskOutcome {
             ran,
             reds_used,
-            notifications: self.take_closed_notifications(),
+            notifications,
         })
     }
 
@@ -339,11 +364,18 @@ impl PortRegistry {
             }
         }
 
+        // Reap the ports a driver closed from inside one of those callbacks (the C's
+        // `driver_failure*`/`driver_exit`) before the closes are reported: the teardown has to run
+        // while the round is still the only thing touching the registry, and a port reaped here
+        // must appear in this round's `Closed` reports like any other close.
+        self.reap_failures(poller)?;
+
         // Collect the closes only now that the round's fallible steps are behind us: an early
         // return above leaves them queued for the next round instead of dropping them, because
         // nothing has drained `self.closed` yet. Minting a report also retires the closed port's
         // number (see `take_closed_notifications`).
-        let mut notifications = self.take_closed_notifications();
+        let mut notifications = self.take_reaped_notifications();
+        notifications.extend(self.take_closed_notifications());
 
         // Harvest the data the INPUT tasks read: a port task never hands bytes up itself,
         // so the round reports them for the runtime to turn into `{Port, {data, Data}}`. A
@@ -780,6 +812,84 @@ impl PortRegistry {
                 PortNotification::Closed { port }
             })
             .collect()
+    }
+
+    /// Tears down every port whose driver closed it, in port-number order, and queues the
+    /// reasons for the runtime.
+    ///
+    /// This is the **only** consumer of [`Port::take_failure`]: a driver latches a
+    /// [`DriverFailure`] from inside its own callback (the C's `driver_failure*` family and
+    /// `driver_exit`, see [`crate::port_failure`]), and by the time the callback returns the port
+    /// must be closed — but not from inside the callback, which is still running on the driver.
+    /// So the port is reaped here, at the end of every entry point that drove a driver, through
+    /// the **ordinary** [`PortRegistry::close`] path: the driver's `stop` runs, the port leaves
+    /// the live map, its staged completions are harvested, and its number is retired when the
+    /// deferred [`PortNotification::Closed`] is minted — never here.
+    ///
+    /// Whatever a dying port had already staged for its owner is harvested first
+    /// ([`PortRegistry::take_reaped_notifications`]), so the bytes a failing callback delivered
+    /// before it failed still reach the owner ahead of the close — the pinned oracle row.
+    ///
+    /// A teardown failure does **not** stop the sweep: every latched port is reaped, and the first
+    /// error is reported afterwards (the failures themselves are queued regardless, so the
+    /// runtime learns every reason even when a driver's `stop` misbehaves).
+    fn reap_failures(&mut self, poller: &mut Poller) -> Result<()> {
+        // Snapshot the latched failures first: `close` needs the whole registry, and the port
+        // numbers are the deterministic visit order the rest of the round uses.
+        let latched: Vec<(PortId, DriverFailure)> = self
+            .sorted_keys()
+            .into_iter()
+            .filter_map(|key| {
+                let port = self.ports.get_mut(&key)?;
+                let failure = port.take_failure()?;
+                Some((port.id(), failure))
+            })
+            .collect();
+
+        let mut first_error = None;
+        for (id, failure) in latched {
+            self.failures.push(PortFailure::new(id, failure));
+            let staged = match self.ports.get_mut(&id.number()) {
+                Some(port) => port.take_input_notifications(),
+                None => Vec::new(),
+            };
+            self.reaped_notifications.extend(staged);
+            if let Err(err) = self.close(poller, id) {
+                first_error.get_or_insert(err);
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Drains the ports a driver closed into [`PortFailure`] values, in the order they were
+    /// reaped (port-number order within a round).
+    ///
+    /// This is the runtime's half of the failure channel: for each entry it renders the owner's
+    /// `{'EXIT', Port, Reason}` signal when
+    /// [`failure.signals_owner`](crate::DriverFailure::signals_owner) is set and **nothing** when
+    /// it is not (the `driver_exit` shape, where the C unlinks the connected process before
+    /// closing the port), using
+    /// [`reason.atom_name()`](crate::FailureReason::atom_name) for the atom-shaped reasons and
+    /// [`reason.code()`](crate::FailureReason::code) for the integer one.
+    ///
+    /// The port itself is already gone by the time this returns — its
+    /// [`PortNotification::Closed`] travels through [`PortTaskOutcome::notifications`] and is what
+    /// retires its number, so a consumer must treat the two as the same event's halves rather
+    /// than as two independent reports.
+    pub fn take_failures(&mut self) -> Vec<PortFailure> {
+        std::mem::take(&mut self.failures)
+    }
+
+    /// Drains the input the ports reaped by a driver failure had already staged for their owners.
+    ///
+    /// Prepended to each round's [`PortTaskOutcome::notifications`] (see
+    /// [`PortRegistry::execute_port_tasks`] and [`PortRegistry::handle_events`]), so a caller
+    /// draining the outcome sees a dying port's data before its [`PortNotification::Closed`].
+    fn take_reaped_notifications(&mut self) -> Vec<PortNotification> {
+        std::mem::take(&mut self.reaped_notifications)
     }
 
     /// Whether a port with id `id` is live.
