@@ -494,6 +494,10 @@ fn image_with_recs(recs: &[u8]) -> Vec<u8> {
     code.push(3); // `int_code_end`
     push_chunk(&mut body, b"Code", &code);
 
+    // `ImpT`/`ExpT` are mandatory chunks (`beam_load.c:155-169`); empty tables keep the
+    // image structurally complete so each case can only fail in the `Recs` parser.
+    push_chunk(&mut body, b"ImpT", &0u32.to_be_bytes());
+    push_chunk(&mut body, b"ExpT", &0u32.to_be_bytes());
     push_chunk(&mut body, b"Recs", recs);
     wrap(body)
 }

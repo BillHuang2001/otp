@@ -409,6 +409,10 @@ fn image_with_body(
     let mut chunks = Vec::new();
     push_chunk(&mut chunks, b"AtU8", &atoms);
     push_chunk(&mut chunks, b"Code", &code);
+    // `ImpT`/`ExpT` are mandatory chunks (`beam_load.c:155-169`); empty tables keep the
+    // image structurally complete so each case fails for the operand under test.
+    push_chunk(&mut chunks, b"ImpT", &0u32.to_be_bytes());
+    push_chunk(&mut chunks, b"ExpT", &0u32.to_be_bytes());
     for (id, payload) in extras {
         push_chunk(&mut chunks, id, payload);
     }

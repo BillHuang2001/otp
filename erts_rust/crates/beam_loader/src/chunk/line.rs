@@ -84,6 +84,12 @@ pub fn parse(data: &[u8], module_name: &str) -> Result<LineTable> {
                 current_name = magnitude as u32;
             }
             TAG_I => {
+                // `LoadAssert(val.size == 0 && val.word_value >= 0)`
+                // (`beam_file.c:519-522`): a negative line number is a corrupt line
+                // table, never the wrapped `4294967295` a plain `as u32` would store.
+                if item.word < 0 {
+                    return Err(bad_file("negative line number"));
+                }
                 items.push(LineEntry {
                     file: current_name,
                     line: magnitude as u32,
@@ -248,6 +254,21 @@ mod tests {
         let data = line_bytes(0, 0, 7, 5, 0, &[0x41, 0x61], &[]);
         let err = parse(&data, "mod").unwrap_err();
         assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn a_negative_line_number_is_rejected() {
+        // `LoadAssert(val.size == 0 && val.word_value >= 0)` (`beam_file.c:519-522`).
+        // `0x19` is a two-byte `i` magnitude, so `0xFF 0xFF` sign-extends to `-1`: a
+        // corrupt line table, never the wrapped line `4294967295`.
+        let data = line_bytes(0, 0, 1, 1, 0, &[0x19, 0xFF, 0xFF], &[]);
+        let err = parse(&data, "mod").unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+
+        // Control: the very same shape with a positive value loads as line 4.
+        let data = line_bytes(0, 0, 1, 1, 0, &[0x41], &[]);
+        let table = parse(&data, "mod").unwrap();
+        assert_eq!(table.items[1], LineEntry { file: 0, line: 4 });
     }
 
     #[test]

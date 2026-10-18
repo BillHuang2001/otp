@@ -25,9 +25,26 @@
 //! Names are **UTF-8, not Latin-1** (`beam_file.c:291`). Wire **index 0 is reserved
 //! for NIL**: index 1 is the module name and real atoms are `1..=count`
 //! (`beam_file.c:262-297`), so the total number of entries is `count + 1`.
-use beam_common::Result;
+//!
+//! Two structural bounds accompany the parse: `CHECK_ITEM_COUNT(count, 1, …)` requires
+//! **at least one** real atom (`beam_file.c:260`), and `erts_atom_put` rejects a name
+//! that is too large to be an atom (`atom.c:283-323`, non-truncating form) — see
+//! [`MAX_ATOM_SZ_LIMIT`] and [`MAX_ATOM_CHARACTERS`].
+use beam_common::{BeamError, Result};
 
 use crate::error::bad_file;
+
+/// The largest atom name in **characters** (`MAX_ATOM_CHARACTERS`, `atom.c:29`).
+///
+/// `erts_atom_put` runs the UTF-8 analyzer with this cap and, with `trunc == 0` (the
+/// loader's form), reports `ATOM_MAX_CHARS_ERROR` past it (`atom.c:313-323`).
+const MAX_ATOM_CHARACTERS: usize = 255;
+
+/// The largest atom name in **bytes** (`MAX_ATOM_SZ_LIMIT`, `atom.c:31`).
+///
+/// Checked before the UTF-8 analysis (`atom.c:284-286`), so an over-long name is rejected
+/// as a size limit rather than as an encoding error.
+const MAX_ATOM_SZ_LIMIT: usize = 4 * MAX_ATOM_CHARACTERS;
 
 /// The decoded atom names, in wire-index order.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -56,7 +73,12 @@ pub fn parse(data: &[u8]) -> Result<Vec<String>> {
     };
 
     // Wire index 0 is the reserved NIL placeholder (`beam_file.c:262-297`); real
-    // names occupy indices `1..=count`.
+    // names occupy indices `1..=count`. `CHECK_ITEM_COUNT(count, 1, …)` requires at
+    // least one real atom (`beam_file.c:260`): a module always names itself, so an
+    // empty table is a corrupt/missing one.
+    if count == 0 {
+        return Err(bad_file("empty atom table"));
+    }
     let mut names = Vec::new();
     names.push(String::new());
 
@@ -68,8 +90,19 @@ pub fn parse(data: &[u8]) -> Result<Vec<String>> {
         } else {
             reader.u8()? as usize
         };
+        // `atom.c:284-286`: a name longer than `MAX_ATOM_SZ_LIMIT` bytes is rejected
+        // before the encoding is even examined.
+        if len > MAX_ATOM_SZ_LIMIT {
+            return Err(BeamError::SystemLimit);
+        }
         let bytes = reader.bytes(len)?;
         let name = std::str::from_utf8(bytes).map_err(|_| bad_file("atom name is not UTF-8"))?;
+        // `atom.c:313-323`: `erts_analyze_utf8_x` caps the *character* count at
+        // `MAX_ATOM_CHARACTERS` and reports `ATOM_MAX_CHARS_ERROR` past it (the
+        // loader passes `trunc == 0`, so the cap is an error, not a truncation).
+        if name.chars().count() > MAX_ATOM_CHARACTERS {
+            return Err(BeamError::SystemLimit);
+        }
         names.push(name.to_string());
     }
 
@@ -100,10 +133,70 @@ mod tests {
         assert_eq!(names, vec!["".to_string(), "hello".into(), "abc".into()]);
     }
 
+    /// Packs a length as the long (varint) form's `u`-tagged number
+    /// (`beamreader_read_tagged`, `beam_file.c:167-240`).
+    fn long_length(value: u64) -> Vec<u8> {
+        if value <= 15 {
+            return vec![(value as u8) << 4];
+        }
+        if value < 0x800 {
+            return vec![0x08 | (((value >> 8) as u8) << 5), value as u8];
+        }
+        let count = ((64 - value.leading_zeros()) as usize + 7) / 8;
+        let mut out = vec![0x18 | (((count - 2) as u8) << 5)];
+        out.extend_from_slice(&value.to_be_bytes()[8 - count..]);
+        out
+    }
+
     #[test]
-    fn zero_atoms_yields_only_the_placeholder() {
-        let names = parse(&[0, 0, 0, 0]).unwrap();
-        assert_eq!(names, vec!["".to_string()]);
+    fn an_empty_atom_table_is_rejected() {
+        // `CHECK_ITEM_COUNT(count, 1, …)` (`beam_file.c:260`): a module always carries
+        // its own name, so a table with no real atoms (only the reserved NIL slot) is
+        // corrupt rather than a usable empty table.
+        let err = parse(&[0, 0, 0, 0]).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn an_atom_name_longer_than_the_byte_limit_is_rejected() {
+        // `MAX_ATOM_SZ_LIMIT` (1020 bytes, `atom.c:31,284-286`). Only the long (varint
+        // length) form can express a length above 255.
+        let len = MAX_ATOM_SZ_LIMIT + 1;
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-1i32).to_be_bytes()); // count = -1 (long form)
+        data.extend_from_slice(&long_length(len as u64));
+        data.extend(std::iter::repeat_n(b'a', len));
+        assert!(matches!(parse(&data).unwrap_err(), BeamError::SystemLimit));
+
+        // At the limit it is accepted (a 255-character name of 4-byte characters).
+        let name = "😀".repeat(MAX_ATOM_CHARACTERS);
+        assert_eq!(name.len(), MAX_ATOM_SZ_LIMIT);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-1i32).to_be_bytes());
+        data.extend_from_slice(&long_length(name.len() as u64));
+        data.extend_from_slice(name.as_bytes());
+        let names = parse(&data).unwrap();
+        assert_eq!(names[1], name);
+    }
+
+    #[test]
+    fn an_atom_name_longer_than_the_character_limit_is_rejected() {
+        // `MAX_ATOM_CHARACTERS` (255 characters, `atom.c:29,313-323`): 300 ASCII bytes
+        // are only 300 of the 1020 allowed *bytes* but 45 characters too many.
+        let name = "a".repeat(MAX_ATOM_CHARACTERS + 45);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-1i32).to_be_bytes()); // count = -1 (long form)
+        data.extend_from_slice(&long_length(name.len() as u64));
+        data.extend_from_slice(name.as_bytes());
+        assert!(matches!(parse(&data).unwrap_err(), BeamError::SystemLimit));
+
+        // Exactly 255 characters is the largest legal name.
+        let name = "a".repeat(MAX_ATOM_CHARACTERS);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-1i32).to_be_bytes());
+        data.extend_from_slice(&long_length(name.len() as u64));
+        data.extend_from_slice(name.as_bytes());
+        assert_eq!(parse(&data).unwrap()[1], name);
     }
 
     #[test]
