@@ -129,7 +129,7 @@ The **local record** of a process's relationships with processes on other nodes;
 
 ## Routing Table
 - `pid.rs` + `registers.rs` → process/port identity + the root-set containers (x-register file, Erlang stack, host-published extra roots).
-- `process.rs` → the PCB: state/flags/delivery/GC entry, the owned off-heap refc-binary list + its two sweeps (the reachability-driven `sweep_off_heap_binaries_reachable`/`gather_scan_roots`, over the safe `beam_gc::ReachableObject` view, and the conservative declared-dead `sweep_off_heap_binaries`), the relocation exemption + the host `CollectionGate` seam, the split borrows, the dict/saved-args/signal sub-rootsets, the two mature-space readers.
+- `process.rs` → the PCB: state/flags/delivery/GC entry, the chain-summed young occupancy (`heap_used_words`), the owned off-heap refc-binary list + its two sweeps (the reachability-driven `sweep_off_heap_binaries_reachable`/`gather_scan_roots`, over the safe `beam_gc::ReachableObject` view, and the conservative declared-dead `sweep_off_heap_binaries`) with its read-only `owned_off_heap` handle, the relocation exemption + the host `CollectionGate` seam, the split borrows, the dict/saved-args/signal sub-rootsets, the two mature-space readers.
 - `dict.rs` + `fragments.rs` → the per-process dictionary and the saved BIF/NIF argument roots (both GC sub-rootsets).
 - `max_heap.rs` → the `max_heap_size` policy types (`MaxHeapFlags`/`MaxHeapSetting`/`MaxHeapUsage`/`HeapLimitVerdict`) and their pure arithmetic; the per-process setting and the recorded verdict live on `process.rs`.
 - `run_queue.rs` + `scheduler.rs` → the four-level ready queue + the single-threaded scheduler (incl. the shared `slice_begin`/`slice_end`/`run_one`/`drain_woken_into` SMP-reuse seam).
