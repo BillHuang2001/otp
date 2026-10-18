@@ -37,9 +37,9 @@
 //!   distinction ([`DriverFailure::signals_owner`] `false` ⇒ the owner is told **nothing**), the
 //!   bytes handed up **before** the failure still reaching the owner ahead of the close, and a
 //!   delivery attempted **after** the failure being refused — the bytes reach nobody, and the
-//!   fixture's own log shows the delivery call's return code (`rc=-1`; a real `erts` answers the
-//!   C's *closing*-port code `0` instead, `io.c:6400-6401`, and drops the bytes all the same — see
-//!   `a_delivery_after_a_failure_is_refused_and_reaches_nobody`).
+//!   fixture's own log shows the delivery call's return code, the C's **`0`** (`rc=0`; the closing
+//!   short-circuit at `io.c:6400-6401`, not the invalid-handle `-1` of `io.c:6396-6397`) — see
+//!   `a_delivery_after_a_failure_answers_the_c_zero_and_reaches_nobody`.
 //!
 //! # The measured oracle (OTP 29.1.1 / erts-17.1)
 //!
@@ -564,21 +564,34 @@ fn data_delivered_before_a_failure_reaches_the_owner_ahead_of_the_close() {
     );
 }
 
-/// A delivery attempted **after** the failure is refused by the host (`rc=-1`), and reaches the
-/// owner as nothing at all: only the bytes handed up *before* the failure are delivered.
+/// A delivery attempted **after** the failure answers the C's `0` and reaches the owner as nothing
+/// at all: only the bytes handed up *before* the failure are delivered.
 ///
 /// Op `13` attempts a `driver_output2` after `driver_failure_posix`, op `14` a plain
 /// `driver_output` after `driver_failure_atom("enospc")`, so both delivery entry points are
-/// covered — and the refusal is observed on the fixture's **own** side of the ABI, not inferred.
+/// covered — and the return code is observed on the fixture's **own** side of the ABI, not
+/// inferred.
 ///
-/// **The return code is this crate's, not the C's spelling of the same refusal.** A real `erts`
-/// answers `0` here, because `driver_output2` short-circuits on `ERTS_PORT_SFLG_CLOSING` and drops
-/// the bytes (`io.c:6400-6401`); `-1` is its *invalid-handle* code (`io.c:6396-6397`). This host
-/// has already torn the port's delivery sink down by then, so the refusal surfaces as `-1`. The
-/// observable — nothing reaches the owner — is identical on both sides, and that half is what
-/// `the_rendered_rows_match_the_erl_oracle` pins against the real system.
+/// **The return code is the C's**, because a driver can observe it: `driver_output2` tests the
+/// handle first (`-1` iff `erts_drvport2port_state` reports `ERTS_INVALID_ERL_DRV_PORT`,
+/// `io.c:6396-6397`) and then short-circuits on `ERTS_PORT_SFLG_CLOSING` with **`0`**
+/// (`io.c:6400-6401`; `driver_output_binary` `io.c:6351-6352`, `driver_outputv` `io.c:6473-6474`;
+/// `driver_output` *is* `driver_output2(ix, NULL, 0, buf, len)`, `io.c:6442-6446`). A port whose
+/// driver just failed is on its way out (`driver_failure_term`, `io.c:7196-7224`) but still
+/// resolves — it is `EXITING`, not yet `FREE`/`INITIALIZING` (`erl_port.h:739-766`) — so the
+/// delivery is dropped with a **success** report.
+///
+/// Measured against the system runtime (OTP 29.1.1 / erts-17.1) with this fixture's opcodes: op
+/// `13` logs `call=driver_failure_posix rc=0` then `call=driver_output2_after_failure rc=0`, and op
+/// `14` `call=driver_failure_atom rc=0` then `call=driver_output_after_failure rc=0`, with no
+/// `{Port,{data,_}}` in either event stream. The measurement uses a copy of the fixture whose log
+/// path lives in a **static** buffer, because the real `erts` runs the driver's `stop`
+/// *synchronously inside* `driver_failure*` (so the committed fixture's `stop` frees the per-port
+/// state the next `log_call` would read). That ordering is this crate's one divergence here — the
+/// reaped port's `stop` runs after the round, hence after both `call=` lines — and it is not
+/// observable to the owner.
 #[test]
-fn a_delivery_after_a_failure_is_refused_and_reaches_nobody() {
+fn a_delivery_after_a_failure_answers_the_c_zero_and_reaches_nobody() {
     let Some(so) = shape_fixture_so() else {
         return;
     };
@@ -589,7 +602,7 @@ fn a_delivery_after_a_failure_is_refused_and_reaches_nobody() {
             DriverFailure::posix(libc::EINVAL),
             &[
                 "call=driver_failure_posix rc=0",
-                "call=driver_output2_after_failure rc=-1",
+                "call=driver_output2_after_failure rc=0",
             ],
         ),
         (
@@ -597,7 +610,7 @@ fn a_delivery_after_a_failure_is_refused_and_reaches_nobody() {
             DriverFailure::atom("enospc"),
             &[
                 "call=driver_failure_atom rc=0",
-                "call=driver_output_after_failure rc=-1",
+                "call=driver_output_after_failure rc=0",
             ],
         ),
     ];
@@ -606,7 +619,7 @@ fn a_delivery_after_a_failure_is_refused_and_reaches_nobody() {
         let driven = drive(&so, op, None);
         assert!(
             driven.reads.is_empty(),
-            "op {op}: the post-failure delivery must reach nobody — the C answers -1 to it"
+            "op {op}: the post-failure delivery must reach nobody"
         );
         assert!(
             driven.frames.is_empty(),
@@ -625,9 +638,8 @@ fn a_delivery_after_a_failure_is_refused_and_reaches_nobody() {
         assert_eq!(
             driven.log,
             expected_log(op, calls, true),
-            "op {op}: the fixture's own rc=-1 is the proof the host refused the post-failure \
-             delivery (a real erts drops it under the CLOSING short-circuit and answers 0 — the \
-             refusal, not the spelling, is what both sides share)"
+            "op {op}: the fixture's own rc=0 is the proof the post-failure delivery reported the \
+             C's closing code (`io.c:6400-6401`) while dropping the bytes"
         );
     }
 }

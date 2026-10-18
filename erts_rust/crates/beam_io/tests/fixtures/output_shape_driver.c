@@ -28,7 +28,8 @@
  * The `output` callback reads the **first byte** of the command as an opcode and then makes
  * the `driver_output*` / `driver_failure*` calls the opcode names. It logs one
  * `output op=<n>` line per command and one `call=<name> rc=<n>` line per C call it makes
- * (the C's own return code, so a refused call is observable as `rc=-1`):
+ * (the C's own return code, so the invalid-handle `-1` stays distinguishable from the
+ * closing-port `0`):
  *
  *   0  `driver_output(port, "", 0)`                    — an empty, present body
  *   1  `driver_output(port, NULL, 0)`                  — the C's `buf == NULL`: no body at all
@@ -47,9 +48,10 @@
  *      ordering row: the bytes handed up before the failure still reach the owner, ahead of
  *      the close
  *  13  `driver_failure_posix(port, EINVAL)` then `driver_output2(port, "h", 1, "b", 1)` — a
- *      delivery attempted **after** the failure, which the host must refuse (`rc=-1`)
+ *      delivery attempted **after** the failure: dropped, and it reports the C's closing-port
+ *      code `0` (`io.c:6400-6401`), never the invalid-handle `-1`
  *  14  `driver_failure_atom(port, "enospc")` then `driver_output(port, "x", 1)` — the same
- *      refusal through the plain `driver_output` entry point
+ *      drop-and-report-success through the plain `driver_output` entry point
  *  15  `driver_output(port, "abcdef", 6)` — one read of six bytes (the `{line,4}` column's
  *      over-limit single-read row)
  *
@@ -100,8 +102,9 @@ static void log_line(const shape_state *st, const char *text) {
     fclose(f);
 }
 
-/* Append `call=<name> rc=<code>`: the C entry point's own return code, so a refused delivery
- * (`-1`) is observable from the fixture's side of the ABI. */
+/* Append `call=<name> rc=<code>`: the C entry point's own return code, so the two answers a
+ * `driver_output*` can give — `0` on a closing port, `-1` for an unresolvable handle — are
+ * observable from the fixture's side of the ABI. */
 static void log_call(const shape_state *st, const char *name, int rc) {
     char line[128];
 

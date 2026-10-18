@@ -36,7 +36,7 @@
 
 use super::tests::{new_context_parts, new_host};
 use super::AbiHost;
-use beam_abi::driver::host::DriverHost;
+use beam_abi::driver::host::{DriverHost, PortFailure as AbiFailure};
 use beam_common::Result;
 use beam_process::PortId;
 use std::collections::VecDeque;
@@ -44,6 +44,7 @@ use std::collections::VecDeque;
 use crate::driver::Driver;
 use crate::poller::Poller;
 use crate::port::Port;
+use crate::port_failure::DriverFailure;
 use crate::port_task::{PortNotification, ReadMessage};
 use crate::DriverContext;
 
@@ -205,10 +206,129 @@ fn driver_output_without_a_read_sink_is_the_c_minus_one() {
 }
 
 // -----------------------------------------------------------------------------------------------
+// The `driver_output*` RETURN CODE: `0` on a closing port, `-1` only for an unresolvable handle
+// -----------------------------------------------------------------------------------------------
+
+/// The C's two distinct return codes, in the order the C tests them (`io.c:6387-6439`, with
+/// `driver_output` = `driver_output2(ix, NULL, 0, buf, len)`, `io.c:6442-6446`).
+///
+/// * **post-failure ⇒ `0`.** `driver_failure*`/`driver_exit` put the port on the way out
+///   (`driver_failure_term`, `io.c:7196-7224`), and the C answers `0` — bytes dropped — to a
+///   delivery on such a port (`io.c:6400-6401`, the `ERTS_PORT_SFLG_CLOSING` short-circuit). The
+///   `-1` at `io.c:6396-6397` is the *invalid-handle* code, not the closing one, so reporting `-1`
+///   here would be a divergence a driver can observe (measured against the system runtime: both
+///   post-failure entry points log `rc=0`, see `tests/abi_failure.rs`).
+/// * **invalid/unstarted handle ⇒ `-1`.** A call with no live port context — the driver calling in
+///   from outside its own callback, i.e. no resolvable handle — stays `-1`
+///   (`erts_drvport2port_state` ⇒ `ERTS_INVALID_ERL_DRV_PORT`, `erl_port.h:739-766`), *including*
+///   after a failure, because the C resolves the handle before it reads the CLOSING state.
+///
+/// Both hooks are pinned, nothing is staged by the refused-after-failure calls, and the bytes
+/// handed up **before** the failure survive it (the pinned `driver_output`-then-`driver_failure*`
+/// row).
+#[test]
+fn a_delivery_after_a_failure_answers_the_c_zero_not_minus_one() {
+    let mut host = new_host();
+    let (mut poller, mut input, mut output, mut arms) = new_context_parts();
+    let mut reads: VecDeque<ReadMessage> = VecDeque::new();
+    let mut failure: Option<DriverFailure> = None;
+
+    // An unstarted host — no callback context installed — is the C's invalid handle.
+    assert_eq!(
+        DriverHost::output(&mut host, core::ptr::null_mut(), b"nobody"),
+        -1,
+        "no installed context is the invalid-handle arm, never a delivery"
+    );
+    assert_eq!(
+        DriverHost::output2(&mut host, core::ptr::null_mut(), b"h", Some(b"b")),
+        -1
+    );
+
+    {
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut poller,
+            &mut input,
+            &mut output,
+            &mut arms,
+        )
+        .with_reads(&mut reads)
+        .with_failure(&mut failure);
+        host.install(&mut ctx);
+
+        // A healthy port: both hooks deliver and answer the C's `0`.
+        assert_eq!(
+            DriverHost::output(&mut host, core::ptr::null_mut(), b"before"),
+            0
+        );
+        assert_eq!(
+            DriverHost::output2(&mut host, core::ptr::null_mut(), b"hdr", Some(b"body")),
+            0
+        );
+
+        // The driver fails its own port — accepted, and the host is now closing.
+        assert_eq!(
+            DriverHost::failure(&mut host, AbiFailure::Posix(libc::EINVAL)),
+            0,
+            "the failure request itself answers the C's 0"
+        );
+        assert!(host.closing, "the accepted failure closes the host");
+
+        // Post-failure deliveries: the C's `0`, and **nothing** is staged.
+        assert_eq!(
+            DriverHost::output(&mut host, core::ptr::null_mut(), b"after"),
+            0,
+            "driver_output after driver_failure_posix answers the C's closing code 0, not -1"
+        );
+        assert_eq!(
+            DriverHost::output2(&mut host, core::ptr::null_mut(), b"h", Some(b"b")),
+            0,
+            "driver_output2 after a failure answers 0 as well"
+        );
+        assert_eq!(
+            DriverHost::failure(&mut host, AbiFailure::Atom("enospc")),
+            0,
+            "a second failure is accepted and ignored, as in the C"
+        );
+        assert_eq!(
+            DriverHost::port_exit(&mut host, 0),
+            0,
+            "driver_exit is driver_failure_term too (io.c:7234-7255)"
+        );
+        host.clear();
+
+        // The handle no longer resolves once the callback has returned: the C tests the handle
+        // BEFORE the CLOSING state, so this stays -1 even though the port failed.
+        assert_eq!(
+            DriverHost::output(&mut host, core::ptr::null_mut(), b"outside"),
+            -1,
+            "a call outside any callback is the invalid-handle arm, failure or not"
+        );
+    }
+
+    assert_eq!(
+        failure,
+        Some(DriverFailure::posix(libc::EINVAL)),
+        "exactly one failure is latched (the first), the later ones are ignored"
+    );
+    assert_eq!(
+        reads,
+        VecDeque::from([
+            ReadMessage::body_only(b"before".to_vec()),
+            ReadMessage {
+                header: b"hdr".to_vec(),
+                body: Some(b"body".to_vec()),
+            },
+        ]),
+        "only what was handed up BEFORE the failure reaches the owner; the post-failure \
+         deliveries stage nothing at all"
+    );
+}
+
+// -----------------------------------------------------------------------------------------------
 // The end-to-end owner path: a driver reporting through a real `AbiHost` — exactly how a loaded C
 // driver's `driver_output*` calls arrive — down to the `PortNotification`s the runtime renders.
 // -----------------------------------------------------------------------------------------------
-
 /// One `driver_output*` call a [`HostOutputDriver`] makes in its single `ready_input`.
 enum HostCall {
     /// `driver_output(ix, buf, len)` (`io.c:6405-6415`): one body-only read.
