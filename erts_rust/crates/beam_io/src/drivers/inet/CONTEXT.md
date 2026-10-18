@@ -281,7 +281,7 @@ Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p b
 - `opcode_tests_states.rs` → the numeric bridge's state-machine suite: cached-`stype` post-close `GETTYPE`, the fake `SETNAME`/`SETPEER` endpoint, the `GETLADDRS`/`GETPADDRS` fallbacks, the refusal ladders, the C's guard order, the synchronous `connect` completion and its clamped wait budget, `LISTEN`'s idempotence, and the byte-exact `LISTEN`/`CONNECT` oracle rows (15)
 - `opcode_tests_refusals.rs` → the refusal-and-adoption suite split out of `opcode_tests.rs`: `FDOPEN`(13)'s pre-adoption ladder over a caller-supplied descriptor (Rust-side for a descriptor this process owns, `erl`-compared for a closed number), the bound/unconnected and connected adoptions with their prebound-never-closed invariant, the second-adoption refusal, a UDP adoption, and the four interface requests `GETIFLIST`/`IFGET`/`IFSET`/`GETIFADDRS`(21/22/23/25) against the live host tables (13)
 - `frame_tests.rs` → the in-module framing suite (15)
-- `udp/udp_tests.rs` → the in-module datagram suite (31)
+- `udp/udp_tests.rs` → the in-module datagram suite (37): the verbs over real loopback sockets, the queued-command path (unconnected `sendto`/connected-ignore-address/socket-less refusal/the ancillary-word ladder), the two-form command grammar, and the five `erl`-oracle cross-checks
 - `../../../tests/inet.rs` → the crate-level integration + `erl`-oracle suite (8) (parent node)
 - `../../../tests/udp_inet.rs` → the crate-level datagram integration + `erl`-oracle suite (5) (parent node)
 
