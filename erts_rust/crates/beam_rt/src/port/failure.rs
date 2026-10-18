@@ -88,7 +88,7 @@ use beam_process::PortId;
 
 use super::PortSignalReason;
 use crate::port::completion::ClosedPortSnapshot;
-use crate::port::PortRegistry;
+use crate::port::{FailedReadRecipient, PortRegistry};
 
 /// The [`PortSignalReason`] a driver-declared failure becomes.
 ///
@@ -142,6 +142,10 @@ impl PortRegistry {
         // A completion staged around the teardown still needs its recipient, and the metadata is
         // about to be removed (see [`super::completion::ClosedPortSnapshot`]).
         let snapshot = self.closed_snapshot(id);
+        // The read this callback delivered **before** it failed is still owed to the owner
+        // (`beam_io` re-prepends it for the reaped port), so its recipient is captured here too —
+        // the same reason, and the same instant.
+        self.remember_failed_read(id);
         // The signals are read **before** the metadata goes: the link set and the incoming
         // monitors are the only sources of the recipients.
         let signals = self.port_exit_signals(
@@ -160,6 +164,30 @@ impl PortRegistry {
             .retain(|event| event.port() != Some(id));
         self.push_port_signals(signals);
         snapshot
+    }
+
+    /// Captures the recipient facts of `id` for the read a failing driver callback delivered
+    /// **before** it failed its own port.
+    ///
+    /// [`beam_io`] re-prepends a reaped port's staged bytes (`take_reaped_notifications`), so the
+    /// read really is reported to the runtime — after [`PortRegistry::fail_port`] has removed the
+    /// port's metadata, which is where [`PortRegistry::fold_notifications`]' `Data` arm reads a
+    /// read's recipient from. This is that recipient, taken at the only moment it is still
+    /// readable, and consumed by that fold (see [`super::FailedReadRecipient`]).
+    ///
+    /// A port this registry no longer holds records nothing: there is then no truthful recipient,
+    /// and the fold drops the read rather than delivering it to a stale owner.
+    fn remember_failed_read(&mut self, id: PortId) {
+        if let Some(meta) = self.meta.get(&id.number()) {
+            self.failed_read_recipients.insert(
+                id.number(),
+                FailedReadRecipient {
+                    owner: meta.owner,
+                    stream: meta.stream,
+                    shape: meta.kind.stream_shape(),
+                },
+            );
+        }
     }
 }
 
