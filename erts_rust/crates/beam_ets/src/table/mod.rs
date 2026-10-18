@@ -686,7 +686,8 @@ impl Table {
     ///
     /// Only a removal that actually happened calls this, so a `delete` of an absent
     /// key — a common no-op — never churns the index.
-    fn release_empty_interior(&mut self) {        if self.interior.size() == 0 {
+    fn release_empty_interior(&mut self) {
+        if self.interior.size() == 0 {
             self.interior = build_interior(
                 self.opts.kind(),
                 self.set_interior,

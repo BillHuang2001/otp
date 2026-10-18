@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_is_monotonic_and_at_least_one_word_per_entry() {
+    fn memory_never_falls_on_insert_and_is_at_least_one_word_per_entry() {
         let atoms = AtomTable::new();
         let mut t = SortedOrderedInterior::new();
         assert_eq!(t.memory(), 0, "an empty vector owns no storage");

@@ -569,7 +569,8 @@ impl Interior for ChampInterior {
         // surviving node's over-sized slot vectors (`trim_capacities`), so the
         // count tracks the live tree rather than its high-water mark.
         words_of::<Node>() + heap_words(&self.root)
-    }}
+    }
+}
 
 #[cfg(test)]
 mod tests {

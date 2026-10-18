@@ -124,7 +124,8 @@ impl HashInterior {
     /// The bucket a key hashes to. `buckets` is never empty (it starts at
     /// [`INITIAL_BUCKETS`], doubles past the load factor and never shrinks below
     /// the starting count), so the modulo is well defined.
-    fn bucket_index(&self, key: Eterm, atoms: &AtomTable) -> usize {        (term_hash(key, atoms) as usize) % self.buckets.len()
+    fn bucket_index(&self, key: Eterm, atoms: &AtomTable) -> usize {
+        (term_hash(key, atoms) as usize) % self.buckets.len()
     }
 
     /// The number of hash slots this index exposes (`ets:slot/2`'s
@@ -376,7 +377,8 @@ impl HashInterior {
     /// `_atoms` is accepted for signature symmetry with the other `&AtomTable`
     /// operations: atom storage is global (the runtime's `AtomTable`), not owned by
     /// the interior, so it contributes no words here.
-    pub fn memory(&self, _atoms: &AtomTable) -> usize {        self.memory_words()
+    pub fn memory(&self, _atoms: &AtomTable) -> usize {
+        self.memory_words()
     }
 
     /// The interior's word count, shared by the inherent

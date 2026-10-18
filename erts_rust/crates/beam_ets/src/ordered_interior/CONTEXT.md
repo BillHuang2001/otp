@@ -92,7 +92,7 @@ periodically re-asserts `check_invariants`, checks membership/`lookup` and
 re-checks membership + the walk, re-inserts everything, walks again, then drains back to empty — all
 with immediates (no `Heap`), so it measures the index alone (~0.4 s). `tests.rs` tests cover the empty
 case, replace/`insert_new`/`delete_object`, mixed key classes, present/absent/boundary navigation, the
-replace-key-term rule, and memory monotonicity; both interiors are driven through the `Interior` seam
+replace-key-term rule, and memory accounting across churn; both interiors are driven through the `Interior` seam
 by shared helpers. `../interior_parity.rs` proves the B+-tree and the sorted `Vec` produce identical
 observable traces. End-to-end `ordered_set` behaviour is oracle-differential-tested in
 `../tests/differential/` (navigation, 10 001-key, matchspec, ...). No `#[ignore]` in `tests.rs` or

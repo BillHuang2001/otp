@@ -395,7 +395,9 @@ impl NodeStore {
     pub(crate) fn needs_compaction(&self) -> bool {
         let live = self.slots.len() - self.retired.len();
         self.retired.len() > live
-    }    /// Compact the arena: drop every retired slot, renumber the live ones densely,
+    }
+
+    /// Compact the arena: drop every retired slot, renumber the live ones densely,
     /// rewrite every internal id (`root`, branch children, leaf links) through the
     /// renumbering, and release each surviving node's over-sized vector capacity.
     ///
