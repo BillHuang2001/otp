@@ -56,8 +56,7 @@ use std::time::Instant;
 use beam_common::Result;
 
 use super::super::op_queue::{
-    async_ok_reply, deadline_for, drain_closed, length_too_large, parse_recv_operand, AsyncQueue,
-    RecvOp,
+    async_ok_reply, deadline_for, drain_closed, parse_recv_operand, RecvOp,
 };
 use super::super::wire::{ctl_xerror, pack_address, split_caller_ref_parts};
 use super::{UdpInetDriver, DATAGRAM_CHUNK};
@@ -74,10 +73,14 @@ impl UdpInetDriver {
     /// 1. no socket ⇒ `[0]exbadport` (`!IS_OPEN`, `:14980`);
     /// 2. `active || len != 8` ⇒ `[0]einval` (`:14988`) — an active-mode socket has no passive
     ///    receive, and the operand is the eight-byte `Timeout(4), Length(4)` record;
-    /// 3. a `Length` above the C's `TCP_MAX_PACKET_SIZE` ⇒ `[0]enomem` (`:12301`, the bound the
-    ///    stream arm applies to the same operand);
-    /// 4. the single receive slot is taken ⇒ `[0]ealready` (`enq_async` returning `< 0`,
+    /// 3. the single receive slot is taken ⇒ `[0]ealready` (`enq_async` returning `< 0`,
     ///    `:15003`).
+    ///
+    /// `Length` — the operand's second word — is **ignored** here, exactly as the C says it is:
+    /// "The 2nd arg, Length(4), is ignored for both UDP and SCTP protocols, since they are
+    /// msg-oriented" (`:14992`). The `TCP_MAX_PACKET_SIZE` bound the stream arm enforces on the
+    /// same operand has no datagram counterpart, so an over-long `Length` is *accepted*
+    /// (measured: `[1,0,0]`, not `[0]enomem`). The datagram is delivered whole either way.
     ///
     /// The id is taken **before** step 4, so a refused enqueue still advances
     /// `NEW_ASYNC_ID`'s counter — measured on the oracle: `[1,0,0]`, then `[0]ealready`, then
@@ -100,15 +103,10 @@ impl UdpInetDriver {
         let Some((timeout_ms, length)) = parse_recv_operand(arg) else {
             return Ok(ctl_xerror("einval"));
         };
-        // The C's datagram arm never reads `Length` (the comment at `:14993` says so), but the
-        // same operand's bound is the one the stream arm enforces, and an over-long request is
-        // never satisfiable — report the C's own refusal instead of queueing it.
-        if length_too_large(length) {
-            return Ok(ctl_xerror("enomem"));
-        }
         let id = self.async_ops.next_id();
         let op = RecvOp {
             id,
+            // Carried, never consulted: the C's datagram arm ignores `Length` (`:14992`).
             length,
             deadline: deadline_for(timeout_ms),
         };
@@ -296,10 +294,12 @@ impl UdpInetDriver {
     /// never re-prefixed; [`UdpInetDriver::caller_stripped`] records that, and
     /// [`UdpInetDriver::settle_command`] clears it when the command is done with.
     ///
-    /// A payload carrying no prefix — including the `[0,0]` zero-length-tag form — is written
-    /// verbatim and produces **no** completion (the C's `inet_reply_finish` sends nothing without a
-    /// caller, `:2628`), and a socket-less port is not inspected at all, so its refusal keeps every
-    /// byte queued.
+    /// A **zero-length** tag (`[0,0]`) is a well-formed prefix the C consumes too
+    /// ([`split_caller_ref_parts`]): the two length bytes come off the queue and **no**
+    /// [`InetReply`] is staged for it, because the C's `inet_reply_finish` has no tag to append.
+    /// A payload carrying no prefix at all is written verbatim and likewise produces no
+    /// completion, and a socket-less port is not inspected at all, so its refusal keeps every byte
+    /// queued.
     fn strip_caller_prefix(&mut self, ctx: &mut DriverContext<'_>) -> usize {
         if self.caller_stripped || self.socket.is_none() {
             return 0;
@@ -315,7 +315,9 @@ impl UdpInetDriver {
         if prefix == 0 {
             return 0;
         }
-        self.caller_ref = Some(tag);
+        // An empty tag means "no caller": the C stages nothing for it, so the reply state stays
+        // `None` while the consumed prefix is still counted.
+        self.caller_ref = if tag.is_empty() { None } else { Some(tag) };
         ctx.output().consume(prefix);
         prefix
     }

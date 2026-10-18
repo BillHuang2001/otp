@@ -896,11 +896,13 @@ fn a_command_answers_its_caller_tag_verbatim() {
     );
 }
 
-/// A `[0,0]`-prefixed command carries a **zero-length** tag, which `init_caller` reads as "no
-/// caller at all": the bytes are written verbatim and `inet_reply_finish` sends nothing
-/// (`inet_drv.c:2628`), so no completion is staged and the port stays live.
+/// A `[0,0]`-prefixed command carries a **zero-length** tag: `init_caller`
+/// (`inet_drv.c:1854`-`:1881`) still consumes the two length bytes — the tag is simply empty — so
+/// the payload reaches the peer unchanged while `inet_reply_finish` stages **no**
+/// `{inet_reply, …}` for it (`:2628`). Measured on the oracle: `port_command(P, <<0:16,"raw">>)`
+/// delivers exactly `"raw"`, and the caller's mailbox stays empty.
 #[test]
-fn a_command_without_a_caller_tag_stages_no_reply() {
+fn a_zero_length_caller_tag_is_consumed_and_stages_no_reply() {
     let (mut port, mut peer) = linked();
     let mut command = vec![0, 0];
     command.extend_from_slice(b"raw");
@@ -908,18 +910,28 @@ fn a_command_without_a_caller_tag_stages_no_reply() {
     port.command(&command).expect("the command is accepted");
     assert!(
         port.completions().is_empty(),
-        "a NULL caller produces no {{inet_reply, …}}"
+        "an empty tag has no caller to answer"
     );
     assert!(port.contains(), "and the port is untouched");
 
     peer.set_read_timeout(Some(Duration::from_millis(500)))
         .expect("a read timeout on the far end");
-    let mut payload = [0u8; 5];
+    let mut payload = [0u8; 3];
     peer.read_exact(&mut payload)
-        .expect("the bytes reach the peer verbatim");
+        .expect("the payload reaches the peer");
     assert_eq!(
         &payload,
-        &[0, 0, b'r', b'a', b'w'],
-        "without a caller the whole command is payload"
+        b"raw",
+        "the two length bytes are consumed, the payload is not"
+    );
+    let err = peer
+        .read(&mut [0u8; 1])
+        .expect_err("nothing else was written");
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "the socket carries no trailing bytes: {err:?}"
     );
 }

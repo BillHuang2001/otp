@@ -598,13 +598,24 @@ pub(super) const ETF_VERSION_MAGIC: u8 = 131;
 /// needs the prefix **length** (derivable as `arg.len() - rest.len()`) to count the bytes it
 /// consumed from the port's output queue.
 ///
-/// `None` under exactly the conditions [`split_caller_ref`] documents.
+/// # The zero-length tag is a prefix too
+///
+/// `n == 0` is a **well-formed** prefix: the C's `init_caller` (`inet_drv.c:1854`-`:1881`) reads
+/// the 16-bit length, skips the 2-byte word and only then looks at the `n` tag bytes — so a
+/// `[0,0]` head is consumed and never reaches the wire. Measured on the oracle:
+/// `port_command(P, <<0:16,"raw">>)` on a connected `tcp_inet` port delivers exactly `"raw"` to the
+/// peer. The returned tag is the **empty** slice (it is what the eventual
+/// `inet_reply_finish` sees as a `NULL`/empty tag buffer, so the caller must stage **no**
+/// `InetReply` for it), and the payload is everything after the two length bytes.
+///
+/// `None` for a truncated prefix (fewer than two bytes, so there is no length word at all) and for
+/// a non-empty tag that does not start with [`ETF_VERSION_MAGIC`] or does not fit.
 pub(super) fn split_caller_ref_parts(arg: &[u8]) -> Option<(&[u8], &[u8])> {
     let n = usize::from(u16::from_be_bytes([*arg.first()?, *arg.get(1)?]));
-    // `init_caller`'s `*size_p < 2` / `*size_p < n` guards: a zero-length or otherwise
-    // non-fitting tag carries no caller reference at all.
+    // `init_caller`'s `*size_p < n` guard is trivially satisfied for `n == 0`, so the C consumes
+    // the length word and keeps an empty tag; nothing of the tag needs to look like ETF.
     if n == 0 {
-        return None;
+        return Some((&arg[2..2], &arg[2..]));
     }
     if *arg.get(2)? != ETF_VERSION_MAGIC {
         return None;
@@ -627,8 +638,9 @@ pub(super) fn split_caller_ref_parts(arg: &[u8]) -> Option<(&[u8], &[u8])> {
 ///
 /// **This crate's [`Driver`](crate::Driver)/[`DriverContext`](crate::DriverContext) seam carries
 /// no caller**, so the receiving side has to decide from the payload alone: a `[n:be16][n
-/// bytes]` prefix whose `n` is non-zero, fits inside `arg`, and whose first tag byte is
-/// [`ETF_VERSION_MAGIC`] is treated as a caller reference.
+/// bytes]` prefix whose `n` fits inside `arg` and whose tag is either **empty** (`n == 0`, a
+/// well-formed zero-length prefix the C consumes too — see [`split_caller_ref_parts`]) or
+/// non-empty and starting with [`ETF_VERSION_MAGIC`] is treated as a caller reference.
 ///
 /// Returns the bytes **after** the prefix, or `None` when `arg` is not in that form (the caller
 /// then falls back to the plain `[address][data]` grammar).
@@ -636,12 +648,13 @@ pub(super) fn split_caller_ref_parts(arg: &[u8]) -> Option<(&[u8], &[u8])> {
 /// # Only a fallback — the plain form is authoritative
 ///
 /// A plain command's first byte is an address family tag and byte 2 is the target port's **low**
-/// byte, so a plain command *can* satisfy this shape (e.g. `n` = `0x0100 + port_hi` with
+/// byte, so a plain command *can* satisfy the non-empty shape (e.g. `n` = `0x0100 + port_hi` with
 /// `port_lo == 0x83`). [`UdpInetDriver::verb_send`](super::udp) therefore tries the plain
 /// `[address][data]` grammar **first** and only calls this function when that refuses; a genuinely
 /// prefixed command always survives that order because a `prim_inet` tag's 16-bit length has a
 /// zero high byte (`term_to_binary/1` of a monitor reference is ~15 bytes), never a valid address
-/// tag (1/3/4).
+/// tag (1/3/4). The zero-length form needs no such protection: `0` is not an address tag either,
+/// so a plain `[address][data]` command can never begin with `[0,0]`.
 ///
 /// Residual: a *prefixed* command whose tag length is ≥ 256 would have a first byte of 1/3/4 and
 /// be read as plain. `prim_inet:send/3`'s reference tag is far smaller, so that cannot arise from

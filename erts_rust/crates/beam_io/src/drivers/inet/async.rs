@@ -849,10 +849,13 @@ impl TcpInetDriver {
     /// records that this command's prefix is already off. The flag is cleared when the queue
     /// drains ([`TcpInetDriver::write_pending`]), so the next command is examined afresh.
     ///
-    /// A payload that carries no prefix — including the `[0,0]` "zero-length tag" form — is
-    /// written verbatim and produces **no** completion at all (the C's `inet_reply_finish` sends
-    /// nothing when it has no caller, `:2628`), and a socket-less port is not inspected at all so
-    /// its refusal keeps every byte queued.
+    /// A **zero-length** tag (`[0,0]`) is still a prefix: the C's `init_caller` consumes the
+    /// length word and keeps an empty tag buffer, so the two bytes come off the queue and the
+    /// payload reaches the socket unchanged — measured on the oracle, `port_command(P,
+    /// <<0:16,"raw">>)` delivers exactly `"raw"` — while **no** completion is staged for it (the
+    /// C's `inet_reply_finish` has no tag to append, `:2628`). A payload carrying no prefix at all
+    /// is written verbatim, likewise with no completion, and a socket-less port is not inspected
+    /// at all so its refusal keeps every byte queued.
     fn strip_caller_prefix(&mut self, ctx: &mut DriverContext<'_>) -> usize {
         if self.caller_stripped || !self.state.is_connected() {
             return 0;
@@ -868,7 +871,8 @@ impl TcpInetDriver {
         if prefix == 0 {
             return 0;
         }
-        self.caller_ref = Some(tag);
+        // An empty tag means "no caller": nothing is answered, but the prefix is still consumed.
+        self.caller_ref = if tag.is_empty() { None } else { Some(tag) };
         ctx.output().consume(prefix);
         prefix
     }
