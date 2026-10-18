@@ -454,6 +454,125 @@ pub(super) fn set_socket_int_option(
     Ok(())
 }
 
+/// Reads the `struct linger` of `fd` (`SO_LINGER`) as its `(l_onoff, l_linger)` pair — the two
+/// integers the C's `INET_OPT_LINGER` record carries (`inet_fill_opts`, `inet_drv.c:9505`).
+///
+/// # Errors
+///
+/// `BeamError::Io` when `getsockopt(2)` fails.
+pub(super) fn get_socket_linger(fd: RawFd) -> Result<(i32, i32)> {
+    // SAFETY: `value` is a writable `struct linger` and `len` its exact size, which is the
+    // out-parameter pair `getsockopt(2)` expects, so the kernel writes at most `len` bytes.
+    let mut value = libc::linger {
+        l_onoff: 0,
+        l_linger: 0,
+    };
+    let mut len = std::mem::size_of::<libc::linger>() as libc::socklen_t;
+    // SAFETY: `fd` is a socket owned by this driver, `level`/`name` name a socket option, and
+    // `value`/`len` are a valid buffer and its size.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::addr_of_mut!(value).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    Ok((value.l_onoff, value.l_linger))
+}
+
+/// Writes the `struct linger` of `fd` (`SO_LINGER`), the companion of [`get_socket_linger`].
+///
+/// # Errors
+///
+/// `BeamError::Io` when `setsockopt(2)` fails.
+pub(super) fn set_socket_linger(fd: RawFd, l_onoff: i32, l_linger: i32) -> Result<()> {
+    let value = libc::linger { l_onoff, l_linger };
+    // SAFETY: `value` is a local `struct linger` and its size is the option length, so the
+    // kernel reads only those initialized bytes and never retains the pointer.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Reads an option whose value is a caller-sized **byte buffer** (`getsockopt(2)`), returning how
+/// many bytes the kernel wrote.
+///
+/// This is the raw-payload companion of [`get_socket_int_option`], for the options whose value is
+/// not an `int`: a `struct linger`, a device name (`SO_BINDTODEVICE`), or a caller-nominated
+/// `INET_OPT_RAW` option.
+///
+/// # Errors
+///
+/// `BeamError::Io` when `getsockopt(2)` fails (an option the descriptor does not serve, or a
+/// descriptor that is no longer a socket).
+pub(super) fn get_socket_bytes(
+    fd: RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    buf: &mut [u8],
+) -> Result<usize> {
+    let mut len = buf.len() as libc::socklen_t;
+    // SAFETY: `buf` is a writable slice of `buf.len()` bytes and `len` its exact size, so the
+    // kernel writes at most those bytes and never retains the pointer.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    Ok((len as usize).min(buf.len()))
+}
+
+/// Writes an option whose value is a caller-sized **byte buffer** (`setsockopt(2)`), the
+/// companion of [`get_socket_bytes`].
+///
+/// # Errors
+///
+/// `BeamError::Io` when `setsockopt(2)` fails.
+pub(super) fn set_socket_bytes(
+    fd: RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    buf: &[u8],
+) -> Result<()> {
+    // SAFETY: `buf` is an initialized slice of `buf.len()` bytes and that length is passed as the
+    // option length, so the kernel reads only those bytes and never retains the pointer.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            buf.as_ptr().cast(),
+            buf.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// Shuts `fd` down in the direction `how` names (`SHUT_*`).
 ///
 /// # Errors

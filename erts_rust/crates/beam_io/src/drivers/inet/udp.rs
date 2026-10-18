@@ -159,7 +159,7 @@ use crate::error;
 use crate::poller::{Interest, Token};
 
 use super::adopt_probe::adoption_reply;
-use super::opt::{get_options, set_options, SocketOptions};
+use super::opt::{get_options, set_options, OptScope, SocketOptions};
 use super::opcode::{decode as decode_opcode, Opcode};
 use super::sys::{
     bind_socket, close_fd, connect_socket, dgram_socket_fd, has_peer, hostname, local_port,
@@ -964,7 +964,8 @@ pub struct UdpInetDriver {
     /// `BeamError::BadArg` for a truncated `{active, N}` record (never for a served option — a
     /// rejected `setsockopt(2)` is not propagated, mirroring the C's `propagate = 0`).
     fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        set_options(&mut self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_UDP);
+        set_options(&mut self.options, scope, self.socket, arg)
     }
 
     /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
@@ -978,7 +979,8 @@ pub struct UdpInetDriver {
     ///
     /// `BeamError::Io` when a served option's `getsockopt(2)` fails on a live socket.
     fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
-        get_options(&self.options, self.stype, self.socket, arg)
+        let scope = OptScope::new(self.stype, self.family, libc::IPPROTO_UDP);
+        get_options(&self.options, scope, self.socket, arg)
     }
 
     /// The `INET_REQ_NAME` reply (`inet_drv.c:11329`).
