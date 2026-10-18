@@ -75,6 +75,7 @@ use crate::port::RuntimePorts;
 use super::bridges::PendingInterner;
 use super::bridges::{DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge};
 use super::dispatch::DispatchHooks;
+use super::export_gate::ExportGateBridge;
 use super::fun_identity::FunIdentityBridge;
 use super::memory_hook::RuntimeMemory;
 use super::module_info::ModuleInfoBridge;
@@ -276,6 +277,10 @@ impl<'a> RuntimeContext<'a> {
         // Whether this is `records:get_definition/2`, which needs the record-source bridge
         // (a `&CodeServer` borrow, and therefore a fourth mutually exclusive arm).
         let uses_record_source = hooks.record_source;
+        // Whether this is `erlang:binary_to_term/2`, whose `[safe]` decode consults the
+        // active-export gate — a `&CodeServer` **plus** `&BifRegistry` borrow, and therefore its
+        // own mutually exclusive arm next to the record-source one (see [`ExportGateBridge`]).
+        let uses_export_gate = hooks.export_gate;
         // Whether this is `erlang:send/2`/`erlang:'!'/2`, which need the message-delivery
         // bridge (a fifth arm: it borrows the whole `Runtime` like the fun-caller bridge, and
         // the two cannot co-exist — see [`SendBridge`]).
@@ -555,6 +560,34 @@ impl<'a> RuntimeContext<'a> {
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
                     .with_record_source(&mut source)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                invoke_registered(bif, arity, &mut context, args)
+            } else if uses_export_gate {
+                // `erlang:binary_to_term/2`: the `[safe]` decode's `EXPORT_EXT` check asks "is
+                // this `M:F/A` exported by code loaded *now*?", which only the runtime knows —
+                // the loaded-module cache plus the registered BIFs (see [`ExportGateBridge`]).
+                // Both are immutable borrows of the runtime, so this is its own mutually
+                // exclusive arm. The gate is installed **unconditionally on this key**: the
+                // codec consults it only under `[safe]` and only for an `EXPORT_EXT`, so the
+                // flag-free decode — and every `[used]` call — is byte-for-byte unchanged. The
+                // key applies no fun argument and touches no dictionary.
+                let gate = ExportGateBridge::new(&runtime.code_server, &runtime.registry);
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_export_gate(&gate)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node);
                 if let Some(fun_identity) = fun_identity.as_mut() {
