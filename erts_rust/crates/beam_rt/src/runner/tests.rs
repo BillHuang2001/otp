@@ -942,10 +942,11 @@ run() ->
 /// them is the machine's `Machine::refc_binaries` reservoir (never cleared by `Machine::reset`;
 /// pruned at the slice boundary once the process's binary virtual heap triggers, see
 /// `RuntimeRunner::reclaim_off_heap_binaries`), which the runner keeps where it is rather than
-/// mirroring it: it reads them back through `RunnerState::reservoir_at`. The process's **own** off-heap table is therefore handed out
-/// **no slot at all** — which is the whole point, because `beam_gc::OffHeap`'s slot space is
-/// never compacted, so a slot per payload per slice made the O(slots) `overhead_bytes`/`sweep`
-/// walks quadratic in the number of iterations a build-a-binary loop had run.
+/// mirroring it: it reads them back through `RunnerState::reservoir_at`. The process's **own**
+/// off-heap table is therefore handed out **no slot at all** — which is the whole point, because
+/// `beam_gc::OffHeap`'s slot space is never compacted, so a slot per payload per slice made the
+/// O(slots) `overhead_bytes`/`sweep` walks quadratic in the number of iterations a
+/// build-a-binary loop had run.
 ///
 /// This pins all three halves for a process parked at a `receive` **after** building a
 /// runtime-sized (off-heap, above the 64-byte on-heap limit) binary: the reservoir is non-empty,
