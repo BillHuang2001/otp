@@ -62,21 +62,58 @@ pub use crate::driver::current_host::with_current_host;
 /// The reason a driver asks for its port to be closed — the C's whole `driver_failure*` family
 /// (`erts/emulator/beam/io.c`) collapsed into one seam hook ([`DriverHost::failure`]).
 ///
-/// The four C entry points differ only in how the reason is expressed, so they model as variants
-/// rather than four hooks.
+/// The C funnels all four `driver_failure*` spellings through one function,
+/// `driver_failure_term(ix, term, eof)` (`io.c:7196-7229`), which closes the port with the reason
+/// `eof ? am_normal : term`. The variants therefore differ only in how the **reason term** is
+/// expressed and in whether the `eof` route is taken, so they model as variants rather than four
+/// hooks:
+///
+/// | variant | C entry point | reason the port owner observes |
+/// |---|---|---|
+/// | [`Eof`](PortFailure::Eof) | `driver_failure_eof` (`io.c:7278`) and `driver_failure(P, 0)` (`io.c:7258`) | `normal` |
+/// | [`Atom`](PortFailure::Atom) | `driver_failure_atom` (`io.c:7263`) | the **bare atom** `string` |
+/// | [`Posix`](PortFailure::Posix) | `driver_failure_posix` (`io.c:7273`) | the **bare atom** `erl_errno_id(error)` — the lowercase POSIX name |
+/// | [`Error`](PortFailure::Error) | `driver_failure(P, code)` with `code != 0` (`io.c:7258`) | the **bare integer** `code` |
+///
+/// None of the reasons is wrapped: a port's exit reason is never `{error, …}` (that shape belongs to
+/// the *BIF* raises a driver can trigger, not to `driver_failure*`).
+///
+/// [`Eof`](PortFailure::Eof) is the **eof route**, not merely "reason `normal`": besides discarding
+/// the reason term, it flushes the port's buffered `[line]` data (a trailing partial line arrives as
+/// `{Port,{data,{noeol,…}}}` *before* the exit — `flush_linebuf_messages`, `io.c:3475-3499`) and, on
+/// a port opened with the `eof` option, takes the **soft-eof** branch: the owner gets `{Port,eof}` and
+/// the port **stays alive** instead of being closed (`ERTS_PORT_SFLG_SOFT_EOF`,
+/// `erl_bif_port.c:996`). Reproducing those consequences is the host's job — see
+/// [`DriverHost::failure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortFailure<'a> {
-    /// `driver_failure_eof(port)` — the connected process reached end of file.
+    /// The **eof route** — `driver_failure_eof(port)` (`io.c:7278`, i.e.
+    /// `driver_failure_term(ix, NIL, 1)`) *and* `driver_failure(port, 0)` (`io.c:7258`, i.e.
+    /// `driver_failure_term(ix, make_small(0), 1)`).
+    ///
+    /// Both are the same request: the C's `eof` flag discards the reason term, so the port closes
+    /// with the atom `normal` and the eof route's extra consequences apply (buffered-line flush,
+    /// `[eof]` soft-eof — see the enum docs). `driver_failure(P, 0)` therefore never arrives as
+    /// `Error(0)`.
     Eof,
-    /// `driver_failure_atom(port, string)` — close with `string` as the reason atom.
+    /// `driver_failure_atom(port, string)` — close with `string` as the **bare** reason atom
+    /// (`io.c:7263`).
     ///
     /// The C operand is a NUL-terminated `char *`; this seam carries the name as a `&str` and the
     /// host interns it, exactly as [`DriverHost::intern_atom`] does for the `ERL_DRV_ATOM`
-    /// term-data operand.
+    /// term-data operand. (The C interns the raw bytes as Latin-1 while this seam requires UTF-8 —
+    /// the one documented divergence, see `lifecycle.rs`.)
     Atom(&'a str),
-    /// `driver_failure_posix(port, error)` — close with `{error, <posix reason for the errno>}`.
+    /// `driver_failure_posix(port, error)` — close with the **bare atom** the errno's lowercase
+    /// POSIX name (`erl_errno_id(error)`, `io.c:7273`; `eacces` for `EACCES`), never `{error, …}`.
+    ///
+    /// `0` names `errno_0` and an errno the runtime does not know names `errno_<n>` (the C's
+    /// `erl_errno_str.c:47` convention). The errno→name mapping itself is the host's.
     Posix(c_int),
-    /// `driver_failure(port, error)` — close with `{error, <errno>}`.
+    /// `driver_failure(port, code)` with `code != 0` — close with the **bare integer** `code`
+    /// (`io.c:7258`), never `{error, code}`.
+    ///
+    /// A `0` code is the eof route instead and arrives as [`Eof`](PortFailure::Eof).
     Error(c_int),
 }
 
@@ -241,6 +278,26 @@ pub trait DriverHost {
         None
     }
 
+    /// The port's own **id term** — the C's `driver_mk_port(ix)` answer (`prt->common.id`,
+    /// `io.c:7295-7303`, reached through `erts_drvport2port`; `NIL` for an invalid handle) — or
+    /// `None` when `port` is not a live handle of this host (default: unsupported).
+    ///
+    /// This hook is what closes the **`ERL_DRV_PORT` term-data operand**. The C idiom
+    /// `{ERL_DRV_PORT, driver_mk_port(port)}` carries the port's *id term*, while this crate's
+    /// [`driver_mk_port`](crate::driver::drv::driver_mk_port) returns the **handle** encoding its
+    /// docs describe (a port handle is the [`DriverEnv`] pointer, [`DriverEnv::as_port`]), because
+    /// the term-data layer here has no port table. [`decode_term_spec`] therefore resolves a
+    /// non-port operand through this hook, so a driver written the C way delivers the port term.
+    ///
+    /// The returned term is what the decoded message carries, so it should be an internal port term
+    /// ([`prelude::is_internal_port`](beam_term::prelude::is_internal_port)). The handle is
+    /// **opaque**: an implementor must not dereference it to validate it — compare it against the
+    /// handles it published. The default answers `None` ("no such handle"), which refuses the spec
+    /// exactly as a runtime with no port terms always has.
+    fn port_term(&mut self, port: ErlDrvPort) -> Option<Eterm> {
+        let _ = port;
+        None
+    }
     // ---------------------------------------------------------------------------------------
     // Port queue — `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq[v]`
     //
@@ -320,6 +377,23 @@ pub trait DriverHost {
 
     /// Close the port with `reason` — the single hook behind the C's `driver_failure*` family.
     /// `0` = ok, `-1` = fail (default: unsupported).
+    ///
+    /// The host owns everything the C's `driver_failure_term(ix, term, eof)` (`io.c:7196-7229`) does
+    /// *after* the variant has chosen the reason, so it must reproduce three things:
+    ///
+    /// 1. **The exit reason the port's owner observes.** For [`PortFailure::Eof`] it is the atom
+    ///    `normal`; otherwise the bare term the variant names — the atom of [`PortFailure::Atom`],
+    ///    the lowercase POSIX-name atom `erl_errno_id` yields for [`PortFailure::Posix`]
+    ///    (`eacces`, or `errno_0`/`errno_<n>` for 0/unknown), and the integer of
+    ///    [`PortFailure::Error`]. Measured against a `trap_exit` owner: `{'EXIT',Port,boom}`,
+    ///    `{'EXIT',Port,eacces}`, `{'EXIT',Port,7}` — never `{error, …}`.
+    /// 2. **The eof route** for [`PortFailure::Eof`]: flush the port's buffered `[line]` data first
+    ///    (the owner sees `{Port,{data,{noeol,Partial}}}` before the exit,
+    ///    `flush_linebuf_messages`, `io.c:3475-3499`), and on a port opened with the `eof` option
+    ///    deliver `{Port,eof}` and **keep the port alive** (`ERTS_PORT_SFLG_SOFT_EOF`,
+    ///    `erl_bif_port.c:996`) rather than closing it.
+    /// 3. **The closed state**: after a real close the port is gone, so `port_info(P, …)` answers
+    ///    `undefined` and `port_close(P)` raises `badarg`, exactly as the C's terminated port does.
     fn failure(&mut self, reason: PortFailure<'_>) -> c_int {
         let _ = reason;
         -1
@@ -327,6 +401,16 @@ pub trait DriverHost {
 
     /// Immediately terminate the port's connected process with exit `code` (`driver_exit`). `0` =
     /// ok, `-1` = fail (default: unsupported).
+    ///
+    /// The C (`io.c:7234-7253`) does two things, in this order, and both are the host's obligation:
+    ///
+    /// 1. **Unlink the connected process *before* closing**, so the close delivers no
+    ///    `{'EXIT',Port,Reason}` message at all — a *monitor* on the port still receives
+    ///    `{'DOWN',Ref,port,Port,Reason}` (measured).
+    /// 2. Close with the atom `normal` for `code == 0`, else with the **bare atom** `erl_errno_id`
+    ///    names (`eacces`; never `{error, …}`).
+    ///
+    /// Afterwards `port_info(P, …)` answers `undefined` and `port_close(P)` raises `badarg`.
     fn port_exit(&mut self, code: c_int) -> c_int {
         let _ = code;
         -1
@@ -536,6 +620,26 @@ pub trait DriverHost {
     }
 }
 
+/// Does `port` name **no** [`DriverEnv`] — is it `NULL` or the C's invalid-port sentinel
+/// [`ERTS_INVALID_ERL_DRV_PORT`] (pointer `-1`, `erts/emulator/beam/erl_port.h:60-67`)?
+///
+/// This is the **single definition** every port-argument recovery site consults
+/// ([`DriverEnv::from_port`] and the `drv` layer's `env_for`), so no C entry point can dereference
+/// either non-handle.
+///
+/// The two operands differ in the C and get the same answer here:
+///
+/// * the **sentinel** is the C's own "invalid port" operand — every port-carrying entry point tests
+///   it and returns its failure value (`-1`, or `0` for the port queries) without dereferencing it,
+///   so refusing it is ABI fidelity;
+/// * a **null** operand is *not* that path: the C does not test for it and the real VM faults
+///   (measured). Refusing it is this crate's deliberate safety divergence — a library function must
+///   not crash its host process (workspace `CONTEXT.md` §3), and the returned failure value is the
+///   one a driver following the documented `< 0` idiom already handles.
+pub fn is_invalid_port_handle(port: ErlDrvPort) -> bool {
+    port.is_null() || port == ERTS_INVALID_ERL_DRV_PORT
+}
+
 /// The concrete per-port driver environment behind the C-facing opaque `*mut ErlDrvPort_`.
 ///
 /// Holds a raw pointer to the host, so the environment itself is lifetime-free and can be recovered
@@ -591,9 +695,11 @@ impl DriverEnv {
     /// # Safety
     ///
     /// `port` must be a pointer previously returned by [`DriverEnv::as_port`] for an env that is
-    /// still alive (and whose host is still alive). Returns `None` for a null pointer.
+    /// still alive (and whose host is still alive). Returns `None` for any operand that names no
+    /// environment — `NULL` and the invalid-port sentinel [`ERTS_INVALID_ERL_DRV_PORT`], the one
+    /// predicate [`is_invalid_port_handle`] — so neither is ever dereferenced.
     pub unsafe fn from_port<'a>(port: ErlDrvPort) -> Option<&'a mut DriverEnv> {
-        if port.is_null() {
+        if is_invalid_port_handle(port) {
             return None;
         }
         // SAFETY: the caller guarantees `port` came from `DriverEnv::as_port` on a live env, i.e. it
@@ -625,9 +731,15 @@ impl DriverEnv {
 ///   [`DriverHost::intern_atom`]. In the C the operand is already an atom term from
 ///   `driver_mk_atom`; this seam has no `driver_mk_atom`, so the spec carries the *name* and the
 ///   host interns it — the same atom either way.
-/// * `ERL_DRV_PID`'s (and `ERL_DRV_PORT`'s) operand is the **pid/port term itself**, exactly as in
-///   the C (`mess = ptr[0]`, `io.c:6089`); the C's `driver_connected`-derived term data fits the
-///   same slot, so this is a note rather than a difference.
+/// * `ERL_DRV_PID`'s operand is the **pid term itself**, exactly as in the C (`mess = ptr[0]`,
+///   `io.c:6089`); the C's `driver_connected`-derived term data fits the same slot, so this is a
+///   note rather than a difference.
+/// * `ERL_DRV_PORT`'s operand is the **port term itself** when it is one (the C's own check,
+///   `is_internal_port`, `io.c:5744-5747`), and is otherwise resolved as a **port handle** through
+///   the additive, defaulted [`DriverHost::port_term`] hook — which is what makes the C idiom
+///   `{ERL_DRV_PORT, driver_mk_port(port)}` work on a host whose `driver_mk_port` answers with the
+///   handle encoding ([`crate::driver::drv::driver_mk_port`]). A host that leaves the hook at its
+///   default refuses such an operand (`None`), never delivering a wrong term.
 /// * `ERL_DRV_EXT2TERM`'s bytes are handed to the **additive, defaulted** [`DriverHost::binary_to_term`]
 ///   hook, because the ETF decoder lives outside this crate (see that hook's docs). With the hook
 ///   left at its default the tag answers `None` — the C's "invalid data" outcome (`ERTS_DDT_FAIL`),
@@ -759,14 +871,31 @@ pub fn decode_term_spec(env: &mut DriverEnv, spec: &[ErlDrvTermData]) -> Option<
             }
 
             ERL_DRV_PORT => {
-                let term = Eterm::from_raw(*spec.get(ix)? as usize);
+                // The C's operand is the port's **id term** (`mess = ptr[0]`, `io.c:5969-5972`),
+                // which it checks with `is_internal_port` (`io.c:5744-5747`).
+                let operand = *spec.get(ix)?;
                 ix += 1;
-                if !prelude::is_internal_port(term) {
-                    return None; // The C rejects a non-internal-port operand.
+                let term = Eterm::from_raw(operand as usize);
+                if prelude::is_internal_port(term) {
+                    stack.push(term);
+                } else {
+                    // A host that has no id term for `driver_mk_port` hands out the **handle**
+                    // encoding instead (see that function), so the operand is resolved back to the
+                    // id term through the host. The two encodings are disjoint: a live handle is a
+                    // non-null 8-aligned pointer (low bits 0) and can never satisfy
+                    // `is_internal_port`'s `x & 0xF == 0x7`.
+                    let term = env.host().port_term(operand as usize as ErlDrvPort)?;
+                    // The hook's answer is an invariant, not a hint: the C's slot only ever holds an
+                    // internal port (`io.c:5744-5747`), so a host that answers a non-port term is
+                    // refused exactly as the C refuses a non-port operand — `ERTS_DDT_FAIL` (the
+                    // whole spec is `None`, `-1` returned, nothing delivered) rather than a wrong
+                    // term delivered where the ABI requires a port.
+                    if !prelude::is_internal_port(term) {
+                        return None;
+                    }
+                    stack.push(term);
                 }
-                stack.push(term);
             }
-
             ERL_DRV_PID => {
                 // The operand is the pid term itself (`mess = ptr[0]`, `io.c:6089`); the C rejects
                 // anything that is not an internal pid (`io.c:5816`).
@@ -1115,6 +1244,58 @@ mod tests {
         }
     }
 
+    /// A host that resolves **exactly one** `ErlDrvPort` handle to a port id term, and every other
+    /// operand to `None` — the [`DriverHost::port_term`] seam (`driver_mk_port`'s C answer).
+    ///
+    /// It records the handles it is asked about, so a test can pin *which* operand reached the hook.
+    struct PortTermHost {
+        heap: Heap,
+        atoms: AtomTable,
+        handle: ErlDrvPort,
+        term: Eterm,
+        asked: Vec<ErlDrvPort>,
+    }
+
+    impl PortTermHost {
+        fn new(handle: ErlDrvPort, term: Eterm) -> PortTermHost {
+            PortTermHost {
+                heap: Heap::new(1024).expect("a small test heap is allocatable"),
+                atoms: AtomTable::new(),
+                handle,
+                term,
+                asked: Vec::new(),
+            }
+        }
+
+        fn atoms(&self) -> &AtomTable {
+            &self.atoms
+        }
+    }
+
+    impl DriverHost for PortTermHost {
+        fn heap(&mut self) -> &mut Heap {
+            &mut self.heap
+        }
+
+        fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+            Some(make_atom(self.atoms.intern(name)))
+        }
+
+        fn output(&mut self, _port: ErlDrvPort, _data: &[u8]) -> c_int {
+            -1
+        }
+
+        fn send_term(&mut self, _port: ErlDrvPort, _to: Option<Eterm>, _term: Eterm) -> c_int {
+            -1
+        }
+
+        /// Identity comparison only: the handle is opaque, never dereferenced.
+        fn port_term(&mut self, port: ErlDrvPort) -> Option<Eterm> {
+            self.asked.push(port);
+            (port == self.handle).then_some(self.term)
+        }
+    }
+
     /// The payload bytes of a byte-aligned binary [`Eterm`] (a test-only reader).
     ///
     /// # Safety
@@ -1122,7 +1303,8 @@ mod tests {
     /// `term` must be a live, byte-aligned binary term.
     unsafe fn binary_bytes_of(term: Eterm) -> Vec<u8> {
         // SAFETY: `term` is a live binary (the caller's contract).
-        assert!(unsafe { prelude::is_binary(term) }, "{term:?} is not a binary");        // SAFETY: `term` is a live binary (asserted above).
+        assert!(unsafe { prelude::is_binary(term) }, "{term:?} is not a binary");
+        // SAFETY: `term` is a live binary (asserted above).
         let (ptr, bit_offset, bit_len) = unsafe { prelude::bitstring_parts(term) };
         assert_eq!(bit_offset % 8, 0, "the test reader only handles byte-aligned binaries");
         // SAFETY: `ptr` heads `bit_len` readable bits starting at `bit_offset`, and the block is a
@@ -1144,10 +1326,18 @@ mod tests {
     }
 
     #[test]
-    fn from_port_of_null_is_none() {
-        // SAFETY: a null pointer is explicitly allowed by the contract.
-        let recovered = unsafe { DriverEnv::from_port(std::ptr::null_mut()) };
-        assert!(recovered.is_none());
+    fn from_port_of_null_or_the_invalid_port_sentinel_is_none() {
+        // Both operands name no environment: `NULL` (which the C does not even test for — it faults)
+        // and the C's invalid-port sentinel (`erl_port.h:60-67`), through the one shared predicate.
+        // SAFETY: both are explicitly allowed by the contract and are never dereferenced.
+        for operand in [
+            std::ptr::null_mut(),
+            crate::driver::types::ERTS_INVALID_ERL_DRV_PORT,
+        ] {
+            let recovered = unsafe { DriverEnv::from_port(operand) };
+            assert!(recovered.is_none(), "{operand:?} names no environment");
+            assert!(is_invalid_port_handle(operand));
+        }
     }
 
     #[test]
@@ -1316,6 +1506,85 @@ mod tests {
             decode_term_spec(&mut env, &[ERL_DRV_PORT, 7]).map(Eterm::raw),
             Some(7)
         );
+
+        // A **handle**-encoded operand (what this crate's `driver_mk_port` answers) is not a port
+        // term, so a host without the `port_term` hook — this one is at the trait default — refuses
+        // it. `7` above passes only because it satisfies `is_internal_port`.
+        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(0x1000)]), None);
+    }
+
+    #[test]
+    fn a_port_term_hook_answering_a_non_port_is_refused() {
+        // The `ERL_DRV_PORT` slot only ever holds an internal port in the C (`io.c:5744-5747`), so
+        // the hook's answer is validated rather than trusted: a host that answers a non-port term
+        // gets the C's `ERTS_DDT_FAIL` — the whole spec is `None` (`-1` to the caller, nothing
+        // delivered) — instead of a wrong term delivered where the ABI requires a port.
+        let handle = 0x1000usize as ErlDrvPort;
+        let mut host = PortTermHost::new(handle, make_small(42));
+        let mut env = DriverEnv::new(&mut host);
+        assert_eq!(
+            decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(handle as usize)]),
+            None,
+            "a hook answer that is not an internal port fails the whole spec"
+        );
+        assert_eq!(host.asked, vec![handle], "the hook was consulted exactly once");
+    }
+
+    #[test]
+    fn decode_term_spec_resolves_a_port_handle_through_the_port_term_hook() {
+        // The id term this host answers for its one live handle — a synthesized internal port term,
+        // exactly the shape `driver_mk_port` returns in the C (`prt->common.id`).
+        let handle = 0x1000usize as ErlDrvPort;
+        let port = prelude::make_internal_port(prelude::make_port_data(11));
+        let mut host = PortTermHost::new(handle, port);
+        let mut env = DriverEnv::new(&mut host);
+
+        // The handle encoding (`{ERL_DRV_PORT, driver_mk_port(port)}`, the C's own idiom) resolves
+        // to the id term through the hook.
+        let term = decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(handle as usize)])
+            .expect("a live handle resolves through `port_term`");
+        assert_eq!(term, port);
+        assert_eq!(host.asked, vec![handle], "the hook is asked about the operand's handle");
+
+        // An unknown handle, a null word and a plain non-port word are all refused (`None` from the
+        // hook), never turned into a wrong term.
+        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(0x2000)]), None);
+        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, 0]), None);
+        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, 1]), None);
+        assert_eq!(
+            host.asked,
+            vec![handle, 0x2000usize as ErlDrvPort, 0 as ErlDrvPort, 1usize as ErlDrvPort],
+            "every non-port operand is offered to the hook"
+        );
+
+        // A genuine port term still takes the C's own path: pushed as-is, with no hook query.
+        let direct = decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(port.raw())])
+            .expect("an internal port is a valid operand");
+        assert_eq!(direct, port);
+        assert_eq!(host.asked.len(), 4, "a port term never reaches the hook");
+
+        // And the resolved term participates in compounds like any other value.
+        let name = CString::new("tag").expect("no interior NUL");
+        let spec = [
+            ERL_DRV_ATOM,
+            term_data(name.as_ptr() as usize),
+            ERL_DRV_PORT,
+            term_data(handle as usize),
+            ERL_DRV_TUPLE,
+            2,
+        ];
+        let term = decode_term_spec(&mut env, &spec).expect("a tuple of [atom, port handle]");
+        // SAFETY: `term` is a live term the decoder just built; the tuple readers run only after
+        // `is_tuple` confirms the shape.
+        unsafe {
+            assert!(is_tuple(term));
+            assert_eq!(tuple_size(term), 2);
+        }
+        // SAFETY: `term` is a live 2-tuple (checked above).
+        let (first, second) = unsafe { (tuple_element(term, 0), tuple_element(term, 1)) };
+        assert!(is_atom(first));
+        assert_eq!(host.atoms().name(atom_val(first)).as_deref(), Some("tag"));
+        assert_eq!(second, port);
     }
 
     #[test]

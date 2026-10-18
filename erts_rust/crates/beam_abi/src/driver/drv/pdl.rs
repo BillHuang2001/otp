@@ -884,7 +884,8 @@ mod tests {
         // SAFETY: as above — the host still reports the port as having a PDL.
         assert!(unsafe { driver_pdl_create(port) }.is_null());
 
-        // A null port is the C's `ERTS_INVALID_ERL_DRV_PORT` path.
+        // An operand that names no port — `NULL` here, or the C's invalid-port sentinel
+        // (`ERTS_INVALID_ERL_DRV_PORT`, the C's own early return) — creates nothing.
         // SAFETY: a null port handle is explicitly allowed.
         assert!(unsafe { driver_pdl_create(core::ptr::null_mut()) }.is_null());
     }

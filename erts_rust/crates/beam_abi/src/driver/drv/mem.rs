@@ -32,7 +32,6 @@
 //! live in [`super`].
 
 use core::sync::atomic::{AtomicI64, Ordering};
-
 use libc::{c_char, c_int, c_void, size_t};
 
 use crate::common::ERTS_NAPI_TIME_ERROR;
@@ -47,6 +46,12 @@ use crate::{
 };
 
 use super::driver_term_nil;
+// The errno subsystem lives in its own module (its answer store plus the ported name table — the
+// largest of the host-free families); `erl_errno_id` is re-exported so `drv::erl_errno_id` keeps
+// naming it (the glob re-export in `drv` is what makes it a crate-public entry point).
+mod errno;
+mod errno_table;
+pub use errno::erl_errno_id;
 
 // ---------------------------------------------------------------------------------------------
 // Memory
@@ -472,22 +477,9 @@ pub unsafe extern "C" fn erl_drv_convert_time_unit(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Environment and errno
 // ---------------------------------------------------------------------------------------------
-
-/// `char *erl_errno_id(int error);` — plain-text text for an errno value.
-///
-/// **Documented deviation:** the oracle returns the lowercase POSIX errno *name* (`"enoent"`); this
-/// returns libc `strerror`'s descriptive message (`"No such file or directory"`).
-///
-/// # Safety
-///
-/// The result is owned by libc's static message buffer; do not free or mutate it.
-#[no_mangle]
-pub unsafe extern "C" fn erl_errno_id(error: c_int) -> *mut c_char {
-    // SAFETY: `strerror` accepts any `int`; the returned pointer is valid until the next call.
-    unsafe { libc::strerror(error) }
-}
+// Environment
+// ---------------------------------------------------------------------------------------------
 
 /// `int erl_drv_putenv(const char *key, char *value);` — set an environment variable: `0` on success,
 /// `-1` on failure (the C's "not found" code). A null `key`/`value` is rejected without touching
@@ -981,16 +973,6 @@ mod tests {
         // A driver binary's `orig_size` header is a full machine word on this target.
         assert_eq!(size_of::<ErlDrvSInt>(), 8);
         assert_eq!(offset_of!(ErlDrvBinary, orig_bytes), 8);
-    }
-
-    #[test]
-    fn errno_id_returns_a_non_empty_message() {
-        // SAFETY: `strerror` accepts any `int` and returns a NUL-terminated static string.
-        let p = unsafe { erl_errno_id(libc::ENOENT) };
-        assert!(!p.is_null());
-        // SAFETY: non-null and NUL-terminated (libc static message buffer).
-        let s = unsafe { CStr::from_ptr(p) }.to_str().expect("ascii message");
-        assert!(!s.is_empty());
     }
 
     #[test]

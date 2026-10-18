@@ -46,7 +46,17 @@
 //! port-pointer recovery, the term-data round-trips through the populated table, and the
 //! output/select/timer host traffic) live in the sibling `port_tests.rs`, pulled in by the
 //! `#[path]`-declared `mod tests` at the end of this file.
-
+//!
+//! # `driver_mk_port`'s handle encoding resolves back to the port term
+//!
+//! [`driver_mk_port`] answers with the **handle** encoding (a port handle here *is* the
+//! [`DriverEnv`](crate::driver::host::DriverEnv) pointer), where the C answers the port's id term.
+//! That is unchanged: the `erl_drv_output_term`/`erl_drv_send_term` **port parameter** decodes the
+//! same encoding back to the handle. What closes the loop for a driver written the C way is
+//! [`DriverHost::port_term`](crate::driver::host::DriverHost::port_term): an `ERL_DRV_PORT`
+//! **operand** carrying this encoding is resolved to the port's id term by
+//! [`decode_term_spec`](crate::driver::host::decode_term_spec), so
+//! `{ERL_DRV_PORT, driver_mk_port(port)}` delivers the port term exactly as the emulator does.
 use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
 use beam_term::prelude::Eterm;
@@ -102,7 +112,9 @@ unsafe fn tail_bytes<'a>(buf: *const c_char, len: ErlDrvSizeT) -> Option<Option<
 /// `hbuf`/`hlen` list prefix and `body` its `buf`/`len` tail (`None` = `buf == NULL`).
 ///
 /// Nothing is joined here — preserving the split is the point of the hook. Returns the C's `-1` when
-/// the port is null (its `ERTS_INVALID_ERL_DRV_PORT` path), else the host's code.
+/// the operand names no port — the invalid-port sentinel
+/// [`ERTS_INVALID_ERL_DRV_PORT`](crate::driver::types::ERTS_INVALID_ERL_DRV_PORT) (the C's own
+/// failure path) or `NULL` (refused here instead of faulted) — else the host's code.
 ///
 /// # Safety
 ///
@@ -396,7 +408,10 @@ pub unsafe extern "C" fn driver_outputv(
 /// The C-facing port pointer encoded in an `ErlDrvTermData` (the `erl_drv_*_term` port operand).
 ///
 /// [`driver_mk_port`] produces it; the C passes the port's *id term* instead (documented deviation,
-/// see the module header).
+/// see the module header). Only the `erl_drv_*_term` entry points' **port parameter** uses this
+/// cast — an `ERL_DRV_PORT` **operand** carrying the same encoding is resolved to the port's id term
+/// by [`decode_term_spec`] through
+/// [`DriverHost::port_term`](crate::driver::host::DriverHost::port_term).
 #[inline]
 fn port_from_term_data(port: ErlDrvTermData) -> ErlDrvPort {
     port as usize as ErlDrvPort
@@ -551,6 +566,12 @@ pub unsafe extern "C" fn driver_mk_atom(string: *mut c_char) -> ErlDrvTermData {
 /// [`DriverEnv::from_port`](crate::driver::host::DriverEnv::from_port) and what
 /// [`driver_async_port_key`](crate::driver::api::ErlDrvApi::driver_async_port_key) would key on.
 ///
+/// The encoding is resolvable **back to the id term**: an `ERL_DRV_PORT` term-data operand carrying
+/// it is turned into the port term by [`decode_term_spec`] through
+/// [`DriverHost::port_term`](crate::driver::host::DriverHost::port_term), so the C idiom
+/// `{ERL_DRV_PORT, driver_mk_port(port)}` delivers the port term on a runtime that implements that
+/// hook.
+///
 /// A null handle yields [`driver_term_nil`] — the value the C returns for an invalid (non-null)
 /// handle. That is a **deliberate, documented divergence** (see the module header): the legacy VM
 /// does not null-check the operand, and `driver_mk_port(NULL)` makes it crash (an exit signal with
@@ -560,6 +581,16 @@ pub unsafe extern "C" fn driver_mk_atom(string: *mut c_char) -> ErlDrvTermData {
 /// # Safety
 ///
 /// `port` must be null or a live port handle (it is only compared, never dereferenced).
+///
+/// # The nil answer is not a port operand
+///
+/// A null `handle` answers [`driver_term_nil`] — `NIL`'s word, a non-null pointer-sized value whose
+/// low nibble is **not** the port tag. That value is **not** a valid first argument to
+/// `erl_drv_output_term`/`erl_drv_send_term` (the C shape `f(driver_mk_port(ix), ...)`): the term
+/// data travels back through `port_from_term_data` -> `env_for` ->
+/// [`DriverEnv::from_port`](crate::driver::host::DriverEnv::from_port), which would dereference it as
+/// a handle. Only the non-nil answer is a live handle; a driver that may fail to get a port must pass
+/// a real one (or skip the call), never the nil word.
 #[no_mangle]
 pub unsafe extern "C" fn driver_mk_port(port: ErlDrvPort) -> ErlDrvTermData {
     if port.is_null() {

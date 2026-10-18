@@ -73,8 +73,11 @@
 //! The C's **failure value for an invalid port** is reproduced everywhere it exists (`-1` for the
 //! `driver_failure*`/`driver_exit` family, `0` for `get_port_flags` and `driver_async_port_key`, a
 //! silent return for `set_busy_port`/`set_port_control_flags`/`erl_drv_set_os_pid`,
-//! `ERL_DRV_BUSY_MSGQ_DISABLED` for `erl_drv_busy_msgq_limits`) — a null port is never
-//! dereferenced. A hook that reports "unsupported" (`-1`/`None`, the trait defaults) is reported
+//! `ERL_DRV_BUSY_MSGQ_DISABLED` for `erl_drv_busy_msgq_limits`) — the invalid-port operand is the C's
+//! sentinel `ERTS_INVALID_ERL_DRV_PORT` (pointer `-1`, `erl_port.h:60-67`), and a `NULL` operand is
+//! refused the same way through the one shared [`env_for`](super::env_for) guard, so neither is
+//! dereferenced (the C does not test for `NULL` and faults; refusing it is a deliberate divergence).
+//! A hook that reports "unsupported" (`-1`/`None`, the trait defaults) is reported
 //! exactly as the C reports a port it cannot resolve: a driver following the documented `< 0` idiom
 //! sees identical behaviour.
 //!
@@ -219,8 +222,9 @@ fn limit_to_c_int(value: ErlDrvSizeT) -> c_int {
 /// `int driver_failure_eof(ErlDrvPort port);` — close the port because the connected process reached
 /// end of file (the C's `driver_failure_term(ix, NIL, 1)`, `io.c:7278`).
 ///
-/// Returns `0` for a successful close request and `-1` for a null port (the C's
-/// `ERTS_INVALID_ERL_DRV_PORT`, `io.c:7204`) or a host without the hook.
+/// Returns `0` for a successful close request and `-1` for an operand that names no port — the C's
+/// invalid-port sentinel `ERTS_INVALID_ERL_DRV_PORT` (`io.c:7204`, the faithful `-1`) or `NULL`
+/// (refused here where the C would fault) — or for a host without the hook.
 ///
 /// # Safety
 ///
@@ -281,8 +285,15 @@ pub unsafe extern "C" fn driver_failure_posix(port: ErlDrvPort, error: c_int) ->
 /// `int driver_failure(ErlDrvPort port, int error);` — close the port with the error number (the
 /// C's `driver_failure_term(ix, make_small(code), code == 0)`, `io.c:7258`).
 ///
-/// Returns `0`/`-1` like [`driver_failure_eof`]. Note the C's `eof` flag: a `0` code closes with
-/// `normal`, which is the host's decision — the raw code crosses the seam.
+/// Returns `0`/`-1` like [`driver_failure_eof`]. The C's third argument is the **eof flag**, and it
+/// is `code == 0`: a `0` code takes the eof route with the reason discarded
+/// (`erts_deliver_port_exit(prt, id, eof ? am_normal : term, …)`), so it is reported to the host as
+/// [`PortFailure::Eof`] — exactly what [`driver_failure_eof`] reports, and what the port owner
+/// observes as the reason `normal` — while every other code is
+/// [`PortFailure::Error(code)`](PortFailure::Error) (the bare integer). The eof route's further
+/// consequences (buffered `[line]` data flushed before the exit, and `{Port,eof}` with the port left
+/// **alive** on a port opened with the `eof` option) are the host's, under
+/// [`DriverHost::failure`](crate::driver::host::DriverHost::failure).
 ///
 /// # Safety
 ///
@@ -291,7 +302,13 @@ pub unsafe extern "C" fn driver_failure_posix(port: ErlDrvPort, error: c_int) ->
 pub unsafe extern "C" fn driver_failure(port: ErlDrvPort, error: c_int) -> c_int {
     // SAFETY: `port` is null or a live handle (contract above).
     match unsafe { env_for(port) } {
-        Some(env) => env.host().failure(PortFailure::Error(error)),
+        // `error == 0` **is** the C's `eof` flag, which discards the reason term: same request as
+        // `driver_failure_eof`, hence the same variant (never `Error(0)`).
+        Some(env) => env.host().failure(if error == 0 {
+            PortFailure::Eof
+        } else {
+            PortFailure::Error(error)
+        }),
         None => -1,
     }
 }
@@ -324,7 +341,8 @@ pub unsafe extern "C" fn driver_exit(port: ErlDrvPort, err: c_int) -> c_int {
 /// (`io.c:5208`).
 ///
 /// The C returns `void` (it only moves the port's scheduler flags), so the host's code is discarded;
-/// a null port is a silent no-op, exactly like the C's `ERTS_INVALID_ERL_DRV_PORT` early return.
+/// an operand that names no port — the C's invalid-port sentinel `ERTS_INVALID_ERL_DRV_PORT` (its
+/// early return) or `NULL` (refused here rather than faulted) — is a silent no-op.
 ///
 /// # Safety
 ///
@@ -740,7 +758,10 @@ mod tests {
                 "Eof".to_string(),
                 "Atom(\"enoent\")".to_string(),
                 format!("Posix({})", libc::ENOENT),
-                "Error(0)".to_string(),
+                // `driver_failure(P, 0)` is the C's **eof route** (`driver_failure_term(ix,
+                // make_small(0), code == 0)`, `io.c:7258`): the term is discarded, so the owner
+                // observes the measured reason `normal` — identical to `driver_failure_eof`.
+                "Eof".to_string(),
                 "Error(7)".to_string(),
             ],
             "each C entry point must land on the one `failure` hook with its own reason"
@@ -748,29 +769,37 @@ mod tests {
     }
 
     #[test]
-    fn a_null_port_is_the_c_failure_value_and_is_never_dereferenced() {
+    fn a_null_or_sentinel_port_is_the_c_failure_value_and_is_never_dereferenced() {
         let mut host = LifecycleHost::new();
         let mut env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let name = c"enoent";
-        let null = core::ptr::null_mut();
+        // `NULL` and the C's invalid-port sentinel (`ERTS_INVALID_ERL_DRV_PORT`, pointer `-1`,
+        // `erl_port.h:60-67`) both name no environment and must answer the same failure values.
+        let absent = [
+            core::ptr::null_mut(),
+            crate::driver::types::ERTS_INVALID_ERL_DRV_PORT,
+        ];
 
-        // SAFETY: a null port is `env_for`'s documented `None`; `name` is NUL-terminated; `port` is
-        // live, which proves the null calls record nothing.
-        unsafe {
-            assert_eq!(driver_failure_eof(null), -1);
-            assert_eq!(driver_failure_atom(null, name.as_ptr() as *mut c_char), -1);
-            assert_eq!(driver_failure_posix(null, 1), -1);
-            assert_eq!(driver_failure(null, 1), -1);
-            assert_eq!(driver_exit(null, 1), -1);
-            assert_eq!(get_port_flags(null), 0);
-            assert_eq!(driver_async_port_key(null), 0);
-            set_busy_port(null, 1);
-            set_port_control_flags(null, CONTROL_FLAG_BINARY);
-            erl_drv_set_os_pid(null, 42);
-            erl_drv_init_ack(null, std::ptr::dangling_mut());
+        for operand in absent {
+            // SAFETY: neither operand names an environment (`env_for`'s documented `None`); `name`
+            // is NUL-terminated; `port` is live, which proves the absent calls record nothing.
+            unsafe {
+                assert_eq!(driver_failure_eof(operand), -1);
+                assert_eq!(driver_failure_atom(operand, name.as_ptr() as *mut c_char), -1);
+                assert_eq!(driver_failure_posix(operand, 1), -1);
+                assert_eq!(driver_failure(operand, 0), -1, "the eof route is refused too");
+                assert_eq!(driver_failure(operand, 1), -1);
+                assert_eq!(driver_exit(operand, 1), -1);
+                assert_eq!(get_port_flags(operand), 0);
+                assert_eq!(driver_async_port_key(operand), 0);
+                set_busy_port(operand, 1);
+                set_port_control_flags(operand, CONTROL_FLAG_BINARY);
+                erl_drv_set_os_pid(operand, 42);
+                erl_drv_init_ack(operand, std::ptr::dangling_mut());
+            }
         }
-        assert!(host.failures.is_empty(), "a null port must record nothing");
+        assert!(host.failures.is_empty(), "an absent port must record nothing");
         assert!(host.exits.is_empty());
         assert!(host.busy.is_empty());
         assert!(host.control.is_empty());
