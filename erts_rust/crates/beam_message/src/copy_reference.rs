@@ -44,15 +44,16 @@
 //!   `usize::MAX` its total saturates and it never terminates. `beam_term::size`'s walk detects the
 //!   back-edge itself, so the shipped copier is prompt at *every* limit — a strict improvement the
 //!   cycle tests pin on the shipped side, with the retired side exercised at finite limits only.
-//! * **A wider zero-arity guard.** `needs_visit_reference` skips only a zero-arity `ARITYVAL`
-//!   (the shared empty tuple), while `beam_term::size::classify` skips a zero-arity `ARITYVAL`
-//!   **or** `RECORD_SUBTAG`. The one shape the difference can reach is a forged zero-arity record
-//!   header, which no constructor produces (`write_record` writes
-//!   `make_record_header(n + 1)`, arity >= 1) and only the public `make_record_header(0)` constant
-//!   builder can lay down; there the retired walk prices the canonical `arity + 1 == 1` word and the
-//!   policy walk prices `0`.
-//!   `a_forged_zero_arity_record_header_is_the_one_documented_pricing_delta` pins both answers
-//!   instead of pretending they agree.
+//! * **The empty-tuple guard is the literal-tagged shape in both walks.** `needs_visit_reference`
+//!   skips only a zero-arity `ARITYVAL` (the shared empty tuple), and `beam_term::size::classify`
+//!   applies the *same* predicate: it prices an arity-0 `ARITYVAL` header at nothing only when the
+//!   term carries the literal-area bit — the C's `arity == 0` rule, which recognises
+//!   `ERTS_GLOBAL_LIT_EMPTY_TUPLE` by identity and whose `ASSERT` explicitly excludes a record
+//!   header (`copy.c:124-140`). A forged zero-arity `RECORD` header — which no constructor produces
+//!   (`write_record` writes `make_record_header(n + 1)`, arity >= 1) and only the public
+//!   `make_record_header(0)` constant builder can lay down — therefore prices its structural
+//!   `arity + 1 == 1` word in **both** walks.
+//!   `a_forged_zero_arity_record_header_prices_the_structural_one_word` pins that agreement.
 
 use std::collections::HashSet;
 
@@ -779,20 +780,22 @@ mod tests {
         );
     }
 
-    /// The **one** shape on which the two walks legitimately disagree, pinned so the divergence can
-    /// never be discovered by surprise.
+    /// A forged **zero-arity `RECORD` header** — the one shape the empty-tuple guard could
+    /// misclassify — prices its structural `arity + 1 == 1` word in **both** walks.
     ///
-    /// `beam_term::size::classify` treats a zero-arity `ARITYVAL` **or** `RECORD_SUBTAG` header as
-    /// the shared global literal and prices it at `0` words without consulting the policy; the
-    /// retired walk's guard was `is_arity_value` only, so it priced a zero-arity *record* at the
-    /// canonical `arity + 1 == 1` word. No term the term layer can build is affected: `write_record`
-    /// writes `make_record_header(n + 1)` (arity >= 1), so the only way to reach the shape is a raw
-    /// forge through the public `make_record_header(0)` constant builder.
+    /// `beam_term::size::classify` prices an arity-0 header at nothing only for the literal-tagged
+    /// `ERTS_GLOBAL_LIT_EMPTY_TUPLE`, exactly the C's `arity == 0` rule (`copy.c:124-140`), whose
+    /// `ASSERT(arity > 0 || !is_record_header(hdr))` states the complement: a zero-arity *record*
+    /// header is not the empty tuple. So the retired walk's guard and the shipped policy's guard
+    /// agree here, and both charge one word. No term the term layer can build is affected
+    /// (`write_record` writes `make_record_header(n + 1)`, arity >= 1), so reaching the shape needs
+    /// a raw forge through the public `make_record_header(0)` constant builder — which is what this
+    /// test lays down.
     ///
-    /// This asserts the *current* answers rather than a desired one: if `beam_term` ever extends the
-    /// guard (or drops it), this test fails and the crate `CONTEXT.md`'s note must be revisited.
+    /// This asserts *agreement*, not a tolerance: if `beam_term` ever widens (or drops) the guard,
+    /// this test fails and the crate `CONTEXT.md`'s note must be revisited.
     #[test]
-    fn a_forged_zero_arity_record_header_is_the_one_documented_pricing_delta() {
+    fn a_forged_zero_arity_record_header_prices_the_structural_one_word() {
         let mut src = src_heap();
         // SAFETY: one word is reserved for the header and the object has no payload.
         let zero_arity_record = unsafe {
@@ -816,8 +819,8 @@ mod tests {
         );
         assert_eq!(
             preflight_words(zero_arity_record, usize::MAX, &ctx).ok(),
-            Some(0),
-            "the policy walk prices it as the shared literal"
+            Some(1),
+            "the policy walk prices it at the structural `arity + 1` too"
         );
         // Reachability, restated as an assertion: the record constructor never produces the shape.
         let mut atoms = AtomTable::new();
