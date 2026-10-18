@@ -202,6 +202,9 @@ The host is shared, so every run's load is recorded and the conclusions are draw
 **Read the `sorted/tree` ratio row, not the absolute ns.** A ratio is
 `SortedOrderedInterior / OrderedSetInterior` (numerator = sorted `Vec`, denominator =
 B+-tree), so `< 1.0` favours the `Vec` and `> 1.0` favours the tree.
+Both interiors are timed in the **same process and the same build profile** the crate gate uses
+(`dev`, `opt-level = 1` with dependencies at `opt-level = 2`), so a cell's ratio is what
+transfers and its absolute ns is not.
 The load drift between (A) and (A′) moved the absolute figures by up to 22 % and left the
 ratios reproducing: `n = 100 000`, `shuffled`, `smallint` insert/delete is
 **29.54**/**23.72** in (A) and **29.35**/**24.35** in (A′), and lookup-hit is **0.55**/**0.61**
