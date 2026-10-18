@@ -176,6 +176,16 @@ pub(crate) fn message(text: impl Into<String>) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(text.into())))
 }
 
+/// The prefix of the reason atom the loader's **expected-name check** raises
+/// ([`bad_object_module_name`]).
+///
+/// It is the C's own diagnostic text (`beam_load.c:186`, `BeamLoadError1(stp, "module name in
+/// object code is %T", …)`), so the runtime's CLI diagnostic reads like the oracle's report and
+/// [`is_bad_object_module_name`] has one documented token to classify — the same
+/// prefix-constant convention as [`UNSUPPORTED_PREFIX`], [`HALT_PREFIX`] and [`DUMP_PREFIX`]
+/// (never an ad-hoc `contains`/`ends_with` on an arbitrary message).
+pub(crate) const BAD_OBJECT_MODULE_NAME_PREFIX: &str = "module name in object code is ";
+
 /// The loader's diagnostic for a `.beam` whose **object code names another module**.
 ///
 /// This is the loader's expected-name check — the C's `beam_load.c:186`
@@ -189,6 +199,17 @@ pub(crate) fn message(text: impl Into<String>) -> BeamError {
 /// informative as the C's log line. A bare atom cannot carry it (the harness compares reasons
 /// exactly, so only the `code:*` return value — `badfile` — is part of the contract).
 ///
+/// # The **call** route turns this into the bare `undef`
+///
+/// A `code:*` caller *returns* `badfile`; an **on-demand load performed by a call** (an
+/// `M:F/A` external call to a not-yet-loaded module) does not return anything — the oracle
+/// raises `undef`, exactly as it does for a module with no `.beam` at all (measured on OTP
+/// 29.1.1 / erts-17.1: uncaught `mismatch:id(7)` with a `mismatch.beam` really holding
+/// `mymod` ⇒ exit 1, empty stdout/stderr; `catch mismatch:id(7)` ⇒
+/// `{'EXIT',{undef,[{mismatch,id,[7],[]}, …]}}`). The call site discriminates the two with
+/// [`is_bad_object_module_name`] and raises [`undef`] — see
+/// [`call_load_failure`], the single mapping.
+///
 /// # Accepted residual
 ///
 /// The oracle additionally **logs** an
@@ -198,8 +219,48 @@ pub(crate) fn message(text: impl Into<String>) -> BeamError {
 /// fabricated one.
 pub(crate) fn bad_object_module_name(requested: &str, actual: &str) -> BeamError {
     message(format!(
-        "module name in object code is {actual}, not {requested}"
+        "{BAD_OBJECT_MODULE_NAME_PREFIX}{actual}, not {requested}"
     ))
+}
+
+/// Whether `error` is the loader's **expected-name check** refusal, the classifier of the
+/// [`BAD_OBJECT_MODULE_NAME_PREFIX`] convention.
+///
+/// The counterpart of [`unsupported_reason`]/[`halt_status`]: it reads the raise's *reason
+/// atom* (through the same `ExitReason::as_atom` path, so an owned-`String` atom — which every
+/// message here is — is visible) and answers `true` only when the reason really is a
+/// name-mismatch diagnostic. Nothing else in the runtime raises that reason, so this is a
+/// typed distinction between *"the image named another module"* and every other load failure
+/// (a missing file, a malformed container, an unreadable file), which keep their own
+/// behaviour.
+pub(crate) fn is_bad_object_module_name(error: &BeamError) -> bool {
+    raise_reason(error).is_some_and(|reason| reason.starts_with(BAD_OBJECT_MODULE_NAME_PREFIX))
+}
+
+/// The raise a **failed on-demand module load** produces at a call site.
+///
+/// The oracle's answer to a call whose `<Module>.beam` cannot be loaded is the **bare
+/// `error:undef`** — the module/function/arity live in the stacktrace, never in the reason —
+/// and that is true for *every* reason the load failed: no file at all, and a found-but-refused
+/// image alike. Measured on OTP 29.1.1 / erts-17.1 with a `-pa` directory holding a
+/// `mismatch.beam` whose object code declares `mymod`:
+///
+/// * uncaught `mismatch:id(7)` ⇒ exit 1, empty stdout, empty stderr;
+/// * `catch mismatch:id(7)` ⇒ `{'EXIT',{undef,[{mismatch,id,[7],[]}, {erl_eval,…}, …]}}`,
+///   i.e. the reason is the bare atom `undef`, byte-identical to the same call against
+///   `nosuchmod_xyz` (a module with no file).
+///
+/// So the call route maps the loader's expected-name check ([`bad_object_module_name`], whose
+/// *message* is right for the `code:*` routes that fold it into `badfile`) to [`undef`] — the
+/// one undef constructor, never a second one — and leaves **every** other load failure exactly
+/// as it is (the not-found case is already `undef` from
+/// [`CodeServer::not_found`](crate::CodeServer), a malformed image keeps its own diagnostic).
+pub(crate) fn call_load_failure(error: BeamError) -> BeamError {
+    if is_bad_object_module_name(&error) {
+        undef()
+    } else {
+        error
+    }
 }
 
 /// The reason of a [`BeamError::Raise`], as an atom name, when there is one.
@@ -828,6 +889,59 @@ mod tests {
         // It is a genuine error, not a Milestone-1 capability gap.
         assert_eq!(unsupported_reason(&error), None);
         assert_eq!(halt_status(&error), None);
+    }
+
+    #[test]
+    fn the_loader_name_check_is_classified_and_maps_to_the_bare_undef_at_a_call_site() {
+        // The loader's expected-name check is a *distinguishable* raise: its reason atom starts
+        // with the C's own diagnostic text, and nothing else in the runtime raises it.
+        let mismatch = bad_object_module_name("mismatch", "mymod");
+        assert!(is_bad_object_module_name(&mismatch));
+        // The message names **both** modules, so the CLI diagnostic is informative — that is
+        // what the `code:*` routes see (they fold it into `badfile`, discarding it).
+        assert_eq!(
+            mismatch.to_string(),
+            "error module name in object code is mymod, not mismatch"
+        );
+        // It is neither a capability gap nor a halt: a genuine load refusal.
+        assert_eq!(unsupported_reason(&mismatch), None);
+        assert_eq!(halt_status(&mismatch), None);
+        // Every other failure is *not* the name check — including a missing file (already
+        // `undef`) and a malformed image (which keeps its own diagnostic).
+        for other in [
+            undef(),
+            BeamError::BadArg,
+            BeamError::SystemLimit,
+            message("cannot read /nowhere/x.beam: no such file"),
+            unsupported("opcode"),
+        ] {
+            assert!(!is_bad_object_module_name(&other), "{other}");
+        }
+        // The classifier is exact: a reason that merely *starts* with the prefix words is not a
+        // name-mismatch diagnostic unless the constructor built it.
+        assert!(!is_bad_object_module_name(&message(
+            "module name in object code is"
+        )));
+
+        // At a **call** site the loader's name check becomes the oracle's bare `undef` — the
+        // same reason as a module with no file — while every other error passes through
+        // unchanged (`error::call_load_failure`).
+        let mapped = call_load_failure(mismatch);
+        assert_eq!(mapped.as_atom(), Some("undef"));
+        assert_eq!(mapped.to_string(), "error undef");
+        assert_eq!(unsupported_reason(&mapped), None);
+        let missing = undef();
+        assert_eq!(call_load_failure(missing).to_string(), "error undef");
+        let malformed = message("cannot read /nowhere/x.beam: no such file");
+        assert_eq!(
+            call_load_failure(malformed).to_string(),
+            "error cannot read /nowhere/x.beam: no such file",
+            "a non-name-check load failure keeps its own diagnostic"
+        );
+        assert!(matches!(
+            call_load_failure(BeamError::BadArg),
+            BeamError::BadArg
+        ));
     }
 
     #[test]
