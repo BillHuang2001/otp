@@ -49,6 +49,48 @@
 //! counterpart of the reference `TestMailbox` in `../beam_engine/tests/receive.rs`,
 //! with identical semantics — that test's cases are the ones these must satisfy.
 //!
+//! # The marker anchor (why a marker is not just the scan position)
+//!
+//! A receive marker is the compiler's *selective-receive skip*: `lib/compiler` emits
+//! `recv_marker_reserve` just **before** the `make_ref`/`monitor` that the receive's
+//! leading pattern is built from, `recv_marker_bind` binds the opaque marker to that
+//! reference, and every receive that matches on it starts with
+//! `recv_marker_use` (`beam_ssa_recv.erl:27-106`). The point is that a message queued
+//! *before* the reference existed cannot match, so the scan may start after it.
+//!
+//! The C therefore does not record the *scan position* at all: `recv_marker_insert`
+//! splices a marker **node** into the queue at `sig_qs.last`, i.e. immediately after
+//! the last message queued at reserve time
+//! (`../../erts/emulator/beam/erl_proc_sig_queue.c:4290-4348`), and
+//! `erts_msgq_recv_marker_set_save__` (`erl_proc_sig_queue.h:2151`) makes
+//! `recv_marker_use` resume the scan *at that node*. Two properties follow, and both
+//! are load-bearing:
+//!
+//! * **messages enqueued after the reserve are always scanned** — the marker sits
+//!   before them, so a receive that suspended at the end of the queue resumes onto
+//!   whatever arrived while it waited;
+//! * **the anchor survives structural change** — a queue node's identity does not
+//!   move when an earlier message is unlinked (`erts_msgq_pass_recv_markers` rewrites
+//!   its `prev_next` back-pointer), whereas a raw queue *index* is stale by one after
+//!   every `Queue::remove_at` (`../beam_message/src/message.rs:371`).
+//!
+//! A [`Marker`] here is therefore an **anchor**, not a position: the number of queued
+//! messages that lie *before* the marker. It starts at the queue's length at reserve
+//! time and counts down whenever a message in front of it is unlinked, which is the
+//! index-space equivalent of the C's node. `use_reference` clamps it into `0..=len`
+//! so a queue that shrank without going through [`MailboxState::remove_at`] can never
+//! park the scan past the end — a past-the-end scan is not a benign state: `loop_rec`
+//! reports "no candidate", the compiled code jumps to its `wait`, and the receiver
+//! misses every message already queued.
+//!
+//! One deliberate deviation from the C: an **empty-queue** reserve hands out a usable
+//! marker (the C answers `am_undefined`, `erl_proc_sig_queue.h:2225-2236`). The C can
+//! afford that because "no marker" makes `recv_marker_use` leave the save pointer
+//! alone, which is the front of the queue at that instant; recording the equivalent
+//! anchor (`0`) explicitly is behaviourally identical there and strictly stronger
+//! afterwards, because the anchor is length-stable while an untouched save pointer is
+//! whatever the previous receive left behind.
+//!
 //! `unsafe`-free: every queue access is a bounds-safe [`Queue`] method (a past-the-end
 //! cursor or an empty queue yields `None`, never a panic).
 
@@ -61,8 +103,22 @@ use beam_term::{is_small, make_small, Eterm};
 /// A marker is **opaque** to the engine — it only stores the term and hands it back
 /// verbatim — so any distinct small integer serves; the base merely makes a marker
 /// recognizable in a trace. It must be a *small* integer so
-/// [`MailboxState::bind`] can tell it apart from the empty-queue `undefined`.
+/// [`MailboxState::bind`] can tell it apart from a non-marker term.
 const MARKER_BASE: i64 = 1 << 20;
+
+/// How many markers one process may hold live at a time — the C's
+/// `ERTS_RECV_MARKER_BLOCK_SIZE` (`../../erts/emulator/beam/erl_proc_sig_queue.h`).
+///
+/// The C keeps a fixed-size block and recycles the oldest entry, because a marker is
+/// *not* always cleared: `beam_ssa_recv` deliberately emits no `recv_marker_clear` on
+/// exception edges ("orphaned markers get recycled very quickly so there's little harm
+/// in ignoring exceptions", `lib/compiler/src/beam_ssa_recv.erl:225-232`), so a process
+/// that raises out of a marker'd receive between the reserve and the clear would
+/// otherwise accumulate one entry per iteration for its whole life. Recycling the
+/// oldest is behaviour-safe: an evicted marker is simply unknown, and
+/// `bind`/`use`/`clear` treat an unknown marker as a no-op (the scan then starts where
+/// it was, which only re-scans messages, never skips one).
+const MAX_MARKERS: usize = 64;
 
 /// One reserved receive marker.
 #[derive(Debug)]
@@ -71,8 +127,14 @@ struct Marker {
     term: Eterm,
     /// The reference [`MailboxState::bind`] bound the marker to, if any.
     reference: Option<Eterm>,
-    /// The scan position recorded when the marker was reserved.
-    position: usize,
+    /// The marker's **anchor**: how many queued messages lie *before* it.
+    ///
+    /// Set to the queue's length at reserve time — the C splices the marker in after the
+    /// last message (`erl_proc_sig_queue.c:4290-4348`) — and decremented by
+    /// [`MailboxState::remove_at`] whenever a message in front of it is unlinked, so the
+    /// anchor keeps naming the same queue point after `Queue::remove_at` shifted every
+    /// later message down by one (see the module docs, "The marker anchor").
+    anchor: usize,
 }
 
 /// The receive scan state of one process's mailbox.
@@ -189,7 +251,19 @@ impl MailboxState {
     /// [`MailboxState::retained_off_heap`] and [`MailboxState::retained_nodes`]). A message whose
     /// payload lives entirely in the receiver's heap is dropped exactly as before.
     pub(crate) fn remove_at(&mut self, queue: &mut Queue, cursor: QueueCursor) {
+        let removed = queue.position(cursor);
         if let Some(mut message) = queue.remove_at(cursor) {
+            // Every marker anchored *behind* the unlinked message follows the shift:
+            // one fewer message lies in front of it now. This is the index-space
+            // equivalent of the C rewriting a marker node's `prev_next` back-pointer
+            // (`erts_msgq_pass_recv_markers`), and it is what keeps a marker usable
+            // across a receive that removed a message it had already scanned past. A
+            // marker anchored *at or before* the removed message does not move.
+            for marker in &mut self.markers {
+                if marker.anchor > removed {
+                    marker.anchor -= 1;
+                }
+            }
             if let Some(fragments) = message.fragments_mut() {
                 self.retained_fragments.push(std::mem::take(fragments));
             }
@@ -242,29 +316,44 @@ impl MailboxState {
         self.cursor = queue.cursor();
     }
 
-    /// `recv_marker_reserve`: an opaque marker term recording the current scan position.
+    /// `recv_marker_reserve`: an opaque marker term anchored at the **end of the queue**.
     ///
-    /// An **empty** queue has no position to record, so — exactly like the C
-    /// `am_undefined` — the caller's `undefined` term is returned instead;
-    /// [`MailboxState::bind`] then treats it as a no-op.
+    /// The anchor is the queue's current length — the marker sits immediately after the
+    /// last message queued right now, exactly like the C queue node
+    /// `recv_marker_insert` splices in at `sig_qs.last` — so everything enqueued later is
+    /// scanned by a receive that starts with [`MailboxState::use_reference`], and
+    /// messages already queued (which cannot match the reference the caller is about to
+    /// create) are skipped.
+    ///
+    /// An **empty** queue still hands out a usable marker, with anchor `0`: unlike the C
+    /// `am_undefined` this survives later structural change (the module docs, "The
+    /// marker anchor"). The `undefined` argument is the seam's term for the C's
+    /// no-marker answer; it is no longer used, and no caller observes a difference
+    /// because a marker term is opaque to the engine.
+    ///
+    /// At most [`MAX_MARKERS`] markers are kept; reserving past that recycles the oldest
+    /// (the C's fixed block does the same).
     pub(crate) fn reserve(&mut self, queue: &Queue, undefined: Eterm) -> Eterm {
-        if queue.is_empty() {
-            return undefined;
-        }
+        let _ = undefined;
         let marker = make_small(MARKER_BASE + self.next_marker);
-        self.next_marker += 1;
+        // The term counter is monotone modulo a bound far inside the small-int range, so
+        // two live markers can never share a term (at most `MAX_MARKERS` are live).
+        self.next_marker = (self.next_marker + 1) % (1 << 40);
+        if self.markers.len() == MAX_MARKERS {
+            self.markers.remove(0);
+        }
         self.markers.push(Marker {
             term: marker,
             reference: None,
-            position: queue.position(self.cursor),
+            anchor: queue.len(),
         });
         marker
     }
 
     /// `recv_marker_bind`: bind the opaque `marker` to `reference`.
     ///
-    /// A **non-small** marker (the empty-queue `undefined`) is a silent no-op, exactly
-    /// like the C (`erl_proc_sig_queue.h:2238-2263`).
+    /// A **non-small** marker (any non-marker term a caller may hand back) is a silent
+    /// no-op, exactly like the C (`erl_proc_sig_queue.h:2238-2263`).
     pub(crate) fn bind(&mut self, marker: Eterm, reference: Eterm) {
         if !is_small(marker) {
             return;
@@ -274,17 +363,21 @@ impl MailboxState {
         }
     }
 
-    /// `recv_marker_use`: set the scan position to the one `reference`'s marker recorded.
+    /// `recv_marker_use`: set the scan position to `reference`'s marker anchor.
     ///
-    /// An unknown reference is a no-op.
+    /// The anchor is clamped into `0..=len`, so even a queue that shrank *without* the
+    /// scan state seeing the removal (a direct `Queue::dequeue`/`clear`, or a host that
+    /// rewired the queue) can never park the scan past the end — which would make the
+    /// next `loop_rec` report "no candidate" and lose the messages that are still
+    /// queued. An unknown reference is a no-op.
     pub(crate) fn use_reference(&mut self, queue: &Queue, reference: Eterm) {
-        let position = self
+        let anchor = self
             .markers
             .iter()
             .find(|entry| entry.reference == Some(reference))
-            .map(|entry| entry.position);
-        if let Some(position) = position {
-            self.cursor = queue.cursor_at(position);
+            .map(|entry| entry.anchor);
+        if let Some(anchor) = anchor {
+            self.cursor = queue.cursor_at(anchor.min(queue.len()));
         }
     }
 
@@ -382,16 +475,199 @@ mod tests {
         assert_eq!(state.next(&queue), Some(make_small(1)));
     }
 
+    /// An **empty-queue** reserve hands out a *usable* marker anchored at the front, so a
+    /// receive that suspended at the end of an empty queue re-scans from the front — the
+    /// C `am_undefined` shortcut (`erl_proc_sig_queue.h:2225-2236`) is only equivalent
+    /// there *at that instant*; an explicit anchor also survives a later structural
+    /// change (see the module docs, "The marker anchor").
+    ///
+    /// The discriminator is behavioural, not merely the term's shape: the scan is
+    /// advanced past the (empty) queue and then a message is enqueued, which leaves a
+    /// cursor anchored on nothing. The restore must put the scan back onto it. On the
+    /// pre-fix code an empty queue recorded no marker at all, `bind` and `use` were both
+    /// silent no-ops, and the scan stayed past the end — the message was never seen.
     #[test]
-    fn a_marker_reserved_on_an_empty_queue_is_the_undefined_term() {
-        let queue = Queue::new();
+    fn a_marker_reserved_on_an_empty_queue_still_repositions_the_scan() {
+        let mut queue = Queue::new();
         let mut state = MailboxState::default();
-        let undefined = Eterm::from_raw(0xAB);
-        assert_eq!(state.reserve(&queue, undefined), undefined);
-        // Binding the `undefined` marker is a no-op, and using it cannot move the scan.
-        state.bind(undefined, make_small(7));
+        let marker = state.reserve(&queue, make_small(-1));
+        assert!(is_small(marker), "an empty queue still yields a marker");
+
+        state.bind(marker, make_small(7));
+        assert_eq!(state.next(&queue), None, "an empty mailbox has no candidate");
+        // A message arrives; the scan runs past it (the cursor ended up past the end).
+        queue.enqueue(Message::new(make_small(9), NIL));
+        state.skip(&queue);
+        assert_eq!(
+            state.next(&queue),
+            None,
+            "the cursor was advanced past the newly queued message"
+        );
+
         state.use_reference(&queue, make_small(7));
+        assert_eq!(
+            state.next(&queue),
+            Some(make_small(9)),
+            "the marker re-positioned the scan onto the message that arrived later"
+        );
+    }
+
+    /// A marker anchors at the **end of the queue**, not at the scan cursor, and it stays
+    /// valid across a removal in front of it.
+    ///
+    /// This is the C's `recv_marker_insert` semantics
+    /// (`../../erts/emulator/beam/erl_proc_sig_queue.c:4290-4348`: the marker node is
+    /// spliced in at `sig_qs.last`) together with
+    /// `erts_msgq_pass_recv_markers`'s back-pointer maintenance: `recv_marker_reserve` is
+    /// emitted *before* the `make_ref` the receive matches on
+    /// (`beam_ssa_recv.erl:27-106`), so a receive that starts with `recv_marker_use` must
+    /// skip the messages that were already queued and scan everything that arrived
+    /// afterwards.
+    ///
+    /// The discriminator: on the pre-fix code the marker recorded the **scan cursor**
+    /// (here `0`, because nothing had been scanned yet, while the queue held two
+    /// messages), so `use_reference` rewound the scan onto the first message queued
+    /// *before* the reference existed and the message the receive was waiting for was
+    /// reached only after two useless comparisons — and, worse, a scan that had already
+    /// been exhausted kept its past-the-end position instead. Note the pre-fix code
+    /// satisfied the *weaker* property this test's second half (`reset`-shaped) asserts,
+    /// which is why the defect was silent.
+    #[test]
+    fn a_marker_anchors_at_the_queue_tail_not_at_the_scan_cursor() {
+        let mut queue = queue_of(&[1, 2]);
+        let mut state = MailboxState::default();
+        let marker = state.reserve(&queue, make_small(-1));
+        state.bind(marker, make_small(42));
+        // Messages queued *after* the reserve: these are the ones the receive must see.
+        queue.enqueue(Message::new(make_small(3), NIL));
+        queue.enqueue(Message::new(make_small(4), NIL));
+
+        state.use_reference(&queue, make_small(42));
+        assert_eq!(
+            state.next(&queue),
+            Some(make_small(3)),
+            "the marker skips the two messages queued before it and lands on the first \
+             message queued after it"
+        );
+
+        // ... and it is length-stable: unlinking a message *in front of* the anchor moves
+        // the anchor down with it (the C rewrites the marker node's `prev_next`), so the
+        // restore still names the same queue point and never lands past the end.
+        let mut queue = queue_of(&[1, 2]);
+        let mut state = MailboxState::default();
+        let marker = state.reserve(&queue, make_small(-1));
+        state.bind(marker, make_small(42));
+        queue.enqueue(Message::new(make_small(3), NIL));
+        // Unlink both messages that were queued before the marker.
+        let head = queue.cursor();
+        state.remove_at(&mut queue, head);
+        state.remove_at(&mut queue, head);
+        assert_eq!(payloads(&queue), vec![3], "only the post-reserve message is left");
+        state.use_reference(&queue, make_small(42));
+        assert_eq!(
+            state.next(&queue),
+            Some(make_small(3)),
+            "the anchor followed the removals instead of pointing past the end"
+        );
+    }
+
+    /// A restore **clamps** the anchor into `0..=len`, so a queue that shrank behind the
+    /// scan state's back cannot leave the scan stranded past the end for ever.
+    ///
+    /// [`MailboxState::remove_at`] maintains every anchor, so the clamp only matters for a
+    /// queue emptied or shortened **without** the scan state seeing it (a direct
+    /// [`Queue::dequeue`], [`Queue::clear`], or a host that rewired the queue). The failure
+    /// it prevents is not the restore itself — a cursor past the end peeks `None` either
+    /// way — but everything that happens *afterwards*: an unclamped `anchor > len` stays
+    /// past the end as the queue refills, so `loop_rec` answers "no candidate" and the
+    /// receiver misses every message queued after the restore.
+    #[test]
+    fn a_restored_anchor_is_clamped_into_the_queue() {
+        let mut queue = queue_of(&[1, 2, 3]);
+        let mut state = MailboxState::default();
+        // The marker sits *after* all three messages, so its anchor is `3`.
+        let marker = state.reserve(&queue, make_small(-1));
+        state.bind(marker, make_small(8));
+        assert_eq!(state.next(&queue), Some(make_small(1)));
+
+        // The queue shrinks behind the scan state's back down to one message.
+        assert!(queue.dequeue().is_some());
+        assert!(queue.dequeue().is_some());
+        state.use_reference(&queue, make_small(8));
+        assert_eq!(
+            state.next(&queue),
+            None,
+            "the one message left was queued before the marker, so it is skipped"
+        );
+
+        // Two messages arrive afterwards: a clamped scan still finds them.
+        queue.enqueue(Message::new(make_small(4), NIL));
+        queue.enqueue(Message::new(make_small(5), NIL));
+        assert_eq!(
+            state.next(&queue),
+            Some(make_small(4)),
+            "an unclamped anchor (3) would still be past the end of a 3-message queue"
+        );
+        state.skip(&queue);
+        assert_eq!(state.next(&queue), Some(make_small(5)));
+
+        // A fully drained queue leaves a sane scan position too.
+        queue.clear();
+        state.use_reference(&queue, make_small(8));
         assert_eq!(state.next(&queue), None);
+        queue.enqueue(Message::new(make_small(6), NIL));
+        assert_eq!(
+            state.next(&queue),
+            Some(make_small(6)),
+            "a message queued after a restore over a drained queue is still scanned"
+        );
+    }
+
+    /// The marker table is bounded (the C's `ERTS_RECV_MARKER_BLOCK_SIZE` recycling) and
+    /// keeps handing out usable, distinct markers.
+    ///
+    /// `beam_ssa_recv` deliberately emits no `recv_marker_clear` on exception edges
+    /// (`lib/compiler/src/beam_ssa_recv.erl:225-232`), so an unbounded table would leak
+    /// one entry per raise out of a marker'd receive for the life of the process. An
+    /// evicted marker is simply unknown, which `bind`/`use` treat as a no-op.
+    #[test]
+    fn the_marker_table_is_bounded_and_recycles_the_oldest() {
+        let queue = queue_of(&[1]);
+        let mut state = MailboxState::default();
+        let first = state.reserve(&queue, make_small(-1));
+        state.bind(first, make_small(1));
+        for _ in 1..MAX_MARKERS {
+            let marker = state.reserve(&queue, make_small(-1));
+            state.bind(marker, make_small(-2));
+        }
+        assert_eq!(state.markers.len(), MAX_MARKERS);
+        let newest = state.reserve(&queue, make_small(-1));
+        assert_eq!(
+            state.markers.len(),
+            MAX_MARKERS,
+            "reserving past the bound recycles instead of growing"
+        );
+        assert!(
+            state.markers.iter().all(|marker| marker.term != first),
+            "the oldest marker was the one recycled"
+        );
+        // The recycled marker's reference is simply unknown now: using it is a no-op,
+        // never a wrong scan position, and the newest marker still works.
+        state.bind(newest, make_small(99));
+        state.reset(&queue);
+        state.use_reference(&queue, make_small(1));
+        assert_eq!(
+            state.next(&queue),
+            Some(make_small(1)),
+            "an evicted marker leaves the scan alone"
+        );
+        let queue = queue_of(&[1, 2]);
+        state.use_reference(&queue, make_small(99));
+        assert_eq!(
+            state.next(&queue),
+            Some(make_small(2)),
+            "the newest marker anchors at the tail of the queue it was reserved on"
+        );
     }
 
     #[test]
