@@ -582,6 +582,99 @@ pub(super) fn split_address(arg: &[u8]) -> Result<(InetAddr, &[u8])> {
     Ok((address, &arg[consumed..]))
 }
 
+/// The first byte of every `term_to_binary/1` blob: the external-term-format version byte
+/// (`VERSION_MAGIC`, decimal `131` / `0x83`, `erts/emulator/beam/external.h`).
+///
+/// It is the discriminator [`split_caller_ref`] keys on: `prim_inet` wraps its caller reference
+/// in `term_to_binary(Mref, [local])` (`erts/preloaded/src/prim_inet.erl:575`-`:620`), so the
+/// tag's first byte is always this one.
+pub(super) const ETF_VERSION_MAGIC: u8 = 131;
+
+/// Strips the `prim_inet` **caller-reference prefix**, if `arg` carries one: the wire form is
+/// `[tag_len:be16][tag_bytes][rest]`, the tag being `term_to_binary(Mref, [local])` for
+/// `Mref = monitor(port, S)` (`erts/preloaded/src/prim_inet.erl:575`-`:620` for `send/3`,
+/// `:650`-`:700` for `do_sendto/4`).
+///
+/// The C strips exactly this prefix in `init_caller`/`init_caller_iov`
+/// (`erts/emulator/drivers/common/inet_drv.c:1820`-`:1890`): read the 16-bit `n`, skip it and the
+/// `n` tag bytes, keeping the tag so the later `{inet_reply, S, Reply, Ref}` message can echo it
+/// (`inet_reply_caller_ref`, `:2610`-`:2660`). The C only does so when `driver_caller(port)` is
+/// an internal pid.
+///
+/// **This crate's [`Driver`](crate::Driver)/[`DriverContext`](crate::DriverContext) seam carries
+/// no caller**, so the receiving side has to decide from the payload alone: a `[n:be16][n
+/// bytes]` prefix whose `n` is non-zero, fits inside `arg`, and whose first tag byte is
+/// [`ETF_VERSION_MAGIC`] is treated as a caller reference.
+///
+/// Returns the bytes **after** the prefix, or `None` when `arg` is not in that form (the caller
+/// then falls back to the plain `[address][data]` grammar).
+///
+/// # The one residual ambiguity
+///
+/// A *plain* command whose first two bytes happen to satisfy this shape (a 16-bit length that
+/// fits, followed by `0x83`) is read as a caller-reference form. For a plain UDP command that
+/// means byte 0 would have to be `0x00` (n = 1..255) and byte 2 = `0x83`, i.e. an address family
+/// tag of `0x00` — never a valid address tag (1/3/4), so no *valid* plain command is misparsed.
+pub(super) fn split_caller_ref(arg: &[u8]) -> Option<&[u8]> {
+    let n = usize::from(u16::from_be_bytes([*arg.first()?, *arg.get(1)?]));
+    // `init_caller`'s `*size_p < 2` / `*size_p < n` guards: a zero-length or otherwise
+    // non-fitting tag carries no caller reference at all.
+    if n == 0 {
+        return None;
+    }
+    if *arg.get(2)? != ETF_VERSION_MAGIC {
+        return None;
+    }
+    // `None` when `2 + n` overruns the argument: the C's `*size_p < n` refusal.
+    arg.get(2 + n..)
+}
+
+/// The outcome of decoding the C's datagram command operand,
+/// `[address][anc_len:be32][anc_data][data]` (`packet_inet_command`,
+/// `erts/emulator/drivers/common/inet_drv.c:15205`-`:15230`).
+pub(super) enum DatagramCommand<'a> {
+    /// `anc_len == 0`: send `data` to `address` (`inet_drv.c:15220`).
+    Send(InetAddr, &'a [u8]),
+    /// The C's `return_einval` (`:15205`/`:15212`): fewer than four bytes follow the address, or
+    /// fewer than the ancillary-length word asks for. The caller renders it as
+    /// `[0] ++ "einval"` (`ctl_xerror`), exactly as the C does.
+    Einval,
+}
+
+/// Decodes the C's `[address][anc_len:be32][anc_data][data]` datagram operand — the body
+/// `packet_inet_command` runs once the caller-reference prefix is off
+/// (`inet_drv.c:15205`-`:15230`).
+///
+/// The ancillary length must be **zero**: the C's non-zero arm builds an `msghdr` with the
+/// caller's cmsgs and calls `sendmsg(2)` (`:15220`-`:15230`), a path this floor has no seam for,
+/// so it is a typed [`error::unsupported`] rather than a send with the ancillary data silently
+/// dropped or sent as payload.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] when no packed address leads the argument (the C's
+/// `inet_set_faddress` failure, which it answers with `inet_reply_error_am(xerror)`), and the
+/// typed `unsupported` raise for a non-zero ancillary length.
+pub(super) fn split_datagram(arg: &[u8]) -> Result<DatagramCommand<'_>> {
+    let (address, rest) = split_address(arg)?;
+    if rest.len() < 4 {
+        // `if (len < 4) goto return_einval` (`:15205`).
+        return Ok(DatagramCommand::Einval);
+    }
+    let anc_len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+    let data = &rest[4..];
+    if data.len() < anc_len {
+        // `if (len < anc_len) goto return_einval` (`:15212`).
+        return Ok(DatagramCommand::Einval);
+    }
+    if anc_len != 0 {
+        return Err(error::unsupported(
+            "udp ancillary data (sendmsg cmsg) is not served by this driver floor",
+        ));
+    }
+    Ok(DatagramCommand::Send(address, data))
+}
+
 /// What one `INET_REQ_SETNAME`/`INET_REQ_SETPEER` operand asks of the driver.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum FakeAddress {

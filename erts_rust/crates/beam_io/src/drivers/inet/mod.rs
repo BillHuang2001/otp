@@ -1166,6 +1166,30 @@ impl TcpInetDriver {
     /// `TCP_ADDF_DELAYED_CLOSE_SEND` flag, `inet_drv.c:12682`); a `send` whose write is what
     /// discovers the close answers `closed` too.
     ///
+    /// # The `prim_inet` caller-reference prefix is *not* stripped here (a seam gap)
+    ///
+    /// `prim_inet:send/3` prefixes the payload with `[tag_len:be16][tag_bytes]` — the tag being
+    /// `term_to_binary(Mref, [local])` for `Mref = monitor(port, S)`
+    /// (`erts/preloaded/src/prim_inet.erl:575`-`:620`). The C strips it in
+    /// `init_caller`/`init_caller_iov` (`inet_drv.c:1820`-`:1890`), but **only when
+    /// `driver_caller(port)` is an internal pid** — and it echoes the tag back as the fourth
+    /// element of the later `{inet_reply, S, Reply, Ref}` message (`inet_reply_caller_ref`,
+    /// `:2610`-`:2660`).
+    ///
+    /// This crate's frozen [`Driver`]/[`DriverContext`] seam carries **no caller**, and the TCP
+    /// payload after the prefix is a structureless byte stream, so — unlike the `udp_inet` `send`
+    /// verb, whose post-prefix grammar starts with an address tag and therefore discriminates
+    /// reliably — there is **no sound way to tell a prefixed payload from a data payload that
+    /// merely begins with those bytes**. Guessing would corrupt ordinary sends, so this verb
+    /// does not guess: a `gen_tcp:send` payload arrives with its prefix intact and is written as
+    /// data. Closing the gap needs a caller-carrying seam on `DriverContext` (or the runtime
+    /// pre-stripping the prefix above this crate); the `{inet_reply, …}` echo needs the
+    /// driver→owner message channel this crate does not have either.
+    ///
+    /// Note also that the `{packet, 1|2|4}` framing described above is applied by **this verb**
+    /// only: [`TcpInetDriver::output`]/[`TcpInetDriver::ready_output`] (the
+    /// `erlang:port_command/2` path) go straight to [`TcpInetDriver::write_pending`], which
+    /// writes the queued bytes unframed.    ///
     /// A `shutdown(SHUT_WR|SHUT_RDWR)` **deferred** because output was still queued
     /// ([`TcpInetDriver::pending_shutdown`]) rejects a further `send`, exactly as the C does:
     /// `tcp_inet_commandv` routes it to `tcp_shutdown_error(desc, EPIPE)` (`inet_drv.c:12695`),

@@ -48,7 +48,7 @@
 //! | `open` | `INET_REQ_OPEN` (`:14577`) | `[AF, TYPE, PROTO]` (3 bytes) | `[1]`, `[0] ++ "eafnosupport"`, `[0] ++ "einval"` or `[0] ++ "eprotonosupport"` |
 //! | `bind` | `INET_REQ_BIND` (`:11409`) | packed address | `[1, port_hi, port_lo]` |
 //! | `connect` | `INET_REQ_CONNECT` (`:14710`) | packed address (the C's 4-byte timeout prefix is accepted and skipped) | `[1]`, or `[0] ++ errno` |
-//! | `send` | `packet_inet_command` (`:15037`) | `[address][payload]` | `[1]`, or `[0] ++ errno` |
+//! | `send` | `packet_inet_command` (`:15037`) | `[address][anc_len:be32][data]`, optionally behind a `prim_inet` caller-reference prefix `[n:be16][tag]` | `[1]`, or `[0] ++ errno` |
 //! | `recv` | `PACKET_REQ_RECV` (`:14968`) | — (read-now) | `[1] ++ src_address` with a datagram, the bare `[1]` when none is pending, `[0] ++ errno` on failure |
 //! | `close` | `INET_REQ_CLOSE` (`:14701`) | — | `[1]` |
 //! | `setopts` | `INET_REQ_SETOPTS` (`:11111`) | option records `[opt, val_be32]*` | `[1]`, or `[0] ++ "einval"` |
@@ -104,6 +104,11 @@
 //! * **`INET_REQ_PEER` (code `4`)** — the UDP half does not implement the peer query, so it is
 //!   not a verb here at all (it is reached only through the control code, which this node does
 //!   not decode).
+//! * **The `{inet_reply, S, Reply, Ref}` echo of the caller reference** — `send` **accepts** the
+//!   `prim_inet` caller-reference prefix and strips it (see
+//!   [`UdpInetDriver::verb_send`]), but the C echoes the tag back as that message's fourth
+//!   element (`inet_reply_caller_ref`, `:2610`-`:2660`), which needs a driver→owner message
+//!   channel this crate does not have. The reply stays the synchronous `ctl_reply` bytes.
 //! * **IPv6, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
 //!   `AF_INET`/`SOCK_DGRAM` and `bind`/`connect`/`send` only the packed
 //!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms.
@@ -151,9 +156,9 @@ use super::sys::{
     recv_from, send_connected, send_to, socket_type,
 };
 use super::wire::{
-    ctl_error, ctl_ok, ctl_xerror, pack_address, parse_address, split_address, InetAddr,
-    INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_PROTO_UDP,
-    INET_TYPE_DGRAM, INET_TYPE_STREAM,
+    ctl_error, ctl_ok, ctl_xerror, pack_address, parse_address, split_address, split_caller_ref,
+    split_datagram, DatagramCommand, InetAddr, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK,
+    INET_PROTO_DEFAULT, INET_PROTO_UDP, INET_TYPE_DGRAM, INET_TYPE_STREAM,
 };
 use super::InetState;
 
@@ -589,25 +594,73 @@ impl UdpInetDriver {
 
     /// The `send` verb: sends one datagram.
     ///
-    /// Mirroring `packet_inet_command` (`:15037`-`:15182`), the argument is `[address][payload]`
-    /// — the C's `[address][anc_len:32][data]` without the ancillary-data length, which is out of
-    /// scope. The address is always parsed and consumed; whether it is **used** depends on the
-    /// socket: a **connected** socket sends with `send(2)` and ignores it (the C's
-    /// `INET_F_ACTIVE` branch, `:15164`-`:15175`), an unconnected one with `sendto(2)`.
+    /// Mirroring `packet_inet_command` (`:15037`-`:15230`), the argument carries the C's
+    /// `[address][anc_len:be32][anc_data][data]` grammar. The address is always parsed and
+    /// consumed; whether it is **used** depends on the socket: a **connected** socket sends with
+    /// `send(2)` and ignores it (the C's `INET_F_ACTIVE` branch, `:15164`-`:15175`), an
+    /// unconnected one with `sendto(2)`.
+    ///
+    /// # The two accepted wire forms
+    ///
+    /// The C strips the `prim_inet` **caller-reference prefix** before this grammar, but only
+    /// when `driver_caller(port)` is an internal pid (`init_caller`/`init_caller_iov`,
+    /// `inet_drv.c:1820`-`:1890`). This crate's [`Driver`]/[`DriverContext`] seam carries no
+    /// caller, so the form is recognised from the payload (see [`split_caller_ref`]):
+    ///
+    /// 1. **caller-reference form, tried first** — `[tag_len:be16][tag_bytes][address]
+    ///    [anc_len:be32][anc_data][data]`, where `tag_len` is non-zero, fits, and whose first tag
+    ///    byte is the ETF `VERSION_MAGIC` `131` (`prim_inet:send/3`'s
+    ///    `[<<Size:16, MrefBin/binary>>, Data]` and `do_sendto/4`'s
+    ///    `[<<Size:16, RefBin/binary>>, Address, AncLen, AncData, Data]`,
+    ///    `erts/preloaded/src/prim_inet.erl:575`-`:620`, `:650`-`:700`). The C's own
+    ///    `len < 4` / `len < anc_len` guards (`:15205`/`:15212`) answer `[0] ++ "einval"`; a
+    ///    **non-zero** `anc_len` is the typed `unsupported` raise (this floor has no `sendmsg`
+    ///    cmsg path — the C's `:15220`-`:15230` arm).
+    /// 2. **plain form** — `[address][data]`, the grammar every direct `port_control` caller and
+    ///    every `port_command`-shaped probe uses. See [`split_address`] for why the ancillary
+    ///    length word is not part of it.
+    ///
+    /// **The one residual ambiguity.** A *plain* command whose first two bytes happen to satisfy
+    /// rule 1 (a 16-bit length that fits, followed by `0x83`) is read as a caller-reference form.
+    /// For a plain UDP command that means byte 0 would have to be `0x00` (n = 1..255) and byte 2
+    /// = `0x83`, i.e. an address family tag of `0x00` — never a valid address tag (1/3/4), so no
+    /// *valid* plain command is misparsed.
+    ///
+    /// **Unsendable from this crate:** the C echoes the caller reference back as the fourth
+    /// element of the later `{inet_reply, S, Reply, Ref}` message (`inet_reply_finish` /
+    /// `inet_reply_caller_ref`, `:2610`-`:2660`). The frozen [`Driver`]/[`DriverContext`] seam
+    /// has no driver→owner message channel — and this floor's `send` is a **synchronous** reply
+    /// (see the module docs on the async-op queue) — so that message is not sent. The reply here
+    /// is the C's `ctl_reply` bytes, which is what a `port_control` caller reads; the
+    /// `{inet_reply, …}` shape stays a runtime-side gap. The CLI `gen_udp:send` path is not
+    /// touched by this verb at all: a queued `port_command` reaches
+    /// [`UdpInetDriver::write_pending`] instead, which still requires a connected socket.
     ///
     /// # Errors
     ///
-    /// `BeamError::BadArg` for an argument with no parsable leading address.
+    /// `BeamError::BadArg` for an argument with no parsable leading address, and the typed
+    /// `unsupported` raise for a caller-reference form carrying ancillary data.
     fn verb_send(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
         let Some(fd) = self.socket else {
             // The C's `!IS_OPEN` guard answers `inet_reply_error(desc, EINVAL)` (`:15051`).
             return Ok(ctl_xerror("einval"));
         };
-        let (address, payload) = split_address(arg)?;
+        // Rule 1 first (the `prim_inet` caller-reference form), then the plain grammar; both
+        // arms yield the packed address the C's `inet_set_faddress` would have produced plus the
+        // payload that follows the ancillary-length word.
+        let (address, payload) = match split_caller_ref(arg) {
+            Some(command) => match split_datagram(command)? {
+                DatagramCommand::Send(address, payload) => (address, payload),
+                // The C's `return_einval` (`:15205`/`:15212`).
+                DatagramCommand::Einval => return Ok(ctl_xerror("einval")),
+            },
+            None => split_address(arg)?,
+        };
         // `inet_output_count(desc, len)` at `inet_drv.c:15163` (`packet_inet_command`, the
         // empty-ancillary-data arm; `:15220` is the ancillary one): only the **payload** is
-        // counted — never the packed address prefix — and it is counted at issue time, before
-        // the `send(2)`/`sendto(2)` attempt, so a failed send still counted it.
+        // counted — never the caller-reference prefix, the packed address or the ancillary
+        // length word — and it is counted at issue time, before the `send(2)`/`sendto(2)`
+        // attempt, so a failed send still counted it.
         self.stat.output(payload.len());
         let outcome = if self.state.is_connected() {
             send_connected(fd, payload)
