@@ -366,6 +366,14 @@ pub struct Process {
     /// **declared dead**: the reclamation worklist [`Process::sweep_off_heap_binaries`] consumes.
     /// It is a receiver-side, purely local list, never exposed to the heap.
     dead_binaries: Vec<usize>,
+    /// The host-supplied off-heap payload byte figure
+    /// ([`Process::set_off_heap_binary_bytes`]), or `None` while
+    /// [`Process::off_heap_binary_bytes`] derives the figure from the owned off-heap roster.
+    ///
+    /// The PCB cannot count the payloads itself in production: they live in the engine machine's
+    /// reservoir, outside this structure. A host that has counted them asserts the number here, and
+    /// it then takes precedence over the roster-derived sum for `max_heap_size` charging.
+    off_heap_binary_bytes_override: Option<usize>,
     /// The mailbox.
     mailbox: Queue,
     /// The root-set containers (x-registers + Erlang stack).
@@ -513,6 +521,7 @@ impl Process {
             owned_binary_index: HashMap::new(),
             owned_binary_slots: 0,
             dead_binaries: Vec::new(),
+            off_heap_binary_bytes_override: None,
             mailbox: Queue::new(),
             regs: Registers::new(),
             dict: Dict::new(),
@@ -810,12 +819,59 @@ impl Process {
         self.owned_binaries.len()
     }
 
-    /// The total payload bytes of the **live** owned off-heap binaries (the off-heap payload the
-    /// process is charged for, the `system_info` memory accounting hook).
-    pub fn off_heap_binary_bytes(&self) -> usize {
-        self.owned_binaries.overhead_bytes()
+    /// The **owned** off-heap roster, read-only: the same slot-stable, append-only
+    /// [`beam_gc::OffHeap`] that [`Process::register_off_heap_binary`] appends to and that the two
+    /// sweeps ([`Process::sweep_off_heap_binaries`],
+    /// [`Process::sweep_off_heap_binaries_reachable`]) release from.
+    ///
+    /// It is the handle a memory reporter takes a whole footprint from —
+    /// `HeapFootprint::of(process.collector(), process.owned_off_heap())`
+    /// ([`beam_gc::HeapFootprint::of`]) charges the roster's live payload bytes and its reserved
+    /// slot array without re-deriving either — and the store the reachability accounting is stated
+    /// over (its live entries are the payloads the sweep decides on).
+    pub fn owned_off_heap(&self) -> &beam_gc::OffHeap {
+        &self.owned_binaries
     }
 
+    /// The total payload bytes of this process's off-heap refc binaries — the off-heap payload the
+    /// process is charged for (the `max_heap_size` `include_shared_binaries` half and the
+    /// `system_info` memory accounting hook).
+    ///
+    /// The figure has two sources, in this precedence:
+    ///
+    /// 1. the **host-supplied** assertion ([`Process::set_off_heap_binary_bytes`]), once the host
+    ///    has made one — in production the payloads live in the engine machine's reservoir, which
+    ///    this structure cannot see, so only the host can count them;
+    /// 2. otherwise the **roster-derived** sum over the owned off-heap roster
+    ///    ([`beam_gc::OffHeap::overhead_bytes`]).
+    ///
+    /// It feeds [`MaxHeapUsage::off_heap_binary_bytes`] — i.e. the
+    /// [`include_shared_binaries`](MaxHeapFlags::include_shared_binaries) charge in
+    /// [`Process::max_heap_usage`]/[`Process::heap_limit_verdict`]. It is **not** a view of the
+    /// roster: a reporter wanting exact roster accounting reads [`Process::owned_off_heap`]
+    /// directly, which is what [`beam_gc::HeapFootprint::of`] takes.
+    pub fn off_heap_binary_bytes(&self) -> usize {
+        self.off_heap_binary_bytes_override
+            .unwrap_or_else(|| self.owned_binaries.overhead_bytes())
+    }
+
+    /// Sets this process's off-heap refc-binary payload **byte figure** — the host's assertion of
+    /// how many bytes of off-heap payload the process currently holds.
+    ///
+    /// From then on [`Process::off_heap_binary_bytes`] answers `n` in place of the roster-derived
+    /// sum, so this is the figure `max_heap_size`'s
+    /// [`include_shared_binaries`](MaxHeapFlags::include_shared_binaries) charging sees. It exists
+    /// because in production the payloads live in the engine machine's reservoir, outside this
+    /// structure, so the owned roster is not the process's whole off-heap population and the PCB
+    /// cannot derive the number itself.
+    ///
+    /// The host owns the number's **accuracy** (nothing here validates it against the roster), and
+    /// the value sticks until it is set again — there is no clear-the-override form, so a host that
+    /// wants the roster-derived figure back re-derives it from [`Process::owned_off_heap`] and sets
+    /// that.
+    pub fn set_off_heap_binary_bytes(&mut self, n: usize) {
+        self.off_heap_binary_bytes_override = Some(n);
+    }
     /// Declares the owned off-heap binary at `slot` **dead** and returns whether a live entry was
     /// marked.
     ///
@@ -857,6 +913,9 @@ impl Process {
     /// exactly at reference count 0 (and only when the process held the last handle); a released
     /// slot is never reused and a second sweep releases nothing further.
     ///
+    /// A call with **nothing declared dead** returns `0` without touching the roster at all — the
+    /// common case, since a sweep runs at the tail of every rooted collection.
+    ///
     /// # The predicate is CONSERVATIVE
     ///
     /// An entry is released **only** when it has been declared dead. Every other entry is retained,
@@ -867,6 +926,12 @@ impl Process {
     /// process until the process dies (its `Drop` frees it) — see `DESIGN_DECISIONS.md` for the
     /// exact gap and its owner.
     pub fn sweep_off_heap_binaries(&mut self) -> usize {
+        // Nothing declared dead: return before touching the roster. This is the conservative
+        // second half of every rooted collection's off-heap step, so the empty case is the
+        // overwhelmingly common one and must cost nothing — no `mem::take`, no sweep walk.
+        if self.dead_binaries.is_empty() {
+            return 0;
+        }
         // Take the declarations: this sweep is the single place they turn into releases (the list
         // is cleared by the move, so the same payload is never declared twice).
         let dead = core::mem::take(&mut self.dead_binaries);
@@ -874,7 +939,6 @@ impl Process {
             !dead.contains(&(binary.data_ptr() as usize))
         })
     }
-
     /// Reclaims every owned off-heap binary that **no reachable on-heap handle names** any more,
     /// and returns how many entries were released.
     ///
@@ -1301,11 +1365,16 @@ impl Process {
         self.should_collect(need_words) || self.collection_debt()
     }
 
-    /// The number of words used in the young heap.
+    /// The number of words used across the young heap's **whole chain** — the process's own
+    /// collector read through [`beam_gc::HeapObservable::heap_used_words`].
+    ///
+    /// It is a chain **sum**: a space a no-relocation growth ([`Process::grow_nursery`]) retired
+    /// still holds every word the mutator allocated in it, and contributes them here until a
+    /// collection collapses the chain. The current space alone
+    /// (`collector().young().used_words()`) would silently drop a retired space's occupancy.
     pub fn heap_used_words(&self) -> usize {
-        self.collector.young().used_words()
+        self.collector.heap_used_words()
     }
-
     /// Marks this process as **relocation-exempt** (or clears the mark).
     ///
     /// A host (the `beam_rt` runtime is the motivating one) can hold live terms from this
@@ -1403,7 +1472,7 @@ impl Process {
     /// payload bytes of the off-heap refc binaries this process has registered
     /// ([`Process::register_off_heap_binary`]).
     ///
-    /// Two things a caller must know about the figure:
+    /// Three things a caller must know about the figure:
     ///
     /// * A mailbox word is already inside the heap total. This runtime keeps a queued message
     ///   heap-resident (the copy engine writes it into the receiver's young heap; only an
@@ -1415,6 +1484,11 @@ impl Process {
     ///   through a message's own off-heap table is not in this list, so
     ///   `include_shared_binaries` is charged for what the process registered, not for the whole
     ///   VM's binary population.
+    ///
+    /// * The off-heap half is an **O(off-heap slots)** sum over the owned roster (or the host's own
+    ///   figure, see [`Process::off_heap_binary_bytes`]); the collection door
+    ///   ([`Process::record_max_heap_verdict`]) returns before reading it for an unlimited setting,
+    ///   so a limit-less process pays it only when a caller asks for this figure explicitly.
     ///
     /// This is the *current* usage. The check the oracle performs is on the **prospective
     /// post-collection capacity**, which is what [`Process::heap_limit_verdict`] takes explicitly
@@ -1477,7 +1551,9 @@ impl Process {
     }
 
     /// Records the pending exceed verdict for the capacity a collection/growth has just installed
-    /// — the private tail every collection door runs.
+    /// — the private tail every collection door runs ([`Process::collect`] and
+    /// [`Process::collect_kind`], [`Process::ensure_capacity`], [`Process::grow_nursery`], and
+    /// [`Process::collect_if_needed`] through its `collect` call).
     ///
     /// Only a **breach** is stored: a [`HeapLimitVerdict::Within`] answer needs no notice, and
     /// storing it would make the latch indistinguishable from "nothing to report". The
@@ -1486,7 +1562,16 @@ impl Process {
     /// point the nursery has been collapsed/resized and the growth the admission needed is
     /// installed, so a 1000-word limit fires against the oracle's `Total Heap Size: 1299`, not
     /// against the pre-collection occupancy.
+    ///
+    /// An **unlimited** setting ([`MaxHeapSetting::is_unlimited`] — the state a process nobody
+    /// configures is in) returns before any accounting at all. It can never breach
+    /// ([`MaxHeapSetting::verdict`] answers [`HeapLimitVerdict::Within`] for `size == 0`), and the
+    /// off-heap half of [`Process::max_heap_usage`] is an O(off-heap slots) sum over the owned
+    /// roster, which a limit-less process must not pay at the tail of every collection and growth.
     fn record_max_heap_verdict(&mut self) {
+        if self.max_heap.is_unlimited() {
+            return;
+        }
         let verdict = self.current_heap_limit_verdict();
         if verdict.is_breach() {
             self.max_heap_verdict = Some(verdict);
@@ -1520,7 +1605,8 @@ impl Process {
     /// reachable on-heap `BinRef` names any more when the root set is complete, and the
     /// **conservative** declared-dead sweep ([`Process::sweep_off_heap_binaries`]) always runs — so
     /// a payload the caller has declared dead is released, and one the walk could not soundly judge
-    /// (a process with unpublished roots) is retained.    ///
+    /// (a process with unpublished roots) is retained.
+    ///
     /// The outgoing port-monitor set ([`Process::port_monitors`]) is deliberately **not**
     /// gathered: a [`PortWatch`] holds a reference and a port number, both plain values
     /// rather than heap terms, so it cannot be relocated and needs no root.
@@ -2118,6 +2204,272 @@ mod tests {
         process.collect().expect("the next collection collapses the chain");
         assert!(!process.collection_debt(), "the debt is settled by the collection");
         assert_eq!(process.collector().young_space_count(), 1);
+    }
+
+    /// [`Process::heap_used_words`] is the young heap's **chain sum** — the collector's own
+    /// [`beam_gc::HeapObservable::heap_used_words`] — not the current space's occupancy.
+    ///
+    /// A no-relocation growth ([`Process::grow_nursery`]) retires the space it replaces instead of
+    /// freeing it, so that space's live words stay counted here while
+    /// `collector().young().used_words()` (the freshly installed space) reads zero.
+    #[test]
+    fn heap_used_words_is_the_chain_sum_not_the_current_space() {
+        let mut process = Process::new(pid(32)).expect("the default heap allocates");
+        // Live words in the current space, so the growth must allocate a fresh space instead of
+        // re-adopting an empty retired one.
+        let _root = process
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("the tuple fits");
+        let current = process.collector().young().used_words();
+        assert_eq!(current, 3, "an arityval header plus two elements");
+        assert_eq!(
+            process.heap_used_words(),
+            current,
+            "one space, so the chain sum is that space's occupancy"
+        );
+
+        let capacity = process
+            .grow_nursery(4096)
+            .expect("the growth is reachable under the default policy");
+        assert!(capacity > current, "the nursery really grew");
+        assert_eq!(
+            process.collector().young_space_count(),
+            2,
+            "the growth retired the previous space rather than freeing it"
+        );
+        assert_eq!(
+            process.collector().young().used_words(),
+            0,
+            "the freshly installed space handed out no word"
+        );
+        assert_eq!(
+            process.heap_used_words(),
+            current,
+            "the retired space's live words are still counted"
+        );
+        assert!(
+            process.heap_used_words() > process.collector().young().used_words(),
+            "the chain sum exceeds the current space's occupancy"
+        );
+        assert_eq!(
+            process.heap_used_words(),
+            process.collector().heap_used_words(),
+            "the process reads the collector's chain-summed figure"
+        );
+    }
+
+    /// The conservative declared-dead sweep is **free** when nothing has been declared dead: it
+    /// returns `0` before touching the roster, so a live entry keeps its slot, its handle and its
+    /// bytes.
+    ///
+    /// A live owned payload is deliberately present, so this pins the "no declarations" case
+    /// rather than the trivially empty "no roster" one.
+    #[test]
+    fn an_undeclared_sweep_returns_before_touching_the_roster() {
+        use beam_alloc::RefcBinary;
+
+        let mut process = Process::new(pid(33)).expect("the default heap allocates");
+        let payload =
+            RefcBinary::new(b"a live off-heap payload nothing declared dead").expect("allocate");
+        let data_ptr = payload.data_ptr();
+        let slot = process.register_off_heap_binary(payload.clone());
+        let bytes = process.off_heap_binary_bytes();
+        assert_eq!(bytes, payload.len());
+
+        assert_eq!(
+            process.sweep_off_heap_binaries(),
+            0,
+            "no entry was declared dead, so nothing is released"
+        );
+        assert_eq!(
+            process.off_heap_binary_count(),
+            1,
+            "the roster keeps its entry"
+        );
+        assert_eq!(
+            process.off_heap_binary(slot).map(|binary| binary.data_ptr()),
+            Some(data_ptr),
+            "the slot still resolves to the same payload"
+        );
+        assert_eq!(
+            process.off_heap_binary_bytes(),
+            bytes,
+            "the off-heap figure is unchanged"
+        );
+        assert_eq!(payload.refcount(), 2, "the roster's handle is still held");
+
+        // A declared death still turns into exactly one release afterwards.
+        assert!(process.declare_off_heap_binary_dead(slot));
+        assert_eq!(process.sweep_off_heap_binaries(), 1);
+        assert_eq!(process.off_heap_binary_count(), 0);
+    }
+
+    /// [`Process::owned_off_heap`] is the read-only roster handle a memory reporter charges
+    /// ([`beam_gc::HeapFootprint::of`]): the payload bytes and live-entry count it reports are the
+    /// registered payload's, while the heap half comes from the collector.
+    #[test]
+    fn heap_footprint_reads_the_owned_roster_through_its_handle() -> Result<()> {
+        use beam_alloc::RefcBinary;
+
+        let mut process = Process::new(pid(34)).expect("the default heap allocates");
+        let payload = vec![0xC3u8; 200];
+        let binary = RefcBinary::new(&payload)?;
+        let slot = process.register_off_heap_binary(binary.clone());
+        assert_eq!(slot, 0, "the first registration lands at slot 0");
+
+        let footprint = beam_gc::HeapFootprint::of(process.collector(), process.owned_off_heap());
+        assert_eq!(
+            footprint.off_heap_payload_bytes,
+            payload.len(),
+            "the roster's live payload bytes are the off-heap half"
+        );
+        assert_eq!(footprint.off_heap_entries, 1, "one live entry");
+        assert!(
+            footprint.off_heap_slot_bytes > 0,
+            "the roster's reserved slot array is charged separately"
+        );
+        assert!(footprint.young_capacity_words > 0, "the heap half comes from the collector");
+        assert_eq!(
+            footprint.off_heap_payload_bytes,
+            process.off_heap_binary_bytes(),
+            "with no host-supplied override the PCB reports the roster's figure"
+        );
+        Ok(())
+    }
+
+    /// A limit-less process pays **no** off-heap accounting at the collection/growth tail: with a
+    /// live owned off-heap roster and an unlimited setting (even one whose flags would charge shared
+    /// binaries), neither door records anything — while the **same** state at a one-word bound
+    /// records the breach on the very next door.
+    ///
+    /// Honest scope: this pins the **observable outcome** — nothing latched under an unlimited
+    /// setting, a breach latched under a bound on otherwise identical state. It does *not* itself
+    /// observe that no off-heap walk happened (the roster carries no operation counter), so the
+    /// walk's absence is a structural property of [`Process::record_max_heap_verdict`]'s early
+    /// return, and its cost is what the perf/benchmark figures measure. No wall-clock assertion is
+    /// made here.
+    #[test]
+    fn an_unlimited_setting_returns_before_the_off_heap_accounting() -> Result<()> {
+        use beam_alloc::RefcBinary;
+
+        let mut process = Process::new(pid(35)).expect("the default heap allocates");
+        for i in 0..8u8 {
+            let payload = vec![i; 4_096 + i as usize];
+            process.register_off_heap_binary(RefcBinary::new(&payload)?);
+        }
+        assert_eq!(
+            process.off_heap_binary_count(),
+            8,
+            "eight distinct owned payloads"
+        );
+        assert!(
+            process.off_heap_binary_bytes() > 0,
+            "the roster holds payload bytes"
+        );
+
+        // Unlimited, with the flag that would charge the off-heap half: no breach is possible.
+        process.set_max_heap_size(MaxHeapSetting::unlimited(MaxHeapFlags {
+            include_shared_binaries: true,
+            ..MaxHeapFlags::default()
+        }));
+        process.collect().expect("the collection succeeds");
+        process.grow_nursery(4_096).expect("the growth succeeds");
+        assert_eq!(
+            process.current_heap_limit_verdict(),
+            HeapLimitVerdict::Within,
+            "an unlimited bound is within however large the charge is"
+        );
+        assert_eq!(
+            process.max_heap_verdict(),
+            None,
+            "the collection and the growth recorded nothing"
+        );
+        assert_eq!(process.take_max_heap_verdict(), None);
+
+        // Identical process state, now bounded: the next door records the breach.
+        process.set_max_heap_size(MaxHeapSetting {
+            size: 1,
+            flags: MaxHeapFlags {
+                include_shared_binaries: true,
+                ..MaxHeapFlags::default()
+            },
+        });
+        process.grow_nursery(4_096).expect("the growth succeeds");
+        assert_eq!(
+            process.max_heap_verdict(),
+            Some(HeapLimitVerdict::Kill),
+            "the same state under a bound records the breach"
+        );
+        Ok(())
+    }
+
+    /// [`Process::set_off_heap_binary_bytes`] is the host's figure and takes precedence over the
+    /// roster-derived sum: (a) with no override the figure is the roster's payload bytes; (b) after
+    /// an override it is the host's number even while the roster still holds a payload; (c) the
+    /// override reaches [`Process::max_heap_usage`] and drives a real verdict — a process owning
+    /// **no** binaries breaches a bounded setting through the override alone, while the same process
+    /// without it records nothing.
+    #[test]
+    fn the_host_supplied_off_heap_figure_overrides_the_roster_and_drives_the_charge() -> Result<()> {
+        use beam_alloc::RefcBinary;
+
+        // (a) No override: the roster-derived sum.
+        let mut owning = Process::new(pid(36)).expect("the default heap allocates");
+        let payload = vec![0x5Au8; 8 * 1024];
+        owning.register_off_heap_binary(RefcBinary::new(&payload)?);
+        assert_eq!(
+            owning.off_heap_binary_bytes(),
+            payload.len(),
+            "with no override the figure is the owned roster's payload bytes"
+        );
+
+        // (b) The override wins even though the roster still holds a payload.
+        owning.set_off_heap_binary_bytes(123);
+        assert_eq!(owning.off_heap_binary_bytes(), 123);
+        assert_eq!(
+            owning.off_heap_binary_count(),
+            1,
+            "the override is a figure, not a roster mutation"
+        );
+        assert_eq!(
+            owning.max_heap_usage().off_heap_binary_bytes,
+            123,
+            "the figure is what the charge reads"
+        );
+
+        // (c) A process owning no binaries breaches a bound through the override alone.
+        let mut empty = Process::new(pid(37)).expect("the default heap allocates");
+        assert_eq!(empty.off_heap_binary_count(), 0);
+        assert_eq!(empty.off_heap_binary_bytes(), 0);
+
+        let shared = MaxHeapFlags {
+            include_shared_binaries: true,
+            ..MaxHeapFlags::default()
+        };
+        let heap_words = empty.max_heap_usage().heap_words;
+        assert!(heap_words > 0, "a live process has a heap capacity");
+        // A bound eight times the current capacity: the heap alone is comfortably within it.
+        let size = heap_words * 8;
+        empty.set_max_heap_size(MaxHeapSetting { size, flags: shared });
+        empty.collect().expect("the collection succeeds");
+        assert_eq!(
+            empty.max_heap_verdict(),
+            None,
+            "without the override the heap alone is within the bound"
+        );
+
+        // The host asserts a reservoir figure of sixteen words per heap word — twice the bound.
+        let asserted = 16 * 8 * heap_words;
+        empty.set_off_heap_binary_bytes(asserted);
+        assert_eq!(empty.max_heap_usage().off_heap_binary_bytes, asserted);
+        empty.collect().expect("the collection succeeds");
+        assert_eq!(
+            empty.max_heap_verdict(),
+            Some(HeapLimitVerdict::Kill),
+            "the host-asserted figure drove the charge over the bound"
+        );
+        Ok(())
     }
 
     #[test]
