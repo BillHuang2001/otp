@@ -590,6 +590,30 @@ pub(super) fn split_address(arg: &[u8]) -> Result<(InetAddr, &[u8])> {
 /// tag's first byte is always this one.
 pub(super) const ETF_VERSION_MAGIC: u8 = 131;
 
+/// The two halves of the caller-reference prefix [`split_caller_ref`] strips: the tag bytes
+/// themselves and the command payload after them.
+///
+/// The send path needs both — the tag to echo it verbatim in the `{inet_reply, S, Reply, Tag}`
+/// message (`inet_reply_finish`, `inet_drv.c:2614-2637`) and the payload to write — and it also
+/// needs the prefix **length** (derivable as `arg.len() - rest.len()`) to count the bytes it
+/// consumed from the port's output queue.
+///
+/// `None` under exactly the conditions [`split_caller_ref`] documents.
+pub(super) fn split_caller_ref_parts(arg: &[u8]) -> Option<(&[u8], &[u8])> {
+    let n = usize::from(u16::from_be_bytes([*arg.first()?, *arg.get(1)?]));
+    // `init_caller`'s `*size_p < 2` / `*size_p < n` guards: a zero-length or otherwise
+    // non-fitting tag carries no caller reference at all.
+    if n == 0 {
+        return None;
+    }
+    if *arg.get(2)? != ETF_VERSION_MAGIC {
+        return None;
+    }
+    // `None` when `2 + n` overruns the argument: the C's `*size_p < n` refusal.
+    let rest = arg.get(2 + n..)?;
+    Some((&arg[2..2 + n], rest))
+}
+
 /// Strips the `prim_inet` **caller-reference prefix**, if `arg` carries one: the wire form is
 /// `[tag_len:be16][tag_bytes][rest]`, the tag being `term_to_binary(Mref, [local])` for
 /// `Mref = monitor(port, S)` (`erts/preloaded/src/prim_inet.erl:575`-`:620` for `send/3`,
@@ -623,17 +647,7 @@ pub(super) const ETF_VERSION_MAGIC: u8 = 131;
 /// be read as plain. `prim_inet:send/3`'s reference tag is far smaller, so that cannot arise from
 /// the protocol this function exists for.
 pub(super) fn split_caller_ref(arg: &[u8]) -> Option<&[u8]> {
-    let n = usize::from(u16::from_be_bytes([*arg.first()?, *arg.get(1)?]));
-    // `init_caller`'s `*size_p < 2` / `*size_p < n` guards: a zero-length or otherwise
-    // non-fitting tag carries no caller reference at all.
-    if n == 0 {
-        return None;
-    }
-    if *arg.get(2)? != ETF_VERSION_MAGIC {
-        return None;
-    }
-    // `None` when `2 + n` overruns the argument: the C's `*size_p < n` refusal.
-    arg.get(2 + n..)
+    split_caller_ref_parts(arg).map(|(_tag, rest)| rest)
 }
 
 /// The outcome of decoding the C's datagram command operand,
