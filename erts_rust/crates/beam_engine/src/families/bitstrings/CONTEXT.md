@@ -231,8 +231,8 @@ Growth keeps a build in place when it outgrows the payload. The payload itself i
 `len == capacity` so a relocation copies every written byte), so most appends land in spare
 reservation. A write past the capacity asks the payload to widen (`raw::InPlace::grow` ->
 `Machine::grow_writable_payload` -> `beam_alloc::RefcBinary::ensure_capacity`): an `InPlace { .. }`
-outcome commits capacity inside the
-existing reservation, so the sink's cached capacity moves and it keeps writing at the same base (the
+outcome commits capacity inside the existing reservation, so the sink's cached capacity moves and it
+keeps writing at the same base (the
 registry entry's capacity is refreshed); a `Moved(rel)` outcome reallocates at `rel.to()`,
 `raw::republish_over` rewrites the accumulator's own `[BinRef][ErlSubBits]` pair over the new base
 (the same `Eterm`, the same `start`/`end` window) and the registry is re-keyed
