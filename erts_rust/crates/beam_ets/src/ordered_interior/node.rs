@@ -471,6 +471,22 @@ impl NodeStore {
         self.slots.iter().filter(|slot| slot.is_some()).count()
     }
 
+    /// The number of arena slots the tree ever grew to (live + retired) — the
+    /// high-water mark [`NodeStore::needs_compaction`] and
+    /// [`NodeStore::compact`] work against. Test-only, so a bulk-teardown test can
+    /// assert the arena stayed dense instead of merely looking small.
+    #[cfg(test)]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The number of retired (free-list) slots currently in the arena — nodes a
+    /// rebalance or a root collapse freed and `alloc` may yet reuse. Test-only.
+    #[cfg(test)]
+    pub(crate) fn retired_count(&self) -> usize {
+        self.retired.len()
+    }
+
     /// The node at `id`, mutably.
     fn slot_mut(&mut self, id: NodeId) -> &mut Node {
         self.slots

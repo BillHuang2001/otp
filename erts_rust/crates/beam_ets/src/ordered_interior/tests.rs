@@ -23,6 +23,7 @@
 //! Split out of `ordered_interior/mod.rs` so that file stays within the crate's
 //! ~1000-line guideline (crate-layer `CONTEXT.md`, Constraints).
 
+    use super::node::{MIN_OCCUPANCY, ORDER};
     use super::*;
     use beam_common::BeamError;
     use beam_term::heap::Heap;
@@ -1230,4 +1231,283 @@
                 t.memory()
             );
         }
+    }
+
+    /// Half of `keys`, in a scattered order that a given `seed` selects: walking the
+    /// slice with a stride coprime to its length is a bijection, so no key is picked
+    /// twice and a different `seed` picks a different half in a different order.
+    fn scattered_half(keys: &[i64], seed: usize) -> Vec<i64> {
+        let len = keys.len();
+        if len < 2 {
+            return keys.to_vec();
+        }
+        // The smallest stride at or above `seed` that is coprime with `len`, so the
+        // walk `i -> (i * stride) % len` visits every index exactly once.
+        let coprime = |mut stride: usize| loop {
+            let (mut a, mut b) = (stride % len, len);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            if a == 1 {
+                return stride;
+            }
+            stride += 1;
+        };
+        let stride = coprime(seed.max(1));
+        (0..len / 2).map(|i| keys[(i * stride) % len]).collect()
+    }
+
+    // ---------------------------------------------------------------------
+    // Invariant 3's density half: every node below the root stays at least
+    // `MIN_OCCUPANCY` occupied, so a delete really borrows or merges instead of
+    // leaving a sparse tree behind.
+    // ---------------------------------------------------------------------
+
+    /// Assert invariant 3's **density** half from outside the tree:
+    ///
+    /// * no node below the root holds fewer than [`MIN_OCCUPANCY`] entries/children
+    ///   (and none holds more than [`ORDER`]),
+    /// * the leaf chain is at most `len / MIN_OCCUPANCY` long — the aggregate form of
+    ///   the same fact, which a sparse tree would break even while every individual
+    ///   leaf still answered its lookups,
+    /// * the arena's free list never outgrows its live nodes (the compaction
+    ///   hysteresis bound) and every slot is either live or on that free list.
+    ///
+    /// The root is exempt from the minimum (it may be a single leaf with a handful of
+    /// entries, or a branch with two children); a root *branch* must still keep two.
+    fn assert_occupancy_floor(t: &OrderedSetInterior) {
+        let size = t.size();
+        let profile = t.tree.occupancy_profile();
+        let leaves = t.tree.leaf_count();
+        let (slots, retired, live) = t.tree.arena_stats();
+        for level in profile.iter().filter(|level| level.depth > 0) {
+            assert_eq!(
+                level.underfilled, 0,
+                "level {} holds {} under-full nodes (profile {profile:?}, {size} keys, \
+                     {leaves} leaves)",
+                level.depth, level.underfilled
+            );
+            assert!(
+                level.min >= MIN_OCCUPANCY,
+                "level {} holds a node with only {} entries/children, below the \
+                     {MIN_OCCUPANCY} floor (profile {profile:?})",
+                level.depth,
+                level.min
+            );
+            assert!(
+                level.max <= ORDER,
+                "level {} holds a node with {} entries/children, over the {ORDER} \
+                     fan-out (profile {profile:?})",
+                level.depth,
+                level.max
+            );
+        }
+        if profile.len() > 1 {
+            assert!(
+                profile[0].min >= 2,
+                "the root branch keeps at least two children (profile {profile:?})"
+            );
+        }
+        if leaves > 1 {
+            assert!(
+                leaves * MIN_OCCUPANCY <= size,
+                "the leaf chain is sparse: {leaves} leaves for {size} keys, under the \
+                     {MIN_OCCUPANCY}-density floor"
+            );
+        }
+        assert_eq!(
+            slots,
+            retired + live,
+            "every arena slot is live or on the free list (retired {retired}, live {live})"
+        );
+        assert!(
+            retired <= live,
+            "the arena is {retired}-retired over {live} live nodes: it should have \
+                 compacted (slots {slots})"
+        );
+    }
+
+    /// A `10 000`-key B+-tree torn down to a single key: the delete path must keep
+    /// every node below the root at or above [`MIN_OCCUPANCY`] the whole way down —
+    /// borrowing from a sibling, merging when neither sibling has a spare, cascading
+    /// up the spine and collapsing the root — so the tree gives its storage back as
+    /// the keys leave instead of leaving under-occupied leaves for a later
+    /// whole-arena compaction to paper over.
+    ///
+    /// An *ascending* sweep is the sharpest case: deleting the smallest key over and
+    /// over empties the leftmost leaf, which can only borrow from its right sibling
+    /// (there is no left one), then has to merge, which drops a separator from the
+    /// parent and can under-fill *that*, and so on up the left spine.
+    #[test]
+    fn a_bulk_teardown_keeps_every_node_at_or_above_the_occupancy_floor() {
+        const N: i64 = 10_000;
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(8 * N as usize);
+        let objs: Vec<Eterm> = (0..N).map(|k| object(&mut heap, k, k * 3)).collect();
+        let mut t = OrderedSetInterior::new();
+        for k in 0..N {
+            assert!(t
+                .insert_new(make_small(k), objs[k as usize], &atoms)
+                .unwrap());
+        }
+        assert_eq!(t.size(), N as usize);
+        assert!(
+            t.tree.height() >= 3,
+            "{N} keys need more than two levels (height {})",
+            t.tree.height()
+        );
+        let populated = t.memory();
+        let leaves_populated = t.tree.leaf_count();
+        t.tree.check_invariants(&atoms);
+        assert_occupancy_floor(&t);
+
+        // Keep only the last key: 9 999 ascending deletes, the bulk teardown.
+        let mut samples = 0usize;
+        for k in 0..N - 1 {
+            assert!(t.delete(make_small(k), &atoms).is_ok());
+            if k % 500 == 0 {
+                samples += 1;
+                t.tree.check_invariants(&atoms);
+                assert_occupancy_floor(&t);
+                assert_eq!(t.size(), (N - 1 - k) as usize);
+                // The reported footprint follows the live keys down, so the interior
+                // never holds the 10 000-key arena while a thousand keys are left.
+                assert!(
+                    t.memory() < populated,
+                    "the footprint did not fall with the key count ({populated} -> {} \
+                         words at {} keys)",
+                    t.memory(),
+                    t.size()
+                );
+            }
+        }
+        assert!(
+            samples > 10,
+            "the sweep sampled {samples} intermediate states"
+        );
+        assert_eq!(t.size(), 1);
+
+        // One key left: a single root leaf, nothing retired, a handful of words.
+        let (slots, retired, live) = t.tree.arena_stats();
+        println!(
+            "[ordered_interior] {N} -> 1 key: memory {populated} -> {} words, leaves \
+                 {leaves_populated} -> {}, arena slots={slots} retired={retired} live={live}",
+            t.memory(),
+            t.tree.leaf_count()
+        );
+        assert_eq!(live, 1, "only the root leaf survives");
+        assert_eq!(retired, 0, "the teardown left retired slots behind");
+        assert_eq!(slots, 1, "the arena holds exactly the root leaf");
+        assert_eq!(t.tree.leaf_count(), 1);
+        assert_eq!(t.tree.height(), 1);
+        assert!(
+            t.memory() * 100 < populated,
+            "one key left must not keep the {N}-key arena ({} words of {populated})",
+            t.memory()
+        );
+        assert_eq!(ordered_keys(&t, &atoms), vec![make_small(N - 1)]);
+        assert_eq!(
+            t.lookup(make_small(N - 1), &atoms),
+            vec![objs[N as usize - 1]]
+        );
+        t.tree.check_invariants(&atoms);
+        assert_occupancy_floor(&t);
+    }
+
+    /// The same density contract under a *scattered* teardown and a sustained churn:
+    /// a delete in the middle of a node must borrow from the left sibling, prefer a
+    /// right sibling with a spare, merge either way, and keep the leaf chain ordered.
+    #[test]
+    fn the_occupancy_floor_survives_a_scattered_teardown_and_ten_thousand_key_churn() {
+        const N: i64 = 10_000;
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(8 * N as usize);
+        let objs: Vec<Eterm> = (0..N).map(|k| object(&mut heap, k, k * 3)).collect();
+        let mut t = OrderedSetInterior::new();
+        for k in shuffled(N, 7919) {
+            assert!(t
+                .insert_new(make_small(k), objs[k as usize], &atoms)
+                .unwrap());
+        }
+        t.tree.check_invariants(&atoms);
+        assert_occupancy_floor(&t);
+        let populated = t.memory();
+
+        // A scattered teardown down to 1% of the keys, checking the whole structure
+        // (and every node's occupancy) as it goes.
+        let mut live_keys: Vec<i64> = (0..N).collect();
+        let mut step = 0usize;
+        for k in shuffled(N, 7919) {
+            if live_keys.len() <= (N as usize) / 100 {
+                break;
+            }
+            assert!(t.delete(make_small(k), &atoms).is_ok());
+            live_keys.retain(|&v| v != k);
+            step += 1;
+            if step % 250 == 0 {
+                t.tree.check_invariants(&atoms);
+                assert_occupancy_floor(&t);
+                assert_eq!(t.size(), live_keys.len());
+            }
+        }
+        t.tree.check_invariants(&atoms);
+        assert_occupancy_floor(&t);
+        let dense = t.memory();
+        let dense_leaves = t.tree.leaf_count();
+        assert!(
+            dense_leaves * MIN_OCCUPANCY <= t.size(),
+            "the scattered teardown left a sparse leaf chain"
+        );
+        // …and the footprint followed the keys down, so the interior is not holding
+        // the 10 000-key arena while a hundred keys are left.
+        assert!(
+            dense * 10 < populated,
+            "the footprint did not fall with the key count ({populated} -> {dense} words              at {} keys)",
+            t.size()
+        );
+
+        // A sustained churn at that size: half the survivors leave and come back every
+        // round, in a different scattered order each time, so the tree splits and
+        // re-merges over and over. The density must hold every round, and the arena
+        // must neither grow nor thrash.
+        let base = t.memory();
+        for (round, seed) in [3usize, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+            .into_iter()
+            .enumerate()
+        {
+            let victims = scattered_half(&live_keys, seed);
+            assert!(
+                !victims.is_empty(),
+                "round {round} picked no victim key to delete"
+            );
+            for &k in &victims {
+                assert!(t.delete(make_small(k), &atoms).is_ok());
+            }
+            t.tree.check_invariants(&atoms);
+            assert_occupancy_floor(&t);
+            assert_eq!(t.size(), live_keys.len() - victims.len());
+            for &k in &victims {
+                assert!(t
+                    .insert_new(make_small(k), objs[k as usize], &atoms)
+                    .unwrap());
+            }
+            t.tree.check_invariants(&atoms);
+            assert_occupancy_floor(&t);
+            assert_eq!(t.size(), live_keys.len());
+            assert!(
+                t.memory() <= base * 3,
+                "round {round} grew the arena (base {base}, now {})",
+                t.memory()
+            );
+        }
+        // The churn moved nothing: the survivors are exactly the scattered run, in
+        // ascending arithmetic key order.
+        assert_eq!(
+            ordered_keys(&t, &atoms),
+            live_keys
+                .iter()
+                .copied()
+                .map(make_small)
+                .collect::<Vec<_>>()
+        );
     }
