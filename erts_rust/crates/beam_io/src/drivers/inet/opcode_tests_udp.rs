@@ -398,25 +398,37 @@ fn subscribe_answers_the_c_outq_record_or_badarg() {
 
 /// The `outq` figure is the port's **real** queued-output depth, not a constant.
 ///
-/// A port command on a socket-less datagram port is refused by the driver
-/// ([`super::UdpInetDriver::write_pending`] answers `BadArg`) and its bytes stay queued — exactly
-/// the state the C reports `driver_sizeq(desc->port)` for.
+/// A **correction**: the premise used to be a socket-less `port_command/2` refused with
+/// [`BeamError::BadArg`]. That command now follows the oracle instead — `init_caller`
+/// (`inet_drv.c:15054`) rejects a bare payload and the port dies, so nothing is left queued. The
+/// command that *does* keep its bytes is one this floor refuses on a capability gap: a
+/// caller-prefixed datagram whose ancillary length is non-zero (`packet_inet_command`'s
+/// `sendmsg`-with-cmsgs arm, `:15220`-`:15230`). Only `init_caller`'s prefix has come off the
+/// queue, so `driver_sizeq(desc->port)` reports the rest — exactly what `INET_REQ_SUBSCRIBE`
+/// reports.
 #[test]
 fn subscribe_reports_the_ports_real_queued_output_depth() {
-    let mut port = bare_port();
-    let err = port
-        .command(&[1, 2, 3])
-        .expect_err("a socket-less datagram port refuses the write");
-    assert!(matches!(err, BeamError::BadArg), "the refusal is badarg: {err:?}");
-
+    // A socket is needed: on a socket-less port the C's `!IS_OPEN` arm (`:15068`) answers before
+    // the operand is parsed, so the command is consumed instead of retained.
+    let mut port = opened_port();
+    // `[0:16]` (a zero-length caller tag) + `[address][1:be32][4 ancillary bytes][payload]`.
+    let mut command = vec![0u8, 0];
+    command.extend_from_slice(&[INET_AF_INET, 0x04, 0xd2, 127, 0, 0, 1]);
+    command.extend_from_slice(&1u32.to_be_bytes());
+    command.extend_from_slice(&[1, 2, 3, 4]);
+    command.extend_from_slice(b"payload");
+    let retained = command.len() - 2;
+    port.command(&command)
+        .expect_err("ancillary data is the typed unsupported, not a send");
+    let [a, b, c, d] = (retained as u32).to_be_bytes();
     assert_eq!(
         port.control(&op(24), &[1]),
-        vec![INET_REP_OK, 1, 0, 0, 0, 3],
-        "the reply reports the three bytes the refused command left queued"
+        vec![INET_REP_OK, 1, a, b, c, d],
+        "the reply reports the bytes the refused command left queued"
     );
     assert_eq!(
         port.control(&op(24), &[1, 1]),
-        vec![INET_REP_OK, 1, 0, 0, 0, 3, 1, 0, 0, 0, 3],
+        vec![INET_REP_OK, 1, a, b, c, d, 1, a, b, c, d],
         "every record reports that same depth"
     );
     assert_eq!(

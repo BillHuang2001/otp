@@ -53,7 +53,7 @@
 
 use std::time::Instant;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 
 use super::super::op_queue::{
     async_ok_reply, deadline_for, drain_closed, parse_recv_operand, RecvOp,
@@ -273,12 +273,25 @@ impl UdpInetDriver {
     /// the command the socket accepted — which is what [`crate::Port`]'s write-accounting contract
     /// compares against the queue's shrinkage.
     ///
+    /// Every outcome the C answers out of band is staged here rather than raised:
+    /// `init_caller`'s `FALSE` latches `driver_failure_posix(EINVAL)`
+    /// ([`UdpInetDriver::fail_malformed_command`]), the `!IS_OPEN` arm and the operand grammar's
+    /// `return_einval` both answer `{inet_reply, Port, {error, einval}, Tag}`, and a written
+    /// command answers `ok`. The port survives all of them except the first, which the registry
+    /// reaps after the round.
+    ///
     /// # Errors
     ///
-    /// Whatever [`UdpInetDriver::write_pending`] reports (the socket-less refusal is unchanged:
-    /// nothing is stripped and the command's bytes stay queued), or the typed `unsupported` of a
-    /// context with no completion sink.
+    /// Only a genuine capability gap: the typed `unsupported` of a context with no completion
+    /// sink, of ancillary data (`sendmsg` cmsgs, `udp/udp_tests.rs`'s residual) — or whatever
+    /// [`UdpInetDriver::write_pending`] reports as an I/O failure.
     pub(super) fn write_command(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        // A re-driven `OUTPUT` task with nothing queued is not a command: the C is only ever
+        // handed one (`packet_inet_command`'s `len`), and `init_caller` on an empty buffer is its
+        // `size < 2` FALSE — which would kill the port over a write that already finished.
+        if ctx.output().is_empty() {
+            return Ok(0);
+        }
         // The C's `init_caller` runs first, before `!IS_OPEN` is looked at
         // (`packet_inet_command`, `inet_drv.c:15054`-`:15068`), and its failure kills the port.
         let Some(stripped) = self.strip_command_prefix(ctx) else {
@@ -300,7 +313,27 @@ impl UdpInetDriver {
             }
             return Ok(stripped + discarded);
         }
-        let written = self.write_pending(ctx)?;
+        let written = match self.write_pending(ctx) {
+            Ok(written) => written,
+            // The C's `return_einval` (`:15205`/`:15212`): a command whose operand is not the
+            // `[address][anc_len:be32][anc][data]` grammar, or one whose ancillary-length word
+            // runs past it, is answered `inet_reply_error(EINVAL)` — the port stays **alive** and
+            // the command is consumed (the emulator frees what a callback accepted).
+            Err(BeamError::BadArg) => {
+                let discarded = ctx.output().len();
+                ctx.output().consume(discarded);
+                self.caller_stripped = false;
+                self.send_error = None;
+                if let Some(tag) = self.caller_ref.take() {
+                    ctx.deliver_completion(CompletionEvent::InetReply {
+                        caller_ref: Some(tag),
+                        reply: InetReply::Error(InetReason::from_errno(libc::EINVAL)),
+                    })?;
+                }
+                return Ok(stripped + discarded);
+            }
+            Err(err) => return Err(err),
+        };
         self.settle_command(ctx)?;
         Ok(stripped + written)
     }
