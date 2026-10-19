@@ -596,6 +596,21 @@ because its calibrated `N` exceeds that tier's non-overridable 60 s `run` deadli
 > layout cannot see). `bench` does **not** set it — the harness is a pure driver/observer and never mutates the
 > runtime's environment beyond argv — and the per-unit metric cancels any remaining startup cost by construction.
 
+## Known Issue — the `copy_bound` payload is a module literal, and the two copiers treat literals differently
+
+`payload/0` returns a **compile-time constant**, so `T` is a literal-tagged word into the module's literal
+area (load-time tagged; `../../crates/beam_rt/src/context/CONTEXT.md:196`), never a term built at runtime.
+The four cases therefore copy a *wrapper* around a literal, and the two copiers disagree on literals:
+`beam_message`'s `is_shared` shares a literal-area term (0 destination words,
+`../../crates/beam_message/src/copy.rs:261-269` + `CONTEXT.md:83,87`), while the oracle's message path passes
+`litopt = NULL` (`erts/emulator/beam/global.h:1152` `copy_struct` macro; `copy.c:720,744,767` skips literals
+only when `litopt` is set; `global.h:1135` `size_object` = `size_object_x(Term,NULL)`), i.e. real ERTS **copies**
+the literal's interior into the receiver heap. Consequence for reading the rows: in `send_recv_plain` the oracle
+copies the payload's 70 words per send while the Rust side shares them (so that case is *not* an identical-work
+comparison — the ping-pong dominates both sides); in `send_recv` the worker's `binary_to_term/1` forces a genuine
+heap copy on **both** sides, so the codec attribution (`send_recv − send_recv_plain`) is the more load-bearing
+figure. No measured per-case attribution of this exists in the docs; it is a code-level reading.
+
 ## Known Issue — the `foreign` per-call metric is `N`-dependent, and the loop workloads' rust peak RSS is boot-dominated
 
 ### `foreign` `case_<name>_ns_per_call` is N-dependent on the Rust runtime
