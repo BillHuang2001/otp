@@ -8095,7 +8095,8 @@ fn ping_pong_run(path: &std::path::Path, n: i64) -> PingPongRun {
 fn door_line(door: gc::valve_counters::Door, counts: &gc::valve_counters::DoorCounts) -> String {
     format!(
         "{door:?}: reached={} occupancy={} debt={} forced={} latch_open={} hits={} \
-         [machine_root={} process_root={} descent={}] descents={} collections={} machine_words={}",
+         [machine_root={} process_root={} descent={}] descents={} collections={} machine_words={} \
+         declared_words={} published_words={}",
         counts.reached,
         counts.occupancy,
         counts.debt,
@@ -8108,6 +8109,8 @@ fn door_line(door: gc::valve_counters::Door, counts: &gc::valve_counters::DoorCo
         counts.descents,
         counts.collections,
         counts.machine_words,
+        counts.declared_words,
+        counts.published_words,
     )
 }
 
@@ -8166,11 +8169,11 @@ fn fallback_line(counters: &gc::valve_counters::ValveCounters) -> String {
 ///    (essentially) zero and **flat** in `N`;
 /// 6. each reach's per-word classification covers only the door's **published** region — each
 ///    register file's pointer-bearing prefix plus the whole Erlang stack
-///    ([`gc::valve_counters::DoorCounts::published_words`]) — while
-///    [`gc::valve_counters::DoorCounts::machine_words`] still records the **declared** figure, the
-///    whole x-register file plus the whole FR file, ~2 Ki words per reach. What collapsed is the
-///    number of reaches, so the workload's total classification work is down to a few hundred
-///    words per **iteration**.
+///    ([`gc::valve_counters::DoorCounts::published_words`]) — inside a hand-off
+///    ([`gc::valve_counters::DoorCounts::machine_words`]) that is the machine's **used extent** of
+///    each file (`Machine::with_roots`), never a whole 1024-slot file pair: a handful of words per
+///    reach. What collapsed is the number of reaches, so the workload's total classification work
+///    is a fraction of a word per **iteration**.
 ///
 /// A missing `erlc` is a **loud skip**, never a silent pass.
 #[test]
@@ -8358,18 +8361,48 @@ fn the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve() {
         "collections must be real but rare next to the iterations: {} for N={LARGE}",
         large.stats.collections,
     );
-    // (5) `machine_words` is the door's **declared** per-reach figure — the whole x file (1024)
-    //     plus the whole FR file (1024) plus the Erlang stack — so it remains the right per-reach
-    //     bound for the assertion below. The words the per-word phase actually classifies and the
-    //     door hands over are the pointer-bearing prefix of each register file plus the whole
-    //     stack (`published_words`). What collapsed is the number of reaches, and with it the
-    //     workload's total classification work.
-    const MIN_WORDS_PER_REACH: usize = 2_000;
+    // (5) The door's root-word figure is the size of the root set the **engine handed it**, and
+    //     that is a prefix of each register file, never the whole file: `RootSet::x`/`RootSet::fr`
+    //     arrive as the machine's **used extents** (`Machine::with_roots` → `used_x_extent`/
+    //     `used_fr_extent`; every slot past the extent is `NIL` by the refill invariant), and the
+    //     door bounds each of them again to its pointer-bearing prefix (`machine_root_bounds` →
+    //     `pointer_prefix_len`). So `machine_words`/`declared_words` — one figure, recorded by both
+    //     `note_reached` and `note_root_words` — is that hand-off's
+    //     `x.len() + stack.len() + fr.len()`, and `published_words` is the strictly smaller region
+    //     phase 1 classifies and the hand-off publishes: pointer-bearing x prefix + the whole
+    //     Erlang stack + pointer-bearing FR prefix. The per-file arithmetic is pinned
+    //     deterministically beside the door
+    //     ([`the_full_root_doors_publish_only_the_pointer_bearing_prefix_of_each_register_file`]);
+    //     what this end-to-end case adds is that the *machine's* own hand-off keeps a real
+    //     workload's per-reach figure far below `2 * MAX_REGISTER` — the most the two handed files
+    //     can hold between them, and exactly what a whole-file hand-off passes (here: ≈5.5 words
+    //     handed and ≈4 published per reach, the shallow Erlang stack included) — so a reach's
+    //     classification work stays proportional to what the run used.
+    assert_eq!(
+        full.machine_words, full.declared_words,
+        "the reach counter and the root-word counter record one declared figure: {}/{}",
+        full.machine_words, full.declared_words,
+    );
     assert!(
-        full.machine_words >= full.reached * MIN_WORDS_PER_REACH,
-        "each reach must classify the whole x + FR file: full={}/{}",
+        full.published_words >= full.reached,
+        "every reach publishes at least one root word — the whole Erlang stack is never omitted: \
+         published={} reached={}",
+        full.published_words,
+        full.reached,
+    );
+    assert!(
+        full.published_words <= full.machine_words,
+        "the pointer-prefix bound can only omit words: published={} declared={}",
+        full.published_words,
+        full.machine_words,
+    );
+    assert!(
+        full.machine_words < full.reached * 2 * beam_engine::MAX_REGISTER as usize,
+        "a reach is handed the machine's used extent, never a whole register-file pair: \
+         declared={} over reached={} ({:.2} words/reach)",
         full.machine_words,
         full.reached,
+        full.machine_words as f64 / full.reached as f64,
     );
     let total_words = full.machine_words + rooted.machine_words;
     assert!(
