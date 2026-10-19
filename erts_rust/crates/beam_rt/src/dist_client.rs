@@ -506,6 +506,39 @@ impl DistClient {
         }
     }
 
+    /// Whether this client holds **any** link, handshaking or established.
+    ///
+    /// This is the scheduler pass's quiescence query on the connecting half: a peer link —
+    /// even one whose `'N'` handshake has not completed yet — is work the pass must keep
+    /// pumping, because an inbound `DOP_*` (or the handshake's own completion) can deliver a
+    /// message and wake a process parked on a bare `receive`. A runtime with no link has
+    /// nothing here that could ever wake anything, so this answers `false` and the pass is
+    /// free to declare its stall.
+    ///
+    /// The complement of [`crate::dist::DistNode::is_idle`] on the *dialled* side: a node is
+    /// idle when it has no live link, and this is the same question asked of the outbound
+    /// links.
+    ///
+    /// A cell that cannot be borrowed is reported as **holding a link**: a borrowed cell
+    /// means distribution work is in flight (a pump or the signal router holds it), so the
+    /// caller must keep pumping rather than substantiate a stall it cannot justify.
+    pub fn has_links(&self) -> bool {
+        match self.inner.try_borrow() {
+            Ok(inner) => !inner.links.is_empty(),
+            Err(_) => true,
+        }
+    }
+
+    /// Whether this client holds **no** link at all — [`DistClient::has_links`]'s
+    /// complement, and the same "nothing in flight on this half" answer
+    /// [`crate::dist::DistNode::is_idle`] gives for the accepted links.
+    ///
+    /// A cell that cannot be borrowed is reported as **not** idle, for the same reason
+    /// [`DistClient::has_links`] reports `true` there.
+    pub fn is_idle(&self) -> bool {
+        !self.has_links()
+    }
+
     /// Why the most recently retired link was dropped, if any.
     pub fn last_error(&self) -> Option<String> {
         match self.inner.try_borrow() {

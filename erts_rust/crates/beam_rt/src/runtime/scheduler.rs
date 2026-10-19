@@ -541,6 +541,27 @@ impl Runtime {
     /// A port table that cannot be borrowed (a nested borrow) is reported as **not**
     /// quiescent: the pump then keeps stepping rather than declaring a stall it cannot
     /// substantiate.
+    ///
+    /// # The distribution term (contract A.5)
+    ///
+    /// A live distribution link is pending work even though it is neither a run-queue entry,
+    /// a port nor a timer: an inbound `DOP_*` from a peer that is already connected can be
+    /// delivered into a local mailbox and wake a process parked on a bare `receive`. Both
+    /// halves therefore count — an **accepted** node that is not idle
+    /// ([`DistNode::is_idle`](crate::dist::DistNode::is_idle), i.e. it holds a live link) and
+    /// a **client** that holds any link, handshaking or established
+    /// ([`DistClient::has_links`](crate::dist_client::DistClient::has_links)).
+    ///
+    /// The consequence is that a `run`-route process parked on a bare `receive` with a live
+    /// link keeps pumping — it is resumed the moment the peer's message survives the link —
+    /// and only a link that is genuinely gone lets the pass declare the honest
+    /// [`beam_engine::blocked`] gap; a peer that never sends anything is bounded by
+    /// [`RUN_DEADLINE`]'s "did not terminate" diagnostic instead.
+    ///
+    /// A runtime with no node name has neither half (`None`) and a node that holds no link
+    /// answers idle, so both tests are pure `Option`/link checks that leave a
+    /// non-distributed runtime byte-identically quiescent.
+    ///
     /// Whether some live port owes this runtime an answer — see
     /// [`PortRegistry::awaits_port_reply`](crate::port::PortRegistry::awaits_port_reply).
     ///
@@ -566,14 +587,27 @@ impl Runtime {
             Err(_) => return false,
             Ok(_) => {}
         }
-        match self.run_wake_pid {
+        let timers_idle = match self.run_wake_pid {
             // The `run` route waits for **one** process: only a deadline that could actually
             // wake it counts as work (a `Deliver` to its pid or to a registered name, or its
             // own `receive … after T`). Every other route keeps the bare heap test — any
             // pending deadline is something it may have to fire.
             Some(pid) => !self.timer_wake_targets.can_wake(pid),
             None => self.timers.next_deadline().is_none(),
+        };
+        if !timers_idle {
+            return false;
         }
+        // Distribution (A.5): a live link is work the pass must keep pumping, because an
+        // inbound `DOP_*` can wake a parked process. Both tests are `Option`/link checks, so
+        // a runtime that is not a node — and a node holding no link — is unchanged.
+        if self.dist.as_ref().is_some_and(|node| !node.is_idle()) {
+            return false;
+        }
+        !self
+            .dist_client
+            .as_ref()
+            .is_some_and(|client| client.has_links())
     }
 
     /// Records that a **heap-fragment** delivery woke `pid` (see
@@ -1509,6 +1543,82 @@ mod quiescence_and_port_table_tests {
         );
 
         watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
+    }
+
+    /// A runtime with **no node name** carries neither distribution half, so the two
+    /// `Option` tests add no observable effect: an idle runtime is quiescent exactly as it
+    /// was before the distribution term existed (the differential corpus pins a
+    /// non-distributed runtime's byte-identical behaviour on this).
+    #[test]
+    fn a_non_distributed_runtime_is_quiescent_with_no_distribution_term() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        assert!(
+            rt.dist_node().is_none() && rt.dist_client().is_none(),
+            "a runtime with no node name has neither a listener nor a client"
+        );
+        assert!(
+            rt.is_quiescent(),
+            "a non-distributed idle runtime is quiescent"
+        );
+    }
+
+    /// A distributed node whose listener holds **no** accepted link is still idle, so the
+    /// listen half on its own never keeps the pump awake: a peer that has not connected (and
+    /// does not connect later) cannot wake anything.
+    #[test]
+    fn a_node_with_no_accepted_link_stays_quiescent() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        rt.dist = Some(
+            crate::dist::DistNode::start("sched@localhost", b"cook".to_vec())
+                .expect("the listener binds"),
+        );
+        assert!(
+            rt.dist_node().expect("a node").is_idle(),
+            "a freshly started node has accepted no link"
+        );
+        assert!(
+            rt.is_quiescent(),
+            "an accepted-link-free node is not pending work"
+        );
+    }
+
+    /// A **client** holding a live link — here a freshly dialled, still-handshaking loopback
+    /// link — is pending work: an inbound `DOP_*` (or the handshake's own completion) can
+    /// deliver a message and wake a process parked on a bare `receive`, so the pump must keep
+    /// stepping instead of reporting `beam_engine::blocked()`. Dropping the client restores
+    /// quiescence, which is the `Option` test's own effect.
+    ///
+    /// Toolchain-free: the peer is a local `TcpListener` that never has to speak.
+    #[test]
+    fn a_client_holding_a_link_is_not_quiescent() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        assert!(rt.is_quiescent(), "the runtime starts out idle");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let addr = listener.local_addr().expect("read the loopback port");
+        let our = beam_term::make_atom(rt.code_server.atoms_mut().intern("client@localhost"));
+        let client = crate::dist_client::DistClient::new(b"cook".to_vec())
+            .expect("a distribution client");
+        client.set_identity("client@localhost", our, 1, b"cook");
+        client
+            .connect_addr("peer@localhost", addr, rt.code_server.atoms_mut())
+            .expect("dial the loopback peer");
+        assert!(client.has_links(), "the dialled link is live");
+        assert!(!client.is_idle(), "a client with a link is not idle");
+
+        rt.dist_client = Some(client);
+        assert!(
+            !rt.is_quiescent(),
+            "a live link can deliver a message, so the pass must keep pumping"
+        );
+
+        // The same runtime without the client is quiescent again: the term is the link, not
+        // the mere presence of a distribution field.
+        rt.dist_client = None;
+        assert!(
+            rt.is_quiescent(),
+            "with no client the runtime is stalled again"
+        );
     }
 
     /// The seam hands a caller the **process table** and the live **port table** together for
