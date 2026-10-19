@@ -1033,6 +1033,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
             };            // The wrapper's borrow of the probe ends here (the machine is no longer
             // running), so the slice's accounting is readable.
             drop(budget_ctx);
+            // The entry has now consumed the first run's arguments — unless it is a fun entry
+            // with no local label, which is re-applied **from** them on every run. A consumed
+            // argument set is dead state: it may no longer be published as a reclamation root,
+            // or a resource term standing only in it would be retained for the runtime's life
+            // (`ProcessEngine::args_consumed`).
+            if !matches!(&engine.entry, ProcessEntry::Fun { target: None, .. }) {
+                engine.args_consumed = true;
+            }
             let used = probe.used();
             let exhausted = probe.is_exhausted();
             (outcome, used, exhausted)

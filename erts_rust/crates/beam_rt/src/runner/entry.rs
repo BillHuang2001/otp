@@ -111,12 +111,24 @@ pub(super) struct ProcessEngine {
     pub(super) entry: ProcessEntry,
     /// The first run's arguments (seeded into `x(0..arity)`).
     ///
-    /// Held for the engine's whole life: the first entry reads them
-    /// ([`RunnerState::spawn`] hands them to the machine, which seeds `x(0..arity)`), and no arm
-    /// clears or replaces them afterwards, so a re-run of a finished process is impossible to get
-    /// wrong. Their **provenance** decides whether they may be handed over as a reclamation root
-    /// — see [`ProcessEngine::arena_args`].
+    /// The first entry reads them ([`RunnerState::spawn`] hands them to the machine, which seeds
+    /// `x(0..arity)`); nothing reads them again once that entry has consumed them, which is what
+    /// [`ProcessEngine::args_consumed`] records. Their **provenance** decides whether they may be
+    /// handed over as a reclamation root — see [`ProcessEngine::arena_args`].
     pub(super) args: Vec<Eterm>,
+    /// Whether the first run has already **consumed** [`ProcessEngine::args`] (and a
+    /// [`ProcessEntry::Fun`]'s fun value), i.e. whether they are dead state.
+    ///
+    /// The runner sets it at the end of an entry that can never read them again — every
+    /// [`ProcessEntry::Export`], and a [`ProcessEntry::Fun`] whose local target was resolved —
+    /// and leaves it `false` for a fun entry with **no** local label, which is re-applied from
+    /// `args` on every run.
+    ///
+    /// It is the liveness half of [`ProcessEngine::arena_args`]: a consumed argument set may not
+    /// be published as a reclamation root, because a resource term standing only in dead state
+    /// would be retained for the runtime's life (they are the child's *first* root set, and the
+    /// machine copies them into registers that are then the live roots).
+    pub(super) args_consumed: bool,
     /// Whether `args` (and a [`ProcessEntry::Fun`]'s fun) are copies on the **pointer-stable
     /// arena** rather than terms of a heap a collection may move or a process's death may free.
     ///
@@ -293,6 +305,7 @@ impl RunnerState {
                 machine: Machine::new(),
                 entry,
                 args,
+                args_consumed: false,
                 arena_args,
                 parked: None,
                 parked_timeout: None,
@@ -332,11 +345,17 @@ impl RunnerState {
     /// reclamation prunes (`crate::eval::reclaim`) answer a NIF resource a spawn argument carries
     /// unreachable and release it while the child still holds it.
     ///
-    /// Only stable engines are enumerated, and the enumeration is `O(1)` when there are no
-    /// engines at all — the overwhelmingly common case for a runtime that spawned nothing.
+    /// Only **live** engines are enumerated — an engine whose first run already consumed its
+    /// arguments contributes nothing (see [`ProcessEngine::args_consumed`]), and the enumeration
+    /// is `O(1)` when there are no engines at all.
+    ///
+    /// `RunnerState` is moved out of the [`Runtime`](crate::runtime::Runtime) for the duration of
+    /// a scheduler pass, so this covers the sites that run outside one (the `-eval` statement
+    /// boundary and a nested run's epilogue); the in-pass park arm publishes the machine's own
+    /// root set instead.
     pub(crate) fn gather_off_heap_roots(&self, out: &mut Vec<Eterm>) {
         for engine in self.engines.values() {
-            if !engine.arena_args {
+            if !engine.arena_args || engine.args_consumed {
                 continue;
             }
             out.extend_from_slice(&engine.args);

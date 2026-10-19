@@ -2135,8 +2135,11 @@ impl Runtime {
                 out.push(*fun);
             }
         }
-        // The arguments a **live engine** still holds: the child's first root set, whose arena
-        // copies nothing else in this runtime names (`RunnerState::gather_off_heap_roots`).
+        // The arguments a **live, not-yet-run** engine holds: the child's first root set, whose
+        // arena copies nothing else in this runtime names (`RunnerState::gather_off_heap_roots`).
+        // An engine whose first run already consumed them publishes **nothing** — a consumed
+        // argument set is dead state, and rooting it retains a resource term for the runtime's
+        // life (`ProcessEngine::args_consumed`).
         // `RunnerState` is moved out of the runtime for the duration of a scheduler pass, so this
         // covers the two sites that run outside one (the `-eval` statement boundary and a nested
         // run's epilogue); the in-pass park arm publishes the machine's own root set instead.
