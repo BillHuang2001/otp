@@ -26,8 +26,8 @@ Files: `mod.rs` (buffer lifecycle, labels/fixups, raw byte emission, W^X), `enco
 - arith/logic — `add_rr` `:84`, `sub_rr` `:89`, `cmp_rr` `:94`, `test_rr` `:99`, `and_rr` `:104`, `or_rr` `:109`, `xor_rr` `:114`, `imul_rr` `:127` (two-operand `0F AF /r`; sets OF/CF on 64-bit overflow — the `erlang:'*'/2` guard).
 - shifts — `sar_ri` `:137`, `shl_ri` `:142` (`C1 /n ib`, imm ≤ `u8::MAX` else `BadArg`).
 - stack — `push_r` `:164`, `pop_r` `:172`.
-- control flow — `jmp` (`rel32`) `:182`, `jcc` (`rel32`) `:188`, `call_label` (`rel32`) `:195`, `call_r` (indirect) `:201`, `ret` `:210`.
-- filler — `nop` `:217`, `int3` `:222`.
+- control flow — `jmp` (`rel32`) `:182`, `jcc` (`rel32`) `:188`, `call_label` (`rel32`) `:195`, `jmp_r` (indirect, `FF /4`, `0x41` REX.B for `r8`–`r15`, pinned by `tests.rs::jumps_through_a_register`) `:209`, `call_r` (indirect) `:218`, `ret` `:227`.
+- filler — `nop` `:234`, `int3` `:239`.
 Absent on purpose (add a tested method, don't guess): `mov r/m64, imm32`, memory-operand arithmetic, indexed addressing, SSE/AVX, `syscall`.
 
 ## W^X design (never RWX)
