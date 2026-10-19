@@ -66,7 +66,8 @@ use super::select::try_inline_select_val;
 use super::super::call::{jit_call_store, jit_call_store_linked, CALL_STORED};
 use super::super::receive::jit_receive;
 use super::super::runtime::{
-    ExtCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, LOCAL_DECLINE,
+    encode_local_call, ExtCallHelper, LocalCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
+    EXT_CALL_ONLY, LOCAL_CALL_LAST, LOCAL_CALL_ONLY, LOCAL_DECLINE,
 };
 use super::super::{jit_ext_call, jit_local_call};
 use super::test::try_inline_test;
@@ -589,10 +590,20 @@ pub(crate) fn emit_block(
             // as a BIF means the callee never runs at all. A **decline** falls through to
             // the unchanged exit.
             Instr::CallLast {
-                target, deallocate, ..
+                target, arity, deallocate,
             } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
-                    emit_local_call_probe(buffer, allocation, done, func, pc)?;
+                    emit_local_call_probe(
+                        buffer,
+                        allocation,
+                        done,
+                        func,
+                        pc,
+                        target_func,
+                        *arity,
+                        LOCAL_CALL_LAST,
+                        *deallocate,
+                    )?;
                     if linker.is_compiled(target_func, target_pc) {
                         linker.emit_tail_exit(
                             buffer,
@@ -627,9 +638,19 @@ pub(crate) fn emit_block(
             // NIF-stub tail call takes), and a decline falls through to the unchanged
             // exit — which for a successor this compilation did not emit is
             // `emit_exit`'s return word, exactly as before.
-            Instr::CallOnly { target, .. } => match labels.resolve(*target) {
+            Instr::CallOnly { target, arity } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
-                    emit_local_call_probe(buffer, allocation, done, func, pc)?;
+                    emit_local_call_probe(
+                        buffer,
+                        allocation,
+                        done,
+                        func,
+                        pc,
+                        target_func,
+                        *arity,
+                        LOCAL_CALL_ONLY,
+                        0,
+                    )?;
                     linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
                     terminated = true;
                     break;
@@ -931,6 +952,11 @@ fn emit_deopt(
 /// code cache shares blocks between runs and hosts, so whether a same-module callee is
 /// served as a BIF can only be decided while the block runs, never at compile time.
 ///
+/// The instruction's whole **compile-time** resolution is handed over as immediates —
+/// the caller's `(func, pc)`, the emitter's `callee`/`arity`, and the [`LOCAL_CALL_ONLY`]/
+/// [`LOCAL_CALL_LAST`] kind with its frame size — exactly as `jit_ext_call` receives its
+/// `ImportRef`/kind/size, so the helper re-derives nothing from `module.functions`.
+///
 /// The helper's word is left in `rax` (the block ABI's return register); the decline
 /// comparison is against a constant loaded into `r11` — never a `movabs` into `rax`,
 /// which must keep the word — and on a non-decline word the emitted code jumps to the
@@ -938,19 +964,30 @@ fn emit_deopt(
 /// is the only path that runs on into the caller's static exit; it is safe there
 /// because a decline mutates nothing (see [`jit_local_call`]), so the cached
 /// x-registers that exit spills are still the values `machine.x` must receive.
+#[allow(clippy::too_many_arguments)]
 fn emit_local_call_probe(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     done: CodeLabel,
     func: u32,
     pc: u32,
+    callee: u32,
+    arity: u32,
+    kind: u32,
+    deallocate: u32,
 ) -> Result<()> {
-    let helper: StepHelper = jit_local_call;
+    let helper: LocalCallHelper = jit_local_call;
     emit_helper_call(
         buffer,
         allocation,
         helper as *const (),
-        &[i64::from(func), i64::from(pc)],
+        &[
+            i64::from(func),
+            i64::from(pc),
+            encode_local_call(callee, arity),
+            i64::from(kind),
+            i64::from(deallocate),
+        ],
     pc)?;
     buffer.mov_ri(Reg::R11, LOCAL_DECLINE)?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;

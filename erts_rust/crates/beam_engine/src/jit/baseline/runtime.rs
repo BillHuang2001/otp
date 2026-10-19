@@ -471,6 +471,13 @@ pub(crate) type StepHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32
 /// successor word and the frame size a local `call_last` pops).
 pub(crate) type TailHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, u32) -> i64;
 
+/// The `jit_local_call` helper's native signature (the block ABI plus the instruction's
+/// own `(func, pc)`, the [`encode_local_call`] word naming the emitter's resolved callee
+/// and its register-argument count, the [`LOCAL_CALL_ONLY`]/[`LOCAL_CALL_LAST`] kind and
+/// the `call_last` frame size).
+pub(crate) type LocalCallHelper =
+    for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, i64, u32, u32) -> i64;
+
 /// The `jit_deallocate`/`jit_deallocate_return` helpers' native signature (the block ABI
 /// plus the instruction's own `(func, pc)` and the frame size the checked pop must match).
 pub(crate) type FrameExitHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32) -> i64;
@@ -812,6 +819,30 @@ pub(crate) const EXT_CALL_LAST: u32 = 2;
 /// before the probe existed.
 pub const LOCAL_DECLINE: i64 = -4;
 
+/// The kind of local tail call a [`jit_local_call`] call describes: `call_only Arity
+/// Label` — a tail call with no frame to pop.
+pub(crate) const LOCAL_CALL_ONLY: u32 = 0;
+
+/// The kind of local tail call a [`jit_local_call`] call describes: `call_last Arity
+/// Label Deallocate` — a tail call that pops the `deallocate` frame.
+pub(crate) const LOCAL_CALL_LAST: u32 = 1;
+
+/// Packs a local call's resolved callee and its register-argument count into the one
+/// block-ABI word [`jit_local_call`] receives.
+///
+/// Both are 32-bit (`func` is a `Module::functions` index, `arity` a `u32` operand), so
+/// the packing is lossless — the same two-u32-in-one-i64 shape [`encode_target`] uses to
+/// carry a `(func, pc)` pair through the block ABI. It exists to keep the helper inside
+/// the six integer argument registers (`rt` plus five) [`emit_helper_call`] can fill.
+pub(crate) const fn encode_local_call(callee: u32, arity: u32) -> i64 {
+    ((callee as i64) << 32) | (arity as i64 & 0xFFFF_FFFF)
+}
+
+/// Decodes an [`encode_local_call`] word back into its `(callee, arity)` pair.
+pub(crate) const fn decode_local_call(word: i64) -> (u32, u32) {
+    ((word >> 32) as u32, (word & 0xFFFF_FFFF) as u32)
+}
+
 /// The **`call_ext*`** helper: resolve the import through the host's cross-module-call
 /// seam and, when it answers, apply the variant's frame discipline and hand the
 /// callee to the driver as the [`ENTER`] word — the same transfer [`jit_step_one`]
@@ -1000,21 +1031,36 @@ fn resolve_ext_entry(
 /// arity, exactly as the interpreter's arms do ([`ImportFrame::Only`] for a
 /// `call_only`, [`ImportFrame::Last`] with its `deallocate` for a `call_last`); a
 /// plain `call` is lowered by its own helper ([`jit_call_store`]) and consults the
-/// same seam there, so this probe serves only the `call_only`/`call_last` arms. The label is re-resolved through the same per-run label map the
-/// interpreter uses, and an unresolvable one is a decline.
+/// same seam there, so this probe serves only the `call_only`/`call_last` arms.
+///
+/// The instruction's whole compile-time resolution — the caller's `(func, pc)`, the
+/// callee's function index, its register-argument count, the kind and (for a
+/// `call_last`) the frame size — arrives as **block-ABI immediates**, exactly like
+/// [`jit_ext_call`]'s. The emitter resolves the label for its own transfer anyway, so
+/// the helper never re-reads `module.functions[func].code[pc]` and never re-resolves a
+/// label per call; a debug build re-derives the pair from the instruction and the
+/// driver's label map to prove the two agree (see `probe_local_call`), while a release
+/// build trusts the emitter, which is the single source of truth.
 ///
 /// Three outcomes, all of them the block ABI's own vocabulary:
 ///
 /// * the folded [`Step`] of a served local call (a tail call always yields a
 ///   `Goto`/[`Step::Done`]/[`Step::Enter`], never a `Next`), including the landed raise
 ///   a failing BIF produced (`ERROR` with `rt.error` set);
-/// * [`LOCAL_DECLINE`] when the host declined (`Ok(false)`), the instruction is not a
-///   local tail call, or the callee's identity cannot be named. **Nothing is mutated**
+/// * [`LOCAL_DECLINE`] when the host declined (`Ok(false)`) or the callee's identity
+///   cannot be named. **Nothing is mutated**
 ///   on this path — the host seam is a `&mut ExecutionContext`, which cannot reach
 ///   `machine.x` — so the emitted block's unchanged static exit (the direct `jmp`, or
 ///   `jit_tail_call`'s checked pop plus its `jmp`) sees exactly the state it saw before
 ///   the probe existed.
-pub(crate) extern "C" fn jit_local_call(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+pub(crate) extern "C" fn jit_local_call(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    callee_arity: i64,
+    kind: u32,
+    deallocate: u32,
+) -> i64 {
     let outcome = {
         // SAFETY: the driver passes `rt` as the address of a live, exclusively
         // borrowed `JitRuntime` and never aliases it for the duration of the call;
@@ -1037,7 +1083,18 @@ pub(crate) extern "C" fn jit_local_call(rt: *mut JitRuntime<'_>, func: u32, pc: 
         // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
         // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
         let ctx = unsafe { &mut *runtime.ctx };
-        probe_local_call(machine, entry_module, module, labels, func, pc, ctx)
+        probe_local_call(
+            machine,
+            entry_module,
+            module,
+            labels,
+            func,
+            pc,
+            callee_arity,
+            kind,
+            deallocate,
+            ctx,
+        )
     };
     match outcome {
         None => LOCAL_DECLINE,
@@ -1051,14 +1108,16 @@ pub(crate) extern "C" fn jit_local_call(rt: *mut JitRuntime<'_>, func: u32, pc: 
     }
 }
 
-/// The Rust body of [`jit_local_call`]: recover the local tail call at `(func, pc)`,
-/// consult the host seam through [`Machine::local_call_seam`], and report either the
-/// arm's outcome or `None` for a **decline** (today's static link).
+/// The Rust body of [`jit_local_call`]: build the arm's [`ImportFrame`] from the
+/// emitter's kind/size pair, consult the host seam through
+/// [`Machine::local_call_seam`], and report either the arm's outcome or `None` for a
+/// **decline** (today's static link).
 ///
 /// Separate from the `extern "C"` helper so it may take ordinary Rust types (the
 /// `Option`, the `&Module` both come from the driver's live objects) and so the
 /// exit path's borrows are provably dead before [`fold_step`] takes the runtime again
 /// — the same split [`jit_step_ext`] uses.
+#[allow(clippy::too_many_arguments)]
 fn probe_local_call(
     machine: &mut Machine,
     entry_module: &Module,
@@ -1066,25 +1125,60 @@ fn probe_local_call(
     labels: &LabelMap,
     func: u32,
     pc: u32,
+    callee_arity: i64,
+    kind: u32,
+    deallocate: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Option<std::result::Result<Step, Box<BeamError>>> {
-    let (target, arity, frame) = match module
-        .functions
-        .get(func as usize)
-        .and_then(|function| function.code.get(pc as usize))
-    {
-        Some(Instr::CallOnly { target, arity }) => (*target, *arity, ImportFrame::Only),
-        Some(Instr::CallLast {
-            target,
-            arity,
-            deallocate,
-        }) => (*target, *arity, ImportFrame::Last(*deallocate)),
-        // Not a local tail call: only the two forms the emitter probes reach here, and
-        // anything else keeps the instruction on its existing path.
+    let (callee, arity) = decode_local_call(callee_arity);
+    let frame = match kind {
+        LOCAL_CALL_ONLY => ImportFrame::Only,
+        LOCAL_CALL_LAST => ImportFrame::Last(deallocate),
+        // Not a kind this probe is emitted for: declining leaves the instruction on the
+        // block's own static exit, which is all the probe was ever a preface to.
         _ => return None,
     };
-    let (callee, _) = labels.resolve(target).ok()?;
-    let step = match machine.local_call_seam(entry_module, module, callee, arity, frame, func, pc, ctx) {
+    // The emitted immediates ARE the interpreter arm's step-1 `resolve` result, so a
+    // release build has nothing left to derive. A debug build proves it: the address
+    // names this very tail call, its `arity` operand is the one handed to the seam, the
+    // emitter's kind names the variant, and the callee is the resolution of the
+    // instruction's own target label. A `debug_assert!`, never a run-time branch — the
+    // shipped path pays nothing for it.
+    debug_assert!(
+        match module
+            .functions
+            .get(func as usize)
+            .and_then(|function| function.code.get(pc as usize))
+        {
+            Some(Instr::CallOnly { target, arity: operand }) =>
+                *operand == arity
+                    && kind == LOCAL_CALL_ONLY
+                    && matches!(labels.resolve(*target), Ok((resolved, _)) if resolved == callee),
+            Some(Instr::CallLast {
+                target,
+                arity: operand,
+                deallocate: size,
+            }) =>
+                *operand == arity
+                    && kind == LOCAL_CALL_LAST
+                    && *size == deallocate
+                    && matches!(labels.resolve(*target), Ok((resolved, _)) if resolved == callee),
+            _ => false,
+        },
+        "jit_local_call: the emitter passes the tail call's own resolution for (func={func}, pc={pc})"
+    );
+    #[cfg(not(debug_assertions))]
+    let _ = labels;
+    let step = match machine.local_call_seam(
+        entry_module,
+        module,
+        callee,
+        arity,
+        frame,
+        func,
+        pc,
+        ctx,
+    ) {
         Ok(None) => return None,
         Ok(Some(step)) => Ok(step),
         Err(err) => Err(err),
