@@ -40,6 +40,29 @@ use beam_term::prelude::*;
 
 /// The B+-tree order `K`: a leaf holds at most `ORDER` entries, a branch at most
 /// `ORDER` children.
+///
+/// **Why `32`** (`PERF.md` §3, "Why `ORDER = 32` — the fanout sweep", for the run that chose it).
+/// An [`Entry`] is `{key, obj}` — two `Eterm` words, `16` B — so a full leaf is
+/// `32 × 16 B = 512 B`, i.e. **eight 64-byte cache lines**, and a full branch is its
+/// `32 × 8 B` separator array (four lines) plus its `32 × 8 B` child array (four
+/// lines): every node stays a few cache lines wide.
+/// A root-to-leaf descent is `ceil(log_ORDER n)` node visits — two at 1 000 keys,
+/// three at 10 000, four at 100 000 — and each visit is a binary search
+/// ([`search_entries`], [`child_index`]) that bisects *one contiguous whole-node array*,
+/// so its touches land inside a few adjacent cache lines of the same allocation: a node is
+/// a compact, prefetch-friendly unit rather than a random-access one, and a wider node
+/// never scatters the search.
+/// The split/merge arithmetic is the other half: the occupancy band is
+/// `[MIN_OCCUPANCY, ORDER]` = `[16, 32]`, so a leaf splits once per `16` inserts
+/// (amortized `O(1)`) and a delete only borrows or merges below `16` entries, while a
+/// merge of two children holding at most `16` still fits in `32`.
+/// The measured sweep is what settled it: fanouts `8` and `16` lose every `100 000`-key
+/// write column (`204`/`297` and `185`/`226` ns per insert/delete against `145`/`174`)
+/// and cost `1.5–2.1×`/`1.1–1.3×` the bytes per entry, while `48` and `64` are
+/// `5–11 %` leaner per entry (`26.0` vs `28.8` B/entry at 100 000 shuffled keys) but win
+/// no timing cell by more than that cell's own run-to-run spread on the shared host —
+/// so `32` is kept, the knee where the depth is at most four for every size the
+/// interior is measured at.
 pub(crate) const ORDER: usize = 32;
 
 /// The smallest occupancy a node *below the root* may keep (`ORDER / 2`). A
