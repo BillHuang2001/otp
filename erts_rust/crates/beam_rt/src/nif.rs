@@ -71,7 +71,8 @@
 //! [`NifHostServices`] provider threaded in at construction. The **per-call** host (built by
 //! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) carries a
 //! [`RuntimeNifServices`] over the runtime, the pass's own process table and the calling module,
-//! so all eight are live there. The **load/unload** host (built by//! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
+//! so all eight are live there. The **load/unload** host (built by
+//! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
 //! registry, so it cannot borrow the runtime and is built with `services = None`: those hooks then
 //! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
 //! reference, a pid, a liveness answer or a delivery. `erlang:load_nif/2` on an already-loaded module
@@ -106,11 +107,13 @@
 //!   (`ProcessTable::monitor(watcher, target, kind)`) and a NIF resource has no process identity;
 //!   registering would need `&mut ProcessTable` besides. Defaults: `1` (dead/undefined target), `1`
 //!   (not identified).
-//! * **`select`** (`erl_check_io.c`) — registers poll interest and delivers a notification carrying
-//!   the resource handle to a pid. The poller is `PortRegistry`'s **private** `Poller`, registered
-//!   per *port descriptor* with a port-task callback, and the notification needs a delivery to a
-//!   pid: a new subsystem, not a wiring gap. Default `-1` (negative, so the C's documented
-//!   `retval < 0` idiom still holds).
+//! * **`select`** (`erl_check_io.c`) — registers poll interest on a **raw fd** and delivers the C's
+//!   `{select, ResourceTerm, Ref, EventAtom}` to a pid. The refusal is `-1` (negative, so the C's
+//!   documented `retval < 0` idiom still holds). Two seams this crate cannot reach own it: the
+//!   `PortRegistry`'s **private** `Poller` (registered per *port descriptor*, with no fd→key index
+//!   and no `select` event atom) and a safe `obj → resource term` conversion, which lives in
+//!   `beam_abi`. Both handoffs, with the exact signatures, are in `src/CONTEXT.md`
+//!   *The `enif_select` handoff*; `tests/nif_select.rs` is the `#[ignore]`d reproducer.
 //! * **`schedule_nif`** (`:3560-3604`) — re-enters the NIF through the emulator's scheduling
 //!   trampoline or moves it to a dirty scheduler. This runtime has neither
 //!   (`dirty_scheduler_support = 0`) and its call stack is the engine's. Default `badarg` — the C's
