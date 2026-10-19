@@ -104,12 +104,11 @@
 //!   pids only and `erlang:register/2` refuses a port (`ProcessId::from_eterm`), so no atom can ever
 //!   name a port here: `None` (⇒ `0`) is the *provable* answer, not a missing feature.
 //! * **`select`** (`erl_check_io.c`) — registers poll interest on a **raw fd** and delivers the C's
-//!   `{select, ResourceTerm, Ref, EventAtom}` to a pid. The refusal is `-1` (negative, so the C's
-//!   documented `retval < 0` idiom still holds). Two seams this crate cannot reach own it: the
-//!   `PortRegistry`'s **private** `Poller` (registered per *port descriptor*, with no fd→key index
-//!   and no `select` event atom) and a safe `obj → resource term` conversion, which lives in
-//!   `beam_abi`. Both handoffs, with the exact signatures, are in `src/CONTEXT.md`
-//!   *The `enif_select` handoff*; `tests/nif_select.rs` is the `#[ignore]`d reproducer.
+//!   `{select, ResourceTerm, Ref, EventAtom}` to a pid. The hook is live:
+//!   [`crate::nif_select`] decodes the mask and drives the port layer's select store, and the
+//!   notification's resource term is minted at delivery by
+//!   [`resource_term_for`] (see `src/port/CONTEXT.md`); the resource type's `stop` callback has no
+//!   seam here, so a `STOP` keeps the C's fast-track answer.
 //! * **`schedule_nif`** (`:3560-3604`) — re-enters the NIF through the emulator's scheduling
 //!   trampoline or moves it to a dirty scheduler. This runtime has neither
 //!   (`dirty_scheduler_support = 0`) and its call stack is the engine's. Default `badarg` — the C's
@@ -385,6 +384,33 @@ pub(crate) trait NifHostServices {
         let _ = monitor;
         None
     }
+
+    /// Register (or cancel) poll interest in the raw descriptor `event` — the C's `enif_select`
+    /// (`erts/emulator/sys/common/erl_check_io.c:1245-1293`, `:1447-1483`), whose answer is the
+    /// `ERL_NIF_SELECT_*` return code.
+    ///
+    /// `pid` is the C's `const ErlNifPid*` after the ABI dereferenced it (`None` for a null
+    /// pointer) and `self_pid` is the calling host's own pid term — together they are the C's
+    /// `const Eterm recipient = pid ? pid->pid : env->proc->common.id;` (`:1256`). `reference` is
+    /// the caller's reference operand, or — with `ERL_NIF_SELECT_CUSTOM_MSG` — the message term
+    /// itself (`:716-731`).
+    ///
+    /// `None` (the default) is "this host cannot service the request", which
+    /// [`enif_select`](beam_abi::nif::enif::select::enif_select) answers as its own `-1`. The
+    /// load/unload host stays here, so a `load`/`unload` callback can never register a poll
+    /// interest it cannot own.
+    fn select(
+        &mut self,
+        event: beam_abi::nif::types::ErlNifEvent,
+        mode: beam_abi::common::ErlNifSelectFlags,
+        obj: *mut core::ffi::c_void,
+        pid: Option<Eterm>,
+        self_pid: Eterm,
+        reference: Eterm,
+    ) -> Option<core::ffi::c_int> {
+        let _ = (event, mode, obj, pid, self_pid, reference);
+        None
+    }
 }
 
 /// The concrete [`NifHostServices`] over a runtime's own reference id space, reference registry
@@ -415,7 +441,7 @@ pub(crate) struct RuntimeNifServices<'a> {
 impl RuntimeNifServices<'_> {
     /// The process table a registered name, a liveness answer and a delivery resolve against: the
     /// slice's own table when there is one, else the runtime's.
-    fn processes(&self) -> &ProcessTable {
+    pub(crate) fn processes(&self) -> &ProcessTable {
         match self.mailbox {
             Some(ref table) => table,
             None => &self.runtime.processes,
@@ -569,6 +595,26 @@ impl NifHostServices for RuntimeNifServices<'_> {
         };
         Some(self.runtime.nif_monitors.borrow_mut().remove(id))
     }
+
+    /// Register, cancel or stop the poll interest — the runtime half of `enif_select`.
+    ///
+    /// [`crate::nif_select::select`] is the whole body: it decodes the mask
+    /// (`erl_check_io.c:1294-1307`), resolves the recipient (`:1256`) and drives the port layer's
+    /// [`PortRegistry::arm_nif_select`](crate::port::PortRegistry::arm_nif_select) /
+    /// [`stop_nif_select`](crate::port::PortRegistry::stop_nif_select) /
+    /// [`cancel_nif_select`](crate::port::PortRegistry::cancel_nif_select), answering the C's
+    /// return codes (`:1264-1268`, `:1433`, `:1464-1467`, `:1470-1482`, `:1283`).
+    fn select(
+        &mut self,
+        event: beam_abi::nif::types::ErlNifEvent,
+        mode: beam_abi::common::ErlNifSelectFlags,
+        obj: *mut core::ffi::c_void,
+        pid: Option<Eterm>,
+        self_pid: Eterm,
+        reference: Eterm,
+    ) -> Option<core::ffi::c_int> {
+        crate::nif_select::select(self, self_pid, event, mode, obj, pid, reference)
+    }
 }
 /// The runtime services one NIF call (or one library `load`/`unload`) draws on.
 ///
@@ -631,6 +677,35 @@ impl<'a> NifHostImpl<'a> {
     pub(crate) fn into_heap(self) -> Heap {
         self.heap
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resource terms minted at delivery time
+// ---------------------------------------------------------------------------------------------
+
+/// Mint the **resource term** that designates the object `obj` — the second element of a delivered
+/// `enif_select` notification (`erts/emulator/sys/common/erl_check_io.c:746`, `:757`).
+///
+/// The mint is [`beam_abi::nif::enif::resource_term`], which answers `None` for a null, foreign or
+/// already-dying pointer rather than fabricating a term. It needs a [`NifHost`] only for its heap,
+/// so the scratch host built here is the load/unload host's shape — **no** services (nothing on this
+/// path may arm a reference, resolve a name or deliver a message) — over a heap of its own, which is
+/// why the minted block is copied onto the runtime's arena by the caller
+/// ([`Runtime::stabilize_term`](crate::runtime::Runtime)) before this host drops.
+///
+/// `owner` is the recipient of the notification: it is the scratch host's `self_pid`, so the host is
+/// truthful about which process the term is being minted for.
+pub(crate) fn resource_term_for(
+    runtime: &mut crate::runtime::Runtime,
+    owner: ProcessId,
+    obj: *mut core::ffi::c_void,
+) -> Option<Eterm> {
+    let atoms = runtime.code_server.atoms_handle();
+    let interner = PendingInterner::new(atoms.len());
+    let heap = Heap::new(runtime.bif_heap_words).ok()?;
+    let schedulers = crate::info::schedulers_count(runtime) as i32;
+    let mut host = NifHostImpl::new(heap, atoms, interner, owner.to_eterm(), schedulers, None);
+    beam_abi::nif::enif::resources::resource_term(&mut host, obj)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1125,6 +1200,30 @@ impl NifHost for NifHostImpl<'_> {
     /// provider (the load/unload host) this is the trait default `None`.
     fn demonitor_process(&mut self, monitor: Eterm) -> Option<bool> {
         self.services.as_mut()?.demonitor_process(monitor)
+    }
+
+    /// `enif_select` / `enif_select_x` — register (or cancel) poll interest in a raw descriptor.
+    ///
+    /// Delegates to the borrowed [`NifHostServices`], whose provider owns the runtime's one poller
+    /// (through the port layer) and the process table the recipient resolves against. The
+    /// recipient rule is the C's own — `pid ? pid->pid : env->proc->common.id`
+    /// (`erts/emulator/sys/common/erl_check_io.c:1256`) — so this host's [`NifHost::self_pid`]
+    /// rides along as the second operand and an explicit `pid` operand wins over it. The answers
+    /// are the `ERL_NIF_SELECT_*` codes (`:1264-1268`, `:1433`, `:1464-1467`, `:1470-1482`,
+    /// `:1283`); with no provider (the load/unload host) this stays the trait default `None`, which
+    /// the ABI answers as its `-1` — a registration is never fabricated.
+    fn select(
+        &mut self,
+        event: beam_abi::nif::types::ErlNifEvent,
+        mode: beam_abi::common::ErlNifSelectFlags,
+        obj: *mut core::ffi::c_void,
+        pid: Option<Eterm>,
+        reference: Eterm,
+    ) -> Option<core::ffi::c_int> {
+        let self_pid = self.self_pid;
+        self.services
+            .as_mut()?
+            .select(event, mode, obj, pid, self_pid, reference)
     }
 
     /// `enif_make_unique_integer` — draw from the runtime's four NIF-facing unique sequences.

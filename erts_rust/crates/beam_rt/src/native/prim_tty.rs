@@ -57,7 +57,7 @@
 //! `tty_select/2` **is** served: the C's resource check, a discarded `enif_select`, and the
 //! atom `ok` (the `("tty_select", 2)` arm of [`RuntimeContext::prim_tty_call`]). The read
 //! interest it arms is delivered as `{select, Handle, Ref, ready_input}` by the port layer
-//! ([`crate::port::tty`]) — the runtime's one poller owns the descriptor, so the *answer*
+//! ([`crate::port::select`]) — the runtime's one poller owns the descriptor, so the *answer*
 //! surface stays here and the *delivery* half lives there.
 //!
 //! # The opaque tty handle
@@ -316,7 +316,7 @@ impl RuntimeContext<'_> {
             // `enif_select` whose return value is **discarded**, then an
             // `enif_monitor_process`, answering the atom `ok` (`prim_tty_nif.c:1244-1264`). The
             // read interest is one-shot and its delivery (`{select, Handle, Ref, ready_input}`)
-            // is the port layer's [`crate::port::tty`].
+            // is the port layer's [`crate::port::select`], on the C's hardcoded fd `0`.
             ("tty_select", 2) => {
                 // The resource check first: a term that is not a live handle is `badarg`,
                 // exactly the C's `enif_get_resource` miss (and the C tests it **before** it

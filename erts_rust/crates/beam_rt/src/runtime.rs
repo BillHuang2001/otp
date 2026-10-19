@@ -989,6 +989,18 @@ impl Runtime {
         // The port registry owns the I/O byte counters; the runtime keeps a clone of the very
         // same `Rc` so `statistics(io)` reads them without borrowing the port table.
         let ports = Rc::new(RefCell::new(PortRegistry::new()?));
+        // `+A N` is the emulator's async-job worker count (`erl_async.c`), and the port
+        // registry's async pool is where `driver_async` jobs run. The CLI preserves the switch as
+        // a `(switch, value)` pair, so the *configured* pool size is real state rather than a
+        // compiled-in default; `+A 0` is a genuine zero-worker (inline) pool and is passed through
+        // as such. An absent or malformed value keeps the registry's own default — never a panic,
+        // and never a rebuild after the first port has opened (hence this exact position).
+        if let Some(threads) = config
+            .preserved_emulator_flag("+A")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            ports.borrow_mut().set_async_threads(threads);
+        }
         let io_counters = ports.borrow().io_counters();
         Ok(Runtime {
             config,

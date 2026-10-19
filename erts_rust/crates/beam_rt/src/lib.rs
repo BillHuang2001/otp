@@ -90,6 +90,7 @@ mod mailbox;
 mod native;
 mod nif;
 mod nif_monitor;
+mod nif_select;
 mod nif_send;
 pub mod perf_map;
 pub mod port;
