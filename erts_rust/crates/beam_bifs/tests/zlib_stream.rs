@@ -53,7 +53,7 @@
 //! * both round-trip directions: the oracle inflates **this crate's** streams, and this
 //!   crate inflates the **oracle's** streams;
 //! * `deflateParams/3` mid-stream (the `save_progress`/`restore_progress` hand-off);
-//! * the preset-dictionary protocol (Adler `2662864480`, the 21-byte stream, the raise,
+//! * the preset-dictionary protocol (Adler `2662864480`, the 15-byte stream, the raise,
 //!   the `{need_dictionary,…}` return, `inflateSetDictionary`, the resumed payload);
 //! * the 100 000-byte `safeInflate/2` chunk sequence and its one-shot `inflate` round
 //!   trip;
@@ -822,12 +822,15 @@ fn run_erl(oracle: &Path, eval: &str) -> String {
 }
 
 /// The Erlang prologue every program starts with: hex/md5/`~w` helpers.
+///
+/// Every helper's local bindings use variable names that are **not** bound in the enclosing
+/// `-eval` scope: Erlang has no shadowing, so re-binding an already-bound name inside a `fun`
+/// is a match (e.g. `Hex = <list>` against the `Hex` *fun* raises `badmatch` at boot).
 const ORACLE_PRELUDE: &str = "\
 Hex = fun(B) -> lists:flatten([io_lib:format(\"~2.16.0b\", [X]) || <<X>> <= B]) end, \
-Md5 = fun(B) -> Hex = lists:flatten([io_lib:format(\"~2.16.0b\", [X]) || <<X>> <= erlang:md5(B)]), Hex end, \
+Md5 = fun(B) -> H = lists:flatten([io_lib:format(\"~2.16.0b\", [X]) || <<X>> <= erlang:md5(B)]), H end, \
 Sizes = fun(Out) -> [byte_size(iolist_to_binary([X])) || X <- Out] end, \
 Val = fun(F) -> try F() of V -> V catch error:R -> {error, R} end end, ";
-
 /// `path` as an Erlang string literal.
 fn erl_string(path: &Path) -> String {
     let text = path.to_string_lossy();
@@ -1576,12 +1579,16 @@ fn the_dictionary_protocol_matches_the_live_oracle() {
     close(&mut fx, handle).expect("close");
 
     // (1) The raising form: `error:{need_dictionary, Adler}`, then the resumed payload.
+    // The eval wraps the call in the `Val` thunk, so the raised error comes back as
+    // `{error,{need_dictionary,Adler}}` — that (not the bare `{need_dictionary,…}` token) is
+    // what the oracle prints.
     let raise = oracle_fields(&stdout, "RAISE");
     assert_eq!(
         raise.join(" "),
-        format!("{{need_dictionary,{adler}}}"),
+        format!("{{error,{{need_dictionary,{adler}}}}}"),
         "the oracle raises the dictionary's Adler"
     );
+
     let resumed = unhex(oracle_fields(&stdout, "RESUMED")[0]);
     assert_eq!(resumed, DICT_PAYLOAD, "the oracle's resumed payload");
 
@@ -1651,13 +1658,20 @@ fn the_dictionary_protocol_matches_the_live_oracle() {
         "the oracle's `safeInflate` tuple"
     );
     let safe_fin = oracle_fields(&stdout, "SAFEFIN");
-    assert_eq!(safe_fin[0], "{finished,", "the oracle's `{{finished,…}}`");
+    assert_eq!(safe_fin.len(), 1, "one token per `safeInflate` verdict");
+    // `~w` prints `{finished,[38]}`, i.e. no space after the comma, so the verdict is ONE token.
+    let token = safe_fin[0];
+    let inner = token
+        .strip_prefix("{finished,")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or_else(|| {
+            panic!("the oracle's resumed `safeInflate` is `{{finished,…}}`: `{token}`")
+        });
     assert_eq!(
-        parse_sizes(safe_fin[1].trim_end_matches('}')),
+        parse_sizes(inner),
         vec![DICT_PAYLOAD.len()],
         "the oracle's resumed `safeInflate` output"
     );
-
     let handle = open(&mut fx);
     inflate_init(&mut fx, handle, 15, EOS_CUT).expect("inflateInit");
     match zlib_safe_inflate(&mut fx, handle, &stream).expect("safeInflate") {
@@ -1847,7 +1861,7 @@ fn eval_guards() -> String {
          \nT = fun(F) -> try F() of V -> G(V) catch error:R -> case R of\
          \n        A when is_atom(A) -> \"raise:\" ++ atom_to_list(A);\
          \n        _ -> \"raise:\" ++ lists:flatten(io_lib:format(\"~w\", [R]))\
-         \n    end end,\
+         \n    end end end,\
          \nZero = fun() -> Z = zlib:open(), ok = zlib:deflateInit(Z, default), Z end,\
          \nOne = fun() -> Z = zlib:open(), ok = zlib:inflateInit(Z), Z end,\
          \nZ1 = Zero(), _ = zlib:deflate(Z1, <<\"hello\">>, none),\
@@ -1908,8 +1922,13 @@ fn the_guard_classes_match_the_live_oracle() {
     deflate_init(&mut fx, handle, -1, 15, STRATEGY_DEFAULT).expect("deflateInit");
     zlib_deflate(&mut fx, handle, b"hello", FINISH).expect("deflate finish");
     ours.push(call_token(zlib_deflate(&mut fx, handle, b"more", SYNC)));
+    close(&mut fx, handle).expect("close");
 
     // A repeated `finish` after `finish` — not an error: zlib stays in `Z_STREAM_END`.
+    // The oracle's probe uses its own fresh stream here, so mirror that.
+    let handle = open(&mut fx);
+    deflate_init(&mut fx, handle, -1, 15, STRATEGY_DEFAULT).expect("deflateInit");
+    zlib_deflate(&mut fx, handle, b"hello", FINISH).expect("deflate finish");
     ours.push(call_token(zlib_deflate(&mut fx, handle, &[], FINISH)));
     close(&mut fx, handle).expect("close");
 
