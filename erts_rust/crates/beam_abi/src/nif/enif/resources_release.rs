@@ -81,8 +81,8 @@ use libc::c_void;
 ///
 /// Every term here designates a resource object through [`super::enif_get_resource`], and each holds
 /// one reference on that object (the magic reference's, see the module docs). The snapshot is taken
-/// under the registry lock — which is **not** held while this function returns or afterwards — and is
-/// ordered by the term word so a caller sees a deterministic list; the order carries no meaning.
+/// under the registry lock, which is released before this function returns, and is ordered by the
+/// term word so a caller sees a deterministic list; the order carries no meaning.
 ///
 /// This is the reachability question's input, not its answer: which of these terms is still live is
 /// the caller's decision (see [`release_resource_terms`]). A returned word is only meaningful while
