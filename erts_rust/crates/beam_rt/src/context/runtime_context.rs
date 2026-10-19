@@ -117,6 +117,28 @@ pub struct RuntimeContext<'a> {
     /// would corrupt (see [`crate::context::gc`]). It is never set for a plain
     /// [`RuntimeContext`].
     pub(super) gc_armed: bool,
+    /// The **per-call suspend latch**: whether the BIF that is running right now could not
+    /// complete without waiting and therefore asks the engine to **park** the process and
+    /// re-execute the instruction on resume (the C's `erts_suspend` + `ERTS_BIF_YIELD*`
+    /// re-run, `erl_bif_port.c:220-231`).
+    ///
+    /// It is a permission bit shaped exactly like [`gc_armed`](Self::gc_armed): set by the
+    /// **one** arm that can block inside a BIF dispatch
+    /// ([`RuntimeContext::port_command`](crate::context::RuntimeContext) on a busy port whose
+    /// caller may not pump the scheduler), and
+    /// [`take`](std::mem::take)n as the last statement of the two outcome doors
+    /// ([`ExecutionContext::call_bif_outcome`]/[`ExecutionContext::call_bif_in_machine_outcome`]
+    /// in the sibling `context/execution.rs`), which turn a taken latch into
+    /// [`BifOutcome::Suspend`](beam_engine::BifOutcome). Taking it at the door is what makes a
+    /// stale bit harmless: the very next dispatch observes `false`, so only the call that set it
+    /// can ever be suspended.
+    ///
+    /// It is never set anywhere else — in particular **not** on the shared `send`-to-port route
+    /// ([`crate::context::send`]), which is also reached from the inline `Instr::Send`/`!`
+    /// instruction: that instruction has no BIF door to consume the latch, so a bit set there
+    /// would be taken by the *next* BIF dispatch and suspend an unrelated call. See
+    /// [`crate::port::busy_wait`].
+    pub(super) suspend_requested: bool,
     /// The memo of [`RuntimeContext::dispatch`] answers, so a hot call site pays the dispatch
     /// prologue once instead of once per call (see [`DispatchMemo`] for the soundness argument).
     pub(super) dispatch_memo: DispatchMemo,
@@ -184,6 +206,7 @@ impl<'a> RuntimeContext<'a> {
             current_module: None,
             engines: None,
             gc_armed: false,
+            suspend_requested: false,
             dispatch_memo: DispatchMemo::default(),
             lent_tables: None,
             copy_out_hint: 0,
@@ -202,6 +225,7 @@ impl<'a> RuntimeContext<'a> {
             current_module: None,
             engines: None,
             gc_armed: false,
+            suspend_requested: false,
             dispatch_memo: DispatchMemo::default(),
             lent_tables: None,
             copy_out_hint: 0,
@@ -237,6 +261,7 @@ impl<'a> RuntimeContext<'a> {
             current_module: None,
             engines: None,
             gc_armed: false,
+            suspend_requested: false,
             dispatch_memo: DispatchMemo::default(),
             lent_tables: None,
             copy_out_hint: 0,
@@ -294,6 +319,21 @@ impl<'a> RuntimeContext<'a> {
     /// that one admission point (see the [`gc_armed`](Self::gc_armed) field docs).
     pub(crate) fn arm_gc(&mut self) {
         self.gc_armed = true;
+    }
+
+    /// Records that the BIF currently running on this context could not complete without
+    /// waiting, so the outcome door must answer
+    /// [`BifOutcome::Suspend`](beam_engine::BifOutcome) instead of a value
+    /// (see the [`suspend_requested`](Self::suspend_requested) field docs).
+    ///
+    /// The only caller is
+    /// [`RuntimeContext::port_command`](crate::context::RuntimeContext): a plain command on a
+    /// busy port whose caller may not pump the scheduler
+    /// ([`crate::port::busy_wait::PortWrite::Parked`]). It is deliberately **not** reachable
+    /// from the shared `send`-to-port route — that code also serves the inline
+    /// `Instr::Send`/`!` instruction, which has no BIF door to consume the latch.
+    pub(crate) fn request_suspend(&mut self) {
+        self.suspend_requested = true;
     }
 
     /// The process table a receive/send resolves against: the caller-supplied one when

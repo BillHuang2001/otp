@@ -194,6 +194,9 @@ impl<'a> FunBridge<'a> {
             // A **nested** run: it must never collect the process heap, because the root set
             // the machine would hand out belongs to the outer machine (see `context::gc`).
             gc_armed: false,
+            // A nested run never asks to be parked: the BIF that built it has already
+            // returned (see `RuntimeContext::suspend_requested`).
+            suspend_requested: false,
             // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
             dispatch_memo: super::DispatchMemo::default(),
             lent_tables,
@@ -389,6 +392,9 @@ impl SendHook for SendBridge<'_> {
                         // A **nested** run: the delivery itself allocates no roots to
                         // relocate, and the latch must never be inherited (see `context::gc`).
                         gc_armed: false,
+                        // A delivery never asks to be parked (see
+                        // `RuntimeContext::suspend_requested`).
+                        suspend_requested: false,
                         // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
                         dispatch_memo: super::DispatchMemo::default(),
                         // A delivery applies no fun and reads no `TableRegistry`.
@@ -428,6 +434,9 @@ impl SendHook for SendBridge<'_> {
                     engines: self.engines,
                     copy_out_hint: 0,
                     gc_armed: false,
+                    // A remote transmission never asks to be parked (see
+                    // `RuntimeContext::suspend_requested`).
+                    suspend_requested: false,
                     dispatch_memo: super::DispatchMemo::default(),
                     // A remote transmission applies no fun and reads no `TableRegistry`.
                     lent_tables: None,
@@ -478,6 +487,10 @@ impl SendHook for SendBridge<'_> {
             engines: self.engines,
             copy_out_hint: 0,
             gc_armed: false,
+            // A port **send** never asks to be parked: this route is also the inline
+            // `Instr::Send`/`!` instruction, which has no BIF door to consume the latch
+            // (see `RuntimeContext::suspend_requested` and `crate::port::busy_wait`).
+            suspend_requested: false,
             dispatch_memo: super::DispatchMemo::default(),
             // A port send applies no fun and reads no `TableRegistry`.
             lent_tables: None,
@@ -494,6 +507,15 @@ impl SendHook for SendBridge<'_> {
             Ok(crate::port::busy_wait::PortSend::Write(
                 crate::port::busy_wait::PortWrite::Suspended,
             )) => Ok(beam_bifs::SendOutcome::Nosuspend),
+            // A caller that may not pump the scheduler has **no** BIF door here (this route is
+            // also the inline `Instr::Send`/`!` instruction), so
+            // [`send_message_to_port`](crate::port::busy_wait::send_message_to_port) already
+            // turned the verdict into the typed capability gap; nothing else can reach this arm.
+            Ok(crate::port::busy_wait::PortSend::Write(
+                crate::port::busy_wait::PortWrite::Parked,
+            )) => Err(crate::error::unsupported(
+                crate::port::busy_wait::NO_PUMP_REASON,
+            )),
             Err(other) => Err(other),
         }
     }

@@ -315,6 +315,17 @@ impl RuntimeContext<'_> {
             // `ERTS_PORT_OP_BUSY` under `ERTS_PORT_SIG_FLG_NOSUSPEND`: nothing queued, nothing
             // written — the atom `false` (`erl_bif_port.c:211-214`).
             crate::port::busy_wait::PortWrite::Suspended => "false",
+            // The caller may not pump the scheduler, so it is **suspended here** and the
+            // instruction is re-run on resume — the C's `erts_suspend` + `ERTS_BIF_YIELD3`
+            // (`erl_bif_port.c:220-231`). Nothing was queued, written or converted, and the
+            // wait's start is already recorded on the `Runtime`, so the re-issued attempt keeps
+            // the original deadline. The value returned here is **never observed**: the
+            // outcome door (`context/execution.rs`) converts the taken request into
+            // `BifOutcome::Suspend`, and the engine does not apply a suspended instruction.
+            crate::port::busy_wait::PortWrite::Parked => {
+                self.request_suspend();
+                return self.atom("true");
+            }
         };
         self.atom(answer)
     }

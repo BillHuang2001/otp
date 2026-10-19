@@ -40,7 +40,7 @@
 //! |---|---|---|---|---|---|
 //! | idle | either | none | `Idle` | `Written` | 1 (the bytes) |
 //! | busy | — | — | `Gone` (unknown id) | `error:badarg` | 0 |
-//! | busy | `true`/`false` | none, `[nosuspend]` | `CannotPump` | the `NO_PUMP_REASON` gap | 0 |
+//! | busy | `true`/`false` | none, `[nosuspend]` | `Park` | the caller is parked and re-run | 0 |
 //! | busy | `true` | none, expired deadline | `Deadline` | the `DEADLINE_REASON` gap | 0 |
 //! | cleared | either | none | `Idle` | `Written` | 1 (the bytes) |
 //! | busy | either | `[nosuspend]` | — | `Suspended` (no conversion) | 0 |
@@ -66,7 +66,7 @@ use crate::runtime::Runtime;
 
 use super::{
     classify_message, issue, send_message_to_port, wait_until_idle, wait_until_idle_by, IdleWait,
-    PortMessage, PortSend, PortWrite, DEADLINE_REASON, NO_PUMP_REASON,
+    PortMessage, PortSend, PortWrite, DEADLINE_REASON,
 };
 
 /// The pid the fixture ports belong to — the same owner `register_busy_port` registers, which the
@@ -102,7 +102,7 @@ fn an_idle_port_is_waitable_and_its_command_is_written() {
     let mut runtime = native_runtime();
     let (port, _flag, writes) = register_busy_port(&mut runtime, "bw_idle", false, false);
     assert_eq!(
-        wait_until_idle(&mut runtime, false, port).expect("an idle port is readable"),
+        wait_until_idle(&mut runtime, false, OWNER, port).expect("an idle port is readable"),
         IdleWait::Idle,
         "an idle port is waitable without pumping the scheduler"
     );
@@ -135,7 +135,7 @@ fn a_port_the_registry_does_not_hold_is_gone_and_badarg() {
     // `pt == NULL` / `ERTS_PORT_SFLGS_INVALID_LOOKUP`.
     let missing = PortId::new(9_999_999);
     assert_eq!(
-        wait_until_idle(&mut runtime, true, missing).expect("the port table is readable"),
+        wait_until_idle(&mut runtime, true, OWNER, missing).expect("the port table is readable"),
         IdleWait::Gone
     );
     let ran = Cell::new(false);
@@ -158,22 +158,27 @@ fn a_port_the_registry_does_not_hold_is_gone_and_badarg() {
     );
 }
 
-/// A caller that owns no scheduler pass cannot wait: the wait answers `CannotPump` immediately and
-/// `issue` reports the module's own capability gap, with **nothing written**.
+/// A caller that owns no scheduler pass cannot wait **in place**: the wait answers `Park`
+/// immediately, `issue` reports `PortWrite::Parked`, the wait start is recorded on the `Runtime`
+/// so the re-issued attempt keeps the original deadline, and **nothing was written or converted**.
 ///
-/// This is the arm `tests/port_busy.rs` pins end to end on the `run` route (exit 3); here it is the
-/// verdict and the reason identity, without a scheduler slice.
+/// This is the arm `tests/port_busy.rs` pins end to end on the `run` route: the process parks, the
+/// pass pumps, the timer-driven `port_control/3` clears the bit and the re-issued command writes.
 #[test]
-fn a_busy_port_a_caller_cannot_wait_for_is_the_typed_gap() {
+fn a_busy_port_a_caller_cannot_wait_for_is_parked() {
     let mut runtime = native_runtime();
     let (port, _flag, writes) = register_busy_port(&mut runtime, "bw_nopump", true, false);
     assert_eq!(
-        wait_until_idle(&mut runtime, false, port).expect("the port table is readable"),
-        IdleWait::CannotPump,
+        wait_until_idle(&mut runtime, false, OWNER, port).expect("the port table is readable"),
+        IdleWait::Park,
         "a caller inside a scheduler slice cannot re-enter the scheduler"
     );
+    assert!(
+        runtime.busy_port_waits.contains_key(&(OWNER, port)),
+        "the wait start is recorded so the deadline survives the re-issue"
+    );
     let ran = Cell::new(false);
-    let error = issue(
+    let verdict = issue(
         &mut runtime,
         false,
         OWNER,
@@ -181,14 +186,18 @@ fn a_busy_port_a_caller_cannot_wait_for_is_the_typed_gap() {
         data(&ran, b"x"),
         PortCommandOptions::EMPTY,
     )
-    .expect_err("a busy port cannot be written by a caller that cannot wait");
+    .expect("a caller that may not pump is parked, not refused");
     assert_eq!(
-        error::unsupported_reason(&error),
-        Some(NO_PUMP_REASON.to_string()),
-        "the gap is the module's own reason, never a fabricated `true`"
+        verdict,
+        PortWrite::Parked,
+        "the caller must be suspended and the instruction re-run"
     );
     assert!(!ran.get(), "nothing was converted");
     assert_eq!(writes.get(), 0, "nothing reached the driver's `output`");
+    assert!(
+        runtime.busy_port_waits.contains_key(&(OWNER, port)),
+        "a parking attempt leaves the wait in flight"
+    );
 }
 
 /// An expired deadline is `Deadline`, and the command is the module's `DEADLINE_REASON` gap: the C
@@ -204,7 +213,7 @@ fn an_expired_deadline_is_the_typed_gap() {
     let (port, _flag, writes) = register_busy_port(&mut runtime, "bw_deadline", true, false);
     let past = Instant::now() - Duration::from_millis(1);
     assert_eq!(
-        wait_until_idle_by(&mut runtime, true, port, past).expect("the port table is readable"),
+        wait_until_idle_by(&mut runtime, true, OWNER, port, past).expect("the port table is readable"),
         IdleWait::Deadline,
         "a deadline that has already passed is not waited on"
     );
@@ -239,7 +248,7 @@ fn a_busy_port_cleared_before_the_wait_is_writable() {
     let (port, flag, writes) = register_busy_port(&mut runtime, "bw_cleared", true, false);
     flag.set_busy(false);
     assert_eq!(
-        wait_until_idle(&mut runtime, false, port).expect("the port table is readable"),
+        wait_until_idle(&mut runtime, false, OWNER, port).expect("the port table is readable"),
         IdleWait::Idle
     );
     let ran = Cell::new(false);
