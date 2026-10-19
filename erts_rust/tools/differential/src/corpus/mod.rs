@@ -45,6 +45,10 @@
 //!   argv (neither `-eval` nor `beam_rt run <module>`), and only stdout + exit status are
 //!   compared. This is how a surface that needs **two nodes** or a helper binary is pinned
 //!   (the live distribution loopback of contract A.5 is driven by the `dist_probe` helper).
+//!   A command case may carry an optional [`PeerRun`]: a second process of *that side's own*
+//!   runtime, spawned before the side and killed after it, which turns each side into a
+//!   **self-pair** so a real two-VM handshake and message exchange (A.5) is pinned
+//!   symmetrically instead of only per runtime.
 //!
 //! Keep the default corpus **small and fast** (smoke level, Part I §C): heavy suites are
 //! milestone-only. Cases are grouped by the contract they exercise:
@@ -61,7 +65,7 @@
 //! | [`driver_ports`] | A.4 — the `open_port/2` port-open error shapes + the missing-`spawn_executable` `enoent` shape |
 //! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
 //! | [`wire_ids`] | A.2/A.5 — `term_to_binary` of a local pid / port id, plus the A.5 node-identity surface (`node/0,1`, `nodes/0,1`, the `set_cookie/2` family) |
-//! | [`dist`] | A.5 — the live two-node distribution loopback (handshake / node visibility / term delivery / non-Latin-1 atom round trip) via the external `dist_probe` helper (`CaseKind::Command`) |
+//! | [`dist`] | A.5 — the live two-node distribution loopback (handshake / node visibility / term delivery / non-Latin-1 atom round trip) via the external `dist_probe` helper, plus a **two-VM self-pair** (`PeerRun`) that pins handshake + published visibility + one message each way + `{nodedown,_}` symmetrically on both runtimes (`CaseKind::Command`) |
 //! | [`flags`] | A.6 — CLI / configuration (incl. the `+hmax`/`+hmaxk`/`+hmaxel`/`+hmaxib`/`+hms`/`+hmbs` max-heap family) |
 //! | [`bifs`] | A.7 — BIF / OTP app surface (incl. the timer, process-control and code-loading families, `erts_internal:cmp_term/2`, and the debug-tool families `erts_debug` (the `same`/`flat_size` walks + the `lcnt`/interpreter constants) / `erl_debugger`) |
 //! | [`maps`] | A.7 — the `maps` fun-taking BIFs (`fold`/`map`/`filter`/`foreach`) over a map *or* a `maps` iterator, and the `{badmap, _}` / `badarg` contract |
@@ -321,7 +325,9 @@ pub enum CaseKind {
     /// This is how a surface the CLI cannot reach through a single process is pinned: the
     /// live distribution two-node loopback (contract A.5) needs a *second* node and a helper
     /// binary, so the oracle side spawns `erl` and the Rust side spawns the `dist_probe`
-    /// helper (see [`super::dist`]).
+    /// helper (see [`super::dist`]). A case may additionally carry a [`PeerRun`] — a second
+    /// process of each side's *own* runtime, which makes each side a **self-pair** and so
+    /// pins a genuine two-VM handshake / message exchange symmetrically on both sides.
     Command(CommandRun),
 }
 
@@ -461,6 +467,32 @@ pub struct CommandSpec {
     pub args: &'static [&'static str],
 }
 
+/// The optional **peer leg** of a [`CaseKind::Command`] case: a *second process of the same
+/// runtime* that the case's own side talks to.
+///
+/// A [`CaseKind::Command`] runs its two sides **sequentially** (the oracle child finishes
+/// before the Rust child is spawned) and compares only each child's own stdout + exit status,
+/// so a case can never carry a message *between* the two compared runtimes. What it *can* do
+/// is make each side a **self-pair**: the side (the *client*) talks to a peer started from the
+/// **same program as that side**, so the two-vM observables — a real handshake, the peer's
+/// published (not hidden) visibility, a message each way, `{nodedown, _}` — are produced by
+/// each runtime on its own and compared symmetrically. See [`super::dist`].
+///
+/// The peer's program is deliberately **not** a field: it is always the program of the side it
+/// belongs to (the oracle leg's peer is the oracle, the Rust leg's peer is the Rust runtime),
+/// which makes a cross-runtime pair structurally impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerRun {
+    /// The peer's argv. It may contain [`PEER_NONCE_PLACEHOLDER`] — a per-invocation unique
+    /// suffix, substituted by the harness at run time (so parallel sweeps and concurrent
+    /// worktrees never collide on `epmd`'s machine-global name space).
+    pub args: &'static [&'static str],
+    /// The prefix of the single stdout line the peer prints once it is up and registered.
+    /// The harness waits (bounded) for it before spawning the client; a peer that never
+    /// prints it is a loud skip, never an agreement.
+    pub ready_prefix: &'static str,
+}
+
 /// A non-CLI command case: drive each side with an external program + argv (neither `-eval`
 /// nor `beam_rt run <module>`) and compare stdout + exit status (stderr is not compared).
 ///
@@ -473,6 +505,25 @@ pub struct CommandRun {
     pub oracle: CommandSpec,
     /// The Rust side (`beam_rt` or the `dist_probe` helper).
     pub rust: CommandSpec,
+    /// The optional peer leg: a second process of each side's own runtime, spawned (bounded)
+    /// before that side runs and killed after it (see [`PeerRun`]).
+    pub peer: Option<PeerRun>,
+}
+
+/// The literal token a [`PeerRun`]-bearing command case uses for its **per-invocation unique
+/// suffix** — the fragment that keeps the case's node names out of every other running VM's
+/// way. It appears in both the peer's argv and the client's (a `-sname`, and any Erlang
+/// expression that names the peer), and [`expand_nonce`] substitutes it at run time.
+pub const PEER_NONCE_PLACEHOLDER: &str = "{nonce}";
+
+/// Substitute [`PEER_NONCE_PLACEHOLDER`] in each of `args` with `nonce`.
+///
+/// This is what turns a case's static `-sname diffcli{nonce}` (and the peer node name derived
+/// from it inside the case's expression) into the real, unique node names of one run.
+pub fn expand_nonce<S: AsRef<str>>(args: &[S], nonce: &str) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.as_ref().replace(PEER_NONCE_PLACEHOLDER, nonce))
+        .collect()
 }
 
 impl CommandRun {
@@ -487,12 +538,23 @@ impl CommandRun {
     }
 
     /// A stable, deterministic one-line rendering of the oracle command for the report — the
-    /// [`CommandProgram::label`] followed by the space-joined argv.
+    /// [`CommandProgram::label`] followed by the space-joined argv, plus — for a case with a
+    /// [`PeerRun`] — the peer leg (`| peer <program> <argv…>`), rendered as a *template*: the
+    /// [`PEER_NONCE_PLACEHOLDER`] it carries is only resolved for one run, so the report keeps
+    /// the corpus text.
     pub fn oracle_command_line(&self) -> String {
         let mut line = self.oracle.program.label().to_string();
         for arg in self.oracle.args {
             line.push(' ');
             line.push_str(arg);
+        }
+        if let Some(peer) = &self.peer {
+            // No program label: a peer is always a second process of the side's *own* program.
+            line.push_str(" | peer");
+            for arg in peer.args {
+                line.push(' ');
+                line.push_str(arg);
+            }
         }
         line
     }
@@ -665,7 +727,7 @@ pub fn probe_expr(expr: &str, probe: Probe) -> String {
 mod tests {
     use super::{
         cases, expand_env, find_case, probe_expr, CaseKind, CommandProgram, Contract, Probe,
-        DIR_PLACEHOLDER,
+        DIR_PLACEHOLDER, PEER_NONCE_PLACEHOLDER,
     };
     use std::collections::HashSet;
 
@@ -1013,7 +1075,8 @@ mod tests {
     }
 
     /// The `Command` variant: a non-CLI command case whose oracle side is the resolved `erl`
-    /// and whose Rust side is a resolved program (`beam_rt` or the `dist_probe` helper).
+    /// and whose Rust side is a resolved program (`beam_rt` or the `dist_probe` helper), with
+    /// an optional **peer leg** ([`super::PeerRun`]) that makes each side a self-pair.
     #[test]
     fn command_cases_are_registered_and_well_formed() {
         let mut command_cases = 0;
@@ -1051,6 +1114,33 @@ mod tests {
                 "case {}: a command case must render an oracle command line",
                 case.id
             );
+            // The optional peer leg: a *second process of the side's own program*, so the
+            // Rust side it pairs with must be the runtime itself (never the helper), its argv
+            // must be non-empty, its readiness line must be findable, and both argvs must
+            // carry the per-invocation nonce placeholder (a fixed node name would collide on
+            // the machine-global `epmd` name space).
+            if let Some(peer) = run.peer {
+                assert!(
+                    matches!(run.rust.program, CommandProgram::Rust),
+                    "case {}: a peer leg pairs with the runtime, not with the helper",
+                    case.id
+                );
+                assert!(!peer.args.is_empty(), "case {}: an empty peer argv", case.id);
+                assert!(
+                    !peer.ready_prefix.is_empty() && !peer.ready_prefix.contains('\n'),
+                    "case {}: the peer's ready prefix must be a non-empty single-line prefix",
+                    case.id
+                );
+                for args in [run.oracle.args, run.rust.args, peer.args] {
+                    assert!(
+                        args.iter()
+                            .any(|arg| arg.contains(PEER_NONCE_PLACEHOLDER)),
+                        "case {}: every argv a peer case spawns must carry \
+                         {PEER_NONCE_PLACEHOLDER}",
+                        case.id
+                    );
+                }
+            }
         }
         assert!(
             command_cases > 0,
