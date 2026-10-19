@@ -32,6 +32,9 @@
 //!   [`ERTS_VSN`]) and their parser ([`Version`]);
 //! * the canonical **cross-crate ERTS constants** ([`CONTEXT_REDS`]) that two or more
 //!   workspace crates share — this crate owns the single definition of each;
+//! * the **one local reference-id space** ([`next_ref_id`]) every locally minted reference
+//!   term draws its `id` word from — see the module docs for why it must be collision-free
+//!   and why it lives at this lowest common ancestor;
 //! * the **configuration skeleton** over the emulator start-up surface
 //!   ([`RuntimeConfig`], [`Flavor`], [`FeatureFlags`], [`LogLevel`]);
 //! * a dependency-free **logging facade** ([`init_logging`], [`init_from_env`],
@@ -86,6 +89,7 @@ mod config;
 mod constants;
 mod error;
 mod logging;
+mod refid;
 mod version;
 
 /// The workspace `unsafe` marker convention (documentation only).
@@ -95,4 +99,5 @@ pub use config::*;
 pub use constants::*;
 pub use error::*;
 pub use logging::{enabled, init_from_env, init_logging, level, set_level};
+pub use refid::next_ref_id;
 pub use version::*;
