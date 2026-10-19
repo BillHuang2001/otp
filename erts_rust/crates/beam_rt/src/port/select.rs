@@ -557,7 +557,223 @@ impl Default for SelectWatch {
 
 #[cfg(test)]
 mod tests {
-    // The suite was written against the `prim_tty`-only shape and is rewritten with the generalised
-    // store; it lives here rather than in a sibling file because it pins the private
-    // `SelectRegistration`/`SelectWatch` interiors.
+    use super::*;
+    use beam_io::Ready;
+    use beam_term::make_small;
+    use std::collections::HashSet;
+
+    /// A poller and a watch with one `prim_tty:tty_select/2`-shaped registration (a read interest
+    /// on [`TTY_IFD`], a plain payload, no resource object) armed, plus the terms it carries.
+    fn armed() -> (Poller, SelectWatch, ProcessId, Eterm, Eterm) {
+        let mut poller = Poller::new().expect("a poller");
+        let mut watch = SelectWatch::new();
+        let owner = ProcessId::new(7, 0);
+        let handle = make_small(11);
+        let reference = make_small(22);
+        watch
+            .arm(
+                &mut poller,
+                TTY_IFD,
+                Interest::READABLE,
+                owner,
+                SelectPayload::Plain { reference },
+                handle,
+                core::ptr::null_mut(),
+            )
+            .expect("fd 0 is registrable in a test process");
+        (poller, watch, owner, handle, reference)
+    }
+
+    /// The poll round's event for `key`, reporting **no** observed direction — what an EOF-only
+    /// readiness looks like (see [`SelectEvent::of`]'s fallback).
+    ///
+    /// The token is read out of the watch's own registration: a poller token is opaque, so the
+    /// only way a test can name a real one is to take the one the registration was minted with
+    /// (the store keys by `key`, so any minted token will do for a foreign key).
+    fn polled(watch: &SelectWatch, key: u64) -> Event {
+        let token = watch
+            .registrations
+            .get(&key)
+            .or_else(|| watch.registrations.values().next())
+            .map(|registration| registration.token)
+            .expect("a poll round needs a token, so at least one registration must be armed");
+        Event::new(token, key, Ready::default())
+    }
+
+    #[test]
+    fn a_fresh_watch_is_not_armed_and_owns_nothing() {
+        let watch = SelectWatch::new();
+        assert!(!watch.is_armed());
+        assert!(!watch.owns(0));
+        assert!(!watch.owns(TTY_KEY_TOP));
+    }
+
+    #[test]
+    fn arming_reserves_a_key_and_owns_it() {
+        let (_poller, watch, ..) = armed();
+        assert!(watch.is_armed());
+        assert!(watch.owns(TTY_KEY_TOP), "the first key is the top of the range");
+        // The reservation stays outside the port-number space and below the signal sentinel.
+        assert!(TTY_KEY_TOP < super::super::watch::SIGNAL_KEY);
+        assert!(TTY_KEY_FLOOR > 1 << 59, "keys never wrap into the port-number space");
+    }
+
+    /// The full `prim_tty` shape: a read interest on fd 0 delivers one plain `ready_input` report
+    /// carrying the handle and the caller's reference, and disarms itself.
+    #[test]
+    fn a_readiness_report_is_delivered_exactly_once() {
+        let (mut poller, mut watch, owner, handle, reference) = armed();
+        let events = [polled(&watch, TTY_KEY_TOP)];
+        let delivered = watch.take_ready(&mut poller, &events).expect("a delivery");
+        assert_eq!(delivered.len(), 1);
+        let delivery = &delivered[0];
+        assert_eq!(delivery.owner, owner);
+        assert_eq!(delivery.handle, handle);
+        assert_eq!(delivery.event, SelectEvent::ReadyInput);
+        match delivery.payload {
+            SelectPayload::Plain { reference: delivered } => assert_eq!(delivered, reference),
+            SelectPayload::Custom { .. } => panic!("a plain arming must not deliver a custom message"),
+        }
+        assert!(delivery.obj.is_null(), "a `tty_select/2` arming carries no resource object");
+        // One-shot: the interest is disarmed, so a second round reports nothing.
+        assert!(!watch.is_armed());
+        assert!(watch
+            .take_ready(&mut poller, &events)
+            .expect("nothing armed")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_key_the_watch_does_not_own_is_ignored() {
+        let (mut poller, mut watch, ..) = armed();
+        let foreign = [polled(&watch, 42)];
+        assert!(watch
+            .take_ready(&mut poller, &foreign)
+            .expect("a foreign key is skipped")
+            .is_empty());
+        assert!(watch.is_armed(), "the armed registration is untouched");
+    }
+
+    /// A second arming on one descriptor **widens** the interest mask and replaces the payload,
+    /// owner, handle and object — `mio` allows one membership per descriptor, so there is no second
+    /// registration to create.
+    #[test]
+    fn a_second_arming_widens_the_interest_and_replaces_the_payload() {
+        let (mut poller, mut watch, owner, _handle, _reference) = armed();
+        let handle = make_small(33);
+        let message = make_small(44);
+        watch
+            .arm(
+                &mut poller,
+                TTY_IFD,
+                Interest::WRITABLE,
+                owner,
+                SelectPayload::Custom { message },
+                handle,
+                core::ptr::null_mut(),
+            )
+            .expect("a re-registration");
+        assert_eq!(watch.registrations.len(), 1, "still one registration");
+        assert_eq!(watch.by_fd.len(), 1, "still one descriptor index entry");
+        assert_eq!(watch.by_fd.get(&TTY_IFD).copied(), Some(TTY_KEY_TOP), "the key is kept");
+        let registration = &watch.registrations[&TTY_KEY_TOP];
+        assert_eq!(registration.interest, Interest::BOTH, "the mask is widened");
+        assert_eq!(registration.handle, handle, "the handle is replaced");
+
+        let events = [polled(&watch, TTY_KEY_TOP)];
+        let delivered = watch.take_ready(&mut poller, &events).expect("a delivery");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].handle, handle);
+        match delivered[0].payload {
+            SelectPayload::Custom { message: delivered } => assert_eq!(delivered, message),
+            SelectPayload::Plain { .. } => panic!("the widened arming's payload must replace the old one"),
+        }
+    }
+
+    /// `ERL_NIF_SELECT_STOP` answers whether anything really was armed, and de-registers both the
+    /// descriptor and the `(fd, handle)` index — a handle that names no registration on an armed
+    /// descriptor still stops it (the C addresses a registration by its descriptor).
+    #[test]
+    fn stop_de_registers_the_descriptor() {
+        let (mut poller, mut watch, _owner, handle, _reference) = armed();
+        let stale = make_small(99);
+        assert!(watch.stop(&mut poller, TTY_IFD, handle).expect("a stop"));
+        assert!(!watch.is_armed());
+        assert_eq!(watch.by_fd.get(&TTY_IFD), None);
+        assert_eq!(watch.by_fd_handle.get(&(TTY_IFD, handle_key(handle))), None);
+        assert!(
+            !watch.stop(&mut poller, TTY_IFD, handle).expect("nothing armed"),
+            "a second STOP reports that there was nothing to stop"
+        );
+
+        // A handle the store does not know stops the descriptor all the same.
+        let (mut poller, mut watch, ..) = armed();
+        assert!(watch.stop(&mut poller, TTY_IFD, stale).expect("a stop"));
+        assert!(!watch.is_armed());
+    }
+
+    /// `ERL_NIF_SELECT_CANCEL` reports the directions really armed and clears exactly those — the
+    /// descriptor is de-registered once no direction is left.
+    #[test]
+    fn cancel_reports_the_directions_really_armed() {
+        let (mut poller, mut watch, owner, handle, reference) = armed();
+        // A read interest is all that is armed, so a write cancel clears nothing.
+        assert!(watch
+            .cancel(&mut poller, TTY_IFD, handle, Interest::WRITABLE)
+            .expect("a cancel")
+            .is_empty());
+        assert!(watch.is_armed(), "nothing was cancelled, so nothing was disarmed");
+
+        // Widen to both directions, then clear the read half: the write half stays armed.
+        watch
+            .arm(
+                &mut poller,
+                TTY_IFD,
+                Interest::WRITABLE,
+                owner,
+                SelectPayload::Plain { reference },
+                handle,
+                core::ptr::null_mut(),
+            )
+            .expect("a re-registration");
+        let cancelled = watch
+            .cancel(&mut poller, TTY_IFD, handle, Interest::READABLE)
+            .expect("a cancel");
+        assert!(cancelled.readable && !cancelled.writable && !cancelled.error);
+        assert!(watch.is_armed());
+        assert_eq!(watch.registrations[&TTY_KEY_TOP].interest, Interest::WRITABLE);
+
+        // Clearing the remaining direction de-registers the descriptor.
+        let cancelled = watch
+            .cancel(&mut poller, TTY_IFD, handle, Interest::WRITABLE)
+            .expect("a cancel");
+        assert!(!cancelled.readable && cancelled.writable && !cancelled.error);
+        assert!(!watch.is_armed());
+        assert!(
+            watch
+                .cancel(&mut poller, TTY_IFD, handle, Interest::READABLE)
+                .expect("nothing armed")
+                .is_empty(),
+            "a cancel on an unarmed descriptor cleared nothing"
+        );
+    }
+
+    #[test]
+    fn a_dead_owner_is_pruned_and_a_live_one_is_kept() {
+        let (mut poller, mut watch, owner, ..) = armed();
+        let live: HashSet<ProcessId> = HashSet::new();
+        watch
+            .prune_dead(&mut poller, |pid| live.contains(&pid))
+            .expect("a prune");
+        assert!(!watch.is_armed(), "{owner:?} is gone, so the select is disarmed");
+        assert_eq!(watch.by_fd.get(&TTY_IFD), None);
+
+        let (mut poller, mut watch, owner, ..) = armed();
+        let mut live = HashSet::new();
+        live.insert(owner);
+        watch
+            .prune_dead(&mut poller, |pid| live.contains(&pid))
+            .expect("a prune");
+        assert!(watch.is_armed(), "a live owner keeps its registration");
+    }
 }
