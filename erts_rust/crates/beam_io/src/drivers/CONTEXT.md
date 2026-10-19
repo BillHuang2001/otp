@@ -17,17 +17,28 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
 `ram_file` command protocol).
 
 ## API Surface (summary — the crate root `../CONTEXT.md` carries the frozen detail)
-- `fd.rs` → `FdDriver` (`pipe`/`connected`/`read_only`/`write_only`, line/phase modes, the
-  `line`/`noline`/`text`/`binary`/`getopts` control verbs, EOF de-registration, the `pub(crate)`
+- `fd.rs` → `FdDriver` (`"fd"`; `pipe`/`connected`/`read_only`/`write_only`, line/phase modes, the
+  `line`/`noline`/`text`/`binary`/`getopts` control verbs — an unknown verb is `BadArg` — EOF
+  de-registration, the `pub(crate)`
   read/write-slot seams `adopt_read_fd`/`release_read_fd`/`adopt_write_fd`/`release_write_fd`/
   `has_*_fd`/`attached_fd`), `set_nonblocking`.
-- `efile.rs` → `EfileDriver`, `make_efile`, `FileDataMode`; the `open` flag grammar and `Access`
+- `efile.rs` → `EfileDriver` (`Driver::name() == "efile"`), `make_efile` (its `DriverFactory`),
+  `FileDataMode`; the `open` flag grammar and `Access`
   translation reproduce the C's `efile_translate_modelist` + `get_flags`, and `open(2)` is retried on
   `EINTR` exactly as the C's `do { … } while (fd == -1 && errno == EINTR)` does
-  (`retry_on_eintr`, `unix_prim_file.c:188-191`).
-- `spawn.rs` → `SpawnDriver`, `SpawnSpec`/`SpawnOptions`/`StreamOptions`/`SpawnStream`,
-  `build_command`, the deferred `fork_exec_child`, `ChildProc`/`ForkedChild`.
-- `ram_file.rs` → `RamFileDriver` (`"ram_file_drv"`), `make_ram_file`, `DRIVER_NAME` (aliased
+  (`retry_on_eintr`, `unix_prim_file.c:188-191`). A failed syscall ⇒ the raw `BeamError::Io` errno
+  (the `{error,atom}` rendering is the runtime's `prim_file` floor); an unopened port / unparsable
+  argument ⇒ `BadArg`.
+- `spawn.rs` → `SpawnDriver` (`"spawn"` — the only module here that may spawn OS children),
+  `SpawnSpec`/`SpawnOptions`/`StreamOptions`, `SpawnStream { Binary, List }` (**`Default = List`**, the
+  `binary`/`list` `open_port` option; the **runtime** builds `{Port,{data,Data}}`), `build_command`
+  (the term-free `open_port/2` shape — an empty command/path or an empty argv ⇒ `BadArg`), the
+  deferred `fork_exec_child`, `ChildProc`/`ForkedChild`; constructed via `with_stream_options`,
+  **really spawning in the constructor** and reaping eagerly (`take_exit_status()`/`take_eof()` once
+  only). `stop`/`Drop` kill + reap + deregister/close every descriptor, but an adopted `{fd,N}` is
+  **never** closed.
+- `ram_file.rs` → `RamFileDriver` (`"ram_file_drv"`; a `Vec<u8>` "file", the C's **13 opcodes** and
+  its `OK`/`NUMBER`/`DATA`/`ERROR` reply encodings), `make_ram_file`, `DRIVER_NAME` (aliased
   `RAM_FILE_DRIVER_NAME` at the crate root) and the `pub` `RAM_FILE_*` command/mode/whence/response
   constants. A **command-driven** port holding its whole "file" in memory (no descriptor, nothing
   registered with the poller): [`Driver::output`](crate::Driver::output) drains the port's output
@@ -66,7 +77,10 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   state — no socket, open stream, open datagram, post-`close`, bound-and-listening — plus the
   datagram `post-close` twin (`opt_state_tests.rs`/`opt_sys_tests.rs`; `opt_oracle.rs` is the one
   shared harness).
-- `line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `binary_io.rs` → `Phase`, `PhaseChange`.
+- `line_buffer.rs` → `LineBuffer`, `LineFrame`, `DEFAULT_MAX_LINE_LEN = 1024` (the C's
+  `LINEBUF_EOL`/`LINEBUF_NOEOL` marker rules and the `CR_AFTER` split); `binary_io.rs` → the
+  `erl_child_setup` text⇄binary machine, `Phase { Text, Binary }` (**default `Binary`** = raw
+  passthrough), `PhaseChange`.
 - `mod.rs` → module wiring/re-exports only.
 
 ## Constraints
@@ -87,6 +101,18 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   read in the text phase, so the held bytes must still reach the port queue at EOF/`stop`.
 
 ## Known Issues
+- **`FdDriver` is deliberately minimal.** Byte-stream only: line mode frames **input** but does **not**
+  line-frame output; there are no `inet`/`forker` drivers here and no packet framing (that lives in
+  `inet/`). The `{line,N}` message shape the oracle needs is applied at the **port**, not in this
+  driver (next bullet).
+- **`SpawnDriver` is the OS-child floor, not the whole `spawn` driver.** Synthesizing
+  `{Port,{data,…}}`/`{Port,{exit_status,…}}`/`{Port,eof}` from its bytes, its latched EOF and its
+  once-only exit status is the runtime's job. Writing to a child that closed its stdin fails with a
+  typed `BeamError::Io` (the unwritten remainder stays queued); adoption needs a non-blocking
+  descriptor, and a descriptor that refuses adoption (some inherited ones ⇒ `EPERM`) fails the open.
+  Input is framed at the **port**, not in the driver (there is no `line` verb): `binary`/`list` rides
+  `SpawnStream`, `[line]`/`[binary,{line,N}]` goes through `Port::set_line_mode` +
+  `take_line_notifications`.
 - **The C `ram_file_drv` answers its two reply families through two different output calls.** `OK`/`ERROR`/`NUMBER` go through `driver_output2` (a plain byte list) while `DATA` goes through `driver_output_binary` (an improper `[header | binary]` iolist on a `[binary]` port), so an oracle probe that reads the raw port message must normalise with `binary_to_list(iolist_to_binary(D))` before comparing — and `io:format("~p", [D])` on the raw term raises. This crate keeps that split: `RamReply { header, body }` is delivered through [`DriverContext::deliver_read`](crate::DriverContext::deliver_read), so `OK`/`ERROR`/`NUMBER` are header-only (`body: None`) and a `DATA` reply is the 5-byte `[RESP_DATA, len:i32be]` header plus `Some(payload)` — an empty payload included (`Some(vec![])`, the C's `driver_output_binary(port, hdr, 5, bin, 0, 0)`).
 - **`ram_file_drv` is a registered built-in with a live runtime path.** `DriverRegistry::with_builtins()`
   (in `../driver.rs`) registers `"fd"`/`"efile"`/`"tcp_inet"`/`"udp_inet"`/`"ram_file_drv"`, and
@@ -122,7 +148,9 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   command **before** they look at the socket, with the C's **size-only** rule: the first two bytes
   are a big-endian 16-bit tag length `n`, `n` tag bytes must follow, and the tag's content is never
   inspected (so a *plain* payload reads as a huge length). The strip runs **once per command**, never
-  per short write, and the four rows are each oracle-measured:
+  per short write, and the four rows are each oracle-measured. Once stripped, a command either writes
+  and stages `{inet_reply, Port, ok|{error,Reason}, Tag}` on the completion channel or is answered out
+  of band:
   (a) **malformed** (too short for the length word, or an `n` that does not fit) ⇒ the queue is
   consumed and charged (`prt->bytes_out += size`), nothing is written, and
   `DriverContext::signal_failure(DriverFailure::posix(EINVAL))` is latched — the C's
