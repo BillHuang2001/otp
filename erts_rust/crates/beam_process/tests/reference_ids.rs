@@ -18,94 +18,77 @@
 //
 // %CopyrightEnd%
 
-//! **PIN — HAZARD 2: the two independent reference-id spaces collide on `=:=`.**
+//! **PIN — the reference-id space: ONE shared, process-wide source of ids.**
 //!
-//! # The hazard
+//! # Why one space
 //!
-//! This runtime mints references from **two independent allocators**, each a
-//! [`RefAllocator::new()`] that is monotone from id `0`:
+//! A reference term here is the frozen on-heap block
+//! `[make_header(3, REF_SUBTAG), node = 0, serial = 0, id]`, so a reference's **identity is the
+//! `id` word alone** (`beam_term::compare::cmp_refs` compares the payload words, never the header
+//! subtag, and `node`/`serial` are pinned to `0` by every writer — see
+//! `the_reference_payload_is_compared_word_for_word_leaving_only_the_id`).
 //!
-//! * this crate's [`ProcessTable`] owns one — every `erlang:monitor/2,3` and `erlang:alias/0,1`
-//!   draws from it ([`ProcessTable::create_alias`], `ProcessTable::monitor`);
-//! * `beam_rt`'s `Runtime::refs` owns the other — `erlang:make_ref/0`, the NIF `make_ref`, the
-//!   `erlang:send_after/3`/`start_timer/3` timer references and `seq_trace` draw from it.
+//! Every local reference producer therefore has to draw its `id` from **one** counter, or two
+//! producers can issue the same id and mint the very same term:
 //!
-//! Both render a reference with the **same** frozen 4-word block. `MonitorRef::to_eterm` and
-//! `beam_term::boxed::write_internal_ref` (and `beam_bifs`'s `make_ref_thing`) all write
-//! `[make_header(3, REF_SUBTAG), node = 0, serial = 0, make_small(id)]`, and the second allocator
-//! goes through the very same `MonitorRef::to_eterm` (`beam_rt::native`'s `mint_timer_ref`). Because
-//! the two spaces both start at `0`, the first `make_ref/0` and the first monitor/alias reference
-//! carry the **same id**, so they are literally the **same term**.
+//! * `beam_process`'s monitors and aliases (`ProcessTable`'s [`RefAllocator`] — the handle this
+//!   file pins);
+//! * `erlang:make_ref/0`, the NIF `make_ref`, the timer references, `seq_trace` references and NIF
+//!   resource terms (`beam_rt`'s / `beam_abi`'s draws).
 //!
-//! Term comparison (`beam_term::compare::cmp_refs`) compares the header arity and then the payload
-//! words — it never consults the header **subtag** — so the payload's single distinguishing word is
-//! the id. Equal ids therefore compare `=:=`. The oracle has **one** id space, so it can never
-//! produce such a pair: this is a divergence, not desirable behaviour.
+//! The source of truth is `beam_common::next_ref_id()` — one process-wide `AtomicU64`, first value
+//! `0`, monotone, total. `beam_process::RefAllocator` holds **no counter of its own**: it is a
+//! zero-sized handle whose `next()` *is* that one draw. So:
 //!
-//! (The collision cannot be oracle-cross-checked: the oracle has a single id space, so it is not
-//! possible to make it mint two references with the same id. That is exactly what makes this a
-//! divergence from the oracle.)
+//! * two `RefAllocator`s (and two `ProcessTable`s, and two `Runtime`s in one OS process) can never
+//!   hand out the same id — `two_allocators_never_repeat_an_id`;
+//! * a monitor/alias reference can never collide with a bare `make_ref/0`-shaped reference —
+//!   `a_table_draw_can_never_collide_with_a_bare_reference`;
+//! * the draw is *exactly* the shared counter's next value — `a_table_draw_is_the_shared_spaces_next_id`
+//!   and `an_allocator_draw_is_the_shared_spaces_next_id`.
 //!
-//! # What is already correct (and stays correct)
+//! # Absolute ids are not reproducible
 //!
-//! `beam_rt` classifies a `send` destination by **provenance** (the reference term **word**), not by
-//! its decoded id, so the *send* path never delivers a bare `make_ref/0` to a live alias it happens
-//! to collide with
-//! (`beam_rt/src/context/tests.rs::resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias`).
-//! The residual is purely reference **identity** (`=:=`), which is what this file pins.
+//! Ids are now drawn from a counter shared by every test running in this binary, so an absolute
+//! value (`id 0`, `id + 1`) is meaningless. The two exactness tests below therefore serialize on
+//! [`TEST_LOCK`] and are the **only** tests in this file that draw references; every other test
+//! asserts relative properties (strict increase, distinctness) or constructs an explicitly-valued
+//! `MonitorRef` through `MonitorRef::from_eterm`.
 //!
-//! # Why this cannot be closed from `beam_process`
+//! # No oracle cross-check
 //!
-//! Closing it needs a change no crate here can make alone. Every avenue is blocked:
-//!
-//! 1. **Vary a payload word other than the id** (`node`/`serial`) — the only word the two spaces
-//!    could disagree on without changing the id. `beam_codec`'s internal-reference codec is
-//!    **id-only**: it encodes through `term::internal_ref_id` and rebuilds through
-//!    `make_internal_ref` → `beam_term::boxed::write_internal_ref`, which **zeroes** `node` and
-//!    `serial`. A non-zero `node`/`serial` would therefore break
-//!    `binary_to_term(term_to_binary(M)) =:= M` — a case `beam_rt/tests/reference_ids.rs` asserts
-//!    and the oracle cross-checks. Fixing that needs `beam_codec` (a sibling) to carry the whole
-//!    payload.
-//! 2. **Vary the header subtag** — `cmp_refs` compares arity first and the payload only, never the
-//!    subtag, so a distinct subtag would not distinguish two refs of equal arity.
-//! 3. **Vary the header arity** — a distinct arity would break `internal_ref_id`'s arity check and
-//!    [`MonitorRef::from_eterm`], and would still fail to round-trip through the id-only codec.
-//! 4. **Unify the two allocators onto one id space** — the real fix, but the second allocator is
-//!    `beam_rt`'s (`Runtime::refs`): it must stop minting its own references (or draw from this
-//!    table's allocator), a cross-crate change `beam_process` cannot make.
-//! 5. **Change `RefAllocator::new()`'s starting value or band it per instance** — `beam_rt`'s unit
-//!    test `resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias` relies on
-//!    the space being **monotone from 0** (its `force_next_reference_id` advances a fresh
-//!    `RefAllocator::new()` `id` times so the next draw lands on `id`), so changing the start value
-//!    or banding per instance breaks that test — and `beam_rt` is a sibling edited concurrently.
-//!
-//! # Owner of the fix
-//!
-//! A cross-crate change, not one this node may make:
-//!
-//! * extend `beam_codec`'s internal-reference codec to preserve the whole `[node, serial, id]`
-//!   payload (then a producer may vary `node`/`serial` per id space), **or**
-//! * unify the two allocators via `beam_rt` (draw `make_ref/0` from the [`ProcessTable`]'s
-//!   allocator).
-//!
-//! Until then this file pins the divergence and its exact cause. `beam_rt` carries the matching
-//! provenance-layer pin in its own unit tests, and the crate `CONTEXT.md` records the facts.
+//! The oracle has a single id space, so it cannot express "two producers, one id": the property
+//! pinned here is the *absence* of a divergence, and it is unreachable from `erl -eval` (the oracle
+//! exposes no way to observe its internal id counter across two producers). Deterministic — no
+//! sleeps and no wall-clock bounds.
+
+use std::sync::{Mutex, MutexGuard};
 
 use beam_alloc::Heap;
+use beam_common::next_ref_id;
 use beam_process::prelude::*;
 use beam_term::compare;
 use beam_term::prelude::{
-    boxed_val, make_boxed, make_header, make_small, signed_value, write_internal_ref, AtomTable,
-    Eterm, REF_SUBTAG,
+    boxed_val, header_subtag, make_boxed, make_header, make_small, signed_value, write_internal_ref,
+    AtomTable, Eterm, REF_SUBTAG,
 };
+
+/// Serializes this file's tests, so a draw from the process-wide reference-id space is
+/// deterministic (`cargo test` runs the tests of one binary on parallel threads).
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Takes [`TEST_LOCK`], recovering from a poisoned mutex (a failed sibling test must not turn the
+/// remaining tests into panics of their own).
+fn serialize() -> MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The four words of a reference term, read straight out of its on-heap block.
 ///
 /// # Safety
 ///
 /// Every term passed here is a live, four-word reference block built by one of the producers under
-/// test (`MonitorRef::to_eterm`, `beam_term::boxed::write_internal_ref`, or the fabricated block
-/// below).
+/// test (`MonitorRef::to_eterm` or `beam_term::boxed::write_internal_ref`).
 fn ref_words(term: Eterm) -> [Eterm; 4] {
     // SAFETY: every argument is a live four-word ref block, so words 0..4 are in bounds.
     unsafe {
@@ -114,154 +97,211 @@ fn ref_words(term: Eterm) -> [Eterm; 4] {
     }
 }
 
-/// Pins the **root cause**: this crate's [`RefAllocator`] is monotone from `0`, so **two**
-/// independent instances hand out the very same ids. Every consumer either owns one (the
-/// [`ProcessTable`]) or — like `beam_rt`'s `Runtime::refs` — constructs its own, so the id spaces
-/// coincide from the first draw.
+/// A `ProcessTable` with the canonical signal atoms and no local node — enough to mint a monitor,
+/// an alias or a bare reference.
+fn table() -> ProcessTable {
+    let mut names = AtomTable::new();
+    let atoms = SignalAtoms::from_table(&mut names);
+    ProcessTable::new(atoms)
+}
+
+/// **The shared source, exactly.** A table's draw is the shared counter's next value: after the
+/// draw, one `beam_common::next_ref_id()` is precisely `id + 1`.
+///
+/// This is the property that makes the space real rather than merely "monotone": a private
+/// per-instance counter would answer `id + 1` only by coincidence, and could not stay in step with
+/// a draw from a *different* producer (the second half of the test draws one through the plain
+/// [`RefAllocator`] handle and checks the same relation).
 #[test]
-fn two_independent_reference_allocators_start_at_the_same_zero() {
+fn a_table_draw_is_the_shared_spaces_next_id() {
+    let _guard = serialize();
+    let mut table = table();
+    let owner = table.spawn_default().expect("an alias owner");
+
+    // A monitor reference (`erlang:monitor/2`'s draw path).
+    let target = table.spawn_default().expect("a monitor target");
+    let monitor = table
+        .monitor(owner, target, MonitorKind::Process)
+        .expect("both processes are live");
+    assert_eq!(
+        next_ref_id(),
+        monitor.id() + 1,
+        "a monitor reference is the shared space's next id"
+    );
+
+    // An alias reference (`erlang:alias/0,1`'s draw path).
+    let alias = table
+        .create_alias(owner, UnaliasMode::ExplicitUnalias)
+        .expect("the owner is live");
+    assert_eq!(
+        next_ref_id(),
+        alias.id() + 1,
+        "an alias reference is the shared space's next id"
+    );
+
+    // The table's bare mint (the shape a host uses for `make_ref/0`/timer/`seq_trace`).
+    let bare = table.next_reference();
+    assert_eq!(
+        next_ref_id(),
+        bare.id() + 1,
+        "the table's bare mint is the shared space's next id"
+    );
+}
+
+/// The same exactness for the plain [`RefAllocator`] handle that `beam_rt`'s `Runtime::refs`
+/// holds — proving the two spellings are one counter, not two counters that happen to advance
+/// together.
+#[test]
+fn an_allocator_draw_is_the_shared_spaces_next_id() {
+    let _guard = serialize();
+    let mut refs = RefAllocator::new();
+    let draw = refs.next();
+    assert_eq!(
+        next_ref_id(),
+        draw.id() + 1,
+        "RefAllocator::next() IS beam_common::next_ref_id(), seen through a reference handle"
+    );
+}
+
+/// **Two producers, no collision.** Two independent [`RefAllocator`]s hand out disjoint,
+/// strictly-increasing ids — so two `ProcessTable`s (or a table and `beam_rt`'s
+/// `Runtime::refs`) can never repeat an id, which is what closed the old HAZARD-2 collision.
+#[test]
+fn two_allocators_never_repeat_an_id() {
+    let _guard = serialize();
     let mut a = RefAllocator::new();
     let mut b = RefAllocator::new();
     let a0 = a.next();
     let b0 = b.next();
-    assert_eq!(
-        a0.id(),
-        0,
-        "the first reference of a fresh allocator is id 0"
-    );
-    assert_eq!(b0.id(), 0, "and so is the first reference of a second one");
-    assert_eq!(a0, b0, "the two id spaces coincide on their first draw");
-    // …and on every subsequent draw, because both are the same monotone sequence.
-    for step in 1..8 {
-        assert_eq!(
-            a.next().id(),
-            step,
-            "the allocator advances one id per draw"
-        );
-        assert_eq!(
-            b.next().id(),
-            step,
-            "the second allocator tracks it exactly"
-        );
+    assert_ne!(a0, b0, "one space: the second handle does not restart at 0");
+    assert!(b0.id() > a0.id(), "the draws interleave in one sequence");
+    // …and it stays that way: every later draw is larger than every earlier one.
+    let mut previous = b0.id();
+    for _ in 0..8 {
+        for reference in [a.next(), b.next()] {
+            assert!(
+                reference.id() > previous,
+                "{} must exceed {previous}",
+                reference.id()
+            );
+            previous = reference.id();
+        }
     }
 }
 
-/// The **divergence**, forced deterministically through real crate objects: a reference the
-/// [`ProcessTable`] minted for an `erlang:alias/1` alias and a reference an **independent**
-/// allocator (the shape of `beam_rt`'s `Runtime::refs`) mints for a `make_ref/0` carry the same id,
-/// so they are byte-for-byte the same block and compare `=:=`.
+/// **The divergence that HAZARD 2 recorded is unrepresentable.** A `ProcessTable`-minted alias
+/// reference and an *independent* allocator's (the shape of `beam_rt`'s `Runtime::refs`)
+/// `make_ref/0`-shaped reference are now distinct ids, so their frozen blocks differ in the id word
+/// — the sole distinguishing word — and they never compare `=:=`.
 #[test]
-fn the_process_table_and_an_independent_allocator_mint_the_same_reference_for_the_same_id() {
-    // The process table's OWN allocator: `erlang:alias/0,1` and `erlang:monitor/2,3` draw here.
-    let mut names = AtomTable::new();
-    let atoms = SignalAtoms::from_table(&mut names);
-    let mut table = ProcessTable::new(atoms);
+fn a_table_draw_can_never_collide_with_a_bare_reference() {
+    let _guard = serialize();
+    let mut table = table();
     let owner = table.spawn_default().expect("an alias owner");
     let alias = table
         .create_alias(owner, UnaliasMode::ExplicitUnalias)
         .expect("the owner is live");
-    assert_eq!(alias.id(), 0, "the table's first reference is id 0");
 
     // An INDEPENDENT allocator — the shape of `beam_rt`'s `Runtime::refs` (fed by `make_ref/0`).
     let bare = RefAllocator::new().next();
-    assert_eq!(
+    assert_ne!(
         bare.id(),
         alias.id(),
-        "the two id spaces collide on the very first reference"
+        "one shared space: a bare reference can never reuse an alias's id"
     );
+    assert!(bare.id() > alias.id(), "and it is drawn strictly later");
 
-    // Both render through the very same `MonitorRef::to_eterm`.
+    // Both render through the very same `MonitorRef::to_eterm`; only the id word may differ, and
+    // it does.
     let mut heap = Heap::new(16).expect("test heap");
     let alias_term = alias.to_eterm(&mut heap).expect("the alias ref fits");
     let bare_term = bare.to_eterm(&mut heap).expect("the bare ref fits");
-
-    // The two terms are byte-identical: the frozen block leaves only the id to tell two references
-    // apart, and the two spaces share it.
-    assert_eq!(
+    assert_ne!(
         ref_words(alias_term),
         ref_words(bare_term),
-        "the two references are the identical four-word block"
+        "the two references are different four-word blocks"
     );
-    // …and decode back to the same `MonitorRef`.
-    assert_eq!(
+    // …and decode back to different `MonitorRef`s.
+    assert_ne!(
         MonitorRef::from_eterm(alias_term).expect("an alias produces a reference term"),
         MonitorRef::from_eterm(bare_term).expect("a bare ref produces a reference term"),
-        "and to the same reference id"
     );
-
-    // **The divergence**: `=:=` (and the arithmetic `==`) cannot tell them apart.
+    // The observable consequence: they are not `=:=` (nor arithmetically `==`).
     let atoms = AtomTable::new();
     assert!(
-        compare::eq(alias_term, bare_term, &atoms),
-        "HAZARD 2: a bare make_ref/0 and a monitor/alias reference with the same id compare =:= \
-         here — a divergence from the oracle's single id space"
+        !compare::eq(alias_term, bare_term, &atoms),
+        "a bare make_ref/0-shaped reference and an alias reference are different references"
     );
-    assert!(
-        compare::cmp_arith(alias_term, bare_term, &atoms).is_eq(),
-        "the arithmetic == ordering agrees with =:= for two references"
-    );
+    assert!(!compare::cmp_arith(alias_term, bare_term, &atoms).is_eq());
 }
 
-/// The runtime mints its **bare** references through `beam_term::boxed::write_internal_ref` (the
-/// shape of `beam_bifs::make_ref_thing`); this pins that such a block and a
-/// [`MonitorRef::to_eterm`] block with the same id are the same term too — the two producers write
-/// the identical frozen block, so the collision is not an artefact of one writer.
+/// The second half of the old HAZARD-2 pair: the runtime's own
+/// `beam_term::boxed::write_internal_ref` block (`beam_bifs::make_ref_thing`'s shape) is the same
+/// term as a [`MonitorRef::to_eterm`] block **iff** the id is explicitly equal — which no two
+/// draws can be, since there is one space. The equality is therefore only reachable when a test
+/// constructs the id explicitly, and this test pins exactly that: the *layout* is shared and
+/// id-keyed, while the *ids* are handed out once.
 #[test]
-fn a_runtime_minted_bare_reference_and_a_monitor_reference_with_equal_ids_are_exactly_equal() {
-    let id = 7u64;
+fn a_runtime_minted_block_equals_a_monitor_block_only_at_an_explicitly_shared_id() {
+    let _guard = serialize();
     let mut heap = Heap::new(16).expect("test heap");
 
-    // The runtime side: the canonical internal-reference writer, exactly what `make_ref/0` and the
-    // NIF `make_ref` write.
+    // A real draw: its id, rendered the canonical writer's way.
+    let draw = RefAllocator::new().next();
     // SAFETY: `alloc_words` returned four exclusively-owned, writable words.
     let hp = unsafe { heap.alloc_words(4) }.expect("four words");
     // SAFETY: `hp` owns exactly four words, which `write_internal_ref` fully initialises; the id
-    // fits a 60-bit small (it is 7).
-    let bare = unsafe { write_internal_ref(hp, id) }.expect("the id fits a small");
+    // is a small (this test asserts that below).
+    let bare = unsafe { write_internal_ref(hp, draw.id()) }.expect("the id fits a small");
 
-    // The monitor side: a `MonitorRef` with the same id, from its own allocator.
-    let mut monitor_side = RefAllocator::new();
-    let mut reference = monitor_side.next();
-    while reference.id() < id {
-        reference = monitor_side.next();
-    }
-    assert_eq!(reference.id(), id, "the allocator reached the same id");
-    let monitor_term = reference.to_eterm(&mut heap).expect("the monitor ref fits");
-
+    let monitor_term = draw.to_eterm(&mut heap).expect("the monitor ref fits");
     assert_eq!(
         ref_words(bare),
         ref_words(monitor_term),
-        "the two producers write the identical frozen block"
+        "the two producers write the identical frozen block for one id"
     );
     let atoms = AtomTable::new();
     assert!(
         compare::eq(bare, monitor_term, &atoms),
-        "HAZARD 2: the runtime's write_internal_ref block and a monitor reference block with the \
-         same id compare =:="
+        "…so equal ids are equal terms — the reason ids must never repeat"
     );
+
+    // The *ids*, however, never repeat: a second draw is a different block, hence a different
+    // reference, even though the two producers agree on the layout.
+    let other = RefAllocator::new()
+        .next()
+        .to_eterm(&mut heap)
+        .expect("the second ref fits");
+    assert_ne!(
+        ref_words(bare),
+        ref_words(other),
+        "a later draw is a different block"
+    );
+    assert!(!compare::eq(bare, other, &atoms));
 }
 
-/// Pins the **mechanism** of the comparison, so the reason the hazard is real is explicit: two
-/// references are `=:=` iff their payload words agree, and both producers pin `node`/`serial` to
-/// `0`, leaving the id as the sole distinguishing word. A block that differed in `node` **would**
-/// be distinguished — proof that varying a payload word is the only lever, and the lever the
-/// id-only codec takes away (see the module docs).
+/// Pins the **mechanism** the whole file rests on: two references are `=:=` iff their payload words
+/// agree, and every producer pins `node`/`serial` to `0`, leaving the id as the sole distinguishing
+/// word. A block that differed in `node` **would** be distinguished — which is why the id space has
+/// to be unique, and why the one shared counter is the fix (a payload field is not free to vary:
+/// `beam_codec`'s internal-reference codec is id-only and rebuilds through `write_internal_ref`,
+/// which zeroes both words).
 #[test]
 fn the_reference_payload_is_compared_word_for_word_leaving_only_the_id() {
+    let _guard = serialize();
     let mut heap = Heap::new(32).expect("test heap");
-    let id = 3u64;
 
-    // A reference from each producer, same id.
+    // A reference from each producer, at an explicitly shared id (only a test can do this — the
+    // allocators themselves can no longer produce two equal ids).
+    let draw = RefAllocator::new().next();
+    let id = draw.id();
+
     // SAFETY: `alloc_words` returned four exclusively-owned, writable words.
     let hp = unsafe { heap.alloc_words(4) }.expect("four words");
-    // SAFETY: four writable words, fully initialised by the writer; 3 fits a small.
+    // SAFETY: four writable words, fully initialised by the writer; `id` is a small (it came out of
+    // a draw, and `monitor_ref_to_eterm`-style encodes are checked at the encoder).
     let built = unsafe { write_internal_ref(hp, id) }.expect("the id fits a small");
-    let mut allocator = RefAllocator::new();
-    let mut reference = allocator.next();
-    while reference.id() < id {
-        reference = allocator.next();
-    }
-    let mreffed = reference.to_eterm(&mut heap).expect("the monitor ref fits");
+    let mreffed = draw.to_eterm(&mut heap).expect("the monitor ref fits");
 
     // Both producers pin node (word 1) and serial (word 2) to 0. (`signed_value` is safe — it reads
     // a word's tagged value; the raw block reads already happened, guarded, in `ref_words`.)
@@ -273,26 +313,23 @@ fn the_reference_payload_is_compared_word_for_word_leaving_only_the_id() {
         0,
         "writer: node is the local node (0)"
     );
-    assert_eq!(
-        signed_value(built_words[2]),
-        0,
-        "writer: one id space in M1"
-    );
+    assert_eq!(signed_value(built_words[2]), 0, "writer: serial is 0 in M1");
     assert_eq!(
         signed_value(mreffed_words[1]),
         0,
         "to_eterm: node is the local node (0)"
     );
+    assert_eq!(signed_value(mreffed_words[2]), 0, "to_eterm: serial is 0 in M1");
     assert_eq!(
-        signed_value(mreffed_words[2]),
-        0,
-        "to_eterm: one id space in M1"
+        signed_value(mreffed_words[3]),
+        signed_value(built_words[3]),
+        "and the id word is the whole difference a producer can make"
     );
 
     // A fabricated block that differs ONLY in the node word is treated as a DIFFERENT reference —
-    // which is why node/serial would be the lever to separate the two id spaces, and why pinning
-    // them to 0 (this crate, `write_internal_ref`, and the id-only `beam_codec` decoder) forces the
-    // collision onto the shared id.
+    // which is why node/serial *would* be a lever to separate two id spaces, and why pinning them
+    // to 0 (this crate, `write_internal_ref`, and the id-only `beam_codec` decoder) makes id
+    // uniqueness the only honest guarantee.
     // SAFETY: `alloc_words` returned four exclusively-owned, writable words.
     let p = unsafe { heap.alloc_words(4) }.expect("four words");
     // SAFETY: the four words are exclusively owned and written before the pointer escapes.
@@ -300,18 +337,42 @@ fn the_reference_payload_is_compared_word_for_word_leaving_only_the_id() {
         *p = make_header(3, REF_SUBTAG);
         *p.add(1) = make_small(1); // a non-zero node
         *p.add(2) = make_small(0);
-        *p.add(3) = make_small(id as i64);
+        *p.add(3) = mreffed_words[3];
     }
     let different_node = make_boxed(p as *const Eterm);
 
     let atoms = AtomTable::new();
     assert!(
         !compare::eq(built, different_node, &atoms),
-        "a ref block that differs only in the node word is a different reference — the payload \
-         comparison would distinguish the two spaces if node/serial were free to vary"
+        "a ref block that differs only in the node word is a different reference"
     );
     assert!(
         compare::eq(built, mreffed, &atoms),
-        "…but the two real producers both pin node/serial to 0, so only the shared id remains"
+        "…but the two real producers both pin node/serial to 0, so only the id remains"
     );
+}
+
+/// The encoded id word of a real draw round-trips, and the check that the id is a small integer is
+/// still the encoder's (a refusal past `MAX_SMALL`, never a truncated or substituted id) — the one
+/// contract the shared space did **not** change.
+#[test]
+fn a_real_draw_encodes_and_decodes_byte_exactly() {
+    let _guard = serialize();
+    let mut heap = Heap::new(8).expect("test heap");
+    let reference = RefAllocator::new().next();
+    let term = reference.to_eterm(&mut heap).expect("a draw encodes");
+    assert_eq!(
+        MonitorRef::from_eterm(term).expect("and decodes"),
+        reference,
+        "the reference round-trips through its own term"
+    );
+    // SAFETY: `term` is a live, four-word block written by `to_eterm`, so words 0..4 are in bounds.
+    unsafe {
+        assert_eq!(header_subtag(*boxed_val(term)), REF_SUBTAG as u32);
+        assert_eq!(
+            signed_value(*boxed_val(term).add(3)),
+            reference.id() as i64,
+            "the id word holds this reference's own id"
+        );
+    }
 }

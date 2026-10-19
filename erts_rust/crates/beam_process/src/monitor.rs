@@ -97,7 +97,7 @@
 //! `unalias_1`) and `erts/emulator/beam/erl_proc_sig_queue.c` (the alias-message and DOWN paths).
 
 use beam_alloc::Heap;
-use beam_common::Result;
+use beam_common::{next_ref_id, Result};
 use beam_term::prelude::{
     boxed_val, header_arity, header_subtag, internal_ref_id, is_boxed_term, is_tuple, make_atom,
     signed_value, try_make_small, tuple_element, tuple_size, write_internal_ref, Atom, Eterm,
@@ -134,14 +134,14 @@ use crate::pid::{PortId, ProcessId};
 ///
 /// # Is it reachable?
 ///
-/// Only in principle: [`RefAllocator`] hands out one id per `erlang:monitor/2,3` /
-/// `erlang:alias/1`, monotonically from `0`, so a node would need `MAX_SMALL + 1` monitors
-/// before it reached the bound. It is therefore not a practical limit — but it *is* the
-/// allocator's real limit, and a refusal is the only honest answer once it is passed: an
-/// unchecked wrap would hand out two **equal** references, so a stale `{'DOWN', …}` could be
-/// mistaken for a live monitor's (the invariant [`RefAllocator`] exists to keep).
-fn ref_id_fits(id: u64) -> Result<()> {
-    // `MIN_SMALL` needs no test: a `u64` id is never negative, and `i64::try_from` rejects the
+/// Only in principle: every local reference producer draws one id per mint from the **one shared**
+/// process-wide space ([`beam_common::next_ref_id`]), so a node would need `MAX_SMALL + 1` local
+/// references — `make_ref/0`, timers, `seq_trace`, NIF resources and monitors *together* — before it
+/// reached the bound. It is therefore not a practical limit — but it *is* the id space's real
+/// limit, and a refusal is the only honest answer once it is passed: an unchecked wrap would hand
+/// out two **equal** references, so a stale `{'DOWN', …}` could be mistaken for a live monitor's
+/// (the invariant [`RefAllocator`] exists to keep).
+fn ref_id_fits(id: u64) -> Result<()> {    // `MIN_SMALL` needs no test: a `u64` id is never negative, and `i64::try_from` rejects the
     // whole upper half of the `u64` space.
     let signed = i64::try_from(id).map_err(|_| error::system_limit())?;
     match try_make_small(signed) {
@@ -151,11 +151,15 @@ fn ref_id_fits(id: u64) -> Result<()> {
 }
 
 /// A monitor reference: the identity a `{'DOWN', …}` message carries.
+///
+/// The `id` is drawn from the runtime's one shared local reference-id space
+/// ([`beam_common::next_ref_id`], through [`RefAllocator`]), so a monitor reference can never
+/// collide with another local reference — a bare `make_ref/0`, a timer or `seq_trace` reference or
+/// a NIF resource term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MonitorRef {
     id: u64,
 }
-
 impl MonitorRef {
     /// The numeric reference id.
     pub fn id(self) -> u64 {
@@ -164,12 +168,12 @@ impl MonitorRef {
 
     /// Builds the on-heap ref thing for this reference (see the module docs).
     ///
-    /// The thing is `[make_header(3, REF_SUBTAG), node, serial, id]` — Milestone-1 has a
-    /// single monotonic id space, so `node` and `serial` are zero and the whole id lives in
-    /// the last word (a `small`). The block is written by `beam_term`'s checked
+    /// The thing is `[make_header(3, REF_SUBTAG), node, serial, id]` — Milestone-1 has a single
+    /// node, so `node` and `serial` are zero and the whole id lives in the last word (a `small`);
+    /// the id itself comes from the one process-wide space [`beam_common::next_ref_id`] shared by
+    /// every local reference producer. The block is written by `beam_term`'s checked
     /// `write_internal_ref`, so this producer and the crate's other reference writers cannot
-    /// drift out of the frozen layout.
-    ///
+    /// drift out of the frozen layout.    ///
     /// # Errors
     ///
     /// * `BeamError::Alloc` when `heap` cannot fit the ref thing.
@@ -470,15 +474,25 @@ impl Monitors {
     }
 }
 
-/// The monotonic reference allocator, owned by the
-/// [`ProcessTable`](crate::ptab::ProcessTable).
+/// Mints monitor/alias references from the runtime's **one shared local reference-id space**
+/// ([`beam_common::next_ref_id`]).
 ///
-/// A reference id is never reused, so a stale `{'DOWN', …}` can never be confused with a
-/// live monitor.
+/// The handle is **zero-sized**: there is no per-instance counter, no start value and no band.
+/// Every draw takes the next id of the process-wide space that `erlang:make_ref/0`, the NIF
+/// `make_ref`, the `erlang:send_after/3`/`start_timer/3` timer references, `seq_trace` references,
+/// **NIF resource terms** (`enif_make_resource`) and this crate's monitors and aliases all share
+/// (see `beam_common::refid`). Two reference producers therefore can never hand out the same id —
+/// including two [`RefAllocator`]s, and including the allocator of one
+/// [`ProcessTable`](crate::ptab::ProcessTable) and another's, in one OS process.
+///
+/// A reference id is consequently never reused by *any* local producer, so a stale `{'DOWN', …}`
+/// can never be confused with a live monitor, and a reachability predicate that matches reference
+/// *identity* (the runtime prunes unreferenced NIF resource terms at the runner's park arm) can
+/// never mistake a dead resource term for a live plain reference with the same id.
 ///
 /// # The real limit is the encodable one, and it is checked at the encoder
 ///
-/// The counter is a `u64`, but an *encodable* reference id is only `0..=MAX_SMALL`
+/// The shared counter is a `u64`, but an *encodable* reference id is only `0..=MAX_SMALL`
 /// (`2^59 - 1`): the whole identity of a reference rides the one small-integer word of
 /// `beam_term`'s frozen 4-word ref thing (see [`ref_id_fits`]). [`RefAllocator::next`] is
 /// therefore deliberately **total and infallible** — sibling crates call it as
@@ -487,34 +501,32 @@ impl Monitors {
 /// truncated, substituted or wrapped into a *different* reference. Exhaustion is thus a typed
 /// resource limit (like pid/port number-space exhaustion), not an invariant taken on trust.
 ///
-/// The `wrapping_add` in [`RefAllocator::next`] is consequently **not** a claim that the wrap
-/// point is reachable: it only keeps the counter itself total rather than panicking. The
-/// allocator stops being able to *produce a usable reference* at `MAX_SMALL + 1` — about
-/// `5.8e17` monitors, far below the `2^64` wrap — so an id can never be handed out, refused,
-/// and then handed out again under the wrap.
-pub struct RefAllocator {
-    next: u64,
-}
+/// Because the space is shared, that bound is the *node's* budget for **all** local references
+/// together (`make_ref/0`, timers, `seq_trace`, NIF resources and monitors), not a per-allocator
+/// one. It stays unreachable in practice — about `5.8e17` draws — and lies far below the `2^64`
+/// wrap point of the counter, so an id can never be handed out, refused, and then handed out
+/// again under the wrap.
+pub struct RefAllocator;
 
 impl RefAllocator {
-    /// An allocator that will hand out its first reference on the first call.
+    /// A handle onto the shared reference-id space (it holds no state of its own).
     pub fn new() -> RefAllocator {
-        RefAllocator { next: 0 }
+        RefAllocator
     }
 
-    /// Hands out the next never-reused reference.
+    /// Hands out the next never-reused reference of the shared local id space.
     ///
     /// This never fails; what can fail is **encoding** the returned id as a term
     /// ([`MonitorRef::to_eterm`] refuses an id past `MAX_SMALL` with `BeamError::SystemLimit`).
-    /// `wrapping_add` only keeps the counter total: the wrap point lies far beyond the
-    /// encodable bound, so no observable reference is ever reused (see the type docs).
+    /// The id itself comes from [`beam_common::next_ref_id`], whose counter is total: the wrap
+    /// point lies far beyond the encodable bound, so no observable reference is ever reused (see
+    /// the type docs).
     pub fn next(&mut self) -> MonitorRef {
-        let id = self.next;
-        self.next = self.next.wrapping_add(1);
-        MonitorRef { id }
+        MonitorRef {
+            id: next_ref_id(),
+        }
     }
 }
-
 #[cfg(test)]
 mod tests {
     //! Unit tests for `RefAllocator` monotonicity, the `Monitors` set operations, the
@@ -535,6 +547,10 @@ mod tests {
 
     #[test]
     fn ref_allocator_hands_out_distinct_monotonic_ids() {
+        // The allocator holds no state of its own: every draw takes the next id of the shared
+        // process-wide space, so the ids are strictly increasing and never repeat. The *absolute*
+        // values are not reproducible (other tests draw concurrently) — `tests/reference_ids.rs`
+        // pins the shared source itself, under a lock.
         let mut refs = RefAllocator::new();
         let a = refs.next();
         let b = refs.next();
@@ -543,8 +559,29 @@ mod tests {
         assert!(b.id() < c.id());
         assert_ne!(a, b);
         assert_ne!(b, c);
+        // Two handles are the same handle — there is one space, not one per instance.
+        let mut other = RefAllocator::new();
+        let d = other.next();
+        assert!(d.id() > c.id(), "a second handle draws from the same space");
     }
 
+    #[test]
+    fn a_ref_draw_is_bracketed_by_the_shared_counter() {
+        // `RefAllocator::next` IS `beam_common::next_ref_id`, seen through a reference handle.
+        // Concurrent tests draw from the same counter, so the exact value is not assertable here;
+        // the draw must however land strictly between two bracketing draws of the shared space
+        // (whatever interleaves, `before` was taken earlier and `after` later).
+        // `tests/reference_ids.rs::a_table_draw_is_the_shared_spaces_next_id` pins the exact
+        // `id + 1` relation under a test lock.
+        let before = beam_common::next_ref_id();
+        let reference = RefAllocator::new().next();
+        let after = beam_common::next_ref_id();
+        assert!(
+            before < reference.id() && reference.id() < after,
+            "the draw {} must lie in ({before}, {after})",
+            reference.id()
+        );
+    }
     #[test]
     fn monitor_kind_type_names_round_trip_and_reject_time_offset() {
         // Pins objective item 6: `erlang:monitor/2`'s type dispatch. Only `process` and
@@ -610,12 +647,12 @@ mod tests {
 
     #[test]
     fn monitor_ref_to_eterm_builds_the_frozen_thing() {
+        // Three draws of the shared space: the ids are distinct whatever the counter's position,
+        // and the block's id word must follow each of them exactly.
         let mut refs = RefAllocator::new();
         let reference = refs.next();
-        // Skip one id so the encoded id is not simply zero.
         let _ = refs.next();
         let second = refs.next();
-
         let mut heap = Heap::new(8).expect("test heap");
         let term = reference.to_eterm(&mut heap).expect("the ref thing fits");
         assert!(is_boxed(term));
@@ -758,27 +795,17 @@ mod tests {
             assert_eq!(heap.used(), 0, "a refused id reserves no heap words");
         }
 
-        // Driving the *allocator* to the boundary: the last encodable draw works, the next one is
-        // refused at the encoder (the allocator's own `next` stays total, by contract).
-        let mut refs = RefAllocator::new();
-        refs.next = MAX_SMALL as u64; // reachable only from an in-module test
-        let last = refs.next();
-        assert_eq!(last.id(), MAX_SMALL as u64);
-        let mut heap = Heap::new(8).expect("test heap");
-        assert!(last.to_eterm(&mut heap).is_ok());
-        let overflowed = refs.next();
-        assert_eq!(overflowed.id(), MAX_SMALL as u64 + 1);
-        let mut heap = Heap::new(8).expect("test heap");
-        assert!(matches!(
-            overflowed.to_eterm(&mut heap),
-            Err(BeamError::SystemLimit)
-        ));
+        // The allocator cannot be *driven* to the boundary any more, and deliberately so: it holds
+        // no counter of its own, it draws from the process-wide space `beam_common::next_ref_id`,
+        // which a test may consume but never set. The boundary behaviour is therefore pinned on
+        // explicitly constructed ids (above): the id at `MAX_SMALL` encodes, and the next one is
+        // refused by the encoder with the typed resource limit — exactly what a draw would hit once
+        // the shared space reached that point.
 
         // The ordinary draw path is unaffected: every id the allocator actually reaches early on
         // encodes and round-trips.
         let mut refs = RefAllocator::new();
-        for _ in 0..64 {
-            let reference = refs.next();
+        for _ in 0..64 {            let reference = refs.next();
             let mut heap = Heap::new(8).expect("test heap");
             let term = reference
                 .to_eterm(&mut heap)

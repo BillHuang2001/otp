@@ -1146,29 +1146,31 @@ fn set_group_leader_from_remote_of_an_unknown_process_is_term_not_found() {
     assert!(log.borrow().is_empty());
 }
 
-// --- the table's own reference-id space (HAZARD 2, the additive seam) --------
+// --- the table's reference mint (the one shared local reference-id space) ----
 
 #[test]
 fn next_reference_draws_from_the_tables_own_id_space() {
-    // The additive closure avenue for HAZARD 2: `next_reference` hands out ids from the very same
-    // monotone `RefAllocator` that mints every monitor/alias reference, so a host that adopts it
-    // for `make_ref/0`/timers/`seq_trace` can never collide with a monitor reference.
+    // `next_reference` hands out ids from the very same allocator that mints every monitor/alias
+    // reference — which is itself a handle onto the one shared local id space
+    // (`beam_common::next_ref_id`), so a host that draws `make_ref/0`/timer/`seq_trace` references
+    // from it can never collide with a monitor reference. The ids are *strictly increasing*, but
+    // their absolute values are not reproducible: other tests in this binary draw from the same
+    // process-wide counter concurrently (`tests/reference_ids.rs` pins the shared source under a
+    // lock).
     let (mut table, _names, _node, log) = fixture();
     let owner = table.spawn_default().expect("owner");
 
     let first = table.next_reference();
     let second = table.next_reference();
-    assert_eq!(second.id(), first.id() + 1, "monotone, never reusing an id");
+    assert!(second.id() > first.id(), "monotone, never reusing an id");
 
     let alias = table
         .create_alias(owner, UnaliasMode::ExplicitUnalias)
         .expect("owner is live");
-    assert_eq!(
-        alias.id(),
-        second.id() + 1,
+    assert!(
+        alias.id() > second.id(),
         "the same allocator backs next_reference, monitors and aliases"
-    );
-    assert_ne!(first, alias);
+    );    assert_ne!(first, alias);
     assert_ne!(second, alias);
     assert!(log.borrow().is_empty(), "minting a reference routes nothing");
 }

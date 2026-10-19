@@ -314,13 +314,14 @@ mod tests {
     fn exit(from: ProcessId, reason: Eterm) -> PendingSignal {
         PendingSignal::exit(from, reason, ExitFamily::Explicit)
     }
-    fn reference(id: u64) -> MonitorRef {
-        // The allocator is the only constructor; use it for a real id.
-        let mut allocator = crate::monitor::RefAllocator::new();
-        for _ in 0..id {
-            allocator.next();
-        }
-        allocator.next()
+    /// A fresh reference from the one shared local id space.
+    ///
+    /// The ids these tests use only have to be **distinct from each other**, never a particular
+    /// value: [`RefAllocator`](crate::monitor::RefAllocator) draws from
+    /// `beam_common::next_ref_id`, so each call mints a never-before-used id and the absolute value
+    /// depends on how many references the rest of the test binary has drawn.
+    fn reference() -> MonitorRef {
+        crate::monitor::RefAllocator::new().next()
     }
 
     #[test]
@@ -338,7 +339,7 @@ mod tests {
         queue.push(exit(pid(1), make_small(1)));
         queue.push(exit(pid(2), make_small(2)));
         queue.push(PendingSignal::down(
-            reference(0),
+            reference(),
             pid(3),
             MonitorKind::Process,
             None,
@@ -386,7 +387,7 @@ mod tests {
         assert_eq!(signal.kind(), PendingSignalKind::Exit);
         assert_eq!(signal.reason(), make_small(41));
 
-        let reference = reference(2);
+        let reference = reference();
         let down = PendingSignal::down(reference, pid(5), MonitorKind::Process, None, make_small(51));
         assert_eq!(down.kind(), PendingSignalKind::Down);
         assert_eq!(down.reason(), make_small(51));
@@ -460,7 +461,7 @@ mod tests {
         let mut queue = SignalQueue::new();
         queue.push(exit(pid(1), make_small(1)));
         queue.push(PendingSignal::down(
-            reference(0),
+            reference(),
             pid(2),
             MonitorKind::Process,
             None,
@@ -483,7 +484,7 @@ mod tests {
     fn gather_and_scatter_carry_a_down_user_tag() {
         let mut queue = SignalQueue::new();
         queue.push(PendingSignal::down(
-            reference(0),
+            reference(),
             pid(2),
             MonitorKind::Process,
             Some(make_small(7)),
@@ -491,7 +492,7 @@ mod tests {
         ));
         // An untagged DOWN next to a tagged one: the tagged one contributes an extra word.
         queue.push(PendingSignal::down(
-            reference(1),
+            reference(),
             pid(3),
             MonitorKind::Port,
             None,

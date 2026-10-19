@@ -119,18 +119,13 @@ impl Fixture {
 
 /// A monitor reference the fixture's table has never handed out.
 ///
-/// [`RefAllocator`] is public but its ids are private to it, so a caller can only *skip* past the
-/// ids a table could have used: the allocator starts at `0`, and the caller is expected to pass a
-/// table that has created no monitors (then no id is in use).
+/// [`RefAllocator`] draws from the **one shared local id space** (`beam_common::next_ref_id`), so
+/// a fresh draw is an id no table — this one or any other in the process — has ever issued. The
+/// caller is still expected to pass a table that has created no monitors, so the draw cannot be
+/// confused with a monitor the table itself armed.
 fn reference_beyond_local_table() -> MonitorRef {
-    let mut refs = RefAllocator::new();
-    let mut reference = refs.next();
-    for _ in 0..100 {
-        reference = refs.next();
-    }
-    reference
+    RefAllocator::new().next()
 }
-
 /// Asserts `payload` is the 5-tuple `{'DOWN', <a ref>, tag, target, reason}` and returns the
 /// reason element (element 4).
 ///

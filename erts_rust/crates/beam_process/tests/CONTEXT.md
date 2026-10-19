@@ -439,26 +439,29 @@ SMP pool:
     checked against the receiver's own nursery observables (`minor_gcs`, the young space's
     base/used words, the mature generation's used words); no sleeps / wall-clock bounds / oracle.
 
-41. `reference_ids.rs` (4 tests) — **PIN — HAZARD 2, the two reference-id spaces colliding on `=:=`**
-    (a documented divergence, **not closable from this crate**): the crate's [`RefAllocator`] is
-    monotone from `0`, so two independent instances hand out the same ids
-    (`two_independent_reference_allocators_start_at_the_same_zero`); a `ProcessTable`-minted
-    `erlang:alias/1` reference and an **independent** allocator's (`beam_rt::Runtime::refs`'s shape)
-    `make_ref/0` reference carry the same id and are the **byte-identical** four-word block
-    (`the_process_table_and_an_independent_allocator_mint_the_same_reference_for_the_same_id`); the
-    runtime's `beam_term::boxed::write_internal_ref` block (`beam_bifs`'s `make_ref_thing` shape) is
-    the same term as a `MonitorRef::to_eterm` block with the same id
-    (`a_runtime_minted_bare_reference_and_a_monitor_reference_with_equal_ids_are_exactly_equal`);
-    and the comparison mechanism — `beam_term::compare::cmp_refs` keys on the payload words
-    (`[arity, node, serial, id]`), and both producers pin `node`/`serial` to `0`, so the shared id is
-    the only distinguishing word
-    (`the_reference_payload_is_compared_word_for_word_leaving_only_the_id`, which also shows a block
-    differing only in `node` **would** be distinguished). The module docs state the exact reason it
-    cannot be closed here (the id-only `beam_codec` internal-reference codec; the two independent
-    allocators; `beam_rt`'s monotone-from-0 dependency) and name the owner (a cross-crate change:
-    extend the ref codec to preserve the whole payload, or unify the allocators via `beam_rt`). No
-    oracle cross-check — the oracle has **one** id space, so it cannot produce the colliding pair.
-    Deterministic — no sleeps / wall-clock bounds / oracle.
+41. `reference_ids.rs` (7 tests) — **PIN — the reference-id space is ONE shared, process-wide
+    source** (`beam_common::next_ref_id`). `beam_process::RefAllocator` is a **zero-sized handle**
+    onto it: `a_table_draw_is_the_shared_spaces_next_id` and
+    `an_allocator_draw_is_the_shared_spaces_next_id` prove the exact relation (after a monitor, an
+    alias or a bare table mint — and after a plain `RefAllocator` draw — one
+    `beam_common::next_ref_id()` is precisely `id + 1`), serialized on a module `static TEST_LOCK`
+    because the counter is shared by the whole binary; `two_allocators_never_repeat_an_id` pins that
+    two independent handles (two `ProcessTable`s, or a table and `beam_rt`'s `Runtime::refs`) draw
+    one strictly-increasing sequence rather than two sequences from `0`;
+    `a_table_draw_can_never_collide_with_a_bare_reference` pins the **closure of the old HAZARD-2
+    collision** (a `ProcessTable` alias reference and an independent `make_ref/0`-shaped draw differ
+    in the id word, decode to different `MonitorRef`s and are not `=:=`, nor arithmetically `==`);
+    `a_runtime_minted_block_equals_a_monitor_block_only_at_an_explicitly_shared_id` and
+    `the_reference_payload_is_compared_word_for_word_leaving_only_the_id` keep the *layout* facts
+    (the canonical `write_internal_ref` block and `MonitorRef::to_eterm` write the identical frozen
+    `[header, node, serial, id]` thing for one id; `node`/`serial` are pinned to `0`, so the id is
+    the sole distinguishing word and a block differing only in `node` *would* be distinguished —
+    which is why unique ids are the only honest guarantee, since `beam_codec`'s internal-reference
+    codec is id-only); `a_real_draw_encodes_and_decodes_byte_exactly` keeps the encoder contract
+    (a real draw round-trips; the `MAX_SMALL` check stays in `MonitorRef::to_eterm`, pinned in
+    `src/monitor.rs`). No absolute ids are asserted: the counter advances under every test in the
+    binary. No oracle cross-check — the oracle has **one** id space, so it cannot express "two
+    producers, one id". Deterministic — no sleeps / wall-clock bounds / oracle.
 42. `off_heap_reachability.rs` (9 tests) — the **reachability-driven** liveness decision for the
     **process-owned** off-heap refc binaries (`Process::sweep_off_heap_binaries_reachable`, over
     `beam_gc::AnyCollector::for_each_reachable_object_view` + the read-only `gather_scan_roots` root
@@ -672,10 +675,11 @@ SMP pool:
 - `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` /
   an unreachable peer heap must not abort the death; the observer and the port-monitor cleanup still
   run)
-- `reference_ids.rs` → the **HAZARD-2 pin**: the two independent reference-id spaces
-  (`ProcessTable`'s `RefAllocator` vs `beam_rt::Runtime::refs`) collide on `=:=` — a documented
-  divergence, not closable from this crate (the owner and the blocked avenues are named in the
-  file's module docs)
+- `reference_ids.rs` → the **shared reference-id-space pin**: `RefAllocator` is a zero-sized handle
+  onto `beam_common::next_ref_id`, so a draw *is* the shared counter's next id, two handles never
+  repeat an id, and a monitor/alias reference can never collide with a bare `make_ref/0`-shaped
+  reference (the old HAZARD-2 `=:=` collision is unrepresentable; the layout/encoder contracts that
+  remain are pinned alongside)
 - `alias.rs`, `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`,
   `port_monitor_cleanup.rs` (oracle tests) →
   `erl`-cross-checked process-dictionary, reference-alias, process-control, lifecycle and port-monitor evidence (loud skip

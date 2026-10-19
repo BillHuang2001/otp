@@ -242,9 +242,9 @@ fn oracle_an_alias_resolves_to_its_owner_and_unalias_reports_true_then_false() {
     assert_eq!(f.table.resolve_alias(reference), Some(owner), "an alias resolves to its creator");
 
     // `unalias/1` answers `true` exactly once. `create_alias` returns a **fresh** reference (the
-    // `RefAllocator` never reuses an id), so two aliases can never collide.
-    assert!(f.table.unalias(owner, reference).expect("a live owner"));
-    assert_eq!(f.table.resolve_alias(reference), None, "a cleared alias is no destination");
+    // `RefAllocator` draws from the one shared local id space and never reuses an id), so two
+    // aliases can never collide.
+    assert!(f.table.unalias(owner, reference).expect("a live owner"));    assert_eq!(f.table.resolve_alias(reference), None, "a cleared alias is no destination");
     assert!(!f.table.unalias(owner, reference).expect("a live owner is not an error"));
 
     // A second alias from the same owner gets its own reference.
