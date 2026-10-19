@@ -81,42 +81,46 @@ The walk loop body never allocates, never crosses a heap-admission point and nev
 
 ## Measured
 Every figure below is this harness' own output unless a section says otherwise.
-The two rounds are two independent passes of the same binary (commit `a72107ce2d`), `--test-threads=1`.
-**The host was not quiet:** `/proc/loadavg` 1-min 41.8 → 103.2 (round 1) and 84.5 → 103.2 (round 2).
+The two rounds are two independent passes of the same binary (commit `786b96ba32`), `--test-threads=1`, one process at a time under `setsid -w taskset -c 3`, release profile.
+**The host was not quiet:** `/proc/loadavg` 1-min 8.42 → 8.39 (round 1, list_walk) / 8.60 → 8.60 (cowboy) / 9.19 → 9.19 (emqx), and 9.33 → 8.81 (round 2, all three back to back); `long_append` ran at 6.37.
 Read the deterministic counters and the `ns per instruction` column; never the absolute wall times.
 
 ### Per-workload attribution (whole call)
-`list_walk`: `BENCH_K=20 BENCH_ITERS=1000 BENCH_BATCH=50 BENCH_WARMUP=50`; the foreign cases: `BENCH_ITERS=50000 BENCH_BATCH=500 BENCH_WARMUP=5000`.
+`list_walk`: `BENCH_K=20 BENCH_ITERS=1000 BENCH_BATCH=50 BENCH_WARMUP=50`; the foreign cases: `BENCH_ITERS=50000 BENCH_BATCH=500 BENCH_WARMUP=5000`; `long_append` at its defaults (`50 / 5 / 5`).
 
 | workload | tier | min / median ns per call (R1 · R2) | instructions/call | ns per instruction (R1 / R2) |
 |---|---|---|---|---|
-| `list_walk` (20 000 el.) | interpreter | 3 033 774 / 3 083 484 · 2 994 209 / 3 040 548 | 169 418 | 17.91 / 17.67 |
-| `list_walk` (20 000 el.) | baseline | **804 590 / 845 822** · 782 185 / 851 922 | 169 418 | 4.75 / 4.62 |
-| `to_lower/1` | interpreter | 15 427.2 / 16 134.3 | 438 | 35.22 / 35.47 |
-| `to_lower/1` | baseline | **7 863.7 / 8 142.7** | 438 | 17.95 / 17.94 |
-| `capitalize_token/1` | interpreter | 19 742.7 / 19 983.0 | 660 | 29.91 / 29.46 |
-| `capitalize_token/1` | baseline | **10 374.0 / 10 626.7** | 660 | 15.72 / 15.46 |
-| `base62:encode/1` | interpreter | 7 473.4 / 7 783.5 | 244 | 30.63 / 29.54 |
-| `base62:encode/1` | baseline | **5 176.3 / 5 442.0** | 244 | 21.21 / 18.17 |
-| `base62:decode/1` | — | **SKIP** (typed reason in Constraints) | — | — |
-| `long_append:expand/1` | interpreter | 5 711 500 | 98 318 | 58.09 |
-| `long_append:expand/1` | baseline | **4 770 731** | 98 318 | 48.52 |
+| `list_walk` (20 000 el.) | interpreter | 2 321 030 / 2 372 867 · 2 264 711 / 2 272 057 | 169 418 | 13.70 / 13.37 |
+| `list_walk` (20 000 el.) | baseline | **466 821 / 469 133** · 474 145 / 478 177 | 169 418 | 2.76 / 2.80 |
+| `to_lower/1` | interpreter | 10 664.8 / 10 723.7 · 10 389.7 / 10 462.0 | 438 | 24.35 / 23.72 |
+| `to_lower/1` | baseline | **4 802.5 / 4 844.8** · 4 682.3 / 4 693.0 | 438 | 10.96 / 10.69 |
+| `capitalize_token/1` | interpreter | 13 907.7 / 14 155.9 · 13 816.8 / 13 858.6 | 660 | 21.07 / 20.93 |
+| `capitalize_token/1` | baseline | **6 596.2 / 6 769.7** · 6 631.0 / 6 778.1 | 660 | 9.99 / 10.05 |
+| `base62:encode/1` | interpreter | 4 912.7 / 4 915.3 · 5 325.3 / 5 355.4 | 244 | 20.13 / 21.82 |
+| `base62:encode/1` | baseline | **3 064.1 / 3 075.6** · 3 307.2 / 3 331.9 | 244 | 12.56 / 13.55 |
+| `base62:decode/1` | interpreter | 9 512.0 / 9 578.1 · 10 350.4 / 10 487.5 | 531 | 17.91 / 19.49 |
+| `base62:decode/1` | baseline | **5 600.5 / 5 623.3** · 6 029.6 / 6 072.4 | 531 | 10.55 / 11.36 |
+| `long_append:expand/1` | interpreter | 2 527 170 / 2 558 207 | 98 318 | 25.70 |
+| `long_append:expand/1` | baseline | **1 961 612 / 2 033 860** | 98 318 | 19.95 |
 
-`ns per instruction` is the discriminating column across a loaded host: the two foreign comprehension cases sit at **15–18 ns/instruction** on the baseline tier while `list_walk` sits at **4.7**, so a per-call wall time alone would misattribute the difference to dispatch.
-`long_append`'s 58 / 48 ns per instruction against `list_walk`'s 17.7 / 4.7 is the load band, not a mechanism — its deterministic counters (below) are the evidence.
+`ns per instruction` is the discriminating column across a loaded host: the three bitstring-heavy foreign cases sit at **10–14 ns/instruction** on the baseline tier while `list_walk` sits at **2.8**, so a per-call wall time alone would misattribute the difference to dispatch.
+`long_append`'s 25.7 / 20.0 ns per instruction against `list_walk`'s 13.7 / 2.8 is the load band, not a mechanism — its deterministic counters (below) are the evidence.
+`decode/1` is measured here for the first time (the floor now serves `erlang:bit_size/1`); every other figure in this table moved since the `a72107ce2d` round because both tiers' driver/return paths changed, so do **not** compare across the two round labels.
 
-Deterministic counters per call (identical on both rounds; "—" = not emitted for that case):
+Deterministic counters per call (identical on both rounds; "—" = the census pass does not cover that case — it runs once per loaded artifact, for the module's **first** case, so `capitalize_token` and `decode` have no census row):
 
-| workload | driver round-trips | block-entry lookups (misses) | rooted calls / words | heap-door calls | BIF calls | local-call requests | refc payloads |
-|---|---|---|---|---|---|---|---|
-| `list_walk` | 20 044 (>0 miss: **0**) | 20 044 000 (0) | 1 000 / 2 000 | 1 000 / 2 000 | 21 040 interp · **0** baseline | 21 042 | 0 |
-| `to_lower/1` | 63 | 3 150 000 (0) | 32 / 163 | 0 | 0 | 61 | 1 |
-| `capitalize_token/1` | — | — | 63 / 318 | 0 | 0 | 57 | 1 |
-| `base62:encode/1` | 39 (`step_ext` 4) | 1 950 000 (0) | 35 / 130 | 4 / 32 | 20 interp · 4 baseline | 21 | 1 |
-| `long_append:expand/1` (dev) | — | — | 16 386 / 81 933 | 0 | 0 | 16 385 | 1 accumulator payload |
+| workload | driver round-trips | in-block calls (declines) | block-entry lookups (misses) | rooted calls / words | heap-door calls | BIF calls | local-call requests | refc payloads |
+|---|---|---|---|---|---|---|---|---|
+| `list_walk` | 2.00 (>0 miss: **0**) | 21.00 (0) | 2.00 (0) | 1 000 / 2 000 | 1 000 / 2 000 | 21 040 interp · **0** baseline | 21 042 | 0 |
+| `to_lower/1` | 3.00 | 30.00 (0) | 3.00 (0) | 32 / 163 | 0 | 0 | 61 | 1 |
+| `capitalize_token/1` | — | — | — | 63 / 318 | 0 | 0 | 57 | 1 |
+| `base62:encode/1` | 7.00 (`step_ext` 4) | 16.00 (0) | 7.00 (0) | 35 / 130 | 4 / 32 | 20 interp · 4 baseline | 21 | 1 |
+| `base62:decode/1` | — | — | — | 62 / 283 | 0 | 33 interp · **17 baseline** | 31 | 1 |
+| `long_append:expand/1` | — | — | — | 16 386 / 81 933 | 0 | 0 | 16 385 | 1 accumulator payload |
 
 `list_walk`'s `rooted`/`heap-door` figures are `build/2` (one cons cell and one `test_heap 2 2` per element), **not** the walk loop — the marginal table below is the loop.
-BIF histogram: `list_walk` `erlang:+/2` 20 020 000 + `-/2` 1 020 000 over 1 000 calls (interpreter tier only — the baseline tier inlines small-int arithmetic, so it dispatches zero); `encode` `+/2` 800 000 (16/call) + `iolist_to_binary/1` 200 000 (4/call).
+The `in_block_calls` column is the native tier's in-block call/return link path (`counters::record_in_block_call`): each one is a driver round-trip the tier did **not** pay, which is why `driver_round_trips_per_call` is 2–7 per call rather than the per-element 1.0 the pre-link tier paid.
+BIF histogram: `list_walk` `erlang:+/2` 20 020 000 + `-/2` 1 020 000 over 1 000 calls (interpreter tier only — the baseline tier inlines small-int arithmetic, so it dispatches zero); `encode` `+/2` 800 000 (16/call) + `iolist_to_binary/1` 200 000 (4/call); `decode` `-/2` 800 000 (16/call) + `bit_size/1` 800 000 (16/call) + `rem/2` 50 000 (1/call) on the interpreter, and `bit_size/1` 800 000 + `rem/2` 50 000 on the baseline tier (which inlines the `-`).
 `bif_floor_declines_per_call = 0` and `result_is_correct = true` on every case, and the two tiers agree on the result bytes.
 
 ### `list_walk` — the per-element marginal (the engine figure)
@@ -124,20 +128,21 @@ Paired `walk(20) − walk(0)`: one `build/2` in both phases, so the build (9 018
 
 | quantity | interpreter (R1 / R2) | baseline (R1 / R2) |
 |---|---|---|
-| `ns_per_element` | **143.51 / 141.33** | **38.18 / 37.10** |
+| `ns_per_element` | **109.92 / 107.04** | **21.57 / 21.94** |
 | instructions per element | 8.020 | 8.020 |
 | rooted allocations per element | 0.0000 | 0.0000 |
 | heap-door calls per element | 0.0000 | 0.0000 |
 | BIF calls per element | **1.0020** | **0.0000** |
 | local-call seam requests per element | 1.0020 | 1.0020 |
-| driver round-trips per element | — | **1.0022** |
-| block-entry lookups / hits per element | — | 1.0022 / 1.0022 (misses 0) |
+| driver round-trips per element | — | **0.0001** (2 per call) |
+| in-block calls per element | — | 0.0010 (21 per call) |
+| block-entry lookups / hits per element | — | 0.0001 / 0.0001 (misses 0) |
 | `step_one` / `step_ext` / driver interp steps per element | — | 0 / 0 / 0 |
 | deopts per element | — | **0** |
-| `census_ns_per_element` (the census pass' own loop) | — | 62.0 / 54.3 |
+| `census_ns_per_element` (the census pass' own loop) | — | 24.6 / — |
 
 Whole-call `instr_per_element` is **8.471**, so the build is 5.3 % of the call.
-The baseline tier executes **one driver-loop iteration and one block entry per element** — a fully linked local tail call still returns through the driver — and deopts on nothing; the interpreter's extra BIF call per element is the small-int `+` the baseline tier inlines.
+The baseline tier pays **2 driver round-trips per 20 000-element call** (not per element): the walk's `call_only` is linked in-block, so the loop runs without returning to the driver, and the interpreter's extra BIF call per element is the small-int `+` the baseline tier inlines.
 
 ### `long_append` — the growth path amortises
 Deterministic counters per call (dev profile, both rounds identical): `instr_per_call` **98 318** (6 per appended element), `rooted_calls/words` **16 386 / 81 933** (the 5-word `bs_start_match3` match context per iteration, **not** the accumulator), `local_call_requests` 16 385, heap-door calls 0 (the fixture has no `test_heap`/`allocate_heap`), BIF calls 0 (asserted), `accumulator_payloads_per_call` **1** (one writable payload per call, however many appends).
