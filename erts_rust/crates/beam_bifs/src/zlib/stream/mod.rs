@@ -18,16 +18,17 @@
 //
 // %CopyrightEnd%
 
-//! **DRAFT — not yet wired in.** The `zlib` stream API at the NIF level: the 19
-//! non-exported local functions `../../../../erts/preloaded/src/zlib.erl:100-106`
-//! declares in its `-nifs([...])` list.
+//! The `zlib` stream API at the NIF level: the 19 non-exported local functions
+//! `../../../../../erts/preloaded/src/zlib.erl:100-106` declares in its
+//! `-nifs([...])` list.
 //!
-//! This file carries the design and the shared machinery (state, registry, handle
-//! minting, the universal prologue, the argument tables, the key table and the
-//! local-call predicate) of the stream surface. The 19 `BifFn` bodies, the pump and the
-//! ETF stash are **not implemented yet** — see "Remaining work" at the bottom. Nothing
-//! declares `mod stream;` yet, so this draft cannot affect the build or the roster
-//! census; the crate's `zlib` surface is still the six one-shot fast paths.
+//! This node owns the whole surface. This file carries the shared machinery (state,
+//! registry, handle minting, the universal prologue, the argument tables, the key
+//! table, the local-call predicate and [`register`]); the bodies live in the four
+//! submodules — [`pump`] (`zlib_return` plus the shared pump and its classification
+//! order), [`lifecycle`] (`open`/`close`/`set_controller`/`enqueue` and the three
+//! stash keys), [`deflate`] (six bodies) and [`inflate`] (six bodies). Each of the
+//! four is also where the `beam_deflate` mapping of its own keys is documented.
 //!
 //! # The 19 keys, and how each maps to [`beam_deflate`]
 //!
@@ -115,20 +116,12 @@
 //! instead. `NeedDict` is never a `zlib_return` input (the pump classifies it), so it
 //! lands on the C's `default:` arm (`unknown_error`).
 //!
-//! # Remaining work (the next round)
-//!
-//! `stream/pump.rs` (`zlib_return_reason` + the shared pump + its classification order),
-//! `stream/lifecycle.rs` (7 bodies + the ETF stash), `stream/deflate.rs` (9 bodies) and
-//! `stream/inflate.rs` (6 bodies), then `mod stream;`, `stream::register(reg)` and the
-//! `serves_local_call` re-export in the parent `zlib/mod.rs`. Two facts the brief gets
-//! wrong, both oracle-verified (OTP 29.1.1 / erts-17.1), must shape `inflateSetDictionary`:
-//! a **fresh framed** stream answers `stream_error` (zlib's `mode != DICT`), not
-//! `data_error`, which is why [`Stream::need_dict_pending`] exists; and a repeated
-//! `deflateSetDictionary` **succeeds** (answering `adler32(adler, bytes)` folded twice),
-//! while a raw stream's answer is `beam_deflate::adler32(0, &bytes)` (`135791189` for
-//! `<<"abcdef">>`, where `erlang:adler32/1` answers `136184406`).
+mod deflate;
+mod inflate;
+mod lifecycle;
+mod pump;
 
-#![allow(dead_code)]
+pub(crate) use pump::Outcome;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -473,6 +466,17 @@ pub(crate) fn is_nif_key(function: &str, arity: usize) -> bool {
     NIF_KEYS
         .iter()
         .any(|&(name, key_arity)| name == function && key_arity as usize == arity)
+}
+
+/// Installs the 19 `zlib` NIF keys ([`NIF_KEYS`]) into `reg`.
+///
+/// Three submodules own the bodies: [`lifecycle`] 7 (`open`/`close`/`set_controller`/
+/// `enqueue` and the three stash keys), [`deflate`] 6 and [`inflate`] 6 — 19 in total,
+/// exactly the `-nifs([...])` list `zlib.erl:100-106` declares.
+pub(crate) fn register(reg: &mut crate::registry::BifRegistry) {
+    lifecycle::register(reg);
+    deflate::register(reg);
+    inflate::register(reg);
 }
 
 #[cfg(test)]

@@ -152,6 +152,7 @@
 //! reaches its `erlang:nif_error(undef)` stub and is `undef`.
 
 mod one_shot;
+mod stream;
 
 use crate::registry::BifRegistry;
 
@@ -160,6 +161,14 @@ use crate::registry::BifRegistry;
 /// Every key is a `zlib.erl` function, not a `bif.tab` NIF, so the six are stdlib fast
 /// paths — registered here the way `erlang:memory/0,1` is. The stream surface has no
 /// registered key: `zlib.erl` reaches it through its own non-exported NIF stubs.
+/// Whether `Module:Function/Arity` is one of the `zlib` BIF-surface keys this crate
+/// serves — the six convenience functions plus the 19 stream keys.
+///
+/// The local-call predicate a host consults before entering compiled code.
+pub fn serves_local_call(module: &str, function: &str, arity: usize) -> bool {
+    module == "zlib" && stream::is_nif_key(function, arity)
+}
+
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("zlib", "compress", 1, one_shot::compress_1);
     reg.register("zlib", "uncompress", 1, one_shot::uncompress_1);
