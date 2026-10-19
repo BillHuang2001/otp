@@ -711,6 +711,15 @@ fn print_census(
     println!("step_ext_per_call = {:.2}", per_call(snapshot.step_ext));
     println!("driver_round_trips_per_call = {:.2}", per_call(snapshot.driver_round_trips));
     println!("driver_interp_steps_per_call = {:.2}", per_call(snapshot.driver_interp_steps));
+    // The in-block call/return link path: a frame-preserving local `call` the block tail-jumped
+    // into a natively compiled callee (a driver round-trip the tier did **not** pay), and the
+    // declines that paid the pre-existing round-trip anyway. They explain the
+    // `driver_round_trips_per_call` figure beside them.
+    println!("in_block_calls_per_call = {:.2}", per_call(snapshot.in_block_calls));
+    println!(
+        "in_block_call_declines_per_call = {:.2}",
+        per_call(snapshot.in_block_call_declines)
+    );
     println!("block_entry_lookups = {}", snapshot.block_entry_lookups);
     println!("block_entry_hits = {}", snapshot.block_entry_hits);
     println!("block_entry_misses = {block_entry_misses}");
@@ -731,6 +740,14 @@ fn print_census(
         println!(
             "driver_interp_steps_per_{label} = {:.4}",
             per_call(snapshot.driver_interp_steps) / units
+        );
+        println!(
+            "in_block_calls_per_{label} = {:.4}",
+            per_call(snapshot.in_block_calls) / units
+        );
+        println!(
+            "in_block_call_declines_per_{label} = {:.4}",
+            per_call(snapshot.in_block_call_declines) / units
         );
         println!(
             "block_entry_lookups_per_{label} = {:.4}",

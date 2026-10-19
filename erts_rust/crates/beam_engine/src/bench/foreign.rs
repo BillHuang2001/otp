@@ -53,19 +53,19 @@
 //!
 //! # What each case needs from the host
 //!
-//! * `to_lower`, `capitalize_token` and `decode` are **BIF-free** Erlang in principle: a binary
-//!   comprehension/append plus a `select_val` character table.
+//! * `to_lower`, `capitalize_token` are **BIF-free** Erlang: a binary comprehension/append plus
+//!   a `select_val` character table.
 //! * `encode` is **not**: it calls `erlang:iolist_to_binary/1` once per four encoded characters
 //!   (3 static call sites; 4 calls for this 12-byte input), and the base62 character tables do
 //!   small-integer `+`/`-`. [`super::counting::CountingContext`]'s own floor serves exactly that
 //!   set, so the case reports a real `bif_calls` figure and its histogram instead of asserting
 //!   `bif_calls == 0`.
 //! * `decode` additionally needs `erlang:bit_size/1` — in a guard (`bit_size(Rest) >= 8`) and
-//!   for `bit_size(Acc) rem 8`, the latter over a **match context** (`t_bs_context` in
-//!   `erlc -S`'s output). A correct `bit_size` needs a raw-heap bit-size reader, and a
-//!   *half*-correct one would turn a guard failure into a silently wrong decode, so the floor
-//!   deliberately does not serve it: this case reports a **loud, named skip** rather than a
-//!   figure or a wrong result.
+//!   for `bit_size(Acc) rem 8`, the latter over the bitstring accumulator (which `erlc -S`
+//!   types as a `t_bs_context`). The floor serves it through the bitstring family's own
+//!   frozen-layout reader ([`crate::families::bitstrings::bit_size`]), which reads heap bits, an
+//!   off-heap refc window and a live match context exactly as C's `erts_bin_bits_size` does and
+//!   refuses a non-bitstring instead of substituting a size, so the case reports a real figure.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -167,8 +167,8 @@ static EMQX: Program = Program {
             function: "decode",
             input: b"ABCDEFGHIJKLMNO",
             expected: &[0, 16, 131, 16, 81, 135, 32, 146, 139, 48, 222],
-            // `bit_size/1`, which the harness' BIF floor deliberately does not model (see the
-            // module docs) -- so this case is expected to report a loud skip.
+            // `bit_size/1` (a guard and the accumulator's size, over a match context) plus the
+            // floor's small-int `rem`/`-` -- see the module docs.
             bif_free: false,
         },
     ],

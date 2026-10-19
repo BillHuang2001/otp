@@ -52,22 +52,24 @@
 //! Most workloads here are **BIF-free by construction** (`cowboy_bstr:to_lower/1`,
 //! `cowboy_bstr:capitalize_token/1`, the `list_walk` program, the bitstring fixtures), so the
 //! inner host's rejecting default hook is exactly right for them. Two real foreign functions
-//! are not: `emqx_base62:encode/1` calls `erlang:iolist_to_binary/1` once per encoded group, and
-//! the base62 charset functions do small-integer arithmetic. [`CountingContext::host_bif`]
-//! therefore serves that **closed, documented set** — `iolist_to_binary/1` plus the small-int
-//! `+ - * div rem abs` — and **every other BIF stays rejected** with the inner host's typed
-//! `unsupported_bif`.
+//! are not: `emqx_base62:encode/1` calls `erlang:iolist_to_binary/1` once per encoded group,
+//! `emqx_base62:decode/1` calls `erlang:bit_size/1` (in a guard and over its bitstring
+//! accumulator), and the base62 charset functions do small-integer arithmetic.
+//! [`CountingContext::host_bif`] therefore serves that **closed, documented set** —
+//! `iolist_to_binary/1`, `bit_size/1` plus the small-int `+ - * div rem abs` — and **every
+//! other BIF stays rejected** with the inner host's typed `unsupported_bif`.
 //!
-//! Two rules make that floor safe to trust:
+//! One rule makes that floor safe to trust: it **never guesses**. An operand that is not a
+//! small integer, an integer overflow, a non-`0..=255` byte, an improper list, a bitstring that
+//! is not byte-aligned, or a `bit_size` subject that is not a bitstring is a typed
+//! `BadArg`/`unsupported`, never a substituted value.
 //!
-//! * it **never guesses**: an operand that is not a small integer, an integer overflow, a
-//!   non-`0..=255` byte, an improper list or a bitstring that is not byte-aligned is a typed
-//!   `BadArg`/`unsupported`, never a substituted value;
-//! * it deliberately does **not** serve `erlang:bit_size/1`. A half-correct `bit_size` would
-//!   turn a *guard* failure into a silently wrong result (the engine folds a guard BIF's error
-//!   into a failed guard), and a correct one needs a raw-heap bit-size reader that this node
-//!   cannot reach — so the `emqx_base62:decode/1` case reports a loud skip instead (see
-//!   [`super::foreign`]).
+//! `bit_size/1` is the case that rule was written for, so it is served by the **bitstring
+//! family's own** frozen-layout reader ([`crate::families::bitstrings::bit_size`], C's
+//! `erts_bin_bits_size`: heap bits, an off-heap refc window and an `ErlSubBits` match context)
+//! rather than by a local re-derivation. A half-correct `bit_size` would turn a *guard* failure
+//! into a silently wrong result — the engine folds a guard BIF's error into a failed guard — so
+//! the reader is the family's and a non-bitstring is [`refuse`]d.
 //!
 //! The allocating BIF (`iolist_to_binary/1`) is served **here**, not by the inner host's
 //! `set_bif_hook`: a [`BifHook`](crate::context::BifHook) receives `(module, function, arity,
@@ -86,6 +88,7 @@ use beam_loader::{Label, Module};
 use beam_term::{is_small, make_small, signed_value, Atom, AtomTable, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::context::{ExecutionContext, MinimalContext, RootSet};
+use crate::families::bitstrings::bit_size;
 use crate::terms::{binary_bytes, list_elements, make_heap_binary};
 
 /// The deepest iolist nesting `erlang:iolist_to_binary/1`'s floor implementation will flatten.
@@ -285,10 +288,10 @@ impl CountingContext {
     /// models, `None` when the call belongs to the inner host (which rejects it).
     ///
     /// The served set is deliberately tiny and named in the module docs:
-    /// `erlang:iolist_to_binary/1` plus the small-int `erlang:'+'/2`, `'-'/2`, `'*'/2`,
-    /// `div/2`, `rem/2` and `abs/1`. Every other `(module, function, arity)` is `None`, so the
-    /// call keeps the inner host's typed `unsupported_bif` — a workload that needed it reports
-    /// a loud skip rather than a figure.
+    /// `erlang:iolist_to_binary/1`, `erlang:bit_size/1` plus the small-int `erlang:'+'/2`,
+    /// `'-'/2`, `'*'/2`, `div/2`, `rem/2` and `abs/1`. Every other `(module, function, arity)`
+    /// is `None`, so the call keeps the inner host's typed `unsupported_bif` — a workload that
+    /// needed it reports a loud skip rather than a figure.
     ///
     /// The floor **allocates through this context** ([`make_heap_binary`] →
     /// [`ExecutionContext::alloc_words`]), so its traffic is counted like the engine's own and
@@ -315,6 +318,7 @@ impl CountingContext {
                 Some(small_int_arith(function, args[0], args[1]))
             }
             ("abs", 1) => Some(small_int_abs(args[0])),
+            ("bit_size", 1) => Some(bit_size_of(args[0])),
             _ => None,
         }
     }
@@ -385,6 +389,31 @@ fn small_result(function: &str, value: i64) -> Result<Eterm> {
         )));
     }
     Ok(make_small(value))
+}
+
+/// `erlang:bit_size/1` over a bitstring **or** a live match context.
+///
+/// The size comes from the bitstring family's own frozen-layout reader
+/// ([`crate::families::bitstrings::bit_size`]) — heap bits and an off-heap refc window take
+/// their size, an `ErlSubBits` match context its remaining window, which is what C's
+/// `erts_bin_bits_size` (`erl_bits.h`) does for every `SUB_BITS` thing. A subject that is
+/// neither is [`refuse`]d (the real BIF raises `badarg`), and a size outside the small-integer
+/// range is [`refuse`]d rather than truncated, so nothing is ever coerced into a value.
+///
+/// This is what makes `emqx_base62:decode/1` measurable: it asks `bit_size/1` about a binary in
+/// a **guard** and about its bitstring accumulator, and a wrong size would silently change the
+/// decode rather than fail it.
+fn bit_size_of(subject: Eterm) -> Result<Eterm> {
+    let Some(bits) = bit_size(subject) else {
+        return Err(refuse(
+            "erlang:bit_size/1 was given something that is neither a bitstring nor a match \
+             context",
+        ));
+    };
+    let Ok(bits) = i64::try_from(bits) else {
+        return Err(refuse("erlang:bit_size/1 does not fit a small integer"));
+    };
+    small_result("bit_size", bits)
 }
 
 /// `erlang:'+'/2`, `'-'/2`, `'*'/2`, `div/2`, `rem/2` over two small integers.
