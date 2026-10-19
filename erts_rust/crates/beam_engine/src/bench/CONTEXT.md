@@ -28,7 +28,9 @@ It is absent from production builds: `../lib.rs` declares `#[cfg(test)] mod benc
   including the growth-shape probe over `Machine::refc_binaries()`.
 - Env knobs: `BENCH_ITERS`, `BENCH_BATCH`, `BENCH_WARMUP`, `BENCH_TIER` (`interpreter`|`baseline`|`both`);
   defaults are per workload (`bstr_to_lower`: 20 000 / 500 / 2 000; `long_append`: 50 / 5 / 5, because a
-  long-append call copies 64 KiB out).
+  long-append call copies 64 KiB out; `list_walk`: 100 / 10 / 10 with `BENCH_K = 20` walks per call,
+  because one call walks 20 000 elements; the foreign cases: 20 000 / 500 / 2 000). `BENCH_K` is the only
+  knob a single workload owns.
 
 ## How to run
 ```text
@@ -195,9 +197,19 @@ allocation — not dispatch, and not the append path.
   route. That is why the same file runs against `b52f403a30` for the A/B.
 
 ## Routing Table
-- `mod.rs` → the shared harness (`compile_fixture`, `Prepare`, `run_calls`, `measure`, `Measurement`,
-  the env knobs) + the `cowboy_bstr` fixture, its `#[ignore]`d entry point and `baseline_census` (the
+- `mod.rs` → the shared harness (`compile_fixture`/`compile_staged`, `Prepare`, `run_calls`, `measure`/`measure_result`,
+  `Measurement` + its `ResultSnapshot`, `instr_per_call`, the generic `ReportSpec`/`report_generic`), the
+  `cowboy_bstr` fixture, its `#[ignore]`d entry point and `baseline_census` (the
   per-thread `../jit/baseline/counters.rs` snapshot pass).
-- `counting.rs` → `CountingContext` (the delegating counting `ExecutionContext`).
+- `counting.rs` → `CountingContext` (the delegating counting `ExecutionContext`) plus the harness' own
+  **closed BIF floor** (`host_bif`): `erlang:iolist_to_binary/1` and small-int `+ - * div rem abs`, with
+  everything else left to the inner host's rejecting hook and a `floor_declines` counter the report asserts to 0.
 - `long_append.rs` → the growing-accumulator fixture, its `#[ignore]`d entry point, its report and the
   growth-shape probe (`Machine::refc_binaries()` → `capacity`/`reserved_bytes`/`growth_counters`).
+- `list_walk.rs` → the BIF-free per-element dispatch floor (the `tools/bench` `list_walk` program,
+  `LEN = 1000`), entry point `list_walk_decomposition`; reports the whole call normalised per element **and**
+  the paired, build-cancelled marginal (`walk(K)` − `walk(0)`) that lines up with the runtime's own figure.
+- `foreign.rs` → the four real foreign cases staged from the read-only checkouts
+  (`cowboy_bstr:to_lower/1`, `cowboy_bstr:capitalize_token/1`, `emqx_base62:encode/1`,
+  `emqx_base62:decode/1`), entry points `foreign_cowboy_bstr_decomposition` and
+  `foreign_emqx_base62_decomposition`; one loaded artifact per module serves its cases.

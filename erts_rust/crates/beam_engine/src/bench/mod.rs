@@ -62,18 +62,36 @@
 //! rather than a build that fits the hint. Both workloads share this module's batch loop
 //! ([`run_calls`]), [`measure`] and [`Measurement`]; the fixture-specific parts live in the
 //! sibling file.
+//!
+//! Two more workloads attribute the engine's per-call cost at the **same `N`** from inside the
+//! crate, so the runtime's own per-workload figures can be decomposed without its CLI boot:
+//!
+//! * [`list_walk::list_walk_decomposition`] — the BIF-free per-element dispatch floor
+//!   (`erts_rust/tools/bench`'s `list_walk` program, verbatim), reported **per element** with a
+//!   paired, build-cancelled marginal (`walk(K)` minus `walk(0)`).
+//! * [`foreign::foreign_cowboy_bstr_decomposition`] and
+//!   [`foreign::foreign_emqx_base62_decomposition`] — real functions compiled from the
+//!   **read-only foreign checkouts** (`cowboy_bstr:to_lower/1`, `cowboy_bstr:capitalize_token/1`,
+//!   `emqx_base62:encode/1`, `emqx_base62:decode/1`), each with one fixed input and one verified
+//!   expected result.
+//!
+//! Every workload supplies its own correctness predicate and its own per-unit label through
+//! [`ReportSpec`]; [`report_generic`] is the single report formatter, so the key set is identical
+//! across workloads and the per-case `workload = …` line names what was measured.
 
 mod counting;
+mod foreign;
+mod list_walk;
 mod long_append;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use beam_loader::{load_file, Module};
-use beam_term::{Atom, Eterm, NIL};
+use beam_term::{is_small, signed_value, Atom, Eterm, NIL};
 
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
@@ -186,7 +204,7 @@ fn foreign_bstr_to_lower_decomposition() {
             *tier,
             measure(
                 &module,
-                entry_atom(&module),
+                atom_named(&module, ENTRY),
                 *tier,
                 iters,
                 batch,
@@ -196,34 +214,21 @@ fn foreign_bstr_to_lower_decomposition() {
         ));
     }
     // The instruction count is a property of the code, not of the tier (see the header note).
-    let instr_per_call = match measurements
+    let entry = atom_named(&module, ENTRY);
+    let interpreter = measurements
         .iter()
         .find(|(tier, _)| *tier == Tier::Interpreter)
-    {
-        Some((_, measurement)) => {
-            measurement.counters.instructions as f64 / measurement.iters.max(1) as f64
-        }
-        None => {
-            if tiers.contains(&Tier::BaselineJit) {
-                println!(
-                    "note = the instruction count came from a short interpreter counting pass \
-                     (BENCH_TIER did not select the interpreter)"
-                );
-            }
-            let (instructions, calls) =
-                interpreter_instruction_count(&module, batch, &bstr_input);
-            instructions as f64 / calls as f64
-        }
-    };
+        .map(|(_, measurement)| measurement);
+    let per_call_instr = instr_per_call(interpreter, &module, entry, batch, &bstr_input);
 
     for (tier, measurement) in &measurements {
-        report(measurement, *tier, instr_per_call);
+        report(measurement, *tier, per_call_instr);
     }
     if let [(_, first), (_, second)] = measurements.as_slice() {
-        assert_tiers_agree(first, second);
+        assert_tiers_agree(first, second, &format!("{MODULE}:{ENTRY}/1"));
     }
     if tiers.contains(&Tier::BaselineJit) {
-        baseline_census(&beam, iters, batch);
+        baseline_census(&beam, ENTRY, iters, batch, &bstr_input);
     }
 }
 
@@ -238,11 +243,45 @@ struct Measurement {
     /// Off-heap payloads the phase's machines were holding at their last call.
     refc_payloads: u64,
     /// The last measured call's raw result.
+    ///
+    /// Kept for the workloads that still key their own report off it
+    /// ([`long_append`](long_append)); the generic report uses [`Measurement::snapshot`],
+    /// because a term is only guaranteed readable while the host that built it is alive.
     result: Eterm,
+    /// The last measured call's result, **copied out while the host was still alive**.
+    ///
+    /// `measure` captures this at the end of the phase, before the batch's [`CountingContext`]
+    /// (and with it the region heap every term of that batch lives on) is dropped, so the
+    /// generic report's correctness predicate never reads a retired heap.
+    snapshot: ResultSnapshot,
 }
 
-impl Measurement {
-    /// The fastest sub-run (the robust statistic under additive background load).
+/// What a measured call returned, copied out while its host was alive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResultSnapshot {
+    /// The result was a binary: its bytes.
+    Binary(Vec<u8>),
+    /// The result was a small integer: its value.
+    Small(i64),
+    /// The result is neither of the above (an atom, a tuple, a refc binary, …): its bytes, if it
+    /// even has any, are not part of this harness' contract.
+    Opaque,
+}
+
+impl ResultSnapshot {
+    /// Snapshot `term`; call this while the host that built it is still alive.
+    fn of(term: Eterm) -> ResultSnapshot {
+        if is_small(term) {
+            return ResultSnapshot::Small(signed_value(term));
+        }
+        match binary_bytes(term) {
+            Ok(bytes) => ResultSnapshot::Binary(bytes.to_vec()),
+            Err(_) => ResultSnapshot::Opaque,
+        }
+    }
+}
+
+impl Measurement {    /// The fastest sub-run (the robust statistic under additive background load).
     fn min(&self) -> f64 {
         self.samples.iter().copied().fold(f64::INFINITY, f64::min)
     }
@@ -267,6 +306,10 @@ fn measured_calls(iters: usize) -> usize {
 }
 
 /// Run the untimed warmup and the measured phase of one tier.
+///
+/// Panics on a workload error: the fixtures in this harness are expected to run. A workload
+/// whose *capability* is host-dependent (the foreign cases, whose BIF traffic a minimal host
+/// may not be able to serve) uses [`measure_result`] and reports a loud skip instead.
 fn measure(
     module: &Arc<Module>,
     entry: Atom,
@@ -276,10 +319,26 @@ fn measure(
     warmup: usize,
     prepare: Prepare<'_>,
 ) -> Measurement {
+    measure_result(module, entry, tier, iters, batch, warmup, prepare)
+        .unwrap_or_else(|error| panic!("measure on {}: {error:?}", tier.name()))
+}
+
+/// [`measure`], but a workload error (rather than a panic) is reported to the caller.
+///
+/// The error surfaces from the **warmup** pass first, which is the point: a fixture the host
+/// cannot serve never reaches the timed phase, so no figure is ever reported for it.
+fn measure_result(
+    module: &Arc<Module>,
+    entry: Atom,
+    tier: Tier,
+    iters: usize,
+    batch: usize,
+    warmup: usize,
+    prepare: Prepare<'_>,
+) -> beam_common::Result<Measurement> {
     // Warmup runs on its own context, so none of its traffic lands in the phase's counters.
     let mut warm = CountingContext::new(Arc::clone(module));
-    run_calls(module, entry, tier, warmup, batch, &mut warm, prepare)
-        .unwrap_or_else(|error| panic!("warmup on {}: {error:?}", tier.name()));
+    run_calls(module, entry, tier, warmup, batch, &mut warm, prepare)?;
     drop(warm);
 
     let per_run = measured_calls(iters);
@@ -288,19 +347,22 @@ fn measure(
     let mut refc_payloads = 0u64;
     let mut result = NIL;
     for _ in 0..SUB_RUNS {
-        let phase = run_calls(module, entry, tier, per_run, batch, &mut ctx, prepare)
-            .unwrap_or_else(|error| panic!("measure on {}: {error:?}", tier.name()));
+        let phase = run_calls(module, entry, tier, per_run, batch, &mut ctx, prepare)?;
         samples.push(ns_per_call(phase.elapsed, per_run));
         refc_payloads += phase.refc_payloads;
         result = phase.result;
     }
-    Measurement {
+    // The result term lives on the last batch's host heap, which is dropped when `ctx` is; take
+    // the copy now (see `Measurement::snapshot`).
+    let snapshot = ResultSnapshot::of(result);
+    Ok(Measurement {
         iters: per_run * SUB_RUNS,
         samples,
         counters: ctx.counters,
         refc_payloads,
         result,
-    }
+        snapshot,
+    })
 }
 
 /// What one [`run_calls`] phase produced.
@@ -386,27 +448,112 @@ fn run_calls(
 /// The interpreter's instruction count over `calls` calls (for `BENCH_TIER=baseline`).
 fn interpreter_instruction_count(
     module: &Arc<Module>,
+    entry: Atom,
     calls: usize,
     prepare: Prepare<'_>,
 ) -> (u64, usize) {
-    let entry = entry_atom(module);
     let mut ctx = CountingContext::new(Arc::clone(module));
     run_calls(module, entry, Tier::Interpreter, calls, calls, &mut ctx, prepare)
         .expect("the interpreter counting pass");
     (ctx.counters.instructions, calls.max(1))
 }
 
-/// Print one tier's `key = value` table.
+/// The per-call **interpreter** instruction count for one prepared argument.
+///
+/// The count is a property of the code, not of the tier (the native tier offers the same
+/// reduction hook once per driver-loop iteration, not once per instruction), so a run that
+/// selected only the baseline tier takes a short interpreter-only counting pass instead.
+fn instr_per_call(
+    measurement: Option<&Measurement>,
+    module: &Arc<Module>,
+    entry: Atom,
+    batch: usize,
+    prepare: Prepare<'_>,
+) -> f64 {
+    match measurement {
+        Some(measurement) => {
+            measurement.counters.instructions as f64 / measurement.iters.max(1) as f64
+        }
+        None => {
+            println!(
+                "note = the instruction count came from a short interpreter counting pass \
+                 (BENCH_TIER did not select the interpreter)"
+            );
+            let (instructions, calls) = interpreter_instruction_count(module, entry, batch, prepare);
+            instructions as f64 / calls as f64
+        }
+    }
+}
+
+/// One workload's report labelling: what was measured, at which granularity, and what the
+/// result must be.
+///
+/// Every reported block keeps the same key set; a workload only chooses its `workload = …`
+/// line, whether it also reports **per unit** (per element, say) and how its result is checked.
+struct ReportSpec<'a> {
+    /// The `workload = …` line: what this block measured.
+    workload: &'a str,
+    /// The per-unit normalisation, when the workload has a natural unit smaller than a call.
+    unit: Option<Unit>,
+    /// The correctness predicate over the measurement's captured result.
+    expect: &'a dyn Fn(&Measurement) -> bool,
+    /// What the predicate expects, for the assertion message.
+    expected: String,
+    /// `true` when the workload must dispatch **no** BIF at all (a BIF-free program).
+    bif_free: bool,
+}
+
+/// A workload's per-unit normalisation: `per_call` units are performed by one call.
+struct Unit {
+    /// The unit's name, used in the `*_per_<label>` keys (`element`, …).
+    label: &'static str,
+    /// How many units one call performs.
+    per_call: f64,
+}
+
+/// Print one tier's `key = value` table (the `cowboy_bstr:to_lower/1` workload).
 fn report(measurement: &Measurement, tier: Tier, instr_per_call: f64) {
+    let expect = |measurement: &Measurement| {
+        measurement.snapshot == ResultSnapshot::Binary(EXPECTED.to_vec())
+    };
+    let spec = ReportSpec {
+        workload: "cowboy_bstr:to_lower/1",
+        unit: None,
+        expect: &expect,
+        expected: format!("{:?}", String::from_utf8_lossy(EXPECTED)),
+        bif_free: true,
+    };
+    report_generic(measurement, tier, instr_per_call, &spec);
+}
+
+/// Both tiers must produce the same result for the same input — the engine's tier-equivalence
+/// contract, here on a foreign module rather than a committed fixture.
+fn assert_tiers_agree(first: &Measurement, second: &Measurement, workload: &str) {
+    assert_eq!(
+        first.snapshot, second.snapshot,
+        "the two tiers disagree on {workload}"
+    );
+}
+
+/// Print one tier's `key = value` table for `spec`'s workload.
+fn report_generic(
+    measurement: &Measurement,
+    tier: Tier,
+    instr_per_call: f64,
+    spec: &ReportSpec<'_>,
+) {
     let calls = measurement.iters.max(1) as f64;
     let per_call = |count: u64| count as f64 / calls;
     let min = measurement.min();
+    let median = measurement.median();
     let counters = &measurement.counters;
+    let correct = (spec.expect)(measurement);
     println!("---");
+    println!("workload = {}", spec.workload);
     println!("tier = {}", tier.name());
     println!("iters = {}", measurement.iters);
     println!("min_ns_per_call = {min:.1}");
-    println!("median_ns_per_call = {:.1}", measurement.median());
+    println!("median_ns_per_call = {median:.1}");
     println!("instr_per_call = {instr_per_call:.2}");
     println!(
         "ns_per_instruction = {:.2}",
@@ -426,8 +573,36 @@ fn report(measurement: &Measurement, tier: Tier, instr_per_call: f64) {
     println!("external_call_requests_per_call = {:.2}", per_call(counters.external_call_requests));
     println!("local_fun_requests_per_call = {:.2}", per_call(counters.local_fun_requests));
     println!("local_call_requests_per_call = {:.2}", per_call(counters.local_call_requests));
+    println!("bif_floor_declines_per_call = {:.2}", per_call(counters.floor_declines));
     println!("refc_payloads_per_call = {:.2}", per_call(measurement.refc_payloads));
-    println!("result_is_correct = {}", is_expected(measurement.result));
+    println!("result_is_correct = {correct}");
+    if let Some(unit) = &spec.unit {
+        let units = unit.per_call.max(1.0);
+        let label = unit.label;
+        println!("{label}s_per_call = {units:.0}");
+        println!("ns_per_{label} = {:.2}", min / units);
+        println!("median_ns_per_{label} = {:.2}", median / units);
+        println!("instr_per_{label} = {:.3}", instr_per_call / units);
+        println!("rooted_calls_per_{label} = {:.4}", per_call(counters.rooted_calls) / units);
+        println!("rooted_words_per_{label} = {:.4}", per_call(counters.rooted_words) / units);
+        println!(
+            "heap_door_calls_per_{label} = {:.4}",
+            per_call(counters.heap_calls) / units
+        );
+        println!("bif_calls_per_{label} = {:.4}", per_call(counters.bif_calls) / units);
+        println!(
+            "local_call_requests_per_{label} = {:.4}",
+            per_call(counters.local_call_requests) / units
+        );
+        println!(
+            "note = those per-{label} figures divide the WHOLE call by {units:.0} {label}s, so \
+             a per-call setup cost is"
+        );
+        println!(
+            "note = included; the marginal block (a paired K-call pass minus a 0-call pass) is \
+             the build-cancelled figure."
+        );
+    }
     let histogram = ranked(&counters.bif_histogram, TOP_BIFS);
     let empty = histogram.is_empty();
     for (name, count) in histogram {
@@ -438,36 +613,32 @@ fn report(measurement: &Measurement, tier: Tier, instr_per_call: f64) {
     }
 
     assert!(
-        is_expected(measurement.result),
-        "{} returned {:?}, not {:?}",
+        correct,
+        "{} on {} returned {:?}, not {}",
+        spec.workload,
         tier.name(),
-        measurement.result,
-        String::from_utf8_lossy(EXPECTED)
+        measurement.snapshot,
+        spec.expected
     );
-    if counters.bif_calls > 0 {
-        println!(
-            "surprise: {} dispatched {} BIF call(s) -- this workload is expected to be \
-             engine-only (see the histogram above)",
-            tier.name(),
-            counters.bif_calls
+    if spec.bif_free {
+        assert_eq!(
+            counters.bif_calls, 0,
+            "{} dispatched BIF call(s) on {} -- this workload is BIF-free by construction (see \
+             the histogram above)",
+            counters.bif_calls,
+            tier.name()
         );
     }
-}
-
-/// Whether `result` is the byte-identical [`EXPECTED`] binary.
-fn is_expected(result: Eterm) -> bool {
-    binary_bytes(result)
-        .map(|bytes| bytes == EXPECTED)
-        .unwrap_or(false)
-}
-
-/// Both tiers must produce the same term for the same input — the engine's tier-equivalence
-/// contract, here on a foreign module rather than a committed fixture.
-fn assert_tiers_agree(first: &Measurement, second: &Measurement) {
+    // A decline means the harness' own BIF floor recognised a call and refused its operands, so
+    // the figure above was produced with a member of that set unavailable: the correctness
+    // predicate may not have noticed (a guard failure can change a branch without changing the
+    // shape of the answer), so it is asserted here too.
     assert_eq!(
-        binary_bytes(first.result).ok(),
-        binary_bytes(second.result).ok(),
-        "the two tiers disagree on {MODULE}:{ENTRY}/1"
+        counters.floor_declines, 0,
+        "the harness' BIF floor declined {} call(s) on {} -- the figures above are not reportable \
+         (see bif_histogram and the module docs of `counting`)",
+        counters.floor_declines,
+        tier.name()
     );
 }
 
@@ -481,13 +652,19 @@ fn assert_tiers_agree(first: &Measurement, second: &Measurement) {
 /// half the cache key, so this pass compiles the module again with recording on and the
 /// census is complete; and because the counters are reset immediately before it, every figure
 /// below belongs to this pass alone.
-fn baseline_census(beam: &Path, iters: usize, batch: usize) {
+fn baseline_census(
+    beam: &Path,
+    entry_name: &str,
+    iters: usize,
+    batch: usize,
+    prepare: Prepare<'_>,
+) {
     use crate::jit::baseline::counters;
 
     let module = Arc::new(
         load_file(beam).unwrap_or_else(|error| panic!("reload {}: {error:?}", beam.display())),
     );
-    let entry = entry_atom(&module);
+    let entry = atom_named(&module, entry_name);
     let mut ctx = CountingContext::new(Arc::clone(&module));
     counters::set_enabled(true);
     counters::reset();
@@ -498,7 +675,7 @@ fn baseline_census(beam: &Path, iters: usize, batch: usize) {
         iters,
         batch,
         &mut ctx,
-        &bstr_input,
+        prepare,
     )
     .expect("the baseline census pass");
     counters::set_enabled(false);
@@ -560,12 +737,13 @@ fn ns_per_call(elapsed: Duration, calls: usize) -> f64 {
     elapsed.as_secs_f64() * 1e9 / calls.max(1) as f64
 }
 
-/// The exported function's atom.
-fn entry_atom(module: &Module) -> Atom {
+/// The atom of the export `name` in `module`; a module that does not export it is a panic,
+/// because every workload names an export its own fixture (or its staged foreign source) has.
+fn atom_named(module: &Module, name: &str) -> Atom {
     module
         .atom_table
-        .lookup(ENTRY)
-        .unwrap_or_else(|| panic!("the fixture exports {ENTRY:?}"))
+        .lookup(name)
+        .unwrap_or_else(|| panic!("the loaded module exports {name:?}"))
 }
 
 /// `usize` env knob; an unset, unparsable or zero value falls back to `default`.
@@ -596,17 +774,45 @@ fn selected_tiers() -> Vec<Tier> {
 /// `tag` only distinguishes one workload's temp directory from another's.
 /// `Err` means "skip": no spawnable `erlc`, or an `erlc` that refused the (valid) source — the
 /// caller prints the reason and returns, which is this crate's skip-loudly convention.
-fn compile_fixture(module: &str, source: &str, tag: &str) -> Result<std::path::PathBuf, String> {
+fn compile_fixture(module: &str, source: &str, tag: &str) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join(format!("beam_engine_bench_{tag}_{}", std::process::id()));
     let path = dir.join(format!("{module}.erl"));
     std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     std::fs::write(&path, source)
         .map_err(|error| format!("write {}: {error}", path.display()))?;
+    run_erlc(&dir, &path)?;
+    Ok(dir.join(format!("{module}.beam")))
+}
+
+/// Compile a module **staged from an existing source file** (the read-only foreign checkouts)
+/// into a unique temp directory with the system `erlc`.
+///
+/// The [`compile_fixture`] sibling: the source is *copied*, never rewritten or embedded, so the
+/// workload measures exactly the foreign project's own code. `Err` means "skip", with the same
+/// two causes (no spawnable `erlc`, or an `erlc` that refused the source).
+fn compile_staged(module: &str, source: &Path, tag: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("beam_engine_bench_{tag}_{}", std::process::id()));
+    let path = dir.join(format!("{module}.erl"));
+    std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    std::fs::copy(source, &path).map_err(|error| {
+        format!(
+            "copy {} -> {}: {error}",
+            source.display(),
+            path.display()
+        )
+    })?;
+    run_erlc(&dir, &path)?;
+    Ok(dir.join(format!("{module}.beam")))
+}
+
+/// Run `erlc +deterministic -o dir path`; the shared compile step of [`compile_fixture`] and
+/// [`compile_staged`].
+fn run_erlc(dir: &Path, path: &Path) -> Result<(), String> {
     let output = Command::new("erlc")
         .arg("+deterministic")
         .arg("-o")
-        .arg(&dir)
-        .arg(&path)
+        .arg(dir)
+        .arg(path)
         .output()
         .map_err(|error| format!("no usable `erlc` on PATH ({error})"))?;
     if !output.status.success() {
@@ -617,5 +823,5 @@ fn compile_fixture(module: &str, source: &str, tag: &str) -> Result<std::path::P
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(dir.join(format!("{module}.beam")))
+    Ok(())
 }
