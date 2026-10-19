@@ -93,8 +93,8 @@ use beam_codec::{
     VERSION_MAGIC,
 };
 use beam_term::prelude::{
-    atom_val, is_atom, is_list, is_nil, is_small, make_small, signed_value, Atom, AtomTable, Eterm,
-    NIL,
+    atom_val, is_atom, is_list, is_nil, is_small, make_atom, make_small, signed_value, Atom,
+    AtomTable, Eterm, NIL,
 };
 
 // ---------------------------------------------------------------------------
@@ -194,10 +194,14 @@ const LARGE_TUPLE_256: &[u8] = &[131, 105, 0, 0, 1, 0, 97, 1, 97, 2, 97, 3, 97, 
 /// uncompressed `term_to_binary(lists:duplicate(500, hello))` image with its version
 /// byte removed (`zlib:uncompress/1` over the stream yields exactly `inner[1..]`).
 ///
-/// The zlib bytes are **zlib's** output. `flate2`/`miniz_oxide` would produce a
-/// different — equally valid — deflate stream for the same input, so this vector
-/// pins the **decoder** and the inner body, not our compressor's byte output (that is
-/// covered by the round-trip tests in `roundtrip.rs`).
+/// This vector is **both** the decoder golden and the **encoder** golden: the deflate
+/// stream is the workspace's safe-Rust port of zlib 1.3.2 (`beam_deflate`) — the same
+/// zlib version the oracle links, so the same bytes — and our own
+/// `encode_term_compressed(term, atoms, 6)` reproduces every byte below. The wrapper
+/// rule is the C's (`external.c:2276-2298`): `body` is the plain image length minus its
+/// version byte (the `0x00000DB2` size field above), `Z` is the zlib stream length over
+/// exactly those bytes, and the wrapper is emitted iff `Z <= body - 5` — equality lands
+/// on the `COMPRESSED` side, and `level == 0` never compresses.
 const COMPRESSED_DUP_500_HELLO: &[u8] = &[
     131, 80, 0, 0, 13, 178, 120, 156, 237, 197, 177, 9, 0, 32, 16, 4, 176, 183, 112, 84, 65, 228,
     192, 210, 197, 29, 192, 53, 44, 146, 38, 169, 106, 247, 244, 57, 146, 45, 73, 146, 36, 73,
@@ -691,16 +695,50 @@ fn seed_compressed_image_decodes_and_its_inner_body_matches() {
     }
 
     // The inner body — the zlib stream, decompressed — is byte-identical to our own
-    // uncompressed encoding of the same term. This pins the term layer even though
-    // the zlib bytes themselves are implementation-defined.
+    // uncompressed encoding of the same term, and its length is the wrapper's declared
+    // size field: `body` is the plain image (VERSION_MAGIC included) minus that one byte.
     let inner = decompress(&COMPRESSED_DUP_500_HELLO[6..]).expect("the stream is valid zlib");
     assert_eq!(inner.len(), 3506, "the declared inner size");
     assert_eq!(encode_term_body(term, &atoms).unwrap(), inner);
+    let plain = encode_term(term, &atoms).expect("plain encode");
+    let declared = u32::from_be_bytes([
+        COMPRESSED_DUP_500_HELLO[2],
+        COMPRESSED_DUP_500_HELLO[3],
+        COMPRESSED_DUP_500_HELLO[4],
+        COMPRESSED_DUP_500_HELLO[5],
+    ]);
+    assert_eq!(
+        declared,
+        u32::try_from(plain.len() - 1).expect("the plain image fits a u32"),
+        "the declared inner size must be the plain image length minus VERSION_MAGIC"
+    );
 
-    // Re-compressing produces a well-formed wrapper whose inner body is the same.
+    // **The encoder golden.** The deflate stream is the workspace's zlib-1.3.2 port's
+    // output, so re-compressing the decoded term reproduces the oracle image byte for
+    // byte — the wrapper's inner body and its whole zlib stream included.
     let image = encode_term_compressed(term, &atoms, 6).unwrap();
     assert_eq!(image[0], VERSION_MAGIC);
     assert_eq!(image[1], COMPRESSED_EXT);
+    assert_eq!(
+        image, COMPRESSED_DUP_500_HELLO,
+        "re-compressing the decoded term must reproduce the oracle bytes exactly"
+    );
+
+    // The same term built directly on a heap — `lists:duplicate(500, hello)`, no decoder
+    // involvement — encodes to those same bytes too (`tests/compressed_used.rs`'s idiom).
+    let mut src = Heap::new(4096).expect("a 4096-word heap holds 500 cons cells");
+    let hello = make_atom(atoms.intern("hello"));
+    let mut acc = NIL;
+    for _ in 0..500 {
+        acc = src.cons(hello, acc).expect("heap sized for the list");
+    }
+    assert_eq!(
+        encode_term_compressed(acc, &atoms, 6).unwrap(),
+        COMPRESSED_DUP_500_HELLO,
+        "compressing a freshly built `lists:duplicate(500, hello)` must reproduce the oracle bytes"
+    );
+
+    // And our image decodes to the same inner body.
     let mut heap2 = Heap::new(4096).expect("a 4096-word heap holds 500 cons cells");
     let mut atoms2 = AtomTable::new();
     let term2 = decode_term(&image, &mut heap2, &mut atoms2).expect("our image must decode");
