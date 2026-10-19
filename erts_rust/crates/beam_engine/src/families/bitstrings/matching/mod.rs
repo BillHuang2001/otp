@@ -104,6 +104,13 @@ pub(crate) use reads::{
     skip_utf, trailing_bytes_for_utf8,
 };
 /// Execute a bitstring **matching** instruction.
+///
+/// Kept out of line (`#[inline(never)]`) so the family entry
+/// [`super::exec`] stays small enough for the instruction router
+/// (`families::dispatch`) to keep inlining it: with this dispatcher inlined into
+/// the family entry, that entry grew past LLVM's inline budget and every
+/// bitstring instruction — `bs_match` included — started paying a call.
+#[inline(never)]
 pub(super) fn exec(
     machine: &mut Machine,
     module: &Module,
@@ -114,6 +121,41 @@ pub(super) fn exec(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
     let _ = (func, pc);
+    // Hot-variant pre-test. `bs_match` is the variant a compiled binary
+    // comprehension or match loop re-enters on **every** iteration (the compiler
+    // fuses a fixed-size field read into one `bs_match` command list), so it is
+    // tested before the 18-arm `match` below: that one costs the variant's
+    // discriminant decode plus a bounds check and an indirect `jmp` through a jump
+    // table on every call. A direct compare and a well-predicted branch replace it
+    // for the common case.
+    //
+    // The rest of the dispatch is **outlined** ([`exec_other`], `#[inline(never)]`)
+    // on purpose: without a call boundary LLVM merges the pre-test back into the
+    // very switch it is meant to avoid (it did, when this was one function), which
+    // leaves the jump table on the hot path. The remaining arms stay reachable and
+    // unchanged; only `bs_match`'s body moved here, so nothing is duplicated.
+    if let Instr::BsMatch {
+        fail,
+        ctx: ctx_op,
+        commands,
+    } = instr
+    {
+        return run_commands(machine, module, labels, *fail, ctx_op, commands, ctx);
+    }
+    exec_other(machine, module, labels, instr, ctx)
+}
+
+/// The non-`bs_match` half of [`exec`]'s dispatch: the other 17 matching variants.
+///
+/// Outlined so the hot pre-test in [`exec`] stays a compare-and-branch (see there).
+#[inline(never)]
+fn exec_other(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &LabelMap,
+    instr: &Instr,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
     match instr {
         Instr::BsStartMatch3 {
             fail,
@@ -330,11 +372,8 @@ pub(super) fn exec(
             raw::set_ctx_start(term, next);
             Ok(Some(Step::Next))
         }
-        Instr::BsMatch {
-            fail,
-            ctx: ctx_op,
-            commands,
-        } => run_commands(machine, module, labels, *fail, ctx_op, commands, ctx),
+        // `bs_match` is executed by the hot-variant pre-test at the top of this
+        // function, so it never reaches this `match` (the body lives there, once).
         // `bs_match_string Fail Ctx Bits Offset` — compare the next `Bits` bits of
         // the context against the `StrT` string at byte `Offset`
         // (`i_bs_match_string`, `bs_instrs.tab:1004`). The comparison succeeds only
