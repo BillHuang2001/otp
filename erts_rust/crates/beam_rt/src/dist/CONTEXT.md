@@ -121,6 +121,23 @@ A payload's own local identifiers go on the wire in their external form through 
 Remaining A.5 gaps, each typed — never a wrong value:
 * The distributed-spawn family — `DOP_SPAWN_REQUEST`/`DOP_SPAWN_REPLY` (`SpawnRequest`/`SpawnReply`) and `Delivery::Other(_)` — stays `Unsupported`, so `rpc:call/4,5` (which is `erpc`: a remote spawn plus a monitor) and `spawn(Node, M, F, A)` are capability gaps; the missing seam is a `beam_process` remote reservation API ([`../../HANDOFF.md`](../../HANDOFF.md)).
 * The ack-owing `UnlinkId` half (`id != 0`) stays `Unsupported`; `id == 0` is `Delivered`.
+  `DFLAG_UNLINK_ID` is in `DFLAG_DIST_MANDATORY_26`, so a real OTP peer negotiates it.
+* **No outbound `DOP_MONITOR_P_EXIT` is ever emitted.** `beam_process::DistSignal` has no
+  monitor-down variant, so a local process with incoming remote watchers is dropped silently at
+  `../../beam_process/src/ptab.rs:2483` — a peer's `erlang:monitor(process, RemotePid)` on one of
+  our processes never receives its `'DOWN'`, while the reverse direction (our record receiving the
+  peer's `DOP_MONITOR_P_EXIT`) works.
+* **`erlang:exit(RemotePid, Reason)` emits no bytes**: the runtime-native floor's `exit_target`
+  (`../native/process/exit.rs:139`) answers `true` for `PidTarget::Remote` without routing. The
+  entry point that would fix it already exists and is unused by the floor:
+  `ProcessTable::send_exit_term` (`../../beam_process/src/ptab.rs:3442`).
+* **An inbound `DOP_ALIAS_SEND` is effectively always `Unsupported`** on the real wire path (an
+  external wire reference cannot resolve through `MonitorRef::from_eterm`, `inbound.rs:456-464`),
+  not the routed arm the table above describes; the outbound `DOP_ALIAS_SEND` (which carries
+  `net_adm:ping/1`'s alias reply) is live.
+* `DFLAG_EXIT_PAYLOAD` **is** advertised (`dist/node.rs:572-574` via `DFLAG_DIST_DEFAULT`,
+  `../../beam_dist/src/flags.rs:239`), so the payload opcodes are accepted inbound, but this
+  runtime never emits one.
 * `erlang:monitor_node/3` (the `Info`-carrying form) is a typed `unsupported`.
 * `erlang:monitor(process, {Name, Node})` naming **another** node is a typed `unsupported` (`src/native/process/monitor.rs::named_node_target` resolves names on this node only), so a remote **name** monitor has no `DOWN`; a remote **pid** monitor works in both directions.
 * No Erlang-level distribution subtree runs on a `-sname`/`-name` node: the native floor answers `erl_distribution:start_link/0,1` with `ignore`, so `kernel_sup` skips `net_sup`. Measured on a `-sname` node `whereis(net_kernel)` is a live pid (this crate's service) while `whereis(net_sup)`/`whereis(auth)` are `undefined` here vs pids on the oracle; `whereis(kernel_sup)`/`whereis(application_controller)`/`whereis(logger)` are pids on both, `whereis(timer_server)` is `undefined` on both, and `node()`/`is_alive()` agree. Mechanism: `src/native/CONTEXT.md` *The Erlang-level distribution supervisor*.
