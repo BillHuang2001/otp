@@ -56,15 +56,22 @@
 //! DistSignal::Demonitor -> {DOP_DEMONITOR_P, Watcher(local), Watched(remote), Ref}    -> Dop::DemonitorP, &[watcher.to_eterm(), target_term, ref_term]  dist.c:1566
 //! DistSignal::Exit      -> {DOP_EXIT,        From(local), To(remote), Reason}        -> Dop::Exit,       &[from.to_eterm(),  target_term, reason]  dist.c:1747
 //! DistSignal::Exit2     -> {DOP_EXIT2,       From(local), To(remote), Reason}        -> Dop::Exit2,      &[from.to_eterm(),  target_term, reason]  dist.c:1800
+//! DistSignal::MonitorExit -> {DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref, Reason}
+//!                                                                    -> Dop::MonitorP,   &[watched.to_eterm(), watcher.to_eterm(), ref_term, reason]  dist.c:1497
 //! ```
 //!
 //! where `target_term` is the **target** [`RemotePid`] (the `To` of the link/unlink/exit
 //! family, the *watched* remote process/port of the monitor family) and `from`/`watcher` is
 //! the local sender, each materialised on the router's own scratch heap with
 //! [`RemotePid::to_eterm`]; `ref_term` is the [`MonitorRef`] materialised with
-//! [`MonitorRef::to_eterm`]. Two details a router must not get wrong: **the watcher comes
-//! first** in the monitor family (`TUPLE4(DOP_MONITOR_P, watcher, watched, ref)`,
-//! `dist.c:1543-1545`), and **`DOP_UNLINK_ID` carries a leading `Id`**
+//! [`MonitorRef::to_eterm`] — except for [`DistSignal::MonitorExit`], whose reference is the
+//! one the record carries ([`RemoteWatcherRef`]: either a local `MonitorRef` or the peer's
+//! own [`RemoteRef`], which must go back verbatim as the external reference the peer minted).
+//! Three details a router must not get wrong: **the watcher comes first** in the monitor
+//! family (`TUPLE4(DOP_MONITOR_P, watcher, watched, ref)`, `dist.c:1543-1545`), **the watched
+//! comes first** in the monitor-**exit** message
+//! (`TUPLE5(DOP_MONITOR_P_EXIT, watched, watcher, ref, reason)`, `dist.c:1497-1519` — the
+//! reverse of the monitor family), and **`DOP_UNLINK_ID` carries a leading `Id`**
 //! (`TUPLE4(DOP_UNLINK_ID, id, from, to)`, `dist.c:1472`) which [`DistSignal::Unlink`] does
 //! **not** carry — the router supplies it. (`DOP_UNLINK` = 4 is documented as *never sent*;
 //! modern ERTS unlinks by id, hence `Dop::UnlinkId`.) `DOP_EXIT` and `DOP_EXIT2` are distinct
@@ -73,6 +80,15 @@
 //! `erts_dsig_send_exit`, `dist.c:1747`) and `DOP_EXIT2` is a plain exit signal from
 //! `erlang:exit/2` ("`from` sent an exit signal to `to`" → `erts_dsig_send_exit2`,
 //! `dist.c:1800`), so the seam keeps them separate.
+//!
+//! [`DistSignal::MonitorExit`]'s **`DFLAG` gate is the transport's**, not this crate's: the C
+//! checks `DFLAG_DIST_MONITOR|DFLAG_DIST_MONITOR_NAME` on the *destination's* negotiated flags
+//! (and prefers the 4-tuple `DOP_PAYLOAD_MONITOR_P_EXIT` when it has `DFLAG_EXIT_PAYLOAD`,
+//! `dist.c:1504-1519`), which only the router knows — so `beam_process` emits one signal per
+//! recorded watcher unconditionally. A signal for a node no live link reaches is likewise the
+//! router's typed error (never a silent drop), and a caller inside the termination cascade
+//! treats that error as best-effort: the death is already complete, so the failure is
+//! logged ("dropped", ERTS's `erts_dsig_drop`) and the remaining watchers are still routed.
 //!
 //! [`DistSignalRouter::route`] must serialise the signal **synchronously**: `reason` may live
 //! in the signaller's heap, which the caller is free to drop or recycle as soon as `route`
@@ -364,10 +380,13 @@ pub enum RemoteWatcherRef {
 /// port — the mirror of [`RemoteMonitor`].
 ///
 /// It is the record an inbound `DOP_MONITOR_P` ({`DOP_MONITOR_P`, `Remote(watcher)`,
-/// `Local pid-or-name(watched)`, `Ref`}, `dist.c:2341`) installs, and an inbound
-/// `DOP_DEMONITOR_P` (`dist.c:2415`) removes. The record holds no term that can be relocated:
-/// [`RemotePid`] is a decomposed external pid, its [`RemoteWatcherRef`] is all-immediate (an
-/// internal [`MonitorRef`] or a decomposed [`RemoteRef`]), so it is not a GC root.
+/// `Local pid-or-name(watched)`, `Ref`}, `dist.c:2341`) installs, an inbound `DOP_DEMONITOR_P`
+/// (`dist.c:2415`) removes, and the watched process's death resolves by routing one
+/// [`DistSignal::MonitorExit`] per record (`DOP_MONITOR_P_EXIT`, the C's `erts_dsig_send_m_exit`)
+/// so the watcher's `{'DOWN', Ref, process, Watched, Reason}` is actually sent. The record holds
+/// no term that can be relocated: [`RemotePid`] is a decomposed external pid, its
+/// [`RemoteWatcherRef`] is all-immediate (an internal [`MonitorRef`] or a decomposed
+/// [`RemoteRef`]), so it is not a GC root.
 ///
 /// It lives in a side table on
 /// [`ProcessTable`](crate::ptab::ProcessTable) rather than in
@@ -448,6 +467,44 @@ pub enum DistSignal {
         /// The remote recipient.
         to: RemotePid,
         /// The exit reason term (may live in the signaller's heap — serialise it synchronously).
+        reason: Eterm,
+    },
+    /// A local process a remote node **watches** has died, so the watcher must be sent its
+    /// `{'DOWN', Ref, process, Watched, Reason}`
+    /// (`DOP_MONITOR_P_EXIT` → `{DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref,
+    /// Reason}` → the C's `erts_dsig_send_m_exit`, `dist.c:1497-1519`).
+    ///
+    /// This is the outbound mirror of an inbound `DOP_MONITOR_P`: the record an inbound monitor
+    /// installs ([`RemoteWatcher`]) is resolved here when its subject dies, exactly as the
+    /// outgoing record of a remote *monitor* is resolved by an inbound DOWN. The reference is
+    /// therefore carried in the spelling the table recorded ([`RemoteWatcherRef`]) — either a
+    /// locally minted [`MonitorRef`] or the peer-minted [`RemoteRef`] the peer's `DOP_MONITOR_P`
+    /// arrived with — because the peer matches its own `{'DOWN', …}` on the reference **it**
+    /// minted, and a lossy `u64` image does not exist for the latter.
+    ///
+    /// **The wire order is watched-first**: `TUPLE5(DOP_MONITOR_P_EXIT, watched, watcher, ref,
+    /// reason)` — the reverse of the monitor family's `{DOP_MONITOR_P, watcher, watched, ref}`
+    /// (`dist.c:1543`). A router that has `DFLAG_EXIT_PAYLOAD` on the peer link and prefers the
+    /// 4-tuple form (`DOP_PAYLOAD_MONITOR_P_EXIT`, `{op, watched, watcher, ref}` with the reason
+    /// as the message body, `dist.c:1509-1515`) supplies that decision; the `DFLAG_DIST_MONITOR`
+    /// support gate of `dist.c:1504-1508` is the transport's too — this crate emits one signal
+    /// per recorded watcher and knows nothing about negotiated flags.
+    ///
+    /// `reason` may live in the dying process's heap (it is the exit reason the cascading
+    /// [`ProcessTable::terminate_into`](crate::ptab::ProcessTable) was handed), so the router
+    /// **must** serialise it synchronously — the same contract [`DistSignal::Exit`] carries. A
+    /// node no live link reaches is the router's typed error, and the termination cascade treats
+    /// any router failure as best-effort: it drops-and-logs (ERTS's `erts_dsig_drop`) and routes
+    /// the remaining watchers, because the death has already happened.
+    MonitorExit {
+        /// The local process that died (the **watched** party, first on the wire).
+        watched: ProcessId,
+        /// The remote process that was monitoring it.
+        watcher: RemotePid,
+        /// The reference the peer's `{'DOWN', …}` must carry, in the spelling the table
+        /// recorded it.
+        reference: RemoteWatcherRef,
+        /// The exit reason term (may live in the dying heap — serialise it synchronously).
         reason: Eterm,
     },
 }
