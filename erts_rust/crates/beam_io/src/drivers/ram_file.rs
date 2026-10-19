@@ -618,3 +618,6 @@ fn read_i32(bytes: &[u8]) -> Result<i32> {
 #[cfg(test)]
 #[path = "ram_file_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "ram_file_split_tests.rs"]
+mod split_tests;
