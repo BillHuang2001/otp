@@ -52,6 +52,28 @@
 //! `RT_CTL_FOREIGN` points it at a buffer **inside the loaded object**, and `RT_CTL_NEGATIVE`
 //! returns `-1`.
 //!
+//! # The reply-**shape** verbs (`26`..`30`, `beam_io`'s own numbering)
+//!
+//! `write_port_control_result` (`io.c:4126-4175`) renders a reply from **two** facts, tested in
+//! this order: the driver's reply pointer (`if (!resp_bufp) return NIL;`, `io.c:4134`) and then the
+//! port's `PORT_CONTROL_FLAG_BINARY` word (`io.c:4136-4162` binary / `io.c:4163-4166` int list).
+//! Two of the four rows therefore produce **zero bytes** and are told apart by nothing but the
+//! shape, so the fixture drives them with the same opcode numbers `beam_io`'s own C-driver fixture
+//! uses (`crates/beam_io/tests/fixtures/host_driver.c:826-844`):
+//!
+//! | opcode | flag | `*rbuf` | `cres` | the C's answer |
+//! |---|---|---|---|---|
+//! | `26` | clear | `NULL` | 0 | `[]` (`io.c:4134`) |
+//! | `27` | clear | `NULL` | 5 | `[]` — the pointer test precedes any length use |
+//! | `28` | **set** | `NULL` | 0 | `[]`, **not** `<<>>` (`io.c:4134` before `:4136`) |
+//! | `29` | **set** | buffer kept | 0 | `<<>>` (`io.c:4136-4162`) |
+//! | `30` | clear | buffer kept | 0 | `[]` (`io.c:4163-4166`, `buf_to_intlist` of nothing) |
+//!
+//! `set_port_control_flags` (`io.c:5318`) needs the `ErlDrvPort` `start` is handed and the control
+//! callback never sees, so `start` stashes it in a file-static (`rt_port` in the fixture). The
+//! flag is per-port **state**, which is why every shape verb states it explicitly rather than
+//! relying on the row before it.
+//!
 //! A second build of the same source (`RT_CTL_HAS_CONTROL=0`) leaves the entry's `control` slot
 //! `NULL`, which is how the absent-slot `badarg` is discriminated.
 //!
@@ -74,10 +96,10 @@ use beam_term::AtomTable;
 
 use super::{DriverPort, DriverPortAdapter};
 
-/// The fixture: a driver whose `control` callback answers one of five verbs (see the module docs).
+/// The fixture: a driver whose `control` callback answers one of ten verbs (see the module docs).
 ///
-/// `start` only records the marker path, so the port has no descriptor and no timer — this suite
-/// is about the control path alone.
+/// `start` only stashes the port handle and (when it is handed one) records the marker path, so
+/// the port has no descriptor and no timer — this suite is about the control path alone.
 const CONTROL_C: &str = r#"
 #include <erl_driver.h>
 
@@ -92,6 +114,13 @@ const CONTROL_C: &str = r#"
 #define RT_CTL_NEGATIVE 3
 #define RT_CTL_NIL      4
 #define RT_CTL_FOREIGN  5
+/* The reply-shape verbs — `beam_io`'s own numbering for these exact shapes
+ * (`crates/beam_io/tests/fixtures/host_driver.c:826-844`). */
+#define RT_CTL_NULL_NO_FLAG        26
+#define RT_CTL_NULL_NO_FLAG_LENGTH 27
+#define RT_CTL_NULL_BINARY         28
+#define RT_CTL_EMPTY_BINARY        29
+#define RT_CTL_EMPTY_LIST          30
 
 #define RT_FIXED_REPLY   "CTL!"
 #define RT_FOREIGN_REPLY "FOREIGN"
@@ -100,19 +129,28 @@ const CONTROL_C: &str = r#"
  * buffer the runtime handed in nor through the request buffer. */
 static char rt_foreign[sizeof(RT_FOREIGN_REPLY)] = RT_FOREIGN_REPLY;
 
+/* The port handle `start` is handed. `set_port_control_flags` takes an `ErlDrvPort` and the
+ * control callback only ever sees the opaque `ErlDrvData`, so the handle is kept here. */
+static ErlDrvPort rt_port = NULL;
+
 /* The marker file, opened in `start` and appended to on every control call. */
 static FILE *rt_marker = NULL;
 
+/* Whether `path` ends in ".txt" — the marker paths this suite hands in do. A driver opened from
+ * an Erlang probe (the end-to-end suite) is handed its own **name** or object path instead, and
+ * `start` must not create a file beside it. */
+static int rt_is_marker_path(const char *path) {
+    size_t n = strlen(path);
+    return n > 4 && strcmp(path + n - 4, ".txt") == 0;
+}
+
 static ErlDrvData rt_start(ErlDrvPort port, char *command) {
-    char marker[RT_CTL_MARKER_MAX];
-    (void) port;
-    if (command == NULL)
-        return (ErlDrvData) -1;
-    if (sscanf(command, "%511s", marker) != 1)
-        return (ErlDrvData) -1;
-    rt_marker = fopen(marker, "w");
-    if (rt_marker == NULL)
-        return (ErlDrvData) -1;
+    rt_port = port;
+    /* A marker failure no longer fails `start`: the suites that care about the marker assert the
+     * lines it wrote (an unopened marker shows up there), and the end-to-end suite opens the same
+     * driver from an Erlang probe that passes no marker at all. */
+    if (command != NULL && rt_is_marker_path(command))
+        rt_marker = fopen(command, "w");
     return (ErlDrvData) 1;  /* any non-negative private state */
 }
 
@@ -151,11 +189,38 @@ static ErlDrvSSizeT rt_control(ErlDrvData drv_data, unsigned int cmd, char *buf,
         /* A reply from this object's own memory — the runtime cannot read it without raw access. */
         *rbuf = rt_foreign;
         return (ErlDrvSSizeT) (sizeof(RT_FOREIGN_REPLY) - 1);
+    case RT_CTL_NULL_NO_FLAG:
+        /* `NULL` reply pointer, flag clear, `cres == 0`: the C's `NIL` (`io.c:4134`). */
+        set_port_control_flags(rt_port, 0);
+        if (rbuf != NULL)
+            *rbuf = NULL;
+        return (ErlDrvSSizeT) 0;
+    case RT_CTL_NULL_NO_FLAG_LENGTH:
+        /* The same `NULL` pointer with a **non-zero** `cres`: still `NIL`, because the pointer
+         * test precedes any use of the length (`io.c:4134`). */
+        set_port_control_flags(rt_port, 0);
+        if (rbuf != NULL)
+            *rbuf = NULL;
+        return (ErlDrvSSizeT) 5;
+    case RT_CTL_NULL_BINARY:
+        /* `PORT_CONTROL_FLAG_BINARY` set **and** `*rbuf = NULL`: the empty list `[]`, never `<<>>`
+         * — the row a runtime that reads the flag alone gets wrong. */
+        set_port_control_flags(rt_port, PORT_CONTROL_FLAG_BINARY);
+        if (rbuf != NULL)
+            *rbuf = NULL;
+        return (ErlDrvSSizeT) 0;
+    case RT_CTL_EMPTY_BINARY:
+        /* `PORT_CONTROL_FLAG_BINARY` set, zero bytes, the caller's buffer kept: `<<>>`. */
+        set_port_control_flags(rt_port, PORT_CONTROL_FLAG_BINARY);
+        return (ErlDrvSSizeT) 0;
+    case RT_CTL_EMPTY_LIST:
+        /* Flag cleared, zero bytes, the caller's buffer kept: `[]` again. */
+        set_port_control_flags(rt_port, 0);
+        return (ErlDrvSSizeT) 0;
     default:
         return (ErlDrvSSizeT) -1;
     }
 }
-
 static ErlDrvEntry rt_control_entry = {
     .init = NULL,
     .start = rt_start,
@@ -511,6 +576,12 @@ fn a_negative_control_result_is_badarg() {
 
 /// A `NULL` reply pointer is the C's `NIL` (`io.c:4126`): an **empty reply**, not an error —
 /// which is what distinguishes it from the absent-slot and negative-result failures.
+///
+/// Re-derived: the bytes alone do not say *why* they are empty, so the test also pins the fact the
+/// renderer needs beside them — [`PortRegistry::control_reply_shape`] is
+/// [`ControlReplyShape::Null`](beam_io::ControlReplyShape::Null) for this reply, and `Null` is what
+/// makes `erlang:port_control/3` answer `[]` for **every** `PORT_CONTROL_FLAG_BINARY` setting
+/// (`io.c:4134`) instead of the `<<>>` a zero-byte *buffer* would become under that flag.
 #[test]
 fn a_null_reply_pointer_is_an_empty_reply_not_an_error() {
     let Some(fixture) = build_fixture("rt_control_nil", true) else {
@@ -522,11 +593,171 @@ fn a_null_reply_pointer_is_an_empty_reply_not_an_error() {
         .port_control(&mut poller, id, "4", b"")
         .expect("the C's NIL is an empty reply");
     assert!(reply.is_empty(), "no fabricated bytes: {reply:?}");
+    assert_eq!(
+        ports
+            .control_reply_shape(id)
+            .expect("the port is live, so its last reply is describable"),
+        beam_io::ControlReplyShape::Null,
+        "the driver left *rbuf NULL: the C tests that pointer first (`io.c:4134`)"
+    );
 
     ports.close(&mut poller, id).expect("the port closes");
     fixture.cleanup();
 }
 
+/// The **two zero-byte reply shapes** `write_port_control_result` keeps apart
+/// (`io.c:4126-4175`), driven through a real C driver: a `NULL` reply pointer and a zero-byte
+/// **buffer** both carry no bytes, so only the shape tells them apart — and the C renders the first
+/// as `[]` for **every** `PORT_CONTROL_FLAG_BINARY` setting (`io.c:4134`, the pointer test comes
+/// *before* the flag test at `io.c:4136`) while the second is `<<>>` under that flag
+/// (`io.c:4136-4162`) and `[]` without it (`io.c:4163-4166`, `buf_to_intlist` of nothing).
+///
+/// Every row is a distinct verb of the fixture, and every verb states the port's flag word
+/// explicitly (it is per-port state, `io.c:5318`). The rows, in drive order:
+///
+/// | verb | flag | `*rbuf` | `cres` | shape | the C's answer |
+/// |---|---|---|---|---|---|
+/// | `28` | set | `NULL` | 0 | `Null` | `[]` — the row a flag-only reading renders `<<>>` |
+/// | `29` | set | buffer | 0 | `Buffer` | `<<>>` |
+/// | `30` | clear | buffer | 0 | `Buffer` | `[]` |
+/// | `26` | clear | `NULL` | 0 | `Null` | `[]` |
+/// | `27` | clear | `NULL` | 5 | `Null` | `[]` — `cres` is irrelevant once the pointer is `NULL` |
+///
+/// Discriminates: an implementation that derived the shape from `cres == 0` (or from the bytes)
+/// would answer `Buffer` for verbs `28`, `26` and `27`, and one that never latched the pointer at
+/// all would answer `Buffer` for every row.
+#[test]
+fn the_reply_shape_separates_a_null_pointer_from_a_zero_byte_buffer() {
+    use beam_io::ControlReplyShape;
+
+    let Some(fixture) = build_fixture("rt_control_shape", true) else {
+        return;
+    };
+    let (mut poller, mut ports, id) = open_port(&fixture);
+
+    // Every row reports the shape (`PortRegistry::control_reply_shape`) beside its bytes; `flag`
+    // says whether the verb set `PORT_CONTROL_FLAG_BINARY` on the port (`io.c:5318`).
+    let row = |ports: &mut PortRegistry, poller: &mut Poller, verb: &str, flag: bool| {
+        let bytes = ports
+            .port_control(poller, id, verb, b"")
+            .unwrap_or_else(|error| panic!("verb {verb} must reach the driver: {error}"));
+        assert!(
+            bytes.is_empty(),
+            "verb {verb} answers a zero-length reply: {bytes:?}"
+        );
+        assert_eq!(
+            ports
+                .control_reply_shape(id)
+                .expect("the port is live, so its last reply is describable"),
+            if flag {
+                ControlReplyShape::Buffer
+            } else {
+                ControlReplyShape::Null
+            },
+            "verb {verb}: the reply pointer decides the shape (`io.c:4134`), never `cres` \
+             (both rows are zero bytes)"
+        );
+    };
+
+    // Row: `PORT_CONTROL_FLAG_BINARY` set + `*rbuf = NULL` ⇒ `[]`, never `<<>>` (`io.c:4134`
+    // precedes the flag test at `io.c:4136`).
+    row(&mut ports, &mut poller, "28", false);
+    // Row: the flag set + a zero-byte **buffer** ⇒ `<<>>` (`io.c:4136-4162`). The same zero bytes
+    // as verb 28 and the opposite shape.
+    row(&mut ports, &mut poller, "29", true);
+    // Row: the flag cleared + a zero-byte buffer ⇒ `[]` (`io.c:4163-4166`).
+    row(&mut ports, &mut poller, "30", true);
+    // Row: the flag clear + `NULL` ⇒ `[]` (`io.c:4134`), shape `Null` though the flag is off.
+    row(&mut ports, &mut poller, "26", false);
+    // Row: `NULL` with a non-zero `cres` ⇒ still `[]`: the pointer is tested before any length use.
+    row(&mut ports, &mut poller, "27", false);
+
+    assert_eq!(
+        fixture.marker_lines(),
+        vec![
+            "C:28:0".to_string(),
+            "C:29:0".to_string(),
+            "C:30:0".to_string(),
+            "C:26:0".to_string(),
+            "C:27:0".to_string(),
+        ],
+        "every verb reached the driver as the parsed integer, with an empty request"
+    );
+
+    ports.close(&mut poller, id).expect("the port closes");
+    fixture.cleanup();
+}
+
+/// The latched shape describes the **last successful** `control` call
+/// ([`DriverPortAdapter::control`] sets it only once `cres` was accepted, `io.c:4074`), so it
+/// follows the driver from row to row instead of latching on the first `NULL`.
+///
+/// Discriminates: a latch written only when the pointer is `NULL` (or only once) would answer
+/// `Null` for the second call below.
+#[test]
+fn the_reply_shape_follows_the_last_successful_control_call() {
+    use beam_io::ControlReplyShape;
+
+    let Some(fixture) = build_fixture("rt_control_shape_follow", true) else {
+        return;
+    };
+    let (mut poller, mut ports, id) = open_port(&fixture);
+    let shape = |ports: &PortRegistry| {
+        ports
+            .control_reply_shape(id)
+            .expect("the port is live, so its last reply is describable")
+    };
+
+    // A `NULL` reply (verb 28) latches `Null`...
+    assert!(ports
+        .port_control(&mut poller, id, "28", b"")
+        .expect("the driver answers")
+        .is_empty());
+    assert_eq!(shape(&ports), ControlReplyShape::Null);
+    // ...and the next call, which answers from a real buffer (verb 2), latches `Buffer` again.
+    assert_eq!(
+        ports
+            .port_control(&mut poller, id, "2", b"ignored")
+            .expect("the driver answers"),
+        b"CTL!"
+    );
+    assert_eq!(
+        shape(&ports),
+        ControlReplyShape::Buffer,
+        "the shape describes the last call, not the first NULL one"
+    );
+    // A call whose `cres` is **rejected** (`io.c:4074`, verb 3) does not re-latch: the shape still
+    // describes the last *successful* call (`io.c:4134` is only reached for an accepted reply).
+    assert!(matches!(
+        ports
+            .port_control(&mut poller, id, "3", b"")
+            .expect_err("a negative result is badarg"),
+        BeamError::BadArg
+    ));
+    assert_eq!(
+        shape(&ports),
+        ControlReplyShape::Buffer,
+        "a rejected call leaves the last successful call's shape in place"
+    );
+    // A buffer reply (verb 30) followed by a `NULL` one (verb 4) flips the shape back to `Null`.
+    assert!(ports
+        .port_control(&mut poller, id, "30", b"")
+        .expect("the driver answers")
+        .is_empty());
+    assert_eq!(shape(&ports), ControlReplyShape::Buffer);
+    assert!(ports
+        .port_control(&mut poller, id, "4", b"")
+        .expect("the driver answers")
+        .is_empty());
+    assert_eq!(
+        shape(&ports),
+        ControlReplyShape::Null,
+        "a NULL reply latches Null whatever the call before it answered"
+    );
+
+    ports.close(&mut poller, id).expect("the port closes");
+    fixture.cleanup();
+}
 /// A reply the driver answers from **its own** memory is the typed capability gap — never a
 /// fabricated or truncated reply.
 ///
