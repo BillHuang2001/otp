@@ -276,15 +276,6 @@ between sessions and up to 5× on a loaded one).
   parent `src/` node.**
 - **`src/exec_census.rs` is 2.12 % of `to_lower`'s self time while disabled** — the thread-local `bool`
   load sits on the per-instruction funnel. **OWNER: the parent `src/` node.**
-- **`Instr::SelectVal` materializes every pair operand** (`src/interpreter/dispatch.rs:353-362`): a `read_operand`
-  per pair (`Operand::Integer`/`Operand::Character` → `terms::number::make_integer_unrooted`) followed by a full
-  `beam_term::cmp` per pair, so a character-table `select_val` (what a per-character case/`select_val` compiles to)
-  pays an O(pairs) term-materialization + atom-namespace comparison per execution, although the small-integer
-  scrutinee could be compared against a small/literal candidate directly. **OWNER: the parent `src/` node** — the
-  one interpreter hot spot in the `to_lower` function-level profile (`bitstrings/CONTEXT.md` → `## Measured`) that
-  no change in this node can reach; 2.61 % of that profile is `make_integer_unrooted` call overhead and 2.92 %
-  `cmp_impl`.
-
 ## Notes for Agents
 - The router (`mod.rs:112`) and `lists::exec` are `#[inline]`, so a dispatched instruction hands straight to its owning family.
 - A family's `Ok(None)` is **not** a silent no-op: it reaches the router's last arm and yields the sentinel.

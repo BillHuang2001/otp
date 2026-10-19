@@ -117,6 +117,11 @@ accessors are claimed from either variant and the three pure accessors from `Bif
   `Typed{reg:Y(n)}` read — the caller decides addressability via `y_addressable`); `y_offset` is the
   `lea [y_base + k*8]` displacement. `constant_word` accepts only `Integer`/`Character`
   (small, via `small_word`) and `Atom`/`Nil` — a bignum constant, a float or a literal -> `None`.
+  **It is not a definition of its own: it *delegates* to `crate::interpreter::constant_word`, the single
+  authority on "decidable by a raw-word compare" shared with the interpreter's `select_val` ladder (and, through
+  `jit/cranelift/inline.rs`, with the Cranelift tier).** So the alternatives this tier emits a word compare for
+  are exactly the alternatives the interpreted ladder decides without a general comparison, and the two cannot
+  drift.
   `MAX_REGISTER` is enforced per lowering (a register past it must deopt so the interpreter reports
   the faithful `bad_register`); `y_addressable` refuses a Y index whose `disp32` would overflow
   (`k <= i32::MAX / size_of::<Eterm>()`). `Loc::of`/`locate_all` build the wider location set (an
@@ -148,7 +153,9 @@ accessors are claimed from either variant and the three pure accessors from `Bif
   the per-instruction `jit_step_one`.
 - **`select_val`** (`select.rs`): `NO_FAIL` -> `None`; unresolved label -> `None`; the scrutinee must
   be a `TestSrc` (an in-bound x-register, an addressable `Y` slot, or a constant); **every**
-  alternative must be an immediate `constant_word`. `SelectPlan::uses_y` gates the Y publish/refresh;
+  alternative must be an immediate `constant_word` (i.e. the shared
+  `crate::interpreter::constant_word` answers it, so the set of alternatives inlined here is exactly the set the
+  interpreted ladder decides by word identity). `SelectPlan::uses_y` gates the Y publish/refresh;
   a Y scrutinee emits a frame-window guard whose rejection runs one `emit_step_and_continue`.
 - **`select_tuple_arity`** (`aggregate.rs`): `NO_FAIL`/unresolved label -> `None`; the tuple operand
   must be a `Loc`; every alternative must be a non-negative `Operand::Integer`.
@@ -621,7 +628,8 @@ by construction).
   (the per-instruction native touches) + `cacheable_writes` (the block's written x-registers, mirroring each lowering's shape
   test but returning destinations) + `spill_sets`/`is_inlined`/`test_helper_inlined` (the per-pc
   dirty-set walk and its inlining mirror).
-- `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`,
+- `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`
+  (a thin delegation to the shared definition, `crate::interpreter::constant_word`),
   `small_word`, the shared guarded-Y access (`emit_guarded_y_address`/`emit_guarded_y_load`/
   `emit_guarded_y_store`/`guard_y_store`), the `Loc` location abstraction
   (`of`/`is_y`/`register`/`load`/`guard_store`/`store_at`), `locate_all`, and the

@@ -617,4 +617,62 @@ mod tests {
         ));
         let _ = machine.set_x(0, make_small(1));
     }
+
+    /// The committed **real `erlc` fixture** end to end (`tests/fixtures/selval.beam`):
+    /// every pair of an immediate-only switch (`ints/1` over small ints, `atoms/1` over
+    /// atoms) is answered by rungs 1-3 on the interpreter, so the general comparison runs
+    /// **zero** times, and the native tier never enters the ladder at all (its emitted
+    /// block compares the same words inline) — the deterministic per-pair tally, not a
+    /// timing.
+    ///
+    /// `tests/select_val.rs` is the observable half of the same fixture (both tiers vs
+    /// the live `erl`, plus the zero-on-heap-allocation claim); this is the tally the
+    /// ladder itself is gated on.
+    #[test]
+    fn the_committed_fixture_is_decided_without_a_general_compare() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/selval.beam"
+        );
+        let module = beam_loader::load_file(path)
+            .unwrap_or_else(|error| panic!("load {path}: {error:?}"));
+        let alpha = module.atom_table.lookup("alpha").expect("`selval` interns `alpha`");
+
+        for (function, argument) in [("ints", make_small(3)), ("atoms", make_atom(alpha))] {
+            let entry = module
+                .atom_table
+                .lookup(function)
+                .unwrap_or_else(|| panic!("`selval` does not intern `{function}`"));
+            for tier in [crate::Tier::Interpreter, crate::Tier::BaselineJit] {
+                let mut ctx = MinimalContext::new();
+                let mut machine = Machine::new();
+                reset_select_answers();
+                machine
+                    .run_with_tier(&module, entry, 1, &[argument], &mut ctx, tier)
+                    .unwrap_or_else(|error| panic!("selval:{function}/1 on {}: {error:?}", tier.name()));
+                let (word, by_cmp) = select_answers();
+                assert_eq!(
+                    by_cmp, 0,
+                    "{}: {by_cmp} pair(s) of `selval:{function}/1` paid a general term \
+                     comparison over immediate alternatives",
+                    tier.name()
+                );
+                match tier {
+                    // The interpreter scans the switch through this ladder.
+                    crate::Tier::Interpreter => assert!(
+                        word > 0,
+                        "the ladder answered no pair of `selval:{function}/1`: it did not engage"
+                    ),
+                    // The baseline tier inlines the switch into its own word compares, so
+                    // the ladder is legitimately never reached (tier-equivalence is
+                    // `tests/select_val.rs`'s claim; this pins the structural difference).
+                    _ => assert_eq!(
+                        word, 0,
+                        "{}: the inlined `select_val` block must not reach the ladder",
+                        tier.name()
+                    ),
+                }
+            }
+        }
+    }
 }
