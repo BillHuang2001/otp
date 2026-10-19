@@ -79,6 +79,7 @@ use crate::hasher::{FastHashMap, FastHashSet};
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
 use crate::nif::NifRegistry;
+use crate::nif_monitor::NifMonitorIndex;
 use crate::perf_map::PerfMap;
 use crate::port::{IoCounters, PortRegistry};
 use crate::runner::{ProcessEntry, RunnerState};
@@ -328,6 +329,18 @@ pub struct Runtime {
     /// registry is `!Send` (it owns `dlopen` handles), which is fine — the runtime is
     /// single-threaded (see [`crate::nif`]).
     pub(crate) nifs: Rc<RefCell<NifRegistry>>,
+    /// The **NIF process monitors** the runtime's NIF hosts have armed (contract A.3): the
+    /// `monitor → target pid` index behind `enif_monitor_process` / `enif_demonitor_process` and
+    /// the `down`-callback delivery, over the ABI's own `monitor → resource` table (see
+    /// [`crate::nif_monitor`]).
+    ///
+    /// Shared through an [`Rc`]`<`[`RefCell`]`>` because two hosts reach it at different times: the
+    /// per-call NIF host arms and demonitors through
+    /// [`NifHostServices`](crate::nif::NifHostServices), while the process-exit observer
+    /// ([`ets_owner::EtsExitObserver`]) delivers on a death. No BIF borrows this cell, so the
+    /// observer can always take it from inside the finalizer — the same argument as
+    /// [`Runtime::ets_owners`].
+    pub(crate) nif_monitors: Rc<RefCell<NifMonitorIndex>>,
     /// The node-global **persistent-term** store behind the seven `persistent_term:*`
     /// BIFs.
     ///
@@ -838,9 +851,14 @@ impl Runtime {
         // observer touches only this cell, so it is safe to run from inside the finalizer even
         // while a BIF call holds the ETS registry.
         let ets_owners = Rc::new(RefCell::new(ets_owner::OwnerIndex::default()));
-        processes.set_process_exit_observer(Box::new(ets_owner::EtsExitObserver::new(Rc::clone(
-            &ets_owners,
-        ))));
+        // The NIF process monitors the observer delivers on (contract A.3): the same shared-cell
+        // discipline as the owner index, because the death path is the one place a monitor's
+        // `down` callback has to be fired from.
+        let nif_monitors = Rc::new(RefCell::new(NifMonitorIndex::new()));
+        processes.set_process_exit_observer(Box::new(ets_owner::EtsExitObserver::new(
+            Rc::clone(&ets_owners),
+            Rc::clone(&nif_monitors),
+        )));
         // The runtime's own root process carries the emulator's default heap policy — the
         // same one `erlang:spawn` gives a child — so `process_info(Pid, min_heap_size | …)`
         // reports the oracle's figures for it too (see [`Runtime::default_spawn_policy`]).
@@ -996,6 +1014,7 @@ impl Runtime {
             ets_owners,
             ports,
             nifs: Rc::new(RefCell::new(NifRegistry::new())),
+            nif_monitors,
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
             executing: None,

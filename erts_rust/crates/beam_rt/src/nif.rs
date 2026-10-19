@@ -139,6 +139,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use beam_abi::nif::enif::resources::MonitorId;
+use beam_abi::nif::host::NifMonitorResult;
 use beam_abi::nif::loader::{NifCallError, NifLibrary};
 use beam_abi::nif::types::ErlNifEnv;
 use beam_abi::{ErlDrvSysInfo, NifEnv, NifHost};
@@ -351,6 +353,42 @@ pub(crate) trait NifHostServices {
         let _ = term;
         None
     }
+
+    /// Arm a monitor on the process `pid` for the resource that asked — the C's
+    /// `enif_monitor_process` (`erl_nif.c:3954-4011`).
+    ///
+    /// `heap` is the **calling host's** heap: the monitor's identity is an ordinary internal
+    /// reference the C mints with `erts_make_ref_in_buffer` (`:3978`), and it has to be built
+    /// where the caller can store it, exactly as [`NifHostServices::make_ref`] does.
+    ///
+    /// Answers the ABI's three-way [`NifMonitorResult`]:
+    ///
+    /// * `Some(Armed(reference))` — the C's `0`. The provider must also record
+    ///   `(reference, pid)` in its own index ([`crate::nif_monitor`]), because this runtime's
+    ///   death path is what fires the resource type's `down` callback later.
+    /// * `Some(NotAlive)` — the C's `1`: the pid names no live local process.
+    /// * `None` (the default) — "this provider cannot arm", which the ABI folds into its own
+    ///   `1`. **No** provider therefore never fabricates an arm.
+    fn monitor_process_result(
+        &mut self,
+        pid: Eterm,
+        heap: &mut Heap,
+    ) -> Option<NifMonitorResult> {
+        let _ = (pid, heap);
+        None
+    }
+
+    /// Cancel the monitor `monitor` identifies — the C's `enif_demonitor_process`
+    /// (`erl_nif.c:4019-4052`), whose answer is `0` when the monitor was identified and removed
+    /// and `1` when it was not.
+    ///
+    /// `Some(true)` is "I removed it", which `beam_abi` ORs with its own tree's removal; an entry
+    /// left in the provider's index would make a cancelled monitor deliver a `down` the C never
+    /// fires, so a `false` must mean "it was not armed here".
+    fn demonitor_process(&mut self, monitor: Eterm) -> Option<bool> {
+        let _ = monitor;
+        None
+    }
 }
 
 /// The concrete [`NifHostServices`] over a runtime's own reference id space, reference registry
@@ -481,6 +519,59 @@ impl NifHostServices for RuntimeNifServices<'_> {
             Some(self.runtime.local_node()),
             term,
         )
+    }
+
+    /// Arm a real monitor on the process `pid` — the runtime half of `enif_monitor_process`
+    /// (`erl_nif.c:3954-4011`).
+    ///
+    /// The three steps are the C's own: (1) the target must be a **live local** process, tested
+    /// with the very relation [`NifHostServices::is_process_alive`] answers
+    /// (`ProcessTable::is_process_alive`, the same one `erlang:is_process_alive/1` uses) so
+    /// `enif_is_process_alive` and this hook can never disagree; (2) the identity is an ordinary
+    /// internal reference minted exactly as [`NifHostServices::make_ref`] mints one (the runtime's
+    /// own reference id space, registered as a **plain** reference); (3) the runtime records
+    /// `(monitor, target)` in its index, which is what the death path
+    /// ([`crate::runtime::ets_owner`]) delivers the resource type's `down` callback from.
+    ///
+    /// A **remote or non-pid** term is [`NifMonitorResult::NotAlive`] (the C's `1`): this runtime
+    /// has no monitor arm across distribution, so nothing is armed. A reference that cannot be
+    /// built on `heap` is the same answer rather than a fabricated monitor.
+    fn monitor_process_result(
+        &mut self,
+        pid: Eterm,
+        heap: &mut Heap,
+    ) -> Option<NifMonitorResult> {
+        let Ok(target) = ProcessId::from_eterm(pid) else {
+            return Some(NifMonitorResult::NotAlive);
+        };
+        if !self.processes().is_process_alive(target) {
+            return Some(NifMonitorResult::NotAlive);
+        }
+        // Steps (2) and (3): the C's `erts_make_ref_in_buffer`, then the registration that makes
+        // `demonitor/1` and the death path recognise the term.
+        let reference = self.runtime.refs.next();
+        let Ok(term) = reference.to_eterm(heap) else {
+            return Some(NifMonitorResult::NotAlive);
+        };
+        self.runtime.references.insert(term, None);
+        let Some(monitor) = MonitorId::from_term(term) else {
+            return Some(NifMonitorResult::NotAlive);
+        };
+        self.runtime.nif_monitors.borrow_mut().arm(monitor, target);
+        Some(NifMonitorResult::Armed(term))
+    }
+
+    /// Cancel the monitor `monitor` identifies — `enif_demonitor_process`'s `0` / `1`
+    /// (`erl_nif.c:4043-4051`) for this runtime's half of the monitor state.
+    ///
+    /// `beam_abi` removes its own binding **first** and ORs the two answers, so this only has to
+    /// report whether *this* index still held the monitor: an entry left behind here would let a
+    /// cancelled monitor deliver a `down` the C never fires.
+    fn demonitor_process(&mut self, monitor: Eterm) -> Option<bool> {
+        let Some(id) = MonitorId::from_term(monitor) else {
+            return Some(false);
+        };
+        Some(self.runtime.nif_monitors.borrow_mut().remove(id))
     }
 }
 /// The runtime services one NIF call (or one library `load`/`unload`) draws on.
@@ -1012,6 +1103,32 @@ impl NifHost for NifHostImpl<'_> {
     fn is_current_process_alive(&mut self) -> Option<bool> {
         let self_pid = self.self_pid;
         self.services.as_mut()?.is_process_alive(self_pid)
+    }
+
+    /// `enif_monitor_process` — arm a monitor on `pid` for the resource that asked.
+    ///
+    /// Delegates to the borrowed [`NifHostServices`], which tests the target's liveness against
+    /// the runtime's process table, mints the internal reference the C's
+    /// `erts_make_ref_in_buffer` mints on **this host's** heap, and records the pair in the
+    /// runtime's monitor index so the death path can fire the resource type's `down` callback.
+    /// The three answers are the ABI's own [`NifMonitorResult`] (`0` / `1` / `-1`); with no
+    /// provider (the load/unload host) this stays the trait default `None`, which the ABI folds
+    /// into its `1` — never a fabricated arm.
+    fn monitor_process_result(&mut self, pid: Eterm) -> Option<NifMonitorResult> {
+        // Disjoint field borrows: `heap` and `services` are distinct fields of `self`.
+        let heap = &mut self.heap;
+        self.services.as_mut()?.monitor_process_result(pid, heap)
+    }
+
+    /// `enif_demonitor_process` — cancel the monitor `monitor` identifies.
+    ///
+    /// Delegates to the borrowed [`NifHostServices`], which drops the entry from the runtime's
+    /// monitor index (so no `down` can be delivered for it later) and reports whether it was
+    /// armed there. `beam_abi` consults its own resource-side table first and ORs the two
+    /// answers, so the C's `0` still holds for a monitor only the ABI knew about. With no
+    /// provider (the load/unload host) this is the trait default `None`.
+    fn demonitor_process(&mut self, monitor: Eterm) -> Option<bool> {
+        self.services.as_mut()?.demonitor_process(monitor)
     }
 
     /// `enif_make_unique_integer` — draw from the runtime's four NIF-facing unique sequences.
@@ -1935,6 +2052,25 @@ mod tests {
             self.saw_port_command = true;
             Some(port == self.port && data == self.accepted)
         }
+
+        fn monitor_process_result(
+            &mut self,
+            pid: Eterm,
+            heap: &mut Heap,
+        ) -> Option<NifMonitorResult> {
+            // The heap is load-bearing: the C mints the monitor's internal reference on the
+            // calling NIF's heap (`erts_make_ref_in_buffer`, `erl_nif.c:3978`).
+            self.saw_heap = heap.available() > 0;
+            Some(if pid == self.pid {
+                NifMonitorResult::Armed(self.reference)
+            } else {
+                NifMonitorResult::NotAlive
+            })
+        }
+
+        fn demonitor_process(&mut self, monitor: Eterm) -> Option<bool> {
+            Some(monitor == self.reference)
+        }
     }
 
     /// `make_ref`/`whereis_pid`/`is_process_alive` delegate to the borrowed provider (the reference
@@ -2022,6 +2158,57 @@ mod tests {
         let (mut bare, _atoms, _interner) = host_with(&[]);
         assert_eq!(bare.is_process_alive(live), None);
         assert_eq!(bare.is_current_process_alive(), None);
+    }
+
+    /// The two **monitor** hooks (`enif_monitor_process`/`enif_demonitor_process`) delegate to the
+    /// provider — which is handed the host's own heap, because the monitor's identity is a
+    /// reference minted there — and stay the typed `None` with no provider (the load/unload host),
+    /// which `beam_abi` folds into the C's `1` rather than a fabricated arm.
+    #[test]
+    fn the_monitor_hooks_delegate_to_the_provider() {
+        let live = make_small(7);
+        let other = make_small(99);
+        let reference = make_small(11);
+        let mut services = MockServices {
+            reference,
+            name: make_small(0),
+            pid: live,
+            port: make_small(0),
+            accepted: make_small(0),
+            saw_heap: false,
+            saw_port_command: false,
+        };
+
+        let mut host = host_as(live, &mut services);
+        assert_eq!(
+            host.monitor_process_result(live),
+            Some(NifMonitorResult::Armed(reference)),
+            "a live target is armed with the provider's reference"
+        );
+        assert_eq!(
+            host.monitor_process_result(other),
+            Some(NifMonitorResult::NotAlive),
+            "a dead target is the C's `1`, not an arm"
+        );
+        assert_eq!(
+            host.demonitor_process(reference),
+            Some(true),
+            "the armed reference cancels"
+        );
+        assert_eq!(
+            host.demonitor_process(make_small(12)),
+            Some(false),
+            "an unarmed reference is the C's `1`"
+        );
+        drop(host);
+        assert!(
+            services.saw_heap,
+            "the provider is handed the calling host's own heap"
+        );
+
+        let (mut bare, _atoms, _interner) = host_with(&[]);
+        assert_eq!(bare.monitor_process_result(live), None);
+        assert_eq!(bare.demonitor_process(reference), None);
     }
 
     /// The two **port** hooks delegate to the provider with the very terms the NIF passed
@@ -2383,6 +2570,105 @@ mod tests {
         assert!(
             runtime.references.contains_key(&reference),
             "the minted reference is registered in the runtime ({reference:?})"
+        );
+    }
+
+    /// The runtime provider **arms a real monitor** on a live process: it mints an ordinary
+    /// internal reference from the runtime's own id space, registers it as a plain reference, and
+    /// records `(monitor, pid)` in the runtime's monitor index — the state `enif_monitor_process`
+    /// answers the C's `0` from. A dead pid and a non-pid are the C's `1`, and the demonitor
+    /// answers its `0` exactly once.
+    #[test]
+    fn the_runtime_provider_arms_and_cancels_a_monitor() {
+        let mut runtime = crate::Runtime::with_defaults().expect("the default runtime");
+        let target = runtime.self_pid();
+        let dead = ProcessId::new(999_999, 0);
+        let mut heap = Heap::new(256).expect("a test heap");
+
+        let mut services = services_of(&mut runtime);
+        let armed = services.monitor_process_result(target.to_eterm(), &mut heap);
+        assert_eq!(
+            services.monitor_process_result(dead.to_eterm(), &mut heap),
+            Some(NifMonitorResult::NotAlive),
+            "a pid the table does not hold is the C's `1`"
+        );
+        assert_eq!(
+            services.monitor_process_result(make_small(1), &mut heap),
+            Some(NifMonitorResult::NotAlive),
+            "a non-pid names no live process"
+        );
+        let Some(NifMonitorResult::Armed(reference)) = armed else {
+            panic!("a live pid must be armed, got {armed:?}");
+        };
+        assert!(
+            MonitorId::from_term(reference).is_some(),
+            "the armed term is an internal reference, as the C's `erts_make_ref_in_buffer` gives"
+        );
+        assert_eq!(
+            services.demonitor_process(reference),
+            Some(true),
+            "the monitor was armed here, so its cancel answers the C's `0`"
+        );
+        assert_eq!(
+            services.demonitor_process(reference),
+            Some(false),
+            "a second cancel finds nothing — the C's `1`"
+        );
+        drop(services);
+
+        assert!(
+            runtime.references.contains_key(&reference),
+            "the monitor's reference is a registered plain reference ({reference:?})"
+        );
+        assert!(
+            runtime.nif_monitors.borrow().is_empty(),
+            "the demonitor took the entry out of the index"
+        );
+    }
+
+    /// A death delivers the monitors armed on that pid **once**, through the observer the runtime
+    /// installs on its process table (`erts_fire_nif_monitor`, `erl_nif.c:3058-3115`).
+    ///
+    /// No resource type stands behind the id in this test — opening one needs a real C NIF, which
+    /// `tests/nif_monitor.rs` builds — so the ABI runs no callback and counts none. What is pinned
+    /// here is the runtime's half: the entry leaves the index on the death, no second death can
+    /// deliver it again, and the liveness relation the arm used agrees with the death that just
+    /// happened.
+    #[test]
+    fn a_death_takes_the_monitors_armed_on_the_pid_out_of_the_index() {
+        let mut runtime = crate::Runtime::with_defaults().expect("the default runtime");
+        let policy = runtime.default_spawn_policy();
+        let child = runtime.processes.spawn(policy).expect("spawns a child");
+        let mut heap = Heap::new(256).expect("a test heap");
+
+        let armed = {
+            let mut services = services_of(&mut runtime);
+            services.monitor_process_result(child.to_eterm(), &mut heap)
+        };
+        let Some(NifMonitorResult::Armed(reference)) = armed else {
+            panic!("a live child must be armed, got {armed:?}");
+        };
+        assert!(MonitorId::from_term(reference).is_some());
+        assert_eq!(
+            runtime.nif_monitors.borrow().len(),
+            1,
+            "the monitor is armed on the child"
+        );
+
+        runtime
+            .processes
+            .terminate(child, make_small(0))
+            .expect("the child is live");
+
+        assert!(
+            runtime.nif_monitors.borrow().is_empty(),
+            "the death delivered the monitor and took it out of the index"
+        );
+        let mut services = services_of(&mut runtime);
+        assert_eq!(
+            services.monitor_process_result(child.to_eterm(), &mut heap),
+            Some(NifMonitorResult::NotAlive),
+            "the arm's liveness relation agrees with the death that just happened"
         );
     }
 }
