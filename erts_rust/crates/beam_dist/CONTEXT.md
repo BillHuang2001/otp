@@ -755,6 +755,18 @@ than two).
   `{nodedown,Node}` decision belong to `net_kernel` (Erlang, `lib/kernel/src/net_kernel.erl`), not
   this crate's; this crate only answers an inbound tick.
 ## Notes for Agents
+- **Handshake tags: `NAME_TAG == CHALLENGE_TAG == b'N'` (78), `STATUS_TAG == b's'` (115).** No legacy
+  form is supported: a pre-OTP-23 `'n'` (110) NAME, or a `'S'` status, fails the tag check with
+  `BeamError::BadArg` and the driver goes to `Failed` **without emitting a byte** (the peer then sees
+  `{error,closed}` on its next read). `flags.rs`'s `NAME_TAG` doc comment ("the `'N'`/`'n'` tag") is
+  misleading — `'n'` is accepted nowhere.
+- **A refusal is buffered into `take_output` *before* `step` returns `Err`, so a caller must drain
+  `take_output()` even on the error path** (`driver.rs`: the `not_allowed` mandatory-flag refusal, and
+  an `AcceptDecision::Refuse`). A `let outcome = driver.step()?;` that returns before the flush drops
+  the only status the responder ever sends, leaving the peer waiting for a frame already in memory.
+- **`step` returns `Handshaking`/`Progress`/`Established` before it ever returns `WouldBlock`**, so a
+  consumer must drive it to `WouldBlock` (not call it once per socket read) to drain buffered frames;
+  after a failure it returns `Ok(StepOutcome::Failed)`/`Ok(StepOutcome::Closed)` — never `Err` twice.
 - **A safe pid/port/ref term builder exists.** `beam_codec::term::{make_external_pid,
   make_external_port, make_external_ref}` are safe public wrappers over `beam_term::thing`'s raw
   writers, so a `#![deny(unsafe_code)]` crate can materialize external pids/ports/refs; the live
