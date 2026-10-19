@@ -75,10 +75,14 @@
 //! [`RuntimeNifServices`] over the runtime, the pass's own process table and the calling module,
 //! so all ten are live there. The **load/unload** host (built by
 //! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
-//! registry, so it cannot borrow the runtime and is built with `services = None`: those hooks then
-//! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
-//! reference, a pid, a liveness answer or a delivery. `erlang:load_nif/2` on an already-loaded module
-//! is a `reload` (the oracle's rule since OTP 20).
+//! registry, so it cannot borrow the runtime and is built with `services = None`: nine of the ten
+//! then stay the trait default (the typed `None`), so a `load`/`unload` callback can never
+//! fabricate a reference, a pid, a liveness answer or a monitor arm. The tenth — `enif_send` — is
+//! served by a **callback-scoped pending-send queue**: while a `load` callback runs, the host
+//! queues the send ([`NifHostImpl::with_load_sends`]) and [`NifBridge::load_nif`] delivers every
+//! queued message the moment the callback returns, so a `load` callback's `enif_send` really
+//! delivers (see [`PendingNifSend`]).
+//! `erlang:load_nif/2` on an already-loaded module is a `reload` (the oracle's rule since OTP 20).
 //!
 //! # Hooks still at the trait default — and exactly why
 //!
@@ -118,7 +122,7 @@
 //!   terms *it* minted, so this needs a per-library `{module, name}`-keyed resource-type registry.
 //!   Default ⇒ the C's failure code `1`.
 //!
-//! # `enif_send` is live on the per-call host
+//! # `enif_send` is live on the per-call host — and in a `load` callback
 //!
 //! [`NifHost::send`] reaches the runtime's **own** send seam
 //! ([`crate::context::nif_send::deliver`]): the message is copied into the receiver's heap by
@@ -129,6 +133,11 @@
 //! failure code here, not the `!` operator's silent drop. Both forms (`msg_env == NULL` and a
 //! message env) go through that one hook, because every message env this host allocates shares its
 //! heap ([`NifHost::make_copy`] is the identity). Sender resolution: [`crate::nif_send`].
+//!
+//! A **`load` callback's** `enif_send` is live too, through the queue: the host has no provider to
+//! reach, so it records the send on its own [`NifHostImpl::with_load_sends`] window, and
+//! [`NifBridge::load_nif`](crate::context::bridges::NifBridge) delivers it the moment the callback
+//! returns — still inside the `erlang:load_nif/2` call, on the runtime's own send seam.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -252,6 +261,22 @@ impl NifRegistry {
     }
 }
 
+/// One `enif_send` a library's **`load` callback** issued.
+///
+/// The load host cannot reach the runtime — it is moved into the registry and its borrow is
+/// erased — so the send is queued here and delivered by
+/// [`NifBridge::load_nif`](crate::context::bridges::NifBridge) the moment the callback returns,
+/// i.e. still inside the `erlang:load_nif/2` call. See [`NifHostImpl::take_load_sends`].
+pub(crate) struct PendingNifSend {
+    /// The sending process: the process that ran `erlang:load_nif/2` (the C's `c_p` in the
+    /// `load` callback, so its id is the message envelope's `from`).
+    pub(crate) from: ProcessId,
+    /// The destination, exactly as the C's `ErlNifPid` carried it.
+    pub(crate) to: Eterm,
+    /// The message term, on the load host's own (never-reset, pointer-stable) heap.
+    pub(crate) msg: Eterm,
+}
+
 /// The runtime services a NIF host calls back into.
 ///
 /// The three `enif_*` hooks [`NifHost::make_ref`], [`NifHost::whereis_pid`],
@@ -260,7 +285,9 @@ impl NifRegistry {
 /// borrows it through this trait instead of duplicating the runtime's minting/registry logic. The
 /// concrete provider is [`RuntimeNifServices`], built by
 /// [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext); the load/unload host carries
-/// no provider, so every hook stays its typed default there.
+/// no provider, so every hook stays its typed default there (a `load` callback's [`NifHost::send`]
+/// excepted — it is queued on the host and drained by
+/// [`NifBridge::load_nif`](crate::context::bridges::NifBridge), see [`PendingNifSend`]).
 pub(crate) trait NifHostServices {
     /// Mint a fresh internal reference on `heap` and register it in the runtime's reference
     /// registry (a **plain** reference, so `demonitor/1` recognises it), returning its term.
@@ -323,6 +350,12 @@ pub(crate) trait NifHostServices {
     /// message and reports success. A non-local (remote or non-pid) destination is the same `0`
     /// — there is no distribution arm in the C's `enif_send`. The default `None` is "cannot
     /// answer", which `beam_abi` turns into its own `0`; nothing here ever fabricates a `1`.
+    ///
+    /// A host with no provider has **three** routes, and only one of them can answer truthfully: a
+    /// `load` callback's window ([`NifHostImpl::with_load_sends`]), which queues the send for
+    /// [`NifBridge::load_nif`](crate::context::bridges::NifBridge) to deliver when the callback
+    /// returns. The `unload`/resource-`dtor` host has no such window and none was ever opened for
+    /// it, so the trait default `None` stands there.
     fn send(&mut self, from: ProcessId, to: Eterm, msg: Eterm) -> Option<bool> {
         let _ = (from, to, msg);
         None
@@ -649,6 +682,10 @@ pub(crate) struct NifHostImpl<'a> {
     schedulers: i32,
     /// The runtime services this host may call back into; `None` for the load/unload host.
     services: Option<&'a mut dyn NifHostServices>,
+    /// The sends the current **`load` callback** issued, awaiting delivery; `None` on the
+    /// per-call host (which delivers immediately through `services`) and on any host whose load
+    /// window has already been drained ([`NifHostImpl::take_load_sends`]).
+    load_sends: Option<Vec<PendingNifSend>>,
 }
 
 impl<'a> NifHostImpl<'a> {
@@ -670,12 +707,29 @@ impl<'a> NifHostImpl<'a> {
             envs: Vec::new(),
             schedulers,
             services,
+            load_sends: None,
         }
     }
 
     /// Takes the heap back out (the per-call host is consumed once the call returns).
     pub(crate) fn into_heap(self) -> Heap {
         self.heap
+    }
+
+    /// Opens the `load`-callback send window: from now on [`NifHost::send`] queues into
+    /// [`NifHostImpl::take_load_sends`] instead of answering the ABI's `0`.
+    pub(crate) fn with_load_sends(mut self) -> NifHostImpl<'a> {
+        self.load_sends = Some(Vec::new());
+        self
+    }
+
+    /// Closes the `load`-callback send window and hands back everything the callback queued.
+    ///
+    /// Closes it **permanently**: a later callback on this same long-lived host (`unload`, a
+    /// resource `dtor`) then answers the ABI's `0` rather than reporting a success no drain point
+    /// would ever honour.
+    pub(crate) fn take_load_sends(&mut self) -> Vec<PendingNifSend> {
+        self.load_sends.take().unwrap_or_default()
     }
 }
 
@@ -1157,12 +1211,38 @@ impl NifHost for NifHostImpl<'_> {
     /// (`beam_message`'s copier into the receiver's heap, the mailbox enqueue and the
     /// resume-on-send wake). `Some(true)` once the message is queued, `Some(false)` when it is not
     /// (the C's `!rp` for a pid with no process is the `false`, **not** the `erlang:send/2` BIF's
-    /// silent-drop-and-report-success), and the trait default `None` with no provider (the
-    /// load/unload host) — never a fabricated `1`.
+    /// silent-drop-and-report-success).
+    ///
+    /// With **no** provider the `load`-callback window is the one route that still answers
+    /// truthfully: the send is recorded in [`NifHostImpl::take_load_sends`], from where
+    /// [`NifBridge::load_nif`](crate::context::bridges::NifBridge) delivers it the moment the
+    /// callback returns — so the answer is the C's `1` for an internal local pid and the C's `0`
+    /// (no process to look up) for anything else. Every other provider-less host — the `unload`
+    /// window after it closed, the scratch host — keeps the trait default `None`, which
+    /// `beam_abi` folds into its `0`; nothing here ever fabricates a `1`.
     fn send(&mut self, to: Eterm, from: Option<Eterm>, msg: Eterm) -> Option<bool> {
         let sender = crate::nif_send::sender_pid(self.self_pid, from)?;
-        self.services.as_mut()?.send(sender, to, msg)
-    }    /// `enif_is_current_process_alive(env)` — whether **this host's** process is still alive.
+        if let Some(services) = self.services.as_mut() {
+            return services.send(sender, to, msg);
+        }
+        // No provider: the `load`-callback window is the one route that can still answer
+        // truthfully. Everything else (the `unload`/`dtor` host after the window closed, the
+        // scratch host) keeps the trait default, which `beam_abi` folds into its `0`.
+        let queue = self.load_sends.as_mut()?;
+        // A destination that names no **internal local** pid can never be delivered, and the C's
+        // `enif_send` answers exactly `0` for it (`erts_proc_lookup` finds no process,
+        // `erl_nif.c:876-877`) — so the answer stays the C's refusal even though the liveness
+        // relation itself is out of reach here.
+        if ProcessId::from_eterm(to).is_err() {
+            return Some(false);
+        }
+        queue.push(PendingNifSend { from: sender, to, msg });
+        // `1` = accepted: the delivery happens when the callback returns, still inside the
+        // `erlang:load_nif/2` call (see `NifBridge::load_nif`).
+        Some(true)
+    }
+
+    /// `enif_is_current_process_alive(env)` — whether **this host's** process is still alive.
     ///
     /// The C asks the calling process's own PCB, `!ERTS_PROC_IS_EXITING(c_p)` (`erl_nif.c:2319`),
     /// which it can reach only on a scheduler thread holding a process and otherwise *aborts the
@@ -2495,7 +2575,7 @@ mod tests {
     /// ([`ExecutionContext::receive_next`](beam_engine::ExecutionContext::receive_next)), so this
     /// pins the *delivery*, not just the hook's return value. The host half — the `from`
     /// resolution and the provider-less answer — is pinned by
-    /// [`the_load_host_cannot_send_and_never_fabricates_a_delivery`] and end to end by
+    /// [`the_load_host_queues_a_send_only_inside_the_load_window`] and end to end by
     /// `tests/nif_send.rs`.
     #[test]
     fn runtime_services_deliver_a_message_and_answer_the_c_engines_codes() {
@@ -2540,17 +2620,61 @@ mod tests {
     }
 
     /// The **load/unload** host carries no provider (`services = None`, built by
-    /// [`NifBridge::load_nif`](crate::context::bridges::NifBridge)), so `enif_send` from a
-    /// `load`/`upgrade`/`dtor` callback answers the ABI's `0` — the C's answer for a call with no
-    /// process (`env->proc == NULL`) is not reproduced, but nothing is fabricated either.
+    /// [`NifBridge::load_nif`](crate::context::bridges::NifBridge)), so whether an `enif_send`
+    /// answers the ABI's `1` depends on whether the `load`-callback window is open.
+    ///
+    /// Three states, all asserted here: a host with **no** window (the `unload`/`dtor` context, the
+    /// scratch host) is the trait default `None`; a host **inside** the window accepts an internal
+    /// local pid as the C's `1` and refuses a non-pid as the C's `0`; and once the window is drained
+    /// ([`NifHostImpl::take_load_sends`]) the very same host is back to `None` — the window closes
+    /// for good, so nothing ever reports a success no drain point would honour.
     #[test]
-    fn the_load_host_cannot_send_and_never_fabricates_a_delivery() {
+    fn the_load_host_queues_a_send_only_inside_the_load_window() {
         let (mut host, _, _) = host_with(&[]);
         let target = ProcessId::new(1, 0).to_eterm();
         assert_eq!(
             NifHost::send(&mut host, target, None, make_small(1)),
             None,
-            "a host with no provider reports the trait default, never a delivery"
+            "a host with no provider and no load window reports the trait default"
+        );
+
+        // The load-callback host: same shape, but its `self_pid` is a real pid (the process that
+        // ran `erlang:load_nif/2`) and its send window is open.
+        let sender = ProcessId::new(3, 0);
+        let mut host = NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            Rc::new(AtomTable::new()),
+            PendingInterner::new(0),
+            sender.to_eterm(),
+            1,
+            None,
+        )
+        .with_load_sends();
+        assert_eq!(
+            NifHost::send(&mut host, target, None, make_small(1)),
+            Some(true),
+            "an internal local pid is accepted: the delivery happens at callback exit"
+        );
+        assert_eq!(
+            NifHost::send(&mut host, make_small(1), None, make_small(2)),
+            Some(false),
+            "a destination that names no process is the C's refusal"
+        );
+
+        let queued = host.take_load_sends();
+        assert_eq!(queued.len(), 1, "only the accepted send was queued");
+        assert_eq!(queued[0].from, sender, "the queued send's sender");
+        assert_eq!(queued[0].to, target, "the queued send's destination");
+        assert_eq!(queued[0].msg, make_small(1), "the queued send's message");
+
+        assert_eq!(
+            NifHost::send(&mut host, target, None, make_small(1)),
+            None,
+            "the window closed with the drain, permanently"
+        );
+        assert!(
+            host.take_load_sends().is_empty(),
+            "a drained window queues nothing more"
         );
     }
     /// The oracle's `erlang:is_process_alive/1` answers the **same relation** the provider answers

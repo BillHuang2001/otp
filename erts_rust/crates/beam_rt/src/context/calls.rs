@@ -532,6 +532,9 @@ impl<'a> RuntimeContext<'a> {
                     atoms: Rc::clone(&atoms),
                     interner: pending.share(),
                     self_pid: self_pid.to_eterm(),
+                    // The pass's own table, so a `load`-callback `enif_send` is delivered into
+                    // the live process table rather than the pass's empty placeholder.
+                    mailbox: mailbox_table.as_deref_mut(),
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
