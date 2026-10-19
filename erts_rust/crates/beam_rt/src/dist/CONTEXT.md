@@ -90,6 +90,7 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 - `dist.rs` (parent) → the node half: `DistNode`/`DistConnection`/`NodeName`/`DistConnectionSnapshot`/`resolve_cookie`/`NONODE_NAME`; declares `mod inbound;`/`mod links;` and re-exports `LocalDeliverySink`.
 - `dist/links.rs` → the one node→link table over both halves (`DistLinks`), the one routing entry (`route_control`/`route_message`/`route_alias`) and the single `no_link_error`.
 - `dist/inbound.rs` → the inbound delivery sink over `beam_dist::InboundSink` (contract A.5): `LocalDeliverySink` + routing helpers, the heap-fragment fallback (`enqueue_fragmented`) and its `fragment_deliveries` record (`take_fragment_deliveries`); its suite is the sibling `dist/inbound/tests.rs`.
+- `dist/externalize.rs` → the outbound payload's local-identifier externaliser (`holds_local_id` gate + `PayloadArena`): the one implementation behind `DistClient::outbound_payload`, shared by all three message families; its suite is the sibling `dist/externalize/tests.rs`.
 
 ## See Also
 - `../dist_client.rs` → the connecting half (outbound client handshake, the queued `DistSignalRouter` and its `flush_pending`).
