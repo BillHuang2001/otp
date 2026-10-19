@@ -59,22 +59,32 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// `(module, function, arity)` itself, so the engine marshals `x(0..arity)` through
     /// [`Self::call_bif`] under the arm's own frame discipline.
     ///
-    /// The only local keys the runtime serves are the `prim_tty` NIF library's **non-exported**
-    /// stubs (`tty_create/1`, `tty_init/2`, `setlocale/1`, `tty_select/2`,
-    /// `tty_window_size/1`, `tty_encoding/1`, `write_nif/2`, `read_nif/3`, `isprint/1`,
-    /// `wcwidth/1`, `setupterm_nif/0`, `tiget*_nif/1`, `tinfo_nif/0`, `tputs_nif/2` — the
-    /// compiler emits a LOCAL `call`/`call_only` for each, so `call_ext`/`floor_shadows`
-    /// never sees them). ERTS serves that library from its static NIF table; the Rust
-    /// counterpart is [`crate::native::prim_tty`], and the dispatch lands on the SAME
-    /// `try_native` arm the exported stubs use, so there is one implementation.
+    /// Two local keys are served, both as **non-exported same-module stubs** (the compiler emits
+    /// a LOCAL `call`/`call_only` for each, so `call_ext`/`floor_shadows` never sees them):
+    ///
+    /// * the `prim_tty` NIF library's stubs (`tty_create/1`, `tty_init/2`, `setlocale/1`,
+    ///   `tty_select/2`, `tty_window_size/1`, `tty_encoding/1`, `write_nif/2`, `read_nif/3`,
+    ///   `isprint/1`, `wcwidth/1`, `setupterm_nif/0`, `tiget*_nif/1`, `tinfo_nif/0`,
+    ///   `tputs_nif/2`) — ERTS serves that library from its static NIF table; the Rust
+    ///   counterpart is [`crate::native::prim_tty`], and the dispatch lands on the SAME
+    ///   `try_native` arm the exported stubs use, so there is one implementation;
+    /// * the `zlib` stream surface's 19 NIF stubs (`open_nif/0`, `close_nif/1`,
+    ///   `deflateInit_nif/6`, `deflate_nif/4`, `inflate_nif/4`, `getStash_nif/1`, …) — the
+    ///   bodies of `zlib.erl`'s `open/0`, `deflate/2,3`, `inflate/2,3`, `safeInflate/2`,
+    ///   `deflateParams/3` and the rest are real Erlang that runs in-machine and chains
+    ///   **locally** into them, so serving the 19 keys is what makes the whole `zlib` stream
+    ///   API reachable. They are registered BIFs ([`beam_bifs`]'s `zlib` module over
+    ///   `beam_deflate`), so the dispatch is the ordinary `call_bif` one.
     ///
     /// This is consulted for **every** local call in **every** module, so it must answer
-    /// `Ok(false)` for everything else — [`crate::native::prim_tty::serves_local_call`]
-    /// (a `prim_tty` module check plus a `NIF_KEYS` membership test) does.
+    /// `Ok(false)` for everything else and stay allocation-free: both predicates begin with a
+    /// **module-name equality** check (`prim_tty`, `zlib`) and only then test membership in a
+    /// fixed `(name, arity)` table — no registry lookup, no hash, no term is built.
     fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
-        Ok(crate::native::prim_tty::serves_local_call(
-            module, function, arity,
-        ))
+        if crate::native::prim_tty::serves_local_call(module, function, arity) {
+            return Ok(true);
+        }
+        Ok(beam_bifs::serves_local_call(module, function, arity as usize))
     }
 
     /// Resolve an interned atom id to its name from the runtime's **live** shared namespace,
