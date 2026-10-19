@@ -25,7 +25,8 @@
 //! A passive socket's bytes wait in the port's **input queue** for the owner's next read — the
 //! `{Port, {data, Data}}` path
 //! ([`PortNotification::Data`](crate::PortNotification::Data)), which
-//! [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) drives. An **active** socket
+//! [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) drives (they wait in the kernel
+//! instead while a spent grant has the read side deselected — see *Arming*). An **active** socket
 //! (`{active, true}`, `{active, once}`, `{active, N}`) instead sends its owner a **message** per
 //! delivered unit — `tcp_message` (`:3979`), `{tcp, S, [H1..Hsz | Data]}` — which the runtime
 //! renders from an [`ActiveInputEvent::Data`] on the active-input channel
@@ -83,18 +84,19 @@
 //!
 //! # Arming
 //!
-//! The C arms read readiness only while `active > 0` (`sock_select(desc, FD_READ|FD_CLOSE,
-//! desc->active > 0)`, `:7944`-`:7986`) — going passive de-selects the socket. This crate's
-//! poller has no empty-interest mask (`crate::poller::Interest` is `READABLE`/`WRITABLE`/`BOTH`)
-//! and `mio`'s epoll is **edge-triggered**, so the registration is kept armed for the socket's
-//! life and the driver gates on `options.active` instead; a **passive → active** transition
-//! re-registers so already-buffered bytes produce a fresh edge
-//! ([`TcpInetDriver::after_setopts`](super::TcpInetDriver)). The consequence of keeping the
-//! registration armed is that bytes arriving **after** an `{active, N}` counter is spent are read
-//! into the port's input queue by the passive half of
-//! [`Driver::ready_input`](crate::Driver::ready_input) rather than staying in the kernel buffer —
-//! they are still there for the owner's next passive read, and nothing is delivered on the active
-//! channel.
+//! The C selects the socket's read side only while `active > 0` (`sock_select(desc,
+//! FD_READ|FD_CLOSE, desc->active > 0)`, `:7944`-`:7986`) and **deselects** it the moment a
+//! delivery spends the grant (`:13106`-`:13114`). This crate's poller has no empty-interest mask
+//! (`crate::poller::Interest` is `READABLE`/`WRITABLE`/`BOTH`) and `mio`'s epoll is
+//! **edge-triggered**, so the registration is kept armed for the socket's life and the driver
+//! reproduces the C's selection itself: [`TcpInetDriver::read_armed`](super::TcpInetDriver) is
+//! cleared by the delivery that empties a grant, and set again by an armed `{active, …}` grant
+//! (which also re-registers, so already-buffered bytes produce a fresh edge —
+//! [`TcpInetDriver::after_setopts`](super::TcpInetDriver)), by a queued `TCP_REQ_RECV`, by the
+//! synchronous `recv` verbs and on every fresh connection. While it is clear the reactor reads
+//! nothing, so a peer write during the spent window waits in the kernel for the next arm — where
+//! the C leaves it — instead of being moved onto the passive `{Port, {data, …}}` channel and
+//! going missing from the next delivery.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`,
 //! `erts/emulator/beam/packet_parser.{c,h}`.
@@ -320,6 +322,12 @@ impl TcpInetDriver {
             }
             _ => {}
         }
+        // `if (! desc->inet.active) { … sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0); … }`
+        // (`inet_drv.c:13106`-`:13114`): the delivery that emptied the grant deselects the socket's
+        // read side, so a peer write during the spent window is never read by the reactor.
+        if !self.active_mode() {
+            self.read_armed = false;
+        }
         Ok(())
     }
 
@@ -401,6 +409,10 @@ impl TcpInetDriver {
         if self.state.is_connected() && self.has_socket() && before_active == INET_PASSIVE {
             if self.active_mode() {
                 self.set_interest(ctx, Interest::READABLE)?;
+                // `sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` (`:7982`): an armed
+                // grant selects the socket's read side again, ending any spent-grant window
+                // (see [`TcpInetDriver::read_armed`](super::TcpInetDriver)).
+                self.read_armed = true;
             }
         }
         if self.inline_burst(before_active, before_htype) {

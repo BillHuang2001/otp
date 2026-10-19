@@ -499,6 +499,46 @@ fn a_spent_grant_ends_the_burst_and_leaves_the_rest_for_the_passive_path() {
     assert_eq!(port.take_input(1), b"b".to_vec(), "the frame the burst left behind");
 }
 
+/// A peer write that arrives **after** the grant is spent stays in the kernel: the reactor must
+/// not read it into the port input queue, and the next arm delivers it on the active channel.
+///
+/// This is `tcp_deliver`'s deselect arm (`inet_drv.c:13106`-`:13114`): the moment a delivery
+/// spends the grant the C runs `sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0)`, so a peer write
+/// during the spent window generates **no** read callback at all — the bytes wait in the socket
+/// until `inet_set_opts` re-selects it (`sock_select(desc, FD_READ|FD_CLOSE, desc->active > 0)`,
+/// `:7982`) and the `trigger_recv` inline `tcp_recv` (`:11139`) takes them. Nothing of them may
+/// surface as `{Port, {data, …}}` in the meantime, or the later arm would deliver nothing.
+#[test]
+fn a_spent_grant_leaves_the_peers_bytes_in_the_kernel_and_the_rearm_delivers_them() {
+    let Link { mut port, mut peer } = link();
+
+    assert_eq!(port.setopts(&[active_once()]), ctl_ok());
+    send(&mut peer, b"abc");
+    let delivered = port.until(1);
+    assert_eq!(delivered.len(), 1, "the grant's one delivery");
+    assert_eq!(payloads(&delivered)[0].body.as_deref(), Some(&b"abc"[..]));
+    assert_eq!(port.input_len(), 0, "an active port never fills the input queue");
+
+    // The grant is spent, so the socket is passive. The peer writes again: the readiness edge
+    // still fires (this crate keeps the registration armed for the socket's life), but the spent
+    // window means the bytes must be left alone.
+    send(&mut peer, b"defgh");
+    let extra = port.quiet(3);
+    assert!(extra.is_empty(), "a spent grant delivers nothing: {extra:?}");
+    assert_eq!(
+        port.input_len(),
+        0,
+        "and the reactor leaves the peer's bytes in the kernel"
+    );
+
+    // Re-arming delivers exactly what the peer wrote during the spent window.
+    assert_eq!(port.setopts(&[active_once()]), ctl_ok());
+    let again = port.until(1);
+    assert_eq!(again.len(), 1, "the re-arm delivers the waiting bytes: {again:?}");
+    assert_eq!(payloads(&again)[0].body.as_deref(), Some(&b"defgh"[..]));
+    assert_eq!(port.input_len(), 0, "still nothing on the passive channel");
+}
+
 /// `{active, false}`: the bytes take the **passive** path into the port input queue, so the
 /// active channel stays empty and the existing `recv` route is unchanged.
 #[test]
@@ -837,6 +877,38 @@ fn the_oracle_delivers_a_waiting_byte_inside_the_setopts_call() {
     );
     let Some(out) = erl_stdout(armed) else { return };
     assert_eq!(out.trim(), "N=0|D=<<\"Q\">>", "`{{active,true}}` only arms");
+}
+
+/// A peer write during a spent grant stays in the socket: nothing arrives while the port is
+/// passive, and the next `{active, once}` delivers exactly those bytes.
+///
+/// The oracle's counterpart of
+/// [`a_spent_grant_leaves_the_peers_bytes_in_the_kernel_and_the_rearm_delivers_them`]: the driver
+/// deselects the socket when the grant is spent (`inet_drv.c:13106`-`:13114`) and re-selects it on
+/// the next arm, whose `trigger_recv` inline read (`:11139`) takes the waiting bytes.
+#[test]
+fn the_oracle_holds_the_peers_bytes_over_a_spent_grant_and_delivers_them_on_the_rearm() {
+    let expr = concat!(
+        "{ok,L} = gen_tcp:listen(0,[binary,{active,false},{reuseaddr,true},{ip,{127,0,0,1}}]), ",
+        "{ok,P} = inet:port(L), ",
+        "{ok,C} = gen_tcp:connect({127,0,0,1},P,[binary,{active,false},{nodelay,true}]), ",
+        "{ok,S} = gen_tcp:accept(L), ",
+        "ok = inet:setopts(S,[{packet,raw},{active,once}]), ",
+        "ok = gen_tcp:send(C,\"abc\"), ",
+        "{tcp,_,D1} = receive M1 -> M1 after 2000 -> timeout end, ",
+        "ok = gen_tcp:send(C,\"defgh\"), ",
+        "timer:sleep(100), ",
+        "X = receive M2 -> M2 after 300 -> none end, ",
+        "ok = inet:setopts(S,[{active,once}]), ",
+        "{tcp,_,D2} = receive M3 -> M3 after 2000 -> timeout end, ",
+        "io:format(\"D1=~p|X=~p|D2=~p~n\",[D1,X,D2])"
+    );
+    let Some(out) = erl_stdout(expr) else { return };
+    assert_eq!(
+        out.trim(),
+        "D1=<<\"abc\">>|X=none|D2=<<\"defgh\">>",
+        "the spent grant holds the second write back, the re-arm delivers it"
+    );
 }
 
 /// The oracle's counterpart of
