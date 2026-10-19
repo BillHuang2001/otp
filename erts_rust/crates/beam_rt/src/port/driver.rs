@@ -2145,14 +2145,6 @@ pub struct DriverPortAdapter {
     /// `load` stamps the entry's flag word onto. The driver has no other route to report the state:
     /// the port layer consults the driver, never the runtime's metadata.
     busy: BusyFlag,
-    /// The port's **OS child pid**, seized from the host at [`DriverPortAdapter::load`] (see
-    /// [`OsPidFlag`]).
-    ///
-    /// Held so the pid the driver records from inside `start` stays reachable for the port's whole
-    /// life even if a reader took its own copy late, and so a port that is torn down still has the
-    /// value its `port_info(Port, os_pid)` would have answered. [`DriverPort::clear_driver_state`]
-    /// does **not** clear it (the C's `prt->os_pid` is port state, not driver-private state).
-    os_pid: OsPidFlag,
 }
 
 /// One descriptor a driver selected, with the directions it armed.
@@ -2216,9 +2208,10 @@ impl DriverPortAdapter {
         // exposes no host): the busy state `set_busy_port` writes, whose other half `load` stamps
         // just below from the entry's `ERL_DRV_FLAG_SOFT_BUSY`, and the OS pid `erl_drv_set_os_pid`
         // records. Both are shared by `Rc`, so taking them here and writing through the host later
-        // is the same state (see [`BusyFlag`], [`OsPidFlag`]).
+        // is the same state (see [`BusyFlag`], [`OsPidFlag`]). The OS pid handle is **not** kept on
+        // this adapter: the runtime seizes its own clone with [`DriverPort::os_pid_flag`] before
+        // this call and answers `port_info(Port, os_pid)` from that same shared cell.
         let busy = host.busy_flag();
-        let os_pid = host.os_pid_flag();
         {
             let mut state = control.borrow_mut();
             state.attached = true;
@@ -2239,7 +2232,6 @@ impl DriverPortAdapter {
             terms,
             monitors,
             busy,
-            os_pid,
             selected: Vec::new(),
         })
     }

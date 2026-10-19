@@ -298,6 +298,7 @@ fn test_meta(command: &str) -> PortMeta {
         driver_atoms: None,
         driver_control_flags: None,
         driver_busy: None,
+        driver_os_pid: None,
         driver_monitors: None,
         input: Cell::new(0),
         output: Cell::new(0),

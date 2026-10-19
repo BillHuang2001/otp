@@ -215,6 +215,10 @@ impl PeerCloseLatches {
     }
 
     /// How many ports this latch currently holds a report for (the suite's witness).
+    ///
+    /// Test-only: production code never needs the size, because [`PeerCloseLatches::prune`] is the
+    /// bound that keeps the set live-port-sized and it answers the count it dropped.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.reported.len()
     }
@@ -384,11 +388,13 @@ impl PortRegistry {
     }
 
     /// Forgets port `number`'s peer-close latch — the per-port half of
-    /// [`PeerCloseLatches::forget`], for a caller that retires a port number outside
-    /// [`PortRegistry::close`](PortRegistry::close).
+    /// [`PeerCloseLatches::forget`].
     ///
-    /// [`PortRegistry::close`](PortRegistry::close) already drops it with the port's extras, so
-    /// this is idempotent: a second call for the same number is a no-op.
+    /// [`PortRegistry::close`](PortRegistry::close) and [`PortRegistry::fail_port`] already drop it
+    /// with the port's extras (`PortExtras::forget_port`), so no production route needs this
+    /// separate seam; it exists for the suite's recycle check, which clears one latch without
+    /// tearing the port down. Idempotent: a second call for the same number is a no-op.
+    #[cfg(test)]
     pub(crate) fn forget_peer_close(&mut self, number: u64) {
         self.extras.peer_closes.forget(number);
     }
