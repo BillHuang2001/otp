@@ -345,6 +345,174 @@ fn bs_get_binary2_above_the_heap_limit_builds_an_off_heap_refc_result() {
     );
 }
 
+// -- bs_get_position / bs_set_position: C's small-integer pair ----------
+/// Drive one bitstring-family instruction over `module`, asserting the family claims it
+/// and reports no raise.
+fn drive_instr(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut MinimalContext,
+    instr: &Instr,
+) -> Step {
+    family_exec(
+        machine,
+        module,
+        &LabelMap::new(),
+        instr,
+        0,
+        0,
+        ctx,
+    )
+    .expect("the bitstrings family reports no raise")
+    .expect("the bitstrings family claims the variant")
+}
+
+/// `bs_start_match3 {f,0} {x,0} {x,1}` — the entry every position test below starts from.
+fn start_match(machine: &mut Machine, module: &Module, ctx: &mut MinimalContext) -> Step {
+    drive_instr(
+        machine,
+        module,
+        ctx,
+        &Instr::BsStartMatch3 {
+            fail: NO_FAIL,
+            bin: Operand::X(0),
+            live: 1,
+            dst: Operand::X(1),
+        },
+    )
+}
+
+/// `bs_skip_bits2 {f,0} {x,1} N 1` — advance the context at `x(1)` by `bits` bits.
+fn skip_bits(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut MinimalContext,
+    bits: i64,
+) -> Step {
+    drive_instr(
+        machine,
+        module,
+        ctx,
+        &Instr::BsSkipBits2 {
+            fail: NO_FAIL,
+            ctx: Operand::X(1),
+            size: Operand::Integer(bits),
+            unit: 1,
+            flags: 0,
+        },
+    )
+}
+
+/// `bs_get_position {x,1} {x,2}`.
+fn get_position(machine: &mut Machine, module: &Module, ctx: &mut MinimalContext) -> Step {
+    drive_instr(
+        machine,
+        module,
+        ctx,
+        &Instr::BsGetPosition {
+            ctx: Operand::X(1),
+            dst: Operand::X(2),
+            live: 2,
+        },
+    )
+}
+
+/// `bs_set_position {x,1} {x,2}` — restore the context at `x(1)` from `x(2)`.
+fn set_position(machine: &mut Machine, module: &Module, ctx: &mut MinimalContext) -> Step {
+    drive_instr(
+        machine,
+        module,
+        ctx,
+        &Instr::BsSetPosition {
+            ctx: Operand::X(1),
+            pos: Operand::X(2),
+        },
+    )
+}
+
+/// The `(start, end)` bit position of the match context at `x(1)`.
+fn context_position(machine: &Machine) -> Option<(usize, usize)> {
+    raw::ctx_parts(machine.x(1).expect("the context root"))
+        .map(|(_, start, end)| (start, end))
+}
+
+/// A 4-byte subject in `x(0)` with a match context over it in `x(1)`, driven through the
+/// real family dispatch.
+fn position_fixture() -> (Machine, Module, MinimalContext) {
+    let mut machine = Machine::with_max_register(4);
+    let mut ctx = MinimalContext::new();
+    let module = Module::default();
+    let subject = raw::make_bits(&mut machine, &mut ctx, &[1, 2, 3, 4], 32).expect("a heap binary");
+    machine.set_x(0, subject).expect("root the subject");
+    assert_eq!(start_match(&mut machine, &module, &mut ctx), Step::Next);
+    (machine, module, ctx)
+}
+
+/// `bs_get_position` publishes the bare bit position as a **small integer**
+/// (`make_small(sb->start)`, C's `i_bs_get_position`, `emu/bs_instrs.tab:1145-1149`;
+/// the ARCH_64 fused `i_bs_start_match3_gp` does the same for its `$Pos`), and
+/// `bs_set_position` decodes that immediate back into `sb->start` (`:1140-1143`) — so the
+/// save/restore pair the compiler brackets a match sequence with reserves **nothing**.
+/// A context-snapshot save would allocate a 5-word block per attempt.
+#[test]
+fn bs_get_position_stores_a_small_integer_that_bs_set_position_restores() {
+    let (mut machine, module, mut ctx) = position_fixture();
+    assert_eq!(skip_bits(&mut machine, &module, &mut ctx, 16), Step::Next);
+    assert_eq!(context_position(&machine), Some((16, 32)));
+
+    assert_eq!(get_position(&mut machine, &module, &mut ctx), Step::Next);
+    let saved = machine.x(2).expect("the saved position");
+    assert!(
+        beam_term::is_small(saved),
+        "C stores `make_small(position)`, not a context snapshot"
+    );
+    assert_eq!(beam_term::signed_value(saved), 16);
+
+    // Move on, then rewind through the saved immediate.
+    assert_eq!(skip_bits(&mut machine, &module, &mut ctx, 16), Step::Next);
+    assert_eq!(context_position(&machine), Some((32, 32)));
+    assert_eq!(set_position(&mut machine, &module, &mut ctx), Step::Next);
+    assert_eq!(
+        context_position(&machine),
+        Some((16, 32)),
+        "the restored position is the one `bs_get_position` published"
+    );
+    // And the restored context is still the live, mutable one: a further advance works.
+    assert_eq!(skip_bits(&mut machine, &module, &mut ctx, 8), Step::Next);
+    assert_eq!(context_position(&machine), Some((24, 32)));
+}
+
+/// A position no small integer can hold (`2^60`, past the 60-bit immediate range) keeps the
+/// engine's **whole-context snapshot**: C builds a `BIG_UINT_HEAP_SIZE` bignum there
+/// (`emu/bs_instrs.tab:1150-1163`) and its `bs_set_position` reads a bignum back, while
+/// `position_of` decodes the small form and a context only — so the snapshot (which
+/// `position_of` accepts) is the honest fallback rather than a word `bs_set_position` would
+/// refuse. It round-trips in both directions.
+#[test]
+fn bs_get_position_beyond_the_small_range_round_trips_through_a_snapshot() {
+    const HUGE: usize = 1 << 60;
+    let (mut machine, module, mut ctx) = position_fixture();
+    let context = machine.x(1).expect("the context root");
+    raw::set_ctx_start(context, HUGE);
+
+    assert_eq!(get_position(&mut machine, &module, &mut ctx), Step::Next);
+    let saved = machine.x(2).expect("the saved position");
+    assert!(
+        !beam_term::is_small(saved),
+        "2^60 is not a small integer, so the immediate form cannot carry it"
+    );
+    assert_eq!(
+        raw::ctx_parts(saved).map(|(_, start, end)| (start, end)),
+        Some((HUGE, 32)),
+        "the fallback is a context snapshot carrying the position"
+    );
+
+    // Restore it: `position_of` reads the snapshot's `start`, so the rewind is exact.
+    raw::set_ctx_start(context, 0);
+    assert_eq!(set_position(&mut machine, &module, &mut ctx), Step::Next);
+    assert_eq!(context_position(&machine), Some((HUGE, 32)));
+}
+
 // -- the empty-binary match (the `base64:encode(<<>>)` shape) -----------
 /// The **empty-binary match**: the two `bs_match` command lists the installed
 /// `erlc` emits for `base64:encode_binary/4`'s first and empty clauses, driven as
