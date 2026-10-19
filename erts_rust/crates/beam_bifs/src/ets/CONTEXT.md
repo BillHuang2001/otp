@@ -4,7 +4,7 @@
 The `ets:*` BIF surface of `beam_bifs`: the `TableRegistry` (handle → live `beam_ets::Table`, name → handle, direction-tagged continuation handles, compiled-spec handles, creation-time `TableProfile`s) plus every registered `ets:*` BIF, built on `beam_ets`'s table semantics.
 The crate's `TableRegistry` is the M1 "runtime side" of ETS — the table state itself, the access matrix and the match-spec engine stay in `../beam_ets` (read-only).
 Ground truth (read-only): `../../../erts/emulator/beam/erl_db_*.c`, `erl_db_util.c`, `../../../erts/emulator/beam/erl_db_hash.c` and the compiled `ets.erl` wrappers.
-`bif.tab` declares 59 `ets:*` keys: **58 are served here**, **1** C-interior one (`internal_request_all/0`) stays a seam-backed typed `unsupported_bif` gap registered in `../runtime/other.rs`.
+The registry carries **59** `ets:*` keys — the **51** `bif.tab` declares plus **8** stdlib fast paths (`all/0`, `delete_all_objects/1`, `foldl/3`, `foldr/3`, `match_delete/2`, `match_spec_run/2`, `select_delete/2`, `tab2list/1`): **58 are served here**, **1** C-interior one (`internal_request_all/0`) stays a seam-backed typed `unsupported_bif` gap registered in `../runtime/other.rs`.
 `fun2ms/1`/`repair_continuation/2` are **not** in `bif.tab` (pure `ets.erl` functions) and stay unregistered.
 
 ## API Surface
