@@ -549,12 +549,14 @@ impl Evaluator<'_, '_> {
         let Expr::Block(body) = tree else {
             let value = self.expr(tree, env)?;
             self.prune_escaped(env, value);
+            self.prune_resources(env, value);
             return Ok(value);
         };
         let mut last = NIL;
         for expression in body {
             last = self.expr(expression, env)?;
             self.prune_escaped(env, last);
+            self.prune_resources(env, last);
         }
         Ok(last)
     }
@@ -578,6 +580,30 @@ impl Evaluator<'_, '_> {
         extra.extend(env.values().copied());
         extra.push(value);
         let _ = reclaim::prune(self.ctx.runtime, &extra);
+    }
+    /// Releases the **NIF resource terms** the `-eval` route minted and dropped
+    /// ([`reclaim::prune_at_statement_boundary`]).
+    ///
+    /// The `-eval` action process is never enqueued, so it never reaches the runner's park arm where
+    /// a scheduled process's resource prune runs; without this site an `-eval`-only run would retain
+    /// every resource term it ever minted for the runtime's life. The boundary is the same one
+    /// [`Evaluator::prune_escaped`] uses and for the same reason: it is the only point where the
+    /// evaluator's live term set (its environment plus the reduced value) is fully nameable.
+    ///
+    /// The soundness device is the runtime's **frontier** — the candidate set as of the previous
+    /// statement boundary — because a resource minted *before* this expression began may be held by
+    /// a store this walk cannot enumerate; only candidates minted inside the statement may be
+    /// released. The very first boundary of a runtime therefore releases nothing (a bounded
+    /// one-statement leak, documented in the `reclaim` module's resource half). The steady-state
+    /// cost is one registry snapshot of an (usually empty) set plus one `Vec` compare.
+    fn prune_resources(&mut self, env: &Env, value: Eterm) {
+        if !self.prune || self.depth != 0 {
+            return;
+        }
+        let mut extra: Vec<Eterm> = Vec::with_capacity(env.len() + 1);
+        extra.extend(env.values().copied());
+        extra.push(value);
+        let _ = reclaim::prune_at_statement_boundary(self.ctx.runtime, &extra);
     }
     /// [`Evaluator::expr`] without the depth bookkeeping.
     fn expr_inner(&mut self, expr: &Expr, env: &mut Env) -> EResult<Eterm> {

@@ -53,7 +53,18 @@
 //! * a **heap-admission door** inside a slice — the executing machine's root set is not published
 //!   there, and the door has no `&mut Machine` to publish it from;
 //! * a **BIF** — a BIF's arguments live on a pooled heap outside the process's root set;
-//! * the **`-eval` route** — the action process is never enqueued, so it never parks.
+//! * the **`-eval` route** — the action process is never enqueued, so it never parks. That route
+//!   is **not** left unreclaimed: it has its own two sites, in [`crate::eval::reclaim`]'s resource
+//!   half — the `-eval` statement boundary
+//!   ([`crate::eval::reclaim::prune_at_statement_boundary`], between the evaluator's top-level
+//!   statements) and a **nested run**'s epilogue
+//!   ([`crate::eval::reclaim::prune_beyond`], from `RuntimeContext::adopt_nested_payloads`, which a
+//!   cross-module call and a fun application both reach). Both run the **same** reachability
+//!   descent and the same two-tier (word, then reference-identity) match this module's walk uses,
+//!   under a different soundness device — a **frontier**, so a site releases only candidates minted
+//!   inside its own window, because neither site can enumerate its whole process the way a park
+//!   can. This module stays the scheduled-process site and its gates below stay exactly as they
+//!   are.
 //!
 //! # Cadence
 //!

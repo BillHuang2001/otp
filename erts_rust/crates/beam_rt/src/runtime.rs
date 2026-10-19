@@ -197,6 +197,31 @@ pub struct EvalOffHeapStats {
     pub any_engine: bool,
 }
 
+/// The **NIF-resource prune**, as this runtime's own bookkeeping sees it.
+///
+/// A live `enif_make_resource` term owns one reference on its resource object, and the reference is
+/// dropped only when nothing reachable names the term any more (`beam_abi`'s release seam, whose
+/// reachability predicate is the caller's). Three sites decide that: the runner's park arm
+/// ([`crate::context::gc`]'s `resources::reclaim`, for a scheduled process) plus the two **non-park**
+/// sites [`crate::eval::reclaim`]'s resource half adds — the `-eval` statement boundary and a nested
+/// run's epilogue. This snapshot is the runtime's observability of all of it; the oracle has no
+/// counterpart (its terms are refcounted straight off the process heap), so nothing here is a
+/// differential figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourcePruneStats {
+    /// How many live resource terms the ABI's registry holds right now (one per mint).
+    pub live_terms: usize,
+    /// How many resource terms the non-park sites have released (each is one dropped term
+    /// reference; a release whose count did not reach zero runs no destructor).
+    pub released: u64,
+    /// How many times a non-park site ran a reachability walk.
+    pub prunes: u64,
+    /// How many times a non-park site declined because soundness could not be shown.
+    pub declines: u64,
+    /// The reason of the most recent decline.
+    pub last_decline: Option<&'static str>,
+}
+
 /// The Rust ERTS runtime.
 pub struct Runtime {
     /// The configuration this runtime was created with.
@@ -341,7 +366,16 @@ pub struct Runtime {
     /// weaken any guard — it disables the reclaim, so the store simply grows, which is what the
     /// measurement compares against.
     eval_prune_enabled: bool,
-    /// Whether a process **engine** has ever been registered on this runtime — a sticky,
+    /// The **NIF-resource prune**'s bookkeeping
+    /// ([`crate::eval::reclaim::ResourcePruneState`]): the `-eval` route's frontier slot (the
+    /// candidate set as of its previous statement boundary), the observed live-term count and the
+    /// prune/decline/release counters.
+    ///
+    /// It lives here rather than in a site because the `-eval` statement boundary must remember its
+    /// previous observation **across** statements. A nested run's frontier is deliberately *not*
+    /// here: nested runs recurse, so it is a per-run local (see [`crate::eval::reclaim`]'s resource
+    /// half).
+    pub(crate) resource_prune: crate::eval::reclaim::ResourcePruneState,    /// Whether a process **engine** has ever been registered on this runtime — a sticky,
     /// `O(1)` signal (there is no way to enumerate
     /// [`Runtime::runner_state`](crate::runner::RunnerState)'s engines from outside
     /// `crate::runner`, and an engine outlives the slice that created it, so *presence* is
@@ -1219,7 +1253,7 @@ impl Runtime {
             eval_heap_retired: Vec::new(),
             eval_prune: crate::eval::reclaim::PruneState::default(),
             eval_prune_enabled: true,
-            engine_registered: false,
+            resource_prune: crate::eval::reclaim::ResourcePruneState::default(),            engine_registered: false,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
             ports,
@@ -1983,6 +2017,32 @@ impl Runtime {
             prunes: self.eval_prune.prunes,
             declines: self.eval_prune.declines,
             any_engine: self.any_engine_ever(),
+        }
+    }
+    /// Turns the **NIF-resource** prune's two non-park sites ([`crate::eval::reclaim`]'s resource
+    /// half: the `-eval` statement boundary and a nested run's epilogue) on or off.
+    ///
+    /// It is **on** in every production route; this exists for the same reason
+    /// [`Runtime::set_eval_prune_enabled`] does — so a measurement can hold the mechanism out of the
+    /// picture and compare one loop against itself (the same expression with it off retains every
+    /// resource term the loop mints, which is what makes the "bounded" claim falsifiable). Nothing
+    /// else changes: the runner's park-arm resource prune is a different site and is not affected,
+    /// no guard is weakened, and while it is off the sites record no frontier (so turning it back on
+    /// starts from a clean slate and leaks one window).
+    ///
+    /// It is deliberately **not** a `-eval` flag or an `ERL_*` switch — a user-facing kill switch for
+    /// a memory reclaim would be a footgun.
+    pub fn set_resource_prune_enabled(&mut self, enabled: bool) {
+        self.resource_prune.enabled = enabled;
+    }
+    /// This runtime's own view of the NIF-resource prune (see [`ResourcePruneStats`]).
+    pub fn resource_prune_stats(&self) -> ResourcePruneStats {
+        ResourcePruneStats {
+            live_terms: beam_abi::nif::enif::resources::resource_terms().len(),
+            released: self.resource_prune.released,
+            prunes: self.resource_prune.prunes,
+            declines: self.resource_prune.declines,
+            last_decline: self.resource_prune.last_decline,
         }
     }
     /// Appends every **root** that can name an off-heap payload to `out` — the prune's
