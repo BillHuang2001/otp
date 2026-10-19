@@ -27,6 +27,8 @@
 
 use super::*;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::time::Duration;
 
 use beam_alloc::Heap;
 use beam_term::atom::AtomTable;
@@ -34,6 +36,7 @@ use beam_term::prelude::{
     atom_val, is_atom, is_tuple, make_atom, make_small, tuple_element, tuple_size,
 };
 
+use crate::driver::async_pool::{AsyncPool, ReadyDelivery};
 use crate::driver::host::{DriverEnv, DriverHost};
 use crate::driver::types::{term_data, ERL_DRV_ATOM, ERL_DRV_INT, ERL_DRV_READ, ERL_DRV_TUPLE};
 
@@ -203,6 +206,55 @@ impl DriverHost for MinimalDriverHost {
 
     fn send_term(&mut self, _port: ErlDrvPort, _to: Option<Eterm>, _term: Eterm) -> c_int {
         -1
+    }
+}
+
+/// A host that offers the C async-job pool ([`DriverHost::async_pool`]) and records what
+/// [`DriverHost::deliver_ready_async`] is asked to deliver.
+///
+/// It has **no** `r#async` override, so a job that reached the legacy path would answer `-1` — a
+/// pool submission is therefore unmistakable.
+struct PoolDriverHost {
+    heap: Heap,
+    pool: AsyncPool,
+    delivered: Vec<(usize, usize)>,
+}
+
+impl PoolDriverHost {
+    fn new(pool: AsyncPool) -> PoolDriverHost {
+        PoolDriverHost {
+            heap: Heap::new(1024).expect("a small test heap is allocatable"),
+            pool,
+            delivered: Vec::new(),
+        }
+    }
+}
+
+impl DriverHost for PoolDriverHost {
+    fn heap(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    fn intern_atom(&mut self, _name: &str) -> Option<Eterm> {
+        None
+    }
+
+    fn output(&mut self, _port: ErlDrvPort, _data: &[u8]) -> c_int {
+        -1
+    }
+
+    fn send_term(&mut self, _port: ErlDrvPort, _to: Option<Eterm>, _term: Eterm) -> c_int {
+        -1
+    }
+
+    fn async_pool(&self) -> Option<AsyncPool> {
+        Some(self.pool.clone())
+    }
+
+    fn deliver_ready_async(&mut self, port: ErlDrvPort, data: *mut c_void) -> ReadyDelivery {
+        self.delivered.push((port as usize, data as usize));
+        // The driver entry of this host has no `ready_async` callback (`io.c:5382`).
+        ReadyDelivery::NeedFree
     }
 }
 
@@ -1016,4 +1068,89 @@ fn the_default_output2_makes_exactly_one_output_call() {
     assert_eq!(host.output2(port, b"HDR", Some(b"")), 0);
     assert_eq!(host.calls, 4);
     assert_eq!(host.output, b"bHDRHDR");
+}
+
+/// With a pool ([`DriverHost::async_pool`]) `driver_async` submits the job and reports the C's
+/// positive id (`erl_async.c:600`); the pool then invokes it off this thread and the host's
+/// completion policy releases it.
+#[test]
+fn driver_async_with_a_pool_returns_the_job_id() {
+    static INVOKES: AtomicUsize = AtomicUsize::new(0);
+    static FREES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn job_invoke(_: *mut c_void) {
+        INVOKES.fetch_add(1, SeqCst);
+    }
+
+    unsafe extern "C" fn job_free(_: *mut c_void) {
+        FREES.fetch_add(1, SeqCst);
+    }
+
+    let mut host = PoolDriverHost::new(AsyncPool::new(2));
+    // A clone, so the assertions below never alias the `&mut host` the env holds.
+    let pool = host.pool.clone();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+    let data = 0x1234usize as *mut c_void;
+    let mut key: c_uint = 5;
+
+    // SAFETY: `port` is a live env handle; the two callbacks are live C functions and `data` is a
+    // payload neither reads.
+    let rc = unsafe { driver_async(port, &mut key, Some(job_invoke), data, Some(job_free)) };
+    assert!(rc > 0, "a pool reports the job id, not a handle: {rc}");
+    assert_eq!(key, 5 % 2, "the pool writes `*key % threads` back (`:590-592`)");
+    assert_eq!(
+        pool.pending_for_port(port),
+        1,
+        "the job landed in the pool (queued or ready)"
+    );
+
+    // Wait for the worker to run and publish it, then apply the completion policy through the host.
+    assert!(
+        pool.wait_ready(Duration::from_secs(10)),
+        "the pool ran `async_invoke` and made the job ready"
+    );
+    assert_eq!(INVOKES.load(SeqCst), 1, "the pool ran `async_invoke`");
+    assert_eq!(host.delivered.len(), 0, "nothing was delivered before the drain");
+    let delivered = pool.drain_ready(|p, d| host.deliver_ready_async(p, d));
+    assert_eq!(delivered, 1, "the finished job was completed exactly once");
+    assert_eq!(
+        host.delivered,
+        vec![(port as usize, data as usize)],
+        "`ready_async` received the port handle and the job's `async_data`"
+    );
+    assert_eq!(FREES.load(SeqCst), 1, "`NeedFree` ran the job's `async_free`");
+    assert_eq!(pool.pending_for_port(port), 0);
+}
+
+/// A host **without** a pool keeps the legacy `DriverHost::r#async` path byte-identically (the
+/// existing `TestDriverHost` answers its recognizable `5`), and a pool host refuses a `NULL`
+/// `async_invoke` instead of calling it (`erl_async.c:604`).
+#[test]
+fn driver_async_without_a_pool_keeps_the_legacy_path() {
+    let mut host = TestDriverHost::new();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+    let mut key: c_uint = 9;
+
+    // SAFETY: `port` is a live env handle; the operands are forwarded verbatim to the host.
+    let rc = unsafe { driver_async(port, &mut key, None, 0x99usize as *mut c_void, None) };
+    assert_eq!(rc, 5, "the legacy hook's code comes back unchanged");
+    assert_eq!(host.async_calls, vec![(false, 0x99)]);
+    assert_eq!(key, 9, "the legacy path is the host's business, not ours");
+}
+
+#[test]
+fn driver_async_with_a_pool_refuses_a_null_invoke() {
+    let mut host = PoolDriverHost::new(AsyncPool::new(1));
+    let pool = host.pool.clone();
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+
+    // SAFETY: `port` is a live env handle; `None` invoke is exactly the operand under test.
+    let rc = unsafe {
+        driver_async(port, core::ptr::null_mut(), None, 0x77usize as *mut c_void, None)
+    };
+    assert_eq!(rc, -1, "nothing to run is not a job (the C would call NULL, `:604`)");
+    assert_eq!(pool.pending_for_port(port), 0, "and nothing was submitted");
 }

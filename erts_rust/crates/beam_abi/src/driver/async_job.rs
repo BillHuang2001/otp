@@ -52,10 +52,13 @@
 //!     let Some(job) = (unsafe { AsyncJob::new(invoke, free, data) }) else {
 //!         return -1; // `async_invoke == NULL`: nothing to run, so the caller still owns the data
 //!     };
-//!     let tdata = job.invoke();              // `(*async_invoke)(async_data)`
-//!     let _ = self.ready_async(port, tdata); // the C then calls the entry's `ready_async`
-//!     job.finish();                          // ... and finally `(*async_free)(async_data)`, once
-//!     0                                      // `0` = "completed", as the C reports an inline job
+//!     let tdata = job.invoke();               // `(*async_invoke)(async_data)`
+//!     if self.ready_async(port, tdata) {      // the C then calls the entry's `ready_async`
+//!         job.hand_off();                     // ... which took the data: `async_free` must NOT run
+//!     } else {
+//!         job.finish();                       // ... no callback: `(*async_free)(async_data)`, once
+//!     }
+//!     0                                       // `0` = "completed", as the C reports an inline job
 //! }
 //! ```
 //!
@@ -63,23 +66,26 @@
 //! answering `-1`, and the existence of this type changes no slot's semantics (the addition is
 //! **inert**).
 //!
-//! The C runs that final `async_free` whenever the result has been consumed — the entry's
-//! `ready_async` callback took it (`erl_async.c:332`) or the port is already gone
-//! (`erl_async.c:322`) — so a host reproduces the same gate by choosing *when* it releases:
-//! `finish` runs it, dropping the handle runs it, and a host that hands the data on instead simply
-//! never calls either.
+//! The C's release gate is the *inverse* of "the data was consumed": `async_free` runs when the C's
+//! `async_ready(p, data)` reports `need_free` (`io.c:5374-5406`) — i.e. when the port has **no**
+//! `ready_async` callback at all (`:5382`, `need_free` stays `1`) or when the port is already gone
+//! (`erl_async.c:322-329`) — and it does **not** run when the driver's own `ready_async` callback
+//! actually took the data (`io.c:5399-5400` sets `need_free = 0`). A host reproduces that gate by
+//! choosing *when* it releases: [`AsyncJob::finish`] runs `async_free`, dropping the handle runs it,
+//! and [`AsyncJob::hand_off`] says "the driver's `ready_async` took the data" so nothing is freed.
 //!
 //! A host with a real worker pool queues the job instead (the C's `async_add`, `erl_async.c:544`);
-//! note that the handle is neither `Send` nor `Sync` because it holds raw C pointers, so a pooled
-//! host either constructs the handle on the worker thread that runs the job or re-establishes that
-//! guarantee itself. Transferring a job between threads is the *pool's* contract, not something this
-//! type can assert.
+//! note that the handle is neither `Send` nor `Sync` because it holds raw C pointers, so the
+//! thread-transfer contract is the pool's: [`super::async_pool::AsyncPool`] owns it (one documented
+//! `unsafe impl Send`), and this type cannot assert it.
 //!
 //! # `unsafe`
 //!
 //! Every `unsafe` block below carries a `// SAFETY:` rationale and [`AsyncJob::new`] documents its
 //! caller contract (workspace `CONTEXT.md` §3). `invoke`, `finish` and `drop` call the *driver's*
-//! C callbacks, which is only sound because `new` was told they are a live job's callbacks.
+//! C callbacks, which is only sound because `new` was told they are a live job's callbacks;
+//! [`AsyncJob::hand_off`] calls **nothing** — it only records that the driver's `ready_async` owns
+//! the data now.
 
 use core::fmt;
 
@@ -170,6 +176,17 @@ impl AsyncJob {
     /// the driver passed a `NULL` `async_free`, this is a no-op.
     pub fn finish(mut self) {
         self.release();
+    }
+
+    /// Hand the data over to the driver: its own `ready_async` callback took ownership, so
+    /// `async_free` must **not** run — the C's `need_free = 0` (`io.c:5399-5400`).
+    ///
+    /// This consumes the handle without calling either callback: `Drop` sees the release already
+    /// accounted for and frees nothing, so the driver's `ready_async` is the sole owner of
+    /// `async_data` from here on (`erl_async.c:332-338` runs `async_free` only when `async_ready`
+    /// answered `need_free`).
+    pub fn hand_off(mut self) {
+        self.finished = true;
     }
 
     /// The job's `async_data` pointer — the same pointer [`AsyncJob::invoke`] hands back and the
@@ -388,5 +405,33 @@ mod tests {
         assert!(shown.contains("Some"), "the free callback's presence is reported: {shown}");
         // Consume the (never-invoked) job so the counter-assertions above stay per-test.
         job.finish();
+    }
+
+    /// `hand_off` says the driver's `ready_async` took the data: neither callback runs, and the
+    /// handle's `Drop` cannot free afterwards (`io.c:5399-5400`, `erl_async.c:332-338`).
+    #[test]
+    fn handing_the_data_off_frees_nothing() {
+        static INVOKES: AtomicUsize = AtomicUsize::new(0);
+        static FREES: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn job_invoke(_: *mut c_void) {
+            INVOKES.fetch_add(1, SeqCst);
+        }
+
+        unsafe extern "C" fn job_free(_: *mut c_void) {
+            FREES.fetch_add(1, SeqCst);
+        }
+
+        // SAFETY: two live C callbacks of the frozen signature and a never-dereferenced payload.
+        let job = unsafe { AsyncJob::new(Some(job_invoke), Some(job_free), data_ptr()) }
+            .expect("a job with an `async_invoke` is a job");
+        let _ = job.invoke();
+        assert_eq!(INVOKES.load(SeqCst), 1);
+        job.hand_off();
+        assert_eq!(
+            FREES.load(SeqCst),
+            0,
+            "the driver's `ready_async` owns the data now — `async_free` must not run"
+        );
     }
 }
