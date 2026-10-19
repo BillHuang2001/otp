@@ -59,8 +59,8 @@ use beam_engine::{terms, ExecutionContext, MinimalContext};
 use beam_gc::HeapPolicy;
 use beam_loader::Module;
 use beam_process::{
-    MonitorRef, Priority, ProcessId, ProcessState, ProcessTable, RefAllocator, RemotePid, Scheduler,
-    SignalAtoms,
+    MonitorRef, PortId, Priority, ProcessId, ProcessState, ProcessTable, RefAllocator, RemotePid,
+    Scheduler, SignalAtoms,
 };
 use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm};
 
