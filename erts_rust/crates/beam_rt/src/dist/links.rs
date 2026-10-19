@@ -115,46 +115,57 @@ impl DistLinks {
             .position(|link| link.node == node && link.is_established())
     }
 
-    /// The index of the **established** accepted link whose handshake named `node`, if any.
+    /// The index of the **established** accepted link bound to `node`, if any.
     ///
-    /// The peer name comparison goes through `atoms` (see the module docs); an atom this
-    /// table does not know, or a non-atom term, has no name to compare and is therefore no
-    /// link. A cell that cannot be borrowed is reported as **no link**: this is a pure
-    /// query (the routing entry re-borrows and reports the typed error itself), and a
-    /// query must never panic.
-    pub(crate) fn accepted_index_for_node(
-        &self,
-        node: Eterm,
-        atoms: &AtomTable,
-    ) -> Option<usize> {
-        self.accepted_index(node, atoms, true)
+    /// The comparison is the peer's own **node atom term** ([`DistConnection::node_term`]),
+    /// bound by [`crate::dist::DistNode::bind_peer_nodes`] from the `node@host` name its
+    /// `'N'` handshake carried — so an accepted link is matched **exactly**, by the same
+    /// term the caller addresses, and a node no accepted link names has no index here. An
+    /// unbound link (still handshaking when the pass last bound) is not a route.
+    ///
+    /// A cell that cannot be borrowed is reported as **no link**: this is a pure query (the
+    /// routing entry re-borrows and reports the typed error itself), and a query must never
+    /// panic.
+    pub(crate) fn accepted_index_for_node(&self, node: Eterm) -> Option<usize> {
+        let accepted = self.accepted.try_borrow().ok()?;
+        accepted
+            .iter()
+            .position(|connection| connection.is_established() && connection.node_term() == Some(node))
     }
 
     /// Whether an **established** link to `node` exists in either half.
-    pub(crate) fn has_established_link_to(&self, node: Eterm, atoms: &AtomTable) -> bool {
-        self.link_index_for_node(node).is_some() || self.accepted_index_for_node(node, atoms).is_some()
+    pub(crate) fn has_established_link_to(&self, node: Eterm) -> bool {
+        self.link_index_for_node(node).is_some() || self.accepted_index_for_node(node).is_some()
     }
 
     /// Whether **any** link (either half) names `node`, whatever its handshake state.
     ///
     /// The distinction from [`DistLinks::has_established_link_to`] is what keeps a queued
     /// control alive while its link is still handshaking: the node is reachable, just not
-    /// yet usable.
-    pub(crate) fn names_node(&self, node: Eterm, atoms: &AtomTable) -> bool {
+    /// yet usable. The accepted half is matched by its bound node term, exactly like
+    /// [`DistLinks::accepted_index_for_node`].
+    pub(crate) fn names_node(&self, node: Eterm) -> bool {
         self.outbound.iter().any(|link| link.node == node)
-            || self.accepted_index(node, atoms, false).is_some()
+            || match self.accepted.try_borrow() {
+                Ok(accepted) => accepted
+                    .iter()
+                    .any(|connection| connection.node_term() == Some(node)),
+                Err(_) => false,
+            }
     }
 
     /// Whether a link that could reach `node` exists at all, **without** an atom table.
     ///
     /// This is the [`DistSignalRouter`](beam_process::DistSignalRouter)'s gate: the router
-    /// installed on the process table holds no atoms, so it can only compare the
-    /// **outbound** half's node term exactly (`link.node == node`) and observe that the
-    /// **accepted** half holds *some* link — an accepted connection knows its peer only as
-    /// `peer_name()`, and matching that against `node` needs the atom table the router does
-    /// not have. The precise resolution therefore happens one step later, in
-    /// [`crate::dist_client::DistClientInner`]'s flush, which does hold the live table and
-    /// drops a control for a node no link names with the typed reason recorded.
+    /// installed on the process table holds no atoms, so it compares **node atom terms** —
+    /// an outbound link's own `node` and an accepted link's bound
+    /// [`DistConnection::node_term`] — exactly, on both halves. Both are interned in the
+    /// runtime's one live table, so the term a routed signal addresses is the term a link
+    /// answers with; no name resolution is needed and none is skipped.
+    ///
+    /// A node with no link in either half is therefore refused **here**, with the typed
+    /// [`no_link_error`] — never accepted and dropped by a later flush (the A.5 contract: a
+    /// signal for a node with no link is a typed error, never a silent drop).
     ///
     /// A cell that cannot be borrowed is reported as **reachable**: a borrowed table means
     /// distribution work is in flight, so the signal must be queued rather than refused.
@@ -163,7 +174,9 @@ impl DistLinks {
             return true;
         }
         match self.accepted.try_borrow() {
-            Ok(accepted) => !accepted.is_empty(),
+            Ok(accepted) => accepted
+                .iter()
+                .any(|connection| connection.node_term() == Some(node)),
             Err(_) => true,
         }
     }
@@ -260,7 +273,7 @@ impl DistLinks {
         if let Some(index) = self.link_index_for_node(node) {
             return self.outbound[index].send_control(dop, args, atoms);
         }
-        if let Some(index) = self.accepted_index_for_node(node, atoms) {
+        if let Some(index) = self.accepted_index_for_node(node) {
             let mut accepted = self.borrow_accepted_mut()?;
             return (*accepted)[index].send_control(dop, args, atoms);
         }
@@ -288,22 +301,11 @@ impl DistLinks {
         if let Some(index) = self.link_index_for_node(node) {
             return self.outbound[index].send_message(from, to, msg, atoms);
         }
-        if let Some(index) = self.accepted_index_for_node(node, atoms) {
+        if let Some(index) = self.accepted_index_for_node(node) {
             let mut accepted = self.borrow_accepted_mut()?;
             return (*accepted)[index].send_message(from, to, msg, atoms);
         }
         Err(no_link_error(&self.node_label_in(node, atoms)))
-    }
-
-    /// The index of the accepted link naming `node`, optionally limited to established
-    /// ones.
-    fn accepted_index(&self, node: Eterm, atoms: &AtomTable, established_only: bool) -> Option<usize> {
-        let name = node_name(node, atoms)?;
-        let accepted = self.accepted.try_borrow().ok()?;
-        accepted.iter().position(|connection| {
-            (!established_only || connection.is_established())
-                && connection.peer_name().as_deref() == Some(name)
-        })
     }
 
     /// Borrows the accepted cell for a write, mapping a re-entrant borrow to a typed error
@@ -477,6 +479,19 @@ mod tests {
         panic!("the loopback 'N' handshake never completed");
     }
 
+    /// Binds an established accepted link's peer **node atom term**, exactly as
+    /// [`crate::dist::DistNode::bind_peer_nodes`] does from the scheduler pass: the peer's
+    /// `node@host` name is interned in the live table and the resulting term handed to the
+    /// link. Returns the bound term so a test can address the peer by it.
+    fn bind_peer(connection: &mut DistConnection, atoms: &mut AtomTable) -> Eterm {
+        let peer = connection
+            .peer_name()
+            .expect("an established link knows its peer's name");
+        let atom = make_atom(atoms.intern(&peer));
+        connection.bind_node(atom);
+        atom
+    }
+
     /// A toolchain-free **outbound** pair: a [`DistClient`] that dialled a loopback listener
     /// speaking the server side of the handshake, established and ready to route. The
     /// `dist_client` suite's fixture, copied for the same reason as [`socket_pair`].
@@ -597,11 +612,14 @@ mod tests {
     /// an accepted one, and an outbound `DOP_REG_SEND` must still reach it.
     #[test]
     fn the_routing_entry_finds_an_accepted_link() {
-        let (connection, mut peer, mut stream) = establishing_accepted();
+        let (mut connection, mut peer, mut stream) = establishing_accepted();
+        let mut atoms = AtomTable::new();
+        // The link's peer node term, bound exactly as the scheduler pass binds it — the
+        // accepted half is an exact node-term match, so an unbound link is no route.
+        let node = bind_peer(&mut connection, &mut atoms);
+        assert_eq!(node, make_atom(atoms.intern(PEER_NAME)));
         let accepted = Rc::new(RefCell::new(vec![connection]));
         let mut links = DistLinks::new(Rc::clone(&accepted));
-        let mut atoms = AtomTable::new();
-        let node = make_atom(atoms.intern(PEER_NAME));
         let mut heap = Heap::new(64).expect("the message heap");
         let from = make_external_pid(
             &mut heap,
@@ -668,9 +686,10 @@ mod tests {
     /// `DOP_EXIT` the accepted peer decodes.
     #[test]
     fn the_router_reaches_an_accepted_link() {
-        let (connection, mut peer, mut stream) = establishing_accepted();
-        let accepted = Rc::new(RefCell::new(vec![connection]));
+        let (mut connection, mut peer, mut stream) = establishing_accepted();
         let mut atoms = AtomTable::new();
+        let bound = bind_peer(&mut connection, &mut atoms);
+        let accepted = Rc::new(RefCell::new(vec![connection]));
         let our = make_atom(atoms.intern(ACCEPTOR_NAME));
         let client = DistClient::new(COOKIE.to_vec()).expect("client");
         client.set_identity(ACCEPTOR_NAME, our, 1, COOKIE);
@@ -680,8 +699,7 @@ mod tests {
 
         let mut heap = Heap::new(64).expect("the reason heap");
         let remote = RemotePid::from_eterm(
-            make_external_pid(&mut heap, make_atom(atoms.intern(PEER_NAME)), 5, 0, 1)
-                .expect("the target's external pid"),
+            make_external_pid(&mut heap, bound, 5, 0, 1).expect("the target's external pid"),
         )
         .expect("a remote target pid");
         let boom = make_atom(atoms.intern("boom"));
@@ -711,5 +729,63 @@ mod tests {
             }
             other => panic!("expected a DOP_EXIT on the accepted link, got {other:?}"),
         }
+    }
+
+    /// A routed signal for a node **no link reaches** is the typed refusal even when
+    /// another link is present — and it is refused **by the router**, not accepted and
+    /// silently dropped by the later flush (contract A.5: a signal for a node with no link
+    /// is a typed error, never a silent drop).
+    ///
+    /// The fixture holds one **established accepted** link bound to peer
+    /// `peer@host.example`, and addresses `other@host.example`: an accepted half that only
+    /// knew "some link exists" would have answered `Ok` here, queued the control, and let
+    /// `flush_pending` drop it with nothing but a recorded reason to show for it.
+    #[test]
+    fn a_routed_signal_for_an_unlinked_node_is_a_typed_error_even_with_another_link_present() {
+        let (mut connection, _peer, _stream) = establishing_accepted();
+        let mut atoms = AtomTable::new();
+        let bound = bind_peer(&mut connection, &mut atoms);
+        assert_eq!(
+            bound,
+            make_atom(atoms.intern(PEER_NAME)),
+            "the accepted link is bound to its own peer"
+        );
+        let accepted = Rc::new(RefCell::new(vec![connection]));
+        let our = make_atom(atoms.intern(ACCEPTOR_NAME));
+        let client = DistClient::new(COOKIE.to_vec()).expect("client");
+        client.set_identity(ACCEPTOR_NAME, our, 1, COOKIE);
+        client
+            .share_links_with(Rc::clone(&accepted))
+            .expect("install the node's accepted links");
+
+        let mut heap = Heap::new(64).expect("the reason heap");
+        let other = make_atom(atoms.intern("other@host.example"));
+        let remote =
+            RemotePid::from_eterm(make_external_pid(&mut heap, other, 5, 0, 1).expect("the pid"))
+                .expect("a remote target pid");
+        let reason = make_atom(atoms.intern("normal"));
+        let mut router = client.router();
+        let err = router
+            .route(beam_process::DistSignal::Exit {
+                from: ProcessId::new(2, 0),
+                to: remote,
+                reason,
+            })
+            .expect_err("no link reaches other@host.example, so the signal must be refused");
+        assert!(
+            err.to_string()
+                .contains("no established connection to node"),
+            "the router reports the typed refusal: {err}"
+        );
+        assert_eq!(
+            client.pump(&mut atoms).expect("pump the client"),
+            0,
+            "nothing was queued for the peer"
+        );
+        assert!(
+            client.last_error().is_none(),
+            "the refusal happened at the router, not as a silent flush drop: {:?}",
+            client.last_error()
+        );
     }
 }

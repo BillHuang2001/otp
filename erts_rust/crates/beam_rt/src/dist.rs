@@ -115,8 +115,10 @@ use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::epmd::{Alive2Req, Alive2Resp, EpmdClient, EPMD_DEFAULT_ADDR};
 use beam_dist::{DeliveryOutcome, Dispatched, Dop, InboundSink, PeerVisibility};
 use beam_dist::TcpListener;
-use beam_term::prelude::Eterm;
+use beam_term::prelude::{make_atom, Eterm};
 use beam_term::AtomTable;
+
+use crate::error;
 
 mod inbound;
 pub use inbound::LocalDeliverySink;
@@ -247,6 +249,12 @@ pub struct DistConnection {
     stream: TcpStream,
     /// The peer's socket address (a diagnostic; the dist wire carries no address).
     peer_addr: SocketAddr,
+    /// The peer's **node atom term** — the key a routed [`crate::dist::DistSignal`] addresses.
+    ///
+    /// `None` until [`DistNode::bind_peer_nodes`] interns [`DistConnection::peer_name`] into
+    /// the runtime's live atom table; a link that never binds is simply not matched by the
+    /// accepted half's lookup (see [`crate::dist::links`]).
+    node: Option<Eterm>,
     /// Bytes read from the peer so far.
     bytes_in: u64,
     /// Bytes written to the peer so far.
@@ -265,6 +273,7 @@ impl DistConnection {
             driver: ConnectionDriver::server(advertised, cookie, creation),
             stream,
             peer_addr,
+            node: None,
             bytes_in: 0,
             bytes_out: 0,
         })
@@ -288,11 +297,11 @@ impl DistConnection {
             driver,
             stream,
             peer_addr,
+            node: None,
             bytes_in: 0,
             bytes_out: 0,
         }
     }
-
     /// The link's protocol state ([`DriverState::Established`] once the `'N'`
     /// handshake has completed and been acknowledged).
     pub fn state(&self) -> DriverState {
@@ -319,6 +328,24 @@ impl DistConnection {
             .map(|name| String::from_utf8_lossy(name).into_owned())
     }
 
+    /// The peer's **node atom term**, once [`DistNode::bind_peer_nodes`] has interned
+    /// [`DistConnection::peer_name`] into the runtime's live atom table.
+    ///
+    /// This is what makes the accepted half of the routing table an **exact** node match:
+    /// a routed control addresses its peer by atom term, and an accepted link that has
+    /// bound its own answers with the very term the caller holds. A retired link is gone
+    /// from the table, so its binding is irrelevant — nothing outside the link holds it.
+    pub(crate) fn node_term(&self) -> Option<Eterm> {
+        self.node
+    }
+
+    /// Binds this link's peer node atom term (see [`DistConnection::node_term`]).
+    ///
+    /// The caller interns the peer's `node@host` name in the runtime's one live atom table
+    /// and hands the resulting term in; binding never re-interns and never looks a name up.
+    pub(crate) fn bind_node(&mut self, atom: Eterm) {
+        self.node = Some(atom);
+    }
     /// The peer's node creation, once the handshake advertised it.
     pub fn peer_creation(&self) -> u32 {
         self.driver.peer_creation()
@@ -647,6 +674,49 @@ impl DistNode {
         Rc::clone(&self.connections)
     }
 
+    /// Gives every **established** accepted link its peer's **node atom term**, interned
+    /// into `atoms` — the binding that makes the accepted half of [`DistLinks`] an **exact**
+    /// node match.
+    ///
+    /// A [`DistConnection`] learns its peer only as the `node@host` bytes its `'N'`
+    /// handshake carried ([`DistConnection::peer_name`]), while a routed control addresses
+    /// its peer by an **atom term**. Interned here, in the runtime's one live table, the
+    /// link can then answer [`DistConnection::node_term`] with the very term the caller
+    /// holds — so a control for a node with **no** link on either half is the typed
+    /// refusal from the routing entry itself, instead of a queued control that a later
+    /// flush silently drops.
+    ///
+    /// Called from the scheduler pass once the atom table is live
+    /// ([`crate::runtime::Runtime::bind_dist_peers`]); it is idempotent — a link already
+    /// bound is skipped, so a steady-state pass pays one borrow and one `is_some` per link.
+    /// Returns how many links were bound by **this** call.
+    ///
+    /// # Errors
+    ///
+    /// The shared link table's re-entrant borrow (never in practice: the pass binds between
+    /// the node's pump and the client's flush, holding neither).
+    pub(crate) fn bind_peer_nodes(&mut self, atoms: &mut AtomTable) -> Result<usize> {
+        let cell = self.links();
+        let mut connections = cell
+            .try_borrow_mut()
+            .map_err(|_| error::message("distribution: the accepted link table is already in use"))?;
+        let mut bound = 0;
+        for connection in connections.iter_mut() {
+            if connection.node_term().is_some() || !connection.is_established() {
+                continue;
+            }
+            let Some(name) = connection.peer_name() else {
+                // An established link whose handshake carried no readable peer name has
+                // nothing to intern; it stays unbound (and therefore unmatched) rather
+                // than being bound to a fabricated node.
+                continue;
+            };
+            let atom = make_atom(atoms.intern(&name));
+            connection.bind_node(atom);
+            bound += 1;
+        }
+        Ok(bound)
+    }
     /// A **diagnostic snapshot** of the accepted links, in accept order.
     ///
     /// The table is shared with the routing entry, so it cannot be lent out by reference;
@@ -1282,6 +1352,79 @@ mod tests {
         assert_eq!(client.peer_name().as_deref(), Some("acceptor@host.example"));
         assert_eq!(server.peer_creation(), 1);
         assert_eq!(client.peer_creation(), 1);
+    }
+
+    /// An **established** accepted link is bound to its peer's node atom term, which is
+    /// what makes the routing table's accepted half an exact node match: the link learns
+    /// its peer only as `node@host` bytes, so the term has to be interned into the live
+    /// table once, and binding is idempotent thereafter.
+    #[test]
+    fn bind_peer_nodes_gives_every_established_accepted_link_its_peer_term() {
+        let name = unique_node("bind");
+        let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+        let mut client = TcpStream::connect(("127.0.0.1", node.port()))
+            .expect("connect the node's listener");
+        client.set_nodelay(true).expect("TCP_NODELAY");
+        client
+            .set_read_timeout(Some(DIST_READ_SLICE))
+            .expect("the link's read slice");
+        // The accept, and (best-effort) the `epmd` registration.
+        node.pump().expect("the accept");
+
+        let mut peer = ConnectionDriver::client(b"peer@host.example", COOKIE, 1);
+        for _ in 0..200 {
+            node.pump().expect("the accepted link's pump");
+            let mut buf = [0u8; 4096];
+            match client.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => peer.feed(&buf[..n]),
+                Err(err) if is_would_block(&err) => {}
+                Err(err) => panic!("the peer's read: {err}"),
+            }
+            loop {
+                match peer.step() {
+                    Ok(beam_dist::StepOutcome::WouldBlock) => break,
+                    Ok(_) => {}
+                    Err(err) => panic!("the peer's step: {err}"),
+                }
+            }
+            if peer.has_output() {
+                let bytes = peer.take_output();
+                client.write_all(&bytes).expect("the peer's write");
+                client.flush().expect("the peer's flush");
+            }
+            let established = node
+                .links()
+                .borrow()
+                .first()
+                .is_some_and(|connection| connection.is_established());
+            if established {
+                break;
+            }
+        }
+
+        let mut atoms = beam_term::prelude::AtomTable::new();
+        assert_eq!(
+            node.links().borrow().first().and_then(|c| c.node_term()),
+            None,
+            "an accepted link is unbound until the scheduler pass binds it"
+        );
+        assert_eq!(
+            node.bind_peer_nodes(&mut atoms).expect("the first bind"),
+            1,
+            "the one established accepted link is bound"
+        );
+        let expected = make_atom(atoms.intern("peer@host.example"));
+        assert_eq!(
+            node.links().borrow().first().and_then(|c| c.node_term()),
+            Some(expected),
+            "the bound term is the peer's own node atom, interned in the live table"
+        );
+        assert_eq!(
+            node.bind_peer_nodes(&mut atoms).expect("the second bind"),
+            0,
+            "binding is idempotent: an already-bound link is skipped"
+        );
     }
 
     /// `close()` is deterministic and idempotent: the first call shuts the socket

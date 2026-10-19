@@ -975,6 +975,15 @@ impl Runtime {
                 Ok(0) => {}
                 Ok(count) => delivered += count,
             }
+            // Bind every freshly **established** accepted link to its peer's node atom term
+            // (contract A.5): the router installed on the process table holds no atom table,
+            // so without this binding an accepted link could not be matched by the node term
+            // a routed signal addresses, and a signal for a node with no link would have to
+            // be queued and then silently dropped. Deliberately not gated on
+            // `self.inbound_delivery` — that flag gates inbound *routing*, not peer binding.
+            if let Err(err) = self.bind_dist_peers() {
+                break Err(err);
+            }
             // The inbound-delivery half: route what the established links decoded into the
             // addressed local process's mailbox. A delivery is what wakes a receiver
             // blocked in a compiled `receive`, so it enqueues the woken process and goes
@@ -1075,6 +1084,35 @@ impl Runtime {
         }
     }
 
+    /// Gives every **established** accepted distribution link its peer's node atom term —
+    /// the binding that makes the accepted half of the one node→link table
+    /// ([`crate::dist::DistLinks`]) an **exact** node match.
+    ///
+    /// An accepted [`crate::dist::DistConnection`] knows its peer only as the `node@host`
+    /// bytes its `'N'` handshake carried, while a routed `link`/`monitor`/`exit`/`unlink`
+    /// addresses its peer by an **atom term**. The term is interned here, in the runtime's
+    /// one live table, and handed to the link
+    /// ([`crate::dist::DistNode::bind_peer_nodes`]), so the router installed on the process
+    /// table — which holds no atom table at all — can compare node terms **exactly** on both
+    /// halves and refuse a signal for a node with no link instead of silently dropping it.
+    ///
+    /// Called from every scheduler pass right after `pump_dist` (a link becomes established
+    /// *during* the pump) and **not** gated on
+    /// [`Runtime::inbound_delivery`](crate::Runtime), which gates *inbound routing*, not peer
+    /// binding. A runtime with no node name pays one `Option::is_none` check.
+    ///
+    /// # Errors
+    ///
+    /// The shared link table's re-entrant borrow (never in practice: the pass binds between
+    /// the node's pump and the client's flush, holding neither).
+    pub(crate) fn bind_dist_peers(&mut self) -> Result<usize> {
+        // Split borrows: the node lives in `dist`, the table in `code_server`.
+        let Runtime { dist, code_server, .. } = self;
+        match dist.as_mut() {
+            Some(node) => node.bind_peer_nodes(code_server.atoms_mut()),
+            None => Ok(0),
+        }
+    }
     /// Routes the inbound control messages `driver` has queued into this runtime's
     /// **local process mailboxes** — the runtime side of `beam_dist`'s
     /// [`InboundSink`] seam (contract A.5).

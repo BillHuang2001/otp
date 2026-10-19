@@ -724,11 +724,14 @@ impl DistClientInner {
     /// queued. The scratch heap is reset exactly when the queue empties, so no queued term
     /// can dangle.
     ///
-    /// The router itself holds no atom table, so its queue gate can only tell "a link for
-    /// this node exists" for the outbound half; this flush — the one place the table is live
-    /// — resolves the accepted half too, and drops (with the typed reason recorded in
-    /// [`DistClientInner::last_error`]) a control whose node no link names any more instead
-    /// of retrying for ever.
+    /// Both gates are **exact** node-term matches on both halves
+    /// ([`DistLinks::names_node`]/[`DistLinks::has_established_link_to`]), the same terms
+    /// [`DistLinks::may_reach_node`] gated the router's `route` with. The `names_node`
+    /// branch is therefore a belt-and-braces guard, not the normal path: it fires only for a
+    /// control that was queued while its link was alive and whose link died before the
+    /// flush — the queue may not grow for ever, so such a control is dropped with the typed
+    /// reason recorded in [`DistClientInner::last_error`] (the router already told its
+    /// caller `Ok`, so recording is the only honest place the loss can surface).
     fn flush_pending(&mut self, atoms: &mut AtomTable) -> Result<usize> {
         if self.pending.is_empty() {
             return Ok(0);
@@ -737,15 +740,15 @@ impl DistClientInner {
         let mut retry: VecDeque<Queued> = VecDeque::new();
         let mut sent = 0;
         for item in queued {
-            if !self.links.names_node(item.node, atoms) {
+            if !self.links.names_node(item.node) {
                 // The link it waited for was retired: nothing in either half names that
                 // node any more, so the control can never be delivered. Record the typed
                 // refusal and drop it rather than growing the queue for ever.
-                let label = self.links.node_label(item.node, atoms);
+                let label = self.links.node_label_in(item.node, atoms);
                 self.last_error = Some(format!("{label}: {}", no_link_error(&label)));
                 continue;
             }
-            if !self.links.has_established_link_to(item.node, atoms) {
+            if !self.links.has_established_link_to(item.node) {
                 // A link that names the node exists but has not completed its handshake
                 // yet: keep it queued, bounded by the scratch heap.
                 retry.push_back(item);
@@ -757,7 +760,7 @@ impl DistClientInner {
             {
                 Ok(()) => sent += 1,
                 Err(err) => {
-                    let label = self.links.node_label(item.node, atoms);
+                    let label = self.links.node_label_in(item.node, atoms);
                     self.last_error = Some(format!("{label}: {err}"));
                 }
             }
@@ -777,12 +780,15 @@ impl DistClientInner {
     /// table the message was decoded against, so a forged or malformed control message
     /// is an `Err` — which retires that one link (recorded in
     /// [`DistClientInner::last_error`]) instead of being mis-routed.
+    ///
+    /// Only the **outbound** half is drained here: the accepted links are the listening
+    /// node's ([`crate::dist::DistNode::dispatch_inbound`]).
     fn dispatch(&mut self, atoms: &mut AtomTable, sink: &mut dyn InboundSink) -> Result<usize> {
         self.dispatch_heap.reset();
         let mut delivered = 0;
         let mut index = 0;
-        while index < self.links.len() {
-            if !self.links[index].is_established() {
+        while index < self.links.outbound.len() {
+            if !self.links.outbound[index].is_established() {
                 index += 1;
                 continue;
             }
@@ -790,7 +796,7 @@ impl DistClientInner {
             // for the duration of the decode only.
             let outcome = {
                 let heap = &mut self.dispatch_heap;
-                self.links[index]
+                self.links.outbound[index]
                     .driver
                     .dispatch_inbound_checked(heap, atoms, sink)
             };
@@ -815,12 +821,12 @@ impl DistClientInner {
     /// in the dying process's heap, and the caller may drop that heap the moment this
     /// returns — so every term is written onto the stable scratch heap here.
     ///
-    /// The gate is [`DistLinks::may_reach_node`]: the router holds no atom table, so it
-    /// can match an **outbound** link's node term exactly and can only tell that the
-    /// **accepted** half is non-empty — the accepted half's `peer_name` is resolved
-    /// against the live atom table by [`DistClientInner::flush_pending`], which is the one
-    /// place the table is available. A node no link names in either half is the typed
-    /// refusal, never a silent drop.
+    /// The gate is [`DistLinks::may_reach_node`], an **exact node-term** match on both
+    /// halves: the outbound links key on their node atom term and the accepted links on the
+    /// peer term [`crate::dist::DistNode::bind_peer_nodes`] bound for them, so a signal for
+    /// a node **no** link reaches is the typed refusal here — never a queued control that a
+    /// later flush would have to drop (the A.5 contract: a signal for a node with no link is
+    /// a typed error, never a silent drop).
     fn queue_signal(&mut self, signal: DistSignal) -> Result<()> {
         let node = signal_node(&signal);
         if !self.links.may_reach_node(node) {

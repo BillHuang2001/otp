@@ -1,74 +1,61 @@
 # `beam_rt` — distribution, accepting half (`src/dist.rs` + `src/dist/`)
 
 ## Intent
-The accepting half of the distributed node (contract **A.5**, phases 1–2), split in two by responsibility.
-`src/dist.rs` is the module root and **node half**: the module docs, the `epmd` registration, the bound
-listener and the per-link `'N'` handshake/drain.
-`src/dist/inbound.rs` is the **inbound delivery sink**: the runtime side of `beam_dist`'s `InboundSink`
-seam, which routes a classified inbound `Delivery` to the addressed local process.
-The connecting half is the sibling `src/dist_client.rs` (not part of this node).
-This directory holds only the sink submodule and this doc; the node half is the parent file `src/dist.rs`.
+The accepting half of the distributed node (contract **A.5**, phases 1–2), split by responsibility.
+`src/dist.rs` is the module root and **node half**: the module docs, the `epmd` registration, the bound listener and the per-link `'N'` handshake/drain.
+`src/dist/links.rs` is the **one node→link table** (`DistLinks`): both distribution halves in a single registry, plus the **one** routing entry every outbound control and message goes through.
+`src/dist/inbound.rs` is the **inbound delivery sink**: the runtime side of `beam_dist`'s `InboundSink` seam, which routes a classified inbound `Delivery` to the addressed local process.
+The connecting half is the sibling `src/dist_client.rs` (not part of this node): it owns the outbound links and installs this half's accepted cell into its `DistLinks` at `Runtime::new`.
 
 ## API Surface
-- `dist.rs` (module `crate::dist`, FROZEN façade): `NodeName` (+ `local_hostname`), `DistConnection`
-  (+ `state`/`is_established`/`is_live`/`peer_name`/`peer_creation`/`peer_visibility`/`peer_addr`/
-  `bytes`/`has_pending_output`/`close`), `DistNode`, `resolve_cookie`, `epmd_addr`, and the consts
-  `NONODE_NAME`, `DIST_READ_SLICE`, `DIST_LISTEN_ADDR`
-  (also `MAX_ACCEPTS_PER_PUMP`/`DIST_DISPATCH_HEAP_WORDS`).
-- `dist/inbound.rs`: `LocalDeliverySink` — the `impl InboundSink` sink plus its private `Target` enum and
-  routing helpers (`envelope_from`, `receipt`, `remote_pid`, `small_uint`).
-  **Path identity is mandatory**: it is re-exported from the parent as
-  `pub use inbound::LocalDeliverySink;`, so `crate::dist::LocalDeliverySink` (and
-  `beam_rt::dist::LocalDeliverySink`) resolve exactly as before the split.
+- `dist.rs` (module `crate::dist`, FROZEN façade): `NodeName` (+ `local_hostname`), `DistConnection` (+ `state`/`is_established`/`is_live`/`peer_name`/`peer_creation`/`peer_visibility`/`peer_addr`/`bytes`/`has_pending_output`/`close`, and the crate-visible `node_term`/`bind_node`/`send_control`/`send_message`/`flush_output`), `DistNode`, `DistConnectionSnapshot`, `resolve_cookie`, `epmd_addr`, and the consts `NONODE_NAME`, `DIST_READ_SLICE`, `DIST_LISTEN_ADDR` (also `MAX_ACCEPTS_PER_PUMP`/`DIST_DISPATCH_HEAP_WORDS`).
+- `DistNode`: `start`/`node_name`/`advertised_name`/`epmd_name`/`is_short_name`/`port`/`creation`/`is_registered`/`is_alive`/`registration_error`/`pump`/`has_established_link`/`dispatch_inbound`/`last_link_error`/`is_idle`, the **diagnostic** `connections() -> Vec<DistConnectionSnapshot>`, and the crate-visible `links()` (the shared accepted cell) and `bind_peer_nodes(&mut AtomTable) -> Result<usize>`.
+- `dist/links.rs`: `DistLinks` (crate-visible) — `new(accepted)`, `outbound`/`accepted`, `link_index_for_node`, `accepted_index_for_node`, `has_established_link_to`, `names_node`, `may_reach_node`, `has_any`/`is_idle`/`has_established`, `established_names`, `node_label`/`node_label_in`, `route_control`, `route_message` — plus the free `no_link_error` and the `pub` `DistConnectionSnapshot`.
+- `dist/inbound.rs`: `LocalDeliverySink` — the `impl InboundSink` sink plus its private `Target` enum and routing helpers (`envelope_from`, `receipt`, `remote_pid`, `small_uint`).
+  **Path identity is mandatory**: it is re-exported from the parent as `pub use inbound::LocalDeliverySink;`, so `crate::dist::LocalDeliverySink` (and `beam_rt::dist::LocalDeliverySink`) resolve exactly as before the split.
+
+## One table over both halves (the A.5 routing gate)
+- A distributed runtime holds links of two kinds, and both are links **to a node**: the ones it **dialled** (`dist_client.rs`'s `ClientLink`, keyed by its peer's node atom term) and the ones a peer **dialled into** it (`DistConnection`, which learns its peer only as the `node@host` bytes its `'N'` handshake carried).
+- `DistLinks` is the one table over them: the outbound `Vec<ClientLink>` plus the accepted cell, looked up outbound-first because a real node never holds two live links to one peer (the re-connect in `DistClient::connect_addr` replaces the old link) and a node whose only link was accepted has no outbound entry at all.
+- The accepted links are a **shared** `Rc<RefCell<Vec<DistConnection>>>`, held by `DistNode` (which pumps and mutates it) and by `DistLinks` (which borrows it only to write one frame).
+  The cell is shared because the routing entry is reached from paths that hold no `DistNode` at all: the `DistSignalRouter` installed on the **process table**, which the runtime *moves out of itself* for the duration of a pass, and the runtime's own `dist_send_*` API.
+  The two never run at the same time (one scheduler pass drives both, and the pump's borrows are released before the send paths run), and every borrow is a `try_borrow`/`try_borrow_mut` — a re-entrant borrow is a typed error or a documented no-op, never a panic.
+- `DistNode::links()` hands out the cell (`Rc::clone`); `DistNode::connections()` is a **snapshot** (`DistConnectionSnapshot`, empty while the cell is borrowed) because the live table cannot be lent out by reference — it is a diagnostic and never affects routing.
+- `route_control` and `route_message` are the **one** routing entry: every outbound control (a routed `link`/`monitor`/`exit`/`unlink`, a `DOP_REG_SEND`, the runtime's `dist_send_*` API) and every outbound message goes through them, so a peer reached by an accepted link is served exactly like one this runtime dialled — the regression the table exists for.
+  Both refuse with the single `no_link_error` (`distribution: no established connection to node <label>`) when neither half is an **established** link to the node, and neither ever reports a fabricated success.
+- **The accepted half is an exact node-term match.** `DistConnection` carries `node: Option<Eterm>` — the peer's node atom term — bound by `DistNode::bind_peer_nodes`, which interns each established accepted link's `peer_name()` into the runtime's one live `AtomTable` and hands the term to `bind_node`.
+  `accepted_index_for_node` (and `names_node`/`may_reach_node`) therefore compare node terms on both halves, exactly, with no atom table needed at the router.
+  An unbound link is not a route; a link retired is out of the table, so its binding is irrelevant and nothing outside the link holds it.
+- `bind_peer_nodes` is called by `Runtime::bind_dist_peers` (`src/runtime/scheduler.rs`) on **every** scheduler pass, immediately after `pump_dist` (a link becomes established *during* the pump) and before the inbound dispatch and the client's flush.
+  It is deliberately **not** gated on `inbound_delivery` — that flag gates inbound *routing*, not peer binding — and a runtime with no node name pays one `Option::is_none`.
+- Because the router's gate is exact, a routed signal for a node **no link reaches** is the typed refusal at `route` time — never a queued control a later flush would have to drop (contract A.5: a signal for a node with no link is a typed error, never a silent drop).
+  `flush_pending`'s `names_node` → drop-and-record branch stays as a belt-and-braces guard for a control queued while its link was alive and whose link died before the flush; the queue may not grow for ever, so such a control is dropped with the typed reason recorded in `DistClient::last_error`.
+- Both halves are one table for the **quiescence** question too: `DistNode::is_idle` and `DistClient::has_links` ask the same question of the same table (a cell that cannot be borrowed counts as holding a link — work in flight).
 
 ## The two halves, one line each
-- `dist.rs` — bind a wildcard listener, register with `epmd` (best-effort), and drive each accepted link
-  through `beam_dist::ConnectionDriver` (server `'N'` → `'s'`/`'S'` → `'r'` → `'a'`), then per-link
-  checked drain (`dispatch_inbound_checked`) handing each classified `Delivery` to the sink.
-- `dist/inbound.rs` — the `InboundSink` sink: route the message family and the route-free receipt signal
-  families into the local process table, report the genuinely unrouted families as the honest
-  `DeliveryOutcome::Unsupported`.
+- `dist.rs` — bind a wildcard listener, register with `epmd` (best-effort), and drive each accepted link through `beam_dist::ConnectionDriver` (server `'N'` → `'s'`/`'S'` → `'r'` → `'a'`), then per-link checked drain (`dispatch_inbound_checked`) handing each classified `Delivery` to the sink.
+- `dist/inbound.rs` — the `InboundSink` sink: route the message family and the route-free receipt signal families into the local process table, report the genuinely unrouted families as the honest `DeliveryOutcome::Unsupported`.
 
 ## How an accepted link is driven (read before debugging a stalled peer handshake)
-- One `DistConnection` per accepted socket owns one `ConnectionDriver::server(advertised, cookie, creation)`:
-  `advertised` is the **full** `node@host` (`NodeName::parse`), the cookie is `resolve_cookie`
-  (`-setcookie` → `$HOME/.erlang.cookie` → `b"nocookie"`), and `creation` is the `epmd` value (`1`,
-  `DEFAULT_CREATION`, before/without registration). `DistConnection::pump` reads **once**, `feed`s
-  whatever arrived (partial frames included), `step`s to quiescence and `write_all`s `take_output()`.
-- Accepted sockets are **blocking with a `DIST_READ_SLICE` (25 ms) read timeout**; only the *listener* is
-  non-blocking. Neither the listener nor a link is registered with `beam_io`'s poller — the only driver is
-  `scheduler_pass`'s `pump_dist`, so a route that runs no scheduler pass never accepts anything.
-- The listener is bound in `Runtime::new` but published to `epmd` (`ALIVE2_REQ`) **on the first pump**, so
-  a runtime that runs no scheduler pass is never resolvable.
-- `Runtime::is_quiescent` (`src/runtime/scheduler.rs`) has **no dist term**: `run_scheduled` reports
-  `blocked` (exit 3) on the first round with `ran == 0 && delivered == 0`, even with a pending inbound
-  connection or a link mid-handshake. A node therefore serves distribution only while some *other* wake
-  source (a timer deadline, a runnable process, a port) keeps the pump stepping — which is why both live
-  dist suites drive a keep-alive fixture's `receive … after 25`.
-- `DistConnection::pump` flushes `take_output()` on **both** outcomes, so a refusal status the driver
-  framed (`not_allowed` on a mandatory-flag failure, an accept-decision refusal) still reaches the peer's
-  socket although `step` reports it as `Err`; only a write failure suppresses it, and it retires the link.
-- `DistConnection::close` shuts the socket down in both directions (`ENOTCONN` and the connection-lost
-  errors are the post-condition, not failures), and it is the first thing `DistNode::retire` does — on the
-  pump's error arm and on its dead-link (`!is_live()`) arm alike — so a retired link is never left
-  half-open.
-- `DistConnection::peer_visibility` reports how the peer's own flags classify it
-  (`PeerVisibility::Normal`/`Hidden`, `dist_util.erl:publish_type/1`), which is **recorded, never
-  refused**: both ends of an OTP connection may advertise themselves hidden (this runtime advertises
-  `preferred_flags`, which omits `DFLAG_PUBLISHED`).
-- `epmd_addr` is the node's one `epmd` address: `$ERL_EPMD_PORT` (a bare `N` ⇒ `127.0.0.1:N`, a value
-  containing `:` used verbatim) else `EPMD_DEFAULT_ADDR`, and it is what `DistNode::register_once`'s
-  `ALIVE2_REQ` connects to.
+- One `DistConnection` per accepted socket owns one `ConnectionDriver::server(advertised, cookie, creation)`: `advertised` is the **full** `node@host` (`NodeName::parse`), the cookie is `resolve_cookie` (`-setcookie` → `$HOME/.erlang.cookie` → `b"nocookie"`), and `creation` is the `epmd` value (`1`, `DEFAULT_CREATION`, before/without registration).
+  `DistConnection::pump` reads **once**, `feed`s whatever arrived (partial frames included), `step`s to quiescence and `write_all`s `take_output()`.
+- Accepted sockets are **blocking with a `DIST_READ_SLICE` (25 ms) read timeout**; only the *listener* is non-blocking.
+  Neither the listener nor a link is registered with `beam_io`'s poller — the only driver is `scheduler_pass`'s `pump_dist`, so a route that runs no scheduler pass never accepts anything.
+- The listener is bound in `Runtime::new` but published to `epmd` (`ALIVE2_REQ`) **on the first pump**, so a runtime that runs no scheduler pass is never resolvable.
+- `Runtime::is_quiescent` (`src/runtime/scheduler.rs`) has **no dist term**: `run_scheduled` reports `blocked` (exit 3) on the first round with `ran == 0 && delivered == 0`, even with a pending inbound connection or a link mid-handshake.
+  A node therefore serves distribution only while some *other* wake source (a timer deadline, a runnable process, a port) keeps the pump stepping — which is why both live dist suites drive a keep-alive fixture's `receive … after 25`.
+- `DistConnection::pump` flushes `take_output()` on **both** outcomes, so a refusal status the driver framed (`not_allowed` on a mandatory-flag failure, an accept-decision refusal) still reaches the peer's socket although `step` reports it as `Err`; only a write failure suppresses it, and it retires the link.
+- `DistConnection::close` shuts the socket down in both directions (`ENOTCONN` and the connection-lost errors are the post-condition, not failures), and it is the first thing the link-retirement helper `retire_at` does — on the pump's error arm and on its dead-link (`!is_live()`) arm alike — so a retired link is never left half-open.
+- `DistConnection::peer_visibility` reports how the peer's own flags classify it (`PeerVisibility::Normal`/`Hidden`, `dist_util.erl:publish_type/1`), which is **recorded, never refused**: both ends of an OTP connection may advertise themselves hidden (this runtime advertises `preferred_flags`, which omits `DFLAG_PUBLISHED`).
+- `epmd_addr` is the node's one `epmd` address: `$ERL_EPMD_PORT` (a bare `N` ⇒ `127.0.0.1:N`, a value containing `:` used verbatim) else `EPMD_DEFAULT_ADDR`, and it is what `DistNode::register_once`'s `ALIVE2_REQ` connects to.
 
 ## Constraints
-- Errors are return-based (`beam_common::Result`); a link-level failure **retires that one link** and is
-  recorded, never raised — it must never fail a scheduler pass.
+- Errors are return-based (`beam_common::Result`); a link-level failure **retires that one link** and is recorded, never raised — it must never fail a scheduler pass.
 - `unsafe`-free (the crate is `#![deny(unsafe_code)]`).
-- Never deliver to the wrong process: an addressed party not local to *this* node is `NoSuchProcess`, a
-  party outside its opcode's wire contract is `Unsupported`, never a silent mis-delivery.
+- Never deliver to the wrong process: an addressed party not local to *this* node is `NoSuchProcess`, a party outside its opcode's wire contract is `Unsupported`, never a silent mis-delivery.
+- Never route silently: a node no link reaches is the typed `no_link_error` from the routing entry, and a queued control whose link died is dropped with its reason recorded — never a quiet success.
 - Do not hand-edit generated artifacts; Apache-2.0 header block required on every `.rs` file.
-- Keep each file ~1000 lines; `dist.rs` is 1278 (907 of production, the rest its inline unit suite —
-  loopback `DistConnection`/`DistNode` fixtures over a real socket pair), `dist/inbound.rs` is ~865.
+- Keep each file ~1000 lines: `dist.rs` is 1500 (1056 of production, the rest its inline unit suite — loopback `DistConnection`/`DistNode` fixtures over a real socket pair), `dist/links.rs` is 791 (413 of production, the rest its own loopback table/router suite), `dist/inbound.rs` is 865.
 
 ## Missing sibling APIs (the still-`Unsupported` families)
 - **The distributed-spawn family** (`SpawnRequest`/`SpawnReply`) needs a `beam_process` spawn-responder/reservation API — a `DOP_SPAWN_REPLY` sender plus the reservation bookkeeping a `DOP_SPAWN_REQUEST` keys into.
@@ -78,9 +65,10 @@ This directory holds only the sink submodule and this doc; the node half is the 
 - `beam_process`'s route-free receipt primitives (all present, none echoing a `DOP_*`): `record_remote_link`, `apply_remote_exit_signal`, `unlink_from_remote`/`unlink_ack_from_remote`, `monitor_from_remote_ref`/`demonitor_from_remote_ref` (the peer-minted wire-reference spellings; the `MonitorRef` ones stay for an internal ref), `remote_monitor_down`, `set_group_leader_from_remote` — the per-family routing table is [`../runtime/CONTEXT.md`](../runtime/CONTEXT.md)'s.
 
 ## Routing Table
-- `dist.rs` (parent) → the node half: `DistNode`/`DistConnection`/`NodeName`/`resolve_cookie`/`NONODE_NAME`; declares `mod inbound;` and re-exports `LocalDeliverySink`.
+- `dist.rs` (parent) → the node half: `DistNode`/`DistConnection`/`NodeName`/`DistConnectionSnapshot`/`resolve_cookie`/`NONODE_NAME`; declares `mod inbound;`/`mod links;` and re-exports `LocalDeliverySink`.
+- `dist/links.rs` → the one node→link table over both halves (`DistLinks`), the one routing entry (`route_control`/`route_message`) and the single `no_link_error`.
 - `dist/inbound.rs` → the inbound delivery sink over `beam_dist::InboundSink` (contract A.5): `LocalDeliverySink` + routing helpers.
 
 ## See Also
-- `../dist_client.rs` → the connecting half (outbound client handshake + the `DistSignalRouter`).
+- `../dist_client.rs` → the connecting half (outbound client handshake, the queued `DistSignalRouter` and its `flush_pending`).
 - `../CONTEXT.md` → the crate façade and the A.5 status; `../runtime/CONTEXT.md` → the per-pass distribution drive.
