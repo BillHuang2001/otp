@@ -619,9 +619,7 @@ fn a_builtin_driver_name_opens_a_live_driver_port() {
     // ...but its bytes must **not** be drained from a C driver's inline `output` callback — a
     // built-in driver delivers through its poller-registered descriptor on the port-task round.
     let kind = fx.registry.borrow().meta.get(&port.number()).map(|meta| meta.kind);
-    assert_eq!(kind, Some(PortName::SpawnDriverBuiltin));
-    assert!(!PortName::SpawnDriverBuiltin.bytes_from_driver_output());
-    // `port_close/1` succeeds for it (the oracle's `true`) and releases the id.
+    assert_eq!(kind, Some(PortName::SpawnDriverBuiltin));    // `port_close/1` succeeds for it (the oracle's `true`) and releases the id.
     fx.hook.close_port(port).expect("closing the built-in driver port");
     assert!(!fx.registry.borrow().contains(port));
 

@@ -345,24 +345,7 @@ pub enum PortName {
 }
 
 impl PortName {
-    /// Whether the port's bytes come from a C driver's **inline `output` callback** — only a
-    /// `dlopen`ed `{spawn_driver, Name}` port ([`PortName::SpawnDriver`]).
-    ///
-    /// A built-in driver port ([`PortName::SpawnDriverBuiltin`]) — and every `spawn`/`fd` port —
-    /// delivers through a poller-registered descriptor on the port-task round instead, so its
-    /// bytes are not harvested from the driver's input queue.
-    fn bytes_from_driver_output(self) -> bool {
-        match self {
-            PortName::SpawnDriver => true,
-            PortName::SpawnDriverBuiltin
-            | PortName::Spawn
-            | PortName::SpawnExecutable
-            | PortName::Fd => false,
-        }
-    }
-
-    /// The [`StreamShape`] this `Name` form's reads carry — the producer fact a read cannot
-    /// say about itself.
+    /// The [`StreamShape`] this `Name` form's reads carry — the producer fact a read cannot    /// say about itself.
     ///
     /// A **built-in** driver port's bytes come up through [`beam_io::DriverContext::input`], a
     /// flat byte queue that cannot say which `driver_output*` call wrote them, so they render
@@ -537,13 +520,11 @@ struct PortMeta {
     owner: ProcessId,
     /// Which `Name` form opened the port.
     ///
-    /// The two message producers route on it (see [`PortName::bytes_from_driver_output`], and
+    /// The two message producers route on it (see [`PortName::stream_shape`] and
     /// [`PortMeta::has_driver_control`] for the `port_control` gate's `Name`-form half): a
-    /// `dlopen`ed `{spawn_driver, Name}` port's bytes
-    /// come from the C driver's inline `output` callback (the port-task round reports the reads
-    /// [`driver::DriverPortAdapter`] hands up, header/body split intact), while every other port's
-    /// — including a **built-in** driver port's — come from a poller-registered descriptor through
-    /// the same round.
+    /// built-in driver port's bytes come up through [`beam_io::DriverContext::input`], a flat byte
+    /// queue that cannot say which `driver_output*` call wrote them, while a `dlopen`ed
+    /// `{spawn_driver, Name}` port's reads carry the C's header/body split.
     kind: PortName,
     /// Whether this port's driver declares a **`control` callback** — the C's
     /// `prt->drv_ptr->control != NULL` test (`../../erts/emulator/beam/io.c:4035`), captured from
