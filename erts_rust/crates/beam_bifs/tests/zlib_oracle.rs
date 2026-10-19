@@ -23,8 +23,8 @@
 //! What is pinned, per input:
 //!
 //! * `zlib:compress/1`, `zlib:zip/1` and `zlib:gzip/1` produce the oracle's bytes
-//!   **exactly** (the whole point of the `src/zlib_deflate/` port: block splits, block
-//!   types, lazy-match decisions and code lengths are zlib's own);
+//!   **exactly** (the whole point of the `beam_deflate` port they drive: block splits,
+//!   block types, lazy-match decisions and code lengths are zlib's own);
 //! * direction 1 — the oracle's `zlib:uncompress/1` / `zlib:unzip/1` / `zlib:gunzip/1`
 //!   recover the input from **this crate's** streams;
 //! * direction 2 — this crate's `zlib:uncompress/1` / `zlib:unzip/1` / `zlib:gunzip/1`

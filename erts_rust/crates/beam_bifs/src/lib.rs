@@ -77,7 +77,6 @@ mod checksum;
 mod compare;
 mod context;
 mod convert;
-mod deflate;
 mod dict;
 mod error;
 mod erts_internal;
@@ -112,7 +111,6 @@ mod time;
 mod type_test;
 mod unicode;
 mod zlib;
-mod zlib_deflate;
 pub use crate::context::{
     AtomInterner, BifContext, BytesSink, DictHook, FunCaller, LocalFunIdentity, LocalNode,
     MemoryHook, ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PersistentTerm,

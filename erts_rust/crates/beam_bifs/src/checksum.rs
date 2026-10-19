@@ -228,9 +228,9 @@ const fn crc32_table() -> [u32; 256] {
 /// zlib's `crc32(prev, data)` (`crc32_z`): the CRC-32 of `data` continuing from the
 /// CRC-32 `prev` of the preceding bytes. A zero-length `data` is the identity.
 ///
-/// `pub(crate)` because `crate::zlib`'s RFC 1952 (gzip) member framing needs the very
-/// same primitive for its header CRC-16 and its per-member CRC-32 trailer — the one
-/// shared home for the checksum, never a second copy.
+/// `pub(crate)` because `crate::zlib`'s RFC 1952 (gzip) framing checks — the header's
+/// CRC-16 and the per-member CRC-32 trailer — are the same primitive, so the tests that
+/// build those members share this one checksum, never a second copy.
 pub(crate) fn crc32_step(prev: u32, data: &[u8]) -> u32 {
     let mut crc = prev ^ 0xFFFF_FFFF;
     for &byte in data {
@@ -336,9 +336,8 @@ fn adler_pack(adler: u64, sum2: u64) -> u32 {
 /// caller-supplied *non-canonical* accumulator (`adler32/2`) reduces exactly as the
 /// oracle reduces it.
 ///
-/// `pub(crate)` because the deflate port's trailer is the same checksum over the same
-/// bytes: `zlib::compress/1` appends `strm->adler` exactly as the C does, so it must be
-/// this one implementation rather than a second copy.
+/// `pub(crate)` so the crate's other Adler-32 users reach the one implementation rather
+/// than a second copy (the `erlang:adler32/1,2` and `adler32_combine/3` BIFs below).
 pub(crate) fn adler32_step(prev: u32, data: &[u8]) -> u32 {
     let mut sum2 = u64::from((prev >> 16) & 0xFFFF);
     let mut adler = u64::from(prev & 0xFFFF);
