@@ -48,12 +48,22 @@
 //!   because the pop *is* a frame change.
 //! * **`return`** ([`emit_return`]) and the fused **`deallocate_return`**
 //!   ([`emit_deallocate_return`]) **always transfer control** — the interpreter's
-//!   `return_step` yields `Step::Done`/`Goto`/`Enter`, never `Next` — so the block
-//!   leaves with the helper's word in `rax` and the driver takes it. The fused form is
-//!   one helper round-trip for the pair `deallocate N; return`: the loader fuses that
-//!   adjacent pair into `Instr::DeallocateReturn` (`super::super::super` docs,
-//!   `beam_loader::lower::fuse`), and [`super::emit_block`] fuses the separate pair a
-//!   hand-built module (the crate's own test modules, the bench fixtures) still holds.
+//!   `return_step` yields `Step::Done`/`Goto`/`Enter`, never `Next` — but the transfer is
+//!   not always the driver's: a continuation naming a block entry of **this artifact** is
+//!   tail-jumped to **in-block** by [`emit_resume_or_exit`] — the common same-function shape
+//!   (every non-tail call returns to its own `pc + 1`, a continuation sub-block of the same
+//!   function) *and* the cross-function one (a call into another function of the module
+//!   returns into the caller's function, in another executable mapping of the same
+//!   artifact) — which is why a call-heavy function no longer pays a driver iteration per
+//!   return. Every other outcome — a bottom frame's [`HALT`], another module context's
+//!   [`ENTER`], a function this artifact holds no compiled code for, an address no block
+//!   covers, a register-file bound the machine does not satisfy, a refused pre-emption
+//!   charge ([`ERROR`]) — leaves the helper's word in `rax` for the driver, exactly as
+//!   before. The fused form is one helper round-trip for the pair
+//!   `deallocate N; return`: the loader fuses that adjacent pair into
+//!   `Instr::DeallocateReturn` (`super::super::super` docs, `beam_loader::lower::fuse`),
+//!   and [`super::emit_block`] fuses the separate pair a hand-built module (the crate's own
+//!   test modules, the bench fixtures) still holds.
 //!
 //! # Guards
 //!
@@ -73,9 +83,10 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::super::runtime::{
     encode_target, jit_deallocate, jit_deallocate_return, jit_return, FrameExitHelper,
-    ReturnHelper,
+    ReturnHelper, RUNTIME_RESUME_DISP,
 };
-use super::{emit_helper_call, emit_refresh_y, Allocation};
+use super::link::emit_frame_teardown;
+use super::{emit_helper_call, emit_refresh_y, Allocation, RUNTIME_SLOT_DISP};
 
 /// Lower `deallocate N` — the frame pop, then continue in-block at `pc + 1`.
 ///
@@ -119,9 +130,11 @@ pub(super) fn emit_deallocate(
 /// Lower `return` — follow the current frame's continuation.
 ///
 /// The helper ([`jit_return`]) reads the frame's continuation and encodes it as the
-/// block-ABI word; `return` always transfers control, so the block leaves with that
-/// word in `rax` for the driver (a `(func, pc)` target, [`HALT`] on the bottom frame,
-/// or [`ENTER`] for a caller in another module context).
+/// block-ABI word; `return` always transfers control, so the block either tail-jumps to
+/// the block entry the helper resolved inside **this module's artifact**
+/// ([`emit_resume_or_exit`]) or leaves with that word in `rax` for the driver (an address
+/// the artifact compiled no block for, a register-file bound the machine does not satisfy,
+/// [`HALT`] on the bottom frame, or [`ENTER`] for a caller in another module context).
 ///
 /// [`HALT`]: super::super::runtime::HALT
 /// [`ENTER`]: super::super::runtime::ENTER
@@ -139,18 +152,20 @@ pub(super) fn emit_return(
         helper as *const (),
         &[i64::from(func), i64::from(pc)],
     pc)?;
-    emit_word_exit(buffer, done)
+    emit_resume_or_exit(buffer, allocation, done)
 }
 
 /// Lower `deallocate N; return` — the loader's fused superinstruction, or the separate
 /// pair [`super::emit_block`] fuses.
 ///
 /// One helper round-trip ([`jit_deallocate_return`]) performs the interpreter's two
-/// constituents in order (the checked pop, then the continuation read), and the block
-/// then leaves with the helper's word in `rax` — [`HALT`], a `(func, pc)` target,
-/// [`ENTER`] or [`ERROR`]. `func`/`position_pc` name the **return**: the fused
-/// instruction's own address, or the `return`'s address when the emitter fused a separate
-/// pair (exactly the position the interpreter would have recorded last).
+/// constituents in order (the checked pop, then the continuation read), and the block then
+/// either tail-jumps to the same-function block entry the helper resolved or leaves with the
+/// helper's word in `rax` — [`HALT`], a `(func, pc)` target in another function/context,
+/// [`ENTER`] or [`ERROR`] (see [`emit_resume_or_exit`]). `func`/`position_pc` name the
+/// **return**: the fused instruction's own address, or the `return`'s address when the
+/// emitter fused a separate pair (exactly the position the interpreter would have recorded
+/// last).
 ///
 /// # The two pcs — `position_pc` is not the store pc
 ///
@@ -190,23 +205,78 @@ pub(super) fn emit_deallocate_return(
         ],
         store_pc,
     )?;
-    emit_word_exit(buffer, done)
+    emit_resume_or_exit(buffer, allocation, done)
 }
 
-/// Leave the block with the helper's word already in `rax`.
+/// Leave the block with the helper's word in `rax` — **or** tail-jump straight to the block
+/// entry the helper resolved for a continuation that names a block of this artifact (the
+/// function that is already running, or another function of the same module).
 ///
 /// The word *is* the exit value — the driver decodes it as a `(func, pc)` target or as
-/// [`HALT`]/[`ENTER`]/[`ERROR`] — so nothing is materialised and no comparison is made:
-/// the block jumps to its shared `done` epilogue, which tears the **native** frame down
-/// (`emit_helper_call` has already spilled the cached x-registers into `machine.x`, the
-/// tier's root-set contract) and returns. Fabricating or re-encoding a word here could
+/// [`HALT`]/[`ENTER`]/[`ERROR`] — so nothing is materialised and no comparison is made
+/// against it: every outcome the helper did not turn into an in-block transfer jumps to the
+/// shared `done` epilogue with `rax` untouched. Fabricating or re-encoding a word here could
 /// only disagree with the helper.
+///
+/// # The in-block continuation
+///
+/// A **non-tail call's** continuation is its own `pc + 1`, which the compiler lowered as a
+/// continuation sub-block — of the *caller's* function, which for a call into another
+/// function of the module is another executable mapping of the same artifact. The helper
+/// resolves the entry itself ([`super::super::runtime::EntryTables`], else the artifact) and
+/// stores it in [`JitRuntime::resume_entry`](super::super::runtime::JitRuntime) — having
+/// already done the driver iteration's work (publish the position, bump the slice counter,
+/// offer the pre-emption hook) in the driver's own order. When it did, `rax` is not consulted
+/// at all and the block transfers **in-block**:
+///
+/// ```text
+///   call <helper>                     ; the frame-discipline instruction; spills first
+///   mov  rdi, [rsp + RUNTIME_SLOT_DISP] ; rt — reloaded, the helper may clobber rdi
+///   mov  r11, [rdi + RUNTIME_RESUME_DISP] ; the resolved block entry (same artifact)
+///   test r11, r11
+///   je   <done>                       ; no entry: today's word exit, `rax` intact
+///   lea  rsp, [rsp + slot] ; pop …    ; leave this block's native frame
+///   jmp  r11                          ; the target prologue rebuilds its own frame
+/// ```
+///
+/// This is a **tail** transfer: the block's frame is torn down before the jump, so the
+/// native stack neither grows (deep Erlang recursion stays safe) nor is left holding a stale
+/// frame, and it is exactly the shape a linked `call_only`/`jump` exit uses
+/// ([`super::link::Linker::emit_exit`]) — reload `rt` into `rdi` (the one thing a target
+/// prologue needs, and a register the teardown does not pop), tear down, jump. `rdi` and
+/// `r11` are both caller-saved and the teardown only pops the block's saved callee-saved set,
+/// so both survive it.
+///
+/// # Why the skipped checks cannot be skipped unsoundly
+///
+/// The helper's own docs carry the argument ([`super::super::runtime::return_word`]): the
+/// entry is used only when it belongs to **the module's compiled artifact the block is
+/// running** (a different module context is [`ENTER`] and keeps the driver path), the
+/// artifact's code stays mapped for the whole slice, and a transfer into a function other
+/// than the one the tables describe has had **that function's** register-file bound checked
+/// inside the helper before the entry is handed over. The same-function shape stays within
+/// the bound the driver already checked on entry.
 ///
 /// [`HALT`]: super::super::runtime::HALT
 /// [`ENTER`]: super::super::runtime::ENTER
 /// [`ERROR`]: super::super::runtime::ERROR
-fn emit_word_exit(buffer: &mut CodeBuffer, done: CodeLabel) -> Result<()> {
-    buffer.jmp(done)
+fn emit_resume_or_exit(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+) -> Result<()> {
+    // `rt`, reloaded from the block's own slot: the helper is an ordinary `extern "C"` call
+    // and `rdi` is caller-saved, so it may hold anything now. It is also what the resumed
+    // block's prologue stores as *its* `rt` slot.
+    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    // The entry the helper resolved, or null when the continuation must go back to the
+    // driver (a bottom frame's `HALT`, another context's `ENTER`, another function, an
+    // address no block covers, a refused pre-emption charge).
+    buffer.mov_rm(Reg::R11, Reg::Rdi, RUNTIME_RESUME_DISP)?;
+    buffer.test_rr(Reg::R11, Reg::R11)?;
+    buffer.jcc(Cond::E, done)?;
+    emit_frame_teardown(buffer, allocation)?;
+    buffer.jmp_r(Reg::R11)
 }
 
 #[cfg(test)]
@@ -263,11 +333,25 @@ mod tests {
         code.windows(2).any(|w| w == [0x48, 0xB8])
     }
 
-    /// Whether `code` ends with the emitted `jmp rel32` (`E9 <disp32>`) — the word
-    /// exit's "leave with the helper's word in `rax`" branch. The displacement's four
-    /// bytes follow the opcode, so the opcode is the fifth byte from the end.
-    fn ends_with_a_jmp(code: &[u8]) -> bool {
-        code.len() >= 5 && code[code.len() - 5] == 0xE9
+    /// Whether `code` ends with the in-block resume transfer `jmp r11` (`41 FF E3`) — the
+    /// tail transfer [`emit_resume_or_exit`] takes for a continuation of the function that
+    /// is already running.
+    fn ends_with_a_resume_jump(code: &[u8]) -> bool {
+        code.ends_with(&encoded(|buffer| buffer.jmp_r(Reg::R11).unwrap()))
+    }
+
+    /// The `je <done>` guard of [`emit_resume_or_exit`], as `(site offset, target offset)`.
+    ///
+    /// `done` is bound by [`lowered`] one byte (a `ret` filler) past the end of the
+    /// lowering, so the branch must land on `code.len() + 1`.
+    fn resume_guard(code: &[u8]) -> (usize, usize) {
+        // The last `je rel32` (`0F 84 <disp32>`) of the lowering.
+        let site = (0..code.len().saturating_sub(5))
+            .rev()
+            .find(|&i| code[i] == 0x0F && code[i + 1] == 0x84)
+            .expect("the exit guards the in-block transfer");
+        let rel = i32::from_le_bytes(code[site + 2..site + 6].try_into().unwrap());
+        (site, (site as i64 + 6 + i64::from(rel)) as usize)
     }
 
     #[test]
@@ -301,9 +385,16 @@ mod tests {
             "the frame size the pop must match is passed to the helper"
         );
 
-        // The exit leaves with the helper's word in `rax`: an unconditional jump to the
-        // shared epilogue, and nothing materialised in `rax`.
-        assert!(ends_with_a_jmp(&exit), "the exit ends in `jmp rel32`");
+        // The exit transfers **in-block** when the helper resolved a same-function entry
+        // (the tail `jmp r11`), guarded by a `je` to the shared epilogue for every other
+        // outcome — where the helper's word leaves in `rax` untouched, nothing materialised.
+        assert!(ends_with_a_resume_jump(&exit), "the exit ends in the resume jump");
+        let (_, target) = resume_guard(&exit);
+        assert_eq!(
+            target,
+            exit.len() + 1,
+            "the guard falls through to the clean-exit arm"
+        );
         assert!(
             !fabricates_a_word_in_rax(&exit),
             "the exit must not re-encode the helper's word"
@@ -323,10 +414,15 @@ mod tests {
             "a bare `return` calls `jit_return`"
         );
         assert!(!fabricates_a_word_in_rax(&bare));
-        // Both are "leave with the helper's word": the same single trailing jump, and
-        // the bare form's is the shorter sequence (no frame-size argument).
-        assert!(ends_with_a_jmp(&bare));
-        assert!(ends_with_a_jmp(&fused));
+        // Both end in the same in-block resume transfer (guarded by a `je` to the shared
+        // epilogue, where the helper's word leaves in `rax`), and the bare form's sequence
+        // is the shorter one (no frame-size argument).
+        assert!(ends_with_a_resume_jump(&bare));
+        assert!(ends_with_a_resume_jump(&fused));
+        let (_, bare_target) = resume_guard(&bare);
+        let (_, fused_target) = resume_guard(&fused);
+        assert_eq!(bare_target, bare.len() + 1);
+        assert_eq!(fused_target, fused.len() + 1);
         assert!(
             bare.len() < fused.len(),
             "a bare `return` passes no frame size: {} vs {}",

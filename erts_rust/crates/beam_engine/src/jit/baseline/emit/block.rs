@@ -663,14 +663,27 @@ pub(crate) fn emit_block(
             // has no x-register operand — and, like the two tail forms, it must not
             // refill either: the exit below spills first, which is the tier's whole
             // liveness/root-set model.
-            Instr::Call { target, .. } => match labels.resolve(*target) {
+            Instr::Call { target, arity } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
+                    // The helper is handed the **whole compile-time resolution** of the
+                    // instruction — the call site, the resolved callee (and its `pc`,
+                    // which the linker exits to below) and the `arity` operand — so it
+                    // never re-reads `module.functions` nor re-resolves a label per call
+                    // (see `super::super::call`). `arity` is matched out of the pattern
+                    // here rather than ignored: it is the seam's register-argument count.
                     emit_helper_call(
                         buffer,
                         allocation,
                         jit_call_store as *const (),
-                        &[i64::from(func), i64::from(pc)],
-                    pc)?;
+                        &[
+                            i64::from(func),
+                            i64::from(pc),
+                            i64::from(target_func),
+                            i64::from(target_pc),
+                            i64::from(*arity),
+                        ],
+                        pc,
+                    )?;
                     buffer.mov_ri(Reg::R11, CALL_STORED)?;
                     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
                     buffer.jcc(Cond::Ne, done)?;

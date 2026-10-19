@@ -29,12 +29,12 @@
 //!
 //! # What the helper reproduces
 //!
-//! The interpreter's own arm, `src/interpreter/dispatch.rs:371` *verbatim* — the one
+//! The interpreter's own arm, `src/interpreter/dispatch.rs:417` *verbatim* — the one
 //! definition of a local `call`'s semantics:
 //!
 //! ```text
 //! Instr::Call { target, arity } => {
-//!     let (callee, callee_pc) = resolve(labels, *target)?;      // 1
+//!     let (callee, callee_pc) = resolve(labels, *target)?;       // 1  (compile time here)
 //!     if let Some(step) = self.local_call_seam(                  // 2
 //!         entry_module, module, callee, *arity,
 //!         ImportFrame::Call, func, pc, ctx)? { return Ok(step); }
@@ -48,12 +48,23 @@
 //! }
 //! ```
 //!
-//! Step 3 is the whole reason this helper exists: the stored address names the **call
-//! site** (`func` = the calling function, `pc + 1` = the next instruction) tagged with
-//! the context executing **now** (the caller's, which for a same-module call is the
+//! **Step 1 is the emitter's, not the helper's.** The block resolves the `call`'s target
+//! label at **compile** time — it must, for the linker's transfer — so the emitter passes
+//! the resolved `(callee, callee_pc)` *and* the instruction's own `arity` operand to the
+//! helper as block-ABI arguments. The helper therefore never re-reads
+//! `module.functions[func].code[pc]` and never resolves a label again: it used to do both
+//! per call (a `Vec` pair plus a `LabelMap` hash probe), which is exactly the work this
+//! change removed from the hot path. The arguments are the emitter's whole compile-time
+//! knowledge of the instruction, and a debug build re-derives them from the instruction
+//! and the driver's label map to prove the two agree (see `store_continuation`); a
+//! release build trusts the emitter, which is the single source of truth.
+//!
+//! Step 3 is the rest of the reason this helper exists: the stored address names the
+//! **call site** (`func` = the calling function, `pc + 1` = the next instruction) tagged
+//! with the context executing **now** (the caller's, which for a same-module call is the
 //! callee's context too), so the callee's eventual `return` comes back to `pc + 1` in
-//! `func`'s code. `arity` is *not* part of the store — the interpreter only hands it to
-//! the local-call seam (step 2) as the callee's register-argument count.
+//! `func`'s code. `arity` is *not* part of the store — it is handed to the local-call
+//! seam (step 2) as the callee's register-argument count.
 //!
 //! Step 2 is the **host seam** (`ExecutionContext::resolve_local_call`): a host that
 //! serves this same-module callee as a BIF makes the callee's own code never run, so the
@@ -61,7 +72,9 @@
 //! stores anything, on the same run-time terms the tier's two tail forms probe it
 //! (`super::runtime::jit_local_call`) — the code cache is shared between runs and hosts,
 //! so whether a callee is served can only be decided while the block runs, never at
-//! compile time.
+//! compile time. The seam is consulted on **every** call (its answer may change mid-run:
+//! `erlang:load_nif/2`, a resolver that flips between calls, and a host that charges a
+//! reduction unit per consultation); only the *resolution* moved to compile time.
 //!
 //! Step 5 is the block linker's transfer and step 4 the (natively-suppressed) A.8 trace
 //! event: a traced run never enters native code at all, so there is nothing to emit
@@ -75,9 +88,9 @@
 //!   the interpreter's own typed diagnostic — the block leaves for the driver with that
 //!   word, exactly as it leaves with a deopt's.
 //!
-//! A `(func, pc)` that does not name a `call`, or a target the label map cannot resolve,
-//! is handed to [`jit_step_one`] — the interpreter's own step reports *its* exact
-//! diagnostic; nothing is ever invented.
+//! A served callee's continuation-store failure (`Machine::set_continuation`, an
+//! unreachable "no live frame" for a compiled `call`) is the folded typed error, reported
+//! at the instruction's own address.
 
 #![allow(unsafe_code)]
 
@@ -89,7 +102,6 @@ use crate::interpreter::{ImportFrame, LabelMap};
 use crate::machine::{Continuation, Machine};
 use crate::Step;
 
-use super::jit_step_one;
 use super::runtime::{fold_step, JitRuntime};
 
 /// The block-ABI word [`jit_call_store`] answers when it has **stored the
@@ -110,11 +122,8 @@ use super::runtime::{fold_step, JitRuntime};
 /// reaches the driver's word decoder.
 pub(crate) const CALL_STORED: i64 = -5;
 
-/// The helper's three answers, in ordinary Rust types (see [`store_continuation`]).
+/// The helper's two answers, in ordinary Rust types (see [`store_continuation`]).
 enum CallOutcome {
-    /// The address does not name a `call`, or its target is unresolvable: let
-    /// [`jit_step_one`] report the interpreter's exact diagnostic.
-    Deopt,
     /// The continuation is stored ([`CALL_STORED`]).
     Stored,
     /// Hand this folded step (a **served** callee's, or the interpreter's own error
@@ -122,20 +131,66 @@ enum CallOutcome {
     Fold(std::result::Result<Step, Box<BeamError>>),
 }
 
+/// The compile-time-resolved facts about the local `call` a block emitted this helper
+/// for: the call site (`func`, `pc`) plus everything the emitter already knows about the
+/// instruction — its resolved target (`callee`, `callee_pc`) and its `arity` operand.
+///
+/// Passing them is what keeps the helper off the emitter's own work: it is exactly the
+/// interpreter arm's step-1 `resolve` result, handed over instead of re-derived per call.
+#[derive(Clone, Copy, Debug)]
+struct CallSite {
+    /// The **calling** function index.
+    func: u32,
+    /// The `call` instruction's own `pc`.
+    pc: u32,
+    /// The resolved target function (the interpreter's `callee`), i.e. the local-call
+    /// seam's subject and the linker's transfer target.
+    callee: u32,
+    /// The resolved target `pc` (the interpreter's `callee_pc`). Unused on the store path
+    /// — the transfer is the block linker's — and carried so the emitter hands over the
+    /// whole resolution and a debug build can prove the pair is the instruction's own.
+    callee_pc: u32,
+    /// The instruction's `arity` operand: the callee's register-argument count, which
+    /// only the local-call seam consumes.
+    arity: u32,
+}
+
 /// Store the continuation of the local `call` at `(func, pc)` — or report what to do
 /// instead.
 ///
-/// Emitted by the block for `Instr::Call` (see `super::emit`). It has the
-/// [`StepHelper`](super::runtime::StepHelper) signature, so the arm drives it through
-/// the shared `emit::emit_helper_call` sequence and then branches on its answer:
+/// Emitted by the block for `Instr::Call` (see `super::emit`), which passes the
+/// instruction's compile-time resolution as block-ABI arguments: `func`, `pc`, the
+/// resolved `callee`, its `callee_pc` and the `arity` operand (in that order, in the
+/// argument registers after `rt`). It has the
+/// [`StepHelper`](super::runtime::StepHelper) signature for that prefix, so the arm drives
+/// it through the shared `emit::emit_helper_call` sequence and then branches on its
+/// answer:
 ///
 /// * [`CALL_STORED`] — the continuation is in place; the block transfers to the callee;
-/// * any other word — either the host served the same-module callee as a BIF (so the
-///   callee's own code must not run, and the continuation was deliberately not stored)
-///   or the instruction could not be handled here at all; the block leaves for the
-///   driver with that word, whose encoding is [`fold_step`]'s — the **one** definition
-///   of the block-ABI encoding.
-pub(crate) extern "C" fn jit_call_store(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+/// * any other word — the host served the same-module callee as a BIF (so the callee's
+///   own code must not run, and the continuation was deliberately not stored); the block
+///   leaves for the driver with that word, whose encoding is [`fold_step`]'s — the
+///   **one** definition of the block-ABI encoding.
+///
+/// Nothing about the instruction is re-derived here: the emitter resolved the label at
+/// compile time (it had to, for the linker's transfer), so a release build trusts the
+/// arguments and a debug build re-checks them against the instruction and the driver's
+/// label map (see [`store_continuation`]).
+pub(crate) extern "C" fn jit_call_store(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    callee: u32,
+    callee_pc: u32,
+    arity: u32,
+) -> i64 {
+    let site = CallSite {
+        func,
+        pc,
+        callee,
+        callee_pc,
+        arity,
+    };
     let outcome = {
         // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
         // `JitRuntime` and never aliases it for the duration of the call; every pointer
@@ -160,10 +215,9 @@ pub(crate) extern "C" fn jit_call_store(rt: *mut JitRuntime<'_>, func: u32, pc: 
         // a raw pointer; the driver holds no `&mut` to it while the helper runs.
         let ctx = unsafe { &mut *runtime.ctx };
 
-        store_continuation(machine, entry_module, module, labels, func, pc, ctx)
+        store_continuation(machine, entry_module, module, labels, site, ctx)
     };
     match outcome {
-        CallOutcome::Deopt => jit_step_one(rt, func, pc),
         CallOutcome::Stored => CALL_STORED,
         CallOutcome::Fold(step) => {
             // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver
@@ -177,34 +231,41 @@ pub(crate) extern "C" fn jit_call_store(rt: *mut JitRuntime<'_>, func: u32, pc: 
 
 /// The Rust body of [`jit_call_store`] — separate from the `extern "C"` helper so the
 /// exit path's borrows are provably dead before [`fold_step`] takes the runtime again
-/// (the same split [`jit_step_one`]/[`jit_local_call`](super::jit_local_call) use).
+/// (the same split [`jit_step_one`](super::jit_step_one)/
+/// [`jit_local_call`](super::jit_local_call) use).
 fn store_continuation(
     machine: &mut Machine,
     entry_module: &Module,
     module: &Module,
     labels: &LabelMap,
-    func: u32,
-    pc: u32,
+    site: CallSite,
     ctx: &mut dyn ExecutionContext,
 ) -> CallOutcome {
-    // The instruction this block emitted the helper for. An address outside the module
-    // cannot be here (the block was compiled from this very code), and any other
-    // instruction is not this helper's — both are handed to the interpreter's own step
-    // rather than invented; it reports the interpreter's exact diagnostic.
-    let (target, arity) = match module
-        .functions
-        .get(func as usize)
-        .and_then(|function| function.code.get(pc as usize))
-    {
-        Some(Instr::Call { target, arity }) => (*target, *arity),
-        _ => return CallOutcome::Deopt,
-    };
-    // Step 1: the module-local label, resolved through the same per-run label map the
-    // interpreter uses. An unresolvable label is the interpreter's own `unknown_label`.
-    let callee = match labels.resolve(target) {
-        Ok((callee, _callee_pc)) => callee,
-        Err(_) => return CallOutcome::Deopt,
-    };
+    let CallSite {
+        func,
+        pc,
+        callee,
+        callee_pc,
+        arity,
+    } = site;
+    // The emitter's arguments ARE the interpreter arm's step-1 `resolve` result, so a
+    // release build has nothing left to derive. A debug build proves it: the address
+    // names this very `call`, its `arity` operand is the one handed to the seam, and the
+    // resolved pair is the resolution of the instruction's own target label. This is a
+    // `debug_assert!`, never a run-time branch — the shipped path pays nothing for it.
+    debug_assert!(
+        match module
+            .functions
+            .get(func as usize)
+            .and_then(|function| function.code.get(pc as usize))
+        {
+            Some(Instr::Call { target, arity: operand }) =>
+                *operand == arity
+                    && matches!(labels.resolve(*target), Ok(resolved) if resolved == (callee, callee_pc)),
+            _ => false,
+        },
+        "jit_call_store: the emitter passes the `call`'s own resolution for          (func={func}, pc={pc})"
+    );
     // Step 2: the host's local-call seam, **before** anything is stored — a served
     // callee's code never runs, so it must not be left a return address.
     match machine.local_call_seam(
@@ -218,18 +279,21 @@ fn store_continuation(
         ctx,
     ) {
         Err(err) => CallOutcome::Fold(decorate(machine, module, Err(err), func, pc)),
-        Ok(Some(step)) => CallOutcome::Fold(decorate(machine, module, Ok(step), func, pc)),
+        // Served: the seam ran the callee as a BIF and produced this step. The exact
+        // suspension/raise position an interpreted `call` records is its own instruction
+        // address (`Machine::step_instruction` stores it before it runs the arm), so a
+        // raise from inside the seam's BIF reports at the instruction's own granularity
+        // (see [`jit_receive`](super::receive::jit_receive)). Only this arm needs it: a
+        // declined seam transfers into the callee, whose block immediately stores its own
+        // position, so a store here would be overwritten before anything could observe it.
+        Ok(Some(step)) => {
+            machine.set_current_code(func, pc);
+            CallOutcome::Fold(decorate(machine, module, Ok(step), func, pc))
+        }
         // Step 3: the continuation store, byte for byte what the interpreter's arm
         // stores — the call site (`func`, `pc + 1`) tagged with the context executing
         // now. `arity` plays no part in it.
         Ok(None) => {
-            // The exact suspension/raise position an interpreted `call` records: its own
-            // instruction address (`Machine::step_instruction` stores it before it runs
-            // the arm). Declined, the transfer into the callee immediately re-stores the
-            // callee's own block position, so this is invisible on that path; served, it
-            // is what keeps a raise from inside the seam's BIF at the instruction's own
-            // granularity. See [`jit_receive`](super::receive::jit_receive).
-            machine.set_current_code(func, pc);
             let continuation = Continuation::Address {
                 func,
                 pc: pc + 1,
