@@ -11,9 +11,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   call frames, exception catch frames, literal area, module-context registry, the **raise-time snapshot**
   `raise_snapshot: Vec<(u32, u32, u32)>` — the pre-unwind `(context, func, pc)` chain, the engine's
   replacement for C's saved raw `StackTrace` (`c_p->ftrace`) — latched A.8 trace gate, reduction counter,
-  and the **in-machine BIF-dispatch gate** `bif_in_machine_on` — the cached
+  the **in-machine BIF-dispatch gate** `bif_in_machine_on` — the cached
   `ExecutionContext::wants_bif_in_machine` answer, latched once per run by `Machine::drive` **and** by the
-  native baseline tier's driver, read by `Machine::dispatch_bif_call`); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
+  native baseline tier's driver, read by `Machine::dispatch_bif_call` — and the fourth latched gate,
+  **`census_on`**, the per-run copy of `exec_census::is_enabled()` that the per-instruction funnel at
+  `interpreter/dispatch.rs::step_instruction_inner` tests instead of touching the census's thread-local on
+  every instruction (cleared by `reset`, latched by both drivers, so a mid-run `enable()` takes effect at the
+  run's next entry)); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
   (`stack_mut`, `with_roots` handing over the whole `RootSet`, and `alloc_rooted` — the convenience
   wrapper that calls `ExecutionContext::alloc_words_rooted`); and the **off-heap refc-binary handle view**
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,

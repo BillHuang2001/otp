@@ -51,7 +51,7 @@ use beam_loader::Module;
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::interpreter::{build_label_map, LabelMap};
+use crate::interpreter::LabelMap;
 use crate::Step;
 
 use super::{Continuation, Machine, ModuleContext, RunOutcome};
@@ -122,18 +122,28 @@ impl Machine {
         // plain `call_bif` path byte-identical and pays one `bool` load instead of an
         // extra vtable crossing.
         self.bif_in_machine_on = ctx.wants_bif_in_machine();
+        // Latch the per-run dynamic-census gate too (see the `Machine::census_on` field
+        // docs): the census recorder runs once per *interpreted instruction*, and it is
+        // enabled only while a measurement is in progress, so its thread-local flag is
+        // copied here and the funnel then pays one `bool` load instead of a TLS access on
+        // every instruction. The native tiers' driver latches the same answer, so a
+        // deopt step is counted on both tiers; a natively-inlined instruction stays
+        // unobservable either way (the census's documented blind spot).
+        self.census_on = crate::exec_census::is_enabled();
         // One `drive` call is one scheduling slice, so the reduction counter starts
         // here (the ERTS process counter, `c_p->fcalls`, is likewise reset when a
         // process is scheduled in; the host reads the count when the slice returns).
         self.reductions = 0;
         // The entry module's label index. A run entry that already resolved its
-        // entry label hands its map in; otherwise it is built here (still exactly
-        // one build per run).
-        let built: LabelMap;
+        // entry label hands its map in; otherwise it comes from the machine's
+        // label-map cache, which builds the whole-module value only on a miss (a
+        // re-entered module answers from the entry `Machine::reset` deliberately
+        // keeps — it is content-keyed, not run-keyed).
+        let built: Arc<LabelMap>;
         let entry_labels: &LabelMap = match labels {
             Some(map) => map,
             None => {
-                built = build_label_map(module);
+                built = self.label_map(module);
                 &built
             }
         };

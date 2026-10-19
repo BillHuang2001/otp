@@ -405,7 +405,18 @@ pub(crate) fn resolve(labels: &LabelMap, label: Label) -> Result<(u32, u32)> {
     labels.resolve(label)
 }
 
-/// Resolve a module-local label to its `(function index, code offset)`.
+/// Resolve a module-local label to its `(function index, code offset)` against a
+/// **fresh** build of the module's index — the test-only convenience.
+///
+/// Production never calls this: a run resolves its labels against the machine's
+/// label-map cache ([`Machine::label_map`](crate::Machine), which
+/// [`Machine::run_label_outcome`](crate::Machine::run_label_outcome), the dispatch
+/// loop and the native tier all go through, so a re-entered module builds nothing),
+/// and a label handed in is resolved against the map the run will execute with
+/// ([`resolve`]). This per-call builder is compiled only for tests, where it pins the
+/// semantics of an index built from scratch — and so that no future site can quietly
+/// reintroduce a per-call whole-module build.
+#[cfg(test)]
 pub(crate) fn resolve_label(module: &Module, label: Label) -> Result<(u32, u32)> {
     build_label_map(module).resolve(label)
 }

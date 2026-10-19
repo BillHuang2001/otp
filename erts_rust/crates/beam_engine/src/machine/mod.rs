@@ -75,6 +75,8 @@
 //!   nested / blocking run path a fired `after T` has to work through.
 //! * `test_support` — the `cfg(test)`-only synthetic-module builder (`Fixture`)
 //!   and the cross-module seam context (`seam`) the `machine` tests share.
+use std::sync::Arc;
+
 use beam_common::{ExceptionClass, Result, StackTrace};
 use beam_loader::{Module, SharedLiteralArea};
 use beam_term::Eterm;
@@ -82,6 +84,7 @@ use beam_term::Eterm;
 pub use self::catch::CatchFrame;
 pub(crate) use self::catch::namespace_atom;pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
+pub(crate) use self::label_cache::LabelMaps;
 pub(crate) use self::local_callee::{CalleeTarget, LocalCallees};
 pub use self::location::WaitDeadline;
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
@@ -97,6 +100,9 @@ mod context;
 mod deadline_tests;
 mod drive;
 mod frames;
+mod label_cache;
+#[cfg(test)]
+mod label_cache_tests;
 mod local_callee;
 mod location;
 mod offheap;
@@ -254,6 +260,23 @@ pub struct Machine {
     /// process blocked in, which is how a resume recovers the module identity of
     /// the reported `(func, pc)`.
     pub(crate) context: u32,
+    /// The **label-map cache**: one already-built module-wide label index (plus the
+    /// import table derived from it), for the module this machine most recently
+    /// entered.
+    ///
+    /// [`interpreter::build_label_map`](crate::interpreter) is a whole-module value —
+    /// a traversal of every function's label table plus a resolution of the whole
+    /// import table — and it is a pure function of the module's immutable content, so
+    /// rebuilding it per run is pure overhead. Every label-map site reaches it through
+    /// [`Machine::label_map`] / [`Machine::label_map_arc`] (never the builder), which
+    /// is what makes the cache the single answer.
+    ///
+    /// **Content-keyed, not run-keyed**, so [`Machine::reset`] deliberately does
+    /// **not** clear it: a machine that runs one module repeatedly builds its map once.
+    /// The key is the module's load-time digest plus its atom-table snapshot plus its
+    /// address — see `label_cache.rs` for why that triple is sound on the bare
+    /// `&Module` route and why a synthetic (all-zero-checksum) module is never cached.
+    pub(crate) label_maps: LabelMaps,
     /// The **raise-time snapshot** of the pre-unwind frame chain: the engine's
     /// replacement for C's saved raw `StackTrace` (`c_p->ftrace`).
     ///
@@ -494,6 +517,33 @@ pub struct Machine {
     /// `Machine::step_instruction` call in a test) cannot leak a stale value from an
     /// earlier run.
     pub(crate) bif_in_machine_on: bool,
+    /// The **per-run dynamic-census gate**: a copy of the thread's
+    /// [`exec_census::is_enabled`](crate::exec_census::is_enabled) state, taken at the
+    /// run/resume entry.
+    ///
+    /// The dynamic execution census ([`crate::exec_census`]) is a thread-local
+    /// instrument, and its recording site sits on the **hottest** path the engine has
+    /// (the per-instruction funnel
+    /// [`Machine::step_instruction_inner`](crate::machine::Machine)), where it runs once
+    /// per interpreted instruction. Asking the thread-local flag there costs a TLS
+    /// access per instruction even when nothing is counting, so the entry latches the
+    /// answer into this plain field instead: the funnel pays one `bool` load and a
+    /// branch and **never touches TLS while the census is off**.
+    ///
+    /// **Semantics.** The flag is latched at a run/resume entry — by
+    /// [`Machine::drive`](crate::machine::Machine) for the interpreter **and** by the
+    /// native baseline tier's own driver — so both tiers see the same answer, and
+    /// turning counting **on** mid-run takes effect at the run's (or resume's) *next*
+    /// entry. Every consumer enables before it runs
+    /// (`jit::baseline::census::dynamic_execution_census`, `tests/dynamic_census.rs`,
+    /// `tests/real_beam_variant_proofs`), so no existing count changes. Turning it
+    /// **off** mid-run stops counting at the next instruction, because each recorder
+    /// re-checks the thread flag (a stricter, never a laxer, answer than the latch).
+    ///
+    /// [`Machine::reset`](crate::machine::Machine::reset) leaves it `false`, so a run
+    /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
+    /// test) cannot leak a stale `true` from an earlier counted run.
+    pub(crate) census_on: bool,
     /// The **local-callee identity memo** the local-call seam consults on every local
     /// `call`/`call_only`/`call_last` ([`Machine::local_call_seam`]).
     ///
@@ -608,6 +658,7 @@ impl Machine {
             entry_literals: None,
             contexts: Contexts::new(),
             context: 0,
+            label_maps: LabelMaps::new(),
             raise_snapshot: Vec::new(),
             pending_callee_head: false,
             raise_head_item: false,
@@ -621,6 +672,7 @@ impl Machine {
             trace_on: false,
             reduce_on: false,
             bif_in_machine_on: false,
+            census_on: false,
             local_callees: LocalCallees::new(),
             current_code: None,
             entry_call: None,
@@ -780,12 +832,44 @@ impl Machine {
     ) -> Result<*mut Eterm> {
         self.with_roots(live, |roots| ctx.alloc_words_rooted(n, roots))
     }
+    /// The module-wide label index of `module` — **the** label-map door.
+    ///
+    /// [`interpreter::build_label_map`](crate::interpreter) is a whole-module value (a
+    /// traversal of every function's label table plus a resolution of the module's
+    /// entire import table) and a pure function of the module's immutable content, so
+    /// this answers from [`Machine::label_maps`] after the first build for that module
+    /// and only builds on a miss. Every per-run label-map site goes through here (the
+    /// bare `&Module` route: `run_label_outcome`, the dispatch loop's fallback, the
+    /// native tier's per-run fallback), and the module-context registry uses
+    /// [`Machine::label_map_arc`].
+    ///
+    /// The returned `Arc` is what lets a call site hold the map across the `&mut self`
+    /// calls a run makes. A **synthetic** module (no load-time digest) is never cached
+    /// and is built on every call, exactly as before the cache existed; a hit can never
+    /// answer with another module's map (see `label_cache.rs`).
+    #[inline]
+    pub(crate) fn label_map(&mut self, module: &Module) -> Arc<crate::interpreter::LabelMap> {
+        self.label_maps.resolve(module)
+    }
+
+    /// The module-wide label index of `module`, keeping the module alive for as long as
+    /// the cache names it — the `Arc` route.
+    ///
+    /// Used where the machine is handed the module **handle** rather than a borrow (the
+    /// module-context registry): holding the `Arc` in the entry means the module cannot
+    /// be dropped, so its address cannot be recycled while the entry holds it.
+    #[inline]
+    pub(crate) fn label_map_arc(&mut self, module: &Arc<Module>) -> Arc<crate::interpreter::LabelMap> {
+        self.label_maps.resolve_arc(module)
+    }
+
     /// Register `module` as an enterable module context and return its id (`>= 1`).
     ///
     /// Idempotent by the `Arc`'s allocation identity (see [`Contexts::register`]),
     /// so a repeated or recursive cross-module call reuses one context.
-    pub(crate) fn register_context(&mut self, module: &std::sync::Arc<Module>) -> u32 {
-        self.contexts.register(module)
+    pub(crate) fn register_context(&mut self, module: &Arc<Module>) -> u32 {
+        let labels = self.label_map_arc(module);
+        self.contexts.register(module, labels)
     }
 
     /// Land the machine in module context `id`, re-binding [`Machine::literals`].

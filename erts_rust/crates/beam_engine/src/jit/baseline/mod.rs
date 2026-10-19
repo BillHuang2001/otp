@@ -710,7 +710,7 @@ fn enter_compiled_cached(
 }
 
 /// The module-wide label map a driver run resolves labels/imports through: the tier's
-/// own (built once with the artifact) when it holds one, else a fresh build.
+/// own (built once with the artifact) when it holds one, else the machine's cached one.
 ///
 /// `Deref`s to [`LabelMap`], so a driver call site passes it exactly as it passed the
 /// by-value map before ([`drive`] takes `&LabelMap`, [`interpreter::resolve`] too).
@@ -718,8 +718,9 @@ pub(crate) enum RunLabels<'a> {
     /// The map the tier's artifact already holds ([`NativeCode::labels`]): reused, so
     /// the run pays no per-run build.
     Stored(&'a interpreter::LabelMap),
-    /// The per-run map the driver built because the tier holds none.
-    Built(interpreter::LabelMap),
+    /// The map [`Machine::label_map`](crate::Machine) answered with because the tier
+    /// holds none — the machine's label-map cache, which builds on a miss only.
+    Built(std::sync::Arc<interpreter::LabelMap>),
 }
 
 impl std::ops::Deref for RunLabels<'_> {
@@ -737,8 +738,9 @@ impl std::ops::Deref for RunLabels<'_> {
 /// entry points share (it mirrors [`Machine::run_label`](crate::Machine)).
 ///
 /// The label map is **reused** from the tier's artifact when it holds one
-/// ([`NativeCode::labels`], i.e. the compiled map) and built here only otherwise: it is
-/// a per-module value, so rebuilding it on every run of the same artifact is pure
+/// ([`NativeCode::labels`], i.e. the compiled map) and taken from the machine's
+/// label-map cache otherwise ([`Machine::label_map`](crate::Machine)): it is a
+/// per-module value, so rebuilding it on every run of the same module is pure
 /// per-run overhead.
 fn enter_machine<'a>(
     machine: &mut Machine,
@@ -756,7 +758,7 @@ fn enter_machine<'a>(
     machine.set_literals(module.literals.clone());
     Ok(match code.labels(module) {
         Some(labels) => RunLabels::Stored(labels),
-        None => RunLabels::Built(interpreter::build_label_map(module)),
+        None => RunLabels::Built(machine.label_map(module)),
     })
 }
 
@@ -834,7 +836,10 @@ pub(crate) fn run_native_outcome(
         .ok_or_else(|| error::unsupported("jit: export not found"))?;
 
     let labels = enter_machine(machine, module, arity, args, code)?;
-    let (func, pc) = interpreter::resolve_label(module, entry)?;
+    // The entry label is resolved against the very map the run executes with (the
+    // tier's stored one, else the machine's cache entry), so the export path adds no
+    // whole-module build of its own.
+    let (func, pc) = interpreter::resolve(&labels, entry)?;
     // Record the run's entry call, exactly as every other run entry does
     // (`Machine::run_label_outcome`, `run_native_label_outcome`): without it the
     // export path would leave `Machine::entry_call` unset — the introspection
@@ -954,7 +959,7 @@ fn switch_into(
         // the wrong module.
         machine.set_literals(handle.module.literals.clone());
         let module = &*handle.module as *const Module;
-        let labels = &handle.labels as *const LabelMap;
+        let labels = Arc::as_ptr(&handle.labels);
         // Resolve the callee's compiled blocks once per context. A context the tier
         // has no blocks for keeps `active = None`: the driver runs that module on its
         // per-instruction interpreter step, exactly as it does an address its entry
@@ -1050,7 +1055,16 @@ fn drive(
     // interpreter's: what this slice charged, read back through `Machine::reductions`.
     machine.reduce_on = ctx.wants_reduce();
     let reduce_on = machine.reduce_on;
-    machine.reductions = 0;    // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
+    machine.reductions = 0;
+    // Latch the per-run dynamic-census gate too, exactly as `Machine::drive` does: the
+    // tier's per-instruction deopt helper (`jit_step_one` ->
+    // `Machine::step_instruction_with_entry`) is the same census funnel the interpreter
+    // uses, so the two drivers must agree or a deopt step would be counted on one tier
+    // and not the other. The default (census off) costs one `bool` load per instruction
+    // here and no TLS access at all. (The traced early return above delegates to
+    // `Machine::drive`, which latches the gate itself.)
+    machine.census_on = crate::exec_census::is_enabled();
+    // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.
     let x_regs: *mut Eterm = machine.x.as_mut_ptr();
