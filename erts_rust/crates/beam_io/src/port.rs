@@ -1823,3 +1823,10 @@ mod active_input_tests;
 #[cfg(test)]
 #[path = "port_command_tests.rs"]
 mod port_command_tests;
+
+// The control-reply shape surface (`Port::control_reply_shape`,
+// `PortRegistry::port_control_reply`/`control_reply_shape`): a `#[path]` sibling for the same
+// reason as `active_input_tests.rs`.
+#[cfg(test)]
+#[path = "port_control_reply_tests.rs"]
+mod port_control_reply_tests;

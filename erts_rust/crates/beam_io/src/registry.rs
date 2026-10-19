@@ -2120,7 +2120,9 @@ mod tests {
         let (mut registry, id) = registry_with_pipe(&mut poller);
 
         // `[nosuspend]` only — `[force]` is refused for a driver that does not advertise
-        // `ERL_DRV_FLAG_SOFT_BUSY`, which no built-in driver does (see `Port::command`).
+        // `ERL_DRV_FLAG_SOFT_BUSY`, and this pipe port's `fd` driver does not: only `tcp_inet`
+        // sets the bit (`inet_drv.c:1374`; `udp_inet` `:1432` and `ram_file_drv.c:126` do not),
+        // so a forced command here is the oracle's `error:notsup` (see `Port::command`).
         let options = PortCommandOptions::new().with_nosuspend(true);
         registry
             .port_command(&mut poller, id, b"cmd!", options)
