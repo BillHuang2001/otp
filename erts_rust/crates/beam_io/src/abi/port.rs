@@ -36,6 +36,7 @@
 //! | [`Driver::ready_output`] | `outputv`/`output`, then `ready_output` | the write path, then the write-readiness notification when the slot exists |
 //! | [`Driver::timeout`] | `timeout` | absent slot ⇒ no-op (`no_timeout_callback`) |
 //! | [`Driver::control`] | `control` | absent slot ⇒ `badarg` (`io.c:4035`) |
+//! | [`Driver::control_reply_shape`] | — | the `*rbuf == NULL` test of the last `control` call (`io.c:4134`); the shape no `cres` can carry |
 //! | [`Driver::port_exit`] | `process_exit`, falling back to `emergency_close` | the C has no port-exit callback |
 //! | [`Driver::stop`] | `stop` | absent slot ⇒ no-op |
 //! | [`Driver::next_timeout`] | the `driver_set_timer` deadline | see [`crate::AbiHost`] |
@@ -155,7 +156,7 @@ use beam_abi::SysIOVec;
 use beam_common::{BeamError, ExitReason, Raise, Result};
 
 use crate::abi::host::{AbiHost, PortHost};
-use crate::driver::{Driver, DriverContext, DriverFlags, PortExitReason};
+use crate::driver::{ControlReplyShape, Driver, DriverContext, DriverFlags, PortExitReason};
 use crate::error;
 
 /// The capacity of the reply buffer handed to a driver's `control` callback.
@@ -206,6 +207,14 @@ pub struct DriverPort {
     env: Box<DriverEnv>,
     /// The driver's private data, as returned by its `start` callback.
     data: ErlDrvData,
+    /// How this port's most recent `control` call described its reply buffer — the C's
+    /// `*rbuf == NULL` test `write_port_control_result` makes **before** it looks at
+    /// `PORT_CONTROL_FLAG_BINARY` (`io.c:4134`).
+    ///
+    /// The callback's `cres` alone cannot carry this (a `NULL` reply and a zero-length buffer both
+    /// report zero bytes), so the bridge records it here, where [`Driver::control_reply_shape`] and
+    /// [`crate::Port::control_reply_shape`] can report it beside the bytes.
+    control_shape: ControlReplyShape,
 }
 
 impl DriverPort {
@@ -283,6 +292,7 @@ impl DriverPort {
             abi,
             env,
             data: core::ptr::null_mut(),
+            control_shape: ControlReplyShape::Buffer,
         })
     }
 
@@ -748,9 +758,18 @@ impl Driver for DriverPort {
     ///   `!prt->drv_ptr->control ⇒ BADARG`, `io.c:4035`) or when the driver returned a negative
     ///   result (`io.c:4074`).
     ///
-    /// A driver that returns `cres > 0` while pointing `*rbuf` at `NULL` yields the **empty reply**
-    /// `[]`, exactly as the C does (`erts/doc/references/driver_entry.md` › *control*: "If `*rbuf`
-    /// is set to `NULL`, an empty list is returned"); only a negative `cres` is `badarg`.
+    /// A driver that points `*rbuf` at `NULL` yields the **empty reply**, never `badarg` — the C's
+    /// `write_port_control_result` answers `NIL` before it even looks at the port's
+    /// `PORT_CONTROL_FLAG_BINARY` (`io.c:4134`: `if (!resp_bufp) return NIL;`). Only a negative
+    /// `cres` is `badarg` (`io.c:4074`).
+    ///
+    /// That `NULL` answer is the empty **list** `[]` **whatever** the port's control flags say, and
+    /// the bytes are the same empty slice a zero-length reply buffer produces — so the two are told
+    /// apart by [`Driver::control_reply_shape`], which this method records
+    /// ([`ControlReplyShape::Null`] vs [`ControlReplyShape::Buffer`]). The four rows
+    /// (`io.c:4126-4175`): `NULL` ⇒ `[]` with the binary flag set **and** clear; a buffer of zero
+    /// bytes ⇒ `<<>>` with the flag set, `[]` without it. Rendering the empty slice as `<<>>`
+    /// whenever the flag is set is the one wrong answer, and it is the shape that prevents it.
     ///
     /// The driver may re-point the reply pointer at its own buffer and must keep it valid until the
     /// next `control` call (the C contract). That is a trust boundary: a driver is native code the
@@ -780,13 +799,22 @@ impl Driver for DriverPort {
             Ok(cres) if cres >= 0 => cres,
             _ => return Err(error::badarg()),
         };
+        // The C tests the reply pointer **before** it reads `cres`'s length
+        // (`write_port_control_result`, `io.c:4134`), so the shape is recorded here — before the
+        // `cres == 0` early return below, which is what would otherwise erase it.
+        self.control_shape = if rbuf.is_null() {
+            ControlReplyShape::Null
+        } else {
+            ControlReplyShape::Buffer
+        };
         let n = cres as usize;
-        if n == 0 {
+        if rbuf.is_null() {
+            // The C's `*rbuf == NULL` reply: the empty list for **every** flag word, not `badarg`
+            // (`io.c:4134`). The shape recorded above is what tells a caller this empty slice is
+            // the `NULL` reply rather than an empty buffer.
             return Ok(Vec::new());
         }
-        if rbuf.is_null() {
-            // The C's documented `*rbuf == NULL` reply: an empty list, not `badarg`
-            // (`erts/doc/references/driver_entry.md` › *control*). Only `cres < 0` is an error.
+        if n == 0 {
             return Ok(Vec::new());
         }
         // SAFETY: the driver reported `n` readable bytes at `rbuf` — either the buffer handed in
@@ -795,7 +823,16 @@ impl Driver for DriverPort {
         let bytes = unsafe { core::slice::from_raw_parts(rbuf as *const u8, n) }.to_vec();
         Ok(bytes)
     }
-    /// `ready_async`/`async_free`: hand the driver its finished `driver_async` jobs.
+
+    /// The shape of this port's last `control` reply — the `*rbuf == NULL` test the C makes before
+    /// it reads `PORT_CONTROL_FLAG_BINARY` (`io.c:4134`).
+    ///
+    /// Recorded by [`DriverPort::control`] on every successful call, so a caller that renders the
+    /// reply bytes afterwards can answer `[]` for a `NULL` reply even when the port's control flag
+    /// asks for a binary (`<<>>` is only right for an **empty buffer**, `io.c:4136-4166`).
+    fn control_reply_shape(&self) -> ControlReplyShape {
+        self.control_shape
+    }    /// `ready_async`/`async_free`: hand the driver its finished `driver_async` jobs.
     ///
     /// This is the `Driver::drive_async` drive point over the C entry's async slots; the work
     /// lives in [`DriverPort::poll_async`] (which the runtime may also call directly).

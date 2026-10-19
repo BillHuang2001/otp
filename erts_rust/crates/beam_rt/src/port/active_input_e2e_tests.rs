@@ -77,30 +77,37 @@
 //! build the expected text with [`Session::port_text`], and each one quotes the oracle's line in its
 //! message so a future reader can re-check it):
 //!
-//! | arming | client write | oracle |
+//! | arming / state | client write | oracle |
 //! |---|---|---|
 //! | `{active,once}`, `[binary]` | `<<"hello">>` | `{tcp,#Port<0.5>,<<104,101,108,108,111>>}` |
-//! | the grant is spent, no re-arm | `<<"world">>` | *nothing* |
-//! | re-armed, then written | `<<"again">>` | `{tcp,#Port<0.5>,<<119,111,114,108,100>>}` (the passive window's `<<"world">>`) |
-//! | `{mode,list}` | `<<"hello">>` | `{tcp,#Port<0.5>,[104,101,108,108,111]}`, `is_list(Data)` = true (the probe re-arms after the passive window, so its own `[mode,list]` line carries those buffered bytes) |
+//! | the grant is spent, no re-arm | `<<"world">>` | *nothing* (no `{tcp,S,Data}`, no passive `{Port,{data,…}}`) |
+//! | re-armed | — | `{tcp,#Port<0.5>,<<119,111,114,108,100>>}` — the bytes the spent grant left in the socket |
+//! | written under that (now spent) re-arm | `<<"again">>` | *nothing* — those bytes are withheld until the **next** re-arm |
+//! | the next re-arm | — | `{tcp,#Port<0.5>,<<97,103,97,105,110>>}` — that withheld `<<"again">>` |
+//! | `{mode,list}`, then written | `<<"hello">>` | `{tcp,#Port<0.5>,[104,101,108,108,111]}`, `is_list(Data)` = true |
 //! | `{packet,2}` | `<<0,5,"hello">>` | `{tcp,#Port<0.5>,<<104,101,108,108,111>>}` (header stripped) |
 //! | `{header,2}` | `<<"hello">>` | `{tcp,#Port<0.5>,[104,101\|<<108,108,111>>]}` |
 //! | `{active,2}` | `<<"one">>`, `<<"two">>`, `<<"three">>` | `{tcp,…<<"one">>}`, `{tcp,…<<"two">>}`, `{tcp_passive,#Port<0.5>}`, then nothing |
+//! | re-armed `{active,2}` | — | `{tcp,…<<"three">>}` — the withheld bytes, then nothing |
 //! | `{active,false}` / never armed | `<<"hi">>` | *nothing* |
 //! | UDP `{active,once}` | `<<"hi">>` / `<<>>` | `{udp,#Port<0.3>,{127,0,0,1},56678,<<104,105>>}` / `…,<<>>}` |
 //! | UDP `{mode,list}` | `<<"hi">>` | `{udp,#Port<0.3>,{127,0,0,1},56678,[104,105]}` |
 //!
-//! # Two measured differences from the oracle (both recorded, neither hidden)
+//! # The spent grant keeps the peer's bytes in the socket
 //!
-//! * **The passive window's bytes.** On the oracle a write that arrives while an
-//!   `{active,once}`/`{active,N}` grant is spent stays in the socket (the C calls
-//!   `sock_select(desc, FD_READ, 0)`), so the *re-arm's* inline read delivers those bytes. Here the
-//!   poll registration stays armed (`beam_io`'s poller is edge-triggered and has no empty interest
-//!   mask), so `async_ready_input` harvests them into the **port data queue** instead and the
-//!   re-arm's inline burst finds the socket empty. [`an_active_once_tcp_delivery_is_one_binary_and_the_next_write_waits_for_a_rearm`]
-//!   therefore asserts what both sides agree on — a write under a spent grant delivers nothing, and
-//!   the next write after a re-arm is delivered — and writes its third payload itself rather than
-//!   relying on the passive window's bytes.
+//! A write that arrives while an `{active,once}` / `{active,N}` grant is spent is **not** delivered
+//! and does **not** become a passive `{Port,{data,…}}`: the socket's read interest is disarmed (the
+//! C's `sock_select(desc, FD_READ, 0)`), so the bytes stay in the kernel until a re-arm's inline
+//! read hands them over. The same bytes a re-arm *did* deliver spend that re-arm's grant, so a
+//! write made after it waits for the next one. Measured on the oracle (`[TCP_PROBE]` below):
+//! `{tcp,…<<104,101,108,108,111>>}` for the armed `<<"hello">>`, `timeout` for `<<"world">>` written
+//! under the spent grant, `{tcp,…<<119,111,114,108,100>>}` for that same `<<"world">>` at the
+//! re-arm, `timeout` for `<<"again">>` written under the now-spent re-arm, and
+//! `{tcp,…<<97,103,97,105,110>>}` for that `<<"again">>` at the next re-arm. Cases 1 and 5 assert
+//! that sequence, and [`the_oracle_renders_every_shape_these_cases_assert`] re-measures it.
+//!
+//! # One measured difference from the oracle (recorded, not hidden)
+//!
 //! * **`hsz > len`.** `beam_io`'s `split_payload` clamps the `{header, N}` size to the payload, so a
 //!   header wider than the payload reaches the renderer as a whole-payload header with a
 //!   present-but-empty body; the C's `(mode == LIST) || (hsz > len)` branch would render one flat
@@ -578,13 +585,16 @@ fn skip_no_loopback(what: &str) {
 // -----------------------------------------------------------------------------------------------
 
 /// An `{active, once}` `[binary]` socket delivers exactly **one** `{tcp, S, <<Data>>}` per grant:
-/// the write under the grant arrives, a write while the grant is spent delivers nothing at all, and
-/// the next write after a re-arm is delivered again.
+/// the write under the grant arrives, a write while the grant is spent delivers nothing at all, the
+/// **re-arm** hands over the bytes that spent grant left in the socket — one delivery, which spends
+/// the re-arm's own grant — and the write after it waits for the next re-arm.
 ///
 /// The oracle's own sequence (`gen_tcp:listen` + a real loopback client + a re-armed `inet:setopts`)
-/// prints `{tcp,#Port<0.5>,<<104,101,108,108,111>>}` for `<<"hello">>`, `timeout` for the write
-/// under the spent grant, and a `{tcp, …}` again once re-armed — see the module docs' table and
-/// [`the_oracle_renders_every_shape_these_cases_assert`].
+/// prints `{tcp,#Port<0.5>,<<104,101,108,108,111>>}` for `<<"hello">>`, `timeout` for `<<"world">>`
+/// written under the spent grant, `{tcp,#Port<0.5>,<<119,111,114,108,100>>}` for that `<<"world">>`
+/// at the re-arm, `timeout` for `<<"again">>` written under the now-spent re-arm, and
+/// `{tcp,#Port<0.5>,<<97,103,97,105,110>>}` for that `<<"again">>` at the next re-arm — see the
+/// module docs' table and [`the_oracle_renders_every_shape_these_cases_assert`].
 #[test]
 fn an_active_once_tcp_delivery_is_one_binary_and_the_next_write_waits_for_a_rearm() {
     let Some((mut session, mut peer)) =
@@ -639,24 +649,53 @@ fn an_active_once_tcp_delivery_is_one_binary_and_the_next_write_waits_for_a_rear
         "`m2 = timeout` — the oracle's second receive times out",
     );
 
-    // (c) Re-armed, the next write is delivered again.
+    // (c) The re-arm hands over what the spent grant left in the socket: the peer's `<<"world">>`,
+    // as **one** delivery. The read interest was disarmed while the grant was spent, so those bytes
+    // never reached the port data queue — the re-arm's own inline read is what delivers them.
     assert_eq!(
         session.setopts(&record(INET_LOPT_ACTIVE, INET_ONCE)),
         vec![1],
         "the driver accepts the re-arm"
     );
-    peer.write_all(b"again")
-        .expect("the loopback peer writes `again`");
     let packets = session.collect(DELIVERY_BOUND);
     assert_eq!(
         packets.len(),
         1,
-        "a re-armed socket delivers the next write once, staged {packets:?}"
+        "the re-arm delivers the spent grant's one withheld write exactly once, staged {packets:?}"
+    );
+    assert_eq!(
+        binary(session.tcp_data(&packets[0])),
+        b"world",
+        "the re-arm's delivery is the `<<\"world\">>` written under the spent grant — the oracle \
+         prints `{{tcp,#Port<0.5>,<<119,111,114,108,100>>}}` there"
+    );
+
+    // (d) That delivery spent the re-arm's grant, so the next write is withheld like any other.
+    peer.write_all(b"again")
+        .expect("the loopback peer writes `again`");
+    session.assert_silent(
+        "a write under the grant the re-arm's own delivery spent",
+        "`m4 = timeout` — the oracle's fourth receive times out",
+    );
+
+    // (e) …and the next re-arm hands *those* bytes over, which is what makes (d) the spent-grant
+    // silence rather than a lost write.
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_ACTIVE, INET_ONCE)),
+        vec![1],
+        "the driver accepts the second re-arm"
+    );
+    let packets = session.collect(DELIVERY_BOUND);
+    assert_eq!(
+        packets.len(),
+        1,
+        "the second re-arm delivers the write (d) withheld, once, staged {packets:?}"
     );
     assert_eq!(
         binary(session.tcp_data(&packets[0])),
         b"again",
-        "the re-arm's delivery is the payload written under it"
+        "the second re-arm's delivery is the `<<\"again\">>` written under the spent re-arm — the \
+         oracle prints `{{tcp,#Port<0.5>,<<97,103,97,105,110>>}}` there"
     );
 }
 
@@ -829,13 +868,15 @@ fn a_header_two_delivery_conses_the_header_bytes_in_front_of_the_payload() {
 // -----------------------------------------------------------------------------------------------
 
 /// An `{active, 2}` counter delivers exactly two `{tcp, S, Data}` messages, then **one**
-/// `{tcp_passive, S}`, and then nothing — and a later `{active, false}` owes no second passive
-/// message.
+/// `{tcp_passive, S}`, and then nothing — a re-arm then hands over the bytes the spent counter left
+/// in the socket, and a later `{active, false}` owes no second passive message.
 ///
 /// The passive message follows the delivery that spent the last credit (`tcp_reply_data`'s
 /// `INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:4302`), which is why it lands in the **same** drain
 /// as the second payload. Measured on the oracle:
-/// `{tcp,…<<"one">>}`, `{tcp,…<<"two">>}`, `{tcp_passive,#Port<0.5>}`, then `timeout`.
+/// `{tcp,…<<"one">>}`, `{tcp,…<<"two">>}`, `{tcp_passive,#Port<0.5>}`, `timeout` for the
+/// `<<"three">>` written under the spent counter, `{tcp,…<<"three">>}` at the re-arm, then `timeout`
+/// and `timeout` (`[COUNTER_PROBE]`).
 #[test]
 fn an_active_n_counter_delivers_n_then_exactly_one_passive_message() {
     let Some((mut session, mut peer)) =
@@ -893,7 +934,31 @@ fn an_active_n_counter_delivers_n_then_exactly_one_passive_message() {
         .expect("the loopback peer writes `three`");
     session.assert_silent(
         "a write after the `{active,2}` counter was spent",
-        "`m4 = timeout` — the oracle's fourth receive times out",
+        "`silent=timeout` — the oracle's fourth receive times out",
+    );
+
+    // The spent counter kept `<<"three">>` in the socket, so a re-arm hands it over — the same rule
+    // the `{active,once}` case pins, through the counter's own record.
+    assert_eq!(
+        session.setopts(&active_counter_record(2)),
+        vec![1],
+        "the driver accepts an `{{active,2}}` re-arm"
+    );
+    let rearmed = session.collect(DELIVERY_BOUND);
+    assert_eq!(
+        rearmed.len(),
+        1,
+        "the re-arm delivers the withheld `<<\"three\">>` once, staged {rearmed:?}"
+    );
+    assert_eq!(
+        binary(session.tcp_data(&rearmed[0])),
+        b"three",
+        "the re-arm's delivery is the `<<\"three\">>` written under the spent counter — the oracle \
+         prints `{{tcp,#Port<0.5>,<<116,104,114,101,101>>}}` there"
+    );
+    session.assert_silent(
+        "a further write on the re-armed-then-spent counter",
+        "`rearmed_silent=timeout` — the oracle's sixth receive times out",
     );
 
     assert_eq!(
@@ -903,7 +968,7 @@ fn an_active_n_counter_delivers_n_then_exactly_one_passive_message() {
     );
     session.assert_silent(
         "a further `{active,false}` on an already passive socket",
-        "`m4 = timeout` — the oracle owes no second `{{tcp_passive,S}}`",
+        "`after_false=timeout` — the oracle owes no second `{{tcp_passive,S}}`",
     );
 }
 
@@ -1124,8 +1189,9 @@ fn loopback_datagram_client(label: &str) -> Option<UdpSocket> {
 // Test 9 — the oracle
 // -----------------------------------------------------------------------------------------------
 
-/// The system `erl`'s own rendering of every shape the cases above assert, and of the sequences they
-/// deliberately do **not** claim (the passive window).
+/// The system `erl`'s own rendering of every shape the cases above assert, including the whole
+/// spent-grant / re-arm sequence of [`an_active_once_tcp_delivery_is_one_binary_and_the_next_write_waits_for_a_rearm`]
+/// and of [`an_active_n_counter_delivers_n_then_exactly_one_passive_message`].
 ///
 /// Each probe is a real `gen_tcp`/`gen_udp` listener plus a real loopback `std::net`-equivalent
 /// client in another Erlang process, armed through `inet:setopts/2` — i.e. the same wire the cases
@@ -1143,14 +1209,10 @@ fn the_oracle_renders_every_shape_these_cases_assert() {
     for (label, expected) in [
         ("m1=", "m1={tcp,#Port<0.5>,<<104,101,108,108,111>>}"),
         ("m2=", "m2=timeout"),
-        // The re-arm's inline read takes what the socket buffered during the passive window
-        // (`<<"world">>`), not the `<<"again">>` written after it — see the module docs' measured
-        // differences. This runtime delivers the fresh write instead, which case 1 asserts.
         ("m3=", "m3={tcp,#Port<0.5>,<<119,111,114,108,100>>}"),
-        // The probe's `{mode,list}` arm inherits the passive window's buffered bytes
-        // (`<<"again">>`), so the oracle renders THAT payload as a char list here. Case 2 asserts
-        // this runtime renders its own `<<"hello">>` write the same way (`[104,101,108,108,111]`).
-        ("mode_list=", "mode_list={tcp,#Port<0.5>,[97,103,97,105,110]}"),
+        ("m4=", "m4=timeout"),
+        ("m5=", "m5={tcp,#Port<0.5>,<<97,103,97,105,110>>}"),
+        ("mode_list=", "mode_list={tcp,#Port<0.5>,[104,101,108,108,111]}"),
         ("mode_list_is_list=", "mode_list_is_list=true"),
     ] {
         assert_eq!(
@@ -1187,6 +1249,8 @@ fn the_oracle_renders_every_shape_these_cases_assert() {
         ("two=", "two={tcp,#Port<0.5>,<<116,119,111>>}"),
         ("passive=", "passive={tcp_passive,#Port<0.5>}"),
         ("silent=", "silent=timeout"),
+        ("rearmed=", "rearmed={tcp,#Port<0.5>,<<116,104,114,101,101>>}"),
+        ("rearmed_silent=", "rearmed_silent=timeout"),
         ("after_false=", "after_false=timeout"),
     ] {
         assert_eq!(
@@ -1228,8 +1292,9 @@ fn the_oracle_renders_every_shape_these_cases_assert() {
     );
 }
 
-/// `{active,once}` binary, the spent grant, the re-arm — plus the same `[binary]` socket switched to
-/// `{mode,list}`, all over real loopback TCP.
+/// `{active,once}` binary, the spent grant, the re-arm that hands its bytes over, the write that
+/// re-arm withholds and the next re-arm that delivers it — plus the same `[binary]` socket switched
+/// to `{mode,list}`, all over real loopback TCP.
 const TCP_PROBE: &str = "begin \
      {ok,L} = gen_tcp:listen(0,[binary,{ip,{127,0,0,1}},{active,false}]), \
      {ok,{_,P}} = inet:sockname(L), \
@@ -1244,13 +1309,16 @@ const TCP_PROBE: &str = "begin \
      gen_tcp:send(C,<<\"world\">>), \
      M2 = receive X2 -> X2 after 800 -> timeout end, \
      inet:setopts(A,[{active,once}]), \
-     gen_tcp:send(C,<<\"again\">>), \
      M3 = receive X3 -> X3 after 2000 -> timeout end, \
+     gen_tcp:send(C,<<\"again\">>), \
+     M4 = receive X4 -> X4 after 800 -> timeout end, \
+     inet:setopts(A,[{active,once}]), \
+     M5 = receive X5 -> X5 after 2000 -> timeout end, \
      inet:setopts(A,[{mode,list},{active,once}]), \
      gen_tcp:send(C,<<\"hello\">>), \
-     M4 = receive X4 -> X4 after 2000 -> timeout end, \
-     io:format(\"m1=~w~nm2=~w~nm3=~w~nmode_list=~w~nmode_list_is_list=~w~n\", \
-     [M1,M2,M3,M4,is_list(element(3,M4))]), \
+     M6 = receive X6 -> X6 after 2000 -> timeout end, \
+     io:format(\"m1=~w~nm2=~w~nm3=~w~nm4=~w~nm5=~w~nmode_list=~w~nmode_list_is_list=~w~n\", \
+     [M1,M2,M3,M4,M5,M6,is_list(element(3,M6))]), \
      gen_tcp:close(A), gen_tcp:close(L) end";
 
 /// `{packet,2}` and `{header,2}`, each on its own real loopback connection.
@@ -1278,7 +1346,8 @@ const FRAMING_PROBE: &str = "begin \
      io:format(\"packet2=~w~nheader2=~w~n\",[Packet2,Header2]), \
      gen_tcp:close(A2), gen_tcp:close(L2) end";
 
-/// `{active,2}` over three writes, then a `{active,false}` that owes no second passive message.
+/// `{active,2}` over three writes, the withheld third delivered by a re-arm, then a `{active,false}`
+/// that owes no second passive message.
 const COUNTER_PROBE: &str = "begin \
      {ok,L} = gen_tcp:listen(0,[binary,{ip,{127,0,0,1}},{active,false}]), \
      {ok,{_,P}} = inet:sockname(L), \
@@ -1295,10 +1364,14 @@ const COUNTER_PROBE: &str = "begin \
      Passive = receive X3 -> X3 after 2000 -> timeout end, \
      gen_tcp:send(C,<<\"three\">>), \
      Silent = receive X4 -> X4 after 800 -> timeout end, \
+     inet:setopts(A,[{active,2}]), \
+     Rearmed = receive X5 -> X5 after 2000 -> timeout end, \
+     RearmedSilent = receive X6 -> X6 after 800 -> timeout end, \
      inet:setopts(A,[{active,false}]), \
-     AfterFalse = receive X5 -> X5 after 800 -> timeout end, \
-     io:format(\"one=~w~ntwo=~w~npassive=~w~nsilent=~w~nafter_false=~w~n\", \
-     [One,Two,Passive,Silent,AfterFalse]), \
+     AfterFalse = receive X7 -> X7 after 800 -> timeout end, \
+     io:format(\"one=~w~ntwo=~w~npassive=~w~nsilent=~w~nrearmed=~w~n\
+     rearmed_silent=~w~nafter_false=~w~n\", \
+     [One,Two,Passive,Silent,Rearmed,RearmedSilent,AfterFalse]), \
      gen_tcp:close(A), gen_tcp:close(L) end";
 
 /// UDP: `{active,once}` binary, an empty datagram, and `{mode,list}` — with the sender's own

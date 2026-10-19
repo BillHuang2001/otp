@@ -233,7 +233,8 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - **The write path and the busy decision** are pinned hermetically (no `erl`, no child, no sleep) in
   two sibling modules of the source halves: `registry_reply_tests.rs` (declared from `registry.rs` as
   `#[cfg(test)] #[path = "registry_reply_tests.rs"] mod reply_tests;`) and `port_command_tests.rs`
-  (declared from `port.rs` the same way; `registry_busy_tests.rs` is `registry.rs`'s third). The
+  (declared from `port.rs` the same way); `registry_busy_tests.rs` and `registry_downcast_tests.rs`
+  are `registry.rs`'s next two, and `port_control_reply_tests.rs` is `port.rs`'s second sibling. The
   reply round trip: one `ram_file_drv` port, `port_command [1,0,0,0,3,97,98,99]` ⇒ **one**
   `execute_port_tasks` round reports exactly one `Data { read: ReadMessage::body_only([3,0,0,0,0]) }` with `output_len()`
   and `input_len()` back to `0` and no task left pending, a second round reports nothing; plus a
@@ -244,7 +245,10 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   written and one `OUTPUT` task, busy + plain or `[nosuspend]` ⇒ `Busy` with **nothing** queued and no
   task, `[force]` ⇒ the `notsup` raise without `SOFT_BUSY` and `Done` with it, the state cleared ⇒
   `Done` again, a non-`Open` port ⇒ `BadArg`, and the `is_busy`/`port_closed` probes forwarding to the
-  driver. `registry_busy_tests.rs` (4) adds only what the registry contributes: the live answer, the
+  driver. `port_control_reply_tests.rs` (4) pins the control reply's second fact
+  (`Port::control_reply_shape`, `PortRegistry::port_control_reply`/`control_reply_shape`, the reserved
+  `close` op answering an empty `Buffer`, an unknown id's `badarg`, and `port_control`'s unchanged
+  `Result<Vec<u8>>`). `registry_busy_tests.rs` (4) adds only what the registry contributes: the live answer, the
   legacy `port_command` folding `Busy` into `Ok(())` without queueing, and the unknown-id `BadArg`.
 - **The completion channel** is pinned structurally in `completion_tests.rs` — a sibling `#[path]`
   module of `completion.rs` (11 tests, no `erl` needed): each of the nine driver interaction points
@@ -279,14 +283,19 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` regular-file fallback), `Token`, `Interest` (`READABLE`/`WRITABLE`/`BOTH`/`ERROR`), `Ready`, `Event`, `Waker`; `poller_tests.rs` → its `#[path]` suite
-- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`/`PortCommandOutcome`, `Port::command`/`is_busy`/`port_closed`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`), the completion stage (`completions` + `take_completions`), the `{active,…}` stage (`active_inputs` + `take_active_inputs`), and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`; suite `port_command_tests.rs`
-- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_command_with`/`is_busy`/`port_closed`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`, `take_completions` + the `closed_completions` harvest, `take_active_inputs` + the `closed_active` harvest); suites `registry_reply_tests.rs`/`registry_busy_tests.rs`
+- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`/`PortCommandOutcome`, `Port::command`/`is_busy`/`port_closed`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`), the completion stage (`completions` + `take_completions`), the `{active,…}` stage (`active_inputs` + `take_active_inputs`), and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`; suite `port_command_tests.rs`, plus `port_control_reply_tests.rs`
+- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_command_with`/`is_busy`/`port_closed`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`, `take_completions` + the `closed_completions` harvest, `take_active_inputs` + the `closed_active` harvest); suites `registry_reply_tests.rs`/`registry_busy_tests.rs`/`registry_downcast_tests.rs`
 - `completion.rs` → the driver→owner completion side channel: `CompletionEvent` (`InetReply { caller_ref: Option<Vec<u8>>, reply }` / `InetAsync { id, result }`), `InetReply` (`Ok`/`Error(InetReason)`), `InetAsyncResult` (`Ok`/`Data`/`Port`/`Error`), `InetReason` (`Closed`/`Timeout`/`Errno` + `from_errno`/`atom_name`) and the port-stamped `PortCompletion { port, event }`
 - `active_input_tests.rs` → the `{active,…}` channel's structural suite (12 tests), a `#[path]` test module of `port.rs`
 - `completion_tests.rs` → the channel's structural suite (11 tests), a `#[path]` test module of `completion.rs`: all nine interaction points, the timer-only route, both round drivers, port-number ordering, the close harvest, exactly-once, and the no-sink `unsupported`
 - `driver_output2.rs` (`../tests/`) → the split-read pin over a real `PortRegistry`/`Poller`: one `Data` per call, header/body exact, `Some(vec![])` vs `None`, `input_len` = `hlen+len`, no re-report on a second round
 - `registry_reply_tests.rs` → the write-path pin: the reply round trip (`port_command` ⇒ one `Data`) and the refused-command propagation (`Err(BadArg)` out of `execute_port_tasks`), a `#[path]` test module of `registry.rs`
 - `registry_busy_tests.rs` → the registry's busy/peer-close seams (4 tests), a `#[path]` test module of `registry.rs`: a live idle port taking the command, a busy port reported busy with the legacy `port_command` folding `Busy` into `Ok(())` **without** queueing, `port_closed` forwarding the driver's latch, and the unknown-id `BadArg` all three seams answer
+- `port_control_reply_tests.rs` → the control-reply **shape** suite (4 tests), a `#[path]` test module of
+  `port.rs`: the driver's shape forwarded (`Buffer` default), the registry answering bytes **and** shape,
+  the reserved `close` op's empty `Buffer`, and an unknown id's `badarg` on both new seams
+- `registry_downcast_tests.rs` → the driver-downcast seam's suite (7 tests): `Port::driver`/`driver_as`
+  and `PortRegistry::driver_as`, a mismatched type answering `None`, and an unknown id
 - `port_command_tests.rs` → the busy-port decision table's suite (8 tests), a `#[path]` test module of `port.rs`: idle ⇒ `Done` + one `OUTPUT` task, busy + plain/`[nosuspend]` ⇒ `Busy` with nothing queued, `[force]` ⇒ `notsup` without `SOFT_BUSY` and `Done` with it, the state cleared ⇒ `Done` again, `BadArg` on a non-`Open` port, and the `is_busy`/`port_closed` probes
 - `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `ActiveInput`/`ActiveInputEvent` (the separate `{active,…}` channel: `Data`/`Passive`/`Error(InetReason)`), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`

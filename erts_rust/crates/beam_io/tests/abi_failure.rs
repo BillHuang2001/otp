@@ -80,10 +80,7 @@
 mod cdriver;
 mod support;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
+use std::path::Path;
 use std::time::Duration;
 
 use beam_common::BeamError;
@@ -817,16 +814,13 @@ fn strip_c_comments(source: &str) -> String {
 // ---------------------------------------------------------------------------------------------
 // The live oracle cross-check
 // ---------------------------------------------------------------------------------------------
-/// Runs the compiled fixture under the **system** Erlang and returns one `op rendering` line per
-/// scripted opcode. The session runs with `cwd` as its working directory, so a callback that wrote
-/// outside the `log=` path it was given would leave its file there (the caller hands in an empty
-/// sandbox and asserts it stays empty — see `the_rendered_rows_match_the_erl_oracle`).
+/// The oracle escript, run through [`support::oracle::run_escript`]. Its first line **must** be a
+/// `#!` line: without one `escript` mis-parses the file.
 ///
-/// The escript loads the object with `erl_ddll:load_driver/2`, opens one
-/// `open_port({spawn_driver, Name}, [binary])` per opcode, sends the opcode byte with
-/// `port_command/2`, and collects `{P,{data,D}}` / `{'EXIT',P,R}` until a 200 ms idle window
-/// (`process_flag(trap_exit,true)`). Each event is normalized so the two sides can be compared as
-/// text:
+/// It loads the object with `erl_ddll:load_driver/2`, opens one `open_port({spawn_driver, Name},
+/// [binary])` per opcode, sends the opcode byte with `port_command/2`, and collects
+/// `{P,{data,D}}` / `{'EXIT',P,R}` until a 200 ms idle window (`process_flag(trap_exit,true)`). Each
+/// event is normalized so the two sides can be compared as text:
 ///
 /// * a binary body → `data:bin(<hex>)` (the `[binary]` port mode's bare tail);
 /// * a proper list → `data:list(<hex>)` (the C's `buf == NULL` header-only / empty reply);
@@ -837,49 +831,6 @@ fn strip_c_comments(source: &str) -> String {
 ///
 /// `is_list/1` is a *shallow* test (a cons whose tail is a binary answers `true`), so the
 /// proper/improper distinction is the walk, not the guard.
-fn oracle_stdout(script: &Path, so: &Path, cwd: &Path) -> Option<String> {
-    let script = script.to_path_buf();
-    let so = so.to_path_buf();
-    let cwd = cwd.to_path_buf();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let out = Command::new("escript")
-            .arg(&script)
-            .arg(&so)
-            .current_dir(&cwd)
-            .output();
-        let _ = tx.send(out);
-    });
-
-    match rx.recv_timeout(ORACLE_TIMEOUT) {
-        Err(_) => {
-            support::skip(&format!(
-                "oracle check skipped: the `escript` session did not answer within {ORACLE_TIMEOUT:?}"
-            ));
-            None
-        }
-        Ok(Err(err)) => {
-            support::skip(&format!(
-                "oracle check skipped: could not spawn `escript` ({err}); is escript on PATH?"
-            ));
-            None
-        }
-        Ok(Ok(out)) => {
-            assert!(
-                out.status.success(),
-                "the oracle escript failed (exit {:?}) — a non-zero exit is a divergence, never a \
-                 skip:\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            Some(String::from_utf8_lossy(&out.stdout).into_owned())
-        }
-    }
-}
-
-/// The oracle escript. Its first line **must** be a `#!` line: without one `escript` mis-parses
-/// the file.
 const ORACLE_ESCRIPT: &str = r#"#!/usr/bin/env escript
 main([SoPath]) ->
     Dir = filename:dirname(SoPath),
@@ -1042,24 +993,6 @@ fn dir_entries(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Writes the oracle escript into a fresh scratch directory and answers its path.
-fn write_oracle_escript() -> PathBuf {
-    let dir = support::scratch_dir("abi-failure-oracle");
-    std::fs::create_dir_all(&dir).expect("a scratch dir is creatable");
-    let script = dir.join("oracle.escript");
-    std::fs::write(&script, ORACLE_ESCRIPT).expect("the oracle escript is writable");
-    script
-}
-
-/// Is `tool` an executable on `PATH`?
-fn on_path(tool: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(tool))
-            .any(|candidate| candidate.is_file())
-    })
-}
-
 /// The whole `driver_output*` + failure table, cross-checked against the **real** system Erlang.
 ///
 /// This is the live version of the file header's measured table: the oracle escript runs every
@@ -1074,7 +1007,7 @@ fn the_rendered_rows_match_the_erl_oracle() {
     let Some(so) = shape_fixture_so() else {
         return;
     };
-    if !on_path("escript") || !on_path("erl") {
+    if !support::oracle::on_path("escript") || !support::oracle::on_path("erl") {
         support::skip("the oracle cross-check needs `erl` and `escript` on PATH");
         return;
     }
@@ -1092,7 +1025,6 @@ fn the_rendered_rows_match_the_erl_oracle() {
         }
     }
 
-    let script = write_oracle_escript();
     // The oracle session runs from an **empty** sandbox, and it must still be empty afterwards: the
     // fixture may only ever write the `log=` path a caller named, never a path of its own. That is
     // the regression guard for the class this fixture used to leak — a post-`stop` `log_call` (the
@@ -1100,7 +1032,7 @@ fn the_rendered_rows_match_the_erl_oracle() {
     // named after whatever garbage bytes it found, in the process's working directory.
     let sandbox = support::scratch_dir("abi-failure-oracle-cwd");
     std::fs::create_dir_all(&sandbox).expect("a scratch working directory is creatable");
-    let stdout = oracle_stdout(&script, &so, &sandbox);
+    let stdout = support::oracle::run_escript("oracle", ORACLE_ESCRIPT, &so, &sandbox, ORACLE_TIMEOUT);
     let stray = dir_entries(&sandbox);
     let _ = std::fs::remove_dir_all(&sandbox);
     assert!(

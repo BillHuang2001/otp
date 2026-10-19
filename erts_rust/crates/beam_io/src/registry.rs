@@ -59,10 +59,13 @@ use beam_common::Result;
 use beam_process::{PortId, PortTable};
 
 use crate::completion::PortCompletion;
-use crate::driver::{Driver, DriverRegistry, PortExitReason};
+use crate::driver::{ControlReplyShape, Driver, DriverRegistry, PortExitReason};
 use crate::error;
 use crate::poller::{Event, Poller};
-use crate::port::{Port, PortCommandOptions, PortCommandOutcome, PortControl, DEFAULT_READINESS_RED_BUDGET};
+use crate::port::{
+    Port, PortCommandOptions, PortCommandOutcome, PortControl, PortControlReply,
+    DEFAULT_READINESS_RED_BUDGET,
+};
 use crate::port_failure::{DriverFailure, PortFailure};
 use crate::port_task::{
     ActiveInput, LineNotification, PortNotification, PortTaskKind, PortTaskOutcome, Readiness,
@@ -205,6 +208,21 @@ impl PortRegistry {
     /// The port with id `id`, mutably, if it is live.
     pub fn get_mut(&mut self, id: PortId) -> Option<&mut Port> {
         self.ports.get_mut(&id.number())
+    }
+
+    /// The driver of port `id` downcast to `T`, or `None`.
+    ///
+    /// This is the registry surface of [`Port::driver_as`]: the **read-only** downcast a runtime needs to reach a *concrete* driver through the `Box<dyn Driver>` a [`Port`] owns.
+    /// The consumer is the C's `tcp_inet_copy` (`erts/emulator/drivers/common/inet_drv.c:11795`): accepting a connection builds the second, connected port's driver from the **listener's** option set, so the runtime resolves the listener port and asks for its [`TcpInetDriver`](crate::drivers::TcpInetDriver) here, then calls
+    /// [`TcpInetDriver::from_accepted`](crate::drivers::TcpInetDriver::from_accepted) with it.
+    ///
+    /// `None` answers **both** refusals in one shape — `id` names no live port (it was never allocated, or its [`PortNotification::Closed`](crate::PortNotification::Closed) has already been reported and its number retired) and the live port's driver is of another concrete type.
+    /// The two are deliberately not an `Option`/`Result` pair: both mean "no `&T` for you", and every caller would fold them together anyway.
+    /// Nothing panics, nothing is `unwrap`ped, and an unknown id is not a `badarg` the way the mutating seams' faults are — this reads only.
+    ///
+    /// It reads only, and that is why there is **no `&mut` form**: the port-task round drives the driver, so an exclusive borrow handed out here could race it.
+    pub fn driver_as<T: Driver + 'static>(&self, port: PortId) -> Option<&T> {
+        self.ports.get(&port.number())?.driver_as::<T>()
     }
 
     /// Writes `data` to the given port's output queue and asks the port's driver to write it
@@ -521,6 +539,11 @@ impl PortRegistry {
     /// The single exception is the reserved [`PortControl::CLOSE`] (`"close"`), which closes
     /// the port like [`PortRegistry::close`] and answers with no bytes.
     ///
+    /// This is the bytes-only form of [`PortRegistry::port_control_reply`], which also reports the
+    /// **shape** the driver described them with (a `NULL` reply pointer is the oracle's `[]` even
+    /// for a binary-reply port). A caller that renders the reply as a term needs that shape; a
+    /// caller that only forwards bytes can keep using this one.
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's
@@ -533,17 +556,77 @@ impl PortRegistry {
         op: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        if op == PortControl::CLOSE {
-            self.close(poller, id)?;
-            return Ok(Vec::new());
-        }
-        let result = match self.ports.get_mut(&id.number()) {
-            Some(port) => port.control(poller, op, arg),
-            None => Err(error::badarg()),
-        };
-        self.after_driver_call(poller, result)
+        self.port_control_reply(poller, id, op, arg)
+            .map(|reply| reply.bytes)
     }
 
+    /// Delivers a named port-control operation to the port's driver, answering its reply **bytes**
+    /// together with the **shape** the driver described them with — the whole
+    /// `erlang:port_control/3` reply, not just its payload.
+    ///
+    /// `op`/`arg` are forwarded exactly as [`PortRegistry::port_control`] forwards them, including
+    /// the reserved [`PortControl::CLOSE`] arm, which answers an empty
+    /// [`Buffer`](ControlReplyShape::Buffer) reply (`[]`; no driver ran, so no reply pointer
+    /// existed).
+    ///
+    /// The shape matters because the bytes alone cannot distinguish the two zero-length replies the
+    /// C produces: a driver that leaves `*rbuf` `NULL` gets the empty **list** `[]` for **every**
+    /// port-flag word — `write_port_control_result` tests the pointer first
+    /// (`erts/emulator/beam/io.c:4134`) — while an empty *buffer* under
+    /// `PORT_CONTROL_FLAG_BINARY` is `<<>>` (`io.c:4136-4162`). So the runtime renders `[]` for
+    /// [`ControlReplyShape::Null`] **even when** its port asked for binary replies, and `<<>>` only
+    /// for [`ControlReplyShape::Buffer`] + zero bytes + that flag. See [`PortControlReply`] for the
+    /// whole table.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's
+    /// `control`/`stop` returns (an unrecognised operation is the *driver's* `BeamError::BadArg`).
+    pub fn port_control_reply(
+        &mut self,
+        poller: &mut Poller,
+        id: PortId,
+        op: &str,
+        arg: &[u8],
+    ) -> Result<PortControlReply> {
+        if op == PortControl::CLOSE {
+            self.close(poller, id)?;
+            return Ok(PortControlReply {
+                bytes: Vec::new(),
+                shape: ControlReplyShape::Buffer,
+            });
+        }
+        // The shape is read before `after_driver_call`, which may reap a port the driver closed
+        // from inside its own `control` callback — the reply that call produced still has to be
+        // describable.
+        let (result, shape) = match self.ports.get_mut(&id.number()) {
+            Some(port) => {
+                let result = port.control(poller, op, arg);
+                (result, port.control_reply_shape())
+            }
+            None => (Err(error::badarg()), ControlReplyShape::Buffer),
+        };
+        let bytes = self.after_driver_call(poller, result)?;
+        Ok(PortControlReply { bytes, shape })
+    }
+
+    /// How port `id`'s driver described its most recent [`PortRegistry::port_control`] reply buffer.
+    ///
+    /// The registry surface of [`Port::control_reply_shape`], for a caller that already holds the
+    /// reply bytes (from [`PortRegistry::port_control`]) and wants the shape afterwards. Prefer
+    /// [`PortRegistry::port_control_reply`], which answers both from the same call — this one reads
+    /// the **last** reply, so anything else that drove the port's `control` in between would
+    /// describe that call instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn control_reply_shape(&self, id: PortId) -> Result<ControlReplyShape> {
+        match self.ports.get(&id.number()) {
+            Some(port) => Ok(port.control_reply_shape()),
+            None => Err(error::badarg()),
+        }
+    }
     /// Drives port `id`'s asynchronous driver completions, returning how many were processed.
     ///
     /// A `driver_async` job finishes on a worker thread; the runtime then hands it to the driver's
@@ -2037,7 +2120,9 @@ mod tests {
         let (mut registry, id) = registry_with_pipe(&mut poller);
 
         // `[nosuspend]` only — `[force]` is refused for a driver that does not advertise
-        // `ERL_DRV_FLAG_SOFT_BUSY`, which no built-in driver does (see `Port::command`).
+        // `ERL_DRV_FLAG_SOFT_BUSY`, and this pipe port's `fd` driver does not: only `tcp_inet`
+        // sets the bit (`inet_drv.c:1374`; `udp_inet` `:1432` and `ram_file_drv.c:126` do not),
+        // so a forced command here is the oracle's `error:notsup` (see `Port::command`).
         let options = PortCommandOptions::new().with_nosuspend(true);
         registry
             .port_command(&mut poller, id, b"cmd!", options)
@@ -2309,3 +2394,10 @@ mod reply_tests;
 #[cfg(test)]
 #[path = "registry_busy_tests.rs"]
 mod busy_tests;
+
+/// The **driver-downcast seam** (`PortRegistry::driver_as`/`Port::driver_as`, and the generic
+/// `Port::driver` view beside them) — the read-only route to a port's concrete driver, which the
+/// accepted-socket adoption needs — lives in its own sibling for the same reason as `reply_tests`.
+#[cfg(test)]
+#[path = "registry_downcast_tests.rs"]
+mod downcast_tests;

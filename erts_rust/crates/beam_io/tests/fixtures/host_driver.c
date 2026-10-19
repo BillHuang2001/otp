@@ -124,14 +124,26 @@
  *  27  set `*rbuf = NULL` and return `5` — the C's documented `cres > 0`-with-a-`NULL`-reply case,
  *      which `port_control/3` reports as the **empty list** (`ertdoc › driver_entry.md › control`:
  *      "If `*rbuf` is set to `NULL`, an empty list is returned"), never `badarg`.
+ *  28  `set_port_control_flags(port, PORT_CONTROL_FLAG_BINARY)`, then set `*rbuf = NULL` and return
+ *      `0` — the row that separates the two facts the C answers a control reply from
+ *      (`write_port_control_result`, `io.c:4126-4175`): the reply pointer is tested **first**
+ *      (`io.c:4134`), so this is the empty **list** `[]` even though the port asked for binary
+ *      replies. Never `<<>>`.
+ *  29  `set_port_control_flags(port, PORT_CONTROL_FLAG_BINARY)` and return `0` leaving `*rbuf` at the
+ *      buffer the caller handed in — the other half of that table: a zero-length **buffer** under
+ *      the binary flag is the empty **binary** `<<>>` (`io.c:4136-4162`).
+ *  30  `set_port_control_flags(port, 0)` (back to a list reply) and return `0` leaving `*rbuf` at the
+ *      caller's buffer — so the (flag clear, zero-byte buffer) row is `[]` again and a test can
+ *      restore a port a verb 28/29 made binary.
  *
  * Verbs 19–23 answer their observation as `key=value` text; the `bytes=` field is the trailing raw
  * payload and every other field is a decimal number. Verbs 19–23 are the driver-queue family
  * (`driver_enq`/`driver_sizeq`/`driver_peekq[v]`/`driver_deq`, `io.c:6790-6919`): the queue is the
  * host's driver-private byte queue (the C's `prt->ioq`, **not** the port's Erlang→driver output
  * queue), so it persists across these `control` calls for the port's whole life and a host can
- * drive the four steps in order. Verbs 25/26 flip the port's busy state (`set_busy_port`) and 27
- * exercises the `NULL`-`*rbuf` reply arm; none of them carries a `key=value` payload.
+ * drive the four steps in order. Verbs 25/26 flip the port's busy state (`set_busy_port`), 27
+ * exercises the `NULL`-`*rbuf` reply arm and 28/29/30 the `PORT_CONTROL_FLAG_BINARY` × reply-pointer
+ * matrix (`set_port_control_flags`); none of them carries a `key=value` payload.
  *
  * Any other command returns `-1`, the C's negative `cres` (`port_control/3` answers `badarg`,
  * `io.c:4074`).
@@ -811,6 +823,25 @@ static ErlDrvSSizeT host_control(ErlDrvData drv_data, unsigned int command,
         if (rbuf != NULL)
             *rbuf = NULL;
         return (ErlDrvSSizeT) 5;
+    case 28:
+        /* `PORT_CONTROL_FLAG_BINARY` set, and `*rbuf` = NULL: the reply pointer is tested **first**
+         * (`write_port_control_result`, `io.c:4134`), so the answer stays the empty **list** `[]`
+         * even though the port asked for a binary — never `<<>>`. */
+        set_port_control_flags(st->port, PORT_CONTROL_FLAG_BINARY);
+        if (rbuf != NULL)
+            *rbuf = NULL;
+        return (ErlDrvSSizeT) 0;
+    case 29:
+        /* `PORT_CONTROL_FLAG_BINARY` set, `cres == 0`, `*rbuf` left at the caller's buffer: a
+         * zero-length **buffer** under the binary flag is the empty **binary** `<<>>`
+         * (`io.c:4136-4162`). */
+        set_port_control_flags(st->port, PORT_CONTROL_FLAG_BINARY);
+        return (ErlDrvSSizeT) 0;
+    case 30:
+        /* Back to a list reply (`PORT_CONTROL_FLAG_BINARY` cleared), `cres == 0`, `*rbuf` left at
+         * the caller's buffer: the same zero bytes are the empty **list** `[]` again. */
+        set_port_control_flags(st->port, 0);
+        return (ErlDrvSSizeT) 0;
     default:
         /* An unrecognised request: a negative `cres`, which `port_control/3` reports as `badarg`. */
         return (ErlDrvSSizeT) -1;

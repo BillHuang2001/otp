@@ -48,7 +48,9 @@
 //! the `driver_async` completions owned by a `ready_async`/`async_free` (the latter the subject of
 //! `tests/abi_async.rs`) and `17`/`18` the sticky `ERL_DRV_USE` re-selections, `19`–`22`
 //! `driver_enq`/`driver_sizeq`/`driver_peekq`/`driver_deq` (the driver's own queue) and `23`/`24`
-//! `driver_peekqv` / a `driver_select(WRITE)` arm on `fd=<n>`; any
+//! `driver_peekqv` / a `driver_select(WRITE)` arm on `fd=<n>`, `25`/`26` `set_busy_port`, `27` the
+//! `NULL`-`*rbuf` control reply and `28`–`30` the `PORT_CONTROL_FLAG_BINARY` × reply-pointer matrix
+//! (`set_port_control_flags`); any
 //! other verb answers the negative `cres` that `port_control/3` reports as `badarg`. Its `output`
 //! echoes via `driver_output`, its `ready_input` reads the selected fd and `driver_output`s the
 //! bytes, its `ready_output` emits `"W"`, its `timeout` emits `"T"`, its `ready_async`/`async_free`
@@ -74,6 +76,7 @@
 //! `{fd, N}` descriptor to `O_NONBLOCK`); the socket-pair test below sets it explicitly.
 
 mod cdriver;
+mod support;
 
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -911,6 +914,298 @@ fn port_control_with_a_null_rbuf_reply_is_the_empty_list() {
     );
 
     registry.close(&mut poller, id).expect("the port closes");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The control reply's *shape*: `*rbuf == NULL` × `PORT_CONTROL_FLAG_BINARY`
+// ---------------------------------------------------------------------------------------------
+
+/// The `*rbuf == NULL` answer is the empty **list** for every flag word, and a zero-length reply
+/// **buffer** is only `<<>>` under `PORT_CONTROL_FLAG_BINARY` — the C's two independent facts.
+///
+/// `write_port_control_result` (`erts/emulator/beam/io.c:4126-4175`) opens with
+/// `if (!resp_bufp) return NIL;` (`io.c:4134`), **before** it reads the port's control flags, so the
+/// four cases are:
+///
+/// | fixture verb | `*rbuf` | `PORT_CONTROL_FLAG_BINARY` | `port_control/3` answers |
+/// |---|---|---|---|
+/// | `27` (returns `5`) | `NULL` | clear | `[]` |
+/// | `28` (returns `0`) | `NULL` | **set** | `[]` — never `<<>>` |
+/// | `29` (returns `0`) | the caller's buffer | **set** | `<<>>` |
+/// | `30` (returns `0`) | the caller's buffer | cleared again | `[]` |
+/// | `25`/`26` (return `0`) | the caller's buffer | clear | `[]` |
+///
+/// Both zero-byte replies come back as the same empty `Vec<u8>` from
+/// [`PortRegistry::port_control`], which is exactly why
+/// [`PortRegistry::port_control_reply`] reports the [`ControlReplyShape`] beside the bytes: a runtime
+/// that renders the bytes from its port flag alone answers `<<>>` for verb `28`, which the oracle
+/// never does (`the_control_reply_shapes_match_the_erl_oracle` pins that against the real system).
+#[test]
+fn port_control_reports_the_reply_shape_the_driver_described() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let (mut poller, mut registry, id) = open_port(&so, "", host);
+
+    // (flag clear, caller's buffer, zero bytes) — the plain `cres == 0` reply.
+    for verb in ["25", "26"] {
+        let reply = registry
+            .port_control_reply(&mut poller, id, verb, &[])
+            .expect("a zero-length buffer reply");
+        assert_eq!(reply.bytes, Vec::<u8>::new(), "verb {verb} answers no bytes");
+        assert_eq!(
+            reply.shape,
+            ControlReplyShape::Buffer,
+            "verb {verb} leaves `*rbuf` at the buffer the emulator handed in"
+        );
+        // The bytes-only entry point is the same reply, and the shape is readable separately.
+        assert_eq!(
+            registry
+                .port_control(&mut poller, id, verb, &[])
+                .expect("the bytes-only form answers too"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            registry.control_reply_shape(id).expect("the port is live"),
+            ControlReplyShape::Buffer
+        );
+    }
+
+    // (flag clear, `*rbuf == NULL`, `cres == 5`) — the `NULL` reply.
+    let reply = registry
+        .port_control_reply(&mut poller, id, "27", &[])
+        .expect("control verb 27 answers the C's NULL reply");
+    assert!(reply.bytes.is_empty());
+    assert_eq!(
+        reply.shape,
+        ControlReplyShape::Null,
+        "a `NULL` `*rbuf` is the empty list (`io.c:4134`), and the shape must say so"
+    );
+
+    // (flag SET, `*rbuf == NULL`) — the row this accessor exists for: `io.c:4134` still answers the
+    // empty list, so a runtime must NOT render this as `<<>>`.
+    let reply = registry
+        .port_control_reply(&mut poller, id, "28", &[])
+        .expect("control verb 28 answers the C's NULL reply under the binary flag");
+    assert!(reply.bytes.is_empty());
+    assert_eq!(
+        reply.shape,
+        ControlReplyShape::Null,
+        "`PORT_CONTROL_FLAG_BINARY` does not change a NULL reply: the pointer is tested first"
+    );
+    assert_eq!(
+        registry.control_reply_shape(id).expect("the port is live"),
+        ControlReplyShape::Null,
+        "the registry surface reports the same shape"
+    );
+
+    // (flag SET, a real buffer with zero bytes) — the only `<<>>` row.
+    let reply = registry
+        .port_control_reply(&mut poller, id, "29", &[])
+        .expect("control verb 29 answers an empty buffer under the binary flag");
+    assert!(reply.bytes.is_empty());
+    assert_eq!(
+        reply.shape,
+        ControlReplyShape::Buffer,
+        "a zero-length buffer under `PORT_CONTROL_FLAG_BINARY` is `<<>>` (`io.c:4136-4162`)"
+    );
+
+    // …and the flag cleared again puts the same bytes back to `[]`.
+    let reply = registry
+        .port_control_reply(&mut poller, id, "30", &[])
+        .expect("control verb 30 clears the binary flag");
+    assert!(reply.bytes.is_empty());
+    assert_eq!(reply.shape, ControlReplyShape::Buffer);
+
+    // A non-empty reply (the driver's own memory, verb 13) is a buffer as well.
+    let reply = registry
+        .port_control_reply(&mut poller, id, "13", &[])
+        .expect("control verb 13 answers from the driver's own buffer");
+    assert_eq!(reply.bytes, b"host-reply".to_vec());
+    assert_eq!(reply.shape, ControlReplyShape::Buffer);
+
+    // The reserved `close` op runs no driver, so there is no reply pointer at all — an empty
+    // `Buffer` (the oracle answers `[]`, never a binary, for it).
+    let reply = registry
+        .port_control_reply(&mut poller, id, "close", &[])
+        .expect("the reserved close op answers");
+    assert!(reply.bytes.is_empty());
+    assert_eq!(reply.shape, ControlReplyShape::Buffer);
+    // …and a closed port has no shape to report.
+    let err = registry
+        .control_reply_shape(id)
+        .expect_err("a closed port is not live");
+    assert_eq!(err.as_atom(), Some("badarg"));
+
+    // An unknown id is `badarg` for both entry points.
+    let unknown = PortId::new(4242);
+    assert_eq!(
+        registry
+            .port_control_reply(&mut poller, unknown, "25", &[])
+            .expect_err("an unknown port")
+            .as_atom(),
+        Some("badarg")
+    );
+    assert_eq!(
+        registry
+            .control_reply_shape(unknown)
+            .expect_err("an unknown port")
+            .as_atom(),
+        Some("badarg")
+    );
+}
+
+/// The oracle escript for the control-reply matrix: one line per verb, `op rendering`, where the
+/// rendering is the **term** the real `port_control/3` answered (`list(<hex>)` / `bin(<hex>)`).
+///
+/// It loads the same compiled fixture the Rust side loads, opens one
+/// `open_port({spawn_driver, Name}, [])` per verb and closes it again — the four-row matrix only
+/// exists because the driver's `control` callback runs under the real emulator.
+const CONTROL_ORACLE_ESCRIPT: &str = r#"#!/usr/bin/env escript
+main([SoPath]) ->
+    Dir = filename:dirname(SoPath),
+    Name = filename:basename(SoPath, ".so"),
+    ok = erl_ddll:load_driver(Dir, Name),
+    lists:foreach(
+      fun(Op) ->
+              P = open_port({spawn_driver, Name}, []),
+              Rendering =
+                  try port_control(P, Op, <<>>) of
+                      Reply -> render(Reply)
+                  catch
+                      C:E -> "raised:" ++ atom_to_list(C) ++ ":" ++ atom_to_list(E)
+                  end,
+              io:format("~w ~s~n", [Op, Rendering]),
+              try port_close(P) catch _:_ -> ok end
+      end, [25, 26, 27, 28, 29, 30]).
+
+render(Reply) when is_binary(Reply) ->
+    "bin(" ++ hex(Reply) ++ ")";
+render(Reply) when is_list(Reply) ->
+    "list(" ++ hex(list_to_binary(Reply)) ++ ")" .
+
+hex(Bin) ->
+    lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B>> <= Bin]).
+"#;
+
+/// `list(<hex bytes>)` / `bin(<hex bytes>)` — the two terms `erlang:port_control/3` can answer,
+/// rendered the way [`CONTROL_ORACLE_ESCRIPT`] renders them.
+///
+/// `binary_flag` is whether the **port** asked for binary replies (`PORT_CONTROL_FLAG_BINARY`, which
+/// the fixture verb itself sets through `set_port_control_flags`). The decision is the runtime's —
+/// `beam_io` reports bytes + shape and nothing about the flag — so this function is the rule a
+/// runtime must apply, pinned here against the oracle:
+///
+/// * a [`ControlReplyShape::Null`] reply is `[]` **whatever** the flag says (`io.c:4134`);
+/// * a [`ControlReplyShape::Buffer`] reply is a binary only under the flag, else a byte-int list.
+fn render_control_reply(reply: &PortControlReply, binary_flag: bool) -> String {
+    match reply.shape {
+        ControlReplyShape::Null => "list()".to_string(),
+        ControlReplyShape::Buffer if binary_flag => format!("bin({})", hex_bytes(&reply.bytes)),
+        ControlReplyShape::Buffer => format!("list({})", hex_bytes(&reply.bytes)),
+    }
+}
+
+/// Lowercase hex, two digits per byte — the same spelling `~2.16.0b` produces on the other side.
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// The whole control-reply matrix, cross-checked against the **real** system Erlang.
+///
+/// This is the live version of
+/// [`port_control_reports_the_reply_shape_the_driver_described`]'s table: the same `.so` is loaded
+/// under the system runtime, `port_control/3` is called with each verb, and the term the oracle
+/// answers is compared with this crate's rendering. The `28` row is the one that matters — a `NULL`
+/// reply pointer with `PORT_CONTROL_FLAG_BINARY` set is `[]` on the oracle, and only the recorded
+/// [`ControlReplyShape`] lets a runtime answer it that way instead of `<<>>`.
+///
+/// A missing `escript`/`erl` is a **loud skip**; a non-zero escript exit or a differing row is an
+/// assertion failure.
+#[test]
+fn the_control_reply_shapes_match_the_erl_oracle() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    if !support::oracle::on_path("escript") || !support::oracle::on_path("erl") {
+        support::skip("the oracle cross-check needs `erl` and `escript` on PATH");
+        return;
+    }
+
+    // The Rust side: one fresh port per verb, so verb 28/29's flag cannot leak into another row.
+    // `binary_flag` is what the verb itself asks for through `set_port_control_flags`.
+    let mut rust_rows: Vec<(u8, String)> = Vec::new();
+    for (verb, binary_flag) in [
+        (25u8, false),
+        (26, false),
+        (27, false),
+        (28, true),
+        (29, true),
+        (30, false),
+    ] {
+        let (host, _state) = TestPortHost::new();
+        let (mut poller, mut registry, id) = open_port(&so, "", host);
+        let reply = registry
+            .port_control_reply(&mut poller, id, &verb.to_string(), &[])
+            .unwrap_or_else(|err| panic!("control verb {verb} answers: {err:?}"));
+        rust_rows.push((verb, render_control_reply(&reply, binary_flag)));
+        registry.close(&mut poller, id).expect("the port closes");
+    }
+
+    let sandbox = support::scratch_dir("abi-driver-control-oracle");
+    std::fs::create_dir_all(&sandbox).expect("a scratch working directory is creatable");
+    let stdout = support::oracle::run_escript(
+        "control_oracle",
+        CONTROL_ORACLE_ESCRIPT,
+        &so,
+        &sandbox,
+        Duration::from_secs(120),
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+    let Some(stdout) = stdout else {
+        return; // the oracle is unavailable; the skip was printed loudly above
+    };
+
+    let oracle_rows: Vec<(u8, String)> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (op, rendering) = line
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("an `op rendering` line, got {line:?}"));
+            (
+                op.trim()
+                    .parse()
+                    .unwrap_or_else(|err| panic!("the verb in {line:?}: {err}")),
+                rendering.trim_end().to_string(),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        oracle_rows.len(),
+        6,
+        "the oracle prints one line per verb, got {oracle_rows:?}\n{stdout}"
+    );
+    assert_eq!(
+        rust_rows, oracle_rows,
+        "the reply shapes must agree with the system runtime: a NULL `*rbuf` is `[]` even under \
+         `PORT_CONTROL_FLAG_BINARY`, and only a zero-length **buffer** under that flag is `<<>>`"
+    );
+    // The row the defect was about, spelled out so a regression names itself.
+    assert_eq!(
+        rust_rows
+            .iter()
+            .find(|(verb, _)| *verb == 28)
+            .map(|(_, row)| row.as_str()),
+        Some("list()"),
+        "verb 28 sets `PORT_CONTROL_FLAG_BINARY` and then `*rbuf = NULL`; the oracle's answer is `[]`"
+    );
 }
 
 /// A driver whose `output` callback consumes the command and emits nothing must **not** be reported
