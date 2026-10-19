@@ -72,17 +72,25 @@ Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, sa
   alias reply (`dist/links.rs::route_alias` → `DOP_ALIAS_SEND`; `DFLAG_ALIAS` is negotiated by OTP 29) and
   the peer binding (`runtime/scheduler.rs:999`) are all live. A **wrong cookie** answers `pang` in ~20 ms
   (a real refusal) — that is the discriminator against the timeout form below.
-- **The `-eval` `receive … after T` route does not pump, so a peer dialling more than ~0.5 s after start is
-  never accepted.** `eval/mod.rs:1376` charges the whole remaining window to
-  `RuntimeContext::poll_port_messages(remaining)` → `PortRegistry::pump(timeout)` (`port.rs:1767`), which
-  loops in `PORT_POLL_SLICE` (25 ms) `epoll_wait` slices for as long as any port is live — the booted
-  kernel's `inet_gethost` child is (`port.rs:1802`). `scheduler_pass` therefore never runs, `pump_dist` /
-  `accept_one` never run, and the peer's connection sits unaccepted in the listen backlog (observed:
-  `LISTEN Recv-Q ≥ 1`, `CLOSE-WAIT … Recv-Q 31` = its unread `'N'`); the oracle gives up at its 7 s
-  `net_setuptime` and answers `pang` after 7005 ms. `wait_for_timer` (`eval/mod.rs:1399` →
-  `scheduler.rs:320`, sleeping to `min(next_deadline, until)`) is the second latent blocker on the same
-  loop. The fix shape is to bound **both** per-iteration waits to a 25 ms slice and to break only once the
-  caller's own deadline has elapsed.
+- **The `-eval` `receive … after T` route pumps the scheduler every port-poll slice, so a peer is
+  accepted however late it dials.** Both per-iteration waits of the `after` arm are bounded by
+  `PORT_POLL_SLICE` (25 ms, the port poller's own budget, reused rather than duplicated) and the wait ends
+  only once the **caller's** deadline has elapsed: `poll_port_messages(remaining.min(PORT_POLL_SLICE))`
+  and `wait_for_timer(min(deadline, now + PORT_POLL_SLICE), …)` (`eval/mod.rs`, the `after` arm of
+  `Evaluator::receive`), so `Runtime::pump_scheduler` — and with it `pump_dist` → `DistNode::pump` →
+  `accept_one` — is re-entered every slice. Before that, one iteration charged the whole window to
+  `poll_port_messages(remaining)` → `PortRegistry::pump(timeout)` (`port.rs:1767`), which loops in
+  `PORT_POLL_SLICE` `epoll_wait` slices for as long as any port is live (the booted kernel's
+  `inet_gethost` child never closes, `port.rs:1802`), so `scheduler_pass` never ran and the peer's
+  connection sat unaccepted in the listen backlog until `net_setuptime` (measured: `pang` after 7005 ms,
+  `LISTEN Recv-Q 1`, `CLOSE-WAIT … Recv-Q 31` = its unread `'N'`). Now measured
+  `beam_rt -sname rustnode -setcookie c123 -noshell -eval 'receive after 25000 -> ok end.'` +
+  `erl -sname peerpos … net_adm:ping(rustnode@billmini)` ⇒ **`pong` in 0.38 s**, against `pang` after
+  7.2 s for the pre-fix build. The observable timing of the arm is unchanged (the window still ends it; a
+  message that arrives in a slice still wins over the timeout, and a pending timer inside a slice is still
+  slept to exactly), pinned structurally by the colocated
+  `eval::tests::{a_long_after_window_is_waited_out_in_port_poll_slices,
+  a_sub_slice_after_window_never_loops}` over a test-only per-thread iteration counter.
 - **`DistNode::is_idle` (`dist.rs:744` → `links.rs:200`) means "no live LINK".** The listener and a pending
   accept are not counted as work, so a distributed node with nothing to run is `is_quiescent`
   (`scheduler.rs:581`). The `run` route only survives an idle `receive` because the live `inet_gethost`
@@ -121,7 +129,7 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `src/port/failure_e2e_tests.rs` 848 lines — a **test-only** suite (declared from `port/failure.rs`'s tail), so it is legitimately long: it compiles its own real C `.so` and drives one row per oracle opcode through the whole `port_command → output → FailureLatch → settle → signal_failure → drain_failures → push_ready` road, asserting each published `PortSignal` list whole.
 - `src/port/driver/port_term_tests.rs` 761 lines — a **test-only** suite (declared from `port/driver.rs`'s tail) for the `ERL_DRV_PORT` hook: the stamped handle↔`PortId` round trip through the real term-spec decoder, the foreign/null/unstamped refusals, the gone bit after `clear_driver_state`, and an end-to-end row through a real C driver that emits `{ERL_DRV_PORT, driver_mk_port(port)}`.
 - `src/port/failure.rs` 200 lines, 193 of production — **within target**; it is the driver-failure channel's runtime half (`signal_reason`, `PortRegistry::drain_failures`/`fail_port`, the ready-queue publication), declared inside `exit.rs`, and its two suites are `port/failure_tests.rs` (159, the reason-mapping units) and `port/failure_e2e_tests.rs` (above).
-- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 3 488 / 2 597, `cli.rs` 2 968 / 1 791, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 450 / 1 450, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 273 / 1 269, `eval/parse.rs` 1 593 / 1 235, `native/process.rs` 1 841 / 1 196, `native/prim.rs` 4 066 / 1 139, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 167 / 1 022, `nif.rs` 2 101 / 1 004.
+- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 3 616 / 2 655, `cli.rs` 2 968 / 1 791, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 450 / 1 450, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 273 / 1 269, `eval/parse.rs` 1 593 / 1 235, `native/process.rs` 1 841 / 1 196, `native/prim.rs` 4 066 / 1 139, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 167 / 1 022, `nif.rs` 2 101 / 1 004.
 
 ## Routing Table
 - `boot.rs` + `boot/` → preloaded-module set (`PreloadedModules`/`CORE_ATOMS`), the boot banner, the
