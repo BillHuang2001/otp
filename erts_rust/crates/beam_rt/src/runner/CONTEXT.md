@@ -486,7 +486,7 @@ collection that **grows** the mature space instead of refusing: `beam_gc::AnyCol
 reports typed heap exhaustion when the mature space cannot absorb the whole nursery, so every
 refusal on these shapes escalates. The handoff is `beam_gc::AnyCollector::collect_young(&mut self,
 roots: &mut [Eterm]) -> Result<Collection>` (never escalates; grows/reclaims the mature space instead
-of a fullsweep; reports `CollectionKind::Minor`), recorded in `../../M1_GAPS.md` *GC / heap model*.
+of a fullsweep; reports `CollectionKind::Minor`), recorded in `../../M1_GAPS_GC.md` *GC / heap model*.
 The pinned, current fact is `churn`'s **0.74 %** firing rate at one collapsed 609-word space (next
 paragraph), which is what the ratio above would have to move to matter.
 The door's structure is pinned by [`tests/boundary_cost.rs`](tests/boundary_cost.rs)
@@ -514,7 +514,7 @@ the rounds; host `/proc/loadavg` 1.0–2.5):
 | `emqx_base62_decode` | 10 111 ns | 282.5 ns | 35.8× |
 
 The per-call cost of a build-a-binary loop is **not** this table's figure — there is no per-slice
-off-heap mirror — so the controlled A/B is [`../../PERF.md`](../../PERF.md) *The per-call cost is
+off-heap mirror — so the controlled A/B is [`../../PERF_HISTORY.md`](../../PERF_HISTORY.md) *The per-call cost is
 independent of the iteration count* (`BEFORE` `3aa42c0e41` → `AFTER` `72d778dcf1`:
 `emqx_base62_encode` **138 544.3 → 5 667.6 ns/call** at `loadavg` 18–89, `decode` 20 698.3 → 10 028.7).
 

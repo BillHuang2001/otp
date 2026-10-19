@@ -309,7 +309,7 @@ The control leg must run in its **own process**: the ABI resource registry is pr
 
 - [`src/eval/reclaim/resource.rs`](src/eval/reclaim/resource.rs) → the frontier, the two-tier sink, the three gates and the in-module unit tests.
 - [`src/context/gc/resources.rs`](src/context/gc/resources.rs) → the scheduled-site contract, its five decline gates and its residual class (this section extends it, it does not replace it).
-- [`M1_GAPS.md`](M1_GAPS.md) *NIF (A.3)* → the residual ledger: the first-boundary statement leak, the nested `Err` path, the pointer-reuse heuristic and the root-family completeness dependency.
+- [`M1_GAPS_A3_NIF.md`](M1_GAPS_A3_NIF.md) *NIF (A.3)* → the residual ledger: the first-boundary statement leak, the nested `Err` path, the pointer-reuse heuristic and the root-family completeness dependency.
 ## The `-eval` statement window (deterministic word counts, not timings)
 **Nothing here is a timing**: every figure is a **word count** from `Runtime::eval_region_stats()` (`Runtime::eval_heap`'s `used`/`capacity` plus the window's counters), deterministic in the expression text, so no load filter applies — the load context is recorded for reproducibility only.
 Host: Linux `x86_64`, `nproc` **14**, shared, 1-min `/proc/loadavg` **2.3–4.6** across the runs; both legs are **debug** builds (this crate's gate default).

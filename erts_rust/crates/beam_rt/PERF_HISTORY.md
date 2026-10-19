@@ -58,7 +58,7 @@ The `sys` / `rust` columns are the **per-unit metric** min-of-3 for each side (b
 for context; the ratio is the headline. `slice` is per-case **whole-process** wall (one call per process);
 the `foreign`/`list_walk`/`copy_bound`/`gc_bound` rows are **startup-cancelled marginals**
 (`(mean wall@N − mean wall@0) / N`), the interpreter-throughput signal.
-These `baseline`/`slice` figures are this snapshot's own preloaded-only-slice measurements; every CLI action now pays the boot script (see *Current startup regime*), so they are not the current whole-process wall.
+These `baseline`/`slice` figures are this snapshot's own preloaded-only-slice measurements; every CLI action now pays the boot script (see [`PERF.md`](PERF.md) *Current startup regime*), so they are not the current whole-process wall.
 
 | workload | case | metric (unit) | **rust/sys (min of 3)** | range over 3 | sys (min of 3) | rust (min of 3) |
 |---|---|---|---|---|---|---|
