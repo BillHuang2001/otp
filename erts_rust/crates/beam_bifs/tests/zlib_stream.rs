@@ -1996,6 +1996,22 @@ fn the_guard_classes_match_the_live_oracle() {
 /// dictionary protocol (`save_progress`/`restore_progress` → `getStash_nif` +
 /// `clearStash_nif`) — plus the violation classes the C returns for a second
 /// `setStash` / a `clearStash` of an empty stash.
+///
+/// **These expectations are C-derived, not oracle-checked.** The three keys are
+/// non-exported NIFs of the preloaded `zlib.beam`, so neither an `-eval` nor a compiled
+/// module outside `zlib` can reach them (`erlang:apply(zlib, getStash_nif, [H])` is
+/// `undef`), and the shapes below are read off `zlib_nif.c` plus the state machine:
+///
+/// * `zlib_getStash`/`zlib_setStash`/`zlib_clearStash` (`zlib_nif.c:473-522`) test only
+///   the handle (`get_zlib_data`), the controlling process (`zlib_process_check`) and
+///   their own **stash** state — there is **no** `d->state` test, unlike `zlib_close`
+///   (`:574`) or the codec keys. So a **closed** stream answers the three keys exactly
+///   as a live one does; only a second `close` is `not_initialized` (the tombstone).
+/// * `zlib_internal_close` (`:280-292`) drops `d->stash_env` with the rest of the
+///   stream, so after `close` the stash is empty again: `getStash_nif` ⇒ `empty`,
+///   `clearStash_nif` ⇒ the bare-atom `error` raise (`:496-498`), and `setStash_nif`
+///   ⇒ `ok` (a *fresh* stash, no second-stash `error`) with the later `getStash_nif`
+///   ⇒ `{ok, Term}`.
 #[test]
 fn the_stash_keys_keep_their_documented_shapes() {
     let mut fx = Fixture::new();
@@ -2032,15 +2048,40 @@ fn the_stash_keys_keep_their_documented_shapes() {
     assert_eq!(clear_stash(&mut fx, handle).expect("clearStash"), fx.atom("ok"));
     assert_eq!(get_stash(&mut fx, handle).expect("getStash"), fx.atom("empty"));
 
-    // `close` drops the stash with the rest of the stream, and a closed handle is
-    // `not_initialized` (the tombstone the crate's `Known Issues` records).
+    // `close` drops the stash with the rest of the stream (`zlib_internal_close`), and
+    // the three stash keys carry **no** state precondition (`zlib_nif.c:473-522`), so a
+    // closed stream keeps answering them: the stash reads back `empty`, `clearStash` of
+    // an empty stash is the bare atom `error`, and a fresh `setStash` still works.
     let stored = progress_term(&mut fx, "inflate", b"progress");
     assert_eq!(set_stash(&mut fx, handle, stored).expect("setStash"), fx.atom("ok"));
     assert_eq!(close(&mut fx, handle).expect("close"), fx.atom("ok"));
     assert_eq!(
-        raise_token(get_stash(&mut fx, handle).expect_err("getStash after close")),
-        "raise:not_initialized"
+        get_stash(&mut fx, handle).expect("getStash after close"),
+        fx.atom("empty"),
+        "`close` emptied the stash, and `getStash` has no state precondition"
     );
+    assert_eq!(
+        raise_token(clear_stash(&mut fx, handle).expect_err("clearStash after close")),
+        "raise:error",
+        "an empty stash is the bare atom `error`, not a state raise"
+    );
+    let restored = progress_term(&mut fx, "inflate", b"again");
+    assert_eq!(
+        set_stash(&mut fx, handle, restored).expect("setStash after close"),
+        fx.atom("ok"),
+        "a closed stream still stashes (the C stores it in its own env)"
+    );
+    let fetched = get_stash(&mut fx, handle).expect("getStash of the fresh stash");
+    let outer = fx.tuple(fetched);
+    assert_eq!(outer.len(), 2, "`getStash` answers `{{ok, Term}}`");
+    assert_eq!(outer[0], fx.atom("ok"));
+    assert_eq!(fx.iolist_bytes(fx.tuple(outer[1])[1]), b"again");
+    assert_eq!(
+        clear_stash(&mut fx, handle).expect("clearStash of the fresh stash"),
+        fx.atom("ok")
+    );
+    assert_eq!(get_stash(&mut fx, handle).expect("getStash"), fx.atom("empty"));
+    // Only `close` itself carries the state test (`zlib_nif.c:574`).
     assert_eq!(
         raise_token(close(&mut fx, handle).expect_err("a second close")),
         "raise:not_initialized"

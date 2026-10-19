@@ -41,7 +41,7 @@ All bytes come from [`beam_deflate`](../beam_deflate) — the sibling crate the 
 - `Stream` holds `state` (`State::{New, Deflate, Inflate, Closed}`, the C's `ST_NONE`/`ST_DEFLATE`/`ST_INFLATE`/closed), `controller: ProcessId`, the codec, `eos_behavior`, `is_raw`, `eos_seen`, `started`/`finished`, `need_dict_pending`, and the input queue and stash below.
 - Input is a `VecDeque<Vec<u8>>` with one piece per iovec segment (what `enqueue_nif` pushes and the pump drains).
 - The stash is a serialized ETF image (`[131][body]`, `Vec<u8>`), never a raw `Eterm`, so it survives a collection and a heap change; decode goes into a clone of the shared `AtomTable` and commits the names the decoder appended, the way `binconv::decode_term_bif` does it.
-- Every entry point runs the same prologue (`with_stream`), in the C's order: decode the handle (`badarg`), look it up (`not_initialized`), check `stream.controller == caller` (`not_on_controlling_process`), then the key's `Requires` state check.
+- Every entry point runs the same prologue (`with_stream`), in the C's order: decode the handle (`badarg` for anything that is not an internal reference this module minted), find it in the process-global stream table (`badarg` for an unknown id — the C's `get_zlib_data`), check `stream.controller == caller` (`not_on_controlling_process`), then the key's `Requires` state check (`not_initialized`/`already_initialized`, skipped entirely for `Requires::Any`).
 - `Requires::{Init, Deflate, Inflate, Open, Closable}` are the C's `d->state` tests (`Closable` is "anything but `Closed`", `close_nif`'s); `Requires::Any` is the four keys the C gives no state check at all (`set_controller_nif` plus the three stash keys).
 
 ## The pump
