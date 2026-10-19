@@ -240,10 +240,18 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `cli.rs` + `cli/` → the A.6 CLI parser/driver, the four `EXIT_*` codes and the boot-script drive
   (`cli/CONTEXT.md`).
 - `context/` → the concrete `ExecutionContext` glue, the host-seam bridges and the NIF-dispatch order
-  (`context/CONTEXT.md`); the `load`-callback `enif_send` window is drained by `NifBridge::load_nif`
+  (`context/CONTEXT.md`); its children own one subject each — `context/calls/CONTEXT.md` (the registered-call
+  path: the gated dispatch arms, the lent/held `TableRegistry`, `PendingInterner`, the `[safe]` export gate),
+  `context/pool/CONTEXT.md` (the BIF-result copy-out: the pooled frontier, the table-less arm, the learned
+  copy-out hint, the aliased `ets` witness) and `context/gc/CONTEXT.md` (the collection doors, the unscanned-root
+  valve, the refc-binary reclamation and the NIF-resource prune) — with `context/IMPLEMENTATION.md` holding the
+  remaining dispatch/heap seam detail; the `load`-callback `enif_send` window is drained by `NifBridge::load_nif`
   (`context/bridges.rs`) the moment the callback returns, over the pass's own process table.
 - `native.rs` + `native/` → the runtime-native BIF floor (`try_native`, before the registry), the
-  native `file_server_2` service and the code/init/application/memory floors (`native/CONTEXT.md`).
+  native `file_server_2` service and the code/init/application/memory floors (`native/CONTEXT.md`, whose
+  per-family children are `native/memory/CONTEXT.md` (A.8 `process_info`), `native/process/CONTEXT.md`
+  (the process-control families and the on-demand collection), `native/erts_internal/CONTEXT.md` and
+  `native/file_server/CONTEXT.md`).
 - `info.rs` + `info/` → the A.8 `system_info`/`process_info` introspection surface, incl. this file's
   version producers (`info/CONTEXT.md`).
 - `port.rs` + `port/` → the A.4 `PortHook` provider, the port registry/poller and the driver C-ABI
@@ -251,7 +259,8 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `runtime.rs` + `runtime/` → the `Runtime` façade, the scheduler-pass family and the GC/ETS-owner
   state (`runtime/CONTEXT.md`); its pid-keyed bookkeeping (`group_leaders`/`async_dist`/`monitor_nodes`/
   `timer_resumes`) and the `runtime/timer_wakes.rs` `TimerWakes` mirror are `crate::hasher` maps.
-- `runner/` → the `beam_process::ProcessRunner` (`runner/CONTEXT.md`); `RunnerState`'s four pid-keyed
+- `runner/` → the `beam_process::ProcessRunner` (`runner/CONTEXT.md`, whose measurement record is
+  `runner/MEASURED.md`); `RunnerState`'s four pid-keyed
   maps (`engines`/`results`/`exits`/`errors`) are `crate::hasher::FastHashMap`.
 - `dist.rs` + `dist/` + `dist_client/` → the distributed node, accepting and connecting halves
   (`dist/CONTEXT.md`, `dist_client/CONTEXT.md`).
