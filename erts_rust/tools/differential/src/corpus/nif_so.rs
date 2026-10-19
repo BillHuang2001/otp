@@ -105,7 +105,8 @@
 //! duplicate-key refusal, `enif_binary_to_term`'s consumed-byte report and
 //! `enif_term_to_binary` of a local fun. Each is a live side effect, so the case waits for it
 //! (a deadlined `receive`, a bounded poll) and reduces the whole observation to one integer —
-//! the harness's two-signal `unsupported` classification still applies to the Rust side.//!
+//! the harness's two-signal `unsupported` classification still applies to the Rust side.
+//!
 //! # Reachability rules this group depends on
 //!
 //! * `erlang:load_nif/2` must be called from the NIF module itself — the oracle refuses it

@@ -53,9 +53,10 @@
 //! slots the Rust runtime really exports. The original fixture uses `driver_alloc`/`driver_free`
 //! and `driver_output` (all exported by the `beam_rt` binary — see its
 //! `-Wl,--export-dynamic` link options) and never a typed gap documented in
-//! `crates/beam_rt/src/port/driver.rs` (the remaining one is `driver_async` — there is no async
-//! pool; the entry's `control` callback behind `port_control/3` **is** routed). The observable
-//! surface is consequently the **port lifecycle**: load → `start` → `output` → `stop`.
+//! `crates/beam_rt/src/port/driver.rs` (the async pool, the driver monitors and the entry's
+//! `control` callback behind `port_control/3` all **are** routed). The observable surface is the
+//! **port lifecycle** — load → `start` → `output` → `stop` — plus the asynchronous job pool and the
+//! monitor/`process_exit` families each fixture adds on top of it.
 //!
 //! # The four driver-registry slots (their own fixtures)
 //!
