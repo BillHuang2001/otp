@@ -215,6 +215,15 @@ BEAM_ETS_BENCH_SIZES=1000000 BEAM_ETS_BENCH_SHAPES=smallint BEAM_ETS_BENCH_ORDER
 BEAM_ETS_BENCH_INDEX=bplus BEAM_ETS_BENCH_REPEATS=3 \
 erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml \
     -p beam_ets --lib ordered_interior_microbenchmark -- --nocapture
+
+# (D) the fanout sweep behind `ORDER = 32`: one sweep per fanout, `ORDER` (and
+#     `MIN_OCCUPANCY = ORDER / 2`) edited by hand in src/ordered_interior/node.rs for
+#     the duration of that sweep and restored afterwards — a throwaway experiment, the
+#     shipped consts are `ORDER = 32` / `MIN_OCCUPANCY = ORDER / 2` (see "Why `ORDER = 32`")
+BEAM_ETS_BENCH_SIZES=1000,10000,100000 BEAM_ETS_BENCH_SHAPES=smallint \
+BEAM_ETS_BENCH_ORDER=all BEAM_ETS_BENCH_REPEATS=3 BEAM_ETS_BENCH_INDEX=bplus \
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml \
+    -p beam_ets --lib ordered_interior_microbenchmark -- --nocapture
 ```
 
 ### Runs recorded here, with their `/proc/loadavg`
@@ -228,6 +237,8 @@ The host is shared, so every run's load is recorded and the conclusions are draw
 | (A′) the (A) cells again, as a reproducibility check | same, `REPEATS=5` | 38 285 ms | `29.08 21.96 11.36` → `50.47 27.75 13.72` |
 | (B) | 1k, 10k, 1e5 / `binary`,`tuple` / all three orders, `REPEATS=3` | 73 332 ms | `24.37 15.07 8.03` → `34.12 22.37 11.26` |
 | (C) | 1e6 / `smallint` / all three orders, B+-tree only, `REPEATS=3` | 14 627 ms | `34.12 22.37 11.26` → `29.87 21.99 11.31` |
+| (A″) the fresh before/after record below | 1k, 10k, 1e5 / `smallint` / all three orders, both interiors, `REPEATS=5` | 35 193 ms | `7.70 25.30 18.75` → `21.46 26.89 19.53` |
+| (D) the fanout sweep (`ORDER` = 8 / 16 / 32 / 64, four runs, B+-tree only) | 1k, 10k, 1e5 / `smallint` / all three orders, `REPEATS=3` | 0.8–1.8 s per fanout | `6.14`, `6.29`, `7.07`, `6.03` — each unchanged before → after |
 
 **Read the `sorted/tree` ratio row, not the absolute ns.** A ratio is
 `SortedOrderedInterior / OrderedSetInterior` (numerator = sorted `Vec`, denominator =
@@ -241,6 +252,25 @@ ratios reproducing: `n = 100 000`, `shuffled`, `smallint` insert/delete is
 (the sub-microsecond tree-side timers are the load-sensitive half).
 The `words` figures are identical in (A) and (A′) — `3 602`/`2 048`, `34 332`/`32 768`,
 `360 006`/`262 144` — which is the load-independent anchor for the memory claims.
+
+**The fresh (A″) before/after record — `sorted`/`tree` ratios on `smallint` keys.**
+Insert/Delete is **0.92**/**0.81** at 1 000 shuffled keys, **0.63**/**1.49** ascending and
+**1.56**/**0.59** descending; **3.96**/**3.46** at 10 000 shuffled, **0.71**/**11.98** ascending
+and **14.29**/**0.59** descending; and **33.20**/**27.82** at 100 000 shuffled — `5 151.4` ns
+insert for the `Vec` against the tree's **155.1**, `5 108.7` ns delete against **183.7** —
+**0.79**/**95.46** ascending and **101.89**/**0.63** descending.
+The deterministic index footprint is untouched by the run: the tree's
+`28.8`/`27.5`/`28.8` B/entry at 1 000/10 000/100 000 shuffled keys
+(`3 602`/`34 332`/`360 006` words) and `42.5`/`41.2`/`40.2` ascending
+(`5 316`/`51 480`/`502 480`), against the `Vec`'s `16.4`/`26.2`/`21.0` B/entry
+(`2 048`/`32 768`/`262 144` words) — a `sorted`/`tree` word ratio of
+**0.57**/**0.95**/**0.73** in the neutral order and **0.39**/**0.64**/**0.52** ascending.
+So the verdict below is **re-confirmed** by a run taken at a different load (`7.70` → `21.46`):
+from 10 000 keys up, every neutral-order write belongs to the tree (**3.96×**/**3.46×**, and
+**33.20×**/**27.82×** at 100 000), the `Vec` wins only its own append fast path
+(**0.63–0.79×** on ascending insert) and pays it back on the matching delete
+(**11.98×**/**95.46×**), and its memory saving is bounded (**≤ 2.6×**, shrinking with `n`) rather
+than growing.
 
 **Table (A) — `smallint` keys, ns per operation, `words` = the interior's own index word count with all `n` keys stored, `B/e` = `words × 8 / n`**
 
@@ -362,9 +392,73 @@ and **29.5×/23.7× at 100 000 keys** (worst case **116×**), while everything i
 bounded and absolute small — **≤ 2.59×** memory (1.05–1.76× in the neutral order, and below the
 `Vec`'s at 10k and 100k when keys arrive descending), **≤ 81 ns** per lookup, **≤ 4.8 ns** per
 iterated object.
+(The fresh (A″) run reads `3.96×`/`3.46×`, `33.20×`/`27.82×` and a `101.89×` worst insert cell —
+the same verdict within 12 %.)
 The size at which the choice starts to matter is therefore **10 000 keys**: below ~1 000 keys
 the two interiors are within 1.7× on every column in either direction, and from 10 000 keys up
 the ordering-sensitive write cost is the only term that grows.
 `OrderedInterior::Sorted` remains correct and selectable, and this table is its honest case: a
 read-mostly table that stays under ~1 000 keys, or bulk loads in ascending key order — provided
 it is never emptied by ascending deletes.
+
+### Why `ORDER = 32` — the fanout sweep
+
+The fanout is a size trade: a node a few cache lines wide keeps the descent cache-resident, a node
+wide enough to fill a page cuts the depth.
+A stored entry is `{key, obj}` — two `Eterm` words, **16 B** — so a full leaf is `ORDER × 16 B`,
+and a full branch is two `ORDER`-element arrays (`keys: Vec<Eterm>` and `children: Vec<NodeId>`,
+8 B per element each).
+At `ORDER = 32` that is a **512 B leaf = eight 64-byte cache lines** and a branch of two 256 B
+(four-line) arrays; at `8` a 128 B (two-line) leaf and one line per branch array; at `64` a
+1 024 B (16-line) leaf and eight lines per branch array.
+The depth is `ceil(log_ORDER n)` node visits — `2`/`3`/`4` at 1 000/10 000/100 000 keys for
+`ORDER = 32`, `2`/`3`/`3` for `48` and `64`, `3`/`4`/`5` for `16`, `4`/`5`/`6` for `8`.
+Both halves interact because a node visit is a **binary search inside one contiguous array**
+(`node::search_entries`, `node::child_index`): the array is walked sequentially and fetched as
+one prefetch unit, so a wider node does not scatter the access, it only lengthens the search by
+one comparison per doubling and moves a wider block on a split, a borrow or a merge.
+The occupancy band `[ORDER / 2, ORDER]` is what makes the split cost amortized `O(1)` (one split
+per `ORDER / 2` inserts) and keeps a merge of two under-full siblings inside one node
+(`ORDER / 2 + ORDER / 2 = ORDER`).
+
+Reproduction (D). The sweep is one source edit of the two consts per row — a throwaway
+experiment, reverted to `ORDER = 32` / `MIN_OCCUPANCY = ORDER / 2` afterwards — so each row is a
+separate process, and each row's first run (which includes the rebuild and the first-cell warm-up)
+was discarded in favour of a second, warm run.
+
+| `ORDER` | leaf / branch array (bytes, cache lines) | depth 1k/10k/100k | 1 000 shuf ins/del | 10 000 shuf ins/del | 100 000 shuf ins/del | 100 000 asc ins/del | B/e shuf 1k/10k/100k |
+|---|---|---|---|---|---|---|---|
+| 8 | 128 B (2) / 64 B (1) × 2 | 4/5/6 | 155.9 / 187.2 | 147.8 / 198.3 | 204.1 / 296.9 | 140.8 / 186.4 | 43.3 / 50.9 / 46.8 |
+| 16 | 256 B (4) / 128 B (2) × 2 | 3/4/5 | 122.8 / 150.7 | 186.2 / 232.5 | 184.8 / 226.4 | 102.9 / 128.4 | 32.8 / 31.7 / 34.4 |
+| **32** | **512 B (8) / 256 B (4) × 2** | **2/3/4** | **108.3 / 128.4** | **156.2 / 166.1** | **145.1 / 174.2** | **72.1 / 87.4** | **28.8 / 27.5 / 28.8** |
+| 48 ‡ | 768 B (12) / 384 B (6) × 2 | 2/3/3 | 98.6 / 115.2 | 150.7 / 179.3 | 141.2 / 168.2 | 68.3 / 85.9 | 27.1 / 26.9 / 26.2 |
+| 64 | 1 024 B (16) / 512 B (8) × 2 | 2/3/3 | 95.5 / 113.5 | 152.2 / 177.7 | 148.7 / 170.8 | 71.9 / 93.9 | 25.7 / 25.3 / 26.0 |
+
+‡ `48` is one extra `REPEATS=5` pass (load `5.01`, its cold first run discarded); the other rows
+are the `REPEATS=3` runs at load `6.14` (`8`), `6.29` (`16`), `7.07` (`32`) and `6.03` (`64`).
+The two ends of the sweep are decisive, the middle is not.
+Fanouts `8` and `16` lose **every** `100 000`-key column — insert `204.1`/`184.8` and delete
+`296.9`/`226.4` ns against `145.1`/`174.2` — and the same ordering holds at the smaller sizes in
+both orders (insert at 1 000/10 000 keys: `8` `155.9`/`147.8` shuffled and `128.2`/`106.2`
+ascending, `16` `122.8`/`186.2` and `86.6`/`79.6`, `32` `108.3`/`156.2` and `72.2`/`56.3`).
+They also cost **1.50–2.11×** (`8`) and **1.14–1.25×** (`16`) the bytes per entry, because a
+narrower node spends proportionally more on the per-node arena slot and on `Vec` capacity slack
+(the split-at-half rule leaves a leaf roughly two-thirds full under random inserts) and has to
+amortize both over fewer entries.
+Fanouts `48` and `64` go the other way: **5–11 %** leaner per entry (`26.0` vs `28.8` B/entry at
+100 000 shuffled keys) and one level shallower at 100 000 keys, yet no timing cell they win
+survives this host's run-to-run spread — the same 100 000-key shuffled insert measured
+`145.0`–`155.1` ns at `ORDER = 32`, `140.4`–`141.2` ns at `48` and `148.7`–`163.3` ns at `64`
+across runs at load `5`–`25`, while a single cell can move by more than 2× between runs at
+different load (`ORDER = 64`, 1 000-key shuffled insert: `71.8` ns at load `25` vs `95.5` ns at
+load `6`).
+Only two columns are read as evidence: the **word counts** (deterministic, identical at every
+load) and the ordering of the sweep's ends.
+
+**`ORDER = 32` is kept.** Its 512 B leaf and two 256 B branch arrays stay inside eight cache
+lines, its depth is at most four at every measured size, and it is where the write columns stop
+improving: `8` and `16` are clearly worse on both axes, and `48`/`64` trade a deterministic
+`5–11 %` leaner index for no measurable time and a wider block to move on every split, borrow and
+merge.
+This is a choice, not a contract — `Interior` promises no fanout — and the knob is the pair of
+consts in `src/ordered_interior/node.rs` (`MIN_OCCUPANCY` is derived, `ORDER / 2`).
