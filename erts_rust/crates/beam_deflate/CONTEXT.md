@@ -42,8 +42,8 @@ Decompression (`src/inflate/`):
   `NeedDict` answer becomes `BadArg` because the one-shot signature has no dictionary parameter.
 
 Checksums (`src/checksum.rs`): `adler32`, `crc32`, `adler32_combine`, `crc32_combine`
-(all re-exported at the crate root) — the single `erts_refc`-style primitive for every trailer in the
-workspace; `beam_codec`/`beam_bifs` must use these, never a local copy.
+(all re-exported at the crate root) — the workspace's only checksum implementation, so `beam_codec`/`beam_bifs`
+must use these, never a local copy.
 
 ## Exact-vs-typed matrix
 **Byte-identical to the oracle (system `erl`, OTP 29.1.1 / erts-17.1)** — every row was measured, not
