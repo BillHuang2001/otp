@@ -121,6 +121,13 @@ mod inflate;
 mod lifecycle;
 mod pump;
 
+// The byte-exact golden suite for the whole stream surface. It is deliberately long: it
+// embeds the oracle goldens (per-level leaf vectors, the whole 129-byte level-6 stream, the
+// one-shot framings, the dictionary pair) plus a comprehensive matrix over every key, the
+// same convention as `beam_deflate/tests/deflate_goldens.rs`. Test-only: it cannot affect a
+// release build.
+#[cfg(test)]
+mod tests;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -523,7 +530,7 @@ pub(super) fn assert_badarg<Ok>(result: Result<Ok>) {
 }
 
 #[cfg(test)]
-mod tests {
+mod unit_tests {
     use super::*;
     use beam_term::make_small;
 
