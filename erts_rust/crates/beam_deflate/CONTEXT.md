@@ -41,9 +41,9 @@ Decompression (`src/inflate/`):
 - `decompress_all(window_bits, input, limit) -> Result<(Vec<u8>, usize)>` — bounded one-shot loop; a
   `NeedDict` answer becomes `BadArg` because the one-shot signature has no dictionary parameter.
 
-Checksums (`src/checksum.rs`): `adler32`, `crc32`, `adler32_combine`, `crc32_combine`
-(all re-exported at the crate root) — the workspace's only checksum implementation, so `beam_codec`/`beam_bifs`
-must use these, never a local copy.
+Checksums (`src/checksum.rs`): `adler32`, `crc32`, `adler32_combine`, `crc32_combine`, all re-exported at
+the crate root; `beam_bifs`'s `zlib` stream layer takes a raw stream's `deflateSetDictionary` answer from
+`beam_deflate::adler32` (`crates/beam_bifs/src/zlib/stream/deflate.rs`).
 
 ## Exact-vs-typed matrix
 **Byte-identical to the oracle (system `erl`, OTP 29.1.1 / erts-17.1)** — every row was measured, not
@@ -70,7 +70,8 @@ Notes that matter to a consumer:
   input pieces reproduce the one-shot image exactly). `tests/deflate_stream.rs` pins both facts.
 - **ETF `COMPRESSED` only ever uses levels 1..=9**: `erts/emulator/beam/external.c` skips zlib entirely at
   `{compressed, 0}` and emits the uncompressed image, and `[compressed]` is `Z_DEFAULT_COMPRESSION` (6).
-  A `beam_codec` implementation must therefore **not** call `compress(.., 0)` for that option.
+  `beam_codec` therefore never calls `compress(.., 0)` for that option — its `compress_if_smaller` returns
+  before the compressor at level 0, so no level-0 stream is ever built.
 - `Partial`/`Block` have no `zlib.erl` binding (`arg_flush/1` exposes only `none`/`sync`/`full`/`finish`), so they
   are covered structurally (`Z_BLOCK` output is a strict prefix of `Z_SYNC`; `Z_PARTIAL` extends `Z_BLOCK` by
   the alignment byte) plus round-trip, not by byte goldens.
@@ -103,16 +104,13 @@ Notes that matter to a consumer:
   reserved for a rejected configuration, i.e. the cases where `deflateInit2_`/`inflateInit2_` return
   `Z_STREAM_ERROR` before any byte is processed. Nothing panics on data.
 
-## Consumer shapes (what `beam_codec` / `beam_bifs` should call)
-- **ETF `COMPRESSED` (`beam_codec`)**: `compress(body, level)` for levels 1..=9 (and `-1`), and
-  `decompress_bounded_used(stream, declared_inner_size)` — the consumed count is the `used` option and the
-  bound is the C's "fill the declared buffer completely" rule. Never compress at level 0 (see the matrix).
-- **The `zlib` BIF layer (`beam_bifs`)**: drive the **pump**, reproducing
-  `erts/emulator/nifs/common/zlib_nif.c::zlib_flush_queue` + `zlib_codec`: one `output_chunk_size` buffer;
-  per queued input piece `deflate/inflate(Z_NO_FLUSH)` summing `consumed`; when the queue drains and
-  `produced < output_chunk_size` one more call with an empty input and the caller's `flush`; classify
-  `{finished, Out}` / `{continue, Out}` / `{need_dictionary, Adler, Out}` in the C's order.
-  `deflate/3` uses 8192/8192, `inflate/2` and `safeInflate/2` 8192/16384 (`erts/preloaded/src/zlib.erl`).
+## Consumers (what `beam_codec` and `beam_bifs` call)
+- **ETF `COMPRESSED` (`beam_codec`)**: `compress(body, level)` for levels 1..=9 (and `-1`), and `decompress_bounded_used(stream, declared_inner_size)` — the consumed count is the `used` option, the bound is the C's "fill the declared buffer completely" rule, and the `MAX_UNCOMPRESSED` (32 MiB) policy is `beam_codec`'s while this crate takes the bound from the caller.
+  The image is `[VERSION_MAGIC][COMPRESSED_EXT][body_len:4 BE][zlib stream]`, emitted only when the stream fits the 5-byte wrapper (`stream_len <= body_len - 5`, equality landing on the compressed side), with a `body_len < 5` always plain and level 0 never compressing (`crates/beam_codec/src/encode/mod.rs::compress_if_smaller`).
+  Both oracle-verified boundary crossings are pinned in `crates/beam_codec/tests/`: `binary:copy(<<"a">>, N)` flips to the compressed image at `N = 15`, and `zeros(P) ++ 300-lcg-bytes` flips at `P = 33`.
+- **The `zlib` module (`beam_bifs`)**: all six one-shot functions (`compress/1`, `uncompress/1`, `zip/1`, `unzip/1`, `gzip/1`, `gunzip/1`) and all 19 NIF-level stream keys (`open_nif/0` … `enqueue_nif/2`) are served from this crate — 25 registry keys, every one a stdlib fast path.
+  The stream layer reproduces the **pump** of `erts/emulator/nifs/common/zlib_nif.c::zlib_flush_queue` + `zlib_codec`: one `output_chunk_size` buffer, `deflate/inflate(Z_NO_FLUSH)` per queued input piece summing `consumed`, one more call with an empty input and the caller's `flush` once the queue drains short of a full output buffer, and `{finished, Out}` / `{continue, Out}` / `{need_dictionary, Adler, Out}` classified in the C's order.
+  It runs at `zlib.erl`'s chunk sizes — 8192/8192 for `deflate/3`, 8192/16384 for `inflate/2` and `safeInflate/2` (`erts/preloaded/src/zlib.erl:141-144`).
   `tests/roundtrip.rs` contains a faithful re-implementation of that loop as executable evidence.
 - `deflateParams` maps to `Deflate::set_params`: the Erlang layer first calls `deflate(Z, <<>>, sync)`; with an
   empty input and a 1-byte dummy output the C returns `Z_OK` (or `Z_BUF_ERROR` when the pending block does not
@@ -169,7 +167,7 @@ parallel boots are what made early runs flaky). Oracle inputs are handed over th
 ## Routing Table
 - `src/lib.rs` → the frozen shared surface: `Flush`/`Strategy`/`Method`/`Status`/`Pump`, the level/window
   constants, and the one-shot zlib-wrapped free functions.
-- `src/checksum.rs` → `adler32`/`crc32` and both `*_combine` forms (the workspace's only checksum port).
+- `src/checksum.rs` → `adler32`/`crc32` and both `*_combine` forms — zlib's checksum algorithms, ported here.
 - `src/deflate/` → the compression direction (zlib's `deflate.c` + `deflate.h` + `trees.c`):
   - `mod.rs` → `DeflateConfig`/`GzHeader`/`Deflate` (the public stream API) and the one-shot `compress_with`.
   - `state.rs` → `DeflateState` (`deflate.h`: window, hash chains, symbol buffer, `configuration_table`).
@@ -190,11 +188,10 @@ parallel boots are what made early runs flaky). Oracle inputs are handed over th
   reproduced, deliberately.
 - The `Partial`/`Block`/`Z_FIXED`/rejected-`windowBits` rows cannot be compared with the oracle through
   `zlib.erl`; they are covered structurally and by round trip.
-- `decompress_all` cannot answer `NeedDict`: a dictionary-bearing stream is `BadArg` through the one-shot
-  functions — a caller that supports dictionaries must drive `Inflate` (as `beam_bifs` will).
-- `beam_codec` still carries its own `flate2`-based `compress`/`decompress_bounded_used`
-  (`crates/beam_codec/src/compress.rs`); switching it to this crate is the parent's round, and its
-  `MAX_UNCOMPRESSED` policy stays a `beam_codec` decision (this crate takes the bound from the caller).
+- `decompress_all` cannot answer `NeedDict`: a dictionary-bearing stream is `BadArg` through the one-shot functions, so a caller that supports dictionaries drives `Inflate`.
+  `beam_bifs`'s stream layer is such a caller (`inflateSetDictionary_nif/2`), and a `need_dictionary` answer reaches `zlib.erl` as the C's `{need_dictionary, Adler, Out}`.
+- The `erlang:crc32/1,2`, `crc32_combine/3`, `adler32/1,2` and `adler32_combine/3` BIFs are served by `beam_bifs`'s own copy of both algorithms (`crates/beam_bifs/src/checksum.rs`, alongside its MD5), so the workspace holds two CRC-32/Adler-32 implementations.
+  Re-pointing that module at this crate is `beam_bifs`'s round.
 
 ## See Also
 - `../CONTEXT.md` → the crate layer's binding cross-crate contracts and routing table.
