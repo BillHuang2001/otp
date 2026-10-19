@@ -325,6 +325,39 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   (framing inherited from `gen_tcp:listen/2`, a truncated prefix withholding a message, and two
   coalesced frames delivered as two messages all agree). Owner: `beam_rt` / `beam_io`.
 
+  **Re-measured while landing the write-path group** (`inet_write.rs`), with the peer's bytes
+  observed on its `{active, true}` message queue (a passive `gen_tcp:recv/3` is the exit-`3`
+  capability gap below, so it cannot carry the measurement). All three reproductions of the gap still
+  hold at this commit: `{packet, 2}` in `gen_tcp:connect/3`'s option list ⇒ oracle
+  `ok {ok,{data,<<0,5,104,101,108,108,111>>}}` vs `beam_rt` `ok {ok,{data,<<104,101,108,108,111>>}}`;
+  `{packet, 4}` via `inet:setopts/2` after the connect ⇒ oracle
+  `ok {ok,ok,{data,<<0,0,0,5,104,101,108,108,111>>}}` vs `beam_rt`
+  `ok {ok,ok,{data,<<104,101,108,108,111>>}}`; a `{packet, 4}` sender against a `{packet, 4}`
+  receiver ⇒ oracle `ok {ok,{data,<<104,101,108,108,111>>}}` vs `beam_rt` `ok {ok,timeout}`.
+  `{packet, line}` on a sender agrees and **is** pinned by
+  `inet_write/line_mode_send_adds_no_prefix`. The framed-write cases (a raw-peer `{packet, 4}` /
+  `{packet, 2}` header image, plus a large payload needing `<<0,0,0,N>>`) land the moment the write
+  side prefixes the header; the recipe is in `src/corpus/inet_write.rs`'s module docs and its
+  `no_case_pins_a_measured_divergence` guard is what keeps them out until then.
+- **The stream writer's *other* write-side shapes**: `gen_tcp:send/2` after
+  `gen_tcp:shutdown(Cl, write)` and every **passive** read (`gen_tcp:recv/2,3`, even with the bytes
+  already queued by a completed send) are the same `process blocked` exit-`3` capability gap the
+  `inet_control` module docs record (`beam_rt: unsupported: opcode: run: process blocked (no message
+  available)`; the oracle answers `ok {ok,{error,closed},{error,enotconn}}` for the two sends and
+  `{ok, <<"hi">>}` for the read). Owner: `beam_rt` / `beam_io`.
+- **`inet:getstat/1` never advances its send-side counters (`beam_rt`).** For a connected socket the
+  item agrees before any write (`{ok,[{send_cnt,0},{send_oct,0}]}` on both), but after two completed
+  writes of 3 bytes each the oracle answers `{ok,[{send_cnt,2},{send_oct,6}]}` while `beam_rt` still
+  answers `{ok,[{send_cnt,0},{send_oct,0}]}` — the driver accounting is not updated on the write path.
+  A plain observable, so `inet_write`'s guard test rejects `inet:getstat(`. Owner: `beam_io`.
+- **A bare-integer payload is written by the oracle and dropped by `beam_rt`.** `gen_tcp:send(Cl, 42)`
+  answers `ok` on both sides, but the oracle puts the single byte `42` on the wire where the runtime
+  writes nothing (measured: the peer receives `<<42,0,255,1,128>>` after a `42`, `<<0,255,1,128>>`
+  sequence on the oracle against `<<0,255,1,128>>` on `beam_rt`). The neighbouring bad-iodata shapes
+  **do** agree (`[256]` and `[<<"ab">> | 7]` are both `{error,einval}`, both sides), but the oracle
+  additionally writes a racy, timestamped `=ERROR REPORT==== … Bad value on output port 'tcp_inet'`
+  line to **stdout** for them, which makes any case around the badarg family unpinnable. Guarded by
+  `inet_write`'s `no_case_sends_a_bare_integer_payload`. Owner: `beam_rt` / `beam_io`.
 ## A.6 — CLI flags & environment (owner: `beam_rt` / the `-eval` evaluator)
 - `-extra foo`: the oracle prints a SIGTERM info report and **hangs** (no exit within a 20 s timeout);
   the Rust runtime exits `0`. A **plain argument after `--`** (`-- foo`) is a `mismatch`:
