@@ -91,10 +91,24 @@ This is the frozen public-API shape dependents design against; keep it stable.
   `Process::set_off_heap_binary_bytes(machine.off_heap_overhead_bytes())`.
   The trigger is O(1) per slice (the overhead figure is re-derived only when the reservoir's handle
   count moves); a declined prune retains the whole reservoir (a leak, never a dangle).
+- `beam_deflate` → zlib 1.3.2 in safe Rust: the one-shot `compress`/`decompress`/`decompress_bounded`/
+  `decompress_bounded_used`, the streaming `Deflate`/`Inflate` types whose one-call pump
+  (`deflate(input, output, flush) -> {status, consumed, produced}`) reproduces zlib's
+  `avail_in`/`avail_out` accounting, `Flush`/`Strategy`/`Method`/`Status` (incl. `NeedDict(adler)`),
+  `DeflateConfig`/`GzHeader`, and `checksum::{crc32, adler32, crc32_combine, adler32_combine}`.
+  Bytes only — no terms, no host state; byte-identical to the oracle for levels `-1`/`0..=9`, all five
+  strategies, windowBits `±8..=±15` and `16+9..=16+15`, memLevel `1..=9`, all six flush modes (a
+  combination it does not cover is a **typed** `BeamError`, never a conforming approximation).
 - `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface, plus
   **fifteen** optional defaulted host seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/
   `PortHook`/`DictHook`/`PersistentTerm`/`NifLoader`/`RecordSource`/`LocalNode`/`LocalFunIdentity`/
-  `ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`).
+  `ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`). It also exposes the **local-call predicate**
+  `serves_local_call(module, function, arity) -> bool` (`module == "zlib"` + the 19 `(name, arity)`
+  rows of `zlib.erl`'s non-exported NIF stubs) — the seam `beam_rt`'s `resolve_local_call` consults
+  for a module's own unexported `*_nif` stubs, alongside `prim_tty`'s. A `zlib` stub is reached **two**
+  ways and both must be served: as a local `call`, and as a local `make_fun3` closure (`zlib.erl`
+  stores `fun deflate_nif/4` in a `#zlib_opts{}` record), which `beam_rt::context::apply` declines
+  through the same predicate and dispatches via `call_bif`.
 - `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam).
 - `beam_rt` → the runtime **binary**: boot sequence, CLI flags, `system_info`, and the concrete
   `ExecutionContext` wiring engine + bifs + process — including the `Mailbox` receive seam over the
