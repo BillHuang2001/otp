@@ -119,8 +119,8 @@ This is the frozen public-API shape dependents design against; keep it stable.
 Determined by the Cargo workspace DAG; a crate may only use crates in earlier waves.
 | Wave | Crates | Depends on |
 |---|---|---|
-| 0 | `beam_alloc`, `beam_abi` | `beam_common`, `beam_term` |
-| 1 | `beam_codec`, `beam_ets`, `beam_gc` | wave 0 |
+| 0 | `beam_alloc`, `beam_abi`, `beam_deflate` | `beam_common`, `beam_term` (`beam_deflate`: `beam_common` only — it owns bytes, not terms) |
+| 1 | `beam_codec`, `beam_ets`, `beam_gc` | wave 0 (`beam_codec` also `beam_deflate`) |
 | 2 | `beam_loader`, `beam_message`, `beam_dist` | wave 1 (`beam_codec`; `beam_message` also `beam_gc`, `beam_dist` also `beam_alloc`) |
 | 3 | `beam_process` | `beam_gc`, `beam_message`, `beam_alloc` |
 | 4 | `beam_engine` | `beam_loader`, `beam_alloc` |
