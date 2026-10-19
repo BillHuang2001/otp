@@ -201,6 +201,25 @@ that owns a shared table.
 — the blocking-aware entries report `RunOutcome::Wait`; the non-blocking `run_export`/`run_label` fold it
 (Handoff #1, owner `beam_rt`).
 
+## The local-call seam's callee identity (cost + the cache precedent)
+The local-call arm (`dispatch.rs:413-515`, seams at `:421`/`:467`/`:496`) does **not** call
+`atom_name`/`atom_table.name`: `atom_table.name` is a plain `Vec<Arc<str>>` index + deref (`beam_term/src/atom.rs:308-310`)
+— no hash lookup and no `Arc<str>` clone, only two dependent loads per name.
+The identity itself is `local_callee_identity` (`dispatch.rs:1234-1239`, the **only** caller is `Machine::local_call_seam` at `:1120`):
+`module.functions.get(func)` then `atom_name(function.name)` **and** `atom_name(function.module)` (the *function's* own module atom,
+not `module.name`), returning `(owner, name, function.arity)` — the **declared** arity, while `nregs` is the instruction's operand.
+The in-crate empirical anchor for that derivation's price is the sibling `LabelMap` cache: resolving one import's two names was
+measured at ~**5 ns** per BIF call against ~**0.5 ns** for the cached hit (`mod.rs:93-111`, `ImportTarget`, which stores the two names
+`Box<str>` **owned** because the map is reached through a bare pointer inside `JitRuntime` and cannot carry the module's lifetime).
+That is the template a per-`(module, function)` callee-identity cache should follow.
+**`Machine::local_call_seam` (`dispatch.rs:1109-1142`) is the ONE definition of the seam both tiers drive** — the interpreter's three
+local-call arms, `jit/baseline/call.rs::store_continuation` (`:271`) and `jit/baseline/runtime.rs::probe_local_call` (`:1087`) — so any
+caching placed **inside** it, the `Machine` state it reads, or `local_callee_identity` benefits the baseline tier with **zero**
+`../jit/baseline/**` edits. `Machine` has **no** `labels` field, so a `LabelMap`-owned cache would need a `labels` parameter threaded
+through all five call sites (two of them under `src/jit/baseline/`) — use a `Machine`-owned cache keyed on the module's address instead.
+The host's **verdict** must stay per-call (one `resolve_local_call` consultation and one reduction spend per local call:
+`beam_rt/src/runner/budget.rs:482-485`); only the identity is memoizable.
+
 ## Routing Table
 - `dispatch.rs` → the dispatcher + run entries; `Machine::step_instruction_with_entry` is the JIT helper's deopt
   target, and `Machine::call_ext_dispatch` + `ImportFrame` are the shared `call_ext*` body a tier drives.
