@@ -74,6 +74,11 @@
 //! 5. [`a_missing_toolchain_is_a_loud_skip_never_a_silent_pass`] — the loud-skip guard
 //!    (`tests/support/mod.rs`): no `erl` declines the oracle half loudly, never silently.
 //!
+//! [`a_fun_loop_keeps_a_retained_payload_byte_exact_across_nested_prunes`] adds the
+//! **nested-call** half of the safety contract: a 64 KiB payload a `lists:foldl/3` lambda's
+//! throw-away builds cannot name must survive the prune that runs at every lambda's epilogue,
+//! checked by `erlang:md5/1` before and after the churn and `=:=` a fresh rebuild.
+//!
 //! The two remaining cases of the reclaim's own contract are pinned **in-crate**, where the store
 //! is reachable at all: the `RefCount > 1` belt and the decline-on-doubt rule both need to write a
 //! handle into `Runtime::eval_off_heap` directly, which is `pub(crate)`
@@ -115,6 +120,20 @@ const BOUND_HANDLES: usize = 16;
 /// How many prune rounds the anti-dangle case must survive (each one is a real rewrite of the
 /// store, asserted through `prunes`).
 const KEEP_ROUNDS: usize = 24;
+
+/// The source bytes `binary:copy/2` copies for the **fun-loop** anti-dangle payload: base64 of
+/// 49 152 bytes is exactly 65 536, one 64 KiB payload.
+const FUN_KEEP_SOURCE_BYTES: u32 = 49_152;
+
+/// That payload's own size, in bytes: `ceil(49 152 / 3) * 4`.
+const FUN_KEEP_PAYLOAD_BYTES: u32 = 65_536;
+
+/// How many throw-away payload builds the fun loop runs while the 64 KiB payload is retained.
+///
+/// Each application of the lambda is its own nested run (`apply_fun` -> `run_label_blocking`),
+/// so the loop crosses many nested-call prunes; 40 builds is also enough on its own to cross the
+/// store's 46 422-word trigger with [`PRODUCER`]'s 53 336-byte payloads.
+const FUN_LOOP_ROUNDS: u32 = 40;
 
 /// A single `Runtime` on the default configuration.
 fn runtime() -> Runtime {
@@ -355,6 +374,66 @@ fn a_retained_off_heap_binary_survives_every_prune_byte_exactly() {
         text.trim_end(),
         format!("{{true,{expected}}}"),
         "the retained payload is no longer byte-identical, or lost its length"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4. Anti-dangle for the **nested-call** prune: a fun-loop payload survives it.
+// ---------------------------------------------------------------------------------------------
+
+/// The nested-call **anti-dangle** case: a payload a live term names must survive the prune that
+/// runs at a fun loop's nested-call epilogue.
+///
+/// The fun-loop arm restores the store from a different place than the statement boundaries
+/// above: a `lists:foldl/3` lambda is applied on its own short-lived `Machine`
+/// ([`RuntimeContext::apply_fun`] -> `run_label_blocking`), and that machine's epilogue adopts
+/// the payloads the lambda built into this store and then prunes it against **that run's own**
+/// published root set (`RuntimeContext::adopt_nested_payloads`: its X registers, its whole
+/// Erlang stack, its FR file and the term it returns).
+///
+/// The payload bound to `Keep` is named by none of those while the lambda runs — yet it must
+/// survive, because a nested call may only release the handles it adopted **itself**: an earlier
+/// statement's payload is out of its scope and is retained unconditionally. That rule is what
+/// makes the nested-call prune sound, and this case is its witness.
+///
+/// The retained payload is checked at **both ends** of the loop: `D0` is its `erlang:md5/1`
+/// taken *before* the churn and compared *after* it, and the value itself is compared `=:=` with
+/// a **fresh rebuild** of the same bytes (`=:=` on binaries compares content, not identity).
+/// `byte_size/1` is the independent third check, and `prunes > 0` below is what stops the case
+/// passing on a runtime where no prune ran at all.
+#[test]
+fn a_fun_loop_keeps_a_retained_payload_byte_exact_across_nested_prunes() {
+    let keep = format!("base64:encode(binary:copy(<<7>>, {FUN_KEEP_SOURCE_BYTES}))");
+    let expr = format!(
+        "Keep = {keep}, D0 = erlang:md5(Keep), \
+         lists:foldl(fun(_, Acc) -> _ = {PRODUCER}, Acc end, ok, lists:seq(1, {FUN_LOOP_ROUNDS})), \
+         {{erlang:md5(Keep) =:= D0, Keep =:= {keep}, byte_size(Keep)}}"
+    );
+    let mut runtime = runtime();
+    let value = runtime
+        .eval(&expr)
+        .expect("the fun-loop retaining expression evaluates without dangling");
+    let stats = runtime.eval_off_heap_stats();
+    eprintln!(
+        "[{SUITE}] fun-loop retain: handles={} bytes={} prunes={} declines={}",
+        stats.handles, stats.retained_bytes, stats.prunes, stats.declines
+    );
+    assert!(
+        stats.prunes > 0,
+        "the fun-loop case must cross at least one prune boundary: {stats:?}"
+    );
+    assert_eq!(
+        stats.declines, 0,
+        "this graph is fully walkable, so a decline would be a bug: {stats:?}"
+    );
+    let text = runtime
+        .format_term_w(value, None)
+        .expect("the witness formats");
+    assert_eq!(
+        text.trim_end(),
+        format!("{{true,true,{FUN_KEEP_PAYLOAD_BYTES}}}"),
+        "the payload retained across the fun loop is no longer byte-identical (md5 before/after \
+         the churn, `=:=` a fresh rebuild) or lost its length"
     );
 }
 

@@ -913,15 +913,13 @@ fn a_missing_toolchain_is_a_loud_skip_never_a_silent_pass() {
 // `RuntimeContext::apply_fun` -> `run_label_blocking`'s own short-lived `Machine`, whose payload
 // reservoir is handed to `Runtime::adopt_escaped_binaries` when that machine drops
 // (`src/context/pump.rs`, `src/runtime.rs`). The payloads therefore live in the runtime's
-// **escaped-payload store**, not in the process's `Machine::refc_binaries` reservoir, which is
-// what the slice-boundary prune walks -- so the fun-loop envelope is NOT bounded by the
-// binary-virtual-heap budget today.
+// **escaped-payload store**, not in the process's `Machine::refc_binaries` reservoir that the
+// slice-boundary prune walks.
 //
-// Which means: the safety half (`foldl_keep`, below) is green and must stay green -- a retained
-// payload is never freed by either path -- while the *release* half is a **known gap** and is
-// kept as an `#[ignore]`d measurement harness rather than a failing assertion, so this suite
-// stays a green gate while stating the gap honestly. Remove the `#[ignore]` when the
-// escaped-payload store gains a prune; the assertion below is written to pass unchanged then.
+// Both halves are green. The safety half (`foldl_keep`) proves a payload a live root names is
+// never freed; the release half (`foldl_discard`) proves the fun-loop envelope is bounded,
+// because that store is pruned at the nested-call adopt site against the run's own published
+// root set (`RuntimeContext::adopt_nested_payloads`).
 // ---------------------------------------------------------------------------------------------
 
 /// The fun-loop **safety** half: a payload the fold accumulator keeps live across
@@ -983,23 +981,24 @@ fn a_retained_off_heap_binary_survives_the_fun_loop_byte_exactly() {
     );
 }
 
-/// The fun-loop **release** half -- **the known gap, kept as a measurement harness**.
+/// The fun-loop **release** half: the envelope must be bounded by the binary-virtual-heap
+/// budget and flat in N.
 ///
 /// The fun-loop body builds and drops one [`PAYLOAD_BYTES`]-byte off-heap binary per iteration,
-/// exactly like the direct-recursion cases above, whose envelope is bounded by the
-/// binary-virtual-heap budget (a sawtooth between one payload and ~345). This shape is **linear
-/// in N**: the lambda is applied through `apply_fun` -> `run_label_blocking`, whose per-call
-/// `Machine` hands its reservoir to `Runtime::adopt_escaped_binaries` when it drops, so the
-/// payloads land in the runtime's escaped-payload store -- a region the slice-boundary prune
-/// does not walk (it prunes `Machine::refc_binaries` against the process's root set).
+/// exactly like the direct-recursion cases above. The lambda is applied through `apply_fun` ->
+/// `run_label_blocking`, whose per-call `Machine` hands its reservoir to
+/// `Runtime::adopt_escaped_binaries` when it drops, so the payloads land in the runtime's
+/// escaped-payload store and are released there: that store is pruned at the same nested-call
+/// epilogue, against the run's own published root set (its X registers, its whole Erlang stack,
+/// its FR file and the term it is about to return).
 ///
-/// Measured (4 096-byte payloads): `4 144 000` bytes at N = 1 000 and `41 440 000` at
-/// N = 10 000, i.e. exactly `N × (Bytes + 48)`; at 65 536 B: `65 584 000` / `655 840 000`. The
-/// identical workload driven by direct recursion reads `4 144` / `4 144` and `65 584` /
-/// `65 584`. The assertion below is the one that must hold once that store gains a prune; it is
-/// `#[ignore]`d until then so the suite stays a green gate (see the module docs).
+/// The store is bounded by `STORE_BUDGET_WORDS` (46 422 words, the C `BIN_VH_MIN_SIZE`), so the
+/// envelope is a converged capacity, not a function of N: measured **377 104** bytes at both
+/// N = 1 000 and N = 10 000 (4 096-byte payloads, ~91 payloads) against a linear
+/// `N × (Bytes + 48)` before that store had a prune. The assertion is structural on purpose --
+/// bounded, and no growth from the small to the large N -- never an exact byte figure and never
+/// a wall-clock claim.
 #[test]
-#[ignore = "known gap: a fun-loop lambda's payloads escape to Runtime::eval_off_heap, which no prune walks"]
 fn the_fun_loop_envelope_is_bounded_by_the_bin_vheap_budget() {
     let Some(toolchain) = setup("foldl_discard") else {
         return;
@@ -1032,6 +1031,7 @@ fn the_fun_loop_envelope_is_bounded_by_the_bin_vheap_budget() {
     let (_, large) = figures[1];
     assert!(
         large <= small.saturating_mul(2),
-        "the fun-loop envelope is linear in N ({small} -> {large}), not bounded: {figures:?}"
+        "the fun-loop envelope grows with N ({small} -> {large}) instead of converging on the \
+         binary-virtual-heap budget: {figures:?}"
     );
 }

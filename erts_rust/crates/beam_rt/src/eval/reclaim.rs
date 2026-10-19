@@ -174,13 +174,24 @@ pub(crate) enum Prune {
     },
 }
 
-/// The store's prune state: the last observed handle count (the `O(1)` half of the trigger)
-/// and the counters a test and [`crate::runtime::EvalOffHeapStats`] read.
+/// The store's prune state: the last observed handle count (the `O(1)` half of the trigger),
+/// that count's cached budget verdict, and the counters a test and
+/// [`crate::runtime::EvalOffHeapStats`] read.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PruneState {
     /// The store's handle count at the last prune **or** observation — the comparison half of
     /// the trigger.
     pub(crate) seen_handles: usize,
+    /// The budget verdict derived at [`PruneState::seen_handles`], cached so an unchanged
+    /// handle count costs one compare instead of an `O(handles)` byte sum.
+    ///
+    /// Caching the **verdict** rather than only the count is load-bearing: a prune that
+    /// releases nothing net leaves the count exactly where the next call observes it, and a
+    /// cache that answered "nothing to do" there would skip every second call's prune and leak
+    /// one payload per skip (measured: a 4 096-byte fun-loop discard measured
+    /// `2 258 480`/`20 906 480` bytes at N = 1 000/10 000, i.e. exactly half a payload per
+    /// iteration).
+    pub(crate) over_budget: bool,
     /// How many times the store was actually rewritten.
     pub(crate) prunes: u64,
     /// How many times soundness could not be shown.
@@ -204,32 +215,84 @@ enum Walk {
     Declined(&'static str),
 }
 
+/// Whether [`prune`] would do any work right now — its trigger, without its walk.
+///
+/// This is [`prune`]'s own prelude, split out because a caller that must first **collect
+/// roots** may not pay for that collection on a call that would only be deferred (a
+/// nested-call pump's live set is a machine's register files, so collecting it is a copy of the
+/// whole root set). It answers `false` exactly when `prune` would return [`Prune::Deferred`],
+/// and it is idempotent: `prune` runs this same prelude, so a caller that has already asked may
+/// call `prune` immediately afterwards.
+///
+/// The cost is one `Vec::len` compare while the handle count has not moved since the last
+/// observation, because the budget verdict is cached alongside the count
+/// ([`PruneState::over_budget`]); the `O(handles)` byte sum is derived only when the count has
+/// moved. It records the observation, so the check is not a pure read (which is also why it
+/// cannot be two functions: the verdict and the observation must not drift apart).
+pub(crate) fn due(runtime: &mut Runtime) -> bool {
+    // The diagnostic kill switch (`Runtime::set_eval_prune_enabled`) is checked before anything
+    // else, so the trigger's own observation is not recorded while it is off: turning the reclaim
+    // back on then starts from a clean slate instead of a half-observed store.
+    if !runtime.eval_prune_enabled() {
+        return false;
+    }
+    // The trigger's `O(1)` half: the handle count, and whether it moved at all.
+    let handles = runtime.eval_off_heap_handle_count();
+    if handles == 0 {
+        return false;
+    }
+    if handles == runtime.eval_prune().seen_handles {
+        return runtime.eval_prune().over_budget;
+    }
+    // It moved: derive the expensive half once, and record both halves so a steady state costs
+    // a single `len()` compare again.
+    let over = runtime.eval_off_heap_bytes() / size_of::<Eterm>() > STORE_BUDGET_WORDS;
+    runtime.note_eval_prune_observed(handles, over);
+    over
+}
+
 /// Prunes the `-eval` route's off-heap refc-binary store.
 ///
 /// `extra` is the caller's own live set — the terms the driver is holding that no runtime
 /// field names (the evaluator's environment and the value being reduced). Passing them is
 /// what makes the root enumeration complete; a caller that cannot name its live terms must
 /// not call this.
+///
+/// Every entry of the store is a candidate for release: the caller can name its whole live
+/// set (the statement boundary of a `-eval` expression is the one point where it can).
 pub(crate) fn prune(runtime: &mut Runtime, extra: &[Eterm]) -> Prune {
-    // The diagnostic kill switch (`Runtime::set_eval_prune_enabled`) is checked before anything
-    // else, so the trigger's own observation is not recorded while it is off: turning the reclaim
-    // back on then starts from a clean slate instead of a half-observed store.
-    if !runtime.eval_prune_enabled() {
-        return Prune::Deferred;
-    }
-    // The trigger's `O(1)` half: the handle count, and whether it moved at all.
-    let handles = runtime.eval_off_heap_handle_count();
-    if handles == 0 {
-        return Prune::Deferred;
-    }
-    if handles == runtime.eval_prune().seen_handles {
-        return Prune::Deferred;
-    }
-    // It moved: derive the expensive half once, and record the observation so a steady state
-    // costs a single `len()` again.
-    let bytes = runtime.eval_off_heap_bytes();
-    runtime.note_eval_prune_observed(handles);
-    if bytes / size_of::<Eterm>() <= STORE_BUDGET_WORDS {
+    prune_scoped(runtime, extra, None)
+}
+
+/// [`prune`], restricted to a **subset** of the store: `only` names the payload addresses
+/// (`RefcBinary::data_ptr` values) that may be released, and every other entry is retained
+/// untouched.
+///
+/// The restriction is what makes a prune sound at a **nested call site**
+/// ([`RuntimeContext::adopt_nested_payloads`](crate::context::RuntimeContext)). Such a site
+/// can enumerate exactly one machine's root set — the run's own — while the *enclosing*
+/// machines of the same process (a suspended `lists:map/2`, the slice's own machine) are
+/// alive and hold terms this crate cannot see. A payload **this run built** can only have
+/// escaped into one of those by being returned to the caller (which the caller stores
+/// *after* this run returns, and which rides the `extra` roots here), so it is fully
+/// accounted for; a payload an **earlier** run built may already stand in such a machine's
+/// stack, so releasing it on this run's evidence would be a use-after-free. Hence: a nested
+/// call releases only what it adopted itself, and everything else is a bounded leak.
+///
+/// That is measured, not assumed: with `None` at the nested site,
+/// `lists:map/2` over 200 40 000-byte engine-built binaries returns **190 corrupted elements**
+/// (the payloads are freed while `lists:map`'s own stack still names them), against **0** with
+/// the run's own handles as the scope.
+///
+/// `None` means "the whole store" (the `-eval` route's statement boundary).
+pub(crate) fn prune_scoped(
+    runtime: &mut Runtime,
+    extra: &[Eterm],
+    only: Option<&[usize]>,
+) -> Prune {
+    // The trigger, with the kill switch and the cached-verdict `O(1)` half — the same prelude
+    // `due` runs, so a caller that asked first pays nothing extra here.
+    if !due(runtime) {
         return Prune::Deferred;
     }
     let mut roots = Vec::with_capacity(extra.len() + 16);
@@ -251,10 +314,15 @@ pub(crate) fn prune(runtime: &mut Runtime, extra: &[Eterm]) -> Prune {
     let total = held.len();
     let mut retained = 0;
     for handle in held {
-        let reachable = live.payloads.contains(&(handle.data_ptr() as usize));
+        let address = handle.data_ptr() as usize;
+        // The optional restriction: an entry outside it is retained unconditionally — an
+        // out-of-scope payload is one this caller has no evidence about (see
+        // [`prune_scoped`]).
+        let out_of_scope = only.is_some_and(|only| !only.contains(&address));
+        let reachable = live.payloads.contains(&address);
         // The `RefCount > 1` belt: another owner exists outside this enumeration.
         let shared = handle.refcount() > 1;
-        if reachable || shared {
+        if out_of_scope || reachable || shared {
             let duplicate = runtime
                 .eval_off_heap_mut()
                 .binaries()
@@ -270,7 +338,10 @@ pub(crate) fn prune(runtime: &mut Runtime, extra: &[Eterm]) -> Prune {
         }
     }
     let handles = runtime.eval_off_heap_handle_count();
-    runtime.note_eval_prune(handles);
+    // The rewrite's own budget verdict, so the next call's `O(1)` half answers from the store
+    // as this prune leaves it (see [`PruneState::over_budget`]).
+    let over = runtime.eval_off_heap_bytes() / size_of::<Eterm>() > STORE_BUDGET_WORDS;
+    runtime.note_eval_prune(handles, over);
     Prune::Pruned {
         released: total - retained,
         retained,

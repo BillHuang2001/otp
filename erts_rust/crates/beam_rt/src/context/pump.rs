@@ -277,14 +277,12 @@ impl<'a> RuntimeContext<'a> {
             // The machine is dropped when this scope ends, releasing every off-heap payload
             // handle it built — but the returned term (and any term the callee stored where
             // this run cannot see it) may still point at one. Adopt them into the runtime's
-            // escaped-payload store **before** that drop, on every path, so no live term can
-            // dangle (see `Runtime::adopt_escaped_binaries`).
-            this.runtime
-                .adopt_escaped_binaries(machine.refc_binaries());
+            // escaped-payload store **before** that drop, and release the ones this run built
+            // that nothing names any more (see [`RuntimeContext::adopt_nested_payloads`]).
+            this.adopt_nested_payloads(machine, &result);
             result
         })
     }
-
     /// Runs the raw entry `label` of `module` to its `return`, **driving the scheduler**
     /// while the callee is suspended in a `receive`.
     ///
@@ -345,13 +343,96 @@ impl<'a> RuntimeContext<'a> {
                 Err(err) => Err(err),
             };
             // As [`Self::run_export_blocking`]: adopt the closure's off-heap payload handles
-            // before the machine holding them is dropped.
-            this.runtime
-                .adopt_escaped_binaries(machine.refc_binaries());
+            // before the machine holding them is dropped, and release the ones this run built
+            // that nothing names any more.
+            this.adopt_nested_payloads(machine, &result);
             result
         })
     }
 
+    /// The nested run's epilogue: adopt every off-heap payload handle the just-finished
+    /// `machine` built, and — when the escaped-payload store is due a prune — release the ones
+    /// **this run itself** built that no live term names.
+    ///
+    /// Adoption is unconditional: the returned term (and every term the callee stored where
+    /// this run cannot see it) may name a payload whose only owner is about to be dropped, so
+    /// [`Runtime::adopt_escaped_binaries`](crate::runtime::Runtime) hands ownership to the
+    /// runtime on **every** path — errors and deferred prunes included.
+    ///
+    /// # Publish, then prune
+    ///
+    /// The root set of the prune is this machine's own: its X registers, its whole Erlang
+    /// stack and its FR file, published through the engine's frozen root-set hand-off with
+    /// [`RootSet::ALL_LIVE`] — an over-publish on purpose (a root set may be too large, never
+    /// too small; the `live` field is a hint a collector clamps). The returned term is added to
+    /// it as well: it is live by definition (the caller is about to receive it) and need not be
+    /// in a register. The runtime's own named live sets and its unscanned term regions are
+    /// added by the prune itself.
+    ///
+    /// # Why the machine is dropped between the two steps
+    ///
+    /// The prune retains any payload whose `RefCount > 1` (another owner exists outside its
+    /// enumeration). While this machine lives **it** is such an owner for every payload it
+    /// built, so a prune run before the drop would retain exactly the payloads this run is
+    /// asking about. The adoption above has already cloned each handle into the store, so
+    /// dropping the machine here frees nothing.
+    ///
+    /// # Why only this run's own payloads may be released
+    ///
+    /// See [`Runtime::prune_off_heap`](crate::runtime::Runtime): a nested site can enumerate one
+    /// machine's roots, while the enclosing machines of the same process hold terms this crate
+    /// cannot see. A payload an earlier run built may already stand in one of them, so it is
+    /// retained — a bounded leak, never a dangle.
+    ///
+    /// # Why the error path does not prune
+    ///
+    /// A raise's reason term is not part of the frozen root set — it escapes in
+    /// [`beam_common::Raise`]'s live-reason slot — so a failed run takes the plain adopt path
+    /// and leaves the store alone (a bounded leak).
+    fn adopt_nested_payloads(&mut self, mut machine: Machine, result: &Result<Eterm>) {
+        let roots = match result {
+            Ok(term) => self.publish_nested_roots(&mut machine, *term),
+            Err(_) => None,
+        };
+        self.runtime
+            .adopt_escaped_binaries(machine.refc_binaries());
+        let adopted: Vec<usize> = match &roots {
+            Some(_) => machine
+                .refc_binaries()
+                .iter()
+                .map(|handle| handle.data_ptr() as usize)
+                .collect(),
+            None => Vec::new(),
+        };
+        // The machine must not outlive this point as a payload owner (see above).
+        drop(machine);
+        if let Some(roots) = roots {
+            self.runtime.prune_off_heap(&roots, &adopted);
+        }
+    }
+
+    /// This run's live root set, copied out of `machine` for
+    /// [`Runtime::prune_off_heap`](crate::runtime::Runtime) — or `None` when the
+    /// escaped-payload store is **not due a prune**, in which case the caller pays nothing but
+    /// the gate itself.
+    ///
+    /// The words are raw [`Eterm`]s (integers), so copying them out is always safe; they stay
+    /// valid because this context never arms the collection latch, so the pump's allocations
+    /// fall back to the pointer-stable arena and nothing paused here is moved
+    /// ([`RuntimeContext::run_export_blocking`]).
+    fn publish_nested_roots(&mut self, machine: &mut Machine, term: Eterm) -> Option<Vec<Eterm>> {
+        if !self.runtime.off_heap_prune_pending() {
+            return None;
+        }
+        let mut roots = Vec::with_capacity(machine.register_count() as usize + 64);
+        machine.with_roots(beam_engine::context::RootSet::ALL_LIVE, |rootset| {
+            roots.extend_from_slice(rootset.x);
+            roots.extend_from_slice(rootset.stack);
+            roots.extend_from_slice(rootset.fr);
+        });
+        roots.push(term);
+        Some(roots)
+    }
     /// One pump-and-resume of a blocked cross-module run: advance the scheduler, then resume
     /// `machine` at the address its [`RunOutcome::Wait`] reported.
     ///

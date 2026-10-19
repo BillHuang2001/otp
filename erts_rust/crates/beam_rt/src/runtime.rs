@@ -1690,6 +1690,35 @@ impl Runtime {
         }
     }
 
+    /// Whether the escaped-payload store is **due a prune** — the `O(1)` gate a caller that
+    /// must *collect roots before it can prune* checks first.
+    ///
+    /// It is exactly [`crate::eval::reclaim::prune`]'s own trigger (the reclaim switch, the
+    /// handle count against the last observation, and only then the summed payload bytes
+    /// against `STORE_BUDGET_WORDS`) and it is idempotent with it — `prune` re-runs the same
+    /// prelude — so a `true` is only ever an invitation to call [`Runtime::prune_off_heap`].
+    /// It exists so the nested-call sites do not copy a whole machine root set on a call that
+    /// would only be deferred: in the steady state that is one `Vec::len` compare per call.
+    pub(crate) fn off_heap_prune_pending(&mut self) -> bool {
+        crate::eval::reclaim::due(self)
+    }
+
+    /// Prunes the escaped-payload store against `extra_roots` (a nested run's own live terms),
+    /// releasing **only** the payloads `adopted` names — the handles that same nested run
+    /// adopted into the store a moment ago.
+    ///
+    /// The restriction is the soundness condition of pruning from a nested call site: such a
+    /// site can enumerate one machine's root set, while the *enclosing* machines of the same
+    /// process hold terms this crate cannot see. A payload **this** run built can only reach
+    /// them by being returned to the caller (which happens after this run returns, and whose
+    /// term rides `extra_roots`), so it is fully accounted for; a payload an **earlier** run
+    /// built may already stand in an enclosing machine's stack, so releasing it on this run's
+    /// evidence would be a use-after-free. Everything out of scope is therefore retained — a
+    /// bounded leak, never a dangle. See [`crate::eval::reclaim::prune_scoped`].
+    pub(crate) fn prune_off_heap(&mut self, extra_roots: &[Eterm], adopted: &[usize]) {
+        let _ = crate::eval::reclaim::prune_scoped(self, extra_roots, Some(adopted));
+    }
+
     // -- the `-eval` route's escaped-payload store: the surface `crate::eval::reclaim` prunes
     // through ------------------------------------------------------------------------------
     /// Whether a process **engine** has ever been registered on this runtime.
@@ -1732,20 +1761,25 @@ impl Runtime {
     pub fn set_eval_prune_enabled(&mut self, enabled: bool) {
         self.eval_prune_enabled = enabled;
     }
-    /// Records that the store was rewritten and now holds `handles` payload handles.
-    pub(crate) fn note_eval_prune(&mut self, handles: usize) {
+    /// Records that the store was rewritten and now holds `handles` payload handles, together
+    /// with the budget verdict `over` derived from the store as the rewrite left it.
+    pub(crate) fn note_eval_prune(&mut self, handles: usize, over: bool) {
         self.eval_prune.seen_handles = handles;
+        self.eval_prune.over_budget = over;
         self.eval_prune.prunes += 1;
         self.eval_prune.last_decline = None;
     }
-    /// Records the trigger's `O(1)` observation (*the handle count*) **without** rewriting the
-    /// store — the "nothing to do yet" half of the trigger.
+    /// Records the trigger's `O(1)` observation (*the handle count*) and that count's budget
+    /// verdict `over`, **without** rewriting the store — the "nothing to do yet" half of the
+    /// trigger.
     ///
     /// Needed as its own entry point because the expensive half of the trigger (the summed
-    /// payload bytes) is derived only when this observation *moves*: recording it here is what
-    /// keeps a steady-state statement a single `Vec::len()` read instead of an `O(handles)` walk.
-    pub(crate) fn note_eval_prune_observed(&mut self, handles: usize) {
+    /// payload bytes) is derived only when this observation *moves*: recording both halves here
+    /// is what keeps a steady-state statement a single `Vec::len()` compare instead of an
+    /// `O(handles)` walk.
+    pub(crate) fn note_eval_prune_observed(&mut self, handles: usize, over: bool) {
         self.eval_prune.seen_handles = handles;
+        self.eval_prune.over_budget = over;
     }
     /// Records that a prune **declined** because soundness could not be shown, and why.
     pub(crate) fn note_eval_prune_declined(&mut self, reason: &'static str) {
