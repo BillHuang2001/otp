@@ -36,6 +36,11 @@
 //!
 //! * **at the receiver's schedule-in**, through [`ProcessTable::service_signals`] (the
 //!   scheduler calls it on the dequeued pid before running it); and
+//! * **during a receive scan**, through [`ProcessTable::service_receive_signals`]: the runtime's
+//!   receive fetch applies the queue's *receive-applicable* head signals (a trapped exit as
+//!   `{'EXIT', …}`, a monitor-DOWN as `{'DOWN', …}`, an ignored exit discarded) so the scan can
+//!   match them in the same reduction slice, and leaves a **terminating** one queued for the
+//!   schedule-out net (the C's `i_loop_rec` → `do_schedule`); and
 //! * **eagerly at the end of the sending operation**, for a receiver that is **not** the
 //!   currently executing process (ERTS's early signal handling). "Currently executing" is
 //!   [`ProcessState::Running`]: the single scheduler sets it before a runner runs, so at most
@@ -107,8 +112,8 @@ use crate::remote::{
 use crate::run_queue::Priority;
 use crate::signal::{
     build_down_message_port, build_down_message_remote, build_down_message_term,
-    build_exit_message, build_exit_message_term, exit_policy, ExitFamily, ExitPolicy, ExitSignal,
-    SignalAtoms,
+    build_exit_message, build_exit_message_term, exit_policy, receive_applicability, ExitFamily,
+    ExitPolicy, ExitSignal, ReceiveApplicability, SignalAtoms,
 };
 use crate::signal_queue::PendingSignal;
 
@@ -2354,6 +2359,101 @@ impl ProcessTable {
     ) -> Result<()> {
         let mut ports: Option<&mut PortTable> = Some(ports);
         self.service_signals_and_cascade(&mut ports, pid)
+    }
+
+    /// Applies the **receive-applicable** signals queued for `pid`, in FIFO order, stopping at the
+    /// first one whose application would terminate it — the **receive-scan** entry point.
+    ///
+    /// # What it is, and why it is not [`ProcessTable::service_signals`]
+    ///
+    /// `service_signals` is the **schedule-in** (and eager) entry point: it applies the whole
+    /// queue, terminates the process when a signal's [`exit_policy`] verdict says so, and cascades
+    /// to every process that termination signals. A **receive scan** must not do that. The C's
+    /// `i_loop_rec` (`erts/emulator/beam/emu/msg_instrs.tab:60-140`), on finding its message queue
+    /// exhausted, calls `erts_proc_sig_receive_helper` (`erl_proc_sig_queue.c:7729`), which handles
+    /// the receiver's own incoming signals (`erts_proc_sig_handle_incoming`, `:6229`) and then
+    /// re-peeks: a trapped exit becomes an `{'EXIT', …}` message, a monitor-DOWN becomes a
+    /// `{'DOWN', …}` message, an ignored (`normal` to a non-trapping receiver) exit is dropped —
+    /// but a signal that would **terminate** the process only sets `ERTS_PSFLG_EXITING`; the
+    /// helper reports `get_out > 0` (`:7860-7872`) and the receive instruction jumps to
+    /// `do_schedule`, so the process dies *after* it is scheduled out, never inside its own
+    /// receive.
+    ///
+    /// So this entry point:
+    ///
+    /// * **applies** ([`ReceiveApplicability::Apply`]), strictly FIFO, every head signal whose
+    ///   application yields a mailbox message — a trapped exit (`{'EXIT', From, Reason}` through
+    ///   `deliver_trapped_exit`) or a monitor-DOWN (`{'DOWN', …}`/`{Tag, …}` through
+    ///   `deliver_down_message`);
+    /// * **discards** ([`ReceiveApplicability::Discard`]) a head signal the C drops (an
+    ///   [`ExitPolicy::Ignore`] exit), popping it and continuing with the next one;
+    /// * **stops** ([`ReceiveApplicability::Stop`]) before the first head signal that would
+    ///   terminate the receiver ([`ExitPolicy::Terminate`]), leaving it — and everything behind it
+    ///   — queued and untouched, and returns `Ok(())`. That termination is the **schedule-out
+    ///   net's**: the runtime's park arm re-queues instead of parking, and the next schedule-in's
+    ///   [`ProcessTable::service_signals`] applies it and cascades.
+    ///
+    /// Two consequences a caller must know:
+    ///
+    /// * It **never** cascades to another process, so it takes **no** [`PortTable`] and has no
+    ///   `_with_ports` sibling: the only thing that drains a dying process's incoming port monitors
+    ///   is a cascade that terminates it, and no termination happens here.
+    /// * A delivered message `wake`s the receiver through the existing `deliver_head_signal` tail
+    ///   (and is recorded on the wake list). The normal in-scan caller is the currently executing
+    ///   ([`ProcessState::Running`]) process, which is not blocked, so that wake is a no-op for it.
+    ///
+    /// Nothing else about a delivery changes: the per-class message builders, the exhaustion
+    /// policy (collect-and-grow on demand, or the heap-fragment fallback for a receiver whose
+    /// relocating collection is declined — a `Running` or relocation-exempt receiver, or one the
+    /// host's [`CollectionGate`] declines) and the propagation rule itself are the **existing**
+    /// ones. The propagation policy stays single-sourced: the class comes from
+    /// [`receive_applicability`], which reads [`exit_policy`], and the action from the shared
+    /// [`ProcessTable::apply_head_signal`] — so the two can never disagree. That shared applier's
+    /// cascade `pending` worklist is constructed here but stays **empty**: only its terminating arm
+    /// (`terminate_into` → `schedule_service`) pushes to it, and a `Stop` verdict keeps this loop
+    /// away from that arm.
+    ///
+    /// A **quiet** or unknown `pid` returns `Ok(())` immediately, mutating nothing and allocating
+    /// nothing — the same fast path [`ProcessTable::service_signals`] takes (the `VecDeque::new`
+    /// below never allocates, and it is only reached when there is a head signal to look at).
+    ///
+    /// Documented approximation: the C's walk is **reduction-bounded**
+    /// (`erts_proc_sig_handle_incoming`'s `limit`/`abs_lim`, and the helper's `left_reds` yield), so
+    /// a long queue can make it return mid-queue. This walk is not: the receive scan's pre-emption
+    /// is the engine's own reduction budget at the caller (the runner's `budget`), so the whole
+    /// receive-applicable prefix is applied in one call. That changes no observable term or order,
+    /// only when a yield lands.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the message builders' `BeamError::Alloc` (a receiver whose nursery could not be
+    /// grown and whose relocating collection was not declined) exactly as the schedule-in path
+    /// does.
+    pub fn service_receive_signals(&mut self, pid: ProcessId) -> Result<()> {
+        if self.head_signal(pid).is_none() {
+            return Ok(());
+        }
+        // No port table: nothing on this path can terminate a process (see the docs above).
+        let mut ports: Option<&mut PortTable> = None;
+        // The shared applier's cascade worklist. It stays empty: only its terminating arm pushes
+        // to it, and `ReceiveApplicability::Stop` stops this loop before that arm.
+        let mut no_cascade = VecDeque::new();
+        while let Some(signal) = self.head_signal(pid) {
+            let Some(process) = self.get(pid) else {
+                // The queue outlived its PCB (nothing here can remove one): nothing to apply.
+                break;
+            };
+            let applicability =
+                receive_applicability(signal, process.is_trapping_exit(), &self.atoms);
+            if applicability == ReceiveApplicability::Stop {
+                // The receiver would have to *terminate*: leave the head (and the rest) queued.
+                break;
+            }
+            // `Apply` and `Discard` are exactly the two classes the shared applier handles without
+            // terminating: it delivers the message (popping the head) or pops the ignored signal.
+            self.apply_head_signal(&mut ports, pid, &mut no_cascade)?;
+        }
+        Ok(())
     }
 
     /// The shared body of [`ProcessTable::service_signals`] and
