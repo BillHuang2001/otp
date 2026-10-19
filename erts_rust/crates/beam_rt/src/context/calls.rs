@@ -1327,19 +1327,13 @@ impl<'a> RuntimeContext<'a> {
         let nifs = Rc::clone(&self.runtime.nifs);
         // The runtime services the host calls back into, over the same process table the rest of
         // the context resolves against (the slice's own table when there is one, else the
-        // runtime's). These are **disjoint** field borrows of `self.runtime`, which is what lets
-        // them co-exist with each other and with `self.mailbox_table`.
-        let processes: &ProcessTable = match &self.mailbox_table {
-            Some(table) => &**table,
-            None => &self.runtime.processes,
-        };
+        // runtime's). These are **disjoint** borrows — the runtime itself and the caller-supplied
+        // pass table — which is what lets them co-exist with each other and with
+        // `self.mailbox_table`.
         let mut services = RuntimeNifServices {
-            refs: &mut self.runtime.refs,
-            references: &mut self.runtime.references,
-            processes,
-            ports: &self.runtime.ports,
-        };
-        let mut host = NifHostImpl::new(
+            runtime: self.runtime,
+            mailbox: self.mailbox_table.as_deref_mut(),
+        };        let mut host = NifHostImpl::new(
             heap,
             Rc::clone(&atoms),
             interner.share(),

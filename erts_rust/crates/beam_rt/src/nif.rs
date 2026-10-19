@@ -62,14 +62,14 @@
 //! four counter sequences), the emulator information block (`system_info`) and the
 //! extra-environment family (`alloc_env`/`free_env`/`make_copy`).
 //!
-//! Six hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name lookup
-//! (`enif_whereis_pid`), the two liveness answers (`enif_is_process_alive`,
-//! `enif_is_current_process_alive`) and the two port relations (`enif_is_port_alive`,
-//! `enif_port_command`) — and reach it through the optional [`NifHostServices`] provider threaded in
-//! at construction. The **per-call** host (built by
+//! Seven hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name
+//! lookup (`enif_whereis_pid`), the two liveness answers (`enif_is_process_alive`,
+//! `enif_is_current_process_alive`), the two port relations (`enif_is_port_alive`,
+//! `enif_port_command`) and a message delivery (`enif_send`) — and reach it through the optional
+//! [`NifHostServices`] provider threaded in at construction. The **per-call** host (built by
 //! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) carries a
-//! [`RuntimeNifServices`] over the runtime's reference-id allocator, its reference registry, its
-//! process table and its port registry, so all six are live there. The **load/unload** host (built by
+//! [`RuntimeNifServices`] over the runtime and the pass's own process table, so all seven are live
+//! there. The **load/unload** host (built by
 //! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
 //! registry, so it cannot borrow the runtime and is built with `services = None`: those hooks then
 //! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
@@ -91,17 +91,14 @@
 //!   Default: null — the C's own value for a library that set none. To close: a field plus the call
 //!   site handing the pointer in.
 //! * **`consume_timeslice`** (`:3362-3381`) — charges `((CONTEXT_REDS+99)/100) * percent` reductions
-//!   to the calling process and reports whether its timeslice is exhausted. The provider holds the
-//!   process table **immutably** (`Process::bump_reductions` takes `&mut`), and the hook's `bool`
-//!   cannot express "unsupported": the honest answer is the default `false` ("do not yield").
+//!   to the calling process and reports whether its timeslice is exhausted. The running process's
+//!   reduction budget belongs to the slice's `BudgetProbe`, which the runner charges and turns into a
+//!   yield; a charge made from here would be a second, uncoordinated accounting of the same quantum,
+//!   and the hook's `bool` cannot express "unsupported" either: the honest answer is the default
+//!   `false` ("do not yield"). To close: a provider seam into the runner's budget.
 //! * **`whereis_port`** (`:1182`) — resolves a name to a **port**. This runtime's name registry holds
 //!   pids only and `erlang:register/2` refuses a port (`ProcessId::from_eterm`), so no atom can ever
 //!   name a port here: `None` (⇒ `0`) is the *provable* answer, not a missing feature.
-//! * **`send`** (`:860-1093`) — copies `msg` onto the receiver's heap and queues it
-//!   (`erts_alloc_message_heap` + `copy_struct`); here that is `ProcessTable::deliver` plus the
-//!   `beam_message` copier, which need a **mutable** table *and* a copy context the provider lacks.
-//!   Default `None` ⇒ `enif_send` answers `0`: a NIF that ignores the return value loses the message
-//!   — the most damaging remaining gap, and still better than fabricating `1`.
 //! * **`monitor_process`** / **`demonitor_process`** (`:3954-4011`, `:4019-4052`) — records the
 //!   monitor under the *resource* doing the watching and returns the internal reference it was
 //!   registered under. This runtime's monitors are keyed by a **process** watcher
@@ -110,8 +107,8 @@
 //!   (not identified).
 //! * **`select`** (`erl_check_io.c`) — registers poll interest and delivers a notification carrying
 //!   the resource handle to a pid. The poller is `PortRegistry`'s **private** `Poller`, registered
-//!   per *port descriptor* with a port-task callback, and the notification needs the `send` path
-//!   above: a new subsystem, not a wiring gap. Default `-1` (negative, so the C's documented
+//!   per *port descriptor* with a port-task callback, and the notification needs a delivery to a
+//!   pid: a new subsystem, not a wiring gap. Default `-1` (negative, so the C's documented
 //!   `retval < 0` idiom still holds).
 //! * **`schedule_nif`** (`:3560-3604`) — re-enters the NIF through the emulator's scheduling
 //!   trampoline or moves it to a dirty scheduler. This runtime has neither
@@ -121,7 +118,18 @@
 //!   module and calls that type's `dyncall`; `beam_abi`'s registry (a thread-local) resolves only the
 //!   terms *it* minted, so this needs a per-library `{module, name}`-keyed resource-type registry.
 //!   Default ⇒ the C's failure code `1`.
-
+//!
+//! # `enif_send` is live on the per-call host
+//!
+//! [`NifHost::send`] reaches the runtime's **own** send seam
+//! ([`crate::context::nif_send::deliver`]): the message is copied into the receiver's heap by
+//! `beam_message`'s copier, enqueued in its mailbox, and a receiver blocked in `receive` is woken
+//! through the scheduler's resume-on-send wake list — the same path a compiled `!` and
+//! `erlang:send/2` take. `enif_send` therefore answers the C's `1` for a queued message and its `0`
+//! when there is no local process for the target (`erl_nif.c:876-877`) — the C's `0` is a real
+//! failure code here, not the `!` operator's silent drop. Both forms (`msg_env == NULL` and a
+//! message env) go through that one hook, because every message env this host allocates shares its
+//! heap ([`NifHost::make_copy`] is the identity). Sender resolution: [`crate::nif_send`].
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -132,7 +140,7 @@ use beam_abi::nif::types::ErlNifEnv;
 use beam_abi::{ErlDrvSysInfo, NifEnv, NifHost};
 use beam_alloc::Heap;
 use beam_bifs::AtomInterner;
-use beam_process::{MonitorRef, ProcessId, ProcessTable, RefAllocator};
+use beam_process::{ProcessId, ProcessTable};
 use beam_term::prelude::{atom_val, is_atom, is_header, make_atom, make_small, Eterm};
 use beam_term::AtomTable;
 use libc::c_char;
@@ -300,32 +308,57 @@ pub(crate) trait NifHostServices {
         let _ = (port, data);
         None
     }
+
+    /// Deliver `msg` to the process `to` **as `from`**, answering the C's `enif_send` code
+    /// (`erl_nif.c:860-1093`): `Some(true)` once the message is in the receiver's mailbox,
+    /// `Some(false)` when it could not be queued at all.
+    ///
+    /// `from` is the sending process — the calling process (`c_p`), whose id the C copies into
+    /// the message envelope — already resolved to a [`ProcessId`] by the host.
+    ///
+    /// The C's failure code is **not** the `erlang:send/2` BIF's answer: `erts_proc_lookup` on a
+    /// receiver the runtime has no process for makes `enif_send` answer `0` (`:876-877`), i.e. a
+    /// dead/unknown pid is a reported failure here, where the `!` operator silently drops the
+    /// message and reports success. A non-local (remote or non-pid) destination is the same `0`
+    /// — there is no distribution arm in the C's `enif_send`. The default `None` is "cannot
+    /// answer", which `beam_abi` turns into its own `0`; nothing here ever fabricates a `1`.
+    fn send(&mut self, from: ProcessId, to: Eterm, msg: Eterm) -> Option<bool> {
+        let _ = (from, to, msg);
+        None
+    }
 }
 
 /// The concrete [`NifHostServices`] over a runtime's own reference id space, reference registry
 /// and process table.
 ///
-/// The three fields are **disjoint borrows** of the runtime ([`Runtime::refs`](crate::Runtime) /
-/// `references` / `processes`), so this provider co-exists with the rest of the NIF call's runtime
-/// uses. `processes` is the caller-supplied pass table when the call runs inside a scheduler slice,
-/// else the runtime's own — the same resolution [`RuntimeContext::process_table`] makes.
+/// The two fields are **disjoint borrows**: the runtime itself, and the caller-supplied process
+/// table when the call runs inside a scheduler slice. That table lives outside the runtime (a pass
+/// takes it out before running a process: the runner cannot lend the same table to both a
+/// `&mut Runtime` and its own scheduling state), so it is a field of its own; `None` means "resolve
+/// against the runtime's own [`processes`](crate::Runtime::processes)", the same resolution
+/// [`RuntimeContext::process_table`] makes.
+///
+/// Holding the whole `&mut Runtime` (rather than the four field borrows the hooks used to need) is
+/// what lets [`NifHostServices::send`] build the nested delivery context a `send` requires — a
+/// delivery is the runtime's ordinary [`RuntimeContext::send_message`] path, not a second copier.
 pub(crate) struct RuntimeNifServices<'a> {
-    /// The runtime's **own** reference id space (`erlang:make_ref/0`, the NIF `make_ref`, the
-    /// timers and `seq_trace` draw from it). Monitor/alias references mint from the process
-    /// table's separate allocator; a minted plain reference is recorded in `references` so its
-    /// provenance stays unambiguous.
-    pub(crate) refs: &'a mut RefAllocator,
-    /// The runtime's reference registry; a minted plain reference is recorded here.
-    pub(crate) references: &'a mut HashMap<Eterm, Option<MonitorRef>>,
-    /// The process table a registered name is resolved against.
-    pub(crate) processes: &'a ProcessTable,
-    /// The runtime's port registry — where [`NifHostServices::is_port_alive`] and
-    /// [`NifHostServices::port_command`] are answered (contract A.4).
-    ///
-    /// A `&RefCell` (not `&mut`) so it is a **disjoint** borrow of the runtime that co-exists with
-    /// the other fields; the lock is taken only for the length of one port operation. A nested
-    /// borrow is reported as the "cannot answer" `None`, never a panic.
-    pub(crate) ports: &'a std::cell::RefCell<crate::port::PortRegistry>,
+    /// The runtime the hooks draw on: its reference id space and registry (the NIF `make_ref`), its
+    /// process tables (a name lookup, the liveness answers, a delivery) and its port registry
+    /// (contract A.4).
+    pub(crate) runtime: &'a mut crate::runtime::Runtime,
+    /// The caller-supplied process table, when the NIF call runs inside a scheduler slice.
+    pub(crate) mailbox: Option<&'a mut ProcessTable>,
+}
+
+impl RuntimeNifServices<'_> {
+    /// The process table a registered name, a liveness answer and a delivery resolve against: the
+    /// slice's own table when there is one, else the runtime's.
+    fn processes(&self) -> &ProcessTable {
+        match self.mailbox {
+            Some(ref table) => table,
+            None => &self.runtime.processes,
+        }
+    }
 }
 
 impl NifHostServices for RuntimeNifServices<'_> {
@@ -333,19 +366,18 @@ impl NifHostServices for RuntimeNifServices<'_> {
     /// ([`crate::native::process::RuntimeContext::make_ref_0`]) performs: draw the next id from the
     /// shared allocator, build its term on `heap`, and register it as a plain reference.
     fn make_ref(&mut self, heap: &mut Heap) -> Option<Eterm> {
-        let reference = self.refs.next();
+        let reference = self.runtime.refs.next();
         let term = reference.to_eterm(heap).ok()?;
-        self.references.insert(term, None);
+        self.runtime.references.insert(term, None);
         Some(term)
     }
-
     /// Look `name` up in the process table's local name registry. A non-atom argument never names
     /// a process.
     fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm> {
         if !is_atom(name) {
             return None;
         }
-        Some(self.processes.whereis(atom_val(name))?.to_eterm())
+        Some(self.processes().whereis(atom_val(name))?.to_eterm())
     }
 
     /// The process table's own liveness test — the same relation `erlang:is_process_alive/1`
@@ -353,7 +385,7 @@ impl NifHostServices for RuntimeNifServices<'_> {
     /// [`ProcessTable::is_process_alive`]). The provider holds the table, so it can always answer:
     /// a non-internal-pid term is `Some(false)`.
     fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
-        Some(ProcessId::from_eterm(pid).is_ok_and(|pid| self.processes.is_process_alive(pid)))
+        Some(ProcessId::from_eterm(pid).is_ok_and(|pid| self.processes().is_process_alive(pid)))
     }
 
     /// The port registry's own liveness test — the relation
@@ -364,7 +396,7 @@ impl NifHostServices for RuntimeNifServices<'_> {
         let Ok(id) = beam_process::PortId::from_eterm(port) else {
             return Some(false);
         };
-        let registry = self.ports.try_borrow().ok()?;
+        let registry = self.runtime.ports.try_borrow().ok()?;
         Some(registry.is_live(id))
     }
 
@@ -384,8 +416,27 @@ impl NifHostServices for RuntimeNifServices<'_> {
         if crate::native::port::iodata_bytes(data, &mut bytes).is_err() {
             return Some(false);
         }
-        let mut registry = self.ports.try_borrow_mut().ok()?;
+        let mut registry = self.runtime.ports.try_borrow_mut().ok()?;
         Some(registry.write_command(id, &bytes).is_ok())
+    }
+
+    /// Delivers `msg` to `to` as `from` — the C's `enif_send` (`erl_nif.c:860-1093`) — through the
+    /// runtime's **own** send seam, so the message is copied into the receiver's heap by
+    /// `beam_message`'s copier, enqueued in its mailbox, and a receiver blocked in `receive` is
+    /// resumed by the scheduler's wake list, exactly as for a compiled `!` or `erlang:send/2`.
+    ///
+    /// The answer is the C's own pair: `Some(true)` once the message is queued, `Some(false)` when
+    /// there is no local process for `to` (`:876-877`) or the delivery itself failed. A remote pid
+    /// is `Some(false)` too — the C's `enif_send` has no distribution arm.
+    fn send(&mut self, from: ProcessId, to: Eterm, msg: Eterm) -> Option<bool> {
+        let RuntimeNifServices { runtime, mailbox } = self;
+        Some(crate::context::nif_send::deliver(
+            runtime,
+            mailbox.as_deref_mut(),
+            from,
+            to,
+            msg,
+        ))
     }
 }
 
@@ -842,7 +893,20 @@ impl NifHost for NifHostImpl<'_> {
         self.services.as_mut()?.port_command(port, data)
     }
 
-    /// `enif_is_current_process_alive(env)` — whether **this host's** process is still alive.
+    /// `enif_send(env, &to, msg_env, msg)` — queue `msg` in the mailbox of the process `to`.
+    ///
+    /// The sender resolution (the C's `c_p`, or the ABI's `from` override) and the whole
+    /// rationale live in [`crate::nif_send`]; the delivery itself is the borrowed
+    /// [`NifHostServices`] provider's, which runs the runtime's own send seam
+    /// (`beam_message`'s copier into the receiver's heap, the mailbox enqueue and the
+    /// resume-on-send wake). `Some(true)` once the message is queued, `Some(false)` when it is not
+    /// (the C's `!rp` for a pid with no process is the `false`, **not** the `erlang:send/2` BIF's
+    /// silent-drop-and-report-success), and the trait default `None` with no provider (the
+    /// load/unload host) — never a fabricated `1`.
+    fn send(&mut self, to: Eterm, from: Option<Eterm>, msg: Eterm) -> Option<bool> {
+        let sender = crate::nif_send::sender_pid(self.self_pid, from)?;
+        self.services.as_mut()?.send(sender, to, msg)
+    }    /// `enif_is_current_process_alive(env)` — whether **this host's** process is still alive.
     ///
     /// The C asks the calling process's own PCB, `!ERTS_PROC_IS_EXITING(c_p)` (`erl_nif.c:2319`),
     /// which it can reach only on a scheduler thread holding a process and otherwise *aborts the
@@ -1040,14 +1104,13 @@ mod tests {
         )
     }
 
-    /// The [`RuntimeNifServices`] provider over a real runtime — the three disjoint field borrows
-    /// [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext) builds.
+    /// The [`RuntimeNifServices`] provider over a real runtime — the two disjoint borrows
+    /// [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext) builds (the runtime, and
+    /// the pass's own process table when there is one).
     fn services_of(runtime: &mut crate::Runtime) -> RuntimeNifServices<'_> {
         RuntimeNifServices {
-            refs: &mut runtime.refs,
-            references: &mut runtime.references,
-            processes: &runtime.processes,
-            ports: &runtime.ports,
+            runtime,
+            mailbox: None,
         }
     }
 
@@ -1984,6 +2047,73 @@ mod tests {
         }
     }
 
+    /// [`NifHostServices::send`] runs the runtime's own delivery: a message to a **live** process
+    /// is queued in its mailbox and answers the C's `1`; a pid with no process answers the C's `0`
+    /// (`erl_nif.c:876-877` — the `enif_send` failure code, *not* the `!` operator's silent drop);
+    /// a term that names no process at all answers `0` too.
+    ///
+    /// The message's arrival is checked by reading it back through the mailbox scan
+    /// ([`ExecutionContext::receive_next`](beam_engine::ExecutionContext::receive_next)), so this
+    /// pins the *delivery*, not just the hook's return value. The host half — the `from`
+    /// resolution and the provider-less answer — is pinned by
+    /// [`the_load_host_cannot_send_and_never_fabricates_a_delivery`] and end to end by
+    /// `tests/nif_send.rs`.
+    #[test]
+    fn runtime_services_deliver_a_message_and_answer_the_c_engines_codes() {
+        let mut runtime = crate::Runtime::with_defaults().expect("the default runtime");
+        let root = runtime.self_pid();
+        let message = make_small(4242);
+        {
+            let mut services = services_of(&mut runtime);
+            assert_eq!(
+                services.send(root, root.to_eterm(), message),
+                Some(true),
+                "a message to a live process is queued"
+            );
+            assert_eq!(
+                services.send(root, ProcessId::new(999_999, 0).to_eterm(), message),
+                Some(false),
+                "a pid with no process is the C's not-sent"
+            );
+            assert_eq!(
+                services.send(root, make_small(1), message),
+                Some(false),
+                "a term that names no process is not sent"
+            );
+        }
+        // The one accepted delivery is really in the root process's mailbox, byte for byte.
+        let mut context = crate::context::RuntimeContext::new(&mut runtime);
+        assert_eq!(
+            beam_engine::ExecutionContext::receive_next(&mut context)
+                .expect("the mailbox scan answers"),
+            Some(message),
+            "the message the provider queued is the one the mailbox holds"
+        );
+        // `receive_next` peeks (the compiled receive's `loop_rec`), so the scan has to advance past
+        // the match before the mailbox can be seen to be empty.
+        beam_engine::ExecutionContext::receive_skip(&mut context).expect("the scan advances");
+        assert_eq!(
+            beam_engine::ExecutionContext::receive_next(&mut context)
+                .expect("the mailbox scan answers"),
+            None,
+            "the two refused sends queued nothing"
+        );
+    }
+
+    /// The **load/unload** host carries no provider (`services = None`, built by
+    /// [`NifBridge::load_nif`](crate::context::bridges::NifBridge)), so `enif_send` from a
+    /// `load`/`upgrade`/`dtor` callback answers the ABI's `0` — the C's answer for a call with no
+    /// process (`env->proc == NULL`) is not reproduced, but nothing is fabricated either.
+    #[test]
+    fn the_load_host_cannot_send_and_never_fabricates_a_delivery() {
+        let (mut host, _, _) = host_with(&[]);
+        let target = ProcessId::new(1, 0).to_eterm();
+        assert_eq!(
+            NifHost::send(&mut host, target, None, make_small(1)),
+            None,
+            "a host with no provider reports the trait default, never a delivery"
+        );
+    }
     /// The oracle's `erlang:is_process_alive/1` answers the **same relation** the provider answers
     /// (`!!erts_proc_lookup`, `erl_nif.c:2330`; `is_process_alive_1`, `erl_bif_info.c:4069`): a live
     /// process is `true`, a terminated one `false`. Skips **loudly** without the toolchain.

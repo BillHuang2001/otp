@@ -89,6 +89,7 @@ pub mod info;
 mod mailbox;
 mod native;
 mod nif;
+mod nif_send;
 pub mod perf_map;
 pub mod port;
 pub mod runtime;

@@ -50,6 +50,8 @@
 //!   scheduled process is running to re-home it.
 //! * [`send`] — the send/deliver family, the mailbox scan surface and the alias-aware send
 //!   destination.
+//! * [`nif_send`] — the delivery behind `enif_send` (contract A.3): the nested context a NIF's
+//!   message is queued through, which is the runtime's own send seam.
 //! * [`apply`] — fun application ([`LocalFunTarget`], `local_fun_target`,
 //!   `apply_non_local_fun`) and the callee-admission predicates behind the in-machine
 //!   cross-module seam.
@@ -87,6 +89,8 @@ mod runtime_hooks;
 mod send;
 mod signal;
 mod trace;
+
+pub(crate) mod nif_send;
 
 #[cfg(test)]
 pub(crate) mod test_support;
