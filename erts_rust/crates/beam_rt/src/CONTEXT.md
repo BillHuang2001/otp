@@ -88,14 +88,21 @@ Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, sa
   (`scheduler.rs:581`). The `run` route only survives an idle `receive` because the live `inet_gethost`
   port keeps `has_nothing_to_poll()` false; without it a long-lived server node would exit
   `unsupported: run: process blocked`, and `RUN_DEADLINE` (60 s) bounds that route anyway.
-- **This runtime is a HIDDEN node to real peers.** The acceptor advertises
-  `preferred_flags()` (`dist.rs:273` → `ConnectionDriver::server` →
-  `beam_dist::handshake::preferred_flags`, the emulator's `erts_dflags.default`), which omits
-  `DFLAG_PUBLISHED` (`0x01`); a real node adds that bit per peer
-  (`lib/kernel/src/dist_util.erl:152-160`). Observed: a peer's `nodes()` is `[]` while
-  `nodes(hidden)`/`nodes(connected)` list this node, where oracle-vs-oracle `ping` puts the peer in
-  `nodes()`. `ConnectionDriver::server_with_flags(…, preferred_flags() | publish_flag(false, true))` (and
-  the client constructor) is the published form, to be used unless the node is started `-hidden`.
+- **This node is PUBLISHED to real peers (and `-hidden` is honoured).** Both distribution halves
+  advertise `dist.rs::advertised_flags(hidden)` — the emulator default
+  (`beam_dist::handshake::preferred_flags`, `erts_dflags.default`) **OR**
+  `beam_dist::handshake::publish_flag(hidden, true)`, i.e. `DFLAG_PUBLISHED` (`0x01`) unless the node
+  was started `-hidden` (a real node adds that bit per peer, `lib/kernel/src/dist_util.erl:152-160`;
+  `net_kernel.erl:hidden_argument/0` reads the `-hidden` init argument). The acceptor
+  (`DistConnection::new` → `ConnectionDriver::server_with_flags`) and the connector
+  (`dist_client.rs::connect_addr` → `ConnectionDriver::client_with_flags`) are told the same value by
+  `Runtime::new` through the additive `DistNode::set_hidden`/`DistClient::set_hidden`, since visibility
+  is a property of the node, not of who dialled. Measured against an OTP 29.1.1 peer: a pinged
+  **published** node now appears in the peer's `nodes()` (`[pubprobe@billmini]`, was `[]`), a pinged
+  `-hidden` node appears only in `nodes(hidden)`/`nodes(connected)`, and a **dialled** link
+  (`net_adm:ping/1` driven from inside this runtime) puts this node in the peer's `nodes()` too. A
+  hidden *peer* stays recorded-not-refused (`DistConnection::peer_visibility`,
+  `a_hidden_and_a_published_peer_both_establish_and_are_recorded`).
 
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's own test region — everything from its first test-module declaration to EOF, whether that declaration opens an inline module or a sibling `#[path]` one).
