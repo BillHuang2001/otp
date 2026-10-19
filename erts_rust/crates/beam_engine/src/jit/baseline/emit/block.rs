@@ -55,7 +55,7 @@ use super::aggregate::{
 use super::arith::try_inline_gc_bif;
 use super::bif::try_inline_bif;
 use super::compare::try_inline_comparison;
-use super::family;
+use super::family::{self, emit_bs_match};
 use super::frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use super::heap::{emit_allocate, emit_allocate_heap, emit_test_heap, emit_trim};
 use super::link::{emit_frame_teardown, emit_in_block_call, ExitSpill, Linker};
@@ -63,6 +63,7 @@ use super::operands;
 use super::prologue::emit_block_prologue;
 use super::r#move::{try_inline_move, try_inline_swap};
 use super::select::try_inline_select_val;
+use super::super::bitstr;
 use super::super::call::{jit_call_store, jit_call_store_linked, CALL_STORED};
 use super::super::receive::jit_receive;
 use super::super::runtime::{
@@ -879,6 +880,17 @@ pub(crate) fn emit_block(
             | Instr::WaitTimeout { .. }
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
+            // The **hot `bs_match` shape** — a compile-time `ensure_at_least` skip followed by
+            // a `integer` read of a constant size/unit into a register, which is one executed
+            // instance per element of a binary comprehension / fixed-field decoder. The
+            // emitter already knows the variant here, so the specialised helper calls the
+            // bitstring family's own body **directly** instead of routing through
+            // [`crate::families::dispatch`]'s variant match (see [`super::super::bitstr`]).
+            // Any other `bs_match` command list falls through to the generic family arm below,
+            // which is the same emission over the same family body.
+            Instr::BsMatch { .. } if bitstr::supported(instr) => {
+                emit_bs_match(buffer, allocation, done, func, pc)?
+            }
             // The **whole family-owned surface** the interpreter's `other` arm hands to
             // [`crate::families::dispatch`] — every variant [`crate::families::dispatch`]
             // claims and the interpreter's core arms above do **not** (the tuples/list

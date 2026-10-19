@@ -31,6 +31,7 @@ use beam_common::Result;
 
 use crate::jit::emitter::{CodeBuffer, Label as CodeLabel};
 
+use super::super::bitstr::jit_bs_match;
 use super::super::family::jit_family;
 use super::super::runtime::StepHelper;
 use super::{emit_continue_check, emit_helper_call, Allocation};
@@ -63,6 +64,33 @@ pub(super) fn emit_family(
     pc: u32,
 ) -> Result<()> {
     let helper: StepHelper = jit_family;
+    emit_helper_call(
+        buffer,
+        allocation,
+        helper as *const (),
+        &[i64::from(func), i64::from(pc)],
+    pc)?;
+    emit_continue_check(buffer, done, allocation, func, pc)
+}
+
+/// Emit the native arm for the **one `bs_match` shape worth specialising**: the
+/// [`jit_bs_match`](super::super::bitstr::jit_bs_match) helper followed by the same
+/// continuation check a deopt uses.
+///
+/// The emitted sequence is byte-for-byte [`emit_family`]'s — spill, call, continuation
+/// check — because the only thing the specialisation removes is the *routing* hop inside the
+/// helper (`crate::families::dispatch`'s variant match), not any emitted code. Keeping the
+/// two emissions identical is what makes the two helpers interchangeable for every other
+/// purpose: a shape this arm does not claim keeps the generic family arm, and both reach the
+/// same bitstring family body.
+pub(super) fn emit_bs_match(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+) -> Result<()> {
+    let helper: StepHelper = jit_bs_match;
     emit_helper_call(
         buffer,
         allocation,
