@@ -4,7 +4,7 @@ The runtime side of contract A.4.
 `port.rs` is the **port provider**: `open_port/2`'s `Name`/`Options` decoding, the `PortRegistry`, the port-task round, the `{Port,{data,..}}` pump behind `beam_io`.
 Each child owns one post-`open_port/2` fact over the one `PortExtras` side table: `ops.rs` the table-entry operations, `exit.rs` the `'EXIT'`/`'DOWN'` a close owes, `failure.rs` the driver's own close request, `info_extras.rs` the derived `port_info/2` items.
 Four are driver→owner channels: `completion.rs` (`{inet_reply,…}`/`{inet_async,…}`, what makes `prim_inet:send/4` return), `active_input.rs` (`{tcp,…}`/`{udp,…}`/`{tcp_passive,…}`), `peer_closed.rs` (`{tcp_closed,S}`), `inet_opts.rs` (the per-port `mode`/`active`/`exit_on_close` mirror).
-`driver.rs` is this runtime's **own** driver C-ABI host for `{spawn_driver,Name}` ports over `beam_abi`'s frozen `DriverHost` seam; `watch.rs`/`tty.rs` deliver `os:set_signal/2` and `prim_tty:tty_select/2`'s `enif_select` interest.
+`driver.rs` is this runtime's **own** driver C-ABI host for `{spawn_driver,Name}` ports over `beam_abi`'s frozen `DriverHost` seam (`driver/`); `watch.rs` delivers `os:set_signal/2` and `select.rs` the `prim_tty:tty_select/2` interest, the special case of its `enif_select` store (`select/`).
 **Separate** from `beam_io`'s own host layer (`beam_io::abi`), so end-to-end `.so`-driver traffic goes through this tree.
 ## API Surface
 ### `port.rs` — the `PortHook` provider (A.4)
@@ -160,7 +160,7 @@ The largest wall-clock cost this layer can impose on a CLI start-up is **not wor
 - `failure.rs` → `signal_reason`, `drain_failures`/`fail_port`, the ready-queue publication; `completion.rs` → `CompletionPacket`/`ClosedPortSnapshot`, `drain_io_completions`, `adopt_accepted` + `discard_descriptor`, the reply/async/caller-tag builders, and `accept_inherit_tests.rs`.
 - `peer_closed.rs` → the latches, the latch registry ops, `deliver_peer_closes`/`retire_peer_closed_port`, `poll_peer_closes`/`peer_close_message`, the `inet_active`/`inet_exit_on_close` gates.
 - `active_input.rs` → `ActiveInputPacket`, `drain_active_inputs`, `decode_packed_address`, the three builders, declared as `crate::port::ops::active_input`.
-- `driver.rs` → the driver C-ABI host and its `beam_io::Driver` lifecycle, with `driver/state.rs` (the `prt->ioq` byte queue) and `driver/monitor.rs` (the monitor tree) in the driver node — [`driver/CONTEXT.md`](driver/CONTEXT.md); `watch.rs`/`tty.rs` → the `os:set_signal/2` and `prim_tty:tty_select/2` delivery halves.
+- `driver.rs` → the driver C-ABI host and its `beam_io::Driver` lifecycle, with `driver/state.rs` (the `prt->ioq` byte queue) and `driver/monitor.rs` (the monitor tree) in the driver node — [`driver/CONTEXT.md`](driver/CONTEXT.md); `watch.rs` → the `os:set_signal/2` delivery half (`prim_tty:tty_select/2`'s is `select.rs`'s, above).
 - `select.rs`/`select/tests.rs` → the runtime's **one** select mechanism — [`select/CONTEXT.md`](select/CONTEXT.md).
 - Test suites live in the `*_tests.rs` siblings named in *Test Strategy*; `test_support.rs` holds the provider's fixtures.
 - `../native/port.rs` → the port BIF floor; `../context/signal.rs` → the `os:set_signal/2` answer surface; `../context/runtime_hooks.rs`/`../context/process_bridge.rs` → the `port_set_data`/`port_get_data`/`erts_internal:port_connect` bridge and the name registry; `../context/` installs `RuntimePorts` as the `PortHook`.
