@@ -64,6 +64,15 @@
 //! `(a)` the count is read **after** those parks, and it moves `0` → `1` across them —
 //! which is what makes the pin real rather than accidental.
 //!
+//! # The second site: the `-eval` statement boundary
+//!
+//! The `-eval` action process is **never enqueued**, so it never parks and the park arm above can
+//! never serve it; without a second site an `-eval`-only run would retain every resource term it
+//! ever minted. [`the_eval_statement_boundary_keeps_the_resource_table_bounded`] is that site's
+//! pin and [`without_the_resource_prune_the_eval_route_is_linear`] its A/B control; both drive the
+//! `-eval` route **in process** (`Runtime::eval`), because the figures that make the claim
+//! falsifiable (`Runtime::resource_prune_stats()`) are runtime state rather than observable
+//! output.//!
 //! # Everything here is real
 //!
 //! The C fixture (`tests/fixtures/nif_resource_gc.c`) is compiled at test time with the
@@ -589,5 +598,429 @@ fn a_never_exported_resource_runs_its_destructor_without_the_prune() {
         return;
     };
     assert_matches(&observed, "unexported", "{0,1}");
+    fixture.cleanup();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The `-eval` route's statement boundary — the second, NON-park cadence site
+// ---------------------------------------------------------------------------------------------
+//
+// Everything above drives a **scheduled** process (`run <beam> ...`), which parks at its slice
+// boundaries; that park arm is where `context::gc::resources` reclaims. The `-eval` **action
+// process is never enqueued**, so it never parks: without a second site an `-eval`-only run would
+// retain every resource term it ever minted for the runtime's life. That site is the top-level
+// statement boundary of `Evaluator::run_top_level`
+// (`src/eval/mod.rs` → `reclaim::prune_at_statement_boundary`), and the two legs below are its pin
+// and its A/B control.
+//
+// The `-eval` route is driven **in process** (`Runtime::eval`) rather than through the binary,
+// because the figures that make the claim falsifiable — `Runtime::resource_prune_stats()` — are
+// runtime state, not observable output. Neither figure is a differential one: the oracle refcounts
+// resource terms straight off its process heap, so it has no counterpart for a frontier, a release
+// count or a live-term table (which is why no leg below compares against `erl`).
+
+use std::sync::Mutex;
+
+use beam_rt::config::RuntimeConfig;
+use beam_rt::runtime::Runtime;
+
+/// The mint counts the sweep drives.
+///
+/// 1 000 is included on purpose: the claim under test is that the resource table is **flat in N**,
+/// and it takes a hundred-fold step for a linear table to be unmistakable.
+const EVAL_SWEEP: [usize; 3] = [10, 100, 1_000];
+
+/// Serialises the two in-process legs, and the reason is not politeness: `beam_abi`'s resource-term
+/// registry is **process-global** (`beam_abi::nif::enif::resources::resource_terms`, one
+/// `OnceLock<Mutex<…>>`), so two legs running concurrently in this test binary would each see the
+/// other's minted terms in `live_terms` and in the frontier snapshot.
+static EVAL_LEG: Mutex<()> = Mutex::new(());
+
+/// One measured leg of the sweep.
+///
+/// `live_before`/`live_after` are **deltas by construction**: the registry is process-global, so a
+/// leg measures its own growth (`live_after - live_before`) instead of assuming an empty table.
+#[derive(Debug, Clone, Copy)]
+struct LegSample {
+    /// How many resource terms the expression minted.
+    mints: usize,
+    /// The fixture's own destructor counter, read as `dtor_count() after - dtor_count() before`.
+    dtors: u64,
+    /// `erlang:memory(total)` at the end of the leg, in bytes.
+    total_bytes: u64,
+    /// `ResourcePruneStats::live_terms` before the expression.
+    live_before: usize,
+    /// ... and after it.
+    live_after: usize,
+    /// `ResourcePruneStats::released` (this runtime only, so it starts at `0`).
+    released: u64,
+    /// `ResourcePruneStats::prunes`.
+    prunes: u64,
+    /// `ResourcePruneStats::declines`.
+    declines: u64,
+}
+
+impl LegSample {
+    /// The table growth this leg caused.
+    fn growth(&self) -> usize {
+        self.live_after.saturating_sub(self.live_before)
+    }
+}
+
+/// Prints one leg, so a failure (and the reported measurement table) is diagnosable from the log.
+fn report_legs(label: &str, series: &[LegSample]) {
+    for leg in series {
+        println!(
+            "nif_resource_gc/eval {label}: mints={} dtors={} released={} prunes={} declines={} \
+             live={}->{} (growth {}) memory_total={}B",
+            leg.mints,
+            leg.dtors,
+            leg.released,
+            leg.prunes,
+            leg.declines,
+            leg.live_before,
+            leg.live_after,
+            leg.growth(),
+            leg.total_bytes,
+        );
+    }
+}
+
+/// The `-eval` expression: load the library, take the destructor counter's baseline, then
+/// **discard** one minted resource term per statement, and finally report the destructor delta and
+/// the runtime's total memory.
+///
+/// Each minting statement must leave its term un-rooted by the time the statement boundary runs,
+/// which is why it is `erlang:length([probe()])` — the statement's **value** is a small integer.
+/// A bare `probe()` would not do, and neither would a bound variable: both the evaluator's
+/// environment (a bound variable) and the reduced value of the statement just finished are handed
+/// to the prune as roots, so either shape is *correctly* retained — and the pin would then measure
+/// the root set instead of the table.
+///
+/// The load path is double-quoted so the parser builds a char list, which is what
+/// `erlang:load_nif/2` accepts (and what the fixture's `init/1` receives here).
+fn eval_sweep_expression(fixture: &Fixture, mints: usize) -> String {
+    let mut parts = vec![
+        format!(
+            "nif_resource_gc:init(\"{}\")",
+            fixture.load_path().display()
+        ),
+        "D0 = nif_resource_gc:dtor_count()".to_string(),
+    ];
+    for _ in 0..mints {
+        parts.push("erlang:length([nif_resource_gc:probe()])".to_string());
+    }
+    parts.push("{nif_resource_gc:dtor_count() - D0, erlang:memory(total)}".to_string());
+    parts.join(", ")
+}
+
+/// Reads a `{A,B}` 2-tuple off the `~w` printer's output.
+fn parse_pair(text: &str) -> (u64, u64) {
+    let trimmed = text.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or_else(|| panic!("the witness must print a 2-tuple, got {text:?}"));
+    let (left, right) = inner
+        .split_once(',')
+        .unwrap_or_else(|| panic!("the witness must print a 2-tuple, got {text:?}"));
+    let parse = |field: &str| {
+        field
+            .trim()
+            .parse::<u64>()
+            .unwrap_or_else(|error| panic!("unparsable witness field {field:?} in {text:?}: {error}"))
+    };
+    (parse(left), parse(right))
+}
+
+/// Drives one leg: one `-eval` expression of `mints` mint-and-discard statements on `runtime`.
+///
+/// Both sweeps below run their legs on **one** runtime rather than a fresh one per leg, and the
+/// reason is a measured property of the ABI's registry, not convenience: a NIF result is built on
+/// the running call's pooled BIF heap, so a *fresh* `Runtime` mints at the same words its
+/// predecessor did — and `Registry::bind_term` **evicts** a binding whose word the new mint now
+/// occupies ("a reused address evicts a dead mint", `beam_abi`'s resources module). Across two
+/// runtimes that eviction destroys the earlier runtime's still-live terms, which would put
+/// destructor runs into the *other* leg's counter. Within one runtime every mint gets its own word
+/// (a NIF result is not rewound onto the pool), so a leg's figures are its own.
+fn drive_eval_leg(runtime: &mut Runtime, fixture: &Fixture, mints: usize) -> LegSample {
+    let before = runtime.resource_prune_stats();
+    let expression = eval_sweep_expression(fixture, mints);
+    let value = runtime
+        .eval(&expression)
+        .unwrap_or_else(|error| panic!("the {mints}-mint eval leg failed: {error:?}"));
+    let text = runtime
+        .format_term_w(value, None)
+        .expect("the witness formats");
+    let stats = runtime.resource_prune_stats();
+    let (dtors, total_bytes) = parse_pair(&text);
+    LegSample {
+        mints,
+        dtors,
+        total_bytes,
+        live_before: before.live_terms,
+        live_after: stats.live_terms,
+        released: stats.released,
+        prunes: stats.prunes,
+        declines: stats.declines,
+    }
+}
+
+/// A fresh `-eval` runtime over the fixture directory, with the resource prune set to `enabled`.
+fn eval_runtime(fixture: &Fixture, enabled: bool) -> Runtime {
+    let config = RuntimeConfig::default().with_code_paths(vec![fixture.dir.clone()]);
+    let mut runtime = Runtime::new(config).expect("the eval runtime");
+    runtime.set_resource_prune_enabled(enabled);
+    runtime
+}
+
+/// How many resource terms the **process-global** registry holds right now, through the public
+/// runtime view.
+///
+/// Both `-eval` legs below need this to be `0` before they start, and the reason is a measured
+/// property of the ABI's registry rather than a preference: a resource term's mint block stands on
+/// the running call's pooled BIF heap, so a *fresh* `Runtime` in the same process mints at the very
+/// words its predecessor did — and `Registry::bind_term` evicts a binding whose word the new mint
+/// takes over ("a reused address evicts a dead mint"). With a dirty registry the reuse is
+/// **word-for-word**, so the frontier's candidate set is identical at every boundary, gate 2
+/// (`now == frontier`) defers every prune, and the leg would measure the *previous* leg's state
+/// instead of its own. Each leg therefore runs in its own process: this suite's other tests drive
+/// the built binary (a subprocess), so a plain `cargo test` run starts clean, and the control leg is
+/// `#[ignore]`d so it can never run beside this one.
+fn live_resource_terms() -> usize {
+    Runtime::new(RuntimeConfig::default())
+        .expect("the probe runtime")
+        .resource_prune_stats()
+        .live_terms
+}
+
+/// The host's load average, printed with the measurement (this host is shared, so a wall-time
+/// figure would be meaningless while a deterministic counter is not).
+fn load_average() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .map(|text| text.trim().to_string())
+        .unwrap_or_else(|error| format!("unavailable ({error})"))
+}
+
+/// **THE CADENCE PIN.** An `-eval`-only run that mints and drops `N` resource terms must leave the
+/// resource table **bounded (flat in N)**, not linear.
+///
+/// Asserted per leg, for `N` ∈ [`EVAL_SWEEP`] (the sweep runs on **one** runtime, so `released` and
+/// `prunes` are asserted against the cumulative mint count):
+///
+/// * `dtors == N` — the fixture's own destructor counter, taken as a delta, so it is **exactly** one
+///   destructor run per minted-and-dropped term. No residual constant is needed here: the very first
+///   statement boundary of the run follows `nif_resource_gc:init/1`, which mints nothing, so the
+///   frontier records an empty candidate set and is already correct by the first mint (the
+///   one-statement leak the design documents is *zero* in this shape rather than one term);
+/// * `released == ΣN` and `prunes == ΣN` — one walk per minting statement, releasing exactly that
+///   statement's mint — and `declines == 0`, so no walk was refused;
+/// * `live_after <= live_before` — the table does not grow by a single entry, which is the "bounded"
+///   half stated on the table itself;
+/// * the sweep's own comparison: the table after `1 110` mints is no larger than it was after the
+///   first `10` (a linear table answers `1 110` there);
+/// * `erlang:memory(total)` is printed, never asserted. Measured: it does **not** move either way
+///   (`19 107` B after the first leg, `19 121` B after the last, in both legs) — a resource term's
+///   object is a host `malloc` outside every runtime allocator, so this figure cannot see the table
+///   and is not evidence either way.
+///
+/// # Measured (debug build, shared host, `loadavg` ≈ 36 at run time)
+///
+/// | mints (cumulative) | dtors | released | prunes | declines | live terms |
+/// |---|---|---|---|---|---|
+/// | 10 | 10 | 10 | 10 | 0 | 0 → 0 |
+/// | 100 (110) | 100 | 110 | 110 | 0 | 0 → 0 |
+/// | 1 000 (1 110) | 1 000 | 1 110 | 1 110 | 0 | 0 → 0 |
+///
+/// # The revert evidence
+///
+/// With the boundary call reverted (both `self.prune_resources(env, …)` lines in
+/// `src/eval/mod.rs::run_top_level` commented out) this test fails at its **first** assertion, with
+/// the table growing linearly instead:
+///
+/// ```text
+/// mints=10   dtors=0    released=0   prunes=0   declines=0 live=0->10    (growth 10)
+/// mints=100  dtors=0    released=0   prunes=0   declines=0 live=10->110  (growth 100)
+/// mints=1000 dtors=0    released=0   prunes=0   declines=0 live=110->1110 (growth 1000)
+/// left: 0, right: 10   ("every minted-and-dropped resource term must run its destructor …")
+/// ```
+///
+/// — i.e. exactly the pre-fix shape the site exists to remove, and identical to the control leg
+/// below, which is what makes that leg a meaningful negative control.
+#[test]
+fn the_eval_statement_boundary_keeps_the_resource_table_bounded() {
+    let dirty = live_resource_terms();
+    if dirty > 0 {
+        skip(&format!(
+            "the process-global NIF-resource registry already holds {dirty} term(s): the -eval \
+             legs must not share a process (run the `#[ignore]`d control leg with `--ignored` \
+             instead of `--include-ignored`)"
+        ));
+        return;
+    }
+    let Some(fixture) = build_fixture("eval_cadence") else {
+        return;
+    };
+    let _serialised = EVAL_LEG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    println!("nif_resource_gc/eval reclaim-on loadavg={}", load_average());
+    // ONE runtime for the whole sweep (see [`drive_eval_leg`]).
+    let mut runtime = eval_runtime(&fixture, true);
+    let mut series = Vec::with_capacity(EVAL_SWEEP.len());
+    for mints in EVAL_SWEEP {
+        series.push(drive_eval_leg(&mut runtime, &fixture, mints));
+    }
+    report_legs("reclaim-on", &series);
+    let mut cumulative = 0usize;
+    for leg in &series {
+        cumulative += leg.mints;
+        assert_eq!(
+            leg.dtors, leg.mints as u64,
+            "every minted-and-dropped resource term must run its destructor at the next statement \
+             boundary ({} mints): {leg:?}",
+            leg.mints
+        );
+        assert_eq!(
+            leg.released, cumulative as u64,
+            "the boundary must have released exactly the {cumulative} terms the sweep has minted \
+             so far: {leg:?}"
+        );
+        assert_eq!(
+            leg.prunes, cumulative as u64,
+            "one walk per minting statement ({cumulative} so far): {leg:?}"
+        );
+        assert_eq!(
+            leg.declines, 0,
+            "this root graph is fully walkable, so a declined walk would be a bug: {leg:?}"
+        );
+        assert!(
+            leg.live_after <= leg.live_before,
+            "the resource table must not grow ({} mints left {} live term(s) behind: {} -> {}): \
+             {leg:?}",
+            leg.mints,
+            leg.growth(),
+            leg.live_before,
+            leg.live_after
+        );
+    }
+    // Flat in N, stated as the sweep's own comparison: the table after a hundred-fold more mints may
+    // not be larger than it was after the smallest step (a linear table would answer 1 110 here).
+    let early_peak = series
+        .iter()
+        .take(2)
+        .map(|leg| leg.live_after)
+        .max()
+        .unwrap_or(0);
+    let large = series.last().copied().expect("the sweep has a last leg");
+    assert!(
+        large.live_after <= early_peak,
+        "the table drifted upward across the sweep: {} live term(s) after {} mints vs an early \
+         peak of {early_peak}",
+        large.live_after,
+        cumulative
+    );
+    fixture.cleanup();
+}
+
+/// The A/B control for the pin above: **the same sweep** with the reclaim switched off
+/// (`Runtime::set_resource_prune_enabled(false)`) retains one resource term per mint, so the table
+/// is **linear in N**.
+///
+/// This is a positive assertion about the control, not a shipped dependence on a defect: it is what
+/// makes [`the_eval_statement_boundary_keeps_the_resource_table_bounded`] falsifiable, exactly as
+/// `tests/eval_off_heap_reclaim.rs`'s `without_the_reclaim_the_same_loop_is_linear` does for the refc
+/// half. With the mechanism off, nothing is observed, so no frontier is recorded, no walk runs and
+/// no destructor is run by it.
+///
+/// # Measured
+///
+/// Debug build on a shared host; the figures below are this leg's own printed lines from a green
+/// run (`resource_prune_stats()` is per-runtime, so `released`/`prunes` start at `0`; `live` is the
+/// process-global registry's size, so it is reported as the cumulative figure the sweep produces):
+///
+/// | mints (cumulative) | dtors | released | prunes | live terms (cumulative) |
+/// |---|---|---|---|---|
+/// | 10 | 0 | 0 | 0 | 10 |
+/// | 100 (110) | 0 | 0 | 0 | 110 |
+/// | 1 000 (1 110) | 0 | 0 | 0 | 1 110 |
+///
+/// So the control's table is **exactly linear**: one entry per mint, never released. `erlang:memory
+/// (total)` is printed beside it and deliberately not asserted — it is an arena figure (the pooled
+/// BIF heap a NIF result is built on is not rewound after a NIF call), not a table figure.
+///
+/// # Why this leg is `#[ignore]`d
+///
+/// It leaves its `1 110` minted terms **live** in the process-global registry (that is the whole
+/// point of the control), and a live set with those exact words is precisely what silences the pin
+/// above if the two legs share a process (`Registry::bind_term` evicts a binding whose word a new
+/// mint takes over, so the frontier's candidate set would stop changing). Neither leg is therefore
+/// allowed to run beside the other:
+///
+/// ```text
+/// cargo test --manifest-path erts_rust/Cargo.toml -p beam_rt --test nif_resource_gc            # the pin
+/// cargo test --manifest-path erts_rust/Cargo.toml -p beam_rt --test nif_resource_gc -- --ignored --nocapture   # this control
+/// ```
+///
+/// A plain `cargo test` run selects the pin and not this leg; `--ignored` selects only this leg. The
+/// dirty-registry guard below turns the one remaining combination (`--include-ignored`) into a loud
+/// skip instead of a wrong figure.
+#[test]
+#[ignore = "leaves its minted terms live; run alone with --ignored (see the docs)"]
+fn without_the_resource_prune_the_eval_route_is_linear() {
+    let dirty = live_resource_terms();
+    if dirty > 0 {
+        skip(&format!(
+            "the process-global NIF-resource registry already holds {dirty} term(s): this control \
+             needs its own process (run it alone with `--ignored --exact`)"
+        ));
+        return;
+    }
+    let Some(fixture) = build_fixture("eval_control") else {
+        return;
+    };
+    let _serialised = EVAL_LEG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    println!("nif_resource_gc/eval reclaim-off loadavg={}", load_average());
+    // ONE runtime for the whole sweep (see [`drive_eval_leg`]), so the legs cannot evict each
+    // other's mints and every retained term is this control's own.
+    let mut runtime = eval_runtime(&fixture, false);
+    let mut series = Vec::with_capacity(EVAL_SWEEP.len());
+    for mints in EVAL_SWEEP {
+        series.push(drive_eval_leg(&mut runtime, &fixture, mints));
+    }
+    report_legs("reclaim-off", &series);
+    let mut cumulative = 0usize;
+    for leg in &series {
+        cumulative += leg.mints;
+        assert_eq!(
+            leg.dtors, 0,
+            "with the reclaim switched off nothing is released, so no destructor runs ({} mints, \
+             {cumulative} so far): {leg:?}",
+            leg.mints
+        );
+        assert_eq!(leg.released, 0, "nothing may be released: {leg:?}");
+        assert_eq!(leg.prunes, 0, "no walk may run: {leg:?}");
+        assert_eq!(leg.declines, 0, "and nothing may decline: {leg:?}");
+        assert!(
+            leg.live_after >= cumulative,
+            "the control must be LINEAR: {cumulative} mints must leave at least {cumulative} live \
+             resource term(s), not {}: {leg:?}",
+            leg.live_after
+        );
+    }
+    // Linear stated as the sweep's own comparison: a hundred-fold more mints leaves a hundred-fold
+    // more terms (a bounded table would answer 0 at both ends).
+    let small = series.first().copied().expect("the sweep has a first leg");
+    let large = series.last().copied().expect("the sweep has a last leg");
+    assert!(
+        large.live_after >= 10 * small.live_after,
+        "the control must grow with N, not stay bounded ({} mints → {} term(s), {} mints → {})",
+        small.mints,
+        small.live_after,
+        cumulative,
+        large.live_after
+    );
     fixture.cleanup();
 }
