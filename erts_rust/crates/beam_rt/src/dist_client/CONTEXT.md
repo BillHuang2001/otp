@@ -31,6 +31,10 @@ No item here is re-implemented from the lower crates: terms come from `beam_term
 - `signals.rs` → `signal_node`, `monitor_ref_term`, `unlink_id_term` (all `pub(super)`).
 - `lookup.rs` → `host_part`, `lookup_dist_port`, `lookup_dist_port_at` (all `pub(super)`).
 - `tests.rs` → the colocated suite (handshake against a server driver, node visibility, the outbound message and routed-signal path, the `epmd` lookup).
+## Known Issues
+* **`encode_signal` draws the `DOP_UNLINK_ID` id *before* the `match`** (`client.rs:765-766`), so **every** routed signal consumes one id although only `DistSignal::Unlink` emits it; the counter starts at `1` and steps `wrapping_add(1).max(1)` (`client.rs:153`), so an id is never `0`. `signals.rs`'s `unlink_id_term` doc ("one id is spent per routed unlink signal") describes the intent, not the cadence.
+* **No pending-unlink record is kept** — the id is minted and forgotten, so an inbound `DOP_UNLINK_ID_ACK` has nothing here to match (the inbound side likewise has no reply channel to emit one).
+* **`DistSignal::Monitor`'s `kind` (`MonitorKind`) is dropped** by the `..` at `client.rs:795`: a **port** monitor encodes as `Dop::MonitorP` with no gate and no typed refusal.
 ## Test Strategy
 The colocated suite (`tests.rs`, 11 tests) is hermetic: a loopback socket and a server-side `ConnectionDriver`, no `erl` and no real `epmd`.
 It is run by the crate gate `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --lib dist_client`.
