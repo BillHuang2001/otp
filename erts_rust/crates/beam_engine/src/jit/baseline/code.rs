@@ -411,23 +411,15 @@ impl CompiledModule {
                 ) else {
                     return super::runtime::EntryTables::NONE;
                 };
-                super::runtime::EntryTables {
-                    func,
-                    entries: entries.as_ptr(),
-                    entries_len: entries.len(),
-                    sub_entries: sub_entries.as_ptr(),
-                    sub_entries_len: sub_entries.len(),
-                }
+                super::runtime::EntryTables::of(func, entries, sub_entries)
             }
             Layout::Lazy(_) => match cached {
                 Some((cached_func, function)) if *cached_func == func => {
-                    super::runtime::EntryTables {
+                    super::runtime::EntryTables::of(
                         func,
-                        entries: function.entries.as_ptr(),
-                        entries_len: function.entries.len(),
-                        sub_entries: function.sub_entries.as_ptr(),
-                        sub_entries_len: function.sub_entries.len(),
-                    }
+                        &function.entries,
+                        &function.sub_entries,
+                    )
                 }
                 // No handle for this function: publish "nothing", which only makes the
                 // return take today's return-to-driver path.
@@ -436,6 +428,63 @@ impl CompiledModule {
         }
     }
 
+    /// The native entry for `(func, pc)` — in **any** function of this artifact — together
+    /// with the register-file bound that entry requires and the block-entry tables of the
+    /// function it belongs to.
+    ///
+    /// This is what an in-block **cross-function** return resolves through
+    /// ([`super::runtime::resume_in_block`]): a call into another function of the same
+    /// module returns into the *caller's* function, whose blocks may live in a different
+    /// executable mapping of this artifact, and the fixed jump is a legal tail transfer
+    /// because the module (code *and* label map and literal area) is the one the block is
+    /// already running.
+    ///
+    /// The precedence is [`CompiledModule::entry`]'s — a real IR-block start first, then a
+    /// continuation sub-block — so an in-block transfer enters exactly the address the
+    /// driver would have entered. A lazy artifact compiles the owning function here, on
+    /// first sight, through the same [`CompiledModule::function`] the driver's entry path
+    /// uses (one compilation path, never a second); codegen makes no host call and can
+    /// therefore not re-enter the artifact's `RefCell`, and every borrow is released before
+    /// this returns, so the caller can jump immediately.
+    ///
+    /// The returned tables address the function's own entry vectors, which are built before
+    /// its buffer is sealed and never mutated afterwards, while the artifact keeps the owning
+    /// `Rc` alive in its per-function slot — so they stay valid for as long as the artifact
+    /// the driver holds (the same argument [`CompiledModule::entry_tables`] makes).
+    ///
+    /// `None` when the address is not a block/sub-block entry of a function this module has,
+    /// or when the lazy function's compilation fails.
+    pub(crate) fn native_entry_tables(
+        &self,
+        module: &Module,
+        func: u32,
+        pc: u32,
+    ) -> Option<(*const u8, Option<u32>, super::runtime::EntryTables)> {
+        match &self.layout {
+            Layout::Eager(eager) => {
+                let entry = eager_entry(eager, func, pc)?;
+                let entries = eager.entries.get(func as usize)?;
+                let sub_entries = eager.sub_entries.get(func as usize)?;
+                Some((
+                    entry,
+                    // The eager artifact's bound is the whole-module maximum for every one
+                    // of its functions (see `CompiledModule::native_entry`).
+                    eager.summary.highest_native_register,
+                    super::runtime::EntryTables::of(func, entries, sub_entries),
+                ))
+            }
+            Layout::Lazy(_) => {
+                let function = self.function(module, func)?;
+                let entry = lazy_entry(&function, pc)?;
+                let tables = super::runtime::EntryTables::of(
+                    func,
+                    &function.entries,
+                    &function.sub_entries,
+                );
+                Some((entry, function.summary.highest_native_register, tables))
+            }
+        }
+    }
     /// The compiled function `func`, compiling it on first sight for a lazy artifact.
     ///
     /// `None` for the eager layout (its entries are addressed directly) and for a

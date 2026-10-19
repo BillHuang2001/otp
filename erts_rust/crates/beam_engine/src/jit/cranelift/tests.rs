@@ -164,6 +164,7 @@ fn the_compiled_function_runs_the_export_natively() {
         literals_end: std::ptr::null(),
         resume_entry: std::ptr::null(),
         tables: crate::jit::baseline::runtime::EntryTables::NONE,
+        compiled: std::ptr::null(),
     };
 
     let word = code

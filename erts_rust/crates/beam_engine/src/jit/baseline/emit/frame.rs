@@ -49,14 +49,17 @@
 //! * **`return`** ([`emit_return`]) and the fused **`deallocate_return`**
 //!   ([`emit_deallocate_return`]) **always transfer control** — the interpreter's
 //!   `return_step` yields `Step::Done`/`Goto`/`Enter`, never `Next` — but the transfer is
-//!   not always the driver's: a continuation inside the **function that is already
-//!   running** (every non-tail call returns to its own `pc + 1`, a continuation sub-block
-//!   of the same function) is tail-jumped to **in-block** by [`emit_resume_or_exit`],
-//!   which is why a call-heavy function no longer pays a driver iteration per return.
-//!   Every other outcome — a bottom frame's [`HALT`], another module context's [`ENTER`],
-//!   another function (a different executable mapping), an address no block covers, a
-//!   refused pre-emption charge ([`ERROR`]) — leaves the helper's word in `rax` for the
-//!   driver, exactly as before. The fused form is one helper round-trip for the pair
+//!   not always the driver's: a continuation naming a block entry of **this artifact** is
+//!   tail-jumped to **in-block** by [`emit_resume_or_exit`] — the common same-function shape
+//!   (every non-tail call returns to its own `pc + 1`, a continuation sub-block of the same
+//!   function) *and* the cross-function one (a call into another function of the module
+//!   returns into the caller's function, in another executable mapping of the same
+//!   artifact) — which is why a call-heavy function no longer pays a driver iteration per
+//!   return. Every other outcome — a bottom frame's [`HALT`], another module context's
+//!   [`ENTER`], a function this artifact holds no compiled code for, an address no block
+//!   covers, a register-file bound the machine does not satisfy, a refused pre-emption
+//!   charge ([`ERROR`]) — leaves the helper's word in `rax` for the driver, exactly as
+//!   before. The fused form is one helper round-trip for the pair
 //!   `deallocate N; return`: the loader fuses that adjacent pair into
 //!   `Instr::DeallocateReturn` (`super::super::super` docs, `beam_loader::lower::fuse`),
 //!   and [`super::emit_block`] fuses the separate pair a hand-built module (the crate's own
@@ -128,10 +131,10 @@ pub(super) fn emit_deallocate(
 ///
 /// The helper ([`jit_return`]) reads the frame's continuation and encodes it as the
 /// block-ABI word; `return` always transfers control, so the block either tail-jumps to
-/// the same-function block entry the helper resolved ([`emit_resume_or_exit`]) or leaves
-/// with that word in `rax` for the driver (a `(func, pc)` target in another function or
-/// context, [`HALT`] on the bottom frame, or [`ENTER`] for a caller in another module
-/// context).
+/// the block entry the helper resolved inside **this module's artifact**
+/// ([`emit_resume_or_exit`]) or leaves with that word in `rax` for the driver (an address
+/// the artifact compiled no block for, a register-file bound the machine does not satisfy,
+/// [`HALT`] on the bottom frame, or [`ENTER`] for a caller in another module context).
 ///
 /// [`HALT`]: super::super::runtime::HALT
 /// [`ENTER`]: super::super::runtime::ENTER
@@ -206,7 +209,8 @@ pub(super) fn emit_deallocate_return(
 }
 
 /// Leave the block with the helper's word in `rax` — **or** tail-jump straight to the block
-/// entry the helper resolved for a continuation inside the function that is already running.
+/// entry the helper resolved for a continuation that names a block of this artifact (the
+/// function that is already running, or another function of the same module).
 ///
 /// The word *is* the exit value — the driver decodes it as a `(func, pc)` target or as
 /// [`HALT`]/[`ENTER`]/[`ERROR`] — so nothing is materialised and no comparison is made
@@ -217,17 +221,18 @@ pub(super) fn emit_deallocate_return(
 /// # The in-block continuation
 ///
 /// A **non-tail call's** continuation is its own `pc + 1`, which the compiler lowered as a
-/// continuation sub-block of the same function, so the helper can resolve the entry itself
-/// ([`super::super::runtime::EntryTables`]) and store it in
-/// [`JitRuntime::resume_entry`](super::super::runtime::JitRuntime) — having already done the
-/// driver iteration's work (publish the position, bump the slice counter, offer the
-/// pre-emption hook) in the driver's own order. When it did, `rax` is not consulted at all
-/// and the block transfers **in-block**:
+/// continuation sub-block — of the *caller's* function, which for a call into another
+/// function of the module is another executable mapping of the same artifact. The helper
+/// resolves the entry itself ([`super::super::runtime::EntryTables`], else the artifact) and
+/// stores it in [`JitRuntime::resume_entry`](super::super::runtime::JitRuntime) — having
+/// already done the driver iteration's work (publish the position, bump the slice counter,
+/// offer the pre-emption hook) in the driver's own order. When it did, `rax` is not consulted
+/// at all and the block transfers **in-block**:
 ///
 /// ```text
 ///   call <helper>                     ; the frame-discipline instruction; spills first
 ///   mov  rdi, [rsp + RUNTIME_SLOT_DISP] ; rt — reloaded, the helper may clobber rdi
-///   mov  r11, [rdi + RUNTIME_RESUME_DISP] ; the resolved same-function block entry
+///   mov  r11, [rdi + RUNTIME_RESUME_DISP] ; the resolved block entry (same artifact)
 ///   test r11, r11
 ///   je   <done>                       ; no entry: today's word exit, `rax` intact
 ///   lea  rsp, [rsp + slot] ; pop …    ; leave this block's native frame
@@ -245,10 +250,12 @@ pub(super) fn emit_deallocate_return(
 /// # Why the skipped checks cannot be skipped unsoundly
 ///
 /// The helper's own docs carry the argument ([`super::super::runtime::return_word`]): the
-/// entry is used only when it belongs to **the function the driver last entered a block of**
-/// (a different function is a different executable mapping, and a different module context is
-/// [`ENTER`], both of which keep the driver path), and a transfer inside that function stays
-/// within the register-file bound the driver already checked on entry.
+/// entry is used only when it belongs to **the module's compiled artifact the block is
+/// running** (a different module context is [`ENTER`] and keeps the driver path), the
+/// artifact's code stays mapped for the whole slice, and a transfer into a function other
+/// than the one the tables describe has had **that function's** register-file bound checked
+/// inside the helper before the entry is handed over. The same-function shape stays within
+/// the bound the driver already checked on entry.
 ///
 /// [`HALT`]: super::super::runtime::HALT
 /// [`ENTER`]: super::super::runtime::ENTER

@@ -635,16 +635,25 @@ fn enter_compiled_cached(
         }
     }
     // Publish the function's block-entry tables so a **return** inside it can resolve its
-    // own same-function continuation and jump there instead of leaving the block for the
-    // driver (`runtime::EntryTables`, `runtime::resume_in_block`). Published on exactly the
+    // own continuation and jump there instead of leaving the block for the driver
+    // (`runtime::EntryTables`, `runtime::resume_in_block`). Published on exactly the
     // iterations that enter native code, so it always names the function whose blocks may
     // be executing; the driver clears it on the iterations that take an interpreter step
     // instead.
     //
-    // SAFETY: `rt` is the live driver-owned runtime block; writing one of its Rust-side
-    // fields touches no executable memory and no block is running here.
+    // The artifact itself is published alongside, because a return can land in **another
+    // function of this artifact** (a call into a different function of the module returns
+    // into the caller's function, in another executable mapping of the same artifact); the
+    // helper resolves such a continuation through those tables
+    // (`runtime::cross_function_entry`) and re-publishes the target function's own.
+    //
+    // SAFETY: `rt` is the live driver-owned runtime block; writing two of its Rust-side
+    // fields touches no executable memory and no block is running here. `compiled` points at
+    // the artifact `code` is running from, which the caller owns (context `0`) or the
+    // driver's callee entry holds for the whole loop.
     unsafe {
         (*rt).tables = compiled.entry_tables(func, cached);
+        (*rt).compiled = compiled as *const CompiledModule;
     }
     // Structural counter: the lookup is entered (the register-file guard passed).
     #[cfg(test)]
@@ -1049,6 +1058,7 @@ fn drive(
         literals_end: std::ptr::null(),
         resume_entry: std::ptr::null(),
         tables: runtime::EntryTables::NONE,
+        compiled: std::ptr::null(),
     };
     // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
     // a `move` with an `Operand::Literal` source loads its word from this base at run
@@ -1224,9 +1234,10 @@ fn drive(
             #[cfg(test)]
             counters::record_driver_interp_step();
             // No native code is about to run, so no in-block return can be taken in this
-            // iteration's function: withdraw the published tables (a `return` reached
-            // through a *later* block republishes them on that block's own entry).
+            // iteration's function: withdraw the published tables and artifact (a `return`
+            // reached through a *later* block republishes them on that block's own entry).
             rt.tables = runtime::EntryTables::NONE;
+            rt.compiled = std::ptr::null();
         }
 
         // SAFETY: the native call returned, so no `&mut` derived from `rt` is alive;
