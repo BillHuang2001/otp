@@ -765,8 +765,8 @@ impl Default for PortTerms {
 /// record a *new* atom is predicted on, and answers the port queries with the owning [`ProcessId`].
 ///
 /// See the module docs for the current scope: the output / term-data / pid services and the
-/// recorded `driver_select` / timer requests are implemented; `driver_async` and the custom
-/// `control` keep the seam's typed defaults.
+/// recorded `driver_select` / timer requests, the `driver_async` pool hook and the `ready_async`
+/// hand-off are implemented; the custom `control` keeps its one documented reply-source gap.
 pub struct DriverPort {
     /// The term arena the term-data decoder allocates on.
     ///
@@ -2137,9 +2137,8 @@ pub(crate) fn load_driver_at(
 ///
 /// # Typed gaps (documented, never a fabricated success)
 ///
-/// * `driver_async` keeps the [`beam_abi::DriverHost`] default (`-1`): see the module docs — there
-///   is no async pool, and the C's in-band path needs the entry and the driver's private state,
-///   which the frozen host seam does not hand the host function.
+/// * `driver_async` submits to the runtime's pool and its completion is delivered at the port's
+///   drive point (see the module docs); `driver_async_cancel` has no C implementation in this tree.
 /// * `driver_control` (the entry's `control` callback behind `port_control/3`) is routed by
 ///   [`DriverPortAdapter::control`]; its only gap is a reply the driver answers from memory of its
 ///   own rather than from the buffer it was handed (a typed *unsupported*, see the module docs).
