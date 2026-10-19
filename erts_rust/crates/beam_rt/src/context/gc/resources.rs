@@ -83,6 +83,14 @@
 //!
 //! * a resource held only by a **foreign** container (a pooled-BIF tuple, an arena fallback) is
 //!   kept alive by gate 5, forever if nothing ever drops that container;
+//! * a candidate whose **reference identity cannot be read** (its minted block no longer holds a
+//!   reference header) is recorded as reached rather than released: "cannot identify it" must never
+//!   become "it is dead", so that resource stays leaked for the runtime's life;
+//! * a resource term that was **copied** (the send path's `copy_struct`, an ETS insert) keeps its
+//!   object alive through the copy's identity — [`super::super::gc_walk::reachable_resource_words`]
+//!   matches a reached reference term's id against the candidates' — so a copy that leaves no
+//!   reachable word and no identity behind is the only shape a release can still miss, and a
+//!   recycled-in-place minted block can only *narrow* the match (a leak), never invent one;
 //! * a term held by a **host-side** store outside the six gathered root families — a pending
 //!   [`TimerAction::Deliver`](crate::timers) message, a `ProcessEngine`'s spawn arguments/entry
 //!   fun, a persistent-term value, an execution-trace token — is invisible to the walk, so
@@ -161,8 +169,10 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
         return Ok(0);
     }
 
-    // The reachability decision itself: the reachable subset of `candidates`, over both regions and
-    // through cons cells (so a resource held in `[Res]` or in a message payload is found).
+    // The reachability decision itself: the reachable subset of `candidates`, over both regions, through
+    // cons cells (so a resource held in `[Res]` or in a message payload is found), and by **reference
+    // identity** as well as by word — a `copy_struct` copy (the send path, ETS) is a different word with
+    // the same id, and it designates the same object.
     let reached = super::super::gc_walk::reachable_resource_words(
         runtime.walk_scratch(),
         process,
@@ -170,9 +180,10 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
         &candidates,
     );
 
-    // A candidate that was not reached is dead: drop the reference its term took. `reached` is
-    // sorted (the walk's entry point guarantees it), and identity is the raw word — never a
-    // structural comparison, because a resource term is a leaf.
+    // A candidate that was not reached is dead: drop the reference its term took. `reached` is sorted
+    // (the walk's entry point guarantees it) and holds a candidate's own raw word whenever anything
+    // reachable names it — directly, through a copy's identity, or because the walk could not read the
+    // candidate's identity and therefore declined to call it dead.
     let released = release_resource_terms(|term| reached.binary_search(&term.raw()).is_ok());
     if released > 0 {
         crate::debug_trace::trace(format_args!(
