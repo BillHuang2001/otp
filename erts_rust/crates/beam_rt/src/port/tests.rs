@@ -920,7 +920,63 @@ fn an_unknown_spawn_driver_name_is_still_badarg() {
     let port = fx.hook.open_port(spawn, NIL).expect("a valid port");
     assert_eq!(port, PortId::new(0));
 }
-
+/// The `{spawn_driver, Name}` **candidate spellings** are suffix-free, for both name forms.
+///
+/// `beam_abi`'s driver loader appends the platform's shared-object suffix **unconditionally**,
+/// exactly as the oracle's `erts_sys_ddll_open` does (`erl_unix_sys_ddll.c:104-118`; pinned by
+/// `beam_abi`'s `shared_object_path_appends_the_suffix_unconditionally`), so a candidate that still
+/// carried the suffix would be handed to `dlopen` as `<path>.so.so` — the defect that made the
+/// `/`-containing form of `open_port({spawn_driver, …})` answer `badarg`. The bare-name form strips
+/// the same way, so a bare `foo.so` resolves instead of becoming `foo.so.so`.
+#[test]
+fn driver_lookup_candidates_are_suffix_free_spellings() {
+    let suffix = std::env::consts::DLL_SUFFIX;
+    let spelled = format!("/drivers/rt_lookup{suffix}");
+    let suffix_free = "/drivers/rt_lookup";
+    let (candidates, driver_name) = driver_lookup(&spelled);
+    assert_eq!(
+        candidates,
+        vec![suffix_free.to_string()],
+        "a path that already carries the suffix is stripped back to the spelling the loader expects"
+    );
+    assert_eq!(
+        format!("{}{suffix}", candidates[0]),
+        spelled,
+        "the loader's own suffix turns the candidate back into the object the name spelled"
+    );
+    assert_eq!(driver_name, "rt_lookup");
+    // The suffix-free spelling yields the very same candidate list and driver name.
+    assert_eq!(driver_lookup(suffix_free), (candidates, driver_name));
+    // Only an **exact** trailing suffix is stripped: a driver object legitimately named `foo.so.1`
+    // is left alone (the oracle appends, opening `foo.so.1.so`).
+    let numbered = format!("{suffix_free}{suffix}.1");
+    let (candidates, driver_name) = driver_lookup(&numbered);
+    assert_eq!(candidates, vec![numbered.clone()]);
+    assert_eq!(
+        format!("{}{suffix}", candidates[0]),
+        format!("{numbered}{suffix}")
+    );
+    assert_eq!(driver_name, format!("rt_lookup{suffix}.1"));
+}
+/// A **bare** driver name keeps its `./<name>` fallback — `dlopen` searches the loader's path for a
+/// slash-free name, never the current directory — and strips the suffix the same way, so a bare
+/// `foo.so` is tried as `foo`/`./foo` rather than as `foo.so.so`.
+#[test]
+fn a_bare_driver_name_keeps_its_current_directory_fallback() {
+    let suffix = std::env::consts::DLL_SUFFIX;
+    let bare = format!("rt_bare{suffix}");
+    let (candidates, driver_name) = driver_lookup(&bare);
+    assert_eq!(
+        candidates,
+        vec!["rt_bare".to_string(), "./rt_bare".to_string()]
+    );
+    // The driver name a bare spelling derives is the name **as written** — untouched by the
+    // candidate stripping — exactly as before this fix.
+    assert_eq!(driver_name, bare);
+    // An already suffix-free bare name spells the very same candidates (its driver name is the
+    // same, since a bare name is used as written either way).
+    assert_eq!(driver_lookup("rt_bare"), (candidates, "rt_bare".to_string()));
+}
 #[test]
 fn whitelisted_option_atoms_and_tuples_are_accepted() {
     let mut fx = fixture();
