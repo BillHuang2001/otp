@@ -121,7 +121,7 @@ That workload set is the in-crate tier set, not the OTP corpus, so the corpus-sc
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`
-(`machine/mod.rs:643`), `Machine::alloc_rooted` (`:701`, → `ExecutionContext::alloc_words_rooted`) and
+(`machine/mod.rs:653`), `Machine::alloc_rooted` (`:711`, → `ExecutionContext::alloc_words_rooted`) and
 `Machine::ensure_heap`/`allocate_heap` → `ExecutionContext::ensure_heap_full`
 (`machine/frames.rs:283`).
 `with_roots` hands over the **whole** three files — `&mut self.x` (all `max_register` slots),
@@ -146,6 +146,17 @@ new engine-side build must follow.
 so it is a **per-`test_heap`** door, never a per-allocation one; `Instr::Allocate` (`:611-617`) pushes
 the frame with **no** admission.
 `ExecutionContext::heap_available` has **no** call site anywhere in the crate (introspection only).
+**The off-heap reservoir is on no door at all.** `Machine::refc_binaries` (`mod.rs:349`) is reachable only
+as `&self` (`refc_binaries()` `:1114`, `off_heap_overhead_bytes()` `machine/offheap.rs:78`), so a host at
+`call_bif_in_machine` (`context.rs:413`) can *price* the reservoir but never prune it; no seam hands out
+`&mut Machine`. `retain_refc_binaries` (`machine/offheap.rs:126`) takes `&mut self`, so it also cannot run
+while a `RootSet` built from `&mut self.x`/`stack`/`fr` is alive — a prune hosted at a door needs a
+field-level split (the three register files and `refc_binaries`/`writable_payloads` are disjoint fields,
+`mod.rs:105/113/146/349/384`) behind a new closure shape, and must keep `with_roots`' raise-latch parking
+(`mod.rs:659-688`). The engine cannot derive the predicate itself: it does not depend on `beam_gc`
+(`Cargo.toml:8-13`). An in-slice prune is also unsound for the accumulator **in flight** — the roots do not
+name a `bs_init_writable` payload until its term is written back, while `retain_refc_binaries` prunes the
+writable registry in lockstep (`offheap.rs:138-142`).
 Every other engine→host call carries **no** root set, so a host that
 *allocated* inside it would relocate the young heap against unpublished roots. Those calls, with the
 state each holds in a Rust local across the call:
