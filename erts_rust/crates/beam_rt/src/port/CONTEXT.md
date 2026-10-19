@@ -264,8 +264,8 @@ port term): `{active,once}` + `<<"hi">>` ⇒ `{tcp,'#Port<P>',<<"hi">>}`; `[list
 `{udp,'#Port<P>',{127,0,0,1},39846,<<"hi">>}` from a socket bound to 23456 (`0x5BA0`) ⇒ the source
 **port field is big-endian**; UDP `{active,2}` + three datagrams ⇒ two `{udp,…}` then
 `{udp_passive,…}`; an empty datagram is `{udp,'#Port<P>',{127,0,0,1},50339,<<>>}`.
-**The rendering is proven end to end over real loopback traffic** (`active_input_e2e_tests.rs`);
-what is *not* yet wired is the packet's delivery into the owner's mailbox — see *Wiring* below.
+**The rendering and the delivery are proven end to end over real loopback traffic**
+(`active_input_e2e_tests.rs`, `tests/inet_active.rs`) — see *Delivery* below.
 
 The module is declared from **`ops.rs`** (`#[path = "active_input.rs"] pub(crate) mod
 active_input;`, beside the `#[path]` declaration of `inet_opts`). It has two suites, reached with
@@ -300,16 +300,17 @@ the oracle's own differing value. (b) `{mode,list}`'s effective mode is not in t
 `data_mode` seam below.
 
 **Every `setopts` in the e2e suite is followed by an explicit `PortRegistry::note_inet_setopts`
-with the reply's own success tag** — the documented stand-in for the hook `src/port.rs`'s
-`port_control` will make (`accept_inherit_tests.rs`'s pattern). Once that hook lands, the explicit
-calls are redundant, not wrong.
+with the reply's own success tag** — a redundant, harmless stand-in for production's own hook in
+`src/port.rs`'s `port_control` (gated on `is_setopts_control(op)` + `setopts_succeeded(reply)`),
+which is what records the mirror on a real run.
 
 **`ActiveInputPacket { port, owner, data_mode, kind, event }`** mirrors `CompletionPacket`: the
 owner, the stream mode and the port's **kind** are all resolved at **drain** time
 (`PortRegistry::drain_active_inputs`, from `PortMeta`), because a delivery staged around a
 teardown outlives the metadata. `drain_active_inputs` returns `Vec<ActiveInputPacket>` — its own
-term-free type, **not** a `PortEvent`: the packet already names its recipient, so the provider
-needs no event variant to carry it and no second table read to deliver it. `ActivePortKind
+term-free type; `src/port.rs` wraps each one in `PortEvent::ActiveInput { packet }` for the pending
+queue, so the packet already names its recipient and the provider needs no second table read to
+deliver it. `ActivePortKind
 { Tcp, Udp, Other }` comes from the driver name — `driver_path_name(&meta.command)` matched
 literally against `tcp_inet`/`udp_inet`, the same first-blank rule the driver search applies.
 `Other` is a **typed capability gap** for both events (`crate::error::unsupported`, naming the
@@ -342,19 +343,20 @@ consing / improper lists / list flattening cannot drift into a second byte-list 
 header that is not exactly one packed IPv4 record is a typed gap — an address is the one element
 of `{udp,…}` that must never be invented.
 
-**Wiring still owed by the parent node (`src/port.rs`)** — the module compiles and both suites
-pass without any of it, because the drain is called directly by the tests; nothing yet delivers a
-packet into its owner's mailbox: (a) call
-`drain_active_inputs()` immediately after each of the six `drain_io_completions(...)` sites
-(`write_command`'s two branches, `port_control`, `close`, `pump`'s round and `pump`'s "nothing
-live to poll" early return) and hold the returned packets as pending work, and (b) the two
-delivery arms (`Runtime::deliver_port_messages` → `packet.owner` via `deliver_in_table`, so a
-blocked receiver wakes; `RuntimeContext::poll_port_messages` → only `packet.owner == self.pid()`),
-calling `RuntimeContext::active_input_message` on the public path. Until (a) lands, a staged
-active delivery is never drained, so `src/port.rs` currently reports the module's items as dead
-code (10 of the crate's 31 build warnings, the other 21 being `inet_opts`'s);
-`PortRegistry::has_nothing_to_poll` will then need the pending packets counted (they are not a
-`PortEvent` and so are invisible to `pending_events`).
+**Delivery (`src/port.rs`) — live.** The drain rides every point a driver callback can stage an
+active delivery: `drain_active_inputs()` is called immediately after each of the six
+`drain_io_completions(...)` sites (`write_command`'s two branches, `port_control`, `close`, `pump`'s
+round, `pump`'s "nothing live to poll" early return) and the packets are published as
+`PortEvent::ActiveInput { packet }` on `pending_events`, so `has_nothing_to_poll` stays truthful
+without an arm of its own. `PortEvent::port()` answers `None` for the variant, so `close`'s purge can
+never re-attribute or drop a staged delivery. Two delivery arms consume it:
+`Runtime::deliver_port_messages` (the scheduled `run` route) delivers to `packet.owner` through
+`deliver_in_table` — so a receiver blocked in `receive` is woken by the ordinary resume-on-send path
+— and `RuntimeContext::poll_port_messages` (the `-eval` route) delivers only when
+`packet.owner == self.pid()`, both calling `RuntimeContext::active_input_message`.
+The rendering mode is resolved **at the delivery arms**, from `PortRegistry::data_mode(port,
+packet.data_mode)`, so a `{mode,list}` socket renders a char list while the packet itself stays
+`Binary` at the drain boundary.
 
 **Known residual — `hsz > len`, a `beam_io` seam.** The C's list branch is `(mode == LIST) ||
 (hsz > len)`, so a `{header,N}` wider than the payload is one flat string with no binary tail (the
@@ -430,17 +432,17 @@ frame, a rejected record leaves the mirror untouched, and a poisoned replay clos
 the accept — with one case comparing against the live `erl` oracle's own
 `inet:getopts(A,[packet,packet_size,header,mode])`.
 
-**Two residuals, both typed, neither silent.**
-(a) `PortRegistry::note_inet_setopts` has **no production call site yet** — the hook belongs in
+**The mirror's one writer is production.** `PortRegistry::note_inet_setopts` is called from
 `src/port.rs::PortRegistry::port_control`, after the completion drain, gated on
-`inet_opts::is_setopts_control(op)` and `setopts_succeeded(reply)`; that file is the parent node's.
-Until it lands the mirror is fed only by the two test suites, whose `setopts` helpers **detect** the
-hook (the recorded count is read across the control call, and the argument is recorded only when the
-reply succeeded and nothing was recorded), so they become no-ops the day it lands rather than
-double-recording. The patch text, its rationale per hunk and its verification recipe are in
-[`PARENT_WIRING.md`](PARENT_WIRING.md).
-(b) There are **two** mode lookups — `PortMeta::data_mode` (in `active_input.rs`, body =
-`PortMeta::stream`) and `PortRegistry::data_mode(id, fallback)` (the mirror) — and a payload renderer
+`inet_opts::is_setopts_control(op)` and `setopts_succeeded(reply)` — it reads the reply, never
+consumes it. The suites' own `setopts` helpers **detect** the hook (the recorded count is read
+across the control call, and the argument is recorded only when the reply succeeded and nothing was
+recorded), so they are no-ops on a wired runtime rather than double-recording; the hook's own
+presence is pinned by
+`accept_inherit_tests.rs::a_setopts_control_call_populates_the_option_mirror_from_production_alone`,
+which calls `port_control` directly with no stand-in.
+**One residual, typed.** There are **two** mode lookups — `PortMeta::data_mode` (in
+`active_input.rs`, body = `PortMeta::stream`) and `PortRegistry::data_mode(id, fallback)` (the mirror) — and a payload renderer
 must consult the second with the first as the fallback. One seam, two accessors: a caller that reads
 the wrong one renders an `inet` list payload as a binary. `src/port.rs::make_stream_payload`'s callers
 (`port_data_message_shaped`, `port_line_message`) are where the consolidation lands.
