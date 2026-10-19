@@ -409,6 +409,28 @@ impl<'a> RuntimeContext<'a> {
             && !hooks.persistent_term
             && !hooks.runtime_hooks
             && !reentrant;
+        // The `ets` **table-alias witness** (`BifContext::with_table_aliasing`), installed on every
+        // arm below. With it the `ets` copy-out helpers (`beam_bifs::ets::copy_out`/`copy_out_list`)
+        // hand back the table's **own** terms — the list spine over table-owned object roots —
+        // instead of copying them onto the pooled BIF heap, and set this cell. The single copy then
+        // happens in the tail below, onto the region that outlives the call.
+        //
+        // Three facts make the pair sound, and they are the whole argument:
+        //
+        // * a witnessed term points into `beam_ets`'s `TermStore`, a **never-relocating** arena the
+        //   table owns, so the source stays valid for the whole of the tail's copy — and the copy
+        //   runs before `heap.reset_to(mark)` (never after: the returned spine lives on the pool,
+        //   and rewinding first would recycle it while the copier still reads it);
+        // * the copy is **unconditional** for an aliased container (`graph_holds_reference`'s
+        //   reference exemption is deliberately NOT consulted — see the tail), because a
+        //   `TermStore`'s `free` recycles exact-fit runs, so a returned table word could be handed
+        //   out again for a different term;
+        // * the cell is a stack `Cell<bool>`: no allocation, no `Vec` and no extra copy for a
+        //   non-`ets` BIF, so the dispatch prologue's cost is one stack slot.
+        //
+        // A **nested** call (a fun a BIF applies) re-enters `call_registered` and gets its own
+        // cell, so a nested `ets:*` cannot confuse the outer call's answer.
+        let alias = std::cell::Cell::new(false);
         let mut result = {
             let RuntimeContext {
                 runtime,
@@ -473,6 +495,7 @@ impl<'a> RuntimeContext<'a> {
                     pid: self_pid,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_dict_hook(&mut dict)
                     .with_port_hook(&mut ports)
@@ -504,6 +527,7 @@ impl<'a> RuntimeContext<'a> {
                     self_pid,
                 );
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_process_hook(&mut bridge)
                     .with_port_hook(&mut ports)
@@ -534,6 +558,7 @@ impl<'a> RuntimeContext<'a> {
                     self_pid: self_pid.to_eterm(),
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_nif_loader(&mut bridge)
                     .with_current_module(caller_module.as_deref().unwrap_or(""))
@@ -561,6 +586,7 @@ impl<'a> RuntimeContext<'a> {
                     code_server: &runtime.code_server,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_record_source(&mut source)
                     .with_port_hook(&mut ports)
@@ -589,6 +615,7 @@ impl<'a> RuntimeContext<'a> {
                 // key applies no fun argument and touches no dictionary.
                 let gate = ExportGateBridge::new(&runtime.code_server, &runtime.registry);
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_export_gate(&gate)
                     .with_port_hook(&mut ports)
@@ -622,6 +649,7 @@ impl<'a> RuntimeContext<'a> {
                     engines: *engines,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_sender(&mut bridge)
                     .with_port_hook(&mut ports)
@@ -647,6 +675,7 @@ impl<'a> RuntimeContext<'a> {
                     code_server: &runtime.code_server,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_module_info(&mut source)
                     .with_port_hook(&mut ports)
@@ -696,6 +725,7 @@ impl<'a> RuntimeContext<'a> {
                     Rc::clone(&atoms),
                 );
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_persistent_term(&mut store)
                     .with_port_hook(&mut ports)
@@ -727,6 +757,7 @@ impl<'a> RuntimeContext<'a> {
                     self_pid,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_runtime_hooks(&mut bridge)
                     .with_port_hook(&mut ports)
@@ -758,6 +789,7 @@ impl<'a> RuntimeContext<'a> {
                     engines: *engines,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_table_aliasing(&alias)
                     .with_atom_interner(&mut pending)
                     .with_fun_caller(&mut bridge)
                     .with_port_hook(&mut ports)
@@ -832,13 +864,66 @@ impl<'a> RuntimeContext<'a> {
         // `reset_to(mark)` frees exactly this call's words `[mark..used)` and leaves the ones a
         // previous caller still owns below `mark` untouched (see `mark` above). For a heap taken
         // clean (`mark == 0`) that is byte for byte the `reset()` it replaces.
+        //
+        // # The `ets` table-alias witness — one copy, BEFORE the rewind
+        //
+        // `aliased` says the `ets` copy-out helpers handed back the table's **own** terms
+        // ([`Self::call_registered`]'s witness, [`BifContext::with_table_aliasing`]) instead of
+        // copying them onto this pool. An **aliased container** is therefore a graph that lives in
+        // `beam_ets`'s `TermStore` and possibly, for a `{Key, [Objects]}`/`{Results, Cont}` shape,
+        // partly on this pool (the spine/tuple the helper built) — so it is copied out
+        // **unconditionally** and **before** `heap.reset_to(mark)`:
+        //
+        // * **why unconditionally** — the `graph_holds_reference` exemption below protects a
+        //   *pooled* word (a reference is identified by its address, so a copy would stop being the
+        //   timer/monitor it names). An aliased result's words belong to the table, not the pool, and
+        //   `TermStore::free` recycles **exact-fit runs**: a returned table word could be handed out
+        //   again for a different term on the next delete. Memory safety wins — the result is always
+        //   copied, and a reference inside it is copied with it.
+        // * **why before the rewind** — a `select`/`last_lookup`-shaped result MIXES table-owned
+        //   objects with the spine/tuple the helper built on this pool. Copying first keeps the
+        //   pool-built part alive for the copier; rewinding first would hand the copier a recycled
+        //   spine.
+        //
+        // A **refused** aliased copy can never be papered over by returning the un-copied term (its
+        // words are the table's, and the table may recycle them): it surfaces the term-heap
+        // `system_limit` the tail's own `enforce_term_heap_limit` maps an allocation refusal to. The
+        // pool is left un-rewound, the same residual a failed move already has.
+        let aliased = alias.get();
+        // The witness's own tally: a test that asserts "no copy ran for this immediate" is only
+        // meaningful once the cell is known to have been **set** by the `ets` helper (a witness
+        // that was never installed would skip the copy for the trivial reason that `aliased` is
+        // `false`). One thread-local bump per aliased call, test builds only.
+        #[cfg(test)]
+        notes::note_alias_mark(aliased);
         let move_container = self.mailbox_table.is_some() || safe_to_rewind;
         let mut rewind = false;
         if let Ok(term) = result {
             if !Self::result_is_foreign_container(term) {
-                // Nothing reachable lives on this heap, so no byte of it was handed out for
-                // anything that survives the call: rewinding disturbs nothing.
+                // Nothing reachable lives on this heap — and an **aliased** result that is an
+                // immediate (a small int, an atom, `'$end_of_table'`) names no table word either,
+                // even though the helper set the cell for it — so no byte of either region was
+                // handed out: rewinding disturbs nothing.
                 rewind = safe_to_rewind;
+            } else if aliased {
+                // The one copy, onto the region that outlives the call, unconditionally and before
+                // the rewind (see the block comment above).
+                #[cfg(test)]
+                notes::note_alias_copy();
+                #[cfg(test)]
+                notes::note_alias_copy_pool(mark, heap.used());
+                match self.rehome_container_result(term) {
+                    Some(copied) => {
+                        result = Ok(copied);
+                        rewind = safe_to_rewind;
+                    }
+                    None => {
+                        // Never the un-copied term: it points into the table's `TermStore`.
+                        #[cfg(test)]
+                        notes::note_alias_refusal();
+                        result = Err(BeamError::SystemLimit);
+                    }
+                }
             } else if Self::graph_holds_reference(term) {
                 // A reference's identity **is** its address (see the comment above): the copy
                 // would be a different term, so the result stays where it is and the pool is
@@ -1799,6 +1884,10 @@ mod notes {
         static WALK_VISITS: Cell<usize> = const { Cell::new(0) };
         static WALK_HASH_INSERTS: Cell<usize> = const { Cell::new(0) };
         static WALK_SPILLS: Cell<usize> = const { Cell::new(0) };
+        static ALIAS_COPIES: Cell<usize> = const { Cell::new(0) };
+        static ALIAS_MARKS: Cell<usize> = const { Cell::new(0) };
+        static ALIAS_REFUSALS: Cell<usize> = const { Cell::new(0) };
+        static ALIAS_COPY_POOL: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     }
 
     /// The reference walk's counters, in one value so a test can assert them as a unit.
@@ -1877,7 +1966,58 @@ mod notes {
         WALK_SPILLS.with(|c| c.set(c.get() + 1));
     }
 
-    /// Zeroes this thread's counters, so a test measures only its own work.
+    /// Records one **aliased** `ets` container result the tail copied out
+    /// ([`RuntimeContext::call_registered`]'s `aliased` arm), i.e. one result the witness turned
+    /// into a single copy instead of `beam_bifs`' copy plus this one.
+    pub(super) fn note_alias_copy() {
+        ALIAS_COPIES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records the pooled BIF heap's `(mark, used)` **at the instant** the aliased copy-out hands
+    /// the term to the copier.
+    ///
+    /// This is the deterministic witness for the ordering invariant: `used > mark` proves the words
+    /// this call built on the pool (the `ets` helpers' list spine / `{Key,[Objects]}` tuple) were
+    /// still **live** when the copier read them, i.e. the copy ran **before**
+    /// `Heap::reset_to(mark)`. A tail that rewound first would record `used == mark`.
+    pub(super) fn note_alias_copy_pool(mark: usize, used: usize) {
+        ALIAS_COPY_POOL.with(|c| c.set((mark, used)));
+    }
+
+    /// This thread's `(mark, used)` from the last aliased copy-out ([`note_alias_copy_pool`]).
+    pub(super) fn alias_copy_pool() -> (usize, usize) {
+        ALIAS_COPY_POOL.with(Cell::get)
+    }
+    /// Records one **refused** aliased copy-out — the `system_limit` arm. Unreachable in practice
+    /// (it needs a graph the copier rejects, or a destination that cannot be grown), so a
+    /// non-zero count is itself the diagnosis.
+    pub(super) fn note_alias_refusal() {
+        ALIAS_REFUSALS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one `call_registered` whose `ets` **table-alias witness** fired — the tail read
+    /// `aliased == true`, whether or not the result then needed a copy.
+    #[allow(dead_code)]
+    pub(super) fn note_alias_mark(aliased: bool) {
+        if aliased {
+            ALIAS_MARKS.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// This thread's `(copies, refusals)` of the **aliased** copy-out arm.
+    pub(super) fn alias_snapshot() -> (usize, usize) {
+        (ALIAS_COPIES.with(Cell::get), ALIAS_REFUSALS.with(Cell::get))
+    }
+
+    /// This thread's count of calls whose `ets` **table-alias witness** fired
+    /// ([`note_alias_mark`]).
+    ///
+    /// This is what makes a "the aliased result was not copied" assertion meaningful: it proves
+    /// the cell really was set, so the copy was skipped by the *immediate* rule rather than
+    /// because no witness was installed.
+    pub(super) fn alias_marks() -> usize {
+        ALIAS_MARKS.with(Cell::get)
+    }    /// Zeroes this thread's counters, so a test measures only its own work.
     pub(super) fn reset() {
         COPY_ATTEMPTS.with(|c| c.set(0));
         GROW_RETRIES.with(|c| c.set(0));
@@ -1887,6 +2027,10 @@ mod notes {
         WALK_VISITS.with(|c| c.set(0));
         WALK_HASH_INSERTS.with(|c| c.set(0));
         WALK_SPILLS.with(|c| c.set(0));
+        ALIAS_COPIES.with(|c| c.set(0));
+        ALIAS_MARKS.with(|c| c.set(0));
+        ALIAS_REFUSALS.with(|c| c.set(0));
+        ALIAS_COPY_POOL.with(|c| c.set((0, 0)));
     }
 
     /// This thread's `(copy_attempts, grow_retries, empty_destination_attempts)`.
@@ -1911,3 +2055,6 @@ mod notes {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "calls/alias_tests.rs"]
+mod alias_tests;
