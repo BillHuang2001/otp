@@ -961,3 +961,4 @@ fn the_exit_on_close_false_socket_survives_the_peer_close_message() {
         "the once-only latch is keyed on *reported*, so a live port reports nothing more"
     );
 }
+

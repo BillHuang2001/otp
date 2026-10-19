@@ -34,22 +34,28 @@
 //!
 //! | the C | here |
 //! |---|---|
-//! | `tcp_recv_closed`'s `if (!desc->inet.active)` passive arm — *no message*, **no** port death from the message path (`:12819-12832`) | [`PeerCloseReport`] is **not** produced while the port's mirrored `{active, …}` is `INET_PASSIVE` |
-//! | `tcp_recv_closed`'s active arm → `tcp_closed_message` (`:12830`) | one [`PeerCloseReport`] per descriptor |
+//! | `tcp_recv_closed`'s `if (!desc->inet.active)` passive arm — *no message*, **no** port death from the message path (`:12819-12832`) | [`PeerCloseReport`] is **not** produced while the port's **live** `{active, …}` state is `INET_PASSIVE` |//! | `tcp_recv_closed`'s active arm → `tcp_closed_message` (`:12830`) | one [`PeerCloseReport`] per descriptor |
 //! | `tcp_closed_message`'s `TCP_ADDF_CLOSE_SENT` guard (`:4064-4071`) — **at most once per descriptor** | [`PeerCloseLatches::is_reported`] |
 //! | the sticky re-fire in `inet_set_opts`'s `INET_LOPT_ACTIVE` arm: a *passive* descriptor already in `INET_STATE_CLOSED` sends the message the moment an active mode is armed (`:7013-7021`) | a passive observation keeps the latch and the **later** active `setopts` makes the report due — the once-only guard is keyed on *reported*, never on *observed* |
 //! | `if (desc->inet.exitf) driver_exit(...)` (`:12835-12837`) | [`PeerCloseReport::exit_on_close`], so the caller can retire the port exactly as that call does |
 //!
-//! # Why the active mode comes from the runtime's own mirror
+//! # Where the active mode comes from: the live driver state, with the mirror as fallback
 //!
-//! `beam_io`'s socket driver holds the `{active, …}` state machine but exposes **no accessor** for
-//! it (its `SocketOptions` is private to the driver), while the runtime *does* observe every
-//! accepted `{active, …}` record: `prim_inet:setopts/2` is an `erlang:port_control/3` call and
-//! [`PortRegistry::note_inet_setopts`] records it ([`super::inet_opts`]). So the gate reads
-//! [`PortInetOptions::active_mode`], and the *fallback* is the C's own default: a descriptor with
-//! no `{active, …}` record has never been armed, and `inet_start` leaves `desc->active =
-//! INET_PASSIVE` (`inet_drv.c:10932`). An unknown mode is therefore **passive**, never an invented
-//! "active" — a fabricated `{tcp_closed, S}` would be a wrong message, which is worse than none.
+//! The C reads `desc->inet.active` at the close, i.e. the driver's **own** field — which every
+//! delivery has been spending (`INET_CHECK_ACTIVE_TO_PASSIVE`, `:1552-1560`). So the gate asks the
+//! driver first: [`beam_io::PortRegistry::active_mode`] exposes exactly that store (the mode word
+//! and the running `active_count`), and it is what `inet_active` reads, mapped through
+//! [`beam_io::ActiveMode::is_active`]. A close observed after an exhausted `{active, once}` /
+//! `{active, N}` grant is therefore **silent**, as the oracle's is.
+//!
+//! The port's accepted-`setopts` mirror ([`PortInetOptions::active_state`]) is the **fallback**,
+//! used only where `beam_io` cannot answer — the port has already left it while this runtime still
+//! holds the mirror — and it is kept in step with every spend
+//! ([`PortRegistry::drain_active_spends`]) so it is never a grant behind the driver it stands in
+//! for. Its own fallback is the C's default: a descriptor with no `{active, …}` record has never
+//! been armed, and `inet_start` leaves `desc->active = INET_PASSIVE` (`inet_drv.c:10932`). An
+//! unknown mode is therefore **passive**, never an invented "active" — a fabricated
+//! `{tcp_closed, S}` would be a wrong message, which is worse than none.
 //!
 //! # No `{udp_closed, _}`
 //!
@@ -60,16 +66,18 @@
 //!
 //! # Where the drain happens
 //!
-//! The latch is read **once per port-task round**, immediately beside the other two driver→owner
-//! channels ([`PortRegistry::drain_io_completions`] and
-//! [`PortRegistry::drain_active_inputs`]), because the observation is made by the very same
+//! The latch is read **once per port-task round**, immediately beside the other driver→owner
+//! channels ([`PortRegistry::drain_io_completions`], [`PortRegistry::drain_active_inputs`] and
+//! [`PortRegistry::drain_active_spends`]), because the observation is made by the very same
 //! `ready_input`/`read` callbacks those channels are staged from: every site that owes one owes
-//! this one. Reading it there also means the once-only latch is one hash probe per live port per
-//! round, and no callback can miss a close by draining late — `beam_io`'s answer is sticky.
+//! this one. The spend drain comes **first** within
+//! [`PortRegistry::collect_peer_closes`](PortRegistry) — it is what makes the gate below read a
+//! mode a same-round spend cannot have invalidated. Reading it there also means the once-only latch
+//! is one hash probe per live port per round, and no callback can miss a close by draining late —
+//! `beam_io`'s answer is sticky.
 //!
 //! [`TcpInetDriver`]: beam_io::drivers::inet::TcpInetDriver
-//! [`PortInetOptions::active_mode`]: super::inet_opts::PortInetOptions::active_mode
-//!
+//! [`PortInetOptions::active_mode`]: super::inet_opts::PortInetOptions::active_mode//!
 //! # The three halves of the channel
 //!
 //! Reading the latch is only the first half: the message has to reach its recipient, and the
@@ -109,11 +117,6 @@ use crate::port::{driver_path_name, PortMeta, PortRegistry, RuntimeContext};
 use crate::Runtime;
 
 use super::inet_opts::PortInetOptions;
-
-/// `INET_PASSIVE` (0) — the value of the C's `INET_LOPT_ACTIVE` operand that means "no `{active,
-/// …}` grant is armed" (`inet_drv.c:786`), and the state `inet_start` leaves a descriptor in
-/// (`inet_drv.c:10932`).
-const INET_PASSIVE: i32 = 0;
 
 /// The one driver whose peer-close observation this channel reports — `beam_io`'s
 /// [`beam_io::drivers::inet::DRIVER_NAME`], matched literally so the module never has to hold a
@@ -238,7 +241,7 @@ impl PortRegistry {
     /// port-task round and answers the reports whose delivery is **due now**: the first
     /// observation on an active socket, or a sticky re-fire on a passive→active transition.
     ///
-    /// Call this beside the two sibling channels — immediately after
+    /// Call this beside the sibling channels — immediately after
     /// [`drain_io_completions`](PortRegistry::drain_io_completions) and
     /// [`drain_active_inputs`](PortRegistry::drain_active_inputs) — at every point a driver
     /// callback can run, because the close is observed by the same `ready_input`/read path that
@@ -250,10 +253,12 @@ impl PortRegistry {
     ///    trait default `false` and this channel has no message family for it;
     /// 2. the driver's answer is [`beam_io::PortRegistry::port_closed`] — latched and sticky, so a
     ///    round that drains late cannot miss it;
-    /// 3. the port's mirrored `{active, …}` decides **whether a message exists at all**
-    ///    ([`PortInetOptions::active_mode`], passive on `None` — the C's `inet_start` default). A
-    ///    passive socket reports nothing **now** and its latch is *not* consumed, so the active
-    ///    `setopts` that arrives later makes the report due (the sticky rule);
+    /// 3. the port's **live** `{active, …}` state decides **whether a message exists at all**
+    ///    ([`beam_io::PortRegistry::active_mode`] first — the mode the driver's own store holds
+    ///    after every spend — with [`PortInetOptions::active_state`] as the fallback and passive
+    ///    for `None`, the C's `inet_start` default). A passive socket reports nothing **now** and
+    ///    its latch is *not* consumed, so the active `setopts` that arrives later makes the report
+    ///    due (the sticky rule);
     /// 4. the once-only guard ([`PeerCloseLatches::is_reported`]) is set **before** the report is
     ///    handed out, so one descriptor yields one `{tcp_closed, S}` however many rounds drain it.
     ///
@@ -267,7 +272,6 @@ impl PortRegistry {
     pub(crate) fn drain_peer_closes(&mut self) -> Vec<PeerCloseReport> {
         self.collect_peer_closes(None)
     }
-
     /// [`PortRegistry::drain_peer_closes`] restricted to the reports addressed to `to` — the
     /// `-eval` route's half (see [`RuntimeContext::poll_peer_closes`]).
     ///
@@ -285,8 +289,12 @@ impl PortRegistry {
     /// The one drain: `wanted = None` reports every due close, `wanted = Some(to)` only that
     /// recipient's (see the two public wrappers).
     fn collect_peer_closes(&mut self, wanted: Option<ProcessId>) -> Vec<PeerCloseReport> {
-        // A latch can only outlive its port on a route that bypassed `PortExtras::forget_port`;
-        // this keeps the set bounded by the live ports on every path (`PendingPortSignals::prune`
+        // The spend channel first: this gate reads the `{active, …}` state a delivery may have
+        // spent since the last round, and a drain that ran after the gate would let a close be
+        // reported from a mode the very same round already invalidated (the C clears the flag at
+        // the spend, `inet_drv.c:1552-1560`, so `tcp_recv_closed` sees the passive arm).
+        self.drain_active_spends();
+        // A latch can only outlive its port on a route that bypassed `PortExtras::forget_port`;        // this keeps the set bounded by the live ports on every path (`PendingPortSignals::prune`
         // is the same safety net for the close signals).
         self.extras
             .peer_closes
@@ -399,23 +407,32 @@ impl PortRegistry {
         self.extras.peer_closes.forget(number);
     }
 
-    /// Whether `id`'s mirrored `{active, …}` mode is anything but `INET_PASSIVE` — the C's
-    /// `desc->inet.active` test.
+    /// Whether `id`'s **live** `{active, …}` state is anything but `INET_PASSIVE` — the C's
+    /// `desc->inet.active` test at the close (`if (! desc->inet.active)`, `inet_drv.c:13106`).
     ///
-    /// An unknown mode is **passive**: no `{active, …}` record has ever been accepted for this
-    /// port, and the driver starts at `INET_PASSIVE` (`inet_drv.c:10932`). Never an invented
-    /// "active" — an unknown mode must not produce a message the oracle would not send.
+    /// The answer comes from the driver's own store first ([`beam_io::PortRegistry::active_mode`],
+    /// the C's `desc->inet.active` + `active_count`), because that is the state the C reads: it is
+    /// spent by every delivery (`INET_CHECK_ACTIVE_TO_PASSIVE`, `:1552-1560`), so an
+    /// `{active, once}` socket whose one grant is gone — and an `{active, N}` one whose counter
+    /// reached zero — is **passive** here even though the last `setopts` said otherwise. That is
+    /// what makes `tcp_recv_closed` take its silent passive arm (`:12819-12832`: no message, and no
+    /// port death from the message path) exactly as the oracle does.
     ///
-    /// Residual: a **spent** grant (`{active, once}` after its one delivery, or `{active, N}` whose
-    /// counter reached zero) is still reported as active, because the transition happens inside the
-    /// driver and no `{active, …}` record follows it. See the module report.
+    /// The port's mirrored `{active, …}` ([`PortInetOptions::active_state`]) is the **fallback**,
+    /// used only where `beam_io` cannot answer — the port has left it but this runtime still holds
+    /// its mirror. An unknown mode is **passive** there: no `{active, …}` record has ever been
+    /// accepted for this port, and the driver starts at `INET_PASSIVE` (`inet_drv.c:10932`). Never
+    /// an invented "active" — an unknown mode must not produce a message the oracle would not send.
     fn inet_active(&self, id: PortId) -> bool {
-        let mode = self
-            .inet_options(id)
-            .and_then(PortInetOptions::active_mode);
-        matches!(mode, Some(value) if value != INET_PASSIVE)
+        let mode = match self.registry.active_mode(id) {
+            Ok(mode) => mode,
+            Err(_) => self
+                .inet_options(id)
+                .and_then(PortInetOptions::active_state)
+                .unwrap_or_default(),
+        };
+        mode.is_active()
     }
-
     /// `id`'s mirrored `{exit_on_close, …}` flag, defaulting to the C's `true`
     /// (`desc->inet.exitf = 1`, `inet_drv.c:10929`).
     ///

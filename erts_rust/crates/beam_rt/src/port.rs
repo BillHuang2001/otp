@@ -1735,12 +1735,15 @@ impl PortRegistry {
         // is about to discard and then lose the event to that purge. Folded after, the read is
         // rendered from the recipient the teardown snapshotted ([`FailedReadRecipient`]), which is
         // the snapshot the oracle's `{data,<<"hi">>}` **then** `{'EXIT',P,9}` row needs.
+        // The `active` grants this round's driver callbacks spent are harvested **before** anything
+        // is folded or drained, so the mirror the peer-close gate reads (`ops::inet_opts`) is never
+        // a grant behind the driver (see [`PortRegistry::drain_active_spends`]).
+        self.drain_active_spends();
         let completions = self.drain_io_completions(None);
         // The round harvested the replies the drivers just wrote (and every other live port's
         // buffered input along with them — a round drains them all), so its notifications are
         // **retained** here for the next pump: the queue they came from is already empty.
-        let mut events = Vec::new();
-        self.fold_notifications(notifications, &mut events)?;
+        let mut events = Vec::new();        self.fold_notifications(notifications, &mut events)?;
         self.pending_events.extend(events);
         self.pending_events.extend(completions);
         let active = self.drain_active_inputs();
@@ -1841,8 +1844,8 @@ impl PortRegistry {
         // queue an operation that completes later), so the channel is drained here too — the
         // drain is unconditional, because a failing control call must not also lose the reply
         // it staged.
-        let completions = self.drain_io_completions(None);
-        self.pending_events.extend(completions);
+        self.drain_active_spends();
+        let completions = self.drain_io_completions(None);        self.pending_events.extend(completions);
         // The same callback is where a socket driver stages an `{active, …}` delivery (a
         // `setopts` that reads inline does), so that channel is drained here too.
         let active = self.drain_active_inputs();
@@ -2158,8 +2161,11 @@ impl PortRegistry {
         // (the C's `async_error_am_all`), and `beam_io` harvests those into a registry-owned
         // queue precisely so they are still reported exactly once. Draining here — with the
         // snapshot, because the port's metadata is already gone — is what keeps that reply.
-        let completions = self.drain_io_completions(snapshot);
-        self.pending_events.extend(completions);
+        // The `{active, …}` spends the driver staged before (and during) the teardown are taken in
+        // the same breath; a spend for this port lands on a mirror `extras.forget_port` has already
+        // dropped, which is the intended no-op (a dead socket has no mode).
+        self.drain_active_spends();
+        let completions = self.drain_io_completions(snapshot);        self.pending_events.extend(completions);
         // The teardown's round is a drive point for the `{active, …}` channel as well. A delivery
         // staged for **this** port has no metadata any more, so the drain drops it — the
         // completion channel's rule — while a delivery staged for another live port is held like
@@ -2250,8 +2256,12 @@ impl PortRegistry {
             // A close `beam_io` has not reported yet still owes its `'EXIT'`/`'DOWN'`: minting
             // the report is what retires the port's number and releases them, and with no
             // live port left nothing else would ever run the round that mints it.
-            self.report_pending_closes(&mut events)?;
-            // That round is also a drive point for the completion channel (it is what mints a
+            //
+            // The report round is a drive point for the `{active, …}` spend channel, so the spend
+            // drain comes first — a spend harvested after the closes it precedes would apply to a
+            // mirror the next round already replaced (see [`PortRegistry::drain_active_spends`]).
+            self.drain_active_spends();
+            self.report_pending_closes(&mut events)?;            // That round is also a drive point for the completion channel (it is what mints a
             // close report, and a close is where a driver answers its queued operations), so it
             // is drained here — otherwise a completion awaiting the last port's teardown would
             // be stranded for ever.
@@ -2348,8 +2358,12 @@ impl PortRegistry {
                 }
             }
             let outcome = self.run_port_tasks(PORT_REDS_EXECUTE)?;
-            // The **completion channel** is drained on *every* round, immediately after the
-            // tasks: a driver stages an `{inet_reply, …}`/`{inet_async, …}` from inside a task
+            // The `{active, …}` grants those tasks spent are taken **before** the channels below,
+            // so a spend and the delivery it produced are never split across the mirror's view:
+            // the mode the driver now holds is the one a later peer-close gate must read (see
+            // [`PortRegistry::drain_active_spends`]).
+            self.drain_active_spends();
+            // The **completion channel** is drained on *every* round, immediately after the            // tasks: a driver stages an `{inet_reply, …}`/`{inet_async, …}` from inside a task
             // (or from `output`/`control`), and the port keeps it until a drain takes it, so
             // deferring the drain until something else looked non-empty would starve a caller
             // blocked on that very message (see [`completion`]).

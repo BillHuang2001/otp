@@ -185,9 +185,9 @@ fn the_latches_follow_the_last_accepted_record() {
     assert_eq!(options.get(7), Some(&PortInetOptions {
         mode: Some(StreamType::List),
         active: None,
+        active_count: 0,
         exit_on_close: None,
-    }));
-    // Last accepted record wins, exactly as the driver's field does.
+    }));    // Last accepted record wins, exactly as the driver's field does.
     assert!(options.record(7, &rec(INET_LOPT_MODE, INET_MODE_BINARY as u32)));
     assert_eq!(
         options.get(7).and_then(PortInetOptions::mode),

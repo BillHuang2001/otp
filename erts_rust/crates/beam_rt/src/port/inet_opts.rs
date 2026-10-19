@@ -43,7 +43,7 @@
 //! | latch | code | the C field | the consumer |
 //! |---|---|---|---|
 //! | [`PortInetOptions::mode`] | [`INET_LOPT_MODE`] (24) | `inet.mode` (`inet_drv.c:899`) | [`PortRegistry::data_mode`], which every inet payload renderer resolves its stream through |
-//! | [`PortInetOptions::active_mode`] | [`INET_LOPT_ACTIVE`] (22) | `inet.active` (`inet_drv.c:6968-7016`) | the `{tcp_closed, S}` gate in [`inet_active`](super::peer_closed) |
+//! | [`PortInetOptions::active_mode`] | [`INET_LOPT_ACTIVE`] (22) | `inet.active` + `inet.active_count` (`inet_drv.c:6968-7016`) | the **fallback** half of the `{tcp_closed, S}` gate in [`inet_active`](super::peer_closed), whose live source is [`beam_io::PortRegistry::active_mode`] |
 //! | [`PortInetOptions::exit_on_close`] | [`INET_LOPT_EXITONCLOSE`] (26) | `inet.exitf` (`inet_drv.c:904`) | the port-retirement gate in [`inet_exit_on_close`](super::peer_closed) |
 //!
 //! Nothing else about a `setopts` argument is (or needs to be) retained: the option store itself
@@ -51,6 +51,17 @@
 //! point ([`PortRegistry::note_inet_setopts`]) called from
 //! [`PortRegistry::port_control`](super::PortRegistry) once the driver has answered, so a rejected
 //! `setopts` can never move a latch: only a reply tagged `INET_REP_OK` is applied.
+//!
+//! # `{active, …}` has a second source, and it comes first
+//!
+//! Every other field a driver holds is *not* readable from this runtime, but the `{active, …}`
+//! state is ([`beam_io::PortRegistry::active_mode`], the C's `desc->inet.active` plus
+//! `active_count`), and it is the **authoritative** one: the driver spends one grant per delivered
+//! packet (`INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:1552-1560`), and those spends reach this
+//! mirror too ([`PortRegistry::drain_active_spends`]). So [`PortInetOptions::active_mode`] is the
+//! last accepted `setopts` record — what the port was *told* — and a reader that needs the mode the
+//! socket is **in** asks `beam_io` first and falls back here when the port has left it
+//! ([`PortInetOptions::active_state`], which is that fallback's only reader).
 //!
 //! # `mode` is a seam, not a convenience
 //!
@@ -89,6 +100,7 @@ use beam_process::PortId;
 
 use crate::port::{PortRegistry, StreamType};
 
+use beam_io::{ActiveMode, ActiveSpend};
 /// `ERTS_INET_DRV_CONTROL_MAGIC_NUMBER` (`erts/emulator/beam/sys.h:1466`) — the offset the Erlang
 /// side adds to every `inet` control request and both `*_inet_ctl` entries subtract again.
 const INET_CONTROL_MAGIC: u64 = 0x03f1_a300;
@@ -167,7 +179,9 @@ const INET_AF_INET6: i32 = 2;
 /// `INET_MULTI` (3) — the `{active, N}` value whose record carries the trailing counter
 /// (`inet_drv.c:780`).
 const INET_MULTI: i32 = 3;
-/// `INET_MODE_BINARY` (1) — the only `mode` value besides `INET_MODE_LIST` (`0`, `inet_drv.c:779`).
+/// `INET_PASSIVE` (0) — `{active, false}`, the mode `inet_start` leaves a descriptor in and the one
+/// a spent `{active, once}`/`{active, N}` grant falls back to (`inet_drv.c:786`, `:1554-1557`).
+const INET_PASSIVE: i32 = 0;/// `INET_MODE_BINARY` (1) — the only `mode` value besides `INET_MODE_LIST` (`0`, `inet_drv.c:779`).
 const INET_MODE_BINARY: i32 = 1;
 
 /// One record of a `setopts` argument, as [`walk`] reports it: the option code and the big-endian
@@ -181,6 +195,11 @@ struct RecordBytes {
     code: u8,
     /// The record's big-endian value word, as the C reads it.
     value: i32,
+    /// The trailing big-endian 16-bit **counter** an `{active, N}` record carries after its value
+    /// word (the C's `Sint16 nval`, read with `ptr += 2` in `inet_set_opts`,
+    /// `inet_drv.c:6977-6979`). `None` for every record that carries none — which includes every
+    /// `{active, …}` form except the `INET_MULTI` one.
+    counter: Option<i16>,
 }
 
 /// What a port has been told about its inet options: three latches, each the last accepted
@@ -194,40 +213,57 @@ pub(crate) struct PortInetOptions {
     /// The driver's current `{mode, list|binary}` — the C's `inet.mode`. `None` while no `mode`
     /// record has been seen (every `prim_inet` port sets one, but a port driven by hand may not).
     mode: Option<StreamType>,
-    /// The driver's current `{active, …}` operand — the C's `inet.active`. See
+    /// The driver's `{active, …}` operand — the C's `inet.active`. See
     /// [`PortInetOptions::active_mode`].
     active: Option<i32>,
+    /// The `{active, N}` counter the last accepted record left behind — the C's
+    /// `inet.active_count`, which [`PortInetOptions::active_mode`]'s record accumulates and a
+    /// spent grant zeroes ([`InetOptions::spend_active`]). `0` for every non-`INET_MULTI` mode
+    /// (`inet_set_opts` zeroes it there, `inet_drv.c:6998-6999`).
+    active_count: i16,
     /// The driver's current `{exit_on_close, …}` flag — the C's `inet.exitf`. See
     /// [`PortInetOptions::exit_on_close`].
     exit_on_close: Option<bool>,
 }
-
 impl PortInetOptions {
     /// The driver's current data mode, if a `{mode, …}` record has been seen.
     pub(crate) fn mode(&self) -> Option<StreamType> {
         self.mode
     }
 
-    /// The driver's current `{active, …}` mode value, if a record has been seen.
+    /// The `{active, …}` mode word this mirror **last accepted**, if a record has been seen.
     ///
     /// [`INET_LOPT_ACTIVE`]'s operand **is** the C's `desc->inet.active`
     /// (`inet_set_opts`'s arm, `erts/emulator/drivers/common/inet_drv.c:6968-7016`), whose
     /// vocabulary is `INET_PASSIVE` 0 / `INET_ACTIVE` 1 / `INET_ONCE` 2 / `INET_MULTI` 3
-    /// (`inet_drv.c:786-789`). The mirror only observes it: the driver owns the state machine.
+    /// (`inet_drv.c:786-789`).
     ///
     /// `None` means **no `{active, …}` record has ever been accepted** — the port's driver is
     /// still at the C's `inet_start` default, `INET_PASSIVE` (`inet_drv.c:10932`). The last record
     /// wins, exactly as the driver's own field does.
     ///
-    /// One caveat the caller must carry: a **spent** grant is invisible here. The C clears
-    /// `desc->active` back to `INET_PASSIVE` after an `{active, once}` delivery
-    /// (`INET_CHECK_ACTIVE_TO_PASSIVE`) or when an `{active, N}` counter reaches zero — a
-    /// transition that is the *driver's* state, which this mirror records only when a **new**
-    /// `setopts` arrives.
+    /// What this is: the port's **own last `setopts`**. It is *not* the mode the socket is in — a
+    /// delivery spends an `{active, once}`/`{active, N}` grant inside the driver
+    /// (`INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:1552-1560`) — so a caller that must know the
+    /// live mode asks [`beam_io::PortRegistry::active_mode`] and uses this mirror only where that
+    /// cannot answer, mapped through [`PortInetOptions::active_state`]. The mirror is kept in step
+    /// with a spend too, by [`PortRegistry::drain_active_spends`], so the fallback is never one
+    /// grant behind the driver it stands in for.
     pub(crate) fn active_mode(&self) -> Option<i32> {
         self.active
     }
 
+    /// The `{active, …}` **state** this mirror records, in the vocabulary its live counterpart
+    /// speaks — the fallback reading of [`beam_io::PortRegistry::active_mode`].
+    ///
+    /// `None` when no `{active, …}` record was ever accepted (see
+    /// [`PortInetOptions::active_mode`]), i.e. the C's `inet_start` default; otherwise the mode
+    /// word plus the running `{active, N}` counter, mapped by [`ActiveMode::from_parts`] — the one
+    /// place the numeric encoding lives, so this module never re-spells it.
+    pub(crate) fn active_state(&self) -> Option<ActiveMode> {
+        self.active_mode()
+            .map(|active| ActiveMode::from_parts(active, self.active_count))
+    }
     /// The driver's current `{exit_on_close, …}` flag, if a record has been seen — the C's
     /// `desc->inet.exitf` ([`INET_LOPT_EXITONCLOSE`], `inet_drv.c:904`).
     ///
@@ -290,9 +326,29 @@ impl InetOptions {
                     }
                 }
                 INET_LOPT_ACTIVE => {
-                    self.ports.entry(number).or_default().active = Some(record.value);
-                }
-                INET_LOPT_EXITONCLOSE => {
+                    let entry = self.ports.entry(number).or_default();
+                    entry.active = Some(record.value);
+                    match record.counter {
+                        // The `INET_MULTI` form: the C **accumulates** the record's counter onto
+                        // the running one (`ac = desc->active_count; ac += nval; … desc->active_count
+                        // += nval`, `inet_drv.c:6975-6992`), clamps it up at zero (`if
+                        // (desc->active_count < 0) desc->active_count = 0;`) and falls back to
+                        // `INET_PASSIVE` when nothing is left (`:6993-6996`) — the state
+                        // `beam_io`'s own `set_active` reaches for the same argument.
+                        Some(counter) => {
+                            let total = i32::from(entry.active_count) + i32::from(counter);
+                            entry.active_count =
+                                i16::try_from(total.clamp(0, i32::from(i16::MAX)))
+                                    .unwrap_or(i16::MAX);
+                            if entry.active_count == 0 {
+                                entry.active = Some(INET_PASSIVE);
+                            }
+                        }
+                        // Every other `{active, …}` zeroes the running counter
+                        // (`:6998-6999`).
+                        None => entry.active_count = 0,
+                    }
+                }                INET_LOPT_EXITONCLOSE => {
                     self.ports.entry(number).or_default().exit_on_close = Some(record.value != 0);
                 }
                 _ => {}
@@ -330,8 +386,29 @@ impl InetOptions {
             entry.exit_on_close = Some(exit_on_close);
         }
     }
-}
 
+    /// Applies one drained spend to `number`'s `{active, …}` latch.
+    ///
+    /// Both [`ActiveSpend`] variants leave the same store behind, which is the C's: the mode falls
+    /// back to `INET_PASSIVE` and no grant is left. `INET_ONCE` never has a counter of its own
+    /// (arming it zeroes one, `inet_drv.c:6998-6999`) and the `INET_MULTI` arm only flips once
+    /// `--active_count` reached zero (`:1556-1560`), so the counter is `0` either way — the only
+    /// difference between the two is the `{tcp_passive, S}` the `INET_MULTI` transition also sends,
+    /// which rides the *active-input* channel as `ActiveInputEvent::Passive`, not this mirror.
+    ///
+    /// A port with no mirror entry (no `{active, …}` record was ever accepted, or the port has
+    /// left this runtime's extras) is left alone: the mirror already reads as passive, which is
+    /// what the spend made the driver, so inventing an entry here would fabricate a record the
+    /// port was never sent.
+    ///
+    /// The variant is carried rather than matched on because both land the same store; it is the
+    /// caller's channel that distinguishes them (see [`ActiveSpend`]).
+    fn spend_active(&mut self, number: u64, _spend: ActiveSpend) {
+        if let Some(entry) = self.ports.get_mut(&number) {
+            entry.active = Some(INET_PASSIVE);
+            entry.active_count = 0;
+        }
+    }}
 impl PortRegistry {
     /// Notes one `setopts` control answer for the port `id`, applying the argument to its latches
     /// when the driver accepted it.
@@ -358,6 +435,28 @@ impl PortRegistry {
         self.extras.inet.get(id.number())
     }
 
+    /// Drains every `{active, …}` grant a driver has **spent** since the last drain and applies
+    /// each one to its port's mirror.
+    ///
+    /// The spend happens inside the driver's own option store
+    /// (`INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:1552-1560`): an `{active, once}` grant is
+    /// consumed by the delivery it granted — **silently**, no message — and an `{active, N}`
+    /// counter is decremented per delivery, flipping the mode to `INET_PASSIVE` at zero.
+    /// [`beam_io::PortRegistry::take_active_spends`] reports both, and this is the runtime's one
+    /// consumer: leaving them undrained would keep the mirror claiming a mode the socket has left,
+    /// which is what makes a close after an exhausted grant report a `{tcp_closed, S}` the oracle
+    /// never sends (`tcp_recv_closed`'s passive arm, `inet_drv.c:12819-12832`, is **silent**).
+    ///
+    /// The drain is **destructive** and must therefore run at every point a driver callback can
+    /// spend — beside [`drain_io_completions`](PortRegistry::drain_io_completions) and
+    /// [`drain_active_inputs`](PortRegistry::drain_active_inputs), which are staged by the very
+    /// same callbacks — and **before** [`drain_peer_closes`](PortRegistry::drain_peer_closes),
+    /// whose gate reads the mirror this updates.
+    pub(crate) fn drain_active_spends(&mut self) {
+        for (id, spend) in self.registry.take_active_spends() {
+            self.extras.inet.spend_active(id.number(), spend);
+        }
+    }
     /// The port's current **data mode**: the driver's `{mode, …}` when the mirror knows it, else
     /// `fallback`.
     ///
@@ -434,8 +533,9 @@ pub(crate) fn is_setopts_control(op: &str) -> bool {
 /// The walk is the C's (`inet_set_opts`, `inet_drv.c:6908`): while at least [`RECORD`] bytes remain,
 /// take the code and the big-endian value word, then step over the record's **whole** length —
 /// [`RECORD`] for every fixed-length code and the code-specific payload for the variable-length ones
-/// ([`record_len`]).
-///
+/// ([`record_len`]). An `{active, N}` record's trailing counter is part of that payload and is
+/// reported with the record ([`RecordBytes::counter`]), because the mode word alone does not say how
+/// many grants the port was given.///
 /// The conservative rule: a record whose length is not determinable from the bytes actually present
 /// (a negative or oversized length word, a truncated payload) makes the walk answer `None`, and
 /// [`InetOptions::record`] then applies **nothing** — a mis-split record list would attribute a
@@ -469,7 +569,20 @@ fn walk(arg: &[u8]) -> Option<Vec<RecordBytes>> {
         if step > rest.len() {
             return None;
         }
-        records.push(RecordBytes { code, value });
+        // An `{active, N}` record's trailing counter — the C's `Sint16 nval = get_int16(ptr)`
+        // (`inet_drv.c:6977`). [`record_len`] has already required the two bytes to be present
+        // (`:6978-6979`'s `ptr += 2; len -= 2;`), so this never re-checks the span.
+        let counter = if code == INET_LOPT_ACTIVE && value == INET_MULTI {
+            let tail = rest.get(RECORD..RECORD + ACTIVE_COUNTER)?;
+            Some(i16::from_be_bytes([tail[0], tail[1]]))
+        } else {
+            None
+        };
+        records.push(RecordBytes {
+            code,
+            value,
+            counter,
+        });
         rest = &rest[step..];
     }
     if rest.is_empty() {
@@ -478,7 +591,6 @@ fn walk(arg: &[u8]) -> Option<Vec<RecordBytes>> {
         None
     }
 }
-
 /// The whole length of the record at the head of `rest`, or `None` when it cannot be determined
 /// from the bytes present.
 ///
