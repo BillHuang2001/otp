@@ -694,7 +694,7 @@ impl Runtime {
             process.flags_mut().set_in_run_queue(true);
             process.set_state(ProcessState::Runnable);
             let priority = process.priority();
-            state.spawn(spawn.pid, spawn.entry, spawn.args);
+            state.spawn_stable(spawn.pid, spawn.entry, spawn.args);
             scheduler.enqueue_with_priority(spawn.pid, priority);
             enqueued += 1;
         }

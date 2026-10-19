@@ -109,9 +109,26 @@ pub(super) struct ProcessEngine {
     pub(super) machine: Machine,
     /// Where the process starts and what it is called with.
     pub(super) entry: ProcessEntry,
-    /// The first run's arguments (seeded into `x(0..arity)`); unused once the process
-    /// has run, but kept so a re-run of a finished process is impossible to get wrong.
+    /// The first run's arguments (seeded into `x(0..arity)`).
+    ///
+    /// Held for the engine's whole life: the first entry reads them
+    /// ([`RunnerState::spawn`] hands them to the machine, which seeds `x(0..arity)`), and no arm
+    /// clears or replaces them afterwards, so a re-run of a finished process is impossible to get
+    /// wrong. Their **provenance** decides whether they may be handed over as a reclamation root
+    /// — see [`ProcessEngine::arena_args`].
     pub(super) args: Vec<Eterm>,
+    /// Whether `args` (and a [`ProcessEntry::Fun`]'s fun) are copies on the **pointer-stable
+    /// arena** rather than terms of a heap a collection may move or a process's death may free.
+    ///
+    /// Only a spawn that stabilized its entry and arguments through
+    /// [`Runtime::try_stabilize_escaped`](crate::runtime::Runtime::try_stabilize_escaped) sets
+    /// this (the pending-spawn route, [`RunnerState::spawn_stable`]). It is the soundness gate
+    /// of [`RunnerState::gather_off_heap_roots`]: that function's caller **dereferences** what it
+    /// hands over, and a term that is not a live copy on a stable region must never be rooted —
+    /// which is why the un-stabilized spawn routes contribute nothing here (their terms are on
+    /// the spawning process's own heap, whose root set is the collection's business, not the
+    /// prune's).
+    pub(super) arena_args: bool,
     /// The `(func, pc)` a `receive` suspended at, until the process is woken.
     ///
     /// A [`ProcessEntry::Export`] process and a **`ProcessEntry::Fun`** process whose fun
@@ -244,13 +261,39 @@ impl RunnerState {
     }
 
     /// Registers the engine of a freshly spawned process.
+    ///
+    /// The arguments are **not** asserted stable ([`ProcessEngine::arena_args`] is `false`), so
+    /// this engine contributes no reclamation root; a spawn path that stabilized its terms uses
+    /// [`RunnerState::spawn_stable`] instead.
     pub(crate) fn spawn(&mut self, pid: ProcessId, entry: ProcessEntry, args: Vec<Eterm>) {
+        self.spawn_with_stability(pid, entry, args, false);
+    }
+
+    /// [`RunnerState::spawn`] for the spawn paths that copied the entry fun and every argument
+    /// onto the **pointer-stable arena** first ([`Runtime::note_pending_spawn`], i.e. the
+    /// `erlang:spawn*` calls made from inside a scheduler slice) — the only shape whose terms
+    /// [`RunnerState::gather_off_heap_roots`] may hand over.
+    ///
+    /// [`Runtime::note_pending_spawn`]: crate::runtime::Runtime::note_pending_spawn
+    pub(crate) fn spawn_stable(&mut self, pid: ProcessId, entry: ProcessEntry, args: Vec<Eterm>) {
+        self.spawn_with_stability(pid, entry, args, true);
+    }
+
+    /// The one engine constructor, so the two staged/stable entry points cannot drift.
+    fn spawn_with_stability(
+        &mut self,
+        pid: ProcessId,
+        entry: ProcessEntry,
+        args: Vec<Eterm>,
+        arena_args: bool,
+    ) {
         self.engines.insert(
             pid,
             ProcessEngine {
                 machine: Machine::new(),
                 entry,
                 args,
+                arena_args,
                 parked: None,
                 parked_timeout: None,
                 // A freshly reset machine's FR file is all `NIL` (`fr_mark() == 0`), so its
@@ -277,6 +320,30 @@ impl RunnerState {
     /// resolved by that first run, not here.
     pub(crate) fn spawn_fun(&mut self, pid: ProcessId, fun: Eterm, args: Vec<Eterm>) {
         self.spawn(pid, ProcessEntry::Fun { fun, target: None }, args);
+    }
+
+    /// Appends every **stable** term a live engine still names to `out`: the arguments of a
+    /// [`ProcessEngine::arena_args`] engine and the fun term of its [`ProcessEntry::Fun`] entry.
+    ///
+    /// An engine outlives the slice that created it (a `receive` resumes in the same machine), and
+    /// its first arguments are the child's **first root set** — the arena copies a spawn made
+    /// ([`RunnerState::spawn_stable`]). Nothing else in this runtime names them: they stand on the
+    /// pointer-stable arena, not in any process's mailbox or dictionary, so without this the
+    /// reclamation prunes (`crate::eval::reclaim`) answer a NIF resource a spawn argument carries
+    /// unreachable and release it while the child still holds it.
+    ///
+    /// Only stable engines are enumerated, and the enumeration is `O(1)` when there are no
+    /// engines at all — the overwhelmingly common case for a runtime that spawned nothing.
+    pub(crate) fn gather_off_heap_roots(&self, out: &mut Vec<Eterm>) {
+        for engine in self.engines.values() {
+            if !engine.arena_args {
+                continue;
+            }
+            out.extend_from_slice(&engine.args);
+            if let ProcessEntry::Fun { fun, .. } = &engine.entry {
+                out.push(*fun);
+            }
+        }
     }
 
     /// Whether `pid` is a process this runtime spawned an engine for.

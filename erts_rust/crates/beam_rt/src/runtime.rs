@@ -2052,9 +2052,21 @@ impl Runtime {
     ///
     /// What this function collects is the **named live sets**: the escaped closures' capture
     /// environments, the sequential-trace tokens, every live process's dictionary and mailbox
-    /// queue, and the pending-spawn records (entry fun + arguments). These hold terms no heap
-    /// region necessarily holds. Every one of them is a **real term**, so the walk started from
-    /// them (`crate::eval::reclaim::walk`) may legitimately dereference what it finds.
+    /// queue, the pending-spawn records (entry fun + arguments), the arguments a live engine of a
+    /// stabilized spawn still holds, and every pending timer **delivery** (its message and its
+    /// sender). These hold terms no heap region necessarily holds. Every one of them is a **real
+    /// term**, so the walk started from them (`crate::eval::reclaim::walk`) may legitimately
+    /// dereference what it finds.
+    ///
+    /// Two things make a family belong here. A **refc payload** needs a root when the term naming
+    /// it may have been stored *unstabilized* (the sequential-trace tokens) or when it is an
+    /// engine's own argument copy. A **NIF resource** term needs one wherever it is held at all,
+    /// because a resource's identity is its reference id and a copy of it — which the stabilization
+    /// is — carries the same id: the resource prune's second match tier
+    /// ([`crate::eval::reclaim::resource`]) recognises such a copy, so a family that is not
+    /// enumerated makes a live resource look unreachable and releases it. That is why the pending
+    /// timers and a stabilized engine's arguments are here even though the refc half of both is
+    /// already flattened on-heap.
     ///
     /// What it deliberately does **not** collect is the word image of the runtime's own term
     /// regions — [`Runtime::eval_heap`], its retired generations, the pooled BIF heaps and the
@@ -2068,20 +2080,32 @@ impl Runtime {
     /// handled by [`Runtime::for_each_off_heap_region`] instead, whose scan reads word *patterns*
     /// only and dereferences nothing.
     ///
-    /// Terms that **cannot** name a payload are deliberately not rooted, each for a stated reason:
+    /// Families that are **not** rooted, each with the mechanism that makes them safe:
     ///
-    /// * `persistent_term` values — stabilized through
-    ///   [`Runtime::try_stabilize_escaped`](crate::runtime::gc), whose copy flattens a refc
-    ///   payload on-heap (no handle is registered, and the stored term is the flattened copy).
-    /// * timer messages ([`crate::timers`] `TimerAction::Deliver.message`) and `trace` match specs
-    ///   — stabilized the same way ([`Runtime::stabilize_term`]).
-    /// * ETS — the table copy deep-copies and re-materializes a refc window as on-heap sub-bits
-    ///   (`beam_ets`'s copy), so a stored term names no payload.
-    /// * [`Runtime::references`] — an all-immediate leaf block (a reference has no child slots).
+    /// * `persistent_term` values — the two storing BIFs copy every value through
+    ///   [`Runtime::try_stabilize_escaped`] before the store keeps it, and that copy **flattens**
+    ///   an off-heap refc binary into a fresh on-heap bitstring, so the stored term names no
+    ///   payload. (A resource term in a `persistent_term` value is still released by the resource
+    ///   prune: the copy keeps its identity and the store is not enumerated — the residual
+    ///   `crate::eval::reclaim::resource` records.)
+    /// * `trace` match specs — [`Runtime::stabilize_term`] flattens a refc payload on-heap before
+    ///   the spec is installed, the same way.
+    /// * ETS objects — `beam_ets`' table store **deep-copies** on insert and materializes a refc
+    ///   window as a self-contained on-heap bitstring, so a stored object names no payload. (Its
+    ///   copy of a resource block keeps the reference id, so a resource held *only* by a table is
+    ///   the same residual as the `persistent_term` one: closing it needs an object iterator over
+    ///   the table registry, which `beam_bifs` does not expose.)
+    /// * [`Runtime::references`] — keys and values are reference terms and `MonitorRef`s. A
+    ///   reference thing's four words are a header plus three small integers (node, serial, id),
+    ///   i.e. an all-immediate leaf block: it has no child slot that could name a payload.
     /// * the [`RuntimeContext`]/`DispatchMemo`/native-floor structs and every `thread_local!`
-    ///   site — they hold no `Eterm` a prune can run between, except the x-register/stack set of
-    ///   a *live* engine, which the `RefCount > 1` belt covers (see
-    ///   [`Runtime::any_engine_ever`]).
+    ///   site — each holds either immediates, or a borrowed handle into state already enumerated
+    ///   here (the atom table, the process table, a table registry cell), or the x-register/stack
+    ///   set of a *live* engine during its own call. That last one is the only `Eterm` a prune can
+    ///   run between, and it is covered by the `RefCount > 1` belt (see
+    ///   [`Runtime::any_engine_ever`]) — a payload a live machine holds is still in
+    ///   [`Runtime::eval_off_heap`] or the machine's reservoir, so a candidate is retained rather
+    ///   than released.
     pub(crate) fn gather_off_heap_roots(&mut self, out: &mut Vec<Eterm>) {
         // The escaped closures' capture environments.
         for body in &self.eval_closures {
@@ -2111,6 +2135,17 @@ impl Runtime {
                 out.push(*fun);
             }
         }
+        // The arguments a **live engine** still holds: the child's first root set, whose arena
+        // copies nothing else in this runtime names (`RunnerState::gather_off_heap_roots`).
+        // `RunnerState` is moved out of the runtime for the duration of a scheduler pass, so this
+        // covers the two sites that run outside one (the `-eval` statement boundary and a nested
+        // run's epilogue); the in-pass park arm publishes the machine's own root set instead.
+        self.runner_state.gather_off_heap_roots(out);
+        // Pending `erlang:send_after` deliveries. The message is an arena copy, so a refc payload
+        // in it is already flattened — but a NIF **resource** term's copy keeps its reference
+        // identity, which is how the resource prune recognises a copy, so the family must be a
+        // root or a resource named only by a pending timer is released while it is still live.
+        self.timers.gather_off_heap_roots(out);
     }
     /// Hands `visit` the **word image** of every term region this runtime owns: the never-reset
     /// `-eval`/single-pass store ([`Runtime::eval_heap`]), its retired generations, the pooled BIF
