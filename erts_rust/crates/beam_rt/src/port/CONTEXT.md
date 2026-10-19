@@ -3,7 +3,8 @@
 The runtime side of contract A.4.
 `port.rs` is the **port provider**: `open_port/2`'s `Name`/`Options` decoding, the `PortRegistry`, the port-task round, the `{Port,{data,..}}` pump behind `beam_io`.
 Each child owns one post-`open_port/2` fact over the one `PortExtras` side table: `ops.rs` the table-entry operations, `exit.rs` the `'EXIT'`/`'DOWN'` a close owes, `failure.rs` the driver's own close request, `info_extras.rs` the derived `port_info/2` items.
-Four are driver→owner channels: `completion.rs` (`{inet_reply,…}`/`{inet_async,…}`, what makes `prim_inet:send/4` return), `active_input.rs` (`{tcp,…}`/`{udp,…}`/`{tcp_passive,…}`), `peer_closed.rs` (`{tcp_closed,S}`), `inet_opts.rs` (the per-port `mode`/`active`/`exit_on_close` mirror).
+Four are driver→owner channels: `completion.rs` (`{inet_reply,…}`/`{inet_async,…}`, what makes `prim_inet:send/4` return), `active_input.rs` (`{tcp,…}`/`{udp,…}`/`{tcp_passive,…}`), `peer_closed.rs` (`{tcp_closed,S}`), `inet_opts.rs` (the per-port `mode`/`active`/`exit_on_close` mirror, whose `{active,…}` half is kept in
+step with the driver's own spend path by `PortRegistry::drain_active_spends`).
 Those runtime halves and the closing-port signals are files of this node; the mechanics of every one of them are in [`driver/CONTEXT.md`](driver/CONTEXT.md), which owns the driver side that stages them.
 `driver.rs` is this runtime's **own** driver C-ABI host for `{spawn_driver,Name}` ports over `beam_abi`'s frozen `DriverHost` seam (`driver/`); `watch.rs` delivers `os:set_signal/2` and `select.rs` the `prim_tty:tty_select/2` interest, the special case of its `enif_select` store (`select/`).
 **Separate** from `beam_io`'s own host layer (`beam_io::abi`), so end-to-end `.so`-driver traffic goes through this tree.
@@ -34,6 +35,12 @@ Detail: [`driver/CONTEXT.md`](driver/CONTEXT.md) *`port/completion.rs` — the d
 ### `port/inet_opts.rs` — the per-port inet option mirror (A.4)
 Detail: [`driver/CONTEXT.md`](driver/CONTEXT.md) *`port/inet_opts.rs` — the per-port inet option mirror (A.4)*.
 `prim_inet:open/6` opens every inet port with `[binary]` alone and applies every other option through `setopts/2`, so this node mirrors the driver's `{mode,…}`/`{active,…}`/`{exit_on_close,…}` out of each accepted `port_control/3` argument; `PortRegistry::data_mode(id, fallback)` is the one consuming accessor the delivery renderers read.
+`PortRegistry::drain_active_spends` (`inet_opts.rs:455`) is the spend channel's drain: it takes
+`beam_io::PortRegistry::take_active_spends` (destructive — every spend consumed exactly once) and applies each
+to the mirror (`InetOptions::spend_active` ⇒ `active = INET_PASSIVE`, `active_count = 0`), and it runs **before**
+`collect_peer_closes`'s gate at every drive point, so the peer-close gate never reads a mode a same-round spend
+already invalidated; `PortInetOptions::active_state` is the mirror's `ActiveMode` reader, the fallback half of
+that gate behind `beam_io::PortRegistry::active_mode`.
 ### `port/active_input.rs` — the `{active, …}` input channel (A.4)
 Detail: [`driver/CONTEXT.md`](driver/CONTEXT.md) *`port/active_input.rs` — the `{active, …}` input channel (A.4)*.
 An `{active, true|once|N}` socket parks no input in the port's byte queue, so the driver sends the owner `{tcp,S,Data}`/`{udp,S,IP,Port,Data}`/`{tcp_passive,S}`/`{udp_passive,S}`; the staged `PortEvent::ActiveInput` rides `pending_events`, so `has_nothing_to_poll` sees it.
