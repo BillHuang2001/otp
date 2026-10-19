@@ -128,6 +128,11 @@ Remaining A.5 gaps, each typed — never a wrong value:
 * A `~w`/`~p` of a term holding a **foreign** pid is `beam_codec`'s typed `unsupported_external_term` (`beam_codec/src/error.rs:43`), so a peer's pid cannot be printed.
 * A payload whose local identifier hides in a leaf `holds_local_id` does not descend — a >32-pair hash map, a fun environment, a native record's fields — keeps that same honest refusal rather than risking a wrong term.
 
+**Observation gaps in the inbound path** (both are facts about the wiring, not missing opcode arms):
+* Both production drains count **only** `DeliveryOutcome::Delivered` and discard the rest — `dist/node.rs`'s `dispatch_inbound` and `dist_client/client.rs`'s `dispatch` (`filter(|r| r.outcome == DeliveryOutcome::Delivered).count()`), so an `Unsupported`/`Dropped`/`NoSuchProcess` outcome is invisible in production (no log, no `last_error`, no counter).
+  Only the explicit seam `Runtime::dispatch_inbound` returns the per-message `Vec<Dispatched>` records that carry the outcome.
+* A `RemotePid` naming **this** node is demoted to a local `ProcessId` in exactly one place — `dist/inbound.rs`'s `resolve` (node **and** creation, number **and** serial).
+  The outbound paths do not demote it: `context/send.rs`'s `classify_send_destination` tests `RemotePid::from_eterm` before any node comparison, and the native monitor's `monitor_target` maps every external pid to `MonitorTarget::Remote`, so such a pid reaches the routing entry as a wire destination and answers `no_link_error` instead of delivering locally.
 ## See Also
 - `../dist_client/` → the connecting half (outbound client handshake, the queued `DistSignalRouter` and its `flush_pending`).
 - `../CONTEXT.md` → the crate façade and the A.5 status; `../runtime/CONTEXT.md` → the per-pass distribution drive.
