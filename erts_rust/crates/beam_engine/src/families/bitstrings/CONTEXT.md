@@ -232,16 +232,15 @@ toolchain is absent).
 Every expected byte vector in the newer suites was taken from the system `erl`
 (OTP 29.1.1 / erts-17.1) — never invented.
 Gate: the whole-crate suite is authoritative —
-`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --offline
---no-fail-fast` must stay green (currently 1738 passed / 0 failed / 7 ignored across its 77 targets).
-This family's subset is `... -p beam_engine --offline --lib families::bitstrings`, and the build
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
+--no-fail-fast` must stay green (1764 passed / 0 failed / 7 ignored across its 77 targets).
+This family's subset is `... -p beam_engine --lib families::bitstrings` (135 passed), and the build
 `... -p beam_engine --all-targets` is warning-free. Re-run these for the live counts.
-**Differential evidence:** the project gate `erts_rust/tools/differential` was run
-per-case over the whole `binary/` group plus every bitstring/binary-shaped corpus id
-(62 cases: `binary/*`, `semantics/bit_size_of_bitstring`, the `binary*`/bit-size BIF and
-`mexec_extra` ids, the four `gc/*binary*` cases, `phash2/non_byte_aligned_bitstring`,
-`errors/badmatch_binary_value`, `wire_extra/eval_wide_binary_segment_*`) — **62 agree /
-0 mismatch / 0 unsupported**, all exit 0.
+**Differential evidence:** `erts_rust/tools/differential` was run per-case over the whole `binary/`
+group plus every bitstring/binary-shaped corpus id
+(80 cases: all `binary/*`, `bits/*`, `semantics/bit*`, `wire/bit_binary*`,
+`wire_extra/eval_wide_binary*`, the four `gc/*binary*` cases and `errors/*binary*`) —
+**80 agree / 0 mismatch / 0 unsupported / 0 skipped**, all exit 0.
 **Corpus coverage hole (tools-owned):** no corpus case exercises a **bit-granular
 little-endian** integer write, a `float` segment, a `float-native` pattern or a
 `utf32-little` pattern (the `binary/bignum_*` LE cases are all byte-aligned 16/64-bit
