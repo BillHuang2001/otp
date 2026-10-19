@@ -86,8 +86,12 @@ use crate::terms::{reserve, Slack};
 /// offset and size come from the frozen `ErlSubBits`
 /// ([`beam_term::bitstring_parts`]), so the rest of the family reads it exactly like
 /// a heap binary, at whatever bit offset its window starts.
+///
+/// `pub(crate)` on purpose: a later JIT round inlining a match opcode needs the same
+/// subject triple the family reads (see `matching::match_ctx`'s seam note); the
+/// semantics are unchanged by the visibility.
 #[inline]
-pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize, usize)> {
+pub(crate) fn heap_bits(t: Eterm) -> Option<(*const u8, usize, usize)> {
     // SAFETY: `is_bitstring` checks `is_boxed` before it dereferences the header.
     if !unsafe { beam_term::is_bitstring(t) } {
         return None;
@@ -160,8 +164,15 @@ pub(super) fn subject_bytes<'a>(t: Eterm) -> Result<(&'a [u8], usize)> {
 /// The `(orig, start, end)` triple of an `ErlSubBits` match context.
 ///
 /// `None` when `t` is not a boxed `ErlSubBits` term (`erl_bits.h:60-82`).
+///
+/// In this engine a non-refc `ErlSubBits` is **always** a match context (see
+/// [`heap_bits`]), so `ctx_parts(t).is_some() && !is_refc_binary(t)` is exactly C's
+/// `erl_sub_bits_is_match_context` (`erl_bits.h:107-108`) — the predicate
+/// `bs_start_match3`'s `reuse` arm tests before it re-uses the term untouched.
+///
+/// `pub(crate)` on purpose: see [`heap_bits`].
 #[inline]
-pub(super) fn ctx_parts(t: Eterm) -> Option<(Eterm, usize, usize)> {
+pub(crate) fn ctx_parts(t: Eterm) -> Option<(Eterm, usize, usize)> {
     // `is_boxed` reads only the tag bits, never dereferences.
     if !beam_term::is_boxed(t) {
         return None;
@@ -203,10 +214,9 @@ pub(crate) fn bit_size(t: Eterm) -> Option<usize> {
 /// The inner subject (`orig`, word 4) of a match-context term, or `None` when `t`
 /// is not one.
 ///
-/// The readers that must *re-derive* the `orig` of a fresh subject (the
-/// `bs_start_match*` reuse path and the `bs_get_position` snapshot) use this after
-/// re-reading the context's operand, so the re-wrapped context keeps the inner
-/// subject the C `reuse` path keeps — never the outer context.
+/// Used by the `bs_get_position` over-large-position fallback, which re-derives the
+/// snapshot's `orig` after re-reading the context's operand so the snapshot keeps the
+/// inner subject the C keeps — never the outer context.
 #[inline]
 pub(super) fn inner_orig(t: Eterm) -> Option<Eterm> {
     ctx_parts(t).map(|(orig, _, _)| orig)
@@ -258,8 +268,10 @@ where
 ///
 /// The caller must pass a term [`ctx_parts`] accepted (a live `ErlSubBits`); the
 /// context is mutated in place, mirroring the C `sb->start = …` assignments.
+///
+/// `pub(crate)` on purpose: see [`heap_bits`].
 #[inline]
-pub(super) fn set_ctx_start(t: Eterm, start: usize) {
+pub(crate) fn set_ctx_start(t: Eterm, start: usize) {
     // SAFETY: the caller passed a term `ctx_parts` accepted as a live `ErlSubBits`
     // block, so word 2 is its mutable `start` field.
     unsafe {

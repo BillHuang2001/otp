@@ -94,7 +94,9 @@ mod elision_tests;
 #[allow(unused_imports)]
 pub(crate) use commands::{cmd_at, ensure_at_least, run_commands};
 #[allow(unused_imports)]
-pub(crate) use match_ctx::{enter_match, position_of, read_ctx, reread_ctx, resolve_match4_fail};
+pub(crate) use match_ctx::{
+    enter_match, position_of, position_term, read_ctx, reread_ctx, resolve_match4_fail,
+};
 #[allow(unused_imports)]
 pub(crate) use reads::{
     bit_at, bits_equal, decode_utf16, decode_utf32, decode_utf8, f16_to_f32, read_float_field,
@@ -159,9 +161,23 @@ pub(super) fn exec(
             live: _,
         } => {
             let (_, _, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_position")?;
-            // Reserve the snapshot first, then re-read the context operand so the
-            // snapshot's `orig` is the post-collection inner subject of the *current*
-            // context.
+            // C's `i_bs_get_position` publishes `make_small(sb->start)` — the bare bit
+            // position, an immediate, **no** allocation (`emu/bs_instrs.tab:1145-1149`; the
+            // ARCH_64 fused `i_bs_start_match3_gp` does the same for `$Pos`, `:1091`), and
+            // `bs_set_position` decodes it back into `sb->start` (`:1140-1143`). That pair
+            // is what the compiler brackets a match sequence with, so the save must not
+            // reserve a whole context block per attempt.
+            if let Some(position) = position_term(start) {
+                write_operand(machine, dst, position)?;
+                return Ok(Some(Step::Next));
+            }
+            // A position beyond the small-integer range. C builds a bignum here
+            // (`$GC_TEST_PRESERVE(BIG_UINT_HEAP_SIZE, …)`, `:1150-1163`); the engine cannot
+            // yet restore one (`position_of` reads the small form and a context), so it
+            // keeps its pre-existing whole-context snapshot rather than publishing a term
+            // `bs_set_position` would refuse. Reserve the snapshot first, then re-read the
+            // context operand so the snapshot's `orig` is the post-collection inner subject
+            // of the *current* context.
             let extra = operand_slack_words(ctx_op);
             let snapshot = raw::make_ctx(machine, ctx, start, end, extra, |m, slack| {
                 let value = read_operand_slack(m, ctx_op, slack)?;

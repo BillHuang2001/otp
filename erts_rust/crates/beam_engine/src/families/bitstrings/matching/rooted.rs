@@ -349,3 +349,85 @@ fn bs_match_commits_each_advance_before_it_binds_the_context_register() {
         raw::ctx_parts(machine.x(2).expect("the second context root")).expect("a match context");
     assert_eq!((start, end), (64, 128));
 }
+
+// ---------------------------------------------------------------------------
+// bs_start_match3's reuse path
+// ---------------------------------------------------------------------------
+/// `bs_start_match3` over a term that already **is** the match context re-binds that very
+/// term and reserves nothing: C's `reuse` arm computes `reuse =
+/// erl_sub_bits_is_match_context(sb)` and then does `$Dst = context` — no
+/// `erts_bs_start_match_3`, no `HeapOnlyAlloc`, and no re-read of
+/// `orig`/`start`/`end` (`emu/bs_instrs.tab:1189-1236`; the ARCH_64 fused
+/// `i_bs_start_match3_gp` is the same, `:1063-1095`).
+///
+/// This is the binary comprehension's inner loop shape: `cowboy_bstr:to_lower/1`'s body is
+/// `bs_start_match3 {x,0} → {x,2}` where `{x,0}` is the **previous iteration's** context, so
+/// every iteration took the reuse path — and the engine used to pay a 5-word *collecting*
+/// reservation there for a context it then discarded.
+///
+/// The counter is exact, not a timing: [`MovingContext`] collects on **every**
+/// `alloc_words_rooted` call, so `collections` *is* the rooted-allocation count. The identity
+/// assertion is what makes the reuse faithful (the C re-uses the block rather than rebuilding
+/// one with the same fields), and the position/mutation assertions prove the re-bound term is
+/// the live mutable context rather than a copy of it.
+#[test]
+fn bs_start_match3_reuses_a_match_context_with_no_rooted_allocation() {
+    let mut machine = Machine::with_max_register(4);
+    let mut ctx = MovingContext::new();
+    let context = context_over(&mut machine, &mut ctx, &[0xAB, 0xCD, 0xEF]);
+    // Advance it, so a *rebuilt* context would have to carry the advanced position.
+    assert_eq!(
+        drive(
+            &mut machine,
+            &Instr::BsSkipBits2 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                size: Operand::Integer(8),
+                unit: 1,
+                flags: 0,
+            },
+            &mut ctx,
+        ),
+        Step::Next
+    );
+    assert_eq!(position(&machine), (8, 24));
+
+    let allocations = ctx.collections;
+    // `bs_start_match3 {f,0} {x,0} {x,1}` over the context at `x(0)`.
+    let start_match3 = |dst: Operand| Instr::BsStartMatch3 {
+        fail: NO_FAIL,
+        bin: Operand::X(0),
+        live: 1,
+        dst,
+    };
+    assert_eq!(
+        drive(&mut machine, &start_match3(Operand::X(1)), &mut ctx),
+        Step::Next
+    );
+    assert_eq!(
+        ctx.collections, allocations,
+        "the reuse path must reserve nothing (every `alloc_words_rooted` call collects)"
+    );
+    assert_eq!(
+        machine.x(1).expect("the re-bound context").raw(),
+        context.raw(),
+        "C's reuse arm re-binds the SAME term (`$Dst = context`)"
+    );
+    // The re-bound term is the live context: it carries the advanced position...
+    let (_, start, end) = raw::ctx_parts(machine.x(1).expect("the re-bound context"))
+        .expect("the re-bound term is a match context");
+    assert_eq!((start, end), (8, 24));
+    // ...and a mutation through the new alias is visible through the old one, because the
+    // two registers name one block (a copy would leave `x(0)` behind).
+    raw::set_ctx_start(machine.x(1).expect("the re-bound context"), 16);
+    assert_eq!(position(&machine), (16, 24));
+
+    // A re-entry whose `Dst` is its own `Src` is the no-op `emu/ops.tab:1251-1252` names
+    // for the `resume` form, and it stays a no-op here (nothing is reserved, nothing moves).
+    assert_eq!(
+        drive(&mut machine, &start_match3(Operand::X(0)), &mut ctx),
+        Step::Next
+    );
+    assert_eq!(ctx.collections, allocations);
+    assert_eq!(position(&machine), (16, 24));
+}
