@@ -32,10 +32,13 @@
 //! round-trip:
 //!
 //! ```text
-//!   spill             ; the block's WRITTEN cached x-registers back into
+//!   spill             ; the block's dirty cached x-registers back into
 //!                     ; `machine.x` — MANDATORY: this is the tier's whole
 //!                     ; liveness / root-set model, so a linked exit must never
-//!                     ; skip it (see [`super::spill`])
+//!                     ; skip it (see [`super::spill`]) — except under
+//!                     ; [`ExitSpill::Done`], where a helper call emitted
+//!                     ; immediately before the exit already stored that very
+//!                     ; same dirty set at that very same `pc`
 //!   mov rdi, [rsp+RUNTIME_SLOT_DISP]  ; `rt` for the successor's prologue
 //!   lea rsp, [rsp+slot] ; drop the `rt` slot (`slot` = the prologue's own reservation)
 //!   pop … ; leave the frame, restoring exactly the registers the prologue pushed
@@ -161,6 +164,61 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use super::super::runtime::{encode_target, jit_tail_call, TailHelper, RUNTIME_RESUME_DISP};
 use super::{native_frame_regs, frame_slot_len, spill, Allocation, SpillSite, RUNTIME_SLOT_DISP};
 
+/// Whether a block exit still owes the cached-register **spill**, or whether the code
+/// emitted immediately in front of it has already done that store.
+///
+/// A [`spill`] is site- and path-independent: [`spill_slots_at`] stores exactly the cached
+/// x-registers **dirty at the exit's `pc`**, and no other code in the tier stores them. So
+/// two spill sites reaching the *same* `pc` with no cached-register write in between are
+/// two stores of the same words — the second one is pure redundancy, and that is what
+/// [`ExitSpill::Done`] declares.
+///
+/// `Done` is sound only under all three of these, which the two probed local-call shapes
+/// (and only they) satisfy:
+///
+/// 1. the caller emitted [`emit_helper_call`](super::emit_helper_call) **first**, whose
+///    own [`SpillSite::Helper`] spill at the **same `pc`** is the tier's mandatory
+///    root-set contract (it must run for the helper's sake, so it is never the one
+///    removed);
+/// 2. nothing emitted between that helper call and this exit writes a cached x-register
+///    (the only code there is a helper `call`, a `mov` of a constant into the caller-saved
+///    scratch `r11`, a `cmp` and a `jcc` — no cache slot, no `machine.x` write);
+/// 3. the helper's **decline** path mutates nothing —
+///    [`jit_local_call`](super::super::runtime::jit_local_call) mutates neither `machine.x`
+///    nor any cached register on the decline it hands back to the exit, and
+///    [`jit_call_store`](super::super::call::jit_call_store) only stores the continuation
+///    on the path this exit is reached from — so the values already spilled are still the
+///    ones `machine.x` must receive.
+///
+/// Every other exit — the `jump`, the `test`/`select_val` fail-label branches, the
+/// block's fall-through — passes [`ExitSpill::Required`]: no helper ran in front of it, so
+/// the store is the exit's own.
+///
+/// [`spill_slots_at`]: super::Allocation::spill_slots_at
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ExitSpill {
+    /// The exit owns the store: nothing ahead of it spilled this `pc`.
+    Required,
+    /// A helper call ahead of this exit already spilled the same dirty set at the same
+    /// `pc` (see the type docs); the exit emits no second store.
+    Done,
+}
+
+impl ExitSpill {
+    /// Emit the exit's cached-register store, or nothing when it is already done.
+    fn emit(
+        self,
+        buffer: &mut CodeBuffer,
+        allocation: &Allocation,
+        pc: u32,
+    ) -> Result<()> {
+        match self {
+            ExitSpill::Required => spill(buffer, allocation, SpillSite::Exit, pc),
+            ExitSpill::Done => Ok(()),
+        }
+    }
+}
+
 /// The compiled blocks a branch may jump to directly, keyed by `(func, block
 /// start)` — the same key the driver's entry table uses.
 ///
@@ -197,8 +255,11 @@ impl<'a> Linker<'a> {
     ///
     /// The cached x-registers are spilled on **both** paths, before the frame is
     /// torn down — that spill *is* the tier's liveness/root-set model, so an exit
-    /// may never skip it. The linked path additionally reloads this block's `rt`
-    /// into `rdi` (the block ABI's first argument), because a successor entered by a
+    /// may never skip it — **unless** the caller passes [`ExitSpill::Done`], which
+    /// declares that a helper call emitted immediately before this exit already
+    /// stored the very same dirty set at the very same `pc` (the probed local-call
+    /// shapes; see [`ExitSpill`]). The linked path additionally reloads this block's
+    /// `rt` into `rdi` (the block ABI's first argument), because a successor entered by a
     /// `jmp` gets no `call` to set it.
     pub(super) fn emit_exit(
         &self,
@@ -207,10 +268,12 @@ impl<'a> Linker<'a> {
         done: CodeLabel,
         func: u32,
         pc: u32,
-    store_pc: u32) -> Result<()> {
+        store_pc: u32,
+        spill_mode: ExitSpill,
+    ) -> Result<()> {
         match self.entries.get(&(func, pc)) {
             Some(&target) => {
-                spill(buffer, allocation, SpillSite::Exit, store_pc)?;
+                spill_mode.emit(buffer, allocation, store_pc)?;
                 // `rt` for the successor's prologue: it stores `rdi` into *its* `rt`
                 // slot and loads `rbx` from it. `rdi` is not one of the registers the
                 // teardown pops, so the reloaded value survives the teardown and the
@@ -220,7 +283,7 @@ impl<'a> Linker<'a> {
                 buffer.jmp(target)
             }
             None => {
-                spill(buffer, allocation, SpillSite::Exit, store_pc)?;
+                spill_mode.emit(buffer, allocation, store_pc)?;
                 buffer.mov_ri(Reg::Rax, encode_target(func, pc))?;
                 buffer.jmp(done)
             }
@@ -321,7 +384,9 @@ impl<'a> Linker<'a> {
     /// here): the pop happens **while this block's frame is still live**, so a
     /// frame-size mismatch raises exactly as it does on the interpreter path, and the
     /// spill (the tier's root-set contract, see [`super::spill`]) happens before the
-    /// successor's prologue reloads `machine.x`.
+    /// successor's prologue reloads `machine.x` — skipped only under [`ExitSpill::Done`],
+    /// the probed local-call shape whose helper call already stored the same dirty set at
+    /// the same `pc`.
     pub(super) fn emit_tail_exit(
         &self,
         buffer: &mut CodeBuffer,
@@ -330,7 +395,9 @@ impl<'a> Linker<'a> {
         func: u32,
         pc: u32,
         deallocate: u32,
-    store_pc: u32) -> Result<()> {
+        store_pc: u32,
+        spill_mode: ExitSpill,
+    ) -> Result<()> {
         let &target = self.entries.get(&(func, pc)).ok_or_else(|| {
             crate::error::unsupported("jit: tail-call target has no compiled block")
         })?;
@@ -340,7 +407,7 @@ impl<'a> Linker<'a> {
         // pop returns to a driver that owns the same root set. `jit_tail_call` reads no
         // x-register, so the spill order relative to the call is free — this one keeps
         // the exit shaped like every other exit in the tier.
-        spill(buffer, allocation, SpillSite::Exit, store_pc)?;
+        spill_mode.emit(buffer, allocation, store_pc)?;
         // `rt` (the helper's first argument), the already-resolved successor and the
         // frame size the pop must match.
         buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
@@ -383,6 +450,10 @@ impl<'a> Linker<'a> {
     /// resolved label this compilation emitted no block for (the common case for a tail
     /// call into **another** function of the lazy per-function artifact) is precisely
     /// what the driver serves.
+    ///
+    /// `spill_mode` is [`ExitSpill::Done`] for the probed local-call shape, whose helper
+    /// call already stored the same dirty set at the same `pc`; every other caller passes
+    /// [`ExitSpill::Required`].
     pub(super) fn emit_tail_exit_to_driver(
         &self,
         buffer: &mut CodeBuffer,
@@ -391,13 +462,15 @@ impl<'a> Linker<'a> {
         func: u32,
         pc: u32,
         deallocate: u32,
-    store_pc: u32) -> Result<()> {
+        store_pc: u32,
+        spill_mode: ExitSpill,
+    ) -> Result<()> {
         let word = encode_target(func, pc);
 
         // The root set first (the exit's contract, see [`super::spill`]), then `rt` and
         // the helper's two value arguments: the resolved successor word and the frame
         // size the pop must match.
-        spill(buffer, allocation, SpillSite::Exit, store_pc)?;
+        spill_mode.emit(buffer, allocation, store_pc)?;
         buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
         buffer.mov_ri(Reg::Rsi, word)?;
         buffer.mov_ri(Reg::Rdx, i64::from(deallocate))?;
@@ -503,7 +576,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0, ExitSpill::Required)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the successor's entry, so the
@@ -568,7 +641,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0, ExitSpill::Required)
             .unwrap();
         let exit_len = buffer.len();
         buffer.bind(target).unwrap();
@@ -613,7 +686,7 @@ mod tests {
         let allocation = Allocation::default();
 
         linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0)
+            .emit_exit(&mut buffer, &allocation, done, 0, 7, 0, ExitSpill::Required)
             .unwrap();
         let exit_len = buffer.len();
         buffer.bind(done).unwrap();
@@ -678,7 +751,7 @@ mod tests {
             let linker = Linker::new(&entries);
 
             linker
-                .emit_exit(&mut buffer, &allocation, done, func, pc, pc)
+                .emit_exit(&mut buffer, &allocation, done, func, pc, pc, ExitSpill::Required)
                 .unwrap();
             let exit_len = buffer.len();
             buffer.bind(target).unwrap();
@@ -738,7 +811,7 @@ mod tests {
         };
 
         linker
-            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 0)
+            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 0, ExitSpill::Required)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the successor's entry, so the jump's
@@ -809,7 +882,7 @@ mod tests {
         let linker = Linker::new(&entries);
         let allocation = Allocation::default();
         let err = linker
-            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 0)
+            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 0, ExitSpill::Required)
             .expect_err("an unlinkable tail target is the documented typed error");
         assert!(
             format!("{err:?}").contains("no compiled block"),
@@ -852,7 +925,7 @@ mod tests {
         };
 
         linker
-            .emit_tail_exit_to_driver(&mut buffer, &allocation, done, 0, 7, 3, 0)
+            .emit_tail_exit_to_driver(&mut buffer, &allocation, done, 0, 7, 3, 0, ExitSpill::Required)
             .unwrap();
         let exit_len = buffer.len();
         // A filler byte between the exit and the epilogue, so the trailing jump's

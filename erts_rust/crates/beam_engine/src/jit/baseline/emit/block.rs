@@ -58,7 +58,7 @@ use super::compare::try_inline_comparison;
 use super::family;
 use super::frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use super::heap::{emit_allocate, emit_allocate_heap, emit_test_heap, emit_trim};
-use super::link::{emit_frame_teardown, emit_in_block_call, Linker};
+use super::link::{emit_frame_teardown, emit_in_block_call, ExitSpill, Linker};
 use super::operands;
 use super::prologue::emit_block_prologue;
 use super::r#move::{try_inline_move, try_inline_swap};
@@ -555,7 +555,16 @@ pub(crate) fn emit_block(
                     // A compiled successor is entered **directly** (the linker tears
                     // this block's frame down and jumps to its entry); anything else
                     // returns the `(func, pc)` word to the driver exactly as before.
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
+                    // No helper ran in front of this exit, so the exit owns its spill.
+                    linker.emit_exit(
+                        buffer,
+                        allocation,
+                        done,
+                        target_func,
+                        target_pc,
+                        pc,
+                        ExitSpill::Required,
+                    )?;
                     terminated = true;
                     break;
                 }
@@ -612,7 +621,9 @@ pub(crate) fn emit_block(
                             target_func,
                             target_pc,
                             *deallocate,
-                        pc)?;
+                            pc,
+                            ExitSpill::Done,
+                        )?;
                     } else {
                         linker.emit_tail_exit_to_driver(
                             buffer,
@@ -621,7 +632,9 @@ pub(crate) fn emit_block(
                             target_func,
                             target_pc,
                             *deallocate,
-                        pc)?;
+                            pc,
+                            ExitSpill::Done,
+                        )?;
                     }
                     terminated = true;
                     break;
@@ -651,7 +664,15 @@ pub(crate) fn emit_block(
                         LOCAL_CALL_ONLY,
                         0,
                     )?;
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
+                    linker.emit_exit(
+                        buffer,
+                        allocation,
+                        done,
+                        target_func,
+                        target_pc,
+                        pc,
+                        ExitSpill::Done,
+                    )?;
                     terminated = true;
                     break;
                 }
@@ -733,7 +754,15 @@ pub(crate) fn emit_block(
                     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
                     buffer.jcc(Cond::Ne, done)?;
                     if linked {
-                        linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
+                        linker.emit_exit(
+                            buffer,
+                            allocation,
+                            done,
+                            target_func,
+                            target_pc,
+                            pc,
+                            ExitSpill::Done,
+                        )?;
                     } else {
                         emit_in_block_call(buffer, allocation, done, target_func, target_pc)?;
                     }
@@ -894,8 +923,17 @@ pub(crate) fn emit_block(
 
     if !terminated {
         // The block ran off its end: hand the next address back to the driver — or,
-        // when the following block starts exactly there, jump straight into it.
-        linker.emit_exit(buffer, allocation, done, func, end as u32, end as u32)?;
+        // when the following block starts exactly there, jump straight into it. No
+        // helper ran in front of this exit, so the exit owns its spill.
+        linker.emit_exit(
+            buffer,
+            allocation,
+            done,
+            func,
+            end as u32,
+            end as u32,
+            ExitSpill::Required,
+        )?;
     }
 
     // --- epilogue -----------------------------------------------------------
