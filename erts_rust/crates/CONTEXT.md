@@ -435,13 +435,13 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 ## Contract A.9 (build/bootstrapping) — status
 A.9 is the shallowest contract: its differential coverage is boot/version **observability** plus the
 in-process compiler route.
-- **In-process compilation — 86/86 stdlib sources, `.beam` byte-identical to the oracle's.** Every
-  `lib/stdlib/src/*.erl` the oracle can itself compile in-process now compiles here through the
-  runtime's native floors and produces the oracle's bytes (the `Code` chunk md5 matches for every
-  artifact); the 10 sources that `-include` a header outside their own directory fail on the oracle
-  too. The sweep is `beam_rt/src/context/pump.rs`'s `#[ignore]`d
-  `every_stdlib_source_compiles_in_process_like_the_oracle`. There is still **no self-hosted build**
-  (the Rust runtime does not compile and run itself).
+- **In-process compilation — all 755 oracle-compilable sources byte-identical.** The sweep covers 772
+  `lib/*/src/*.erl` sources over 34 apps; 17 fail on the oracle itself and the other 755 produce the
+  oracle's bytes (a `zlib:compress/1` that is libz-byte-exact at level 6 is what the last of them,
+  `common_test/test_server_node`, needs through `compressed_literals`). `code:get_path/0` returns the
+  oracle's 36 entries, derived from the release layout by `beam_rt/src/codeserver/path.rs`. The sweep is
+  `beam_rt`'s `#[ignore]`d `selfhost_breadth` harness (shard-resumable, `$TMPDIR`-private). There is
+  still **no self-hosted build** (the Rust runtime does not compile and run itself).
 - **Boot path — completes.** `beam_rt`'s boot (`src/boot/`, the boot node: `beam_rt/src/boot/CONTEXT.md`)
   reads and executes the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to
   completion**, ending at the final `{progress,started}` (index 21): `beam_rt -noshell -boot

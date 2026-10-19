@@ -81,7 +81,7 @@ jobs:
       - name: Install Erlang/OTP oracle
         uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # ratchet:erlef/setup-beam@v1.20.4
         with:
-          otp-version: '28'
+          otp-version: '29.1.1'
       - name: Build workspace
         run: cargo build --workspace --all-targets --manifest-path erts_rust/Cargo.toml
       - name: Test workspace

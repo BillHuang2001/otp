@@ -132,7 +132,7 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3156 agree=3155 mismatch=0
+- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3218 agree=3217 mismatch=0
   unsupported=1 skipped=0`** → `gate.sh` exits 0. **No case disagrees.** The single recorded
   capability gap (`known-gaps.txt`, the ratchet allowlist) is `wire/new_fun_ext_encode` (A.5, an
   `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`). `gate.sh` is
@@ -185,20 +185,7 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `code:*`/`init:*`/`application:*` queries are served by a native floor
   (`crates/beam_rt/src/native/{code,init,application}.rs`). Per-crate detail:
   `crates/CONTEXT.md` (A.9 status) and `crates/beam_rt/src/boot/CONTEXT.md`.
-- **A.9 — in-process compilation: 86/86 stdlib sources, `.beam` byte-identical to the oracle's.**
-  Every `lib/stdlib/src/*.erl` that the oracle itself can compile in-process now compiles in-process
-  here and produces a **byte-identical** `.beam` (the `Code` chunk md5 equals the oracle's for every
-  artifact). The route is OTP's default `compile:file/2` shape. The last two blockers were fixed: the
-  `maps` iterator-protocol acceptance (a shared `walk_map_or_iter` now backs
-  `map/2`/`fold/3`/`filter/2`/`foreach/2`/`to_list/1`), and the `bs_create_bin`
-  bignum-into-narrow-segment write (`erl_tar.erl` now compiles byte-identically). The pump deadline
-  that previously truncated long compiles was raised to the legitimate CPU cost
-  (`BLOCKING_PUMP_DEADLINE` 60 s → 900 s). Two native floors make the route work: the native
-  `file_server_2` (`crates/beam_rt/src/native/file_server.rs`, incl. `read_handle_info/1` and the
-  `{write_file,…}`/write-mode-`{open,…}`/`getopts` requests, which is what `epp`'s
-  `-moduledoc({file,…})` needs), and `code:load_binary/3`. The 10 remaining stdlib sources `-include`
-  a header outside their own directory and fail on the oracle too. **No self-hosted build** (the
-  runtime still does not compile/run *itself*).
+- **A.9 — in-process compilation: all 755 oracle-compilable `lib/*/src/*.erl` sources compile and produce the oracle's `.beam` bytes.** The sweep covers **772** sources across 34 apps; **17** fail on the oracle too (so they are not comparable) and the remaining **755** are byte-identical (whole-file md5 and every chunk). The route is OTP's default `compile:file/2` shape, and `code:get_path/0` is derived from the release layout the way `code_server.erl`'s `make_path` does it (**36** entries, matching the oracle element for element — the bundled-app/version selection, `choose_bundles`, `$ERL_LIBS`, `-pa`/`-pz` order). The mechanisms the sweep depends on: the `maps` iterator-protocol acceptance (a shared `walk_map_or_iter` backs `map/2`/`fold/3`/`filter/2`/`foreach/2`/`to_list/1`), the `bs_create_bin` bignum-into-narrow-segment write, a **libz-byte-exact** level-6 deflate behind `zlib:compress/1` (which `common_test/test_server_node`'s `compressed_literals` needs), and two native floors — `file_server_2` (`crates/beam_rt/src/native/file_server.rs`, incl. `read_handle_info/1` and the `{write_file,…}`/write-mode-`{open,…}`/`getopts` requests that `epp`'s `-moduledoc({file,…})` needs) and `code:load_binary/3`. A staged `epp → erl_scan → erl_lint → compile` chain (the compiler compiling the compiler) is byte-identical end to end; long compiles are bounded by `BLOCKING_PUMP_DEADLINE` (900 s). **No self-hosted build** (the runtime still does not compile/run *itself*).
 - **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
   default-OFF and not on `beam_rt`'s path — the native baseline tier is the default for every process
   entry, compiled lazily per function, with `BEAM_RT_TIER=interpreter` the only kill switch); the
