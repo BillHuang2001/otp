@@ -56,14 +56,17 @@
 //!   resource term of that exact type, and returns `0` (leaving `*objp` untouched) for a term of
 //!   another resource type, for a plain term, or for a non-term word. Because a resource term holds a
 //!   reference (point 3 below), a term that was released by its NIF still resolves — exactly as on the
-//!   oracle.
+//!   oracle. Resolution is by **term identity**, not by heap address: a `copy_struct` copy of a
+//!   resource term (the send path, ETS) designates the same object and resolves too — as on the
+//!   oracle, whose magic refs are pointer-identified through `ErtsMRefThing.mb` and therefore
+//!   copy-stable. See "The registry key is the term's IDENTITY" below.
 //!
 //! # Documented substitutions (this crate has no `ERTS_MAGIC_REF` tag, no GC and no module identity)
 //!
 //! 1. **The resource term is minted here, on the host heap.** `beam_term` has no magic-reference
 //!    tag, so a resource term is an ordinary **internal reference** built by this file — the same
 //!    `[hdr|REF_SUBTAG][node][serial][id]` block `beam_rt`'s own `erlang:make_ref/0` builds — with a
-//!    distinct id per call, recorded in the registry as *term word → (type, object)*.
+//!    distinct id per call, recorded in the registry as *(term identity, type, object)*.
 //!    `enif_get_resource` then resolves that mapping (and checks the type), which is exactly the
 //!    observable contract. Measured on the oracle: two `enif_make_resource` calls for one object
 //!    yield two *distinct* terms that both print as `#Ref<0.…>`, so a fresh reference per call is
@@ -75,7 +78,11 @@
 //!    returned by `enif_make_resource_binary` yields `1` and the resource object. So the term built
 //!    here is registered as well. (Its *bytes* are copied onto the heap; the C zero-copies the
 //!    caller's buffer into a refc binary. The bytes are the same; only the aliasing differs.)
-//! 3. **Liveness: a resource TERM holds its own reference; the destructor's timing.** An exporting
+//!    **The one identity residual:** an `enif_make_resource` term is a *reference*, so its identity
+//!    survives a copy — but this term is an **on-heap binary**, and a binary carries no shared
+//!    identity at all (the C's magic binary is an off-heap refc binary, which is copy-shared). A
+//!    *copied* resource-**binary** term therefore does not resolve here, where the oracle's does. A
+//!    typed residual (`enif_get_resource` answers `0`), never a wrong result.//! 3. **Liveness: a resource TERM holds its own reference; the destructor's timing.** An exporting
 //!    call (`enif_make_resource` / `enif_make_resource_binary`) takes **one extra reference** on the
 //!    object for the term it returns — exactly the reference the C's magic reference holds
 //!    (`erl_nif.c` `erts_bld_resource_ref` → `erts_mk_magic_ref` → `erts_bin_inc_refc`). A
@@ -124,10 +131,42 @@
 //!    it on module unload) — the registry is process-lifetime, exactly like the C's global
 //!    `resource_type_list`.
 //!
+//! # The registry key is the term's IDENTITY, not its heap word
+//!
+//! A resource term's identity is its **reference id** — the M1 block's last word — and not the
+//! address of the block. The registry is therefore keyed by [`TermKey`]: a reference thing (header
+//! arity [`prelude::INTERNAL_REF_PAYLOAD_WORDS`]) keys on [`prelude::internal_ref_id`], every other
+//! term shape on its raw word. One private helper, [`term_key`], derives the key for **both** the
+//! binding and the lookup, so the two can never disagree.
+//!
+//! Why it matters: `beam_message::copy_struct` (the send path, ETS) copies a term word for word, so a
+//! copy is a *different heap address carrying the same identity*. Keying on the word made such a copy
+//! miss (`enif_get_resource` answered `0` where the oracle answers `1`); keying on the identity makes
+//! it resolve to the same object. It is also what the C does — its magic refs are pointer-identified
+//! through `ErtsMRefThing.mb` (a refc-binary header the copy shares), i.e. copy-stable.
+//!
+//! The `Word` arm exists for the shapes that genuinely have no shared identity: an
+//! `enif_make_resource_binary` term is an **on-heap binary** here (module docs, substitution 2), so a
+//! copy of it is only itself. Per-mint refcounting is unaffected: each minting call mints a fresh id
+//! (or a fresh binary) and takes its own object reference, so `terms` still holds exactly one binding
+//! per *live* mint, and each removed binding releases exactly one reference.
+//!
+//! **A reused address evicts a dead mint.** Two *live* term blocks cannot share a heap word, so when a
+//! fresh mint lands on a word some existing binding still occupies, that older binding's term block
+//! has necessarily been freed: its term is dead, and only its reference is still standing. Binding the
+//! new term therefore evicts the old entry and gives its reference back (outside the lock, so a
+//! destructor may call back in) — which is what a prune would have done, one park point earlier, and
+//! it keeps `resource_terms()`'s words unique.
+//!
+//! **Residual (reported, not closable from this file):** this crate's reference id space is its own
+//! (`next_resource_ref_id`), independent of the runtime's (`beam_process::ProcessTable::next_reference`,//! which feeds `make_ref/0`, monitors, aliases and timers). A *plain* reference whose id happens to
+//! equal a live resource term's id would resolve as that resource. `beam_process` documents the same
+//! hazard class ("HAZARD 2"); its closure is one shared id allocator at the host level (for instance a
+//! `NifHost` mint hook that draws from the runtime's allocator), which is a `beam_rt` change.
+//!
 //! # The destructor's timing — the deviation the C does not let us close
 //!
-//! **What the C does** (`erts/emulator/beam/erl_nif.c`). `enif_release_resource` (`:3164-3175`)
-//! drops one reference. The release that reaches zero does **not** run the destructor: it runs
+//! **What the C does** (`erts/emulator/beam/erl_nif.c`). `enif_release_resource` (`:3164-3175`)//! drops one reference. The release that reaches zero does **not** run the destructor: it runs
 //! `nif_resource_dtor_prologue` (`:2961-2972`), which does
 //! `erts_schedule_misc_aux_work(<sched_id>, run_resource_dtor, bin)` and returns `0` ("don't free"),
 //! so the magic binary and its payload stay live for an **aux-work** task to pick up.
@@ -299,6 +338,45 @@ struct ResourceType {
     host: *mut dyn NifHost,
 }
 
+/// The **identity** of a term that designates a resource object — the registry's key.
+///
+/// A resource term is an M1 internal reference (module docs, substitution 1), and a reference is
+/// identified by its `id` word, not by the address of its block: `copy_struct` (the send path, ETS)
+/// produces a *different heap address with the same identity*, and the C's magic refs are
+/// pointer-identified through `ErtsMRefThing.mb`, which a copy shares. Keying the registry by the raw
+/// word therefore loses every copy of a resource term; keying it by the identity keeps them all
+/// (module docs, "The registry key is the term's IDENTITY").
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum TermKey {
+    /// An M1 internal-reference thing whose header arity is
+    /// [`prelude::INTERNAL_REF_PAYLOAD_WORDS`], keyed by its copy-stable reference id.
+    Ref(u64),
+    /// Every other term shape, keyed by the raw term word. This is the arm
+    /// `enif_make_resource_binary` lands in: its term is an **on-heap binary**, which carries no
+    /// shared identity at all, so the word is the only identity it has.
+    Word(usize),
+}
+
+/// The registry key of `term` — **the one place** binding and lookup derive identity, so they can
+/// never disagree.
+fn term_key(term: Eterm) -> TermKey {
+    let word = term.raw();
+    if !is_term_word(term) {
+        // Not a term at all (a bare header word / `THE_NON_VALUE`): it has no shape to inspect.
+        return TermKey::Word(word);
+    }
+    // SAFETY: `internal_ref_id` validates before it reads — it re-checks the `REF_SUBTAG`, refuses a
+    // block whose header arity is not `INTERNAL_REF_PAYLOAD_WORDS` (a C-layout `[hdr, w1, w2]` block
+    // has arity 2 and no id word), and refuses an id word that is not a non-negative small integer.
+    // So it only dereferences the header of a boxed term the caller holds, and it answers a typed
+    // error — never a wrong id — for anything else.
+    match unsafe { prelude::internal_ref_id(term) } {
+        Ok(id) => TermKey::Ref(id),
+        // Not an M1 reference (a small int, an atom, a binary, a tuple, a C-layout ref block, …):
+        // the raw word is the only identity such a term has.
+        Err(_) => TermKey::Word(word),
+    }
+}
 /// One live term designating a resource object (the registry's value).
 #[derive(Copy, Clone)]
 struct ResourceRef {
@@ -306,6 +384,14 @@ struct ResourceRef {
     ty: *mut ResourceType,
     /// The resource payload pointer (what `enif_get_resource` writes to `*objp`).
     obj: *mut c_void,
+    /// The term word **as minted** — the address of the block this crate built, even though the map
+    /// is keyed by the term's identity ([`TermKey`]).
+    ///
+    /// This is what the release seam enumerates ([`resource_terms`]) and hands to the caller's
+    /// reachability predicate, so a caller keeps reasoning about the term it was given (its root set
+    /// holds words, and `beam_rt`'s walk answers a candidate's own word for a direct hit *or* for a
+    /// copy's identity).
+    word: Eterm,
 }
 
 /// The process-wide registry: the resource types ever opened and the live resource terms.
@@ -314,8 +400,11 @@ struct Registry {
     /// Every type ever opened, in open order (the C's global `resource_type_list`). A `Box` keeps the
     /// `*mut ResourceType` handed to NIFs stable across `Vec` growth.
     types: Vec<Box<ResourceType>>,
-    /// `term word -> object` for every resource term this crate minted (see the module docs, point 1).
-    terms: HashMap<usize, ResourceRef>,
+    /// `term identity -> object` for every resource term this crate minted (see the module docs,
+    /// point 1 and "The registry key is the term's IDENTITY"). One entry per **mint**; any number of
+    /// copies of a minted term share it, because they all carry the same identity.
+    terms: HashMap<TermKey, ResourceRef>,
+
     /// The **live payload pointers** of every object this crate allocated, i.e. the set of `void*`
     /// values that really are `&ErtsResource.data` in the C's sense.
     ///
@@ -357,9 +446,26 @@ impl Registry {
         &mut **last as *mut ResourceType
     }
 
-    /// Record that the term word `word` designates the object `obj` of type `ty`.
-    fn bind_term(&mut self, word: usize, r: ResourceRef) {
-        self.terms.insert(word, r);
+    /// Record that the term `term` designates the object `r` binds — keyed by the term's **identity**
+    /// ([`term_key`]), so a later lookup through a copy of the term (same identity, different heap
+    /// address) finds this binding.
+    ///
+    /// Also **evicts** a binding that is provably dead because the new term reuses its heap word: two
+    /// *live* term blocks cannot share an address, so an existing binding whose word this term now
+    /// occupies can only be a mint whose heap is gone (module docs, "A reused address evicts a dead
+    /// mint"). The evicted object is returned so the caller can drop that binding's reference
+    /// **outside** the registry lock — the destructor may call straight back into these entry points.
+    fn bind_term(&mut self, term: Eterm, r: ResourceRef) -> Option<*mut c_void> {
+        let key = term_key(term);
+        let word = term.raw();
+        let dead = self
+            .terms
+            .iter()
+            .find(|(other, entry)| **other != key && entry.word.raw() == word)
+            .map(|(other, _)| *other);
+        let dead = dead.and_then(|other| self.terms.remove(&other)).map(|e| e.obj);
+        self.terms.insert(key, r);
+        dead
     }
 
     /// Record that `obj` is a **live** payload pointer this crate allocated.
@@ -380,15 +486,22 @@ impl Registry {
         Some(unsafe { (*header_ptr(obj)).ty })
     }
 
-    /// The object a resource term designates, if any.
-    fn lookup_term(&self, word: usize) -> Option<ResourceRef> {
-        self.terms.get(&word).copied()
+    /// The object the resource term `key` identifies, if any.
+    ///
+    /// The caller passes [`term_key`]'s answer, so a copy of a minted resource term resolves to the
+    /// very binding the mint created.
+    fn lookup_term(&self, key: TermKey) -> Option<ResourceRef> {
+        self.terms.get(&key).copied()
     }
 
     /// Drop every term binding to `obj` **and** its liveness registration, and cancel its armed
     /// monitors — called as the object is destroyed, so a term that still designates it resolves to
     /// nothing (instead of a dangling payload pointer) and a later [`Registry::object_type`] query
     /// answers `None` rather than reading freed memory.
+    ///
+    /// The retention is on the **value**, not the key, so every binding that names this object goes —
+    /// whichever identity key it was filed under (a reference id, or the word of an on-heap
+    /// resource-binary term), and therefore every copy of every term that designated it.
     ///
     /// Cancelling the monitors is the C's `run_resource_dtor` → `dtor_demonitor` path
     /// (`erl_nif.c:2940-2948`, `:2974-3030`): a dying resource's monitors are removed **without** a
@@ -920,8 +1033,22 @@ fn mint_resource_ref(e: &mut NifEnv) -> Option<Eterm> {
     Some(prelude::make_boxed(p as *const Eterm))
 }
 
-/// `ERL_NIF_TERM enif_make_resource(ErlNifEnv* env, void* obj);`
+/// Drop the reference an **evicted** (provably dead) binding held — outside the registry lock, so the
+/// destructor it may run can call straight back into these entry points.
 ///
+/// # Safety
+///
+/// `dead` must be null or a payload pointer that carried exactly one outstanding reference: the one
+/// the evicted binding took when it was minted. [`Registry::bind_term`] only ever answers the object
+/// of a binding whose heap word a *live* term has just re-occupied, which is exactly that case.
+unsafe fn release_evicted(dead: Option<*mut c_void>) {
+    if let Some(stale) = dead {
+        // SAFETY: forwarded from the caller's contract; the registry lock is already released.
+        unsafe { enif_release_resource(stale) };
+    }
+}
+
+/// `ERL_NIF_TERM enif_make_resource(ErlNifEnv* env, void* obj);`///
 /// Mints the resource term **here** — a fresh internal reference built on the host heap by
 /// [`mint_resource_ref`] — and records it in the registry (module docs, substitution 1). The C
 /// returns a fresh magic ref per call (measured: two calls for one object yield two distinct terms),
@@ -952,14 +1079,28 @@ pub unsafe extern "C" fn enif_make_resource(env: *mut ErlNifEnv, obj: *mut c_voi
     };
     // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
     let ty = unsafe { (*header_ptr(obj)).ty };
-    with_registry(|r| {
-        r.bind_term(reference.raw(), ResourceRef { ty, obj });
-    });
-    // The term now owns a reference — the reference the C's magic ref holds. It is dropped by
-    // `release_resource_terms` once the caller's reachability analysis says the term is dead, and
-    // never otherwise (there is no GC to collect the term); see the module docs, point 3.
+    // The term takes its reference **before** it is published — the reference the C's magic ref
+    // holds. It is dropped by `release_resource_terms` once the caller's reachability analysis says
+    // the term is dead, and never otherwise (there is no GC to collect the term); see the module
+    // docs, point 3.
     // SAFETY: `obj` is a live payload pointer with an outstanding reference (caller contract).
     unsafe { retain_object(obj) };
+    let dead = with_registry(|r| {
+        r.bind_term(
+            reference,
+            ResourceRef {
+                ty,
+                obj,
+                word: reference,
+            },
+        )
+    });
+    // A binding whose heap word this fresh term now occupies was provably dead: give its reference
+    // back (module docs, "A reused address evicts a dead mint"). It is never `obj` itself — the
+    // caller's contract keeps `obj` live.
+    // SAFETY: `dead` is the evicted binding's payload pointer, exactly one reference outstanding
+    // (see `release_evicted`'s contract); `bind_term` is the only producer of that answer.
+    unsafe { release_evicted(dead) };
     n(reference)
 }
 
@@ -1010,12 +1151,24 @@ pub unsafe extern "C" fn enif_make_resource_binary(
     };
     // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
     let ty = unsafe { (*header_ptr(obj)).ty };
-    with_registry(|r| {
-        r.bind_term(term.raw(), ResourceRef { ty, obj });
-    });
-    // The term owns a reference, exactly as for `enif_make_resource` (module docs, point 3).
+    // The term takes its reference before it is published, exactly as for `enif_make_resource`
+    // (module docs, point 3).
     // SAFETY: `obj` is a live payload pointer with an outstanding reference (caller contract).
     unsafe { retain_object(obj) };
+    let dead = with_registry(|r| {
+        r.bind_term(
+            term,
+            ResourceRef {
+                ty,
+                obj,
+                word: term,
+            },
+        )
+    });
+    // As in `enif_make_resource`: a dead binding whose word this term reuses gives its reference back.
+    // SAFETY: `dead` is the evicted binding's payload pointer, exactly one reference outstanding
+    // (see `release_evicted`'s contract); `bind_term` is the only producer of that answer.
+    unsafe { release_evicted(dead) };
     n(term)
 }
 
@@ -1024,6 +1177,10 @@ pub unsafe extern "C" fn enif_make_resource_binary(
 /// Returns `1` and writes `*objp` only when `term` designates a resource object of exactly `type`;
 /// otherwise returns `0` and leaves `*objp` untouched. (The C writes `*objp` without a null check; a
 /// null `objp` is tolerated here.)
+///
+/// Resolution is by the term's **identity** ([`term_key`]), not by its heap address, so a
+/// `copy_struct` copy of a resource term — a different heap address with the same reference identity —
+/// resolves to the same object, exactly as the C's copy-stable magic refs do.
 ///
 /// # Safety
 ///
@@ -1045,7 +1202,7 @@ pub unsafe extern "C" fn enif_get_resource(
     if !is_term_word(word) {
         return 0;
     }
-    match with_registry(|r| r.lookup_term(word.raw())) {
+    match with_registry(|r| r.lookup_term(term_key(word))) {
         Some(entry) if entry.ty == target => {
             if !objp.is_null() {
                 // SAFETY: `objp` is non-null and writable (checked; the caller declares it).
@@ -1061,7 +1218,9 @@ pub unsafe extern "C" fn enif_get_resource(
 ///
 /// Returns `0` after calling the identified type's `dyncall`, and non-zero when no call was made
 /// (`erl_nif.c:3297-3323`). A term this crate minted is resolved directly: the `name` atom must match
-/// the type and the type must carry a `dyncall`. Any other term falls through to the defaulted
+/// the type and the type must carry a `dyncall`. Resolution is by the term's identity
+/// ([`term_key`]), so a `copy_struct` copy of the minted term reaches the `dyncall` too. Any other
+/// term falls through to the defaulted
 /// [`NifHost::dynamic_resource_call`] hook (a resource type from another NIF module); `None` from the
 /// hook is unsupported and yields the C's failure code `1`.
 ///
@@ -1086,7 +1245,7 @@ pub unsafe extern "C" fn enif_dynamic_resource_call(
         // Not a term at all — never a resource handle (the C's `is_internal_magic_ref` is false).
         return 1;
     }
-    let Some(entry) = with_registry(|r| r.lookup_term(resource.raw())) else {
+    let Some(entry) = with_registry(|r| r.lookup_term(term_key(resource))) else {
         // Not a resource object this crate minted: let the host resolve it (another NIF module).
         return match e
             .host()
