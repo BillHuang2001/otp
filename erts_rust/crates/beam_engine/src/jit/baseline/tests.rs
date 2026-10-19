@@ -1253,8 +1253,102 @@ fn a_call_continuation_inside_a_block_gets_its_own_native_sub_block() {
     assert_eq!(eager.block_count(), 3, "sub-blocks add no block");
 }
 
-/// The **eager** layout — the one the mandated `jit_bench` harness compiles — lowers the
-/// same continuation sub-blocks as the lazy layout, so its driver has a native entry at the
+/// A block entry that stays inside one function resolves from the caller's
+/// [`ResolvedFunction`] handle instead of re-resolving the lazy artifact's per-function
+/// table, and every answer stays identical to the uncached
+/// [`CompiledModule::native_entry`].
+///
+/// The observable is the thread-local `lazy_function_resolutions` counter, recorded by
+/// [`CompiledModule::native_entry_cached`] on each **successful** per-function
+/// resolution: a same-function entry must add none (that is the `RefCell` probe +
+/// `Rc::clone` the cache spares), an entry into another function must add exactly one,
+/// returning to a function the cache no longer holds must add one again, an address with
+/// no compiled block must add none, and the eager layout — which addresses its one shared
+/// table directly — must never resolve anything.
+#[test]
+fn a_same_function_block_entry_reuses_the_resolved_function() {
+    let (module, _) = local_call_case();
+    // `local_call_case` has two functions: `f/0` (block start pc 1, continuation pc 4)
+    // and `g/0` (block start pc 0).
+    let compiled = CompiledModule::lazy(&module);
+
+    // The uncached answers, taken before the counters are armed so the two forms can be
+    // compared without polluting the counts.
+    let (want_block, want_block_bound) = compiled.native_entry(&module, 0, 1).expect("pc 1");
+    let (want_sub, want_sub_bound) = compiled.native_entry(&module, 0, 4).expect("pc 4");
+    let (want_g, want_g_bound) = compiled.native_entry(&module, 1, 0).expect("g/0 pc 0");
+
+    super::counters::reset();
+    super::counters::set_enabled(true);
+    let mut cache: ResolvedFunction = None;
+
+    // A first entry into a function resolves it.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 0, 1, &mut cache),
+        Some((want_block, want_block_bound)),
+        "the cached entry must agree with `native_entry`"
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 1);
+
+    // A different pc in the SAME function (here a continuation sub-block) is a cache hit.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 0, 4, &mut cache),
+        Some((want_sub, want_sub_bound)),
+        "a same-function sub-block entry must agree with `native_entry`"
+    );
+    assert_eq!(
+        super::counters::snapshot().lazy_function_resolutions,
+        1,
+        "a same-function block entry must not re-resolve the function"
+    );
+
+    // A different function (and a different bound, its own) re-resolves once.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 1, 0, &mut cache),
+        Some((want_g, want_g_bound)),
+        "a cross-function entry must agree with `native_entry`"
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 2);
+
+    // ... and the handle is single-slot, so going back resolves `f/0` again.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 0, 1, &mut cache),
+        Some((want_block, want_block_bound))
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 3);
+
+    // An address in the cached function with no compiled block resolves nothing and
+    // leaves the cache as it was, so the next same-function entry is still a hit.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 0, 99, &mut cache),
+        None,
+        "an address past the end of the function has no entry"
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 3);
+    assert!(
+        compiled.native_entry_cached(&module, 0, 1, &mut cache).is_some(),
+        "a miss must leave the cached function in place"
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 3);
+
+    // The eager layout forwards to `native_entry` and carries nothing.
+    let eager = compile_module(&module).expect("the module compiles eagerly");
+    let mut eager_cache: ResolvedFunction = None;
+    assert_eq!(
+        eager.native_entry_cached(&module, 0, 1, &mut eager_cache),
+        eager.native_entry(&module, 0, 1),
+        "the eager layout's cached form is `native_entry` itself"
+    );
+    assert!(eager_cache.is_none(), "the eager layout caches nothing");
+    assert_eq!(
+        super::counters::snapshot().lazy_function_resolutions,
+        3,
+        "the eager layout resolves no function at all"
+    );
+    super::counters::set_enabled(false);
+}
+
+/// The **eager** layout — the one the mandated `jit_bench` harness compiles — lowers the/// same continuation sub-blocks as the lazy layout, so its driver has a native entry at the
 /// `pc + 1` a frame-preserving call returns to even though that address is not an IR block
 /// start. An address with no code at all still answers `None`, and `block_count` still
 /// counts the non-empty IR blocks only (sub-blocks are not blocks).

@@ -133,6 +133,12 @@ struct LazyLayout {
     ///
     /// `RefCell` because compile-on-entry happens through [`CompiledModule::native_entry`],
     /// which the shared driver calls with `&self`.
+    ///
+    /// This cell is **not** on the driver's hot path: a block entry into the function the
+    /// driver last resolved answers from its own `ResolvedFunction` handle
+    /// ([`CompiledModule::native_entry_cached`]), so only a *different* function (a
+    /// cross-function transfer, a call into another function, a fresh slice) pays the
+    /// borrow and the `Rc` clone.
     functions: RefCell<Vec<Option<Rc<CompiledFunction>>>>,
 }
 
@@ -280,16 +286,10 @@ impl CompiledModule {
             Layout::Lazy(lazy) => {
                 let functions = lazy.functions.borrow();
                 let function = functions.get(func as usize)?.as_ref()?;
-                function
-                    .entries
-                    .get(pc as usize)
-                    .copied()
-                    .flatten()
-                    .or_else(|| function.sub_entries.get(pc as usize).copied().flatten())
+                lazy_entry(function, pc)
             }
         }
     }
-
     /// The native entry for `(func, pc)` **together with the register-file bound the run
     /// must satisfy before entering it** — the driver's entry point, and the one place a
     /// lazy artifact compiles a function.
@@ -312,6 +312,10 @@ impl CompiledModule {
     ///   and links only intra-function blocks; a cross-function transfer is absent from
     ///   the map, so the block returns the target's `(func, pc)` word to the driver,
     ///   which re-checks the target function's own bound on its own entry.
+    ///
+    /// This form re-resolves the owning function on every call (a `RefCell` probe plus
+    /// an `Rc` clone for the lazy layout). The driver, which asks once per block entry,
+    /// goes through [`CompiledModule::native_entry_cached`] instead.
     pub(crate) fn native_entry(
         &self,
         module: &Module,
@@ -325,15 +329,58 @@ impl CompiledModule {
             }
             Layout::Lazy(_) => {
                 let function = self.function(module, func)?;
-                let entry = function
-                    .entries
-                    .get(pc as usize)
-                    .copied()
-                    .flatten()
-                    .or_else(|| function.sub_entries.get(pc as usize).copied().flatten())?;
+                let entry = lazy_entry(&function, pc)?;
                 Some((entry, function.summary.highest_native_register))
             }
         }
+    }
+
+    /// [`CompiledModule::native_entry`] with the owning function carried across calls.
+    ///
+    /// `cached` holds the lazy layout's last resolved function: while the driver stays
+    /// in one function (a block-to-block jump inside it, the common case for a loop body
+    /// or a continuation sub-block) an entry resolves from that handle with **no**
+    /// `RefCell` borrow and **no** `Rc` traffic, only the two-entry block-table probe.
+    ///
+    /// The semantics are exactly [`CompiledModule::native_entry`]'s: the cache changes
+    /// **when** a lazy function is looked up, never **whether** one is compiled, so
+    /// compile-on-first-entry is preserved and every answer is identical. A different
+    /// `func` re-resolves (and compiles on first sight) and becomes the new cached
+    /// handle; a resolution (or compilation) failure returns `None` and **leaves the
+    /// cache as it was**, so the next call re-attempts it. The bound is the entered
+    /// function's own — a lazy artifact never reports a whole-module bound, whether or
+    /// not the handle came from the cache.
+    ///
+    /// The eager layout has nothing to carry (its entries are addressed directly off the
+    /// one shared table), so it forwards to [`CompiledModule::native_entry`].
+    ///
+    /// The cache is **per artifact**: two artifacts are two executable mappings with
+    /// their own function tables, so a handle cached for one must never answer for the
+    /// other (see [`crate::jit::baseline::ResolvedFunction`]).
+    pub(crate) fn native_entry_cached(
+        &self,
+        module: &Module,
+        func: u32,
+        pc: u32,
+        cached: &mut Option<(u32, Rc<CompiledFunction>)>,
+    ) -> Option<(*const u8, Option<u32>)> {
+        if !matches!(self.layout, Layout::Lazy(_)) {
+            return self.native_entry(module, func, pc);
+        }
+        if cached.as_ref().map(|(cached_func, _)| *cached_func) != Some(func) {
+            // Compile-on-first-entry, exactly as `function` does; a `None` here (a
+            // missing function, or a failed compilation) leaves `cached` untouched.
+            let function = self.function(module, func)?;
+            // Structural counter: one per-function resolution the caller's cache
+            // missed — and only a successful one, since a failed resolution cloned no
+            // `Rc`.
+            #[cfg(test)]
+            super::counters::record_lazy_function_resolution();
+            *cached = Some((func, function));
+        }
+        let function = &cached.as_ref()?.1;
+        let entry = lazy_entry(function, pc)?;
+        Some((entry, function.summary.highest_native_register))
     }
 
     /// The compiled function `func`, compiling it on first sight for a lazy artifact.
@@ -341,6 +388,12 @@ impl CompiledModule {
     /// `None` for the eager layout (its entries are addressed directly) and for a
     /// function index the module does not have, and for a function whose compilation
     /// failed (see [`CompiledModule::native_entry`]).
+    ///
+    /// A hit costs one `RefCell` probe and one `Rc` clone, so a caller that keeps
+    /// entering the same function should hold the handle instead
+    /// ([`CompiledModule::native_entry_cached`]); this is the one-shot form, used by
+    /// [`CompiledModule::native_entry`], the eager whole-module
+    /// [`CompiledModule::code_map`] sweep and the tests.
     fn function(&self, module: &Module, func: u32) -> Option<Rc<CompiledFunction>> {
         let lazy = match &self.layout {
             Layout::Lazy(lazy) => lazy,
@@ -555,6 +608,21 @@ fn eager_entry(eager: &EagerLayout, func: u32, pc: u32) -> Option<*const u8> {
         .flatten()
 }
 
+/// The lazy block-table probe for one already-compiled function: `entries[pc]` first (so
+/// a real IR-block start always wins), then the continuation-sub-block table
+/// `sub_entries[pc]`.
+///
+/// The single definition every lazy entry path shares — [`CompiledModule::entry`],
+/// [`CompiledModule::native_entry`] and [`CompiledModule::native_entry_cached`] — so the
+/// two-table precedence cannot drift between them.
+fn lazy_entry(function: &CompiledFunction, pc: u32) -> Option<*const u8> {
+    function
+        .entries
+        .get(pc as usize)
+        .copied()
+        .flatten()
+        .or_else(|| function.sub_entries.get(pc as usize).copied().flatten())
+}
 /// Turn `blocks` — `(address, func, pc)` in ascending address order, all inside the
 /// mapping that ends at `end` — into contiguous [`CodeRegion`]s named from `module`.
 ///

@@ -36,7 +36,7 @@
 //!   `(func, pc)` the helper ran by looking the instruction up in the **active**
 //!   module's code (the same module the helper executes the step against).
 //! * **Block entries / driver round-trips** — [`record_block_entry`]/
-//!   [`record_block_entered`] from `mod::enter_compiled`, and
+//!   [`record_block_entered`] from `mod::enter_compiled_cached`, and
 //!   [`record_driver_round_trip`]/[`record_driver_interp_step`] from `mod::drive`
 //!   (every block-ABI word the driver had to decode, classified).
 //! * **Prologue position/publish calls** — [`record_set_position`] /
@@ -144,13 +144,18 @@ pub(crate) struct Counters {
     pub(crate) ext_call_declined: u64,
     /// `jit_ext_call` invocations that fell back to the full interpreter step.
     pub(crate) ext_call_fallback: u64,
-    /// `enter_compiled` lookups (one per driver iteration that asked for native code).
+    /// `enter_compiled_cached` lookups (one per driver iteration that asked for native code).
     pub(crate) block_entry_lookups: u64,
     /// Of those, how many found a compiled entry (an IR block start or a sub-block).
     pub(crate) block_entry_hits: u64,
     /// Of those, how many were actually entered (the register-file guard passed).
     pub(crate) block_entry_natives: u64,
-    /// Block-ABI words the driver had to decode (a block ran and returned).
+    /// Lazy-artifact function resolutions
+    /// ([`CompiledModule::native_entry_cached`](super::code::CompiledModule::native_entry_cached)) —
+    /// the `RefCell` probe + `Rc` clone a caller carrying a
+    /// [`ResolvedFunction`](super::ResolvedFunction) skips whenever it stays inside one
+    /// function. Counted only on the lazy layout: an eager artifact resolves nothing.
+    pub(crate) lazy_function_resolutions: u64,    /// Block-ABI words the driver had to decode (a block ran and returned).
     pub(crate) driver_round_trips: u64,
     /// Driver iterations with no native entry: one interpreter step each.
     pub(crate) driver_interp_steps: u64,
@@ -348,7 +353,7 @@ pub(crate) fn record_ext_fallback() {
     with(|c| c.ext_call_fallback += 1);
 }
 
-/// An `enter_compiled` lookup; `hit` is whether a compiled entry was found.
+/// An `enter_compiled_cached` lookup; `hit` is whether a compiled entry was found.
 pub(crate) fn record_block_entry(hit: bool) {
     with(|c| {
         c.block_entry_lookups += 1;
@@ -358,11 +363,16 @@ pub(crate) fn record_block_entry(hit: bool) {
     });
 }
 
-/// An `enter_compiled` lookup that was actually entered (the register-file guard passed).
+/// An `enter_compiled_cached` lookup that was actually entered (the register-file guard passed).
 pub(crate) fn record_block_entered() {
     with(|c| c.block_entry_natives += 1);
 }
-
+/// A lazy artifact resolved (and possibly compiled) a function for an entry: the
+/// `RefCell` probe + `Rc` clone a caller's
+/// [`ResolvedFunction`](super::ResolvedFunction) cache spares.
+pub(crate) fn record_lazy_function_resolution() {
+    with(|c| c.lazy_function_resolutions += 1);
+}
 /// One block-ABI word the driver decoded, classified by the word class.
 pub(crate) fn record_driver_round_trip(word: i64) {
     with(|c| {
