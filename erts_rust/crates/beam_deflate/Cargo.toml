@@ -1,0 +1,12 @@
+[package]
+name = "beam_deflate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zlib-faithful DEFLATE compression and INFLATE decompression (RFC 1950/1951/1952) in safe Rust, byte-identical to the zlib 1.3.2 this repository ships."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+
+[lints]
+workspace = true

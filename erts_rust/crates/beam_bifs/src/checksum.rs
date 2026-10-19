@@ -25,10 +25,12 @@
 //! Ground truth (read-only): `../../erts/emulator/beam/erl_bif_chksum.c` (the
 //! `do_chksum` iolist walk and the `(OldChecksum, Data)` / `*_combine/3` wrappers),
 //! `../../erts/emulator/beam/erl_md5.c` + `erl_md5.h` (the `erts_md5_state` and its
-//! `init`/`update`/`finish`/`hash_part`/`pad`) and the bundled zlib
-//! (`../../erts/emulator/zlib/crc32.c`, `adler32.c` — the CRC-32/Adler-32
-//! algorithms and the `*_combine` operator arithmetic). No external dependency is
-//! added: zlib's algorithms are small and are reproduced here.
+//! `init`/`update`/`finish`/`hash_part`/`pad`) and `../../erts/emulator/zlib/crc32.c` +
+//! `adler32.c` (the CRC-32/Adler-32 algorithms and the `*_combine` operator arithmetic).
+//! The two zlib checksums are **not** reproduced here: they are the workspace's
+//! `beam_deflate::checksum` port of those two files (the lowest common ancestor this
+//! crate and `beam_deflate`'s own gzip/zlib trailers share), and this module forwards to
+//! them. MD5 has no other consumer, so it stays here.
 //!
 //! Every value pinned below was **probed against the system oracle** (OTP 29 /
 //! erts-17.1); `tests/checksum.rs` additionally cross-checks a corpus live.
@@ -73,7 +75,8 @@
 //! `x^(8*len2) mod p` operator form), **not** the older "return `crc1` for a
 //! zero length" variant: `crc32_combine(C1, C2, 0)` is `C1 bxor C2` in erts-17.1.
 //! `adler32_combine/3` is zlib's `adler32_combine_` (`adler32.c:133`), with OTP's
-//! own `length == 0` workaround (`erl_bif_chksum.c:443`) that returns `C1`.
+//! own `length == 0` workaround (`erl_bif_chksum.c:443`) that returns `C1`. Both are
+//! [`beam_deflate::checksum`]'s, so the arithmetic exists once in the workspace.
 
 use beam_common::Result;
 use beam_term::{signed_value, Eterm};
@@ -199,233 +202,99 @@ fn collect_input(root: Eterm) -> Result<Input> {
 }
 
 // ---------------------------------------------------------------------------
-// CRC-32 (the reflected IEEE polynomial, zlib `crc32.c`)
+// CRC-32 and Adler-32 (the workspace's zlib 1.3.2 port, `beam_deflate`)
 // ---------------------------------------------------------------------------
 
-/// The reflected CRC-32 polynomial (zlib `POLY`, `crc32.c:157`).
-const CRC32_POLY: u32 = 0xEDB8_8320;
-
-/// zlib's byte-wise CRC table: `crc_table[i]` is the CRC of the single byte `i`
-/// (`crc32.c:248-256`).
-const CRC32_TABLE: [u32; 256] = crc32_table();
-
-const fn crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 { (c >> 1) ^ CRC32_POLY } else { c >> 1 };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-}
-
 /// zlib's `crc32(prev, data)` (`crc32_z`): the CRC-32 of `data` continuing from the
-/// CRC-32 `prev` of the preceding bytes. A zero-length `data` is the identity.
+/// CRC-32 `prev` of the preceding bytes. A zero-length `data` is the identity, and a
+/// non-canonical `prev` is complemented on entry exactly as the C complements it.
 ///
-/// `pub(crate)` because `crate::zlib`'s RFC 1952 (gzip) member framing needs the very
-/// same primitive for its header CRC-16 and its per-member CRC-32 trailer — the one
-/// shared home for the checksum, never a second copy.
+/// [`beam_deflate::crc32`] is the workspace's port of
+/// `../../erts/emulator/zlib/crc32.c` (the same reflected `0xEDB8_8320` table, the same
+/// pre/post complement), so this is a thin forwarder: one table and one algorithm, shared
+/// with the gzip/zip framings below and with `beam_deflate`'s own trailers.
+///
+/// `pub(crate)` because `crate::zlib`'s RFC 1952 (gzip) framing checks — the header's
+/// CRC-16 and the per-member CRC-32 trailer — are the same primitive, so the tests that
+/// build those members share this one checksum, never a second copy.
 pub(crate) fn crc32_step(prev: u32, data: &[u8]) -> u32 {
-    let mut crc = prev ^ 0xFFFF_FFFF;
-    for &byte in data {
-        crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize];
-    }
-    crc ^ 0xFFFF_FFFF
-}
-
-/// `a(x) * b(x) mod p(x)` in the reflected CRC-32 field, where the lowest powers sit
-/// in the most significant bit — zlib's `multmodp` (`crc32.c:163`).
-///
-/// `a` is a power of `x` and therefore never zero; the `a == 0` guard (matching
-/// `crc32_combine_op`'s early return) keeps the loop's shift register from decaying
-/// to zero, which would otherwise never satisfy the terminating condition.
-const fn crc_multmodp(a: u32, b: u32) -> u32 {
-    if a == 0 {
-        return 0;
-    }
-    let mut m: u32 = 1 << 31;
-    let mut p: u32 = 0;
-    let mut b = b;
-    loop {
-        if a & m != 0 {
-            p ^= b;
-            if a & (m - 1) == 0 {
-                break;
-            }
-        }
-        m >>= 1;
-        b = if b & 1 != 0 { (b >> 1) ^ CRC32_POLY } else { b >> 1 };
-    }
-    p
-}
-
-/// `x2n_table[j] = x^(2^j) mod p(x)` — zlib's `x2n_table` (`crc32.c:258-262`).
-/// `x^(2^32) == x`, so the 32 entries suffice for every bit of a `u64` exponent.
-const CRC32_X2N_TABLE: [u32; 32] = crc32_x2n_table();
-
-const fn crc32_x2n_table() -> [u32; 32] {
-    let mut table = [0u32; 32];
-    let mut p: u32 = 1 << 30; // x^1
-    table[0] = p;
-    let mut n = 1;
-    while n < 32 {
-        p = crc_multmodp(p, p);
-        table[n] = p;
-        n += 1;
-    }
-    table
-}
-
-/// `x^(n * 2^k) mod p(x)` — zlib's `x2nmodp` (`crc32.c:184`).
-fn crc_x2nmodp(n: u64, k: u32) -> u32 {
-    let mut p: u32 = 1 << 31; // x^0
-    let mut n = n;
-    let mut k = k;
-    while n != 0 {
-        if n & 1 != 0 {
-            p = crc_multmodp(CRC32_X2N_TABLE[(k & 31) as usize], p);
-        }
-        n >>= 1;
-        k += 1;
-    }
-    p
+    beam_deflate::crc32(prev, data)
 }
 
 /// zlib's `crc32_combine(crc1, crc2, len2)` (`crc32.c:969-982`): the CRC-32 of two
-/// concatenated streams whose CRCs are `crc1` (first stream) and `crc2` (second
-/// stream, `len2` bytes long). `len2` is a byte count; `2^3 = 8` in `crc_x2nmodp`
-/// turns it into the bit count.
+/// concatenated streams whose CRCs are `crc1` (first stream) and `crc2` (second stream,
+/// `len2` bytes long). `len2` is a byte count; zlib's `x2nmodp(len2, 3)` turns it into
+/// the bit count.
 ///
 /// A zero `len2` yields `crc1 bxor crc2` (the modern zlib operator form), matching
-/// the oracle's `crc32_combine(C1, C2, 0)`.
+/// the oracle's `crc32_combine(C1, C2, 0)` — **not** the pre-1.3 "return `crc1`" variant.
 fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
-    let op = crc_x2nmodp(len2, 3);
-    if op == 0 {
-        // `crc32_combine_op`'s guard; unreachable for a non-negative `len2`.
-        return 0;
-    }
-    crc_multmodp(op, crc1) ^ crc2
+    beam_deflate::crc32_combine(crc1, crc2, len2)
 }
-
-// ---------------------------------------------------------------------------
-// Adler-32 (zlib `adler32.c`)
-// ---------------------------------------------------------------------------
 
 /// The largest prime below 65536 (zlib `BASE`).
 const ADLER_BASE: u64 = 65521;
 
-/// The largest block length during which the two running sums stay below `2^32`
-/// (zlib `NMAX`).
-const ADLER_NMAX: usize = 5552;
-
 /// `(sum1, sum2)` back into the packed Adler-32 value.
-fn adler_pack(adler: u64, sum2: u64) -> u32 {
-    ((adler & 0xFFFF) | ((sum2 & 0xFFFF) << 16)) as u32
+fn adler_pack(sum1: u64, sum2: u64) -> u32 {
+    ((sum1 & 0xFFFF) | ((sum2 & 0xFFFF) << 16)) as u32
 }
 
 /// zlib's `adler32(prev, data)` (`adler32_z`, `adler32.c:61`): the Adler-32 of
 /// `data` continuing from `prev`.
 ///
-/// The one-byte and shorter-than-16-byte fast paths are reproduced literally, so a
-/// caller-supplied *non-canonical* accumulator (`adler32/2`) reduces exactly as the
-/// oracle reduces it.
+/// Two short arms stay here because zlib's own shortcuts are **observable** through
+/// `adler32/2`, which accepts a *non-canonical* accumulator, while
+/// [`beam_deflate::adler32`] — the bulk path below, zlib's `NMAX`-batched loop — folds
+/// both sums modulo `BASE` at every chunk boundary:
 ///
-/// `pub(crate)` because the deflate port's trailer is the same checksum over the same
-/// bytes: `zlib::compress/1` appends `strm->adler` exactly as the C does, so it must be
-/// this one implementation rather than a second copy.
+/// * `len == 0` — zlib's `len < 16` arm runs for a zero-length call too, so the
+///   accumulator **is** folded: the oracle's `adler32(4294967295, <<>>)` is `917518`.
+///   (zlib's `buf == Z_NULL` special case — `1` — never arises here: `do_chksum` always
+///   passes a real buffer.)
+/// * `len == 1` — the byte-at-a-time fast path folds each sum with a **single**
+///   conditional subtract, so a non-canonical `sum2` can leave `sum2 >= BASE` and the
+///   packed value is then not its `% BASE` reduction: the oracle's
+///   `adler32(4294967025, <<255>>)` is `4294901744` (`sum2` 65534), where a modulo fold
+///   would answer `917488`.
+///
+/// `pub(crate)` so the crate's other Adler-32 users reach the one implementation rather
+/// than a second copy (the `erlang:adler32/1,2` and `adler32_combine/3` BIFs below).
 pub(crate) fn adler32_step(prev: u32, data: &[u8]) -> u32 {
+    let mut sum1 = u64::from(prev & 0xFFFF);
     let mut sum2 = u64::from((prev >> 16) & 0xFFFF);
-    let mut adler = u64::from(prev & 0xFFFF);
-    let len = data.len();
-
-    if len == 1 {
-        adler += u64::from(data[0]);
-        if adler >= ADLER_BASE {
-            adler -= ADLER_BASE;
+    if data.is_empty() {
+        // `len < 16` with `len == 0`: fold, then pack.
+        if sum1 >= ADLER_BASE {
+            sum1 -= ADLER_BASE;
         }
-        sum2 += adler;
+        return adler_pack(sum1, sum2 % ADLER_BASE);
+    }
+    if data.len() == 1 {
+        // The C's `len == 1` arm, literally: one conditional subtract each.
+        sum1 += u64::from(data[0]);
+        if sum1 >= ADLER_BASE {
+            sum1 -= ADLER_BASE;
+        }
+        sum2 += sum1;
         if sum2 >= ADLER_BASE {
             sum2 -= ADLER_BASE;
         }
-        return adler_pack(adler, sum2);
+        return adler_pack(sum1, sum2);
     }
-
-    if len < 16 {
-        for &byte in data {
-            adler += u64::from(byte);
-            sum2 += adler;
-        }
-        if adler >= ADLER_BASE {
-            adler -= ADLER_BASE;
-        }
-        sum2 %= ADLER_BASE;
-        return adler_pack(adler, sum2);
-    }
-
-    let mut i = 0usize;
-    while len - i >= ADLER_NMAX {
-        let end = i + ADLER_NMAX;
-        while i < end {
-            adler += u64::from(data[i]);
-            sum2 += adler;
-            i += 1;
-        }
-        adler %= ADLER_BASE;
-        sum2 %= ADLER_BASE;
-    }
-    let mut rem = len - i;
-    while rem >= 16 {
-        let end = i + 16;
-        while i < end {
-            adler += u64::from(data[i]);
-            sum2 += adler;
-            i += 1;
-        }
-        rem -= 16;
-    }
-    while rem > 0 {
-        adler += u64::from(data[i]);
-        sum2 += adler;
-        i += 1;
-        rem -= 1;
-    }
-    adler %= ADLER_BASE;
-    sum2 %= ADLER_BASE;
-    adler_pack(adler, sum2)
+    beam_deflate::adler32(prev, data)
 }
 
 /// zlib's `adler32_combine_(adler1, adler2, len2)` (`adler32.c:133`): the Adler-32
 /// of two concatenated streams, where `len2` is the byte length of the second.
 ///
-/// `MOD63(len2)` reduces the length modulo `BASE` first, exactly as zlib does.
+/// `MOD63(len2)` reduces the length modulo `BASE` first, exactly as zlib does, and the
+/// second stream's length is folded into the first stream's `sum2` — including zlib's
+/// `sum1 | (sum2 << 16)` packing, whose **unmasked** `sum1` a non-canonical pair can
+/// push past 16 bits (the oracle's `adler32_combine(4294901759, 4294967295, 5)` is
+/// `6094860`, not the `6029324` a masked packing would give).
 fn adler32_combine(adler1: u32, adler2: u32, len2: u64) -> u32 {
-    let rem = len2 % ADLER_BASE;
-    let mut sum1 = u64::from(adler1 & 0xFFFF);
-    let mut sum2 = (rem * sum1) % ADLER_BASE;
-    sum1 += u64::from(adler2 & 0xFFFF) + ADLER_BASE - 1;
-    sum2 += u64::from((adler1 >> 16) & 0xFFFF)
-        + u64::from((adler2 >> 16) & 0xFFFF)
-        + ADLER_BASE
-        - rem;
-    if sum1 >= ADLER_BASE {
-        sum1 -= ADLER_BASE;
-    }
-    if sum1 >= ADLER_BASE {
-        sum1 -= ADLER_BASE;
-    }
-    if sum2 >= ADLER_BASE << 1 {
-        sum2 -= ADLER_BASE << 1;
-    }
-    if sum2 >= ADLER_BASE {
-        sum2 -= ADLER_BASE;
-    }
-    adler_pack(sum1, sum2)
+    beam_deflate::adler32_combine(adler1, adler2, len2)
 }
 
 // ---------------------------------------------------------------------------

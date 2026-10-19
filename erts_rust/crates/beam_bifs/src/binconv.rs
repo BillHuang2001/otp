@@ -109,8 +109,13 @@
 //!   `term_to_binary([1,2,3], [compressed])` is the *uncompressed*
 //!   `<<131,107,0,3,1,2,3>>` — a small body cannot pay for zlib's framing — while a
 //!   large one (`lists:duplicate(500, hello)`) becomes a real `COMPRESSED` image.
-//!   The deflate bytes themselves are implementation-defined (miniz_oxide vs zlib),
-//!   so only the framing and the round-trip are pinned.
+//!   The deflate bytes are **the oracle's**: [`beam_codec::compress`] deflates
+//!   through [`beam_deflate`](../../beam_deflate/index.html), the workspace's port of
+//!   the zlib 1.3.2 the repository vendors, so the same body at the same level gives
+//!   the same stream (the zlib header/footer included). The budget test is
+//!   `stream_len <= body_len - 5` — an **equality** compresses — and a body shorter
+//!   than the 5-byte wrapper is always left plain; level 0 stores, so it never pays
+//!   off and always reverts.
 //! * **`{minor_version, N}`** selects the tag set `parse_t2b_opts` builds
 //!   (`external.c:1499-1514`): `2` (the default) is UTF-8 atoms + `NEW_FLOAT_EXT`;
 //!   `1` clears `DFLAG_UTF8_ATOMS` (Latin-1 `ATOM_EXT` atoms, `NEW_FLOAT_EXT` floats);
@@ -925,7 +930,8 @@ impl Default for T2bOptions {
 /// The zlib level the bare `compressed` atom selects.
 ///
 /// The C sets `Z_DEFAULT_COMPRESSION` (`-1`), which zlib maps to level 6, so the
-/// explicit [`flate2`](beam_codec::compress) level is 6.
+/// explicit level is 6 — faithful because `deflateInit(-1)` and `deflateInit(6)`
+/// emit byte-identical streams through [`beam_codec::compress`].
 const DEFAULT_COMPRESSED_LEVEL: u8 = 6;
 
 /// The largest `{compressed, Level}` level — the C requires `0 =< Level < 10`.
@@ -3301,8 +3307,9 @@ mod tests {
             hand.extend_from_slice(&[9, 8, 7, 6]);
 
             // The premise of the count: a prefix that stops short of the zlib stream's
-            // end does **not** inflate to the declared size (`flate2`'s reader reports an
-            // unexpected EOF), while the stream's own end does.
+            // end does **not** inflate to the declared size (the codec's own
+            // `decompress_bounded` reports a truncated stream), while the stream's own
+            // end does.
             let declared = body.len();
             assert!(
                 beam_codec::compress::decompress_bounded(&stream[..stream.len() - 1], declared)
@@ -3414,10 +3421,11 @@ mod tests {
     ///
     /// The oracle produces the image (`term_to_binary(lists:seq(1,1000), [compressed])`),
     /// reports its own `[used]` for `<Image/binary, 1,2,…,10>`, and prints the image's
-    /// exact bytes. The **same** bytes are then decoded here, so the two runtimes are
-    /// compared on one image (the oracle's zlib payload is its own — miniz_oxide's
-    /// deflate bytes differ — which is why comparing on *its* bytes, not two
-    /// independently produced ones, is what makes this a cross-check). Oracle-pinned:
+    /// exact bytes. The **same** bytes are then decoded here, so the padded-count rule
+    /// is compared on one image rather than on two independently produced ones (the two
+    /// runtimes do emit the same stream — the deflate is zlib 1.3.2's through
+    /// [`beam_codec::compress`] — but a decode-side `[used]` rule needs one input to be
+    /// a cross-check at all). Oracle-pinned:
     /// `1827 1837 1827` for `lists:seq(1,1000)` (erts-17.1, probed live) — the
     /// 1827-byte image inside a 1837-byte input reports 1827.
     #[test]

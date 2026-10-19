@@ -91,10 +91,24 @@ This is the frozen public-API shape dependents design against; keep it stable.
   `Process::set_off_heap_binary_bytes(machine.off_heap_overhead_bytes())`.
   The trigger is O(1) per slice (the overhead figure is re-derived only when the reservoir's handle
   count moves); a declined prune retains the whole reservoir (a leak, never a dangle).
+- `beam_deflate` → zlib 1.3.2 in safe Rust: the one-shot `compress`/`decompress`/`decompress_bounded`/
+  `decompress_bounded_used`, the streaming `Deflate`/`Inflate` types whose one-call pump
+  (`deflate(input, output, flush) -> {status, consumed, produced}`) reproduces zlib's
+  `avail_in`/`avail_out` accounting, `Flush`/`Strategy`/`Method`/`Status` (incl. `NeedDict(adler)`),
+  `DeflateConfig`/`GzHeader`, and `checksum::{crc32, adler32, crc32_combine, adler32_combine}`.
+  Bytes only — no terms, no host state; byte-identical to the oracle for levels `-1`/`0..=9`, all five
+  strategies, windowBits `±8..=±15` and `16+9..=16+15`, memLevel `1..=9`, all six flush modes (a
+  combination it does not cover is a **typed** `BeamError`, never a conforming approximation).
 - `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface, plus
   **fifteen** optional defaulted host seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/
   `PortHook`/`DictHook`/`PersistentTerm`/`NifLoader`/`RecordSource`/`LocalNode`/`LocalFunIdentity`/
-  `ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`).
+  `ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`). It also exposes the **local-call predicate**
+  `serves_local_call(module, function, arity) -> bool` (`module == "zlib"` + the 19 `(name, arity)`
+  rows of `zlib.erl`'s non-exported NIF stubs) — the seam `beam_rt`'s `resolve_local_call` consults
+  for a module's own unexported `*_nif` stubs, alongside `prim_tty`'s. A `zlib` stub is reached **two**
+  ways and both must be served: as a local `call`, and as a local `make_fun3` closure (`zlib.erl`
+  stores `fun deflate_nif/4` in a `#zlib_opts{}` record), which `beam_rt::context::apply` declines
+  through the same predicate and dispatches via `call_bif`.
 - `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam).
 - `beam_rt` → the runtime **binary**: boot sequence, CLI flags, `system_info`, and the concrete
   `ExecutionContext` wiring engine + bifs + process — including the `Mailbox` receive seam over the
@@ -105,8 +119,8 @@ This is the frozen public-API shape dependents design against; keep it stable.
 Determined by the Cargo workspace DAG; a crate may only use crates in earlier waves.
 | Wave | Crates | Depends on |
 |---|---|---|
-| 0 | `beam_alloc`, `beam_abi` | `beam_common`, `beam_term` |
-| 1 | `beam_codec`, `beam_ets`, `beam_gc` | wave 0 |
+| 0 | `beam_alloc`, `beam_abi`, `beam_deflate` | `beam_common`, `beam_term` (`beam_deflate`: `beam_common` only — it owns bytes, not terms) |
+| 1 | `beam_codec`, `beam_ets`, `beam_gc` | wave 0 (`beam_codec` also `beam_deflate`) |
 | 2 | `beam_loader`, `beam_message`, `beam_dist` | wave 1 (`beam_codec`; `beam_message` also `beam_gc`, `beam_dist` also `beam_alloc`) |
 | 3 | `beam_process` | `beam_gc`, `beam_message`, `beam_alloc` |
 | 4 | `beam_engine` | `beam_loader`, `beam_alloc` |
@@ -124,14 +138,15 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 |---|---|
 | `beam_alloc` | carrier allocator + size classes + process-heap bump allocator |
 | `beam_abi` | layout-frozen NIF/driver struct + fn-table types, static size/offset asserts, transmute; the working `enif_*` host API (`NifHost` seam) + the `dlopen`-based NIF loader |
-| `beam_codec` | ETF encode/decode of the core tag set + `VERSION_MAGIC 131` round-trips |
+| `beam_codec` | ETF encode/decode of the core tag set + `VERSION_MAGIC 131` round-trips; the `COMPRESSED` (`80`) tag is **byte-identical to the oracle** over `beam_deflate` (wrapper `[131][80][body_len:4 BE][zlib stream]`, emitted iff `stream_len <= body_len - 5`, `body_len < 5` always plain, level 0 never compresses) |
+| `beam_deflate` | zlib 1.3.2 deflate + inflate in safe Rust: one-shot and streaming (all six flush modes, per-call `avail_in`/`avail_out`), the five match functions + `configuration_table` (levels `-1`/`0..=9`), the `inftrees`/`inffast` inflate with zlib's status codes, `crc32`/`adler32` + `combine`, gzip/zlib/raw framings |
 | `beam_dist` | `DFLAG_*`/`DOP_*` constants, handshake + control-message framing, `epmd` client |
 | `beam_loader` | chunk parse + BEAM disassembly + lowering to the typed block IR |
 | `beam_engine` | IR + direct-threaded interpreter + the native baseline JIT tier (default-OFF Cranelift hot tier) + `ExecutionContext` + the receive/message family over a `Mailbox` seam |
 | `beam_gc` | generational Cheney copying + immix mature generation (measurement-gated) + MSO refcount |
 | `beam_message` | `copy_struct` + send/receive envelope + the `QueueCursor` scan position |
 | `beam_process` | `Process`, run queue, scheduler loop, resume-on-send, signals/links/monitors |
-| `beam_bifs` | `BifRegistry` + the whole declared `bif.tab` surface (556 BIFs; registry 640 keys) + the host seams |
+| `beam_bifs` | `BifRegistry` + the whole declared `bif.tab` surface (556 BIFs; registry 667 keys = 556 declared + 111 non-table keys, 25 of them `zlib`) + the host seams |
 | `beam_ets` | `set` (CHAMP) + `ordered_set` (K-ary B+-tree) + `bag`/`duplicate_bag` (chained) over `new/insert/lookup/delete/select` |
 | `beam_io` | `mio` poller/reactor + `Port`/`PortRegistry` + port-task scheduling + built-in `fd`/`efile` **and OS-child `spawn`** drivers |
 | `beam_rt` | boot/CLI/`system_info` + the executor runner (send/receive) + the `PortHook` provider + end-to-end vertical-slice integration test |
@@ -225,14 +240,15 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc`, `fun` (local/export/imported fun interior) (frozen, Stage 0)
 - `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary); `tests/` (the allocator integration suite)
 - `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs; the **working host API** (`nif/enif.rs` — the `enif_*` function implementations over the `NifHost` seam), the **dynamic loader** (`nif/loader.rs` — `dlopen`/`dlsym` of a NIF shared object + `ErlNifEntry` validation + `NifLibrary::call`), and `nif/host.rs` (`NifHost`/`NifEnv`)
-- `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
+- `beam_deflate/` → zlib 1.3.2 in safe Rust (bytes only, `beam_common` its sole dependency): `deflate/` (window + hash chains, the five match functions, Huffman construction, the flush driver), `inflate/` (bit reader, `inftrees`/`inffast`, header/trailer state machine, dictionary protocol), `checksum.rs` (`crc32`/`adler32` + `combine`); the one shared encoder behind both `beam_codec`'s ETF `COMPRESSED` and `beam_bifs`'s `zlib` BIFs
+- `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`, the `COMPRESSED` wrapper over `beam_deflate`
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
 - `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` + `Mailbox` (receive/message) seams, the block/suspend outcome; companion docs `TEST_NOTES.md` (measurement discipline) and `HANDOFF_bs_init_writable.md`
 - `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4); copies fun blocks by the `beam_term::fun` descriptor layout
 - `beam_message/` → copy engine (`copy_struct`) + messaging (`Message`/`Queue` + the `QueueCursor` scan position)
 - `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`); sub-nodes `src/smp/` and `tests/`
-- `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the fifteen host seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/`PortHook`/`DictHook`/`PersistentTerm`/`NifLoader`/`RecordSource`/`LocalNode`/`LocalFunIdentity`/`ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`)
+- `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the fifteen host seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/`PortHook`/`DictHook`/`PersistentTerm`/`NifLoader`/`RecordSource`/`LocalNode`/`LocalFunIdentity`/`ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`); sub-nodes `src/zlib/` (the six one-shots + the 19 stream NIF keys over `beam_deflate`), and the `serves_local_call` predicate `beam_rt` consults for a module's own unexported `*_nif` stubs
 - `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag): `set` defaults to a CHAMP interior, `ordered_set` to a K-ary B+-tree, `bag`/`duplicate_bag` to a chained bucket index; `ETS_SURFACE.md` (the ETS API-surface reference)
 - `beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, port-task scheduling, built-in drivers (`fd`/`efile` + the OS-child `spawn` driver)
 - `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), the port subsystem (drives `beam_io::PortRegistry` + delivers port data to the owning process), and the `PortHook` provider; sub-nodes `src/boot/`, `src/cli/`, `src/info/`, `src/native/`, `src/port/`
@@ -318,8 +334,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   to (de-duplication). Writers take a caller-provided `*mut Eterm`; allocation stays in `beam_alloc`.
 - **Stage-1 execution tiers shipped (`beam_engine`).** The typed-IR seam carries a direct-threaded interpreter plus a real native baseline tier (`src/jit/`): `src/jit/baseline/` lowers each IR basic block to an x86-64 `extern "C"` function (block ABI returns `(func<<32|pc)`, `HALT=-1`, `ERROR=-2`; `rbx` = x-register array base) with a driver loop that deopts to the interpreter's own `step_instruction` for anything it does not inline. A cross-run compiled-block cache (`src/jit/cache.rs`) and a block linker (`src/jit/baseline/emit/link.rs`) reuse and chain compiled blocks, and a local tail call (`call_last`/`call_only`) is linked natively. `tests/jit_real_module.rs` is the real-`erlc`-module tier-equivalence gate — **736/736** oracle-checked comparisons agree with zero divergences. An optional Cranelift hot tier (`src/jit/cranelift/`) sits behind the default-OFF `jit-cranelift` feature. Correctness (interpreter-identical results) is the deliverable. The native baseline tier is the **default for every `beam_rt` process entry**, compiled lazily **per function** (not whole-module at first entry); the only kill switch is the environment variable `BEAM_RT_TIER=interpreter`. No per-module switch-safety predicate gates the JIT — the engine's in-machine module-context switch (`Step::Enter`) is implemented and driver-mediated, so a module containing a cross-module `call_ext*`/`apply` runs natively too. Deeper inlining is later work.
 - **BIF surface complete (`beam_bifs`).** The registry covers the whole declared `bif.tab` surface —
-  **556 declared BIFs (registry 640 keys = 556 declared + 84 non-table keys: 79 stdlib fast paths +
-  `erlang:memory/0,1` + the OTP-30 `pid_to_binary`/`ref_to_binary`/`port_to_binary`)** — via two defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`).
+  **556 declared BIFs (registry 667 keys = 556 declared + 111 stdlib fast paths: `lists` 40, `zlib` 25,
+  `erlang` 15, `maps` 12, `ets` 8, `binary` 3, `io_lib` 3, `unicode` 3, `io` 2 — re-derive the set from
+  `bif_tab::census(..).fast_paths`, pinned by `tests/bif_tab.rs`)** — via two defaulted seams
+  (`RuntimeHooks::call`, `MemoryHook::memory`).
   Registered-but-unadopted BIFs return the typed `unsupported_bif` until a host hook is installed, so
   the runtime-coupled families are registered here while their behaviour remains a host gap.
 - **Data-structure and runtime defaults.** `beam_ets`: `set` → CHAMP, `ordered_set` → K-ary B+-tree
@@ -379,10 +397,13 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   live catch frame, matching C's `handle_error` → `next_catch`). `beam_bifs` attaches the true reason term
   instead of collapsing to a bare `badarg`: `{badmap,M}`, `{badkey,K}`, `{case_clause,V}`,
   `{badrecord,T}`, `{badfield,{{M,N},K}}`, and any **non-atom** `erlang:error/1,2`/`exit/1`/`throw/1`/
-  `nif_error/1,2` argument (an atom reason stays `ExitReason::Atom` with no slot). The one remaining
-  degradation is a tag atom that cannot be interned (no `AtomInterner` hook) ⇒ plain `badarg`.
-  `beam_rt::runner::exit_reason` recovers the live reason term from the slot and renders it as the
-  uncaught-exception reason.
+  `nif_error/1,2` argument (an atom reason stays `ExitReason::Atom` with no slot). `beam_rt` installs
+  the `AtomInterner` hook on every BIF call, so a structured reason's tag atom is always nameable; only
+  a host that installs **no** interner degrades such a raise to the bare `badarg` (never a substituted
+  atom). A raise whose own reason atom is absent from every table is interned by
+  `RuntimeContext::name_raise_reason_atom` before the engine spells it, so it can no longer escape a
+  live `try…catch`. `beam_rt::runner::exit_reason` recovers the live reason term from the slot and
+  renders it as the uncaught-exception reason.
 - **Failed head-clause/guard terminates via `func_info`; a missing module/function is bare `undef`.**
   `beam_engine`'s `Instr::FuncInfo` (`src/interpreter.rs`) raises class `error` with the **bare atom
   `function_clause`** (resolved from the running module's atom table; a module whose table lacks the

@@ -76,8 +76,8 @@ map for the source subtree and the notes the child nodes inherit.
   slot is a `beam_term` layout decision (**owner: `beam_term`**). This is a documented,
   honest limitation, not a bug.
 
-- **Two source files sit over the ~1000-line target:** `decode/mod.rs` (~1438) and
-  `encode/mod.rs` (~1376). Each is a single state machine — the whole `match tag`
+- **Two source files sit over the ~1000-line target:** `decode/mod.rs` (~1485) and
+  `encode/mod.rs` (~1393). Each is a single state machine — the whole `match tag`
   dispatch plus its per-tag emitters — and neither has accrued a second
   responsibility. A future split should move arms by tag family into `decode/`/
   `encode/` submodules, leaving `Decoder`/`Encoder` as the only state.
@@ -90,7 +90,11 @@ map for the source subtree and the notes the child nodes inherit.
 - `atom_cache.rs` → `AtomCache` + the `AtomCacheWriter` hook trait
 - `off_heap.rs` → `OffHeapBinaries` host trait
 - `decode/export_gate.rs` → the `ExportGate` host trait (the `[safe]` active-export predicate)
-- `compress.rs` → zlib for `COMPRESSED` (`compress`/`decompress`/`decompress_bounded`/`decompress_bounded_used`)
+- `compress.rs` → the `COMPRESSED` plumbing, delegated to **`beam_deflate`** (the workspace's
+  zlib 1.3.2 port, so the streams are the oracle's bytes): `compress`/`decompress`/
+  `decompress_bounded`/`decompress_bounded_used` + the level bounds; the wrapper rule
+  (`Z <= body - 5`, equality COMPRESSED, level 0 never) lives on the encode side in
+  `encode/mod.rs::compress_if_smaller`
 - `error.rs` → `bad_arg`/`system_limit`, the `unsupported*` reason atoms
 - `prelude.rs` → the downstream glob-import surface
 - `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) and the local-node pid/port/ref **demotion** to the internal form, the active-export gate (`export_gate.rs`), `decode_atom_strict` (the C `dec_atom`: no `NIL_EXT` marker, used by `EXPORT_EXT`'s module/function, `NEW_FUN_EXT`'s module and `RECORD_EXT`'s module/name/key atoms) vs `decode_node_atom` (the C `dec_sysname`: marker allowed, used for identifier node fields), `decode_term[_with_local_node]`, the `MAX_DECODE_DEPTH` bound

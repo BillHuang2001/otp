@@ -63,7 +63,7 @@ use std::rc::Rc;
 
 use beam_abi::nif::loader::NifCallError;
 use beam_alloc::Heap;
-use beam_bifs::{BifContext, BifFn, TableRegistry};
+use beam_bifs::{AtomInterner, BifContext, BifFn, TableRegistry};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessTable;
 use beam_term::Eterm;
@@ -988,6 +988,69 @@ impl<'a> RuntimeContext<'a> {
         // A registered BIF that ran its heap dry is the emulator's documented hard limit,
         // not a host-level allocation abort (see `error::enforce_term_heap_limit`).
         result.map_err(error::enforce_term_heap_limit)
+    }
+
+    /// Names a failed call's **reason atom** in the runtime's one shared atom table, so the
+    /// engine's raise funnel can land it.
+    ///
+    /// # The shape this exists for
+    ///
+    /// A raise may carry its reason as an atom **name** rather than as an atom term the
+    /// [`BifContext`] built: `beam_bifs`'s `zlib` stream surface reports a state guard as
+    /// `BeamError::Raise(Raise::error(ExitReason::atom("not_initialized")))`, which is the C's
+    /// `enif_raise_exception(env, am_not_initialized)` — the name is the whole reason, no term
+    /// exists yet. To land such a raise in a live catch frame, `beam_engine` has to spell the
+    /// reason as a term, and it resolves the name through its atom-namespace seam
+    /// ([`ExecutionContext::atoms`](beam_engine::ExecutionContext::atoms), this runtime's
+    /// **live** shared table) with the running module's load-time snapshot as the fallback. A
+    /// name **neither** knows makes the engine decline — it never invents an atom index — and
+    /// the raise then escapes every `try … catch` instead of being caught (measured: the
+    /// oracle answers `{exception,error,not_initialized}` where this runtime terminated the
+    /// process with `beam_rt: error not_initialized`).
+    ///
+    /// `not_initialized` is in no module's atom table (`zlib.beam` names neither it nor its
+    /// two siblings — the C NIF's own static atoms carry them), so the only table that can
+    /// name it is the shared one. Interning it here — append-only, exactly like the run-time
+    /// atom a NIF interns through [`PendingInterner`] — is what keeps the raise catchable.
+    ///
+    /// The rule is stated over **the name the engine will spell**, not over one error kind, so a
+    /// reason variant whose atom is likewise outside the boot seed is covered too:
+    /// [`BeamError::Alloc`] names `out_of_memory` and is caught by the same hash lookup.
+    ///
+    /// # What is deliberately left alone
+    ///
+    /// * an error with **no** atom name (a live structured reason term, `TermNotFound`, `Io`, a
+    ///   `Raise` whose [`ExitReason::Structured`](beam_common::ExitReason::Structured) slot holds
+    ///   nothing nameable) — there is nothing to name;
+    /// * a **capability gap** ([`crate::error::unsupported_reason`]: every runtime diagnostic
+    ///   whose reason atom starts with `unsupported`) — those must stay **uncatchable**, or a
+    ///   program's own `try … catch` could swallow the runtime's honest gap and the CLI would
+    ///   report a wrong result instead of the `unsupported` exit code;
+    /// * a name the shared table **already** holds (the overwhelmingly common case: every
+    ///   core reason atom is seeded at boot) — one hash lookup, no borrow of the table, so the
+    ///   cost of a raise that already lands is unchanged.
+    pub(super) fn name_raise_reason_atom(&mut self, error: &BeamError) {
+        // The atom the engine will try to spell for this error: a raise's own reason atom
+        // (`not_initialized` — an owned name no table need hold) or, for the reason variants, the
+        // fixed atom `BeamError::as_atom` names (`badarg`, `out_of_memory`, …).
+        let name = match error {
+            BeamError::Raise(raise) => raise.reason.as_atom(),
+            other => other.as_atom(),
+        };
+        let Some(name) = name else {
+            return;
+        };
+        if crate::error::unsupported_reason(error).is_some() {
+            return;
+        }
+        if self.runtime.code_server.atoms().lookup(name).is_some() {
+            return;
+        }
+        // The commit route every interning call takes: predict the index, then append in
+        // intern order, so the name lands exactly where `pending` already pointed.
+        let mut pending = PendingInterner::new(self.runtime.code_server.atoms().len());
+        pending.intern(name);
+        self.runtime.code_server.intern_pending(&pending);
     }
 
     /// Whether `term` is a **container the pooled BIF heap could own** — the mirror of the

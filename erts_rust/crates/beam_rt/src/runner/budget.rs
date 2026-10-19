@@ -475,10 +475,16 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     /// would see the trait default (`Ok(false)`), always decline, and jump **in-machine** into a
     /// non-exported same-module callee's own code — which for a built-in/static NIF library stub
     /// such as `prim_tty:tty_create/1` (body `erlang:nif_error(undef)`) raises `undef` instead of
-    /// reaching the host that serves it. Forwarding reaches
-    /// [`RuntimeContext`]'s own override (`crate::native::prim_tty::serves_local_call`), so the
-    /// served key is dispatched through [`call_bif`](ExecutionContext::call_bif) under the arm's
-    /// frame discipline and every other key stays the unchanged in-machine jump.
+    /// reaching the host that serves it.
+    ///
+    /// Forwarding reaches [`RuntimeContext`]'s own override, which answers over **two** key sets
+    /// (`crate::native::prim_tty::serves_local_call`, then `beam_bifs::serves_local_call` —
+    /// `module == "zlib"` plus its 19 `(name, arity)` rows), so a served key is dispatched through
+    /// [`call_bif`](ExecutionContext::call_bif) under the arm's frame discipline and every other
+    /// key stays the unchanged in-machine jump. The same keys also arrive as a local `make_fun3`
+    /// closure — `zlib.erl` keeps the stub in a `#zlib_opts{}` record — which
+    /// `crate::context::apply`'s `served_local_key` declines here and dispatches in
+    /// `apply_non_local_fun` instead.
     fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
         self.probe.spend();
         ExecutionContext::resolve_local_call(self.inner, module, function, arity)

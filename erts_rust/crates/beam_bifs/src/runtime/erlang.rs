@@ -794,13 +794,12 @@ mod tests {
             let expected = bytes_of(ctx, t2b);
             assert_eq!(image, expected, "term_to_iovec/2 =:= term_to_binary/2");
 
-            // The `[131][80][body_len:4 BE][zlib]` wrapper. The deflate bytes are
-            // implementation-defined (this crate's miniz_oxide emits one byte less
-            // than the oracle's zlib for this body), so — exactly as `crate::binconv`'s
-            // compressed tests do — only the framing and the round-trip are pinned,
-            // never the oracle's `byte_size/1` (50). See `../CONTEXT.md`.
+            // The `[131][80][body_len:4 BE][zlib]` wrapper. The deflate is zlib
+            // 1.3.2's (`beam_deflate` behind `beam_codec::compress`), so the image is
+            // the oracle's byte for byte and `byte_size/1` of it is the oracle's `50`.
             let plain_term = call(reg, ctx, "term_to_binary", &[big]).expect("plain");
             let plain = bytes_of(ctx, plain_term);
+            assert_eq!(image.len(), 50, "the oracle's compressed size for 500 `hello`s");
             assert_eq!(image[0], 131, "VERSION_MAGIC");
             assert_eq!(image[1], 80, "COMPRESSED_EXT");
             assert_eq!(
@@ -935,7 +934,7 @@ mod tests {
         let registered = default_registry();
         let census = crate::bif_tab::census(&tab, &registered);
         assert_eq!(census.implemented_count(), 556);
-        assert_eq!(census.fast_path_count(), 92);
+        assert_eq!(census.fast_path_count(), 111);
 
         // Seed every name the sweep touches, so `ctx.atom` never needs an interner.
         let mut names: Vec<&str> = vec!["true", "false"];
@@ -950,9 +949,9 @@ mod tests {
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
 
         // Every declared key is `true` (the C gives every `bif.tab` line a
-        // `bif_number`), and every stdlib fast path — the 90 registry keys that
+        // `bif_number`), and every stdlib fast path — the 111 registry keys that
         // are NOT in the table — is `false`. A registry-membership implementation
-        // would answer `true` for all 90.
+        // would answer `true` for all 111.
         for entry in &census.implemented {
             let args = [
                 atom(&ctx, &entry.module),

@@ -1081,14 +1081,17 @@ impl<'a> Encoder<'a> {
     /// (`external.c:2289-2297`). The wrapper costs 5 bytes (`COMPRESSED_EXT` + the
     /// 4-byte size), so — exactly as the C does with a `dest_len` of `body_len - 5`
     /// (`external.c:2276-2298`) — the wrapper is emitted only when the stream fits in
-    /// `body_len - 5` bytes; otherwise the **plain** image
+    /// `body_len - 5` bytes (equality included: `6 + Z <= 1 + body` iff
+    /// `Z <= body - 5`); otherwise the **plain** image
     /// `[VERSION_MAGIC][body]` is returned instead (compression was requested but is
     /// not profitable, and `erlang:term_to_binary/2` yields the uncompressed image
     /// then). A body shorter than 5 bytes can never fit the wrapper and always
-    /// reverts.
+    /// reverts, and `level == 0` never compresses at all (the C's `level != 0` guard).
     ///
-    /// (The deflate bytes themselves are implementation-defined: zlib and
-    /// `miniz_oxide` emit different, equally valid streams for the same body.)
+    /// The deflate bytes are zlib 1.3.2's, produced by `beam_deflate` (the workspace's
+    /// port of the zlib vendored at `erts/emulator/zlib/`), so the stream — and the
+    /// whole image with it — is **byte-identical to the oracle's** for the same body
+    /// and level.
     ///
     /// A `level` outside `0..=9` yields `BeamError::BadArg`; an inner body larger
     /// than the 32-bit size field yields `BeamError::SystemLimit`; a zlib failure
@@ -1205,23 +1208,36 @@ fn latin1_bytes(name: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// zlib-compresses `body`, returning the stream **only when the 5-byte
-/// `COMPRESSED` wrapper still shrinks the image** — the destination-capacity rule
-/// the C applies (`external.c:2276-2298`).
+/// Deflates `body`, returning the stream **only when the 5-byte `COMPRESSED`
+/// wrapper still shrinks the image** — the acceptance rule the C applies
+/// (`external.c:2248-2321`) — and `None` at level `0`, where the C never compresses
+/// at all.
 ///
-/// The C compresses into a buffer of `body_len - 5` bytes (`0` when `body_len < 5`)
-/// and keeps the plain image when `compress2` reports `Z_BUF_ERROR`. Equivalently:
-/// the wrapper is used only when `stream.len() + 5 <= body_len`, i.e.
-/// `stream.len() <= body_len - 5`. A body shorter than 5 bytes can never satisfy
-/// this (a non-empty zlib stream is always longer than 0), so it always reverts.
+/// The predicate is `stream.len() <= body.len() - 5`, **equality included**: a
+/// compressed image is `1 + 1 + 4 + Z` bytes against the plain image's `1 + body`, so
+/// `6 + Z <= 1 + body` ⟺ `Z <= body - 5`, i.e. equal total sizes are on the
+/// COMPRESSED side (the C compresses into a `body_len - 5`-byte destination and keeps
+/// the plain image only on `Z_BUF_ERROR`, which equality does not raise,
+/// `external.c:2276-2298`). A body shorter than 5 bytes (`checked_sub` → `None`) can
+/// never satisfy the predicate and always reverts to the plain image.
+///
+/// `level == 0` returns `None` **without calling the compressor**: the C's
+/// `level != 0` guard (`external.c:2270`, `:2570-2854`) means a level-0 stream is
+/// never emitted, and the level-0 stream's block boundaries are zlib pump-schedule
+/// dependent, so it must not even be computed.
 ///
 /// A `level` outside `0..=9` never reaches here (the caller rejected it); any zlib
 /// failure propagates as `BeamError::BadArg`.
 fn compress_if_smaller(body: &[u8], level: u8) -> Result<Option<Vec<u8>>> {
+    if level == 0 {
+        // The C never compresses at level 0 (`level != 0`), so no stream is built.
+        return Ok(None);
+    }
     let Some(cap) = body.len().checked_sub(5) else {
         return Ok(None);
     };
     let stream = crate::compress::compress(body, level)?;
+    // `<=`: equal total image sizes land on the COMPRESSED side (6 + Z == 1 + body).
     Ok(if stream.len() <= cap { Some(stream) } else { None })
 }
 /// Repacks `size_bits` significant bits — MSB-first inside each byte — from bit
@@ -1328,9 +1344,10 @@ pub fn encode_term_with_minor_version(
 /// byte layout of `erlang:term_to_binary(Term, [{compressed, Level}])`
 /// (`external.c:2289-2297`), which reverts to the uncompressed image whenever zlib
 /// cannot fit the stream into `body_len - 5` bytes — the space the 5-byte wrapper
-/// itself costs (`external.c:2276-2298`). The revert is applied by
-/// [`Encoder::finish_compressed`], so a small term (e.g. `[1,2,3]`) yields exactly
-/// what [`encode_term`] would.
+/// itself costs (`external.c:2276-2298`), equality landing on the compressed side —
+/// and never compresses at all at `level == 0` (the C's `level != 0` guard). The
+/// revert is applied by [`Encoder::finish_compressed`], so a small term (e.g.
+/// `[1,2,3]`) yields exactly what [`encode_term`] would.
 ///
 /// The default [`encode_term`] stays uncompressed: the wrapper is emitted only here
 /// (and only when it helps).

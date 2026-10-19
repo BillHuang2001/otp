@@ -77,7 +77,6 @@ mod checksum;
 mod compare;
 mod context;
 mod convert;
-mod deflate;
 mod dict;
 mod error;
 mod erts_internal;
@@ -112,7 +111,6 @@ mod time;
 mod type_test;
 mod unicode;
 mod zlib;
-mod zlib_deflate;
 pub use crate::context::{
     AtomInterner, BifContext, BytesSink, DictHook, FunCaller, LocalFunIdentity, LocalNode,
     MemoryHook, ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PersistentTerm,
@@ -132,6 +130,7 @@ pub use crate::hook_sets::{
 };
 pub use crate::reason::{exit_reason_from_term, reason_term_from_exit_reason};
 pub use crate::registry::{default_registry, BifFn, BifRegistry};
+pub use crate::zlib::serves_local_call;
 
 /// The conventional glob-import surface for downstream crates.
 ///
@@ -141,7 +140,8 @@ pub use crate::registry::{default_registry, BifFn, BifRegistry};
 pub mod prelude {
     pub use crate::{
         default_registry, exit_reason_from_term, raise_error, raise_exit, raise_throw,
-        reason_term_from_exit_reason, AtomInterner, BifContext, BifFn, BifRegistry, BytesSink,
+        reason_term_from_exit_reason, serves_local_call, AtomInterner, BifContext, BifFn,
+        BifRegistry, BytesSink,
         DictHook, FunCaller, LocalFunIdentity, LocalNode, MemoryHook, ModuleInfo, NifLoadError,
         NifLoader, NullSink, OutputSink, PersistentTerm, PortHook, ProcessHook, ProcessInfoItem,
         RecordDefinitionView, RecordFieldView, RecordSource, RuntimeHooks, SendHook, SendOptions,

@@ -17,9 +17,8 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-
 //! The constant tables zlib's `deflate` needs, transcribed from
-//! `../../erts/emulator/zlib/trees.h` (the generated header of zlib 1.3.2).
+//! `../../../erts/emulator/zlib/trees.h` (the generated header of zlib 1.3.2).
 //!
 //! `trees.h` is itself the output of `trees.c`'s `gen_trees_header()` under
 //! `-DGEN_TREES_H`, i.e. the canonical tables the C library compiles in — so they are

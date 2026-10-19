@@ -17,8 +17,7 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-
-//! Huffman coding and block emission — the port of `../../erts/emulator/zlib/trees.c`.
+//! Huffman coding and block emission — the port of `../../../erts/emulator/zlib/trees.c`.
 //!
 //! This is the half of the encoder that turns a block's LZ77 symbols into bits, and it
 //! is where almost all of zlib's output shape is decided: the frequencies are built into
@@ -26,15 +25,21 @@
 //! tree is grown on top of the two trees' code lengths
 //! ([`DeflateState::build_bl_tree`]), and [`DeflateState::flush_block`] then compares the
 //! three possible encodings of the block — stored, fixed-Huffman and dynamic-Huffman —
-//! and emits the smallest (with zlib's exact tie-break: `static_lenb <= opt_lenb` picks
-//! the fixed tree, `stored_len + 4 <= opt_lenb` picks the stored one).
+//! and emits the smallest (with zlib's exact tie-break: `static_lenb <= opt_lenb`, or
+//! `Z_FIXED`, picks the fixed tree; `stored_len + 4 <= opt_lenb` picks the stored one).
+//!
+//! The bit writer is the C's: [`DeflateState::send_bits`] fills a 16-bit accumulator from
+//! the least significant bit and spills whole `put_short` words into `pending_buf`, and
+//! [`DeflateState::bi_windup`] / [`DeflateState::bi_flush`] are the two ways it gets
+//! drained — which is what makes a caller's per-call output chunking reproducible.
 //!
 //! Every routine keeps the C's name, so a reader can put the two side by side; the only
 //! differences are Rust bookkeeping (explicit indices instead of pointers).
 
 use super::state::{
-    DeflateState, TreeKind, BL_CODES, DYN_TREES, END_BLOCK, HEAP_SIZE, LITERALS, L_CODES,
-    MAX_BITS, REPZ_11_138, REPZ_3_10, REP_3_6, STATIC_TREES,
+    DeflateState, TreeKind, BL_CODES, BUF_SIZE, DYN_TREES, END_BLOCK, HEAP_SIZE, LITERALS,
+    L_CODES, MAX_BITS, MAX_BL_BITS, REPZ_11_138, REPZ_3_10, REP_3_6, STATIC_TREES, Z_BINARY,
+    Z_FIXED, Z_TEXT, Z_UNKNOWN,
 };
 use super::tables::{
     BASE_DIST, BASE_LENGTH, BL_ORDER, DIST_CODE, EXTRA_DBITS, EXTRA_LBITS, LENGTH_CODE,
@@ -70,7 +75,7 @@ impl Codes {
 }
 
 /// `d_code(dist)` (`deflate.h:320`): the distance code of a **distance minus one**.
-fn d_code(dist: u32) -> usize {
+pub(super) fn d_code(dist: u32) -> usize {
     if dist < 256 {
         usize::from(DIST_CODE[dist as usize])
     } else {
@@ -95,9 +100,75 @@ fn bi_reverse(code: u32, len: i32) -> u16 {
     (res >> 1) as u16
 }
 
-impl<'a> DeflateState<'a> {
+impl DeflateState {
+    // ---------------------------------------------------------------------
+    // The bit writer (`trees.c:144-193`)
+    // ---------------------------------------------------------------------
+
+    /// `send_bits(s, value, length)` (`trees.c:274`): append `length` bits of `value`
+    /// (least significant first) to the bit buffer, spilling a whole 16-bit word into
+    /// `pending_buf` when it would overflow.
+    ///
+    /// A zero `length` is a no-op, exactly as the C's macro is: nodes with `Len == 0` also
+    /// have `Code == 0` there, so the `|=` contributes nothing. `(ush)val >> (16 -
+    /// bi_valid)` is reproduced with the 16-bit mask the C's cast performs.
+    pub(super) fn send_bits(&mut self, value: u32, length: i32) {
+        if length <= 0 {
+            return;
+        }
+        let len = length;
+        if self.bi_valid > BUF_SIZE - len {
+            self.bi_buf |= ((value << self.bi_valid) & 0xffff) as u16;
+            let buf = self.bi_buf;
+            self.put_short(buf);
+            self.bi_buf = ((value & 0xffff) >> (BUF_SIZE - self.bi_valid)) as u16;
+            self.bi_valid += len - BUF_SIZE;
+        } else {
+            self.bi_buf |= ((value << self.bi_valid) & 0xffff) as u16;
+            self.bi_valid += len;
+        }
+    }
+
+    /// `bi_flush` (`trees.c:166`): drain the bit buffer down to at most 7 bits.
+    pub(super) fn bi_flush(&mut self) {
+        if self.bi_valid == 16 {
+            let buf = self.bi_buf;
+            self.put_short(buf);
+            self.bi_buf = 0;
+            self.bi_valid = 0;
+        } else if self.bi_valid >= 8 {
+            let byte = self.bi_buf as u8;
+            self.put_byte(byte);
+            self.bi_buf >>= 8;
+            self.bi_valid -= 8;
+        }
+    }
+
+    /// `bi_windup` (`trees.c:181`): flush the bit buffer and align on a byte boundary.
+    pub(super) fn bi_windup(&mut self) {
+        if self.bi_valid > 8 {
+            let buf = self.bi_buf;
+            self.put_short(buf);
+        } else if self.bi_valid > 0 {
+            let byte = self.bi_buf as u8;
+            self.put_byte(byte);
+        }
+        self.bi_used = ((self.bi_valid - 1) & 7) + 1;
+        self.bi_buf = 0;
+        self.bi_valid = 0;
+    }
+
+    /// `_tr_flush_bits` (`trees.c:880`).
+    pub(super) fn flush_bits(&mut self) {
+        self.bi_flush();
+    }
+
+    // ---------------------------------------------------------------------
+    // Block bookkeeping
+    // ---------------------------------------------------------------------
+
     /// `init_block` (`trees.c:440`): reset the three trees' frequencies for a new block.
-    pub fn init_block(&mut self) {
+    pub(super) fn init_block(&mut self) {
         for n in 0..L_CODES {
             self.dyn_ltree[n].freq = 0;
         }
@@ -111,7 +182,67 @@ impl<'a> DeflateState<'a> {
         self.opt_len = 0;
         self.static_len = 0;
         self.sym_next = 0;
+        self.matches = 0;
     }
+
+    /// `_tr_stored_block` (`trees.c:860`): a stored (uncompressed) deflate block.
+    ///
+    /// `buf` is the window offset of the block's bytes (`None` where the C passes a NULL
+    /// buffer — the dummy header `deflate_stored` later patches, or a block whose start
+    /// has slid out of the window), and `stored_len` its length.
+    pub(super) fn stored_block(&mut self, buf: Option<usize>, stored_len: u64, last: bool) {
+        self.send_bits(STORED_BLOCK_HEADER + u32::from(last), 3);
+        self.bi_windup();
+        self.put_short(stored_len as u16);
+        self.put_short(!(stored_len as u16));
+        if stored_len != 0 {
+            if let Some(from) = buf {
+                let len = stored_len as usize;
+                for i in 0..len {
+                    let byte = self.window[from + i];
+                    self.put_byte(byte);
+                }
+            }
+        }
+    }
+
+    /// `_tr_align` (`trees.c:888`): one empty static block, to give `inflate` enough
+    /// lookahead (`Z_PARTIAL_FLUSH`).
+    pub(super) fn align(&mut self) {
+        self.send_bits(STATIC_TREES << 1, 3);
+        self.emit_code(Codes::StaticLit, END_BLOCK);
+        self.bi_flush();
+    }
+
+    /// `detect_data_type` (`trees.c:966`): `Z_TEXT` or `Z_BINARY` for the block just
+    /// tallied. The answer is only reported through `strm->data_type` (it never changes a
+    /// bit), but it is part of the C's stream state, so it is reproduced.
+    fn detect_data_type(&self) -> i32 {
+        // `block_mask` is the bit mask of block-listed bytes: 0..6, 14..25 and 28..31.
+        let mut block_mask: u32 = 0xf3ff_c07f;
+        for n in 0..=31usize {
+            if (block_mask & 1) != 0 && self.dyn_ltree[n].freq != 0 {
+                return Z_BINARY;
+            }
+            block_mask >>= 1;
+        }
+        if self.dyn_ltree[9].freq != 0
+            || self.dyn_ltree[10].freq != 0
+            || self.dyn_ltree[13].freq != 0
+        {
+            return Z_TEXT;
+        }
+        for n in 32..LITERALS {
+            if self.dyn_ltree[n].freq != 0 {
+                return Z_TEXT;
+            }
+        }
+        Z_BINARY
+    }
+
+    // ---------------------------------------------------------------------
+    // Huffman construction (`trees.c:499-855`)
+    // ---------------------------------------------------------------------
 
     /// `send_code(s, c, tree)` (`trees.c:239`).
     fn emit_code(&mut self, codes: Codes, c: usize) {
@@ -190,9 +321,9 @@ impl<'a> DeflateState<'a> {
                 .opt_len
                 .wrapping_add(f.wrapping_mul(u64::from(bits as u32 + xbits)));
             if let Some(stree) = stree {
-                self.static_len = self
-                    .static_len
-                    .wrapping_add(f.wrapping_mul(u64::from(u32::from(stree[n as usize].1) + xbits)));
+                self.static_len = self.static_len.wrapping_add(
+                    f.wrapping_mul(u64::from(u32::from(stree[n as usize].1) + xbits)),
+                );
             }
         }
         if overflow == 0 {
@@ -262,7 +393,7 @@ impl<'a> DeflateState<'a> {
 
     /// `build_tree` (`trees.c:627`): one Huffman tree, its lengths, its codes and the
     /// `opt_len`/`static_len` contributions.
-    pub fn build_tree(&mut self, kind: TreeKind) {
+    pub(super) fn build_tree(&mut self, kind: TreeKind) {
         let elems = kind.elems();
         let stree = kind.static_tree();
         let mut max_code: i32 = -1;
@@ -539,23 +670,36 @@ impl<'a> DeflateState<'a> {
     /// `buf` is the window offset of the block's bytes (`None` when `block_start` has gone
     /// negative — the C's NULL buffer, which disables the stored form) and `stored_len`
     /// its length.
-    pub fn flush_block(&mut self, buf: Option<usize>, stored_len: u64, last: bool) {
+    pub(super) fn flush_block(&mut self, buf: Option<usize>, stored_len: u64, last: bool) {
         let mut opt_lenb;
         let static_lenb;
+        let mut max_blindex = 0;
 
-        self.build_tree(TreeKind::Lit);
-        self.build_tree(TreeKind::Dist);
-        let max_blindex = self.build_bl_tree();
+        if self.level > 0 {
+            // Check if the file is binary or text.
+            if self.data_type == Z_UNKNOWN {
+                self.data_type = self.detect_data_type();
+            }
 
-        // `opt_lenb = (s->opt_len+3+7)>>3;` — on the wrapped `ulg` totals (`trees.c:1027`).
-        opt_lenb = self.opt_len.wrapping_add(3 + 7) >> 3;
-        static_lenb = self.static_len.wrapping_add(3 + 7) >> 3;
+            self.build_tree(TreeKind::Lit);
+            self.build_tree(TreeKind::Dist);
+            max_blindex = self.build_bl_tree();
 
-        if static_lenb <= opt_lenb {
-            opt_lenb = static_lenb;
+            // `opt_lenb = (s->opt_len+3+7)>>3;` — on the wrapped `ulg` totals
+            // (`trees.c:1027`).
+            opt_lenb = self.opt_len.wrapping_add(3 + 7) >> 3;
+            static_lenb = self.static_len.wrapping_add(3 + 7) >> 3;
+
+            if static_lenb <= opt_lenb || self.strategy == Z_FIXED {
+                opt_lenb = static_lenb;
+            }
+        } else {
+            // `Assert(buf != NULL)` — a level-0 stream forces a stored block.
+            opt_lenb = stored_len + 5;
+            static_lenb = opt_lenb;
         }
 
-        if stored_len + 4 <= opt_lenb && buf.is_some() {
+        if stored_len.wrapping_add(4) <= opt_lenb && buf.is_some() {
             self.stored_block(buf, stored_len, last);
         } else if static_lenb == opt_lenb {
             // `send_bits(s, (STATIC_TREES<<1)+last, 3)` — the block type sits one bit
@@ -578,7 +722,7 @@ impl<'a> DeflateState<'a> {
 
     /// `_tr_tally_lit` (`deflate.h:357`): record a literal byte; `true` when the symbol
     /// buffer is full and the block must be flushed.
-    pub fn tr_tally_lit(&mut self, c: u8) -> bool {
+    pub(super) fn tr_tally_lit(&mut self, c: u8) -> bool {
         let i = self.sym_next;
         self.sym_buf[i] = 0;
         self.sym_buf[i + 1] = 0;
@@ -590,18 +734,27 @@ impl<'a> DeflateState<'a> {
 
     /// `_tr_tally_dist` (`deflate.h:365`): record a match of `length` (3..=258) at
     /// `distance`; `true` when the symbol buffer is full.
-    pub fn tr_tally_dist(&mut self, distance: u32, length: u32) -> bool {
+    pub(super) fn tr_tally_dist(&mut self, distance: u32, length: u32) -> bool {
         let i = self.sym_next;
         self.sym_buf[i] = (distance & 0xff) as u8;
         self.sym_buf[i + 1] = ((distance >> 8) & 0xff) as u8;
         self.sym_buf[i + 2] = length as u8;
         self.sym_next += 3;
         let dist = distance - 1;
+        self.matches += 1;
         self.dyn_ltree[usize::from(LENGTH_CODE[length as usize]) + LITERALS + 1].freq += 1;
         self.dyn_dtree[d_code(dist)].freq += 1;
         self.sym_next == self.sym_end
     }
 }
+
+/// `(STORED_BLOCK << 1)` — the three-bit stored-block header prefix; the `BFINAL` bit is
+/// added by the caller (`trees.c:862`).
+const STORED_BLOCK_HEADER: u32 = super::state::STORED_BLOCK << 1;
+
+/// `MAX_BL_BITS` is only referenced through [`TreeKind::max_length`]; this keeps the
+/// import list honest if that ever changes.
+const _: usize = MAX_BL_BITS;
 
 #[cfg(test)]
 mod tests {
@@ -655,5 +808,88 @@ mod tests {
                 base + span
             );
         }
+    }
+
+    /// The static (fixed-Huffman) tables are `trees.h`'s, and they have to satisfy the
+    /// canonical-code rule `code + bl_count[MAX_BITS] - 1 == 2^MAX_BITS - 1` that
+    /// `gen_codes` asserts — otherwise a fixed-code block could not be decoded by a
+    /// conforming inflater.
+    #[test]
+    fn the_static_trees_are_canonical() {
+        let mut bl_count = [0u16; MAX_BITS + 1];
+        for (_, len) in STATIC_LTREE.iter().take(L_CODES + 2) {
+            bl_count[*len as usize] += 1;
+        }
+        let mut code = 0u32;
+        for bits in 1..=MAX_BITS {
+            code = (code + u32::from(bl_count[bits - 1])) << 1;
+        }
+        assert_eq!(code + u32::from(bl_count[MAX_BITS]) - 1, (1 << MAX_BITS) - 1);
+        // `static_dtree[n].Code == bi_reverse(n, 5)`: the fixed distance codes are the
+        // canonical 5-bit codes in numeric order, bit-reversed for the LSB-first writer.
+        for (n, (code, len)) in STATIC_DTREE.iter().enumerate() {
+            assert_eq!(*len, 5, "distance code {n}");
+            assert_eq!(*code, bi_reverse(n as u32, 5), "distance code {n}");
+        }
+    }
+
+    /// `send_bits` fills the 16-bit accumulator from the least significant bit and only
+    /// spills when a value would overflow it (`bi_valid > Buf_size - len`), so exactly 16
+    /// live bits stay in the buffer until the next `send_bits` or `bi_windup`; the spilled
+    /// word goes out little-endian first.
+    #[test]
+    fn the_bit_writer_spills_little_endian_words() {
+        let mut st = DeflateState::new(6, 0, 0, 15, 8);
+        st.send_bits(0b1, 1);
+        assert_eq!(st.bi_valid, 1);
+        assert_eq!(st.pending, 0);
+        st.send_bits(0x1ff, 9);
+        assert_eq!(st.bi_valid, 10);
+        // Bit 10 is the accumulator's last free one, so nothing spills yet.
+        st.send_bits(0x3f, 6);
+        assert_eq!(st.bi_valid, 16);
+        assert_eq!(st.bi_buf, 0xffff);
+        assert_eq!(st.pending, 0, "a full word waits for the next send or flush");
+        // One more bit overflows: the whole word goes out LSB first.
+        st.send_bits(0b1, 1);
+        assert_eq!(st.pending, 2);
+        assert_eq!(&st.pending_buf[..2], &[0xff, 0xff]);
+        assert_eq!(st.bi_buf, 0b1);
+        assert_eq!(st.bi_valid, 1);
+        st.bi_windup();
+        assert_eq!(st.bi_valid, 0);
+        assert_eq!(&st.pending_buf[..3], &[0xff, 0xff, 0x01], "the tail is padded");
+    }
+    /// A zero-length code (`Len == 0` in the C, i.e. `Code == 0` there too) contributes
+    /// nothing; sending it must not corrupt the accumulator.
+    #[test]
+    fn a_zero_length_code_is_a_no_op() {
+        let mut st = DeflateState::new(6, 0, 0, 15, 8);
+        st.send_bits(0xabcd, 0);
+        assert_eq!(st.bi_buf, 0);
+        assert_eq!(st.bi_valid, 0);
+        assert_eq!(st.pending, 0);
+    }
+
+    /// `_tr_stored_block`'s header is `BFINAL/BTYPE`, then a byte-aligned `LEN`/`NLEN`
+    /// pair, then the bytes.
+    #[test]
+    fn a_stored_block_carries_its_own_length_and_complement() {
+        let mut st = DeflateState::new(6, 0, 0, 15, 8);
+        st.window[10..15].copy_from_slice(b"hello");
+        st.stored_block(Some(10), 5, true);
+        assert_eq!(st.pending, 5 + 5);
+        assert_eq!(&st.pending_buf[..5], &[0x01, 0x05, 0x00, 0xfa, 0xff]);
+        assert_eq!(&st.pending_buf[5..10], b"hello");
+    }
+
+    /// The empty block that `Z_SYNC_FLUSH` appends is a *stored* block of length zero:
+    /// `00 00 FF FF` after the three block-type bits, byte-aligned.
+    #[test]
+    fn an_empty_stored_block_is_the_sync_marker() {
+        let mut st = DeflateState::new(6, 0, 0, 15, 8);
+        st.stored_block(None, 0, false);
+        assert_eq!(&st.pending_buf[..5], &[0x00, 0x00, 0x00, 0xff, 0xff]);
+        assert_eq!(st.pending, 5);
     }
 }

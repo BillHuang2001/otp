@@ -37,10 +37,11 @@
 //!   `error:data_error` for a stream the inflater cannot finish — with **no** length
 //!   arm, unlike `uncompress/1`);
 //! * the round trip over many sizes **and every compression level 0..=9**, which is
-//!   the correctness evidence for the hand-written decoder in `src/deflate.rs`: level 0
-//!   exercises stored blocks and the higher levels exercise dynamic Huffman blocks
-//!   (`the_sweep_covers_all_three_deflate_block_types` asserts that the sweep really
-//!   reaches a dynamic block, rather than assuming it);
+//!   the correctness evidence for the inflater behind `unzip/1` and `uncompress/1` —
+//!   `beam_deflate`'s `decompress`/`decompress_bounded`, the sibling crate's port of
+//!   zlib 1.3.2: level 0 exercises stored blocks and the higher levels exercise dynamic
+//!   Huffman blocks (`the_sweep_covers_all_three_deflate_block_types` asserts that the
+//!   sweep really reaches a dynamic block, rather than assuming it);
 //! * a **live cross-check against the system oracle** — streams the system `erl`'s own
 //!   `zlib:zip/1` produced, one of them long enough (> 1 KiB) to need dynamic Huffman.
 //!   `tests/zlib_oracle.rs` extends that to all six functions over a bounded corpus.

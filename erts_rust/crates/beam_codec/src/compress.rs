@@ -26,22 +26,23 @@
 //! version byte and the stream is a zlib-wrapped (RFC 1950) deflate stream — a
 //! 2-byte zlib header plus an Adler-32 trailer, **not** raw deflate.
 //!
-//! Ground truth is the legacy C `../../erts/emulator/beam/external.c`
-//! (`binary2term_prepare`, `external.c:1744-1816`, decode; the `erlang:term_to_binary/2`
-//! path, `external.c:2291`, encode) with `../../erts/emulator/beam/erl_zlib.c`. The C
-//! calls zlib's `compress2`/`uncompress` (i.e. `deflateInit`/`inflateInit` with the
-//! default window), so this module uses [`flate2`]'s zlib wrappers and never raw deflate.
+//! **The deflate is byte-identical to the oracle's.** Ground truth is the legacy C
+//! `../../erts/emulator/beam/external.c` (`binary2term_prepare`, `external.c:1744-1816`,
+//! decode; the `erlang:term_to_binary/2` path `external.c:2248-2321` with the
+//! `TTBEncode`/`TTBCompress` state machine `:2570-2854`, encode) over
+//! `../../erts/emulator/beam/erl_zlib.c`, whose `erl_zlib_compress2` is
+//! `deflateInit(level)` + one `deflate(Z_FINISH)`. The deflate here is
+//! [`beam_deflate`], the workspace's safe-Rust port of the zlib 1.3.2 the repository
+//! vendors at `erts/emulator/zlib/`, so the `COMPRESSED` bytes this crate emits are
+//! the bytes the oracle emits for the same body and level — not merely "a valid
+//! stream". The wrapper layout stays `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4
+//! BE][zlib stream]`, the 4-byte size excluding the version byte.
 //!
 //! This module is safe Rust: it owns only the zlib plumbing. Building the wrapper
 //! bytes (the version byte, the tag, the size field) is [`crate::encode`]'s job and
 //! recognising/handling the top-level wrapper is [`crate::decode`]'s.
 
-use std::io::{Read, Write};
-
 use beam_common::Result;
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
 
 use crate::error::bad_arg;
 
@@ -65,17 +66,22 @@ pub const MAX_UNCOMPRESSED: usize = 32 * 1024 * 1024;
 /// Compresses `data` with zlib (RFC 1950) at `level` (`0..=9`).
 ///
 /// `level` is the zlib compression level, exactly like the C `{compressed, Level}`
-/// option: `0` stores, `9` is best compression. A `level` outside [`MIN_LEVEL`]`..=`[`MAX_LEVEL`]
-/// yields [`BeamError::BadArg`](beam_common::BeamError::BadArg); a zlib failure (it
-/// can only fail on an internal error here) yields the same. The output is the whole
-/// zlib stream: 2-byte header, deflate data, Adler-32 trailer.
+/// option: `0` stores, `9` is best compression. The output is the whole zlib stream
+/// — 2-byte header, deflate data, Adler-32 trailer — byte-identical to what the
+/// oracle's `erl_zlib_compress2` (`deflateInit(level)` + one `deflate(Z_FINISH)`)
+/// produces for the same input and level.
+///
+/// The `u8` parameter range is deliberate: the ETF option range is `0..=9`, and a
+/// `level` outside [`MIN_LEVEL`]`..=`[`MAX_LEVEL`] yields
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg). zlib's
+/// `Z_DEFAULT_COMPRESSION` (`-1`) is mapped to level 6 by the caller
+/// (`beam_bifs::binconv`), which is faithful because `deflateInit(-1)` and
+/// `deflateInit(6)` emit byte-identical streams.
 pub fn compress(data: &[u8], level: u8) -> Result<Vec<u8>> {
     if level > MAX_LEVEL {
         return Err(bad_arg());
     }
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(u32::from(level)));
-    encoder.write_all(data).map_err(|_| bad_arg())?;
-    encoder.finish().map_err(|_| bad_arg())
+    beam_deflate::compress(data, level as i8)
 }
 
 /// Decompresses a zlib (RFC 1950) stream.
@@ -86,22 +92,9 @@ pub fn compress(data: &[u8], level: u8) -> Result<Vec<u8>> {
 /// [`MAX_UNCOMPRESSED`] bytes; a larger stream is rejected with the same error rather
 /// than allocating without bound. Never panics.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = ZlibDecoder::new(data);
-    let mut out = Vec::new();
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        match decoder.read(&mut chunk) {
-            // The stream ended (all input consumed, deflate final block seen).
-            Ok(0) => return Ok(out),
-            Ok(read) => {
-                if out.len() + read > MAX_UNCOMPRESSED {
-                    return Err(bad_arg());
-                }
-                out.extend_from_slice(&chunk[..read]);
-            }
-            Err(_) => return Err(bad_arg()),
-        }
-    }
+    // [`beam_deflate::decompress`] is deliberately unbounded, so this fixed ceiling —
+    // the module's contract — is applied by asking for the bounded form instead.
+    beam_deflate::decompress_bounded(data, MAX_UNCOMPRESSED)
 }
 
 /// Decompresses a zlib (RFC 1950) stream, refusing to inflate past `limit` bytes.
@@ -125,7 +118,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
 /// inflated length `> limit` yields
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg). Never panics.
 pub fn decompress_bounded(data: &[u8], limit: usize) -> Result<Vec<u8>> {
-    decompress_bounded_used(data, limit).map(|(body, _consumed)| body)
+    beam_deflate::decompress_bounded(data, limit)
 }
 
 /// Like [`decompress_bounded`], but also reports how many **input** bytes the zlib
@@ -142,27 +135,7 @@ pub fn decompress_bounded(data: &[u8], limit: usize) -> Result<Vec<u8>> {
 /// error or an inflated length `> limit` yields
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg).
 pub fn decompress_bounded_used(data: &[u8], limit: usize) -> Result<(Vec<u8>, usize)> {
-    let mut decoder = ZlibDecoder::new(data);
-    let mut out = Vec::new();
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        match decoder.read(&mut chunk) {
-            Ok(0) => {
-                // `total_in()` is every input byte the decompressor consumed (including
-                // the Adler-32 trailer) and stops at the stream end, so it is at most
-                // `data.len()` — the `as usize` narrowing cannot lose information.
-                let consumed = decoder.total_in() as usize;
-                return Ok((out, consumed));
-            }
-            Ok(read) => {
-                if out.len().saturating_add(read) > limit {
-                    return Err(bad_arg());
-                }
-                out.extend_from_slice(&chunk[..read]);
-            }
-            Err(_) => return Err(bad_arg()),
-        }
-    }
+    beam_deflate::decompress_bounded_used(data, limit)
 }
 
 /// The `BeamError` a `level` outside [`MIN_LEVEL`]`..=`[`MAX_LEVEL`] yields.
@@ -227,6 +200,73 @@ mod tests {
             data.len()
         );
         assert_eq!(decompress(&packed).unwrap(), data);
+    }
+
+    /// The exact zlib streams the oracle (OTP 29.1.1 / erts-17.1) produces for the
+    /// ETF body of `binary:copy(<<"a">>,100)` — i.e. `<<109,0,0,0,100>>` followed by
+    /// 100 `a`s, 105 bytes, which is what the oracle compresses:
+    /// `term_to_binary(binary:copy(<<"a">>,100), [{compressed,Level}])` is
+    /// `<<131,80,0,0,0,105, Stream/binary>>`. Every level `1..=9` deflates the body to
+    /// the same bytes; only the 2-byte zlib header differs (`78 01` / `78 5e` /
+    /// `78 9c` / `78 da`). Byte-for-byte is the contract: this crate's `COMPRESSED`
+    /// payload is zlib's, not merely "a valid stream".
+    const ORACLE_ETF_BODY_DEFLATE: [u8; 14] = [
+        0xcb, 0x65, 0x60, 0x60, 0x48, 0x49, 0xa4, 0x03, 0x00, 0x00, 0xce, 0x75, 0x26, 0xb6,
+    ];
+
+    /// The 105-byte inner body of `binary:copy(<<"a">>,100)`'s external format.
+    fn a100_etf_body() -> Vec<u8> {
+        let mut body = vec![109, 0, 0, 0, 100]; // BINARY_EXT + length
+        body.extend_from_slice(&[b'a'; 100]);
+        body
+    }
+
+    /// A whole oracle stream: the level's 2-byte zlib header then the shared deflate
+    /// body *and* Adler-32 trailer.
+    fn oracle_a100_stream(header: [u8; 2]) -> Vec<u8> {
+        let mut stream = header.to_vec();
+        stream.extend_from_slice(&ORACLE_ETF_BODY_DEFLATE);
+        stream
+    }
+
+    #[test]
+    fn compress_is_byte_identical_to_the_oracle_stream() {
+        let body = a100_etf_body();
+
+        // The four levels with a captured whole-image oracle stream, byte for byte.
+        let goldens: [(u8, [u8; 2]); 4] = [
+            (1, [0x78, 0x01]),
+            (2, [0x78, 0x5e]),
+            (6, [0x78, 0x9c]),
+            (9, [0x78, 0xda]),
+        ];
+        for (level, header) in goldens {
+            let expected = oracle_a100_stream(header);
+            assert_eq!(compress(&body, level).unwrap(), expected, "level {level}");
+        }
+
+        // Every level emits a well-formed zlib stream that round-trips, and its header
+        // carries the `FLEVEL` bits zlib's `configuration_table` assigns to the level.
+        for level in MIN_LEVEL..=MAX_LEVEL {
+            let packed = compress(&body, level).unwrap();
+            let round_trip = decompress(&packed).unwrap();
+            assert_eq!(round_trip, body, "level {level} round-trip");
+            let expected_flevel = match level {
+                0 | 1 => 0x00,
+                2..=5 => 0x01,
+                6 => 0x02,
+                _ => 0x03,
+            };
+            assert_eq!(
+                packed[0], 0x78,
+                "level {level}: the CMF byte is `deflate`/32K window"
+            );
+            assert_eq!(
+                packed[1] & 0xc0,
+                expected_flevel << 6,
+                "level {level}: zlib FLEVEL bits"
+            );
+        }
     }
 
     #[test]
