@@ -1068,3 +1068,202 @@ fn a_resource_term_of_another_type_does_not_resolve() {
     let minted_word = minted.raw();
     assert_eq!(release_resource_terms(|candidate| candidate.raw() != minted_word), 1);
 }
+
+// ---------------------------------------------------------------------------------------------
+// `resource_term(host, obj)` — a resource term for a bare `void*` handle
+// (`resources_term.rs`; the C's `prepare_select_msg`, `erl_check_io.c:699-767`)
+//
+// Every prune below is narrowed to this test's own term words (`candidate.raw() != word`), so the
+// other tests' live terms in this shared process stay reachable under parallel execution; and every
+// assertion is a membership/identity statement rather than a length delta on the process-wide
+// registry, for the same reason.
+// ---------------------------------------------------------------------------------------------
+
+/// A handle that is null, and a pointer this crate never allocated, both answer `None` — and neither
+/// even allocates a reference block, so no term is fabricated and no object is resurrected.
+#[test]
+fn resource_term_refuses_a_handle_that_is_not_ours() {
+    let mut host = RetainHost::new();
+    let before = host.heap.used();
+
+    // SAFETY: a null handle is explicitly allowed by `resource_term`'s contract.
+    assert_eq!(
+        resource_term(&mut host, core::ptr::null_mut()),
+        None,
+        "a null handle names no object"
+    );
+    // A pointer this crate never allocated. It is never dereferenced: the registry's live-object set
+    // is the only gate, exactly as for `enif_get_resource`.
+    let foreign = 0x1000 as *mut c_void;
+    assert_eq!(
+        resource_term(&mut host, foreign),
+        None,
+        "a pointer this crate did not allocate is not a resource"
+    );
+    assert_eq!(
+        host.heap.used(),
+        before,
+        "both refusals happen before the reference block is allocated — nothing was minted"
+    );
+}
+
+/// The minted term is a full resource term: `enif_get_resource` resolves it to the very pointer that
+/// was allocated, and it holds **its own** reference (releasing the allocator's leaves it alive and
+/// the destructor un-run until the term dies).
+#[test]
+fn resource_term_mints_a_resolving_term_that_holds_its_own_reference() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_dtor(_: *mut ErlNifEnv, _: *mut c_void) {
+        RUNS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    let mut host = RetainHost::new();
+    let (ty, obj) = {
+        let mut env = NifEnv::new(&mut host);
+        let ty = open_type(&mut env, "select_term_rt", counting_dtor);
+        // SAFETY: `ty` came from `open_type`; every reference taken here is released below.
+        let obj = unsafe { alloc_object(ty, 4) };
+        // SAFETY: `obj` is a live 4-byte payload; the first byte is in bounds.
+        unsafe { *(obj as *mut u8) = 0x2a };
+        (ty, obj)
+    };
+    let base = RUNS.load(AtomicOrdering::Relaxed);
+
+    // The host seam call: a bare `void*` in, a resource term out (no env, no raw pointer to an env).
+    let term = resource_term(&mut host, obj).expect("a live object mints a term");
+
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live; `term` is the term just minted; `ty` is the object's own type.
+        assert_eq!(
+            unsafe { get_resource(&mut env, term, ty) },
+            (1, obj),
+            "the minted term resolves to the very payload pointer that was allocated"
+        );
+    }
+
+    // Release the allocator's reference: the mint's own reference keeps the block (and the payload)
+    // alive, exactly as for `enif_make_resource` (module docs, "It takes a reference").
+    // SAFETY: `obj` still has the term's outstanding reference.
+    unsafe { enif_release_resource(obj) };
+    assert_eq!(
+        RUNS.load(AtomicOrdering::Relaxed) - base,
+        0,
+        "the term's reference keeps the object alive, so no destructor has run"
+    );
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live; `ty` is the object's own type; the block is still allocated.
+        assert_eq!(
+            unsafe { get_resource(&mut env, term, ty) },
+            (1, obj),
+            "and it still resolves after the allocator's release"
+        );
+    }
+
+    // The term's reference is dropped by the release seam (the caller-owned reachability signal).
+    let word = term.raw();
+    assert_eq!(
+        release_resource_terms(|candidate| candidate.raw() != word),
+        1,
+        "the prune releases exactly this term"
+    );
+    assert_eq!(
+        RUNS.load(AtomicOrdering::Relaxed) - base,
+        1,
+        "the term was the last reference, so the destructor ran exactly once"
+    );
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live; `term` is a readable word on the still-live host heap.
+        assert_eq!(
+            unsafe { get_resource(&mut env, term, ty) },
+            (0, core::ptr::null_mut()),
+            "the binding is gone, so the term no longer designates anything"
+        );
+    }
+}
+
+/// Two mints of ONE object answer two **distinct** terms that both resolve to it — the C's fresh
+/// magic reference per call (measured on the oracle for `enif_make_resource`).
+#[test]
+fn two_mints_of_one_object_answer_two_distinct_terms() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_dtor(_: *mut ErlNifEnv, _: *mut c_void) {
+        RUNS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    let mut host = RetainHost::new();
+    let (ty, obj) = {
+        let mut env = NifEnv::new(&mut host);
+        let ty = open_type(&mut env, "select_term_twice_rt", counting_dtor);
+        // SAFETY: `ty` came from `open_type`; every reference taken here is released below.
+        let obj = unsafe { alloc_object(ty, 2) };
+        (ty, obj)
+    };
+    let base = RUNS.load(AtomicOrdering::Relaxed);
+
+    let first = resource_term(&mut host, obj).expect("the first mint succeeds");
+    let second = resource_term(&mut host, obj).expect("the second mint succeeds");
+    assert_ne!(
+        first.raw(),
+        second.raw(),
+        "each mint is a fresh internal-reference block"
+    );
+    // SAFETY: both are internal-reference blocks `write_resource_ref` just built, so their id words
+    // are readable.
+    let (first_id, second_id) = unsafe {
+        (
+            prelude::internal_ref_id(first).expect("a reference id"),
+            prelude::internal_ref_id(second).expect("a reference id"),
+        )
+    };
+    assert_ne!(first_id, second_id, "each mint draws a fresh reference id");
+
+    {
+        let mut env = NifEnv::new(&mut host);
+        for term in [first, second] {
+            // SAFETY: `env` is live; `term` is one of the two mints; `ty` is the object's own type.
+            assert_eq!(
+                unsafe { get_resource(&mut env, term, ty) },
+                (1, obj),
+                "both terms designate the same object"
+            );
+        }
+    }
+
+    // Three references: the allocator's and the two terms'.
+    let words = [first.raw(), second.raw()];
+    assert_eq!(
+        release_resource_terms(|candidate| !words.contains(&candidate.raw())),
+        2,
+        "both mints are released in one pass"
+    );
+    assert_eq!(
+        RUNS.load(AtomicOrdering::Relaxed) - base,
+        0,
+        "the allocator's reference still holds the object"
+    );
+    // SAFETY: the allocator's reference is the last outstanding one, so this release destroys it.
+    unsafe { enif_release_resource(obj) };
+    assert_eq!(RUNS.load(AtomicOrdering::Relaxed) - base, 1);
+}
+
+/// The minting seam is reachable at both documented public paths —
+/// `nif::enif::resources::resource_term` (where it is implemented) and `nif::enif::resource_term`
+/// (the family re-export) — with one and the same signature, because the runtime implements its
+/// caller side against them.
+#[test]
+fn the_minting_seam_is_publicly_reachable() {
+    type Seam = fn(&mut dyn NifHost, *mut c_void) -> Option<Eterm>;
+    let here: Seam = resource_term;
+    let family: Seam = crate::nif::enif::resources::resource_term;
+    let re_export: Seam = crate::nif::enif::resource_term;
+    let _ = (here, family, re_export);
+}
