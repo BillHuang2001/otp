@@ -33,6 +33,7 @@ use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
+use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -44,7 +45,7 @@ use super::super::{
     decode_flags, extract_bits, fail_step, is_all, raw, read_size, read_uint_be, small_value,
 };
 use super::match_ctx::{read_ctx, reread_ctx};
-use super::reads::read_integer_field;
+use super::reads::read_integer_field_tracked;
 // ---------------------------------------------------------------------------
 // The `bs_match` command interpreter
 // ---------------------------------------------------------------------------
@@ -64,18 +65,34 @@ pub(crate) fn run_commands(
     // *after* the C has advanced `sb->start`, and that destination may be the very
     // operand the context lives in (`get_tail` in `bits/1`), so a trailing write-back
     // would have to re-read a register a command had already overwritten.
-    let (_, _, start, _) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
+    //
+    // The context term, its inner subject and the subject's byte view are captured
+    // **once** here and re-derived only after a command that could have allocated
+    // through the rooted seam (`stale`): `ensure_at_least`/`ensure_exactly`/`skip`/`=:=`
+    // allocate nothing at all, and an `integer` command allocates only when its field
+    // does not fit a small integer ([`read_integer_field_tracked`]'s flag), so in the
+    // hot shape (`ensure_at_least N 1` then `integer … 8 1 Dst`) the whole command list
+    // runs off one capture — no per-iteration operand read, no per-iteration
+    // `subject_bytes`, and only one `commit` re-read at most. The default is the
+    // re-read: a false `stale` is UB (a relocated block), a false `true` is one wasted
+    // read.
+    let (mut term, orig, start, mut end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
+    let (mut bytes, mut off) = raw::subject_bytes(orig)?;
     let mut pos = start;
+    // `true` when the previous command may have relocated the context block, so the
+    // capture above is stale and must be re-derived before it is used again.
+    let mut stale = false;
     let mut i = 0usize;
     while i < commands.len() {
-        // Re-derive the context and its byte view at the top of **every** iteration:
-        // the previous iteration's `integer`/`binary`/`get_tail` command allocated
-        // through the rooted seam (`read_integer_field` -> `raw::make_big`,
-        // `raw::make_binary`), whose moving collector may have relocated the context
-        // block, so a `term`/`bytes` captured before that allocation is stale
-        // (the frozen reserve, then read, then write ordering).
-        let (_, orig, _, end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
-        let (bytes, off) = raw::subject_bytes(orig)?;
+        if stale {
+            let (fresh, fresh_orig, _, fresh_end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
+            let (fresh_bytes, fresh_off) = raw::subject_bytes(fresh_orig)?;
+            term = fresh;
+            end = fresh_end;
+            bytes = fresh_bytes;
+            off = fresh_off;
+            stale = false;
+        }
         let Operand::Atom(command) = &commands[i] else {
             return Err(error::unsupported(
                 "bs_match: command list does not start with an atom",
@@ -113,7 +130,7 @@ pub(crate) fn run_commands(
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos = next;
-                commit(machine, ctx, ctx_op, pos)?;
+                commit(machine, ctx, ctx_op, term, false, pos)?;
                 i += 2;
             }
             // `integer Live Flags Size Unit Dst` (`i_bs_get_fixed_integer`).
@@ -128,13 +145,15 @@ pub(crate) fn run_commands(
                 if nbits > end.saturating_sub(pos) {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                let value = read_integer_field(machine, ctx, bytes, pos + off, nbits, flags)?;
+                let (value, allocated) =
+                    read_integer_field_tracked(machine, ctx, bytes, pos + off, nbits, flags)?;
                 pos += nbits;
                 // The C advances `sb->start` (inside `erts_bs_get_integer_2`) *before*
                 // it binds `$Dst`, so the advance is mirrored first: `Dst` may be the
                 // context's own operand.
-                commit(machine, ctx, ctx_op, pos)?;
+                commit(machine, ctx, ctx_op, term, allocated, pos)?;
                 write_operand(machine, dst, value)?;
+                stale = allocated;
                 i += 6;
             }
             // `binary Live Flags Size Unit Dst` (`i_bs_get_fixed_binary`).
@@ -163,9 +182,11 @@ pub(crate) fn run_commands(
                 pos += nbits;
                 // `i_bs_get_fixed_binary` does `sb->start += size;` *before*
                 // `$Dst = result;` — mirror the advance first (`Dst` may be the
-                // context's own operand).
-                commit(machine, ctx, ctx_op, pos)?;
+                // context's own operand). `raw::make_binary` reserves on **every**
+                // build, so the commit always re-reads.
+                commit(machine, ctx, ctx_op, term, true, pos)?;
                 write_operand(machine, dst, value)?;
+                stale = true;
                 i += 6;
             }
             // `get_tail Live Unit Dst` — bind the whole remaining bits
@@ -180,6 +201,7 @@ pub(crate) fn run_commands(
                 // `ERL_ONHEAP_BINARY_LIMIT`, off-heap refc above).
                 let value = raw::make_binary(machine, ctx, &out, nbits)?;
                 write_operand(machine, dst, value)?;
+                stale = true;
                 i += 4;
             }
             // `'=:=' Nil Bits Value` (`i_bs_eq`, `bs_instrs.tab:1366`): the next
@@ -204,7 +226,7 @@ pub(crate) fn run_commands(
                 pos += bits;
                 // The C consumes `Bits` through the `i_bs_read_bits` that feeds
                 // `i_bs_eq`, which advances `sb->start` by `Bits`.
-                commit(machine, ctx, ctx_op, pos)?;
+                commit(machine, ctx, ctx_op, term, false, pos)?;
                 i += 4;
             }
             other => {
@@ -217,13 +239,14 @@ pub(crate) fn run_commands(
 
 /// Mirror the local cursor `pos` into the match context's own position field.
 ///
-/// The context operand is re-read **here**, right before the write: the command that
-/// advanced the cursor may have allocated through the rooted seam
-/// ([`read_integer_field`] -> [`raw::make_big`], [`raw::make_binary`]), whose moving
-/// collector may have relocated the context block, so the term captured at the top of
-/// the iteration is stale (the frozen reserve, then read, then write ordering). The
-/// operand itself is part of the machine's root set and is rewritten in place by the
-/// collector, so re-evaluating it yields the live term.
+/// `live` is the context term this iteration captured. `stale` says the command that
+/// just ran may have allocated through the rooted seam ([`read_integer_field_tracked`]'s
+/// bignum arm -> [`raw::make_big`], [`raw::make_binary`]), whose moving collector may
+/// have relocated the context block, so `live` is a stale pointer and the operand must
+/// be re-read **here**, right before the write (the frozen reserve, then read, then
+/// write ordering). When it cannot have allocated, `live` is reused — no operand
+/// re-read, no [`raw::ctx_parts`]. The operand itself is part of the machine's root set
+/// and is rewritten in place by the collector, so re-evaluating it yields the live term.
 ///
 /// Every caller commits **before** binding a command's destination: the C advances
 /// `sb->start` first (`i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_skip`/
@@ -233,9 +256,15 @@ fn commit(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
     ctx_op: &Operand,
+    live: Eterm,
+    stale: bool,
     pos: usize,
 ) -> Result<()> {
-    let term = reread_ctx(machine, ctx, ctx_op, "bs_match")?;
+    let term = if stale {
+        reread_ctx(machine, ctx, ctx_op, "bs_match")?
+    } else {
+        live
+    };
     raw::set_ctx_start(term, pos);
     Ok(())
 }

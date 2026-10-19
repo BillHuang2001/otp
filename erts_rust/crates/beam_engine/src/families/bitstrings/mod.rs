@@ -63,6 +63,16 @@ mod matching;
 mod raw;
 #[cfg(test)]
 mod run_tests;
+/// The one narrow name a host's BIF floor adopts to serve `erlang:bit_size/1`: a BIF
+/// cannot reach this module's `pub(super)` family readers, so the frozen bitstring /
+/// `ErlSubBits` size is exposed as a single safe function that answers `None` (→ the
+/// caller's `badarg`) for a non-bitstring rather than a substituted size.
+///
+/// The lint allow is deliberate and temporary: the adopters are the runtime-side BIF
+/// floors (`src/bench/counting.rs`'s harness floor and `tests/support/bifs.rs`'s test
+/// host), which live outside this node.
+#[allow(unused_imports)]
+pub(crate) use raw::bit_size;
 
 use crate::interpreter::LabelMap;
 
@@ -184,11 +194,24 @@ pub(super) fn goto_label(labels: &LabelMap, label: Label) -> Result<Step> {
 /// size a segment, and the C `BS_GET_FIELD_SIZE` macro fails the match there; this
 /// engine reports that case as a typed [`crate::error::unsupported`] rather than
 /// guessing.
+#[inline]
 pub(super) fn read_size(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
     operand: &Operand,
 ) -> Result<usize> {
+    // The compiler emits a segment size as a **literal integer operand** (`<<V:8>>`
+    // is `Operand::Integer(8)`), which is by far the hottest shape here: it denotes
+    // `n` itself, so the term the general read would materialise is only read back
+    // for that same value. Short-circuit it (and `Character`, its `h`-tagged twin)
+    // rather than paying an out-of-line `make_integer_unrooted` call for every
+    // segment; every other operand kind — a register holding a runtime `size(Expr)`,
+    // a literal — still goes through [`read_operand`].
+    match operand {
+        Operand::Integer(n) => return size_of_int(*n),
+        Operand::Character(c) => return size_of_int(i64::from(*c)),
+        _ => {}
+    }
     let value = read_operand(machine, ctx, operand)?;
     if beam_term::is_small(value) {
         let n = beam_term::signed_value(value);
@@ -196,12 +219,31 @@ pub(super) fn read_size(
             return Ok(n as usize);
         }
     }
-    Err(error::unsupported(
-        "bitstring: size is not a non-negative small integer",
-    ))
+    Err(size_error())
+}
+
+/// The size an integer operand value denotes.
+///
+/// The accept rule is exactly [`read_size`]'s: a value that is a non-negative small
+/// integer ([`beam_term::try_make_small`]'s range) is the size; anything else — a
+/// negative value, or a magnitude that only a bignum represents — cannot size a
+/// segment and is the same typed error.
+#[inline]
+fn size_of_int(n: i64) -> Result<usize> {
+    if n >= 0 && beam_term::try_make_small(n).is_ok() {
+        return Ok(n as usize);
+    }
+    Err(size_error())
+}
+
+/// The typed error a size operand that is not a non-negative small integer raises.
+#[cold]
+fn size_error() -> beam_common::BeamError {
+    error::unsupported("bitstring: size is not a non-negative small integer")
 }
 
 /// True when `operand` is the atom `all` (a whole-tail segment size).
+#[inline]
 pub(super) fn is_all(module: &Module, operand: &Operand) -> bool {
     match operand {
         Operand::Atom(atom) => module.atom_name(*atom) == Some("all"),
@@ -215,8 +257,11 @@ pub(super) fn is_all(module: &Module, operand: &Operand) -> bool {
 /// `Literal` holding a flag-atom list (`little`/`signed`/`native`; `big`/`unsigned`
 /// are the defaults and contribute nothing). The comparison is by `make_atom` on
 /// this module's atom table, so it needs no index arithmetic.
+#[inline]
 pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
     match operand {
+        // The overwhelmingly common segment carries no flags (`encode_arg` maps the
+        // empty list to `a,0`), so the hot arm is a plain zero.
         Operand::Nil => Ok(0),
         Operand::Literal(index) => {
             let term = module
@@ -234,6 +279,7 @@ pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
 
 /// The `BSF_*` bit a single flag atom contributes (`big`/`unsigned` are the
 /// defaults, i.e. zero).
+#[inline]
 fn flag_bit(module: &Module, elem: Eterm) -> Result<u32> {
     let named = |name: &str| module.atom_table.lookup(name).map(make_atom) == Some(elem);
     if named("little") {
@@ -288,6 +334,18 @@ pub(super) fn read_uint_be(bytes: &[u8], start: usize, nbits: usize) -> Result<u
             "bitstring: integer segment out of range",
         ));
     }
+    // A byte-aligned field of a whole number of bytes — every `<<V:8>>`/`<<V:16>>`/…
+    // segment the compiler emits for real data — is the field's bytes read
+    // big-endian, so accumulate whole bytes instead of shifting in one bit at a time.
+    if start % 8 == 0 && nbits % 8 == 0 {
+        let base = start / 8;
+        let nbytes = nbits / 8;
+        let mut value = 0u64;
+        for &byte in &bytes[base..base + nbytes] {
+            value = (value << 8) | u64::from(byte);
+        }
+        return Ok(value);
+    }
     let mut value = 0u64;
     for i in 0..nbits {
         let bit_index = start + i;
@@ -321,6 +379,7 @@ pub(super) fn read_uint_le(bytes: &[u8], start: usize, nbits: usize) -> Result<u
 }
 
 /// Sign-extend the low `nbits` bits of `raw` to 64 bits.
+#[inline]
 pub(super) fn sign_extend(raw: u64, nbits: usize) -> u64 {
     if nbits == 0 || nbits >= 64 {
         return raw;
@@ -334,6 +393,7 @@ pub(super) fn sign_extend(raw: u64, nbits: usize) -> u64 {
 }
 
 /// Turn an `i64` into a small-integer term, or report the bignum gap.
+#[inline]
 pub(super) fn make_small_checked(value: i64) -> Result<Eterm> {
     beam_term::try_make_small(value)
         .map_err(|_| error::unsupported("bitstring: value needs a bignum"))
@@ -341,6 +401,7 @@ pub(super) fn make_small_checked(value: i64) -> Result<Eterm> {
 
 /// Encode a small integer as a term, or report the bignum gap (used by the
 /// integer *builders*, where C masks the value into the segment width).
+#[inline]
 pub(super) fn small_value(t: Eterm) -> Option<i64> {
     if beam_term::is_small(t) {
         Some(beam_term::signed_value(t))
@@ -445,6 +506,7 @@ pub(super) fn make_int(
 /// [`BitWriter::push_le_groups`], the same one the machine-word writer
 /// [`BitWriter::push_uint_le`] uses, so a non-byte-multiple width is bit-granular
 /// however wide (or however big) the value is.
+#[inline]
 pub(super) fn push_wide_int(
     writer: &mut BitWriter,
     value: Eterm,
@@ -461,8 +523,18 @@ pub(super) fn push_wide_int(
     if little {
         writer.push_le_groups(&bytes, nbits);
     } else {
-        for k in (0..nbits).rev() {
-            writer.push_bit((bytes[k / 8] >> (k % 8)) & 1);
+        // Big-endian: the magnitude's most significant byte first, MSB-first within
+        // each byte. A byte-aligned whole-byte field writes the bytes directly (in
+        // reverse, since `bytes` is the little-endian magnitude) instead of paying a
+        // `push_bit` per bit.
+        if nbits % 8 == 0 && writer.bit_len() % 8 == 0 {
+            for &byte in bytes[..num_bytes].iter().rev() {
+                writer.push_whole_bytes(&[byte]);
+            }
+        } else {
+            for k in (0..nbits).rev() {
+                writer.push_bit((bytes[k / 8] >> (k % 8)) & 1);
+            }
         }
     }
     Ok(())
@@ -512,6 +584,15 @@ pub(super) fn extract_bits(bytes: &[u8], start: usize, nbits: usize) -> Result<V
         .ok_or_else(|| error::unsupported("bitstring: bit range out of range"))?;
     if end > bytes.len() * 8 {
         return Err(error::unsupported("bitstring: bit range out of range"));
+    }
+    // A byte-aligned field of a whole number of bytes is exactly its source bytes —
+    // copy them whole instead of transposing bit by bit.
+    if start % 8 == 0 && nbits % 8 == 0 {
+        let base = start / 8;
+        let nbytes = nbits / 8;
+        let mut out = vec![0u8; nbytes];
+        out.copy_from_slice(&bytes[base..base + nbytes]);
+        return Ok(out);
     }
     let mut out = vec![0u8; nbits.div_ceil(8)];
     for i in 0..nbits {
@@ -628,6 +709,7 @@ impl BitWriter {
     /// The growth door is consulted ONLY on a shortfall: it scans the machine's payload
     /// roster, so a per-append call would be an O(#payloads) regression on exactly the
     /// workload this exists to speed up.
+    #[inline]
     fn ensure_room(&mut self, machine: &mut Machine, bits: usize) -> Result<()> {
         let Dest::InPlace(sink) = &mut self.dest else {
             return Ok(());
@@ -643,6 +725,7 @@ impl BitWriter {
 
     /// The bits written so far — the **whole** result's bit count (for an in-place build,
     /// the accumulator's window end plus everything this build appended).
+    #[inline]
     pub(super) fn bit_len(&self) -> usize {
         match &self.dest {
             Dest::Vec { nbits, .. } => *nbits,
@@ -652,6 +735,7 @@ impl BitWriter {
 
     /// Whether the segment source `src` overlaps the in-place payload this writer appends
     /// into; such a source is copied out first (promotion) so no read ever aliases a write.
+    #[inline]
     fn source_overlaps(&self, src: &[u8]) -> bool {
         match &self.dest {
             Dest::Vec { .. } => false,
@@ -660,6 +744,7 @@ impl BitWriter {
     }
 
     /// Append a single bit (`0` or `1`).
+    #[inline]
     pub(super) fn push_bit(&mut self, bit: u8) {
         if let Dest::InPlace(sink) = &self.dest {
             if sink.remaining_bits() == 0 {
@@ -681,6 +766,12 @@ impl BitWriter {
         }
     }
     /// Append the low `width` bits of `value`, most-significant bit first.
+    ///
+    /// A **whole number of bytes** written to a **byte-aligned** destination (every
+    /// `<<V:8>>`/`<<V:16>>`/… segment the compiler emits for real data) is the
+    /// value's big-endian bytes, so it takes the whole-byte path instead of a
+    /// `push_bit` per bit. Every other width/alignment keeps the bit loop, which is
+    /// what makes a bit-granular field exact.
     pub(super) fn push_uint(
         &mut self,
         value: u64,
@@ -688,6 +779,14 @@ impl BitWriter {
         machine: &mut Machine,
     ) -> Result<()> {
         self.ensure_room(machine, width)?;
+        if width % 8 == 0 && width <= 64 && self.bit_len() % 8 == 0 {
+            let nbytes = width / 8;
+            if nbytes != 0 {
+                let bytes = value.to_be_bytes();
+                self.push_whole_bytes(&bytes[bytes.len() - nbytes..]);
+            }
+            return Ok(());
+        }
         for k in (0..width).rev() {
             self.push_bit(((value >> k) & 1) as u8);
         }
@@ -712,6 +811,18 @@ impl BitWriter {
         machine: &mut Machine,
     ) -> Result<()> {
         self.ensure_room(machine, width)?;
+        // A whole number of bytes to a byte-aligned destination is the value's low
+        // `width / 8` little-endian bytes — byte-identical to what
+        // [`BitWriter::push_le_groups`] writes for the same field (`<<16#0102:16>>`
+        // is `<<2,1>>` on both routes), just without a `push_bit` per bit.
+        if width % 8 == 0 && width <= 64 && self.bit_len() % 8 == 0 {
+            let nbytes = width / 8;
+            if nbytes != 0 {
+                let bytes = value.to_le_bytes();
+                self.push_whole_bytes(&bytes[..nbytes]);
+            }
+            return Ok(());
+        }
         let mut bytes = [0u8; 8];
         for (j, byte) in bytes.iter_mut().enumerate() {
             *byte = ((value >> (8 * j)) & 0xFF) as u8;
@@ -734,6 +845,14 @@ impl BitWriter {
     fn push_le_groups(&mut self, bytes: &[u8], nbits: usize) {
         let rem = nbits % 8;
         let nbytes = nbits.div_ceil(8).min(bytes.len());
+        // No trailing partial group to place and a byte-aligned destination: the
+        // groups ARE the source bytes in order, so write them whole.
+        if rem == 0 && self.bit_len() % 8 == 0 {
+            if nbytes != 0 {
+                self.push_whole_bytes(&bytes[..nbytes]);
+            }
+            return;
+        }
         for (j, &byte) in bytes.iter().enumerate().take(nbytes) {
             let bits = if j + 1 == nbytes && rem != 0 { rem } else { 8 };
             for k in (0..bits).rev() {
@@ -784,6 +903,7 @@ impl BitWriter {
     /// The caller guarantees `bytes` does **not** overlap the in-place payload (the
     /// promotion in [`BitWriter::push_bits_from`] establishes that), so the in-place arm
     /// may use a non-overlapping copy.
+    #[inline]
     fn push_whole_bytes(&mut self, bytes: &[u8]) {
         if let Dest::InPlace(sink) = &self.dest {
             if sink.remaining_bits() < bytes.len() * 8 {
@@ -914,6 +1034,210 @@ mod tests {
         assert_eq!(le(0x0102, 24), (vec![0x02, 0x01, 0x00], 24));
         assert_eq!(le(0x0102, 32), (vec![0x02, 0x01, 0x00, 0x00], 32));
         assert_eq!(le(0x0102, 64), (vec![0x02, 0x01, 0, 0, 0, 0, 0, 0], 64));
+    }
+
+    /// The bit vector (MSB-first) of the low `width` bits of `value` — the field a
+    /// big-endian segment holds.
+    fn be_bits(value: u64, width: usize) -> Vec<u8> {
+        (0..width).rev().map(|k| ((value >> k) & 1) as u8).collect()
+    }
+
+    /// The little-endian group layout [`BitWriter::push_le_groups`] documents, as a
+    /// bit vector (MSB-first): `bytes[0]`'s bits, then `bytes[1]`'s, …, with the
+    /// final partial group carrying `bytes`'s low remaining bits left-aligned.
+    fn le_bits(value: u64, width: usize) -> Vec<u8> {
+        let bytes = value.to_le_bytes();
+        let rem = width % 8;
+        let nbytes = width.div_ceil(8);
+        let mut bits = Vec::new();
+        for (j, &byte) in bytes.iter().enumerate().take(nbytes) {
+            let n = if j + 1 == nbytes && rem != 0 { rem } else { 8 };
+            for k in (0..n).rev() {
+                bits.push((byte >> k) & 1);
+            }
+        }
+        bits
+    }
+
+    /// Pack an MSB-first bit vector into `(bytes, bit count)`.
+    fn pack(bits: &[u8]) -> (Vec<u8>, usize) {
+        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &bit) in bits.iter().enumerate() {
+            if bit != 0 {
+                bytes[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        (bytes, bits.len())
+    }
+
+    /// The whole-byte fast paths of [`BitWriter::push_uint`]/[`push_uint_le`] are
+    /// **byte-identical** to the per-bit rule at every width — the fast path is taken
+    /// exactly when the destination is byte-aligned and the field is a whole number of
+    /// bytes, and the bit loop keeps every other shape.
+    #[test]
+    fn the_whole_byte_writers_match_the_bit_rule_at_every_width() {
+        let mut machine = Machine::new();
+        for width in 0..=64usize {
+            for value in [0u64, 1, 0x02, 0x0102, 0xABC, 0x1ABC, 0x80, u64::MAX] {
+                let mut writer = BitWriter::default();
+                writer
+                    .push_uint(value, width, &mut machine)
+                    .expect("the copy-rebuild destination never refuses room");
+                assert_eq!(
+                    writer.finish(),
+                    pack(&be_bits(value, width)),
+                    "big-endian {value:#x}:{width}"
+                );
+
+                let mut writer = BitWriter::default();
+                writer
+                    .push_uint_le(value, width, &mut machine)
+                    .expect("the copy-rebuild destination never refuses room");
+                assert_eq!(
+                    writer.finish(),
+                    pack(&le_bits(value, width)),
+                    "little-endian {value:#x}:{width}"
+                );
+            }
+        }
+    }
+
+    /// A whole-byte width written to a destination that is **not** byte-aligned keeps
+    /// the bit loop, so the field lands bit-granularly instead of being shifted a
+    /// whole byte.
+    #[test]
+    fn a_whole_byte_width_after_a_partial_bit_stays_bit_granular() {
+        let mut machine = Machine::new();
+        for (width, value) in [(8usize, 0x02u64), (16, 0x0102), (32, 0x0000_0102)] {
+            let mut writer = BitWriter::default();
+            for _ in 0..4 {
+                writer.push_bit(0);
+            }
+            writer
+                .push_uint(value, width, &mut machine)
+                .expect("the copy-rebuild destination never refuses room");
+            let mut expect = vec![0u8; 4];
+            expect.extend(be_bits(value, width));
+            assert_eq!(writer.finish(), pack(&expect), "big-endian {value:#x}:{width}");
+
+            let mut writer = BitWriter::default();
+            for _ in 0..4 {
+                writer.push_bit(0);
+            }
+            writer
+                .push_uint_le(value, width, &mut machine)
+                .expect("the copy-rebuild destination never refuses room");
+            let mut expect = vec![0u8; 4];
+            expect.extend(le_bits(value, width));
+            assert_eq!(
+                writer.finish(),
+                pack(&expect),
+                "little-endian {value:#x}:{width}"
+            );
+        }
+    }
+
+    /// The wide (`fmt_big_be`) writer's byte-aligned branch writes the same field as
+    /// its per-bit loop (`<<16#0102:32>>` is `<<0,0,1,2>>`), and a non-multiple-of-8
+    /// width stays bit-granular through the loop.
+    #[test]
+    fn the_wide_big_endian_writer_matches_the_bit_rule() {
+        let mut machine = Machine::new();
+        for nbits in [8usize, 12, 16, 24, 32] {
+            let mut writer = BitWriter::default();
+            push_wide_int(
+                &mut writer,
+                beam_term::make_small(0x0102),
+                nbits,
+                false,
+                &mut machine,
+            )
+            .expect("the copy-rebuild destination never refuses room");
+            assert_eq!(
+                writer.finish(),
+                pack(&be_bits(0x0102, nbits)),
+                "big-endian wide {nbits}"
+            );
+        }
+        // The oracle shape: `<<16#0102:32>>` is `<<0,0,1,2>>`.
+        let mut writer = BitWriter::default();
+        push_wide_int(
+            &mut writer,
+            beam_term::make_small(0x0102),
+            32,
+            false,
+            &mut machine,
+        )
+        .expect("the copy-rebuild destination never refuses room");
+        assert_eq!(writer.finish(), (vec![0x00, 0x00, 0x01, 0x02], 32));
+    }
+
+    /// The byte-aligned reader/the byte-aligned extractor agree with the per-bit rule
+    /// they replace on every start/width pair (both paths are exercised: the aligned
+    /// one is taken only when `start` **and** `nbits` are whole bytes).
+    #[test]
+    fn the_byte_aligned_readers_agree_with_the_bit_rule() {
+        let bytes: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        let bits_of = |start: usize, nbits: usize| -> Vec<u8> {
+            (0..nbits)
+                .map(|i| {
+                    let index = start + i;
+                    (bytes[index / 8] >> (7 - (index % 8))) & 1
+                })
+                .collect()
+        };
+        for start in 0..8usize {
+            for nbits in 0..=64usize {
+                let bits = bits_of(start, nbits);
+                let mut value = 0u64;
+                for &bit in &bits {
+                    value = (value << 1) | u64::from(bit);
+                }
+                assert_eq!(
+                    read_uint_be(&bytes, start, nbits).expect("in range"),
+                    value,
+                    "read_uint_be {start}+{nbits}"
+                );
+                assert_eq!(
+                    extract_bits(&bytes, start, nbits).expect("in range"),
+                    pack(&bits).0,
+                    "extract_bits {start}+{nbits}"
+                );
+            }
+        }
+        // Out of range stays a typed error on both readers.
+        assert!(read_uint_be(&bytes, 120, 16).is_err());
+        assert!(extract_bits(&bytes, 120, 16).is_err());
+    }
+
+    /// A size operand's accept rule is unchanged by the literal-integer fast path: a
+    /// non-negative in-range integer is the size, and a negative/oversized one is the
+    /// same typed error the general read produced.
+    #[test]
+    fn a_literal_integer_size_operand_is_classified_exactly_as_before() {
+        let machine = Machine::new();
+        let mut ctx = crate::context::MinimalContext::new();
+        for n in [0i64, 1, 8, 64, beam_term::MAX_SMALL] {
+            assert_eq!(
+                read_size(&machine, &mut ctx, &Operand::Integer(n)).expect("in range"),
+                n as usize
+            );
+        }
+        for n in [-1i64, -8, beam_term::MIN_SMALL, beam_term::MAX_SMALL + 1, i64::MAX] {
+            assert!(
+                read_size(&machine, &mut ctx, &Operand::Integer(n)).is_err(),
+                "{n} cannot size a segment"
+            );
+        }
+        assert_eq!(
+            read_size(&machine, &mut ctx, &Operand::Character(65)).expect("in range"),
+            65
+        );
+        // `Character` is a `u32`, so it is always a non-negative small.
+        assert_eq!(
+            read_size(&machine, &mut ctx, &Operand::Character(u32::MAX)).expect("in range"),
+            u32::MAX as usize
+        );
     }
 
     /// The **byte-slice** form of the same rule, which the bignum/wide writer

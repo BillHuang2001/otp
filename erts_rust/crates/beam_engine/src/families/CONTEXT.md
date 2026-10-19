@@ -11,9 +11,20 @@ variants has exactly one owning family, so the route is a jump table on the `Ins
 semantically identical to the old first-claim-wins probe loop (see the module doc, `mod.rs:93-110`).
 
 ## API Surface
-- `pub(crate) fn dispatch(machine, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:112`.
+- `pub(crate) fn dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:112`.
 - `pub(crate) const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed"` — `mod.rs:82` (frozen sentinel, pinned by `mod.rs:321`).
-- Every family: `pub(crate) fn exec(machine, module, labels, instr, func, pc, ctx) -> Result<Option<Step>>`.
+- Every family: `pub(crate) fn exec(machine, module, labels, instr, func, pc, ctx) -> Result<Option<Step>>`; `funs` and
+  `exceptions` additionally take the run's `entry_module` (the stacktrace/callee-item cooks need it).
+- `pub(crate) fn bit_size(t: Eterm) -> Option<usize>` (`bitstrings/raw.rs`, re-exported once from
+  `bitstrings/mod.rs` under `#[allow(unused_imports)]`) — the host-facing `erlang:bit_size/1` reader: a heap
+  bits/binary takes its size word, while a refc window **and** an `ErlSubBits` match context take
+  `end - start`, exactly `erts_bin_bits_size`; a non-bitstring — and a bare off-heap `BinRef`, which no
+  `bs_start_match` has wrapped yet — is `None`, never a substituted size. Its two
+  intended adopters are the BIF floors that serve `erlang:bit_size/1` — the in-crate harness floor
+  `src/bench/counting.rs`, and the external test host `tests/support/bifs.rs` (which would additionally need a
+  `pub` re-export, `families` being a private module). **Neither has adopted it yet**: both still report
+  `emqx_base62:decode/1` as `skipped` on `unsupported_opcode: bif erlang:bit_size`, so the `#[allow]` stands and
+  no engine code calls it today.
 - All computation goes through `crate::context::ExecutionContext`; term construction via `crate::terms`.
   Families build no term layout of their own **except** `bitstrings/raw.rs` (see Duplication).
 
@@ -29,8 +40,11 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
   `unsupported` (C reads the class atoms from its `am_error`/`am_exit`/`am_throw` globals, so it can never be in that
   state). Resolving in each family (or at each raise site) instead would duplicate the same lookup nine times and
   still miss `bitstrings`/`records`' internal raises.
-- **Cost.** One `bool` test per instruction in steady state: the per-run `class_atoms_live` latch
-  (`../machine/CONTEXT.md`) short-circuits the body once per run, and an atom already installed is never overwritten.
+- **Cost.** `dispatch` tests the per-run `class_atoms_live` latch (`../machine/CONTEXT.md`) **itself** and only
+  calls `Machine::ensure_class_atoms` when it is clear, so the steady state is one `bool` load and a not-taken
+  branch instead of a function call per family-owned instruction; the resolution runs at most once per run, and
+  an atom already installed is never overwritten. The saving is small but deterministic: **−359 retired
+  instructions per call (−0.19 %)** on `cowboy_bstr:to_lower/1` (see `## Measured`).
 - **Honesty.** A class name that **neither** source can name stays unresolved, and the landing reports the typed
   `unsupported("exceptions: no atom for the '<class>' exception class …")` — never a substituted atom index
   (pinned by `mod.rs`'s `a_family_raise_lands_…` / `a_family_raise_whose_class_is_unnameable_…` pair).
@@ -43,7 +57,16 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 - `exceptions/` (`mod.rs`, `raise.rs`, `stacktrace.rs`, `tests/`) — `Try`/`Catch`/`Badmatch`/`CaseEnd`/`TryCaseEnd`/`Badrecord`/`IfEnd`/`Raise`/`TryCase`/`TryEnd`/`CatchEnd`/`BuildStacktrace`/`RawRaise`.
 - `floats/` (`mod.rs`, `arith.rs`, `convert.rs`) — `Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`. Detail: `floats/CONTEXT.md`.
 - `maps/` (`mod.rs`, `read.rs`, `write.rs`) — `GetMapElements`/`HasMapFields`/`PutMapAssoc`/`PutMapExact`.
-- `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is this sub-node's `#[allow(unsafe_code)]` module (`records/raw.rs` is the other one in the node); `create/` = `bs_create_bin`, `matching/` = the match commands. Endianness: `matching/reads.rs::field_is_little` is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit` normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand carries it).
+- `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is this
+  sub-node's `#[allow(unsafe_code)]` module (`records/raw.rs` is the other one in the node); `create/` =
+  `bs_create_bin`, `matching/` = the
+  match commands (with the allocation-aware context re-read elision). Endianness: `matching/reads.rs::field_is_little`
+  is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit`
+  normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand
+  carries it). Whole-byte fast paths on both sides: the writers (`push_uint`/`push_uint_le`/`push_le_groups`/
+  `push_wide_int`) and the readers (`read_uint_be`/`extract_bits`) take a byte-at-a-time arm only when the field
+  is a whole number of bytes **and** byte-aligned, after every range/width check, so an out-of-range field keeps
+  the oracle's error and a non-aligned shape keeps the bit-exact rule.
 - `receive.rs` — `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`/`RecvMarkerReserve`/`RecvMarkerBind`/`RecvMarkerUse`/`RecvMarkerClear`.
 
 ## The router sentinel + the honest-error convention
@@ -126,6 +149,40 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 - `bitstrings/raw.rs` `subject_bytes` returns `&'a [u8]` with an unconstrained lifetime ("caller keeps it alive") — a safe-signature soundness caveat, documented as the `ExecutionContext` ownership contract.
 - Dead/stub remnants (harmless): `bitstrings/mod.rs` `#[allow(dead_code)] const BSF_ALIGNED`.
 
+## Measured — the baseline-JIT (default) tier on foreign workloads
+All figures are `BENCH_TIER=baseline` (the default tier), `taskset -c 3`, `setsid -w`, one process at a time,
+20 000 iterations, on a **shared, loud host**. Record the load band with every row: only the **ratios** and the
+deterministic structural counters are meaningful, never a bare absolute — the same workload's absolute moves
+with the host load, which is why `to_lower` appears twice.
+
+| workload | min / median ns | instr/call | ns/instr | load |
+|---|---|---|---|---|
+| `cowboy_bstr:to_lower/1` | 6 886.1 / 6 971.4 | 438 | 15.72 | 15.5 |
+| `cowboy_bstr:to_lower/1` | ~10 500–11 600 / 11 200–12 500 | 438 | — | 20–35 |
+| `cowboy_bstr:capitalize_token/1` | ~14 300–16 200 / 15 500–16 600 | 660 | — | 20–35 |
+| `emqx_base62:encode/1` | 6 867.9 / 6 907.5 | 244 | 28.15 | 26 |
+
+- The paired ratios below are quoted against the same harness's round-2 reference measurements (`to_lower`
+  7 948.7 / 8 537.1 ns at 18.15 ns/instr over 438 instr/call, `capitalize_token` 10 601.4 / 10 870.4 ns at
+  16.06 ns/instr over 660 instr/call, `encode` ≈5 176 ns over 244 instr/call).
+- Deterministic structural counters — **pins, not targets**, and unchanged by the fast paths (`to_lower`
+  `rooted_calls_per_call` 32, `rooted_words_per_call` 163, `local_call_requests_per_call` 61,
+  `driver_round_trips_per_call` 33, `block_entry_lookups` 660 000 with 660 000 hits / 0 misses; `encode`
+  `rooted_calls_per_call` 35, `local_call_requests_per_call` 21).
+- Paired A/B per change (post/pre, ≥3 alternating rounds, same harness): whole-byte fast paths `to_lower`
+  0.826 / 0.828 min/median, `capitalize_token` 0.873 / 0.874, `long_append` 0.668, `encode` 0.956 / 0.987;
+  match-context re-read elision `to_lower` 0.928 / 0.963, `capitalize_token` 0.909 / 0.969, with
+  `match_ctx::read_ctx`'s profiled self-share 5.69 % → 1.77 %; the `dispatch` latch change moved no wall clock
+  (post/pre medians 0.997 and 1.019 — inside a ±10 % noise band at load 20–35) but is deterministic:
+  **−359 retired instructions per call (−0.19 %)** by `perf stat -e instructions` over the 180 000-call delta.
+- The writable-accumulator growth curve is unchanged for 64 KiB of 512-byte appends from a 1 KiB hint:
+  1 payload handle, 2 in-place grows, 4 moves and 61 440 bytes copied. `bitstrings/create/grow_tests.rs`
+  asserts the *shape*, not those exact figures (≤ 12 moves, `bytes_copied ≤ 2×` the appended bytes, ≥ 1
+  in-place grow, exactly one payload handle), so a quadratic regression still fails it.
+- `emqx_base62:decode/1` reports `skipped`, reason `unsupported_opcode: bif erlang:bit_size`: the harness's BIF
+  floor does not serve `bit_size/1` yet — a cross-node handoff (`src/bench/`), not an engine gap. `raw::bit_size`
+  exists for exactly that adoption (see API Surface).
+
 ## Constraints
 - `#![deny(unsafe_code)]` crate-wide; the node's two `#[allow(unsafe_code)]` modules are `bitstrings/raw.rs`
   and `records/raw.rs` (every `unsafe` block carries a `// SAFETY:` rationale).
@@ -137,7 +194,8 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 ## Test Strategy
 - Per-family `#[cfg(test)]` unit tests over hand-built `Instr`s with a recording `ExecutionContext` stub:
   `mod.rs`, `receive.rs`, `records/tests/*`, `exceptions/tests/*`, `funs/tests.rs`,
-  `bitstrings/*/tests.rs`, `bitstrings/create/*_tests.rs`, `bitstrings/matching/*_tests.rs`, `bitstrings/raw.rs`.
+  `bitstrings/*/tests.rs`, `bitstrings/create/*_tests.rs` ,
+  `bitstrings/matching/*_tests.rs` (incl. the `matching/elision_tests.rs` re-read-elision suite), `bitstrings/raw.rs`.
 - The router's diagnostics contract is pinned by `mod.rs:321+` (`the_prefix_is_unchanged`); the receive
   family's tests assert an owned variant never reaches the sentinel again.
 - End-to-end coverage lives in the crate integration suites (`../TEST_NOTES.md`).

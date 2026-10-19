@@ -954,3 +954,56 @@ fn built_tail_builds_the_wide_subject_itself_and_returns_an_off_heap_result() {
         None => eprintln!("SKIP: no system `erl` on PATH -- built_tail/1 oracle value skipped"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// (4) `raw::bit_size` -- the host-facing `erlang:bit_size/1` reader
+// ---------------------------------------------------------------------------
+
+/// `raw::bit_size` is the reader a BIF floor serves `erlang:bit_size/1` with, so it
+/// must be exact for **every** form `bit_size/1` accepts — an on-heap binary, a
+/// non-byte-aligned heap bitstring, a refc-binary window, and a match **context**
+/// (whose size is the window's remaining `end - start`, as `erts_bin_bits_size`
+/// reads it) — and `None`, never a substituted size, for a non-bitstring.
+///
+/// The `WINDOW_PAYLOAD`/`1..17` fixture is the same one the refc tests above use, so
+/// the refc and context arms are pinned against an independently known 16.
+#[test]
+fn bit_size_reads_every_bitstring_form_and_rejects_a_non_bitstring() {
+    let mut ctx = MinimalContext::new();
+    // An on-heap binary: 4 bytes -> 32 bits.
+    let binary = make_heap_binary(&mut ctx, &[1, 2, 3, 4]).expect("a heap binary");
+    assert_eq!(raw::bit_size(binary), Some(32), "an on-heap binary's size word");
+    // An empty binary is 0 bits, not `None`.
+    let empty = make_heap_binary(&mut ctx, &[]).expect("an empty heap binary");
+    assert_eq!(raw::bit_size(empty), Some(0));
+    // A non-byte-aligned on-heap bitstring: `<<1:3>>` is 3 bits, one payload byte.
+    // SAFETY: 1 payload byte fits in the words `heap_bits_size_words(3)` reserves, and
+    // the block is `ctx`'s exclusively-owned, pointer-stable arena storage.
+    let bits3 = unsafe {
+        let hp = ctx
+            .alloc_words(beam_term::bitstring::heap_bits_size_words(3))
+            .expect("the arena hands out a 3-bit block");
+        beam_term::bitstring::write_heap_bits(hp, &[0b0010_0000], 3).expect("3 bits fit")
+    };
+    assert_eq!(raw::bit_size(bits3), Some(3), "the size word is the bit count");
+    // A refc-binary window `[1, 17)` over the shared fixture -> 16 bits.
+    let (refc, _payload) = refc_window(&mut ctx, &WINDOW_PAYLOAD, 1, 16);
+    assert_eq!(raw::bit_size(refc), Some(16), "a refc window is end - start");
+    // A match context over the same window, positioned at bit 6 -> 10 bits left.
+    let mut machine = Machine::new();
+    let context = raw::make_ctx(&mut machine, &mut ctx, 6, 16, 0, |_, _| Ok(refc))
+        .expect("a 5-word match context");
+    assert_eq!(
+        raw::bit_size(context),
+        Some(10),
+        "a match context's size is its remaining window, not its subject's"
+    );
+    // A non-bitstring of every shape is `None` -- never a fabricated 0.
+    assert_eq!(raw::bit_size(beam_term::make_small(7)), None, "a small integer");
+    assert_eq!(raw::bit_size(beam_term::NIL), None, "the empty list");
+    assert_eq!(
+        raw::bit_size(beam_term::make_atom(Atom::from_raw(0))),
+        None,
+        "an atom"
+    );
+}

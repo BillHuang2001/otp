@@ -80,7 +80,7 @@ use crate::Step;
 /// existed, so callers that match on it keep working; [`dispatch`] appends
 /// `": <name>"` (the instruction's `ops.tab` spelling, see [`instr_name`]).
 pub(crate) const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed";
-mod bitstrings;
+pub(crate) mod bitstrings;
 pub(crate) mod exceptions;
 mod floats;
 pub(crate) mod funs;
@@ -123,12 +123,20 @@ pub(crate) fn dispatch(
     // interpreter calls this directly; the native baseline tier's `jit_family`
     // helper reaches the same call), so it is where the machine resolves the three
     // exception-**class** atoms from the engine's live atom namespace
-    // ([`ExecutionContext::atoms`], with the module snapshot as the fallback) —
-    // one `bool` test per instruction in steady state. Without it a family raise
-    // (`machine.throw`/`throw_error`) whose class atom the *module's* table cannot
-    // name would select its catch frame and then abandon it with a typed
-    // `unsupported` instead of landing (C reads its class atoms from globals).
-    machine.ensure_class_atoms(ctx, module);
+    // ([`ExecutionContext::atoms`], with the module snapshot as the fallback).
+    // Without it a family raise (`machine.throw`/`throw_error`) whose class atom the
+    // *module's* table cannot name would select its catch frame and then abandon it
+    // with a typed `unsupported` instead of landing (C reads its class atoms from
+    // globals).
+    //
+    // The latch is tested **here**, not inside [`Machine::ensure_class_atoms`]: the
+    // steady state is one `bool` load and a not-taken branch, whereas an
+    // unconditional call pays a function call per family-owned instruction (the
+    // resolution itself runs at most once per run, so the call is pure overhead for
+    // every instruction after it).
+    if !machine.class_atoms_live {
+        machine.ensure_class_atoms(ctx, module);
+    }
     let claimed = match instr {
         // tuples
         Instr::PutTuple2 { .. }

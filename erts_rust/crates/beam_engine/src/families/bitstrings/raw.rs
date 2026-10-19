@@ -86,6 +86,7 @@ use crate::terms::{reserve, Slack};
 /// offset and size come from the frozen `ErlSubBits`
 /// ([`beam_term::bitstring_parts`]), so the rest of the family reads it exactly like
 /// a heap binary, at whatever bit offset its window starts.
+#[inline]
 pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize, usize)> {
     // SAFETY: `is_bitstring` checks `is_boxed` before it dereferences the header.
     if !unsafe { beam_term::is_bitstring(t) } {
@@ -139,6 +140,7 @@ pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize, usize)> {
 /// so the caller must keep the owning heap (or off-heap payload) alive and unmoved
 /// for as long as it is used (the [`ExecutionContext`] ownership contract; an
 /// off-heap payload is held by the [`Machine`] that built it).
+#[inline]
 pub(super) fn subject_bytes<'a>(t: Eterm) -> Result<(&'a [u8], usize)> {
     let (ptr, bits, off) = heap_bits(t)
         .ok_or_else(|| error::unsupported("bitstring: subject is not a readable binary"))?;
@@ -158,6 +160,7 @@ pub(super) fn subject_bytes<'a>(t: Eterm) -> Result<(&'a [u8], usize)> {
 /// The `(orig, start, end)` triple of an `ErlSubBits` match context.
 ///
 /// `None` when `t` is not a boxed `ErlSubBits` term (`erl_bits.h:60-82`).
+#[inline]
 pub(super) fn ctx_parts(t: Eterm) -> Option<(Eterm, usize, usize)> {
     // `is_boxed` reads only the tag bits, never dereferences.
     if !beam_term::is_boxed(t) {
@@ -176,6 +179,27 @@ pub(super) fn ctx_parts(t: Eterm) -> Option<(Eterm, usize, usize)> {
     Some((orig, start, end))
 }
 
+/// `erlang:bit_size/1` — the bit size of a bitstring **or** of a live match context,
+/// or `None` when `t` is neither.
+///
+/// A heap-bits/binary subject (`ErlHeapBits`, on-heap binary) takes its `size` word; a
+/// refc-binary window and an `ErlSubBits` **match context** both take their remaining
+/// window `end - start`, which is exactly what `erts_bin_bits_size` (`erl_bits.h`) does
+/// for every `SUB_BITS` thing. A bare off-heap `BinRef` (a reference no
+/// `bs_start_match` has wrapped yet) and every non-bitstring are `None`, so a caller
+/// turns that into `badarg` rather than a substituted size.
+///
+/// This is the host-facing reader the BIF floors need (a BIF cannot reach this
+/// module's `pub(super)` family readers); the family's own readers keep their narrower
+/// [`heap_bits`]/[`ctx_parts`] shapes.
+#[allow(dead_code)]
+pub(crate) fn bit_size(t: Eterm) -> Option<usize> {
+    if let Some((_, bits, _)) = heap_bits(t) {
+        return Some(bits);
+    }
+    ctx_parts(t).map(|(_, start, end)| end - start)
+}
+
 /// The inner subject (`orig`, word 4) of a match-context term, or `None` when `t`
 /// is not one.
 ///
@@ -183,6 +207,7 @@ pub(super) fn ctx_parts(t: Eterm) -> Option<(Eterm, usize, usize)> {
 /// `bs_start_match*` reuse path and the `bs_get_position` snapshot) use this after
 /// re-reading the context's operand, so the re-wrapped context keeps the inner
 /// subject the C `reuse` path keeps — never the outer context.
+#[inline]
 pub(super) fn inner_orig(t: Eterm) -> Option<Eterm> {
     ctx_parts(t).map(|(orig, _, _)| orig)
 }
@@ -233,6 +258,7 @@ where
 ///
 /// The caller must pass a term [`ctx_parts`] accepted (a live `ErlSubBits`); the
 /// context is mutated in place, mirroring the C `sb->start = …` assignments.
+#[inline]
 pub(super) fn set_ctx_start(t: Eterm, start: usize) {
     // SAFETY: the caller passed a term `ctx_parts` accepted as a live `ErlSubBits`
     // block, so word 2 is its mutable `start` field.
@@ -247,6 +273,7 @@ pub(super) fn set_ctx_start(t: Eterm, start: usize) {
 /// The caller must pass a term [`ctx_parts`] accepted (a live `ErlSubBits`) whose
 /// bits `[0, end)` are the ones it means to publish, and must keep
 /// `start <= end <= `the payload's capacity in bits.
+#[inline]
 pub(super) fn set_ctx_end(t: Eterm, end: usize) {
     // SAFETY: the caller passed a term `ctx_parts` accepted as a live `ErlSubBits`
     // block, so word 3 is its mutable `end` field.
@@ -312,6 +339,7 @@ pub(super) fn big_parts_safe(t: Eterm) -> Option<(bool, Vec<u64>)> {
 /// `#![deny(unsafe_code)]` and so cannot call the `unsafe` predicate themselves, so the
 /// single dereference stays here in the node's marked module.
 #[cfg(test)]
+#[inline]
 pub(super) fn is_refc_binary(t: Eterm) -> bool {
     // SAFETY: `is_refc_binary` checks `is_boxed` before it dereferences the header and
     // only reads the `ErlSubBits.orig` slot when the header says `ErlSubBits`, so a
@@ -748,11 +776,13 @@ impl InPlace {
 
     /// The bits written so far: the **whole** result's bit count (the accumulator's
     /// window end plus everything this build appended).
+    #[inline]
     pub(super) fn bit_len(&self) -> usize {
         self.cur
     }
 
     /// How many more bits fit in the payload.
+    #[inline]
     pub(super) fn remaining_bits(&self) -> usize {
         self.capacity.saturating_sub(self.cur)
     }
@@ -828,6 +858,7 @@ impl InPlace {
     /// A segment source that overlaps the accumulator is the one shape that would read
     /// and write the same bytes; the writer promotes to a fresh `Vec` when this answers
     /// `true` (see [`super::BitWriter`]).
+    #[inline]
     pub(super) fn overlaps(&self, ptr: *const u8, len: usize) -> bool {
         if len == 0 {
             return false;
@@ -846,6 +877,7 @@ impl InPlace {
     /// low bits away while keeping the accumulated high bits), so the bytes this build
     /// writes never inherit the residue of an earlier **failed** attempt at the same
     /// offset — a failure leaves those bytes invisible, but not necessarily zero.
+    #[inline]
     pub(super) fn push_bit(&mut self, bit: u8) {
         debug_assert!(self.cur < self.capacity, "the caller checked the capacity");
         let byte = self.cur / 8;
@@ -873,6 +905,7 @@ impl InPlace {
     /// The caller guarantees `src.len() * 8 <= `[`InPlace::remaining_bits`] (checked by
     /// [`super::BitWriter`], which promotes on a shortfall) and that `src` does **not**
     /// overlap the payload ([`InPlace::overlaps`]).
+    #[inline]
     pub(super) fn copy_bytes(&mut self, src: &[u8]) {
         debug_assert!(
             src.len() * 8 <= self.remaining_bits(),
