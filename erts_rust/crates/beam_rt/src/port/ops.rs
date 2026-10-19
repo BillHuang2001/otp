@@ -67,7 +67,7 @@
 //! ⚠️ `PortHook` is only *named* in this module's docs; nothing here calls it.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
@@ -160,6 +160,17 @@ pub(crate) struct PortExtras {
     /// Empty for every non-socket port; dropped here with the rest of the port's extras, so a
     /// recycled port number inherits nothing.
     peer_closes: peer_closed::PeerCloseLatches,
+    /// The ports whose closing `{'EXIT', Port, normal}` the owner is **not** owed — the C's
+    /// `driver_exit` shape, which runs `unlink_proc` before delivering (`io.c:7244`).
+    ///
+    /// Every other closer (`port_close/1`, the `driver_failure*` family) signals the links; only
+    /// the peer-close retirement ([`PortRegistry::retire_peer_closed`](super::PortRegistry))
+    /// marks itself here, and only for the one close it is about to perform, so the mark's whole
+    /// lifetime is that single call: [`PortExtras::forget_port`] drops it with the rest of the
+    /// port's extras, and the only path that leaves a port in the table after a refused close
+    /// ([`PortRegistry::retire_peer_closed`](super::PortRegistry)'s `badarg` guard) never sets it
+    /// in the first place.
+    no_owner_exit: HashSet<u64>,
 }
 
 impl PortExtras {
@@ -178,6 +189,26 @@ impl PortExtras {
         self.links.remove(&number);
         self.inet.forget_port(number);
         self.peer_closes.forget(number);
+        self.no_owner_exit.remove(&number);
+    }
+
+    /// Suppresses port `number`'s owner-`'EXIT'` for the close that follows — see
+    /// [`PortExtras::no_owner_exit`].
+    ///
+    /// Set by [`PortRegistry::retire_peer_closed`](super::PortRegistry) immediately before the
+    /// [`PortRegistry::close`](super::PortRegistry) it performs, so
+    /// [`PortRegistry::capture_port_exit`](super::PortRegistry) reads it while snapshotting the
+    /// close's signals. A port that never closes keeps the mark only if its own close was
+    /// refused after the port had already left the table, which `retire_peer_closed` prevents by
+    /// testing the table first.
+    pub(crate) fn suppress_owner_exit(&mut self, number: u64) {
+        self.no_owner_exit.insert(number);
+    }
+
+    /// Whether port `number`'s owner has been denied its `{'EXIT', Port, Reason}` — the C's
+    /// `driver_exit` shape.
+    pub(crate) fn owner_exit_suppressed(&self, number: u64) -> bool {
+        self.no_owner_exit.contains(&number)
     }
 }
 impl PortRegistry {

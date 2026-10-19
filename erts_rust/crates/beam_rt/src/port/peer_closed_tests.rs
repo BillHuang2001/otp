@@ -48,7 +48,8 @@ use std::time::{Duration, Instant};
 
 use beam_bifs::PortHook;
 use beam_engine::terms;
-use beam_process::PortId;
+use beam_process::{PortId, ProcessId, ProcessTable, SignalAtoms};
+use beam_term::{AtomTable, Eterm};
 
 use super::{PeerCloseKind, PeerCloseReport};
 use crate::config::RuntimeConfig;
@@ -242,6 +243,13 @@ impl Session {
         let mut session = Session::bare();
         let port = session.open("tcp_inet", label)?;
         session.port = port;
+        let peer = session.connect_loopback(label)?;
+        Some((session, peer))
+    }
+
+    /// `open`(2)s the port under test as a stream socket, connects it to a fresh loopback
+    /// listener and answers the accepted `std::net` peer — the other end a case closes.
+    fn connect_loopback(&mut self, label: &str) -> Option<std::net::TcpStream> {
         let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,
             Err(error) => {
@@ -256,25 +264,23 @@ impl Session {
             return None;
         };
         assert_eq!(
-            session.control("open", &[INET_AF_INET, INET_SOCK_STREAM, INET_PROTO_DEFAULT]),
+            self.control("open", &[INET_AF_INET, INET_SOCK_STREAM, INET_PROTO_DEFAULT]),
             vec![1],
             "{label}: INET_REQ_OPEN on a stream/inet port answers the bare `[1]`"
         );
         assert_eq!(
-            session.control("connect", &loopback_address(address.port())),
+            self.control("connect", &loopback_address(address.port())),
             vec![1],
             "{label}: a completed loopback connect answers the bare `[1]`"
         );
-        let peer = match listener.accept() {
-            Ok((peer, _)) => peer,
+        match listener.accept() {
+            Ok((peer, _)) => Some(peer),
             Err(error) => {
                 skip_no_loopback(&format!("{label}: the loopback accept failed: {error}"));
-                return None;
+                None
             }
-        };
-        Some((session, peer))
+        }
     }
-
     /// A `udp_inet` port opened and bound to a kernel-assigned loopback port, plus that port
     /// number.
     fn bound_udp(label: &str) -> Option<(Session, u16)> {
@@ -352,13 +358,32 @@ impl Session {
     /// One pump round, then one read of the peer-close channel — the two steps a consuming route
     /// performs, in the order `src/port.rs` performs them.
     fn round(&mut self) -> Vec<PeerCloseReport> {
+        self.pump_once();
+        self.rt.ports.borrow_mut().drain_peer_closes()
+    }
+
+    /// One port round and **no** drain: the step that makes the driver see a peer's EOF, for the
+    /// cases whose drain is the delivery half under test (a full
+    /// [`PortRegistry::drain_peer_closes`](crate::port::PortRegistry) here would consume the
+    /// report before it could be).
+    fn pump_once(&mut self) {
         let _ = {
             let mut registry = self.rt.ports.borrow_mut();
             registry
                 .pump(PUMP_SLICE)
                 .unwrap_or_else(|error| panic!("the port round: {error}"))
         };
-        self.rt.ports.borrow_mut().drain_peer_closes()
+    }
+
+    /// Whether the driver has observed the port's peer close (a latched, sticky answer) — the
+    /// condition that ends a pump-until-observed loop without waiting out the whole bound.
+    fn peer_close_observed(&self) -> bool {
+        self.rt
+            .ports
+            .borrow()
+            .registry
+            .port_closed(self.port)
+            .unwrap_or(false)
     }
 
     /// Pumps until the channel reports something or `bound` expires.
@@ -409,6 +434,85 @@ impl Session {
             .trim_end_matches('\n')
             .to_string()
     }
+
+    /// One **observe-and-deliver** step of the scheduler route: a port round (which is what makes
+    /// the driver see the peer's EOF at all) followed by the delivery half under test, with `table`
+    /// standing in for the process table a scheduler pass moves out of the runtime.
+    fn deliver(&mut self, table: &mut ProcessTable) -> usize {
+        let _ = {
+            let mut registry = self.rt.ports.borrow_mut();
+            registry
+                .pump(PUMP_SLICE)
+                .unwrap_or_else(|error| panic!("the port round: {error}"))
+        };
+        self.rt
+            .deliver_peer_closes(table)
+            .unwrap_or_else(|error| panic!("the peer-close delivery: {error}"))
+    }
+
+    /// Repeats [`Session::deliver`] until it delivers something or `bound` expires.
+    fn deliver_until(&mut self, table: &mut ProcessTable, bound: Duration) -> usize {
+        let deadline = Instant::now() + bound;
+        loop {
+            let delivered = self.deliver(table);
+            if delivered > 0 || Instant::now() >= deadline {
+                return delivered;
+            }
+        }
+    }
+}
+
+/// A [`Session`] whose port is owned by a process living in a **separate** process table.
+///
+/// `Runtime::deliver_peer_closes` (like `Runtime::deliver_port_signals`) takes that table
+/// alongside the runtime — the scheduler pass moves it out of the [`Runtime`], so `&mut
+/// rt.processes` cannot be handed to `&mut rt` — which means the mailbox-writing half can only be
+/// exercised against a table the test owns. The provider records `owner` as the port's connected
+/// process, exactly as `open_port/2` does for a real one.
+///
+/// The owner's **number** is deliberately not the runtime's own (`rt.self_pid()`): a local pid is
+/// identified by its number alone, so a fresh table's first process would be `=:=` the runtime's
+/// root and could not stand in for "somebody else" ([`RuntimeContext::poll_peer_closes`] takes
+/// exactly the reports addressed to its own pid). One extra spawn makes the owner genuinely
+/// foreign.
+fn table_owned(label: &str) -> Option<(Session, ProcessTable, ProcessId)> {
+    let fx = fixture();
+    let rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+    let mut owner = table.spawn_default().expect("the port's owner");
+    while owner == rt.self_pid() {
+        owner = table.spawn_default().expect("a distinct owner");
+    }
+    let hook = fx.hook_over(Rc::clone(&rt.ports), owner);
+    let mut session = Session {
+        rt,
+        fx,
+        hook,
+        port: PortId::new(0),
+    };
+    let port = session.open("tcp_inet", label)?;
+    session.port = port;
+    Some((session, table, owner))
+}
+
+/// Every message in `pid`'s mailbox, as terms.
+fn mailbox_terms(table: &ProcessTable, pid: ProcessId) -> Vec<Eterm> {
+    table
+        .get(pid)
+        .unwrap_or_else(|| panic!("the recipient {pid:?}"))
+        .mailbox()
+        .iter()
+        .map(|message| message.payload())
+        .collect()
+}
+
+/// `term` as the registered `~w` printer renders it — the text the oracle's own
+/// `io:format("~w",[Term])` prints, minus the trailing newline.
+fn rendered(rt: &mut Runtime, term: Eterm) -> String {
+    rt.format_term_w(term, None)
+        .unwrap_or_else(|error| panic!("the `~w` printer refused a built term: {error}"))
+        .trim_end_matches('\n')
+        .to_string()
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -555,5 +659,294 @@ fn the_message_tag_is_the_cs_tcp_closed_atom() {
         .expect("a tuple's arity"),
         2,
         "`{{tcp_closed, S}}` is a 2-tuple"
+    );
+}
+
+// -----------------------------------------------------------------------------------------------
+// The retirement half — the C's `driver_exit`, not `port_close/1`
+// -----------------------------------------------------------------------------------------------
+
+/// A peer-closed port is retired with **`driver_exit`'s** signal set: every monitor gets its
+/// `{'DOWN', Ref, port, S, normal}`, and a **trapping linked owner gets nothing at all**.
+///
+/// That asymmetry is the whole point of [`PortRegistry::retire_peer_closed`] and the reason it
+/// cannot simply be `port_close/1`: `driver_exit` runs `unlink_proc` first (`io.c:7244`), so the
+/// link family drops the owner, while the C's one `erts_deliver_port_exit` path still tells the
+/// monitors. Measured on the oracle (OTP 29.1.1 / erts-17.1): for a socket opened with
+/// `{active,true}` whose peer closes, a `trap_exit` owner's mailbox stays **empty** and the port
+/// is gone afterwards (`erlang:port_info(S, connected)` ⇒ `undefined`); a
+/// `monitor(port, S)` watcher receives `{'DOWN',Ref,port,S,normal}`.
+#[test]
+fn retiring_a_peer_closed_port_tells_its_monitors_and_not_its_owner() {
+    let Some((mut session, mut table, owner)) = table_owned("peer close: driver_exit") else {
+        return;
+    };
+    let watcher = table.spawn_default().expect("the port's watcher");
+    // `open_port/2` links the port to its owner, so an ordinary `port_close/1` would hand this
+    // trapping process `{'EXIT', S, normal}` — which `driver_exit` must not.
+    table
+        .get_mut(owner)
+        .expect("the owner")
+        .set_trap_exit(true);
+    {
+        let mut registry = session.rt.ports.borrow_mut();
+        table
+            .monitor_port(watcher, session.port, registry.port_table_mut())
+            .expect("a monitor on the port");
+    }
+
+    session
+        .rt
+        .ports
+        .borrow_mut()
+        .retire_peer_closed(session.port)
+        .expect("the peer-close retirement");
+
+    assert!(
+        !session.rt.ports.borrow().is_live(session.port),
+        "`driver_exit(desc->inet.port, 0)` kills the port: it is gone from the table"
+    );
+
+    // The `'DOWN'`s become deliverable at the port's close **report**, which a round mints — the
+    // same two-step shape every close's signals have (see `exit.rs`).
+    let _ = {
+        let mut registry = session.rt.ports.borrow_mut();
+        registry
+            .pump(PUMP_SLICE)
+            .unwrap_or_else(|error| panic!("the port round: {error}"))
+    };
+    let delivered = session
+        .rt
+        .deliver_port_signals(&mut table)
+        .expect("the close's signals");
+    assert_eq!(
+        delivered, 1,
+        "exactly one message is owed: the watcher's `'DOWN'` — `driver_exit` unlinked the owner"
+    );
+
+    assert!(
+        mailbox_terms(&table, owner).is_empty(),
+        "a trapping linked owner receives NOTHING when the peer close kills the port \
+         (the oracle's own answer — `driver_exit` runs `unlink_proc` before delivering)"
+    );
+    let down = mailbox_terms(&table, watcher);
+    assert_eq!(down.len(), 1, "one `'DOWN'` per watcher, got {down:?}");
+    let port_text = session.port_text();
+    let rendered = rendered(&mut session.rt, down[0]);
+    assert!(
+        rendered.starts_with("{'DOWN',")
+            && rendered.ends_with(&format!(",port,{port_text},normal}}")),
+        "the oracle's `{{'DOWN', Ref, port, S, normal}}`, got {rendered}"
+    );
+    assert_eq!(
+        terms::tuple_arity(down[0]).expect("a tuple's arity"),
+        5,
+        "`{{'DOWN', Ref, port, S, normal}}` is a 5-tuple"
+    );
+}
+
+/// The scheduler route writes `{tcp_closed, S}` into the **connected process's** mailbox, once,
+/// and then retires the port (`exit_on_close` defaults to `true`).
+///
+/// The mailbox shape is the oracle's: the *only* message an active socket's peer close produces is
+/// the bare 2-tuple `{tcp_closed,S}` — never a `{tcp_passive,S}` beside it, never a 3-tuple.
+#[test]
+fn the_scheduler_route_delivers_the_peer_close_into_the_owners_mailbox() {
+    let Some((mut session, mut table, owner)) = table_owned("peer close: delivery") else {
+        return;
+    };
+    let peer = match session.connect_loopback("peer close: delivery") {
+        Some(peer) => peer,
+        None => return,
+    };
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_ACTIVE, INET_ONCE)),
+        vec![1],
+        "the driver accepts `{{active,once}}`"
+    );
+    drop(peer);
+
+    let delivered = session.deliver_until(&mut table, DELIVERY_BOUND);
+    assert_eq!(
+        delivered, 1,
+        "one peer close delivers one `{{tcp_closed, S}}` to the connected process"
+    );
+    let messages = mailbox_terms(&table, owner);
+    assert_eq!(messages.len(), 1, "one message, got {messages:?}");
+    let port_text = session.port_text();
+    assert_eq!(
+        rendered(&mut session.rt, messages[0]),
+        format!("{{tcp_closed,{port_text}}}"),
+        "the oracle prints `{{tcp_closed,#Port<0.N>}}` — the bare 2-tuple"
+    );
+    assert!(
+        !session.rt.ports.borrow().is_live(session.port),
+        "`exitf` defaults to 1, so the port dies right after the message (`inet_drv.c:12835-12837`)"
+    );
+    assert_eq!(
+        session
+            .rt
+            .deliver_peer_closes(&mut table)
+            .expect("a second delivery pass"),
+        0,
+        "`TCP_ADDF_CLOSE_SENT`: the message is delivered at most once per descriptor"
+    );
+}
+
+/// The `-eval` route returns the message for **its own** process and leaves the port dead.
+#[test]
+fn poll_peer_closes_returns_the_message_addressed_to_this_process() {
+    let Some((mut session, peer)) = Session::connected_tcp("peer close: eval route") else {
+        return;
+    };
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_ACTIVE, INET_ONCE)),
+        vec![1],
+        "the driver accepts `{{active,once}}`"
+    );
+    drop(peer);
+
+    // The evaluator sees its own EOF only through a port round, then takes its message inline.
+    // The round is [`Session::pump_once`], never [`Session::round`]: the latter also drains the
+    // channel, which would consume the very report this case is about to poll for.
+    let deadline = Instant::now() + DELIVERY_BOUND;
+    while !session.peer_close_observed() && Instant::now() < deadline {
+        session.pump_once();
+    }
+    assert!(
+        session.peer_close_observed(),
+        "the driver must have latched the peer's EOF before the poll can report it"
+    );
+    let messages = {
+        let mut ctx = RuntimeContext::new(&mut session.rt);
+        ctx.poll_peer_closes()
+            .unwrap_or_else(|error| panic!("the `-eval` peer-close poll: {error}"))
+    };
+    let port_text = session.port_text();
+    assert_eq!(
+        messages.len(),
+        1,
+        "the evaluator owns the socket, so the report is its own"
+    );
+    assert_eq!(
+        rendered(&mut session.rt, messages[0]),
+        format!("{{tcp_closed,{port_text}}}"),
+        "the `-eval` route returns the same 2-tuple the mailbox route delivers"
+    );
+    assert!(
+        !session.rt.ports.borrow().is_live(session.port),
+        "the retirement runs on this route too — the evaluator's port is gone"
+    );
+}
+
+/// A report addressed to **another** process is left latched by the `-eval` route, so the
+/// scheduler route still delivers it — never dropped between the two routes.
+#[test]
+fn poll_peer_closes_leaves_another_processs_message_latched() {
+    let Some((mut session, mut table, owner)) = table_owned("peer close: foreign owner") else {
+        return;
+    };
+    let peer = match session.connect_loopback("peer close: foreign owner") {
+        Some(peer) => peer,
+        None => return,
+    };
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_ACTIVE, INET_ONCE)),
+        vec![1],
+        "the driver accepts `{{active,once}}`"
+    );
+    drop(peer);
+
+    let deadline = Instant::now() + DELIVERY_BOUND;
+    while !session.peer_close_observed() && Instant::now() < deadline {
+        session.pump_once();
+    }
+    assert!(
+        session.peer_close_observed(),
+        "the driver must have latched the peer's EOF before the poll can decline it"
+    );
+    let polled = {
+        let mut ctx = RuntimeContext::new(&mut session.rt);
+        ctx.poll_peer_closes()
+            .unwrap_or_else(|error| panic!("the `-eval` peer-close poll: {error}"))
+    };
+    assert!(
+        polled.is_empty(),
+        "the socket belongs to another process, so the evaluator returns nothing: {polled:?}"
+    );
+    assert!(
+        session.rt.ports.borrow().is_live(session.port),
+        "and it does not retire a port whose message it never took"
+    );
+
+    let delivered = session
+        .rt
+        .deliver_peer_closes(&mut table)
+        .expect("the scheduler route's delivery");
+    assert_eq!(
+        delivered, 1,
+        "the latch was left undrained, so the route that owns the process table still reports it"
+    );
+    let port_text = session.port_text();
+    let messages = mailbox_terms(&table, owner);
+    assert_eq!(
+        messages.len(),
+        1,
+        "the message reaches the port's real owner, got {messages:?}"
+    );
+    assert_eq!(
+        rendered(&mut session.rt, messages[0]),
+        format!("{{tcp_closed,{port_text}}}"),
+        "and it is the same 2-tuple"
+    );
+}
+
+/// `{exit_on_close, false}` keeps the socket half-open: the message is delivered, the port stays
+/// **live**, and the once-only latch still forbids a second message.
+///
+/// Measured on the oracle: with `{exit_on_close,false}` the owner gets `{tcp_closed,S}` exactly
+/// once and `erlang:port_info(S, connected)` still answers the owner afterwards.
+#[test]
+fn the_exit_on_close_false_socket_survives_the_peer_close_message() {
+    let Some((mut session, mut table, owner)) = table_owned("peer close: half open") else {
+        return;
+    };
+    let peer = match session.connect_loopback("peer close: half open") {
+        Some(peer) => peer,
+        None => return,
+    };
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_ACTIVE, INET_ONCE)),
+        vec![1],
+        "the driver accepts `{{active,once}}`"
+    );
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_EXITONCLOSE, 0)),
+        vec![1],
+        "the driver accepts `{{exit_on_close,false}}`"
+    );
+    drop(peer);
+
+    assert_eq!(
+        session.deliver_until(&mut table, DELIVERY_BOUND),
+        1,
+        "the close is still reported once"
+    );
+    assert!(
+        session.rt.ports.borrow().is_live(session.port),
+        "`exitf = 0` leaves the socket half-open — nothing may retire it"
+    );
+    assert_eq!(
+        mailbox_terms(&table, owner).len(),
+        1,
+        "exactly one `{{tcp_closed, S}}`, never a second message"
+    );
+    assert_eq!(
+        session
+            .rt
+            .deliver_peer_closes(&mut table)
+            .expect("a second delivery pass"),
+        0,
+        "the once-only latch is keyed on *reported*, so a live port reports nothing more"
     );
 }

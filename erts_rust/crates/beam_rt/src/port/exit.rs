@@ -275,8 +275,20 @@ impl PortRegistry {
     /// answer depends on the recipient's `trap_exit` flag (see
     /// [`Runtime::deliver_port_signals`]) and on whether the recipient is still alive; neither
     /// is readable here (this registry holds no process table).
+    ///
+    /// # The one closer that owes the links nothing
+    ///
+    /// [`PortRegistry::retire_peer_closed`](super::PortRegistry) marks the port in
+    /// `PortExtras::no_owner_exit` before calling
+    /// [`PortRegistry::close`](super::PortRegistry), because the C's peer-close retirement is
+    /// `driver_exit(desc->inet.port, 0)` (`inet_drv.c:12835-12837`) — and `driver_exit` runs
+    /// `unlink_proc` **first** (`io.c:7244`), so a trapping linked owner gets no
+    /// `{'EXIT', S, normal}` while every monitor still gets its `{'DOWN', Ref, port, S, normal}`.
+    /// Suppressing here (rather than at delivery) keeps the whole signal set one snapshot, so the
+    /// two messages of one close can never disagree.
     pub(super) fn capture_port_exit(&mut self, id: PortId) {
-        let signals = self.port_exit_signals(id, PortSignalReason::Normal, true);
+        let signals_owner = !self.extras.owner_exit_suppressed(id.number());
+        let signals = self.port_exit_signals(id, PortSignalReason::Normal, signals_owner);
         if !signals.is_empty() {
             self.pending_port_signals.stash(id, signals);
         }

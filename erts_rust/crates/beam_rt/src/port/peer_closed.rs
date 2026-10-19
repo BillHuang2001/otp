@@ -69,14 +69,44 @@
 //!
 //! [`TcpInetDriver`]: beam_io::drivers::inet::TcpInetDriver
 //! [`PortInetOptions::active_mode`]: super::inet_opts::PortInetOptions::active_mode
+//!
+//! # The three halves of the channel
+//!
+//! Reading the latch is only the first half: the message has to reach its recipient, and the
+//! port has to die afterwards exactly as the C makes it die. Both are here, so the consuming
+//! sites in `src/port.rs` are one line each.
+//!
+//! | half | entry point | route |
+//! |---|---|---|
+//! | read | [`PortRegistry::drain_peer_closes`] / [`PortRegistry::drain_peer_closes_for`] | per port round |
+//! | deliver | [`Runtime::deliver_peer_closes`] | the scheduler `run` route (a mailbox write) |
+//! | deliver | [`RuntimeContext::poll_peer_closes`] | the `-eval` `receive` route (returned inline) |
+//! | retire | [`PortRegistry::retire_peer_closed`] | the C's `driver_exit`, called by both deliver halves |
+//!
+//! ## The retirement is `driver_exit`, not `port_close/1`
+//!
+//! `tcp_recv_closed`'s `if (desc->inet.exitf) driver_exit(desc->inet.port, 0)`
+//! (`erts/emulator/drivers/common/inet_drv.c:12835-12837`) is a *driver* exit, and `driver_exit`
+//! runs `unlink_proc` **before** it delivers (`io.c:7244`). The port therefore leaves the runtime
+//! with the `'EXIT'` half of the link family **suppressed** while every monitor still gets its
+//! `{'DOWN', Ref, port, S, normal}` — measured on the oracle (OTP 29.1.1 / erts-17.1): a trapping
+//! owner linked to the socket receives **nothing** when its peer closes, and after that the port
+//! is fully gone (`erlang:port_info(S, connected)` ⇒ `undefined`). [`PortRegistry::close`] is the
+//! ordinary `port_close/1` closer and *does* signal the links, so the suppression is recorded on
+//! the port's extras immediately before that one call — never at delivery, so the two messages of
+//! one close can never disagree.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
-use beam_process::{PortId, ProcessId};
+use beam_common::Result;
+use beam_process::{PortId, ProcessId, ProcessTable};
 use beam_term::{make_atom, Eterm};
 
+use crate::error;
 use crate::port::completion::terms_tuple;
 use crate::port::{driver_path_name, PortMeta, PortRegistry, RuntimeContext};
+use crate::Runtime;
 
 use super::inet_opts::PortInetOptions;
 
@@ -231,6 +261,26 @@ impl PortRegistry {
     /// Reports are answered in **port-number order**, so two closings in one round have a stable
     /// sequence rather than the hash map's.
     pub(crate) fn drain_peer_closes(&mut self) -> Vec<PeerCloseReport> {
+        self.collect_peer_closes(None)
+    }
+
+    /// [`PortRegistry::drain_peer_closes`] restricted to the reports addressed to `to` — the
+    /// `-eval` route's half (see [`RuntimeContext::poll_peer_closes`]).
+    ///
+    /// A route that can only observe **its own** mailbox (the `-eval` evaluator) must not consume
+    /// another process's report: the message would be lost, because the once-only latch has no
+    /// second chance. So a report addressed elsewhere is **not** marked as reported here, and the
+    /// next full drain — the scheduler route's [`PortRegistry::drain_peer_closes`], at the same
+    /// pass boundary — still produces it. That is strictly better than the sibling channels'
+    /// "drop it and let the other route handle it", whose pumps are destructive; here nothing is
+    /// destroyed, the latch simply stays undrained.
+    pub(crate) fn drain_peer_closes_for(&mut self, to: ProcessId) -> Vec<PeerCloseReport> {
+        self.collect_peer_closes(Some(to))
+    }
+
+    /// The one drain: `wanted = None` reports every due close, `wanted = Some(to)` only that
+    /// recipient's (see the two public wrappers).
+    fn collect_peer_closes(&mut self, wanted: Option<ProcessId>) -> Vec<PeerCloseReport> {
         // A latch can only outlive its port on a route that bypassed `PortExtras::forget_port`;
         // this keeps the set bounded by the live ports on every path (`PendingPortSignals::prune`
         // is the same safety net for the close signals).
@@ -252,6 +302,13 @@ impl PortRegistry {
             };
             if !is_tcp {
                 continue;
+            }
+            // A recipient this route cannot deliver to: leave the latch untouched so the route
+            // that owns a process table still reports it (see `drain_peer_closes_for`).
+            if let Some(wanted) = wanted {
+                if owner != wanted {
+                    continue;
+                }
             }
             let id = PortId::new(number);
             let closed = match self.registry.port_closed(id) {
@@ -291,6 +348,41 @@ impl PortRegistry {
         reports
     }
 
+    /// Retires a peer-closed port exactly as the C's
+    /// `driver_exit(desc->inet.port, 0)` does — the second half of
+    /// `tcp_recv_closed`'s active arm (`inet_drv.c:12835-12837`).
+    ///
+    /// [`PortRegistry::close`] is the *Erlang* closer (`port_close/1`) and owes a trapping linked
+    /// owner its `{'EXIT', Port, normal}`. `driver_exit` does not: it runs `unlink_proc` first
+    /// (`io.c:7244`), so the link family is dropped and only the monitors are told. The mark that
+    /// reproduces that order is recorded on the port's extras **before** the close, because
+    /// [`PortRegistry::capture_port_exit`](super::PortRegistry) is what snapshots the signals and
+    /// it runs inside [`PortRegistry::close`]:
+    ///
+    /// * `no_owner_exit` is set for this port number;
+    /// * [`PortRegistry::close`] snapshots the `'DOWN'`-only set
+    ///   (`signals_owner = false`);
+    /// * the port's extras — the mark included — are dropped by the close's own
+    ///   `forget_port`, so the mark never outlives the close it was made for.
+    ///
+    /// The `'DOWN'` messages become deliverable at the port's close **report**, like every other
+    /// close's signals (see [`super::exit`]), so the caller's delivery route reports them one
+    /// round later.
+    ///
+    /// # Errors
+    ///
+    /// [`beam_common::BeamError::BadArg`] for a port the runtime does not hold — the same answer
+    /// [`PortRegistry::close`] gives, tested **before** the mark is set so a refused retirement
+    /// cannot leave one behind — and whatever the teardown or the driver's exit notification
+    /// reports.
+    pub(crate) fn retire_peer_closed(&mut self, id: PortId) -> Result<()> {
+        if !self.is_live(id) {
+            return Err(beam_common::BeamError::BadArg);
+        }
+        self.extras.suppress_owner_exit(id.number());
+        self.close(id)
+    }
+
     /// Forgets port `number`'s peer-close latch — the per-port half of
     /// [`PeerCloseLatches::forget`], for a caller that retires a port number outside
     /// [`PortRegistry::close`](PortRegistry::close).
@@ -327,7 +419,138 @@ impl PortRegistry {
     }
 }
 
+impl Runtime {
+    /// Delivers every due `{tcp_closed, S}` into its **connected process's** mailbox and retires
+    /// every port whose `{exit_on_close, …}` is true, answering how many messages were delivered.
+    ///
+    /// This is the **scheduler** route's half of the channel, shaped exactly like
+    /// [`Runtime::deliver_port_signals`](crate::port::Runtime) (which `src/port.rs`'s
+    /// `deliver_port_messages` calls at the same pass boundary, with the same `table`): the
+    /// message is copied into the recipient's own heap through
+    /// [`RuntimeContext::deliver_in_table`], so a receiver parked in a compiled `receive` is woken
+    /// through `beam_process`'s wake list exactly as a `{Port, {data, …}}` delivery wakes it.
+    ///
+    /// Per report the steps are the C's `tcp_recv_closed`:
+    ///
+    /// 1. a report whose owner the table no longer holds is **skipped** — a dead process has no
+    ///    mailbox, and its own death already resolved its side of the relationship;
+    /// 2. the message is built on the runtime's arena (`peer_close_message`) **after** the port
+    ///    registry's borrow has been released — the snapshot rule every other port delivery site
+    ///    follows — and delivered with the port as its sender;
+    /// 3. when [`PeerCloseReport::exit_on_close`] is set the port is retired through
+    ///    [`PortRegistry::retire_peer_closed`], which is the C's following
+    ///    `driver_exit(desc->inet.port, 0)` — `'DOWN'` to the monitors, **no** `'EXIT'` to the
+    ///    owner, port fully gone. A port that has already left the table (a concurrent
+    ///    `port_close/1`, its own failure channel) is not retired twice.
+    ///
+    /// Retirement does **not** depend on the delivery: the C sends the message and then kills the
+    /// port, so an owner that is gone still takes its port with it.
+    ///
+    /// # Errors
+    ///
+    /// A nested borrow of the port registry (a typed capability gap, never a panic), the message
+    /// builder's allocation failure, the deliver path's own errors, and the retirement's teardown
+    /// errors.
+    pub(crate) fn deliver_peer_closes(&mut self, table: &mut ProcessTable) -> Result<usize> {
+        // The `Rc` is cloned **before** the borrow so the returned `RefMut` borrows the clone
+        // rather than the runtime field — the shape every other port accessor uses.
+        let cell = Rc::clone(&self.ports);
+        let reports = {
+            let mut registry = cell
+                .try_borrow_mut()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            registry.drain_peer_closes()
+        };
+        let mut delivered = 0;
+        for report in reports {
+            if table.contains(report.owner) {
+                // The message is built while the context is borrowed, then delivered once that
+                // borrow is released.
+                let message = {
+                    let mut ctx = RuntimeContext::new(&mut *self);
+                    ctx.peer_close_message(&report)?
+                };
+                RuntimeContext::deliver_in_table(
+                    self,
+                    table,
+                    report.owner,
+                    report.port.to_eterm(),
+                    message,
+                )?;
+                delivered += 1;
+            }
+            if report.exit_on_close {
+                self.retire_peer_closed_port(report.port)?;
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Retires `id` as a peer close must, skipping a port that has already left the table.
+    ///
+    /// The liveness test is the whole point: [`PortRegistry::retire_peer_closed`] answers
+    /// `badarg` for a port the runtime no longer holds, and that is the *expected* answer when the
+    /// port died between the drain and this call (a `port_close/1` from the owner, the driver's
+    /// own failure channel). Folding it into a delivery error would fail a scheduler pass for a
+    /// port that is already in exactly the state the retirement would have put it in, so it is
+    /// skipped here instead of surfaced.
+    ///
+    /// # Errors
+    ///
+    /// A nested borrow of the port registry (a typed capability gap) and the teardown's own
+    /// failures, which are never swallowed.
+    pub(crate) fn retire_peer_closed_port(&mut self, id: PortId) -> Result<()> {
+        let cell = Rc::clone(&self.ports);
+        let mut registry = cell
+            .try_borrow_mut()
+            .map_err(|_| error::unsupported("the port table is already in use"))?;
+        if !registry.is_live(id) {
+            return Ok(());
+        }
+        registry.retire_peer_closed(id)
+    }
+}
+
 impl RuntimeContext<'_> {
+    /// The messages the peer-close channel owes **this context's own process**, for the `-eval`
+    /// `receive` to match inline.
+    ///
+    /// The `-eval` route can only observe its own mailbox, so it takes exactly the reports
+    /// addressed to itself ([`PortRegistry::drain_peer_closes_for`]) and **leaves every other
+    /// recipient's latch undrained**, so the scheduler route still reports it — the rule the
+    /// completion/active-input/driver-term arms follow, made exact here because the once-only
+    /// latch has no second chance to give.
+    ///
+    /// A report with [`PeerCloseReport::exit_on_close`] set retires its port here, exactly as
+    /// [`Runtime::deliver_peer_closes`] does: the C's `tcp_recv_closed` sends the message and then
+    /// calls `driver_exit`, so the evaluator's next `port_info/2` on that port finds it gone. The
+    /// close's `'DOWN'` messages need the port's close **report**, which a later port round mints
+    /// (see [`super::exit`]), so a watcher's `{'DOWN', …}` arrives on the round after — the same
+    /// shape `port_close/1` has on this route.
+    ///
+    /// # Errors
+    ///
+    /// A nested borrow of the port registry (a typed capability gap), the message builder's
+    /// allocation failure and the retirement's teardown errors.
+    pub(crate) fn poll_peer_closes(&mut self) -> Result<Vec<Eterm>> {
+        let pid = self.pid();
+        let cell = Rc::clone(&self.runtime.ports);
+        let reports = {
+            let mut registry = cell
+                .try_borrow_mut()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            registry.drain_peer_closes_for(pid)
+        };
+        let mut messages = Vec::with_capacity(reports.len());
+        for report in reports {
+            messages.push(self.peer_close_message(&report)?);
+            if report.exit_on_close {
+                self.runtime.retire_peer_closed_port(report.port)?;
+            }
+        }
+        Ok(messages)
+    }
+
     /// The message one [`PeerCloseReport`] delivers: the 2-tuple `{tcp_closed, S}`.
     ///
     /// Built on the runtime's pointer-stable `-eval` arena (like every other port message) after the
