@@ -290,7 +290,7 @@ The `auto`/`{debug_hash_fixed_number_of_locks, N}` `write_concurrency` rendering
 - `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations (+ its `CONTEXT.md`)
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs); `src/error.rs` → the `badarg`/`unsupported` constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing; `tests/ets_*.rs`, `tests/select.rs`, `tests/match_spec_run.rs` → the public-API integration suites (what each pins is in Test Strategy)
-- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups); `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace (`#[ignore]`d; run with `--ignored`)
+- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups); `tests/ets_ordered_oracle.rs` → the randomised mixed-type `ordered_set` differential trace (`#[ignore]`d; run with `--ignored`); `tests/ets_ordered_stress_oracle.rs` → the 10 000-key `ordered_set` scale shapes (split cascade, merge cascade, duplicate boundaries, split-boundary walks, select order, `{keypos,2}`), all always-on and oracle-cross-checked
 
 ## See Also
 - `ETS_SURFACE.md` → the `ets:*` coverage census: every operation mapped to this crate / `beam_bifs` / missing, the oracle-probed semantic facts, and the runtime-level gaps with the exact API each needs.
