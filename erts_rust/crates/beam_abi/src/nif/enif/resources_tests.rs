@@ -770,14 +770,40 @@ fn resource_terms_reports_the_live_set_and_shrinks_after_the_prune() {
 /// implements the caller side against them.
 #[test]
 fn the_release_seam_is_publicly_reachable() {
+    unsafe extern "C" fn noop_dtor(_: *mut ErlNifEnv, _: *mut c_void) {}
+
     // Every live term is called reachable here, so nothing is released (and the shared registry of
     // this test binary is left untouched).
     assert_eq!(crate::nif::enif::resources::release_resource_terms(|_| true), 0);
     assert_eq!(crate::nif::enif::release_resource_terms(|_| true), 0);
+
+    // A term minted by this test is visible through both paths. Two consecutive snapshots are
+    // deliberately NOT compared for set equality: the registry is process-wide, so a concurrently
+    // running test can mint or prune a term between the two calls. Membership of a term this test
+    // owns is the concurrency-proof observable.
+    let mut host = RetainHost::new();
+    let mut env = NifEnv::new(&mut host);
+    let ty = open_type(&mut env, "seam_reachable_rt", noop_dtor);
+    // SAFETY: `ty` came from `open_type`; the allocator's reference is released below.
+    let obj = unsafe { alloc_object(ty, 1) };
+    // SAFETY: `env` is live; `obj` is a live payload pointer.
+    let term = unsafe { make_resource_term(&mut env, obj) };
+    // SAFETY: the minted term holds the reference that keeps the object alive from here on.
+    unsafe { enif_release_resource(obj) };
+    assert!(
+        crate::nif::enif::resources::resource_terms().contains(&term),
+        "the implemented path reports the live term"
+    );
+    assert!(
+        crate::nif::enif::resource_terms().contains(&term),
+        "so does the family re-export"
+    );
+    // Leave the process-wide registry as it was: drop this term's own reference (everything else in
+    // the snapshot is called reachable, so only this binding is taken).
     assert_eq!(
-        crate::nif::enif::resources::resource_terms(),
-        crate::nif::enif::resource_terms(),
-        "both paths designate the same live set"
+        release_resource_terms(|candidate| candidate.raw() != term.raw()),
+        1,
+        "only this test's term is released"
     );
 }
 
