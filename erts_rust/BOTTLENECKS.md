@@ -21,7 +21,7 @@ very different host load, which is why the same workload can appear at two ratio
 |---|---|---|---|---|
 | **Q** (quiet) | `crates/beam_engine/MEASURED.md` §*Cross-runtime record and the binary A/B* | 2026-10-20 | **1.02–2.37** | **the current rust-vs-sys ratios** for `list_walk`, `etf_roundtrip`, `ets_copy`, `send_recv`, `send_recv_plain`, `churn`, all four `foreign/*`; and the code-change A/B |
 | **m17** | `tools/bench/RESULTS.md` (session `m17`, 2026-10-18) | 2026-10-18 | 3 → 92 | start-up p50/p99, `slice`, the memory rows, `binary_append`'s last **full-record** figure, the external targets |
-| **fresh** | measured while writing this file (§1.3) | now | 161 → 181 | only what it says: one `binary_append` single round on a heavily loaded host |
+| **fresh** | measured by hand while writing this file (§1.3), **no `out/` copy archived** | now | 161 → 181 | only what it says: one `binary_append` single round on a heavily loaded host — a hand measurement, not a record |
 
 **Q supersedes m17 for the rows it measures.** Concrete examples of the difference, all
 `rust`/`sys`:
@@ -112,6 +112,9 @@ sys leg, sequentially, `taskset -c 3`, `setsid -w`**, load **161.53 → 170.00**
 is 1.9× the rust figure the quiet A/B records (1 333 404 ns/call), which is the load effect, and the
 driver's own note says the append path measured is the real binary-append path (16 384 four-byte
 segments into one writable payload), not a series of copies.
+**No `out/` copy of this round was archived** — it was measured by hand while this file was written,
+so it is a hand measurement, **not a record**, and it must be re-run through the driver (and archived
+under `tools/bench/results/`) before it is quoted as a ratio.
 A matched-round re-run is the way to publish a current `binary_append` ratio.
 
 ---
@@ -132,7 +135,7 @@ owner's stated priority). "Gap" is the Q ratio unless the column says otherwise.
 | **B7** | compiler throughput: root descent at every heap admission | **no cross-runtime ratio** (in-crate: 3.62 % → **44.50 %** of samples) | whole-graph unscanned-root walk (`beam_rt::context::gc_walk`) | **architectural** | yes — bound/incrementalise |
 | **B8** | `ets_copy` retained memory | rust peak RSS **90.30** vs sys **66.26 MiB**, linear in `N` | nursery grows and is never shrunk (`beam_rt` + `beam_gc`) | **architectural**, cross-crate | needs a new seam |
 
-**Defer (micro-optimisation)**: `BitWriter::push_bit` fast path, family-id baking, `jit_call_store`
+**Defer (micro-optimisation)**: family-id baking, `jit_call_store`
 re-decode, `local_call_seam` boolean, block register-cache traffic (**no measurable effect**, §5), the
 allocator (§5), and **Cranelift — rejected as a performance tier** (§5).
 
@@ -154,11 +157,14 @@ and the sizing policy that sets those capacities is `crates/beam_gc/src/policy.r
 (`mature_after_fullsweep` `:269`, `young_after_collection` `:313`).
 For churn's shape the nursery is priced so small that the escalation fires on nearly every op.
 
-**Structural counters.** ≈**1 830 words/op** allocated and **7.00 collections/op** (5.50 minor +
-1.50 major) at the runtime level; `beam_gc`'s own attribution
-(`crates/beam_gc/tests/churn_attribution.rs`, 4 000 ops) gives 2.00 collections/op (1.50 minor /
-0.50 major), **1 269.5 words copied/op = 1.58× the allocated volume**, 418.0 objects and 634.6 words
-per collection; the reds door fires on **1 in 8 checks** (0.74 % of collections); `peak_young_spaces
+**Structural counters.** ≈**1 830 words/op** allocated, and at the runtime level **7.669165
+collections/call and 1.256372 majors/call at a 609-word young space**
+(`crates/beam_rt/src/runner/CONTEXT.md:431-440`; the `6.984032`/`6.996002`/`6.999200` collections and
+`1.497006`/`1.499250`/`1.499850` majors columns in that section are a superseded earlier tree state).
+`beam_gc`'s own attribution (`crates/beam_gc/tests/churn_attribution.rs`, 4 000 ops) gives 2.00
+collections/op (1.50 minor / 0.50 major), **1 269.5 words copied/op = 1.58× the allocated volume**,
+**418.0 objects/op** (≈209 per collection at 2.00 collections/op) and **634.6 words copied per
+collection**; the reds door fires on **1 in 8 checks** (0.74 % of collections); `peak_young_spaces
 == 1`; young capacity plateaus at 609 words.
 The copier is **not** the cost: `beam_gc`'s copy loop is **4.2 %** of `perf` samples against
 interpreter 20 %, libc `malloc`/`free`/`memmove` 15 %, `beam_rt::context::gc` 12.7 % and `beam_bifs`
@@ -226,16 +232,23 @@ the two `send_recv` rows are a **small real regression**: `send_recv` 1.022×, `
    (`crates/beam_message/src/copy.rs:347`), then `beam_term::size::size_object_bounded_with`
    (`crates/beam_term/src/size.rs:565`) → `sizing_walk` (`:386`, `HashSet` path-set + `Step::Exit` +
    `&dyn SizingPolicy`), then `is_acyclic` (`:448`, two more sets), then `size_object_with` (`:522`).
-   On `ets_copy` this machinery is **≈29 % of cycles** (`hash_one::<&usize>` 8.1 %, SipHash13
-   6.2 + 1.8 %, `sizing_walk` 2.9 %); eliminating refusals (`+hms 200000`) removes every symbol and
-   makes the case **~1.2× faster**.
+   On `ets_copy`, measured **before** the hint gate landed (`crates/beam_message/CONTEXT.md:134`),
+   this machinery is **≈29 % of cycles** (`hash_one::<&usize>` 8.1 %, SipHash13 6.2 + 1.8 %,
+   `sizing_walk` 2.9 %); eliminating refusals (`+hms 200000`) removes every symbol and makes the case
+   **~1.2× faster**. The gate drove that machinery's `perf` share from 26.5 % to ~0, so Q's rust
+   `ets_copy` (2 180.34 ns) is the post-gate build and the 29 % is not its profile.
 4. **`beam_message` is not the whole story** — `copy_struct` is **198.8 ns mean / 176 ns best =
-   2.8 ns/word** for a 70-word / 27-object payload (2 allocations, 192 B), split as copy traversal
-   167.2 / whole send 190.7 / enqueue **23.5 ns** (≈88 % copy, ≈12 % build + enqueue).
+   2.8 ns/word** for a 70-word / 27-object payload (2 allocations, 192 B; five-run median,
+   `crates/beam_message/PERF.md:104-108`), while a *different* counter session splits the same `send`
+   as copy traversal 167.2 / whole send 190.7 / enqueue **23.5 ns** (≈88 % copy, ≈12 % build +
+   enqueue, `crates/beam_message/PERF.md:111-113`) — `167.2 + 23.5 = 190.7` holds only inside that
+   190.7 ns run, not against the 198.8 ns median.
    Its share of `send_recv_plain` is ≈**21 % (0.41 µs) — a lower bound** (the payload is sent twice
    per op); even a free copy leaves ≈1.5 µs, which belongs to `beam_rt`'s per-slice runner and
-   `beam_process` delivery (end-to-end split of a 79 518 ns/op `send_recv`: `beam_process` 73 ns =
-   0.09 %, `beam_message` 439 ns = 0.55 %, remainder **99.4 %** engine/Erlang/host seams).
+   `beam_process` delivery. The split quoted for a 79 518 ns/op `send_recv` (`beam_process` 73 ns =
+   0.09 %, `beam_message` 439 ns = 0.55 %, remainder **99.4 %** engine/Erlang/host seams) is the
+   harness's per-crate rows applied to the workload's structure, **not** a profiled end-to-end trace
+   (`crates/beam_process/PERF.md:252-256`, with its own disclaimer at `:284-285`).
 5. **A second copy inside the ETS registry** — `ets:lookup/2` yields `[{k, ~73-word payload}]`, copied
    onto the process's own young heap; on a full nursery `Process::grow_nursery` + one retry, with
    nothing shrinking it back (**B8**). `beam_ets` itself is **not** the cost: `TermStore::words` 73
@@ -308,9 +321,12 @@ together **−7.03 % / −4.39 %**.
 `small_value` before `big_parts_safe` → **1.022–1.023× slower**; and **do not inline
 `bs_create_bin`** (`src/bench/CONTEXT.md:283`).
 The architectural part of this row **already landed**: the per-slice off-heap mirror that made the
-cost accumulate was replaced by a reservoir roster with an `O(1)` gate (`beam_rt/src/runner/run.rs`,
-`OffHeapReclaimer::observe`) — that is the 0.62–0.80× A/B above, and the old shape grew
-**23.2× over 12× `N`** (encode 16 287.5 → 377 725.2 ns/call) where it is now flat.
+cost accumulate was replaced by a reservoir roster with an `O(1)` gate —
+`crates/beam_rt/src/context/gc/bin_vheap.rs:203` (`OffHeapReclaimer`, `observe` `:236`, re-exported at
+`crates/beam_rt/src/context/gc.rs:171`), pruned at the slice boundary by
+`RuntimeRunner::reclaim_off_heap_binaries` (`crates/beam_rt/src/runner/run.rs:367`, called `:1220`) —
+that is the 0.62–0.80× A/B above, and the old shape grew **23.2× over 12× `N`** (encode
+16 287.5 → 377 725.2 ns/call, `crates/beam_rt/PERF.md:402`) where it is now flat.
 
 **Next step.** (a) bake a **family id + operand-slice index at compile time** (mechanical; removes the
 re-decode); (b) route a byte-aligned `width % 8 == 0` `push_uint` through the existing
@@ -351,9 +367,9 @@ the interpreter's 152**).
 public fields); a per-`func` resolved-slice cache (**costs 20–40 %** on tight dispatch rows); a
 cross-function per-run 2-slot memo (answered 58/60 resolutions yet **+1.84 %**; kept test-only); a
 range-crossing Y-window witness (**+1.15 %** and **unsound** at the `fold_step` `pc+1` shape);
-removing the position store while keeping the derivation (invalid split — deopts,
-`result_is_correct = false`); a conditional `ctx.reduce` (parks mid-block, replays a prefix);
-Cranelift as a tier (§5).
+removing the Y-window derivation while keeping the position store (invalid split — with no window
+published the emitted Y guard rejects, the tier deopts, `result_is_correct = false`; the store itself
+is not a removal candidate, `src/jit/CONTEXT.md:258-262`); Cranelift as a tier (§5).
 
 **Next step.** Give `JitRuntime` the active function's `entries` base and answer the **block entry
 address** for a same-function continuation — the instruction-count tree already prices it
@@ -468,9 +484,13 @@ with the compiler route — no `bench` workload isolates it.
 
 ### B8 — `ets_copy` retains memory: the nursery grows and is never shrunk
 
-**Workload and both sides.** `copy_bound/ets_copy` peak RSS **rust 90.30 MiB vs sys 66.26 MiB**,
-growing **linearly in `N`**: 94.68 MiB at `N` = 100 000 and still linear, ≈790 B ≈ 99 words per
-iteration.
+**Workload and both sides.** `copy_bound/ets_copy` peak RSS **rust 90.30 MiB vs sys 66.26 MiB**, both
+read at **`N` = 100 000** (`crates/beam_ets/PERF.md:39`) — one `N`, so it is a ratio, not a curve. The
+growth is **linear in `N`** at ≈**790 B ≈ 99 words retained per iteration**
+(`crates/beam_rt/PERF_DISPATCH.md:305-306`), and a second session read **94.68 MiB at that same
+`N` = 100 000** (`crates/beam_rt/PERF_DISPATCH.md:305`) — a session delta, not `N`-growth. The
+linearity's real anchor is the per-iteration retention plus the oracle, whose peak RSS moves
+**+0 KiB** over a 20× `N` range (counter below).
 
 **Mechanism.** `move_result_into_process_heap` (`crates/beam_rt/src/context/calls.rs:1333`) **cannot
 collect at a BIF call** — the machine's roots are not published there — so a full nursery is met by
@@ -519,10 +539,11 @@ Consolidated so a future round does not spend a day re-measuring a dead end.
   **6.5–60×** the baseline's. `jit-cranelift` stays default-OFF and is **not reachable end-to-end**:
   `beam_rt/src/runner/tier.rs` maps `BEAM_RT_TIER` only to `JitMode::{Auto,Interpreter,Baseline}`.
 * The five dispatch/memoisation ideas and the Y-window witness in B4.
-* **Block register-cache traffic — below this host's resolution.** Dirty-set spill stores
-  4 678 655 → 1 594 678 (−65.9 %) and bytes 341 653 629 → 320 065 790 (−6.32 %); prologue/push+pop ops
-  7 167 996 → 2 707 930 (−62.2 %) — yet 9 paired rounds across loadavg 8 → 123 flip sign per case with
-  a 1.5–5.2× spread ⇒ **≲2 % wall-clock, no attributable movement**. Also rejected: per-helper clobber
+* **Block register-cache traffic — below this host's resolution.** Spill stores **4 678 655
+  (written-set) → 1 594 678 (dirty-set)** (−65.9 %) and bytes 341 653 629 → 320 065 790 (−6.32 %);
+  prologue/push+pop ops 7 167 996 → 2 707 930 (−62.2 %) — yet 9 paired rounds across loadavg 8 → 123
+  flip sign per case with a 1.5–5.2× spread ⇒ **≲2 % wall-clock, no attributable movement**
+  (`crates/beam_engine/MEASURED.md:142`). Also rejected: per-helper clobber
   sets narrower than the whole cache (no sound set — a collecting host may rewrite every root),
   changing the 5-slot `CACHE_REGISTERS` budget (no per-register benefit counter), and Y-slot caching
   (12 Y accesses corpus-wide; attempted then reverted).
@@ -538,10 +559,12 @@ Consolidated so a future round does not spend a day re-measuring a dead end.
 * **MMTk and Boehm — rejected outright**; GenImmix stays a measurement-gated option.
 * Immix below one whole block is **strictly dominated** (64 → 64 / 12 → 64, 128 → 128 / 24 → 128).
   From one block up it pins the live set: the allocation-heavy A/B moved **19 115 520 (Copying) vs
-  12 290 560 (Immix) words = 0.643×** at **3.79×** peak line-words (14 848 vs 34 816 peak resident);
+  12 290 560 (Immix) words = 0.643×** at **3.79× peak mature occupancy** (7 168 words vs 27 136
+  line-words / 1 696 lines) and **2.35× peak resident words, nursery + mature** (14 848 vs 34 816)
+  (`crates/beam_gc/MEASURED.md:81` and `:82`);
   runtime-shaped through `beam_rt`'s doors, `initial_mature_words` 2047 vs 2048 is **1.146× words
   moved for 6.57× occupancy**. `IMMIX_BREAK_EVEN_WORDS = 8 * BLOCK_WORDS = 2048`
-  (`crates/beam_gc/src/selection.rs:111`, `select_mature`) stays the rule.
+  (`crates/beam_gc/src/selection.rs:111`; `fn select_mature` `:122`) stays the rule.
 * The B1 list: `need = 0`, exact-live escalation, pre-collection mature sizing, pre-`reset()` nursery
   sizing, the `1/2` and `1/1` door watermarks, and write barriers (impossible by contract).
 
@@ -549,19 +572,30 @@ Consolidated so a future round does not spend a day re-measuring a dead end.
 
 * The allocation-free `WorkStack` and the "fresh payload per op" hypothesis (B2).
 * Reading `vm_memory_total_bytes` as a footprint win — **an accounting artefact**, see below.
-* `beam_ets` interiors: the B+-tree is the right `ordered_set` (insert/delete 108.5/126.9 (1k) →
-  297.4/460.0 (1M) vs sorted `Vec` 100.0/105.4 → 5 221.1/5 146.0; ratios 0.92/0.83 @1k, 3.51/3.18
-  @10k, 29.54/23.72 @100k, worst 115.92×), and copy-trimming/hysteresis is in place (200-round churn:
-  `max == base`, no thrash).
-* Map flatmap→HAMT threshold (`MAP_SMALL_MAP_LIMIT = 32`) — no measured threshold bottleneck; the
-  measured map cost is the 64-key HAMT copy (234 words / 3 744 B / 559.3 ns) inside B2.
+* `beam_ets` interiors: the B+-tree is the right `ordered_set` — like-for-like at `n` = 100 000
+  (shuffled `smallint`) insert/delete is **176.8/217.0 ns (tree) vs 5 221.1/5 146.0 ns (sorted
+  `Vec`)**, i.e. **29.54/23.72×** (`crates/beam_ets/PERF.md:267` and `:268`), and it stays at or below
+  parity at 1k/10k (0.92/0.83 @1k, 3.51/3.18 @10k), worst 115.92× (100k descending). Only the tree
+  was measured at 1M — insert/delete **297.4/460.0** (`PERF.md:306`) — because **no** sorted-`Vec` 1M
+  figure exists: extrapolating its measured `O(n)` 5.2 µs at 100k gives ≈52 s per metric per pass
+  against the tree's measured 0.3 s (`PERF.md:300-302`). Copy-trimming/hysteresis is in place
+  (200-round churn: `max == base`, no thrash).
+* Map flatmap→HAMT threshold (`MAP_SMALL_MAP_LIMIT = 32`, `crates/beam_term/src/map.rs:111`) — no
+  measured threshold bottleneck; the measured map cost is the 64-key HAMT copy (234 words / 3 744 B /
+  559.3 ns) inside B2.
 
 **Allocator**
 
 * `beam_alloc`'s per-op figures (size-class lookup 3.58 / 5.55 ns; alloc+free 871.14 ns at 1×64 B,
-  616.16 ns at 256×64 B) are **memory/syscall-bound, not CPU-bound** — twice documented as "not a
-  regression to chase" (release ≈ debug; the 1 062 → 4 290 ns jump is the legacy-faithful
-  `get_next_mbc_size` clamp to ≥`smbcs` = 1 MiB plus fresh-carrier page faults).
+  616.16 ns at 256×64 B) are **memory/syscall-bound, not CPU-bound** — documented once as "do not
+  chase these as regressions" (`crates/beam_alloc/CONTEXT.md:262`), with the numbers themselves
+  designated a regression *baseline* in the harness's own method notes
+  (`crates/beam_alloc/tests/hot_path.rs:55-58`). Release ≈ debug, and the jump is the legacy-faithful
+  `smbcs` floor — the implemented rule is `mbc_size`'s clamp of the preferred carrier into
+  `smbcs`..`lmbcs` (`crates/beam_alloc/src/allocator/core.rs:392-416`; `get_next_mbc_size` is the
+  legacy C name, not an item in this crate) — plus fresh-carrier page faults. The record carries the
+  jump pair in two spellings: `1 062 / 4 290` (`CONTEXT.md:258`) and `1 029 → 4 311`
+  (`CONTEXT.md:260`), so do not quote either as a settled pair.
 
 **Bench instrumentation**
 
