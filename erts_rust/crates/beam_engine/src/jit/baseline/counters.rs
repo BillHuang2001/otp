@@ -66,7 +66,8 @@
 //!
 //! Both directions of the cache are **partial** — `spill` stores a subset of the block's
 //! cache and `fill` reloads the registers the continuation can still observe
-//! (`Allocation::fill_slots`, its block-local liveness unioned with the write set) — so a
+//! (`Allocation::fill_slots`: its block-local liveness unioned with the inline write set of
+//! the instruction *at* that pc) — so a
 //! single measured run has to yield *every* model's count at once. Each `record_*` sees
 //! only the count it was handed (that is all `spill`/`fill` know per call), so it records
 //! that count and queues the site; [`record_block`] — which is handed the whole
@@ -160,6 +161,21 @@ pub(crate) struct Counters {
     /// [`ResolvedFunction`](super::ResolvedFunction) skips whenever it stays inside one
     /// function. Counted only on the lazy layout: an eager artifact resolves nothing.
     pub(crate) lazy_function_resolutions: u64,
+    /// **Cross-function** in-block transfers that reached the artifact — the shape
+    /// [`super::runtime::cross_function_entry`] pays a
+    /// [`CompiledModule::native_entry_tables`](super::code::CompiledModule::native_entry_tables)
+    /// for: a call into another function of the module (whose blocks are another
+    /// executable mapping of the same lazy artifact) and the return the callee does back
+    /// into the caller. Every one of them resolves a function the published
+    /// [`EntryTables`](super::runtime::EntryTables) does not describe.
+    pub(crate) cross_function_resolutions: u64,
+    /// Of those, how many the per-run
+    /// [`CrossEntry`](super::runtime::CrossEntry) memo answered **without** touching the
+    /// artifact (no `RefCell` probe, no `Rc` clone, no per-function table build). This
+    /// is the count the memo removes from
+    /// [`cross_function_resolutions`](Counters::cross_function_resolutions); the two are
+    /// disjoint (a transfer records exactly one of them).
+    pub(crate) cross_function_memo_hits: u64,
     /// Block-ABI words the driver had to decode (a block ran and returned).
     pub(crate) driver_round_trips: u64,    /// Driver iterations with no native entry: one interpreter step each.
     pub(crate) driver_interp_steps: u64,
@@ -266,11 +282,12 @@ pub(crate) struct Counters {
     pub(crate) spill_stores_full: u64,
     /// Fill sites by kind ([`FillSite`]) — the number of `fill` calls.
     pub(crate) fill_calls_by_site: BTreeMap<FillSite, u64>,
-    /// Fill register loads by kind under the liveness model: Σ `fill_slots(pc).len()`.
+    /// Fill register loads by kind under the observable model: Σ `fill_slots(pc).len()`
+    /// (block-local liveness ∪ the instruction-at-`pc`'s inline write set).
     pub(crate) fill_registers_by_site: BTreeMap<FillSite, u64>,
     /// Fill register loads by kind under the previous full-cache model: Σ `slots.len()`.
     pub(crate) fill_registers_by_site_full: BTreeMap<FillSite, u64>,
-    /// Total fill register loads under the liveness model (Σ `fill_slots(pc).len()`).
+    /// Total fill register loads under the observable model (Σ `fill_slots(pc).len()`).
     pub(crate) fill_registers: u64,
     /// Total fill register loads under the previous full-cache model (Σ `slots.len()`).
     pub(crate) fill_registers_full: u64,
@@ -372,6 +389,18 @@ pub(crate) fn record_ext_declined() {
 /// A `jit_ext_call` that fell back to the full interpreter step.
 pub(crate) fn record_ext_fallback() {
     with(|c| c.ext_call_fallback += 1);
+}
+
+/// A **cross-function** in-block transfer that had to resolve its target function
+/// through the artifact ([`super::runtime::cross_function_entry`]'s memo miss).
+pub(crate) fn record_cross_function_resolution() {
+    with(|c| c.cross_function_resolutions += 1);
+}
+
+/// A cross-function in-block transfer answered from the per-run
+/// [`CrossEntry`](super::runtime::CrossEntry) memo.
+pub(crate) fn record_cross_function_memo_hit() {
+    with(|c| c.cross_function_memo_hits += 1);
 }
 
 /// An `enter_compiled_cached` lookup; `hit` is whether a compiled entry was found.
@@ -509,7 +538,8 @@ pub(crate) fn record_spill(site: SpillSite, n: u64) {
 ///
 /// `fill` is **partial** ([`super::emit::regs::fill`]): it reloads only the registers a
 /// helper at that `pc` can still be observed through (the continuation's block-local
-/// liveness unioned with the block's write set), so `n` is the **new** load count. The
+/// liveness unioned with the instruction at that `pc`'s own inline write set), so `n` is the
+/// **new** load count. The
 /// **old** (full-cache) count is `slots.len()`, which only the enclosing block knows — so
 /// the site is queued for [`record_block`] to attribute it, exactly as
 /// [`record_spill`] does.
@@ -685,7 +715,7 @@ mod tests {
             ..Default::default()
         };
         // Three fill sites in the block: the prologue's whole-cache load (4) and two
-        // partial post-helper refills (1 and 0 registers — the liveness model).
+        // partial post-helper refills (1 and 0 registers — the observable model).
         record_fill(FillSite::Prologue, allocation.slots.len() as u64);
         record_fill(FillSite::Helper, 1);
         record_fill(FillSite::Helper, 0);

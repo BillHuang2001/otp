@@ -59,12 +59,13 @@
 //!
 //! [`fill`] is **partial**: it reloads only the cached registers a helper at that `pc`
 //! can still be observed through — the block-local liveness set of the continuation
-//! unioned with the block's write set ([`super::liveness::fill_sets`], and see that
-//! module for why the write set is part of the rule). A cached register left out of the
+//! unioned with the **instruction's own** inline write set ([`super::liveness::fill_sets`],
+//! and see that module for why the write set is part of the rule, and why it is the `pc`'s
+//! rather than the block's). A cached register left out of the
 //! fill set keeps a stale word, which is safe because it is never observed: a later
 //! **read** through that machine register would make the register live at that helper
 //! (so it is in the set), and every **store** of a cached register stores exactly the
-//! write set, which the fill set always contains.
+//! dirty set, whose entries are always in the fill set at the `pc` that dirtied them.
 
 use beam_common::Result;
 
@@ -175,9 +176,9 @@ pub(crate) struct Allocation {
     ///
     /// A cached register the block **writes before it reads** is not loaded: the writing
     /// instruction sets its machine register (never `machine.x`), and every later store of
-    /// that register stores the write set, which the fill set always contains — so the
-    /// stale machine register is only ever overwritten before it is read. Loading it would
-    /// be a redundant load of a word the block immediately replaces.
+    /// that register stores the dirty set, whose entries were all refilled at the `pc` that
+    /// dirtied them — so the stale machine register is only ever overwritten before it is
+    /// read. Loading it would be a redundant load of a word the block immediately replaces.
     ///
     /// `None` (a synthetic `Allocation` a unit test built directly) conservatively means
     /// the **whole** cache, which is the pre-live-in model.
@@ -247,7 +248,8 @@ impl Allocation {
     /// `(x-register index, machine register)` pairs.
     ///
     /// The set is the block-local liveness of the continuation at `pc` unioned with the
-    /// block's write set ([`super::liveness::fill_sets`]); a table that does not cover
+    /// **instruction at `pc`**'s own inline write set (the `pc`-local join rule —
+    /// [`super::liveness::fill_sets`]); a table that does not cover
     /// `pc` (an empty one — a synthetic allocation from a unit test) conservatively
     /// means the **whole** cache, which is the pre-liveness model.
     pub(crate) fn fill_slots(&self, pc: u32) -> Vec<(u32, Reg)> {

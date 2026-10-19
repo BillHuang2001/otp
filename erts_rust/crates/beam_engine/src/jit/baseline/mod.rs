@@ -203,6 +203,7 @@ use crate::machine::{Machine, RunOutcome};
 use crate::Step;
 
 mod bif_helper;
+mod bitstr;
 mod call;
 mod code;
 mod emit;
@@ -220,8 +221,13 @@ pub(crate) mod counters;
 mod census;
 
 #[cfg(test)]
+mod bitstr_tests;
+
+#[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod cross_tests;
 #[cfg(test)]
 #[path = "tail_exit_tests.rs"]
 mod tail_exit_tests;
