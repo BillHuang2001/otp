@@ -72,7 +72,8 @@ use crate::nif::types::{ErlNifEnv, ErlNifEvent};
 /// hook returns this enum rather than an `Option<Eterm>`:
 ///
 /// * [`NifMonitorResult::Armed`] — the C's `0` (`:4010`): the monitor was armed and `*monitor` was
-///   filled with the 3-word internal-reference block the payload names.
+///   filled with the whole internal-reference block the payload names (this tree's frozen 4-word M1
+///   block, `REF_THING_BYTES` bytes).
 /// * [`NifMonitorResult::NotAlive`] — the C's `1` (`:3976` for an `enif_set_pid_undefined` target,
 ///   `:4004` when the monitor signal cannot be sent because the target is already dead). The caller's
 ///   holder is left **untouched**.

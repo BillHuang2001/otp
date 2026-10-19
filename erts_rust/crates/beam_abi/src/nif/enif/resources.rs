@@ -119,7 +119,7 @@
 //!    is unaffected: the create branch reports `CREATE` either way.
 //! 6. **The `ERL_NIF_SELECT_STOP` (`stop`) callback is stored but never invoked** (it is driven by
 //!    `beam_io`, which is not wired to this crate). The `down` callback **is** invoked: the registry
-//!    carries the C's per-object monitor tree as one table keyed by the 24-byte reference block
+//!    carries the C's per-object monitor tree as one table keyed by the stored reference block
 //!    ([`Registry::monitors`], owned by [`monitors`]), [`deliver_resource_down_id`] reproduces
 //!    `erts_fire_nif_monitor` (`erl_nif.c:3058-3115`) and [`Registry::forget_object`] cancels a dying
 //!    object's monitors silently (the C's `dtor_demonitor`, `:2940-2948`). The registry also exposes
@@ -416,7 +416,7 @@ struct Registry {
     /// stale pointer never resolves.
     objects: HashSet<usize>,
     /// The C's per-resource monitor tree (`rsrc->monitors->root`), as **one** process-wide table keyed
-    /// by the 24-byte reference block an arm stored ([`MonitorId`]).
+    /// by the reference block an arm stored ([`MonitorId`]).
     ///
     /// It lives here — under the same lock as `types`/`terms`/`objects` — rather than behind its own
     /// mutex: the delivery path has to consult `objects` and the header refcount while holding it, and

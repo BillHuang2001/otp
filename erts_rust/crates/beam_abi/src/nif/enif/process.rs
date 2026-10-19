@@ -44,22 +44,33 @@
 //! | `enif_make_monitor_term` | an ordinary internal reference holding the monitor's payload (`:4013-4017`) |
 //! | `enif_schedule_nif` | the term the scheduled call will produce; `badarg` for `argc > MAX_ARG` (`:3569`) or a bad `flags` (`:3597`) |
 //!
-//! # The monitor payload is the C's reference block
+//! # The monitor payload is the tree's internal-reference block
 //!
 //! `ErlNifMonitor` is `typedef ErlDrvMonitor ErlNifMonitor`, an opaque `unsigned char data[32]`
-//! that carries an *ordinary internal reference*: `erts_ref_to_driver_monitor` byte-copies
-//! `ERTS_REF_THING_SIZE * sizeof(Eterm)` (**24** bytes — the 3-word `[header, w1, w2]` block) into
-//! it and `erts_driver_monitor_to_ref` copies it back onto a heap and re-tags the pointer
-//! (`io.c:6994-7010`). This file reproduces that exactly, so an `ErlNifMonitor` produced here is
-//! byte-identical to the C's and [`enif_make_monitor_term`] really returns an internal reference:
+//! that carries an *ordinary internal reference*: `erts_ref_to_driver_monitor` byte-copies the
+//! reference block into it and `erts_driver_monitor_to_ref` copies it back onto a heap and re-tags
+//! the pointer (`io.c:6994-7010`).
 //!
-//! * [`enif_monitor_process`] stores the 3-word block of the internal reference the host hands over
-//!   — [`NifHost::monitor_process_result`]'s `Armed(term)`, or the legacy
+//! The C's block is `ERTS_REF_THING_SIZE * sizeof(Eterm)` = **24** bytes, because in the C the
+//! three packed `num[]` ids of `ErtsORefThing` (`erl_term.h:990`) hold the whole reference identity.
+//! **This tree does not build that block.** The frozen internal-reference thing is the 4-word M1
+//! block `[make_header(3, REF_SUBTAG), node, serial, id]`
+//! (`beam_term::boxed::{write_internal_ref, INTERNAL_REF_WORDS}`, which `beam_process::MonitorRef`,
+//! `beam_bifs`'s `make_ref_thing` and `beam_rt` all mint), whose identity lives in **word 3** while
+//! words 1..2 (`node`, `serial`) are pinned to `make_small(0)`. So the block copied here is the
+//! whole **32** bytes of it — `REF_THING_BYTES` (`REF_THING_WORDS` = 4 machine words), which fills
+//! the `ErlNifMonitor` payload ([`MONITOR_BYTES`] = `sizeof(void *) * 4` = 32) exactly. Copying only
+//! the C's 24 bytes would drop the id, leaving every monitor's block byte-identical.
+//!
+//! * [`enif_monitor_process`] stores the whole 4-word block of the internal reference the host hands
+//!   over — [`NifHost::monitor_process_result`]'s `Armed(term)`, or the legacy
 //!   [`NifHost::monitor_process`]'s term (the C's `erts_make_ref_in_buffer`). The hook must
-//!   therefore return an internal reference; anything else is refused as `1` ("could not
-//!   establish") rather than stored, so no un-reconstructable payload is ever fabricated.
-//! * Bytes 24..32 are zeroed (the C leaves them untouched and never reads them), and
-//!   [`enif_compare_monitors`], like the C, compares only the first 24.
+//!   therefore return an internal reference of the frozen shape (header arity
+//!   `INTERNAL_REF_PAYLOAD_WORDS`); anything else is refused as `1` ("could not establish") rather
+//!   than stored, so no un-reconstructable payload is ever fabricated.
+//! * There is no zeroed tail: the block is the whole 32-byte payload, so
+//!   [`enif_compare_monitors`] compares every byte of the holder — and therefore two monitors armed
+//!   from different references stay distinct.
 //!
 //! # Documented substitutions — never a wrong value, never a crash
 //!
@@ -105,7 +116,8 @@
 //!   term / `1`) instead of faulting.
 //! * **`enif_compare_monitors` with a `NULL` operand** answers `0` for two nulls and `-1`/`1` for
 //!   exactly one (the C reads through the pointer and faults). Non-null operands are ordered
-//!   `memcmp`-style over the C's 24 bytes, byte for byte.
+//!   `memcmp`-style over the whole stored reference block ([`REF_THING_BYTES`] bytes, the
+//!   `ErlNifMonitor` payload), byte for byte.
 
 use super::*;
 
@@ -134,19 +146,30 @@ const DEMONITOR_REMOVED: c_int = 0;
 /// The C's "the monitor could not be identified" code (`erl_nif.c:4043-4044`).
 const DEMONITOR_NOT_FOUND: c_int = 1;
 
-/// `ERTS_REF_THING_SIZE` (`erl_term.h:990`) — an ordinary internal reference on LP64 is
-/// `ErtsORefThing { Eterm header; uint32 num[3]; uint32 marker; }`, i.e. 3 machine words.
-const REF_THING_WORDS: usize = 3;
+/// The word count of the internal-reference block copied into an `ErlNifMonitor`.
+///
+/// The C's `ERTS_REF_THING_SIZE` (`erl_term.h:990`) is `3` — `ErtsORefThing { Eterm header;
+/// uint32 num[3]; uint32 marker; }`, whose three packed `num[]` ids hold the whole reference
+/// identity. This tree builds a different thing: the frozen 4-word M1 internal reference
+/// `[make_header(3, REF_SUBTAG), node, serial, id]`
+/// (`beam_term::boxed::{INTERNAL_REF_WORDS, write_internal_ref}`), whose identity lives in word 3
+/// while `node`/`serial` are pinned to `make_small(0)`. So the block this crate must copy is the
+/// frozen block's whole word count — anything less would drop the id and make two distinct
+/// monitors compare equal.
+const REF_THING_WORDS: usize = prelude::INTERNAL_REF_WORDS;
 
-/// `ERTS_REF_THING_SIZE * sizeof(Eterm)` — the `ErlNifMonitor` bytes the C copies (`io.c:6994-7010`)
-/// and compares (`erl_nif.c:4057`). Also the key of the resource monitor tree
+/// The whole stored reference block: [`REF_THING_WORDS`] machine words, i.e. **32** bytes on LP64 —
+/// which fills the `ErlNifMonitor` payload ([`MONITOR_BYTES`]) exactly. This is the byte range the
+/// C copies (`io.c:6994-7010`) and compares (`erl_nif.c:4057`), widened from the C's 24 bytes to
+/// this tree's 4-word frozen block. Also the key of the resource monitor tree
 /// ([`super::resources::MonitorId`]), which is why the sibling monitor module reads it.
 pub(super) const REF_THING_BYTES: usize = REF_THING_WORDS * core::mem::size_of::<Eterm>();
 
 /// The `ErlNifMonitor` payload length, spelled as the type declares it (`sizeof(void *) * 4`).
 pub(super) const MONITOR_BYTES: usize = core::mem::size_of::<*mut c_void>() * 4;
 
-// `ERTS_CT_ASSERT(ERTS_REF_THING_SIZE*sizeof(Uint) <= sizeof(ErlDrvMonitor))` (`io.c:6996`).
+// The C's own assert is `ERTS_REF_THING_SIZE*sizeof(Uint) <= sizeof(ErlDrvMonitor)` (`io.c:6996`);
+// with this tree's 4-word block the block and the holder payload are the same 32 bytes.
 const _: () = assert!(REF_THING_BYTES <= MONITOR_BYTES);
 
 /// Populate the `ErlNifApi` slots this file owns (see the module docs).
@@ -167,7 +190,7 @@ pub(super) const fn populate(mut api: ErlNifApi) -> ErlNifApi {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The monitor payload — the C's 3-word reference block (`io.c:6994-7010`)
+// The monitor payload — the tree's internal-reference block (`io.c:6994-7010`)
 // ---------------------------------------------------------------------------------------------
 
 /// The first [`REF_THING_BYTES`] bytes of `monitor` — the reference block it carries (`None` for a
@@ -189,9 +212,11 @@ pub(super) unsafe fn monitor_block(monitor: *const ErlNifMonitor) -> Option<[u8;
 }
 
 /// The `ErlNifMonitor` **value** a C caller is handed for the reference block `block` — the C
-/// `erts_ref_to_driver_monitor` (`erl_nif.c:3105`, `:4008-4009`: the first
-/// `ERTS_REF_THING_SIZE * sizeof(Eterm)` bytes of the holder are the reference block, the rest is
-/// left zero).
+/// `erts_ref_to_driver_monitor` (`erl_nif.c:3105`, `:4008-4009`): the reference block is copied into
+/// the holder and the rest of the payload is left zero.
+///
+/// The block is the whole [`REF_THING_BYTES`]-byte frozen reference block, so it fills the
+/// [`MONITOR_BYTES`]-byte payload exactly (a copy, never a borrow).
 ///
 /// This is the one place the block→holder mapping is written; [`store_monitor`] writes it into a
 /// caller's pointer and the `down` operand builder ([`super::resources`]'s monitor module) takes the
@@ -204,8 +229,9 @@ pub(super) fn holder_from_block(block: &[u8; REF_THING_BYTES]) -> ErlNifMonitor 
 
 /// Store `block` in `monitor` (the C `erts_ref_to_driver_monitor`).
 ///
-/// A null `monitor` is legal in the C (`if (monitor) …`, `erl_nif.c:4007`). The bytes after the
-/// reference block are zeroed; the C leaves them untouched and never reads them.
+/// A null `monitor` is legal in the C (`if (monitor) …`, `erl_nif.c:4007`). The block is the whole
+/// [`MONITOR_BYTES`]-byte payload, so every byte of the holder is written (on a narrower block the
+/// bytes past it are zeroed; the C leaves them untouched and never reads them).
 fn store_monitor(monitor: *mut ErlNifMonitor, block: &[u8; REF_THING_BYTES]) {
     if monitor.is_null() {
         return;
@@ -215,8 +241,17 @@ fn store_monitor(monitor: *mut ErlNifMonitor, block: &[u8; REF_THING_BYTES]) {
     unsafe { monitor.write(holder_from_block(block)) };
 }
 
-/// The 3-word reference block of the internal reference `term` (`None` when it is not one) — the C's
+/// The whole reference block of the internal reference `term` (`None` when it is not one) — the C's
 /// `is_internal_ordinary_ref(ref)` + `internal_ref_val(ref)` pair (`io.c:6997-6999`).
+///
+/// The block is the frozen 4-word M1 internal reference `[header, node, serial, id]`
+/// (`beam_term::boxed::INTERNAL_REF_WORDS`), so its header **arity** must be
+/// `INTERNAL_REF_PAYLOAD_WORDS` (3): `is_internal_ref` tests the subtag only and is therefore also
+/// true for the C `ErtsORefThing` (header arity 2, 3 words), whose block this crate must not copy —
+/// copying [`REF_THING_BYTES`] out of a 3-word block would read past it. That arity check is the
+/// same precondition `beam_term::boxed::internal_ref_id` enforces. `None` is the sound refusal: the
+/// caller answers the C's `1` (`enif_monitor_process`) or `badarg`
+/// (`enif_make_monitor_term`) rather than storing or rebuilding an unusable payload.
 pub(super) fn ref_block_of(term: Eterm) -> Option<[u8; REF_THING_BYTES]> {
     if !is_term_word(term) {
         return None;
@@ -226,9 +261,16 @@ pub(super) fn ref_block_of(term: Eterm) -> Option<[u8; REF_THING_BYTES]> {
         return None;
     }
     let p = prelude::boxed_val(term);
+    // SAFETY: `is_internal_ref` confirmed a boxed term, so its header word is a live, aligned term
+    // word.
+    if prelude::header_arity(unsafe { *p }) != prelude::INTERNAL_REF_PAYLOAD_WORDS {
+        // A C-layout ref block (arity 2): its block is one word shorter than
+        // `REF_THING_BYTES`, so refuse it instead of reading past it.
+        return None;
+    }
     let mut block = [0u8; REF_THING_BYTES];
-    // SAFETY: `term` is a live internal reference, so `boxed_val` points at its `[header, w1, w2]`
-    // block, which is exactly `REF_THING_BYTES` bytes long.
+    // SAFETY: the header arity says the block has `INTERNAL_REF_PAYLOAD_WORDS` payload words, so
+    // `[header, node, serial, id]` is exactly `REF_THING_BYTES` bytes long.
     unsafe { core::ptr::copy_nonoverlapping(p.cast::<u8>(), block.as_mut_ptr(), REF_THING_BYTES) };
     Some(block)
 }
@@ -236,13 +278,21 @@ pub(super) fn ref_block_of(term: Eterm) -> Option<[u8; REF_THING_BYTES]> {
 /// Copy the reference block `block` onto `env`'s heap and return the tagged internal reference (the C
 /// `erts_driver_monitor_to_ref`).
 ///
+/// The allocation is [`REF_THING_WORDS`] words and the block is exactly that long, so the rebuilt
+/// term is a valid frozen 4-word M1 internal reference (`[header, node, serial, id]`) — the same
+/// shape `beam_term::boxed::write_internal_ref` builds. Before the block was widened to the frozen
+/// block's word count this under-allocated (3 words for a header claiming 4), so a term rebuilt
+/// through `enif_make_monitor_term` had its id word past the allocation; that out-of-bounds read is
+/// closed by the widened allocation copying the whole block.
+///
 /// # Safety
 ///
 /// `env` must be a live env (the returned term points into its host's heap).
 unsafe fn ref_term_from_block(env: &mut NifEnv, block: &[u8; REF_THING_BYTES]) -> Option<Eterm> {
     // SAFETY: a bump allocation of `REF_THING_WORDS` words; exhaustion is reported as `None`.
     let hp = unsafe { alloc(env, REF_THING_WORDS) }?;
-    // SAFETY: `hp` addresses `REF_THING_WORDS` freshly reserved, exclusively owned words.
+    // SAFETY: `hp` addresses `REF_THING_WORDS` freshly reserved, exclusively owned words, and the
+    // block is exactly `REF_THING_WORDS * size_of::<Eterm>()` bytes.
     unsafe { core::ptr::copy_nonoverlapping(block.as_ptr(), hp.cast::<u8>(), REF_THING_BYTES) };
     Some(prelude::make_boxed(hp))
 }
@@ -489,8 +539,9 @@ pub unsafe extern "C" fn enif_is_port_alive(
 /// 2. **`1`** ([`MONITOR_TARGET_DEAD`]) for a null `target_pid`, an `enif_set_pid_undefined` pid
 ///    (`:3975-3976`), or a target the host reports as already dead (`:4004`). `*monitor` is left
 ///    untouched — the C only stores on the success path (`:4007`).
-/// 3. **`0`** ([`MONITOR_ESTABLISHED`]) after storing the monitor's 3-word reference block in
-///    `*monitor` (`:4007-4010`); a null `monitor` pointer is legal there and is honoured.
+/// 3. **`0`** ([`MONITOR_ESTABLISHED`]) after storing the monitor's reference block — the whole
+///    [`REF_THING_BYTES`]-byte frozen internal-reference block — in `*monitor` (`:4007-4010`); a null
+///    `monitor` pointer is legal there and is honoured.
 ///
 /// The arm itself is the host's: [`NifHost::monitor_process_result`] is consulted first (it can
 /// express all three outcomes), and when it answers `None` the legacy single-outcome
@@ -606,9 +657,13 @@ pub unsafe extern "C" fn enif_demonitor_process(
 
 /// `int enif_compare_monitors(const ErlNifMonitor *monitor1, const ErlNifMonitor *monitor2);`
 ///
-/// A `memcmp`-style ordering over the monitor payload: the C compares exactly
-/// `ERTS_REF_THING_SIZE * sizeof(Eterm)` = 24 bytes (`erl_nif.c:4054-4059`), leaving the rest of the
-/// 32-byte holder outside the comparison.
+/// A `memcmp`-style ordering over the stored monitor payload, byte for byte (`erl_nif.c:4054-4059`).
+///
+/// The C compares `ERTS_REF_THING_SIZE * sizeof(Eterm)` = 24 bytes because its 3 packed `num[]` ids
+/// carry the whole reference identity. Here the compared range is the whole stored reference block —
+/// [`REF_THING_BYTES`] bytes, the entire `ErlNifMonitor` payload — because this tree's frozen 4-word
+/// M1 block keeps the identity in word 3; comparing fewer bytes would make two distinct monitors
+/// compare equal.
 ///
 /// # Safety
 ///
@@ -638,8 +693,9 @@ pub unsafe extern "C" fn enif_compare_monitors(
 /// `ERL_NIF_TERM enif_make_monitor_term(ErlNifEnv* env, const ErlNifMonitor*);`
 ///
 /// Builds an ordinary internal reference holding the monitor's payload — the C's
-/// `alloc_heap(env, ERTS_REF_THING_SIZE)` + `erts_driver_monitor_to_ref`. `badarg` is returned (never
-/// a fabricated term) for an unusable `env` or a null `monitor`.
+/// `alloc_heap(env, ERTS_REF_THING_SIZE)` + `erts_driver_monitor_to_ref`, with this tree's frozen
+/// block width ([`REF_THING_WORDS`] words, so the id word is materialised). `badarg` is returned
+/// (never a fabricated term) for an unusable `env` or a null `monitor`.
 ///
 /// # Safety
 ///
