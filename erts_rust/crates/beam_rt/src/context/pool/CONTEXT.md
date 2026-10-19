@@ -103,8 +103,11 @@ The measurement narrative behind these entries is in [`../../../M1_GAPS.md`](../
 
 ## Test Strategy
 
-The suites below read the `#[cfg(test)] mod notes` structural counters (`alias_marks`/`alias_snapshot`/
-`alias_copy_pool`, the copy site's `(mark, used)`), so a change in ordering is observable.
+The suites below read the `#[cfg(test)] mod notes` structural counters — `note_alias_mark`/`note_alias_copy`/
+`note_alias_copy_pool`/`note_alias_refusal`, surfaced as `alias_marks`/`alias_snapshot`/`alias_copy_pool`, the copy
+site's `(mark, used)` — so a change in ordering is observable.
+The non-aliased cascade beside them (`result_is_foreign_container` / `graph_holds_reference` / `move_container`) is
+unchanged, and `reset_to`/`put_bif_heap` run on every path.
 
 * Colocated units in `tests.rs` + `test_support.rs`: the `uses_*` predicates (incl. their pairwise disjointness and the `uses_memory_hook`/`uses_fun_identity`/`uses_export_gate` gates), the `install_tables` rule (`tables_capable_names_exactly_the_table_registry_seam_consumers`), `RecordBridge` over a loaded module's `Recs`, `NodeIdentity`'s internal-pid `NEW_PID_EXT` encoding, `FunIdentityBridge`'s clean-miss contract, the nested-BIF seams, `PendingInterner` and the export gate's six cases.
   `a_table_less_context_grows_its_pooled_bif_region_instead_of_exhausting_it` pins the frontier growth (it fails with the growth branch disabled).
@@ -136,6 +139,7 @@ Each entry is the module's one-line purpose; the mechanics companion is [`../IMP
   and the two destinations `move_result_into_process_heap`/`move_result_into_runtime_store`, and the three-way
   aliased-result rule.
 * `calls/alias_tests.rs` → the aliased copy-out suite (6 cases).
+* The alias witness's reason for the copy-first ordering: those words are `beam_ets`'s `TermStore`'s (`free` recycles exact-fit runs), and a chunked `select` mixes them with a pool-built `{Objects, Cont}` tuple, so the rewind must not precede the copy.
 * `../runtime.rs` → the stores themselves (`arena`, `bif_heaps`, `eval_heap`/`eval_heap_retired`, `eval_off_heap`).
 * Read-only siblings: [`../calls/CONTEXT.md`](../calls/CONTEXT.md) (the dispatch that produces the result), [`../gc/CONTEXT.md`](../gc/CONTEXT.md) (the doors that make a copied result collectable), [`../../../../beam_message/CONTEXT.md`](../../../../beam_message/CONTEXT.md) (`copy_struct` + `OffHeapTable`).
 
