@@ -52,6 +52,24 @@
 //! | combined mask | `READ \| WRITE` on a pipe write end, and on a read end with a byte queued | `ready_output` and `ready_input` respectively — the direction that really became ready |
 //! | error interest | `READ \| ERROR` on a TCP socket whose peer sent an `SO_LINGER`-RST | `code=0`, then `first={delivered,ready_input}` and `second={delivered,ready_error}`, and nothing after the two |
 //! | error-only interest | `ERROR` alone on the same kind of socket | `outcome={delivered,ready_error}`, one-shot |
+//! | released then ready | `arm_keep/0` (a registration minting **no** term) then `release/0`, i.e. the NIF drops its own reference, then the write | `dtor_after_release=0` (the interest's reference holds the object), `written=1`, `outcome={delivered,ready_input}`, and the object still alive in the delivered term's own hand (`final_dtor=0`, the oracle's reading too) |
+//! | STOP after release | the above, then `ERL_NIF_SELECT_STOP` | `stop=17` = `STOP_CALLED \| READ_CANCELLED`, `dtor_after_stop=1` (the interest's reference was the last one, and it is given back **once**), `outcome=timeout`, `stop2=1` |
+//! | owner death | a spawned owner arms and drops its own reference in one call, then exits | `dtor_after_death=1` (the liveness prune gave the interest's reference back), `outcome=timeout` |
+//!
+//! The **codes and the delivery** are pinned on both runtimes; the **destructor counts** are pinned
+//! on this runtime only, for the reason in "The destructor's timing" below.
+//!
+//! # The destructor's timing, and why the counts are this side's alone
+//!
+//! The C runs a resource type's destructor as **deferred aux work** — `nif_resource_dtor_prologue`
+//! schedules it and answers "don't free" (`erts/emulator/beam/erl_nif.c:2961-2971`), so the
+//! destructor may run at any later scheduling point — while this runtime's runs **synchronously**, at
+//! the release that takes the reference count to zero (the documented `beam_abi` deviation: see
+//! `src/nif/enif/resources_keep.rs` → "The destructor is synchronous").
+//! A destructor count read *immediately* after a release or a stop is therefore **exact here and racy
+//! on the oracle**, which is why every case prints the oracle's counts (the [`run_case`] probe is
+//! repeated where the count is the interesting half, so the spread is visible rather than sampled
+//! once) and asserts them only on this runtime.
 //!
 //! # What this suite does not pin
 //!
@@ -59,7 +77,6 @@
 //!
 //! * The resource type's `stop` callback is never invoked by this runtime, so
 //!   `ERL_NIF_SELECT_STOP_SCHEDULED` is never emitted.
-//! * An object released before its readiness arrives delivers nothing.
 //! * `ERL_NIF_SELECT_NOTSUP` is unreachable by construction.
 //! * The delivered `{select, ResourceTerm, Ref, Event}` matches the arming `Ref` because a copy keeps a
 //!   reference's id — a term identity, not a pointer identity (the fixture's `delivered` clause binds
@@ -77,6 +94,15 @@
 //! [`erl_include_dir`]/[`cc`]/[`cc_available`] mirror `tests/nif.rs`'s (resolving the header is a
 //! filesystem question, never "run `erl` and see"); they are private to this file so the suite stays
 //! self-contained.
+//!
+//! # Why this file is long
+//!
+//! It is one contract's whole surface (A.3's `enif_select`) in one place: the fixture's C and Erlang
+//! are **string constants** in this file (a `.c`/`.erl` on disk would be a committed artifact the two
+//! runtimes would have to agree to rebuild), so the C body and the caller module's clauses each take
+//! a few hundred lines that no shared helper could shrink, and then one `#[test]` per case carries
+//! the pinning itself. Splitting it would mean a second copy of the toolchain discovery and of
+//! [`build_fixture`], which is worse than the length.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -111,12 +137,27 @@ const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
 /// runtimes. The registrations themselves name a **genuine** resource of the library's own type
 /// (`obj`), exactly as the ABI (and the C) require.
 ///
-/// **Why the resource is never released.** A `STOP`, and the C's own `state->driver.stop.resource`,
-/// address the object by pointer, so the fixture keeps the allocator's one reference for the whole
-/// (short-lived) run instead of releasing it — a deliberate, documented leak of one small block.
-/// The resource type is also opened with a `stop` callback (`enif_open_resource_type_x`): the C's
-/// `ERL_NIF_SELECT_STOP` path calls `erts_resource_stop` unconditionally (`erl_check_io.c:1530`), so
-/// a library without one would crash the oracle rather than measure anything.
+/// **Why the `arm_*` cases never release.** A `STOP`, and the C's own `state->driver.stop.resource`,
+/// address the object by pointer, so those `arm_*` exports keep the allocator's one reference for the
+/// whole (short-lived) run instead of releasing it — a deliberate, documented leak of one small block.
+/// The released-then-ready family (`arm_keep/0` + `release/0`, see the Rust-side docs below) is what
+/// exercises the release, and it needs its own arming shape to do so safely: the second `STOP` of
+/// `stop_after_release_case/1` names the descriptor with a **sentinel** object, because the C's
+/// `enif_select` dereferences `DATA_TO_RESOURCE(obj)` before it looks the descriptor up and the
+/// interest's object is already destroyed by then.
+/// The resource type is also opened with a `stop` callback
+/// (`enif_open_resource_type_x`): the C's `ERL_NIF_SELECT_STOP` path calls `erts_resource_stop`
+/// unconditionally (`erl_check_io.c:1530`), so a library without one would crash the oracle rather
+/// than measure anything.
+///
+/// **Why `arm_keep/0` mints no resource term.** `enif_make_resource` takes a reference the *term*
+/// owns, and this runtime drops a dead resource term's reference at the ordinal park-arm prune
+/// (contract A.3's term-release path, `src/context/gc/resources.rs`) — on its own schedule. A
+/// destructor count measured in the same call would then be a race against that prune, while the
+/// count this suite wants to pin is exactly "allocator(1) + interest keep(1)": with `arm_keep/0`'s
+/// plain `enif_select` and no mint, `release/0` leaves precisely the interest's reference and the
+/// object can only die at a disarm. The term-minting arming shape is already covered by the
+/// `arm/0` cases above.
 const SELECT_NIF_C: &str = r#"
 #include <erl_nif.h>
 #include <unistd.h>
@@ -135,9 +176,15 @@ static int armed_rd = -1;
 static int armed_wr = -1;
 static void* armed_obj = NULL;
 
+/* How many times pipe_dtor has run in this operating-system process. Every case runs in its own
+   process, so the count starts at zero in each probe. */
+static int dtor_count = 0;
+
 static void pipe_dtor(ErlNifEnv* env, void* obj) {
     pipe_pair* p = (pipe_pair*) obj;
     (void) env;
+    dtor_count++;
+    if (armed_obj == obj) armed_obj = NULL;
     if (p->rd >= 0) { close(p->rd); p->rd = -1; }
     if (p->wr >= 0) {
         if (armed_wr == p->wr) armed_wr = -1;
@@ -177,6 +224,37 @@ static ERL_NIF_TERM answer(ErlNifEnv* env, int code, pipe_pair* p, ERL_NIF_TERM 
     return enif_make_tuple_from_array(env, terms, 3);
 }
 
+/* The two-term answer {RawReturnCode, Ref} of the arm_*_keep exports, which mint no resource term
+   (see this file's "Why arm_keep/0 mints no resource term"). */
+static ERL_NIF_TERM keep_answer(ErlNifEnv* env, int code, ERL_NIF_TERM ref) {
+    ERL_NIF_TERM terms[2];
+    terms[0] = enif_make_int(env, code);
+    terms[1] = ref;
+    return enif_make_tuple_from_array(env, terms, 2);
+}
+
+/* A live resource of the library's own type, allocated on first use and never released. A STOP names
+   its object as the stop callback's operand and the C dereferences it (DATA_TO_RESOURCE(obj),
+   erl_check_io.c:1245), so a call addressing a descriptor whose interest object is already destroyed
+   must name something alive rather than the freed block. */
+static void* sentinel_obj(void) {
+    static void* sentinel = NULL;
+    if (sentinel == NULL) {
+        pipe_pair* p = (pipe_pair*) enif_alloc_resource(pipe_type, sizeof(pipe_pair));
+        if (p != NULL) {
+            p->rd = -1;
+            p->wr = -1;
+            sentinel = (void*) p;
+        }
+    }
+    return sentinel;
+}
+
+/* The object a STOP/CANCEL addresses: the interest's own while it is alive, else the sentinel. */
+static void* addressable_obj(void) {
+    if (armed_obj != NULL) return armed_obj;
+    return sentinel_obj();
+}
 /* One connected loopback TCP pair whose client has been closed with an SO_LINGER {1,0} reset, and
    the accepted socket in a fresh resource. The reset is what an ERROR interest is about. */
 static pipe_pair* new_reset_pair(int* accepted) {
@@ -312,22 +390,28 @@ static ERL_NIF_TERM arm_error_only(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
 /* stop/0: ERL_NIF_SELECT_STOP on the descriptor the last arm_* registered. */
 static ERL_NIF_TERM stop(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     ERL_NIF_TERM ref;
+    void* obj;
     (void) argc; (void) argv;
-    if (armed_obj == NULL) return enif_make_atom(env, "nothing_armed");
+    if (armed_rd < 0) return enif_make_atom(env, "nothing_armed");
+    obj = addressable_obj();
+    if (obj == NULL) return enif_make_atom(env, "nothing_armed");
     ref = enif_make_ref(env);
     return enif_make_int(env, enif_select(env, (ErlNifEvent) armed_rd,
-                                          ERL_NIF_SELECT_STOP, armed_obj, NULL, ref));
+                                          ERL_NIF_SELECT_STOP, obj, NULL, ref));
 }
 
 /* cancel/0: ERL_NIF_SELECT_CANCEL | ERL_NIF_SELECT_READ on the same descriptor. */
 static ERL_NIF_TERM cancel(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     ERL_NIF_TERM ref;
+    void* obj;
     (void) argc; (void) argv;
-    if (armed_obj == NULL) return enif_make_atom(env, "nothing_armed");
+    if (armed_rd < 0) return enif_make_atom(env, "nothing_armed");
+    obj = addressable_obj();
+    if (obj == NULL) return enif_make_atom(env, "nothing_armed");
     ref = enif_make_ref(env);
     return enif_make_int(env, enif_select(env, (ErlNifEvent) armed_rd,
                                           ERL_NIF_SELECT_CANCEL | ERL_NIF_SELECT_READ,
-                                          armed_obj, NULL, ref));
+                                          obj, NULL, ref));
 }
 
 /* poke/0: the one byte that makes the pipe's read end readable. */
@@ -340,6 +424,49 @@ static ERL_NIF_TERM poke(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     return enif_make_int(env, (int) n);
 }
 
+/* arm_keep/0: ERL_NIF_SELECT_READ on a fresh pipe, answering {Code, Ref} and minting no term. */
+static ERL_NIF_TERM arm_keep(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    pipe_pair* p;
+    ERL_NIF_TERM ref;
+    int code;
+    (void) argc; (void) argv;
+    p = new_pair();
+    if (p == NULL) return enif_make_atom(env, "pipe_failed");
+    ref = enif_make_ref(env);
+    code = enif_select(env, (ErlNifEvent) p->rd, ERL_NIF_SELECT_READ, (void*) p, NULL, ref);
+    return keep_answer(env, code, ref);
+}
+
+/* arm_keep_release/0: arm_keep/0's body followed by the NIF's own release of the object it
+   allocated, so one call arms an interest and drops the caller's own reference (the owner-death
+   case's shape). */
+static ERL_NIF_TERM arm_keep_release(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    pipe_pair* p;
+    ERL_NIF_TERM ref;
+    int code;
+    (void) argc; (void) argv;
+    p = new_pair();
+    if (p == NULL) return enif_make_atom(env, "pipe_failed");
+    ref = enif_make_ref(env);
+    code = enif_select(env, (ErlNifEvent) p->rd, ERL_NIF_SELECT_READ, (void*) p, NULL, ref);
+    enif_release_resource((void*) p);
+    return keep_answer(env, code, ref);
+}
+
+/* release/0: the NIF drops its OWN reference on the object it allocated — the C's
+   enif_release_resource (erl_nif.c:3170) — leaving only whatever the registration holds. */
+static ERL_NIF_TERM release(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    if (armed_obj == NULL) return enif_make_atom(env, "nothing_armed");
+    enif_release_resource(armed_obj);
+    return enif_make_atom(env, "released");
+}
+
+/* dtor/0: how many times pipe_dtor has run in this operating-system process. */
+static ERL_NIF_TERM dtor(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    return enif_make_int(env, dtor_count);
+}
 static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info) {
     ErlNifResourceFlags tried;
     ErlNifResourceTypeInit init;
@@ -365,6 +492,10 @@ static ErlNifFunc select_nif_funcs[] = {
     {"arm_read_both", 0, arm_read_both, 0},
     {"arm_error", 0, arm_error, 0},
     {"arm_error_only", 0, arm_error_only, 0},
+    {"arm_keep", 0, arm_keep, 0},
+    {"arm_keep_release", 0, arm_keep_release, 0},
+    {"release", 0, release, 0},
+    {"dtor", 0, dtor, 0},
     {"stop", 0, stop, 0},
     {"cancel", 0, cancel, 0},
     {"poke", 0, poke, 0}
@@ -377,7 +508,8 @@ ERL_NIF_INIT(select_nif, select_nif_funcs, load, NULL, NULL, NULL)
 const SELECT_NIF_ERL: &str = r#"%% Generated by `beam_rt/tests/nif_select.rs` (never committed).
 -module(select_nif).
 -export([init/1, arm/0, arm_custom/0, arm_write/0, arm_read_both/0,
-         arm_error/0, arm_error_only/0, stop/0, cancel/0, poke/0]).
+         arm_error/0, arm_error_only/0, arm_keep/0, arm_keep_release/0,
+         release/0, dtor/0, stop/0, cancel/0, poke/0]).
 init(Path) -> erlang:load_nif(Path, 0).
 arm() -> erlang:nif_error(not_loaded).
 arm_custom() -> erlang:nif_error(not_loaded).
@@ -385,6 +517,10 @@ arm_write() -> erlang:nif_error(not_loaded).
 arm_read_both() -> erlang:nif_error(not_loaded).
 arm_error() -> erlang:nif_error(not_loaded).
 arm_error_only() -> erlang:nif_error(not_loaded).
+arm_keep() -> erlang:nif_error(not_loaded).
+arm_keep_release() -> erlang:nif_error(not_loaded).
+release() -> erlang:nif_error(not_loaded).
+dtor() -> erlang:nif_error(not_loaded).
 stop() -> erlang:nif_error(not_loaded).
 cancel() -> erlang:nif_error(not_loaded).
 poke() -> erlang:nif_error(not_loaded).
@@ -400,12 +536,25 @@ poke() -> erlang:nif_error(not_loaded).
 /// must not match before the descriptor is poked. `wait_next/1` is one more bounded receive, for the
 /// cases that pin what does (and does not) follow the first notification.
 ///
+/// `kept_case/1` is the released-then-ready shape: `arm_keep/0` registers an interest without minting
+/// a term, `release/0` drops the NIF's own reference, and the descriptor's readiness must still be
+/// delivered because the **interest** holds a reference of its own. Its `final_dtor` reading, taken
+/// after the delivered notification has been received and one further bounded park, is the object's
+/// state once the term is what holds it: the delivered term took a reference of its own, so the
+/// destructor has **not** run — the same reading the oracle reports.
+/// `stop_after_release_case/1` is the same arming with a `STOP` instead of a delivery: the disarm
+/// gives the interest's reference back exactly once, so the object dies there and a second `STOP`
+/// finds the descriptor already gone. `owner_death_case/1` arms and releases *inside a spawned
+/// process* and lets that process exit, so the interest's reference is given back by the runtime's
+/// liveness prune instead of by a delivery or a stop.
+///
 /// Every export reaches the NIF through an **external** call (`select_caller` is a different module
 /// from `select_nif`), which is the dispatch point this runtime intercepts for NIFs.
 const SELECT_CALLER_ERL: &str = r#"%% Generated by `beam_rt/tests/nif_select.rs` (never committed).
 -module(select_caller).
 -export([deliver/1, stop_case/1, cancel_case/1, custom_case/1,
-         combined_write/1, combined_read/1, error_only_case/1, error_case/1]).
+         combined_write/1, combined_read/1, error_only_case/1, error_case/1,
+         kept_case/1, stop_after_release_case/1, owner_death_case/1]).
 wait_early(Ref) ->
     receive
         {select, _Resource, Ref, _Event} -> delivered_early
@@ -493,6 +642,49 @@ wait_next(Ref) ->
         Other -> {unexpected, Other}
     after 300 ->
         timeout
+    end.
+kept_case(Path) ->
+    ok = select_nif:init(Path),
+    {Code, Ref} = select_nif:arm_keep(),
+    io:format("code=~w~n", [Code]),
+    io:format("release=~w~n", [select_nif:release()]),
+    io:format("dtor_after_release=~w~n", [select_nif:dtor()]),
+    io:format("early=~w~n", [wait_early(Ref)]),
+    io:format("written=~w~n", [select_nif:poke()]),
+    io:format("outcome=~w~n", [wait_for_select(Ref)]),
+    receive after 100 -> ok end,
+    io:format("final_dtor=~w~n", [select_nif:dtor()]),
+    ok.
+stop_after_release_case(Path) ->
+    ok = select_nif:init(Path),
+    {Code, Ref} = select_nif:arm_keep(),
+    io:format("code=~w~n", [Code]),
+    io:format("release=~w~n", [select_nif:release()]),
+    io:format("dtor_after_release=~w~n", [select_nif:dtor()]),
+    io:format("stop=~w~n", [select_nif:stop()]),
+    io:format("dtor_after_stop=~w~n", [select_nif:dtor()]),
+    io:format("outcome=~w~n", [wait_for_select(Ref)]),
+    io:format("stop2=~w~n", [select_nif:stop()]),
+    ok.
+owner_death_case(Path) ->
+    ok = select_nif:init(Path),
+    Parent = self(),
+    _Child = spawn(fun() ->
+                           {ChildCode, ChildRef} = select_nif:arm_keep_release(),
+                           Parent ! {armed, ChildCode, ChildRef}
+                   end),
+    {Code, Ref} = await_armed(),
+    io:format("code=~w~n", [Code]),
+    io:format("dtor_after_arm=~w~n", [select_nif:dtor()]),
+    receive after 300 -> ok end,
+    io:format("dtor_after_death=~w~n", [select_nif:dtor()]),
+    io:format("outcome=~w~n", [wait_for_select(Ref)]),
+    ok.
+await_armed() ->
+    receive
+        {armed, Code, Ref} -> {Code, Ref}
+    after 1000 ->
+        {no_answer, no_ref}
     end.
 "#;
 
@@ -815,6 +1007,69 @@ fn run_case(label: &str, function: &str) -> Option<Answers> {
     })
 }
 
+/// As [`run_case`], but over **one** fixture the oracle probe is repeated `probes` times, and the
+/// `keys` of every run are printed — the destructor-count half of a case, whose value is not a
+/// deterministic function of the program on the oracle (module docs, "The destructor's timing").
+///
+/// The [`Answers`] carry this runtime's one run and the oracle's **first**, so the pinned comparisons
+/// read exactly as [`run_case`]'s do; the returned `Vec` holds one `key=value …` reading per oracle
+/// run, the first of which is that same first run.
+fn run_repeated(
+    label: &str,
+    function: &str,
+    probes: usize,
+    keys: &[&str],
+) -> Option<(Answers, Vec<String>)> {
+    let fixture = build_fixture(label)?;
+    let Some(rust) = invoke_rust(&fixture, function) else {
+        skip_loudly(
+            "nif_select",
+            &format!(
+                "the built beam_rt binary did not complete {function} inside the probe bound"
+            ),
+        );
+        fixture.cleanup();
+        return None;
+    };
+    let Some(oracle) = require_oracle("nif_select") else {
+        fixture.cleanup();
+        return None;
+    };
+    let probes = probes.max(1);
+    let mut outputs = Vec::with_capacity(probes);
+    for _ in 0..probes {
+        let Some(stdout) = invoke_oracle(&fixture, &oracle, function) else {
+            skip_loudly(
+                "nif_select",
+                "the oracle did not complete the probe (see the warning above)",
+            );
+            fixture.cleanup();
+            return None;
+        };
+        outputs.push(stdout);
+    }
+    fixture.cleanup();
+    let readings: Vec<String> = outputs
+        .iter()
+        .map(|stdout| {
+            keys.iter()
+                .map(|key| format!("{key}={}", field(stdout, key).unwrap_or("<missing>")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    for (n, reading) in readings.iter().enumerate() {
+        println!("oracle probe {}/{}: {reading}", n + 1, probes);
+    }
+    let oracle_stdout = outputs.remove(0);
+    Some((
+        Answers {
+            rust,
+            oracle: oracle_stdout,
+        },
+        readings,
+    ))
+}
 // ---------------------------------------------------------------------------------------------
 // Reading the answers
 // ---------------------------------------------------------------------------------------------
@@ -873,9 +1128,26 @@ impl Answers {
     }
 }
 
+/// A key's value on **this** runtime only, as an integer — the destructor-count half of a case, which
+/// is asserted here and only printed for the oracle (module docs, "The destructor's timing").
+///
+/// A missing or unparsable line is a loud skip naming this side, exactly like [`Answers::text`]'s.
+fn rust_int(answers: &Answers, key: &str) -> Option<i32> {
+    match field(&answers.rust, key).and_then(|value| value.trim().parse::<i32>().ok()) {
+        Some(value) => Some(value),
+        None => {
+            skip(&format!(
+                "nif_select: this runtime's `{key}=` line is missing or not an integer; beam_rt \
+                 stdout:\n{}",
+                answers.rust
+            ));
+            None
+        }
+    }
+}
+
 /// The case's heading: its name and the one-line description of what it arms.
-fn heading(case: &str, detail: &str) {
-    println!();
+fn heading(case: &str, detail: &str) {    println!();
     println!("=============== nif_select :: {case} ===============");
     println!("fixture: {detail}");
 }
@@ -1461,5 +1733,339 @@ fn enif_select_read_and_error_interest_delivers_both_directions() {
     assert_eq!(
         rust_third, oracle_third,
         "this runtime delivers nothing after the two directions either, got {rust_third}"
+    );
+}
+
+/// **An armed interest keeps its object alive after the NIF drops its own reference.**
+///
+/// The C takes one `enif_keep_resource` reference per armed interest (`erl_check_io.c:1446`) and gives
+/// it back when the interest is dropped (`:1533`, `:1834`, `:2242`), so a NIF that arms a select and
+/// then releases the object it allocated still gets its notification. `arm_keep/0` is that shape: it
+/// registers a read interest on a fresh pipe and mints **no** resource term, so the object's reference
+/// count is exactly the allocator's one plus the interest's one. After `release/0` the object must
+/// still be alive (`dtor_after_release=0`, and the pipe's descriptors still open, so `poke/0` writes
+/// its byte: `written=1`), and the readiness must still be delivered (`{delivered,ready_input}`) —
+/// the mint the delivery makes can only succeed on a live object, which is what pins the
+/// mint-before-release ordering: a release of the interest's reference **before** that mint would
+/// leave a zero count, so the mint would refuse and nothing would be delivered.
+/// `final_dtor=0` afterwards is the rest of the same picture: the delivered term took a reference of
+/// its own, so the object is held by the term rather than dropped by the disarm — and the oracle,
+/// whose destructor runs later still as aux work, reads the same zero.
+/// The "exactly once" half is pinned by the two cases below, where the count does reach zero.
+#[test]
+fn enif_select_interest_reference_keeps_a_released_object_alive_until_readiness() {
+    let Some((answers, readings)) = run_repeated(
+        "kept",
+        "select_caller:kept_case/1",
+        3,
+        &["dtor_after_release", "final_dtor"],
+    ) else {
+        return;
+    };
+    let Some((rust_code, oracle_code)) = answers.int("code") else {
+        return;
+    };
+    let Some((rust_release, oracle_release)) = answers.text("release") else {
+        return;
+    };
+    let Some((rust_early, oracle_early)) = answers.text("early") else {
+        return;
+    };
+    let Some((rust_written, oracle_written)) = answers.int("written") else {
+        return;
+    };
+    let Some((rust_outcome, oracle_outcome)) = answers.text("outcome") else {
+        return;
+    };
+    let Some(rust_dtor_after_release) = rust_int(&answers, "dtor_after_release") else {
+        return;
+    };
+    let Some(rust_final_dtor) = rust_int(&answers, "final_dtor") else {
+        return;
+    };
+    heading(
+        "released then ready",
+        &format!(
+            "enif_select(env, pipe_read_fd, ERL_NIF_SELECT_READ={ERL_NIF_SELECT_READ}, object, \
+             NULL, Ref) with **no** enif_make_resource, then enif_release_resource(object) — the NIF \
+             drops its own reference — then the write"
+        ),
+    );
+    println!(
+        "beam_rt        : code={rust_code} [{}] release={rust_release} \
+         dtor_after_release={rust_dtor_after_release} early={rust_early} written={rust_written} \
+         outcome={rust_outcome} final_dtor={rust_final_dtor}",
+        decode(rust_code)
+    );
+    println!(
+        "oracle         : code={oracle_code} [{}] release={oracle_release} early={oracle_early} \
+         written={oracle_written} outcome={oracle_outcome}",
+        decode(oracle_code)
+    );
+    println!(
+        "oracle dtors   : {} — the C's destructor is deferred aux work, so these are a spread, not a \
+         constant (see the module docs)",
+        readings.join(" | ")
+    );
+    let agrees = rust_code == oracle_code
+        && rust_release == oracle_release
+        && rust_early == oracle_early
+        && rust_written == oracle_written
+        && rust_outcome == oracle_outcome;
+    verdict(
+        agrees,
+        "the interest's own reference is what keeps the object alive: the release reports success, \
+         the descriptor is still open, the readiness is delivered, and the delivered term — not the \
+         interest — is what holds the object afterwards",
+    );
+
+    assert_eq!(oracle_code, 0, "the oracle accepts the registration");
+    assert_eq!(rust_code, 0, "this runtime accepts the registration");
+    assert_eq!(oracle_release, "released", "the oracle's release reports success");
+    assert_eq!(rust_release, "released", "the release of the NIF's own reference must succeed");
+    // The reference the release dropped was the allocator's; the interest holds its own.
+    assert_eq!(
+        rust_dtor_after_release, 0,
+        "the object must survive the NIF's own release: the interest holds a reference of its own"
+    );
+    assert_eq!(
+        oracle_early, "timeout",
+        "the oracle delivers nothing before the write"
+    );
+    assert_eq!(
+        rust_early, "timeout",
+        "no {{select, …}} may reach the caller before the descriptor is readable"
+    );
+    assert_eq!(
+        rust_written, 1,
+        "the pipe must still be open after the release (a destroyed object closes its descriptors, \
+         so a `no_pipe` answer here is exactly the pre-fix behaviour)"
+    );
+    assert_eq!(oracle_written, 1, "the oracle's write into the pipe must succeed");
+    assert_eq!(
+        oracle_outcome, "{delivered,ready_input}",
+        "the oracle delivers {{select, Resource, Ref, ready_input}} for the released-but-armed object"
+    );
+    assert_eq!(
+        rust_outcome, "{delivered,ready_input}",
+        "this runtime must deliver the readiness of an object whose only remaining reference is the \
+         interest's own"
+    );
+    assert_eq!(
+        rust_final_dtor, 0,
+        "the delivered term took a reference of its own, so the object is still alive once the \
+         interest's reference has been given back: a nonzero count here would mean the delivery \
+         destroyed it — a release made before the mint, or a double one"
+    );
+}
+
+/// **A `STOP` on a released-but-armed interest gives the interest's reference back exactly once.**
+///
+/// The C disarms with `ERL_NIF_SELECT_STOP` (`erl_check_io.c:1272-1284`) and releases the interest's
+/// reference on the way out (`:1533`), so with the NIF's own reference already dropped by `release/0`
+/// the object's count reaches zero there — exactly one destructor run, no over-keep (the interest took
+/// one) and no leak (it is given back). Two things follow, identically on both runtimes: a write after
+/// the stop delivers nothing (`outcome=timeout`), and a second `STOP` finds the descriptor already
+/// gone and reports `ERL_NIF_SELECT_STOP_CALLED` alone (`stop2=1`).
+///
+/// The second `STOP` names the descriptor with a **sentinel** object rather than the interest's own:
+/// the C dereferences the object it is handed (`DATA_TO_RESOURCE(obj)`, `:1245`) and this runtime
+/// destroys the object synchronously at the first `STOP`, so naming the interest's object again would
+/// hand the oracle a freed block. `select_nif:stop/0` makes that substitution itself, answering
+/// `nothing_armed` only when nothing was ever armed.
+#[test]
+fn enif_select_stop_releases_the_interests_reference_exactly_once() {
+    let Some((answers, readings)) = run_repeated(
+        "stop_release",
+        "select_caller:stop_after_release_case/1",
+        3,
+        &["dtor_after_release", "dtor_after_stop"],
+    ) else {
+        return;
+    };
+    let Some((rust_code, oracle_code)) = answers.int("code") else {
+        return;
+    };
+    let Some((rust_stop, oracle_stop)) = answers.int("stop") else {
+        return;
+    };
+    let Some((rust_outcome, oracle_outcome)) = answers.text("outcome") else {
+        return;
+    };
+    let Some((rust_stop2, oracle_stop2)) = answers.int("stop2") else {
+        return;
+    };
+    let Some(rust_dtor_after_release) = rust_int(&answers, "dtor_after_release") else {
+        return;
+    };
+    let Some(rust_dtor_after_stop) = rust_int(&answers, "dtor_after_stop") else {
+        return;
+    };
+    heading(
+        "STOP after release",
+        "enif_select(env, pipe_read_fd, ERL_NIF_SELECT_READ, object, NULL, Ref) with no \
+         enif_make_resource, enif_release_resource(object), then \
+         enif_select(env, pipe_read_fd, ERL_NIF_SELECT_STOP, …), then a second STOP",
+    );
+    println!(
+        "beam_rt        : code={rust_code} [{}] stop={rust_stop} [{}] dtor_after_release={} \
+         dtor_after_stop={rust_dtor_after_stop} outcome={rust_outcome} stop2={rust_stop2}",
+        decode(rust_code),
+        decode(rust_stop),
+        rust_dtor_after_release
+    );
+    println!(
+        "oracle         : code={oracle_code} [{}] stop={oracle_stop} [{}] outcome={oracle_outcome} \
+         stop2={oracle_stop2}",
+        decode(oracle_code),
+        decode(oracle_stop)
+    );
+    println!(
+        "oracle dtors   : {} — the C's destructor is deferred aux work, so these are a spread, not a \
+         constant (see the module docs)",
+        readings.join(" | ")
+    );
+    let agrees = rust_code == oracle_code
+        && rust_stop == oracle_stop
+        && rust_outcome == oracle_outcome
+        && rust_stop2 == oracle_stop2;
+    verdict(
+        agrees,
+        "the same code on both runtimes — STOP_CALLED | READ_CANCELLED for the stop, STOP_CALLED \
+         alone for the second — and one destructor run here, because the interest's single reference \
+         is what the disarm gives back",
+    );
+
+    assert_eq!(oracle_code, 0, "the oracle accepts the read registration");
+    assert_eq!(rust_code, 0, "this runtime accepts the read registration");
+    assert_eq!(
+        oracle_stop,
+        ERL_NIF_SELECT_STOP_CALLED | ERL_NIF_SELECT_READ_CANCELLED,
+        "the oracle reports STOP_CALLED | READ_CANCELLED for a stopped read interest, got \
+         {oracle_stop} [{}]",
+        decode(oracle_stop)
+    );
+    assert_eq!(
+        rust_stop, oracle_stop,
+        "this runtime reports the oracle's exact stop code, got {rust_stop} [{}] against the \
+         oracle's {oracle_stop} [{}]",
+        decode(rust_stop),
+        decode(oracle_stop)
+    );
+    assert_eq!(
+        rust_dtor_after_release, 0,
+        "the object must survive the NIF's own release: the interest holds a reference of its own"
+    );
+    assert_eq!(
+        rust_dtor_after_stop, 1,
+        "the disarm gives the interest's one reference back, so the object dies there exactly once \
+         (0 would be an over-keep, 2 a double release)"
+    );
+    assert_eq!(
+        oracle_outcome, "timeout",
+        "the oracle delivers nothing after the stop"
+    );
+    assert_eq!(
+        rust_outcome, "timeout",
+        "a stopped descriptor must not deliver the notification of a later write"
+    );
+    assert_eq!(
+        oracle_stop2, ERL_NIF_SELECT_STOP_CALLED,
+        "the oracle's second STOP reports STOP_CALLED alone"
+    );
+    assert_eq!(
+        rust_stop2, oracle_stop2,
+        "this runtime's second STOP reports the oracle's exact code, got {rust_stop2} [{}]",
+        decode(rust_stop2)
+    );
+}
+
+/// **A dead owner's interest is pruned, and the interest's reference released with it.**
+///
+/// The C's select path monitors the owning process and `tty_monitor_down` clears the interest when it
+/// dies (`erl_check_io.c:1266-1276`); this runtime's equivalent is
+/// [`PortRegistry::prune_dead_select`](crate::port::PortRegistry::prune_dead_select), run at the start
+/// of every port round, whose `SelectHold` drop is what gives the interest's reference back
+/// (`src/port/select/tests.rs::a_dead_owner_is_pruned_and_a_live_one_is_kept` pins the same half at
+/// the unit level). `owner_death_case/1` is the end-to-end shape: a spawned process arms a read
+/// interest and drops its own reference in one call (`arm_keep_release/0`), reports the arming
+/// reference to its parent, and exits — and the parent then observes the object's destructor having
+/// run (`dtor_after_death=1`) and no notification ever arriving (`outcome=timeout`).
+#[test]
+fn enif_select_interest_of_a_dead_owner_is_pruned_and_released() {
+    let Some((answers, readings)) = run_repeated(
+        "owner_death",
+        "select_caller:owner_death_case/1",
+        2,
+        &["dtor_after_arm", "dtor_after_death"],
+    ) else {
+        return;
+    };
+    let Some((rust_code, oracle_code)) = answers.int("code") else {
+        return;
+    };
+    let Some((rust_outcome, oracle_outcome)) = answers.text("outcome") else {
+        return;
+    };
+    let Some(rust_dtor_after_arm) = rust_int(&answers, "dtor_after_arm") else {
+        return;
+    };
+    let Some(rust_dtor_after_death) = rust_int(&answers, "dtor_after_death") else {
+        return;
+    };
+    heading(
+        "owner death",
+        "a spawned process calls arm_keep_release/0 — enif_select(env, pipe_read_fd, \
+         ERL_NIF_SELECT_READ, object, NULL, Ref) followed by enif_release_resource(object) — sends the \
+         reference to its parent and exits; the parent waits, then reads the destructor count",
+    );
+    println!(
+        "beam_rt        : code={rust_code} [{}] dtor_after_arm={rust_dtor_after_arm} \
+         dtor_after_death={rust_dtor_after_death} outcome={rust_outcome}",
+        decode(rust_code)
+    );
+    println!(
+        "oracle         : code={oracle_code} [{}] outcome={oracle_outcome}",
+        decode(oracle_code)
+    );
+    println!(
+        "oracle dtors   : {} — the C's destructor is deferred aux work, so these are a spread, not a \
+         constant (see the module docs)",
+        readings.join(" | ")
+    );
+    let agrees = rust_code == oracle_code && rust_outcome == oracle_outcome;
+    verdict(
+        agrees,
+        "the interest is pruned with its owner on both runtimes: no notification is ever delivered, \
+         and here the interest's reference is given back, so the object's destructor runs once",
+    );
+
+    assert_eq!(
+        oracle_code, 0,
+        "the oracle accepts the child's registration, got {oracle_code} [{}]",
+        decode(oracle_code)
+    );
+    assert_eq!(
+        rust_code, 0,
+        "this runtime accepts the child's registration, got {rust_code} [{}]",
+        decode(rust_code)
+    );
+    assert_eq!(
+        rust_dtor_after_arm, 0,
+        "the armed, released object must still be alive while its owner runs: the interest holds a \
+         reference of its own"
+    );
+    assert_eq!(
+        rust_dtor_after_death, 1,
+        "the liveness prune must give the dead owner's interest reference back, so the object dies \
+         exactly once (0 would be a leaked registration, 2 a double release)"
+    );
+    assert_eq!(
+        oracle_outcome, "timeout",
+        "the oracle never delivers a dead owner's readiness"
+    );
+    assert_eq!(
+        rust_outcome, "timeout",
+        "a pruned registration must not deliver, and its reference must not be minted into a term"
     );
 }
