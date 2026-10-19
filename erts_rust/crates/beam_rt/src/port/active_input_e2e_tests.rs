@@ -59,15 +59,16 @@
 //! both halves of that: the drained packet's `data_mode` is still `Binary`, and the resolved mode
 //! is `List` and renders a char list — the oracle's own answer for the same socket.
 //!
-//! # The `note_inet_setopts` hook (documented stand-in)
+//! # The `note_inet_setopts` calls below (redundant on a wired runtime)
 //!
 //! [`PortRegistry::port_control`](crate::port::PortRegistry) is where a real `setopts` becomes part
-//! of the mode mirror. That one-line call is **not wired yet** in `src/port.rs` (owned by another
-//! agent), so every `setopts` below is followed by an explicit
-//! [`PortRegistry::note_inet_setopts`](crate::port::PortRegistry) with the reply's own success tag
-//! — the same call, from the same reply, that the hook will make (this is the pattern
-//! `accept_inherit_tests.rs` established). When the hook lands these explicit calls become
-//! redundant, not wrong.
+//! of the mode mirror: `src/port.rs:1459` calls
+//! [`PortRegistry::note_inet_setopts`](crate::port::PortRegistry) after the completion drain, gated
+//! on `inet_opts::is_setopts_control(op)` and `setopts_succeeded(reply)`. That hook is live, so the
+//! explicit call each `setopts` below is followed by is a redundant stand-in rather than a
+//! substitute: it passes the reply's own success tag from the same reply, exactly as the hook does
+//! (the pattern `accept_inherit_tests.rs` established), and the suite's helpers detect the hook by
+//! reading the recorded count across the control call so they never double-record.
 //!
 //! # The oracle, measured (OTP 29.1.1 / erts-17.1)
 //!
