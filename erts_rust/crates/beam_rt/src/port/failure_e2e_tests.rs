@@ -93,13 +93,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use beam_bifs::PortHook;
-use beam_io::PortNotification;
 use beam_process::{MonitorRef, PortId, ProcessId, RefAllocator};
 use beam_term::NIL;
 
 use crate::port::exit::{PortSignal, PortSignalKind, PortSignalReason};
 use crate::port::tests::{assert_badarg, fixture, Fixture};
-use crate::port::RuntimePorts;
+use crate::port::{RuntimePorts, StreamType};
 
 /// The process the port belongs to — the recipient of every `'EXIT'`.
 const OWNER: ProcessId = ProcessId::new(11, 0);/// The `monitor(port, P)` watcher — the recipient of every `'DOWN'`.
@@ -722,21 +721,57 @@ fn driver_exit_with_a_posix_code_owes_the_watcher_an_eacces_down_and_the_owner_n
 /// The data-then-failure row: a `driver_output` **before** the failure is delivered ahead of the
 /// port's exit, and exactly one `'EXIT'` (never two) is published.
 ///
-/// The read is observed where the runtime really produces it — the port-task round's notification
-/// list (`PortNotification::Data`), which `beam_io` re-prepends for a reaped port — because the
-/// failure's own teardown removes the port's metadata in the same call, and
-/// [`PortRegistry::fold_notifications`](crate::port::PortRegistry) renders a read only for a port
-/// it still holds. The remaining half is stated honestly: the runtime drops the read for the port
-/// the driver just closed, where the oracle delivers `{P,{data,<<"hi">>}}` first. That residual
-/// belongs to `port.rs`'s fold gate (out of this node's write scope) and is recorded in the
-/// module docs of `src/port/CONTEXT.md`'s A.4 *Known Issues* by the crate's owning node.
+/// The read is observed where the runtime really reports it — the message buffer a pump drains
+/// ([`PortRegistry::drain_pending_events`](crate::port::PortRegistry)), which
+/// [`PortRegistry::command`](crate::port::PortRegistry) fills from the round that reaped the port.
+/// This is the only layer that can still see it: the same round runs the teardown, so by then the
+/// port's metadata is gone by construction and the read's recipient is the snapshot
+/// [`fail_port`](crate::port::PortRegistry) took ([`FailedReadRecipient`]) — the bytes are never
+/// lost, they simply do not survive at the `beam_io` *round* level, which the write already
+/// consumed.
+///
+/// The ordering is asserted where it is decided: both delivery routes take the port's **messages**
+/// ([`Runtime::deliver_port_messages`](crate::Runtime::deliver_port_messages) on the scheduler
+/// route, `RuntimeContext::poll_port_messages` on `-eval`) before they take its **exit signals**
+/// (`Runtime::deliver_port_signals` / `poll_port_signals`), so the read is taken here first and the
+/// `'EXIT'`/`'DOWN'` are then asserted *still queued behind it* — the oracle's
+/// `{P,{data,<<"hi">>}}` then `{'EXIT',P,9}` then `{'DOWN',…,9}`.
 #[test]
-fn a_data_read_before_a_failure_reaches_the_round_ahead_of_one_exit_signal() {
+fn a_data_read_before_a_failure_reaches_the_owner_ahead_of_one_exit_signal() {
     let Some(mut case) = open_row("rt_failure_data") else {
         return;
     };
     fail(&mut case, 8);
-    // The failure published exactly one 'EXIT' (and the watcher's 'DOWN'), never two.
+
+    // The messages the failure's own read produced, taken exactly as a pump (and therefore both
+    // delivery routes) takes them: `{P,{data,Data}}`, byte for byte, addressed to the port's
+    // owner, shaped by the port's own `binary`/`list` option.
+    let messages: Vec<(PortId, Vec<u8>, ProcessId, StreamType)> = case
+        .fx
+        .registry
+        .borrow_mut()
+        .drain_pending_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            crate::port::PortEvent::Data {
+                port,
+                read,
+                stream,
+                owner,
+                ..
+            } if port == case.id => Some((port, read.flattened(), owner, stream)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        vec![(case.id, b"hi".to_vec(), OWNER, StreamType::List)],
+        "the failing callback's own `driver_output` bytes are reported once, to its owner, byte \
+         for byte"
+    );
+
+    // The failure published exactly one 'EXIT' (and the watcher's 'DOWN'), never two — and both
+    // are still owed *after* the read was taken, which is the order the routes deliver in.
     let signals = case.signals();
     assert_eq!(
         signals
@@ -766,34 +801,14 @@ fn a_data_read_before_a_failure_reaches_the_round_ahead_of_one_exit_signal() {
         "the data-then-failure row's signals"
     );
 
-    // The bytes the failing callback delivered: `beam_io` re-harvested them for a reaped port, so
-    // the next port-task round reports them exactly once, ahead of the close report.
-    let outcome = {
-        let registry = &mut *case.fx.registry.borrow_mut();
-        registry
-            .registry
-            .execute_port_tasks(&mut registry.poller, 1024)
-            .expect("the port-task round runs")
-    };
-    let reads: Vec<Vec<u8>> = outcome        .notifications
-        .iter()
-        .filter_map(|notification| match notification {
-            PortNotification::Data { port, read } if *port == case.id => Some(read.flattened()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        reads,
-        vec![b"hi".to_vec()],
-        "the failing callback's own `driver_output` bytes are reported once, byte for byte"
-    );
     let mut after = case.fx.registry.borrow_mut();
     assert!(
         !after.is_live(case.id),
         "the port is gone: the read above and the signals are all that is left of it"
     );
     assert_badarg(after.close(case.id));
-    drop(after);    case.finish();
+    drop(after);
+    case.finish();
 }
 
 /// The driver's `driver_failure*` return value is the host's (`0` — the C's own success code),

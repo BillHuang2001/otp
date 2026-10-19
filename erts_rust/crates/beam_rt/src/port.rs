@@ -1526,27 +1526,34 @@ impl PortRegistry {
         // retired by this round, which is why the round is entered through
         // [`PortRegistry::run_port_tasks`] (it snapshots the monitors the teardown owes).
         let round = self.run_port_tasks(PORT_REDS_EXECUTE);
-        let refused = match round {
-            Ok(outcome) => {
-                // The round harvested the replies the drivers just wrote (and every other live
-                // port's buffered input along with them — a round drains them all), so its
-                // notifications are **retained** here for the next pump: the queue they came from
-                // is already empty.
-                let mut events = Vec::new();
-                self.fold_notifications(outcome.notifications, &mut events)?;
-                self.pending_events.extend(events);
-                None
-            }
+        let (notifications, refused) = match round {
+            Ok(outcome) => (outcome.notifications, None),
             // A driver that refused the command may still owe its owner a reply, a completion or
             // its `{'EXIT', …}`: the channels below are drained before the refusal is reported
             // (the round's own `Closed` report stays queued for the next one).
-            Err(error) => Some(error),
+            Err(error) => (Vec::new(), Some(error)),
         };
         // The `OUTPUT` task that carried this command is where a socket driver stages its
         // `{inet_reply, …}` (see [`completion`]) and its `{active, …}` delivery (see
-        // [`ops::active_input`]); both are drained and held as pending work until a pump reports
+        // [`ops::active_input`]), and where a driver that closes its **own** port latches the
+        // failure — so both channels are drained and held as pending work until a pump reports
         // them.
+        //
+        // The drain comes **before** the round's notifications are folded, the order
+        // [`PortRegistry::pump`] uses and the only order that keeps a failing callback's own read:
+        // [`PortRegistry::drain_failures`] is what finishes the teardown
+        // ([`PortRegistry::fail_port`]) — removing the port's metadata and purging the events
+        // retained for it — so a fold that ran first would bind the read to metadata the teardown
+        // is about to discard and then lose the event to that purge. Folded after, the read is
+        // rendered from the recipient the teardown snapshotted ([`FailedReadRecipient`]), which is
+        // the snapshot the oracle's `{data,<<"hi">>}` **then** `{'EXIT',P,9}` row needs.
         let completions = self.drain_io_completions(None);
+        // The round harvested the replies the drivers just wrote (and every other live port's
+        // buffered input along with them — a round drains them all), so its notifications are
+        // **retained** here for the next pump: the queue they came from is already empty.
+        let mut events = Vec::new();
+        self.fold_notifications(notifications, &mut events)?;
+        self.pending_events.extend(events);
         self.pending_events.extend(completions);
         let active = self.drain_active_inputs();
         self.pending_events
@@ -2303,13 +2310,27 @@ impl PortRegistry {
     /// delivered to a stale owner ([`PortRegistry::close`] purges them outright, which is what
     /// keeps a reused port number from inheriting them).
     ///
+    /// A [`PortEvent::Data`] is the exception, and it is not a relaxation: its recipient was
+    /// **already** resolved where the read was folded, from a live port's metadata or — for the
+    /// read a failing driver callback wrote before it closed its own port — from the snapshot
+    /// [`PortRegistry::fail_port`] took ([`FailedReadRecipient`]). That port is gone *by
+    /// construction*, and the read is exactly what the owner is owed **ahead of** the `'EXIT'`
+    /// the same failure published (the oracle's `{P,{data,<<"hi">>}}` then `{'EXIT',P,9}` row),
+    /// so the liveness question here could only suppress it. There is no stale owner to reach: a
+    /// read with no recoverable recipient is dropped by the fold itself, `close`'s and
+    /// `fail_port`'s purges never leave another port's read behind, and a recycled number gets a
+    /// live port whose own metadata resolves its own reads.
+    ///
     /// Nothing is re-delivered: the bytes left [`beam_io`]'s input queue when they were harvested,
     /// so this is the **only** report they can still have.
     fn drain_pending_events(&mut self) -> Vec<PortEvent> {
         std::mem::take(&mut self.pending_events)
             .into_iter()
             .filter(|event| match event.port() {
-                Some(port) => self.meta.contains_key(&port.number()),
+                Some(port) => {
+                    self.meta.contains_key(&port.number())
+                        || matches!(event, PortEvent::Data { .. })
+                }
                 None => true,
             })
             .collect()
