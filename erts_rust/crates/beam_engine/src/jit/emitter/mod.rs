@@ -61,8 +61,8 @@
 //! * integer arithmetic/logic — [`add_rr`], [`sub_rr`], [`cmp_rr`], [`test_rr`],
 //!   [`and_rr`], [`or_rr`], [`xor_rr`];
 //! * stack — [`push_r`], [`pop_r`];
-//! * control flow — [`jmp`] (`rel32`), [`jcc`] (`rel32`), [`call_label`]
-//!   (`rel32`), [`call_r`] (indirect), [`ret`];
+//! * control flow — [`jmp`] (`rel32`), [`jcc`] (`rel32`), [`jmp_r`] (indirect),
+//!   [`call_label`] (`rel32`), [`call_r`] (indirect), [`ret`];
 //! * filler — [`nop`], [`int3`].
 //!
 //! Everything else (immediates in `mov r/m64, imm32`, memory-operand arithmetic,

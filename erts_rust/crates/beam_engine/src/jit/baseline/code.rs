@@ -383,6 +383,59 @@ impl CompiledModule {
         Some((entry, function.summary.highest_native_register))
     }
 
+    /// The block-entry tables of `func`, for the driver to publish to the runtime so a
+    /// **return** can resolve its own same-function continuation without leaving the block
+    /// ([`super::runtime::EntryTables`]).
+    ///
+    /// `cached` is the caller's [`ResolvedFunction`] handle — the function the last
+    /// `native_entry_cached` resolved — so this costs the two `Vec` indexings that read the
+    /// per-function slices, with no `RefCell` probe and no `Rc` clone. It is called right
+    /// after a successful lookup, when `cached` already names `func`; when it does not (a
+    /// stale handle, or the eager layout, whose entries are addressed off the one shared
+    /// table) the eager arm indexes its own `[func]` slice instead.
+    ///
+    /// The returned pointers address the artifact's own entry vectors: they are built
+    /// before the function's buffer is sealed and never mutated afterwards, and the
+    /// artifact keeps the owning `Rc` alive in its per-function slot, so the pointers stay
+    /// valid for as long as the artifact the driver holds.
+    pub(crate) fn entry_tables(
+        &self,
+        func: u32,
+        cached: &super::ResolvedFunction,
+    ) -> super::runtime::EntryTables {
+        match &self.layout {
+            Layout::Eager(eager) => {
+                let (Some(entries), Some(sub_entries)) = (
+                    eager.entries.get(func as usize),
+                    eager.sub_entries.get(func as usize),
+                ) else {
+                    return super::runtime::EntryTables::NONE;
+                };
+                super::runtime::EntryTables {
+                    func,
+                    entries: entries.as_ptr(),
+                    entries_len: entries.len(),
+                    sub_entries: sub_entries.as_ptr(),
+                    sub_entries_len: sub_entries.len(),
+                }
+            }
+            Layout::Lazy(_) => match cached {
+                Some((cached_func, function)) if *cached_func == func => {
+                    super::runtime::EntryTables {
+                        func,
+                        entries: function.entries.as_ptr(),
+                        entries_len: function.entries.len(),
+                        sub_entries: function.sub_entries.as_ptr(),
+                        sub_entries_len: function.sub_entries.len(),
+                    }
+                }
+                // No handle for this function: publish "nothing", which only makes the
+                // return take today's return-to-driver path.
+                _ => super::runtime::EntryTables::NONE,
+            },
+        }
+    }
+
     /// The compiled function `func`, compiling it on first sight for a lazy artifact.
     ///
     /// `None` for the eager layout (its entries are addressed directly) and for a

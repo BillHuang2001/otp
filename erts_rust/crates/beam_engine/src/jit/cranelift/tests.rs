@@ -162,6 +162,8 @@ fn the_compiled_function_runs_the_export_natively() {
         // reject every access" discipline documents.
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
+        tables: crate::jit::baseline::runtime::EntryTables::NONE,
     };
 
     let word = code
