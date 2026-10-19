@@ -146,7 +146,7 @@ use beam_term::prelude::{make_atom, make_small, try_make_small, Eterm};
 use beam_term::AtomTable;
 
 use crate::dist::links::no_link_error;
-use crate::dist::{DistConnection, DistLinks, NodeName, DIST_READ_SLICE};
+use crate::dist::{advertised_flags, DistConnection, DistLinks, NodeName, DIST_READ_SLICE};
 use crate::error;
 
 /// The words of the stable scratch heap the routed signals' terms are materialised on.
@@ -344,6 +344,12 @@ struct DistClientInner {
     dispatch_heap: Heap,
     /// Why the most recently retired link was dropped (recorded, never raised).
     last_error: Option<String>,
+    /// Whether this node is **hidden** (`-hidden`): a link this client dials then
+    /// advertises no `DFLAG_PUBLISHED`, exactly as the accepted half does
+    /// ([`crate::dist::advertised_flags`]). Visibility belongs to the node, not to who
+    /// dialled, so [`DistClient::set_hidden`] is set alongside
+    /// [`crate::dist::DistNode::set_hidden`].
+    hidden: bool,
     /// The next `DOP_UNLINK_ID` id (starts at `1`; a real receiver rejects `0`).
     next_unlink_id: u64,
 }
@@ -381,6 +387,7 @@ impl DistClient {
                 scratch: Heap::new(SCRATCH_WORDS)?,
                 dispatch_heap: Heap::new(DISPATCH_HEAP_WORDS)?,
                 last_error: None,
+                hidden: false,
                 next_unlink_id: 1,
             })),
         })
@@ -419,6 +426,30 @@ impl DistClient {
             inner.creation = creation;
             inner.cookie = cookie.to_vec();
         }
+    }
+
+    /// Marks this node **hidden** (`-hidden`) — or, with `false`, published (the
+    /// default).
+    ///
+    /// An outbound link then advertises [`crate::dist::advertised_flags`]'s set, which
+    /// omits `DFLAG_PUBLISHED` for a hidden node, so a real peer records this runtime as
+    /// [`beam_dist::PeerVisibility::Hidden`] and leaves it out of `nodes()` — the
+    /// mirror of [`crate::dist::DistNode::set_hidden`] on the accepted half. Visibility
+    /// is a property of the node, not of who dialled, so both halves must be told the
+    /// same value.
+    ///
+    /// Additive: it only affects links dialled afterwards (the flags are baked into a
+    /// link's driver when it is created), which is why the runtime sets it before any
+    /// pump.
+    pub fn set_hidden(&self, hidden: bool) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.hidden = hidden;
+        }
+    }
+
+    /// Whether this node dials out as **hidden** ([`DistClient::set_hidden`]).
+    pub fn is_hidden(&self) -> bool {
+        self.inner.try_borrow().map(|inner| inner.hidden).unwrap_or(false)
     }
 
     /// The `DistSignalRouter` sharing this client's links and outbound queue.
@@ -494,7 +525,15 @@ impl DistClient {
         // A re-connect to the same node replaces the old link (never two live links to
         // one peer, which a real node would treat as a simultaneous connection).
         inner.links.outbound.retain(|link| link.node != node);
-        let driver = ConnectionDriver::client(&inner.our_name, &inner.cookie, inner.creation);
+        // The flags this link advertises are the **node's** visibility
+        // ([`advertised_flags`]): a normal node publishes itself to the peer it dials
+        // exactly as it does to one that dials it, and a `-hidden` node never does.
+        let driver = ConnectionDriver::client_with_flags(
+            &inner.our_name,
+            &inner.cookie,
+            inner.creation,
+            advertised_flags(inner.hidden),
+        );
         inner.links.outbound.push(ClientLink {
             node,
             name: peer.full().to_string(),
@@ -1094,7 +1133,8 @@ impl DistSignalRouter for DistRouter {
 mod tests {
     use super::*;
     use beam_alloc::Heap as TestHeap;
-    use beam_dist::{Delivery, UnsupportedSink};
+    use beam_dist::flags::DFLAG_PUBLISHED;
+    use beam_dist::{preferred_flags, publish_flag, Delivery, DistFlags, UnsupportedSink};
     use beam_process::{MonitorKind, RefAllocator};
     use beam_term::prelude::{make_atom as atom_term, AtomTable as Table};
 
@@ -1105,11 +1145,21 @@ mod tests {
         cookie: &str,
         creation: u32,
     ) -> (DistClient, ConnectionDriver, TcpStream, AtomTable) {
+        loopback_with_visibility(cookie, creation, false)
+    }
+    /// [`loopback`] with this node's **visibility** chosen (`-hidden` when `hidden`), so a
+    /// test can compare the flags the connector puts on the wire for both kinds of node.
+    fn loopback_with_visibility(
+        cookie: &str,
+        creation: u32,
+        hidden: bool,
+    ) -> (DistClient, ConnectionDriver, TcpStream, AtomTable) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
         let addr = listener.local_addr().expect("read the port");
         let mut atoms = Table::new();
         let our = atom_term(atoms.intern("client@localhost"));
         let client = DistClient::new(cookie.as_bytes().to_vec()).expect("client");
+        client.set_hidden(hidden);
         client.set_identity("client@localhost", our, creation, cookie.as_bytes());
         client
             .connect_addr("peer@localhost", addr, &mut atoms)
@@ -1180,6 +1230,64 @@ mod tests {
         assert!(client.last_error().is_none(), "no link was retired");
     }
 
+    /// **Contract A.5 — this node's visibility, dialling half.** A node's visibility is a
+    /// property of the node, not of who opened the socket, so a link this runtime dials
+    /// advertises exactly what the accepted half advertises
+    /// ([`crate::dist::advertised_flags`]): the emulator default **plus**
+    /// `DFLAG_PUBLISHED` (`dist.h:30`, `dist_util.erl:152-160`) unless the node is
+    /// `-hidden`. The peer's `ConnectionDriver::client_flags` is its record of our `Name`
+    /// message, i.e. the bytes that crossed the socket.
+    #[test]
+    fn the_client_publishes_the_node_unless_it_is_hidden() {
+        let (client, mut driver, mut stream, mut atoms) = loopback("cook", 5);
+        drive(&client, &mut driver, &mut stream, &mut atoms);
+        let published = DistFlags::from_bits(DFLAG_PUBLISHED);
+        assert!(!client.is_hidden(), "a client is published unless `-hidden` says so");
+        assert!(
+            driver.client_flags().contains(published),
+            "the peer read our flags as 0x{:x}, which omits DFLAG_PUBLISHED (0x{:x}) — \
+             it would list this node only under `nodes(hidden)`",
+            driver.client_flags().bits(),
+            DFLAG_PUBLISHED
+        );
+        assert_eq!(
+            driver.client_flags().bits(),
+            (preferred_flags() | publish_flag(false, true)).bits(),
+            "the advertised set is the emulator default plus exactly DFLAG_PUBLISHED"
+        );
+        assert!(
+            driver.client_flags().contains(preferred_flags()),
+            "every capability of the emulator default is still advertised"
+        );
+    }
+
+    /// The `-hidden` half of the same rule: a hidden node's outbound link advertises the
+    /// emulator default **unchanged**, so the peer classifies it as hidden
+    /// (`publish_type/1`) and keeps it out of `nodes()` — while the link still establishes.
+    #[test]
+    fn a_hidden_client_withholds_the_published_bit() {
+        let (client, mut driver, mut stream, mut atoms) = loopback_with_visibility("cook", 5, true);
+        drive(&client, &mut driver, &mut stream, &mut atoms);
+        assert!(client.is_hidden(), "`set_hidden(true)` takes effect");
+        assert!(
+            !driver.client_flags().contains(DistFlags::from_bits(DFLAG_PUBLISHED)),
+            "the peer read the hidden node's flags as 0x{:x}, which still sets \
+             DFLAG_PUBLISHED (0x{:x})",
+            driver.client_flags().bits(),
+            DFLAG_PUBLISHED
+        );
+        assert_eq!(
+            driver.client_flags().bits(),
+            preferred_flags().bits(),
+            "a hidden node advertises the emulator default, unchanged"
+        );
+        assert_eq!(
+            client.connected_nodes(),
+            vec!["peer@localhost".to_string()],
+            "a hidden node still connects: visibility changes who lists us, not whether \
+             the link works"
+        );
+    }
     /// A `DOP_REG_SEND` written through the client's public send API is decoded by the
     /// peer's driver as the same `{DOP_REG_SEND, From, Cookie, ToName} -- Msg` tuple —
     /// the outbound message path, with no `erl`.

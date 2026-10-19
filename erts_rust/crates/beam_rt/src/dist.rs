@@ -113,7 +113,10 @@ use beam_common::{BeamError, Result};
 use beam_dist::connection::TcpTransport;
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::epmd::{Alive2Req, Alive2Resp, EpmdClient, EPMD_DEFAULT_ADDR};
-use beam_dist::{DeliveryOutcome, Dispatched, DistFlags, Dop, InboundSink, PeerVisibility};
+use beam_dist::{
+    preferred_flags, publish_flag, DeliveryOutcome, Dispatched, DistFlags, Dop, InboundSink,
+    PeerVisibility,
+};
 use beam_dist::TcpListener;
 use beam_term::prelude::{make_atom, Eterm};
 use beam_term::AtomTable;
@@ -263,14 +266,16 @@ pub struct DistConnection {
 
 impl DistConnection {
     /// Wraps an accepted socket in a **server-side** driver advertising
-    /// `advertised` as this node's name.
-    fn new(stream: TcpStream, peer_addr: SocketAddr, advertised: &[u8], cookie: &[u8], creation: u32) -> Result<DistConnection> {
+    /// `advertised` as this node's name and `flags` as this node's capability set —
+    /// [`advertised_flags`], so a normal node publishes itself (`DFLAG_PUBLISHED`) and a
+    /// `-hidden` one does not.
+    fn new(stream: TcpStream, peer_addr: SocketAddr, advertised: &[u8], cookie: &[u8], creation: u32, flags: DistFlags) -> Result<DistConnection> {
         stream.set_nodelay(true).map_err(BeamError::Io)?;
         stream
             .set_read_timeout(Some(DIST_READ_SLICE))
             .map_err(BeamError::Io)?;
         Ok(DistConnection {
-            driver: ConnectionDriver::server(advertised, cookie, creation),
+            driver: ConnectionDriver::server_with_flags(advertised, cookie, creation, flags),
             stream,
             peer_addr,
             node: None,
@@ -370,10 +375,11 @@ impl DistConnection {
     /// flags, not a permission this runtime could check: both ends of a real OTP
     /// connection may advertise themselves hidden (`dist_util.erl:publish_type/1`
     /// answers `hidden` for any peer that did not set `DFLAG_PUBLISHED`, and
-    /// `-hidden` is a per-node choice), and this runtime itself advertises
-    /// [`beam_dist::preferred_flags`], which omits that bit. A hidden peer is
-    /// therefore the *expected* case for a hidden node and is accepted exactly like a
-    /// normal one; the classification is only made observable here, per link.
+    /// `-hidden` is a per-node choice), and this runtime's own choice is
+    /// [`DistNode::set_hidden`] ([`advertised_flags`] — published unless `-hidden`). A
+    /// hidden peer is therefore the *expected* case for a hidden node and is accepted
+    /// exactly like a normal one; the classification is only made observable here, per
+    /// link.
     pub fn peer_visibility(&self) -> Option<PeerVisibility> {
         self.driver.peer_visibility()
     }
@@ -590,6 +596,12 @@ pub struct DistNode {
     registration_attempted: bool,
     /// Why the most recently retired link was dropped (recorded, never raised).
     last_link_error: Option<String>,
+    /// Whether this node is **hidden** (`-hidden`): its handshake then omits
+    /// `DFLAG_PUBLISHED`, so a peer lists it only in
+    /// `nodes(hidden)`/`nodes(connected)` (see [`advertised_flags`]). Set through
+    /// [`DistNode::set_hidden`] before the first pump; `false` — a **published** node —
+    /// by default.
+    hidden: bool,
     /// The scratch arena an inbound control message is decoded on by
     /// [`DistNode::dispatch_inbound`] (reset per drain — the delivery copies the
     /// term out immediately). See [`DIST_DISPATCH_HEAP_WORDS`].
@@ -626,10 +638,38 @@ impl DistNode {
             registration_error: None,
             registration_attempted: false,
             last_link_error: None,
+            hidden: false,
             dispatch_heap: Heap::new(DIST_DISPATCH_HEAP_WORDS)?,
         })
     }
 
+    /// Marks this node **hidden** (`-hidden`) — or, with `false`, published (the
+    /// default).
+    ///
+    /// A hidden node's `'N'` handshake omits `DFLAG_PUBLISHED`, exactly as
+    /// `dist_util.erl:152-160`'s `publish_flag/3` does for a `-hidden` node, so a real
+    /// peer records it as [`PeerVisibility::Hidden`] and leaves it out of `nodes()`.
+    /// Visibility is a property of the node, so the connecting half
+    /// ([`crate::dist_client::DistClient::set_hidden`]) must be told the same value.
+    ///
+    /// Additive: a node built by [`DistNode::start`] is published. It only affects links
+    /// **accepted afterwards** (the flags are baked into each link's driver at accept
+    /// time), which is why the runtime sets it before the first
+    /// [`pump`](Self::pump).
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
+    }
+
+    /// Whether this node advertises itself as **hidden** ([`DistNode::set_hidden`]).
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// The capability flags this node advertises in its handshake
+    /// ([`advertised_flags`] of [`DistNode::is_hidden`]).
+    pub fn advertised_flags(&self) -> DistFlags {
+        advertised_flags(self.hidden)
+    }
     /// The node's full `node@host` name.
     pub fn node_name(&self) -> &str {
         self.name.full()
@@ -889,6 +929,7 @@ impl DistNode {
                     self.name.advertised(),
                     &self.cookie,
                     self.creation,
+                    advertised_flags(self.hidden),
                 )?;
                 Ok(Some(connection))
             }
@@ -1024,6 +1065,24 @@ fn epmd_addr_from(value: Option<&str>) -> String {
     }
 }
 
+/// The capability flags this node advertises in its `'N'` handshake: the emulator
+/// default ([`preferred_flags`]) **plus** `DFLAG_PUBLISHED` unless the node is
+/// **hidden** (`-hidden`).
+///
+/// A real node publishes itself per peer: `dist_util.erl:152-160`'s `publish_flag/3`
+/// ORs `DFLAG_PUBLISHED` (`dist.h:30`) into the flags this side advertises unless the
+/// node was started `-hidden` (`net_kernel.erl:hidden_argument/0` reads exactly that
+/// command-line argument). The bit is what makes a peer list this node in `nodes()`:
+/// without it every real peer classifies this runtime as *hidden*
+/// ([`beam_dist::handshake::publish_type`], `dist_util.erl:917-923`) and it shows up
+/// only in `nodes(hidden)`/`nodes(connected)`.
+///
+/// Visibility is a property of the **node**, not of who dialled, so this one set is
+/// what both halves advertise — the acceptor ([`DistConnection`]) and the connector
+/// ([`crate::dist_client::DistClient`]).
+pub(crate) fn advertised_flags(hidden: bool) -> DistFlags {
+    preferred_flags() | publish_flag(hidden, true)
+}
 /// Resolves the cookie the handshake digests use: `-setcookie` from the command
 /// line, else `$HOME/.erlang.cookie`, else the documented Milestone-1 default.
 pub fn resolve_cookie(init_args: &crate::config::InitArgs) -> Vec<u8> {
@@ -1303,9 +1362,11 @@ mod tests {
 
     /// Both ends of a real OTP connection may advertise themselves hidden, so a
     /// hidden peer is **recorded** ([`DistConnection::peer_visibility`]), never
-    /// refused: here a published client and this runtime's own hidden
-    /// ([`preferred_flags`]) acceptor complete the handshake, each classifying the
-    /// other.
+    /// refused: here a published peer and a deliberately hidden acceptor
+    /// ([`ConnectionDriver::server`], the emulator default) complete the handshake, each
+    /// classifying the other. The *accepting* half's own visibility comes from
+    /// [`advertised_flags`] — see
+    /// [`the_acceptor_publishes_the_node_unless_it_is_hidden`].
     #[test]
     fn a_hidden_and_a_published_peer_both_establish_and_are_recorded() {
         let (server_stream, client_stream) = socket_pair();
@@ -1356,13 +1417,151 @@ mod tests {
         assert_eq!(
             client.peer_visibility(),
             Some(PeerVisibility::Hidden),
-            "this runtime advertises `preferred_flags`, which omits `DFLAG_PUBLISHED`"
+            "an acceptor whose driver advertises `preferred_flags` (the emulator default) \
+             omits `DFLAG_PUBLISHED`"
         );
         // The rest of the peer identity stays truthful.
         assert_eq!(server.peer_name().as_deref(), Some("peer@host.example"));
         assert_eq!(client.peer_name().as_deref(), Some("acceptor@host.example"));
         assert_eq!(server.peer_creation(), 1);
         assert_eq!(client.peer_creation(), 1);
+    }
+
+    /// The capability flags the **accepting** half actually put on the wire, as the
+    /// connecting peer reads them: a real [`DistNode`] and a peer driver run the `'N'`
+    /// handshake against each other over a loopback socket, and the peer's record of the
+    /// acceptor's `Challenge` flags (`ConnectionDriver::server_flags`) is returned.
+    ///
+    /// This is the wire truth rather than the constructor's input: it is what a system
+    /// `erl` classifies with `publish_type/1` when it decides whether to list this node in
+    /// `nodes()`.
+    fn acceptor_flags_as_the_peer_read_them(node: &mut DistNode) -> DistFlags {
+        let mut client = TcpStream::connect(("127.0.0.1", node.port()))
+            .expect("connect the node's listener");
+        client.set_nodelay(true).expect("TCP_NODELAY");
+        client
+            .set_read_timeout(Some(DIST_READ_SLICE))
+            .expect("the link's read slice");
+        // The accept, and (best-effort) the `epmd` registration.
+        node.pump().expect("the accept");
+        // The peer publishes itself, so the acceptor's classification of it is exercised
+        // too (a hidden peer is equally acceptable — see the test above).
+        let mut peer = ConnectionDriver::client_with_flags(
+            b"peer@host.example",
+            COOKIE,
+            1,
+            preferred_flags() | publish_flag(false, true),
+        );
+        for _ in 0..200 {
+            node.pump().expect("the accepted link's pump");
+            let mut buf = [0u8; 4096];
+            match client.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => peer.feed(&buf[..n]),
+                Err(err) if is_would_block(&err) => {}
+                Err(err) => panic!("the peer's read: {err}"),
+            }
+            loop {
+                match peer.step() {
+                    Ok(beam_dist::StepOutcome::WouldBlock) => break,
+                    Ok(_) => {}
+                    Err(err) => panic!("the peer's step: {err}"),
+                }
+            }
+            if peer.has_output() {
+                let bytes = peer.take_output();
+                client.write_all(&bytes).expect("the peer's write");
+                client.flush().expect("the peer's flush");
+            }
+            if matches!(peer.state(), DriverState::Established) {
+                assert_eq!(
+                    node.links().borrow().first().map(|link| link.state()),
+                    Some(DriverState::Established),
+                    "both ends completed the `'N'` handshake"
+                );
+                assert_eq!(
+                    node.links().borrow().first().and_then(|link| link.peer_visibility()),
+                    Some(PeerVisibility::Normal),
+                    "the peer published ITSELF; our own flags are the separate question"
+                );
+                return peer.server_flags();
+            }
+        }
+        panic!("the loopback 'N' handshake never completed");
+    }
+
+    /// **Contract A.5 — this node's visibility.** A published node ORs
+    /// `DFLAG_PUBLISHED` (`dist.h:30`) into the flags it advertises, exactly as
+    /// `dist_util.erl:152-160`'s `publish_flag/3` does for a node that was not started
+    /// `-hidden`. The bit is what makes a real peer list this runtime in `nodes()`:
+    /// without it every peer classifies it as *hidden* and only `nodes(hidden)`/
+    /// `nodes(connected)` show the link.
+    ///
+    /// The assertion is on the peer's view of the acceptor's `Challenge`, i.e. the bytes
+    /// that actually crossed the socket, not on a locally computed set.
+    #[test]
+    fn the_acceptor_publishes_the_node_unless_it_is_hidden() {
+        let published = DistFlags::from_bits(beam_dist::flags::DFLAG_PUBLISHED);
+        let name = unique_node("published");
+        let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+        assert!(!node.is_hidden(), "a node is published unless `-hidden` says otherwise");
+        assert!(
+            node.advertised_flags().contains(published),
+            "the node's own flag set carries DFLAG_PUBLISHED: 0x{:x}",
+            node.advertised_flags().bits()
+        );
+        let peer_view = acceptor_flags_as_the_peer_read_them(&mut node);
+        assert!(
+            peer_view.contains(published),
+            "the peer read the acceptor's flags as 0x{:x}, which omits DFLAG_PUBLISHED \
+             (0x{:x}) — such a node is hidden to every real peer",
+            peer_view.bits(),
+            beam_dist::flags::DFLAG_PUBLISHED
+        );
+        assert_eq!(
+            peer_view.bits(),
+            (preferred_flags() | publish_flag(false, true)).bits(),
+            "the advertised set is the emulator default plus exactly DFLAG_PUBLISHED"
+        );
+        assert!(
+            peer_view.contains(preferred_flags()),
+            "every capability of the emulator default is still advertised"
+        );
+    }
+
+    /// The `-hidden` half: a node started hidden advertises the emulator default
+    /// **unchanged** — no `DFLAG_PUBLISHED` — so a real peer records it as
+    /// [`PeerVisibility::Hidden`] and leaves it out of `nodes()` (`-hidden` is a
+    /// per-node choice, `dist_util.erl:152-160`).
+    #[test]
+    fn a_hidden_node_withholds_the_published_bit() {
+        let name = unique_node("hidden");
+        let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+        node.set_hidden(true);
+        assert!(node.is_hidden(), "`set_hidden(true)` takes effect");
+        assert!(
+            !node
+                .advertised_flags()
+                .contains(DistFlags::from_bits(beam_dist::flags::DFLAG_PUBLISHED)),
+            "a hidden node's own flag set omits DFLAG_PUBLISHED: 0x{:x}",
+            node.advertised_flags().bits()
+        );
+        let peer_view = acceptor_flags_as_the_peer_read_them(&mut node);
+        assert!(
+            !peer_view.contains(DistFlags::from_bits(beam_dist::flags::DFLAG_PUBLISHED)),
+            "the peer read the hidden acceptor's flags as 0x{:x}, which still sets \
+             DFLAG_PUBLISHED (0x{:x})",
+            peer_view.bits(),
+            beam_dist::flags::DFLAG_PUBLISHED
+        );
+        assert_eq!(
+            peer_view.bits(),
+            preferred_flags().bits(),
+            "a hidden node advertises the emulator default, unchanged"
+        );
+        // Back to published: the switch is a plain property, reversible before a pump.
+        node.set_hidden(false);
+        assert!(!node.is_hidden(), "`set_hidden(false)` publishes the node again");
     }
 
     /// An **established** accepted link is bound to its peer's node atom term, which is

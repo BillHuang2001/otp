@@ -924,8 +924,19 @@ impl Runtime {
         // first scheduler pass. The cookie comes from `-setcookie`/`$HOME/.erlang.cookie`,
         // resolved **once** so the runtime's own `cookie` field and the node agree.
         let cookie = resolve_cookie(&config.init_args);
+        // `-hidden` is an ordinary command-line argument to `init` (`net_kernel.erl`'s
+        // `hidden_argument/0` reads exactly `init:get_argument(hidden)`), so the CLI has
+        // already recorded it. A hidden node's handshake omits `DFLAG_PUBLISHED`, which is
+        // what keeps it out of a peer's `nodes()`; a normal node publishes itself.
+        // Both distribution halves are told, because visibility is the node's, not the
+        // dialler's.
+        let hidden = config.init_args.get("hidden").is_some();
         let dist = match config.emulator.node_name.as_deref() {
-            Some(name) => Some(DistNode::start(name, cookie.clone())?),
+            Some(name) => {
+                let mut node = DistNode::start(name, cookie.clone())?;
+                node.set_hidden(hidden);
+                Some(node)
+            }
             None => None,
         };
         // The native **`net_kernel` service** (contract A.5): a `Runnable`, never-enqueued
@@ -968,6 +979,7 @@ impl Runtime {
         let dist_client = match dist.as_ref() {
             Some(node) => {
                 let client = DistClient::new(cookie.clone())?;
+                client.set_hidden(hidden);
                 // The advertised name is the full `node@host` form (a `-sname` node is not
                 // advertised bare), which `node_name()` already returns; the creation is the
                 // value known so far (the `epmd`-assigned one is only final after the node's
