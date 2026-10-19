@@ -287,7 +287,7 @@ Numbers are in-crate per-element or the runtime-route per-op conversions above.
 
 Read the profiles with these grain-of-salt facts: `families::dispatch` is the per-instruction tax of a *non-inlined* family with the router inlined (not a lookup), `jit::baseline::drive` is ~20 instructions + 2 indirect calls per **block entry** (not a hot loop body), `call_registered`'s per-BIF self is dominated by the copy-out (a `term_to_binary` binary counts as a foreign container by `calls.rs:913-916`), and `RuntimeContext`/`DispatchMemo`/`enter_module` at 0.00 % is inlining, not absence.
 Provably redundant per-call work in the baseline tier: `jit_call_store`'s re-decode + `labels.resolve` (#4); the `local_call_seam` ask (#2); `CompiledModule::function`'s `Rc::clone`/drop + `RefCell` borrow per entry for an artifact alive for the whole run (`code.rs:344-368`); and `set_current_code` written 3× per element with the same value (worth ~0.2 ns — not a lever).
-Per element, `list_walk` crosses 4 `extern "C"` helpers, **2 driver-loop iterations**, 2 host vtable calls (`resolve_local_call`, `reduce`) and 1 `Rc` refcount RMW pair.
+Per element, `list_walk` crosses 4 `extern "C"` helpers, **0.0001 driver-loop iterations** (2 per 20 000-element call — the walk's `call_only` is linked in-block), 2 host vtable calls (`resolve_local_call`, `reduce`) and 1 `Rc` refcount RMW pair.
 
 ## Constraints / Notes for Agents
 - **`MinimalContext` opts out of the reduction hook** (`wants_reduce() == false`), so `CountingContext` MUST override it to `true` or the instruction count silently stays 0.
