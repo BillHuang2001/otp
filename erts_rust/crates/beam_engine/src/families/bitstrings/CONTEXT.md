@@ -161,7 +161,14 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     byte model) whenever `nbits > 64` **or** the value is a bignum, so a bignum is masked
     into a narrow field exactly as C's `fmt_big_be`/`fmt_big_le` do.
   - `segments.rs` → the per-segment-type sources and encoders (`segment_source`,
-    `string_source`, `float_source`, `put_float`/`f64_to_f16`, `put_utf8/16/32`). The
+    `string_source`, `float_source`, `put_float`/`f64_to_f16`, `put_utf8/16/32`), and the
+    **cold-body host**: `binary_segment`/`string_segment`/`float_segment`/`utf_segment`
+    return `Result<SegOutcome>` (`Written` | `Fail(Step)`), and
+    `float_source`/`put_float`/`put_utf8`/`put_utf16`/`put_utf32` are `#[inline(never)]`, so
+    `assemble`'s hot block (the `private_append` + `integer` walk) stays small.
+    `binary_segment` alone is `#[inline]` (a single call site on the accumulator hot path).
+    Inlining all four was measured a **net regression** (`decode` +3.5 %, `capitalize_token`
+    +1.8 %) — do not re-attempt it. The
     `float` source accepts a float, a small integer **or a bignum** (the nearest finite
     double via `beam_term::number::big_to_f64`, the `big_to_double` port); only a
     non-number or a magnitude that overflows a finite double is `badarg`
