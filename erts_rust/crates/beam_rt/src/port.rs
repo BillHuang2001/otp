@@ -178,7 +178,7 @@ pub(crate) mod watch;
 use beam_alloc::Heap;
 use beam_abi::driver::types::PORT_CONTROL_FLAG_BINARY;
 use beam_bifs::PortHook;
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use libc::c_int;
 use beam_io::{
@@ -1279,8 +1279,89 @@ impl PortRegistry {
         self.meta.contains_key(&id.number())
     }
 
+    /// Hands a command to the port the way `erlang:port_command/2,3` does, taking the command's
+    /// bytes from `make_data` **only once the port has accepted the command** — the C's own order.
+    ///
+    /// The C resolves the port and tests the driver's flag word **before** `erts_port_output` runs
+    /// (`erts_internal_port_command_3`, `erts/emulator/beam/erl_bif_port.c:190-198`), and
+    /// `erts_port_output` answers `ERTS_PORT_OP_BUSY` from the port's scheduler flags **before** it
+    /// converts `Data` (`io.c:1749-1754`, against the `erts_ioq_iodata_vec_len`/
+    /// `io_list_to_buf` conversion at `io.c:1790`/`:1866`). A `[nosuspend]` command on a busy port
+    /// therefore answers the atom `false` even when `Data` is **not iodata at all** — the command is
+    /// dropped, never `badarg`. A bytes-first seam cannot reproduce that (the caller converts first,
+    /// so the conversion failure wins), which is why this variant takes a producer and calls it
+    /// only on the accept path.
+    ///
+    /// The pre-conversion gate is [`PortRegistry::decide_before_data`], the C's two checks that
+    /// answer without looking at `Data`; a command that passes it is handed to
+    /// [`PortRegistry::command`], where [`beam_io`]'s decision table re-decides on the converted
+    /// bytes and the accepted command's round and byte accounting run. The two halves read the same
+    /// facts, so a command the gate accepts cannot then be refused as busy.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PortRegistry::command`], plus whatever `make_data` returns (the caller's own iodata
+    /// conversion — `badarg` for a term that is not iodata).
+    pub fn command_with_data<F>(
+        &mut self,
+        id: PortId,
+        make_data: F,
+        options: PortCommandOptions,
+    ) -> Result<PortCommandOutcome>
+    where
+        F: FnOnce() -> Result<Vec<u8>>,
+    {
+        if let Some(outcome) = self.decide_before_data(id, options)? {
+            return Ok(outcome);
+        }
+        let bytes = make_data()?;
+        self.command(id, &bytes, options)
+    }
+    /// The C's **pre-conversion** half of the `port_command` decision: the checks that answer
+    /// without ever looking at the data, in the C's order.
+    ///
+    /// * the port must be live — `sig_lookup_port`'s `badarg` (`erl_bif_port.c:190-193`), which
+    ///   [`beam_io::PortRegistry::is_busy`] reports as its own `badarg` for an unknown port;
+    /// * `[force]` is refused `error:notsup` unless the driver **entry** advertises
+    ///   `ERL_DRV_FLAG_SOFT_BUSY` (`erl_bif_port.c:195-198`) — a fact about the entry, so it holds
+    ///   on an idle port too;
+    /// * otherwise a **busy** port is `ERTS_PORT_OP_BUSY` (`io.c:1749-1754`): nothing is queued,
+    ///   and the runtime answers `false` or suspends the caller.
+    ///
+    /// `Some(outcome)` is that answer; `None` means the command is accepted so far and its bytes
+    /// may be converted.
+    ///
+    /// Both facts are the ones the port layer's own decision reads — the state through
+    /// [`beam_io::Driver::is_busy`] (whom [`beam_io::PortRegistry::is_busy`] forwards to) and the
+    /// entry flag through [`PortRegistry::soft_busy`], the runtime's mirror of the
+    /// `ERL_DRV_FLAG_SOFT_BUSY` bit a loaded driver entry reported (the very handle
+    /// [`driver::DriverPortAdapter::flags`] answers from) — so the gate can never disagree with the
+    /// decision that follows it.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened), and
+    /// the `notsup` raise for `[force]` on a driver without `ERL_DRV_FLAG_SOFT_BUSY`.
+    fn decide_before_data(
+        &self,
+        id: PortId,
+        options: PortCommandOptions,
+    ) -> Result<Option<PortCommandOutcome>> {
+        let busy = self.registry.is_busy(id)?;
+        if options.is_force() {
+            if !self.soft_busy(id) {
+                return Err(notsup());
+            }
+            return Ok(None);
+        }
+        Ok(busy.then_some(PortCommandOutcome::Busy))
+    }
     /// Hands `bytes` to the port the way `erlang:port_command/2,3` does, and reports what the
     /// port's **busy state** and the command options made of it.
+    ///
+    /// This is [`PortRegistry::command_with_data`]'s **eager** form: the bytes are already
+    /// converted, so the C's order (busy before conversion) is not observable and a caller holding
+    /// a *term* must use `command_with_data` instead.
     ///
     /// The **decision** is [`beam_io`]'s — [`beam_io::PortRegistry::port_command_with`], whose
     /// [`beam_io::Port::command`] is the crate's one implementation of the C's decision table
@@ -2777,6 +2858,32 @@ impl RuntimePorts {
     ) -> Result<PortCommandOutcome> {
         self.registry_mut()?.command(port, bytes, options)
     }
+    /// Hands a command to a port the way `erlang:port_command/2,3` does, converting the data
+    /// **only once the port has accepted the command** — [`PortRegistry::command_with_data`], the
+    /// C's own order (the busy state and the driver's flag word are decided before `Data` is
+    /// converted, `io.c:1749-1754` vs `:1790`).
+    ///
+    /// This is the seam `crate::native::port`'s `port_command` floor uses: it holds the **term**,
+    /// not bytes, so a `[nosuspend]` command on a busy port must be able to answer `false` without
+    /// ever converting it.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PortRegistry::command_with_data`], plus whatever `make_data` returns; a nested
+    /// borrow of the registry is the typed capability gap of [`RuntimePorts::registry_mut`], never a
+    /// panic.
+    pub fn command_with_data<F>(
+        &mut self,
+        port: PortId,
+        make_data: F,
+        options: PortCommandOptions,
+    ) -> Result<PortCommandOutcome>
+    where
+        F: FnOnce() -> Result<Vec<u8>>,
+    {
+        self.registry_mut()?
+            .command_with_data(port, make_data, options)
+    }
 
     /// `erts_internal:port_control(Port, Op, Data)` — deliver a port-control operation to the
     /// port's driver and return its reply bytes.
@@ -4143,7 +4250,17 @@ fn opens_a_driver_port(spec: &NameSpec) -> bool {
         PortName::SpawnExecutable | PortName::Fd => false,
     }
 }
-/// The driver search a `{spawn_driver, Name}` name performs: the candidate object paths to try
+
+/// The `error:notsup` raise a `[force]` command answers on a driver whose entry does not
+/// advertise `ERL_DRV_FLAG_SOFT_BUSY`
+/// (`erts/emulator/beam/erl_bif_port.c:195-198`).
+///
+/// [`PortRegistry::decide_before_data`] needs it because it answers that arm **before** the command
+/// reaches [`beam_io`], whose [`beam_io::Port::command`] raises the identical reason for the same
+/// rule; both spell the bare atom the oracle raises, never a message the harness could not compare.
+fn notsup() -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom("notsup")))
+}/// The driver search a `{spawn_driver, Name}` name performs: the candidate object paths to try
 /// and the driver name the loaded entry must declare.
 ///
 /// The C looks the name's prefix up to the first space up in its **loaded-driver list**

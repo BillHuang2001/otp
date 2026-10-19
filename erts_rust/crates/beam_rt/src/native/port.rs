@@ -264,23 +264,27 @@ impl RuntimeContext<'_> {
         } else {
             CommandOptions::default()
         };
-        // The iodata is collected here — the port layer's seam takes bytes — and the **whole**
-        // decision on them is `beam_io`'s, reached through the port hook
-        // ([`RuntimePorts::command`](crate::port::RuntimePorts::command), which wraps
-        // `beam_io::PortRegistry::port_command_with`): a dead port is `badarg` (the C's
-        // `sig_lookup_port`), `[force]` on a driver entry without `ERL_DRV_FLAG_SOFT_BUSY` is
-        // `notsup` whether or not the port is busy (`erl_bif_port.c:195-198`), and a busy port is
-        // the C's `ERTS_PORT_OP_BUSY` with **nothing queued** (`io.c:1763-1769`).
-        let mut bytes = Vec::new();
-        self.iodata_bytes(data, &mut bytes)?;
+        // The iodata is collected **only if the port's decision accepts the command** — the C's
+        // order (`io.c:1749-1754` before `:1790`), reached through the port hook
+        // ([`RuntimePorts::command_with_data`](crate::port::RuntimePorts::command_with_data)): a
+        // dead port is `badarg` (the C's `sig_lookup_port`), `[force]` on a driver entry without
+        // `ERL_DRV_FLAG_SOFT_BUSY` is `notsup` whether or not the port is busy
+        // (`erl_bif_port.c:195-198`), and a busy port is the C's `ERTS_PORT_OP_BUSY` with
+        // **nothing queued** (`io.c:1763-1769`) — all decided before the conversion, so a
+        // `[nosuspend]` command on a busy port answers `false` even for non-iodata `Data`.
+        let make_data = || {
+            let mut bytes = Vec::new();
+            iodata_bytes(data, &mut bytes)?;
+            Ok(bytes)
+        };
         let mut hook = crate::port::RuntimePorts::new(
             Rc::clone(&self.runtime.ports),
             self.runtime.code_server.atoms_handle(),
             self.pid(),
         );
-        let outcome = hook.command(
+        let outcome = hook.command_with_data(
             port,
-            &bytes,
+            make_data,
             beam_io::PortCommandOptions::EMPTY
                 .with_force(options.force)
                 .with_nosuspend(options.nosuspend),
@@ -874,7 +878,9 @@ mod tests {
     /// returning its id together with the shared handle a driver would write through
     /// `set_busy_port` (bypasses `open_port/2` so no C compiler is needed).
     fn busy_port(runtime: &mut Runtime, busy: bool, soft_busy: bool) -> (PortId, BusyFlag) {
-        crate::port::test_support::register_busy_port(runtime, "native_port_busy", busy, soft_busy)
+        let (port, flag, _writes) =
+            crate::port::test_support::register_busy_port(runtime, "native_port_busy", busy, soft_busy);
+        (port, flag)
     }
 
     /// The busy-port arms of `erlang:port_command/2,3`, pinned against the oracle

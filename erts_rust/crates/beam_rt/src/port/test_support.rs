@@ -92,6 +92,13 @@ impl ControlVerb {
 /// An **unknown** verb is [`BeamError::BadArg`], the C's own answer for a command the driver
 /// rejects (a negative `cres`, `io.c:4074`), so a test can tell "the driver saw the verb" from
 /// "the runtime substituted one".
+///
+/// It also carries the two facts `beam_io`'s `port_command` decision reads off the **driver**
+/// ([`Driver::is_busy`] and [`Driver::flags`]) when the caller supplied them, forwarded from the
+/// very [`BusyFlag`] the port's metadata holds — exactly as
+/// [`DriverPortAdapter`](super::driver::DriverPortAdapter) forwards its own
+/// (`super::driver::DriverPortAdapter::is_busy`/`flags`). Without that, a fixture port could look
+/// busy to the runtime's metadata and idle to the port layer's decision table.
 pub(crate) struct ControlDriver {
     /// The registered driver name (the trait requires one; nothing looks it up here).
     name: &'static str,
@@ -100,6 +107,12 @@ pub(crate) struct ControlDriver {
     /// The port's control-flag cell, shared with the [`PortMeta`] the runtime reads after the
     /// callback — the C's `prt->control_flags`.
     flags: Rc<Cell<libc::c_int>>,
+    /// The port's busy state and its entry's `ERL_DRV_FLAG_SOFT_BUSY` claim, or `None` for a
+    /// fixture that is never busy (the state every port no driver has reported on is in).
+    busy: Option<BusyFlag>,
+    /// How many times the driver's `output` callback ran — the fixture's evidence that a refused
+    /// or dropped command reached **no write** at all.
+    writes: Rc<Cell<usize>>,
 }
 
 impl Driver for ControlDriver {
@@ -112,7 +125,27 @@ impl Driver for ControlDriver {
     }
 
     fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+        self.writes.set(self.writes.get() + 1);
         Ok(0)
+    }
+
+    /// The port's busy state as its driver last reported it (`set_busy_port`) — the C's
+    /// `ERTS_PTS_FLG_BUSY_PORT`, which `beam_io::Port::command` reads to answer
+    /// `ERTS_PORT_OP_BUSY` (`io.c:1749-1769`).
+    fn is_busy(&self) -> bool {
+        self.busy.as_ref().is_some_and(BusyFlag::is_busy)
+    }
+
+    /// The driver entry's capability flags in `beam_io`'s vocabulary: this fixture advertises
+    /// `ERL_DRV_FLAG_SOFT_BUSY` when the caller said so, and nothing otherwise — the same one-bit
+    /// mapping `DriverPortAdapter::flags` performs from a loaded entry's `driver_flags`.
+    fn flags(&self) -> beam_io::DriverFlags {
+        let flags = beam_io::DriverFlags::empty();
+        if self.busy.as_ref().is_some_and(BusyFlag::soft_busy) {
+            flags.union(beam_io::DriverFlags::SOFT_BUSY)
+        } else {
+            flags
+        }
     }
 
     fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
@@ -166,28 +199,35 @@ pub(crate) fn register_control_port(
     name: &'static str,
     verbs: Vec<ControlVerb>,
 ) -> (PortId, Rc<Cell<libc::c_int>>) {
-    register_driver_port(runtime, name, verbs, None, None)
+    let (id, flags, _writes) = register_driver_port(runtime, name, verbs, None, None);
+    (id, flags)
 }
 
 /// Registers a [`ControlDriver`] as a live `{spawn_driver, _}`-kind port that reports the **busy**
-/// state `busy`, and returns its id together with the shared [`BusyFlag`] handle so a test can
-/// toggle the state (`set_busy_port`) the way a C driver does from inside a callback.
+/// state `busy`, and returns its id together with the shared [`BusyFlag`] handle — so a test can
+/// toggle the state (`set_busy_port`) the way a C driver does from inside a callback — and the
+/// driver's **write counter**.
 ///
-/// The handle is shared by `Rc` with the registered port's metadata — exactly as
-/// [`super::driver::DriverPort::busy_flag`] is with a real C host — so
-/// [`PortRegistry::is_busy`](super::PortRegistry::is_busy) sees every change, and a test can drive
-/// the `erlang:port_command/2,3` busy arms without a C compiler.
+/// The flag handle is shared by `Rc` with the registered port's metadata **and** with the driver
+/// itself, exactly as [`super::driver::DriverPort::busy_flag`] is with a real C host: the runtime's
+/// [`PortRegistry::is_busy`](super::PortRegistry::is_busy) reads the metadata and `beam_io`'s
+/// `port_command` decision reads [`Driver::is_busy`]/[`Driver::flags`], so both see every change
+/// and a test can drive the `erlang:port_command/2,3` busy arms without a C compiler.
+///
+/// The counter is the fixture's own proof that a refused or dropped command reached **no write**:
+/// it increments once per `output` callback the port layer actually ran.
 pub(crate) fn register_busy_port(
     runtime: &mut Runtime,
     name: &'static str,
     busy: bool,
     soft_busy: bool,
-) -> (PortId, BusyFlag) {
+) -> (PortId, BusyFlag, Rc<Cell<usize>>) {
     let flag = BusyFlag::new();
     flag.set_busy(busy);
     flag.set_soft_busy(soft_busy);
-    let (id, _flags) = register_driver_port(runtime, name, Vec::new(), None, Some(flag.clone()));
-    (id, flag)
+    let (id, _control_flags, writes) =
+        register_driver_port(runtime, name, Vec::new(), None, Some(flag.clone()));
+    (id, flag, writes)
 }
 
 /// Registers a [`ControlDriver`] as a live `{spawn_driver, _}`-kind port that **holds the
@@ -207,24 +247,33 @@ pub(crate) fn register_monitored_port(
     name: &'static str,
     monitors: Rc<super::driver::DriverMonitors>,
 ) -> PortId {
-    let (id, _flags) = register_driver_port(runtime, name, Vec::new(), Some(monitors), None);
+    let (id, _flags, _writes) =
+        register_driver_port(runtime, name, Vec::new(), Some(monitors), None);
     id
 }
 
 /// The one body behind both fixtures above: a [`ControlDriver`] with `verbs` registered under
-/// `name`, carrying `driver_monitors` when the caller asked for a monitor tree.
+/// `name`, carrying `driver_monitors` when the caller asked for a monitor tree and `driver_busy`
+/// when it asked for a controllable busy state.
+///
+/// A `driver_busy` handle is shared by `Rc` with **both** the driver (whose
+/// `is_busy`/`flags` the port layer's decision reads) and the [`PortMeta`] (which the runtime's own
+/// `is_busy`/`soft_busy` read), so the two views of one port can never disagree.
 fn register_driver_port(
     runtime: &mut Runtime,
     name: &'static str,
     verbs: Vec<ControlVerb>,
     driver_monitors: Option<Rc<super::driver::DriverMonitors>>,
     driver_busy: Option<BusyFlag>,
-) -> (PortId, Rc<Cell<libc::c_int>>) {
+) -> (PortId, Rc<Cell<libc::c_int>>, Rc<Cell<usize>>) {
     let flags = Rc::new(Cell::new(0));
+    let writes = Rc::new(Cell::new(0));
     let driver = ControlDriver {
         name,
         verbs,
         flags: Rc::clone(&flags),
+        busy: driver_busy.clone(),
+        writes: Rc::clone(&writes),
     };
     let meta = PortMeta {
         command: name.to_string(),
@@ -261,5 +310,5 @@ fn register_driver_port(
     let id = registry
         .register(Box::new(driver), meta)
         .expect("the fixture port registers");
-    (id, flags)
+    (id, flags, writes)
 }
