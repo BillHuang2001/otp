@@ -44,16 +44,22 @@
 //! # Answers
 //!
 //! The C's only two outcomes, never a third: `Some(true)` / `Some(false)` from the provider, which
-//! `beam_abi`'s `enif_send` renders as `1` / `0`. Two paths answer without a delivery and neither
-//! fabricates success:
+//! `beam_abi`'s `enif_send` renders as `1` / `0`. Three paths answer without a provider delivery and
+//! none fabricates success:
 //!
-//! * **no provider** — the load/unload host ([`NifHostImpl`] built with `services: None` by
-//!   [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) has no runtime to reach, so the
-//!   trait default `None` applies and `enif_send` answers `0`. The C's `env->proc == NULL` case
-//!   (a `load`/`upgrade`/`dtor`/thread call) is therefore a reported `0` here rather than a silent
-//!   success. Closing it needs a `'static`-safe handle to the runtime's process table, which the
-//!   boxed host cannot hold: the host *is* owned by the runtime (`Runtime::nifs`), so such a
-//!   handle would be a self-reference. See [`crate::nif`]'s module docs.
+//! * **no provider, inside a `load` callback** — the load/unload host ([`NifHostImpl`] built with
+//!   `services: None` by [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) has no runtime
+//!   to reach, so the host serves `enif_send` out of its own callback-scoped pending-send window
+//!   ([`NifHostImpl::with_load_sends`]): the send is queued and answers the C's `1` for an internal
+//!   local pid, and `NifBridge::load_nif` delivers it through [`deliver`] the moment the callback
+//!   returns — still inside the `erlang:load_nif/2` call, so the message is in the receiver's mailbox
+//!   before Erlang continues.
+//! * **no provider, outside that window** — the `unload`/resource-`dtor` callback (whose window closed
+//!   with the load callback, and which no drain point would honour) and the scratch host keep the
+//!   trait default `None`, which `enif_send` renders as `0`. A destination naming a **dead** local pid
+//!   is the one honest residual inside the window: it is accepted (`1`) where the C answers `0`,
+//!   because the liveness relation lives in a process table the load host cannot reach — the drain
+//!   then reports the undelivered message on the debug-trace channel.
 //! * **a `from` that is not an internal pid** — no such term can be built by this host (its
 //!   `self_pid` is always a local pid), and a pid the runtime cannot name names no sender, so the
 //!   answer is the ABI's `0` rather than a delivery attributed to nobody.

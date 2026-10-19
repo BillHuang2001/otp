@@ -88,7 +88,8 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `cli.rs` + `cli/` → the A.6 CLI parser/driver, the four `EXIT_*` codes and the boot-script drive
   (`cli/CONTEXT.md`).
 - `context/` → the concrete `ExecutionContext` glue, the host-seam bridges and the NIF-dispatch order
-  (`context/CONTEXT.md`).
+  (`context/CONTEXT.md`); the `load`-callback `enif_send` window is drained by `NifBridge::load_nif`
+  (`context/bridges.rs`) the moment the callback returns, over the pass's own process table.
 - `native.rs` + `native/` → the runtime-native BIF floor (`try_native`, before the registry), the
   native `file_server_2` service and the code/init/application/memory floors (`native/CONTEXT.md`).
 - `info.rs` + `info/` → the A.8 `system_info`/`process_info` introspection surface, incl. this file's
