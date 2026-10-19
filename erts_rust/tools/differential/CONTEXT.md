@@ -146,7 +146,7 @@ Corpus groups (`src/corpus/*`): the **per-group inventory is the `differential-c
 - A.7 → `bifs.rs`, `ets.rs`, `ets_access.rs`, `ets_spec.rs`, `maps.rs`, `phash.rs`, `binmatch.rs`, `math_bifs.rs`, `printing.rs`, `re.rs` (141), `format_limit.rs` (21), `ddll.rs` (21), `decode_packet.rs` (43), `proc_signals.rs`, `proc_control.rs`, `records.rs`, `zlib.rs` (36)
 - A.8 → `system_info.rs`
 - A.1/A.7 → `bits.rs` (37), `gc.rs` (38)
-- A.9 → `boot.rs`, `boot_prereq.rs` (72), `boot_extra.rs` (275), `selfhost.rs` (26)
+- A.9 → `boot.rs`, `boot_prereq.rs` (72), `boot_extra.rs` (275), `selfhost.rs` (26), `selfhost_chain.rs` (7)
 - A.2/A.7 module-run → `modules.rs` (71), `mexec.rs`, `mexec_extra.rs` (60)
 - registry → `mod.rs` (`Case`/`CaseKind`/`PeerRun`/nonce/`expand_env` + the registry and its well-formedness tests)
 Each file's own module doc is still the per-case reference. Three traps stay here because each one manufactures a false `mismatch`: a probe must not bind `V`/`C`/`R` (the wrapper binds them); an expression containing a `case` or a `<<…>>` pattern must be wrapped in an immediately-applied fun (the *oracle's* `erl_eval` cannot evaluate it inside the probe's `try` body); and no golden may be order-unstable (a multi-key atom-keyed map `~w`, a per-VM-start pid/port/ref/creation value, a temp-dir path).
