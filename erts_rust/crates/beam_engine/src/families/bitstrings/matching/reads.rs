@@ -93,7 +93,46 @@ pub(crate) fn skip_utf(
 /// maximum (`2^59-1`) still fits. A 60..64-bit field, and every little-endian
 /// field of 9 or more bits (C has no small fast path for those), can therefore
 /// exceed `MAX_SMALL` and must build a bignum.
-pub(crate) fn read_integer_field(
+///
+/// The second half of the result is the **allocation witness** a match-context caller
+/// needs. A field that fits a small integer is a plain immediate: the read allocates
+/// nothing from the BEAM heap, so a match context (and its `orig` subject) read *before*
+/// the field is still live *after* it — and the caller may reuse its captured context
+/// term, byte view and window end instead of re-reading them through the operand. A
+/// field that does **not** fit goes through `raw::make_big` (C's general path,
+/// `erl_bits.c:245-398`), which reserves **rooted** and so may run a moving collector.
+///
+/// The flag is exact rather than merely conservative, and it is derived from the
+/// constructed term instead of from a second copy of the width/sign decision:
+/// [`make_int`] is the only BEAM-heap allocator on this path, and it either returns a
+/// small-integer immediate ([`beam_term::make_small`]) or the bignum `raw::make_big`
+/// wrote — which is never a small. So [`may_have_allocated`] is exactly "the rooted seam
+/// ran" and cannot drift from the two `make_int` call sites the way a duplicated
+/// predicate could.
+pub(crate) fn read_integer_field_tracked(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    bytes: &[u8],
+    start: usize,
+    nbits: usize,
+    flags: u32,
+) -> Result<(Eterm, bool)> {
+    let value = read_integer_field_untracked(machine, ctx, bytes, start, nbits, flags)?;
+    Ok((value, may_have_allocated(value)))
+}
+
+/// `true` when building `value` may have reserved through the rooted seam: false for a
+/// small-integer immediate, true for anything else (the bignum `raw::make_big` builds).
+///
+/// This is the conservative direction that matters — a `true` only costs a re-read,
+/// while a wrong `false` would hand a live term to a relocated block.
+#[inline]
+pub(crate) fn may_have_allocated(value: Eterm) -> bool {
+    !beam_term::is_small(value)
+}
+
+/// The field read itself; [`read_integer_field_tracked`] is the reported form.
+fn read_integer_field_untracked(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     bytes: &[u8],
@@ -198,6 +237,14 @@ pub(crate) fn bits_equal(a: &[u8], astart: usize, b: &[u8], bstart: usize, nbits
 /// Read `nbits` bits (a whole number of bytes) starting at bit `start` as a
 /// **little-endian** integer: the field's least-significant byte comes first in the
 /// stream, each byte taken MSB-first.
+///
+/// A **byte-aligned** field (the only shape `read_integer_field`'s little-endian fast
+/// path sends here, and the shape a `-little` float/UTF read almost always has) is the
+/// shared whole-byte little-endian reader [`read_uint_le`] — the same bytes for the same
+/// bits, without the per-bit transposition below. Only a little-endian field that starts
+/// mid-byte still needs the bit-granular loop (C's `erts_copy_bits_fwd`), and that shape
+/// is not reachable from `read_integer_field` (it routes it to
+/// [`read_wide_integer_field`]) — it survives for the float/UTF callers.
 pub(crate) fn read_uint_le_bits(bytes: &[u8], start: usize, nbits: usize) -> Result<u64> {
     if nbits % 8 != 0 {
         return Err(error::unsupported(
@@ -208,6 +255,12 @@ pub(crate) fn read_uint_le_bits(bytes: &[u8], start: usize, nbits: usize) -> Res
         return Err(error::unsupported(
             "bitstring: little-endian field out of range",
         ));
+    }
+    // A byte-aligned field is exactly its source bytes, least-significant first: the
+    // shared reader's range check is the one just made (`start / 8 + nbits / 8 >
+    // bytes.len()` ⟺ `start + nbits > bytes.len() * 8` for an aligned field).
+    if start % 8 == 0 {
+        return read_uint_le(bytes, start, nbits);
     }
     let mut value = 0u64;
     for k in 0..nbits / 8 {
@@ -425,12 +478,17 @@ mod tests {
     fn read_integer_field_accepts_a_non_byte_multiple_little_endian_field() {
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
-        let term = read_integer_field(&mut machine, &mut ctx, &[0x02, 0x10], 0, 12, BSF_LITTLE)
-            .expect("a 12-bit little-endian field reads bit-granularly");
+        let (term, allocated) =
+            read_integer_field_tracked(&mut machine, &mut ctx, &[0x02, 0x10], 0, 12, BSF_LITTLE)
+                .expect("a 12-bit little-endian field reads bit-granularly");
         assert!(
             beam_term::is_small(term),
             "16#102 fits a small integer, so no bignum is built"
         );
         assert_eq!(beam_term::signed_value(term), 0x102);
+        assert!(
+            !allocated,
+            "a small-integer field allocates nothing, so a caller may keep its context capture"
+        );
     }
 }
