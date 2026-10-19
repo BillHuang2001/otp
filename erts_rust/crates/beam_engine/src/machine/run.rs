@@ -541,7 +541,8 @@ mod tests {
     /// The module here is synthetic (no content identity, so `label_cache` never holds
     /// it), so the single entry pays exactly one `build_label_map` — resolving the entry
     /// label and the dispatch loop share that one map instead of each deriving its own.
-    /// The `cfg(test)` counter ([`crate::interpreter`]) makes the count observable here.    #[test]
+    /// The `cfg(test)` counter ([`crate::interpreter`]) makes the count observable here.
+    #[test]
     fn run_export_builds_the_label_map_exactly_once() {
         let (module, name) = module_with_code(
             "f",

@@ -225,7 +225,8 @@ fn finish_module(mut module: Module, name: &str, arity: u32, body: Vec<Instr>) -
 /// caches it, but a synthetic image (all-zero checksum) is never cached, so the bench
 /// modules pay one build in the warm-up rather than in the timed loop.
 /// Duplicate `Instr::Label`s collapse (last wins), which is exactly what the
-/// no-op baseline relies on (see [`bench_dispatch_noop`]).fn collect_labels(code: &[Instr]) -> BTreeMap<Label, usize> {
+/// no-op baseline relies on (see [`bench_dispatch_noop`]).
+fn collect_labels(code: &[Instr]) -> BTreeMap<Label, usize> {
     code.iter()
         .enumerate()
         .filter_map(|(index, instr)| match instr {
