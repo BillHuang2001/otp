@@ -29,7 +29,7 @@
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{ImportRef, Instr, Module, NO_FAIL};
 use beam_term::{
-    atom_val, cmp, is_atom, is_internal_pid, is_list, is_nil, make_atom, Eterm, NIL,
+    atom_val, is_atom, is_internal_pid, is_list, is_nil, make_atom, Eterm, NIL,
 };
 
 use crate::context::ExecutionContext;
@@ -352,14 +352,8 @@ impl Machine {
             }
             Instr::SelectVal { value, fail, pairs } => {
                 let scrutinee = read_operand(self, ctx, value)?;
-                let mut target = None;
-                for (candidate, label) in pairs {
-                    let candidate_value = read_operand(self, ctx, candidate)?;
-                    if cmp(scrutinee, candidate_value, ctx.atoms(module)).is_eq() {
-                        target = Some(*label);
-                        break;
-                    }
-                }
+                let target =
+                    super::select::first_match(self, ctx, module, scrutinee, pairs)?;
                 match target {
                     Some(label) => {
                         let (func, pc) = resolve(labels, label)?;

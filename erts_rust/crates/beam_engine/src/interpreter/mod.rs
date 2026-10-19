@@ -49,6 +49,7 @@ use crate::error;
 
 mod bif;
 mod dispatch;
+mod select;
 mod test;
 mod trace;
 #[cfg(test)]
@@ -57,6 +58,12 @@ mod tests;
 // The one definition of the failed-clause `function_clause` raise, shared with the
 // instruction families (the maps read path's absent-key `NO_FAIL` branch).
 pub(crate) use dispatch::raise_function_clause_no_fail;
+// The `select_val` pair ladder (`select.rs`): the single decision authority the
+// interpreter's `SelectVal` arm **and** both native tiers' `select_val` plans use,
+// so no tier can drift from another's notion of "this alternative matches".
+pub(crate) use select::constant_word;
+#[cfg(test)]
+pub(crate) use select::{reset_select_answers, select_answers};
 // The frame discipline of the `call_ext*` forms, shared with a sibling module that
 // drives `Machine::call_ext_dispatch` for a given form. Its consumer is the JIT tier
 // (`crate::jit`), so the import is not itself "used" by anything in this module today

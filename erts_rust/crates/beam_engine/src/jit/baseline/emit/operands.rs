@@ -30,7 +30,7 @@ use std::mem;
 
 use beam_common::Result;
 use beam_loader::{Operand, Reg as RegRef};
-use beam_term::{make_atom, make_small, Eterm, MAX_SMALL, MIN_SMALL, NIL};
+use beam_term::{make_small, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
@@ -99,14 +99,13 @@ pub(crate) fn y_register(operand: &Operand) -> Option<u32> {
 /// `jit_step_one`, whose interpreter step materialises the exact bignum through
 /// [`crate::terms::make_integer`]. `make_small` must never see an out-of-range value
 /// (it `debug_assert`s).
+///
+/// The definition itself lives in the interpreter's `select_val` ladder
+/// ([`crate::interpreter::constant_word`]) — the **one** authority on which candidate
+/// is decidable by a raw-word compare — so the emitter accepts exactly the
+/// alternatives the interpreted ladder decides without a general comparison.
 pub(crate) fn constant_word(operand: &Operand) -> Option<i64> {
-    match operand {
-        Operand::Integer(value) => small_word(*value),
-        Operand::Character(c) => small_word(i64::from(*c)),
-        Operand::Atom(atom) => Some(make_atom(*atom).raw() as i64),
-        Operand::Nil => Some(NIL.raw() as i64),
-        _ => None,
-    }
+    crate::interpreter::constant_word(operand)
 }
 
 /// The raw `Eterm` word of a small-int constant, or `None` when `value` is outside
