@@ -333,7 +333,8 @@ struct Registry {
     /// mutex: the delivery path has to consult `objects` and the header refcount while holding it, and
     /// [`Registry::forget_object`] has to cancel an object's monitors, so a second lock would invert
     /// the order against `destroy` and deadlock. The rules it obeys are in [`monitors`].
-    monitors: HashMap<MonitorId, MonitorBinding>,}
+    monitors: HashMap<MonitorId, MonitorBinding>,
+}
 
 // SAFETY: the registry is a process-wide singleton guarded by a `Mutex`, and the raw pointers it
 // carries are only ever dereferenced to (a) compare a type identity, (b) read a type's callbacks and
@@ -403,7 +404,8 @@ impl Registry {
         self.terms.retain(|_, r| r.obj != obj);
         self.objects.remove(&(obj as usize));
         self.forget_monitors_for_object(obj);
-    }}
+    }
+}
 
 /// The registry singleton (initialised on first use).
 fn registry() -> &'static Mutex<Registry> {
