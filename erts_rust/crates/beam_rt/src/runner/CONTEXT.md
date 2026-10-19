@@ -67,7 +67,9 @@ characterisation and figures are in `PERF.md`).
   (the exit path) — whether the process **built** it or **received** it.
   The machine's `refc_binaries()` reservoir is **not** copied onto the running process: it is the one
   holder of every payload the process's own compiled bitstring code built, so
-  `erlang:process_info(Pid, binary)` reads it straight through `RunnerState::reservoir_at(pid)` and the
+  `erlang:process_info(Pid, binary)` reads it straight through `RunnerState::reservoir_at(pid)` for
+  **another** pid (and through the in-machine door's published roster for the **executing** one, the
+  machine the pass holds out of `RunnerState` for the whole slice) and the
   process's own off-heap table stays empty. That is what keeps `beam_gc::OffHeap`'s never-compacted slot
   space out of the per-call path — mirroring the reservoir onto the PCB hands that space a slot per
   payload per slice, and the O(slots) `overhead_bytes`/`sweep` walks it implies make a build-a-binary
