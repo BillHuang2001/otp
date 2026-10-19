@@ -24,15 +24,16 @@ The refusal rule is exactly: **an exhausted `WALK_VISIT_BUDGET` (`1 << 20`) or a
 The global collection valve (`Runtime::gc_enabled`) is **not** a guard — it says "this runtime stopped *moving* process heaps", while this prune moves nothing, and the `-eval` route does not trip it (`reclaim::tests::the_eval_route_does_not_trip_the_collection_valve`).
 `Runtime::any_engine_ever` is a **diagnostic**, not a decline condition: every route registers `{kernelProcess,…}` engines during boot, and a term an engine holds always brings its own payload handle (`Machine::refc_binaries`), which the `refcount() > 1` belt retains.
 Every residual is therefore a **leak, never a dangle**.
-### Known issues (blocker first)
-**The prune is not reachable in practice yet**: the store path itself SIGBUSes once the store's payload bytes pass ≈0.5 MB on this route.
-Measured through `Runtime::eval` on ONE `Runtime`, `base64:encode(binary:copy(<<1>>, 40000))` per call: 2 / 4 / 6 handles (131 072 / 262 144 / 393 216 reserved bytes) evaluate, the **4th** (8 handles) dies with signal 7 — with `prunes == 0` and `declines == 0` for the whole run, i.e. the crash is in the store's own growth path (`Runtime::grow_eval_heap` / `context/pool.rs::move_result_into_runtime_store`), not in the prune.
-Until that is fixed the prune can only be exercised in-node (its unit tests), and no end-to-end `-eval` envelope test exists.
+### Known issues
+Nothing here blocks the prune: the `-eval` route's store is bounded end to end (`../tests/eval_off_heap_reclaim.rs`) and the `run` route's nested-call payloads are bounded by the nested epilogue's **scoped** prune (`../context/pump.rs::adopt_nested_payloads`, which releases only the handles the finished run itself adopted).
 A declined walk retains the whole store (the documented leak).
+A payload an **earlier** nested run built is retained for the store's lifetime, so the fun-loop envelope converges on a capacity rather than a trough: measured `377 104` bytes at both N = 1 000 and 10 000 with 4 096-byte payloads and `393 504` at both with 65 536-byte ones, against `4 144 000` → `41 440 000` before.
+`apply_eval_closure` never prunes: its caller's terms are live and unnameable from this node.
+A raise from a nested run takes the plain adopt path — its reason term rides `Raise`'s live-reason slot, not the frozen root set — so that run's payloads are retained.
+The `eval_heap` **region** grows ~10 004 words per two-build evaluation and is never reset: it is the term region, not the payload store, and it is not reclaimed.
 The `-eval` store's per-pid figure is never published (`Process::set_off_heap_binary_bytes` stays the runner's park-arm prune's): the store is not pid-attributable.
 The reachability descent in `reclaim.rs` duplicates the shape of `RuntimeContext::graph_holds_reference` (`../context/calls.rs`); de-duplicating them is a deferral (that node owns the helper).
 `beam_engine::MinimalContext`'s `ContextHeap` (`../../beam_engine/src/context.rs`) exposes no word-range accessor, so the `-eval` arena is covered only nominally (a pair on it is reached through `eval_heap`/`Env`/`eval_closures`, which is why it is not a hole for store-owned payloads).
-The `context/pump.rs` adopt site (`adopt_escaped_binaries`) receives only handles, no roots, so a prune there cannot be sound and none runs.
 
 ## API Surface
 ### Entry points (`mod.rs`)
