@@ -150,38 +150,40 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 - Dead/stub remnants (harmless): `bitstrings/mod.rs` `#[allow(dead_code)] const BSF_ALIGNED`.
 
 ## Measured — the baseline-JIT (default) tier on foreign workloads
-All figures are `BENCH_TIER=baseline` (the default tier), `taskset -c 3`, `setsid -w`, one process at a time,
-20 000 iterations, on a **shared, loud host**. Record the load band with every row: only the **ratios** and the
-deterministic structural counters are meaningful, never a bare absolute — the same workload's absolute moves
-with the host load, which is why `to_lower` appears twice.
+`BENCH_TIER=baseline` (the default tier), a pinned core, `setsid -w`, one process at a time, on a **shared,
+loud host**. Record the load band with every row: only the **ratios** and the deterministic structural
+counters are meaningful, never a bare absolute — an absolute moves with the host load (observed ±15 %
+between sessions and up to 5× on a loaded one).
 
-| workload | min / median ns | instr/call | ns/instr | load |
-|---|---|---|---|---|
-| `cowboy_bstr:to_lower/1` | 6 886.1 / 6 971.4 | 438 | 15.72 | 15.5 |
-| `cowboy_bstr:to_lower/1` | ~10 500–11 600 / 11 200–12 500 | 438 | — | 20–35 |
-| `cowboy_bstr:capitalize_token/1` | ~14 300–16 200 / 15 500–16 600 | 660 | — | 20–35 |
-| `emqx_base62:encode/1` | 6 867.9 / 6 907.5 | 244 | 28.15 | 26 |
+| workload | min / median ns | instr/call | ns/instr |
+|---|---|---|---|
+| `cowboy_bstr:to_lower/1` | 3 410.4 / 3 447.3 | 438 | 7.87 |
+| `cowboy_bstr:capitalize_token/1` | 4 376.7 / 4 404.2 | 660 | 6.67 |
+| `emqx_base62:decode/1` | 4 581.0 / 4 634.8 | 531 | 8.73 |
+| `emqx_base62:encode/1` | 2 648.6 / 2 656.8 | 244 | 10.89 |
+| `bench_list_walk:walk/1` | 373 065 / 374 416 | 169 418 | 2.21 |
 
-- The paired ratios below are quoted against the same harness's round-2 reference measurements (`to_lower`
-  7 948.7 / 8 537.1 ns at 18.15 ns/instr over 438 instr/call, `capitalize_token` 10 601.4 / 10 870.4 ns at
-  16.06 ns/instr over 660 instr/call, `encode` ≈5 176 ns over 244 instr/call).
-- Deterministic structural counters — **pins, not targets**, and unchanged by the fast paths (`to_lower`
-  `rooted_calls_per_call` 32, `rooted_words_per_call` 163, `local_call_requests_per_call` 61,
-  `driver_round_trips_per_call` 33, `block_entry_lookups` 660 000 with 660 000 hits / 0 misses; `encode`
-  `rooted_calls_per_call` 35, `local_call_requests_per_call` 21).
-- Paired A/B per change (post/pre, ≥3 alternating rounds, same harness): whole-byte fast paths `to_lower`
-  0.826 / 0.828 min/median, `capitalize_token` 0.873 / 0.874, `long_append` 0.668, `encode` 0.956 / 0.987;
-  match-context re-read elision `to_lower` 0.928 / 0.963, `capitalize_token` 0.909 / 0.969, with
-  `match_ctx::read_ctx`'s profiled self-share 5.69 % → 1.77 %; the `dispatch` latch change moved no wall clock
-  (post/pre medians 0.997 and 1.019 — inside a ±10 % noise band at load 20–35) but is deterministic:
-  **−359 retired instructions per call (−0.19 %)** by `perf stat -e instructions` over the 180 000-call delta.
+- **Deterministic structural counters are the primary evidence.** `rooted_calls_per_call` /
+  `rooted_words_per_call`: `to_lower` **2 / 13**, `capitalize_token` **2 / 13**, `encode` 18 / 45,
+  `decode` 32 / 133, `list_walk` 1000 / 2000; `driver_round_trips_per_call` 3 (`to_lower`),
+  `in_block_calls_per_call` 30 with 0 declines, `refc_payloads_per_call` 1. Both comprehension workloads
+  reserved **32 / 163** and **63 / 318** before the match-context reuse landed, and now reserve nothing
+  beyond the single `bs_init_writable` pair.
+- Paired `post/pre` medians for the changes that landed, each its own ≥7-round alternating run:
+  match-context reuse + `bs_get_position` small integer `to_lower` 0.958 / `capitalize_token` 0.908
+  (interpreter tier 0.963 / 0.963); `bs_create_bin` cold-body outlining `to_lower` 0.995 /
+  `capitalize_token` 0.992 / `encode` 0.990 / `long_append` 0.982; the `bs_match` dispatch pre-test
+  `to_lower` 0.982 / `capitalize_token` 0.982 / `decode` 0.990 / `encode` 0.990. `list_walk` measures
+  0.995–1.005 medians against all of them (it executes no bitstring instruction), so the estimator
+  carries no cross-workload bias.
+- **Measured negative, do not re-attempt:** recognising the six emitted `bs_match` command shapes as
+  whole-operand-list slice patterns ahead of the reference loop made `to_lower` **1.027×** *slower*
+  (`capitalize_token` 1.016, `encode` 1.012; 9 alternating rounds, 9/9 ≥ 1.0). The residual
+  `bs_match` cost belongs to the loader (see Handoffs).
 - The writable-accumulator growth curve is unchanged for 64 KiB of 512-byte appends from a 1 KiB hint:
   1 payload handle, 2 in-place grows, 4 moves and 61 440 bytes copied. `bitstrings/create/grow_tests.rs`
   asserts the *shape*, not those exact figures (≤ 12 moves, `bytes_copied ≤ 2×` the appended bytes, ≥ 1
   in-place grow, exactly one payload handle), so a quadratic regression still fails it.
-- `emqx_base62:decode/1` reports `skipped`, reason `unsupported_opcode: bif erlang:bit_size`: the harness's BIF
-  floor does not serve `bit_size/1` yet — a cross-node handoff (`src/bench/`), not an engine gap. `raw::bit_size`
-  exists for exactly that adoption (see API Surface).
 
 ## Constraints
 - `#![deny(unsafe_code)]` crate-wide; the node's two `#[allow(unsafe_code)]` modules are `bitstrings/raw.rs`
