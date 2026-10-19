@@ -195,6 +195,11 @@ pub(crate) struct Counters {
     /// ([`Allocation::y_last`](super::emit::Allocation::y_last)): the blocks a per-block
     /// Y-value cache would have to publish (guard + load) the slot in.
     pub(crate) y_blocks: u64,
+    /// Emitted block prologues that publish the frame's Y window
+    /// (`Allocation::prologue_publishes_y`). The static twin of the runtime
+    /// [`publish_y`](Counters::publish_y) count; the difference between the two and
+    /// [`y_blocks`](Counters::y_blocks) is exactly the dead publishes this gate removes.
+    pub(crate) y_prologue_publishes: u64,
     /// Emitted Y-window **refresh** sites: the in-block helper calls after which a later
     /// instruction of the *same* block still accesses a `Y` slot
     /// ([`Allocation::refresh_y_after`](super::emit::Allocation::refresh_y_after)). The
@@ -553,6 +558,9 @@ pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
         c.block_emitted_bytes += bytes;
         if allocation.y_last.is_some() {
             c.y_blocks += 1;
+        }
+        if allocation.prologue_publishes_y() {
+            c.y_prologue_publishes += 1;
         }
         c.block_cache_slots += cache_slots;
         c.block_written_slots += written_slots;

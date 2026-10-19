@@ -286,6 +286,34 @@ fn allocate_registers_with_labels(
         .filter(|(_, instr)| uses_y(module, instr))
         .map(|(offset, _)| (start + offset) as u32)
         .max();
+    // The block's **first** Y access (`y_last`'s twin): the gate
+    // `Allocation::prologue_publishes_y` needs to tell a block that reads a Y slot before
+    // anything published the window from one whose every Y access follows a helper that
+    // re-published it already.
+    allocation.y_first = code[start..end]
+        .iter()
+        .enumerate()
+        .filter(|(_, instr)| uses_y(module, instr))
+        .map(|(offset, _)| (start + offset) as u32)
+        .min();
+    // The block's **first** frame-changing helper that re-publishes the Y window itself
+    // (`JitRuntime::refresh_y_base` on the helper's success arm — see
+    // [`Allocation::prologue_publishes_y`]). Deliberately only the three the emitter always
+    // lowers to that helper: `allocate`, `allocate_heap` and `trim`. `deallocate` is
+    // excluded: its `deallocate; return` shape fuses into `DeallocateReturn` (which leaves
+    // the block) and it is never followed by a Y access in compiler output, so claiming it
+    // would buy nothing and cost soundness reasoning.
+    allocation.frame_republish_first = code[start..end]
+        .iter()
+        .enumerate()
+        .filter(|(_, instr)| {
+            matches!(
+                instr,
+                Instr::Allocate { .. } | Instr::AllocateHeap { .. } | Instr::Trim { .. }
+            )
+        })
+        .map(|(offset, _)| (start + offset) as u32)
+        .min();
 
     // The **fill sets**: for every instruction of the block, the cached x-registers a
     // helper call at that pc must reload out of `machine.x` (the block-local liveness of

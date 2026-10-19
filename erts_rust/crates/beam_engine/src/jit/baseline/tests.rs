@@ -4055,7 +4055,11 @@ fn the_move_y_gate_matches_the_move_inliner_exactly() {
 /// A block whose inlined Y moves follow an in-block helper call is covered by the
 /// compile-time gate: `y_last` names the last Y access, so the helper's deopt arm
 /// (`Allocate`, which may reallocate `machine.stack`) re-publishes the window
-/// (`refresh_y_after`) before the move reads it.
+/// (`refresh_y_after`) before the move reads it — and, for exactly that reason, the
+/// block's prologue **skips** its own publish
+/// ([`Allocation::prologue_publishes_y`]: every Y access follows the `allocate`, whose
+/// helper re-published the window on the arm that continued the block, so a prologue
+/// publish would be overwritten before anything read it).
 #[test]
 fn the_y_window_gate_covers_the_inlined_y_moves() {
     let code = vec![
@@ -4100,8 +4104,8 @@ fn the_y_window_gate_covers_the_inlined_y_moves() {
     let labels = crate::interpreter::build_label_map(&module);
     let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
     assert!(
-        code_contains_helper(&function, jit_publish_y as *const ()),
-        "a block with an inlined Y move publishes the window from its prologue"
+        !code_contains_helper(&function, jit_publish_y as *const ()),
+        "every Y access follows the `allocate`, so the prologue's publish would be dead"
     );
     assert!(
         code_contains_helper(&function, jit_refresh_y as *const ()),
@@ -4246,6 +4250,201 @@ fn the_y_window_publication_is_gated_at_compile_time() {
         !code_contains_helper(&x_function, jit_refresh_y as *const ()),
         "a Y-free block emits no window refresh"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the prologue's Y-window publish is skipped when a frame helper already made it
+// ---------------------------------------------------------------------------
+/// The prologue publishes the frame's Y window only when a Y access can reach it
+/// before anything published it.
+///
+/// A block whose **every** Y access lies after an in-block `allocate` /
+/// `allocate_heap` / `trim` skips the publish
+/// ([`Allocation::prologue_publishes_y`]): those three lowerings are the
+/// frame-changing helpers, and each one's helper calls `JitRuntime::refresh_y_base`
+/// on the very arm that continues the block in-block (`runtime.rs::jit_allocate` /
+/// `jit_allocate_heap` / `jit_trim`), so it has already re-published the window
+/// before the first Y access runs. A block's control flow is **linear** — it is
+/// entered only at its own start and its only ways out of the middle are a
+/// branch/exit into another range (each with its own prologue) or a continuation
+/// sub-block (a separate emitted range with its own `Allocation` and prologue) — so
+/// "instruction `h` precedes the first Y access" means `h` was necessarily executed
+/// first.
+///
+/// Four shapes, each compiled through [`compile_function`] with the structural
+/// counters on:
+///
+/// 1. `allocate` **before** every Y access — the compiler's `sum/1` recursion shape
+///    (`test is_nonempty_list` · `allocate` · `get_list {x,0} -> {y,0},{x,0}` ·
+///    `return`) — skips the publish and keeps `y_last` (so it still gets the gated
+///    post-helper refresh);
+/// 2. the mirrored shape with the Y access **before** the `allocate` publishes;
+/// 3. a Y-free block publishes nothing;
+/// 4. a Y access with **no** frame helper at all publishes (the conservative
+///    `frame_republish_first == None` arm).
+#[test]
+fn a_block_whose_y_accesses_all_follow_a_frame_helper_skips_the_prologue_publish() {
+    /// What one compiled shape produced: its block's [`Allocation`], whether the
+    /// prologue emitted the window publish, and the counters of that compilation.
+    struct Case {
+        allocation: Allocation,
+        publishes: bool,
+        counters: super::counters::Counters,
+    }
+    /// Compile `f/0` over a body whose **only** label is `Label(2)` at pc 0, so the
+    /// function is exactly one IR block `[0, code.len())` and the helper-address probe
+    /// below cannot see another block's prologue.
+    fn compile_case(name: &str, code: Vec<Instr>) -> Case {
+        let module = build_module(name, &[], vec![("f", 0, code)], &[("f", 0, Label(2))]);
+        let code = &module.functions[0].code;
+        assert_eq!(
+            module.functions[0].blocks.len(),
+            1,
+            "the case must be exactly one IR block"
+        );
+        let start = module.functions[0].blocks[0].start;
+        let end = module.functions[0].blocks[0].end;
+        let allocation = allocate_registers(&module, code, start, end);
+        super::counters::reset();
+        super::counters::set_enabled(true);
+        let labels = crate::interpreter::build_label_map(&module);
+        let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+        super::counters::set_enabled(false);
+        Case {
+            publishes: code_contains_helper(&function, jit_publish_y as *const ()),
+            counters: super::counters::snapshot(),
+            allocation,
+        }
+    }
+    // (1) `allocate` before every Y access — the `sum/1` shape, whose `get_list` reads
+    // its `Y` slot only after the frame push.
+    let dead = compile_case(
+        "ypro_after_alloc",
+        vec![
+            Instr::Label(Label(2)),
+            Instr::Test {
+                kind: TestKind::IsNonemptyList,
+                fail: Label(2),
+                args: vec![Operand::X(0)],
+            },
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 1,
+            },
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::Y(0),
+                tail: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    assert_eq!(dead.allocation.y_first, Some(3), "the `get_list` reads Y first");
+    assert_eq!(
+        dead.allocation.y_last,
+        Some(3),
+        "the same access is the block's last one: `y_last` keeps the post-helper refresh gate"
+    );
+    assert_eq!(
+        dead.allocation.frame_republish_first,
+        Some(2),
+        "the `allocate` is the block's first window-re-publishing helper"
+    );
+    assert!(
+        !dead.allocation.prologue_publishes_y(),
+        "every Y access follows the `allocate`, so the prologue publish is dead"
+    );
+    assert!(
+        !dead.publishes,
+        "the compiled prologue must not emit `jit_publish_y` for this shape"
+    );
+    assert_eq!(dead.counters.y_blocks, 1, "the block does touch Y");
+    assert_eq!(
+        dead.counters.y_prologue_publishes, 0,
+        "the dead prologue publish is removed"
+    );
+    // (2) The mirrored shape: the Y access precedes the `allocate`, so the window must
+    // be published before it can be read.
+    let live = compile_case(
+        "ypro_before_alloc",
+        vec![
+            Instr::Label(Label(2)),
+            Instr::Test {
+                kind: TestKind::IsNonemptyList,
+                fail: Label(2),
+                args: vec![Operand::X(0)],
+            },
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::Y(0),
+                tail: Operand::X(0),
+            },
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 1,
+            },
+            Instr::Return,
+        ],
+    );
+    assert_eq!(live.allocation.y_first, Some(2));
+    assert_eq!(live.allocation.frame_republish_first, Some(3));
+    assert!(
+        live.allocation.prologue_publishes_y(),
+        "a Y access before the frame helper needs the prologue's window"
+    );
+    assert!(
+        live.publishes,
+        "the compiled prologue must emit `jit_publish_y` for this shape"
+    );
+    assert_eq!(live.counters.y_blocks, 1);
+    assert_eq!(live.counters.y_prologue_publishes, 1);
+    // (3) A Y-free block publishes nothing at all.
+    let none = compile_case(
+        "ypro_free",
+        vec![
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(1),
+            },
+            Instr::Return,
+        ],
+    );
+    assert_eq!(none.allocation.y_first, None);
+    assert_eq!(none.allocation.y_last, None);
+    assert!(!none.allocation.prologue_publishes_y());
+    assert!(!none.publishes, "a Y-free block emits the plain position store");
+    assert_eq!(none.counters.y_blocks, 0);
+    assert_eq!(none.counters.y_prologue_publishes, 0);
+    // (4) A Y access with no frame helper in the block: nothing has published the
+    // window, so the prologue must (the conservative `None` arm).
+    let conservative = compile_case(
+        "ypro_no_helper",
+        vec![
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::Y(0),
+            },
+            Instr::Move {
+                src: Operand::Y(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    assert_eq!(conservative.allocation.y_first, Some(1));
+    assert_eq!(
+        conservative.allocation.frame_republish_first, None,
+        "the block holds no window-re-publishing helper"
+    );
+    assert!(
+        conservative.allocation.prologue_publishes_y(),
+        "with no helper to re-publish it, the prologue must publish"
+    );
+    assert!(conservative.publishes);
+    assert_eq!(conservative.counters.y_blocks, 1);
+    assert_eq!(conservative.counters.y_prologue_publishes, 1);
 }
 
 // ---------------------------------------------------------------------------

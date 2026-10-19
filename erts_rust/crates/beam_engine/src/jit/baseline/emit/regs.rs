@@ -144,6 +144,22 @@ pub(crate) struct Allocation {
     /// operand (each through its own syntactic shape predicate), and an `init_yregs`
     /// listing an addressable `Y` register.
     pub(crate) y_last: Option<u32>,
+    /// The **first pc of the block whose instruction accesses a `Y` slot**, or `None`
+    /// when no instruction of the block does — [`Allocation::y_last`]'s twin.
+    ///
+    /// Only [`Allocation::prologue_publishes_y`] reads it; it exists so the prologue can
+    /// tell a block that reaches a Y access *before* anything has published the window
+    /// from one whose every Y access follows a helper that re-published it already.
+    pub(crate) y_first: Option<u32>,
+    /// The **first pc of the block of an instruction whose native lowering is a
+    /// frame-changing helper that re-publishes the Y window itself** on its in-block
+    /// continue path: `allocate`/`allocate_heap` (`Machine::push_frame`) and `trim`
+    /// (`Machine::trim`). Each helper calls `JitRuntime::refresh_y_base` on its success
+    /// arm before answering "the next instruction" (`runtime.rs::jit_allocate` /
+    /// `jit_allocate_heap` / `jit_trim`); on a failure it answers `ERROR` and the block
+    /// leaves to the driver, so the only way to continue in-block past it is through that
+    /// re-publish. `None` when the block holds no such instruction.
+    pub(crate) frame_republish_first: Option<u32>,
     /// The block's **first pc** (`start`), the base `fill_sets` is indexed from.
     pub(crate) block_start: u32,
     /// The **fill set of every instruction of the block**, indexed by `pc - block_start`
@@ -284,6 +300,33 @@ impl Allocation {
     /// round-trip ever refreshes.
     pub(crate) fn refresh_y_after(&self, pc: u32) -> bool {
         matches!(self.y_last, Some(last) if last > pc)
+    }
+    /// Whether the block's **prologue** must publish the current frame's Y window
+    /// ([`super::super::runtime::jit_publish_y`]) instead of only recording the position
+    /// ([`super::super::jit_set_position`]).
+    ///
+    /// A block that accesses no Y slot publishes nothing. A block that does publishes
+    /// **unless** every one of its Y accesses lies at or after an in-block helper that has
+    /// already re-published the window itself ([`Allocation::frame_republish_first`]: an
+    /// `allocate`/`allocate_heap`/`trim`, whose helper calls
+    /// `JitRuntime::refresh_y_base` on its success arm). A block's control flow is linear
+    /// — it is entered only at its own start and the only ways out of the middle are a
+    /// branch/exit into another range (each with **its own** prologue) — so reaching the
+    /// first Y access necessarily executed that helper first and the prologue's window is
+    /// overwritten before anything reads it: the publish would be dead work.
+    ///
+    /// **Conservative by construction**: an `Allocation` whose tables the analysis did not
+    /// fill (a synthetic one a unit test built directly — `y_last` set but `y_first`
+    /// absent) still publishes. The only failure direction is therefore a redundant
+    /// publish, never a Y access against a window nothing published.
+    pub(crate) fn prologue_publishes_y(&self) -> bool {
+        if self.y_last.is_none() {
+            return false;
+        }
+        match (self.y_first, self.frame_republish_first) {
+            (Some(first), Some(republish)) => first <= republish,
+            _ => true,
+        }
     }
 }
 

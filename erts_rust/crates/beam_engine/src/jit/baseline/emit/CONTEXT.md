@@ -302,9 +302,11 @@ instruction's own operands.
   `16` when odd, so `rsp` stays 16-byte aligned at every helper call), `rbx = rt->x_regs`,
   then call `jit_set_position(rt, func, block_start_pc)` (the block-entry
   position store — emitted before the cached loads, because `rbx` is callee-saved and no cached register
-  may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
-  (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
-  re-publishes the current frame's Y window in one call — then load each cached register in
+  may sit in caller-saved scratch across the call) — or, when the block must publish the window
+  (`Allocation::prologue_publishes_y`: it accesses a Y slot and **not** every one of those accesses
+  follows an in-block `allocate`/`allocate_heap`/`trim`, whose helper re-published the window itself),
+  `jit_publish_y(rt, func, pc)`, which does that same position store **and** re-publishes the current
+  frame's Y window in one call — then load each cached register in
   `Allocation::entry_fill` from `machine.x` (the block's **live-in** slots: a cached register the block
   writes before it reads is not loaded at entry, because that writing instruction sets it).
   The frame is **variable-length**: `k = native_frame_regs(allocation).len()` is the block's own push count,
@@ -414,11 +416,18 @@ Under `#[cfg(test)]` the scan also records live-range statistics on `Allocation`
 (`live_candidates` / `live_total` / `live_max`), which `counters::record_block` folds into the per-run
 structural counters; they hold no production state.
 
-`allocate_registers` also derives `Allocation::y_last` — the highest pc of the block whose instruction
-accesses a Y slot (`arith::uses_y`, the union of every lowering's per-shape Y test — including
-`bif::bif_uses_y` for the named-BIF accessors, whose `Value` route is never a Y-window access) — which is the
-compile-time gate for the emitter's prologue publish and its post-helper refresh. A `Y` slot is **not** an
-x-register, so it is neither a candidate nor charged to any live interval, and it never raises
+`allocate_registers` also derives the block's Y-gate triple, all from the same `arith::uses_y` scan (the
+union of every lowering's per-shape Y test — including `bif::bif_uses_y` for the named-BIF accessors,
+whose `Value` route is never a Y-window access): `Allocation::y_last` (the highest pc whose instruction
+accesses a Y slot — the compile-time gate for the emitter's post-helper refresh), `Allocation::y_first`
+(its twin, the lowest such pc) and `Allocation::frame_republish_first` (the lowest pc of an
+`allocate`/`allocate_heap`/`trim`, whose helper calls `JitRuntime::refresh_y_base` on the arm that
+continues the block in-block). `y_first` and `frame_republish_first` together answer
+`Allocation::prologue_publishes_y`, the prologue-publish gate: a block publishes **unless** every Y
+access lies at or after that helper, because then the helper's own re-publish overwrites the prologue's
+window before anything reads it (a block's control flow is linear — it is entered only at its own start,
+and every way out of the middle lands in another emitted range with its own prologue). A `Y` slot is
+**not** an x-register, so it is neither a candidate nor charged to any live interval, and it never raises
 `highest_native_register`: a stack slot must not refuse native entry (the driver's bound is
 `machine.x.len() > bound`).
 
@@ -574,8 +583,9 @@ by construction).
   live-in cache load) plus the private `emit_position_store`/`emit_publish_y`/`emit_prologue_helper`
   it uses.
 - `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`spill_sets`/`y_last`/
-  `block_start`/`fill_sets`/`entry_fill`, `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/
-  `entry_loads`/`refresh_y_after`), `spill` (stores `spill_slots_at(pc)`, falling back to `written`),
+  `y_first`/`frame_republish_first`/`block_start`/`fill_sets`/`entry_fill`,
+  `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/`entry_loads`/`refresh_y_after`/
+  `prologue_publishes_y`), `spill` (stores `spill_slots_at(pc)`, falling back to `written`),
   `fill` (loads only `fill_slots(pc)` at a helper site, and the prologue's `entry_fill` set at entry), and the
   test-only `SpillSite`/`FillSite` classification of the call sites; `liveness.rs` computes the per-pc
   `fill_sets` **and** the block's live-in `entry_fill` set, `regalloc.rs` the per-pc `spill_sets`.
@@ -586,7 +596,8 @@ by construction).
   `emit_shared_sub_blocks`, `emit_function`, and the code-size budgets (`BLOCK_BYTES`/`INSTRUCTION_BYTES`/
   `FAST_PATH_BYTES`/`COMPARE_PATH_BYTES`/`LIST_PATH_BYTES`/`TUPLE_PATH_BYTES`) with their estimates
   `code_capacity_estimate`/`function_capacity_estimate`/`sub_blocks_capacity_estimate`.
-- `regalloc.rs` -> `allocate_registers` (incl. the `y_last`, `written` and `spill_sets` derivations) +
+- `regalloc.rs` -> `allocate_registers` (incl. the `y_last`/`y_first`/`frame_republish_first`, `written`
+  and `spill_sets` derivations) +
   `cacheable_touches`
   (the per-instruction native touches) + `cacheable_writes` (the block's written x-registers, mirroring each lowering's shape
   test but returning destinations) + `spill_sets`/`is_inlined`/`test_helper_inlined` (the per-pc
