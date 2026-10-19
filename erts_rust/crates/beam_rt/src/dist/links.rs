@@ -74,7 +74,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
-use beam_dist::{Dop, PeerVisibility};
+use beam_dist::{DistFlags, Dop, PeerVisibility};
 use beam_term::prelude::{atom_val, is_atom, Eterm};
 use beam_term::AtomTable;
 
@@ -308,6 +308,67 @@ impl DistLinks {
         Err(no_link_error(&self.node_label_in(node, atoms)))
     }
 
+    /// Encodes one **alias message** for the node named by the alias reference `to` and
+    /// writes it, on the same link search as [`DistLinks::route_message`].
+    ///
+    /// `to` is an external **reference** term (`NEWER_REFERENCE_EXT`): a process alias is a
+    /// reference whose node slot names the peer the alias lives on, so the destination node
+    /// is read out of the term itself ([`beam_codec::term::external_ref_parts`]) and needs
+    /// no separate argument. `from` and `to` are already external terms prepared by the
+    /// caller; the wire form is `{DOP_ALIAS_SEND, From, To} -- Msg` (`dist.c:2563`), so the
+    /// argument order is `[from, to]`.
+    ///
+    /// # The `DFLAG_ALIAS` gate
+    ///
+    /// `DOP_ALIAS_SEND` is only meaningful to a peer that offered `DFLAG_ALIAS`. OTP 29
+    /// advertises it in both its **default** and its **addable** flag masks
+    /// (`DFLAG_DIST_DEFAULT`/`DFLAG_DIST_ADDABLE`) and does **not** make it mandatory
+    /// (`DFLAG_DIST_MANDATORY` omits it), so a peer may legitimately establish a link
+    /// without it. Such a link is the typed
+    /// `distribution: the link to <label> did not negotiate DFLAG_ALIAS` — never a silent
+    /// drop and never a bare [`BeamError::BadArg`], because the caller (`erlang:send/2` on
+    /// an alias) must be able to tell an unreachable alias from a protocol shortfall.
+    ///
+    /// # Errors
+    ///
+    /// The typed refusal above, the typed
+    /// `distribution: an alias send needs an external reference destination` when `to` is
+    /// not an external reference, [`no_link_error`] when neither half holds an established
+    /// link to the reference's node, the accepted cell's re-entrant-borrow refusal, and the
+    /// encode/socket failures of the link itself.
+    pub(crate) fn route_alias(
+        &mut self,
+        to: Eterm,
+        from: Eterm,
+        msg: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        let node = match beam_codec::term::external_ref_parts(to) {
+            Ok((node, _ids, _creation)) => node,
+            Err(_) => {
+                return Err(error::message(
+                    "distribution: an alias send needs an external reference destination",
+                ))
+            }
+        };
+        let label = self.node_label_in(node, atoms);
+        if let Some(index) = self.link_index_for_node(node) {
+            if !negotiated_alias(self.outbound[index].negotiated()) {
+                return Err(alias_flag_error(&label));
+            }
+            return self.outbound[index].send_control(Dop::AliasSend, &[from, to, msg], atoms);
+        }
+        if let Some(index) = self.accepted_index_for_node(node) {
+            let mut accepted = self.borrow_accepted_mut()?;
+            let link = &mut (*accepted)[index];
+            if !negotiated_alias(link.negotiated()) {
+                return Err(alias_flag_error(&label));
+            }
+            return link.send_control(Dop::AliasSend, &[from, to, msg], atoms);
+        }
+        Err(no_link_error(&label))
+    }
+
     /// Borrows the accepted cell for a write, mapping a re-entrant borrow to a typed error
     /// (never a panic: the routing entry can be reached while a pass holds the cell).
     fn borrow_accepted_mut(&self) -> Result<std::cell::RefMut<'_, Vec<DistConnection>>> {
@@ -411,6 +472,25 @@ pub(crate) fn no_link_error(label: &str) -> BeamError {
     ))
 }
 
+/// Whether a link's negotiated flags allow [`Dop::AliasSend`] (`DFLAG_ALIAS`).
+///
+/// The one place the per-link alias capability is read, so the gate cannot be spelled
+/// differently on the outbound and the accepted half.
+pub(crate) fn negotiated_alias(flags: DistFlags) -> bool {
+    flags.contains(DistFlags::from_bits(beam_dist::flags::DFLAG_ALIAS))
+}
+
+/// A typed "the link to `label` did not negotiate `DFLAG_ALIAS`" error.
+///
+/// A peer may establish a link without the flag — `DFLAG_ALIAS` is in OTP 29's default and
+/// addable masks but not in its mandatory set — so an alias send over such a link is a
+/// protocol shortfall the caller must see, not a silent drop and not a bare `BadArg`.
+pub(crate) fn alias_flag_error(label: &str) -> BeamError {
+    error::message(format!(
+        "distribution: the link to {label} did not negotiate DFLAG_ALIAS"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,7 +498,7 @@ mod tests {
     use std::net::TcpStream;
 
     use beam_alloc::Heap;
-    use beam_codec::term::make_external_pid;
+    use beam_codec::term::{make_external_pid, make_external_ref};
     use beam_dist::driver::{ConnectionDriver, DriverState};
     use beam_dist::{Delivery, StepOutcome, UnsupportedSink};
     use beam_process::{ProcessId, RemotePid};
@@ -460,6 +540,14 @@ mod tests {
     /// `'N'` handshake — so the link is established by exactly the bytes a real peer sends,
     /// with no `erl` and no `epmd`.
     fn establishing_accepted() -> (DistConnection, ConnectionDriver, TcpStream) {
+        establishing_accepted_with_peer_flags(beam_dist::preferred_flags())
+    }
+
+    /// [`establishing_accepted`] with an explicit **peer** (connecting-side) flag set, so a
+    /// fixture can withhold a non-mandatory capability — `DFLAG_ALIAS` in particular.
+    fn establishing_accepted_with_peer_flags(
+        peer_flags: beam_dist::DistFlags,
+    ) -> (DistConnection, ConnectionDriver, TcpStream) {
         let (server_stream, mut peer_stream) = socket_pair();
         let peer_addr = server_stream.peer_addr().expect("the peer's address");
         let mut connection = DistConnection::from_parts(
@@ -467,7 +555,8 @@ mod tests {
             server_stream,
             peer_addr,
         );
-        let mut peer = ConnectionDriver::client(PEER_NAME.as_bytes(), COOKIE, 1);
+        let mut peer =
+            ConnectionDriver::client_with_flags(PEER_NAME.as_bytes(), COOKIE, 1, peer_flags);
         for _ in 0..200 {
             connection.pump().expect("the accepted link's pump");
             read_into(&mut peer, &mut peer_stream);
@@ -786,6 +875,94 @@ mod tests {
             client.last_error().is_none(),
             "the refusal happened at the router, not as a silent flush drop: {:?}",
             client.last_error()
+        );
+    }
+
+    /// An alias send reaches an accepted peer as `{DOP_ALIAS_SEND, From, To} -- Msg`
+    /// (`dist.c:2563`): the destination node is read out of the alias **reference** term
+    /// itself, so the routing entry needs no separate node argument.
+    ///
+    /// The link's peer advertised `DFLAG_ALIAS` (it is in OTP 29's default mask), so the
+    /// gate passes and the opcode is written; the peer decodes the very reference term the
+    /// caller held (compared structurally, `beam_term::compare::eq`) and the message.
+    #[test]
+    fn an_alias_send_writes_a_dop_alias_send() {
+        let (mut connection, mut peer, mut stream) = establishing_accepted();
+        let mut atoms = AtomTable::new();
+        let node = bind_peer(&mut connection, &mut atoms);
+        let accepted = Rc::new(RefCell::new(vec![connection]));
+        let mut links = DistLinks::new(Rc::clone(&accepted));
+        let mut heap = Heap::new(64).expect("the alias heap");
+        let to = make_external_ref(&mut heap, node, &[7, 11], 5).expect("the alias reference");
+        let from = make_external_pid(&mut heap, make_atom(atoms.intern(ACCEPTOR_NAME)), 9, 0, 1)
+            .expect("the sender's external pid");
+        let msg = hello(&mut heap, &mut atoms, 3);
+        links
+            .route_alias(to, from, msg, &atoms)
+            .expect("the routing entry writes the DOP_ALIAS_SEND");
+
+        match decoded(&mut peer, &mut stream, &mut atoms).first() {
+            Some(Delivery::AliasSend {
+                to: got_to,
+                message,
+                ..
+            }) => {
+                assert!(
+                    beam_term::compare::eq(*got_to, to, &atoms),
+                    "the alias reference reaches the peer intact (same node/ids/creation)"
+                );
+                let mut expected_heap = Heap::new(64).expect("the expected heap");
+                let expected = hello(&mut expected_heap, &mut atoms, 3);
+                assert!(
+                    beam_term::compare::eq(*message, expected, &atoms),
+                    "the routed message reaches the accepted peer intact"
+                );
+            }
+            other => panic!("expected a DOP_ALIAS_SEND, got {other:?}"),
+        }
+    }
+
+    /// A link whose peer did **not** offer `DFLAG_ALIAS` refuses the alias send with the
+    /// typed `did not negotiate DFLAG_ALIAS` — never a silent drop, never a bare `BadArg`.
+    ///
+    /// OTP 29 advertises `DFLAG_ALIAS` in its default **and** addable masks but does not
+    /// make it mandatory, so a peer may establish a link without it: the fixture's peer
+    /// offers only the mandatory set, which still completes the `'N'` handshake.
+    #[test]
+    fn an_alias_send_without_the_alias_flag_is_a_typed_error() {
+        let (mut connection, mut peer, mut stream) =
+            establishing_accepted_with_peer_flags(beam_dist::DistFlags::from_bits(
+                beam_dist::flags::DFLAG_DIST_MANDATORY,
+            ));
+        assert!(
+            !negotiated_alias(connection.negotiated()),
+            "the fixture's link did not negotiate DFLAG_ALIAS"
+        );
+        let mut atoms = AtomTable::new();
+        let node = bind_peer(&mut connection, &mut atoms);
+        let accepted = Rc::new(RefCell::new(vec![connection]));
+        let mut links = DistLinks::new(Rc::clone(&accepted));
+        let mut heap = Heap::new(64).expect("the alias heap");
+        let to = make_external_ref(&mut heap, node, &[1, 2], 1).expect("the alias reference");
+        let from = make_external_pid(&mut heap, make_atom(atoms.intern(ACCEPTOR_NAME)), 2, 0, 1)
+            .expect("the sender's external pid");
+        let msg = hello(&mut heap, &mut atoms, 5);
+
+        let err = links
+            .route_alias(to, from, msg, &atoms)
+            .expect_err("a link without DFLAG_ALIAS must refuse an alias send");
+        assert!(
+            err.to_string().contains("DFLAG_ALIAS"),
+            "the refusal names the missing capability: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("the link to peer@host.example did not negotiate DFLAG_ALIAS"),
+            "the refusal names the link's node: {err}"
+        );
+        assert!(
+            decoded(&mut peer, &mut stream, &mut atoms).is_empty(),
+            "nothing was written to the peer"
         );
     }
 }

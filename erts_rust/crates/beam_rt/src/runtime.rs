@@ -2859,6 +2859,34 @@ impl Runtime {
         client.send_message_pid(to, from, msg, self.code_server.atoms_mut())
     }
 
+    /// Sends `msg` from `from` to the **process alias** `to`
+    /// (`{DOP_ALIAS_SEND, From, To} -- Msg`, `dist.c:2563`).
+    ///
+    /// `to` is an external **reference** term; the node in its node slot selects the link,
+    /// exactly as [`Runtime::dist_send_message_pid`]'s pid does. The link must have
+    /// negotiated `DFLAG_ALIAS` — a link that did not is the typed
+    /// `distribution: the link to <node> did not negotiate DFLAG_ALIAS` (OTP 29 offers the
+    /// flag in its default and addable masks but does not make it mandatory, so a peer can
+    /// legitimately establish a link without it).
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::dist_send_reg_send`], plus a typed error when `to` is not an external
+    /// reference and when the link did not negotiate `DFLAG_ALIAS`.
+    pub fn dist_send_alias(
+        &mut self,
+        to: Eterm,
+        from: ProcessId,
+        msg: Eterm,
+    ) -> Result<()> {
+        let Some(client) = self.dist_client.as_ref() else {
+            return Err(error::message(
+                "distribution: this runtime is not a distributed node (no -name/-sname)",
+            ));
+        };
+        client.send_alias(to, from, msg, self.code_server.atoms_mut())
+    }
+
     /// The distribution **cookie** this runtime's handshake digests use.
     ///
     /// Resolved once at construction from `-setcookie`, else `$HOME/.erlang.cookie`, else the

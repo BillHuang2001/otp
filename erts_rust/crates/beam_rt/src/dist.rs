@@ -113,7 +113,7 @@ use beam_common::{BeamError, Result};
 use beam_dist::connection::TcpTransport;
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::epmd::{Alive2Req, Alive2Resp, EpmdClient, EPMD_DEFAULT_ADDR};
-use beam_dist::{DeliveryOutcome, Dispatched, Dop, InboundSink, PeerVisibility};
+use beam_dist::{DeliveryOutcome, Dispatched, DistFlags, Dop, InboundSink, PeerVisibility};
 use beam_dist::TcpListener;
 use beam_term::prelude::{make_atom, Eterm};
 use beam_term::AtomTable;
@@ -349,6 +349,17 @@ impl DistConnection {
     /// The peer's node creation, once the handshake advertised it.
     pub fn peer_creation(&self) -> u32 {
         self.driver.peer_creation()
+    }
+
+    /// The **peer's** validated capability flags, once the handshake completed
+    /// (`beam_dist::Handshake::negotiated`; [`DistFlags::EMPTY`] before then).
+    ///
+    /// This is what governs outbound opcode choice on the link — e.g. whether
+    /// `DFLAG_ALIAS` allows a `DOP_ALIAS_SEND` (see
+    /// [`DistLinks::route_alias`](crate::dist::links::DistLinks::route_alias)) or
+    /// `DFLAG_SEND_SENDER` a `DOP_SEND_SENDER` (`dist.c:1686`).
+    pub(crate) fn negotiated(&self) -> DistFlags {
+        self.driver.negotiated()
     }
 
     /// How the peer's own advertised flags classify it — [`PeerVisibility::Normal`]

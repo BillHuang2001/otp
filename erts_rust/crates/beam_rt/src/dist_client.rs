@@ -205,6 +205,17 @@ impl ClientLink {
         matches!(self.driver.state(), DriverState::Established)
     }
 
+    /// The **peer's** validated capability flags, once the handshake completed
+    /// ([`beam_dist::DistFlags::EMPTY`] before then).
+    ///
+    /// The same per-link gate the accepting half exposes
+    /// ([`DistConnection::negotiated`](crate::dist::DistConnection::negotiated)): it
+    /// decides whether an opcode may be used at all — e.g. `DFLAG_ALIAS` for a
+    /// `DOP_ALIAS_SEND`.
+    pub(crate) fn negotiated(&self) -> beam_dist::DistFlags {
+        self.driver.negotiated()
+    }
+
     /// Whether the link can still make progress (handshaking or established).
     fn is_live(&self) -> bool {
         matches!(
@@ -663,6 +674,30 @@ impl DistClient {
         inner
             .links
             .route_message(remote.node(), local, to_term, msg, atoms)
+    }
+
+    /// Sends `msg` from `from` to the **process alias** `to`
+    /// (`{DOP_ALIAS_SEND, From, To} -- Msg`, `dist.c:2563`).
+    ///
+    /// `to` is an **external reference** term naming the alias; its node decides which link
+    /// carries the message, exactly as [`DistClient::send_message_pid`]'s does. The link
+    /// must have negotiated `DFLAG_ALIAS` (see [`DistLinks::route_alias`]).
+    ///
+    /// # Errors
+    ///
+    /// A typed error when `to` is not an external reference, when there is no established
+    /// link to its node in either half, when that link did not negotiate `DFLAG_ALIAS`,
+    /// plus the encoding/socket failures.
+    pub fn send_alias(
+        &self,
+        to: Eterm,
+        from: ProcessId,
+        msg: Eterm,
+        atoms: &mut AtomTable,
+    ) -> Result<()> {
+        let mut inner = self.borrow_mut()?;
+        let local = inner.local_pid_term(from)?;
+        inner.links.route_alias(to, local, msg, atoms)
     }
 
     /// Borrows the shared inner state, mapping a live borrow to a typed error (never a
