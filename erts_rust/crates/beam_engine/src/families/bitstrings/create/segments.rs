@@ -60,9 +60,10 @@ use super::SegOutcome;
 /// (`erts_bs_put_binary_all`, `erl_bits.c:1311`); a non-`all` size goes through
 /// `$BS_SAFE_MUL` plus the signed-size-fits check (`system_limit`, `:424`/`:427`).
 ///
-/// `#[inline(never)]`: it is one of the arms the compiler's linear accumulator never
-/// emits, so its body belongs outside [`super::assemble`]'s hot block.
-#[inline(never)]
+/// `#[inline]` (a single call site): the `<<Acc/binary, Bin/binary>>` splice of real
+/// foreign code lands here on every accumulator iteration, so this body is measured
+/// *inside* [`super::assemble`]'s block rather than behind a call.
+#[inline]
 pub(super) fn binary_segment(
     machine: &mut Machine,
     module: &Module,
