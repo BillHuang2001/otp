@@ -377,6 +377,7 @@ fn term_key(term: Eterm) -> TermKey {
         Err(_) => TermKey::Word(word),
     }
 }
+
 /// One live term designating a resource object (the registry's value).
 #[derive(Copy, Clone)]
 struct ResourceRef {
