@@ -87,6 +87,11 @@ header kept apart from the body because a `[binary]` port renders `[H1,…,Hn | 
 all), `Some(vec![])` a present empty body (`<<>>` tail). A `Data` payload is therefore legitimately
 empty: an explicit empty read IS the oracle's `{Port,{data,[]}}`. A `ram_file_drv` port needs no descriptor, so the whole chain is testable with no
 child process and no poller wait.
+The **outbound** half of a write is the driver's: a `tcp_inet` port prepends the `{packet, 1|2|4}`
+length header on **both** write routes (the named `send` verb and the `port_command/2` one, i.e.
+`Port::run_task(Output)` → `Driver::output`/`ready_output` → `write_command`) and charges header +
+payload to `send_oct`; `udp_inet` writes its datagrams verbatim. The rules and their oracle-measured
+pins are `drivers/inet/CONTEXT.md`'s `write_frame_tests.rs` (12).
 A driver that **refuses** a write (`Err(BeamError::BadArg)` from `output`/`ready_output`, e.g. an
 `inet` port whose socket is not open) is surfaced as that error: it short-circuits
 `Port::check_write_accounting` (`result?` runs first, so the driver's reported byte count is never
@@ -177,8 +182,9 @@ deliveries on: a driver owns the `{active, false|true|once|N}` mode (the C's `in
 Without this seam a runtime can only mirror the `setopts` walk, and can never learn the running
 `{active, N}` counter nor that an `{active, once}` grant was spent (the C clears it **silently**,
 sending no `{tcp_passive,_}`).
-Everything here is driver-agnostic: the value types live in `port_task.rs`, the two `Driver` members
-carry defaults, and nothing in `src/drivers/` is involved.
+The **value types** are driver-agnostic (they live in `port_task.rs` and the two `Driver` members
+carry defaults), so a driver that knows nothing about `{active,…}` needs no code; the two socket
+drivers publish their own state through them (see *Who overrides the seam* below).
 - `port_task.rs` → `ActiveMode { False, True, Once, Multi { remaining: i16 } }`
   (`Copy + Clone + PartialEq + Eq + Debug`, `Default = False`) with
   `ActiveMode::from_parts(active: i32, active_count: i16) -> ActiveMode` — the **single** place the
@@ -211,10 +217,13 @@ carry defaults, and nothing in `src/drivers/` is involved.
   The closed half exists because a delivery staged for a port that then closed still reaches the owner
   (`take_active_inputs`), so the spend that produced it must be reportable too; the number keeps the
   existing rule (retired only by the `Closed` report).
-- **Current state of `src/`:** the seam is complete and driver-agnostic, and **no driver under
-  `src/drivers/` overrides either member yet** — every built-in, the `inet` pair included, inherits
-  `ActiveMode::False`/no spends, which keeps every existing driver's behaviour unchanged.
-  Wiring the concrete `tcp_inet`/`udp_inet` drivers onto it is that node's work.
+- **Who overrides the seam:** both socket drivers do — `TcpInetDriver` and `UdpInetDriver` read
+  `ActiveMode::from_parts(self.options.active, self.options.active_count)` and record a spend at
+  **one** site each, the per-delivery spend site (TCP `count_delivery`, the datagram twin), never on
+  the `setopts`-walk-to-zero path (which still emits its `ActiveInputEvent::Passive` but spends no
+  grant). Every other built-in inherits the trait defaults (`ActiveMode::False`, no spends), which is
+  the honest answer for a driver with no active mode. The driver-level pins are
+  `drivers/inet/active_seam_tests.rs` (9) and the child node's `src/drivers/inet/CONTEXT.md`.
 
 ## Known Issues (durable gotchas — not fixed by changing this file)
 - **A `PortNotification::Closed` names a number that is retired *with the report*.** `PortRegistry::close`
@@ -256,11 +265,11 @@ carry defaults, and nothing in `src/drivers/` is involved.
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
 integration-test node, and the crate-level policy (real fds, loud skips, oracle cross-checks) is in
 `../CONTEXT.md`.
-**Per-module in-module counts (`-p beam_io --lib` = 968):** `drivers` **639** — of which `inet`
-**527** (per-suite breakdown in `drivers/inet/CONTEXT.md`), `line_buffer` 24, `spawn` 23, `ram_file`
+**Per-module in-module counts (`-p beam_io --lib` = 989):** `drivers` **660** — of which `inet`
+**548** (per-suite breakdown in `drivers/inet/CONTEXT.md`), `line_buffer` 24, `spawn` 23, `ram_file`
 29 (`ram_file_tests` 23 + `ram_file_split_tests` 6), `fd` 14, `efile` 13, `binary_io` 9 — then
-`registry` 61 (36 + the 4 in `registry_reply_tests.rs` + the 4 in `registry_busy_tests.rs` + the 7 in
-`registry_downcast_tests.rs` + the 10 in `active_mode_tests.rs`), `io_device` 41, `abi` 41 (`host` 23 = 18 + the 5 in
+`registry` 60 (36 + the 4 in `registry_reply_tests.rs` + the 4 in `registry_busy_tests.rs` + the 7 in
+`registry_downcast_tests.rs` + the 9 in `active_mode_tests.rs`), `io_device` 41, `abi` 41 (`host` 23 = 18 + the 5 in
 `host_output_tests.rs`, `port` 8, `table` 7, `job` 3), `port` 36 (12 + the 12 in
 `active_input_tests.rs` + the 8 in `port_command_tests.rs` + the 4 in `port_control_reply_tests.rs`),
 `port_task` 22, `signal` 20, `poller` 17, `driver` 13, `timer` 12, `ddll` 11, `completion` 11,
@@ -299,7 +308,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   and `input_len()` back to `0` and no task left pending, a second round reports nothing; plus a
   `RefusingWriteDriver` whose `output`/`ready_output` answer `Err(BadArg)` — `Port::output`,
   `Port::ready_output` and `execute_port_tasks` each surface `BadArg` with the bytes still queued.
-- **The `{active, …}` state seam** is pinned hermetically in `active_mode_tests.rs` (10 tests, no
+- **The `{active, …}` state seam** is pinned hermetically in `active_mode_tests.rs` (9 tests, no
   socket, no `cc`, no `erl`), a `#[path]` sibling of `registry.rs`, over a plain-Rust `ActiveDriver`
   whose raw store (`active`/`active_count`) and staged spends are observable: `from_parts` for all four
   modes plus the out-of-range values (⇒ `False`), `is_active` on the mode field (including
@@ -311,6 +320,10 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   (a second call is empty), its within-port spending order and its port-number order across two ports;
   and the **closed half** — a spend staged before a `close`, and one staged from the driver's own `stop`,
   each reported once afterwards while the port is already gone from the live map.
+  The **driver-level** half is `drivers/inet/active_seam_tests.rs` (9): the real `tcp_inet`/`udp_inet`
+  drivers, one spend per exhausted `{active,once}`/`{active,N}` grant, the remaining counter readable
+  through `PortRegistry::active_mode`, `{active,true}` never spending, the `setopts`-to-zero path
+  spending nothing, and the registry route over a factory-built `"tcp_inet"` port.
   The busy decision table is `port_command_tests.rs`'s (8 tests over a plain-Rust `BusyDriver` whose
   busy state, flag word and written bytes are all observable): idle ⇒ `Done` with the bytes really
   written and one `OUTPUT` task, busy + plain or `[nosuspend]` ⇒ `Busy` with **nothing** queued and no
@@ -376,6 +389,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - `signal.rs` → `Signal`/`Disposition`/`SignalFacility`; `cpu_time.rs` → `CpuTimes`/`RuntimeClock`; `ddll.rs` → `DynLib`/`DllError`
 - `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site, `EINTR` retried, an interior-NUL path ⇒ `BadArg`), `access` (`Result<bool>`, refusal ⇒ `false`, only a genuine syscall failure is `BeamError::Io`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>` — the **effective** ids `check_access` compares a `stat` against)
 - `drivers/` → the built-in drivers (`fd`, `efile`, `spawn`, `tcp_inet`, `udp_inet`, `ram_file_drv`) + framing, incl. `line_buffer.rs`'s `LineFrame`/`LineBuffer` (the port-level `{eol | noeol, Data}` splitter) — child node `drivers/CONTEXT.md`
+- `drivers/inet/` → the `tcp_inet`/`udp_inet` socket drivers (option/syscall/stat layer, the async-op queue, the `{active,…}` deliveries, the opcode bridge, `{packet,N}` framing) — child node `drivers/inet/CONTEXT.md`; its two newest suite halves are `write_frame_tests.rs` (12 — the `{packet,1|2|4}` header on both write routes, `send_oct`, the short write and the refusals, over a real loopback port) and `active_seam_tests.rs` (9 — `Driver::active_mode`/`take_active_spends` over the real drivers)
 - `abi/` → the driver C-ABI host layer — child node `abi/CONTEXT.md`
 - `io_device/` → the `{get_until,…}` io-device request layer — child node `io_device/` (files listed in `../CONTEXT.md`)
 
