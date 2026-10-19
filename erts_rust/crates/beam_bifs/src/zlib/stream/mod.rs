@@ -57,7 +57,14 @@
 //! 1. arity/type validation failures ⇒ `badarg` (a `BifRegistry` call already matched the
 //!    arity, so this is each body's own argument destructuring);
 //! 2. caller is not the stream's controlling process ⇒ raise `error:not_on_controlling_process`;
-//! 3. the state precondition ⇒ raise `error:not_initialized` or `error:already_initialized`.
+//! 3. the state precondition, where the C has one ⇒ raise `error:not_initialized` or
+//!    `error:already_initialized`.
+//!
+//! Four keys impose **no** state precondition — `set_controller_nif` and the three stash
+//! keys ([`Requires::Any`]) — exactly as the C's `zlib_set_controller`/`zlib_getStash`/
+//! `zlib_setStash`/`zlib_clearStash` test only the handle, the controller and their own
+//! argument/stash state (`zlib_nif.c:473-522`, `:583-602`). A closed stream therefore
+//! still answers `set_controlling_process/2` with `ok`, as the oracle does.
 //!
 //! The handle decodes through `access::ref_thing_id`, so a term that is not an internal
 //! reference — or one this module never minted — is `badarg`, exactly as the C's
@@ -319,6 +326,11 @@ pub(super) fn raise_atom(reason: &'static str) -> BeamError {
 /// The state precondition a NIF imposes on its stream, checked after the controlling
 /// process (the C's `d->state != ST_…` tests).
 pub(super) enum Requires {
+    /// **No** state precondition: the C's `zlib_set_controller`
+    /// (`zlib_nif.c:583-602`) and its three stash functions (`:473-522`) test only the
+    /// handle, the controller and their own argument/stash state, so a closed — or
+    /// not-yet-initialized — stream answers exactly as a live one does.
+    Any,
     /// `deflateInit`/`inflateInit`: the stream must be untouched, else
     /// `already_initialized`.
     Init,
@@ -337,7 +349,8 @@ pub(super) enum Requires {
 /// The order is the C's: the handle decodes first (`badarg` for anything that is not an
 /// internal reference this module minted), then the controlling-process check raises
 /// `not_on_controlling_process`, then [`Requires`] raises
-/// `not_initialized`/`already_initialized`. Every argument-type check a body needs has
+/// `not_initialized`/`already_initialized` — [`Requires::Any`] raises neither, matching
+/// the four C keys that have no state test. Every argument-type check a body needs has
 /// already run (the bodies decode their own arguments before calling in), so a malformed
 /// argument is `badarg` even when the caller is not the owner — exactly the C's single
 /// `if (argc != n || !get_zlib_data(...) || !enif_get_int(...))` condition.
@@ -358,6 +371,7 @@ pub(super) fn with_stream<R>(
         return Err(raise_atom("not_on_controlling_process"));
     }
     let satisfied = match requires {
+        Requires::Any => true,
         Requires::Init => stream.state == State::New,
         Requires::Deflate => stream.state == State::Deflate,
         Requires::Inflate => stream.state == State::Inflate,
