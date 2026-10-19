@@ -554,6 +554,37 @@ pub struct Runtime {
     /// `entry`/`get_mut`/`remove`d (never iterated), so they probe with the crate's own
     /// [`FastHashMap`] over [`crate::hasher`], like [`Runtime::mailboxes`].
     pub(crate) monitor_nodes: FastHashMap<ProcessId, FastHashMap<u64, u64>>,
+    /// The `erlang:monitor_node/2` subscriptions of every process — the C's
+    /// `ERTS_MON_TYPE_NODE` monitor chain, the `bif.tab` BIF's own store.
+    ///
+    /// `erlang:monitor_node(Node, true)` subscribes the calling process to **one** node's
+    /// connection state; the process is then sent a plain `{nodeup, Node}` / `{nodedown, Node}`
+    /// 2-tuple each time that node's connection is established or lost. This is a *different*
+    /// family from [`Runtime::monitor_nodes`] (`ERTS_MON_TYPE_NODES`, the undocumented
+    /// `process_flag({monitor_nodes, Opts}, true)` flag `net_kernel:monitor_nodes/1,2` sets,
+    /// whose messages are the 3-tuple/`Info` form): the two stores are separate and share
+    /// nothing.
+    ///
+    /// The value is the C's **idempotent set**: a repeat `monitor_node(Node, true)` neither
+    /// duplicates nor refcounts, `monitor_node(Node, false)` removes the entry, and — exactly
+    /// like the C — subscribing to a node that is *already* connected replays **nothing**; a
+    /// notification follows only a **transition**. [`NodeMonitorLatch::saw_connected`] is the
+    /// per-subscription memory that turns the diff into a transition: it is seeded from the
+    /// node's state at subscription time and flipped by [`Runtime::service_node_monitors`], the
+    /// scheduler pass's step.
+    ///
+    /// The node is held as an **atom term** — an immediate from the one shared atom table, so it
+    /// is stable and re-deliverable exactly as the subscriber spelled it. A terminated process's
+    /// entry is dropped by that step; leaving one behind would be harmless for the same reason
+    /// [`Runtime::monitor_nodes`]'s stale keys are.
+    ///
+    /// Unlike the probe-only pid-keyed maps ([`Runtime::timer_resumes`],
+    /// [`Runtime::group_leaders`], [`Runtime::monitor_nodes`]), this one **is** iterated: it is
+    /// the one place the runtime walks a pid-keyed map on purpose, over a set that is only ever
+    /// the processes that subscribed. It stays a [`FastHashMap`] because the per-pass cost is a
+    /// probe (`is_empty`), and the iteration order is unobservable — each pid's own latch list is
+    /// diffed in insertion order and a receiver's mailbox order is all it can see.
+    pub(crate) node_monitors: FastHashMap<ProcessId, Vec<NodeMonitorLatch>>,
     /// Closures built by the `-eval` evaluator, indexed by the fun term's `index`.
     ///
     /// An `-eval` `fun` may be applied *inside a loaded module* (e.g.
@@ -760,6 +791,70 @@ impl SourcePayloads {
     }
 }
 
+/// One `erlang:monitor_node(Node, true)` subscription — an entry of
+/// [`Runtime::node_monitors`].
+pub(crate) struct NodeMonitorLatch {
+    /// The monitored node, as the **atom term** the subscriber wrote (an immediate from the one
+    /// shared atom table, so it is stable and re-delivered verbatim as the notification's second
+    /// element).
+    pub node: Eterm,
+    /// Whether the node has been observed **connected** at or since subscription time.
+    ///
+    /// Seeded by `erlang:monitor_node/2` from the runtime's own link table
+    /// ([`Runtime::dist_is_connected`]) and flipped by [`node_monitor_transitions`]. It is what
+    /// implements the no-replay rule: a subscription made while the node is already connected
+    /// starts `true` and therefore emits no `nodeup`, and a `nodedown` can only follow a
+    /// `nodeup`.
+    pub saw_connected: bool,
+}
+
+/// Diffs every `monitor_node/2` subscription against the node set that is **established now**,
+/// answering one `(node, up)` per transition and updating the latches in place.
+///
+/// This is the whole of the node-monitor rule, kept a **pure function** so it is unit-testable
+/// without a live peer; the live half (the connected set, the term building and the delivery) is
+/// [`Runtime::service_node_monitors`].
+///
+/// | `saw_connected` | node in `established` | answer | new `saw_connected` |
+/// |---|---|---|---|
+/// | `false` | yes | `(node, true)` — a `nodeup` | `true` |
+/// | `true` | no | `(node, false)` — a `nodedown` | `false` |
+/// | `false` | no | nothing — a never-connected node stays silent | `false` |
+/// | `true` | yes | nothing — the steady state | `true` |
+///
+/// `established` holds the full `node@host` names of the links that completed their handshake,
+/// and a latch matches one **by name** (the C compares the monitor's atom against the
+/// connection's node name; a short name does not match a long one, so a subscriber that spells a
+/// node differently from its own `node()` argument hears nothing — never a fabricated
+/// notification).
+///
+/// A latch whose node name `name_of` cannot resolve is **inert**: it neither matches nor flips,
+/// because a fabricated match would be a wrong message.
+pub(crate) fn node_monitor_transitions(
+    latches: &mut [NodeMonitorLatch],
+    established: &[String],
+    name_of: &dyn Fn(Eterm) -> Option<String>,
+) -> Vec<(Eterm, bool)> {
+    let mut transitions = Vec::new();
+    for latch in latches.iter_mut() {
+        let Some(name) = name_of(latch.node) else {
+            continue;
+        };
+        let connected = established.iter().any(|node| *node == name);
+        match (latch.saw_connected, connected) {
+            (false, true) => {
+                latch.saw_connected = true;
+                transitions.push((latch.node, true));
+            }
+            (true, false) => {
+                latch.saw_connected = false;
+                transitions.push((latch.node, false));
+            }
+            _ => {}
+        }
+    }
+    transitions
+}
 impl Runtime {
     /// Creates a runtime for `config`.
     ///
@@ -1056,6 +1151,7 @@ impl Runtime {
             max_heap_set: FastHashSet::default(),
             max_heap_kill: FastHashSet::default(),
             monitor_nodes: FastHashMap::default(),
+            node_monitors: FastHashMap::default(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
             timer_wake_targets: TimerWakes::default(),
@@ -1918,7 +2014,123 @@ impl Runtime {
         }
         old
     }
-    /// Gives a freshly spawned `child` the group leader its `parent` has
+
+    /// Records `pid`'s `erlang:monitor_node(node, true)` subscription — the C's **idempotent
+    /// set** (`erts_monitor_node`, `dist.c`): a node the process already watches is left exactly
+    /// as it stands, so a repeat neither duplicates the entry nor refcounts it, and — because the
+    /// existing latch keeps its own [`saw_connected`](NodeMonitorLatch::saw_connected) — a
+    /// subscription that arrives while a transition is still pending cannot swallow it.
+    ///
+    /// `saw_connected` is the node's connection state **at subscription time**
+    /// ([`Runtime::dist_is_connected`]), which is what makes an already-connected node produce no
+    /// immediate `nodeup`.
+    pub(crate) fn monitor_node_add(&mut self, pid: ProcessId, node: Eterm, saw_connected: bool) {
+        let latches = self.node_monitors.entry(pid).or_default();
+        if latches.iter().all(|latch| latch.node != node) {
+            latches.push(NodeMonitorLatch {
+                node,
+                saw_connected,
+            });
+        }
+    }
+
+    /// Removes `pid`'s subscription to `node` (`erlang:monitor_node(node, false)`), dropping the
+    /// process's entry once its last latch is gone — the C's delete, which removes the monitor
+    /// whatever it was watching.
+    ///
+    /// A node the process does not watch is a silent no-op (the BIF still answers `true`).
+    pub(crate) fn monitor_node_remove(&mut self, pid: ProcessId, node: Eterm) {
+        let Some(latches) = self.node_monitors.get_mut(&pid) else {
+            return;
+        };
+        latches.retain(|latch| latch.node != node);
+        if latches.is_empty() {
+            self.node_monitors.remove(&pid);
+        }
+    }
+
+    /// Delivers every `erlang:monitor_node/2` notification owed at this scheduler-pass boundary,
+    /// returning how many were delivered — the **only** emitter of `{nodeup, Node}` /
+    /// `{nodedown, Node}` (contract A.5).
+    ///
+    /// The transition rule itself is the pure [`node_monitor_transitions`]; this step supplies the
+    /// three live inputs — the established node set ([`Runtime::dist_connected_nodes`], the union
+    /// of both link directions), each latch's node **name** from the one shared atom table, and
+    /// the receiving process — and then builds and delivers the 2-tuple. The message is built on
+    /// the runtime's pointer-stable arena and delivered through
+    /// [`RuntimeContext::deliver_in_table`], exactly as [`Runtime::deliver_gc_completions`] does;
+    /// its `from` is the emulator's own `system` atom (an immediate, so the envelope is neither
+    /// copied nor gathered as a GC root, and a receiver cannot observe it).
+    ///
+    /// A subscriber the table no longer holds has terminated — its latch list is dropped here
+    /// (harmless if it were not, like [`Runtime::monitor_nodes`]'s stale keys) and nothing is
+    /// delivered. A runtime that is **not** a node has an empty established set, so every latch
+    /// stays silent: `monitor_node(any_atom, true)` on a `nonode@nohost` VM answers `true` and
+    /// gains it no message, which is what the oracle does.
+    ///
+    /// # Errors
+    ///
+    /// The term builder's allocation failure and the delivery path's own errors (the emulator's
+    /// documented `error:system_limit`).
+    pub(crate) fn service_node_monitors(&mut self, table: &mut ProcessTable) -> Result<usize> {
+        // The common case — nobody subscribed — is one `is_empty` probe per pass and allocates
+        // nothing, so a hermetic `-eval`/`run` route pays nothing for this step.
+        if self.node_monitors.is_empty() {
+            return Ok(0);
+        }
+        let established = self.dist_connected_nodes();
+        // The pids are collected first: the latch list is taken out of the map so the diff runs
+        // while `self` is free to answer atom names and build terms.
+        let subscribers: Vec<ProcessId> = self.node_monitors.keys().copied().collect();
+        let mut delivered = 0;
+        for pid in subscribers {
+            if !table.contains(pid) {
+                self.node_monitors.remove(&pid);
+                continue;
+            }
+            let Some(mut latches) = self.node_monitors.remove(&pid) else {
+                continue;
+            };
+            let transitions = {
+                let runtime: &Runtime = self;
+                node_monitor_transitions(&mut latches, &established, &|node| {
+                    runtime.atom_name_of(node).map(str::to_owned)
+                })
+            };
+            if !latches.is_empty() {
+                self.node_monitors.insert(pid, latches);
+            }
+            for (node, up) in transitions {
+                let message = self.node_monitor_message(node, up)?;
+                let from = self.intern("system");
+                RuntimeContext::deliver_in_table(self, table, pid, from, message)?;
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Builds one node-monitor notification `{nodeup, Node}` (`up`) or `{nodedown, Node}`, the
+    /// plain **2-tuple** `erlang:monitor_node/2` carries (the `Info`-carrying 3-tuple belongs to
+    /// the `process_flag(monitor_nodes, …)` family).
+    ///
+    /// Built on the runtime's pointer-stable arena, so the delivery's own receiver-heap copy is
+    /// the only copy the message ever takes.
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the tuple does not fit.
+    fn node_monitor_message(&mut self, node: Eterm, up: bool) -> Result<Eterm> {
+        let mut ctx = RuntimeContext::new(self);
+        let (tag, node) = {
+            let atoms = ctx.runtime.code_server.atoms_mut();
+            (
+                make_atom(atoms.intern(if up { "nodeup" } else { "nodedown" })),
+                node,
+            )
+        };
+        terms::make_tuple(&mut ctx, &[tag, node])
+    }    /// Gives a freshly spawned `child` the group leader its `parent` has
     /// (`erl_process.c:12654-12663`).
     ///
     /// A child with no explicit `spawn_opt` leader inherits its parent's, so an explicit
@@ -4098,5 +4310,195 @@ mod tests {
         assert_eq!(assert_fast_hashed_values(&rt.monitor_nodes), 1);
         assert_eq!(rt.monitor_nodes_remove(own, 3), 2);
         assert_eq!(rt.monitor_nodes_remove(own, 3), 0);
+    }
+
+    // -- `erlang:monitor_node/2` (contract A.5) -------------------------------
+
+    /// A `ProcessTable` with its own atom namespace — the shape the pass-boundary step tests use
+    /// (`runtime/gc.rs`), so a delivery can be asserted against a table the runtime does not own.
+    fn monitor_table() -> ProcessTable {
+        ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()))
+    }
+
+    /// The pure diff's four states, over one latch at a time: a `nodedown` when a node the
+    /// subscription had seen connected is gone, a `nodeup` when a node it had not seen connected
+    /// appears, and **nothing** in the two steady states — in particular nothing for a node that
+    /// was never connected (the "no replay, no fabricated up" rule: `monitor_node(N, true)` on a
+    /// node with no link is silent until a link actually comes up).
+    #[test]
+    fn node_monitor_transitions_fire_once_per_change_and_never_for_a_steady_state() {
+        let mut rt = runtime();
+        let peer = rt.intern("peer@host");
+        let connected = vec!["peer@host".to_string()];
+        // (a) a node the subscription saw connected, now absent; (d) the same, still present.
+        let mut lost = [NodeMonitorLatch {
+            node: peer,
+            saw_connected: true,
+        }];
+        let mut steady = [NodeMonitorLatch {
+            node: peer,
+            saw_connected: true,
+        }];
+        // (b) a node the subscription never saw connected, now present; (c) the same, absent.
+        let mut gained = [NodeMonitorLatch {
+            node: peer,
+            saw_connected: false,
+        }];
+        let mut silent = [NodeMonitorLatch {
+            node: peer,
+            saw_connected: false,
+        }];
+        let name_of = |term: Eterm| rt.atom_name_of(term).map(str::to_owned);
+
+        assert_eq!(
+            node_monitor_transitions(&mut lost, &[], &name_of),
+            vec![(peer, false)],
+            "(a) a lost connection is one nodedown"
+        );
+        assert!(
+            !lost[0].saw_connected,
+            "the latch flipped to not-connected"
+        );
+
+        assert!(
+            node_monitor_transitions(&mut steady, &connected, &name_of).is_empty(),
+            "(d) an unchanged connection notifies nobody"
+        );
+        assert!(steady[0].saw_connected);
+
+        assert_eq!(
+            node_monitor_transitions(&mut gained, &connected, &name_of),
+            vec![(peer, true)],
+            "(b) a new connection is one nodeup"
+        );
+        assert!(gained[0].saw_connected, "the latch flipped to connected");
+
+        assert!(
+            node_monitor_transitions(&mut silent, &[], &name_of).is_empty(),
+            "(c) a node that never connected produces no message"
+        );
+        assert!(!silent[0].saw_connected);
+    }
+
+    /// Latches are independent: two subscriptions on different nodes transition on their own
+    /// links, in subscription order, and a latch whose node name cannot be resolved is inert
+    /// (it neither matches nor flips — never a fabricated notification).
+    #[test]
+    fn node_monitor_latches_transition_independently_and_an_unnamed_one_is_inert() {
+        let mut rt = runtime();
+        let up = rt.intern("up@host");
+        let down = rt.intern("down@host");
+        let unnameable = make_small(7); // not an atom ⇒ no name ⇒ inert
+        let mut latches = [
+            NodeMonitorLatch {
+                node: up,
+                saw_connected: false,
+            },
+            NodeMonitorLatch {
+                node: down,
+                saw_connected: true,
+            },
+            NodeMonitorLatch {
+                node: unnameable,
+                saw_connected: true,
+            },
+        ];
+        let established = vec!["up@host".to_string(), "other@host".to_string()];
+        let transitions = node_monitor_transitions(&mut latches, &established, &|term| {
+            rt.atom_name_of(term).map(str::to_owned)
+        });
+        assert_eq!(
+            transitions,
+            vec![(up, true), (down, false)],
+            "each latch answers its own node's transition, in subscription order"
+        );
+        assert!(latches[0].saw_connected && !latches[1].saw_connected);
+        assert!(
+            latches[2].saw_connected,
+            "an unnameable node never matches, so its latch never flips"
+        );
+    }
+    /// **The pass step delivers exactly one `{nodedown, Node}`** for a subscription that saw its
+    /// node connected and now has no link — the plain **2-tuple** `monitor_node/2` carries — and
+    /// answers `0` on the next pass (a transition fires once, never per pass).
+    #[test]
+    fn a_nodedown_is_delivered_into_the_subscribers_mailbox_exactly_once() {
+        let mut rt = runtime();
+        let mut table = monitor_table();
+        let watcher = table.spawn_default().expect("a watcher process");
+        let peer = rt.intern("peer@host");
+        rt.monitor_node_add(watcher, peer, true);
+
+        assert_eq!(
+            rt.service_node_monitors(&mut table).expect("one nodedown"),
+            1,
+            "a lost connection notifies its subscriber once"
+        );
+        let message = table
+            .get_mut(watcher)
+            .expect("the watcher")
+            .receive(|_| true)
+            .expect("a node-monitor message");
+        assert_eq!(
+            rt.format_term_w(message.payload(), None)
+                .expect("printable")
+                .trim_end(),
+            "{nodedown,peer@host}",
+            "the notification is the plain 2-tuple"
+        );
+        assert_eq!(
+            rt.service_node_monitors(&mut table).expect("steady state"),
+            0,
+            "the transition is not re-reported on the next pass"
+        );
+        assert_eq!(
+            table.get_mut(watcher).expect("the watcher").mailbox().len(),
+            0,
+            "the one taken message was the only delivery"
+        );
+    }
+
+    /// A runtime that is **not** a distributed node delivers nothing: `monitor_node(any_atom,
+    /// true)` is still recorded (the BIF answers `true`), but with no node there is no connection
+    /// to transition, so a hermetic `-eval`/`run` route gains no message. A subscriber the table
+    /// no longer holds has terminated, and its latches are dropped rather than delivered.
+    #[test]
+    fn a_dormant_runtime_delivers_no_node_monitor_message_and_drops_dead_subscribers() {
+        let mut rt = runtime();
+        assert!(
+            rt.node_name().is_none(),
+            "a -noshell runtime is `nonode@nohost`"
+        );
+        let mut table = monitor_table();
+        let watcher = table.spawn_default().expect("a watcher process");
+        let peer = rt.intern("peer@host");
+        rt.monitor_node_add(watcher, peer, false);
+        assert_eq!(
+            rt.service_node_monitors(&mut table).expect("silent"),
+            0,
+            "a node with no link never transitions"
+        );
+        assert!(
+            table
+                .get_mut(watcher)
+                .expect("the watcher")
+                .receive(|_| true)
+                .is_none(),
+            "nothing was delivered"
+        );
+        assert_eq!(rt.node_monitors.len(), 1, "the subscription itself stands");
+
+        let gone = table.spawn_default().expect("a second process");
+        table.take(gone).expect("the terminated process");
+        rt.monitor_node_add(gone, peer, true);
+        assert_eq!(
+            rt.service_node_monitors(&mut table).expect("nobody to notify"),
+            0,
+            "a terminated subscriber's latches are dropped, never delivered elsewhere"
+        );
+        assert!(
+            !rt.node_monitors.contains_key(&gone),
+            "and the stale key is gone"
+        );
     }
 }

@@ -505,6 +505,13 @@ impl RuntimeContext<'_> {
             ("erlang", "alias", 0) => Some(self.alias_0()),
             ("erlang", "alias", 1) => Some(self.alias_1(args)),
             ("erlang", "unalias", 1) => Some(self.unalias_1(args)),
+            // The **node-monitor** BIF (`erlang:monitor_node/2`, `bif.tab:108`): subscribes the
+            // caller to one node's connection state. Its store is runtime state — the C's
+            // `ERTS_MON_TYPE_NODE` monitor chain on [`Runtime`](crate::Runtime) — and the
+            // notifications are emitted by the scheduler pass, so the arm lives here and the
+            // body in [`net`]. `monitor_node/3` (the `Info`-carrying form) has **no** arm: it
+            // stays the `beam_bifs` registry's typed capability gap.
+            ("erlang", "monitor_node", 2) => Some(self.monitor_node_2(args)),
             ("erlang", "exit", 2) => Some(self.exit_2(args)),
             ("erlang", "exit", 3) => Some(self.exit_3(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
