@@ -1025,14 +1025,15 @@ that module** (a safe single `-pa` for the oracle).
 `not_initialized` / `already_initialized` / `badarg` families and the `ok` boundaries around them),
 `controlling/0` (`not_on_controlling_process` and the `set_controlling_process/2` transfer both
 ways, plus a dead pid and a non-pid) and `closed_controller/0` (`set_controlling_process/2` across
-the fresh / ended / closed states, where the closed state is the suite's one pinned `zlib`
-divergence). `guard_atoms/0` is **load-bearing**: it names the six guard atoms so they enter the
-module's atom table, because on this runtime a raise whose reason atom is absent from the raising
-module's atom table is not catchable by that module's `try … catch`.
+the fresh / ended / closed states, which all answer `ok` on both runtimes — the C's
+`set_controller_nif` imposes no state precondition). `guard_atoms/0` is **documentation** of the
+class set: it names the six guard atoms so they enter the module's atom table, but nothing depends
+on that — a raise whose reason atom is absent from the raising module's atom table is catchable
+anyway, because the runtime names a BIF raise's reason atom in its one shared table.
 `zlib_guards_unnamed.erl` is that probe shape *without* the atom reference (`deflate_end_twice/0`,
-`deflate_init_twice/0`, `after_finish/0`); the suite pins the resulting escape (exit 1,
-`beam_rt: error <atom>`) against the oracle's caught `{exception,error,<atom>}`. Nothing in it may
-spell a guard atom — not even as a function name, since an exported name *is* an atom in the
+`deflate_init_twice/0`, `after_finish/0`); the suite pins that it answers the **same** caught
+`{exception,error,<atom>}` lines as the system `erl` oracle and as the named fixture. Nothing in it
+may spell a guard atom — not even as a function name, since an exported name *is* an atom in the
 table (measured).
 Both fixtures print their transcript with `io:format/2` and return `ok`, so the compared observable
 is the printed transcript and never the `run` route's `~w` result line; no binary is ever printed

@@ -32,7 +32,8 @@
 %%
 %% Nothing here may name the guard atoms, not even in a comment that the compiler would not
 %% read: only *code* references load atoms, and only code references are what this fixture must
-%% stay free of.-module(zlib_guards_unnamed).
+%% stay free of.
+-module(zlib_guards_unnamed).
 
 -export([deflate_end_twice/0, after_finish/0, deflate_init_twice/0]).
 

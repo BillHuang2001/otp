@@ -43,7 +43,7 @@
 //! | 5 | a **foreign** process calling into another's stream ⇒ `not_on_controlling_process` | `foreign_process_*` | [`the_controlling_process_guards_agree_on_every_route_and_tier`] |
 //! | 6 | `deflateEnd/1` then `close/1` ⇒ `ok` | `deflateEnd_then_close` | [`the_guard_classes_agree_on_every_route_and_tier`] |
 //! | 7 | `close/1` twice ⇒ `not_initialized`; `close/1` on a live stream ⇒ `ok`; on a closed one ⇒ `not_initialized` | `close_twice*`, `close_a_fresh_stream`, `deflate_on_a_closed_stream` | same |
-//! | 8 | `set_controlling_process/2` transfers ownership both ways, a dead pid is accepted, a non-pid is `badarg` | `transfer_*`, `set_controlling_process_*` | [`the_controlling_process_guards_agree_on_every_route_and_tier`], [`setting_the_controlling_process_on_a_closed_stream_is_a_known_divergence`] |
+//! | 8 | `set_controlling_process/2` transfers ownership both ways, a dead pid is accepted, a non-pid is `badarg`, and the closed/ended/fresh stream states all answer `ok` | `transfer_*`, `set_controlling_process_*` | [`the_controlling_process_guards_agree_on_every_route_and_tier`], [`setting_the_controlling_process_on_a_closed_stream_agrees_on_every_route_and_tier`] |
 //! | 9 | `already_initialized` is reachable from the wrapper (a second `deflateInit/1`, `inflateInit/1` after it, `inflateInit/1` twice) | `deflateInit_twice`, `inflateInit_after_deflateInit`, `inflateInit_twice` | [`the_guard_classes_agree_on_every_route_and_tier`] |
 //!
 //! # The two routes and the two tiers
@@ -71,20 +71,14 @@
 //! that one trailing `ok` line, and no binary is ever printed (the payload probe answers
 //! `byte_size`/`=:=` witnesses instead).
 //!
-//! # The one pinned divergence (pinned, not papered over)
+//! # `set_controlling_process/2` imposes no stream-state precondition
 //!
-//! It is not a `zlib` semantics difference, and it is pinned on **both** sides so a divergence
-//! cannot silently disappear or change shape. It cannot be fixed from this suite (`src/` is out of
-//! scope), so the assertions record today's pair of answers verbatim.
-//!
-//! | What | This runtime | The system `erl` |
-//! |---|---|---|
-//! | `zlib:set_controlling_process(Z, Pid)` on a **closed** stream | `{exception,error,not_initialized}` | `{value,ok}` |
-//!
-//! That is the documented `Requires::Closable` deviation in `beam_bifs/src/zlib/CONTEXT.md`
-//! (the C's `set_controller_nif` — `zlib_nif.c:583-602` — imposes **no** state precondition, so
-//! it answers `ok` even on a closed stream). The suite pins that the divergence is *exactly* the
-//! closed state: the ended and fresh states answer `ok` on both sides.
+//! The C's `set_controller_nif` (`zlib_nif.c:583-602`) validates its arguments, checks the
+//! ownership and overwrites the pid — there is **no** state test at all — so the wrapper answers
+//! `ok` on a **closed**, an **ended** and a **fresh** stream alike, and this runtime agrees with
+//! the oracle on all three
+//! ([`setting_the_controlling_process_on_a_closed_stream_agrees_on_every_route_and_tier`]).
+//! `beam_bifs`'s `Requires::Any` is the same no-precondition answer for the three stash keys.
 //!
 //! # A guard atom the module does not name is still catchable
 //!
@@ -98,7 +92,8 @@
 //! reads, so catchability no longer depends on a module's load-time atom snapshot.
 //! `tests/fixtures/zlib_guards.erl` still names the six classes in `guard_atoms/0` — as
 //! documentation of the class set — but nothing depends on that any more, and the unnamed fixture
-//! answers the same lines.//!
+//! answers the same lines.
+//!
 //! # Toolchain
 //!
 //! The oracle (`erl`) is resolved from the **filesystem** ([`support::require_oracle`], never by
@@ -394,7 +389,8 @@ impl Drop for Fixture {
 /// fixture's atom image must not be loaded beside the unnamed one, or the shared atom table
 /// would carry the guard atoms from a *module image* and the test would no longer be exercising a
 /// name only the raise's own table can supply.
-fn build_fixture(label: &str, module: &'static str) -> Option<Fixture> {    let Some(erlc) = resolve_erlc() else {
+fn build_fixture(label: &str, module: &'static str) -> Option<Fixture> {
+    let Some(erlc) = resolve_erlc() else {
         support::skip_loudly(SUITE, "no `erlc` available (and none beside $ERTS_ORACLE)");
         return None;
     };
@@ -509,17 +505,10 @@ transfer_to_a_dead_pid {value,{{value,ok},{exception,error,not_on_controlling_pr
 transfer_to_a_non_pid {value,{{exception,error,badarg},ok}}
 transfer_to_self {value,true}";
 
-/// `zlib_guards:closed_controller/0` on **this** runtime — the divergence is line 1 only (see
-/// the module docs): `set_controller_nif` has no state precondition in the C, so the oracle
-/// answers `ok` there.
-const GOLDEN_CLOSED_CONTROLLER_OURS: &str = "\
-set_controlling_process_on_a_closed_stream {exception,error,not_initialized}
-set_controlling_process_on_an_ended_stream {value,ok}
-set_controlling_process_on_a_fresh_stream {value,ok}";
-
-/// The **oracle's** `zlib_guards:closed_controller/0` — identical to
-/// [`GOLDEN_CLOSED_CONTROLLER_OURS`] except line 1.
-const GOLDEN_CLOSED_CONTROLLER_ORACLE: &str = "\
+/// `zlib_guards:closed_controller/0` — the **single** recording both runtimes answer:
+/// `set_controller_nif` has no state precondition in the C (`zlib_nif.c:583-602`), so a closed,
+/// an ended and a fresh stream all answer `ok`.
+const GOLDEN_CLOSED_CONTROLLER: &str = "\
 set_controlling_process_on_a_closed_stream {value,ok}
 set_controlling_process_on_an_ended_stream {value,ok}
 set_controlling_process_on_a_fresh_stream {value,ok}";
@@ -582,7 +571,8 @@ const EXPR_CLASSES: &str = concat!(
 ///
 /// The transcript is the whole line the fixture prints, and it is what the system `erl` **and**
 /// this runtime must both answer: the class does not depend on the catching module's atom table.
-const UNNAMED_PROBES: [(&str, &str, &str); 3] = [    (
+const UNNAMED_PROBES: [(&str, &str, &str); 3] = [
+    (
         "deflate_end_twice",
         "not_initialized",
         "deflateEnd_twice {exception,error,not_initialized}",
@@ -609,7 +599,8 @@ const UNNAMED_PROBES: [(&str, &str, &str); 3] = [    (
 ///
 /// This is the driver that reaches `zlib` through the runtime's own `-eval` walker rather than
 /// through a compiled fixture, so it is the one route where a guard class is pinned without any
-/// dependence on a module's atom table (see the module docs' second divergence).
+/// dependence on a module's atom table (see the module docs' *A guard atom the module does not
+/// name is still catchable*).
 #[test]
 fn the_guard_classes_agree_on_the_self_contained_eval_route() {
     let Some(oracle) = oracle_or_skip() else {
@@ -725,23 +716,22 @@ fn the_controlling_process_guards_agree_on_every_route_and_tier() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 4. The one divergence: set_controlling_process/2 on a CLOSED stream
+// 4. set_controlling_process/2 on a CLOSED stream (no state precondition)
 // ---------------------------------------------------------------------------------------
 
-/// Pins the **known divergence** (module docs, table 1) on all four combinations plus the
-/// oracle: `zlib:set_controlling_process/2` answers `ok` on a closed stream under the system
-/// `erl` — the C's `set_controller_nif` (`zlib_nif.c:583-602`) has no state precondition — while
-/// this runtime raises `not_initialized`, because `beam_bifs`'s `Requires::Closable` refuses a
-/// `Closed` stream.
+/// Pins that `zlib:set_controlling_process/2` answers `ok` on a **closed**, an **ended** and a
+/// **fresh** stream — on all four combinations *and* under the oracle, against the **one** shared
+/// recording [`GOLDEN_CLOSED_CONTROLLER`].
 ///
-/// Both sides are asserted **verbatim**, so the divergence cannot change shape unnoticed and a
-/// fix is caught: the day this runtime answers `ok`, this test fails and
-/// [`GOLDEN_CLOSED_CONTROLLER_OURS`] must become [`GOLDEN_CLOSED_CONTROLLER_ORACLE`].
+/// The C's `set_controller_nif` (`zlib_nif.c:583-602`) validates its arguments, checks the
+/// ownership and overwrites the pid; it does not look at the stream's state at all, so `ok` is the
+/// answer on every state and this runtime must match it on each of them — the closed state
+/// included, where a state precondition would instead raise `not_initialized`.
 ///
-/// The other two lines pin the boundary of the divergence: the **ended** and **fresh** states
-/// already agree with the oracle.
+/// The assertion is symmetric on purpose: the same golden is required of this runtime and of the
+/// system `erl`, so neither side can drift into a different answer unobserved.
 #[test]
-fn setting_the_controlling_process_on_a_closed_stream_is_a_known_divergence() {
+fn setting_the_controlling_process_on_a_closed_stream_agrees_on_every_route_and_tier() {
     let Some(oracle) = oracle_or_skip() else {
         return;
     };
@@ -756,31 +746,24 @@ fn setting_the_controlling_process_on_a_closed_stream_is_a_known_divergence() {
         );
         assert_eq!(
             eval,
-            GOLDEN_CLOSED_CONTROLLER_OURS,
+            GOLDEN_CLOSED_CONTROLLER,
             "`{MODULE}:closed_controller/0` through the `-eval` driver on {}",
             tier.label()
         );
         let scheduled = ours_run(&fixture, "closed_controller", tier);
         assert_eq!(
             scheduled,
-            GOLDEN_CLOSED_CONTROLLER_OURS,
+            GOLDEN_CLOSED_CONTROLLER,
             "`{MODULE}:closed_controller/0` through the scheduled `run` route on {}",
             tier.label()
         );
     }
     let theirs = theirs_fixture(&oracle, &fixture, "closed_controller");
     assert_eq!(
-        theirs, GOLDEN_CLOSED_CONTROLLER_ORACLE,
-        "the oracle's `set_controlling_process/2` on a closed stream is `ok` — the C imposes no \
-         state precondition, which is exactly the divergence this test pins"
-    );
-
-    // The divergence is line 1 and nothing else: both sides agree on the remaining lines.
-    let ours_lines: Vec<&str> = GOLDEN_CLOSED_CONTROLLER_OURS.lines().skip(1).collect();
-    let oracle_lines: Vec<&str> = GOLDEN_CLOSED_CONTROLLER_ORACLE.lines().skip(1).collect();
-    assert_eq!(
-        ours_lines, oracle_lines,
-        "the ended/fresh `set_controlling_process/2` answers must agree with the oracle"
+        theirs, GOLDEN_CLOSED_CONTROLLER,
+        "the oracle's `set_controlling_process/2` answers `ok` on a closed, an ended and a fresh \
+         stream alike — the C's `set_controller_nif` imposes no state precondition — and this \
+         runtime must answer exactly the same recording"
     );
 }
 
