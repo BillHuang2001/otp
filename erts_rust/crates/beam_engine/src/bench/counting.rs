@@ -94,6 +94,104 @@ use crate::terms::{binary_bytes, list_elements, make_heap_binary};
 /// iolists are a handful of levels deep.
 const MAX_IOLIST_DEPTH: usize = 64;
 
+/// One histogram key: the `(module, function, arity)` triple of a BIF dispatch.
+///
+/// The `Box<str>`s are minted **once per distinct key**, never per dispatch (see
+/// [`BifHistogram::record`]), which is the whole point of the type.
+#[derive(Debug)]
+struct BifName {
+    /// The BIF's owning module.
+    module: Box<str>,
+    /// The BIF's name.
+    function: Box<str>,
+    /// The call's arity.
+    arity: u32,
+}
+
+impl BifName {
+    /// `true` when this key names `module:function/arity`.
+    ///
+    /// Two `&str` comparisons (the arity first, because it is the cheapest field and a mismatch
+    /// there is the most common one), no allocation and no hashing — so the hot dispatch path
+    /// pays a `memcmp`, not a `format!`.
+    fn names(&self, module: &str, function: &str, arity: u32) -> bool {
+        self.arity == arity && self.module.as_ref() == module && self.function.as_ref() == function
+    }
+}
+
+/// The `call_bif` histogram: `module:function/arity` → dispatch count.
+///
+/// # Why this is not a `BTreeMap<String, u64>` keyed by `format!(…)`
+///
+/// It used to be exactly that, and the `format!` ran **once per dispatch**. A `perf` profile of
+/// the interpreter tier priced it at **~17 %** of `list_walk`'s per-element samples and **~7 %**
+/// of `emqx_base62:encode`'s (`alloc::fmt::format::format_inner` +
+/// `<String as fmt::Write>::write_str` + `core::fmt::write` + the `String`'s growth), i.e. the
+/// harness' own bookkeeping was inflating precisely the figure the harness exists to report.
+///
+/// The key set is tiny (a workload dispatches a handful of distinct BIFs; the harness' own floor
+/// serves seven names at most), so pairwise lookup is both the cheapest and the simplest
+/// structure — and the memo of the last key makes the common case (a run of calls to the same
+/// BIF) a single key comparison.
+///
+/// The display strings are built in [`BifHistogram::to_map`], once, at report time only.
+#[derive(Debug, Default)]
+pub(crate) struct BifHistogram {
+    /// The distinct keys, in first-seen order; parallel to `counts`.
+    keys: Vec<BifName>,
+    /// Dispatches per key.
+    counts: Vec<u64>,
+    /// The index of the most recently used key, so a repeated dispatch skips the search.
+    last: Option<usize>,
+}
+
+impl BifHistogram {
+    /// Count one `module:function/arity` dispatch. Allocates **only** when the key is new.
+    fn record(&mut self, module: &str, function: &str, arity: u32) {
+        if let Some(id) = self.last {
+            if self.keys[id].names(module, function, arity) {
+                self.counts[id] += 1;
+                return;
+            }
+        }
+        for (id, key) in self.keys.iter().enumerate() {
+            if key.names(module, function, arity) {
+                self.counts[id] += 1;
+                self.last = Some(id);
+                return;
+            }
+        }
+        self.keys.push(BifName {
+            module: module.into(),
+            function: function.into(),
+            arity,
+        });
+        self.counts.push(1);
+        self.last = Some(self.keys.len() - 1);
+    }
+
+    /// `true` when no BIF was dispatched at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The report form: `"module:function/arity"` → count, keyed exactly as the printed
+    /// `bif_histogram[…]` rows were before (byte-identical output; the `format!` now happens
+    /// here, once per distinct key, instead of once per dispatch).
+    pub(crate) fn to_map(&self) -> BTreeMap<String, u64> {
+        self.keys
+            .iter()
+            .zip(&self.counts)
+            .map(|(key, count)| {
+                (
+                    format!("{}:{}/{}", key.module, key.function, key.arity),
+                    *count,
+                )
+            })
+            .collect()
+    }
+}
+
 /// The counters one measured phase accumulates.
 ///
 /// All fields are `pub(crate)` so the harness in [`super`] can format them without a second
@@ -114,8 +212,10 @@ pub(crate) struct Counters {
     pub(crate) heap_words: u64,
     /// `call_bif` calls (an in-crate BIF dispatch).
     pub(crate) bif_calls: u64,
-    /// `call_bif` calls keyed `"module:function/arity"`.
-    pub(crate) bif_histogram: BTreeMap<String, u64>,
+    /// `call_bif` calls keyed `"module:function/arity"` (see [`BifHistogram`]: the dispatch
+    /// path allocates nothing, the display strings are built by
+    /// [`BifHistogram::to_map`] at report time).
+    pub(crate) bif_histogram: BifHistogram,
     /// `apply` calls (the general `apply`/`call_ext` hook).
     pub(crate) apply_calls: u64,
     /// `apply_fun` calls (the value-returning closure-application fallback).
@@ -357,11 +457,9 @@ impl ExecutionContext for CountingContext {
         args: &[Eterm],
     ) -> Result<Eterm> {
         self.counters.bif_calls += 1;
-        *self
-            .counters
-            .bif_histogram
-            .entry(format!("{module}:{function}/{arity}"))
-            .or_insert(0) += 1;
+        // Deliberately the allocation-free form: `format!`ing the key here cost ~17 % of the
+        // interpreter `list_walk` per-element samples (see `BifHistogram`).
+        self.counters.bif_histogram.record(module, function, arity);
         // The harness' own floor comes first; anything it does not model keeps the inner
         // host's rejecting behaviour. A *declined* operand is counted so the report can
         // assert the floor never silently shaped a result.

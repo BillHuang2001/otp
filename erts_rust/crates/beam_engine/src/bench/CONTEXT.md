@@ -19,11 +19,20 @@ It is absent from production builds: `../lib.rs` declares `#[cfg(test)] mod benc
   `alloc_words_rooted` calls/words (the per-built-term admission door), the
   `ensure_heap`/`ensure_heap_full` door (the `test_heap`/`allocate_heap` door), `call_bif` plus a
   `module:function/arity` histogram, `apply`/`apply_fun`, `alloc_words`, and the three resolver seams.
+  The histogram is `BifHistogram`, not a `BTreeMap<String, u64>`: its `record` is **allocation-free and
+  hash-free** on the dispatch path (a memo of the last key, then a pairwise scan of the few distinct
+  keys), and the `"module:function/arity"` display strings are built once, by `to_map`, at report time.
+  A `format!` per dispatch measured at **~19 %** of the interpreter `list_walk` per-element samples and
+  **~7.5 %** of `emqx_base62:encode`'s — harness bookkeeping inflating the very figure the harness
+  exists to report.
 - `mod.rs` → the **shared harness**: `compile_fixture(module, source, tag)` (fixture compiled at test
   time with the system `erlc`; every workload **skips loudly** when `erlc` is absent), the `Prepare`
   closure that builds a batch's argument, `run_calls` (the batch loop), `measure`, `Measurement`
   (`min`/`median`), `ns_per_call`, the env knobs, and the `bstr_to_lower` fixture + its report
-  (`foreign_bstr_to_lower_decomposition`, including `baseline_census`).
+  (`foreign_bstr_to_lower_decomposition`, including `baseline_census`). `baseline_census` /
+  `print_census` take an optional `&Unit`: `None` prints the per-call driver/block figures only (the
+  foreign cases), `Some` adds their **per-unit** twins (`driver_round_trips_per_element`,
+  `block_entry_lookups_per_element`, …) for a workload that is not call-shaped.
 - `long_append.rs` → the long-append fixture + `foreign_long_append_decomposition` + its report,
   including the growth-shape probe over `Machine::refc_binaries()`.
 - Env knobs: `BENCH_ITERS`, `BENCH_BATCH`, `BENCH_WARMUP`, `BENCH_TIER` (`interpreter`|`baseline`|`both`);
@@ -163,6 +172,30 @@ round-trips per call, and `<CarrierAllocator>::alloc_impl` (the single `bs_init_
 top remaining frame at **17.3 %**. The next lever on this shape is therefore `bs_init_writable`'s payload
 allocation — not dispatch, and not the append path.
 
+## Measured — the `call_bif` histogram keying (`BifHistogram`)
+The histogram key used to be a `format!("{module}:{function}/{arity}")` **per dispatch**. `perf` self
+time (interpreter tier, `taskset -c 3`, shared host) put that family at **14.2 %** of `list_walk`'s
+samples (`format_inner` 5.66 + `write_str` 4.93 + `core::fmt::write` 3.63) and **7.5 %** of `encode`'s
+(2.14 / 2.04 / 1.94 / 1.39 with `RawVecInner::finish_grow`), i.e. the harness was inflating the figure
+it exists to report. After (`BifHistogram`: memo + pairwise key compare, display strings only at report
+time) **no** `format`/`write_str`/`core::fmt::write`/`finish_grow` frame appears above perf's 0.5 %
+cut-off in either workload; the only string-comparison residue is `__memcmp_avx2_movbe` at
+**2.18 %** of the `list_walk` samples (0.92 % before — the key compare plus the engine's own name
+comparisons; memcmp is a small constant either way, versus ~10× that for `format!`).
+
+Paired A/B, two binaries (before/after the change, identical sources otherwise), alternating order,
+`BENCH_TIER=interpreter`, `/proc/loadavg` 39.9–43.6 across every run, `min_ns_per_call` /
+`ns_per_instruction`, interpreter tier:
+
+| workload | before (3 rounds) | after (3 rounds) | ratio |
+|---|---|---|---|
+| `list_walk` (K=20, 1000 iters) | 3 540 945 / **20.90** · 3 898 399 / 23.01 · 4 030 500 / 23.79 | 2 482 150 / **14.65** · 2 856 699 / 16.86 · 2 981 692 / 17.60 | **1.43×** |
+| `emqx_base62:encode` (50 000 iters) | 8 835 / **36.21** · 8 700 / 35.66 · 8 684 / 35.59 | 7 079 / **29.01** · 7 204 / 29.52 · 7 029 / 28.81 | **1.24×** |
+
+Every deterministic counter is **identical** on the two sides (`instr_per_call` 169 418 / 244, the
+`bif_histogram` rows, `rooted_*`, `heap_door_*`, `local_call_requests`, `refc_payloads`, correct result) —
+this was bookkeeping, not semantics.
+
 ## Constraints / Notes for Agents
 - **`MinimalContext` opts out of the reduction hook** (`wants_reduce() == false`), so `CountingContext`
   MUST override it to `true` or the instruction count silently stays 0.
@@ -199,16 +232,22 @@ allocation — not dispatch, and not the append path.
 ## Routing Table
 - `mod.rs` → the shared harness (`compile_fixture`/`compile_staged`, `Prepare`, `run_calls`, `measure`/`measure_result`,
   `Measurement` + its `ResultSnapshot`, `instr_per_call`, the generic `ReportSpec`/`report_generic`), the
-  `cowboy_bstr` fixture, its `#[ignore]`d entry point and `baseline_census` (the
-  per-thread `../jit/baseline/counters.rs` snapshot pass).
+  `cowboy_bstr` fixture, its `#[ignore]`d entry point and `baseline_census`/`print_census` (the
+  per-thread `../jit/baseline/counters.rs` snapshot pass, with an optional `&Unit` for per-unit rows).
 - `counting.rs` → `CountingContext` (the delegating counting `ExecutionContext`) plus the harness' own
   **closed BIF floor** (`host_bif`): `erlang:iolist_to_binary/1` and small-int `+ - * div rem abs`, with
   everything else left to the inner host's rejecting hook and a `floor_declines` counter the report asserts to 0.
+  `BifHistogram` is the allocation-free `call_bif` key (see the measured A/B above).
 - `long_append.rs` → the growing-accumulator fixture, its `#[ignore]`d entry point, its report and the
   growth-shape probe (`Machine::refc_binaries()` → `capacity`/`reserved_bytes`/`growth_counters`).
 - `list_walk.rs` → the BIF-free per-element dispatch floor (the `tools/bench` `list_walk` program,
   `LEN = 1000`), entry point `list_walk_decomposition`; reports the whole call normalised per element **and**
-  the paired, build-cancelled marginal (`walk(K)` − `walk(0)`) that lines up with the runtime's own figure.
+  the paired, build-cancelled marginal (`walk(K)` − `walk(0)`) that lines up with the runtime's own figure,
+  plus (baseline tier selected) the `baseline_census` block **with its per-element twins**
+  (`driver_round_trips_per_element` 1.0022, `block_entry_lookups_per_element` 1.0022,
+  `block_entry_misses_per_element` 0, `step_one`/`step_ext`/`driver_interp_steps` 0 at the element,
+  `census_ns_per_element` ~54–62 ns) — the one workload that is entirely engine-bound previously emitted
+  no census at all.
 - `foreign.rs` → the four real foreign cases staged from the read-only checkouts
   (`cowboy_bstr:to_lower/1`, `cowboy_bstr:capitalize_token/1`, `emqx_base62:encode/1`,
   `emqx_base62:decode/1`), entry points `foreign_cowboy_bstr_decomposition` and

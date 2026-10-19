@@ -320,7 +320,7 @@ fn decompose(program: &Program) {
             let prepare = move |ctx: &mut CountingContext,
                                 _machine: &mut Machine|
                   -> beam_common::Result<Eterm> { make_heap_binary(ctx.inner_mut(), input) };
-            baseline_census(&beam, function, iters, batch, &prepare);
+            baseline_census(&beam, function, iters, batch, &prepare, None);
         }
     }
 }

@@ -228,7 +228,7 @@ fn foreign_bstr_to_lower_decomposition() {
         assert_tiers_agree(first, second, &format!("{MODULE}:{ENTRY}/1"));
     }
     if tiers.contains(&Tier::BaselineJit) {
-        baseline_census(&beam, ENTRY, iters, batch, &bstr_input);
+        baseline_census(&beam, ENTRY, iters, batch, &bstr_input, None);
     }
 }
 
@@ -504,6 +504,7 @@ struct ReportSpec<'a> {
 }
 
 /// A workload's per-unit normalisation: `per_call` units are performed by one call.
+#[derive(Clone, Copy)]
 struct Unit {
     /// The unit's name, used in the `*_per_<label>` keys (`element`, …).
     label: &'static str,
@@ -603,13 +604,15 @@ fn report_generic(
              the build-cancelled figure."
         );
     }
-    let histogram = ranked(&counters.bif_histogram, TOP_BIFS);
-    let empty = histogram.is_empty();
+    // The dispatch path keys the histogram allocation-free (`counting::BifHistogram`); the
+    // `module:function/arity` display strings are built here, once, at report time.
+    let histogram = counters.bif_histogram.to_map();
+    let histogram = ranked(&histogram, TOP_BIFS);
+    if counters.bif_histogram.is_empty() {
+        println!("note = bif_histogram is empty: the workload dispatched no BIF at all");
+    }
     for (name, count) in histogram {
         println!("bif_histogram[{name}] = {count}");
-    }
-    if empty {
-        println!("note = bif_histogram is empty: the workload dispatched no BIF at all");
     }
 
     assert!(
@@ -652,12 +655,17 @@ fn report_generic(
 /// half the cache key, so this pass compiles the module again with recording on and the
 /// census is complete; and because the counters are reset immediately before it, every figure
 /// below belongs to this pass alone.
+///
+/// `unit` adds a per-unit normalisation (the `element` rows of
+/// [`list_walk::list_walk_decomposition`](list_walk)) beside the per-call ones; the foreign
+/// cases pass `None` because one call is their only natural unit.
 fn baseline_census(
     beam: &Path,
     entry_name: &str,
     iters: usize,
     batch: usize,
     prepare: Prepare<'_>,
+    unit: Option<&Unit>,
 ) {
     use crate::jit::baseline::counters;
 
@@ -679,29 +687,68 @@ fn baseline_census(
     )
     .expect("the baseline census pass");
     counters::set_enabled(false);
-    print_census(counters::snapshot(), iters.max(1), &phase);
+    print_census(counters::snapshot(), iters.max(1), &phase, unit);
 }
 
 /// Print the baseline census snapshot as one `key = value` block.
-fn print_census(snapshot: crate::jit::baseline::counters::Counters, iters: usize, phase: &Phase) {
+fn print_census(
+    snapshot: crate::jit::baseline::counters::Counters,
+    iters: usize,
+    phase: &Phase,
+    unit: Option<&Unit>,
+) {
     let calls = iters as f64;
     let per_call = |count: u64| count as f64 / calls;
+    let min_ns = ns_per_call(phase.elapsed, iters);
+    let block_entry_misses = snapshot
+        .block_entry_lookups
+        .saturating_sub(snapshot.block_entry_hits);
     println!("---");
     println!("tier = {}-census", Tier::BaselineJit.name());
     println!("iters = {iters}");
-    println!("census_min_ns_per_call = {:.1}", ns_per_call(phase.elapsed, iters));
+    println!("census_min_ns_per_call = {min_ns:.1}");
     println!("step_one_per_call = {:.2}", per_call(snapshot.step_one));
     println!("step_ext_per_call = {:.2}", per_call(snapshot.step_ext));
     println!("driver_round_trips_per_call = {:.2}", per_call(snapshot.driver_round_trips));
     println!("driver_interp_steps_per_call = {:.2}", per_call(snapshot.driver_interp_steps));
     println!("block_entry_lookups = {}", snapshot.block_entry_lookups);
     println!("block_entry_hits = {}", snapshot.block_entry_hits);
-    println!(
-        "block_entry_misses = {}",
-        snapshot
-            .block_entry_lookups
-            .saturating_sub(snapshot.block_entry_hits)
-    );
+    println!("block_entry_misses = {block_entry_misses}");
+    if let Some(unit) = unit {
+        // The same driver/block figures per unit of work, so a workload that is not
+        // call-shaped (a K-walk, 1000-element traversal) can be compared with the other
+        // workloads' per-element rows without re-deriving the division by hand.
+        let units = unit.per_call.max(1.0);
+        let label = unit.label;
+        println!("{label}s_per_call = {units:.0}");
+        println!("census_ns_per_{label} = {:.3}", min_ns / units);
+        println!("step_one_per_{label} = {:.4}", per_call(snapshot.step_one) / units);
+        println!("step_ext_per_{label} = {:.4}", per_call(snapshot.step_ext) / units);
+        println!(
+            "driver_round_trips_per_{label} = {:.4}",
+            per_call(snapshot.driver_round_trips) / units
+        );
+        println!(
+            "driver_interp_steps_per_{label} = {:.4}",
+            per_call(snapshot.driver_interp_steps) / units
+        );
+        println!(
+            "block_entry_lookups_per_{label} = {:.4}",
+            per_call(snapshot.block_entry_lookups) / units
+        );
+        println!(
+            "block_entry_hits_per_{label} = {:.4}",
+            per_call(snapshot.block_entry_hits) / units
+        );
+        println!(
+            "block_entry_misses_per_{label} = {:.6}",
+            per_call(block_entry_misses) / units
+        );
+        println!(
+            "note = those divide the WHOLE census pass by {units:.0} {label}s, so a per-call \
+             setup cost is included."
+        );
+    }
     for (variant, count) in ranked(&snapshot.deopts_by_variant, TOP_ROWS) {
         println!("deopt_count[{variant}] = {count}");
     }

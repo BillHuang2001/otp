@@ -74,6 +74,19 @@
 //! `'-'/2`. That is why the workload is *not* declared `bif_free`: the histogram is the
 //! evidence that the arithmetic `gc_bif` is the only BIF traffic, and it is served by the
 //! harness' own floor ([`super::counting`]'s module docs).
+//!
+//! # The baseline-tier census block (and why it is per element too)
+//!
+//! `list_walk` is the one workload that is entirely engine-bound, so the figures that say
+//! *where* a native-tier slice goes — driver round-trips per block entry,
+//! `jit_step_one`/`jit_step_ext`, block-entry lookups/hits/misses, the per-variant deopt
+//! census and the static emitted-instance census — are the ones a reader needs here. The run
+//! therefore ends with the same [`super::baseline_census`] pass the foreign workloads do
+//! (**freshly loaded** module: the per-thread block cache is keyed on the atom-table identity,
+//! so a second `load_file` is required or `instr_instances` comes back empty), and because one
+//! call is K walks of [`LEN`] elements rather than one element, it reports those counters
+//! **per element** as well (`driver_round_trips_per_element`,
+//! `block_entry_lookups_per_element`, …).
 
 use std::sync::Arc;
 
@@ -211,12 +224,13 @@ fn list_walk_decomposition() {
 
     let expect_walks =
         |measurement: &Measurement| measurement.snapshot == ResultSnapshot::Small(expected_walks);
+    let unit = Unit {
+        label: "element",
+        per_call: elements,
+    };
     let spec = ReportSpec {
         workload: &label,
-        unit: Some(Unit {
-            label: "element",
-            per_call: elements,
-        }),
+        unit: Some(unit),
         expect: &expect_walks,
         expected: expected_walks.to_string(),
         bif_free: false,
@@ -244,6 +258,21 @@ fn list_walk_decomposition() {
     if let [(_, first_walks, first_zero), (_, second_walks, second_zero)] = measured.as_slice() {
         super::assert_tiers_agree(first_walks, second_walks, &label);
         super::assert_tiers_agree(first_zero, second_zero, &format!("{label} walk(0)"));
+    }
+
+    // The baseline tier's own per-thread counters (round-trips per block entry, deopts,
+    // the static emitted-instance census) for the one workload that is entirely engine-bound.
+    // The reload inside `baseline_census` is what makes its static census non-empty: the
+    // per-thread block cache would otherwise answer from an artifact compiled with recording
+    // off (see its doc comment).
+    if tiers.contains(&Tier::BaselineJit) {
+        println!("note = the census block below is the baseline tier's per-thread counters for");
+        println!(
+            "note = walk({walks})/1 only ({iters} calls of {walks} walks of {LEN} elements); its \
+             per-element"
+        );
+        println!("note = rows divide by the same {elements:.0} elements per call as the blocks above.");
+        super::baseline_census(&beam, ENTRY, iters, batch, &prepare_walks, Some(&unit));
     }
 }
 
