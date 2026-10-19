@@ -121,8 +121,6 @@ mod inflate;
 mod lifecycle;
 mod pump;
 
-pub(crate) use pump::Outcome;
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -249,6 +247,9 @@ impl Stream {
         self.stash = None;
         self.eos_seen = false;
         self.need_dict_pending = false;
+        // Both status mirrors describe the codec that was just dropped, so they go with it.
+        self.started = false;
+        self.finished = false;
         self.state = State::Closed;
     }
 
@@ -434,9 +435,13 @@ pub(super) fn strategy_arg(term: Eterm) -> Result<Strategy> {
 
 /// The 19 `zlib.erl` NIF keys, in the module's `-nifs([...])` order.
 ///
-/// This table is the one definition of the surface: the (not yet written) `register`
-/// installs it and [`is_nif_key`] answers the runtime's local-call predicate from it, so
-/// the two can never disagree.
+/// This table is the one definition of the surface: [`register`] installs exactly these
+/// keys through the three submodules and [`is_nif_key`] answers the runtime's local-call
+/// predicate from it, so the two can never disagree.
+// Nothing in this crate calls them directly: the key table is read through
+// `crate::zlib::serves_local_call`, whose consumer is the host (see there), and by this
+// module's own tests.
+#[allow(dead_code)]
 pub(super) const NIF_KEYS: &[(&str, u32)] = &[
     ("close_nif", 1),
     ("open_nif", 0),
@@ -462,6 +467,7 @@ pub(super) const NIF_KEYS: &[(&str, u32)] = &[
 /// Whether `Function/Arity` is one of the 19 `zlib` stream keys.
 ///
 /// `crate::zlib::serves_local_call` short-circuits on the module name and delegates here.
+#[allow(dead_code)]
 pub(crate) fn is_nif_key(function: &str, arity: usize) -> bool {
     NIF_KEYS
         .iter()
@@ -477,6 +483,43 @@ pub(crate) fn register(reg: &mut crate::registry::BifRegistry) {
     lifecycle::register(reg);
     deflate::register(reg);
     inflate::register(reg);
+}
+
+/// Asserts that `result` is the `error`-class raise of the **bare atom** `name` —
+/// what [`raise_atom`] builds, without needing `PartialEq` on
+/// [`BeamError`](beam_common::BeamError) (which does not implement it).
+#[cfg(test)]
+pub(super) fn assert_raise_atom<Ok>(result: Result<Ok>, name: &'static str) {
+    match result {
+        Err(BeamError::Raise(raise)) => {
+            assert_eq!(
+                raise.class,
+                beam_common::ExceptionClass::Error,
+                "error:{name} must be the `error` class"
+            );
+            assert_eq!(
+                raise.reason,
+                ExitReason::atom(name),
+                "error:{name} must carry that bare atom"
+            );
+            assert!(
+                raise.stacktrace.is_empty(),
+                "error:{name} is raised without a stacktrace"
+            );
+        }
+        Err(other) => panic!("expected the raise error:{name}, got {other:?}"),
+        Ok(_) => panic!("expected the raise error:{name}, got a value"),
+    }
+}
+
+/// Asserts that `result` is [`BeamError::BadArg`] — the argument fault (never a raise).
+#[cfg(test)]
+pub(super) fn assert_badarg<Ok>(result: Result<Ok>) {
+    match result {
+        Err(BeamError::BadArg) => {}
+        Err(other) => panic!("expected badarg, got {other:?}"),
+        Ok(_) => panic!("expected badarg, got a value"),
+    }
 }
 
 #[cfg(test)]
@@ -521,9 +564,9 @@ mod tests {
         assert_eq!(flush_arg(make_small(3)).expect("full"), Flush::Full);
         assert_eq!(flush_arg(make_small(4)).expect("finish"), Flush::Finish);
         // `Z_PARTIAL_FLUSH` is deliberately absent from `arg_flush/1`.
-        assert_eq!(flush_arg(make_small(1)).err(), Some(BeamError::BadArg));
-        assert_eq!(flush_arg(make_small(5)).err(), Some(BeamError::BadArg));
-        assert_eq!(flush_arg(beam_term::NIL).err(), Some(BeamError::BadArg));
+        assert_badarg(flush_arg(make_small(1)));
+        assert_badarg(flush_arg(make_small(5)));
+        assert_badarg(flush_arg(beam_term::NIL));
     }
 
     /// The strategy table is `arg_strategy/1`'s plus zlib's `Z_FIXED`; every other
@@ -538,11 +581,8 @@ mod tests {
         );
         assert_eq!(strategy_arg(make_small(3)).expect("rle"), Strategy::Rle);
         assert_eq!(strategy_arg(make_small(4)).expect("fixed"), Strategy::Fixed);
-        assert_eq!(
-            strategy_arg(make_small(5)).err(),
-            Some(raise_atom("stream_error"))
-        );
-        assert_eq!(strategy_arg(beam_term::NIL).err(), Some(BeamError::BadArg));
+        assert_raise_atom(strategy_arg(make_small(5)), "stream_error");
+        assert_badarg(strategy_arg(beam_term::NIL));
     }
 
     /// A chunk size must be a positive integer: `zlib.erl` hardcodes 8 KiB/16 KiB, and a
@@ -550,9 +590,9 @@ mod tests {
     #[test]
     fn a_chunk_size_must_be_positive() {
         assert_eq!(chunk_arg(make_small(8192)).expect("8 KiB"), 8192);
-        assert_eq!(chunk_arg(make_small(0)).err(), Some(BeamError::BadArg));
-        assert_eq!(chunk_arg(make_small(-1)).err(), Some(BeamError::BadArg));
-        assert_eq!(chunk_arg(beam_term::NIL).err(), Some(BeamError::BadArg));
+        assert_badarg(chunk_arg(make_small(0)));
+        assert_badarg(chunk_arg(make_small(-1)));
+        assert_badarg(chunk_arg(beam_term::NIL));
     }
 
     /// `open_nif`'s defaults are the C's: `ST_NONE`, the caller as the controller, the
@@ -604,10 +644,17 @@ mod tests {
             );
         }
         assert!(STREAM_ID_BASE < 1 << 59, "fits the ref id's small-integer slot");
+        // The id counter is process-global, so a test running in parallel may mint between
+        // these two calls: `insert_stream` is pinned to hand out its own pre-increment
+        // value (distinct, from the stream space, monotonic), never a shared or repeated id.
         let first = insert_stream(Stream::new(ProcessId::new(1, 0)));
         let second = insert_stream(Stream::new(ProcessId::new(1, 0)));
-        assert_eq!(second, first + 1, "ids are consecutive");
-        assert!(lock_streams().contains_key(&first));
-        assert!(lock_streams().contains_key(&second));
+        assert!(second > first, "ids increase monotonically ({first} then {second})");
+        assert!(first >= STREAM_ID_BASE);
+        {
+            let streams = lock_streams();
+            assert!(streams.contains_key(&first));
+            assert!(streams.contains_key(&second));
+        }
     }
 }

@@ -230,7 +230,9 @@ mod tests {
     use beam_term::{make_small, AtomTable};
 
     use crate::access::{make_ref_thing, ref_thing_id};
-    use crate::zlib::stream::{insert_stream, lock_streams, Stream};
+    use crate::zlib::stream::{
+        assert_badarg, assert_raise_atom, insert_stream, lock_streams, Stream,
+    };
 
     fn heap() -> Heap {
         Heap::new(1 << 16).expect("test heap")
@@ -267,11 +269,12 @@ mod tests {
         initialised(&mut ctx, 47);
 
         let owner = ctx.self_pid();
-        let handle = make_ref_thing(&mut heap, insert_stream(Stream::new(owner))).expect("room");
-        assert_eq!(
-            inflate_init_nif(&mut ctx, &[handle, make_small(15), make_small(3)]).err(),
-            Some(BeamError::BadArg)
-        );
+        let id = insert_stream(Stream::new(owner));
+        let handle = make_ref_thing(ctx.heap(), id).expect("room");
+        assert_badarg(inflate_init_nif(
+            &mut ctx,
+            &[handle, make_small(15), make_small(3)],
+        ));
     }
 
     /// `inflateEnd` is `data_error` until `eos_seen`, then `ok`.
@@ -282,10 +285,7 @@ mod tests {
         let mut ctx = context(&mut heap, &atoms);
 
         let truncated = initialised(&mut ctx, 15);
-        assert_eq!(
-            inflate_end_nif(&mut ctx, &[truncated]).err(),
-            Some(raise_atom("data_error"))
-        );
+        assert_raise_atom(inflate_end_nif(&mut ctx, &[truncated]), "data_error");
 
         let complete = initialised(&mut ctx, 15);
         {
@@ -306,9 +306,9 @@ mod tests {
 
         let framed = initialised(&mut ctx, 15);
         let dictionary = bits::make_binary(ctx.heap(), b"abcdef").expect("room");
-        assert_eq!(
-            inflate_set_dictionary_nif(&mut ctx, &[framed, dictionary]).err(),
-            Some(raise_atom("stream_error"))
+        assert_raise_atom(
+            inflate_set_dictionary_nif(&mut ctx, &[framed, dictionary]),
+            "stream_error",
         );
 
         let raw = initialised(&mut ctx, -8);
@@ -341,18 +341,16 @@ mod tests {
         let handle = initialised(&mut ctx, 15);
 
         // A brand-new (uninitialised) stream.
-        let fresh = make_ref_thing(&mut heap, insert_stream(Stream::new(ctx.self_pid()))).expect("r");
-        assert_eq!(
-            inflate_end_nif(&mut ctx, &[fresh]).err(),
-            Some(raise_atom("not_initialized"))
-        );
+        let fresh_id = insert_stream(Stream::new(ctx.self_pid()));
+        let fresh = make_ref_thing(ctx.heap(), fresh_id).expect("r");
+        assert_raise_atom(inflate_end_nif(&mut ctx, &[fresh]), "not_initialized");
 
         // The same stream, addressed by a process that is not its controller.
         let mut other_heap = Heap::new(1 << 12).expect("test heap");
         let mut other = BifContext::new(&mut other_heap, &atoms, ProcessId::new(2, 0));
-        assert_eq!(
-            inflate_end_nif(&mut other, &[handle]).err(),
-            Some(raise_atom("not_on_controlling_process"))
+        assert_raise_atom(
+            inflate_end_nif(&mut other, &[handle]),
+            "not_on_controlling_process",
         );
     }
 
@@ -362,9 +360,6 @@ mod tests {
         let mut heap = heap();
         let atoms = atoms();
         let mut ctx = context(&mut heap, &atoms);
-        assert_eq!(
-            inflate_end_nif(&mut ctx, &[make_small(7)]).err(),
-            Some(BeamError::BadArg)
-        );
+        assert_badarg(inflate_end_nif(&mut ctx, &[make_small(7)]));
     }
 }

@@ -219,6 +219,8 @@ mod tests {
     use beam_alloc::Heap;
     use beam_term::{make_small, AtomTable};
 
+    use crate::zlib::stream::{assert_badarg, assert_raise_atom};
+
     fn heap() -> Heap {
         Heap::new(1 << 16).expect("test heap")
     }
@@ -265,21 +267,18 @@ mod tests {
         let atoms = atoms();
         let mut ctx = context(&mut heap, &atoms);
 
-        assert_eq!(close_nif(&mut ctx, &[make_small(1)]).err(), Some(BeamError::BadArg));
+        assert_badarg(close_nif(&mut ctx, &[make_small(1)]));
 
         let handle = open_nif(&mut ctx, &[]).expect("a handle");
         let mut other_heap = Heap::new(1 << 12).expect("test heap");
         let mut other = BifContext::new(&mut other_heap, &atoms, ProcessId::new(2, 0));
-        assert_eq!(
-            close_nif(&mut other, &[handle]).err(),
-            Some(raise_atom("not_on_controlling_process"))
+        assert_raise_atom(
+            close_nif(&mut other, &[handle]),
+            "not_on_controlling_process",
         );
 
         close_nif(&mut ctx, &[handle]).expect("the controller may close");
-        assert_eq!(
-            close_nif(&mut ctx, &[handle]).err(),
-            Some(raise_atom("not_initialized"))
-        );
+        assert_raise_atom(close_nif(&mut ctx, &[handle]), "not_initialized");
     }
 
     /// The stash round-trips a term through its ETF image, and a second `setStash`
@@ -295,17 +294,11 @@ mod tests {
             get_stash_nif(&mut ctx, &[handle]).expect("empty"),
             ctx.atom("empty").expect("seeded")
         );
-        assert_eq!(
-            clear_stash_nif(&mut ctx, &[handle]).err(),
-            Some(raise_atom("error"))
-        );
+        assert_raise_atom(clear_stash_nif(&mut ctx, &[handle]), "error");
 
         let term = ctx.atom("hello").expect("seeded");
         set_stash_nif(&mut ctx, &[handle, term]).expect("a first stash");
-        assert_eq!(
-            set_stash_nif(&mut ctx, &[handle, term]).err(),
-            Some(raise_atom("error"))
-        );
+        assert_raise_atom(set_stash_nif(&mut ctx, &[handle, term]), "error");
 
         let answer = get_stash_nif(&mut ctx, &[handle]).expect("a tuple");
         assert_eq!(beam_codec::term::tuple_arity(answer).expect("a tuple"), 2);
@@ -330,9 +323,9 @@ mod tests {
         let mut ctx = context(&mut heap, &atoms);
         let handle = open_nif(&mut ctx, &[]).expect("a handle");
 
-        assert_eq!(
-            enqueue_nif(&mut ctx, &[handle, beam_term::NIL]).err(),
-            Some(raise_atom("not_initialized"))
+        assert_raise_atom(
+            enqueue_nif(&mut ctx, &[handle, beam_term::NIL]),
+            "not_initialized",
         );
 
         let first = crate::bits::make_binary(ctx.heap(), b"ab").expect("room");
@@ -364,21 +357,18 @@ mod tests {
         let mut ctx = context(&mut heap, &atoms);
         let handle = open_nif(&mut ctx, &[]).expect("a handle");
 
-        assert_eq!(
-            set_controller_nif(&mut ctx, &[handle, make_small(1)]).err(),
-            Some(BeamError::BadArg)
-        );
+        assert_badarg(set_controller_nif(&mut ctx, &[handle, make_small(1)]));
 
-        let target = ProcessId::new(7, 0).to_eterm(ctx.heap()).expect("room");
+        let target = ProcessId::new(7, 0).to_eterm();
         set_controller_nif(&mut ctx, &[handle, target]).expect("a local pid");
 
         // The new controller passes; the old one no longer does.
         let mut other_heap = Heap::new(1 << 12).expect("test heap");
         let mut new_owner = BifContext::new(&mut other_heap, &atoms, ProcessId::new(7, 0));
         close_nif(&mut new_owner, &[handle]).expect("the new controller may close");
-        assert_eq!(
-            close_nif(&mut ctx, &[handle]).err(),
-            Some(raise_atom("not_on_controlling_process"))
+        assert_raise_atom(
+            close_nif(&mut ctx, &[handle]),
+            "not_on_controlling_process",
         );
     }
 }

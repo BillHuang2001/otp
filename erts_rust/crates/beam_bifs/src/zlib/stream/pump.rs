@@ -174,13 +174,19 @@ where
         consumed += step.consumed;
         out_pos += step.produced;
         status = step.status;
-        // Advance the front piece by what the codec consumed (`enif_ioq_deq`).
-        match queue.front_mut() {
-            Some(piece) if step.consumed >= piece.len() => {
-                queue.pop_front();
+        // Advance the front piece by what the codec consumed (`enif_ioq_deq`),
+        // dropping it once it is empty. A codec cannot consume more than the block
+        // it was handed, but `min` keeps the drain panic-free regardless.
+        let exhausted = match queue.front_mut() {
+            Some(piece) => {
+                let taken = step.consumed.min(piece.len());
+                piece.drain(..taken);
+                piece.is_empty()
             }
-            Some(piece) => piece.drain(..step.consumed),
-            None => break,
+            None => false,
+        };
+        if exhausted {
+            queue.pop_front();
         }
         if step.consumed == 0 && step.produced == 0 {
             // The C's `ASSERT` says a `Z_OK` step either drains its block or fills
@@ -263,6 +269,8 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::AtomTable;
 
+    use super::super::assert_raise_atom;
+
     fn heap() -> Heap {
         Heap::new(1 << 14).expect("test heap")
     }
@@ -318,14 +326,8 @@ mod tests {
             let term = zlib_return(&mut ctx, status).expect("a plain atom");
             assert_eq!(atom_name(&mut ctx, term), name);
         }
-        assert_eq!(
-            zlib_return(&mut ctx, Status::StreamError).err(),
-            Some(raise_atom("stream_error"))
-        );
-        assert_eq!(
-            zlib_return(&mut ctx, Status::DataError).err(),
-            Some(raise_atom("data_error"))
-        );
+        assert_raise_atom(zlib_return(&mut ctx, Status::StreamError), "stream_error");
+        assert_raise_atom(zlib_return(&mut ctx, Status::DataError), "data_error");
     }
 
     /// The `finished` arm: the queue drained and the output buffer was not filled.
@@ -533,25 +535,25 @@ mod tests {
             let mut eos = false;
             let mut progress = Progress::default();
 
-            let error = pump(
-                &mut ctx,
-                &mut queue,
-                8,
-                8,
-                Flush::None,
-                &mut eos,
-                &mut progress,
-                |input, _output, _flush| {
-                    Ok(Pump {
-                        status,
-                        consumed: input.len(),
-                        produced: 0,
-                    })
-                },
-            )
-            .err()
-            .expect("an exception");
-            assert_eq!(error, raise_atom(reason));
+            assert_raise_atom(
+                pump(
+                    &mut ctx,
+                    &mut queue,
+                    8,
+                    8,
+                    Flush::None,
+                    &mut eos,
+                    &mut progress,
+                    |input, _output, _flush| {
+                        Ok(Pump {
+                            status,
+                            consumed: input.len(),
+                            produced: 0,
+                        })
+                    },
+                ),
+                reason,
+            );
         }
     }
 
@@ -565,26 +567,25 @@ mod tests {
         let mut eos = false;
         let mut progress = Progress::default();
 
-        let error = pump(
-            &mut ctx,
-            &mut queue,
-            8,
-            8,
-            Flush::None,
-            &mut eos,
-            &mut progress,
-            |_input, _output, _flush| {
-                Ok(Pump {
-                    status: Status::Ok,
-                    consumed: 0,
-                    produced: 0,
-                })
-            },
-        )
-        .err()
-        .expect("an exception");
-
-        assert_eq!(error, raise_atom("data_error"));
+        assert_raise_atom(
+            pump(
+                &mut ctx,
+                &mut queue,
+                8,
+                8,
+                Flush::None,
+                &mut eos,
+                &mut progress,
+                |_input, _output, _flush| {
+                    Ok(Pump {
+                        status: Status::Ok,
+                        consumed: 0,
+                        produced: 0,
+                    })
+                },
+            ),
+            "data_error",
+        );
         assert!(!queue.is_empty(), "a no-progress step consumes nothing");
     }
 }

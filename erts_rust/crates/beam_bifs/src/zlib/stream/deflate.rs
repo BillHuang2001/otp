@@ -41,11 +41,10 @@
 //! answers `BadArg` at construction, which this module re-maps. `Strategy` goes
 //! through [`strategy_arg`], which already raises `stream_error` past `4`.
 
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 use beam_deflate::{Deflate, DeflateConfig, Flush, Method};
 use beam_term::Eterm;
 
-use crate::access;
 use crate::binary;
 use crate::context::BifContext;
 
@@ -247,8 +246,9 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::{make_small, AtomTable};
 
+    use crate::access;
     use crate::access::make_ref_thing;
-    use crate::zlib::stream::{insert_stream, lock_streams, Stream};
+    use crate::zlib::stream::{assert_badarg, assert_raise_atom, insert_stream, lock_streams, Stream};
 
     fn heap() -> Heap {
         Heap::new(1 << 16).expect("test heap")
@@ -267,6 +267,12 @@ mod tests {
     fn handle(ctx: &mut BifContext<'_>, stream: Stream) -> Eterm {
         let id = insert_stream(stream);
         make_ref_thing(ctx.heap(), id).expect("the test heap has room")
+    }
+
+    /// A fresh `ST_NONE` stream owned by the context's own process, as a handle term.
+    fn fresh_handle(ctx: &mut BifContext<'_>) -> Eterm {
+        let owner = ctx.self_pid();
+        handle(ctx, Stream::new(owner))
     }
 
     /// `deflateEnd` on a stream that never deflated is `ok`; once a `deflate` call
@@ -310,8 +316,11 @@ mod tests {
             ],
         )
         .expect("deflateInit");
-        // Enqueue three bytes, then deflate with `none`: the pump consumes them.
-        deflate_set_dictionary_nif(&mut ctx, &[dirty, make_small(0)]);
+        // A three-byte preset dictionary installs on the pristine stream and answers the
+        // Adler-32 of the bytes (`zlib_nif.c:658-663`).
+        let dictionary = crate::bits::make_binary(ctx.heap(), b"abc").expect("room");
+        deflate_set_dictionary_nif(&mut ctx, &[dirty, dictionary])
+            .expect("deflateSetDictionary of three bytes");
         {
             let id = access::ref_thing_id(dirty).expect("a handle");
             lock_streams()
@@ -326,8 +335,7 @@ mod tests {
             let id = access::ref_thing_id(dirty).expect("a handle");
             lock_streams().get_mut(&id).expect("the stream").started = true;
         }
-        let error = deflate_end_nif(&mut ctx, &[dirty]).err().expect("an exception");
-        assert_eq!(error, raise_atom("data_error"));
+        assert_raise_atom(deflate_end_nif(&mut ctx, &[dirty]), "data_error");
     }
 
     /// A re-`deflateInit` on a live deflate stream is `already_initialized`.
@@ -336,7 +344,7 @@ mod tests {
         let mut heap = heap();
         let atoms = atoms();
         let mut ctx = context(&mut heap, &atoms);
-        let handle = handle(&mut ctx, Stream::new(ctx.self_pid()));
+        let handle = fresh_handle(&mut ctx);
         let args = [
             handle,
             make_small(-1),
@@ -346,10 +354,7 @@ mod tests {
             make_small(0),
         ];
         deflate_init_nif(&mut ctx, &args).expect("deflateInit");
-        assert_eq!(
-            deflate_init_nif(&mut ctx, &args).err(),
-            Some(raise_atom("already_initialized"))
-        );
+        assert_raise_atom(deflate_init_nif(&mut ctx, &args), "already_initialized");
     }
 
     /// `windowBits = -8` is `deflateInit2`'s `Z_STREAM_ERROR`; `8` is accepted (the
@@ -360,8 +365,8 @@ mod tests {
         let atoms = atoms();
         let mut ctx = context(&mut heap, &atoms);
 
-        let bad = handle(&mut ctx, Stream::new(ctx.self_pid()));
-        assert_eq!(
+        let bad = fresh_handle(&mut ctx);
+        assert_raise_atom(
             deflate_init_nif(
                 &mut ctx,
                 &[
@@ -372,12 +377,11 @@ mod tests {
                     make_small(8),
                     make_small(0)
                 ]
-            )
-            .err(),
-            Some(raise_atom("stream_error"))
+            ),
+            "stream_error",
         );
 
-        let good = handle(&mut ctx, Stream::new(ctx.self_pid()));
+        let good = fresh_handle(&mut ctx);
         deflate_init_nif(
             &mut ctx,
             &[
@@ -399,8 +403,8 @@ mod tests {
         let mut heap = heap();
         let atoms = atoms();
         let mut ctx = context(&mut heap, &atoms);
-        let handle = handle(&mut ctx, Stream::new(ctx.self_pid()));
-        assert_eq!(
+        let handle = fresh_handle(&mut ctx);
+        assert_raise_atom(
             deflate_init_nif(
                 &mut ctx,
                 &[
@@ -411,9 +415,8 @@ mod tests {
                     make_small(8),
                     make_small(0)
                 ]
-            )
-            .err(),
-            Some(raise_atom("stream_error"))
+            ),
+            "stream_error",
         );
     }
 
@@ -423,25 +426,18 @@ mod tests {
         let mut heap = heap();
         let atoms = atoms();
         let mut ctx = context(&mut heap, &atoms);
-        let handle = handle(&mut ctx, Stream::new(ctx.self_pid()));
-        assert_eq!(
-            deflate_init_nif(
-                &mut ctx,
-                &[
-                    handle,
-                    beam_term::NIL,
-                    make_small(8),
-                    make_small(15),
-                    make_small(8),
-                    make_small(0)
-                ]
-            )
-            .err(),
-            Some(BeamError::BadArg)
-        );
-        assert_eq!(
-            deflate_end_nif(&mut ctx, &[make_small(42)]).err(),
-            Some(BeamError::BadArg)
-        );
+        let handle = fresh_handle(&mut ctx);
+        assert_badarg(deflate_init_nif(
+            &mut ctx,
+            &[
+                handle,
+                beam_term::NIL,
+                make_small(8),
+                make_small(15),
+                make_small(8),
+                make_small(0),
+            ],
+        ));
+        assert_badarg(deflate_end_nif(&mut ctx, &[make_small(42)]));
     }
 }

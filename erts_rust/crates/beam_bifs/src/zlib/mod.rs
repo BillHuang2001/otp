@@ -148,27 +148,32 @@
 //! drives [`beam_deflate`]'s streaming entry points directly; its design is
 //! `../../ZLIB_STREAM_BRIEF.md`.
 //!
-//! Only the six convenience functions above are registered today, so a stream call still
-//! reaches its `erlang:nif_error(undef)` stub and is `undef`.
+//! All 19 are registered here beside the six convenience functions ([`stream`] owns the
+//! bodies), so a `zlib` stream call is served rather than reaching its
+//! `erlang:nif_error(undef)` stub.
 
 mod one_shot;
 mod stream;
 
 use crate::registry::BifRegistry;
 
-/// Registers the six self-contained `zlib` functions.
-///
-/// Every key is a `zlib.erl` function, not a `bif.tab` NIF, so the six are stdlib fast
-/// paths — registered here the way `erlang:memory/0,1` is. The stream surface has no
-/// registered key: `zlib.erl` reaches it through its own non-exported NIF stubs.
 /// Whether `Module:Function/Arity` is one of the `zlib` BIF-surface keys this crate
 /// serves — the six convenience functions plus the 19 stream keys.
 ///
 /// The local-call predicate a host consults before entering compiled code.
+// Nothing in this crate calls it: the consumer is the host (`beam_rt`'s
+// `resolve_local_call`, through the crate root's re-export), which the crate root owns.
+#[allow(dead_code)]
 pub fn serves_local_call(module: &str, function: &str, arity: usize) -> bool {
     module == "zlib" && stream::is_nif_key(function, arity)
 }
 
+/// Registers the whole `zlib` surface this crate serves: the six self-contained
+/// convenience functions and the 19 stream keys.
+///
+/// The six are `zlib.erl` functions rather than `bif.tab` NIFs, so they are stdlib fast
+/// paths — registered here the way `erlang:memory/0,1` is; the 19 stream keys are the
+/// preloaded module's own NIF stubs ([`stream`]'s `NIF_KEYS`).
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("zlib", "compress", 1, one_shot::compress_1);
     reg.register("zlib", "uncompress", 1, one_shot::uncompress_1);
@@ -176,32 +181,81 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("zlib", "unzip", 1, one_shot::unzip_1);
     reg.register("zlib", "gzip", 1, one_shot::gzip_1);
     reg.register("zlib", "gunzip", 1, one_shot::gunzip_1);
+    stream::register(reg);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The six fast paths are exactly the registered keys — no stream-API key is
-    /// registered (that surface is `zlib.erl`'s own NIF stubs, not a registry entry).
+    /// The 19 stream keys, in `zlib.erl`'s `-nifs([...])` order.
+    const STREAM_KEYS: &[(&str, u32)] = &[
+        ("open_nif", 0),
+        ("close_nif", 1),
+        ("set_controller_nif", 2),
+        ("deflateInit_nif", 6),
+        ("deflateSetDictionary_nif", 2),
+        ("deflateReset_nif", 1),
+        ("deflateEnd_nif", 1),
+        ("deflateParams_nif", 3),
+        ("deflate_nif", 4),
+        ("inflateInit_nif", 3),
+        ("inflateSetDictionary_nif", 2),
+        ("inflateGetDictionary_nif", 1),
+        ("inflateReset_nif", 1),
+        ("inflateEnd_nif", 1),
+        ("inflate_nif", 4),
+        ("getStash_nif", 1),
+        ("clearStash_nif", 1),
+        ("setStash_nif", 2),
+        ("enqueue_nif", 2),
+    ];
+
+    /// Both halves of the surface are registered: the six one-shot fast paths **and** the
+    /// 19 stream keys `zlib.erl` declares in its `-nifs([...])` list — 25 keys in total.
     #[test]
-    fn register_installs_the_six_zlib_functions_with_the_right_arity() {
+    fn register_installs_the_six_one_shots_and_the_nineteen_stream_keys() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
 
-        assert!(reg.contains("zlib", "compress", 1));
-        assert!(reg.contains("zlib", "uncompress", 1));
-        assert!(reg.contains("zlib", "zip", 1));
-        assert!(reg.contains("zlib", "unzip", 1));
-        assert!(reg.contains("zlib", "gzip", 1));
-        assert!(reg.contains("zlib", "gunzip", 1));
-        assert!(!reg.contains("zlib", "compress", 2));
-        assert!(!reg.contains("zlib", "zip", 2));
-        assert!(!reg.contains("zlib", "unzip", 2));
-        assert!(!reg.contains("zlib", "gzip", 2));
-        assert!(!reg.contains("zlib", "gunzip", 2));
-        // The stream API has no registry key (its NIF stubs).
+        // The six convenience functions, at arity 1 only.
+        for function in ["compress", "uncompress", "zip", "unzip", "gzip", "gunzip"] {
+            assert!(reg.contains("zlib", function, 1), "zlib:{function}/1");
+            assert!(!reg.contains("zlib", function, 2), "zlib:{function}/2");
+        }
+
+        // Every stream key, at its own arity only.
+        assert_eq!(STREAM_KEYS.len(), 19);
+        for &(function, arity) in STREAM_KEYS {
+            assert!(
+                reg.contains("zlib", function, arity),
+                "zlib:{function}/{arity} is registered"
+            );
+            assert!(
+                !reg.contains("zlib", function, arity + 1),
+                "zlib:{function}/{} is not",
+                arity + 1
+            );
+        }
+
+        // The Erlang-level wrappers the NIF stubs sit under are not registry keys: they
+        // are `zlib.erl` code the runtime executes.
         assert!(!reg.contains("zlib", "open", 0));
-        assert_eq!(reg.len(), 6);
+        assert!(!reg.contains("zlib", "deflate", 3));
+        assert!(!reg.contains("zlib", "safeInflate", 2));
+        assert_eq!(reg.len(), 25);
+    }
+
+    /// `serves_local_call` short-circuits on the module and then answers from the same
+    /// key table the registry is built from — the two can never disagree.
+    #[test]
+    fn serves_local_call_answers_the_nineteen_stream_keys_for_zlib_only() {
+        for &(function, arity) in STREAM_KEYS {
+            assert!(serves_local_call("zlib", function, arity as usize));
+            assert!(!serves_local_call("zlib", function, arity as usize + 1));
+            assert!(!serves_local_call("lists", function, arity as usize));
+        }
+        // The one-shots are `zlib.erl` functions, not NIF-level calls.
+        assert!(!serves_local_call("zlib", "compress", 1));
     }
 }
