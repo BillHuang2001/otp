@@ -6,7 +6,7 @@ Four workload shapes, one methodology:
 1. `list_walk` — the `tools/bench` `list_walk` program (`bench_list_walk:walk/1`, `LEN = 1000`): a BIF-free body-recursive `sum/1`, i.e. the pure **dispatch floor**, with no allocation in the timed loop.
 2. `cowboy_bstr:to_lower/1` and `cowboy_bstr:capitalize_token/1` — binary comprehensions whose accumulator **fits** the compiler's `bs_init_writable` hint, so they measure the plain build + dispatch floor on real foreign code.
 3. `long_append:expand/1` — a binary accumulator that genuinely **outgrows** its hint, so it measures the writable payload's **growth** path (`BitWriter::ensure_room` → `Machine::grow_writable_payload` → `beam_alloc`'s `RefcBinary::ensure_capacity`).
-4. `emqx_base62:encode/1` — bitstring matching + creation over a caller-sized input (`decode/1` is a documented skip, see Constraints).
+4. `emqx_base62:encode/1` and `emqx_base62:decode/1` — bitstring matching + creation over a caller-sized input; `decode/1` is the one case that needs `erlang:bit_size/1` (a guard plus the accumulator's size), which the harness' own BIF floor serves.
 The foreign sources are **staged** from their read-only checkouts at test time (`compile_staged`, system `erlc +deterministic`); this repository stores no copy that could drift.
 It is absent from production builds: `../lib.rs` declares `#[cfg(test)] mod bench;`.
 
