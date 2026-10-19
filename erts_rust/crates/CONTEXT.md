@@ -240,7 +240,8 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc`, `fun` (local/export/imported fun interior) (frozen, Stage 0)
 - `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary); `tests/` (the allocator integration suite)
 - `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs; the **working host API** (`nif/enif.rs` — the `enif_*` function implementations over the `NifHost` seam), the **dynamic loader** (`nif/loader.rs` — `dlopen`/`dlsym` of a NIF shared object + `ErlNifEntry` validation + `NifLibrary::call`), and `nif/host.rs` (`NifHost`/`NifEnv`)
-- `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
+- `beam_deflate/` → zlib 1.3.2 in safe Rust (bytes only, `beam_common` its sole dependency): `deflate/` (window + hash chains, the five match functions, Huffman construction, the flush driver), `inflate/` (bit reader, `inftrees`/`inffast`, header/trailer state machine, dictionary protocol), `checksum.rs` (`crc32`/`adler32` + `combine`); the one shared encoder behind both `beam_codec`'s ETF `COMPRESSED` and `beam_bifs`'s `zlib` BIFs
+- `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`, the `COMPRESSED` wrapper over `beam_deflate`
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
 - `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` + `Mailbox` (receive/message) seams, the block/suspend outcome; companion docs `TEST_NOTES.md` (measurement discipline) and `HANDOFF_bs_init_writable.md`
