@@ -210,7 +210,14 @@ pub fn oracle_inflate(stream: &[u8]) -> Option<Vec<u8>> {
         concat!(
             "Z=zlib:open(),",
             "ok=zlib:inflateInit(Z),",
-            "O=iolist_to_binary(zlib:inflate(Z,binary:decode_hex(<<\"{}\">>))),",
+            // `zlib:inflate/2` can return before Z_STREAM_END when its internal output
+            // buffer fills, so keep passing `finish` until `inflate` reports `finished`.
+            "L=fun F(In, Acc) ->",
+            "    case zlib:inflate(Z, In, finish) of",
+            "        {{finished, Out}} -> iolist_to_binary(lists:reverse([Out|Acc]));",
+            "        Out -> F(<<>>, [Out|Acc])",
+            "    end end,",
+            "O=L(binary:decode_hex(<<\"{}\">>), []),",
             "ok=zlib:inflateEnd(Z),zlib:close(Z),",
             "io:format(\"~s\",[binary:encode_hex(O)]),",
             "halt()."
