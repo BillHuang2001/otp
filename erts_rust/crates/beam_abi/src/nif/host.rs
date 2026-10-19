@@ -115,6 +115,33 @@ pub trait NifHost {
         None
     }
 
+    /// The two-answer form of [`NifHost::binary_to_term`]: decode the **first** term in `bytes` and
+    /// report how many leading source bytes it occupied — the C `enif_binary_to_term`'s
+    /// `return bp - data` (`erts/emulator/beam/erl_nif.c:1543`).
+    ///
+    /// An External Term Format image is allowed to carry bytes **after** the encoded term (the
+    /// C decodes one term and returns; it never checks that the image was exhausted). The count is
+    /// therefore the first term's own size, which may be *smaller* than `bytes.len()`; trailing bytes
+    /// are tolerated and simply not counted. A truncated or otherwise undecodable payload is `None`
+    /// (the C's `return 0`), and a `None` must leave the caller's `*term` untouched — never a
+    /// half-decoded term.
+    ///
+    /// **The default forwards to [`NifHost::binary_to_term`] and reports `bytes.len()`, so every
+    /// existing implementor keeps its current behaviour with no source change.** Be honest about
+    /// what that means: it is exact only for a hook whose decoder consumes the whole image. A hook
+    /// whose decoder strict-checks the trailing bytes (as `beam_rt`'s `NifHostImpl` does through
+    /// `beam_codec::decode_term`) answers `None` for an image with trailing bytes, i.e. the C's `0`
+    /// where the C answers the first term's size — so reproducing the C needs the override below.
+    ///
+    /// **Owner: `beam_rt`'s `NifHostImpl`** — implement it with `beam_codec::decode_term_used`
+    /// (`erts_rust/crates/beam_codec/src/decode/mod.rs`), which returns `(Eterm, used)` and
+    /// deliberately does **not** call `Decoder::finish()`, i.e. exactly the C's trailing-byte
+    /// tolerance. It is a separate hook rather than a signature change so that this additive seam
+    /// cannot break any existing implementor.
+    fn binary_to_term_used(&mut self, bytes: &[u8]) -> Option<(Eterm, usize)> {
+        let term = self.binary_to_term(bytes)?;
+        Some((term, bytes.len()))
+    }
     /// `erlang:make_ref/0` (default: unsupported).
     ///
     /// **Owner: `beam_rt`'s `NifHostImpl`** — it must mint a fresh internal reference term. With no
