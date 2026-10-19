@@ -63,8 +63,9 @@
 //! builds its send/receive path on:
 //!
 //! * **A fragment is sized to the whole payload and never reallocates.** [`HeapFragment::new`]
-//!   takes the region's capacity, and [`send_fragmented`](crate::send_fragmented) sizes it to at
-//!   least `size_object(term)`, so **one** fragment holds a whole payload. The backing [`Heap`]
+//!   takes the region's capacity, and [`send_fragmented`](crate::send_fragmented) sizes it from the
+//!   receiver-heap refusal's own exact destination price (in words), so **one** fragment holds a
+//!   whole payload. The backing [`Heap`]
 //!   never reallocates, so a root pointer returned by [`HeapFragment::copy_root`] stays valid for
 //!   the fragment's lifetime, including after the fragment (and the [`Fragments`] chain holding it)
 //!   is moved: the pointer-stability invariant [`crate::Message::payload`] depends on. Splitting

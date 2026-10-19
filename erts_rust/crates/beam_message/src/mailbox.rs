@@ -41,12 +41,13 @@
 //!   heap" signal. [`send_fragmented`] encodes that rule: it tries [`send`] first and falls back to
 //!   a fragment **only** on that one error kind, propagating every other failure unchanged (the
 //!   receiver heap, and the destination table since the failed attempt wrote nothing, stay untouched).
-//! * **One fragment holds the whole payload.** [`send_fragmented`] sizes its fragment to at least
-//!   `size_object(term)` (honouring a larger `fragment_capacity_words` hint) and never splits a
-//!   payload across a chain; a size-bounded split is not done here, so a caller that wants one builds
-//!   the [`Fragments`] chain itself. The fragment's backing heap never reallocates, so the enqueued
-//!   [`Message`]'s [`payload`](Message::payload) pointer, which points *into* the fragment, stays
-//!   valid for the message's lifetime.
+//! * **One fragment holds the whole payload.** [`send_fragmented`] sizes its fragment from the
+//!   refusal's own **exact destination price** in words (honouring a larger
+//!   `fragment_capacity_words` hint) and never splits a payload across a chain; a size-bounded split
+//!   is not done here, so a caller that wants one builds the [`Fragments`] chain itself. The
+//!   fragment's backing heap never reallocates, so the enqueued [`Message`]'s
+//!   [`payload`](Message::payload) pointer, which points *into* the fragment, stays valid for the
+//!   message's lifetime.
 //! * **The fragment owns the payload's off-heap objects** until the receiver's
 //!   [`Fragments::move_into`] hands them to the receiver's table; the enqueued message's own
 //!   `off_heap`/`binaries`/`nodes` lists are empty on the fragment path.
@@ -95,13 +96,21 @@ pub fn send(
 ///
 /// It first tries the ordinary receiver-heap copy; **only** a
 /// [`BeamError::Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) triggers the fragment
-/// path (any other failure is propagated unchanged, and `to_heap` is left untouched). The fragment
-/// is **one** fragment sized to hold the whole payload (at least `fragment_capacity_words` words, at
-/// least `size_object(term)`), and a size-bounded split across a chain is not done here: that is the
-/// caller's concern. `term` is copied into the fragment's heap with a fresh [`CopyContext`]
-/// whose source is `ctx`'s off-heap table and whose destination is the **fragment's** off-heap
-/// table, so the fragment owns the payload's off-heap objects. The enqueued [`Message`]'s
-/// [`payload`](Message::payload) points into the fragment and it owns the [`Fragments`].
+/// path (any other failure is propagated unchanged, and `to_heap` is left untouched). That single
+/// refusal already carries the copier's **exact destination price** in words —
+/// [`AllocFailure::requested`](beam_common::AllocFailure::requested) divided by
+/// `size_of::<Eterm>()` — so the fragment is sized from it directly: one abandoned trial, one
+/// exact pricing walk, then **one** copy into the fragment. That is the C's shape
+/// (`size_object_litopt` then `copy_struct_litopt`, `erl_message.c:771,797,839,860`); nothing is
+/// re-copied and no second sizing walk is run. `fragment_capacity_words` is only a **floor** a
+/// caller may raise the reservation with, never a substitute for the price.
+///
+/// The fragment is **one** fragment holding the whole payload, and a size-bounded split across a
+/// chain is not done here: that is the caller's concern. `term` is copied into the fragment's heap
+/// with a fresh [`CopyContext`] whose source is `ctx`'s off-heap table and whose destination is the
+/// **fragment's** off-heap table, so the fragment owns the payload's off-heap objects. The enqueued
+/// [`Message`]'s [`payload`](Message::payload) points into the fragment and it owns the
+/// [`Fragments`].
 ///
 /// `ctx`'s own destination off-heap table is **not** used on the fragment path (its objects would
 /// belong to the fragment, not the receiver's heap), mirroring how the C fragment carries its own
@@ -120,29 +129,68 @@ pub fn send_fragmented(
             Ok(())
         }
         Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
-            enqueue_fragmented(from, term, to_queue, ctx.src_off_heap(), fragment_capacity_words)
+            // The refusal's own figure *is* the copier's destination price — the same number the
+            // fragment has to hold — so no re-sizing walk is needed.
+            let reserved = refused_words(failure.requested)
+                .unwrap_or_else(|| beam_term::size_object(term));
+            enqueue_fragmented(
+                from,
+                term,
+                to_queue,
+                ctx.src_off_heap(),
+                fragment_capacity_words,
+                reserved,
+            )
         }
         Err(other) => Err(other),
     }
 }
 
-/// Copies `term` into a fresh [`HeapFragment`] (sized to hold the whole payload) and enqueues a
-/// message that points into it and owns it.
+/// The word count a message-heap refusal reports, when its byte figure is a whole (nonzero) number
+/// of term words — `None` for any other figure, so the caller can fall back.
+fn refused_words(requested_bytes: usize) -> Option<usize> {
+    let word = core::mem::size_of::<Eterm>();
+    let words = requested_bytes / word;
+    (words > 0 && requested_bytes % word == 0).then_some(words)
+}
+
+/// Copies `term` into a fresh [`HeapFragment`] and enqueues a message that points into it and owns
+/// it.
+///
+/// `reserved_words` is the copier's own exact destination price (the refusal's figure), so the
+/// fragment's capacity is `fragment_capacity_words.max(reserved_words)` and **one** copy fills it.
+/// The reservation is re-checked against the copy's own refusal rather than trusted blindly: the
+/// `size_object` fallback in [`send_fragmented`] under-prices one shape (a refc binary whose
+/// payload no source off-heap handle owns, which the copier flattens), and a strictly larger figure
+/// re-reserves the fragment — monotonic, so the retry terminates. A refused fragment writes
+/// nothing, so re-reserving leaks only the abandoned region.
 fn enqueue_fragmented(
     from: Eterm,
     term: Eterm,
     to_queue: &mut Queue,
     src_off_heap: &crate::off_heap::OffHeapTable,
     fragment_capacity_words: usize,
+    reserved_words: usize,
 ) -> Result<()> {
-    // At least the whole payload, but honour a larger caller hint.
-    let capacity = fragment_capacity_words.max(beam_term::size_object(term));
-    let mut fragment = HeapFragment::new(capacity)?;
-    let root = fragment.copy_root(term, src_off_heap)?;
-    let mut fragments = Fragments::new();
-    fragments.push(fragment);
-    to_queue.enqueue(Message::new(root, from).with_fragments(fragments));
-    Ok(())
+    let mut capacity = fragment_capacity_words.max(reserved_words);
+    loop {
+        let mut fragment = HeapFragment::new(capacity)?;
+        match fragment.copy_root(term, src_off_heap) {
+            Ok(root) => {
+                let mut fragments = Fragments::new();
+                fragments.push(fragment);
+                to_queue.enqueue(Message::new(root, from).with_fragments(fragments));
+                return Ok(());
+            }
+            Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
+                match refused_words(failure.requested) {
+                    Some(words) if words > capacity => capacity = words,
+                    _ => return Err(BeamError::Alloc(failure)),
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
 }
 
 /// Drains the copy's destination off-heap table into a [`Message`] and enqueues it.
