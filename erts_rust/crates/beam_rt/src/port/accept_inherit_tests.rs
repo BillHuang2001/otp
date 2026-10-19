@@ -21,65 +21,78 @@
 //! `tcp_inet_copy` (`erts/emulator/drivers/common/inet_drv.c:11834`), driven with **real loopback
 //! TCP traffic**.
 //!
-//! # What the C does, and what this runtime has to do instead
+//! # What the C does, and how this runtime does it
 //!
 //! The C's socket drivers create the accepted port themselves: `tcp_inet_copy` copies the
 //! listening descriptor's option block field by field into the accepted one
 //! (`inet_drv.c:11810-11846`) and `async_ok_port` hands the Erlang side `{ok, Port2}`. A
 //! [`beam_io::Driver`] here cannot create a port, so the accepted descriptor rides
 //! [`InetAsyncResult::Accepted`] up to the runtime, which registers the port
-//! ([`PortRegistry::adopt_accepted`]) and then **replays** the listener's inherited block onto it
-//! ([`PortRegistry::inherit_inet_options`]) through the driver's own `setopts` surface.
+//! ([`PortRegistry::adopt_accepted`](crate::port::PortRegistry)).
 //!
-//! `beam_io`'s driver does have the C's copy in one call — `TcpInetDriver::from_accepted(fd,
-//! &listener)` (`erts_rust/crates/beam_io/src/drivers/inet/mod.rs:860`,
-//! `SocketOptions::inherited_from`) — but **no route to the listener's concrete driver exists**
-//! from here: `beam_io::Port` owns a `Box<dyn Driver>` and exposes only `driver_name()`
-//! (`beam_io/src/port.rs:108`, `:201`), the `Driver` trait has no `as_any`/downcast hook
-//! (`beam_io/src/driver.rs:507`) and `PortRegistry` only hands out `&Port`/`&mut Port`
-//! (`beam_io/src/registry.rs:201`, `:206`). So the replay is this node's, and it is kept
-//! **field-for-field** with that copy list — the audit is [`inet_opts`](super::ops::inet_opts)'s
-//! module docs, and the three elements a record cannot carry (`stype`/`family`, the
-//! `INET_FLG_BUFFER_SET` flag, `TCP_ADDF_LINGER_ZERO`) are named there with their evidence.
+//! The **copy itself is the driver's**:
+//! [`TcpInetDriver::from_accepted(fd, &listener)`](beam_io::TcpInetDriver::from_accepted) adopts
+//! the descriptor and takes the listener's option store across in one call
+//! (`SocketOptions::inherited_from`, `erts_rust/crates/beam_io/src/drivers/inet/mod.rs:924`). The
+//! listener's concrete driver is reached through the read-only downcast
+//! [`beam_io::PortRegistry::driver_as`] over [`beam_io::Driver::downcast_ref`]
+//! (`beam_io/src/driver.rs:544`, `:870`; `beam_io/src/registry.rs:224`), so this node keeps **no
+//! record list and replays none** — every assertion below reads the result back **through the
+//! accepted port's own driver**, which is where the inheritance really has to have happened.
+//!
+//! What the driver cannot carry across is this runtime's own mirror
+//! ([`inet_opts`](super::ops::inet_opts)): the C copies exactly two of its fields into the new
+//! descriptor — `inet.mode` (`inet_drv.c:11811`) and `inet.exitf` (`:11812`) — and omits
+//! `inet.active` from its copy list (`:11814`-`:11844`), which `inet_start` resets
+//! (`:10967`/`:10932`). So the adopted port inherits **mode + `exit_on_close`** through
+//! [`PortRegistry::seed_inet_latches`](crate::port::PortRegistry) and starts **passive**;
+//! `prim_inet:accept_opts/3` (`erts/preloaded/src/prim_inet.erl:502-517`) is what re-applies the
+//! listener's active mode from the Erlang side, and this runtime has no `prim_inet` in the loop.
 //!
 //! # What this suite asserts
 //!
-//! Every assertion is read back **through the driver** with a `getopts` control op on **both**
-//! ports — the state a `gen_tcp`/`inet` caller would see, never a Rust-side copy of what the replay
-//! claimed to do:
+//! Every driver assertion is read back with a `getopts` control op on **both** ports — the state a
+//! `gen_tcp`/`inet` caller would see, never a Rust-side copy of what an inheritance claimed to do:
 //!
-//! * **the whole copied block** ([`INHERITED_CODES`], 16 codes): the accepted port's reply is the
+//! * **the whole inherited block** ([`INHERITED_CODES`], 16 codes): the accepted port's reply is the
 //!   listener's, **byte for byte**, for every one of them;
 //! * four of them additionally pinned to the C's literals, so the encoding itself is witnessed;
-//! * `{active, 3}` — recorded but **never** replayed: the accepted socket stays at the driver's
-//!   passive default, so its counter cannot be doubled (the C does not copy it either, and
-//!   `prim_inet:accept_opts/3` re-applies it from the Erlang side,
-//!   `erts/preloaded/src/prim_inet.erl:502-517`);
-//! * `{recbuf, …}`'s **raise** of the copied `inet.bufsz` — the one copied field with two writers,
-//!   which is why code 7 is replayed beside code 20 (see
-//!   [`inet_opts`](super::ops::inet_opts)'s audit);
+//! * `{active, 3}` — **never** inherited: the accepted socket stays at the driver's passive default,
+//!   so its counter cannot be doubled (the C does not copy it either);
+//! * `{recbuf, …}`'s **raise** of the inherited `inet.bufsz` — the one inherited field with two
+//!   writers, so a case of its own ([`a_recbuf_raised_driver_buffer_is_inherited`]);
 //! * `gettype` — the accepted port's cached `stype`/`family` agree with the listener's, the two
 //!   fields the C copies without an option code;
-//! * one row proves the replayed block is live **on the wire** rather than only in the driver's
+//! * one row proves the inherited block is live **on the wire** rather than only in the driver's
 //!   option store: the named `send` verb on the accepted port emits the `{packet, 2}` length header
 //!   before the payload (`inet_drv.c:13745-13769`), so the peer reads `<<0,2,"hi">>`.
 //!
+//! # The mirror row — what the runtime's own latches do
+//!
+//! [`an_accepted_socket_inherits_the_whole_tcp_inet_copy_block`] also pins the split the change that
+//! introduced this suite's seam produced: the accepted port's mirror holds **nothing it was told to
+//! replay** (its `{active, …}` latch is unset, though the listener's is `INET_MULTI` with a live
+//! counter), only the two latches the C copies, while its driver state equals the listener's and its
+//! resolved data mode ([`PortRegistry::data_mode`](crate::port::PortRegistry)) is the listener's
+//! `{mode, list}` rather than its own `[binary]` open-time stream option. That last equality is the
+//! whole point: every inet delivery renderer resolves its stream through the mirror, so an accepted
+//! socket rendered `[binary]` while the driver writes lists would be a wrong term.
+//!
 //! # The negative rows
 //!
-//! * A `setopts` the driver **rejects** (`tcp_inet_copy` has no failure mode — a replay does) must
-//!   leave the mirror at its pre-call state, so a value the driver refused can never be replayed
-//!   onto a later accepted socket. Both rejections are covered: the driver's own `[0]einval` reply
-//!   (an unserved option code) and its typed `badarg` (a truncated `{active, N}` record).
-//! * A record the driver rejects **during the replay** is not ignored: the freshly adopted port is
-//!   closed (which releases the descriptor — nothing leaks) and the accept completes as
-//!   `{error, einval}` — the errno the driver itself answers for a bad option value. The record
-//!   that trips this is written straight into the listener's mirror, because no real listener can
-//!   hold one its own driver refused: it exercises the replay rule, which is otherwise unreachable.
+//! * A `setopts` the driver **rejects** must leave the mirror at its pre-call state, so a value the
+//!   driver refused can never be inherited by a later accepted socket. Both rejection shapes are
+//!   covered: the driver's own `[0]einval` reply (an unserved option code) and its typed `badarg`
+//!   (a truncated `{active, N}` record).
+//! * A descriptor the **constructor** refuses (it is not a socket) answers the constructor's **own**
+//!   `getsockopt(2)` errno and is released — and a listener that names no `tcp_inet` driver answers
+//!   `{error, closed}` and releases it too. Neither leaves a port behind, and neither leaks the
+//!   descriptor; both rows prove the release by re-closing the number and reading `EBADF`.
 //!
 //! # Where the mirror comes from
 //!
 //! [`PortRegistry::port_control`](super::PortRegistry) feeds it: every successful `setopts` control
-//! op is recorded by production (`src/port.rs:1457-1461`), so the suite's `setopts` calls need no
+//! op is recorded by production (`src/port.rs:1843`), so the suite's `setopts` calls need no
 //! stand-in and every case would fail loudly if that call site disappeared.
 //!
 //! # The oracle
@@ -93,15 +106,16 @@
 use std::cell::RefCell;
 use std::io::Read;
 use std::net::TcpStream;
+use std::os::fd::{IntoRawFd, RawFd};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use beam_bifs::PortHook;
 use beam_common::BeamError;
 use beam_io::{CompletionEvent, InetAsyncResult, InetReason};
-use beam_process::PortId;
+use beam_process::{PortId, ProcessId};
 
-use super::super::ops::inet_opts::{is_inherited_record, is_setopts_control, setopts_succeeded};
+use super::super::ops::inet_opts::{is_setopts_control, setopts_succeeded};
 use super::super::tests::{fixture, skip_oracle_check, Fixture};
 use super::super::{PortEvent, PortRegistry, StreamType};
 
@@ -151,7 +165,8 @@ const INET_LOPT_PACKET_SIZE: u8 = 32;
 /// `INET_LOPT_TCP_SEND_TIMEOUT_CLOSE` (35) — `desc->send_timeout_close`.
 const INET_LOPT_TCP_SEND_TIMEOUT_CLOSE: u8 = 35;
 /// `INET_LOPT_MSGQ_HIWTRMRK` (36) — a **copied** code whose set form the driver refuses below
-/// `ERL_DRV_BUSY_MSGQ_LIM_MIN` (`1`), which is what makes it the replay-failure record below.
+/// `ERL_DRV_BUSY_MSGQ_LIM_MIN` (`1`), which is what [`a_rejected_setopts_never_enters_the_option_mirror`]
+/// uses as an unserved-value record.
 const INET_LOPT_MSGQ_HIWTRMRK: u8 = 36;
 /// `INET_LOPT_MSGQ_LOWTRMRK` (37) — the other half of the busy-message-queue pair.
 const INET_LOPT_MSGQ_LOWTRMRK: u8 = 37;
@@ -160,7 +175,7 @@ const INET_LOPT_TCP_SHOW_ECONNRESET: u8 = 39;
 /// `INET_LOPT_TCP_READ_AHEAD` (49) — `tcp_add_flags & TCP_ADDF_NO_READ_AHEAD`, negated.
 const INET_LOPT_TCP_READ_AHEAD: u8 = 49;
 
-/// Every option code of the C's copied block that a `setopts` record can carry — the replay set,
+/// Every option code of the C's copied block that a `setopts` record can carry — the inherited set,
 /// read back through both ports' drivers by
 /// [`an_accepted_socket_inherits_the_whole_tcp_inet_copy_block`].
 ///
@@ -188,7 +203,7 @@ const INHERITED_CODES: [u8; 16] = [
 
 /// `INET_MULTI` (3) — the `{active, N}` form, whose record carries a trailing 16-bit counter.
 const INET_MULTI: i32 = 3;
-/// `INET_PASSIVE` (0) — the driver's default `active`, and what a **not** replayed counter leaves.
+/// `INET_PASSIVE` (0) — the driver's default `active`, and what a **not** inherited counter leaves.
 const INET_PASSIVE: i32 = 0;
 /// `{mode, list}` — `INET_MODE_LIST` (`inet_drv.c:786`).
 const INET_MODE_LIST: i32 = 0;
@@ -202,9 +217,9 @@ const PACKET_SIZE: i32 = 4096;
 const HEADER_SIZE: i32 = 8;
 /// `{buffer, 4096}` — above `INET_BUFFER_MIN`, so the driver stores it verbatim.
 const BUFFER_SIZE: i32 = 4096;
-/// `{recbuf, 65536}` — a kernel receive buffer whose **raise** of `inet.bufsz` the replay has to
-/// reproduce; in the whole-block case the following `{buffer, 4096}` overrides `bufsz` again, which
-/// is what pins the pair's order.
+/// `{recbuf, 65536}` — a kernel receive buffer whose **raise** of `inet.bufsz` the adopted driver's
+/// option store has to carry across; in the whole-block case the following `{buffer, 4096}` overrides
+/// `bufsz` again, which is what pins the pair's order.
 const RECBUF_SIZE: i32 = 65_536;
 /// `{high_watermark, 1000}` / `{low_watermark, 500}` — a pair written high-then-low, so the store's
 /// cross-clamp is exercised in the same order on both ports.
@@ -287,9 +302,19 @@ fn setopts(reg: &mut PortRegistry, id: PortId, arg: &[u8]) -> Vec<u8> {
     control(reg, id, &setopts_op(), arg)
 }
 
-/// How many `setopts` records the port's mirror holds.
+/// How many of the port's three inet latches are set — the witness every mirror row here reads.
+///
+/// The mirror keeps three latches (`{mode, …}`, `{active, …}`, `{exit_on_close, …}`) and no record
+/// list (`super::super::ops::inet_opts`), so this counts the ones a port has actually been told.
+/// A `setopts` naming none of them (`{packet, 2}`, `{recbuf, …}`, …) leaves the count where it was,
+/// which is exactly what [`a_recbuf_raised_driver_buffer_is_inherited`] turns into evidence: that
+/// case's `bufsz` can only have been inherited by the **driver's** option store.
 fn recorded(reg: &PortRegistry, id: PortId) -> usize {
-    reg.inet_options(id).map_or(0, |options| options.records().len())
+    reg.inet_options(id).map_or(0, |options| {
+        usize::from(options.mode().is_some())
+            + usize::from(options.active_mode().is_some())
+            + usize::from(options.exit_on_close().is_some())
+    })
 }
 
 /// The driver's reply to a `getopts` request for `code`, as raw bytes.
@@ -309,12 +334,13 @@ fn gettype(reg: &mut PortRegistry, id: PortId) -> Vec<u8> {
 }
 
 /// The `setopts` argument the listener of the whole-block case is configured with: **every** code
-/// [`INHERITED_CODES`] names, plus `{active, 3}` (the code that must never be replayed).
+/// [`INHERITED_CODES`] names, plus `{active, 3}` (the code that must never be inherited).
 ///
-/// The order is the C's arrival order, which the mirror preserves and the replay re-sends. It is
-/// deliberately not sorted: `{recbuf, 65536}` comes **before** `{buffer, 4096}` so the `bufsz`
-/// raise and its override are both exercised, and the watermark pair is written high-then-low so
-/// the store's cross-clamp runs on both ports in the same order.
+/// The order is the C's arrival order, which the driver's option store applies in sequence (and the
+/// accepted driver then inherits whole). It is deliberately not sorted: `{recbuf, 65536}` comes
+/// **before** `{buffer, 4096}` so the `bufsz` raise and its override are both exercised, and the
+/// watermark pair is written high-then-low so the store's cross-clamp runs on both ports in the same
+/// order.
 fn listener_options() -> Vec<u8> {
     [
         record(INET_OPT_RCVBUF, RECBUF_SIZE),
@@ -338,8 +364,12 @@ fn listener_options() -> Vec<u8> {
     .concat()
 }
 
-/// The number of records [`listener_options`] sends — the listener's mirror size, and one more than
-/// the accepted port's, because `{active, 3}` is recorded but never replayed.
+/// The number of **latches** [`listener_options`] sets on its listener — all three: `{mode, list}`
+/// (`inet.mode`), `{active, 3}` (`inet.active`) and `{exit_on_close, false}` (`inet.exitf`). The
+/// accepted port carries only two of them, because the C's copy list omits `inet.active`.
+const LISTENER_LATCHES: usize = 3;
+/// The number of five-byte records [`listener_options`] carries — one per [`INHERITED_CODES`] row
+/// plus the `{active, 3}` record (`17 × 5` bytes, with the two-byte counter after them).
 const LISTENER_RECORDS: usize = 17;
 
 // -----------------------------------------------------------------------------------------------
@@ -351,8 +381,8 @@ const LISTENER_RECORDS: usize = 17;
 enum Adoption {
     /// The descriptor became a live `tcp_inet` port (the C's `{ok, Port2}`).
     Port(PortId),
-    /// The replay was refused, so the port was closed and the operation answered `{error, Reason}`
-    /// (the C's `send_async_error`).
+    /// The adoption was refused, so nothing was registered and the operation answered
+    /// `{error, Reason}` (the C's `send_async_error`).
     Rejected(InetReason),
 }
 
@@ -540,10 +570,11 @@ fn skip_no_loopback(what: &str) {
 ///
 /// The listener is told all 16 inherited codes plus `{active,3}` the way `prim_inet` tells it; a
 /// real `std::net` client connects over loopback; the runtime adopts the descriptor the `accept`
-/// took and replays the block.
+/// took, and [`TcpInetDriver::from_accepted`](beam_io::TcpInetDriver::from_accepted) takes the
+/// listener's option store across.
 ///
 /// The comparison is the contract itself — the accepted port's `getopts` reply is the listener's,
-/// byte for byte, for every code — so a code the replay dropped, re-ordered or applied with
+/// byte for byte, for every code — so a field the inheritance lost, re-ordered or applied with
 /// different semantics fails here even before the four literal rows below say which encoding is
 /// meant. Every literal is the oracle's own answer for the same sequence (cross-checked by
 /// [`the_oracle_copies_the_same_option_set_into_an_accepted_socket`]).
@@ -554,10 +585,41 @@ fn an_accepted_socket_inherits_the_whole_tcp_inet_copy_block() {
     };
     listener.bind_and_listen();
     let arg = listener_options();
+    // The argument really drives every code of the copied block, once each: 17 five-byte records
+    // (`INHERITED_CODES` plus `{active,3}`) with the multi form's two-byte counter after them. A
+    // code that is missing here would make the byte-for-byte comparison below vacuous for it.
+    assert_eq!(
+        arg.len(),
+        LISTENER_RECORDS * 5 + 2,
+        "the whole block plus the `{{active,3}}` counter"
+    );
+    // Split the argument into its records: five bytes each, except the multi `{active, N}` form,
+    // which carries its two-byte counter after the value word (`inet_drv.c:6977-6979`) — the only
+    // variable-length record this case sends.
+    let mut codes: Vec<u8> = Vec::new();
+    let mut rest = &arg[..];
+    while rest.len() >= 5 {
+        let code = rest[0];
+        let value = i32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]);
+        let step = if code == INET_LOPT_ACTIVE && value == INET_MULTI {
+            5 + 2
+        } else {
+            5
+        };
+        codes.push(code);
+        rest = &rest[step..];
+    }
+    assert!(rest.is_empty(), "the argument is whole records: {} left", rest.len());
+    assert_eq!(
+        codes.len(),
+        LISTENER_RECORDS,
+        "one record per inherited code plus `{{active,3}}`: {codes:?}"
+    );
     for code in INHERITED_CODES {
-        assert!(
-            is_inherited_record(&record(code, 0)),
-            "code {code} is driven here, so the replay table must admit it"
+        assert_eq!(
+            codes.iter().filter(|sent| **sent == code).count(),
+            1,
+            "code {code} must be sent to the listener exactly once, or its comparison is vacuous"
         );
     }
     let reply = listener.configure(&arg);
@@ -568,7 +630,7 @@ fn an_accepted_socket_inherits_the_whole_tcp_inet_copy_block() {
     );
 
     // The listener's own state, before any accept: the driver really took every record, so a
-    // mismatch after the accept can only come from the replay.
+    // mismatch after the accept can only come from the inheritance.
     {
         let mut reg = listener.reg();
         assert_eq!(
@@ -612,40 +674,33 @@ fn an_accepted_socket_inherits_the_whole_tcp_inet_copy_block() {
             vec![1, INET_LOPT_ACTIVE, 0, 0, 0, INET_MULTI as u8, 0, 3],
             "the listener is in the multi (counter) form, with a live counter of 3"
         );
-        // The mirror the replay reads from holds one entry per record, in arrival order, fed by
-        // production alone.
+        // The mirror holds exactly the three latches a `setopts` can move — `inet.mode`
+        // (`inet_drv.c:899`), `inet.active` (`:6968-7016`) and `inet.exitf` (`:904`) — each the
+        // last accepted value, fed by production alone (`src/port.rs:1843`). The other 14 records of
+        // the block are the driver's option store, not the runtime's.
         let mirrored = reg
             .inet_options(listener.id)
             .expect("a configured listener has an option mirror");
-        let mirrored: Vec<Vec<u8>> = mirrored.records().to_vec();
         assert_eq!(
-            mirrored.len(),
-            LISTENER_RECORDS,
-            "the mirror holds every record the listener was told: {mirrored:?}"
+            recorded(&reg, listener.id),
+            LISTENER_LATCHES,
+            "all three latches are set, and nothing else is retained"
         );
         assert_eq!(
-            mirrored[0],
-            record(INET_OPT_RCVBUF, RECBUF_SIZE),
-            "the first record is the listener's `{{recbuf,65536}}`"
+            mirrored.mode(),
+            Some(StreamType::List),
+            "the `{{mode,list}}` record moved the listener's `inet.mode` latch"
         );
         assert_eq!(
-            *mirrored.last().expect("a non-empty mirror"),
-            record(INET_LOPT_MSGQ_LOWTRMRK, MSGQ_LOW),
-            "the last record is the listener's `{{low_msgq_watermark,10000}}`"
+            mirrored.active_mode(),
+            Some(INET_MULTI),
+            "the listener's `{{active,3}}` latch is the C's multi form"
         );
-        for record in &mirrored {
-            if record[0] == INET_LOPT_ACTIVE {
-                assert!(
-                    !is_inherited_record(record),
-                    "`{{active, N}}` is recorded but never replayed: the C does not copy `active`"
-                );
-            } else {
-                assert!(
-                    is_inherited_record(record),
-                    "every other record is part of the C's copied block: {record:?}"
-                );
-            }
-        }
+        assert_eq!(
+            mirrored.exit_on_close(),
+            Some(false),
+            "the `{{exit_on_close,false}}` record moved the listener's `inet.exitf` latch"
+        );
     }
 
     let Some(mut client) = listener.connect() else {
@@ -673,28 +728,42 @@ fn an_accepted_socket_inherits_the_whole_tcp_inet_copy_block() {
             StreamType::List,
             "the accepted port inherits the listener's *data* mode, not its `[binary]` stream option"
         );
-        // The replay re-records what it replays, so a *second*-generation accept from this port
-        // inherits the same block. `{active,3}` must be the one record that never appears.
-        let replayed: Vec<Vec<u8>> = reg
+        // Nothing was replayed onto the adopted port: its mirror holds the two latches the C copies
+        // and no record list at all. `{active, …}` is the one the C's copy list omits
+        // (`inet_drv.c:11814`-`:11844`, `inet_start` resets it at `:10967`/`:10932`), so the
+        // accepted port starts passive while its **driver** still answers the listener's block.
+        let inherited = reg
             .inet_options(accepted)
-            .map(|options| options.records().to_vec())
-            .unwrap_or_default();
+            .expect("an adopted port carries the two seeded latches");
         assert_eq!(
-            replayed.len(),
-            LISTENER_RECORDS - 1,
-            "the accepted port's mirror holds exactly the replayed (inherited) records: {replayed:?}"
+            recorded(&reg, accepted),
+            2,
+            "only `inet.mode` and `inet.exitf` are inherited — nothing was replayed"
         );
-        assert!(
-            replayed.iter().all(|record| is_inherited_record(record)),
-            "only the C's copied block may be re-recorded on the accepted port: {replayed:?}"
+        assert_eq!(
+            inherited.mode(),
+            Some(StreamType::List),
+            "`inet.mode` is copied (`inet_drv.c:11811`)"
         );
-        assert!(
-            !replayed.contains(&active_counter_record(3)),
-            "the `{{active,3}}` record must never be replayed: {replayed:?}"
+        assert_eq!(
+            inherited.exit_on_close(),
+            Some(false),
+            "`inet.exitf` is copied (`inet_drv.c:11812`)"
+        );
+        assert_eq!(
+            inherited.active_mode(),
+            None,
+            "`inet.active` is not copied, so the accepted port starts passive"
+        );
+        assert_eq!(
+            reg.data_mode(accepted, StreamType::Binary),
+            reg.data_mode(listener.id, StreamType::Binary),
+            "the adopted port renders payloads in the listener's data mode — the mirror equality \
+             every inet delivery renderer depends on"
         );
     }
 
-    // The replayed effect, read back through the accepted port's own driver: for every code the C
+    // The inherited effect, read back through the accepted port's own driver: for every code the C
     // copies, the answer is the listener's, byte for byte.
     {
         let mut reg = listener.reg();
@@ -716,7 +785,7 @@ fn an_accepted_socket_inherits_the_whole_tcp_inet_copy_block() {
         assert_eq!(
             getopts(&mut reg, accepted, INET_LOPT_ACTIVE),
             vec![1, INET_LOPT_ACTIVE, 0, 0, 0, INET_PASSIVE as u8],
-            "`{{active, N}}` is NOT replayed: the accepted socket stays passive, so the counter \
+            "`{{active, N}}` is NOT inherited: the accepted socket stays passive, so the counter \
              cannot be doubled (the Erlang side re-applies it, `prim_inet:accept_opts/3`)"
         );
         // The two copied fields with no option code: the driver's cached socket tags. `beam_io`
@@ -765,9 +834,10 @@ fn an_accepted_socket_inherits_the_whole_tcp_inet_copy_block() {
 /// `inet.bufsz = 65536` — the C's `{recbuf, …}` arm raises it while `INET_FLG_BUFFER_SET` is clear
 /// (`inet_drv.c:7350-7360`) — and `tcp_inet_copy` copies that value into the accepted socket.
 ///
-/// This is why the replay carries code **7** as well as code **20**: the mirror holds the
-/// listener's *arguments*, not the driver's derived state, so replaying `{buffer, …}` alone would
-/// leave the accepted socket at the 9216-byte default. Measured against the oracle by
+/// This is why the inheritance cannot be built out of a record list: the runtime's mirror holds
+/// three latches and no `{buffer, …}` at all, so only the driver's own option store (which
+/// [`TcpInetDriver::from_accepted`](beam_io::TcpInetDriver::from_accepted) takes across whole) can
+/// carry the derived 65536 — otherwise the accepted socket would report the 9216-byte default. Measured against the oracle by
 /// [`the_oracle_inherits_a_recbuf_raised_driver_buffer`].
 #[test]
 fn a_recbuf_raised_driver_buffer_is_inherited() {
@@ -785,13 +855,9 @@ fn a_recbuf_raised_driver_buffer_is_inherited() {
             "`{{recbuf,65536}}` raised the listener's own `inet.bufsz` to 65536"
         );
         assert!(
-            !reg.inet_options(listener.id)
-                .map(|options| options
-                    .records()
-                    .iter()
-                    .any(|record| record[0] == INET_LOPT_BUFFER))
-                .unwrap_or(false),
-            "…and no `{{buffer, N}}` record exists to replay it from"
+            reg.inet_options(listener.id).is_none(),
+            "…and the runtime's mirror holds nothing at all: `{{recbuf, N}}` is none of the three \
+             latched codes, so the 65536 can only come from the driver's own option store"
         );
     }
 
@@ -827,7 +893,7 @@ fn a_recbuf_raised_driver_buffer_is_inherited() {
 // -----------------------------------------------------------------------------------------------
 
 /// A `setopts` the driver **rejects** leaves the mirror exactly as it was, so a value the driver
-/// refused can never be replayed onto a later accepted socket.
+/// refused can never be inherited by a later accepted socket.
 ///
 /// Two rejections are covered, because the driver has two shapes for them:
 ///
@@ -930,8 +996,8 @@ fn a_setopts_control_call_populates_the_option_mirror_from_production_alone() {
         let reg = listener.reg();
         assert_eq!(
             recorded(&reg, listener.id),
-            LISTENER_RECORDS,
-            "the control call recorded every accepted record on its own — no caller stood in"
+            LISTENER_LATCHES,
+            "the control call moved every latched code on its own — no caller stood in"
         );
         assert_eq!(
             reg.data_mode(listener.id, StreamType::Binary),
@@ -963,74 +1029,159 @@ fn a_setopts_control_call_populates_the_option_mirror_from_production_alone() {
 }
 
 // -----------------------------------------------------------------------------------------------
-// Test 3 — a record the driver rejects *during* the replay fails the whole accept
+// Test 3 — the two refusals: the constructor's own errno, and a listener with no driver
 // -----------------------------------------------------------------------------------------------
 
-/// A replay record the driver rejects is not ignored: the freshly adopted port is **closed** (its
-/// descriptor released with it, so nothing leaks) and the accept operation completes as
-/// `{error, einval}` — the errno the driver itself answers for a bad option value.
+/// The owner operand every adopted port would be registered under — `prim_inet`'s own owner in
+/// production, and a fixed pid here because no process table is involved.
+const OWNER: ProcessId = ProcessId::new(7, 0);
+
+/// A raw descriptor that is **not** a socket — what [`TcpInetDriver::from_accepted`] refuses.
 ///
-/// The record is written straight into the listener's mirror with a claimed success, because no
-/// real listener can hold one its own driver refused — that is exactly the state the rule exists
-/// for, and it is unreachable through `setopts`.
+/// `/dev/null` is a character device, so the constructor's very first probe
+/// (`getsockopt(SO_ACCEPTCONN)`, `beam_io/src/drivers/inet/sys.rs:217`) fails with `ENOTSOCK`. The
+/// descriptor is handed over as a raw number (`into_raw_fd`), i.e. nobody closes it but the code
+/// under test — which is exactly what the rows below assert.
+///
+/// `None` when this host has no `/dev/null` ([`skip_no_loopback`] has printed the banner).
+fn non_socket_fd(label: &str) -> Option<RawFd> {
+    match std::fs::File::open("/dev/null") {
+        Ok(file) => Some(file.into_raw_fd()),
+        Err(error) => {
+            skip_no_loopback(&format!("{label}: /dev/null could not be opened: {error}"));
+            None
+        }
+    }
+}
+
+/// Asserts that `fd` has already been released — a second `close(2)` must answer `EBADF`.
+///
+/// This is how every refusal row proves it leaked nothing: the number is closed by the code under
+/// test, so re-closing it can only fail, and it fails with the kernel's own `EBADF`
+/// ([`beam_io::close_fd`] reports it rather than swallowing it).
+fn assert_released(fd: RawFd, what: &str) {
+    match beam_io::close_fd(fd) {
+        Err(BeamError::Io(error)) => assert_eq!(
+            error.raw_os_error(),
+            Some(libc::EBADF),
+            "{what}: the descriptor was already released, so the re-close is EBADF"
+        ),
+        Ok(()) => panic!("{what}: the descriptor was still open — the refusal leaked it"),
+        Err(other) => panic!("{what}: the re-close answered {other}, not EBADF"),
+    }
+}
+
+/// A descriptor the **constructor** refuses answers the constructor's own `getsockopt(2)` errno and
+/// is released — never a fabricated `ebadf`/`einval`, and never a leak.
+///
+/// `beam_io`'s `from_socket` evaluates `is_listening`/`has_peer` *before* the struct literal whose
+/// `Drop` closes the socket (`beam_io/src/drivers/inet/mod.rs:848`), so a refused adoption produces
+/// no driver at all and the descriptor is still the caller's — which is why
+/// `PortRegistry::adopt_accepted` must release it itself.
 #[test]
-fn a_replay_the_driver_rejects_closes_the_new_port_and_fails_the_accept() {
+fn a_descriptor_that_is_not_a_socket_is_refused_with_the_constructors_errno() {
     let Some(mut listener) = Listener::open() else {
         return;
     };
     listener.bind_and_listen();
-    let arg = listener_options();
-    assert_eq!(listener.configure(&arg), vec![1], "the driver accepts the block");
-    let poisoned = record(INET_LOPT_MSGQ_HIWTRMRK, 0);
-    assert!(
-        is_inherited_record(&poisoned),
-        "the poisoning record must be part of the copied block, or the replay would skip it"
-    );
-    assert!(
-        {
-            // The driver's own refusal of the record, proved on the listener first: below
-            // `ERL_DRV_BUSY_MSGQ_LIM_MIN` (1) the whole reply is `[0]einval`.
-            let mut reg = listener.reg();
-            let reply = control(&mut reg, listener.id, &setopts_op(), &poisoned);
-            reply == b"\x00einval".to_vec()
-        },
-        "the driver refuses `{{high_msgq_watermark,0}}`, which is what makes the replay fail"
-    );
-    {
+    let Some(fd) = non_socket_fd("refused adoption") else {
+        return;
+    };
+    let (adoption, ports_before) = {
         let mut reg = listener.reg();
-        assert!(
-            reg.note_inet_setopts(listener.id, &poisoned, true),
-            "the poisoning record is mirrored with a claimed success"
-        );
+        let before = reg.len();
+        let adoption = reg.adopt_accepted(listener.id, fd, OWNER, StreamType::Binary, None);
+        (adoption, before)
+    };
+    match adoption {
+        InetAsyncResult::Error(reason) => {
+            assert_eq!(
+                reason,
+                InetReason::from_errno(libc::ENOTSOCK),
+                "the constructor's own `getsockopt(2)` errno, preserved (`beam_io`'s \
+                 `from_socket` never rewrites it) — not a fabricated `ebadf`/`einval`"
+            );
+            assert_eq!(
+                reason.atom_name(),
+                "enotsock",
+                "the atom the C's `error_atom(err)` would spell for the same descriptor \
+                 (`inet_drv.c:2314-2317`)"
+            );
+        }
+        InetAsyncResult::Port(port) => {
+            panic!("a non-socket descriptor must not become a port, got {port:?}")
+        }
+        other => panic!("unexpected adoption result {other:?}"),
     }
-
-    let Some(_client) = listener.connect() else {
-        return;
-    };
-    let Some(adopted) = listener.accept_one() else {
-        return;
-    };
-    let Adoption::Rejected(reason) = adopted else {
-        panic!("a poisoned replay must not adopt a port, got {adopted:?}");
-    };
-    assert_eq!(
-        reason.atom_name(),
-        "einval",
-        "a rejected replay completes the accept as `{{error, einval}}`, the driver's own errno"
-    );
+    assert_released(fd, "a refused descriptor");
     {
         let reg = listener.reg();
         assert_eq!(
             reg.len(),
-            1,
-            "the half-configured port was closed, so only the listener is left (nothing leaked)"
+            ports_before,
+            "a refused adoption registers no port (nothing was left behind)"
         );
         assert!(
             reg.is_live(listener.id),
-            "the listening port itself survives a failed accept"
+            "the listening port itself survives a refused adoption"
         );
     }
+    listener.close_all(None);
+}
 
+/// A listener [`beam_io::PortRegistry::driver_as`] cannot resolve to a `TcpInetDriver` answers
+/// `{error, closed}` — the C's own teardown reason, never an invented errno — and releases the
+/// descriptor.
+///
+/// Unreachable from `beam_io`'s accept path ([`InetAsyncResult::Accepted`] is staged **only** by
+/// `TcpInetDriver`, `beam_io/src/drivers/inet/accept.rs:345-384`, and `UdpInetDriver` has no accept
+/// path), but a listener whose port was torn down between the driver's `accept(2)` and the runtime's
+/// drain would reach it — so it is a tested, descriptor-releasing answer, not an `unwrap`.
+#[test]
+fn a_listener_that_names_no_tcp_inet_driver_is_refused_and_releases_the_descriptor() {
+    let Some(mut listener) = Listener::open() else {
+        return;
+    };
+    listener.bind_and_listen();
+    let Some(fd) = non_socket_fd("unresolvable listener") else {
+        return;
+    };
+    // A port number this registry does not hold: the downcast has no port to reach.
+    let absent = PortId::new(999);
+    let (adoption, ports_before) = {
+        let mut reg = listener.reg();
+        assert!(
+            !reg.is_live(absent),
+            "the fixture must not hold a port at the number this row uses"
+        );
+        let before = reg.len();
+        let adoption = reg.adopt_accepted(absent, fd, OWNER, StreamType::Binary, None);
+        (adoption, before)
+    };
+    match adoption {
+        InetAsyncResult::Error(reason) => {
+            assert_eq!(
+                reason,
+                InetReason::Closed,
+                "no errno is fabricated: the refusal is the C's own `closed` teardown reason"
+            );
+            assert_eq!(reason.atom_name(), "closed", "the atom name a caller renders");
+        }
+        InetAsyncResult::Port(port) => {
+            panic!("an unresolvable listener must not adopt a port, got {port:?}")
+        }
+        other => panic!("unexpected adoption result {other:?}"),
+    }
+    assert_released(fd, "an unresolvable listener's descriptor");
+    {
+        let reg = listener.reg();
+        assert_eq!(
+            reg.len(),
+            ports_before,
+            "the live listening port is untouched and nothing was registered"
+        );
+        assert!(reg.is_live(listener.id), "the listener is still live");
+    }
     listener.close_all(None);
 }
 
@@ -1084,15 +1235,16 @@ fn the_oracle_copies_the_same_option_set_into_an_accepted_socket() {
          {exit_on_close,false},{buffer,4096},{high_watermark,1000},{low_watermark,500},\
          {send_timeout,7000},{send_timeout_close,true},{show_econnreset,true},{read_ahead,false},\
          {high_msgq_watermark,20000},{low_msgq_watermark,10000}]",
-        "the oracle's accepted socket carries exactly the block this runtime replays"
+        "the oracle's accepted socket carries exactly the block this runtime's adopted driver inherits"
     );
 }
 
 /// The oracle's `inet.bufsz` after `{recbuf, 65536}` and no `{buffer, …}`: `65536` on the listener,
 /// and `65536` again on the accepted socket because `tcp_inet_copy` copies the field.
 ///
-/// This is the row code **7** exists for: without replaying it, the accepted port would report the
-/// 9216-byte default and this measurement is what says so.
+/// This is the row that says the driver's option store — not a record list — is what carries
+/// `inet.bufsz`: a copy that only re-sent `{buffer, …}` records would leave the accepted port at the
+/// 9216-byte default, and this measurement is what says so.
 #[test]
 fn the_oracle_inherits_a_recbuf_raised_driver_buffer() {
     let expr = "begin \

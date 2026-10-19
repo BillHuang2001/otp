@@ -332,7 +332,7 @@ impl Session {
     /// Applies a `setopts` record list through the numeric request, returning the driver's reply.
     ///
     /// The mirror is fed by production code ([`crate::port::PortRegistry::port_control`] calls
-    /// `note_inet_setopts`); the explicit call below only runs when the hook recorded nothing, so
+    /// `note_inet_setopts`); the explicit call below only runs when the hook moved no latch, so
     /// this helper cannot double-record and stays correct either way.
     fn setopts(&mut self, arg: &[u8]) -> Vec<u8> {
         let port = self.port;
@@ -345,14 +345,25 @@ impl Session {
         reply
     }
 
-    /// How many `setopts` records the port's mirror holds.
+    /// How many of the port's three inet latches are set — the hook-detection witness
+    /// [`Session::setopts`] reads across the control call.
+    ///
+    /// The mirror keeps three latches (`{mode, …}`, `{active, …}`, `{exit_on_close, …}`) and no
+    /// record list (`src/port/inet_opts.rs`), so a `setopts` naming none of those three leaves the
+    /// witness unmoved and the stand-in makes its call again. That cannot move a latch — the
+    /// production hook has already recorded the same argument, and each latch is last-value-wins
+    /// over the very same bytes.
     fn recorded(&self) -> usize {
         let port = self.port;
         self.rt
             .ports
             .borrow()
             .inet_options(port)
-            .map_or(0, |options| options.records().len())
+            .map_or(0, |options| {
+                usize::from(options.mode().is_some())
+                    + usize::from(options.active_mode().is_some())
+                    + usize::from(options.exit_on_close().is_some())
+            })
     }
 
     /// One pump round, then one read of the peer-close channel — the two steps a consuming route
