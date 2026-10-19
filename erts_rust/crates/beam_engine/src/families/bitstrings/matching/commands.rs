@@ -173,7 +173,6 @@ fn fused_run(
             end = fresh_end;
             bytes = fresh_bytes;
             off = fresh_off;
-            stale = false;
         }
         let flags = decode_flags(module, flags_op)?;
         let Some(nbits) = size.checked_mul(unit) else {
