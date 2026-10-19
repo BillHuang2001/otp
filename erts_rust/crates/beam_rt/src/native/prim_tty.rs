@@ -316,7 +316,7 @@ impl RuntimeContext<'_> {
             // `enif_select` whose return value is **discarded**, then an
             // `enif_monitor_process`, answering the atom `ok` (`prim_tty_nif.c:1244-1264`). The
             // read interest is one-shot and its delivery (`{select, Handle, Ref, ready_input}`)
-            // is the port layer's [`crate::port::tty`].
+            // is the port layer's [`crate::port::select`], on the C's hardcoded fd `0`.
             ("tty_select", 2) => {
                 // The resource check first: a term that is not a live handle is `badarg`,
                 // exactly the C's `enif_get_resource` miss (and the C tests it **before** it
