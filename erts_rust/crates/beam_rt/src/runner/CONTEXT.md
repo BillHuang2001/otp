@@ -541,7 +541,7 @@ These are **measured** figures rather than ones a test asserts: the mechanism's 
 | system-ERTS oracle | 223.4 | ~22 000 B | ~21 000–32 000 B | 69.9–70.9 MB | — |
 
 **The leak removed is exactly 1 072 B per call** — a 1 024-byte payload plus its 48-byte off-heap header — and it is perfectly linear pre-fix (`1 072 000` → `10 720 000` over the 10× step), so a process doing 10 M encodes holds ~10 GB.
-Post-fix that same 10× step adds **42 880 B**, a one-off heap growth and not a per-call trend, and the RSS is **flat**: `VmHWM` 119.9 MB at N = 10 000 against 119.8 MB at N = 600 000 (a 60× step), where the pre-fix side goes 132.1 → 878.7 MB.
+Post-fix that same step — **9 000 extra calls** — adds **42 880 B**, a one-off heap growth and not a per-call trend, and the RSS is **flat**: `VmHWM` 119.9 MB at N = 10 000 against 119.8 MB at N = 600 000 (a 60× step), where the pre-fix side goes 132.1 → 878.7 MB.
 **Throughput:** `POST/PRE` = **0.885** and the independent 9-round pass' **0.958** agree in direction, but the size is load-dominated, so only a **4–12 %** speed-up is claimed; `POST/oracle` is **27.4×** against `PRE/oracle`'s **30.9×**.
 **This is a memory fix, not a throughput fix**: the leaked payloads were unreferenced and never traversed, so the pre-fix leak cost no measurable time and there is **no throughput cliff at 878 MB**.
 The per-fixture envelope — the N-step figures, the sawtooth ladder, the disabled-site A/B and the retained-payload half of [`../../tests/off_heap_reclaim.rs`](../../tests/off_heap_reclaim.rs) — lives in [`../../CONTEXT.md`](../../CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, which owns those figures.
