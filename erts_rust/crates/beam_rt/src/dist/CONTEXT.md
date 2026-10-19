@@ -27,6 +27,27 @@ This directory holds only the sink submodule and this doc; the node half is the 
   families into the local process table, report the genuinely unrouted families as the honest
   `DeliveryOutcome::Unsupported`.
 
+## How an accepted link is driven (read before debugging a stalled peer handshake)
+- One `DistConnection` per accepted socket owns one `ConnectionDriver::server(advertised, cookie, creation)`:
+  `advertised` is the **full** `node@host` (`NodeName::parse`), the cookie is `resolve_cookie`
+  (`-setcookie` → `$HOME/.erlang.cookie` → `b"nocookie"`), and `creation` is the `epmd` value (`1`,
+  `DEFAULT_CREATION`, before/without registration). `DistConnection::pump` reads **once**, `feed`s
+  whatever arrived (partial frames included), `step`s to quiescence and `write_all`s `take_output()`.
+- Accepted sockets are **blocking with a `DIST_READ_SLICE` (25 ms) read timeout**; only the *listener* is
+  non-blocking. Neither the listener nor a link is registered with `beam_io`'s poller — the only driver is
+  `scheduler_pass`'s `pump_dist`, so a route that runs no scheduler pass never accepts anything.
+- The listener is bound in `Runtime::new` but published to `epmd` (`ALIVE2_REQ`) **on the first pump**, so
+  a runtime that runs no scheduler pass is never resolvable.
+- `Runtime::is_quiescent` (`src/runtime/scheduler.rs`) has **no dist term**: `run_scheduled` reports
+  `blocked` (exit 3) on the first round with `ran == 0 && delivered == 0`, even with a pending inbound
+  connection or a link mid-handshake. A node therefore serves distribution only while some *other* wake
+  source (a timer deadline, a runnable process, a port) keeps the pump stepping — which is why both live
+  dist suites drive a keep-alive fixture's `receive … after 25`.
+- `DistConnection::pump` calls `self.driver.step()?`, which returns **before** the output flush, so a
+  driver that framed a refusal status (`not_allowed` on a mandatory-flag failure, an accept-decision
+  refusal) and then returned `Err` never gets those bytes written — the link is retired with them still in
+  the driver's buffer (contrary to `beam_dist`'s "the bytes survive even though `step` then returns `Err`").
+
 ## Constraints
 - Errors are return-based (`beam_common::Result`); a link-level failure **retires that one link** and is
   recorded, never raised — it must never fail a scheduler pass.
