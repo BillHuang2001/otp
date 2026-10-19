@@ -705,16 +705,17 @@ impl TcpInetDriver {
 // ---------------------------------------------------------------------------
 
 impl TcpInetDriver {
-    /// The `erlang:port_command/2` write path: strip one caller tag, write, then answer the
-    /// caller with the C's `{inet_reply, Port, Reply[, Tag]}`.
+    /// The `erlang:port_command/2` write path: strip one caller tag, frame the payload, write, then
+    /// answer the caller with the C's `{inet_reply, Port, Reply[, Tag]}`.
     ///
     /// The C's `tcp_inet_commandv` (`inet_drv.c:12656`-`:12705`) runs `init_caller` on the
-    /// command's bytes first (`:1820`-`:1890`), writes what is left and finishes the caller in
-    /// `inet_reply_finish` (`:2614`-`:2637`). This is that whole sequence.
+    /// command's bytes first (`:1820`-`:1890`), writes what is left in `tcp_sendv`
+    /// (`:13736`-`:13848`, which is also where the `{packet, 1|2|4}` header is prepended) and
+    /// finishes the caller in `inet_reply_finish` (`:2614`-`:2637`). This is that whole sequence.
     ///
-    /// Returns the number of bytes **consumed from the port's output queue** — the tag prefix
-    /// plus what the socket accepted — which is what [`crate::Port`]'s write-accounting contract
-    /// compares against the queue's shrinkage.
+    /// Returns the output queue's **net shrinkage**: the tag prefix plus what the socket accepted,
+    /// minus the framing header the write path put back on the queue — which is what
+    /// [`crate::Port`]'s write-accounting contract compares the queue against.
     ///
     /// # Errors
     ///
@@ -759,6 +760,7 @@ impl TcpInetDriver {
             let discarded = ctx.output().len();
             ctx.output().consume(discarded);
             self.caller_stripped = false;
+            self.out_framed = false;
             // The C's `!IS_CONNECTED` arm first consults the send ladder
             // (`tcp_inet_commandv`, `inet_drv.c:12681`-`:12692`): a latched `closed`/`econnreset`
             // one-shot is what the caller is answered with, and only an unarmed ladder is the
@@ -775,15 +777,63 @@ impl TcpInetDriver {
             }
             return Ok(stripped + discarded);
         }
-        let queued = ctx.output().len();
+        // The command's **payload** length — the C's `len = ev->size` read inside `tcp_sendv`
+        // (`inet_drv.c:13736`-`:13743`) **after** `init_caller_iov` has taken the caller tag off
+        // (`:1827`-`:1851`, which reduces `ev->size` by the tag). It is therefore the length the
+        // framing header announces, and it never includes the tag bytes.
+        let payload_len = ctx.output().len();
+        // `{packet, 1|2|4}` frames the payload on the **write** side too — `tcp_sendv` switches on
+        // `desc->inet.htype` and prepends the 1-/2-/4-byte big-endian payload length
+        // (`inet_drv.c:13744`-`:13769`; the non-vector `tcp_send` does the same at `:13861`-`:13885`).
+        // Only the **stream** driver frames: `packet_inet_command` (the datagram `port_command`
+        // path) has no `h_len` logic at all — `inet_output_count`'s `len+h_len` and the two
+        // `tcp_send*` functions are the C's only framing sites — so `udp_inet` writes its
+        // datagrams verbatim.
+        //
+        // The header goes in **front** of the payload, exactly as `ev->iov[0].iov_base = buf`
+        // (`:13766`) puts it in the emulator's spare leading iovec slot (`io.c:1639`: the slot
+        // arrives with `iov_len = 0`). This floor has no iovec and `ByteQueue` only appends, so
+        // the header is prepended by re-queueing the payload behind it; `front()` therefore stays
+        // one contiguous slice, and the header bytes are the first thing `write_pending` sends.
+        //
+        // It runs once per **command**, not once per write attempt (the C decides `h_len` inside
+        // the one `tcp_sendv` call it makes per command): a short write leaves header and payload
+        // queued together and the remainder must never be framed again, or the peer would read a
+        // header announcing the remainder's length in the middle of the stream.
+        if !self.out_framed {
+            let header = frame::write_header(&self.options, payload_len);
+            let h_len = header.as_ref().map_or(0, Vec::len);
+            if let Some(header) = header {
+                let payload = ctx.output().front().to_vec();
+                ctx.output().clear();
+                ctx.output().push(&header);
+                ctx.output().push(&payload);
+            }
+            // `inet_output_count(INETP(desc), len+h_len)` (`inet_drv.c:13763`, the `tcp_send`
+            // counterpart at `:13862`): the payload **plus** the framing header, counted once per
+            // command at issue time — so a partial write, or a write that then discovers the peer
+            // gone, still counted it, exactly as the C does before it sends. A refused command
+            // never reaches this line (`!IS_CONNECTED` above returns first, where the C returns
+            // before `tcp_sendv` too), so `send_oct` is unchanged by it.
+            self.stat.output(payload_len + h_len);
+            self.out_framed = true;
+        }
         let _written = self.write_pending(ctx)?;
         self.settle_command(ctx)?;
-        // Report what actually **left** the output queue, not just what the socket accepted: a
-        // write that discovered the peer's close drops the bytes that can never be delivered
-        // (`latch_peer_close` → `tcp_clear_output`, `inet_drv.c:12786`) and the C charges the
-        // whole command to `prt->bytes_out` there anyway (`:12690`). The port's write accounting
-        // compares the count against the queue, so the dropped remainder is part of it.
-        Ok(stripped + queued.saturating_sub(ctx.output().len()))
+        // Report the queue's **net** shrinkage — the length the port measured before this callback
+        // (`stripped + payload_len`) minus what is left now — which is exactly what
+        // [`crate::Port`]'s write accounting compares against. The strip took `stripped` bytes off
+        // the queue and the framing header put `h_len` back on, so the two are not separable: the
+        // header is written before the payload and the port only sees the total. A saturated
+        // subtraction is the same clamp the port applies, so a command that grew the queue (a
+        // zero-length tag under `{packet,4}` that stalled before its header went out) reports 0 on
+        // both sides.
+        //
+        // A write that discovered the peer's close drops the bytes that can never be delivered
+        // (`latch_peer_close` → `tcp_clear_output`, `inet_drv.c:12786`) and the C charges the whole
+        // command to `prt->bytes_out` there anyway (`:12690`), so the dropped remainder is part of
+        // the count too.
+        Ok((stripped + payload_len).saturating_sub(ctx.output().len()))
     }
 
     /// The C's `driver_failure_posix(port, EINVAL)` for a command `init_caller` rejects
@@ -797,6 +847,7 @@ impl TcpInetDriver {
     fn fail_malformed_command(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         self.caller_ref = None;
         self.caller_stripped = false;
+        self.out_framed = false;
         let discarded = ctx.output().len();
         ctx.output().consume(discarded);
         ctx.signal_failure(DriverFailure::posix(libc::EINVAL))?;
