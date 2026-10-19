@@ -141,7 +141,9 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   (blocking-aware); the **tier-selecting** entries `run_with_tier`/`run_export_outcome_with_tier`/
   `run_label_outcome_with_tier` (first entry) and `resume_outcome_with_tier` (**resume** — a slice that suspended on a
   native tier resumes on it: `Interpreter` → `resume_outcome`, `BaselineJit` → the cached no-reset baseline resume,
-  `Cranelift` → a typed error); `RunOutcome` (`Returned` / `Wait`), re-exported at the crate root.
+  `Cranelift` → a typed error); `RunOutcome` (`Returned` / `Wait` / `Suspend`), re-exported at the crate root;
+  `fold_outcome` is the non-blocking entries' single fold — `Wait` → `error::blocked()`, `Suspend` →
+  `error::suspended()`.
 - `drive.rs` — **`Machine::drive`**: owns the `(func, pc)` position *and* the module context those indices belong
   to, folds every `Step` back into that position, and charges **exactly one reduction per interpreted instruction
   before the instruction's effect** through the defaulted `ExecutionContext::reduce` (the pre-emption point a
@@ -153,7 +155,10 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   (`bif_in_machine_on`, the cached `ExecutionContext::wants_bif_in_machine` answer) so every BIF dispatch in the run
   goes through the single `Machine::dispatch_bif_call` funnel, and threads the run's **entry module** (context `0`)
   down to it via `step_instruction_with_entry` — the same latch the native baseline tier's driver performs. It then re-binds the
-  literal area exactly on a `Step::Enter` into a different context. It also runs the raise funnel's second half
+  literal area exactly on a `Step::Enter` into a different context. It is also where the two parks are folded:
+  `Step::Wait` → `RunOutcome::Wait` (the `receive` resume label) and `Step::Suspend` → `RunOutcome::Suspend`
+  (the **un-applied** BIF instruction itself, re-executed on resume, the machine left as the pre-execution
+  state). It also runs the raise funnel's second half
   (`Machine::with_uncaught_frames`) over a raise that surfaced inside a cross-module callee — the driver is where
   the run's true entry module is known, so those caller frames are named against the right module.
 - `tests.rs` — the cross-cutting end-to-end tests of the raise funnel: one synthetic module per raise kind
