@@ -145,7 +145,7 @@ Whole-call `instr_per_element` is **8.471**, so the build is 5.3 % of the call.
 The baseline tier pays **2 driver round-trips per 20 000-element call** (not per element): the walk's `call_only` is linked in-block, so the loop runs without returning to the driver, and the interpreter's extra BIF call per element is the small-int `+` the baseline tier inlines.
 
 ### `long_append` — the growth path amortises
-Deterministic counters per call (dev profile, both rounds identical): `instr_per_call` **98 318** (6 per appended element), `rooted_calls/words` **16 386 / 81 933** (the 5-word `bs_start_match3` match context per iteration, **not** the accumulator), `local_call_requests` 16 385, heap-door calls 0 (the fixture has no `test_heap`/`allocate_heap`), BIF calls 0 (asserted), `accumulator_payloads_per_call` **1** (one writable payload per call, however many appends).
+Deterministic counters per call (release profile; identical on both rounds and on the dev profile): `instr_per_call` **98 318** (6 per appended element), `rooted_calls/words` **16 386 / 81 933** (the 5-word `bs_start_match3` match context per iteration, **not** the accumulator), `local_call_requests` 16 385, heap-door calls 0 (the fixture has no `test_heap`/`allocate_heap`), BIF calls 0 (asserted), `accumulator_payloads_per_call` **1** (one writable payload per call, however many appends).
 
 The accumulator payload after one call (`Machine::refc_binaries()`, printed by the growth-shape probe):
 
