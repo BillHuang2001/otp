@@ -1359,7 +1359,8 @@ fn report_table(reports: &[Report]) {
         // entry label; the no-op baseline carries the entry label plus its single
         // *shared* body label. The map itself is built once per machine
         // (`Machine::label_map`, warm-up), so the residual below prices the entry
-        // lookup over a wide table, not a build.        assert_eq!(
+        // lookup over a wide table, not a build.
+        assert_eq!(
             noop.instructions_per_run, many.instructions_per_run,
             "the label-map probe must have the baseline's instruction count"
         );
@@ -1371,11 +1372,11 @@ fn report_table(reports: &[Report]) {
         println!(
             "engine_bench | label-map build: {many_labels} labels vs the baseline's {noop_labels} \
              (+{extra_labels:.0}, the same {instr} instructions/run and {iters} iterations) costs \
-             {extra_ns_per_run:+.1} ns/run = {per_label_per_run:.3} ns per extra label per run = \
-             {per_call:.3} ns per `build_label_map` call (two calls per run)",
+             {extra_ns_per_run:+.1} ns/run = {per_label_per_run:.3} ns per extra label per run \
+             (a label map is built once per machine and module, so this prices the entry lookup \
+             over a wide table)",
             instr = many.instructions_per_run,
             iters = many.iterations,
-            per_call = per_label_per_run / 2.0,
         );
     }
     println!();
