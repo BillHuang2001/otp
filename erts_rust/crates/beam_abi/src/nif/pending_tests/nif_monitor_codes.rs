@@ -74,8 +74,9 @@ use beam_abi::nif::types::{
 use beam_abi::{nif_from_eterm, NifEnv, NifHost};
 use beam_term::atom::AtomTable;
 use beam_term::prelude::{
-    atom_val, boxed_val, is_atom, is_internal_ref, is_small, make_atom, make_boxed, make_header,
-    make_internal_pid, make_pid_data, signed_value, tuple_element, tuple_size, Eterm, REF_SUBTAG,
+    atom_val, boxed_val, header_arity, is_atom, is_internal_ref, is_small, make_atom,
+    make_internal_pid, make_pid_data, signed_value, tuple_element, tuple_size, write_internal_ref,
+    Eterm, INTERNAL_REF_PAYLOAD_WORDS, INTERNAL_REF_WORDS,
 };
 
 use common::{compile_so, skip};
@@ -103,8 +104,14 @@ const ORACLE: [&str; 5] = ["{0,0}", "{1,1}", "{-1,1}", "{-1,1}", "0"];
 /// `1` ("could not establish") because no host armed the monitor — the one recorded divergence.
 const WITHOUT_HOOK: [&str; 5] = ["{1,1}", "{1,1}", "{-1,1}", "{-1,1}", "1"];
 
-/// `ERTS_REF_THING_SIZE * sizeof(Eterm)` — the monitor bytes the C copies (`io.c:6994-7010`).
-const REF_THING_BYTES: usize = 24;
+/// The monitor payload the arm stores: the **whole** stored reference block — this tree's frozen
+/// 4-word M1 internal reference `[header, node, serial, id]`, i.e. `INTERNAL_REF_WORDS *
+/// size_of::<Eterm>()` = 32 bytes on LP64, which fills the `ErlNifMonitor` payload exactly.
+///
+/// The C's own block is `ERTS_REF_THING_SIZE * sizeof(Eterm)` = 24 bytes (`erl_term.h:990`), because
+/// in the C the three packed `num[]` ids hold the whole identity; this tree keeps the identity in
+/// word 3, so 24 bytes would leave only the (constant) `node`/`serial` words.
+const REF_THING_BYTES: usize = INTERNAL_REF_WORDS * core::mem::size_of::<usize>();
 
 /// The `ErlNifMonitor` payload length (`sizeof(void *) * 4`).
 const MONITOR_BYTES: usize = 32;
@@ -172,18 +179,16 @@ impl ArmingHost {
         }
     }
 
-    /// Mint the internal reference the C's `erts_make_ref_in_buffer` builds (`erl_nif.c:3978`): a
-    /// 3-word `[header, id, 0]` block tagged `REF_SUBTAG`.
+    /// Mint the internal reference the C's `erts_make_ref_in_buffer` stands for (`erl_nif.c:3978`):
+    /// this tree's frozen 4-word M1 block `[header, node, serial, id]`, built with the canonical
+    /// writer so it is byte-identical to what every producer in the tree mints.
     fn mint_ref(&mut self) -> Eterm {
-        // SAFETY: three fresh, exclusively owned words from the test heap.
-        let p = unsafe { self.inner.heap.alloc_words(3) }.expect("the test heap has room");
-        // SAFETY: `p` addresses those three words.
-        unsafe {
-            *p = make_header(2, REF_SUBTAG);
-            *p.add(1) = Eterm::from_raw(0x5eed_0001);
-            *p.add(2) = Eterm::from_raw(0);
-        }
-        make_boxed(p)
+        // SAFETY: `INTERNAL_REF_WORDS` fresh, exclusively owned words from the test heap.
+        let p = unsafe { self.inner.heap.alloc_words(INTERNAL_REF_WORDS) }
+            .expect("the test heap has room");
+        // SAFETY: `p` addresses those words; `write_internal_ref` writes exactly
+        // `INTERNAL_REF_WORDS` of them before the root escapes.
+        unsafe { write_internal_ref(p, 0x5eed_0001) }.expect("the id fits the M1 id slot")
     }
 }
 
@@ -286,8 +291,9 @@ unsafe extern "C" fn unused_down(
 ) {
 }
 
-/// The 24 reference bytes an `ErlNifMonitor` carries for the internal reference `term` — what
-/// `enif_monitor_process` must store on the `0` path.
+/// The whole stored reference block an `ErlNifMonitor` carries for the internal reference `term` —
+/// what `enif_monitor_process` must store on the `0` path: this tree's frozen 4-word M1 block, read
+/// word by word.
 #[track_caller]
 fn ref_block(term: Eterm) -> [u8; REF_THING_BYTES] {
     // SAFETY: `is_internal_ref` dereferences only the header word of a boxed term.
@@ -296,10 +302,18 @@ fn ref_block(term: Eterm) -> [u8; REF_THING_BYTES] {
         "the arm payload must be an internal reference"
     );
     let p = boxed_val(term);
+    // The subtag alone does not pin the width — this tree's block has header arity
+    // `INTERNAL_REF_PAYLOAD_WORDS` (4 words), the C's `ErtsORefThing` has arity 2 (3 words).
+    // SAFETY: `is_internal_ref` confirmed a boxed term, so its header word is live and aligned.
+    assert_eq!(
+        unsafe { header_arity(*p) },
+        INTERNAL_REF_PAYLOAD_WORDS,
+        "the arm payload must be the frozen 4-word M1 internal reference"
+    );
     let mut block = [0u8; REF_THING_BYTES];
-    for index in 0..(REF_THING_BYTES / core::mem::size_of::<usize>()) {
-        // SAFETY: `term` is a live internal reference, so `boxed_val` points at its
-        // `[header, w1, w2]` block, which is exactly `REF_THING_BYTES` bytes long.
+    for index in 0..INTERNAL_REF_WORDS {
+        // SAFETY: the header arity says the block has `INTERNAL_REF_PAYLOAD_WORDS` payload words,
+        // so `[header, node, serial, id]` is exactly `REF_THING_BYTES` bytes long.
         let word = unsafe { *p.add(index) }.raw();
         let at = index * core::mem::size_of::<usize>();
         block[at..at + core::mem::size_of::<usize>()].copy_from_slice(&word.to_ne_bytes());
@@ -367,9 +381,9 @@ fn an_arming_host_reproduces_the_oracles_zero() {
     assert_eq!(ours[3], "{-1,1}");
 }
 
-/// The stored payload is the hook's internal reference — all 24 bytes of it, with bytes 24..32
-/// zeroed — which is what makes `enif_make_monitor_term`/`enif_demonitor_process` able to rebuild it
-/// later.
+/// The stored payload is the hook's internal reference — the whole `REF_THING_BYTES`-byte frozen
+/// 4-word M1 block, which fills the `ErlNifMonitor` payload exactly (so there is no tail left over) —
+/// which is what makes `enif_make_monitor_term`/`enif_demonitor_process` able to rebuild it later.
 #[test]
 fn the_armed_holder_carries_the_reference_block() {
     // This sub-case drives the `enif_*` entry point directly (its own type, its own object), so it
@@ -426,12 +440,13 @@ fn the_armed_holder_carries_the_reference_block() {
     assert_eq!(
         holder.data[..REF_THING_BYTES],
         expected,
-        "the holder carries the hook's 3-word reference block"
+        "the holder carries the hook's frozen 4-word reference block"
     );
-    assert_eq!(
-        holder.data[REF_THING_BYTES..],
-        [0u8; MONITOR_BYTES - REF_THING_BYTES],
-        "and the bytes past the block are zeroed"
+    // `REF_THING_BYTES` == `MONITOR_BYTES` (32), so the block fills the payload: an **empty** tail is
+    // what "the bytes past the block are zeroed" degenerates to once the block is the whole holder.
+    assert!(
+        holder.data[REF_THING_BYTES..].is_empty(),
+        "the block fills the holder — no zeroed tail is left over"
     );
 
     // The object was never exported as a term, so its allocator reference is the only one.
