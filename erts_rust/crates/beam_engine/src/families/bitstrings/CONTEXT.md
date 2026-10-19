@@ -117,7 +117,15 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     only as the over-large-position fallback, and `position_of` accepts both forms.
   - `commands.rs` → the flattened `bs_match` command interpreter (`run_commands`:
     `ensure_at_least`/`ensure_exactly`/`skip`/`integer`/`binary`/`get_tail`/`'=:='`) and
-    the `commit` write-back discipline. `run_commands` captures the context term, its inner
+    the `commit` write-back discipline. The four cold command bodies (`skip`, `binary`,
+    `get_tail`, `'=:='`) are `#[inline(never)]` helpers `skip_cmd`/`binary_cmd`/
+    `get_tail_cmd`/`eq_cmd` reporting `CmdFlow { Done, Relocated, Fail }`; only the
+    `ensure_*`/`integer` arms, the capture and the `stale` re-read stay in `run_commands`
+    (a comprehension re-enters it once per byte with a **two-command** list, so the call was
+    paying for code it never runs). Classification is still `module.atom_name` (a `Vec`
+    index) plus a length-discriminated `&str` match — a precomputed atom-id table would cost
+    7 hash probes per invocation and does not pay.
+    `run_commands` captures the context term, its inner
     `orig` and the subject byte view **once** and re-derives them only after a command that
     can have allocated through the rooted seam: `integer` dirties only when its field did not
     fit a small integer, `binary`/`get_tail` always (they build a bitstring every time), and
