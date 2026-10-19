@@ -96,8 +96,8 @@ use beam_term::Eterm;
 
 use beam_abi::nif::enif::resources::{release_resource_terms, resource_terms};
 
-use super::super::Runtime;
-use crate::error::Result;
+use crate::runtime::Runtime;
+use beam_common::Result;
 
 /// Drops the reference held by every live NIF **resource term** that nothing reachable from `pid`'s
 /// complete root set names, returning how many terms were released.
@@ -118,7 +118,7 @@ use crate::error::Result;
 pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: ProcessId) -> Result<usize> {
     // Gate 1: the common case, and the reason this costs nothing for a program that never minted a
     // resource — one registry read, no walk.
-    let candidates: Vec<usize> = resource_terms().iter().map(Eterm::raw).collect();
+    let candidates: Vec<usize> = resource_terms().iter().map(|term| term.raw()).collect();
     if candidates.is_empty() {
         return Ok(0);
     }
@@ -163,7 +163,7 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
 
     // The reachability decision itself: the reachable subset of `candidates`, over both regions and
     // through cons cells (so a resource held in `[Res]` or in a message payload is found).
-    let reached = super::gc_walk::reachable_resource_words(
+    let reached = super::super::gc_walk::reachable_resource_words(
         runtime.walk_scratch(),
         process,
         roots.iter(),
