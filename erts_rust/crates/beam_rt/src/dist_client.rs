@@ -618,6 +618,25 @@ impl DistClient {
         }
     }
 
+    /// The **local link identity** of the established link to `peer_name` — the integer
+    /// `erlang:nodes/2` reports as `connection_id` (`dist.c`'s `dep->connection_id`).
+    ///
+    /// The identity lives in the one link table both halves share, so a peer that dialled
+    /// **into** this runtime has one exactly like a peer this runtime dialled: the name is
+    /// normalized through [`NodeName::parse`] exactly as [`DistClient::is_connected_any_half`]
+    /// does and the table assigns the id on its first request
+    /// ([`DistLinks::connection_id_for`]), which keeps it stable for that link's lifetime.
+    /// A cell that cannot be borrowed answers `None` — the caller then renders the atom
+    /// `undefined` rather than a fabricated integer, the same discipline
+    /// [`DistClient::is_connected_any_half`] keeps.
+    pub fn connection_id_for(&self, peer_name: &str) -> Option<u64> {
+        let full = NodeName::parse(peer_name).full().to_string();
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner.links.connection_id_for(&full),
+            Err(_) => None,
+        }
+    }
+
     /// Whether an outbound link to the node named by `node` (its atom term) completed
     /// its `'N'` handshake.
     pub fn is_connected_to_node(&self, node: Eterm) -> bool {

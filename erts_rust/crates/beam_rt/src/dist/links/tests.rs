@@ -77,6 +77,15 @@ fn establishing_accepted() -> (DistConnection, ConnectionDriver, TcpStream) {
 fn establishing_accepted_with_peer_flags(
     peer_flags: beam_dist::DistFlags,
 ) -> (DistConnection, ConnectionDriver, TcpStream) {
+    establishing_accepted_named(PEER_NAME, peer_flags)
+}
+
+/// [`establishing_accepted_with_peer_flags`] for an arbitrary connecting-side node name, so a
+/// fixture can hold **two** accepted links to two distinct peers.
+fn establishing_accepted_named(
+    peer_name: &str,
+    peer_flags: beam_dist::DistFlags,
+) -> (DistConnection, ConnectionDriver, TcpStream) {
     let (server_stream, mut peer_stream) = socket_pair();
     let peer_addr = server_stream.peer_addr().expect("the peer's address");
     let mut connection = DistConnection::from_parts(
@@ -85,7 +94,7 @@ fn establishing_accepted_with_peer_flags(
         peer_addr,
     );
     let mut peer =
-        ConnectionDriver::client_with_flags(PEER_NAME.as_bytes(), COOKIE, 1, peer_flags);
+        ConnectionDriver::client_with_flags(peer_name.as_bytes(), COOKIE, 1, peer_flags);
     for _ in 0..200 {
         connection.pump().expect("the accepted link's pump");
         read_into(&mut peer, &mut peer_stream);
@@ -649,5 +658,144 @@ fn an_unlinked_peer_is_absent_from_the_connected_node_view() {
     assert!(
         !empty.is_connected_any_half(PEER_NAME),
         "a runtime with no link at all is connected to nobody"
+    );
+}
+
+// -- the local link identity (`erlang:nodes/2`'s `connection_id`) ---------------
+
+/// The second distinct peer a connection-id fixture holds a link to.
+const SECOND_PEER: &str = "second@host.example";
+
+/// A link's identity is handed out **once** and stays: the same peer answers the same
+/// integer on a second request, and a name no link reaches answers `None` (the caller's
+/// `~0`) rather than a fabricated one.
+#[test]
+fn an_established_link_has_a_stable_connection_id() {
+    let (mut connection, _peer, _stream) = establishing_accepted();
+    let mut atoms = AtomTable::new();
+    bind_peer(&mut connection, &mut atoms);
+    let accepted = Rc::new(RefCell::new(vec![connection]));
+    let mut links = DistLinks::new(Rc::clone(&accepted));
+
+    let first = links
+        .connection_id_for(PEER_NAME)
+        .expect("an established link has an identity");
+    assert!(
+        first >= 1,
+        "a link's identity is a positive integer (0 and ~0 are not link identities), got {first}"
+    );
+    assert_eq!(
+        links.connection_id_for(PEER_NAME),
+        Some(first),
+        "the identity belongs to the link, so a second request answers the same integer"
+    );
+    assert_eq!(
+        links.connection_id_for("other@host.example"),
+        None,
+        "a node no link reaches has no identity — the caller's `undefined`, never an integer"
+    );
+    assert_eq!(
+        links.connection_id_for(PEER_NAME),
+        Some(first),
+        "asking about an unlinked node neither consumes nor perturbs the live link's identity"
+    );
+}
+
+/// Two live links have two identities: the id is **per link**, not a constant.
+#[test]
+fn two_peers_have_different_connection_ids() {
+    let (mut connection, _peer, _stream) = establishing_accepted();
+    let (mut second, _peer2, _stream2) =
+        establishing_accepted_named(SECOND_PEER, beam_dist::preferred_flags());
+    let mut atoms = AtomTable::new();
+    bind_peer(&mut connection, &mut atoms);
+    bind_peer(&mut second, &mut atoms);
+    let accepted = Rc::new(RefCell::new(vec![connection, second]));
+    let mut links = DistLinks::new(Rc::clone(&accepted));
+
+    let first_id = links.connection_id_for(PEER_NAME).expect("the first peer's id");
+    let second_id = links.connection_id_for(SECOND_PEER).expect("the second peer's id");
+    assert_ne!(
+        first_id, second_id,
+        "two live links must not share one identity ({first_id} vs {second_id})"
+    );
+    assert_eq!(
+        links.connection_id_for(PEER_NAME),
+        Some(first_id),
+        "a second peer's identity does not disturb the first link's"
+    );
+    assert_eq!(
+        links.connection_id_for(SECOND_PEER),
+        Some(second_id),
+        "each link keeps its own identity"
+    );
+}
+
+/// A retired link's identity is **dropped** (the C has no connection to number), and the
+/// link that replaces it is a new connection with a new id — never the old one.
+#[test]
+fn a_retired_peer_loses_its_id_and_a_new_link_gets_a_fresh_one() {
+    let (mut connection, _peer, _stream) = establishing_accepted();
+    let mut atoms = AtomTable::new();
+    bind_peer(&mut connection, &mut atoms);
+    let accepted = Rc::new(RefCell::new(vec![connection]));
+    let mut links = DistLinks::new(Rc::clone(&accepted));
+    let first_id = links.connection_id_for(PEER_NAME).expect("an identity");
+
+    accepted.borrow_mut().clear();
+    assert_eq!(
+        links.connection_id_for(PEER_NAME),
+        None,
+        "a retired link has no identity — the entry falls back to `undefined`, never to a stale integer"
+    );
+
+    let (mut replacement, _peer2, _stream2) = establishing_accepted();
+    bind_peer(&mut replacement, &mut atoms);
+    accepted.borrow_mut().push(replacement);
+    let second_id = links
+        .connection_id_for(PEER_NAME)
+        .expect("the replacement link's identity");
+    assert_ne!(
+        second_id, first_id,
+        "a re-established link is a new connection, so it gets a fresh id, not the retired one"
+    );
+}
+
+/// The same identity through the runtime's client half — the delegation `erlang:nodes/2`
+/// goes through — and `None` for a client that shares no link at all.
+#[test]
+fn the_client_reports_a_links_identity_through_the_shared_table() {
+    let (mut connection, _peer, _stream) = establishing_accepted();
+    let mut atoms = AtomTable::new();
+    bind_peer(&mut connection, &mut atoms);
+    let accepted = Rc::new(RefCell::new(vec![connection]));
+    let client = DistClient::new(COOKIE.to_vec()).expect("client");
+    client
+        .share_links_with(Rc::clone(&accepted))
+        .expect("install the node's accepted links");
+
+    let id = client
+        .connection_id_for(PEER_NAME)
+        .expect("a peer that dialled in has a link identity");
+    assert!(id >= 1, "a positive integer, never `undefined`, got {id}");
+    assert_eq!(
+        client.connection_id_for(PEER_NAME),
+        Some(id),
+        "stable across calls through the client half"
+    );
+    assert_eq!(
+        client.connection_id_for("other@host.example"),
+        None,
+        "a peer with no link has no identity"
+    );
+
+    let empty = DistClient::new(COOKIE.to_vec()).expect("client");
+    empty
+        .share_links_with(Rc::new(RefCell::new(Vec::new())))
+        .expect("install an empty accepted table");
+    assert_eq!(
+        empty.connection_id_for(PEER_NAME),
+        None,
+        "a runtime with no link at all has no identity to report"
     );
 }

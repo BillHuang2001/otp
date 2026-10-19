@@ -3000,6 +3000,23 @@ impl Runtime {
             .is_some_and(|client| client.is_connected_any_half(peer))
     }
 
+    /// The **local link identity** of this runtime's established link to `peer`: the integer
+    /// ERTS reports as `erlang:nodes/2`'s `connection_id` (`dist.c`'s `dep->connection_id`),
+    /// for a link this runtime dialled and for one the peer opened alike.
+    ///
+    /// The value is a per-link identity, not a per-call number: `DistLinks::connection_id_for`
+    /// mints it on the first request and keeps it until that link is gone, so two
+    /// `nodes/2` calls describe the same connection with the same integer.
+    ///
+    /// `None` for a runtime that is not a node (`nonode@nohost`) and for a peer with no
+    /// established link — the caller renders the C's `~0` (the atom `undefined`), never a
+    /// fabricated id.
+    pub fn dist_connection_id(&self, peer: &str) -> Option<u64> {
+        self.dist_client
+            .as_ref()
+            .and_then(|client| client.connection_id_for(peer))
+    }
+
     /// Dials `peer` and drives the connector handshake to completion (contract A.5, Phase 2).
     ///
     /// `peer` is a `-name`/`-sname` value (the short name of a short node, the full

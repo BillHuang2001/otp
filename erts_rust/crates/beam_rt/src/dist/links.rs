@@ -81,6 +81,14 @@ use beam_term::AtomTable;
 use crate::dist::DistConnection;
 use crate::dist_client::ClientLink;
 use crate::error;
+use crate::hasher::FastHashMap;
+
+/// The largest connection id this table assigns.
+///
+/// The id is the local link identity `erlang:nodes/2` reports, so it is materialised as a
+/// term; staying inside the 60-bit small-integer range keeps it a plain integer (the ERTS
+/// value is an opaque `UWord` no peer ever compares, and a node never has 2^59 live links).
+const MAX_CONNECTION_ID: u64 = (1 << 59) - 1;
 
 /// Both halves of this runtime's distribution links, and the routing entry over them.
 ///
@@ -93,6 +101,17 @@ pub(crate) struct DistLinks {
     /// The links a peer dialled **into** this runtime (the accepting half) — the very same
     /// cell [`crate::dist::DistNode`] pumps and mutates.
     pub(crate) accepted: Rc<RefCell<Vec<DistConnection>>>,
+    /// The **local link identity** [`DistLinks::connection_id_for`] hands out —
+    /// `erlang:nodes/2`'s `connection_id` — keyed by the link's `node@host` name.
+    ///
+    /// An id is minted on its first request and dropped only when the link it numbers is
+    /// gone ([`DistLinks::connection_id_for`] prunes it), so it is stable for one link's
+    /// whole lifetime and never reused for a re-established one (that is a new
+    /// connection).
+    connection_ids: FastHashMap<String, u64>,
+    /// The next id to mint; starts at `1` (the C's `connection_id` is never `0` for a link
+    /// and `~0` — the atom `undefined` — for `this`).
+    next_connection_id: u64,
 }
 
 impl DistLinks {
@@ -101,7 +120,40 @@ impl DistLinks {
         DistLinks {
             outbound: Vec::new(),
             accepted,
+            connection_ids: FastHashMap::default(),
+            next_connection_id: 1,
         }
+    }
+
+    /// The **local link identity** of the established link to `name` — the integer ERTS
+    /// reports as `nodes/2`'s `connection_id` (`dist.c`'s `dep->connection_id`).
+    ///
+    /// `name` is a peer's `node@host` name, matched against
+    /// [`DistLinks::established_names`] (the one union rule both halves share), so a peer
+    /// that dialled **into** this runtime has an identity exactly like one this runtime
+    /// dialled. The id is assigned on the first request for a live link and kept in
+    /// [`DistLinks::connection_ids`] until that link is gone: a caller asks twice and sees
+    /// the same integer, which is what makes the value an identity rather than a
+    /// per-call number. Names no longer established are pruned on every call, so the map
+    /// is bounded by the number of live links; a **re-established** link gets a fresh id,
+    /// because it genuinely is a new connection.
+    ///
+    /// `None` when no established link matches — the caller renders the C's `~0`, the atom
+    /// `undefined`, and never a fabricated integer.
+    pub(crate) fn connection_id_for(&mut self, name: &str) -> Option<u64> {
+        let established = self.established_names();
+        self.connection_ids
+            .retain(|known, _| established.iter().any(|live| live == known));
+        if !established.iter().any(|live| live == name) {
+            return None;
+        }
+        if let Some(id) = self.connection_ids.get(name) {
+            return Some(*id);
+        }
+        let id = self.next_connection_id;
+        self.next_connection_id = if id >= MAX_CONNECTION_ID { 1 } else { id + 1 };
+        self.connection_ids.insert(name.to_string(), id);
+        Some(id)
     }
 
     /// The index of the **established** outbound link keyed by `node`, if any.
