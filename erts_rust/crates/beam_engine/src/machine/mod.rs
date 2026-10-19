@@ -719,8 +719,15 @@ impl Machine {
     }
 
     /// Run `f` with the engine's **whole live root set** handed over as a
-    /// [`RootSet`]: the X-register file, the whole Erlang stack and the whole FR
-    /// file, all borrowed mutably and disjointly from one `&mut self`.
+    /// [`RootSet`]: the **used prefix** of the X-register file
+    /// ([`Machine::used_x_extent`]), the **whole** Erlang stack and the used prefix of
+    /// the FR file ([`Machine::used_fr_extent`]), all borrowed mutably and disjointly
+    /// from one `&mut self`.
+    ///
+    /// Every slot at or beyond a register file's used extent is `NIL` by the refill
+    /// invariant, so it holds no term to relocate; the prefix handed over is what the run
+    /// has actually written, which is what keeps the next [`Machine::reset`] proportional
+    /// to the run. The stack has no liveness map, so it is rooted in full.
     ///
     /// This is the engine's root hand-off for an allocation that may collect
     /// ([`Machine::alloc_rooted`] is the convenience wrapper). The three files are
@@ -759,10 +766,6 @@ impl Machine {
     /// (and rides out of the machine in the raise's live-reason slot on the uncaught
     /// path, never re-read from the field).
     pub fn with_roots<R>(&mut self, live: u32, f: impl FnOnce(RootSet<'_>) -> R) -> R {
-        // The receiver is handed mutable slices of BOTH register files, so it may write
-        // any slot of either — a move that the `set_x`/`set_fr` high-water marks cannot
-        // see. Mark the files escaped so the next `reset` refills them in full rather
-        // than trusting the marks.
         // The receiver is handed mutable slices of BOTH register files, but only the
         // **prefix that can hold a term**: every slot at or beyond the run's used extent
         // is `NIL` by the refill invariant, so it is not a root and cannot be relocated.

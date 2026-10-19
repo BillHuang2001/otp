@@ -48,30 +48,29 @@
 //! ## Why the workloads are shaped the way they are
 //!
 //! `run_export` pays a **fixed per-run setup** that is *not* per-instruction
-//! work: `Machine::reset` (the x-register and float-register files), the bottom
-//! frame, and — twice per run (`run_label_outcome`'s `resolve_label` and then
-//! `run_loop`) — a **module-wide `Label -> (func, pc)` map rebuilt from every
-//! function's label table** (`interpreter::build_label_map`). That build is
-//! `O(labels in the module)`, so a module with a thousand labels measures its
-//! label-map build, not its dispatch loop. Two consequences shape the design:
+//! work: `Machine::reset` (which refills only each register file's used extent)
+//! and the bottom frame. The module-wide `Label -> (func, pc)` map
+//! (`interpreter::build_label_map`) is **not** part of it: `Machine::label_map`
+//! caches it per machine per module (`src/machine/label_cache.rs`), so a timing
+//! loop that reuses one `Machine` builds it once, in the warm-up. Two
+//! consequences shape the design:
 //!
 //! 1. every **kind-isolating** body keeps the label count tiny (the pure no-op
 //!    baseline repeats *one* redundant label instruction, which the engine
 //!    dispatches as an ordinary no-op but which leaves the label map 2 entries
 //!    wide — see [`bench_dispatch_noop`]), so the per-instruction numbers isolate
 //!    dispatch; and
-//! 2. the setup cost is itself **measured**, by the [`bench_setup_empty`] floor
-//!    and by [`bench_dispatch_many_labels`], a body identical to the no-op baseline
-//!    except that every no-op carries a *distinct* label — the difference between
-//!    the two is the label-map build, i.e. the per-label cost of `run_export`.
-//!
+//! 2. the setup cost is itself **measured**, by the [`bench_setup_empty`] floor —
+//!    and [`bench_dispatch_many_labels`] checks the other side of the same fact: a
+//!    body of *distinct* labels, the no-op baseline's exact length, carries no
+//!    per-run penalty for its wide label table.//!
 //! ## Workloads
 //!
 //! | workload | body (per run) | instruction kinds isolated |
 //! |---|---|---|
 //! | [`bench_setup_empty`] | `label; return` | the per-run setup floor (2 instructions) |
 //! | [`bench_dispatch_noop`] | *K* redundant labels | pure dispatch (the baseline) |
-//! | [`bench_dispatch_many_labels`] | *K* **distinct** labels | the label-map build |
+//! | [`bench_dispatch_many_labels`] | *K* **distinct** labels | that label-table width is not a per-run cost |
 //! | [`bench_move`] | *K* `move` | operand read/write |
 //! | [`bench_test_nobranch`] | *K* passing `test` | test evaluation (predicate) |
 //! | [`bench_gcbif`] | *K* small-int `gc_bif '+'` | per-BIF argument marshalling |
@@ -95,8 +94,7 @@
 //!
 //! * **Measured**: the wall-clock `ns/instruction` of every workload (median of
 //!   [`SAMPLES`] samples), and — from the difference between the no-op and
-//!   many-labels baselines — the per-run per-label setup cost.
-//! * **Inferred**: the per-instruction-kind attribution, from the *difference*
+//!   many-labels baselines — that a wide label table adds no per-run cost.//! * **Inferred**: the per-instruction-kind attribution, from the *difference*
 //!   between a kind-isolating workload and the no-op baseline (see
 //!   [`report_attribution`]). A difference isolates the marginal cost of that
 //!   kind only to the extent the two bodies are otherwise alike; the loop and
@@ -296,9 +294,8 @@ fn bench_setup_empty() -> Report {
 /// the body has no branches, so the run executes exactly `KIND_OPS + 2`
 /// instructions. The trick is that all *K* labels are the **same** label, so the
 /// per-run label map stays 2 entries wide and the measurement isolates dispatch
-/// rather than the `O(labels)` map build ([`bench_dispatch_many_labels`] measures
-/// that separately).
-fn bench_dispatch_noop() -> Report {
+/// rather than any label-table effect ([`bench_dispatch_many_labels`] carries the
+/// same body with *distinct* labels).fn bench_dispatch_noop() -> Report {
     let shared = Label(2);
     let body = vec![Instr::Label(shared); KIND_OPS];
     let (module, function) = finish_module(Module::default(), "bench_noop", 2, body);
@@ -312,16 +309,15 @@ fn bench_dispatch_noop() -> Report {
     report
 }
 
-/// The **label-map probe**: [`KIND_OPS`] *distinct* label instructions.
+/// The **label-table-width probe**: [`KIND_OPS`] *distinct* label instructions.
 ///
 /// Its body is instruction-for-instruction the **same shape and length** as
 /// [`bench_dispatch_noop`] (a sequence of `label` no-ops, `KIND_OPS + 2`
 /// instructions per run, the same iteration count), but each carries a label of
-/// its own, so the module has `KIND_OPS + 1` labels and the two per-run
-/// `build_label_map` calls must build that many `BTreeMap` entries. Because the
-/// two workloads execute the same number of instructions, the difference between
-/// their `ns/run` **is** the per-run label-map build cost (no dispatch-volume
-/// confound) — reported by [`report_attribution`].
+/// its own, so the module's label map is `KIND_OPS + 1` entries wide. Because the
+/// map is cached per machine (`Machine::label_map`) the width is not a per-run
+/// cost: both workloads dispatch the same number of straight-line instructions,
+/// so their `ns/run` difference is noise, and [`report_attribution`] prints it.
 fn bench_dispatch_many_labels() -> Report {
     let body: Vec<Instr> = (0..KIND_OPS)
         .map(|index| Instr::Label(Label(2 + index as u32)))
@@ -1298,17 +1294,18 @@ fn report_table(reports: &[Report]) {
 /// dispatching a no-op label.
 ///
 /// Both numbers are **floor-adjusted**: the per-run setup cost [`bench_setup_empty`]
-/// measures (`Machine::reset` + the bottom frame + the two per-run `build_label_map`
-/// calls) is subtracted from every workload's `ns/run` first, because it is a
+/// measures (`Machine::reset`'s used-extent refill + the bottom frame) is subtracted
+/// from every workload's `ns/run` first, because it is a
 /// constant per run and would otherwise inflate the cheap workloads' per-instruction
 /// figures (it is ~400 ns/run against bodies of 2050 instructions). The residual
 /// approximation is the label-count difference (the loop bodies carry four labels,
 /// the baseline two), worth a few ns/run.
 ///
-/// The label-map decomposition uses [`bench_dispatch_many_labels`], whose body has
-/// the baseline's *exact* instruction count, so their `ns/run` difference is the
-/// label-map build alone.
-fn report_attribution(reports: &[Report]) {
+/// The label-table-width line uses [`bench_dispatch_many_labels`], whose body has
+/// the baseline's *exact* instruction count. The module's map is built once per
+/// machine (`Machine::label_map`) and therefore in the warm-up, so the residual
+/// between the two rows is the per-run cost of a wide label table — no build, only
+/// the entry-label lookup.fn report_attribution(reports: &[Report]) {
     let by_label = |needle: &str| reports.iter().find(|r| r.label.starts_with(needle));
     let floor_ns_per_run = by_label("setup/empty")
         .expect("the setup floor is always measured")
@@ -1357,12 +1354,12 @@ fn report_attribution(reports: &[Report]) {
         by_label("dispatch/noop"),
         by_label("dispatch/many-labels"),
     ) {
-        // The two bodies have identical instruction counts and iteration counts,
-        // so their `ns/run` difference is the label-map build alone. The
-        // many-labels body carries `KIND_OPS` distinct body labels plus the entry
-        // label; the no-op baseline carries the entry label plus its single
-        // *shared* body label.
-        assert_eq!(
+        // The two bodies have identical instruction counts and iteration counts.
+        // The many-labels body carries `KIND_OPS` distinct body labels plus the
+        // entry label; the no-op baseline carries the entry label plus its single
+        // *shared* body label. The map itself is built once per machine
+        // (`Machine::label_map`, warm-up), so the residual below prices the entry
+        // lookup over a wide table, not a build.        assert_eq!(
             noop.instructions_per_run, many.instructions_per_run,
             "the label-map probe must have the baseline's instruction count"
         );

@@ -26,10 +26,9 @@
 //! import table. It is a **pure function of the module's immutable content** — the
 //! label slots come from `Function::labels`, the import table from `Module::imports`
 //! resolved through the module's own load-time atom table — so a run that re-enters
-//! the module it just ran pays again for a value it already had. Measured on the
-//! `cowboy_bstr:to_lower/1` decomposition workload: 3.6 % of a timed call, paid by
-//! every `run_*` entry.
-//!
+//! the module it just ran would pay again for a value it already had. With this cache
+//! the build happens **once per machine per module** and never again on a later run
+//! (`MEASURED.md` carries the per-module build costs).//!
 //! # Identity: the `Digest` plus the atom namespace plus the address — never content
 //!
 //! A *content* key would cost at least the build it replaces (hashing the decoded IR

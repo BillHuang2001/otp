@@ -247,11 +247,9 @@ impl Machine {
         //
         // The gate is the plain `Machine::census_on` `bool` latched by each driver at its
         // run/resume entry, **never** the instrument's thread-local flag: this funnel runs
-        // once per interpreted instruction, so a TLS access here is a per-instruction cost
-        // paid by every run (`src/families/CONTEXT.md` measured it as 2.12 % of a
-        // `to_lower/1` workload while counting was disabled). With the latch off the whole
-        // instrument costs this branch and the result stays byte-identical.
-        //
+        // once per interpreted instruction, so a TLS access here would be a per-instruction
+        // cost paid by every run. With the latch off a disabled run pays this branch and
+        // nothing else (figures: `MEASURED.md`).        //
         // The instruction's effect lives in [`Machine::step_instruction_body`] so that
         // **every** `Err` out of it — including one propagated by `?` inside a single
         // arm, which returns from the body rather than falling out of the `match` — is

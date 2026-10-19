@@ -46,17 +46,16 @@
 //! # The per-run latch: the funnel never reads the thread-local flag
 //!
 //! The recorder runs **once per interpreted instruction**, so *asking* whether to count
-//! sits on the hottest path the engine has: reading [`is_enabled`]'s thread-local there
-//! was measured at **2.12 %** of the `foreign/bstr_to_lower` workload while counting was
-//! **disabled** (`src/families/CONTEXT.md`). The funnel therefore tests
+//! sits on the hottest path the engine has: a thread-local access there would be a
+//! per-instruction TLS read paid by every run. The funnel therefore tests
 //! `Machine::census_on` — a plain `bool` each driver copies out of [`is_enabled`] **once
 //! per run/resume entry**, the same latched-gate idiom as `Machine::trace_on`,
 //! `Machine::reduce_on` and `Machine::bif_in_machine_on`. A disabled census thus costs
 //! one predictable load and a branch and performs **zero thread-local accesses per
 //! instruction**; both drivers (the interpreter's `Machine::drive` and the native tiers'
 //! shared driver, whose deopt helper goes through this same funnel) latch the same
-//! answer, so a deopt step is counted identically on either tier.
-//!
+//! answer, so a deopt step is counted identically on either tier. Measured effect of the
+//! latch: `MEASURED.md`'s latched-census-gate rows.//!
 //! Two consequences, both worth knowing before quoting a mid-run experiment:
 //!
 //! * Turning counting **on** during a run is not observed by that run — it starts
