@@ -289,7 +289,31 @@ impl RuntimeContext<'_> {
         match &packet.event {
             ActiveInputEvent::Data(read) => self.active_data_message(packet, read),
             ActiveInputEvent::Passive => self.active_passive_message(packet),
+            ActiveInputEvent::Error(reason) => self.active_error_message(packet, reason),
         }
+    }
+    /// `{tcp_error, S, Reason}` / `{udp_error, S, Reason}` — a socket error delivered to the
+    /// owner in active mode.
+    ///
+    /// The C's `tcp_error_message` (`inet_drv.c:4079`) picks the atom from the socket's protocol
+    /// exactly as the passive message does, and renders the reason through `error_atom`'s
+    /// errno→name rule — here the one reader of `beam_io`'s errno table
+    /// ([`beam_io::InetReason::atom_name`]), so no errno is ever spelled twice. It is delivered
+    /// **before** the `{tcp_closed, S}` of the same close (`inet_drv.c:12871-12881`), which is the
+    /// order the driver stages the two events in.
+    fn active_error_message(
+        &mut self,
+        packet: &ActiveInputPacket,
+        reason: &beam_io::InetReason,
+    ) -> beam_common::Result<Eterm> {
+        let tag = match packet.kind {
+            ActivePortKind::Tcp => "tcp_error",
+            ActivePortKind::Udp => "udp_error",
+            ActivePortKind::Other => return Err(unsupported_kind(packet, "an {active,…} error")),
+        };
+        let tag = self.socket_atom(tag);
+        let reason_atom = self.socket_atom(&reason.atom_name());
+        terms_tuple(self, &[tag, packet.port.to_eterm(), reason_atom])
     }
 
     /// `{tcp, S, Data}` / `{udp, S, IP, Port, Data}` — one delivered input in active mode.
