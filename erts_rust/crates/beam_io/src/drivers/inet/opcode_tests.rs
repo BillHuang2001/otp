@@ -50,6 +50,7 @@ use beam_process::PortId;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -335,6 +336,55 @@ pub(super) fn erl_stdout(expr: &str) -> Option<String> {
             assert!(
                 out.status.success(),
                 "the oracle expression failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+    }
+}
+
+/// Runs the **escript** `source` under the system runtime with `args` and returns its stdout, or
+/// `None` — after a loud `SKIP:` message — when `escript` is absent or does not answer within
+/// [`ERL_TIMEOUT`]. A probe that exits non-zero fails the test: that is a broken script, not a
+/// missing tool.
+///
+/// A probe that needs more than a single expression — a listener and an accepted peer, a socket
+/// whose port is rebound, a `receive` with several clauses — is a **file**, not an `-eval` string:
+/// `-eval` has no line continuation, so a multi-clause `fun` or a `case` written inline has to be
+/// squeezed onto one line and any quoting mistake in it surfaces as an unrelated syntax error. The
+/// file is written to the platform temp directory under `name` (so two suites never share one) and
+/// removed again, and the script keeps its own module identity via the file name.
+pub(super) fn escript_stdout(name: &str, source: &str, args: &[&str]) -> Option<String> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "beam_io_{}_{serial}_{name}.escript",
+        std::process::id()
+    ));
+    std::fs::write(&path, source).expect("the probe escript is writable");
+
+    let mut command = Command::new("escript");
+    command.arg(&path).args(args);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(command.output());
+    });
+    let outcome = rx.recv_timeout(ERL_TIMEOUT);
+    let _ = std::fs::remove_file(&path);
+
+    match outcome {
+        Err(_) => {
+            eprintln!("SKIP: `escript` did not answer within {ERL_TIMEOUT:?} (probe `{name}`)");
+            None
+        }
+        Ok(Err(err)) => {
+            eprintln!("SKIP: no `escript` on PATH — could not run probe `{name}` ({err})");
+            None
+        }
+        Ok(Ok(out)) => {
+            assert!(
+                out.status.success(),
+                "the oracle escript `{name}` failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             Some(String::from_utf8_lossy(&out.stdout).into_owned())

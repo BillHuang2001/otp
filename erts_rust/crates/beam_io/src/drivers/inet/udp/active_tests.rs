@@ -67,6 +67,8 @@ use crate::poller::Poller;
 use crate::port::PortRegistry;
 use crate::port_task::{ActiveInput, ActiveInputEvent, ReadMessage};
 
+/// `INET_REQ_CONNECT` (`inet_drv.c:11993`).
+const INET_REQ_CONNECT: u32 = 3;
 /// `INET_REQ_OPEN` (`inet_drv.c:14577`).
 const INET_REQ_OPEN: u32 = 1;
 /// `INET_REQ_BIND` (`:11409`).
@@ -114,7 +116,7 @@ const MAX_ROUNDS: usize = 200;
 /// A live `udp_inet` port bound to an ephemeral loopback port, driven through the real runtime
 /// path: [`PortRegistry::port_control`] for the control verbs, [`PortRegistry::handle_events`] for
 /// a readiness round, [`PortRegistry::take_active_inputs`] for the deliveries.
-struct Rig {
+pub(super) struct Rig {
     registry: PortRegistry,
     poller: Poller,
     id: PortId,
@@ -131,9 +133,9 @@ struct Round {
 }
 
 /// What a burst of rounds collected.
-struct Drained {
+pub(super) struct Drained {
     /// Every delivery, in delivery order.
-    inputs: Vec<ActiveInput>,
+    pub(super) inputs: Vec<ActiveInput>,
     /// How many deliveries each round produced.
     per_round: Vec<usize>,
     /// How many rounds observed a readiness event — the non-vacuity witness for a "nothing is
@@ -144,7 +146,7 @@ struct Drained {
 impl Rig {
     /// Opens a `udp_inet` port, creates its datagram socket (`INET_REQ_OPEN`) and binds it to an
     /// ephemeral loopback port (`INET_REQ_BIND`).
-    fn new() -> Rig {
+    pub(super) fn new() -> Rig {
         Rig::with_bind(INET_AF_LOOPBACK)
     }
 
@@ -180,7 +182,7 @@ impl Rig {
     }
 
     /// One control call, panicking on a typed error.
-    fn control(&mut self, command: String, arg: &[u8]) -> Vec<u8> {
+    pub(super) fn control(&mut self, command: String, arg: &[u8]) -> Vec<u8> {
         self.registry
             .port_control(&mut self.poller, self.id, &command, arg)
             .unwrap_or_else(|err| panic!("the `{command}` control call failed: {err:?}"))
@@ -241,10 +243,38 @@ impl Rig {
     }
 
     /// `{active, value}`, asserting the walk accepted it.
-    fn arm(&mut self, value: i32) {
+    pub(super) fn arm(&mut self, value: i32) {
         assert_eq!(self.set_active(value), ctl_ok(), "{{active,{value}}} is accepted");
     }
 
+    /// The loopback port the kernel bound for this port (`INET_REQ_BIND`'s reply).
+    pub(super) fn bound(&self) -> u16 {
+        self.bound
+    }
+    /// The port's own id — what every delivery is stamped with.
+    pub(super) fn id(&self) -> PortId {
+        self.id
+    }
+
+    /// `INET_REQ_CONNECT` to `127.0.0.1:port` — the C's `[Timeout(4), packed-address]` operand
+    /// (`inet_drv.c:14814`-`:14830`). A datagram `connect(2)` installs a default peer and returns
+    /// at once (nothing is sent), so the timeout is ignored.
+    pub(super) fn connect_to(&mut self, port: u16) {
+        assert_eq!(
+            self.control(
+                op(INET_REQ_CONNECT),
+                &super::super::opcode_tests_udp::connect_arg(port)
+            ),
+            ctl_ok(),
+            "INET_REQ_CONNECT(3) installs the default peer"
+        );
+    }
+
+    /// Whether the driver has latched the peer's close ([`crate::Driver::port_closed`]) — a
+    /// datagram port never reports one (there is no `{udp_closed, S}` in the C).
+    pub(super) fn port_closed(&mut self) -> bool {
+        self.registry.port_closed(self.id).expect("a live port")
+    }
     /// The driver's stored `{active, …}` state, read back through `INET_REQ_GETOPTS` code 22: the
     /// `INET_LOPT_ACTIVE` value, plus the `{active, N}` counter when the mode is `N`.
     fn active_state(&mut self) -> (i32, Option<i16>) {
@@ -293,7 +323,7 @@ impl Rig {
     /// Drives rounds until the port has been quiet for [`QUIET_ROUNDS`] rounds, collecting every
     /// delivery — the condition wait every case here uses instead of a fixed sleep, under
     /// [`HANG_GUARD`].
-    fn drain_until_quiet(&mut self) -> Drained {
+    pub(super) fn drain_until_quiet(&mut self) -> Drained {
         let guard = Instant::now() + HANG_GUARD;
         let mut drained = Drained {
             inputs: Vec::new(),
@@ -351,7 +381,7 @@ impl Rig {
 }
 
 /// Every `Data` delivery of a drain, in order.
-fn data_of(inputs: &[ActiveInput]) -> Vec<&ReadMessage> {
+pub(super) fn data_of(inputs: &[ActiveInput]) -> Vec<&ReadMessage> {
     inputs
         .iter()
         .filter_map(|input| match &input.event {

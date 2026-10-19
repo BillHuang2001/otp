@@ -69,7 +69,7 @@ fn bound_port() -> (Rig, u16) {
 
 /// The C's `INET_REQ_CONNECT` operand: `[Timeout(4), packed-address]`
 /// (`inet_drv.c:14814`-`:14830`). The timeout is ignored for UDP, which never blocks.
-fn connect_arg(port: u16) -> Vec<u8> {
+pub(super) fn connect_arg(port: u16) -> Vec<u8> {
     let [hi, lo] = port.to_be_bytes();
     let mut arg = vec![0, 0, 0, 0];
     arg.extend_from_slice(&[INET_AF_INET, hi, lo, 127, 0, 0, 1]);
