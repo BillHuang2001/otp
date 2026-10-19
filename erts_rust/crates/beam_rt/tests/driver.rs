@@ -238,12 +238,16 @@ impl Fixture {
         }
     }
 
-    /// The candidate paths [`load_driver`] should try, in order: the stem and its `.so` spelling.
+    /// The candidate path [`load_driver`] should try: the stem, **without** its suffix.
+    ///
+    /// Deliberately a single entry. `beam_abi::driver::loader::load` appends the platform
+    /// shared-object suffix unconditionally (the oracle's own `erts_sys_ddll_open` rule,
+    /// `erts/emulator/sys/unix/erl_unix_sys_ddll.c`), so a `<path>.so` spelling would be opened as
+    /// `<path>.so.so` and fail with a meaningless `ENOENT`. Because `load_driver_at` reports the
+    /// **last** candidate's error, such a redundant suffix would mask the real diagnostic (e.g. a
+    /// vetoing `init`'s `driver_init_failed`).
     fn candidates(&self) -> Vec<String> {
-        vec![
-            self.stem.display().to_string(),
-            format!("{}.so", self.stem.display()),
-        ]
+        vec![self.stem.display().to_string()]
     }
 }
 
