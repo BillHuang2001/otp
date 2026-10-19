@@ -62,7 +62,7 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 - Never deliver to the wrong process: an addressed party not local to *this* node is `NoSuchProcess`, a party outside its opcode's wire contract is `Unsupported`, never a silent mis-delivery.
 - Never route silently: a node no link reaches is the typed `no_link_error` from the routing entry, and a queued control whose link died is dropped with its reason recorded — never a quiet success.
 - Do not hand-edit generated artifacts; Apache-2.0 header block required on every `.rs` file.
-- Keep each file ~1000 lines: `dist.rs` is 1500 (1056 of production, the rest its inline unit suite — loopback `DistConnection`/`DistNode` fixtures over a real socket pair), `dist/links.rs` is 791 (413 of production, the rest its own loopback table/router suite), `dist/inbound.rs` is 865.
+- Keep each file ~1000 lines: `dist.rs` is 1511 (1056 of production, the rest its inline unit suite — loopback `DistConnection`/`DistNode` fixtures over a real socket pair), `dist/links.rs` is 498 of production with its loopback table/router suite split out to the sibling `dist/links/tests.rs` (652, the crate's `port/tests.rs` pattern), `dist/inbound.rs` is 865.
 
 ## Missing sibling APIs (the still-`Unsupported` families)
 - **The distributed-spawn family** (`SpawnRequest`/`SpawnReply`) needs a `beam_process` spawn-responder/reservation API — a `DOP_SPAWN_REPLY` sender plus the reservation bookkeeping a `DOP_SPAWN_REQUEST` keys into.
