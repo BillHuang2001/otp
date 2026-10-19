@@ -103,6 +103,7 @@ mod io;
 mod loader;
 pub(crate) mod memory;
 mod net;
+pub(crate) mod net_kernel;
 mod node;
 pub(crate) mod port;
 mod prim;
@@ -116,7 +117,9 @@ use std::process::Command;
 
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext};
-use beam_term::{atom_val, is_atom, is_small, make_atom, make_small, signed_value, Eterm, NIL};
+use beam_term::{
+    atom_val, is_atom, is_list, is_small, make_atom, make_small, signed_value, Eterm, NIL,
+};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -1172,6 +1175,32 @@ fn halt_slogan(chars: Eterm) -> Result<String> {
 /// The C's `HALT_MSG_SIZE` — the slogans' character budget (`bif.c:4380`).
 const HALT_MSG_SIZE: usize = 1023;
 
+/// The elements of a tuple term, or `None` when `term` is not a tuple.
+///
+/// Shared by the native **service** modules that decode a wire message
+/// ([`file_server`](crate::native::file_server)'s `gen_server`/device protocols and
+/// [`net_kernel`](crate::native::net_kernel)'s `gen:call`), so the two decoders cannot drift.
+pub(crate) fn tuple_fields(term: Eterm) -> Option<Vec<Eterm>> {
+    let arity = terms::tuple_arity(term).ok()?;
+    let mut fields = Vec::with_capacity(arity);
+    for index in 0..arity {
+        fields.push(terms::tuple_element(term, index).ok()?);
+    }
+    Some(fields)
+}
+
+/// The head of an **improper** list `[Head | Tail]` whose tail is not a list — the shape of
+/// `gen:reply/2`'s `[alias|Ref]` tag. `None` for a proper list (or tail) and for a non-list.
+///
+/// `is_list/1` is the **proper**-list predicate, so it reports `false` for `[alias|Ref]`; the
+/// cons accessors are what decide whether the term is a cons cell at all.
+pub(crate) fn improper_list_head(term: Eterm) -> Option<Eterm> {
+    let tail = terms::cons_tail(term).ok()?;
+    if tail == NIL || is_list(tail) {
+        return None;
+    }
+    terms::cons_head(term).ok()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

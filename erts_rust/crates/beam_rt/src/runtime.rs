@@ -705,6 +705,13 @@ pub struct Runtime {
     /// request decoding, reply shaping and scheduler-pass step); the field itself is the
     /// state that ties the registered `file_server_2` pid to the runtime.
     pub(crate) file_services: crate::native::file_server::FileServices,
+    /// The runtime-native **`net_kernel` service** (contract A.5) — present only on a
+    /// **distributed** node, where a peer's `net_adm:ping/1` `gen:call` needs a process
+    /// holding that name. See [`crate::native::net_kernel`].
+    ///
+    /// `pub(crate)` because the service's whole implementation lives in that module (its
+    /// request decoding, reply routing and scheduler-pass step).
+    pub(crate) net_kernel: Option<crate::native::net_kernel::NetKernelService>,
     /// The `{Name, Vsn}` header of the OTP boot script this runtime has **loaded**, or
     /// `None` before any script was read/executed — the source of `init:script_id/0`. Set
     /// by [`Runtime::boot_from_script`] / [`Runtime::boot_from_script_reporting`].
@@ -921,6 +928,20 @@ impl Runtime {
             Some(name) => Some(DistNode::start(name, cookie.clone())?),
             None => None,
         };
+        // The native **`net_kernel` service** (contract A.5): a `Runnable`, never-enqueued
+        // process holding that name, so a peer's `net_adm:ping/1` `gen:call`
+        // (`{'$gen_call', From, {is_auth, PeerNode}}`) finds a real process to answer instead
+        // of parking for ever in `gen:call/4`'s untimed `receive` (see
+        // `src/native/net_kernel.rs`). A runtime with **no** `-name`/`-sname` has no peer that
+        // could dial it, so it spawns nothing and stays observably identical.
+        let net_kernel = match dist.as_ref() {
+            Some(_) => Some(crate::native::net_kernel::NetKernelService::start(
+                &mut processes,
+                code_server.atoms_mut(),
+                system_spawn_policy(&config),
+            )?),
+            None => None,
+        };
         // The local-node identity: the configured node's full `node@host` name when this is a
         // node, else the fixed `nonode@nohost` (the same one the node bridge gives
         // `beam_codec`). Installing it on the process table is what lets a **named** monitor
@@ -1039,6 +1060,7 @@ impl Runtime {
             open_files: HashMap::new(),
             prim_tty_handles: HashMap::new(),
             file_services,
+            net_kernel,
             boot_script_id: None,
             boot_script_path: None,
         })

@@ -907,6 +907,21 @@ impl Runtime {
                     continue;
                 }
             }
+            // The **`net_kernel` service half** (contract A.5): drain the mailbox of the process
+            // holding the `net_kernel` name and route each `gen:call` reply back to its caller —
+            // a local pid, a peer pid or a peer-minted `[alias|Ref]` (`src/native/net_kernel.rs`).
+            // A peer's `net_adm:ping/1` blocks in `gen:call/4`'s untimed `receive` until this
+            // reply arrives, so a delivery counts into `delivered` and the pass goes round again;
+            // a runtime that is **not** a node owns no such service and gets the `Ok(0)` no-op.
+            match self.service_net_kernel(&mut table) {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    scheduler.resume_woken(&mut table);
+                    continue;
+                }
+            }
             // The port-monitor half of the exit obligation: a process that died in the slices
             // just run may have been watching a live port, and `beam_process`'s finalizer cannot
             // remove the matching *incoming* entry because this runtime threads no port table

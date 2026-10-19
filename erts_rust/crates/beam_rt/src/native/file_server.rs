@@ -165,8 +165,8 @@ use crate::context::RuntimeContext;
 use crate::error;
 use crate::native::prim;
 use crate::native::prim_file::take_open_file;
+use crate::native::{improper_list_head, tuple_fields};
 use crate::runtime::Runtime;
-
 mod file_info;
 mod get_line;
 mod get_until;
@@ -1071,31 +1071,7 @@ impl Runtime {
     }
 }
 
-/// The elements of a tuple term, or `None` when `term` is not a tuple.
-fn tuple_fields(term: Eterm) -> Option<Vec<Eterm>> {
-    let arity = terms::tuple_arity(term).ok()?;
-    let mut fields = Vec::with_capacity(arity);
-    for index in 0..arity {
-        fields.push(terms::tuple_element(term, index).ok()?);
-    }
-    Some(fields)
-}
-
-/// The head of an **improper** list `[Head | Tail]` whose tail is not a list — the shape of
-/// `gen:reply/2`'s `[alias|Ref]` tag. `None` for a proper list (or tail) and for a non-list.
-///
-/// `is_list/1` is the **proper**-list predicate, so it reports `false` for `[alias|Ref]`; the
-/// cons accessors are what decide whether the term is a cons cell at all.
-fn improper_list_head(term: Eterm) -> Option<Eterm> {
-    let tail = terms::cons_tail(term).ok()?;
-    if tail == NIL || is_list(tail) {
-        return None;
-    }
-    terms::cons_head(term).ok()
-}
-
-/// The `SeekFrom` a `{position, At}` request denotes (`file_io_server.erl:268-273`).
-///
+/// The `SeekFrom` a `{position, At}` request denotes (`file_io_server.erl:268-273`).///
 /// The bare `cur`/`{cur, Offs}` forms are parsed here as an un-adjusted relative seek;
 /// [`Runtime::position_seek`] is the entry point that compensates them for the device's
 /// stashed buffer (`file_io_server:position/3`).
