@@ -475,12 +475,24 @@ fn drive(module: &Arc<Module>, leg: &Leg, ops: usize, tier: Tier) -> beam_common
                 break;
             }
             RunOutcome::Wait { func, pc } => (func, pc),
+            // The bench host answers every BIF directly, so a suspend would mean the measuring
+            // context changed shape: the ping-pong is a park/resume workload only.
+            RunOutcome::Suspend { .. } => {
+                return Err(crate::error::unsupported(
+                    "send_split: the driver suspended on a BIF; the bench host never suspends",
+                ))
+            }
         };
         let worker_position = match worker_outcome {
             RunOutcome::Wait { func, pc } => (func, pc),
             RunOutcome::Returned(_) => {
                 return Err(crate::error::unsupported(
                     "send_split: the worker returned before the driver",
+                ))
+            }
+            RunOutcome::Suspend { .. } => {
+                return Err(crate::error::unsupported(
+                    "send_split: the worker suspended on a BIF; the bench host never suspends",
                 ))
             }
         };

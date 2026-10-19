@@ -54,7 +54,8 @@ use super::Machine;
 /// `Err(`[`crate::error::suspended`]`)` rather than inventing a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
-    /// The run finished; this is `x(0)`.    Returned(Eterm),
+    /// The run finished; this is `x(0)`.
+    Returned(Eterm),
     /// The process blocked on an empty `receive`; resume at code offset `pc` of the
     /// function at index `func` (into [`Module::functions`]) once a message arrives.
     Wait {

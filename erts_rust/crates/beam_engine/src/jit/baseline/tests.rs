@@ -5306,12 +5306,24 @@ fn drive_probe(
         let (func, pc) = match driver_outcome {
             RunOutcome::Wait { func, pc } => (func, pc),
             RunOutcome::Returned(_) => unreachable!("handled above"),
+            // This probe's context answers every BIF directly, so a suspend is a harness
+            // mismatch, not a reachable outcome of the ping-pong.
+            RunOutcome::Suspend { .. } => {
+                return Err(crate::error::unsupported(
+                    "srbench probe: the driver suspended on a BIF; the probe host never suspends",
+                ))
+            }
         };
         let (worker_func, worker_pc) = match worker_outcome {
             RunOutcome::Wait { func, pc } => (func, pc),
             RunOutcome::Returned(_) => {
                 return Err(crate::error::unsupported(
                     "srbench probe: the worker returned before the driver",
+                ))
+            }
+            RunOutcome::Suspend { .. } => {
+                return Err(crate::error::unsupported(
+                    "srbench probe: the worker suspended on a BIF; the probe host never suspends",
                 ))
             }
         };
