@@ -107,6 +107,59 @@ deopt are the load-bearing contracts.
 - `unsafe` is confined to `baseline/{mod,runtime}.rs` + `baseline/emit/*` + `emitter/mod.rs` (+ feature-gated `cranelift/mod.rs`); each `unsafe` block carries a `// SAFETY:` rationale.
 - **A *loaded* `Module` is immutable after load** — no production path mutates its fields (every post-load field write lives in a `#[cfg(test)]` fixture or a `tests/` tree; the code server stores `Arc<Module>` and only reads), so a content-derived module identity is stable. `Module::checksum` (`[u8;16]`, a `Copy`) is such an identity: it digests `AtU8`·`Code`·`StrT`·`ImpT`·`ExpT`·`FunT'`·`LitT`·`Meta`·`Recs`·`DbgB` (plus the obsolete `Atom`) and excludes `Line`/`LocT`/`Type`/`Attr`/`CInf`/`Docs`/`Dbgi`. The exclusions are safe for the cache: the baseline emitter reads only `functions`/`literals`/`strings`/export-import tables (all digested) and treats `Operand::Typed { reg, .. }` exactly like `X`/`Y(reg)` (`baseline/emit/operands.rs`), so a stripped-vs-unstripped pair with identical `Code` (same checksum, different `Type`) compiles to the same code. `Module::default()` carries an **all-zero** checksum, so synthetic (`Module::default()`-based) fixtures must NOT be identified by the checksum alone — they all collide on `[0u8;16]`.
 
+## Measured (native baseline tier — per-call / per-block-entry overhead)
+The instrument is retired user instructions, **not wall clock**: on this shared host wall A/B swings
+0.29–1.76 per round at the 1–3 % effect size and resolves nothing, so every figure below is a
+**counter** (see `## Notes for Agents (measurement)` for how to reproduce one).
+Workloads: `list_walk` = a BIF-free body-recursive `sum/1` over a 1000-element list (`~7` dispatched
+instructions per element, tiny blocks); `to_lower/1` = `cowboy_bstr:to_lower/1` over a token binary
+(`438` IR instructions/call, a `char_to_lower/1` call per byte).
+- **`list_walk` (instructions per element), by tree** — the reference point for any entry/call-path change:
+
+| tree | instr/element |
+|---|---|
+| m15-era `a34ca61332` | 556.1 |
+| pre-optimisation HEAD | 610.5 |
+| `ba245ddc9c` (the `call` helper takes the emitter's compile-time resolution) | 570.9 |
+| `ce0936464a` (a block entry resolved from the driver's function cache) | 530.6 |
+| `d1596601b3` (same-function continuation return tail-jumps in-block) | 497.3 |
+| `26a196a1a1` (same-module cross-function continuation return tail-jumps in-block) | 502.2 |
+
+- **The m15 → pre-optimisation regression is one commit: `edaeb0c512`** ("charge one reduction per
+  compiled block at the driver loop head"), `list_walk` **556.1 → 610.3 instructions/element (+9.7 %)**
+  and wall ≈ **1.215×–1.22×**. Its mechanism is exactly the three per-iteration costs it added at
+  `baseline/mod.rs`'s loop head: `set_current_code(func, pc)`, `reductions.saturating_add(1)`, and a
+  fully-armed `ctx.reduce(1)` dynamic call (a `BudgetContext` answers `wants_reduce() == true`).
+  `3accfc17a6` (eager continuation sub-blocks) is **neutral** (0.9999); the `exec_census` commits
+  `8ad21d9158`/`1429938ecd` are **free while disabled** (≤ 0.05 %, opposite-sign deltas = noise; the
+  recorders are reached only from `step_instruction_inner`, never from natively inlined code); and
+  `964c683f3e`/`68899ec5ec` contribute nothing to the per-call path.
+  The three surviving per-iteration costs are load-bearing — the position store is what makes a resumed
+  pre-emption exact and the reduction charge is the scheduling point — so they were kept and the *work
+  around* them removed instead.
+- **`to_lower/1`, structural counters** (`baseline/counters.rs`, test-only): `instr_per_call` **438.00**
+  (invariant — it counts IR instructions, not round-trips), `driver_round_trips_per_call` **63.00 →
+  33.00** (`block_entry_lookups` 1 260 000 → 660 000, `hits` 660 000, `misses` 0,
+  `local_call_requests_per_call` 61.00, `step_one`/`step_ext`/`driver_interp_steps` 0,
+  `result_is_correct = true`).
+- **`to_lower/1`, whole-process instructions per call**: **130 439–130 466** → **126 812–126 842**
+  (**−2.78 %**, spread 0.05 %, no overlap), measured as a per-rep slope at N = 50 000 → 450 000 with
+  `-pa <bstr dir>`. The pure boot intercept is identical on both sides (7 036 182 170 vs 7 036 275 469,
+  −0.0013 %), so the gain is per-call and the `EntryTables` publication in `enter_compiled_cached`
+  costs no measurable startup.
+- **`26a196a1a1` is a `list_walk`/`to_lower` trade, measured**: `list_walk` **+0.90 %** (497.1 → 502.2,
+  min-of-slopes 1.0087 / median 1.0097, zero overlap, reproduced on two independent N pairs to 0.03 pp)
+  against `to_lower/1` **−2.78 %**. It is kept for the foreign-code workloads, which is where the
+  remaining ratio gap is; the `list_walk` cost is the cross-function entry probe that runs on a
+  same-function return too, and reclaiming it needs the same-function probe answered without touching
+  the artifact.
+- **Noise floor**: a fresh release build of the same tree measures within **0.01–0.04 %** of the binary
+  under test on both counters, so every effect in the table above is 13–70× noise.
+- **Residual (measured, not yet levered)**: the remaining 33 round-trips per `to_lower/1` call are
+  **block entries, not returns** (`block_entry_hits` = 660 000, `misses` = 0 — the driver's cached
+  entry answers every one), so the return path is exhausted and the next lever is entry-side. Any such
+  change must be judged against the `list_walk` row above, since that workload is 7-instruction blocks.
+
 ## Known Issues (per-process cost attribution)
 - **The entry path is O(1) on the key's own digest; only the cross-module path uses the address memo.** `CodeCache::compiled_handle` (`cache/mod.rs`) resolves a module through `CacheKey::of` (the O(1) digest **plus** the O(1) `atom_table.snapshot()` namespace half): for a real `.beam` the module half is the module's **load-time MD5** (`Module::checksum`, read as a plain `Copy` — no hash, no allocation, no name lookup), so the `&Module`-only entry used by `run_baseline_cached{,_outcome,_label_outcome,_resume_outcome}` is O(1) on **every** entry and resume with no IR re-hash; only a synthetic all-zero-checksum module (`Module::default()`) falls to the `Content { name, fingerprint }` variant, whose `fingerprint` is a hash of the whole decoded IR (the cost there scales with module size — `../MEASURED.md`: ~2 µs tiny, ~141 µs at 2048 instructions). The address memo is therefore a **redundant micro-optimisation on the digest path**, retained for the priming API `remember_module`, which has no production caller (its callers are tests); it is filled by `cached_module_blocks` (the cross-module `Arc<Module>` route → `remember`) and by `remember_module`, and its entry is honoured only while its `Weak<Module>` still upgrades **and** the module's current `atom_table.snapshot()` still equals the memoized key's (a stale generation recompiles). Pinned by `cache/tests.rs::a_real_loaded_beam_never_rehashes_its_ir_on_any_entry_path` (0 fingerprints across all four entry paths), `cache/tests.rs::a_dead_memo_entry_is_ignored_and_falls_back_to_the_content_hash` (content fallback = `before + 1`), `cache/tests.rs::a_memoized_lookup_does_not_rehash_the_ir` (the memoized cross-module path) and the namespace pin `cache/tests.rs::a_second_atom_namespace_is_never_handed_the_first_namespaces_artifact`.
 - **`cached_module_blocks` self-disables on `RefCell` re-entrancy** (`cache/mod.rs`: `try_borrow_mut().ok()?` → `None`), silently making the driver run that callee on its per-instruction interpreter step — a documented perf cliff, never a correctness one.
