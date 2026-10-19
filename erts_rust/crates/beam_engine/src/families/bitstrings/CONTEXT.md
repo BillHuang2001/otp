@@ -45,6 +45,21 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   bit position — C's `fmt_small_le`/`fmt_big_le` + `restore_and_shift`,
   `erl_bits.c:686/812/891`); `push_uint_le` (a `u64`-sized field) and `push_wide_int`'s
   little branch (a `fmt_big_le` byte array) both delegate to it.
+  **Whole-byte fast paths** serve the byte-wise shapes the compiler emits for real data
+  (a `<<C:8>>` match field, a `<<Acc/binary,C>>` accumulator), whose per-bit route costs a
+  `push_bit`/bit read per bit: `push_uint`/`push_uint_le`/`push_le_groups`/`push_wide_int`
+  take a byte-at-a-time arm when the width is a whole number of bytes **and** the
+  destination is byte-aligned, and `read_uint_be`/`extract_bits` do the same on the read
+  side. Every range/width check still runs **first**, so an out-of-range field keeps the
+  oracle's error; the bit-at-a-time rule stands for every non-aligned shape, because a
+  mid-byte destination needs `raw::InPlace::push_bit`'s byte-window handling (clearing an
+  entered byte, and masking the one byte the accumulator's window ends inside).
+  `read_size` classifies a literal `Operand::Integer`/`Operand::Character` size directly
+  through `size_of_int` — it is by far the hottest size shape (`<<V:8>>` *is*
+  `Operand::Integer(8)`) and the general read would materialise an integer term only to read
+  that same value back; the reject case is the `#[cold] size_error`. `read_size`/`is_all`/
+  `decode_flags`/`flag_bit`/`small_value`/`sign_extend` and the hot `BitWriter` methods carry
+  `#[inline]`.
 - `raw.rs` → the family's **single** `#[allow(unsafe_code)]` module: `heap_bits` /
   `subject_bytes` (the subject triple), `ctx_parts`/`inner_orig`/`make_ctx`/
   `set_ctx_start` (the match context), `make_big`/`big_parts_safe` (bignums) and
@@ -62,21 +77,48 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   `is_refc_binary` is a `#[cfg(test)]` safe wrapper over
   `beam_term::refc::is_refc_binary` for the node's test modules (which live under
   the crate-wide `#![deny(unsafe_code)]`), mirroring `big_parts_safe`.
+  `bit_size` is the host-facing `erlang:bit_size/1` reader — a heap bits/binary takes its
+  `size` word, a refc window **and** an `ErlSubBits` match context take `end - start`
+  (exactly `erts_bin_bits_size`), and a non-bitstring is `None` (→ the caller's `badarg`),
+  never a substituted size. It exists because a BIF living in this crate cannot reach this
+  module's `pub(super)` readers, and it is re-exported once from `bitstrings/mod.rs` for the
+  two BIF floors that would serve `bit_size/1`: the in-crate harness floor
+  (`src/bench/counting.rs`) and the external test host (`tests/support/bifs.rs`, which would
+  also need a `pub` re-export — `families` is a private module). Neither has adopted it yet,
+  so nothing in the engine calls it and the re-export's `#[allow(unused_imports)]` stands.
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/
-    `bs_match_string`/`bs_test_tail2` opcodes.
+    `bs_match_string`/`bs_test_tail2` opcodes. `bs_get_integer2` commits its advance through
+    the term its own `read_ctx` already captured, re-reading the context operand only when the
+    field read actually reserved a heap term (`read_integer_field_tracked`'s allocation
+    witness) — the same one-sided rule `run_commands` follows.
   - `match_ctx.rs` → match entry (`enter_match`, the `reuse` path, `resolve_match4_fail`),
     the context operand readers (`read_ctx`/`reread_ctx`) and `bs_set_position`
     (`position_of`).
   - `commands.rs` → the flattened `bs_match` command interpreter (`run_commands`:
     `ensure_at_least`/`ensure_exactly`/`skip`/`integer`/`binary`/`get_tail`/`'=:='`) and
-    the `commit` write-back discipline.
+    the `commit` write-back discipline. `run_commands` captures the context term, its inner
+    `orig` and the subject byte view **once** and re-derives them only after a command that
+    can have allocated through the rooted seam: `integer` dirties only when its field did not
+    fit a small integer, `binary`/`get_tail` always (they build a bitstring every time), and
+    `ensure_at_least`/`ensure_exactly`/`skip`/`'=:='` never. The rule is deliberately
+    one-sided — a stale capture would be unsound, a redundant re-read only costs a read.
   - `reads.rs` → the fixed field readers: `read_integer_field`/`read_wide_integer_field`,
     `read_float_field` + `f16_to_f32`, `decode_utf8`/`decode_utf16`/`decode_utf32`, the
     shared `field_is_little` endianness resolver, and the byte/bit helpers they share.
+    `read_uint_le_bits` forwards a **byte-aligned** field to the shared whole-byte
+    `read_uint_le` and keeps its bit-granular loop only for a mid-byte start (the float/UTF
+    callers — `read_integer_field` routes an unaligned little-endian integer elsewhere).
   - `utf_tests.rs` → `#[cfg(test)]` instruction-arm regressions for the match reads'
     endianness flags (`BsGetUtf32`/`BsSkipUtf32`, and the raw-`BSF_NATIVE`
     float/integer/utf16 reads), oracle-derived.
+  - `elision_tests.rs` → `#[cfg(test)]` the allocation-aware re-read elision: a
+    non-allocating command list elaborates off one capture and advances the context exactly,
+    a 128-bit (bignum) `integer` still commits the full advance, `binary`/`get_tail` keep the
+    always-re-read commit (including `get_tail` targeting the context's own operand), `skip`
+    and `'=:='` elide, and the allocation witness agrees with the term the read built. A
+    `MinimalContext` never relocates, so what is observable here is that the elided route
+    changes nothing a caller can see (the reverse direction is a purity argument, not a test).
   - `rooted.rs` → `#[cfg(test)]` rooted-allocation tests for the match path.
   - `tests.rs` → `#[cfg(test)]` unit tests for the pure decoders the `bs_*` match opcodes
     call (`decode_utf8`/`utf16`/`utf32`, `read_float_field`) plus the instruction-level
@@ -84,11 +126,37 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     results.
 - `create/` → the construction side:
   - `mod.rs` → `exec` (`bs_init_writable`, `bs_create_bin`) and `assemble` (the flat
-    six-operand segment walk). A non-integer value is the bare `badarg` at **every**
+    six-operand segment walk). `assemble` first offers the whole build to
+    [`whole::try_assemble`], which either writes the compiler's whole-byte accumulator shape
+    in one copy or answers `Ok(None)` **having written nothing**, so the walk below runs from
+    a pristine writer unchanged. A non-integer value is the bare `badarg` at **every**
     segment width (checked before the width dispatch, C's `erl_bits.c:952/1152`), and the
     `"integer"` arm routes a value to the shared `push_wide_int` (`mod.rs`, `> 64`-bit
     byte model) whenever `nbits > 64` **or** the value is a bignum, so a bignum is masked
     into a narrow field exactly as C's `fmt_big_be`/`fmt_big_le` do.
+  - `whole.rs` (+ `whole/tests.rs`) → the **whole-byte `integer` accumulator** fast path.
+    Every binary comprehension and every `<<Acc/binary, …>>` loop compiles to the same short
+    (`beam_ssa_codegen`'s two-to-four) group segment list, and `assemble`'s generic walk
+    re-derives on every execution a descriptor that is entirely compile-time constant
+    (type-atom names, unit, flags, the `all` test, the size, `size * unit`, the integer
+    classification) and then writes each field bit by bit.
+    `try_assemble` accepts only that shape: a **pristine** writer, a first group that is
+    `private_append` with size `all`, unit 1 or 8 bits and no flags, and then 1..=8 `integer`
+    groups naming the same type atom, each with unit 1, no flags and a **static** whole-byte
+    size in `8..=64` bits, over an accumulator that resolves to an in-place writable target
+    at a byte-aligned position (2..=9 groups in all). It resolves the plan once, reads every
+    field value into a stack buffer, then writes the whole run with ONE `push_bits_from` +
+    `finish_built()` (the fields are contiguous whole bytes, so their concatenation is
+    byte-identical to writing them one at a time). Every deviation — a rejected shape, a
+    `read_value` decline, a bignum or non-integer field, a non-writable accumulator, a
+    non-byte-aligned position — answers `Ok(None)` before a single bit is written, so the
+    general walk's bits, `fail` branch and typed errors all stand. The one failure the fast
+    path owns is the **non-bitstring accumulator** (the same `heap_bits` read reports the
+    generic walk's bare `badarg`). Its `#[cfg(test)]` thread-local tally `fast_builds` is the
+    only way a test can tell the two routes apart, since their results are identical by
+    construction; the writable-accumulator in-place/grow semantics are untouched. Measured:
+    ~1.33–1.50× slower on `long_append` than the generic walk — recorded as an honest negative
+    in `../CONTEXT.md` § Measured.
   - `segments.rs` → the per-segment-type sources and encoders (`segment_source`,
     `string_source`, `float_source`, `put_float`/`f64_to_f16`, `put_utf8/16/32`). The
     `float` source accepts a float, a small integer **or a bignum** (the nearest finite
@@ -139,7 +207,7 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
 - Files ~1000 lines; split by responsibility. `matching/mod.rs` holds only the family's
   opcode dispatch table plus the per-opcode arms; its unit tests live in
   `matching/tests.rs`, and new test cases go to `matching/tests.rs` /
-  `matching/utf_tests.rs` / `matching/rooted.rs`.
+  `matching/utf_tests.rs` / `matching/elision_tests.rs` / `matching/rooted.rs`.
 
 ## Test Strategy
 Per-module `#[cfg(test)]` unit tests over hand-built operands/direct decoder calls (`raw.rs`,
@@ -151,7 +219,7 @@ Every expected byte vector in the newer suites was taken from the system `erl`
 (OTP 29.1.1 / erts-17.1) — never invented.
 Gate: the whole-crate suite is authoritative —
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --offline
---no-fail-fast` must stay green (currently 1634 passed / 0 failed / 4 ignored across every target).
+--no-fail-fast` must stay green (currently 1738 passed / 0 failed / 7 ignored across its 77 targets).
 This family's subset is `... -p beam_engine --offline --lib families::bitstrings`, and the build
 `... -p beam_engine --all-targets` is warning-free. Re-run these for the live counts.
 **Differential evidence:** the project gate `erts_rust/tools/differential` was run
