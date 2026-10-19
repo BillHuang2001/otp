@@ -129,7 +129,7 @@ printed result on this runtime's side, the fixture's own `~w`-printed return val
 |---|---|---|---|
 | `t1` | `{active,true}` `{mode,binary}`, peer writes `<<"hello">>` then `<<"again">>` | every write becomes a `{tcp, S, Data}` | `t1_first={tcp,'$port',<<104,101,108,108,111>>}`, `t1_socket_is_port=true`, `t1_second={tcp,'$port',<<97,103,97,105,110>>}` |
 | `t2` | `{active,2}` | two deliveries, exactly one `{tcp_passive, S}`, silence, then a re-armed delivery | `t2_one={tcp,'$port',<<111,110,101>>}`, `t2_two={tcp,'$port',<<116,119,111>>}`, `t2_passive={tcp_passive,'$port'}`, `t2_silent=timeout`, `t2_rearmed={tcp,'$port',<<116,104,114,101,101>>}` |
-| `t3` | `{active,once}` | one delivery, silence while the grant is spent, a re-arm, one more delivery | `t3_first={tcp,'$port',<<104,101,108,108,111>>}`, `t3_silent=timeout`, `t3_second={tcp,'$port',<<98,98,98,98>>}`, `t3_silent_again=timeout` |
+| `t3` | `{active,once}` | one delivery, a withheld spent-grant write, the re-arm that hands it over, and the fresh write at the next re-arm (distinct payloads, so the wrong write fails) | `t3_first={tcp,'$port',<<104,101,108,108,111>>}`, `t3_silent=timeout`, `t3_second={tcp,'$port',<<98,98,98,98>>}`, `t3_silent_again=timeout`, `t3_third={tcp,'$port',<<99,99,99,99>>}` |
 | `t4` | `{mode,binary}` vs `{mode,list}`, same `<<"hello">>` | binary vs charlist for one payload | `t4_binary={tcp,'$port',<<104,101,108,108,111>>}`, `t4_list={tcp,'$port',[104,101,108,108,111]}`, `t4_list_is_hello=true` |
 | `t5` | `{packet,2}`, peer writes `<<5:16,"hello">>` | the framing header is stripped before delivery | `t5_stripped={tcp,'$port',<<104,101,108,108,111>>}`, `t5_body_is_hello=true` |
 | `t6` | UDP `{active,true}`, one datagram | `{udp, S, {127,0,0,1}, SourcePort, Data}` with the peer's real bound port | `t6_datagram={udp,'$port',{127,0,0,1},'$source',<<104,105>>}`, `t6_source_is_peer=true`, `t6_source_is_real=true`, `t6_address={127,0,0,1}` |
@@ -140,13 +140,14 @@ effective default for a `[binary]` port is a *list* — measured, which is why `
 `[binary]` alone is not enough), and `{active, …}` is the one option block an accepted socket does
 **not** inherit (the C copies everything else), so `t7` re-arms the accepted port itself.
 
-### The one measured difference the fixture avoids on purpose
-This runtime harvests a passive window's bytes out of the socket when it emits `{tcp_passive, S}`
-and never delivers them, while the oracle keeps them queued and hands them over after the next
-re-arm (a peer write made while the grant is spent shows up as `<<"threethree">>` there and
-`<<"three">>` here — the note recorded in `src/port/active_input_e2e_tests.rs`). `t2` therefore
-writes **nothing** during its passive window and `t3` never reads back its spent-grant write, so
-every line agrees; making the window byte-faithful is the port provider's work, not the fixture's.
+### A spent grant keeps the peer's bytes in the socket
+A write that arrives while an `{active,once}` / `{active,N}` grant is spent is delivered to nobody:
+the read interest is disarmed, so the bytes stay in the kernel until a re-arm's inline read hands
+them over, and that delivery spends the re-arm's own grant. `t3` pins the whole sequence with
+distinct payloads (`t3_second` is the withheld `<<"bbbb">>`, never the fresh `<<"cccc">>` written
+after the re-arm, which only `t3_third` delivers). `t2` writes nothing during its passive window and
+re-arms `{active,true}`, because the counter's own `{tcp_passive, S}` is what that case pins
+(`src/port/active_input_e2e_tests.rs` pins the counter's withheld-write shape).
 
 ### Skip-loudly rule
 Each test skips **loudly** (`beam_rt inet_active SKIPPED` plus a return, never a silent pass) when
