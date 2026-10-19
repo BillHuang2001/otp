@@ -2,9 +2,11 @@
 
 ## Intent
 Source root of `beam_io` (the I/O subsystem of the Rust ERTS rewrite) plus the three sub-nodes that
-carry the bulk of the code. The **authoritative** description of this crate — intent, the frozen API
-surface per module, constraints, test strategy and design decisions — lives in the parent
-`../CONTEXT.md`; read it before changing anything here. This file only routes and records gotchas.
+carry the bulk of the code. The parent `../CONTEXT.md` carries the crate's frozen API surface,
+constraints, design decisions and cross-crate handoffs — read it first. This file adds the
+**port-level channel mechanism** (line framing, the write path and the busy decision, the completion
+and `{active,…}` channels), the per-module in-module test counts and the oracle-pinned shape tables,
+and the durable gotchas; the parent routes here for that detail.
 
 ## API Surface
 Module wiring + root re-exports + `prelude`: `src/lib.rs`. Every module below is re-exported at the
@@ -78,7 +80,8 @@ reported as **one `PortNotification::Data` per completed read message**, drained
 double report on a later round; a port in `{line, N}` mode reports through the separate
 `LineNotification` channel instead).
 `DriverContext::deliver_read(header, body)` is the same path for a **split** read (the C's
-`driver_output2`/`driver_output_binary`/`driver_outputv`): one `ReadMessage { header, body }`, the
+`driver_output2`/`driver_output_binary`/`driver_outputv`, whose `(hbuf, hlen, buf, len)` argument
+group is what the split preserves): one `ReadMessage { header, body }`, the
 header kept apart from the body because a `[binary]` port renders `[H1,…,Hn | <<Body>>]` while a
 `[list]` port flattens both into ints. `body: None` is the C's `buf == NULL` (no binary tail at
 all), `Some(vec![])` a present empty body (`<<>>` tail). A `Data` payload is therefore legitimately
@@ -206,6 +209,15 @@ drain — `PortNotification` keeps its two variants and `CompletionEvent` gains 
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
 integration-test node, and the crate-level policy (real fds, loud skips, oracle cross-checks) is in
 `../CONTEXT.md`.
+**Per-module in-module counts (`-p beam_io --lib` = 959):** `drivers` **639** — of which `inet`
+**527** (per-suite breakdown in `drivers/inet/CONTEXT.md`), `line_buffer` 24, `spawn` 23, `ram_file`
+29 (`ram_file_tests` 23 + `ram_file_split_tests` 6), `fd` 14, `efile` 13, `binary_io` 9 — then
+`registry` 51 (36 + the 4 in `registry_reply_tests.rs` + the 4 in `registry_busy_tests.rs` + the 7 in
+`registry_downcast_tests.rs`), `io_device` 41, `abi` 41 (`host` 23 = 18 + the 5 in
+`host_output_tests.rs`, `port` 8, `table` 7, `job` 3), `port` 36 (12 + the 12 in
+`active_input_tests.rs` + the 8 in `port_command_tests.rs` + the 4 in `port_control_reply_tests.rs`),
+`port_task` 22, `signal` 20, `poller` 17, `driver` 13, `timer` 12, `ddll` 11, `completion` 11,
+`fs_access` 10, `queue` 8, `error` 8, `port_failure` 7, `cpu_time` 6, `close_fd` 6.
 - `fs_access.rs` (10 tests) covers the mode→`<unistd.h>`-constant table, the refusal-vs-error split,
   the interior-NUL `badarg` and real fixtures under `$TMPDIR`: a `0644` file, a `0755` directory, a
   missing path, an executable file, a file with no execute bit, and a mode-`000` file. One test
@@ -302,7 +314,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`is_busy`/`port_closed` (both defaulting `false`; the first is the `set_busy_port` state `Port::command` decides on, the second a latched peer/OS close)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async`/`take_exit_status`/`take_eof`), `DriverContext` (incl. the four sinks: `with_reads` + `deliver_read(header, body)`, `with_completions` + `deliver_completion(event)`, `with_active` + `deliver_active_input(event)`, `with_failure` + `signal_failure(failure)` — the first three stamp `ctx.port()` itself, and each answers a typed `unsupported` with no sink), `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors
 - `signal.rs` → `Signal`/`Disposition`/`SignalFacility`; `cpu_time.rs` → `CpuTimes`/`RuntimeClock`; `ddll.rs` → `DynLib`/`DllError`
-- `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site), `access` (`Result<bool>`, refusal ⇒ `false`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>`)
+- `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site, `EINTR` retried, an interior-NUL path ⇒ `BadArg`), `access` (`Result<bool>`, refusal ⇒ `false`, only a genuine syscall failure is `BeamError::Io`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>` — the **effective** ids `check_access` compares a `stat` against)
 - `drivers/` → the built-in drivers (`fd`, `efile`, `spawn`, `tcp_inet`, `udp_inet`, `ram_file_drv`) + framing, incl. `line_buffer.rs`'s `LineFrame`/`LineBuffer` (the port-level `{eol | noeol, Data}` splitter) — child node `drivers/CONTEXT.md`
 - `abi/` → the driver C-ABI host layer — child node `abi/CONTEXT.md`
 - `io_device/` → the `{get_until,…}` io-device request layer — child node `io_device/` (files listed in `../CONTEXT.md`)
