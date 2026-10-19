@@ -25,7 +25,11 @@
 //! resolves the **external** (`EXPORT_EXT`, `fun M:F/A`) kind of fun to the callee module's
 //! export label, so the engine's `call_fun` seam can enter *either* kind in-machine.
 //! [`RuntimeContext::apply_non_local_fun`] is the value-returning fallback for the fun kinds
-//! that have no in-machine entry. The predicates ([`callee_observes_its_call_site`] and its
+//! that have no in-machine entry — including a **local** closure whose descriptor names a
+//! function this host *serves* as a local-call key ([`served_local_key`]), which is how OTP's
+//! own wrapper modules reach their NIF stubs when they hold one in a record
+//! (`erts/preloaded/src/zlib.erl`'s `#zlib_opts{method = fun deflate_nif/4}`). The predicates
+//! ([`callee_observes_its_call_site`] and its
 //! helpers) decide whether the engine's cross-module call seam may enter a callee **in-machine**
 //! or must keep it on the synchronous call route — and the external-fun resolver delegates to
 //! that seam so both routes share one verdict.
@@ -34,8 +38,7 @@ use std::sync::Arc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext};
-use beam_loader::{Atom, Function, ImportRef, Instr, Label, Module};
-use beam_term::Eterm;
+use beam_loader::{Atom, Function, FunDescriptor, ImportRef, Instr, Label, Module};use beam_term::Eterm;
 
 use super::bridges::descriptor_of;
 use super::runtime_context::RuntimeContext;
@@ -72,7 +75,7 @@ impl RuntimeContext<'_> {
     /// Resolves `fun` to the [`LocalFunTarget`] of a `.beam` **local** closure; `Ok(None)`
     /// when it has no local label to enter.
     ///
-    /// `Ok(None)` covers the two fun kinds that are *not* a compiled local closure:
+    /// `Ok(None)` covers the fun kinds that are *not* a compiled local closure body:
     ///
     /// * an **external** fun (`fun M:F/A`, the `EXPORT_EXT` encoding) — not a closure at
     ///   all, it carries no `uniq`/`index` descriptor; it is resolved by
@@ -81,11 +84,23 @@ impl RuntimeContext<'_> {
     ///   [`RuntimeContext::call_bif`];
     /// * the `-eval` evaluator's own closure (`uniq ==` [`crate::eval::EVAL_FUN_UNIQ`]),
     ///   whose body only the evaluator can run
-    ///   ([`crate::eval::apply_eval_closure`]).
+    ///   ([`crate::eval::apply_eval_closure`]);
+    /// * a **named local reference** (`fun deflate_nif/4`) whose descriptor names a **served
+    ///   local-call key** ([`served_local_key`]) — the stub functions OTP's wrapper modules
+    ///   hold in a record and invoke indirectly (`erts/preloaded/src/zlib.erl:414-425`'s
+    ///   `#zlib_opts{method = fun deflate_nif/4}`, applied as `Method(Z, …)` from
+    ///   `dequeue_next_chunk/2`). Entering such a body runs its `erlang:nif_error(undef)`
+    ///   stub, so the host dispatches it instead
+    ///   ([`RuntimeContext::apply_non_local_fun`]).
     ///
-    /// Both are what [`RuntimeContext::apply_fun`] falls back to, so a caller that wants the
-    /// blocking-aware local path (the runner's fun-entry arm) can keep the synchronous one
+    /// All three are what [`RuntimeContext::apply_fun`] falls back to, so a caller that wants
+    /// the blocking-aware local path (the runner's fun-entry arm) can keep the synchronous one
     /// for them.
+    ///
+    /// The served-key test costs the declining path two `O(1)` atom-table reads and one
+    /// module-name comparison — no allocation, no registry or hash lookup — which is
+    /// negligible beside the `FunT` search that resolved the descriptor (and beside the `Vec`
+    /// this method already builds for the closure's combined arguments).
     ///
     /// # Errors
     ///
@@ -119,16 +134,17 @@ impl RuntimeContext<'_> {
         // `{x,0}` and its free variable `N` from `{x,1}`.
         let mut combined = args.to_vec();
         combined.extend_from_slice(terms::fun_free(fun)?);
-        let found = self
-            .runtime
-            .code_server
-            .modules()
-            .find(|module| descriptor_of(module, uniq, index).is_some())
-            .map(Arc::clone)
+        let (found, descriptor) = self
+            .local_fun_descriptor(uniq, index)
             .ok_or(BeamError::BadArg)?;
-        let descriptor = descriptor_of(&found, uniq, index).ok_or(BeamError::BadArg)?;
         if combined.len() != descriptor.arity as usize {
             return Err(BeamError::BadArity);
+        }
+        // A named local reference to a **served** stub has no body to enter: decline it, so
+        // `apply_fun` dispatches it to the host instead of running the stub's
+        // `erlang:nif_error(undef)` (see the doc comment above).
+        if served_local_key(&found, &descriptor).is_some() {
+            return Ok(None);
         }
         Ok(Some(LocalFunTarget {
             module: found,
@@ -138,7 +154,20 @@ impl RuntimeContext<'_> {
         }))
     }
 
-    /// Applies a fun that has **no local label entry** — the two kinds
+    /// The defining module (the code server's own `Arc<Module>`, which the engine dedups
+    /// module contexts by) and the `FunT` descriptor of the **local** (`make_fun3`) closure
+    /// identified by `(uniq, index)`.
+    ///
+    /// The lookup is a search over the code server's **loaded** module set: a closure's term
+    /// carries only its per-module `uniq` and its module-level lambda `index`, so the defining
+    /// module is the one whose `FunT` table carries the entry. `None` when no loaded module
+    /// does.
+    fn local_fun_descriptor(&self, uniq: u64, index: u32) -> Option<(Arc<Module>, FunDescriptor)> {
+        self.runtime.code_server.modules().find_map(|module| {
+            descriptor_of(module, uniq, index).map(|entry| (Arc::clone(module), entry))
+        })
+    }
+    /// Applies a fun that has **no local label entry** — the fun kinds
     /// [`RuntimeContext::local_fun_target`] reports `Ok(None)` for.
     ///
     /// * An **external** fun (`fun m:f/A`, the `EXPORT_EXT` encoding) is not a closure at
@@ -148,6 +177,15 @@ impl RuntimeContext<'_> {
     ///   same dispatch every other call uses — the native floor, the registry, or a
     ///   load-on-demand module export. That is what makes `term_to_binary(fun
     ///   lists:reverse/1)` and `(fun lists:reverse/1)([1,2,3])` both work.
+    /// * A **local** (`make_fun3`) closure whose descriptor names a **served local-call key**
+    ///   ([`served_local_key`]) is a *named local reference* to a NIF stub — OTP's wrapper
+    ///   modules keep one in a record and call it indirectly (`erts/preloaded/src/zlib.erl`
+    ///   stores `fun deflate_nif/4` in `#zlib_opts{}` and `dequeue_next_chunk/2` applies it).
+    ///   Its body is `erlang:nif_error(undef)`, so entering it raises `undef`; the function is
+    ///   served here instead, through the same [`RuntimeContext::call_bif`] an exported stub
+    ///   reaches. A named local fun captures nothing, so the callee's arguments are exactly
+    ///   the call `args` — a mismatch with the descriptor's arity is
+    ///   [`BeamError::BadArity`], never an entry with a wrong frame.
     /// * The `-eval` evaluator's own closure is applied through the evaluator's store
     ///   (`Runtime::eval_closures`): it may escape into a loaded module
     ///   (`lists:map(fun(X) -> X*X end, …)`) which calls back into it, and only the
@@ -169,10 +207,27 @@ impl RuntimeContext<'_> {
             let (module, function, arity) = self.external_fun_name(fun)?;
             return self.call_bif(&module, &function, arity, args);
         }
-        let index = terms::fun_index(fun)? as usize;
-        crate::eval::apply_eval_closure(self, fun, index, args)
+        let uniq = terms::fun_uniq(fun)?;
+        let index = terms::fun_index(fun)?;
+        if uniq != crate::eval::EVAL_FUN_UNIQ {
+            if let Some((module, descriptor)) = self.local_fun_descriptor(uniq, index) {
+                // The two names come from the defining module's **own** atom table (a load-time
+                // clone of the runtime's shared, append-only one) and the descriptor's `function`
+                // atom was interned into that same table, so the module-local lookup is
+                // authoritative here — unlike [`RuntimeContext::external_fun_name`], whose fun
+                // term may name an atom interned after the callee was loaded. Both borrow the
+                // `Arc<Module>`, never `self`, so they stay valid across the `&mut self`
+                // dispatch below.
+                if let Some((module_name, function)) = served_local_key(&module, &descriptor) {
+                    if args.len() as u32 != descriptor.arity {
+                        return Err(BeamError::BadArity);
+                    }
+                    return self.call_bif(module_name, function, descriptor.arity, args);
+                }
+            }
+        }
+        crate::eval::apply_eval_closure(self, fun, index as usize, args)
     }
-
     /// The `(module, function, arity)` identity of an **external** fun (`fun M:F/A`, the
     /// `EXPORT_EXT` encoding), as names.
     ///
@@ -240,6 +295,38 @@ impl RuntimeContext<'_> {
     }
 }
 
+/// The `(module, function)` **names** of a resolved **local** closure when its descriptor
+/// names a local-call key this host **serves** ([`beam_bifs::serves_local_call`]); `None` for
+/// every other function — the answer on the hot path, which must stay free of allocation and
+/// of registry/hash lookups.
+///
+/// This is the fun-in-record indirection OTP's wrapper modules use to reach their own NIF
+/// stubs: `erts/preloaded/src/zlib.erl:414-425` builds
+/// `#zlib_opts{method = fun deflate_nif/4, …}` and `dequeue_next_chunk/2` applies
+/// `Method(Z, IChSz, OChSz, Flush)`. The compiler lowers `fun deflate_nif/4` to a **named
+/// local** fun ([`beam_codec::FunKind::Local`]) whose [`FunDescriptor`] `function` atom is the
+/// **compiled** function's name and whose [`FunDescriptor::num_free`] is `0` — it captures
+/// nothing, so the applied arguments *are* the callee's arguments. A lambda body (an
+/// anonymous `fun … end`) is never such a reference, and a capturing one would not be either,
+/// so `num_free != 0` answers `None` before any name is touched.
+///
+/// The names come from `module`'s own atom table, which is authoritative for a descriptor the
+/// module itself carries (both atoms were interned at load time), and the predicate itself
+/// begins with a **module-name equality** check, so the whole test is two `O(1)` table reads
+/// and one `&str` comparison — the same shape as the local-call seam
+/// (`ExecutionContext::resolve_local_call`).
+fn served_local_key<'m>(
+    module: &'m Module,
+    descriptor: &FunDescriptor,
+) -> Option<(&'m str, &'m str)> {
+    if descriptor.num_free != 0 {
+        return None;
+    }
+    let module_name = module.atom_name(module.name)?;
+    let function = module.atom_name(descriptor.function)?;
+    beam_bifs::serves_local_call(module_name, function, descriptor.arity as usize)
+        .then_some((module_name, function))
+}
 /// The call-site-reading imports a module's `ImpT` declares, classified by the **scope** of
 /// the refusal each one forces — computed in **one** pass over [`Module::imports`].
 ///

@@ -445,7 +445,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// it suspends the *process* and the scheduler resumes it when the child's message arrives.
     ///
     /// `Ok(None)` — the seam's "I cannot run this fun in your machine" — is passed through for
-    /// every fun kind that has no in-machine entry: the `-eval` evaluator's own closure, and any
+    /// every fun kind that has no in-machine entry: the `-eval` evaluator's own closure, a
+    /// **named local reference to a served stub** ([`LocalFunTarget`]'s third declining kind —
+    /// `zlib.erl`'s record-held `fun deflate_nif/4`, which
+    /// [`RuntimeContext::apply_non_local_fun`] dispatches through `call_bif` instead of running
+    /// its `erlang:nif_error(undef)` body), and any
     /// external fun the resolver refuses (a floor/registry/NIF name, a call-site-observing
     /// callee, a non-exported name). They keep the value-returning [`Self::apply_fun`] fallback,
     /// byte-identical to a host without the seam.
