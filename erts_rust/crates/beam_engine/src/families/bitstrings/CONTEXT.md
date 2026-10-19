@@ -278,11 +278,34 @@ Structural counters (deterministic; the primary evidence):
 | `long_append:expand` | 2 | 13 | 98 318 |
 | `bench_list_walk:walk` | 1000 | 2000 | 169 418 |
 
-`to_lower`/`capitalize_token` paid **32 / 163** and **63 / 318** rooted calls/words before the
-match-context reuse landed; the accumulator loop now reserves nothing at all beyond the single
-`bs_init_writable` pair, and `encode`/`decode` reserve only their genuine result binaries (plus the
-`iolist_to_binary` calls in `encode`). Wall clock (default tier, 19 alternating paired rounds, load
-band 1.23–2.12): `to_lower` 3 410.4 / 3 447.3 ns min/median at 7.87 ns per instruction,
+`decode`'s 32 calls / 133 words decompose **call-count-exactly**: `1 × 8` words (the `bs_init_writable`
+`[BinRef][ErlSubBits]` pair) + `1 × 5` (the outer accumulator's first `bs_start_match3`) + `15 × 3`
+(one `<<DecodeChar>>` 8-bit `ErlHeapBits` per iteration) + `15 × 5` (a fresh match context over that
+freshly-built field binary, where C's reuse arm cannot apply because the operand is not itself a
+context).
+Every element matches C's `bs_instrs.tab:571-586` (`<<Char>>` build) and `erl_bits.c:81-105`
+(`erts_bs_start_match_3`, `HeapOnlyAlloc` only when `!reuse`).
+The accumulator loop therefore reserves nothing beyond its own result binaries, and `encode`/`decode`
+add only their genuine results (`encode` additionally pays the `iolist_to_binary` calls of its BIF floor).
+
+**Oracle word parity — the standing parity claim.** Reclaimed words per call from
+`erlang:statistics(garbage_collection)` on the real system ERTS (OTP 29.1.1 / erts-17.1),
+`{min_heap_size, 233}`, N = 200 000, in a dedicated process, on the same inputs the harness uses
+(`<<"The Quick Brown Fox 0123456789">>`, `<<"the-quick-brown-fox-0123456789">>`, `<<1..12>>`,
+`<<"ABCDEFGHIJKLMNO">>`):
+
+| workload | ERTS words/call | ours | verdict |
+|---|---|---|---|
+| `cowboy_bstr:to_lower/1` | 13.00 | 13 | exact |
+| `cowboy_bstr:capitalize_token/1` | 13.00 | 13 | exact |
+| `emqx_base62:decode/1` | 133.00 | 133 | exact |
+| `emqx_base62:encode/1` | 57.00 | 45 | ours lower (the oracle's extra words are `iolist_to_binary/1` inside the harness BIF floor) |
+
+The three binary-comprehension workloads allocate **word-for-word what C allocates**, so **no
+avoidable allocation remains on these paths** — corroborated by a `perf` profile of `to_lower` in
+which no allocator symbol reaches the 1.2 % reporting floor.
+
+Wall clock (default tier, 19 alternating paired rounds, load band 1.23–2.12): `to_lower` 3 410.4 / 3 447.3 ns min/median at 7.87 ns per instruction,
 `capitalize_token` 4 376.7 / 4 404.2 at 6.67, `decode` 4 581.0 / 4 634.8 at 8.73, `encode`
 2 648.6 / 2 656.8 at 10.89, `list_walk` 373 065 / 374 416 at 2.21.
 Paired `post/pre` medians for the changes that landed (each its own ≥7-round alternating run):
@@ -292,9 +315,14 @@ match-context reuse + `bs_get_position` small integer `to_lower` 0.958 / `capita
 `to_lower` 0.982 / `capitalize_token` 0.982 / `decode` 0.990 / `encode` 0.990.
 `list_walk` measures 0.995–1.005 median against every one of them (it executes no bitstring
 instruction), so the estimator carries no cross-workload bias.
-Function-level self time on the post-change tree (`to_lower`): `step_instruction_body` 14.5 %,
-`step_instruction_with_entry` 7.3 %, `run_commands` 5.5 %, `create::assemble` 5.5 %,
-`Machine::drive` 4.8 %, `matching::exec` 3.5 %, `families::dispatch` 3.2 %, `jit_bitstr` 3.0 %.
+Function-level self time on the current tree (`to_lower`, release, `perf record --call-graph dwarf`,
+`perf report --no-children`, ≥1.2 % self): `step_instruction_body` 13.37 %,
+`step_instruction_with_entry` 7.54 %, `run_commands` **6.35 %**, `create::assemble` **4.98 %**,
+`Machine::drive` 4.61 %, `interpreter::build_label_map` 3.16 %, `families::dispatch` 3.01 %,
+`beam_term::compare::cmp_impl` 2.92 %, `jit::baseline::bitstr::jit_bitstr` 2.76 %, `Machine::reset`
+2.67 %, `terms::number::make_integer_unrooted` 2.61 %, `matching::exec_other` 2.35 %,
+`jit::baseline::runtime::enter_in_block` 2.35 %, `matching::match_ctx::read_ctx` 2.13 %, `read_size`
+1.75 %, `decode_flags` 1.37 %, `exec_census::on_instruction` 1.24 % (while **disabled**).
 Every remaining item is either outside this node (see `## Out-of-node findings`) or the
 `bs_match` interpretation C removes at load time.
 **Measured negative, do not re-attempt:** recognising the six emitted `bs_match` command shapes as
@@ -348,7 +376,21 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   this node is currently unreachable from `src/jit/**` — a tier that wants a per-command entry
   (`matching::exec`, `matching::commands::run_commands`, `create::assemble`) needs
   `pub(crate) mod families` (or targeted root re-exports) first.
-- **`src/exec_census.rs`** measured 2.20 % of `to_lower`'s self time while **disabled** — the
+- **`src/interpreter/dispatch.rs:353-362` — `Instr::SelectVal` materializes every pair operand.** It
+  calls `read_operand` per pair (`Operand::Integer`/`Operand::Character` →
+  `terms::number::make_integer_unrooted`, `src/operand.rs:69,75`) and then a full `beam_term::cmp` per
+  pair, so a character-table `select_val` (what a per-character case/`select_val` compiles to) pays an
+  O(pairs) term-materialization + atom-namespace comparison per execution; the small-integer scrutinee
+  could be compared against a small/literal candidate directly.
+  Parent-owned; the measured contributor to this profile's `make_integer_unrooted` 2.61 % and
+  `cmp_impl` 2.92 %.
+- **`terms::number::make_integer_unrooted` at 2.61 % is CALL overhead, not allocation** — its
+  small-value arm is `make_small` (no allocation), but the function is not inlined at its
+  `src/operand.rs` call sites. **OWNER: the parent `src/` node.**
+- **`Machine::reset` 2.67 % + `interpreter::build_label_map` 3.16 %** are per-run entry costs in the
+  parent's `run_label_outcome`/`reset` path, material at this harness' batch granularity.
+  **OWNER: the parent `src/` node.**
+- **`src/exec_census.rs`** is 1.24 % of `to_lower`'s self time while **disabled** — the
   thread-local `bool` load sits on the per-instruction funnel; the instrument has no call site in
   this node.
 - **`tools/differential` corpus coverage hole** (see Test Strategy).

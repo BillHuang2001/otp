@@ -174,8 +174,25 @@ between sessions and up to 5× on a loaded one).
   `rooted_words_per_call`: `to_lower` **2 / 13**, `capitalize_token` **2 / 13**, `encode` 18 / 45,
   `decode` 32 / 133, `list_walk` 1000 / 2000; `driver_round_trips_per_call` 3 (`to_lower`),
   `in_block_calls_per_call` 30 with 0 declines, `refc_payloads_per_call` 1. Both comprehension workloads
-  reserved **32 / 163** and **63 / 318** before the match-context reuse landed, and now reserve nothing
-  beyond the single `bs_init_writable` pair.
+  now allocate exactly what C allocates — `to_lower`/`capitalize_token` **13 words/call** — and `decode`
+  133, `encode` 45 (below the oracle's 57): nothing beyond the single `bs_init_writable` pair plus each
+  iteration's own field binary and match context.
+- **Oracle word parity — the strongest evidence in this section.** Reclaimed words per call from
+  `erlang:statistics(garbage_collection)` on the real system ERTS (OTP 29.1.1 / erts-17.1),
+  `{min_heap_size, 233}`, N = 200 000, in a dedicated process, on the harness' own inputs
+  (`<<"The Quick Brown Fox 0123456789">>`, `<<"the-quick-brown-fox-0123456789">>`, `<<1..12>>`,
+  `<<"ABCDEFGHIJKLMNO">>`):
+
+  | workload | ERTS words/call | ours | verdict |
+  |---|---|---|---|
+  | `cowboy_bstr:to_lower/1` | 13.00 | 13 | exact |
+  | `cowboy_bstr:capitalize_token/1` | 13.00 | 13 | exact |
+  | `emqx_base62:decode/1` | 133.00 | 133 | exact |
+  | `emqx_base62:encode/1` | 57.00 | 45 | ours lower (the oracle's extra words are `iolist_to_binary/1` inside the harness BIF floor) |
+
+  The three binary-comprehension workloads allocate **word-for-word what C allocates**, so no
+  avoidable allocation remains on these paths. Per-call decomposition and the allocator's absence
+  from the `perf` profile: `bitstrings/CONTEXT.md` → `## Measured`.
 - Paired `post/pre` medians for the changes that landed, each its own ≥7-round alternating run:
   match-context reuse + `bs_get_position` small integer `to_lower` 0.958 / `capitalize_token` 0.908
   (interpreter tier 0.963 / 0.963); `bs_create_bin` cold-body outlining `to_lower` 0.995 /
@@ -237,8 +254,16 @@ between sessions and up to 5× on a loaded one).
   (the match/dispatch/segment seams listed in `bitstrings/CONTEXT.md`) is unreachable from `src/jit/**`; a tier
   that wants a per-command entry needs `pub(crate) mod families` or targeted root re-exports. **OWNER: the
   parent `src/` node.**
-- **`src/exec_census.rs` measured 2.20 % of `to_lower`'s self time while disabled** — the thread-local `bool`
+- **`src/exec_census.rs` is 1.24 % of `to_lower`'s self time while disabled** — the thread-local `bool`
   load sits on the per-instruction funnel. **OWNER: the parent `src/` node.**
+- **`Instr::SelectVal` materializes every pair operand** (`src/interpreter/dispatch.rs:353-362`): a `read_operand`
+  per pair (`Operand::Integer`/`Operand::Character` → `terms::number::make_integer_unrooted`) followed by a full
+  `beam_term::cmp` per pair, so a character-table `select_val` (what a per-character case/`select_val` compiles to)
+  pays an O(pairs) term-materialization + atom-namespace comparison per execution, although the small-integer
+  scrutinee could be compared against a small/literal candidate directly. **OWNER: the parent `src/` node** — the
+  one interpreter hot spot in the `to_lower` function-level profile (`bitstrings/CONTEXT.md` → `## Measured`) that
+  no change in this node can reach; 2.61 % of that profile is `make_integer_unrooted` call overhead and 2.92 %
+  `cmp_impl`.
 
 ## Notes for Agents
 - The router (`mod.rs:112`) and `lists::exec` are `#[inline]`, so a dispatched instruction hands straight to its owning family.
