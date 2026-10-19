@@ -1635,6 +1635,9 @@ fn cross_function_entry(
     if compiled.is_null() {
         return None;
     }
+    // Structural counter: one per cross-function transfer that has to ask the artifact.
+    #[cfg(test)]
+    super::counters::record_cross_function_resolution();
     // SAFETY: `runtime.compiled` is the artifact the driver published for the module it is
     // running and holds alive for the whole loop (the caller-owned one in context `0`, a
     // callee's `Rc` in `DriverContext::callees`); no `&mut` to it exists while a block of it

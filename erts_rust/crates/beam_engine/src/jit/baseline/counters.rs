@@ -161,6 +161,21 @@ pub(crate) struct Counters {
     /// [`ResolvedFunction`](super::ResolvedFunction) skips whenever it stays inside one
     /// function. Counted only on the lazy layout: an eager artifact resolves nothing.
     pub(crate) lazy_function_resolutions: u64,
+    /// **Cross-function** in-block transfers that reached the artifact — the shape
+    /// [`super::runtime::cross_function_entry`] pays a
+    /// [`CompiledModule::native_entry_tables`](super::code::CompiledModule::native_entry_tables)
+    /// for: a call into another function of the module (whose blocks are another
+    /// executable mapping of the same lazy artifact) and the return the callee does back
+    /// into the caller. Every one of them resolves a function the published
+    /// [`EntryTables`](super::runtime::EntryTables) does not describe.
+    pub(crate) cross_function_resolutions: u64,
+    /// Of those, how many the per-run
+    /// [`CrossEntry`](super::runtime::CrossEntry) memo answered **without** touching the
+    /// artifact (no `RefCell` probe, no `Rc` clone, no per-function table build). This
+    /// is the count the memo removes from
+    /// [`cross_function_resolutions`](Counters::cross_function_resolutions); the two are
+    /// disjoint (a transfer records exactly one of them).
+    pub(crate) cross_function_memo_hits: u64,
     /// Block-ABI words the driver had to decode (a block ran and returned).
     pub(crate) driver_round_trips: u64,    /// Driver iterations with no native entry: one interpreter step each.
     pub(crate) driver_interp_steps: u64,
@@ -374,6 +389,18 @@ pub(crate) fn record_ext_declined() {
 /// A `jit_ext_call` that fell back to the full interpreter step.
 pub(crate) fn record_ext_fallback() {
     with(|c| c.ext_call_fallback += 1);
+}
+
+/// A **cross-function** in-block transfer that had to resolve its target function
+/// through the artifact ([`super::runtime::cross_function_entry`]'s memo miss).
+pub(crate) fn record_cross_function_resolution() {
+    with(|c| c.cross_function_resolutions += 1);
+}
+
+/// A cross-function in-block transfer answered from the per-run
+/// [`CrossEntry`](super::runtime::CrossEntry) memo.
+pub(crate) fn record_cross_function_memo_hit() {
+    with(|c| c.cross_function_memo_hits += 1);
 }
 
 /// An `enter_compiled_cached` lookup; `hit` is whether a compiled entry was found.
