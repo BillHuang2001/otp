@@ -135,13 +135,21 @@ The instrument's own ranked view is `jit/baseline/census.rs`'s runtime **executi
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors, all under `src/machine/`: `Machine::with_roots` (the `RootSet` carrier and the only hand-off body, `machine/mod.rs`), `Machine::alloc_rooted` (→ `ExecutionContext::alloc_words_rooted`, `machine/mod.rs`) and `Machine::ensure_heap` (→ `ExecutionContext::ensure_heap_full`, `machine/frames.rs`).
-`with_roots` hands over the **whole** three files — `&mut self.x` (all `max_register` slots),
-`&mut self.stack` (every Y slot) and `&mut self.fr` (all `MAX_FLOAT_REGISTER`) — plus `live`, which is
-**only a hint** (`RootSet::live_len()` clamps it, `src/context.rs`): a host that scans just
-`x[..live_len()]` leaves any word above `live` unrelocated, so the hint's provenance is a contract:
-the two **heap** doors pass the instruction's own `Live` operand verbatim (`interpreter/dispatch.rs`'s
-`Instr::TestHeap`/`Instr::AllocateHeap` arms ← `beam_loader`'s operand), while **every** `alloc_rooted`
-caller passes `RootSet::ALL_LIVE`. The engine computes no liveness of its own.
+`with_roots` hands over exactly what the run has **used**: `&mut self.x[..used_x_extent]`, the whole
+`&mut self.stack` (every Y slot) and `&mut self.fr[..used_fr_extent]`, where the used extent is
+`max(x_mark, x_dirty)` / `max(fr_mark, fr_dirty)` clamped to the file — `machine::registers::used_extent`,
+the **single rule** the hand-off and `Machine::reset`'s refill share. `x_dirty`/`fr_dirty` name the extent
+from `x_mut`/`fr_mut` (whole file), from `with_roots` (the root prefix it hands over) and from the native
+driver (`CompiledModule::native_write_extent`, noted **before** the block runs). Every slot at or beyond the
+extent is `NIL` by the refill invariant, so it is not a root; a host therefore relocates and writes a moved
+term back **only inside the slices it receives** (it physically cannot write outside them), and that
+hand-off — not a host promise — is what bounds the next reset to the words the run actually used.
+`live` is still **only a hint** (`RootSet::live_len()` clamps it to the handed slice, `src/context.rs`): a
+host that scans just `x[..live_len()]` leaves any word above `live` unrelocated, so the hint's provenance
+is a contract: the two **heap** doors pass the instruction's own `Live` operand verbatim
+(`interpreter/dispatch.rs`'s `Instr::TestHeap`/`Instr::AllocateHeap` arms ← `beam_loader`'s operand), while
+**every** `alloc_rooted` caller passes `RootSet::ALL_LIVE` — the hint is unchanged by the narrower
+hand-off. The engine computes no liveness of its own.
 Their call sites, exactly: `alloc_words_rooted` has **one** production caller — `terms::reserve`
 (`src/terms/slack.rs`, hence `reserve_slack` and every `*_rooted` builder; `terms::test_support` is
 `#[cfg(test)]`), reached **per built term** (each `put_list`/`put_tuple2`/`make_fun3`/

@@ -41,8 +41,8 @@
 //! **construction**, however, goes through [`alloc_words`], which has neither an
 //! admission point nor root access — so a host whose heap must be collected cannot
 //! collect while the engine builds a term. [`alloc_words_rooted`] closes that gap:
-//! it is the rooted twin of [`alloc_words`], taking a [`RootSet`] (the X
-//! registers, the whole Erlang stack and the whole FR file) and defaulting to
+//! it is the rooted twin of [`alloc_words`], taking a [`RootSet`] (the live
+//! X-register prefix, the whole Erlang stack and the live FR prefix) and defaulting to
 //! [`alloc_words`] with the roots discarded, so **every existing implementor
 //! compiles and behaves byte-identically**. [`crate::machine::Machine::alloc_rooted`]
 //! is where the engine's own slices are handed over.
@@ -179,29 +179,39 @@ pub trait Mailbox {
 /// The engine's **mutable root set** — the terms a collection must keep alive and
 /// may relocate **in place**.
 ///
-/// This is the hand-off [`ExecutionContext::alloc_words_rooted`] receives: an
-/// allocation that may run the collector is handed the live roots *by mutable
-/// slice*, and the context writes each moved term back through those slices, so a
-/// collector can compact/move a term without the engine keeping any frame liveness
-/// map (the same contract [`ExecutionContext::ensure_heap`] documents).
+/// This is what [`ExecutionContext::alloc_words_rooted`] receives: the live roots *by
+/// mutable slice*, with each moved term written back through them, so a collector can
+/// move a term without the engine keeping any frame liveness map (the same contract
+/// [`ExecutionContext::ensure_heap`] documents).
 ///
 /// # The root-set contract (frozen)
 ///
 /// The live roots of a running [`Machine`](crate::machine::Machine) are exactly:
 ///
-/// * `x[0..live)` — the leading `live` X registers of [`RootSet::x`]; the trailing
+/// * `x[0..live_len()]` — the leading X registers of [`RootSet::x`]; the trailing
 ///   registers are dead for the instruction in flight;
 /// * **the whole** [`RootSet::stack`] (every Y slot of every live frame — there are
 ///   no frame liveness maps);
-/// * **the whole** [`RootSet::fr`] (the float-register file, which at Milestone 1
+/// * **the whole** [`RootSet::fr`] **as handed** (the FR file, which at Milestone 1
 ///   holds `Eterm` **term slots**, so it can hold heap pointers like any other
 ///   register).
 ///
-/// [`RootSet::live`] is only a **hint**: the engine hands over the whole x-register
-/// file (a conservative over-approximation is always *safe* for a copying
-/// collector — it can only keep a term alive that would otherwise die, never free a
-/// live one), and [`RootSet::live_len`] clamps it to the slice length, so
-/// [`RootSet::ALL_LIVE`] (`u32::MAX`) means "treat every register as live".
+/// **The two register slices are exactly what the machine hands over for this run,
+/// never a whole file**: each carries the file's *used extent*
+/// (`machine::registers::used_extent` — the larger of the register-write seam's
+/// high-water mark and the extent a slot-escaping writer reported, clamped to the
+/// file), and every slot at or beyond it is [`NIL`](beam_term::NIL) by construction,
+/// so it is not a root and cannot be relocated. A host therefore **relocates and
+/// writes a moved term back only inside the slices it receives** — it physically
+/// cannot write outside them — and *that hand-off*, not a host promise, is what
+/// bounds [`Machine::reset`](crate::machine::Machine::reset)'s refill to the words a
+/// run actually used.
+///
+/// [`RootSet::live`] is only a **hint**: [`RootSet::live_len`] clamps it to the
+/// slice length, so [`RootSet::ALL_LIVE`] (`u32::MAX`) means "every handed
+/// register". Declaring more than is really live is always *safe* for a copying
+/// collector (it can only keep a term alive that would otherwise die, never free a
+/// live one); the engine computes no register liveness of its own.
 ///
 /// Nothing outside the root set is a root: a raw [`Eterm`] the engine is holding
 /// only in a local variable, or a `*mut Eterm` from a previous
@@ -211,19 +221,21 @@ pub trait Mailbox {
 /// and the engine must re-read any live term from `x`/`stack`/`fr`.
 #[derive(Debug)]
 pub struct RootSet<'a> {
-    /// The whole X-register file; `x[0..live_len()]` is declared live.
+    /// The writable **root prefix** of the X-register file — what the machine hands
+    /// over for this run (the file's used extent), never the whole file.
     pub x: &'a mut [Eterm],
     /// The whole Erlang stack: the Y slots of every live frame, oldest first.
     pub stack: &'a mut [Eterm],
-    /// The whole float-register (FR) file (`Eterm` term slots at Milestone 1).
+    /// The live float-register (FR) prefix the machine hands over for this run
+    /// (`Eterm` term slots at Milestone 1); a slot beyond it is `NIL`.
     pub fr: &'a mut [Eterm],
     /// How many leading `x` slots the caller declares live (a hint; clamped by
-    /// [`RootSet::live_len`]). [`RootSet::ALL_LIVE`] means "all of them".
+    /// [`RootSet::live_len`]). [`RootSet::ALL_LIVE`] means "every handed register".
     pub live: u32,
 }
 
 impl<'a> RootSet<'a> {
-    /// The value of [`RootSet::live`] that declares **every** X register live.
+    /// The value of [`RootSet::live`] that declares **every** handed X register live.
     pub const ALL_LIVE: u32 = u32::MAX;
 
     /// Build a root set over the three mutable slices.
@@ -236,7 +248,7 @@ impl<'a> RootSet<'a> {
         RootSet { x, stack, fr, live }
     }
 
-    /// The declared live X-register count, clamped to the actual file length.
+    /// The declared live X-register count, clamped to the handed root prefix.
     #[inline]
     pub fn live_len(&self) -> usize {
         (self.live as usize).min(self.x.len())
@@ -443,17 +455,17 @@ pub trait ExecutionContext {
     /// This is the full-root twin of
     /// [`ensure_heap`](ExecutionContext::ensure_heap): where `ensure_heap` receives
     /// only the X registers and the Erlang stack, this method receives the whole
-    /// [`RootSet`] — the X-register file, the whole Erlang stack **and the whole FR
-    /// file**. The FR file holds `Eterm` **term slots** at Milestone 1, so a float
-    /// register can point into the process heap and must be a root; the narrow
-    /// `ensure_heap` cannot see it, so a module containing any float-family
-    /// instruction could never be collected over correctly.
+    /// [`RootSet`] — the live X-register prefix, the whole Erlang stack **and the live
+    /// FR prefix** the root set carries. The FR file holds `Eterm` **term slots** at
+    /// Milestone 1, so a float register can point into the process heap and must be a
+    /// root; the narrow `ensure_heap` cannot see it, so a module containing any
+    /// float-family instruction could never be collected over correctly.
     /// [`Machine::ensure_heap`](crate::machine::Machine::ensure_heap) — reached by
     /// `test_heap`/`allocate_heap` — calls **this** method, so a host whose heap must
     /// be collected at the primary admission point now sees every live root.
     ///
     /// The default body forwards to
-    /// [`ensure_heap`](ExecutionContext::ensure_heap) with the FR file discarded, so
+    /// [`ensure_heap`](ExecutionContext::ensure_heap) with the FR slice discarded, so
     /// **every existing implementor keeps working unchanged** (and byte-identically):
     /// a host with a real collector overrides this and runs its collector over the
     /// full `roots` first, writing any moved term back through
@@ -497,17 +509,18 @@ pub trait ExecutionContext {
     /// root-set access, so a context whose heap must be collected cannot collect
     /// when the engine builds a term: every `crate::terms::make_*` goes through
     /// `alloc_words`, and there is nowhere to hand the roots over. This method is
-    /// that missing admission point: it takes the [`RootSet`] (the X registers, the
-    /// whole Erlang stack and the whole FR file — see the type docs for the frozen
-    /// contract) and returns a pointer to `n` **uninitialized** words under exactly
-    /// [`alloc_words`](ExecutionContext::alloc_words)'s stability rule (valid until
-    /// the next `ensure_heap`/collecting allocation).
+    /// that missing admission point: it takes the [`RootSet`] (the live X-register
+    /// prefix, the whole Erlang stack and the live FR prefix — see the type docs for
+    /// the frozen contract) and returns a pointer to `n` **uninitialized** words under
+    /// exactly [`alloc_words`](ExecutionContext::alloc_words)'s stability rule (valid
+    /// until the next `ensure_heap`/collecting allocation).
     ///
     /// The default body is [`alloc_words`](ExecutionContext::alloc_words) with the
     /// roots discarded, so **every existing implementor keeps working unchanged**
     /// (and byte-identically): a host with a real collector overrides this and runs
     /// its collector over `roots` first, writing any moved term back through
-    /// `roots.x`/`roots.stack`/`roots.fr`.
+    /// `roots.x`/`roots.stack`/`roots.fr` — inside the slices it was handed, which is
+    /// the whole writable window.
     ///
     /// The engine reaches this method through
     /// [`Machine::alloc_rooted`](crate::machine::Machine::alloc_rooted), which is
