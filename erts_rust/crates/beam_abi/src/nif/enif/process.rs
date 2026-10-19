@@ -285,7 +285,7 @@ fn store_monitor(monitor: *mut ErlNifMonitor, block: &[u8; REF_THING_BYTES]) {
 ///
 /// | shape | header arity | its block | where its identity lives | copied |
 /// |---|---|---|---|---|
-/// | this tree's frozen **M1** block `[hdr(3), node, serial, id]` (`beam_term::boxed::write_internal_ref`, minted by `beam_process::MonitorRef`, `beam_bifs`'s `make_ref_thing` and `beam_rt`) | `INTERNAL_REF_PAYLOAD_WORDS` = 3 | 4 words = 32 B — exactly [`REF_THING_BYTES`] | **word 3** (`node`/`serial` are the zeroed words 1..2) | all 4 words |
+/// | this tree's frozen **M1** block `[hdr(3), node, serial, id]` (`beam_term::boxed::write_internal_ref`, minted by `beam_process::MonitorRef`, `beam_bifs`'s `make_ref_thing` and `beam_rt`) | `INTERNAL_REF_PAYLOAD_WORDS` = 3 | 4 words = 32 B — exactly [`REF_THING_BYTES`] | **word 3** (words 1..2 are `node`/`serial`, pinned to `make_small(0)`) | all 4 words |
 /// | the C's `ErtsORefThing` `[hdr(2), num[0..3] \| marker]` (`erl_term.h:796-805`; `ERTS_REF_THING_SIZE` = 3 at `:990`, hence arity `ERTS_REF_THING_SIZE - 1` = 2 at `:998`) | [`C_LAYOUT_REF_PAYLOAD_WORDS`] = 2 | 3 words = 24 B | the packed `num[]` ids of its **two** payload words (`erl_term.h:828-869`) — nothing lives outside them | 3 words; the block's last 8 bytes stay **zeroed** |
 ///
 /// The zero tail is identity-safe: a C-layout ref's *whole* identity is inside its own three words,
