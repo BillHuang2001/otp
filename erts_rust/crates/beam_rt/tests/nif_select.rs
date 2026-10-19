@@ -45,34 +45,25 @@
 //!
 //! | case | what it does | pinned answer |
 //! |---|---|---|
-//! | read delivery | `enif_select(…, READ, …)` on a pipe read end | `0`, nothing before the write (`early=timeout`), then `{delivered,ready_input}` |
-//! | STOP | the above, then `ERL_NIF_SELECT_STOP` on the same descriptor | the stop code; nothing delivered by a later write, and a second STOP reports nothing left to release |
-//! | CANCEL | the above, then `ERL_NIF_SELECT_CANCEL \| READ` | `ERL_NIF_SELECT_READ_CANCELLED`; nothing delivered by a later write, and a second CANCEL cancels nothing (`0`) |
+//! | read delivery | `enif_select(…, READ, …)` on a pipe read end | `code=0`, nothing before the write (`early=timeout`), then `outcome={delivered,ready_input}` |
+//! | STOP | the above, then `ERL_NIF_SELECT_STOP` on the same descriptor | `stop=17` = `STOP_CALLED \| READ_CANCELLED`; nothing delivered by a later write; a second STOP answers `stop2=1` (`STOP_CALLED` alone) |
+//! | CANCEL | the above, then `ERL_NIF_SELECT_CANCEL \| READ` | `cancel=16` = `READ_CANCELLED`; nothing delivered by a later write; a second CANCEL cancels nothing (`cancel2=0`) |
 //! | CUSTOM_MSG | `enif_select_x(…, READ \| CUSTOM_MSG, …)` with a 3-tuple message | the caller's message **verbatim** (no `select` tuple, no event atom) |
 //! | combined mask | `READ \| WRITE` on a pipe write end, and on a read end with a byte queued | `ready_output` and `ready_input` respectively — the direction that really became ready |
-//! | error interest | `READ \| ERROR` on a TCP socket whose peer sent an `SO_LINGER`-RST | (see the residual below — the two runtimes do not agree, so that case is `#[ignore]`d) |
-//! | error-only interest | `ERROR` alone on the same kind of socket | `{delivered,ready_error}`, one-shot |
+//! | error interest | `READ \| ERROR` on a TCP socket whose peer sent an `SO_LINGER`-RST | `code=0`, then `first={delivered,ready_input}` and `second={delivered,ready_error}`, and nothing after the two |
+//! | error-only interest | `ERROR` alone on the same kind of socket | `outcome={delivered,ready_error}`, one-shot |
 //!
-//! # The two measured residuals, neither papered over
+//! # What this suite does not pin
 //!
-//! 1. **`ERL_NIF_SELECT_STOP`'s bit set.** The C reports the stop *and* the directions it cleared on
-//!    the way, so an armed read answers `17` = `ERL_NIF_SELECT_STOP_CALLED (1) |
-//!    ERL_NIF_SELECT_READ_CANCELLED (16)` (`erl_check_io.c:1497-1510` runs with the rewritten mode
-//!    `READ|WRITE|USE`). This runtime answers the fast-track bit alone (`1`). The *behaviour* agrees
-//!    completely (the descriptor is de-registered: a later write delivers nothing and a second STOP
-//!    finds nothing), so the case stays green and pins both facts: the oracle's exact `17`, and the
-//!    monotone invariant that this runtime's answer carries no bit the oracle's does not.
-//! 2. **`READ | ERROR` on a reset socket.** The C queues one message **per observed direction**, in
-//!    (`in`, `out`, `err`) order (`erl_check_io.c:2120-2185`), so the oracle delivers
-//!    `{delivered,ready_input}` and then `{delivered,ready_error}`; this runtime reports the error
-//!    direction alone and its registration is one-shot, so it delivers `ready_error` and nothing
-//!    more. That case is `#[ignore]`d with the measured difference recorded — turning it into a pin
-//!    is the runtime's work, not this suite's. The `ERROR`-only mask agrees and *is* pinned.
+//! The feature's own limits, one line each:
 //!
-//! Documented residuals this suite deliberately does not assert around (they are honest gaps, not
-//! divergences the corpus can express): the resource type's `stop` callback is never *invoked* here
-//! (no seam), so `ERL_NIF_SELECT_STOP_SCHEDULED` is never emitted; an object released before its
-//! readiness arrives delivers nothing; `ERL_NIF_SELECT_NOTSUP` is unreachable by construction.
+//! * The resource type's `stop` callback is never invoked by this runtime, so
+//!   `ERL_NIF_SELECT_STOP_SCHEDULED` is never emitted.
+//! * An object released before its readiness arrives delivers nothing.
+//! * `ERL_NIF_SELECT_NOTSUP` is unreachable by construction.
+//! * The delivered `{select, ResourceTerm, Ref, Event}` matches the arming `Ref` because a copy keeps a
+//!   reference's id — a term identity, not a pointer identity (the fixture's `delivered` clause binds
+//!   `Ref` in the head, and a mismatched reference would report `{delivered_other_ref, Event}`).
 //!
 //! # Skip policy
 //!
@@ -84,9 +75,8 @@
 //! # A note on the shared helpers
 //!
 //! [`erl_include_dir`]/[`cc`]/[`cc_available`] mirror `tests/nif.rs`'s (resolving the header is a
-//! filesystem question, never "run `erl` and see"). They are duplicated rather than moved into
-//! `tests/support/` because this round's file scope for this harness is this one file; the
-//! de-duplication belongs with whoever next touches that shared module.
+//! filesystem question, never "run `erl` and see"); they are private to this file so the suite stays
+//! self-contained.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -156,8 +146,10 @@ static void pipe_dtor(ErlNifEnv* env, void* obj) {
     }
 }
 
-/* The ERL_NIF_SELECT_STOP callback. The C calls it from the STOP path, so it must exist; what it
-   does is the library's business and is not part of this measurement. */
+/* The ERL_NIF_SELECT_STOP callback. The oracle calls it from the STOP path, so it must exist for the
+   oracle to measure anything; what it does is the library's business. This runtime's STOP path does
+   not invoke it (see the module docs' "What this suite does not pin"), so nothing here depends on
+   either answer. */
 static void pipe_stop(ErlNifEnv* env, void* obj, ErlNifEvent event, int is_direct_call) {
     (void) env; (void) obj; (void) event; (void) is_direct_call;
 }
@@ -405,7 +397,8 @@ poke() -> erlang:nif_error(not_loaded).
 /// so this clause only matches a term-equal reference), `{delivered_other_ref, Event}` when a
 /// `{select, _, _, Event}` tuple arrived for a different reference, and `timeout` when nothing
 /// arrived. `wait_early/1` is the "nothing before readiness" phase: a **short** bounded receive that
-/// must not match before the descriptor is poked.
+/// must not match before the descriptor is poked. `wait_next/1` is one more bounded receive, for the
+/// cases that pin what does (and does not) follow the first notification.
 ///
 /// Every export reaches the NIF through an **external** call (`select_caller` is a different module
 /// from `select_nif`), which is the dispatch point this runtime intercepts for NIFs.
@@ -484,16 +477,17 @@ error_only_case(Path) ->
     {Code, _Resource, Ref} = select_nif:arm_error_only(),
     io:format("code=~w~n", [Code]),
     io:format("outcome=~w~n", [wait_for_select(Ref)]),
-    io:format("second=~w~n", [wait_second(Ref)]),
+    io:format("second=~w~n", [wait_next(Ref)]),
     ok.
 error_case(Path) ->
     ok = select_nif:init(Path),
     {Code, _Resource, Ref} = select_nif:arm_error(),
     io:format("code=~w~n", [Code]),
     io:format("outcome=~w~n", [wait_for_select(Ref)]),
-    io:format("second=~w~n", [wait_second(Ref)]),
+    io:format("second=~w~n", [wait_next(Ref)]),
+    io:format("third=~w~n", [wait_next(Ref)]),
     ok.
-wait_second(Ref) ->
+wait_next(Ref) ->
     receive
         {select, _Resource, Ref, Event} -> {delivered, Event};
         Other -> {unexpected, Other}
@@ -1016,11 +1010,14 @@ fn enif_select_read_on_a_real_pipe_fd_delivers_the_c_notification() {
 
 /// **`ERL_NIF_SELECT_STOP` releases an armed descriptor** — and reports it in the C's bit vocabulary.
 ///
-/// Two facts are pinned. The behaviour, on both runtimes: after the `STOP` a write into the pipe
-/// delivers nothing (the descriptor is out of the poll set, so the "further readiness attempt" the
-/// write represents reports nothing), and a second `STOP` finds nothing left to release. And the
-/// code: the oracle answers the C's full bit set (`STOP_CALLED | READ_CANCELLED`), this runtime the
-/// fast-track bit alone — see this file's module docs, residual 1.
+/// Two facts are pinned, identically on both runtimes. The code: the C reports the stop *and* the
+/// direction it cleared on the way, so a `STOP` on an armed read interest answers `17` =
+/// `ERL_NIF_SELECT_STOP_CALLED (1) | ERL_NIF_SELECT_READ_CANCELLED (16)` (`erl_check_io.c:1497-1510`
+/// runs with the rewritten mode `READ|WRITE|USE`). The behaviour: after the `STOP` a write into the
+/// pipe delivers nothing (the descriptor is out of the poll set, so the "further readiness attempt" the
+/// write represents reports nothing), and a second `STOP` answers `ERL_NIF_SELECT_STOP_CALLED` alone
+/// (`1`) because no interest is left to clear — which is what proves the first one really did
+/// de-register.
 #[test]
 fn enif_select_stop_on_an_armed_descriptor_releases_it() {
     let Some(answers) = run_case("stop", "select_caller:stop_case/1") else {
@@ -1063,9 +1060,9 @@ fn enif_select_stop_on_an_armed_descriptor_releases_it() {
         && rust_stop2 == oracle_stop2;
     verdict(
         agrees,
-        "the stop takes effect identically on both runtimes; only the reported bit set differs \
-         (residual 1: the oracle ORs in the direction it cleared, this runtime reports the \
-         fast-track bit alone)",
+        "the same code on both runtimes — STOP_CALLED | READ_CANCELLED for the first STOP, \
+         STOP_CALLED alone for the second — and the same observable behaviour: the descriptor is \
+         de-registered, so a later write delivers nothing",
     );
 
     assert_eq!(oracle_code, 0, "the oracle accepts the read registration");
@@ -1078,26 +1075,12 @@ fn enif_select_stop_on_an_armed_descriptor_releases_it() {
          {oracle_stop} [{}]",
         decode(oracle_stop)
     );
-    // OPEN RESIDUAL 1: this runtime answers the fast-track bit only. The invariant asserted here is
-    // the honest one — the stop really happened, nothing failed, and no bit is invented that the
-    // oracle does not report. A fix that reproduces the oracle's full set keeps this test green.
     assert_eq!(
-        rust_stop & ERL_NIF_SELECT_STOP_CALLED,
-        ERL_NIF_SELECT_STOP_CALLED,
-        "this runtime must report that the stop ran, got {rust_stop} [{}]",
-        decode(rust_stop)
-    );
-    assert_eq!(
-        rust_stop & ERL_NIF_SELECT_FAILED,
-        0,
-        "the stop must not fail, got {rust_stop} [{}]",
-        decode(rust_stop)
-    );
-    assert_eq!(
-        rust_stop & !oracle_stop,
-        0,
-        "this runtime reports no bit the oracle does not, got {rust_stop} against the oracle's \
-         {oracle_stop}"
+        rust_stop, oracle_stop,
+        "this runtime reports the oracle's exact stop code, got {rust_stop} [{}] against the \
+         oracle's {oracle_stop} [{}]",
+        decode(rust_stop),
+        decode(oracle_stop)
     );
     assert_eq!(rust_written, 1, "the write itself must still succeed");
     assert_eq!(oracle_written, 1, "the write itself must still succeed on the oracle");
@@ -1114,11 +1097,12 @@ fn enif_select_stop_on_an_armed_descriptor_releases_it() {
     // first one really de-registered the read interest (it no longer reports READ_CANCELLED).
     assert_eq!(
         oracle_stop2, ERL_NIF_SELECT_STOP_CALLED,
-        "the oracle's second STOP reports the fast track alone"
+        "the oracle's second STOP reports STOP_CALLED alone"
     );
     assert_eq!(
-        rust_stop2, ERL_NIF_SELECT_STOP_CALLED,
-        "this runtime's second STOP reports the fast track alone"
+        rust_stop2, oracle_stop2,
+        "this runtime's second STOP reports the oracle's exact code, got {rust_stop2} [{}]",
+        decode(rust_stop2)
     );
 }
 
@@ -1400,39 +1384,32 @@ fn enif_select_error_interest_reports_ready_error() {
     );
 }
 
-/// **A combined `READ | ERROR` interest on a reset socket — measured, not agreed.**
+/// **A combined `READ | ERROR` interest on a reset socket delivers both directions, in the C's order.**
 ///
-/// `#[ignore]`d because the two runtimes genuinely differ on this platform, and the difference is
-/// recorded rather than papered over: the C queues **one message per observed direction**, in
-/// (`in`, `out`, `err`) order (`erl_check_io.c:2120-2185`), and a reset socket's readiness carries both
-/// `EPOLLIN` and `EPOLLERR`, so the oracle delivers `{delivered,ready_input}` and then
-/// `{delivered,ready_error}`. This runtime classifies a readiness that reports an error condition as
-/// the error direction (`src/port/select.rs:175-189`, `SelectEvent::of`'s error-first order) and its
-/// registration is one-shot, so it delivers `ready_error` alone. Turning *that* into a pin is the
-/// runtime's work; the honest `ERROR`-only case above already pins the agreeing half.
-///
-/// Run it with `-- --ignored --nocapture`: it prints both sides and asserts the oracle's exact
-/// sequence plus the invariant that this runtime's answer is a **subset** of the oracle's — the
-/// property that a divergence may lose an event but may never invent one. It stays green so that a
-/// fix which delivers both events keeps it green.
+/// The C queues **one message per observed direction**, in (`in`, `out`, `err`) order
+/// (`erl_check_io.c:2120-2185`), and a reset socket's readiness reports both `EPOLLIN` and `EPOLLERR`,
+/// so the answer is `{delivered,ready_input}` and then `{delivered,ready_error}`. Both runtimes print
+/// that same pair for the same `.so`/`.beam`, both accept the combined interest with the C's `0`, and
+/// nothing follows the two.
 #[test]
-#[ignore = "measured divergence on READ | ERROR: the oracle delivers ready_input then ready_error, \
-            this runtime ready_error alone — see this file's module docs, residual 2"]
-fn enif_select_read_and_error_interest_measures_the_delivered_sequence() {
+fn enif_select_read_and_error_interest_delivers_both_directions() {
     let Some(answers) = run_case("error", "select_caller:error_case/1") else {
         return;
     };
     let Some((rust_code, oracle_code)) = answers.int("code") else {
         return;
     };
-    let Some((rust_outcome, oracle_outcome)) = answers.text("outcome") else {
+    let Some((rust_first, oracle_first)) = answers.text("outcome") else {
         return;
     };
     let Some((rust_second, oracle_second)) = answers.text("second") else {
         return;
     };
+    let Some((rust_third, oracle_third)) = answers.text("third") else {
+        return;
+    };
     heading(
-        "READ | ERROR interest (measured divergence)",
+        "READ | ERROR interest",
         &format!(
             "enif_select(env, reset_socket_fd, ERL_NIF_SELECT_READ | ERL_NIF_SELECT_ERROR={}, …) \
              on the accepted end of a reset TCP pair",
@@ -1440,46 +1417,49 @@ fn enif_select_read_and_error_interest_measures_the_delivered_sequence() {
         ),
     );
     println!(
-        "beam_rt        : code={rust_code} [{}] first={rust_outcome} second={rust_second}",
+        "beam_rt        : code={rust_code} [{}] first={rust_first} second={rust_second} \
+         third={rust_third}",
         decode(rust_code)
     );
     println!(
-        "oracle         : code={oracle_code} [{}] first={oracle_outcome} second={oracle_second}",
+        "oracle         : code={oracle_code} [{}] first={oracle_first} second={oracle_second} \
+         third={oracle_third}",
         decode(oracle_code)
     );
     let agrees = rust_code == oracle_code
-        && rust_outcome == oracle_outcome
-        && rust_second == oracle_second;
+        && rust_first == oracle_first
+        && rust_second == oracle_second
+        && rust_third == oracle_third;
     verdict(
         agrees,
-        "the oracle reports the input direction and then the error direction; this runtime reports \
-         the error direction alone",
+        "one message per observed direction, in the C's in → out → err order: ready_input and then \
+         ready_error, with nothing after the two",
     );
 
     assert_eq!(oracle_code, 0, "the oracle accepts the combined interest");
-    assert_eq!(rust_code, 0, "this runtime accepts the combined interest");
+    assert_eq!(rust_code, oracle_code, "this runtime accepts the combined interest with the C's 0");
     assert_eq!(
-        oracle_outcome, "{delivered,ready_input}",
+        oracle_first, "{delivered,ready_input}",
         "the oracle's first message names the input direction (the C's in→out→err order)"
+    );
+    assert_eq!(
+        rust_first, oracle_first,
+        "this runtime's first message names the input direction too, got {rust_first}"
     );
     assert_eq!(
         oracle_second, "{delivered,ready_error}",
         "the oracle's second message names the error direction"
     );
-    // This runtime loses the input event but invents nothing: whatever it delivers is one of the
-    // events the oracle reports for the same readiness.
-    let delivered: Vec<&str> = [rust_outcome.as_str(), rust_second.as_str()]
-        .into_iter()
-        .filter(|value| *value != "timeout")
-        .collect();
-    assert!(
-        delivered
-            .iter()
-            .all(|value| *value == "{delivered,ready_input}" || *value == "{delivered,ready_error}"),
-        "this runtime delivered an event the oracle never reports: {delivered:?}"
+    assert_eq!(
+        rust_second, oracle_second,
+        "this runtime's second message names the error direction too, got {rust_second}"
     );
-    assert!(
-        delivered.contains(&"{delivered,ready_error}"),
-        "this runtime must report the error direction of a reset socket, got {delivered:?}"
+    assert_eq!(
+        oracle_third, "timeout",
+        "the oracle delivers nothing after the two directions, got {oracle_third}"
+    );
+    assert_eq!(
+        rust_third, oracle_third,
+        "this runtime delivers nothing after the two directions either, got {rust_third}"
     );
 }
