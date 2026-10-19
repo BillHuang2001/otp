@@ -45,10 +45,8 @@
 //! * [`ActiveInput`] / [`ActiveInputEvent`] — the **`{active, …}` input** channel, a separate
 //!   struct with its own drain ([`crate::PortRegistry::take_active_inputs`]) exactly like
 //!   [`LineNotification`]: an active-mode socket's incoming message is a message to the *owner*
-//!   (`{tcp, S, Data}` / `{tcp_error, S, Reason}` / `{udp_passive, S}` / …), never
-//!   `{Port, {data, …}}`, so it does not ride [`PortNotification`] and that enum keeps its two
-//!   variants.
-//!
+//!   (`{tcp, S, Data}` / `{udp_passive, S}` / …), never `{Port, {data, …}}`, so it does not ride
+//!   [`PortNotification`] and that enum keeps its two variants.//!
 //! # Reductions
 //!
 //! Running a task costs reductions, with the C's per-kind constants:
@@ -578,7 +576,7 @@ pub struct LineNotification {
 /// ([`DriverContext::deliver_active_input`](crate::DriverContext::deliver_active_input)), so a
 /// driver cannot attribute a delivery to another port.
 ///
-/// The things a delivered [`ActiveInput`] can be are [`ActiveInputEvent`]'s.
+/// The two things a delivered [`ActiveInput`] can be are [`ActiveInputEvent`]'s.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ActiveInput {
     /// The port that produced the delivery.
@@ -586,7 +584,7 @@ pub struct ActiveInput {
     /// What the socket driver reported.
     pub event: ActiveInputEvent,
 }
-/// The things an `{active, …}` socket reports on [`ActiveInput`].
+/// The two things an `{active, …}` socket reports on [`ActiveInput`].
 ///
 /// Honest scoping: this vocabulary stops at the *term-free* shape. Which message an event
 /// becomes depends on the driving port's driver name (`tcp_inet` vs `udp_inet`), which the
@@ -616,23 +614,6 @@ pub enum ActiveInputEvent {
     /// the channel stays term-free and a driver cannot spell a message name this layer would have
     /// to validate.
     Passive,
-    /// `{tcp_error, S, Reason}` / `{udp_error, S, Reason}`: a **read error** on an
-    /// `{active, …}` socket. The C's `tcp_error_message` (`inet_drv.c:4079`) and the datagram
-    /// driver's `packet_error_message` (`:4245`).
-    ///
-    /// This is the C's `tcp_recv_error` active arm (`:12849`), which runs
-    /// `tcp_error_message(desc, err)` and **then** `tcp_closed_message(desc)`
-    /// (`:12880`-`:12881`): the runtime renders `{tcp_error, S, Reason}` **before** the
-    /// `{tcp_closed, S}` it builds from [`crate::Driver::port_closed`]. The close is therefore
-    /// **not** a second event on this channel — it is the `port_closed()` observation the same
-    /// callback latched — so this event is the last thing an erroring stream socket's read path
-    /// reports. A datagram port has no `{udp_closed, S}` in the C at all (an active read error
-    /// is `packet_error_message` and the port keeps running, `:15486`) and reports only this.
-    ///
-    /// `reason` carries no atom ([`InetReason`](crate::InetReason)'s vocabulary is a closed
-    /// [`crate::InetReason::Closed`]/[`crate::InetReason::Timeout`]/errno set): the name is
-    /// [`crate::InetReason::atom_name`], resolved by the runtime like every other reason.
-    Error(crate::completion::InetReason),
 }
 /// What one [`crate::PortRegistry::execute_port_tasks`] round did.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
