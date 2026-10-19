@@ -77,7 +77,7 @@ The walk loop body never allocates, never crosses a heap-admission point and nev
 
 ### `emqx_base62` — bitstring matching + creation over a caller-sized input
 `encode/1` folds four 6-bit groups per output character with a `select_val` character table and calls `erlang:iolist_to_binary/1` once per four encoded characters (3 static call sites, **4 calls** for this 12-byte input), so it is the one foreign case that is **not** BIF-free and reports a real `bif_calls` histogram.
-`decode/1` additionally needs `erlang:bit_size/1`, both in a guard (`bit_size(Rest) >= 8`) and as `bit_size(Acc) rem 8` over a **match context** — see Constraints for why that case is a loud skip.
+`decode/1` additionally needs `erlang:bit_size/1`, both in a guard (`bit_size(Rest) >= 8`) and as `bit_size(Acc) rem 8` over its bitstring accumulator (which `erlc -S` types as a `t_bs_context`); the harness' BIF floor serves it through the bitstring family's own reader, which is exact for heap bits, an off-heap refc window and a live match context and refuses a non-bitstring (see Constraints).
 
 ## Measured
 Every figure below is this harness' own output unless a section says otherwise.
