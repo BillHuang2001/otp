@@ -117,7 +117,8 @@ fn both_fields(atoms: &ProbeAtoms) -> Vec<(Operand, Operand)> {
 /// compiler's local case); a `{Module,Name}` id naming *another* module is the
 /// documented typed `unsupported` and is deliberately not probed here. `live` is
 /// carried by the instruction but never consulted — the build reserves its block
-/// with `RootSet::ALL_LIVE`, so the whole register file is the standing root set.
+/// with `RootSet::ALL_LIVE`, so every register the machine has written is declared a
+/// root and the hint never narrows the hand-off.
 fn create_record(atoms: &ProbeAtoms, dst: Operand, updates: Vec<(Operand, Operand)>) -> Instr {
     Instr::PutRecord(Box::new(PutRecordArgs {
         fail: FAIL_SINK_LABEL,

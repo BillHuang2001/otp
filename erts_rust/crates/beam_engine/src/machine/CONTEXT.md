@@ -18,7 +18,7 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `interpreter/dispatch.rs::step_instruction_inner` tests instead of touching the census's thread-local on
   every instruction (cleared by `reset`, latched by both drivers, so a mid-run `enable()` takes effect at the
   run's next entry)); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
-  (`stack_mut`, `with_roots` handing over the whole `RootSet`, and `alloc_rooted` — the convenience
+  (`stack_mut`, `with_roots` handing over the live `RootSet`, and `alloc_rooted` — the convenience
   wrapper that calls `ExecutionContext::alloc_words_rooted`); and the **off-heap refc-binary handle view**
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
   which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc

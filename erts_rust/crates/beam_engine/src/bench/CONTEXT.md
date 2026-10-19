@@ -181,7 +181,10 @@ Paired A/B, two identical-source binaries, `BENCH_TIER=interpreter`, `/proc/load
 | `reduce` / `return_step` / `eval_test` | 1.95 / 1.33 / 1.22 % | — |
 | `__memcmp_avx2_movbe` | 2.18 % | — |
 
-`exec_census::on_instruction` is the census instrument's own disabled-path load, present only because that run recorded a census; a plain run does not pay it.
+`exec_census::on_instruction`'s **6.27 %** is the recorder's own body, i.e. the price of a
+**census-recording** run: the funnel only reaches it when the run's latched `Machine::census_on` gate is
+set. A plain (non-recording) run pays one load of that latched `bool` plus a branch per interpreted
+instruction and never calls into the instrument, and no thread-local is touched on that path.
 On the baseline tier the emitted code is **under a fifth** of the samples: the tier's per-helper crossings (`jit_call_store`, `local_call_seam`, `native_entry`, the frame helpers) plus the driver loop are the rest.
 
 ### Foreign cases — the mechanism ranking (runtime route)

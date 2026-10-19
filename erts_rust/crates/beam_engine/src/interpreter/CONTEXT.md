@@ -4,16 +4,17 @@
 The direct-threaded, one-instruction-at-a-time execution step of the Stage-1 engine: `Machine::step_instruction`
 (`dispatch.rs`) matches on the frozen `beam_loader::Instr` variant and executes the **core arms** natively; every
 variant it does not own is routed to `crate::families::dispatch` (`../families/mod.rs`).
-Owns the per-run label/import index (`LabelMap`), BIF-argument marshalling + the BIF raise path, `Test` evaluation,
+Owns the label/import index (`LabelMap`), BIF-argument marshalling + the BIF raise path, `Test` evaluation,
 and the contract-A.8 trace emission.
 This file is the crate-internal execution core: no BIF table lives here (all computation goes through
 `ExecutionContext::call_bif`), and the module is split by responsibility (dispatch / bif / test / trace).
 Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*.tab` and `emu/beam_emu.c`.
 
 ## API Surface (crate-internal; all methods on `impl Machine`)
-- `mod.rs` — module docs + `LabelMap` (dense or sparse label slots + the per-run `ImportTable`); `build_label_map`,
-  `resolve`, `resolve_label`, `import_target` (the uncached fallback), `resolve_imports`.
-- `dispatch.rs` — `run_loop`/`run_loop_with_map` (thin run entries over `Machine::drive`), `enter_run` (the per-run
+- `mod.rs` — module docs + `LabelMap` (dense or sparse label slots + the cached `ImportTable`);
+  `build_label_map` (the whole-module build, then cached per machine per module by
+  `Machine::label_map`/`label_map_arc` — `../machine/label_cache.rs`), `resolve`, `resolve_label`,
+  `import_target` (the uncached fallback), `resolve_imports`.- `dispatch.rs` — `run_loop`/`run_loop_with_map` (thin run entries over `Machine::drive`), `enter_run` (the per-run
   prologue that binds the literal area and records the entry call), **`Machine::step_instruction_with_entry`** (the
   one-instruction dispatcher every driver calls — the interpreter's `Machine::drive` **and** the native tiers'
   per-instruction deopt helper `../jit/baseline/runtime.rs::jit_step_one` — which wraps the body
@@ -32,9 +33,10 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   error propagated by `?` *inside* one arm, which returns from the body rather than falling out of the `match`, is
   still observed) and then calls `crate::exec_census::on_error(instr, err)` for an `Err` result, re-reading the
   same gate. The gate is a plain `bool` field the drivers latch once per run/resume entry
-  (`Machine::drive` and the native tiers' driver), so a disabled census costs **one load and a branch and zero
-  thread-local accesses per instruction** — reading `exec_census`'s thread-local here had measured 2.12 % of a
-  `foreign/bstr_to_lower` workload while counting was off. The gate is deliberately **not** cached in a local
+  (`Machine::drive` in `../machine/drive.rs` and the native tiers' driver in
+  `../jit/baseline/mod.rs`; `Machine::reset` clears it, so a mid-run `enable()` takes effect at the
+  run's next entry), so a disabled census costs **one load and a branch and zero thread-local
+  accesses per instruction**. The gate is deliberately **not** cached in a local
   across `step_instruction_body`: the error arm is the only other reader, and holding it live across that call
   costs the hot frame a callee-saved register (measured: +4.5 % on `list-walk/1` vs −5.2 % with the re-read).
 - `bif.rs` — `exec_bif` (`gc_bif`/`bif`/`bif0` operand marshalling + the fail-label/raise split), `call_import`
@@ -288,7 +290,8 @@ consultations, 1 derivation) and `../machine/local_callee.rs`'s unit tests (hits
 - `select.rs` → the `select_val` **pair ladder** (`first_match`/`pair_eq`), `constant_word` (the single definition
   both JIT tiers' `select_val` plans delegate to) and the `#[cfg(test)]` pair tally (`reset_select_answers`/
   `select_answers`).
-- `mod.rs` → `LabelMap`/import resolution (the label+import index every run entry builds).
+- `mod.rs` → `LabelMap`/import resolution (the label+import index a machine builds once per module and
+  then serves from `../machine/label_cache.rs`).
 - Related semantics one level away: `../machine/` (frames, catch, run entries, location), `../families/` (per-family
   instruction bodies), `../jit/baseline/` (the native tier's inline set + `runtime.rs::jit_step_one`).
 - `../CONTEXT.md` → the engine's binding execution semantics; `INSTRUCTION_SURFACE.md` → the exhaustive per-opcode

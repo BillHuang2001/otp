@@ -22,8 +22,8 @@
 //! allocation seam.**
 //!
 //! [`ExecutionContext::alloc_words_rooted`] is the engine's admission point for
-//! *term construction*: it hands the host the machine's whole live [`RootSet`] (the
-//! X-register file, the whole Erlang stack, the whole FR file), so a host with a
+//! *term construction*: it hands the host the machine's live [`RootSet`] (the used
+//! X-register prefix, the whole Erlang stack, the used FR prefix), so a host with a
 //! **moving** collector may relocate every live term — and rewrite the root slices in
 //! place — *before* it hands back the storage. The arms that build terms (`put_tuple2`
 //! → `make_tuple_rooted`, `put_list` → `make_cons_rooted`, the map/bitstring/record
@@ -275,7 +275,7 @@ fn serve(blocks: &mut Vec<Box<[Eterm]>>, n: usize) -> *mut Eterm {
 #[derive(Default)]
 struct RootedCalls {
     calls: usize,
-    /// The whole X-register file / Erlang stack / FR file handed over, per call.
+    /// The X-register prefix / Erlang stack / FR prefix handed over, per call.
     x: Vec<Vec<Eterm>>,
     stack: Vec<Vec<Eterm>>,
     fr: Vec<Vec<Eterm>>,

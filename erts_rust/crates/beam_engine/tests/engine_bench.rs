@@ -217,11 +217,13 @@ fn finish_module(mut module: Module, name: &str, arity: u32, body: Vec<Instr>) -
     (module, function)
 }
 
-/// The module-wide `Label -> code offset` map the engine rebuilds per run.
+/// The module-wide `Label -> code offset` table the bench's synthetic modules carry.
 ///
+/// `Machine::label_map` builds the engine's own index once per machine per module and
+/// caches it, but a synthetic image (all-zero checksum) is never cached, so the bench
+/// modules pay one build in the warm-up rather than in the timed loop.
 /// Duplicate `Instr::Label`s collapse (last wins), which is exactly what the
-/// no-op baseline relies on (see [`bench_dispatch_noop`]).
-fn collect_labels(code: &[Instr]) -> BTreeMap<Label, usize> {
+/// no-op baseline relies on (see [`bench_dispatch_noop`]).fn collect_labels(code: &[Instr]) -> BTreeMap<Label, usize> {
     code.iter()
         .enumerate()
         .filter_map(|(index, instr)| match instr {

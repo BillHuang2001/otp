@@ -587,7 +587,8 @@ struct MovingContext {
     /// The whole Erlang stack handed over at each reservation, as seen *before* the
     /// collection of that reservation.
     stack_seen: Vec<Vec<Eterm>>,
-    /// The whole X-register file handed over at each reservation, before the move.
+    /// The X-register slice handed over at each reservation (`RootSet::x`), before the
+    /// move.
     x_seen: Vec<Vec<Eterm>>,
 }
 

@@ -536,13 +536,12 @@ mod tests {
         );
     }
 
-    /// Change 2: a run must build the module-wide label index **exactly once**.
+    /// A run builds the module-wide label index **exactly once**.
     ///
-    /// `run_label_outcome` used to resolve the entry label with one
-    /// `build_label_map` and then rebuild the identical map inside `run_loop` — two
-    /// `O(labels)` passes per run. The `cfg(test)` counter ([`crate::interpreter`])
-    /// makes the count observable here.
-    #[test]
+    /// The module here is synthetic (no content identity, so `label_cache` never holds
+    /// it), so the single entry pays exactly one `build_label_map` — resolving the entry
+    /// label and the dispatch loop share that one map instead of each deriving its own.
+    /// The `cfg(test)` counter ([`crate::interpreter`]) makes the count observable here.    #[test]
     fn run_export_builds_the_label_map_exactly_once() {
         let (module, name) = module_with_code(
             "f",

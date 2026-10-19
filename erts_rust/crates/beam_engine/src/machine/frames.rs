@@ -268,9 +268,9 @@ impl Machine {
         Ok(())
     }
 
-    /// Ensure `heap_need` heap words are available, handing the context the **whole
-    /// live root set** (`x[0..live)`, the whole stack **and the whole FR file**) so a
-    /// Stage-4 collector can move terms in place.
+    /// Ensure `heap_need` heap words are available, handing the context the **live
+    /// root set** (`x[..used_x_extent()]`, the whole stack **and
+    /// `fr[..used_fr_extent()]`**) so a Stage-4 collector can move terms in place.
     ///
     /// This delegates to
     /// [`ExecutionContext::ensure_heap_full`](crate::context::ExecutionContext::ensure_heap_full),

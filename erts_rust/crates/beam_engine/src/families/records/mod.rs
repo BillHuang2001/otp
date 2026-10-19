@@ -126,9 +126,9 @@
 //!   operands across the GC it may trigger); every record build here first reserves
 //!   its block through the **rooted** allocation seam
 //!   ([`crate::terms::reserve`] → `Machine::alloc_rooted`) with
-//!   [`RootSet::ALL_LIVE`], so the whole X-register file plus the stack and the FR
-//!   file are the standing root set and the count is not consulted — the same stance
-//!   [`Instr::UpdateRecord`] takes.
+//!   [`RootSet::ALL_LIVE`], so every register the run has written plus the stack and
+//!   the used FR slots are the standing root set and the count is not consulted — the
+//!   same stance [`Instr::UpdateRecord`] takes.
 //!
 //! # Failure model (never a panic, never a wrong result)
 //!

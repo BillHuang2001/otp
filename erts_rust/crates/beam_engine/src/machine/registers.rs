@@ -51,11 +51,12 @@ pub const MAX_FLOAT_REGISTER: u32 = 1024;
 /// The all-[`NIL`](beam_term::NIL) template the register files are refilled from,
 /// and the word count that [`fill_nil`] copies at a time.
 ///
-/// [`Machine::reset`] rewrites the whole x-register file (`max_register` words) and
-/// the whole FR file ([`MAX_FLOAT_REGISTER`] words) on **every** run, so the refill
-/// is on the per-run critical path. 16 words is 128 bytes — the widest
-/// `copy_from_slice` the optimizer still expands *inline* into wide moves, and it is
-/// read repeatedly, so it stays resident in L1.
+/// [`Machine::reset`] rewrites each register file's **used extent** —
+/// `used_extent(len, mark, dirty)` = `max(mark, dirty)` clamped to the file, so a
+/// small run refills a few words and a run that touched the whole file refills all of
+/// it — on **every** run, so the refill is on the per-run critical path. 16 words is
+/// 128 bytes — the widest `copy_from_slice` the optimizer still expands *inline* into
+/// wide moves, and it is read repeatedly, so it stays resident in L1.
 ///
 /// It is deliberately **not** a `Machine` field: a per-machine buffer would double
 /// the memory traffic (one copy into the buffer, one out of it) and would have to be
