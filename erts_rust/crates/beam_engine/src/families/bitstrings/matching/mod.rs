@@ -84,6 +84,8 @@ mod rooted;
 mod utf_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod elision_tests;
 
 // Every moved item is re-exported here so its existing
 // `crate::families::bitstrings::matching::…` path keeps resolving. Some are only
