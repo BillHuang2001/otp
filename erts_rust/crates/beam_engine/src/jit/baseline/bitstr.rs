@@ -23,11 +23,13 @@
 //!
 //! Every family-owned instruction the emitter claims reaches its family through
 //! [`crate::families::dispatch`], the router that re-matches the instruction's variant (a
-//! jump table on the [`Instr`] discriminant) to find the **owning** family. For a `Bs*`
-//! instruction that hop is pure overhead: this tier already knows the variant (it emitted
-//! the arm), so [`jit_bitstr`] calls the bitstring family's own body
+//! jump table on the [`Instr`](beam_loader::Instr) discriminant) to find the **owning**
+//! family. For a `Bs*` instruction that hop is pure overhead: this tier already knows the
+//! variant (it emitted the arm), so [`jit_bitstr`] calls the bitstring family's own body
 //! ([`crate::families::bitstrings::exec`]) directly. The emitted arm claims the family's
-//! **whole** variant set ([`claimed`], the exact list the router owns for it), so the
+//! **whole** variant set (the `match` arm in
+//! [`emit_block`](super::emit::emit_block), the exact list the router owns for it, which the
+//! test-build predicate `claimed` pins against the family's own `Ok(None)` contract), so the
 //! bypass covers `bs_start_match*`, `bs_get_position`, `bs_create_bin`, `bs_init_writable`,
 //! the `bs_get_integer*`/`bs_get_binary*` reads, `bs_match_string`, the UTF reads and every
 //! other member — not one hand-picked shape.
@@ -40,12 +42,13 @@
 //! per-instruction step would not — only reach it one dispatch hop sooner.
 //!
 //! **The helper runs no per-execution shape predicate.** The emit side decided the route at
-//! compile time ([`claimed`]); re-deciding it here would hand back a large part of the hop
-//! this helper exists to remove (the previous round measured a per-execution re-test at
-//! about a third of the win). An address that holds a variant the family does not own — an
+//! compile time (the `emit_block` arm); re-deciding it here would hand back a large part of
+//! the hop this helper exists to remove (the previous round measured a per-execution re-test
+//! at about a third of the win). An address that holds a variant the family does not own — an
 //! artifact/module mismatch, say — is answered by the family's own `Ok(None)` and handed to
 //! [`jit_step_one`], which is the interpreter's exact diagnostic for it.
 
+#[cfg(test)]
 use beam_loader::Instr;
 
 use super::jit_step_one;
@@ -66,6 +69,14 @@ use crate::families::bitstrings;
 /// variant it wrongly accepted would still execute correctly through
 /// [`crate::families::bitstrings::exec`] (or decline to [`jit_step_one`]); it could only fail
 /// to be the fast path.
+///
+/// **Test-build only.** The emit side is a `match` arm in
+/// [`emit_block`](super::emit::emit_block) naming the same variants, so no production code
+/// path calls this function; it exists so the pins in `bitstr_tests` can compare the
+/// emitter's variant set against the family's own `Ok(None)` contract independently of that
+/// arm. It is `#[cfg(test)]`-gated so a production build carries no copy of the list at all
+/// ([`emit_block`](super::emit::emit_block) remains the single production transcription).
+#[cfg(test)]
 pub(crate) fn claimed(instr: &Instr) -> bool {
     matches!(
         instr,
