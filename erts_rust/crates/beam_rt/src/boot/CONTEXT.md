@@ -551,3 +551,9 @@ The duplication was unavoidable while `../native/code.rs` was owned by another a
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
 - `../native/file_server.rs` → the native `file_server_2` service, registered under that name only where the runtime drives no boot script (not owned here; see `../native/CONTEXT.md`)
 - `../context/mod.rs` → `RuntimeContext::run_export`/`run_export_blocking` and `resolve_external_call` (the in-machine seam the boot's `{apply, …}` chains are entered through; read-only from this node)
+
+## Measured: startup cost and the poll budget
+Whole-process startup is **≈0.34 s wall / ≈0.33 s CPU** (release, `-eval 'halt(0).'`) and **CPU-bound**: the boot drive issues **0** `clock_nanosleep` calls, because a blocking port poll requires a port that owes a reply and only the drive's `TimerWait::ImminentWithin` policy takes that gate.
+The boot path issues **927 filesystem stats**, but only **2** on `os.beam`, since `Runtime::find_module_file` answers an already-loaded module from `CodeServer::loaded_path`.
+A normal installation therefore pays **no** `erl` start-up (the resident `erl` shell-out alone costs ≈0.5 s and is avoided).
+Figures and their measurement pins: [`../PERF.md`](../PERF.md) *The boot path's one live-but-idle port, and the poll budget*.
