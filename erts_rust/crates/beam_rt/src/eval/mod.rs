@@ -113,6 +113,7 @@ use beam_term::{
 
 use crate::context::RuntimeContext;
 use crate::error;
+use crate::port::PORT_POLL_SLICE;
 
 use ast::{is_var_name, BinOp, CatchClause, Clause, Expr, MapField, Qual, Seg, SegKind, Try, UnOp};
 
@@ -129,6 +130,28 @@ pub(crate) const EVAL_FUN_UNIQ: u64 = 0x6265_616d_7274_0001;
 /// meant to avoid). 64 slices is far more than the corpus needs and small enough that a
 /// pathological program reports the gap promptly.
 const RECEIVE_PUMP_SLICES: u64 = 64;
+// **Test-only** count of the `receive … after T` wait-loop iterations this thread has run.
+//
+// The `after`-arm's slicing changes no term and no exit code — its only observable effect is
+// *when* the scheduler is re-entered — so a test can pin it only through a counter, the way
+// `crate::runtime`'s pass-sleep counters pin the `run` route's blocking policy. One increment
+// per iteration that reached the two waits, read through [`receive_wait_iterations`] and
+// cleared through [`reset_receive_wait_iterations`]. Per **thread**, and the evaluator runs on
+// the thread that entered it, so tests running in parallel cannot see each other's count.
+#[cfg(test)]
+thread_local! {
+    static RECEIVE_WAIT_ITERATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// How many `receive … after T` wait iterations this thread has run (test instrumentation).
+#[cfg(test)]
+fn receive_wait_iterations() -> u64 {
+    RECEIVE_WAIT_ITERATIONS.with(std::cell::Cell::get)
+}
+/// Resets this thread's test-only receive-wait iteration counter.
+#[cfg(test)]
+fn reset_receive_wait_iterations() {
+    RECEIVE_WAIT_ITERATIONS.with(|count| count.set(0));
+}
 
 /// Converts a `Result<_, BeamError>` into the evaluator's control flow.
 ///
@@ -1430,6 +1453,19 @@ impl Evaluator<'_, '_> {
     ///   end` takes the oracle's 300 ms rather than returning at once — and the loop is
     ///   driven by real deadlines only, so the case with nothing to run, no port output and
     ///   no timer cannot busy-spin.
+    ///
+    ///   Both waits are **sliced** ([`PORT_POLL_SLICE`], the port poller's own budget, which
+    ///   this loop reuses rather than inventing a second granularity): one iteration waits at
+    ///   most one slice, then rescans. The window, not the slice, is what ends the wait, so
+    ///   the observable timing is unchanged — but a long `after T` now re-enters
+    ///   [`Runtime::pump_scheduler`] every slice. That is what keeps a **distribution**
+    ///   connection alive on this route (contract A.5): a peer's `'N'` handshake is only
+    ///   *accepted* by the scheduler pass's distribution pump, so a wait that handed the whole
+    ///   window to the port poller — which blocks on any live port, and the boot's own
+    ///   `inet_gethost` helper child never closes — left the peer's connection queued in the
+    ///   listen backlog until `net_setuptime` gave up. A message that arrives in a slice
+    ///   (delivered by that very pump, or by the port poller) is picked up by the rescan
+    ///   before the timeout is considered, so a message still wins over the deadline.
     /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
     ///   runnable and then reports the typed capability gap `receive: no matching message
     ///   arrived` rather than hanging. There *is* a host-timer mechanism
@@ -1460,11 +1496,25 @@ impl Evaluator<'_, '_> {
                     if remaining.is_zero() {
                         break;
                     }
+                    // **One slice of the window, never all of it** (see the method docs): the
+                    // waits below are the only places this loop blocks, and blocking for the
+                    // whole window is what starved the scheduler — and with it the distribution
+                    // pump that `accept`s a peer's connection. A context that may *not* pump
+                    // (the evaluator running inside a scheduler slice) keeps the old
+                    // whole-window wait: its `after` body is due when the window ends.
+                    let slice = if self.ctx.may_pump_scheduler() {
+                        remaining.min(PORT_POLL_SLICE)
+                    } else {
+                        remaining
+                    };
+                    #[cfg(test)]
+                    RECEIVE_WAIT_ITERATIONS.with(|count| count.set(count.get() + 1));
                     // The port poller owns the *other* message source (see the module docs of
                     // `crate::context`): its messages are produced, matched and discarded, not
                     // enqueued, so a non-matching one is not left behind. With a live port it
-                    // waits out the remaining time; with none it returns at once.
-                    let messages = match self.ctx.poll_port_messages(remaining) {
+                    // waits one slice (or the rest of the window, if that is shorter); with
+                    // none it returns at once.
+                    let messages = match self.ctx.poll_port_messages(slice) {
                         Ok(messages) => messages,
                         Err(err) => return Err(Flow::Fatal(err)),
                     };
@@ -1476,8 +1526,8 @@ impl Evaluator<'_, '_> {
                     // The **third** source is the runtime's own timer heap, and only a
                     // scheduler pass fires it: `timer:apply_after/4` (a `timer_server` arming
                     // `erlang:start_timer/3`) and `erlang:send_after/3` deliver through it.
-                    // Waiting for the earliest pending deadline — or, with none, for the rest
-                    // of this window — and then pumping is what makes
+                    // Waiting for the earliest pending deadline — or, with none, for the next
+                    // slice of this window — and then pumping is what makes
                     // `timer:apply_after(300, erlang, send, [Self, done]), receive M -> M
                     // after 1500 -> timeout end` answer `done` here exactly as the oracle
                     // does, and what makes a bare `receive _ -> ok after 300 -> ok end` take
@@ -1487,9 +1537,17 @@ impl Evaluator<'_, '_> {
                     if !self.ctx.may_pump_scheduler() {
                         break;
                     }
-                    if !heap!(self.ctx.runtime.wait_for_timer(deadline, RECEIVE_PUMP_SLICES)) {
-                        // Nothing was pending inside the window and nothing became due: the
-                        // window itself has elapsed, so run the `after` body.
+                    // Again one slice, so the loop above's [`Runtime::pump_scheduler`] — the
+                    // distribution pump, the timer heap and the run queue — is re-entered
+                    // every slice while the window is open. A pending deadline *inside* the
+                    // slice is still slept to exactly (`Runtime::wait_for_timer` takes the
+                    // earlier of the two instants), so a short timer fires at its deadline
+                    // rather than up to a slice late.
+                    let wake = deadline.min(Instant::now() + PORT_POLL_SLICE);
+                    heap!(self.ctx.runtime.wait_for_timer(wake, RECEIVE_PUMP_SLICES));
+                    // Nothing became due in that slice; the wait ends when the **window** (not
+                    // the slice) has elapsed, and only then does the `after` body run.
+                    if Instant::now() >= deadline {
                         break;
                     }
                 }
@@ -3401,6 +3459,76 @@ mod tests {
         assert_eq!(raise.class, ExceptionClass::Throw);
         assert_eq!(raise.reason.as_atom(), Some("x"));
         assert!(raise.stacktrace.is_empty(), "`[]` decodes to an empty trace");
+    }
+    /// Evaluates a `receive … after T` probe on a **booted** runtime and returns how many
+    /// slice-sized wait iterations the `after` arm took (the probe's own value must be the
+    /// small integer `1`).
+    ///
+    /// The boot is warmed *before* the counter is reset, because a runtime boots **lazily**, on
+    /// its first scheduler pass — and that one pass drives the whole boot script (far longer
+    /// than any window these tests use), so measuring it would report zero slices of the window.
+    /// The runtime is the real `-eval` route's (`Runtime::eval` builds the same context this
+    /// does), and after the boot the kernel's `inet_gethost` helper port is live and idle exactly
+    /// as it is on the CLI's route.
+    fn wait_iterations(expr: &str) -> u64 {
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        // One slice, so `boot_if_needed` has run before the measurement starts.
+        runtime.run_one_slice().expect("the runtime boots");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        reset_receive_wait_iterations();
+        let value = eval(&mut ctx, expr).unwrap_or_else(|error| panic!("{expr} failed: {error}"));
+        assert!(is_small(value), "{expr} must answer the small integer `1`");
+        assert_eq!(signed_value(value), 1, "{expr}");
+        receive_wait_iterations()
+    }
+
+    /// A `receive … after T` window longer than one port-poll slice is waited out in
+    /// **slices**, re-entering the scheduler each time — never handed to the port poller whole.
+    ///
+    /// This is the structural half of contract A.5's inbound requirement (a peer's connection is
+    /// only `accept`ed by the scheduler pass's distribution pump, so the wait must reach it
+    /// repeatedly); the end-to-end proof needs two live nodes and is a manual probe, not a unit
+    /// test. A count, not a wall clock, is asserted: the slicing changes no term and no exit
+    /// code, only *when* the scheduler re-entered, so a counter is the only honest witness —
+    /// exactly the discipline `crate::runtime`'s pass-sleep counters follow.
+    #[test]
+    fn a_long_after_window_is_waited_out_in_port_poll_slices() {
+        // 100 ms is four slices (measured: 4). The lower bound is the slicing itself; the upper
+        // bound guards the other failure — a slice that degenerated to a spin. Neither bound can
+        // flake on a loaded host, which can only make each slice *longer* (fewer iterations).
+        let iterations = wait_iterations("receive _ -> ok after 100 -> ok end, 1");
+        assert!(
+            iterations >= 2,
+            "a 100 ms `after` window (PORT_POLL_SLICE = {PORT_POLL_SLICE:?}) must be waited out \
+             in slices, re-entering the scheduler each time, but it took {iterations} wait \
+             iteration(s) — a single one means the whole window went to the port poller again, \
+             which is the distribution starvation contract A.5 measures"
+        );
+        assert!(
+            iterations <= 100,
+            "a 100 ms `after` window must not busy-spin: {iterations} waits is more than one per \
+             millisecond, so the slice is no longer a slice"
+        );
+    }
+
+    /// A window **shorter** than one slice is not stretched into a slice loop.
+    ///
+    /// The bound is `<= 1` rather than `== 1` on purpose: each iteration *starts* with a
+    /// scheduler pump, and a pump whose run queue is empty already blocks up to one
+    /// [`PORT_POLL_SLICE`] in its own port poll (a live-but-idle port, which the booted kernel's
+    /// helper child is), so a sub-slice window can legitimately be consumed by that pump before
+    /// the loop ever reaches its own wait. What must not happen — and is what this pins — is a
+    /// **slice loop** around a shorter window.
+    #[test]
+    fn a_sub_slice_after_window_never_loops() {
+        // `PORT_POLL_SLICE` is 25 ms, so a 5 ms window fits inside one slice.
+        let iterations = wait_iterations("receive _ -> ok after 5 -> ok end, 1");
+        assert!(
+            iterations <= 1,
+            "a 5 ms `after` window is inside one {PORT_POLL_SLICE:?} slice, so it must take at \
+             most one wait, but it took {iterations}"
+        );
     }
     #[test]
     fn malformed_expressions_are_capability_gaps() {

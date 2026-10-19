@@ -43,9 +43,9 @@
 //! | `init:restart/0` | reboots the node **in place** (resets the code path to its boot default, re-runs the boot sequence and the loaded boot script) and answers `ok` (`init.erl:492-518,937-954`) |
 //! | `init:boot/1` | the boot **entry point**: parses the `-boot <Script>` flag out of the byte-list argument, resolves it exactly as the CLI's `-boot FILE` does and executes the script (`init.erl:585-597`) |
 //! | `erlang:is_alive/0`, `erlang:get_cookie/0`, `erlang:set_cookie/2` | read/replace this node's own identity (the name, the cookie) and its liveness — the distribution state no BIF module can reach (contract A.5, `src/native/node.rs`) |
-//! | `erlang:nodes/0,1,2` | read this runtime's own **link table** (the established outbound distribution links), not a registry value (contract A.5, `src/native/net.rs`) |
-//! | `net_adm:ping/1`, `net_kernel:connect_node/1` | **drive** that link table: the outbound `epmd` lookup + `'N'` client handshake (`Runtime::dist_connect`) is host socket work (contract A.5, `src/native/net.rs`) |
-//! | `erl_distribution:start_link/0,1` | the Erlang-level distribution **supervisor** `kernel_sup` starts as its `net_sup` child: answered `ignore` because this runtime's distribution is the native [`beam_dist`](crate::dist)/`DistNode`, not the `inet_tcp`/`prim_inet` stack that supervisor would run (contract A.5, `src/native/net.rs`) |
+//! | `erlang:nodes/0,1,2` | read this runtime's own **link table** (the established outbound distribution links), not a registry value (contract A.5, `src/native/net/`) |
+//! | `net_adm:ping/1`, `net_kernel:connect_node/1` | **drive** that link table: the outbound `epmd` lookup + `'N'` client handshake (`Runtime::dist_connect`) is host socket work (contract A.5, `src/native/net/`) |
+//! | `erl_distribution:start_link/0,1` | the Erlang-level distribution **supervisor** `kernel_sup` starts as its `net_sup` child: answered `ignore` because this runtime's distribution is the native [`beam_dist`](crate::dist)/`DistNode`, not the `inet_tcp`/`prim_inet` stack that supervisor would run (contract A.5, `src/native/net/`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:get_object_code/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) — and, for `get_object_code/1`, its `.beam` bytes |
 //! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
@@ -103,6 +103,7 @@ mod io;
 mod loader;
 pub(crate) mod memory;
 mod net;
+pub(crate) mod net_kernel;
 mod node;
 pub(crate) mod port;
 mod prim;
@@ -116,7 +117,9 @@ use std::process::Command;
 
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext};
-use beam_term::{atom_val, is_atom, is_small, make_atom, make_small, signed_value, Eterm, NIL};
+use beam_term::{
+    atom_val, is_atom, is_list, is_small, make_atom, make_small, signed_value, Eterm, NIL,
+};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -502,6 +505,13 @@ impl RuntimeContext<'_> {
             ("erlang", "alias", 0) => Some(self.alias_0()),
             ("erlang", "alias", 1) => Some(self.alias_1(args)),
             ("erlang", "unalias", 1) => Some(self.unalias_1(args)),
+            // The **node-monitor** BIF (`erlang:monitor_node/2`, `bif.tab:108`): subscribes the
+            // caller to one node's connection state. Its store is runtime state — the C's
+            // `ERTS_MON_TYPE_NODE` monitor chain on [`Runtime`](crate::Runtime) — and the
+            // notifications are emitted by the scheduler pass, so the arm lives here and the
+            // body in [`net`]. `monitor_node/3` (the `Info`-carrying form) has **no** arm: it
+            // stays the `beam_bifs` registry's typed capability gap.
+            ("erlang", "monitor_node", 2) => Some(self.monitor_node_2(args)),
             ("erlang", "exit", 2) => Some(self.exit_2(args)),
             ("erlang", "exit", 3) => Some(self.exit_3(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
@@ -1172,6 +1182,32 @@ fn halt_slogan(chars: Eterm) -> Result<String> {
 /// The C's `HALT_MSG_SIZE` — the slogans' character budget (`bif.c:4380`).
 const HALT_MSG_SIZE: usize = 1023;
 
+/// The elements of a tuple term, or `None` when `term` is not a tuple.
+///
+/// Shared by the native **service** modules that decode a wire message
+/// ([`file_server`](crate::native::file_server)'s `gen_server`/device protocols and
+/// [`net_kernel`](crate::native::net_kernel)'s `gen:call`), so the two decoders cannot drift.
+pub(crate) fn tuple_fields(term: Eterm) -> Option<Vec<Eterm>> {
+    let arity = terms::tuple_arity(term).ok()?;
+    let mut fields = Vec::with_capacity(arity);
+    for index in 0..arity {
+        fields.push(terms::tuple_element(term, index).ok()?);
+    }
+    Some(fields)
+}
+
+/// The head of an **improper** list `[Head | Tail]` whose tail is not a list — the shape of
+/// `gen:reply/2`'s `[alias|Ref]` tag. `None` for a proper list (or tail) and for a non-list.
+///
+/// `is_list/1` is the **proper**-list predicate, so it reports `false` for `[alias|Ref]`; the
+/// cons accessors are what decide whether the term is a cons cell at all.
+pub(crate) fn improper_list_head(term: Eterm) -> Option<Eterm> {
+    let tail = terms::cons_tail(term).ok()?;
+    if tail == NIL || is_list(tail) {
+        return None;
+    }
+    terms::cons_head(term).ok()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
