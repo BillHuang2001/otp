@@ -125,6 +125,36 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   `Env` (`:182-187`, pushed by `register_fun` `:1624`); and whatever `eval_off_heap`/`eval_heap`
   themselves hold. `Runtime::as_action_process` (`runtime.rs:3059`) runs the body as a freshly spawned
   child and `stabilize_term_with`s only the **final** result (step 5).
+- **`eval_off_heap` is NOT pid-less in practice: a scheduled `run`-route process grows it too.**
+  `RuntimeContext::run_export` (the `ExecutionContext::call_bif` external-module route) is
+  **blocking-aware for every caller**, so a `run`-route process calling e.g. `base64:encode/1` (an
+  external-module entry into `base64.beam`, whose `bs_create_bin` accumulator passes
+  `ERL_ONHEAP_BINARY_LIMIT` = 64 bytes) goes through `run_export_blocking`/`run_label_blocking` and
+  their `runtime.adopt_escaped_binaries(machine.refc_binaries())` — see
+  `adopt_escaped_binaries`'s own doc list of nested runs (`runtime.rs:1599-1613`). `pump_once` is the
+  *same* path (it is the `step` closure both pass). `runtime/CONTEXT.md`'s "not attributed to any
+  process" is about `process_info(P, binary)` attribution, **not** about who grows the table.
+- **`beam_message::OffHeapTable` traps for anyone pruning it.** There is **no per-entry removal** —
+  only `drain_binaries()` (all), so a prune is drain → filter → re-`push_binary`. `push_binary` never
+  dedups (two pushes of one payload = two entries) and `binary_by_data_ptr` resolves only the
+  **first** match; the `data_ptr` dedup lives in `adopt_escaped_binaries` (`runtime.rs:1618-1629`).
+  `len`/`is_empty`/`iter`/`overhead_bytes` are **MSO-only** — after `push_binary`, `is_empty()` is
+  still `true` — so a binary-side gate must read `binaries()`. A `GrowOutcome::Moved` realloc
+  invalidates every previously handed-out `data_ptr`; re-read it from the live handles.
+- **The raw-`Eterm` holders a prune must publish are already inventoried** (written for a *moving*
+  heap, but the same roster is the prune's must-publish list — relocation-rooting asks for pointer
+  updates, prune-rooting for read-reachability, so the requirement differs but the set does not):
+  `context/IMPLEMENTATION.md` §*What a MOVING engine heap would invalidate — the at-risk roster*
+  (`Runtime::persistent_terms`, `trace`'s `MatchSpec::Functions`, `seq_trace`'s `Token{label,from}`,
+  `eval_closures`' `FunBody.env`, `timers`' `TimerAction::Deliver`) and its *Safe* list
+  (`RunnerState.exits`/`results`, `references`/`Timers.refs` keys, ETS's own arena,
+  `RuntimeContext`, `dist`/`port`, `PortMeta`). Two refinements found by inspecting the writers:
+  `persistent_term:put/2`'s key+value and `TimerAction::Deliver.message` **are** stabilized
+  (`context/calls.rs:713-722`; `context/runtime_hooks.rs:1343` and `native.rs:807`) and
+  `trace_pattern` stabilizes its match-spec functions (`native/erts_internal/trace.rs:165-174`), so
+  none of those three can name a `[BinRef][ErlSubBits]` payload (the simple copy flattens it) —
+  whereas `seq_trace`'s `set_label` (`seq_trace.rs:324-329`, reached from `seq_trace_2:461`) stores
+  the raw term **unstabilized**, and `eval_closures`' env can name one.
 
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's own test region — everything from its first test-module declaration to EOF, whether that declaration opens an inline module or a sibling `#[path]` one).
