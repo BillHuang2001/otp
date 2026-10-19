@@ -1,13 +1,13 @@
 # `beam_rt` — dated performance snapshots (`BEFORE` → `AFTER`)
 
-Two **dated, HEAD-labelled** snapshots of the Rust runtime taken with the **same method**, so the behavioural changes that landed between them read off directly.
-Both are **historical records kept verbatim**: each describes the tree at *its* HEAD, not today's, and neither is the figure to quote for the present tree.
+Two **dated, HEAD-labelled** suite snapshots of the Rust runtime taken with the **same method**, so the behavioural changes that landed between them read off directly — followed by three **single-mechanism controlled A/Bs** taken later, each carrying its own two HEADs.
+All of them are **historical records kept verbatim**: each describes its own tree, never today's, and none is the figure to quote for the present tree.
 The present-tree figures are in [`PERF.md`](PERF.md) (`CURRENT` plus the standing *Current startup regime* note), the per-call dispatch and copy-out analyses are in [`PERF_DISPATCH.md`](PERF_DISPATCH.md), the measurement narrative is [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md), and the bench driver's own environment record is [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md).
 A `copy-out OFF`/`copy-out ON` or `Path A`/`Path B` arm label names that comparison's arm as it was at its own HEAD — [`PERF_DISPATCH.md`](PERF_DISPATCH.md)'s *Measurement provenance* note records what each arm did then, since both arms of the present tree copy a container result and only the destination differs.
 `BEFORE` is the pre-change baseline; `AFTER` is the same method re-run after the execution tier defaulted to the native baseline JIT for every process and the registered-BIF dispatch prologue was cut, with a `BEAM_RT_TIER=interpreter` column added so a **tier effect** reads apart from a **dispatch-prologue effect**.
 Every number here is **measured, never modelled**; a sys-only workload that cannot produce a Rust-side figure is recorded as `skipped(<reason>)` with no number.
 
-## Host load (read before quoting any absolute number from either snapshot)
+## Host load for the two suite snapshots (read before quoting any absolute number from either of them)
 
 The benchmark host is shared and other agent builds run concurrently, so the 1-min `/proc/loadavg` sat at **≈ 20–55** (≈ 1.5–4× `nproc`) during `BEFORE` and **≈ 31–52** (≈ 2.2–3.7× `nproc`) across the `AFTER` passes — a somewhat lighter band, with the same non-monotonic relationship to the measured figures.
 **Absolute latencies are load-polluted and are not comparable across runs or across the two snapshots**; only the **ratios** and the **minima** are signal.
@@ -356,9 +356,244 @@ native `gc_bif` fast path.
   `elixir_compiler`) remain out of scope for this Rust-side snapshot exactly as in `BEFORE`
   (`emqx` still `skipped(emqx-requires-otp-28)`).
 
+## Further dated snapshots — single-mechanism controlled A/Bs
+
+Each A/B below carries **its own two HEADs** and isolates **one mechanism** with nothing else changed, measured after the `AFTER` snapshot above.
+
+### The interpreter path's per-instruction reduction charge — controlled A/B
+
+`PERF.md`'s `INTERP` column and its *The one-shot cold-start cost* section both compare **tiers**; neither
+isolates the cost of the **per-instruction reduction charge** itself. Under
+`BEAM_RT_TIER=interpreter` every scheduled process pays, for each interpreted instruction, one
+`&mut dyn ExecutionContext` crossing plus a u32 decrement/compare: `Machine::drive` calls
+`ctx.reduce(1)?` whenever it latched `wants_reduce() == true`
+(`crates/beam_engine/src/machine/drive.rs`), and `runner/budget.rs::BudgetContext` is the only host
+that answers `true` (the single-pass `RuntimeContext` answers `false`, so those runs skip the
+crossing). A controlled A/B at **one HEAD**, with nothing else changed, measures what that charge
+costs.
+
+| variant | temporary edit (never committed) | what it removes |
+|---|---|---|
+| **A — charge ON** | none — the shipped behaviour | — |
+| **B — charge OFF** | `BudgetContext::wants_reduce() -> false` | the **hook crossing**, the charge, **and** the slice pre-emptions the charge induced on any stretch that reaches no heap-admission point |
+
+**Variant (ii) was chosen deliberately**, over the alternative (keep `wants_reduce() == true`, make
+`reduce` return `Ok(())`): that variant would have measured the charge *arithmetic* alone, whereas
+variant (ii) removes the whole mechanism and is therefore the **full-cost upper bound** on the
+per-instruction dyn call. Read every delta below as that upper bound, not as pure call overhead.
+
+| item | value |
+|---|---|
+| HEAD (one, for both variants) | `06bf44d962306b7ae91891e040f734919a494b1f` (`06bf44d962`, 2026-10-12 06:49 +0800) |
+| Date (UTC) | 2026-10-11 23:10–23:17 UTC |
+| Host / kernel | Linux 7.2.9 `x86_64`, `nproc` = **14** (the same shared, oversubscribed host) |
+| Toolchain | `rustc 1.98.1`, `cargo 1.98.0` |
+| Tier | `BEAM_RT_TIER=interpreter` (the charge is unreachable mid-block on the default baseline tier) |
+| Runtime side | `--runtime rust` only — the system-ERTS side cannot see this charge and would only double the wall time |
+| N | **5 per variant**, **alternated at run granularity** (`A B A B …`, 10 runs in ≈ 7 min) |
+| Host load (1-min `/proc/loadavg` immediately **before** each run) | A `1.06, 1.17, 1.01, 1.00, 1.00`; B `1.18, 1.18, 1.07, 1.00, 0.93` — ≈ **0.9–1.2** on a 14-CPU host, and ≤ 1.25 after every run (a light window: the `BEFORE`/`AFTER` load caveat does **not** apply to this pass) |
+| per-run figure | the report's `summary.min` for a sampled metric (`startup_ms`, `case_*_wall_ms`; 10 samples/case/run, 50 for `baseline` startup) and the scalar `value` for a throughput metric (`ns_per_call`/`ns_per_op`/`ns_per_element`) |
+| reported figure | **min over the 5** runs of that variant; the spread is that variant's full min–max over its 5 runs |
+
+```sh
+# 1. build the runtime + driver in release; keep the shipped binary aside as A
+erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p bench -p beam_rt
+cp erts_rust/target/release/beam_rt $TMPDIR/ab/beam_rt.charge            # A — charge ON
+
+# 2. TEMPORARY, NON-COMMITTED edit to src/runner/budget.rs:
+#      fn wants_reduce(&self) -> bool { false }
+#    rebuild and keep the binary aside as B
+erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p beam_rt
+cp erts_rust/target/release/beam_rt $TMPDIR/ab/beam_rt.nocharge         # B — charge OFF
+
+# 3. revert the edit completely — `git diff src/runner/budget.rs` is empty in the measured tree
+
+# 4. ten interleaved runs, host load recorded before each
+for v in charge nocharge charge nocharge charge nocharge charge nocharge charge nocharge; do
+  cp $TMPDIR/ab/beam_rt.$v erts_rust/target/release/beam_rt
+  cat /proc/loadavg >> $TMPDIR/ab/loadavg.log
+  BEAM_RT_TIER=interpreter erts_rust/target/release/bench run --full --runtime rust \
+    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound --out-file $TMPDIR/ab/runN.json
+done
+```
+
+All ten reports are `status=ok` with **no** unsupported case and **no** below-timer-resolution note,
+so every row below is a real measurement (the raw JSON was written under `$TMPDIR/ab/` and is
+**ephemeral**, not committed — re-run the loop to regenerate).
+
+Result — `A/B > 1` ⇒ charge ON is dearer; the variant removed `Δ = A − B`. `baseline`/`slice` rows are
+**ms** (`startup_ms` / `case_*_wall_ms`); every other row is **ns** per unit.
+
+| workload | case | A (min5) | A range (5) | B (min5) | B range (5) | Δ (A−B) | A/B | verdict |
+|---|---|---|---|---|---|---|---|---|
+| `baseline` | — | 13.778 | 13.778–29.519 | 13.733 | 13.733–22.782 | +0.045 | 1.003× | below the spread |
+| `slice` | `add` | 13.944 | 13.944–22.224 | 14.041 | 14.041–18.066 | −0.097 | 0.993× | below the spread |
+| `slice` | `fib` | 14.076 | 14.076–22.308 | 14.043 | 14.043–25.821 | +0.033 | 1.002× | below the spread |
+| `slice` | `pick` | 13.994 | 13.994–15.611 | 14.080 | 14.080–22.873 | −0.086 | 0.994× | below the spread |
+| `slice` | `calendar_last_day` | 14.654 | 14.654–25.223 | 14.842 | 14.842–25.910 | −0.187 | 0.987× | below the spread |
+| `slice` | `queue_from_size` | 17.081 | 17.081–25.941 | 18.193 | 18.193–23.692 | −1.112 | 0.939× | below the spread |
+| `slice` | `gb_trees_size` | 14.779 | 14.779–25.063 | 14.735 | 14.735–22.510 | +0.044 | 1.003× | below the spread |
+| `slice` | `base64_encode_size` | 15.314 | 15.314–26.073 | 16.065 | 16.065–25.861 | −0.752 | 0.953× | below the spread |
+| `slice` | `ordsets_from_size` | 14.401 | 14.401–22.709 | 15.486 | 15.486–22.813 | −1.085 | 0.930× | below the spread |
+| `slice` | `string_str_length` | 27.424 | 27.424–33.580 | 29.850 | 29.850–33.510 | −2.426 | 0.919× | below the spread |
+| `foreign` | `cowboy_bstr:to_lower/1` | 18 911 | 18 911–19 594 | 18 353 | 18 353–18 798 | +558 | 1.030× | disjoint ranges; Δ inside A's own range |
+| `foreign` | `cowboy_bstr:capitalize_token/1` | 23 739 | 23 739–23 884 | 22 857 | 22 857–23 297 | +882 | 1.039× | **above the spread** (ranges disjoint) |
+| `foreign` | `emqx_base62:encode/1` | 11 625 | 11 625–11 996 | 11 259 | 11 259–11 533 | +366 | 1.032× | disjoint ranges; Δ inside A's own range |
+| `foreign` | `emqx_base62:decode/1` | 19 998 | 19 998–20 499 | 17 403 | 17 403–17 861 | +2 595 | 1.149× | **above the spread** (ranges disjoint) |
+| `copy_bound` | `etf_roundtrip` | 72 172 | 72 172–73 961 | 72 560 | 72 560–73 646 | −389 | 0.995× | below the spread |
+| `copy_bound` | `ets_copy` | 3 192 | 3 192–3 261 | 3 084 | 3 084–3 205 | +108 | 1.035× | below the spread |
+| `copy_bound` | `send_recv` | 146 599 | 146 599–150 600 | 147 884 | 147 884–150 961 | −1 285 | 0.991× | below the spread |
+| `list_walk` | — | 145.6 | 145.6–163.0 | 134.3 | 134.3–145.5 | +11.3 | 1.084× | disjoint by 0.1 ns; Δ inside A's own range |
+| `gc_bound` | `churn` | 239 053 | 239 053–245 901 | 237 677 | 237 677–240 416 | +1 376 | 1.006× | below the spread |
+
+**Verdict.**
+
+- **Above the spread — the charge's full cost is resolved:** `emqx_base62:decode/1` **+14.9 %**
+  (19 998 → 17 403 ns) and `cowboy_bstr:capitalize_token/1` **+3.9 %** (23 739 → 22 857 ns), both with
+  disjoint 5-run ranges and a Δ exceeding the larger range.
+- **Sign consistent, magnitude at the noise floor:** `cowboy_bstr:to_lower/1` (+3.0 %),
+  `emqx_base62:encode/1` (+3.3 %) and `list_walk` (+8.4 %) have **disjoint** 5-run ranges (5/5
+  rank-separated) but a delta of minima *inside* the larger set's own min–max range, so the sign is
+  rank-separable and the **magnitude is not separable at this N**.
+- **Not separable from the noise floor, sign not even consistent:** every `baseline` and `slice` row, all
+  three `copy_bound` rows and `gc_bound churn` (overlapping ranges; several read *cheaper* under A).
+
+Which rows could show it at all:
+
+- **Process-startup-dominated — cannot show it.** `baseline` `startup_ms` (≈ 13.7 ms of process boot —
+  this snapshot's preloaded-only slice; the current runtime instead pays the ≈ 0.35 s boot-script drive,
+  see `PERF.md` *Current startup regime*) and every `slice` row (whole-process wall for one call per OS process,
+  13.9–27.4 ms), of which the interpreted work is a small fraction.
+- **Interpreted-work marginals — the rows that *can* show it.** `foreign` (per `cowboy_bstr` /
+  `emqx_base62` call) is the only family that resolved it, at **+3.0 % to +14.9 %** of per-call time.
+  `copy_bound`'s three cases are dominated by the copy itself and `gc_bound churn` by the
+  allocate-and-abandon work plus any collection (≈ 239 µs/op), so one reduction charge is a small share
+  there — and their startup-cancelled marginals are noisier (2–4 % min–max per set), leaving it
+  unresolved at N = 5.
+- The case-to-case deltas span **+3.0 % to +14.9 %** while the disjoint-but-inside-spread rows sit at
+  ≈ +3 % to +8 %, so the charge is **not** a single per-instruction constant across these workloads —
+  consistent with variant (ii) also removing the **pre-emptions** the charge induced, which is why the
+  figures are an **upper bound** on the pure dyn call.
+
+**Take-away for the tree.** On the **interpreter** tier the shipped per-instruction charge costs up to
+**≈ 15 %** of per-call time on the most instruction-bound workload measured here and **≈ 3–4 %** on
+the other three `foreign` shapes; on the **default baseline-JIT** tier the hook is unreachable
+mid-block, so this cost is specific to the interpreter path and no startup-dominated or
+copy/GC-dominated row resolves it at N = 5. Nothing here changes the pre-emption property the charge
+exists for (see `src/runner/budget.rs`) — it only prices it.
+
+### The per-call cost is independent of the iteration count — the per-slice off-heap mirror (`BEFORE` `3aa42c0e41` → `AFTER` `72d778dcf1`)
+
+**Sides.** `AFTER` is `beam_rt` built from the committed tree at `72d778dcf1`; `BEFORE` is the **same harness** built from `3aa42c0e41`, the commit immediately before it, so this A/B isolates one mechanism and nothing else.
+It is, like the reduction-charge A/B above, a controlled A/B carrying its own two HEADs rather than a re-run of the `CURRENT` snapshot's `--full` pass.
+The system side (`sys`) is `erl` on `PATH` — **OTP 29.1.1 / erts-17.1** — and did not change between the two sides.
+Host: Linux `x86_64`, `nproc` = **14**, **shared and heavily loaded** — the 1-min `/proc/loadavg` read **18–89** during these runs — so **ratios and the per-`N` shape are the evidence, never the absolute wall time**.
+Every measured run was pinned with `taskset -c 3`, and every `/proc/loadavg` reading was recorded **before and after** each run.
+
+**The one mechanism the A/B isolates.** `BEFORE` mirrors the engine's `Machine::refc_binaries` reservoir onto the running process at the end of every slice, and `beam_gc::OffHeap` is a slot-stable, never-compacted slot vector, so that mirror hands out one slot per payload per slice for the life of the process and puts three `O(off-heap slots)` scans on the per-call path — the eager `max_heap_size` usage figure that `Process::grow_nursery`/`ensure_capacity` read, and `Process::sweep_off_heap_binaries` at every rooted collection.
+`AFTER` keeps the roster on the reservoir itself (`RunnerState::reservoir_at`, unioned with any payload a host registers on the PCB), so the PCB's off-heap table stays **empty** and all three scans walk an empty vector.
+
+**The ladder** — `(wall − boot_baseline) / N`, the boot baseline being the median of 3 `N = 0` runs; the real `emqx_base62.erl` plus a driver loop, `taskset -c 3 <beam_rt> -pa <dir> run <drv.beam> b62drv:<fn>/1 <N>`; 3 rounds, **alternating `BEFORE`/`AFTER`**; every `N` produced **identical checksums on both sides**, so the two sides do the same work:
+
+| `N` | enc `BEFORE` (ns/call) | enc `AFTER` (ns/call) | B/A | dec `BEFORE` (ns/call) | dec `AFTER` (ns/call) | B/A |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 000 | 16 287.5 | 7 371.4 | 2.21× | 4 029.6 | 2 852.8 | 1.41× |
+| 20 000 | 30 235.7 | 6 418.3 | 4.71× | 5 088.1 | 4 204.4 | 1.21× |
+| 40 000 | 78 509.7 | 6 096.0 | 12.88× | 12 656.3 | 6 377.9 | 1.98× |
+| 60 000 | 127 050.9 | 4 684.2 | 27.12× | 16 931.6 | 7 377.0 | 2.30× |
+| 120 000 | 377 725.2 | 6 581.7 | 57.39× | 31 904.1 | 7 559.4 | 4.22× |
+
+**Reading the ladder.** `BEFORE`'s per-call cost grows **23.2× over a 12× `N` range** (16 287.5 → 377 725.2 ns/call from `N` = 10 000 to 120 000) — super-linear, which is the per-slice `O(slots)` mirror priced per iteration.
+`AFTER` is **flat within a noise band** (4 684.2–7 371.4 ns/call across the same 12× range, with no monotone trend), so the per-call cost is **independent of `N`** and the total is linear in the iteration count.
+`decode` has the same shape — **7.9× growth → flat** (4 029.6 → 31 904.1 ns/call under `BEFORE`, 2 852.8–7 559.4 under `AFTER`).
+
+**Paired `bench` A/B** — `bench run --quick --runtime all --workloads foreign`, **3 alternating rounds**, medians of the `rust` rows; the `sys` row is that A/B's own noise floor at **0.88–0.92×**, so only a rust-side move outside that band is the change:
+
+| case | `BEFORE` (ns/call) | `AFTER` (ns/call) | B/A |
+|---|---:|---:|---:|
+| `emqx_base62_encode` | 138 544.3 | 5 667.6 | 24.44× |
+| `emqx_base62_decode` | 20 698.3 | 10 028.7 | 2.06× |
+| `bstr_to_lower` | 18 504.0 | 8 607.9 | 2.15× |
+| `bstr_capitalize_token` | 21 656.3 | 10 485.8 | 2.07× |
+
+**As a multiple of the system ERTS measured in the same rounds**, the `rust` side moved from **392–563×** to **19.3×** (`encode`), **47–64×** to **23.9×** (`decode`), **37–53×** to **19.6×** (`bstr_to_lower`) and **41–59×** to **24.2×** (`bstr_capitalize_token`).
+
+**The defect was not `encode`-specific.** Any loop whose iteration builds an **off-heap refc binary from compiled code** accumulated into the mirror: a second `bstr_to_lower` ladder reads `BEFORE` **11 905 → 26 024 ns/call** from `N` = 10 000 to 60 000 and `AFTER` **flat in a 9 829–11 119 ns/call band** across the same range.
+The three non-`encode` paired rows above therefore carry the same shape — a real `BEFORE` value and a flat `AFTER` one — at their own `N`.
+
+**The A/B moves per-call cost, not memory.** Peak RSS on both sides is the same within the noise band — the roster is a machine-level handle list either way, so the difference was per-call work, never a memory win.
+
+**Correctness of the measured side.** `--lib -- runner::tests` **46 passed / 0 failed**, `--lib -- native::memory` **34 passed / 0 failed**, `--test process_info_items` **4 / 0**, `--test engine_off_heap_transport` **6 / 0**.
+The re-pointed path was probed directly — a compiled `<<0:N/unit:8>>` held live by a parked child, then `erlang:process_info(P, binary)` → `{1,true}` — and agrees with the system runtime.
+The differential cases `gc/process_info_gc_key_set_is_stable`, `gc/process_info_memory_is_positive_integer` and `system_info/process_info_bulk_returns_list` all report `[AGREE]`; **no corpus case exercises the `binary` item** — [`tools/differential/src/corpus/gc.rs`](../tools/differential/src/corpus/gc.rs) keeps it out behind a stale capability-gap note, so that item's coverage is `tests/process_info_binary.rs`'s own oracle cross-check (`PERF.md` *`process_info(self(), binary)`*), not the corpus.
+
+**Where the memory ceiling is bounded.** The reservoir is not an accumulator: the runner's `Yield` arm prunes it at the slice boundary whenever the process's binary virtual heap is over its budget, releasing every payload its just-published roots no longer reach (`src/context/gc/bin_vheap.rs`), so `erlang:memory(binary)` is flat in the iteration count — the figures, the sawtooth envelope, the disabled-site A/B and the retained-payload half are [`CONTEXT.md`](CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, measured by `tests/off_heap_reclaim.rs`.
+The end-to-end effect on a real workload — `emqx_base62:encode/1` on the unmodified EMQX module, `PRE-FIX` `dc63fd7f49` vs `HEAD` vs the oracle, all three legs from the identical `.beam` — is [`src/runner/CONTEXT.md`](src/runner/CONTEXT.md) *Measured*; the mirror A/B above is the per-call half of this machinery, never a memory one.
+The residuals are that prune's own (a `Wait` park, a declined gate, an un-pre-empted slice, the `-eval` route) — a leak, never a dangle: [`src/context/CONTEXT.md`](src/context/CONTEXT.md) *The off-heap refc-binary reclamation*.
+`Process::sweep_off_heap_binaries` returns before touching the roster when nothing was declared dead, so an empty slot space costs nothing on the per-call path.
+
+### The copy-out's learned size hint — `copy_bound/ets_copy` (`BEFORE` `56683d2982` → `AFTER` `ead363d2a5`)
+
+**Sides.** `AFTER` is `beam_rt` built from the committed tree at `ead363d2a5`; `BEFORE` is the **pristine pre-fix tree** at `56683d2982`, so this A/B isolates the copy-out's growth policy and nothing else. Both sides are driven by the **same `bench` binary** (the harness crate is unchanged across the window). The system side (`sys`) is `erl` on `PATH` — **OTP 29.1.1 / erts-17.1**.
+Host: Linux `x86_64`, `nproc` = **14**, shared — 1-min `/proc/loadavg` **2.06 → 1.12** during the paired rounds (an earlier pre-fix baseline at load 18–31 published the same shape: `ets_copy` 4 064 / 4 076 / 4 769 ns/op, median 4 076).
+
+**The one mechanism the A/B isolates.** A registered BIF's container result is re-homed onto the process's own scanned young heap (`src/context/calls.rs::move_result_into_process_heap` → `copy_result_fresh`). The default nursery is 233 words (`beam_gc::DEFAULT_MIN_HEAP_WORDS`) and `Nursery::collapse` re-installs a *demand*-sized space after every collection, so the space is small again on the next op. `BEFORE` learned the payload's size only from a **refusal**: `try_copy_fast` ran out of words, and the copier's preflight then walked the payload five times (three of them hashing — `size_object_bounded_with`'s SipHash path set, `is_acyclic`'s two sets) purely to produce a word count the exhaustion error already carried, before growing and retrying. `AFTER` **learns that count and spends it**: `RuntimeContext::copy_out_hint` is `max(hint, copy_shortfall_words(err))`, and `hint_grow_gate` grows the nursery through the no-relocation `Process::grow_nursery` seam **before** the attempt when `available() < hint + max(hint/4, 32)`, so the successful first attempt is the common path and the sizing walk never runs. `hint == 0` reproduces `BEFORE` exactly, and the whole refusal fallback stays behind it (fresh per-attempt destination table, permanent-non-exhaustion short-circuit, `safe_to_rewind`, and the `max_heap_words` ceiling refusing a headroom request → bare-shortfall fallback).
+
+**Cadence, on the compiled `ets_copy` shape** (250 000 ops, `taskset -c 3`, 3 alternating paired rounds, same binary with the hint disabled vs enabled):
+
+| counter | `BEFORE` | `AFTER` |
+|---|---:|---:|
+| refusals | 83 067 (**0.332 /op**) | 754 (**0.003 /op**) |
+| copy attempts | 1.016 /op | 1.016 /op |
+| hint-driven grows | 0 | 83 387 |
+| collections /op | 0.33–0.34 (`ensure_heap_full` 83 289, reds door 160) | 0.33–0.34 (`ensure_heap_full` 84 158, reds door 162) |
+| mean `available()` at the copy-out | 277 words | 190 words |
+
+Each avoided refusal is worth ≈**4.2 µs**, which is the whole regression.
+
+**Paired `bench` A/B** — `bench run --quick --runtime rust --workloads copy_bound,gc_bound,slice`, **3 rounds, alternating sides per round**, medians:
+
+| case | `BEFORE` (ns) | `AFTER` (ns) | B/A |
+|---|---:|---:|---:|
+| `copy_bound/ets_copy` | 3 586.5 | **2 171.4** | **0.605×** |
+| `copy_bound/etf_roundtrip` | 1 419.5 | 1 405.2 | 0.990× |
+| `copy_bound/send_recv` | 8 149.7 | 7 875.5 | 0.966× |
+| `copy_bound/send_recv_plain` | 1 886.3 | 1 872.9 | 0.993× |
+| `gc_bound/churn` | 65 497.8 | 66 275.0 | 1.012× |
+
+`ets_copy` is **−39.5 %** and now sits at **0.67×** of the m15-era figure (3 229 ns/op) it had regressed *from* — i.e. below the pre-regression floor rather than merely back on it. Every sibling case is inside its own noise band.
+
+**Memory is unchanged.** `case_ets_copy_peak_rss_bytes` 118.72 MB → 118.57 MB (0.999×), `churn` 118.54 → 118.40 MB, `etf_roundtrip` 120.21 → 119.87 MB. The growth is a pre-copy `Nursery::grow`, which retires the space it replaces; a collection still collapses the chain, so no space is retained for longer than it was before.
+
+**`perf` attribution, on the raw shape** (`beam_rt -pa <dir> run probe.beam probe:ets_copy/1 250000`, `perf record -F 500`, same probe on both sides — the wall clock is 1 349 ms `BEFORE` → 877 ms `AFTER`, 0.650×, and 877 ms is the diagnosis's `+hms 200000` floor of 816 ms):
+
+| symbol share | `BEFORE` | `AFTER` |
+|---|---:|---:|
+| `RandomState::hash_one::<&usize>` | 11.09 % | — (below the 1.2 % cut) |
+| `SipHasher13::write` | 5.71 % | 1.59 % |
+| `HashMap<usize,()>::insert` | 3.87 % | — |
+| `size_object_bounded_with` | 4.19 % | — |
+| `sizing_walk` | 1.68 % | — |
+| **sizing machinery, total** | **26.5 %** | **~0** |
+| `shallow_unshared::<TrialTarget>` (the copier itself) | 7.91 % | 10.16 % |
+| `RuntimeContext::call_registered` | 7.91 % | 12.42 % |
+
+The refusal machinery is gone from the profile; the new top-share symbols are the two **copies that remain** — `call_registered` 12.42 % and the copier's `shallow_unshared` 10.16 %, beside `beam_ets::TermStore::{alloc_words,copy_term,release}` (3.47 + 2.98 + 2.49 %) and allocator churn. That is the quantified `beam_bifs` double-copy handoff: the registry's own copy onto the pooled BIF heap is still paid on every `ets:lookup`.
+
+**One shape's cadence did move** (wall time unmoved): `gc_bound/churn`'s loop copies out a 257-word `list_to_tuple/1` result, so its growth now happens *before* the copy, and one growth = one retired space = one unit of collection debt — its schedule shifts from 13 971 collections / 2 997 majors to **15 346 / 2 514** at `N` = 2 000 (7.6728 collections per iteration, one major per iteration plus a fixed 514) against a wall change of 1.012×.
+That is a table move, not a door regression: `src/runner/tests/boundary_cost.rs` and `src/runner/CONTEXT.md`'s `MEASURED` table are re-derived from it, and the door's own invariants (`checks == yields`, `unpublished == 0`, the `checks/9 … checks/7` ration, one young space, `capacity ≤ 610`) all still hold.
+
+**Correctness of the measured side.** `--lib` **1 520 passed / 0 failed / 3 ignored**; `--lib -- runner` 47 / 0; `--lib -- copy_out` 3 / 0 (including the collecting-default-process case and its no-hint control, which refuses again); `--lib -- context::calls` 14 / 0 (1 ignored); `--test max_heap_enforce` 6 / 0, `--test max_heap_flag` 12 / 0, `--test process_info_items` 2 / 0, `--test engine_off_heap_transport` 4 / 0, `--test port_wake` 1 / 0. `build --release -p beam_rt -p bench --all-targets` is **warning-free**.
+
+**Residual / owned by other nodes.**
+The hint is **per `RuntimeContext`**, so the first copy of each context still learns by refusing: **754 refusals per 250 000 ops ≈ 13 ns/op (0.4 %)**. Removing it needs a `Runtime`-owned pid→hint map with cleanup on process death (this crate, next pass).
+The `beam_term::size` hashing walk is now **off this shape's critical path** (it was the #1 `perf` symbol at ~8 % while refusals ran at 0.332/op) — what remains of it is that 0.4 %.
+The registry's own copy is untouched: every `ets:lookup` result is still copied twice (`beam_bifs::ets::copy_out` onto the pooled BIF heap, then `copy_result_fresh` onto the process heap; `shallow_unshared::<TrialTarget>` was 5.7–8.1 % of the run) — that is a `beam_bifs`/pool-rewind contract change, not expressible here.
+A deeper `beam_gc` fix (feed the collapse the post-copy live demand so a no-relocation growth survives a collection) would make the growth permanent instead of per-space, and `+hmax` still does not bound the growth-retired nursery chain.
+
 ## See Also
 
-- [`PERF.md`](PERF.md) → the current figures (`CURRENT`), the *Current startup regime* note and the two controlled A/Bs it hosts (the interpreter's per-instruction reduction charge; the per-call cost's independence from the iteration count after the per-slice off-heap mirror).
+- [`PERF.md`](PERF.md) → the current figures (`CURRENT`), the *Current startup regime* note and the standing boot-path poll-budget note.
 - [`PERF_DISPATCH.md`](PERF_DISPATCH.md) → the per-call `DISPATCH-CUT` / `COPY-OUT-CUT` analyses.
 - [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md) → the bench driver's environment record, per-target tables and methodology.
 - [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) → the harnesses behind every figure here and the dispatch-cost narrative.
