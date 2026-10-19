@@ -958,6 +958,12 @@ impl Runtime {
                     node.creation(),
                     &cookie,
                 );
+                // Both halves then route through the **one** node→link table
+                // ([`crate::dist::DistLinks`]): the node's own accepted-links cell is
+                // installed here, *before* the router reaches the process table, so an
+                // outbound `link`/`monitor`/`exit`/`unlink` (or a `dist_send_*` message)
+                // reaches a peer that dialled **us** exactly as it reaches one we dialled.
+                client.share_links_with(node.links())?;
                 processes.set_dist_router(client.router());
                 Some(client)
             }

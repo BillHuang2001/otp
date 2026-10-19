@@ -145,7 +145,8 @@ use beam_process::{DistSignal, DistSignalRouter, MonitorRef, ProcessId, RemotePi
 use beam_term::prelude::{make_atom, make_small, try_make_small, Eterm};
 use beam_term::AtomTable;
 
-use crate::dist::{NodeName, DIST_READ_SLICE};
+use crate::dist::links::no_link_error;
+use crate::dist::{DistConnection, DistLinks, NodeName, DIST_READ_SLICE};
 use crate::error;
 
 /// The words of the stable scratch heap the routed signals' terms are materialised on.
@@ -179,11 +180,15 @@ struct Queued {
 }
 
 /// One outbound distribution link: the connecting state machine and its socket.
-struct ClientLink {
+///
+/// Crate-visible because the one node→link table ([`DistLinks`]) shares it with the
+/// accepting half: it looks a link up by `node`, labels it by `name` and writes a control
+/// message through [`ClientLink::send_control`]/[`ClientLink::send_message`].
+pub(crate) struct ClientLink {
     /// The peer's node atom term — the key a routed signal addresses.
-    node: Eterm,
+    pub(crate) node: Eterm,
     /// The peer's full `node@host` name (diagnostic and [`DistClient::connected_nodes`]).
-    name: String,
+    pub(crate) name: String,
     /// The connecting side's handshake/established state machine.
     driver: ConnectionDriver,
     /// The socket the driver's bytes travel over.
@@ -196,7 +201,7 @@ struct ClientLink {
 
 impl ClientLink {
     /// Whether the handshake completed and the link carries `DOP_*`.
-    fn is_established(&self) -> bool {
+    pub(crate) fn is_established(&self) -> bool {
         matches!(self.driver.state(), DriverState::Established)
     }
 
@@ -206,6 +211,39 @@ impl ClientLink {
             self.driver.state(),
             DriverState::Handshaking | DriverState::Established
         )
+    }
+
+    /// Encodes one `DOP_*` control on this link's driver and writes it.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] before the handshake completed (the driver's own contract),
+    /// the encoder's failures and the socket's write failure.
+    pub(crate) fn send_control(
+        &mut self,
+        dop: Dop,
+        args: &[Eterm],
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.driver.send_control(dop, args, atoms)?;
+        self.flush_output()
+    }
+
+    /// Encodes one message on this link; the driver picks `DOP_SEND_SENDER` when the peer
+    /// negotiated `DFLAG_SEND_SENDER` and `DOP_SEND` otherwise (`dist.c:1686`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientLink::send_control`].
+    pub(crate) fn send_message(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        msg: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.driver.send_message(from, to, msg, atoms)?;
+        self.flush_output()
     }
 
     /// Writes whatever the driver has queued to the socket.
@@ -281,8 +319,10 @@ struct DistClientInner {
     creation: u32,
     /// The shared cookie the handshake digests use.
     cookie: Vec<u8>,
-    /// The outbound links, one per peer node.
-    links: Vec<ClientLink>,
+    /// **Both** distribution halves' links, and the one routing entry over them
+    /// ([`DistLinks`]): the outbound links this client dialled plus the accepted cell
+    /// [`crate::dist::DistNode`] owns, installed by [`DistClient::share_links_with`].
+    links: DistLinks,
     /// Controls the router queued for delivery (their terms live on `scratch`).
     pending: VecDeque<Queued>,
     /// The stable heap the `pending` terms are materialised on. Reset **exactly** when
@@ -311,6 +351,10 @@ pub struct DistClient {
 impl DistClient {
     /// An empty client with no links.
     ///
+    /// The accepted half starts as this client's **own** empty cell — enough for the unit
+    /// suites and for a runtime that never installs a node's table; [`DistClient::share_links_with`]
+    /// replaces it with the live one.
+    ///
     /// # Errors
     ///
     /// The scratch heaps' own allocation failures.
@@ -321,7 +365,7 @@ impl DistClient {
                 our_node: make_small(0),
                 creation: 0,
                 cookie,
-                links: Vec::new(),
+                links: DistLinks::new(Rc::new(RefCell::new(Vec::new()))),
                 pending: VecDeque::new(),
                 scratch: Heap::new(SCRATCH_WORDS)?,
                 dispatch_heap: Heap::new(DISPATCH_HEAP_WORDS)?,
@@ -329,6 +373,26 @@ impl DistClient {
                 next_unlink_id: 1,
             })),
         })
+    }
+
+    /// Installs the **accepted** link table this client routes through.
+    ///
+    /// The listening half ([`crate::dist::DistNode`]) owns the links a peer dialled into
+    /// this runtime and pumps them from the scheduler pass; both halves then share one
+    /// table ([`DistLinks`]), so an outbound `link`/`monitor`/`exit`/`unlink` or message
+    /// reaches a peer **whichever side opened the socket**. The runtime calls this once,
+    /// before the [`DistSignalRouter`] is installed on the process table.
+    ///
+    /// # Errors
+    ///
+    /// The shared cell's re-entrant borrow (never in practice: this runs before anything is
+    /// pumped).
+    pub(crate) fn share_links_with(
+        &self,
+        accepted: Rc<RefCell<Vec<DistConnection>>>,
+    ) -> Result<()> {
+        self.borrow_mut()?.links.accepted = accepted;
+        Ok(())
     }
 
     /// Installs this node's identity (the name/atom/creation an outbound handshake
@@ -416,9 +480,9 @@ impl DistClient {
         }
         // A re-connect to the same node replaces the old link (never two live links to
         // one peer, which a real node would treat as a simultaneous connection).
-        inner.links.retain(|link| link.node != node);
+        inner.links.outbound.retain(|link| link.node != node);
         let driver = ConnectionDriver::client(&inner.our_name, &inner.cookie, inner.creation);
-        inner.links.push(ClientLink {
+        inner.links.outbound.push(ClientLink {
             node,
             name: peer.full().to_string(),
             driver,
@@ -476,6 +540,7 @@ impl DistClient {
         match self.inner.try_borrow() {
             Ok(inner) => inner
                 .links
+                .outbound
                 .iter()
                 .any(|link| link.name == full && link.is_established()),
             Err(_) => false,
@@ -486,18 +551,19 @@ impl DistClient {
     /// its `'N'` handshake.
     pub fn is_connected_to_node(&self, node: Eterm) -> bool {
         match self.inner.try_borrow() {
-            Ok(inner) => inner
-                .link_index_for_node(node)
-                .is_some_and(|index| inner.links[index].is_established()),
+            Ok(inner) => inner.links.link_index_for_node(node).is_some(),
             Err(_) => false,
         }
     }
 
-    /// The full `node@host` names of every peer this runtime has **established** a link to.
+    /// The full `node@host` names of every peer this runtime has **dialled** and established
+    /// a link to (the outbound half only — see [`crate::dist::DistLinks::established_names`]
+    /// for the union with the links a peer opened).
     pub fn connected_nodes(&self) -> Vec<String> {
         match self.inner.try_borrow() {
             Ok(inner) => inner
                 .links
+                .outbound
                 .iter()
                 .filter(|link| link.is_established())
                 .map(|link| link.name.clone())
@@ -506,7 +572,7 @@ impl DistClient {
         }
     }
 
-    /// Whether this client holds **any** link, handshaking or established.
+    /// Whether this client holds **any** link, handshaking or established, in either half.
     ///
     /// This is the scheduler pass's quiescence query on the connecting half: a peer link —
     /// even one whose `'N'` handshake has not completed yet — is work the pass must keep
@@ -515,22 +581,22 @@ impl DistClient {
     /// nothing here that could ever wake anything, so this answers `false` and the pass is
     /// free to declare its stall.
     ///
-    /// The complement of [`crate::dist::DistNode::is_idle`] on the *dialled* side: a node is
-    /// idle when it has no live link, and this is the same question asked of the outbound
-    /// links.
+    /// The complement of [`crate::dist::DistNode::is_idle`]: a node is idle when it has no
+    /// live link, and this is the same question asked of the one link table both halves
+    /// share ([`crate::dist::DistLinks`]).
     ///
     /// A cell that cannot be borrowed is reported as **holding a link**: a borrowed cell
     /// means distribution work is in flight (a pump or the signal router holds it), so the
     /// caller must keep pumping rather than substantiate a stall it cannot justify.
     pub fn has_links(&self) -> bool {
         match self.inner.try_borrow() {
-            Ok(inner) => !inner.links.is_empty(),
+            Ok(inner) => !inner.links.is_idle(),
             Err(_) => true,
         }
     }
 
     /// Whether this client holds **no** link at all — [`DistClient::has_links`]'s
-    /// complement, and the same "nothing in flight on this half" answer
+    /// complement, and the same "nothing in flight" answer
     /// [`crate::dist::DistNode::is_idle`] gives for the accepted links.
     ///
     /// A cell that cannot be borrowed is reported as **not** idle, for the same reason
@@ -552,7 +618,7 @@ impl DistClient {
     ///
     /// # Errors
     ///
-    /// A typed error when there is no **established** link to `peer_name` (an
+    /// A typed error when there is no **established** link to `peer_name` in either half (an
     /// unconnected node is never a silent drop and never a fabricated success), plus
     /// the encoding/socket failures.
     pub fn send_reg_send(
@@ -568,7 +634,9 @@ impl DistClient {
         let empty = make_atom(atoms.intern(""));
         let mut inner = self.borrow_mut()?;
         let local = inner.local_pid_term(from)?;
-        inner.send_to_node(node, Dop::RegSend, &[local, empty, to_name, msg], atoms)
+        inner
+            .links
+            .route_control(node, Dop::RegSend, &[local, empty, to_name, msg], atoms)
     }
 
     /// Sends `msg` from `from` to the **external pid** `to`
@@ -577,7 +645,7 @@ impl DistClient {
     /// # Errors
     ///
     /// A typed error when `to` is not an external pid, when there is no established
-    /// link to its node, plus the encoding/socket failures.
+    /// link to its node in either half, plus the encoding/socket failures.
     pub fn send_message_pid(
         &self,
         to: Eterm,
@@ -592,7 +660,9 @@ impl DistClient {
         // `send_message` selects `DOP_SEND_SENDER` when the peer negotiated
         // `DFLAG_SEND_SENDER` and `DOP_SEND` otherwise (`dist.c:1686`), so the choice
         // cannot be made here — it is the driver's.
-        inner.send_message_to_node(remote.node(), local, to_term, msg, atoms)
+        inner
+            .links
+            .route_message(remote.node(), local, to_term, msg, atoms)
     }
 
     /// Borrows the shared inner state, mapping a live borrow to a typed error (never a
@@ -605,16 +675,19 @@ impl DistClient {
 }
 
 impl DistClientInner {
-    /// Steps every link, retiring the ones that died, and returns the event count.
+    /// Steps every **outbound** link, retiring the ones that died, and returns the event count.
+    ///
+    /// Only the outbound half is stepped here: the accepted links are the listening node's
+    /// ([`crate::dist::DistNode::pump`]) and are driven by it in the same pass.
     fn step_links(&mut self) -> usize {
         let mut events = 0;
         let mut index = 0;
-        while index < self.links.len() {
-            let outcome = self.links[index].pump();
+        while index < self.links.outbound.len() {
+            let outcome = self.links.outbound[index].pump();
             match outcome {
                 Ok(progress) => {
                     events += progress;
-                    if self.links[index].is_live() {
+                    if self.links.outbound[index].is_live() {
                         index += 1;
                     } else {
                         self.retire(index, BeamError::BadArg);
@@ -626,25 +699,10 @@ impl DistClientInner {
         events
     }
 
-    /// Removes the link at `index` and records why.
+    /// Removes the outbound link at `index` and records why.
     fn retire(&mut self, index: usize, err: BeamError) {
-        let link = self.links.remove(index);
+        let link = self.links.outbound.remove(index);
         self.last_error = Some(format!("{}: {err}", link.name));
-    }
-
-    /// The index of the link to `node`, if any.
-    fn link_index_for_node(&self, node: Eterm) -> Option<usize> {
-        self.links.iter().position(|link| link.node == node)
-    }
-
-    /// A human-readable label for `node`: its `node@host` name if a link (established
-    /// or still handshaking) is keyed by it, else a rendering of the raw term.
-    fn node_label(&self, node: Eterm) -> String {
-        self.links
-            .iter()
-            .find(|link| link.node == node)
-            .map(|link| link.name.clone())
-            .unwrap_or_else(|| format!("{node:?}"))
     }
 
     /// An **external pid** term for a local process: the `From`/`Watcher` element a
@@ -660,68 +718,17 @@ impl DistClientInner {
         )
     }
 
-    /// Encodes `msg` (from `from` to `to`, both already external pids) and writes it to
-    /// the node `node`'s link, selecting the send opcode from the negotiated flags.
-    fn send_message_to_node(
-        &mut self,
-        node: Eterm,
-        from: Eterm,
-        to: Eterm,
-        msg: Eterm,
-        atoms: &mut AtomTable,
-    ) -> Result<()> {
-        let Some(index) = self.link_index_for_node(node) else {
-            let label = self.node_label(node);
-            return Err(no_link_error(&label));
-        };
-        self.send_on_link(index, |link, atoms| link.driver.send_message(from, to, msg, atoms), atoms)
-    }
-
-    /// Encodes one control message and writes it to the node `node`'s link.
-    fn send_to_node(
-        &mut self,
-        node: Eterm,
-        dop: Dop,
-        args: &[Eterm],
-        atoms: &mut AtomTable,
-    ) -> Result<()> {
-        let Some(index) = self.link_index_for_node(node) else {
-            let label = self.node_label(node);
-            return Err(no_link_error(&label));
-        };
-        self.send_on_link(
-            index,
-            |link, atoms| link.driver.send_control(dop, args, atoms),
-            atoms,
-        )
-    }
-
-    /// Runs `encode` against the link at `index` (which must be established) and writes
-    /// the resulting bytes to its socket.
-    fn send_on_link<F>(
-        &mut self,
-        index: usize,
-        encode: F,
-        _atoms: &AtomTable,
-    ) -> Result<()>
-    where
-        F: FnOnce(&mut ClientLink, &AtomTable) -> Result<()>,
-    {
-        let link = &mut self.links[index];
-        if !link.is_established() {
-            return Err(error::message(format!(
-                "distribution: the link to {} has not completed its handshake",
-                link.name
-            )));
-        }
-        encode(link, _atoms)?;
-        link.flush_output()
-    }
-
-    /// Drains the outbound queue: every control whose node has an **established** link
-    /// is encoded (with the live `atoms`) and written; one whose link has not finished
-    /// handshaking stays queued. The scratch heap is reset exactly when the queue
-    /// empties, so no queued term can dangle.
+    /// Drains the outbound queue: every control whose node has an **established** link (in
+    /// **either** half — see [`DistLinks`]) is encoded with the live `atoms` and written
+    /// through the one routing entry; one whose link has not finished handshaking stays
+    /// queued. The scratch heap is reset exactly when the queue empties, so no queued term
+    /// can dangle.
+    ///
+    /// The router itself holds no atom table, so its queue gate can only tell "a link for
+    /// this node exists" for the outbound half; this flush — the one place the table is live
+    /// — resolves the accepted half too, and drops (with the typed reason recorded in
+    /// [`DistClientInner::last_error`]) a control whose node no link names any more instead
+    /// of retrying for ever.
     fn flush_pending(&mut self, atoms: &mut AtomTable) -> Result<usize> {
         if self.pending.is_empty() {
             return Ok(0);
@@ -730,20 +737,29 @@ impl DistClientInner {
         let mut retry: VecDeque<Queued> = VecDeque::new();
         let mut sent = 0;
         for item in queued {
-            match self.link_index_for_node(item.node) {
-                Some(index) if self.links[index].is_established() => {
-                    let link = &mut self.links[index];
-                    match link.driver.send_control(item.dop, &item.args, atoms) {
-                        Ok(()) => match link.flush_output() {
-                            Ok(()) => sent += 1,
-                            Err(err) => self.last_error = Some(format!("{}: {err}", link.name)),
-                        },
-                        Err(err) => self.last_error = Some(format!("{}: {err}", link.name)),
-                    }
+            if !self.links.names_node(item.node, atoms) {
+                // The link it waited for was retired: nothing in either half names that
+                // node any more, so the control can never be delivered. Record the typed
+                // refusal and drop it rather than growing the queue for ever.
+                let label = self.links.node_label(item.node, atoms);
+                self.last_error = Some(format!("{label}: {}", no_link_error(&label)));
+                continue;
+            }
+            if !self.links.has_established_link_to(item.node, atoms) {
+                // A link that names the node exists but has not completed its handshake
+                // yet: keep it queued, bounded by the scratch heap.
+                retry.push_back(item);
+                continue;
+            }
+            match self
+                .links
+                .route_control(item.node, item.dop, &item.args, atoms)
+            {
+                Ok(()) => sent += 1,
+                Err(err) => {
+                    let label = self.links.node_label(item.node, atoms);
+                    self.last_error = Some(format!("{label}: {err}"));
                 }
-                // No link yet (or one still handshaking): keep it queued, bounded by the
-                // scratch heap.
-                _ => retry.push_back(item),
             }
         }
         self.pending = retry;
@@ -752,7 +768,6 @@ impl DistClientInner {
         }
         Ok(sent)
     }
-
     /// Decodes, **validates + classifies** and routes every control message the
     /// established links queued, using one scratch arena reset per drain.
     ///
@@ -799,10 +814,17 @@ impl DistClientInner {
     /// **Synchronous materialisation is the contract**: the signal's `reason` may live
     /// in the dying process's heap, and the caller may drop that heap the moment this
     /// returns — so every term is written onto the stable scratch heap here.
+    ///
+    /// The gate is [`DistLinks::may_reach_node`]: the router holds no atom table, so it
+    /// can match an **outbound** link's node term exactly and can only tell that the
+    /// **accepted** half is non-empty — the accepted half's `peer_name` is resolved
+    /// against the live atom table by [`DistClientInner::flush_pending`], which is the one
+    /// place the table is available. A node no link names in either half is the typed
+    /// refusal, never a silent drop.
     fn queue_signal(&mut self, signal: DistSignal) -> Result<()> {
         let node = signal_node(&signal);
-        if self.link_index_for_node(node).is_none() {
-            let label = self.node_label(node);
+        if !self.links.may_reach_node(node) {
+            let label = self.links.node_label(node);
             return Err(no_link_error(&label));
         }
         let (dop, args) = self.encode_signal(signal)?;
@@ -940,16 +962,6 @@ fn unlink_id_term(id: u64) -> Result<Eterm> {
     // the whole upper half of the `u64` space.
     let signed = i64::try_from(id).map_err(|_| BeamError::SystemLimit)?;
     try_make_small(signed).map_err(|_| BeamError::SystemLimit)
-}
-
-/// A typed "this runtime has no link to that node" error.
-///
-/// Never a silent drop: the caller (a link/monitor operation, or a dying process's
-/// termination) can see exactly why the signal did not reach the wire.
-fn no_link_error(label: &str) -> BeamError {
-    error::message(format!(
-        "distribution: no established connection to node {label}"
-    ))
 }
 
 /// The host part of a `node@host` name.

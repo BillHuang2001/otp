@@ -102,8 +102,10 @@
 //!   failure or a failed per-link inbound validation retires that one link and is
 //!   recorded in [`DistNode::last_link_error`]; it never aborts the runtime.
 
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::rc::Rc;
 use std::time::Duration;
 
 use beam_alloc::Heap;
@@ -111,13 +113,17 @@ use beam_common::{BeamError, Result};
 use beam_dist::connection::TcpTransport;
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::epmd::{Alive2Req, Alive2Resp, EpmdClient, EPMD_DEFAULT_ADDR};
-use beam_dist::{DeliveryOutcome, Dispatched, InboundSink, PeerVisibility};
+use beam_dist::{DeliveryOutcome, Dispatched, Dop, InboundSink, PeerVisibility};
 use beam_dist::TcpListener;
+use beam_term::prelude::Eterm;
 use beam_term::AtomTable;
 
 mod inbound;
 pub use inbound::LocalDeliverySink;
 
+pub(crate) mod links;
+pub(crate) use links::DistLinks;
+pub use links::DistConnectionSnapshot;
 /// The address the distribution listener binds: the wildcard on an OS-chosen
 /// port, exactly the oracle's default (`inet_dist_use_interface` unset).
 pub const DIST_LISTEN_ADDR: &str = "0.0.0.0:0";
@@ -350,6 +356,50 @@ impl DistConnection {
         self.driver.has_output()
     }
 
+    /// Writes whatever the driver has queued to the socket (the link's one output path).
+    ///
+    /// # Errors
+    ///
+    /// The socket's own write failure, which the caller turns into a retired link.
+    pub(crate) fn flush_output(&mut self) -> Result<()> {
+        if self.driver.has_output() {
+            let bytes = self.driver.take_output();
+            self.stream.write_all(&bytes).map_err(BeamError::Io)?;
+            self.stream.flush().map_err(BeamError::Io)?;
+            self.bytes_out += bytes.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Encodes one `DOP_*` control on this link's driver and writes it — the accepting
+    /// half's outbound path, reached through [`DistLinks::route_control`] so a peer that
+    /// dialled *this* runtime is served exactly like one it dialled.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] before the handshake completed (the driver's own contract),
+    /// the encoder's failures and the socket's write failure.
+    pub(crate) fn send_control(&mut self, dop: Dop, args: &[Eterm], atoms: &AtomTable) -> Result<()> {
+        self.driver.send_control(dop, args, atoms)?;
+        self.flush_output()
+    }
+
+    /// Encodes one message on this link and writes it; the driver picks
+    /// `DOP_SEND_SENDER`/`DOP_SEND` from the negotiated flags.
+    ///
+    /// # Errors
+    ///
+    /// As [`DistConnection::send_control`].
+    pub(crate) fn send_message(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        msg: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.driver.send_message(from, to, msg, atoms)?;
+        self.flush_output()
+    }
     /// Shuts the link's socket down in **both** directions.
     ///
     /// A link is never left half-open: [`DistNode::retire`] and
@@ -416,10 +466,7 @@ impl DistConnection {
             }
         }
         if self.driver.has_output() {
-            let bytes = self.driver.take_output();
-            self.stream.write_all(&bytes).map_err(BeamError::Io)?;
-            self.stream.flush().map_err(BeamError::Io)?;
-            self.bytes_out += bytes.len() as u64;
+            self.flush_output()?;
             events += 1;
         }
         stepped?;
@@ -491,8 +538,10 @@ pub struct DistNode {
     listener: std::net::TcpListener,
     /// The shared cookie the handshake digests use.
     cookie: Vec<u8>,
-    /// The accepted links.
-    connections: Vec<DistConnection>,
+    /// The accepted links, **shared** with [`DistLinks`] — the one table both distribution
+    /// halves route through (see [`links`]). The node pumps and mutates it; the routing
+    /// entry only borrows it to write a frame.
+    connections: Rc<RefCell<Vec<DistConnection>>>,
     /// The live `ALIVE2` socket — dropping it de-registers the node.
     registration: Option<EpmdClient<TcpTransport>>,
     /// Whether `epmd` accepted the registration.
@@ -533,7 +582,7 @@ impl DistNode {
             port,
             listener,
             cookie,
-            connections: Vec::new(),
+            connections: Rc::new(RefCell::new(Vec::new())),
             registration: None,
             registered: false,
             registration_error: None,
@@ -591,14 +640,28 @@ impl DistNode {
         self.registration_error.as_deref()
     }
 
-    /// The accepted links, in accept order.
-    pub fn connections(&self) -> &[DistConnection] {
-        &self.connections
+    /// The accepted links' address handle — the very cell the routing table
+    /// ([`DistLinks`]) borrows, shared so an outbound `DOP_*` can reach a link this runtime
+    /// **accepted** (see [`links`]).
+    pub(crate) fn links(&self) -> Rc<RefCell<Vec<DistConnection>>> {
+        Rc::clone(&self.connections)
+    }
+
+    /// A **diagnostic snapshot** of the accepted links, in accept order.
+    ///
+    /// The table is shared with the routing entry, so it cannot be lent out by reference;
+    /// each entry is the link's observable state at the moment it was read. The snapshot is
+    /// empty while the table is being mutated (a pump in flight) — it never affects routing.
+    pub fn connections(&self) -> Vec<DistConnectionSnapshot> {
+        DistConnectionSnapshot::of_table(&self.connections)
     }
 
     /// Whether the node has no live link.
+    ///
+    /// A cell that cannot be borrowed counts as holding a link (work in flight), so a
+    /// scheduler pass never declares a stall it cannot justify.
     pub fn is_idle(&self) -> bool {
-        self.connections.is_empty()
+        DistLinks::new(self.links()).is_idle()
     }
 
     /// Accepts whatever connections are pending, advances every live link and
@@ -607,76 +670,60 @@ impl DistNode {
     ///
     /// # Errors
     ///
-    /// Only the accept path's own failures. A *link*'s failure never propagates:
-    /// the link is retired and the reason recorded in
-    /// [`last_link_error`](Self::last_link_error), so a hostile or broken peer
-    /// can neither fail nor stall the scheduler.
+    /// The accept path's own failures, and the shared link table's re-entrant borrow (see
+    /// [`DistNode::links`]). A *link*'s failure never propagates: the link is retired and
+    /// the reason recorded in [`last_link_error`](Self::last_link_error), so a hostile or
+    /// broken peer can neither fail nor stall the scheduler.
     pub fn pump(&mut self) -> Result<usize> {
         self.register_once();
         let mut events = 0;
+        // The cell is cloned out of `self` first, so the borrow of the table does not tie
+        // `self` (which `accept_one`/`register_once` still need mutably).
+        let cell = self.links();
+        let mut connections = cell
+            .try_borrow_mut()
+            .map_err(|_| error::message("distribution: the accepted link table is already in use"))?;
         for _ in 0..MAX_ACCEPTS_PER_PUMP {
             match self.accept_one()? {
                 Some(connection) => {
-                    self.connections.push(connection);
+                    connections.push(connection);
                     events += 1;
                 }
                 None => break,
             }
         }
         let mut index = 0;
-        while index < self.connections.len() {
-            let outcome = self.connections[index].pump();
+        while index < connections.len() {
+            let outcome = connections[index].pump();
             match outcome {
                 Ok(progress) => events += progress,
                 Err(err) => {
                     // The link is broken (a protocol error, a dead socket). Retire
                     // it and keep the reason observable — the runtime carries on.
-                    self.retire(index, err);
+                    retire_at(&mut connections, &mut self.last_link_error, index, err);
                     continue;
                 }
             }
-            if self.connections[index].is_live() {
+            if connections[index].is_live() {
                 index += 1;
             } else {
                 // A terminal driver state (`Failed`/`Closed`) is a dead link: retire
                 // it — which shuts its socket down first, so the peer sees the
                 // closure instead of a half-open socket — and carry on.
                 let err = BeamError::BadArg;
-                self.retire(index, err);
+                retire_at(&mut connections, &mut self.last_link_error, index, err);
             }
         }
         Ok(events)
     }
-
-    /// Retires the link at `index` (removing it), shutting its socket down first and
-    /// recording why.
-    ///
-    /// The socket is shut down **before** the connection drops, so a link is never
-    /// left half-open from the peer's point of view. The retirement reason stays the
-    /// driver's (or the socket's) failure; a `shutdown(2)` failure is appended rather
-    /// than swallowed, since the link is gone either way.
-    fn retire(&mut self, index: usize, err: BeamError) {
-        let mut connection = self.connections.remove(index);
-        let closed = connection.close();
-        let reason = match connection.peer_name() {
-            Some(peer) => format!("{peer}: {err}"),
-            None => format!("{}: {err}", connection.peer_addr()),
-        };
-        self.last_link_error = Some(match closed {
-            Ok(()) => reason,
-            Err(close_err) => format!("{reason} (close: {close_err})"),
-        });
-    }
-
     /// Whether at least one accepted link has completed the `'N'` handshake.
     ///
     /// The cheap guard the scheduler pass uses to skip the inbound-delivery half
     /// entirely (and never allocate the decode arena) for a node with no usable
-    /// link — the common case.
+    /// link — the common case. A table that cannot be borrowed counts as having one.
     pub fn has_established_link(&self) -> bool {
-        self.connections.iter().any(DistConnection::is_established)
+        DistLinks::new(self.links()).has_established()
     }
-
     /// Decodes, classifies and **routes** every control message queued on every
     /// **established** link through `sink` (the runtime's [`InboundSink`] — see
     /// [`LocalDeliverySink`]), returning how many were actually delivered to a
@@ -711,18 +758,22 @@ impl DistNode {
         // copies out), so the previous drain's arena is reclaimed wholesale.
         self.dispatch_heap.reset();
         let mut delivered = 0;
+        let cell = self.links();
+        let mut connections = cell
+            .try_borrow_mut()
+            .map_err(|_| error::message("distribution: the accepted link table is already in use"))?;
         let mut index = 0;
-        while index < self.connections.len() {
-            if !self.connections[index].is_established() {
+        while index < connections.len() {
+            if !connections[index].is_established() {
                 index += 1;
                 continue;
             }
             // The decode arena (`self.dispatch_heap`) and the link
-            // (`self.connections[index]`) are disjoint fields, so both are borrowed
+            // (`connections[index]`) are separate objects, so both are borrowed
             // for the duration of the decode only.
             let outcome = {
                 let heap = &mut self.dispatch_heap;
-                self.connections[index].dispatch_inbound(heap, atoms, sink)
+                connections[index].dispatch_inbound(heap, atoms, sink)
             };
             match outcome {
                 Ok(dispatched) => {
@@ -737,7 +788,7 @@ impl DistNode {
                 }
                 // A decode/classification failure retires just this link (recorded,
                 // never raised) — the scheduler pass carries on.
-                Err(err) => self.retire(index, err),
+                Err(err) => retire_at(&mut connections, &mut self.last_link_error, index, err),
             }
         }
         Ok(delivered)
@@ -819,6 +870,34 @@ impl DistNode {
     }
 }
 
+/// Retires `connections[index]` (removing it), shutting its socket down first and recording
+/// why in `last_link_error`.
+///
+/// The socket is shut down **before** the connection drops, so a link is never left
+/// half-open from the peer's point of view. The retirement reason stays the driver's (or the
+/// socket's) failure; a `shutdown(2)` failure is appended rather than swallowed, since the
+/// link is gone either way.
+///
+/// A free function rather than a method because the table is a borrowed `Rc<RefCell<…>>`
+/// while the pump drains it (see [`links`]) — the borrow is already held, so the caller
+/// passes the slice and the `last_link_error` slot instead of `&mut DistNode`.
+fn retire_at(
+    connections: &mut Vec<DistConnection>,
+    last_link_error: &mut Option<String>,
+    index: usize,
+    err: BeamError,
+) {
+    let mut connection = connections.remove(index);
+    let closed = connection.close();
+    let reason = match connection.peer_name() {
+        Some(peer) => format!("{peer}: {err}"),
+        None => format!("{}: {err}", connection.peer_addr()),
+    };
+    *last_link_error = Some(match closed {
+        Ok(()) => reason,
+        Err(close_err) => format!("{reason} (close: {close_err})"),
+    });
+}
 /// The creation a node advertises before `epmd` has assigned one.
 const DEFAULT_CREATION: u32 = 1;
 
