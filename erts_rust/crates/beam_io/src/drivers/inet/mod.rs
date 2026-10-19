@@ -1955,7 +1955,18 @@ impl TcpInetDriver {
                 }
                 Ok(ctl_ok())
             }
-            Err(err) => Ok(ctl_error(err)),
+            Err(err) => {
+                // `if (how != TCP_SHUT_RD) desc->tcp_add_flags |= TCP_ADDF_SHUTDOWN_WR_DONE;`
+                // runs **before** the error reply (`inet_drv.c:12370`-`:12374`), so a write-side
+                // shutdown the kernel refused still counts as "the write half is shut": the
+                // `EPIPE`→`ECONNRESET` rewrite in `tcp_send_error` is skipped afterwards
+                // (`:13717` tests exactly this flag), so a later `EPIPE` surfaces as `epipe`
+                // rather than `econnreset`.
+                if how != TCP_SHUT_RD {
+                    self.shutdown_wr_done = true;
+                }
+                Ok(ctl_error(err))
+            }
         }
     }
 
