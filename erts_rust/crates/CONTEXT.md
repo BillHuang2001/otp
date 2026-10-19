@@ -109,7 +109,7 @@ This is the frozen public-API shape dependents design against; keep it stable.
   ways and both must be served: as a local `call`, and as a local `make_fun3` closure (`zlib.erl`
   stores `fun deflate_nif/4` in a `#zlib_opts{}` record), which `beam_rt::context::apply` declines
   through the same predicate and dispatches via `call_bif`.
-- `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam).
+- `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam); plus the two additive seams a host needs to *reach* a built-in driver: `pub trait Driver: core::any::Any` with the one downcast path `dyn Driver::downcast_ref::<T>()` (safe, no `unsafe` fat-pointer work), surfaced as `Port::driver_as`/`PortRegistry::driver_as` — what lets `beam_rt` recover the concrete `TcpInetDriver` a port boxes and call `TcpInetDriver::from_accepted(fd, listener)` (the C's `tcp_inet_copy`) instead of replaying the option block — and `ControlReplyShape` (`Null`/`Buffer`) with `Driver::control_reply_shape`/`PortRegistry::port_control_reply`/`control_reply_shape`, because the C's `*rbuf == NULL` is `[]` for **every** flag word (`io.c:4134`, before the `PORT_CONTROL_FLAG_BINARY` split).
 - `beam_rt` → the runtime **binary**: boot sequence, CLI flags, `system_info`, and the concrete
   `ExecutionContext` wiring engine + bifs + process — including the `Mailbox` receive seam over the
   process mailbox, a single-threaded `ProcessRunner`/scheduler loop, and the `beam_bifs::PortHook`
