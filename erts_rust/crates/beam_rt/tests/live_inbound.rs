@@ -167,11 +167,12 @@ impl Peer {
     ///
     /// The readiness probe is `net_kernel:connect_node/1` — a real OTP node resolving our
     /// listener through `epmd` and driving the `'N'` handshake as the **connecting**
-    /// side (exactly what [`tests/dist.rs`](../dist.rs) uses). `net_adm:ping/1` is *not*
-    /// usable here: it is a `gen:call` to the **remote `net_kernel`** (`{is_auth, node()}`,
-    /// `kernel/src/net_adm.erl:101-110`) with an `infinity` timeout, and this runtime
-    /// runs no `net_kernel`/auth server, so it would block for ever rather than answer
-    /// `pang`. That is a real capability asymmetry, named here rather than papered over.
+    /// side (exactly what [`tests/dist.rs`](../dist.rs) uses), which answers as soon as the
+    /// link is up and needs no reply round trip. `net_adm:ping/1` would work too — it is a
+    /// `gen:call` to the **remote `net_kernel`** (`{is_auth, node()}`,
+    /// `kernel/src/net_adm.erl:101-110`), which this runtime answers through its native
+    /// `net_kernel` service — but it adds that gen-server round trip to a probe that only
+    /// needs the link; `tests/dist_two_vm.rs` is where `ping` ⇒ `pong` is the assertion.
     fn start(oracle: &Path, node: &str, cookie: &str, target: &str) -> std::io::Result<Peer> {
         // The peer connects, then `DOP_REG_SEND`s the greeting to our registered name.
         // `node()` is the peer's own full `node@host` name, which is exactly what the
