@@ -55,7 +55,19 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   `jit_deallocate`/`jit_return`/`jit_deallocate_return` (the frame-discipline helpers: the checked pop
   and/or the continuation read, encoding the instruction's own outcome as the block-ABI word — sharing
   `return_word` for the continuation→word mapping and `report_frame_error` for the typed diagnostic, with
-  the `FrameExitHelper`/`ReturnHelper` fn-pointer types; `return_word` also resolves a **same-function** continuation entry against the published `EntryTables` — `resume_in_block` performs the skipped driver iteration's position store, reduction bump and `ctx.reduce(1)` and the emitted arm tail-jumps to the entry, `JitRuntime::resume_entry` carrying it, while every other outcome leaves the word for the driver), `jit_allocate`/`jit_allocate_heap`/
+  the `FrameExitHelper`/`ReturnHelper` fn-pointer types; `return_word` also resolves a continuation block
+  entry in-block so a `return` need not round-trip the driver — `resume_in_block` →
+  `resolve_resume_entry` answers a **same-function** entry from the published `EntryTables` (two `Vec`
+  indexings, no artifact lookup) and hands anything else to `cross_function_entry`, which resolves the
+  address through `CompiledModule::native_entry_tables` on the artifact the driver published in
+  `JitRuntime::compiled` and checks **that function's** register-file bound in Rust (the same-function
+  bound argument does not transfer to a different function's code); on a hit `resume_in_block` performs
+  the skipped driver iteration's position store, reduction bump and `ctx.reduce(1)` — in the driver's
+  order, so a refusal parks exactly where a driver-side refusal would — re-publishes the target
+  function's tables for a cross-function transfer, and the emitted arm tail-jumps to the entry with
+  `JitRuntime::resume_entry` carrying it, while every other outcome leaves the word for the driver.
+  `EntryTables::of` is the one place an `EntryTables` is built, used by both the driver's publication
+  and a re-publication), `jit_allocate`/`jit_allocate_heap`/
   `jit_test_heap`/`jit_trim` (the **heap / frame-admission** family: the interpreter's own
   `Machine::push_frame` / `ensure_heap` **then** `push_frame` / `ensure_heap` / `trim` calls — in the
   interpreter's own order — each answering `encode_target(func, pc + 1)` or `report_frame_error`'s
