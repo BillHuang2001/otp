@@ -27,47 +27,102 @@
 //! until this module existed it only ever grew: nothing removed an entry, so a route that
 //! builds and drops off-heap binaries retained every one of them for the runtime's life.
 //!
+//! # Where it runs, and why only there
+//!
+//! One call site: [`Evaluator::run_top_level`](crate::eval::Evaluator), **between the top-level
+//! statements** of a `-eval` expression. That is the only point on this route where the
+//! evaluator's live term set is fully nameable — its [`Env`](crate::eval) and the value of the
+//! statement just reduced — so it is the only point where the caller can hand this module a
+//! complete root list. A recursion-depth test inside the expression walker would *not* be
+//! equivalent: the same statement list is reached from `case`/`try`/`fun` clause bodies, whose
+//! subject terms and partially built containers are live and unnamed (see
+//! [`Evaluator::prune_escaped`](crate::eval::Evaluator)).
+//!
 //! # Publish, then prune
 //!
 //! A payload may be released only while **no live term names it**. The argument this module
-//! rests on has three parts:
+//! rests on has four parts:
 //!
-//! 1. **Every root is enumerated.** At a prune point the terms that can name a payload are
-//!    the ones reachable from: the evaluator's own live set (its environment and the value it
-//!    is reducing — passed in as `extra` by the driver, which is the only code that can see
-//!    them), every term a public runtime entry handed to an outside caller
-//!    (`Runtime::escaped_terms`), the escaped closures' environments
-//!    (`Runtime::eval_closures`), the sequential-trace tokens, every mailbox queue and process
-//!    dictionary. A prune is **declined** whenever a family that cannot be enumerated may hold
-//!    a term — today that is the runner's per-pid machines/results, whose only writers live in
-//!    `crate::runner` where this crate's visibility cannot reach (`Runtime::any_engine_ever`).
-//! 2. **The walk is conservative.** Any doubt — an exhausted visit budget, a boxed header this
-//!    module does not know, a word that is not a readable term — **declines the whole prune**
-//!    and retains everything. That is deliberately the *opposite* of
-//!    `RuntimeContext::graph_holds_reference`, whose exhaustion answer is "assume a reference"
-//!    because its only consequence is a declined move; here a wrong answer frees a payload a
-//!    live term names, so doubt must mean "keep".
-//! 3. **A shared payload is retained.** A handle whose `RefCount > 1` is owned by something
+//! 1. **Every region that can hold a store-owned pair is read word by word.**
+//!    [`Runtime::gather_off_heap_roots`](crate::runtime::Runtime) pushes *every* written word of
+//!    `eval_heap`, its retired generations, the pooled BIF heaps and the `system_info` scratch
+//!    heap — not just their "top-level" terms. A `[BinRef][ErlSubBits]` pair therefore can never
+//!    be hidden behind a container this module cannot read: the pair is found wherever it stands.
+//!    (That is also why the engine arena's missing word-range accessor is a *reported* gap and
+//!    not a hole here: no constructor in this workspace writes a pair onto the arena, and a pair
+//!    on `eval_heap` is reached whether or not an arena container points at it.)
+//! 2. **Every root family that holds a term no heap region holds is enumerated** — the evaluator's
+//!    environment and reduced value (passed in as `extra`), the escaped closures' capture
+//!    environments, the sequential-trace tokens, every live process's dictionary and mailbox
+//!    queue, and the pending-spawn records.
+//! 3. **The walk is conservative.** Any doubt — an exhausted visit budget, a boxed header this
+//!    module does not know — **declines the whole prune** and retains everything. That is
+//!    deliberately the *opposite* of `RuntimeContext::graph_holds_reference`, whose exhaustion
+//!    answer is "assume a reference" because its only consequence is a declined move; here a wrong
+//!    answer frees a payload a live term names, so doubt must mean "keep".
+//! 4. **A shared payload is retained.** A handle whose `RefCount > 1` is owned by something
 //!    outside the enumeration (a mailbox's retained binaries, a machine reservoir, a copy's
 //!    source table), so it is kept: a false retain is a bounded leak, a false release a dangle.
 //!
 //! Every residual is therefore a **leak, never a dangle**.
 //!
-//! # The walk duplicates `graph_holds_reference` on purpose
+//! # The refusal rule, and the two guards that are deliberately *not* in it
 //!
-//! The reachability descent here is the shape of `RuntimeContext::graph_holds_reference`
-//! (`crate::context::calls`): an inline worklist, the same word guards
-//! (`is_literal` / `is_term_word` / boxed-or-list / an aligned non-null pointer) and the same
-//! child enumeration ([`beam_term::layout::for_each_child_slot`]). It is a copy because that
-//! function answers a *different* question and lives in a node this change may not edit;
-//! de-duplicating the two is a deferral (one helper taking a visitor over the reachable graph,
-//! owned by `src/context/calls.rs`).
+//! The rule is exactly: *spend the visit budget or meet an unknown boxed header ⇒ decline*;
+//! *`RefCount > 1` ⇒ retain that payload*. Two candidate guards were considered and rejected:
+//!
+//! * **The global collection valve** (`Runtime::gc_enabled`). It says "this runtime stopped
+//!   **moving** process heaps", because an out-of-band store holds a term the copier could not
+//!   relocate ([`Runtime::try_stabilize_escaped`](crate::runtime::gc)). It is the wrong predicate
+//!   here on both counts: the prune **moves nothing** (a retained payload keeps its `data_ptr`),
+//!   and the valve is unrelated to off-heap reachability. Measured on the route this module
+//!   serves — a `-eval` expression that builds and drops off-heap binaries through
+//!   `base64:encode/1` — the valve is **not** tripped (`Runtime::gc_enabled()` stays `true`;
+//!   pinned by this module's `the_eval_route_does_not_trip_the_collection_valve`), and the only
+//!   ways to trip it store a
+//!   term that could not be copied at all — an **MSO** container, whose refc binaries (if any)
+//!   are covered by the `RefCount > 1` belt, since the machine that built them still holds their
+//!   handles. Keeping the guard would have made the prune a no-op the moment any unrelated
+//!   `persistent_term`/timer store tripped the valve, for no soundness gain.
+//! * **"An engine has ever existed"** ([`Runtime::any_engine_ever`](crate::runtime::Runtime)).
+//!   [`crate::runner::RunnerState`]'s engines, their machines and their recorded outcomes are
+//!   private to `crate::runner`, so the family is only observable as a sticky flag — and it is
+//!   set on **every** route, because the boot script registers `{kernelProcess,…}` engines before
+//!   any action runs. Declining on it would make this prune permanently dead. It does not need to
+//!   be a condition: a term an engine holds that names a payload always brings its own handle
+//!   (`Machine::refc_binaries` never clears, and a copy registers in the destination table), so
+//!   part 4's belt retains exactly those payloads — and the runner's *recorded* outcomes are
+//!   `eval_heap` copies, i.e. part 1's region scan. The flag stays a **diagnostic**
+//!   ([`crate::runtime::EvalOffHeapStats::any_engine`]).
+//!
+//! # The trigger
+//!
+//! `O(1)` per call: the store's handle count (`Vec::len`) is compared with the count the last
+//! prune (or the last observation) saw, and the `O(handles)` byte figure is re-derived **only**
+//! when it moved — the same shape `beam_rt`'s slice-boundary prune uses
+//! (`src/context/gc/bin_vheap.rs`). Past that, the summed payload bytes must exceed
+//! [`STORE_BUDGET_WORDS`]; only then is the walk run and the store rewritten.
 //!
 //! # What this module does *not* touch
 //!
 //! No per-pid `Process::set_off_heap_binary_bytes` figure is published: the store is not
 //! pid-attributable (a nested run inside a scheduled process grows it too), so that figure
 //! stays the runner's park-arm prune's.
+//!
+//! # A duplicate that is a deferral, not an accident
+//!
+//! The reachability descent here is the shape of `RuntimeContext::graph_holds_reference`
+//! (`crate::context::calls`): an inline worklist, the same word guards (`is_literal` /
+//! `is_term_word` / boxed-or-list / an aligned non-null pointer) and the same child enumeration
+//! ([`beam_term::layout::for_each_child_slot`]). It is a copy because that function answers a
+//! *different* question (and its exhaustion answer) and lives in a node this change may not edit;
+//! de-duplicating the two is a deferral (one helper taking a visitor over the reachable graph,
+//! owned by `src/context/calls.rs`).
+// The narrow, documented `unsafe` override the workspace's policy sanctions for a term-graph walk
+// (`src/context/gc_walk.rs`'s precedent): the descent must read raw heap words. Every read is
+// guarded exactly as `graph_holds_reference`'s are, and the module allocates no pointer of its
+// own.
+#![allow(unsafe_code)]
 
 use std::mem::align_of;
 use std::mem::size_of;
@@ -105,10 +160,11 @@ pub(crate) enum Prune {
 }
 
 /// The store's prune state: the last observed handle count (the `O(1)` half of the trigger)
-/// and the counters a test and `erlang:memory`-style introspection read.
+/// and the counters a test and [`crate::runtime::EvalOffHeapStats`] read.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PruneState {
-    /// The store's handle count at the last prune — the observation pair of the trigger.
+    /// The store's handle count at the last prune **or** observation — the comparison half of
+    /// the trigger.
     pub(crate) seen_handles: usize,
     /// How many times the store was actually rewritten.
     pub(crate) prunes: u64,
@@ -140,27 +196,19 @@ enum Walk {
 /// what makes the root enumeration complete; a caller that cannot name its live terms must
 /// not call this.
 pub(crate) fn prune(runtime: &mut Runtime, extra: &[Eterm]) -> Prune {
-    // (b) The global collection valve: while an escaped term's relocation could not be shown
-    // safe, this runtime has stopped collecting entirely, and the store is frozen for the same
-    // reason.
-    if !runtime.gc_enabled() {
-        return decline(runtime, "collection disabled");
-    }
-    // (c) A root family that cannot be enumerated: the runner's per-pid machines, their
-    // recorded `x(0)`/exit-reason terms and their reservoirs are `crate::runner`'s private
-    // state, so once any process has ever run there may be a term this walk cannot see.
-    if runtime.any_engine_ever() {
-        return decline(runtime, "a process engine has run");
-    }
-    let (handles, bytes) = runtime.eval_off_heap_figures();
+    // The trigger's `O(1)` half: the handle count, and whether it moved at all.
+    let handles = runtime.eval_off_heap_handle_count();
     if handles == 0 {
         return Prune::Deferred;
     }
-    // The trigger, mirroring `OffHeapReclaimer::triggered`: nothing has been added since the
-    // last prune (`O(1)`), or the store is still inside its budget.
-    if handles == runtime.eval_prune().seen_handles
-        || bytes / size_of::<Eterm>() <= STORE_BUDGET_WORDS
-    {
+    if handles == runtime.eval_prune().seen_handles {
+        return Prune::Deferred;
+    }
+    // It moved: derive the expensive half once, and record the observation so a steady state
+    // costs a single `len()` again.
+    let bytes = runtime.eval_off_heap_bytes();
+    runtime.note_eval_prune_observed(handles);
+    if bytes / size_of::<Eterm>() <= STORE_BUDGET_WORDS {
         return Prune::Deferred;
     }
     let mut roots = Vec::with_capacity(extra.len() + 16);
@@ -196,7 +244,7 @@ pub(crate) fn prune(runtime: &mut Runtime, extra: &[Eterm]) -> Prune {
             retained += 1;
         }
     }
-    let (handles, _bytes) = runtime.eval_off_heap_figures();
+    let handles = runtime.eval_off_heap_handle_count();
     runtime.note_eval_prune(handles);
     Prune::Pruned {
         released: total - retained,
@@ -299,28 +347,37 @@ mod tests {
 
     /// An off-heap payload of `bytes` zero bytes.
     fn payload(bytes: usize) -> RefcBinary {
-        let mut binary =
-            RefcBinary::new(bytes).expect("the test payload allocation");
-        binary.set_len(bytes).expect("the test payload length");
-        binary
+        RefcBinary::new(&vec![0u8; bytes]).expect("the test payload allocation")
+    }
+
+    /// Writes the 8-word `[BinRef][ErlSubBits]` pair naming `binary`'s payload onto `heap` and
+    /// returns its root term.
+    fn pair(heap: &mut beam_term::heap::Heap, binary: &RefcBinary, bits: usize) -> Eterm {
+        // SAFETY: `alloc_words` reserves the pair's 8 words, which `write_refc_binary` fully
+        // writes; `binary` outlives the term in every caller below.
+        unsafe {
+            let hp = heap
+                .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
+                .expect("the test heap has room for one refc pair");
+            beam_term::refc::write_refc_binary(
+                hp,
+                binary.data_ptr().cast::<Eterm>(),
+                std::ptr::null_mut(),
+                binary.data_ptr().cast_const(),
+                0,
+                bits,
+            )
+        }
     }
 
     /// The walk finds the payload a `[BinRef][ErlSubBits]` pair names — directly, through a
     /// cons, and through a tuple — and reports nothing for an unrelated payload.
     #[test]
     fn the_walk_collects_a_payload_reachable_through_any_container() {
-        let mut heap = beam_term::heap::Heap::new(64).expect("the test heap");
+        let mut heap = beam_term::heap::Heap::new(64);
         let first = payload(128);
         let second = payload(128);
-        let pair = beam_term::refc::write_refc_binary(
-            heap.hp_mut(),
-            first.data_ptr().cast::<u8>().cast_const(),
-            0,
-            128 * 8,
-        )
-        .expect("the pair");
-        // SAFETY: `write_refc_binary` returned the root of a live 8-word pair.
-        let pair_term = unsafe { pair };
+        let pair_term = pair(&mut heap, &first, 128 * 8);
         let cons = heap.cons(pair_term, beam_term::prelude::NIL).expect("the cons");
         let tuple = heap
             .tuple(&[beam_term::prelude::make_small(1), cons])
@@ -336,6 +393,40 @@ mod tests {
             !live.payloads.contains(&(second.data_ptr() as usize)),
             "an unreferenced payload is not reported reachable"
         );
+    }
+
+    /// A pair that is itself a **root** is found without any container above it — the property
+    /// the region word scan depends on (every written word of a heap is pushed as a root).
+    #[test]
+    fn a_pair_pushed_as_a_root_is_found_directly() {
+        let mut heap = beam_term::heap::Heap::new(32);
+        let binary = payload(96);
+        let pair_term = pair(&mut heap, &binary, 96 * 8);
+        let Walk::Complete(live) = walk(&[pair_term]) else {
+            panic!("the walk over a lone pair completes");
+        };
+        assert!(live.payloads.contains(&(binary.data_ptr() as usize)));
+    }
+
+    /// The empirical premise behind rejecting the collection-valve guard: the `-eval` route
+    /// this prune serves never trips the valve, including while it builds and drops off-heap
+    /// payloads through `base64:encode/1` (the store's own producer here).
+    #[test]
+    fn the_eval_route_does_not_trip_the_collection_valve() {
+        let mut runtime =
+            crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+                .expect("the runtime");
+        assert!(runtime.gc_enabled(), "a fresh runtime has the valve open");
+        for _ in 0..3 {
+            runtime
+                .eval("base64:encode(binary:copy(<<1>>, 40000))")
+                .expect("the off-heap building expression evaluates");
+            assert!(
+                runtime.gc_enabled(),
+                "the collection valve must stay open on the -eval route, so it cannot be the \
+                 prune's guard"
+            );
+        }
     }
 
     /// The `RefCount > 1` belt: a payload a second handle owns is retained even when nothing

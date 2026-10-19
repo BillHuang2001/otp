@@ -163,6 +163,37 @@ pub(crate) struct PendingSpawn {
     pub(crate) args: Vec<Eterm>,
 }
 
+/// The **`-eval` route's escaped off-heap store**, as this runtime's own bookkeeping sees it.
+///
+/// The store ([`Runtime::eval_off_heap`]) owns the off-heap refc-binary payloads a term on the
+/// table-less (`-eval`/`-s`/`-run`) route points at, and
+/// [`crate::eval::reclaim`] releases the ones nothing reaches any more. This snapshot is the
+/// runtime's **observability** of that loop: the oracle has no counterpart for any of it (its
+/// payloads are refcounted straight off the process heap), so nothing here is a differential
+/// figure — but a bounded store is what makes the route's memory behaviour a *shape* rather than
+/// a leak, and that shape is what the tests assert.
+///
+/// `erlang:memory(binary)` reports the same payload bytes through `binary_alloc`'s live-bytes
+/// figure; it cannot report the handle count, the prune/decline counters or the engine signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvalOffHeapStats {
+    /// How many payload handles the store holds (one per registered payload; a duplicate
+    /// registration of one payload counts once, and a prune de-duplicates).
+    pub handles: usize,
+    /// The payload bytes those handles reserve
+    /// ([`beam_alloc::RefcBinary::reserved_bytes`], summed) — the figure the prune's trigger
+    /// compares against its budget.
+    pub retained_bytes: usize,
+    /// How many times a prune rewrote the store.
+    pub prunes: u64,
+    /// How many times a prune declined because soundness could not be shown.
+    pub declines: u64,
+    /// Whether a process engine has ever been registered on this runtime (the
+    /// [`Runtime::any_engine_ever`] signal; see [`crate::eval::reclaim`]'s docs for why it is a
+    /// diagnostic and not a decline condition).
+    pub any_engine: bool,
+}
+
 /// The Rust ERTS runtime.
 pub struct Runtime {
     /// The configuration this runtime was created with.
@@ -294,6 +325,26 @@ pub struct Runtime {
     /// difference is what it holds: only the terms the table-less route had to keep (a BIF's
     /// container results and the evaluator's own bitstrings), never a call's temporaries.
     pub(crate) eval_heap_retired: Vec<Heap>,
+    /// The `-eval` route's escaped-payload store bookkeeping
+    /// ([`crate::eval::reclaim::PruneState`]): the last observed handle count (the `O(1)`
+    /// half of the prune trigger), the prune/decline counters and the most recent decline
+    /// reason.
+    pub(crate) eval_prune: crate::eval::reclaim::PruneState,
+    /// Whether a process **engine** has ever been registered on this runtime — a sticky,
+    /// `O(1)` signal (there is no way to enumerate
+    /// [`Runtime::runner_state`](crate::runner::RunnerState)'s engines from outside
+    /// `crate::runner`, and an engine outlives the slice that created it, so *presence* is
+    /// only observable as "one has existed").
+    ///
+    /// Read by [`crate::eval::reclaim`] as the *diagnostic* half of its completeness
+    /// argument, never as a decline condition (see that module's docs: an engine's terms
+    /// always carry their own payload handle, so the `RefCount > 1` belt already covers
+    /// them — declining on this flag would instead make the prune permanently dead on
+    /// every route, because the boot script registers `{kernelProcess,…}` engines).
+    /// Set beside the only two engine-registering calls
+    /// ([`Runtime::spawn_process_with_policy`] and [`Runtime::spawn_fun_process`], i.e.
+    /// `RunnerState::spawn`/`spawn_fun`), which are the sole creators of engines.
+    engine_registered: bool,
     /// The `ets:*` tables.
     ///
     /// Shared through an [`Rc`]`<`[`RefCell`]`>` so a BIF call can hold the registry for
@@ -992,6 +1043,8 @@ impl Runtime {
             eval_heap: Heap::new(heap_words)?,
             eval_off_heap: beam_message::OffHeapTable::new(),
             eval_heap_retired: Vec::new(),
+            eval_prune: crate::eval::reclaim::PruneState::default(),
+            engine_registered: false,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
             ports,
@@ -1628,6 +1681,147 @@ impl Runtime {
         }
     }
 
+    // -- the `-eval` route's escaped-payload store: the surface `crate::eval::reclaim` prunes
+    // through ------------------------------------------------------------------------------
+    /// Whether a process **engine** has ever been registered on this runtime.
+    ///
+    /// The sticky, `O(1)` signal [`crate::eval::reclaim`] records as a **diagnostic**: the
+    /// runner's per-pid engines, their machines and their recorded outcomes live in
+    /// [`crate::runner::RunnerState`], whose maps are private to that node, so "an engine might
+    /// exist" is only observable as "one has ever existed". It is deliberately **not** a decline
+    /// condition — the boot script registers `{kernelProcess,…}` engines on every route, so
+    /// declining here would make the prune permanently dead, and it does not need to be one: a
+    /// term on an engine's heap that names a payload always brings its own payload handle
+    /// (`Machine::refc_binaries`, which `reset` never clears; a copy's destination table), so the
+    /// prune's `RefCount > 1` belt retains exactly those payloads. See the module docs for the
+    /// full argument.
+    pub(crate) fn any_engine_ever(&self) -> bool {
+        self.engine_registered
+    }
+    /// The escaped-payload store's prune bookkeeping ([`crate::eval::reclaim::PruneState`]).
+    pub(crate) fn eval_prune(&self) -> &crate::eval::reclaim::PruneState {
+        &self.eval_prune
+    }
+    /// Records that the store was rewritten and now holds `handles` payload handles.
+    pub(crate) fn note_eval_prune(&mut self, handles: usize) {
+        self.eval_prune.seen_handles = handles;
+        self.eval_prune.prunes += 1;
+        self.eval_prune.last_decline = None;
+    }
+    /// Records the trigger's `O(1)` observation (*the handle count*) **without** rewriting the
+    /// store — the "nothing to do yet" half of the trigger.
+    ///
+    /// Needed as its own entry point because the expensive half of the trigger (the summed
+    /// payload bytes) is derived only when this observation *moves*: recording it here is what
+    /// keeps a steady-state statement a single `Vec::len()` read instead of an `O(handles)` walk.
+    pub(crate) fn note_eval_prune_observed(&mut self, handles: usize) {
+        self.eval_prune.seen_handles = handles;
+    }
+    /// Records that a prune **declined** because soundness could not be shown, and why.
+    pub(crate) fn note_eval_prune_declined(&mut self, reason: &'static str) {
+        self.eval_prune.declines += 1;
+        self.eval_prune.last_decline = Some(reason);
+    }
+    /// The number of payload handles the escaped-payload store holds — the `O(1)` half of the
+    /// prune's trigger (`Vec::len`, no traversal of the handles).
+    pub(crate) fn eval_off_heap_handle_count(&self) -> usize {
+        self.eval_off_heap.binaries().len()
+    }
+    /// The payload bytes the escaped-payload store reserves, summed over its handles — the
+    /// `O(handles)` half of the prune's trigger, re-derived only when the handle count moves.
+    pub(crate) fn eval_off_heap_bytes(&self) -> usize {
+        self.eval_off_heap
+            .binaries()
+            .iter()
+            .map(beam_alloc::RefcBinary::reserved_bytes)
+            .sum()
+    }
+    /// The escaped-payload store, mutably — the prune's only writer
+    /// ([`beam_message::OffHeapTable::drain_binaries`] is its only removal path).
+    pub(crate) fn eval_off_heap_mut(&mut self) -> &mut beam_message::OffHeapTable {
+        &mut self.eval_off_heap
+    }
+    /// This runtime's own view of the escaped-payload store and its prune loop (see
+    /// [`EvalOffHeapStats`]).
+    pub fn eval_off_heap_stats(&self) -> EvalOffHeapStats {
+        EvalOffHeapStats {
+            handles: self.eval_off_heap_handle_count(),
+            retained_bytes: self.eval_off_heap_bytes(),
+            prunes: self.eval_prune.prunes,
+            declines: self.eval_prune.declines,
+            any_engine: self.any_engine_ever(),
+        }
+    }
+    /// Appends every **root** that can name an off-heap payload to `out` — the prune's
+    /// completeness half (`crate::eval::reclaim`).
+    ///
+    /// Two kinds of region are covered, for two different reasons:
+    ///
+    /// * **Whole regions, word by word** — [`Runtime::eval_heap`], its retired generations, the
+    ///   pooled BIF heaps and the `system_info` scratch heap. A payload-bearing term here is a
+    ///   `[BinRef][ErlSubBits]` pair, and pushing *every* written word (not just the "top-level"
+    ///   term) is what makes the walk independent of who points at the pair: a container on a
+    ///   region this function cannot read (the engine arena, a machine heap) still cannot hide a
+    ///   pair that lives on one of these. That property is the reason the arena's missing
+    ///   word-range accessor (`beam_engine::MinimalContext`'s `ContextHeap` is private) is a
+    ///   *reported* gap and not a soundness hole for store-owned payloads.
+    /// * **Named live sets** — the escaped closures' capture environments, the sequential-trace
+    ///   tokens, every live process's dictionary and mailbox queue, and the pending-spawn records
+    ///   (entry fun + arguments). These hold terms no heap region above necessarily holds.
+    ///
+    /// Terms that **cannot** name a payload are deliberately not rooted, each for a stated reason:
+    ///
+    /// * `persistent_term` values — stabilized through
+    ///   [`Runtime::try_stabilize_escaped`](crate::runtime::gc), whose copy flattens a refc
+    ///   payload on-heap (no handle is registered, and the stored term is the flattened copy).
+    /// * timer messages ([`crate::timers`] `TimerAction::Deliver.message`) and `trace` match specs
+    ///   — stabilized the same way ([`Runtime::stabilize_term`]).
+    /// * ETS — the table copy deep-copies and re-materializes a refc window as on-heap sub-bits
+    ///   (`beam_ets`'s copy), so a stored term names no payload.
+    /// * [`Runtime::references`] — an all-immediate leaf block (a reference has no child slots).
+    /// * the [`RuntimeContext`]/`DispatchMemo`/native-floor structs and every `thread_local!`
+    ///   site — they hold no `Eterm` a prune can run between, except the x-register/stack set of
+    ///   a *live* engine, which the `RefCount > 1` belt covers (see
+    ///   [`Runtime::any_engine_ever`]).
+    pub(crate) fn gather_off_heap_roots(&mut self, out: &mut Vec<Eterm>) {
+        // The regions whose every written word is a root (see the docs above).
+        out.extend_from_slice(self.eval_heap.used_words_mut());
+        for heap in &mut self.eval_heap_retired {
+            out.extend_from_slice(heap.used_words_mut());
+        }
+        for heap in &mut self.bif_heaps {
+            out.extend_from_slice(heap.used_words_mut());
+        }
+        out.extend_from_slice(self.info_heap.used_words_mut());
+        // The escaped closures' capture environments.
+        for body in &self.eval_closures {
+            body.env_terms(out);
+        }
+        // The sequential-trace tokens: `set_label`/`set_from` store the term unstabilized.
+        self.seq_trace.gather_off_heap_roots(out);
+        // Every live process's dictionary and mailbox queue.
+        for pid in self.processes.pids() {
+            let Some(process) = self.processes.get(pid) else {
+                continue;
+            };
+            for (key, value) in process.dict().entries() {
+                out.push(key);
+                out.push(value);
+            }
+            for message in process.mailbox().iter() {
+                out.push(message.payload());
+                out.push(message.token());
+                out.push(message.from());
+            }
+        }
+        // A spawn recorded but not yet absorbed into the process table.
+        for spawn in &self.pending_spawns {
+            out.extend_from_slice(&spawn.args);
+            if let ProcessEntry::Fun { fun, .. } = &spawn.entry {
+                out.push(*fun);
+            }
+        }
+    }
     /// The **source** off-heap table a transport copy of a term leaving a process resolves its
     /// refc binaries against: `extra` (the sending **machine's** own handles,
     /// [`Machine::refc_binaries`](beam_engine::Machine::refc_binaries)) **unioned** with the
@@ -2400,6 +2594,10 @@ impl Runtime {
         // The child's first root set is the argument list below; open its descent gate when
         // any argument is a container (see [`Runtime::note_spawn_foreign_roots`]).
         self.note_spawn_foreign_roots(pid, &args, None);
+        // The one place an engine is ever created (`RunnerState::spawn` is the only inserter
+        // of `RunnerState::engines` from here, `spawn_fun` the other): the sticky signal
+        // [`Runtime::any_engine_ever`] reports.
+        self.engine_registered = true;
         self.runner_state.spawn(pid, entry, args);
         self.enqueue_process(pid)?;
         Ok(pid)
@@ -2575,6 +2773,8 @@ impl Runtime {
         // As `spawn_process_with_policy`, for the fun's own environment as well as the
         // arguments (see [`Runtime::note_spawn_foreign_roots`]).
         self.note_spawn_foreign_roots(pid, &args, Some(fun));
+        // As above: this is the fun-entry half of the only two engine-creating calls.
+        self.engine_registered = true;
         self.runner_state.spawn_fun(pid, fun, args);
         self.enqueue_process(pid)?;
         Ok(pid)
