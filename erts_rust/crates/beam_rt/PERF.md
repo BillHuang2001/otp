@@ -514,3 +514,82 @@ Measured on the `copy_bound/ets_copy` shape (250 000 rust ops, release `beam_rt`
 The host is shared (21–64 loadavg on 14 cores), so **one of the five pre-registered rounds** passed a strict load filter and only that pair is quoted as a ratio; the rest are retained as ranges, never as a single figure.
 Nothing outside the shape moved beyond **± 4 %**: `etf_roundtrip` **+0.5 %**, `list_walk` **−2.2 %**, while `send_recv` and `gc_bound churn` are **inconclusive** at this load.
 Read the structural word counts as the result and the −16 % as an indication; re-measure on an idle host before quoting a tighter ratio.
+
+## The NIF-resource prune's two non-park sites (deterministic counters, flat in N)
+
+**Nothing here is a timing.** A NIF resource's payload is a **host `malloc` block** outside every runtime allocator, so no `erlang:memory/1` figure can see the table and no wall clock is separable from it.
+Every number below is a **deterministic counter** — the C fixture's own destructor count, its live-object count, and `ResourcePruneStats`' fields — so this section needs no load filter and makes no latency claim; the load context is recorded only for reproducibility.
+Host: Linux `x86_64`, `nproc` = **14**, shared — 1-min `/proc/loadavg` **32–47** across the runs (33.79 at the transcription of this section). Both legs are **debug** builds (`erts_rust/scripts/cargo.sh test …`), which is the default for this crate's gates.
+
+**The mechanism.** A resource term owns one reference on its object (`beam_abi::nif::enif::resources`), and *which* terms are still live is only knowable by the host — hence `release_resource_terms(predicate)`.
+`src/context/gc/resources.rs::reclaim` is that predicate's caller for a **scheduled** process (the runner's `Yield` park arm, the one point with a published complete root set).
+The two **non-park** sites are the new ones, both in `src/eval/reclaim/resource.rs` and both sharing the refc walk's descent through a two-method `Reach` sink (`src/eval/reclaim.rs::walk<R: Reach>`), so there is **one** reachability implementation, not three:
+`prune_at_statement_boundary` runs between an `-eval` expression's top-level statements, and `prune_beyond` runs at a **nested run's epilogue** (`src/context/pump.rs::adopt_nested_payloads`, reached by every fun application and cross-module call).
+Neither site can enumerate its whole process, so both are gated by a **frontier** — a sorted snapshot of the live resource-term candidate set taken at statement entry / run entry — and release only candidates that appeared **inside** their own window and that their published live set does not name.
+That is the same soundness device as `prune_scoped`'s `only` list, and for the same measured reason.
+
+**Matching is two-tier**, because a `copy_struct` copy is a different *word* with the same *identity*: tier 1 is the candidate's own raw word (`binary_search`), tier 2 is `beam_term::boxed::internal_ref_id` on the term's id block. An identity that cannot be read is recorded as **reached** — "cannot identify it" must never become "it is dead".
+
+### The `-eval` statement boundary, N sweep (`tests/nif_resource_gc.rs`)
+
+One runtime, one process; the driver expression is `D0 = nif_resource_gc:dtor_count(), erlang:length([nif_resource_gc:probe()])` ×N, `{dtor_count() - D0, erlang:memory(total)}`.
+`erlang:length([probe()])` is load-bearing: it consumes the minted term as a function argument, so the term is genuinely **un-rooted** at the boundary (a bound-but-unused variable would still be a live `Env` value and a release would be a false one).
+
+| leg | mints (cumulative) | dtors | released | prunes | declines | live terms |
+|---|---|---:|---:|---:|---:|---|
+| prune ON | 10 | 10 | 10 | 10 | 0 | 0 → 0 |
+| prune ON | 100 (110) | 100 | 110 | 110 | 0 | 0 → 0 |
+| prune ON | 1 000 (1 110) | 1 000 | 1 110 | 1 110 | 0 | 0 → 0 |
+| prune OFF | 10 | 0 | 0 | 0 | 0 | 0 → 10 |
+| prune OFF | 100 | 0 | 0 | 0 | 0 | 10 → 110 |
+| prune OFF | 1 000 | 0 | 0 | 0 | 0 | 110 → 1 110 |
+
+**ON is exactly one destructor per minted-and-dropped term at every N, and the table does not grow by a single entry**; **OFF is exactly linear**, one entry per mint — the pre-fix shape, and the reason the OFF leg exists as a control rather than as a comment.
+`released == prunes == ΣN` is one walk per minting **statement** (not per mint), and `declines == 0` says no walk was refused, so the flat half is not a decline in disguise.
+The zero residual is real here rather than the documented one-statement leak: the run's very first boundary follows `init/1`, which mints nothing, so the frontier is already correct at the first mint.
+The A/B procedure is a **one-line flip** (`ResourcePruneState::default`'s `enabled: true → false`) plus a rebuild; with it flipped the cadence test fails at its first assertion (`left: 0, right: 10`), which is the revert evidence.
+
+### The nested-run epilogue (`tests/nif_resource_nested.rs`)
+
+Every probe is compared against the **system `erl`** on the identical `.beam`s, the identical `.so` and the identical expression text (OTP 29.1.1 / erts-17.1), so the table is an agreement, not a hard-coded expectation.
+
+| probe | prune ON | prune OFF | oracle |
+|---|---|---|---|
+| `dropped(10)` | `{10,0}` | `{0,10}` | `{10,0}` |
+| `dropped(200)` | `{200,0}` | `{0,200}` | `{200,0}` |
+| `mapped(10)` / `mapped(200)` | `{10,0}` / `{200,0}` | — | `{10,0}` / `{200,0}` |
+| `held(16)` (linear control) | `{16,0}` | — | `{16,0}` |
+| `keep_var` / `keep_tuple` / `keep_list` | `{8,0}` | — | `{8,0}` |
+| `plain` (probe discriminates) | `{error,8,0}` | — | `{error,8,0}` |
+
+`dropped(N)` is `{dtor_count, live_count}`, so flat in N means the destructor count tracks N while the live-object count returns to `0`; OFF is linear in the live count with no destructor at all.
+`mapped(N)` is the **scope** half — the `lists:map/2` shape that pinned the refc version: every element was minted by an *earlier* nested run than the one that reads it, and all of them still resolve through `enif_get_resource` (`probe/0` writes a `42` marker and `peek/1` answers `8` from `enif_sizeof_resource`, so a recycled block at the right address is refused rather than trusted).
+`held(16)` is the **non-vacuity** control: the same loop through `probe_held/0`, whose objects the NIF's own C reference keeps alive, is linear — so a broken live-object counter could not make the flat half pass silently.
+
+**Two honesty notes.** (1) The oracle defers a resource `dtor` to misc aux work, so its count only moves after a GC *and* a thread-progress point; the fixture's `dropped/2` does both (`erlang:garbage_collect/0` + `timer:sleep/1`), and because the oracle can still lag **strictly** behind under a loaded host, the dropped legs compare exactly first and otherwise only the shared shape `dtor + live == N`. (2) This runtime releases **synchronously** at each run's epilogue, so the same expression's destructor runs earlier — a timing difference, not a correctness one.
+
+### Cost, and the two device decisions worth recording
+
+**The O(1) steady state is one snapshot and one `Vec` compare per site.** `Frontier::snapshot()` reads `resource_terms()` into a sorted word list (an empty registry allocates nothing); `prune_beyond` then defers when the total word count is unchanged, when nothing is fresh, or when the kill switch is off — so a site with no NIF resource traffic costs one registry read and no walk at all, which is what makes the per-lambda-application price acceptable.
+The nested epilogue goes further: when **neither** store is due (neither the refc payload store nor the resource table), it does not copy the root set either.
+
+**There is no region word scan for resources, and that is a decision, not an omission.** The refc prune gets a region half for free because a payload *pointer* is a value written beside its header, so a `HEADER_BIN_REF` pattern scan finds it without dereferencing anything.
+A resource's identity instead lives **inside** its 4-word `[hdr][node][serial][id]` block, and the mint block itself stands in a runtime region (the pooled BIF heap) — so a word-pattern scan would match every candidate every time and make the prune a permanent no-op.
+Omitting it is sound for a specific reason: this descent is region-**agnostic** (it never consults the collector's scanned bounds), so every *live* copy of a resource term is reached from the named roots, while a copy sitting in a region nothing names is dead data — regions are never reset, so treating region words as roots would retain forever, which is the "false positive can only retain" argument pointing the other way.
+The residual is the one the park arm already documents: a resource held only by a store outside the walk's root families (another process's heap, an ETS table, `persistent_term`) is retained.
+
+### Reproduction
+
+```text
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test nif_resource_gc
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test nif_resource_gc -- --ignored   # the control leg, own process
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test nif_resource_nested
+```
+
+The control leg must run in its **own process**: the ABI resource registry is process-global and `Registry::bind_term` evicts a binding whose word a new mint reuses, so a second `Runtime` in the same OS process mints at the same words and the frontier's candidate set is invariant (which would make every prune defer). Both the cadence test and the control carry a loud-skip guard for a dirty registry for exactly that reason.
+
+### See Also
+
+- [`src/eval/reclaim/resource.rs`](src/eval/reclaim/resource.rs) → the frontier, the two-tier sink, the three gates and the in-module unit tests.
+- [`src/context/gc/resources.rs`](src/context/gc/resources.rs) → the scheduled-site contract, its five decline gates and its residual class (this section extends it, it does not replace it).
+- [`M1_GAPS.md`](M1_GAPS.md) *NIF (A.3)* → the residual ledger: the first-boundary statement leak, the nested `Err` path, the pointer-reuse heuristic and the root-family completeness dependency.
