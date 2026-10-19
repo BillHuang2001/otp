@@ -21,10 +21,10 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   `end - start`, exactly `erts_bin_bits_size`; a non-bitstring — and a bare off-heap `BinRef`, which no
   `bs_start_match` has wrapped yet — is `None`, never a substituted size. Its two
   intended adopters are the BIF floors that serve `erlang:bit_size/1` — the in-crate harness floor
-  `src/bench/counting.rs`, and the external test host `tests/support/bifs.rs` (which would additionally need a
-  `pub` re-export, `families` being a private module). **Neither has adopted it yet**: both still report
-  `emqx_base62:decode/1` as `skipped` on `unsupported_opcode: bif erlang:bit_size`, so the `#[allow]` stands and
-  no engine code calls it today.
+  `src/bench/counting.rs`, which **has** adopted it (that is what makes `emqx_base62:decode/1`
+  measurable: `instr_per_call` 531, `rooted_calls_per_call` 32), and the external test host
+  `tests/support/bifs.rs`, which still cannot (integration tests see the crate from outside and
+  `families` is a private module, so it would need a `pub` re-export).
 - All computation goes through `crate::context::ExecutionContext`; term construction via `crate::terms`.
   Families build no term layout of their own **except** `bitstrings/raw.rs` (see Duplication).
 
