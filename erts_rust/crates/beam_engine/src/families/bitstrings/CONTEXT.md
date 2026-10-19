@@ -262,6 +262,46 @@ fields), so those shapes are covered only by this node's oracle-derived unit tes
   code (`<<1, X/binary, 2>>` emits a non-append `binary` segment with `{f,0}`). Verified
   oracle-identical for that shape — do not "fix" it into a silent continue.
 
+## `## Measured` — per-call cost of the two foreign bitstring workloads
+All figures are the default (native baseline) tier on the shared host, pinned core, one process at
+a time, with the `/proc/loadavg` band recorded; only the **ratios** and the deterministic
+`*_per_call` counters are meaningful — an absolute moves with the host load (observed ±15 % between
+sessions, and up to 5× on a loaded one).
+Structural counters (deterministic; the primary evidence):
+
+| workload | `rooted_calls_per_call` | `rooted_words_per_call` | `instr_per_call` |
+|---|---|---|---|
+| `cowboy_bstr:to_lower` | 2 | 13 | 438 |
+| `cowboy_bstr:capitalize_token` | 2 | 13 | 660 |
+| `emqx_base62:encode` | 18 | 45 | 244 |
+| `emqx_base62:decode` | 32 | 133 | 531 |
+| `long_append:expand` | 2 | 13 | 98 318 |
+| `bench_list_walk:walk` | 1000 | 2000 | 169 418 |
+
+`to_lower`/`capitalize_token` paid **32 / 163** and **63 / 318** rooted calls/words before the
+match-context reuse landed; the accumulator loop now reserves nothing at all beyond the single
+`bs_init_writable` pair, and `encode`/`decode` reserve only their genuine result binaries (plus the
+`iolist_to_binary` calls in `encode`). Wall clock (default tier, 19 alternating paired rounds, load
+band 1.23–2.12): `to_lower` 3 410.4 / 3 447.3 ns min/median at 7.87 ns per instruction,
+`capitalize_token` 4 376.7 / 4 404.2 at 6.67, `decode` 4 581.0 / 4 634.8 at 8.73, `encode`
+2 648.6 / 2 656.8 at 10.89, `list_walk` 373 065 / 374 416 at 2.21.
+Paired `post/pre` medians for the changes that landed (each its own ≥7-round alternating run):
+match-context reuse + `bs_get_position` small integer `to_lower` 0.958 / `capitalize_token` 0.908
+(interpreter 0.963 / 0.963), `bs_create_bin` cold-body outlining `to_lower` 0.995 /
+`capitalize_token` 0.992 / `encode` 0.990 / `long_append` 0.982, the `bs_match` dispatch pre-test
+`to_lower` 0.982 / `capitalize_token` 0.982 / `decode` 0.990 / `encode` 0.990.
+`list_walk` measures 0.995–1.005 median against every one of them (it executes no bitstring
+instruction), so the estimator carries no cross-workload bias.
+Function-level self time on the post-change tree (`to_lower`): `step_instruction_body` 14.5 %,
+`step_instruction_with_entry` 7.3 %, `run_commands` 5.5 %, `create::assemble` 5.5 %,
+`Machine::drive` 4.8 %, `matching::exec` 3.5 %, `families::dispatch` 3.2 %, `jit_bitstr` 3.0 %.
+Every remaining item is either outside this node (see `## Out-of-node findings`) or the
+`bs_match` interpretation C removes at load time.
+**Measured negative, do not re-attempt:** recognising the six emitted `bs_match` command shapes as
+whole-operand-list slice patterns ahead of the reference loop made `to_lower` **1.027×** *slower*
+(`capitalize_token` 1.016, `encode` 1.012; 9 alternating rounds, 9/9 rounds ≥ 1.0) — the shape test,
+`sizeable`/`atom_is` and the extra branch cost more than the two-iteration loop it replaced.
+
 ## Remaining typed capability gaps
 Every gap is a typed error, never a wrong value. Each remaining site is a guard for a
 **malformed `.beam`** or an internal invariant the installed compiler cannot reach
