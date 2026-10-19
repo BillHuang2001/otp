@@ -176,6 +176,35 @@
 //! sweep), so the answer is polled with a bounded retry — never an unbounded wait, and never a
 //! rendered pid/ref image.
 //!
+//! # The C's asynchronous job pool (selectors `70`-`71`)
+//!
+//! `driver_async/5` is the C's worker-thread job submission (`erl_async.c:541-617`) and the entry's
+//! `ready_async` slot is where a finished job's data lands (`io.c:5374-5406`). [`ASYNC_DRIVER_C`]
+//! submits one job from its `output` callback with a key, an `async_invoke` and an `async_free`,
+//! answers the **submission** as one byte (`'1'` for a positive job id, `'0'` when the pool ran it
+//! inline, `'-'` for a refusal), and then reports what its own callbacks observed: whether
+//! `ready_async` ran **with the very data the driver armed**, whether it ran exactly once, whether
+//! `async_invoke` ran, and whether `async_free` ran. Selector `70` is the whole shape on an entry
+//! that declares `ready_async` (the completion is handed to the driver, so its `async_free` must
+//! **not** run); selector `71` is the other half of the C's policy on the [`ASYNC_NO_READY_DRIVER`]
+//! build, whose entry leaves the slot `NULL` — `ready_async` can never run, so the pool must release
+//! the data through `async_free` instead.
+//!
+//! A completion reaches its port at the port's **drive point** (this runtime drains the pool once
+//! per port round, the C from its async-ready queue), so the reports are polled with a **bounded**
+//! retry — exactly the shape `process_exit_firing` uses, and never an unbounded wait. No job id is
+//! ever rendered: an id is a per-VM-start counter, so the observable is the *acceptance* (`'1'`),
+//! never the number.
+//!
+//! # Two entry points whose observable is outside the data channel (selectors `72`-`73`)
+//!
+//! [`STATE_DRIVER_C`] carries the two remaining driver entry points whose answer reaches Erlang by
+//! another route. `erl_drv_set_os_pid/2` records the pid `port_info(P, os_pid)` reports afterwards
+//! (`io.c:2971-2979`) — pinned as the `{os_pid, 4711}` the driver itself set. `erl_drv_putenv/2`
+//! followed by `erl_drv_getenv/3` pins the environment round trip *inside* the driver (its return
+//! code, the size the call writes back, and the bytes it reads), so the case needs no environment of
+//! its own.
+//!
 //! # Measured divergences (shapes that must **not** become cases)
 //!
 //! Every shape below was measured on both runtimes while this group was widened; each is a gap,
@@ -204,15 +233,47 @@
 //!   golden line, so the refusal is pinned only through the verb/port refusals above.
 //! * **`driver_set_port_data`/`driver_get_port_data`** — not slots at all: `erl_driver.h` (OTP 30)
 //!   and the frozen `ErlDrvApi` carry no such entry point.
-//! * **`driver_async`/`driver_async_cancel`** — no async pool in `beam_rt` (`port/driver.rs`), so
-//!   the entry point answers the C's failure code from every fixture; already documented by the
-//!   sibling `driver_abi` group and left out here too. Measured directly while this group was
-//!   widened (a fixture whose `output` callback calls
-//!   `driver_async(port, &key, invoke, data, NULL)` and answers the acceptance as one byte): the
-//!   oracle accepts the job and the probe answers `49` (`'1'`, the async id was allocated),
-//!   `beam_rt` answers `-1` and the probe answers `48` (`'0'`), i.e. a **capability gap** and never
-//!   a corpus case. Owner: `beam_abi` (the `driver_async` slot) / `beam_rt` (no async pool ⇒ no
-//!   `ready_async` either).
+//! * **`driver_async` with a `NULL` port** — the oracle dereferences it and dies of SIGSEGV
+//!   (measured, exit `139`), so the refusal shape is unpinnable: a probe that kills the oracle is a
+//!   harness artifact, not a runtime difference.
+//! * **`driver_async_port_key/1`** — the oracle answers the port's opaque data word (measured `3`,
+//!   stable within a VM but not a contract), `beam_rt` keeps the `DriverHost` trait default and
+//!   answers `0`. A fabricated key is not *the* key, so no value is pinnable. Owner: `beam_rt`
+//!   (`DriverHost::async_port_key`).
+//! * **the four `*_output_term`/`*_send_term` success codes** — the *delivery* agrees (the term
+//!   reaches its receiver on both runtimes; `driver_c`'s selector `26` and `driver_abi`'s delivery
+//!   selectors pin it), but `erl_drv_output_term`/`erl_drv_send_term`/`driver_output_term`/
+//!   `driver_send_term` answer the C's `1` on the oracle and `0` on `beam_rt` (measured), so the
+//!   return value itself is an open divergence. Owner: `beam_abi`.
+//! * **`ERL_DRV_LIST N`** — the C pops the top of the decode stack as the **tail** and conses the
+//!   `n - 1` values below it onto that tail (`io.c:6043-6055`), so `INT 1, INT 2, INT 3, LIST 3`
+//!   builds the **improper** `[1,2|3]` on the oracle while `beam_abi`'s decoder builds the proper
+//!   `[1,2,3]` (measured through the delivered term). Owner: `beam_abi` (`decode_term_spec`).
+//! * **`erl_drv_consume_timeslice/2`** — the C accumulates `percent*((CONTEXT_REDS+99)/100)` reds
+//!   and answers `1` only once they reach `CONTEXT_REDS` (`erl_port_task.c:1282-1296`): a
+//!   `percent` of `100` answers `1` on the oracle three times running while `beam_rt` answers `0`
+//!   (measured). A sub-slice `percent` answers `0` on both, which is why that weaker shape is
+//!   deliberately **not** a case — it would hide the divergence instead of pinning it. Owner:
+//!   `beam_rt`.
+//! * **`erl_drv_busy_msgq_limits/3`** — the oracle answers its configured `4096`/`8192`; `beam_rt`
+//!   answers `(size_t)-1`/`(size_t)-1`, the C's *disabled* pair (measured). Owner: `beam_rt`.
+//! * **`erl_drv_getenv/3` on an absent key** — both answer `-1`, but the oracle then writes
+//!   `(size_t)-1` (or one below the size it was handed) into `*value_size` while `beam_rt` leaves
+//!   the caller's value untouched (measured with a `0` and with a real size). The **present**-key
+//!   round trip agrees and *is* pinned (selector `73`). Owner: `beam_rt`.
+//! * **`driver_dl_error/0`'s message** — after a failed `driver_dl_open/1` both answer a non-`NULL`
+//!   message, but its length differs (measured `33` vs `78`): the text is the loader's, so no
+//!   value agrees. Owner: `beam_abi` (`driver_dl_error`).
+//! * **`erl_drv_monotonic_time/1` and `erl_drv_time_offset/1`** — the oracle's
+//!   `erl_drv_monotonic_time(ERL_DRV_SEC)` equals `erlang:monotonic_time(second)` and its offset is
+//!   the real `system - monotonic` (`2 368 889 336` measured); `beam_rt`'s monotonic answer is an
+//!   unrelated epoch and its offset is `0`. Only the unit consistency is pinnable, and
+//!   `driver_extra` already pins that. Owner: `beam_rt` / `beam_abi`.
+//! * **`erl_drv_init_ack/2`** — reachable only for a **waiting** async-open port (a `start` that
+//!   answered `ERL_DRV_ERROR_WAIT`), and the C ignores it for every other port
+//!   (`io.c:2933-2956`); on an ordinary port it is a no-op on both runtimes (measured: the port
+//!   stays open and usable), so the *acknowledgement* itself has no observable here. Owner:
+//!   `beam_rt` (the async-open route).
 //!
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!
@@ -426,7 +487,21 @@ classify(N) ->
         %% `64` is the callback itself: the driver watches a **helper** process and reports the
         %% firing on a later `output` command, so the observable is "`process_exit` ran exactly
         %% once, for the monitor this driver armed" — never a pid/ref/monitor image.
-        64 -> process_exit_firing(Dir)
+        64 -> process_exit_firing(Dir);
+        %% `70`/`71` are the C's asynchronous job pool end to end: the driver answers the
+        %% **submission** as one byte (`'1'` = a positive job id, `'0'` = the pool ran it inline,
+        %% `'-'` = refused), then reports what its own callbacks observed. `70` runs on an entry
+        %% that declares `ready_async` (`R1111`: it ran once, with the armed data, after the
+        %% invoke) and whose data is therefore *not* freed (`F0`); `71` runs on the entry that
+        %% leaves the slot NULL, where `ready_async` can never run (`R0001`) and the pool must
+        %% release the data itself (`F1`).
+        70 -> async_job(Dir, <<"R1111">>, <<"F0">>);
+        71 -> async_job(Dir, <<"R0001">>, <<"F1">>);
+        %% `72`/`73` are the two entry points whose answer reaches Erlang by another route: the pid
+        %% `erl_drv_set_os_pid` records for `port_info/2`, and the driver's own environment round
+        %% trip (`erl_drv_putenv` then `erl_drv_getenv`).
+        72 -> os_pid_record(Dir);
+        73 -> env_round_trip(Dir)
     end.
 
 %% Send one payload through the driver and answer the bytes it echoed back (`timeout` when the
@@ -523,6 +598,45 @@ poll_fired(P, Tries) ->
     end.
 yn(true) -> 1;
 yn(_) -> 0.
+
+%% The C's `driver_async/5` end to end (`erl_async.c:541-617`): the submission must be accepted
+%% (one byte, `'1'` for a positive job id, never the id itself — an id is a per-VM-start counter),
+%% and the driver's own report of its `ready_async`/`async_free` bookkeeping must reach the value
+%% the C's completion policy implies (`Ready`), with `Free` the `async_free` half. A completion is
+%% delivered at the port's drive point, so each report is polled with a **bounded** retry rather
+%% than awaited once.
+async_job(Dir, Ready, Free) ->
+    P = open(Dir, ""),
+    true = erlang:port_command(P, <<"a">>),
+    Accepted = echoed(P),
+    Got = poll_answer(P, <<"r">>, Ready, 300),
+    Freed = poll_answer(P, <<"f">>, Free, 300),
+    yn(Accepted =:= <<"1">> andalso Got =:= Ready andalso Freed =:= Free).
+
+%% One command per try, with the driver's own answer compared whole; `timeout` when the bound is
+%% exhausted, so a case can never hang.
+poll_answer(_P, _Cmd, _Want, 0) ->
+    timeout;
+poll_answer(P, Cmd, Want, Tries) ->
+    true = erlang:port_command(P, Cmd),
+    case echoed(P) of
+        Want -> Want;
+        _ -> receive after 10 -> ok end, poll_answer(P, Cmd, Want, Tries - 1)
+    end.
+
+%% `erl_drv_set_os_pid/2` records the pid `port_info(P, os_pid)` reports (`io.c:2971-2979`).
+os_pid_record(Dir) ->
+    P = open(Dir, ""),
+    true = erlang:port_command(P, <<"P">>),
+    yn(echoed(P) =:= <<"setpid">>
+       andalso erlang:port_info(P, os_pid) =:= {os_pid, 4711}).
+
+%% `erl_drv_putenv/2` then `erl_drv_getenv/3` of the same key, inside the driver: both return codes,
+%% the size the call writes back and the bytes it reads.
+env_round_trip(Dir) ->
+    P = open(Dir, ""),
+    true = erlang:port_command(P, <<"Q">>),
+    yn(echoed(P) =:= <<"q=0,0,3,abc">>).
 
 %% Reach the driver the way each runtime can, without changing the argv:
 %%   * the oracle refuses a path in `{spawn_driver, _}` (`badarg`) and needs the object
@@ -1342,6 +1456,293 @@ DRIVER_INIT(host_driver) {
 }
 "#;
 
+/// A real driver .so (contract A.4): the C's **asynchronous job pool** end to end.
+///
+/// `output` submits one `driver_async/5` job per `"a"` command — a key, an `async_invoke` and an
+/// `async_free` — and answers the *submission* as one byte (`'1'` for a positive job id, `'0'` when
+/// the pool ran it inline, `'-'` for a refusal). Two later commands report what the driver's own
+/// callbacks observed: `"R"` + four flags (`ready_async` ran, it ran with the very data the driver
+/// armed, it ran exactly once, `async_invoke` ran) and `"F"` + one flag (`async_free` ran). Every
+/// flag is a single digit, so the answer is a stable byte string — never a job id (a per-VM-start
+/// counter) and never a pointer.
+///
+/// `async_invoke` runs on a worker thread, so it only touches plain statics: the C forbids a driver
+/// from calling `driver_output` there, and this fixture does not. The completion is reported by
+/// `ready_async`, which runs at the port's drive point — on the emulator thread — and therefore does
+/// not emit anything either: the module polls for the report instead, so nothing depends on *when*
+/// the completion lands.
+const ASYNC_DRIVER_C: &str = r#"/* A real driver .so (contract A.4): `driver_async` and the `ready_async` completion. */
+#include <erl_driver.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    ErlDrvPort port;
+} async_state;
+
+/* What this driver's own callbacks observed (one port at a time, like the other fixtures). */
+static int async_invokes;
+static int async_frees;
+static int async_ready_runs;
+static int async_ready_saw_data;
+static void *async_armed; /* the `async_data` this driver handed to `driver_async` */
+
+static ErlDrvData async_start(ErlDrvPort port, char *command) {
+    async_state *st;
+    (void) command;
+    st = (async_state *) driver_alloc(sizeof(async_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    return (ErlDrvData) st;
+}
+
+static void async_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+/* Runs on an async worker thread: the C allows no `driver_*` call here, only plain state. */
+static void async_invoke(void *data) {
+    (void) data;
+    async_invokes++;
+}
+
+/* Runs on the emulator thread when the pool decides nothing took the data. */
+static void async_free(void *data) {
+    (void) data;
+    async_frees++;
+}
+
+/* The callback the whole family exists for: it receives the job's `async_data` operand. */
+static void async_ready(ErlDrvData drv_data, ErlDrvThreadData data) {
+    (void) drv_data;
+    async_ready_runs++;
+    if (data == (ErlDrvThreadData) async_armed)
+        async_ready_saw_data = 1;
+}
+
+static void async_report(ErlDrvData drv_data, const char *s) {
+    async_state *st = (async_state *) drv_data;
+    (void) driver_output(st->port, (char *) s, (ErlDrvSizeT) strlen(s));
+}
+
+static void async_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    async_state *st = (async_state *) drv_data;
+    char out[16];
+    if (st == NULL || len < 1)
+        return;
+    switch (buf[0]) {
+    case 'a': {
+        unsigned int key = 0;
+        long id;
+        async_armed = (void *) st;
+        id = driver_async(st->port, &key, async_invoke, async_armed, async_free);
+        /* The acceptance only: a job id is a per-VM-start counter (`erl_async.c:574-586`). */
+        (void) driver_output(st->port, id > 0 ? "1" : id == 0 ? "0" : "-", 1);
+        break;
+    }
+    case 'r':
+        (void) snprintf(out, sizeof(out), "R%d%d%d%d",
+                        async_ready_runs > 0 ? 1 : 0,
+                        async_ready_saw_data ? 1 : 0,
+                        async_ready_runs == 1 ? 1 : 0,
+                        async_invokes > 0 ? 1 : 0);
+        async_report(drv_data, out);
+        break;
+    case 'f':
+        (void) snprintf(out, sizeof(out), "F%d", async_frees > 0 ? 1 : 0);
+        async_report(drv_data, out);
+        break;
+    default:
+        break;
+    }
+}
+
+static ErlDrvEntry async_entry = {
+    .init = NULL,
+    .start = async_start,
+    .stop = async_stop,
+    .output = async_output,
+    .ready_async = async_ready,
+    .driver_name = "host_driver",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(host_driver) {
+    return &async_entry;
+}
+"#;
+
+/// The same job submission on an entry that declares **no** `ready_async` slot — the other half of
+/// the C's completion policy (`io.c:5376-5382`): nothing can take the data, so the pool must run the
+/// job's `async_free`. Reporting is identical to [`ASYNC_DRIVER_C`], so `R0001` (only the invoke
+/// happened) and `F1` (the free ran) are the answers this build gives.
+const ASYNC_NO_READY_DRIVER_C: &str = r#"/* A real driver .so (contract A.4): `driver_async` without a `ready_async` slot. */
+#include <erl_driver.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    ErlDrvPort port;
+} async_state;
+
+static int async_invokes;
+static int async_frees;
+static void *async_armed;
+
+static ErlDrvData async_start(ErlDrvPort port, char *command) {
+    async_state *st;
+    (void) command;
+    st = (async_state *) driver_alloc(sizeof(async_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    return (ErlDrvData) st;
+}
+
+static void async_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+static void async_invoke(void *data) {
+    (void) data;
+    async_invokes++;
+}
+
+static void async_free(void *data) {
+    (void) data;
+    async_frees++;
+}
+
+static void async_report(ErlDrvData drv_data, const char *s) {
+    async_state *st = (async_state *) drv_data;
+    (void) driver_output(st->port, (char *) s, (ErlDrvSizeT) strlen(s));
+}
+
+static void async_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    async_state *st = (async_state *) drv_data;
+    char out[16];
+    if (st == NULL || len < 1)
+        return;
+    switch (buf[0]) {
+    case 'a': {
+        unsigned int key = 0;
+        long id;
+        async_armed = (void *) st;
+        id = driver_async(st->port, &key, async_invoke, async_armed, async_free);
+        (void) driver_output(st->port, id > 0 ? "1" : id == 0 ? "0" : "-", 1);
+        break;
+    }
+    case 'r':
+        /* This entry declares no `ready_async`, so its three flags are always zero. */
+        (void) snprintf(out, sizeof(out), "R000%d", async_invokes > 0 ? 1 : 0);
+        async_report(drv_data, out);
+        break;
+    case 'f':
+        (void) snprintf(out, sizeof(out), "F%d", async_frees > 0 ? 1 : 0);
+        async_report(drv_data, out);
+        break;
+    default:
+        break;
+    }
+}
+
+static ErlDrvEntry async_entry = {
+    .init = NULL,
+    .start = async_start,
+    .stop = async_stop,
+    .output = async_output,
+    .driver_name = "host_driver",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(host_driver) {
+    return &async_entry;
+}
+"#;
+
+/// Two driver entry points whose answer reaches Erlang by another route: the pid
+/// `erl_drv_set_os_pid/2` records for `port_info(P, os_pid)` (`io.c:2971-2979`), and the driver's own
+/// environment round trip (`erl_drv_putenv/2` then `erl_drv_getenv/3`).
+const STATE_DRIVER_C: &str = r#"/* A real driver .so (contract A.4): the OS-pid record and the driver environment round trip. */
+#include <erl_driver.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    ErlDrvPort port;
+} state_state;
+
+static ErlDrvData state_start(ErlDrvPort port, char *command) {
+    state_state *st;
+    (void) command;
+    st = (state_state *) driver_alloc(sizeof(state_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    return (ErlDrvData) st;
+}
+
+static void state_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+static void state_report(ErlDrvData drv_data, const char *s) {
+    state_state *st = (state_state *) drv_data;
+    (void) driver_output(st->port, (char *) s, (ErlDrvSizeT) strlen(s));
+}
+
+static void state_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    state_state *st = (state_state *) drv_data;
+    char out[64];
+    char value[32];
+    size_t size;
+    int put;
+    int got;
+    if (st == NULL || len < 1)
+        return;
+    switch (buf[0]) {
+    case 'P':
+        /* The pid `port_info(P, os_pid)` must report afterwards. */
+        erl_drv_set_os_pid(st->port, 4711);
+        state_report(drv_data, "setpid");
+        break;
+    case 'Q':
+        put = erl_drv_putenv("DIFFTEST_DRIVER_VAR", "abc");
+        size = sizeof(value);
+        got = erl_drv_getenv("DIFFTEST_DRIVER_VAR", value, &size);
+        (void) snprintf(out, sizeof(out), "q=%d,%d,%lu,%s", put, got,
+                        (unsigned long) size, got == 0 ? value : "");
+        state_report(drv_data, out);
+        break;
+    default:
+        break;
+    }
+}
+
+static ErlDrvEntry state_entry = {
+    .init = NULL,
+    .start = state_start,
+    .stop = state_stop,
+    .output = state_output,
+    .driver_name = "host_driver",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(host_driver) {
+    return &state_entry;
+}
+"#;
+
 /// The registry fixture every selector-`7` case loads.
 const REGISTRY_DRIVER: NifFixture = NifFixture::CompiledLibrary {
     name: "host_driver",
@@ -1388,6 +1789,24 @@ const SPLIT_DRIVER: NifFixture = NifFixture::CompiledLibrary {
 const MONITOR_DRIVER: NifFixture = NifFixture::CompiledLibrary {
     name: "host_driver",
     c_source: MONITOR_DRIVER_C,
+};
+
+/// The asynchronous-job fixture the `70` case loads (an entry that declares `ready_async`).
+const ASYNC_DRIVER: NifFixture = NifFixture::CompiledLibrary {
+    name: "host_driver",
+    c_source: ASYNC_DRIVER_C,
+};
+
+/// The same job submission on an entry that declares **no** `ready_async` slot (selector `71`).
+const ASYNC_NO_READY_DRIVER: NifFixture = NifFixture::CompiledLibrary {
+    name: "host_driver",
+    c_source: ASYNC_NO_READY_DRIVER_C,
+};
+
+/// The OS-pid / environment fixture the `72`-`73` cases load.
+const STATE_DRIVER: NifFixture = NifFixture::CompiledLibrary {
+    name: "host_driver",
+    c_source: STATE_DRIVER_C,
 };
 
 /// Build one module-run case over [`DRIVER_MODULE_SOURCE`] with `fixture` as its `.so`.
@@ -1733,6 +2152,32 @@ pub(crate) fn group() -> Vec<Case> {
             &[64],
             MONITOR_DRIVER,
         ),
+        // --- the C's asynchronous job pool (`driver_async` → `ready_async`) --------------------
+        case(
+            "driver_c/driver_async_runs_ready_async_with_the_armed_data",
+            "driver_async/5 is accepted with a positive job id, its async_invoke runs, and ready_async delivers the very async_data the driver armed — once, and without the async_free taking it",
+            &[70],
+            ASYNC_DRIVER,
+        ),
+        case(
+            "driver_c/driver_async_frees_the_data_when_the_entry_has_no_ready_async",
+            "on an entry with no ready_async slot the job still runs and the pool releases its async_data through async_free",
+            &[71],
+            ASYNC_NO_READY_DRIVER,
+        ),
+        // --- the two entry points whose answer reaches Erlang by another route ----------------
+        case(
+            "driver_c/erl_drv_set_os_pid_is_reported_by_port_info",
+            "erl_drv_set_os_pid(P, 4711) records the pid port_info(P, os_pid) reports afterwards",
+            &[72],
+            STATE_DRIVER,
+        ),
+        case(
+            "driver_c/erl_drv_putenv_and_getenv_round_trip_inside_the_driver",
+            "erl_drv_putenv/2 then erl_drv_getenv/3 of the same key answer the value, its length and the success code",
+            &[73],
+            STATE_DRIVER,
+        ),
     ]
 }
 #[cfg(test)]
@@ -1743,9 +2188,9 @@ mod tests {
     //! `9`) each carry their **own** C source, so a case's temp dir holds exactly one `.so`.
 
     use super::{
-        group, CaseKind, Contract, NifFixture, CONTROL_DRIVER_C, ENTRY_DRIVER_C, EXTRA_DRIVER_C,
-        FAILURE_DRIVER_C, HOST_DRIVER_C, LOCK_DRIVER_C, MONITOR_DRIVER_C, REGISTRY_DRIVER_C,
-        SPLIT_DRIVER_C,
+        group, CaseKind, Contract, NifFixture, ASYNC_DRIVER_C, ASYNC_NO_READY_DRIVER_C,
+        CONTROL_DRIVER_C, ENTRY_DRIVER_C, EXTRA_DRIVER_C, FAILURE_DRIVER_C, HOST_DRIVER_C,
+        LOCK_DRIVER_C, MONITOR_DRIVER_C, REGISTRY_DRIVER_C, SPLIT_DRIVER_C, STATE_DRIVER_C,
     };
     use std::collections::HashSet;
 
@@ -1754,7 +2199,7 @@ mod tests {
     /// to [`HOST_DRIVER_C`], whose `output` callback only echoes.
     const OWN_SOURCE_SELECTORS: &[i64] = &[
         7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33, 34, 35, 40, 41, 42, 43, 44, 45,
-        46, 47, 48, 49, 50, 51, 52, 60, 61, 62, 63, 64,
+        46, 47, 48, 49, 50, 51, 52, 60, 61, 62, 63, 64, 70, 71, 72, 73,
     ];
 
     /// The source each own-source selector must carry (its family's fixture).
@@ -1769,6 +2214,9 @@ mod tests {
             34..=35 => Some(CONTROL_DRIVER_C),
             40..=52 => Some(FAILURE_DRIVER_C),
             60..=64 => Some(MONITOR_DRIVER_C),
+            70 => Some(ASYNC_DRIVER_C),
+            71 => Some(ASYNC_NO_READY_DRIVER_C),
+            72..=73 => Some(STATE_DRIVER_C),
             _ => None,
         }
     }
@@ -1809,7 +2257,10 @@ mod tests {
                     EXTRA_DRIVER_C,
                     FAILURE_DRIVER_C,
                     SPLIT_DRIVER_C,
-                    MONITOR_DRIVER_C
+                    MONITOR_DRIVER_C,
+                    ASYNC_DRIVER_C,
+                    ASYNC_NO_READY_DRIVER_C,
+                    STATE_DRIVER_C
                 ]
                 .contains(&c_source),
                 "case {}: the fixture is not one of the group's C sources",
@@ -1856,8 +2307,8 @@ mod tests {
         assert_eq!(selectors.len(), group().len(), "every selector is distinct");
         assert_eq!(
             selectors.len(),
-            50,
-            "the group covers fifty distinct selectors"
+            54,
+            "the group covers fifty-four distinct selectors"
         );
     }
 
