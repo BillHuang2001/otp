@@ -410,6 +410,14 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   `peer_visibility() -> Option<PeerVisibility>` / `handshake()` / `ticks_answered()` / `is_eof()`.
 - Runtime drive loop: `read → feed → loop{step until WouldBlock} → take_output → write → while
   next_message{ handle }`; `Closed`/`Failed` mean drop the link.
+- **The responder (server) sequence, byte-exact** (`step`'s `ServerAwaitName`/`ServerAwaitReply`):
+  consume the peer's 2-byte-framed `'N'` NAME (`'N'+flags:8+creation:4+namelen:2+name`) → buffer
+  `'s'`+`"ok"` (`sok`) **then** the `'N'` CHALLENGE (`'N'+flags:8+challenge:4+creation:4+namelen:2+name`,
+  both 2-byte framed, in that order) → consume `'r'` CHALLENGE_REPLY (`'r'+challenge:4+digest:16`) →
+  buffer `'a'`+digest:16 CHALLENGE_ACK → `DriverState::Established`. That last arm is the **only**
+  `Established` transition. The server never emits a `'c'` Complement (the codec exists, is never
+  driven) and never validates the peer name's shape — no counterpart of `dist_util.erl:801-812`
+  `is_name_ok` or `check_allowed/2`.
 
 ### `src/bin/dist_probe.rs` — the hermetic-loopback CLI (bin target, not part of the library API)
 `dist_probe loopback <report>`. Cargo auto-discovers `src/bin/`, so no `Cargo.toml` change. The bin is
