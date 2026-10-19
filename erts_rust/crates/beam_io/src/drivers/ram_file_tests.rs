@@ -28,7 +28,7 @@
 //! still the driver's own in-module suite (`super` is the `ram_file` module).
 
 use super::{
-    make_ram_file, data_reply, number_reply, read_i32, RamFileDriver, DRIVER_NAME,
+    make_ram_file, data_reply, number_reply, read_i32, RamFileDriver, RamReply, DRIVER_NAME,
     RAM_FILE_ADVISE, RAM_FILE_ALLOCATE, RAM_FILE_FDATASYNC, RAM_FILE_FSYNC, RAM_FILE_GET,
     RAM_FILE_LSEEK, RAM_FILE_MODE_READ, RAM_FILE_MODE_READ_WRITE, RAM_FILE_MODE_WRITE,
     RAM_FILE_OPEN, RAM_FILE_PREAD, RAM_FILE_PWRITE, RAM_FILE_READ, RAM_FILE_RESP_DATA,
@@ -38,9 +38,11 @@ use super::{
 };
 use crate::driver::{Driver, DriverContext, DriverFlags, PortArms};
 use crate::poller::Poller;
+use crate::port_task::ReadMessage;
 use crate::queue::ByteQueue;
 use beam_common::BeamError;
 use beam_process::PortId;
+use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -55,6 +57,9 @@ struct Harness {
     input_q: ByteQueue,
     output_q: ByteQueue,
     arms: PortArms,
+    /// The completed reads the driver handed up — the `driver_output2` header/body pairs the
+    /// `Port` drains after each interaction (`crate::ReadMessage`).
+    reads: VecDeque<ReadMessage>,
     driver: RamFileDriver,
 }
 
@@ -65,22 +70,39 @@ impl Harness {
             input_q: ByteQueue::new(),
             output_q: ByteQueue::new(),
             arms: PortArms::default(),
+            reads: VecDeque::new(),
             driver: RamFileDriver::new(),
         }
     }
 
-    /// Feeds `bytes` through the driver's `output` transport and returns the reply it pushed
-    /// onto the input queue, asserting the consume-what-you-report accounting on the way.
+    /// Feeds `bytes` through the driver's `output` transport and returns the reply's bytes,
+    /// flattened, asserting the consume-what-you-report accounting on the way.
     fn output(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.reply(bytes).flattened()
+    }
+
+    /// Feeds `bytes` through the driver's `output` transport and returns the one reply the
+    /// driver handed up, header/body split preserved.
+    fn reply(&mut self, bytes: &[u8]) -> RamReply {
+        let replies = self.replies(bytes);
+        assert_eq!(replies.len(), 1, "one reply per command: {replies:?}");
+        replies.into_iter().next().expect("one reply")
+    }
+
+    /// Feeds `bytes` through the driver's `output` transport and returns **every** reply it
+    /// handed up, in delivery order (the C delivers one message per `driver_output*` call).
+    fn replies(&mut self, bytes: &[u8]) -> Vec<RamReply> {
         let Harness {
             driver,
             poller,
             input_q,
             output_q,
             arms,
+            reads,
         } = self;
         output_q.push(bytes);
-        let mut ctx = DriverContext::new(PortId::new(0), poller, input_q, output_q, arms);
+        let mut ctx = DriverContext::new(PortId::new(0), poller, input_q, output_q, arms)
+            .with_reads(reads);
         let written = driver.output(&mut ctx).expect("the command is accepted");
         assert_eq!(
             written,
@@ -88,10 +110,18 @@ impl Harness {
             "the driver consumes exactly the command bytes"
         );
         drop(ctx);
-        let reply = input_q.front().to_vec();
-        input_q.clear();
         assert!(output_q.is_empty(), "the whole command was consumed");
-        reply
+        assert!(
+            input_q.is_empty(),
+            "the reply rides the completed-read channel, never the input queue"
+        );
+        reads
+            .drain(..)
+            .map(|read| RamReply {
+                header: read.header,
+                body: read.body,
+            })
+            .collect()
     }
 
     /// Runs one named verb through the driver's `control` transport.
@@ -102,11 +132,19 @@ impl Harness {
             input_q,
             output_q,
             arms,
+            reads,
         } = self;
-        let mut ctx = DriverContext::new(PortId::new(0), poller, input_q, output_q, arms);
-        driver
+        let mut ctx = DriverContext::new(PortId::new(0), poller, input_q, output_q, arms)
+            .with_reads(reads);
+        let reply = driver
             .control(&mut ctx, command, arg)
-            .unwrap_or_else(|err| panic!("the `{command}` verb is accepted: {err:?}"))
+            .unwrap_or_else(|err| panic!("the `{command}` verb is accepted: {err:?}"));
+        drop(ctx);
+        assert!(
+            reads.is_empty(),
+            "a control reply answers its caller; it never also reaches the owner as port data"
+        );
+        reply
     }
 }
 
@@ -221,6 +259,7 @@ fn exec(driver: &mut RamFileDriver, command: u8, arg: &[u8]) -> Vec<u8> {
     driver
         .execute(command, arg)
         .unwrap_or_else(|err| panic!("command {command} is well-formed: {err:?}"))
+        .flattened()
 }
 
 // -----------------------------------------------------------------------
@@ -531,6 +570,7 @@ fn start_ready_input_and_stop_leave_no_state_behind() {
         input_q,
         output_q,
         arms,
+        reads: _,
     } = &mut h;
     let mut ctx = DriverContext::new(PortId::new(0), poller, input_q, output_q, arms);
     driver.start(&mut ctx).expect("start is a no-op");
@@ -597,7 +637,7 @@ fn the_named_verbs_match_their_opcodes() {
         let mut named = Harness::new();
         assert_eq!(
             named.verb(name, &arg),
-            expected,
+            expected.flattened(),
             "the `{name}` verb matches opcode {opcode}"
         );
         assert_eq!(named.driver.flags(), direct.driver.flags());
@@ -607,7 +647,7 @@ fn the_named_verbs_match_their_opcodes() {
         let mut decimal = Harness::new();
         assert_eq!(
             decimal.verb(&opcode.to_string(), &arg),
-            expected,
+            expected.flattened(),
             "the decimal spelling of opcode {opcode} matches"
         );
         assert_eq!(decimal.driver.flags(), direct.driver.flags());
@@ -639,6 +679,7 @@ fn an_unknown_verb_is_a_badarg() {
         input_q,
         output_q,
         arms,
+        reads: _,
     } = &mut h;
     let mut ctx = DriverContext::new(PortId::new(0), poller, input_q, output_q, arms);
     assert!(matches!(
@@ -703,8 +744,14 @@ fn the_reply_shapes_are_the_reference_encodings() {
     assert_eq!(err("enomem"), vec![1, 101, 110, 111, 109, 101, 109]);
 
     // The two helpers the driver itself builds its replies with.
-    assert_eq!(number_reply(6), number(6));
-    assert_eq!(data_reply(b"abcdef"), data(b"abcdef"));
+    // The two builders the driver itself answers with: `NUMBER` is header-only (the C's
+    // `driver_output2(tmp, 5, NULL, 0)`), `DATA` is header + body (the C's
+    // `driver_output_binary(header, 5, bin, 0, n)`).
+    assert_eq!(number_reply(6).flattened(), number(6));
+    assert_eq!(number_reply(6).body, None);
+    assert_eq!(data_reply(b"abcdef").flattened(), data(b"abcdef"));
+    assert_eq!(data_reply(b"abcdef").header, vec![2, 0, 0, 0, 6]);
+    assert_eq!(data_reply(b"abcdef").body.as_deref(), Some(b"abcdef".as_slice()));
 }
 
 #[test]
@@ -738,8 +785,8 @@ fn the_output_transport_consumes_the_whole_command_and_replies_once() {
 #[test]
 fn an_empty_output_queue_reports_zero_bytes_written() {
     let mut h = Harness::new();
-    let reply = h.output(b"");
-    assert!(reply.is_empty());
+    let replies = h.replies(b"");
+    assert!(replies.is_empty(), "nothing queued, nothing replied");
     assert_eq!(h.output_q.len(), 0);
 }
 
@@ -752,6 +799,7 @@ fn the_output_transport_replies_to_a_bad_command_with_a_typed_error() {
         input_q,
         output_q,
         arms,
+        reads: _,
     } = &mut h;
     output_q.push(&[200u8, 1, 2, 3]);
     let mut ctx = DriverContext::new(PortId::new(0), poller, input_q, output_q, arms);
@@ -776,7 +824,7 @@ fn a_write_past_the_end_zero_fills_the_gap() {
         number(2)
     );
     assert_eq!(driver.size(), 7);
-    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get");
+    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get").flattened();
     assert_eq!(reply[0], RAM_FILE_RESP_DATA);
     assert_eq!(
         &reply[5..],
@@ -798,7 +846,7 @@ fn truncate_ends_the_file_at_the_current_position() {
     assert_eq!(exec(&mut driver, RAM_FILE_TRUNCATE, &[]), ok());
     assert_eq!(driver.size(), 3);
     assert_eq!(exec(&mut driver, RAM_FILE_SIZE, &[]), number(3));
-    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get");
+    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get").flattened();
     assert_eq!(&reply[5..], b"abc");
 }
 
@@ -813,7 +861,7 @@ fn truncate_past_the_end_extends_the_file_with_zeros() {
         .expect("seek");
     assert_eq!(exec(&mut driver, RAM_FILE_TRUNCATE, &[]), ok());
     assert_eq!(driver.size(), 5);
-    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get");
+    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get").flattened();
     assert_eq!(&reply[5..], &[b'a', b'b', 0, 0, 0]);
 }
 
@@ -842,7 +890,7 @@ fn a_write_at_the_end_extends_the_logical_file() {
     assert_eq!(exec(&mut driver, RAM_FILE_WRITE, b"cd"), number(2));
     assert_eq!(driver.size(), 4);
     assert_eq!(driver.position(), 4);
-    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get");
+    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get").flattened();
     assert_eq!(&reply[5..], b"abcd");
 }
 
@@ -854,7 +902,7 @@ fn get_and_size_do_not_need_a_write_mode() {
         .execute(RAM_FILE_OPEN, &c_open(RAM_FILE_MODE_READ, b"seed")[1..])
         .expect("open");
     assert_eq!(exec(&mut driver, RAM_FILE_SIZE, &[]), number(4));
-    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get");
+    let reply = driver.execute(RAM_FILE_GET, &[]).expect("get").flattened();
     assert_eq!(&reply[5..], b"seed");
     assert!(driver.is_open());
 }
@@ -1032,7 +1080,8 @@ fn the_command_matrix_agrees_with_the_erl_oracle() {
         for (command, want) in cmds.iter().zip(&oracle) {
             let got = driver
                 .execute(command[0], &command[1..])
-                .expect("the command is well-formed");
+                .expect("the command is well-formed")
+                .flattened();
             match want {
                 Some(bytes) => assert_eq!(
                     &got, bytes,

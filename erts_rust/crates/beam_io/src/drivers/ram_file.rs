@@ -75,6 +75,20 @@
 //!
 //! The only errnos this driver produces are `EBADF`, `EINVAL`, `ENOMEM` and `EACCES`.
 //!
+//! # The C's header/body split
+//!
+//! A reply is not one flat byte string: the C sends `OK`/`NUMBER`/`ERROR` through
+//! `driver_output2(port, response, len, NULL, 0)` — *header only*, no body — and a `DATA` reply
+//! (the one that carries file content) through
+//! `driver_output_binary(port, header, 5, bin, 0, n)`, i.e. the 5-byte
+//! `[RAM_FILE_RESP_DATA, n:i32be]` **header** plus the `n` content bytes as the **body**
+//! (`erts/emulator/drivers/common/ram_file_drv.c:182-230`, the `READ`/`PREAD`/`GET` arms at
+//! `:448`/`:461`/`:488`). The split is observable at the owner: a `[binary]` port sees
+//! `[2,0,0,0,5|<<"hello">>]` for a `DATA` reply but the **proper** list `[3,0,0,0,11]` for a
+//! `NUMBER` one, and `ram_file.erl`'s own `{Port, {data, [Response|Rest]}}` match depends on it.
+//! [`RamReply`] carries the pair; [`Driver::output`] hands it up through
+//! [`DriverContext::deliver_read`] as **one** read (one `driver_output*` call, never two).
+//!
 //! # The in-memory file
 //!
 //! The logical file is modelled as a [`Vec<u8>`] whose `len()` **is** the C's `end` (the
@@ -158,6 +172,47 @@ pub const RAM_FILE_SEEK_CUR: i32 = 1;
 /// The `lseek` whence: the offset is relative to the end of the file.
 pub const RAM_FILE_SEEK_END: i32 = 2;
 
+/// One driver reply, in the C's `driver_output2`/`driver_output_binary` shape.
+///
+/// [`header`](RamReply::header) is the `hbuf`/`hlen` pair every reply carries;
+/// [`body`](RamReply::body) is the `buf`/`len` pair, which is `Some` only for a `DATA` reply —
+/// the C's `driver_output_binary` body — and `None` for the header-only `OK`/`NUMBER`/`ERROR`
+/// replies, whose `buf` is `NULL` (`ram_file_drv.c:182`-`:230`).
+///
+/// `Some(vec![])` (a `DATA` reply with no content bytes, e.g. a read at end of file) and `None`
+/// are therefore **different** replies, exactly as [`crate::ReadMessage`] distinguishes them: the
+/// former is `[hdr|<<>>]` at a `[binary]` port, the latter the proper list `[hdr]`.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct RamReply {
+    /// The `hbuf`/`hlen` bytes, always present (the response code plus its operands).
+    pub header: Vec<u8>,
+    /// The `buf`/`len` bytes: `Some` for a `DATA` reply, `None` where the C passes `NULL`.
+    pub body: Option<Vec<u8>>,
+}
+
+impl RamReply {
+    /// A header-only reply — the C's `driver_output2(port, header, len, NULL, 0)`.
+    fn header_only(header: Vec<u8>) -> RamReply {
+        RamReply {
+            header,
+            body: None,
+        }
+    }
+
+    /// The reply's bytes in one flat sequence: the header bytes then the body bytes.
+    ///
+    /// This is what an `[list]` port's `{data, …}` carries (the split is not observable there)
+    /// and what the crate-only [`Driver::control`] transport answers with, since a control op
+    /// returns bytes rather than building the owner's term.
+    pub fn flattened(&self) -> Vec<u8> {
+        let mut bytes = self.header.clone();
+        if let Some(body) = &self.body {
+            bytes.extend_from_slice(body);
+        }
+        bytes
+    }
+}
+
 /// The in-memory file driver (`"ram_file_drv"`).
 ///
 /// See the [module documentation](self) for the command protocol and the reply encoding.
@@ -220,8 +275,9 @@ impl RamFileDriver {
     ///
     /// This is the single shared core behind both transports — the [`Driver::output`]
     /// `port_command` path and the [`Driver::control`] named-verb path (which funnels its
-    /// verb into the matching integer). It returns the reply bytes to be handed back to the
-    /// port owner, exactly as the C's `rfile_command` writes them.
+    /// verb into the matching integer). It returns the reply in the C's `rfile_command`
+    /// shape: a [`RamReply`] whose header/body pair is exactly what the reference passes to
+    /// `driver_output2`/`driver_output_binary`.
     ///
     /// # Errors
     ///
@@ -229,7 +285,7 @@ impl RamFileDriver {
     /// short for the command that reads it. Operation-level failures (a wrong access mode, a
     /// negative offset, an allocation failure) are reported as `ERROR <errno>` **replies**,
     /// not as Rust errors.
-    pub fn execute(&mut self, command: u8, arg: &[u8]) -> Result<Vec<u8>> {
+    pub fn execute(&mut self, command: u8, arg: &[u8]) -> Result<RamReply> {
         match command {
             RAM_FILE_OPEN => self.open_command(arg),
             RAM_FILE_READ => self.read_command(arg),
@@ -249,7 +305,7 @@ impl RamFileDriver {
 
     /// `open`: take the access mode from the first four operand bytes and reset the file to
     /// the remaining bytes, replying `NUMBER 0` (the C's unused result slot).
-    fn open_command(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
+    fn open_command(&mut self, arg: &[u8]) -> Result<RamReply> {
         let flags = read_i32(arg)?;
         let content = &arg[4..];
         let mut buf = Vec::new();
@@ -266,7 +322,7 @@ impl RamFileDriver {
     }
 
     /// `read`: read at the current position and advance it (the C's `location == NULL` form).
-    fn read_command(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
+    fn read_command(&mut self, arg: &[u8]) -> Result<RamReply> {
         let len = read_i32(arg)? as i64;
         Ok(self.read_at(self.cur, len, true))
     }
@@ -275,7 +331,7 @@ impl RamFileDriver {
     ///
     /// The offset is validated **before** the access mode, matching the C's `rfile_command`
     /// (which rejects a negative offset itself and only then calls `ram_file_read`).
-    fn pread_command(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
+    fn pread_command(&mut self, arg: &[u8]) -> Result<RamReply> {
         let offset = read_i32(arg)? as i64;
         if offset < 0 {
             return Ok(error_reply(libc::EINVAL));
@@ -287,7 +343,7 @@ impl RamFileDriver {
     /// `pwrite`: write at an explicit offset and leave the position untouched.
     ///
     /// As for [`RamFileDriver::pread_command`], the offset is validated before the mode.
-    fn pwrite_command(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
+    fn pwrite_command(&mut self, arg: &[u8]) -> Result<RamReply> {
         let offset = read_i32(arg)? as i64;
         if offset < 0 {
             return Ok(error_reply(libc::EINVAL));
@@ -296,7 +352,7 @@ impl RamFileDriver {
     }
 
     /// `lseek`: reposition the file, honouring the seek mode.
-    fn lseek_command(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
+    fn lseek_command(&mut self, arg: &[u8]) -> Result<RamReply> {
         let offset = read_i32(arg)? as i64;
         let whence = read_i32(&arg[4..])?;
         if self.flags == 0 {
@@ -319,7 +375,7 @@ impl RamFileDriver {
     ///
     /// Shrinking drops the tail; truncating past the end extends the file with zeros, which
     /// is what the C's unwritten (`end = cur`) region reads back as — see the module docs.
-    fn truncate_command(&mut self) -> Vec<u8> {
+    fn truncate_command(&mut self) -> RamReply {
         if self.flags & RAM_FILE_MODE_WRITE == 0 {
             return error_reply(libc::EACCES);
         }
@@ -329,7 +385,7 @@ impl RamFileDriver {
     }
 
     /// The `flags == 0` gate shared by `fsync`/`fdatasync`/`advise`/`allocate`.
-    fn require_open(&self) -> Vec<u8> {
+    fn require_open(&self) -> RamReply {
         if self.flags == 0 {
             error_reply(libc::EBADF)
         } else {
@@ -342,7 +398,7 @@ impl RamFileDriver {
     /// Reading at or past the logical end yields an empty `DATA` reply, and the amount is
     /// clamped to what is left, so a read can never run past the end. Only the
     /// non-located (`read`) form moves the position, and only by the amount actually read.
-    fn read_at(&mut self, pos: i64, len: i64, advance: bool) -> Vec<u8> {
+    fn read_at(&mut self, pos: i64, len: i64, advance: bool) -> RamReply {
         if self.flags & RAM_FILE_MODE_READ == 0 {
             return error_reply(libc::EBADF);
         }
@@ -364,7 +420,7 @@ impl RamFileDriver {
     /// A write that starts past the logical end zero-fills the gap before the data, and the
     /// logical end grows to the furthest byte written. Only the non-located (`write`) form
     /// moves the position.
-    fn write_at(&mut self, pos: i64, data: &[u8], advance: bool) -> Vec<u8> {
+    fn write_at(&mut self, pos: i64, data: &[u8], advance: bool) -> RamReply {
         if self.flags & RAM_FILE_MODE_WRITE == 0 {
             return error_reply(libc::EBADF);
         }
@@ -401,12 +457,13 @@ impl Driver for RamFileDriver {
         Ok(())
     }
 
-    /// The `port_command` transport: run the command word at the head of the output queue
-    /// and push its reply onto the input queue.
+    /// The `port_command` transport: run the command word at the head of the output queue and hand
+    /// its reply up as **one** completed read (the C's `driver_output2`/`driver_output_binary`
+    /// call, header/body split preserved — see [`RamReply`]).
     ///
     /// The whole queued payload is consumed — the driver reports exactly its length, as the
-    /// consume-what-you-report contract (see [`Driver::output`]) requires — and the reply is
-    /// left for the port to deliver to the owner as `{Port, {data, Reply}}`.
+    /// consume-what-you-report contract (see [`Driver::output`]) requires — and the reply reaches
+    /// the port owner as `{Port, {data, Reply}}` on the next port-task round.
     fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         let queued = ctx.output().front();
         if queued.is_empty() {
@@ -417,7 +474,7 @@ impl Driver for RamFileDriver {
         let consumed = queued.len();
         ctx.output().consume(consumed);
         let reply = self.execute(command, &arg)?;
-        ctx.input().push(&reply);
+        ctx.deliver_read(&reply.header, reply.body.as_deref())?;
         Ok(consumed)
     }
 
@@ -446,6 +503,11 @@ impl Driver for RamFileDriver {
     /// correspondence can be driven either way. `close` returns the driver to its inert
     /// state and replies `OK`.
     ///
+    /// A control op answers **bytes to its caller** (the C's `ctl_reply`), not the owner's
+    /// `{Port, {data, …}}` message, so the reply's header/body pair is flattened here — the split
+    /// is not observable on this transport, exactly as it is not for an `[list]` port
+    /// ([`RamReply::flattened`]).
+    ///
     /// # Errors
     ///
     /// Returns [`crate::error::badarg`] for an unknown verb.
@@ -455,7 +517,7 @@ impl Driver for RamFileDriver {
         command: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        match command {
+        let reply = match command {
             "open" => self.execute(RAM_FILE_OPEN, arg),
             "read" => self.execute(RAM_FILE_READ, arg),
             "lseek" | "position" => self.execute(RAM_FILE_LSEEK, arg),
@@ -477,7 +539,8 @@ impl Driver for RamFileDriver {
                 Ok(opcode) => self.execute(opcode, arg),
                 Err(_) => Err(error::badarg()),
             },
-        }
+        }?;
+        Ok(reply.flattened())
     }
 
     /// Releases the buffer, returning the driver to its inert state.
@@ -498,40 +561,46 @@ pub fn make_ram_file() -> Result<Box<dyn Driver>> {
     Ok(Box::new(RamFileDriver::new()))
 }
 
-/// The `OK` reply: the bare response code.
-fn ok_reply() -> Vec<u8> {
-    vec![RAM_FILE_RESP_OK]
+/// The `OK` reply: the bare response code, header-only (the C's `driver_output2(&c, 1, NULL, 0)`).
+fn ok_reply() -> RamReply {
+    RamReply::header_only(vec![RAM_FILE_RESP_OK])
 }
 
-/// The `NUMBER` reply: the response code plus the value truncated to an `i32`, big-endian.
-fn number_reply(value: i64) -> Vec<u8> {
+/// The `NUMBER` reply: the response code plus the value truncated to an `i32`, big-endian,
+/// header-only (the C's `driver_output2(tmp, 5, NULL, 0)`).
+fn number_reply(value: i64) -> RamReply {
     let mut out = Vec::with_capacity(5);
     out.push(RAM_FILE_RESP_NUMBER);
     out.extend_from_slice(&(value as i32).to_be_bytes());
-    out
+    RamReply::header_only(out)
 }
 
-/// The `DATA` reply: the response code plus the length (big-endian `i32`) plus the bytes.
-fn data_reply(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + data.len());
-    out.push(RAM_FILE_RESP_DATA);
-    out.extend_from_slice(&(data.len() as i32).to_be_bytes());
-    out.extend_from_slice(data);
-    out
+/// The `DATA` reply: the 5-byte header (`[RAM_FILE_RESP_DATA, len:i32be]`) plus the content
+/// bytes as the **body** — the C's `driver_output_binary(port, header, 5, bin, 0, n)`, whose
+/// body is present even when `data` is empty (`[hdr|<<>>]`, not a header-only reply).
+fn data_reply(data: &[u8]) -> RamReply {
+    let mut header = Vec::with_capacity(5);
+    header.push(RAM_FILE_RESP_DATA);
+    header.extend_from_slice(&(data.len() as i32).to_be_bytes());
+    RamReply {
+        header,
+        body: Some(data.to_vec()),
+    }
 }
 
-/// The `ERROR` reply: the response code plus the lowercased POSIX errno name.
+/// The `ERROR` reply: the response code plus the lowercased POSIX errno name, header-only (the
+/// C's `driver_output2(response, t-response, NULL, 0)`).
 ///
 /// The name comes from [`crate::error::errno_atom`], the crate's single errno→atom table —
 /// the same string the C's `erl_errno_id` lowercased. An errno that table does not name
 /// falls back to the reference's own generic spelling rather than inventing an atom.
-fn error_reply(errno: i32) -> Vec<u8> {
+fn error_reply(errno: i32) -> RamReply {
     let mut out = vec![RAM_FILE_RESP_ERROR];
     match error::errno_atom(errno) {
         Some(name) => out.extend_from_slice(name.as_bytes()),
         None => out.extend_from_slice(format!("errno_{errno}").as_bytes()),
     }
-    out
+    RamReply::header_only(out)
 }
 
 /// Reads a big-endian `i32` from the first four bytes of `bytes`.
@@ -549,3 +618,6 @@ fn read_i32(bytes: &[u8]) -> Result<i32> {
 #[cfg(test)]
 #[path = "ram_file_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "ram_file_split_tests.rs"]
+mod split_tests;

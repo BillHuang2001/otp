@@ -574,8 +574,23 @@ fn rust_state_rows(rig: &mut ResetRig) -> Vec<Vec<u8>> {
 /// order and printed as `~w|`.
 ///
 /// The C's discovery needs a receive to be pending — its read interest exists only while a
-/// `TCP_REQ_RECV` is queued — so the probe issues one and waits for its `{inet_async, …}`
-/// completion before reading the descriptor state (that wait is also what lets the poll loop run).
+/// `TCP_REQ_RECV` is queued — so the probe issues one and waits for that receive's **own**
+/// `{inet_async, …}` completion before reading the descriptor state (that wait is also what lets
+/// the poll loop run). Two orderings are load-bearing and are waited for, never assumed:
+///
+/// * the raw `INET_REQ_CONNECT`(3) completes **asynchronously** (`tcp_inet_ready_output` sets
+///   `INET_STATE_CONNECTED` and only then `async_ok`, `inet_drv.c:14284`/`:14287`), and a
+///   `TCP_REQ_RECV` issued while the state is still `INET_STATE_CONNECTING` is refused by the
+///   `IS_CONNECTED` guard (`:12279`-`:12288`) — which arms **no** read interest (`:12306`/
+///   `:12317`), so the peer's end-of-file would never be read and the descriptor would legitimately
+///   stay `CONNECTED`. The probe therefore polls `GETSTATUS` until the connect is through, bounded
+///   at 2000 polls (≈2 s);
+/// * the receive's completion must be awaited **by its own id** — the one its control reply hands
+///   back (`[1] ++ <<Id:16>>`, `enq_async`'s `NEW_ASYNC_ID`, `:1549`) — because a wildcard id
+///   matches the connect's completion instead and lets the rows run before the close was read.
+///
+/// Every wait is bounded and **loud**: an abnormal `-eval` exit loses the whole buffered output,
+/// so both give-up arms print to `standard_error` and `halt(1)` (see the node's *Known Issues*).
 fn oracle_state_expression(exit_on_close: bool) -> String {
     let code = |request: u64| (CONTROL_MAGIC + request).to_string();
     let rows = STATE_ROWS
@@ -588,6 +603,26 @@ fn oracle_state_expression(exit_on_close: bool) -> String {
             )
         })
         .collect::<String>();
+    let wait_for_connected = format!(
+        "Wait = fun F(0) -> io:format(standard_error, \"the raw connect never completed~n\"), \
+         erlang:halt(1); \
+         F(N) -> case erlang:port_control(P, {}, <<>>) of \
+                     [1,0,0,0,5] -> ok; \
+                     _ -> timer:sleep(1), F(N-1) \
+                 end \
+         end, \
+         Wait(2000), ",
+        code(16),
+    );
+    let recv_and_wait = format!(
+        "Rq = erlang:port_control(P, {}, <<0:64>>), \
+         J(Rq), \
+         <<1,Id:16>> = iolist_to_binary([Rq]), \
+         receive {{inet_async,P,Id,_}} -> ok after 5000 -> \
+             io:format(standard_error, \"no completion for the queued receive~n\"), erlang:halt(1) \
+         end, ",
+        code(42),
+    );
     format!(
         "J = fun(R) -> io:format(\"~w|\", [R]) end, \
          {{ok,L}} = gen_tcp:listen(0,[binary,{{active,false}}]), \
@@ -597,15 +632,12 @@ fn oracle_state_expression(exit_on_close: bool) -> String {
          J(erlang:port_control(P, {}, <<0,0,3,232,4,LP:16>>)), \
          J(erlang:port_control(P, {}, <<26,0,0,0,{}>>)), \
          {{ok,C}} = gen_tcp:accept(L, 5000), \
-         gen_tcp:close(C), \
-         J(erlang:port_control(P, {}, <<0:64>>)), \
-         receive {{inet_async,P,_,_}} -> ok after 5000 -> exit(no_async) end, \
-         {rows}erlang:port_close(P)",
+         {wait_for_connected}gen_tcp:close(C), \
+         {recv_and_wait}{rows}erlang:port_close(P)",
         code(1),
         code(3),
         code(7),
         u8::from(exit_on_close),
-        code(42),
     )
 }
 
@@ -799,6 +831,13 @@ fn the_state_rows_agree_with_the_erl_oracle_for_both_exit_on_close_values() {
         }
         close_peer_write(&mut rig);
         drive_reactor(&mut rig);
+        assert!(
+            rig.port
+                .registry
+                .port_closed(rig.port.id)
+                .expect("the port is still live"),
+            "{label}: the reactor's discovery latched the peer close"
+        );
         let rust = rust_state_rows(&mut rig);
 
         let Some(dump) = erl_stdout(&oracle_state_expression(exit_on_close)) else {

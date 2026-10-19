@@ -65,9 +65,9 @@
 //! on how many rounds they took.
 use std::io::Write;
 use std::net::{TcpStream, UdpSocket};
+use std::os::unix::io::AsRawFd;
 use std::thread;
 use std::time::{Duration, Instant};
-
 use beam_common::BeamError;
 use beam_io::drivers::inet::{
     DRIVER_NAME, INET_ACTIVE, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_INFINITY,
@@ -89,6 +89,10 @@ const INET_REQ_LISTEN: u32 = 27;
 /// `PACKET_REQ_RECV` (`inet_drv.c:14990`) — the datagram half's asynchronous receive.
 const PACKET_REQ_RECV: u32 = 60;
 
+/// `INET_LOPT_TCP_SHOW_ECONNRESET` (39, `inet_drv.c:916`) — the option that sends a read reset to
+/// the C's `tcp_recv_error` (`:13185`-`:13196`) instead of `tcp_recv_closed`, so the owner gets a
+/// `{tcp_error, S, econnreset}` before the close.
+const INET_LOPT_TCP_SHOW_ECONNRESET: u8 = 39;
 /// The hang guard: how long a condition may stay unsatisfied before the case fails, instead of
 /// hanging. Deliberately generous — it is a liveness bound, not a performance budget.
 const WAIT: Duration = Duration::from_secs(10);
@@ -400,14 +404,57 @@ fn split_packed(header: &[u8]) -> ([u8; 4], u16) {
 }
 
 /// Every `Data` delivery of a drain, in order.
+///
+/// A `Data` drain never carries a read **error**: an `ActiveInputEvent::Error` on this channel is
+/// the `{tcp_error, S, Reason}` half of the C's active arm (`inet_drv.c:12871`), produced only by
+/// `{show_econnreset,true}` + a reset (or a genuine read failure) — read it with [`error_of`].
 fn data_of(inputs: &[ActiveInput]) -> Vec<&ReadMessage> {
+    let mut reads = Vec::new();
+    for input in inputs {
+        match &input.event {
+            ActiveInputEvent::Data(read) => reads.push(read),
+            ActiveInputEvent::Passive => {}
+            ActiveInputEvent::Error(reason) => panic!(
+                "a data drain carries no read error (`{}` belongs to `error_of`): {inputs:?}",
+                reason.atom_name()
+            ),
+        }
+    }
+    reads
+}
+
+/// Every `Error` reason of a drain, in delivery order — the `{tcp_error, S, Reason}` half of the
+/// active channel, rendered by [`InetReason::atom_name`] where the runtime builds the message.
+fn error_of(inputs: &[ActiveInput]) -> Vec<InetReason> {
     inputs
         .iter()
         .filter_map(|input| match &input.event {
-            ActiveInputEvent::Data(read) => Some(read),
-            ActiveInputEvent::Passive => None,
+            ActiveInputEvent::Error(reason) => Some(*reason),
+            ActiveInputEvent::Data(_) | ActiveInputEvent::Passive => None,
         })
         .collect()
+}
+/// Aborts the connection: `SO_LINGER` with a zero timeout makes `close(2)` send an **RST** instead
+/// of an orderly FIN — the peer behaviour the C's `tcp_recv_error` arm exists for.
+fn abort(peer: TcpStream) {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: `linger` is a fully initialized `struct linger` and the descriptor is an open socket
+    // owned by this test; `setsockopt` reads at most `size_of::<linger>()` bytes and retains
+    // nothing.
+    let rc = unsafe {
+        libc::setsockopt(
+            peer.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&raw const linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "SO_LINGER is settable");
+    drop(peer); // an abortive close: RST
 }
 
 /// How many `Passive` deliveries a drain carried.
@@ -841,4 +888,125 @@ fn the_active_channel_is_empty_for_a_passive_port_and_after_a_close() {
         "and the close-harvest queue stays empty"
     );
     eprintln!("case 8: quiet + 1 delivery + quiet after close, {} round(s)", rig.rounds);
+}
+
+// ---------------------------------------------------------------------------
+// 9. TCP `{active, true}` + `{show_econnreset, true}` — the error precedes the close
+// ---------------------------------------------------------------------------
+
+/// The C's **active** arm of `tcp_recv_error` (`inet_drv.c:12871`-`:12881`) runs
+/// `tcp_error_message(desc, err)` and **then** `tcp_closed_message(desc)` — the error first, the
+/// close second, once per discovery. At the level this suite pins, the two halves are the
+/// **drain** (`{tcp_error, S, econnreset}`, the `ActiveInputEvent::Error` the driver stages inside
+/// `latch_peer_close` *before* it arms `PeerClose`) and the registry's sticky `port_closed()` latch
+/// (which the runtime renders as `{tcp_closed, S}` right after the error it just drained).
+///
+/// So the ordering shows up as three facts, all asserted here:
+///
+/// * **no close before the error** — every round before the reset is reported must have
+///   `port_closed() == false` *and* an empty drain (that is the loop's exit condition);
+/// * **the first round that can report the close already carries the error** — a silent round that
+///   flips the latch, with the error arriving later (or never), fails;
+/// * **exactly once** — the error is never re-delivered, and the latch stays `true`.
+///
+/// The peer is an external `std::net::TcpStream` aborted with `SO_LINGER(1,0)` (a real RST), and
+/// the port is the built-in `tcp_inet` driver reached through `open_port`'s path
+/// ([`PortRegistry::open_named`]) — the same wiring `beam_rt` uses.
+#[test]
+fn an_active_read_error_is_drained_before_the_close_is_reported_once() {
+    let mut rig = Rig::new();
+    let (id, peer) = rig.tcp_accepted();
+    assert_eq!(
+        rig.ports.get(id).expect("live").driver_name(),
+        DRIVER_NAME,
+        "the port runs the built-in tcp_inet driver"
+    );
+
+    // One `setopts` walk arms both the reset-reporting option and the active mode.
+    let arming = records(&[
+        record(INET_LOPT_TCP_SHOW_ECONNRESET, 1),
+        record(INET_LOPT_ACTIVE, INET_ACTIVE),
+    ]);
+    assert_eq!(
+        rig.op(id, INET_REQ_SETOPTS, &arming),
+        ctl_ok(),
+        "{{show_econnreset,true}} and {{active,true}} are accepted"
+    );
+    assert!(
+        !rig.ports.port_closed(id).expect("the port is live"),
+        "a live connection has no peer close to report"
+    );
+
+    abort(peer);
+
+    // Pump rounds until the close becomes reportable, and hold the round that did it.
+    let deadline = Instant::now() + WAIT;
+    let mut quiet_rounds = 0usize;
+    let (close_round, closed) = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the peer's reset was never reported (the close latch stayed false)"
+        );
+        let round = rig.round();
+        let closed = rig.ports.port_closed(id).expect("the port is live");
+        if closed || !round.active.is_empty() {
+            break (round, closed);
+        }
+        quiet_rounds += 1;
+    };
+
+    assert!(
+        !close_round.active.is_empty(),
+        "the close was reported on a silent round: the error must be drained in the same round \
+         that makes the close reportable (after {quiet_rounds} quiet round(s))"
+    );
+    assert!(
+        closed,
+        "the discovery stages the error and flips the close latch in one callback: {close_round:?}"
+    );
+    assert_eq!(
+        close_round.active.len(),
+        1,
+        "one event: the error, never a close event on this channel: {:?}",
+        close_round.active
+    );
+    assert_eq!(
+        close_round.active[0].port, id,
+        "the delivery names the delivering port"
+    );
+    assert_eq!(
+        error_of(&close_round.active),
+        vec![InetReason::Errno(libc::ECONNRESET)],
+        "the failure is the reset's errno, not a bare `closed`: {:?}",
+        close_round.active
+    );
+    assert_eq!(
+        error_of(&close_round.active)[0].atom_name(),
+        "econnreset",
+        "the runtime renders `{{tcp_error, S, econnreset}}`"
+    );
+    assert_eq!(
+        passive_count(&close_round.active),
+        0,
+        "{{active,true}} spends no grant, so there is no passive message"
+    );
+
+    // And it is not delivered again: the close the error precedes is the latch, reported once.
+    rig.assert_quiet(QUIET_BUDGET, "the read error is never re-delivered");
+    assert!(
+        rig.ports.port_closed(id).expect("the port is live"),
+        "the close latch is sticky: it survives every later round"
+    );
+    assert!(
+        rig.ports.contains(id),
+        "a peer close tears the socket down, not the port"
+    );
+    eprintln!(
+        "case 9: {quiet_rounds} quiet round(s), then 1 error in the close's round, {} round(s)",
+        rig.rounds
+    );
+
+    rig.ports
+        .close(&mut rig.poller, id)
+        .expect("the port closes");
 }

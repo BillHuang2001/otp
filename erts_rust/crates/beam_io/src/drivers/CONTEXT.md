@@ -87,7 +87,7 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   read in the text phase, so the held bytes must still reach the port queue at EOF/`stop`.
 
 ## Known Issues
-- **The C `ram_file_drv` answers its two reply families through two different output calls.** `OK`/`ERROR`/`NUMBER` go through `driver_output2` (a plain byte list) while `DATA` goes through `driver_output_binary` (an improper `[header | binary]` iolist on a `[binary]` port), so an oracle probe that reads the raw port message must normalise with `binary_to_list(iolist_to_binary(D))` before comparing — and `io:format("~p", [D])` on the raw term raises. In this crate both families simply become bytes appended to [`DriverContext::input()`](crate::DriverContext::input), which is what the port delivers to the owner.
+- **The C `ram_file_drv` answers its two reply families through two different output calls.** `OK`/`ERROR`/`NUMBER` go through `driver_output2` (a plain byte list) while `DATA` goes through `driver_output_binary` (an improper `[header | binary]` iolist on a `[binary]` port), so an oracle probe that reads the raw port message must normalise with `binary_to_list(iolist_to_binary(D))` before comparing — and `io:format("~p", [D])` on the raw term raises. This crate keeps that split: `RamReply { header, body }` is delivered through [`DriverContext::deliver_read`](crate::DriverContext::deliver_read), so `OK`/`ERROR`/`NUMBER` are header-only (`body: None`) and a `DATA` reply is the 5-byte `[RESP_DATA, len:i32be]` header plus `Some(payload)` — an empty payload included (`Some(vec![])`, the C's `driver_output_binary(port, hdr, 5, bin, 0, 0)`).
 - **`ram_file_drv` is a registered built-in with a live runtime path.** `DriverRegistry::with_builtins()`
   (in `../driver.rs`) registers `"fd"`/`"efile"`/`"tcp_inet"`/`"udp_inet"`/`"ram_file_drv"`, and
   `beam_rt` opens a port on it through `open_port({spawn_driver,"ram_file_drv"}, …)` (its
@@ -185,7 +185,8 @@ children for `spawn`, loopback TCP/UDP + `erl`-oracle cross-checks for `inet`. B
 against the C `read_linebuf` cases in `line_buffer.rs`'s in-module suite. The `spawn` suite's
 child-exit and end-of-file waits are **condition-based under a 60 s hang guard**, never a wall-clock
 budget tuned for an idle host (see *Notes for Agents*).
-`ram_file.rs`'s suite (the sibling `ram_file_tests.rs`, 23 tests) needs no OS resource: the reply
+`ram_file.rs`'s suites (the sibling `ram_file_tests.rs`, 23 tests, plus the reply-split pin
+`ram_file_split_tests.rs`, 6) need no OS resource: the reply
 encodings, the mode/whence bit tables, the zero-filled-gap/truncate semantics, the argument faults
 and the two transports' consume-what-you-report accounting are pure in-memory assertions driven
 through a real `DriverContext`, plus a hard-coded matrix of the exact reply bytes the real
@@ -194,15 +195,16 @@ through a real `DriverContext`, plus a hard-coded matrix of the exact reply byte
 through a raw `open_port({spawn,"ram_file_drv"},[binary])` and compares **77 replies byte-for-byte**,
 the other pins the high-level `ram_file:*` API shapes (`get_size`/`get_file`/`position`/`read`/
 `pread`/`pwrite`/`truncate`/`sync`/`datasync`/`advise`/`allocate`/`ipread_s32bu_p32bu`/`close`).
-The crate-level integration suites for this node are the sibling `../../tests/` ones: `inet.rs` (8), `udp_inet.rs` (5) and `ram_file.rs` (12).
+The crate-level integration suites for this node are the sibling `../../tests/` ones: `inet.rs` (10), `udp_inet.rs` (6) and `ram_file.rs` (12).
 
 ## Routing Table
 - `fd.rs` → `FdDriver` + `set_nonblocking` (the shared non-blocking wrapper)
 - `efile.rs` → `EfileDriver`/`make_efile`/`FileDataMode`, the `open` grammar + `Access`/`OpenFlags`
 - `spawn.rs` → `SpawnDriver`/`SpawnSpec`/`SpawnOptions`/`StreamOptions`/`build_command`
 - `ram_file.rs` → `RamFileDriver`/`make_ram_file`/`DRIVER_NAME` + the `RAM_FILE_*` command/mode/whence/response
-  constants (the in-memory command-driven file driver); its suite is the sibling `ram_file_tests.rs`
-  (`#[cfg(test)] #[path = "ram_file_tests.rs"] mod tests;`, the `inet/` split pattern)
+  constants (the in-memory command-driven file driver); its suites are the siblings `ram_file_tests.rs`
+  (`#[cfg(test)] #[path = "ram_file_tests.rs"] mod tests;`, the `inet/` split pattern) and
+  `ram_file_split_tests.rs` (`mod split_tests;`, the `header`/`body` pin per reply shape)
 - `line_buffer.rs` → `LineBuffer`; `binary_io.rs` → `Phase`/`PhaseChange`
 - `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers; the option vocabulary
   (`opt.rs` — the five-byte/one-byte record walk over `Step`, the `SocketOptions` store, the

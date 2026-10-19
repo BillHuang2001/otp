@@ -98,6 +98,7 @@ use beam_common::Result;
 
 use super::accept::AcceptQueue;
 use super::frame;
+use super::header;
 use super::stat;
 use super::wire::{ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
 use super::{Interest, ReadReport, TcpInetDriver};
@@ -105,7 +106,6 @@ use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply}
 use crate::driver::DriverContext;
 use crate::port_failure::DriverFailure;
 use crate::error;
-use crate::port_task::ReadMessage;
 
 /// The C's `INET_MAX_ASYNC` (`erts/emulator/drivers/common/inet_drv.c:1069`): the receive slot
 /// holds **one** operation, so a second concurrent receive is `[0]ealready`.
@@ -275,17 +275,25 @@ pub(super) fn length_too_large(length: u32) -> bool {
 ///
 /// Returns the typed `unsupported` when the driver context carries no completion sink — a driver
 /// method called outside a [`Port`](crate::port::Port), which no runtime path does.
-pub(super) fn drain_closed(
+pub(super) fn drain_error_all(
     queue: &mut AsyncQueue,
     ctx: &mut DriverContext<'_>,
+    reason: InetReason,
 ) -> Result<()> {
     for id in queue.take_all() {
         ctx.deliver_completion(CompletionEvent::InetAsync {
             id,
-            result: InetAsyncResult::Error(InetReason::Closed),
+            result: InetAsyncResult::Error(reason),
         })?;
     }
     Ok(())
+}
+/// [`drain_error_all`] with the C's `am_closed` — `async_error_am_all(desc, am_closed)`.
+pub(super) fn drain_closed(
+    queue: &mut AsyncQueue,
+    ctx: &mut DriverContext<'_>,
+) -> Result<()> {
+    drain_error_all(queue, ctx, InetReason::Closed)
 }
 
 impl TcpInetDriver {
@@ -320,8 +328,8 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        if let Some(name) = self.peer_close.recv_reply() {
-            return Ok(ctl_xerror(name));
+        if let Some(reason) = self.peer_close.recv_reply() {
+            return Ok(ctl_xerror(&reason.atom_name()));
         }
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
@@ -355,6 +363,9 @@ impl TcpInetDriver {
         // armed (the port mirrors `next_timeout` into its `TIMEOUT` task right after this control
         // call) and the completion itself is produced at a later round — see the module docs.
         self.set_interest(ctx, Interest::READABLE)?;
+        // The enqueue selects the read side even out of a spent `{active, …}` grant's window —
+        // the C's `sock_select(INETP(desc), (FD_READ|FD_CLOSE), 1)` on `TCP_REQ_RECV` (`:12315`).
+        self.read_armed = true;
         Ok(async_ok_reply(id))
     }
 
@@ -425,9 +436,16 @@ impl TcpInetDriver {
                     // add, so this is the C's `len` too.
                     self.stat.input(payload.len());
                 }
+                // The passive reply splits on `{header, N}` exactly as the active message does:
+                // `inet_async_data` (`:3162`) applies `desc->hsz` to the **body**
+                // `packet_get_body` left behind, including its flat-list branch when `hsz > len`
+                // (`:3175`-`:3190`) — one rule, [`header::split_payload`].
                 ctx.deliver_completion(CompletionEvent::InetAsync {
                     id: op.id,
-                    result: InetAsyncResult::Data(ReadMessage::body_only(payload)),
+                    result: InetAsyncResult::Data(header::split_payload(
+                        self.options.header,
+                        payload,
+                    )),
                 })?;
                 return Ok(true);
             }
@@ -453,11 +471,7 @@ impl TcpInetDriver {
             // (`inet_drv.c:12829`) for an end-of-file, and `tcp_recv_error` with
             // `async_error_am_all(desc, error_atom(err))` (`:12877`) for a reset under
             // `{show_econnreset,true}`, which is how the oracle reports `{error,econnreset}`.
-            let reason = if self.peer_close.reset {
-                InetReason::from_errno(libc::ECONNRESET)
-            } else {
-                InetReason::Closed
-            };
+            let reason = self.peer_close.observed_reason();
             if let Some(op) = self.async_ops.take_recv() {
                 ctx.deliver_completion(CompletionEvent::InetAsync {
                     id: op.id,
@@ -520,7 +534,9 @@ impl TcpInetDriver {
 
     /// The read-readiness callback's body: serve the accepts a listener has queued, then either
     /// complete the pending receive or move the bytes into the port's input queue (the passive
-    /// floor's `{Port, {data, …}}` path).
+    /// floor's `{Port, {data, …}}` path) — that last step only while the descriptor's read side is
+    /// selected (see [`TcpInetDriver::read_armed`]), so a spent `{active, …}` grant leaves the
+    /// peer's bytes in the kernel for the next arm.
     pub(super) fn async_ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         self.serve_accepts(ctx)?;
         if !self.state.is_connected() {
@@ -534,6 +550,14 @@ impl TcpInetDriver {
         // owed to the user's next `recv` (see [`ReadReport`]). The C never reads in this state at
         // all — read interest is armed only by a queued `TCP_REQ_RECV` (`:12315`) — which is why
         // the reply has to be deferred rather than dropped.
+        //
+        // The reactor's read is additionally gated on the descriptor's read **selection**
+        // ([`TcpInetDriver::read_armed`]): a delivery that spent its `{active, …}` grant deselected
+        // the socket (`inet_drv.c:13106`-`:13114`), so the peer's later bytes must stay in the
+        // kernel for the next arm instead of being moved onto the passive channel here.
+        if !self.read_armed {
+            return Ok(());
+        }
         self.read_available(ctx, ReadReport::OwedToNextRecv)
             .map(|_read| ())
     }
@@ -586,8 +610,8 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        if let Some(name) = self.peer_close.recv_reply() {
-            return Ok(ctl_xerror(name));
+        if let Some(reason) = self.peer_close.recv_reply() {
+            return Ok(ctl_xerror(&reason.atom_name()));
         }
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
@@ -595,6 +619,11 @@ impl TcpInetDriver {
         if !arg.is_empty() {
             return Err(error::badarg());
         }
+        // An explicit read is never gated by a spent `{active, …}` grant — `sock_select(…, 0)`
+        // drops only the *reactor's* read callback (`:13107`) — and the port's eager passive read
+        // resumes once it has run, so the read side is selected again (see
+        // [`TcpInetDriver::read_armed`]).
+        self.read_armed = true;
         if self.framed().is_some() {
             return self.verb_recv_framed(ctx);
         }
@@ -606,7 +635,7 @@ impl TcpInetDriver {
             // an end-of-file, `econnreset` when the read's error was a reset under
             // `{show_econnreset,true}` (`tcp_recv_closed` vs `tcp_recv_error`,
             // `inet_drv.c:13185`-`:13196`).
-            return Ok(ctl_xerror(self.peer_close.observed_atom()));
+            return Ok(ctl_xerror(&self.peer_close.observed_reason().atom_name()));
         }
         Ok(ctl_ok())
     }
@@ -659,7 +688,7 @@ impl TcpInetDriver {
                             // This read is what found the peer gone (see [`verb_recv`]):
                             // `closed`, or `econnreset` for a reset under
                             // `{show_econnreset,true}`.
-                            return Ok(ctl_xerror(self.peer_close.observed_atom()));
+                            return Ok(ctl_xerror(&self.peer_close.observed_reason().atom_name()));
                         }
                         // The socket is drained but the frame is still partial: deliver nothing
                         // and keep the buffered bytes for the next `recv`.
@@ -674,21 +703,6 @@ impl TcpInetDriver {
 // ---------------------------------------------------------------------------
 // The send path's caller tag — `init_caller` + `inet_reply_finish`
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// The send path's caller tag — `init_caller` + `inet_reply_finish`
-// ---------------------------------------------------------------------------
-
-/// The error half of the `{inet_reply, Port, Reply[, Tag]}` message for one of [`PeerClose`]'s
-/// ladder names: `{error,econnreset}`, `{error,enotconn}` or `{error,closed}`
-/// (`inet_reply_error`/`inet_reply_error_am`, `inet_drv.c:12681`-`:12692`, `:13664`-`:13669`).
-fn close_reason(name: &str) -> InetReason {
-    match name {
-        "econnreset" => InetReason::from_errno(libc::ECONNRESET),
-        "enotconn" => InetReason::from_errno(libc::ENOTCONN),
-        _ => InetReason::Closed,
-    }
-}
 
 impl TcpInetDriver {
     /// The `erlang:port_command/2` write path: strip one caller tag, write, then answer the
@@ -750,7 +764,7 @@ impl TcpInetDriver {
             // one-shot is what the caller is answered with, and only an unarmed ladder is the
             // bare `enotconn`.
             let reply = match self.peer_close.send_reply() {
-                Some(name) => InetReply::Error(close_reason(name)),
+                Some(reason) => InetReply::Error(reason),
                 None => InetReply::Error(InetReason::from_errno(libc::ENOTCONN)),
             };
             if let Some(tag) = self.caller_ref.take() {
@@ -847,7 +861,7 @@ impl TcpInetDriver {
             // caller with the send ladder's reply — `inet_reply_error`/`inet_reply_error_am`,
             // `inet_drv.c:12689`-`:12692` and `:13664`-`:13669` — and with `{error,enotconn}`
             // once that one-shot is spent.
-            Some(name) => InetReply::Error(close_reason(name)),
+            Some(reason) => InetReply::Error(reason),
             None => InetReply::Ok,
         };
         ctx.deliver_completion(CompletionEvent::InetReply {

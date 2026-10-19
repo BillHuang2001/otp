@@ -139,7 +139,12 @@ fn a_built_in_drivers_reply_reaches_the_owner_as_one_data_notification() {
         round.notifications,
         vec![PortNotification::Data {
             port: id,
-            read: ReadMessage::body_only(OPEN_READ_WRITE_ABC_REPLY.to_vec()),
+            // An `ok` reply is header-only (`driver_output2(port, hdr, len, NULL, 0)`), so the
+            // whole five-byte reply is the read's header and there is no body at all.
+            read: ReadMessage {
+                header: OPEN_READ_WRITE_ABC_REPLY.to_vec(),
+                body: None,
+            },
         }],
         "exactly one notification, naming that port, carrying the driver's reply bytes"
     );

@@ -255,10 +255,12 @@ use std::time::Instant;
 
 use beam_common::Result;
 
+use crate::completion::InetReason;
 use crate::driver::{Driver, DriverContext};
 use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
+use crate::port_task::ActiveInputEvent;
 
 // The TCP accept state machine (`INET_REQ_ACCEPT`'s multi-operation list, its per-port timer
 // entries, the sticky `INET_F_MULTI_CLIENT` bit and the listener's readiness arming), split out of
@@ -266,6 +268,9 @@ use crate::poller::{Interest, Token};
 mod accept;
 mod adopt_probe;
 mod frame;
+// The `{header, N}` split of one delivered payload (the C's `desc->hsz`), shared by the active
+// and the passive delivery paths. Its own module doc is `src/drivers/inet/header.rs`.
+mod header;
 mod opcode;
 mod opt;
 // The asynchronous-operation queue (`TCP_REQ_RECV`/`INET_REQ_ACCEPT` and the
@@ -330,7 +335,7 @@ use self::opcode::{decode as decode_opcode, Opcode};
 // `enq_multi_op` accept list its sibling `accept` module owns), the `NEW_ASYNC_ID` counter and the
 // completion production points (`ready_input`/`timeout`/`drive_async`). Its own module doc is
 // `src/drivers/inet/async.rs`.
-use self::op_queue::{drain_closed, AsyncQueue};
+use self::op_queue::{drain_closed, drain_error_all, AsyncQueue};
 // The raw `libc` socket wrappers (`socket`/`accept`/`bind`/`listen`/`getsockopt`/`shutdown`/
 // `close`) live in the private `sys` submodule, so every `unsafe` block of the driver sits in
 // one place.
@@ -476,10 +481,11 @@ impl InetState {
 ///   set "for the next receive operation" (`:12685`'s comment);
 /// * every other state answers `enotconn`.
 ///
-/// `reset` is not a C flag: it records whether the *observation itself* was a reset, so the
-/// operation that **discovered** the close can report `econnreset` rather than `closed` — the split
-/// the C makes between `tcp_recv_error` and `tcp_recv_closed` (`:13190`-`:13196`) when it answers
-/// the discovering operation inline.
+/// `observed` is not a C flag either: it is the reason the **discovering** operation reports —
+/// `None` meaning `closed` — so a read reset under `{show_econnreset,true}` answers `econnreset`
+/// and any other read failure answers its own `error_atom(err)`, the split the C makes between
+/// `tcp_recv_error` and `tcp_recv_closed` (`:13190`-`:13196`) when it answers the discovering
+/// operation inline ([`PeerClose::observed_reason`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct PeerClose {
     /// The peer's end-of-file (or a connection reset) has been observed.
@@ -488,11 +494,15 @@ struct PeerClose {
     delayed_close_recv: bool,
     /// The C's `TCP_ADDF_DELAYED_CLOSE_SEND`.
     delayed_close_send: bool,
-    /// The C's `TCP_ADDF_DELAYED_ECONNRESET`.
-    delayed_econnreset: bool,
-    /// Whether the **observation** was a connection reset (`ECONNRESET` under
-    /// `{show_econnreset,true}`), so the operation that discovered it reports `econnreset`.
-    reset: bool,
+    /// The C's `TCP_ADDF_DELAYED_ECONNRESET`, generalised into the reason the deferred reply
+    /// owes: `None` is the `closed` both ladders answer by default, `Some(reason)` is the
+    /// `econnreset` of a write-path reset under `{show_econnreset,true}` **and** the
+    /// `error_atom(err)` a reactor-discovered **read error** owes
+    /// (`tcp_recv_error`'s `async_error_am_all(error_atom(err))`, `inet_drv.c:12877`).
+    delayed_reason: Option<InetReason>,
+    /// The reason the **discovering** operation reports, `None` being `closed`: `econnreset` for
+    /// a reset under `{show_econnreset,true}`, the failing errno for a read error.
+    observed: Option<InetReason>,
 }
 
 /// How the peer's close was observed — which decides both the flags
@@ -502,13 +512,15 @@ struct PeerClose {
 /// arms a different subset, and only a read-side discovery can report a reset *inline*.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CloseSource {
-    /// A **read** discovered it: `tcp_recv`'s `n == 0` or a non-reset read error
-    /// (`tcp_recv_closed`, `inet_drv.c:12783`), or an `ECONNRESET` under `{show_econnreset,true}`
-    /// (`tcp_recv_error`, `:12849`).
+    /// A **read** discovered it: `tcp_recv`'s `n == 0` or a reset-under-`{show_econnreset,false}`
+    /// (`tcp_recv_closed`, `inet_drv.c:12783`), or `tcp_recv_error`'s `ECONNRESET`-under-show /
+    /// any-other-errno route (`:12849`).
     Read {
-        /// The observation was an `ECONNRESET` **and** `{show_econnreset,true}` was in effect
-        /// (`:13190`-`:13196`), so it is `tcp_recv_error`'s route rather than `tcp_recv_closed`'s.
-        reset: bool,
+        /// The errno a **read failure** carried — `tcp_recv_error`'s route — or `None` for the
+        /// clean end-of-file that `tcp_recv_closed` handles. `tcp_recv` (`:13185`-`:13210`) sends
+        /// `ECONNRESET` to `tcp_recv_error` **only** under `{show_econnreset,true}`, so a reset
+        /// without the option is `None` here and still `tcp_recv_closed`'s clean close.
+        error: Option<i32>,
         /// Who the discovery's `closed`/`econnreset` reply belongs to (see [`ReadReport`]).
         report: ReadReport,
     },
@@ -544,11 +556,15 @@ enum ReadReport {
 }
 
 impl CloseSource {
-    /// Whether the observation was a reset — the input to both the inline reply and the
-    /// `TCP_ADDF_DELAYED_ECONNRESET` latch.
-    fn is_reset(self) -> bool {
+    /// The reason the **discovering** operation reports, `None` being `closed`: the C's
+    /// `tcp_recv_error` vs `tcp_recv_closed` split (`inet_drv.c:13190`-`:13196`) is exactly
+    /// `error_atom(err)` vs `am_closed`, and a write-path reset (`TCP_ADDF_DELAYED_ECONNRESET`,
+    /// `:13615`) is its `econnreset`. It is the input to both the inline reply and the
+    /// `TCP_ADDF_DELAYED_*` latch.
+    fn reason(self) -> Option<InetReason> {
         match self {
-            CloseSource::Read { reset, .. } | CloseSource::Write { reset } => reset,
+            CloseSource::Read { error, .. } => error.map(InetReason::from_errno),
+            CloseSource::Write { reset } => reset.then(|| InetReason::from_errno(libc::ECONNRESET)),
         }
     }
 }
@@ -557,40 +573,38 @@ impl PeerClose {
     /// Latches the observation and arms exactly the one-shot flags that discovery path arms.
     fn observe(&mut self, source: CloseSource) {
         self.seen = true;
-        self.reset = source.is_reset();
+        self.observed = source.reason();
         match source {
             // `tcp_recv_error` (`inet_drv.c:12849`-`:12890`) sets **no** flag: the error is
-            // delivered on the spot (`async_error_am_all(error_atom(err))`, `:12877`) and every
-            // later operation answers `enotconn`.
+            // delivered on the spot — `async_error_am_all(error_atom(err))` (`:12877`) to a
+            // passive caller, `tcp_error_message`/`tcp_closed_message` (`:12880`-`:12881`) to an
+            // active owner — and every later operation answers `enotconn`.
             //
             // `tcp_recv_closed` (`:12810`-`:12819`) arms the *send* one-shot only — a clean
             // end-of-file owes the receive nothing beyond the reply it already gave.
             //
             // Both hold for `ReadReport::Answered`, where the discovering operation takes that
             // reply. A reactor-made discovery has no such operation, so the reply it owes is armed
-            // on the receive ladder; a clean end-of-file still arms the send one-shot as well (the
-            // C arms it unconditionally in `tcp_recv_closed`), while a reset arms none — the
-            // `econnreset` the deferred reply owes rides the reset bit instead, because
-            // `tcp_recv_error` names the reason in its `async_error_am_all` argument.
-            CloseSource::Read { reset, report } => {
-                if !reset {
+            // on the receive ladder — carrying `error_atom(err)` for a read failure and the plain
+            // `closed` for a clean end-of-file, because `tcp_recv_error` names the reason in its
+            // `async_error_am_all` argument while `tcp_recv_closed` names `am_closed`.
+            CloseSource::Read { error, report } => {
+                self.delayed_reason = error.map(InetReason::from_errno);
+                if error.is_none() {
                     self.delayed_close_send = true;
                 }
                 if report == ReadReport::OwedToNextRecv {
                     self.delayed_close_recv = true;
-                    if reset {
-                        self.delayed_econnreset = true;
-                    }
                 }
             }
             CloseSource::Write { reset } => {
                 // `tcp_send_or_shutdown_error` (`:13660`-`:13685`): the send one-shot, then the
                 // receive one-shot, then — only for a reset under `{show_econnreset,true}` — the
-                // reset bit that turns both of their `closed` into `econnreset`.
+                // reason that turns both of their `closed` into `econnreset`.
                 self.delayed_close_send = true;
                 self.delayed_close_recv = true;
                 if reset {
-                    self.delayed_econnreset = true;
+                    self.delayed_reason = Some(InetReason::from_errno(libc::ECONNRESET));
                 }
             }
         }
@@ -599,23 +613,19 @@ impl PeerClose {
     /// The reply the next `recv` owes, or `None` while the connection is still usable.
     ///
     /// The C's `TCP_REQ_RECV` ladder (`inet_drv.c:12279`-`:12288`): with
-    /// `TCP_ADDF_DELAYED_CLOSE_RECV` set it clears **both** one-shots and answers `econnreset`
-    /// (also clearing `TCP_ADDF_DELAYED_ECONNRESET`) or `closed`; in every other state the reply is
-    /// `enotconn`.
-    fn recv_reply(&mut self) -> Option<&'static str> {
+    /// `TCP_ADDF_DELAYED_CLOSE_RECV` set it clears **both** one-shots and answers `econnreset` /
+    /// the deferred `error_atom(err)` (also clearing `TCP_ADDF_DELAYED_ECONNRESET`) or `closed`;
+    /// in every other state the reply is `enotconn`.
+    fn recv_reply(&mut self) -> Option<InetReason> {
         if !self.seen {
             return None;
         }
         if !self.delayed_close_recv {
-            return Some("enotconn");
+            return Some(InetReason::from_errno(libc::ENOTCONN));
         }
         self.delayed_close_recv = false;
         self.delayed_close_send = false;
-        if self.delayed_econnreset {
-            self.delayed_econnreset = false;
-            return Some("econnreset");
-        }
-        Some("closed")
+        Some(self.delayed_reason.take().unwrap_or(InetReason::Closed))
     }
 
     /// The reply the next `send` owes, or `None` while the connection is still usable.
@@ -624,29 +634,22 @@ impl PeerClose {
     /// `TCP_ADDF_DELAYED_CLOSE_SEND` set it clears **only** that one and answers `econnreset` — the
     /// reset bit staying armed for the next receive, as that arm's comment insists — or `closed`;
     /// in every other state the reply is `enotconn`.
-    fn send_reply(&mut self) -> Option<&'static str> {
+    fn send_reply(&mut self) -> Option<InetReason> {
         if !self.seen {
             return None;
         }
         if !self.delayed_close_send {
-            return Some("enotconn");
+            return Some(InetReason::from_errno(libc::ENOTCONN));
         }
         self.delayed_close_send = false;
-        if self.delayed_econnreset {
-            return Some("econnreset");
-        }
-        Some("closed")
+        Some(self.delayed_reason.unwrap_or(InetReason::Closed))
     }
 
-    /// The atom the operation that **discovered** the close reports: `econnreset` only when the
-    /// observation was a reset under `{show_econnreset,true}`, else `closed` (the C's
+    /// The reason the operation that **discovered** the close reports: `econnreset` for a reset
+    /// under `{show_econnreset,true}`, the failing errno for a read error, else `closed` (the C's
     /// `tcp_recv_error` vs `tcp_recv_closed` split, `inet_drv.c:13190`-`:13196`).
-    fn observed_atom(&self) -> &'static str {
-        if self.reset {
-            "econnreset"
-        } else {
-            "closed"
-        }
+    fn observed_reason(&self) -> InetReason {
+        self.observed.unwrap_or(InetReason::Closed)
     }
 
     /// Consumes the send one-shot that an **inline** reply has just answered.
@@ -764,6 +767,30 @@ pub struct TcpInetDriver {
     /// Whether the current command's caller-tag prefix has already been stripped from the output
     /// queue (see [`TcpInetDriver::caller_ref`]).
     caller_stripped: bool,
+    /// Whether read readiness may move bytes out of the kernel on the **reactor's** behalf — the
+    /// C's `FD_READ` **selection** state.
+    ///
+    /// `tcp_deliver` deselects the socket the moment a delivery spends its `{active, …}` grant
+    /// (`if (! desc->inet.active) { … sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0); … }`,
+    /// `inet_drv.c:13106`-`:13114`), so in the C a peer write during that window produces no read
+    /// callback at all and waits in the socket; `inet_set_opts` re-selects the socket when an
+    /// active grant is armed (`sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))`, `:7982`)
+    /// and a queued `TCP_REQ_RECV` selects it directly (`:12315`).
+    ///
+    /// This floor keeps the poller registration armed for the socket's whole life (`Interest` has
+    /// no empty mask and `mio`'s epoll is edge-triggered), so that gate has to live here: with
+    /// this flag `false`, [`TcpInetDriver::async_ready_input`] returns **without** reading, which
+    /// is what leaves the peer's bytes in the kernel for the next arm instead of spilling them
+    /// onto the passive [`PortNotification::Data`](crate::PortNotification::Data) channel and
+    /// losing them from the next `{active, …}` delivery.
+    ///
+    /// It is `true` by construction and on every fresh connection ([`TcpInetDriver::adopt`],
+    /// [`TcpInetDriver::adopt_prebound`], [`TcpInetDriver::mark_connected`],
+    /// [`TcpInetDriver::close_socket`]): a port that was never armed keeps this floor's eager
+    /// passive read, which is the one deliberate divergence from a C socket that is deselected
+    /// from the start. It gates the **reactor's** read only — every explicit/queued read
+    /// (the `recv` verbs, `TCP_REQ_RECV`) is unaffected.
+    read_armed: bool,
 }
 
 impl TcpInetDriver {
@@ -794,6 +821,7 @@ impl TcpInetDriver {
             async_ops: AsyncQueue::new(),
             caller_ref: None,
             caller_stripped: false,
+            read_armed: true,
         }
     }
 
@@ -846,6 +874,8 @@ impl TcpInetDriver {
             async_ops: AsyncQueue::new(),
             caller_ref: None,
             caller_stripped: false,
+            // A freshly adopted socket starts with its read side selected (see the field's note).
+            read_armed: true,
         })
     }
 
@@ -972,6 +1002,9 @@ impl TcpInetDriver {
                 // A fresh socket starts a fresh byte stream: any partial frame buffered for
                 // the previous socket no longer belongs to this one.
                 self.pending_input.clear();
+                // ... and a fresh read side: nothing has been delivered on the new socket yet, so
+                // no `{active, …}` grant can be spent (see [`TcpInetDriver::read_armed`]).
+                self.read_armed = true;
                 // The C's `inet_ctl_open` records the family and type here
                 // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close: `inet.stype`
                 // is `SOCK_STREAM` from `open` on, which is what gates the `send_timeout`
@@ -1049,6 +1082,8 @@ impl TcpInetDriver {
         // A fresh socket starts a fresh byte stream: any partial frame buffered for the previous
         // socket no longer belongs to this one.
         self.pending_input.clear();
+        // The read side is selected again: the new socket has delivered nothing yet.
+        self.read_armed = true;
         self.state = if connected {
             InetState::Connected
         } else {
@@ -1072,6 +1107,8 @@ impl TcpInetDriver {
         // The new connection's byte stream begins now: drop any partial frame buffered for the
         // socket this one replaces.
         self.pending_input.clear();
+        // ... and nothing has been delivered on it yet, so its read side is selected again.
+        self.read_armed = true;
     }
     /// Changes the socket's registered interest mask (registering it the first time).
     ///
@@ -1137,6 +1174,9 @@ impl TcpInetDriver {
         self.peer_close = PeerClose::default();
         self.shutdown_wr_done = false;
         self.pending_shutdown = None;
+        // A torn-down port has no spent grant left to remember (see
+        // [`TcpInetDriver::read_armed`]).
+        self.read_armed = true;
     }
     /// De-registers **and** closes the current socket, returning the de-registration outcome.
     ///
@@ -1241,7 +1281,10 @@ impl TcpInetDriver {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` when the read fails irrecoverably.
+    /// [`TcpInetDriver::connected_socket`]'s `BadArg` (a connected state with no descriptor) and
+    /// whatever the close latch reports (a failed poller de-registration, or a refused
+    /// active-input delivery). A **read** failure is not one of them: it is classified through
+    /// [`CloseSource::Read`] instead of being raised.
     fn read_bytes(
         &mut self,
         ctx: &mut DriverContext<'_>,
@@ -1273,27 +1316,31 @@ impl TcpInetDriver {
                 // `async_error_am_all(am_closed)` (`:12829`), which this floor's reactor must
                 // defer to the next `recv` (`report`).
                 self.read_eof = true;
-                self.latch_peer_close(ctx, CloseSource::Read { reset: false, report })?;
+                self.latch_peer_close(ctx, CloseSource::Read { error: None, report })?;
                 return Ok(read);
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
                 Some(libc::EAGAIN) => return Ok(read),
-                // A reset (or an aborted connection) is the peer's close, not a read failure.
-                // `tcp_recv` (`inet_drv.c:13185`-`:13196`) sends `ECONNRESET` to
-                // `tcp_recv_error` — which reports `{error,econnreset}` and arms nothing — only
-                // when `TCP_ADDF_SHOW_ECONNRESET` is set (`{show_econnreset,true}`); otherwise
-                // it takes `tcp_recv_closed`, the clean-closed path. `ECONNABORTED` has no
-                // show/closed split, so it always takes the closed route here.
-                Some(libc::ECONNRESET) | Some(libc::ECONNABORTED) => {
+                // The C's `tcp_recv` classification (`inet_drv.c:13185`-`:13210`), in its order:
+                // `ECONNRESET` goes to `tcp_recv_error` — which reports `error_atom(err)` and
+                // arms nothing — **only** while `TCP_ADDF_SHOW_ECONNRESET` is set
+                // (`{show_econnreset,true}`); without it the same errno takes `tcp_recv_closed`,
+                // the clean-close path. **Every other** errno (`ECONNABORTED` included — its
+                // `ECONNRESET` translation is the Windows `FD_CLOSE` arm only, `:13430`-`:13437`)
+                // is `tcp_recv_error`'s "real error" arm.
+                other => {
+                    let errno = other.unwrap_or(libc::EIO);
+                    let error = if errno == libc::ECONNRESET && !self.options.show_econnreset {
+                        None
+                    } else {
+                        Some(errno)
+                    };
                     self.read_eof = true;
-                    let reset = err.raw_os_error() == Some(libc::ECONNRESET)
-                        && self.options.show_econnreset;
-                    self.latch_peer_close(ctx, CloseSource::Read { reset, report })?;
+                    self.latch_peer_close(ctx, CloseSource::Read { error, report })?;
                     return Ok(read);
                 }
-                _ => return Err(error::io(err)),
             }
         }
     }
@@ -1332,13 +1379,29 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         source: CloseSource,
     ) -> Result<()> {
+        // `tcp_recv_error`'s **active** arm (`inet_drv.c:12875`-`:12881`) reports
+        // `tcp_error_message(desc, err)` and only then `tcp_closed_message(desc)`: the error
+        // event is delivered **first** and the close follows it — as a second message in the C,
+        // and here as the `port_closed()` observation this latch sets right after. A passive
+        // socket sends no such message (it ends in `async_error_am_all(error_atom(err))`, the
+        // drain below).
+        if self.options.active > INET_PASSIVE {
+            if let Some(reason) = source.reason() {
+                ctx.deliver_active_input(ActiveInputEvent::Error(reason))?;
+            }
+        }
         self.peer_close.observe(source);
         self.pending_shutdown = None;
         // The peer is gone, so every queued operation can only end one way: the C's
-        // `async_error_am_all(am_closed)` (`inet_drv.c:11887`, `:2597`-`:2608`). It runs before
+        // `async_error_am_all(am_closed)` (`inet_drv.c:11887`, `:2597`-`:2608`) for a clean close
+        // and `async_error_am_all(error_atom(err))` (`:12877`) for a read error. It runs before
         // the queued output is dropped so a failure to stage a completion is not swallowed by
         // the teardown below.
-        drain_closed(&mut self.async_ops, ctx)?;
+        drain_error_all(
+            &mut self.async_ops,
+            ctx,
+            source.reason().unwrap_or(InetReason::Closed),
+        )?;
         ctx.output().clear();
         let released = self.deregister(ctx);
         // `tcp_recv_closed`/`tcp_recv_error`/`tcp_send_or_shutdown_error`'s passive
@@ -1743,8 +1806,8 @@ impl TcpInetDriver {
         // default `{exit_on_close,true}` ends in `tcp_desc_close` → `erl_inet_close`, which
         // clears `INET_STATE_CONNECTED` (`:5078`) and sets `INET_STATE_CLOSED` (`:5106`) — so a
         // state-first guard would swallow the one-shot `tcp_recv_closed` armed (`:12816`).
-        if let Some(name) = self.peer_close.send_reply() {
-            return Ok(ctl_xerror(name));
+        if let Some(reason) = self.peer_close.send_reply() {
+            return Ok(ctl_xerror(&reason.atom_name()));
         }
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
@@ -1794,9 +1857,9 @@ impl TcpInetDriver {
             // the next receive (`flags |= TCP_ADDF_DELAYED_CLOSE_RECV`, `:13678`) and, for a
             // reset, leaves `TCP_ADDF_DELAYED_ECONNRESET` armed too (`:13683`); the send
             // one-shot is *not* armed, because this call answered it on the spot.
-            let name = self.peer_close.observed_atom();
+            let name = self.peer_close.observed_reason().atom_name();
             self.peer_close.consumed_by_send();
-            return Ok(ctl_xerror(name));
+            return Ok(ctl_xerror(&name));
         }
         Ok(ctl_ok())
     }
@@ -2388,13 +2451,24 @@ mod active;
 mod active_tests;
 #[cfg(test)]
 mod accept_tests;
+// The **passive** half of the read-error delivery: a queued `TCP_REQ_RECV` completed by the
+// peer's reset (the failing errno) or by its clean close (`closed`) — the
+// `drain_error_all`-vs-`drain_closed` split `async.rs` makes.
+#[cfg(test)]
+#[path = "async_error_tests.rs"]
+mod async_error_tests;
 #[cfg(test)]
 #[path = "close_tests.rs"]
 mod close_tests;
 #[cfg(test)]
+#[path = "error_delivery_tests.rs"]
+mod error_delivery_tests;
+#[cfg(test)]
 mod fdopen_errno_tests;
 #[cfg(test)]
 mod frame_tests;
+#[cfg(test)]
+mod header_tests;
 #[cfg(test)]
 #[path = "inherit_tests.rs"]
 mod inherit_tests;

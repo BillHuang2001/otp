@@ -334,9 +334,21 @@ fn an_unknown_how_defers_nothing_and_takes_the_shutdown_errno() {
 ///
 /// The oracle needs a **real** connection, and its raw `INET_REQ_CONNECT`(3) is asynchronous with
 /// an `INET_INFINITY` budget (`0xffffffff`; a `0` budget answers `{error,timeout}` before the
-/// handshake completes), so the probe listens, connects, waits for the connection, accepts it and
-/// reads `GETSTATUS` back — that status row is part of the compared list, so a probe that silently
-/// ran against an *unconnected* port cannot pass.
+/// handshake completes), so the probe listens, connects, accepts it and reads `GETSTATUS` back —
+/// that status row is part of the compared list, so a probe that silently ran against an
+/// *unconnected* port cannot pass.
+///
+/// Two reply-independent details are what make that connection real:
+///
+/// * the connect operand's address is `Tag(1) ++ Port(2)` — the C parses it with
+///   `inet_set_faddress` (`inet_drv.c:4795`), whose first byte is an `INET_AF_*` tag
+///   (`INET_AF_LOOPBACK` = `4`, `:760`), **not** an address octet; a tag-less port-then-address
+///   payload is refused (`[0]"eafnosupport"`) and the `accept` then blocks forever;
+/// * the connect completes asynchronously (`tcp_inet_ready_output` sets `INET_STATE_CONNECTED`
+///   before `async_ok`, `inet_drv.c:14284`/`:14287`), so the probe polls `GETSTATUS` until it
+///   reports [`CONNECTED`] instead of sleeping on it, bounded at 2000 polls (≈2 s) and loud when it
+///   runs out — an abnormal `-eval` exit loses the whole output (`opcode_tests::erl_stdout`'s
+///   note), so the give-up arm prints to `standard_error` and `halt(1)`.
 ///
 /// **Skips loudly** when `erl` is not on `PATH` or does not answer within its budget.
 #[test]
@@ -352,7 +364,7 @@ fn the_shutdown_replies_agree_with_the_erl_oracle() {
          J(erlang:port_control(B,{shutdown},<<1,2>>)), \
          J(erlang:port_control(B,{shutdown},<<1>>)), \
          O = open_port({{spawn_driver,\"tcp_inet\"}},[binary]), \
-         J(erlang:port_control(O,{open},<<1,1,0>>)), \
+         [1] = erlang:port_control(O,{open},<<1,1,0>>), \
          J(erlang:port_control(O,{shutdown},<<>>)), \
          J(erlang:port_control(O,{shutdown},<<1,2>>)), \
          J(erlang:port_control(O,{shutdown},<<1>>)), \
@@ -360,10 +372,17 @@ fn the_shutdown_replies_agree_with_the_erl_oracle() {
          {{ip,{{127,0,0,1}}}}]), \
          {{ok,{{_,P0}}}} = inet:sockname(L), \
          C = open_port({{spawn_driver,\"tcp_inet\"}},[binary]), \
-         erlang:port_control(C,{open},<<1,1,0>>), \
-         erlang:port_control(C,{connect},<<{},(P0 bsr 8),(P0 band 255),127,0,0,1>>), \
-         timer:sleep(200), \
-         {{ok,_A}} = gen_tcp:accept(L), \
+         [1] = erlang:port_control(C,{open},<<1,1,0>>), \
+         erlang:port_control(C,{connect},<<{INFINITY},4,(P0 bsr 8),(P0 band 255)>>), \
+         Wait = fun F(0) -> io:format(standard_error, \"the raw connect never completed~n\"), \
+         erlang:halt(1); \
+         F(N) -> case erlang:port_control(C,{status},<<>>) of \
+                     [1,0,0,0,{CONNECTED}] -> ok; \
+                     _ -> timer:sleep(1), F(N-1) \
+                 end \
+         end, \
+         Wait(2000), \
+         {{ok,_A}} = gen_tcp:accept(L, 5000), \
          J(erlang:port_control(C,{status},<<>>)), \
          J(erlang:port_control(C,{shutdown},<<>>)), \
          J(erlang:port_control(C,{shutdown},<<1,2>>)), \
@@ -372,7 +391,7 @@ fn the_shutdown_replies_agree_with_the_erl_oracle() {
          J(erlang:port_control(C,{shutdown},<<1>>)), \
          J(erlang:port_control(C,{shutdown},<<2>>)), \
          gen_tcp:close(L)",
-        INFINITY_TIMEOUT
+        INFINITY = INFINITY_TIMEOUT
             .iter()
             .map(u8::to_string)
             .collect::<Vec<_>>()

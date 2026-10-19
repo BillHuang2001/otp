@@ -46,6 +46,7 @@ use std::time::Instant;
 use beam_common::Result;
 use beam_process::PortId;
 
+use crate::completion::InetReason;
 use crate::driver::{Driver, DriverContext, PortArms, PortExitReason};
 use crate::poller::Poller;
 use crate::port::{Port, PortCommandOptions, DEFAULT_READINESS_RED_BUDGET};
@@ -191,6 +192,9 @@ fn tags(deliveries: &[ActiveInput]) -> Vec<(PortId, u8)> {
                     .copied()
                     .expect("every hook delivery carries a one-byte body"),
                 ActiveInputEvent::Passive => 0,
+                ActiveInputEvent::Error(_) => {
+                    panic!("no hook stages an error event; the error path has its own tests")
+                }
             };
             (delivery.port, tag)
         })
@@ -201,7 +205,16 @@ fn tags(deliveries: &[ActiveInput]) -> Vec<(PortId, u8)> {
 // The channel primitive: `DriverContext::deliver_active_input`
 // -----------------------------------------------------------------------------------------------
 
-/// A context with no active-input sink is the typed `unsupported` naming the missing sink — never a
+/// The `Error` reasons of a drained batch, rendered by their Erlang atom name, in drain order.
+fn errors(deliveries: &[ActiveInput]) -> Vec<String> {
+    deliveries
+        .iter()
+        .filter_map(|delivery| match &delivery.event {
+            ActiveInputEvent::Error(reason) => Some(reason.atom_name()),
+            ActiveInputEvent::Data(_) | ActiveInputEvent::Passive => None,
+        })
+        .collect()
+}/// A context with no active-input sink is the typed `unsupported` naming the missing sink — never a
 /// silent drop, because the owner may be blocked in `receive {tcp, S, _}`.
 #[test]
 fn deliver_active_input_without_a_sink_is_the_typed_unsupported() {
@@ -437,6 +450,110 @@ fn a_passive_event_survives_the_round_trip() {
         "an active-mode counter transition is a delivery with no payload and no atom"
     );
     assert!(port.take_active_inputs().is_empty());
+}
+
+// -----------------------------------------------------------------------------------------------
+// The third event: a read error
+// -----------------------------------------------------------------------------------------------
+
+/// A driver whose read-readiness callback stages the errors it was built with, in call order —
+/// the C's `tcp_error_message` (`inet_drv.c:4079`) / `packet_error_message` (`:4245`) through
+/// [`DriverContext::deliver_active_input`].
+struct ErrorDriver {
+    /// The reasons to stage, in order, from one `ready_input`.
+    reasons: Vec<InetReason>,
+}
+
+impl Driver for ErrorDriver {
+    fn name(&self) -> &str {
+        "active-input-error-test"
+    }
+
+    fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        let len = ctx.output().len();
+        ctx.output().consume(len);
+        Ok(len)
+    }
+
+    fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        for reason in &self.reasons {
+            ctx.deliver_active_input(ActiveInputEvent::Error(*reason))?;
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A read error crosses the channel unchanged: one event, stamped with the port's own id, and a
+/// second drain is empty. The reason is the term-free [`InetReason`] — the runtime picks
+/// `{tcp_error, S, Reason}` vs `{udp_error, S, Reason}` from the port's driver name and renders the
+/// atom with [`InetReason::atom_name`], so nothing here may invent one.
+#[test]
+fn an_error_event_survives_the_round_trip() {
+    let mut poller = poller();
+    let id = PortId::new(17);
+    let mut port = Port::new(
+        id,
+        Box::new(ErrorDriver {
+            reasons: vec![InetReason::Errno(libc::ECONNRESET)],
+        }),
+    );
+    port.open(&mut poller).expect("the driver starts");
+    port.ready_input(&mut poller).expect("read readiness");
+
+    let delivered = port.take_active_inputs();
+    assert_eq!(
+        delivered,
+        vec![ActiveInput {
+            port: id,
+            event: ActiveInputEvent::Error(InetReason::Errno(libc::ECONNRESET)),
+        }],
+        "one read error is one delivery, stamped with the context's own port"
+    );
+    assert_eq!(
+        errors(&delivered),
+        vec!["econnreset".to_string()],
+        "the reason needs no atom of its own: the runtime renders it"
+    );
+    assert!(
+        port.take_active_inputs().is_empty(),
+        "a delivery is reported exactly once"
+    );
+}
+
+/// Two errors staged in one callback are **two** deliveries in call order — never merged, and never
+/// collapsed to one reason. The C's active arm sends the error and then the close
+/// (`inet_drv.c:12880`-`:12881`); a driver that reports both reasons keeps them distinguishable.
+#[test]
+fn two_errors_in_one_callback_are_two_deliveries_in_call_order() {
+    let mut poller = poller();
+    let id = PortId::new(19);
+    let mut port = Port::new(
+        id,
+        Box::new(ErrorDriver {
+            reasons: vec![InetReason::Errno(libc::ECONNRESET), InetReason::Closed],
+        }),
+    );
+    port.open(&mut poller).expect("the driver starts");
+    port.ready_input(&mut poller).expect("read readiness");
+
+    let delivered = port.take_active_inputs();
+    assert_eq!(
+        errors(&delivered),
+        vec!["econnreset".to_string(), "closed".to_string()],
+        "two staged errors are two deliveries, in call order: {delivered:?}"
+    );
+    assert!(
+        delivered.iter().all(|input| input.port == id),
+        "each delivery is stamped with the context's own port"
+    );
 }
 
 // -----------------------------------------------------------------------------------------------

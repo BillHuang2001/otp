@@ -25,7 +25,8 @@
 //! A passive socket's bytes wait in the port's **input queue** for the owner's next read — the
 //! `{Port, {data, Data}}` path
 //! ([`PortNotification::Data`](crate::PortNotification::Data)), which
-//! [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) drives. An **active** socket
+//! [`TcpInetDriver::async_ready_input`](super::TcpInetDriver) drives (they wait in the kernel
+//! instead while a spent grant has the read side deselected — see *Arming*). An **active** socket
 //! (`{active, true}`, `{active, once}`, `{active, N}`) instead sends its owner a **message** per
 //! delivered unit — `tcp_message` (`:3979`), `{tcp, S, [H1..Hsz | Data]}` — which the runtime
 //! renders from an [`ActiveInputEvent::Data`] on the active-input channel
@@ -48,10 +49,13 @@
 //!
 //! The read's `header` is **not** the framing header (that one is already gone): it is the
 //! `{header, N}` option — the C's `desc->hsz` (`inet_drv.c:6931`) — split off the front of the
-//! payload, exactly as `tcp_message` (`:3979`) renders `[H1..Hsz | Data]`. In `[list]` mode the
-//! C flattens the pair into one string (and reports the whole payload as a flat string when
-//! `hsz > len`); flattening is the **runtime's** job, so this module always hands up the split
-//! [`ReadMessage`] and never a mode-dependent shape.
+//! payload, exactly as `tcp_message` (`:3979`) renders `[H1..Hsz | Data]`. A `hsz` wider than the
+//! payload takes the C's **flat-list** branch there (`(desc->mode == INET_MODE_LIST) || (hsz >
+//! len)`, `:3985`): the whole payload as one proper list, with no binary tail — which the split
+//! expresses as `body: None` ([`super::header::split_payload`]). In `[list]` mode the C flattens
+//! the pair into one string whatever the split is; flattening is the **runtime's** job, so this
+//! module always hands up the split
+//! [`ReadMessage`](crate::port_task::ReadMessage) and never a mode-dependent shape.
 //!
 //! # The `{active, N}` bookkeeping
 //!
@@ -83,18 +87,19 @@
 //!
 //! # Arming
 //!
-//! The C arms read readiness only while `active > 0` (`sock_select(desc, FD_READ|FD_CLOSE,
-//! desc->active > 0)`, `:7944`-`:7986`) — going passive de-selects the socket. This crate's
-//! poller has no empty-interest mask (`crate::poller::Interest` is
-//! `READABLE`/`WRITABLE`/`BOTH`/`ERROR`) and `mio`'s epoll is **edge-triggered**, so the
-//! registration is kept armed for the socket's life and the driver gates on `options.active`
-//! instead; a **passive → active** transition re-registers so already-buffered bytes produce a
-//! fresh edge ([`TcpInetDriver::after_setopts`](super::TcpInetDriver)). The consequence of keeping
-//! the registration armed is that bytes arriving **after** an `{active, N}` counter is spent are
-//! read into the port's input queue by the passive half of
-//! [`Driver::ready_input`](crate::Driver::ready_input) rather than staying in the kernel buffer —
-//! they are still there for the owner's next passive read, and nothing is delivered on the active
-//! channel.
+//! The C selects the socket's read side only while `active > 0` (`sock_select(desc,
+//! FD_READ|FD_CLOSE, desc->active > 0)`, `:7944`-`:7986`) and **deselects** it the moment a
+//! delivery spends the grant (`:13106`-`:13114`). This crate's poller has no empty-interest mask
+//! (`crate::poller::Interest` is `READABLE`/`WRITABLE`/`BOTH`) and `mio`'s epoll is
+//! **edge-triggered**, so the registration is kept armed for the socket's life and the driver
+//! reproduces the C's selection itself: [`TcpInetDriver::read_armed`](super::TcpInetDriver) is
+//! cleared by the delivery that empties a grant, and set again by an armed `{active, …}` grant
+//! (which also re-registers, so already-buffered bytes produce a fresh edge —
+//! [`TcpInetDriver::after_setopts`](super::TcpInetDriver)), by a queued `TCP_REQ_RECV`, by the
+//! synchronous `recv` verbs and on every fresh connection. While it is clear the reactor reads
+//! nothing, so a peer write during the spent window waits in the kernel for the next arm — where
+//! the C leaves it — instead of being moved onto the passive `{Port, {data, …}}` channel and
+//! going missing from the next delivery.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`,
 //! `erts/emulator/beam/packet_parser.{c,h}`.
@@ -102,9 +107,10 @@ use beam_common::Result;
 
 use crate::driver::DriverContext;
 use crate::poller::Interest;
-use crate::port_task::{ActiveInputEvent, ReadMessage};
+use crate::port_task::ActiveInputEvent;
 
 use super::frame;
+use super::header;
 use super::opt::{set_options_tracked, OptScope};
 use super::stat;
 use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, ReadReport, TcpInetDriver};
@@ -267,37 +273,10 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         payload: Vec<u8>,
     ) -> Result<()> {
-        let read = self.split_payload(payload);
+        let read = header::split_payload(self.options.header, payload);
         ctx.deliver_active_input(ActiveInputEvent::Data(read))?;
         self.count_delivery(ctx)
     }
-
-    /// The `{tcp, S, [H1..Hsz | Data]}` split of one delivered payload
-    /// (`tcp_message`, `:3979`-`:4005`).
-    ///
-    /// `hsz` is the `{header, N}` option (the C's `desc->hsz`, `:6931`) — **not** the `{packet, N}`
-    /// framing header, which was stripped before this point. The body is always present, even
-    /// when empty: the C's `LOAD_BUF2BINARY(buf+hsz, 0)` still builds `<<>>`, so a `[binary]` port
-    /// renders `[H1..Hsz|<<>>]` where a header-less read renders the bare binary.
-    ///
-    /// **Divergence, recorded:** when `hsz > payload.len()` the C takes its list branch
-    /// (`(desc->mode == INET_MODE_LIST) || (hsz > len)`, `:3985`) and reports the whole payload as
-    /// one flat string (a *proper* list, no binary tail). This floor always hands up
-    /// `header = payload`, `body = Some(vec![])` there, which a `[list]` consumer flattens to the
-    /// same bytes; only a `[binary]` consumer would see an empty binary tail instead of none.
-    /// Nothing is lost or mis-ordered either way, and the split stays the runtime's to render.
-    fn split_payload(&self, mut payload: Vec<u8>) -> ReadMessage {
-        // The C stores `{header, N}` as an `unsigned int` (`desc->hsz = ival`, `:6931`), so a
-        // negative option is the huge unsigned that makes `hsz > len` true.
-        let hsz = self.options.header as u32 as usize;
-        let split = hsz.min(payload.len());
-        let body = payload.split_off(split);
-        ReadMessage {
-            header: payload,
-            body: Some(body),
-        }
-    }
-
     /// `INET_CHECK_ACTIVE_TO_PASSIVE` (`:1552`-`:1561`): spends one `{active, …}` grant after
     /// each delivered packet.
     ///
@@ -319,6 +298,12 @@ impl TcpInetDriver {
                 }
             }
             _ => {}
+        }
+        // `if (! desc->inet.active) { … sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0); … }`
+        // (`inet_drv.c:13106`-`:13114`): the delivery that emptied the grant deselects the socket's
+        // read side, so a peer write during the spent window is never read by the reactor.
+        if !self.active_mode() {
+            self.read_armed = false;
         }
         Ok(())
     }
@@ -401,6 +386,10 @@ impl TcpInetDriver {
         if self.state.is_connected() && self.has_socket() && before_active == INET_PASSIVE {
             if self.active_mode() {
                 self.set_interest(ctx, Interest::READABLE)?;
+                // `sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` (`:7982`): an armed
+                // grant selects the socket's read side again, ending any spent-grant window
+                // (see [`TcpInetDriver::read_armed`](super::TcpInetDriver)).
+                self.read_armed = true;
             }
         }
         if self.inline_burst(before_active, before_htype) {

@@ -509,8 +509,9 @@ fn the_reply_encodings_are_the_documented_big_endian_bytes() {
 /// **The grammar, through the port.** Every command of the session is sent as opcode bytes with
 /// `port_command` and its reply is asserted byte for byte **where it arrives**: the
 /// `PortNotification::Data` of the port-task round that ran the `OUTPUT` task. The first row is
-/// additionally pinned as the notification itself, so the `[port, bytes]` shape of the
-/// delivery — not just the payload — is on the record.
+/// additionally pinned as the notification itself — the delivery's port, and its C
+/// `driver_output2` header/body split — so the shape of the delivery, not just the payload, is on
+/// the record.
 #[test]
 fn the_opcode_grammar_surfaces_its_replies_as_port_data() {
     let mut poller = poller();
@@ -524,9 +525,16 @@ fn the_opcode_grammar_surfaces_its_replies_as_port_data() {
                 notifications,
                 vec![PortNotification::Data {
                     port: id,
-                    read: ReadMessage::body_only(vec![3, 0, 0, 0, 0]),
+                    // `open` answers `NUMBER 0` through the C's `driver_output2(tmp, 5, NULL, 0)`:
+                    // the five header bytes are the whole reply and there is **no** body
+                    // (`body: None`), which a `[binary]` owner renders as the proper list
+                    // `[3,0,0,0,0]` rather than an improper `[3,0,0,0,0|<<>>]`.
+                    read: ReadMessage {
+                        header: vec![3, 0, 0, 0, 0],
+                        body: None,
+                    },
                 }],
-                "`open` answers `NUMBER 0` as the bytes of one Data notification"
+                "`open` answers `NUMBER 0` as the header bytes of one Data notification"
             );
         }
         let reply = reply_bytes(notifications, id);

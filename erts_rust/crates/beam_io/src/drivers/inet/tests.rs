@@ -57,6 +57,11 @@ const ERL_TIMEOUT: Duration = Duration::from_secs(30);
 fn poller() -> Poller {
     Poller::new().expect("a poll set")
 }
+/// The atom name a [`PeerClose`] ladder reply renders as — `None` while the connection is still
+/// usable — for the reply-sequence assertions of the peer-close state machine.
+fn reply_name(reply: Option<InetReason>) -> Option<String> {
+    reply.map(|reason| reason.atom_name())
+}
 
 /// A loopback listener the test owns (the driver is given its own copy of the fd).
 fn loopback_listener() -> TcpListener {
@@ -293,18 +298,18 @@ fn a_fresh_driver_has_no_socket() {
 fn the_peer_close_answers_once_per_direction() {
     // While the connection is usable neither direction owes a reply.
     let mut close = PeerClose::default();
-    assert_eq!(close.recv_reply(), None);
-    assert_eq!(close.send_reply(), None);
+    assert_eq!(reply_name(close.recv_reply()), None);
+    assert_eq!(reply_name(close.send_reply()), None);
 
     // A **write** discovers a clean close: it arms both one-shots
     // (`tcp_send_or_shutdown_error`, `inet_drv.c:13662`/`:13678`), so each direction reports
     // `closed` exactly once and `enotconn` forever after.
     close.observe(CloseSource::Write { reset: false });
-    assert_eq!(close.send_reply(), Some("closed"));
-    assert_eq!(close.recv_reply(), Some("closed"));
-    assert_eq!(close.send_reply(), Some("enotconn"));
-    assert_eq!(close.recv_reply(), Some("enotconn"));
-    assert_eq!(close.send_reply(), Some("enotconn"));
+    assert_eq!(reply_name(close.send_reply()).as_deref(), Some("closed"));
+    assert_eq!(reply_name(close.recv_reply()).as_deref(), Some("closed"));
+    assert_eq!(reply_name(close.send_reply()).as_deref(), Some("enotconn"));
+    assert_eq!(reply_name(close.recv_reply()).as_deref(), Some("enotconn"));
+    assert_eq!(reply_name(close.send_reply()).as_deref(), Some("enotconn"));
 
     // The two directions are independent: a `send` that is what discovered the close does not
     // consume the receive direction's one-shot `closed` (the C's `tcp_send_error` ->
@@ -312,32 +317,36 @@ fn the_peer_close_answers_once_per_direction() {
     // about the close from its next receive).
     let mut close = PeerClose::default();
     close.observe(CloseSource::Write { reset: false });
-    assert_eq!(close.send_reply(), Some("closed"));
-    assert_eq!(close.recv_reply(), Some("closed"));
-    assert_eq!(close.send_reply(), Some("enotconn"));
-    assert_eq!(close.recv_reply(), Some("enotconn"));
+    assert_eq!(reply_name(close.send_reply()).as_deref(), Some("closed"));
+    assert_eq!(reply_name(close.recv_reply()).as_deref(), Some("closed"));
+    assert_eq!(reply_name(close.send_reply()).as_deref(), Some("enotconn"));
+    assert_eq!(reply_name(close.recv_reply()).as_deref(), Some("enotconn"));
 
     // A **reset** under `{show_econnreset,true}` turns both `closed`s into `econnreset`, and the
     // send ladder deliberately leaves `TCP_ADDF_DELAYED_ECONNRESET` armed for the next receive
     // (`inet_drv.c:12685`'s comment), so a receive after a send still reports the reset.
     let mut close = PeerClose::default();
     close.observe(CloseSource::Write { reset: true });
-    assert_eq!(close.observed_atom(), "econnreset");
-    assert_eq!(close.send_reply(), Some("econnreset"));
-    assert_eq!(close.recv_reply(), Some("econnreset"), "the reset bit survives a send");
-    assert_eq!(close.send_reply(), Some("enotconn"));
-    assert_eq!(close.recv_reply(), Some("enotconn"));
+    assert_eq!(close.observed_reason().atom_name(), "econnreset");
+    assert_eq!(reply_name(close.send_reply()).as_deref(), Some("econnreset"));
+    assert_eq!(
+        reply_name(close.recv_reply()).as_deref(),
+        Some("econnreset"),
+        "the reset bit survives a send"
+    );
+    assert_eq!(reply_name(close.send_reply()).as_deref(), Some("enotconn"));
+    assert_eq!(reply_name(close.recv_reply()).as_deref(), Some("enotconn"));
 
     // A **read**-discovered reset (`tcp_recv_error`, `inet_drv.c:12849`) arms nothing at all: the
     // operation that found it reports `econnreset` inline, and both ladders are `enotconn` after.
     let mut close = PeerClose::default();
     close.observe(CloseSource::Read {
-        reset: true,
+        error: Some(libc::ECONNRESET),
         report: ReadReport::Answered,
     });
-    assert_eq!(close.observed_atom(), "econnreset");
-    assert_eq!(close.recv_reply(), Some("enotconn"));
-    assert_eq!(close.send_reply(), Some("enotconn"));
+    assert_eq!(close.observed_reason().atom_name(), "econnreset");
+    assert_eq!(reply_name(close.recv_reply()).as_deref(), Some("enotconn"));
+    assert_eq!(reply_name(close.send_reply()).as_deref(), Some("enotconn"));
 }
 
 /// Once the peer's end goes away the driver **latches** the close: the

@@ -1505,3 +1505,7 @@ mod async_tests;
 
 #[cfg(test)]
 mod active_tests;
+#[cfg(test)]
+mod empty_datagram_tests;
+#[cfg(test)]
+mod error_tests;
