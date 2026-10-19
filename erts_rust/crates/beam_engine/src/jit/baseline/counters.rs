@@ -66,7 +66,8 @@
 //!
 //! Both directions of the cache are **partial** — `spill` stores a subset of the block's
 //! cache and `fill` reloads the registers the continuation can still observe
-//! (`Allocation::fill_slots`, its block-local liveness unioned with the write set) — so a
+//! (`Allocation::fill_slots`: its block-local liveness unioned with the inline write set of
+//! the instruction *at* that pc) — so a
 //! single measured run has to yield *every* model's count at once. Each `record_*` sees
 //! only the count it was handed (that is all `spill`/`fill` know per call), so it records
 //! that count and queues the site; [`record_block`] — which is handed the whole
@@ -266,11 +267,12 @@ pub(crate) struct Counters {
     pub(crate) spill_stores_full: u64,
     /// Fill sites by kind ([`FillSite`]) — the number of `fill` calls.
     pub(crate) fill_calls_by_site: BTreeMap<FillSite, u64>,
-    /// Fill register loads by kind under the liveness model: Σ `fill_slots(pc).len()`.
+    /// Fill register loads by kind under the observable model: Σ `fill_slots(pc).len()`
+    /// (block-local liveness ∪ the instruction-at-`pc`'s inline write set).
     pub(crate) fill_registers_by_site: BTreeMap<FillSite, u64>,
     /// Fill register loads by kind under the previous full-cache model: Σ `slots.len()`.
     pub(crate) fill_registers_by_site_full: BTreeMap<FillSite, u64>,
-    /// Total fill register loads under the liveness model (Σ `fill_slots(pc).len()`).
+    /// Total fill register loads under the observable model (Σ `fill_slots(pc).len()`).
     pub(crate) fill_registers: u64,
     /// Total fill register loads under the previous full-cache model (Σ `slots.len()`).
     pub(crate) fill_registers_full: u64,
@@ -509,7 +511,8 @@ pub(crate) fn record_spill(site: SpillSite, n: u64) {
 ///
 /// `fill` is **partial** ([`super::emit::regs::fill`]): it reloads only the registers a
 /// helper at that `pc` can still be observed through (the continuation's block-local
-/// liveness unioned with the block's write set), so `n` is the **new** load count. The
+/// liveness unioned with the instruction at that `pc`'s own inline write set), so `n` is the
+/// **new** load count. The
 /// **old** (full-cache) count is `slots.len()`, which only the enclosing block knows — so
 /// the site is queued for [`record_block`] to attribute it, exactly as
 /// [`record_spill`] does.
@@ -685,7 +688,7 @@ mod tests {
             ..Default::default()
         };
         // Three fill sites in the block: the prologue's whole-cache load (4) and two
-        // partial post-helper refills (1 and 0 registers — the liveness model).
+        // partial post-helper refills (1 and 0 registers — the observable model).
         record_fill(FillSite::Prologue, allocation.slots.len() as u64);
         record_fill(FillSite::Helper, 1);
         record_fill(FillSite::Helper, 0);

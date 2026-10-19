@@ -573,6 +573,12 @@ pub(crate) const RUNTIME_RESUME_DISP: i32 =
 ///
 /// `func`/`pc` are the address of the instruction the helper ran; they are used only
 /// for [`Step::Next`], which advances to `pc + 1`.
+///
+/// This is the *boxed*-error form: a caller already holding a `Result` with a
+/// [`BeamError`] payload costs a heap allocation for the box on its `Err` arm and a
+/// footprint the size of [`BeamError`] (72 bytes) for the whole `Result` — which is
+/// why a helper whose success path is the rare-path-free steady state calls
+/// [`fold_ok_step`]/[`fold_err`] directly instead (see [`super::jit_family`]).
 pub(crate) fn fold_step(
     runtime: &mut JitRuntime<'_>,
     step: std::result::Result<Step, Box<BeamError>>,
@@ -580,13 +586,27 @@ pub(crate) fn fold_step(
     pc: u32,
 ) -> i64 {
     match step {
-        Ok(Step::Next) => encode_target(func, pc + 1),
-        Ok(Step::Goto { func, pc }) => encode_target(func, pc),
+        Ok(step) => fold_ok_step(runtime, step, func, pc),
+        Err(err) => fold_err(runtime, *err),
+    }
+}
+
+/// Fold a **successful** [`Step`] into the block-return word — the success half of
+/// [`fold_step`], reachable without building a `Result` over [`BeamError`].
+///
+/// A helper whose body already computes the family's own `Step` (the steady state of
+/// every family-owned instruction) matches on that body's `Result` once, at its own
+/// call site, and reaches this function with a plain [`Step`] — so no 72-byte error
+/// union is ever materialised, copied or boxed on the path that succeeds.
+pub(crate) fn fold_ok_step(runtime: &mut JitRuntime<'_>, step: Step, func: u32, pc: u32) -> i64 {
+    match step {
+        Step::Next => encode_target(func, pc + 1),
+        Step::Goto { func, pc } => encode_target(func, pc),
         // Hand the resume address to the driver (see `WAIT_BIT`): a blocking-aware
         // driver reports it as `RunOutcome::Wait`, a non-blocking one folds it into
         // the typed `blocked` error (never a wrong result and never a silent
         // continue at the `wait`'s own re-examination label).
-        Ok(Step::Wait { func, pc }) => encode_wait(func, pc),
+        Step::Wait { func, pc } => encode_wait(func, pc),
         // A module-context transfer (a `call_ext*` the host resolved through
         // `ExecutionContext::resolve_external_call`, a `return` onto a
         // caller-context continuation, or a raise landing in another context's catch
@@ -594,20 +614,27 @@ pub(crate) fn fold_step(
         // for one module, so the block cannot make the switch itself: it hands the
         // resolved target to the driver, which owns the module-context registry
         // (`Machine::switch_context`) exactly as the interpreter's driver does.
-        Ok(Step::Enter {
+        Step::Enter {
             context,
             func,
             pc,
-        }) => {
+        } => {
             runtime.enter = Some((context, func, pc));
             ENTER
         }
-        Ok(Step::Done) => HALT,
-        Err(err) => {
-            runtime.error = Some(*err);
-            ERROR
-        }
+        Step::Done => HALT,
     }
+}
+/// Fold a **propagating raise** into the block-return word: park it on the runtime for
+/// the driver, and report [`ERROR`] — the `Err` half of [`fold_step`].
+///
+/// Takes the [`BeamError`] by value, so a helper that already owns the error (the
+/// family helper's `Err` arm, after any raise-funnel decoration) hands it over with no
+/// allocation: the box exists only where a caller has already built a
+/// `Result<_, Box<BeamError>>`.
+pub(crate) fn fold_err(runtime: &mut JitRuntime<'_>, err: BeamError) -> i64 {
+    runtime.error = Some(err);
+    ERROR
 }
 
 /// The per-instruction deopt: execute exactly one instruction with the

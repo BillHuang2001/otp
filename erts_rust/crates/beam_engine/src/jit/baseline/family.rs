@@ -32,7 +32,7 @@
 #![allow(unsafe_code)]
 
 use super::jit_step_one;
-use super::runtime::{fold_step, JitRuntime};
+use super::runtime::{fold_err, fold_ok_step, JitRuntime};
 
 /// Run the family-owned instruction at `(func, pc)` natively and encode its outcome as a
 /// block-ABI word.
@@ -55,12 +55,17 @@ use super::runtime::{fold_step, JitRuntime};
 /// instruction-agnostic, because everything specific to an opcode lives in the family
 /// the dispatcher routes it to.
 pub(crate) extern "C" fn jit_family(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
-    let step = {
-        // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
-        // `JitRuntime` and never aliases it for the duration of the call; every pointer
-        // it holds points at an object the driver owns and keeps alive for the whole
-        // loop (`machine`, `module`), or at a local (`labels`) that outlives the loop.
-        let runtime = unsafe { &mut *rt };
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer
+    // it holds points at an object the driver owns and keeps alive for the whole
+    // loop (`machine`, `module`), or at a local (`labels`) that outlives the loop.
+    let runtime = unsafe { &mut *rt };
+    // The family body's outcome, kept as the family's own `Result<Step, BeamError>` —
+    // never boxed, and never converted into a `Result` over a 72-byte error union a
+    // second time: the success arm carries a plain [`Step`], so the steady state (every
+    // family-owned instruction that succeeds) pays one ordinary `Result` return from
+    // `families::dispatch` and nothing else.
+    let outcome = {
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs (the driver is
         // blocked in the block call that reached us).
@@ -100,21 +105,20 @@ pub(crate) extern "C" fn jit_family(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         // The owning family's own body (the entry the interpreter's `other` arm
         // reaches), so the mailbox seam calls, the operand reads/writes, the rooted
         // term construction and every error landing are the family's, unchanged.
-        let step =
-            crate::families::dispatch(machine, entry_module, module, labels, instr, func, pc, ctx)
-                .map_err(Box::new);
-        // The uniform raise funnel's context-`0` half, exactly as
-        // `Machine::step_instruction` runs it: in context `0` the active module IS the
-        // entry module, so a propagating raise is decorated here; a non-zero context is
-        // left to the driver, which knows the true entry module.
-        if machine.current_context() == 0 {
-            step.map_err(|err| Box::new(machine.with_uncaught_frames(*err, Some(module), func, pc)))
-        } else {
-            step
+        match crate::families::dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) {
+            Ok(step) => Ok(step),
+            // The uniform raise funnel's context-`0` half, exactly as
+            // `Machine::step_instruction` runs it: in context `0` the active module IS the
+            // entry module, so a propagating raise is decorated here; a non-zero context
+            // is left to the driver, which knows the true entry module.
+            Err(err) if machine.current_context() == 0 => {
+                Err(machine.with_uncaught_frames(err, Some(module), func, pc))
+            }
+            Err(err) => Err(err),
         }
     };
-    // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver owns;
-    // the `&mut` derived from it above is dead by now, so this borrow does not alias it.
-    let runtime = unsafe { &mut *rt };
-    fold_step(runtime, step, func, pc)
+    match outcome {
+        Ok(step) => fold_ok_step(runtime, step, func, pc),
+        Err(err) => fold_err(runtime, err),
+    }
 }

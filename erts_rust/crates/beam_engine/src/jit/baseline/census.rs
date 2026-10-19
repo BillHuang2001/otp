@@ -1079,7 +1079,8 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
 // three candidate spill models — the **dirty** set `regs::spill` emits today
 // (`Allocation::spill_slots_at(pc)`), the **written set** (`Allocation::written`) and the
 // **full cache** (`Allocation::slots`), the model the partial spill replaced — and two
-// fill models — the continuation's **liveness** (`Allocation::fill_slots`) and the
+// fill models — the continuation's **observable** set (`Allocation::fill_slots`: liveness
+// unioned with the instruction-at-`pc`'s own inline write set) and the
 // **full cache**. `counters::record_block` derives the
 // models only the enclosing block can see (see the counters module docs). This section
 // compiles the corpus the static deopt census uses and prints the traffic each model
@@ -1110,7 +1111,7 @@ struct RegCacheRow {
     spill_stores_written: u64,
     /// Spill stores under the full-cache model (Σ `slots.len()`).
     spill_stores_full: u64,
-    /// Fill loads under the liveness model (Σ `fill_slots(pc).len()`).
+    /// Fill loads under the observable model (Σ `fill_slots(pc).len()`).
     fill_registers: u64,
     /// Fill loads under the full-cache model (Σ `slots.len()`).
     fill_registers_full: u64,
@@ -1134,7 +1135,7 @@ struct RegCacheRow {
     spill_stores_by_site_full: BTreeMap<SpillSite, u64>,
     /// `fill` calls by site.
     fill_calls_by_site: BTreeMap<FillSite, u64>,
-    /// Fill loads by site under the liveness model.
+    /// Fill loads by site under the observable model.
     fill_registers_by_site: BTreeMap<FillSite, u64>,
     /// Fill loads by site under the full-cache model.
     fill_registers_by_site_full: BTreeMap<FillSite, u64>,
@@ -1278,7 +1279,7 @@ fn print_reg_cache_row(row: &RegCacheRow) {
         row.redundant_clean_stores(),
     );
     println!(
-        "  fill registers: liveness={} full-cache={}",
+        "  fill registers: observable={} full-cache={}",
         row.fill_registers, row.fill_registers_full
     );
     println!(
