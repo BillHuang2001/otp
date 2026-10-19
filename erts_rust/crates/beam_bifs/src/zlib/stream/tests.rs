@@ -27,13 +27,13 @@
 //!
 //! It is a *golden* suite, so every value the oracle produced is embedded here as a size
 //! vector, a hex image or an md5 — no test shells out to `erl`, which keeps the suite
-//! self-contained and CI-safe without an Erlang installation. The goldens are the ones
-//! `../../ZLIB_STREAM_BRIEF.md` § *Values that must hold (oracle OTP 29.1.1,
-//! live-verified)* records; each deflate-side image was re-derived independently with
-//! zlib 1.3.2 itself (`zlib.compressobj` over the same fixture, same parameters) before
-//! being pasted in, so a mismatch is a real divergence on one side or the other rather
-//! than a transcription slip. The convention — an embedded golden table plus the whole
-//! matrix around it — is the same one `beam_deflate/tests/deflate_goldens.rs` follows.
+//! self-contained and CI-safe without an Erlang installation. The goldens are the ones the
+//! oracle (OTP 29.1.1 / erts-17.1) produced, live-verified; each deflate-side image was
+//! re-derived independently with zlib 1.3.2 itself (`zlib.compressobj` over the same
+//! fixture, same parameters) before being pasted in, so a mismatch is a real divergence on
+//! one side or the other rather than a transcription slip. The convention — an embedded
+//! golden table plus the whole matrix around it — is the same one
+//! `beam_deflate/tests/deflate_goldens.rs` follows.
 //!
 //! The file is `#[cfg(test)]`-gated (declared by [`super`] as `#[cfg(test)] mod tests;`),
 //! so it cannot affect a release build.
@@ -65,8 +65,7 @@ use super::{assert_badarg, assert_raise_atom, lock_streams, State};
 // The oracle fixtures
 // ---------------------------------------------------------------------------
 
-/// The sentence every fixture is built from — the one
-/// `../../ZLIB_STREAM_BRIEF.md` names for `F1`.
+/// The sentence every fixture is built from — the source of `F1`.
 const SENTENCE: &[u8] = b"It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness, it was the epoch of belief, it was the epoch of incredulity.\n";
 
 /// `F1` — the 1024-byte pump fixture: `binary:part(binary:copy(Sentence, 6), 0, 1024)`.
@@ -616,7 +615,7 @@ fn stream_state(handle: Eterm) -> (State, bool, usize, bool, bool) {
 // ===========================================================================
 
 /// `F1` is the fixture every deflate golden is stated over, so it is pinned by md5 before
-/// anything is compressed: 1024 B of the brief's sentence.
+/// anything is compressed: 1024 B of the fixture sentence.
 #[test]
 fn the_f1_fixture_is_the_one_the_goldens_were_measured_on() {
     let fixture = f1();
@@ -625,7 +624,7 @@ fn the_f1_fixture_is_the_one_the_goldens_were_measured_on() {
     assert_eq!(
         md5(&fixture),
         "A1D3CA40959CD47D539D2A0115E99AF2",
-        "F1's md5 (the brief's fixture pin)"
+        "F1's md5 (the fixture pin the goldens are stated over)"
     );
     assert_eq!(
         payload_100k().len(),
@@ -852,7 +851,7 @@ fn safe_inflate_delivers_the_oracles_one_to_one_chunk_sequence() {
         "the payload behind the sequence"
     );
     let image = zlib_image(&payload);
-    assert_eq!(image.len(), 494, "the brief's 494-byte compressed image");
+    assert_eq!(image.len(), 494, "the oracle's 494-byte compressed image");
     assert_eq!(
         md5(&image),
         "2421EBCCB6E4D3D98AEA9DC3C3963707",
