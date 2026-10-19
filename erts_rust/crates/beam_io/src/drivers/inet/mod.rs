@@ -266,6 +266,9 @@ use crate::poller::{Interest, Token};
 mod accept;
 mod adopt_probe;
 mod frame;
+// The `{header, N}` split of one delivered payload (the C's `desc->hsz`), shared by the active
+// and the passive delivery paths. Its own module doc is `src/drivers/inet/header.rs`.
+mod header;
 mod opcode;
 mod opt;
 // The asynchronous-operation queue (`TCP_REQ_RECV`/`INET_REQ_ACCEPT` and the
@@ -2432,6 +2435,8 @@ mod close_tests;
 mod fdopen_errno_tests;
 #[cfg(test)]
 mod frame_tests;
+#[cfg(test)]
+mod header_tests;
 #[cfg(test)]
 #[path = "inherit_tests.rs"]
 mod inherit_tests;

@@ -368,11 +368,77 @@ fn a_packet_framed_delivery_strips_the_framing_header() {
     );
 }
 
-/// `{header, 2}`: the read's `header` is the `{header, N}` option (`desc->hsz`,
-/// `inet_drv.c:6931`) split off the front of the payload, and the body is the remainder
-/// (`tcp_message`, `:3979`).
+/// `{header, 2}` on a payload that is **exactly two bytes**: the C's binary branch still builds an
+/// (empty) binary tail — `LOAD_BUF2BINARY(buf+hsz, 0)` ⇒ `<<>>` (`inet_drv.c:3995`) — so the read
+/// carries a **present, empty** body and `[binary]` mode renders `[97,98|<<>>]`.
+///
+/// The `hsz == len` boundary is the one an off-by-one in the split would show up on: a
+/// `Some(vec![])` tail is not the same term as no tail at all.
 #[test]
-fn the_header_option_splits_the_payload() {
+fn a_header_as_wide_as_the_payload_leaves_an_empty_binary_tail() {
+    let Link { mut port, mut peer } = link();
+
+    assert_eq!(port.setopts(&[header(2), active_true()]), ctl_ok());
+    send(&mut peer, b"ab");
+
+    let delivered = port.until(1);
+    assert_eq!(delivered.len(), 1);
+    let read = &payloads(&delivered)[0];
+    assert_eq!(read.header, b"ab".to_vec(), "the whole payload is the header");
+    assert_eq!(read.body.as_deref(), Some(&b""[..]), "`<<>>`, not no tail");
+    assert!(read.has_body(), "the tail exists and is empty");
+}
+
+/// `{header, 10}` on a three-byte payload: `hsz > len`, so the C takes its **flat-list** branch
+/// (`(desc->mode == INET_MODE_LIST) || (hsz > len)`, `inet_drv.c:3985`) and reports the whole
+/// payload as one proper list — `[97,98,99]` in `[binary]` mode too, never `[…|<<>>]`.
+///
+/// The driver expresses that branch as `header = payload` with **no** body, which is the C's
+/// `LOAD_STRING(buf, len)` (`:3987`) as `ReadMessage` can spell it.
+#[test]
+fn a_header_wider_than_the_payload_reports_one_flat_list() {
+    let Link { mut port, mut peer } = link();
+
+    assert_eq!(port.setopts(&[header(10), active_true()]), ctl_ok());
+    send(&mut peer, b"abc");
+
+    let delivered = port.until(1);
+    assert_eq!(delivered.len(), 1);
+    let read = &payloads(&delivered)[0];
+    assert_eq!(read.header, b"abc".to_vec(), "the whole payload is the header");
+    assert_eq!(read.body, None, "no binary tail at all (the C's flat list)");
+    assert!(!read.has_body(), "never `[97,98,99|<<>>]`");
+    assert_eq!(read.flattened(), b"abc".to_vec(), "the bytes are all there");
+}
+
+/// The same `hsz > len` delivery in `[list]` mode is the **identical bytes** as in `[binary]` mode
+/// — the C's list branch does not look at `desc->mode` at all, and the driver's read must not
+/// either: `[list]` renders `[97,98,99]`, `[binary]` renders the same list because the read has no
+/// binary tail.
+#[test]
+fn a_header_wider_than_the_payload_is_the_same_bytes_in_both_modes() {
+    fn delivered_under(mode_option: Vec<u8>) -> ReadMessage {
+        let Link { mut port, mut peer } = link();
+        assert_eq!(
+            port.setopts(&[header(10), mode_option, active_true()]),
+            ctl_ok()
+        );
+        send(&mut peer, b"abc");
+        let delivered = port.until(1);
+        assert_eq!(delivered.len(), 1);
+        payloads(&delivered).remove(0)
+    }
+
+    let binary = delivered_under(mode(MODE_BINARY));
+    let list = delivered_under(mode(0));
+    assert_eq!(binary, list, "the flat-list branch never depends on the mode");
+    assert_eq!(binary, ReadMessage { header: b"abc".to_vec(), body: None });
+}
+
+/// `{header, 2}` on a six-byte payload — the `hsz < len` row of the same table, `[H1,H2|<<"cdef">>]`
+/// (`LOAD_BUF2BINARY(buf+hsz, len-hsz)` + `LOAD_STRING_CONS`, `inet_drv.c:3994`-`:3996`).
+#[test]
+fn a_narrow_header_is_consed_onto_the_binary_tail() {
     let Link { mut port, mut peer } = link();
 
     assert_eq!(port.setopts(&[header(2), active_true()]), ctl_ok());
@@ -381,10 +447,26 @@ fn the_header_option_splits_the_payload() {
     let delivered = port.until(1);
     assert_eq!(delivered.len(), 1);
     let read = &payloads(&delivered)[0];
-    assert_eq!(read.header, b"ab".to_vec(), "the first hsz bytes");
-    assert_eq!(read.body.as_deref(), Some(&b"cdef"[..]), "the remainder");
+    assert_eq!(read.header, b"ab".to_vec());
+    assert_eq!(read.body.as_deref(), Some(&b"cdef"[..]), "an improper tail");
 }
 
+/// A **negative** `{header, N}` is the C's huge `unsigned int` (`desc->hsz = ival`, `:6931`), so
+/// every payload takes the flat-list branch — measured against the oracle by
+/// [`the_oracle_reports_a_header_wider_than_the_payload_as_one_flat_list`].
+#[test]
+fn a_negative_header_takes_the_flat_list_branch() {
+    let Link { mut port, mut peer } = link();
+
+    assert_eq!(port.setopts(&[header(-1), active_true()]), ctl_ok());
+    send(&mut peer, b"abc");
+
+    let delivered = port.until(1);
+    assert_eq!(delivered.len(), 1);
+    let read = &payloads(&delivered)[0];
+    assert_eq!(read.header, b"abc".to_vec(), "the unsigned hsz is wider than the payload");
+    assert_eq!(read.body, None, "the whole payload as one flat list");
+}
 /// `{active, once}`: exactly one delivery, then the socket is passive **silently** — no
 /// `{tcp_passive, S}` ever (the C's `INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:1552`).
 #[test]
@@ -787,6 +869,56 @@ fn the_oracle_reports_the_header_split_in_both_modes() {
         out.trim(),
         "B=[97,98|<<\"cdef\">>]|L=\"abcdef\"",
         "the oracle's `{{header,2}}` split, in both modes"
+    );
+}
+
+/// `{header, 10}` on a three-byte write — `hsz > len` — is the oracle's **flat list** in both
+/// modes: `[97,98,99]` in `[binary]` too, because the C's `tcp_message` takes its list branch
+/// (`(desc->mode == INET_MODE_LIST) || (hsz > len)`, `inet_drv.c:3985`) and never builds a binary
+/// tail. The Rust side hands that up as `header = payload`, `body = None`
+/// ([`a_header_wider_than_the_payload_reports_one_flat_list`]).
+#[test]
+fn the_oracle_reports_a_header_wider_than_the_payload_as_one_flat_list() {
+    let expr = concat!(
+        "{ok,L} = gen_tcp:listen(0,[binary,{active,false},{reuseaddr,true},{ip,{127,0,0,1}}]), ",
+        "{ok,P} = inet:port(L), ",
+        "{ok,C} = gen_tcp:connect({127,0,0,1},P,[binary,{active,false},{nodelay,true}]), ",
+        "{ok,S} = gen_tcp:accept(L), ",
+        "ok = inet:setopts(S,[{packet,raw},{header,10},{mode,binary},{active,true}]), ",
+        "ok = gen_tcp:send(C,\"abc\"), ",
+        "{tcp,_,D1} = receive M1 -> M1 after 2000 -> timeout end, ",
+        "ok = inet:setopts(S,[{mode,list}]), ",
+        "ok = gen_tcp:send(C,\"xyz\"), ",
+        "{tcp,_,D2} = receive M2 -> M2 after 2000 -> timeout end, ",
+        "io:format(\"B=~w|L=~w~n\",[D1,D2])"
+    );
+    let Some(out) = erl_stdout(expr) else { return };
+    assert_eq!(
+        out.trim(),
+        "B=[97,98,99]|L=[120,121,122]",
+        "`{{header,10}}` over a three-byte payload is the oracle's flat int list in both modes"
+    );
+}
+
+/// `{header, 2}` on a **two-byte** write — `hsz == len` — is the oracle's `[97,98|<<>>]`: the
+/// binary branch runs with an empty tail, which is the row that tells an empty tail from no tail.
+#[test]
+fn the_oracle_leaves_an_empty_binary_tail_when_the_header_is_as_wide_as_the_payload() {
+    let expr = concat!(
+        "{ok,L} = gen_tcp:listen(0,[binary,{active,false},{reuseaddr,true},{ip,{127,0,0,1}}]), ",
+        "{ok,P} = inet:port(L), ",
+        "{ok,C} = gen_tcp:connect({127,0,0,1},P,[binary,{active,false},{nodelay,true}]), ",
+        "{ok,S} = gen_tcp:accept(L), ",
+        "ok = inet:setopts(S,[{packet,raw},{header,2},{mode,binary},{active,true}]), ",
+        "ok = gen_tcp:send(C,\"ab\"), ",
+        "{tcp,_,D} = receive M -> M after 2000 -> timeout end, ",
+        "io:format(\"D=~w~n\",[D])"
+    );
+    let Some(out) = erl_stdout(expr) else { return };
+    assert_eq!(
+        out.trim(),
+        "D=[97,98|<<>>]",
+        "`{{header,2}}` over a two-byte payload leaves an empty binary tail"
     );
 }
 
