@@ -552,14 +552,15 @@ in-process compiler route.
 
 ## Known Structural Debt (candidates for the next pass)
 - **A.4 port/driver residuals, each a typed error rather than a wrong result.**
-  (a) A `driver_output2`/`driver_output_binary` **DATA** reply's improper list (`[hdr|<<body>>]`) cannot
-  be rendered because `beam_io`'s stream layer flattens the header/body split producer-side
-  (`DriverContext::input()` is a flat `ByteQueue`; `PortNotification::Data` carries one `Vec<u8>`); the
-  seam needed is `(hbuf, hlen, buf, len)` on that notification, after which `beam_rt` routes it into its
-  existing `StreamShape` builder. Bytes and both counters already agree.
-  (b) The `PACKET_REQ_RECV`/`TCP_REQ_RECV`/`ACCEPT` **async-op queue** (`INET_MAX_ASYNC`,
-  `{inet_async, Port, Ref, Result}` delivery) needs a driver→owner message channel the frozen `Driver`
-  trait lacks, so `recv` is a synchronous read-now substitution.
+  (a) A **header-less** read of a built-in driver port — `tcp_inet`'s and `udp_inet`'s passive `recv`,
+  still on `beam_io`'s flat `DriverContext::input()` sink — arrives as list elements where the C answers
+  a binary on a `[binary]` port; every read that carries the C's `(hbuf, hlen, buf, len)` split does
+  render it (`PortNotification::Data` carries `ReadMessage { header, body: Option<Vec<u8>> }`, one
+  notification = one `driver_output*` call, so `[hdr|<<body>>]` reaches a `[binary]` owner and flat bytes
+  a `[list]` one). A line frame's derived header prefix also stays out of the input counters
+  (`io.c:6403`).
+  (b) A **raw-mode read of nothing** (`driver_output(NULL,0)`) is dropped where the oracle delivers
+  `{Port,{data,[]}}` — a proper empty list even on a `[binary]` port.
   (c) `INET_REQ_FDOPEN`'s adoption form (the C's `prebound` descriptor is never closed, while this
   floor's `stop`/`Drop` closes everything it owns), `ignorefd` (needs readiness suppression) and
   `tcp_sendfile` reproduce their refusals only.
