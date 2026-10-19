@@ -1002,6 +1002,8 @@ pub fn resource_type_has_down(obj: *mut c_void) -> Option<bool> {
 /// monitor references use, so the term prints as the oracle's `#Ref<0.…>`.
 const RESOURCE_REF_PAYLOAD_WORDS: usize = 3;
 
+/// The whole internal-reference block: the header word plus [`RESOURCE_REF_PAYLOAD_WORDS`].
+const RESOURCE_REF_WORDS: usize = RESOURCE_REF_PAYLOAD_WORDS + 1;
 /// The next resource-reference id.
 ///
 /// A process-wide monotonic counter, exactly like the C's reference id space: two
@@ -1018,22 +1020,36 @@ fn next_resource_ref_id() -> i64 {
 /// `serial` zero (Milestone 1 has one node and one id space) and a fresh monotonic `id`. Returns
 /// `None` only when the host heap cannot fit the four words.
 fn mint_resource_ref(e: &mut NifEnv) -> Option<Eterm> {
-    // SAFETY: `alloc` hands out exactly `RESOURCE_REF_PAYLOAD_WORDS + 1` exclusively-owned,
-    // writable words from the host heap; every one is written below, before the pointer escapes.
-    let p = unsafe { alloc(e, RESOURCE_REF_PAYLOAD_WORDS + 1) }?;
-    // SAFETY: `p` addresses the four words just handed out (see above).
-    unsafe {
-        *p = prelude::make_header(
-            RESOURCE_REF_PAYLOAD_WORDS,
-            beam_term::REF_SUBTAG,
-        );
-        *p.add(1) = prelude::make_small(0); // node: the local node
-        *p.add(2) = prelude::make_small(0); // serial: one id space in M1
-        *p.add(3) = prelude::make_small(next_resource_ref_id());
-    }
-    Some(prelude::make_boxed(p as *const Eterm))
+    // SAFETY: `alloc` hands out exactly `RESOURCE_REF_WORDS` exclusively-owned, writable words from
+    // the host heap; `write_resource_ref` writes every one of them before the pointer escapes.
+    let p = unsafe { alloc(e, RESOURCE_REF_WORDS) }?;
+    // SAFETY: `p` addresses the `RESOURCE_REF_WORDS` words just handed out.
+    Some(unsafe { write_resource_ref(p) })
 }
 
+/// Write the canonical internal-reference block for a resource term at `hp` and return the boxed
+/// term that designates it — the C's magic reference (`erts_mk_magic_ref`, the shape reproduced
+/// here after the M1 substitution documented in the module header).
+///
+/// This is the **one** writer of that block: [`mint_resource_ref`] (the `enif_make_resource` route)
+/// passes words it obtained from a live env's host heap, and
+/// [`resource_term`](super::resource_term) passes words from the host it is handed.
+///
+/// # Safety
+///
+/// `hp` must point at [`RESOURCE_REF_WORDS`] **writable**, exclusively-owned words that stay valid
+/// (and reachable from the caller's heap) for as long as the returned term is.
+unsafe fn write_resource_ref(hp: *mut Eterm) -> Eterm {
+    // SAFETY: the caller guarantees `RESOURCE_REF_WORDS` writable words at `hp`; every word of the
+    // block is written below, before the pointer escapes.
+    unsafe {
+        *hp = prelude::make_header(RESOURCE_REF_PAYLOAD_WORDS, beam_term::REF_SUBTAG);
+        *hp.add(1) = prelude::make_small(0); // node: the local node
+        *hp.add(2) = prelude::make_small(0); // serial: one id space in M1
+        *hp.add(3) = prelude::make_small(next_resource_ref_id());
+    }
+    prelude::make_boxed(hp as *const Eterm)
+}
 /// Drop the reference an **evicted** (provably dead) binding held — outside the registry lock, so the
 /// destructor it may run can call straight back into these entry points.
 ///
@@ -1309,6 +1325,18 @@ pub use self::monitors::{
 // The two crate-internal hooks `super::process` drives the arm/demonitor entry points through.
 pub(super) use self::monitors::{record_monitor, take_monitor};
 
+// ---------------------------------------------------------------------------------------------
+// The term-minting seam — a resource term for a bare `void*` handle
+// ---------------------------------------------------------------------------------------------
+
+// The C's `prepare_select_msg` (`erl_check_io.c:699-767`) names a selected object by a **resource
+// term**, which only this crate can mint; the helper lives in its own file (this one is at the
+// ~1000-line target) and is re-exported here, so `nif::enif::resources::resource_term` is the public
+// path.
+#[path = "resources_term.rs"]
+mod term;
+
+pub use self::term::resource_term;
 #[cfg(test)]
 #[path = "resources_tests.rs"]
 mod tests;
