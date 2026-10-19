@@ -224,6 +224,21 @@ between sessions and up to 5× on a loaded one).
   **OWNER: `beam_rt`** (markers are served; the timer is not).
 - **`exceptions/stacktrace.rs` supplied-frame atom source** — `encode_supplied_stacktrace` requires a `Module`
   carrying the ONE shared atom table; a name it cannot resolve is the typed `unsupported`. **OWNER: `beam_rt`** (its `-eval` route).
+- **`bs_match`'s command-list generator expansion belongs in `crates/beam_loader`.** C never interprets a
+  flattened command list at run time: `emu/ops.tab:1102` + `emu/generators.tab:1096-1112` make the
+  loader/assembler generator explode `bs_match` at load time into `i_bs_ensure_bits`/`_unit`/`i_bs_read_bits`/
+  `i_bs_eq`/`i_bs_extract_integer`/`i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_get_tail`/`i_bs_skip`/
+  `i_bs_drop`, including the fused `i_bs_read_bits Ctx=x u==8 | i_bs_extract_integer u==8 Dst=x =>
+  i_bs_read_integer_8`. Our loader preserves the raw list, so `run_commands` re-derives a load-time fact on
+  every execution (a comprehension enters it once per byte, two commands each). An in-family re-discovery of
+  the shapes was measured a **regression** (1.027× on `to_lower`), so the loader is the only route left.
+  **OWNER: `crates/beam_loader`** (and `crates/beam_engine/src/lib.rs` for the `Instr` variants).
+- **`src/lib.rs` declares `families` as a private module**, so every `pub(crate)` entry point inside this node
+  (the match/dispatch/segment seams listed in `bitstrings/CONTEXT.md`) is unreachable from `src/jit/**`; a tier
+  that wants a per-command entry needs `pub(crate) mod families` or targeted root re-exports. **OWNER: the
+  parent `src/` node.**
+- **`src/exec_census.rs` measured 2.20 % of `to_lower`'s self time while disabled** — the thread-local `bool`
+  load sits on the per-instruction funnel. **OWNER: the parent `src/` node.**
 
 ## Notes for Agents
 - The router (`mod.rs:112`) and `lists::exec` are `#[inline]`, so a dispatched instruction hands straight to its owning family.
