@@ -393,6 +393,12 @@ the block for the driver.
 `CALL_STORED` is consumed **inside** the block (the arm compares `rax` against it and branches to `done`
 on a mismatch); it is disjoint from `HALT`/`ERROR`/`ENTER`/`LOCAL_DECLINE`/`WAIT_BIT` and never reaches
 the driver's decoder.
+The arm resolves the callee **at compile time** and hands the helper the answer: `block.rs` turns the
+target label into its `(function index, block pc, arity)` through the same map the `Linker` uses for the
+branch, so `jit_call_store` receives a `CallSite` and never re-derives the callee's identity from the
+instruction word. Emitter and helper are pinned to each other by a `debug_assert!` on that agreement,
+which is the invariant to preserve if either side's operand handling changes: a mismatched pair would
+store a return address into the wrong function's frame and only show up as a corrupted continuation.
 
 ## Constraints
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder, and the
