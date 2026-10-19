@@ -739,3 +739,9 @@ pub(super) mod oracle;
 #[cfg(test)]
 #[path = "accept_opts_tests.rs"]
 mod accept_opts_tests;
+/// The **whole** `prim_inet:accept_opts/3` list — the eleven codes, including
+/// `inet_tcp:accept_family_opts/0`'s `[tos, ttl, recvtos, recvttl]` — on a real loopback listener
+/// and a really accepted socket, byte-compared against the system driver in every port state.
+#[cfg(test)]
+#[path = "accept_opts_family_tests.rs"]
+mod accept_opts_family_tests;
