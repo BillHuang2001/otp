@@ -32,9 +32,14 @@
 mod zsupport;
 
 use beam_deflate::{Deflate, DeflateConfig, Strategy};
-use zsupport::{corpus_small, hex, oracle_batch, oracle_inflate, Case};
+use zsupport::{corpus_small, hex, oracle_batch, oracle_inflate_wbits, Case};
 
 /// Compare one matrix in a single `erl` boot; `label` names the sweep in a failure.
+///
+/// Both sides must *accept* the same tuples and then agree byte for byte: a case the
+/// oracle refuses (`windowBits` `16 + 8`, whose `deflateInit2` test runs after the 8 → 9
+/// window bump) has to be refused here too, so an asymmetric acceptance is a failure and
+/// not a skipped case.
 fn check_matrix(label: &str, cases: &[Case]) {
     if !zsupport::have_oracle() {
         println!("SKIP {label}: erl not found");
@@ -48,11 +53,8 @@ fn check_matrix(label: &str, cases: &[Case]) {
         }
     };
     let mut failures = Vec::new();
+    let mut rejected = 0usize;
     for (case, want) in cases.iter().zip(oracle.iter()) {
-        let want = match want {
-            Ok(w) => w,
-            Err(_) => continue,
-        };
         let config = DeflateConfig::new(
             case.level,
             beam_deflate::Method::Deflated,
@@ -60,8 +62,19 @@ fn check_matrix(label: &str, cases: &[Case]) {
             case.mem_level,
             strategy_of(case.strategy),
         );
-        match Deflate::compress_with(config, &case.data) {
-            Ok(got) => {
+        let got = Deflate::compress_with(config, &case.data);
+        match (want, got) {
+            (Err(_), Err(_)) => rejected += 1,
+            (Err(why), Ok(_)) => failures.push(format!(
+                "level {} windowBits {} memLevel {} strategy {} input {} bytes: the oracle \
+                 refuses it ({why}) but this port accepted it",
+                case.level,
+                case.window_bits,
+                case.mem_level,
+                case.strategy,
+                case.data.len()
+            )),
+            (Ok(want), Ok(got)) => {
                 if &got != want {
                     failures.push(format!(
                         "level {} windowBits {} memLevel {} strategy {} input {} bytes\n  want {}\n  got  {}",
@@ -75,8 +88,9 @@ fn check_matrix(label: &str, cases: &[Case]) {
                     ));
                 }
             }
-            Err(e) => failures.push(format!(
-                "level {} windowBits {} memLevel {} strategy {} input {} bytes: {e:?}",
+            (Ok(_), Err(e)) => failures.push(format!(
+                "level {} windowBits {} memLevel {} strategy {} input {} bytes: the oracle \
+                 accepts it but this port rejected it ({e:?})",
                 case.level,
                 case.window_bits,
                 case.mem_level,
@@ -92,7 +106,11 @@ fn check_matrix(label: &str, cases: &[Case]) {
         cases.len(),
         failures.join("\n")
     );
-    println!("{label}: {} cases agree with the oracle", cases.len());
+    println!(
+        "{label}: {} cases agree with the oracle ({rejected} of them by refusing the same \
+         parameter tuple)",
+        cases.len()
+    );
 }
 
 /// `Z_DEFAULT_STRATEGY` … `Z_RLE`, the four the `zlib` module can name.
@@ -307,8 +325,9 @@ fn a_large_input_round_trips_through_the_oracle() {
         ] {
             let stream = Deflate::compress_with(config, &data)
                 .unwrap_or_else(|e| panic!("level {level} {config:?}: {e:?}"));
-            let back = oracle_inflate(&stream)
-                .unwrap_or_else(|| panic!("level {level} {config:?}: the oracle could not inflate"));
+            let back = oracle_inflate_wbits(&stream, config.window_bits).unwrap_or_else(|| {
+                panic!("level {level} {config:?}: the oracle could not inflate")
+            });
             assert_eq!(
                 back,
                 data,
@@ -322,14 +341,11 @@ fn a_large_input_round_trips_through_the_oracle() {
 
 /// The 70 000-byte input: `mixed_kib` repeated with 37 zero bytes between the copies, so
 /// the window has to slide and matches can span a copy boundary.
+///
+/// Shared with the golden fingerprints in `tests/deflate_goldens.rs` through
+/// [`zsupport::large_input`], so both files are pinned to the same bytes.
 fn large_input() -> Vec<u8> {
-    let mut data = Vec::new();
-    while data.len() < 70_000 {
-        data.extend_from_slice(&zsupport::mixed_kib());
-        data.extend_from_slice(&[0u8; 37]);
-    }
-    data.truncate(70_000);
-    data
+    zsupport::large_input(70_000)
 }
 
 /// `Z_FIXED` is not reachable through the `zlib` module, so it is verified the other way
@@ -353,7 +369,7 @@ fn the_fixed_strategy_round_trips_through_the_oracle() {
                 Strategy::Fixed,
             );
             let stream = Deflate::compress_with(config, &data).expect("compress");
-            let back = oracle_inflate(&stream).expect("oracle inflate");
+            let back = oracle_inflate_wbits(&stream, config.window_bits).expect("oracle inflate");
             assert_eq!(back, data, "level {level} input {name}");
         }
     }

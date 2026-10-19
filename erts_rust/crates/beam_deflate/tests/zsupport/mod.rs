@@ -134,19 +134,31 @@ fn have_oracle_locked() -> bool {
 }
 
 /// The `-eval` script the batch oracle runs: one line per case on stdin (a file named by
-/// `$BD_SPEC`), one line of hex per case on stdout.
+/// `$BD_SPEC`), one line per case on stdout.
+///
+/// Each case is answered either `=<hex>` (the stream) or `ERR` (the oracle rejected the
+/// parameter tuple). The per-case `try` matters: a case the oracle refuses (`windowBits`
+/// `16 + 8` gets past `arg_bitsz/1` but then fails `deflateInit2`'s own `windowBits == 8 &&
+/// wrap != 1` test) used to abort the whole script, which made every matrix containing such
+/// a case silently report "the oracle batch failed to run" instead of checking anything. An
+/// empty stream is `=` (not an empty line), so a case can never be lost to whitespace
+/// filtering. Level `-1` is `zlib`'s `default` atom: `arg_level/1` accepts integers `0..=9`
+/// only.
 const BATCH_SCRIPT: &str = concat!(
     "{ok,B}=file:read_file(os:getenv(\"BD_SPEC\")),",
     "Ls=[L||L<-binary:split(B,<<\"\\n\">>,[global]),L=/=<<>>],",
     "St=fun(S)->element(S+1,{default,filtered,huffman_only,rle}) end,",
     "[begin ",
+    "try ",
     "[Lv,Wv,Mv,Sv,H]=binary:split(L,<<\",\">>,[global]),",
+    "Level=case binary_to_integer(Lv) of -1 -> default; N -> N end,",
     "Z=zlib:open(),",
-    "ok=zlib:deflateInit(Z,binary_to_integer(Lv),deflated,binary_to_integer(Wv),",
+    "ok=zlib:deflateInit(Z,Level,deflated,binary_to_integer(Wv),",
     "binary_to_integer(Mv),St(binary_to_integer(Sv))),",
     "O=iolist_to_binary(zlib:deflate(Z,binary:decode_hex(H),finish)),",
     "ok=zlib:deflateEnd(Z),zlib:close(Z),",
-    "io:format(\"~s~n\",[binary:encode_hex(O)]) ",
+    "io:format(\"=~s~n\",[binary:encode_hex(O)]) ",
+    "catch _:_ -> io:format(\"ERR~n\") end ",
     "end||L<-Ls],",
     "halt()."
 );
@@ -171,8 +183,8 @@ fn scratch_dir(tag: &str) -> std::path::PathBuf {
 /// Run a whole matrix through the oracle in **one** `erl` boot.
 ///
 /// `None` means "no oracle available" (the caller should print a SKIP line); `Some` holds
-/// one compressed stream per case, in order. A case the oracle rejects is reported as the
-/// (empty) `Err` variant so a caller can assert symmetric rejection.
+/// one answer per case, in order, where [`Err`] is a parameter tuple the oracle itself
+/// refuses (`zlib:deflateInit` raised) so a caller can assert symmetric rejection.
 pub fn oracle_batch(cases: &[Case]) -> Option<Vec<Result<Vec<u8>, String>>> {
     let _guard = oracle_lock();
     if !have_oracle_locked() {
@@ -202,9 +214,7 @@ pub fn oracle_batch(cases: &[Case]) -> Option<Vec<Result<Vec<u8>, String>>> {
         .ok()?;
     std::fs::remove_dir_all(&dir).ok();
 
-    // A case the oracle rejected aborts the whole script, so a non-empty exit means the
-    // batch is unusable; callers that want rejection symmetry spell those cases out
-    // individually.
+    // One answer line per case; a rejected case is `ERR`, an accepted one is `=<hex>`.
     if !out.status.success() {
         return None;
     }
@@ -216,8 +226,11 @@ pub fn oracle_batch(cases: &[Case]) -> Option<Vec<Result<Vec<u8>, String>>> {
     Some(
         lines
             .iter()
-            .map(|l| Ok(unhex(l)))
-            .collect::<Vec<Result<Vec<u8>, String>>>(),
+            .map(|l| match l.strip_prefix('=') {
+                Some(hex_body) => Ok(unhex(hex_body)),
+                None => Err((*l).to_string()),
+            })
+            .collect(),
     )
 }
 
@@ -238,13 +251,26 @@ pub fn erl_eval(script: &str) -> Option<String> {
     String::from_utf8(out.stdout).ok()
 }
 
-/// `zlib:uncompress/1` in the oracle: the inverse check for a stream the oracle itself
-/// cannot produce (the `Z_FIXED` strategy).
+/// `zlib:uncompress/1` in the oracle — the zlib-framing convenience form of
+/// [`oracle_inflate_wbits`].
+pub fn oracle_inflate(stream: &[u8]) -> Option<Vec<u8>> {
+    oracle_inflate_wbits(stream, 15)
+}
+
+/// `zlib:inflateInit(Z, WindowBits)` + `zlib:inflate/2` in the oracle: inflate `stream`
+/// under the framing its `windowBits` selects.
+///
+/// The window bits are not optional: `zlib:inflateInit/1` is `inflateInit(Z, 15)`, so a raw
+/// (`-15`) or gzip (`16 + 15`) stream cannot be inflated by it at all. A caller that built
+/// the stream from a `DeflateConfig` must pass `config.window_bits` here.
+///
+/// Also the inverse check for a stream the oracle itself cannot produce (the `Z_FIXED`
+/// strategy).
 ///
 /// The stream is handed over through a file, not through `argv`: a 70 000-byte input
 /// hex-encodes to 140 000 characters, past the kernel's `E2BIG` limit for a single
 /// argument.
-pub fn oracle_inflate(stream: &[u8]) -> Option<Vec<u8>> {
+pub fn oracle_inflate_wbits(stream: &[u8], window_bits: i8) -> Option<Vec<u8>> {
     let _guard = oracle_lock();
     let dir = scratch_dir("inflate");
     let path = dir.join("stream.hex");
@@ -252,7 +278,7 @@ pub fn oracle_inflate(stream: &[u8]) -> Option<Vec<u8>> {
     let script = concat!(
         "{ok,B}=file:read_file(os:getenv(\"BD_HEX\")),",
         "Z=zlib:open(),",
-        "ok=zlib:inflateInit(Z),",
+        "ok=zlib:inflateInit(Z,list_to_integer(os:getenv(\"BD_WBITS\"))),",
         // `zlib:inflate/3` dequeues until its input is exhausted and returns a plain
         // iolist (the `{continue,_}`/`{finished,_}` tuples come from `safeInflate/2`),
         // so a single call is enough.
@@ -264,6 +290,7 @@ pub fn oracle_inflate(stream: &[u8]) -> Option<Vec<u8>> {
     let out = Command::new(erl_program())
         .args(["-noshell", "-eval", script])
         .env("BD_HEX", &path)
+        .env("BD_WBITS", window_bits.to_string())
         .output()
         .ok()?;
     std::fs::remove_dir_all(&dir).ok();
@@ -271,6 +298,160 @@ pub fn oracle_inflate(stream: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     String::from_utf8(out.stdout).ok().map(|s| unhex(&s))
+}
+
+/// The mid-stream flush mode of [`oracle_deflate_split`] — the two the `zlib` module can
+/// name (`arg_flush/1` has no `partial` or `block` clause).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MidFlush {
+    /// `zlib:deflate(Z, Part1, sync)` — `Z_SYNC_FLUSH`.
+    Sync,
+    /// `zlib:deflate(Z, Part1, full)` — `Z_FULL_FLUSH`.
+    Full,
+}
+
+impl MidFlush {
+    fn name(self) -> &'static str {
+        match self {
+            MidFlush::Sync => "sync",
+            MidFlush::Full => "full",
+        }
+    }
+}
+
+/// The oracle's **split-flush** image: `deflateInit`, `deflate(Z, first, mid)`,
+/// `deflate(Z, second, finish)`, concatenated.
+///
+/// This is the golden a mid-stream `Sync`/`Full` flush is checked against. Both pieces are
+/// handed over in files (see [`oracle_inflate_wbits`] for why).
+pub fn oracle_deflate_split(
+    level: i8,
+    window_bits: i8,
+    first: &[u8],
+    second: &[u8],
+    mid: MidFlush,
+) -> Option<Vec<u8>> {
+    oracle_two_piece(
+        level,
+        window_bits,
+        first,
+        second,
+        Some(("deflate", mid.name())),
+        None,
+    )
+}
+
+/// The oracle's **`deflateParams`** image: `deflateInit(Z, init_level)`,
+/// `deflate(Z, first, sync)`, `deflateParams(Z, new_level, new_strategy)`,
+/// `deflate(Z, rest, finish)`, concatenated.
+///
+/// `zlib:deflateParams/3` itself performs the `deflate(Z, <<>>, sync)` that puts the stream
+/// on a byte boundary with nothing pending (the NIF refuses anything else — see
+/// `zlib_nif.c:zlib_deflateParams`), and stashes its output for the next `deflate` call, so
+/// the bytes between `first` and `rest` are part of the stream. `new_strategy` is the
+/// `zlib` module's strategy index (0 `default` … 3 `rle`).
+pub fn oracle_deflate_params(
+    init_level: i8,
+    first: &[u8],
+    new_level: i8,
+    new_strategy: u8,
+    rest: &[u8],
+) -> Option<Vec<u8>> {
+    oracle_two_piece(
+        init_level,
+        15,
+        first,
+        rest,
+        Some(("deflate", "sync")),
+        Some((new_level, new_strategy)),
+    )
+}
+
+/// The shared body of the two split-stream oracle calls: build the script from two input
+/// files plus the optional mid-flush and `deflateParams` steps, then read the hex back.
+fn oracle_two_piece(
+    level: i8,
+    window_bits: i8,
+    first: &[u8],
+    second: &[u8],
+    mid: Option<(&str, &str)>,
+    params: Option<(i8, u8)>,
+) -> Option<Vec<u8>> {
+    let _guard = oracle_lock();
+    if !have_oracle_locked() {
+        return None;
+    }
+    let dir = scratch_dir("split");
+    let first_path = dir.join("first.bin");
+    let second_path = dir.join("second.bin");
+    std::fs::write(&first_path, first).ok()?;
+    std::fs::write(&second_path, second).ok()?;
+    let mid_step = match mid {
+        Some((function, flush)) => format!(
+            "O1=iolist_to_binary(zlib:{function}(Z,A,{flush})),"
+        ),
+        None => "O1=iolist_to_binary(zlib:deflate(Z,A,none)),".to_string(),
+    };
+    let param_step = match params {
+        Some((new_level, new_strategy)) => format!(
+            "ok=zlib:deflateParams(Z,{new_level},{}),",
+            strategy_atom(new_strategy)
+        ),
+        None => String::new(),
+    };
+    let script = format!(
+        concat!(
+            "{{ok,A}}=file:read_file(os:getenv(\"BD_A\")),",
+            "{{ok,B}}=file:read_file(os:getenv(\"BD_B\")),",
+            "Z=zlib:open(),",
+            "ok=zlib:deflateInit(Z,list_to_integer(os:getenv(\"BD_LEVEL\")),deflated,",
+            "list_to_integer(os:getenv(\"BD_WBITS\")),8,default),",
+            "{mid}",
+            "{params}",
+            "O2=iolist_to_binary(zlib:deflate(Z,B,finish)),",
+            "ok=zlib:deflateEnd(Z),zlib:close(Z),",
+            "io:format(\"~s\",[binary:encode_hex(<<O1/binary,O2/binary>>)]),",
+            "halt()."
+        ),
+        mid = mid_step,
+        params = param_step
+    );
+    let out = Command::new(erl_program())
+        .args(["-noshell", "-eval", &script])
+        .env("BD_A", &first_path)
+        .env("BD_B", &second_path)
+        .env("BD_LEVEL", level.to_string())
+        .env("BD_WBITS", window_bits.to_string())
+        .output()
+        .ok()?;
+    std::fs::remove_dir_all(&dir).ok();
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok().map(|s| unhex(&s))
+}
+
+/// `arg_strategy/1`'s atom for a strategy index (`zlib.erl:889`).
+fn strategy_atom(strategy: u8) -> &'static str {
+    match strategy {
+        0 => "default",
+        1 => "filtered",
+        2 => "huffman_only",
+        3 => "rle",
+        _ => "default",
+    }
+}
+
+/// The 70 000-byte large input: [`mixed_kib`] repeated with 37 zero bytes between the
+/// copies, so the window (32 KiB) has to slide and matches can span a copy boundary.
+pub fn large_input(n: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    while data.len() < n {
+        data.extend_from_slice(&mixed_kib());
+        data.extend_from_slice(&[0u8; 37]);
+    }
+    data.truncate(n);
+    data
 }
 
 /// The inputs the golden matrix uses. Small enough to inline the expected bytes, varied

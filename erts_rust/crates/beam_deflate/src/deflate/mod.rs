@@ -435,6 +435,15 @@ impl Deflate {
     /// bigger buffer (the level/strategy change has *not* been applied yet).
     /// Switching away from level 0 replays the hash-table slides `deflate_stored`
     /// deferred (`matches`), clearing instead when two or more are owed.
+    ///
+    /// [`Pump::status`] is `deflateParams`'s own return code, which is **not** the inner
+    /// `deflate(Z_BLOCK)`'s: `deflate.c:deflateParams` keeps that call's value in a local
+    /// `err` used only to propagate `Z_STREAM_ERROR` (`if (err == Z_STREAM_ERROR) return
+    /// err;`) and returns `Z_OK` otherwise. The inner call does normally report
+    /// `Z_BUF_ERROR` here — with nothing pending, `deflate()` refuses a `Z_BLOCK` flush
+    /// whose rank is below the previous `Z_SYNC_FLUSH`'s — so reporting it would make a
+    /// faithful `zlib:deflateParams/3` raise `buf_error` on the ordinary "sync, then
+    /// change level" sequence.
     pub fn set_params(
         &mut self,
         level: i8,
@@ -453,22 +462,38 @@ impl Deflate {
         let func = state::CONFIGURATION_TABLE[s.level as usize].func;
         let mut consumed = 0;
         let mut produced = 0;
-        let mut status = Status::Ok;
         if (strategy_i != s.strategy
             || func != state::CONFIGURATION_TABLE[level_i as usize].func)
             && s.last_flush != -2
         {
             // Flush the last buffer.
             let mut io = Io::new(&[], output);
-            status = s.deflate_step(&mut io, Flush::Block);
+            let inner = s.deflate_step(&mut io, Flush::Block);
             consumed = io.in_pos;
             produced = io.out_pos;
-            if status == Status::StreamError {
-                return Ok(Pump {
-                    status,
-                    consumed,
-                    produced,
-                });
+            match inner {
+                // `if (err == Z_STREAM_ERROR) return err;` — the one inner value the C
+                // propagates.
+                Status::StreamError => {
+                    return Ok(Pump {
+                        status: Status::StreamError,
+                        consumed,
+                        produced,
+                    })
+                }
+                // The inner call's ordinary "nothing more to do" answer, which the C
+                // discards (see the note above). `deflate_step` reports it when the block
+                // was already closed, so it says nothing about `deflateParams`'s outcome.
+                Status::Ok | Status::BufError => {}
+                // Anything else is a stream-level failure the C would also discard, but
+                // this port never swallows one: report it instead of claiming success.
+                other => {
+                    return Ok(Pump {
+                        status: other,
+                        consumed,
+                        produced,
+                    })
+                }
             }
             if io.avail_in() != 0
                 || (i64::from(s.strstart) - s.block_start) + i64::from(s.lookahead) != 0
@@ -496,8 +521,9 @@ impl Deflate {
             s.max_chain_length = state::CONFIGURATION_TABLE[level_i as usize].max_chain;
         }
         s.strategy = strategy_i;
+        // The C's tail: `s->strategy = strategy; return Z_OK;`.
         Ok(Pump {
-            status,
+            status: Status::Ok,
             consumed,
             produced,
         })
