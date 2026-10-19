@@ -414,14 +414,15 @@ fn output_counter(runtime: &mut Runtime, port: Eterm) -> i64 {
 /// |---|---|---|---|---|
 /// | busy | `[nosuspend]` | not iodata | atom `false` | 0 |
 /// | busy | `[nosuspend]` | iodata | atom `false` | 0 |
-/// | busy | none | iodata | the typed capability gap (`unsupported: … busy port …`) | 0 |
+/// | busy | none | iodata | the typed capability gap: this fixture driver never clears its bit, so the wait expires (the oracle's `erts_suspend` caller never resumes either) | 0 |
 /// | busy | `[force]` on a **non**-`SOFT_BUSY` entry | iodata | `error:notsup` | 0 |
 ///
 /// The first row is the C's ordering: the busy check runs **before** the iolist conversion
 /// (`io.c:1749-1754` vs `:1790`), so a command that is dropped is never `badarg` — even when the
-/// bytes could not have been converted at all. The third row is this runtime's one honest
-/// divergence: the C suspends the caller and re-issues the BIF, which the `call_bif` seam cannot
-/// express, so it is a typed capability gap rather than a fabricated `true`.
+/// bytes could not have been converted at all. The third row takes the C's own wait
+/// (`erts_suspend` + `ERTS_BIF_YIELD3`) through [`crate::port::busy_wait`]: with nothing able to
+/// clear the busy bit, the wait runs to its deadline and reports the typed gap naming it rather
+/// than a fabricated `true`.
 #[test]
 fn the_busy_dropped_rows_write_nothing() {
     let mut runtime = native_runtime();
@@ -451,7 +452,8 @@ fn the_busy_dropped_rows_write_nothing() {
     )
     .expect("`nosuspend` on a busy port answers false");
     assert_eq!(runtime.atom_name_of(answer), Some("false"));
-    // 3. busy, no options ⇒ the C suspends the caller; here, the typed capability gap.
+    // 3. busy, no options ⇒ the C waits for the idle state; nothing here can clear the bit, so the
+    //    wait expires into the typed capability gap.
     for args in [vec![port_term, data], vec![port_term, data, NIL]] {
         let error = call(&mut runtime, "erlang", "port_command", &args)
             .expect_err("a plain command on a busy port cannot answer");

@@ -56,7 +56,7 @@
 //! |---|---|---|
 //! | busy | `[nosuspend]` (no `force`) | the atom `false` — the command is dropped, nothing written |
 //! | busy | `[force]` | `true` if the driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`, else `error:notsup` |
-//! | busy | neither | the caller **waits** until the port is idle and the command is then re-issued ⇒ `true`, the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run ([`crate::port::busy_wait`]); on a caller that may not pump, a typed capability gap (see [`RuntimeContext::port_command`]) |
+//! | busy | neither | the caller **waits** until the port is idle and the command is then re-issued ⇒ `true` (the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run, `crate::port::busy_wait`); a port still busy at the deadline, or a caller that may not pump, is a typed capability gap (see [`RuntimeContext::port_command`]) |
 //! | idle | any | `true` — except `[force]` on a driver **without** `ERL_DRV_FLAG_SOFT_BUSY`, which is `error:notsup` |
 //!
 //! The `force` rule is a property of the driver **entry**, not of the current busy state: the C
@@ -907,7 +907,7 @@ mod tests {
     /// |---|---|---|
     /// | busy | `[nosuspend]` | the atom `false` (nothing written) |
     /// | busy | `[force]` | `error:notsup` |
-    /// | busy | `[]` / none | the caller is **suspended**, then `true` — a capability gap here |
+    /// | busy | `[]` / none | the caller **waits** for the port to go idle, then the command is re-issued ⇒ `true`; this fixture driver never clears the bit, so the wait expires into the typed capability gap |
     /// | idle | `[]` / none / `[nosuspend]` / **`[force]`** | `true` **except** `[force]` ⇒ `notsup` |
     ///
     /// The last row's `[force]` cell is the subtle one: the C's `notsup` test is on the driver
@@ -953,8 +953,9 @@ mod tests {
                 "`notsup` is a genuine error, not a capability gap: {error}"
             );
         }
-        // A plain command on the busy port is the C's `erts_suspend`: a typed capability gap here
-        // (the runtime has no BIF-suspend channel), and deliberately **not** a fabricated `true`.
+        // A plain command on the busy port enters the C's `erts_suspend` wait. This fixture driver
+        // never clears its bit and nothing else can, so the wait runs to its deadline and answers
+        // the typed capability gap naming it — deliberately **not** a fabricated `true`.
         for options in [data, list_of(&mut runtime, &[])] {
             let args: Vec<Eterm> = if options == data {
                 vec![port.to_eterm(), data]

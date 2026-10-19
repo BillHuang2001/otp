@@ -600,7 +600,8 @@ struct PortMeta {
     ///
     /// `erlang:port_command/2,3` consults it exactly as `erts_port_output` does (`io.c:1749-1764` and
     /// `erl_bif_port.c:192-220`): `nosuspend` on a busy port answers `false`, `force` bypasses the
-    /// busy check, and a plain command on a busy port suspends the caller. The handle also carries
+    /// busy check, and a plain command on a busy port waits for the idle state and is then
+    /// re-issued ([`busy_wait`]). The handle also carries
     /// whether the loaded entry advertises `ERL_DRV_FLAG_SOFT_BUSY`, which decides the `force` arm.
     /// Seized from the host with [`driver::DriverPort::busy_flag`] before the host is moved into the
     /// port lifecycle (the boxed driver exposes no host), the same way [`PortMeta::driver_terms`],
@@ -1585,7 +1586,8 @@ impl PortRegistry {
     ///   `ERL_DRV_FLAG_SOFT_BUSY` (`erl_bif_port.c:195-198`) — a fact about the entry, so it holds
     ///   on an idle port too;
     /// * otherwise a **busy** port is `ERTS_PORT_OP_BUSY` (`io.c:1749-1754`): nothing is queued,
-    ///   and the runtime answers `false` or suspends the caller.
+    ///   and the caller answers `false` (`[nosuspend]`) or hands itself to
+    ///   [`busy_wait::issue`]'s wait-and-re-issue for the idle state.
     ///
     /// `Some(outcome)` is that answer; `None` means the command is accepted so far and its bytes
     /// may be converted.
@@ -1885,9 +1887,9 @@ impl PortRegistry {
     /// `set_busy_port` (the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, `io.c:5208-5264`).
     ///
     /// `erlang:port_command/2,3` consults it exactly as `erts_port_output` does: a busy port answers
-    /// `false` for `nosuspend`, suspends the caller for a plain command, and lets `force` through —
-    /// when the driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`
-    /// ([`PortRegistry::soft_busy`]).
+    /// `false` for `nosuspend`, waits for the idle state before a plain command is re-issued
+    /// ([`busy_wait`]), and lets `force` through — when the driver entry advertises
+    /// `ERL_DRV_FLAG_SOFT_BUSY` ([`PortRegistry::soft_busy`]).
     ///
     /// `false` for an unknown port and for every port without a C driver (a `spawn`/`fd` port and a
     /// built-in driver port), none of which can ever report busy — the oracle's own answer for a
