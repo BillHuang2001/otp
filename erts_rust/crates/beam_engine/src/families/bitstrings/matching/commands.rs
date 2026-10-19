@@ -122,15 +122,10 @@ pub(crate) fn run_commands(
             // `skip Stride` — advance without binding (`i_bs_skip`, which does
             // `sb->start += size`).
             "skip" => {
-                let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
-                let Some(next) = pos.checked_add(stride) else {
-                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
-                };
-                if next > end {
-                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
+                match skip_cmd(machine, ctx, ctx_op, commands, i, term, &mut pos, end)? {
+                    CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
+                    CmdFlow::Done | CmdFlow::Relocated => {}
                 }
-                pos = next;
-                commit(machine, ctx, ctx_op, term, false, pos)?;
                 i += 2;
             }
             // `integer Live Flags Size Unit Dst` (`i_bs_get_fixed_integer`).
@@ -158,50 +153,23 @@ pub(crate) fn run_commands(
             }
             // `binary Live Flags Size Unit Dst` (`i_bs_get_fixed_binary`).
             "binary" => {
-                let size_op = cmd_at(commands, i + 3)?;
-                let unit = read_size(machine, ctx, cmd_at(commands, i + 4)?)?;
-                let dst = cmd_at(commands, i + 5)?;
-                let nbits = if is_all(module, size_op) {
-                    end.saturating_sub(pos)
-                } else {
-                    let size = read_size(machine, ctx, size_op)?;
-                    match size.checked_mul(unit) {
-                        Some(nbits) => nbits,
-                        None => return fail_step(machine, module, labels, fail, ctx_op, ctx),
-                    }
-                };
-                if nbits > end.saturating_sub(pos) {
-                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
+                match binary_cmd(machine, module, ctx, commands, i, &mut pos, end, bytes, off, term, ctx_op)? {
+                    CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
+                    CmdFlow::Done => {}
+                    // `raw::make_binary` reserves on **every** build.
+                    CmdFlow::Relocated => stale = true,
                 }
-                let out = extract_bits(bytes, pos + off, nbits)?;
-                // `i_bs_get_fixed_binary` builds the window through
-                // `erts_build_sub_bitstring` for an arbitrary bit count (no 64-byte
-                // limit), so the result goes through `raw::make_binary`, which picks
-                // the frozen on-heap/off-heap representation by size.
-                let value = raw::make_binary(machine, ctx, &out, nbits)?;
-                pos += nbits;
-                // `i_bs_get_fixed_binary` does `sb->start += size;` *before*
-                // `$Dst = result;` — mirror the advance first (`Dst` may be the
-                // context's own operand). `raw::make_binary` reserves on **every**
-                // build, so the commit always re-reads.
-                commit(machine, ctx, ctx_op, term, true, pos)?;
-                write_operand(machine, dst, value)?;
-                stale = true;
                 i += 6;
             }
             // `get_tail Live Unit Dst` — bind the whole remaining bits
             // (`i_bs_get_tail`); the position is left unchanged (it is the last
             // command, `bs_translate_fixup`).
             "get_tail" => {
-                let dst = cmd_at(commands, i + 3)?;
-                let nbits = end.saturating_sub(pos);
-                let out = extract_bits(bytes, pos + off, nbits)?;
-                // `i_bs_get_tail` builds an arbitrary bit count (no 64-byte limit),
-                // so the result goes through `raw::make_binary` (on-heap at/below
-                // `ERL_ONHEAP_BINARY_LIMIT`, off-heap refc above).
-                let value = raw::make_binary(machine, ctx, &out, nbits)?;
-                write_operand(machine, dst, value)?;
-                stale = true;
+                match get_tail_cmd(machine, ctx, commands, i, pos, end, bytes, off)? {
+                    CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
+                    CmdFlow::Done => {}
+                    CmdFlow::Relocated => stale = true,
+                }
                 i += 4;
             }
             // `'=:=' Nil Bits Value` (`i_bs_eq`, `bs_instrs.tab:1366`): the next
@@ -212,21 +180,10 @@ pub(crate) fn run_commands(
             // `'=:='` are just the non-alphanumeric-atom notation and are not part
             // of the name).
             "=:=" => {
-                let bits = read_size(machine, ctx, cmd_at(commands, i + 2)?)?;
-                let want_term = read_operand(machine, ctx, cmd_at(commands, i + 3)?)?;
-                let Some(want) = small_value(want_term) else {
-                    return Err(error::unsupported("bs_match '=:=': non-integer value"));
-                };
-                if bits > 64 || bits > end.saturating_sub(pos) {
-                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
+                match eq_cmd(machine, ctx, commands, i, &mut pos, end, bytes, off, term, ctx_op)? {
+                    CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
+                    CmdFlow::Done | CmdFlow::Relocated => {}
                 }
-                if read_uint_be(bytes, pos + off, bits)? != want as u64 {
-                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
-                }
-                pos += bits;
-                // The C consumes `Bits` through the `i_bs_read_bits` that feeds
-                // `i_bs_eq`, which advances `sb->start` by `Bits`.
-                commit(machine, ctx, ctx_op, term, false, pos)?;
                 i += 4;
             }
             other => {
@@ -235,6 +192,157 @@ pub(crate) fn run_commands(
         }
     }
     Ok(Some(Step::Next))
+}
+
+/// The outcome of one **outlined** `bs_match` command body.
+///
+/// The bodies that build a term ([`binary_cmd`], [`get_tail_cmd`]) are kept out of
+/// [`run_commands`] as `#[inline(never)]` functions: they pull in
+/// `raw::make_binary`/`extract_bits`, whose inlined form is several hundred bytes
+/// each, and a compiled binary-comprehension loop re-enters `run_commands` once per
+/// iteration with a two-command list (`ensure_at_least`, `integer`). Outlining the
+/// cold bodies keeps that hot function small enough to stay resident instead of
+/// faulting cold instruction lines in on every call; semantics are unchanged
+/// because each body is still handed the same operands in the same order.
+enum CmdFlow {
+    /// The command completed without allocating through the rooted seam, so the
+    /// caller's `(term, bytes, off, end)` capture is still live.
+    Done,
+    /// The command completed through an allocating build, so the context block may
+    /// have been relocated: the caller must re-derive its capture before the next
+    /// command reuses it.
+    Relocated,
+    /// The command's guard failed: the caller takes the instruction's fail path
+    /// ([`fail_step`]).
+    Fail,
+}
+
+/// `skip Stride` — advance without binding (`i_bs_skip`, `sb->start += size`).
+#[inline(never)]
+fn skip_cmd(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    ctx_op: &Operand,
+    commands: &[Operand],
+    i: usize,
+    term: Eterm,
+    pos: &mut usize,
+    end: usize,
+) -> Result<CmdFlow> {
+    let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
+    let Some(next) = (*pos).checked_add(stride) else {
+        return Ok(CmdFlow::Fail);
+    };
+    if next > end {
+        return Ok(CmdFlow::Fail);
+    }
+    *pos = next;
+    commit(machine, ctx, ctx_op, term, false, *pos)?;
+    Ok(CmdFlow::Done)
+}
+
+/// `binary Live Flags Size Unit Dst` (`i_bs_get_fixed_binary`).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn binary_cmd(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    commands: &[Operand],
+    i: usize,
+    pos: &mut usize,
+    end: usize,
+    bytes: &[u8],
+    off: usize,
+    term: Eterm,
+    ctx_op: &Operand,
+) -> Result<CmdFlow> {
+    let size_op = cmd_at(commands, i + 3)?;
+    let unit = read_size(machine, ctx, cmd_at(commands, i + 4)?)?;
+    let dst = cmd_at(commands, i + 5)?;
+    let nbits = if is_all(module, size_op) {
+        end.saturating_sub(*pos)
+    } else {
+        let size = read_size(machine, ctx, size_op)?;
+        match size.checked_mul(unit) {
+            Some(nbits) => nbits,
+            None => return Ok(CmdFlow::Fail),
+        }
+    };
+    if nbits > end.saturating_sub(*pos) {
+        return Ok(CmdFlow::Fail);
+    }
+    let out = extract_bits(bytes, *pos + off, nbits)?;
+    // `i_bs_get_fixed_binary` builds the window through `erts_build_sub_bitstring`
+    // for an arbitrary bit count (no 64-byte limit), so the result goes through
+    // `raw::make_binary`, which picks the frozen on-heap/off-heap representation by
+    // size.
+    let value = raw::make_binary(machine, ctx, &out, nbits)?;
+    *pos += nbits;
+    // `i_bs_get_fixed_binary` does `sb->start += size;` *before* `$Dst = result;` —
+    // mirror the advance first (`Dst` may be the context's own operand).
+    // `raw::make_binary` reserves on **every** build, so the commit always re-reads.
+    commit(machine, ctx, ctx_op, term, true, *pos)?;
+    write_operand(machine, dst, value)?;
+    Ok(CmdFlow::Relocated)
+}
+
+/// `get_tail Live Unit Dst` — bind the whole remaining bits (`i_bs_get_tail`).
+///
+/// The position is left unchanged (it is the last command, `bs_translate_fixup`).
+#[inline(never)]
+fn get_tail_cmd(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    commands: &[Operand],
+    i: usize,
+    pos: usize,
+    end: usize,
+    bytes: &[u8],
+    off: usize,
+) -> Result<CmdFlow> {
+    let dst = cmd_at(commands, i + 3)?;
+    let nbits = end.saturating_sub(pos);
+    let out = extract_bits(bytes, pos + off, nbits)?;
+    // `i_bs_get_tail` builds an arbitrary bit count (no 64-byte limit), so the
+    // result goes through `raw::make_binary` (on-heap at/below
+    // `ERL_ONHEAP_BINARY_LIMIT`, off-heap refc above).
+    let value = raw::make_binary(machine, ctx, &out, nbits)?;
+    write_operand(machine, dst, value)?;
+    Ok(CmdFlow::Relocated)
+}
+
+/// `'=:=' Nil Bits Value` (`i_bs_eq`, `bs_instrs.tab:1366`).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn eq_cmd(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    commands: &[Operand],
+    i: usize,
+    pos: &mut usize,
+    end: usize,
+    bytes: &[u8],
+    off: usize,
+    term: Eterm,
+    ctx_op: &Operand,
+) -> Result<CmdFlow> {
+    let bits = read_size(machine, ctx, cmd_at(commands, i + 2)?)?;
+    let want_term = read_operand(machine, ctx, cmd_at(commands, i + 3)?)?;
+    let Some(want) = small_value(want_term) else {
+        return Err(error::unsupported("bs_match '=:=': non-integer value"));
+    };
+    if bits > 64 || bits > end.saturating_sub(*pos) {
+        return Ok(CmdFlow::Fail);
+    }
+    if read_uint_be(bytes, *pos + off, bits)? != want as u64 {
+        return Ok(CmdFlow::Fail);
+    }
+    *pos += bits;
+    // The C consumes `Bits` through the `i_bs_read_bits` that feeds `i_bs_eq`,
+    // which advances `sb->start` by `Bits`.
+    commit(machine, ctx, ctx_op, term, false, *pos)?;
+    Ok(CmdFlow::Done)
 }
 
 /// Mirror the local cursor `pos` into the match context's own position field.

@@ -225,8 +225,13 @@ pub(super) fn exec(
 ///
 /// `Err(step)` is a completed failure `Step` (a branch to `fail`, or a raise) — the
 /// caller returns it verbatim.
+///
+/// `pub(crate)` so a future native tier can lower a recognised `bs_create_bin` segment
+/// shape straight to this walk (the whole construction side of the family is reachable
+/// from outside this module: [`exec`] for the instruction, this for the assembly).
+/// Semantics are unchanged by the visibility.
 #[allow(clippy::type_complexity)]
-fn assemble(
+pub(crate) fn assemble(
     machine: &mut Machine,
     module: &Module,
     labels: &LabelMap,
