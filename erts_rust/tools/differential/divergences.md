@@ -518,33 +518,51 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 One Rust node and one system node were driven by hand (a `beam_rt -sname <name>` runtime and a
 system `erl -sname <peer>`), `net_kernel:verbose(3)` on the system side, `epmd -names` and `ss -tn`
 for the transport state.
-- **The Rust → ERTS direction completes.** `beam_rt -sname <name> -eval 'net_adm:ping(<peer>@<host>)'`
-  answers `pong`; the oracle's `verbose(3)` logs `{net_kernel,{accept,…}}` →
-  `{dist_ctrlr,…,<peer-node>,<pid>}` → `{nodeup,…}`, and on halt `{nodedown,…,normal}`. The Rust
-  node connects as **hidden**, so it appears in no side's `nodes/0` — the correct OTP answer for a
-  hidden node (`nodes(hidden)` would list it), not a divergence.
-- **The ERTS → Rust direction never completes.** With `beam_rt -noshell -sname <name>` bound and
-  published to `epmd` (confirmed by `epmd -names` and a LISTEN socket), the system side's
-  `net_adm:ping/1` answers **`pang` after ~7.15 s**; `verbose(3)` shows `{init_setup_check,…}` →
-  `{setup,…}` → `{conn_own_exit,…,setup_timer_timeout}` →
-  `{nodedown,…,pending,setup_timer_timeout}`, and `ss -tn` shows the peer's 30-byte `'n'` name
-  message sitting **unread** (Recv-Q 30) on the accepted link — no `'N'` reply is ever sent. Owner:
-  `beam_rt` (`crates/beam_rt/src/dist.rs`, the accept / `'N'` path).
-- **No corpus case can express cross-runtime traffic — two independent reasons.** (a) *Structural*:
-  `harness::execute` runs the oracle side to completion **first**, then the Rust side, and compares
-  each child's own stdout + exit status, so the two VMs never coexist; a `Command` oracle script
-  could only **hard-code** a cross-runtime observation (exactly the tautology the `Command`-kind rule
-  forbids), and making the oracle child spawn `beam_rt` would bake an artifact path into an argv —
-  against `runtime::resolve_rust`'s `$BEAM_RT`-else-workspace-relative resolution, since a tree holds
-  only one of `target/release`/`target/debug`. (b) *Capability*: the ERTS → Rust direction cannot
-  reach `nodeup`, so a case pinning it would be a permanent `mismatch`, and admitting it as
-  `unsupported` would open a second ratchet gap.
-- **Further A.5 capability gaps measured while probing** (each exits `3`, so an honest gap, never a
-  `mismatch`): `erlang:monitor_node/2` → `beam_rt: unsupported: erlang:monitor_node/2`;
-  `erlang:send/2` to a remote registered name → `beam_rt: unsupported: … distributed send is not
-  implemented`; `net_kernel:node()` → `undef`. Owner: `beam_rt`. The adjacent shapes agree and are
-  pinned: off the `-sname`/`-name` path `node()` is `nonode@nohost`, `is_alive()` is `false` and
-  `nodes()` is `[]`, and with `-sname` the node-name/aliveness shapes agree.
+- **Both directions complete.** The ERTS → Rust direction was audited fresh: the system side's
+  `net_adm:ping/1` answers `pong` in 28–200 ms, `verbose(3)` shows the full
+  `{auto_connect,…}` → `{init_setup_check,…}` → `{setup_check,…}` → `{setup,…}` →
+  `{dist_ctrlr,…}` → `{nodeup,…}` ladder with no `setup_timer_timeout`, and `ss -tn` shows
+  Recv-Q/Send-Q zero on both sides. The earlier `pang` / `setup_timer_timeout` symptom was a
+  **missing `net_kernel` service**, not a wire defect: `net_adm:ping/1` is a
+  `gen:call({net_kernel,Node}, '$gen_call', {is_auth,node()}, infinity)`, so with no process holding
+  the name the request was dropped and the caller parked in an untimed receive until the oracle's
+  setup timeout fired.
+- **The Rust node is a published node, not hidden**: it appears in the peer's `nodes/0`, a
+  `nodes(hidden)` call stays `[]`, and `DistNode::hidden` defaults to `false`.
+- **Both directions carry user traffic**: `{sink,Peer} ! Msg` reaches a registered process on the
+  other side and the peer's reply reaches the Rust side's plain `receive`; `erlang:monitor_node/2`
+  answers `true` and both `{nodeup,…}` and `{nodedown,…}` are genuinely delivered; and
+  `erlang:send/2` to a remote registered name auto-dials a reachable node.
+- **No corpus case can express cross-runtime traffic.** `harness::execute` runs the oracle leg to
+  completion **before** the Rust leg and compares each child's own stdout + exit status, so no case
+  can carry a message between the two runtimes; a `Command` oracle script could only **hard-code** a
+  cross-runtime observation (exactly the tautology the `Command`-kind rule forbids), and having the
+  oracle child spawn `beam_rt` would bake an artifact path into an argv — against
+  `runtime::resolve_rust`'s `$BEAM_RT`-else-workspace-relative resolution.
+- The genuine cross-runtime property is pinned instead by the crate-local
+  `crates/beam_rt/tests/dist_two_vm.rs` (two `#[ignore]`d tests, a private `epmd`, both sides
+  asserted).
+<!--PEER-VERDICT-->
+
+### Distribution capability gaps and plain-value divergences (measured)
+- **A message to `net_kernel` that is not a `{'$gen_call', From, Request}` tuple is FATAL**: a peer
+  sending a plain term to `{net_kernel, Node}` kills the runtime with exit `3` (only the `up` line
+  has been printed), and a stray term is not catchable from `-eval`. Owner: `beam_rt`.
+- **`net_kernel`: `<request> is not served`** (e.g. `monitor_nodes/2`) and **`erlang:monitor_node/3`**
+  both exit `3` — honest capability gaps, never mismatches. Owner: `beam_rt`.
+- `erlang:send({RegName, UnreachableNode}, Msg)` **raises**
+  (`beam_rt: error distribution: no established connection to node …`) where the oracle silently
+  drops the message and returns it. Owner: `beam_rt`.
+- `erl_distribution:start_link()` on an already-distributed node answers `ignore` where the oracle
+  answers `{error,{already_started,<pid>}}`. Owner: `beam_rt`.
+- `net_adm:ping/1` with a **non-atom** is `badarg` where the oracle raises `function_clause`. Owner:
+  `beam_rt`.
+- `catch net_kernel:node()`'s **stacktrace** is one frame against the oracle's eight; the `undef`
+  class and reason themselves agree (`net_kernel:node()` is `undef` on **both** sides — not a gap), so
+  the probe wrapper pins them. Owner: `beam_rt`.
+- The adjacent shapes agree and are pinned: off the `-sname`/`-name` path `node()` is
+  `nonode@nohost`, `is_alive()` is `false` and `nodes()` is `[]`, and with `-sname` the
+  node-name/aliveness shapes agree.
 
 ### ETF decode bound (measured)
 - **A 3 000-deep nested list decodes on the oracle and raises here.**
