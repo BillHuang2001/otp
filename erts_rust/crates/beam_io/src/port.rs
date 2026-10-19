@@ -70,9 +70,10 @@ use crate::error;
 use crate::poller::Poller;
 use crate::port_failure::DriverFailure;
 use crate::port_task::{
-    ActiveInput, LineNotification, PortNotification, PortTask, PortTaskKind, PortTaskQueue,
-    ReadMessage, PORT_REDS_EXECUTE,
-};use crate::queue::ByteQueue;
+    ActiveInput, ActiveMode, ActiveSpend, LineNotification, PortNotification, PortTask,
+    PortTaskKind, PortTaskQueue, ReadMessage, PORT_REDS_EXECUTE,
+};
+use crate::queue::ByteQueue;
 
 // The registry lives in the sibling [`crate::registry`] module; re-export it here so the
 // in-crate `crate::port::PortRegistry` path (used by the built-in drivers) keeps resolving.
@@ -494,6 +495,37 @@ impl Port {
         self.driver.port_closed()
     }
 
+    /// This port's current `{active, Mode}`.
+    ///
+    /// Forwards to [`Driver::active_mode`]: the state a socket driver holds in its own option store
+    /// after the `{active, …}` grants it has already spent — including the **running**
+    /// `{active, N}` counter ([`ActiveMode::remaining`]). A driver with no active mode answers
+    /// [`ActiveMode::False`], so this is safe to poll for every port.
+    ///
+    /// This is the read accessor; the *notification* that a grant was spent to exhaustion is
+    /// [`Port::take_active_spends`].
+    pub fn active_mode(&self) -> ActiveMode {
+        self.driver.active_mode()
+    }
+
+    /// Takes the `{active, …}` grants this port's driver has spent since the previous call,
+    /// **oldest first**.
+    ///
+    /// Forwards to [`Driver::take_active_spends`], the drain side of the active-mode state machine
+    /// (see [`ActiveSpend`]): an `{active, once}` grant is cleared **silently** by the C
+    /// (`erts/emulator/drivers/common/inet_drv.c:1552-1556`, no `{tcp_passive, S}` follows), so
+    /// without this a runtime could only infer the transition from a later `setopts`.
+    ///
+    /// Every spend is returned **exactly once** and the driver's queue is emptied, so a caller must
+    /// drain after every round (and after every explicit driver interaction), exactly as it must
+    /// drain [`Port::take_completions`]/[`Port::take_active_inputs`]. A port whose driver never
+    /// enters an active mode always answers an empty `Vec`, so a caller can poll unconditionally.
+    ///
+    /// The spends are **not** stamped with this port's id here — the caller owns the port and knows
+    /// it; [`crate::PortRegistry::take_active_spends`] is the stamped form.
+    pub fn take_active_spends(&mut self) -> Vec<ActiveSpend> {
+        self.driver.take_active_spends()
+    }
     /// How this port's driver described its most recent [`Port::control`] reply buffer.
     ///
     /// Forwards to [`Driver::control_reply_shape`]: the C's `*rbuf == NULL` test, which

@@ -40,9 +40,10 @@ use super::opcode_tests::{erl_stdout, loopback_arg, open_arg, op};
 use super::wire::ctl_ok;
 use super::TcpInetDriver;
 use crate::completion::{CompletionEvent, InetAsyncResult};
+use crate::driver::DriverRegistry;
 use crate::poller::Poller;
 use crate::port::PortRegistry;
-use crate::port_task::{ActiveInput, ActiveInputEvent, ReadMessage};
+use crate::port_task::{ActiveInput, ActiveInputEvent, ActiveMode, ActiveSpend, ReadMessage};
 use beam_process::PortId;
 use std::io::Write;
 use std::net::TcpStream;
@@ -84,30 +85,30 @@ fn record(code: u8, value: i32) -> Vec<u8> {
 }
 
 /// `{active, true}` (`INET_ACTIVE`, `inet_drv.c:781`).
-fn active_true() -> Vec<u8> {
+pub(super) fn active_true() -> Vec<u8> {
     record(ACTIVE, 1)
 }
 
 /// `{active, false}` (`INET_PASSIVE`).
-fn active_false() -> Vec<u8> {
+pub(super) fn active_false() -> Vec<u8> {
     record(ACTIVE, 0)
 }
 
 /// `{active, once}` (`INET_ONCE`, `inet_drv.c:781`).
-fn active_once() -> Vec<u8> {
+pub(super) fn active_once() -> Vec<u8> {
     record(ACTIVE, 2)
 }
 
 /// `{active, N}` (`INET_MULTI`) plus the 16-bit counter that follows its record
 /// (`inet_drv.c:6977`).
-fn active_multi(n: i16) -> Vec<u8> {
+pub(super) fn active_multi(n: i16) -> Vec<u8> {
     let mut bytes = record(ACTIVE, 3);
     bytes.extend_from_slice(&n.to_be_bytes());
     bytes
 }
 
 /// `{packet, N}`.
-fn packet(n: i32) -> Vec<u8> {
+pub(super) fn packet(n: i32) -> Vec<u8> {
     record(PACKET, n)
 }
 
@@ -122,12 +123,12 @@ fn mode(m: i32) -> Vec<u8> {
 }
 
 /// Concatenates option records into one `setopts` payload.
-fn records(parts: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn records(parts: &[Vec<u8>]) -> Vec<u8> {
     parts.iter().flatten().copied().collect()
 }
 
 /// A live in-crate `tcp_inet` port plus the poller the runtime drives it with.
-struct Rig {
+pub(super) struct Rig {
     registry: PortRegistry,
     poller: Poller,
     id: PortId,
@@ -135,7 +136,7 @@ struct Rig {
 
 impl Rig {
     /// A bare (socket-less) port — the state the driver factory starts in.
-    fn bare() -> Rig {
+    pub(super) fn bare() -> Rig {
         let mut poller = Poller::new().expect("a poll set");
         let mut registry = PortRegistry::new();
         let id = registry
@@ -156,19 +157,61 @@ impl Rig {
     }
 
     /// One **named** control call ([`super::TcpInetDriver::control`]'s name match).
-    fn named(&mut self, verb: &str, arg: &[u8]) -> Vec<u8> {
+    pub(super) fn named(&mut self, verb: &str, arg: &[u8]) -> Vec<u8> {
         self.registry
             .port_control(&mut self.poller, self.id, verb, arg)
             .expect("the named control call answers")
     }
 
+    /// A port whose driver came from the **built-in driver registry** — the route
+    /// `open_port({spawn_driver, Name}, …)` takes in `beam_rt`
+    /// ([`DriverRegistry::with_builtins`] + [`PortRegistry::open`] over the factory's
+    /// `Box<dyn Driver>`), rather than one built by hand as [`Rig::bare`] does.
+    pub(super) fn from_factory(name: &str) -> Rig {
+        let mut poller = Poller::new().expect("a poll set");
+        let mut registry = PortRegistry::new();
+        let driver = DriverRegistry::with_builtins()
+            .create(name)
+            .unwrap_or_else(|err| panic!("the built-in `{name}` driver is registered: {err:?}"));
+        let id = registry.open(&mut poller, driver).expect("the port opens");
+        Rig {
+            registry,
+            poller,
+            id,
+        }
+    }
+
+    /// The port's own id — what every delivery and every spend is stamped with.
+    pub(super) fn id(&self) -> PortId {
+        self.id
+    }
+
+    /// The port's live `{active, …}` mode through the **runtime's** seam
+    /// ([`PortRegistry::active_mode`]) — the read half of the `{active, …}` state machine.
+    pub(super) fn active_mode(&self) -> ActiveMode {
+        self.registry
+            .active_mode(self.id)
+            .expect("a live port has a mode")
+    }
+
+    /// Drains the grants a delivery spent, through [`PortRegistry::take_active_spends`] — the
+    /// notification half, stamped with this port's id. Taking consumes.
+    pub(super) fn take_active_spends(&mut self) -> Vec<(PortId, ActiveSpend)> {
+        self.registry.take_active_spends()
+    }
+
+    /// The `{active, …}` deliveries staged by the **control call itself** (no round runs), which
+    /// is where a `setopts` inline burst and the option walk's own passive event land.
+    pub(super) fn drain_staged(&mut self) -> Vec<ActiveInput> {
+        self.registry.take_active_inputs()
+    }
     /// A `setopts` request over the given option records.
-    fn setopts(&mut self, parts: &[Vec<u8>]) -> Vec<u8> {
+    pub(super) fn setopts(&mut self, parts: &[Vec<u8>]) -> Vec<u8> {
         self.numbered(SETOPTS, &records(parts))
     }
 
     /// One round of the runtime's loop: poll, handle the readiness, drain the active channel.
-    fn round(&mut self) -> Vec<ActiveInput> {
+    pub(super) fn round(&mut self) -> Vec<ActiveInput> {
         let events = self.poller.poll(Some(POLL_WAIT)).expect("the poll runs");
         self.registry
             .handle_events(&mut self.poller, &events)
@@ -177,7 +220,7 @@ impl Rig {
     }
 
     /// Rounds until `want` deliveries have been drained (or [`GUARD`] expires).
-    fn until(&mut self, want: usize) -> Vec<ActiveInput> {
+    pub(super) fn until(&mut self, want: usize) -> Vec<ActiveInput> {
         let deadline = Instant::now() + GUARD;
         let mut got = Vec::new();
         while got.len() < want && Instant::now() < deadline {
@@ -187,7 +230,7 @@ impl Rig {
     }
 
     /// `rounds` further rounds, collected — for the "nothing more arrives" assertions.
-    fn quiet(&mut self, rounds: usize) -> Vec<ActiveInput> {
+    pub(super) fn quiet(&mut self, rounds: usize) -> Vec<ActiveInput> {
         let mut got = Vec::new();
         for _ in 0..rounds {
             got.extend(self.round());
@@ -219,7 +262,7 @@ impl Rig {
     }
 
     /// How many bytes sit in the port's **input queue** (the passive channel).
-    fn input_len(&mut self) -> usize {
+    pub(super) fn input_len(&mut self) -> usize {
         self.registry.get(self.id).expect("a live port").input_len()
     }
 
@@ -246,17 +289,22 @@ impl Rig {
 }
 
 /// A `tcp_inet` port **transferred** to an accepted loopback connection, plus the peer's end.
-struct Link {
-    port: Rig,
-    peer: TcpStream,
+pub(super) struct Link {
+    pub(super) port: Rig,
+    pub(super) peer: TcpStream,
 }
 
 /// Builds the link: `open` → `bind` → `listen` on an ephemeral loopback port, a peer connects,
 /// and the named `accept` verb transfers the port to the accepted connection (the C's
 /// `INET_REQ_ACCEPT` would create a *second* port; this floor's named verb is the synchronous
 /// route, see [`super::TcpInetDriver::verb_accept`]).
-fn link() -> Link {
-    let mut port = Rig::bare();
+pub(super) fn link() -> Link {
+    link_with(Rig::bare())
+}
+
+/// [`link`] over a caller-supplied port — the socket-less state any `tcp_inet` port starts in, so a
+/// suite can choose how the driver was built ([`Rig::bare`] or [`Rig::from_factory`]).
+pub(super) fn link_with(mut port: Rig) -> Link {
     assert_eq!(port.numbered(OPEN, &open_arg()), ctl_ok(), "INET_REQ_OPEN");
     let bound = port.numbered(BIND, &loopback_arg(0));
     assert_eq!(bound.len(), 3, "`bind` replies [1, port_hi, port_lo]");
@@ -282,13 +330,13 @@ fn link() -> Link {
 }
 
 /// Writes `bytes` on the peer's end — the bytes the port's socket then holds.
-fn send(peer: &mut TcpStream, bytes: &[u8]) {
+pub(super) fn send(peer: &mut TcpStream, bytes: &[u8]) {
     peer.write_all(bytes).expect("the peer writes");
     peer.flush().expect("the peer flushes");
 }
 
 /// The `Data` payloads of the collected deliveries, in order.
-fn payloads(inputs: &[ActiveInput]) -> Vec<ReadMessage> {
+pub(super) fn payloads(inputs: &[ActiveInput]) -> Vec<ReadMessage> {
     inputs
         .iter()
         .map(|input| match &input.event {
@@ -300,7 +348,7 @@ fn payloads(inputs: &[ActiveInput]) -> Vec<ReadMessage> {
 }
 
 /// How many of the collected deliveries are `Passive` events.
-fn passive_count(inputs: &[ActiveInput]) -> usize {
+pub(super) fn passive_count(inputs: &[ActiveInput]) -> usize {
     inputs
         .iter()
         .filter(|input| matches!(input.event, ActiveInputEvent::Passive))

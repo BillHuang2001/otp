@@ -75,7 +75,7 @@ use super::{UdpInetDriver, DATAGRAM_CHUNK};
 use crate::completion::InetReason;
 use crate::driver::DriverContext;
 use crate::poller::Interest;
-use crate::port_task::{ActiveInputEvent, ReadMessage};
+use crate::port_task::{ActiveInputEvent, ActiveSpend, ReadMessage};
 
 /// `{deliver, term}` (`INET_DELIVER_TERM`, `inet_drv.c:783`) — the default, and the only
 /// delivery mode this channel can express (see the module docs).
@@ -315,16 +315,25 @@ impl UdpInetDriver {
     ///
     /// The decrement is a wrapping `i16` subtraction, as the C's `--((inet)->active_count)` on a
     /// `Sint16` is, and the flip tests `== 0` rather than `<= 0` — the C's own condition.
+    ///
+    /// The two spending arms also **record** the spend (`ActiveSpend::Once` / `ActiveSpend::Multi`)
+    /// on the driver's `active_spends`, which [`crate::Driver::take_active_spends`] drains — an
+    /// `{active, once}` transition carries no message at all, so without it the runtime could not
+    /// tell it happened. This is the **only** spend site: [`UdpInetDriver::after_setopts`]'s
+    /// `landed_at_zero` is the option walk's own zero (`inet_drv.c:6993`-`:6998`), which delivers
+    /// no datagram and therefore spends nothing.
     fn after_delivery(&mut self) -> Option<ActiveInputEvent> {
         match self.options.active {
             INET_ONCE => {
                 self.options.active = INET_PASSIVE;
+                self.active_spends.push(ActiveSpend::Once);
                 None
             }
             INET_MULTI => {
                 self.options.active_count = self.options.active_count.wrapping_sub(1);
                 if self.options.active_count == 0 {
                     self.options.active = INET_PASSIVE;
+                    self.active_spends.push(ActiveSpend::Multi);
                     Some(ActiveInputEvent::Passive)
                 } else {
                     None

@@ -65,7 +65,7 @@ use super::super::wire::{
 use super::UdpInetDriver;
 use crate::poller::Poller;
 use crate::port::PortRegistry;
-use crate::port_task::{ActiveInput, ActiveInputEvent, ReadMessage};
+use crate::port_task::{ActiveInput, ActiveInputEvent, ActiveMode, ActiveSpend, ReadMessage};
 
 /// `INET_REQ_CONNECT` (`inet_drv.c:11993`).
 const INET_REQ_CONNECT: u32 = 3;
@@ -116,7 +116,7 @@ const MAX_ROUNDS: usize = 200;
 /// A live `udp_inet` port bound to an ephemeral loopback port, driven through the real runtime
 /// path: [`PortRegistry::port_control`] for the control verbs, [`PortRegistry::handle_events`] for
 /// a readiness round, [`PortRegistry::take_active_inputs`] for the deliveries.
-pub(super) struct Rig {
+pub(in crate::drivers::inet) struct Rig {
     registry: PortRegistry,
     poller: Poller,
     id: PortId,
@@ -133,9 +133,9 @@ struct Round {
 }
 
 /// What a burst of rounds collected.
-pub(super) struct Drained {
+pub(in crate::drivers::inet) struct Drained {
     /// Every delivery, in delivery order.
-    pub(super) inputs: Vec<ActiveInput>,
+    pub(in crate::drivers::inet) inputs: Vec<ActiveInput>,
     /// How many deliveries each round produced.
     per_round: Vec<usize>,
     /// How many rounds observed a readiness event — the non-vacuity witness for a "nothing is
@@ -146,7 +146,7 @@ pub(super) struct Drained {
 impl Rig {
     /// Opens a `udp_inet` port, creates its datagram socket (`INET_REQ_OPEN`) and binds it to an
     /// ephemeral loopback port (`INET_REQ_BIND`).
-    pub(super) fn new() -> Rig {
+    pub(in crate::drivers::inet) fn new() -> Rig {
         Rig::with_bind(INET_AF_LOOPBACK)
     }
 
@@ -233,7 +233,7 @@ impl Rig {
     }
 
     /// `{active, N}`, asserting the walk accepted it.
-    fn arm_multi(&mut self, n: i16) {
+    pub(in crate::drivers::inet) fn arm_multi(&mut self, n: i16) {
         assert_eq!(self.set_multi(n), ctl_ok(), "{{active,{n}}} is accepted");
     }
 
@@ -243,7 +243,7 @@ impl Rig {
     }
 
     /// `{active, value}`, asserting the walk accepted it.
-    pub(super) fn arm(&mut self, value: i32) {
+    pub(in crate::drivers::inet) fn arm(&mut self, value: i32) {
         assert_eq!(self.set_active(value), ctl_ok(), "{{active,{value}}} is accepted");
     }
 
@@ -252,7 +252,7 @@ impl Rig {
         self.bound
     }
     /// The port's own id — what every delivery is stamped with.
-    pub(super) fn id(&self) -> PortId {
+    pub(in crate::drivers::inet) fn id(&self) -> PortId {
         self.id
     }
 
@@ -275,7 +275,20 @@ impl Rig {
     pub(super) fn port_closed(&mut self) -> bool {
         self.registry.port_closed(self.id).expect("a live port")
     }
-    /// The driver's stored `{active, …}` state, read back through `INET_REQ_GETOPTS` code 22: the
+    /// The port's live `{active, …}` mode through the **runtime's** seam
+    /// ([`crate::PortRegistry::active_mode`]) — the read half of the `{active, …}` state machine,
+    /// the only way to see a `{active, N}` counter's remaining credit.
+    pub(in crate::drivers::inet) fn active_mode(&self) -> ActiveMode {
+        self.registry
+            .active_mode(self.id)
+            .expect("a live port has a mode")
+    }
+    /// Drains the grants a **delivered datagram** spent, through
+    /// [`crate::PortRegistry::take_active_spends`] — the notification half, stamped with this
+    /// port's id. Taking consumes.
+    pub(in crate::drivers::inet) fn take_active_spends(&mut self) -> Vec<(PortId, ActiveSpend)> {
+        self.registry.take_active_spends()
+    }    /// The driver's stored `{active, …}` state, read back through `INET_REQ_GETOPTS` code 22: the
     /// `INET_LOPT_ACTIVE` value, plus the `{active, N}` counter when the mode is `N`.
     fn active_state(&mut self) -> (i32, Option<i16>) {
         let reply = self.control(op(INET_REQ_GETOPTS), &[INET_LOPT_ACTIVE]);
@@ -323,7 +336,7 @@ impl Rig {
     /// Drives rounds until the port has been quiet for [`QUIET_ROUNDS`] rounds, collecting every
     /// delivery — the condition wait every case here uses instead of a fixed sleep, under
     /// [`HANG_GUARD`].
-    pub(super) fn drain_until_quiet(&mut self) -> Drained {
+    pub(in crate::drivers::inet) fn drain_until_quiet(&mut self) -> Drained {
         let guard = Instant::now() + HANG_GUARD;
         let mut drained = Drained {
             inputs: Vec::new(),
@@ -357,7 +370,7 @@ impl Rig {
 
     /// Injects one datagram `payload` from a fresh external socket and returns that socket (whose
     /// `local_addr` is the delivery's expected source).
-    fn inject(&self, payload: &[u8]) -> UdpSocket {
+    pub(in crate::drivers::inet) fn inject(&self, payload: &[u8]) -> UdpSocket {
         let sender = UdpSocket::bind("127.0.0.1:0").expect("an external sender socket");
         sender
             .send_to(payload, ("127.0.0.1", self.bound))
@@ -381,7 +394,7 @@ impl Rig {
 }
 
 /// Every `Data` delivery of a drain, in order.
-pub(super) fn data_of(inputs: &[ActiveInput]) -> Vec<&ReadMessage> {
+pub(in crate::drivers::inet) fn data_of(inputs: &[ActiveInput]) -> Vec<&ReadMessage> {
     inputs
         .iter()
         .filter_map(|input| match &input.event {
@@ -392,7 +405,7 @@ pub(super) fn data_of(inputs: &[ActiveInput]) -> Vec<&ReadMessage> {
 }
 
 /// How many `Passive` deliveries a drain carried.
-fn passive_count(inputs: &[ActiveInput]) -> usize {
+pub(in crate::drivers::inet) fn passive_count(inputs: &[ActiveInput]) -> usize {
     inputs
         .iter()
         .filter(|input| input.event == ActiveInputEvent::Passive)

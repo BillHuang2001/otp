@@ -68,7 +68,8 @@ use crate::port::{
 };
 use crate::port_failure::{DriverFailure, PortFailure};
 use crate::port_task::{
-    ActiveInput, LineNotification, PortNotification, PortTaskKind, PortTaskOutcome, Readiness,
+    ActiveInput, ActiveMode, ActiveSpend, LineNotification, PortNotification, PortTaskKind,
+    PortTaskOutcome, Readiness,
 };
 /// The set of live ports, keyed by port number, plus the id allocator.
 ///
@@ -122,7 +123,19 @@ pub struct PortRegistry {
     /// **during** its own teardown — would be dropped with it. Harvesting keeps that delivery
     /// reportable exactly once after the port is gone; the queue is drained by
     /// [`PortRegistry::take_active_inputs`].
-    closed_active: Vec<ActiveInput>,    /// The **failures** of ports whose driver closed them (the C's `driver_failure*` family and
+    closed_active: Vec<ActiveInput>,
+    /// The **`{active, …}` grants spent** by ports that were closed before their owner was told
+    /// about them, harvested by [`PortRegistry::close`] in close order.
+    ///
+    /// The same rule [`PortRegistry::closed_active`] follows, for the same reason: an
+    /// `{active, once}` delivery a driver staged for a port that then closed still reaches the
+    /// owner ([`PortRegistry::take_active_inputs`] reports it), so the spend that produced it must
+    /// be reportable too — otherwise the owner would see the delivery without the mode change it
+    /// caused. Reachable in practice: [`PortRegistry::reap_failures`] closes a port in the same
+    /// round its driver delivered and spent, and a caller may close before draining. Drained by
+    /// [`PortRegistry::take_active_spends`], after the live ports'.
+    closed_active_spends: Vec<(PortId, ActiveSpend)>,
+    /// The **failures** of ports whose driver closed them (the C's `driver_failure*` family and
     /// `driver_exit`), latched by [`DriverContext::signal_failure`](crate::DriverContext::signal_failure)
     /// and harvested by [`PortRegistry::reap_failures`] in port-number order.
     ///
@@ -153,7 +166,9 @@ impl PortRegistry {
             ports: HashMap::new(),
             closed: Vec::new(),
             closed_completions: Vec::new(),
-            closed_active: Vec::new(),            failures: Vec::new(),
+            closed_active: Vec::new(),
+            closed_active_spends: Vec::new(),
+            failures: Vec::new(),
             reaped_notifications: Vec::new(),
             single_threaded: PhantomData,
         }
@@ -532,6 +547,23 @@ impl PortRegistry {
         }
     }
 
+    /// Port `id`'s current `{active, Mode}` — the socket driver's `desc->inet.active` plus its
+    /// running `active_count` (see [`ActiveMode`] and [`Driver::active_mode`]).
+    ///
+    /// The registry surface of [`Port::active_mode`], for a runtime that answers
+    /// `inet:getopts(S, [active])` or reports the mode after a delivery rather than mirroring the
+    /// `setopts` walk itself. For [`ActiveMode::Multi`] the **remaining** counter is carried;
+    /// a driver with no active mode (every non-socket one) reports [`ActiveMode::False`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn active_mode(&self, id: PortId) -> Result<ActiveMode> {
+        match self.ports.get(&id.number()) {
+            Some(port) => Ok(port.active_mode()),
+            None => Err(error::badarg()),
+        }
+    }
     /// Delivers a named port-control operation to the port's driver.
     ///
     /// The operation name `op` is forwarded **verbatim** to the driver's `control` — the
@@ -816,7 +848,49 @@ impl PortRegistry {
         active.append(&mut self.closed_active);
         active
     }
-    /// Releases port `id`'s pending partial line as `noeol` frame(s) for the next harvest.
+
+    /// Drains the **`{active, …}` grants** every port's driver has spent since the previous call,
+    /// in **port-number order**, plus the ones a closed port left behind.
+    ///
+    /// This is the runtime entry point of the active-mode state machine's *notification* half (see
+    /// [`ActiveSpend`]): the driver spends one grant per delivered packet
+    /// (`INET_CHECK_ACTIVE_TO_PASSIVE`, `erts/emulator/drivers/common/inet_drv.c:1552-1560`) and,
+    /// for [`ActiveSpend::Once`], clears the mode **silently** — no `{tcp_passive, S}` follows — so
+    /// this drain is the only way to learn the socket went passive. [`ActiveSpend::Multi`] means
+    /// the `{active, N}` counter ran out (its `{tcp_passive, S}` rides the
+    /// [`PortRegistry::take_active_inputs`] channel as [`ActiveInputEvent::Passive`]).
+    ///
+    /// The accessor style is [`PortRegistry::take_completions`]'s and
+    /// [`PortRegistry::take_active_inputs`]'s — drain after **every** round (and after every
+    /// explicit driver interaction **and after every [`PortRegistry::close`]**), because draining
+    /// is what removes them. The order is:
+    ///
+    /// 1. each **live** port's spends, ports visited in ascending port-number order and each port's
+    ///    own spends in the order its driver spent them, then
+    /// 2. the spends harvested from ports **closed** since the last drain
+    ///    ([`PortRegistry::close`]), in close order.
+    ///
+    /// # Port numbers of closed ports
+    ///
+    /// The closed half exists for the same reason [`PortRegistry::closed_active`] does: a delivery
+    /// staged for a port that then closed still reaches the owner, so the spend that produced it
+    /// must too. The same caveat applies — a harvested spend still names the number of the port it
+    /// was staged for, and that number is retired only by the deferred
+    /// [`PortNotification::Closed`] report — so drain in the round you ran.
+    ///
+    /// A registry whose ports never enter an active mode always returns an empty `Vec`, so a caller
+    /// can poll unconditionally.
+    pub fn take_active_spends(&mut self) -> Vec<(PortId, ActiveSpend)> {
+        let mut spends = Vec::new();
+        for key in self.sorted_keys() {
+            if let Some(port) = self.ports.get_mut(&key) {
+                let id = port.id();
+                spends.extend(port.take_active_spends().into_iter().map(|spend| (id, spend)));
+            }
+        }
+        spends.append(&mut self.closed_active_spends);
+        spends
+    }    /// Releases port `id`'s pending partial line as `noeol` frame(s) for the next harvest.
     ///
     /// This is the C's `flush_linebuf_messages`: it is what [`PortRegistry::take_eof`] runs when
     /// the driver reports the end of the stream, exposed separately for a caller that knows the
@@ -991,7 +1065,14 @@ impl PortRegistry {
         self.closed_completions
             .append(&mut port.take_completions());
         self.closed_active
-            .append(&mut port.take_active_inputs());        // The port is gone from the registry either way, so its close is queued (and its number
+            .append(&mut port.take_active_inputs());
+        // The spend a staged `{active, once}`/`{active, N}` delivery produced is part of the same
+        // report, so it is harvested with the deliveries: the owner must be able to see the
+        // delivery **and** the mode change it caused, even though the port is already gone.
+        let spent = port.take_active_spends();
+        self.closed_active_spends
+            .extend(spent.into_iter().map(|spend| (id, spend)));
+        // The port is gone from the registry either way, so its close is queued (and its number
         // retired by the reporting round) even if the driver's teardown reports a failure.
         self.closed.push(id);
         result
@@ -2401,3 +2482,12 @@ mod busy_tests;
 #[cfg(test)]
 #[path = "registry_downcast_tests.rs"]
 mod downcast_tests;
+
+/// The **driver-agnostic `{active, …}` seam** — the [`ActiveMode`]/[`ActiveSpend`] value types, the
+/// two defaulted [`Driver`] members that publish them and the two registry seams over them
+/// (`PortRegistry::active_mode`/`take_active_spends`) — lives in its own sibling for the same reason
+/// as `reply_tests`: the suite runs over a plain-Rust fake driver, so it needs no socket and no
+/// `erl`.
+#[cfg(test)]
+#[path = "active_mode_tests.rs"]
+mod active_mode_tests;
