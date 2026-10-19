@@ -407,14 +407,13 @@ pub(super) fn x_register(operand: &Operand) -> Option<u32> {
 /// An `Integer`/`Character` outside the small-int range is `None`: the native tier
 /// only inlines immediates, so such a constant makes the block **deopt** to
 /// `jit_step_one`, whose interpreter step materialises the exact bignum.
+///
+/// The definition itself lives in the interpreter's `select_val` ladder
+/// ([`crate::interpreter::constant_word`]) — the **one** authority on which operand is
+/// decidable by a raw-word compare — so this tier accepts exactly the values the other
+/// two do.
 pub(super) fn constant_word(operand: &Operand) -> Option<i64> {
-    match operand {
-        Operand::Integer(value) => small_word(*value),
-        Operand::Character(c) => small_word(i64::from(*c)),
-        Operand::Atom(atom) => Some(make_atom(*atom).raw() as i64),
-        Operand::Nil => Some(NIL.raw() as i64),
-        _ => None,
-    }
+    crate::interpreter::constant_word(operand)
 }
 
 /// The raw `Eterm` word of a small-int constant, or `None` when `value` is outside
