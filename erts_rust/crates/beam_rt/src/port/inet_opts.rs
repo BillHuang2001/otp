@@ -311,6 +311,55 @@ impl PortInetOptions {
     pub(crate) fn records(&self) -> &[Vec<u8>] {
         &self.records
     }
+
+    /// The driver's current `{active, …}` mode value, if a record has been seen.
+    ///
+    /// [`INET_LOPT_ACTIVE`]'s operand **is** the C's `desc->inet.active`
+    /// (`inet_set_opts`'s arm, `erts/emulator/drivers/common/inet_drv.c:6968-7016`), whose
+    /// vocabulary is `INET_PASSIVE` 0 / `INET_ACTIVE` 1 / `INET_ONCE` 2 / `INET_MULTI` 3
+    /// (`inet_drv.c:786-789`). Recorded, never replayed (see the module docs): the Erlang side is
+    /// authoritative for `active`, so the mirror only observes it.
+    ///
+    /// `None` means **no `{active, …}` record has ever been accepted** — the port's driver is
+    /// still at the C's `inet_start` default, `INET_PASSIVE` (`inet_drv.c:10932`). The last record
+    /// wins, exactly as the driver's own field does.
+    ///
+    /// One caveat the caller must carry: a **spent** grant is invisible here. The C clears
+    /// `desc->active` back to `INET_PASSIVE` after an `{active, once}` delivery
+    /// (`INET_CHECK_ACTIVE_TO_PASSIVE`) or when an `{active, N}` counter reaches zero — a
+    /// transition that is the *driver's* state, which this mirror records only when a **new**
+    /// `setopts` arrives.
+    pub(crate) fn active_mode(&self) -> Option<i32> {
+        self.last_value(INET_LOPT_ACTIVE)
+    }
+
+    /// The driver's current `{exit_on_close, …}` flag, if a record has been seen — the C's
+    /// `desc->inet.exitf` ([`INET_LOPT_EXITONCLOSE`], `inet_drv.c:904`).
+    ///
+    /// `None` means no such record was accepted, i.e. the driver's own default, `true`
+    /// (`exitf = 1`, `inet_drv.c:10929`). Both `{exit_on_close, true}` and the `0`/`1` operand the
+    /// wire carries are covered: the record's value word is the flag itself.
+    pub(crate) fn exit_on_close(&self) -> Option<bool> {
+        self.last_value(INET_LOPT_EXITONCLOSE).map(|value| value != 0)
+    }
+
+    /// The value word of the **last** recorded record carrying `code`, if any.
+    ///
+    /// Every record this mirror stores is a whole `[opt, val_be32, …]` span ([`walk`]), so a
+    /// record's value word is always its bytes `1..RECORD` whatever its total length.
+    fn last_value(&self, code: u8) -> Option<i32> {
+        let mut value = None;
+        for record in &self.records {
+            if record.first() != Some(&code) {
+                continue;
+            }
+            let Some(word) = record.get(1..RECORD) else {
+                continue;
+            };
+            value = Some(i32::from_be_bytes([word[0], word[1], word[2], word[3]]));
+        }
+        value
+    }
 }
 
 /// The per-port inet option mirrors of one [`PortRegistry`].

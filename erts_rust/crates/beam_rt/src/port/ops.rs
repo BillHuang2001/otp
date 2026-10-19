@@ -99,6 +99,18 @@ pub(crate) mod inet_opts;
 /// layer.
 #[path = "active_input.rs"]
 pub(crate) mod active_input;
+/// The **peer-close** channel — the driver's latched "the other end closed" observation
+/// ([`beam_io::PortRegistry::port_closed`]) turned into the `{tcp_closed, S}` message a socket
+/// port's owner is owed, with the active-mode gate and the once-per-descriptor latch the C's
+/// `tcp_recv_closed`/`tcp_closed_message` apply.
+///
+/// Declared here, as a child of this module, rather than beside `port.rs`'s other `mod`
+/// declarations: its latch life is this module's ([`PortExtras::forget_port`] drops it with the
+/// rest of a port's post-`open_port/2` state), and its drain method is a sibling of this module's
+/// own port operations — exactly the arrangement [`inet_opts`] and [`active_input`] already use.
+/// The `#[path]` keeps the source at `src/port/peer_closed.rs`, beside the rest of the port layer.
+#[path = "peer_closed.rs"]
+pub(crate) mod peer_closed;
 /// The port state `port_set_data/2`, `register/2` and `port_connect/2` establish after a
 /// port is open — the part of a port that is *not* `open_port/2`'s.
 ///
@@ -142,6 +154,12 @@ pub(crate) struct PortExtras {
     /// Empty for every non-`inet` port; a socket port fills it as `prim_inet` applies its options,
     /// and [`PortRegistry::close`](super::PortRegistry) drops it with the rest of the port's extras.
     inet: inet_opts::InetOptions,
+    /// The ports whose `{tcp_closed, S}` has already been **reported** — the peer-close channel's
+    /// once-per-descriptor latch ([`super::peer_closed`]).
+    ///
+    /// Empty for every non-socket port; dropped here with the rest of the port's extras, so a
+    /// recycled port number inherits nothing.
+    peer_closes: peer_closed::PeerCloseLatches,
 }
 
 impl PortExtras {
@@ -152,12 +170,14 @@ impl PortExtras {
     /// leaves the runtime — so a closed port's name disappears from `whereis/1` (the oracle's
     /// own answer: `undefined` after `port_close/1`) and a recycled port number starts clean.
     /// The inet option mirror goes the same way, so a recycled number cannot inherit a dead
-    /// socket's option block.
+    /// socket's option block, and so does the peer-close latch (a new port under this number has
+    /// observed nothing and reported nothing).
     pub(crate) fn forget_port(&mut self, number: u64) {
         self.data.remove(&number);
         self.names.remove(&number);
         self.links.remove(&number);
         self.inet.forget_port(number);
+        self.peer_closes.forget(number);
     }
 }
 impl PortRegistry {
