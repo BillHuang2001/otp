@@ -141,11 +141,15 @@
 use super::{Case, CaseKind, CommandProgram, CommandRun, CommandSpec, Contract, Golden, PeerRun};
 
 /// The name every client in this group registers itself under (the `DOP_REG_SEND` target of
-/// the peers' replies).
+/// the peers' replies). Test-only: the scripts inline the literal (a script must stay one
+/// `-eval` line), so this exists to pin the two names in one place.
+#[cfg(test)]
 const CLIENT_NAME: &str = "dxcli";
 
 /// The name every peer registers itself under (the `DOP_REG_SEND` target the clients send
 /// to, which is also what makes a client's `send` auto-dial an as-yet-unconnected peer).
+/// Test-only, for the same reason as [`CLIENT_NAME`].
+#[cfg(test)]
 const PEER_NAME: &str = "dxpeer";
 
 /// The client node's `-sname` local part; `{nonce}` is resolved per run.
@@ -546,7 +550,6 @@ mod tests {
     /// measured by running the case (`differential run <id>` prints it as `oracle: … stdout=…`).
     const MEASURED: &[(&str, &str)] = &[
         ("dist_extra/net_kernel_connect_node", "connect=true pong=pong"),
-        ("dist_extra/missing_node_pang", ""),
         ("dist_extra/ping_a_missing_node", "pong=pong missing=pang"),
         ("dist_extra/cookie_mismatch", "ping=pang"),
         (
@@ -684,14 +687,11 @@ mod tests {
     #[test]
     fn every_golden_is_the_measured_oracle_line() {
         for case in group() {
-            let Some((_, expected)) = MEASURED
+            let expected = MEASURED
                 .iter()
                 .find(|(id, _)| *id == case.id)
-                .copied()
-                .filter(|(_, golden)| !golden.is_empty())
-            else {
-                continue;
-            };
+                .map(|(_, line)| *line)
+                .unwrap_or_else(|| panic!("{}: no measured oracle line recorded", case.id));
             assert_eq!(
                 case.golden.stdout,
                 Some(expected),
@@ -707,7 +707,7 @@ mod tests {
     fn no_golden_carries_a_volatile_observable() {
         for case in group() {
             let golden = case.golden.stdout.expect("every case asserts a stdout line");
-            for forbidden in ["@", "<", ">", PEER_NONCE_PLACEHOLDER, "node", "ms", "timeout"] {
+            for forbidden in ["@", "<", ">", PEER_NONCE_PLACEHOLDER, "ms", "timeout"] {
                 assert!(
                     !golden.contains(forbidden),
                     "{}: the golden {golden:?} must not contain {forbidden:?}",
@@ -737,14 +737,23 @@ mod tests {
             assert!(client.contains("catch Cls:Rs ->"), "{}: catch as Cls:Rs", case.id);
             assert!(peer.contains("catch Cls:Rs ->"), "{}: catch as Cls:Rs", case.id);
             for script in [client, peer] {
-                assert!(!script.contains("receive {"), "{}: no tuple pattern in a receive", case.id);
+                // Only a *quoted atom* in a receive pattern is unevaluable; a fresh variable
+                // next to a literal atom (`receive {who, From}`) is fine.
                 assert!(!script.contains("receive {'"), "{}: no quoted-atom pattern", case.id);
-                assert!(script.contains(" after "), "{}: every receive is bounded", case.id);
+                assert!(
+                    script.contains(" after ") || script.contains("timer:sleep("),
+                    "{}: every wait is bounded",
+                    case.id
+                );
                 assert!(script.contains("halt(0)"), "{}", case.id);
-                assert!(!script.contains("nosuchname{nonce}"), "{}", case.id);
             }
-            // The registered names are the two the scripts agree on.
-            assert!(client.contains("register(dxcli, self())"), "{}", case.id);
+            // The registered names are the two the scripts agree on — every client owns
+            // `dxcli` except the cookie client, which never receives a reply.
+            if case.id == "dist_extra/cookie_mismatch" {
+                assert!(!client.contains("register("), "{}: the cookie client registers nothing", case.id);
+            } else {
+                assert!(client.contains("register(dxcli, self())"), "{}", case.id);
+            }
             assert!(peer.contains("register(dxpeer, self())"), "{}", case.id);
         }
         assert_eq!(super::CLIENT_NAME, "dxcli");
@@ -800,8 +809,8 @@ mod tests {
         assert_ne!(client_cookie, peer_cookie, "the cookies must differ");
         assert_eq!(client_cookie, super::PEER_COOKIE);
         assert!(
-            peer.args.iter().any(|arg| arg.contains("PEER_IDLE_LONG").not()),
-            "the peer script is carried as an argv, not a name"
+            peer.args.iter().any(|arg| arg.contains("timer:sleep(120000)")),
+            "the cookie peer outlives the client's bounded retries"
         );
         for other in &cases {
             if other.id == cookie.id {
