@@ -174,7 +174,11 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     non-number or a magnitude that overflows a finite double is `badarg`
     (`erl_bits.c:1341/1373`).
   - `size.rs` → the segment size validation (`SegSize`/`segment_size`, `seg_nbits`,
-    `float_nbits`) and the `SegReason` raise (`fail_seg`).
+    `float_nbits`) and the `SegReason` raise (`fail_seg`). `segment_size` short-circuits a
+    literal `Operand::Integer`/`Operand::Character` through `literal_segment_size` (same
+    `BadArg`/`Small`/`SystemLimit` discrimination) instead of `read_operand` →
+    `make_integer_unrooted`; it pays on `long_append`/`decode` and costs `encode` ~0.8 %
+    (whose sizes arrive as register shadows, never a literal).
   - `tests.rs` → `#[cfg(test)]` unit tests for the segment encoders.
   - `wide_tests.rs` → `#[cfg(test)]` unit tests for the integer segment's value masking
     (a bignum into a narrow field, big/little endian, signed/unsigned, a literal-operand
