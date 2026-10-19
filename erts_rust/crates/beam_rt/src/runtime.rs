@@ -2113,7 +2113,11 @@ impl Runtime {
         }
         // The sequential-trace tokens: `set_label`/`set_from` store the term unstabilized.
         self.seq_trace.gather_off_heap_roots(out);
-        // Every live process's dictionary and mailbox queue.
+        // Every live process's **complete** published root set — the same five families
+        // `Process::collect` gathers (`crate::context::gc::resources::reclaim` mirrors them for
+        // one process): the registers (a parked process's published x registers + Erlang stack +
+        // the host-published extra roots), the mailbox queue, the dictionary, the saved arguments
+        // and the pending signals.
         for pid in self.processes.pids() {
             let Some(process) = self.processes.get(pid) else {
                 continue;
@@ -2127,6 +2131,9 @@ impl Runtime {
                 out.push(message.token());
                 out.push(message.from());
             }
+            process.registers().gather_roots(out);
+            process.saved_args().gather_roots(out);
+            process.signals().gather_roots(out);
         }
         // A spawn recorded but not yet absorbed into the process table.
         for spawn in &self.pending_spawns {
@@ -2135,15 +2142,16 @@ impl Runtime {
                 out.push(*fun);
             }
         }
-        // The arguments a **live, not-yet-run** engine holds: the child's first root set, whose
-        // arena copies nothing else in this runtime names (`RunnerState::gather_off_heap_roots`).
-        // An engine whose first run already consumed them publishes **nothing** — a consumed
-        // argument set is dead state, and rooting it retains a resource term for the runtime's
-        // life (`ProcessEngine::args_consumed`).
+        // A live engine's terms (`RunnerState::gather_off_heap_roots`): the arena-stable arguments
+        // of a child that has not consumed them yet, and the root set of a machine parked in an
+        // **un-published** (relocation-exempt) window — the only family that names a live term of
+        // a process whose `receive` park published nothing into its registers.
         // `RunnerState` is moved out of the runtime for the duration of a scheduler pass, so this
         // covers the two sites that run outside one (the `-eval` statement boundary and a nested
         // run's epilogue); the in-pass park arm publishes the machine's own root set instead.
-        self.runner_state.gather_off_heap_roots(out);
+        let processes = &self.processes;
+        self.runner_state
+            .gather_off_heap_roots(out, |pid| processes.get(pid).is_some());
         // Pending `erlang:send_after` deliveries. The message is an arena copy, so a refc payload
         // in it is already flattened — but a NIF **resource** term's copy keeps its reference
         // identity, which is how the resource prune recognises a copy, so the family must be a

@@ -29,6 +29,7 @@
 use std::sync::Arc;
 
 use beam_common::BeamError;
+use beam_engine::context::RootSet;
 use beam_engine::{Machine, Tier};
 use beam_loader::Module;
 use beam_process::ProcessId;
@@ -336,32 +337,69 @@ impl RunnerState {
     }
 
     /// Appends every **stable** term a live engine still names to `out`: the arguments of a
-    /// [`ProcessEngine::arena_args`] engine and the fun term of its [`ProcessEntry::Fun`] entry.
+    /// [`ProcessEngine::arena_args`] engine, the fun term of its [`ProcessEntry::Fun`] entry, and
+    /// the root set of a machine parked in an **un-published** window.
     ///
     /// An engine outlives the slice that created it (a `receive` resumes in the same machine), and
     /// its first arguments are the child's **first root set** — the arena copies a spawn made
     /// ([`RunnerState::spawn_stable`]). Nothing else in this runtime names them: they stand on the
-    /// pointer-stable arena, not in any process's mailbox or dictionary, so without this the
+    /// pointer-stable arena, not in any process's mailbox or dictionary, so without them the
     /// reclamation prunes (`crate::eval::reclaim`) answer a NIF resource a spawn argument carries
-    /// unreachable and release it while the child still holds it.
+    /// unreachable and release it while the child still holds it. A **consumed** argument set is
+    /// dead state and contributes nothing ([`ProcessEngine::args_consumed`]): the machine copied it
+    /// into registers, and those are published by the second family below.
     ///
-    /// Only **live** engines are enumerated — an engine whose first run already consumed its
-    /// arguments contributes nothing (see [`ProcessEngine::args_consumed`]), and the enumeration
-    /// is `O(1)` when there are no engines at all.
+    /// # The parked machine's root set — the live family
+    ///
+    /// A process parked in a **relocation-exempt** window (every `receive` park, and a `Yield` park
+    /// whose slice ended with a live FR prefix) publishes **nothing** into its process
+    /// [`Registers`](beam_process::Registers): nothing can relocate its heap for the window, so the
+    /// machine stays the authoritative root set (`ProcessEngine::parked_published` is `false`). Its
+    /// live terms are then named by nothing but `machine.x`/`machine.stack`/`machine.fr` — exactly
+    /// the `x(0)` a `receive` is about to match — so a resource a parked child holds in a register
+    /// is reachable **only** through this family.
+    ///
+    /// A machine parked in a **publishing** window is the opposite case: its roots were copied into
+    /// the process's `Registers`, which a collection may then relocate, leaving the machine's own
+    /// copy pointing into an abandoned space. Those words must therefore **not** be published —
+    /// the process's registers are the truth there, and [`Runtime::gather_off_heap_roots`] gathers
+    /// them (`crate::runtime::Runtime::gather_off_heap_roots`).
+    ///
+    /// Both families are gated on the pid still being in `live` process table: an engine is not
+    /// removed when its process terminates, and a terminated process's heap is gone, so its
+    /// machine's registers would be dangling words. Only **live**, **un-published** engines are
+    /// enumerated, and the enumeration is `O(1)` when there are no engines at all.
     ///
     /// `RunnerState` is moved out of the [`Runtime`](crate::runtime::Runtime) for the duration of
     /// a scheduler pass, so this covers the sites that run outside one (the `-eval` statement
     /// boundary and a nested run's epilogue); the in-pass park arm publishes the machine's own
     /// root set instead.
-    pub(crate) fn gather_off_heap_roots(&self, out: &mut Vec<Eterm>) {
-        for engine in self.engines.values() {
-            if !engine.arena_args || engine.args_consumed {
+    pub(crate) fn gather_off_heap_roots(
+        &mut self,
+        out: &mut Vec<Eterm>,
+        live: impl Fn(ProcessId) -> bool,
+    ) {
+        for (pid, engine) in self.engines.iter_mut() {
+            if engine.arena_args && !engine.args_consumed {
+                out.extend_from_slice(&engine.args);
+                if let ProcessEntry::Fun { fun, .. } = &engine.entry {
+                    out.push(*fun);
+                }
+            }
+            // The parked machine's own root set: the only family that names a live term of a
+            // process parked in a relocation-exempt (un-published) window. Skipped for a
+            // publishing window (the process's registers hold the relocated truth) and for an
+            // engine whose process has terminated (its heap is gone).
+            if engine.parked_published || !live(*pid) {
                 continue;
             }
-            out.extend_from_slice(&engine.args);
-            if let ProcessEntry::Fun { fun, .. } = &engine.entry {
-                out.push(*fun);
-            }
+            let fr = engine.machine.fr_mark() as usize;
+            engine.machine.with_roots(RootSet::ALL_LIVE, |roots| {
+                out.extend_from_slice(roots.live_x());
+                out.extend_from_slice(roots.stack);
+                let fr = fr.min(roots.fr.len());
+                out.extend_from_slice(&roots.fr[..fr]);
+            });
         }
     }
 
