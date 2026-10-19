@@ -59,7 +59,7 @@ use beam_engine::{terms, ExecutionContext, MinimalContext};
 use beam_gc::HeapPolicy;
 use beam_loader::Module;
 use beam_process::{
-    MonitorRef, Priority, ProcessId, ProcessState, ProcessTable, RefAllocator, Scheduler,
+    MonitorRef, Priority, ProcessId, ProcessState, ProcessTable, RefAllocator, RemotePid, Scheduler,
     SignalAtoms,
 };
 use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm};
@@ -70,7 +70,7 @@ use crate::codeserver::CodeServer;
 use crate::config::{strategy_env_default, ArgTerm, InitArgs, MaxHeapSetting, RuntimeConfig};
 use crate::context::gc_walk::{ForeignLatch, RuntimeCollectionGate};
 use crate::context::{PersistentTermStore, RuntimeContext};
-use crate::dist::{resolve_cookie, DistNode, NONODE_NAME};
+use crate::dist::{resolve_cookie, DistNode, NodeName, NONODE_NAME};
 use crate::dist_client::{DistClient, DIST_CONNECT_TIMEOUT};
 use crate::error;
 use crate::eval::FunBody;
@@ -88,6 +88,8 @@ use crate::trace::TraceState;
 use self::timer_wakes::{TimerSlot, TimerWakes};
 
 pub(crate) mod executing;
+#[cfg(test)]
+mod dist_connect_tests;
 mod ets_owner;
 mod gc;
 mod scheduler;
@@ -3076,11 +3078,92 @@ impl Runtime {
         })
     }
 
+    /// Establishes the link to `peer` **on demand**, the way ERTS sets a distribution entry
+    /// up for a node a message addresses (`dist.c`'s `erts_get_dist_entry`): a send to a node
+    /// this runtime has not dialled yet is what opens the connection.
+    ///
+    /// The one gate is [`Runtime::dist_is_connected`], which covers **both** halves: a peer
+    /// reached by a link this runtime dialled *or* by one the peer opened is already reachable,
+    /// so it is never dialled again (a re-connect would replace the live link with a new
+    /// connection). A runtime with **no** client (no `-name`/`-sname`) and a `peer` naming this
+    /// runtime's own node are skipped entirely, so a non-distributed runtime — and the
+    /// differential corpus that pins it — behaves byte for byte as before.
+    ///
+    /// A failed attempt is deliberately **not** raised here: [`Runtime::dist_connect`] is
+    /// bounded by [`DIST_CONNECT_TIMEOUT`] and records why in [`DistClient::last_error`], and
+    /// the caller's own established-link lookup answers the typed
+    /// `distribution: no established connection to node <label>` — never a silent drop.
+    fn dist_ensure_link(&mut self, peer: &str) {
+        if self.dist_client.is_none() || self.dist_peer_is_local(peer) {
+            return;
+        }
+        if self.dist_is_connected(peer) {
+            return;
+        }
+        let dial = self.dist_dial_name(peer);
+        let _ = self.dist_connect(&dial);
+    }
+
+    /// The name [`Runtime::dist_connect`] must be handed for `peer`: the peer's own **short**
+    /// name when the peer is on **this** host, else `peer` verbatim.
+    ///
+    /// Two facts force this. `epmd` registers a node under its short name whatever it was
+    /// started with (`-sname foo` and `-name foo@host` both appear as `foo` in `epmd -names`),
+    /// and this runtime's `epmd` lookup queries the **local** `epmd`
+    /// ([`crate::dist_client::DistClient::connect`]) — so a peer on this host is reachable and
+    /// must be dialled by the name that `epmd` knows it by. A peer whose host part is not this
+    /// host is left verbatim: dialling its short name would key the link to
+    /// `short@<this host>` — a node that is not the one addressed.
+    ///
+    /// This is the host-aware superset of [`crate::native`]'s `connect_name`
+    /// (`net_adm:ping/1`'s dial form, which strips the host part of every `name@host`).
+    fn dist_dial_name(&self, peer: &str) -> String {
+        let own_host = self
+            .node_name()
+            .and_then(|own| own.split_once('@'))
+            .map(|(_short, host)| host);
+        match peer.split_once('@') {
+            Some((short, host)) if Some(host) == own_host => short.to_string(),
+            _ => peer.to_string(),
+        }
+    }
+
+    /// [`Runtime::dist_ensure_link`] for a send whose destination is a **node atom term**
+    /// (an external pid's or external reference's node slot).
+    ///
+    /// A term that names this runtime's own node — or an atom the shared table cannot name —
+    /// opens nothing: the send's own link lookup is the honest answer in both cases.
+    fn dist_ensure_link_to_node(&mut self, node: Eterm) {
+        if node == make_atom(self.local_node) {
+            return;
+        }
+        if let Some(peer) = self.atom_name_of(node).map(str::to_owned) {
+            self.dist_ensure_link(&peer);
+        }
+    }
+
+    /// Whether `peer` names **this** runtime's own node, in the full `node@host` form
+    /// [`Runtime::dist_connect`] keys a link by.
+    ///
+    /// A send addressed to the local node is delivered locally (see
+    /// `crate::context::send::classify_send_destination`), so it must never dial this node's
+    /// own distribution port.
+    fn dist_peer_is_local(&self, peer: &str) -> bool {
+        match self.node_name() {
+            Some(own) => NodeName::parse(peer).full() == own,
+            None => false,
+        }
+    }
+
     /// Sends `msg` from `from` to the process **registered as** `name` on `peer`
     /// (`{DOP_REG_SEND, From, Cookie, ToName} -- Msg`).
     ///
-    /// The link must already be established ([`Runtime::dist_connect`]); an unconnected peer is
-    /// a typed error, never a silent drop and never a fabricated success.
+    /// A peer with no established link is **dialled first**
+    /// ([`Runtime::dist_ensure_link`]) — ERTS establishes the connection on demand, so the
+    /// send itself is what reaches a node this runtime has not talked to yet. The frame is
+    /// still emitted only on an established link; whatever the attempt's outcome, an
+    /// unreachable peer stays a typed error, never a silent drop and never a fabricated
+    /// success.
     ///
     /// # Errors
     ///
@@ -3092,6 +3175,7 @@ impl Runtime {
         from: ProcessId,
         msg: Eterm,
     ) -> Result<()> {
+        self.dist_ensure_link(peer);
         let Some(client) = self.dist_client.as_ref() else {
             return Err(error::message(
                 "distribution: this runtime is not a distributed node (no -name/-sname)",
@@ -3105,7 +3189,9 @@ impl Runtime {
     ///
     /// The send opcode is the driver's choice from the negotiated flags
     /// (`DOP_SEND_SENDER` when the peer negotiated it), so it cannot be made here. As
-    /// [`Runtime::dist_send_reg_send`], the link must be established first.
+    /// [`Runtime::dist_send_reg_send`], the destination node is **dialled first** when this
+    /// runtime has no link to it; a term that is not an external pid is left to the send
+    /// below, which owns that refusal.
     ///
     /// # Errors
     ///
@@ -3116,6 +3202,9 @@ impl Runtime {
         from: ProcessId,
         msg: Eterm,
     ) -> Result<()> {
+        if let Ok(remote) = RemotePid::from_eterm(to) {
+            self.dist_ensure_link_to_node(remote.node());
+        }
         let Some(client) = self.dist_client.as_ref() else {
             return Err(error::message(
                 "distribution: this runtime is not a distributed node (no -name/-sname)",
@@ -3128,7 +3217,8 @@ impl Runtime {
     /// (`{DOP_ALIAS_SEND, From, To} -- Msg`, `dist.c:2563`).
     ///
     /// `to` is an external **reference** term; the node in its node slot selects the link,
-    /// exactly as [`Runtime::dist_send_message_pid`]'s pid does. The link must have
+    /// exactly as [`Runtime::dist_send_message_pid`]'s pid does, and is **dialled first** when
+    /// this runtime has no link to it. The link must have
     /// negotiated `DFLAG_ALIAS` — a link that did not is the typed
     /// `distribution: the link to <node> did not negotiate DFLAG_ALIAS` (OTP 29 offers the
     /// flag in its default and addable masks but does not make it mandatory, so a peer can
@@ -3144,6 +3234,9 @@ impl Runtime {
         from: ProcessId,
         msg: Eterm,
     ) -> Result<()> {
+        if let Ok((node, _ids, _creation)) = beam_codec::term::external_ref_parts(to) {
+            self.dist_ensure_link_to_node(node);
+        }
         let Some(client) = self.dist_client.as_ref() else {
             return Err(error::message(
                 "distribution: this runtime is not a distributed node (no -name/-sname)",
