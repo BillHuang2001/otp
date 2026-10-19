@@ -97,11 +97,15 @@ deopt are the load-bearing contracts.
 - **Y-slot operands are guarded by a published frame window.** A lowering that reads or writes a `Y`
   slot (an inlined `Move`, and the small-int arith fast path) addresses `machine.stack[y_base + k*8]`
   against the current frame's `[y_base, y_end)` held on `JitRuntime` (`RUNTIME_YBASE_DISP`/
-  `RUNTIME_YEND_DISP`). The window is published in a **Y-touching** block's prologue (`jit_publish_y`,
-  the position store fused with the refresh, so such a block pays nothing extra) and refreshed
-  (`jit_refresh_y`) after an **in-block helper call** only when a later instruction of the block still
-  touches `Y` (`Allocation::y_last`/`refresh_y_after`); a `Y`-free block keeps the plain position store
-  and pays nothing, and the driver never refreshes. The emitted guard — and a null window — only ever
+  `RUNTIME_YEND_DISP`). The window is published in a block's prologue (`jit_publish_y`, the position
+  store fused with the refresh) **only when `Allocation::prologue_publishes_y()`** — false when the
+  block touches no `Y` at all, and false when its *first* `Y` access lies after an in-block
+  `allocate`/`allocate_heap`/`trim`, because those helpers re-publish the window on their own continue
+  arm and would overwrite the prologue's work before anything could read it (a **dead publish**: 52 232
+  of 185 113 `Y`-touching emitted ranges corpus-wide, **28.2 %**). It is refreshed (`jit_refresh_y`)
+  after an **in-block helper call** only when a later instruction of the block still touches `Y`
+  (`Allocation::y_last`/`refresh_y_after`); a `Y`-free block keeps the plain position store and pays
+  nothing, and the driver never refreshes. The emitted guard — and a null window — only ever
   *rejects* (branches to `jit_step_one`); an index the `lea ... disp32` cannot address is refused at
   compile time. Every other `Y`-operand instruction (`get_list`/`get_hd`/`get_tl`/…) is **not** a
   window access — it deopts to the interpreter, which reads `machine.stack` itself. A `Y` slot is never
@@ -155,6 +159,7 @@ absolute.
 | frame-op helpers re-publish the Y window inside the helper (`jit_allocate`/`jit_allocate_heap`/`jit_trim`/`jit_deallocate`) | **−1.49 %** (0.985087 / 0.985089) | −0.17 % (0.998177 / 0.998296) |
 | tail forms' probe carries its resolution as block-ABI immediates (`runtime.rs::encode_local_call`/`probe_local_call`) | **−0.406 %** (0.995936 / 0.995940) | **−0.669 %** (0.993313 / 0.993417) |
 | exit-spill dedup where a helper spill and an exit coincide (`emit/link.rs::ExitSpill`) | −0.194 % (0.998059 / 0.998074) | −0.064 % / −0.039 % |
+| prologue `Y`-window publish elided when provably dead (`emit/regs.rs::prologue_publishes_y`, gated at `emit/prologue.rs:87`) | **−2.33 %** (0.976676 / 0.976684) | −0.40 % / −0.36 % (0.996005 / 0.996398) |
 | the last two combined (pre-lever-A → HEAD) | **−0.598 %** (0.994016 / 0.994022) | **−0.714 %** (0.992857 / 0.993020) |
 
 The two `≤ 0.7 %` levers are additive to within 0.001 pp on both workloads, which validates the
@@ -204,24 +209,33 @@ buy a deterministic `−9.12 %` dirty-set spill stores corpus-wide (1 496 158 �
   against the `list_walk` row above, since that workload is 7-instruction blocks.
 - **`list_walk` against the system oracle, same window, paired** (`tools/bench --quick`, 3 rounds, side order alternated, one process at a time, load 5.2–5.7): rust **21.03 ns/element** (min) / 21.45 (median) vs the oracle's **2.02** / 2.70 → **7.71× (min) / 7.99× (median)**. The m17 report's **11.80×** (30.55 vs 2.52 ns/element) was taken under load 40–55; both sides scale with load, so the ratio is the comparable figure and an absolute ns is a same-window reading only. Startup belongs to the boot path, not this node: it reads 3.64× in the same window (457.9 ms vs 122.2 ms) and a parent-vs-HEAD paired A/B puts these commits at **0.86–1.02×**, i.e. unchanged.
 - **The in-crate `src/bench` decomposition harness** (`foreign_bstr_to_lower_decomposition`, release, pinned, same window): **min 5965.9 / median 6054.0 ns/call** at `instr_per_call = 438.00`, `local_call_requests_per_call = 61.00`, `driver_round_trips_per_call = 3.00`. The pre-work baseline read min 5521.5 / median 10394.7 in a far more loaded window, so those two are **not** comparable absolutes; the deterministic per-call counters are, and the whole-process instruction count is the figure that moved (130 439–130 466 → 126 812–126 842). What remains on this workload is **not** call setup: 438 IR instructions for a 30-byte lowercase (`~14.6` per byte) is the per-instruction execution cost, which is the tier's next lever and not a per-call one.
-- **Where the time goes now** (`perf record -g`, flat self time, `list_walk` at N = 50 000, release;
-  pre → HEAD across the two `≤ 0.7 %` levers): `jit_publish_y` 17.15 → **19.90 %**, `jit_allocate`
-  10.28 → **10.21 %**, `Machine::local_call_seam` 10.64 → **9.10 %**, `call::jit_call_store` 9.39 →
-  **6.14 %**, `enter_in_block` 8.59 → **8.95 %**, `call::call_store_impl` 7.72 → **7.53 %** (the
-  call-store pair 17.11 → 13.67 %), `jit_deallocate_return` 4.94 → **4.92 %**, `family::jit_family`
-  4.72 → **4.91 %**, `CountingContext::resolve_local_call` 2.53 → **3.61 %**,
-  `CountingContext::reduce` 1.89 → **2.13 %**, `families::dispatch` 1.30 → **1.24 %**.
-  `probe_local_call` no longer appears at all, and `jit_refresh_y` falls below the 0.6 % cut on both
-  sides; the rising shares are share inflation over a 0.6 %-smaller total (every absolute count is
-  flat or down). The block-entry path (`drive`, `enter_compiled`, `CompiledModule::function`,
-  `JitRuntime::refresh_y_base`) and `return_word` are all off the profile.
-  What remains **in this node**: `jit_publish_y` (~20 %, which already fuses the position store with
-  the Y-window refresh, so it needs a cheaper *mechanism* rather than a removal), `jit_allocate` (a
-  real heap/frame-admission door) and `enter_in_block` (the frozen skipped-iteration reproduction).
-  `Machine::local_call_seam` (9 %) and `CountingContext::resolve_local_call` are the host-owned seam
-  and must not be short-circuited from the tier; `beam_rt`'s rooted collection
-  (`gc_walk::Walk::seed` + `Visited::insert` + `Walk::run` + `Nursery::contains`) is the largest
-  single owner outside this node.
+- **Where the time goes now** (`perf record -e cpu_core/cycles/u -g`, flat self time, `list_walk` at
+  N = 50 000, release, 73 945 samples): `jit_allocate` **16.63 %**, `Machine::local_call_seam`
+  **11.25 %**, `jit_publish_y` 20.45 → **9.80 %** (the prologue-publish gate below), `enter_in_block`
+  **8.74 %**, `call::call_store_impl` **7.61 %**, `jit_deallocate_return` **4.99 %`,
+  `family::jit_family` **4.95 %**, `call::jit_call_store` **4.63 %**, `jit_set_position` **4.37 %**
+  (the ranges the gate demoted off `jit_publish_y`), `CountingContext::resolve_local_call` **2.18 %**,
+  `CountingContext::reduce` **2.12 %**. `probe_local_call` no longer appears at all, and the
+  block-entry path (`drive`, `enter_compiled`, `CompiledModule::function`, `return_word`) is off the
+  profile. Shares inflate as the total shrinks — compare only within one window.
+  What remains **in this node**: the **continuation sub-blocks** — a call's `pc+1` range sits *before*
+  the `call`, so its `Allocation` sees no frame helper and `prologue_publishes_y` is true there; that
+  is 2 of the 4 publishes `list_walk` used to pay per element, and closing it needs a **range-crossing**
+  witness (the transfer helper already republishes the window after its frame teardown, so the target's
+  prologue could skip), with `y_prologue_publishes` vs `y_blocks` as the counter that lever must move.
+  Then `jit_allocate` (a real heap/frame-admission door) and `enter_in_block` (the frozen
+  skipped-iteration reproduction). `Machine::local_call_seam` and
+  `CountingContext::resolve_local_call` are the host-owned seam (`src/machine/**`,
+  `src/interpreter/dispatch.rs`) and must not be short-circuited from the tier; `beam_rt`'s rooted
+  collection is the largest single owner outside this node.
+- **The position store vs. the window derivation, split and measured** (`jit_publish_y` is two jobs):
+  the `Machine::set_current_code` store is **3.58 %** of the per-rep count and the re-derivation is the
+  majority of the row (frame deref + `stack` pointer + mul-add ≈42 %, `frames.len()` ≈8 %,
+  `movl` store ≈18.3 %, the `#[cfg(test)]` counter probe ≈7.6 %). The store is **not** a removal
+  candidate — `Machine::current_code` is the frozen publication set a resume and `process_info/2` read
+  — so every lever on this row attacks the derivation by not needing it. Removing the derivation while
+  keeping the store is **not** a valid split: with no window published the emitted Y guard rejects, the
+  tier deopts (`result_is_correct = false`), so that measurement is an artifact, not a cost.
 
 ## Known Issues (per-process cost attribution)
 - **The entry path is O(1) on the key's own digest; only the cross-module path uses the address memo.** `CodeCache::compiled_handle` (`cache/mod.rs`) resolves a module through `CacheKey::of` (the O(1) digest **plus** the O(1) `atom_table.snapshot()` namespace half): for a real `.beam` the module half is the module's **load-time MD5** (`Module::checksum`, read as a plain `Copy` — no hash, no allocation, no name lookup), so the `&Module`-only entry used by `run_baseline_cached{,_outcome,_label_outcome,_resume_outcome}` is O(1) on **every** entry and resume with no IR re-hash; only a synthetic all-zero-checksum module (`Module::default()`) falls to the `Content { name, fingerprint }` variant, whose `fingerprint` is a hash of the whole decoded IR (the cost there scales with module size — `../MEASURED.md`: ~2 µs tiny, ~141 µs at 2048 instructions). The address memo is therefore a **redundant micro-optimisation on the digest path**, retained for the priming API `remember_module`, which has no production caller (its callers are tests); it is filled by `cached_module_blocks` (the cross-module `Arc<Module>` route → `remember`) and by `remember_module`, and its entry is honoured only while its `Weak<Module>` still upgrades **and** the module's current `atom_table.snapshot()` still equals the memoized key's (a stale generation recompiles). Pinned by `cache/tests.rs::a_real_loaded_beam_never_rehashes_its_ir_on_any_entry_path` (0 fingerprints across all four entry paths), `cache/tests.rs::a_dead_memo_entry_is_ignored_and_falls_back_to_the_content_hash` (content fallback = `before + 1`), `cache/tests.rs::a_memoized_lookup_does_not_rehash_the_ir` (the memoized cross-module path) and the namespace pin `cache/tests.rs::a_second_atom_namespace_is_never_handed_the_first_namespaces_artifact`.
@@ -231,7 +245,7 @@ buy a deterministic `−9.12 %` dirty-set spill stores corpus-wide (1 496 158 �
 ## Execution-position bookkeeping (`Machine::current_code`) — the complete store set
 `Machine::set_current_code` (`src/machine/location.rs:160`, a plain `self.current_code = Some(..)`) is the **only** writer, and `src/jit/**` reaches it from exactly these sites:
 - **Driver loop head** — `baseline/mod.rs:1102`, `(func, pc)` of the address about to be entered, **before** the `reductions` bump (`:1103`), before `ctx.reduce(1)` (`:1110`) and before `code.enter_cached`/`enter_compiled` (`:1128`/`:1142`). Both native tiers run this one loop (Cranelift enters it through `baseline::run_native*`), so this is the only per-iteration store.
-- **Block / continuation-sub-block prologue** — emitted at `baseline/emit/prologue.rs:84-88` as `jit_publish_y` (Y-touching block, `runtime.rs:1027` → store at `:1041`) or `jit_set_position` (otherwise, `runtime.rs:993` → store at `:1005`), with `pc = the block's start` (a sub-block therefore stores its own post-call continuation). Runs after `code.enter`, inside the block.
+- **Block / continuation-sub-block prologue** — emitted at `baseline/emit/prologue.rs:87` as `jit_publish_y` (when `Allocation::prologue_publishes_y()`, `runtime.rs:1260` → store at `:1274`) or `jit_set_position` (otherwise, `runtime.rs:1226` → store at `:1238`), with `pc = the block's start` (a sub-block therefore stores its own post-call continuation). Runs after `code.enter`, inside the block.
 - **Instruction-granular helpers** (each stores its own `(func, pc)` before touching the machine): `jit_step_one` → `step_instruction_with_entry` (`runtime.rs:485`/`508` → `interpreter/dispatch.rs:201`); `jit_step_ext` (`runtime.rs:576`, before `call_ext_dispatch`); `jit_family` (`family.rs:85`; `jit_receive` is a thin wrapper, `receive.rs:68`); `jit_test` (`test_helper.rs:121`); the frame/heap family `jit_deallocate` (`:1439`), `jit_return` (`:1471`), `jit_deallocate_return` (`:1514`), `jit_allocate` (`:1557`), `jit_allocate_heap` (`:1600`, **before** `ensure_heap`), `jit_test_heap` (`:1638`, before `ensure_heap`), `jit_trim` (`:1671`); and `jit_call_store`, on its **served** arm only (see below).
 - **The return arms store a *second*, conditional position — the resumed continuation.** `jit_return`/`jit_deallocate_return` store the return's own `(func, pc)` for the pop (as before), then `return_word` (`runtime.rs:1358`) resolves the continuation through the shared `enter_in_block` (`:1437`) → `resolve_resume_entry` (`:1517`): the published `EntryTables` answer a **same-function** entry with two `Vec` indexings and no artifact lookup, and anything else goes to `cross_function_entry` (`:1481`), which resolves the address in the artifact the driver published (`JitRuntime::compiled`, `:264`) via `CompiledModule::native_entry_tables` (`code.rs:457`) and **checks the target function's own register-file bound in Rust** (a different function's bound is a different number, so the same-function soundness argument does not carry over). On a hit `enter_in_block` stores that `(func, pc)`, bumps `reductions` and offers `ctx.reduce(1)` (`:1442-1470`) — the skipped driver iteration's work in the driver's own order, so a refusal leaves the machine parked where a driver-side refusal would have — and, for a cross-function transfer, replaces the published tables with the target's before the emitted arm tail-jumps to the entry. On every other outcome (no artifact published, an uncompiled address, an unsatisfied bound) nothing is stored and the word goes back to the driver, which publishes at its loop head, so the declining arm keeps exactly the pre-existing store set.
 - **Sites that store NOTHING** (the position they run under is the last store above): `jit_ext_call` — `resolve_ext_entry` asks `ctx.resolve_external_call` at `runtime.rs:818`, stores the `EXT_CALL` continuation at `:839-843` and returns `ENTER` with no store; `jit_call_store`/`jit_call_store_linked` — the local-call seam is consulted at `call.rs:271` and `set_current_code(func, pc)` happens **only on the *served* arm** (`call.rs:290`, where a raise from inside the seam's BIF must report at instruction granularity); the store-and-link arm stores nothing itself — a **resolved** transfer's position is the callee entry `enter_in_block` stored just before the jump (exactly the address a driver iteration would have published), and a **declined** one leaves the position to the driver's loop head; `jit_local_call`/`probe_local_call` (`runtime.rs:878`/`:948`) — no store at all, and the local-call seam's `call_bif_named` (`dispatch.rs:1129`) therefore runs with a stale position; `jit_bif_value` (`bif_helper.rs:99`, declines to `jit_step_one` at `:123`); `jit_tail_call` (`runtime.rs:1093`), whose callers spill and transfer (the successor prologue or the driver stores next).
