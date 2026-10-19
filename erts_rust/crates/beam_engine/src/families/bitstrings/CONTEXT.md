@@ -334,6 +334,23 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   (C's `big_to_double < 0`).
 
 ## Out-of-node findings (do not fix here)
+- **`crates/beam_loader` — the `bs_match` command-list generator expansion.** C never interprets a
+  flattened command list at run time: `emu/ops.tab:1102` + `emu/generators.tab:1096-1112` make the
+  loader/assembler generator explode `bs_match` into dedicated instructions at load time
+  (`i_bs_ensure_bits`/`i_bs_ensure_bits_unit`/`i_bs_read_bits`/`i_bs_eq`/`i_bs_extract_integer`/
+  `i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_get_tail`/`i_bs_skip`/`i_bs_drop`, incl.
+  the fused `i_bs_read_bits Ctx=x u==8 | i_bs_extract_integer u==8 Dst=x => i_bs_read_integer_8`).
+  Our loader preserves the raw list, so `run_commands` re-derives a load-time fact on **every**
+  execution (a comprehension enters it once per byte). Doing it in the loader would remove the
+  interpretation entirely; an in-family re-discovery of the shapes was measured a **regression**
+  (see `## Measured`), so this is the only route left.
+- **`src/lib.rs` declares `families` as a private module**, so every `pub(crate)` entry point inside
+  this node is currently unreachable from `src/jit/**` — a tier that wants a per-command entry
+  (`matching::exec`, `matching::commands::run_commands`, `create::assemble`) needs
+  `pub(crate) mod families` (or targeted root re-exports) first.
+- **`src/exec_census.rs`** measured 2.20 % of `to_lower`'s self time while **disabled** — the
+  thread-local `bool` load sits on the per-instruction funnel; the instrument has no call site in
+  this node.
 - **`tools/differential` corpus coverage hole** (see Test Strategy).
 
 ## `append` / `private_append` — in place while the payload is writable
