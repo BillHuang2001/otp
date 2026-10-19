@@ -62,6 +62,20 @@
 //!   the numeric forms `0…4` are accepted while `3`/`8`/`16` are `{error, einval}` and leave
 //!   the previous mode untouched.
 //!
+//! * **`tcp_send_listening_and_connected`** — `gen_tcp:send/2`'s two answers against one
+//!   listener: `{error, enotconn}` on the listening socket itself, then `ok` on the socket a
+//!   `gen_tcp:connect/3` + `gen_tcp:accept/1` produced.
+//! * **`tcp_active_delivery_and_peer_close`** — the stream **data** path end to end: with
+//!   `{active, true}` on the accepted socket, the client's bytes arrive as one
+//!   `{tcp, S, <<"abc">>}` message and the client's close is the `{tcp_closed, S}` teardown
+//!   message (both bounded by a 1000 ms `after`).
+//! * **`udp_datagram_delivery_across_two_sockets`** — the datagram **read** path: an active-mode
+//!   `{udp, S, {127,0,0,1}, FromPort, Data}` delivery from a *second* socket in the same VM, with
+//!   the sender's ephemeral port reduced to `is_integer/1`.
+//! * **`udp_passive_recv_returns_the_payload`** — the passive half of the same path:
+//!   `gen_udp:recv/3` hands back `{ok, {Ip, FromPort, Data}}` (again with the sender port reduced
+//!   to `is_integer/1`).
+//!
 //! Ids are `inet_control/<snake_case_name>`; the contract is A.4 ([`Contract::DriverAbi`]) plus
 //! A.7 ([`Contract::OtpApps`]) wherever the observation is the `gen_udp`/`gen_tcp`/`inet`
 //! module answer rather than a bare port BIF. Every golden is the **oracle's** own output,
@@ -71,43 +85,36 @@
 //!
 //! Every socket these rows open is bound to **loopback only** (`{ip, {127, 0, 0, 1}}`, port
 //! `0`), and the ephemeral port the kernel hands out is never pinned: it is either reduced to
-//! `is_integer/1` + `P > 0`, or used once as an argument (the `eaddrinuse` and closed-socket
-//! rows) where only the resulting `posix()` reason is observed. Every socket and port is
-//! closed before the row answers, so no row leaks a descriptor into the next one. No row sends
-//! a datagram that is expected to be delivered and no row waits for one, so there is **no
-//! `receive` and no `after` guard at all** — every row is a straight-line computation over
-//! synchronous port-BIF replies, which is also why a loaded host cannot reorder it.
+//! `is_integer/1` + `P > 0`, or used once as an argument (the `eaddrinuse`, closed-socket and
+//! data-path rows) where only the resulting `posix()` reason or payload is observed. Every socket
+//! and port is closed before the row answers, so no row leaks a descriptor into the next one.
+//! The two delivery rows wait with a bounded `receive … after 1000 -> timeout end` whose
+//! **oracle** answer is the golden, and the bytes they deliver are already queued in the kernel
+//! by a *previous, completed* `send`, so neither depends on host load — and a lost datagram or a
+//! dropped connection would show up as the `timeout` answer, i.e. as a visible mismatch, never as
+//! a silent pass.
 //!
-//! # Measured divergences that are deliberately NOT cases (handoffs, never `mismatch`-pinned)
+//! # Measured shapes that are deliberately NOT cases (handoffs, never `mismatch`-pinned)
 //!
-//! The datagram **data** path is one of them, which is why this group pins the framing *mode*
-//! rather than the frame *bytes* (`erlang:decode_packet/3` — the same framing algorithm — is
-//! already pinned byte-exactly by [`super::decode_packet`]). Each item below is a plain Erlang
-//! value/reason (or a typed capability gap), so pinning it would be a `mismatch`; it is
-//! reported to the runtime owners instead. Verified in this environment (oracle OTP 29.1.1 /
-//! `erts-17.1`; the built `beam_rt`) by running the *same* expression under both runtimes:
+//! Verified in this environment (oracle OTP 29.1.1 / `erts-17.1`; the built `beam_rt`) by
+//! running the *same* expression under both runtimes:
 //!
-//! * **an incoming datagram is never delivered (`beam_rt`).** The datagram *write* path agrees:
-//!   `gen_udp:send/4` answers `ok` on both sides and the in-VM loopback pair (`gen_udp:send/4`
-//!   to the socket's own port, then `gen_udp:recv/3`) agrees, so the `inet_reply` bridge is in
-//!   place. What has no pinnable shape is the read half. With a `{active, true}` socket,
-//!   a datagram injected from outside the VM (`os:cmd("printf abc > /dev/udp/127.0.0.1/P")`)
-//!   arrives as `{udp, S, {127,0,0,1}, _, <<"abc">>}` under the oracle and as nothing at all
-//!   under `beam_rt` within a 2 s guard; `gen_udp:recv(S, 0, 300)` likewise answers
-//!   `{error, einval}` there and raises `{case_clause, {ok, …}}` (inside
-//!   `prim_inet:recvfrom0/3`) here. So no read-path reassembly or truncation refusal can be
-//!   pinned. Owner: `beam_rt` / `beam_io`.
-//! * **`gen_tcp:accept/2` on a listening socket (`beam_rt`).** The oracle answers
-//!   `{error, timeout}` for a short accept timeout; here `prim_inet:async_accept/2` fails with a
-//!   `{case_clause, {ok, []}}` — the same `inet:getopts/2` reply shape the other `prim_inet`
-//!   callers pattern-match on. Owner: `beam_rt` (the `inet:getopts/2` reply shape).
-//! * **`gen_tcp:send/2` on a listening socket (`beam_io`).** The oracle answers
-//!   `{error, enotconn}`; `beam_rt` answers `{error, einval}`.
-//! * **`erlang:port_command/2` on a socket-less driver port** is measured and unpinnable rather
-//!   than divergent: the oracle answers `true` and then kills the port
-//!   (`driver_failure_posix(EINVAL)`, a following `port_info/2` is `undefined`), `beam_rt` raises
-//!   `error:badarg` and leaves the port alive. Owner: `beam_rt` / `beam_io` (the port-command
-//!   bridge).
+//! * **a framed stream read delivers nothing (`beam_rt`).** With `{packet, 4}` on the accepted
+//!   socket and a `{packet, 4}` client send of `<<"hello">>`, the oracle delivers
+//!   `{tcp, A, <<"hello">>}` while `beam_rt` times out (the raw `{packet, 0}` stream *is*
+//!   delivered, which is what `tcp_active_delivery_and_peer_close` pins). Owner: `beam_io` /
+//!   `beam_rt` (the read-side framing). Reported, never pinned: a `receive` that answers
+//!   `timeout` is a plain observable, so a case would commit a `mismatch`.
+//! * **the blocking reads are a typed capability gap (`beam_rt`).** `gen_tcp:recv(A, 2, 1000)`
+//!   (with or without queued bytes), `gen_tcp:accept(L, 200)` and `gen_udp:recv(S, 0, 300)`
+//!   (with no datagram queued) each make the Rust runtime exit `3` with
+//!   `beam_rt: unsupported: opcode: run: process blocked (no message available)` where the oracle
+//!   answers `{ok, …}` / `{error, timeout}`. That is `unsupported`, not a divergence, but it is
+//!   not an *agreement* either, so no row pins a read with nothing queued. Owners: `beam_rt` /
+//!   `beam_io`.
+//! * **`erlang:port_command/2` on a socket-less driver port** now agrees and is pinned by the
+//!   [`super::udp`] group (`udp/port_command_on_a_socket_less_port_kills_it`,
+//!   `udp/port_command_with_a_caller_ref_prefix_keeps_the_port`).
 //!
 //! The structural half of A.4 (that a C translation unit referencing the `driver_*` /
 //! `erl_drv_*` declarations still compiles against the frozen headers) is asserted in
@@ -315,6 +322,82 @@ pub(crate) fn group() -> Vec<Case> {
              {3,{error,einval},{ok,[{packet,2}]}},{4,ok,{ok,[{packet,4}]}},\
              {8,{error,einval},{ok,[{packet,4}]}},{16,{error,einval},{ok,[{packet,4}]}}]}",
         ),
+        // --- the stream send path -------------------------------------------------------------
+        case(
+            "inet_control/tcp_send_listening_and_connected",
+            "gen_tcp:send/2 answers {error,enotconn} on the listening socket itself and ok on the connected socket a gen_tcp:connect/3 + gen_tcp:accept/1 pair produced",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]), \
+             {ok, Port} = inet:port(L), \
+             ListenSent = gen_tcp:send(L, <<\"x\">>), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             Acc = case gen_tcp:accept(L) of \
+                       {ok, A} -> gen_tcp:close(A), accepted; \
+                       Other -> Other \
+                   end, \
+             ConnSent = gen_tcp:send(Cl, <<\"hi\">>), \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(L), \
+             {ListenSent, Acc, ConnSent} end",
+            "ok {{error,enotconn},accepted,ok}",
+        ),
+        // --- the stream data path: active-mode delivery and the peer-close teardown ----------
+        case(
+            "inet_control/tcp_active_delivery_and_peer_close",
+            "the connected stream's data path: with {active,true} on the accepted socket the client's bytes arrive as one {tcp,S,<<\"abc\">>} message, and the client's close arrives as the {tcp_closed,S} teardown message",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                               {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{active, true}]), \
+             ok = gen_tcp:send(Cl, <<\"abc\">>), \
+             Data = receive {tcp, A, Db} -> {data, Db} after 1000 -> timeout end, \
+             ok = gen_tcp:close(Cl), \
+             Closed = receive {tcp_closed, A} -> closed after 1000 -> timeout2 end, \
+             ok = gen_tcp:close(A), \
+             ok = gen_tcp:close(L), \
+             {Data, Closed} end",
+            "ok {{data,<<97,98,99>>},closed}",
+        ),
+        // --- the datagram data path: active delivery and the passive read ---------------------
+        case(
+            "inet_control/udp_datagram_delivery_across_two_sockets",
+            "an active-mode datagram sent from a second socket in the same VM is delivered as {udp,S,{127,0,0,1},FromPort,Data} with the sender's ephemeral port reduced to is_integer/1",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, Rd} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                              {active, true}]), \
+             {ok, RdPort} = inet:port(Rd), \
+             {ok, Wr} = gen_udp:open(0, [binary, {active, false}]), \
+             Send = gen_udp:send(Wr, {127, 0, 0, 1}, RdPort, <<\"abc\">>), \
+             M = receive {udp, Rd, Ip, From, Db} -> {data, Ip, is_integer(From), Db} \
+                 after 1000 -> timeout end, \
+             gen_udp:close(Wr), \
+             gen_udp:close(Rd), \
+             {Send, M} end",
+            "ok {ok,{data,{127,0,0,1},true,<<97,98,99>>}}",
+        ),
+        case(
+            "inet_control/udp_passive_recv_returns_the_payload",
+            "gen_udp:recv/3 on a passive socket hands back {ok,{Ip,FromPort,Data}} for a datagram a second socket in the same VM sent, with the sender's ephemeral port reduced to is_integer/1",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, Rd} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                              {active, false}]), \
+             {ok, RdPort} = inet:port(Rd), \
+             {ok, Wr} = gen_udp:open(0, [binary, {active, false}]), \
+             ok = gen_udp:send(Wr, {127, 0, 0, 1}, RdPort, <<\"hi\">>), \
+             Rc = case gen_udp:recv(Rd, 0, 1000) of \
+                      {ok, {Ip, From, Db}} -> {ok, {Ip, is_integer(From), Db}}; \
+                      Other -> Other \
+                  end, \
+             gen_udp:close(Wr), \
+             gen_udp:close(Rd), \
+             Rc end",
+            "ok {ok,{{127,0,0,1},true,<<104,105>>}}",
+        ),
     ]
 }
 
@@ -329,7 +412,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_inet_control_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 7, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 11, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -373,30 +456,34 @@ mod tests {
         );
     }
 
-    /// The shapes that were **measured** to diverge stay out of the group: the datagram *read*
-    /// path is unreachable from Erlang on `beam_rt` (an incoming datagram is never delivered),
-    /// `gen_tcp:accept/2` fails inside `prim_inet`, and `port_command/2` on a socket-less port has
-    /// no shared observable — pinning any of them would commit a `mismatch`. See the module docs
-    /// for the exact pairs of observations. (The datagram *write* path is not one of them:
-    /// `gen_udp:send/4` answers `ok` on both sides.)
+    /// The shapes that were **measured** to diverge stay out of the group: the `{packet, N}`
+    /// **framed** stream read delivers nothing on `beam_rt` (the raw one is pinned), the blocking
+    /// reads that have nothing queued are a typed `unsupported` capability gap, and
+    /// `prim_inet`'s own verbs are not the layer this group drives. Pinning any of them would
+    /// commit a `mismatch`. See the module docs for the exact pairs of observations.
     ///
     /// The option/address surface of both drivers (including `inet:getstat/1`,
     /// `gen_tcp:connect/3`, `gen_tcp:listen/2` and the `{mode, list|binary}` store) is served,
-    /// so those verbs are free to appear in a row.
+    /// and so now are `gen_tcp:send/2` (`{error, enotconn}` on a listener, `ok` on a connection)
+    /// and the data path of both drivers (raw active-mode delivery, the peer-close teardown and
+    /// the passive/active datagram read), so those verbs are free to appear in a row.
     #[test]
     fn no_case_pins_a_measured_divergence() {
         for case in group() {
             let expr = case.expr().expect("eval case");
             for forbidden in [
-                // The send verb family: it drives the data path (whose read half has no
-                // delivered-datagram bridge), and its closing path polls the driver's counters.
+                // The raw port-command bridge and `prim_inet`'s own verbs: this group drives the
+                // documented `gen_udp`/`gen_tcp`/`inet` API, and the bare port BIFs are pinned by
+                // the `udp/`, `driver/` and `ram_file/` groups.
                 "port_command",
                 "prim_inet",
-                // The only route to a datagram injected from outside the VM.
+                // The only route to a datagram injected from outside the VM: it needs a
+                // non-POSIX sender (`bash`'s `/dev/udp` or a `python3` one-liner), which would
+                // make the golden host-dependent.
                 "os:cmd",
-                // A stream send on a listening socket: enotconn under the oracle, einval here.
-                "gen_tcp:send",
-                "ok = gen_udp:send",
+                // The framed read: `{packet, N}` on a connected socket delivers nothing on the
+                // Rust runtime (see the module docs).
+                "{packet, 4}, {active, true}",
             ] {
                 assert!(
                     !expr.contains(forbidden),
@@ -427,31 +514,38 @@ mod tests {
         }
     }
 
-    /// No row may wait: an `after` guard (or a bare `receive`) would make the group's runtime
-    /// depend on the host's load, and the datagram delivery it would wait for is a measured
-    /// `beam_rt` gap anyway (see the module docs).
+    /// No row may depend on the clock: a `timer:sleep`, or a `receive` with no `after` clause (an
+    /// unbounded wait) would make the group's runtime depend on the host's load. A **bounded**
+    /// `receive … after N -> timeout end` is allowed — its *oracle* answer is the golden, and a
+    /// delivery that never happened shows up as a `timeout` answer, i.e. as a visible mismatch.
     #[test]
     fn no_case_waits_on_a_message() {
         for case in group() {
             let expr = case.expr().expect("eval case");
-            for forbidden in ["receive", "after ", "timer:sleep"] {
+            assert!(
+                !expr.contains("timer:sleep"),
+                "case {} sleeps on the clock, which no inet_control/ row may do",
+                case.id
+            );
+            if expr.contains("receive") {
                 assert!(
-                    !expr.contains(forbidden),
-                    "case {} waits (`{forbidden}`), which no inet_control/ row may do",
+                    expr.contains("after "),
+                    "case {} waits on a message with no `after` bound (an unbounded wait)",
                     case.id
                 );
             }
         }
     }
 
-    /// Every row closes what it opens: the driver-name, framing and datagram rows each call a
-    /// close, so no case leaks a socket or port into a later one.
+    /// Every row closes what it opens: the driver-name, framing, send and data-path rows each
+    /// call a close, so no case leaks a socket or port into a later one.
     #[test]
     fn every_case_closes_what_it_opens() {
         for case in group() {
             let expr = case.expr().expect("eval case");
             assert!(
                 expr.contains("inet:close(S)")
+                    || expr.contains("gen_udp:close(")
                     || expr.contains("gen_tcp:close(L)")
                     || expr.contains("erlang:port_close(Pt)"),
                 "case {} never closes the socket/port it opened",
