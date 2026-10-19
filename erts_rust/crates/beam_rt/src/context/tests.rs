@@ -154,12 +154,94 @@ fn the_pending_interner_reports_emptiness_so_the_commit_can_be_skipped() {
     );
 }
 
+/// **A failed call's reason atom is named in the runtime's ONE shared table**, so the engine's
+/// raise funnel can land it in a catch frame.
+///
+/// `beam_bifs`'s `zlib` stream surface raises its state guards as atom **names**
+/// (`Raise::error(ExitReason::atom("not_initialized"))`, the C's
+/// `enif_raise_exception(env, am_not_initialized)`), and no module names those atoms —
+/// `zlib.beam` does not either — so neither the live namespace nor a module snapshot can spell
+/// the reason, the engine declines, and a `try … catch` around the call could never see the
+/// raise. Naming it here (append-only, at exactly the index the interner predicts) is what the
+/// `tests/zlib_guards.rs` fixture observes end to end.
+#[test]
+fn a_failed_calls_reason_atom_is_interned_into_the_shared_table() {
+    use beam_common::{ExitReason, Raise};
+
+    let mut rt = runtime();
+    let name = "not_initialized_zzz_probe";
+    assert!(
+        rt.atoms().lookup(name).is_none(),
+        "premise: the boot seed does not hold the name"
+    );
+    let base = rt.atoms().len();
+    let raise = BeamError::Raise(Raise::error(ExitReason::atom(name)));
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.name_raise_reason_atom(&raise);
+    }
+    assert_eq!(
+        rt.atoms().lookup(name).map(|atom| atom.raw() as usize),
+        Some(base),
+        "the name lands at exactly the index the interner predicted"
+    );
+    assert_eq!(rt.atoms().len(), base + 1);
+
+    // Idempotent: a second identical raise finds the name and does not append again.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.name_raise_reason_atom(&raise);
+    }
+    assert_eq!(
+        rt.atoms().len(),
+        base + 1,
+        "an already-named reason atom is not interned twice"
+    );
+}
+
+/// The three shapes that must leave the shared table **byte-identical**: a capability gap (whose
+/// uncatchability is a CLI contract), an error with no nameable atom, and a name the boot seed
+/// already holds.
+#[test]
+fn a_failed_calls_reason_atom_is_left_alone_when_it_must_be() {
+    use beam_common::{ExitReason, Raise};
+
+    let mut rt = runtime();
+    let base = rt.atoms().len();
+    let cases = [
+        // A capability gap must stay uncatchable: interning it would let a program's own
+        // `try … catch` swallow the runtime's honest gap.
+        BeamError::Raise(Raise::error(ExitReason::atom(
+            "unsupported_opcode: some_future_op",
+        ))),
+        // No atom to name at all.
+        BeamError::TermNotFound,        BeamError::Raise(Raise::error(ExitReason::Structured)),
+        // Already seeded at boot.
+        BeamError::Raise(Raise::error(ExitReason::atom("badarg"))),
+        BeamError::BadArith,
+    ];
+    for error in &cases {
+        {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.name_raise_reason_atom(error);
+        }
+        assert_eq!(
+            rt.atoms().len(),
+            base,
+            "`{error}` must not add an atom to the shared table"
+        );
+    }
+    assert!(
+        rt.atoms().lookup("unsupported_opcode: some_future_op").is_none(),
+        "a capability gap's reason atom stays unnameable, so it stays uncatchable"
+    );
+}
+
 #[test]
 fn a_bif_interns_a_new_atom_into_the_shared_table() {
     let mut rt = runtime();
     let name = "a_fresh_atom_zzz";
-    assert!(rt.atoms().lookup(name).is_none(), "the name starts unknown");
-    let base = rt.atoms().len();
+    assert!(rt.atoms().lookup(name).is_none(), "the name starts unknown");    let base = rt.atoms().len();
     let mut ctx = RuntimeContext::new(&mut rt);
     let image = terms::make_heap_binary(&mut ctx, name.as_bytes()).expect("a binary");
     let atom = ctx
@@ -4357,7 +4439,164 @@ fn resolve_local_fun_declines_the_fun_kinds_it_cannot_claim() {
     );
 }
 
-// ---------------------------------------------------------------------------
+/// **A named local `fun` over a *served* stub dispatches to the host; every other local fun
+/// keeps its in-machine entry.**
+///
+/// OTP's wrapper modules reach their own NIF stubs through a **fun held in a record**:
+/// `erts/preloaded/src/zlib.erl:414-425` builds `#zlib_opts{method = fun deflate_nif/4, …}` and
+/// `dequeue_next_chunk/2` applies it as `Method(Z, IChSz, OChSz, Flush)`. The compiler lowers
+/// `fun deflate_nif/4` to a **named local** (`make_fun3`) fun whose `FunT` descriptor names the
+/// non-exported stub, and whose body is `erlang:nif_error(undef)` — so entering its label
+/// raises `undef` even though the 19 stream keys are registered BIFs. So
+/// [`RuntimeContext::local_fun_target`] must **decline** such a fun (`Ok(None)`, the seam's "no
+/// in-machine entry") and [`RuntimeContext::apply_non_local_fun`] must dispatch it through
+/// `call_bif` instead.
+///
+/// The decline is deliberately narrow, and each half is pinned here on synthetic modules (no
+/// toolchain needed — the module cache is seeded directly):
+///
+/// * the served key (`close_nif/1`, applied to a handle `open_nif/0` really minted) answers the
+///   BIF's own `ok`;
+/// * a name the key table does not carry at that **arity** (`deflate_nif/3`) and one it does not
+///   carry at all (`deflate_nix/4`) keep their in-machine entry (their own label);
+/// * an ordinary module's named local fun still resolves to its own label, so `call_fun`
+///   everywhere else is untouched;
+/// * a non-fun and a served fun applied with the wrong argument count answer the `BadArg` /
+///   `BadArity` they answer today — a served key is never entered (nor dispatched) with a
+///   mismatched frame.
+#[test]
+fn a_local_fun_naming_a_served_stub_dispatches_and_everything_else_stays_in_machine() {
+    use beam_loader::FunDescriptor;
+
+    /// A synthetic module whose `funs` table carries one **named local** (`fun f/A`) reference
+    /// per entry — `(function, arity)` — with `uniq = uniq_base + index`, `index` its position
+    /// and `num_free = 0` (a named local reference captures nothing). The label is the position.
+    fn module_with_local_refs(name: &str, uniq_base: u32, refs: &[(&str, u32)]) -> Module {
+        let mut module = Module::default();
+        module.name = module.atom_table.intern(name);
+        for (index, (function, arity)) in refs.iter().enumerate() {
+            let function = module.atom_table.intern(function);
+            module.funs.push(FunDescriptor {
+                function,
+                arity: *arity,
+                label: Label(index as u32),
+                index: index as u32,
+                num_free: 0,
+                uniq: uniq_base + index as u32,
+            });
+        }
+        module
+    }
+
+    let mut rt = runtime();
+    // The wrapper module: the served key `close_nif/1`, then two names the key table does NOT
+    // serve (a wrong arity of a served name, and an unrelated name).
+    let wrapper = rt.code_server.insert_loaded(
+        "zlib",
+        module_with_local_refs(
+            "zlib",
+            100,
+            &[("close_nif", 1), ("deflate_nif", 3), ("deflate_nix", 4)],
+        ),
+        crate::codeserver::RecordedName::Str("zlib.beam".to_string()),
+    );
+    // An ordinary module, whose named local fun is a real body.
+    let ordinary = rt.code_server.insert_loaded(
+        "plain_wrapper",
+        module_with_local_refs("plain_wrapper", 200, &[("helper", 1)]),
+        crate::codeserver::RecordedName::Str("plain_wrapper.beam".to_string()),
+    );
+    let ok = rt.intern("ok");
+    let (_close_words, close_fun) = local_fun(1, 100, 0, &[]);
+    let (_arity_words, wrong_arity_key) = local_fun(3, 101, 1, &[]);
+    let (_name_words, unserved_name) = local_fun(4, 102, 2, &[]);
+    let (_helper_words, helper_fun) = local_fun(1, 200, 0, &[]);
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    // ---- the served key ------------------------------------------------------------------
+    let handle = ctx
+        .call_bif("zlib", "open_nif", 0, &[])
+        .expect("`open_nif/0` mints a stream handle");
+    assert!(
+        ctx.local_fun_target(close_fun, &[handle])
+            .expect("the resolver reports a routing, never an error")
+            .is_none(),
+        "a named local fun over a served stub has no body to enter, so the seam declines it"
+    );
+    assert!(
+        ctx.resolve_local_fun(close_fun, &[handle])
+            .expect("the seam reports a routing, never an error")
+            .is_none(),
+        "the engine's `call_fun` seam declines it too, keeping its `apply_fun` fallback"
+    );
+    assert_eq!(
+        ctx.apply_fun(close_fun, &[handle])
+            .expect("`close_nif/1` is a registered BIF, so the fallback dispatches it"),
+        ok,
+        "the applied fun reaches the host, whose answer is the BIF's own `ok` — never the \
+         stub's `erlang:nif_error(undef)`"
+    );
+
+    // ---- the names the key table does not serve keep their in-machine entry --------------
+    let three = [make_small(1), make_small(2), make_small(3)];
+    let target = ctx
+        .local_fun_target(wrong_arity_key, &three)
+        .expect("the resolver reports a routing, never an error")
+        .expect("`deflate_nif/3` is not a served key (the key is /4), so the fun is entered");
+    assert!(
+        Arc::ptr_eq(&target.module, &wrapper),
+        "the in-machine target is the defining module the code server caches"
+    );
+    assert_eq!(target.label, Label(1), "the descriptor's own lambda label");
+    assert_eq!(target.arity, 3, "the descriptor's own arity");
+    assert!(
+        matches!(
+            ctx.apply_non_local_fun(wrong_arity_key, &three),
+            Err(BeamError::BadArg)
+        ),
+        "an unserved local fun keeps today's answer on the value-returning route (no closure \
+         is stored at its index)"
+    );
+    let four = [make_small(1), make_small(2), make_small(3), make_small(4)];
+    let target = ctx
+        .local_fun_target(unserved_name, &four)
+        .expect("the resolver reports a routing, never an error")
+        .expect("`deflate_nix/4` names no served key at all, so the fun is entered");
+    assert_eq!(target.label, Label(2), "the descriptor's own lambda label");
+
+    // ---- an ordinary module's named local fun is untouched -------------------------------
+    let (callee, label) = ctx
+        .resolve_local_fun(helper_fun, &[make_small(7)])
+        .expect("the seam reports a routing, never an error")
+        .expect("a plain module's named local fun still resolves to its own label");
+    assert!(
+        Arc::ptr_eq(&callee, &ordinary),
+        "`call_fun` still enters a non-served module in-machine"
+    );
+    assert_eq!(label, Label(0));
+
+    // ---- the errors that must not change ------------------------------------------------
+    assert!(
+        matches!(ctx.local_fun_target(make_small(1), &[]), Err(BeamError::BadArg))
+            && matches!(
+                ctx.apply_non_local_fun(make_small(1), &[]),
+                Err(BeamError::BadArg)
+            ),
+        "a non-fun is still the bare `badarg` on both routes"
+    );
+    assert!(
+        matches!(ctx.local_fun_target(close_fun, &[]), Err(BeamError::BadArity)),
+        "the arity guard still precedes the served decline, so a mismatched call stays BadArity"
+    );
+    assert!(
+        matches!(
+            ctx.apply_non_local_fun(close_fun, &[]),
+            Err(BeamError::BadArity)
+        ),
+        "a served key applied with the wrong argument count is never dispatched with a \
+         mismatched frame"
+    );
+}// ---------------------------------------------------------------------------
 // The `RuntimeHooksBridge` arms beyond the timer/tag families.
 //
 // Each test drives the real dispatch (`RuntimeContext::call_bif`), so the arm is reached

@@ -961,3 +961,79 @@ A missing **committed** probe image is not a skip: `tests/fixtures/port_failure.
 repository artifact, so `require_probe_beam` panics with the regeneration recipe (and
 `the_probe_image_is_committed` fails alongside it), because skipping there would report nine green
 rows that compared nothing.
+### `zlib_stream_levels_fixture.erl` — compiled at test time, never committed as a `.beam`
+`zlib_stream_levels_fixture.erl` is the **`zlib` per-level / flush / init-form** image for
+`tests/zlib_stream_levels.rs`, driven through the scheduler `run` route
+(`beam_rt run <scratch>/zlib_stream_levels_fixture.beam zlib_stream_levels_fixture:<f>/0`). Like
+`zlib_stream.erl` it is **source only**: the suite compiles it into a per-fixture scratch directory
+holding only this module (a safe single `-pa` for the oracle) with the system `erlc` at test time.
+Six exported functions cover the six surfaces — `multi_sync/0` (the four-`sync`-then-`finish`
+transcript per compression level 0–9 with its per-call byte-count vector, total and md5),
+`flush_modes/0` (the whole payload with each flush), `init_forms/0` (`deflateInit/1,2,6`),
+`reset_mid_stream/0` (`deflateReset/1`), `deflate_params/0` (`deflateParams/3`) and `round_trip/0`
+(deflate → `inflate/2`).
+Every function **prints** its transcript with `io:format/2` and returns `ok`, never a binary: the
+`run` route renders its result with `~w`, and this runtime's binary printing is `<<55,56,…>>` where
+the oracle prints `<<"AB">>` for printable content (a pre-existing printer limitation, unrelated to
+`zlib`). Sizes are integers and digests are `binary:encode_hex/1` charlists, and the payload's own
+`bytes`/`md5` line pins it to the same 1 024 bytes the `-eval` probes build. A missing `erlc` skips
+the `run`-route half **loudly** (the `-eval` half still runs).
+### `zlib_stream.erl` — compiled at test time, never committed as a `.beam`
+`zlib_stream.erl` is the **`zlib` stream-API** image for `tests/zlib_stream_dict.rs`, driven through
+the scheduler `run` route (`beam_rt run <scratch>/zlib_stream.beam zlib_stream:<f>/0`). Unlike the
+committed images above it is **source only**: the suite copies it into a scratch directory and
+compiles it there with the system `erlc` at test time (the file is the source of truth, and a
+committed `.beam` would age independently of it). Five exported functions cover the five cases:
+`params_stash/0` (`deflateParams/3`'s stash path), `dict_protocol/0` (the `need_dictionary`
+protocol), `safe_inflate_chunks/0` (`safeInflate/2` chunking), `reset_and_dictionary/0`
+(`inflateReset/1`, `inflateGetDictionary/1`, `deflateReset/1`) and `truncated_stream/0` (a stream
+missing its Adler trailer is only caught by `inflateEnd/1`).
+
+Every function returns a term, **never a binary**: the `run` route prints its result with `~w`, and
+this runtime's binary printing is `<<55,56,…>>` where the oracle prints `<<"AB">>` for printable
+content (a pre-existing printer limitation, unrelated to `zlib`). Hex digests therefore travel as
+`binary_to_list(binary:encode_hex/1)` integer lists and payloads as sizes plus `=:=` booleans; the
+scratch directory holds **only** this module, so it is also a safe single `-pa` for the oracle.
+A missing `erlc` skips the `run`-route half **loudly** (the `-eval` half still runs).
+### `zlib_one_shot_fixture.erl` — compiled at test time, never committed as a `.beam`
+`zlib_one_shot_fixture.erl` is the **one-shot `zlib`** image (the six convenience functions
+`compress/1`, `uncompress/1`, `zip/1`, `unzip/1`, `gzip/1`, `gunzip/1`) for
+`tests/zlib_one_shot.rs`, driven through the scheduler `run` route
+(`beam_rt run <scratch>/zlib_one_shot_fixture.beam zlib_one_shot_fixture:<f>/0`). Like
+`zlib_stream.erl` it is **source only**: the suite compiles it into a scratch directory with the
+system `erlc` at test time. Five exported functions cover the five surfaces — `goldens/0` (the
+three named hex goldens), `fast_paths/0` (each function's bytes plus the three round trips over
+the six-payload table), `wrapper/0` (`deflateInit/6` + `deflate(…, finish)` + `deflateEnd` +
+`close`, at window bits 15 / -15 / 31, against the one-shot image), `libz/0` (the whole
+`zlib:compress/1` image — A.9 libz byte exactness) and `concat/0` (`gunzip/1` over concatenated
+gzip members).
+Every function **prints** its transcript with `io:format/2` and returns `ok`, **never a binary**:
+the `run` route renders its result with `~w`, and this runtime's binary printing is `<<55,56,…>>`
+where the oracle prints `<<"AB">>` for printable content (a pre-existing printer limitation,
+unrelated to `zlib`). Sizes are integers and digests/hex images are
+`binary_to_list(binary:encode_hex/1)` charlists. The payload table (`payload/1`) is
+byte-identical to the `-eval` expressions' `PAYLOADS_ERL` list, and the transcript's own
+`payload <label> bytes <N> md5 <HEX>` line is what pins the two constructions together. The
+scratch directory holds **only** this module, so it is also a safe single `-pa` for the oracle; a
+missing `erlc` skips the `run`-route half **loudly** (the `-eval` half still runs).
+
+### `zlib_guards.erl` / `zlib_guards_unnamed.erl` — compiled at test time, never committed as `.beam`
+The **`zlib` guard-class / controlling-process** images for `tests/zlib_guards.rs`. Both are source
+only and are compiled by the suite with the system `erlc` into a scratch directory holding **only
+that module** (a safe single `-pa` for the oracle).
+`zlib_guards.erl` exports `guard_atoms/0`, `classes/0` (the `data_error` / `stream_error` /
+`not_initialized` / `already_initialized` / `badarg` families and the `ok` boundaries around them),
+`controlling/0` (`not_on_controlling_process` and the `set_controlling_process/2` transfer both
+ways, plus a dead pid and a non-pid) and `closed_controller/0` (`set_controlling_process/2` across
+the fresh / ended / closed states, where the closed state is the suite's one pinned `zlib`
+divergence). `guard_atoms/0` is **load-bearing**: it names the six guard atoms so they enter the
+module's atom table, because on this runtime a raise whose reason atom is absent from the raising
+module's atom table is not catchable by that module's `try … catch`.
+`zlib_guards_unnamed.erl` is that probe shape *without* the atom reference (`deflate_end_twice/0`,
+`deflate_init_twice/0`, `after_finish/0`); the suite pins the resulting escape (exit 1,
+`beam_rt: error <atom>`) against the oracle's caught `{exception,error,<atom>}`. Nothing in it may
+spell a guard atom — not even as a function name, since an exported name *is* an atom in the
+table (measured).
+Both fixtures print their transcript with `io:format/2` and return `ok`, so the compared observable
+is the printed transcript and never the `run` route's `~w` result line; no binary is ever printed
+(probes answer atoms, integers, booleans and small tuples).
