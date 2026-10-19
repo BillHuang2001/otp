@@ -170,6 +170,7 @@ use std::time::{Duration, Instant};
 
 pub mod driver;
 pub(crate) mod async_ready;
+use async_ready::AsyncReady;
 pub(crate) mod completion;
 pub(crate) mod exit;pub(crate) mod info_extras;
 pub(crate) mod ops;
@@ -219,6 +220,17 @@ const PORT_HEAP_WORDS: usize = 4_096;
 /// driver declares an earlier deadline (see [`beam_io::Driver::next_timeout`]), so a
 /// driver-declared timer fires at its deadline rather than up to a slice late.
 pub(crate) const PORT_POLL_SLICE: Duration = Duration::from_millis(25);
+/// How long one poll round may block while the async-job pool has work in flight.
+///
+/// The pool's completions arrive on **worker** threads, which the poller knows nothing about, so a
+/// round that blocked for a whole [`PORT_POLL_SLICE`] would report a finished `driver_async` job up
+/// to 25 ms late — squarely inside the owner's `receive` latency. This bound shortens the wait to a
+/// couple of milliseconds while
+/// [`AsyncReady::pool_is_busy`](async_ready::AsyncReady::pool_is_busy) is true, which is the
+/// polling substitute for the C's `erts_notify_check_async_ready_queue` wake-up
+/// (`erl_async.c:174`). It is a bound, never a spin: an idle round still blocks for the whole
+/// slice, and a quiet pool costs the clamp nothing.
+const ASYNC_READY_POLL_BOUND: Duration = Duration::from_millis(2);
 
 /// How long a child port's **line frames** may be held back while the port still owes its
 /// `{Port, {exit_status, Status}}` (see [`PortRegistry::hold_or_report_line`]).
@@ -1101,6 +1113,14 @@ pub struct PortRegistry {
     /// inherits an entry: it is consumed by the read it was recorded for, dropped when the port's
     /// `Closed` report is folded, and cleared when a new port registers under that number.
     failed_read_recipients: HashMap<u64, FailedReadRecipient>,
+    /// The runtime's **async-job delivery handle** — the C async pool behind `driver_async` and the
+    /// per-port completion queues (see [`AsyncReady`] and [`driver`]).
+    ///
+    /// This registry is the party that **drains the pool** (a port round has no driver, and the
+    /// pool's ready queue is global), while each port's own drive point calls the driver. The handle
+    /// is shared by `Rc` with every driver host and every port adapter, so the pool is built once for
+    /// the whole runtime.
+    async_ready: AsyncReady,
 }
 
 impl PortRegistry {
@@ -1131,7 +1151,61 @@ impl PortRegistry {
             pending_events: Vec::new(),
             pending_port_signals: exit::PendingPortSignals::default(),
             failed_read_recipients: HashMap::new(),
+            // The pool itself is built lazily, on the first `driver_async` (`AsyncReady::ensure_pool`),
+            // but the worker count is stamped now: `+A`'s default is one thread, and `+A 0` — an
+            // explicit zero — must stay distinguishable from "not configured yet".
+            async_ready: {
+                let async_ready = AsyncReady::new();
+                async_ready.set_threads(driver::DEFAULT_ASYNC_THREADS);
+                async_ready
+            },
         })
+    }
+    /// Sets the **async-job worker count** — the emulator's `+A N` (`erl_async.c`'s
+    /// `ERTS_ASYNC_THREADS_DEFAULT` is [`driver::DEFAULT_ASYNC_THREADS`]).
+    ///
+    /// `0` is `+A 0` and is honoured as a genuine zero-worker pool: every job then runs **inline on
+    /// the submitting thread** (`AsyncPool::new(0)`), which is exactly the C's `+A 0` behaviour, and
+    /// `driver_async` answers `0`. It is deliberately **not** "no pool": that would send
+    /// `driver_async` down the frozen seam's legacy hook and answer `-1`.
+    ///
+    /// The runtime calls this once, at startup, from `RuntimeConfig`'s preserved `+A` flag (see
+    /// `crate::runtime`'s registry construction). A pool that already exists is rebuilt, so this
+    /// belongs **before** the first driver port is opened.
+    pub fn set_async_threads(&mut self, threads: usize) {
+        self.async_ready.set_threads(threads);
+    }
+    /// The runtime's async-job delivery handle (see [`AsyncReady`]) — what a port's host and adapter
+    /// are stamped with at `open_port/2`.
+    pub fn async_ready(&self) -> AsyncReady {
+        self.async_ready.clone()
+    }
+    /// Moves every completed `driver_async` job from the pool into the per-port delivery queues
+    /// (see [`AsyncReady::offer`]) and releases any library whose port's work is gone
+    /// ([`AsyncReady::reap_unloads`]).
+    ///
+    /// Called once per port round, **before** the round's drive points, so a job that finished while
+    /// the runtime was busy is delivered by the very round that notices it. A job whose port has
+    /// closed is released here — the C's `!p` branch — so its `async_free` runs even when no port is
+    /// left to drive.
+    fn drain_async_pool(&mut self) {
+        let Some(pool) = self.async_ready.pool() else {
+            return;
+        };
+        let drained = pool.drain();
+        if !drained.is_empty() {
+            self.async_ready.offer(drained);
+        }
+        // Order matters: the completions are offered first, so a job that just became terminal no
+        // longer counts against its port's deferred unload in this round.
+        self.async_ready.reap_unloads();
+    }
+    /// Whether the async-job pool has anything in flight — what shortens a poll round to
+    /// [`ASYNC_READY_POLL_BOUND`] and keeps a blocked owner wakeable (see [`AsyncReady::pool_is_busy`]).
+    fn async_pool_is_busy(&self) -> bool {
+        self.async_ready
+            .pool()
+            .is_some_and(|pool| self.async_ready.pool_is_busy(&pool))
     }
 
     /// Constructs the **statically linked emulator** driver named `name`, or `None` when `name` is
@@ -1651,6 +1725,11 @@ impl PortRegistry {
             && self.pending_port_signals.is_empty()
             && !self.tty.is_armed()
             && !self.watch.has_pending_signal()
+            // A `driver_async` job in flight is a `{Port, {data, …}}` (or a freed job's obligation)
+            // the owner is still owed, and it is finished by a **worker thread** the poller knows
+            // nothing about — so a route that skipped the round because "nothing is live" would
+            // never see its completion (see [`AsyncReady`]).
+            && !self.async_pool_is_busy()
     }
     /// The ids of the **live** ports, in port-number order.
     ///
@@ -1800,6 +1879,10 @@ impl PortRegistry {
         // now-drained pipe, and an *idle* one can only become readable when a signal arrives —
         // blocking on it would be waiting for nothing. A live port or an armed `tty_select/2`
         // interest is real async I/O and is still waited on.
+        // The async-job pool is drained before anything else: a completion finished by a worker
+        // thread is this round's work, and a job whose port has closed is released right here (the
+        // C's `!p` branch) so its `async_free` runs even with no port left to drive.
+        self.drain_async_pool();
         if self.registry.is_empty() && !self.tty.is_armed() {
             // A close `beam_io` has not reported yet still owes its `'EXIT'`/`'DOWN'`: minting
             // the report is what retires the port's number and releases them, and with no
@@ -1817,6 +1900,15 @@ impl PortRegistry {
                     .into_iter()
                     .map(|packet| PortEvent::ActiveInput { packet }),
             );
+            // No port is left to poll, but the async-job pool may still owe work (a job a worker is
+            // running, or a library it keeps mapped — see [`AsyncReady::pool_is_busy`]). Waiting one
+            // bounded tick keeps the caller from spinning while it drains, and the second drain turns
+            // a completion into its release; a `+A N` job is then never stranded by the last port's
+            // close.
+            if self.async_pool_is_busy() {
+                let _ = self.poller.poll(Some(ASYNC_READY_POLL_BOUND))?;
+                self.drain_async_pool();
+            }
             return Ok(events);
         }
         let deadline = Instant::now() + timeout;
@@ -1831,7 +1923,16 @@ impl PortRegistry {
             if let Some(next) = self.registry.next_deadline() {
                 wait = wait.min(next.saturating_duration_since(now));
             }
+            // With async jobs in flight the round must come back soon: their completions arrive on
+            // worker threads, which the poller cannot report (see [`ASYNC_READY_POLL_BOUND`]).
+            if self.async_pool_is_busy() {
+                wait = wait.min(ASYNC_READY_POLL_BOUND);
+            }
             let polled = self.poller.poll(Some(wait))?;
+            // Whatever finished during the wait is routed to its port **before** the tasks run, so
+            // this very round's drive point delivers it (`beam_io` drives `drive_async` ahead of
+            // harvesting input).
+            self.drain_async_pool();
             // The signal self-pipe is **not** a port: its readiness means "the dispatcher caught
             // something", so it is read here — the C's own model — and the descriptor's event is
             // filtered out of the batch before the port scheduler sees it, so nothing but
@@ -3170,7 +3271,11 @@ impl PortHook for RuntimePorts {
             // `ERL_DRV_MONITOR_NOT_ALIVE` from: the runtime's most recent observation, published
             // by [`PortRegistry::refresh_liveness`] at the start of each port round (see
             // [`ProcessLiveness`]).
-            .with_liveness(registry.liveness());
+            .with_liveness(registry.liveness())
+            // The runtime's async-job delivery handle: the host answers `driver_async`'s pool hook
+            // from it, and the port's adapter delivers the completions it queues (see
+            // [`AsyncReady`]). One handle per runtime, so one pool.
+            .with_async_ready(registry.async_ready());
             // Seize the driver's term queue **before** the host is moved into the port lifecycle
             // (the boxed driver exposes no host): it is the handle a driver callback's
             // `erl_drv_output_term`/`erl_drv_send_term` pushes onto and

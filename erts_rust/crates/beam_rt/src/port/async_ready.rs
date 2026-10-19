@@ -241,6 +241,13 @@ impl AsyncReady {
             }
         }
         state.inline.remove(&key);
+        // Everything the **pool** still holds for the port is marked gone, so its completion frees
+        // the data instead of delivering it — the C's `!p` branch, applied at the earliest moment it
+        // is known. (A job `AsyncReady::offer` meets first is released the same way, so this is
+        // belt and braces, never the only guard.)
+        if let Some(pool) = state.pool.as_ref() {
+            pool.port_closed(port);
+        }
         released
     }
 
