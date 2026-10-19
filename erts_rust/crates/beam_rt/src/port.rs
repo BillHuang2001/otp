@@ -4321,3 +4321,10 @@ mod packet_framing_tests;
 /// separate file so the matrix does not grow this one.
 #[cfg(test)]
 mod completion_tests;
+/// The **async-job pool** end-to-end suite (contract A.4, `erl_async.c`): `driver_async` through the
+/// real port round — a positive id and one `ready_async` with the submitted `async_data`, the
+/// port-exit path's single `async_free`, the `+A 0` inline configuration, and the entry with no
+/// `ready_async` slot (see `src/port/async_ready_tests.rs`). A separate file so the C fixture text
+/// and the measured oracle table do not grow this one.
+#[cfg(test)]
+mod async_ready_tests;
