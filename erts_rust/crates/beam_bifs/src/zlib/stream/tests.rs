@@ -628,8 +628,8 @@ fn the_f1_fixture_is_the_one_the_goldens_were_measured_on() {
         "F1's md5 (the brief's fixture pin)"
     );
     assert_eq!(
-        md5(&payload_100k().len().to_be_bytes()),
-        md5(&100_000u32.to_be_bytes()),
+        payload_100k().len(),
+        100_000,
         "the safeInflate payload is 100 000 B"
     );
 }
@@ -1035,10 +1035,23 @@ fn deflate_params_mid_stream_reproduces_the_wrappers_sequence() {
     assert_eq!(name_of(&ctx, params), Some("ok"), "deflateParams → ok");
 
     // 4. `deflate(Z, <<"BBBB">>, finish)` → `restore_progress` prepends the stashed chunk.
-    let restored = must(&reg, &mut ctx, "getStash_nif", &[handle]);
-    let restored = answer(restored);
-    assert_eq!(restored.leaves.len(), 1, "the stash carries one segment");
-    let stash = restored.bytes();
+    //    `getStash_nif` answers `{ok, {deflate, Output}}`, so the stash is read two
+    //    levels down: the `ok` wrapper, then `save_progress/3`'s `{Kind, iolist}` tuple.
+    let stashed = must(&reg, &mut ctx, "getStash_nif", &[handle]);
+    assert_eq!(
+        name_of(&ctx, access::tuple_element(stashed, 0)),
+        Some("ok"),
+        "getStash answers {{ok, Term}}"
+    );
+    let restored = access::tuple_element(stashed, 1);
+    assert_eq!(
+        access::tuple_element(restored, 0),
+        ctx.atom("deflate").expect("seeded"),
+        "save_progress/3's kind tag"
+    );
+    let leaves_of_stash = list_bytes(access::tuple_element(restored, 1));
+    assert_eq!(leaves_of_stash.len(), 1, "the stash carries one segment");
+    let stash = leaves_of_stash.concat();
     must(&reg, &mut ctx, "clearStash_nif", &[handle]);
 
     enqueue(&reg, &mut ctx, handle, b"BBBB").expect("enqueue");
@@ -1073,15 +1086,22 @@ fn inflate_whole(reg: &BifRegistry, ctx: &mut BifContext<'_>, image: &[u8]) -> V
     out.bytes()
 }
 
-/// A.7 — a second `deflate(finish)` is `error:stream_error` (zlib's `FINISH_STATE`).
+/// A.7 — after a `finish`, zlib is in `FINISH_STATE`: a *repeated* `finish` is harmless
+/// (`{finished, []}`, i.e. `[]` in `zlib.erl`), while a flush that is **not** `finish` is
+/// `Z_STREAM_ERROR` (`deflate.c:992`, `s->status == FINISH_STATE && flush != Z_FINISH`),
+/// i.e. `error:stream_error`.
+///
+/// Oracle OTP 29.1.1 (live probe): `zlib:deflate(Z, <<"hello hello hello">>, finish)`,
+/// then `zlib:deflate(Z, <<>>, finish)` -> `[]` (twice), then `zlib:deflate(Z, [], none)`
+/// and `zlib:deflate(Z, [], sync)` -> `error:stream_error`, and `zlib:deflateEnd(Z)` ->
+/// `error:data_error`.
 #[test]
-fn a_second_finish_raises_stream_error() {
+fn a_repeated_finish_is_empty_and_a_non_finish_flush_after_it_is_stream_error() {
     let reg = registry();
     let mut heap = heap();
     let atoms = atoms();
     let mut ctx = context(&mut heap, &atoms, ProcessId::new(1, 0));
     let fixture = f1();
-
     let handle = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, handle, 6);
     enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
@@ -1089,13 +1109,25 @@ fn a_second_finish_raises_stream_error() {
             .expect("the first finish"),
     );
     assert_eq!(out.sizes(), vec![102], "the first finish produced the image");
-
-    assert_raise_atom(
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH),
-        "stream_error",
-    );
+    assert_tag(&ctx, &out, "finished", "the first finish");
+    // A repeated `finish`: zlib keeps answering `Z_STREAM_END`, so the pump classifies it
+    // as `{finished, []}` — `zlib.erl`'s `dequeue_all_chunks_1/3` folds that into `[]`.
+    for round in 0..2 {
+        let again = answer(
+            deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+                .expect("a repeated finish is not an error"),
+        );
+        assert_eq!(again.sizes(), Vec::<usize>::new(), "round {round}: no output");
+        assert_tag(&ctx, &again, "finished", "a repeated finish");
+    }
+    // Every other flush is `Z_STREAM_ERROR` once the stream finished.
+    for flush in [NONE, SYNC] {
+        assert_raise_atom(
+            deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, flush),
+            "stream_error",
+        );
+    }
 }
-
 /// A.8 — `deflateReset` after `finish` makes the stream reusable, and the second run is
 /// byte-identical to the first (and to a fresh stream's).
 #[test]
@@ -1201,8 +1233,9 @@ fn a_foreign_process_is_refused_until_it_owns_the_stream() {
             "not_on_controlling_process",
         );
         // The state check comes *after* the controller check: a stream in `ST_NONE`
-        // reached by a foreign process is still the ownership fault, not `not_initialized`.
-        let untouched = open(&reg, &mut other);
+        // that the OWNER opened is still the ownership fault when a foreign process
+        // reaches it, not `not_initialized`.
+        let untouched = open(&reg, &mut ctx);
         assert_raise_atom(
             deflate_call(&reg, &mut other, untouched, DEFLATE_CHUNK, DEFLATE_CHUNK, NONE),
             "not_on_controlling_process",
@@ -1664,7 +1697,14 @@ fn every_reset_and_end_drops_the_stash() {
             "{key}: the stash is set"
         );
 
-        must(&reg, &mut ctx, key, &[handle]);
+        if key == "inflateEnd_nif" {
+            // The C's `inflateEnd` is `data_error` unless the stream reached
+            // `Z_STREAM_END` (`zlib_nif.c:925`), and a fresh stream never did — the
+            // refusal still runs `zlib_reset_input`, which is what this test is about.
+            assert_raise_atom(call(&reg, &mut ctx, key, &[handle]), "data_error");
+        } else {
+            must(&reg, &mut ctx, key, &[handle]);
+        }
         if key == "close_nif" {
             // A closed stream is unreachable through the NIFs, so the drop is read from
             // the registry itself.
@@ -1712,19 +1752,37 @@ fn the_stash_carries_the_production_shape() {
         "the {{deflate, iolist}} image round-trips"
     );
     assert_eq!(
-        name_of(&ctx, access::tuple_element(retrieved, 0)),
-        Some("deflate"),
+        access::tuple_element(retrieved, 0),
+        ctx.atom("deflate").expect("seeded"),
         "the kind tag survives"
     );
+    // The iolist keeps its four elements: the binary segment and the three small
+    // integers. An iolist leaf need not be a binary, so this walk checks each element's
+    // own kind (`list_bytes` is the *output* helper and insists on binaries).
     let output = access::tuple_element(retrieved, 1);
-    let leaves = list_bytes(output);
-    assert_eq!(leaves.len(), 4, "the iolist keeps its four elements");
-    assert_eq!(leaves[0], b"abc".to_vec(), "the binary segment");
-    assert_eq!(
-        leaves[1..].iter().map(|leaf| leaf.len()).sum::<usize>(),
-        0,
-        "the small integers are not binaries"
-    );
+    let mut rest = output;
+    let mut index = 0usize;
+    while !access::is_nil(rest) {
+        assert!(access::is_list(rest), "the iolist is a proper list");
+        let leaf = access::car(rest);
+        if index == 0 {
+            assert_eq!(
+                bits::bytes(leaf).expect("the binary segment"),
+                b"abc".to_vec(),
+                "the binary segment"
+            );
+        } else {
+            assert!(access::is_small(leaf), "element {index} is a small integer");
+            assert_eq!(
+                beam_term::signed_value(leaf),
+                index as i64,
+                "element {index} is its small integer"
+            );
+        }
+        index += 1;
+        rest = access::cdr(rest);
+    }
+    assert_eq!(index, 4, "the iolist keeps its four elements");
 }
 
 // ===========================================================================
@@ -1752,8 +1810,9 @@ fn enqueue_refuses_non_iodata_and_caps_the_segment_count() {
         assert_badarg(call(&reg, &mut ctx, "enqueue_nif", &[handle, bogus]));
     }
 
-    // `[]` — `enqueue_input(Z, [])` — is `ok`.
-    let ok = enqueue(&reg, &mut ctx, handle, b"").expect("an empty iovec");
+    // `[]` — `enqueue_input(Z, [])` — is `ok`. (`zlib.erl` never calls `enqueue_nif`
+    // for an empty list: `enqueue_input_1(Z, []) -> ok`.)
+    let ok = enqueue_pieces(&reg, &mut ctx, handle, &[]).expect("an empty iovec");
     assert_eq!(name_of(&ctx, ok), Some("ok"), "an empty iovec is ok");
     assert_eq!(stream_state(handle).2, 0, "and it queues nothing");
 

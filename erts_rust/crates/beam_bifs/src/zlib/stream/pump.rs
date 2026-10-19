@@ -34,8 +34,9 @@
 //!    else runs: the two stream faults raise, `Z_MEM_ERROR` returns the atom;
 //! 2. `Z_STREAM_END` latches `eos_seen`;
 //! 3. **zero** progress on a non-empty queue is the C's `Z_DATA_ERROR` (a raise);
-//! 4. `[Binary]` when output was produced, `[]` when not;
-//! 5. `finished` when the queue drained **and** the output buffer was not filled;
+//! 4. `Out` is `[Binary]` when output was produced, `[]` when not;
+//! 5. `{finished, Out}` when the queue drained **and** the output buffer was not
+//!    filled;
 //! 6. otherwise `{need_dictionary, Adler, Out}` for `Z_NEED_DICT`, `{continue, Out}`
 //!    for everything else.
 //!
@@ -243,20 +244,36 @@ where
     }
 }
 
-/// The term a [`Outcome`] answers with: the `{need_dictionary, Adler, Out}` tuple
-/// for the dictionary request, the plain `Out` list otherwise.
+/// The term a [`Outcome`] answers with (`zlib_nif.c:459-467`): the
+/// `{finished, Out}` / `{continue, Out}` tagged 2-tuples, the
+/// `{need_dictionary, Adler, Out}` 3-tuple, and the bare term for
+/// [`Outcome::Value`].
+///
+/// The tag is **load-bearing**: `zlib.erl`'s `dequeue_all_chunks_1/3` and
+/// `dequeue_next_chunk/2` pattern-match `{continue, Chunk}` / `{finished, Chunk}`
+/// / `{need_dictionary, _, _}`, so a bare `Out` list is a `case_clause` in the
+/// Erlang layer. Only the `zlib_return` short-circuit (`Z_MEM_ERROR`) answers a
+/// bare atom.
 ///
 /// # Errors
 ///
 /// The context's atom/allocation failures.
 pub(super) fn outcome_term(ctx: &mut BifContext<'_>, outcome: Outcome) -> Result<Eterm> {
     match outcome {
-        Outcome::Finished(out) | Outcome::Continue(out) | Outcome::Value(out) => Ok(out),
+        Outcome::Finished(out) => {
+            let tag = ctx.intern_atom("finished")?;
+            ctx.tuple(&[tag, out])
+        }
+        Outcome::Continue(out) => {
+            let tag = ctx.intern_atom("continue")?;
+            ctx.tuple(&[tag, out])
+        }
         Outcome::NeedDictionary { adler, out } => {
             let tag = ctx.intern_atom("need_dictionary")?;
             let count = ctx.int(i64::from(adler))?;
             ctx.tuple(&[tag, count, out])
         }
+        Outcome::Value(out) => Ok(out),
     }
 }
 
@@ -284,6 +301,8 @@ mod tests {
             "buf_error",
             "unknown_error",
             "need_dictionary",
+            "finished",
+            "continue",
         ]);
         atoms
     }
@@ -301,6 +320,8 @@ mod tests {
             "buf_error",
             "unknown_error",
             "need_dictionary",
+            "finished",
+            "continue",
         ] {
             if ctx.atom(name).expect("seeded") == term {
                 return name;
@@ -486,6 +507,30 @@ mod tests {
                 let adler = beam_codec::term::tuple_element(term, 1).expect("adler");
                 assert_eq!(beam_term::signed_value(adler), 42);
             }
+        }
+    }
+
+    /// `outcome_term` carries the C's tag on both continuing answers (`zlib_nif.c:459-466`):
+    /// a bare `Out` list is a `case_clause` in `zlib.erl`'s `dequeue_all_chunks_1/3`.
+    #[test]
+    fn the_continuing_answers_carry_their_tag() {
+        let mut heap = heap();
+        let atoms = atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        for (outcome, tag) in [
+            (Outcome::Finished(beam_term::NIL), "finished"),
+            (Outcome::Continue(beam_term::NIL), "continue"),
+        ] {
+            let term = outcome_term(&mut ctx, outcome).expect("a term");
+            assert_eq!(
+                beam_codec::term::tuple_arity(term).expect("a tuple"),
+                2,
+                "{{{tag}, Out}} is a 2-tuple"
+            );
+            let got = beam_codec::term::tuple_element(term, 0).expect("the tag");
+            assert_eq!(atom_name(&mut ctx, got), tag, "the answer's tag atom");
+            let out = beam_codec::term::tuple_element(term, 1).expect("Out");
+            assert_eq!(out, beam_term::NIL, "Out is the empty output list");
         }
     }
 

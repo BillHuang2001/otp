@@ -33,7 +33,8 @@ All bytes come from [`beam_deflate`], the workspace's one zlib 1.3.2 port, so th
 
 ## The pump's classification order
 `pump` loops while `status == Ok` with input left, queue non-empty, `consumed < input_chunk_size` and room in the output buffer, feeding `min(front.len(), remaining_input)` to the codec and draining that many bytes from the front piece (dropping the piece when it empties); it then does the C's end-of-input flush when the queue drained with room left.
-Classification: (1) `DataError`/`StreamError`/`MemError` → `zlib_return` (`mem_error` as a value, `stream_error`/`data_error` as raises); (2) `StreamEnd` latches `eos_seen`; (3) zero progress with input still queued → raise `data_error`; (4) queue drained with room left → `Outcome::Finished`; (5) `NeedDict` → `Outcome::NeedDictionary{adler, out}` → the `{need_dictionary, Adler, Out}` tuple; (6) otherwise `Outcome::Continue`.
+Classification: (1) `DataError`/`StreamError`/`MemError` → `zlib_return` (`mem_error` as a value, `stream_error`/`data_error` as raises); (2) `StreamEnd` latches `eos_seen`; (3) zero progress with input still queued → raise `data_error`; (4) queue drained with room left → `Outcome::Finished`; (5) `NeedDict` → `Outcome::NeedDictionary{adler, out}`; (6) otherwise `Outcome::Continue`.
+**Every continuing answer is a tagged tuple** — `outcome_term` builds `{finished, Out}`, `{continue, Out}` and `{need_dictionary, Adler, Out}` (the C's `enif_make_tuple2`/`tuple3`, `zlib_nif.c:459-467`), `Out` being `[Binary]` or `[]`; only `zlib_return`'s `Z_MEM_ERROR` short-circuit answers a bare atom. The tag is load-bearing: `zlib.erl`'s `dequeue_all_chunks_1/3` and `dequeue_next_chunk/2` pattern-match on it, so a bare `Out` list is a `case_clause` in the Erlang layer.
 The C's `enif_consume_timeslice` breaks are deliberately not reproduced (a scheduler courtesy, not semantics); `out_pos < output_chunk_size` standing in for the C's `avail_out > 0` assertion is what makes the loop terminate.
 
 ## Errors
@@ -45,6 +46,8 @@ A capability gap is a typed `BeamError`; never a fabricated value, never `panic!
 - `inflateSetDictionary` on a fresh **framed** stream is `error:stream_error`, not `data_error`, so `Stream::need_dict_pending` records that the inflater actually reported `Status::NeedDict`; only that flag (or a raw stream) makes the call legal.
 - A **repeated** `deflateSetDictionary` succeeds rather than raising, and a **raw** stream's answer is `beam_deflate::adler32(0, &bytes)` rather than the stream's own running Adler.
 - `deflateEnd`'s status is inferred from the `started`/`finished` flags on `Stream`, because `beam_deflate` exposes no `status()` the way the C's `z_stream` does.
+- After a `finish`, a **repeated** `finish` is *not* an error: zlib stays in `Z_STREAM_END`, so the NIF answers `{finished, []}` (`zlib:deflate/3` ⇒ `[]`). The `stream_error` comes from a flush that is **not** `finish` (`deflate.c:992`, `s->status == FINISH_STATE && flush != Z_FINISH`), with or without queued input; `deflateEnd` then answers `data_error`.
+- `inflateEnd_nif` on a fresh, never-fed inflate stream is `error:data_error` (the C requires `eos_seen`, `zlib_nif.c:925`) — a `{deflateEnd,ok}` / `{inflateEnd,data_error}` asymmetry, both oracle-verified.
 
 ## Constraints
 - Files target ~1000 lines; the stream surface is split by direction and by responsibility (`one_shot.rs` / `stream/*`), not by count.
