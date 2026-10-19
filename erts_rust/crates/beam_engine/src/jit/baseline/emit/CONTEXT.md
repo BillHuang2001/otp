@@ -78,8 +78,8 @@ Logical groups:
 | BIF accessors | `Bif` (`hd`, `element`, `tuple_size`) | `bif.rs::try_inline_bif` -> the reused `aggregate.rs` cons/tuple read | `bif.rs::bif_shape` (the cons/tuple read shapes; `element/2` additionally needs a **compile-time small-int index `>= 1`**) |
 | BIF value accessors | `Bif` and `GcBif` (`byte_size`, `length`) | `bif.rs::try_inline_bif` -> `emit_helper_call(jit_bif_value)` (`../bif_helper.rs`) | `bif.rs::value_shape` (the operand is re-read and written through the engine's own `read_operand`/`write_operand`) |
 | Frame pop | `Deallocate` | `frame.rs::emit_deallocate` (an `emit_helper_call` to `jit_deallocate`) | always lowered (the instruction's own outcome is the helper's block-ABI word): continues in-block on `encode_target(func, pc+1)`, else leaves via `done` |
-| Return | `Return` | `frame.rs::emit_return` (an `emit_helper_call` to `jit_return`) | always lowered — a `return` always transfers control, so the block leaves via `emit_word_exit` |
-| Fused frame pop + return | `DeallocateReturn` | `frame.rs::emit_deallocate_return` (an `emit_helper_call` to `jit_deallocate_return`); `emit_block` also fuses a separate adjacent `Deallocate`+`Return` pair into one such call | always lowered — always transfers control, leaves via `emit_word_exit` |
+| Return | `Return` | `frame.rs::emit_return` (an `emit_helper_call` to `jit_return`) | always lowered — a `return` always transfers control: `emit_resume_or_exit` tail-jumps to a same-function continuation entry when the helper resolved one, else the block leaves with the helper's word in `rax` |
+| Fused frame pop + return | `DeallocateReturn` | `frame.rs::emit_deallocate_return` (an `emit_helper_call` to `jit_deallocate_return`); `emit_block` also fuses a separate adjacent `Deallocate`+`Return` pair into one such call | always lowered — always transfers control, leaves via `emit_resume_or_exit` (in-block tail-jump, else the helper's word) |
 | Frame push | `Allocate` | `heap.rs::emit_allocate` (an `emit_helper_call` to `jit_allocate`) | always lowered (the helper's `Machine::push_frame`; `allocate` performs no heap admission): continues in-block on `encode_target(func, pc+1)`, else leaves via `done` |
 | Frame push + heap admission | `AllocateHeap` | `heap.rs::emit_allocate_heap` (an `emit_helper_call` to `jit_allocate_heap`) | always lowered — one helper round-trip does the interpreter's two calls in order (`ensure_heap` **then** `push_frame`); continues in-block via the shared `emit_continue_check` (partial refill + gated Y refresh) |
 | Heap admission | `TestHeap` | `heap.rs::emit_test_heap` (an `emit_helper_call` to `jit_test_heap`) | always lowered — reaches the host's admission door exactly once with the instruction's own `heap_need`/`live`; continues in-block via `emit_continue_check` |
@@ -219,7 +219,7 @@ accessors are claimed from either variant and the three pure accessors from `Bif
    exactly this instruction's `Machine` work and hands the driver a block-ABI word, so **no
    interpreter step runs**: `emit_deallocate`, `heap.rs::emit_allocate`/`emit_trim` and the
    `CALL_STORED` arm continue in-block on the appropriate word (branching to `done` otherwise), while
-   `emit_return`/`emit_deallocate_return` always transfer control and leave via `emit_word_exit`;
+   `emit_return`/`emit_deallocate_return` always transfer control and leave via `emit_resume_or_exit`;
    `heap.rs::emit_allocate_heap`/`emit_test_heap`, `emit_ext_call`, `emit_receive` and `emit_family`
    continue through the shared `emit_continue_check` (a collecting host's admission rewrites
    `machine.x`, so the cache is refilled before the block resumes). There are no guards to emit: every
@@ -521,7 +521,7 @@ by construction).
   each taking a trailing `store_pc` separate from the branch target), `emit_frame_teardown`, and the
   byte-level linker unit tests (alongside `test.rs`'s own unit tests).
 - `frame.rs` -> `emit_deallocate`, `emit_return`, `emit_deallocate_return` (whose `position_pc` — the
-  helper's recorded position — is separate from its `store_pc`, the pair's first pc), `emit_word_exit`
+  helper's recorded position — is separate from its `store_pc`, the pair's first pc), `emit_resume_or_exit`
   (the three end-of-body lowerings + the shared `jmp done` exit), plus its unit tests (the
   frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /

@@ -208,7 +208,9 @@ mod code;
 mod emit;
 mod family;
 mod receive;
-mod runtime;
+// `pub(crate)` because the tier's own tests build a `JitRuntime` by hand (the
+// `runtime` module's layout constants and `EntryTables` are the ABI they pin).
+pub(crate) mod runtime;
 mod test_helper;
 
 #[cfg(test)]

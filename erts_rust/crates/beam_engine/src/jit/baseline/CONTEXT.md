@@ -55,7 +55,7 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   `jit_deallocate`/`jit_return`/`jit_deallocate_return` (the frame-discipline helpers: the checked pop
   and/or the continuation read, encoding the instruction's own outcome as the block-ABI word — sharing
   `return_word` for the continuation→word mapping and `report_frame_error` for the typed diagnostic, with
-  the `FrameExitHelper`/`ReturnHelper` fn-pointer types), `jit_allocate`/`jit_allocate_heap`/
+  the `FrameExitHelper`/`ReturnHelper` fn-pointer types; `return_word` also resolves a **same-function** continuation entry against the published `EntryTables` — `resume_in_block` performs the skipped driver iteration's position store, reduction bump and `ctx.reduce(1)` and the emitted arm tail-jumps to the entry, `JitRuntime::resume_entry` carrying it, while every other outcome leaves the word for the driver), `jit_allocate`/`jit_allocate_heap`/
   `jit_test_heap`/`jit_trim` (the **heap / frame-admission** family: the interpreter's own
   `Machine::push_frame` / `ensure_heap` **then** `push_frame` / `ensure_heap` / `trim` calls — in the
   interpreter's own order — each answering `encode_target(func, pc + 1)` or `report_frame_error`'s
