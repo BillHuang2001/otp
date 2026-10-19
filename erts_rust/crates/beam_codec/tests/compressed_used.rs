@@ -28,12 +28,10 @@
 //! `used` count (`external.c:1797-1801`).
 //!
 //! The property that matters is that the count **stops at the term**: trailing bytes
-//! after a plain image and after a `COMPRESSED` image are neither read nor counted
-//! (for a compressed image the count is `6 + <zlib stream length>`, the stream ending
-//! at its Adler-32 trailer). This is exactly why `is_compressed_image` and the
-//! consumed-count API are public and why `beam_bifs::binconv`'s old
-//! re-inflate-and-binary-search workaround (`consumed_compressed_len`) is no longer
-//! needed.
+//! after a plain image and after a `COMPRESSED` image are neither read nor counted.
+//! `beam_codec::compress::decompress_bounded_used` returns the consumed input bytes,
+//! and `binary_to_term/2`'s `[used]` option reports `6 + <zlib stream length>` for a
+//! `COMPRESSED` image, the stream ending at its Adler-32 trailer.
 //!
 //! Every oracle-dependent test resolves the oracle the same way [`tools/differential`]
 //! does (`$ERTS_ORACLE` if it is an existing executable, else `erl` on `$PATH`) and
@@ -175,8 +173,8 @@ fn heap(words: usize) -> Heap {
     Heap::new(words).expect("the carrier allocator never fails for these sizes")
 }
 
-/// Trailing bytes that follow the image; long enough that a re-inflating binary search
-/// over the whole input would be a real (multi-step) search.
+/// Trailing bytes that follow the image; long enough that a count stopping at the image
+/// end is plainly distinguishable from the input length.
 const JUNK: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// `C` (compressed) and `P` (plain) images of `lists:duplicate(500,hello)` from the
@@ -301,12 +299,21 @@ fn decode_term_used_matches_the_oracle_for_compressed_and_plain() {
             "{label}: the junk after the image must not be counted"
         );
 
-        // The decoded term is the oracle's term: re-encoding gives its plain image.
+        // The decoded term is the oracle's term: re-encoding gives its plain image, and
+        // re-compressing gives the oracle's whole compressed image (our deflate is the
+        // workspace's zlib-1.3.2 port, so the zlib stream matches byte for byte).
         let reencoded = encode_term(term, &atoms).expect("re-encoding a decoded term");
         assert_eq!(
             reencoded, oracle.plain,
             "{label}: decode must reproduce the oracle's term"
         );
+        if is_compressed_image(image) {
+            assert_eq!(
+                encode_term_compressed(term, &atoms, 6).expect("re-compressing a decoded term"),
+                *image,
+                "{label}: the encoder must reproduce the oracle's whole compressed image"
+            );
+        }
     }
 }
 
@@ -340,6 +347,11 @@ fn decode_term_with_local_node_used_matches_on_compressed() {
     );
     let reencoded = encode_term(term, &atoms).expect("re-encoding a decoded term");
     assert_eq!(reencoded, oracle.plain, "the identity path must decode the same term");
+    assert_eq!(
+        encode_term_compressed(term, &atoms, 6).expect("re-compressing a decoded term"),
+        oracle.compressed,
+        "the identity path's term must re-compress to the oracle's image byte for byte"
+    );
 }
 
 /// The same invariant, oracle-free: our own compressed image, followed by junk, is
@@ -375,9 +387,17 @@ fn our_own_compressed_image_with_trailing_junk_is_consumed_up_to_the_image() {
         image.len(),
         "the count must stop at the compressed image, not the longer input"
     );
-    // Decode→re-encode is not byte-identical (zlib vs miniz_oxide), so compare the
-    // re-encoded plain image instead.
+    // Decode→re-encode IS byte-identical: our deflate is the workspace's zlib-1.3.2
+    // port, so re-compressing the decoded term must reproduce the whole `image` — the
+    // `COMPRESSED` wrapper, its size field and its zlib stream — not just the plain
+    // body. The plain image is compared too, so a wrong term could not hide behind a
+    // matching stream.
     let plain = encode_term(term, &atoms).expect("plain encode");
     let reencoded = encode_term(decoded, &d_atoms).expect("re-encoding a decoded term");
     assert_eq!(reencoded, plain, "the decoded term must be the original term");
+    assert_eq!(
+        encode_term_compressed(decoded, &d_atoms, 6).expect("re-compressing a decoded term"),
+        image,
+        "re-compressing the decoded term must reproduce the original compressed image exactly"
+    );
 }

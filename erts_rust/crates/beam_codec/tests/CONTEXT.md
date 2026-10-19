@@ -39,12 +39,26 @@ the full binary inventory are owned by `../CONTEXT.md` (§Test Strategy) — do 
   `NEWER_REFERENCE_EXT` re-encode of a legacy local `REFERENCE_EXT`), and stays **external** when
   no identity is installed. `tests/local_node.rs` pins the earlier identity-gated *bound checks*
   (D2/D4/D6/D7) and now also asserts the internal form at each boundary just below a local limit.
+- `tests/compressed_oracle.rs` compares **whole `COMPRESSED` images byte for byte** — the wrapper
+  choice *and* the deflate stream — because the stream is `beam_deflate`'s, the workspace's port of
+  the zlib 1.3.2 the oracle links, so `term_to_binary(T, [{compressed,Level}])` here *is* the
+  oracle's image. It is legitimately ~1.4 k lines: each test is a **distinct** C path or witness
+  family (both wrapper-decision paths, the level matrix, the boundary crossings, payloads past
+  32 KiB moved through temp files, a real `.beam`) and each compares whole images — not a split
+  candidate.
+- `tests/compressed_bytes.rs` is the oracle-free **`COMPRESSED` byte and boundary** suite: embedded
+  oracle goldens (`a*14/15/16/1024`, `ok`, `1`, `[]`, `<<>>`, `{1,2,3}`), the *derived* boundary
+  sweep over `N = 0..=64` of `binary:copy(<<"a">>, N)` (the crossing recomputed from `Z <= body - 5`,
+  observed at the equality case `N = 15`), the incompressible second path (`zeros(P) ++ Lcg300`,
+  crossing `P = 33`), level-0-never-compresses, out-of-range levels ⇒ `BadArg`, and the
+  decode→re-encode byte-identical fixed point. It must pass with no `erl` on `$PATH`.
 
 ## Routing Table
 - Oracle-dependent cross-checks (live `erl`) live in: `interop.rs`, `property_oracle.rs`,
-  `compressed_oracle.rs`, `legacy_scalar_oracle.rs`, `scalar_ext_decode.rs`, `decode_bound_oracle.rs`,
-  `export_arity_oracle.rs`, `map_key_order.rs`, `minor_version.rs`, `port_ext_legacy.rs`,
-  `local_fun_encode.rs`, `local_node.rs`, `local_identity_roundtrip.rs`, `tag_space_audit.rs`.
+  `compressed_oracle.rs`, `compressed_used.rs`, `legacy_scalar_oracle.rs`, `scalar_ext_decode.rs`,
+  `decode_bound_oracle.rs`, `export_arity_oracle.rs`, `map_key_order.rs`, `minor_version.rs`,
+  `port_ext_legacy.rs`, `local_fun_encode.rs`, `local_node.rs`, `local_identity_roundtrip.rs`,
+  `tag_space_audit.rs`.
 - `tag_space_audit.rs` is the **exhaustive tag-space audit** and is both kinds at once: its dense
   256-row disposition sweep and its no-panic `[131, byte]` sweep are pure (hand-built images, no
   oracle), while one test cross-checks every cross-checkable row against a live `erl`
@@ -54,7 +68,7 @@ the full binary inventory are owned by `../CONTEXT.md` (§Test Strategy) — do 
   reclassified tag byte must be added.
 - Pure (no-oracle) wire/layout suites: `roundtrip.rs`, `wire_roundtrip.rs`, `ground_truth.rs`,
   `map_ext_decode.rs`, `refc_decode.rs`, `ref_ext_zero_and_arity.rs`, `record_roundtrip.rs`,
-  `internal_ids.rs`, `atom_cache_writer.rs`, `compressed_decode.rs`, `decode_depth.rs`,
-  `decode_hostile.rs`, `property_roundtrip.rs`.
+  `internal_ids.rs`, `atom_cache_writer.rs`, `compressed_decode.rs`, `compressed_bytes.rs`,
+  `decode_depth.rs`, `decode_hostile.rs`, `property_roundtrip.rs`.
 - `../CONTEXT.md` → the crate-level Intent / API Surface / Tag coverage / Test Strategy (authoritative).
 - `../src/CONTEXT.md` → the source-side contract this API is written against.
