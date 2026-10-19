@@ -31,7 +31,7 @@
 
 use super::*;
 
-use crate::nif::host::NifHost;
+use crate::nif::host::{NifHost, NifMonitorResult};
 use beam_alloc::Heap;
 use beam_term::atom::AtomTable;
 use beam_term::prelude::{
@@ -555,4 +555,445 @@ fn schedule_returns_the_hosts_term_and_enforces_the_c_rules() {
         1,
         "only the one legal call reached the host"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The three-way monitor seam — `NifHost::monitor_process_result`
+// ---------------------------------------------------------------------------------------------
+//
+// `enif_monitor_process` has THREE C outcomes (`0` established, `1` dead/undefined target, `-1` the
+// resource type has no `down` callback), and they are taken in that order's source order:
+// `erl_nif.c:3968-3972` (the resource's monitor table) comes BEFORE `:3975` (the undefined pid), and
+// `:4004` (a dead target) comes last. The tests below pin every one of them, plus the legacy
+// single-outcome fallback that must keep behaving exactly as it did.
+
+/// A monitor holder pre-filled with `byte`, so "the C left it untouched" and "the C wrote it" are
+/// both observable (a zeroed holder would blur them for a payload that happens to start with 0).
+fn filled_monitor(byte: u8) -> ErlNifMonitor {
+    ErlNifMonitor {
+        data: [byte; MONITOR_BYTES],
+    }
+}
+
+/// The first [`REF_THING_BYTES`] bytes of a holder that was never written (an untouched
+/// [`filled_monitor`] value).
+fn untouched_block(byte: u8) -> [u8; REF_THING_BYTES] {
+    [byte; REF_THING_BYTES]
+}
+
+/// A `down` callback for monitor-capable test resource types: this crate only records its *presence*
+/// (`resource_type_has_down`), it never calls it, so the body is intentionally empty.
+///
+/// # Safety
+///
+/// The C `ErlNifResourceDown` ABI; the body touches no pointer.
+unsafe extern "C" fn unused_down(
+    _env: *mut crate::nif::types::ErlNifEnv,
+    _obj: *mut c_void,
+    _pid: *mut ErlNifPid,
+    _monitor: *mut ErlNifMonitor,
+) {
+}
+
+/// Open (or re-open) a test resource type: `with_down` opens the monitor-capable one through
+/// `enif_init_resource_type` with `members = 3` (so `down` is read), the other through the plain
+/// `enif_open_resource_type` (`members = 1`, no `down`) — exactly the two C shapes.
+///
+/// The type carries **no destructor**, so releasing one of its objects never builds an environment
+/// (this crate runs the destructor synchronously; the test host is already borrowed by `env`).
+fn open_test_type(
+    env: &mut NifEnv,
+    name: &str,
+    with_down: bool,
+) -> *mut crate::nif::types::ErlNifResourceType {
+    use crate::nif::enif::resources::{enif_init_resource_type, enif_open_resource_type};
+    use crate::nif::types::{ErlNifResourceFlags, ErlNifResourceTypeInit};
+
+    let cname = std::ffi::CString::new(name).expect("the test name has no interior NUL");
+    let mut tried = ErlNifResourceFlags::from_bits(0);
+    if with_down {
+        let init = ErlNifResourceTypeInit {
+            dtor: None,
+            stop: None,
+            down: Some(unused_down),
+            members: 3,
+            dyncall: None,
+        };
+        // SAFETY: `env` is live, `init` is a live local and `tried` is writable.
+        unsafe {
+            enif_init_resource_type(
+                env.as_ptr(),
+                cname.as_ptr(),
+                &init,
+                ErlNifResourceFlags::CREATE,
+                &mut tried,
+            )
+        }
+    } else {
+        // SAFETY: as above; the plain variant takes the destructor directly.
+        unsafe {
+            enif_open_resource_type(
+                env.as_ptr(),
+                core::ptr::null(),
+                cname.as_ptr(),
+                None,
+                ErlNifResourceFlags::CREATE,
+                &mut tried,
+            )
+        }
+    }
+}
+
+/// A host that implements the NEW three-way hook, the legacy one, or both — and records which of
+/// them `enif_monitor_process` actually consulted.
+struct MonitorHost {
+    heap: Heap,
+    /// What [`NifHost::monitor_process_result`] answers; `None` = this host does not implement it.
+    result: Option<NifMonitorResult>,
+    /// Whether [`NifHost::monitor_process`] (the legacy hook) establishes a monitor.
+    legacy: bool,
+    /// Every pid the legacy hook was consulted for, in call order.
+    legacy_asks: Vec<Eterm>,
+    /// The last reference [`MonitorHost::mint_ref`] built (`None` until one is minted).
+    last_minted: Option<Eterm>,
+    /// The next reference id the hooks mint.
+    next_ref: u64,
+}
+
+impl MonitorHost {
+    fn new() -> MonitorHost {
+        MonitorHost {
+            heap: Heap::new(1024).expect("a test heap is allocatable"),
+            result: None,
+            legacy: false,
+            legacy_asks: Vec::new(),
+            last_minted: None,
+            next_ref: 1,
+        }
+    }
+
+    /// Mint the internal reference `erts_make_ref_in_buffer` builds, with a fresh payload id.
+    fn mint_ref(&mut self) -> Eterm {
+        let id = self.next_ref;
+        self.next_ref += 1;
+        let term = ref_term(&mut self.heap, id);
+        self.last_minted = Some(term);
+        term
+    }
+}
+
+impl NifHost for MonitorHost {
+    fn heap(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    /// Interning is genuinely unsupported here: the monitor family never needs an atom.
+    fn intern_atom(&mut self, _name: &str) -> Option<Eterm> {
+        None
+    }
+
+    /// No atom table either — the monitor family never resolves a name.
+    fn atom_name(&mut self, _atom: Eterm) -> Option<String> {
+        None
+    }
+
+    fn monitor_process_result(&mut self, _pid: Eterm) -> Option<NifMonitorResult> {
+        self.result
+    }
+
+    fn monitor_process(&mut self, pid: Eterm) -> Option<Eterm> {
+        self.legacy_asks.push(pid);
+        if !self.legacy {
+            return None;
+        }
+        Some(self.mint_ref())
+    }
+}
+
+/// **The arm path of the three-way seam.** `Armed(ref)` ⇒ the C's `0`, `*monitor` receives that
+/// reference's 3-word block, bytes 24..32 are zeroed, and the legacy hook is never consulted.
+///
+/// Oracle measurement (OTP 29.1.1 / erts-17.1, a `cc`-built NIF arming on `enif_self` through a
+/// resource type opened with a `down` callback from the `load` callback): code `0`, holder written.
+#[test]
+fn the_three_way_hook_arms_and_writes_the_reference_block() {
+    let mut host = MonitorHost::new();
+    let armed = host.mint_ref();
+    host.result = Some(NifMonitorResult::Armed(armed));
+    let target = ErlNifPid {
+        pid: n(pid(1)),
+    };
+    let mut holder = filled_monitor(0xAA);
+    let (code, null_holder_code);
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live and every local below is initialised and writable.
+        code = unsafe {
+            enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
+        };
+        // A null holder is legal on the success path (`if (monitor) ...`, `erl_nif.c:4007`).
+        // SAFETY: as above; the null holder is explicitly tolerated.
+        null_holder_code = unsafe {
+            enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, core::ptr::null_mut())
+        };
+    }
+    assert_eq!(code, MONITOR_ESTABLISHED, "the C's 0 = established");
+    assert_eq!(null_holder_code, MONITOR_ESTABLISHED, "a null holder is tolerated");
+    // The stored payload IS the hook's reference block — the C's `erts_ref_to_driver_monitor`.
+    // SAFETY: `holder` is an initialised local.
+    let stored = unsafe { monitor_block(&holder) }.expect("a non-null holder");
+    assert_eq!(
+        Some(stored),
+        ref_block_of(armed),
+        "the 24 payload bytes are the hook's internal-reference block"
+    );
+    assert_eq!(
+        &holder.data[REF_THING_BYTES..],
+        &filled_monitor(0).data[REF_THING_BYTES..],
+        "bytes 24..32 are zeroed (the C leaves them untouched and never reads them)"
+    );
+    assert!(
+        host.legacy_asks.is_empty(),
+        "the legacy hook is not consulted when the three-way hook answers"
+    );
+}
+
+/// **The two failure outcomes of the three-way seam.** `NotAlive` ⇒ `1` and `NoDownCallback` ⇒ `-1`,
+/// both leaving the caller's holder untouched (`erl_nif.c:4004`, `:3968-3972`).
+///
+/// Oracle measurements: an `enif_set_pid_undefined` target on a `down`-capable resource ⇒ `{1,1}`
+/// (code, holder-untouched); a type opened without `down` ⇒ `-1`.
+#[test]
+fn the_three_way_hook_reports_not_alive_and_no_down_callback() {
+    let mut host = MonitorHost::new();
+    host.result = Some(NifMonitorResult::NotAlive);
+    let target = ErlNifPid {
+        pid: n(pid(2)),
+    };
+    let mut holder = filled_monitor(0x5A);
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live and the locals are initialised and writable.
+        let code = unsafe {
+            enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
+        };
+        assert_eq!(code, MONITOR_TARGET_DEAD, "the C's 1 = the target is not alive");
+    }
+    // SAFETY: `holder` is an initialised local.
+    assert_eq!(
+        unsafe { monitor_block(&holder) },
+        Some(untouched_block(0x5A)),
+        "a failed establishment never touches the holder (`erl_nif.c:4007`)"
+    );
+
+    // The same host, now answering the "the type cannot hold monitors" outcome.
+    let mut host = MonitorHost::new();
+    host.result = Some(NifMonitorResult::NoDownCallback);
+    let mut holder = filled_monitor(0x77);
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: as above.
+        let code = unsafe {
+            enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
+        };
+        assert_eq!(code, MONITOR_NO_DOWN_CALLBACK, "the C's -1");
+        assert_eq!(code, -1, "the literal the C returns");
+    }
+    // SAFETY: `holder` is an initialised local.
+    assert_eq!(
+        unsafe { monitor_block(&holder) },
+        Some(untouched_block(0x77)),
+        "the -1 path does not touch the holder either"
+    );
+}
+
+/// An undefined or null target pid answers `1` **before** any hook is consulted, and leaves the
+/// holder untouched (`erl_nif.c:3975-3976`).
+#[test]
+fn an_undefined_or_null_target_answers_one_and_never_touches_the_holder() {
+    let mut host = MonitorHost::new();
+    let armed = host.mint_ref();
+    host.result = Some(NifMonitorResult::Armed(armed));
+    host.legacy = true;
+    let undefined = ErlNifPid { pid: UNDEFINED_PID };
+    let mut holder = filled_monitor(0x11);
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live; the locals are initialised, and the null pid is explicitly handled.
+        let (undef, null_pid) = unsafe {
+            (
+                enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &undefined, &mut holder),
+                enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), core::ptr::null(), &mut holder),
+            )
+        };
+        assert_eq!(undef, MONITOR_TARGET_DEAD, "an undefined pid is the C's 1");
+        assert_eq!(null_pid, MONITOR_TARGET_DEAD, "a null target pid is the C's 1");
+    }
+    // SAFETY: `holder` is an initialised local.
+    assert_eq!(
+        unsafe { monitor_block(&holder) },
+        Some(untouched_block(0x11)),
+        "the early returns never write the holder"
+    );
+    assert!(
+        host.legacy_asks.is_empty(),
+        "neither hook is consulted for an undefined/null target"
+    );
+}
+
+/// A hook that answers `Armed` with something that is not an internal reference is refused as `1`
+/// rather than stored — an un-reconstructable payload is never fabricated.
+#[test]
+fn a_non_reference_arm_is_refused_rather_than_stored() {
+    let mut host = MonitorHost::new();
+    host.result = Some(NifMonitorResult::Armed(make_small(7)));
+    let target = ErlNifPid {
+        pid: n(pid(4)),
+    };
+    let mut holder = filled_monitor(0x22);
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live and the locals are initialised and writable.
+        let code = unsafe {
+            enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
+        };
+        assert_eq!(code, MONITOR_TARGET_DEAD);
+    }
+    // SAFETY: `holder` is an initialised local.
+    assert_eq!(
+        unsafe { monitor_block(&holder) },
+        Some(untouched_block(0x22)),
+        "nothing was stored"
+    );
+}
+
+/// The C's `-1` gate, answered **without any host**, from this crate's own resource registry: an
+/// object of a type opened without a `down` callback answers `-1` — and it does so *before* the pid is
+/// examined, so an undefined target on such a resource also answers `-1` (C ordering).
+///
+/// Measured on the oracle: without `down` ⇒ `{-1,1}` for both a live and an undefined target;
+/// with `down` ⇒ `{0,0}` (live) / `{1,1}` (undefined). See also
+/// [`resources::resource_type_has_down`]'s doc for the probe shape.
+#[test]
+fn a_resource_without_a_down_callback_answers_minus_one_before_looking_at_the_pid() {
+    use crate::nif::enif::resources::{enif_alloc_resource, enif_release_resource};
+
+    let mut host = MonitorHost::new();
+    let live = pid(5);
+    let target = ErlNifPid { pid: n(live) };
+    let undefined = ErlNifPid { pid: UNDEFINED_PID };
+    let mut holder = filled_monitor(0x33);
+    let (no_down, with_down) = {
+        let mut env = NifEnv::new(&mut host);
+        // Distinct names per test: the resource registry is process-wide and keyed by name.
+        let no_down = open_test_type(&mut env, "monitor_rt_no_down", false);
+        let with_down = open_test_type(&mut env, "monitor_rt_with_down", true);
+        assert!(!no_down.is_null() && !with_down.is_null(), "both types open");
+        // SAFETY: both handles are live types from the open calls above.
+        let obj_no_down = unsafe { enif_alloc_resource(no_down, 4) };
+        // SAFETY: as above.
+        let obj_with_down = unsafe { enif_alloc_resource(with_down, 4) };
+        assert!(!obj_no_down.is_null() && !obj_with_down.is_null());
+        // The registry knows both, and only the second is monitor-capable.
+        assert_eq!(
+            crate::nif::enif::resources::resource_type_has_down(obj_no_down),
+            Some(false)
+        );
+        assert_eq!(
+            crate::nif::enif::resources::resource_type_has_down(obj_with_down),
+            Some(true)
+        );
+
+        // SAFETY: `env` is live, both objects are live payload pointers of `env`'s host and the
+        // holders are initialised locals.
+        let (live_no_down, undef_no_down, live_with_down) = unsafe {
+            (
+                enif_monitor_process(env.as_ptr(), obj_no_down, &target, &mut holder),
+                enif_monitor_process(env.as_ptr(), obj_no_down, &undefined, &mut holder),
+                enif_monitor_process(env.as_ptr(), obj_with_down, &target, &mut holder),
+            )
+        };
+        assert_eq!(
+            live_no_down, MONITOR_NO_DOWN_CALLBACK,
+            "a resource type without a `down` callback cannot hold monitors (`erl_nif.c:3968-3972`)"
+        );
+        assert_eq!(
+            undef_no_down, MONITOR_NO_DOWN_CALLBACK,
+            "the resource is consulted BEFORE the pid, exactly as in the C"
+        );
+        assert_eq!(
+            live_with_down, MONITOR_TARGET_DEAD,
+            "a monitor-capable type passes the gate; with no host support the arm still answers 1"
+        );
+
+        // SAFETY: both objects have exactly the allocator's reference outstanding; each release frees
+        // its block (the types carry no destructor, so no environment is built).
+        unsafe {
+            enif_release_resource(obj_no_down);
+            enif_release_resource(obj_with_down);
+        }
+        // A released object is no longer recognised — the query never reads freed memory.
+        assert_eq!(
+            crate::nif::enif::resources::resource_type_has_down(obj_no_down),
+            None
+        );
+        (no_down, with_down)
+    };
+    assert!(!no_down.is_null() && !with_down.is_null());
+    // SAFETY: `holder` is an initialised local.
+    assert_eq!(
+        unsafe { monitor_block(&holder) },
+        Some(untouched_block(0x33)),
+        "none of the three calls wrote the holder"
+    );
+}
+
+/// **The legacy fallback is unchanged.** A host that implements only `monitor_process` still gets
+/// the pre-existing behaviour: a reference term ⇒ `0` + the payload; `None` ⇒ `1` and an untouched
+/// holder.
+#[test]
+fn a_legacy_only_host_keeps_its_single_outcome_behaviour() {
+    let mut host = MonitorHost::new();
+    host.legacy = true;
+    let target = ErlNifPid {
+        pid: n(pid(6)),
+    };
+    let mut holder = filled_monitor(0x44);
+    let stored;
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live and the locals are initialised and writable.
+        let code = unsafe {
+            enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
+        };
+        assert_eq!(code, MONITOR_ESTABLISHED, "a reference term is still an arm");
+        // SAFETY: `holder` is an initialised local.
+        stored = unsafe { monitor_block(&holder) }.expect("a non-null holder");
+    }
+    let minted = host.last_minted.expect("the legacy hook minted a reference");
+    assert_eq!(
+        Some(stored),
+        ref_block_of(minted),
+        "the payload is the legacy hook's own reference block"
+    );
+    assert_eq!(host.legacy_asks, vec![t(target.pid)], "the legacy hook was asked once");
+
+    // The legacy hook declining: `None` ⇒ the C's 1, holder untouched.
+    host.legacy = false;
+    let mut holder = filled_monitor(0x55);
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live and the locals are initialised and writable.
+        let code = unsafe {
+            enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
+        };
+        assert_eq!(code, MONITOR_TARGET_DEAD);
+    }
+    // SAFETY: `holder` is an initialised local.
+    assert_eq!(
+        unsafe { monitor_block(&holder) },
+        Some(untouched_block(0x55)),
+        "a declining legacy hook writes nothing"
+    );
+    assert_eq!(host.legacy_asks.len(), 2, "both calls went through the legacy hook");
 }

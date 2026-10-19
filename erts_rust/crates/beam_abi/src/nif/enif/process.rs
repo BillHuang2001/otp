@@ -53,25 +53,28 @@
 //! (`io.c:6994-7010`). This file reproduces that exactly, so an `ErlNifMonitor` produced here is
 //! byte-identical to the C's and [`enif_make_monitor_term`] really returns an internal reference:
 //!
-//! * [`enif_monitor_process`] stores the 3-word block of the internal reference returned by the
-//!   `NifHost::monitor_process` hook (the C's `erts_make_ref_in_buffer`). The hook must therefore
-//!   return an internal reference; anything else is refused as `1` ("could not establish") rather
-//!   than stored, so no un-reconstructable payload is ever fabricated.
+//! * [`enif_monitor_process`] stores the 3-word block of the internal reference the host hands over
+//!   — [`NifHost::monitor_process_result`]'s `Armed(term)`, or the legacy
+//!   [`NifHost::monitor_process`]'s term (the C's `erts_make_ref_in_buffer`). The hook must
+//!   therefore return an internal reference; anything else is refused as `1` ("could not
+//!   establish") rather than stored, so no un-reconstructable payload is ever fabricated.
 //! * Bytes 24..32 are zeroed (the C leaves them untouched and never reads them), and
 //!   [`enif_compare_monitors`], like the C, compares only the first 24.
 //!
 //! # Documented substitutions — never a wrong value, never a crash
 //!
-//! * **A `NULL` `obj` is ignored.** The C reaches the resource's monitor table through `obj`
-//!   (`DATA_TO_RESOURCE`); a resource handle is an opaque `void *` here (the resource registry
-//!   belongs to the `resources` family and the runtime) and the monitor hooks take the pid/monitor
-//!   term alone.
-//! * **`enif_monitor_process` never returns the C's `-1`.** That code is chosen from the *resource
-//!   type* (`rsrc->monitors` / `type->fn.down`, `:3968-3973`): a type created without a `down`
-//!   callback cannot hold monitors. That fact is not reachable from an opaque `obj`, so a monitor
-//!   that cannot be established (dead or foreign pid, an undefined `ErlNifPid`, an unusable
-//!   `env`/`target_pid`, or a hook that declines) is reported as the C's "target not alive" `1` —
-//!   never as a fabricated `0`.
+//! * **A `NULL` `obj` is ignored by the monitor family.** The C reaches the resource's monitor table
+//!   through `obj` (`DATA_TO_RESOURCE`); here the only fact read from it is
+//!   [`super::resources::resource_type_has_down`], which recognises the payload pointers this crate
+//!   minted and answers `None` for anything else (a null `obj`, a foreign object). Only a
+//!   recognised object of a type opened **without** a `down` callback selects the C's `-1`
+//!   ([`MONITOR_NO_DOWN_CALLBACK`]); every unrecognised `obj` keeps the historical behaviour, so an
+//!   `obj` from another NIF module is never dereferenced.
+//! * **`enif_monitor_process` reaches all three C codes** (`0` established, `1` dead/undefined
+//!   target, `-1` no `down` callback): the `-1` gate is answered from this crate's resource registry
+//!   first, exactly as the C orders it (`erl_nif.c:3968-3972` precedes `:3975`), and the arm itself is
+//!   the host's [`NifHost::monitor_process_result`] hook. With no host support (or no reference from
+//!   it) the answer is the C's "target not alive" `1` — never a fabricated `0`.
 //! * **`enif_whereis_pid`/`_port` answer `0` for a `NULL` out-parameter** (the C dereferences it).
 //! * **The liveness predicates answer `0` with no host support.** The C's answer for a dead or
 //!   invalid id is `0` too (`!!erts_proc_lookup(...)`, `:2330`), so "unknown" and "dead" coincide; a
@@ -109,10 +112,14 @@ use super::*;
 use libc::{c_char, c_int, c_void};
 
 use crate::common::{ERL_DIRTY_JOB_CPU_BOUND, ERL_DIRTY_JOB_IO_BOUND};
+use crate::nif::host::NifMonitorResult;
 use crate::nif::types::{ErlNifMonitor, ErlNifPid, ErlNifPort};
 
 /// `MAX_ARG` (`erl_vm.h:48`) — the largest argument count `enif_schedule_nif` accepts.
 const MAX_ARG: c_int = 255;
+
+/// The C's "the resource type carries no `down` callback" code (`erl_nif.c:3968-3972`).
+const MONITOR_NO_DOWN_CALLBACK: c_int = -1;
 
 /// The C's "the monitor was established" code (`erl_nif.c:4010`).
 const MONITOR_ESTABLISHED: c_int = 0;
@@ -458,9 +465,23 @@ pub unsafe extern "C" fn enif_is_port_alive(
 
 /// `int enif_monitor_process(ErlNifEnv*, void* obj, const ErlNifPid*, ErlNifMonitor *monitor);`
 ///
-/// Returns [`MONITOR_ESTABLISHED`] (`0`) when the monitor was created and stored in `*monitor`, and
-/// [`MONITOR_TARGET_DEAD`] (`1`) otherwise. The C's `-1` ("no `down` callback") is not reachable
-/// from an opaque `obj` — see the module docs.
+/// Reproduces the C's three codes **in the C's own order** (`erl_nif.c:3954-4011`):
+///
+/// 1. **`-1`** ([`MONITOR_NO_DOWN_CALLBACK`]) when `obj` is a resource object of a type this crate
+///    opened **without** a `down` callback (`:3968-3972`). This is tested *first*, before the pid is
+///    even read, because that is what the C does — so an undefined target on such a resource answers
+///    `-1`, not `1` (measured on the oracle). The answer comes from the crate's own resource registry
+///    ([`super::resources::resource_type_has_down`]), so it needs no host; an `obj` this crate did
+///    not mint keeps the historical behaviour.
+/// 2. **`1`** ([`MONITOR_TARGET_DEAD`]) for a null `target_pid`, an `enif_set_pid_undefined` pid
+///    (`:3975-3976`), or a target the host reports as already dead (`:4004`). `*monitor` is left
+///    untouched — the C only stores on the success path (`:4007`).
+/// 3. **`0`** ([`MONITOR_ESTABLISHED`]) after storing the monitor's 3-word reference block in
+///    `*monitor` (`:4007-4010`); a null `monitor` pointer is legal there and is honoured.
+///
+/// The arm itself is the host's: [`NifHost::monitor_process_result`] is consulted first (it can
+/// express all three outcomes), and when it answers `None` the legacy single-outcome
+/// [`NifHost::monitor_process`] is used exactly as before, so no existing host changes behaviour.
 ///
 /// # Safety
 ///
@@ -469,10 +490,17 @@ pub unsafe extern "C" fn enif_is_port_alive(
 #[no_mangle]
 pub unsafe extern "C" fn enif_monitor_process(
     env: *mut crate::nif::types::ErlNifEnv,
-    _obj: *mut c_void,
+    obj: *mut c_void,
     target_pid: *const ErlNifPid,
     monitor: *mut ErlNifMonitor,
 ) -> c_int {
+    // The C reads the resource's monitor table first (`rm = rsrc->monitors; if (!rm) return -1;`,
+    // `erl_nif.c:3968-3972`) — before the pid, which is why an undefined target still answers `-1`
+    // on a monitor-incapable resource (measured). `None` = "not an object of ours": fall through to
+    // the historical behaviour rather than dereferencing a foreign pointer.
+    if super::resources::resource_type_has_down(obj) == Some(false) {
+        return MONITOR_NO_DOWN_CALLBACK;
+    }
     let Some(e) = (unsafe { env_mut(env) }) else {
         return MONITOR_TARGET_DEAD;
     };
@@ -486,7 +514,16 @@ pub unsafe extern "C" fn enif_monitor_process(
         // `enif_set_pid_undefined` wrote the "undefined" marker (`erl_nif.c:3975-3976`).
         return MONITOR_TARGET_DEAD;
     }
-    let Some(term) = e.host().monitor_process(pid) else {
+    // The three-way hook first: it is the only seam that can say `-1` or distinguish "unsupported"
+    // from "dead". A host that declines (`None`) falls back to the legacy single-outcome hook, whose
+    // contract (a term, or `None` for "nothing established") is unchanged.
+    let armed = match e.host().monitor_process_result(pid) {
+        Some(NifMonitorResult::Armed(term)) => Some(term),
+        Some(NifMonitorResult::NotAlive) => return MONITOR_TARGET_DEAD,
+        Some(NifMonitorResult::NoDownCallback) => return MONITOR_NO_DOWN_CALLBACK,
+        None => e.host().monitor_process(pid),
+    };
+    let Some(term) = armed else {
         return MONITOR_TARGET_DEAD;
     };
     // The hook's term must be the ordinary internal reference the C builds with
