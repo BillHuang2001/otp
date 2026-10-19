@@ -54,7 +54,13 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 - `enif_free_iovec` is a **probe hazard**: the only safe shape needs the *internal*
   `ERL_NIF_IOVEC_FLAGS_PREALLOC` (absent from the public `erl_nif.h`), and the freeing form of an
   env-attached vector is UB on the oracle — deliberately not pinned.
-
+- A resource type's **`stop` callback is never invoked** by the Rust runtime, while the oracle calls
+  it once per `enif_select(…, ERL_NIF_SELECT_STOP, …)` (`erl_check_io.c:1530`) — armed or not.
+  Measured trace (arm a READ interest on a pipe read end, then `STOP` twice, reading the callback's
+  own counter between the steps): oracle `{0,0,17,1,1,2}`, rust `{0,0,17,0,1,0}` — the *codes*
+  agree (`17` = `STOP_CALLED|READ_CANCELLED`, then `1` = `STOP_CALLED`), only the callback count
+  differs, and `ERL_NIF_SELECT_STOP_SCHEDULED` is unobservable for the same reason. Owner:
+  `beam_abi` / the `beam_rt` select hook (`crates/beam_rt/src/nif_select.rs`).
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - `driver_async_port_key(port)` answers the port's opaque `ErlDrvData`/pointer word in the oracle while
   the Rust runtime's `DriverPort` keeps the `DriverHost` trait default (`0`,
