@@ -87,9 +87,9 @@ Logical groups:
 | Heap admission | `TestHeap` | `heap.rs::emit_test_heap` (an `emit_helper_call` to `jit_test_heap`) | always lowered — reaches the host's admission door exactly once with the instruction's own `heap_need`/`live`; continues in-block via `emit_continue_check` (partial refill + the gated Y refresh — this helper changes no frame) |
 | Frame trim | `Trim` | `heap.rs::emit_trim` (an `emit_helper_call` to `jit_trim`) | always lowered — an over-trim / frameless trim is the helper's `ERROR`; continues in-block on `encode_target(func, pc+1)` via `emit_frame_change_continue` (no refill; the helper re-published the Y window) |
 | Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label **in the block map** -> linked; otherwise return-to-driver (the target's function is compiled on entry) |
-| Local tail call | `CallLast` | `block.rs::emit_local_call_probe` then `link.rs::Linker::emit_tail_exit` (compiled successor) or `::emit_tail_exit_to_driver` (resolved but uncompiled successor) | `Linker::is_compiled`; an undefined label keeps the `emit_deopt` `unknown_label` |
-| Local tail call (no pop) | `CallOnly` | `block.rs::emit_local_call_probe` then `link.rs::Linker::emit_exit` | resolved label |
-| Local frame-preserving call | `Call` | `block.rs`: `emit_helper_call(jit_call_store)` + a `CALL_STORED` compare, then `link.rs::Linker::emit_exit` when `is_compiled` holds the callee's block, else `emit_helper_call(jit_call_store_linked)` + `link.rs::emit_in_block_call` | resolved label; the helper stores the continuation *and* consults the local-call seam, and the linking twin also resolves the callee's native entry so the block tail-jumps into it (declines to the driver's word) |
+| Local tail call | `CallLast` | `block.rs::emit_local_call_probe` then `link.rs::Linker::emit_tail_exit` (compiled successor) or `::emit_tail_exit_to_driver` (resolved but uncompiled successor) | `Linker::is_compiled`; an undefined label keeps the `emit_deopt` `unknown_label`. The probe carries the resolved callee/arity (packed), the `LOCAL_CALL_LAST` kind and the `deallocate` size as block-ABI immediates, and both exits pass `ExitSpill::Done` (the probe already spilled at the same `pc`) |
+| Local tail call (no pop) | `CallOnly` | `block.rs::emit_local_call_probe` then `link.rs::Linker::emit_exit` | resolved label; the same baked immediates with the `LOCAL_CALL_ONLY` kind, and the exit passes `ExitSpill::Done` |
+| Local frame-preserving call | `Call` | `block.rs`: `emit_helper_call(jit_call_store)` + a `CALL_STORED` compare, then `link.rs::Linker::emit_exit` when `is_compiled` holds the callee's block, else `emit_helper_call(jit_call_store_linked)` + `link.rs::emit_in_block_call` | resolved label; the helper stores the continuation *and* consults the local-call seam, and the linking twin also resolves the callee's native entry so the block tail-jumps into it (declines to the driver's word); the linked exit passes `ExitSpill::Done` (the same helper call already spilled at this `pc`) |
 | Cross-module call | `CallExt`,`CallExtOnly`,`CallExtLast` | `block.rs::emit_ext_call` (an `emit_helper_call` to `jit_ext_call`) | n/a — the helper resolves the import and reports `ENTER` |
 | Receive/send control | `Send`,`LoopRec`,`LoopRecEnd`,`Wait`,`WaitTimeout`,`Timeout`,`RemoveMessage` | `block.rs::emit_receive` (an `emit_helper_call` to `jit_receive`) | n/a — the helper runs the family body and reports the block-ABI word |
 | Family-owned surface | `PutList`,`PutTuple2`, the native-record set, `MakeFun3`,`CallFun`,`CallFun2`,`Apply`,`ApplyLast`, the try/catch/raise set, the float set, the map set, the bitstring set, `RecvMarker*` | `family.rs::emit_family` (an `emit_helper_call` to `jit_family`) | n/a — the helper runs the owning family's own body and reports the block-ABI word |
@@ -357,10 +357,39 @@ instruction's own operands.
   `jit_step_one`) and `y_base == y_end == null` rejects every slot, so the worst reachable state is
   "not yet published", never a stale window.
 - `link.rs::emit_exit`, `link.rs::emit_tail_exit` and `link.rs::emit_tail_exit_to_driver` spill (the
-  dirty set at their own `store_pc`) on **every** path — the linked and the return-to-driver ones alike.
+  dirty set at their own `store_pc`) on **every** path — the linked and the return-to-driver ones alike —
+  except where the caller passes `link.rs::ExitSpill::Done` (see the next bullet).
   `link.rs::emit_in_block_call` deliberately emits **no** spill of its own: it only ever runs after the
   `jit_call_store_linked` `emit_helper_call`, which already spilled the dirty set, and both its arms then
   leave `machine.x` authoritative.
+- **`link.rs::ExitSpill::{Required, Done}` — an exit skips only a *duplicate* store of the same dirty
+  set.** A `spill` is site- and path-independent: it stores exactly
+  `Allocation::spill_slots_at(pc)` at the `pc` it is given, whatever `SpillSite` asked for it. So a
+  mandatory `SpillSite::Helper` store at an instruction's own `pc` (from `emit_helper_call`) and a
+  block exit's `SpillSite::Exit` store at the **same** `pc` would write the identical words twice. The
+  mode every exit emitter takes — `ExitSpill::emit`, the one place the exit store is made:
+  - `Required` — the exit owns the store, because nothing spilled ahead of it: the `Jump`, the
+    `test`/`select_val`/`select_tuple_arity` fail-label branches, and the block's fall-through;
+  - `Done` — the exit emits nothing, and is passed **only** where an `emit_helper_call` at the same
+    `pc` immediately precedes the exit: the three probed local-call shapes (`CallLast`'s
+    `emit_tail_exit`/`emit_tail_exit_to_driver`, `CallOnly`'s `emit_exit`, and the frame-preserving
+    `Call`'s linked `emit_exit`), whose helper is `jit_local_call`/`jit_call_store*`.
+
+  `Done` is sound because nothing emitted between that helper call and the exit writes a cached
+  x-register (a helper `call`, a `mov` of a constant into the caller-saved scratch `r11`, a `cmp`, a
+  `jcc`) and both helpers' **decline** paths mutate nothing, so the words already stored are still the
+  ones `machine.x` must receive on every path the exit can run — it removes stores only, never a
+  store the helper site owes (the helper spill is the tier's root-set contract, so it is never the one
+  removed), and the fill model is untouched.
+  Corpus figures (`../census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed`,
+  deterministic, no threshold: 1358 modules / 103 066 functions / 597 507 blocks): exit-site spill
+  calls **797 396 → 705 569** (−91 827, −11.5 %), total spill calls 2 603 645 → 2 511 818;
+  dirty-set spill stores **1 496 158 → 1 359 648** (−136 510, −9.12 %), of which exit-site stores
+  415 661 → 279 151 (−32.8 %); every fill figure is unchanged (liveness 3 291 217 on both sides), and
+  the emitted bytes of the corpus move **316 324 782 → 315 369 212** (−955 570, −0.30 %) on the tree
+  that already carries the baked tail-call immediates (those immediates themselves cost +2 432 640
+  bytes, +0.78 %, on the un-probed tree, so the net over both mechanisms is +1 477 070 / +0.47 %). The
+  single-store saving is −7 bytes per probed exit, i.e. one `mov [rbx+disp], reg`.
 - The epilogue (`block.rs`: `done` -> `emit_frame_teardown` -> `ret`) does **not** spill: every path reaching
   it has already spilled. The inline fast paths (`move`/`arith`/`compare`/`test`/`select`/`aggregate`) do
   **not** spill themselves — a result lands in a cache register or straight in `machine.x` (the very slot
@@ -411,7 +440,7 @@ context (`JitRuntime::refresh_literals`, called by the driver before the run loo
 cross-module switch). A rejection branches to the helper, whose interpreter step reads the literal area
 itself.
 
-## `Call` — the frame-preserving local call and `CALL_STORED`
+## Local calls — the frame-preserving `Call`, `CALL_STORED`, and the tail forms' baked probe
 `Instr::Call` is the one local call form that writes a continuation; `jit_call_store` does that store
 *and* consults the host's local-call seam (`ExecutionContext::resolve_local_call`) in one helper call, in
 the interpreter's own probe-then-store order (a served callee's own code never runs and must not be left
@@ -444,6 +473,33 @@ store a return address into the wrong function's frame and only show up as a cor
   reductions bump, `ctx.reduce(1)?`). Every decline leaves `resume_entry` null and the helper's word equal
   to the pre-existing `encode_target(func, pc)`, so the driver serves it exactly as before.
 Pinned by `call_tests.rs`'s five transfer tests (see `../CONTEXT.md`).
+
+### The tail forms (`CallLast`/`CallOnly`): the same compile-time-baked probe
+The two tail forms are probed through `block.rs::emit_local_call_probe` →
+`../runtime.rs::jit_local_call`, and they receive the same treatment as the frame-preserving `Call`:
+the emitter's **whole compile-time resolution arrives as block-ABI immediates** — the caller's
+`(func, pc)`, `runtime.rs::encode_local_call(callee, arity)` (the packed `(function index, arity)`
+word, so the five payload words still fit `emit_helper_call`'s argument registers), the variant kind
+(`LOCAL_CALL_LAST`/`LOCAL_CALL_ONLY`) and, for a `call_last`, its `deallocate` frame size — exactly as
+`jit_ext_call` receives its `ImportRef`/kind/size.
+`runtime.rs::probe_local_call` therefore re-derives nothing on the per-call path: it does **not**
+re-read `module.functions[func].code[pc]` and does **not** re-resolve the target label (the `Linker`
+already resolved it for the block's own exit), it just decodes the pair, builds the arm's
+`ImportFrame` from the kind and consults `Machine::local_call_seam`.
+The instruction re-derivation is retained **only** as a `debug_assert!` cross-check — the address
+names this very tail call, its `arity` operand is the one handed to the seam, the baked kind names
+the variant (`call_last`'s `deallocate` too) and `labels.resolve(target)` equals the baked callee —
+so an emitter/helper divergence stays a test-time failure at zero release cost (the label map is
+dropped from the release body, `#[cfg(not(debug_assertions))] let _ = labels;`). The emitter is the
+single source of truth, which is also what keeps the immediates honest: it resolved the label for
+the exit it emits anyway.
+
+Cost, per kind (`../census.rs::the_per_kind_emitted_code_size_table_is_printed`): `CallLast
+(unlinked exit)` measures **200 → 230** whole-block bytes — the +30 nets the three extra helper
+arguments it now passes (the packed callee/arity word, the kind, the frame size: +37 bytes) against
+the −7-byte single-store saving the exit's `ExitSpill::Done` mode gives back (see
+`## Spill/fill discipline`); the corpus-wide totals are there too.
+
 ## Constraints
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder, and the
   attribute covers every submodule of this node; nothing here dereferences a raw pointer itself. The
@@ -486,6 +542,16 @@ full-cache stores from one recorded run. The emitted bytes themselves are pinned
 `baseline/tests.rs` (`every_exit_spills_the_cached_registers_before_leaving_the_frame`,
 `a_tail_exit_spills_pops_the_frame_and_then_jumps_to_the_successor`,
 `a_deallocate_spills_before_calling_the_helper`), which assert against the dirty-set store count.
+The `ExitSpill` mode is pinned twice: `link.rs`'s
+`a_done_exit_emits_exactly_the_spill_it_skips_less` (the `Required`-vs-`Done` byte-length equality on
+all three exits) and `../tail_exit_tests.rs::the_probed_local_call_records_one_spill_call_and_none_at_the_exit`
+(per probed tail shape: exactly **one** `SpillSite::Helper` spill call, **zero** `SpillSite::Exit`
+calls/stores, and the instruction lowered rather than deopted, so the pin cannot pass vacuously); the
+tail forms' interpreter agreement under the probe is
+`../tail_exit_tests.rs::the_probed_tail_call_still_agrees_with_the_interpreter`. The corpus-wide
+traffic behind the figures quoted above is `../census.rs::
+the_register_cache_traffic_census_over_the_corpus_is_printed`, and the per-kind sizes
+`../census.rs::the_per_kind_emitted_code_size_table_is_printed`.
 Tier-equivalence is proven by the crate's `tests/jit*.rs` real-module gates (interpreter-identical
 by construction).
 
@@ -686,7 +752,9 @@ never disagree. Both directions of the traffic are **partial**:
   missed reset only costs a redundant store). An allocation whose table is empty (a synthetic one
   a unit test built directly) falls back to the whole-block `Allocation::written` set. Sites:
   `SpillSite::Helper` (before an in-block helper call — the helper *is* the interpreter
-  and reads `machine.x`) and `SpillSite::Exit` (the block exit and the tail exit).
+  and reads `machine.x`) and `SpillSite::Exit` (the block exit and the tail exit — `link.rs::ExitSpill`
+  decides whether that exit still owes the store or a preceding helper call at the same `pc` already
+  made it; see `## Spill/fill discipline`).
   Because `resident ⊆ slots` and a non-resident slot's `machine.x` is already
   authoritative, the dirty set is complete on every path — including the deopt and
   epilogue paths.
