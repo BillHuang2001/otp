@@ -62,15 +62,15 @@
 //! four counter sequences), the emulator information block (`system_info`) and the
 //! extra-environment family (`alloc_env`/`free_env`/`make_copy`).
 //!
-//! Seven hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name
+//! Eight hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name
 //! lookup (`enif_whereis_pid`), the two liveness answers (`enif_is_process_alive`,
 //! `enif_is_current_process_alive`), the two port relations (`enif_is_port_alive`,
-//! `enif_port_command`) and a message delivery (`enif_send`) — and reach it through the optional
+//! `enif_port_command`), a message delivery (`enif_send`) and the `NEW_FUN_EXT` identity of a
+//! local closure (`enif_term_to_binary`) — and reach it through the optional
 //! [`NifHostServices`] provider threaded in at construction. The **per-call** host (built by
 //! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) carries a
-//! [`RuntimeNifServices`] over the runtime and the pass's own process table, so all seven are live
-//! there. The **load/unload** host (built by
-//! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
+//! [`RuntimeNifServices`] over the runtime, the pass's own process table and the calling module,
+//! so all eight are live there. The **load/unload** host (built by//! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
 //! registry, so it cannot borrow the runtime and is built with `services = None`: those hooks then
 //! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
 //! reference, a pid, a liveness answer or a delivery. `erlang:load_nif/2` on an already-loaded module
@@ -326,11 +326,31 @@ pub(crate) trait NifHostServices {
         let _ = (from, to, msg);
         None
     }
+
+    /// The `NEW_FUN_EXT` (`112`) identity of a **local** closure `term`, or `None` when it
+    /// cannot be faithfully derived.    ///
+    /// A `make_fun3` closure's term inlines only its engine-internal descriptor
+    /// (`[uniq: u64][index: u32]`): the module atom, the 16-byte module MD5 and the legacy
+    /// `old_index`/`old_uniq` (`ErlFunEntry`, `erts/emulator/beam/erl_fun.h:31-59`) live in the
+    /// **loaded module's** lambda table, which only the runtime knows. The provider derives them
+    /// from the code server's loaded-module snapshot with the very same derivation the
+    /// `erlang:term_to_binary/1` BIF uses
+    /// ([`crate::context::fun_identity_for`], caller module first), so `enif_term_to_binary`'s
+    /// image is the BIF's image.
+    ///
+    /// `None` is "identity unavailable" — a non-fun term, an `EXPORT_EXT` fun (which needs no
+    /// seam), a closure no loaded module defines, an unreadable module `.beam`. The encoder then
+    /// reports its typed `unsupported_local_fun` and [`NifHost::term_to_binary`] answers the C's
+    /// failure code `0`; nothing is ever invented. The default `None` is a provider that cannot
+    /// answer at all (the load/unload host), which has the same honest consequence.
+    fn local_fun_identity(&mut self, term: Eterm) -> Option<beam_codec::FunIdentity> {
+        let _ = term;
+        None
+    }
 }
 
 /// The concrete [`NifHostServices`] over a runtime's own reference id space, reference registry
-/// and process table.
-///
+/// and process table.///
 /// The two fields are **disjoint borrows**: the runtime itself, and the caller-supplied process
 /// table when the call runs inside a scheduler slice. That table lives outside the runtime (a pass
 /// takes it out before running a process: the runner cannot lend the same table to both a
@@ -348,8 +368,12 @@ pub(crate) struct RuntimeNifServices<'a> {
     pub(crate) runtime: &'a mut crate::runtime::Runtime,
     /// The caller-supplied process table, when the NIF call runs inside a scheduler slice.
     pub(crate) mailbox: Option<&'a mut ProcessTable>,
+    /// The name of the module whose **code** issued the NIF call, when there is one — the
+    /// caller-first preference of the local-fun identity derivation
+    /// ([`NifHostServices::local_fun_identity`]), exactly as the `erlang:term_to_binary/1` BIF
+    /// route passes [`RuntimeContext::current_module`](crate::context::RuntimeContext).
+    pub(crate) caller: Option<&'a str>,
 }
-
 impl RuntimeNifServices<'_> {
     /// The process table a registered name, a liveness answer and a delivery resolve against: the
     /// slice's own table when there is one, else the runtime's.
@@ -429,7 +453,7 @@ impl NifHostServices for RuntimeNifServices<'_> {
     /// there is no local process for `to` (`:876-877`) or the delivery itself failed. A remote pid
     /// is `Some(false)` too — the C's `enif_send` has no distribution arm.
     fn send(&mut self, from: ProcessId, to: Eterm, msg: Eterm) -> Option<bool> {
-        let RuntimeNifServices { runtime, mailbox } = self;
+        let RuntimeNifServices { runtime, mailbox, .. } = self;
         Some(crate::context::nif_send::deliver(
             runtime,
             mailbox.as_deref_mut(),
@@ -438,8 +462,23 @@ impl NifHostServices for RuntimeNifServices<'_> {
             msg,
         ))
     }
-}
 
+    /// The `NEW_FUN_EXT` identity of a local closure — the code server's loaded-module
+    /// snapshot, resolved caller-first, through the one derivation the
+    /// `erlang:term_to_binary/1` BIF also uses ([`crate::context::fun_identity_for`]).
+    ///
+    /// The provider owns no long-lived borrow of the code server (the snapshot is the code
+    /// server's own cached [`Rc`] handle), so this answers in place, with the runtime's real
+    /// local node atom as the creator pid's node.
+    fn local_fun_identity(&mut self, term: Eterm) -> Option<beam_codec::FunIdentity> {
+        crate::context::fun_identity_for(
+            &self.runtime.code_server,
+            self.caller,
+            Some(self.runtime.local_node()),
+            term,
+        )
+    }
+}
 /// The runtime services one NIF call (or one library `load`/`unload`) draws on.
 ///
 /// It **owns** its [`Heap`] so it has a stable address when boxed (the library's erased host
@@ -772,9 +811,15 @@ impl NifHost for NifHostImpl<'_> {
     /// `encode_body`), so an internal pid/port id encodes as the oracle's `NEW_PID_EXT`/`V4_PORT_EXT`
     /// rather than being unencodable.
     ///
-    /// A tag the codec cannot write — most importantly a local (`make_fun3`) fun, whose identity is
-    /// the *compiled module's*, unreachable from this host — yields the typed `None`: `enif_term_to_binary`
-    /// then answers the C's failure code `0` and writes nothing, never a wrong image.
+    /// A **local** (`make_fun3`) fun's term carries none of the `NEW_FUN_EXT` fields, so its
+    /// identity comes from the borrowed [`NifHostServices`] provider
+    /// ([`NifHostServices::local_fun_identity`]) — the loaded module that defines the closure,
+    /// derived exactly as the BIF route derives it. An **external** (`EXPORT_EXT`) fun needs no
+    /// seam, and a local fun whose defining module is not loaded here stays the codec's typed
+    /// `unsupported_local_fun`.
+    ///
+    /// Any tag the codec still cannot write yields the typed `None`: `enif_term_to_binary` then
+    /// answers the C's failure code `0` and writes nothing, never a wrong image.
     ///
     /// [`MinorVersion::V2`]: beam_codec::MinorVersion::V2
     fn term_to_binary(&mut self, term: Eterm) -> Option<Vec<u8>> {
@@ -786,10 +831,20 @@ impl NifHost for NifHostImpl<'_> {
         if let Some(node) = node {
             encoder = encoder.with_local_node(node, 0);
         }
+        // A local fun's `NEW_FUN_EXT` identity: the one input the term does not carry. The
+        // provider derives it from the runtime's loaded modules (the same derivation the
+        // `erlang:term_to_binary/1` BIF uses); with no provider — the load/unload host — or no
+        // matching module the encoder keeps its typed `unsupported_local_fun` gap.
+        if let Some(identity) = self
+            .services
+            .as_mut()
+            .and_then(|services| services.local_fun_identity(term))
+        {
+            encoder = encoder.with_fun_identity(identity);
+        }
         encoder.encode(term).ok()?;
         Some(encoder.finish())
     }
-
     /// `enif_binary_to_term` — decode an External Term Format image onto this host's heap.
     ///
     /// The decoder owns the version-byte check and the `COMPRESSED` wrapper, and is strict about
@@ -1111,9 +1166,9 @@ mod tests {
         RuntimeNifServices {
             runtime,
             mailbox: None,
+            caller: None,
         }
     }
-
     /// [`NifHost::make_copy`] is the **identity**: `alloc_env` builds the message env over this
     /// same host, so the message env and the call env share one heap and there is nothing to move.
     ///

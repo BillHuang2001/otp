@@ -162,10 +162,41 @@ impl FunIdentityBridge {
     }
 }
 
+/// The [`LocalFunIdentity`] answer for `term`, derived against the code server's **cached**
+/// loaded-module snapshot.
+///
+/// This is the free-function form of [`FunIdentityBridge`] for a host that holds no
+/// [`RuntimeContext`](super::RuntimeContext) and can therefore build no `BifContext`: the NIF
+/// host behind `enif_term_to_binary`
+/// ([`NifHostServices::local_fun_identity`](crate::nif::NifHostServices::local_fun_identity)).
+/// Building and consulting a bridge is the bridge's own `Rc` clone plus the derivation, so both
+/// routes answer from exactly one implementation.
+///
+/// `module` is the caller-first preference [`FunIdentityBridge::new`] documents — the module
+/// whose code is executing — and `node` the local node's name atom.
+///
+/// `None` is the one answer this derivation gives when the identity is genuinely unknown: a
+/// non-fun term, an `EXPORT_EXT` fun (which needs no seam), a fun no loaded module defines, an
+/// unreadable module `.beam`, or a malformed descriptor. The encoder then stays on its typed
+/// `unsupported_local_fun` gap, so no caller ever writes an invented image.
+pub(crate) fn fun_identity_for(
+    code_server: &CodeServer,
+    module: Option<&str>,
+    node: Option<Atom>,
+    term: Eterm,
+) -> Option<beam_codec::FunIdentity> {
+    let mut bridge = FunIdentityBridge::new(code_server, module, node);
+    match bridge.local_fun_identity(term) {
+        Ok(identity) => identity,
+        // A derivation error (a malformed fun descriptor, an index beyond the wire's `u32`) is
+        // "identity unavailable", exactly like the `Ok(None)` above — never a guessed identity.
+        Err(_) => None,
+    }
+}
+
 impl LocalFunIdentity for FunIdentityBridge {
     fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
-        // This hook is consulted for **every** fun argument of `term_to_binary/1,2` and of
-        // the `erlang:fun_info/1,2` introspection pair. Only the two fun kinds whose term
+        // This hook is consulted for **every** fun argument of `term_to_binary/1,2` and of        // the `erlang:fun_info/1,2` introspection pair. Only the two fun kinds whose term
         // carries (or can be matched to) an `ErlFunEntry` identity are answered here: a
         // `Local` (`make_fun3`) closure and an `Imported` (`NEW_FUN_EXT`) one. An `External`
         // (`EXPORT_EXT`) fun needs no seam — its whole identity is the export the term

@@ -1333,8 +1333,12 @@ impl<'a> RuntimeContext<'a> {
         let mut services = RuntimeNifServices {
             runtime: self.runtime,
             mailbox: self.mailbox_table.as_deref_mut(),
-        };        let mut host = NifHostImpl::new(
-            heap,
+            // The module whose code issued the call: the caller-first preference of the local-fun
+            // `NEW_FUN_EXT` identity (`enif_term_to_binary` of a closure), the same one
+            // `call_registered` hands its `FunIdentityBridge`.
+            caller: self.current_module.as_deref(),
+        };
+        let mut host = NifHostImpl::new(            heap,
             Rc::clone(&atoms),
             interner.share(),
             self_pid,

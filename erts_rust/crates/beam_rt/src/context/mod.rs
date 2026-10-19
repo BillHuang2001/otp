@@ -101,7 +101,7 @@ pub use self::runtime_context::RuntimeContext;
 pub(crate) use self::position::InMachinePosition;
 pub(crate) use self::apply::LocalFunTarget;
 pub(crate) use self::bridges::{module_md5, PendingInterner};
-pub(crate) use self::persistent_term::PersistentTermStore;
+pub(crate) use self::fun_identity::fun_identity_for;pub(crate) use self::persistent_term::PersistentTermStore;
 use self::dispatch::DispatchMemo;
 
 // `tests.rs` and `pump.rs`'s inline suite reach the items they assert on through `use
