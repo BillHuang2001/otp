@@ -128,20 +128,28 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 ## Dynamic execution census (`exec_census`)
 The **dynamic** counterpart of the static corpus census: per-`Instr`-variant counts of what actually *executes* at run time, keyed by `exec_census::variant_name` (a `Test` by its kind), plus per-variant typed-error counts with the exact `Display` text of each variant's first error.
 It is a **public** module (`beam_engine::exec_census`, not `#[cfg(test)]`, following the `jit::bench` precedent) so the `tests/` integration drivers can call `enable`/`disable`/`set_enabled`/`is_enabled`/`reset`/`snapshot`/`write_dump`.
-The recorders are the two `pub(crate)` funnel hooks in `interpreter/dispatch.rs` — `on_instruction` before the instruction's effect, `on_error` for an `Err` out of `step_instruction_body` — each one thread-local `bool` read when disabled; a counted run is byte-identical to an uncounted one (asserted in `exec_census.rs`'s tests).
+The recorders are the two `pub(crate)` funnel hooks in `interpreter/dispatch.rs` — `on_instruction` before the instruction's effect, `on_error` for an `Err` out of `step_instruction_body` — gated on the latched `Machine::census_on` field each driver copies out of `is_enabled` once per run/resume entry, so a disabled census costs one load and a branch and **zero thread-local accesses per instruction**; a counted run is byte-identical to an uncounted one (asserted in `exec_census.rs`'s tests).
 Observability limits, honestly: an `Err` escaping the funnel is an error, so a raise folded into a `Step` by a live in-machine `try`/`catch` frame counts as **executed but not error**; and a natively-inlined baseline-JIT instruction never reaches the funnel, so `Tier::Interpreter` is the fully covered tier while a native tier reports only its deopted steps.
 `write_dump(section) -> Option<PathBuf>` writes `std::env::temp_dir()/beam_engine_exec_census_<section>.tsv` (a `#` totals line, the `variant`/`executed`/`errors`/`first_error` header, one row per variant, `-` when a variant never errored; any `section` character that is not alphanumeric/`-`/`_` becomes `_`), the machine-readable form of a snapshot; a write failure is reported on stderr and yields `None`.
 The instrument's own ranked view is `jit/baseline/census.rs`'s runtime **execution** census over the `jit::bench` workload set at `Tier::Interpreter`, and the corpus-scale ranking is `tests/dynamic_census.rs`: both are measured figures and live in `../MEASURED.md`, never here — and that workload set is the in-crate tier set, not the OTP corpus.
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors, all under `src/machine/`: `Machine::with_roots` (the `RootSet` carrier and the only hand-off body, `machine/mod.rs`), `Machine::alloc_rooted` (→ `ExecutionContext::alloc_words_rooted`, `machine/mod.rs`) and `Machine::ensure_heap` (→ `ExecutionContext::ensure_heap_full`, `machine/frames.rs`).
-`with_roots` hands over the **whole** three files — `&mut self.x` (all `max_register` slots),
-`&mut self.stack` (every Y slot) and `&mut self.fr` (all `MAX_FLOAT_REGISTER`) — plus `live`, which is
-**only a hint** (`RootSet::live_len()` clamps it, `src/context.rs`): a host that scans just
-`x[..live_len()]` leaves any word above `live` unrelocated, so the hint's provenance is a contract:
-the two **heap** doors pass the instruction's own `Live` operand verbatim (`interpreter/dispatch.rs`'s
-`Instr::TestHeap`/`Instr::AllocateHeap` arms ← `beam_loader`'s operand), while **every** `alloc_rooted`
-caller passes `RootSet::ALL_LIVE`. The engine computes no liveness of its own.
+`with_roots` hands over exactly what the run has **used**: `&mut self.x[..used_x_extent]`, the whole
+`&mut self.stack` (every Y slot) and `&mut self.fr[..used_fr_extent]`, where the used extent is
+`max(x_mark, x_dirty)` / `max(fr_mark, fr_dirty)` clamped to the file — `machine::registers::used_extent`,
+the **single rule** the hand-off and `Machine::reset`'s refill share. `x_dirty`/`fr_dirty` name the extent
+from `x_mut`/`fr_mut` (whole file), from `with_roots` (the root prefix it hands over) and from the native
+driver (`CompiledModule::native_write_extent`, noted **before** the block runs). Every slot at or beyond the
+extent is `NIL` by the refill invariant, so it is not a root; a host therefore relocates and writes a moved
+term back **only inside the slices it receives** (it physically cannot write outside them), and that
+hand-off — not a host promise — is what bounds the next reset to the words the run actually used.
+`live` is still **only a hint** (`RootSet::live_len()` clamps it to the handed slice, `src/context.rs`): a
+host that scans just `x[..live_len()]` leaves any word above `live` unrelocated, so the hint's provenance
+is a contract: the two **heap** doors pass the instruction's own `Live` operand verbatim
+(`interpreter/dispatch.rs`'s `Instr::TestHeap`/`Instr::AllocateHeap` arms ← `beam_loader`'s operand), while
+**every** `alloc_rooted` caller passes `RootSet::ALL_LIVE` — the hint is unchanged by the narrower
+hand-off. The engine computes no liveness of its own.
 Their call sites, exactly: `alloc_words_rooted` has **one** production caller — `terms::reserve`
 (`src/terms/slack.rs`, hence `reserve_slack` and every `*_rooted` builder; `terms::test_support` is
 `#[cfg(test)]`), reached **per built term** (each `put_list`/`put_tuple2`/`make_fun3`/

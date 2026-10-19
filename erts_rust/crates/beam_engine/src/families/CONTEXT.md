@@ -6,12 +6,19 @@ loop (`../interpreter/`) does not execute natively is routed here by [`mod.rs::d
 family that owns it.
 One family per opcode group; each exposes `exec(...) -> Result<Option<Step>>` where `Ok(Some(step))` =
 "this family executed it", `Ok(None)` = "not my variant", `Err` = the family raised.
-Family ownership is **disjoint and variant-complete** (`mod.rs:121-218`): each of the 77 claimed `Instr`
-variants has exactly one owning family, so the route is a jump table on the `Instr` discriminant —
-semantically identical to the old first-claim-wins probe loop (see the module doc, `mod.rs:93-110`).
+Family ownership is **disjoint and variant-complete** (`mod.rs`'s `dispatch` arms): each of the 77 claimed
+`Instr` variants has exactly one owning family, so the route is a jump table on the `Instr` discriminant —
+semantically identical to the old first-claim-wins probe loop (see the module doc). One arm is a
+**predicate** rather than a variant list: the bitstring family's `_ if bitstrings::claimed(instr)`
+(`mod.rs:206`), which is the family's own statement of its variant set (see API Surface).
 
 ## API Surface
 - `pub(crate) fn dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:112`.
+- `pub(crate) fn bitstrings::claimed(&Instr) -> bool` (`bitstrings/mod.rs:135`) — the bitstring family's **one**
+  statement of the 20 `Bs*` variants it owns. `dispatch` routes on it, and so do the native baseline tier's
+  emitted arm (`jit/baseline/emit/block.rs`) and its in-block helper (`jit/baseline/bitstr.rs`), so the
+  router and the tier cannot disagree about who owns an opcode; the family's `exec` `Ok(None)` contract is
+  the authority it is pinned against (`jit/baseline/bitstr_tests.rs`).
 - `pub(crate) const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed"` — `mod.rs:82` (frozen sentinel, pinned by `mod.rs:321`).
 - Every family: `pub(crate) fn exec(machine, module, labels, instr, func, pc, ctx) -> Result<Option<Step>>`; `funs` and
   `exceptions` additionally take the run's `entry_module` (the stacktrace/callee-item cooks need it).
@@ -40,6 +47,11 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
   `unsupported` (C reads the class atoms from its `am_error`/`am_exit`/`am_throw` globals, so it can never be in that
   state). Resolving in each family (or at each raise site) instead would duplicate the same lookup nine times and
   still miss `bitstrings`/`records`' internal raises.
+- **The latch is duplicated only where a caller bypasses the router.** `bitstrings::exec` installs it itself
+  (`bitstrings/mod.rs:176`), because the native baseline tier's `jit_bitstr` calls that entry directly; on
+  the routed path it is a second `bool` load and a not-taken branch, and the family that owns it also owns
+  the raise sites it protects. Pinned by `bitstrings/mod.rs`'
+  `exec_installs_the_class_atom_anchor_for_a_direct_caller`.
 - **Cost.** `dispatch` tests the per-run `class_atoms_live` latch (`../machine/CONTEXT.md`) **itself** and only
   calls `Machine::ensure_class_atoms` when it is clear, so the steady state is one `bool` load and a not-taken
   branch instead of a function call per family-owned instruction; the resolution runs at most once per run, and
@@ -258,22 +270,13 @@ between sessions and up to 5× on a loaded one).
   every execution (a comprehension enters it once per byte, two commands each). An in-family re-discovery of
   the shapes was measured a **regression** (1.027× on `to_lower`), so the loader is the only route left.
   **OWNER: `crates/beam_loader`** (and `crates/beam_engine/src/lib.rs` for the `Instr` variants).
-- **`src/lib.rs` declares `families` as a private module**, so every `pub(crate)` entry point inside this node
-  (the match/dispatch/segment seams listed in `bitstrings/CONTEXT.md`) is unreachable from `src/jit/**`; a tier
-  that wants a per-command entry needs `pub(crate) mod families` or targeted root re-exports. **OWNER: the
-  parent `src/` node.**
-- **`src/exec_census.rs` is 2.12 % of `to_lower`'s self time while disabled** — the thread-local `bool`
-  load sits on the per-instruction funnel. **OWNER: the parent `src/` node.**
-- **`Instr::SelectVal` materializes every pair operand** (`src/interpreter/dispatch.rs:353-362`): a `read_operand`
-  per pair (`Operand::Integer`/`Operand::Character` → `terms::number::make_integer_unrooted`) followed by a full
-  `beam_term::cmp` per pair, so a character-table `select_val` (what a per-character case/`select_val` compiles to)
-  pays an O(pairs) term-materialization + atom-namespace comparison per execution, although the small-integer
-  scrutinee could be compared against a small/literal candidate directly. **OWNER: the parent `src/` node** — the
-  one interpreter hot spot in the `to_lower` function-level profile (`bitstrings/CONTEXT.md` → `## Measured`) that
-  no change in this node can reach; 2.61 % of that profile is `make_integer_unrooted` call overhead and 2.92 %
-  `cmp_impl`.
-
-## Notes for Agents
+- **`src/lib.rs` declares `families` as `pub(crate) mod families`**, so this node's `pub(crate)` entry points
+  (the match/dispatch/segment seams listed in `bitstrings/CONTEXT.md`) are reachable from `src/jit/**` directly;
+  no item inside is `pub`. `bitstrings`' `claimed(&Instr)` is the single statement of that family's variant
+  ownership, consumed by the router and by the baseline emitter.
+- **The census gate is the latched `Machine::census_on` field** — one load and a branch on the per-instruction
+  funnel, the same latched-gate idiom as `trace_on`/`reduce_on`; a disabled census performs no thread-local
+  access per instruction (figures: `../MEASURED.md`). **OWNER: the parent `src/` node.**## Notes for Agents
 - The router (`mod.rs:112`) and `lists::exec` are `#[inline]`, so a dispatched instruction hands straight to its owning family.
 - A family's `Ok(None)` is **not** a silent no-op: it reaches the router's last arm and yields the sentinel.
   The only way to "claim then no-op" would be an arm returning `Ok(Some(Step::Next))` without doing the

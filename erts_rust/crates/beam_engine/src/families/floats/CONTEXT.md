@@ -35,7 +35,8 @@ every read converts the slot with `crate::terms::float_value` and every write st
 built by `crate::terms::make_float_rooted`. A malformed module's non-float slot is therefore
 detected as the arithmetic failure rather than being reinterpreted as bits. This file is the
 family that makes the substitution observable, so the `RootSet` the machine publishes includes the
-whole FR file (`../../CONTEXT.md` §"The GC root-set contract").
+FR file's used prefix — every slot an FR write has touched (`Machine::used_fr_extent`,
+`../../CONTEXT.md` §"The GC root-set contract").
 
 ## Failure semantics (never a panic, never a fabricated value)
 - A **non-float FR slot** or a **non-finite result** (including `x/0.0` ⇒ `inf` and `0.0/0.0` ⇒

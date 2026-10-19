@@ -11,10 +11,14 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   call frames, exception catch frames, literal area, module-context registry, the **raise-time snapshot**
   `raise_snapshot: Vec<(u32, u32, u32)>` — the pre-unwind `(context, func, pc)` chain, the engine's
   replacement for C's saved raw `StackTrace` (`c_p->ftrace`) — latched A.8 trace gate, reduction counter,
-  and the **in-machine BIF-dispatch gate** `bif_in_machine_on` — the cached
+  the **in-machine BIF-dispatch gate** `bif_in_machine_on` — the cached
   `ExecutionContext::wants_bif_in_machine` answer, latched once per run by `Machine::drive` **and** by the
-  native baseline tier's driver, read by `Machine::dispatch_bif_call`); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
-  (`stack_mut`, `with_roots` handing over the whole `RootSet`, and `alloc_rooted` — the convenience
+  native baseline tier's driver, read by `Machine::dispatch_bif_call` — and the fourth latched gate,
+  **`census_on`**, the per-run copy of `exec_census::is_enabled()` that the per-instruction funnel at
+  `interpreter/dispatch.rs::step_instruction_inner` tests instead of touching the census's thread-local on
+  every instruction (cleared by `reset`, latched by both drivers, so a mid-run `enable()` takes effect at the
+  run's next entry)); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
+  (`stack_mut`, `with_roots` handing over the live `RootSet`, and `alloc_rooted` — the convenience
   wrapper that calls `ExecutionContext::alloc_words_rooted`); and the **off-heap refc-binary handle view**
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
   which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc
@@ -32,10 +36,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`; `x_mut`/`fr_mut` as
   the single-view root-set accessors); `fr_mark()` — the **live leading FR-slot count** (the FR high-water
   mark, `0` ⇒ no live FR slot), the FR twin of the `x[0..live)` root-set bound, so a host can publish/scan
-  only the slots an FR write actually touched (exact after the ordinary interpret seams; a native JIT block
-  or a caller that took a raw `fr_mut`/`with_roots` slice sets the crate-internal `regs_escaped` flag and may
-  understate it — the caller must account for that itself); `Machine::reset` clears the raise snapshot
-  alongside the module contexts (both belong to the run that is starting) **and clears all four raise
+  only the slots an FR write actually touched. The refill bound is the **used extent** of each file:
+  `used_extent(len, mark, dirty)` = `max(mark, dirty)` clamped to the file length, where the mark is raised
+  by `set_x`/`set_fr` and the *dirty* extent by every writer that cannot report slots — `x_mut`/`fr_mut`
+  (the whole file), `with_roots` (the prefix it hands over) and the native driver (the artifact's own
+  `CompiledModule::native_write_extent`, noted **before** the block runs). Every slot at or beyond the extent
+  is `NIL` by the refill invariant, which is what makes the narrow root hand-off sound by construction
+  rather than by host promise. `Machine::reset` clears the raise snapshot  alongside the module contexts (both belong to the run that is starting) **and clears all four raise
   latches** (`pending_function_clause_args`/`raise_function_clause_args`/`pending_supplied_trace`/
   `raise_supplied_trace`).
 - `mod.rs` — the four raise latches. The failed-clause pair:

@@ -49,6 +49,7 @@ use crate::error;
 
 mod bif;
 mod dispatch;
+mod select;
 mod test;
 mod trace;
 #[cfg(test)]
@@ -57,6 +58,12 @@ mod tests;
 // The one definition of the failed-clause `function_clause` raise, shared with the
 // instruction families (the maps read path's absent-key `NO_FAIL` branch).
 pub(crate) use dispatch::raise_function_clause_no_fail;
+// The `select_val` pair ladder (`select.rs`): the single decision authority the
+// interpreter's `SelectVal` arm **and** both native tiers' `select_val` plans use,
+// so no tier can drift from another's notion of "this alternative matches".
+pub(crate) use select::constant_word;
+#[cfg(test)]
+pub(crate) use select::{reset_select_answers, select_answers};
 // The frame discipline of the `call_ext*` forms, shared with a sibling module that
 // drives `Machine::call_ext_dispatch` for a given form. Its consumer is the JIT tier
 // (`crate::jit`), so the import is not itself "used" by anything in this module today
@@ -263,9 +270,10 @@ impl<const N: usize> From<[(Label, (u32, u32)); N]> for LabelMap {
 
 // A test-only counter of `build_label_map` calls on the current thread.
 //
-// A run must build the module-wide label index **exactly once** (it used to build
-// it twice — once to resolve the entry label and once inside the dispatch loop),
-// and a focused unit test asserts that. Compiled only under `cfg(test)`, so it is
+// It makes the build count observable: a run of a **synthetic** module (no content
+// identity, so `crate::machine::label_cache` never caches it) builds exactly once per
+// entry, and a real `.beam` module builds once on its first entry through a machine and
+// not at all on later ones. Compiled only under `cfg(test)`, so it is
 // absent from production builds and from the `tests/` integration suites (which
 // link the non-test library) and cannot perturb their timing.
 #[cfg(test)]
@@ -311,22 +319,25 @@ pub(crate) fn build_label_map(module: &Module) -> LabelMap {
     //
     // The traversal — not the table filling — is what this costs: `Function::labels`
     // is a `BTreeMap`, so reaching each element is a chase into a separately allocated
-    // node. The buffer's `len()` and the running `max` give exactly the two facts the
-    // previous version spent a whole **second** traversal on (`count` and `max`, for
-    // the dense/sparse decision), so that walk was pure overhead. Measured
-    // interleaved on one host (a reused scratch harness, 5k-20k builds per run):
+    // node. The buffer's `len()` and the running `max` give the two facts the
+    // dense/sparse decision needs (`count` and `max`), so one walk answers both.
+    // Measured interleaved on one host (a reused scratch harness, 5k-20k builds per run):
     //
-    // | module | labels | before | after |
-    // |---|---|---|---|
-    // | `lists.beam` | 1256 | 10647 ns | 6467 ns |
-    // | `string.beam` | 1194 | 9525 ns | 5974 ns |
-    // | `tailcall.beam` | 27 | 276 ns | 193 ns |
+    // | module | labels | per build |
+    // |---|---|---|
+    // | `lists.beam` | 1256 | 6467 ns |
+    // | `string.beam` | 1194 | 5974 ns |
+    // | `tailcall.beam` | 27 | 193 ns |
     //
-    // The entries come out in **label-id order**: each `BTreeMap` iterates in key
-    // order, so the concatenation of the per-function tables is ordered except for
-    // the function boundaries — the same input, in the same order, the previous
-    // version collected and then sorted, so the sparse table (and its last-wins
-    // behaviour for a duplicated label id) is identical.
+    // A build happens once per machine per module, never once per run: `Machine::label_map`
+    // serves it from the one-entry cache in `crate::machine::label_cache` (a synthetic
+    // all-zero-checksum image has no content identity and is rebuilt on every entry).
+    //
+    // The entries come out in **label-id order** within each function: a `BTreeMap`
+    // iterates in key order, so the concatenation of the per-function tables is ordered
+    // except across function boundaries. The dense branch does not care (it indexes by
+    // label id), and the sparse branch sorts explicitly, so a duplicated label id is
+    // last-wins either way.
     //
     // A real `.beam` numbers its labels `1..=count`, so `max + 1 == count + 1` and the
     // dense table is exactly as large as the label set (verified across the installed
@@ -398,7 +409,18 @@ pub(crate) fn resolve(labels: &LabelMap, label: Label) -> Result<(u32, u32)> {
     labels.resolve(label)
 }
 
-/// Resolve a module-local label to its `(function index, code offset)`.
+/// Resolve a module-local label to its `(function index, code offset)` against a
+/// **fresh** build of the module's index — the test-only convenience.
+///
+/// Production never calls this: a run resolves its labels against the machine's
+/// label-map cache ([`Machine::label_map`](crate::Machine), which
+/// [`Machine::run_label_outcome`](crate::Machine::run_label_outcome), the dispatch
+/// loop and the native tier all go through, so a re-entered module builds nothing),
+/// and a label handed in is resolved against the map the run will execute with
+/// ([`resolve`]). This per-call builder is compiled only for tests, where it pins the
+/// semantics of an index built from scratch — and so that no future site can quietly
+/// reintroduce a per-call whole-module build.
+#[cfg(test)]
 pub(crate) fn resolve_label(module: &Module, label: Label) -> Result<(u32, u32)> {
     build_label_map(module).resolve(label)
 }

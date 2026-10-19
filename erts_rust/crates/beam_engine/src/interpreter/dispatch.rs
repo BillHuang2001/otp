@@ -29,7 +29,7 @@
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{ImportRef, Instr, Module, NO_FAIL};
 use beam_term::{
-    atom_val, cmp, is_atom, is_internal_pid, is_list, is_nil, make_atom, Eterm, NIL,
+    atom_val, is_atom, is_internal_pid, is_list, is_nil, make_atom, Eterm, NIL,
 };
 
 use crate::context::ExecutionContext;
@@ -243,18 +243,30 @@ impl Machine {
         // body runs (a raising instruction is counted as executed AND as an error), only
         // an `Err` that escapes here is an error (a raise folded into a `Step` by a live
         // in-machine `try`/`catch` frame is not), and a natively-inlined baseline-JIT
-        // instruction never reaches this point and so is not observable. A disabled
-        // census costs one `bool` load and leaves the result byte-identical.
+        // instruction never reaches this point and so is not observable.
         //
+        // The gate is the plain `Machine::census_on` `bool` latched by each driver at its
+        // run/resume entry, **never** the instrument's thread-local flag: this funnel runs
+        // once per interpreted instruction, so a TLS access here would be a per-instruction
+        // cost paid by every run. With the latch off a disabled run pays this branch and
+        // nothing else (figures: `MEASURED.md`).        //
         // The instruction's effect lives in [`Machine::step_instruction_body`] so that
         // **every** `Err` out of it — including one propagated by `?` inside a single
         // arm, which returns from the body rather than falling out of the `match` — is
         // observed here. Every arm is unchanged: the split is a pure wrap.
-        crate::exec_census::on_instruction(instr);
+        if self.census_on {
+            crate::exec_census::on_instruction(instr);
+        }
         let result =
             self.step_instruction_body(instr, entry_module, module, labels, func, pc, ctx);
         if let Err(err) = &result {
-            crate::exec_census::on_error(instr, err);
+            // Re-read the latch instead of holding it across the body call: the value is
+            // needed again only on this (cold) error arm, and keeping it live across
+            // `step_instruction_body` would cost the interpreter's hot frame a
+            // callee-saved register on every instruction.
+            if self.census_on {
+                crate::exec_census::on_error(instr, err);
+            }
         }
         result
     }
@@ -352,14 +364,8 @@ impl Machine {
             }
             Instr::SelectVal { value, fail, pairs } => {
                 let scrutinee = read_operand(self, ctx, value)?;
-                let mut target = None;
-                for (candidate, label) in pairs {
-                    let candidate_value = read_operand(self, ctx, candidate)?;
-                    if cmp(scrutinee, candidate_value, ctx.atoms(module)).is_eq() {
-                        target = Some(*label);
-                        break;
-                    }
-                }
+                let target =
+                    super::select::first_match(self, ctx, module, scrutinee, pairs)?;
                 match target {
                     Some(label) => {
                         let (func, pc) = resolve(labels, label)?;

@@ -178,6 +178,31 @@ impl BifHistogram {
         self.keys.is_empty()
     }
 
+    /// Fold `other`'s dispatches into this histogram.
+    ///
+    /// A phased measurement runs many batches through many contexts, so the phase's histogram is
+    /// the sum over its batches; `record`'s allocation-free fast path stays exactly as it is (a
+    /// merge happens once per batch, never on the dispatch path).
+    pub(crate) fn merge(&mut self, other: &BifHistogram) {
+        for (key, count) in other.keys.iter().zip(&other.counts) {
+            let id = match self.keys.iter().position(|mine| {
+                mine.names(&key.module, &key.function, key.arity)
+            }) {
+                Some(id) => id,
+                None => {
+                    self.keys.push(BifName {
+                        module: key.module.clone(),
+                        function: key.function.clone(),
+                        arity: key.arity,
+                    });
+                    self.counts.push(0);
+                    self.keys.len() - 1
+                }
+            };
+            self.counts[id] += count;
+        }
+        self.last = None;
+    }
     /// The report form: `"module:function/arity"` → count, keyed exactly as the printed
     /// `bif_histogram[…]` rows were before (byte-identical output; the `format!` now happens
     /// here, once per distinct key, instead of once per dispatch).
@@ -232,6 +257,18 @@ pub(crate) struct Counters {
     pub(crate) local_call_requests: u64,
     /// `alloc_words` calls: the **unrooted** allocation path (no admission point).
     pub(crate) unrooted_calls: u64,
+    /// `send_message` calls: the `Instr::Send` arm's door (also the entry the
+    /// `erlang:send/2`/`'!'/2` `call_ext` case and the defaulted
+    /// `send_message_with_off_heap` use), i.e. one per message handed to the host.
+    pub(crate) sends: u64,
+    /// `receive_next` calls: one per `loop_rec` candidate scan.
+    pub(crate) receive_nexts: u64,
+    /// `receive_skip` calls: one per `loop_rec_end` (the scan advances one position).
+    pub(crate) receive_skips: u64,
+    /// `receive_remove` calls: one per `remove_message`.
+    pub(crate) receive_removes: u64,
+    /// `receive_reset` calls: one per `timeout` (the scan returns to the head).
+    pub(crate) receive_resets: u64,
     /// BIF dispatches the harness' own floor **recognised by name but declined** on the
     /// operands it was given (see the module docs' "never guesses" rule).
     ///
@@ -545,9 +582,9 @@ impl ExecutionContext for CountingContext {
     }
 
     fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        self.counters.sends += 1;
         self.inner.send_message(to, message)
     }
-
     fn resolve_external_call(
         &mut self,
         module: &str,
@@ -593,21 +630,24 @@ impl ExecutionContext for CountingContext {
     }
 
     fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        self.counters.receive_nexts += 1;
         self.inner.receive_next()
     }
 
     fn receive_skip(&mut self) -> Result<()> {
+        self.counters.receive_skips += 1;
         self.inner.receive_skip()
     }
 
     fn receive_remove(&mut self) -> Result<()> {
+        self.counters.receive_removes += 1;
         self.inner.receive_remove()
     }
 
     fn receive_reset(&mut self) -> Result<()> {
+        self.counters.receive_resets += 1;
         self.inner.receive_reset()
     }
-
     fn receive_marker_reserve(&mut self) -> Result<Eterm> {
         self.inner.receive_marker_reserve()
     }

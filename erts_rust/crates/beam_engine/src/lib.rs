@@ -98,7 +98,12 @@ mod bench;
 pub mod context;
 pub mod error;
 pub mod exec_census;
-mod families;
+// `pub(crate)`: the router is the interpreter's family seam, and the native baseline
+// tier reaches the owning family's entry from inside `jit::baseline` too (the
+// bitstring family's `exec`/`claimed` are the single source of truth for its variant
+// set). Every item behind it stays `pub(crate)`-or-narrower — the crate's public API
+// is unchanged.
+pub(crate) mod families;
 mod generic;
 pub mod interpreter;
 pub mod jit;

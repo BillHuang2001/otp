@@ -59,25 +59,23 @@ use crate::interpreter::LabelMap;
 /// One enterable module: the host's module handle plus the label index the
 /// dispatch loop resolves module-local labels against.
 ///
-/// The label map is built **once**, when the context is registered, and is keyed
-/// on this `Arc`'s allocation address (`LabelMap::imports_owner`), exactly as the
-/// entry run's own map is — so the per-run import cache works for a callee too.
+/// The label map arrives **pre-built** from the machine's label-map cache
+/// ([`Machine::label_map_arc`](crate::Machine)) when the context is registered, so
+/// registering a callee the machine already holds a map for costs no build; it is
+/// keyed on this `Arc`'s allocation address (`LabelMap::imports_owner`), exactly as the
+/// entry run's own map is, so the per-run import cache works for a callee too.
 pub(crate) struct ModuleContext {
     /// The host-owned module handle. Held for as long as a suspended frame can
     /// return into this module.
     pub(crate) module: Arc<Module>,
     /// The module-wide `Label -> (func, pc)` index (and the per-run import table
     /// derived from it).
-    pub(crate) labels: LabelMap,
+    pub(crate) labels: Arc<LabelMap>,
 }
 
 impl ModuleContext {
-    /// Build a context for `module`: its label map is derived from the module's
-    /// own label table, so a `Label` resolved here matches what
-    /// [`Machine::run_export`](crate::Machine::run_export) would resolve for the
-    /// same export.
-    fn new(module: Arc<Module>) -> ModuleContext {
-        let labels = crate::interpreter::build_label_map(&module);
+    /// A context for `module` and its already-built label map.
+    fn new(module: Arc<Module>, labels: Arc<LabelMap>) -> ModuleContext {
         ModuleContext { module, labels }
     }
 }
@@ -104,18 +102,24 @@ impl Contexts {
         self.entries.clear();
     }
 
-    /// Register `module` and return its context id (`>= 1`).
+    /// Register `module` with its already-built label map `labels` and return the
+    /// context id (`>= 1`).
     ///
     /// Reuses the existing id when the very same `Arc<Module>` was registered
     /// before (see the module docs on identity), so a repeated or recursive
-    /// cross-module call does not grow the list.
-    pub(crate) fn register(&mut self, module: &Arc<Module>) -> u32 {
+    /// cross-module call does not grow the list. `labels` comes from the machine's
+    /// label-map cache ([`Machine::label_map_arc`](crate::Machine)), so a callee the
+    /// machine entered before costs no build; a map for the wrong module would be a
+    /// wrong-answer bug, which is why the cache keys on the module's content witness
+    /// and its address (`label_cache.rs`).
+    pub(crate) fn register(&mut self, module: &Arc<Module>, labels: Arc<LabelMap>) -> u32 {
         for (index, entry) in self.entries.iter().enumerate() {
             if Arc::ptr_eq(&entry.module, module) {
                 return index as u32 + 1;
             }
         }
-        self.entries.push(Arc::new(ModuleContext::new(Arc::clone(module))));
+        self.entries
+            .push(Arc::new(ModuleContext::new(Arc::clone(module), labels)));
         self.entries.len() as u32
     }
 

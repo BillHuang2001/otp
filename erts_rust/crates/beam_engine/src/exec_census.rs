@@ -22,7 +22,8 @@
 //!
 //! This is a **measurement-only** instrument: it is not part of any execution path, it
 //! never changes a result, and with the census disabled every hook below costs a single
-//! `bool` load. It answers the question the baseline tier's *static* census
+//! `bool` load from the machine's per-run gate (never a thread-local access — see *The
+//! per-run latch*). It answers the question the baseline tier's *static* census
 //! (`jit::baseline::census`, which counts the instructions a module **contains**) cannot:
 //! how often does each [`Instr`] variant actually **execute** at run time, and how often
 //! does it **raise**?
@@ -42,6 +43,31 @@
 //!   [`Snapshot::errors`]/[`Snapshot::total_errors`], with the **first** such error's
 //!   exact [`Display`](std::fmt::Display) text kept in [`Snapshot::first_error`].
 //!
+//! # The per-run latch: the funnel never reads the thread-local flag
+//!
+//! The recorder runs **once per interpreted instruction**, so *asking* whether to count
+//! sits on the hottest path the engine has: a thread-local access there would be a
+//! per-instruction TLS read paid by every run. The funnel therefore tests
+//! `Machine::census_on` — a plain `bool` each driver copies out of [`is_enabled`] **once
+//! per run/resume entry**, the same latched-gate idiom as `Machine::trace_on`,
+//! `Machine::reduce_on` and `Machine::bif_in_machine_on`. A disabled census thus costs
+//! one predictable load and a branch and performs **zero thread-local accesses per
+//! instruction**; both drivers (the interpreter's `Machine::drive` and the native tiers'
+//! shared driver, whose deopt helper goes through this same funnel) latch the same
+//! answer, so a deopt step is counted identically on either tier. Measured effect of the
+//! latch: `MEASURED.md`'s latched-census-gate rows.//!
+//! Two consequences, both worth knowing before quoting a mid-run experiment:
+//!
+//! * Turning counting **on** during a run is not observed by that run — it starts
+//!   counting at the run's (or a resume's) **next** entry. Every consumer enables
+//!   before it runs (`jit::baseline::census::dynamic_execution_census`, the
+//!   `dynamic_census` and `real_beam_variant_proofs` integration suites), so no count
+//!   changes.
+//! * Turning counting **off** during a run stops at the next instruction, because each
+//!   recorder also re-checks [`ENABLED`] (a stale `true` latch can therefore only ever
+//!   make counting happen *earlier* than the flag says, never keep it running past a
+//!   [`disable`]).
+//!
 //! # Semantics of the numbers (read these before quoting a table)
 //!
 //! * **Counting happens before the instruction's body runs.** An instruction that
@@ -59,9 +85,10 @@
 //!   covers the steps it deopts (plus every instruction of a module the tier has no
 //!   compiled blocks for). The native baseline tier's own structural counters
 //!   (`jit::baseline::counters`) remain the instrument for inlined code.
-//! * **The disabled path is free** (one thread-local `bool` load, no allocation), and a
-//!   counted run is byte-identical to an uncounted one — the census only reads the
-//!   instruction and, on the error path, formats the variant name and the error text.
+//! * **The disabled path is free** — one `bool` load and a branch, no allocation and no
+//!   thread-local access (see *The per-run latch* above) — and a counted run is
+//!   byte-identical to an uncounted one: the census only reads the instruction and, on
+//!   the error path, formats the variant name and the error text.
 //!
 //! # Where the numbers go
 //!
@@ -78,6 +105,11 @@ use beam_loader::Instr;
 
 thread_local! {
     /// Whether this thread is currently counting (default: off).
+    ///
+    /// Sampled by the engine's drivers **once per run/resume entry** into the
+    /// `Machine::census_on` latch, which is what the per-instruction funnel actually
+    /// tests (see the module docs); the recorders below keep checking it too, so a
+    /// [`disable`] mid-run stops counting at the next instruction.
     static ENABLED: Cell<bool> = const { Cell::new(false) };
     /// This thread's census.
     static CENSUS: RefCell<Snapshot> = RefCell::new(Snapshot::default());
@@ -123,6 +155,11 @@ pub fn disable() {
 }
 
 /// Whether this thread is currently counting.
+///
+/// Sampled **once per run/resume entry** by the engine's drivers into the
+/// `Machine::census_on` latch, so it sits on the run-entry path of every run; `#[inline]`
+/// keeps that a plain thread-local load rather than a cross-module call.
+#[inline]
 pub fn is_enabled() -> bool {
     ENABLED.with(Cell::get)
 }
@@ -158,6 +195,11 @@ pub fn variant_name(instr: &Instr) -> String {
 }
 
 /// Record that `instr` is about to execute (one count), if this thread is counting.
+///
+/// Called by the interpreter funnel only when the run latched
+/// `Machine::census_on` (see the module docs), so the disabled hot path never reaches
+/// this function at all; the thread-flag check below is the second, stricter half of the
+/// gate (a mid-run [`disable`] stops counting immediately).
 pub(crate) fn on_instruction(instr: &Instr) {
     if !ENABLED.with(Cell::get) {
         return;
@@ -645,6 +687,107 @@ mod tests {
             "the worker never saw this thread's counts"
         );
         assert_eq!(snapshot(), mine, "and this thread's census is unchanged");
+        fresh();
+    }
+
+    /// **The funnel's gate is `Machine::census_on`, latched from [`is_enabled`] at each
+    /// run entry** — which is what keeps the disabled path off the thread local.
+    ///
+    /// Three legs: a run entered counted is counted; a later run on the *same* machine,
+    /// entered after [`disable`], counts nothing (the latch is re-taken at every entry,
+    /// never inherited); and an [`enable`] issued **during** a run is not observed by
+    /// that run — its latch was already taken — but is by the next one.
+    #[test]
+    fn the_census_gate_is_latched_at_the_run_entry() {
+        // ---- leg 1: a run entered with counting on IS counted --------------
+        let (module, name) = put_list_module();
+        let mut ctx = MinimalContext::new();
+        let mut machine = Machine::new();
+        fresh();
+        enable();
+        let value = machine
+            .run_with_tier(&module, name, 0, &[], &mut ctx, Tier::Interpreter)
+            .expect("run/0 returns");
+        assert_eq!(value, beam_term::make_small(42));
+        let counted = snapshot();
+        assert_eq!(
+            executed(&counted, "PutList"),
+            1,
+            "a run entered with the census enabled is counted: {:?}",
+            counted.executed
+        );
+
+        // ---- leg 2: the same machine, entered after `disable()` ------------
+        disable();
+        reset();
+        let value = machine
+            .run_with_tier(&module, name, 0, &[], &mut ctx, Tier::Interpreter)
+            .expect("run/0 returns");
+        assert_eq!(value, beam_term::make_small(42), "counting changes no result");
+        assert_eq!(
+            snapshot(),
+            Snapshot::default(),
+            "a run entered with the census disabled counts nothing"
+        );
+
+        // ---- leg 3: `enable()` issued MID-run is deferred to the next entry -
+        let mut fixture = Fixture::new("census_latch");
+        let hook = fixture.import("erlang", "hook", 0);
+        let entry = fixture.add_function(
+            "g",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Bif {
+                    arity: 0,
+                    bif: hook,
+                    fail: beam_loader::NO_FAIL,
+                    args: Vec::new(),
+                    dst: Operand::X(0),
+                },
+                Instr::Move {
+                    src: Operand::Integer(7),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        );
+        fixture.add_export("g", 0, entry);
+        let g = fixture.atom("g");
+        let latch = fixture.finish();
+        let mut ctx = MinimalContext::with_bif_hook(Box::new(|_module, _function, _arity, _args| {
+            // Turn counting on from *inside* the run: this run's latch was taken at its
+            // entry (off), so nothing here may be counted.
+            enable();
+            Ok(beam_term::make_small(0))
+        }));
+        let mut machine = Machine::new();
+        reset();
+        assert!(!is_enabled());
+        let value = machine
+            .run_with_tier(&latch, g, 0, &[], &mut ctx, Tier::Interpreter)
+            .expect("g/0 returns");
+        assert_eq!(value, beam_term::make_small(7));
+        assert!(is_enabled(), "the hook really did turn counting on");
+        assert_eq!(
+            snapshot(),
+            Snapshot::default(),
+            "an enable() issued during a run is deferred to the run's next entry"
+        );
+
+        // ... and the next entry latches the now-enabled flag.
+        machine
+            .run_with_tier(&latch, g, 0, &[], &mut ctx, Tier::Interpreter)
+            .expect("g/0 returns");
+        let next = snapshot();
+        assert_eq!(
+            executed(&next, "Bif"),
+            1,
+            "the next run is counted: {:?}",
+            next.executed
+        );
+        assert_eq!(executed(&next, "Return"), 1);
+        assert_eq!(next.total_errors, 0);
         fresh();
     }
 }

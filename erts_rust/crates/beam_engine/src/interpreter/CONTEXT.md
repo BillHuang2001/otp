@@ -4,16 +4,17 @@
 The direct-threaded, one-instruction-at-a-time execution step of the Stage-1 engine: `Machine::step_instruction`
 (`dispatch.rs`) matches on the frozen `beam_loader::Instr` variant and executes the **core arms** natively; every
 variant it does not own is routed to `crate::families::dispatch` (`../families/mod.rs`).
-Owns the per-run label/import index (`LabelMap`), BIF-argument marshalling + the BIF raise path, `Test` evaluation,
+Owns the label/import index (`LabelMap`), BIF-argument marshalling + the BIF raise path, `Test` evaluation,
 and the contract-A.8 trace emission.
 This file is the crate-internal execution core: no BIF table lives here (all computation goes through
 `ExecutionContext::call_bif`), and the module is split by responsibility (dispatch / bif / test / trace).
 Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*.tab` and `emu/beam_emu.c`.
 
 ## API Surface (crate-internal; all methods on `impl Machine`)
-- `mod.rs` — module docs + `LabelMap` (dense or sparse label slots + the per-run `ImportTable`); `build_label_map`,
-  `resolve`, `resolve_label`, `import_target` (the uncached fallback), `resolve_imports`.
-- `dispatch.rs` — `run_loop`/`run_loop_with_map` (thin run entries over `Machine::drive`), `enter_run` (the per-run
+- `mod.rs` — module docs + `LabelMap` (dense or sparse label slots + the cached `ImportTable`);
+  `build_label_map` (the whole-module build, then cached per machine per module by
+  `Machine::label_map`/`label_map_arc` — `../machine/label_cache.rs`), `resolve`, `resolve_label`,
+  `import_target` (the uncached fallback), `resolve_imports`.- `dispatch.rs` — `run_loop`/`run_loop_with_map` (thin run entries over `Machine::drive`), `enter_run` (the per-run
   prologue that binds the literal area and records the entry call), **`Machine::step_instruction_with_entry`** (the
   one-instruction dispatcher every driver calls — the interpreter's `Machine::drive` **and** the native tiers'
   per-instruction deopt helper `../jit/baseline/runtime.rs::jit_step_one` — which wraps the body
@@ -26,11 +27,18 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   `crate::interpreter::ImportFrame` (its variants inherit that visibility, so a sibling module can name
   `crate::interpreter::ImportFrame::Call`).
   **The dynamic execution census hooks live here.** `step_instruction_inner` looks the instruction up, calls
-  `crate::exec_census::on_instruction(instr)` (**before** the effect), delegates the effect to
+  `crate::exec_census::on_instruction(instr)` (**before** the effect) when the run's latched gate
+  `Machine::census_on` is set, delegates the effect to
   `step_instruction_body(instr, …)` (the original `match instr` arms, byte-identical — the split exists so that an
   error propagated by `?` *inside* one arm, which returns from the body rather than falling out of the `match`, is
-  still observed) and then calls `crate::exec_census::on_error(instr, err)` for an `Err` result. Both hooks are one
-  thread-local `bool` load when the census is disabled.
+  still observed) and then calls `crate::exec_census::on_error(instr, err)` for an `Err` result, re-reading the
+  same gate. The gate is a plain `bool` field the drivers latch once per run/resume entry
+  (`Machine::drive` in `../machine/drive.rs` and the native tiers' driver in
+  `../jit/baseline/mod.rs`; `Machine::reset` clears it, so a mid-run `enable()` takes effect at the
+  run's next entry), so a disabled census costs **one load and a branch and zero thread-local
+  accesses per instruction**. The gate is deliberately **not** cached in a local
+  across `step_instruction_body`: the error arm is the only other reader, and holding it live across that call
+  costs the hot frame a callee-saved register (measured: +4.5 % on `list-walk/1` vs −5.2 % with the re-read).
 - `bif.rs` — `exec_bif` (`gc_bif`/`bif`/`bif0` operand marshalling + the fail-label/raise split), `call_import`
   (`call_ext*`), `raise_bif_error` (the catch-aware raise, shared with the families — `families::funs::apply_target`
   for an applied-target host BIF error, and `families::funs::call_fun` for the closure-apply fallback),
@@ -71,7 +79,7 @@ shared catch-aware `raise_bif_error`.
 ## Instruction ownership
 - **Core arms executed inline in `step_instruction`** (`dispatch.rs`): the metadata no-ops (`Label`, `Line`,
   `IntCodeEnd`, `ExecutableLine`, `DebugLine`, `NifStart`, `OnLoad`); `FuncInfo`; `Move`/`Swap`/`InitYregs`;
-  `Test`; `SelectVal`; `Jump`; `GcBif`/`Bif`/`Bif0`; `Call`/`CallLast`/`CallOnly`/`CallExt`/`CallExtOnly`/`CallExtLast`
+  `Test`; `SelectVal` (its pair decision is the ladder of `select.rs`, next section); `Jump`; `GcBif`/`Bif`/`Bif0`; `Call`/`CallLast`/`CallOnly`/`CallExt`/`CallExtOnly`/`CallExtLast`
   (each `CallExt*` arm traces the callee's entry and then delegates its whole body to `Machine::call_ext_dispatch`,
   which runs the ordered resolution — the `erlang:apply/3` special case + the cross-module call seam, the
   `erlang:send/2` seam, the host's cross-module seam, the synchronous BIF route — and applies the form's
@@ -80,6 +88,44 @@ shared catch-aware `raise_bif_error`.
 - **Everything else** falls to the catch-all `other => families::dispatch(...)` arm → the single owning family (tuples,
   records, lists, funs, exceptions, floats, maps, bitstrings, receive); an unclaimed or declined variant is the typed
   `unsupported("<ops.tab name>")`. Family ownership is disjoint (each variant has exactly one owner).
+
+## `select_val`: the per-pair ladder (`select.rs`)
+`Instr::SelectVal` (`dispatch.rs`) reads the scrutinee, asks `select::first_match` for the first alternative whose
+candidate is `=:=` to it (C's ordered scan, `../../erts/emulator/beam/emu/select_instrs.tab:130-153`, minus C's
+loader-time sort — the IR keeps source order), then branches to that label, to `fail`, or — with `NO_FAIL` — into the
+shared `raise_function_clause_with_args(.., "select_val", ..)`. **The per-pair decision is `select::pair_eq`, a
+cost-ordered ladder**; `select.rs`'s module docs are its normative description. In brief, cheapest first:
+1. **Unboxed immediate candidate.** `select::constant_word` answers the raw `Eterm` word of an
+   `Operand::Integer`/`Character` inside `MIN_SMALL..=MAX_SMALL`, an `Operand::Atom`, or `Operand::Nil`, so the pair
+   is one word compare against the scrutinee's own word and **no candidate term is built** (a small-int operand used
+   to be materialized through `terms::make_integer_unrooted` on *every* pair). An out-of-range `Integer`/`Character`
+   materializes as a bignum, so it is not an immediate constant and does not take this rung.
+2. **Word identity.** For every other candidate (a register, a literal, a bignum constant) the value is read and its
+   **word** compared: two identical words are `=:=` for every term kind, so a hit needs no ordering.
+3. **Either side immediate.** The words differ (rung 2), and an immediate's primary tag (`11`) can never match a cons
+   (`01`), boxed (`10`) or header (`00`) word, so this is a **definite** non-match — still with no `cmp`.
+4. **Otherwise** the general `beam_term::cmp(..).is_eq()`, unchanged.
+
+Rungs 1-3 are sound on the frozen layout facts the module tabulates and its tests pin: a word with low nibble `F` is a
+small integer (so the compare *is* `=:=`, floats/bignums/atoms/binaries included), a word whose low 6 bits are `0xB`
+is an atom, `0x3B` is `[]` and `0x1B` a catch term (no other class produces those bits, so `[]` never matches the
+*atom* `'[]'`), and a cons/boxed word carries at most `TAG_LITERAL_PTR` above an 8-byte-aligned pointer. The unit
+tests run the ladder against a `cmp`-only oracle over the adversarial battery (float vs int, two equal floats, two
+equal bignums, a bignum candidate vs an out-of-range `Integer`, two equal heap binaries, the tag-collision table,
+`NIL` vs `'[]'`, first-match-in-source-order).
+`constant_word` is the **single** definition of "decidable by word identity": `../jit/baseline/emit/operands.rs` and
+`../jit/cranelift/inline.rs` delegate their `constant_word` to it, so a tier's emitted word compare and the
+interpreter's ladder cannot drift. The control flow (`fail`, `NO_FAIL`) is untouched, and a bad register operand
+keeps `read_operand`'s typed `bad_register` — the ladder adds fast rungs, it weakens no error path.
+**The test-only counter.** `select_answers()` -> `(decided_without_cmp, decided_by_cmp)` is a `#[cfg(test)]`
+thread-local tally (the same idiom as `label_map_builds`), so a pair is counted exactly once and the production ladder
+carries no counter at all. Consumers: `../bench/mod.rs` prints it per call
+(`select_pairs_by_word_per_call`/`select_pairs_by_cmp_per_call`) and its
+`every_bstr_select_val_pair_is_decided_without_a_general_compare` gate asserts `cmp == 0` on
+`cowboy_bstr:to_lower/1`; `select.rs`'s `the_committed_fixture_is_decided_without_a_general_compare` asserts it on
+`tests/fixtures/selval.beam` for **both** tiers (the interpreter answers every pair by word; the baseline tier inlines
+the switch and never reaches the ladder). The fixture's *observable* half — both tiers against the live `erl`, plus a
+zero-`alloc_words` claim on the immediate-only switches — is `tests/select_val.rs`.
 
 ## Constraints / Notes for Agents
 - Errors are `beam_common::Result` only — never a crate-local error enum, never a panic; an unsupported opcode/operand
@@ -128,7 +174,8 @@ shared catch-aware `raise_bif_error`.
   **The rule the cooked trace reports:** the failed function's argument list goes in the **frame-0** `A` slot (C's
   `save_stacktrace`'s `non_bif_stacktrace:` + `erts_build_mfa_item`), and **every outer frame keeps its declared
   arity** — so the oracle cooks `{Mod,Fun,[Arg,…],Location}` for the failing function and `{Mod,Fun,Arity,Location}`
-  for each caller. A comparison `Test`/`SelectVal` uses `cmp` (`=:=`) vs `cmp_arith` (`==`).
+  for each caller. A comparison `Test` uses `cmp` (`=:=`) vs `cmp_arith` (`==`); `SelectVal` always tests `=:=`
+  (through the ladder below, which reproduces `cmp(..).is_eq()` exactly).
 - `gc_bif`/`bif` decode a boxed-term test only where the family/`predicates` do; the small-int `'+'`/`'-'`/`'*'` and the
   eight comparison BIFs have baseline-JIT inline paths (see `../jit/baseline/emit/`), everything else deopts to
   `jit_step_one` (`../jit/baseline/runtime.rs`), which calls `step_instruction_with_entry`.
@@ -240,7 +287,11 @@ consultations, 1 derivation) and `../machine/local_callee.rs`'s unit tests (hits
   target, and `Machine::call_ext_dispatch` + `ImportFrame` are the shared `call_ext*` body a tier drives.
 - `bif.rs` → BIF operand marshalling + the fail-label/raise split (cross-ref `../context.rs` `ExecutionContext::call_bif`).
 - `test.rs` → `TestKind` evaluation (raw type tests live in `../predicates.rs`).
-- `mod.rs` → `LabelMap`/import resolution (the label+import index every run entry builds).
+- `select.rs` → the `select_val` **pair ladder** (`first_match`/`pair_eq`), `constant_word` (the single definition
+  both JIT tiers' `select_val` plans delegate to) and the `#[cfg(test)]` pair tally (`reset_select_answers`/
+  `select_answers`).
+- `mod.rs` → `LabelMap`/import resolution (the label+import index a machine builds once per module and
+  then serves from `../machine/label_cache.rs`).
 - Related semantics one level away: `../machine/` (frames, catch, run entries, location), `../families/` (per-family
   instruction bodies), `../jit/baseline/` (the native tier's inline set + `runtime.rs::jit_step_one`).
 - `../CONTEXT.md` → the engine's binding execution semantics; `INSTRUCTION_SURFACE.md` → the exhaustive per-opcode

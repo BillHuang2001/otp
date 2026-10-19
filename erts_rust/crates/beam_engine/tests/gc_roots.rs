@@ -29,12 +29,14 @@
 //!
 //! This suite pins the additive fix, with **no `beam_gc` dependency**:
 //!
-//! * [`Machine::with_roots`]/[`Machine::alloc_rooted`] hand the engine's
-//!   **whole** live root set over as a [`RootSet`] — the X-register file, the whole
-//!   Erlang stack and the whole FR file (the FR file holds `Eterm` **term slots**,
-//!   so a float register can point into the heap and must be a root). The three
-//!   files are borrowed together because three separate `&mut self` accessors
-//!   cannot coexist.
+//! * [`Machine::with_roots`]/[`Machine::alloc_rooted`] hand the engine's live root set
+//!   over as a [`RootSet`] — the **used prefix** of the X-register file, the whole
+//!   Erlang stack and the used prefix of the FR file (the FR file holds `Eterm` **term
+//!   slots**, so a float register can point into the heap and must be a root). Every
+//!   slot at or beyond a file's used extent is `NIL`, so it holds no term to relocate;
+//!   the tests below seed their roots through `x_mut`/`fr_mut`, which declares the whole
+//!   file and therefore hands the whole file over. The three files are borrowed together
+//!   because three separate `&mut self` accessors cannot coexist.
 //! * [`ExecutionContext::alloc_words_rooted`] is the defaulted counterpart of
 //!   `alloc_words`; its default discards the roots and forwards to `alloc_words`,
 //!   so an existing host compiles and behaves **byte-identically**.
@@ -280,7 +282,7 @@ struct HeapSeen {
     fr: Vec<Vec<Eterm>>,
 }
 
-/// A recording context that pins the **whole root set** at the engine's primary
+/// A recording context that pins the roots at the engine's primary
 /// admission point ([`Machine::ensure_heap`], reached by `test_heap`/`allocate_heap`).
 ///
 /// It overrides the full-root door
@@ -389,7 +391,7 @@ fn an_alloc_words_loop_reaches_the_hook_with_x_stack_and_fr_roots() {
     assert_eq!(y0, make_small(Y0_VALUE));
 
     // The allocation-heavy `alloc_words`-only loop: every iteration is one
-    // rooted allocation with the machine's whole root set in hand.
+    // rooted allocation with the machine's live root set in hand.
     const CALLS: usize = 16;
     for _ in 0..CALLS {
         let ptr = machine

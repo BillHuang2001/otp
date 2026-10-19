@@ -35,7 +35,12 @@ field reader (`read_integer_field`, `read_wide_integer_field`, `read_float_field
 a `-native` field big-endian — a wrong value, which is the defect this rule prevents.
 
 ## Routing Table (file → responsibility)
-- `mod.rs` → the family `exec`, the shared `fail_step`/`goto_label`, the operand helpers
+- `mod.rs` → the family `exec` (the **only** entry: the router dispatches to it and the native
+  baseline tier's `jit_bitstr` calls it directly — it installs the `error`/`exit`/`throw` class-atom
+  anchor itself, so a caller that bypasses the router still gets a raise that lands),
+  `claimed` (the family's one statement of its 20 `Bs*` variants, which the router's arm, the tier's
+  emitted arm and `jit_bitstr` all share; `exec`'s `Ok(None)` contract is the authority it is pinned
+  against, in `jit/baseline/bitstr_tests.rs`), the shared `fail_step`/`goto_label`, the operand helpers
   (`read_size`, `is_all`, `decode_flags`/`flag_bit` + the `BSF_*` bits), the safe bit
   arithmetic (`read_uint_be`/`read_uint_le`/`read_uint_le_bits`/`sign_extend`/
   `extract_bits`), the wide-integer (`> 64` bit) byte model, and the `BitWriter` (two-mode: `Dest::Vec` copy-rebuild / `Dest::InPlace` writable accumulator) sink.
@@ -330,11 +335,16 @@ Function-level self time (`to_lower`, release, `perf record --call-graph dwarf`,
 `perf report --no-children`, ≥1.1 % self): `step_instruction_body` 15.43 %,
 `step_instruction_with_entry` 8.82 %, `create::assemble` **6.66 %**, `run_commands` **6.12 %**,
 `Machine::drive` 4.27 %, `beam_term::compare::cmp_impl` 3.96 %, `families::dispatch` 3.28 %,
-`jit::baseline::bitstr::jit_bitstr` 2.71 %, `interpreter::build_label_map` 2.33 %,
-`matching::exec_other` 2.27 %, `exec_census::on_instruction` 2.12 % (while **disabled**),
+`jit::baseline::bitstr::jit_bitstr` 2.71 %, `matching::exec_other` 2.27 %,
 `jit::baseline::runtime::enter_in_block` 1.99 %, `terms::number::make_integer_unrooted` 1.85 %,
-`create::exec` 1.80 %, `matching::match_ctx::read_ctx` 1.57 %, `Machine::reset` 1.28 %.
-`read_size` and `decode_flags` have no symbol of their own: both are folded into `run_commands`
+`create::exec` 1.80 %, `matching::match_ctx::read_ctx` 1.57 %, `Machine::reset` 1.28 %,
+`interpreter::build_label_map` 2.33 %, `exec_census::on_instruction` 2.12 %.
+The last three are **entry-path** rows, not per-call ones: `Machine::reset` refills the run's used
+register extents once per run entry, `build_label_map` is the module's single build (once per
+machine per module — `Machine::label_map`'s cache, `../../machine/label_cache.rs` — so its share is
+amortised over the whole batch), and `on_instruction`'s 2.12 % is the census **recorder's own body**
+on a census-recording run; a plain run pays one latched `bool` load and a branch per interpreted
+instruction (`Machine::census_on`) and never calls the recorder.`read_size` and `decode_flags` have no symbol of their own: both are folded into `run_commands`
 and `assemble` by their always-inlined shells (the inlined `size_of_int` is visible inside
 `run_commands`), so the two remaining in-node bodies are `assemble` and `run_commands`.
 Every remaining item is either outside this node (see `## Out-of-node findings`) or the
@@ -399,24 +409,18 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   this node is currently unreachable from `src/jit/**` — a tier that wants a per-command entry
   (`matching::exec`, `matching::commands::run_commands`, `create::assemble`) needs
   `pub(crate) mod families` (or targeted root re-exports) first.
-- **`src/interpreter/dispatch.rs:353-362` — `Instr::SelectVal` materializes every pair operand.** It
-  calls `read_operand` per pair (`Operand::Integer`/`Operand::Character` →
-  `terms::number::make_integer_unrooted`, `src/operand.rs:69,75`) and then a full `beam_term::cmp` per
-  pair, so a character-table `select_val` (what a per-character case/`select_val` compiles to) pays an
-  O(pairs) term-materialization + atom-namespace comparison per execution; the small-integer scrutinee
-  could be compared against a small/literal candidate directly.
-  Parent-owned; the measured contributor to this profile's `make_integer_unrooted` 2.61 % and
-  `cmp_impl` 2.92 %.
 - **`terms::number::make_integer_unrooted` at 2.61 % is CALL overhead, not allocation** — its
   small-value arm is `make_small` (no allocation), but the function is not inlined at its
   `src/operand.rs` call sites. **OWNER: the parent `src/` node.**
-- **`Machine::reset` 2.67 % + `interpreter::build_label_map` 3.16 %** are per-run entry costs in the
-  parent's `run_label_outcome`/`reset` path, material at this harness' batch granularity.
+- **`Machine::reset` + `interpreter::build_label_map`** are entry-path rows in the parent's
+  `run_label_outcome`/`reset` path, material at this harness' batch granularity: `reset` refills the
+  run's used register extents once per run entry, and the build happens **once per machine per
+  module** (`Machine::label_map`'s cache, `../../machine/label_cache.rs`), never per call.
   **OWNER: the parent `src/` node.**
-- **`src/exec_census.rs`** is 2.12 % of `to_lower`'s self time while **disabled** — the
-  thread-local `bool` load sits on the per-instruction funnel; the instrument has no call site in
-  this node.
-- **`tools/differential` corpus coverage hole** (see Test Strategy).
+- **`src/exec_census.rs`** costs one latched `bool` load and a branch per interpreted instruction
+  while disabled (`Machine::census_on`, latched once per run); its 2.12 % of `to_lower`'s self time
+  is the recorder's own body on a **census-recording** run. The instrument has no call site in
+  this node.- **`tools/differential` corpus coverage hole** (see Test Strategy).
 
 ## `append` / `private_append` — in place while the payload is writable
 

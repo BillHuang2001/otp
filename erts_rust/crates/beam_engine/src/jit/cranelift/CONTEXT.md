@@ -51,6 +51,15 @@ behaviourally-neutral spots (an un-interned `true`/`false` in `is_boolean`; a no
 Inlined: metadata no-ops, `Move`, `Swap`, `Jump`, `CallOnly`, `Test`, small-int `GcBif`, comparison
 `GcBif`/`Bif`, `SelectVal`, `SelectTupleArity`, `GetTupleElement`, `GetList`/`GetHd`/`GetTl`.
 
+## `constant_word`: one definition, three consumers
+`inline.rs::constant_word` is a **delegation** to `crate::interpreter::constant_word` — the single authority
+(`src/interpreter/select.rs`) on which candidate is decidable by a raw-word compare — exactly as the baseline
+emitter's `emit/operands.rs::constant_word` is. Nothing here decides immediacy on its own, so all three consumers
+accept the same values: the interpreter's `select_val` ladder, the baseline tier's inlined `select_val`/`test`/
+`select_tuple_arity`/`SetTupleElement` plans, and this tier's. The crate-local `small_word` beside it is the
+small-int-only reader (the same 60-bit range test) for the `test` lowering's `TestConst::Small` sites, which need
+that half alone.
+
 ## Constraints
 `unsafe` only inside the `mod.rs` module subtree: `mod.rs` declares `#![allow(unsafe_code)]` and its
 children inherit it, so `codegen.rs`/`inline.rs`/`compare.rs`/`shape.rs`/`report.rs` are safe Rust and

@@ -83,7 +83,7 @@ mod counting;
 mod foreign;
 mod list_walk;
 mod long_append;
-
+mod send_split;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -254,6 +254,13 @@ struct Measurement {
     /// (and with it the region heap every term of that batch lives on) is dropped, so the
     /// generic report's correctness predicate never reads a retired heap.
     snapshot: ResultSnapshot,
+    /// `(decided_without_cmp, decided_by_cmp)`: how the phase's `select_val` pairs were
+    /// answered, from `crate::interpreter`'s test-only pair tally (see the `select` node).
+    ///
+    /// Deterministic, like the [`Counters`] — a structural figure, not a timing one. On the
+    /// native tier a `select_val` the emitter inlines never reaches the interpreter's ladder
+    /// at all, so the two tiers legitimately report different values here.
+    select_answers: (usize, usize),
 }
 
 /// What a measured call returned, copied out while its host was alive.
@@ -346,12 +353,14 @@ fn measure_result(
     let mut samples = Vec::with_capacity(SUB_RUNS);
     let mut refc_payloads = 0u64;
     let mut result = NIL;
+    crate::interpreter::reset_select_answers();
     for _ in 0..SUB_RUNS {
         let phase = run_calls(module, entry, tier, per_run, batch, &mut ctx, prepare)?;
         samples.push(ns_per_call(phase.elapsed, per_run));
         refc_payloads += phase.refc_payloads;
         result = phase.result;
     }
+    let select_answers = crate::interpreter::select_answers();
     // The result term lives on the last batch's host heap, which is dropped when `ctx` is; take
     // the copy now (see `Measurement::snapshot`).
     let snapshot = ResultSnapshot::of(result);
@@ -362,6 +371,7 @@ fn measure_result(
         refc_payloads,
         result,
         snapshot,
+        select_answers,
     })
 }
 
@@ -575,6 +585,15 @@ fn report_generic(
     println!("local_fun_requests_per_call = {:.2}", per_call(counters.local_fun_requests));
     println!("local_call_requests_per_call = {:.2}", per_call(counters.local_call_requests));
     println!("bif_floor_declines_per_call = {:.2}", per_call(counters.floor_declines));
+    let (word_pairs, cmp_pairs) = measurement.select_answers;
+    println!(
+        "select_pairs_by_word_per_call = {:.2}",
+        per_call(word_pairs as u64)
+    );
+    println!(
+        "select_pairs_by_cmp_per_call = {:.2}",
+        per_call(cmp_pairs as u64)
+    );
     println!("refc_payloads_per_call = {:.2}", per_call(measurement.refc_payloads));
     println!("result_is_correct = {correct}");
     if let Some(unit) = &spec.unit {
@@ -888,4 +907,74 @@ fn run_erlc(dir: &Path, path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The `select_val` ladder's structural gate
+// ---------------------------------------------------------------------------
+
+/// **Every** `select_val` pair on `cowboy_bstr:to_lower/1` is decided without a general
+/// term comparison — the structural counter the ladder in `src/interpreter/select.rs`
+/// is gated on.
+///
+/// `char_to_lower/1` is a pure-Erlang 27-clause function whose body is one `select_val`
+/// over 26 small-int alternatives (`$A`/`$B`/…/`$Z`), so a call scans them by word
+/// identity alone: the candidates are `Operand::Integer` constants, i.e. **unboxed**
+/// alternates (no term is built, no `cmp` is entered). Before the ladder existed the
+/// same call built one `Eterm` per candidate and ran the full `beam_term::compare`
+/// ordering between every pair; this asserts that no pair takes that path any more.
+///
+/// The tally is deterministic, so this is a **gate**, not a measurement; it skips loudly
+/// when the system `erlc` (which compiles the fixture) is unavailable.
+#[test]
+fn every_bstr_select_val_pair_is_decided_without_a_general_compare() {
+    let beam = match compile_fixture(MODULE, SOURCE, "bstr_ladder") {
+        Ok(beam) => beam,
+        Err(why) => {
+            println!("SKIP: {why} -- the select_val ladder gate did not run");
+            return;
+        }
+    };
+    let module = Arc::new(
+        load_file(&beam).unwrap_or_else(|error| panic!("load {}: {error:?}", beam.display())),
+    );
+    let entry = atom_named(&module, ENTRY);
+
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        let mut ctx = CountingContext::new(Arc::clone(&module));
+        let mut machine = Machine::new();
+        let input = bstr_input(&mut ctx, &mut machine).expect("the 30-byte argument");
+        crate::interpreter::reset_select_answers();
+        let outcome = machine
+            .run_export_outcome_with_tier(&module, entry, 1, &[input], &mut ctx, tier)
+            .unwrap_or_else(|error| panic!("{ENTRY}/1 on {}: {error:?}", tier.name()));
+        let (word_pairs, cmp_pairs) = crate::interpreter::select_answers();
+        let RunOutcome::Returned(value) = outcome else {
+            panic!("{} blocked in a receive: this fixture has none", tier.name())
+        };
+        assert_eq!(
+            ResultSnapshot::of(value),
+            ResultSnapshot::Binary(EXPECTED.to_vec()),
+            "{} produced the wrong bytes",
+            tier.name()
+        );
+        println!(
+            "select_val_ladder[{}] = word {word_pairs}, cmp {cmp_pairs} (one to_lower/1 call)",
+            tier.name()
+        );
+        assert_eq!(
+            cmp_pairs, 0,
+            "{} paid {cmp_pairs} general term comparison(s) on a small-int switch",
+            tier.name()
+        );
+        if tier == Tier::Interpreter {
+            // 30 bytes × a 26-alternative scan that runs to the catch-all clause for the
+            // lowercase bytes, so the count is large and, above all, non-zero: the pairs are
+            // answered, just not by `cmp`.
+            assert!(
+                word_pairs > 0,
+                "the interpreter answered no pair by word identity: the ladder did not engage"
+            );
+        }
+    }
 }

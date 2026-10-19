@@ -25,21 +25,20 @@
 //! [`crate::families::dispatch`], the router that re-matches the instruction's variant (a
 //! jump table on the [`Instr`](beam_loader::Instr) discriminant) to find the **owning**
 //! family. For a `Bs*` instruction that hop is pure overhead: this tier already knows the
-//! variant (it emitted the arm), so [`jit_bitstr`] calls the bitstring family's own body
-//! ([`crate::families::bitstrings::exec`]) directly. The emitted arm claims the family's
-//! **whole** variant set (the `match` arm in
-//! [`emit_block`](super::emit::emit_block), the exact list the router owns for it, which the
-//! test-build predicate `claimed` pins against the family's own `Ok(None)` contract), so the
-//! bypass covers `bs_start_match*`, `bs_get_position`, `bs_create_bin`, `bs_init_writable`,
-//! the `bs_get_integer*`/`bs_get_binary*` reads, `bs_match_string`, the UTF reads and every
-//! other member — not one hand-picked shape.
+//! variant (it emitted the arm), so [`jit_bitstr`] calls the bitstring family's own entry
+//! ([`crate::families::bitstrings::exec`]) directly. The emitted arm claims with the
+//! family's own [`claimed`](crate::families::bitstrings::claimed) predicate — the same
+//! function the router routes on — so the bypass covers `bs_start_match*`,
+//! `bs_get_position`, `bs_create_bin`, `bs_init_writable`, the
+//! `bs_get_integer*`/`bs_get_binary*` reads, `bs_match_string`, the UTF reads and every
+//! other member — not one hand-picked shape, and never a hand-maintained copy of the set.
 //!
 //! Everything else is deliberately identical to [`super::family::jit_family`]: the same
 //! position store, the same instruction fetch (declining to [`jit_step_one`] on an address
-//! that does not resolve), the same `class_atoms_live` latch the router would have run, the
-//! same context-`0` raise decoration, and the same [`fold_ok_step`]/[`fold_err`] encoding of
-//! the outcome. The helper therefore cannot produce a result the interpreter's
-//! per-instruction step would not — only reach it one dispatch hop sooner.
+//! that does not resolve), the same context-`0` raise decoration, and the same
+//! [`fold_ok_step`]/[`fold_err`] encoding of the outcome. The helper therefore cannot
+//! produce a result the interpreter's per-instruction step would not — only reach it one
+//! dispatch hop sooner.
 //!
 //! **The helper runs no per-execution shape predicate.** The emit side decided the route at
 //! compile time (the `emit_block` arm); re-deciding it here would hand back a large part of
@@ -48,60 +47,9 @@
 //! artifact/module mismatch, say — is answered by the family's own `Ok(None)` and handed to
 //! [`jit_step_one`], which is the interpreter's exact diagnostic for it.
 
-#[cfg(test)]
-use beam_loader::Instr;
-
 use super::jit_step_one;
 use super::runtime::{fold_err, fold_ok_step, JitRuntime};
 use crate::families::bitstrings;
-
-/// `true` for exactly the variants [`crate::families::dispatch`] routes to the bitstring
-/// family.
-///
-/// This is the router's own bitstring arm (`../families/mod.rs`, the `bitstrings::
-/// exec` arm) transcribed variant for variant, so the emitted arm and the router can never
-/// disagree about who owns an opcode; [`crate::families::bitstrings::exec`]'s `Ok(None)`
-/// contract — the family's own statement of its variant set — is what the pins compare it
-/// against.
-///
-/// The predicate is **purely syntactic** (the instruction's own variant), which is what lets
-/// the emitter take the decision at compile time and the helper skip it at execution time. A
-/// variant it wrongly accepted would still execute correctly through
-/// [`crate::families::bitstrings::exec`] (or decline to [`jit_step_one`]); it could only fail
-/// to be the fast path.
-///
-/// **Test-build only.** The emit side is a `match` arm in
-/// [`emit_block`](super::emit::emit_block) naming the same variants, so no production code
-/// path calls this function; it exists so the pins in `bitstr_tests` can compare the
-/// emitter's variant set against the family's own `Ok(None)` contract independently of that
-/// arm. It is `#[cfg(test)]`-gated so a production build carries no copy of the list at all
-/// ([`emit_block`](super::emit::emit_block) remains the single production transcription).
-#[cfg(test)]
-pub(crate) fn claimed(instr: &Instr) -> bool {
-    matches!(
-        instr,
-        Instr::BsStartMatch3 { .. }
-            | Instr::BsStartMatch4 { .. }
-            | Instr::BsGetPosition { .. }
-            | Instr::BsSetPosition { .. }
-            | Instr::BsGetTail { .. }
-            | Instr::BsTestTail2 { .. }
-            | Instr::BsGetInteger2(_)
-            | Instr::BsGetBinary2(_)
-            | Instr::BsSkipBits2 { .. }
-            | Instr::BsMatch { .. }
-            | Instr::BsMatchString { .. }
-            | Instr::BsGetFloat2(_)
-            | Instr::BsGetUtf8 { .. }
-            | Instr::BsGetUtf16 { .. }
-            | Instr::BsGetUtf32 { .. }
-            | Instr::BsSkipUtf8 { .. }
-            | Instr::BsSkipUtf16 { .. }
-            | Instr::BsSkipUtf32 { .. }
-            | Instr::BsInitWritable
-            | Instr::BsCreateBin { .. }
-    )
-}
 
 /// How many times [`jit_bitstr`] has actually executed on this thread.
 ///
@@ -169,17 +117,10 @@ pub(crate) extern "C" fn jit_bitstr(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
             None => return jit_step_one(rt, func, pc),
         };
 
-        // The router's own `class_atoms_live` latch, reproduced because this helper bypasses
-        // the router: without it a family raise whose class atom the *module's* table cannot
-        // name would select its catch frame and then abandon it with a typed `unsupported`.
-        // One `bool` load and a not-taken branch in the steady state.
-        if !machine.class_atoms_live {
-            machine.ensure_class_atoms(ctx, module);
-        }
-
-        // The bitstring family's own body (the entry [`crate::families::dispatch`] reaches
-        // for every `Bs*` variant), so the operand reads/writes, the match-context state, the
-        // rooted term construction and every error landing are the family's, unchanged.
+        // The bitstring family's own entry (the one `crate::families::dispatch` reaches for
+        // every `Bs*` variant), so the exception-class anchor, the operand reads/writes, the
+        // match-context state, the rooted term construction and every error landing are the
+        // family's, unchanged.
         #[cfg(test)]
         BITSTR_CALLS.with(|calls| calls.set(calls.get() + 1));
         match bitstrings::exec(machine, module, labels, instr, func, pc, ctx) {
