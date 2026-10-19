@@ -275,17 +275,25 @@ pub(super) fn length_too_large(length: u32) -> bool {
 ///
 /// Returns the typed `unsupported` when the driver context carries no completion sink — a driver
 /// method called outside a [`Port`](crate::port::Port), which no runtime path does.
-pub(super) fn drain_closed(
+pub(super) fn drain_error_all(
     queue: &mut AsyncQueue,
     ctx: &mut DriverContext<'_>,
+    reason: InetReason,
 ) -> Result<()> {
     for id in queue.take_all() {
         ctx.deliver_completion(CompletionEvent::InetAsync {
             id,
-            result: InetAsyncResult::Error(InetReason::Closed),
+            result: InetAsyncResult::Error(reason),
         })?;
     }
     Ok(())
+}
+/// [`drain_error_all`] with the C's `am_closed` — `async_error_am_all(desc, am_closed)`.
+pub(super) fn drain_closed(
+    queue: &mut AsyncQueue,
+    ctx: &mut DriverContext<'_>,
+) -> Result<()> {
+    drain_error_all(queue, ctx, InetReason::Closed)
 }
 
 impl TcpInetDriver {
