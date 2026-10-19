@@ -328,8 +328,8 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        if let Some(name) = self.peer_close.recv_reply() {
-            return Ok(ctl_xerror(name));
+        if let Some(reason) = self.peer_close.recv_reply() {
+            return Ok(ctl_xerror(&reason.atom_name()));
         }
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
@@ -448,7 +448,8 @@ impl TcpInetDriver {
                     )),
                 })?;
                 return Ok(true);
-            }            if self.peer_close.seen {
+            }
+            if self.peer_close.seen {
                 break;
             }
             // Not enough buffered bytes: read what the socket has and try once more.
@@ -470,11 +471,7 @@ impl TcpInetDriver {
             // (`inet_drv.c:12829`) for an end-of-file, and `tcp_recv_error` with
             // `async_error_am_all(desc, error_atom(err))` (`:12877`) for a reset under
             // `{show_econnreset,true}`, which is how the oracle reports `{error,econnreset}`.
-            let reason = if self.peer_close.reset {
-                InetReason::from_errno(libc::ECONNRESET)
-            } else {
-                InetReason::Closed
-            };
+            let reason = self.peer_close.observed_reason();
             if let Some(op) = self.async_ops.take_recv() {
                 ctx.deliver_completion(CompletionEvent::InetAsync {
                     id: op.id,
@@ -613,8 +610,8 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        if let Some(name) = self.peer_close.recv_reply() {
-            return Ok(ctl_xerror(name));
+        if let Some(reason) = self.peer_close.recv_reply() {
+            return Ok(ctl_xerror(&reason.atom_name()));
         }
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
@@ -638,7 +635,7 @@ impl TcpInetDriver {
             // an end-of-file, `econnreset` when the read's error was a reset under
             // `{show_econnreset,true}` (`tcp_recv_closed` vs `tcp_recv_error`,
             // `inet_drv.c:13185`-`:13196`).
-            return Ok(ctl_xerror(self.peer_close.observed_atom()));
+            return Ok(ctl_xerror(&self.peer_close.observed_reason().atom_name()));
         }
         Ok(ctl_ok())
     }
@@ -691,7 +688,7 @@ impl TcpInetDriver {
                             // This read is what found the peer gone (see [`verb_recv`]):
                             // `closed`, or `econnreset` for a reset under
                             // `{show_econnreset,true}`.
-                            return Ok(ctl_xerror(self.peer_close.observed_atom()));
+                            return Ok(ctl_xerror(&self.peer_close.observed_reason().atom_name()));
                         }
                         // The socket is drained but the frame is still partial: deliver nothing
                         // and keep the buffered bytes for the next `recv`.
@@ -706,21 +703,6 @@ impl TcpInetDriver {
 // ---------------------------------------------------------------------------
 // The send path's caller tag — `init_caller` + `inet_reply_finish`
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// The send path's caller tag — `init_caller` + `inet_reply_finish`
-// ---------------------------------------------------------------------------
-
-/// The error half of the `{inet_reply, Port, Reply[, Tag]}` message for one of [`PeerClose`]'s
-/// ladder names: `{error,econnreset}`, `{error,enotconn}` or `{error,closed}`
-/// (`inet_reply_error`/`inet_reply_error_am`, `inet_drv.c:12681`-`:12692`, `:13664`-`:13669`).
-fn close_reason(name: &str) -> InetReason {
-    match name {
-        "econnreset" => InetReason::from_errno(libc::ECONNRESET),
-        "enotconn" => InetReason::from_errno(libc::ENOTCONN),
-        _ => InetReason::Closed,
-    }
-}
 
 impl TcpInetDriver {
     /// The `erlang:port_command/2` write path: strip one caller tag, write, then answer the
@@ -782,7 +764,7 @@ impl TcpInetDriver {
             // one-shot is what the caller is answered with, and only an unarmed ladder is the
             // bare `enotconn`.
             let reply = match self.peer_close.send_reply() {
-                Some(name) => InetReply::Error(close_reason(name)),
+                Some(reason) => InetReply::Error(reason),
                 None => InetReply::Error(InetReason::from_errno(libc::ENOTCONN)),
             };
             if let Some(tag) = self.caller_ref.take() {
@@ -879,7 +861,7 @@ impl TcpInetDriver {
             // caller with the send ladder's reply — `inet_reply_error`/`inet_reply_error_am`,
             // `inet_drv.c:12689`-`:12692` and `:13664`-`:13669` — and with `{error,enotconn}`
             // once that one-shot is spent.
-            Some(name) => InetReply::Error(close_reason(name)),
+            Some(reason) => InetReply::Error(reason),
             None => InetReply::Ok,
         };
         ctx.deliver_completion(CompletionEvent::InetReply {

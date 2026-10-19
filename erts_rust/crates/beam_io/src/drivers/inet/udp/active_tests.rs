@@ -356,7 +356,7 @@ fn data_of(inputs: &[ActiveInput]) -> Vec<&ReadMessage> {
         .iter()
         .filter_map(|input| match &input.event {
             ActiveInputEvent::Data(read) => Some(read),
-            ActiveInputEvent::Passive => None,
+            ActiveInputEvent::Passive | ActiveInputEvent::Error(_) => None,
         })
         .collect()
 }
@@ -941,6 +941,7 @@ fn rust_multi_rendering(rig: &mut Rig) -> String {
                 String::from_utf8_lossy(read.body.as_deref().unwrap_or_default())
             ),
             ActiveInputEvent::Passive => "passive".to_string(),
+            ActiveInputEvent::Error(reason) => format!("{{error,{}}}", reason.atom_name()),
         })
         .collect();
     format!("[{}]", rendered.join(","))

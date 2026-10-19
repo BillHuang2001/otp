@@ -294,6 +294,7 @@ fn payloads(inputs: &[ActiveInput]) -> Vec<ReadMessage> {
         .map(|input| match &input.event {
             ActiveInputEvent::Data(read) => read.clone(),
             ActiveInputEvent::Passive => panic!("a passive event where data was expected"),
+            ActiveInputEvent::Error(_) => panic!("an error event where data was expected"),
         })
         .collect()
 }

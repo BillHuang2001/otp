@@ -27,8 +27,9 @@
 //! `PACKET_REQ_RECV`(60) and is a no-op otherwise, because a datagram's *source address* has no
 //! home in the byte-only port input queue. The channel that does carry it is
 //! [`crate::port_task::ActiveInput`] — `ActiveInputEvent::Data(ReadMessage)` for one delivered
-//! datagram (the packed source address as the read's **header**, the payload as its body) and
-//! `ActiveInputEvent::Passive` for the `{udp_passive, S}` of a spent `{active, N}` counter — with
+//! datagram (the packed source address as the read's **header**, the payload as its body),
+//! `ActiveInputEvent::Passive` for the `{udp_passive, S}` of a spent `{active, N}` counter and
+//! `ActiveInputEvent::Error` for the `{udp_error, S, Reason}` of a failed `recvfrom(2)` — with
 //! [`DriverContext::deliver_active_input`] as the driver-side seam and
 //! [`crate::PortRegistry::take_active_inputs`] as the runtime's drain.
 //!
@@ -71,6 +72,7 @@ use super::super::sys::recv_from;
 use super::super::wire::{pack_address, InetAddr};
 use super::super::InetState;
 use super::{UdpInetDriver, DATAGRAM_CHUNK};
+use crate::completion::InetReason;
 use crate::driver::DriverContext;
 use crate::poller::Interest;
 use crate::port_task::{ActiveInputEvent, ReadMessage};
@@ -125,23 +127,22 @@ impl UdpInetDriver {
     ///   socket with the `recv` verb;
     /// * the port has no socket (`!IS_OPEN`) or `{deliver, port}` is set (see the module docs).
     ///
-    /// # Divergence: a real read error
+    /// # A real read error
     ///
-    /// The C answers a non-blocking, non-`EAGAIN` `recvfrom(2)` failure on an **active** socket
-    /// with `packet_error_message` — the `{udp_error, S, Reason}` of `inet_drv.c:4245` — and
-    /// keeps the port. This channel has no error vocabulary
-    /// ([`ActiveInputEvent`](crate::port_task::ActiveInputEvent) is `Data` or `Passive`), and
-    /// fabricating one would be worse than reporting the truth, so the raw failure is returned as
-    /// the typed [`beam_common::BeamError::Io`] — the surrounding code's convention. It is a
+    /// A non-blocking, non-`EAGAIN` `recvfrom(2)` failure on an **active** socket is the C's
+    /// `if (err != ERRNO_BLOCK)` "real error" arm (`inet_drv.c:15479`-`:15492`): an active
+    /// descriptor runs `packet_error_message` (`:15486`) — the `{udp_error, S, Reason}` of `:4245`,
+    /// whose `Reason` is `error_atom(err)` — and the read loop returns. A datagram port has no
+    /// close message of its own (the C has no `{udp_closed, S}` anywhere), so the port stays live
+    /// and the burst simply ends on the delivery; the next readiness edge reads again. This is a
     /// genuine socket failure (`ECONNREFUSED` on a *connected* datagram socket is the realistic
     /// one), never a normal datagram arrival.
     ///
     /// # Errors
     ///
     /// The typed `unsupported` of a context with no active-input sink (a driver driven outside a
-    /// port), the raw read failure described above, and — through
-    /// [`DriverContext::deliver_active_input`] — a refusal after a failure latched in the same
-    /// callback.
+    /// port), and — through [`DriverContext::deliver_active_input`] — a refusal after a failure
+    /// latched in the same callback.
     pub(super) fn active_delivery(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         // The queued passive operation owns the socket; it was already served by
         // `async_ready_input` (the caller runs it first).
@@ -188,10 +189,21 @@ impl UdpInetDriver {
                         ctx.deliver_active_input(event)?;
                     }
                 }
-                // `ERRNO_BLOCK` — nothing more is buffered right now (`:15490`).
+                // `ERRNO_BLOCK` — nothing more is buffered right now (`:15490`) — ends the
+                // burst; any other failure is the C's `if (err != ERRNO_BLOCK)` arm (`:15479`-
+                // `:15492`): a **real error** on an active descriptor runs
+                // `packet_error_message(udesc, err)` (`:15486`, the `{udp_error, S, Reason}` of
+                // `:4245`) and `return count`s out of the read loop. The datagram port has no
+                // close message of its own (there is no `{udp_closed, S}` anywhere in the C), so
+                // it stays live and this delivery is the whole report.
                 Err(err) => match err.raw_os_error() {
                     Some(libc::EAGAIN) => break,
-                    _ => return Err(crate::error::io(err)),
+                    errno => {
+                        ctx.deliver_active_input(ActiveInputEvent::Error(
+                            InetReason::from_errno(errno.unwrap_or(libc::EIO)),
+                        ))?;
+                        return Ok(());
+                    }
                 },
             }
             spent_the_budget = budget == 0;

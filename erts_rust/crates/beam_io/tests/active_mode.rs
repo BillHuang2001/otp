@@ -405,7 +405,7 @@ fn data_of(inputs: &[ActiveInput]) -> Vec<&ReadMessage> {
         .iter()
         .filter_map(|input| match &input.event {
             ActiveInputEvent::Data(read) => Some(read),
-            ActiveInputEvent::Passive => None,
+            ActiveInputEvent::Passive | ActiveInputEvent::Error(_) => None,
         })
         .collect()
 }

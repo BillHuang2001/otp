@@ -191,6 +191,7 @@ fn tags(deliveries: &[ActiveInput]) -> Vec<(PortId, u8)> {
                     .copied()
                     .expect("every hook delivery carries a one-byte body"),
                 ActiveInputEvent::Passive => 0,
+                ActiveInputEvent::Error(_) => u8::MAX,
             };
             (delivery.port, tag)
         })

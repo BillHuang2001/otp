@@ -255,6 +255,7 @@ use std::time::Instant;
 
 use beam_common::Result;
 
+use crate::completion::InetReason;
 use crate::driver::{Driver, DriverContext};
 use crate::drivers::fd::set_nonblocking;
 use crate::error;
@@ -480,10 +481,11 @@ impl InetState {
 ///   set "for the next receive operation" (`:12685`'s comment);
 /// * every other state answers `enotconn`.
 ///
-/// `reset` is not a C flag: it records whether the *observation itself* was a reset, so the
-/// operation that **discovered** the close can report `econnreset` rather than `closed` — the split
-/// the C makes between `tcp_recv_error` and `tcp_recv_closed` (`:13190`-`:13196`) when it answers
-/// the discovering operation inline.
+/// `observed` is not a C flag either: it is the reason the **discovering** operation reports —
+/// `None` meaning `closed` — so a read reset under `{show_econnreset,true}` answers `econnreset`
+/// and any other read failure answers its own `error_atom(err)`, the split the C makes between
+/// `tcp_recv_error` and `tcp_recv_closed` (`:13190`-`:13196`) when it answers the discovering
+/// operation inline ([`PeerClose::observed_reason`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct PeerClose {
     /// The peer's end-of-file (or a connection reset) has been observed.
@@ -1279,7 +1281,10 @@ impl TcpInetDriver {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` when the read fails irrecoverably.
+    /// [`TcpInetDriver::connected_socket`]'s `BadArg` (a connected state with no descriptor) and
+    /// whatever the close latch reports (a failed poller de-registration, or a refused
+    /// active-input delivery). A **read** failure is not one of them: it is classified through
+    /// [`CloseSource::Read`] instead of being raised.
     fn read_bytes(
         &mut self,
         ctx: &mut DriverContext<'_>,
@@ -1801,8 +1806,8 @@ impl TcpInetDriver {
         // default `{exit_on_close,true}` ends in `tcp_desc_close` → `erl_inet_close`, which
         // clears `INET_STATE_CONNECTED` (`:5078`) and sets `INET_STATE_CLOSED` (`:5106`) — so a
         // state-first guard would swallow the one-shot `tcp_recv_closed` armed (`:12816`).
-        if let Some(name) = self.peer_close.send_reply() {
-            return Ok(ctl_xerror(name));
+        if let Some(reason) = self.peer_close.send_reply() {
+            return Ok(ctl_xerror(&reason.atom_name()));
         }
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
@@ -1852,9 +1857,9 @@ impl TcpInetDriver {
             // the next receive (`flags |= TCP_ADDF_DELAYED_CLOSE_RECV`, `:13678`) and, for a
             // reset, leaves `TCP_ADDF_DELAYED_ECONNRESET` armed too (`:13683`); the send
             // one-shot is *not* armed, because this call answered it on the spot.
-            let name = self.peer_close.observed_atom();
+            let name = self.peer_close.observed_reason().atom_name();
             self.peer_close.consumed_by_send();
-            return Ok(ctl_xerror(name));
+            return Ok(ctl_xerror(&name));
         }
         Ok(ctl_ok())
     }
