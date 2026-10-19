@@ -58,7 +58,9 @@ use std::os::unix::io::{IntoRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use super::super::opcode_tests::{bare_port, listening_port, op, opened_port, Rig};
-use super::super::opt::{INET_INFINITY, INET_LOPT_ACTIVE, INET_LOPT_MODE, INET_LOPT_PACKET};
+use super::super::opt::{
+    INET_INFINITY, INET_LOPT_ACTIVE, INET_LOPT_HEADER, INET_LOPT_MODE, INET_LOPT_PACKET,
+};
 use super::super::wire::{ctl_ok, ctl_xerror};
 use super::super::{TcpInetDriver, INET_ACTIVE, INET_PASSIVE};
 use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply, PortCompletion};
@@ -505,6 +507,103 @@ fn a_receive_delivers_the_raw_byte_stream_as_a_body_only_read() {
     };
     assert!(read.header.is_empty(), "a raw read has no header split");
     assert_eq!(read.body.as_deref(), Some(&b"abcdef"[..]));
+}
+
+/// A passive `TCP_REQ_RECV` reply applies the **`{header, N}` split** exactly as the active message
+/// does: the C's `inet_async_data` (`inet_drv.c:3162`) splits `desc->hsz` off the front of the body
+/// `packet_get_body` left behind and builds `{ok, [H1..HSz | Data]}` (`:3175`-`:3190`) — the same
+/// rule as `tcp_message`, not a raw read.
+#[test]
+fn a_header_option_splits_the_passive_receive_too() {
+    let (mut port, mut peer) = linked();
+    set_option(&mut port, INET_LOPT_HEADER, 2);
+    peer.write_all(b"abcde").expect("the peer writes");
+
+    assert_eq!(
+        port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)),
+        vec![1, 0, 0]
+    );
+    let events = await_events(&mut port, 1);
+    let (id, result) = &events[0];
+    assert_eq!(*id, 0, "the completion echoes the reply's id");
+    let InetAsyncResult::Data(read) = result else {
+        panic!("the receive completed with {result:?}");
+    };
+    assert_eq!(read.header, b"ab".to_vec(), "the first hsz bytes are the header");
+    assert_eq!(
+        read.body.as_deref(),
+        Some(&b"cde"[..]),
+        "the body is the remainder, as an improper tail"
+    );
+}
+
+/// The passive path's `hsz > len` row: `{header, 10}` over a three-byte write takes the C's
+/// flat-list branch (`(desc->mode == INET_MODE_LIST) || (hsz > len)`, `inet_drv.c:3179`) — the
+/// whole payload as the read's header and **no** binary tail.
+#[test]
+fn a_header_wider_than_the_passive_payload_reports_one_flat_list() {
+    let (mut port, mut peer) = linked();
+    set_option(&mut port, INET_LOPT_HEADER, 10);
+    peer.write_all(b"abc").expect("the peer writes");
+
+    assert_eq!(
+        port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)),
+        vec![1, 0, 0]
+    );
+    let events = await_events(&mut port, 1);
+    let InetAsyncResult::Data(read) = &events[0].1 else {
+        panic!("the receive completed with {:?}", events[0].1);
+    };
+    assert_eq!(read.header, b"abc".to_vec(), "the whole payload is the header");
+    assert_eq!(read.body, None, "no binary tail (the C's flat list)");
+}
+
+/// `{header, 2}` and a two-byte write: the passive reply keeps an **empty, present** binary tail
+/// (`LOAD_BUF2BINARY(buf+hsz, 0)` ⇒ `<<>>`, `inet_drv.c:3186`), so it renders `[97,98|<<>>]`.
+#[test]
+fn a_header_as_wide_as_the_passive_payload_leaves_an_empty_binary_tail() {
+    let (mut port, mut peer) = linked();
+    set_option(&mut port, INET_LOPT_HEADER, 2);
+    peer.write_all(b"ab").expect("the peer writes");
+
+    assert_eq!(
+        port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)),
+        vec![1, 0, 0]
+    );
+    let events = await_events(&mut port, 1);
+    let InetAsyncResult::Data(read) = &events[0].1 else {
+        panic!("the receive completed with {:?}", events[0].1);
+    };
+    assert_eq!(read.header, b"ab".to_vec());
+    assert_eq!(read.body.as_deref(), Some(&b""[..]), "`<<>>`, not no tail");
+    assert!(read.has_body(), "the tail exists and is empty");
+}
+
+/// The `{header, N}` split also applies **after** a framing `{packet, N}` header is stripped: the
+/// C's `tcp_reply_data` calls `packet_get_body` first and hands the resulting body to
+/// `inet_async_data` (`:4288`-`:4295`), so `hsz` addresses the payload, not the frame.
+#[test]
+fn a_header_option_splits_the_framed_passive_payload_after_the_frame_is_stripped() {
+    let (mut port, mut peer) = linked();
+    set_option(&mut port, INET_LOPT_PACKET, PACKET_2);
+    set_option(&mut port, INET_LOPT_HEADER, 2);
+    peer.write_all(&[0, 5, b'a', b'b', b'c', b'd', b'e'])
+        .expect("the peer writes one frame");
+
+    assert_eq!(
+        port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)),
+        vec![1, 0, 0]
+    );
+    let events = await_events(&mut port, 1);
+    let InetAsyncResult::Data(read) = &events[0].1 else {
+        panic!("the receive completed with {:?}", events[0].1);
+    };
+    assert_eq!(read.header, b"ab".to_vec(), "hsz applies to the frame's payload");
+    assert_eq!(
+        read.body.as_deref(),
+        Some(&b"cde"[..]),
+        "the framing header is gone before the split"
+    );
 }
 
 /// A non-zero `Length` means "exactly this many bytes" (raw header type only), and the bytes left
@@ -972,5 +1071,55 @@ fn a_socket_less_command_closes_the_port() {
             Err(BeamError::BadArg)
         ),
         "and so is every later control call"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The system-`erl` oracle (OTP 29.1.1 / erts-17.1)
+//
+// `gen_tcp:recv/3` on a passive socket is exactly the `TCP_REQ_RECV` the driver serves, so these
+// pin the *terms* the C's `inet_async_data` (`inet_drv.c:3162`) builds for the `{header, N}`
+// split. The Rust-side equivalents are the `*_header_*_passive_*` cases above.
+// ---------------------------------------------------------------------------
+
+/// The passive `{header, N}` split, in the three `hsz` relations at once: `hsz < len` ⇒
+/// `[H1,H2|<<"cde">>]`, `hsz == len` ⇒ `[H1,H2|<<>>]`, `hsz > len` ⇒ the flat list `[97,98,99]`.
+#[test]
+fn the_oracle_splits_a_passive_receive_by_the_header_option() {
+    fn recv_under(hsz: i32, payload: &str) -> Option<String> {
+        let expr = concat!(
+            "{ok,L} = gen_tcp:listen(0,[binary,{active,false},{reuseaddr,true},{ip,{127,0,0,1}}]), ",
+            "{ok,P} = inet:port(L), ",
+            "{ok,C} = gen_tcp:connect({127,0,0,1},P,[binary,{active,false},{nodelay,true}]), ",
+            "{ok,S} = gen_tcp:accept(L), ",
+            "ok = inet:setopts(S,[{packet,raw},{header,HSZ}]), ",
+            "ok = gen_tcp:send(C,PAYLOAD), ",
+            "R = gen_tcp:recv(S,0,2000), ",
+            "io:format(\"R=~w~n\",[R])"
+        )
+        .replace("HSZ", &hsz.to_string())
+        .replace("PAYLOAD", &format!("\"{payload}\""));
+        super::super::opcode_tests::erl_stdout(&expr)
+    }
+
+    let Some(narrow) = recv_under(2, "abcde") else { return };
+    assert_eq!(
+        narrow.trim(),
+        "R={ok,[97,98|<<99,100,101>>]}",
+        "`{{header,2}}` on five bytes: the split, as an improper list"
+    );
+
+    let Some(exact) = recv_under(2, "ab") else { return };
+    assert_eq!(
+        exact.trim(),
+        "R={ok,[97,98|<<>>]}",
+        "`{{header,2}}` on two bytes: an empty binary tail, not no tail"
+    );
+
+    let Some(wide) = recv_under(10, "abc") else { return };
+    assert_eq!(
+        wide.trim(),
+        "R={ok,[97,98,99]}",
+        "`{{header,10}}` on three bytes: the whole payload as one flat int list"
     );
 }

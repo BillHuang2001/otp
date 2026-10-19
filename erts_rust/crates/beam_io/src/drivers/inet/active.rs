@@ -49,10 +49,13 @@
 //!
 //! The read's `header` is **not** the framing header (that one is already gone): it is the
 //! `{header, N}` option — the C's `desc->hsz` (`inet_drv.c:6931`) — split off the front of the
-//! payload, exactly as `tcp_message` (`:3979`) renders `[H1..Hsz | Data]`. In `[list]` mode the
-//! C flattens the pair into one string (and reports the whole payload as a flat string when
-//! `hsz > len`); flattening is the **runtime's** job, so this module always hands up the split
-//! [`ReadMessage`] and never a mode-dependent shape.
+//! payload, exactly as `tcp_message` (`:3979`) renders `[H1..Hsz | Data]`. A `hsz` wider than the
+//! payload takes the C's **flat-list** branch there (`(desc->mode == INET_MODE_LIST) || (hsz >
+//! len)`, `:3985`): the whole payload as one proper list, with no binary tail — which the split
+//! expresses as `body: None` ([`super::header::split_payload`]). In `[list]` mode the C flattens
+//! the pair into one string whatever the split is; flattening is the **runtime's** job, so this
+//! module always hands up the split
+//! [`ReadMessage`](crate::port_task::ReadMessage) and never a mode-dependent shape.
 //!
 //! # The `{active, N}` bookkeeping
 //!
@@ -104,9 +107,10 @@ use beam_common::Result;
 
 use crate::driver::DriverContext;
 use crate::poller::Interest;
-use crate::port_task::{ActiveInputEvent, ReadMessage};
+use crate::port_task::ActiveInputEvent;
 
 use super::frame;
+use super::header;
 use super::opt::{set_options_tracked, OptScope};
 use super::stat;
 use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, ReadReport, TcpInetDriver};
@@ -269,37 +273,10 @@ impl TcpInetDriver {
         ctx: &mut DriverContext<'_>,
         payload: Vec<u8>,
     ) -> Result<()> {
-        let read = self.split_payload(payload);
+        let read = header::split_payload(self.options.header, payload);
         ctx.deliver_active_input(ActiveInputEvent::Data(read))?;
         self.count_delivery(ctx)
     }
-
-    /// The `{tcp, S, [H1..Hsz | Data]}` split of one delivered payload
-    /// (`tcp_message`, `:3979`-`:4005`).
-    ///
-    /// `hsz` is the `{header, N}` option (the C's `desc->hsz`, `:6931`) — **not** the `{packet, N}`
-    /// framing header, which was stripped before this point. The body is always present, even
-    /// when empty: the C's `LOAD_BUF2BINARY(buf+hsz, 0)` still builds `<<>>`, so a `[binary]` port
-    /// renders `[H1..Hsz|<<>>]` where a header-less read renders the bare binary.
-    ///
-    /// **Divergence, recorded:** when `hsz > payload.len()` the C takes its list branch
-    /// (`(desc->mode == INET_MODE_LIST) || (hsz > len)`, `:3985`) and reports the whole payload as
-    /// one flat string (a *proper* list, no binary tail). This floor always hands up
-    /// `header = payload`, `body = Some(vec![])` there, which a `[list]` consumer flattens to the
-    /// same bytes; only a `[binary]` consumer would see an empty binary tail instead of none.
-    /// Nothing is lost or mis-ordered either way, and the split stays the runtime's to render.
-    fn split_payload(&self, mut payload: Vec<u8>) -> ReadMessage {
-        // The C stores `{header, N}` as an `unsigned int` (`desc->hsz = ival`, `:6931`), so a
-        // negative option is the huge unsigned that makes `hsz > len` true.
-        let hsz = self.options.header as u32 as usize;
-        let split = hsz.min(payload.len());
-        let body = payload.split_off(split);
-        ReadMessage {
-            header: payload,
-            body: Some(body),
-        }
-    }
-
     /// `INET_CHECK_ACTIVE_TO_PASSIVE` (`:1552`-`:1561`): spends one `{active, …}` grant after
     /// each delivered packet.
     ///

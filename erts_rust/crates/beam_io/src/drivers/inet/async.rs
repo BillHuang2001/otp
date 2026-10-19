@@ -98,6 +98,7 @@ use beam_common::Result;
 
 use super::accept::AcceptQueue;
 use super::frame;
+use super::header;
 use super::stat;
 use super::wire::{ctl_ok, ctl_xerror, echoable_caller_tag, split_command_prefix};
 use super::{Interest, ReadReport, TcpInetDriver};
@@ -105,7 +106,6 @@ use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply}
 use crate::driver::DriverContext;
 use crate::port_failure::DriverFailure;
 use crate::error;
-use crate::port_task::ReadMessage;
 
 /// The C's `INET_MAX_ASYNC` (`erts/emulator/drivers/common/inet_drv.c:1069`): the receive slot
 /// holds **one** operation, so a second concurrent receive is `[0]ealready`.
@@ -428,13 +428,19 @@ impl TcpInetDriver {
                     // add, so this is the C's `len` too.
                     self.stat.input(payload.len());
                 }
+                // The passive reply splits on `{header, N}` exactly as the active message does:
+                // `inet_async_data` (`:3162`) applies `desc->hsz` to the **body**
+                // `packet_get_body` left behind, including its flat-list branch when `hsz > len`
+                // (`:3175`-`:3190`) — one rule, [`header::split_payload`].
                 ctx.deliver_completion(CompletionEvent::InetAsync {
                     id: op.id,
-                    result: InetAsyncResult::Data(ReadMessage::body_only(payload)),
+                    result: InetAsyncResult::Data(header::split_payload(
+                        self.options.header,
+                        payload,
+                    )),
                 })?;
                 return Ok(true);
-            }
-            if self.peer_close.seen {
+            }            if self.peer_close.seen {
                 break;
             }
             // Not enough buffered bytes: read what the socket has and try once more.
