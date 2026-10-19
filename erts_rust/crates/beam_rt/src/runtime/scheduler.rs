@@ -999,6 +999,24 @@ impl Runtime {
             if let Err(err) = self.bind_dist_peers() {
                 break Err(err);
             }
+            // The **node-monitor half** of contract A.5: a process that called
+            // `erlang:monitor_node(Node, true)` is owed a plain `{nodeup, Node}` /
+            // `{nodedown, Node}` for every transition of that node's connection, and this is
+            // where the transition is observed — right after `bind_dist_peers`, so a link that
+            // became established in this very pass is already visible to the diff. The step is
+            // a no-op (`Ok(0)`, no allocation) for a runtime nobody subscribed on, which is
+            // every hermetic run; a delivery wakes a receiver blocked on `nodedown`, so it
+            // counts into `delivered` and the pass goes round again — the same resume-on-send
+            // path the gc completions and the port/timer halves take.
+            match self.service_node_monitors(&mut table) {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    scheduler.resume_woken(&mut table);
+                    continue;
+                }
+            }
             // The inbound-delivery half: route what the established links decoded into the
             // addressed local process's mailbox. A delivery is what wakes a receiver
             // blocked in a compiled `receive`, so it enqueues the woken process and goes

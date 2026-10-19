@@ -409,8 +409,57 @@ impl RuntimeContext<'_> {
         self.atom("ignore")
     }
 
-    // -- helpers --------------------------------------------------------------
+    // -- erlang:monitor_node/2 ------------------------------------------------
 
+    /// `erlang:monitor_node(Node, Bool)`: subscribe (`true`) or unsubscribe (`false`) the calling
+    /// process to `Node`'s **connection** state, answering the atom `true`.
+    ///
+    /// Oracle facts (measured on OTP 29.1.1 / erts-17.1, and the reason this is not the surface it
+    /// looks like):
+    ///
+    /// * The answer is the atom `true` for **every atom** `Node` — `node()` itself and
+    ///   `nonode@nohost` included, and a node this runtime has never connected to. There is no
+    ///   `badarg` for "your own node" (a claim sometimes made about this BIF; it is measurably
+    ///   false) and none for a node with no link.
+    /// * `badarg` only for a **non-atom** `Node`, or a `Bool` that is not the atom `true`/`false`.
+    /// * No replay: subscribing to a node that is **already** connected yields no immediate
+    ///   `nodeup`; one arrives only for a connection established **after** the subscription, and
+    ///   a `nodedown` when the node's last link retires.
+    ///
+    /// The store is the runtime's ([`Runtime::monitor_node_add`] /
+    /// [`Runtime::monitor_node_remove`] over [`Runtime::node_monitors`]) and the notifications are
+    /// emitted by the scheduler pass's [`Runtime::service_node_monitors`]; this body only decides
+    /// the argument shapes and seeds the latch with the node's state **now** — which is exactly
+    /// what implements the no-replay rule. `erlang:monitor_node/3` (the `Info`-carrying form) is
+    /// deliberately not served: it stays `beam_bifs`'s typed capability gap.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a non-atom `Node` (or an atom this runtime's namespace cannot
+    /// name) and for a `Bool` other than `true`/`false`.
+    pub(super) fn monitor_node_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let node = *args.first().ok_or(BeamError::BadArg)?;
+        let flag = *args.get(1).ok_or(BeamError::BadArg)?;
+        // A non-atom `Node` is the C's `badarg`; an atom always names something here, because a
+        // loaded module's atom table is a snapshot of this runtime's shared namespace (interning
+        // only appends), so the name lookup only fails for a non-atom.
+        let name = self.atom_name(node).ok_or(BeamError::BadArg)?;
+        let on = match self.atom_name(flag).as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(BeamError::BadArg),
+        };
+        let pid = self.pid();
+        if on {
+            let saw_connected = self.runtime.dist_is_connected(&name);
+            self.runtime.monitor_node_add(pid, node, saw_connected);
+        } else {
+            self.runtime.monitor_node_remove(pid, node);
+        }
+        self.atom("true")
+    }
+
+    // -- helpers --------------------------------------------------------------
     /// The node atoms of every peer this runtime has an **established** outbound link to,
     /// in connection order.
     ///
@@ -918,8 +967,109 @@ mod tests {
         }
     }
 
-    // -- the name helpers -----------------------------------------------------
+    // -- erlang:monitor_node/2 ------------------------------------------------
 
+    /// The oracle's answer is the atom `true` for **every atom** node — this runtime's own node,
+    /// `nonode@nohost`, and a node it has never connected to — with the subscription recorded as
+    /// one latch per distinct node. (Measured on OTP 29.1.1 / erts-17.1; there is no `badarg` for
+    /// `Node == node()`, and none for a node with no link.)
+    #[test]
+    fn monitor_node_answers_true_for_every_atom_node() {
+        for extra in [None, Some("peer@elsewhere")] {
+            let mut rt = runtime();
+            let own = rt.local_node_term();
+            let on = rt.intern("true");
+            let mut nodes = vec![own, rt.intern(NONODE_NAME)];
+            if let Some(name) = extra {
+                nodes.push(rt.intern(name));
+            }
+            for node in nodes {
+                let term = call(&mut rt, "erlang", "monitor_node", &[node, on])
+                    .unwrap_or_else(|error| panic!("monitor_node({node:?}, true): {error}"));
+                assert_eq!(rendered(&mut rt, term), "true", "every atom node answers `true`");
+            }
+            // `own` and `nonode@nohost` are the same atom on a `-noshell` runtime, so those two
+            // subscriptions collapse to the same idempotent-set entry.
+            let latches = rt
+                .node_monitors
+                .get(&rt.self_pid())
+                .expect("the subscriptions are recorded");
+            assert_eq!(
+                latches.len(),
+                if extra.is_some() { 2 } else { 1 },
+                "one latch per distinct node atom"
+            );
+        }
+    }
+
+    /// A **repeated** `monitor_node(Node, true)` neither duplicates nor refcounts its entry, and
+    /// `monitor_node(Node, false)` removes it — the C's idempotent set. `false` for a node the
+    /// process never subscribed to is the same no-op, and still answers `true`.
+    #[test]
+    fn monitor_node_is_an_idempotent_set_and_false_removes() {
+        let mut rt = runtime();
+        let on = rt.intern("true");
+        let off = rt.intern("false");
+        let peer = rt.intern("peer@host");
+        for _ in 0..3 {
+            let term = call(&mut rt, "erlang", "monitor_node", &[peer, on]).expect("monitor_node");
+            assert_eq!(rendered(&mut rt, term), "true");
+        }
+        assert_eq!(
+            rt.node_monitors
+                .get(&rt.self_pid())
+                .expect("the subscription")
+                .len(),
+            1,
+            "a repeat neither duplicates nor refcounts"
+        );
+        let term = call(&mut rt, "erlang", "monitor_node", &[peer, off]).expect("unsubscribe");
+        assert_eq!(rendered(&mut rt, term), "true");
+        assert!(
+            !rt.node_monitors.contains_key(&rt.self_pid()),
+            "the last latch's removal drops the process's entry"
+        );
+
+        let unknown = rt.intern("other@host");
+        let term = call(&mut rt, "erlang", "monitor_node", &[unknown, off]).expect("no-op false");
+        assert_eq!(rendered(&mut rt, term), "true", "`false` is `true` for any atom node");
+        assert!(rt.node_monitors.is_empty());
+    }
+
+    /// `badarg` — and only `badarg` — for a **non-atom** node or a flag that is not the atom
+    /// `true`/`false`. Nothing is recorded by a rejected call.
+    #[test]
+    fn monitor_node_rejects_a_non_atom_node_or_a_non_boolean_flag() {
+        let mut rt = runtime();
+        let on = rt.intern("true");
+        let off = rt.intern("false");
+        let peer = rt.intern("peer@host");
+
+        let int = make_small(42);
+        let list = rt.eval("[1, 2]").expect("a list");
+        let pid = rt.eval("self()").expect("a pid");
+        for (what, node) in [("an integer", int), ("a list", list), ("a pid", pid)] {
+            for flag in [on, off] {
+                assert!(
+                    call(&mut rt, "erlang", "monitor_node", &[node, flag]).is_err(),
+                    "{what} as the node must be badarg"
+                );
+            }
+        }
+        for name in ["maybe", "1", "True"] {
+            let flag = rt.intern(name);
+            assert!(
+                call(&mut rt, "erlang", "monitor_node", &[peer, flag]).is_err(),
+                "the flag `{name}` must be badarg"
+            );
+        }
+        assert!(
+            rt.node_monitors.is_empty(),
+            "a rejected call records no subscription"
+        );
+    }
+
+    // -- the name helpers -----------------------------------------------------
     #[test]
     fn same_node_accepts_the_short_and_the_full_name() {
         assert!(same_node("foo@host", "foo@host"));
