@@ -1659,7 +1659,38 @@ fn cross_function_entry(
             return None;
         }
     }
+    // The artifact's x write extent may have just grown: `native_entry_tables` compiles the
+    // target function on first sight, and the extent the driver declared at this block's entry
+    // predates that. Re-declare it before the jump (see `note_native_write_extent`).
+    note_native_write_extent(runtime, artifact);
     Some((entry, Some(tables)))
+}
+
+/// Re-declare the artifact's x-register write extent on the machine.
+///
+/// A compiled block stores straight into `machine.x` through the pointer it holds, which the
+/// `set_x` high-water mark cannot observe; the artifact bounds every such write
+/// (`CompiledModule::native_write_extent`, one past the highest x slot any compiled block of it
+/// touches), and [`super::enter_compiled_cached`] declares that bound before every block entry
+/// so the next `Machine::reset` refills exactly what the run could have written and every
+/// mid-block helper sees the full x-register prefix through `Machine::with_roots`.
+///
+/// **In-block transfers need it too.** [`cross_function_entry`] compiles the target function on
+/// first sight, so the artifact's running maximum can grow *while a block runs*, after the
+/// driver's entry-time note: the block then jumps into that function's code, which may write a
+/// deeper register and call a helper that reads the register files. Declaring the (now larger)
+/// extent before the jump keeps the note an upper bound. Monotone and O(1) — a no-op whenever
+/// the maximum did not move; the FR file is untouched (nothing generated writes it; see
+/// `CompiledModule::native_write_extent`).
+fn note_native_write_extent(runtime: &JitRuntime<'_>, artifact: &CompiledModule) {
+    let Some(extent) = artifact.native_write_extent() else {
+        return;
+    };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`; no other
+    // `&mut Machine` exists while a block or its helper runs (see the `cross_function_entry`
+    // bound check above, which reads `x.len()` through the same pointer).
+    let machine = unsafe { &mut *runtime.machine };
+    machine.note_x_dirty(extent);
 }
 
 /// [`cross_function_entry`] behind the published-tables fast path: the same-function shape

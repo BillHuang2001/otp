@@ -61,8 +61,7 @@ use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
-use beam_engine::machine::MAX_FLOAT_REGISTER;
-use beam_engine::{error, terms, ExecutionContext, Machine, RunOutcome, MAX_REGISTER};
+use beam_engine::{error, terms, ExecutionContext, Machine, RunOutcome};
 use beam_loader::{Export, Function, Instr, Label, Module, Operand};
 use beam_term::{
     boxed_val, is_boxed_term, is_list, make_atom, make_small, Atom, Eterm, NIL, TAG_PTR_MASK,
@@ -782,13 +781,17 @@ fn the_tuple_arm_reserves_once_through_the_rooted_seam() {
     );
 
     let seen = seen.borrow();
-    // One `put_tuple2` = exactly one rooted reservation. The whole X-register file and
-    // the whole FR file (a float register holds a term slot) are handed over, and the
-    // argument the build reads is a live root at the reserve.
+    // One `put_tuple2` = exactly one rooted reservation. The handed x slice is the machine's
+    // **writable root prefix** — one past the highest slot the run has written, here the
+    // single seeded argument — not the whole 1024-word file: every slot at or beyond it is
+    // `NIL` by the refill invariant, so it holds no term and cannot be relocated. The
+    // narrow slice is sound *by construction* (the host cannot write outside what it was
+    // handed), so the assertion is the extent, not a length that promises NIL tail words.
     assert_eq!(seen.calls, TUPLE_RESERVES);
-    assert_eq!(seen.x[0].len(), MAX_REGISTER as usize);
-    assert_eq!(seen.fr[0].len(), MAX_FLOAT_REGISTER as usize);
+    assert_eq!(seen.x[0].len(), 1, "the used x prefix: the one live argument");
     assert_eq!(seen.x[0][0], make_small(42));
+    // No FR slot is live in this run, so the FR hand-off is empty rather than 1024 NIL words.
+    assert!(seen.fr[0].is_empty(), "no live FR slot in this run");
 }
 
 #[test]
@@ -811,14 +814,15 @@ fn the_list_arm_reserves_once_through_the_rooted_seam() {
     assert_eq!(terms::cons_tail(result).expect("tail"), make_small(9));
 
     let seen = seen.borrow();
-    // One `put_list` = exactly one rooted reservation (one cons cell), with no frame
-    // live in a leaf run and both operands live in the handed-over X file.
+    // One `put_list` = exactly one rooted reservation (one cons cell), with no frame live in
+    // a leaf run and both operands inside the handed x prefix — which is exactly the two
+    // registers the run has written.
     assert_eq!(seen.calls, LIST_RESERVES);
     assert_eq!(seen.stack[0].len(), 0);
-    assert_eq!(seen.x[0].len(), MAX_REGISTER as usize);
-    assert_eq!(seen.fr[0].len(), MAX_FLOAT_REGISTER as usize);
+    assert_eq!(seen.x[0].len(), 2, "the used x prefix: the two live arguments");
     assert_eq!(seen.x[0][0], make_small(8));
     assert_eq!(seen.x[0][1], make_small(9));
+    assert!(seen.fr[0].is_empty(), "no live FR slot in this run");
 }
 
 #[test]
@@ -848,8 +852,22 @@ fn each_build_instruction_reserves_exactly_once_and_hands_over_the_live_operands
     // are among them: the `put_list` reserve is handed the tuple the previous
     // `put_tuple2` built (X(3)), the third reserve still sees the live tuple in X(3) and
     // the live cons cell in X(4), and the fourth is handed the pair built into X(5).
+    //
+    // Each hand-off is the machine's x **used prefix** at that moment — so the first
+    // reserve (before anything is built) is handed exactly the three seeded arguments,
+    // and each later one grows by the register its predecessor wrote. "X(3) does not
+    // exist yet" is therefore expressed as the prefix's length, not as a NIL word: a slot
+    // at or beyond the prefix is not handed over at all (it is `NIL` by the refill
+    // invariant, hence not a root), and the host cannot reach it.
     assert_eq!(seen.calls, BUILD_RESERVES);
-    assert_eq!(seen.x[0][3], NIL);
+    assert_eq!(
+        seen.x[0].len(),
+        3,
+        "the first reserve is handed the three live arguments and nothing else"
+    );
+    assert_eq!(seen.x[1].len(), 4, "…the second, the tuple in X(3) too");
+    assert_eq!(seen.x[2].len(), 5, "…the third, the cons cell in X(4) too");
+    assert_eq!(seen.x[3].len(), 6, "…the fourth, the pair in X(5) too");
     assert_eq!(seen.x[1][3], inner_tuple);
     assert_eq!(seen.x[2][3], inner_tuple);
     assert_eq!(seen.x[2][4], inner_list);

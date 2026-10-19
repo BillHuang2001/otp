@@ -664,6 +664,42 @@ fn enter_compiled_cached(
     // Structural counter: the lookup is entered (the register-file guard passed).
     #[cfg(test)]
     counters::record_block_entered();
+    // ── The native register-write extent, reported BEFORE the block runs ──
+    //
+    // A compiled block stores straight into `machine.x` through the pointer it holds —
+    // the cached registers' exit spill, and any register beyond the cache budget that is
+    // addressed directly — which the `set_x` high-water mark cannot observe. The artifact
+    // bounds every such write: `CompiledModule::native_write_extent` is one past the
+    // highest x slot any compiled block of it touches, so declaring that extent makes the
+    // next `Machine::reset` refill exactly what the run could have written instead of both
+    // 1024-word files (a stale register would be a wrong result, so the extent must be an
+    // upper bound, and it is: it is the emitted code's own bound).
+    //
+    // It is noted **here, before the call**, not after the block returns, because a helper
+    // the block calls in the middle of its body reads the register files — a deopted
+    // `test_heap` reaches `Machine::ensure_heap` → `with_roots`, which hands the host the
+    // x-register *prefix* [`Machine::used_x_extent`] derives from this very figure. Noting
+    // it afterwards would hand such a helper an empty slice: the block's own spilled
+    // registers would be invisible to the host's root set (measured: the JIT register-spill
+    // gate `the_block_spills_its_cached_registers_before_a_helper_call` saw a zero-length
+    // slice).
+    //
+    // The FR file is untouched: generated code never stores into it (`rbx` is the
+    // `machine.x` base and no emitter module in `src/jit/**` emits an FR store), so an FR
+    // slot is covered by the `set_fr` high-water mark on this tier too. An artifact with no
+    // registered extent at all — a hand-built synthetic `Allocation`, which no real
+    // compilation produces — falls back to the wide `mark_regs_escaped`.
+    //
+    // SAFETY: `rt` is the live driver-owned runtime block and its `machine` pointer points
+    // at the driver's live `Machine`; no native code is running yet and the driver holds no
+    // `&mut` alias of it.
+    unsafe {
+        let machine = &mut *(*rt).machine;
+        match compiled.native_write_extent() {
+            Some(extent) => machine.note_x_dirty(extent),
+            None => machine.mark_regs_escaped(),
+        }
+    }
     // SAFETY: `block_entry` points just past the start of a complete native
     // function emitted by `emit_block` with exactly the `NativeBlock` signature
     // (`extern "C" fn(*mut JitRuntime) -> i64`), inside a buffer sealed
@@ -1172,16 +1208,12 @@ fn drive(
             // block-return round-trip), classified by that word.
             #[cfg(test)]
             counters::record_driver_round_trip(word);
-            // The compiled block just ran, storing straight into `machine.x` (and,
-            // potentially, the FR file) through the raw pointer it holds — writes the
-            // `set_x`/`set_fr` high-water marks cannot observe. Declare the register
-            // files escaped so the next `Machine::reset` refills them in full instead of
-            // trusting the marks (a stale register would be a wrong result).
-            //
-            // SAFETY: `machine_ptr` points at the live driver-owned `Machine`; the
-            // block has returned, so no native code is running and no `&mut` of it is
-            // outstanding.
-            unsafe { (*machine_ptr).mark_regs_escaped() };
+            // The register-file extent the block may have written was already declared by
+            // the entry path, *before* the block ran (`enter_compiled_cached`) — which is
+            // where it has to happen, because a helper the block calls in mid-body reads
+            // the register files through `Machine::with_roots`. Nothing is (and must not
+            // be) re-declared here: a second, wider note after the fact would undo the
+            // narrowing this figure exists for.
             if word == HALT {
                 // SAFETY: `machine_ptr` points at the live driver-owned `Machine`;
                 // no native code is running here.

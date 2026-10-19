@@ -1873,6 +1873,13 @@ fn the_block_spills_its_cached_registers_before_a_helper_call() {
     assert_eq!(ctx.lives, vec![4], "the instruction's own live count");
     assert_eq!(ctx.needs, vec![8], "the instruction's own heap need");
     let spilled = &ctx.x_slices[0];
+    assert_eq!(
+        spilled.len(),
+        4,
+        "the hand-off is the artifact's own x write extent (x0..x3), reported before the \
+         block ran — without that report the block's native stores are invisible to the \
+         `set_x` mark and the host would be handed an empty slice"
+    );
     for (register, value) in [(0usize, 11i64), (1, 22), (2, 33), (3, 44)] {
         assert_eq!(
             spilled[register],
@@ -1881,6 +1888,127 @@ fn the_block_spills_its_cached_registers_before_a_helper_call() {
              block must have spilled its resident"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// the native register-write extent bounds the next reset
+// ---------------------------------------------------------------------------
+
+/// A compiled block stores straight into `machine.x` through the pointer it holds, which the
+/// `set_x` high-water mark cannot observe. The artifact's own extent does: the driver declares
+/// one past the highest x slot any compiled block of it touches
+/// ([`CompiledModule::native_write_extent`]) **before** entering the block, so the next
+/// [`Machine::reset`] refills exactly that region instead of both 1024-word files — and a deep
+/// native write is still wiped, which is the half that must never regress (a stale register is
+/// a wrong result).
+#[test]
+fn a_deep_native_write_is_refilled_by_the_artifact_extent_not_the_whole_file() {
+    let deep = 900u32;
+    let module = build_module(
+        "native_extent",
+        &[],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Move {
+                    src: Operand::Integer(7),
+                    dst: Operand::X(deep),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+
+    let compiled = compile_module(&module).expect("compile the module");
+    assert_eq!(
+        compiled.native_write_extent(),
+        Some(deep + 1),
+        "the artifact bounds every x slot its generated code can write (the move is \
+         lowered natively, not deopted)"
+    );
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let outcome = run_compiled_outcome(&compiled, &mut machine, &module, name, 0, &[], &mut ctx)
+        .expect("the natively compiled run returns");
+    assert_eq!(outcome, RunOutcome::Returned(NIL));
+    assert_eq!(
+        machine.x(deep),
+        Some(make_small(7)),
+        "the block wrote the deep register natively"
+    );
+
+    machine.reset();
+    assert_eq!(
+        machine.x(deep),
+        Some(NIL),
+        "a deep native write must not survive the reset"
+    );
+    assert!(machine.x.iter().all(|slot| *slot == NIL));
+    assert!(
+        machine.fr.iter().all(|slot| *slot == NIL),
+        "nothing generated writes the FR file, so no FR slot is dirty"
+    );
+    assert_eq!(
+        machine.refilled_words(),
+        deep + 1,
+        "the refill is the artifact's x extent (and no FR word), not the 2048 words of \
+         the two files"
+    );
+}
+
+/// The FR half of the same contract: generated code never stores into the FR file (`rbx` is
+/// the `machine.x` base; `emit/move.rs` refuses an `Operand::FloatReg` destination), so the
+/// driver notes no FR extent and an FR slot is covered by the `set_fr` high-water mark alone —
+/// including on a native run.
+#[test]
+fn a_native_run_notes_no_fr_extent_and_an_fr_write_is_still_refilled() {
+    let module = build_module(
+        "native_fr_extent",
+        &[],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Move {
+                    src: Operand::Integer(3),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+    let compiled = compile_module(&module).expect("compile the module");
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    run_compiled_outcome(&compiled, &mut machine, &module, name, 0, &[], &mut ctx)
+        .expect("the natively compiled run returns");
+    assert_eq!(
+        machine.fr_mark(),
+        0,
+        "the native run leaves no live FR slot: nothing generated writes the FR file, so \
+         the driver declares no FR extent"
+    );
+    // An FR slot can still be written — by the `set_fr` seam, whose own mark covers it.
+    machine.set_fr(40, make_small(9)).unwrap();
+    machine.reset();
+    assert_eq!(machine.get_fr(40), Some(NIL));
+    assert_eq!(
+        machine.refilled_words(),
+        1 + 41,
+        "one x word (x0, the artifact's extent) plus the FR prefix the `set_fr` mark names \
+         (fr40) — no whole-file fill, and no FR extent declared by the native path"
+    );
 }
 
 // ---------------------------------------------------------------------------

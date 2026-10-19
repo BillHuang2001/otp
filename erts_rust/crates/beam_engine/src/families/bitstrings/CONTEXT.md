@@ -404,14 +404,6 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   this node is currently unreachable from `src/jit/**` — a tier that wants a per-command entry
   (`matching::exec`, `matching::commands::run_commands`, `create::assemble`) needs
   `pub(crate) mod families` (or targeted root re-exports) first.
-- **`src/interpreter/dispatch.rs:353-362` — `Instr::SelectVal` materializes every pair operand.** It
-  calls `read_operand` per pair (`Operand::Integer`/`Operand::Character` →
-  `terms::number::make_integer_unrooted`, `src/operand.rs:69,75`) and then a full `beam_term::cmp` per
-  pair, so a character-table `select_val` (what a per-character case/`select_val` compiles to) pays an
-  O(pairs) term-materialization + atom-namespace comparison per execution; the small-integer scrutinee
-  could be compared against a small/literal candidate directly.
-  Parent-owned; the measured contributor to this profile's `make_integer_unrooted` 2.61 % and
-  `cmp_impl` 2.92 %.
 - **`terms::number::make_integer_unrooted` at 2.61 % is CALL overhead, not allocation** — its
   small-value arm is `make_small` (no allocation), but the function is not inlined at its
   `src/operand.rs` call sites. **OWNER: the parent `src/` node.**

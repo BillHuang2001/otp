@@ -448,7 +448,10 @@ mod tests {
 
     #[test]
     fn ensure_heap_forwards_the_root_set() {
-        struct Probe(usize);
+        // The narrow door receives the machine's **used** x prefix, not the whole file: the
+        // slots at or beyond it are `NIL` by the refill invariant, so they hold no term and
+        // are not roots. `live` is still forwarded as the caller's hint.
+        struct Probe(usize, usize);
         impl ExecutionContext for Probe {
             fn call_bif(&mut self, _m: &str, _f: &str, _a: u32, _args: &[Eterm]) -> Result<Eterm> {
                 Err(beam_common::BeamError::BadArg)
@@ -461,24 +464,34 @@ mod tests {
                 stack: &mut [Eterm],
             ) -> Result<()> {
                 self.0 = live as usize + x_regs.len() + stack.len();
+                self.1 = x_regs.len();
                 Ok(())
             }
         }
         let mut machine = Machine::with_max_register(8);
+        // x(2) is the deepest written register, so the used prefix is three slots — of an
+        // eight-slot file.
+        machine.set_x(2, Eterm::from_raw(0x77)).unwrap();
         machine.push_frame(2).unwrap();
-        let mut ctx = Probe(0);
+        let mut ctx = Probe(0, 0);
         machine.ensure_heap(16, 3, &mut ctx).unwrap();
-        assert_eq!(ctx.0, 3 + 8 + 2);
+        assert_eq!(
+            ctx.1, 3,
+            "the handed x slice is the used prefix (x2 written), not the whole 8-word file"
+        );
+        assert_eq!(ctx.0, 3 + 3 + 2, "live + the used x prefix + the whole stack");
     }
 
     #[test]
-    fn ensure_heap_hands_over_the_fr_file_at_the_full_root_door() {
-        // The full-root door carries the FR file (which the narrow `ensure_heap`
-        // cannot): a context that overrides it sees the whole FR file, and a write
-        // through `roots.fr` lands back in the machine. The narrow method must never
-        // be reached, or the FR file would be lost.
+    fn ensure_heap_hands_over_the_live_fr_prefix_at_the_full_root_door() {
+        // The full-root door carries the FR file (which the narrow `ensure_heap` cannot): a
+        // context that overrides it sees the FR **live prefix** — every FR slot a write seam
+        // has stored into, which is the root set — and a write through `roots.fr` lands back
+        // in the machine. The narrow method must never be reached, or the FR file would be
+        // lost.
         struct FrProbe {
             fr_len: usize,
+            reached_beyond: bool,
             saw_fr: bool,
         }
         impl ExecutionContext for FrProbe {
@@ -500,6 +513,7 @@ mod tests {
                 roots: crate::context::RootSet<'_>,
             ) -> Result<()> {
                 self.fr_len = roots.fr.len();
+                self.reached_beyond = roots.fr.get_mut(roots.fr.len()).is_some();
                 if let Some(slot) = roots.fr.get_mut(1) {
                     *slot = Eterm::from_raw(0xFEED);
                 }
@@ -511,18 +525,26 @@ mod tests {
         machine.set_fr(1, Eterm::from_raw(0x0001)).unwrap();
         let mut ctx = FrProbe {
             fr_len: 0,
+            reached_beyond: true,
             saw_fr: false,
         };
         machine.ensure_heap(16, 3, &mut ctx).unwrap();
         assert!(ctx.saw_fr, "the full-root door was used");
-        assert_eq!(ctx.fr_len, crate::machine::MAX_FLOAT_REGISTER as usize);
+        assert_eq!(
+            ctx.fr_len, 2,
+            "the handed FR slice is the live prefix (fr1 written), not all 1024 slots"
+        );        assert!(
+            !ctx.reached_beyond,
+            "the FR slice stops at the live prefix — a host cannot reach past it"
+        );
         assert_eq!(
             machine.get_fr(1),
             Some(Eterm::from_raw(0xFEED)),
             "a write through the FR root landed back in the machine"
         );
+        // The narrowing is confined to the hand-off: the FR file itself is whole.
+        assert_eq!(machine.fr.len(), crate::machine::MAX_FLOAT_REGISTER as usize);
     }
-
     #[test]
     fn resumption_addresses_walk_the_callers_innermost_first() {
         let mut machine = Machine::new();

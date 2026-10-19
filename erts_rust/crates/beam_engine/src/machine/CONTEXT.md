@@ -32,10 +32,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`; `x_mut`/`fr_mut` as
   the single-view root-set accessors); `fr_mark()` — the **live leading FR-slot count** (the FR high-water
   mark, `0` ⇒ no live FR slot), the FR twin of the `x[0..live)` root-set bound, so a host can publish/scan
-  only the slots an FR write actually touched (exact after the ordinary interpret seams; a native JIT block
-  or a caller that took a raw `fr_mut`/`with_roots` slice sets the crate-internal `regs_escaped` flag and may
-  understate it — the caller must account for that itself); `Machine::reset` clears the raise snapshot
-  alongside the module contexts (both belong to the run that is starting) **and clears all four raise
+  only the slots an FR write actually touched. The refill bound is the **used extent** of each file:
+  `used_extent(len, mark, dirty)` = `max(mark, dirty)` clamped to the file length, where the mark is raised
+  by `set_x`/`set_fr` and the *dirty* extent by every writer that cannot report slots — `x_mut`/`fr_mut`
+  (the whole file), `with_roots` (the prefix it hands over) and the native driver (the artifact's own
+  `CompiledModule::native_write_extent`, noted **before** the block runs). Every slot at or beyond the extent
+  is `NIL` by the refill invariant, which is what makes the narrow root hand-off sound by construction
+  rather than by host promise. `Machine::reset` clears the raise snapshot  alongside the module contexts (both belong to the run that is starting) **and clears all four raise
   latches** (`pending_function_clause_args`/`raise_function_clause_args`/`pending_supplied_trace`/
   `raise_supplied_trace`).
 - `mod.rs` — the four raise latches. The failed-clause pair:
