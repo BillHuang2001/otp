@@ -23,11 +23,60 @@
 //! returns: [`Deflate::deflate`] is one `deflate()` pump step and
 //! [`Deflate::compress_with`] is the one-shot `Z_FINISH` form.
 //!
-//! not-implemented: the port lands here.
+//! ```text
+//! deflateInit2(Z,Level,Method,WindowBits,MemLevel,Strat)   Deflate::new(DeflateConfig::new(..))
+//! deflate(Z, In, Flush)                                    Deflate::deflate(in, out, flush)
+//! deflateParams(Z, Level, Strat)                           Deflate::set_params(level, strat, out)
+//! deflateSetDictionary(Z, Dict)                            Deflate::set_dictionary(dict)
+//! deflateSetHeader(Z, Head)                                Deflate::set_header(head)
+//! deflateReset(Z)                                          Deflate::reset()
+//! ```
+//!
+//! # Shape
+//!
+//! The module is split the way the C is, so the two can be read side by side:
+//!
+//! | module | C |
+//! |---|---|
+//! | [`state`] | `deflate.h`'s `deflate_state`, `configuration_table`, `lm_init` |
+//! | [`window`] | `read_buf`/`fill_window` and the `next_in`/`next_out` cursors |
+//! | [`tables`] | `trees.h`'s static trees and length/distance tables |
+//! | [`trees`] | `trees.c` — the bit writer, Huffman construction, block emission |
+//! | [`lz77`] | `longest_match` and the five `block_state` strategy functions |
+//! | [`driver`] | `deflate()` itself, `flush_pending`, the zlib/gzip headers and trailers |
+//!
+//! # What is exact
+//!
+//! Every parameter combination `deflateInit2` accepts is accepted here and produces the
+//! C's bytes: levels `0..=9` (and `-1` for 6) against every strategy, `windowBits`
+//! `8..=15` (zlib), `-15..=-8` (raw) and `16 + 8 ..= 16 + 15` (gzip), and `memLevel`
+//! `1..=9`. A rejected combination is [`beam_common::BeamError::BadArg`] — the C's
+//! `Z_STREAM_ERROR` from `deflateInit2_` — and never a merely-conforming stream.
 
 use beam_common::{BeamError, Result};
 
-use crate::{Flush, Method, Pump, Strategy, DEFAULT_COMPRESSION, DEFAULT_MEM_LEVEL, MAX_WBITS};
+use crate::checksum::adler32;
+use crate::{Flush, Method, Pump, Status, Strategy, DEFAULT_COMPRESSION, DEFAULT_MEM_LEVEL, MAX_WBITS};
+
+mod driver;
+mod lz77;
+mod state;
+mod tables;
+mod trees;
+mod window;
+
+use state::{DeflateState, INIT_STATE, MIN_MATCH, Z_DEFAULT_STRATEGY};
+use window::Io;
+
+/// `MAX_MEM_LEVEL` (`zconf.h:277`) — the largest `memLevel` `deflateInit2` accepts.
+const MAX_MEM_LEVEL: i32 = 9;
+/// `deflateInit2_`'s 8 → 9 window bump: `if (windowBits == 8) windowBits = 9;  /* until
+/// 256-byte window bug fixed */`.
+const MIN_DEFLATE_WBITS: i32 = 9;
+/// The chunk size [`Deflate::compress_with`] hands each pump step. Any size works — the
+/// loop simply repeats — but a power of two keeps the allocations uniform and the number
+/// of steps small.
+const ONESHOT_CHUNK: usize = 32 * 1024;
 
 /// `deflateInit2`'s argument tuple.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -103,59 +152,306 @@ impl DeflateConfig {
     }
 }
 
+/// A user-supplied gzip member header — `gz_header` (`zlib.h:1720`) as `deflateSetHeader`
+/// takes it.
+///
+/// Only meaningful for a gzip-framed stream (`windowBits` `16 + 8 ..= 16 + 15`); setting
+/// it on a zlib or raw stream is rejected by [`Deflate::set_header`], exactly as
+/// `deflateSetHeader` refuses a `deflate_state` whose `wrap` is not 2.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct GzHeader {
+    /// `text` — set the header's "text" flag, which tells the decoder the content is
+    /// probably ASCII.
+    pub text: bool,
+    /// `hcrc` — also emit a CRC-16 of the header itself (`FHCRC`).
+    pub hcrc: bool,
+    /// `time` — the modification time, in seconds since the Unix epoch (0 means "no
+    /// timestamp available").
+    pub time: u32,
+    /// `os` — the operating-system byte. The C writes `gzhead->os` here; without a header
+    /// it writes `OS_CODE` (3 on Unix).
+    pub os: u8,
+    /// `extra` — the `FEXTRA` payload, emitted with its own 16-bit length prefix.
+    pub extra: Option<Vec<u8>>,
+    /// `name` — the original file name (`FNAME`). The C expects a NUL-terminated C
+    /// string; this port stores the bytes **without** the terminator and appends it.
+    pub name: Option<Vec<u8>>,
+    /// `comment` — the `FCOMMENT` payload, same terminator convention as [`Self::name`].
+    pub comment: Option<Vec<u8>>,
+}
+
+impl GzHeader {
+    /// A header carrying only an `mtime` — the common case.
+    pub fn with_time(time: u32) -> Self {
+        GzHeader {
+            time,
+            ..GzHeader::default()
+        }
+    }
+}
+
 /// A `deflate` stream (`z_stream` in the `INIT`/`BUSY`/`FINISH` state machine).
 pub struct Deflate {
     config: DeflateConfig,
+    state: DeflateState,
 }
 
 impl Deflate {
     /// `deflateInit2_` — allocate the window, hash chains and symbol buffer.
+    ///
+    /// Parameter validation and normalization are `deflateInit2_`'s line for line:
+    /// `-1` becomes 6, a negative `windowBits` selects wrap 0 (raw) and is negated, an
+    /// over-15 one selects wrap 2 (gzip) and has 16 subtracted, then the C's combined
+    /// range test runs, and finally `windowBits == 8` is bumped to 9 (the window is
+    /// *two* 2^bits areas, so 8 would leave no room for the lookahead).
     pub fn new(config: DeflateConfig) -> Result<Deflate> {
-        Err(BeamError::BadArg).map(|()| Deflate { config })
+        let mut level = i32::from(config.level);
+        if level == DEFAULT_COMPRESSION as i32 {
+            level = 6;
+        }
+        let mut window_bits = i32::from(config.window_bits);
+        let wrap;
+        if window_bits < 0 {
+            // suppress the zlib wrapper
+            wrap = 0;
+            if window_bits < -15 {
+                return Err(BeamError::BadArg);
+            }
+            window_bits = -window_bits;
+        } else if window_bits > 15 {
+            wrap = 2; // write a gzip wrapper instead
+            window_bits -= 16;
+        } else {
+            wrap = 1;
+        }
+        let mem_level = i32::from(config.mem_level);
+        if !(1..=MAX_MEM_LEVEL).contains(&mem_level)
+            || !(8..=15).contains(&window_bits)
+            || !(0..=9).contains(&level)
+            || (window_bits == 8 && wrap != 1)
+        {
+            return Err(BeamError::BadArg);
+        }
+        let w_bits = if window_bits == 8 {
+            MIN_DEFLATE_WBITS as u32
+        } else {
+            window_bits as u32
+        };
+        Ok(Deflate {
+            config,
+            state: DeflateState::new(
+                level,
+                config.strategy.code(),
+                wrap,
+                w_bits,
+                mem_level as u32,
+            ),
+        })
     }
 
     /// One-shot `deflateInit` + `deflate(Z_FINISH)` + `deflateEnd`: the whole stream.
+    ///
+    /// Byte-identical to the C's `compress2` for the same parameters — which is the
+    /// strongest single test of the streaming core, since `compress2` *is* this loop.
     pub fn compress_with(config: DeflateConfig, input: &[u8]) -> Result<Vec<u8>> {
         let mut stream = Deflate::new(config)?;
-        let mut out = vec![0u8; input.len() / 2 + 1024];
-        let pump = stream.deflate(input, &mut out, Flush::Finish)?;
-        let _ = pump;
-        Ok(out)
+        let mut out = Vec::new();
+        let mut chunk = vec![0u8; ONESHOT_CHUNK];
+        let mut consumed = 0usize;
+        loop {
+            let pump = stream.deflate(&input[consumed..], &mut chunk, Flush::Finish)?;
+            out.extend_from_slice(&chunk[..pump.produced]);
+            consumed += pump.consumed;
+            match pump.status {
+                Status::StreamEnd => return Ok(out),
+                // `Z_OK` is the only other outcome a `Z_FINISH` pump loop can see: the
+                // stream is not finished yet because the output chunk filled up. Anything
+                // else cannot happen for a stream this module created, and is a
+                // configuration rejection rather than a mere "close enough" stream.
+                Status::Ok => {}
+                _ => return Err(BeamError::BadArg),
+            }
+        }
     }
 
     /// One `deflate()` pump step: consume at most `input.len()` bytes, write at most
     /// `output.len()` bytes, and report zlib's return code with both counts.
-    pub fn deflate(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        flush: Flush,
-    ) -> Result<Pump> {
-        let _ = (input, output, flush);
-        Err(BeamError::BadArg)
+    ///
+    /// `Pump::consumed`/`Pump::produced` are the C's `avail_in`/`avail_out` deltas, so a
+    /// caller that mirrors `zlib:deflate/3` (feed a chunk, take what comes back) sees the
+    /// same chunking the oracle does.
+    pub fn deflate(&mut self, input: &[u8], output: &mut [u8], flush: Flush) -> Result<Pump> {
+        let mut io = Io::new(input, output);
+        let status = self.state.deflate_step(&mut io, flush);
+        Ok(Pump {
+            status,
+            consumed: io.in_pos,
+            produced: io.out_pos,
+        })
     }
 
     /// `deflateReset` — start a new stream with the same configuration.
     pub fn reset(&mut self) -> Result<()> {
-        Err(BeamError::BadArg)
+        self.state.reset_keep();
+        self.state.lm_init();
+        Ok(())
     }
 
     /// `deflateSetDictionary` — the Adler-32 of the dictionary is returned.
+    ///
+    /// The dictionary becomes the stream's LZ77 history and (for zlib framing) is
+    /// checksummed into `strm->adler`, which the header then carries as the preset
+    /// dictionary id with the `PRESET_DICT` flag set. Called on a gzip stream, on an
+    /// already-started zlib stream, or once the window holds data, it is
+    /// [`beam_common::BeamError::BadArg`] — the C's `Z_STREAM_ERROR`.
     pub fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<u32> {
-        let _ = dictionary;
-        Err(BeamError::BadArg)
+        let s = &mut self.state;
+        let wrap = s.wrap;
+        if wrap == 2 || (wrap == 1 && s.status != INIT_STATE) || s.lookahead != 0 {
+            return Err(BeamError::BadArg);
+        }
+        // With the zlib wrapper, the dictionary's Adler-32 goes into the header.
+        if wrap == 1 {
+            s.adler = adler32(s.adler, dictionary);
+        }
+        s.wrap = 0; // avoid computing Adler-32 in read_buf
+
+        let mut dict = dictionary;
+        if dict.len() >= s.w_size as usize {
+            if wrap == 0 {
+                // already empty otherwise
+                s.clear_hash();
+                s.strstart = 0;
+                s.block_start = 0;
+                s.insert = 0;
+            }
+            dict = &dict[dict.len() - s.w_size as usize..]; // use the tail
+        }
+
+        // Insert the dictionary into the window and the hash chains. The C temporarily
+        // points `next_in` at the dictionary and reuses `fill_window`.
+        let mut scratch: [u8; 0] = [];
+        let mut io = Io::new(dict, &mut scratch);
+        s.fill_window(&mut io);
+        while s.lookahead >= MIN_MATCH {
+            let mut str = s.strstart;
+            let mut n = s.lookahead - (MIN_MATCH - 1);
+            loop {
+                let c = s.window[str as usize + MIN_MATCH as usize - 1];
+                s.update_hash(c);
+                let h = (s.ins_h & s.hash_mask) as usize;
+                let slot = (str & s.w_mask) as usize;
+                s.prev[slot] = s.head[h];
+                s.head[h] = str as u16;
+                str += 1;
+                n -= 1;
+                if n == 0 {
+                    break;
+                }
+            }
+            s.strstart = str;
+            s.lookahead = MIN_MATCH - 1;
+            s.fill_window(&mut io);
+        }
+        s.strstart += s.lookahead;
+        s.block_start = i64::from(s.strstart);
+        s.insert = s.lookahead;
+        s.lookahead = 0;
+        s.match_length = MIN_MATCH - 1;
+        s.prev_length = MIN_MATCH - 1;
+        s.match_available = false;
+        s.wrap = wrap;
+        Ok(s.adler)
+    }
+
+    /// `deflateSetHeader` — attach a [`GzHeader`] to a gzip-framed stream.
+    ///
+    /// [`beam_common::BeamError::BadArg`] unless the stream is gzip-framed (the C's
+    /// `wrap != 2` check).
+    pub fn set_header(&mut self, header: GzHeader) -> Result<()> {
+        if self.state.wrap != 2 {
+            return Err(BeamError::BadArg);
+        }
+        self.state.gzhead = Some(header);
+        Ok(())
     }
 
     /// `deflateParams` — change the level/strategy mid-stream, flushing the current block
     /// into `output` the way the C does.
+    ///
+    /// When the *strategy function* changes (or the strategy itself does) and the stream
+    /// has already been started, the C first runs `deflate(strm, Z_BLOCK)` so the pending
+    /// block is closed with the settings it was built under; if that leaves anything
+    /// unwritten the call reports [`Status::BufError`], and the caller must retry with a
+    /// bigger buffer (the level/strategy change has *not* been applied yet).
+    /// Switching away from level 0 replays the hash-table slides `deflate_stored`
+    /// deferred (`matches`), clearing instead when two or more are owed.
     pub fn set_params(
         &mut self,
         level: i8,
         strategy: Strategy,
         output: &mut [u8],
     ) -> Result<Pump> {
-        let _ = (level, strategy, output);
-        Err(BeamError::BadArg)
+        let mut level_i = i32::from(level);
+        if level_i == DEFAULT_COMPRESSION as i32 {
+            level_i = 6;
+        }
+        if !(0..=9).contains(&level_i) {
+            return Err(BeamError::BadArg);
+        }
+        let strategy_i = strategy.code();
+        let s = &mut self.state;
+        let func = state::CONFIGURATION_TABLE[s.level as usize].func;
+        let mut consumed = 0;
+        let mut produced = 0;
+        let mut status = Status::Ok;
+        if (strategy_i != s.strategy
+            || func != state::CONFIGURATION_TABLE[level_i as usize].func)
+            && s.last_flush != -2
+        {
+            // Flush the last buffer.
+            let mut io = Io::new(&[], output);
+            status = s.deflate_step(&mut io, Flush::Block);
+            consumed = io.in_pos;
+            produced = io.out_pos;
+            if status == Status::StreamError {
+                return Ok(Pump {
+                    status,
+                    consumed,
+                    produced,
+                });
+            }
+            if io.avail_in() != 0
+                || (i64::from(s.strstart) - s.block_start) + i64::from(s.lookahead) != 0
+            {
+                return Ok(Pump {
+                    status: Status::BufError,
+                    consumed,
+                    produced,
+                });
+            }
+        }
+        if s.level != level_i {
+            if s.level == 0 && s.matches != 0 {
+                if s.matches == 1 {
+                    s.slide_hash();
+                } else {
+                    s.clear_hash();
+                }
+                s.matches = 0;
+            }
+            s.level = level_i;
+            s.max_lazy_match = state::CONFIGURATION_TABLE[level_i as usize].max_lazy;
+            s.good_match = state::CONFIGURATION_TABLE[level_i as usize].good_length;
+            s.nice_match = state::CONFIGURATION_TABLE[level_i as usize].nice_length;
+            s.max_chain_length = state::CONFIGURATION_TABLE[level_i as usize].max_chain;
+        }
+        s.strategy = strategy_i;
+        Ok(Pump {
+            status,
+            consumed,
+            produced,
+        })
     }
 
     /// The configuration this stream was created with.
@@ -163,3 +459,7 @@ impl Deflate {
         self.config
     }
 }
+
+/// `Z_DEFAULT_STRATEGY` is what [`DeflateConfig::default`] selects; pinned here so a
+/// change to [`Strategy`]'s discriminants fails to build.
+const _: () = assert!(Z_DEFAULT_STRATEGY == 0);
