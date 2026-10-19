@@ -2451,6 +2451,12 @@ mod active;
 mod active_tests;
 #[cfg(test)]
 mod accept_tests;
+// The **passive** half of the read-error delivery: a queued `TCP_REQ_RECV` completed by the
+// peer's reset (the failing errno) or by its clean close (`closed`) — the
+// `drain_error_all`-vs-`drain_closed` split `async.rs` makes.
+#[cfg(test)]
+#[path = "async_error_tests.rs"]
+mod async_error_tests;
 #[cfg(test)]
 #[path = "close_tests.rs"]
 mod close_tests;
