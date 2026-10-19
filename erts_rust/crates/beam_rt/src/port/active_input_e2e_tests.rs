@@ -62,13 +62,16 @@
 //! # The `note_inet_setopts` calls below (redundant on a wired runtime)
 //!
 //! [`PortRegistry::port_control`](crate::port::PortRegistry) is where a real `setopts` becomes part
-//! of the mode mirror: `src/port.rs:1459` calls
+//! of the mode mirror: `src/port.rs:1843` calls
 //! [`PortRegistry::note_inet_setopts`](crate::port::PortRegistry) after the completion drain, gated
 //! on `inet_opts::is_setopts_control(op)` and `setopts_succeeded(reply)`. That hook is live, so the
 //! explicit call each `setopts` below is followed by is a redundant stand-in rather than a
 //! substitute: it passes the reply's own success tag from the same reply, exactly as the hook does
 //! (the pattern `accept_inherit_tests.rs` established), and the suite's helpers detect the hook by
-//! reading the recorded count across the control call so they never double-record.
+//! reading the port's latch count across the control call so they never double-record. A record
+//! naming none of the three latched codes (`{packet, 2}`, `{header, 2}`) moves no latch, so the
+//! stand-in re-applies the same argument — harmless, because each latch is last-value-wins over
+//! those same bytes.
 //!
 //! # The oracle, measured (OTP 29.1.1 / erts-17.1)
 //!
@@ -393,11 +396,11 @@ impl Session {
     }
 
     /// Applies a `setopts` record list through the numeric request and mirrors the reply into the
-    /// port's option table.
+    /// port's option latches.
     ///
     /// The mirror is fed by production code once `src/port.rs::PortRegistry::port_control` calls
     /// `note_inet_setopts` on the driver's own reply; until then it is fed here. The stand-in
-    /// detects the hook (the recorded count is read across the control call) so it becomes a no-op
+    /// detects the hook (the latch count is read across the control call) so it becomes a no-op
     /// the day the hook lands, instead of double-recording. Returns the driver's reply.
     fn setopts(&mut self, arg: &[u8]) -> Vec<u8> {
         let port = self.port;
@@ -410,15 +413,25 @@ impl Session {
         reply
     }
 
-    /// How many `setopts` records the port's mirror holds — the hook-detection witness
+    /// How many of the port's three inet latches are set — the hook-detection witness
     /// [`Session::setopts`] reads across the control call.
+    ///
+    /// The mirror keeps three latches (`{mode, …}`, `{active, …}`, `{exit_on_close, …}`) and no
+    /// record list (`src/port/inet_opts.rs`), so a `setopts` naming none of those three — this
+    /// suite's `{packet, 2}` and `{header, 2}` rows — leaves the witness unmoved and the stand-in
+    /// makes its call again. That cannot move a latch: the production hook has already recorded the
+    /// same argument, and each latch is last-value-wins over the very same bytes.
     fn recorded(&self) -> usize {
         let port = self.port;
         self.rt
             .ports
             .borrow()
             .inet_options(port)
-            .map_or(0, |options| options.records().len())
+            .map_or(0, |options| {
+                usize::from(options.mode().is_some())
+                    + usize::from(options.active_mode().is_some())
+                    + usize::from(options.exit_on_close().is_some())
+            })
     }
 
     /// One pump round followed by a reading of the provider's pending lane — the two steps a
