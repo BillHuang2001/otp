@@ -17,7 +17,7 @@ All bytes come from [`beam_deflate`](../beam_deflate) — the sibling crate the 
 ## The 19 keys, one contract each
 - `open_nif/0` — mint a handle (an internal `Ref` thing, `is_reference/1` true) for a fresh stream owned by the caller: `ST_NONE`, the `cut` eos behaviour, an empty queue, no stash.
 - `close_nif/1` — `ok`; drops the codec, the queue and the stash and latches `Closed` (the registry entry stays as a tombstone, so a second `close` is `not_initialized`).
-- `set_controller_nif/2` — `ok`; the caller must be the current controller and the new pid must be **local** (a non-pid or an external pid is `badarg`); no "inside a call" check in this OTP version.
+- `set_controller_nif/2` — `ok`; the caller must be the current controller and the new pid must be **local** (a non-pid or an external pid is `badarg`); no "inside a call" check in this OTP version and **no state precondition** either, so a closed stream is `ok` too (as on the oracle).
 - `deflateInit_nif/6` `(Z, Level, Method, WindowBits, MemLevel, Strategy)` — `ok`; the atoms are already integers (the wrappers did that); `method ≠ 8`, an unrepresentable level/`windowBits`/`memLevel` or a strategy past `4` is `deflateInit2`'s `stream_error`, and a second init without an end is `already_initialized`.
 - `deflateSetDictionary_nif/2` — the Adler-32 as an integer; a **raw** stream answers `beam_deflate::adler32(0, &bytes)` (zlib does not update `adler` in raw mode), and a **repeated** call succeeds.
 - `deflateReset_nif/1` — `ok`; `Deflate::reset` plus `zlib_reset_input` (queue and stash dropped, the `started`/`finished` mirrors cleared), so a finished stream is usable again.
@@ -42,7 +42,7 @@ All bytes come from [`beam_deflate`](../beam_deflate) — the sibling crate the 
 - Input is a `VecDeque<Vec<u8>>` with one piece per iovec segment (what `enqueue_nif` pushes and the pump drains).
 - The stash is a serialized ETF image (`[131][body]`, `Vec<u8>`), never a raw `Eterm`, so it survives a collection and a heap change; decode goes into a clone of the shared `AtomTable` and commits the names the decoder appended, the way `binconv::decode_term_bif` does it.
 - Every entry point runs the same prologue (`with_stream`), in the C's order: decode the handle (`badarg`), look it up (`not_initialized`), check `stream.controller == caller` (`not_on_controlling_process`), then the key's `Requires` state check.
-- `Requires::{Init, Deflate, Inflate, Open}` are the state preconditions; `Requires::Closable` is the catch-all "anything but `Closed`" for the keys the C gives no state check.
+- `Requires::{Init, Deflate, Inflate, Open, Closable}` are the C's `d->state` tests (`Closable` is "anything but `Closed`", `close_nif`'s); `Requires::Any` is the four keys the C gives no state check at all (`set_controller_nif` plus the three stash keys).
 
 ## The pump
 `pump` loops while `status == Ok`, input is queued, `consumed < input_chunk_size` and the output buffer has room, feeding `min(front.len(), remaining_input)` to the codec and draining that many bytes from the front piece (dropping the piece when it empties); it then does the C's end-of-input flush — one real-flush call with an empty input — when the queue drained and the output buffer was not filled.
@@ -74,11 +74,11 @@ The live oracle is `tests/zlib_stream.rs`: the **live-oracle gate for the stream
 `tests/zlib_oracle.rs` is that gate for the six one-shots; the counts live in the run, never in this prose.
 
 ## Known Issues
-- **No in-tree consumer yet for `serves_local_call`.** `beam_rt`'s `resolve_local_call` must consult it before a `zlib` local call is entered as code; that wiring is the **parent node's** (this crate may not edit `beam_rt`). Until it lands, a `zlib` local call still reaches its `erlang:nif_error(undef)` stub on the runtime path even though the key is registered for a host that dispatches it.
+- **`serves_local_call` has two in-tree consumers in `beam_rt`:** the local-call seam (`src/context/execution.rs::resolve_local_call`, so `zlib`'s own `-nifs` keys dispatch as BIFs) **and** the `make_fun3` closure indirection (`src/context/apply.rs::served_local_key`) — `zlib.erl` stores the stub fun in a `#zlib_opts{}` record, so `deflate/3`/`inflate/3`/`safeInflate/2` reach their stub through a named local fun, not a local call. `beam_rt`'s four `zlib_*` suites (**29** oracle-cross-checked tests: guards, one-shots, stream-dictionary, stream-levels) cover the stream route end to end.
 - No `tools/differential` case and no `tools/bench` entry covers the 19 stream keys (the corpus is the sibling `../../tools/differential/`); the six one-shots keep their oracle suite.
 - `close_nif` sets `State::Closed` but never removes the registry entry, so closed streams are tombstones (bounded, never reclaimed); there is likewise no process-exit observer, so a dead controller's streams stay in the registry unreachable.
 - `Z_ERRNO`/`Z_VERSION_ERROR` are unmodelled — `beam_deflate` never reports them, so the C's errno/version arms are absent; a `Status::NeedDict` reaching `zlib_return` lands on the C's `default:` arm (`unknown_error`), which the pump's own `NeedDict` classification makes unreachable.
-- `Requires::Closable` stands in for the C's "no state precondition" keys, so an ill-timed call answers `not_initialized` rather than whatever the C's `ASSERT`-guarded path would have done.
+- **Four keys carry no state precondition** (`Requires::Any`): `set_controller_nif` and the three stash keys, as in the C (`zlib_nif.c:473-522`, `:583-602`). Everything else raises `not_initialized`/`already_initialized` exactly where the C's `d->state` test does.
 
 ## Routing Table
 - `mod.rs` → the whole-surface module doc, submodule wiring, `register()`, `serves_local_call`, the module suite

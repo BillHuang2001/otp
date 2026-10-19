@@ -451,6 +451,18 @@ fn adler32_matches_the_oracle() {
         458_872,
         "adler32(4286578688,<<\"x\">>)",
     );
+    // The same fast path folds each sum with a **single** conditional subtract, so a
+    // non-canonical accumulator whose `sum2` then lands past `BASE` is *not* reduced
+    // modulo `BASE`: the packed high half here is 65534, and a modulo fold would answer
+    // `917488` instead.
+    // ORACLE: erlang:adler32(4294967025, <<255>>) -> 4294901744
+    let high_sum2 = make_small(4_294_967_025);
+    let one_ff = fx.binary(&[255]);
+    assert_int(
+        fx.ok("adler32", &[high_sum2, one_ff]),
+        4_294_901_744,
+        "adler32(4294967025,<<255>>)",
+    );
 
     // A 20-byte payload uses the 16-byte block path.
     let all_ones = make_small(i64::from(u32::MAX));
@@ -541,6 +553,21 @@ fn adler32_combine_matches_the_oracle() {
     );
     // OTP's own `len2 == 0` workaround returns `A1` unchanged.
     assert_int(combine(&mut fx, 0), a1, "adler32_combine(A1,A2,0) = A1");
+    // A non-canonical pair pushes the packed `sum1` past 16 bits, and zlib packs with
+    // `sum1 | (sum2 << 16)` — unmasked — so the answer is `6094860`, not the `6029324` a
+    // masked packing would give.
+    // ORACLE: erlang:adler32_combine(4294901759, 4294967295, 5) -> 6094860
+    let a1_noncanonical = make_small(4_294_901_759);
+    let a2_all_ones = make_small(i64::from(u32::MAX));
+    let five = make_small(5);
+    assert_int(
+        fx.ok(
+            "adler32_combine",
+            &[a1_noncanonical, a2_all_ones, five],
+        ),
+        6_094_860,
+        "adler32_combine(4294901759,4294967295,5)",
+    );
 }
 
 #[test]

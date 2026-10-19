@@ -40,14 +40,14 @@
 //! process's `zlib:deflate/3` is `not_on_controlling_process` raised *here*, and a
 //! foreign `zlib:deflateParams/3` reaches here too (via its own `deflate/3`).
 //!
-//! # `Requires::Closable` is "the process check, plus not closed"
+//! # The four keys with no state precondition
 //!
 //! The C imposes **no** state precondition on `set_controller_nif`,
-//! `getStash_nif`/`setStash_nif`/`clearStash_nif` (`zlib_nif.c:583-602`, `:473-522`),
-//! so `Requires::Closable` (anything but `Closed`) is the closest the draft's enum
-//! offers. `zlib.erl` never touches a closed stream's stash or controller, so the
-//! difference is unobservable through the module; the [tombstone](super::State)
-//! is what keeps a second `close` a `not_initialized`.
+//! `getStash_nif`/`setStash_nif`/`clearStash_nif` (`zlib_nif.c:583-602`, `:473-522`), so
+//! all four take [`Requires::Any`]: a closed (or not-yet-initialized) stream answers
+//! exactly as a live one, which is observable through `zlib:set_controlling_process/2`
+//! (it is `ok` on a closed stream on the oracle too). The [tombstone](super::State) is
+//! what keeps a second `close` a `not_initialized`.
 
 use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
@@ -80,10 +80,11 @@ fn close_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// The pid is decoded before the prologue, as the C's `enif_get_local_pid` is part
 /// of its single `badarg` condition: a non-pid *or* an external pid is `badarg`.
-/// There is no "inside a call" check in this OTP version.
+/// There is no "inside a call" check in this OTP version, and **no** state
+/// precondition either (`zlib_nif.c:583-602`), so a closed stream is `ok` too.
 fn set_controller_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let new_owner = ProcessId::from_eterm(args[1])?;
-    with_stream(ctx, args[0], Requires::Closable, |stream, ctx| {
+    with_stream(ctx, args[0], Requires::Any, |stream, ctx| {
         stream.controller = new_owner;
         ctx.intern_atom("ok")
     })
@@ -166,7 +167,7 @@ fn decode_stash(ctx: &mut BifContext<'_>, image: &[u8]) -> Result<Eterm> {
 
 /// `getStash_nif/1` — `empty`, or `{ok, Term}` with the stashed term copied out.
 fn get_stash_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    with_stream(ctx, args[0], Requires::Closable, |stream, ctx| {
+    with_stream(ctx, args[0], Requires::Any, |stream, ctx| {
         match stream.stash.clone() {
             None => ctx.intern_atom("empty"),
             Some(image) => {
@@ -180,7 +181,7 @@ fn get_stash_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `setStash_nif/2` — store the term; a **second** stash is the bare atom `error`.
 fn set_stash_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    with_stream(ctx, args[0], Requires::Closable, |stream, ctx| {
+    with_stream(ctx, args[0], Requires::Any, |stream, ctx| {
         if stream.stash.is_some() {
             return Err(raise_atom("error"));
         }
@@ -192,7 +193,7 @@ fn set_stash_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `clearStash_nif/1` — `ok`, or the bare atom `error` when the stash is empty.
 fn clear_stash_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    with_stream(ctx, args[0], Requires::Closable, |stream, ctx| {
+    with_stream(ctx, args[0], Requires::Any, |stream, ctx| {
         if stream.stash.take().is_none() {
             return Err(raise_atom("error"));
         }
@@ -370,5 +371,66 @@ mod tests {
             close_nif(&mut ctx, &[handle]),
             "not_on_controlling_process",
         );
+    }
+
+    /// The four [`Requires::Any`] keys impose **no** state precondition
+    /// (`zlib_nif.c:473-522`, `:583-602`), so a **closed** stream answers them exactly
+    /// as a live one: `set_controlling_process/2` is `ok` on the oracle for a closed
+    /// stream (`zlib_guards:closed_controller/0`), and `close` having emptied the stash
+    /// makes `getStash_nif` `empty` and `clearStash_nif` `error`.
+    #[test]
+    fn a_closed_stream_still_answers_the_precondition_free_keys() {
+        let mut heap = heap();
+        let atoms = atoms();
+        let mut ctx = context(&mut heap, &atoms);
+        let handle = open_nif(&mut ctx, &[]).expect("a handle");
+        let term = ctx.atom("hello").expect("seeded");
+        set_stash_nif(&mut ctx, &[handle, term]).expect("a first stash");
+        close_nif(&mut ctx, &[handle]).expect("close");
+
+        // The stash went with the close (`zlib_internal_close`), so the C's answers are
+        // `empty` / `error` rather than a state raise.
+        assert_eq!(
+            get_stash_nif(&mut ctx, &[handle]).expect("empty"),
+            ctx.atom("empty").expect("seeded")
+        );
+        assert_raise_atom(clear_stash_nif(&mut ctx, &[handle]), "error");
+        // A closed stream still stashes (the C stores it in its own env).
+        assert_eq!(
+            set_stash_nif(&mut ctx, &[handle, term]).expect("still stashes"),
+            ctx.atom("ok").expect("seeded")
+        );
+        assert_eq!(
+            clear_stash_nif(&mut ctx, &[handle]).expect("clears"),
+            ctx.atom("ok").expect("seeded")
+        );
+
+        // The transfer is the observable one: `ok`, and the new owner owns it.
+        let target = ProcessId::new(9, 0).to_eterm();
+        assert_eq!(
+            set_controller_nif(&mut ctx, &[handle, target]).expect("ok on a closed stream"),
+            ctx.atom("ok").expect("seeded")
+        );
+        let mut other_heap = Heap::new(1 << 12).expect("test heap");
+        let mut new_owner = BifContext::new(&mut other_heap, &atoms, ProcessId::new(9, 0));
+        let fetched = get_stash_nif(&mut new_owner, &[handle]).expect("the new owner reaches it");
+        assert_eq!(fetched, ctx.atom("empty").expect("seeded"));
+        // None of that revived the stream: a codec key is still `not_initialized`.
+        assert_raise_atom(
+            enqueue_nif(&mut new_owner, &[handle, beam_term::NIL]),
+            "not_initialized",
+        );
+        // And the old owner is refused, as for any other key.
+        assert_raise_atom(
+            get_stash_nif(&mut ctx, &[handle]),
+            "not_on_controlling_process",
+        );
+        let id = access::ref_thing_id(handle).expect("id");
+        {
+            let guard = super::super::lock_streams();
+            let stream = guard.get(&id).expect("the stream");
+            assert_eq!(stream.state, super::super::State::Closed, "the tombstone stays");
+            assert!(stream.stash.is_none(), "the cleared stash stayed cleared");
+        }
     }
 }
