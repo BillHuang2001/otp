@@ -88,7 +88,7 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
 bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 26 suites, **248
-passing / 0 failing**; the whole `-p beam_io` run is **1139** (888 lib + 248 integration + 3
+passing / 0 failing**; the whole `-p beam_io` run is **1143** (892 lib + 248 integration + 3
 doctests, 2 doctests `ignore`d). Per file:
 
 | Suite | Tests | Suite | Tests |
