@@ -44,10 +44,10 @@ use super::runtime_context::RuntimeContext;
 /// The one classification every `send` route shares — the compiled `Dest ! Msg`
 /// instruction, the `-eval` evaluator's `!` operator and the `erlang:send/2`/`'!'/2`
 /// BIF ([`SendBridge`](super::bridges::SendBridge)) — so the three can never drift.
-/// The distinction is needed because the two *remote* arms must be transmitted through
-/// [`Runtime::dist_send_message_pid`]/[`Runtime::dist_send_reg_send`], which take
-/// `&mut Runtime`, so classifying (`&self`) and transmitting (`&mut self`) are separate
-/// steps.
+/// The distinction is needed because the three *remote* arms must be transmitted through
+/// [`Runtime::dist_send_message_pid`]/[`Runtime::dist_send_reg_send`]/
+/// [`Runtime::dist_send_alias`], which take `&mut Runtime`, so classifying (`&self`) and
+/// transmitting (`&mut self`) are separate steps.
 pub(super) enum SendDestination {
     /// A destination on **this** node: the internal pid term to deliver to, plus the alias
     /// reference to consume once the message has been delivered (`None` for every other
@@ -62,6 +62,33 @@ pub(super) enum SendDestination {
     RemotePid {
         /// The external pid term as it was passed to `send` (it decodes with
         /// [`RemotePid::from_eterm`], which is how this arm was selected).
+        to: Eterm,
+    },
+    /// A **reference alias on another node**: `{DOP_ALIAS_SEND, From, To} -- Msg`
+    /// (`../../erts/emulator/beam/dist.c:2563`).
+    ///
+    /// An alias send is a **distinct wire form**, not a `DOP_SEND`: the C's `remote_send`
+    /// selects it for a reference destination exactly because the receiver must look the
+    /// reference up in *its own* alias table (`handle_altact_msg`) instead of delivering to a
+    /// process, so the control message's `To` is the reference term and the peer decides what
+    /// to do with it. The peer's link must have negotiated `DFLAG_ALIAS` — a link that did not
+    /// is this runtime's typed `distribution: the link to <node> did not negotiate
+    /// DFLAG_ALIAS` error (OTP 29 offers the flag in its default and addable masks but does not
+    /// make it mandatory, so a peer can legitimately establish a link without it).
+    ///
+    /// A reference that names no live alias **on the peer** is the peer's own silent drop: the
+    /// C's receiver consumes the message and reports nothing back (measured on the system
+    /// oracle, OTP 29.1.1 — `erlang:send(Alias, Msg)` to a stale remote alias returns `Msg`
+    /// and delivers nothing). This runtime propagates only what it can observe, the local
+    /// transmission, so that drop is the peer's answer and never a fabricated failure here.
+    ///
+    /// This arm is what makes a **remote `gen` call** answerable at all: `gen:reply/2`
+    /// (`../lib/stdlib/src/gen.erl:549-556`) replies to the alias reference the caller put in
+    /// `From` (`{CallerPid, [alias | MonitorRef]}`), so without it a call whose caller lives
+    /// on another node could never receive its reply.
+    RemoteAlias {
+        /// The external reference term as it was passed to `send` (it decodes with
+        /// [`beam_codec::term::external_ref_parts`], which is how this arm was selected).
         to: Eterm,
     },
     /// A `{Name, Node}` atom pair: `{DOP_REG_SEND, From, Cookie, ToName} -- Msg`.
@@ -82,10 +109,13 @@ pub(super) enum SendDestination {
 /// The C's `send` destination classification (`bif.c:2469-2674`), shared by every send route.
 ///
 /// The order is the C's: an internal pid, a registered name, an alias reference, an external
-/// pid, a port, then a `{Name, Node}` pair — and finally `badarg`. An **external pid is
-/// boxed**, so none of the three local cases can match it, which is why their order relative
-/// to it does not matter; what does matter is that the port and `{Name, Node}` arms come last
-/// (their shapes are boxed too).
+/// pid, an external **reference** (`RemoteAlias`), a port, then a `{Name, Node}` pair — and
+/// finally `badarg`. An **external pid is boxed**, so none of the three local cases can match
+/// it, which is why their order relative to it does not matter; what does matter is that the
+/// port and `{Name, Node}` arms come last (their shapes are boxed too), and that the
+/// external-reference arm comes **after** the live-local-alias one — a reference this runtime
+/// minted as a live alias resolves to its owner locally, and only a reference naming **another**
+/// node is transmitted ([`remote_alias_destination`]).
 ///
 /// `table` is the process table local destinations are resolved against: the scheduler pass's
 /// own table inside a slice, else [`Runtime`]'s own (the same choice
@@ -152,6 +182,13 @@ pub(super) fn classify_send_destination(
         // `DOP_SEND[_SENDER]` control message on the link to that node.
         return Ok(SendDestination::RemotePid { to });
     }
+    if remote_alias_destination(runtime, to) {
+        // An **external reference** naming another node: the C's alias-send arm
+        // (`dist.c:2563`), `{DOP_ALIAS_SEND, From, To} -- Msg`. It must come *after* the
+        // live-local-alias test above (a live alias on **this** node resolves locally and is
+        // never transmitted) and after the external-pid test (an external pid is boxed too).
+        return Ok(SendDestination::RemoteAlias { to });
+    }
     if PortId::from_eterm(to).is_ok() {
         return Err(error::unsupported(
             "erlang:send/2 to a port: the port write path is not wired",
@@ -188,6 +225,45 @@ pub(super) fn classify_send_destination(
     Err(BeamError::BadArg)
 }
 
+/// Whether `to` is a **remote alias** destination: an external **reference** whose node slot
+/// names a node other than this runtime's own.
+///
+/// This is the C's alias-send selection (`../../erts/emulator/beam/dist.c:2563`,
+/// `{DOP_ALIAS_SEND, From, To} -- Msg`), which `remote_send` enters for a reference
+/// destination just as it enters the pid form for a pid. The node is read out of the term
+/// itself ([`beam_codec::term::external_ref_parts`] answers `(node, ids, creation)`), so the
+/// classification needs no id bookkeeping and no link-table lookup — the transmitting side
+/// does that.
+///
+/// Two destinations are deliberately **not** remote aliases, so that the local semantics stay
+/// exactly what the differential corpus pins:
+///
+/// * a reference whose node **is** this runtime's node — the same comparison the
+///   `{Name, Node}` arm makes against [`Runtime::local_node`]. Not a live alias (the
+///   live-local test runs first and would have claimed it), it keeps falling through to the
+///   typed [`BeamError::BadArg`] a local non-alias reference has always been.
+/// * **any** reference on a runtime that is **not** a node ([`Runtime::dist_client`] is
+///   `None`): there is no link table to transmit over, so the destination keeps its existing
+///   answer and a non-distributed runtime's observable behaviour is unchanged.
+///
+/// A term that is not an external reference (every on-heap reference, pid, port or atom)
+/// yields `false`, so the caller's remaining arms are reached unchanged.
+fn remote_alias_destination(runtime: &Runtime, to: Eterm) -> bool {
+    // No node, no link table: keep the existing `badarg` for every reference.
+    if runtime.dist_client().is_none() {
+        return false;
+    }
+    let Ok((node, _ids, _creation)) = beam_codec::term::external_ref_parts(to) else {
+        return false;
+    };
+    // The node slot of a well-formed external reference is an atom; a corrupt one is not
+    // classified here (it falls through to the ordinary `badarg`).
+    if !is_atom(node) {
+        return false;
+    }
+    // A reference naming **this** node is the local rule's business, not the wire's.
+    atom_val(node) != runtime.local_node()
+}
 impl<'a> RuntimeContext<'a> {
     /// The **source** off-heap table a delivery resolves `message`'s refc binaries against.
     ///
@@ -708,6 +784,7 @@ impl<'a> RuntimeContext<'a> {
             // reach the remote arms through [`RuntimeContext::resolve_send_destination`]
             // directly.
             SendDestination::RemotePid { .. }
+            | SendDestination::RemoteAlias { .. }
             | SendDestination::RemoteName { .. }
             | SendDestination::Dropped => Err(BeamError::BadArg),
         }
@@ -732,11 +809,13 @@ impl<'a> RuntimeContext<'a> {
 
     /// Transmits `message` to a **remote** destination (contract A.5, Phase 2).
     ///
-    /// The two remote arms mirror C's `remote_send` (`bif.c:2381-2456`): an external pid goes on
-    /// the link to *its* node as `DOP_SEND[_SENDER]`, a `{Name, Node}` pair as `DOP_REG_SEND`
-    /// addressed to the peer's registered name. This is the same pair of
-    /// [`Runtime::dist_send_message_pid`]/[`Runtime::dist_send_reg_send`] calls the
-    /// `erlang:send/2` BIF route makes, so both routes reach a peer identically.
+    /// The three remote arms mirror C's `remote_send` (`bif.c:2381-2456`): an external pid goes
+    /// on the link to *its* node as `DOP_SEND[_SENDER]`, a `{Name, Node}` pair as
+    /// `DOP_REG_SEND` addressed to the peer's registered name, and an external **reference** as
+    /// `DOP_ALIAS_SEND` (`dist.c:2563`). This is the same trio of
+    /// [`Runtime::dist_send_message_pid`]/[`Runtime::dist_send_reg_send`]/
+    /// [`Runtime::dist_send_alias`] calls the `erlang:send/2` BIF route makes, so both routes
+    /// reach a peer identically.
     ///
     /// `to` is the destination term **verbatim** — it is what the ordinary `send` trace event
     /// carries (the C's `trace_send(p, full_to, msg)`), and the remote transmission is the only
@@ -770,6 +849,9 @@ impl<'a> RuntimeContext<'a> {
             }
             SendDestination::RemoteName { name, node } => {
                 self.runtime.dist_send_reg_send(&node, &name, from, message)?;
+            }
+            SendDestination::RemoteAlias { to: alias } => {
+                self.runtime.dist_send_alias(alias, from, message)?;
             }
             // Accepted and dropped: nothing to deliver and nothing to transmit.
             SendDestination::Dropped => {}
