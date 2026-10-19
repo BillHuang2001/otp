@@ -1120,8 +1120,8 @@ fn drive(
             Some(index) => {
                 // Disjoint field borrows: the artifact comes out of the callee entry and
                 // its cache is a different field of the same entry.
-                let CalleeCode { compiled, cached, .. } = &mut state.callees[index];                match compiled {
-                    // SAFETY: `active_module` points at the live active module (see the
+                let CalleeCode { compiled, cached, .. } = &mut state.callees[index];
+                match compiled {                    // SAFETY: `active_module` points at the live active module (see the
                     // context-0 arm above); no `&mut` aliases it while native code runs.
                     Some(compiled) => enter_compiled_cached(
                         &**compiled,

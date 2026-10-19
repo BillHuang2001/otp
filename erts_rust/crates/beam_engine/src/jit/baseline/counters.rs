@@ -155,9 +155,9 @@ pub(crate) struct Counters {
     /// the `RefCell` probe + `Rc` clone a caller carrying a
     /// [`ResolvedFunction`](super::ResolvedFunction) skips whenever it stays inside one
     /// function. Counted only on the lazy layout: an eager artifact resolves nothing.
-    pub(crate) lazy_function_resolutions: u64,    /// Block-ABI words the driver had to decode (a block ran and returned).
-    pub(crate) driver_round_trips: u64,
-    /// Driver iterations with no native entry: one interpreter step each.
+    pub(crate) lazy_function_resolutions: u64,
+    /// Block-ABI words the driver had to decode (a block ran and returned).
+    pub(crate) driver_round_trips: u64,    /// Driver iterations with no native entry: one interpreter step each.
     pub(crate) driver_interp_steps: u64,
     /// `jit_set_position` calls (every Y-free block prologue).
     pub(crate) set_position: u64,
