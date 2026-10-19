@@ -35,16 +35,20 @@
 //!
 //! The fixture scaffolding is shared with `drive.rs` via [`super::test_support`].
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use beam_common::{BeamError, ExceptionClass, ExitReason, Raise, StackTrace};
-use beam_loader::{Atom, HeapNeed, Instr, Label, Operand, NO_FAIL};
+use beam_loader::{Atom, HeapNeed, Instr, Label, Module, Operand, NO_FAIL};
 use beam_term::{cmp, make_atom, make_small, Eterm, NIL};
 
 use super::test_support::{seam, Fixture};
-use super::{CatchFrame, Continuation, Machine, RunOutcome};
+use super::{CalleeTarget, CatchFrame, Continuation, Machine, RunOutcome};
 use crate::context::MinimalContext;
 use crate::Step;
+
+use super::local_callee::CalleeKey;
 
 // The production builders take the `Machine` plus a reader closure so a moving
 // collector can relocate operands between the reserve and the read; these tests
@@ -601,5 +605,284 @@ fn reset_clears_the_raise_snapshot_but_a_resume_preserves_it() {
     assert!(
         machine.raise_snapshot().is_empty(),
         "reset clears the snapshot"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The local-call seam's callee-identity memo (`Machine::local_callees`)
+// ---------------------------------------------------------------------------
+
+/// A module with **two** consecutive local (non-tail) calls to the same non-exported
+/// callee, plus a `call_last` form:
+///
+/// ```text
+/// run/0:       label 1;  allocate 0,0; call helper; call helper; deallocate 0; return
+/// run_last/0:  label 10; allocate 2,0; move x0 -> y0; call_last helper 2; return
+/// helper/0:    label 5;  allocate 0,0; move 99 -> x0; deallocate 0; return
+/// ```
+///
+/// `helper/0` is never exported, so a local `call`/`call_last` is the only way to reach
+/// it — the shape the local-call seam exists for. Its **in-machine** body answers `99`
+/// while a serving host answers `7`, so which route ran is visible in the value.
+fn two_call_module() -> Module {
+    const HELPER: Label = Label(5);
+    let mut fixture = Fixture::new("m");
+
+    let run = fixture.add_function(
+        "run",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 0,
+            },
+            Instr::Call {
+                target: HELPER,
+                arity: 0,
+            },
+            Instr::Call {
+                target: HELPER,
+                arity: 0,
+            },
+            Instr::Deallocate(0),
+            Instr::Return,
+        ],
+    );
+
+    let run_last = fixture.add_function(
+        "run_last",
+        0,
+        vec![
+            Instr::Label(Label(10)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(2),
+                live: 0,
+            },
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::Y(0),
+            },
+            Instr::CallLast {
+                target: HELPER,
+                arity: 0,
+                deallocate: 2,
+            },
+            Instr::Return,
+        ],
+    );
+
+    fixture.add_function(
+        "helper",
+        0,
+        vec![
+            Instr::Label(HELPER),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 0,
+            },
+            Instr::Move {
+                src: Operand::Integer(99),
+                dst: Operand::X(0),
+            },
+            Instr::Deallocate(0),
+            Instr::Return,
+        ],
+    );
+
+    fixture.add_export("run", 0, run);
+    fixture.add_export("run_last", 0, run_last);
+    fixture.finish()
+}
+
+/// The atom `name` in `module`'s own table.
+fn atom_of(module: &Module, name: &str) -> Atom {
+    module
+        .atom_table
+        .lookup(name)
+        .unwrap_or_else(|| panic!("atom {name:?} is interned in the fixture"))
+}
+
+/// What one seam observation recorded.
+#[derive(Default)]
+struct SeamObservations {
+    /// How many times the host's `resolve_local_call` was consulted.
+    consultations: Rc<Cell<usize>>,
+    /// How many times the host's BIF hook was called.
+    bif_calls: Rc<Cell<usize>>,
+}
+
+/// The host for the seam tests: a BIF hook that serves `m:helper/0` as `7`, and a
+/// `resolve_local_call` resolver that is consulted (and counted) on every local call,
+/// answering `serve`.
+fn seam_context(serve: bool, observations: &SeamObservations) -> MinimalContext {
+    let bif_calls = Rc::clone(&observations.bif_calls);
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(
+        move |module: &str, function: &str, arity: u32, _args: &[Eterm]| -> beam_common::Result<Eterm> {
+            bif_calls.set(bif_calls.get() + 1);
+            match (module, function, arity) {
+                ("m", "helper", 0) => Ok(make_small(7)),
+                _ => Err(crate::error::unsupported("seam test: no such BIF")),
+            }
+        },
+    ));
+    let consultations = Rc::clone(&observations.consultations);
+    ctx.set_local_call_resolver(Box::new(move |module: &str, function: &str, arity: u32| {
+        consultations.set(consultations.get() + 1);
+        Ok(serve && module == "m" && function == "helper" && arity == 0)
+    }));
+    ctx
+}
+
+/// Run `export/0` of the two-call fixture and report the value plus the observations.
+fn run_two_call_fixture(
+    module: &Module,
+    export: &str,
+    serve: bool,
+) -> (RunOutcome, SeamObservations, Machine) {
+    let observations = SeamObservations::default();
+    let mut ctx = seam_context(serve, &observations);
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(module, atom_of(module, export), 0, &[], &mut ctx)
+        .expect("the fixture runs");
+    (outcome, observations, machine)
+}
+
+/// **HARD INVARIANT 1 — the host's verdict is never memoized.** Two consecutive local
+/// calls consult `resolve_local_call` **twice** (a host spends one reduction unit per
+/// consultation, and `erlang:load_nif/2` can install a stub mid-run), while the callee's
+/// identity is derived **once** for both calls: that derivation is a pure function of a
+/// loaded module, which is the only thing the memo holds.
+#[test]
+fn the_local_call_seam_consults_the_host_once_per_call_and_derives_the_identity_once() {
+    let module = two_call_module();
+    let (outcome, observations, machine) = run_two_call_fixture(&module, "run", false);
+
+    // A declined callee runs in this machine, so the caller's two calls both reach the
+    // in-machine body (99) — and the memo neither hides nor invents a consultation.
+    assert_eq!(outcome, RunOutcome::Returned(make_small(99)));
+    assert_eq!(
+        observations.consultations.get(),
+        2,
+        "one `resolve_local_call` consultation per local call"
+    );
+    assert_eq!(observations.bif_calls.get(), 0, "a declined callee is not a BIF");
+    assert_eq!(
+        machine.local_callees.fill_count(),
+        1,
+        "the identity is derived once and read from the memo on the second call"
+    );
+
+    // The memo holds the callee's **own** identity (its function entry's module atom and
+    // name atom, its declared arity), keyed on the module image's address — `helper` is
+    // function index 2 of the fixture.
+    let key = CalleeKey {
+        module: &module as *const Module as usize,
+        func: 2,
+    };
+    let target: &CalleeTarget = machine
+        .local_callees
+        .memoized(key)
+        .expect("the callee is memoized");
+    assert_eq!(
+        (
+            target.module.as_ref(),
+            target.function.as_ref(),
+            target.arity
+        ),
+        ("m", "helper", 0)
+    );
+}
+
+/// A **served** callee is still dispatched once per call (the verdict is per call) while
+/// its identity comes from the memo — the two observable counts differ, which is exactly
+/// the invariant.
+#[test]
+fn a_served_local_call_is_dispatched_once_per_call_from_the_memoized_identity() {
+    let module = two_call_module();
+    let (outcome, observations, machine) = run_two_call_fixture(&module, "run", true);
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(make_small(7)),
+        "a served callee's BIF value flows out (the in-machine body answers 99)"
+    );
+    assert_eq!(
+        observations.consultations.get(),
+        2,
+        "the host is still asked once per call"
+    );
+    assert_eq!(
+        observations.bif_calls.get(),
+        2,
+        "and its answer is honoured once per call"
+    );
+    assert_eq!(
+        machine.local_callees.fill_count(),
+        1,
+        "the identity derivation stays memoized across both calls"
+    );
+}
+
+/// The `call_last` arm keeps its frame discipline when the identity comes from the memo:
+/// the served route's resting depths equal the in-machine route's (the frame pop is the
+/// discriminant — a skipped pop leaves the caller's two Y slots on the stack).
+#[test]
+fn a_served_local_tail_call_still_pops_its_frame_with_the_memoized_identity() {
+    let module = two_call_module();
+
+    let (declined, declined_observations, declined_machine) =
+        run_two_call_fixture(&module, "run_last", false);
+    assert_eq!(declined, RunOutcome::Returned(make_small(99)));
+    assert_eq!(declined_observations.consultations.get(), 1);
+    assert_eq!(declined_observations.bif_calls.get(), 0);
+    assert_eq!(declined_machine.local_callees.fill_count(), 1);
+    assert_eq!(
+        (
+            declined_machine.frame_depth(),
+            declined_machine.stack_depth()
+        ),
+        (1, 0),
+        "`call_last` pops its two-Y-slot frame before the callee runs"
+    );
+
+    let (served, served_observations, served_machine) =
+        run_two_call_fixture(&module, "run_last", true);
+    assert_eq!(served, RunOutcome::Returned(make_small(7)));
+    assert_eq!(served_observations.consultations.get(), 1);
+    assert_eq!(served_observations.bif_calls.get(), 1);
+    assert_eq!(served_machine.local_callees.fill_count(), 1);
+    assert_eq!(
+        (
+            served_machine.frame_depth(),
+            served_machine.stack_depth()
+        ),
+        (1, 0),
+        "a served `call_last` pops the same frame the in-machine route does"
+    );
+}
+
+/// The memo's entries are **address-keyed**, so `Machine::reset` (the start of every run)
+/// clears them: two different module images — a clone is a different address — never
+/// share an entry, and a fresh run re-derives rather than answering from an image that is
+/// no longer the one being executed.
+#[test]
+fn resetting_the_machine_clears_the_local_callee_memo() {
+    let module = two_call_module();
+    let (_outcome, _observations, mut machine) = run_two_call_fixture(&module, "run", false);
+    assert_eq!(machine.local_callees.fill_count(), 1);
+
+    machine.reset();
+
+    let observations = SeamObservations::default();
+    let mut ctx = seam_context(false, &observations);
+    machine
+        .run_export_outcome(&module, atom_of(&module, "run"), 0, &[], &mut ctx)
+        .expect("the fixture runs again");
+    assert_eq!(
+        machine.local_callees.fill_count(),
+        2,
+        "the reset cleared the memo, so the new run derived again"
     );
 }

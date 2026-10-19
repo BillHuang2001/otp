@@ -63,6 +63,10 @@
 //!   ([`Machine::off_heap_overhead_bytes`] and [`Machine::retain_refc_binaries`]): the
 //!   reservoir is host-prunable by a reachability predicate, and its backing-store bytes
 //!   are the figure a host prices against `beam_gc`'s off-heap trigger.
+//! * `local_callee` — the **local-callee identity memo** ([`LocalCallees`]): the
+//!   `(module, function, arity)` derivation the local-call seam would otherwise repeat on
+//!   every local call, memoized per `(module address, function index)`. It memoizes the
+//!   *derivation* only, never the host's verdict.
 //! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
 //!   symbolic frames, run through real run entries), over the synthetic-module
 //!   scaffolding in `test_support`.
@@ -78,6 +82,7 @@ use beam_term::Eterm;
 pub use self::catch::CatchFrame;
 pub(crate) use self::catch::namespace_atom;pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
+pub(crate) use self::local_callee::{CalleeTarget, LocalCallees};
 pub use self::location::WaitDeadline;
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
 pub use self::run::RunOutcome;
@@ -92,6 +97,7 @@ mod context;
 mod deadline_tests;
 mod drive;
 mod frames;
+mod local_callee;
 mod location;
 mod offheap;
 mod registers;
@@ -463,6 +469,29 @@ pub struct Machine {
     /// `Machine::step_instruction` call in a test) cannot leak a stale value from an
     /// earlier run.
     pub(crate) bif_in_machine_on: bool,
+    /// The **local-callee identity memo** the local-call seam consults on every local
+    /// `call`/`call_only`/`call_last` ([`Machine::local_call_seam`]).
+    ///
+    /// Naming the same-module callee costs the callee's function entry plus two atom
+    /// names, and all three are immutable for a loaded module, so the derivation is
+    /// memoized per `(module address, function index)` ([`LocalCallees`]).
+    ///
+    /// **Only the derivation is memoized — never the host's verdict.** The seam still
+    /// calls [`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call)
+    /// exactly once per local call: a host spends one reduction unit per consultation,
+    /// and `erlang:load_nif/2` can install a stub mid-run that a later call must be
+    /// served from. An un-nameable callee is memoized as `None`, so it keeps costing the
+    /// host *zero* consultations.
+    ///
+    /// **`pub(crate)`** so the seam (`crate::interpreter::dispatch`) can hold
+    /// `&mut self.local_callees` for the memo while `resolve_local_call`'s
+    /// `&mut dyn ExecutionContext` is a *separate* parameter — the two borrows never
+    /// overlap `self`.
+    ///
+    /// Cleared by [`Machine::reset`] (the entries are address-keyed, so they are only
+    /// valid for the run that filled them — see [`LocalCallees`]); a resume deliberately
+    /// does not reset, and a suspended machine's modules are still alive.
+    pub(crate) local_callees: LocalCallees,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
@@ -566,6 +595,7 @@ impl Machine {
             trace_on: false,
             reduce_on: false,
             bif_in_machine_on: false,
+            local_callees: LocalCallees::new(),
             current_code: None,
             entry_call: None,
             reductions: 0,
