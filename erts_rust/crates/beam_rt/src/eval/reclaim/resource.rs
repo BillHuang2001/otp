@@ -481,7 +481,16 @@ mod tests {
     fn freshness_is_the_sorted_difference() {
         let before = frontier(&[10, 30]);
         assert_eq!(before.freshness(&frontier(&[10, 30])), Vec::<usize>::new());
-        assert_eq!(before.freshness(&frontier(&[10, 20])), Vec::<usize>::new());
+        assert_eq!(
+            before.freshness(&frontier(&[10])),
+            Vec::<usize>::new(),
+            "a shrinking set yields nothing: no word it holds is new"
+        );
+        assert_eq!(
+            before.freshness(&frontier(&[10, 20])),
+            vec![20],
+            "a word the frontier did not list is fresh even when another candidate vanished"
+        );
         assert_eq!(before.freshness(&frontier(&[10, 20, 30, 40])), vec![20, 40]);
         assert_eq!(
             Frontier::default().freshness(&frontier(&[7, 5])),

@@ -375,7 +375,8 @@ pub struct Runtime {
     /// previous observation **across** statements. A nested run's frontier is deliberately *not*
     /// here: nested runs recurse, so it is a per-run local (see [`crate::eval::reclaim`]'s resource
     /// half).
-    pub(crate) resource_prune: crate::eval::reclaim::ResourcePruneState,    /// Whether a process **engine** has ever been registered on this runtime — a sticky,
+    pub(crate) resource_prune: crate::eval::reclaim::ResourcePruneState,
+    /// Whether a process **engine** has ever been registered on this runtime — a sticky,
     /// `O(1)` signal (there is no way to enumerate
     /// [`Runtime::runner_state`](crate::runner::RunnerState)'s engines from outside
     /// `crate::runner`, and an engine outlives the slice that created it, so *presence* is
@@ -1253,7 +1254,8 @@ impl Runtime {
             eval_heap_retired: Vec::new(),
             eval_prune: crate::eval::reclaim::PruneState::default(),
             eval_prune_enabled: true,
-            resource_prune: crate::eval::reclaim::ResourcePruneState::default(),            engine_registered: false,
+            resource_prune: crate::eval::reclaim::ResourcePruneState::default(),
+            engine_registered: false,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
             ports,
