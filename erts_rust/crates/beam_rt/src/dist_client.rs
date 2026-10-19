@@ -145,6 +145,7 @@ use beam_process::{DistSignal, DistSignalRouter, MonitorRef, ProcessId, RemotePi
 use beam_term::prelude::{make_atom, make_small, try_make_small, Eterm};
 use beam_term::AtomTable;
 
+use crate::dist::externalize::PayloadArena;
 use crate::dist::links::no_link_error;
 use crate::dist::{advertised_flags, DistConnection, DistLinks, NodeName, DIST_READ_SLICE};
 use crate::error;
@@ -342,6 +343,11 @@ struct DistClientInner {
     /// The arena one inbound control message is decoded on (reset per drain; the
     /// delivery copies the term out immediately).
     dispatch_heap: Heap,
+    /// The arena an outbound **payload** is re-materialised on when it carries one of this
+    /// runtime's own pids/ports/references (see [`crate::dist::externalize`]). Every term
+    /// it returns is consumed by the encoder inside the same send, which is the arena's
+    /// lifetime contract.
+    payloads: PayloadArena,
     /// Why the most recently retired link was dropped (recorded, never raised).
     last_error: Option<String>,
     /// Whether this node is **hidden** (`-hidden`): a link this client dials then
@@ -386,6 +392,7 @@ impl DistClient {
                 pending: VecDeque::new(),
                 scratch: Heap::new(SCRATCH_WORDS)?,
                 dispatch_heap: Heap::new(DISPATCH_HEAP_WORDS)?,
+                payloads: PayloadArena::new()?,
                 last_error: None,
                 hidden: false,
                 next_unlink_id: 1,
@@ -741,6 +748,7 @@ impl DistClient {
         let empty = make_atom(atoms.intern(""));
         let mut inner = self.borrow_mut()?;
         let local = inner.local_pid_term(from)?;
+        let msg = inner.outbound_payload(msg, atoms)?;
         inner
             .links
             .route_control(node, Dop::RegSend, &[local, empty, to_name, msg], atoms)
@@ -764,6 +772,7 @@ impl DistClient {
         let mut inner = self.borrow_mut()?;
         let local = inner.local_pid_term(from)?;
         let to_term = remote.to_eterm(&mut inner.scratch)?;
+        let msg = inner.outbound_payload(msg, atoms)?;
         // `send_message` selects `DOP_SEND_SENDER` when the peer negotiated
         // `DFLAG_SEND_SENDER` and `DOP_SEND` otherwise (`dist.c:1686`), so the choice
         // cannot be made here — it is the driver's.
@@ -793,6 +802,7 @@ impl DistClient {
     ) -> Result<()> {
         let mut inner = self.borrow_mut()?;
         let local = inner.local_pid_term(from)?;
+        let msg = inner.outbound_payload(msg, atoms)?;
         inner.links.route_alias(to, local, msg, atoms)
     }
 
@@ -834,6 +844,29 @@ impl DistClientInner {
     fn retire(&mut self, index: usize, err: BeamError) {
         let link = self.links.outbound.remove(index);
         self.last_error = Some(format!("{}: {err}", link.name));
+    }
+
+    /// The **wire form** of an outbound message payload: `msg` itself when it carries no
+    /// identifier of this runtime's own (the gate's answer — nothing is copied and nothing
+    /// is allocated), else a copy whose internal pids/ports/references are the external
+    /// terms the wire carries.
+    ///
+    /// This is the **one** externalising step of the outbound path — every message family
+    /// ([`DistClient::send_reg_send`], [`DistClient::send_message_pid`],
+    /// [`DistClient::send_alias`]) funnels its payload through it — and it is what makes the
+    /// canonical `Peer ! {reply, self()}` idiom sendable: `beam_dist` encodes every control
+    /// with no local node identity of its own, so an internal pid has no wire form there
+    /// (see [`crate::dist::externalize`]).
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failures and the codec's own refusal for a payload the wire
+    /// has no image for (a `make_fun3` local fun). A payload is never silently altered: a
+    /// rewrite that cannot be completed is a typed error, exactly as an unencodable payload
+    /// is today.
+    fn outbound_payload(&mut self, msg: Eterm, atoms: &mut AtomTable) -> Result<Eterm> {
+        self.payloads
+            .externalize(msg, atoms, self.our_node, self.creation)
     }
 
     /// An **external pid** term for a local process: the `From`/`Watcher` element a

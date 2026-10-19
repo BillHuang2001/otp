@@ -123,6 +123,7 @@ use beam_term::AtomTable;
 
 use crate::error;
 
+pub(crate) mod externalize;
 mod inbound;
 pub use inbound::LocalDeliverySink;
 
