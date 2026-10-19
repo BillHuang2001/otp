@@ -49,6 +49,16 @@
 //! ([`crate::ptab::ProcessTable`]'s `deliver_down_message`), so a DOWN is delivered
 //! **unconditionally**, whatever the receiver's `trap_exit` flag says.
 //!
+//! # The receive-time reading of the policy
+//!
+//! The same decision is read differently at two points. At a **schedule-in** (or on an eager
+//! signal to a non-executing receiver) the whole queue is applied and a terminating verdict kills
+//! the receiver on the spot. During a **receive scan** the receiver is executing, so a terminating
+//! verdict must only *stop the scan* and leave the signal queued for the schedule-out net — the C's
+//! `i_loop_rec` → `do_schedule` ([`ReceiveApplicability`],
+//! [`receive_applicability`]). Both readings are derived from this one [`exit_policy`]; neither
+//! re-implements it.
+//!
 //! The message builders allocate the message terms on the *receiving* process's heap
 //! (through `beam_alloc::Heap`), so a built `{'EXIT', …}`/`{'DOWN', …}` term is already
 //! owned by its recipient.
@@ -68,6 +78,7 @@ use beam_term::prelude::{atom_val, is_atom, make_atom, Atom, AtomTable, Eterm};
 
 use crate::pid::{PortId, ProcessId};
 use crate::remote::RemotePid;
+use crate::signal_queue::PendingSignal;
 
 /// The well-known atom indices used to build signal messages.
 ///
@@ -284,6 +295,74 @@ pub fn exit_policy(
     } else {
         // Every other reason terminates the target unchanged — including a linked-family `kill`.
         ExitPolicy::Terminate(reason)
+    }
+}
+
+/// What a **receive-scan** signal servicing must do with the head of a receiver's signal queue.
+///
+/// This is the *receive-time* reading of the propagation decision — the C's behaviour in
+/// `erts_proc_sig_handle_incoming` (`erts/emulator/beam/erl_proc_sig_queue.c:6229`), which the
+/// receive helper `erts_proc_sig_receive_helper` (`:7729`) calls when `i_loop_rec`
+/// (`erts/emulator/beam/emu/msg_instrs.tab:60-140`) finds its message queue exhausted. That
+/// handler walks the process's own incoming signals **in FIFO order** and:
+///
+/// * converts a signal it can deliver into a message — a trapped exit becomes `{'EXIT', …}`
+///   (`ERTS_SIG_Q_OP_EXIT`/`_EXIT_LINKED` via `handle_exit_signal`, `:6389-6398`), a monitor-down
+///   becomes `{'DOWN', …}` (`ERTS_SIG_Q_OP_MONITOR_DOWN` → `convert_to_down_message`, `:6400`);
+/// * removes a signal it would drop — a `normal` exit reason to a non-trapping process
+///   (`handle_exit_signal`'s ignore arm, `erl_proc_sig_queue.c:4758`), reported as "ignored or
+///   converted to exit message";
+/// * **stops** on a signal that would terminate the process: `handle_exit_signal` sets
+///   `ERTS_PSFLG_EXITING`, the switch leaves with `goto stop`, and the receive helper reports
+///   `get_out > 0` (`:7860-7872`) so the instruction jumps to `do_schedule` — the process is
+///   **scheduled out to die**, never killed inside its own receive.
+///
+/// The distinction is the whole reason this type exists: a signal applied in the middle of an
+/// instruction stream must not terminate the process executing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReceiveApplicability {
+    /// The head signal becomes a mailbox message the receive scan can match immediately — a
+    /// [`ExitPolicy::Trap`] exit (a `{'EXIT', From, Reason}` message) or a monitor-DOWN
+    /// (a `{'DOWN', …}`/`{Tag, …}` message, which never consults the policy).
+    Apply,
+    /// The head signal is discarded without producing a message — a [`ExitPolicy::Ignore`] exit
+    /// (a `normal` reason to a non-trapping receiver). The C removes it and keeps walking the
+    /// queue.
+    Discard,
+    /// Stop the scan **before** this signal, leaving it — and every signal behind it — queued and
+    /// untouched: applying it would [terminate](ExitPolicy::Terminate) the receiver, and a
+    /// termination belongs to the schedule-out net (the runtime's park arm re-queues the process
+    /// instead of parking it, and the next schedule-in's
+    /// [`service_signals`](crate::ptab::ProcessTable::service_signals) applies the signal and
+    /// cascades).
+    Stop,
+}
+
+/// The receive-scan class of `signal` for a receiver whose `trap_exit` flag is `trapping` — the
+/// FIFO walk `i_loop_rec` may make from the head of that receiver's queue.
+///
+/// A monitor-DOWN is [`ReceiveApplicability::Apply`] whatever `trapping` says: the C handles a
+/// down notification in its own arm, never consulting the exit policy (see the module docs). An
+/// exit signal is classified through [`exit_policy`] — the **single** source of the propagation
+/// rule, so the receive scan and the schedule-in path can never disagree:
+///
+/// * [`ExitPolicy::Trap`] ⇒ [`ReceiveApplicability::Apply`];
+/// * [`ExitPolicy::Ignore`] ⇒ [`ReceiveApplicability::Discard`];
+/// * [`ExitPolicy::Terminate`] ⇒ [`ReceiveApplicability::Stop`].
+pub fn receive_applicability(
+    signal: PendingSignal,
+    trapping: bool,
+    atoms: &SignalAtoms,
+) -> ReceiveApplicability {
+    match signal {
+        PendingSignal::Down { .. } => ReceiveApplicability::Apply,
+        PendingSignal::Exit {
+            reason, family, ..
+        } => match exit_policy(reason, trapping, family, atoms) {
+            ExitPolicy::Trap => ReceiveApplicability::Apply,
+            ExitPolicy::Ignore => ReceiveApplicability::Discard,
+            ExitPolicy::Terminate(_) => ReceiveApplicability::Stop,
+        },
     }
 }
 
@@ -553,6 +632,99 @@ mod tests {
             exit_policy(weird, false, Linked, atoms),
             ExitPolicy::Terminate(weird)
         );
+    }
+
+    /// The receive-scan reading of the propagation table: every [`ExitPolicy`] arm maps onto its
+    /// [`ReceiveApplicability`], over the full `{normal, kill, other} × {Explicit, Linked} ×
+    /// trapping{false, true}` matrix.
+    ///
+    /// The two classifications are cross-checked here rather than asserted independently: each
+    /// case's expected applicability is *derived* from [`exit_policy`]'s verdict, so the test
+    /// pins the mapping (and the "no second copy of the rule" contract) instead of restating it.
+    #[test]
+    fn receive_applicability_is_the_receive_time_reading_of_the_policy() {
+        use ExitFamily::{Explicit, Linked};
+
+        let mut f = fixture();
+        let atoms = &f.atoms;
+        let boom = make_atom(f.table.intern("boom"));
+        let normal = atoms.normal_term();
+        let kill = atoms.kill_term();
+
+        let expected = |policy: ExitPolicy| match policy {
+            ExitPolicy::Trap => ReceiveApplicability::Apply,
+            ExitPolicy::Ignore => ReceiveApplicability::Discard,
+            ExitPolicy::Terminate(_) => ReceiveApplicability::Stop,
+        };
+
+        for reason in [normal, kill, boom, make_small(9)] {
+            for family in [Explicit, Linked] {
+                for trapping in [false, true] {
+                    let policy = exit_policy(reason, trapping, family, atoms);
+                    let signal = PendingSignal::exit(ProcessId::new(1, 0), reason, family);
+                    assert_eq!(
+                        receive_applicability(signal, trapping, atoms),
+                        expected(policy),
+                        "reason {:?} / {:?} / trapping {trapping}: the receive scan must read \
+                         the schedule-in policy, not a second copy of it",
+                        atoms.classify(reason),
+                        family,
+                    );
+                }
+            }
+        }
+
+        // The three arms are all actually reached (an anti-vacuity guard).
+        let trapped = PendingSignal::exit(ProcessId::new(1, 0), boom, Linked);
+        assert_eq!(
+            receive_applicability(trapped, true, atoms),
+            ReceiveApplicability::Apply
+        );
+        let ignored = PendingSignal::exit(ProcessId::new(1, 0), normal, Linked);
+        assert_eq!(
+            receive_applicability(ignored, false, atoms),
+            ReceiveApplicability::Discard
+        );
+        let fatal = PendingSignal::exit(ProcessId::new(1, 0), boom, Linked);
+        assert_eq!(
+            receive_applicability(fatal, false, atoms),
+            ReceiveApplicability::Stop
+        );
+        // An explicit `kill` is untrappable, so even a **trapping** receiver stops on it.
+        let untrappable = PendingSignal::exit(ProcessId::new(1, 0), kill, Explicit);
+        assert_eq!(
+            receive_applicability(untrappable, true, atoms),
+            ReceiveApplicability::Stop
+        );
+    }
+
+    /// A monitor-DOWN is receive-applicable whatever the receiver's `trap_exit` flag says (and
+    /// whatever user tag it carries): the C handles a down notification in its own arm, never
+    /// consulting the exit policy.
+    #[test]
+    fn a_monitor_down_is_always_receive_applicable() {
+        let mut f = fixture();
+        let tag = make_atom(f.table.intern("mytag"));
+        let atoms = &f.atoms;
+        let reference = crate::monitor::RefAllocator::new().next();
+        let target = ProcessId::new(4, 2);
+
+        for trap in [false, true] {
+            for user_tag in [None, Some(tag)] {
+                let signal = PendingSignal::down(
+                    reference,
+                    target,
+                    crate::monitor::MonitorKind::Process,
+                    user_tag,
+                    atoms.normal_term(),
+                );
+                assert_eq!(
+                    receive_applicability(signal, trap, atoms),
+                    ReceiveApplicability::Apply,
+                    "a DOWN is delivered unconditionally (trapping {trap}, tag {user_tag:?})"
+                );
+            }
+        }
     }
 
     #[test]

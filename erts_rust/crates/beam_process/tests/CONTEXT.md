@@ -570,6 +570,35 @@ SMP pool:
     an unlimited setting and a comfortably-within process recording nothing, the setting round-tripping
     wholesale, and the verdict queries never latching. Deterministic — every figure derived from
     `capacity_words`/`next_heap_size`, no sleeps / wall-clock bounds / oracle.
+48. `receive_signals.rs` (18 tests) — the **receive-scan** signal entry point
+    `ProcessTable::service_receive_signals`: a trapped link exit applied as `{'EXIT',…}`; a
+    link-exit `kill` trapped while an explicit `exit/2` `kill` **stops** the scan (both read through
+    `receive_applicability`, so each expectation is derived from `exit_policy`, never restated); a
+    plain and a `{tag,T}` monitor `DOWN`; the **FIFO** mailbox order pinned in both arrangements
+    (exit-then-DOWN, DOWN-then-exit); a terminating head leaving the queue byte-identical with the
+    process alive, plus the `service_signals` regression pin on the same fixture; a trapped exit
+    applied ahead of a following terminating head; an `Ignore` head discarded with the next `DOWN`
+    delivered; quiet/unknown/stale-pid no-ops (state, pending, mailbox, `minor_gcs`, links and the
+    wake list all untouched); a delivered message waking a `Waiting` receiver onto the wake list; a
+    `Running` receiver's in-scan `DOWN` delivered through a **heap fragment** with no collection and
+    an untouched nursery (the `signal_fragment_fallback.rs` machinery); and 5 `oracle_*` probes
+    (trapped link exit, link `kill` trapped, explicit `kill` ⇒ `killed`, monitor `DOWN` reason,
+    `normal` link exit ignored). The module docs record the determinism limit: the relative order of
+    two independently generated signals is not oracle-probeable (Erlang orders only per
+    `(sender,receiver)` pair), so the C's single per-process FIFO is the ordering source.
+49. `reserve_remote.rs` (13 tests) — the **distributed-spawn reservation** seam: `reserve_remote` ⇒
+    `spawn_reserved` puts a live process at exactly the reserved `(number, serial)` with the claim
+    gone; a claim creates no process and keeps `alloc_pid` off the number while a second allocation
+    still works; two claims of different numbers coexist; live-number / already-claimed /
+    out-of-range (`system_limit`) / wrong-or-uninstalled-node refusals; stale, cancelled, consumed
+    and foreign handles install nothing; `cancel_reservation` makes the number allocatable again
+    (bumped serial) while a stale `spawn_reserved` is `badarg`; a **double cancel leaves exactly one
+    `free` entry** (the leak pin); a forced `spawn_reserved` failure (the number squatted through the
+    public `insert`) releases the claim without a stray slot; and 64 reserve/cancel rounds leave
+    `slot_count`/`free_count` stable. No oracle probe: a local pid pre-post-allocation is not
+    observable from `erl -noshell -eval` without a second node and a full `DOP_SPAWN_REQUEST` peer,
+    so the C derivation (`dist.c` line ranges, `src/reserve.rs`'s module docs) is the documented
+    basis.
 
 ## Constraints- **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
@@ -588,8 +617,8 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **586 passed, 0 failed, 1 ignored** (196
-  in-module unit tests + 389 across the 47 integration test targets under `tests/` — one per top-level
+  `../../../tools/differential/` harness, not here. Current: **639 passed, 0 failed, 1 ignored** (214
+  in-module unit tests + 424 across the 49 integration test targets under `tests/` — one per top-level
   `tests/*.rs` file; the `common/mod.rs` support module contributes its 4 normalizer unit tests to each
   of its 7 includers — plus 1 doctest; the single ignore is the documented non-yielding-runner hang
   failure mode in `preemption.rs`).
@@ -635,6 +664,11 @@ SMP pool:
   death-side port-monitor cleanup
 - `service_signals_fast_path.rs` → the quiet-process schedule-in no-op and the capacity-retaining
   wake-list hand-over
+- `receive_signals.rs` → the receive-scan signal entry point (`service_receive_signals`:
+  receive-applicable FIFO application, the `Ignore` discard, the `Terminate` stop, the heap-fragment
+  route for a `Running` receiver)
+- `reserve_remote.rs` → the distributed-spawn reservation seam (`reserve_remote`/`spawn_reserved`/
+  `cancel_reservation`, the no-leak rollback pins)
 - `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` /
   an unreachable peer heap must not abort the death; the observer and the port-monitor cleanup still
   run)

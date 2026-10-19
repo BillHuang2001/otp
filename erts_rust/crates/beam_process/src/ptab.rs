@@ -36,6 +36,11 @@
 //!
 //! * **at the receiver's schedule-in**, through [`ProcessTable::service_signals`] (the
 //!   scheduler calls it on the dequeued pid before running it); and
+//! * **during a receive scan**, through [`ProcessTable::service_receive_signals`]: the runtime's
+//!   receive fetch applies the queue's *receive-applicable* head signals (a trapped exit as
+//!   `{'EXIT', …}`, a monitor-DOWN as `{'DOWN', …}`, an ignored exit discarded) so the scan can
+//!   match them in the same reduction slice, and leaves a **terminating** one queued for the
+//!   schedule-out net (the C's `i_loop_rec` → `do_schedule`); and
 //! * **eagerly at the end of the sending operation**, for a receiver that is **not** the
 //!   currently executing process (ERTS's early signal handling). "Currently executing" is
 //!   [`ProcessState::Running`]: the single scheduler sets it before a runner runs, so at most
@@ -104,11 +109,12 @@ use crate::remote::{
     DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid, RemoteRef, RemoteWatcher,
     RemoteWatcherRef,
 };
+use crate::reserve::{check_local_node, Reservation, Reservations};
 use crate::run_queue::Priority;
 use crate::signal::{
     build_down_message_port, build_down_message_remote, build_down_message_term,
-    build_exit_message, build_exit_message_term, exit_policy, ExitFamily, ExitPolicy, ExitSignal,
-    SignalAtoms,
+    build_exit_message, build_exit_message_term, exit_policy, receive_applicability, ExitFamily,
+    ExitPolicy, ExitSignal, ReceiveApplicability, SignalAtoms,
 };
 use crate::signal_queue::PendingSignal;
 
@@ -491,6 +497,11 @@ pub struct ProcessTable {
     slots: Vec<Slot>,
     /// Free slot numbers available for reuse (with a bumped serial).
     free: Vec<u64>,
+    /// The **distributed-spawn reservations**: identities claimed for a process that does not
+    /// exist yet (see [`Reservations`]). A claimed number is not in [`ProcessTable::free`] and is
+    /// skipped by [`ProcessTable::alloc_pid`], so it is handed out only through
+    /// [`ProcessTable::spawn_reserved`].
+    reserved: Reservations,
     /// The local name registry (`erlang:register/2` / `whereis/1`).
     names: HashMap<Atom, ProcessId>,
     /// The never-reusing monitor-reference allocator.
@@ -570,6 +581,7 @@ impl ProcessTable {
         ProcessTable {
             slots: Vec::new(),
             free: Vec::new(),
+            reserved: Reservations::new(),
             names: HashMap::new(),
             refs: RefAllocator::new(),
             atoms,
@@ -590,6 +602,10 @@ impl ProcessTable {
 
     /// Allocates a fresh pid, reusing a free slot with a bumped serial.
     ///
+    /// A number a live **reservation** claims is never handed out here (see
+    /// [`ProcessTable::reserve_remote`]): the claim owns that identity until
+    /// [`ProcessTable::spawn_reserved`] or [`ProcessTable::cancel_reservation`] resolves it.
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::SystemLimit` when the pid number space is exhausted.
@@ -599,14 +615,22 @@ impl ProcessTable {
             None => {
                 // Grow the table: a number that was never handed out yet. The slot's
                 // serial is 0 for a brand-new number and already bumped for a reused one.
-                let number = self.slots.len() as u64;
-                if number > MAX_PROCESS_NUMBER {
-                    return Err(error::system_limit());
+                // A claimed number is materialised (so a later cancel can return it to the
+                // reuse list) but never handed out.
+                let mut number = self.slots.len() as u64;
+                loop {
+                    if number > MAX_PROCESS_NUMBER {
+                        return Err(error::system_limit());
+                    }
+                    self.slots.push(Slot {
+                        serial: 0,
+                        process: None,
+                    });
+                    if !self.reserved.is_reserved(number) {
+                        break;
+                    }
+                    number += 1;
                 }
-                self.slots.push(Slot {
-                    serial: 0,
-                    process: None,
-                });
                 number
             }
         };
@@ -656,6 +680,10 @@ impl ProcessTable {
         }
         // The slot is no longer available for reuse.
         self.free.retain(|&free| free != number);
+        // A live process at this number resolves its identity, so a pending reservation of it is
+        // dead: a later `spawn_reserved` on that handle answers `badarg` instead of clobbering the
+        // occupant (see `reserve.rs`).
+        self.reserved.release_number(number);
         let slot = &mut self.slots[index];
         slot.serial = pid.serial();
         slot.process = Some(process);
@@ -690,6 +718,183 @@ impl ProcessTable {
     /// Removes the process named by `pid`.
     pub fn remove(&mut self, pid: ProcessId) -> Option<Process> {
         self.take(pid)
+    }
+
+    // --- distributed-spawn reservations --------------------------------------
+
+    /// Claims the local pid **identity** an inbound `DOP_SPAWN_REQUEST` will occupy, without
+    /// creating the process.
+    ///
+    /// This is the wire-facing spelling: `pid` is the decomposed external pid naming the identity
+    /// to claim, and its node must be **this** node
+    /// ([`ProcessTable::set_local_node`]). The claim is what lets the caller build the
+    /// `{spawn_reply, Ref, To, Flags, From}` reply (with `pid.to_eterm()` of
+    /// [`Reservation::pid`]) before the process exists, and abandon the attempt without leaking a
+    /// pid number or a slot. See [`crate::reserve`] for the reply-path contract, the C derivation
+    /// and why a [`Process`] carries no `ProcessEntry`.
+    ///
+    /// A successful claim makes [`ProcessTable::alloc_pid`] skip the number (a claim is **not** an
+    /// allocation: no [`Process`], and no slot if the number is beyond the table) and removes it
+    /// from the reuse list, so [`ProcessTable::cancel_reservation`] can return it there exactly
+    /// once.
+    ///
+    /// # Errors
+    ///
+    /// * [`BeamError::BadArg`] — `pid`'s node is not this node (or no local node is installed, in
+    ///   which case the identity cannot be verified at all: see `reserve.rs`), the number names a
+    ///   **live** process, or the number is already claimed;
+    /// * [`BeamError::SystemLimit`] — the number/serial is outside the pid space (the C's
+    ///   `SYSTEM_LIMIT`).
+    pub fn reserve_remote(&mut self, pid: RemotePid) -> Result<Reservation> {
+        check_local_node(self.local_node, pid.node())?;
+        self.reserve_identity(ProcessId::new(pid.number() as u64, pid.serial() as u64))
+    }
+
+    /// [`ProcessTable::reserve_remote`]'s node-less spelling: claims a local `(number, serial)`
+    /// identity directly.
+    ///
+    /// For a caller that already holds the identity as a [`ProcessId`] (it is local by
+    /// construction, so there is no node to verify). `reserve_remote` is the spelling a
+    /// distribution-derived pid uses; both share one claim table, so a number can never be claimed
+    /// twice across the two.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::reserve_remote`], minus the node check.
+    pub fn reserve_identity(&mut self, pid: ProcessId) -> Result<Reservation> {
+        if self.number_is_live(pid.number()) {
+            return Err(error::bad_arg());
+        }
+        let reservation = self.reserved.claim(pid)?;
+        // A claim is not an allocation: the number must not be handed out by `alloc_pid` while it
+        // is claimed, so it leaves the reuse list (a cancel returns it, exactly once).
+        self.free.retain(|&number| number != pid.number());
+        Ok(reservation)
+    }
+
+    /// Installs a fresh process with `policy` at **exactly** the pid `reservation` claims,
+    /// consuming the reservation.
+    ///
+    /// The returned pid equals `reservation.pid()`, and it is what the spawn reply must carry.
+    /// From here the identity is an ordinary live process: [`ProcessTable::take`] frees it with a
+    /// bumped serial as usual.
+    ///
+    /// **Rollback:** the claim is consumed before anything is created, so every failure below
+    /// returns the number to the reuse list — the identity is never left dangling and the slot is
+    /// never leaked. The reachable failure is a number that became **live** in the meantime (a
+    /// public [`ProcessTable::insert`] at that number, which also drops the claim, so the handle is
+    /// `badarg` before it gets here); a heap-allocation failure
+    /// ([`Process::with_policy`]) rolls back through the same path.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a stale, already-consumed, cancelled or foreign handle, or when
+    /// the number is occupied; [`BeamError::SystemLimit`] for an exhausted pid space (via
+    /// [`ProcessTable::insert`]); otherwise the creation's own error.
+    pub fn spawn_reserved(
+        &mut self,
+        reservation: Reservation,
+        policy: HeapPolicy,
+    ) -> Result<ProcessId> {
+        let pid = self.reserved.release(reservation)?;
+        // The claim is gone: every path below must leave the number reusable.
+        if self.number_is_live(pid.number()) {
+            // An occupied slot is not ours to free (`release_reserved_number` is a no-op then).
+            self.release_reserved_number(pid.number());
+            return Err(error::bad_arg());
+        }
+        let process = match Process::with_policy(pid, policy) {
+            Ok(process) => process,
+            Err(failure) => {
+                self.release_reserved_number(pid.number());
+                return Err(failure);
+            }
+        };
+        if let Err(failure) = self.insert(process) {
+            self.release_reserved_number(pid.number());
+            return Err(failure);
+        }
+        Ok(pid)
+    }
+
+    /// Abandons a reservation, returning its number to the reuse list so a later
+    /// [`ProcessTable::alloc_pid`] may hand it out again (with the slot's serial).
+    ///
+    /// This is the `badopt`/`invalid_message` arm of an inbound `DOP_SPAWN_REQUEST`: the request
+    /// never became a process, and nothing of it is left behind. A **stale** handle is `badarg`,
+    /// so a double cancel cannot push the number onto the reuse list twice (a duplicated entry
+    /// would hand out one identity to two processes — the pin in
+    /// `tests/reserve_remote.rs`).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for an unknown, stale, already-consumed, cancelled or foreign handle.
+    pub fn cancel_reservation(&mut self, reservation: Reservation) -> Result<()> {
+        let pid = self.reserved.release(reservation)?;
+        self.release_reserved_number(pid.number());
+        Ok(())
+    }
+
+    /// The number of live distributed-spawn reservations.
+    pub fn reserved_count(&self) -> usize {
+        self.reserved.len()
+    }
+
+    /// Whether `number` is claimed by a live reservation (so [`ProcessTable::alloc_pid`] will not
+    /// hand it out).
+    pub fn is_reserved(&self, number: u64) -> bool {
+        self.reserved.is_reserved(number)
+    }
+
+    /// The claimed identities, in unspecified order (a diagnostic; nothing may be inferred about
+    /// the pid table from it — a claimed pid is **not** a live process).
+    pub fn reserved_pids(&self) -> Vec<ProcessId> {
+        self.reserved.pids().collect()
+    }
+
+    /// The number of pid numbers currently available for reuse (the reuse list's length).
+    ///
+    /// A diagnostic for the reservation tests: a claim removes its number from this list and a
+    /// cancel returns it, so the length must return to what it was (a leak or a double entry shows
+    /// up here). It is **not** the count of allocatable numbers — [`ProcessTable::alloc_pid`] can
+    /// always grow past the materialised slots.
+    pub fn free_count(&self) -> usize {
+        self.free.len()
+    }
+
+    /// The number of materialised process-table slots (the pid-number high-water mark).
+    ///
+    /// A diagnostic for the reservation tests: a claim on a number beyond the table materialises
+    /// nothing, so a reserve/cancel round must leave this unchanged.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether the slot holding `number` has a live process in it.
+    ///
+    /// Deliberately **serial-blind**: an identity claim is on a *number*, and a different serial
+    /// in that slot still means the number is not available.
+    fn number_is_live(&self, number: u64) -> bool {
+        self.slots
+            .get(number as usize)
+            .map_or(false, |slot| slot.process.is_some())
+    }
+
+    /// Returns a released claim's `number` to the reuse list — at most **once**, and only if the
+    /// slot exists and is empty.
+    ///
+    /// A number beyond the table has no slot yet, so it is left alone: [`ProcessTable::alloc_pid`]
+    /// reaches it by growing, and materialising a slot here would strand every number between the
+    /// table's end and this one. The `contains` guard makes the at-most-once rule structural: a
+    /// duplicated reuse-list entry would let two processes share one identity.
+    fn release_reserved_number(&mut self, number: u64) {
+        let reusable = self
+            .slots
+            .get(number as usize)
+            .map_or(false, |slot| slot.process.is_none());
+        if reusable && !self.free.contains(&number) {
+            self.free.push(number);
+        }
     }
 
     /// Whether `pid` names a live process.
@@ -2354,6 +2559,101 @@ impl ProcessTable {
     ) -> Result<()> {
         let mut ports: Option<&mut PortTable> = Some(ports);
         self.service_signals_and_cascade(&mut ports, pid)
+    }
+
+    /// Applies the **receive-applicable** signals queued for `pid`, in FIFO order, stopping at the
+    /// first one whose application would terminate it — the **receive-scan** entry point.
+    ///
+    /// # What it is, and why it is not [`ProcessTable::service_signals`]
+    ///
+    /// `service_signals` is the **schedule-in** (and eager) entry point: it applies the whole
+    /// queue, terminates the process when a signal's [`exit_policy`] verdict says so, and cascades
+    /// to every process that termination signals. A **receive scan** must not do that. The C's
+    /// `i_loop_rec` (`erts/emulator/beam/emu/msg_instrs.tab:60-140`), on finding its message queue
+    /// exhausted, calls `erts_proc_sig_receive_helper` (`erl_proc_sig_queue.c:7729`), which handles
+    /// the receiver's own incoming signals (`erts_proc_sig_handle_incoming`, `:6229`) and then
+    /// re-peeks: a trapped exit becomes an `{'EXIT', …}` message, a monitor-DOWN becomes a
+    /// `{'DOWN', …}` message, an ignored (`normal` to a non-trapping receiver) exit is dropped —
+    /// but a signal that would **terminate** the process only sets `ERTS_PSFLG_EXITING`; the
+    /// helper reports `get_out > 0` (`:7860-7872`) and the receive instruction jumps to
+    /// `do_schedule`, so the process dies *after* it is scheduled out, never inside its own
+    /// receive.
+    ///
+    /// So this entry point:
+    ///
+    /// * **applies** ([`ReceiveApplicability::Apply`]), strictly FIFO, every head signal whose
+    ///   application yields a mailbox message — a trapped exit (`{'EXIT', From, Reason}` through
+    ///   `deliver_trapped_exit`) or a monitor-DOWN (`{'DOWN', …}`/`{Tag, …}` through
+    ///   `deliver_down_message`);
+    /// * **discards** ([`ReceiveApplicability::Discard`]) a head signal the C drops (an
+    ///   [`ExitPolicy::Ignore`] exit), popping it and continuing with the next one;
+    /// * **stops** ([`ReceiveApplicability::Stop`]) before the first head signal that would
+    ///   terminate the receiver ([`ExitPolicy::Terminate`]), leaving it — and everything behind it
+    ///   — queued and untouched, and returns `Ok(())`. That termination is the **schedule-out
+    ///   net's**: the runtime's park arm re-queues instead of parking, and the next schedule-in's
+    ///   [`ProcessTable::service_signals`] applies it and cascades.
+    ///
+    /// Two consequences a caller must know:
+    ///
+    /// * It **never** cascades to another process, so it takes **no** [`PortTable`] and has no
+    ///   `_with_ports` sibling: the only thing that drains a dying process's incoming port monitors
+    ///   is a cascade that terminates it, and no termination happens here.
+    /// * A delivered message `wake`s the receiver through the existing `deliver_head_signal` tail
+    ///   (and is recorded on the wake list). The normal in-scan caller is the currently executing
+    ///   ([`ProcessState::Running`]) process, which is not blocked, so that wake is a no-op for it.
+    ///
+    /// Nothing else about a delivery changes: the per-class message builders, the exhaustion
+    /// policy (collect-and-grow on demand, or the heap-fragment fallback for a receiver whose
+    /// relocating collection is declined — a `Running` or relocation-exempt receiver, or one the
+    /// host's [`CollectionGate`] declines) and the propagation rule itself are the **existing**
+    /// ones. The propagation policy stays single-sourced: the class comes from
+    /// [`receive_applicability`], which reads [`exit_policy`], and the action from the shared
+    /// [`ProcessTable::apply_head_signal`] — so the two can never disagree. That shared applier's
+    /// cascade `pending` worklist is constructed here but stays **empty**: only its terminating arm
+    /// (`terminate_into` → `schedule_service`) pushes to it, and a `Stop` verdict keeps this loop
+    /// away from that arm.
+    ///
+    /// A **quiet** or unknown `pid` returns `Ok(())` immediately, mutating nothing and allocating
+    /// nothing — the same fast path [`ProcessTable::service_signals`] takes (the `VecDeque::new`
+    /// below never allocates, and it is only reached when there is a head signal to look at).
+    ///
+    /// Documented approximation: the C's walk is **reduction-bounded**
+    /// (`erts_proc_sig_handle_incoming`'s `limit`/`abs_lim`, and the helper's `left_reds` yield), so
+    /// a long queue can make it return mid-queue. This walk is not: the receive scan's pre-emption
+    /// is the engine's own reduction budget at the caller (the runner's `budget`), so the whole
+    /// receive-applicable prefix is applied in one call. That changes no observable term or order,
+    /// only when a yield lands.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the message builders' `BeamError::Alloc` (a receiver whose nursery could not be
+    /// grown and whose relocating collection was not declined) exactly as the schedule-in path
+    /// does.
+    pub fn service_receive_signals(&mut self, pid: ProcessId) -> Result<()> {
+        if self.head_signal(pid).is_none() {
+            return Ok(());
+        }
+        // No port table: nothing on this path can terminate a process (see the docs above).
+        let mut ports: Option<&mut PortTable> = None;
+        // The shared applier's cascade worklist. It stays empty: only its terminating arm pushes
+        // to it, and `ReceiveApplicability::Stop` stops this loop before that arm.
+        let mut no_cascade = VecDeque::new();
+        while let Some(signal) = self.head_signal(pid) {
+            let Some(process) = self.get(pid) else {
+                // The queue outlived its PCB (nothing here can remove one): nothing to apply.
+                break;
+            };
+            let applicability =
+                receive_applicability(signal, process.is_trapping_exit(), &self.atoms);
+            if applicability == ReceiveApplicability::Stop {
+                // The receiver would have to *terminate*: leave the head (and the rest) queued.
+                break;
+            }
+            // `Apply` and `Discard` are exactly the two classes the shared applier handles without
+            // terminating: it delivers the message (popping the head) or pops the ignored signal.
+            self.apply_head_signal(&mut ports, pid, &mut no_cascade)?;
+        }
+        Ok(())
     }
 
     /// The shared body of [`ProcessTable::service_signals`] and
