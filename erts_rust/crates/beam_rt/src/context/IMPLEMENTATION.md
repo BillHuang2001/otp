@@ -187,3 +187,9 @@ The C computes it **once per VM start** in `erts_late_init_external` (`erts/emul
 * `block_hash(bytes, seed) -> u32` is a self-contained port of the C's `erts_block_hash_init`/`erts_block_hash` (`erts/emulator/beam/erl_term_hashing.c`): 12-byte blocks, `HCONST = 0x9e3779b9`, the 9-round `MIX`, the buffer's full length added into `c`, the descending-shift tail fold, a final `MIX` answering `c`.
 `NodeIdentity`'s `LocalNode::local_node_hash` returns `Some(node_hash())`; `beam_codec`'s `Encoder::finish_local(hash)` writes `[VERSION_MAGIC][LOCAL_EXT:121][hash:4 BE][body]`.
 **A differential case covering `[local]` must MASK the four hash bytes** and compare the rest (the value differs per VM start on **both** runtimes); `../tools/differential` (read-only sibling) still records `[local]` as an honest gap — adding the case is theirs.
+
+### The aliased `ets` copy-out in the tail
+
+`call_registered`'s result tail reads the `ets` table-alias witness (`alias.get()`) before it looks at the result, and splits three ways: an immediate/literal result is never copied; an **aliased container** is copied through `rehome_container_result` **unconditionally and before** `heap.reset_to(mark)` (its words are `beam_ets`'s `TermStore`'s — `free` recycles exact-fit runs — and a chunked `select` mixes them with a pool-built `{Objects, Cont}` tuple, so the rewind must not precede the copy); a refused aliased copy answers `BeamError::SystemLimit` instead of the un-copied term.
+The non-aliased cascade (`result_is_foreign_container` / `graph_holds_reference` / `move_container`) is unchanged, and `reset_to`/`put_bif_heap` run on every path.
+`mod notes` carries `note_alias_mark`/`note_alias_copy`/`note_alias_copy_pool`/`note_alias_refusal` for the deterministic pins in `calls/alias_tests.rs`.

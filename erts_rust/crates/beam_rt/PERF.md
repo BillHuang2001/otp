@@ -505,3 +505,11 @@ A deeper `beam_gc` fix (feed the collapse the post-copy live demand so a no-relo
 - [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md) → the bench driver's authoritative environment record, per-target tables, methodology and honesty audit (this file links to it and does not reproduce it). Its `m6` bands are a **different, far more heavily loaded** pass and are not the `CURRENT` baseline.
 - [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) → the `perf_bif` harness, the dispatch-cost narrative and the execution-trace seam.
 - [`CONTEXT.md`](CONTEXT.md) → the runtime crate's contracts and current state.
+
+## The `ets` table-alias witness (the copy-out halved)
+
+`beam_bifs`' `ets` read helpers can hand back the table's own terms (the `TableAliasing` seam) instead of copying every object onto the pooled BIF heap; the host half in `src/context/calls.rs` installs the witness on every dispatch and does the **one** copy in the tail, before the pool rewind.
+The structural figure is per op, not a timing: `ets:lookup/2` of one `{k,42}` object writes **5 → 2** words, `tab2list/1` of three objects **15 → 6**, `lookup_element/3` of a boxed element **3 → 0**, and a miss/empty result **0 → 0** (`../../beam_bifs/CONTEXT.md`).
+Measured on the `copy_bound/ets_copy` shape (250 000 rust ops, release `beam_rt` vs the pre-change binary kept in `$TMPDIR`, `bench compare` per pair): **−10.99 %** ns/op in the only round whose side-pair was taken at comparable host load (3341 → 2974 ns/op, `/proc/loadavg` ≈ 94 both sides).
+The remaining four rounds are **not** usable as a ratio: the shared host sat at 54–137 loadavg with 70-minute spikes, so `/proc/loadavg` moved by more than the effect inside a single round (`etf_roundtrip` swung +17 % … +139 %, `send_recv` +10 % … +83 %) and several rounds lost a metric to a starved run (`metric-only-in-a`).
+Read the structural word counts as the result and the −11 % as an indication; re-measure on an idle host before quoting a ratio.
