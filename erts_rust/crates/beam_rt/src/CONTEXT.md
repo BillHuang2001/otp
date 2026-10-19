@@ -173,7 +173,7 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `src/port/failure_e2e_tests.rs` 848 lines — a **test-only** suite (declared from `port/failure.rs`'s tail), so it is legitimately long: it compiles its own real C `.so` and drives one row per oracle opcode through the whole `port_command → output → FailureLatch → settle → signal_failure → drain_failures → push_ready` road, asserting each published `PortSignal` list whole.
 - `src/port/driver/port_term_tests.rs` 761 lines — a **test-only** suite (declared from `port/driver.rs`'s tail) for the `ERL_DRV_PORT` hook: the stamped handle↔`PortId` round trip through the real term-spec decoder, the foreign/null/unstamped refusals, the gone bit after `clear_driver_state`, and an end-to-end row through a real C driver that emits `{ERL_DRV_PORT, driver_mk_port(port)}`.
 - `src/port/failure.rs` 200 lines, 193 of production — **within target**; it is the driver-failure channel's runtime half (`signal_reason`, `PortRegistry::drain_failures`/`fail_port`, the ready-queue publication), declared inside `exit.rs`, and its two suites are `port/failure_tests.rs` (159, the reason-mapping units) and `port/failure_e2e_tests.rs` (above).
-- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 3 488 / 2 597, `cli.rs` 2 968 / 1 791, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 450 / 1 450, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 273 / 1 269, `eval/parse.rs` 1 593 / 1 235, `native/process.rs` 1 841 / 1 196, `native/prim.rs` 4 066 / 1 139, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 167 / 1 022, `nif.rs` 2 101 / 1 004.
+- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 3 488 / 2 597, `cli.rs` 2 968 / 1 791, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 450 / 1 450, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 273 / 1 269, `eval/parse.rs` 1 593 / 1 235, `native/process.rs` 1 841 / 1 196, `native/prim.rs` 4 066 / 1 139, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 167 / 1 022, `nif.rs` 2 385 / 1 160.
 
 ## Routing Table
 - `boot.rs` + `boot/` → preloaded-module set (`PreloadedModules`/`CORE_ATOMS`), the boot banner, the
@@ -181,7 +181,8 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `cli.rs` + `cli/` → the A.6 CLI parser/driver, the four `EXIT_*` codes and the boot-script drive
   (`cli/CONTEXT.md`).
 - `context/` → the concrete `ExecutionContext` glue, the host-seam bridges and the NIF-dispatch order
-  (`context/CONTEXT.md`).
+  (`context/CONTEXT.md`); the `load`-callback `enif_send` window is drained by `NifBridge::load_nif`
+  (`context/bridges.rs`) the moment the callback returns, over the pass's own process table.
 - `native.rs` + `native/` → the runtime-native BIF floor (`try_native`, before the registry), the
   native `file_server_2` service and the code/init/application/memory floors (`native/CONTEXT.md`).
 - `info.rs` + `info/` → the A.8 `system_info`/`process_info` introspection surface, incl. this file's

@@ -169,6 +169,13 @@ mod bin_vheap;
 /// payload reservoir, gated by the process's binary virtual heap (see [`bin_vheap`]'s module docs
 /// for why the park arm is its only sound site).
 pub(crate) use bin_vheap::{reclaim, OffHeapReclaimer};
+mod resources;
+/// The **NIF-resource prune** — drops the reference held by every live resource term nothing
+/// reachable from the parked process's complete root set names, so a resource that only an Erlang
+/// term kept alive gets its destructor run (contract A.3). Called from the same `Yield` park arm as
+/// the off-heap prune and under the same publishing gate; see [`resources`]'s module docs for the
+/// gates, the park-driven cadence and the leak-not-dangle residual.
+pub(crate) use resources::reclaim as reclaim_resources;
 /// Whether `module`'s code contains any **float-family** instruction, i.e. anything that
 /// reads or writes the machine's float-register file
 /// ([`Machine::fr`](beam_engine::Machine)).

@@ -48,6 +48,7 @@ use beam_alloc::Heap;
 use beam_term::prelude::{self, Eterm, NIL};
 
 use crate::common::SysIOVec;
+use crate::driver::async_pool::{AsyncPool, ReadyDelivery};
 use crate::driver::types::{
     ErlDrvBinary, ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvMonitor, ErlDrvNowData, ErlDrvPDL,
     ErlDrvPort, ErlDrvPort_, ErlDrvSInt, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_ATOM,
@@ -254,6 +255,10 @@ pub trait DriverHost {
     /// queue position (`=> 0`) or a negative error (default: unsupported, `-1`).
     ///
     /// A raw identifier because `async` is a Rust keyword; the C name is `driver_async`.
+    ///
+    /// This is the hook a host implements when it has **no** C async-job pool: the C's legacy
+    /// inline path. A host that has one ([`async_pool`](DriverHost::async_pool)) does not see this
+    /// hook at all — `driver_async` hands the job to the pool instead.
     fn r#async(
         &mut self,
         port: ErlDrvPort,
@@ -264,6 +269,56 @@ pub trait DriverHost {
     ) -> c_long {
         let _ = (port, key, invoke, data, free);
         -1
+    }
+
+    /// The host's C async-job pool — `erl_async.c`'s `ErtsAsyncData`, i.e. the emulator's `+A N`.
+    ///
+    /// When this answers `Some(pool)`, `driver_async` submits the job to it and reports what the C
+    /// reports: the positive job id for a queued job (`erl_async.c:600`), or `0` after the pool ran
+    /// it inline — the `+A 0` configuration, which is `AsyncPool::new(0)` (`:603-616`) — and the
+    /// completion policy then travels through
+    /// [`deliver_ready_async`](DriverHost::deliver_ready_async).
+    ///
+    /// The default `None` keeps `driver_async` on the legacy path that forwards to
+    /// [`r#async`](DriverHost::r#async), so a host with no pool is byte-identical to before this
+    /// hook existed.
+    ///
+    /// The pool is cheap to clone (an `Arc`), so a host typically stores one and hands out clones.
+    /// Everything the host must then do is listed on [`AsyncPool`]: drain the ready queue on a
+    /// scheduler tick, call [`AsyncPool::port_closed`] when a port dies, and keep the driver's
+    /// shared object mapped while [`AsyncPool::pending_for_port`] is non-zero (the C's
+    /// `erts_ddll_reference_referenced_driver`/`..._dereference_driver` pair, `:236-237`,
+    /// `:343-344`).
+    fn async_pool(&self) -> Option<AsyncPool> {
+        None
+    }
+
+    /// The C's `async_ready(Port *p, void *data)` (`io.c:5374-5406`): deliver a finished async job's
+    /// data to the port's driver entry `ready_async` callback and say whether the **caller** must
+    /// still release it.
+    ///
+    /// * [`ReadyDelivery::NeedFree`] — the C's `need_free == 1` (`io.c:5376`): no callback ran (the
+    ///   entry has no `ready_async`, `:5382`), or the port is gone, or the host could not deliver.
+    ///   The calling [`CompletedAsync`] then runs the job's `async_free`.
+    /// * [`ReadyDelivery::Consumed`] — the C's `need_free == 0` (`io.c:5400`): the entry's
+    ///   `ready_async` callback actually ran and took ownership of the data, so `async_free` must
+    ///   **not** run.
+    ///
+    /// The delivery itself is `DriverLibrary::ready_async(ErlDrvData, ErlDrvThreadData)`
+    /// ([`crate::driver::loader::DriverLibrary::ready_async`]) — the port's driver-private
+    /// `ErlDrvData` plus the `data` operand as `ErlDrvThreadData`, i.e. the `ErlDrvEntry`'s
+    /// `ready_async` slot (`crate::driver::types::ErlDrvEntry::ready_async`,
+    /// `erts/emulator/beam/erl_driver.h`). A port that no longer exists must answer
+    /// [`ReadyDelivery::NeedFree`] **without** calling any callback: that is the C's `!p` branch
+    /// (`erl_async.c:320-330`), and it is what makes the pool's completion race-free even for a job
+    /// a worker was still running when the port died.
+    ///
+    /// The default answers [`ReadyDelivery::NeedFree`] without delivering anything, which is exactly
+    /// what an entry with no `ready_async` callback gets — so a host that does not implement this is
+    /// safe (its jobs' `async_free` always runs), never wrong.
+    fn deliver_ready_async(&mut self, port: ErlDrvPort, data: *mut c_void) -> ReadyDelivery {
+        let _ = (port, data);
+        ReadyDelivery::NeedFree
     }
 
     /// The pid the port is connected to (`driver_connected`), or `None` (default: unsupported).
@@ -2018,5 +2073,13 @@ mod tests {
 
         // Deprecated wall clock.
         assert!(host.now().is_none());
+
+        // The C async-job pool and its delivery hook: no pool, and "nothing was delivered, so the
+        // caller must free" — which is exactly what an entry with no `ready_async` gets.
+        assert!(host.async_pool().is_none(), "no pool ⇒ the legacy `r#async` path");
+        assert_eq!(
+            host.deliver_ready_async(core::ptr::null_mut(), core::ptr::null_mut()),
+            ReadyDelivery::NeedFree
+        );
     }
 }

@@ -286,7 +286,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `'EXIT'`/`'DOWN'` on close for a trapping/monitoring owner and `port_info/2`'s `queue_size`/`memory` all
   agree; a driver port's `control` answer is gated on the **driver's own** capability
   (`Driver::has_control`, the C's `control != NULL`), not a name list; `{packet,N}` framing applies to the
-  output path too. Typed residuals are listed under *Known Structural Debt*. The compatibility gate is `../tools/differential/gate.sh`
+  output path too. **A.4 async jobs:** `driver_async` allocates from a real pool
+  (`beam_abi::driver::async_pool::AsyncPool` — the C's `erl_async.c` table: monotonically increasing
+  positive ids, `+A N` workers, `+A 0` the C's inline branch), drained by the runtime's poll loop so
+  `ready_async` is called with the job's own `async_data` and `async_free` runs exactly once (never when
+  `ready_async` took the data, always when the port is gone); the driver `.so` stays mapped while
+  `pending_for_port(port) > 0`. Typed residuals are listed under *Known Structural Debt*. The compatibility gate is `../tools/differential/gate.sh`
   (root-owned) — it boots the script per case, so an end-to-end `gate.sh` run now takes >100 min single-threaded; a full-corpus
   sweep of `differential run <case-id>` is gate-equivalent per case because every `run` verdict already folds in
   the oracle-vs-golden drift check (`tools/differential/src/compare.rs::verdict_with`).
@@ -411,16 +416,45 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   OWN records (`families/records/mod.rs` — the `create_native_record`/`create_local_native_record` route,
   built from the module's own `Recs` definition); the only remaining gap is a create from a **foreign**
   module's record id (`{Module,Name}` naming another module), which stays a typed `unsupported`.
-- **The NIF subsystem (contract A.3) works end-to-end.** `beam_abi` implements a real `enif_*` host API
-  (`src/nif/enif.rs`) over the host seam `NifHost`/`NifEnv` (`src/nif/host.rs`), which supplies term
-  allocation/`intern_atom`/`atom_name`/`self_pid` and optional `term_to_binary`/`binary_to_term`/`make_ref`
-  hooks — so `beam_abi` gains **no** dependency edge to `beam_codec` (the wave DAG stays acyclic). Coverage
-  spans allocation (`enif_alloc`/`free`/`alloc_binary`/`release_binary`/`make_new_binary`), accessors
-  (`enif_get_int/long/uint/ulong/int64/uint64/double/atom(+_len)/string/tuple/list_cell/list_length/
-  map_size/map_value/binary`, `enif_is_*`), constructors (`enif_make_int/long/uint/ulong/int64/uint64/
-  double/atom(+_len)/tuple(+_from_array)/list(_cell/_reverse/_from_array)/binary/string(+_len)/ref/pid/
-  badarg/map_put/map_remove`), `enif_raise_exception`, `enif_compare`, `enif_has_pending_exception`,
-  `enif_clear_env`. The **dynamic loader** (`src/nif/loader.rs`) uses `libc`'s `dlopen`/`dlsym`/`dlclose`
+- **The NIF subsystem (contract A.3) is live end-to-end, including the stateful `enif_*` family.**
+  `beam_abi` implements the 176-slot `enif_*` host API (`src/nif/enif/`) over `NifHost`/`NifEnv`
+  (`src/nif/host.rs`) — term allocation/`intern_atom`/`atom_name`/`self_pid` plus the optional hooks
+  (`term_to_binary`/`binary_to_term`/`binary_to_term_used`/`make_ref`/`send`/`select`/
+  `monitor_process(_result)`/`demonitor_process`/`whereis_pid`/`system_info`/`atom_table`/`alloc_env`/
+  `free_env`/`make_copy`/…) — so `beam_abi` gains **no** dependency edge to `beam_codec` (the wave DAG
+  stays acyclic). Resources are keyed by reference **identity**, so `enif_get_resource` resolves a
+  *copied* resource term, and a monitor's identity is the whole 32-byte internal-reference block.
+  Coverage spans allocation (`enif_alloc`/`free`/`alloc_binary`/`release_binary`/`make_new_binary`),
+  accessors (`enif_get_int/long/uint/ulong/int64/uint64/double/atom(+_len)/string/tuple/list_cell/
+  list_length/map_size/map_value/binary`, `enif_is_*`), constructors (`enif_make_int/long/uint/ulong/
+  int64/uint64/double/atom(+_len)/tuple(+_from_array)/list(_cell/_reverse/_from_array)/binary/
+  string(+_len)/ref/pid/badarg/map_put/map_remove`), `enif_raise_exception`, `enif_compare`,
+  `enif_has_pending_exception`, `enif_clear_env`.
+- **The stateful `enif_*` behaviours are oracle-cross-checked** (OTP 29.1.1, `cc`-built C fixtures under
+  `beam_abi/src/nif/enif/fixtures/` and `beam_rt/tests/fixtures/`; every case is the same `.so`/`.beam`
+  under both runtimes, and each test skips loudly without the toolchain):
+  * `enif_send` delivers through the same `beam_message::copy_struct` boundary as a BIF send — from a call
+    (`NULL`-env and `msg_env`/`enif_make_copy` forms) **and** from a NIF's `load` callback, where a
+    callback-scoped queue on the load host is drained at callback exit so the message is in the target's
+    mailbox before Erlang continues; a dead pid is the C's `0`.
+  * `enif_monitor_process` arms a real monitor, and the resource type's `down` callback fires exactly once
+    with the dead target's pid and the stored monitor block; `enif_demonitor_process` answers the C's
+    `0`/`1`; a dead or `undefined` target, and a type opened without a `down` callback, answer the C's
+    `1`/`-1`. A resource released/destroyed while armed fires nothing.
+  * `enif_select` on a real descriptor registers with the runtime's single `beam_io` reactor, holds one
+    reference per interest (`beam_abi::nif::enif::resources::keep_resource`, released on every teardown
+    path), and delivers the C's `{select, ResourceTerm, Reference, EventAtom}`
+    (`ready_input`/`ready_output`/`ready_error`; `CUSTOM_MSG` delivers the caller's term verbatim); STOP
+    and CANCEL answer the C's `STOP_CALLED`/`*_CANCELLED` bits and an unservable request stays a typed
+    refusal. Residual: `ERL_NIF_SELECT_STOP_SCHEDULED` (no resource-`stop` seam yet).
+  * A resource exposed only as a term is reclaimed when the term dies: the runner's park arm prunes
+    through `beam_abi::nif::enif::release_resource_terms` with a complete-root predicate that matches a
+    word **or** a reference identity (a copied term therefore counts as reachable), running the
+    destructor exactly once.
+  * `enif_make_map_from_arrays` refuses a duplicate key as the C does (`0`, `=:=` basis);
+    `enif_binary_to_term` reports the consumed byte count and answers `0` for a truncated image;
+    `enif_term_to_binary` of a local closure emits `NEW_FUN_EXT` through the `LocalFunIdentity` bridge.
+- The **dynamic loader** (`src/nif/loader.rs`) uses `libc`'s `dlopen`/`dlsym`/`dlclose`
   (no new dependency) to read `nif_init`'s `ErlNifEntry`, validate `ERL_NIF_MAJOR_VERSION`/
   `ERL_NIF_MINOR_VERSION`, run the entry's `load` callback against a host `ErlNifEntry*`, and expose
   `NifLibrary::call`. `beam_bifs` adds the `erlang:load_nif/2` BIF + the optional `NifLoader`/`current_module`
@@ -430,7 +464,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   code in `beam_rt/tests/nif.rs`; a version mismatch / missing `nif_init` yields a typed error, never a crash.
   `enif_*` C-variadic functions (make_tuple/list, `set_option`, the `*printf` family) are left `None` because
   stable Rust cannot define a C-variadic `fn` (rust-lang/rust#44930); the `_from_array` variants cover
-  tuple/list building. `term_to_binary`/`binary_to_term`/`make_ref` remain defaulted `None` in `NifHostImpl`.
+  tuple/list building. The load/unload host carries `services = None`, so only the callback-scoped
+  `enif_send` window answers there; `upgrade` is not modelled (a second `load_nif/2` is the oracle's
+  `reload` refusal).
 
 ## Contract A.9 (build/bootstrapping) — status
 A.9 is the shallowest contract: its differential coverage is boot/version **observability** plus the
@@ -506,6 +542,15 @@ in-process compiler route.
   (c) `INET_REQ_FDOPEN`'s adoption form (the C's `prebound` descriptor is never closed, while this
   floor's `stop`/`Drop` closes everything it owns), `ignorefd` (needs readiness suppression) and
   `tcp_sendfile` reproduce their refusals only.
+- **A.3 residuals, each a typed refusal or a deferred answer rather than a wrong result.**
+  (a) `ERL_NIF_SELECT_STOP_SCHEDULED` is never answered — the resource type's `stop` callback has no
+  host seam, so a STOP keeps the C's fast-track `STOP_CALLED` answer.
+  (b) The load/unload host runs with `services = None`: only the callback-scoped `enif_send` window
+  answers there, and `upgrade` is not modelled at all (a second `load_nif/2` is the oracle's `reload`
+  refusal), while a `dtor`-time send has no live receiver set and no drain point.
+  (c) A monitor of a **remote** pid answers `NotAlive` (no cross-node NIF monitor), and a copied
+  `enif_make_resource_binary` term does not resolve through `enif_get_resource` (that binary is on-heap
+  here, not the C's copy-shared magic binary).
 - The map/bitstring/refc handoffs above are only partly adopted: `beam_codec` forwards to `beam_term`
   (`src/term/{binary,record}.rs`) but keeps a crate-local oversized-*flat*-map writer. Off-heap refc
   liveness is the process's: `beam_process` sweeps its owned payloads by reachability at the end of a

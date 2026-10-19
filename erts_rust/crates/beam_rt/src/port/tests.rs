@@ -26,6 +26,8 @@
 use super::*;
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use beam_io::signal::{Disposition, Signal};
 use beam_io::DriverContext;
 use beam_process::{ProcessState, SignalAtoms};
@@ -3964,4 +3966,180 @@ fn the_delivered_data_half_encodes_byte_for_byte_like_the_oracle() {
             None => skip_oracle_check("the byte-for-byte `term_to_binary(element(2, Msg))` check"),
         }
     }
+}
+/// One armed select registration on a **real readable descriptor**, plus the terms it carries.
+///
+/// The descriptor is a socketpair end the test owns: writing on the peer makes it readable, which
+/// is exactly the readiness an `enif_select` caller arms for. (A socketpair rather than a pipe
+/// because the sandbox refuses `fcntl` on inherited descriptors and `UnixStream::pair` always
+/// accepts it.)
+fn armed_select(
+    rt: &mut Runtime,
+    owner: ProcessId,
+    payload: select::SelectPayload,
+    handle: Eterm,
+) -> (UnixStream, UnixStream) {
+    let (local, peer) = UnixStream::pair().expect("a socketpair");
+    rt.ports
+        .borrow_mut()
+        .arm_nif_select(
+            owner,
+            local.as_raw_fd(),
+            Interest::READABLE,
+            payload,
+            handle,
+            std::ptr::null_mut(),
+        )
+        .expect("a socketpair end is registrable");
+    (local, peer)
+}
+/// The first message `pid` received, as `(sender, payload)`.
+fn first_message(table: &ProcessTable, pid: ProcessId) -> (Eterm, Eterm) {
+    let process = table.get(pid).expect("the recipient is live");
+    let message = process.mailbox().peek().expect("the recipient got a message");
+    (message.from(), message.payload())
+}
+/// The name of a term that must be an atom, resolved in the runtime's shared table.
+fn atom_name(rt: &Runtime, term: Eterm) -> String {
+    rt.atom_name_of(term)
+        .unwrap_or_else(|| panic!("{term:?} is not a resolvable atom"))
+        .to_string()
+}
+/// A ready `enif_select`/`tty_select/2` registration delivers the C's **plain** notification —
+/// the 4-tuple `{select, Handle, Reference, EventAtom}` with the emulator itself (`system`) as the
+/// sender — into the **arming** process's mailbox, exactly once, and leaves nothing armed
+/// (`prepare_select_msg`/`send_select_msg`, `erts/emulator/sys/common/erl_check_io.c:699-858`).
+#[test]
+fn a_ready_select_registration_delivers_the_plain_notification_tuple() {
+    use std::io::Write;
+    let (mut rt, mut table) = runtime_with_table();
+    let reader = table.spawn_default().expect("the selecting process");
+    let handle = make_small(11);
+    let reference = make_small(22);
+    let (_local, mut peer) = armed_select(
+        &mut rt,
+        reader,
+        select::SelectPayload::Plain { reference },
+        handle,
+    );
+    // An armed registration is a wake source: a blocked process can still be woken by it.
+    assert!(
+        !rt.ports.borrow().has_nothing_to_poll(),
+        "an armed select registration is pending work"
+    );
+    peer.write_all(b"x").expect("write to the selected descriptor");
+    assert_eq!(
+        deliver_until(&mut rt, &mut table, 1),
+        1,
+        "the readiness is delivered exactly once"
+    );
+    let (from, message) = first_message(&table, reader);
+    assert_eq!(atom_name(&rt, from), "system", "the emulator is the sender");
+    assert_eq!(atom_name(&rt, terms::tuple_element(message, 0).expect("element 0")), "select");
+    assert_eq!(
+        terms::tuple_element(message, 1).expect("element 1"),
+        handle,
+        "the handle is the tuple's second element"
+    );
+    assert_eq!(
+        terms::tuple_element(message, 2).expect("element 2"),
+        reference,
+        "the caller's reference is the third"
+    );
+    assert_eq!(
+        atom_name(&rt, terms::tuple_element(message, 3).expect("element 3")),
+        "ready_input",
+        "a read interest reports the readable event atom"
+    );
+    // One-shot: the registration was de-registered as it was reported, so the runtime has nothing
+    // left to poll for again.
+    assert!(
+        rt.ports.borrow().has_nothing_to_poll(),
+        "the delivered registration leaves nothing armed"
+    );
+}
+/// A registration armed with `ERL_NIF_SELECT_CUSTOM_MSG` delivers the caller's own message term
+/// **verbatim** — no `{select, …}` tuple and no event atom (`erl_check_io.c:716-731`), still sent
+/// by the emulator.
+#[test]
+fn a_custom_select_payload_is_delivered_verbatim() {
+    use std::io::Write;
+    let (mut rt, mut table) = runtime_with_table();
+    let reader = table.spawn_default().expect("the selecting process");
+    // The caller's own message: a tuple of immediates, which needs no re-homing and is what a NIF
+    // hands over as `msg_env`'s term.
+    let message = make_small(77);
+    let (_local, mut peer) = armed_select(
+        &mut rt,
+        reader,
+        select::SelectPayload::Custom { message },
+        make_small(11),
+    );
+    peer.write_all(b"x").expect("write to the selected descriptor");
+    assert_eq!(deliver_until(&mut rt, &mut table, 1), 1, "the readiness is delivered");
+    let (from, delivered) = first_message(&table, reader);
+    assert_eq!(atom_name(&rt, from), "system", "the emulator is the sender");
+    assert_eq!(
+        delivered, message,
+        "a custom message is delivered as itself, never wrapped in the plain tuple"
+    );
+}
+/// `ERL_NIF_SELECT_STOP` really de-registers and answers whether anything was armed, and
+/// `ERL_NIF_SELECT_CANCEL` reports which directions really were armed
+/// (`erl_check_io.c:1272-1284`, `:1292`, `:1470-1482`).
+#[test]
+fn stop_and_cancel_report_what_was_really_armed() {
+    let (mut rt, mut table) = runtime_with_table();
+    let reader = table.spawn_default().expect("the selecting process");
+    let handle = make_small(11);
+    let (local, _peer) = armed_select(
+        &mut rt,
+        reader,
+        select::SelectPayload::Plain {
+            reference: make_small(22),
+        },
+        handle,
+    );
+    let fd = local.as_raw_fd();
+    {
+        let mut registry = rt.ports.borrow_mut();
+        // A cancel of a direction that was never armed clears nothing and leaves the read armed.
+        let cancelled = registry
+            .cancel_nif_select(fd, handle, Interest::WRITABLE)
+            .expect("a cancel");
+        assert!(cancelled.is_empty(), "nothing was armed for writing");
+        assert!(
+            !registry.has_nothing_to_poll(),
+            "the read interest is still armed after a no-op cancel"
+        );
+        let stopped = registry.stop_nif_select(fd, handle).expect("a stop");
+        assert!(
+            stopped.readable && !stopped.writable && !stopped.error,
+            "STOP reports the read interest it cleared, got {stopped:?}"
+        );
+        assert!(
+            registry.has_nothing_to_poll(),
+            "STOP really de-registered the descriptor"
+        );
+        assert!(
+            registry
+                .stop_nif_select(fd, handle)
+                .expect("a second stop")
+                .is_empty(),
+            "a second STOP reports that nothing was armed"
+        );
+        let cancelled = registry
+            .cancel_nif_select(fd, handle, Interest::READABLE)
+            .expect("a cancel on an unarmed descriptor");
+        assert!(cancelled.is_empty());
+    }
+    // Nothing was delivered to the arming process: the readiness was never reported.
+    assert!(
+        table
+            .get(reader)
+            .expect("the reader")
+            .mailbox()
+            .peek()
+            .is_none()
+    );
 }

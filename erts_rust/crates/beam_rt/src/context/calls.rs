@@ -556,6 +556,9 @@ impl<'a> RuntimeContext<'a> {
                     atoms: Rc::clone(&atoms),
                     interner: pending.share(),
                     self_pid: self_pid.to_eterm(),
+                    // The pass's own table, so a `load`-callback `enif_send` is delivered into
+                    // the live process table rather than the pass's empty placeholder.
+                    mailbox: mailbox_table.as_deref_mut(),
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_table_aliasing(&alias)
@@ -1412,20 +1415,18 @@ impl<'a> RuntimeContext<'a> {
         let nifs = Rc::clone(&self.runtime.nifs);
         // The runtime services the host calls back into, over the same process table the rest of
         // the context resolves against (the slice's own table when there is one, else the
-        // runtime's). These are **disjoint** field borrows of `self.runtime`, which is what lets
-        // them co-exist with each other and with `self.mailbox_table`.
-        let processes: &ProcessTable = match &self.mailbox_table {
-            Some(table) => &**table,
-            None => &self.runtime.processes,
-        };
+        // runtime's). These are **disjoint** borrows — the runtime itself and the caller-supplied
+        // pass table — which is what lets them co-exist with each other and with
+        // `self.mailbox_table`.
         let mut services = RuntimeNifServices {
-            refs: &mut self.runtime.refs,
-            references: &mut self.runtime.references,
-            processes,
-            ports: &self.runtime.ports,
+            runtime: self.runtime,
+            mailbox: self.mailbox_table.as_deref_mut(),
+            // The module whose code issued the call: the caller-first preference of the local-fun
+            // `NEW_FUN_EXT` identity (`enif_term_to_binary` of a closure), the same one
+            // `call_registered` hands its `FunIdentityBridge`.
+            caller: self.current_module.as_deref(),
         };
-        let mut host = NifHostImpl::new(
-            heap,
+        let mut host = NifHostImpl::new(            heap,
             Rc::clone(&atoms),
             interner.share(),
             self_pid,

@@ -209,6 +209,26 @@ impl ErlNifSelectFlags {
     pub const fn from_bits(bits: c_int) -> Self {
         Self(bits)
     }
+
+    /// Whether this mask and `other` overlap — the C's `mode & FLAG` test.
+    ///
+    /// This is the decode [`enif_select`](crate::nif::enif::select::enif_select) hands a host, which
+    /// is what `erts/emulator/sys/common/erl_check_io.c` does with the mode it is given:
+    /// `mode & ERL_NIF_SELECT_STOP` (`:1272`), `mode & ERL_NIF_SELECT_CANCEL` with `ASSERT(mode)`
+    /// (`:1292-1293`), `mode & ERL_DRV_READ` (`:1294`), `mode & ERL_DRV_WRITE` (`:1297`) and
+    /// `mode & ERL_NIF_SELECT_ERROR` (`:1300`) on the way in, and the same tests on the way out to
+    /// build the `ERL_NIF_SELECT_*_CANCELLED` bits (`:1470-1482`). `ERL_DRV_READ`/`ERL_DRV_WRITE`/
+    /// `ERL_DRV_USE` are `#define`s of `ERL_NIF_SELECT_READ`/`_WRITE`/`_STOP`
+    /// (`erts/emulator/beam/erl_driver.h:61-63`), so one flag set serves both spellings.
+    ///
+    /// A host uses it to map a mode onto its poller's interests (`readable`/`writable`/`error`)
+    /// without hard-coding bit shifts. Note that a *zero* mask intersects nothing — the C treats a
+    /// zero mode as a programming error (`ASSERT(mode)`), which
+    /// [`enif_select`](crate::nif::enif::select::enif_select) refuses before a host ever sees it.
+    #[inline]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

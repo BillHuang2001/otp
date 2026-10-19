@@ -115,9 +115,30 @@ impl Token {
 /// A readiness mask requested at registration time.
 ///
 /// It is a tiny bitset: whether the caller wants to be notified when the descriptor is
-/// readable and/or writable. Use the [`Interest::READABLE`], [`Interest::WRITABLE`] and
-/// [`Interest::BOTH`] constants or the [`Interest::readable`]/[`Interest::writable`]
-/// constructors.
+/// readable and/or writable **and/or has an error condition**. Use the
+/// [`Interest::READABLE`], [`Interest::WRITABLE`], [`Interest::BOTH`] and [`Interest::ERROR`]
+/// constants, the [`Interest::readable`]/[`Interest::writable`]/[`Interest::error`]
+/// constructors, or [`Interest::add`] to combine a direction with the error bit — the way the
+/// driver/NIF select surfaces spell `ERL_DRV_READ | ERL_NIF_SELECT_ERROR`.
+///
+/// # The error bit is caller intent, not an OS request
+///
+/// [`Interest::ERROR`] mirrors `ERL_NIF_SELECT_ERROR`
+/// (`erts/emulator/beam/erl_drv_nif.h:54-61`, `ERL_NIF_SELECT_ERROR = (1 << 5)`), which
+/// `erl_check_io.c:1297-1307` translates into an `ERTS_POLL_EV_ERR` bit on the poll set's
+/// control mask. At the *requested*-mask conversion the error bit has nowhere to go:
+/// `erl_poll.c`'s `ev2pollev` (:340-352) maps only `ERTS_POLL_EV_IN`/`ERTS_POLL_EV_OUT`,
+/// while the *observed* half `pollev2ev` (:352-366) is what turns a kernel error into
+/// `ERTS_POLL_EV_ERR`. `mio` 1.x is the same: its interest set is
+/// `READABLE`/`WRITABLE`/`AIO`/`LIO`/`PRIORITY` with **no error bit**
+/// (`mio-1.2.4/src/interest.rs:20-52`). The bit is therefore a **caller-intent** bit at this
+/// boundary, recording that the caller wants error notifications so that
+/// [`Poller::register`] can carry the intent; the delivery half is
+/// [`Ready::is_error`], which `epoll`/`kqueue` report unconditionally in every round.
+///
+/// Consequently the mask never *suppresses* error readiness: a registration made with
+/// [`Interest::READABLE`] alone still observes [`Ready::is_error`] (that is what the inet
+/// drivers' read-readiness accounting relies on), and [`Interest::ERROR`] agrees with it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Interest {
     bits: u8,
@@ -133,6 +154,13 @@ impl Interest {
     /// Interested in both readiness directions.
     pub const BOTH: Interest = Interest { bits: 0b11 };
 
+    /// Interested in an error condition (`ERL_NIF_SELECT_ERROR`).
+    ///
+    /// See the type docs: this is a caller-intent bit — no poll backend takes an error
+    /// *request* — and the observation it asks for is [`Ready::is_error`], which a poll round
+    /// reports whether or not the bit was set.
+    pub const ERROR: Interest = Interest { bits: 0b100 };
+
     /// An [`Interest`] in readability only (same as [`Interest::READABLE`]).
     pub const fn readable() -> Interest {
         Interest::READABLE
@@ -141,6 +169,11 @@ impl Interest {
     /// An [`Interest`] in writability only (same as [`Interest::WRITABLE`]).
     pub const fn writable() -> Interest {
         Interest::WRITABLE
+    }
+
+    /// An [`Interest`] in an error condition only (same as [`Interest::ERROR`]).
+    pub const fn error() -> Interest {
+        Interest::ERROR
     }
 
     /// Whether this mask includes readability.
@@ -152,6 +185,22 @@ impl Interest {
     pub fn is_writable(self) -> bool {
         self.bits & 0b10 != 0
     }
+
+    /// Whether this mask includes an error condition.
+    pub fn is_error(self) -> bool {
+        self.bits & 0b100 != 0
+    }
+
+    /// The union of two masks (named after `mio::Interest::add`).
+    ///
+    /// This is how a direction and the error bit are combined:
+    /// [`Interest::READABLE`]`.add(`[`Interest::ERROR`]`)` is
+    /// `ERL_NIF_SELECT_READ | ERL_NIF_SELECT_ERROR`.
+    pub const fn add(self, other: Interest) -> Interest {
+        Interest {
+            bits: self.bits | other.bits,
+        }
+    }
 }
 
 /// The readiness actually observed for a descriptor.
@@ -159,6 +208,12 @@ impl Interest {
 /// Unlike [`Interest`], a [`Ready`] value reports what the operating system observed in a
 /// [`Poller::poll`] round: readability, writability, an error condition and the
 /// read/write half-close (EOF) edges.
+///
+/// The error condition is surfaced through [`Ready::is_error`] and **is never gated on the
+/// registration's [`Interest`] mask**: `epoll`/`kqueue` report error (and hang-up) readiness
+/// unconditionally, so a registration made with [`Interest::READABLE`] alone still observes
+/// it. That is also why [`Interest::ERROR`] is a caller-intent bit rather than an OS request
+/// (see its docs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Ready {
     readable: bool,
@@ -180,6 +235,9 @@ impl Ready {
     }
 
     /// Whether the descriptor reported an error condition.
+    ///
+    /// It is what an [`Interest::ERROR`] registration asks for; the OS reports it in every
+    /// poll round regardless of the registration's [`Interest`] mask.
     pub fn is_error(self) -> bool {
         self.error
     }
@@ -198,7 +256,9 @@ impl Ready {
 /// One readiness event produced by [`Poller::poll`].
 ///
 /// It pairs the opaque [`Token`] assigned at registration with the caller's `u64` key and
-/// the observed [`Ready`] mask, so the reactor can find the owning port by key.
+/// the observed [`Ready`] mask, so the reactor can find the owning port by key. The observed
+/// error readiness of a round is [`Ready::is_error`]; it is reported whether or not the
+/// registration asked for it with [`Interest::ERROR`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Event {
     token: Token,
@@ -258,8 +318,17 @@ pub struct Poller {
 
 /// Translates this crate's [`Interest`] mask into `mio`'s.
 ///
-/// `mio::Interest` is a non-zero bitset, so an empty mask (no readiness direction
-/// requested) falls back to readability, which is always a legal registration.
+/// `mio::Interest` is a non-zero bitset of `READABLE`/`WRITABLE` (plus the platform-only
+/// `AIO`/`LIO`/`PRIORITY`) and has **no error bit** (`mio-1.2.4/src/interest.rs:20-52`), so
+/// [`Interest::ERROR`] has nothing of its own to map onto:
+///
+/// * [`Interest::ERROR`] alone maps to `mio::Interest::READABLE` — the legal non-zero
+///   fallback. Readability is registered **solely** because `mio::Interest` must be non-zero;
+///   an error is reported by `epoll`/`kqueue` regardless of the mask, so the registration
+///   still observes it through [`Ready::is_error`].
+/// * `READABLE.add(ERROR)` and `BOTH.add(ERROR)` are unchanged from `READABLE` and `BOTH`.
+///
+/// The mapping is total and side-effect free.
 fn to_mio_interest(interest: Interest) -> mio::Interest {
     match (interest.is_readable(), interest.is_writable()) {
         (true, true) => mio::Interest::READABLE.add(mio::Interest::WRITABLE),
@@ -574,7 +643,10 @@ impl Poller {
             let ready = Ready {
                 readable: pfd.revents & libc::POLLIN != 0,
                 writable: pfd.revents & libc::POLLOUT != 0,
-                error: pfd.revents & libc::POLLERR != 0,
+                // `POLLERR`/`POLLHUP`/`POLLNVAL` are output-only in `poll(2)`, so they are
+                // never requested above; the C folds `ERR|NVAL` into one error event
+                // (`erl_check_io.c:1146`, `:2143`).
+                error: pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0,
                 read_closed: pfd.revents & libc::POLLHUP != 0,
                 write_closed: pfd.revents & libc::POLLHUP != 0,
             };
@@ -643,323 +715,10 @@ impl Waker {
     }
 }
 
+// The poller's suite — the readiness newtypes, the `mio`↔`poll(2)` mappings and the real
+// descriptor cases — is a `#[path]` sibling for the same reason as `port.rs`'s
+// `active_input_tests.rs`: the source half stays near the workspace's ~1000-line convention.
+// It remains a **child** module of `poller` so it can pin the private `Interest` bitset.
 #[cfg(test)]
-mod tests {
-    use super::{to_mio_interest, Event, Interest, Poller, Ready, Token, WAKER_KEY};
-    use beam_common::BeamError;
-    use std::io::Write;
-    use std::os::unix::io::{AsRawFd, RawFd};
-    use std::os::unix::net::UnixStream;
-    use std::path::PathBuf;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn interest_constants_and_constructors_agree() {
-        assert_eq!(Interest::readable(), Interest::READABLE);
-        assert_eq!(Interest::writable(), Interest::WRITABLE);
-
-        assert!(Interest::READABLE.is_readable());
-        assert!(!Interest::READABLE.is_writable());
-
-        assert!(Interest::WRITABLE.is_writable());
-        assert!(!Interest::WRITABLE.is_readable());
-
-        assert!(Interest::BOTH.is_readable());
-        assert!(Interest::BOTH.is_writable());
-    }
-
-    #[test]
-    fn interest_maps_onto_mio() {
-        assert!(to_mio_interest(Interest::READABLE).is_readable());
-        assert!(!to_mio_interest(Interest::READABLE).is_writable());
-
-        assert!(to_mio_interest(Interest::WRITABLE).is_writable());
-        assert!(!to_mio_interest(Interest::WRITABLE).is_readable());
-
-        let both = to_mio_interest(Interest::BOTH);
-        assert!(both.is_readable() && both.is_writable());
-    }
-
-    #[test]
-    fn ready_and_event_accessors() {
-        let ready = Ready {
-            readable: true,
-            writable: false,
-            error: false,
-            read_closed: true,
-            write_closed: false,
-        };
-        assert!(ready.readable());
-        assert!(!ready.writable());
-        assert!(!ready.is_error());
-        assert!(ready.is_read_closed());
-        assert!(!ready.is_write_closed());
-        assert_eq!(
-            Ready::default(),
-            Ready {
-                readable: false,
-                writable: false,
-                error: false,
-                read_closed: false,
-                write_closed: false
-            }
-        );
-
-        let event = Event::new(Token(3), 42, ready);
-        assert_eq!(event.token(), Token(3));
-        assert_eq!(event.token().get(), 3);
-        assert_eq!(event.key(), 42);
-        assert_eq!(event.ready(), ready);
-    }
-
-    #[test]
-    fn a_fresh_poller_has_no_registrations() {
-        let poller = Poller::new().expect("a poll set");
-        assert!(poller.is_empty());
-        assert_eq!(poller.len(), 0);
-        assert_eq!(poller.registration(Token(1)), None);
-    }
-
-    #[test]
-    fn waker_key_cannot_collide_with_a_port_number() {
-        assert_eq!(WAKER_KEY, u64::MAX);
-    }
-
-    #[test]
-    fn waker_handles_are_cheap_repeatable_clones() {
-        let poller = Poller::new().expect("a poll set");
-        // The poller owns the single wakeup handle; obtaining several handles to it must
-        // not panic (mio permits only one `Waker` per poll set).
-        let first = poller.waker().expect("a waker");
-        let second = poller.waker().expect("a second waker");
-        first.wake().expect("the first handle fires");
-        second.wake().expect("the second handle fires");
-        drop(first);
-        second.wake().expect("the surviving handle still fires");
-    }
-    #[test]
-    fn register_assigns_tokens_from_one_and_records_the_key() {
-        let mut poller = Poller::new().expect("a poll set");
-        let (_peer, fd) = UnixStream::pair().expect("socketpair");
-
-        let first = poller
-            .register(fd.as_raw_fd(), Interest::READABLE, 7)
-            .expect("the fd registers");
-        assert_eq!(first, Token(1), "user tokens start after the waker's 0");
-        assert_eq!(poller.registration(first), Some(7));
-        assert_eq!(poller.len(), 1);
-        assert!(!poller.is_empty());
-
-        // Registering the very same descriptor twice is rejected by the OS.
-        let err = poller
-            .register(fd.as_raw_fd(), Interest::READABLE, 8)
-            .expect_err("a duplicate registration fails");
-        assert!(matches!(err, BeamError::Io(_)), "mapped to BeamError::Io");
-        assert_eq!(poller.len(), 1, "the failed registration recorded nothing");
-
-        poller
-            .deregister(fd.as_raw_fd(), first)
-            .expect("deregisters");
-        assert_eq!(poller.registration(first), None);
-        assert!(poller.is_empty());
-    }
-
-    #[test]
-    fn reregister_and_deregister_an_unknown_token_map_to_io() {
-        let mut poller = Poller::new().expect("a poll set");
-        let (_peer, fd) = UnixStream::pair().expect("socketpair");
-        // Token 1 was never registered with this poller.
-        let err = poller
-            .reregister(fd.as_raw_fd(), Token(1), Interest::WRITABLE)
-            .expect_err("an unknown token cannot be re-registered");
-        assert!(matches!(err, BeamError::Io(_)));
-
-        let err = poller
-            .deregister(fd.as_raw_fd(), Token(1))
-            .expect_err("an unknown token cannot be de-registered");
-        assert!(matches!(err, BeamError::Io(_)));
-    }
-
-    /// Creates a unique temporary **regular file** holding `contents` and opens a fresh
-    /// descriptor over it with `flags` (the caller owns and closes the descriptor).
-    ///
-    /// A regular file is exactly the descriptor `mio`'s `epoll` backend refuses, so every
-    /// test below travels the poller's fallback readiness source.
-    fn temp_regular_file(tag: &str, contents: &[u8], flags: libc::c_int) -> (PathBuf, RawFd) {
-        let path = std::env::temp_dir().join(format!(
-            "beam_io_poller_{tag}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("a clock")
-                .as_nanos()
-        ));
-        std::fs::write(&path, contents).expect("the fixture file is written");
-        let mut c_path = path.as_os_str().as_encoded_bytes().to_vec();
-        c_path.push(0);
-        // SAFETY: `c_path` is a NUL-terminated path owned by this call; `open(2)` only
-        // reads it and returns a fresh descriptor owned by the caller.
-        let fd = unsafe { libc::open(c_path.as_ptr().cast(), flags | libc::O_CLOEXEC) };
-        assert!(fd >= 0, "the regular file opens");
-        (path, fd)
-    }
-
-    /// Closes a descriptor and removes the fixture file a `temp_regular_file` created.
-    fn cleanup(path: &PathBuf, fd: RawFd) {
-        // SAFETY: `fd` was created by `temp_regular_file` and is not used again.
-        let _ = unsafe { libc::close(fd) };
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn a_regular_file_registers_through_the_fallback_and_reports_readiness() {
-        let (path, fd) = temp_regular_file("read", b"hello", libc::O_RDONLY);
-
-        let mut poller = Poller::new().expect("a poll set");
-        let token = poller
-            .register(fd, Interest::READABLE, 42)
-            .expect("a regular file registers (epoll would answer EPERM)");
-        assert_eq!(token, Token(1), "user tokens still start after the waker's 0");
-        assert_eq!(poller.registration(token), Some(42));
-        assert_eq!(poller.len(), 1, "the fallback registration counts towards len");
-        assert!(!poller.is_empty());
-
-        // A regular file is always reported readable.
-        let events = poller.poll(Some(Duration::ZERO)).expect("poll succeeds");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].key(), 42);
-        assert_eq!(events[0].token(), token);
-        assert!(events[0].ready().readable(), "a regular file is always readable");
-        assert!(!events[0].ready().is_error());
-        // `poll(None)` (wait forever) must not block while a fallback registration exists.
-        let started = Instant::now();
-        let events = poller.poll(None).expect("poll succeeds");
-        assert!(!events.is_empty(), "the fallback descriptor is ready");
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "poll(None) returned promptly instead of blocking, took {:?}",
-            started.elapsed()
-        );
-
-        poller
-            .deregister(fd, token)
-            .expect("the fallback registration de-registers");
-        assert_eq!(poller.registration(token), None);
-        assert!(poller.is_empty());
-
-        cleanup(&path, fd);
-    }
-
-    #[test]
-    fn the_mio_and_fallback_sources_merge_into_one_event_batch() {
-        let (path, file_fd) = temp_regular_file("merge", b"data", libc::O_RDONLY);
-        let (peer, local) = UnixStream::pair().expect("socketpair");
-
-        let mut poller = Poller::new().expect("a poll set");
-        let mio_token = poller
-            .register(local.as_raw_fd(), Interest::READABLE, 7)
-            .expect("the socket registers with mio");
-        let fallback_token = poller
-            .register(file_fd, Interest::READABLE, 9)
-            .expect("the regular file registers with the fallback source");
-        assert_eq!(poller.len(), 2, "len counts both sources");
-
-        // Only the always-ready fallback descriptor is ready before the socket is written.
-        let events = poller.poll(Some(Duration::ZERO)).expect("poll succeeds");
-        assert_eq!(events.len(), 1, "the idle socket is not ready");
-        assert_eq!(events[0].key(), 9);
-        assert_eq!(events[0].token(), fallback_token);
-
-        // Writing to the socket makes the mio descriptor ready too; both merge into one
-        // batch.
-        (&peer).write_all(b"x").expect("the peer accepts the write");
-        let mut events = poller
-            .poll(Some(Duration::from_secs(1)))
-            .expect("poll succeeds");
-        events.sort_by_key(|event| event.key());
-        assert_eq!(events.len(), 2, "the mio and fallback events merge");
-        assert_eq!(events[0].key(), 7);
-        assert_eq!(events[0].token(), mio_token);
-        assert!(events[0].ready().readable());
-        assert_eq!(events[1].key(), 9);
-        assert!(events[1].ready().readable());
-
-        // Deregistering removes each from whichever set holds it.
-        poller
-            .deregister(local.as_raw_fd(), mio_token)
-            .expect("the mio registration de-registers");
-        assert_eq!(poller.len(), 1);
-        poller
-            .deregister(file_fd, fallback_token)
-            .expect("the fallback registration de-registers");
-        assert!(poller.is_empty());
-
-        cleanup(&path, file_fd);
-    }
-
-    #[test]
-    fn reregister_switches_the_interest_of_a_fallback_registration() {
-        let (path, fd) = temp_regular_file("rw", b"content", libc::O_RDWR);
-
-        let mut poller = Poller::new().expect("a poll set");
-        let token = poller
-            .register(fd, Interest::READABLE, 5)
-            .expect("the regular file registers");
-
-        let events = poller.poll(Some(Duration::ZERO)).expect("poll succeeds");
-        assert_eq!(events.len(), 1);
-        assert!(events[0].ready().readable());
-        assert!(
-            !events[0].ready().writable(),
-            "only readability was requested"
-        );
-
-        poller
-            .reregister(fd, token, Interest::WRITABLE)
-            .expect("the fallback registration re-registers");
-        let events = poller.poll(Some(Duration::ZERO)).expect("poll succeeds");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].token(), token);
-        assert!(
-            events[0].ready().writable(),
-            "a descriptor open for writing is writable"
-        );
-        assert!(
-            !events[0].ready().readable(),
-            "readability is no longer requested"
-        );
-
-        poller.deregister(fd, token).expect("de-registers");
-        assert!(poller.is_empty());
-
-        cleanup(&path, fd);
-    }
-
-    #[test]
-    fn two_fallback_registrations_over_one_descriptor_are_independent() {
-        // Two fallback registrations over the same descriptor are independent entries: the
-        // poller keeps no per-fd index for the fallback set, so both are accepted (a
-        // regular file has no exclusive epoll membership to clash with). Deregistering one
-        // leaves the other live.
-        let (path, fd) = temp_regular_file("dup", b"x", libc::O_RDONLY);
-        let mut poller = Poller::new().expect("a poll set");
-        let first = poller
-            .register(fd, Interest::READABLE, 1)
-            .expect("the first fallback registration");
-        let second = poller
-            .register(fd, Interest::READABLE, 2)
-            .expect("a second fallback registration is accepted");
-        assert_ne!(first, second);
-        assert_eq!(poller.len(), 2);
-
-        let events = poller.poll(Some(Duration::ZERO)).expect("poll succeeds");
-        assert_eq!(events.len(), 2, "both registrations report readiness");
-
-        poller.deregister(fd, first).expect("the first de-registers");
-        assert_eq!(poller.len(), 1);
-        poller.deregister(fd, second).expect("the second de-registers");
-        assert!(poller.is_empty());
-
-        cleanup(&path, fd);
-    }
-}
+#[path = "poller_tests.rs"]
+mod tests;

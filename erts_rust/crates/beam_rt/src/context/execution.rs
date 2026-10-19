@@ -40,6 +40,7 @@ use beam_common::Result;
 use beam_engine::context::RootSet;
 use beam_engine::ExecutionContext;
 use beam_loader::{Label, Module};
+use beam_process::PendingSignal;
 use beam_term::{Atom, AtomTable, Eterm};
 
 use super::apply::{callee_observes_its_call_site, LocalFunTarget};
@@ -653,7 +654,62 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// **Peeks**: the scan position does not move (the following `loop_rec_end` advances
     /// it). Never `unsupported` while the running process exists — an empty mailbox is
     /// simply `Ok(None)`, which makes the compiled code jump to the `wait` that blocks.
+    ///
+    /// # The fetch of a `'DOWN'`-only signal queue when the scan is exhausted
+    ///
+    /// A process may commit to sleeping only **after** it has drained its own signal queue and
+    /// re-checked that the drained queue yields no message. That is the C's `i_loop_rec`
+    /// (`../../erts/emulator/beam/emu/msg_instrs.tab:80-112`, which calls
+    /// `erts_proc_sig_receive_helper` → `erts_proc_sig_fetch`,
+    /// `../../erts/emulator/beam/erl_proc_sig_queue.c:7729`; the contract is stated at
+    /// `:7739-7759` and the splice-then-re-peek at `:7771-7799`). Without it, a signal a process
+    /// queues on **itself** — `exit(P, kill)` on a monitored `P` followed by
+    /// `receive {'DOWN', …}`, both in the same reduction slice — is applied by no site before the
+    /// `wait`: the schedule-in service (`beam_process/src/scheduler.rs`, `slice_begin`'s
+    /// `service_signals`) runs at the process's **next** entry, and
+    /// `ProcessTable::schedule_service` (`beam_process/src/ptab.rs`) deliberately skips a
+    /// receiver that is still `Running`.
+    ///
+    /// So when the scan yields no message and the process has queued signals, they are applied
+    /// here — through the public [`ProcessTable::service_signals`], i.e. the same whole-queue
+    /// application the schedule-in uses, never a copy of its policy — and the scan is re-read.
+    ///
+    /// **The `PendingSignal::Down`-only gate is mandatory.** `service_signals` applies the WHOLE
+    /// queue through `exit_policy`, and a `Terminate(_)` verdict would kill the running process
+    /// from **inside its own instruction stream**, where the runner has no channel to report the
+    /// death or propagate it. A `PendingSignal::Down` can only deliver a `{'DOWN', …}` message
+    /// (`ProcessTable::apply_head_signal`'s arm), so the gate is provably non-fatal without
+    /// re-deriving the policy table here. Every other signal class — the fatal ones included — is
+    /// left to the schedule-out net in the runner's park arm, which re-queues the process instead
+    /// of letting it sleep.
+    ///
+    /// Two borrow facts make this shape necessary: `mailbox_parts` and the process-table
+    /// accessors each borrow `self`, so the gate is read (and its borrow dropped) before the
+    /// service, and the mailbox is re-read after it.
     fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        let (queue, state) = self.mailbox_parts()?;
+        if let Some(message) = state.next(queue) {
+            // The per-candidate hot path: a scan position that yields a message answers without
+            // touching the signal queue at all.
+            return Ok(Some(message));
+        }
+        // The scan is exhausted. Read the gate first, then drop the borrow before servicing.
+        let pid = self.mailbox_pid;
+        let only_down_signals = {
+            let signals = self.process_table().signals(pid)?;
+            // `is_empty` is explicit: `Iterator::all` is vacuously true on an empty queue, and
+            // servicing a quiet process is a no-op the scan must not mistake for progress.
+            !signals.is_empty()
+                && signals
+                    .iter()
+                    .all(|signal| matches!(signal, PendingSignal::Down { .. }))
+        };
+        if !only_down_signals {
+            return Ok(None);
+        }
+        self.process_table_mut().service_signals(pid)?;
+        // Re-read the scan: a delivered `'DOWN'` is a message like any other, so it is the
+        // candidate the following `loop_rec_end`/`remove_message` pair consumes.
         let (queue, state) = self.mailbox_parts()?;
         Ok(state.next(queue))
     }

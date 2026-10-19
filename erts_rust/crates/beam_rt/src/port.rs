@@ -161,6 +161,7 @@
 //! and a nested borrow is reported as a typed capability gap instead of panicking (the
 //! crate is `#![deny(unsafe_code)]` and never panics on runtime data).
 
+use core::ffi::c_void;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -169,11 +170,15 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub mod driver;
+pub(crate) mod async_ready;
+use async_ready::AsyncReady;
 pub(crate) mod completion;
 pub(crate) mod exit;pub(crate) mod info_extras;
 pub(crate) mod ops;
 pub(crate) mod packet;
-pub(crate) mod tty;
+// The general select seam: `enif_select` (A.3) reached through `crate::nif_select`, plus
+// `prim_tty:tty_select/2` (A.7), which is the read-only special case of it.
+pub(crate) mod select;
 pub(crate) mod watch;
 use beam_alloc::Heap;
 use beam_abi::driver::types::PORT_CONTROL_FLAG_BINARY;
@@ -182,9 +187,9 @@ use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use libc::c_int;
 use beam_io::{
-    Driver, DriverRegistry, Event, Poller, PortCommandOptions, PortCommandOutcome, PortExitReason,
-    PortNotification, PortRegistry as IoPortRegistry, PortTaskOutcome, ReadMessage, SpawnDriver,
-    SpawnOptions, SpawnSpec, SpawnStream, StreamOptions, PORT_REDS_EXECUTE,
+    Driver, DriverRegistry, Event, Interest, Poller, PortCommandOptions, PortCommandOutcome,
+    PortExitReason, PortNotification, PortRegistry as IoPortRegistry, PortTaskOutcome, ReadMessage,
+    SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream, StreamOptions, PORT_REDS_EXECUTE,
 };
 use beam_process::{PortId, PortMonitor, PortTable, ProcessId, ProcessTable};
 use beam_term::{
@@ -218,6 +223,17 @@ const PORT_HEAP_WORDS: usize = 4_096;
 /// driver declares an earlier deadline (see [`beam_io::Driver::next_timeout`]), so a
 /// driver-declared timer fires at its deadline rather than up to a slice late.
 pub(crate) const PORT_POLL_SLICE: Duration = Duration::from_millis(25);
+/// How long one poll round may block while the async-job pool has work in flight.
+///
+/// The pool's completions arrive on **worker** threads, which the poller knows nothing about, so a
+/// round that blocked for a whole [`PORT_POLL_SLICE`] would report a finished `driver_async` job up
+/// to 25 ms late — squarely inside the owner's `receive` latency. This bound shortens the wait to a
+/// couple of milliseconds while
+/// [`AsyncReady::pool_is_busy`](async_ready::AsyncReady::pool_is_busy) is true, which is the
+/// polling substitute for the C's `erts_notify_check_async_ready_queue` wake-up
+/// (`erl_async.c:174`). It is a bound, never a spin: an idle round still blocks for the whole
+/// slice, and a quiet pool costs the clamp nothing.
+const ASYNC_READY_POLL_BOUND: Duration = Duration::from_millis(2);
 
 /// How long a child port's **line frames** may be held back while the port still owes its
 /// `{Port, {exit_status, Status}}` (see [`PortRegistry::hold_or_report_line`]).
@@ -853,32 +869,57 @@ enum PortEvent {
         /// The signal's BEAM atom name — [`beam_io::signal::Signal::name`] (`"sigusr1"`, …).
         name: &'static str,
     },
-    /// A `prim_tty:tty_select/2` read interest became ready — the delivery half of the
-    /// `enif_select` a `prim_tty` reader arms before it announces itself.
+    /// A registered descriptor became ready — the delivery half of **both** `enif_select`
+    /// (contract A.3) and `prim_tty:tty_select/2` (A.7), which share one mechanism (see
+    /// [`select`]).
     ///
-    /// Like [`PortEvent::Signal`] this variant has **no port**: the descriptor (`fd 0`) is
-    /// registered with the poller directly, not carried by any port, and the message's
-    /// recipient is the process that armed the select (recorded here as `owner`), not a
-    /// port-derived one. The message is the 4-tuple `{select, Handle, Reference, ready_input}`
-    /// with the emulator itself (`system`) as the sender, exactly the shape
-    /// `prepare_select_msg` (`erts/emulator/sys/common/erl_check_io.c:731-761`) builds and
-    /// `send_select_msg` (`:836-858`) queues — see [`tty`] for the C ground truth and the
-    /// one-shot rule.
+    /// Like [`PortEvent::Signal`] this variant has **no port**: the descriptor is registered with
+    /// the poller directly, not carried by any port, and the message's recipient is the process
+    /// that armed the select (recorded here as `owner`), not a port-derived one.
+    ///
+    /// * A [`select::SelectPayload::Plain`] registration delivers the 4-tuple
+    ///   `{select, Handle, Reference, EventAtom}` with the emulator itself (`system`) as the
+    ///   sender, exactly the shape `prepare_select_msg`
+    ///   (`erts/emulator/sys/common/erl_check_io.c:699-800`) builds and `send_select_msg`
+    ///   (`:836-858`) queues.
+    /// * A [`select::SelectPayload::Custom`] registration (`ERL_NIF_SELECT_CUSTOM_MSG`) delivers
+    ///   the caller's own message term and nothing else — no tuple, no event atom (`:716-731`).
+    ///
+    /// Either way the report is **one-shot**: the registration is de-registered once it has
+    /// reported, and **one readiness can produce several of these events** — one per observed
+    /// direction the registration asked for, in the C's `input` → `output` → `error` order
+    /// (`erl_check_io.c:2126-2175`; see [`select::SelectWatch::take_ready`]).
     Select {
         /// The process the select message belongs to — `enif_select`'s implicit recipient (the
         /// calling process).
         owner: ProcessId,
-        /// The opaque tty handle (`argv[0]`), the tuple's second element.
+        /// What a readiness report delivers — the plain shape's reference, or the caller's own
+        /// message.
+        payload: select::SelectPayload,
+        /// The direction actually observed, as the C's event atom.
+        event: select::SelectEvent,
+        /// The registration's opaque handle term — the plain shape's second element until the
+        /// resource term is minted in its place.
         handle: Eterm,
-        /// `prim_tty:reader/1`'s `ReaderRef` (`argv[1]`), the tuple's third element.
-        reference: Eterm,
+        /// The resource object a NIF's notification term is minted from, or null.
+        ///
+        /// Moved out of the registration and never dereferenced: it only ever flows into
+        /// [`beam_abi`]'s resource-term minting. A `prim_tty:tty_select/2` arming carries none.
+        obj: *mut c_void,
+        /// The interest's **own reference** on [`PortEvent::Select::obj`], or `None`.
+        ///
+        /// It travels with the delivery so the object outlives the disarm that produced this event,
+        /// and it is released only **after** the notification's resource term is minted (the mint
+        /// takes its own reference): releasing it earlier could destroy the object between the
+        /// disarm and the mint. See [`select::SelectHold`].
+        hold: Option<select::SelectHold>,
     },
 }
 
 impl PortEvent {
     /// The port this event is **about**, or `None` for the events that already carry their
     /// recipient resolved (a completion, an `{active, …}` delivery) and for the two node-global
-    /// kinds that no port carries (a handled signal and a `tty_select/2` report).
+    /// kinds that no port carries (a handled signal and a ready select registration).
     ///
     /// Used where an event has to be checked against the registry's live ports before it is
     /// reported — [`PortRegistry::drain_pending_events`], which drops a retained event whose port
@@ -1060,9 +1101,9 @@ pub struct PortRegistry {
     /// The signal self-pipe's registration with [`PortRegistry::poller`] — the delivery half of
     /// `os:set_signal/2` (see [`watch`]).
     watch: watch::SignalWatch,
-    /// The `prim_tty:tty_select/2` read-select registrations with [`PortRegistry::poller`] — the
-    /// delivery half of the `enif_select` a `prim_tty` reader arms (see [`tty`]).
-    tty: tty::TtyWatch,
+    /// The runtime's registrations of `enif_select`/`prim_tty:tty_select/2` interests with
+    /// [`PortRegistry::poller`] — the delivery half of both (see [`select`]).
+    select: select::SelectWatch,
     /// The runtime's most recent process-liveness observation, shared with every
     /// `{spawn_driver, Name}` port's [`driver::DriverPort`] host — the state behind
     /// `driver_monitor_process`'s positive `ERL_DRV_MONITOR_NOT_ALIVE` (see
@@ -1119,6 +1160,14 @@ pub struct PortRegistry {
     /// about to run and is consumed by the failure that round reaps; a port that survives the
     /// round is simply re-read next time.
     pre_round_monitors: HashMap<u64, Vec<PortMonitor>>,
+    /// The runtime's **async-job delivery handle** — the C async pool behind `driver_async` and the
+    /// per-port completion queues (see [`AsyncReady`] and [`driver`]).
+    ///
+    /// This registry is the party that **drains the pool** (a port round has no driver, and the
+    /// pool's ready queue is global), while each port's own drive point calls the driver. The handle
+    /// is shared by `Rc` with every driver host and every port adapter, so the pool is built once for
+    /// the whole runtime.
+    async_ready: AsyncReady,
 }
 
 impl PortRegistry {
@@ -1143,14 +1192,68 @@ impl PortRegistry {
             heap: Heap::new(PORT_HEAP_WORDS)?,
             io_counters: Rc::new(IoCounters::default()),
             watch: watch::SignalWatch::new(),
-            tty: tty::TtyWatch::new(),
+            select: select::SelectWatch::new(),
             liveness: ProcessLiveness::new(),
             extras: ops::PortExtras::default(),
             pending_events: Vec::new(),
             pending_port_signals: exit::PendingPortSignals::default(),
             failed_read_recipients: HashMap::new(),
             pre_round_monitors: HashMap::new(),
+            // The pool itself is built lazily, on the first `driver_async` (`AsyncReady::ensure_pool`),
+            // but the worker count is stamped now: `+A`'s default is one thread, and `+A 0` — an
+            // explicit zero — must stay distinguishable from "not configured yet".
+            async_ready: {
+                let async_ready = AsyncReady::new();
+                async_ready.set_threads(driver::DEFAULT_ASYNC_THREADS);
+                async_ready
+            },
         })
+    }
+    /// Sets the **async-job worker count** — the emulator's `+A N` (`erl_async.c`'s
+    /// `ERTS_ASYNC_THREADS_DEFAULT` is [`driver::DEFAULT_ASYNC_THREADS`]).
+    ///
+    /// `0` is `+A 0` and is honoured as a genuine zero-worker pool: every job then runs **inline on
+    /// the submitting thread** (`AsyncPool::new(0)`), which is exactly the C's `+A 0` behaviour, and
+    /// `driver_async` answers `0`. It is deliberately **not** "no pool": that would send
+    /// `driver_async` down the frozen seam's legacy hook and answer `-1`.
+    ///
+    /// The runtime calls this once, at startup, from `RuntimeConfig`'s preserved `+A` flag (see
+    /// `crate::runtime`'s registry construction). A pool that already exists is rebuilt, so this
+    /// belongs **before** the first driver port is opened.
+    pub fn set_async_threads(&mut self, threads: usize) {
+        self.async_ready.set_threads(threads);
+    }
+    /// The runtime's async-job delivery handle (see [`AsyncReady`]) — what a port's host and adapter
+    /// are stamped with at `open_port/2`.
+    pub fn async_ready(&self) -> AsyncReady {
+        self.async_ready.clone()
+    }
+    /// Moves every completed `driver_async` job from the pool into the per-port delivery queues
+    /// (see [`AsyncReady::offer`]) and releases any library whose port's work is gone
+    /// ([`AsyncReady::reap_unloads`]).
+    ///
+    /// Called once per port round, **before** the round's drive points, so a job that finished while
+    /// the runtime was busy is delivered by the very round that notices it. A job whose port has
+    /// closed is released here — the C's `!p` branch — so its `async_free` runs even when no port is
+    /// left to drive.
+    fn drain_async_pool(&mut self) {
+        let Some(pool) = self.async_ready.pool() else {
+            return;
+        };
+        let drained = pool.drain();
+        if !drained.is_empty() {
+            self.async_ready.offer(drained);
+        }
+        // Order matters: the completions are offered first, so a job that just became terminal no
+        // longer counts against its port's deferred unload in this round.
+        self.async_ready.reap_unloads();
+    }
+    /// Whether the async-job pool has anything in flight — what shortens a poll round to
+    /// [`ASYNC_READY_POLL_BOUND`] and keeps a blocked owner wakeable (see [`AsyncReady::pool_is_busy`]).
+    fn async_pool_is_busy(&self) -> bool {
+        self.async_ready
+            .pool()
+            .is_some_and(|pool| self.async_ready.pool_is_busy(&pool))
     }
 
     /// Constructs the **statically linked emulator** driver named `name`, or `None` when `name` is
@@ -1275,43 +1378,117 @@ impl PortRegistry {
     }
     /// Arms a **one-shot** read interest on the tty descriptor (fd 0) for `owner` — the
     /// `enif_select` half of `prim_tty:tty_select/2` (see [`tty`]).
+    /// Arms a **one-shot** interest on `fd` for `owner` — the registration half of `enif_select`
+    /// (contract A.3) and of `prim_tty:tty_select/2`, which is a special case of it (see
+    /// [`select`]).
     ///
-    /// `handle` and `reference` must already be **stabilized** terms (copied onto the runtime's
-    /// never-reset arena by [`Runtime::stabilize_term`]): a raw `Eterm` held across a scheduler
-    /// pass belongs to a heap a collection may relocate, and this registration outlives the call
-    /// that armed it. The caller — [`crate::native::prim_tty`] — owns that stabilisation, because
-    /// it holds the arguments and the runtime's arena.
+    /// `payload`'s terms and `handle` must already be **stabilized** terms (copied onto the
+    /// runtime's never-reset arena by [`Runtime::stabilize_term`]): a raw `Eterm` held across a
+    /// scheduler pass belongs to a heap a collection may relocate, and this registration outlives
+    /// the call that armed it. The caller — [`crate::native::prim_tty`] for the tty half, the NIF
+    /// dispatch for the `enif_select` half — owns that stabilisation, because it holds the
+    /// arguments and the runtime's arena.
+    ///
+    /// `obj` is the NIF's `void*` resource operand (null when the producer has none, as
+    /// `prim_tty:tty_select/2` has). It is **moved** into the registration and the eventual
+    /// [`PortEvent::Select`] and never dereferenced — this crate is `#![deny(unsafe_code)]`.
     ///
     /// # Errors
     ///
-    /// The poller's own registration failure, or the typed exhaustion of the key reservation.
-    /// The C **discards** `enif_select`'s answer, so the NIF answers `ok` either way — but the
-    /// failure is still returned here rather than swallowed, and the NIF maps it to "nothing
-    /// armed".
+    /// The poller's own registration failure (a closed descriptor, say), or the typed exhaustion
+    /// of the key reservation. The C **discards** `enif_select`'s answer, so `tty_select/2`
+    /// answers `ok` either way — but the failure is still returned here rather than swallowed.
+    pub(crate) fn arm_nif_select(
+        &mut self,
+        owner: ProcessId,
+        fd: RawFd,
+        interest: Interest,
+        payload: select::SelectPayload,
+        handle: Eterm,
+        obj: *mut c_void,
+    ) -> Result<()> {
+        self.select
+            .arm(&mut self.poller, fd, interest, owner, payload, handle, obj)
+    }
+
+    /// De-registers the interest armed on `fd`, answering which directions it had armed — the
+    /// C's `ERL_NIF_SELECT_STOP` (`erl_check_io.c:1272-1284`, see [`select`]).
+    ///
+    /// The C decides a `STOP` before it decodes the mask, rewrites the mode to
+    /// `ERL_DRV_READ | ERL_DRV_WRITE | ERL_DRV_USE` (`:1274-1276`) and runs its "off" path, so the
+    /// answer is the armed interest of the registration the stop removed: one
+    /// `ERL_NIF_SELECT_*_CANCELLED` bit per direction really cleared (`:1470-1482`). An empty
+    /// [`select::Cancelled`] is a descriptor that was never armed — the C's own fast track
+    /// (`:1276-1280`).
+    ///
+    /// # Errors
+    ///
+    /// The poller's own de-registration failure.
+    pub(crate) fn stop_nif_select(
+        &mut self,
+        fd: RawFd,
+        handle: Eterm,
+    ) -> Result<select::Cancelled> {
+        self.select.stop(&mut self.poller, fd, handle)
+    }
+
+    /// Clears the `interest` directions armed on `fd`, answering which of them really were armed —
+    /// the C's `ERL_NIF_SELECT_CANCEL` and its `ERL_NIF_SELECT_*_CANCELLED` bits
+    /// (`erl_check_io.c:1292`, `:1470-1482`; see [`select`]).
+    ///
+    /// # Errors
+    ///
+    /// The poller's own re-registration or de-registration failure.
+    pub(crate) fn cancel_nif_select(
+        &mut self,
+        fd: RawFd,
+        handle: Eterm,
+        interest: Interest,
+    ) -> Result<select::Cancelled> {
+        self.select.cancel(&mut self.poller, fd, handle, interest)
+    }
+
+    /// Arms a **one-shot** read interest on the tty descriptor for `owner` — the `enif_select`
+    /// half of `prim_tty:tty_select/2` (see [`select`]).
+    ///
+    /// It is [`PortRegistry::arm_nif_select`] with the C's own `tty_select_nif` arguments: the
+    /// hardcoded descriptor [`select::TTY_IFD`], a read interest, the caller's reference as the
+    /// plain payload's third tuple element and no resource object.
+    ///
+    /// # Errors
+    ///
+    /// As [`PortRegistry::arm_nif_select`]; the C discards the answer, so the NIF answers `ok`
+    /// either way and only logs the failure.
     pub(crate) fn arm_tty_select(
         &mut self,
         owner: ProcessId,
         handle: Eterm,
         reference: Eterm,
     ) -> Result<()> {
-        self.tty
-            .arm(&mut self.poller, owner, handle, reference)
+        self.arm_nif_select(
+            owner,
+            select::TTY_IFD,
+            Interest::READABLE,
+            select::SelectPayload::Plain { reference },
+            handle,
+            core::ptr::null_mut(),
+        )
     }
 
-    /// Drops (and de-registers) every `tty_select/2` registration whose owner `live` denies —
-    /// the C's `tty_monitor_down` `ERL_NIF_SELECT_STOP` arm (see [`tty`]).
+    /// Drops (and de-registers) every select registration whose owner `live` denies — the C's
+    /// `tty_monitor_down` `ERL_NIF_SELECT_STOP` arm (see [`select`]).
     ///
     /// Called from both port pumps, immediately after [`PortRegistry::refresh_liveness`], so a
-    /// reader that died without disarming its select cannot keep the runtime polling for ever.
+    /// process that died without disarming its select cannot keep the runtime polling for ever.
     ///
     /// # Errors
     ///
     /// The poller's own de-registration failure.
-    pub(crate) fn prune_dead_tty(
+    pub(crate) fn prune_dead_select(
         &mut self,
         live: impl FnMut(ProcessId) -> bool,
     ) -> Result<()> {
-        self.tty.prune_dead(&mut self.poller, live)
+        self.select.prune_dead(&mut self.poller, live)
     }
 
     /// Registers `driver` as a new port and records its `port_info` `meta`.
@@ -1820,7 +1997,7 @@ impl PortRegistry {
     /// Whether no port is open.
     ///
     /// This counts **ports only**. It is deliberately *not* the "is there anything to poll?"
-    /// question — a signal self-pipe or an armed `tty_select/2` interest can be waited on with
+    /// question — a signal self-pipe or an armed select registration can be waited on with
     /// zero ports — so a caller deciding whether a blocked process can still be woken asks
     /// [`PortRegistry::has_nothing_to_poll`].
     pub fn is_empty(&self) -> bool {
@@ -1828,14 +2005,15 @@ impl PortRegistry {
     }
 
     /// Whether there is nothing a poll round must **wait on**, and nothing left that could wake
-    /// a blocked process: no live port, no armed `tty_select/2` interest, and no **fired**
-    /// `os:set_signal/2` self-pipe (see [`watch`]).
+    /// a blocked process: no live port, no armed select registration (`enif_select`'s or
+    /// `tty_select/2`'s — see [`select`]), and no **fired** `os:set_signal/2` self-pipe (see
+    /// [`watch`]).
     ///
     /// This is the "nothing pending" predicate. It is what tells a caller that a blocked process
     /// can no longer be woken and that a poll round is pure sleep: a live port can deliver
-    /// `{Port, {data, …}}`, an armed `tty_select/2` can deliver
-    /// `{select, Handle, Ref, ready_input}`, and a self-pipe **holding bytes** can deliver
-    /// `{notify, Signal}` — any one of them keeps the runtime awake.
+    /// `{Port, {data, …}}`, an armed select can deliver `{select, Handle, Ref, EventAtom}`, and a
+    /// self-pipe **holding bytes** can deliver `{notify, Signal}` — any one of them keeps the
+    /// runtime awake.
     ///
     /// An **armed but idle** `handle` disposition is deliberately **not** counted
     /// ([`watch::SignalWatch::has_pending_signal`], not `is_pollable`): its descriptor is idle
@@ -1854,8 +2032,13 @@ impl PortRegistry {
         self.meta.is_empty()
             && self.pending_events.is_empty()
             && self.pending_port_signals.is_empty()
-            && !self.tty.is_armed()
+            && !self.select.is_armed()
             && !self.watch.has_pending_signal()
+            // A `driver_async` job in flight is a `{Port, {data, …}}` (or a freed job's obligation)
+            // the owner is still owed, and it is finished by a **worker thread** the poller knows
+            // nothing about — so a route that skipped the round because "nothing is live" would
+            // never see its completion (see [`AsyncReady`]).
+            && !self.async_pool_is_busy()
     }
     /// The ids of the **live** ports, in port-number order.
     ///
@@ -2003,9 +2186,13 @@ impl PortRegistry {
         // excluded even though it is registered: `take_signals` above has already harvested any
         // signal that was caught, so a *pending* one must return at once rather than poll a
         // now-drained pipe, and an *idle* one can only become readable when a signal arrives —
-        // blocking on it would be waiting for nothing. A live port or an armed `tty_select/2`
-        // interest is real async I/O and is still waited on.
-        if self.registry.is_empty() && !self.tty.is_armed() {
+        // blocking on it would be waiting for nothing. A live port or an armed select
+        // registration is real async I/O and is still waited on.
+        // The async-job pool is drained before anything else: a completion finished by a worker
+        // thread is this round's work, and a job whose port has closed is released right here (the
+        // C's `!p` branch) so its `async_free` runs even with no port left to drive.
+        self.drain_async_pool();
+        if self.registry.is_empty() && !self.select.is_armed() {
             // A close `beam_io` has not reported yet still owes its `'EXIT'`/`'DOWN'`: minting
             // the report is what retires the port's number and releases them, and with no
             // live port left nothing else would ever run the round that mints it.
@@ -2022,6 +2209,15 @@ impl PortRegistry {
                     .into_iter()
                     .map(|packet| PortEvent::ActiveInput { packet }),
             );
+            // No port is left to poll, but the async-job pool may still owe work (a job a worker is
+            // running, or a library it keeps mapped — see [`AsyncReady::pool_is_busy`]). Waiting one
+            // bounded tick keeps the caller from spinning while it drains, and the second drain turns
+            // a completion into its release; a `+A N` job is then never stranded by the last port's
+            // close.
+            if self.async_pool_is_busy() {
+                let _ = self.poller.poll(Some(ASYNC_READY_POLL_BOUND))?;
+                self.drain_async_pool();
+            }
             return Ok(events);
         }
         let deadline = Instant::now() + timeout;
@@ -2036,7 +2232,16 @@ impl PortRegistry {
             if let Some(next) = self.registry.next_deadline() {
                 wait = wait.min(next.saturating_duration_since(now));
             }
+            // With async jobs in flight the round must come back soon: their completions arrive on
+            // worker threads, which the poller cannot report (see [`ASYNC_READY_POLL_BOUND`]).
+            if self.async_pool_is_busy() {
+                wait = wait.min(ASYNC_READY_POLL_BOUND);
+            }
             let polled = self.poller.poll(Some(wait))?;
+            // Whatever finished during the wait is routed to its port **before** the tasks run, so
+            // this very round's drive point delivers it (`beam_io` drives `drive_async` ahead of
+            // harvesting input).
+            self.drain_async_pool();
             // The signal self-pipe is **not** a port: its readiness means "the dispatcher caught
             // something", so it is read here — the C's own model — and the descriptor's event is
             // filtered out of the batch before the port scheduler sees it, so nothing but
@@ -2048,21 +2253,28 @@ impl PortRegistry {
             if self.watch.ready(&polled) {
                 events.extend(self.take_signals());
             }
-            // A `tty_select/2` read interest is the other non-port registration: its readiness
-            // is a one-shot `enif_select` report, so each ready key yields exactly one
-            // `{select, …}` event and is de-registered as it is reported (see [`tty`]). The
-            // reported handle/reference were stabilised when the select was armed, so they are
+            // A select registration is the other non-port wake source: its readiness is a
+            // one-shot `enif_select` report, so each ready registration yields exactly one
+            // [`PortEvent::Select`] and is de-registered as it is reported (see [`select`]). The
+            // payload terms and the handle were stabilised when the select was armed, so they are
             // valid across this pass.
-            let tty_keys: Vec<u64> = polled
+            //
+            // Ownership is snapshotted **before** the drain: `take_ready` removes the
+            // registrations it reports, so asking the watch afterwards would say the key belongs
+            // to no one and leak it into the port batch below.
+            let select_keys: Vec<u64> = polled
                 .iter()
                 .map(|event| event.key())
-                .filter(|key| self.tty.owns(*key))
+                .filter(|key| self.select.owns(*key))
                 .collect();
-            for (owner, handle, reference) in self.tty.take_ready(&mut self.poller, &tty_keys)? {
+            for delivery in self.select.take_ready(&mut self.poller, &polled)? {
                 events.push(PortEvent::Select {
-                    owner,
-                    handle,
-                    reference,
+                    owner: delivery.owner,
+                    payload: delivery.payload,
+                    event: delivery.event,
+                    handle: delivery.handle,
+                    obj: delivery.obj,
+                    hold: delivery.hold,
                 });
             }
             if !polled.is_empty() {
@@ -2073,7 +2285,9 @@ impl PortRegistry {
                 let port_events: Vec<Event> = polled
                     .iter()
                     .copied()
-                    .filter(|event| event.key() != watch::SIGNAL_KEY && !self.tty.owns(event.key()))
+                    .filter(|event| {
+                        event.key() != watch::SIGNAL_KEY && !select_keys.contains(&event.key())
+                    })
                     .collect();
                 if !port_events.is_empty() {
                     self.registry.schedule_events(&port_events);
@@ -3457,7 +3671,11 @@ impl PortHook for RuntimePorts {
             // `ERL_DRV_MONITOR_NOT_ALIVE` from: the runtime's most recent observation, published
             // by [`PortRegistry::refresh_liveness`] at the start of each port round (see
             // [`ProcessLiveness`]).
-            .with_liveness(registry.liveness());
+            .with_liveness(registry.liveness())
+            // The runtime's async-job delivery handle: the host answers `driver_async`'s pool hook
+            // from it, and the port's adapter delivers the completions it queues (see
+            // [`AsyncReady`]). One handle per runtime, so one pool.
+            .with_async_ready(registry.async_ready());
             // Seize the driver's term queue **before** the host is moved into the port lifecycle
             // (the boxed driver exposes no host): it is the handle a driver callback's
             // `erl_drv_output_term`/`erl_drv_send_term` pushes onto and
@@ -3711,9 +3929,9 @@ impl Runtime {
             // The round is where driver callbacks run, so the liveness view their hosts query is
             // refreshed from the live table first (see [`PortRegistry::refresh_liveness`]).
             registry.refresh_liveness(table);
-            // A `prim_tty` reader that died without disarming its `tty_select/2` interest would
-            // otherwise keep the runtime polling for ever (see [`PortRegistry::prune_dead_tty`]).
-            registry.prune_dead_tty(|pid| table.contains(pid))?;
+            // A process that died without disarming its select interest would otherwise keep the
+            // runtime polling for ever (see [`PortRegistry::prune_dead_select`]).
+            registry.prune_dead_select(|pid| table.contains(pid))?;
             registry.pump(timeout)?
         };
         // A driver callback cannot mint an atom (the live table is borrowed for the whole
@@ -3747,7 +3965,7 @@ impl Runtime {
         // there is no `erl_signal_server`, so (like the C) nothing is sent.
         let signal_server = self.code_server.atoms().lookup("erl_signal_server");
         let mut delivered = 0;
-        for event in events {
+        for mut event in events {
             // An `{active, …}` delivery is rendered in the port's **effective** data mode — the
             // `{mode, …}` record its driver accepted (`inet_opts`), with the open-time stream as
             // the fallback — so a `{mode,list}` socket renders a char list as the oracle's does.
@@ -3759,6 +3977,14 @@ impl Runtime {
                         .map(|registry| registry.data_mode(packet.port, packet.data_mode))
                         .unwrap_or(packet.data_mode),
                 ),
+                _ => None,
+            };
+            // The interest's **own reference** on the select's resource object is lifted out here,
+            // before the arm borrows the event: it must be released only after that arm has minted
+            // the notification's term (which takes a reference of its own), so releasing it any
+            // earlier could destroy the object between the disarm and the mint.
+            let select_hold = match &mut event {
+                PortEvent::Select { hold, .. } => hold.take(),
                 _ => None,
             };
             // The term is built on the runtime's arena (the `RuntimeContext` the builders
@@ -3850,15 +4076,32 @@ impl Runtime {
                         let (from, message) = ctx.signal_notify_message(name)?;
                         (server, from, message)
                     }
-                    // A ready `tty_select/2` interest is addressed directly to the process that
+                    // A ready select registration is addressed directly to the process that
                     // armed it (`enif_select`'s implicit recipient, recorded as `owner`), with the
                     // emulator (`system`) as the sender — the ordinary one-shot select delivery.
+                    // What it carries is the registration's own payload shape: the plain
+                    // `{select, Handle, Ref, EventAtom}` 4-tuple, or the caller's custom message
+                    // verbatim (`ERL_NIF_SELECT_CUSTOM_MSG`).
                     PortEvent::Select {
                         owner,
+                        payload,
+                        event,
                         handle,
-                        reference,
+                        obj,
+                        ..
                     } => {
-                        let (from, message) = ctx.tty_select_message(*handle, *reference)?;
+                        // The mint comes **first**: it takes its own reference on the object, so
+                        // the interest's reference (dropped right after) can never be the one that
+                        // destroys the object between the disarm and the mint.
+                        let minted =
+                            select_notification_handle(*handle, *obj, *owner, ctx.runtime)?;
+                        drop(select_hold);
+                        let Some(handle) = minted else {
+                            // The resource object is gone (released between arm and readiness):
+                            // nothing is delivered rather than a notification naming the wrong term.
+                            continue;
+                        };
+                        let (from, message) = ctx.select_message(payload, *event, handle)?;
                         (*owner, from, message)
                     }
                 }
@@ -3887,6 +4130,42 @@ impl Runtime {
         delivered += self.deliver_peer_closes(table)?;
         Ok(delivered)
     }
+}
+
+/// The second element of a [`select::SelectPayload::Plain`] notification: the registration's own
+/// handle term, or — when the registration carries a NIF **resource object** — the term minted
+/// from it.
+///
+/// The C mints the interest object's magic reference when the notification is queued
+/// (`erts_mk_magic_ref`, `erts/emulator/sys/common/erl_check_io.c:746`). The mint is
+/// [`crate::nif::resource_term_for`], which answers `None` for a null, foreign or already-dying
+/// object instead of fabricating one — and a refusal delivers **nothing**: a notification whose
+/// second element named the wrong thing would be a lie no caller can detect.
+///
+/// A `prim_tty:tty_select/2` registration carries no object: its stored handle term is exactly the
+/// C's `argv[0]` resource term, so it is delivered as-is.
+///
+/// The minted block is built on a scratch host's heap, so the term is copied onto the runtime's
+/// never-reset arena (`Runtime::stabilize_term`) before that host drops. The copy keeps the
+/// reference's identity word, which is what the resource registry is keyed by, so
+/// `enif_get_resource` still resolves it — and the reference the mint took is dropped by the
+/// ordinary park-arm resource prune ([`crate::context::gc::resources::reclaim`]) once the delivered
+/// message dies.
+///
+/// This crate is `#![deny(unsafe_code)]`, so `obj` is only ever **moved** — never dereferenced.
+fn select_notification_handle(
+    handle: Eterm,
+    obj: *mut c_void,
+    owner: beam_process::ProcessId,
+    runtime: &mut Runtime,
+) -> Result<Option<Eterm>> {
+    if obj.is_null() {
+        return Ok(Some(handle));
+    }
+    let Some(minted) = crate::nif::resource_term_for(runtime, owner, obj) else {
+        return Ok(None);
+    };
+    Ok(Some(runtime.stabilize_term(minted)?))
 }
 
 impl RuntimeContext<'_> {
@@ -3924,9 +4203,9 @@ impl RuntimeContext<'_> {
                 .try_borrow_mut()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
             registry.refresh_liveness(table);
-            // Same as the scheduler path's round: a dead `prim_tty` reader's armed select is
-            // dropped before the poll (see [`PortRegistry::prune_dead_tty`]).
-            registry.prune_dead_tty(|pid| table.contains(pid))?;
+            // Same as the scheduler path's round: a dead process's armed select is
+            // dropped before the poll (see [`PortRegistry::prune_dead_select`]).
+            registry.prune_dead_select(|pid| table.contains(pid))?;
             registry.pump(timeout)?
         };
         let mut messages = Vec::with_capacity(events.len());
@@ -4003,10 +4282,33 @@ impl RuntimeContext<'_> {
                     messages.push(self.active_input_message(&resolved)?);
                 }
                 PortEvent::Signal { .. } => continue,
-                // A ready `tty_select/2` interest belongs in the **owning reader's** mailbox, which
-                // the evaluator is not: it can only observe its own mailbox, so — like the signal
-                // arm — the event is not returned here and the scheduler path delivers it.
-                PortEvent::Select { .. } => continue,
+                // A ready select registration. Same rule as the completion arm above: the evaluator
+                // observes only its **own** mailbox, so one addressed to another process is left to
+                // the scheduler route — but one the evaluator itself armed is its own notification
+                // and is returned here, exactly as the oracle's reader would receive it.
+                PortEvent::Select {
+                    owner,
+                    payload,
+                    event,
+                    handle,
+                    obj,
+                    hold,
+                } => {
+                    if owner != self.pid() {
+                        continue;
+                    }
+                    // The mint first, the interest's reference released only after it (see the
+                    // scheduler path's arm): the mint takes a reference of its own.
+                    let minted = select_notification_handle(handle, obj, owner, self.runtime)?;
+                    drop(hold);
+                    let Some(handle) = minted else {
+                        // The resource object is gone (released between arm and readiness):
+                        // nothing is delivered rather than a notification naming the wrong term.
+                        continue;
+                    };
+                    let (_from, message) = self.select_message(&payload, event, handle)?;
+                    messages.push(message);
+                }
             }
         }
         // A port close owes `'EXIT'`/`'DOWN'` messages to its links and monitors; the ones
@@ -4279,36 +4581,50 @@ impl RuntimeContext<'_> {
         Ok((sender, message))
     }
 
-    /// The `{select, Handle, Reference, ready_input}` message a ready `tty_select/2` interest
-    /// produces, and its sender — the delivery half of the `enif_select` a `prim_tty` reader
-    /// arms.
+    /// The message a ready select registration delivers, and its sender — the delivery half of
+    /// both `enif_select` (A.3) and `prim_tty:tty_select/2` (A.7).
     ///
-    /// ERTS queues exactly this 4-tuple to the **calling** process, with `am_system` as the
-    /// sender: `prepare_select_msg` (`erts/emulator/sys/common/erl_check_io.c:731-761`) builds
-    /// it from the select's resource term and reference term and always closes with the
-    /// `ready_input` event atom, and `send_select_msg` (`:836-858`) queues it with `system` as
-    /// the sender. `handle` is the opaque tty term ([`crate::native::prim_tty`]'s reference) and
-    /// `reference` is `prim_tty:reader/1`'s `ReaderRef`; `prim_tty:reader_loop/2`
-    /// (`lib/kernel/src/prim_tty.erl:454-482`) matches the message on both.
+    /// ERTS queues the notification to the **selecting** process with `am_system` as the sender
+    /// (`send_select_msg`, `erts/emulator/sys/common/erl_check_io.c:836-858`), in one of two
+    /// shapes:
     ///
-    /// Both terms are already **stabilized** (see [`PortRegistry::arm_tty_select`]), so this
-    /// builder copies them into the tuple without re-homing them; the `select`/`ready_input`/
-    /// `system` atoms are interned in the runtime's **one shared** table.
+    /// * [`select::SelectPayload::Plain`] — the 4-tuple `{select, Handle, Reference, EventAtom}`
+    ///   `prepare_select_msg` builds (`:699-800`): the registration's resource term, the caller's
+    ///   reference, and the event atom of the direction actually observed
+    ///   (`ready_input`/`ready_output`/`ready_error`, `:1451-1463`). For
+    ///   `prim_tty:tty_select/2` the `Handle` is the opaque tty term
+    ///   ([`crate::native::prim_tty`]'s reference) and the `Reference` is
+    ///   `prim_tty:reader/1`'s `ReaderRef`, which `prim_tty:reader_loop/2`
+    ///   (`lib/kernel/src/prim_tty.erl:454-482`) matches on both.
+    /// * [`select::SelectPayload::Custom`] — the caller's own message term **verbatim**
+    ///   (`ERL_NIF_SELECT_CUSTOM_MSG`, `:716-731`): no tuple and no event atom, exactly as the C
+    ///   replaces the whole notification with `msg_env`'s term.
+    ///
+    /// The payload terms are already **stabilized** (see [`PortRegistry::arm_nif_select`]), so the
+    /// builder copies them into the tuple without re-homing them; the `select`/event/`system`
+    /// atoms are interned in the runtime's **one shared** table.
     ///
     /// # Errors
     ///
     /// The arena's allocation failure when the tuple does not fit.
-    pub(crate) fn tty_select_message(
+    pub(crate) fn select_message(
         &mut self,
+        payload: &select::SelectPayload,
+        event: select::SelectEvent,
         handle: Eterm,
-        reference: Eterm,
     ) -> Result<(Eterm, Eterm)> {
         let atoms = self.runtime.code_server.atoms_mut();
-        let select = make_atom(atoms.intern("select"));
-        let ready_input = make_atom(atoms.intern("ready_input"));
         let sender = make_atom(atoms.intern("system"));
-        let message = terms::make_tuple(self, &[select, handle, reference, ready_input])?;
-        Ok((sender, message))
+        match payload {
+            select::SelectPayload::Custom { message } => Ok((sender, *message)),
+            select::SelectPayload::Plain { reference } => {
+                let select = make_atom(atoms.intern("select"));
+                let event_atom = make_atom(atoms.intern(event.name()));
+                let message =
+                    terms::make_tuple(self, &[select, handle, *reference, event_atom])?;
+                Ok((sender, message))
+            }
+        }
     }
 }
 
@@ -4576,3 +4892,10 @@ mod packet_framing_tests;
 /// separate file so the matrix does not grow this one.
 #[cfg(test)]
 mod completion_tests;
+/// The **async-job pool** end-to-end suite (contract A.4, `erl_async.c`): `driver_async` through the
+/// real port round — a positive id and one `ready_async` with the submitted `async_data`, the
+/// port-exit path's single `async_free`, the `+A 0` inline configuration, and the entry with no
+/// `ready_async` slot (see `src/port/async_ready_tests.rs`). A separate file so the C fixture text
+/// and the measured oracle table do not grow this one.
+#[cfg(test)]
+mod async_ready_tests;

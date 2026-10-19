@@ -380,6 +380,12 @@ impl<'a> RuntimeRunner<'a> {
             &mut engine.machine,
             &mut engine.off_heap,
         )?;
+        // The **NIF-resource prune**, the second prune of the same publishing window: a resource
+        // term the parked process's root set no longer names loses the reference it took at
+        // `enif_make_resource`, so the resource type's destructor runs (contract A.3). Same site
+        // and same gate for the same reason — this is the one place the process's root set is
+        // complete and no NIF call is mid-flight (see `gc::resources`'s module docs).
+        gc::reclaim_resources(&mut *self.runtime, table, pid)?;
         Ok(())
     }
     /// Drains `pid`'s latched `max_heap_size` **kill** — the runner's half of the verdict the
@@ -1356,10 +1362,50 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // it.
                 self.runtime.serve_gc_request(table, pid);
                 self.state.engines.insert(pid, engine);
+                // The **schedule-out net**: a process that still owes its own queue a signal may
+                // not sleep yet.
+                //
+                // `receive_next` (`crate::context::execution`) applies a queue whose every
+                // pending signal is a `'DOWN'` — the one class that can only deliver a message.
+                // Everything else is left here, because applying it from inside the machine's
+                // instruction stream (a `Terminate(_)` verdict, a cascade) has no channel to
+                // report the death or its propagation. The C instead re-queues such a process at
+                // schedule-out (`schedule_out_process`,
+                // `../../erts/emulator/beam/erl_process.c:6777-6801`, plus
+                // `active_sys_enqueue` `:7027-7094`; the flag itself is
+                // `erts_proc_notify_new_sig`, `../../erts/emulator/beam/erl_proc_sig_queue.h:2062-2075`):
+                // a receiver signalled while RUNNING gets the "has signal work" flag with no
+                // run-queue traffic of its own, and the schedule-out decision then RE-ENQUEUES it
+                // instead of letting it sleep. `RunOutcome::Yield` is this scheduler's
+                // re-enqueue, so the queue is drained monotonically through the ordinary
+                // schedule-in path (`beam_process/src/scheduler.rs`: `slice_begin`'s
+                // `service_signals` runs at the next entry, and `slice_end`'s `Yield` arm sets
+                // `Runnable` + `in_run_queue` before enqueueing). Three invariants hold:
+                //
+                // * **No double scheduling and no lost wakeup** — the pid is put back on its
+                //   run queue by exactly the arm that owns the `Runnable` transition, so every
+                //   later `send`/`deliver` wake finds a process the queue already holds.
+                // * **No spin** — every applied signal is popped and every fatal one terminates
+                //   the pid at the next schedule-in, so one re-entry either matches the
+                //   materialised message (a trapped `{'EXIT', …}`, a DOWN) or parks again with an
+                //   empty queue, which takes the `Wait` below.
+                // * **The parked window stays sound** — the `Waiting` + relocation-exempt park
+                //   set above is overwritten to `Runnable` by the `Yield` arm, and no relocation
+                //   site can move this heap in between (the exemption is consulted by all of
+                //   them), so the machine stays the authoritative root set; a message delivered
+                //   into the window at worst takes the documented heap-fragment fallback.
+                //
+                // The count is read **after** the bookkeeping above and **before** the outcome:
+                // any signal queued during this slice is seen, and a process with a quiet queue
+                // pays one `pending_signals` lookup per park.
+                let owes_signals = table.pending_signals(pid).unwrap_or(0) > 0;
                 // The deterministic park counter (see `RUN_SLICE_COUNTERS`): this slice ended
-                // at the `receive` `Wait` arm.
+                // at the `receive` `Wait` arm, re-queued when the process owes itself a signal.
                 #[cfg(test)]
-                note_slice_parked(false);
+                note_slice_parked(!owes_signals);
+                if owes_signals {
+                    return Ok(RunOutcome::Yield);
+                }
                 Ok(RunOutcome::Wait)
             }
             Err(error) => {

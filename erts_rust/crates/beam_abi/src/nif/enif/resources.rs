@@ -56,14 +56,17 @@
 //!   resource term of that exact type, and returns `0` (leaving `*objp` untouched) for a term of
 //!   another resource type, for a plain term, or for a non-term word. Because a resource term holds a
 //!   reference (point 3 below), a term that was released by its NIF still resolves — exactly as on the
-//!   oracle.
+//!   oracle. Resolution is by **term identity**, not by heap address: a `copy_struct` copy of a
+//!   resource term (the send path, ETS) designates the same object and resolves too — as on the
+//!   oracle, whose magic refs are pointer-identified through `ErtsMRefThing.mb` and therefore
+//!   copy-stable. See "The registry key is the term's IDENTITY" below.
 //!
 //! # Documented substitutions (this crate has no `ERTS_MAGIC_REF` tag, no GC and no module identity)
 //!
 //! 1. **The resource term is minted here, on the host heap.** `beam_term` has no magic-reference
 //!    tag, so a resource term is an ordinary **internal reference** built by this file — the same
 //!    `[hdr|REF_SUBTAG][node][serial][id]` block `beam_rt`'s own `erlang:make_ref/0` builds — with a
-//!    distinct id per call, recorded in the registry as *term word → (type, object)*.
+//!    distinct id per call, recorded in the registry as *(term identity, type, object)*.
 //!    `enif_get_resource` then resolves that mapping (and checks the type), which is exactly the
 //!    observable contract. Measured on the oracle: two `enif_make_resource` calls for one object
 //!    yield two *distinct* terms that both print as `#Ref<0.…>`, so a fresh reference per call is
@@ -75,7 +78,11 @@
 //!    returned by `enif_make_resource_binary` yields `1` and the resource object. So the term built
 //!    here is registered as well. (Its *bytes* are copied onto the heap; the C zero-copies the
 //!    caller's buffer into a refc binary. The bytes are the same; only the aliasing differs.)
-//! 3. **Liveness: a resource TERM holds its own reference; the destructor's timing.** An exporting
+//!    **The one identity residual:** an `enif_make_resource` term is a *reference*, so its identity
+//!    survives a copy — but this term is an **on-heap binary**, and a binary carries no shared
+//!    identity at all (the C's magic binary is an off-heap refc binary, which is copy-shared). A
+//!    *copied* resource-**binary** term therefore does not resolve here, where the oracle's does. A
+//!    typed residual (`enif_get_resource` answers `0`), never a wrong result.//! 3. **Liveness: a resource TERM holds its own reference; the destructor's timing.** An exporting
 //!    call (`enif_make_resource` / `enif_make_resource_binary`) takes **one extra reference** on the
 //!    object for the term it returns — exactly the reference the C's magic reference holds
 //!    (`erl_nif.c` `erts_bld_resource_ref` → `erts_mk_magic_ref` → `erts_bin_inc_refc`). A
@@ -84,13 +91,17 @@
 //!    enif_get_resource` reads back the `42` the NIF wrote (and the same for the
 //!    `enif_make_resource_binary` path), where a runtime that frees at refcount zero would hand the
 //!    NIF a dangling pointer.
-//!    **The documented deviation from C:** the C drops that reference when the term is
-//!    garbage-collected; this crate has no GC and no "term died" signal, so the term's reference is
-//!    **never dropped**. An object that has ever been exposed as a resource term is therefore
-//!    retained — block and payload — for the process lifetime, and its `dtor` does not run. That is a
-//!    bounded, deliberate leak, and it is the *only* sound choice available: the alternative (freeing
-//!    at refcount zero) makes `enif_get_resource` hand a NIF a freed pointer, i.e. a *wrong value*,
-//!    which this crate never does. An object that no term holds is released and destroyed normally.
+//!    **Where that reference goes:** the C drops it when the term is garbage-collected. This crate has
+//!    no GC, so the "the term died" signal is a **caller-owned seam** — [`release_resource_terms`]
+//!    drops the reference of every term that a caller-supplied reachability predicate calls
+//!    unreachable, and runs the type's `dtor` when that was the last reference. The *reachability
+//!    decision is the caller's* (a wrong "unreachable" is a use-after-free, a wrong "reachable" is
+//!    only a leak), exactly as for the off-heap refc binaries. With **no** caller driving that seam —
+//!    a plain `beam_abi` process, or a runtime whose GC is not wired to it — the reference is never
+//!    dropped: that is the bounded, deliberate leak documented here before the seam existed, and it
+//!    remains the only sound *default*, because freeing on our own at refcount zero would make
+//!    `enif_get_resource` hand a NIF a freed pointer, i.e. a *wrong value*, which this crate never
+//!    does. An object that no term holds is released and destroyed normally.
 //!    The destructor itself is **run synchronously** on the release that takes the reference count to
 //!    zero — exactly once per object, never while a `keep` is outstanding, and never for a `NULL`
 //!    release. The C *schedules* it instead; the full comparison is in "The destructor's timing"
@@ -106,16 +117,56 @@
 //!    not find it (measured). This crate has no `load` session boundary (the loader owns it), so a
 //!    created type is visible immediately. Only `*tried` is pinned by the compatibility claim and it
 //!    is unaffected: the create branch reports `CREATE` either way.
-//! 6. **Not implemented (and therefore never faked):** monitors/`enif_monitor_process`, the
-//!    `ERL_NIF_SELECT_STOP` (`stop`) and `down` *callbacks* are stored but never invoked (they are
-//!    driven by `beam_io`/`beam_process`, which are not wired to this crate); no `rt_id`/`enif_select`
-//!    registration; the type is never freed (the C frees it on module unload) — the registry is
-//!    process-lifetime, exactly like the C's global `resource_type_list`.
+//! 6. **The `ERL_NIF_SELECT_STOP` (`stop`) callback is stored but never invoked** (it is driven by
+//!    `beam_io`, which is not wired to this crate). The `down` callback **is** invoked: the registry
+//!    carries the C's per-object monitor tree as one table keyed by the stored reference block
+//!    ([`Registry::monitors`], owned by [`monitors`]), [`deliver_resource_down_id`] reproduces
+//!    `erts_fire_nif_monitor` (`erl_nif.c:3058-3115`) and [`Registry::forget_object`] cancels a dying
+//!    object's monitors silently (the C's `dtor_demonitor`, `:2940-2948`). The registry also exposes
+//!    the one fact the C reads out of the object before any of that
+//!    (`ASSERT(!rsrc->monitors == !rsrc->type->fn.down)`, `erl_nif.c:3966`):
+//!    [`resource_type_has_down`], i.e. whether the object's type was opened WITH a `down` callback —
+//!    the C's `-1` gate (`:3968-3972`), answerable from the crate's own knowledge before any runtime
+//!    hook is consulted. No `rt_id`/`enif_select` registration; the type is never freed (the C frees
+//!    it on module unload) — the registry is process-lifetime, exactly like the C's global
+//!    `resource_type_list`.
+//!
+//! # The registry key is the term's IDENTITY, not its heap word
+//!
+//! A resource term's identity is its **reference id** — the M1 block's last word — and not the
+//! address of the block. The registry is therefore keyed by [`TermKey`]: a reference thing (header
+//! arity [`prelude::INTERNAL_REF_PAYLOAD_WORDS`]) keys on [`prelude::internal_ref_id`], every other
+//! term shape on its raw word. One private helper, [`term_key`], derives the key for **both** the
+//! binding and the lookup, so the two can never disagree.
+//!
+//! Why it matters: `beam_message::copy_struct` (the send path, ETS) copies a term word for word, so a
+//! copy is a *different heap address carrying the same identity*. Keying on the word made such a copy
+//! miss (`enif_get_resource` answered `0` where the oracle answers `1`); keying on the identity makes
+//! it resolve to the same object. It is also what the C does — its magic refs are pointer-identified
+//! through `ErtsMRefThing.mb` (a refc-binary header the copy shares), i.e. copy-stable.
+//!
+//! The `Word` arm exists for the shapes that genuinely have no shared identity: an
+//! `enif_make_resource_binary` term is an **on-heap binary** here (module docs, substitution 2), so a
+//! copy of it is only itself. Per-mint refcounting is unaffected: each minting call mints a fresh id
+//! (or a fresh binary) and takes its own object reference, so `terms` still holds exactly one binding
+//! per *live* mint, and each removed binding releases exactly one reference.
+//!
+//! **A reused address evicts a dead mint.** Two *live* term blocks cannot share a heap word, so when a
+//! fresh mint lands on a word some existing binding still occupies, that older binding's term block
+//! has necessarily been freed: its term is dead, and only its reference is still standing. Binding the
+//! new term therefore evicts the old entry and gives its reference back (outside the lock, so a
+//! destructor may call back in) — which is what a prune would have done, one park point earlier, and
+//! it keeps `resource_terms()`'s words unique.
+//!
+//! **Residual (reported, not closable from this file):** this crate's reference id space is its own
+//! (`next_resource_ref_id`), independent of the runtime's (`beam_process::ProcessTable::next_reference`,//! which feeds `make_ref/0`, monitors, aliases and timers). A *plain* reference whose id happens to
+//! equal a live resource term's id would resolve as that resource. `beam_process` documents the same
+//! hazard class ("HAZARD 2"); its closure is one shared id allocator at the host level (for instance a
+//! `NifHost` mint hook that draws from the runtime's allocator), which is a `beam_rt` change.
 //!
 //! # The destructor's timing — the deviation the C does not let us close
 //!
-//! **What the C does** (`erts/emulator/beam/erl_nif.c`). `enif_release_resource` (`:3164-3175`)
-//! drops one reference. The release that reaches zero does **not** run the destructor: it runs
+//! **What the C does** (`erts/emulator/beam/erl_nif.c`). `enif_release_resource` (`:3164-3175`)//! drops one reference. The release that reaches zero does **not** run the destructor: it runs
 //! `nif_resource_dtor_prologue` (`:2961-2972`), which does
 //! `erts_schedule_misc_aux_work(<sched_id>, run_resource_dtor, bin)` and returns `0` ("don't free"),
 //! so the magic binary and its payload stay live for an **aux-work** task to pick up.
@@ -173,7 +224,7 @@
 use super::*;
 
 use libc::{c_char, c_int, c_void, size_t};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -268,8 +319,9 @@ struct ResourceType {
     /// `ErlNifResourceStop*` — stored, never invoked (needs `enif_select`; see the module docs).
     #[allow(dead_code)]
     stop: Option<ErlNifResourceStop>,
-    /// `ErlNifResourceDown*` — stored, never invoked (needs `enif_monitor_process`).
-    #[allow(dead_code)]
+    /// `ErlNifResourceDown*` — run by [`deliver_resource_down_id`] when a monitor armed on a resource
+    /// of this type fires (`erts_fire_nif_monitor`, `erl_nif.c:3107-3108`), and observable through
+    /// [`resource_type_has_down`].
     down: Option<ErlNifResourceDown>,
     /// `ErlNifResourceDynCall*` — invoked through [`enif_dynamic_resource_call`].
     dyncall: Option<ErlNifResourceDynCall>,
@@ -286,6 +338,46 @@ struct ResourceType {
     host: *mut dyn NifHost,
 }
 
+/// The **identity** of a term that designates a resource object — the registry's key.
+///
+/// A resource term is an M1 internal reference (module docs, substitution 1), and a reference is
+/// identified by its `id` word, not by the address of its block: `copy_struct` (the send path, ETS)
+/// produces a *different heap address with the same identity*, and the C's magic refs are
+/// pointer-identified through `ErtsMRefThing.mb`, which a copy shares. Keying the registry by the raw
+/// word therefore loses every copy of a resource term; keying it by the identity keeps them all
+/// (module docs, "The registry key is the term's IDENTITY").
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum TermKey {
+    /// An M1 internal-reference thing whose header arity is
+    /// [`prelude::INTERNAL_REF_PAYLOAD_WORDS`], keyed by its copy-stable reference id.
+    Ref(u64),
+    /// Every other term shape, keyed by the raw term word. This is the arm
+    /// `enif_make_resource_binary` lands in: its term is an **on-heap binary**, which carries no
+    /// shared identity at all, so the word is the only identity it has.
+    Word(usize),
+}
+
+/// The registry key of `term` — **the one place** binding and lookup derive identity, so they can
+/// never disagree.
+fn term_key(term: Eterm) -> TermKey {
+    let word = term.raw();
+    if !is_term_word(term) {
+        // Not a term at all (a bare header word / `THE_NON_VALUE`): it has no shape to inspect.
+        return TermKey::Word(word);
+    }
+    // SAFETY: `internal_ref_id` validates before it reads — it re-checks the `REF_SUBTAG`, refuses a
+    // block whose header arity is not `INTERNAL_REF_PAYLOAD_WORDS` (a C-layout `[hdr, w1, w2]` block
+    // has arity 2 and no id word), and refuses an id word that is not a non-negative small integer.
+    // So it only dereferences the header of a boxed term the caller holds, and it answers a typed
+    // error — never a wrong id — for anything else.
+    match unsafe { prelude::internal_ref_id(term) } {
+        Ok(id) => TermKey::Ref(id),
+        // Not an M1 reference (a small int, an atom, a binary, a tuple, a C-layout ref block, …):
+        // the raw word is the only identity such a term has.
+        Err(_) => TermKey::Word(word),
+    }
+}
+
 /// One live term designating a resource object (the registry's value).
 #[derive(Copy, Clone)]
 struct ResourceRef {
@@ -293,6 +385,14 @@ struct ResourceRef {
     ty: *mut ResourceType,
     /// The resource payload pointer (what `enif_get_resource` writes to `*objp`).
     obj: *mut c_void,
+    /// The term word **as minted** — the address of the block this crate built, even though the map
+    /// is keyed by the term's identity ([`TermKey`]).
+    ///
+    /// This is what the release seam enumerates ([`resource_terms`]) and hands to the caller's
+    /// reachability predicate, so a caller keeps reasoning about the term it was given (its root set
+    /// holds words, and `beam_rt`'s walk answers a candidate's own word for a direct hit *or* for a
+    /// copy's identity).
+    word: Eterm,
 }
 
 /// The process-wide registry: the resource types ever opened and the live resource terms.
@@ -301,8 +401,29 @@ struct Registry {
     /// Every type ever opened, in open order (the C's global `resource_type_list`). A `Box` keeps the
     /// `*mut ResourceType` handed to NIFs stable across `Vec` growth.
     types: Vec<Box<ResourceType>>,
-    /// `term word -> object` for every resource term this crate minted (see the module docs, point 1).
-    terms: HashMap<usize, ResourceRef>,
+    /// `term identity -> object` for every resource term this crate minted (see the module docs,
+    /// point 1 and "The registry key is the term's IDENTITY"). One entry per **mint**; any number of
+    /// copies of a minted term share it, because they all carry the same identity.
+    terms: HashMap<TermKey, ResourceRef>,
+
+    /// The **live payload pointers** of every object this crate allocated, i.e. the set of `void*`
+    /// values that really are `&ErtsResource.data` in the C's sense.
+    ///
+    /// It exists so a `enif_*` entry point that is handed a bare `void*` `obj` can tell "an object
+    /// this crate minted" from "a pointer I must not dereference": the C reaches the owning
+    /// `ErtsResource` by pointer arithmetic on `obj` (`DATA_TO_RESOURCE`) and reads `rsrc->type`
+    /// unconditionally, which is only sound under the caller's "`obj` is one of mine" contract. The
+    /// entries are removed the moment the block is freed (see [`Registry::forget_object`]), so a
+    /// stale pointer never resolves.
+    objects: HashSet<usize>,
+    /// The C's per-resource monitor tree (`rsrc->monitors->root`), as **one** process-wide table keyed
+    /// by the reference block an arm stored ([`MonitorId`]).
+    ///
+    /// It lives here — under the same lock as `types`/`terms`/`objects` — rather than behind its own
+    /// mutex: the delivery path has to consult `objects` and the header refcount while holding it, and
+    /// [`Registry::forget_object`] has to cancel an object's monitors, so a second lock would invert
+    /// the order against `destroy` and deadlock. The rules it obeys are in [`monitors`].
+    monitors: HashMap<MonitorId, MonitorBinding>,
 }
 
 // SAFETY: the registry is a process-wide singleton guarded by a `Mutex`, and the raw pointers it
@@ -326,18 +447,67 @@ impl Registry {
         &mut **last as *mut ResourceType
     }
 
-    /// Record that the term word `word` designates the object `obj` of type `ty`.
-    fn bind_term(&mut self, word: usize, r: ResourceRef) {
-        self.terms.insert(word, r);
+    /// Record that the term `term` designates the object `r` binds — keyed by the term's **identity**
+    /// ([`term_key`]), so a later lookup through a copy of the term (same identity, different heap
+    /// address) finds this binding.
+    ///
+    /// Also **evicts** a binding that is provably dead because the new term reuses its heap word: two
+    /// *live* term blocks cannot share an address, so an existing binding whose word this term now
+    /// occupies can only be a mint whose heap is gone (module docs, "A reused address evicts a dead
+    /// mint"). The evicted object is returned so the caller can drop that binding's reference
+    /// **outside** the registry lock — the destructor may call straight back into these entry points.
+    fn bind_term(&mut self, term: Eterm, r: ResourceRef) -> Option<*mut c_void> {
+        let key = term_key(term);
+        let word = term.raw();
+        let dead = self
+            .terms
+            .iter()
+            .find(|(other, entry)| **other != key && entry.word.raw() == word)
+            .map(|(other, _)| *other);
+        let dead = dead.and_then(|other| self.terms.remove(&other)).map(|e| e.obj);
+        self.terms.insert(key, r);
+        dead
     }
 
-    /// The object a resource term designates, if any.
-    fn lookup_term(&self, word: usize) -> Option<ResourceRef> {
-        self.terms.get(&word).copied()
+    /// Record that `obj` is a **live** payload pointer this crate allocated.
+    fn register_object(&mut self, obj: *mut c_void) {
+        self.objects.insert(obj as usize);
     }
 
-    /// Drop every term binding to `obj` — called as the object is destroyed, so a term that still
-    /// designates it resolves to nothing instead of a dangling payload pointer.
+    /// Whether `obj` is a live payload pointer this crate allocated (`None` when it is not one, so
+    /// the caller must not dereference it).
+    fn object_type(&self, obj: *mut c_void) -> Option<*mut ResourceType> {
+        if !self.objects.contains(&(obj as usize)) {
+            return None;
+        }
+        // SAFETY: a registered payload pointer belongs to a block this crate `malloc`ed and has not
+        // freed (the entry is removed before the block is freed, under this very lock), so its
+        // `RESOURCE_HEADER_SIZE`-byte header is live. The header's `ty` is a `Box<ResourceType>` the
+        // registry owns and never frees.
+        Some(unsafe { (*header_ptr(obj)).ty })
+    }
+
+    /// The object the resource term `key` identifies, if any.
+    ///
+    /// The caller passes [`term_key`]'s answer, so a copy of a minted resource term resolves to the
+    /// very binding the mint created.
+    fn lookup_term(&self, key: TermKey) -> Option<ResourceRef> {
+        self.terms.get(&key).copied()
+    }
+
+    /// Drop every term binding to `obj` **and** its liveness registration, and cancel its armed
+    /// monitors — called as the object is destroyed, so a term that still designates it resolves to
+    /// nothing (instead of a dangling payload pointer) and a later [`Registry::object_type`] query
+    /// answers `None` rather than reading freed memory.
+    ///
+    /// The retention is on the **value**, not the key, so every binding that names this object goes —
+    /// whichever identity key it was filed under (a reference id, or the word of an on-heap
+    /// resource-binary term), and therefore every copy of every term that designated it.
+    ///
+    /// Cancelling the monitors is the C's `run_resource_dtor` → `dtor_demonitor` path
+    /// (`erl_nif.c:2940-2948`, `:2974-3030`): a dying resource's monitors are removed **without** a
+    /// `down` callback, so a monitor that outlived its resource never fires. The retention rule is
+    /// [`Registry::forget_monitors_for_object`]'s (the `monitors` child owns it).
     ///
     /// An object exported as a resource term holds its own reference (module docs, point 3), so a
     /// normal alloc/export/release sequence never reaches here with bindings outstanding; this fires
@@ -346,6 +516,8 @@ impl Registry {
     /// pointer in the Rust runtime.
     fn forget_object(&mut self, obj: *mut c_void) {
         self.terms.retain(|_, r| r.obj != obj);
+        self.objects.remove(&(obj as usize));
+        self.forget_monitors_for_object(obj);
     }
 }
 
@@ -619,7 +791,7 @@ pub unsafe extern "C" fn enif_alloc_resource(
     }
     // SAFETY: `block` owns `total = RESOURCE_HEADER_SIZE + size` bytes, so both the header and the
     // payload are in bounds; the payload is zeroed and returned.
-    unsafe {
+    let payload = unsafe {
         block.write(ResourceHeader {
             refcount: AtomicUsize::new(1),
             ty: ty.cast::<ResourceType>(),
@@ -628,7 +800,11 @@ pub unsafe extern "C" fn enif_alloc_resource(
         let payload = payload_ptr(block);
         core::ptr::write_bytes(payload, 0, size);
         payload.cast::<c_void>()
-    }
+    };
+    // Publish the payload as a live object of this crate, so a later `void*` operand (for instance
+    // `enif_monitor_process`'s `obj`) can be recognised as one of ours before it is dereferenced.
+    with_registry(|r| r.register_object(payload));
+    payload
 }
 
 /// Take one extra reference on a live resource object — the `erts_bin_inc_refc` increment that
@@ -645,6 +821,81 @@ unsafe fn retain_object(obj: *mut c_void) {
     let header = unsafe { header_ptr(obj) };
     // SAFETY: `header` points at a live block whose count is non-zero (caller contract).
     unsafe { (*header).refcount.fetch_add(1, Ordering::Relaxed) };
+}
+
+/// Take one extra reference on a live resource object **only if it is still alive** — the C's
+/// `erts_refc_inc_unless(&bin->binary.intern.refc, 0, 0)` that `erts_fire_nif_monitor` takes before
+/// it runs a `down` callback (`erl_nif.c:3092`).
+///
+/// `true` means the count was non-zero and went up (the reference is now held by the caller, who must
+/// drop it through [`enif_release_resource`]). `false` means it was already **zero**: the resource is
+/// dying, so the C does **not** call `down` (`brefc == 0`, `:3093-3096`) — and neither may we, because
+/// a resource whose count reached zero is already queued for destruction, and resurrecting it would
+/// run its destructor twice.
+///
+/// # Safety
+///
+/// `obj` must be a payload pointer from [`enif_alloc_resource`] whose block is still allocated and not
+/// freed — in practice an object still registered as live ([`Registry::object_type`] answers `Some`),
+/// which is the only way `destroy` cannot have freed it.
+#[inline]
+unsafe fn retain_object_if_alive(obj: *mut c_void) -> bool {
+    // SAFETY: `obj` is a payload pointer, so its header is the `RESOURCE_HEADER_SIZE` bytes before it
+    // and lies in the same live block (caller contract).
+    let header = unsafe { header_ptr(obj) };
+    // SAFETY: `header` points at a live block; `fetch_update` reads and conditionally writes the count
+    // atomically, so a concurrent release cannot interleave between the test and the increment.
+    unsafe {
+        (*header)
+            .refcount
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count != 0).then_some(count + 1)
+            })
+    }
+    .is_ok()
+}
+
+/// Drop one reference from a live resource object **only if it still has one** — the guarded
+/// counterpart of [`retain_object_if_alive`], for a caller that has no `*mut ErlNifEnv` and therefore
+/// cannot satisfy [`enif_release_resource`]'s "the count is non-zero" precondition.
+///
+/// `true` means one reference was dropped — and, when that was the last one, the type's destructor ran
+/// (synchronously, see [`destroy`]) and the block was freed. `false` means the count was already
+/// **zero**: the object is dying, so nothing is dropped and a second destructor can never run.
+///
+/// The decrement is a `fetch_update`, not a `fetch_sub`, so a concurrent release can neither underflow
+/// the count nor drive an already-destroyed object's destructor twice.
+///
+/// # Safety
+///
+/// `obj` must be a payload pointer from [`enif_alloc_resource`] whose block is still allocated and not
+/// freed — in practice an object still registered as live ([`Registry::object_type`] answers `Some`),
+/// which is the only way `destroy` cannot have freed it.
+#[inline]
+unsafe fn release_object_if_alive(obj: *mut c_void) -> bool {
+    // SAFETY: `obj` is a payload pointer, so its header is the `RESOURCE_HEADER_SIZE` bytes before it
+    // and lies in the same live block (caller contract).
+    let header = unsafe { header_ptr(obj) };
+    // The pre-decrement count of the *committed* update. `fetch_update` may run the closure more than
+    // once (one retry per lost race) and the invocation whose result is stored is always the last one,
+    // so this cell holds exactly the value the successful CAS matched.
+    let previous = core::cell::Cell::new(0usize);
+    // SAFETY: `header` points at a live block; `fetch_update` reads and conditionally writes the count
+    // atomically, so a concurrent release cannot interleave between the test and the decrement.
+    let dropped = unsafe {
+        (*header)
+            .refcount
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                previous.set(count);
+                (count != 0).then(|| count - 1)
+            })
+    }
+    .is_ok();
+    if dropped && previous.get() == 1 {
+        // SAFETY: this call took the count from 1 to 0, so it is the only owner left.
+        unsafe { destroy(header) };
+    }
+    dropped
 }
 
 /// `void enif_keep_resource(void* obj);`
@@ -668,7 +919,9 @@ pub unsafe extern "C" fn enif_keep_resource(obj: *mut c_void) {
 /// Drops one reference; the release that reaches zero runs the type's `dtor` (with a live environment
 /// built from the type's host) and frees the block. An object that has been exported as a resource
 /// term holds one more reference (see the module docs, point 3), so releasing the allocator's
-/// reference leaves it alive — exactly as on the oracle.
+/// reference leaves it alive — exactly as on the oracle. That extra reference is dropped through this
+/// same function by [`release_resource_terms`], so both routes share one decrement/destructor path and
+/// cannot diverge.
 ///
 /// The destructor is run **synchronously** on this thread, where the C schedules it as misc aux work;
 /// see the module docs, "The destructor's timing", for why the asynchronous form is not reproduced.
@@ -753,6 +1006,36 @@ pub unsafe extern "C" fn enif_sizeof_resource(obj: *mut c_void) -> size_t {
     unsafe { (*header_ptr(obj)).data_sz }
 }
 
+/// Whether the resource object `obj` belongs to a type this crate opened **with** a `down` callback
+/// — the C's `rsrc->type->fn.down` presence, the fact `enif_monitor_process` gates its `-1` on
+/// (`erl_nif.c:3968-3972`, whose own `ASSERT(!rsrc->monitors == !rsrc->type->fn.down)` at `:3966`
+/// states the equivalence).
+///
+/// `None` means "no answer": `obj` is null, or it is not a live payload pointer this crate minted
+/// (an object from another NIF module, a term-shaped word, a freed block). The caller must then fall
+/// back to its own behaviour — this function **never** dereferences a pointer it does not recognise,
+/// where the C would read `DATA_TO_RESOURCE(obj)->type` unconditionally.
+///
+/// Measured on the oracle (OTP 29.1.1 / erts-17.1, `tests/fixtures`-style NIF, both resource types
+/// opened from the `load` callback — the only place the C allows it, `erl_nif.c:2708`):
+/// `enif_open_resource_type` (`members = 1`, no `down`) ⇒ `enif_monitor_process` answers `-1` for
+/// both a live and an undefined target; `enif_init_resource_type` with `members = 3` and a `down` ⇒
+/// `0` for a live target and `1` for an undefined one.
+pub fn resource_type_has_down(obj: *mut c_void) -> Option<bool> {
+    if obj.is_null() {
+        return None;
+    }
+    with_registry(|r| {
+        let ty = r.object_type(obj)?;
+        if ty.is_null() {
+            return None;
+        }
+        // SAFETY: `ty` is the registry's own `Box<ResourceType>` (never freed), so reading its
+        // `down` slot is always in bounds.
+        Some(unsafe { (*ty).down }.is_some())
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // Turning an object into a term (and back)
 // ---------------------------------------------------------------------------------------------
@@ -762,6 +1045,8 @@ pub unsafe extern "C" fn enif_sizeof_resource(obj: *mut c_void) -> size_t {
 /// monitor references use, so the term prints as the oracle's `#Ref<0.…>`.
 const RESOURCE_REF_PAYLOAD_WORDS: usize = 3;
 
+/// The whole internal-reference block: the header word plus [`RESOURCE_REF_PAYLOAD_WORDS`].
+const RESOURCE_REF_WORDS: usize = RESOURCE_REF_PAYLOAD_WORDS + 1;
 /// The next resource-reference id.
 ///
 /// A process-wide monotonic counter, exactly like the C's reference id space: two
@@ -778,24 +1063,52 @@ fn next_resource_ref_id() -> i64 {
 /// `serial` zero (Milestone 1 has one node and one id space) and a fresh monotonic `id`. Returns
 /// `None` only when the host heap cannot fit the four words.
 fn mint_resource_ref(e: &mut NifEnv) -> Option<Eterm> {
-    // SAFETY: `alloc` hands out exactly `RESOURCE_REF_PAYLOAD_WORDS + 1` exclusively-owned,
-    // writable words from the host heap; every one is written below, before the pointer escapes.
-    let p = unsafe { alloc(e, RESOURCE_REF_PAYLOAD_WORDS + 1) }?;
-    // SAFETY: `p` addresses the four words just handed out (see above).
-    unsafe {
-        *p = prelude::make_header(
-            RESOURCE_REF_PAYLOAD_WORDS,
-            beam_term::REF_SUBTAG,
-        );
-        *p.add(1) = prelude::make_small(0); // node: the local node
-        *p.add(2) = prelude::make_small(0); // serial: one id space in M1
-        *p.add(3) = prelude::make_small(next_resource_ref_id());
-    }
-    Some(prelude::make_boxed(p as *const Eterm))
+    // SAFETY: `alloc` hands out exactly `RESOURCE_REF_WORDS` exclusively-owned, writable words from
+    // the host heap; `write_resource_ref` writes every one of them before the pointer escapes.
+    let p = unsafe { alloc(e, RESOURCE_REF_WORDS) }?;
+    // SAFETY: `p` addresses the `RESOURCE_REF_WORDS` words just handed out.
+    Some(unsafe { write_resource_ref(p) })
 }
 
-/// `ERL_NIF_TERM enif_make_resource(ErlNifEnv* env, void* obj);`
+/// Write the canonical internal-reference block for a resource term at `hp` and return the boxed
+/// term that designates it — the C's magic reference (`erts_mk_magic_ref`, the shape reproduced
+/// here after the M1 substitution documented in the module header).
 ///
+/// This is the **one** writer of that block: [`mint_resource_ref`] (the `enif_make_resource` route)
+/// passes words it obtained from a live env's host heap, and
+/// [`resource_term`](super::resource_term) passes words from the host it is handed.
+///
+/// # Safety
+///
+/// `hp` must point at [`RESOURCE_REF_WORDS`] **writable**, exclusively-owned words that stay valid
+/// (and reachable from the caller's heap) for as long as the returned term is.
+unsafe fn write_resource_ref(hp: *mut Eterm) -> Eterm {
+    // SAFETY: the caller guarantees `RESOURCE_REF_WORDS` writable words at `hp`; every word of the
+    // block is written below, before the pointer escapes.
+    unsafe {
+        *hp = prelude::make_header(RESOURCE_REF_PAYLOAD_WORDS, beam_term::REF_SUBTAG);
+        *hp.add(1) = prelude::make_small(0); // node: the local node
+        *hp.add(2) = prelude::make_small(0); // serial: one id space in M1
+        *hp.add(3) = prelude::make_small(next_resource_ref_id());
+    }
+    prelude::make_boxed(hp as *const Eterm)
+}
+/// Drop the reference an **evicted** (provably dead) binding held — outside the registry lock, so the
+/// destructor it may run can call straight back into these entry points.
+///
+/// # Safety
+///
+/// `dead` must be null or a payload pointer that carried exactly one outstanding reference: the one
+/// the evicted binding took when it was minted. [`Registry::bind_term`] only ever answers the object
+/// of a binding whose heap word a *live* term has just re-occupied, which is exactly that case.
+unsafe fn release_evicted(dead: Option<*mut c_void>) {
+    if let Some(stale) = dead {
+        // SAFETY: forwarded from the caller's contract; the registry lock is already released.
+        unsafe { enif_release_resource(stale) };
+    }
+}
+
+/// `ERL_NIF_TERM enif_make_resource(ErlNifEnv* env, void* obj);`///
 /// Mints the resource term **here** — a fresh internal reference built on the host heap by
 /// [`mint_resource_ref`] — and records it in the registry (module docs, substitution 1). The C
 /// returns a fresh magic ref per call (measured: two calls for one object yield two distinct terms),
@@ -826,13 +1139,28 @@ pub unsafe extern "C" fn enif_make_resource(env: *mut ErlNifEnv, obj: *mut c_voi
     };
     // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
     let ty = unsafe { (*header_ptr(obj)).ty };
-    with_registry(|r| {
-        r.bind_term(reference.raw(), ResourceRef { ty, obj });
-    });
-    // The term now owns a reference — the reference the C's magic ref holds. It is never released
-    // (there is no GC to collect the term); see the module docs, point 3.
+    // The term takes its reference **before** it is published — the reference the C's magic ref
+    // holds. It is dropped by `release_resource_terms` once the caller's reachability analysis says
+    // the term is dead, and never otherwise (there is no GC to collect the term); see the module
+    // docs, point 3.
     // SAFETY: `obj` is a live payload pointer with an outstanding reference (caller contract).
     unsafe { retain_object(obj) };
+    let dead = with_registry(|r| {
+        r.bind_term(
+            reference,
+            ResourceRef {
+                ty,
+                obj,
+                word: reference,
+            },
+        )
+    });
+    // A binding whose heap word this fresh term now occupies was provably dead: give its reference
+    // back (module docs, "A reused address evicts a dead mint"). It is never `obj` itself — the
+    // caller's contract keeps `obj` live.
+    // SAFETY: `dead` is the evicted binding's payload pointer, exactly one reference outstanding
+    // (see `release_evicted`'s contract); `bind_term` is the only producer of that answer.
+    unsafe { release_evicted(dead) };
     n(reference)
 }
 
@@ -883,12 +1211,24 @@ pub unsafe extern "C" fn enif_make_resource_binary(
     };
     // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
     let ty = unsafe { (*header_ptr(obj)).ty };
-    with_registry(|r| {
-        r.bind_term(term.raw(), ResourceRef { ty, obj });
-    });
-    // The term owns a reference, exactly as for `enif_make_resource` (module docs, point 3).
+    // The term takes its reference before it is published, exactly as for `enif_make_resource`
+    // (module docs, point 3).
     // SAFETY: `obj` is a live payload pointer with an outstanding reference (caller contract).
     unsafe { retain_object(obj) };
+    let dead = with_registry(|r| {
+        r.bind_term(
+            term,
+            ResourceRef {
+                ty,
+                obj,
+                word: term,
+            },
+        )
+    });
+    // As in `enif_make_resource`: a dead binding whose word this term reuses gives its reference back.
+    // SAFETY: `dead` is the evicted binding's payload pointer, exactly one reference outstanding
+    // (see `release_evicted`'s contract); `bind_term` is the only producer of that answer.
+    unsafe { release_evicted(dead) };
     n(term)
 }
 
@@ -897,6 +1237,10 @@ pub unsafe extern "C" fn enif_make_resource_binary(
 /// Returns `1` and writes `*objp` only when `term` designates a resource object of exactly `type`;
 /// otherwise returns `0` and leaves `*objp` untouched. (The C writes `*objp` without a null check; a
 /// null `objp` is tolerated here.)
+///
+/// Resolution is by the term's **identity** ([`term_key`]), not by its heap address, so a
+/// `copy_struct` copy of a resource term — a different heap address with the same reference identity —
+/// resolves to the same object, exactly as the C's copy-stable magic refs do.
 ///
 /// # Safety
 ///
@@ -918,7 +1262,7 @@ pub unsafe extern "C" fn enif_get_resource(
     if !is_term_word(word) {
         return 0;
     }
-    match with_registry(|r| r.lookup_term(word.raw())) {
+    match with_registry(|r| r.lookup_term(term_key(word))) {
         Some(entry) if entry.ty == target => {
             if !objp.is_null() {
                 // SAFETY: `objp` is non-null and writable (checked; the caller declares it).
@@ -934,7 +1278,9 @@ pub unsafe extern "C" fn enif_get_resource(
 ///
 /// Returns `0` after calling the identified type's `dyncall`, and non-zero when no call was made
 /// (`erl_nif.c:3297-3323`). A term this crate minted is resolved directly: the `name` atom must match
-/// the type and the type must carry a `dyncall`. Any other term falls through to the defaulted
+/// the type and the type must carry a `dyncall`. Resolution is by the term's identity
+/// ([`term_key`]), so a `copy_struct` copy of the minted term reaches the `dyncall` too. Any other
+/// term falls through to the defaulted
 /// [`NifHost::dynamic_resource_call`] hook (a resource type from another NIF module); `None` from the
 /// hook is unsupported and yields the C's failure code `1`.
 ///
@@ -959,7 +1305,7 @@ pub unsafe extern "C" fn enif_dynamic_resource_call(
         // Not a term at all — never a resource handle (the C's `is_internal_magic_ref` is false).
         return 1;
     }
-    let Some(entry) = with_registry(|r| r.lookup_term(resource.raw())) else {
+    let Some(entry) = with_registry(|r| r.lookup_term(term_key(resource))) else {
         // Not a resource object this crate minted: let the host resolve it (another NIF module).
         return match e
             .host()
@@ -992,6 +1338,69 @@ pub unsafe extern "C" fn enif_dynamic_resource_call(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The term-release seam — the caller-owned "the term died" signal
+// ---------------------------------------------------------------------------------------------
+
+// The seam lives in its own file (this one is at the ~1000-line target) and is re-exported here, so
+// `nif::enif::resources::{resource_terms, release_resource_terms}` is the public path.
+#[path = "resources_release.rs"]
+mod release;
+
+pub use self::release::{release_resource_terms, resource_terms};
+
+// ---------------------------------------------------------------------------------------------
+// The monitor tree — the `down`-callback delivery seam
+// ---------------------------------------------------------------------------------------------
+
+// The C's per-resource monitor tree and the `down` delivery path live in their own file (this one is
+// at the ~1000-line target); the registry field they own is `Registry::monitors` above.
+#[path = "resources_monitors.rs"]
+mod monitors;
+
+// The binding type the registry's monitor table is keyed to.
+use self::monitors::MonitorBinding;
+
+pub use self::monitors::{
+    deliver_resource_down, deliver_resource_down_id, resource_monitors, MonitorId,
+};
+
+// The two crate-internal hooks `super::process` drives the arm/demonitor entry points through.
+pub(super) use self::monitors::{record_monitor, take_monitor};
+
+// ---------------------------------------------------------------------------------------------
+// The term-minting seam — a resource term for a bare `void*` handle
+// ---------------------------------------------------------------------------------------------
+
+// The C's `prepare_select_msg` (`erl_check_io.c:699-767`) names a selected object by a **resource
+// term**, which only this crate can mint; the helper lives in its own file (this one is at the
+// ~1000-line target) and is re-exported here, so `nif::enif::resources::resource_term` is the public
+// path.
+#[path = "resources_term.rs"]
+mod term;
+
+pub use self::term::resource_term;
+
+// ---------------------------------------------------------------------------------------------
+// The explicit keep/unkeep seam — a raw `void*` handle held alive with no env
+// ---------------------------------------------------------------------------------------------
+
+// The select route's per-interest keep/release needs an env-free Rust helper (the runtime has no
+// `*mut ErlNifEnv`); it lives in its own file (this one is at the ~1000-line target) and is
+// re-exported here, so `nif::enif::resources::{keep_resource, unkeep_resource}` is the public path.
+#[path = "resources_keep.rs"]
+mod keep;
+
+pub use self::keep::{keep_resource, unkeep_resource};
+
 #[cfg(test)]
 #[path = "resources_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "resources_monitors_tests.rs"]
+mod monitor_tests;
+
+#[cfg(test)]
+#[path = "resources_keep_tests.rs"]
+mod keep_tests;

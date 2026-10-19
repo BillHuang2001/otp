@@ -37,9 +37,14 @@
 //! - [`async_job`] — the safe async-job runner ([`AsyncJob`]): the one `unsafe` constructor for a
 //!   `driver_async` job plus safe invoke/release, so a host need not write `unsafe` to drive a
 //!   driver's `async_invoke`/`async_free` callbacks.
+//! - [`async_pool`] — the C async-job pool (`erl_async.c`, the emulator's `+A N`): worker threads,
+//!   the per-worker queues, the monotonic job id and the completion policy that decides when a
+//!   finished job's `async_free` runs ([`AsyncPool`], [`CompletedAsync`], [`ReadyDelivery`],
+//!   [`AsyncSubmit`]).
 
 pub mod api;
 pub mod async_job;
+pub mod async_pool;
 pub mod current_host;
 pub mod drv;
 pub mod host;
@@ -47,4 +52,5 @@ pub mod loader;
 pub mod types;
 
 pub use async_job::{AsyncCallback, AsyncJob};
+pub use async_pool::{AsyncPool, AsyncSubmit, CompletedAsync, ReadyDelivery};
 pub use current_host::with_current_host;

@@ -62,6 +62,8 @@ use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use beam_term::prelude::Eterm;
 
 use crate::driver::api::ErlDrvApi;
+use crate::driver::async_job::AsyncJob;
+use crate::driver::async_pool::AsyncSubmit;
 use crate::driver::host::decode_term_spec;
 use crate::driver::types::{
     ErlDrvBinary, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlDrvTermData, ErlIOVec,
@@ -727,16 +729,29 @@ pub unsafe extern "C" fn driver_select(
 
 /// `long driver_async(ErlDrvPort ix, unsigned int *key, void (*async_invoke)(void *), void
 /// *async_data, void (*async_free)(void *));` — schedule `invoke` on an async thread
-/// (`erl_async.c:541`).
+/// (`erl_async.c:541-617`).
 ///
-/// Returns [`DriverHost::r#async`](crate::driver::host::DriverHost::r#async)'s code: the C returns `0` when the job completed synchronously,
-/// a positive handle for a queued job, and `-1` on error (a null port, or a host without an async
-/// pool — `driver_async_port_key`'s companion is `None` here too).
+/// With an async pool ([`DriverHost::async_pool`](crate::driver::host::DriverHost::async_pool)),
+/// the job goes to the pool and the C's own return contract applies: the **positive id** of a queued
+/// job (`erl_async.c:600`), or `0` when the pool ran it **inline on this thread** — the `+A 0`
+/// configuration (`:603-616`), whose completion policy runs here through
+/// [`deliver_ready_async`](crate::driver::host::DriverHost::deliver_ready_async).
+///
+/// Without a pool the legacy path is untouched: `key`, `data` and the two callbacks are forwarded
+/// verbatim to [`DriverHost::r#async`](crate::driver::host::DriverHost::r#async), whose code comes
+/// back (`0`, a queue handle, or `-1`).
+///
+/// `-1` is returned in three cases, all of them the C's own: an invalid port operand (`:556-558`), a
+/// host that offers neither a pool nor `r#async` support (the C's failure code), and — with a pool —
+/// a `NULL` `async_invoke`, which is not a job at all. That last one is a deliberate **safety
+/// divergence**: the C does not check the operand and would call a null function pointer (`:604`),
+/// while this wrapper refuses it with the documented failure value instead of crashing the host
+/// process (the same policy as `driver_mk_port(NULL)`).
 ///
 /// # Safety
 ///
-/// `port` must be null or a live port handle; `key`, `data` and the two callbacks must be whatever
-/// the host's [`DriverHost::r#async`](crate::driver::host::DriverHost::r#async) expects (they are passed through untouched).
+/// `port` must be null or a live port handle; `key`, `data` and the two callbacks must be a live C
+/// async job (`erl_driver.h:605-607`) that the host may run on another thread.
 #[no_mangle]
 pub unsafe extern "C" fn driver_async(
     ix: ErlDrvPort,
@@ -746,10 +761,34 @@ pub unsafe extern "C" fn driver_async(
     free: Option<unsafe extern "C" fn(*mut c_void)>,
 ) -> c_long {
     // SAFETY: `ix` is null or a live handle (contract above).
-    match unsafe { env_for(ix) } {
-        Some(env) => env.host().r#async(ix, key, invoke, data, free),
-        None => -1,
+    let Some(env) = (unsafe { env_for(ix) }) else {
+        return -1;
+    };
+
+    if let Some(pool) = env.host().async_pool() {
+        // SAFETY: `driver_async`'s operands are a live C async job (the ABI contract above); a
+        // `NULL` `async_invoke` is refused (`-1`) rather than dereferenced — a safety divergence
+        // from the C, which would call it (`:604`).
+        let Some(job) = (unsafe { AsyncJob::new(invoke, free, data) }) else {
+            return -1;
+        };
+        // SAFETY: `key` is the caller's `unsigned int*` operand or null (the ABI contract), read and
+        // written only through the `&mut` the pool takes for the duration of this call.
+        let key = unsafe { key.as_mut() };
+        return match pool.submit(ix, key, job) {
+            // The C's `return id` for a queued job (`:600`).
+            AsyncSubmit::Queued(id) => id,
+            // The C's `+A 0` path: the job already ran on this thread (`:603-616`); apply the
+            // completion policy and report `0`.
+            AsyncSubmit::Inline(item) => {
+                item.complete(|port, data| env.host().deliver_ready_async(port, data));
+                0
+            }
+        };
     }
+
+    // No pool: the legacy (pre-pool) host path, unchanged.
+    env.host().r#async(ix, key, invoke, data, free)
 }
 
 // ---------------------------------------------------------------------------------------------

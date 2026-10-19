@@ -125,12 +125,48 @@
 //! runtime, so it rides the per-round drive point `beam_io`'s port-task round already runs for a
 //! driver whose `has_pending_async` answers `true`: [`DriverPortAdapter::has_pending_async`] reports
 //! the tree, and [`DriverPortAdapter::drive_async`] fires one callback per monitor taken from it
-//! (taking it removes it, as the C does when a monitor fires). That hook is named for `driver_async`
-//! — which stays a typed gap, see below — but it is the one per-round driver entry point this
-//! runtime has, and both are "work that must be handed to the driver between rounds". The teardown
-//! guards are [`beam_io::Driver::stop`] and the `Drop` impl, each of which empties the tree before
-//! the library is unloaded. What marks a monitor pending is the *runtime's* observation of a process
-//! exit (a higher scope's obligation): the tree never fires anything on its own.
+//! (taking it removes it, as the C does when a monitor fires). That hook is the one per-round driver
+//! entry point this runtime has, and it carries both "work that must be handed to the driver
+//! between rounds" kinds — a fired monitor *and* a finished `driver_async` job (see the next
+//! section). The teardown guards are [`beam_io::Driver::stop`] and the `Drop` impl, each of which
+//! empties the tree before the library is unloaded. What marks a monitor pending is the *runtime's*
+//! observation of a process exit (a higher scope's obligation): the tree never fires anything on its
+//! own.
+//!
+//! # `driver_async` (the C async-job pool, `+A N`)
+//!
+//! `driver_async` is the C's asynchronous job submission (`erl_async.c:541-617`), and it is wired
+//! end to end:
+//!
+//! * [`DriverHost::async_pool`] answers the host's pool handle, which is
+//!   [`beam_abi`](beam_abi::driver::async_pool)'s implementation of the C's `ErtsAsync` machinery —
+//!   the threads, the monotonic job ids and the `async_free` bookkeeping. `driver_async` therefore
+//!   returns what the C returns: the **positive id** of a queued job (`:600`), or `0` when the pool
+//!   ran it inline on the calling thread — the `+A 0` configuration (`:603-616`). Without a pool
+//!   the frozen seam's legacy hook (default `-1`) would answer instead, which is exactly the
+//!   divergence this wiring closes.
+//! * The pool is drained once per **port round** by
+//!   [`PortRegistry::pump`](crate::port::PortRegistry::pump), which routes each completed job to the
+//!   port it belongs to through the shared [`AsyncReady`] handle; that port's
+//!   [`beam_io::Driver::drive_async`] point then calls the driver's `ready_async` — the C's
+//!   `call_async_ready` → `async_ready` (`erl_async.c:318-345`, `io.c:5374-5406`) — and applies the
+//!   completion policy: `ready_async` took the data (`need_free = 0`) ⇒ the job's `async_free` does
+//!   **not** run; no `ready_async` slot, or a port that is gone, ⇒ it does.
+//! * `+A 0`'s inline path hands the data off **before** this host can reach the entry (the entry and
+//!   the driver's private state are sibling fields of [`Driver`], not of the host), so
+//!   [`DriverHost::deliver_ready_async`] records the pair on the port's [`AsyncReady`] and
+//!   [`DriverPortAdapter::drive_async`] delivers it at the port's next drive point. A driver with
+//!   **no** `ready_async` slot is answered `NeedFree` on the spot, so its `async_free` runs exactly
+//!   as the C's does.
+//! * A port that closes with jobs still in flight keeps its library **mapped** until they are gone
+//!   ([`AsyncReady::defer_unload`]): `dlclose` under a worker thread that can still enter the
+//!   driver's `async_invoke` would be undefined behaviour. That is the C's own reference duty
+//!   (`erts_ddll_reference_referenced_driver` at submit, released at completion,
+//!   `erl_async.c:236-237`, `:343-344`), which the Rust pool cannot perform for itself.
+//!
+//! Bytes a `ready_async` writes through `driver_output` reach the owner as `{Port, {data, …}}` by
+//! the ordinary read path: [`DriverPortAdapter::drive_async`] ends with the same
+//! [`DriverPortAdapter::settle`] every other callback uses.
 //!
 //! # The liveness view behind `driver_monitor_process` (the C's `1`)
 //!
@@ -146,13 +182,6 @@
 //!
 //! # What is NOT wired yet (the typed gaps)
 //!
-//! * **`driver_async` / `driver_async_cancel`.** `Runtime` is `!Send` (it owns `Rc`/`RefCell`
-//!   tables, a `dlopen`ed library registry and pointer-stable term arenas), so a worker thread
-//!   cannot call back into it and there is no async pool to schedule on. The C's *in-band* path
-//!   (no pool ⇒ invoke in the caller, then `ready_async`, then `async_free` unless `ready_async`
-//!   is present — `erl_async.c:604-613`) needs the driver's private state and entry, which the
-//!   frozen [`DriverHost`] seam does not give the host. It is reported as the C's own failure code
-//!   (`-1`) rather than faked.
 //! * **`driver_control`'s reply *source*.** The entry's `control` callback behind `port_control/3`
 //!   **is** routed ([`DriverPortAdapter::control`]), but the C lets a driver answer from a buffer it
 //!   allocated itself (`*resp_bufp = driver_alloc(…)`, `io.c:4141-4168`), and reading that raw
@@ -170,13 +199,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use libc::{c_int, c_uint, c_ulong};
+use libc::{c_int, c_uint, c_ulong, c_void};
 
 use beam_abi::driver::loader::{self, DriverLibrary, DriverLoadError};
 use beam_abi::driver::types::{
-    ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlIOVec,
+    ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlDrvThreadData, ErlIOVec,
     ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
+use beam_abi::driver::{AsyncPool, CompletedAsync, ReadyDelivery};
 use beam_abi::driver::types::ERL_DRV_FLAG_SOFT_BUSY;
 use beam_abi::driver::types::ErlDrvPDL;
 use beam_abi::{
@@ -202,6 +232,7 @@ use beam_io::{DriverContext, Interest, Token};
 use beam_process::{PortId, ProcessId};
 use beam_term::{make_atom, refc::ERL_ONHEAP_BINARY_LIMIT, Atom, AtomTable, Eterm};
 
+use super::async_ready::AsyncReady;
 use super::ProcessLiveness;
 /// The atoms a driver first interned inside a callback, awaiting the port layer's commit.
 ///
@@ -778,8 +809,8 @@ impl Default for PortTerms {
 /// record a *new* atom is predicted on, and answers the port queries with the owning [`ProcessId`].
 ///
 /// See the module docs for the current scope: the output / term-data / pid services and the
-/// recorded `driver_select` / timer requests are implemented; `driver_async` and the custom
-/// `control` keep the seam's typed defaults.
+/// recorded `driver_select` / timer requests, the `driver_async` pool hook and the `ready_async`
+/// hand-off are implemented; the custom `control` keeps its one documented reply-source gap.
 pub struct DriverPort {
     /// The term arena the term-data decoder allocates on.
     ///
@@ -907,6 +938,33 @@ pub struct DriverPort {
     /// driver-private queue, **never cleared** by [`DriverPort::clear_driver_state`]: the pid is a
     /// field of the port, not of the driver's private state, so `port_info` must keep answering.
     os_pid: OsPidFlag,
+    /// The runtime's **async-job delivery handle** — the pool `driver_async` submits to, the `+A 0`
+    /// inline hand-offs, and the per-port ready queues (see [`AsyncReady`]).
+    ///
+    /// Shared by `Rc` with the [`PortRegistry`](crate::port::PortRegistry) (which builds it and
+    /// drains the pool once per port round) and with this port's
+    /// [`DriverPortAdapter`] (which performs the real `ready_async` call at the port's drive point).
+    /// Stamped by [`DriverPort::with_async_ready`]: a bare host in a unit test gets a private
+    /// one-port handle, which is the same behaviour a runtime host has.
+    async_ready: AsyncReady,
+    /// The `ErlDrvPort` handle this host was published as, once the port lifecycle has built its
+    /// environment — the address `driver_async`'s `async_pool` hook records a submission against.
+    ///
+    /// `None` until [`DriverPortAdapter::start`] stamps it: the handle **is** the environment's
+    /// address ([`DriverEnv::as_port`]), so it cannot exist before that call. A submission from a
+    /// host nobody stamped is refused by [`AsyncReady::note_submission`]'s liveness gate, which is
+    /// the honest answer — there is no port to deliver to.
+    async_port: Option<ErlDrvPort>,
+    /// Whether the **loaded driver entry** declares an [`ErlDrvEntry::ready_async`] slot — the C's
+    /// `dp->entry->ready_async != NULL` test (`io.c:5374-5406`), which decides whether a completion
+    /// is delivered or released.
+    ///
+    /// Stamped at [`DriverPortAdapter::load`] for the same reason as
+    /// [`DriverPort::has_process_exit`]: the host is built before the library is loaded, and
+    /// [`DriverHost::deliver_ready_async`] is reached from inside a driver callback. A host nobody
+    /// claimed keeps the C's "no slot" answer (`false`), so a completion is freed rather than left
+    /// for a `ready_async` that does not exist.
+    has_ready_async: bool,
 }
 
 impl DriverPort {
@@ -944,7 +1002,44 @@ impl DriverPort {
             // No driver has recorded an OS pid yet, so `port_info(Port, os_pid)` is `undefined` —
             // the C's `prt->os_pid = -1` at port construction (`io.c:386`).
             os_pid: OsPidFlag::new(),
+            // A host nobody stamped gets its own delivery handle: `driver_async` then still
+            // submits to a pool and delivers at this port's drive point, exactly as a runtime host
+            // does — `with_async_ready` only shares the runtime's one handle with it.
+            async_ready: AsyncReady::new(),
+            // The environment (and so the handle) does not exist yet: `DriverPortAdapter::start`
+            // stamps it, which is the first moment the port can be addressed at all.
+            async_port: None,
+            // The entry is not loaded yet, so the C's "no `ready_async` slot" answer holds until
+            // `DriverPortAdapter::load` stamps the truth.
+            has_ready_async: false,
         }
+    }
+    /// Installs the runtime's async-job delivery handle (see [`AsyncReady`]).
+    ///
+    /// A builder step like [`DriverPort::with_liveness`], because the handle belongs to the
+    /// [`PortRegistry`](crate::port::PortRegistry) that is about to register the port:
+    /// [`RuntimePorts::open_port`](crate::port::RuntimePorts::open_port) is the one caller and takes
+    /// the very handle the registry drains the pool into. A host nobody claims keeps a private
+    /// one-port handle (see [`DriverPort::new`]).
+    pub fn with_async_ready(mut self, async_ready: AsyncReady) -> DriverPort {
+        self.async_ready = async_ready;
+        self
+    }
+    /// The port's async-job delivery handle, seized by [`DriverPortAdapter::load`] before the host
+    /// is boxed into the port lifecycle (see [`AsyncReady`]).
+    pub fn async_ready(&self) -> AsyncReady {
+        self.async_ready.clone()
+    }
+    /// Records the `ErlDrvPort` handle this host is published as — the address `driver_async`'s
+    /// submissions are recorded against (`DriverPortAdapter::start` is the one caller).
+    pub fn set_async_port(&mut self, port: ErlDrvPort) {
+        self.async_port = Some(port);
+    }
+    /// Records whether the loaded entry declares an [`ErlDrvEntry::ready_async`] slot (see
+    /// [`DriverPort::has_ready_async`]); [`DriverPortAdapter::load`] is the one caller.
+    pub fn with_has_ready_async(mut self, has_ready_async: bool) -> DriverPort {
+        self.has_ready_async = has_ready_async;
+        self
     }
     /// Records whether the loaded driver entry declares an [`ErlDrvEntry::process_exit`] slot (see
     /// [`DriverPort::has_process_exit`]).
@@ -1439,6 +1534,15 @@ fn publishing<R>(driver: &mut Driver, f: impl FnOnce(&DriverLibrary) -> R) -> R 
     let Driver { library, host } = driver;
     beam_abi::with_current_host(&mut **host, || f(library))
 }
+
+/// The emulator's default async-job worker count — `+A`'s default (`erl_async.c`'s
+/// `ERTS_ASYNC_THREADS_DEFAULT`, one thread).
+///
+/// [`PortRegistry::new`](crate::port::PortRegistry::new) stamps it on the runtime's
+/// [`AsyncReady`] handle, so a runtime given no `+A N` behaves exactly like the oracle's default.
+/// `+A 0` is *not* this default: it is a genuine zero-worker pool whose jobs run inline on the
+/// submitting thread (`AsyncPool::new(0)`).
+pub(crate) const DEFAULT_ASYNC_THREADS: usize = 1;
 
 impl DriverHost for DriverPort {
     /// The term arena the term-data decoder allocates on.
@@ -1983,6 +2087,62 @@ impl DriverHost for DriverPort {
     ) -> ErlDrvPort {
         ERTS_INVALID_ERL_DRV_PORT
     }
+    /// The host's async-job pool — what `driver_async` submits to (`erl_async.c:541-617`).
+    ///
+    /// The pool is **lazy**: [`AsyncReady::ensure_pool`] builds it on the first `driver_async` of
+    /// the runtime, so a runtime that never loads a C driver starts no async threads. The worker
+    /// count is the runtime's `+A N` ([`AsyncReady::set_threads`], default
+    /// [`DEFAULT_ASYNC_THREADS`]), and `+A 0` is a real zero-thread pool — **not** `None`, which
+    /// would send `driver_async` down the frozen seam's legacy hook and answer `-1`.
+    ///
+    /// `driver_async` calls this hook exactly once per call, before submitting, which is why the
+    /// submission is recorded here: the pool counts only what it still holds, while
+    /// [`AsyncReady::outstanding`] also covers the job a worker is in the middle of running (it is
+    /// in neither pool queue). That count is what keeps the port's drive point and its library's
+    /// unload honest. A call the ABI then refuses (a `NULL` `async_invoke`) over-counts by one,
+    /// which is safe: the count only ever *keeps* work alive, never the other way round.
+    fn async_pool(&self) -> Option<AsyncPool> {
+        self.async_ready.ensure_pool(self.async_ready.threads());
+        if let Some(port) = self.async_port {
+            self.async_ready.note_submission(port);
+        }
+        self.async_ready.pool()
+    }
+    /// Records a finished `driver_async` job's hand-off for its port's drive point.
+    ///
+    /// The real `ready_async` call cannot happen here. This hook runs while the pool is completing
+    /// the job — either inline inside the driver's own `driver_async` call (`+A 0`) or from the port
+    /// round's drain — and the two operands the callback needs, the loaded entry
+    /// ([`Driver`]'s `library`) and the driver's private state (`ErlDrvData`), are fields of the
+    /// **port lifecycle**, not of the host: they are siblings of this host inside [`Driver`]
+    /// ([`Driver`] bundles them precisely because a callback needs both). So the hand-off is
+    /// queued on the port's [`AsyncReady`] handle and delivered by
+    /// [`DriverPortAdapter::drive_async`], which holds the library and the state.
+    ///
+    /// That deferral is also what the C does: `async_ready` (`io.c:5374-5406`) does **not** call the
+    /// driver from the worker; it enqueues the job on the emulator's ready list and the scheduler's
+    /// `call_async_ready` (`erl_async.c:318-345`) later runs it in a port context. The observable
+    /// result is therefore identical — a positive job id, one `ready_async` with the submitted
+    /// `async_data`, and no `async_free` — only the thread differs.
+    ///
+    /// `NeedFree` is the C's `need_free = 1`: the driver has **no** `ready_async` slot (nothing will
+    /// ever consume the data, `io.c:5400`), or the port is already gone (`erl_async.c:320-330`).
+    /// Either way the pool then runs the job's `async_free`, exactly once.
+    ///
+    /// The `data` operand is the driver's `async_data` pointer: it is stored on the handle and
+    /// handed back unchanged. This crate never dereferences it.
+    fn deliver_ready_async(&mut self, port: ErlDrvPort, data: *mut c_void) -> ReadyDelivery {
+        if !self.has_ready_async {
+            // No slot to deliver to: the C releases the data here (`io.c:5400`).
+            return ReadyDelivery::NeedFree;
+        }
+        if self.async_ready.defer_inline(port, data) {
+            ReadyDelivery::Consumed
+        } else {
+            // A port that is no longer live: the C's `!p` branch frees without delivering.
+            ReadyDelivery::NeedFree
+        }
+    }
 }
 
 /// The shared-object suffix the `dlopen` loader appends to **every** candidate it is handed —
@@ -2071,9 +2231,8 @@ pub(crate) fn load_driver_at(
 ///
 /// # Typed gaps (documented, never a fabricated success)
 ///
-/// * `driver_async` keeps the [`beam_abi::DriverHost`] default (`-1`): see the module docs — there
-///   is no async pool, and the C's in-band path needs the entry and the driver's private state,
-///   which the frozen host seam does not hand the host function.
+/// * `driver_async` submits to the runtime's pool and its completion is delivered at the port's
+///   drive point (see the module docs); `driver_async_cancel` has no C implementation in this tree.
 /// * `driver_control` (the entry's `control` callback behind `port_control/3`) is routed by
 ///   [`DriverPortAdapter::control`]; its only gap is a reply the driver answers from memory of its
 ///   own rather than from the buffer it was handed (a typed *unsupported*, see the module docs).
@@ -2145,6 +2304,19 @@ pub struct DriverPortAdapter {
     /// `load` stamps the entry's flag word onto. The driver has no other route to report the state:
     /// the port layer consults the driver, never the runtime's metadata.
     busy: BusyFlag,
+    /// The port's async-job delivery handle, seized from the host at [`DriverPortAdapter::load`]
+    /// (see [`AsyncReady`]).
+    ///
+    /// A completion whose `ready_async` the host could not call is queued here, keyed by port, and
+    /// this port's [`beam_io::Driver::drive_async`] point delivers it: the library and the driver's
+    /// private state live in this adapter, not in the host a `driver_async` call reaches.
+    async_ready: AsyncReady,
+    /// The `ErlDrvPort` handle this port was published as, taken from the environment in
+    /// [`beam_io::Driver::start`] — the key the delivery handle files this port's work under, and
+    /// the operand the driver's `ready_async` receives.
+    ///
+    /// `null` before `start` (and after `stop`), when the port cannot be addressed at all.
+    port_handle: ErlDrvPort,
 }
 
 /// One descriptor a driver selected, with the directions it armed.
@@ -2159,6 +2331,7 @@ struct Selection {
 }
 
 impl DriverPortAdapter {
+
     /// Loads the driver shared object for `name` from `candidates` and pairs it with `host`.
     ///
     /// The driver's `start` callback is **not** run here: [`beam_io::Driver::start`] runs it once
@@ -2186,6 +2359,10 @@ impl DriverPortAdapter {
         // (`erl_bif_port.c:195-198`), and the runtime already holds the handle (it seized it with
         // `DriverPort::busy_flag` before this call, and the write lands on the same `Rc`).
         let host = host.with_soft_busy(library.entry().driver_flags & ERL_DRV_FLAG_SOFT_BUSY != 0);
+        // The third fact only this site can see: whether the entry declares a `ready_async` slot.
+        // A completion for an entry without one is freed, never queued for a callback that does
+        // not exist (`io.c:5400`).
+        let host = host.with_has_ready_async(library.entry().ready_async.is_some());
         // The C's load path records the entry as a **dynamically loaded** driver
         // (`erts_add_driver_entry(dp, dh, …)`, `io.c:7650`, `dp->handle != NULL`), which is why
         // `remove_driver_entry` refuses it. Recording the same entry here lets the frozen
@@ -2223,6 +2400,12 @@ impl DriverPortAdapter {
             // order is field order, and `driver` takes the host by value): the handle is shared by
             // `Rc`, so the latch the hooks write is the very one this adapter drains.
             failures: host.failures(),
+            // Seized for the same reason, and at the same place: the boxed driver exposes no host,
+            // and the completion the host queues has to be delivered here, where the library and
+            // the driver's private state are in hand.
+            async_ready: host.async_ready(),
+            // Stamped by `start`, which is where the environment (and so the handle) first exists.
+            port_handle: ERTS_INVALID_ERL_DRV_PORT,
             driver: Some(Driver::new(library, host)),
             env: None,
             state: std::ptr::null_mut(),
@@ -2621,6 +2804,102 @@ impl DriverPortAdapter {
         Err(crate::error::unsupported(
             "a driver control reply from the driver's own memory",
         ))
+    }    /// Whether this port owes a `driver_async` owner a `ready_async` call (see
+    /// [`AsyncReady::has_delivery`] and [`AsyncReady::outstanding`]).
+    ///
+    /// Both halves are needed and neither is redundant: `has_delivery` is a completion this side has
+    /// already taken custody of, while `outstanding` covers the job a worker is *currently* running
+    /// — it is in neither of the pool's queues, so only the submission count knows it exists, and
+    /// without it the drive point that would deliver its completion could be skipped.
+    fn has_async_delivery(&self) -> bool {
+        if self.port_handle.is_null() {
+            return false;
+        }
+        self.async_ready.has_delivery(self.port_handle)
+            || self.async_ready.outstanding(self.port_handle) > 0
+    }
+    /// Delivers every `+A 0` inline hand-off queued for this port — the jobs the pool ran on the
+    /// **submitting** thread inside `driver_async` itself (`AsyncSubmit::Inline`).
+    ///
+    /// The data has already been handed off (the ABI answered `Consumed`, so the pool will never run
+    /// its `async_free`), which is why the pointer is only moved here: the driver's `ready_async`
+    /// receives exactly the `async_data` it submitted, and its ownership passes to the driver. A
+    /// port with no driver left (torn down between the hand-off and this point) drops the pointer
+    /// instead of inventing a delivery; [`AsyncReady::detach`] documents that same leak.
+    ///
+    /// The pointer is never dereferenced by this crate.
+    fn deliver_inline_async(&mut self) -> beam_common::Result<usize> {
+        let port = self.port_handle;
+        let handed_off = self.async_ready.take_inline(port);
+        if handed_off.is_empty() {
+            return Ok(0);
+        }
+        let state = self.state;
+        let mut delivered = 0;
+        for data in handed_off {
+            let Some(driver) = self.driver.as_mut() else {
+                break;
+            };
+            publishing(driver, |library| {
+                library.ready_async(state, data as ErlDrvThreadData)
+            })
+                .map_err(driver_call_error)?;
+            self.async_ready.note_delivery(port);
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+    /// Delivers the pooled jobs the port round drained for this port, applying the C's completion
+    /// policy (`call_async_ready`, `erl_async.c:318-345`, over `io.c:5374-5406`) to each.
+    ///
+    /// * `ready_async` ran ⇒ the driver owns the data: the job is **handed off**, so its
+    ///   `async_free` does not run (the C's `need_free = 0`).
+    /// * The port is gone, or the driver has no `ready_async` slot ⇒ the job's `async_free` runs
+    ///   **once** and nothing is delivered (the C's `!p` branch and its `need_free = 1`).
+    ///
+    /// Either way the job's submission is retired ([`AsyncReady::note_delivery`]), which is what
+    /// eventually lets the port's library be unloaded (see [`DriverPortAdapter::stop`]).
+    fn deliver_pooled_async(&mut self) -> beam_common::Result<usize> {
+        let port = self.port_handle;
+        let items: Vec<CompletedAsync> = self.async_ready.take_ready(port);
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let state = self.state;
+        let mut delivered = 0;
+        for item in items {
+            // The C looks the port up before it delivers anything (`erl_async.c:320-330`) and frees
+            // the data of a job whose port is gone. `finish` is that free, exactly once.
+            if item.port_is_gone() {
+                item.finish();
+                self.async_ready.note_delivery(port);
+                continue;
+            }
+            let Some(driver) = self.driver.as_mut() else {
+                item.finish();
+                self.async_ready.note_delivery(port);
+                continue;
+            };
+            let data = item.data();
+            match publishing(driver, |library| {
+                library.ready_async(state, data as ErlDrvThreadData)
+            }) {
+                Ok(()) => item.hand_off(),
+                // The entry turned out to have no `ready_async` slot: the C frees the data
+                // (`io.c:5400`) rather than leaving it for a callback that does not exist.
+                Err(error) if error.is_absent() => item.finish(),
+                Err(error) => {
+                    // The callback could not be entered at all. The job is released exactly once and
+                    // the failure is reported, never swallowed.
+                    item.finish();
+                    self.async_ready.note_delivery(port);
+                    return Err(driver_call_error(error));
+                }
+            }
+            self.async_ready.note_delivery(port);
+            delivered += 1;
+        }
+        Ok(delivered)
     }
 }
 /// Maps a driver-callback failure onto the runtime's error type.
@@ -2721,6 +3000,14 @@ impl beam_io::Driver for DriverPortAdapter {
         let port_terms = driver.host_mut().port_terms();
         port_terms.set_env(port as usize);
         port_terms.set_port(ctx.port());
+        // The third fact this site owns: the handle `driver_async` addresses. The host answers its
+        // pool hook from a callback that receives no port, so the handle is published on it here
+        // (the `driver_async` operand is the very `ErlDrvPort` `as_port` handed out), and the port
+        // becomes deliverable at the same moment — a `driver_async` issued from the driver's own
+        // `start` is addressed to a live port (`AsyncReady::attach`).
+        driver.host_mut().set_async_port(port);
+        self.async_ready.attach(port);
+        self.port_handle = port;
         let command = std::ffi::CString::new(self.command.as_str()).map_err(|_| BeamError::BadArg)?;
         let data = publishing(driver, |library| {
             library.start(port, command.as_ptr() as *mut std::os::raw::c_char)
@@ -2859,7 +3146,7 @@ impl beam_io::Driver for DriverPortAdapter {
     /// the callback and taken the entry, so the port is driven exactly while work is pending and a
     /// fresh port with no monitors never gets a spurious drive point.
     fn has_pending_async(&self) -> bool {
-        self.monitors.has_pending()
+        self.monitors.has_pending() || self.has_async_delivery()
     }
 
     /// Fires `ErlDrvEntry::process_exit` for every monitor whose process has exited.
@@ -2887,23 +3174,35 @@ impl beam_io::Driver for DriverPortAdapter {
     ///
     /// Never today (see above).
     fn drive_async(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<usize> {
-        let _ = ctx;
+        let mut fired = 0;
         let pending = self.monitors.take_pending();
-        if pending.is_empty() {
-            return Ok(0);
+        if !pending.is_empty() {
+            if let Some(driver) = self.driver.as_mut() {
+                let data = self.state;
+                for identity in &pending {
+                    let mut monitor = monitor_from_identity(*identity);
+                    // The pointer addresses a local that lives for the whole call, exactly as the C
+                    // hands the callback a pointer into its own monitor table.
+                    let ptr: *mut ErlDrvMonitor = &mut monitor;
+                    let _ = publishing(driver, |library| library.process_exit(data, ptr));
+                }
+                fired += pending.len();
+            }
         }
-        let Some(driver) = self.driver.as_mut() else {
-            return Ok(0);
-        };
-        let data = self.state;
-        for identity in &pending {
-            let mut monitor = monitor_from_identity(*identity);
-            // The pointer addresses a local that lives for the whole call, exactly as the C hands
-            // the callback a pointer into its own monitor table.
-            let ptr: *mut ErlDrvMonitor = &mut monitor;
-            let _ = publishing(driver, |library| library.process_exit(data, ptr));
+        // The port's `driver_async` completions: the `+A 0` inline hand-offs first (they were
+        // handed off on this very thread, so they are older than anything a worker finished), then
+        // the pooled jobs the port round drained for this port.
+        if self.port_handle.is_null() {
+            return Ok(fired);
         }
-        Ok(pending.len())
+        fired += self.deliver_inline_async()?;
+        fired += self.deliver_pooled_async()?;
+        if fired > 0 {
+            // Bytes a `ready_async` wrote through `driver_output` reach the owner through the very
+            // same read/failure/select hand-off every other callback uses — one delivery path.
+            self.settle(ctx)?;
+        }
+        Ok(fired)
     }
     /// Runs the driver's `control` callback — the driver half of `erlang:port_control/3`
     /// (`call_driver_control`, `io.c:4024-4078`).
@@ -3057,8 +3356,35 @@ impl beam_io::Driver for DriverPortAdapter {
         // destroy, so the queue is emptied — the C's own outcome for a close in progress
         // (`deliver_term_check_port` refuses a delivery while `ERTS_PORT_SFLG_CLOSING`, `io.c:6213`).
         self.terms.clear();
-        // `driver` drops here: `DriverLibrary::Drop` runs the entry's `finish` and `dlclose`s, and
-        // the boxed host goes with it.
+        // The port is going away, so nothing of its own is deliverable any more: the delivery handle
+        // runs the C's `!p` branch for whatever it still held (`AsyncReady::detach`, which also
+        // marks the pool's queued jobs gone so their `async_free` runs instead of a delivery).
+        let port = self.port_handle;
+        let in_flight = if port.is_null() {
+            0
+        } else {
+            let pooled = self
+                .async_ready
+                .pool()
+                .map_or(0, |pool| pool.pending_for_port(port));
+            pooled + self.async_ready.outstanding(port)
+        };
+        if !port.is_null() {
+            self.async_ready.detach(port);
+        }
+        self.port_handle = ERTS_INVALID_ERL_DRV_PORT;
+        if in_flight > 0 {
+            // **Defer, never `dlclose`.** A worker may still be inside the driver's
+            // `async_invoke`, and unloading the code under a running callback is undefined
+            // behaviour. The library stays mapped until the pool and the delivery handle agree that
+            // nothing of this port can be entered any more (`AsyncReady::reap_unloads`, run by
+            // every port round); a worker that never finishes then leaks the mapping — a leak, never
+            // a dangling call. This is the C's own reference duty, which the Rust pool cannot
+            // perform for itself (see the module docs).
+            self.async_ready.defer_unload(port, driver);
+        }
+        // With nothing in flight `driver` drops here: `DriverLibrary::Drop` runs the entry's
+        // `finish` and `dlclose`s, and the boxed host goes with it.
         result.and(released)
     }
 }
@@ -3081,6 +3407,24 @@ impl Drop for DriverPortAdapter {
     fn drop(&mut self) {
         self.monitors.clear();
         self.terms.clear();
+        let port = self.port_handle;
+        // A port dropped without `stop` (an unwound start, a dropped registry) is the same
+        // `dlclose`-under-a-worker hazard: whatever the pool still runs for it keeps the library
+        // mapped, and the delivery handle releases it at the first later port round.
+        if !port.is_null() {
+            let in_flight = self
+                .async_ready
+                .pool()
+                .map_or(0, |pool| pool.pending_for_port(port))
+                + self.async_ready.outstanding(port);
+            self.async_ready.detach(port);
+            if in_flight > 0 {
+                if let Some(driver) = self.driver.take() {
+                    self.async_ready.defer_unload(port, driver);
+                }
+            }
+            self.port_handle = ERTS_INVALID_ERL_DRV_PORT;
+        }
         if let Some(driver) = self.driver.as_mut() {
             driver.host_mut().clear_driver_state();
         }

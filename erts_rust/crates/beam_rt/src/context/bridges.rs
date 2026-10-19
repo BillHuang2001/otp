@@ -490,6 +490,16 @@ pub(super) fn two_atom_tuple(
 ///
 /// The host's [`PendingInterner`] is a clone of this call's, so a name the C `load` callback
 /// interns is committed (at its predicted index) together with any the BIF interns.
+///
+/// # The `load` callback's `enif_send`s
+///
+/// The load host carries no [`NifHostServices`](crate::nif::NifHostServices) provider — it cannot
+/// borrow the runtime it lives inside — so a `load` callback's `enif_send` is **queued** on the
+/// host ([`NifHostImpl::with_load_sends`](crate::nif::NifHostImpl)) and delivered here the moment
+/// the callback returns, over the pass's own process table ([`Self::mailbox`]). That keeps the
+/// acceptance window exactly the callback's: once drained, the window is closed for good, so an
+/// `unload` callback on the same host answers the ABI's `0` rather than promising a delivery no
+/// drain point would ever honour.
 pub(super) struct NifBridge<'a> {
     /// The runtime whose NIF registry stores the loaded library.
     pub(super) runtime: &'a mut Runtime,
@@ -499,6 +509,14 @@ pub(super) struct NifBridge<'a> {
     pub(super) interner: PendingInterner,
     /// `erlang:self()` as seen by the library's `load` callback.
     pub(super) self_pid: Eterm,
+    /// The pass's own process table when the `load_nif/2` call runs inside a scheduler slice;
+    /// `None` means "resolve against the runtime's own `processes`" (the same resolution
+    /// [`RuntimeNifServices`](crate::nif::RuntimeNifServices) makes).
+    ///
+    /// The delivery of a `load`-callback `enif_send` needs it: for the whole of a pass the
+    /// runtime's own `processes` is a fresh empty placeholder (`take_processes`), so a delivery
+    /// resolved against it would find no receiver.
+    pub(super) mailbox: Option<&'a mut ProcessTable>,
 }
 
 impl beam_bifs::NifLoader for NifBridge<'_> {
@@ -548,22 +566,56 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
         let schedulers = crate::info::schedulers_count(self.runtime) as i32;
         // This host is MOVED INTO the runtime's NIF registry, so it cannot borrow the runtime and
         // carries no services: a `load`/`unload` callback's `make_ref`/`whereis_pid` stay the typed
-        // default (never a fabricated reference or pid).
-        let mut host = Box::new(NifHostImpl::new(
-            heap,
-            Rc::clone(&self.atoms),
-            self.interner.share(),
-            self.self_pid,
-            schedulers,
-            None,
-        ));
-        let lib = beam_abi::nif::loader::load(path, module, host.as_mut(), load_info)
-            .map_err(crate::nif::map_load_error)?;
-        self.runtime
-            .nifs
-            .borrow_mut()
-            .insert(module.to_string(), NifEntry::new(lib, host));
-        Ok(())
+        // default (never a fabricated reference or pid) and its `monitor_process` never fabricates
+        // an arm. The one exception is `enif_send`, which the host serves for the duration of the
+        // `load` callback out of its own pending-send window (`with_load_sends`), drained below.
+        let mut host = Box::new(
+            NifHostImpl::new(
+                heap,
+                Rc::clone(&self.atoms),
+                self.interner.share(),
+                self.self_pid,
+                schedulers,
+                None,
+            )
+            .with_load_sends(),
+        );
+        let outcome = beam_abi::nif::loader::load(path, module, host.as_mut(), load_info)
+            .map_err(crate::nif::map_load_error);
+        // The `load` callback's `enif_send`s: the host cannot reach the runtime, so they are
+        // queued (`NifHostImpl::with_load_sends`) and delivered here — the C's `enif_send`
+        // queues inside the callback, so the message is in the receiver's mailbox before
+        // `erlang:load_nif/2` returns either way.
+        let sends = host.take_load_sends();
+        let outcome = match outcome {
+            Ok(lib) => {
+                self.runtime
+                    .nifs
+                    .borrow_mut()
+                    .insert(module.to_string(), NifEntry::new(lib, host));
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        // Delivered on **every** path, including a `load` callback that vetoed the load: the C
+        // queues the message inside the callback, so a vetoing library's send still arrives.
+        for send in sends {
+            let delivered = crate::context::nif_send::deliver(
+                self.runtime,
+                self.mailbox.as_deref_mut(),
+                send.from,
+                send.to,
+                send.msg,
+            );
+            // The ABI's only channel for this is the `1` the callback already received; a
+            // failure is recorded on the debug-trace channel rather than lost.
+            if !delivered && crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "enif_send from the load callback of '{module}' was not delivered"
+                ));
+            }
+        }
+        outcome
     }
 }
 

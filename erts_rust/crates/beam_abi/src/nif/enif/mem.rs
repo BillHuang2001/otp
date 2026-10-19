@@ -89,7 +89,7 @@ use super::*;
 
 use libc::{c_int, c_uchar, c_uint, c_void, size_t};
 
-use crate::nif::types::ErlNifBinary;
+use crate::nif::types::{ErlNifBinary, ErlNifBinaryToTerm};
 
 /// Populate the `ErlNifApi` slots this file owns (see the module docs).
 pub(super) const fn populate(mut api: ErlNifApi) -> ErlNifApi {
@@ -796,7 +796,21 @@ pub unsafe extern "C" fn enif_term_to_binary(
 
 /// `size_t enif_binary_to_term(ErlNifEnv*, const unsigned char* data, size_t sz, ERL_NIF_TERM* term, unsigned int opts);`
 ///
-/// Returns the number of bytes consumed, or `0` on failure.
+/// Returns the number of **source bytes the decoded term occupied**, or `0` on failure
+/// (`erts/emulator/beam/erl_nif.c:1507-1545`, which ends in `return bp - data`). An External Term
+/// Format image may carry bytes **after** the encoded term; the C tolerates them and simply does not
+/// count them, so the answer for `term_to_binary(42) ++ <<"junk">>` is `3`, not the image's length.
+/// A truncated or undecodable payload is `0`, and `*term` is then left untouched.
+///
+/// `opts` is the C's `switch`: `0` or `ERL_NIF_BIN2TERM_SAFE`, anything else `0` before any decoding.
+/// (Only the *option* is validated here; the `safe` flag itself is not applied to the decode — this
+/// crate has no ETF decoder to apply it to, see below.)
+///
+/// The count comes from [`NifHost::binary_to_term_used`]. That hook's default forwards to
+/// [`NifHost::binary_to_term`] and reports the whole slice, which is exact for a host whose decoder
+/// consumes the entire image, and reports the C's `0` (a failure) for an image with trailing bytes
+/// when the decoder is strict — the one thing this crate cannot decide for itself, because deciding
+/// it *is* decoding and `beam_abi` deliberately has no `beam_codec` dependency.
 ///
 /// # Safety
 ///
@@ -807,8 +821,14 @@ pub unsafe extern "C" fn enif_binary_to_term(
     data: *const c_uchar,
     sz: size_t,
     term: *mut ERL_NIF_TERM,
-    _opts: c_uint,
+    opts: c_uint,
 ) -> size_t {
+    // The C's `switch ((Uint32)opts)`: `0` decodes plainly, `ERL_NIF_BIN2TERM_SAFE` decodes with the
+    // `safe` flag, and every other value is an immediate `0` — no decode, no term written
+    // (`erl_nif.c:1519-1523`).
+    if opts != 0 && opts != ErlNifBinaryToTerm::SAFE.bits() {
+        return 0;
+    }
     let Some(e) = (unsafe { env_mut(env) }) else {
         return 0;
     };
@@ -817,21 +837,20 @@ pub unsafe extern "C" fn enif_binary_to_term(
     }
     // SAFETY: the caller declares `sz` readable bytes at `data`.
     let bytes = unsafe { core::slice::from_raw_parts(data, sz) };
-    match e.host().binary_to_term(bytes) {
-        Some(value) => {
+    match e.host().binary_to_term_used(bytes) {
+        Some((value, used)) => {
             // SAFETY: `term` is non-null and writable (checked above).
             unsafe { term.write(n(value)) };
-            sz
+            used
         }
         None => 0,
     }
 }
-
 #[cfg(test)]
 mod tests {
     //! Path-included-module-style tests for the binary family's **representation** (see the module
     //! docs): the word counts this crate produces against the oracle's, measured through the public
-    //! `enif_*` entries.
+    //! `enif_*` entries — plus `enif_binary_to_term`'s *consumed-byte count* contract.
     //!
     //! The oracle column is the measured `enif_term_size` (OTP 29.1.1 / erts-17.1) of the same call:
     //!
@@ -949,6 +968,238 @@ mod tests {
             // SAFETY: `term` is a live bitstring of `size * 8` bits.
             assert_eq!(unsafe { prelude::bitstring_size(t(term)) }, size * 8);
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `enif_binary_to_term`: the C's *consumed byte count*, not the slice length
+    // -----------------------------------------------------------------------------------------
+
+    /// The two images the tests below decode, spelled out as bytes because this crate deliberately
+    /// has **no** `beam_codec` dependency: `erlang:term_to_binary(N)` for a small `N` is
+    /// `[VERSION_MAGIC=131, SMALL_INTEGER_EXT=97, N]`, so three bytes.
+    ///
+    /// `TWO_TERM_IMAGE` is `term_to_binary(42) ++ term_to_binary(7)`: one well-formed term followed by
+    /// four bytes of what is, from the first term's point of view, trailing garbage — the image the C
+    /// answers `3` for (`bp - data`), not `6`.
+    const TWO_TERM_IMAGE: [u8; 6] = [131, 97, 42, 131, 97, 7];
+    /// How much of [`TWO_TERM_IMAGE`] the **first** term occupies.
+    const FIRST_TERM_LEN: usize = 3;
+    /// `[131, 98]` — `SMALL_INTEGER_EXT` with its operand byte missing: a truncated payload.
+    const TRUNCATED_IMAGE: [u8; 2] = [131, 98];
+
+    /// A word that is **not** a valid term, used to prove `*term` was left untouched on failure (a
+    /// written term is always a real, non-sentinel word).
+    const UNTOUCHED: ERL_NIF_TERM = ERL_NIF_TERM::from_raw(usize::MAX);
+
+    /// Decode the leading `[131, 97, N]` of `bytes`, reporting the three bytes it consumed — a
+    /// three-line stand-in for the real ETF decoder (which lives in `beam_codec`, a crate this one
+    /// must not depend on). Anything else is a decode failure, exactly as the real decoder's would be.
+    fn first_small_int(bytes: &[u8]) -> Option<(Eterm, usize)> {
+        match bytes {
+            [131, 97, value, ..] => Some((prelude::make_small(i64::from(*value)), 3)),
+            _ => None,
+        }
+    }
+
+    /// A host that implements only the **legacy** [`NifHost::binary_to_term`] hook, so
+    /// `enif_binary_to_term` sees [`NifHost::binary_to_term_used`]'s *default* body — the situation
+    /// every existing `NifHost` implementor is in.
+    struct ImageHost {
+        heap: Heap,
+        atoms: AtomTable,
+        /// How many times each decode hook body ran, so a test can prove *which* one the entry point
+        /// consults (and that a refused `opts` decodes nothing at all).
+        plain_calls: usize,
+        used_calls: usize,
+    }
+
+    impl ImageHost {
+        fn new() -> ImageHost {
+            ImageHost {
+                heap: Heap::new(4096).expect("a small test heap is allocatable"),
+                atoms: AtomTable::new(),
+                plain_calls: 0,
+                used_calls: 0,
+            }
+        }
+    }
+
+    impl NifHost for ImageHost {
+        fn heap(&mut self) -> &mut Heap {
+            &mut self.heap
+        }
+
+        fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+            Some(prelude::make_atom(self.atoms.intern(name)))
+        }
+
+        fn atom_name(&mut self, atom: Eterm) -> Option<String> {
+            if !prelude::is_atom(atom) {
+                return None;
+            }
+            self.atoms
+                .name(prelude::atom_val(atom))
+                .map(str::to_string)
+        }
+
+        fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
+            self.plain_calls += 1;
+            first_small_int(bytes).map(|(term, _)| term)
+        }
+    }
+
+    /// The same host **plus** the new [`NifHost::binary_to_term_used`] hook — what `beam_rt`'s
+    /// `NifHostImpl` must become. The three boilerplate hooks forward to the inner host so both
+    /// variants share one definition.
+    struct UsedSeamHost(ImageHost);
+
+    impl UsedSeamHost {
+        fn new() -> UsedSeamHost {
+            UsedSeamHost(ImageHost::new())
+        }
+    }
+
+    impl NifHost for UsedSeamHost {
+        fn heap(&mut self) -> &mut Heap {
+            &mut self.0.heap
+        }
+
+        fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+            self.0.intern_atom(name)
+        }
+
+        fn atom_name(&mut self, atom: Eterm) -> Option<String> {
+            self.0.atom_name(atom)
+        }
+
+        fn binary_to_term_used(&mut self, bytes: &[u8]) -> Option<(Eterm, usize)> {
+            self.0.used_calls += 1;
+            first_small_int(bytes)
+        }
+    }
+
+    /// Drive `enif_binary_to_term` over `bytes` on `host`, returning the C entry point's answer and
+    /// the word it left in `*term` ([`UNTOUCHED`] when the call failed and wrote nothing).
+    fn bin2term(host: &mut impl NifHost, bytes: &[u8], opts: c_uint) -> (usize, ERL_NIF_TERM) {
+        let mut env = NifEnv::new(host);
+        let mut term = UNTOUCHED;
+        // SAFETY: `env` is live for the whole call, `bytes` is a live local of exactly `bytes.len()`
+        // readable bytes, and `term` is a live writable local.
+        let used = unsafe {
+            enif_binary_to_term(
+                env.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut term,
+                opts,
+            )
+        };
+        (used, term)
+    }
+
+    /// The headline fix: an image carrying a **second** term after the first must answer the first
+    /// term's byte count (the C's `return bp - data`), not the length of the whole slice.
+    ///
+    /// The host here implements only the used-count hook, so a `enif_binary_to_term` that still
+    /// consulted `binary_to_term` would answer `0` (that hook is at its `None` default).
+    #[test]
+    fn binary_to_term_reports_the_first_terms_byte_count_not_the_slice_length() {
+        let mut host = UsedSeamHost::new();
+        let (used, term) = bin2term(&mut host, &TWO_TERM_IMAGE, 0);
+        assert_eq!(
+            used, FIRST_TERM_LEN,
+            "the C answers `bp - data` (the bytes the FIRST term occupied), not `data_sz` = {}",
+            TWO_TERM_IMAGE.len()
+        );
+        assert_eq!(term, n(prelude::make_small(42)), "the first term is the one decoded");
+        assert_eq!(
+            host.0.plain_calls, 0,
+            "the used-count hook is preferred; the legacy hook must not be consulted"
+        );
+        assert_eq!(host.0.used_calls, 1, "the used-count hook is called exactly once");
+    }
+
+    /// The fallback every existing `NifHost` implementor keeps, unchanged: with **only**
+    /// `binary_to_term` implemented, the default `binary_to_term_used` forwards to it and reports
+    /// `bytes.len()` — exact for a host whose decoder consumes the whole image, and a documented
+    /// under-answer (never a wrong term) for one that tolerates trailing bytes.
+    #[test]
+    fn without_the_used_count_hook_the_default_forwards_and_reports_the_whole_slice() {
+        let mut host = ImageHost::new();
+        let (used, term) = bin2term(&mut host, &TWO_TERM_IMAGE, 0);
+        assert_eq!(
+            used,
+            TWO_TERM_IMAGE.len(),
+            "the default hook forwards to `binary_to_term` and reports `bytes.len()`"
+        );
+        assert_eq!(term, n(prelude::make_small(42)));
+        assert_eq!(host.plain_calls, 1, "the legacy hook is the one consulted");
+        assert_eq!(host.used_calls, 0, "the derived hook body keeps no state of its own");
+    }
+
+    /// A truncated payload is a decode failure: the C's `0`, and `*term` untouched — never a
+    /// half-decoded term. Both host shapes must agree, since both reach `None`.
+    #[test]
+    fn a_truncated_payload_answers_zero_and_leaves_the_term_untouched() {
+        let mut used_host = UsedSeamHost::new();
+        let (used, term) = bin2term(&mut used_host, &TRUNCATED_IMAGE, 0);
+        assert_eq!(used, 0, "a truncated image is the C's `return 0`");
+        assert_eq!(term, UNTOUCHED, "`*term` must not be written on failure");
+        assert_eq!(used_host.0.used_calls, 1, "the hook was consulted, and answered None");
+
+        let mut plain_host = ImageHost::new();
+        let (used, term) = bin2term(&mut plain_host, &TRUNCATED_IMAGE, 0);
+        assert_eq!(used, 0);
+        assert_eq!(term, UNTOUCHED);
+    }
+
+    /// `opts` is the C's `switch`: `0` or `ERL_NIF_BIN2TERM_SAFE`, anything else `0` **before any
+    /// decoding happens** (`erl_nif.c:1519-1523`).
+    #[test]
+    fn only_zero_and_the_safe_flag_are_accepted_as_opts() {
+        let mut host = UsedSeamHost::new();
+        let (used, term) = bin2term(&mut host, &TWO_TERM_IMAGE, ErlNifBinaryToTerm::SAFE.bits());
+        assert_eq!(used, FIRST_TERM_LEN, "`ERL_NIF_BIN2TERM_SAFE` decodes normally");
+        assert_eq!(term, n(prelude::make_small(42)));
+
+        let mut host = UsedSeamHost::new();
+        for opts in [1u32, 0x1000, 0x2000_0001, u32::MAX] {
+            let (used, term) = bin2term(&mut host, &TWO_TERM_IMAGE, opts);
+            assert_eq!(used, 0, "opts {opts:#x} is the C's `default: return 0`");
+            assert_eq!(term, UNTOUCHED, "opts {opts:#x} must not write a term");
+        }
+        assert_eq!(
+            (host.0.used_calls, host.0.plain_calls),
+            (0, 0),
+            "a refused opts value is answered before any decode"
+        );
+    }
+
+    /// The mutability guards the C also has: a null `data` or a null `term` answers `0` without
+    /// touching the host (`erts_rust` must never fault where the C would).
+    #[test]
+    fn a_null_data_or_term_answers_zero() {
+        let mut host = UsedSeamHost::new();
+        let mut env = NifEnv::new(&mut host);
+        let mut term = UNTOUCHED;
+        // SAFETY: a null `data` is explicitly allowed by the contract (`sz` is then 0).
+        let used = unsafe {
+            enif_binary_to_term(env.as_ptr(), core::ptr::null(), 0, &mut term, 0)
+        };
+        assert_eq!(used, 0);
+        assert_eq!(term, UNTOUCHED);
+        // SAFETY: a null `term` is explicitly allowed by the contract.
+        let used = unsafe {
+            enif_binary_to_term(
+                env.as_ptr(),
+                TWO_TERM_IMAGE.as_ptr(),
+                TWO_TERM_IMAGE.len(),
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(used, 0);
+        assert_eq!(host.0.used_calls, 0, "no hook is consulted for a null operand");
     }
 
     #[test]
