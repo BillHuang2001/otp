@@ -257,12 +257,25 @@ pub(super) fn is_all(module: &Module, operand: &Operand) -> bool {
 /// `Literal` holding a flag-atom list (`little`/`signed`/`native`; `big`/`unsigned`
 /// are the defaults and contribute nothing). The comparison is by `make_atom` on
 /// this module's atom table, so it needs no index arithmetic.
-#[inline]
+///
+/// The hot arm (`Nil`, every flagless segment the compiler emits) is kept in an
+/// `#[inline(always)]` shell whose only other work is a call to the out-of-line
+/// [`decode_flags_slow`], so the flags decode costs the caller one discriminant test
+/// instead of a call, a `Result` return through memory and a prologue.
+#[inline(always)]
 pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
+    // The overwhelmingly common segment carries no flags (`encode_arg` maps the
+    // empty list to `a,0`), so the hot arm is a plain zero.
     match operand {
-        // The overwhelmingly common segment carries no flags (`encode_arg` maps the
-        // empty list to `a,0`), so the hot arm is a plain zero.
         Operand::Nil => Ok(0),
+        other => decode_flags_slow(module, other),
+    }
+}
+
+/// The non-`Nil` flags operands: a flag-atom list literal, or the typed error.
+#[inline(never)]
+fn decode_flags_slow(module: &Module, operand: &Operand) -> Result<u32> {
+    match operand {
         Operand::Literal(index) => {
             let term = module
                 .literal(*index)
@@ -273,6 +286,7 @@ pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
             }
             Ok(flags)
         }
+        // `Nil` is the fast shell's own arm, so it cannot reach here.
         _ => Err(error::unsupported("bitstring: unsupported flags operand")),
     }
 }
