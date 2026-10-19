@@ -19,7 +19,7 @@
 // %CopyrightEnd%
 
 //! **Owner-death reclamation** — the runtime's host for the `beam_process`
-//! `ProcessExitObserver` seam, carrying the two obligations a death leaves behind:
+//! `ProcessExitObserver` seam, carrying the three obligations a death leaves behind:
 //!
 //! * **ETS tables** (`erl_db.c`, contract A.1). An ETS table belongs to the process that
 //!   created it, so the runtime must release it the moment that process dies — the table
@@ -30,6 +30,10 @@
 //!   `{'DOWN', Ref, port, Port, Reason}` to the watcher. When the **watcher** dies first, that
 //!   incoming entry outlives it — a port would keep a monitor for a process that no longer
 //!   exists. [`Runtime::drain_port_monitor_exits`] sweeps it.
+//! * **NIF process monitors** (`erl_nif.c:3058-3115`, contract A.3). A resource that armed
+//!   `enif_monitor_process` on a pid must have its type's `down` callback fired when that pid
+//!   dies; the armed set lives in [`crate::nif_monitor`] and the callback is delivered here,
+//!   inline.
 //!
 //! `beam_process` cannot know what the ETS registry allocated on a pid's behalf, and this
 //! runtime threads no [`PortTable`](beam_process::PortTable) into the termination path, so it
@@ -37,18 +41,38 @@
 //! runtime installs an observer on its [`ProcessTable`] and is called **exactly once per
 //! death**, from inside the finalizer, before the dying heap is released.
 //!
-//! # Why the observer only *records*
+//! # Why the observer only *records* the ETS and port obligations
 //!
 //! The finalizer can run while a `RefCell` the runtime owns is already borrowed — a BIF call
 //! holds the shared ETS [`TableRegistry`](beam_bifs::TableRegistry) (or the shared port
 //! registry) for the whole of its call, and a death inside that call would be reached with the
 //! cell taken. An observer that reached for either there would either panic or silently lose
 //! the obligation. So the observer touches **nothing but its own** [`OwnerIndex`] cell (a cell
-//! no BIF ever borrows): it pushes the dead pid and the drained
-//! [`PortWatch`](beam_process::PortWatch) pairs and returns. The two drains then discharge the
-//! recorded obligations at a point where no such borrow is live — a scheduler-pass round —
-//! using `try_borrow_mut` and **deferring** (never dropping, never panicking) when the registry
-//! is still held.
+//! no BIF ever borrows) and the [`NifMonitorIndex`](crate::nif_monitor::NifMonitorIndex) cell:
+//! it pushes the dead pid and the drained [`PortWatch`](beam_process::PortWatch) pairs and
+//! returns. The two drains then discharge the recorded obligations at a point where no such
+//! borrow is live — a scheduler-pass round — using `try_borrow_mut` and **deferring** (never
+//! dropping, never panicking) when the registry is still held.
+//!
+//! # Why the NIF-monitor delivery can run inline (and must)
+//!
+//! The monitor obligation is the one that cannot be deferred: the `down` callback is the
+//! resource type's own code, it takes no runtime state, and the ABI's delivery is
+//! exactly-once — a deferred version would have to carry the monitor ids through a queue for no
+//! benefit. It is safe to run here because:
+//!
+//! * **No runtime cell is held across it.** The only cell this observer borrows besides
+//!   [`OwnerIndex`] is the monitor index, which no BIF ever borrows (only the NIF host's arm and
+//!   demonitor hooks, and those cannot run inside a `down` — see the next point).
+//! * **The callback cannot re-enter the runtime.** `beam_abi` builds the callback's env from the
+//!   **resource type's** host (`pre_nif_noproc`, `erl_nif.c:3107`), which is the *load/unload*
+//!   host — it carries `services = None`, so every runtime hook (`make_ref`, `whereis_pid`,
+//!   `send`, `monitor_process`, …) answers its typed default there. The callback can therefore
+//!   never take a borrow of the runtime, of [`OwnerIndex`] or of the monitor index.
+//! * **The ABI holds no lock while it runs the callback** ([`deliver_resource_down_id`] releases
+//!   its registry lock first), so a re-entrant `enif_*` call from `down` cannot deadlock either.
+//!
+//! [`deliver_resource_down_id`]: beam_abi::nif::enif::resources::deliver_resource_down_id
 //!
 //! # Which tables a death reclaims
 //!
@@ -237,7 +261,7 @@ impl OwnerIndex {
 }
 
 /// The `ProcessExitObserver` host: records the dead pid and its drained port watches, and
-/// nothing else.
+/// delivers the dead pid's NIF process monitors.
 ///
 /// The `reason` is deliberately **not** retained (it may live in the dying heap, and no part
 /// of either obligation needs it), so there is nothing to copy. The
@@ -248,24 +272,40 @@ impl OwnerIndex {
 pub(crate) struct EtsExitObserver {
     /// The shared index the runtime drains.
     index: Rc<RefCell<OwnerIndex>>,
+    /// The NIF process monitors armed on live pids (contract A.3), delivered inline — see the
+    /// module docs on why this one obligation is deliverable here.
+    monitors: Rc<RefCell<crate::nif_monitor::NifMonitorIndex>>,
 }
 
 impl EtsExitObserver {
-    /// An observer recording into `index`.
-    pub(crate) fn new(index: Rc<RefCell<OwnerIndex>>) -> EtsExitObserver {
-        EtsExitObserver { index }
+    /// An observer recording into `index` and delivering the monitors in `monitors`.
+    pub(crate) fn new(
+        index: Rc<RefCell<OwnerIndex>>,
+        monitors: Rc<RefCell<crate::nif_monitor::NifMonitorIndex>>,
+    ) -> EtsExitObserver {
+        EtsExitObserver { index, monitors }
     }
 }
 
 impl ProcessExitObserver for EtsExitObserver {
     fn process_exited(&mut self, exit: &ProcessExit<'_>) {
+        let dead = exit.pid();
         // Only the pid and the port watches are retained: both are heap-independent (a pid and
-        // a `PortWatch` are plain values), and together they are the whole obligation — the
-        // affected ETS tables are looked up at drain time. The borrow is taken once and never
+        // a `PortWatch` are plain values), and together they are the whole ETS/port obligation —
+        // the affected tables are looked up at drain time. The borrow is taken once and never
         // held across the call.
-        let mut index = self.index.borrow_mut();
-        index.deaths.push(exit.pid());
-        index.record_port_watches(exit.port_monitors());
+        {
+            let mut index = self.index.borrow_mut();
+            index.deaths.push(dead);
+            index.record_port_watches(exit.port_monitors());
+        }
+        // The NIF-monitor obligation (`erts_fire_nif_monitor`, `erl_nif.c:3058-3115`) runs here,
+        // once, with the dead pid's own term — a pid is an immediate, so the operand outlives the
+        // dying heap. The index is empty on every death of a runtime that never armed a monitor
+        // (the overwhelmingly common case), where this is a single length check.
+        self.monitors
+            .borrow_mut()
+            .deliver_for(dead, dead.to_eterm());
     }
 }
 /// Whether an owner read back from a table is still a live process.

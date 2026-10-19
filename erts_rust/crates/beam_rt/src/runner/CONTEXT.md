@@ -618,6 +618,31 @@ The `emqx_base62_encode` row of the `foreign` table above is the `bench` driver'
   The off-heap prune's own suite lives with its module ([`../context/gc/bin_vheap.rs`](../context/gc/bin_vheap.rs)); what this node must keep true around it is the park contract — a non-publishing window is refused before any work, and the call sits after the boundary collection and before the heap-kill drain.
 
 ## Known Issues / Handoffs
+* **A signal a process queues on ITSELF is applied only at its NEXT schedule-in, so a `'DOWN'`/`'EXIT'` it awaits in the same slice is missed (measured defect, no fix yet).**
+  `exit(P, kill)` on a monitored/linked `P` runs `ProcessTable::terminate_into`, which queues a
+  `PendingSignal::Down`/`Exit` on every receiver and then calls `schedule_service` — and
+  `schedule_service` **skips a receiver that is `Running`** (`../../beam_process/src/ptab.rs:2315`,
+  `:2482`, `:2498`), i.e. this very process, because the scheduler set it `Running` at slice begin
+  (`slice_begin_inner`, `../../beam_process/src/scheduler.rs:677`).
+  The queued signal is applied only by `slice_begin`'s `service_signals` at the next schedule-in
+  (`scheduler.rs:683-686`), and the `receive` `Wait` arm (`run.rs:1262`–`1363`) parks the process
+  **without servicing its own pending signals** — so a bare `receive {'DOWN', …}` / `{'EXIT', …}`
+  never sees it and takes its `after` branch (or blocks forever on `after infinity`).
+  Measured (`beam_rt run mon_kill.beam mon_kill:go/0`, oracle answers `down=killed` in every shape):
+  `spawn_monitor` + `exit(P,kill)` + `receive 'DOWN' after 1000` → `timeout`; the same with the child
+  having certainly run (`ready` handshake) → `timeout`; `spawn` + `monitor/2` + kill (child never
+  scheduled) → `timeout`; a trapping-link `exit(P,kill)` → `{'EXIT',…,killed}` also `timeout`.
+  A natural `P ! stop` delivers (`down=normal`), and an intervening `receive after 300 -> ok end`
+  makes the DOWN arrive (`message_queue_len` 0 → 1, matching the oracle's 0 → 1) — so the signal is
+  **queued, never lost or un-woken: it is materialised one schedule-in too late**.
+  The `-eval` route is immune (its action process is never set `Running` — `../runtime.rs:3078`
+  runs the body inline — so `schedule_service` serves it eagerly), which is why `tests/monitor.rs`
+  (all `-eval`) and `tests/spawn_monitor.rs` (its children die while the watcher is `Waiting`) stay
+  green, and why the differential corpus misses it (the `proc_signals/*` DOWN cases are `-eval` probes).
+  **Fix scope: one site** — service the process's own queue at the `Wait` arm (after `park_machine` /
+  `set_state(Waiting)` the window is relocation-exempt, so a delivery takes the heap-fragment
+  fallback), then re-check the mailbox instead of parking; a serviced queued `Exit` must return an
+  `Exit` outcome, not `Wait`.
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like
   on an allocation-shaped loop.** Such a runtime runs **zero** collections — the admission declines and
   the nursery grows instead, ≈150 words/call — whereas this one collects several times per call (7.67
