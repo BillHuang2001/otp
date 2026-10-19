@@ -64,7 +64,7 @@ use beam_common::Result;
 use beam_process::PortId;
 
 use crate::completion::PortCompletion;
-use crate::driver::{Driver, DriverContext, DriverFlags, PortArms, PortExitReason};
+use crate::driver::{ControlReplyShape, Driver, DriverContext, DriverFlags, PortArms, PortExitReason};
 use crate::drivers::line_buffer::LineBuffer;
 use crate::error;
 use crate::poller::Poller;
@@ -494,6 +494,20 @@ impl Port {
         self.driver.port_closed()
     }
 
+    /// How this port's driver described its most recent [`Port::control`] reply buffer.
+    ///
+    /// Forwards to [`Driver::control_reply_shape`]: the C's `*rbuf == NULL` test, which
+    /// `write_port_control_result` makes **before** it reads `PORT_CONTROL_FLAG_BINARY`
+    /// (`erts/emulator/beam/io.c:4134`) — so a `NULL` reply is the empty list `[]` even for a port
+    /// whose driver asked for binary replies, while an empty *buffer* under that flag is `<<>>`.
+    ///
+    /// Read it after the [`Port::control`] call whose reply is being rendered. Every built-in
+    /// driver answers [`ControlReplyShape::Buffer`] (they return a real `Vec`), so only the C-ABI
+    /// bridge ([`crate::abi::DriverPort`]) can report [`ControlReplyShape::Null`]; see
+    /// [`PortControlReply`] for the full rendering table.
+    pub fn control_reply_shape(&self) -> ControlReplyShape {
+        self.driver.control_reply_shape()
+    }
     /// Schedules a task of `kind`, reporting whether it was newly scheduled.
     ///
     /// At most one task of a kind is ever pending (see [`PortTaskQueue::enqueue`]), so a
@@ -1257,6 +1271,33 @@ pub enum PortCommandOutcome {
     /// Both of those need the process that issued the command, so this layer reports the state and
     /// the runtime decides: `false`, or park the caller and re-issue.
     Busy,
+}
+
+/// A `control` reply: its bytes **plus** the shape the driver described them with.
+///
+/// The bytes alone are ambiguous for the one row that matters: a driver may leave `*rbuf` `NULL`,
+/// and the C then answers the empty **list** `[]` — tested **before** it looks at the port's
+/// `PORT_CONTROL_FLAG_BINARY` (`erts/emulator/beam/io.c:4134`: `if (!resp_bufp) return NIL;`). An
+/// empty *buffer* under the same flag is `<<>>` instead (`io.c:4136-4162`). Since both replies are
+/// zero bytes, [`shape`](PortControlReply::shape) is what tells them apart; a runtime that renders
+/// the bytes with the flag alone answers `<<>>` for the `NULL` row, which the oracle never does.
+///
+/// | [`shape`](PortControlReply::shape) | bytes | `PORT_CONTROL_FLAG_BINARY` | the oracle's reply |
+/// |---|---|---|---|
+/// | [`ControlReplyShape::Null`] | empty | set **or** clear | `[]` |
+/// | [`ControlReplyShape::Buffer`] | empty | set | `<<>>` |
+/// | [`ControlReplyShape::Buffer`] | empty | clear | `[]` |
+/// | [`ControlReplyShape::Buffer`] | non-empty | either | a list of the bytes, or a binary of them when the flag is set |
+///
+/// The reserved [`PortControl::CLOSE`] operation answers an empty
+/// [`Buffer`](ControlReplyShape::Buffer) reply: no driver ran, so no reply pointer existed — and
+/// `[]` is the oracle's own answer there (the C closes the port and returns `NIL`, not a binary).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PortControlReply {
+    /// The reply bytes: `cres` bytes at the pointer the driver left in `*rbuf`.
+    pub bytes: Vec<u8>,
+    /// Whether the driver's reply pointer was `NULL` (`[]` for every flag word) or a real buffer.
+    pub shape: ControlReplyShape,
 }
 
 /// The options `erlang:port_command/3` accepts, as a small flag set.

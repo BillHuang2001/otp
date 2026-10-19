@@ -96,6 +96,33 @@ impl DriverFlags {
     }
 }
 
+/// How a driver's most recent [`Driver::control`] call described its reply buffer.
+///
+/// The C's `write_port_control_result` (`erts/emulator/beam/io.c:4126-4175`) answers from **two**
+/// independent facts, and they are not interchangeable: whether the driver left `*rbuf` `NULL`, and
+/// whether it asked for a binary reply (`PORT_CONTROL_FLAG_BINARY`, `erl_driver.h:98`). The `NULL`
+/// test comes **first** and answers the empty **list** for every flag word:
+///
+/// | `*rbuf` | `PORT_CONTROL_FLAG_BINARY` | `port_control/3` answers | C |
+/// |---|---|---|---|
+/// | `NULL` | set | `[]` | `io.c:4134` (`if (!resp_bufp) return NIL;`) |
+/// | `NULL` | clear | `[]` | `io.c:4134` |
+/// | buffer, 0 bytes | set | `<<>>` | `io.c:4136-4162` (a zero-bit bitstring) |
+/// | buffer, 0 bytes | clear | `[]` | `io.c:4163-4166` (`buf_to_intlist`) |
+///
+/// Collapsing the two into one empty byte slice is exactly what loses the first row: the runtime
+/// then renders its `PORT_CONTROL_FLAG_BINARY` answer (`<<>>`) where the oracle answers `[]`. Hence
+/// this axis is reported **beside** the bytes, never instead of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ControlReplyShape {
+    /// `*rbuf == NULL`: the C answers `[]` for every flag word (`io.c:4134`).
+    Null,
+    /// A reply buffer (the pre-allocated one the emulator hands in, or the driver's own), `cres`
+    /// bytes long — so zero bytes with `PORT_CONTROL_FLAG_BINARY` set is `<<>>`.
+    #[default]
+    Buffer,
+}
+
 /// The readiness directions a driver has registered with the poller, as seen through its
 /// [`DriverContext`].
 ///
@@ -588,6 +615,25 @@ pub trait Driver: core::any::Any {
         Ok(Vec::new())
     }
 
+    /// How the driver's most recent [`Driver::control`] call described its **reply buffer** — the
+    /// fact [`ControlReplyShape`] names, which the reply bytes alone cannot carry.
+    ///
+    /// The C answers a `control` reply from two independent facts and the reply pointer is tested
+    /// **first**: `write_port_control_result` opens with `if (!resp_bufp) return NIL;`
+    /// (`erts/emulator/beam/io.c:4134`), so a `NULL` `*rbuf` is the empty **list** `[]` *regardless*
+    /// of `PORT_CONTROL_FLAG_BINARY`; only a real buffer splits on that flag (zero bytes with the
+    /// flag set is `<<>>`, without it `[]`). A runtime that renders the empty byte slice as `<<>>`
+    /// whenever the port asked for binary replies therefore answers `[]` wrongly for the `NULL`
+    /// case — which is what this accessor exists to prevent.
+    ///
+    /// The default ([`ControlReplyShape::Buffer`]) is the honest answer for every built-in driver:
+    /// they return a real `Vec` from [`Driver::control`], so their reply is a buffer even when it is
+    /// empty. The C-ABI bridge ([`crate::abi::DriverPort`]) overrides it with the shape its `control`
+    /// callback's `*rbuf` really had. Read it **after** the [`Driver::control`] call whose reply is
+    /// being rendered; before any such call it is the default.
+    fn control_reply_shape(&self) -> ControlReplyShape {
+        ControlReplyShape::Buffer
+    }
     /// Whether the driver's C counterpart has a non-`NULL` `control` entry.
     ///
     /// This is the **control-capability answer** of the frozen C ABI: `erlang:port_control/3`

@@ -59,10 +59,13 @@ use beam_common::Result;
 use beam_process::{PortId, PortTable};
 
 use crate::completion::PortCompletion;
-use crate::driver::{Driver, DriverRegistry, PortExitReason};
+use crate::driver::{ControlReplyShape, Driver, DriverRegistry, PortExitReason};
 use crate::error;
 use crate::poller::{Event, Poller};
-use crate::port::{Port, PortCommandOptions, PortCommandOutcome, PortControl, DEFAULT_READINESS_RED_BUDGET};
+use crate::port::{
+    Port, PortCommandOptions, PortCommandOutcome, PortControl, PortControlReply,
+    DEFAULT_READINESS_RED_BUDGET,
+};
 use crate::port_failure::{DriverFailure, PortFailure};
 use crate::port_task::{
     ActiveInput, LineNotification, PortNotification, PortTaskKind, PortTaskOutcome, Readiness,
@@ -536,6 +539,11 @@ impl PortRegistry {
     /// The single exception is the reserved [`PortControl::CLOSE`] (`"close"`), which closes
     /// the port like [`PortRegistry::close`] and answers with no bytes.
     ///
+    /// This is the bytes-only form of [`PortRegistry::port_control_reply`], which also reports the
+    /// **shape** the driver described them with (a `NULL` reply pointer is the oracle's `[]` even
+    /// for a binary-reply port). A caller that renders the reply as a term needs that shape; a
+    /// caller that only forwards bytes can keep using this one.
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's
@@ -548,17 +556,77 @@ impl PortRegistry {
         op: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        if op == PortControl::CLOSE {
-            self.close(poller, id)?;
-            return Ok(Vec::new());
-        }
-        let result = match self.ports.get_mut(&id.number()) {
-            Some(port) => port.control(poller, op, arg),
-            None => Err(error::badarg()),
-        };
-        self.after_driver_call(poller, result)
+        self.port_control_reply(poller, id, op, arg)
+            .map(|reply| reply.bytes)
     }
 
+    /// Delivers a named port-control operation to the port's driver, answering its reply **bytes**
+    /// together with the **shape** the driver described them with — the whole
+    /// `erlang:port_control/3` reply, not just its payload.
+    ///
+    /// `op`/`arg` are forwarded exactly as [`PortRegistry::port_control`] forwards them, including
+    /// the reserved [`PortControl::CLOSE`] arm, which answers an empty
+    /// [`Buffer`](ControlReplyShape::Buffer) reply (`[]`; no driver ran, so no reply pointer
+    /// existed).
+    ///
+    /// The shape matters because the bytes alone cannot distinguish the two zero-length replies the
+    /// C produces: a driver that leaves `*rbuf` `NULL` gets the empty **list** `[]` for **every**
+    /// port-flag word — `write_port_control_result` tests the pointer first
+    /// (`erts/emulator/beam/io.c:4134`) — while an empty *buffer* under
+    /// `PORT_CONTROL_FLAG_BINARY` is `<<>>` (`io.c:4136-4162`). So the runtime renders `[]` for
+    /// [`ControlReplyShape::Null`] **even when** its port asked for binary replies, and `<<>>` only
+    /// for [`ControlReplyShape::Buffer`] + zero bytes + that flag. See [`PortControlReply`] for the
+    /// whole table.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's
+    /// `control`/`stop` returns (an unrecognised operation is the *driver's* `BeamError::BadArg`).
+    pub fn port_control_reply(
+        &mut self,
+        poller: &mut Poller,
+        id: PortId,
+        op: &str,
+        arg: &[u8],
+    ) -> Result<PortControlReply> {
+        if op == PortControl::CLOSE {
+            self.close(poller, id)?;
+            return Ok(PortControlReply {
+                bytes: Vec::new(),
+                shape: ControlReplyShape::Buffer,
+            });
+        }
+        // The shape is read before `after_driver_call`, which may reap a port the driver closed
+        // from inside its own `control` callback — the reply that call produced still has to be
+        // describable.
+        let (result, shape) = match self.ports.get_mut(&id.number()) {
+            Some(port) => {
+                let result = port.control(poller, op, arg);
+                (result, port.control_reply_shape())
+            }
+            None => (Err(error::badarg()), ControlReplyShape::Buffer),
+        };
+        let bytes = self.after_driver_call(poller, result)?;
+        Ok(PortControlReply { bytes, shape })
+    }
+
+    /// How port `id`'s driver described its most recent [`PortRegistry::port_control`] reply buffer.
+    ///
+    /// The registry surface of [`Port::control_reply_shape`], for a caller that already holds the
+    /// reply bytes (from [`PortRegistry::port_control`]) and wants the shape afterwards. Prefer
+    /// [`PortRegistry::port_control_reply`], which answers both from the same call — this one reads
+    /// the **last** reply, so anything else that drove the port's `control` in between would
+    /// describe that call instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn control_reply_shape(&self, id: PortId) -> Result<ControlReplyShape> {
+        match self.ports.get(&id.number()) {
+            Some(port) => Ok(port.control_reply_shape()),
+            None => Err(error::badarg()),
+        }
+    }
     /// Drives port `id`'s asynchronous driver completions, returning how many were processed.
     ///
     /// A `driver_async` job finishes on a worker thread; the runtime then hands it to the driver's
