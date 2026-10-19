@@ -63,6 +63,69 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   what happens on a host with an `erl` on `$PATH` — the resolved default is the system install's
   script (see above).
 
+## Reachability of a `-sname` node from a real peer (A.5, cross-cutting: dist · eval · scheduler)
+Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, same cookie as this runtime);
+`node()` on both sides is `@<hostname>` (short), so no host-form mismatch is involved.
+- **`net_adm:ping(<this node>)` WORKS whenever a scheduler pass runs.** `run <fixture> …` answers `pong`
+  repeatedly (42–584 ms; three concurrent pongs) and `-eval` with repeated short receives answers `pong`.
+  The `'N'` responder handshake, the `net_kernel` service's `is_auth` answer (`native/net_kernel.rs`), the
+  alias reply (`dist/links.rs::route_alias` → `DOP_ALIAS_SEND`; `DFLAG_ALIAS` is negotiated by OTP 29) and
+  the peer binding (`runtime/scheduler.rs:999`) are all live. A **wrong cookie** answers `pang` in ~20 ms
+  (a real refusal) — that is the discriminator against the timeout form below.
+- **The `-eval` `receive … after T` route pumps the scheduler every port-poll slice, so a peer is
+  accepted however late it dials.** Both per-iteration waits of the `after` arm are bounded by
+  `PORT_POLL_SLICE` (25 ms, the port poller's own budget, reused rather than duplicated) and the wait ends
+  only once the **caller's** deadline has elapsed: `poll_port_messages(remaining.min(PORT_POLL_SLICE))`
+  and `wait_for_timer(min(deadline, now + PORT_POLL_SLICE), …)` (`eval/mod.rs`, the `after` arm of
+  `Evaluator::receive`), so `Runtime::pump_scheduler` — and with it `pump_dist` → `DistNode::pump` →
+  `accept_one` — is re-entered every slice. Before that, one iteration charged the whole window to
+  `poll_port_messages(remaining)` → `PortRegistry::pump(timeout)` (`port.rs:1767`), which loops in
+  `PORT_POLL_SLICE` `epoll_wait` slices for as long as any port is live (the booted kernel's
+  `inet_gethost` child never closes, `port.rs:1802`), so `scheduler_pass` never ran and the peer's
+  connection sat unaccepted in the listen backlog until `net_setuptime` (measured: `pang` after 7005 ms,
+  `LISTEN Recv-Q 1`, `CLOSE-WAIT … Recv-Q 31` = its unread `'N'`). Now measured
+  `beam_rt -sname rustnode -setcookie c123 -noshell -eval 'receive after 25000 -> ok end.'` +
+  `erl -sname peerpos … net_adm:ping(rustnode@billmini)` ⇒ **`pong` in 0.38 s**, against `pang` after
+  7.2 s for the pre-fix build. The observable timing of the arm is unchanged (the window still ends it; a
+  message that arrives in a slice still wins over the timeout, and a pending timer inside a slice is still
+  slept to exactly), pinned structurally by the colocated
+  `eval::tests::{a_long_after_window_is_waited_out_in_port_poll_slices,
+  a_sub_slice_after_window_never_loops}` over a test-only per-thread iteration counter.
+- **`DistNode::is_idle` (`dist.rs:744` → `links.rs:200`) means "no live LINK".** The listener and a pending
+  accept are not counted as work, so a distributed node with nothing to run is `is_quiescent`
+  (`scheduler.rs:581`). The `run` route only survives an idle `receive` because the live `inet_gethost`
+  port keeps `has_nothing_to_poll()` false; without it a long-lived server node would exit
+  `unsupported: run: process blocked`, and `RUN_DEADLINE` (60 s) bounds that route anyway.
+- **This node is PUBLISHED to real peers (and `-hidden` is honoured).** Both distribution halves
+  advertise `dist.rs::advertised_flags(hidden)` — the emulator default
+  (`beam_dist::handshake::preferred_flags`, `erts_dflags.default`) **OR**
+  `beam_dist::handshake::publish_flag(hidden, true)`, i.e. `DFLAG_PUBLISHED` (`0x01`) unless the node
+  was started `-hidden` (a real node adds that bit per peer, `lib/kernel/src/dist_util.erl:152-160`;
+  `net_kernel.erl:hidden_argument/0` reads the `-hidden` init argument). The acceptor
+  (`DistConnection::new` → `ConnectionDriver::server_with_flags`) and the connector
+  (`dist_client.rs::connect_addr` → `ConnectionDriver::client_with_flags`) are told the same value by
+  `Runtime::new` through the additive `DistNode::set_hidden`/`DistClient::set_hidden`, since visibility
+  is a property of the node, not of who dialled. Measured against an OTP 29.1.1 peer: a pinged
+  **published** node now appears in the peer's `nodes()` (`[pubprobe@billmini]`, was `[]`), a pinged
+  `-hidden` node appears only in `nodes(hidden)`/`nodes(connected)`, and a **dialled** link
+  (`net_adm:ping/1` driven from inside this runtime) puts this node in the peer's `nodes()` too. A
+  hidden *peer* stays recorded-not-refused (`DistConnection::peer_visibility`,
+  `a_hidden_and_a_published_peer_both_establish_and_are_recorded`).
+
+## Contract A.5 — measured inbound/outbound behaviour limits (live vs OTP 29.1.1)
+Measured against a real system `erl` (`-sname` only on this host). Facts that bind any A.5 work:
+
+- **Inbound large-term delivery: the sink now falls back to a heap fragment.** `DOP_SEND`/`DOP_REG_SEND` payloads whose term is a **list of ≳117 elements** reach the receiver through the **heap-fragment** model: a message-and-receive-pass receiver is `Running`, so its roots are unpublished and `Process::deliver` returns the copier's **raw refusal** (no collection, no growth) — which `LocalDeliverySink::enqueue_fragmented` (`dist/inbound.rs`) turns into a `beam_message::send_fragmented`, the C's `erts_try_alloc_message_on_heap`/`new_message_buffer` path. The threshold is the default nursery's arithmetic: 117 cons cells is 234 words against a 233-word young space, which is why a 600-byte **binary** was never affected (past 64 bytes it is an off-heap refc payload of 8 heap words). Measured before the fallback, one message per fresh link: `lists:seq(1,115)` (`STRING_EXT`, 118 B body) arrived; `lists:seq(1,118)` (121 B) and `lists:seq(1000,1117)` (`LIST_EXT`, 118 elems) did not; `binary:copy(<<"y">>,600)` (605 B) did. So the bound is **list length**, not wire bytes.
+- **A delivery refusal is an outcome, never a link failure.** `enqueue`'s `Alloc` arm answers `Delivered` (fragment route) or, when even the fragment cannot be allocated, `Dropped` — never `Err`, so an oversized message from a peer cannot retire the link. Pinned by `dist/inbound/tests.rs` (three tests: the fragment delivery with its `take_fragment_deliveries` record, "a delivery refusal is never a link failure", and the unchanged `NoSuchProcess`).
+- **The refusal was never the codec.** The same shapes are fine locally: `binary_to_term(term_to_binary(L))` round-trips at 300 elements (`beam_codec` is correct), and a real cross-process copy (`spawn` + `P ! {N,L}`, 100–1000 elements) delivers every size (`copy_struct`/`Process::deliver` are correct — the refusal is the receiver-heap *capacity* refusal the fragment route exists for).
+- **A malformed arrival can surface as a fatal `badarg`.** When the wrong-shape message does arrive, `length/1` on it raises `badarg` and the CLI prints `beam_rt: badarg` (exit 1) — i.e. the decode can yield a term that is not a proper list.
+- **Sequential distinct-peer links are serviced unreliably**: six separate oracle nodes each sending one 50/115-element message to `myname` delivered only **1 of 6** (all six handshakes answered `ping=pong`, `nodes()=[rustnode@billmini]`) and **2 of 4** in a repeat — so inbound delivery must be measured **one message per link**, never as a loop over fresh peers.
+- **Outbound is the strong direction**: `{Name,Peer} ! Msg` and `RemotePid ! Msg` deliver atoms/tuples/binaries/maps/130-element lists faithfully **after an explicit `net_adm:ping/1`** (`-eval` route; without it: `beam_rt: error distribution: no established connection to node …`, exit 1). `-eval` cannot `~w`-print a term holding a **foreign pid**: `beam_rt: unsupported: external_term` (`beam_codec/src/error.rs:43`).
+- **`rpc:call` is unachievable in both directions** until the distributed-spawn family exists: OTP 29 `rpc:call/5` is `erpc` (`lib/kernel/src/rpc.erl:492` → `erpc:call`), which is `spawn_request/5` + `DOP_SPAWN_REQUEST`/`DOP_SPAWN_REPLY` — not the legacy `rex` `{call,M,F,A,Gleader}` shape. Both halves are missing: `erlang:spawn_request/1..5` are in `error.rs`'s `KNOWN_UNIMPLEMENTED_ERLANG_BIFS`, `erlang:spawn/4` is absent from `native/process.rs`'s dispatch (⇒ bare `undef`), and the inbound family is `Unsupported` at `dist/inbound.rs:295-297` (no `beam_process` spawn-at/reservation API and no reply channel on `InboundSink`).
+- **Cross-node monitors are one-directional**: us→oracle works (`DOP_MONITOR_P` out, `DOP_MONITOR_P_EXIT` back, ref/pid `=:=`, reason `normal`); oracle→us on `{Name,Node}` is the documented gap at `native/process/monitor.rs:357-365`.
+- **Oracle `monitor_node/2` on us WORKS**: `{nodedown,'rustnode@billmini'}` (bare 2-tuple, no reason) arrives on our death; no `{nodeup,_}` is emitted on a later connect — a real-OTP↔real-OTP **control reproduces exactly this**, so it is oracle behaviour, not a divergence.
+- **A `-sname` node survives a connected peer**: `kernel_sup`'s `global_name_server` → `net_kernel:monitor_nodes(true, #{connection_id => true})` → `nodes(visible, #{connection_id => true})` answers the peer with its **real per-link integer** (`native/net.rs::nodes_2` over `Runtime::dist_connection_id`), never a capability gap, so the peer can dial in and outlive any pass (measured: `erl -sname peerprobe -setcookie c123` pings `rustnode@…` ⇒ `pong` with `kernel_sup`/`global_name_server` still live, and the fixture module's own `nodes(visible, #{connection_id => true})` prints `[{peerprobe3@billmini,#{connection_id => 1}}]`).
+
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's own test region — everything from its first test-module declaration to EOF, whether that declaration opens an inline module or a sibling `#[path]` one).
 - `src/port.rs` 4 076 lines, 4 020 of production (unit suite lives in `port/tests.rs`, 3 824 lines, plus the sibling `port/{driver_output_shape,inet_matrix,ram_file_matrix,completion,control_capability,monitor,spawn_driver,packet_framing,stream_shape}_tests.rs` and `port/test_support.rs`).
@@ -80,7 +143,7 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `src/port/failure_e2e_tests.rs` 848 lines — a **test-only** suite (declared from `port/failure.rs`'s tail), so it is legitimately long: it compiles its own real C `.so` and drives one row per oracle opcode through the whole `port_command → output → FailureLatch → settle → signal_failure → drain_failures → push_ready` road, asserting each published `PortSignal` list whole.
 - `src/port/driver/port_term_tests.rs` 761 lines — a **test-only** suite (declared from `port/driver.rs`'s tail) for the `ERL_DRV_PORT` hook: the stamped handle↔`PortId` round trip through the real term-spec decoder, the foreign/null/unstamped refusals, the gone bit after `clear_driver_state`, and an end-to-end row through a real C driver that emits `{ERL_DRV_PORT, driver_mk_port(port)}`.
 - `src/port/failure.rs` 200 lines, 193 of production — **within target**; it is the driver-failure channel's runtime half (`signal_reason`, `PortRegistry::drain_failures`/`fail_port`, the ready-queue publication), declared inside `exit.rs`, and its two suites are `port/failure_tests.rs` (159, the reason-mapping units) and `port/failure_e2e_tests.rs` (above).
-- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 3 488 / 2 597, `cli.rs` 2 968 / 1 791, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 450 / 1 450, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 273 / 1 269, `eval/parse.rs` 1 593 / 1 235, `native/process.rs` 1 841 / 1 196, `native/prim.rs` 4 066 / 1 139, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 167 / 1 022, `nif.rs` 2 101 / 1 004.
+- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 3 616 / 2 655, `cli.rs` 2 968 / 1 791, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 450 / 1 450, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 273 / 1 269, `eval/parse.rs` 1 593 / 1 235, `native/process.rs` 1 841 / 1 196, `native/prim.rs` 4 066 / 1 139, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 167 / 1 022, `nif.rs` 2 101 / 1 004.
 
 ## Routing Table
 - `boot.rs` + `boot/` → preloaded-module set (`PreloadedModules`/`CORE_ATOMS`), the boot banner, the

@@ -35,13 +35,13 @@
 use beam_codec::term::external_ref_parts;
 use beam_common::{BeamError, Result};
 use beam_dist::{AltactSigFlags, Delivery, DeliveryOutcome, InboundSink};
+use beam_message::{CopyContext, OffHeapTable};
 use beam_process::{
     MonitorKind, MonitorRef, PidTarget, ProcessId, ProcessTable, RemotePid, RemoteRef,
 };
 use beam_term::prelude::{
     atom_val, is_atom, is_immediate, is_small, make_atom, signed_value, Atom, Eterm,
 };
-
 
 /// The runtime's [`InboundSink`]: routes a classified inbound [`Delivery`] from a
 /// distribution link to the addressed **local** process.
@@ -114,6 +114,13 @@ use beam_term::prelude::{
 /// [`DeliveryOutcome::Unsupported`]; and a well-formed delivery whose recipient does
 /// not exist is dropped ([`DeliveryOutcome::NoSuchProcess`] /
 /// [`DeliveryOutcome::Dropped`]) exactly as the C's silent-drop arms do.
+///
+/// A message the receiver's own **heap** refuses is neither mis-delivered nor dropped:
+/// the message family falls back to the heap-fragment model
+/// ([`LocalDeliverySink::enqueue_fragmented`]), so an oversized message from a peer is
+/// really delivered. The only remaining drop on that path is a fragment that could not
+/// itself be allocated, and **no delivery refusal is ever an `Err`** — a receiver that
+/// cannot take the payload never retires the link.
 pub struct LocalDeliverySink<'a> {
     /// The runtime's process table the delivery is enqueued into.
     table: &'a mut ProcessTable,
@@ -122,6 +129,13 @@ pub struct LocalDeliverySink<'a> {
     local_node: Eterm,
     /// This node's creation (the incarnation the pid must belong to).
     local_creation: u32,
+    /// The receivers whose message had to be placed in a heap fragment — the caller
+    /// replays the runtime's two fragment notes
+    /// ([`note_foreign_reachable`](crate::runtime::Runtime::note_foreign_reachable) and
+    /// [`note_fragment_wake`](crate::runtime::Runtime::note_fragment_wake)) after the
+    /// drain; a payload in a fragment lives in a region the receiver's collector does not
+    /// scan, so handing it to running code is what opens the descent latch.
+    fragment_deliveries: Vec<ProcessId>,
 }
 
 impl<'a> LocalDeliverySink<'a> {
@@ -132,7 +146,20 @@ impl<'a> LocalDeliverySink<'a> {
             table,
             local_node: make_atom(local_node),
             local_creation,
+            fragment_deliveries: Vec::new(),
         }
+    }
+
+    /// Takes the pids of the receivers this drain had to deliver to through a **heap
+    /// fragment** (see [`Self::enqueue_fragmented`]), in delivery order.
+    ///
+    /// The caller replays the runtime's two fragment notes for each of them after the
+    /// drain — exactly the pair
+    /// [`RuntimeContext::send_fragmented_message`](crate::context) applies on the local
+    /// send path. Taking the list clears it, so a sink reused across links records each
+    /// fragment delivery once.
+    pub(crate) fn take_fragment_deliveries(&mut self) -> Vec<ProcessId> {
+        std::mem::take(&mut self.fragment_deliveries)
     }
 }
 
@@ -527,6 +554,17 @@ impl LocalDeliverySink<'_> {
     ///
     /// The envelope's sender word is derived by [`envelope_from`] — shared by every
     /// routed family, because the rule is the message envelope's, not the opcode's.
+    ///
+    /// A receiver whose own heap refuses the payload is not a lost message: the copier's
+    /// raw [`AllocKind`](beam_common::AllocKind) refusal — what
+    /// [`Process::deliver`](beam_process::Process::deliver) returns unchanged for a receiver
+    /// whose roots are **unpublished** — is routed to the heap-fragment model by
+    /// [`Self::enqueue_fragmented`], exactly as the local send path does
+    /// ([`crate::context`]'s `send_fragmented_message`). So the message family has
+    /// only two honest outcomes: `Delivered` (on the receiver's heap, or in a fragment) and
+    /// `Dropped` (only when even the fragment could not be allocated). Neither is an
+    /// `Err`, so a **delivery** refusal never retires the link; an `Err` here means a table
+    /// invariant really broke.
     fn enqueue(
         &mut self,
         pid: ProcessId,
@@ -546,14 +584,85 @@ impl LocalDeliverySink<'_> {
         }
         match self.table.deliver_simple(pid, envelope, message) {
             Ok(_) => Ok(DeliveryOutcome::Delivered),
-            // The receiver's heap could not hold the message even after a
-            // collection (this runtime has no inbound heap-fragment delivery). Drop
-            // it rather than mis-deliver it, and keep the link up: one oversized
-            // message from a peer must not tear the link down. Reported honestly as
-            // `Dropped`.
-            Err(BeamError::Alloc(_)) => Ok(DeliveryOutcome::Dropped),
+            // The receiver's heap refused the payload — the raw refusal `deliver` returns
+            // for a relocation-exempt or `Running` receiver (and the retried-and-still-
+            // refused one for a parked receiver). Fall back to a heap fragment rather than
+            // dropping the message, exactly as the local send path does.
+            Err(BeamError::Alloc(_)) => self.enqueue_fragmented(pid, envelope, message),
             // Anything else is an unexpected table invariant break — surface it (the
             // caller retires the offending link) rather than swallowing it.
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Delivers `message` (from `from`) into `pid`'s mailbox through the **heap-fragment**
+    /// model — the C's `erts_try_alloc_message_on_heap`/`new_message_buffer` path
+    /// (`../../erts/emulator/beam/erl_message.c:622-691`), reached when the receiver's own
+    /// heap cannot hold the payload.
+    ///
+    /// The work is [`beam_message::send_fragmented`] driven straight into the receiver's
+    /// [`Process`](beam_process::Process) through
+    /// [`heap_and_mailbox_mut`](beam_process::Process::heap_and_mailbox_mut) — the split
+    /// borrow that hands out the receiver's young **heap** and its **mailbox** at once. The
+    /// payload is copied into a fresh [`HeapFragment`](beam_message::HeapFragment) sized to
+    /// hold all of it (the `0` hint means "at least the whole payload") and the enqueued
+    /// message owns that chain, so the payload has a stable home the receiver's heap is not
+    /// involved in — which is exactly why this works for a receiver that must not be
+    /// relocated at all.
+    ///
+    /// `send_fragmented` retries the ordinary receiver-heap copy first and falls back to a
+    /// fragment only when *that* reports [`AllocKind::Message`](beam_common::AllocKind); the
+    /// retry is side-effect free (`copy_struct` preflights capacity before writing a word),
+    /// so reaching this method from exactly that failure costs the refusal, not a partial
+    /// write.
+    ///
+    /// The pid is recorded in [`Self::fragment_deliveries`] whether or not the wake moved
+    /// the receiver: the payload sits in a region the receiver's collector does not scan, so
+    /// the caller must replay the runtime's two fragment notes for it after the drain (the
+    /// wake note is harmless for a receiver that was already runnable — the runtime's wake
+    /// sweep skips a pid that is not a live `Runnable` process).
+    ///
+    /// # Errors
+    ///
+    /// Only a genuine table/protocol failure: a well-formed delivery never returns `Err`
+    /// here. A fragment that cannot be allocated (or a payload the copier still refuses) is
+    /// the honest [`DeliveryOutcome::Dropped`], which **keeps the link up** — one oversized
+    /// message from a peer must never tear the link down.
+    fn enqueue_fragmented(
+        &mut self,
+        pid: ProcessId,
+        from: Eterm,
+        message: Eterm,
+    ) -> Result<DeliveryOutcome> {
+        // Two disjoint field borrows: the table the receiver lives in, and the record of
+        // the fragment deliveries the caller replays after the drain.
+        let LocalDeliverySink {
+            table,
+            fragment_deliveries,
+            ..
+        } = self;
+        let Some(process) = table.get_mut(pid) else {
+            return Ok(DeliveryOutcome::NoSuchProcess);
+        };
+        // A wire-decoded payload carries no refc-binary handles: the distribution decoder
+        // materialises everything it decodes on the dispatch arena (which the drain resets),
+        // so there is no source off-heap table to resolve — exactly like the `deliver_simple`
+        // attempt above, which also passes an empty one. Both tables here are the copier's own
+        // scratch; the fragment path gives the payload to the *fragment's* own off-heap table.
+        let src = OffHeapTable::new();
+        let mut dst = OffHeapTable::new();
+        let mut ctx = CopyContext::new(&src, &mut dst);
+        let (heap, mailbox) = process.heap_and_mailbox_mut();
+        match beam_message::send_fragmented(from, message, heap, mailbox, &mut ctx, 0) {
+            Ok(()) => {
+                let _woken = process.wake();
+                fragment_deliveries.push(pid);
+                Ok(DeliveryOutcome::Delivered)
+            }
+            // Even the fragment could not be allocated: the one remaining honest drop on the
+            // message path. Reported as a drop, never as an `Err` (which would retire the
+            // link) and never as a `Delivered` the receiver cannot see.
+            Err(BeamError::Alloc(_)) => Ok(DeliveryOutcome::Dropped),
             Err(err) => Err(err),
         }
     }
@@ -862,4 +971,12 @@ fn small_uint(term: Eterm) -> Option<u64> {
     }
     u64::try_from(signed_value(term)).ok()
 }
+
+/// The sink's suite: the heap-fragment fallback for a receiver whose own heap refuses the
+/// payload, the "a delivery refusal never retires the link" rule, and the unchanged
+/// `NoSuchProcess` answer (see `src/dist/inbound/tests.rs`). A separate file so the
+/// fixtures that build an oversized payload do not grow this one (the
+/// `src/dist/links/tests.rs` pattern).
+#[cfg(test)]
+mod tests;
 

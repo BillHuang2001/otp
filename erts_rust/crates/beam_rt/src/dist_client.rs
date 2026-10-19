@@ -34,11 +34,11 @@
 //! Every byte of the wire already lives in the sibling `beam_dist` crate — the
 //! connector handshake (`beam_dist::driver::ConnectionDriver::client`), the
 //! control-message codec (`send_control`), the `epmd` `PORT2_REQ` lookup
-//! (`beam_dist::epmd::lookup_port`) and the inbound classifier
-//! (`ConnectionDriver::dispatch_inbound_checked`). What this module adds is the *driving
-//! state* the runtime owns: a socket per peer, a bounded non-blocking pump, a
-//! failure-recorded retirement policy and the [`DistSignalRouter`] implementation
-//! the process table's outbound signals are routed through.
+//! (`beam_dist::epmd::lookup_port_at`, aimed at [`crate::dist::epmd_addr`]) and the
+//! inbound classifier (`ConnectionDriver::dispatch_inbound_checked`). What this module
+//! adds is the *driving state* the runtime owns: a socket per peer, a bounded
+//! non-blocking pump, a failure-recorded retirement policy and the [`DistSignalRouter`]
+//! implementation the process table's outbound signals are routed through.
 //!
 //! # The handshake order (OTP's `handshake_we_started/1`)
 //!
@@ -145,7 +145,9 @@ use beam_process::{DistSignal, DistSignalRouter, MonitorRef, ProcessId, RemotePi
 use beam_term::prelude::{make_atom, make_small, try_make_small, Eterm};
 use beam_term::AtomTable;
 
-use crate::dist::{NodeName, DIST_READ_SLICE};
+use crate::dist::externalize::PayloadArena;
+use crate::dist::links::no_link_error;
+use crate::dist::{advertised_flags, DistConnection, DistLinks, NodeName, DIST_READ_SLICE};
 use crate::error;
 
 /// The words of the stable scratch heap the routed signals' terms are materialised on.
@@ -179,11 +181,15 @@ struct Queued {
 }
 
 /// One outbound distribution link: the connecting state machine and its socket.
-struct ClientLink {
+///
+/// Crate-visible because the one node→link table ([`DistLinks`]) shares it with the
+/// accepting half: it looks a link up by `node`, labels it by `name` and writes a control
+/// message through [`ClientLink::send_control`]/[`ClientLink::send_message`].
+pub(crate) struct ClientLink {
     /// The peer's node atom term — the key a routed signal addresses.
-    node: Eterm,
+    pub(crate) node: Eterm,
     /// The peer's full `node@host` name (diagnostic and [`DistClient::connected_nodes`]).
-    name: String,
+    pub(crate) name: String,
     /// The connecting side's handshake/established state machine.
     driver: ConnectionDriver,
     /// The socket the driver's bytes travel over.
@@ -196,8 +202,19 @@ struct ClientLink {
 
 impl ClientLink {
     /// Whether the handshake completed and the link carries `DOP_*`.
-    fn is_established(&self) -> bool {
+    pub(crate) fn is_established(&self) -> bool {
         matches!(self.driver.state(), DriverState::Established)
+    }
+
+    /// The **peer's** validated capability flags, once the handshake completed
+    /// ([`beam_dist::DistFlags::EMPTY`] before then).
+    ///
+    /// The same per-link gate the accepting half exposes
+    /// ([`DistConnection::negotiated`](crate::dist::DistConnection::negotiated)): it
+    /// decides whether an opcode may be used at all — e.g. `DFLAG_ALIAS` for a
+    /// `DOP_ALIAS_SEND`.
+    pub(crate) fn negotiated(&self) -> beam_dist::DistFlags {
+        self.driver.negotiated()
     }
 
     /// Whether the link can still make progress (handshaking or established).
@@ -206,6 +223,39 @@ impl ClientLink {
             self.driver.state(),
             DriverState::Handshaking | DriverState::Established
         )
+    }
+
+    /// Encodes one `DOP_*` control on this link's driver and writes it.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] before the handshake completed (the driver's own contract),
+    /// the encoder's failures and the socket's write failure.
+    pub(crate) fn send_control(
+        &mut self,
+        dop: Dop,
+        args: &[Eterm],
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.driver.send_control(dop, args, atoms)?;
+        self.flush_output()
+    }
+
+    /// Encodes one message on this link; the driver picks `DOP_SEND_SENDER` when the peer
+    /// negotiated `DFLAG_SEND_SENDER` and `DOP_SEND` otherwise (`dist.c:1686`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientLink::send_control`].
+    pub(crate) fn send_message(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        msg: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.driver.send_message(from, to, msg, atoms)?;
+        self.flush_output()
     }
 
     /// Writes whatever the driver has queued to the socket.
@@ -281,8 +331,10 @@ struct DistClientInner {
     creation: u32,
     /// The shared cookie the handshake digests use.
     cookie: Vec<u8>,
-    /// The outbound links, one per peer node.
-    links: Vec<ClientLink>,
+    /// **Both** distribution halves' links, and the one routing entry over them
+    /// ([`DistLinks`]): the outbound links this client dialled plus the accepted cell
+    /// [`crate::dist::DistNode`] owns, installed by [`DistClient::share_links_with`].
+    links: DistLinks,
     /// Controls the router queued for delivery (their terms live on `scratch`).
     pending: VecDeque<Queued>,
     /// The stable heap the `pending` terms are materialised on. Reset **exactly** when
@@ -291,8 +343,19 @@ struct DistClientInner {
     /// The arena one inbound control message is decoded on (reset per drain; the
     /// delivery copies the term out immediately).
     dispatch_heap: Heap,
+    /// The arena an outbound **payload** is re-materialised on when it carries one of this
+    /// runtime's own pids/ports/references (see [`crate::dist::externalize`]). Every term
+    /// it returns is consumed by the encoder inside the same send, which is the arena's
+    /// lifetime contract.
+    payloads: PayloadArena,
     /// Why the most recently retired link was dropped (recorded, never raised).
     last_error: Option<String>,
+    /// Whether this node is **hidden** (`-hidden`): a link this client dials then
+    /// advertises no `DFLAG_PUBLISHED`, exactly as the accepted half does
+    /// ([`crate::dist::advertised_flags`]). Visibility belongs to the node, not to who
+    /// dialled, so [`DistClient::set_hidden`] is set alongside
+    /// [`crate::dist::DistNode::set_hidden`].
+    hidden: bool,
     /// The next `DOP_UNLINK_ID` id (starts at `1`; a real receiver rejects `0`).
     next_unlink_id: u64,
 }
@@ -311,6 +374,10 @@ pub struct DistClient {
 impl DistClient {
     /// An empty client with no links.
     ///
+    /// The accepted half starts as this client's **own** empty cell — enough for the unit
+    /// suites and for a runtime that never installs a node's table; [`DistClient::share_links_with`]
+    /// replaces it with the live one.
+    ///
     /// # Errors
     ///
     /// The scratch heaps' own allocation failures.
@@ -321,14 +388,36 @@ impl DistClient {
                 our_node: make_small(0),
                 creation: 0,
                 cookie,
-                links: Vec::new(),
+                links: DistLinks::new(Rc::new(RefCell::new(Vec::new()))),
                 pending: VecDeque::new(),
                 scratch: Heap::new(SCRATCH_WORDS)?,
                 dispatch_heap: Heap::new(DISPATCH_HEAP_WORDS)?,
+                payloads: PayloadArena::new()?,
                 last_error: None,
+                hidden: false,
                 next_unlink_id: 1,
             })),
         })
+    }
+
+    /// Installs the **accepted** link table this client routes through.
+    ///
+    /// The listening half ([`crate::dist::DistNode`]) owns the links a peer dialled into
+    /// this runtime and pumps them from the scheduler pass; both halves then share one
+    /// table ([`DistLinks`]), so an outbound `link`/`monitor`/`exit`/`unlink` or message
+    /// reaches a peer **whichever side opened the socket**. The runtime calls this once,
+    /// before the [`DistSignalRouter`] is installed on the process table.
+    ///
+    /// # Errors
+    ///
+    /// The shared cell's re-entrant borrow (never in practice: this runs before anything is
+    /// pumped).
+    pub(crate) fn share_links_with(
+        &self,
+        accepted: Rc<RefCell<Vec<DistConnection>>>,
+    ) -> Result<()> {
+        self.borrow_mut()?.links.accepted = accepted;
+        Ok(())
     }
 
     /// Installs this node's identity (the name/atom/creation an outbound handshake
@@ -346,6 +435,30 @@ impl DistClient {
         }
     }
 
+    /// Marks this node **hidden** (`-hidden`) — or, with `false`, published (the
+    /// default).
+    ///
+    /// An outbound link then advertises [`crate::dist::advertised_flags`]'s set, which
+    /// omits `DFLAG_PUBLISHED` for a hidden node, so a real peer records this runtime as
+    /// [`beam_dist::PeerVisibility::Hidden`] and leaves it out of `nodes()` — the
+    /// mirror of [`crate::dist::DistNode::set_hidden`] on the accepted half. Visibility
+    /// is a property of the node, not of who dialled, so both halves must be told the
+    /// same value.
+    ///
+    /// Additive: it only affects links dialled afterwards (the flags are baked into a
+    /// link's driver when it is created), which is why the runtime sets it before any
+    /// pump.
+    pub fn set_hidden(&self, hidden: bool) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.hidden = hidden;
+        }
+    }
+
+    /// Whether this node dials out as **hidden** ([`DistClient::set_hidden`]).
+    pub fn is_hidden(&self) -> bool {
+        self.inner.try_borrow().map(|inner| inner.hidden).unwrap_or(false)
+    }
+
     /// The `DistSignalRouter` sharing this client's links and outbound queue.
     ///
     /// Installed on the runtime's process table ([`beam_process::ProcessTable::set_dist_router`])
@@ -359,7 +472,9 @@ impl DistClient {
     /// Dials `peer_name` (a `-name`/`-sname` value) and opens an outbound link.
     ///
     /// The peer's distribution listen port is resolved through `epmd`
-    /// ([`beam_dist::epmd::lookup_port`]); the socket is opened, and the connecting
+    /// ([`lookup_dist_port`]), on the `epmd` at [`crate::dist::epmd_addr`] — the same
+    /// address this node's `ALIVE2` registration uses, so a private `epmd`
+    /// (`$ERL_EPMD_PORT`) serves both; the socket is opened, and the connecting
     /// state machine is created. Nothing is sent yet — the first
     /// [`DistClient::pump`] writes the `Name` frame, and
     /// [`crate::Runtime::dist_connect`] drives it to completion.
@@ -371,7 +486,7 @@ impl DistClient {
     /// identity that was never installed ([`DistClient::set_identity`]).
     pub fn connect(&self, peer_name: &str, atoms: &mut AtomTable) -> Result<()> {
         let peer = NodeName::parse(peer_name);
-        let port = beam_dist::epmd::lookup_port(peer.epmd())?;
+        let port = lookup_dist_port(peer.epmd())?;
         let host = host_part(peer.full());
         // A peer on this host is reached over the loopback when its name does not
         // resolve (a `-sname` node's host part is the local hostname); a genuinely
@@ -416,9 +531,17 @@ impl DistClient {
         }
         // A re-connect to the same node replaces the old link (never two live links to
         // one peer, which a real node would treat as a simultaneous connection).
-        inner.links.retain(|link| link.node != node);
-        let driver = ConnectionDriver::client(&inner.our_name, &inner.cookie, inner.creation);
-        inner.links.push(ClientLink {
+        inner.links.outbound.retain(|link| link.node != node);
+        // The flags this link advertises are the **node's** visibility
+        // ([`advertised_flags`]): a normal node publishes itself to the peer it dials
+        // exactly as it does to one that dials it, and a `-hidden` node never does.
+        let driver = ConnectionDriver::client_with_flags(
+            &inner.our_name,
+            &inner.cookie,
+            inner.creation,
+            advertised_flags(inner.hidden),
+        );
+        inner.links.outbound.push(ClientLink {
             node,
             name: peer.full().to_string(),
             driver,
@@ -476,9 +599,48 @@ impl DistClient {
         match self.inner.try_borrow() {
             Ok(inner) => inner
                 .links
+                .outbound
                 .iter()
                 .any(|link| link.name == full && link.is_established()),
             Err(_) => false,
+        }
+    }
+
+    /// Whether **either half's** link to `peer_name` completed its `'N'` handshake.
+    ///
+    /// The union exists because a link a peer **dialled into** this runtime is as much a link
+    /// to that node as one this runtime dialled — `erlang:nodes/0` and `net_adm:ping/1` must
+    /// see a peer that connected *us*, not only the peers we opened.
+    ///
+    /// The name is normalized through [`NodeName::parse`] exactly as
+    /// [`DistClient::is_connected`] does, and the membership test is over
+    /// [`DistLinks::established_names`] — the one union rule, so the two halves can never be
+    /// matched differently. A cell that cannot be borrowed answers `false`, the same
+    /// discipline [`DistClient::is_connected`] keeps.
+    pub fn is_connected_any_half(&self, peer_name: &str) -> bool {
+        let full = NodeName::parse(peer_name).full().to_string();
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.links.established_names().iter().any(|name| *name == full),
+            Err(_) => false,
+        }
+    }
+
+    /// The **local link identity** of the established link to `peer_name` — the integer
+    /// `erlang:nodes/2` reports as `connection_id` (`dist.c`'s `dep->connection_id`).
+    ///
+    /// The identity lives in the one link table both halves share, so a peer that dialled
+    /// **into** this runtime has one exactly like a peer this runtime dialled: the name is
+    /// normalized through [`NodeName::parse`] exactly as [`DistClient::is_connected_any_half`]
+    /// does and the table assigns the id on its first request
+    /// ([`DistLinks::connection_id_for`]), which keeps it stable for that link's lifetime.
+    /// A cell that cannot be borrowed answers `None` — the caller then renders the atom
+    /// `undefined` rather than a fabricated integer, the same discipline
+    /// [`DistClient::is_connected_any_half`] keeps.
+    pub fn connection_id_for(&self, peer_name: &str) -> Option<u64> {
+        let full = NodeName::parse(peer_name).full().to_string();
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner.links.connection_id_for(&full),
+            Err(_) => None,
         }
     }
 
@@ -486,24 +648,75 @@ impl DistClient {
     /// its `'N'` handshake.
     pub fn is_connected_to_node(&self, node: Eterm) -> bool {
         match self.inner.try_borrow() {
-            Ok(inner) => inner
-                .link_index_for_node(node)
-                .is_some_and(|index| inner.links[index].is_established()),
+            Ok(inner) => inner.links.link_index_for_node(node).is_some(),
             Err(_) => false,
         }
     }
 
-    /// The full `node@host` names of every peer this runtime has **established** a link to.
+    /// The full `node@host` names of every peer this runtime has **dialled** and established
+    /// a link to (the outbound half only — see [`crate::dist::DistLinks::established_names`]
+    /// for the union with the links a peer opened).
     pub fn connected_nodes(&self) -> Vec<String> {
         match self.inner.try_borrow() {
             Ok(inner) => inner
                 .links
+                .outbound
                 .iter()
                 .filter(|link| link.is_established())
                 .map(|link| link.name.clone())
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// The full `node@host` names of every peer this runtime has an **established** link to,
+    /// **either** half: the peers it dialled first, then the peers that dialled into it (the
+    /// union [`DistLinks::established_names`] reports).
+    ///
+    /// The union exists because a link a peer **opened into** this runtime reaches that node
+    /// just as an outbound one does, so `erlang:nodes/0` — which reads this — must not hide
+    /// the peers that connected to us. [`DistClient::connected_nodes`] stays the outbound-only
+    /// view. A client cell that cannot be borrowed answers `[]`, matching
+    /// [`DistClient::connected_nodes`]; an accepted cell that cannot be borrowed contributes no
+    /// accepted name (the union rule's own discipline, [`DistLinks::established_names`]).
+    pub fn all_connected_nodes(&self) -> Vec<String> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.links.established_names(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Whether this client holds **any** link, handshaking or established, in either half.
+    ///
+    /// This is the scheduler pass's quiescence query on the connecting half: a peer link —
+    /// even one whose `'N'` handshake has not completed yet — is work the pass must keep
+    /// pumping, because an inbound `DOP_*` (or the handshake's own completion) can deliver a
+    /// message and wake a process parked on a bare `receive`. A runtime with no link has
+    /// nothing here that could ever wake anything, so this answers `false` and the pass is
+    /// free to declare its stall.
+    ///
+    /// The complement of [`crate::dist::DistNode::is_idle`]: a node is idle when it has no
+    /// live link, and this is the same question asked of the one link table both halves
+    /// share ([`crate::dist::DistLinks`]).
+    ///
+    /// A cell that cannot be borrowed is reported as **holding a link**: a borrowed cell
+    /// means distribution work is in flight (a pump or the signal router holds it), so the
+    /// caller must keep pumping rather than substantiate a stall it cannot justify.
+    pub fn has_links(&self) -> bool {
+        match self.inner.try_borrow() {
+            Ok(inner) => !inner.links.is_idle(),
+            Err(_) => true,
+        }
+    }
+
+    /// Whether this client holds **no** link at all — [`DistClient::has_links`]'s
+    /// complement, and the same "nothing in flight" answer
+    /// [`crate::dist::DistNode::is_idle`] gives for the accepted links.
+    ///
+    /// A cell that cannot be borrowed is reported as **not** idle, for the same reason
+    /// [`DistClient::has_links`] reports `true` there.
+    pub fn is_idle(&self) -> bool {
+        !self.has_links()
     }
 
     /// Why the most recently retired link was dropped, if any.
@@ -519,7 +732,7 @@ impl DistClient {
     ///
     /// # Errors
     ///
-    /// A typed error when there is no **established** link to `peer_name` (an
+    /// A typed error when there is no **established** link to `peer_name` in either half (an
     /// unconnected node is never a silent drop and never a fabricated success), plus
     /// the encoding/socket failures.
     pub fn send_reg_send(
@@ -535,7 +748,10 @@ impl DistClient {
         let empty = make_atom(atoms.intern(""));
         let mut inner = self.borrow_mut()?;
         let local = inner.local_pid_term(from)?;
-        inner.send_to_node(node, Dop::RegSend, &[local, empty, to_name, msg], atoms)
+        let msg = inner.outbound_payload(msg, atoms)?;
+        inner
+            .links
+            .route_control(node, Dop::RegSend, &[local, empty, to_name, msg], atoms)
     }
 
     /// Sends `msg` from `from` to the **external pid** `to`
@@ -544,7 +760,7 @@ impl DistClient {
     /// # Errors
     ///
     /// A typed error when `to` is not an external pid, when there is no established
-    /// link to its node, plus the encoding/socket failures.
+    /// link to its node in either half, plus the encoding/socket failures.
     pub fn send_message_pid(
         &self,
         to: Eterm,
@@ -556,10 +772,38 @@ impl DistClient {
         let mut inner = self.borrow_mut()?;
         let local = inner.local_pid_term(from)?;
         let to_term = remote.to_eterm(&mut inner.scratch)?;
+        let msg = inner.outbound_payload(msg, atoms)?;
         // `send_message` selects `DOP_SEND_SENDER` when the peer negotiated
         // `DFLAG_SEND_SENDER` and `DOP_SEND` otherwise (`dist.c:1686`), so the choice
         // cannot be made here — it is the driver's.
-        inner.send_message_to_node(remote.node(), local, to_term, msg, atoms)
+        inner
+            .links
+            .route_message(remote.node(), local, to_term, msg, atoms)
+    }
+
+    /// Sends `msg` from `from` to the **process alias** `to`
+    /// (`{DOP_ALIAS_SEND, From, To} -- Msg`, `dist.c:2563`).
+    ///
+    /// `to` is an **external reference** term naming the alias; its node decides which link
+    /// carries the message, exactly as [`DistClient::send_message_pid`]'s does. The link
+    /// must have negotiated `DFLAG_ALIAS` (see [`DistLinks::route_alias`]).
+    ///
+    /// # Errors
+    ///
+    /// A typed error when `to` is not an external reference, when there is no established
+    /// link to its node in either half, when that link did not negotiate `DFLAG_ALIAS`,
+    /// plus the encoding/socket failures.
+    pub fn send_alias(
+        &self,
+        to: Eterm,
+        from: ProcessId,
+        msg: Eterm,
+        atoms: &mut AtomTable,
+    ) -> Result<()> {
+        let mut inner = self.borrow_mut()?;
+        let local = inner.local_pid_term(from)?;
+        let msg = inner.outbound_payload(msg, atoms)?;
+        inner.links.route_alias(to, local, msg, atoms)
     }
 
     /// Borrows the shared inner state, mapping a live borrow to a typed error (never a
@@ -572,16 +816,19 @@ impl DistClient {
 }
 
 impl DistClientInner {
-    /// Steps every link, retiring the ones that died, and returns the event count.
+    /// Steps every **outbound** link, retiring the ones that died, and returns the event count.
+    ///
+    /// Only the outbound half is stepped here: the accepted links are the listening node's
+    /// ([`crate::dist::DistNode::pump`]) and are driven by it in the same pass.
     fn step_links(&mut self) -> usize {
         let mut events = 0;
         let mut index = 0;
-        while index < self.links.len() {
-            let outcome = self.links[index].pump();
+        while index < self.links.outbound.len() {
+            let outcome = self.links.outbound[index].pump();
             match outcome {
                 Ok(progress) => {
                     events += progress;
-                    if self.links[index].is_live() {
+                    if self.links.outbound[index].is_live() {
                         index += 1;
                     } else {
                         self.retire(index, BeamError::BadArg);
@@ -593,25 +840,33 @@ impl DistClientInner {
         events
     }
 
-    /// Removes the link at `index` and records why.
+    /// Removes the outbound link at `index` and records why.
     fn retire(&mut self, index: usize, err: BeamError) {
-        let link = self.links.remove(index);
+        let link = self.links.outbound.remove(index);
         self.last_error = Some(format!("{}: {err}", link.name));
     }
 
-    /// The index of the link to `node`, if any.
-    fn link_index_for_node(&self, node: Eterm) -> Option<usize> {
-        self.links.iter().position(|link| link.node == node)
-    }
-
-    /// A human-readable label for `node`: its `node@host` name if a link (established
-    /// or still handshaking) is keyed by it, else a rendering of the raw term.
-    fn node_label(&self, node: Eterm) -> String {
-        self.links
-            .iter()
-            .find(|link| link.node == node)
-            .map(|link| link.name.clone())
-            .unwrap_or_else(|| format!("{node:?}"))
+    /// The **wire form** of an outbound message payload: `msg` itself when it carries no
+    /// identifier of this runtime's own (the gate's answer — nothing is copied and nothing
+    /// is allocated), else a copy whose internal pids/ports/references are the external
+    /// terms the wire carries.
+    ///
+    /// This is the **one** externalising step of the outbound path — every message family
+    /// ([`DistClient::send_reg_send`], [`DistClient::send_message_pid`],
+    /// [`DistClient::send_alias`]) funnels its payload through it — and it is what makes the
+    /// canonical `Peer ! {reply, self()}` idiom sendable: `beam_dist` encodes every control
+    /// with no local node identity of its own, so an internal pid has no wire form there
+    /// (see [`crate::dist::externalize`]).
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failures and the codec's own refusal for a payload the wire
+    /// has no image for (a `make_fun3` local fun). A payload is never silently altered: a
+    /// rewrite that cannot be completed is a typed error, exactly as an unencodable payload
+    /// is today.
+    fn outbound_payload(&mut self, msg: Eterm, atoms: &mut AtomTable) -> Result<Eterm> {
+        self.payloads
+            .externalize(msg, atoms, self.our_node, self.creation)
     }
 
     /// An **external pid** term for a local process: the `From`/`Watcher` element a
@@ -627,68 +882,20 @@ impl DistClientInner {
         )
     }
 
-    /// Encodes `msg` (from `from` to `to`, both already external pids) and writes it to
-    /// the node `node`'s link, selecting the send opcode from the negotiated flags.
-    fn send_message_to_node(
-        &mut self,
-        node: Eterm,
-        from: Eterm,
-        to: Eterm,
-        msg: Eterm,
-        atoms: &mut AtomTable,
-    ) -> Result<()> {
-        let Some(index) = self.link_index_for_node(node) else {
-            let label = self.node_label(node);
-            return Err(no_link_error(&label));
-        };
-        self.send_on_link(index, |link, atoms| link.driver.send_message(from, to, msg, atoms), atoms)
-    }
-
-    /// Encodes one control message and writes it to the node `node`'s link.
-    fn send_to_node(
-        &mut self,
-        node: Eterm,
-        dop: Dop,
-        args: &[Eterm],
-        atoms: &mut AtomTable,
-    ) -> Result<()> {
-        let Some(index) = self.link_index_for_node(node) else {
-            let label = self.node_label(node);
-            return Err(no_link_error(&label));
-        };
-        self.send_on_link(
-            index,
-            |link, atoms| link.driver.send_control(dop, args, atoms),
-            atoms,
-        )
-    }
-
-    /// Runs `encode` against the link at `index` (which must be established) and writes
-    /// the resulting bytes to its socket.
-    fn send_on_link<F>(
-        &mut self,
-        index: usize,
-        encode: F,
-        _atoms: &AtomTable,
-    ) -> Result<()>
-    where
-        F: FnOnce(&mut ClientLink, &AtomTable) -> Result<()>,
-    {
-        let link = &mut self.links[index];
-        if !link.is_established() {
-            return Err(error::message(format!(
-                "distribution: the link to {} has not completed its handshake",
-                link.name
-            )));
-        }
-        encode(link, _atoms)?;
-        link.flush_output()
-    }
-
-    /// Drains the outbound queue: every control whose node has an **established** link
-    /// is encoded (with the live `atoms`) and written; one whose link has not finished
-    /// handshaking stays queued. The scratch heap is reset exactly when the queue
-    /// empties, so no queued term can dangle.
+    /// Drains the outbound queue: every control whose node has an **established** link (in
+    /// **either** half — see [`DistLinks`]) is encoded with the live `atoms` and written
+    /// through the one routing entry; one whose link has not finished handshaking stays
+    /// queued. The scratch heap is reset exactly when the queue empties, so no queued term
+    /// can dangle.
+    ///
+    /// Both gates are **exact** node-term matches on both halves
+    /// ([`DistLinks::names_node`]/[`DistLinks::has_established_link_to`]), the same terms
+    /// [`DistLinks::may_reach_node`] gated the router's `route` with. The `names_node`
+    /// branch is therefore a belt-and-braces guard, not the normal path: it fires only for a
+    /// control that was queued while its link was alive and whose link died before the
+    /// flush — the queue may not grow for ever, so such a control is dropped with the typed
+    /// reason recorded in [`DistClientInner::last_error`] (the router already told its
+    /// caller `Ok`, so recording is the only honest place the loss can surface).
     fn flush_pending(&mut self, atoms: &mut AtomTable) -> Result<usize> {
         if self.pending.is_empty() {
             return Ok(0);
@@ -697,20 +904,29 @@ impl DistClientInner {
         let mut retry: VecDeque<Queued> = VecDeque::new();
         let mut sent = 0;
         for item in queued {
-            match self.link_index_for_node(item.node) {
-                Some(index) if self.links[index].is_established() => {
-                    let link = &mut self.links[index];
-                    match link.driver.send_control(item.dop, &item.args, atoms) {
-                        Ok(()) => match link.flush_output() {
-                            Ok(()) => sent += 1,
-                            Err(err) => self.last_error = Some(format!("{}: {err}", link.name)),
-                        },
-                        Err(err) => self.last_error = Some(format!("{}: {err}", link.name)),
-                    }
+            if !self.links.names_node(item.node) {
+                // The link it waited for was retired: nothing in either half names that
+                // node any more, so the control can never be delivered. Record the typed
+                // refusal and drop it rather than growing the queue for ever.
+                let label = self.links.node_label_in(item.node, atoms);
+                self.last_error = Some(format!("{label}: {}", no_link_error(&label)));
+                continue;
+            }
+            if !self.links.has_established_link_to(item.node) {
+                // A link that names the node exists but has not completed its handshake
+                // yet: keep it queued, bounded by the scratch heap.
+                retry.push_back(item);
+                continue;
+            }
+            match self
+                .links
+                .route_control(item.node, item.dop, &item.args, atoms)
+            {
+                Ok(()) => sent += 1,
+                Err(err) => {
+                    let label = self.links.node_label_in(item.node, atoms);
+                    self.last_error = Some(format!("{label}: {err}"));
                 }
-                // No link yet (or one still handshaking): keep it queued, bounded by the
-                // scratch heap.
-                _ => retry.push_back(item),
             }
         }
         self.pending = retry;
@@ -719,7 +935,6 @@ impl DistClientInner {
         }
         Ok(sent)
     }
-
     /// Decodes, **validates + classifies** and routes every control message the
     /// established links queued, using one scratch arena reset per drain.
     ///
@@ -729,12 +944,15 @@ impl DistClientInner {
     /// table the message was decoded against, so a forged or malformed control message
     /// is an `Err` — which retires that one link (recorded in
     /// [`DistClientInner::last_error`]) instead of being mis-routed.
+    ///
+    /// Only the **outbound** half is drained here: the accepted links are the listening
+    /// node's ([`crate::dist::DistNode::dispatch_inbound`]).
     fn dispatch(&mut self, atoms: &mut AtomTable, sink: &mut dyn InboundSink) -> Result<usize> {
         self.dispatch_heap.reset();
         let mut delivered = 0;
         let mut index = 0;
-        while index < self.links.len() {
-            if !self.links[index].is_established() {
+        while index < self.links.outbound.len() {
+            if !self.links.outbound[index].is_established() {
                 index += 1;
                 continue;
             }
@@ -742,7 +960,7 @@ impl DistClientInner {
             // for the duration of the decode only.
             let outcome = {
                 let heap = &mut self.dispatch_heap;
-                self.links[index]
+                self.links.outbound[index]
                     .driver
                     .dispatch_inbound_checked(heap, atoms, sink)
             };
@@ -766,10 +984,17 @@ impl DistClientInner {
     /// **Synchronous materialisation is the contract**: the signal's `reason` may live
     /// in the dying process's heap, and the caller may drop that heap the moment this
     /// returns — so every term is written onto the stable scratch heap here.
+    ///
+    /// The gate is [`DistLinks::may_reach_node`], an **exact node-term** match on both
+    /// halves: the outbound links key on their node atom term and the accepted links on the
+    /// peer term [`crate::dist::DistNode::bind_peer_nodes`] bound for them, so a signal for
+    /// a node **no** link reaches is the typed refusal here — never a queued control that a
+    /// later flush would have to drop (the A.5 contract: a signal for a node with no link is
+    /// a typed error, never a silent drop).
     fn queue_signal(&mut self, signal: DistSignal) -> Result<()> {
         let node = signal_node(&signal);
-        if self.link_index_for_node(node).is_none() {
-            let label = self.node_label(node);
+        if !self.links.may_reach_node(node) {
+            let label = self.links.node_label(node);
             return Err(no_link_error(&label));
         }
         let (dop, args) = self.encode_signal(signal)?;
@@ -909,22 +1134,35 @@ fn unlink_id_term(id: u64) -> Result<Eterm> {
     try_make_small(signed).map_err(|_| BeamError::SystemLimit)
 }
 
-/// A typed "this runtime has no link to that node" error.
-///
-/// Never a silent drop: the caller (a link/monitor operation, or a dying process's
-/// termination) can see exactly why the signal did not reach the wire.
-fn no_link_error(label: &str) -> BeamError {
-    error::message(format!(
-        "distribution: no established connection to node {label}"
-    ))
-}
-
 /// The host part of a `node@host` name.
 fn host_part(full: &str) -> String {
     match full.split_once('@') {
         Some((_, host)) => host.to_string(),
         None => full.to_string(),
     }
+}
+
+/// The distribution listen port of the peer registered as `epmd_name`, resolved on
+/// **the** `epmd` this node speaks to.
+///
+/// The address is [`crate::dist::epmd_addr`] — the runtime's single reading of
+/// `$ERL_EPMD_PORT` — so a node's `ALIVE2` registration
+/// ([`crate::dist::DistNode::register_once`]) and its outbound `PORT2_REQ` lookups
+/// always aim at the same daemon (OTP's `erl_epmd:get_epmd_port/0` semantics: a bare
+/// number is a loopback port, a `host:port` value verbatim, unset the well-known
+/// `127.0.0.1:4369`). An unregistered name stays the typed
+/// `Io(NotFound)` [`DistClient::connect`]'s contract promises.
+fn lookup_dist_port(epmd_name: &[u8]) -> Result<u16> {
+    lookup_dist_port_at(&crate::dist::epmd_addr(), epmd_name)
+}
+
+/// [`lookup_dist_port`] over an **explicit** `epmd` address — the testable core.
+///
+/// The address is a parameter because the process environment is global: a test
+/// points it at a fake `epmd` on an ephemeral loopback port instead of mutating
+/// `$ERL_EPMD_PORT` (this crate never `set_var`s in a test).
+fn lookup_dist_port_at(addr: &str, epmd_name: &[u8]) -> Result<u16> {
+    beam_dist::epmd::lookup_port_at(addr, epmd_name)
 }
 
 /// The [`DistSignalRouter`] implementation over a shared [`DistClientInner`].
@@ -947,7 +1185,8 @@ impl DistSignalRouter for DistRouter {
 mod tests {
     use super::*;
     use beam_alloc::Heap as TestHeap;
-    use beam_dist::{Delivery, UnsupportedSink};
+    use beam_dist::flags::DFLAG_PUBLISHED;
+    use beam_dist::{preferred_flags, publish_flag, Delivery, DistFlags, UnsupportedSink};
     use beam_process::{MonitorKind, RefAllocator};
     use beam_term::prelude::{make_atom as atom_term, AtomTable as Table};
 
@@ -958,11 +1197,21 @@ mod tests {
         cookie: &str,
         creation: u32,
     ) -> (DistClient, ConnectionDriver, TcpStream, AtomTable) {
+        loopback_with_visibility(cookie, creation, false)
+    }
+    /// [`loopback`] with this node's **visibility** chosen (`-hidden` when `hidden`), so a
+    /// test can compare the flags the connector puts on the wire for both kinds of node.
+    fn loopback_with_visibility(
+        cookie: &str,
+        creation: u32,
+        hidden: bool,
+    ) -> (DistClient, ConnectionDriver, TcpStream, AtomTable) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
         let addr = listener.local_addr().expect("read the port");
         let mut atoms = Table::new();
         let our = atom_term(atoms.intern("client@localhost"));
         let client = DistClient::new(cookie.as_bytes().to_vec()).expect("client");
+        client.set_hidden(hidden);
         client.set_identity("client@localhost", our, creation, cookie.as_bytes());
         client
             .connect_addr("peer@localhost", addr, &mut atoms)
@@ -1033,6 +1282,64 @@ mod tests {
         assert!(client.last_error().is_none(), "no link was retired");
     }
 
+    /// **Contract A.5 — this node's visibility, dialling half.** A node's visibility is a
+    /// property of the node, not of who opened the socket, so a link this runtime dials
+    /// advertises exactly what the accepted half advertises
+    /// ([`crate::dist::advertised_flags`]): the emulator default **plus**
+    /// `DFLAG_PUBLISHED` (`dist.h:30`, `dist_util.erl:152-160`) unless the node is
+    /// `-hidden`. The peer's `ConnectionDriver::client_flags` is its record of our `Name`
+    /// message, i.e. the bytes that crossed the socket.
+    #[test]
+    fn the_client_publishes_the_node_unless_it_is_hidden() {
+        let (client, mut driver, mut stream, mut atoms) = loopback("cook", 5);
+        drive(&client, &mut driver, &mut stream, &mut atoms);
+        let published = DistFlags::from_bits(DFLAG_PUBLISHED);
+        assert!(!client.is_hidden(), "a client is published unless `-hidden` says so");
+        assert!(
+            driver.client_flags().contains(published),
+            "the peer read our flags as 0x{:x}, which omits DFLAG_PUBLISHED (0x{:x}) — \
+             it would list this node only under `nodes(hidden)`",
+            driver.client_flags().bits(),
+            DFLAG_PUBLISHED
+        );
+        assert_eq!(
+            driver.client_flags().bits(),
+            (preferred_flags() | publish_flag(false, true)).bits(),
+            "the advertised set is the emulator default plus exactly DFLAG_PUBLISHED"
+        );
+        assert!(
+            driver.client_flags().contains(preferred_flags()),
+            "every capability of the emulator default is still advertised"
+        );
+    }
+
+    /// The `-hidden` half of the same rule: a hidden node's outbound link advertises the
+    /// emulator default **unchanged**, so the peer classifies it as hidden
+    /// (`publish_type/1`) and keeps it out of `nodes()` — while the link still establishes.
+    #[test]
+    fn a_hidden_client_withholds_the_published_bit() {
+        let (client, mut driver, mut stream, mut atoms) = loopback_with_visibility("cook", 5, true);
+        drive(&client, &mut driver, &mut stream, &mut atoms);
+        assert!(client.is_hidden(), "`set_hidden(true)` takes effect");
+        assert!(
+            !driver.client_flags().contains(DistFlags::from_bits(DFLAG_PUBLISHED)),
+            "the peer read the hidden node's flags as 0x{:x}, which still sets \
+             DFLAG_PUBLISHED (0x{:x})",
+            driver.client_flags().bits(),
+            DFLAG_PUBLISHED
+        );
+        assert_eq!(
+            driver.client_flags().bits(),
+            preferred_flags().bits(),
+            "a hidden node advertises the emulator default, unchanged"
+        );
+        assert_eq!(
+            client.connected_nodes(),
+            vec!["peer@localhost".to_string()],
+            "a hidden node still connects: visibility changes who lists us, not whether \
+             the link works"
+        );
+    }
     /// A `DOP_REG_SEND` written through the client's public send API is decoded by the
     /// peer's driver as the same `{DOP_REG_SEND, From, Cookie, ToName} -- Msg` tuple —
     /// the outbound message path, with no `erl`.
@@ -1273,5 +1580,93 @@ mod tests {
             ),
             "an id past the bound is a typed refusal"
         );
+    }
+
+    /// The outbound `epmd` lookup speaks to the **configured** `epmd`, not the
+    /// well-known one: a fake `epmd` on an ephemeral loopback port answers the
+    /// `PORT2_REQ` (`'z'` + the peer name, 2-byte framed) with a hand-encoded
+    /// `PORT2_RESP` (`'w'`, result 0, port(2) node_type(1) protocol(1)
+    /// high_vsn(2) low_vsn(2) namelen(2) name extralen(2) extra — unframed, per
+    /// `epmd_srv.c:904-936`), and the lookup resolves exactly the port it advertised.
+    ///
+    /// The address is the parameter of [`lookup_dist_port_at`] (what
+    /// [`lookup_dist_port`] supplies [`crate::dist::epmd_addr`] for) because the
+    /// process environment is global: this test never mutates `$ERL_EPMD_PORT`.
+    #[test]
+    fn the_dist_port_lookup_asks_the_configured_epmd_address() {
+        /// The port the fake `epmd` claims the peer listens on — deliberately not
+        /// the well-known `4369`, nor a port the fake itself is bound to.
+        const ADVERTISED: u16 = 45_678;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake epmd");
+        let addr = listener.local_addr().expect("read the fake epmd's port");
+        let fake = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the lookup connected");
+            let mut header = [0u8; 2];
+            stream
+                .read_exact(&mut header)
+                .expect("the 2-byte frame length");
+            let len = usize::from(u16::from_be_bytes(header));
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).expect("the framed request");
+            assert_eq!(
+                body.first().copied(),
+                Some(b'z'),
+                "the request must be a PORT2_REQ ('z')"
+            );
+            assert_eq!(&body[1..], b"peer", "the request names the peer");
+            let mut reply = vec![b'w', 0];
+            reply.extend_from_slice(&ADVERTISED.to_be_bytes());
+            reply.push(77); // node_type: normal (`EPMD_NODE_NORMAL`)
+            reply.push(0); // protocol: tcp/ip (`EPMD_PROTO_TCP`)
+            reply.extend_from_slice(&7u16.to_be_bytes()); // high_vsn
+            reply.extend_from_slice(&6u16.to_be_bytes()); // low_vsn
+            reply.extend_from_slice(&4u16.to_be_bytes()); // namelen
+            reply.extend_from_slice(b"peer");
+            reply.extend_from_slice(&0u16.to_be_bytes()); // extralen
+            stream.write_all(&reply).expect("answer the PORT2_REQ");
+            stream.flush().expect("flush the PORT2_RESP");
+        });
+        let resolved = lookup_dist_port_at(&addr.to_string(), b"peer")
+            .expect("the configured epmd answers the lookup");
+        assert_eq!(
+            resolved, ADVERTISED,
+            "the lookup resolves the port the configured epmd advertised"
+        );
+        fake.join().expect("the fake epmd finished");
+    }
+
+    /// [`lookup_dist_port`] — the function [`DistClient::connect`] calls — resolves
+    /// against [`crate::dist::epmd_addr`] and keeps `connect`'s error contract: a name
+    /// nobody registers is a typed [`BeamError::Io`] (the `NotFound` of an answering
+    /// `epmd`, or a connection error when none is listening), never a fabricated port
+    /// and never a panic.
+    #[test]
+    fn an_unregistered_peer_is_a_typed_error_not_a_fabricated_port() {
+        // Two honest outcomes, both typed: an answering `epmd` that does not know the
+        // name (`Io(NotFound)`, what `connect`'s contract promises), or no `epmd`
+        // listening on the configured address (a connection error).
+        match lookup_dist_port(b"beam_rt_no_such_node_for_the_lookup") {
+            Ok(port) => panic!("a fabricated distribution port {port}"),
+            Err(BeamError::Io(err)) => match err.kind() {
+                // An `epmd` answered the `PORT2_REQ` and does not know the name.
+                ErrorKind::NotFound => assert!(
+                    err.to_string().contains("beam_rt_no_such_node_for_the_lookup"),
+                    "a not-registered answer names the node: {err}"
+                ),
+                // No `epmd` is listening on the configured address.
+                kind => assert!(
+                    matches!(
+                        kind,
+                        ErrorKind::ConnectionRefused
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::TimedOut
+                            | ErrorKind::AddrNotAvailable
+                    ),
+                    "unexpected lookup failure: {kind} ({err})"
+                ),
+            },
+            Err(other) => panic!("expected a typed Io error, got {other:?}"),
+        }
     }
 }

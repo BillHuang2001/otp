@@ -81,10 +81,12 @@
 //! `Info` is a **flat** map holding `connection_id` (only when that option is `true`) then
 //! `node_type` (only when that option is `true`), in that key order. `node_type`'s value is
 //! the entry's own type atom -- `this` for the local node, `visible` for a peer.
-//! `connection_id`'s value is the connection's integer id, or the atom `undefined` when the
-//! C's `dep->connection_id == ~0` -- which is the case for a `this` entry. An **empty**
-//! selected set answers `[]` (the C returns `NIL`), but the options are validated **first**,
-//! so an invalid `Options` is still `badarg`.
+//! `connection_id`'s value is the link's **local identity**
+//! ([`Runtime::dist_connection_id`]) -- stable for that link's lifetime, a different integer
+//! for a different peer -- or the atom `undefined` when the C's `dep->connection_id == ~0`,
+//! which is the case for a `this` entry and for a peer whose link retired between the node
+//! set and the lookup. An **empty** selected set answers `[]` (the C returns `NIL`), but the
+//! options are validated **first**, so an invalid `Options` is still `badarg`.
 //!
 //! Measured on the oracle (OTP 29.1.1 / erts-17.1), all on a dormant node:
 //! `nodes(this, #{})` is `[{nonode@nohost,#{}}]`, `nodes(this, #{connection_id => true})` is
@@ -121,25 +123,16 @@
 //!   `function_clause` (the `net_adm.erl`/`net_kernel.erl` clause guard). This runtime has
 //!   no way to raise `function_clause` from a native BIF, so the honest typed rejection
 //!   stands in for it.
-//! * **A peer's `connection_id` is not modelled.** The C answers `nodes/2`'s
-//!   `connection_id` with the peer's link identifier (`dep->connection_id`), a value that
-//!   only exists once the distribution connection machinery it numbers does. This runtime
-//!   has an established link but no such per-link identity, and fabricating an integer
-//!   would be a wrong result, so exactly that sub-case -- a **peer** entry with
-//!   `connection_id => true` -- is the typed
-//!   [`unsupported`](crate::error::unsupported) capability gap. A `this` entry answers the
-//!   atom `undefined`, which **is** the oracle's value.
 //! * `nodes(known)` reports this runtime's own `this`; the oracle's connected peers and its
 //!   extra `not_connected` entries (nodes another node knows) are not modelled.
 //! * `hidden` links are not modelled, so `nodes(hidden)` is always `[]`.
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_term::{is_atom, is_list, Eterm, NIL};
+use beam_term::{is_atom, is_list, make_small, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::dist::NONODE_NAME;
-use crate::error;
 
 impl RuntimeContext<'_> {
     // -- erlang:nodes/0,1,2 ---------------------------------------------------
@@ -193,9 +186,10 @@ impl RuntimeContext<'_> {
     /// the C takes (`dist.c:6323-6377`), so `nodes(visible, #{bogus => 1})` is `badarg`
     /// even for a runtime with no peers.
     ///
-    /// A **peer** entry whose `connection_id` is requested is the typed
-    /// [`unsupported`](crate::error::unsupported) capability gap (the module docs'
-    /// gaps section): this runtime has no faithful integer for a link identity.
+    /// A **peer** entry's `connection_id` is the link's local identity
+    /// ([`Runtime::dist_connection_id`]); a peer whose link retired between the node set and
+    /// the lookup answers the atom `undefined` (the C's `~0`), never an error and never a
+    /// fabricated integer.
     pub(super) fn nodes_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let types_arg = *args.first().ok_or(BeamError::BadArg)?;
         let options = *args.get(1).ok_or(BeamError::BadArg)?;
@@ -209,19 +203,26 @@ impl RuntimeContext<'_> {
         let connection_id_key = self.atom("connection_id")?;
         let node_type_key = self.atom("node_type")?;
         let mut entries = self.selected_node_entries(&types)?;
-        if info.connection_id && entries.iter().any(|(_, kind)| *kind != NodeEntryType::This) {
-            return Err(error::unsupported(
-                "erlang:nodes/2: a peer's connection id is not modelled",
-            ));
-        }
         let atoms = self.runtime.code_server.atoms_handle();
         let mut tuples: Vec<Eterm> = Vec::with_capacity(entries.len());
         for (node, kind) in entries.drain(..) {
             let mut pairs: Vec<(Eterm, Eterm)> = Vec::with_capacity(2);
             if info.connection_id {
                 // `this` carries the C's `dep->connection_id == ~0`, which it renders as
-                // the atom `undefined`; a peer never reaches here (the gap above).
-                pairs.push((connection_id_key, self.atom("undefined")?));
+                // the atom `undefined`; a peer carries its link's own local identity, and
+                // a link that retired out from under the node set falls back to the same
+                // `undefined` (never a raise, never a fabricated integer).
+                let value = match kind {
+                    NodeEntryType::This => None,
+                    NodeEntryType::Visible => self
+                        .atom_name(node)
+                        .and_then(|peer| self.runtime.dist_connection_id(&peer)),
+                };
+                let value = match value {
+                    Some(id) => make_small(id as i64),
+                    None => self.atom("undefined")?,
+                };
+                pairs.push((connection_id_key, value));
             }
             if info.node_type {
                 pairs.push((node_type_key, self.atom(kind.atom_name())?));
@@ -409,8 +410,57 @@ impl RuntimeContext<'_> {
         self.atom("ignore")
     }
 
-    // -- helpers --------------------------------------------------------------
+    // -- erlang:monitor_node/2 ------------------------------------------------
 
+    /// `erlang:monitor_node(Node, Bool)`: subscribe (`true`) or unsubscribe (`false`) the calling
+    /// process to `Node`'s **connection** state, answering the atom `true`.
+    ///
+    /// Oracle facts (measured on OTP 29.1.1 / erts-17.1, and the reason this is not the surface it
+    /// looks like):
+    ///
+    /// * The answer is the atom `true` for **every atom** `Node` — `node()` itself and
+    ///   `nonode@nohost` included, and a node this runtime has never connected to. There is no
+    ///   `badarg` for "your own node" (a claim sometimes made about this BIF; it is measurably
+    ///   false) and none for a node with no link.
+    /// * `badarg` only for a **non-atom** `Node`, or a `Bool` that is not the atom `true`/`false`.
+    /// * No replay: subscribing to a node that is **already** connected yields no immediate
+    ///   `nodeup`; one arrives only for a connection established **after** the subscription, and
+    ///   a `nodedown` when the node's last link retires.
+    ///
+    /// The store is the runtime's ([`Runtime::monitor_node_add`] /
+    /// [`Runtime::monitor_node_remove`] over [`Runtime::node_monitors`]) and the notifications are
+    /// emitted by the scheduler pass's [`Runtime::service_node_monitors`]; this body only decides
+    /// the argument shapes and seeds the latch with the node's state **now** — which is exactly
+    /// what implements the no-replay rule. `erlang:monitor_node/3` (the `Info`-carrying form) is
+    /// deliberately not served: it stays `beam_bifs`'s typed capability gap.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a non-atom `Node` (or an atom this runtime's namespace cannot
+    /// name) and for a `Bool` other than `true`/`false`.
+    pub(super) fn monitor_node_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let node = *args.first().ok_or(BeamError::BadArg)?;
+        let flag = *args.get(1).ok_or(BeamError::BadArg)?;
+        // A non-atom `Node` is the C's `badarg`; an atom always names something here, because a
+        // loaded module's atom table is a snapshot of this runtime's shared namespace (interning
+        // only appends), so the name lookup only fails for a non-atom.
+        let name = self.atom_name(node).ok_or(BeamError::BadArg)?;
+        let on = match self.atom_name(flag).as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(BeamError::BadArg),
+        };
+        let pid = self.pid();
+        if on {
+            let saw_connected = self.runtime.dist_is_connected(&name);
+            self.runtime.monitor_node_add(pid, node, saw_connected);
+        } else {
+            self.runtime.monitor_node_remove(pid, node);
+        }
+        self.atom("true")
+    }
+
+    // -- helpers --------------------------------------------------------------
     /// The node atoms of every peer this runtime has an **established** outbound link to,
     /// in connection order.
     ///
@@ -918,8 +968,109 @@ mod tests {
         }
     }
 
-    // -- the name helpers -----------------------------------------------------
+    // -- erlang:monitor_node/2 ------------------------------------------------
 
+    /// The oracle's answer is the atom `true` for **every atom** node — this runtime's own node,
+    /// `nonode@nohost`, and a node it has never connected to — with the subscription recorded as
+    /// one latch per distinct node. (Measured on OTP 29.1.1 / erts-17.1; there is no `badarg` for
+    /// `Node == node()`, and none for a node with no link.)
+    #[test]
+    fn monitor_node_answers_true_for_every_atom_node() {
+        for extra in [None, Some("peer@elsewhere")] {
+            let mut rt = runtime();
+            let own = rt.local_node_term();
+            let on = rt.intern("true");
+            let mut nodes = vec![own, rt.intern(NONODE_NAME)];
+            if let Some(name) = extra {
+                nodes.push(rt.intern(name));
+            }
+            for node in nodes {
+                let term = call(&mut rt, "erlang", "monitor_node", &[node, on])
+                    .unwrap_or_else(|error| panic!("monitor_node({node:?}, true): {error}"));
+                assert_eq!(rendered(&mut rt, term), "true", "every atom node answers `true`");
+            }
+            // `own` and `nonode@nohost` are the same atom on a `-noshell` runtime, so those two
+            // subscriptions collapse to the same idempotent-set entry.
+            let latches = rt
+                .node_monitors
+                .get(&rt.self_pid())
+                .expect("the subscriptions are recorded");
+            assert_eq!(
+                latches.len(),
+                if extra.is_some() { 2 } else { 1 },
+                "one latch per distinct node atom"
+            );
+        }
+    }
+
+    /// A **repeated** `monitor_node(Node, true)` neither duplicates nor refcounts its entry, and
+    /// `monitor_node(Node, false)` removes it — the C's idempotent set. `false` for a node the
+    /// process never subscribed to is the same no-op, and still answers `true`.
+    #[test]
+    fn monitor_node_is_an_idempotent_set_and_false_removes() {
+        let mut rt = runtime();
+        let on = rt.intern("true");
+        let off = rt.intern("false");
+        let peer = rt.intern("peer@host");
+        for _ in 0..3 {
+            let term = call(&mut rt, "erlang", "monitor_node", &[peer, on]).expect("monitor_node");
+            assert_eq!(rendered(&mut rt, term), "true");
+        }
+        assert_eq!(
+            rt.node_monitors
+                .get(&rt.self_pid())
+                .expect("the subscription")
+                .len(),
+            1,
+            "a repeat neither duplicates nor refcounts"
+        );
+        let term = call(&mut rt, "erlang", "monitor_node", &[peer, off]).expect("unsubscribe");
+        assert_eq!(rendered(&mut rt, term), "true");
+        assert!(
+            !rt.node_monitors.contains_key(&rt.self_pid()),
+            "the last latch's removal drops the process's entry"
+        );
+
+        let unknown = rt.intern("other@host");
+        let term = call(&mut rt, "erlang", "monitor_node", &[unknown, off]).expect("no-op false");
+        assert_eq!(rendered(&mut rt, term), "true", "`false` is `true` for any atom node");
+        assert!(rt.node_monitors.is_empty());
+    }
+
+    /// `badarg` — and only `badarg` — for a **non-atom** node or a flag that is not the atom
+    /// `true`/`false`. Nothing is recorded by a rejected call.
+    #[test]
+    fn monitor_node_rejects_a_non_atom_node_or_a_non_boolean_flag() {
+        let mut rt = runtime();
+        let on = rt.intern("true");
+        let off = rt.intern("false");
+        let peer = rt.intern("peer@host");
+
+        let int = make_small(42);
+        let list = rt.eval("[1, 2]").expect("a list");
+        let pid = rt.eval("self()").expect("a pid");
+        for (what, node) in [("an integer", int), ("a list", list), ("a pid", pid)] {
+            for flag in [on, off] {
+                assert!(
+                    call(&mut rt, "erlang", "monitor_node", &[node, flag]).is_err(),
+                    "{what} as the node must be badarg"
+                );
+            }
+        }
+        for name in ["maybe", "1", "True"] {
+            let flag = rt.intern(name);
+            assert!(
+                call(&mut rt, "erlang", "monitor_node", &[peer, flag]).is_err(),
+                "the flag `{name}` must be badarg"
+            );
+        }
+        assert!(
+            rt.node_monitors.is_empty(),
+            "a rejected call records no subscription"
+        );
+    }
+
+    // -- the name helpers -----------------------------------------------------
     #[test]
     fn same_node_accepts_the_short_and_the_full_name() {
         assert!(same_node("foo@host", "foo@host"));
@@ -934,5 +1085,169 @@ mod tests {
         // `epmd` registers a node under its short name, so that is what is dialled.
         assert_eq!(connect_name("foo@host"), "foo");
         assert_eq!(connect_name("foo"), "foo");
+    }
+
+    // -- nodes/2's `connection_id` with a live peer ---------------------------
+
+    /// The peer a [`node_runtime_with_a_peer`] admits over its own listener.
+    const LIVE_PEER: &str = "peer@localhost";
+
+    /// A `-sname`-configured runtime with **one established accepted link**: a real loopback
+    /// peer (`ConnectionDriver::client`) dials the runtime's own listener and the handshake
+    /// is driven through the runtime's scheduler pass — no `erl` and no `epmd`
+    /// (the `tests/dist_delivery.rs` fixture shape, whose helpers are private to that
+    /// integration suite).
+    fn node_runtime_with_a_peer() -> Runtime {
+        use std::net::TcpStream;
+        use std::time::{Duration, Instant};
+
+        use beam_dist::driver::{ConnectionDriver, DriverState};
+
+        // A node name unique per test *process*, so parallel test binaries cannot collide.
+        let name = format!("beamrtnodes{}{}", "unit", std::process::id());
+        let args: Vec<String> = ["-noshell", "-sname", &name, "-setcookie", "cook", "-eval", "ok."]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let config = crate::parse(&args).expect("the node switches parse");
+        let mut rt = Runtime::new(config).expect("the runtime starts (the listener binds)");
+
+        // One pass publishes the node and opens the listener for accepting.
+        rt.run_one_slice().expect("a scheduler pass");
+        let port = rt.dist_node().expect("a configured node").port();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the listener");
+        stream
+            .set_nonblocking(true)
+            .expect("a non-blocking loopback socket");
+        let mut peer = ConnectionDriver::client(LIVE_PEER.as_bytes(), b"cook", 7);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            peer_round(&mut stream, &mut peer);
+            rt.run_one_slice().expect("a scheduler pass");
+            if peer.state() == DriverState::Established && rt.dist_is_connected(LIVE_PEER) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the loopback link never reached Established within 15 s"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        rt
+    }
+
+    /// One round of a hand-driven non-blocking link: step the driver to quiescence, write
+    /// what it queued, then read whatever arrived.
+    fn peer_round(stream: &mut std::net::TcpStream, driver: &mut beam_dist::driver::ConnectionDriver) {
+        use std::io::{ErrorKind, Read, Write};
+        use std::time::{Duration, Instant};
+
+        loop {
+            match driver.step() {
+                Ok(beam_dist::StepOutcome::WouldBlock)
+                | Ok(beam_dist::StepOutcome::Closed)
+                | Ok(beam_dist::StepOutcome::Failed) => break,
+                Ok(_) => {}
+                Err(err) => panic!("the peer's driver reported a protocol error: {err:?}"),
+            }
+        }
+        let pending = driver.take_output();
+        let mut written = 0;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while written < pending.len() {
+            match stream.write(&pending[written..]) {
+                Ok(0) => panic!("the peer's socket closed while writing"),
+                Ok(n) => written += n,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "the peer's write never drained");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                Err(err) => panic!("the peer's write: {err}"),
+            }
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        match stream.read(&mut buf) {
+            Ok(0) => driver.feed_eof(),
+            Ok(n) => driver.feed(&buf[..n]),
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+            Err(err) => panic!("the peer's read: {err}"),
+        }
+    }
+
+    /// The `connection_id` integer a rendered entry carries — a decode of the printer's own
+    /// output, so an answer of `undefined` (the C's `~0`) fails here rather than passing as a
+    /// "value".
+    fn peer_connection_id(rendered: &str) -> i64 {
+        let (_, rest) = rendered
+            .split_once("#{connection_id => ")
+            .unwrap_or_else(|| panic!("no `connection_id` in {rendered}"));
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().unwrap_or_else(|_| {
+            panic!("`connection_id` is `undefined`, not an integer: {rendered}")
+        })
+    }
+
+    /// **The `-sname` blocker**: with a live peer established,
+    /// `nodes(visible, #{connection_id => true})` — the exact call `global:init/1` makes
+    /// through `net_kernel:monitor_nodes/2` (`lib/kernel/src/global.erl:806-810`) — answers
+    /// the peer with a **real** link identity instead of raising the capability gap that
+    /// killed `kernel_sup`.
+    #[test]
+    fn nodes_2_answers_a_real_connection_id_for_a_live_peer() {
+        let mut rt = node_runtime_with_a_peer();
+        let visible = rt.intern("visible");
+        let yes = rt.intern("true");
+        let options = make_map(&mut rt, &[("connection_id", yes)]);
+        let term = call(&mut rt, "erlang", "nodes", &[visible, options])
+            .expect("nodes/2 must not raise for a live peer (this is the global:init/1 call)");
+        let first = rendered(&mut rt, term);
+        assert!(
+            first.starts_with(&format!("[{{{LIVE_PEER},#{{connection_id => ")),
+            "the established peer heads the node set: {first}"
+        );
+        let id = peer_connection_id(&first);
+        assert!(
+            id >= 1,
+            "a link's identity is a positive integer, not `undefined`: {first}"
+        );
+
+        // Stability: the identity belongs to the link, so a second call answers the same.
+        let again = call(&mut rt, "erlang", "nodes", &[visible, options]).expect("nodes/2 again");
+        assert_eq!(
+            rendered(&mut rt, again),
+            first,
+            "the peer's `connection_id` is stable across calls"
+        );
+
+        // The `global`-shaped call with both keys: it must succeed, keep the C's key order,
+        // and leave the `this` entry's id as the atom `undefined`.
+        let options = make_map(&mut rt, &[("connection_id", yes), ("node_type", yes)]);
+        let this = rt.intern("this");
+        let list = build(&mut rt, |ctx| {
+            terms::make_list(ctx, &[visible, this]).expect("a selector list")
+        });
+        let term = call(&mut rt, "erlang", "nodes", &[list, options])
+            .expect("nodes([visible,this], #{connection_id => true, node_type => true})");
+        let both = rendered(&mut rt, term);
+        assert_eq!(
+            peer_connection_id(&both),
+            id,
+            "the peer keeps its identity with `node_type` requested too: {both}"
+        );
+        assert!(
+            both.contains("node_type => visible"),
+            "the peer's type atom is `visible`: {both}"
+        );
+        assert_eq!(
+            both.matches("undefined").count(),
+            1,
+            "only the `this` entry answers `undefined` (the C's `~0`): {both}"
+        );
+        assert!(
+            both.find("connection_id").unwrap_or(usize::MAX)
+                < both.find("node_type").unwrap_or(usize::MAX),
+            "the info map keeps the C's key order (connection_id then node_type): {both}"
+        );
     }
 }

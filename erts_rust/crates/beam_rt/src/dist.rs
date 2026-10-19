@@ -29,7 +29,8 @@
 //! 2. **Register** the node with `epmd` ([`beam_dist::epmd`]) over an `ALIVE2_REQ`
 //!    carrying the *short* node name and the bound port. The `ALIVE2` socket is
 //!    kept open for the node's whole life — closing it is what de-registers the
-//!    node (`epmd_srv.c` `node_unreg_sock`).
+//!    node (`epmd_srv.c` `node_unreg_sock`). The `epmd` address is [`epmd_addr`], so
+//!    `$ERL_EPMD_PORT` selects a private `epmd`.
 //! 3. **Accept** inbound connections and drive each through
 //!    [`beam_dist::ConnectionDriver`] as the **server** (`'N'` → `'s'`/`'S'` →
 //!    `'r'` → `'a'`), so a remote node completes the handshake with this runtime.
@@ -101,8 +102,10 @@
 //!   failure or a failed per-link inbound validation retires that one link and is
 //!   recorded in [`DistNode::last_link_error`]; it never aborts the runtime.
 
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::rc::Rc;
 use std::time::Duration;
 
 use beam_alloc::Heap;
@@ -110,13 +113,23 @@ use beam_common::{BeamError, Result};
 use beam_dist::connection::TcpTransport;
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::epmd::{Alive2Req, Alive2Resp, EpmdClient, EPMD_DEFAULT_ADDR};
-use beam_dist::{DeliveryOutcome, Dispatched, InboundSink};
+use beam_dist::{
+    preferred_flags, publish_flag, DeliveryOutcome, Dispatched, DistFlags, Dop, InboundSink,
+    PeerVisibility,
+};
 use beam_dist::TcpListener;
+use beam_term::prelude::{make_atom, Eterm};
 use beam_term::AtomTable;
 
+use crate::error;
+
+pub(crate) mod externalize;
 mod inbound;
 pub use inbound::LocalDeliverySink;
 
+pub(crate) mod links;
+pub(crate) use links::DistLinks;
+pub use links::DistConnectionSnapshot;
 /// The address the distribution listener binds: the wildcard on an OS-chosen
 /// port, exactly the oracle's default (`inet_dist_use_interface` unset).
 pub const DIST_LISTEN_ADDR: &str = "0.0.0.0:0";
@@ -240,6 +253,12 @@ pub struct DistConnection {
     stream: TcpStream,
     /// The peer's socket address (a diagnostic; the dist wire carries no address).
     peer_addr: SocketAddr,
+    /// The peer's **node atom term** — the key a routed [`crate::dist::DistSignal`] addresses.
+    ///
+    /// `None` until [`DistNode::bind_peer_nodes`] interns [`DistConnection::peer_name`] into
+    /// the runtime's live atom table; a link that never binds is simply not matched by the
+    /// accepted half's lookup (see [`crate::dist::links`]).
+    node: Option<Eterm>,
     /// Bytes read from the peer so far.
     bytes_in: u64,
     /// Bytes written to the peer so far.
@@ -248,21 +267,47 @@ pub struct DistConnection {
 
 impl DistConnection {
     /// Wraps an accepted socket in a **server-side** driver advertising
-    /// `advertised` as this node's name.
-    fn new(stream: TcpStream, peer_addr: SocketAddr, advertised: &[u8], cookie: &[u8], creation: u32) -> Result<DistConnection> {
+    /// `advertised` as this node's name and `flags` as this node's capability set —
+    /// [`advertised_flags`], so a normal node publishes itself (`DFLAG_PUBLISHED`) and a
+    /// `-hidden` one does not.
+    fn new(stream: TcpStream, peer_addr: SocketAddr, advertised: &[u8], cookie: &[u8], creation: u32, flags: DistFlags) -> Result<DistConnection> {
         stream.set_nodelay(true).map_err(BeamError::Io)?;
         stream
             .set_read_timeout(Some(DIST_READ_SLICE))
             .map_err(BeamError::Io)?;
         Ok(DistConnection {
-            driver: ConnectionDriver::server(advertised, cookie, creation),
+            driver: ConnectionDriver::server_with_flags(advertised, cookie, creation, flags),
             stream,
             peer_addr,
+            node: None,
             bytes_in: 0,
             bytes_out: 0,
         })
     }
 
+    /// A connection around an **explicit** driver, on a socket that must already be
+    /// configured (`TCP_NODELAY`, the [`DIST_READ_SLICE`] read timeout).
+    ///
+    /// The test-only seam that lets a suite install a driver the accepting path never
+    /// builds — e.g. one with an accept policy
+    /// ([`ConnectionDriver::server_with_decision`]) or one whose peer flags fail the
+    /// mandatory check, so a **refusal** (which `beam_dist` buffers into the driver's
+    /// output *before* returning `Err`) can be driven over a real loopback socket.
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        driver: ConnectionDriver,
+        stream: TcpStream,
+        peer_addr: SocketAddr,
+    ) -> DistConnection {
+        DistConnection {
+            driver,
+            stream,
+            peer_addr,
+            node: None,
+            bytes_in: 0,
+            bytes_out: 0,
+        }
+    }
     /// The link's protocol state ([`DriverState::Established`] once the `'N'`
     /// handshake has completed and been acknowledged).
     pub fn state(&self) -> DriverState {
@@ -289,9 +334,55 @@ impl DistConnection {
             .map(|name| String::from_utf8_lossy(name).into_owned())
     }
 
+    /// The peer's **node atom term**, once [`DistNode::bind_peer_nodes`] has interned
+    /// [`DistConnection::peer_name`] into the runtime's live atom table.
+    ///
+    /// This is what makes the accepted half of the routing table an **exact** node match:
+    /// a routed control addresses its peer by atom term, and an accepted link that has
+    /// bound its own answers with the very term the caller holds. A retired link is gone
+    /// from the table, so its binding is irrelevant — nothing outside the link holds it.
+    pub(crate) fn node_term(&self) -> Option<Eterm> {
+        self.node
+    }
+
+    /// Binds this link's peer node atom term (see [`DistConnection::node_term`]).
+    ///
+    /// The caller interns the peer's `node@host` name in the runtime's one live atom table
+    /// and hands the resulting term in; binding never re-interns and never looks a name up.
+    pub(crate) fn bind_node(&mut self, atom: Eterm) {
+        self.node = Some(atom);
+    }
     /// The peer's node creation, once the handshake advertised it.
     pub fn peer_creation(&self) -> u32 {
         self.driver.peer_creation()
+    }
+
+    /// The **peer's** validated capability flags, once the handshake completed
+    /// (`beam_dist::Handshake::negotiated`; [`DistFlags::EMPTY`] before then).
+    ///
+    /// This is what governs outbound opcode choice on the link — e.g. whether
+    /// `DFLAG_ALIAS` allows a `DOP_ALIAS_SEND` (see
+    /// [`DistLinks::route_alias`](crate::dist::links::DistLinks::route_alias)) or
+    /// `DFLAG_SEND_SENDER` a `DOP_SEND_SENDER` (`dist.c:1686`).
+    pub(crate) fn negotiated(&self) -> DistFlags {
+        self.driver.negotiated()
+    }
+
+    /// How the peer's own advertised flags classify it — [`PeerVisibility::Normal`]
+    /// or [`PeerVisibility::Hidden`] (`dist_util.erl:publish_type/1`) — or `None`
+    /// before the handshake completes.
+    ///
+    /// **Recorded, never refused.** Visibility is a *classification* of a peer's
+    /// flags, not a permission this runtime could check: both ends of a real OTP
+    /// connection may advertise themselves hidden (`dist_util.erl:publish_type/1`
+    /// answers `hidden` for any peer that did not set `DFLAG_PUBLISHED`, and
+    /// `-hidden` is a per-node choice), and this runtime's own choice is
+    /// [`DistNode::set_hidden`] ([`advertised_flags`] — published unless `-hidden`). A
+    /// hidden peer is therefore the *expected* case for a hidden node and is accepted
+    /// exactly like a normal one; the classification is only made observable here, per
+    /// link.
+    pub fn peer_visibility(&self) -> Option<PeerVisibility> {
+        self.driver.peer_visibility()
     }
 
     /// The peer's socket address.
@@ -310,11 +401,85 @@ impl DistConnection {
         self.driver.has_output()
     }
 
+    /// Writes whatever the driver has queued to the socket (the link's one output path).
+    ///
+    /// # Errors
+    ///
+    /// The socket's own write failure, which the caller turns into a retired link.
+    pub(crate) fn flush_output(&mut self) -> Result<()> {
+        if self.driver.has_output() {
+            let bytes = self.driver.take_output();
+            self.stream.write_all(&bytes).map_err(BeamError::Io)?;
+            self.stream.flush().map_err(BeamError::Io)?;
+            self.bytes_out += bytes.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Encodes one `DOP_*` control on this link's driver and writes it — the accepting
+    /// half's outbound path, reached through [`DistLinks::route_control`] so a peer that
+    /// dialled *this* runtime is served exactly like one it dialled.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] before the handshake completed (the driver's own contract),
+    /// the encoder's failures and the socket's write failure.
+    pub(crate) fn send_control(&mut self, dop: Dop, args: &[Eterm], atoms: &AtomTable) -> Result<()> {
+        self.driver.send_control(dop, args, atoms)?;
+        self.flush_output()
+    }
+
+    /// Encodes one message on this link and writes it; the driver picks
+    /// `DOP_SEND_SENDER`/`DOP_SEND` from the negotiated flags.
+    ///
+    /// # Errors
+    ///
+    /// As [`DistConnection::send_control`].
+    pub(crate) fn send_message(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        msg: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.driver.send_message(from, to, msg, atoms)?;
+        self.flush_output()
+    }
+    /// Shuts the link's socket down in **both** directions.
+    ///
+    /// A link is never left half-open: [`DistNode::retire`] and
+    /// [`DistNode::pump`](DistNode::pump)'s dead-link branch shut the socket down
+    /// before the connection drops, so the peer observes the closure immediately
+    /// instead of holding a socket whose other end is merely unreferenced.
+    ///
+    /// # Errors
+    ///
+    /// A genuine `shutdown(2)` failure. The *already-closed* answers — `ENOTCONN`
+    /// ([`ErrorKind::NotConnected`], what Linux returns for a socket that is shut
+    /// down or was never connected) and the connection-lost family a peer's reset
+    /// produces — are **not** errors: the post-condition the caller asked for (the
+    /// socket is closed) already holds.
+    pub fn close(&mut self) -> Result<()> {
+        match self.stream.shutdown(std::net::Shutdown::Both) {
+            Ok(()) => Ok(()),
+            Err(err) if is_already_closed(&err) => Ok(()),
+            Err(err) => Err(BeamError::Io(err)),
+        }
+    }
+
     /// Reads whatever has arrived, advances the handshake and writes the
     /// driver's reply. Returns how many protocol events took effect.
     ///
     /// A read timeout ([`DIST_READ_SLICE`], or a clean `WouldBlock`) is not an
     /// event and not an error: the link simply had nothing to say.
+    ///
+    /// The driver's buffered output is flushed on **both** outcomes. `beam_dist`
+    /// frames a refusal status (`"not_allowed"` on a mandatory-flag failure, an
+    /// [`beam_dist::AcceptDecision::Refuse`] status) into the driver's output and
+    /// *then* returns `Err`, so the bytes a peer is waiting for must still reach its
+    /// socket: the step's error is therefore propagated only **after** the flush, and
+    /// only a genuine write failure (which the caller turns into a retired link) can
+    /// suppress it.
     fn pump(&mut self) -> Result<usize> {
         let mut events = 0;
         let mut buf = [0u8; 8192];
@@ -333,21 +498,23 @@ impl DistConnection {
             Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(err) => return Err(BeamError::Io(err)),
         }
-        let outcome = self.driver.step()?;
-        match &outcome {
-            beam_dist::StepOutcome::Progress
-            | beam_dist::StepOutcome::Handshaking
-            | beam_dist::StepOutcome::Established => events += 1,
-            beam_dist::StepOutcome::Failed | beam_dist::StepOutcome::Closed => events += 1,
-            beam_dist::StepOutcome::WouldBlock => {}
+        // A step that reports an error may still have framed a refusal into the
+        // output buffer, so the outcome is held rather than propagated with `?`.
+        let stepped = self.driver.step();
+        if let Ok(outcome) = &stepped {
+            match outcome {
+                beam_dist::StepOutcome::Progress
+                | beam_dist::StepOutcome::Handshaking
+                | beam_dist::StepOutcome::Established => events += 1,
+                beam_dist::StepOutcome::Failed | beam_dist::StepOutcome::Closed => events += 1,
+                beam_dist::StepOutcome::WouldBlock => {}
+            }
         }
         if self.driver.has_output() {
-            let bytes = self.driver.take_output();
-            self.stream.write_all(&bytes).map_err(BeamError::Io)?;
-            self.stream.flush().map_err(BeamError::Io)?;
-            self.bytes_out += bytes.len() as u64;
+            self.flush_output()?;
             events += 1;
         }
+        stepped?;
         Ok(events)
     }
 
@@ -387,6 +554,20 @@ fn is_would_block(err: &std::io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
+/// A `shutdown(2)` whose socket is **already** gone — the answer a shut-down,
+/// never-connected or peer-reset socket gives (`ENOTCONN` is
+/// [`ErrorKind::NotConnected`] on Linux) — is the post-condition
+/// [`DistConnection::close`] exists to establish, never a failure.
+fn is_already_closed(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::NotConnected
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::BrokenPipe
+    )
+}
+
 /// The runtime's distribution node: a bound listener, its `epmd` registration
 /// and every accepted link.
 ///
@@ -402,8 +583,10 @@ pub struct DistNode {
     listener: std::net::TcpListener,
     /// The shared cookie the handshake digests use.
     cookie: Vec<u8>,
-    /// The accepted links.
-    connections: Vec<DistConnection>,
+    /// The accepted links, **shared** with [`DistLinks`] — the one table both distribution
+    /// halves route through (see [`links`]). The node pumps and mutates it; the routing
+    /// entry only borrows it to write a frame.
+    connections: Rc<RefCell<Vec<DistConnection>>>,
     /// The live `ALIVE2` socket — dropping it de-registers the node.
     registration: Option<EpmdClient<TcpTransport>>,
     /// Whether `epmd` accepted the registration.
@@ -414,6 +597,12 @@ pub struct DistNode {
     registration_attempted: bool,
     /// Why the most recently retired link was dropped (recorded, never raised).
     last_link_error: Option<String>,
+    /// Whether this node is **hidden** (`-hidden`): its handshake then omits
+    /// `DFLAG_PUBLISHED`, so a peer lists it only in
+    /// `nodes(hidden)`/`nodes(connected)` (see [`advertised_flags`]). Set through
+    /// [`DistNode::set_hidden`] before the first pump; `false` — a **published** node —
+    /// by default.
+    hidden: bool,
     /// The scratch arena an inbound control message is decoded on by
     /// [`DistNode::dispatch_inbound`] (reset per drain — the delivery copies the
     /// term out immediately). See [`DIST_DISPATCH_HEAP_WORDS`].
@@ -444,16 +633,44 @@ impl DistNode {
             port,
             listener,
             cookie,
-            connections: Vec::new(),
+            connections: Rc::new(RefCell::new(Vec::new())),
             registration: None,
             registered: false,
             registration_error: None,
             registration_attempted: false,
             last_link_error: None,
+            hidden: false,
             dispatch_heap: Heap::new(DIST_DISPATCH_HEAP_WORDS)?,
         })
     }
 
+    /// Marks this node **hidden** (`-hidden`) — or, with `false`, published (the
+    /// default).
+    ///
+    /// A hidden node's `'N'` handshake omits `DFLAG_PUBLISHED`, exactly as
+    /// `dist_util.erl:152-160`'s `publish_flag/3` does for a `-hidden` node, so a real
+    /// peer records it as [`PeerVisibility::Hidden`] and leaves it out of `nodes()`.
+    /// Visibility is a property of the node, so the connecting half
+    /// ([`crate::dist_client::DistClient::set_hidden`]) must be told the same value.
+    ///
+    /// Additive: a node built by [`DistNode::start`] is published. It only affects links
+    /// **accepted afterwards** (the flags are baked into each link's driver at accept
+    /// time), which is why the runtime sets it before the first
+    /// [`pump`](Self::pump).
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
+    }
+
+    /// Whether this node advertises itself as **hidden** ([`DistNode::set_hidden`]).
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// The capability flags this node advertises in its handshake
+    /// ([`advertised_flags`] of [`DistNode::is_hidden`]).
+    pub fn advertised_flags(&self) -> DistFlags {
+        advertised_flags(self.hidden)
+    }
     /// The node's full `node@host` name.
     pub fn node_name(&self) -> &str {
         self.name.full()
@@ -502,14 +719,71 @@ impl DistNode {
         self.registration_error.as_deref()
     }
 
-    /// The accepted links, in accept order.
-    pub fn connections(&self) -> &[DistConnection] {
-        &self.connections
+    /// The accepted links' address handle — the very cell the routing table
+    /// ([`DistLinks`]) borrows, shared so an outbound `DOP_*` can reach a link this runtime
+    /// **accepted** (see [`links`]).
+    pub(crate) fn links(&self) -> Rc<RefCell<Vec<DistConnection>>> {
+        Rc::clone(&self.connections)
+    }
+
+    /// Gives every **established** accepted link its peer's **node atom term**, interned
+    /// into `atoms` — the binding that makes the accepted half of [`DistLinks`] an **exact**
+    /// node match.
+    ///
+    /// A [`DistConnection`] learns its peer only as the `node@host` bytes its `'N'`
+    /// handshake carried ([`DistConnection::peer_name`]), while a routed control addresses
+    /// its peer by an **atom term**. Interned here, in the runtime's one live table, the
+    /// link can then answer [`DistConnection::node_term`] with the very term the caller
+    /// holds — so a control for a node with **no** link on either half is the typed
+    /// refusal from the routing entry itself, instead of a queued control that a later
+    /// flush silently drops.
+    ///
+    /// Called from the scheduler pass once the atom table is live
+    /// ([`crate::runtime::Runtime::bind_dist_peers`]); it is idempotent — a link already
+    /// bound is skipped, so a steady-state pass pays one borrow and one `is_some` per link.
+    /// Returns how many links were bound by **this** call.
+    ///
+    /// # Errors
+    ///
+    /// The shared link table's re-entrant borrow (never in practice: the pass binds between
+    /// the node's pump and the client's flush, holding neither).
+    pub(crate) fn bind_peer_nodes(&mut self, atoms: &mut AtomTable) -> Result<usize> {
+        let cell = self.links();
+        let mut connections = cell
+            .try_borrow_mut()
+            .map_err(|_| error::message("distribution: the accepted link table is already in use"))?;
+        let mut bound = 0;
+        for connection in connections.iter_mut() {
+            if connection.node_term().is_some() || !connection.is_established() {
+                continue;
+            }
+            let Some(name) = connection.peer_name() else {
+                // An established link whose handshake carried no readable peer name has
+                // nothing to intern; it stays unbound (and therefore unmatched) rather
+                // than being bound to a fabricated node.
+                continue;
+            };
+            let atom = make_atom(atoms.intern(&name));
+            connection.bind_node(atom);
+            bound += 1;
+        }
+        Ok(bound)
+    }
+    /// A **diagnostic snapshot** of the accepted links, in accept order.
+    ///
+    /// The table is shared with the routing entry, so it cannot be lent out by reference;
+    /// each entry is the link's observable state at the moment it was read. The snapshot is
+    /// empty while the table is being mutated (a pump in flight) — it never affects routing.
+    pub fn connections(&self) -> Vec<DistConnectionSnapshot> {
+        DistConnectionSnapshot::of_table(&self.connections)
     }
 
     /// Whether the node has no live link.
+    ///
+    /// A cell that cannot be borrowed counts as holding a link (work in flight), so a
+    /// scheduler pass never declares a stall it cannot justify.
     pub fn is_idle(&self) -> bool {
-        self.connections.is_empty()
+        DistLinks::new(self.links()).is_idle()
     }
 
     /// Accepts whatever connections are pending, advances every live link and
@@ -518,62 +792,60 @@ impl DistNode {
     ///
     /// # Errors
     ///
-    /// Only the accept path's own failures. A *link*'s failure never propagates:
-    /// the link is retired and the reason recorded in
-    /// [`last_link_error`](Self::last_link_error), so a hostile or broken peer
-    /// can neither fail nor stall the scheduler.
+    /// The accept path's own failures, and the shared link table's re-entrant borrow (see
+    /// [`DistNode::links`]). A *link*'s failure never propagates: the link is retired and
+    /// the reason recorded in [`last_link_error`](Self::last_link_error), so a hostile or
+    /// broken peer can neither fail nor stall the scheduler.
     pub fn pump(&mut self) -> Result<usize> {
         self.register_once();
         let mut events = 0;
+        // The cell is cloned out of `self` first, so the borrow of the table does not tie
+        // `self` (which `accept_one`/`register_once` still need mutably).
+        let cell = self.links();
+        let mut connections = cell
+            .try_borrow_mut()
+            .map_err(|_| error::message("distribution: the accepted link table is already in use"))?;
         for _ in 0..MAX_ACCEPTS_PER_PUMP {
             match self.accept_one()? {
                 Some(connection) => {
-                    self.connections.push(connection);
+                    connections.push(connection);
                     events += 1;
                 }
                 None => break,
             }
         }
         let mut index = 0;
-        while index < self.connections.len() {
-            let outcome = self.connections[index].pump();
+        while index < connections.len() {
+            let outcome = connections[index].pump();
             match outcome {
                 Ok(progress) => events += progress,
                 Err(err) => {
                     // The link is broken (a protocol error, a dead socket). Retire
                     // it and keep the reason observable — the runtime carries on.
-                    self.retire(index, err);
+                    retire_at(&mut connections, &mut self.last_link_error, index, err);
                     continue;
                 }
             }
-            if self.connections[index].is_live() {
+            if connections[index].is_live() {
                 index += 1;
             } else {
+                // A terminal driver state (`Failed`/`Closed`) is a dead link: retire
+                // it — which shuts its socket down first, so the peer sees the
+                // closure instead of a half-open socket — and carry on.
                 let err = BeamError::BadArg;
-                self.retire(index, err);
+                retire_at(&mut connections, &mut self.last_link_error, index, err);
             }
         }
         Ok(events)
     }
-
-    /// Retires the link at `index` (removing it) and records why.
-    fn retire(&mut self, index: usize, err: BeamError) {
-        let connection = self.connections.remove(index);
-        self.last_link_error = Some(match connection.peer_name() {
-            Some(peer) => format!("{peer}: {err}"),
-            None => format!("{}: {err}", connection.peer_addr()),
-        });
-    }
-
     /// Whether at least one accepted link has completed the `'N'` handshake.
     ///
     /// The cheap guard the scheduler pass uses to skip the inbound-delivery half
     /// entirely (and never allocate the decode arena) for a node with no usable
-    /// link — the common case.
+    /// link — the common case. A table that cannot be borrowed counts as having one.
     pub fn has_established_link(&self) -> bool {
-        self.connections.iter().any(DistConnection::is_established)
+        DistLinks::new(self.links()).has_established()
     }
-
     /// Decodes, classifies and **routes** every control message queued on every
     /// **established** link through `sink` (the runtime's [`InboundSink`] — see
     /// [`LocalDeliverySink`]), returning how many were actually delivered to a
@@ -608,18 +880,22 @@ impl DistNode {
         // copies out), so the previous drain's arena is reclaimed wholesale.
         self.dispatch_heap.reset();
         let mut delivered = 0;
+        let cell = self.links();
+        let mut connections = cell
+            .try_borrow_mut()
+            .map_err(|_| error::message("distribution: the accepted link table is already in use"))?;
         let mut index = 0;
-        while index < self.connections.len() {
-            if !self.connections[index].is_established() {
+        while index < connections.len() {
+            if !connections[index].is_established() {
                 index += 1;
                 continue;
             }
             // The decode arena (`self.dispatch_heap`) and the link
-            // (`self.connections[index]`) are disjoint fields, so both are borrowed
+            // (`connections[index]`) are separate objects, so both are borrowed
             // for the duration of the decode only.
             let outcome = {
                 let heap = &mut self.dispatch_heap;
-                self.connections[index].dispatch_inbound(heap, atoms, sink)
+                connections[index].dispatch_inbound(heap, atoms, sink)
             };
             match outcome {
                 Ok(dispatched) => {
@@ -634,11 +910,12 @@ impl DistNode {
                 }
                 // A decode/classification failure retires just this link (recorded,
                 // never raised) — the scheduler pass carries on.
-                Err(err) => self.retire(index, err),
+                Err(err) => retire_at(&mut connections, &mut self.last_link_error, index, err),
             }
         }
         Ok(delivered)
     }
+
     /// Accepts one pending connection, or `None` when none is waiting.
     ///
     /// # Errors
@@ -653,6 +930,7 @@ impl DistNode {
                     self.name.advertised(),
                     &self.cookie,
                     self.creation,
+                    advertised_flags(self.hidden),
                 )?;
                 Ok(Some(connection))
             }
@@ -681,10 +959,11 @@ impl DistNode {
             name: self.name.epmd().to_vec(),
             extra: Vec::new(),
         };
-        let mut client = match EpmdClient::connect(EPMD_DEFAULT_ADDR) {
+        let addr = epmd_addr();
+        let mut client = match EpmdClient::connect(&addr) {
             Ok(client) => client,
             Err(err) => {
-                self.registration_error = Some(format!("epmd unreachable: {err}"));
+                self.registration_error = Some(format!("epmd unreachable ({addr}): {err}"));
                 return;
             }
         };
@@ -714,6 +993,34 @@ impl DistNode {
     }
 }
 
+/// Retires `connections[index]` (removing it), shutting its socket down first and recording
+/// why in `last_link_error`.
+///
+/// The socket is shut down **before** the connection drops, so a link is never left
+/// half-open from the peer's point of view. The retirement reason stays the driver's (or the
+/// socket's) failure; a `shutdown(2)` failure is appended rather than swallowed, since the
+/// link is gone either way.
+///
+/// A free function rather than a method because the table is a borrowed `Rc<RefCell<…>>`
+/// while the pump drains it (see [`links`]) — the borrow is already held, so the caller
+/// passes the slice and the `last_link_error` slot instead of `&mut DistNode`.
+fn retire_at(
+    connections: &mut Vec<DistConnection>,
+    last_link_error: &mut Option<String>,
+    index: usize,
+    err: BeamError,
+) {
+    let mut connection = connections.remove(index);
+    let closed = connection.close();
+    let reason = match connection.peer_name() {
+        Some(peer) => format!("{peer}: {err}"),
+        None => format!("{}: {err}", connection.peer_addr()),
+    };
+    *last_link_error = Some(match closed {
+        Ok(()) => reason,
+        Err(close_err) => format!("{reason} (close: {close_err})"),
+    });
+}
 /// The creation a node advertises before `epmd` has assigned one.
 const DEFAULT_CREATION: u32 = 1;
 
@@ -722,6 +1029,61 @@ const DEFAULT_CREATION: u32 = 1;
 // can never drift.
 use beam_dist::epmd::{EPMD_DIST_HIGH, EPMD_DIST_LOW, EPMD_NODE_NORMAL, EPMD_PROTO_TCP};
 
+/// The `epmd` address this node registers with: `$ERL_EPMD_PORT` when set, else
+/// the well-known [`EPMD_DEFAULT_ADDR`] (`127.0.0.1:4369`).
+///
+/// OTP honours `ERL_EPMD_PORT` so a node can use a private `epmd` (or an `epmd` on a
+/// non-default port), and this helper is the runtime's one reading of it: it drives
+/// the node's [`DistNode::register_once`] `ALIVE2` registration here, and it is the
+/// address the connecting half's `PORT2_REQ` lookups resolve a peer's port on (see
+/// `crate::dist_client`), so a node and its lookups always agree on which `epmd`
+/// they speak to.
+///
+/// * a bare number `N` is a **port** on the local loopback (`127.0.0.1:N`, the
+///   `ERL_EPMD_PORT=4370` form);
+/// * a value containing `:` is a `host:port` pair and is used verbatim (what
+///   [`beam_dist::epmd::EpmdClient::connect`] accepts);
+/// * an unset or empty value is [`EPMD_DEFAULT_ADDR`].
+pub fn epmd_addr() -> String {
+    match std::env::var("ERL_EPMD_PORT") {
+        Ok(value) => epmd_addr_from(Some(value.as_str())),
+        Err(_) => epmd_addr_from(None),
+    }
+}
+
+/// [`epmd_addr`]'s single definition over an explicit value — the testable core,
+/// kept pure because the process environment is global (surrounding whitespace is
+/// trimmed, so an empty or blank value is "unset").
+fn epmd_addr_from(value: Option<&str>) -> String {
+    let value = value.map(str::trim).unwrap_or_default();
+    if value.is_empty() {
+        return EPMD_DEFAULT_ADDR.to_string();
+    }
+    if value.contains(':') {
+        value.to_string()
+    } else {
+        format!("127.0.0.1:{value}")
+    }
+}
+
+/// The capability flags this node advertises in its `'N'` handshake: the emulator
+/// default ([`preferred_flags`]) **plus** `DFLAG_PUBLISHED` unless the node is
+/// **hidden** (`-hidden`).
+///
+/// A real node publishes itself per peer: `dist_util.erl:152-160`'s `publish_flag/3`
+/// ORs `DFLAG_PUBLISHED` (`dist.h:30`) into the flags this side advertises unless the
+/// node was started `-hidden` (`net_kernel.erl:hidden_argument/0` reads exactly that
+/// command-line argument). The bit is what makes a peer list this node in `nodes()`:
+/// without it every real peer classifies this runtime as *hidden*
+/// ([`beam_dist::handshake::publish_type`], `dist_util.erl:917-923`) and it shows up
+/// only in `nodes(hidden)`/`nodes(connected)`.
+///
+/// Visibility is a property of the **node**, not of who dialled, so this one set is
+/// what both halves advertise — the acceptor ([`DistConnection`]) and the connector
+/// ([`crate::dist_client::DistClient`]).
+pub(crate) fn advertised_flags(hidden: bool) -> DistFlags {
+    preferred_flags() | publish_flag(hidden, true)
+}
 /// Resolves the cookie the handshake digests use: `-setcookie` from the command
 /// line, else `$HOME/.erlang.cookie`, else the documented Milestone-1 default.
 pub fn resolve_cookie(init_args: &crate::config::InitArgs) -> Vec<u8> {
@@ -792,5 +1154,558 @@ mod tests {
         assert_eq!(name.full(), "mynode@some.host.example");
         assert_eq!(name.advertised(), b"mynode@some.host.example");
         assert_eq!(name.epmd(), b"mynode@some.host.example");
+    }
+
+    use beam_dist::{preferred_flags, publish_flag, AcceptDecision, DistFlags, Status};
+
+    /// The cookie every loopback fixture below digests with.
+    const COOKIE: &[u8] = b"dist-unit-test-cookie";
+
+    /// A connected loopback pair, each end configured exactly like an accepted link
+    /// (`TCP_NODELAY` + the [`DIST_READ_SLICE`] read timeout), so a
+    /// [`DistConnection`] built over either end behaves as it does on a real link.
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("the listener's address");
+        let client = TcpStream::connect(addr).expect("connect the loopback listener");
+        let (server, _) = listener.accept().expect("accept the loopback connection");
+        for stream in [&client, &server] {
+            stream.set_nodelay(true).expect("TCP_NODELAY");
+            stream
+                .set_read_timeout(Some(DIST_READ_SLICE))
+                .expect("the link's read slice");
+        }
+        (server, client)
+    }
+
+    /// Whatever the peer end has sent so far (`b""` on the read slice's timeout) —
+    /// the raw wire view the refusal tests assert on.
+    fn read_available(stream: &mut TcpStream) -> Vec<u8> {
+        let mut buf = [0u8; 512];
+        match stream.read(&mut buf) {
+            Ok(n) => buf[..n].to_vec(),
+            Err(err) if is_would_block(&err) => Vec::new(),
+            Err(err) => panic!("reading the peer end failed: {err}"),
+        }
+    }
+
+    /// A name no other test (or re-run) collides with on a shared `epmd`.
+    fn unique_node(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "beamrt_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// `$ERL_EPMD_PORT` unset (or empty) means the well-known default: the mapping is
+    /// pinned on [`epmd_addr_from`], the pure core, because the process environment is
+    /// global and this crate's tests never mutate it.
+    #[test]
+    fn epmd_addr_defaults_to_the_well_known_loopback_address() {
+        assert_eq!(epmd_addr_from(None), EPMD_DEFAULT_ADDR);
+        assert_eq!(epmd_addr_from(Some("")), EPMD_DEFAULT_ADDR);
+        assert_eq!(
+            epmd_addr_from(Some("   ")),
+            EPMD_DEFAULT_ADDR,
+            "a blank value is an unset value"
+        );
+        assert_eq!(EPMD_DEFAULT_ADDR, "127.0.0.1:4369");
+    }
+
+    /// A bare number is a **port** on the local loopback (the `ERL_EPMD_PORT=4370`
+    /// form of a private `epmd`).
+    #[test]
+    fn epmd_addr_reads_a_bare_number_as_a_loopback_port() {
+        assert_eq!(epmd_addr_from(Some("4370")), "127.0.0.1:4370");
+        assert_eq!(epmd_addr_from(Some(" 5370 ")), "127.0.0.1:5370");
+    }
+
+    /// A value containing `:` is already a `host:port` pair and is used verbatim (the
+    /// form [`beam_dist::epmd::EpmdClient::connect`] takes).
+    #[test]
+    fn epmd_addr_uses_a_host_port_pair_verbatim() {
+        assert_eq!(epmd_addr_from(Some("10.0.0.5:4370")), "10.0.0.5:4370");
+        assert_eq!(
+            epmd_addr_from(Some("epmd.internal.example:4370")),
+            "epmd.internal.example:4370"
+        );
+    }
+
+    /// The environment-reading wrapper agrees with the pure core: with
+    /// `ERL_EPMD_PORT` absent (the normal case) it is the default. Read-only — the
+    /// variable is never set by a test, so no other test in this binary can race.
+    #[test]
+    fn epmd_addr_reads_the_environment_when_the_variable_is_absent() {
+        if std::env::var_os("ERL_EPMD_PORT").is_some() {
+            eprintln!("SKIP: ERL_EPMD_PORT is set in this environment");
+            return;
+        }
+        assert_eq!(epmd_addr(), EPMD_DEFAULT_ADDR);
+    }
+
+    /// A peer whose flags fail the mandatory v6 gate is refused with a framed
+    /// `"not_allowed"` status, and those bytes must reach the peer's socket **even
+    /// though** `ConnectionDriver::step` reports the refusal as an error: the driver
+    /// buffers the status *before* returning `Err`, so `pump` flushes the driver's
+    /// output on that path too.
+    #[test]
+    fn a_mandatory_flag_mismatch_still_writes_the_not_allowed_status() {
+        let (server_stream, mut client_stream) = socket_pair();
+        let peer_addr = server_stream.peer_addr().expect("the peer's address");
+
+        // The peer sends a `'N'` name carrying **no** flags at all, so it misses
+        // `DFLAG_DIST_MANDATORY` (the OTP-23+ gate) and is refused.
+        let mut peer = ConnectionDriver::client_with_flags(
+            b"peer@host.example",
+            COOKIE,
+            1,
+            DistFlags::EMPTY,
+        );
+        peer.step().expect("the peer frames its `'N'` message");
+        let name_frame = peer.take_output();
+        assert!(!name_frame.is_empty(), "the `'N'` message is on the wire");
+        client_stream
+            .write_all(&name_frame)
+            .expect("write the `'N'` message to the acceptor");
+
+        let mut server = DistConnection::from_parts(
+            ConnectionDriver::server(b"acceptor@host.example", COOKIE, 1),
+            server_stream,
+            peer_addr,
+        );
+        // A frame may straddle reads: pump until the driver refuses the peer.
+        let mut refusal = None;
+        for _ in 0..8 {
+            match server.pump() {
+                Ok(_) => continue,
+                Err(err) => {
+                    refusal = Some(err);
+                    break;
+                }
+            }
+        }
+        let err = refusal.expect("the acceptor refuses a peer missing the mandatory flags");
+        assert!(
+            matches!(err, BeamError::BadArg),
+            "the mandatory check's typed refusal: {err}"
+        );
+        assert!(!server.is_live(), "a refused link is in the terminal `Failed` state");
+        assert!(
+            !server.has_pending_output(),
+            "the refusal frame was flushed rather than dropped with the link"
+        );
+
+        let received = read_available(&mut client_stream);
+        assert!(
+            !received.is_empty(),
+            "the peer must receive the refusal status, not a silent close"
+        );
+        assert_eq!(
+            received.len() - 2,
+            usize::from(u16::from_be_bytes([received[0], received[1]])),
+            "the status is one 2-byte-framed handshake message: {received:?}"
+        );
+        assert!(
+            received.windows(11).any(|window| window == b"not_allowed"),
+            "the refusal is the oracle's `not_allowed` status: {received:?}"
+        );
+    }
+
+    /// The same flush rule for a **policy** refusal (`AcceptDecision::Refuse`, the
+    /// `nok`/`alive` statuses a real acceptor sends): the status is buffered before
+    /// `step` returns `Err`, so it must still be written.
+    #[test]
+    fn a_policy_refusal_still_writes_its_status() {
+        let (server_stream, mut client_stream) = socket_pair();
+        let peer_addr = server_stream.peer_addr().expect("the peer's address");
+
+        let mut peer = ConnectionDriver::client(b"peer@host.example", COOKIE, 1);
+        peer.step().expect("the peer frames its `'N'` message");
+        let name_frame = peer.take_output();
+        client_stream
+            .write_all(&name_frame)
+            .expect("write the `'N'` message to the acceptor");
+
+        let mut server = DistConnection::from_parts(
+            ConnectionDriver::server_with_decision(
+                b"acceptor@host.example",
+                COOKIE,
+                1,
+                preferred_flags(),
+                Box::new(|_| AcceptDecision::Refuse(Status::nok())),
+            ),
+            server_stream,
+            peer_addr,
+        );
+        let mut refusal = None;
+        for _ in 0..8 {
+            match server.pump() {
+                Ok(_) => continue,
+                Err(err) => {
+                    refusal = Some(err);
+                    break;
+                }
+            }
+        }
+        refusal.expect("the accept policy refuses this peer");
+        assert!(!server.is_live(), "the refused link is terminal");
+        assert!(!server.has_pending_output(), "the refusal frame was flushed");
+
+        let received = read_available(&mut client_stream);
+        assert!(
+            received.len() >= 2 && received.windows(3).any(|window| window == b"nok"),
+            "the peer receives the framed `nok` status: {received:?}"
+        );
+    }
+
+    /// Both ends of a real OTP connection may advertise themselves hidden, so a
+    /// hidden peer is **recorded** ([`DistConnection::peer_visibility`]), never
+    /// refused: here a published peer and a deliberately hidden acceptor
+    /// ([`ConnectionDriver::server`], the emulator default) complete the handshake, each
+    /// classifying the other. The *accepting* half's own visibility comes from
+    /// [`advertised_flags`] — see
+    /// [`the_acceptor_publishes_the_node_unless_it_is_hidden`].
+    #[test]
+    fn a_hidden_and_a_published_peer_both_establish_and_are_recorded() {
+        let (server_stream, client_stream) = socket_pair();
+        let client_addr = client_stream.peer_addr().expect("the client's address");
+        let server_addr = server_stream.peer_addr().expect("the server's address");
+
+        let mut server = DistConnection::from_parts(
+            ConnectionDriver::server(b"acceptor@host.example", COOKIE, 1),
+            server_stream,
+            client_addr,
+        );
+        // The peer publishes itself (`DFLAG_PUBLISHED`), the acceptor does not.
+        let mut client = DistConnection::from_parts(
+            ConnectionDriver::client_with_flags(
+                b"peer@host.example",
+                COOKIE,
+                1,
+                preferred_flags() | publish_flag(false, true),
+            ),
+            client_stream,
+            server_addr,
+        );
+        assert_eq!(
+            server.peer_visibility(),
+            None,
+            "nothing is classified before the handshake completes"
+        );
+
+        for _ in 0..10 {
+            if client.is_established() && server.is_established() {
+                break;
+            }
+            client.pump().expect("the client's handshake step");
+            server.pump().expect("the acceptor's handshake step");
+        }
+
+        assert!(
+            client.is_established() && server.is_established(),
+            "a hidden peer is accepted like any other (client={:?}, server={:?})",
+            client.state(),
+            server.state()
+        );
+        assert_eq!(
+            server.peer_visibility(),
+            Some(PeerVisibility::Normal),
+            "the peer set `DFLAG_PUBLISHED`"
+        );
+        assert_eq!(
+            client.peer_visibility(),
+            Some(PeerVisibility::Hidden),
+            "an acceptor whose driver advertises `preferred_flags` (the emulator default) \
+             omits `DFLAG_PUBLISHED`"
+        );
+        // The rest of the peer identity stays truthful.
+        assert_eq!(server.peer_name().as_deref(), Some("peer@host.example"));
+        assert_eq!(client.peer_name().as_deref(), Some("acceptor@host.example"));
+        assert_eq!(server.peer_creation(), 1);
+        assert_eq!(client.peer_creation(), 1);
+    }
+
+    /// The capability flags the **accepting** half actually put on the wire, as the
+    /// connecting peer reads them: a real [`DistNode`] and a peer driver run the `'N'`
+    /// handshake against each other over a loopback socket, and the peer's record of the
+    /// acceptor's `Challenge` flags (`ConnectionDriver::server_flags`) is returned.
+    ///
+    /// This is the wire truth rather than the constructor's input: it is what a system
+    /// `erl` classifies with `publish_type/1` when it decides whether to list this node in
+    /// `nodes()`.
+    fn acceptor_flags_as_the_peer_read_them(node: &mut DistNode) -> DistFlags {
+        let mut client = TcpStream::connect(("127.0.0.1", node.port()))
+            .expect("connect the node's listener");
+        client.set_nodelay(true).expect("TCP_NODELAY");
+        client
+            .set_read_timeout(Some(DIST_READ_SLICE))
+            .expect("the link's read slice");
+        // The accept, and (best-effort) the `epmd` registration.
+        node.pump().expect("the accept");
+        // The peer publishes itself, so the acceptor's classification of it is exercised
+        // too (a hidden peer is equally acceptable — see the test above).
+        let mut peer = ConnectionDriver::client_with_flags(
+            b"peer@host.example",
+            COOKIE,
+            1,
+            preferred_flags() | publish_flag(false, true),
+        );
+        for _ in 0..200 {
+            node.pump().expect("the accepted link's pump");
+            let mut buf = [0u8; 4096];
+            match client.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => peer.feed(&buf[..n]),
+                Err(err) if is_would_block(&err) => {}
+                Err(err) => panic!("the peer's read: {err}"),
+            }
+            loop {
+                match peer.step() {
+                    Ok(beam_dist::StepOutcome::WouldBlock) => break,
+                    Ok(_) => {}
+                    Err(err) => panic!("the peer's step: {err}"),
+                }
+            }
+            if peer.has_output() {
+                let bytes = peer.take_output();
+                client.write_all(&bytes).expect("the peer's write");
+                client.flush().expect("the peer's flush");
+            }
+            if matches!(peer.state(), DriverState::Established) {
+                assert_eq!(
+                    node.links().borrow().first().map(|link| link.state()),
+                    Some(DriverState::Established),
+                    "both ends completed the `'N'` handshake"
+                );
+                assert_eq!(
+                    node.links().borrow().first().and_then(|link| link.peer_visibility()),
+                    Some(PeerVisibility::Normal),
+                    "the peer published ITSELF; our own flags are the separate question"
+                );
+                return peer.server_flags();
+            }
+        }
+        panic!("the loopback 'N' handshake never completed");
+    }
+
+    /// **Contract A.5 — this node's visibility.** A published node ORs
+    /// `DFLAG_PUBLISHED` (`dist.h:30`) into the flags it advertises, exactly as
+    /// `dist_util.erl:152-160`'s `publish_flag/3` does for a node that was not started
+    /// `-hidden`. The bit is what makes a real peer list this runtime in `nodes()`:
+    /// without it every peer classifies it as *hidden* and only `nodes(hidden)`/
+    /// `nodes(connected)` show the link.
+    ///
+    /// The assertion is on the peer's view of the acceptor's `Challenge`, i.e. the bytes
+    /// that actually crossed the socket, not on a locally computed set.
+    #[test]
+    fn the_acceptor_publishes_the_node_unless_it_is_hidden() {
+        let published = DistFlags::from_bits(beam_dist::flags::DFLAG_PUBLISHED);
+        let name = unique_node("published");
+        let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+        assert!(!node.is_hidden(), "a node is published unless `-hidden` says otherwise");
+        assert!(
+            node.advertised_flags().contains(published),
+            "the node's own flag set carries DFLAG_PUBLISHED: 0x{:x}",
+            node.advertised_flags().bits()
+        );
+        let peer_view = acceptor_flags_as_the_peer_read_them(&mut node);
+        assert!(
+            peer_view.contains(published),
+            "the peer read the acceptor's flags as 0x{:x}, which omits DFLAG_PUBLISHED \
+             (0x{:x}) — such a node is hidden to every real peer",
+            peer_view.bits(),
+            beam_dist::flags::DFLAG_PUBLISHED
+        );
+        assert_eq!(
+            peer_view.bits(),
+            (preferred_flags() | publish_flag(false, true)).bits(),
+            "the advertised set is the emulator default plus exactly DFLAG_PUBLISHED"
+        );
+        assert!(
+            peer_view.contains(preferred_flags()),
+            "every capability of the emulator default is still advertised"
+        );
+    }
+
+    /// The `-hidden` half: a node started hidden advertises the emulator default
+    /// **unchanged** — no `DFLAG_PUBLISHED` — so a real peer records it as
+    /// [`PeerVisibility::Hidden`] and leaves it out of `nodes()` (`-hidden` is a
+    /// per-node choice, `dist_util.erl:152-160`).
+    #[test]
+    fn a_hidden_node_withholds_the_published_bit() {
+        let name = unique_node("hidden");
+        let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+        node.set_hidden(true);
+        assert!(node.is_hidden(), "`set_hidden(true)` takes effect");
+        assert!(
+            !node
+                .advertised_flags()
+                .contains(DistFlags::from_bits(beam_dist::flags::DFLAG_PUBLISHED)),
+            "a hidden node's own flag set omits DFLAG_PUBLISHED: 0x{:x}",
+            node.advertised_flags().bits()
+        );
+        let peer_view = acceptor_flags_as_the_peer_read_them(&mut node);
+        assert!(
+            !peer_view.contains(DistFlags::from_bits(beam_dist::flags::DFLAG_PUBLISHED)),
+            "the peer read the hidden acceptor's flags as 0x{:x}, which still sets \
+             DFLAG_PUBLISHED (0x{:x})",
+            peer_view.bits(),
+            beam_dist::flags::DFLAG_PUBLISHED
+        );
+        assert_eq!(
+            peer_view.bits(),
+            preferred_flags().bits(),
+            "a hidden node advertises the emulator default, unchanged"
+        );
+        // Back to published: the switch is a plain property, reversible before a pump.
+        node.set_hidden(false);
+        assert!(!node.is_hidden(), "`set_hidden(false)` publishes the node again");
+    }
+
+    /// An **established** accepted link is bound to its peer's node atom term, which is
+    /// what makes the routing table's accepted half an exact node match: the link learns
+    /// its peer only as `node@host` bytes, so the term has to be interned into the live
+    /// table once, and binding is idempotent thereafter.
+    #[test]
+    fn bind_peer_nodes_gives_every_established_accepted_link_its_peer_term() {
+        let name = unique_node("bind");
+        let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+        let mut client = TcpStream::connect(("127.0.0.1", node.port()))
+            .expect("connect the node's listener");
+        client.set_nodelay(true).expect("TCP_NODELAY");
+        client
+            .set_read_timeout(Some(DIST_READ_SLICE))
+            .expect("the link's read slice");
+        // The accept, and (best-effort) the `epmd` registration.
+        node.pump().expect("the accept");
+
+        let mut peer = ConnectionDriver::client(b"peer@host.example", COOKIE, 1);
+        for _ in 0..200 {
+            node.pump().expect("the accepted link's pump");
+            let mut buf = [0u8; 4096];
+            match client.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => peer.feed(&buf[..n]),
+                Err(err) if is_would_block(&err) => {}
+                Err(err) => panic!("the peer's read: {err}"),
+            }
+            loop {
+                match peer.step() {
+                    Ok(beam_dist::StepOutcome::WouldBlock) => break,
+                    Ok(_) => {}
+                    Err(err) => panic!("the peer's step: {err}"),
+                }
+            }
+            if peer.has_output() {
+                let bytes = peer.take_output();
+                client.write_all(&bytes).expect("the peer's write");
+                client.flush().expect("the peer's flush");
+            }
+            let established = node
+                .links()
+                .borrow()
+                .first()
+                .is_some_and(|connection| connection.is_established());
+            if established {
+                break;
+            }
+        }
+
+        let mut atoms = beam_term::prelude::AtomTable::new();
+        assert_eq!(
+            node.links().borrow().first().and_then(|c| c.node_term()),
+            None,
+            "an accepted link is unbound until the scheduler pass binds it"
+        );
+        assert_eq!(
+            node.bind_peer_nodes(&mut atoms).expect("the first bind"),
+            1,
+            "the one established accepted link is bound"
+        );
+        let expected = make_atom(atoms.intern("peer@host.example"));
+        assert_eq!(
+            node.links().borrow().first().and_then(|c| c.node_term()),
+            Some(expected),
+            "the bound term is the peer's own node atom, interned in the live table"
+        );
+        assert_eq!(
+            node.bind_peer_nodes(&mut atoms).expect("the second bind"),
+            0,
+            "binding is idempotent: an already-bound link is skipped"
+        );
+    }
+
+    /// `close()` is deterministic and idempotent: the first call shuts the socket
+    /// down (the peer reads EOF) and a second call — whose `shutdown(2)` answers
+    /// `ENOTCONN` — is still `Ok`, never an error.
+    #[test]
+    fn close_shuts_the_socket_down_and_is_idempotent() {
+        let (server_stream, mut client_stream) = socket_pair();
+        let peer_addr = server_stream.peer_addr().expect("the peer's address");
+        let mut connection = DistConnection::from_parts(
+            ConnectionDriver::server(b"acceptor@host.example", COOKIE, 1),
+            server_stream,
+            peer_addr,
+        );
+        connection.close().expect("the first close shuts the socket down");
+        assert!(
+            read_available(&mut client_stream).is_empty(),
+            "the peer sees no data, only the closure"
+        );
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            client_stream.read(&mut buf).expect("the peer's read after the shutdown"),
+            0,
+            "the peer reads a clean EOF, never a half-open socket"
+        );
+        connection
+            .close()
+            .expect("a second close is a no-op, not an `ENOTCONN` error");
+    }
+
+    /// A link the driver refuses on the wire is retired **and** its socket is shut
+    /// down: the peer reads EOF and the node records why the link went.
+    #[test]
+    fn retiring_a_broken_link_shuts_its_socket_down_so_the_peer_sees_eof() {
+        let name = unique_node("retire");
+        let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+        let mut client = TcpStream::connect(("127.0.0.1", node.port()))
+            .expect("connect the node's listener");
+        client
+            .set_read_timeout(Some(DIST_READ_SLICE))
+            .expect("the link's read slice");
+        client.set_nodelay(true).expect("TCP_NODELAY");
+
+        // The first pump accepts the connection and (best-effort) registers with
+        // `epmd`; the link then waits for the peer's `'N'` message.
+        node.pump().expect("the accept");
+        node.pump().expect("the accepted link's first read");
+        assert_eq!(node.connections().len(), 1, "the link is live");
+
+        // A one-byte handshake body that is not a `'N'` name: the acceptor's
+        // `Name::decode` fails, so the link is retired.
+        client
+            .write_all(&[0, 1, 0xff])
+            .expect("write a malformed handshake frame");
+        node.pump().expect("a broken link never fails the pump");
+        assert!(
+            node.connections().is_empty(),
+            "the malformed link was retired: {:?}",
+            node.last_link_error()
+        );
+        assert!(
+            node.last_link_error().is_some(),
+            "the retirement reason is recorded, never swallowed"
+        );
+
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            client.read(&mut buf).expect("the peer's read after the retirement"),
+            0,
+            "the retired link's socket was shut down, so the peer reads EOF"
+        );
     }
 }
