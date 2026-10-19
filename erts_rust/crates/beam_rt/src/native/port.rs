@@ -56,7 +56,7 @@
 //! |---|---|---|
 //! | busy | `[nosuspend]` (no `force`) | the atom `false` — the command is dropped, nothing written |
 //! | busy | `[force]` | `true` if the driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`, else `error:notsup` |
-//! | busy | neither | the C **suspends** the caller until the port is idle, then `true` — a typed capability gap here (no BIF-suspend channel; see [`RuntimeContext::port_command`]) |
+//! | busy | neither | the caller **waits** until the port is idle and the command is then re-issued ⇒ `true` (the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run, `crate::port::busy_wait`); a port still busy at the deadline, or a caller that may not pump, is a typed capability gap (see [`RuntimeContext::port_command`]) |
 //! | idle | any | `true` — except `[force]` on a driver **without** `ERL_DRV_FLAG_SOFT_BUSY`, which is `error:notsup` |
 //!
 //! The `force` rule is a property of the driver **entry**, not of the current busy state: the C
@@ -234,28 +234,42 @@ impl RuntimeContext<'_> {
     /// 5. otherwise, a **busy** port follows the C's busy arms (`erl_bif_port.c:211-220`):
     ///    `nosuspend` answers the atom `false` (nothing is written, and — matching the C, which
     ///    checks the busy state *before* it converts the iolist, `io.c:1760-1764` — even
-    ///    non-iodata is not rejected), while a plain command makes the C **suspend** the caller
-    ///    until the port goes idle and then answer `true`;
+    ///    non-iodata is not rejected), while a plain command **waits** for the port to go idle and
+    ///    then re-issues the command (step 5's arm below);
     /// 6. otherwise collect `Data` as iodata and write it — to the child's stdin, or to the
     ///    adopted duplex descriptor of a `{fd, N}` port.
     ///
-    /// # The one remaining divergence
+    /// # The plain busy-port arm
     ///
-    /// Step 5's plain-command-on-a-busy-port arm is the C's `erts_suspend` + `ERTS_BIF_YIELD3`: the
-    /// caller blocks until the port is idle and the BIF is then **re-run**. This runtime's BIF seam
-    /// (`ExecutionContext::call_bif`) has no way to express "block the caller and re-run me" — its
-    /// only shapes are a value and an error, and the engine's sole suspend is the `receive` family's
-    /// `Step::Wait` — so fabricating the C's eventual `true` would be a **wrong result**, and there
-    /// is no truthful suspend to take. That case therefore raises the runtime's typed capability gap
-    /// ([`crate::error::unsupported`], exit 3) rather than answering at all. Every other arm —
-    /// including both busy arms that *do* have an answer (`false`, `notsup`) — matches the oracle.
+    /// A plain command on a busy port is the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run: the
+    /// caller blocks until the port is idle and the BIF runs again, whereupon the bytes are written
+    /// and the answer is `true`. This runtime's BIF seam (`ExecutionContext::call_bif`) has no
+    /// "block the caller and re-run me" shape — its only shapes are a value and an error — so the
+    /// wait is taken **here**, on the routes that own a scheduler pass:
+    /// [`crate::port::busy_wait::issue`] runs bounded port rounds (the same
+    /// [`Runtime::pump_scheduler`](crate::Runtime::pump_scheduler) step the port pump uses) until
+    /// the port reports idle and then re-issues the command through the same seam. The busy bit is
+    /// cleared by the driver's own callback inside a port round — or by another process's
+    /// `port_control/3`, which the pass's run-queue round serves — so a round is exactly what the
+    /// C's scheduler would do.
+    ///
+    /// The wait is bounded ([`BUSY_PORT_DEADLINE`](crate::port::busy_wait::BUSY_PORT_DEADLINE),
+    /// 5 s) where the C is unbounded, because a single-threaded runtime that owns its own pass
+    /// would otherwise hang the whole executable; expiry is a typed capability gap naming the
+    /// deadline, never a fabricated `true`. A caller that may **not** pump
+    /// ([`RuntimeContext::may_pump_scheduler`] is `false`: a compiled process inside a scheduler
+    /// slice) answers the typed capability gap
+    /// [`NO_PUMP_REASON`](crate::port::busy_wait::NO_PUMP_REASON) —
+    /// `M1_GAPS.md` §*Ports, drivers and the send family (A.4)*. Every other arm — `false`,
+    /// `notsup`, `badarg` — matches the oracle.
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a non-port, a port the runtime does not hold, a malformed
     /// or unrecognized option list, or non-iodata `Data`; the `notsup` raise for `force` on a port
-    /// whose driver does not advertise `ERL_DRV_FLAG_SOFT_BUSY`; the typed capability gap for a
-    /// plain command on a busy port (above); [`BeamError::Io`] when the write fails.
+    /// whose driver does not advertise `ERL_DRV_FLAG_SOFT_BUSY`; a typed capability gap for a busy
+    /// port that never went idle within the deadline or for a caller that may not pump;
+    /// [`BeamError::Io`] when the write fails.
     fn port_command(&mut self, args: &[Eterm], with_options: bool) -> Result<Eterm> {
         let port = PortId::from_eterm(*args.first().ok_or(BeamError::BadArg)?)?;
         let data = *args.get(1).ok_or(BeamError::BadArg)?;
@@ -277,32 +291,32 @@ impl RuntimeContext<'_> {
             iodata_bytes(data, &mut bytes)?;
             Ok(bytes)
         };
-        let mut hook = crate::port::RuntimePorts::new(
-            Rc::clone(&self.runtime.ports),
-            self.runtime.code_server.atoms_handle(),
-            self.pid(),
-        );
-        let outcome = hook.command_with_data(
+        // The whole `erts_port_output` outcome matrix, including the C's **suspend-and-retry**
+        // loop for a plain command on a busy port ([`crate::port::busy_wait::issue`]): the caller
+        // waits until the port is idle — driving the machine meanwhile, so a driver callback or a
+        // `port_control/3` from another process can clear the bit — and the command is then
+        // re-issued, which is exactly the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run.
+        let options = beam_io::PortCommandOptions::EMPTY
+            .with_force(options.force)
+            .with_nosuspend(options.nosuspend);
+        let may_pump = self.may_pump_scheduler();
+        let owner = self.pid();
+        let written = crate::port::busy_wait::issue(
+            &mut *self.runtime,
+            may_pump,
+            owner,
             port,
             make_data,
-            beam_io::PortCommandOptions::EMPTY
-                .with_force(options.force)
-                .with_nosuspend(options.nosuspend),
+            options,
         )?;
-        match outcome {
+        let answer = match written {
             // Queued, written and counted by the seam: the C's `ERTS_PORT_OP_DONE` ⇒ `true`.
-            beam_io::PortCommandOutcome::Done => self.atom("true"),
-            // `ERTS_PORT_OP_BUSY`. `[nosuspend]` answers the atom `false` and drops the command
-            // (`erl_bif_port.c:211-214`); a plain command makes the C suspend the caller and
-            // re-issue the BIF once the port is idle, which this runtime's BIF seam
-            // (`ExecutionContext::call_bif`) cannot express — so that case is the typed capability
-            // gap, never a fabricated `true`.
-            beam_io::PortCommandOutcome::Busy if options.nosuspend => self.atom("false"),
-            beam_io::PortCommandOutcome::Busy => Err(error::unsupported(
-                "port_command on a busy port: suspending the caller until the port is idle is not \
-                 implemented",
-            )),
-        }
+            crate::port::busy_wait::PortWrite::Written => "true",
+            // `ERTS_PORT_OP_BUSY` under `ERTS_PORT_SIG_FLG_NOSUSPEND`: nothing queued, nothing
+            // written — the atom `false` (`erl_bif_port.c:211-214`).
+            crate::port::busy_wait::PortWrite::Suspended => "false",
+        };
+        self.atom(answer)
     }
 
     /// Validates `erlang:port_command/3`'s `Options` and reports which of the two recognized
@@ -893,7 +907,7 @@ mod tests {
     /// |---|---|---|
     /// | busy | `[nosuspend]` | the atom `false` (nothing written) |
     /// | busy | `[force]` | `error:notsup` |
-    /// | busy | `[]` / none | the caller is **suspended**, then `true` — a capability gap here |
+    /// | busy | `[]` / none | the caller **waits** for the port to go idle, then the command is re-issued ⇒ `true`; this fixture driver never clears the bit, so the wait expires into the typed capability gap |
     /// | idle | `[]` / none / `[nosuspend]` / **`[force]`** | `true` **except** `[force]` ⇒ `notsup` |
     ///
     /// The last row's `[force]` cell is the subtle one: the C's `notsup` test is on the driver
@@ -939,8 +953,9 @@ mod tests {
                 "`notsup` is a genuine error, not a capability gap: {error}"
             );
         }
-        // A plain command on the busy port is the C's `erts_suspend`: a typed capability gap here
-        // (the runtime has no BIF-suspend channel), and deliberately **not** a fabricated `true`.
+        // A plain command on the busy port enters the C's `erts_suspend` wait. This fixture driver
+        // never clears its bit and nothing else can, so the wait runs to its deadline and answers
+        // the typed capability gap naming it — deliberately **not** a fabricated `true`.
         for options in [data, list_of(&mut runtime, &[])] {
             let args: Vec<Eterm> = if options == data {
                 vec![port.to_eterm(), data]

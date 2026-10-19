@@ -91,6 +91,14 @@ pub(super) enum SendDestination {
         /// [`beam_codec::term::external_ref_parts`], which is how this arm was selected).
         to: Eterm,
     },
+    /// A **port** on this node: the C's `port_common` block (`bif.c:2551-2613`), which writes
+    /// `Msg` to the port's stream exactly as `erlang:port_command/2` would — except that every
+    /// failure is a **silent success** (the BIF reports the message term), including a port the
+    /// runtime no longer holds.
+    Port {
+        /// The port the delivery writes to.
+        id: PortId,
+    },
     /// A `{Name, Node}` atom pair: `{DOP_REG_SEND, From, Cookie, ToName} -- Msg`.
     RemoteName {
         /// The registered name on the peer.
@@ -143,10 +151,11 @@ pub(super) enum SendDestination {
 /// # Errors
 ///
 /// [`BeamError::BadArg`] for the destinations the oracle rejects with `badarg`; a typed
-/// capability gap ([`crate::error::unsupported`]) for the ones it accepts but this runtime
-/// cannot serve yet — a port destination, and a `{Name, Node}` pair naming **another** node on
-/// a runtime that is **not** a distributed node (`dist_client()` is `None`, which is the
-/// message the non-distributed corpus has always pinned).
+/// capability gap ([`crate::error::unsupported`]) for a `{Name, Node}` pair naming **another**
+/// node on a runtime that is **not** a distributed node (`dist_client()` is `None`, which is the
+/// message the non-distributed corpus has always pinned). A **port** destination classifies
+/// successfully ([`SendDestination::Port`]); its own failures are resolved by the write, which
+/// reports them the way the C's send route does (a silent success).
 pub(super) fn classify_send_destination(
     runtime: &Runtime,
     table: &ProcessTable,
@@ -190,9 +199,12 @@ pub(super) fn classify_send_destination(
         return Ok(SendDestination::RemoteAlias { to });
     }
     if PortId::from_eterm(to).is_ok() {
-        return Err(error::unsupported(
-            "erlang:send/2 to a port: the port write path is not wired",
-        ));
+        // The C's port arm (`bif.c:2551-2613`): the port's write path, i.e. the very
+        // `port_command/2` decision — but with the send route's *silent* failure semantics
+        // (see [`SendDestination::Port`]).
+        return Ok(SendDestination::Port {
+            id: PortId::from_eterm(to)?,
+        });
     }
     if let Some((name_atom, node_atom, name, node)) = two_atom_tuple(runtime.code_server.atoms(), to)
     {
@@ -751,6 +763,53 @@ impl<'a> RuntimeContext<'a> {
         Ok(())
     }
 
+    /// Sends one message to a **port** on this node — the C's `port_common` block
+    /// (`bif.c:2551-2613`), shared by the compiled `!`, the `-eval` `!` and the
+    /// `erlang:send/2,3` BIF.
+    ///
+    /// Three things happen here and nowhere else, so the two arities can never drift:
+    ///
+    /// 1. **One `send` trace event per attempted port send.** The C traces *before* the command
+    ///    (`trace_send(p, portid, msg)` and `seq_trace_output(…)` at `bif.c:2573-2579`, both in
+    ///    the `port_common` block that `send/2` and `send/3` reach through `do_send`), which is
+    ///    why the trace is emitted first and covers every verdict — including a dropped message
+    ///    and a busy port the caller refuses to wait for.
+    /// 2. **The C's message decomposition** (`erts_port_command`, `io.c:3981-4013`): only
+    ///    `{Pid, {command, Data}}` is written and only `{Pid, close}` closes the port; everything
+    ///    else is a bad port signal that writes nothing and succeeds silently
+    ///    ([`crate::port::busy_wait::send_message_to_port`], which owns the whole matrix).
+    /// 3. **The verdict**, which `send/2` discards (the message term is its value) and `send/3`
+    ///    reports (`ok`, or the atom `nosuspend` for a busy port under `[nosuspend]`).
+    ///
+    /// `nosuspend` is the caller's `[nosuspend]` option: it turns a busy port's wait into the
+    /// non-blocking [`PortWrite::Suspended`] verdict instead of suspending-and-retrying.
+    ///
+    /// # Errors
+    ///
+    /// The trace writers' own failures, and the typed capability gaps of the wait
+    /// ([`crate::port::busy_wait::issue`]: an expired deadline, a caller that cannot pump the
+    /// scheduler, a port busy again after the wait) — never a fabricated success.
+    pub(super) fn deliver_to_port(
+        &mut self,
+        id: PortId,
+        to: Eterm,
+        message: Eterm,
+        nosuspend: bool,
+    ) -> Result<crate::port::busy_wait::PortSend> {
+        // The C's trace site: `bif.c:2573-2579`, before `erts_port_command`, on both routes.
+        self.trace_send_events(to, message)?;
+        let may_pump = self.may_pump_scheduler;
+        let owner = self.mailbox_pid;
+        crate::port::busy_wait::send_message_to_port(
+            &mut *self.runtime,
+            may_pump,
+            owner,
+            id,
+            message,
+            nosuspend,
+        )
+    }
+
     /// The internal pid a `send` destination names, plus the **alias reference to consume**
     /// once the message has been delivered.
     ///
@@ -786,6 +845,7 @@ impl<'a> RuntimeContext<'a> {
             SendDestination::RemotePid { .. }
             | SendDestination::RemoteAlias { .. }
             | SendDestination::RemoteName { .. }
+            | SendDestination::Port { .. }
             | SendDestination::Dropped => Err(BeamError::BadArg),
         }
     }
@@ -825,6 +885,10 @@ impl<'a> RuntimeContext<'a> {
     /// the connector's typed error, propagated rather than turned into a silent drop, so a real
     /// peer is never mis-served. `Local` is unreachable here and is rejected outright.
     ///
+    /// A **port** destination is the one arm whose trace does not come from the tail of this
+    /// method: [`Self::deliver_to_port`] emits it *before* the command, at the C's own site
+    /// (`bif.c:2573-2579`), so the send is traced exactly once.
+    ///
     /// This is also the seam's arm for [`SendDestination::Dropped`] — a `{Name, Node}` pair
     /// naming this node under which nothing is registered (`bif.c:2654`'s `return 0`): there is
     /// no local receiver to copy into and nothing to transmit, so the destination is spent
@@ -852,6 +916,16 @@ impl<'a> RuntimeContext<'a> {
             }
             SendDestination::RemoteAlias { to: alias } => {
                 self.runtime.dist_send_alias(alias, from, message)?;
+            }
+            // A **port** on this node: the C's `port_common` block (`bif.c:2551-2613`), through
+            // the one shared port-send implementation ([`Self::deliver_to_port`]), so the `send/2`
+            // and `send/3` routes trace, classify and write identically. That method emits the
+            // arm's **one** `send` trace event itself — at the C's own site, *before* the command
+            // (`bif.c:2573-2579`) — so this arm returns rather than falling through to the trailing
+            // trace below, which would double-trace the send.
+            SendDestination::Port { id } => {
+                self.deliver_to_port(id, to, message, false)?;
+                return Ok(());
             }
             // Accepted and dropped: nothing to deliver and nothing to transmit.
             SendDestination::Dropped => {}

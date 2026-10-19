@@ -65,11 +65,13 @@
 //! x false
 //! ```
 //!
-//! Destinations 7 and 8 are **accepted by the oracle** but are Milestone-1 capability gaps in
-//! this runtime (the port write path belongs to the port subsystem; a `{Name, Node}` send needs
-//! distribution, contract A.5). They surface as the honest `unsupported: …` signal (exit 3),
-//! never as a fabricated value or a wrong `error:badarg`; the fixture cases above cover the
-//! rest.
+//! Destination 8 is **accepted by the oracle** but is a Milestone-1 capability gap in this
+//! runtime (a `{Name, Node}` send needs distribution, contract A.5); it surfaces as the honest
+//! `unsupported: …` signal (exit 3), never as a fabricated value or a wrong `error::badarg`.
+//! Destination 7 is served: a port destination runs the C's `erts_port_command` decomposition, so
+//! `erlang:send(Port, Data)` answers the message term (writing only for the `{Pid,{command,Data}}`
+//! and `{Pid,close}` shapes) — the oracle rows live in `tests/port_busy.rs`. The rest of the
+//! fixture cases above cover the remaining destinations.
 use std::path::PathBuf;
 use std::process::{Command, Output};
 

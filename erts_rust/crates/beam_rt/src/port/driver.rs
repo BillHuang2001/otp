@@ -865,8 +865,9 @@ pub struct DriverPort {
     /// `ERL_DRV_FLAG_SOFT_BUSY` bit, recorded on the very same handle) to answer
     /// `erlang:port_command/2,3` the way the C does: `nosuspend` on a busy port ⇒ `false`, `force`
     /// ⇒ `notsup` unless the entry advertises `SOFT_BUSY`, and a plain command on a busy port
-    /// suspends the caller. Seized with [`DriverPort::busy_flag`] before the host is boxed into
-    /// the port lifecycle, exactly like [`DriverPort::control_flags`].
+    /// waits for the idle state and is then re-issued (`crate::port::busy_wait`). Seized with
+    /// [`DriverPort::busy_flag`] before the host is boxed into the port lifecycle, exactly like
+    /// [`DriverPort::control_flags`].
     busy: BusyFlag,
     /// The driver's **private** byte queue — the C's `prt->ioq` (`io.c:6790-6919`), which
     /// `driver_enq`/`driver_pushq`/`driver_deq`/… reach and nothing else does. Distinct from the
