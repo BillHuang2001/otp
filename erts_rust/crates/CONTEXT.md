@@ -138,7 +138,8 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 |---|---|
 | `beam_alloc` | carrier allocator + size classes + process-heap bump allocator |
 | `beam_abi` | layout-frozen NIF/driver struct + fn-table types, static size/offset asserts, transmute; the working `enif_*` host API (`NifHost` seam) + the `dlopen`-based NIF loader |
-| `beam_codec` | ETF encode/decode of the core tag set + `VERSION_MAGIC 131` round-trips |
+| `beam_codec` | ETF encode/decode of the core tag set + `VERSION_MAGIC 131` round-trips; the `COMPRESSED` (`80`) tag is **byte-identical to the oracle** over `beam_deflate` (wrapper `[131][80][body_len:4 BE][zlib stream]`, emitted iff `stream_len <= body_len - 5`, `body_len < 5` always plain, level 0 never compresses) |
+| `beam_deflate` | zlib 1.3.2 deflate + inflate in safe Rust: one-shot and streaming (all six flush modes, per-call `avail_in`/`avail_out`), the five match functions + `configuration_table` (levels `-1`/`0..=9`), the `inftrees`/`inffast` inflate with zlib's status codes, `crc32`/`adler32` + `combine`, gzip/zlib/raw framings |
 | `beam_dist` | `DFLAG_*`/`DOP_*` constants, handshake + control-message framing, `epmd` client |
 | `beam_loader` | chunk parse + BEAM disassembly + lowering to the typed block IR |
 | `beam_engine` | IR + direct-threaded interpreter + the native baseline JIT tier (default-OFF Cranelift hot tier) + `ExecutionContext` + the receive/message family over a `Mailbox` seam |
