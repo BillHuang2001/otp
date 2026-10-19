@@ -84,13 +84,17 @@
 //!    enif_get_resource` reads back the `42` the NIF wrote (and the same for the
 //!    `enif_make_resource_binary` path), where a runtime that frees at refcount zero would hand the
 //!    NIF a dangling pointer.
-//!    **The documented deviation from C:** the C drops that reference when the term is
-//!    garbage-collected; this crate has no GC and no "term died" signal, so the term's reference is
-//!    **never dropped**. An object that has ever been exposed as a resource term is therefore
-//!    retained — block and payload — for the process lifetime, and its `dtor` does not run. That is a
-//!    bounded, deliberate leak, and it is the *only* sound choice available: the alternative (freeing
-//!    at refcount zero) makes `enif_get_resource` hand a NIF a freed pointer, i.e. a *wrong value*,
-//!    which this crate never does. An object that no term holds is released and destroyed normally.
+//!    **Where that reference goes:** the C drops it when the term is garbage-collected. This crate has
+//!    no GC, so the "the term died" signal is a **caller-owned seam** — [`release_resource_terms`]
+//!    drops the reference of every term that a caller-supplied reachability predicate calls
+//!    unreachable, and runs the type's `dtor` when that was the last reference. The *reachability
+//!    decision is the caller's* (a wrong "unreachable" is a use-after-free, a wrong "reachable" is
+//!    only a leak), exactly as for the off-heap refc binaries. With **no** caller driving that seam —
+//!    a plain `beam_abi` process, or a runtime whose GC is not wired to it — the reference is never
+//!    dropped: that is the bounded, deliberate leak documented here before the seam existed, and it
+//!    remains the only sound *default*, because freeing on our own at refcount zero would make
+//!    `enif_get_resource` hand a NIF a freed pointer, i.e. a *wrong value*, which this crate never
+//!    does. An object that no term holds is released and destroyed normally.
 //!    The destructor itself is **run synchronously** on the release that takes the reference count to
 //!    zero — exactly once per object, never while a `keep` is outstanding, and never for a `NULL`
 //!    release. The C *schedules* it instead; the full comparison is in "The destructor's timing"
@@ -709,7 +713,9 @@ pub unsafe extern "C" fn enif_keep_resource(obj: *mut c_void) {
 /// Drops one reference; the release that reaches zero runs the type's `dtor` (with a live environment
 /// built from the type's host) and frees the block. An object that has been exported as a resource
 /// term holds one more reference (see the module docs, point 3), so releasing the allocator's
-/// reference leaves it alive — exactly as on the oracle.
+/// reference leaves it alive — exactly as on the oracle. That extra reference is dropped through this
+/// same function by [`release_resource_terms`], so both routes share one decrement/destructor path and
+/// cannot diverge.
 ///
 /// The destructor is run **synchronously** on this thread, where the C schedules it as misc aux work;
 /// see the module docs, "The destructor's timing", for why the asynchronous form is not reproduced.
@@ -900,8 +906,9 @@ pub unsafe extern "C" fn enif_make_resource(env: *mut ErlNifEnv, obj: *mut c_voi
     with_registry(|r| {
         r.bind_term(reference.raw(), ResourceRef { ty, obj });
     });
-    // The term now owns a reference — the reference the C's magic ref holds. It is never released
-    // (there is no GC to collect the term); see the module docs, point 3.
+    // The term now owns a reference — the reference the C's magic ref holds. It is dropped by
+    // `release_resource_terms` once the caller's reachability analysis says the term is dead, and
+    // never otherwise (there is no GC to collect the term); see the module docs, point 3.
     // SAFETY: `obj` is a live payload pointer with an outstanding reference (caller contract).
     unsafe { retain_object(obj) };
     n(reference)
@@ -1062,6 +1069,17 @@ pub unsafe extern "C" fn enif_dynamic_resource_call(
         None => 1,
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The term-release seam — the caller-owned "the term died" signal
+// ---------------------------------------------------------------------------------------------
+
+// The seam lives in its own file (this one is at the ~1000-line target) and is re-exported here, so
+// `nif::enif::resources::{resource_terms, release_resource_terms}` is the public path.
+#[path = "resources_release.rs"]
+mod release;
+
+pub use self::release::{release_resource_terms, resource_terms};
 
 #[cfg(test)]
 #[path = "resources_tests.rs"]
