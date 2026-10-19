@@ -207,11 +207,16 @@ The local-call arm (`dispatch.rs:413-515`, seams at `:421`/`:467`/`:496`) does *
 (`beam_term/src/atom.rs:308-310`), but the three values it yields are **immutable for a loaded module**, so the
 derivation is memoized in `Machine::local_callees` (`../machine/local_callee.rs`, `LocalCallees`).
 `Machine::local_call_seam` (`dispatch.rs:1120-1174`) reads it in two phases.
-**Phase 1, every local call:** `self.local_callees.resolve(module, callee)` — a fixed `CAP = 8` array scanned
-`0..len`, with the hot callee moved to index 0 (a hit at 0 is ~two loads and a compare) and a miss deriving once,
-inserting at the front and evicting the oldest entry; the answer is the entry's `Option<CalleeTarget>`
-(`module`/`function` `Box<str>` + declared `arity`), whose inner `None` is the **memoized** "un-nameable callee"
-(no re-derivation, no consultation). Then the host's `resolve_local_call` is asked.
+**Phase 1, every local call:** `self.local_callees.resolve(module, callee)` — a fixed `CAP = 8` array held
+as a compact 16-byte `keys` array (the only thing the scan reads) plus a parallel `targets` array of the owned
+identities. **A hit reorders nothing** (the entry keeps its slot) and only a **miss** inserts — at the front,
+dropping the oldest *insertion* — because the workloads this seam is priced on alternate two callees per element
+(an MRU move-to-front memmoved up to eight entries on *every* call; with the current policy the seam holds
+**1.85 %** of the interpreter's and **4.05 %** of the baseline tier's retired instructions, below the
+un-memoized derivation's 3.22 % / 7.93 %).
+The answer is the slot's `Option<CalleeTarget>` (`module`/`function` `Box<str>` + declared `arity`), whose inner
+`None` is the **memoized** "un-nameable callee" (no re-derivation, no consultation). Then the host's
+`resolve_local_call` is asked.
 **Phase 2, served only:** the rare path re-derives the names from the `module` **parameter** through
 `local_callee_identity` (`dispatch.rs:1270-1274`), so the `&str`s borrow the module and not `self` and the BIF
 dispatch keeps `&mut self` free; nothing is allocated on either path.

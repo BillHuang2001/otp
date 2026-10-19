@@ -1110,8 +1110,10 @@ impl Machine {
     ///
     /// The callee's `(module, function, arity)` is **memoized** per
     /// `(module address, function index)` ([`Machine::local_callees`],
-    /// [`crate::machine::LocalCallees`]): a repeat call is one fixed-array scan with the
-    /// hot callee at index 0. The host's **verdict is never memoized** —
+    /// [`crate::machine::LocalCallees`]): a repeat call is one fixed scan of an 8-entry
+    /// key array that **reorders nothing** (a hit leaves its slot where it is, so the
+    /// two-callee alternation `list_walk`'s inner loop performs is all hits after its
+    /// first cycle). The host's **verdict is never memoized** —
     /// [`ExecutionContext::resolve_local_call`] is asked exactly once per (nameable)
     /// local call, because a host spends one reduction unit per consultation and
     /// `erlang:load_nif/2` can install a stub mid-run.

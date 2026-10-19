@@ -106,12 +106,20 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `CalleeKey`, `CalleeTarget`): the `(module name, function name, arity)` derivation the local-call seam
   (`../interpreter/dispatch.rs::local_call_seam`) would otherwise repeat on every local
   `call`/`call_only`/`call_last`, memoized per `(module address, function index)` in a fixed
-  `CAP = 8` least-recently-used array (the hot callee sits at index 0; a miss derives, a hit moves the entry
-  to the front; a full cache evicts the oldest). An un-nameable callee is memoized as `None` and is then
-  consulted **zero** times. **Invariant: the memo holds the identity derivation only — never the host's
-  verdict** (`ExecutionContext::resolve_local_call` is consulted, and spends one reduction unit, exactly once
-  per local call). Cleared by `reset` (`registers.rs`), which is what keeps the address key ABA-free; a resume
-  does not clear it.
+  `CAP = 8` array held as two parallel slices — a compact `keys: [CalleeKey; 8]` (16 bytes per slot,
+  the only thing the hot scan reads) beside the `targets` payloads that own their name text.
+  **Policy: insert-at-front on a miss; a hit never reorders** (the entry keeps its slot), and the
+  oldest *insertion* falls off the end. That is deliberate: `list_walk`'s inner loop alternates two
+  callees (`sum/1`, `walk/3`), so an MRU move-to-front fired on every call and memmoved up to eight
+  owned entries in the innermost loop. With the fixed policy the seam's share of **retired
+  instructions** is **1.85 %** (interpreter) / **4.05 %** (baseline tier) against the un-memoized
+  derivation's 3.22 % / 7.93 %, i.e. **−0.5 % / −2.2 %** retired instructions per walked element
+  (model-free `perf stat -e cpu_core/instructions/` route, three reps agreeing to 0.01 %). An
+  un-nameable callee is memoized as `None` and is then consulted **zero** times. **Invariant: the
+  memo holds the identity derivation only — never the host's verdict**
+  (`ExecutionContext::resolve_local_call` is consulted, and spends one reduction unit, exactly once
+  per local call). Cleared by `reset` (`registers.rs`), which is what keeps the address key ABA-free;
+  a resume does not clear it.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
   `initial_call`, `current_stacktrace`, `current_module`/`active_context`) **and** the parked-`receive`
   deadline seam `Machine::wait_deadline`/`timeout_delay` + `WaitDeadline { delay_ms, resume }`: it reads the

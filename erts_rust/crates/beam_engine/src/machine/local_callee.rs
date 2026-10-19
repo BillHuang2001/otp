@@ -39,6 +39,32 @@
 //! exactly as before the cache existed, since the seam never asks the host about a
 //! fabricated name.
 //!
+//! # The replacement policy: insert-at-front on a miss, a hit never reorders
+//!
+//! The first version of this memo moved a hit to the front (an MRU cache). That is
+//! exactly the wrong policy here, and measurably so: the workload this seam is priced on
+//! (`list_walk`, `src/bench/list_walk.rs`) makes **two** local calls per walked element
+//! (`sum/1` and `walk/3`), so it **alternates** two callees and a move-to-front fires on
+//! *every* call — a `slice::rotate_right(1)` memmove of up to eight owned entries in the
+//! innermost loop. The hot path is now what it was meant to be:
+//!
+//! * **a hit reads and reorders nothing** — the entry stays where it is, so an
+//!   alternating (or round-robin) call pattern is all hits after its first cycle;
+//! * **only a miss inserts**, at the front, shifting the occupied prefix one slot back
+//!   so the **oldest insertion** falls off the end. Misses happen once per
+//!   `(module, function index)` per run, so their cost is irrelevant — a `rotate_right`
+//!   there is fine.
+//!
+//! # Why the scan is cheap
+//!
+//! The storage is split into two parallel arrays — a compact `keys: [CalleeKey; CAP]`
+//! (16 bytes per entry, so the whole key array is two cache lines) and the
+//! `targets: [Option<CalleeTarget>; CAP]` payloads, which own their name text. The scan
+//! therefore reads keys only and the payload of a slot is touched solely on a hit. The
+//! scan covers the whole fixed array with no length bound: a vacant slot is keyed on
+//! [`CalleeKey::VACANT`], which [`CalleeKey::of`] can never produce, so no match can
+//! come from past `len` and the loop is a fixed eight-iteration test.
+//!
 //! **Why the key is the module's address.** The entry belongs to a `Module` image the
 //! machine is executing, so the cheapest identity for it is its address. Address reuse
 //! (a freed image whose address a new one inherits) cannot produce a stale hit: the
@@ -60,8 +86,8 @@ use beam_loader::Module;
 ///
 /// A machine executes one module at a time and a module's local calls reach a handful
 /// of distinct callees in any one workload, so a fixed, allocation-free array is
-/// enough; the eviction policy (least recently used falls off the end) makes a cold
-/// callee merely cost one re-derivation, never a wrong answer.
+/// enough; the eviction policy (the **oldest insertion** falls off the end) makes a
+/// cold callee merely cost one re-derivation, never a wrong answer.
 const CAP: usize = 8;
 
 /// One memoized callee identity: exactly what
@@ -87,7 +113,8 @@ pub(crate) struct CalleeTarget {
 /// belongs to plus the function index within it.
 ///
 /// Both halves are immutable for a loaded module (see the module docs for why the
-/// address is a sound key).
+/// address is a sound key), and both are trivially copied, which is what makes the
+/// scan array a flat 16-byte record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CalleeKey {
     /// The address of the `Module` the function lives in.
@@ -98,7 +125,7 @@ pub(crate) struct CalleeKey {
 
 impl CalleeKey {
     /// The key of `func` in `module`.
-    #[inline]
+    #[inline(always)]
     fn of(module: &Module, func: u32) -> CalleeKey {
         CalleeKey {
             module: module as *const Module as usize,
@@ -106,40 +133,25 @@ impl CalleeKey {
         }
     }
 
-    /// The vacant slot's key: a real module reference is never null, so no key a
-    /// `resolve` builds can ever equal this one.
+    /// The vacant slot's key: a real module reference is never null, so no key
+    /// [`CalleeKey::of`] builds can ever equal this one.
     const VACANT: CalleeKey = CalleeKey { module: 0, func: 0 };
 }
 
-/// One slot: its key and its memoized identity (`None` = "un-nameable callee", or a
-/// still-vacant slot — the two differ only by their key).
-#[derive(Clone, Debug)]
-struct Entry {
-    key: CalleeKey,
-    target: Option<CalleeTarget>,
-}
-
-impl Entry {
-    /// A slot that no key matches.
-    const VACANT: Entry = Entry {
-        key: CalleeKey::VACANT,
-        target: None,
-    };
-}
-
-/// The machine's **local-callee identity memo**: a fixed, allocation-free,
-/// least-recently-used cache of the identity derivation the local-call seam performs
-/// on every local call.
+/// The machine's **local-callee identity memo**: a fixed, allocation-free cache of the
+/// identity derivation the local-call seam performs on every local call.
 ///
-/// `entries[..len]` are the occupied slots in most-recently-used-first order, so the
-/// callee a loop keeps calling sits at index 0 and a repeat call is one compare. A slot
-/// past `len` is [`Entry::VACANT`] (keyed on [`CalleeKey::VACANT`]), which is why
-/// [`LocalCallees::resolve`] can answer from the front slot unconditionally — there is
-/// no "missing" case left to panic on or to fabricate.
+/// `keys[..len]` and `targets[..len]` are the occupied slots, front (most recent
+/// insertion) first; a slot past `len` is vacant (`keys` = [`CalleeKey::VACANT`],
+/// `targets` = `None`). The split is what keeps the hot scan on the keys: the payloads
+/// own their name text and are touched only once a key has matched.
 pub(crate) struct LocalCallees {
-    /// The slots; `entries[..len]` are occupied.
-    entries: [Entry; CAP],
-    /// The occupied prefix length (`0..=CAP`).
+    /// The slot keys — the whole hot scan reads only this array.
+    keys: [CalleeKey; CAP],
+    /// The memoized identities, parallel to `keys`.
+    targets: [Option<CalleeTarget>; CAP],
+    /// The occupied prefix length (`0..=CAP`); bookkeeping for the insert shift and for
+    /// the test-only accessors (the scan itself needs no bound — see the module docs).
     len: usize,
     /// Test-only: how many times an identity was **derived** (a miss), so a test can
     /// prove the memoization count deterministically. Absent from non-test builds.
@@ -151,9 +163,8 @@ impl LocalCallees {
     /// An empty cache.
     pub(crate) fn new() -> LocalCallees {
         LocalCallees {
-            // `Entry` owns the name text, so it is not `Copy` and the array cannot be
-            // built by repetition.
-            entries: std::array::from_fn(|_| Entry::VACANT),
+            keys: [CalleeKey::VACANT; CAP],
+            targets: std::array::from_fn(|_| None),
             len: 0,
             #[cfg(test)]
             fills: 0,
@@ -167,31 +178,32 @@ impl LocalCallees {
     /// atom the module cannot resolve), which the seam treats exactly as it always
     /// has — by declining without consulting the host.
     ///
-    /// A hit moves the entry to the front (nothing moves when it is already there, the
-    /// steady state of a loop calling one callee); a miss inserts the fresh entry at the
-    /// front and lets the least recently used one fall off the end when the cache is
-    /// full.
-    #[inline]
+    /// **A hit reorders nothing** (the entry keeps its slot, which is what makes an
+    /// alternating-callee loop all hits after its first cycle); **a miss** derives once
+    /// and inserts at the front, letting the oldest insertion fall off the end when the
+    /// cache is full. `#[inline(always)]`: the body is one fixed scan, so a call that
+    /// stayed out of line would cost more than the derivation it saves.
+    #[inline(always)]
     pub(crate) fn resolve(&mut self, module: &Module, func: u32) -> &Option<CalleeTarget> {
         let key = CalleeKey::of(module, func);
-        match self.position(key) {
-            // Already the most recently used: the hot path, two loads and a compare.
-            Some(0) => {}
-            // Bring it to the front. `Entry` owns the name text, so it is not `Copy` and
-            // a rotation is the move-to-front equivalent of a `copy_within` shift.
-            Some(index) => self.entries[..=index].rotate_right(1),
-            None => self.insert(key, derive(module, func)),
+        // A hit is a read: the slot the key already occupies answers, and nothing moves.
+        if let Some(index) = self.position(key) {
+            return &self.targets[index];
         }
-        // Both arms leave `key`'s entry in the front slot, which is all this reads.
-        &self.entries[0].target
+        self.insert(key, derive(module, func));
+        &self.targets[0]
     }
 
     /// Drop every memoized entry (`Machine::reset` — the address-keyed entries are only
     /// valid for the run that filled them).
+    ///
+    /// Once per run, so a plain loop over the (fixed) payload array is the whole cost —
+    /// it is deliberately not on any hot path.
     pub(crate) fn clear(&mut self) {
-        for slot in self.entries.iter_mut() {
-            *slot = Entry::VACANT;
+        for slot in self.targets.iter_mut() {
+            *slot = None;
         }
+        self.keys = [CalleeKey::VACANT; CAP];
         self.len = 0;
     }
 
@@ -206,29 +218,33 @@ impl LocalCallees {
     /// image's address).
     #[cfg(test)]
     pub(crate) fn memoized(&self, key: CalleeKey) -> Option<&CalleeTarget> {
-        self.entries[..self.len]
-            .iter()
-            .find(|entry| entry.key == key)
-            .and_then(|entry| entry.target.as_ref())
+        self.position(key)
+            .and_then(|index| self.targets[index].as_ref())
     }
 
-    /// The occupied index whose key is `key`, if any.
-    #[inline]
+    /// The slot whose key is `key`, if any — the hot scan.
+    ///
+    /// It reads `keys` only (16 bytes per slot) and needs no length bound: a vacant
+    /// slot's key is [`CalleeKey::VACANT`], which no [`CalleeKey::of`] produces.
+    #[inline(always)]
     fn position(&self, key: CalleeKey) -> Option<usize> {
-        self.entries[..self.len]
-            .iter()
-            .position(|entry| entry.key == key)
+        self.keys.iter().position(|slot| *slot == key)
     }
 
     /// Store `target` (which may be the "un-nameable" `None`) at the front.
+    ///
+    /// The cold path: the new entry takes the front slot and the occupied prefix shifts
+    /// one place behind it. A full cache shifts the whole array, so the last (oldest)
+    /// entry is the one the new front slot overwrites — eviction and insertion are the
+    /// same move.
     fn insert(&mut self, key: CalleeKey, target: Option<CalleeTarget>) {
-        // The new entry takes the front slot and the occupied prefix shifts one place
-        // behind it. A full cache rotates the whole array, so the last (least recently
-        // used) entry is the one the new front slot overwrites — eviction and insertion
-        // are the same move.
         let span = if self.len == CAP { CAP } else { self.len + 1 };
-        self.entries[..span].rotate_right(1);
-        self.entries[0] = Entry { key, target };
+        // `keys` is `Copy`, so the shift is a `copy_within`; `targets` owns the name
+        // text, so it is a rotation (the move-to-front equivalent of a shift).
+        self.keys[..span].rotate_right(1);
+        self.targets[..span].rotate_right(1);
+        self.keys[0] = key;
+        self.targets[0] = target;
         if self.len < CAP {
             self.len += 1;
         }
@@ -293,6 +309,12 @@ mod tests {
         })
     }
 
+    /// The memo's key for `func` in `module` (the tests read the private constructor
+    /// through their parent module).
+    fn key_of(module: &Module, func: u32) -> super::CalleeKey {
+        super::CalleeKey::of(module, func)
+    }
+
     #[test]
     fn a_miss_fills_once_and_the_second_resolve_is_a_hit() {
         let module = fixture(&["a", "b"]);
@@ -322,6 +344,53 @@ mod tests {
         assert_eq!(cache.fill_count(), 2, "each new key derives once");
         assert_eq!(triple(cache.resolve(&module, 1)), Some(("m", "b", 1)));
         assert_eq!(cache.fill_count(), 2, "and is a hit afterwards");
+    }
+
+    /// **The policy this memo exists for.** A hit never reorders: an alternating
+    /// two-callee loop (what `list_walk`'s inner loop is — `sum/1` then `walk/3`) fills
+    /// both callees on its first cycle and is all hits afterwards, with **no** entry
+    /// ever moving out of its slot.
+    #[test]
+    fn a_hit_reorders_nothing_so_an_alternating_pattern_is_all_hits() {
+        let module = fixture(&["a", "b"]);
+        let mut cache = LocalCallees::new();
+        let a = key_of(&module, 0);
+        let b = key_of(&module, 1);
+
+        assert_eq!(triple(cache.resolve(&module, 0)), Some(("m", "a", 1)));
+        assert_eq!(triple(cache.resolve(&module, 1)), Some(("m", "b", 1)));
+        assert_eq!(cache.fill_count(), 2, "one derivation per callee");
+        assert_eq!(cache.position(a), Some(1), "the first callee keeps its slot");
+        assert_eq!(cache.position(b), Some(0), "the miss inserted at the front");
+
+        for _ in 0..16 {
+            assert_eq!(triple(cache.resolve(&module, 0)), Some(("m", "a", 1)));
+            assert_eq!(triple(cache.resolve(&module, 1)), Some(("m", "b", 1)));
+        }
+        assert_eq!(cache.fill_count(), 2, "an alternation never re-derives");
+        assert_eq!(cache.position(a), Some(1), "a hit moved nothing");
+        assert_eq!(cache.position(b), Some(0), "a hit moved nothing");
+    }
+
+    /// The un-nameable answers and the `None` of a vacant slot are distinguishable: a
+    /// vacated slot is skipped because its key is `VACANT`, never because its target is
+    /// `None`.
+    #[test]
+    fn a_vacant_slot_is_keyed_out_rather_than_read_as_an_unnameable_callee() {
+        let module = fixture(&["a"]);
+        let mut cache = LocalCallees::new();
+
+        // Function 7 does not exist: the memoized answer is the *un-nameable* `None`...
+        assert_eq!(triple(cache.resolve(&module, 7)), None);
+        assert_eq!(cache.fill_count(), 1);
+        assert_eq!(cache.memoized(key_of(&module, 7)), None);
+        // ... and it is a hit, not a re-derivation, on the next call.
+        assert_eq!(triple(cache.resolve(&module, 7)), None);
+        assert_eq!(cache.fill_count(), 1);
+        // A cleared cache is empty rather than full of un-nameable entries.
+        cache.clear();
+        assert_eq!(cache.len, 0);
+        assert!(cache.keys.iter().all(|key| *key == super::CalleeKey::VACANT));
     }
 
     #[test]
@@ -389,8 +458,11 @@ mod tests {
         assert_eq!(cache.fill_count(), 2, "the entry was re-derived");
     }
 
+    /// The fill order is the eviction order: only a **miss** inserts (at the front), so
+    /// a full cache drops its **oldest insertion** — and, because a hit never promotes,
+    /// touching the oldest entry does **not** save it.
     #[test]
-    fn the_cache_evicts_the_least_recently_used_entry_at_capacity() {
+    fn a_full_cache_evicts_the_oldest_insertion_and_a_hit_never_promotes() {
         let names: Vec<String> = (0..=CAP).map(|index| format!("f{index}")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let module = fixture(&names);
@@ -400,21 +472,31 @@ mod tests {
             cache.resolve(&module, func);
         }
         assert_eq!(cache.fill_count(), CAP as u64, "one derivation per slot");
-        // Touching the first entry makes the *second* one the least recently used.
+        // Every entry keeps the slot its insertion gave it: the last insertion is at the
+        // front, the first at the back.
+        assert_eq!(cache.position(key_of(&module, 0)), Some(CAP - 1));
+        assert_eq!(cache.position(key_of(&module, CAP as u32 - 1)), Some(0));
+
+        // Reading the oldest entry is a hit and promotes nothing, so it is still the
+        // entry the next miss evicts.
         assert_eq!(triple(cache.resolve(&module, 0)), Some(("m", "f0", 1)));
+        assert_eq!(cache.fill_count(), CAP as u64, "a hit derives nothing");
+
         cache.resolve(&module, CAP as u32);
         assert_eq!(cache.fill_count(), CAP as u64 + 1, "the overflow derives");
-
-        // The newest entry and the re-touched one are memoized...
         assert_eq!(
-            triple(cache.resolve(&module, CAP as u32)),
-            Some(("m", names[CAP], 1))
+            cache.position(key_of(&module, CAP as u32)),
+            Some(0),
+            "the new entry took the front slot"
         );
-        assert_eq!(triple(cache.resolve(&module, 0)), Some(("m", "f0", 1)));
-        assert_eq!(cache.fill_count(), CAP as u64 + 1, "both are hits");
+        assert_eq!(
+            cache.position(key_of(&module, 0)),
+            None,
+            "the oldest insertion fell off the end, un-promoted by its recent hit"
+        );
 
-        // ... while the least recently used one (index 1) had to be re-derived.
-        assert_eq!(triple(cache.resolve(&module, 1)), Some(("m", "f1", 1)));
+        // ... and the evicted callee re-derives once on its next call.
+        assert_eq!(triple(cache.resolve(&module, 0)), Some(("m", "f0", 1)));
         assert_eq!(cache.fill_count(), CAP as u64 + 2, "it was evicted");
     }
 }
