@@ -270,13 +270,13 @@ between sessions and up to 5× on a loaded one).
   every execution (a comprehension enters it once per byte, two commands each). An in-family re-discovery of
   the shapes was measured a **regression** (1.027× on `to_lower`), so the loader is the only route left.
   **OWNER: `crates/beam_loader`** (and `crates/beam_engine/src/lib.rs` for the `Instr` variants).
-- **`src/lib.rs` declares `families` as a private module**, so every `pub(crate)` entry point inside this node
-  (the match/dispatch/segment seams listed in `bitstrings/CONTEXT.md`) is unreachable from `src/jit/**`; a tier
-  that wants a per-command entry needs `pub(crate) mod families` or targeted root re-exports. **OWNER: the
-  parent `src/` node.**
-- **`src/exec_census.rs` is 2.12 % of `to_lower`'s self time while disabled** — the thread-local `bool`
-  load sits on the per-instruction funnel. **OWNER: the parent `src/` node.**
-## Notes for Agents
+- **`src/lib.rs` declares `families` as `pub(crate) mod families`**, so this node's `pub(crate)` entry points
+  (the match/dispatch/segment seams listed in `bitstrings/CONTEXT.md`) are reachable from `src/jit/**` directly;
+  no item inside is `pub`. `bitstrings`' `claimed(&Instr)` is the single statement of that family's variant
+  ownership, consumed by the router and by the baseline emitter.
+- **The census gate is the latched `Machine::census_on` field** — one load and a branch on the per-instruction
+  funnel, the same latched-gate idiom as `trace_on`/`reduce_on`; a disabled census performs no thread-local
+  access per instruction (figures: `../MEASURED.md`). **OWNER: the parent `src/` node.**## Notes for Agents
 - The router (`mod.rs:112`) and `lists::exec` are `#[inline]`, so a dispatched instruction hands straight to its owning family.
 - A family's `Ok(None)` is **not** a silent no-op: it reaches the router's last arm and yields the sentinel.
   The only way to "claim then no-op" would be an arm returning `Ok(Some(Step::Next))` without doing the

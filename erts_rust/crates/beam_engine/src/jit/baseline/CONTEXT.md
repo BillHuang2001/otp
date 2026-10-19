@@ -297,9 +297,10 @@ helper can have changed relative to the block's cache expectation is one written
 `pc`** — a guarded inline lowering that rejected to `jit_step_one`.
 
 What remains on this path is not in this node: `families::bitstrings`' `run_commands` (9.6 %) and
-`create::assemble` (8.8 %), `matching::exec` (7.1 %), `Machine::reset` (4.7 %, paid per timed call by the
-bench entry), `interpreter::build_label_map` (3.6 %), `Machine::local_call_seam` (2.4 %), and
-`enter_in_block`'s residual (`set_current_code` + the reduction bump + `ctx.reduce(1)`, all frozen). Within
+`create::assemble` (8.8 %), `matching::exec` (7.1 %), `Machine::local_call_seam` (2.4 %), and`enter_in_block`'s residual (`set_current_code` + the reduction bump + `ctx.reduce(1)`, all frozen). The run
+entry itself is bounded by design: `Machine::reset` refills only each register file's used extent
+(`machine/registers.rs::used_extent`) and `Machine::label_map` builds a module's map once per machine, 0 times
+on a re-entry (`machine/label_cache.rs`). Within
 this node the largest remaining row is `jit_refresh_y` (5.0 %), whose removal is unsound without closing the
 `fold_step` `pc + 1` hole described below.
 
