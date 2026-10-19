@@ -47,21 +47,27 @@
 //! (a 33-pair `MAP_EXT`), so the >32-key HAMT image carries no divergence. (The 32-key edge
 //! itself is still a flatmap in both.)
 //!
-//! ## `compressed` images: the round trip is pinned, the zlib payload is **not**
+//! ## `compressed` images: byte-identical, zlib middle included
 //! `term_to_binary(T, [compressed])` wraps the term in `VERSION_MAGIC` + `COMPRESSED` (80) +
-//! a 32-bit big-endian uncompressed size + a zlib stream. The oracle and the Rust runtime
-//! agree on the framing (the leading `<<131,80,…>>` and the size field) **and** on the
-//! trailing Adler-32 checksum, but their zlib *middle* differs byte-for-byte (different
-//! compressor output), so no case pins the compressed payload — only the `binary_to_term`
-//! round trip is asserted. Exposing only the first two bytes (`<<131,80>>`) stays safe and is
-//! pinned in `super::wire_extra`'s `co_prefix_two_value`.
+//! a 32-bit big-endian uncompressed size + a zlib stream. The compressor is libz-exact, so the
+//! two runtimes agree on the **whole image** — the framing, the size field, the zlib middle and
+//! the trailing Adler-32 checksum. The image is therefore pinned byte-for-byte (a repetitive
+//! binary, a repetitive string body, and the `{compressed,1}` / `{compressed,9}` levels), and
+//! the `binary_to_term/2` round trip is pinned as well.
+//!
+//! The **threshold** is not a byte count: the encoder compresses only when the zlib stream fits
+//! in `plain_size - 5` bytes (the COMPRESSED wrapper's own overhead), so a body whose stream
+//! would not save those five bytes stays verbatim. `lists:seq(1,255)` (a 259-byte plain image)
+//! is on the verbatim side and `lists:seq(1,256)` (522 plain, 378 compressed) on the other —
+//! both pinned as `{plain_size, compressed_size, identity}`. `[used]` reports the compressed
+//! image's whole byte count.
 //!
 //! ## The `term_to_binary/2` option matrix
 //! The last block pins the option *shapes* the encoding is driven through, each as the oracle's
 //! own stable line: `[compressed]` on a body below the compressor's threshold is a no-op, so its
 //! image is **byte-identical** to the plain one (a small tuple and the two-byte empty list), and
 //! a compressible body's COMPRESSED (80) header carries a 32-bit big-endian uncompressed-size
-//! field (pinned as the raw 4-byte field, never the zlib middle); the bare atom option
+//! field; the bare atom option
 //! `minor_version` (no `{minor_version, N}` value) is `badarg` in both runtimes; `{minor_version,1}`
 //! renders an atom as the legacy `ATOM_EXT` (100) inside a compound term; and `{minor_version,2}`
 //! keeps `BIT_BINARY_EXT` (77) for a non-byte-aligned bitstring.
@@ -1138,6 +1144,135 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- the `compressed` image is byte-identical: the compressor is libz-exact ---------
+        // The framing (VERSION_MAGIC + COMPRESSED + the 32-bit big-endian uncompressed size) and
+        // the zlib **middle** are pinned together here: the whole image, not a wrapper. Every
+        // golden is the *oracle's* own stdout line, reproduced by `beam_rt`.
+        Case {
+            id: "etf/term_to_binary_compressed_image_of_a_repetitive_binary",
+            description: "a `[compressed]` image of a 16 000-byte repetitive binary is byte-identical \
+                          to the oracle's 66-byte image",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // `binary:copy(<<"abcdefgh">>, 2000)`: `131,80`, the size field `0,0,62,133`
+                // (16005), then the zlib stream, Adler-32 included — all of it pinned.
+                expr: "term_to_binary(binary:copy(<<\"abcdefgh\">>, 2000), [compressed])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,80,0,0,62,133,120,156,237,197,55,1,0,32,12,0,176,42,195,11,171,240,224,1,233,8,33,121,114,34,202,173,173,143,153,107,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,255,254,1,66,128,139,212>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_compressed_image_of_a_2000_character_string",
+            description: "a `[compressed]` image of a 2000-character `$a` string body is byte-identical \
+                          to the oracle's 31-byte image",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // A `STRING_EXT` body of 2000 identical characters: the smallest image this
+                // encoder produces for a multi-kilobyte term (31 bytes, size field `0,0,7,211`).
+                expr: "term_to_binary(lists:duplicate(2000, $a), [compressed])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,80,0,0,7,211,120,156,203,102,191,144,56,10,70,193,40,24,5,163,96,20,140,130,33,15,0,59,30,247,49>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_compressed_level1_image",
+            description: "`[{compressed,1}]` emits the oracle's byte-exact image for a 16 000-byte body",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // The level reaches the encoder: level 1's image is 130 bytes against level 9's
+                // 66 for the identical body, and only the FLG byte differs between levels 6/9.
+                expr: "term_to_binary(binary:copy(<<\"abcdefgh\">>, 2000), [{compressed,1}])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,80,0,0,62,133,120,1,237,212,57,17,0,32,16,3,192,83,134,23,190,131,6,15,72,71,8,91,165,207,36,123,34,202,173,173,143,153,107,75,61,216,129,31,112,128,3,28,224,0,7,56,192,1,14,112,128,3,28,224,0,7,56,192,1,14,112,128,3,28,224,0,7,56,192,1,14,112,128,3,28,224,0,7,56,192,1,14,112,128,3,28,224,0,7,56,192,1,14,112,128,3,28,224,0,7,56,192,1,14,112,128,3,28,224,0,7,56,192,1,14,112,224,111,7,30,66,128,139,212>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_compressed_level9_image",
+            description: "`[{compressed,9}]` emits the oracle's byte-exact image for a 16 000-byte body",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // Identical payload to the default `[compressed]` image above, FLG `120,218`
+                // instead of `120,156`: the level byte is the only difference and it is pinned.
+                expr: "term_to_binary(binary:copy(<<\"abcdefgh\">>, 2000), [{compressed,9}])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,80,0,0,62,133,120,218,237,197,55,1,0,32,12,0,176,42,195,11,171,240,224,1,233,8,33,121,114,34,202,173,173,143,153,107,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,255,254,1,66,128,139,212>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_compressed_body_below_the_savings_threshold_is_verbatim",
+            description: "a `[compressed]` image whose zlib stream would not save the 5-byte \
+                          COMPRESSED wrapper is byte-identical to the plain image",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // The encoder compresses only if the stream fits in `plain_size - 5`; for
+                // `lists:seq(1,255)` (a 259-byte plain image) it does not, so the two images are
+                // the same 259 bytes. Pinned as the raw sizes plus the identity.
+                expr: "begin Plain = term_to_binary(lists:seq(1,255)), \
+                       Compressed = term_to_binary(lists:seq(1,255), [compressed]), \
+                       {byte_size(Plain), byte_size(Compressed), Compressed =:= Plain} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {259,259,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_compressed_body_past_the_savings_threshold",
+            description: "one element further the same body crosses the savings threshold and the \
+                          COMPRESSED wrapper really is emitted",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // `lists:seq(1,256)` is the first length whose plain image (522 bytes, since 256
+                // needs INTEGER_EXT) leaves zlib room to win: 378 bytes, wrapper included.
+                expr: "begin Plain = term_to_binary(lists:seq(1,256)), \
+                       Compressed = term_to_binary(lists:seq(1,256), [compressed]), \
+                       {byte_size(Plain), byte_size(Compressed), Compressed =:= Plain} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {522,378,false}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/binary_to_term_used_option_on_a_compressed_image",
+            description: "`binary_to_term/2` with `[used]` reports the compressed image's whole byte \
+                          count, and stops there even with trailing bytes",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                // The image is 496 bytes; `used` is 496 whether or not the buffer carries a
+                // trailing byte, because the COMPRESSED wrapper's own size field terminates it.
+                expr: "begin Image = term_to_binary(lists:seq(1,300), [compressed]), \
+                       {T1,U1} = binary_to_term(Image, [used]), \
+                       {T2,U2} = binary_to_term(<<Image/binary, 9>>, [used]), \
+                       {length(T1), U1, T2 =:= T1, U2, byte_size(Image)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {300,496,true,496,496}"),
+                exit_code: 0,
+            },
+        },
         Case {
             id: "etf/term_to_binary_bare_minor_version_is_badarg",
             description: "the bare atom option `minor_version` (no `{minor_version, N}` value) is badarg",
@@ -1724,5 +1859,83 @@ mod tests {
                 exit_code: 0,
             }
         );
+    }
+
+    /// The `compressed` image family (A.2/A.7): the shrink was byte-identity, not a shape, so
+    /// every case here pins the **whole** image (framing + size field + the zlib middle) and
+    /// never a bare `byte_size/1`. Grow this test with the group.
+    #[test]
+    fn the_compressed_image_family_pins_the_whole_image() {
+        let cases = group();
+        let find = |id: &str| cases.iter().find(|c| c.id == id).expect("registered");
+        for (id, bytes) in [
+            (
+                "etf/term_to_binary_compressed_image_of_a_repetitive_binary",
+                66,
+            ),
+            (
+                "etf/term_to_binary_compressed_image_of_a_2000_character_string",
+                31,
+            ),
+            ("etf/term_to_binary_compressed_level1_image", 130),
+            ("etf/term_to_binary_compressed_level9_image", 66),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), "value", "{id}");
+            assert_eq!(case.golden.exit_code, 0, "{id}");
+            let golden = case.golden.stdout.expect("an image golden");
+            assert!(
+                golden.starts_with("ok <<131,80,"),
+                "{id}: a compressed image starts VERSION_MAGIC + COMPRESSED (80): {golden}"
+            );
+            // The golden is the image itself: a `<<`-list of exactly `bytes` elements.
+            let elements = golden
+                .trim_start_matches("ok <<")
+                .trim_end_matches(">>")
+                .split(',')
+                .count();
+            assert_eq!(elements, bytes, "{id}: the golden must be the whole image");
+        }
+
+        // Levels 6/9 share a payload and differ only in the zlib FLG byte; level 1's stream is
+        // a different (and much longer) block choice on the same body.
+        let l6 = find("etf/term_to_binary_compressed_image_of_a_repetitive_binary")
+            .golden
+            .stdout
+            .expect("golden");
+        let l9 = find("etf/term_to_binary_compressed_level9_image")
+            .golden
+            .stdout
+            .expect("golden");
+        assert!(l6.contains(",120,156,"), "level 6 FLG is 156: {l6}");
+        assert!(l9.contains(",120,218,"), "level 9 FLG is 218: {l9}");
+        assert_eq!(
+            l6.replace(",120,156,", ",120,218,"),
+            l9,
+            "levels 6 and 9 differ only in the FLG byte on this body"
+        );
+
+        // The savings threshold: both sides of it are pinned by the raw sizes plus the identity,
+        // so a case cannot silently become a shape-only assertion.
+        for (id, stdout) in [
+            (
+                "etf/term_to_binary_compressed_body_below_the_savings_threshold_is_verbatim",
+                "ok {259,259,true}",
+            ),
+            (
+                "etf/term_to_binary_compressed_body_past_the_savings_threshold",
+                "ok {522,378,false}",
+            ),
+            (
+                "etf/binary_to_term_used_option_on_a_compressed_image",
+                "ok {300,496,true,496,496}",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.golden.stdout, Some(stdout), "{id}");
+            assert_eq!(case.golden.exit_code, 0, "{id}");
+        }
     }
 }
