@@ -145,8 +145,10 @@
 //! `zlib.beam` (`zlib.erl:100-106`: `open_nif/0` … `enqueue_nif/2`), i.e. a NIF surface a
 //! runtime has to serve rather than Erlang that can run on its own. That surface takes a
 //! per-stream resource with a controlling process, a queued-input pump and a stash, and it
-//! drives [`beam_deflate`]'s streaming entry points directly; its design is
-//! `../../ZLIB_STREAM_BRIEF.md`.
+//! drives [`beam_deflate`]'s streaming entry points directly; its contract (the state and
+//! representation, the prologue, the pump's classification order, the `beam_deflate`
+//! mapping of every key and the residual gaps) is [`stream`]'s module documentation and
+//! `CONTEXT.md` beside this file.
 //!
 //! All 19 are registered here beside the six convenience functions ([`stream`] owns the
 //! bodies), so a `zlib` stream call is served rather than reaching its

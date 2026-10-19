@@ -6,7 +6,7 @@ system oracle (OTP 29.1.1 / erts-17.1) with a `target/debug/beam_rt` built at th
 
 ## Closed here (for the record)
 `erlang:convert_time_unit/3` and `zlib:compress/1`/`uncompress/1` were registered as stdlib fast paths in
-`src/time.rs` / `src/zlib.rs`. `timer:tc/1,2,3,4` (every clause ends in `convert_time_unit(T2-T1,native,Unit)`) and
+`src/time.rs` / `src/zlib/`. `timer:tc/1,2,3,4` (every clause ends in `convert_time_unit(T2-T1,native,Unit)`) and
 the two `zlib` convenience functions therefore work:
 `beam_rt -noshell -eval 'io:format("~p~n",[element(2,timer:tc(fun() -> 1+1 end))])'` => `2` (oracle `2`);
 `... [byte_size(zlib:compress(<<"hello">>))]` => `13` (oracle `13`).
@@ -76,7 +76,7 @@ Items that **agree** (16): `status`, `message_queue_len`, `messages`, `monitors`
 - `crates/beam_rt/CONTEXT.md` still claims those three "remain defaulted `None` in `NifHostImpl`".
 
 ## Genuinely blocked in `beam_bifs`
-- `zlib:zip/1` / `zlib:unzip/1` (gzip / RFC 1952) and the whole zlib **stream** API stay `undef`: they need a
-  per-stream resource with a controlling process, and `beam_codec` exposes no gzip framing.
-- `zlib:uncompress/1` diverges for a decompressed payload above `beam_codec::compress::MAX_UNCOMPRESSED` (32 MiB):
-  `data_error` here, success in the oracle. Typed, never a wrong value.
+- `zlib:unzip/1` (raw DEFLATE, RFC 1951) keeps `beam_codec::compress::MAX_UNCOMPRESSED` (32 MiB) as its output
+  ceiling: a decompressed payload above it is `data_error` here, success in the oracle. Typed, never a wrong
+  value. `zlib:uncompress/1` carries no such ceiling (its bound is the DEFLATE format's own `1032:1` on the
+  stream's length), and `zlib:zip/1`/`gzip/1`/`gunzip/1` plus the whole 19-key stream API are served.

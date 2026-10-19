@@ -23,7 +23,7 @@
 //!
 //! # What this suite adds over the embedded goldens
 //!
-//! `src/zlib/stream/tests.rs` pins the brief's recorded goldens as constants. This file
+//! `src/zlib/stream/tests.rs` pins the recorded goldens as constants. This file
 //! re-derives every one of them from a live `erl` instead, so a golden that drifted (or
 //! was transcribed with a slip) cannot pass. It is the crate's usual live-oracle shape
 //! (`tests/zlib_oracle.rs`): **fail-loud, skip loudly without an oracle** — with no
@@ -45,7 +45,7 @@
 //!
 //! # What is covered
 //!
-//! * levels `-1, 0, 1, 2, 6, 9` × the brief's 4 × 256-byte `sync`-then-`finish` scenario
+//! * levels `-1, 0, 1, 2, 6, 9` × the goldens' 4 × 256-byte `sync`-then-`finish` scenario
 //!   **and** the one-shot `finish` scenario — leaf-size vector, total and md5 of the
 //!   concatenation, plus the bytes themselves;
 //! * the `windowBits` (`15` / `-15` / `31`) and strategy (`default`/`filtered`/
@@ -79,7 +79,7 @@ use beam_term::{is_list, make_atom, make_small, AtomTable, Eterm, NIL};
 // `zlib.erl`'s own constants
 // ---------------------------------------------------------------------------
 
-/// The sentence every fixture is built from (`ZLIB_STREAM_BRIEF.md`'s `F1` source).
+/// The sentence every fixture is built from — the source of `F1`.
 const SENTENCE: &[u8] = b"It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness, it was the epoch of belief, it was the epoch of incredulity.\n";
 
 /// `F1` — the 1024-byte pump fixture, `binary:part(binary:copy(Sentence, 6), 0, 1024)`.
@@ -361,7 +361,7 @@ fn inflate_set_dictionary(fx: &mut Fixture, handle: Eterm, data: &[u8]) -> Resul
 // ---------------------------------------------------------------------------
 
 /// What one wrapper call returned: the byte size of each iolist **leaf** (so the
-/// brief's per-call vectors stay observable) and the concatenation.
+/// golden's per-call vectors stay observable) and the concatenation.
 struct Call {
     leaves: Vec<usize>,
     bytes: Vec<u8>,
@@ -1064,7 +1064,7 @@ impl DeflateCase {
     }
 }
 
-/// The case matrix: the brief's level sweep in both scenarios, then the window-bits and
+/// The case matrix: the golden level sweep in both scenarios, then the window-bits and
 /// strategy matrix at level 6.
 fn deflate_cases() -> Vec<DeflateCase> {
     let mut cases = Vec::new();
@@ -1325,7 +1325,7 @@ fn the_deflate_transcript_matches_the_live_oracle() {
     assert_eq!(
         parse_sizes(fields[2]),
         params[1].leaves.clone(),
-        "the second call's leaf sizes (the brief's `[26, 8]`)"
+        "the second call's leaf sizes (the golden's `[26, 8]`)"
     );
     let total: usize = params.iter().map(|call| call.bytes.len()).sum();
     assert_eq!(total, fields[3].parse::<usize>().expect("a byte total"));
@@ -1335,7 +1335,7 @@ fn the_deflate_transcript_matches_the_live_oracle() {
     }
     assert_eq!(md5(&bytes), fields[4].to_ascii_uppercase(), "the md5");
     assert_eq!(hex(&bytes), fields[5].to_ascii_uppercase(), "the bytes");
-    assert_eq!(total, 36, "the brief's 36-byte total");
+    assert_eq!(total, 36, "the golden's 36-byte total");
     println!(
         "zlib_stream deflate transcript: {} cases agree with the oracle",
         cases.len()
@@ -1352,8 +1352,8 @@ fn run_params_case(fx: &mut Fixture) -> Vec<Call> {
     let last = zlib_deflate(fx, handle, b"BBBB", FINISH).expect("the last deflate");
     deflate_end(fx, handle).expect("deflateEnd");
     close(fx, handle).expect("close");
-    assert_eq!(first.leaves, vec![2], "the brief's `[2]`");
-    assert_eq!(last.leaves, vec![26, 8], "the brief's `[26, 8]`");
+    assert_eq!(first.leaves, vec![2], "the golden's `[2]`");
+    assert_eq!(last.leaves, vec![26, 8], "the golden's `[26, 8]`");
     vec![first, last]
 }
 
@@ -1559,9 +1559,9 @@ fn the_dictionary_protocol_matches_the_live_oracle() {
     let adler: u32 = oracle_fields(&stdout, "ADLER")[0]
         .parse()
         .unwrap_or_else(|e| panic!("the oracle's Adler is not an integer: {e}"));
-    assert_eq!(adler, DICT_ADLER, "the brief's dictionary Adler");
+    assert_eq!(adler, DICT_ADLER, "the golden's dictionary Adler");
     let stream = unhex(oracle_fields(&stdout, "STREAM")[0]);
-    assert_eq!(hex(&stream), DICT_STREAM, "the brief's 15-byte stream");
+    assert_eq!(hex(&stream), DICT_STREAM, "the golden's 15-byte stream");
     assert_eq!(oracle_fields(&stdout, "STREAM")[1], "15");
 
     let mut fx = Fixture::new();
@@ -1742,7 +1742,7 @@ fn the_safe_inflate_chunk_sequence_matches_the_live_oracle() {
     assert_eq!(
         oracle_fields(&stdout, "STREAM")[1],
         "494",
-        "the brief's 494-byte compressed payload"
+        "the golden's 494-byte compressed payload"
     );
 
     // The oracle's chunk sequence.
@@ -1766,7 +1766,7 @@ fn the_safe_inflate_chunk_sequence_matches_the_live_oracle() {
             ("finished".to_string(), vec![1696]),
         ]
         .to_vec(),
-        "the brief's `{{continue,[16384]}} ×6` then `{{finished,[1696]}}`"
+        "the golden's `{{continue,[16384]}} ×6` then `{{finished,[1696]}}`"
     );
     let extra = oracle_fields(&stdout, "EXTRA");
     assert_eq!(extra[0], "finished", "the trailing `safeInflate(Z, [])`");
