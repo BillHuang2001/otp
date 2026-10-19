@@ -172,6 +172,9 @@ use std::time::{Duration, Instant};
 pub mod driver;
 pub(crate) mod async_ready;
 use async_ready::AsyncReady;
+// The C's "the caller suspends until the port is idle, then the command is re-issued"
+// (`erts_port_output`'s `ERTS_PORT_OP_BUSY` arm), shared by `port_command/2,3` and `send/2,3`.
+pub(crate) mod busy_wait;
 pub(crate) mod completion;
 pub(crate) mod exit;pub(crate) mod info_extras;
 pub(crate) mod ops;
