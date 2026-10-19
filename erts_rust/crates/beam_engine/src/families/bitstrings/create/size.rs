@@ -41,6 +41,7 @@ use crate::predicates;
 use crate::Step;
 
 use super::super::goto_label;
+use super::SegOutcome;
 
 /// The reason a `bs_create_bin` segment failure (`$BS_FAIL_INFO`) raises — exactly
 /// the atom C leaves in `c_p->freason`.
@@ -143,6 +144,21 @@ pub(super) fn fail_seg(
     Ok(Err(seg_fail_step(machine, module, labels, fail, reason)?))
 }
 
+/// [`fail_seg`]'s [`SegOutcome`] form, for the out-of-line segment bodies in
+/// [`super::segments`]: the same `$BS_FAIL_INFO` discrimination, packaged as the
+/// `Step` a body hands back to [`super::assemble`].
+pub(super) fn seg_fail(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &LabelMap,
+    fail: Label,
+    reason: SegReason,
+) -> Result<SegOutcome> {
+    Ok(SegOutcome::Fail(seg_fail_step(
+        machine, module, labels, fail, reason,
+    )?))
+}
+
 /// [`fail_seg`]'s `Step` half: branch, or raise the segment failure's reason atom.
 fn seg_fail_step(
     machine: &mut Machine,
@@ -215,6 +231,19 @@ pub(super) fn segment_size(
     ctx: &mut dyn ExecutionContext,
     operand: &Operand,
 ) -> Result<SegSize> {
+    // The compiler emits a segment size as a **literal integer operand** (`<<V:8>>`
+    // is `Operand::Integer(8)`), which is by far the hottest shape here: it denotes
+    // `n` itself, so the term the general read would materialise is only read back
+    // for that same value. Short-circuit it (and `Character`, its `h`-tagged twin)
+    // exactly as [`super::super::read_size`] does, rather than paying an
+    // out-of-line `make_integer_unrooted` call for every segment; every other
+    // operand kind — a register holding a runtime `size(Expr)`, a literal — still
+    // goes through [`read_operand`].
+    match operand {
+        Operand::Integer(n) => return Ok(literal_segment_size(*n)),
+        Operand::Character(c) => return Ok(SegSize::Small(*c as usize)),
+        _ => {}
+    }
     let value = read_operand(machine, ctx, operand)?;
     if beam_term::is_small(value) {
         let n = beam_term::signed_value(value);
@@ -235,4 +264,20 @@ pub(super) fn segment_size(
     }
     // Not an integer (`:444`).
     Ok(SegSize::Fail(SegReason::BadArg))
+}
+
+/// The [`SegSize`] a literal integer-oriented operand denotes, with the **same**
+/// reason discrimination the general arm derives from the term it would have built:
+/// a negative value is `badarg` (`emu/bs_instrs.tab:431`/`:440`) whatever its
+/// magnitude, a non-negative value that fits a small is that size, and a
+/// non-negative magnitude only a bignum represents is `system_limit` (`:438`).
+#[inline]
+fn literal_segment_size(n: i64) -> SegSize {
+    if n < 0 {
+        SegSize::Fail(SegReason::BadArg)
+    } else if beam_term::try_make_small(n).is_ok() {
+        SegSize::Small(n as usize)
+    } else {
+        SegSize::Fail(SegReason::SystemLimit)
+    }
 }
