@@ -110,17 +110,19 @@
 //!    not find it (measured). This crate has no `load` session boundary (the loader owns it), so a
 //!    created type is visible immediately. Only `*tried` is pinned by the compatibility claim and it
 //!    is unaffected: the create branch reports `CREATE` either way.
-//! 6. **Not implemented (and therefore never faked):** the `ERL_NIF_SELECT_STOP` (`stop`) and `down`
-//!    *callbacks* are stored but never invoked (they are driven by `beam_io`/`beam_process`, which are
-//!    not wired to this crate), and this crate keeps no monitor tree — arming one is
-//!    `enif_monitor_process`'s host hook (`NifHost::monitor_process_result`), not a resource
-//!    registry job. What the registry *does* expose for that family is the one fact the C reads out
-//!    of the object (`ASSERT(!rsrc->monitors == !rsrc->type->fn.down)`, `erl_nif.c:3966`):
-//!    [`resource_type_has_down`], i.e. whether the object's type was opened WITH a `down` callback.
-//!    That is the C's `-1` gate (`:3968-3972`), and it must be answerable from the crate's own
-//!    knowledge, before any runtime hook is consulted. No `rt_id`/`enif_select` registration; the
-//!    type is never freed (the C frees it on module unload) — the registry is process-lifetime,
-//!    exactly like the C's global `resource_type_list`.
+//! 6. **The `ERL_NIF_SELECT_STOP` (`stop`) callback is stored but never invoked** (it is driven by
+//!    `beam_io`, which is not wired to this crate). The `down` callback **is** invoked: the registry
+//!    carries the C's per-object monitor tree as one table keyed by the 24-byte reference block
+//!    ([`Registry::monitors`], owned by [`monitors`]), [`deliver_resource_down_id`] reproduces
+//!    `erts_fire_nif_monitor` (`erl_nif.c:3058-3115`) and [`Registry::forget_object`] cancels a dying
+//!    object's monitors silently (the C's `dtor_demonitor`, `:2940-2948`). The registry also exposes
+//!    the one fact the C reads out of the object before any of that
+//!    (`ASSERT(!rsrc->monitors == !rsrc->type->fn.down)`, `erl_nif.c:3966`):
+//!    [`resource_type_has_down`], i.e. whether the object's type was opened WITH a `down` callback —
+//!    the C's `-1` gate (`:3968-3972`), answerable from the crate's own knowledge before any runtime
+//!    hook is consulted. No `rt_id`/`enif_select` registration; the type is never freed (the C frees
+//!    it on module unload) — the registry is process-lifetime, exactly like the C's global
+//!    `resource_type_list`.
 //!
 //! # The destructor's timing — the deviation the C does not let us close
 //!
@@ -278,8 +280,9 @@ struct ResourceType {
     /// `ErlNifResourceStop*` — stored, never invoked (needs `enif_select`; see the module docs).
     #[allow(dead_code)]
     stop: Option<ErlNifResourceStop>,
-    /// `ErlNifResourceDown*` — stored, never invoked (the callback needs a live monitor tree; only its
-    /// *presence* is observable, through [`resource_type_has_down`]).
+    /// `ErlNifResourceDown*` — run by [`deliver_resource_down_id`] when a monitor armed on a resource
+    /// of this type fires (`erts_fire_nif_monitor`, `erl_nif.c:3107-3108`), and observable through
+    /// [`resource_type_has_down`].
     down: Option<ErlNifResourceDown>,
     /// `ErlNifResourceDynCall*` — invoked through [`enif_dynamic_resource_call`].
     dyncall: Option<ErlNifResourceDynCall>,
@@ -323,7 +326,14 @@ struct Registry {
     /// entries are removed the moment the block is freed (see [`Registry::forget_object`]), so a
     /// stale pointer never resolves.
     objects: HashSet<usize>,
-}
+    /// The C's per-resource monitor tree (`rsrc->monitors->root`), as **one** process-wide table keyed
+    /// by the 24-byte reference block an arm stored ([`MonitorId`]).
+    ///
+    /// It lives here — under the same lock as `types`/`terms`/`objects` — rather than behind its own
+    /// mutex: the delivery path has to consult `objects` and the header refcount while holding it, and
+    /// [`Registry::forget_object`] has to cancel an object's monitors, so a second lock would invert
+    /// the order against `destroy` and deadlock. The rules it obeys are in [`monitors`].
+    monitors: HashMap<MonitorId, MonitorBinding>,}
 
 // SAFETY: the registry is a process-wide singleton guarded by a `Mutex`, and the raw pointers it
 // carries are only ever dereferenced to (a) compare a type identity, (b) read a type's callbacks and
@@ -374,10 +384,15 @@ impl Registry {
         self.terms.get(&word).copied()
     }
 
-    /// Drop every term binding to `obj` **and** its liveness registration — called as the object is
-    /// destroyed, so a term that still designates it resolves to nothing (instead of a dangling
-    /// payload pointer) and a later [`Registry::object_type`] query answers `None` rather than reading
-    /// freed memory.
+    /// Drop every term binding to `obj` **and** its liveness registration, and cancel its armed
+    /// monitors — called as the object is destroyed, so a term that still designates it resolves to
+    /// nothing (instead of a dangling payload pointer) and a later [`Registry::object_type`] query
+    /// answers `None` rather than reading freed memory.
+    ///
+    /// Cancelling the monitors is the C's `run_resource_dtor` → `dtor_demonitor` path
+    /// (`erl_nif.c:2940-2948`, `:2974-3030`): a dying resource's monitors are removed **without** a
+    /// `down` callback, so a monitor that outlived its resource never fires. The retention rule is
+    /// [`Registry::forget_monitors_for_object`]'s (the `monitors` child owns it).
     ///
     /// An object exported as a resource term holds its own reference (module docs, point 3), so a
     /// normal alloc/export/release sequence never reaches here with bindings outstanding; this fires
@@ -387,8 +402,8 @@ impl Registry {
     fn forget_object(&mut self, obj: *mut c_void) {
         self.terms.retain(|_, r| r.obj != obj);
         self.objects.remove(&(obj as usize));
-    }
-}
+        self.forget_monitors_for_object(obj);
+    }}
 
 /// The registry singleton (initialised on first use).
 fn registry() -> &'static Mutex<Registry> {
@@ -690,6 +705,38 @@ unsafe fn retain_object(obj: *mut c_void) {
     let header = unsafe { header_ptr(obj) };
     // SAFETY: `header` points at a live block whose count is non-zero (caller contract).
     unsafe { (*header).refcount.fetch_add(1, Ordering::Relaxed) };
+}
+
+/// Take one extra reference on a live resource object **only if it is still alive** — the C's
+/// `erts_refc_inc_unless(&bin->binary.intern.refc, 0, 0)` that `erts_fire_nif_monitor` takes before
+/// it runs a `down` callback (`erl_nif.c:3092`).
+///
+/// `true` means the count was non-zero and went up (the reference is now held by the caller, who must
+/// drop it through [`enif_release_resource`]). `false` means it was already **zero**: the resource is
+/// dying, so the C does **not** call `down` (`brefc == 0`, `:3093-3096`) — and neither may we, because
+/// a resource whose count reached zero is already queued for destruction, and resurrecting it would
+/// run its destructor twice.
+///
+/// # Safety
+///
+/// `obj` must be a payload pointer from [`enif_alloc_resource`] whose block is still allocated and not
+/// freed — in practice an object still registered as live ([`Registry::object_type`] answers `Some`),
+/// which is the only way `destroy` cannot have freed it.
+#[inline]
+unsafe fn retain_object_if_alive(obj: *mut c_void) -> bool {
+    // SAFETY: `obj` is a payload pointer, so its header is the `RESOURCE_HEADER_SIZE` bytes before it
+    // and lies in the same live block (caller contract).
+    let header = unsafe { header_ptr(obj) };
+    // SAFETY: `header` points at a live block; `fetch_update` reads and conditionally writes the count
+    // atomically, so a concurrent release cannot interleave between the test and the increment.
+    unsafe {
+        (*header)
+            .refcount
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count != 0).then_some(count + 1)
+            })
+    }
+    .is_ok()
 }
 
 /// `void enif_keep_resource(void* obj);`
@@ -1081,6 +1128,29 @@ mod release;
 
 pub use self::release::{release_resource_terms, resource_terms};
 
+// ---------------------------------------------------------------------------------------------
+// The monitor tree — the `down`-callback delivery seam
+// ---------------------------------------------------------------------------------------------
+
+// The C's per-resource monitor tree and the `down` delivery path live in their own file (this one is
+// at the ~1000-line target); the registry field they own is `Registry::monitors` above.
+#[path = "resources_monitors.rs"]
+mod monitors;
+
+// The binding type the registry's monitor table is keyed to.
+use self::monitors::MonitorBinding;
+
+pub use self::monitors::{
+    deliver_resource_down, deliver_resource_down_id, resource_monitors, MonitorId,
+};
+
+// The two crate-internal hooks `super::process` drives the arm/demonitor entry points through.
+pub(super) use self::monitors::{record_monitor, take_monitor};
+
 #[cfg(test)]
 #[path = "resources_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "resources_monitors_tests.rs"]
+mod monitor_tests;
