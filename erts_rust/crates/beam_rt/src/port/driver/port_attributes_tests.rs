@@ -65,13 +65,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use beam_alloc::Heap;
 use beam_abi::DriverHost;
 use beam_io::registry::PortRegistry;
-use beam_io::{DriverFlags, Poller, PortCommandOptions, PortCommandOutcome};
+// `Driver` is the trait `DriverPortAdapter::flags` is reached through (`beam_io::Driver::flags`).
+use beam_io::{Driver as _, DriverFlags, Poller, PortCommandOptions, PortCommandOutcome};
 use beam_process::{PortId, ProcessId};
 use beam_term::AtomTable;
 
 use super::{DriverPort, DriverPortAdapter, OsPidFlag};
 
-/// The fixture: one driver whose three attribute paths the `start` **mode** token selects.
+/// The fixture: one driver whose attribute paths the `start` **mode** token selects.
 ///
 /// `command` is `<object path> <erl_drv_set_os_pid address> <set_busy_port address> <marker>
 /// <mode>`, where `mode` is
@@ -79,11 +80,13 @@ use super::{DriverPort, DriverPortAdapter, OsPidFlag};
 /// * `pid` — `start` calls `erl_drv_set_os_pid(port, 4242)`;
 /// * `null` — `start` calls it with a **null** port (the C's invalid-port case);
 /// * `busy` — `start` calls `set_busy_port(port, 1)`, so a freshly opened port is busy;
+/// * `force` — as `busy`, and the port additionally records every `output` write it is handed, so
+///   a test can tell "the command was queued and written" from "the command was never queued";
 /// * `idle` — no attribute is recorded at `start`.
 ///
-/// Control verb `1` marks the port busy and verb `0` clears it, each through the real
-/// `set_busy_port` entry; both record the call in the marker so a silently-skipped request is
-/// visible.
+/// Control verb `1` marks the port busy, verb `0` clears it — both through the real
+/// `set_busy_port` entry — and verb `2` records `erl_drv_set_os_pid(port, 7777)` **after** the port
+/// came up. Every verb records the call in the marker so a silently-skipped request is visible.
 const ATTRIBUTES_C: &str = r#"
 #include <erl_driver.h>
 
@@ -103,8 +106,10 @@ typedef struct {
     rt_set_busy_fn set_busy;
     FILE *marker;
     char mode[8];
+    /* Whether `output` records the writes it is handed (`force` mode only, so the other modes'
+     * markers stay exactly the notes they made before). */
+    int count_output;
 } rt_state;
-
 /* One port per loaded object, so the state can live in this object's own storage. */
 static rt_state rt_state_storage;
 
@@ -124,6 +129,7 @@ static ErlDrvData rt_start(ErlDrvPort port, char *command) {
     object[0] = '\0';
     marker[0] = '\0';
     st->mode[0] = '\0';
+    st->count_output = 0;
     if (command == NULL)
         return (ErlDrvData) -1;
     if (sscanf(command, "%511s %lx %lx %511s %7s", object, &os_pid_addr, &busy_addr, marker,
@@ -149,10 +155,25 @@ static ErlDrvData rt_start(ErlDrvPort port, char *command) {
     } else if (strcmp(st->mode, "busy") == 0) {
         st->set_busy(port, 1);
         rt_note(st, "B", 1);
+    } else if (strcmp(st->mode, "force") == 0) {
+        /* Busy *and* watching the write path: the port is exactly the state `io.c:1763`'s
+         * `ERTS_PORT_OP_BUSY` arm is about, while `output` records whether any bytes ever reach the
+         * driver. */
+        st->set_busy(port, 1);
+        st->count_output = 1;
+        rt_note(st, "B", 1);
     }
     return (ErlDrvData) st;
 }
 
+/* `output` is the driver side of the write path: it is reached exactly when the port layer decided
+ * the command may be written (`io.c:1763`'s `ERTS_PORT_OP_DONE`), never for a `Busy` answer. */
+static void rt_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    rt_state *st = (rt_state *) drv_data;
+    (void) buf;
+    if (st != NULL && st->count_output)
+        rt_note(st, "OUT", (long) len);
+}
 static void rt_stop(ErlDrvData drv_data) {
     rt_state *st = (rt_state *) drv_data;
     if (st != NULL && st->marker != NULL) {
@@ -161,7 +182,8 @@ static void rt_stop(ErlDrvData drv_data) {
     }
 }
 
-/* `1` marks the port busy, `0` clears it — both through the real `set_busy_port` entry. */
+/* `1` marks the port busy, `0` clears it — both through the real `set_busy_port` entry — and `2`
+ * records an OS pid *after* the port is up (`erl_drv_set_os_pid`, the C's `prt->os_pid`). */
 static ErlDrvSSizeT rt_control(ErlDrvData drv_data, unsigned int cmd, char *buf,
                                ErlDrvSizeT len, char **rbuf, ErlDrvSizeT rlen) {
     rt_state *st = (rt_state *) drv_data;
@@ -169,11 +191,16 @@ static ErlDrvSSizeT rt_control(ErlDrvData drv_data, unsigned int cmd, char *buf,
     (void) len;
     (void) rbuf;
     (void) rlen;
-    if (st == NULL || st->set_busy == NULL)
+    if (st == NULL || st->set_busy == NULL || st->set_os_pid == NULL)
         return (ErlDrvSSizeT) -1;
     if (cmd == 1 || cmd == 0) {
         st->set_busy(st->port, (int) cmd);
         rt_note(st, "B", (long) cmd);
+        return (ErlDrvSSizeT) 0;
+    }
+    if (cmd == 2) {
+        st->set_os_pid(st->port, 7777);
+        rt_note(st, "OS", 7777);
         return (ErlDrvSSizeT) 0;
     }
     return (ErlDrvSSizeT) -1;
@@ -183,7 +210,7 @@ static ErlDrvEntry rt_attributes_entry = {
     .init = NULL,
     .start = rt_start,
     .stop = rt_stop,
-    .output = NULL,
+    .output = rt_output,
     .ready_input = NULL,
     .ready_output = NULL,
     .driver_name = RT_ATTRIBUTES_NAME,
@@ -512,6 +539,10 @@ struct Open {
     fixture: Fixture,
     /// The port's OS-pid handle — the very one the driver's `erl_drv_set_os_pid` call writes.
     os_pid: OsPidFlag,
+    /// The [`beam_io::Driver::flags`] the adapter reported **before** it was boxed into the port —
+    /// the registry offers no accessor for it, and it is the flag word `Port::command` decides
+    /// `[force]` on.
+    flags: DriverFlags,
     /// The poller the port is registered with.
     poller: Poller,
     /// The registry the port lives in.
@@ -549,6 +580,9 @@ fn open_port(stem: &str, driver_flags: &str, mode: &str) -> Option<Open> {
         command,
     )
     .expect("the fixture driver loads");
+    // Read before the adapter is boxed: `flags()` is the driver's own entry word (the C's
+    // `ERL_DRV_FLAG_SOFT_BUSY`), which no registry accessor exposes afterwards.
+    let flags = adapter.flags();
     let mut poller = Poller::new().expect("a poller");
     let mut ports = PortRegistry::new();
     let id = ports
@@ -557,6 +591,7 @@ fn open_port(stem: &str, driver_flags: &str, mode: &str) -> Option<Open> {
     Some(Open {
         fixture,
         os_pid,
+        flags,
         poller,
         ports,
         id,
@@ -641,10 +676,65 @@ fn a_null_port_records_no_os_pid() {
     fixture.cleanup();
 }
 
+/// The driver records its OS pid **after** the port came up, from a `control` callback, and the
+/// value `port_info(Port, os_pid)` would report turns from `undefined` into that pid.
+///
+/// The C initialises `prt->os_pid` to `-1` (`io.c:386`) and `erl_bif_info.c:3814-3817` renders the
+/// unset sentinel as the atom `undefined`; `erl_drv_set_os_pid` (`io.c:2971`) writes the pid the
+/// driver's own child actually got. So on a live port that no callback has told yet the answer is
+/// `None`, and after verb `2`'s `erl_drv_set_os_pid(port, 7777)` it is `Some(7777)`.
+///
+/// The assertion stops at the flag the answer is read from: the `port_info/2` item itself is
+/// [`PortRegistry::info`]'s `os_pid` arm, which is out of this row's scope (and this suite's
+/// subject — the attribute *recorded* by the driver, not the rendering of the item).
+#[test]
+fn a_control_driven_set_os_pid_turns_the_unset_attribute_into_the_new_pid() {
+    let Some(mut open) = open_port("rt_attr_os_pid_control", "0", "idle") else {
+        return;
+    };
+    assert!(
+        open.fixture.notes().is_empty(),
+        "the idle start token records no attribute"
+    );
+    assert_eq!(
+        open.os_pid.get(),
+        None,
+        "before any driver call the C's `prt->os_pid` is -1, i.e. `port_info(Port, os_pid)` = undefined"
+    );
+
+    // Verb 2: the driver's own `erl_drv_set_os_pid(port, 7777)`, on a port that is already up.
+    let reply = open
+        .ports
+        .port_control(&mut open.poller, open.id, "2", &[])
+        .expect("control verb 2 runs");
+    assert!(
+        reply.is_empty(),
+        "the fixture's os_pid verb answers no bytes"
+    );
+    assert_eq!(
+        open.fixture.notes(),
+        vec!["OS:7777".to_string()],
+        "the fixture did call the real erl_drv_set_os_pid entry point, from `control`"
+    );
+    assert_eq!(
+        open.os_pid.get(),
+        Some(7777),
+        "the pid a control callback recorded is what port_info(Port, os_pid) reports from then on"
+    );
+    let Open {
+        fixture,
+        mut poller,
+        mut ports,
+        id,
+        ..
+    } = open;
+    ports.close(&mut poller, id).expect("the port closes");
+    fixture.cleanup();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Part B — the busy state and the entry flags, through `beam_io`'s seam
 // ---------------------------------------------------------------------------------------------
-
 /// The `beam_io::Driver` seam reports the driver's real busy state, so `PortRegistry::is_busy` and
 /// `Port::command`'s `ERTS_PORT_OP_BUSY` arm follow the driver's own `set_busy_port` requests:
 /// `start` marks the port busy (nothing is queued, no write is scheduled), verb `0` clears it (the
@@ -794,6 +884,115 @@ fn a_driver_without_the_soft_busy_flag_refuses_force_in_both_states() {
         )
         .expect_err("the flag decides, not the state");
     assert_eq!(err.as_atom(), Some("notsup"));
+    let Open {
+        fixture,
+        mut poller,
+        mut ports,
+        id,
+        ..
+    } = open;
+    ports.close(&mut poller, id).expect("the port closes");
+    fixture.cleanup();
+}
+
+/// A `SOFT_BUSY` driver's **busy** port: `[force]` is written through, while the plain and
+/// `[nosuspend]` commands are the C's `ERTS_PORT_OP_BUSY` — nothing queued, so the driver is never
+/// reached. The driver side of that distinction is the point: its `output` callback records every
+/// write it is handed, and the busy arms produce no `OUT:` note at all.
+///
+/// The oracle: `port_command(P, Data, [force])` on a driver whose entry carries
+/// `ERL_DRV_FLAG_SOFT_BUSY` answers `true` **whatever the port's state** — the flag word is what
+/// `erl_bif_port.c:195-198` reads, and under `ERTS_PORT_SIG_FLG_FORCE` the C zeroes `busy_flgs`
+/// (`io.c:1731`), so the `ERTS_PORT_OP_BUSY` arms are unreachable. Without the flag it is the
+/// sibling row's `error:notsup`. A plain or `[nosuspend]` command on a busy port is
+/// `ERTS_PORT_OP_BUSY` (`io.c:1763-1769`): the bytes are **not** queued and the caller re-issues
+/// them once the driver clears the state, so exactly one of the three commands can ever appear at
+/// the driver's `output`.
+#[test]
+fn a_soft_busy_driver_takes_force_while_busy_and_the_busy_arms_reach_no_write() {
+    let Some(mut open) = open_port("rt_attr_busy_force", "ERL_DRV_FLAG_SOFT_BUSY", "force") else {
+        return;
+    };
+    assert!(
+        open.flags.contains(DriverFlags::SOFT_BUSY),
+        "the entry declares ERL_DRV_FLAG_SOFT_BUSY, so `flags()` must report the bit"
+    );
+    assert_eq!(
+        open.fixture.notes(),
+        vec!["B:1".to_string()],
+        "the `force` start token marked the port busy and recorded no write"
+    );
+    assert!(
+        open.ports.is_busy(open.id).expect("a live port"),
+        "the driver marked its port busy at start"
+    );
+
+    // The two busy arms: the C's ERTS_PORT_OP_BUSY — no queueing, no task, no write.
+    assert_eq!(
+        open.ports
+            .port_command_with(&mut open.poller, open.id, b"hi", PortCommandOptions::EMPTY)
+            .expect("a busy port is not an error"),
+        PortCommandOutcome::Busy,
+        "a plain command on the busy port is `ERTS_PORT_OP_BUSY`"
+    );
+    assert_eq!(
+        open.ports
+            .port_command_with(
+                &mut open.poller,
+                open.id,
+                b"hi",
+                PortCommandOptions::EMPTY.with_nosuspend(true)
+            )
+            .expect("a busy port is not an error"),
+        PortCommandOutcome::Busy,
+        "`[nosuspend]` is the same busy arm: the runtime answers `false` rather than waiting"
+    );
+    let round = open
+        .ports
+        .execute_port_tasks(&mut open.poller, 1024)
+        .expect("an empty round runs");
+    assert_eq!(round.ran, 0, "a `Busy` answer schedules no `OUTPUT` task");
+    assert_eq!(
+        open.fixture.notes(),
+        vec!["B:1".to_string()],
+        "neither busy command reached the driver's `output`: nothing was queued"
+    );
+    assert_eq!(
+        open.ports.get(open.id).expect("live").output_len(),
+        0,
+        "the busy arms leave the output queue empty"
+    );
+
+    // `[force]` on that very busy port: `Done`, and the bytes really reach the driver.
+    assert_eq!(
+        open.ports
+            .port_command_with(
+                &mut open.poller,
+                open.id,
+                b"hi",
+                PortCommandOptions::EMPTY.with_force(true)
+            )
+            .expect("a soft-busy driver takes a forced command"),
+        PortCommandOutcome::Done,
+        "`[force]` bypasses the busy state (`io.c:1731`), so the command is queued"
+    );
+    assert_eq!(
+        open.ports.get(open.id).expect("live").output_len(),
+        2,
+        "the forced command is queued for the write path"
+    );
+    open.ports
+        .execute_port_tasks(&mut open.poller, 1024)
+        .expect("the OUTPUT task runs");
+    assert_eq!(
+        open.fixture.notes(),
+        vec!["B:1".to_string(), "OUT:2".to_string()],
+        "exactly one write reached the driver — the forced one, with the command's two bytes"
+    );
+    assert!(
+        open.ports.is_busy(open.id).expect("a live port"),
+        "`[force]` bypasses the state for one command; it does not clear it"
+    );
     let Open {
         fixture,
         mut poller,
