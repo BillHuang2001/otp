@@ -1050,7 +1050,16 @@ fn drive(
     // interpreter's: what this slice charged, read back through `Machine::reductions`.
     machine.reduce_on = ctx.wants_reduce();
     let reduce_on = machine.reduce_on;
-    machine.reductions = 0;    // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
+    machine.reductions = 0;
+    // Latch the per-run dynamic-census gate too, exactly as `Machine::drive` does: the
+    // tier's per-instruction deopt helper (`jit_step_one` ->
+    // `Machine::step_instruction_with_entry`) is the same census funnel the interpreter
+    // uses, so the two drivers must agree or a deopt step would be counted on one tier
+    // and not the other. The default (census off) costs one `bool` load per instruction
+    // here and no TLS access at all. (The traced early return above delegates to
+    // `Machine::drive`, which latches the gate itself.)
+    machine.census_on = crate::exec_census::is_enabled();
+    // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.
     let x_regs: *mut Eterm = machine.x.as_mut_ptr();

@@ -494,6 +494,33 @@ pub struct Machine {
     /// `Machine::step_instruction` call in a test) cannot leak a stale value from an
     /// earlier run.
     pub(crate) bif_in_machine_on: bool,
+    /// The **per-run dynamic-census gate**: a copy of the thread's
+    /// [`exec_census::is_enabled`](crate::exec_census::is_enabled) state, taken at the
+    /// run/resume entry.
+    ///
+    /// The dynamic execution census ([`crate::exec_census`]) is a thread-local
+    /// instrument, and its recording site sits on the **hottest** path the engine has
+    /// (the per-instruction funnel
+    /// [`Machine::step_instruction_inner`](crate::machine::Machine)), where it runs once
+    /// per interpreted instruction. Asking the thread-local flag there costs a TLS
+    /// access per instruction even when nothing is counting, so the entry latches the
+    /// answer into this plain field instead: the funnel pays one `bool` load and a
+    /// branch and **never touches TLS while the census is off**.
+    ///
+    /// **Semantics.** The flag is latched at a run/resume entry — by
+    /// [`Machine::drive`](crate::machine::Machine) for the interpreter **and** by the
+    /// native baseline tier's own driver — so both tiers see the same answer, and
+    /// turning counting **on** mid-run takes effect at the run's (or resume's) *next*
+    /// entry. Every consumer enables before it runs
+    /// (`jit::baseline::census::dynamic_execution_census`, `tests/dynamic_census.rs`,
+    /// `tests/real_beam_variant_proofs`), so no existing count changes. Turning it
+    /// **off** mid-run stops counting at the next instruction, because each recorder
+    /// re-checks the thread flag (a stricter, never a laxer, answer than the latch).
+    ///
+    /// [`Machine::reset`](crate::machine::Machine::reset) leaves it `false`, so a run
+    /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
+    /// test) cannot leak a stale `true` from an earlier counted run.
+    pub(crate) census_on: bool,
     /// The **local-callee identity memo** the local-call seam consults on every local
     /// `call`/`call_only`/`call_last` ([`Machine::local_call_seam`]).
     ///
@@ -621,6 +648,7 @@ impl Machine {
             trace_on: false,
             reduce_on: false,
             bif_in_machine_on: false,
+            census_on: false,
             local_callees: LocalCallees::new(),
             current_code: None,
             entry_call: None,

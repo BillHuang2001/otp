@@ -26,11 +26,17 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   `crate::interpreter::ImportFrame` (its variants inherit that visibility, so a sibling module can name
   `crate::interpreter::ImportFrame::Call`).
   **The dynamic execution census hooks live here.** `step_instruction_inner` looks the instruction up, calls
-  `crate::exec_census::on_instruction(instr)` (**before** the effect), delegates the effect to
+  `crate::exec_census::on_instruction(instr)` (**before** the effect) when the run's latched gate
+  `Machine::census_on` is set, delegates the effect to
   `step_instruction_body(instr, …)` (the original `match instr` arms, byte-identical — the split exists so that an
   error propagated by `?` *inside* one arm, which returns from the body rather than falling out of the `match`, is
-  still observed) and then calls `crate::exec_census::on_error(instr, err)` for an `Err` result. Both hooks are one
-  thread-local `bool` load when the census is disabled.
+  still observed) and then calls `crate::exec_census::on_error(instr, err)` for an `Err` result, re-reading the
+  same gate. The gate is a plain `bool` field the drivers latch once per run/resume entry
+  (`Machine::drive` and the native tiers' driver), so a disabled census costs **one load and a branch and zero
+  thread-local accesses per instruction** — reading `exec_census`'s thread-local here had measured 2.12 % of a
+  `foreign/bstr_to_lower` workload while counting was off. The gate is deliberately **not** cached in a local
+  across `step_instruction_body`: the error arm is the only other reader, and holding it live across that call
+  costs the hot frame a callee-saved register (measured: +4.5 % on `list-walk/1` vs −5.2 % with the re-read).
 - `bif.rs` — `exec_bif` (`gc_bif`/`bif`/`bif0` operand marshalling + the fail-label/raise split), `call_import`
   (`call_ext*`), `raise_bif_error` (the catch-aware raise, shared with the families — `families::funs::apply_target`
   for an applied-target host BIF error, and `families::funs::call_fun` for the closure-apply fallback),

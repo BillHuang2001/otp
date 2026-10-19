@@ -424,6 +424,11 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // run entry (`Machine::drive`); clearing it here keeps a run that never
         // latches it from inheriting a stale value.
         self.reduce_on = false;
+        // The dynamic-census gate is the same kind of per-run latch (a copy of the
+        // thread's `exec_census` enable state, taken at the run entry); clearing it
+        // here keeps a run that never latches it — a bare `step_instruction` in a
+        // test — from inheriting a stale `true` from an earlier counted run.
+        self.census_on = false;
     }
 }
 

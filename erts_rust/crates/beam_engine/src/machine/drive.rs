@@ -122,6 +122,14 @@ impl Machine {
         // plain `call_bif` path byte-identical and pays one `bool` load instead of an
         // extra vtable crossing.
         self.bif_in_machine_on = ctx.wants_bif_in_machine();
+        // Latch the per-run dynamic-census gate too (see the `Machine::census_on` field
+        // docs): the census recorder runs once per *interpreted instruction*, and it is
+        // enabled only while a measurement is in progress, so its thread-local flag is
+        // copied here and the funnel then pays one `bool` load instead of a TLS access on
+        // every instruction. The native tiers' driver latches the same answer, so a
+        // deopt step is counted on both tiers; a natively-inlined instruction stays
+        // unobservable either way (the census's documented blind spot).
+        self.census_on = crate::exec_census::is_enabled();
         // One `drive` call is one scheduling slice, so the reduction counter starts
         // here (the ERTS process counter, `c_p->fcalls`, is likewise reset when a
         // process is scheduled in; the host reads the count when the slice returns).
