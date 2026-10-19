@@ -8096,7 +8096,7 @@ fn door_line(door: gc::valve_counters::Door, counts: &gc::valve_counters::DoorCo
     format!(
         "{door:?}: reached={} occupancy={} debt={} forced={} latch_open={} hits={} \
          [machine_root={} process_root={} descent={}] descents={} collections={} machine_words={} \
-         declared_words={} published_words={}",
+         declared_words={} published_words={} stack_words={}",
         counts.reached,
         counts.occupancy,
         counts.debt,
@@ -8111,6 +8111,7 @@ fn door_line(door: gc::valve_counters::Door, counts: &gc::valve_counters::DoorCo
         counts.machine_words,
         counts.declared_words,
         counts.published_words,
+        counts.stack_words,
     )
 }
 
@@ -8167,13 +8168,14 @@ fn fallback_line(counters: &gc::valve_counters::ValveCounters) -> String {
 /// 5. the arena fallbacks collapse with it — from ≈ 1 per iteration, all of them attributed to a
 ///    refused rooted collection ([`gc::valve_counters::FallbackSite::ValveDeclined`]), to
 ///    (essentially) zero and **flat** in `N`;
-/// 6. each reach's per-word classification covers only the door's **published** region — each
-///    register file's pointer-bearing prefix plus the whole Erlang stack
-///    ([`gc::valve_counters::DoorCounts::published_words`]) — inside a hand-off
-///    ([`gc::valve_counters::DoorCounts::machine_words`]) that is the machine's **used extent** of
-///    each file (`Machine::with_roots`), never a whole 1024-slot file pair: a handful of words per
-///    reach. What collapsed is the number of reaches, so the workload's total classification work
-///    is a fraction of a word per **iteration**.
+/// 6. each reach's hand-off is the machine's **used extent**, never a whole register file: the door
+///    *declares* the x file's used extent, the whole Erlang stack and the FR file's used extent
+///    ([`gc::valve_counters::DoorCounts::declared_words`] — the same number as
+///    [`gc::valve_counters::DoorCounts::machine_words`]) and *publishes* each register file's
+///    pointer-bearing prefix plus the whole stack
+///    ([`gc::valve_counters::DoorCounts::published_words`], whose stack share is
+///    [`gc::valve_counters::DoorCounts::stack_words`]). What collapsed is the number of reaches, so
+///    the workload's total classification work is a fraction of a word per **iteration**.
 ///
 /// A missing `erlc` is a **loud skip**, never a silent pass.
 #[test]
@@ -8361,48 +8363,88 @@ fn the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve() {
         "collections must be real but rare next to the iterations: {} for N={LARGE}",
         large.stats.collections,
     );
-    // (5) The door's root-word figure is the size of the root set the **engine handed it**, and
-    //     that is a prefix of each register file, never the whole file: `RootSet::x`/`RootSet::fr`
-    //     arrive as the machine's **used extents** (`Machine::with_roots` → `used_x_extent`/
-    //     `used_fr_extent`; every slot past the extent is `NIL` by the refill invariant), and the
-    //     door bounds each of them again to its pointer-bearing prefix (`machine_root_bounds` →
-    //     `pointer_prefix_len`). So `machine_words`/`declared_words` — one figure, recorded by both
-    //     `note_reached` and `note_root_words` — is that hand-off's
-    //     `x.len() + stack.len() + fr.len()`, and `published_words` is the strictly smaller region
-    //     phase 1 classifies and the hand-off publishes: pointer-bearing x prefix + the whole
-    //     Erlang stack + pointer-bearing FR prefix. The per-file arithmetic is pinned
-    //     deterministically beside the door
-    //     ([`the_full_root_doors_publish_only_the_pointer_bearing_prefix_of_each_register_file`]);
-    //     what this end-to-end case adds is that the *machine's* own hand-off keeps a real
-    //     workload's per-reach figure far below `2 * MAX_REGISTER` — the most the two handed files
-    //     can hold between them, and exactly what a whole-file hand-off passes (here: ≈5.5 words
-    //     handed and ≈4 published per reach, the shallow Erlang stack included) — so a reach's
-    //     classification work stays proportional to what the run used.
+    // (5) The door's root-word records are two halves of **one** measurement, taken by the single
+    //     `note_root_words` call of each reach (`gc.rs`'s `EnsureHeapFull` / `AllocWordsRooted`
+    //     arms, right beside `note_reached`): `declared_words` is the size of the root set the
+    //     machine actually hands over — the x file's **used extent**, the whole Erlang stack and
+    //     the FR file's used extent (`Machine::with_roots`,
+    //     `beam_engine/src/machine/mod.rs:768-782`; the frozen root-set contract in
+    //     `beam_engine/src/context.rs:199-208`: "each carries the file's *used extent* … never a
+    //     whole file"), and `published_words` is each register file's **pointer-bearing prefix**
+    //     plus the whole stack (`machine_root_bounds`, `gc.rs:659-661`) — the exact words phase 1
+    //     seeds and `publish_roots_full` pushes. `machine_words` is that same declared figure,
+    //     recorded beside it by `note_reached`, so the pair states the bound as a **structure**:
+    //     the pointer-bearing prefix can never exceed the slice it prefixes, the hand-off carries
+    //     the whole stack, and every reach publishes a non-empty root set.
     assert_eq!(
-        full.machine_words, full.declared_words,
-        "the reach counter and the root-word counter record one declared figure: {}/{}",
-        full.machine_words, full.declared_words,
+        full.declared_words, full.machine_words,
+        "the declared figure and `machine_words` are one reading of the same call: {}/{} for \
+         reached={}",
+        full.declared_words, full.machine_words, full.reached,
+    );
+    assert_eq!(
+        rooted.declared_words, rooted.machine_words,
+        "the same identity holds at the rooted seam: {}/{} for reached={}",
+        rooted.declared_words, rooted.machine_words, rooted.reached,
+    );
+    assert!(
+        full.published_words <= full.declared_words,
+        "the pointer-bearing prefix of each register file plus the whole stack can never exceed \
+         what the machine handed over: published={} declared={} for reached={}",
+        full.published_words,
+        full.declared_words,
+        full.reached,
+        full.machine_words as f64 / full.reached as f64,
+    );
+    assert!(
+        rooted.published_words <= rooted.declared_words,
+        "the same bound holds at the rooted seam: published={} declared={}",
+        rooted.published_words,
+        rooted.declared_words,
+    );
+    assert!(
+        full.stack_words > 0,
+        "the driver's door really hands an Erlang stack over — without it the whole-stack half of \
+         the hand-off would be vacuous: stack_words={} for reached={}",
+        full.stack_words,
+        full.reached,
+    );
+    assert!(
+        full.stack_words <= full.published_words,
+        "the whole stack is inside the published figure (the stack is published whole, never \
+         bounded to a pointer-bearing prefix): stack_words={} published={}",
+        full.stack_words,
+        full.published_words,
     );
     assert!(
         full.published_words >= full.reached,
-        "every reach publishes at least one root word — the whole Erlang stack is never omitted: \
+        "every reach must publish a non-empty root set (at least one word classified): \
          published={} reached={}",
         full.published_words,
         full.reached,
     );
+    // ...and the register files really contribute to it (measured: 1 and 2 pointer-bearing x words
+    // on the driver's two reach shapes), so a reach whose register-file half collapsed to "nothing
+    // beyond the stack" fails here rather than hiding behind the stack share.
     assert!(
-        full.published_words <= full.machine_words,
-        "the pointer-prefix bound can only omit words: published={} declared={}",
+        full.published_words - full.stack_words >= full.reached,
+        "each reach must classify at least one pointer-bearing register word beyond the whole \
+         stack: published={} stack={} for reached={}",
         full.published_words,
-        full.machine_words,
-    );
-    assert!(
-        full.machine_words < full.reached * 2 * beam_engine::MAX_REGISTER as usize,
-        "a reach is handed the machine's used extent, never a whole register-file pair: \
-         declared={} over reached={} ({:.2} words/reach)",
-        full.machine_words,
+        full.stack_words,
         full.reached,
-        full.machine_words as f64 / full.reached as f64,
+    );
+    // The declared figure is the handed slices' **used extent**, not the physical files: the
+    // engine's register files are 1024 slots each, so a door that recorded whole files would
+    // declare ~2 Ki words per reach.
+    const FILE_WORDS: usize = 1_024;
+    assert!(
+        full.declared_words * 8 < full.reached * 2 * FILE_WORDS,
+        "the declared figure is the handed slices' used extent, never a whole 1 Ki x + FR pair: \
+         declared={} for reached={} (whole files would be {})",
+        full.declared_words,
+        full.reached,
+        full.reached * 2 * FILE_WORDS,
     );
     let total_words = full.machine_words + rooted.machine_words;
     assert!(

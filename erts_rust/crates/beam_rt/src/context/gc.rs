@@ -1334,6 +1334,7 @@ pub(crate) fn ensure_heap_full(
         valve_counters::Door::EnsureHeapFull,
         roots.x.len() + roots.stack.len() + roots.fr.len(),
         x_count + roots.stack.len() + fr_count,
+        roots.stack.len(),
     );
     // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root in
     // a region the collector does not scan declines the move (see [`root_is_unscanned`]), so the
@@ -1702,6 +1703,7 @@ pub(crate) fn alloc_words_rooted(
         valve_counters::Door::AllocWordsRooted,
         roots.x.len() + roots.stack.len() + roots.fr.len(),
         x_count + roots.stack.len() + fr_count,
+        roots.stack.len(),
     );
     let machine_roots = || {
         roots.x[..x_count]
@@ -1882,6 +1884,11 @@ pub(crate) mod valve_counters {
         /// `Walk::seed` loop over the caller's own root set, and of the region
         /// [`super::publish_roots_full`] pushed onto the process stack.
         pub(crate) published_words: usize,
+        /// The **Erlang-stack** words among [`Self::published_words`]: the stack is published
+        /// whole (it has no pointer-only prefix property — every slot of a live frame is a
+        /// root), so this figure is both the declared and the published stack share. Recorded
+        /// so a measurement can tell a hand-off that carries a stack from one that does not.
+        pub(crate) stack_words: usize,
     }
 
     impl DoorCounts {
@@ -1901,6 +1908,7 @@ pub(crate) mod valve_counters {
             machine_words: 0,
             declared_words: 0,
             published_words: 0,
+            stack_words: 0,
         };
     }
 
@@ -2077,17 +2085,24 @@ pub(crate) mod valve_counters {
         });
     }
 
-    /// Records one valve call's **root-word bound**: the words the caller *declared* and the words
-    /// the door actually **handed over** (`published_words`). Called by the two full-root doors
-    /// next to [`note_reached`], once per reach, so a test can pin the bound as a **structure** —
-    /// the words the bound omits are exactly the declared words minus the published ones — rather
+    /// Records one valve call's **root-word bound**: the words the caller *declared*, the words
+    /// the door actually **handed over** (`published_words`) and the share of them that is the
+    /// whole Erlang stack (`stack_words`). Called by the two full-root doors next to
+    /// [`note_reached`], once per reach, so a test can pin the bound as a **structure** — the
+    /// words the bound omits are exactly the declared words minus the published ones — rather
     /// than as a wall clock (see [`DoorCounts::published_words`]).
-    pub(crate) fn note_root_words(door: Door, declared_words: usize, published_words: usize) {
+    pub(crate) fn note_root_words(
+        door: Door,
+        declared_words: usize,
+        published_words: usize,
+        stack_words: usize,
+    ) {
         COUNTERS.with(|counters| {
             let mut value = counters.get();
             let tally = value.door_mut(door);
             tally.declared_words += declared_words;
             tally.published_words += published_words;
+            tally.stack_words += stack_words;
             counters.set(value);
         });
     }
