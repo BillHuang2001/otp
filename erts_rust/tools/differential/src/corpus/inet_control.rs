@@ -62,6 +62,20 @@
 //!   the numeric forms `0…4` are accepted while `3`/`8`/`16` are `{error, einval}` and leave
 //!   the previous mode untouched.
 //!
+//! * **`packet4_framed_read`** — the framed **read** path: with `{packet, 4}` on the accepted
+//!   socket (plus `{active, true}`) the client's `<<0,0,0,5,"hello">>` arrives as one
+//!   `{tcp, A, <<"hello">>}` message — the four-byte prefix consumed, the payload handed up as
+//!   the whole frame — and `inet:getopts/2` echoes the mode.
+//! * **`packet2_framed_read`** — the same for the two-byte prefix: `<<0,5,"hello">>` arrives as
+//!   `{tcp, A, <<"hello">>}`.
+//! * **`line_framed_read`** — the `line` parser: `<<"hello\r\nworld">>` yields
+//!   `{tcp, A, <<"hello\r\n">>}` (the EOL is part of the frame) and the unterminated
+//!   `<<"world">>` tail withholds a message, so the bounded `after` answers `timeout2`.
+//! * **`packet4_framed_read_buffers_across_segments`** — the frame boundary is the socket, not the
+//!   segment: a lone `<<0,0>>` (a truncated prefix) delivers nothing (`partial_pending`), the
+//!   completing `<<0,5,"hello",0,0,0,2,"ab">>` delivers `<<"hello">>` and `<<"ab">>` as **two**
+//!   messages, and the mode is inherited from the listening socket's `{packet, 4}`
+//!   (`inet:getopts/2` on the accepted socket echoes it).
 //! * **`tcp_send_listening_and_connected`** — `gen_tcp:send/2`'s two answers against one
 //!   listener: `{error, enotconn}` on the listening socket itself, then `ok` on the socket a
 //!   `gen_tcp:connect/3` + `gen_tcp:accept/1` produced.
@@ -88,23 +102,34 @@
 //! `is_integer/1` + `P > 0`, or used once as an argument (the `eaddrinuse`, closed-socket and
 //! data-path rows) where only the resulting `posix()` reason or payload is observed. Every socket
 //! and port is closed before the row answers, so no row leaks a descriptor into the next one.
-//! The two delivery rows wait with a bounded `receive … after 1000 -> timeout end` whose
-//! **oracle** answer is the golden, and the bytes they deliver are already queued in the kernel
-//! by a *previous, completed* `send`, so neither depends on host load — and a lost datagram or a
-//! dropped connection would show up as the `timeout` answer, i.e. as a visible mismatch, never as
-//! a silent pass.
+//! The delivery rows wait with a bounded `receive … after N -> timeout end` (1000 ms, or 300 ms
+//! for the truncated-frame probe) whose **oracle** answer is the golden, and the bytes they
+//! deliver are already queued in the kernel by a *previous, completed* `send`, so neither depends
+//! on host load — and a lost datagram, a dropped connection or an unparsed frame would show up as
+//! the `timeout` answer, i.e. as a visible mismatch, never as a silent pass.
+//!
+//! The framed **read** rows send their bytes from a socket left in `{packet, 0}`, with the length
+//! prefix written out literally (`<<0,0,0,5,"hello">>`). That is deliberate: the read-side parser
+//! is what they pin, and the *write*-side framing — a block framing mode on the sending socket —
+//! is a measured divergence (next section).
 //!
 //! # Measured shapes that are deliberately NOT cases (handoffs, never `mismatch`-pinned)
 //!
 //! Verified in this environment (oracle OTP 29.1.1 / `erts-17.1`; the built `beam_rt`) by
 //! running the *same* expression under both runtimes:
 //!
-//! * **a framed stream read delivers nothing (`beam_rt`).** With `{packet, 4}` on the accepted
-//!   socket and a `{packet, 4}` client send of `<<"hello">>`, the oracle delivers
-//!   `{tcp, A, <<"hello">>}` while `beam_rt` times out (the raw `{packet, 0}` stream *is*
-//!   delivered, which is what `tcp_active_delivery_and_peer_close` pins). Owner: `beam_io` /
-//!   `beam_rt` (the read-side framing). Reported, never pinned: a `receive` that answers
-//!   `timeout` is a plain observable, so a case would commit a `mismatch`.
+//! * **a framed stream *write* prepends no length header (`beam_rt`).** With a block framing mode
+//!   on the **sending** socket — `{packet, 4}` through `gen_tcp:connect/3`'s option list *or* an
+//!   `inet:setopts/2` after the connect — `gen_tcp:send(Cl, <<"hello">>)` reaches a raw peer as
+//!   `<<0,0,0,5,104,101,108,108,111>>` under the oracle and as `<<104,101,108,108,111>>` under
+//!   `beam_rt`: the header is never written. `{packet, 2}` (`<<0,5,…>>` vs `…`) and `{packet, 1}`
+//!   (`<<5,…>>` vs `…`) are missing it the same way, so a framed sender talking to a framed
+//!   receiver simply times out on the Rust side (measured: oracle
+//!   `{ok,{data,<<104,101,108,108,111>>}}`, `beam_rt` `{ok,timeout}`). The **read** side is exact
+//!   in all three modes — that is what the four `*_framed_read` rows pin — and `{packet, line}` on
+//!   a sender agrees too (line mode adds no prefix). Owner: `beam_io` / `beam_rt` (the write-side
+//!   framing). Reported, never pinned: a missing prefix is a plain observable, so a case would
+//!   commit a `mismatch`.
 //! * **the blocking reads are a typed capability gap (`beam_rt`).** `gen_tcp:recv(A, 2, 1000)`
 //!   (with or without queued bytes), `gen_tcp:accept(L, 200)` and `gen_udp:recv(S, 0, 300)`
 //!   (with no datagram queued) each make the Rust runtime exit `3` with
@@ -322,6 +347,94 @@ pub(crate) fn group() -> Vec<Case> {
              {3,{error,einval},{ok,[{packet,2}]}},{4,ok,{ok,[{packet,4}]}},\
              {8,{error,einval},{ok,[{packet,4}]}},{16,{error,einval},{ok,[{packet,4}]}}]}",
         ),
+        // --- the framed read path: the length-prefixed stream ---------------------------------
+        case(
+            "inet_control/packet4_framed_read",
+            "with {packet,4} on the accepted socket the client's <<0,0,0,5,\"hello\">> bytes are delivered as one {tcp,A,<<\"hello\">>} message with the four-byte prefix consumed, and inet:getopts/2 echoes the mode",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                               {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             SetR = inet:setopts(A, [{packet, 4}, {active, true}]), \
+             GetR = inet:getopts(A, [packet]), \
+             Sent = gen_tcp:send(Cl, <<0, 0, 0, 5, \"hello\">>), \
+             Got = receive {tcp, A, Db} -> {data, Db} after 2000 -> timeout end, \
+             ok = gen_tcp:close(Cl), \
+             ok = gen_tcp:close(A), \
+             ok = gen_tcp:close(L), \
+             {SetR, GetR, Sent, Got} end",
+            "ok {ok,{ok,[{packet,4}]},ok,{data,<<104,101,108,108,111>>}}",
+        ),
+        // --- the same path with the two-byte prefix ------------------------------------------
+        case(
+            "inet_control/packet2_framed_read",
+            "with {packet,2} on the accepted socket the client's <<0,5,\"hello\">> bytes are delivered as one {tcp,A,<<\"hello\">>} message with the two-byte prefix consumed",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                               {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{packet, 2}, {active, true}]), \
+             Sent = gen_tcp:send(Cl, <<0, 5, \"hello\">>), \
+             Got = receive {tcp, A, Db} -> {data, Db} after 2000 -> timeout end, \
+             ok = gen_tcp:close(Cl), \
+             ok = gen_tcp:close(A), \
+             ok = gen_tcp:close(L), \
+             {Sent, Got} end",
+            "ok {ok,{data,<<104,101,108,108,111>>}}",
+        ),
+        // --- the line parser over TCP --------------------------------------------------------
+        case(
+            "inet_control/line_framed_read",
+            "with {packet,line} on the accepted socket the client's <<\"hello\\r\\nworld\">> yields one {tcp,A,<<\"hello\\r\\n\">>} message carrying the EOL, and the unterminated <<\"world\">> tail delivers nothing (the bounded after answers timeout2)",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                               {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{packet, line}, {active, true}]), \
+             Sent = gen_tcp:send(Cl, <<\"hello\\r\\nworld\">>), \
+             First = receive {tcp, A, D1} -> {data, D1} after 2000 -> timeout1 end, \
+             Second = receive {tcp, A, D2} -> {data, D2} after 2000 -> timeout2 end, \
+             ok = gen_tcp:close(Cl), \
+             ok = gen_tcp:close(A), \
+             ok = gen_tcp:close(L), \
+             {Sent, First, Second} end",
+            "ok {ok,{data,<<104,101,108,108,111,13,10>>},timeout2}",
+        ),
+        // --- the frame boundary is the socket, not the segment -------------------------------
+        case(
+            "inet_control/packet4_framed_read_buffers_across_segments",
+            "the {packet,4} parser buffers across segments: a lone <<0,0>> truncated prefix delivers nothing, the completing <<0,5,\"hello\",0,0,0,2,\"ab\">> delivers <<\"hello\">> and <<\"ab\">> as two messages, and the mode is inherited from the listening socket's {packet,4}",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                               {active, false}, {packet, 4}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             GetR = inet:getopts(A, [packet]), \
+             ok = inet:setopts(A, [{active, true}]), \
+             Partial = gen_tcp:send(Cl, <<0, 0>>), \
+             Pending = receive {tcp, A, Dp} -> {data, Dp} \
+                       after 300 -> partial_pending end, \
+             Rest = gen_tcp:send(Cl, <<0, 5, \"hello\", 0, 0, 0, 2, \"ab\">>), \
+             First = receive {tcp, A, D1} -> {data, D1} after 2000 -> timeout1 end, \
+             Second = receive {tcp, A, D2} -> {data, D2} after 2000 -> timeout2 end, \
+             ok = gen_tcp:close(Cl), \
+             ok = gen_tcp:close(A), \
+             ok = gen_tcp:close(L), \
+             {GetR, Partial, Pending, Rest, First, Second} end",
+            "ok {{ok,[{packet,4}]},ok,partial_pending,ok,{data,<<104,101,108,108,111>>},\
+             {data,<<97,98>>}}",
+        ),
         // --- the stream send path -------------------------------------------------------------
         case(
             "inet_control/tcp_send_listening_and_connected",
@@ -412,7 +525,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_inet_control_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 11, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 15, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -456,17 +569,19 @@ mod tests {
         );
     }
 
-    /// The shapes that were **measured** to diverge stay out of the group: the `{packet, N}`
-    /// **framed** stream read delivers nothing on `beam_rt` (the raw one is pinned), the blocking
-    /// reads that have nothing queued are a typed `unsupported` capability gap, and
-    /// `prim_inet`'s own verbs are not the layer this group drives. Pinning any of them would
-    /// commit a `mismatch`. See the module docs for the exact pairs of observations.
+    /// The shapes that were **measured** to diverge stay out of the group: a block framing mode
+    /// on the **sending** socket (no length header is written by `beam_rt`), the blocking reads
+    /// that have nothing queued (a typed `unsupported` capability gap), and `prim_inet`'s own
+    /// verbs (not the layer this group drives). Pinning any of them would commit a `mismatch`.
+    /// See the module docs for the exact pairs of observations.
     ///
     /// The option/address surface of both drivers (including `inet:getstat/1`,
     /// `gen_tcp:connect/3`, `gen_tcp:listen/2` and the `{mode, list|binary}` store) is served,
-    /// and so now are `gen_tcp:send/2` (`{error, enotconn}` on a listener, `ok` on a connection)
-    /// and the data path of both drivers (raw active-mode delivery, the peer-close teardown and
-    /// the passive/active datagram read), so those verbs are free to appear in a row.
+    /// and so now are `gen_tcp:send/2` (`{error, enotconn}` on a listener, `ok` on a connection),
+    /// the data path of both drivers (raw active-mode delivery, the peer-close teardown and the
+    /// passive/active datagram read) and the **framed read** in all three block modes
+    /// (`{packet, 4}` / `{packet, 2}` / `line`, including inheritance from `gen_tcp:listen/2` and
+    /// buffering across segments), so those verbs are free to appear in a row.
     #[test]
     fn no_case_pins_a_measured_divergence() {
         for case in group() {
@@ -481,13 +596,27 @@ mod tests {
                 // non-POSIX sender (`bash`'s `/dev/udp` or a `python3` one-liner), which would
                 // make the golden host-dependent.
                 "os:cmd",
-                // The framed read: `{packet, N}` on a connected socket delivers nothing on the
-                // Rust runtime (see the module docs).
-                "{packet, 4}, {active, true}",
             ] {
                 assert!(
                     !expr.contains(forbidden),
                     "case {} pins `{forbidden}`, a measured divergence (see the module docs)",
+                    case.id
+                );
+            }
+            // A block framing mode on the **sending** socket: the oracle prefixes a length header
+            // on every `gen_tcp:send/2` (`{packet, 4}` turns `<<"hello">>` into
+            // `<<0,0,0,5,"hello">>`), `beam_rt` writes the payload raw — a plain observable, so a
+            // case pinning it would be a `mismatch`. Every sender in this group is the socket
+            // `gen_tcp:connect/3` produced, so the guard scans that call's option list. A framing
+            // mode on a **receiving** socket is fine and is exactly what the `*_framed_read` rows
+            // pin (see the module docs and `divergences.md` §A.4).
+            for (at, _) in expr.match_indices("gen_tcp:connect(") {
+                let call = &expr[at..];
+                let opts = call.split(')').next().unwrap_or(call);
+                assert!(
+                    !opts.contains("{packet, "),
+                    "case {} frames the output of its connected socket (`{opts}`), a measured \
+                     divergence (see the module docs)",
                     case.id
                 );
             }

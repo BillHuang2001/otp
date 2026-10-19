@@ -101,7 +101,7 @@ this file, which drifts on every corpus round.
 - `driver_abi.rs` (90 cases) — one shared driver `.so` dispatched by a one-byte selector.
 - `driver_abi_extra.rs` (78 cases, `driver_extra/…`) — `driver_get_now/1`, timeslice, port-queue,
   `driver_pdl_*`, the `erl_drv_thread_exit`/rwlock/cond families, the `tcp_inet` built-in.
-- `udp.rs` (32) / `ram_file.rs` (21) / `inet_control.rs` (11) — the **built-in drivers**; see the
+- `udp.rs` (32) / `ram_file.rs` (21) / `inet_control.rs` (15) — the **built-in drivers**; see the
   "built-in drivers" section below.
 
 ## A.5 — distribution wire / live nodes
@@ -212,12 +212,16 @@ this file, which drifts on every corpus round.
   `NUMBER`/`OK`/`ERROR` proper-list shapes, `port_set_data/2`+`port_get_data/1`, `port_control/3`'s
   `badarg` for every verb). Reply bytes are pinned through `iolist_to_binary/1` because the oracle
   splits a DATA reply into an improper list — see `divergences.md` §A.4.
-- `inet_control.rs` (11) — the inet drivers through `gen_udp`/`gen_tcp`/`inet`: open + option store
+- `inet_control.rs` (15) — the inet drivers through `gen_udp`/`gen_tcp`/`inet`: open + option store
   round trip, the bare refusal matrix for both families, a loopback `gen_tcp:listen/2`'s `sockname/1`
   shape with the `{active,_}`/`{packet,_}` store and the unknown-option `{error,einval}`, the static
-  `spawn_driver` namespace incl. the `efile`/`fd` `badarg`, the `{packet,N}` framing surface, and the
-  **data path** (`gen_tcp:send/2` on a listening vs a connected socket, active-mode TCP delivery +
-  peer-close teardown, a datagram delivered between two `gen_udp` sockets, a passive `gen_udp:recv/3`).
+  `spawn_driver` namespace incl. the `efile`/`fd` `badarg`, the `{packet,N}` option store on both
+  sides, the **framed read** in all three block modes (`{packet,4}`, `{packet,2}`, `line`, plus
+  framing inherited from `gen_tcp:listen/2` and buffering across segments), and the **data path**
+  (`gen_tcp:send/2` on a listening vs a connected socket, active-mode TCP delivery + peer-close
+  teardown, a datagram delivered between two `gen_udp` sockets, a passive `gen_udp:recv/3`). The
+  framed **write** — a block framing mode on the *sending* socket — writes no length header on
+  `beam_rt` and is therefore a ledger row, never a case (`divergences.md` §A.4).
 
 ## A.9 — boot, preloaded, code server, in-process compile
 - `boot.rs` — version banner, code-server + `application:*` observability, boot-time process surface.
@@ -272,8 +276,9 @@ malformed case.
 - The `udp.rs` and `inet_control.rs` group tests still fence their modules: `udp` rejects
   `gen_udp:send`/`gen_udp:recv`/`prim_inet` (those belong to `inet_control`), `inet_control` rejects
   `port_command`/`prim_inet`/`os:cmd` (an external-injection route would make the golden
-  host-dependent), and both pin their group size (32 / 11) — a case lands only together with the
-  matching guard/size edit in the same change.
+  host-dependent) **and** a `{packet, N}` in a `gen_tcp:connect/3` option list (the framed *write*,
+  a measured divergence — a framing mode on a *receiving* socket is free), and both pin their group
+  size (32 / 15) — a case lands only together with the matching guard/size edit in the same change.
 - A NIF/driver fixture may reference only `enif_*`/`driver_*` symbols the Rust runtime really exports
   (both runtimes `dlopen(RTLD_NOW)` it): an unexported symbol makes the *Rust* load fail while the
   oracle loads — a mismatch, not a gap.

@@ -302,6 +302,23 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
     only the order-free pair, never the sequence. The same command under `{spawn, …}` agrees, so it
     is confined to `spawn_executable`.
 
+- **The framed TCP *read* now agrees in all three block modes; the framed *write* does not.** A
+  block framing mode on the **sending** socket writes no length header on `beam_rt`: with
+  `{packet, 4}` on the connected client (`gen_tcp:connect/3`'s option list or an `inet:setopts/2`
+  after it), `gen_tcp:send(Cl, <<"hello">>)` reaches a raw peer as
+  `<<0,0,0,5,104,101,108,108,111>>` under the oracle and as `<<104,101,108,108,111>>` under
+  `beam_rt`; `{packet, 2}` is `<<0,5,…>>` vs the bare payload and `{packet, 1}` is `<<5,…>>` vs
+  the bare payload. A framed sender talking to a framed receiver is therefore the same shape seen
+  from the other end — measured `ok {ok,{data,<<104,101,108,108,111>>}}` on the oracle against
+  `ok {ok,timeout}` on `beam_rt` for the `{packet, 4}` both-ends probe. `{packet, line}` on a
+  sender agrees (line mode adds no prefix), and so does UDP output framing (`gen_udp:send` of
+  `<<"hi">>` under `{packet, 4}` arrives unframed on both sides), so the gap is confined to the
+  TCP **stream** writer. The read side is exact and **is** pinned —
+  `inet_control/packet4_framed_read`, `inet_control/packet2_framed_read`,
+  `inet_control/line_framed_read` and `inet_control/packet4_framed_read_buffers_across_segments`
+  (framing inherited from `gen_tcp:listen/2`, a truncated prefix withholding a message, and two
+  coalesced frames delivered as two messages all agree). Owner: `beam_rt` / `beam_io`.
+
 ## A.6 — CLI flags & environment (owner: `beam_rt` / the `-eval` evaluator)
 - `-extra foo`: the oracle prints a SIGTERM info report and **hangs** (no exit within a 20 s timeout);
   the Rust runtime exits `0`. A **plain argument after `--`** (`-- foo`) is a `mismatch`:
