@@ -479,8 +479,15 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   selection for spawned processes).
 - **The default (spawned-compiler) `[binary]` route agrees but no case can carry it**:
   `compile:file("lib/stdlib/src/timer.erl", [binary, return_errors])` answers `ok timer 13200` on
-  **both** sides, in 127–211 s on the runtime against 0.7 s on the oracle (4 runs, 158/127/211/169 s)
-  — the spawned-process cost above, not a divergence. Owner: `beam_rt` / `beam_engine`.
+  **both** sides, in 119–211 s on the runtime against 0.7 s on the oracle (six serial runs, 158/127/
+  211/169/130/119 s) — the spawned-process cost above, not a divergence. Owner: `beam_rt` /
+  `beam_engine`. **Load flake, not part of the agreement**: under a heavy machine load (several
+  concurrent workspace builds) this same route has twice died with exit `139` (SIGSEGV, empty
+  stdout) after 202 s / 328 s, and it runs clean whenever the machine is quiet — so a case pinning it
+  would flake, and the crash itself is a runtime robustness question for the owner, not a harness
+  artifact.
+- **`no_spawn_compiler_process` + `[binary]` on the same source is the cheap, honest route**: ≈2.3 s,
+  already a case (`selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator`).
 - **No case pins a whole-file byte count or a hash value.** The artifact's `beam_lib:md5/1` image and
   every md5-significant chunk are identical between the two runtimes, but a hash golden is
   **release-dependent** (CI's oracle is OTP 28 while every golden here is measured on OTP 29), so the
@@ -542,7 +549,15 @@ for the transport state.
 - The genuine cross-runtime property is pinned instead by the crate-local
   `crates/beam_rt/tests/dist_two_vm.rs` (two `#[ignore]`d tests, a private `epmd`, both sides
   asserted).
-<!--PEER-VERDICT-->
+- **A per-side two-node pair IS expressible and is pinned**: `CommandRun.peer: Option<PeerRun>`
+  starts a second process of *that side's own* runtime (the Rust leg a harness-spawned `beam_rt`, the
+  oracle leg the system `erl`'s own `peer:start_link/1`), both legs isolated in their own process
+  group under a per-invocation nonce, and a peer that never becomes ready is a loud `Skipped`.
+  `dist/live_self_pair_handshake_and_message` therefore compares reachable-node behaviour
+  symmetrically: the handshake (`pong`), the published-node count (`nodes(hidden)` empty),
+  one message each way twice, and `{nodedown,_}`. What remains inexpressible is a leg that talks to
+  the **other** runtime — a peer leg is always the same runtime, precisely because the two legs never
+  coexist.
 
 ### Distribution capability gaps and plain-value divergences (measured)
 - **A message to `net_kernel` that is not a `{'$gen_call', From, Request}` tuple is FATAL**: a peer
