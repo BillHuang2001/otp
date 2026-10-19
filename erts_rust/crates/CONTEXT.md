@@ -602,6 +602,19 @@ in-process compiler route.
   refc binaries, and the runtime parity work (`func_info`→`function_clause`, the `DictHook` process
   dictionary, the `{minor_version}` `term_to_binary/2` adoption, sorted `-eval` map literals).
 ## Design Decisions
+- **One reference-id space, owned by the LCA.** Reference ids are minted by `beam_common::next_ref_id`
+  and by nothing else. `beam_common` hosts it because it is the lowest common ancestor: `beam_abi`
+  (wave 0) cannot host a type that `beam_process` (wave 3) draws from, and `beam_process` must not
+  depend on the NIF ABI crate. `beam_process::RefAllocator` survives as the typed handle
+  (`new()`/`next() -> MonitorRef`) so dependents are unchanged; `beam_abi` narrows the shared id to
+  `beam_term::MAX_SMALL` **checked** (an `as` cast would shift `1<<59` into the immediate's sign bit and
+  alias two ids) and refuses rather than writing a wrong id. The space is for *mints* only: a
+  fabricated/derived id (`MonitorRef::from_id`) is the caller's claim, and the one such id in the
+  workspace — an unnamed ETS table's tid — comes from `beam_ets`'s table-handle band so it decodes back
+  to its handle. Cross-producer collision-freedom is pinned end to end by
+  `beam_rt/tests/ref_id_space.rs` (NIF resource terms + monitors/aliases + `make_ref`/timers,
+  interleaved: pairwise distinct and strictly increasing) and per producer by
+  `beam_abi::resources_tests` / `beam_process::tests/reference_ids.rs`.
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`
   conversion is added **in `beam_term`**, so all 13 dependents get `?`-interop for free instead of
