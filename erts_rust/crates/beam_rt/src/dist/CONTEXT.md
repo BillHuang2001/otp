@@ -10,7 +10,7 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 ## API Surface
 - `dist.rs` (module `crate::dist`, FROZEN façade): `NodeName` (+ `local_hostname`), `DistConnection` (+ `state`/`is_established`/`is_live`/`peer_name`/`peer_creation`/`peer_visibility`/`peer_addr`/`bytes`/`has_pending_output`/`close`, and the crate-visible `node_term`/`bind_node`/`send_control`/`send_message`/`flush_output`), `DistNode`, `DistConnectionSnapshot`, `resolve_cookie`, `epmd_addr`, and the consts `NONODE_NAME`, `DIST_READ_SLICE`, `DIST_LISTEN_ADDR` (also `MAX_ACCEPTS_PER_PUMP`/`DIST_DISPATCH_HEAP_WORDS`).
 - `DistNode`: `start`/`node_name`/`advertised_name`/`epmd_name`/`is_short_name`/`port`/`creation`/`is_registered`/`is_alive`/`registration_error`/`pump`/`has_established_link`/`dispatch_inbound`/`last_link_error`/`is_idle`, the **diagnostic** `connections() -> Vec<DistConnectionSnapshot>`, and the crate-visible `links()` (the shared accepted cell) and `bind_peer_nodes(&mut AtomTable) -> Result<usize>`.
-- `dist/links.rs`: `DistLinks` (crate-visible) — `new(accepted)`, `outbound`/`accepted`, `link_index_for_node`, `accepted_index_for_node`, `has_established_link_to`, `names_node`, `may_reach_node`, `has_any`/`is_idle`/`has_established`, `established_names`, `node_label`/`node_label_in`, `route_control`, `route_message` — plus the free `no_link_error` and the `pub` `DistConnectionSnapshot`.
+- `dist/links.rs`: `DistLinks` (crate-visible) — `new(accepted)`, `outbound`/`accepted`, `link_index_for_node`, `accepted_index_for_node`, `has_established_link_to`, `names_node`, `may_reach_node`, `has_any`/`is_idle`/`has_established`, `established_names`, `node_label`/`node_label_in`, `route_control`, `route_message`, `route_alias` — plus the free `no_link_error`, `alias_flag_error`, `negotiated_alias` and the `pub` `DistConnectionSnapshot`.
 - `dist/inbound.rs`: `LocalDeliverySink` — the `impl InboundSink` sink plus its private `Target` enum and routing helpers (`envelope_from`, `receipt`, `remote_pid`, `small_uint`).
   **Path identity is mandatory**: it is re-exported from the parent as `pub use inbound::LocalDeliverySink;`, so `crate::dist::LocalDeliverySink` (and `beam_rt::dist::LocalDeliverySink`) resolve exactly as before the split.
 
@@ -23,6 +23,10 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 - `DistNode::links()` hands out the cell (`Rc::clone`); `DistNode::connections()` is a **snapshot** (`DistConnectionSnapshot`, empty while the cell is borrowed) because the live table cannot be lent out by reference — it is a diagnostic and never affects routing.
 - `route_control` and `route_message` are the **one** routing entry: every outbound control (a routed `link`/`monitor`/`exit`/`unlink`, a `DOP_REG_SEND`, the runtime's `dist_send_*` API) and every outbound message goes through them, so a peer reached by an accepted link is served exactly like one this runtime dialled — the regression the table exists for.
   Both refuse with the single `no_link_error` (`distribution: no established connection to node <label>`) when neither half is an **established** link to the node, and neither ever reports a fabricated success.
+- `route_alias` is the alias-send entry beside them: it resolves the destination **node atom** out of the alias reference term itself (`beam_codec::term::external_ref_parts`), does the same outbound-then-accepted link search, and emits `{DOP_ALIAS_SEND, From, To} -- Msg` (`dist.c:2563`).
+  Its one extra gate is per link: a link whose peer did not negotiate `DFLAG_ALIAS` is the typed `distribution: the link to <label> did not negotiate DFLAG_ALIAS` (`negotiated_alias`/`alias_flag_error`), never a silent drop and never a bare `BadArg`, and a non-reference `to` is the typed `distribution: an alias send needs an external reference destination`.
+  `DFLAG_ALIAS` sits in OTP 29's default **and** addable masks (`DFLAG_DIST_DEFAULT`/`DFLAG_DIST_ADDABLE`) but not in its mandatory set (`DFLAG_DIST_MANDATORY`), so a peer may legitimately establish a link without it — which is why the gate is per link and not per handshake policy.
+  The per-link flags come from `DistConnection::negotiated`/`ClientLink::negotiated` (each forwarding its `ConnectionDriver::negotiated`, the peer's validated set).
 - **The accepted half is an exact node-term match.** `DistConnection` carries `node: Option<Eterm>` — the peer's node atom term — bound by `DistNode::bind_peer_nodes`, which interns each established accepted link's `peer_name()` into the runtime's one live `AtomTable` and hands the term to `bind_node`.
   `accepted_index_for_node` (and `names_node`/`may_reach_node`) therefore compare node terms on both halves, exactly, with no atom table needed at the router.
   An unbound link is not a route; a link retired is out of the table, so its binding is irrelevant and nothing outside the link holds it.
@@ -66,7 +70,7 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 
 ## Routing Table
 - `dist.rs` (parent) → the node half: `DistNode`/`DistConnection`/`NodeName`/`DistConnectionSnapshot`/`resolve_cookie`/`NONODE_NAME`; declares `mod inbound;`/`mod links;` and re-exports `LocalDeliverySink`.
-- `dist/links.rs` → the one node→link table over both halves (`DistLinks`), the one routing entry (`route_control`/`route_message`) and the single `no_link_error`.
+- `dist/links.rs` → the one node→link table over both halves (`DistLinks`), the one routing entry (`route_control`/`route_message`/`route_alias`) and the single `no_link_error`.
 - `dist/inbound.rs` → the inbound delivery sink over `beam_dist::InboundSink` (contract A.5): `LocalDeliverySink` + routing helpers.
 
 ## See Also

@@ -639,16 +639,20 @@ mod tests {
 
     /// What the peer decoded from the bytes the link wrote (`DOP_*` classification only;
     /// the per-link identity check is a different seam).
+    ///
+    /// `heap` is the **caller's**: every term a `Delivery` carries is materialized there, so
+    /// it must outlive the assertions (a heap owned by this helper would be dropped on
+    /// return, leaving the returned terms naming recycled memory).
     fn decoded(
         peer: &mut ConnectionDriver,
         stream: &mut TcpStream,
         atoms: &mut AtomTable,
+        heap: &mut Heap,
     ) -> Vec<Delivery> {
         read_into(peer, stream);
         peer.step().expect("the peer's step");
-        let mut heap = Heap::new(1 << 12).expect("the decode heap");
         let mut sink = UnsupportedSink;
-        peer.dispatch_inbound(&mut heap, atoms, &mut sink)
+        peer.dispatch_inbound(heap, atoms, &mut sink)
             .expect("classify the control message the link wrote")
             .into_iter()
             .map(|record| record.delivery)
@@ -678,7 +682,8 @@ mod tests {
             .send_reg_send(PEER_NAME, "echo", ProcessId::new(1, 1), msg, &mut atoms)
             .expect("route the DOP_REG_SEND over the outbound link");
 
-        match decoded(&mut peer, &mut stream, &mut atoms).first() {
+        let mut decode_heap = Heap::new(1 << 12).expect("the decode heap");
+        match decoded(&mut peer, &mut stream, &mut atoms, &mut decode_heap).first() {
             Some(Delivery::RegSend { name, message, .. }) => {
                 assert_eq!(
                     *name,
@@ -725,7 +730,8 @@ mod tests {
             .route_control(node, Dop::RegSend, &[from, empty, to_name, msg], &atoms)
             .expect("the routing entry finds the accepted link");
 
-        match decoded(&mut peer, &mut stream, &mut atoms).first() {
+        let mut decode_heap = Heap::new(1 << 12).expect("the decode heap");
+        match decoded(&mut peer, &mut stream, &mut atoms, &mut decode_heap).first() {
             Some(Delivery::RegSend { name, message, .. }) => {
                 assert_eq!(
                     *name,
@@ -805,7 +811,8 @@ mod tests {
             .expect("the router accepts a signal for an accepted link's node");
         client.pump(&mut atoms).expect("flush the queued exit");
 
-        match decoded(&mut peer, &mut stream, &mut atoms).first() {
+        let mut decode_heap = Heap::new(1 << 12).expect("the decode heap");
+        match decoded(&mut peer, &mut stream, &mut atoms, &mut decode_heap).first() {
             Some(Delivery::Exit { reason, .. }) => {
                 let mut expected_heap = Heap::new(64).expect("the expected heap");
                 let expected = expected_heap
@@ -901,7 +908,8 @@ mod tests {
             .route_alias(to, from, msg, &atoms)
             .expect("the routing entry writes the DOP_ALIAS_SEND");
 
-        match decoded(&mut peer, &mut stream, &mut atoms).first() {
+        let mut decode_heap = Heap::new(1 << 12).expect("the decode heap");
+        match decoded(&mut peer, &mut stream, &mut atoms, &mut decode_heap).first() {
             Some(Delivery::AliasSend {
                 to: got_to,
                 message,
@@ -960,8 +968,9 @@ mod tests {
                 .contains("the link to peer@host.example did not negotiate DFLAG_ALIAS"),
             "the refusal names the link's node: {err}"
         );
+        let mut decode_heap = Heap::new(1 << 12).expect("the decode heap");
         assert!(
-            decoded(&mut peer, &mut stream, &mut atoms).is_empty(),
+            decoded(&mut peer, &mut stream, &mut atoms, &mut decode_heap).is_empty(),
             "nothing was written to the peer"
         );
     }
