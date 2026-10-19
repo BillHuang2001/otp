@@ -1255,6 +1255,167 @@ fn two_mints_of_one_object_answer_two_distinct_terms() {
     assert_eq!(RUNS.load(AtomicOrdering::Relaxed) - base, 1);
 }
 
+/// Two consecutive `enif_make_resource` calls mint **distinct, strictly increasing** reference ids —
+/// the C's fresh magic reference per call, and the monotonicity every local reference producer shares.
+#[test]
+fn two_consecutive_mints_draw_distinct_strictly_increasing_ids() {
+    let mut host = RetainHost::new();
+    let mut env = NifEnv::new(&mut host);
+    let ty = open_type(&mut env, "increasing_ids_rt", silent_dtor);
+    // SAFETY: `ty` came from `open_type`. The two minted terms keep their references (this test asserts
+    // ids, not lifetimes, so leaving them outstanding is only a bounded leak); the allocator's own
+    // reference is released at the end.
+    let obj = unsafe { alloc_object(ty, 1) };
+    // SAFETY: `env` is live; `obj` is a live payload pointer.
+    let first = unsafe { make_resource_term(&mut env, obj) };
+    // SAFETY: as above.
+    let second = unsafe { make_resource_term(&mut env, obj) };
+
+    // SAFETY: both are internal-reference blocks `write_resource_ref` just built, so their id words
+    // are readable.
+    let (first_id, second_id) = unsafe {
+        (
+            prelude::internal_ref_id(first).expect("a reference id"),
+            prelude::internal_ref_id(second).expect("a reference id"),
+        )
+    };
+    assert_ne!(
+        first.raw(),
+        second.raw(),
+        "each mint is a fresh internal-reference block"
+    );
+    assert_ne!(first_id, second_id, "each mint draws a fresh reference id");
+    // Strictly increasing, not merely distinct: the shared source is one monotone counter, so the
+    // later mint's id is always the greater one even when another thread draws in between.
+    assert!(
+        second_id > first_id,
+        "the second mint's id ({second_id}) must exceed the first's ({first_id})"
+    );
+
+    // SAFETY: the two minted terms still hold references, so the object outlives this release; this
+    // drops the allocator's own reference.
+    unsafe { enif_release_resource(obj) };
+}
+
+/// Mint one resource term and prove that **no other draw** of the shared counter happened across the
+/// mint, so the minted id can be compared with its neighbouring draws *exactly*.
+///
+/// Returns `(minted_id, before1, before2, after)`, where `before1`/`before2` are draws of
+/// [`beam_common::next_ref_id`] taken back to back immediately before the mint and `after` is the draw
+/// taken immediately after it. When `after == before1 + 3` the window is **tight** — three draws happened between `before1`
+/// and `after` and the mint accounts for the middle one — which is what makes `minted_id ==
+/// before2 + 1` a proof of the id's *source* rather than a mere monotonicity observation.
+///
+/// `cargo test` runs this binary's unit tests on parallel threads and several other resource tests mint
+/// too, so the window is retried (bounded) until it comes out tight. Each attempt mints a term whose
+/// reference is left outstanding — a bounded leak of a few words, and the test heap (4096 words) holds
+/// far more attempts than the retry budget needs in practice.
+fn mint_in_tight_window(env: &mut NifEnv, obj: *mut c_void) -> (u64, u64, u64, u64) {
+    // Bounded so a pathological scheduler cannot spin here (see the heap-budget note above): 256
+    // attempts reserve at most 256 × `RESOURCE_REF_WORDS` words.
+    for _ in 0..256 {
+        let before1 = beam_common::next_ref_id();
+        let before2 = beam_common::next_ref_id();
+        // SAFETY: `env` is live and `obj` a live payload pointer (the caller's contract).
+        let minted = unsafe { make_resource_term(env, obj) };
+        let after = beam_common::next_ref_id();
+        // SAFETY: `minted` is the internal-reference block the mint just built.
+        let id = unsafe { prelude::internal_ref_id(minted) }.expect("a reference id");
+        if after == before1 + 3 {
+            return (id, before1, before2, after);
+        }
+    }
+    panic!(
+        "no interference-free draw window in 256 attempts — another thread drew from the shared \
+         reference-id counter on every attempt"
+    );
+}
+
+/// **The id's source, pinned exactly.** A minted resource id is the *next draw of the one shared local
+/// reference-id space* ([`beam_common::next_ref_id`]) — the space `erlang:make_ref/0`, the NIF
+/// `make_ref`, monitors, aliases, timers, `seq_trace` references and `beam_process`'s process table
+/// draw from — and not a private counter's.
+///
+/// The proof is a tight draw window: `before2 == before1 + 1` and `after == before1 + 3` show that
+/// nothing else drew between `before1` and `after`, so `minted == before2 + 1` says the mint consumed
+/// exactly the next id of that one space. A private, independently seeded counter could not land on
+/// `before2 + 1` in a tight window — which is the aliasing hazard this closes: with one space, a dead
+/// resource term can never carry a *live* plain reference's id.
+#[test]
+fn a_minted_id_is_the_next_draw_of_the_shared_reference_id_space() {
+    let mut host = RetainHost::new();
+    let mut env = NifEnv::new(&mut host);
+    let ty = open_type(&mut env, "shared_id_space_rt", silent_dtor);
+    // SAFETY: `ty` came from `open_type`; the minted terms' references are left outstanding (a bounded
+    // leak — this test asserts ids), and the allocator's own reference is released at the end.
+    let obj = unsafe { alloc_object(ty, 1) };
+
+    let (minted_id, before1, before2, after) = mint_in_tight_window(&mut env, obj);
+
+    assert_eq!(before2, before1 + 1, "the two probe draws are contiguous");
+    assert_eq!(
+        after,
+        before1 + 3,
+        "the window is tight: the mint drew exactly one id"
+    );
+    assert_eq!(
+        minted_id,
+        before2 + 1,
+        "the minted id is the very next draw of the shared reference-id space"
+    );
+    // The id is inside the block's id slot, read back the same way the writer bounded it (a negative
+    // or out-of-range id is refused by `internal_ref_id` and by `narrow_ref_id` alike).
+    assert!(
+        narrow_ref_id(minted_id).is_some(),
+        "the minted id fits the block's small-integer id slot"
+    );
+
+    // SAFETY: the minted term holds a reference, so the object outlives this release; this drops the
+    // allocator's own reference.
+    unsafe { enif_release_resource(obj) };
+}
+
+/// The checked narrowing that feeds the block's `make_small(id)` word: it accepts exactly the
+/// small-integer id slot and **refuses** (never truncates, wraps or substitutes) everything past it.
+///
+/// The bound is `beam_term::MAX_SMALL` — read from `beam_term`, not transcribed — so the accepted set
+/// coincides with what `beam_term`'s own checked encoder accepts, which is asserted here directly.
+#[test]
+fn narrow_ref_id_accepts_exactly_the_blocks_id_slot() {
+    let max = beam_term::MAX_SMALL;
+    assert_eq!(max, (1i64 << 59) - 1, "the 60-bit small-integer bound");
+
+    for id in [0, 1, 2, max - 1, max] {
+        assert_eq!(
+            narrow_ref_id(id as u64),
+            Some(id),
+            "{id} is inside the block's id slot"
+        );
+        // Cross-check: `beam_term`'s own checked small-int encoder agrees it is representable.
+        assert!(
+            prelude::try_make_small(id).is_ok(),
+            "beam_term accepts {id} as a small integer too"
+        );
+    }
+
+    // One past the bound, the top of the `i64` range, and the whole upper half of the `u64` space
+    // (where `i64::try_from` refuses first) are all typed refusals — never a wrapped id, which would
+    // alias another reference.
+    for id in [
+        (max as u64) + 1,
+        (max as u64) + 2,
+        i64::MAX as u64,
+        i64::MAX as u64 + 1,
+        u64::MAX,
+    ] {
+        assert_eq!(narrow_ref_id(id), None, "{id} is past the id slot");
+    }
+    assert!(
+        prelude::try_make_small(max + 1).is_err(),
+        "beam_term refuses one past the bound as well — the two agree"
+    );
+}
+
 /// The minting seam is reachable at both documented public paths —
 /// `nif::enif::resources::resource_term` (where it is implemented) and `nif::enif::resource_term`
 /// (the family re-export) — with one and the same signature, because the runtime implements its
