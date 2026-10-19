@@ -978,3 +978,24 @@ content (a pre-existing printer limitation, unrelated to `zlib`). Hex digests th
 `binary_to_list(binary:encode_hex/1)` integer lists and payloads as sizes plus `=:=` booleans; the
 scratch directory holds **only** this module, so it is also a safe single `-pa` for the oracle.
 A missing `erlc` skips the `run`-route half **loudly** (the `-eval` half still runs).
+### `zlib_one_shot_fixture.erl` — compiled at test time, never committed as a `.beam`
+`zlib_one_shot_fixture.erl` is the **one-shot `zlib`** image (the six convenience functions
+`compress/1`, `uncompress/1`, `zip/1`, `unzip/1`, `gzip/1`, `gunzip/1`) for
+`tests/zlib_one_shot.rs`, driven through the scheduler `run` route
+(`beam_rt run <scratch>/zlib_one_shot_fixture.beam zlib_one_shot_fixture:<f>/0`). Like
+`zlib_stream.erl` it is **source only**: the suite compiles it into a scratch directory with the
+system `erlc` at test time. Five exported functions cover the five surfaces — `goldens/0` (the
+three named hex goldens), `fast_paths/0` (each function's bytes plus the three round trips over
+the six-payload table), `wrapper/0` (`deflateInit/6` + `deflate(…, finish)` + `deflateEnd` +
+`close`, at window bits 15 / -15 / 31, against the one-shot image), `libz/0` (the whole
+`zlib:compress/1` image — A.9 libz byte exactness) and `concat/0` (`gunzip/1` over concatenated
+gzip members).
+Every function **prints** its transcript with `io:format/2` and returns `ok`, **never a binary**:
+the `run` route renders its result with `~w`, and this runtime's binary printing is `<<55,56,…>>`
+where the oracle prints `<<"AB">>` for printable content (a pre-existing printer limitation,
+unrelated to `zlib`). Sizes are integers and digests/hex images are
+`binary_to_list(binary:encode_hex/1)` charlists. The payload table (`payload/1`) is
+byte-identical to the `-eval` expressions' `PAYLOADS_ERL` list, and the transcript's own
+`payload <label> bytes <N> md5 <HEX>` line is what pins the two constructions together. The
+scratch directory holds **only** this module, so it is also a safe single `-pa` for the oracle; a
+missing `erlc` skips the `run`-route half **loudly** (the `-eval` half still runs).
