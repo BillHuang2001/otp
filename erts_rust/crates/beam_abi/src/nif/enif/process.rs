@@ -139,11 +139,12 @@ const DEMONITOR_NOT_FOUND: c_int = 1;
 const REF_THING_WORDS: usize = 3;
 
 /// `ERTS_REF_THING_SIZE * sizeof(Eterm)` — the `ErlNifMonitor` bytes the C copies (`io.c:6994-7010`)
-/// and compares (`erl_nif.c:4057`).
-const REF_THING_BYTES: usize = REF_THING_WORDS * core::mem::size_of::<Eterm>();
+/// and compares (`erl_nif.c:4057`). Also the key of the resource monitor tree
+/// ([`super::resources::MonitorId`]), which is why the sibling monitor module reads it.
+pub(super) const REF_THING_BYTES: usize = REF_THING_WORDS * core::mem::size_of::<Eterm>();
 
 /// The `ErlNifMonitor` payload length, spelled as the type declares it (`sizeof(void *) * 4`).
-const MONITOR_BYTES: usize = core::mem::size_of::<*mut c_void>() * 4;
+pub(super) const MONITOR_BYTES: usize = core::mem::size_of::<*mut c_void>() * 4;
 
 // `ERTS_CT_ASSERT(ERTS_REF_THING_SIZE*sizeof(Uint) <= sizeof(ErlDrvMonitor))` (`io.c:6996`).
 const _: () = assert!(REF_THING_BYTES <= MONITOR_BYTES);
@@ -175,7 +176,7 @@ pub(super) const fn populate(mut api: ErlNifApi) -> ErlNifApi {
 /// # Safety
 ///
 /// `monitor` must be null or point at a readable [`ErlNifMonitor`].
-unsafe fn monitor_block(monitor: *const ErlNifMonitor) -> Option<[u8; REF_THING_BYTES]> {
+pub(super) unsafe fn monitor_block(monitor: *const ErlNifMonitor) -> Option<[u8; REF_THING_BYTES]> {
     if monitor.is_null() {
         return None;
     }
@@ -187,6 +188,20 @@ unsafe fn monitor_block(monitor: *const ErlNifMonitor) -> Option<[u8; REF_THING_
     Some(block)
 }
 
+/// The `ErlNifMonitor` **value** a C caller is handed for the reference block `block` — the C
+/// `erts_ref_to_driver_monitor` (`erl_nif.c:3105`, `:4008-4009`: the first
+/// `ERTS_REF_THING_SIZE * sizeof(Eterm)` bytes of the holder are the reference block, the rest is
+/// left zero).
+///
+/// This is the one place the block→holder mapping is written; [`store_monitor`] writes it into a
+/// caller's pointer and the `down` operand builder ([`super::resources`]'s monitor module) takes the
+/// value by return, so the two can never disagree.
+pub(super) fn holder_from_block(block: &[u8; REF_THING_BYTES]) -> ErlNifMonitor {
+    let mut data = [0u8; MONITOR_BYTES];
+    data[..REF_THING_BYTES].copy_from_slice(block);
+    ErlNifMonitor { data }
+}
+
 /// Store `block` in `monitor` (the C `erts_ref_to_driver_monitor`).
 ///
 /// A null `monitor` is legal in the C (`if (monitor) …`, `erl_nif.c:4007`). The bytes after the
@@ -195,16 +210,14 @@ fn store_monitor(monitor: *mut ErlNifMonitor, block: &[u8; REF_THING_BYTES]) {
     if monitor.is_null() {
         return;
     }
-    let mut data = [0u8; MONITOR_BYTES];
-    data[..REF_THING_BYTES].copy_from_slice(block);
     // SAFETY: `monitor` is non-null and writable (caller contract); `ErlNifMonitor` is `#[repr(C)]`
     // over exactly `MONITOR_BYTES` bytes.
-    unsafe { monitor.write(ErlNifMonitor { data }) };
+    unsafe { monitor.write(holder_from_block(block)) };
 }
 
 /// The 3-word reference block of the internal reference `term` (`None` when it is not one) — the C's
 /// `is_internal_ordinary_ref(ref)` + `internal_ref_val(ref)` pair (`io.c:6997-6999`).
-fn ref_block_of(term: Eterm) -> Option<[u8; REF_THING_BYTES]> {
+pub(super) fn ref_block_of(term: Eterm) -> Option<[u8; REF_THING_BYTES]> {
     if !is_term_word(term) {
         return None;
     }
@@ -532,15 +545,32 @@ pub unsafe extern "C" fn enif_monitor_process(
     let Some(block) = ref_block_of(term) else {
         return MONITOR_TARGET_DEAD;
     };
+    // The C inserts the monitor into the **resource object's own monitor tree** before it copies the
+    // reference block into the caller's holder (`erts_monitor_tree_insert(&rm->root, &mdp->origin)`,
+    // `erl_nif.c:3983-3986`, then `erts_ref_to_driver_monitor`, `:4008-4009`) — that tree is what
+    // `down` is later fired from and what `enif_demonitor_process` looks the reference up in. Our
+    // stand-in is the registry's one monitor table (`super::resources`'s `monitors` module); an `obj`
+    // that is not a live payload pointer of this crate is simply not tracked, exactly as the C's
+    // `DATA_TO_RESOURCE(obj)` has to be one of its own.
+    super::resources::record_monitor(obj, &block, pid);
     store_monitor(monitor, &block);
+    // The C's `0` does not depend on any bookkeeping of ours, so the code is the same either way.
     MONITOR_ESTABLISHED
 }
 
 /// `int enif_demonitor_process(ErlNifEnv*, void* obj, const ErlNifMonitor *monitor);`
 ///
-/// Returns [`DEMONITOR_REMOVED`] (`0`) when the hook reports the monitor identified and removed, and
+/// Returns [`DEMONITOR_REMOVED`] (`0`) when the monitor was identified and removed, and
 /// [`DEMONITOR_NOT_FOUND`] (`1`) when it could not be — never created, already cancelled or already
 /// triggered (`erl_nif.c:4043-4051`, `erl_nif.md:1177-1183`).
+///
+/// The C keys the lookup on the **resource's** monitor tree
+/// (`erts_monitor_tree_lookup(DATA_TO_RESOURCE(obj)->monitors->root, ref)`, `:4046`); this crate's
+/// single registry table (`super::resources`'s `monitors`) stands in for that per-object tree, so the
+/// `obj` operand is not consulted — it is kept in the signature because the C ABI has it and because a
+/// foreign object's monitor is the host's business. The answer is our own removal **or** the host's
+/// cancel (`NifHost::demonitor_process`), so an object this crate did not mint keeps its previous
+/// behaviour.
 ///
 /// # Safety
 ///
@@ -557,13 +587,20 @@ pub unsafe extern "C" fn enif_demonitor_process(
     let Some(block) = (unsafe { monitor_block(monitor) }) else {
         return DEMONITOR_NOT_FOUND;
     };
+    // Our tree first: a monitor this crate armed is ours to cancel, and its removal is authoritative
+    // even when the host has forgotten it (`:4046-4048`).
+    let ours = super::resources::take_monitor(&block);
+    // The host's cancel, through the reference rebuilt on the caller's heap (the C rebuilds it with
+    // `erts_driver_monitor_to_ref` and hands it to `erts_proc_sig_send_demonitor`).
     // SAFETY: `e` is a live env, so the rebuilt reference lives on a live heap.
-    let Some(term) = (unsafe { ref_term_from_block(e, &block) }) else {
-        return DEMONITOR_NOT_FOUND;
+    let host_cancelled = match unsafe { ref_term_from_block(e, &block) } {
+        Some(term) => matches!(e.host().demonitor_process(term), Some(true)),
+        None => false,
     };
-    match e.host().demonitor_process(term) {
-        Some(true) => DEMONITOR_REMOVED,
-        Some(false) | None => DEMONITOR_NOT_FOUND,
+    if ours || host_cancelled {
+        DEMONITOR_REMOVED
+    } else {
+        DEMONITOR_NOT_FOUND
     }
 }
 
