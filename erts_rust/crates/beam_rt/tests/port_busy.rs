@@ -35,27 +35,51 @@
 //! surface: the committed C fixture `tests/fixtures/busy_driver.c` is compiled by the host `cc`
 //! against the host `erl_driver.h` into **two** shared objects (one per `driver_flags` variant),
 //! and both this runtime's binary (`CARGO_BIN_EXE_beam_rt`) and the **system `erl`** open a
-//! `{spawn_driver, …}` port of each and run the same six-case matrix through it.
+//! `{spawn_driver, …}` port and run the same probes through it: the `port_command` decision matrix
+//! on the `run` route (a scheduler slice), and the send / pumping-`port_command` / dead-port rows on
+//! the `-eval` route (the caller that owns the pass).
 //!
 //! # The behaviour table (oracle-verified, erts-17.1 / OTP 29.1.1)
 //!
-//! | port state | options | driver entry | `beam_rt` | oracle |
+//! | port state | operation | options | driver entry | answer (both runtimes) |
 //! |---|---|---|---|---|
-//! | idle | none / `[]` / `[nosuspend]` | either | `true` | `true` |
-//! | idle | `[force]` | without `ERL_DRV_FLAG_SOFT_BUSY` | `error:notsup` | `notsup` |
-//! | idle | `[force]` | with `ERL_DRV_FLAG_SOFT_BUSY` | `true` | `true` |
-//! | busy | `[nosuspend]` | either | `false` (nothing written) | `false` |
-//! | busy | `[force]` | without `ERL_DRV_FLAG_SOFT_BUSY` | `error:notsup` | `notsup` |
-//! | busy | `[force]` | with `ERL_DRV_FLAG_SOFT_BUSY` | `true` (delivered) | `true` |
-//! | busy | none | either | typed capability gap, exit 3 | caller suspends, then `true` |
+//! | idle | `port_command(P, Data)` | none / `[]` / `[nosuspend]` | either | `true` |
+//! | idle | `port_command(P, Data)` | `[force]` | without `ERL_DRV_FLAG_SOFT_BUSY` | `error:notsup` |
+//! | idle | `port_command(P, Data)` | `[force]` | with `ERL_DRV_FLAG_SOFT_BUSY` | `true` |
+//! | idle | `P ! {Pid, {command, Data}}` / `erlang:send(P, Msg[, []])` | — | either | `Msg` / `Msg` / `ok`, and the driver echoes `Data` |
+//! | idle | `erlang:send(P, PlainData)` | — | either | the message (silent success, nothing written) |
+//! | busy | `port_command(P, Data)` | `[nosuspend]` | either | `false` (nothing written) |
+//! | busy | `port_command(P, Data)` | `[force]` | without `ERL_DRV_FLAG_SOFT_BUSY` | `error:notsup` |
+//! | busy | `port_command(P, Data)` | `[force]` | with `ERL_DRV_FLAG_SOFT_BUSY` | `true` (delivered) |
+//! | busy | `port_command(P, Data)` | none | either | on the `-eval` route: waits for the port to go idle, re-issues, `true`; inside a `run` scheduler slice: typed capability gap, exit 3 |
+//! | busy | `erlang:send(P, {Pid, {command, Data}}, [nosuspend])` | — | either | the atom `nosuspend` |
+//! | busy | `erlang:send(P, PlainData, [nosuspend])` | — | either | `ok` (the payload is decomposed before the port's busy state is consulted) |
+//! | closed | `erlang:send(P, Data)` | — | either | the message (silent success) |
+//! | closed | `port_command(P, Data)` | — | either | `error:badarg` |
 //!
-//! The first six arms are asserted **identically** on both runtimes. The last is the runtime's one
-//! documented divergence: the C's `erts_suspend` + `ERTS_BIF_YIELD3` (`erl_bif_port.c:211-231`) has
-//! no counterpart in this runtime's BIF seam (whose only shapes are a value and an error, and whose
-//! sole suspend is the `receive` family's `Step::Wait`), so a bare `port_command` on a busy port
-//! raises [`beam_rt`'s `unsupported` gap](beam_rt::error) — never a fabricated `true`. The oracle's
-//! own answer for that case is asserted separately, from a helper that clears the busy bit while the
-//! caller is suspended (`{ok,cleared,echoed}`), so **both** halves of the divergence are evidenced.
+//! The **idle** rows and the **closed** row are asserted identically on both runtimes by the
+//! `port_command` matrix and the dead-port row; the **busy** rows by the `[nosuspend]`/`[force]`
+//! matrix, the busy-send row and the pumping-`port_command` row.
+//!
+//! A busy port's plain `port_command`/`send` is answered by **waiting for the port to go idle and
+//! re-issuing** the command — the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run
+//! (`erl_bif_port.c:211-231`), implemented by `crate::port::busy_wait`'s `issue`/`wait_until_idle`
+//! over `Runtime::pump_scheduler`. That wait needs a caller that owns the scheduler pass, which is
+//! the `-eval` route; a caller running **inside** a scheduler slice (the `run` route) cannot
+//! re-enter the scheduler, so it raises [`beam_rt`'s `unsupported` gap](beam_rt::error) naming the
+//! blocker — never a fabricated `true`. Both halves are evidenced here: the pumping route asserts
+//! the oracle's own line, and the slice route asserts exit 3 with the runtime's own reason.
+//!
+//! A `{Pid, close}` / `{Pid, {command, Data}}` message is the only shape the port axis acts on
+//! (`erts_port_command`, `io.c:3981-4013`); every other payload is a *bad port signal* — logged and
+//! dropped there, with the send reporting success. A third shape, `{Pid, {connect, NewPid}}`, is a
+//! real ownership transfer in the C (`erts_port_connect`, `io.c:4006-4009`) that this runtime does
+//! not perform yet: `src/port/ops.rs::connect` implements the `port_connect/2` BIF form (which
+//! creates a link, requires a live target and answers no message), while the bang form sets the
+//! port's connected pid **without** a link, accepts a dead pid, requires the message's pid to be the
+//! port's current connected process and replies `{Port, connected}` — a reply that would have to be
+//! delivered through a `&mut ProcessTable` the send seam does not carry. That arm therefore stays
+//! the C's *drop*, and the unit suite (`src/port/busy_wait_tests.rs`) pins it as such.
 //!
 //! # The `--export-dynamic` link seam
 //!
@@ -92,16 +116,17 @@ const BUSY_DRIVER_C: &str = include_str!("fixtures/busy_driver.c");
 /// under the name its entry declares, so every other line below is shared verbatim.
 const BUSY_PROBE_ERL: &str = r#"%% Generated by `beam_rt/tests/port_busy.rs` (never committed).
 -module(busy_probe).
--export([plain/1, soft/1, busy_plain/1, busy_plain_resumed/1]).
--nowarn_deprecated_catch.
+-export([plain/1, soft/1, busy_plain/1, busy_plain_resumed/1,
+         send_idle/1, send_busy/1, busy_pc/1, dead/1]).
 
 plain(Dir) -> cases(Dir, "busy").
 soft(Dir)  -> cases(Dir, "busysoft").
 
 open(Dir, Name) ->
-    case catch erl_ddll:load_driver(Dir, Name) of
-        ok -> open_port({spawn_driver, Name}, [binary]);
-        _  -> open_port({spawn_driver, Dir ++ "/" ++ Name}, [binary])
+    try erl_ddll:load_driver(Dir, Name) of
+        ok -> open_port({spawn_driver, Name}, [binary])
+    catch _:_ ->
+        open_port({spawn_driver, Dir ++ "/" ++ Name}, [binary])
     end.
 
 startup(Port) ->
@@ -126,6 +151,9 @@ echo(Port) ->
     after 500 -> no_data
     end.
 
+any_data(Port) ->
+    receive {Port, {data, Data}} -> Data after 500 -> no_data end.
+
 cases(Dir, Name) ->
     Port = open(Dir, Name),
     startup(Port),
@@ -144,8 +172,8 @@ case_one(Port, State, Opts) ->
     {normalize(Result), echo(Port)}.
 
 %% A busy port with NO options: the C suspends the caller until the port is idle and then answers
-%% `true`. The oracle runs this (never unbounded — see `busy_plain_resumed/1`); this runtime raises
-%% its typed capability gap instead.
+%% `true`. The oracle runs this (never unbounded — see `busy_plain_resumed/1`); a caller inside a
+%% scheduler slice raises the runtime's typed capability gap instead.
 busy_plain(Dir) ->
     Port = open(Dir, "busy"),
     startup(Port),
@@ -164,7 +192,75 @@ busy_plain_resumed(Dir) ->
     Sent = port_command(Port, <<"x">>),
     Cleared = receive cleared -> cleared after 5000 -> no_clear end,
     {normalize(Sent), Cleared, echo(Port)}.
+
+%% The send-to-port shapes on an IDLE port: "bang", `erlang:send/2` and `erlang:send/3` all
+%% report success, the `{Pid, {command, Data}}` signal really reaches the driver (its echo
+%% arrives), and a payload that is not a port signal is written nowhere.
+send_idle(Dir) ->
+    Port = open(Dir, "busy"),
+    startup(Port),
+    set_state(Port, idle),
+    Self = self(),
+    BangMsg = {Self, {command, <<"a">>}},
+    Bang = Port ! BangMsg,
+    BangEcho = any_data(Port),
+    Send2Msg = {Self, {command, <<"b">>}},
+    Send2 = erlang:send(Port, Send2Msg),
+    Send2Echo = any_data(Port),
+    Send3Msg = {Self, {command, <<"c">>}},
+    Send3 = erlang:send(Port, Send3Msg, []),
+    Send3Echo = any_data(Port),
+    Plain2 = erlang:send(Port, <<"d">>),
+    Plain2Echo = any_data(Port),
+    Plain3 = erlang:send(Port, <<"e">>, []),
+    Plain3Echo = any_data(Port),
+    [{bang, Bang =:= BangMsg, BangEcho},
+     {send2, Send2 =:= Send2Msg, Send2Echo},
+     {send3, Send3, Send3Echo},
+     {plain2, Plain2 =:= <<"d">>, Plain2Echo},
+     {plain3, Plain3, Plain3Echo}].
+
+%% `[nosuspend]` on a BUSY port: the signal send answers the atom `nosuspend` (nothing written),
+%% and a payload that is not a port signal answers `ok` — it is decomposed before the port's busy
+%% state is ever consulted.
+send_busy(Dir) ->
+    Port = open(Dir, "busy"),
+    startup(Port),
+    set_state(Port, busy),
+    Self = self(),
+    Signal = erlang:send(Port, {Self, {command, <<"x">>}}, [nosuspend]),
+    Plain = erlang:send(Port, <<"y">>, [nosuspend]),
+    {Signal, Plain}.
+
+%% A plain `port_command` on a BUSY port whose busy bit is cleared by `erlang:port_control/3` from
+%% a timer while the caller waits: the caller is resumed, the command is re-issued, and the
+%% driver's echo of it arrives. Needs a route that owns the scheduler pass (`-eval`).
+busy_pc(Dir) ->
+    Port = open(Dir, "busy"),
+    startup(Port),
+    set_state(Port, busy),
+    _ = timer:apply_after(100, erlang, port_control, [Port, $N, <<>>]),
+    Sent = try port_command(Port, <<"x">>) of Value -> Value catch Class:Reason -> {Class, Reason} end,
+    {Sent, any_data(Port)}.
+
+%% A CLOSED port id: a send is the C's silent success (`pt == NULL`), while the same id handed to
+%% `port_command/2` is `badarg`. The caught exception is reduced to its `{Class, Reason}` pair
+%% inside the module, so the compared line carries the reason and the class — never a stacktrace,
+%% whose frames the two runtimes spell differently.
+dead(Dir) ->
+    {dead_once(Dir, "busy", hello), dead_once(Dir, "busysoft", hello2)}.
+
+dead_once(Dir, Name, Payload) ->
+    Port = open(Dir, Name),
+    startup(Port),
+    set_state(Port, idle),
+    Closed = port_close(Port),
+    IsPort = is_port(Port),
+    Sent = erlang:send(Port, Payload),
+    Command = try port_command(Port, <<"x">>) of Value -> {ok, Value} catch Class:Reason -> {Class, Reason} end,
+    {Closed, IsPort, Sent, Command}.
 "#;
+
 
 /// The oracle's answer for the `driver_flags = 0` variant (`driver_name "busy"`), measured on
 /// erts-17.1 / OTP 29.1.1 with this very fixture. `{other, {error, notsup}}` is the probe's
@@ -184,7 +280,28 @@ const EXPECTED_SOFT: &str = "[{idle_none,{ok,echoed}},{idle_empty,{ok,echoed}},\
 /// suspends the caller, resumes it `true`, and the command really reaches the driver (the echo).
 const EXPECTED_RESUMED: &str = "{ok,cleared,echoed}";
 
-/// The `beam_rt` reason for the one arm with no truthful answer (`src/native/port.rs`).
+/// The oracle's answer for the send-to-port shapes on an **idle** port: `!`, `erlang:send/2` and
+/// `erlang:send/3` report message / message / `ok` while the driver really echoes each command's
+/// bytes, and the two payloads that are not port signals write nothing at all.
+const EXPECTED_SEND_IDLE: &str = "[{bang,true,<<97>>},{send2,true,<<98>>},{send3,ok,<<99>>},\
+{plain2,true,no_data},{plain3,ok,no_data}]";
+
+/// The oracle's answer for a plain `port_command` on a **busy** port whose busy bit a timer clears
+/// while the caller waits: the caller is resumed, the command is re-issued and accepted (`true`),
+/// and the driver's echo of `<<"x">>` arrives.
+const EXPECTED_BUSY_PC: &str = "{true,<<120>>}";
+
+/// The oracle's answer for `[nosuspend]` on a **busy** port: the port-signal send answers the atom
+/// `nosuspend` (nothing written) and the non-signal payload `ok` — it is decomposed before the
+/// port's busy state is ever consulted.
+const EXPECTED_SEND_BUSY: &str = "{nosuspend,ok}";
+
+/// The oracle's answer for a **closed** port id: `erlang:send/2` reports the message (the C's
+/// silent success at `pt == NULL`) while `port_command/2` raises `badarg`, on both driver variants.
+const EXPECTED_DEAD: &str = "{{true,true,hello,{error,badarg}},{true,true,hello2,{error,badarg}}}";
+
+/// The `beam_rt` reason for the one arm a scheduler slice cannot serve
+/// (`crate::port::busy_wait::NO_PUMP_REASON`).
 const BUSY_UNSUPPORTED: &str =
     "beam_rt: unsupported: port_command on a busy port: this caller runs inside a scheduler slice \
      and cannot re-enter the scheduler to wait for the port (the runtime has no engine-side \
@@ -387,11 +504,7 @@ fn build_fixture(label: &str) -> Option<Fixture> {
     let source = dir.join("busy_driver.c");
     if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&source, BUSY_DRIVER_C))
     {
-        skip(&format!(
-            "port_busy/{label}: cannot prepare {}: {error}",
-            dir.display()
-        ));
-        return None;
+        panic!("cannot prepare {}: {error}", dir.display());
     }
     for (stem, defines) in [("busy", &[][..]), ("busysoft", &["-DBUSY_DRIVER_SOFT=1"][..])] {
         let mut command = Command::new(cc());
@@ -400,15 +513,11 @@ fn build_fixture(label: &str) -> Option<Fixture> {
         command.args(defines);
         command.arg("-o").arg(dir.join(format!("{stem}.so"))).arg(&source);
         match command.output() {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                skip(&format!(
-                    "port_busy/{label}: cc failed for {stem} ({}):\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-                return None;
-            }
+            Ok(output) => assert!(
+                output.status.success(),
+                "the host `cc` rejected the suite's own driver fixture ({stem}):\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
             Err(error) => {
                 skip(&format!(
                     "port_busy/{label}: could not run the C compiler: {error}"
@@ -422,14 +531,14 @@ fn build_fixture(label: &str) -> Option<Fixture> {
 
 /// Compiles the Erlang probe into `<dir>/busy_probe.beam` with the system `erlc`, or `None` when
 /// the compiler is missing (**loudly**).
+///
+/// A **missing** `erlc` is a host-facility skip; an `erlc` that ran and **rejected** the probe is a
+/// defect in this suite's own fixture and fails the test — a broken probe must never be able to
+/// turn the whole suite into a silent pass.
 fn compile_probe(dir: &Path) -> Option<PathBuf> {
     let source_path = dir.join("busy_probe.erl");
     if let Err(error) = std::fs::write(&source_path, BUSY_PROBE_ERL) {
-        skip(&format!(
-            "port_busy/probe: cannot write {}: {error}",
-            source_path.display()
-        ));
-        return None;
+        panic!("cannot write {}: {error}", source_path.display());
     }
     let output = match Command::new("erlc").arg("-o").arg(dir).arg(&source_path).output() {
         Ok(output) => output,
@@ -438,16 +547,15 @@ fn compile_probe(dir: &Path) -> Option<PathBuf> {
             return None;
         }
     };
-    if !output.status.success() {
-        skip(&format!(
-            "port_busy/probe: `erlc` exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-        return None;
-    }
+    assert!(
+        output.status.success(),
+        "`erlc` rejected the suite's own probe ({}):\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let beam = dir.join("busy_probe.beam");
-    beam.is_file().then_some(beam)
+    assert!(beam.is_file(), "`erlc` produced no {}", beam.display());
+    Some(beam)
 }
 
 // -------------------------------------------------------------------------------------------
@@ -461,6 +569,10 @@ fn compile_probe(dir: &Path) -> Option<PathBuf> {
 /// travel through the CLI's argument grammar.
 fn run_beam_rt(beam: &Path, dir: &Path, export: &str) -> Option<std::process::Output> {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_beam_rt"));
+    // The `run` action's `ARG` grammar (the CLI contract, `src/cli/CONTEXT.md`) makes a token a
+    // char-list **only when it is double-quoted**; an unquoted token is a bare atom. The probe
+    // appends `"/busy.so"` to its argument, so it must arrive as a string.
+    let dir_arg = format!("\"{}\"", dir.display());
     support::run_bounded(
         &binary,
         &[
@@ -470,7 +582,7 @@ fn run_beam_rt(beam: &Path, dir: &Path, export: &str) -> Option<std::process::Ou
             "run",
             &beam.display().to_string(),
             &format!("busy_probe:{export}"),
-            &dir.display().to_string(),
+            &dir_arg,
         ],
     )
 }
@@ -481,9 +593,132 @@ fn run_oracle(oracle: &Path, dir: &Path, call: &str) -> Option<String> {
     support::oracle_eval(oracle, Some(dir), &expr)
 }
 
+/// This runtime's answer on the **pumping** `-eval` route, with the same expression the oracle is
+/// given.
+///
+/// The route matters: `-eval`'s action process owns the scheduler pass, so a caller waiting for a
+/// busy port to go idle can drive the machine (`Runtime::pump_scheduler`) — which is what makes the
+/// C's suspend-and-reissue arm expressible at all (`crate::port::busy_wait`). Inside a `run`
+/// scheduler slice it cannot, and that half is pinned by
+/// [`a_busy_ports_plain_command_is_the_documented_capability_gap`].
+fn run_beam_rt_eval(dir: &Path, call: &str) -> Option<std::process::Output> {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_beam_rt"));
+    let code_dir = dir.display().to_string();
+    let expr = format!("io:format(\"~w~n\",[{call}]), halt(0).");
+    support::run_bounded(&binary, &["-noshell", "-pa", &code_dir, "-eval", &expr])
+}
+
+/// Asserts one probe's line is **identical** on both runtimes.
+///
+/// The live oracle is first asserted against the recorded constant (so an oracle upgrade that
+/// changes the table fails there, by name), and this runtime is then asserted against the oracle's
+/// own line — never against a second copy of the constant, so the two sides can never drift apart
+/// silently.
+fn assert_probe_agrees(fixture: &Fixture, oracle: &Path, export: &str, expected: &str, row: &str) {
+    // `export` is spelled `name/arity` for the reader; the call form itself must not carry the
+    // arity (`busy_probe:name/1(…)` is not Erlang — it parses as a fun reference under `/`).
+    let name = export.split('/').next().unwrap_or(export);
+    let call = format!("busy_probe:{name}(\"{}\")", fixture.dir.display());
+    let Some(oracle_line) = run_oracle(oracle, &fixture.dir, &call) else {
+        skip(&format!("port_busy/{row}: the oracle could not answer {call}"));
+        return;
+    };
+    assert_eq!(
+        oracle_line, expected,
+        "the recorded oracle answer for `{row}` no longer matches the live oracle"
+    );
+    let Some(output) = run_beam_rt_eval(&fixture.dir, &call) else {
+        panic!("beam_rt -eval {call} did not terminate");
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`{row}` must complete on the pumping route; stderr={stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        oracle_line,
+        "`{row}` must answer exactly as the oracle; stderr={stderr}"
+    );
+}
+
+/// Builds the fixture and the probe, requires the oracle, and asserts one row's line is identical
+/// on both runtimes — the body the four oracle rows share.
+fn the_row_agrees(label: &str, export: &str, expected: &str) {
+    // The A.4 link seam (see the module docs): the `.so` leaves its `driver_*` imports undefined,
+    // so the loading process must publish them, and this anchors the codegen unit.
+    let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
+    let Some(fixture) = build_fixture(label) else {
+        return;
+    };
+    let Some(_beam) = compile_probe(&fixture.dir) else {
+        fixture.cleanup();
+        return;
+    };
+    let Some(oracle) = support::require_oracle(&format!("port_busy/{label}")) else {
+        fixture.cleanup();
+        return;
+    };
+    assert_probe_agrees(&fixture, &oracle, export, expected, label);
+    fixture.cleanup();
+}
+
 // -------------------------------------------------------------------------------------------
 // The tests
 // -------------------------------------------------------------------------------------------
+
+/// **Row 1 — the send-to-port shapes on an idle port.** `Port ! {Pid, {command, Data}}`,
+/// `erlang:send(Port, Msg)` and `erlang:send(Port, Msg, [])` report the message, the message and
+/// `ok`, and the driver's echo proves the command's bytes really reached its `output` callback
+/// (`erts_port_command`'s `{command, Data}` arm, `io.c:3999-4004`). A payload that is **not** a
+/// port signal (`erlang:send(Port, <<"d">>)`) writes nothing and still reports success — the C's
+/// `bad_port_signal`, logged and dropped with `ret_val = 0` (`io.c:4013`), so the send is a silent
+/// success.
+#[test]
+fn the_send_to_port_shapes_on_an_idle_port_agree_with_the_oracle() {
+    the_row_agrees("send_idle", "send_idle/1", EXPECTED_SEND_IDLE);
+}
+
+/// **Row 2 — a plain `port_command` on a BUSY port, on the route that owns the pass.** The port's
+/// busy bit is cleared by `erlang:port_control/3` from a `timer:apply_after/4` helper 100 ms in;
+/// the caller waits for the port to go idle, the command is **re-issued** and accepted, and the
+/// driver's echo arrives — `{true, <<"x">>}` on both runtimes.
+///
+/// This is the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run (`erl_bif_port.c:211-231`), which
+/// `crate::port::busy_wait`'s wait expresses by driving the machine over `Runtime::pump_scheduler`
+/// while the caller blocks. The same call from inside a `run` scheduler slice has no such route and
+/// is the typed capability gap [`a_busy_ports_plain_command_is_the_documented_capability_gap`]
+/// pins, so the two halves of the arm are evidenced separately.
+#[test]
+fn a_plain_port_command_on_a_busy_port_waits_for_the_port_and_is_reissued() {
+    the_row_agrees("busy_pc", "busy_pc/1", EXPECTED_BUSY_PC);
+}
+
+/// **Row 6 — `[nosuspend]` on a busy port.** `erlang:send/3` answers the atom `nosuspend` for a
+/// port-signal payload (nothing queued, nothing written; `ERTS_PORT_OP_BUSY` under
+/// `ERTS_PORT_SIG_FLG_NOSUSPEND`, `erl_bif_port.c:211-214`) and `ok` for a payload that is not a
+/// port signal — the message is decomposed before the port's busy state is consulted, which is why
+/// the silent success wins there. `port_command/3`'s matching `false` arm is the `busy_nosuspend`
+/// row of [`the_busy_port_port_command_matrix_agrees_with_the_oracle`].
+#[test]
+fn nosuspend_on_a_busy_port_agrees_with_the_oracle() {
+    the_row_agrees("send_busy", "send_busy/1", EXPECTED_SEND_BUSY);
+}
+
+/// **Row 5 — a closed (dead) port id and a non-iodata payload.** After `port_close/1`,
+/// `erlang:send(Port, hello)` reports the message (the C's `pt == NULL` silent success,
+/// `bif.c:2594-2600`) while `port_command(Port, <<"x">>)` raises `badarg` — once per driver
+/// variant, on both runtimes.
+///
+/// The two sides spell a caught exception's **stacktrace frames** differently (this runtime does
+/// not reproduce the oracle's `erlang:port_command`/`erl_eval` frames), so the probe reduces every
+/// raise to its `{Class, Reason}` pair inside the module and the compared line carries only the
+/// class and the reason atom — a **value-wise** comparison, never a `~w` equality of stacktraces.
+#[test]
+fn a_dead_port_and_a_non_iodata_payload_agree_with_the_oracle() {
+    the_row_agrees("dead", "dead/1", EXPECTED_DEAD);
+}
 
 /// The six-arm `port_command` matrix reaches **both** `driver_flags` variants of a real driver and
 /// answers exactly as the oracle does.
@@ -511,8 +746,8 @@ fn the_busy_port_port_command_matrix_agrees_with_the_oracle() {
     };
 
     for (export, expected) in [("plain", EXPECTED_PLAIN), ("soft", EXPECTED_SOFT)] {
-        let Some(oracle_line) = run_oracle(&oracle, &fixture.dir, &format!("busy_probe:{export}(\"{}\")", fixture.dir.display()))
-        else {
+        let call = format!("busy_probe:{export}(\"{}\")", fixture.dir.display());
+        let Some(oracle_line) = run_oracle(&oracle, &fixture.dir, &call) else {
             skip(&format!(
                 "port_busy/matrix: the oracle could not answer busy_probe:{export}/1"
             ));
@@ -543,13 +778,16 @@ fn the_busy_port_port_command_matrix_agrees_with_the_oracle() {
     fixture.cleanup();
 }
 
-/// A plain `port_command` on a **busy** port is this runtime's documented capability gap — exit 3
-/// and the `unsupported` banner — where the oracle **suspends** the caller until the port is idle
-/// and then answers `true`.
+/// A plain `port_command` on a **busy** port issued from **inside a scheduler slice** is this
+/// runtime's typed capability gap — exit 3 and the `unsupported` banner — because such a caller
+/// cannot re-enter the scheduler to wait for the port: the wait is `Runtime::pump_scheduler`, and
+/// the slice's pass is already running (see [`crate::port::busy_wait`]'s module docs). The
+/// pumping `-eval` route, which can wait, is
+/// [`a_plain_port_command_on_a_busy_port_waits_for_the_port_and_is_reissued`].
 ///
 /// The oracle side is deliberately *not* run here: with nothing to clear the busy bit that call
 /// blocks for ever (the C's `erts_suspend`), so running it would hang the probe. The oracle's own
-/// half of the divergence is asserted by
+/// half of the arm is asserted by
 /// [`a_busy_ports_plain_command_suspends_the_oracle_caller_until_it_is_cleared`], which clears the
 /// bit from a helper.
 #[test]
@@ -591,8 +829,8 @@ fn a_busy_ports_plain_command_is_the_documented_capability_gap() {
 /// A helper process clears the bit (`port_control(Port, $N, <<>>)`) 200 ms in, while the caller is
 /// inside `port_command`. The oracle then answers `true`, the helper's `cleared` arrives, and the
 /// command really reached the driver (`{ok,cleared,echoed}`) — the C's
-/// `erts_suspend`/`erts_port_resume_procs` round trip, which is exactly what this runtime's BIF
-/// seam cannot express.
+/// `erts_suspend`/`erts_port_resume_procs` round trip, whose wait this runtime reproduces on the
+/// pumping route ([`a_plain_port_command_on_a_busy_port_waits_for_the_port_and_is_reissued`]).
 #[test]
 fn a_busy_ports_plain_command_suspends_the_oracle_caller_until_it_is_cleared() {
     let Some(fixture) = build_fixture("resumed") else {

@@ -430,3 +430,9 @@ fn close_port(runtime: &mut Runtime, owner: ProcessId, id: PortId) -> Result<()>
     let mut hook = crate::port::RuntimePorts::new(Rc::clone(&runtime.ports), atoms, owner);
     hook.close_port(id)
 }
+
+/// This module's unit suite — the wait's verdict matrix against a registered driver fixture, and
+/// the `erts_port_command` decomposition (see `src/port/busy_wait_tests.rs`).
+#[cfg(test)]
+#[path = "busy_wait_tests.rs"]
+mod tests;
