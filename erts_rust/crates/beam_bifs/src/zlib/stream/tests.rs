@@ -1172,11 +1172,11 @@ fn an_uninitialised_stream_answers_not_initialized() {
 #[test]
 fn a_foreign_process_is_refused_until_it_owns_the_stream() {
     let reg = registry();
-    let mut heap = heap();
+    let mut owner_heap = heap();
     let atoms = atoms();
     let owner = ProcessId::new(1, 0);
     let foreign = ProcessId::new(2, 0);
-    let mut ctx = context(&mut heap, &atoms, owner);
+    let mut ctx = context(&mut owner_heap, &atoms, owner);
 
     let handle = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, handle, 6);
