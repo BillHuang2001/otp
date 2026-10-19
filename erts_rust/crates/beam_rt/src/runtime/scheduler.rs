@@ -1213,8 +1213,23 @@ impl Runtime {
             None => (NONODE_NAME.to_string(), 0),
         };
         let atom = self.code_server.atoms_mut().intern(&name);
-        let mut sink = LocalDeliverySink::new(&mut self.processes, atom, creation);
-        driver.dispatch_inbound(heap, self.code_server.atoms_mut(), &mut sink)
+        // The sink is scoped so the fragment replay below can take `&mut self`.
+        let (dispatched, fragment_pids) = {
+            let mut sink = LocalDeliverySink::new(&mut self.processes, atom, creation);
+            let dispatched =
+                driver.dispatch_inbound(heap, self.code_server.atoms_mut(), &mut sink)?;
+            (dispatched, sink.take_fragment_deliveries())
+        };
+        // The two fragment notes for a message that had to go into a heap fragment, exactly
+        // the pair the local send path applies (`crate::context`'s
+        // `send_fragmented_message`): the descent gate, because the payload lives in a region
+        // the receiver's collector does not scan, and the wake the fragment path cannot
+        // record on the table's own wake list.
+        for pid in fragment_pids {
+            self.note_foreign_reachable(pid);
+            self.note_fragment_wake(pid);
+        }
+        Ok(dispatched)
     }
 
     /// The **inbound-delivery half** of a scheduler pass (contract A.5).
@@ -1249,16 +1264,29 @@ impl Runtime {
         }
         // Split borrows: the node and the code server are disjoint fields, so the
         // node's name/creation can be read while its own decode arena is used.
-        let Some(node) = self.dist.as_mut() else {
-            return Ok(0);
-        };
-        if !node.has_established_link() {
+        if !self
+            .dist
+            .as_ref()
+            .is_some_and(|node| node.has_established_link())
+        {
             return Ok(0);
         }
-        let creation = node.creation();
-        let name_atom = self.code_server.atoms_mut().intern(node.node_name());
-        let mut sink = LocalDeliverySink::new(table, name_atom, creation);
-        node.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)
+        // The node and the sink are scoped so the fragment replay below can take `&mut self`.
+        let (delivered, fragment_pids) = {
+            let Some(node) = self.dist.as_mut() else {
+                return Ok(0);
+            };
+            let creation = node.creation();
+            let name_atom = self.code_server.atoms_mut().intern(node.node_name());
+            let mut sink = LocalDeliverySink::new(table, name_atom, creation);
+            let delivered = node.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)?;
+            (delivered, sink.take_fragment_deliveries())
+        };
+        for pid in fragment_pids {
+            self.note_foreign_reachable(pid);
+            self.note_fragment_wake(pid);
+        }
+        Ok(delivered)
     }
 
     /// The **connecting half** of a scheduler pass (contract A.5, Phase 2).
@@ -1310,9 +1338,9 @@ impl Runtime {
         if !self.inbound_delivery {
             return Ok(0);
         }
-        let Some(client) = self.dist_client.as_ref() else {
+        if self.dist_client.is_none() {
             return Ok(0);
-        };
+        }
         // The node identity the sink resolves an addressed pid against: this runtime's own
         // `node@host` name and creation, exactly what the listening half uses. A client exists
         // only for a node, so the `None` arm is unreachable in practice — it keeps the fixed
@@ -1321,9 +1349,21 @@ impl Runtime {
             Some(node) => (node.node_name().to_string(), node.creation()),
             None => (NONODE_NAME.to_string(), 0),
         };
-        let name_atom = self.code_server.atoms_mut().intern(&name);
-        let mut sink = LocalDeliverySink::new(table, name_atom, creation);
-        client.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)
+        // The client and the sink are scoped so the fragment replay below can take `&mut self`.
+        let (delivered, fragment_pids) = {
+            let Some(client) = self.dist_client.as_ref() else {
+                return Ok(0);
+            };
+            let name_atom = self.code_server.atoms_mut().intern(&name);
+            let mut sink = LocalDeliverySink::new(table, name_atom, creation);
+            let delivered = client.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)?;
+            (delivered, sink.take_fragment_deliveries())
+        };
+        for pid in fragment_pids {
+            self.note_foreign_reachable(pid);
+            self.note_fragment_wake(pid);
+        }
+        Ok(delivered)
     }
 
     /// How long this pass may sleep waiting for the next timer deadline, or `None` when it

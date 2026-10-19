@@ -11,7 +11,7 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 - `dist.rs` (module `crate::dist`, FROZEN façade): `NodeName` (+ `local_hostname`), `DistConnection` (+ `state`/`is_established`/`is_live`/`peer_name`/`peer_creation`/`peer_visibility`/`peer_addr`/`bytes`/`has_pending_output`/`close`, and the crate-visible `node_term`/`bind_node`/`send_control`/`send_message`/`flush_output`), `DistNode`, `DistConnectionSnapshot`, `resolve_cookie`, `epmd_addr`, and the consts `NONODE_NAME`, `DIST_READ_SLICE`, `DIST_LISTEN_ADDR` (also `MAX_ACCEPTS_PER_PUMP`/`DIST_DISPATCH_HEAP_WORDS`).
 - `DistNode`: `start`/`node_name`/`advertised_name`/`epmd_name`/`is_short_name`/`port`/`creation`/`is_registered`/`is_alive`/`registration_error`/`pump`/`has_established_link`/`dispatch_inbound`/`last_link_error`/`is_idle`, the **diagnostic** `connections() -> Vec<DistConnectionSnapshot>`, and the crate-visible `links()` (the shared accepted cell) and `bind_peer_nodes(&mut AtomTable) -> Result<usize>`.
 - `dist/links.rs`: `DistLinks` (crate-visible) — `new(accepted)`, `outbound`/`accepted`, `link_index_for_node`, `accepted_index_for_node`, `has_established_link_to`, `names_node`, `may_reach_node`, `has_any`/`is_idle`/`has_established`, `established_names`, `node_label`/`node_label_in`, `route_control`, `route_message`, `route_alias` — plus the free `no_link_error`, `alias_flag_error`, `negotiated_alias` and the `pub` `DistConnectionSnapshot`.
-- `dist/inbound.rs`: `LocalDeliverySink` — the `impl InboundSink` sink plus its private `Target` enum and routing helpers (`envelope_from`, `receipt`, `remote_pid`, `small_uint`).
+- `dist/inbound.rs`: `LocalDeliverySink` — the `impl InboundSink` sink plus its private `Target` enum and routing helpers (`envelope_from`, `receipt`, `remote_pid`, `small_uint`), the `pub(crate)` `take_fragment_deliveries` and the private `enqueue_fragmented` behind it.
   **Path identity is mandatory**: it is re-exported from the parent as `pub use inbound::LocalDeliverySink;`, so `crate::dist::LocalDeliverySink` (and `beam_rt::dist::LocalDeliverySink`) resolve exactly as before the split.
 
 ## One table over both halves (the A.5 routing gate)
@@ -43,6 +43,9 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 ## The two halves, one line each
 - `dist.rs` — bind a wildcard listener, register with `epmd` (best-effort), and drive each accepted link through `beam_dist::ConnectionDriver` (server `'N'` → `'s'`/`'S'` → `'r'` → `'a'`), then per-link checked drain (`dispatch_inbound_checked`) handing each classified `Delivery` to the sink.
 - `dist/inbound.rs` — the `InboundSink` sink: route the message family and the route-free receipt signal families into the local process table, report the genuinely unrouted families as the honest `DeliveryOutcome::Unsupported`.
+  A message the receiver's own **heap** refuses is delivered through the **heap-fragment** fallback (`enqueue_fragmented` → `beam_message::send_fragmented`), the C's `erts_try_alloc_message_on_heap`/`new_message_buffer` path, so an oversized message from a peer is really delivered instead of dropped.
+  A **delivery** refusal is therefore never an `Err` and never retires the link: the outcomes are `Delivered` (on the receiver's heap, or in a fragment) and `Dropped` (only when even the fragment could not be allocated).
+  The sink records each fragment receiver in `fragment_deliveries`, and the caller replays the runtime's two fragment notes for it after the drain (`note_foreign_reachable` + `note_fragment_wake`, the pair the local send path applies) at all three sink sites in `src/runtime/scheduler.rs`.
 
 ## How an accepted link is driven (read before debugging a stalled peer handshake)
 - One `DistConnection` per accepted socket owns one `ConnectionDriver::server_with_flags(advertised, cookie, creation, flags)`: `advertised` is the **full** `node@host` (`NodeName::parse`), the cookie is `resolve_cookie` (`-setcookie` → `$HOME/.erlang.cookie` → `b"nocookie"`), `creation` is the `epmd` value (`1`, `DEFAULT_CREATION`, before/without registration), and `flags` is **this node's** advertised capability set — `advertised_flags(hidden)` = the emulator default `| publish_flag(hidden, true)`, i.e. `DFLAG_PUBLISHED` unless the node is `-hidden` (`DistNode::set_hidden`, set by `Runtime::new` from the `-hidden` init argument). The connecting half advertises that same set (`dist_client.rs::connect_addr` → `ConnectionDriver::client_with_flags`), because visibility belongs to the node, not to who dialled.
@@ -62,9 +65,10 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 - Errors are return-based (`beam_common::Result`); a link-level failure **retires that one link** and is recorded, never raised — it must never fail a scheduler pass.
 - `unsafe`-free (the crate is `#![deny(unsafe_code)]`).
 - Never deliver to the wrong process: an addressed party not local to *this* node is `NoSuchProcess`, a party outside its opcode's wire contract is `Unsupported`, never a silent mis-delivery.
+- A **delivery** refusal is never a link-level failure: the inbound sink answers an outcome (`Delivered`, or `Dropped` when even a heap fragment cannot be allocated) and only a protocol/decode/table-invariant failure is an `Err` — so one oversized message from a peer never tears the link down.
 - Never route silently: a node no link reaches is the typed `no_link_error` from the routing entry, and a queued control whose link died is dropped with its reason recorded — never a quiet success.
 - Do not hand-edit generated artifacts; Apache-2.0 header block required on every `.rs` file.
-- Keep each file ~1000 lines: `dist.rs` is 1511 (1056 of production, the rest its inline unit suite — loopback `DistConnection`/`DistNode` fixtures over a real socket pair), `dist/links.rs` is 498 of production with its loopback table/router suite split out to the sibling `dist/links/tests.rs` (652, the crate's `port/tests.rs` pattern), `dist/inbound.rs` is 865.
+- Keep each file ~1000 lines: `dist.rs` is 1511 (1056 of production, the rest its inline unit suite — loopback `DistConnection`/`DistNode` fixtures over a real socket pair), `dist/links.rs` is 498 of production with its loopback table/router suite split out to the sibling `dist/links/tests.rs` (652, the crate's `port/tests.rs` pattern), `dist/inbound.rs` is 983 with its own suite split out the same way to `dist/inbound/tests.rs` (228).
 
 ## Missing sibling APIs (the still-`Unsupported` families)
 - **The distributed-spawn family** (`SpawnRequest`/`SpawnReply`) needs a `beam_process` spawn-responder/reservation API — a `DOP_SPAWN_REPLY` sender plus the reservation bookkeeping a `DOP_SPAWN_REQUEST` keys into.
@@ -76,7 +80,7 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 ## Routing Table
 - `dist.rs` (parent) → the node half: `DistNode`/`DistConnection`/`NodeName`/`DistConnectionSnapshot`/`resolve_cookie`/`NONODE_NAME`; declares `mod inbound;`/`mod links;` and re-exports `LocalDeliverySink`.
 - `dist/links.rs` → the one node→link table over both halves (`DistLinks`), the one routing entry (`route_control`/`route_message`/`route_alias`) and the single `no_link_error`.
-- `dist/inbound.rs` → the inbound delivery sink over `beam_dist::InboundSink` (contract A.5): `LocalDeliverySink` + routing helpers.
+- `dist/inbound.rs` → the inbound delivery sink over `beam_dist::InboundSink` (contract A.5): `LocalDeliverySink` + routing helpers, the heap-fragment fallback (`enqueue_fragmented`) and its `fragment_deliveries` record (`take_fragment_deliveries`); its suite is the sibling `dist/inbound/tests.rs`.
 
 ## See Also
 - `../dist_client.rs` → the connecting half (outbound client handshake, the queued `DistSignalRouter` and its `flush_pending`).
