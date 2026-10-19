@@ -264,54 +264,41 @@ impl RuntimeContext<'_> {
         } else {
             CommandOptions::default()
         };
-        // The registry is reached through a cheap clone of its `Rc` handle so writing to the
-        // child never holds a borrow of the runtime while a term (the atom `true`) is built —
-        // the same snapshot rule the port poller follows (`crate::port`). The liveness check and
-        // the two busy facts are read under **one** borrow: they are the C's `sig_lookup_port`
-        // followed by its `prt->drv_ptr->flags`/`ERTS_PTS_FLG_BUSY_PORT` reads (`erl_bif_port.c:192-198`,
-        // `io.c:1749-1764`), taken before any decision.
-        let ports = std::rc::Rc::clone(&self.runtime.ports);
-        let (busy, soft_busy) = {
-            let registry = ports
-                .try_borrow()
-                .map_err(|_| error::unsupported("the port table is already in use"))?;
-            if !registry.is_live(port) {
-                return Err(BeamError::BadArg);
-            }
-            (registry.is_busy(port), registry.soft_busy(port))
-        };
-        if options.force {
-            // `force` pushes the command through a busy port. Only a driver that advertises
-            // `ERL_DRV_FLAG_SOFT_BUSY` can accept it; every other driver — the spawn/`fd` drivers
-            // included — is the oracle's `error:notsup`, whether or not the port is busy.
-            // Deliberately **not** a capability gap (see `crate::error`'s `unsupported` convention):
-            // the oracle raises the same `notsup`.
-            if !soft_busy {
-                return Err(error::message("notsup"));
-            }
-        } else if busy {
-            if options.nosuspend {
-                // The C answers the atom `false` and drops the command (nothing is written).
-                return self.atom("false");
-            }
-            // The C suspends the caller (`erts_suspend` + `ERTS_BIF_YIELD3`) and re-runs the BIF
-            // once the port is idle, then answers `true`. This runtime has no BIF-suspend channel,
-            // so there is no truthful answer to give — a typed capability gap, never a fabricated
-            // `true`.
-            return Err(error::unsupported(
-                "port_command on a busy port: suspending the caller until the port is idle is not \
-                 implemented",
-            ));
-        }
+        // The iodata is collected here — the port layer's seam takes bytes — and the **whole**
+        // decision on them is `beam_io`'s, reached through the port hook
+        // ([`RuntimePorts::command`](crate::port::RuntimePorts::command), which wraps
+        // `beam_io::PortRegistry::port_command_with`): a dead port is `badarg` (the C's
+        // `sig_lookup_port`), `[force]` on a driver entry without `ERL_DRV_FLAG_SOFT_BUSY` is
+        // `notsup` whether or not the port is busy (`erl_bif_port.c:195-198`), and a busy port is
+        // the C's `ERTS_PORT_OP_BUSY` with **nothing queued** (`io.c:1763-1769`).
         let mut bytes = Vec::new();
         self.iodata_bytes(data, &mut bytes)?;
-        {
-            let mut registry = ports
-                .try_borrow_mut()
-                .map_err(|_| error::unsupported("the port table is already in use"))?;
-            registry.write_command(port, &bytes)?;
+        let mut hook = crate::port::RuntimePorts::new(
+            Rc::clone(&self.runtime.ports),
+            self.runtime.code_server.atoms_handle(),
+            self.pid(),
+        );
+        let outcome = hook.command(
+            port,
+            &bytes,
+            beam_io::PortCommandOptions::EMPTY
+                .with_force(options.force)
+                .with_nosuspend(options.nosuspend),
+        )?;
+        match outcome {
+            // Queued, written and counted by the seam: the C's `ERTS_PORT_OP_DONE` ⇒ `true`.
+            beam_io::PortCommandOutcome::Done => self.atom("true"),
+            // `ERTS_PORT_OP_BUSY`. `[nosuspend]` answers the atom `false` and drops the command
+            // (`erl_bif_port.c:211-214`); a plain command makes the C suspend the caller and
+            // re-issue the BIF once the port is idle, which this runtime's BIF seam
+            // (`ExecutionContext::call_bif`) cannot express — so that case is the typed capability
+            // gap, never a fabricated `true`.
+            beam_io::PortCommandOutcome::Busy if options.nosuspend => self.atom("false"),
+            beam_io::PortCommandOutcome::Busy => Err(error::unsupported(
+                "port_command on a busy port: suspending the caller until the port is idle is not \
+                 implemented",
+            )),
         }
-        self.atom("true")
     }
 
     /// Validates `erlang:port_command/3`'s `Options` and reports which of the two recognized
