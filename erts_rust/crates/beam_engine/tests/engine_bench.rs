@@ -63,7 +63,8 @@
 //! 2. the setup cost is itself **measured**, by the [`bench_setup_empty`] floor —
 //!    and [`bench_dispatch_many_labels`] checks the other side of the same fact: a
 //!    body of *distinct* labels, the no-op baseline's exact length, carries no
-//!    per-run penalty for its wide label table.//!
+//!    per-run penalty for its wide label table.
+//!
 //! ## Workloads
 //!
 //! | workload | body (per run) | instruction kinds isolated |
@@ -94,7 +95,8 @@
 //!
 //! * **Measured**: the wall-clock `ns/instruction` of every workload (median of
 //!   [`SAMPLES`] samples), and — from the difference between the no-op and
-//!   many-labels baselines — that a wide label table adds no per-run cost.//! * **Inferred**: the per-instruction-kind attribution, from the *difference*
+//!   many-labels baselines — that a wide label table adds no per-run cost.
+//! * **Inferred**: the per-instruction-kind attribution, from the *difference*
 //!   between a kind-isolating workload and the no-op baseline (see
 //!   [`report_attribution`]). A difference isolates the marginal cost of that
 //!   kind only to the extent the two bodies are otherwise alike; the loop and
@@ -295,7 +297,8 @@ fn bench_setup_empty() -> Report {
 /// instructions. The trick is that all *K* labels are the **same** label, so the
 /// per-run label map stays 2 entries wide and the measurement isolates dispatch
 /// rather than any label-table effect ([`bench_dispatch_many_labels`] carries the
-/// same body with *distinct* labels).fn bench_dispatch_noop() -> Report {
+/// same body with *distinct* labels).
+fn bench_dispatch_noop() -> Report {
     let shared = Label(2);
     let body = vec![Instr::Label(shared); KIND_OPS];
     let (module, function) = finish_module(Module::default(), "bench_noop", 2, body);
@@ -1305,7 +1308,8 @@ fn report_table(reports: &[Report]) {
 /// the baseline's *exact* instruction count. The module's map is built once per
 /// machine (`Machine::label_map`) and therefore in the warm-up, so the residual
 /// between the two rows is the per-run cost of a wide label table — no build, only
-/// the entry-label lookup.fn report_attribution(reports: &[Report]) {
+/// the entry-label lookup.
+fn report_attribution(reports: &[Report]) {
     let by_label = |needle: &str| reports.iter().find(|r| r.label.starts_with(needle));
     let floor_ns_per_run = by_label("setup/empty")
         .expect("the setup floor is always measured")
