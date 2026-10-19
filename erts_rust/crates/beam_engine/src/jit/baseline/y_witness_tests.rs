@@ -440,7 +440,7 @@ fn y_shape_module() -> (Module, Atom) {
             src: Operand::Y(0),
             dst: Operand::X(0),
         },
-        Instr::Deallocate(1),
+        Instr::Deallocate(2),
         Instr::Return,
     ])
 }
