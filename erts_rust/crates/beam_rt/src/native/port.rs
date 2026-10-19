@@ -277,32 +277,32 @@ impl RuntimeContext<'_> {
             iodata_bytes(data, &mut bytes)?;
             Ok(bytes)
         };
-        let mut hook = crate::port::RuntimePorts::new(
-            Rc::clone(&self.runtime.ports),
-            self.runtime.code_server.atoms_handle(),
-            self.pid(),
-        );
-        let outcome = hook.command_with_data(
+        // The whole `erts_port_output` outcome matrix, including the C's **suspend-and-retry**
+        // loop for a plain command on a busy port ([`crate::port::busy_wait::issue`]): the caller
+        // waits until the port is idle — driving the machine meanwhile, so a driver callback or a
+        // `port_control/3` from another process can clear the bit — and the command is then
+        // re-issued, which is exactly the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run.
+        let options = beam_io::PortCommandOptions::EMPTY
+            .with_force(options.force)
+            .with_nosuspend(options.nosuspend);
+        let may_pump = self.may_pump_scheduler();
+        let owner = self.pid();
+        let written = crate::port::busy_wait::issue(
+            &mut *self.runtime,
+            may_pump,
+            owner,
             port,
             make_data,
-            beam_io::PortCommandOptions::EMPTY
-                .with_force(options.force)
-                .with_nosuspend(options.nosuspend),
+            options,
         )?;
-        match outcome {
+        let answer = match written {
             // Queued, written and counted by the seam: the C's `ERTS_PORT_OP_DONE` ⇒ `true`.
-            beam_io::PortCommandOutcome::Done => self.atom("true"),
-            // `ERTS_PORT_OP_BUSY`. `[nosuspend]` answers the atom `false` and drops the command
-            // (`erl_bif_port.c:211-214`); a plain command makes the C suspend the caller and
-            // re-issue the BIF once the port is idle, which this runtime's BIF seam
-            // (`ExecutionContext::call_bif`) cannot express — so that case is the typed capability
-            // gap, never a fabricated `true`.
-            beam_io::PortCommandOutcome::Busy if options.nosuspend => self.atom("false"),
-            beam_io::PortCommandOutcome::Busy => Err(error::unsupported(
-                "port_command on a busy port: suspending the caller until the port is idle is not \
-                 implemented",
-            )),
-        }
+            crate::port::busy_wait::PortWrite::Written => "true",
+            // `ERTS_PORT_OP_BUSY` under `ERTS_PORT_SIG_FLG_NOSUSPEND`: nothing queued, nothing
+            // written — the atom `false` (`erl_bif_port.c:211-214`).
+            crate::port::busy_wait::PortWrite::Suspended => "false",
+        };
+        self.atom(answer)
     }
 
     /// Validates `erlang:port_command/3`'s `Options` and reports which of the two recognized

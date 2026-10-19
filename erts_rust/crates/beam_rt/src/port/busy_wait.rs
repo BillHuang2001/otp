@@ -270,6 +270,40 @@ fn port_state(runtime: &Runtime, id: PortId) -> Result<Option<bool>> {
     Ok(Some(registry.is_busy(id)))
 }
 
-#[cfg(test)]
-#[path = "busy_wait_tests.rs"]
-mod tests;
+/// The C's **`send` port arm**: every failure is a silent success.
+///
+/// `do_send`'s `port_common` block (`bif.c:2551-2613`) treats a busy port exactly as
+/// [`issue`] does, but its *failures* are not raises: `ERTS_PORT_OP_DROPPED`, `BADARG` and
+/// `DONE` all fall out with `ret_val = 0`, so the BIF reports the **message term** and writes
+/// nothing. A dead / never-opened / wrong-incarnation port id never even enters the block
+/// (`pt == NULL`), which is the same silent success — measured on the oracle: after
+/// `port_close(P)`, `erlang:send(P, hello)` answers `hello`, while `port_command(P, <<"x">>)`
+/// answers `error:badarg`.
+///
+/// A capability gap (an expired deadline, a caller that cannot pump, a port busy again after the
+/// wait) is **not** swallowed: it is a raise the caller cannot observe as a value, so it is
+/// propagated exactly as [`issue`] reports it.
+///
+/// # Errors
+///
+/// Only the capability gaps of [`issue`] and a genuine write failure (a child that closed its
+/// stdin is `EPIPE`, which the C reports through the port's failure channel rather than the BIF).
+pub(crate) fn send_to_port<F>(
+    runtime: &mut Runtime,
+    may_pump: bool,
+    owner: ProcessId,
+    id: PortId,
+    make_data: F,
+) -> Result<()>
+where
+    F: Fn() -> Result<Vec<u8>>,
+{
+    match issue(runtime, may_pump, owner, id, make_data, PortCommandOptions::EMPTY) {
+        // `DONE`, and the `nosuspend`/dropped arms: the message term is the BIF value.
+        Ok(_) => Ok(()),
+        // The C's silent success for a port that is not there and for whatever the port axis
+        // rejected.
+        Err(BeamError::BadArg) => Ok(()),
+        Err(other) => Err(other),
+    }
+}

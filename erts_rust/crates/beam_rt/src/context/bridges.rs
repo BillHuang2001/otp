@@ -436,8 +436,61 @@ impl SendHook for SendBridge<'_> {
             }
         }
     }
-}
-/// The `{Name, Node}` pair of an atom/atom 2-tuple destination, if `to` is one.
+
+    /// `erlang:send/3` (`bif.c:2703-2800`): the atom `ok` on success, and the atom `nosuspend`
+    /// for a **busy port** under `[nosuspend]` (`bif.c:2757-2763`) — the one destination whose
+    /// answer differs from the plain `send`'s.
+    ///
+    /// A port destination runs the same write and suspend-and-retry loop as `erlang:send/2`
+    /// ([`crate::port::busy_wait::issue`]) and folds its verdict into [`SendOutcome`]; a port the
+    /// runtime no longer holds is the send route's silent success (`SendOutcome::Ok`), exactly as
+    /// for the `/2` form. Every other destination keeps the seam's existing behaviour: the plain
+    /// [`Self::send`] delivery, reported as `ok`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send`], plus the typed capability gaps of
+    /// [`crate::port::busy_wait::issue`] (an expired deadline, and a caller inside a scheduler
+    /// slice that cannot pump — the `send` route has no engine-side BIF-suspend channel).
+    fn send_with_options(
+        &mut self,
+        to: Eterm,
+        term: Eterm,
+        options: beam_bifs::SendOptions,
+    ) -> Result<beam_bifs::SendOutcome> {
+        let port = match self.resolve(to)? {
+            SendDestination::Port { id } => id,
+            _ => {
+                self.send(to, term)?;
+                return Ok(beam_bifs::SendOutcome::Ok);
+            }
+        };
+        let may_pump = self.may_pump_scheduler;
+        let owner = self.mailbox_pid;
+        let opts = beam_io::PortCommandOptions::EMPTY.with_nosuspend(options.nosuspend);
+        let written = crate::port::busy_wait::issue(
+            &mut *self.runtime,
+            may_pump,
+            owner,
+            port,
+            || {
+                let mut bytes = Vec::new();
+                crate::native::port::iodata_bytes(term, &mut bytes)?;
+                Ok(bytes)
+            },
+            opts,
+        );
+        match written {
+            // The bytes were queued and written (or dropped by the port axis): `ok`.
+            Ok(crate::port::busy_wait::PortWrite::Written) | Err(BeamError::BadArg) => {
+                Ok(beam_bifs::SendOutcome::Ok)
+            }
+            // `ERTS_PORT_SIG_FLG_NOSUSPEND` on a busy port: the atom `nosuspend`.
+            Ok(crate::port::busy_wait::PortWrite::Suspended) => Ok(beam_bifs::SendOutcome::Nosuspend),
+            Err(other) => Err(other),
+        }
+    }
+}/// The `{Name, Node}` pair of an atom/atom 2-tuple destination, if `to` is one.
 ///
 /// The C only treats a 2-tuple of **atoms** as a remote send (`bif.c:2614-2621`); every other
 /// tuple shape is `SEND_BADARG`. A non-2-tuple, a non-tuple, or a tuple with a non-atom element

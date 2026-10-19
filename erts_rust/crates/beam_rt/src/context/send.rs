@@ -91,6 +91,14 @@ pub(super) enum SendDestination {
         /// [`beam_codec::term::external_ref_parts`], which is how this arm was selected).
         to: Eterm,
     },
+    /// A **port** on this node: the C's `port_common` block (`bif.c:2551-2613`), which writes
+    /// `Msg` to the port's stream exactly as `erlang:port_command/2` would — except that every
+    /// failure is a **silent success** (the BIF reports the message term), including a port the
+    /// runtime no longer holds.
+    Port {
+        /// The port the delivery writes to.
+        id: PortId,
+    },
     /// A `{Name, Node}` atom pair: `{DOP_REG_SEND, From, Cookie, ToName} -- Msg`.
     RemoteName {
         /// The registered name on the peer.
@@ -143,10 +151,11 @@ pub(super) enum SendDestination {
 /// # Errors
 ///
 /// [`BeamError::BadArg`] for the destinations the oracle rejects with `badarg`; a typed
-/// capability gap ([`crate::error::unsupported`]) for the ones it accepts but this runtime
-/// cannot serve yet — a port destination, and a `{Name, Node}` pair naming **another** node on
-/// a runtime that is **not** a distributed node (`dist_client()` is `None`, which is the
-/// message the non-distributed corpus has always pinned).
+/// capability gap ([`crate::error::unsupported`]) for a `{Name, Node}` pair naming **another**
+/// node on a runtime that is **not** a distributed node (`dist_client()` is `None`, which is the
+/// message the non-distributed corpus has always pinned). A **port** destination classifies
+/// successfully ([`SendDestination::Port`]); its own failures are resolved by the write, which
+/// reports them the way the C's send route does (a silent success).
 pub(super) fn classify_send_destination(
     runtime: &Runtime,
     table: &ProcessTable,
@@ -190,9 +199,12 @@ pub(super) fn classify_send_destination(
         return Ok(SendDestination::RemoteAlias { to });
     }
     if PortId::from_eterm(to).is_ok() {
-        return Err(error::unsupported(
-            "erlang:send/2 to a port: the port write path is not wired",
-        ));
+        // The C's port arm (`bif.c:2551-2613`): the port's write path, i.e. the very
+        // `port_command/2` decision — but with the send route's *silent* failure semantics
+        // (see [`SendDestination::Port`]).
+        return Ok(SendDestination::Port {
+            id: PortId::from_eterm(to)?,
+        });
     }
     if let Some((name_atom, node_atom, name, node)) = two_atom_tuple(runtime.code_server.atoms(), to)
     {
@@ -786,6 +798,7 @@ impl<'a> RuntimeContext<'a> {
             SendDestination::RemotePid { .. }
             | SendDestination::RemoteAlias { .. }
             | SendDestination::RemoteName { .. }
+            | SendDestination::Port { .. }
             | SendDestination::Dropped => Err(BeamError::BadArg),
         }
     }
@@ -852,6 +865,18 @@ impl<'a> RuntimeContext<'a> {
             }
             SendDestination::RemoteAlias { to: alias } => {
                 self.runtime.dist_send_alias(alias, from, message)?;
+            }
+            // A **port** on this node: the C's `port_common` block (`bif.c:2551-2613`). The write
+            // is `port_command/2`'s decision and its suspend-and-retry loop, with the send route's
+            // silent-failure semantics (`send_to_port`), so a dead port and a non-iodata `Data`
+            // both report the message term instead of raising.
+            SendDestination::Port { id } => {
+                let may_pump = self.may_pump_scheduler;
+                crate::port::busy_wait::send_to_port(&mut *self.runtime, may_pump, from, id, || {
+                    let mut bytes = Vec::new();
+                    crate::native::port::iodata_bytes(message, &mut bytes)?;
+                    Ok(bytes)
+                })?;
             }
             // Accepted and dropped: nothing to deliver and nothing to transmit.
             SendDestination::Dropped => {}

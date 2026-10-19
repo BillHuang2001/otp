@@ -1747,10 +1747,12 @@ impl PortRegistry {
     /// Writes `bytes` to the port's stream — `erlang:port_command/2`, i.e. [`PortRegistry::command`]
     /// with **no** options.
     ///
-    /// A busy port is reported as the typed capability gap the runtime's `port_command` floor
-    /// raises for a plain command on one (this seam has no way to suspend the caller and re-issue
-    /// the command, which is what the C does); every other outcome is [`Ok`] — the bytes really
-    /// were handed to the stream, or the driver really did answer them.
+    /// A busy port is reported as the typed capability gap [`busy_wait::NO_PUMP_REASON`] raises
+    /// for a plain command on one: this seam holds no [`Runtime`](crate::runtime::Runtime) and so
+    /// has no authority to pump the scheduler, which is the wait the C's `erts_suspend` +
+    /// `ERTS_BIF_YIELD3` re-run needs. Every other outcome is [`Ok`] — the bytes really were handed
+    /// to the stream, or the driver really did answer them. The pumping callers (`port_command/2,3`
+    /// and `send/2,3`) go through [`busy_wait::issue`] instead.
     ///
     /// # Errors
     ///
@@ -1758,10 +1760,7 @@ impl PortRegistry {
     pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
         match self.command(id, bytes, PortCommandOptions::EMPTY)? {
             PortCommandOutcome::Done => Ok(()),
-            PortCommandOutcome::Busy => Err(error::unsupported(
-                "port_command on a busy port: suspending the caller until the port is idle is not \
-                 implemented",
-            )),
+            PortCommandOutcome::Busy => Err(error::unsupported(busy_wait::NO_PUMP_REASON)),
         }
     }
 
