@@ -253,14 +253,10 @@ pub fn oracle_inflate(stream: &[u8]) -> Option<Vec<u8>> {
         "{ok,B}=file:read_file(os:getenv(\"BD_HEX\")),",
         "Z=zlib:open(),",
         "ok=zlib:inflateInit(Z),",
-        // `zlib:inflate/2` can return before Z_STREAM_END when its internal output
-        // buffer fills, so keep passing `finish` until `inflate` reports `finished`.
-        "L=fun F(In, Acc) ->",
-        "    case zlib:inflate(Z, In, finish) of",
-        "        {finished, Out} -> iolist_to_binary(lists:reverse([Out|Acc]));",
-        "        Out -> F(<<>>, [Out|Acc])",
-        "    end end,",
-        "O=L(binary:decode_hex(B), []),",
+        // `zlib:inflate/3` dequeues until its input is exhausted and returns a plain
+        // iolist (the `{continue,_}`/`{finished,_}` tuples come from `safeInflate/2`),
+        // so a single call is enough.
+        "O=iolist_to_binary(zlib:inflate(Z, binary:decode_hex(B))),",
         "ok=zlib:inflateEnd(Z),zlib:close(Z),",
         "io:format(\"~s\",[binary:encode_hex(O)]),",
         "halt()."
