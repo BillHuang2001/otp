@@ -48,6 +48,10 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   fallback), so a `badarg`/`error` the runtime interned after the module was loaded still lands in its handler.
   `dispatch_wide`; `STACK_ARGS = 2` (arities ≤ it marshal through a fixed stack array, larger ones through the
   reusable `args_scratch`).
+  **Every marshalling helper returns `Result<BifOutcome>`**, not a bare value: `Machine::dispatch_bif_call`
+  (`&self`) takes one of the two outcome-aware host doors, and a `BifOutcome::Suspend` at a re-execution-idempotent
+  site becomes `Step::Suspend { func, pc }` — the calling instruction left completely un-applied — while the
+  non-idempotent `erlang:apply/3` route (`families/funs/mod.rs`) reports the typed `unsupported` instead.
 - `test.rs` — `Machine::eval_test` (all 25 `TestKind`s) + `eval_is_function2`/`eval_is_tagged_tuple`/`eval_test_arity`.
 - `trace.rs` — the contract-A.8 `call`/`return_from`/`return_to` emission (gated on `Machine::trace_on`).
 - `tests.rs` — the unit tests migrated from the former single-file `interpreter.rs`.
@@ -184,12 +188,13 @@ zero-`alloc_words` claim on the immediate-only switches — is `tests/select_val
 The host is handed a **copy** of the argument terms, never a borrow of the `x` file — and the copy lives in no root set.
 - arity `<= STACK_ARGS` (2) → a **stack array** (`EMPTY_ARGS`, `bif.rs:51`), filled from the operands at `bif.rs:88-91` (`gc_bif`/`bif`) or from `x(0..nregs)` at `bif.rs:233-238` (`call_ext*`/local-call route).
 - a wider arity → `Machine::args_scratch`, which `dispatch_wide` **takes out of the machine** (`std::mem::take`, `bif.rs:157`) and reinstalls *empty* at `bif.rs:167` — so during the dispatch the buffer is not reachable from `Machine` at all (`args_scratch` field doc: `machine/mod.rs:375-387`).
-`Machine::with_roots` publishes only `x`/`stack`/`fr` (`machine/mod.rs:643-679`), so neither flavour is a GC root; and `Machine::dispatch_bif_call` takes **`&self`** (`bif.rs:291-305`) while `call_bif_in_machine` gets `&Machine` (`context.rs:413`), so a **collecting** host can neither relocate the argument words nor write relocated words back into `x`. `ExecutionContext::call_bif`/`call_bif_in_machine` state **no GC contract for `args`** (`context.rs:335`, `:413`) — the host rule is that a BIF dispatch must not move the calling process's heap.
+`Machine::with_roots` publishes only `x`/`stack`/`fr` (`machine/mod.rs:643-679`), so neither flavour is a GC root; and `Machine::dispatch_bif_call` takes **`&self`** and returns **`Result<BifOutcome>`** (`bif.rs:320-334` — one of the two outcome-aware doors, `call_bif_outcome`/`call_bif_in_machine_outcome`, never a bare `Eterm`) while `call_bif_in_machine` gets `&Machine` (`context.rs:597`), so a **collecting** host can neither relocate the argument words nor write relocated words back into `x`. `ExecutionContext::call_bif`/`call_bif_in_machine` state **no GC contract for `args`** (`context.rs:446`, `:597`) — the host rule is that a BIF dispatch must not move the calling process's heap.
 Two further shapes to keep in mind when auditing this seam: `Instr::GcBif`/`Bif`/`Bif0`/`CallExt*` perform **no heap admission** of their own (the compiler's separate `test_heap`/`allocate_heap` is the only admission point), and `read_operand` of a **non-small** `Operand::Integer`/`Character` **allocates** via `ctx.alloc_words` (`operand.rs:69`, `:75` → `terms/number.rs:154`) *between* the reads of successive operands, i.e. inside the marshalling loops at `bif.rs:90`/`:112`, with the already-read terms unpublished. `trace_call` has the same shape: it fills the same taken-out scratch (`trace.rs:186-208`) and passes `&scratch` to `ctx.trace_event` **before** the `call_ext*` dispatch (`dispatch.rs:524-526`, `:541-543`, `:585-587`).
 
 ## Execution-position bookkeeping (exactness)
 `Machine::drive` stores the position **before** pricing the instruction (`machine/drive.rs:169`), so a pre-empting `reduce` `Err` (`:181-184`) parks the machine on the NOT-yet-executed instruction; `step_instruction_with_entry` re-stores the same `(func, pc)` at `dispatch.rs:201` before the body (`:202`). The module **context** is switched after the step returns and before the next store (`drive.rs:216-226` → `machine/mod.rs:726`), so `current_code` and `self.context` agree at every charge point and every step entry.
 A suspend is the one place the two positions differ: `step` reports `Step::Wait { func, pc }` = the **resume label** (`families/receive.rs:245-248`), while `current_code` still names the `wait`/`wait_timeout` instruction that suspended.
+`Step::Suspend { func, pc }` is the opposite case: the BIF instruction was **not** applied, so the reported address *is* the instruction (`current_code`), and the dispatch loop's arm for it returns `RunOutcome::Suspend` verbatim (`machine/drive.rs:250-252`) for the host's resume to re-execute.
 
 ## Typed-error inventory (interpreter core)
 Every typed error this core (and the `machine/` machinery it drives) can return is one of three classes; a real
