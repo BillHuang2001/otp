@@ -50,7 +50,7 @@
 
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_deflate::{Deflate, DeflateConfig, Flush, Method, Strategy};
+use beam_deflate::{Deflate, DeflateConfig, Flush};
 use beam_process::ProcessId;
 use beam_term::{make_small, AtomTable, Eterm, NIL};
 
@@ -474,9 +474,10 @@ fn name_of(ctx: &BifContext<'_>, term: Eterm) -> Option<&'static str> {
 
 /// One `deflate_nif`/`inflate_nif` answer, split into the parts a golden is stated in.
 struct Answer {
-    /// `finished` / `continue` / `need_dictionary` when the C's `{Tag, Out}` tuple is
-    /// there, `None` when the answer is a bare output list.
-    tag: Option<&'static str>,
+    /// The C's tag atom (`finished` / `continue` / `need_dictionary`) when the
+    /// `{Tag, Out}` tuple is there, `None` when the answer is a bare output list. Kept
+    /// as the raw term so that reading an answer never borrows the context.
+    tag: Option<Eterm>,
     /// Every output leaf, in order.
     leaves: Vec<Vec<u8>>,
     /// `{need_dictionary, Adler, Out}`'s Adler value.
@@ -501,7 +502,7 @@ impl Answer {
 /// (`zlib_nif.c:395-468`) — `zlib.erl`'s `dequeue_all_chunks_1/3` pattern-matches all
 /// three. A bare list (or bare atom) is recorded with `tag: None` so the byte goldens can
 /// still be read; the tag assertions then report the missing tag on its own.
-fn answer(ctx: &BifContext<'_>, term: Eterm) -> Answer {
+fn answer(term: Eterm) -> Answer {
     if access::is_tuple(term) && access::tuple_size(term) >= 2 {
         let arity = access::tuple_size(term);
         let adler = if arity == 3 {
@@ -512,7 +513,7 @@ fn answer(ctx: &BifContext<'_>, term: Eterm) -> Answer {
             None
         };
         return Answer {
-            tag: name_of(ctx, access::tuple_element(term, 0)),
+            tag: Some(access::tuple_element(term, 0)),
             leaves: list_bytes(access::tuple_element(term, arity - 1)),
             adler,
         };
@@ -525,7 +526,7 @@ fn answer(ctx: &BifContext<'_>, term: Eterm) -> Answer {
         };
     }
     Answer {
-        tag: name_of(ctx, term),
+        tag: Some(term),
         leaves: Vec::new(),
         adler: None,
     }
@@ -547,10 +548,11 @@ fn list_bytes(term: Eterm) -> Vec<Vec<u8>> {
 }
 
 /// Asserts the C's answer tag.
-fn assert_tag(got: &Answer, want: &str, what: &str) {
+fn assert_tag(ctx: &BifContext<'_>, got: &Answer, want: &str, what: &str) {
+    let atom = ctx.atom(want).expect("a seeded tag atom");
     assert_eq!(
         got.tag,
-        Some(want),
+        Some(atom),
         "{what}: the answer must be the C's `{{{want}, Out}}` tuple, whose tag is the atom \
          `{want}` (zlib.erl's dequeue_all_chunks_1/3 matches on it); a bare output list \
          loses the tag and drives the Erlang layer into a case_clause"
@@ -650,40 +652,36 @@ fn every_level_produces_the_oracles_sync_flush_leaf_vectors() {
         deflate_init_default(&reg, &mut ctx, handle, level);
 
         let mut per_call: Vec<Vec<usize>> = Vec::new();
-        let mut tags: Vec<Option<&'static str>> = Vec::new();
+        let mut tags: Vec<Option<Eterm>> = Vec::new();
         let mut stream = Vec::new();
         for round in 0..4 {
             let piece = &fixture[round * 256..(round + 1) * 256];
             enqueue(&reg, &mut ctx, handle, piece).expect("enqueue");
-            let answer = answer(
-                &ctx,
-                deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, SYNC)
+            let reply = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, SYNC)
                     .expect("a sync flush"),
             );
-            for size in answer.sizes() {
+            for size in reply.sizes() {
                 assert!(
                     size <= DEFLATE_CHUNK as usize,
                     "level {level} round {round}: no leaf may exceed the 8 KiB output chunk"
                 );
             }
-            stream.extend(answer.bytes());
-            per_call.push(answer.sizes());
-            tags.push(answer.tag);
+            stream.extend(reply.bytes());
+            per_call.push(reply.sizes());
+            tags.push(reply.tag);
         }
-        let answer = answer(
-            &ctx,
-            deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+        let reply = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
                 .expect("a finish"),
         );
-        for size in answer.sizes() {
+        for size in reply.sizes() {
             assert!(
                 size <= DEFLATE_CHUNK as usize,
                 "level {level}: the finish leaf fits the output chunk"
             );
         }
-        stream.extend(answer.bytes());
-        per_call.push(answer.sizes());
-        tags.push(answer.tag);
+        stream.extend(reply.bytes());
+        per_call.push(reply.sizes());
+        tags.push(reply.tag);
 
         assert_eq!(per_call.len(), 5, "level {level}: five calls");
         for (call_index, &want) in sizes.iter().enumerate() {
@@ -704,7 +702,7 @@ fn every_level_produces_the_oracles_sync_flush_leaf_vectors() {
         for (call_index, tag) in tags.iter().enumerate() {
             assert_eq!(
                 *tag,
-                Some("finished"),
+                Some(ctx.atom("finished").expect("seeded")),
                 "level {level} call {call_index}: a sync-flush call whose queue drained and \
                  whose buffer was not filled must answer `{{finished, Out}}`"
             );
@@ -729,11 +727,11 @@ fn the_level_six_sync_flush_stream_is_byte_exact() {
         enqueue(&reg, &mut ctx, handle, piece).expect("enqueue");
         let out = deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, SYNC)
             .expect("a sync flush");
-        stream.extend(answer(&ctx, out).bytes());
+        stream.extend(answer(out).bytes());
     }
     let out = deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
         .expect("a finish");
-    stream.extend(answer(&ctx, out).bytes());
+    stream.extend(answer(out).bytes());
 
     let want = unhex(LEVEL6_STREAM);
     assert_eq!(want.len(), 129, "the golden's own length");
@@ -758,9 +756,7 @@ fn the_one_shot_images_match_the_oracles_framings_and_strategies() {
     let handle = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, handle, 6);
     enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
-    let out = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let out = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("a finish"),
     );
     assert_eq!(out.sizes(), vec![102], "the one-shot leaf size");
@@ -770,30 +766,16 @@ fn the_one_shot_images_match_the_oracles_framings_and_strategies() {
         "6518CCA11F87CB76E961FB89CC729D7A",
         "the one-shot md5"
     );
-    assert_tag(&out, "finished", "the one-shot finish");
+    assert_tag(&ctx, &out, "finished", "the one-shot finish");
 
     let framed = unhex(F1_ONE_SHOT_LEVEL6);
     let body = &framed[2..framed.len() - 4];
 
     // windowBits -15: raw RFC 1951 — the framed image minus its header and Adler-32.
     let handle = open(&reg, &mut ctx);
-    must(
-        &reg,
-        &mut ctx,
-        "deflateInit_nif",
-        &[
-            handle,
-            ctx.int(6).expect("small int"),
-            ctx.int(8).expect("small int"),
-            ctx.int(-15).expect("small int"),
-            ctx.int(8).expect("small int"),
-            ctx.int(0).expect("small int"),
-        ],
-    );
+    deflate_init(&reg, &mut ctx, handle, 6, 8, -15, 8, 0).expect("deflateInit");
     enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
-    let out = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let out = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("a finish"),
     );
     assert_eq!(out.sizes(), vec![96], "the raw leaf size");
@@ -807,23 +789,9 @@ fn the_one_shot_images_match_the_oracles_framings_and_strategies() {
     // windowBits 31: the gzip member — the fixed 10-byte header, the same body, and the
     // little-endian CRC-32 + ISIZE trailer.
     let handle = open(&reg, &mut ctx);
-    must(
-        &reg,
-        &mut ctx,
-        "deflateInit_nif",
-        &[
-            handle,
-            ctx.int(6).expect("small int"),
-            ctx.int(8).expect("small int"),
-            ctx.int(31).expect("small int"),
-            ctx.int(8).expect("small int"),
-            ctx.int(0).expect("small int"),
-        ],
-    );
+    deflate_init(&reg, &mut ctx, handle, 6, 8, 31, 8, 0).expect("deflateInit");
     enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
-    let out = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let out = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("a finish"),
     );
     let mut want_gzip = unhex("1F8B0800000000000003");
@@ -834,23 +802,9 @@ fn the_one_shot_images_match_the_oracles_framings_and_strategies() {
 
     // Strategy `filtered` (1): 104 B.
     let handle = open(&reg, &mut ctx);
-    must(
-        &reg,
-        &mut ctx,
-        "deflateInit_nif",
-        &[
-            handle,
-            ctx.int(6).expect("small int"),
-            ctx.int(8).expect("small int"),
-            ctx.int(15).expect("small int"),
-            ctx.int(8).expect("small int"),
-            ctx.int(1).expect("small int"),
-        ],
-    );
+    deflate_init(&reg, &mut ctx, handle, 6, 8, 15, 8, 1).expect("deflateInit");
     enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
-    let out = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let out = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("a finish"),
     );
     assert_eq!(out.sizes(), vec![104], "the filtered leaf size");
@@ -863,23 +817,9 @@ fn the_one_shot_images_match_the_oracles_framings_and_strategies() {
     // Strategies `huffman_only` (2) and `rle` (3): the same 546-byte expansion.
     for strategy in [2i64, 3] {
         let handle = open(&reg, &mut ctx);
-        must(
-            &reg,
-            &mut ctx,
-            "deflateInit_nif",
-            &[
-                handle,
-                ctx.int(6).expect("small int"),
-                ctx.int(8).expect("small int"),
-                ctx.int(15).expect("small int"),
-                ctx.int(8).expect("small int"),
-                ctx.int(strategy).expect("small int"),
-            ],
-        );
+        deflate_init(&reg, &mut ctx, handle, 6, 8, 15, 8, strategy).expect("deflateInit");
         enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
-        let out = answer(
-            &ctx,
-            deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+        let out = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
                 .expect("a finish"),
         );
         assert_eq!(out.sizes(), vec![546], "strategy {strategy}: the leaf size");
@@ -923,13 +863,11 @@ fn safe_inflate_delivers_the_oracles_one_to_one_chunk_sequence() {
     inflate_init(&reg, &mut ctx, handle, 15, 2).expect("inflateInit (cut)");
     enqueue(&reg, &mut ctx, handle, &image).expect("enqueue");
 
-    let mut kinds: Vec<Option<&'static str>> = Vec::new();
+    let mut kinds: Vec<Option<Eterm>> = Vec::new();
     let mut sizes: Vec<Vec<usize>> = Vec::new();
     let mut plain = Vec::new();
     for _ in 0..6 {
-        let out = answer(
-            &ctx,
-            inflate_call(
+        let out = answer(inflate_call(
                 &reg,
                 &mut ctx,
                 handle,
@@ -943,9 +881,7 @@ fn safe_inflate_delivers_the_oracles_one_to_one_chunk_sequence() {
         sizes.push(out.sizes());
         plain.extend(out.bytes());
     }
-    let out = answer(
-        &ctx,
-        inflate_call(
+    let out = answer(inflate_call(
             &reg,
             &mut ctx,
             handle,
@@ -960,9 +896,7 @@ fn safe_inflate_delivers_the_oracles_one_to_one_chunk_sequence() {
     plain.extend(out.bytes());
 
     // The empty follow-up call is `{finished, []}` on the oracle.
-    let tail = answer(
-        &ctx,
-        inflate_call(
+    let tail = answer(inflate_call(
             &reg,
             &mut ctx,
             handle,
@@ -984,9 +918,10 @@ fn safe_inflate_delivers_the_oracles_one_to_one_chunk_sequence() {
     assert_eq!(plain, payload, "the plaintext bytes");
     assert_eq!(md5(&plain), md5(&payload), "the plaintext md5");
     // Tag last: a byte defect above is reported first.
-    let mut want_kinds: Vec<Option<&'static str>> = vec![Some("continue"); 6];
-    want_kinds.push(Some("finished"));
-    want_kinds.push(Some("finished"));
+    let mut want_kinds: Vec<Option<Eterm>> =
+        vec![Some(ctx.atom("continue").expect("seeded")); 6];
+    want_kinds.push(Some(ctx.atom("finished").expect("seeded")));
+    want_kinds.push(Some(ctx.atom("finished").expect("seeded")));
     assert_eq!(kinds, want_kinds, "the continue/finished sequence");
 }
 
@@ -1011,9 +946,7 @@ fn the_preset_dictionary_protocol_matches_the_oracle() {
         "deflateSetDictionary answers the dictionary's Adler-32"
     );
     enqueue(&reg, &mut ctx, handle, DICT_PAYLOAD).expect("enqueue");
-    let out = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let out = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("a finish"),
     );
     assert_eq!(out.sizes(), vec![15], "the dictionary stream's leaf size");
@@ -1024,9 +957,7 @@ fn the_preset_dictionary_protocol_matches_the_oracle() {
     let handle = open(&reg, &mut ctx);
     inflate_init(&reg, &mut ctx, handle, 15, 2).expect("inflateInit (cut)");
     enqueue(&reg, &mut ctx, handle, &image).expect("enqueue");
-    let need = answer(
-        &ctx,
-        inflate_call(
+    let need = answer(inflate_call(
             &reg,
             &mut ctx,
             handle,
@@ -1038,15 +969,13 @@ fn the_preset_dictionary_protocol_matches_the_oracle() {
     );
     assert_eq!(need.adler, Some(DICT_ADLER), "the requested Adler-32");
     assert!(need.leaves.is_empty(), "nothing decodes before the dictionary");
-    assert_tag(&need, "need_dictionary", "the first inflate call");
+    assert_tag(&ctx, &need, "need_dictionary", "the first inflate call");
 
     let dictionary = bits::make_binary(ctx.heap(), DICT).expect("a binary");
     let ok = must(&reg, &mut ctx, "inflateSetDictionary_nif", &[handle, dictionary]);
     assert_eq!(name_of(&ctx, ok), Some("ok"), "inflateSetDictionary → ok");
 
-    let decoded = answer(
-        &ctx,
-        inflate_call(
+    let decoded = answer(inflate_call(
             &reg,
             &mut ctx,
             handle,
@@ -1078,18 +1007,14 @@ fn deflate_params_mid_stream_reproduces_the_wrappers_sequence() {
 
     // 1. `deflate(Z, <<"A"*16>>, none)` → the 2-byte zlib header, nothing more.
     enqueue(&reg, &mut ctx, handle, b"AAAAAAAAAAAAAAAA").expect("enqueue");
-    let first = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, NONE)
+    let first = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, NONE)
             .expect("the none flush"),
     );
     assert_eq!(first.sizes(), vec![2], "the level-0 header only");
     assert_eq!(hex(&first.bytes()), "7801", "the zlib header");
 
     // 2. `deflateParams(Z, 9, default)` starts with `deflate(Z, <<>>, sync)`.
-    let sync = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, SYNC)
+    let sync = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, SYNC)
             .expect("the wrapper's sync flush"),
     );
     assert_eq!(sync.sizes(), vec![26], "the pending stored block and its marker");
@@ -1104,29 +1029,20 @@ fn deflate_params_mid_stream_reproduces_the_wrappers_sequence() {
     must(&reg, &mut ctx, "setStash_nif", &[handle, progress]);
 
     // 3. `deflateParams_nif(Z, 9, default)` → ok.
-    let params = must(
-        &reg,
-        &mut ctx,
-        "deflateParams_nif",
-        &[
-            handle,
-            ctx.int(9).expect("small int"),
-            ctx.int(0).expect("small int"),
-        ],
-    );
+    let level = ctx.int(9).expect("small int");
+    let strategy = ctx.int(0).expect("small int");
+    let params = must(&reg, &mut ctx, "deflateParams_nif", &[handle, level, strategy]);
     assert_eq!(name_of(&ctx, params), Some("ok"), "deflateParams → ok");
 
     // 4. `deflate(Z, <<"BBBB">>, finish)` → `restore_progress` prepends the stashed chunk.
     let restored = must(&reg, &mut ctx, "getStash_nif", &[handle]);
-    let restored = answer(&ctx, restored);
+    let restored = answer(restored);
     assert_eq!(restored.leaves.len(), 1, "the stash carries one segment");
     let stash = restored.bytes();
     must(&reg, &mut ctx, "clearStash_nif", &[handle]);
 
     enqueue(&reg, &mut ctx, handle, b"BBBB").expect("enqueue");
-    let last = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let last = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("the finish"),
     );
     let mut leaves = vec![stash];
@@ -1151,9 +1067,7 @@ fn inflate_whole(reg: &BifRegistry, ctx: &mut BifContext<'_>, image: &[u8]) -> V
     let handle = open(reg, ctx);
     inflate_init(reg, ctx, handle, 15, 2).expect("inflateInit");
     enqueue(reg, ctx, handle, image).expect("enqueue");
-    let out = answer(
-        ctx,
-        inflate_call(reg, ctx, handle, INFLATE_IN_CHUNK, INFLATE_OUT_CHUNK, NONE)
+    let out = answer(inflate_call(reg, ctx, handle, INFLATE_IN_CHUNK, INFLATE_OUT_CHUNK, NONE)
             .expect("an inflate call"),
     );
     out.bytes()
@@ -1171,9 +1085,7 @@ fn a_second_finish_raises_stream_error() {
     let handle = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, handle, 6);
     enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
-    let out = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let out = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("the first finish"),
     );
     assert_eq!(out.sizes(), vec![102], "the first finish produced the image");
@@ -1197,9 +1109,7 @@ fn deflate_reset_after_finish_is_reusable() {
     let handle = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, handle, 6);
     enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
-    let first = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let first = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("the first finish"),
     )
     .bytes();
@@ -1209,9 +1119,7 @@ fn deflate_reset_after_finish_is_reusable() {
     assert_eq!(name_of(&ctx, ok), Some("ok"), "deflateReset → ok");
 
     enqueue(&reg, &mut ctx, handle, &fixture).expect("enqueue");
-    let second = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let second = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("the second finish"),
     )
     .bytes();
@@ -1221,9 +1129,7 @@ fn deflate_reset_after_finish_is_reusable() {
     let fresh = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, fresh, 6);
     enqueue(&reg, &mut ctx, fresh, &fixture).expect("enqueue");
-    let third = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, fresh, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
+    let third = answer(deflate_call(&reg, &mut ctx, fresh, DEFLATE_CHUNK, DEFLATE_CHUNK, FINISH)
             .expect("the fresh finish"),
     )
     .bytes();
@@ -1253,12 +1159,10 @@ fn an_uninitialised_stream_answers_not_initialized() {
         "not_initialized",
     );
     assert_raise_atom(enqueue(&reg, &mut ctx, handle, b"abc"), "not_initialized");
-    assert_raise_atom(
-        must(&reg, &mut ctx, "deflateReset_nif", &[handle]),
+    assert_raise_atom(call(&reg, &mut ctx, "deflateReset_nif", &[handle]),
         "not_initialized",
     );
-    assert_raise_atom(
-        must(&reg, &mut ctx, "inflateReset_nif", &[handle]),
+    assert_raise_atom(call(&reg, &mut ctx, "inflateReset_nif", &[handle]),
         "not_initialized",
     );
 }
@@ -1280,22 +1184,20 @@ fn a_foreign_process_is_refused_until_it_owns_the_stream() {
     // The first NIF `zlib:deflate/3` reaches is `getStash_nif/1` (via
     // `restore_progress/2`), so the check has to be in place there.
     {
-        let mut other = context(&mut heap, &atoms, foreign);
-        assert_raise_atom(
-            must(&reg, &mut other, "getStash_nif", &[handle]),
+        let mut other_heap = heap();
+        let mut other = context(&mut other_heap, &atoms, foreign);
+        assert_raise_atom(call(&reg, &mut other, "getStash_nif", &[handle]),
             "not_on_controlling_process",
         );
         let term = bits::make_binary(other.heap(), b"abc").expect("a binary");
-        assert_raise_atom(
-            must(&reg, &mut other, "setStash_nif", &[handle, term]),
+        assert_raise_atom(call(&reg, &mut other, "setStash_nif", &[handle, term]),
             "not_on_controlling_process",
         );
         assert_raise_atom(
             deflate_call(&reg, &mut other, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, NONE),
             "not_on_controlling_process",
         );
-        assert_raise_atom(
-            must(&reg, &mut other, "close_nif", &[handle]),
+        assert_raise_atom(call(&reg, &mut other, "close_nif", &[handle]),
             "not_on_controlling_process",
         );
         // The state check comes *after* the controller check: a stream in `ST_NONE`
@@ -1313,7 +1215,8 @@ fn a_foreign_process_is_refused_until_it_owns_the_stream() {
     assert_eq!(name_of(&ctx, ok), Some("ok"), "set_controller → ok");
 
     {
-        let mut other = context(&mut heap, &atoms, foreign);
+        let mut other_heap = heap();
+        let mut other = context(&mut other_heap, &atoms, foreign);
         let fetched = must(&reg, &mut other, "getStash_nif", &[handle]);
         assert_eq!(
             name_of(&other, fetched),
@@ -1322,15 +1225,14 @@ fn a_foreign_process_is_refused_until_it_owns_the_stream() {
         );
         enqueue(&reg, &mut other, handle, b"abc").expect("the new owner enqueues");
     }
-    assert_raise_atom(
-        must(&reg, &mut ctx, "getStash_nif", &[handle]),
+    assert_raise_atom(call(&reg, &mut ctx, "getStash_nif", &[handle]),
         "not_on_controlling_process",
     );
 
     // A remote pid and a non-pid are `badarg` (the C's `enif_get_local_pid`).
     let remote = remote_pid(&mut ctx);
-    assert_badarg(must(&reg, &mut ctx, "set_controller_nif", &[handle, remote]));
-    assert_badarg(must(
+    assert_badarg(call(&reg, &mut ctx, "set_controller_nif", &[handle, remote]));
+    assert_badarg(call(
         &reg,
         &mut ctx,
         "set_controller_nif",
@@ -1348,20 +1250,20 @@ fn a_forged_handle_is_badarg() {
     let mut ctx = context(&mut heap, &atoms, ProcessId::new(1, 0));
 
     let never_minted = access::make_ref_thing(ctx.heap(), 1).expect("a ref");
-    assert_badarg(must(&reg, &mut ctx, "close_nif", &[never_minted]));
+    assert_badarg(call(&reg, &mut ctx, "close_nif", &[never_minted]));
 
     // An id from another of the crate's reference spaces (`src/binary.rs`'s compiled
     // patterns) is not a stream either.
     let foreign_space = access::make_ref_thing(ctx.heap(), 1 << 32).expect("a ref");
-    assert_badarg(must(&reg, &mut ctx, "close_nif", &[foreign_space]));
+    assert_badarg(call(&reg, &mut ctx, "close_nif", &[foreign_space]));
 
     for bogus in [
         make_small(1),
         ctx.atom("undefined").expect("seeded"),
         NIL,
     ] {
-        assert_badarg(must(&reg, &mut ctx, "close_nif", &[bogus]));
-        assert_badarg(must(&reg, &mut ctx, "getStash_nif", &[bogus]));
+        assert_badarg(call(&reg, &mut ctx, "close_nif", &[bogus]));
+        assert_badarg(call(&reg, &mut ctx, "getStash_nif", &[bogus]));
     }
 
     let handle = open(&reg, &mut ctx);
@@ -1402,7 +1304,7 @@ fn close_twice_is_not_initialized_and_the_first_close_drops_everything() {
     assert!(!stash, "the stash is dropped");
     assert!(!eos);
 
-    assert_raise_atom(must(&reg, &mut ctx, "close_nif", &[handle]), "not_initialized");
+    assert_raise_atom(call(&reg, &mut ctx, "close_nif", &[handle]), "not_initialized");
     assert_raise_atom(
         deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, NONE),
         "not_initialized",
@@ -1484,7 +1386,7 @@ fn deflate_init_on_a_foreign_handle_is_badarg() {
 
     let forged = access::make_ref_thing(ctx.heap(), 7).expect("a ref");
     assert_badarg(deflate_init(&reg, &mut ctx, forged, 6, 8, 15, 8, 0));
-    assert_badarg(must(&reg, &mut ctx, "getStash_nif", &[forged]));
+    assert_badarg(call(&reg, &mut ctx, "getStash_nif", &[forged]));
 
     let fresh = open(&reg, &mut ctx);
     assert_raise_atom(
@@ -1526,14 +1428,11 @@ fn deflate_end_after_a_deflate_is_data_error() {
     let handle = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, handle, 6);
     enqueue(&reg, &mut ctx, handle, b"abc").expect("enqueue");
-    let out = answer(
-        &ctx,
-        deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, NONE)
+    let out = answer(deflate_call(&reg, &mut ctx, handle, DEFLATE_CHUNK, DEFLATE_CHUNK, NONE)
             .expect("a none flush"),
     );
     assert_eq!(out.sizes(), vec![2], "the header only");
-    assert_raise_atom(
-        must(&reg, &mut ctx, "deflateEnd_nif", &[handle]),
+    assert_raise_atom(call(&reg, &mut ctx, "deflateEnd_nif", &[handle]),
         "data_error",
     );
     assert_eq!(stream_state(handle).0, State::New, "the codec is dropped anyway");
@@ -1542,8 +1441,7 @@ fn deflate_end_after_a_deflate_is_data_error() {
     let handle = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, handle, 6);
     enqueue(&reg, &mut ctx, handle, b"abc").expect("enqueue");
-    assert_raise_atom(
-        must(&reg, &mut ctx, "deflateEnd_nif", &[handle]),
+    assert_raise_atom(call(&reg, &mut ctx, "deflateEnd_nif", &[handle]),
         "data_error",
     );
     assert_eq!(
@@ -1568,9 +1466,7 @@ fn inflate_end_splits_on_whether_the_stream_ended() {
     let handle = open(&reg, &mut ctx);
     inflate_init(&reg, &mut ctx, handle, 15, 2).expect("inflateInit");
     enqueue(&reg, &mut ctx, handle, &image[..60]).expect("enqueue");
-    let partial = answer(
-        &ctx,
-        inflate_call(
+    let partial = answer(inflate_call(
             &reg,
             &mut ctx,
             handle,
@@ -1584,8 +1480,7 @@ fn inflate_end_splits_on_whether_the_stream_ended() {
         !partial.bytes().is_empty(),
         "the prefix decodes to something, but not to everything"
     );
-    assert_raise_atom(
-        must(&reg, &mut ctx, "inflateEnd_nif", &[handle]),
+    assert_raise_atom(call(&reg, &mut ctx, "inflateEnd_nif", &[handle]),
         "data_error",
     );
 
@@ -1593,9 +1488,7 @@ fn inflate_end_splits_on_whether_the_stream_ended() {
     let handle = open(&reg, &mut ctx);
     inflate_init(&reg, &mut ctx, handle, 15, 2).expect("inflateInit");
     enqueue(&reg, &mut ctx, handle, &image).expect("enqueue");
-    let whole = answer(
-        &ctx,
-        inflate_call(
+    let whole = answer(inflate_call(
             &reg,
             &mut ctx,
             handle,
@@ -1614,8 +1507,7 @@ fn inflate_end_splits_on_whether_the_stream_ended() {
     let handle = open(&reg, &mut ctx);
     inflate_init(&reg, &mut ctx, handle, 15, 2).expect("inflateInit");
     enqueue(&reg, &mut ctx, handle, &image).expect("enqueue");
-    assert_raise_atom(
-        must(&reg, &mut ctx, "inflateEnd_nif", &[handle]),
+    assert_raise_atom(call(&reg, &mut ctx, "inflateEnd_nif", &[handle]),
         "data_error",
     );
 }
@@ -1725,15 +1617,15 @@ fn a_second_stash_and_an_empty_clear_are_the_bare_atom_error() {
     let handle = open(&reg, &mut ctx);
     deflate_init_default(&reg, &mut ctx, handle, 6);
 
-    assert_raise_atom(must(&reg, &mut ctx, "clearStash_nif", &[handle]), "error");
+    assert_raise_atom(call(&reg, &mut ctx, "clearStash_nif", &[handle]), "error");
 
     let term = bits::make_binary(ctx.heap(), b"abc").expect("a binary");
     must(&reg, &mut ctx, "setStash_nif", &[handle, term]);
-    assert_raise_atom(must(&reg, &mut ctx, "setStash_nif", &[handle, term]), "error");
+    assert_raise_atom(call(&reg, &mut ctx, "setStash_nif", &[handle, term]), "error");
 
     let ok = must(&reg, &mut ctx, "clearStash_nif", &[handle]);
     assert_eq!(name_of(&ctx, ok), Some("ok"), "the first clear works");
-    assert_raise_atom(must(&reg, &mut ctx, "clearStash_nif", &[handle]), "error");
+    assert_raise_atom(call(&reg, &mut ctx, "clearStash_nif", &[handle]), "error");
 }
 
 /// D.21 — every reset, end and close drops an existing stash.
@@ -1768,7 +1660,7 @@ fn every_reset_and_end_drops_the_stash() {
         let term = stash(&mut ctx);
         must(&reg, &mut ctx, "setStash_nif", &[handle, term]);
         assert!(
-            must(&reg, &mut ctx, "getStash_nif", &[handle]).is_ok(),
+            call(&reg, &mut ctx, "getStash_nif", &[handle]).is_ok(),
             "{key}: the stash is set"
         );
 
