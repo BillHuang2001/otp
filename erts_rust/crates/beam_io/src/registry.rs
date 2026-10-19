@@ -207,6 +207,21 @@ impl PortRegistry {
         self.ports.get_mut(&id.number())
     }
 
+    /// The driver of port `id` downcast to `T`, or `None`.
+    ///
+    /// This is the registry surface of [`Port::driver_as`]: the **read-only** downcast a runtime needs to reach a *concrete* driver through the `Box<dyn Driver>` a [`Port`] owns.
+    /// The consumer is the C's `tcp_inet_copy` (`erts/emulator/drivers/common/inet_drv.c:11795`): accepting a connection builds the second, connected port's driver from the **listener's** option set, so the runtime resolves the listener port and asks for its [`TcpInetDriver`](crate::drivers::TcpInetDriver) here, then calls
+    /// [`TcpInetDriver::from_accepted`](crate::drivers::TcpInetDriver::from_accepted) with it.
+    ///
+    /// `None` answers **both** refusals in one shape — `id` names no live port (it was never allocated, or its [`PortNotification::Closed`](crate::PortNotification::Closed) has already been reported and its number retired) and the live port's driver is of another concrete type.
+    /// The two are deliberately not an `Option`/`Result` pair: both mean "no `&T` for you", and every caller would fold them together anyway.
+    /// Nothing panics, nothing is `unwrap`ped, and an unknown id is not a `badarg` the way the mutating seams' faults are — this reads only.
+    ///
+    /// It reads only, and that is why there is **no `&mut` form**: the port-task round drives the driver, so an exclusive borrow handed out here could race it.
+    pub fn driver_as<T: Driver + 'static>(&self, port: PortId) -> Option<&T> {
+        self.ports.get(&port.number())?.driver_as::<T>()
+    }
+
     /// Writes `data` to the given port's output queue and asks the port's driver to write it
     /// **inline**.
     ///
@@ -2309,3 +2324,10 @@ mod reply_tests;
 #[cfg(test)]
 #[path = "registry_busy_tests.rs"]
 mod busy_tests;
+
+/// The **driver-downcast seam** (`PortRegistry::driver_as`/`Port::driver_as`, and the generic
+/// `Port::driver` view beside them) — the read-only route to a port's concrete driver, which the
+/// accepted-socket adoption needs — lives in its own sibling for the same reason as `reply_tests`.
+#[cfg(test)]
+#[path = "registry_downcast_tests.rs"]
+mod downcast_tests;

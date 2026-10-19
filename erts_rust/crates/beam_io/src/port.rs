@@ -202,6 +202,28 @@ impl Port {
         self.driver.name()
     }
 
+    /// The port's driver, as the shared trait object it is owned as.
+    ///
+    /// This is the driver-generic view: `name`, `flags`, `is_busy`, `port_closed`, … are all readable through it.
+    /// A caller that needs the **concrete** driver — the runtime's accepted-socket adoption, which builds the connected port from the listener's own option set — asks [`Port::driver_as`] instead.
+    ///
+    /// A `&mut` form does not exist: the port drives its driver on every port-task round, so handing out an exclusive borrow would let a caller race it.
+    pub fn driver(&self) -> &dyn Driver {
+        &*self.driver
+    }
+
+    /// The port's driver downcast to `T`, or `None` when it is a driver of another concrete type.
+    ///
+    /// The read-only counterpart of the owning `Box<dyn Driver>`: it is how a listener port's [`crate::drivers::TcpInetDriver`] is reached so
+    /// [`TcpInetDriver::from_accepted`](crate::drivers::TcpInetDriver::from_accepted) — the C's `tcp_inet_copy`, `erts/emulator/drivers/common/inet_drv.c:11795` — can build the accepted connection's driver.
+    /// [`PortRegistry::driver_as`] is the same seam addressed by [`PortId`] instead of by a port reference.
+    ///
+    /// `None` is returned for a driver of another concrete type; nothing panics and nothing is `unwrap`ped.
+    /// A `&mut` form does not exist, for the reason [`Port::driver`] gives.
+    pub fn driver_as<T: Driver + 'static>(&self) -> Option<&T> {
+        self.driver.downcast_ref::<T>()
+    }
+
     /// The number of bytes currently buffered in the input queue.
     ///
     /// This is **all** the input the port owes its owner, in arrival order: every completed

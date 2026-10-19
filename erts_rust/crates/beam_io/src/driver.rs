@@ -504,7 +504,17 @@ impl<'a> DriverContext<'a> {
 /// Implemented by the built-in drivers ([`crate::drivers::FdDriver`],
 /// [`crate::drivers::EfileDriver`]) and, later, by the frozen C-ABI bridge. Every method
 /// receives a [`DriverContext`] and nothing else.
-pub trait Driver {
+///
+/// # Why `core::any::Any` is a supertrait
+///
+/// A port holds its driver as a `Box<dyn Driver>` ([`crate::Port`]), so from the outside the concrete type is erased: the runtime can see a port, its id and its driver's *name*, but it cannot reach the driver itself.
+/// That is a problem for exactly one legitimate consumer — the C's `tcp_inet_copy` (`erts/emulator/drivers/common/inet_drv.c:11795`), where accepting a connection must build the second (connected) port's driver from the *listener's* option set.
+/// [`TcpInetDriver::from_accepted`](crate::drivers::TcpInetDriver::from_accepted) needs the listener's `&TcpInetDriver`, and only a downcast can produce it.
+///
+/// Making [`core::any::Any`] a supertrait is the cheapest seam for that: it adds **no** member a driver must implement, and the downcast itself lives on the trait object as the inherent `downcast_ref` below.
+/// An `as_any` method would put boilerplate in every implementation, and a blanket impl is unnecessary once `Any` is a supertrait.
+/// The one consequence is that **every driver is `'static`**, because `Any` requires it — which already held for every driver here (they are all owned value types, with no borrows in their fields).
+pub trait Driver: core::any::Any {
     /// The driver's registered name (the key it is looked up under in the
     /// [`DriverRegistry`]).
     fn name(&self) -> &str;
@@ -792,6 +802,31 @@ pub trait Driver {
     ///
     /// Returns a `beam_common::BeamError` when teardown fails.
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()>;
+}
+
+impl dyn Driver {
+    /// Downcasts this driver to its concrete type, answering `None` for another type.
+    ///
+    /// This is **the one downcast path** for a driver reached through a port.
+    /// The [`core::any::Any`] supertrait [`Driver`] carries is what makes it possible, and there is no `as_any` method to implement alongside it — a driver implements [`Driver`] and nothing more.
+    ///
+    /// The consumer is the C's `tcp_inet_copy` (`erts/emulator/drivers/common/inet_drv.c:11795`):
+    /// the runtime holds a listener port, needs its `&TcpInetDriver` to build the accepted connection's driver with
+    /// [`TcpInetDriver::from_accepted`](crate::drivers::TcpInetDriver::from_accepted), and can reach it only from the port's `Box<dyn Driver>`.
+    /// See [`crate::Port::driver_as`] and [`crate::PortRegistry::driver_as`] for the two call sites a runtime actually uses.
+    ///
+    /// `T` must be the driver's **exact** concrete type — `TcpInetDriver`, never a supertype of it — and a wrong guess is `None` rather than a panic.
+    ///
+    /// # Note
+    ///
+    /// This is a **read-only** downcast.
+    /// A port owns its driver exclusively and its [`crate::PortRegistry`] hands out only shared borrows, so there is deliberately no `downcast_mut` — mutating a driver from outside would race the port-task round that drives it.
+    pub fn downcast_ref<T: Driver + 'static>(&self) -> Option<&T> {
+        // Trait upcasting (`&dyn Driver` → `&dyn Any`) is a stable coercion since Rust 1.86 and
+        // this workspace is pinned at 1.98.1, so no `unsafe` transmute of the fat pointer is
+        // needed here.
+        (self as &dyn core::any::Any).downcast_ref::<T>()
+    }
 }
 
 /// A driver constructor: the function a [`DriverRegistry`] stores under a name.
