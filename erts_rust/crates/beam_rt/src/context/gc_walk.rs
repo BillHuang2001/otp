@@ -548,6 +548,11 @@ enum Criterion {
     /// The off-heap payload prune ([`reaches_an_unscanned_word`]): **any** pointer-bearing word in
     /// a region the collector does not scan, whether or not it forwards anything.
     PayloadPrune,
+    /// The NIF-resource-term prune ([`reachable_resource_words`]): collect **every** reachable
+    /// word that is one of the caller's candidates. A resource term is a leaf (a magic reference
+    /// or a binary), so identity is the raw word and there is no hit to short-circuit: the walk
+    /// expands both regions and runs to exhaustion.
+    ResourcePrune,
 }
 
 /// The walk's mutable state: the reused scratch, the scanned geometry the whole walk classifies
@@ -567,6 +572,13 @@ struct Walk<'a> {
     /// This is what an admission point that handed over its whole root set needs in order to
     /// **close** the descent latch again (see [`ValveVerdict::foreign_free`]).
     foreign_reached: bool,
+    /// [`Criterion::ResourcePrune`] only: the caller's candidate raw words, **sorted**. A word
+    /// equal to one of them is recorded in `reached` instead of being expanded (see
+    /// [`reachable_resource_words`]).
+    candidates: Option<&'a [usize]>,
+    /// [`Criterion::ResourcePrune`] only: the candidate words this walk reached, in visit order
+    /// and possibly with duplicates (deduplicated by the entry point before it is returned).
+    reached: Vec<usize>,
 }
 
 /// The descent's **visited set**: the object addresses already expanded.
@@ -755,13 +767,31 @@ impl<'a> Walk<'a> {
             criterion,
             hit: false,
             foreign_reached: false,
+            candidates: None,
+            reached: Vec::new(),
         }
+    }
+
+    /// The [`Criterion::ResourcePrune`] form of [`Walk::begin`]: the same traversal, seeded with
+    /// the candidate words to record rather than a hazard to look for.
+    fn begin_resource(
+        scratch: &'a mut WalkScratch,
+        bounds: ScannedBounds,
+        candidates: &'a [usize],
+    ) -> Walk<'a> {
+        let mut walk = Walk::begin(scratch, bounds, Criterion::ResourcePrune);
+        walk.candidates = Some(candidates);
+        walk
     }
 
     /// Classifies one reachable word: enqueues a container the collector scans, records a hazard
     /// for a container it does not scan that forwards a scanned word, and ignores everything no
     /// relocation touches.
     fn seed(&mut self, process: &Process, word: Eterm) {
+        if self.criterion == Criterion::ResourcePrune {
+            self.seed_resource(process, word);
+            return;
+        }
         if self.hit {
             return;
         }
@@ -779,6 +809,41 @@ impl<'a> Walk<'a> {
                 }
             }
             Some(WordRegion::Foreign) => self.reach_foreign(process, word),
+        }
+    }
+
+    /// [`Criterion::ResourcePrune`]'s per-word step: record a candidate, otherwise enqueue a
+    /// container **from either region** so the whole reachable graph is covered.
+    ///
+    /// The two differences from [`Walk::seed`] are both driven by *what the caller is asking*:
+    ///
+    /// * a NIF resource term (or an `enif_make_resource_binary` binary) is a **leaf** — the
+    ///   resource reference it carries is not a term child — so a match is recorded and the word is
+    ///   **not** expanded;
+    /// * a container in a region the collector does not scan is **expanded**, never treated as a
+    ///   hazard. A resource term sitting in a foreign container (a BIF-pool tuple, say) is
+    ///   perfectly reachable, and answering "unreachable" for it would be the use-after-free the
+    ///   prune's caller contract forbids. `Walk::reach_foreign` already expands an *inert* foreign
+    ///   container under the same SAFETY argument, so this is that established step without the
+    ///   forwarding test in front of it.
+    ///
+    /// A walk that cannot finish is impossible here for the reason the visited set exists: every
+    /// object is entered at most once, so the walk is `O(distinct reachable objects)`.
+    fn seed_resource(&mut self, process: &Process, word: Eterm) {
+        if let Some(candidates) = self.candidates {
+            if candidates.binary_search(&word.raw()).is_ok() {
+                self.reached.push(word.raw());
+                // A resource term is a leaf: nothing below it can be a candidate.
+                return;
+            }
+        }
+        match word_region(process, &self.bounds, word) {
+            None => {}
+            Some(WordRegion::Scanned) | Some(WordRegion::Foreign) => {
+                if self.scratch.visited.insert(ptr_val(word) as usize) {
+                    self.scratch.pending.push(word);
+                }
+            }
         }
     }
 
@@ -942,6 +1007,51 @@ impl<'a> Walk<'a> {
 /// Gated on `#[cfg(test)]` (`super::gc`'s `prefix_counters` is the same pattern), so neither the
 /// release binary the differential gate builds nor the debug one it drives carries a single extra
 /// instruction.
+/// Which of `candidates` are reachable from `process`'s complete root set — the reachability
+/// answer behind the NIF-resource prune (`super::gc::resources`).
+///
+/// This is [`reaches_an_unscanned_word`]'s traversal with a different question: instead of
+/// "does anything reach a word in a region the collector does not scan", it collects **every**
+/// reachable word that equals one of `candidates`. `candidates` are raw term words (`Eterm::raw`),
+/// **sorted and deduplicated**; a NIF resource term is a leaf whose identity is its word, never a
+/// structure, so no term comparison is involved.
+///
+/// `roots` is the caller's gathered root set — the *same* set the caller handed to the valves — and
+/// [`Walk::seed_process_roots`] additionally seeds the five root families
+/// [`Process::collect`] gathers, so the answer covers the registers, the whole stack, the mailbox,
+/// the dictionary, the saved arguments and the pending signals. Every container **in either
+/// region** is expanded, and a cons cell seeds both of its words, so a resource term in a list
+/// cell or a message payload is found — the shape a boxed-object-only view cannot see.
+///
+/// The answer is the reachable subset of `candidates`, sorted. It is **not** a verdict: the caller
+/// decides what an unreached candidate means (and must decline — treat everything as reachable —
+/// whenever its own gates say the root set is not complete).
+pub(crate) fn reachable_resource_words<'a, I>(
+    scratch: &mut WalkScratch,
+    process: &Process,
+    roots: I,
+    candidates: &[usize],
+) -> Vec<usize>
+where
+    I: IntoIterator<Item = &'a Eterm>,
+{
+    debug_assert!(
+        candidates.windows(2).all(|pair| pair[0] < pair[1]),
+        "the resource candidates must be sorted and deduplicated"
+    );
+    let bounds = process.collector().scanned_bounds();
+    let mut walk = Walk::begin_resource(scratch, bounds, candidates);
+    for &word in roots {
+        walk.seed(process, word);
+    }
+    walk.seed_process_roots(process);
+    walk.run(process);
+    let mut reached = std::mem::take(&mut walk.reached);
+    reached.sort_unstable();
+    reached.dedup();
+    reached
+}
+
 #[cfg(test)]
 pub(crate) mod seed_counters {
     use std::cell::Cell;

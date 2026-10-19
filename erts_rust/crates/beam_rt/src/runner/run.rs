@@ -380,6 +380,12 @@ impl<'a> RuntimeRunner<'a> {
             &mut engine.machine,
             &mut engine.off_heap,
         )?;
+        // The **NIF-resource prune**, the second prune of the same publishing window: a resource
+        // term the parked process's root set no longer names loses the reference it took at
+        // `enif_make_resource`, so the resource type's destructor runs (contract A.3). Same site
+        // and same gate for the same reason — this is the one place the process's root set is
+        // complete and no NIF call is mid-flight (see `gc::resources`'s module docs).
+        gc::reclaim_resources(&mut *self.runtime, table, pid)?;
         Ok(())
     }
     /// Drains `pid`'s latched `max_heap_size` **kill** — the runner's half of the verdict the

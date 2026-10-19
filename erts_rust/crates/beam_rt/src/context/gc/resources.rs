@@ -1,0 +1,184 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
+//! The **NIF-resource prune** — the reachability decision contract A.3 needs so a resource term
+//! that only an Erlang term kept alive gets its destructor run.
+//!
+//! # Ground truth
+//!
+//! `erts/emulator/beam/erl_nif.c`: `enif_make_resource` (`:3197`) mints an `ERTS_MAGIC_REF` whose
+//! block owns one reference on the resource; the term GC drops that reference when the term
+//! becomes unreachable, and the release that takes the count to zero runs the type's `dtor`
+//! (`nif_resource_dtor_prologue` → `run_resource_dtor`, `:2961-3030`). `beam_abi` mints the term
+//! and takes the reference (`beam_abi::nif::enif::resources`), but it has no GC — *which* terms are
+//! still reachable is only knowable by the host, so the seam is a caller-supplied predicate
+//! (`beam_abi::nif::enif::resources::release_resource_terms`). **This module is that caller.**
+//!
+//! Without it the destructor never runs for a resource exposed through a term: the reference the
+//! term took is never dropped. That was the measured divergence (oracle destructor count `1`,
+//! `beam_rt` `0`), and it is a **bounded leak**, never a wrong result — which is also exactly the
+//! direction every gate below declines in.
+//!
+//! # The site, and why it is the only sound one
+//!
+//! [`reclaim`] is called from the runner's `Yield` park arm, beside the off-heap refc-binary
+//! prune and under the *same* `engine.parked_published` gate
+//! ([`RuntimeRunner::reclaim_off_heap_binaries`](crate::runner)). A prune may only run against the
+//! process's **complete** root set, and the park is the one point that has it: `park_machine`
+//! published the machine's whole root set (`RootSet::ALL_LIVE` — every live x register, the whole
+//! Erlang stack, the FR file at its pointer-bearing prefix) into the process's registers
+//! immediately before this call. An **exempt** park (the `Wait`/receive arm) publishes nothing, so
+//! `parked_published` is `false` there and the prune does not run — its terms stay leaked rather
+//! than being freed behind a live machine's back.
+//!
+//! The prune must **never** be called from:
+//!
+//! * a **heap-admission door** inside a slice — the executing machine's root set is not published
+//!   there, and the door has no `&mut Machine` to publish it from;
+//! * a **BIF** — a BIF's arguments live on a pooled heap outside the process's root set;
+//! * the **`-eval` route** — the action process is never enqueued, so it never parks.
+//!
+//! # Cadence
+//!
+//! The prune is **park-driven**, not collection-driven: a process parks at the end of a slice that
+//! exhausted its reduction budget (`DEFAULT_REDUCTIONS_PER_SLICE = CONTEXT_REDS = 4000`) or that
+//! blocked. So a resource term is reclaimed at the first non-exempt park *after* the last root
+//! naming it died — which a target reaching a `receive` or running longer than one slice does
+//! naturally, and which a straight-line function that returns immediately never does (it has no
+//! park). That is a **timing** difference from the oracle, not a correctness one: the destructor
+//! runs at the next park rather than inside `erlang:garbage_collect/0`.
+//!
+//! # The gates (every one is a decline, and a decline is a leak)
+//!
+//! 1. **No live resource terms** — the overwhelmingly common case (no NIF ever minted one). One
+//!    registry read, and **no heap walk at all**.
+//! 2. the process is in the caller's table;
+//! 3. [`Process::is_relocation_exempt`] is `false`;
+//! 4. [`Runtime::gc_process_enabled`] — the pinned/halted/escape-valve gate every collection
+//!    point honours;
+//! 5. the **prune-only valve** ([`super::reaches_an_unscanned_word`]) — *any* pointer-bearing word
+//!    reachable from the roots in a region the process's collector does not scan. This is the
+//!    soundness gate for this walk: a resource term inside a container from such a region is not
+//!    reliably reachable through the collector's geometry, so the prune declines **everything**
+//!    rather than answering "unreachable" for a resource a live foreign container still holds.
+//!
+//! # The residual (leak, never a dangle)
+//!
+//! * a resource held only by a **foreign** container (a pooled-BIF tuple, an arena fallback) is
+//!   kept alive by gate 5, forever if nothing ever drops that container;
+//! * a term held by a **host-side** store outside the six gathered root families — a pending
+//!   [`TimerAction::Deliver`](crate::timers) message, a `ProcessEngine`'s spawn arguments/entry
+//!   fun, a persistent-term value, an execution-trace token — is invisible to the walk, so
+//!   **no prune runs at all** for a process whose roots reach such a store through no other path…
+//!   except that the store's own words are not roots, so a resource named *only* there would be
+//!   answered unreachable. This is the one open residual: closing it needs a host root-source
+//!   seam (`Runtime::root_terms`), which is a `src/runtime.rs` change and outside this node.
+
+use beam_process::{Process, ProcessId, ProcessTable};
+use beam_term::Eterm;
+
+use beam_abi::nif::enif::resources::{release_resource_terms, resource_terms};
+
+use super::super::Runtime;
+use crate::error::Result;
+
+/// Drops the reference held by every live NIF **resource term** that nothing reachable from `pid`'s
+/// complete root set names, returning how many terms were released.
+///
+/// The caller is the runner's `Yield` park arm, for a **publishing** window (see the module docs
+/// for the site and the cadence, and for the list of sites where this must never be called).
+///
+/// A released term's binding is removed (so a later `enif_get_resource` on it answers `0`) and
+/// exactly one reference is dropped from its object, through the same path `enif_release_resource`
+/// takes — so the resource type's destructor runs, synchronously, when that was the last
+/// reference. An object that still carries an allocator or `enif_keep_resource` reference survives
+/// with its count reduced by one and no destructor run.
+///
+/// # Errors
+///
+/// None are produced: every failure mode is the documented decline. The `Result` matches the
+/// sibling collection doors' shape so the runner's arm reads uniformly.
+pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: ProcessId) -> Result<usize> {
+    // Gate 1: the common case, and the reason this costs nothing for a program that never minted a
+    // resource — one registry read, no walk.
+    let candidates: Vec<usize> = resource_terms().iter().map(Eterm::raw).collect();
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let Some(process) = table.get_mut(pid) else {
+        return Ok(0);
+    };
+    if process.is_relocation_exempt() {
+        return Ok(0);
+    }
+    if !runtime.gc_process_enabled(pid) {
+        return Ok(0);
+    }
+
+    // The process's **complete** root set, gathered exactly as the off-heap prune gathers it and
+    // exactly as `Process::collect` does: the registers (`x[0..live)`, the whole stack and the
+    // host-published extra roots), each queued message's `payload`/`from`/`token`, the dictionary,
+    // the saved arguments and the pending signals.
+    let mut roots: Vec<Eterm> = Vec::new();
+    {
+        let process: &Process = process;
+        process.registers().gather_roots(&mut roots);
+        for message in process.mailbox().iter() {
+            roots.push(message.payload());
+            roots.push(message.from());
+            roots.push(message.token());
+        }
+        process.dict().gather_roots(&mut roots);
+        process.saved_args().gather_roots(&mut roots);
+        process.signals().gather_roots(&mut roots);
+    }
+
+    // Gate 5: the prune-only valve. A word reachable from the roots in a region the collector does
+    // not scan may sit in a container whose children this walk must not trust, so *any* of them
+    // declines the whole prune: the residual is a leak, never a dangling payload.
+    if super::reaches_an_unscanned_word(runtime.walk_scratch(), process, roots.iter()) {
+        runtime.note_foreign_reachable(pid);
+        crate::debug_trace::trace(format_args!(
+            "resource prune declined for {pid:?}: a root reaches a word outside the scanned region"
+        ));
+        return Ok(0);
+    }
+
+    // The reachability decision itself: the reachable subset of `candidates`, over both regions and
+    // through cons cells (so a resource held in `[Res]` or in a message payload is found).
+    let reached = super::gc_walk::reachable_resource_words(
+        runtime.walk_scratch(),
+        process,
+        roots.iter(),
+        &candidates,
+    );
+
+    // A candidate that was not reached is dead: drop the reference its term took. `reached` is
+    // sorted (the walk's entry point guarantees it), and identity is the raw word — never a
+    // structural comparison, because a resource term is a leaf.
+    let released = release_resource_terms(|term| reached.binary_search(&term.raw()).is_ok());
+    if released > 0 {
+        crate::debug_trace::trace(format_args!(
+            "resource prune for {pid:?}: released {released} of {} live resource term(s)",
+            candidates.len()
+        ));
+    }
+    Ok(released)
+}
