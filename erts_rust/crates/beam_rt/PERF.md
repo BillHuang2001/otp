@@ -594,3 +594,26 @@ The control leg must run in its **own process**: the ABI resource registry is pr
 - [`src/eval/reclaim/resource.rs`](src/eval/reclaim/resource.rs) → the frontier, the two-tier sink, the three gates and the in-module unit tests.
 - [`src/context/gc/resources.rs`](src/context/gc/resources.rs) → the scheduled-site contract, its five decline gates and its residual class (this section extends it, it does not replace it).
 - [`M1_GAPS.md`](M1_GAPS.md) *NIF (A.3)* → the residual ledger: the first-boundary statement leak, the nested `Err` path, the pointer-reuse heuristic and the root-family completeness dependency.
+## The `-eval` statement window (deterministic word counts, not timings)
+**Nothing here is a timing**: every figure is a **word count** from `Runtime::eval_region_stats()` (`Runtime::eval_heap`'s `used`/`capacity` plus the window's counters), deterministic in the expression text, so no load filter applies — the load context is recorded for reproducibility only.
+Host: Linux `x86_64`, `nproc` **14**, shared, 1-min `/proc/loadavg` **2.3–4.6** across the runs; both legs are **debug** builds (this crate's gate default).
+**The growth this bounds.** `Runtime::eval_heap` is a pointer-stable `beam_alloc::Heap` whose frontier only moves forward; `Runtime::grow_eval_heap` doubles its capacity and pushes the replaced region onto `Runtime::eval_heap_retired`, **never freed**. A run's container results are copied onto it (`src/context/pool.rs::move_result_into_runtime_store`), so without a rewind a run's store is the **total volume it ever copied**, not its live set.
+`src/eval/scratch.rs` rewinds the dead prefix at the boundary **before** every top-level statement — the one instant a comma sequence's live set is exactly the evaluator's `Env` plus whatever a runtime-lifetime store kept.
+**The reproduction** is `discarded_builds(n)` (`src/eval/scratch/tests.rs`): `n` statements of `_ = lists:seq(1,2000), ` then `ok`.
+With the window off (the pre-fix behaviour, default **16 777 216**-word region, **0** retired regions) one `lists:seq(1,5000)` costs **10 000** words and two cost **20 000**; two `binary:copy(<<1>>,40000)` cost the pre-window note's **10 004**.
+| `n` | ON `used` | ON `resets` | ON `words_reclaimed` | OFF `used` |
+|---:|---:|---:|---:|---:|
+| 1 | 0 | 1 | 4 000 | 4 000 |
+| 10 | 0 | 10 | 40 000 | 40 000 |
+| 100 | 0 | 100 | 400 000 | 400 000 |
+| 1 000 | 0 | 1 000 | 4 000 000 | 4 000 000 |
+`declines` is **0** on every leg. **ON is flat at the baseline** (each statement's 4 000-word copy is reclaimed by the next boundary); **OFF is exactly `4 000 × n`**, the pre-fix shape — hence the OFF control.
+**The cost.** A boundary is one `Option` test plus one `usize` subtraction while the window is closed, pinned, or below `MIN_WINDOW_WORDS` (**1 024** words = 8 KiB); only a window worth reclaiming pays the reachability descent, which stops at its **first hit** (`Reach::done`). Every decline retains every word — a bounded leak of one statement, never a dangle.
+**The oracle cross-check** is [`tests/eval_region.rs`](tests/eval_region.rs): a `persistent_term` value, an environment binding and a mailbox message each survive **20** interposed builds, answering `6003000`/`6003000`/`2001000` on both runtimes.
+### Reproduction
+```text
+C="erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt"
+$C --lib -- eval::scratch                                                     # the 7 pins
+$C --lib -- eval::scratch::tests::the_growth_figures --ignored --nocapture     # the figures above
+$C --test eval_region                                                         # the oracle cross-check
+```

@@ -64,8 +64,11 @@
 //! 2. **A holder the descent cannot see latches the window.** Every writer whose term may be
 //!    retained outside the enumerated root families calls [`pin`], which makes the window
 //!    unresettable and merely advances its mark. The writers are classified below; the ones that
-//!    pin are the runtime-lifetime stores, a nested run's machine and a nested evaluator's
-//!    driver. A pinned window is a bounded leak of one statement, never a dangle.
+//!    pin are the runtime-lifetime stores, a nested evaluator's driver, and a nested run's
+//!    machine **when that run wrote on the store** — a nested run that copied nothing leaves the
+//!    window resettable, which is why the window outlives an ordinary nested call and still
+//!    bounds the statements around it. A pinned window is a bounded leak of one statement, never
+//!    a dangle.
 //! 3. **Doubt ⇒ keep.** Nothing here has a fast path that skips a check: the cheap state is
 //!    "no window", "window pinned", or "the window is smaller than [`MIN_WINDOW_WORDS`]", and all
 //!    three leave every word exactly where it was.
@@ -93,8 +96,8 @@
 //! | `Runtime::eval_closures[..].env` | an enumerated root family ([`Runtime::gather_off_heap_roots`]) |
 //! | every live process's dictionary, mailbox, registers, saved arguments and signals | enumerated root families |
 //! | pending timer deliveries, `seq_trace` tokens, pending spawns, an engine's arena-stable arguments and a parked machine's root set | enumerated root families |
-//! | a nested run's machine (`run_export_blocking` / `run_label_blocking`) — its registers are live and this module cannot enumerate them | **pin at the call site** |
-//! | a nested [`Evaluator`] applied by a loaded module (`apply_eval_closure`), whose copies are held by the *module's* machine (e.g. `lists:map/2`'s accumulator) | **pin at the call site** |
+//! | a nested run's machine (`run_export_blocking` / `run_label_blocking`) — its registers are live and this module cannot enumerate them | **latches at the call site when the run wrote on the store** (`Runtime::pin_window_if_store_written`: a run that copied nothing leaves the window resettable) |
+//! | a nested [`Evaluator`] applied by a loaded module (`apply_eval_closure`), whose copies are held by the *module's* machine (e.g. `lists:map/2`'s accumulator) | **pin at the call site** (unconditional: the closure's own terms are the machine's from the first instruction) |
 //!
 //! # What a reset does to the other readers of the region
 //!

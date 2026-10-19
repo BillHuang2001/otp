@@ -243,6 +243,88 @@ fn a_window_a_writer_latched_reports_its_reason() {
     );
 }
 
+/// The measurement behind `PERF.md`'s growth table: the store's own figures for the reducible
+/// shape, per statement count, with the window **on** and **off** on two runtimes.
+///
+/// `#[ignore]`d because it prints rather than asserts: it is a *measurement*, run by hand
+/// (`--ignored --nocapture`) and recorded in `PERF.md`. The asserting pins are
+/// [`the_store_does_not_grow_with_the_statement_count`] and
+/// [`switching_the_window_off_restores_the_linear_growth`], which bracket the same two shapes.
+///
+/// The host is shared, so `/proc/loadavg` is printed with the figures: every number here is a
+/// **word count**, a deterministic consequence of the expression, never a timing.
+#[test]
+#[ignore = "measurement: prints the store's word counts, asserts nothing"]
+fn the_growth_figures() {
+    eprintln!("== eval store growth, loadavg at start ==");
+    eprintln!("{}", loadavg());
+    for n in [1_usize, 10, 100, 1_000] {
+        let expr = discarded_builds(n);
+        for enabled in [true, false] {
+            print_figure(&format!("discarded_builds({n})"), &expr, enabled);
+        }
+    }
+    eprintln!("== the two shapes the pre-fix note cited ==");
+    for (label, expr) in [
+        (
+            "one lists:seq(1,5000)",
+            "_ = lists:seq(1,5000), ok",
+        ),
+        (
+            "two lists:seq(1,5000)",
+            "_ = lists:seq(1,5000), _ = lists:seq(1,5000), ok",
+        ),
+        (
+            "one binary:copy(<<1>>,40000)",
+            "_ = binary:copy(<<1>>,40000), ok",
+        ),
+        (
+            "two binary:copy(<<1>>,40000)",
+            "_ = binary:copy(<<1>>,40000), _ = binary:copy(<<1>>,40000), ok",
+        ),
+    ] {
+        for enabled in [true, false] {
+            print_figure(label, expr, enabled);
+        }
+    }
+    eprintln!("== loadavg at end ==");
+    eprintln!("{}", loadavg());
+}
+
+/// Evaluates `expr` on a fresh runtime with the window on or off and prints the store's figures.
+fn print_figure(label: &str, expr: &str, enabled: bool) {
+    let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+    if !enabled {
+        runtime.set_eval_scratch_enabled(false);
+    }
+    eval(&mut runtime, expr).expect("the expression evaluates");
+    let stats = runtime.eval_region_stats();
+    eprintln!(
+        "shape={label:<28} window={:<3} used={:<8} capacity={:<9} opens={:<5} resets={:<5} \
+         declines={:<4} last_decline={:?} words_reclaimed={:<8} \
+         retired_regions={} retired_capacity_words={}",
+        if enabled { "on" } else { "off" },
+        stats.used,
+        stats.capacity,
+        stats.opens,
+        stats.resets,
+        stats.declines,
+        stats.last_decline,
+        stats.words_reclaimed,
+        stats.retired_regions,
+        stats.retired_capacity_words,
+    );
+}
+/// `/proc/loadavg` verbatim — the shared-host context every figure in `PERF.md` is quoted with.
+///
+/// Never panics: a platform without the file answers a note instead.
+fn loadavg() -> String {
+    match std::fs::read_to_string("/proc/loadavg") {
+        Ok(text) => text.trim().to_string(),
+        Err(_) => "<no /proc/loadavg>".to_string(),
+    }
+}
+
 /// The `u64` a `-eval` expression answered, for the reduces above.
 fn as_integer(term: Eterm) -> u64 {
     assert!(beam_term::is_small(term), "an integer result");
