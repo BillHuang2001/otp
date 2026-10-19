@@ -5225,8 +5225,22 @@ fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.driver_interp_steps,
     );
     println!(
-        "  prologue: jit_set_position={} jit_publish_y={} jit_refresh_y={}",
-        counters.set_position, counters.publish_y, counters.refresh_y
+        "  prologue: jit_set_position={} jit_publish_y={} jit_refresh_y={} | \
+         y-window skips: publish_y_skips={} refresh_y_skips={}",
+        counters.set_position,
+        counters.publish_y,
+        counters.refresh_y,
+        counters.publish_y_skips,
+        counters.refresh_y_skips,
+    );
+    println!(
+        "  emitting ranges: blocks={} sub_blocks={} ir_blocks={} | sub_blocks_y_touching={} \
+         sub_blocks_publish={}",
+        counters.blocks,
+        counters.emitted_sub_blocks,
+        counters.blocks.saturating_sub(counters.emitted_sub_blocks),
+        counters.sub_blocks_y_touching,
+        counters.sub_blocks_prologue_publishes,
     );
     println!(
         "  call_ext: resolved={} declined={} fallback_to_step_one={}",

@@ -44,7 +44,12 @@
 //!   transfers (a driver round-trip the tier did not pay) and the declines (the honest
 //!   residual: the call kept the pre-existing round-trip).
 //! * **Prologue position/publish calls** — [`record_set_position`] /
-//!   [`record_publish_y`] / [`record_refresh_y`] from the three prologue helpers.
+//!   [`record_publish_y`] / [`record_refresh_y`] from the three prologue helpers, plus the
+//!   **derivation skips** [`record_publish_y_skip`] / [`record_refresh_y_skip`] the
+//!   Y-window witness makes (`publish_y − publish_y_skips` and
+//!   `refresh_y − refresh_y_skips` are the derivations actually performed), and
+//!   [`record_sub_block`] (how many emitting ranges are continuation sub-blocks rather
+//!   than IR blocks — the ranges the compile-time publish gate can never elide).
 //! * **`Y`-window traffic** — [`record_y_access`] (every emitted guarded `Y`-slot read
 //!   or write, with its emitted byte length) and [`record_y_invalidation`] (every
 //!   in-block helper call after which a later instruction of the same block still
@@ -179,8 +184,21 @@ pub(crate) struct Counters {
     pub(crate) set_position: u64,
     /// `jit_publish_y` calls (every block prologue whose body touches a `Y` slot).
     pub(crate) publish_y: u64,
+    /// `jit_publish_y` calls that **skipped the derivation** because the Y-window witness
+    /// ([`JitRuntime::y_window_current`]) was already current: the position store still
+    /// happened, only the `frames.last()` deref + `stack` pointer + mul-add were elided
+    /// (Invariant IW). `publish_y − publish_y_skips` is the number of prologues that really
+    /// derived the window.
+    ///
+    /// [`JitRuntime::y_window_current`]: super::runtime::JitRuntime::y_window_current
+    pub(crate) publish_y_skips: u64,
     /// `jit_refresh_y` calls (the gated in-block Y-window re-publish).
     pub(crate) refresh_y: u64,
+    /// `jit_refresh_y` calls that **skipped the derivation** because the witness was still
+    /// current — the in-block helper that preceded it changed no frame, so the call
+    /// degenerated to a load + test + `ret`. **This is the lever's headline number**: every
+    /// one of these is a derivation the tier no longer performs on the per-block hot path.
+    pub(crate) refresh_y_skips: u64,
     /// Emitted **guarded Y-slot reads** ([`super::emit::emit_guarded_y_load`]): one
     /// frame-window guard plus one load, per inlined `Y` source.
     pub(crate) y_loads: u64,
@@ -212,6 +230,23 @@ pub(crate) struct Counters {
     /// destroys the cache registers) and cannot survive an in-block helper, so only
     /// intra-block reuse of one slot is exploitable.
     pub(crate) y_slot_repeats: u64,
+    /// **Emitted continuation sub-blocks.** An emitting range that covers a frame-preserving
+    /// call's `pc + 1` continuation (`emit::compile::emit_sub_blocks` for the lazy layout,
+    /// `emit::compile::emit_shared_sub_blocks` for the eager one) rather than an IR block
+    /// start. [`blocks`](Counters::blocks) counts **both**, so `blocks − emitted_sub_blocks`
+    /// is the IR-block total and this is the split the range-crossing witness exists for: a
+    /// sub-block's range lies *before* the `call`, so its own allocation contains no frame
+    /// helper and `Allocation::prologue_publishes_y` cannot elide its publish — only the
+    /// run-time witness can.
+    pub(crate) emitted_sub_blocks: u64,
+    /// Emitted continuation sub-blocks whose body accesses a `Y` slot (the sub-blocks that
+    /// publish at all).
+    pub(crate) sub_blocks_y_touching: u64,
+    /// Emitted continuation sub-blocks whose prologue publishes the Y window
+    /// (`Allocation::prologue_publishes_y`). The irreducible part of
+    /// [`y_prologue_publishes`](Counters::y_prologue_publishes) that the **run-time**
+    /// witness has to skip: the compile-time gate can never elide it.
+    pub(crate) sub_blocks_prologue_publishes: u64,
     /// The per-opcode deopt attribution: variant name -> count.
     pub(crate) deopts_by_variant: BTreeMap<String, u64>,
     /// The driver round-trips by the word class they returned (`HALT`/`ERROR`/
@@ -432,6 +467,37 @@ pub(crate) fn record_publish_y() {
 /// A `jit_refresh_y` call (the gated in-block Y-window refresh).
 pub(crate) fn record_refresh_y() {
     with(|c| c.refresh_y += 1);
+}
+
+/// A `jit_publish_y` prologue call that **skipped the Y-window derivation** because the
+/// witness ([`JitRuntime::y_window_current`]) was already current — the range-crossing
+/// lever ([`Counters::publish_y_skips`]).
+///
+/// [`JitRuntime::y_window_current`]: super::runtime::JitRuntime::y_window_current
+pub(crate) fn record_publish_y_skip() {
+    with(|c| c.publish_y_skips += 1);
+}
+
+/// A `jit_refresh_y` call that **skipped the Y-window derivation** because the witness was
+/// still current, i.e. the in-block helper that preceded it changed no frame
+/// ([`Counters::refresh_y_skips`]).
+pub(crate) fn record_refresh_y_skip() {
+    with(|c| c.refresh_y_skips += 1);
+}
+
+/// One emitted **continuation sub-block** (not an IR block start): `y_touching` is whether
+/// its body accesses a `Y` slot and `publishes` whether its prologue publishes the window
+/// ([`Counters::emitted_sub_blocks`] and its two split counters).
+pub(crate) fn record_sub_block(y_touching: bool, publishes: bool) {
+    with(|c| {
+        c.emitted_sub_blocks += 1;
+        if y_touching {
+            c.sub_blocks_y_touching += 1;
+        }
+        if publishes {
+            c.sub_blocks_prologue_publishes += 1;
+        }
+    });
 }
 
 /// One emitted guarded Y-slot access: `load` distinguishes a read

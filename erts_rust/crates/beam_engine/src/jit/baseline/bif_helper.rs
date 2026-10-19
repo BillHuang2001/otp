@@ -114,6 +114,12 @@ pub(crate) extern "C" fn jit_bif_value(rt: *mut JitRuntime<'_>, func: u32, pc: u
         // a raw pointer; the driver holds no `&mut` to it while the helper runs.
         let ctx = unsafe { &mut *runtime.ctx };
 
+        // **No Y-window invalidation on the fast path**: `evaluate_bif` computes
+        // `byte_size/1`/`length/1` through the shared `read_operand`/`write_operand` and
+        // `beam_term`'s own accessors, so it pushes/pops no frame and never touches
+        // `machine.stack` — the published window stays current and the block's gated
+        // refresh can skip its derivation (Invariant IW). The `jit_step_one` fallbacks
+        // below clear it themselves.
         evaluate_bif(machine, module, ctx, func, pc)
     };
     match handled {

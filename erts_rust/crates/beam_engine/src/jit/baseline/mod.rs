@@ -1059,6 +1059,12 @@ fn drive(
         resume_entry: std::ptr::null(),
         tables: runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
+        // The Y-window witness starts **false**: this driver has derived nothing yet, and
+        // a resume rebuilds the whole `JitRuntime` (a parked machine's `machine.stack` may
+        // have been reallocated, or its frame stack rewound, while it was parked), so "not
+        // published" is the only safe initial state. The first Y-publishing block derives
+        // (`JitRuntime::y_window_current`).
+        y_window_current: false,
     };
     // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
     // a `move` with an `Operand::Literal` source loads its word from this base at run
@@ -1108,6 +1114,23 @@ fn drive(
         // objects (`Machine` and the `ExecutionContext`); the loop head is only
         // reached between block calls, so no native code is running and neither
         // borrow is outstanding.
+        //
+        // **The Y-window witness is invalidated at every iteration boundary.** A block
+        // can change the top call frame and leave without running any of this crate's
+        // frame helpers: the family arm (`jit_family`) runs the interpreter's own
+        // `families::dispatch` body, whose raise path (`Machine::unwind_to_frame`)
+        // truncates `machine.frames` **and** `machine.stack`, and it reports that as a
+        // non-`Next` `Step` — so the block exits with the witness still describing a
+        // frame that no longer exists. Every other frame change is covered by its own
+        // helper (see `JitRuntime::y_window_current`'s invalidation set), but this one
+        // cannot be, because the family surface is frame-neutral only on a `Next`
+        // outcome and must stay untouched. Clearing once per driver iteration closes
+        // the hole at one store per block entry and cannot cost a derivation: whatever
+        // runs next publishes in its own prologue (or refreshes) anyway, and the
+        // intra-iteration transfers the witness exists for (`emit_tail_exit`,
+        // `emit_in_block_call`, a continuation `return` tail-jumped in-block) never
+        // reach this point.
+        rt.invalidate_y_window();
         unsafe {
             (*machine_ptr).set_current_code(func, pc);
             // The engine-side slice counter, bumped in the same step as the hook so
