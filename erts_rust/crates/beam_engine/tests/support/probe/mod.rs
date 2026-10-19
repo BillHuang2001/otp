@@ -896,12 +896,24 @@ impl Probe {
                         Observed::Suspended { func, pc },
                         format!("{suspended}, suspended again at ({func},{pc})"),
                     ),
+                    Ok(RunOutcome::Suspend { func, pc }) => (
+                        Observed::Suspended { func, pc },
+                        format!("{suspended}, then bif-suspended at ({func},{pc})"),
+                    ),
                     Err(error) => {
                         let (observed, detail) = observed_error(&module, error);
                         (observed, format!("{suspended}, then {detail}"))
                     }
                 }
             }
+            // A BIF that answered `BifOutcome::Suspend` (no probe host installs an
+            // outcome hook, so this is unreachable today; recorded rather than
+            // mistaken for a value). The parked address is the UN-APPLIED
+            // instruction, which the resume re-executes.
+            Ok(RunOutcome::Suspend { func, pc }) => (
+                Observed::Suspended { func, pc },
+                format!("bif-suspended at ({func},{pc})"),
+            ),
             Err(error) => observed_error(&module, error),
         };
         ProbeRun {

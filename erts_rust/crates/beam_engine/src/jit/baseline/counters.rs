@@ -177,7 +177,8 @@ pub(crate) struct Counters {
     /// disjoint (a transfer records exactly one of them).
     pub(crate) cross_function_memo_hits: u64,
     /// Block-ABI words the driver had to decode (a block ran and returned).
-    pub(crate) driver_round_trips: u64,    /// Driver iterations with no native entry: one interpreter step each.
+    pub(crate) driver_round_trips: u64,
+    /// Driver iterations with no native entry: one interpreter step each.
     pub(crate) driver_interp_steps: u64,
     /// Frame-preserving local `call`s transferred **in-block** to a natively compiled
     /// callee (`jit_call_store_linked` resolved an entry for the lazy artifact's
@@ -612,7 +613,7 @@ pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
     });
 }
 
-/// The word class of a block-ABI word (`HALT`/`ERROR`/`ENTER`/`WAIT`/`GOTO`).
+/// The word class of a block-ABI word (`HALT`/`ERROR`/`ENTER`/`SUSPEND`/`WAIT`/`GOTO`).
 fn word_class(word: i64) -> &'static str {
     if word == super::HALT {
         "HALT"
@@ -620,13 +621,14 @@ fn word_class(word: i64) -> &'static str {
         "ERROR"
     } else if word == super::ENTER {
         "ENTER"
+    } else if word == super::SUSPEND {
+        "SUSPEND"
     } else if super::decode_wait(word).is_some() {
         "WAIT"
     } else {
         "GOTO"
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

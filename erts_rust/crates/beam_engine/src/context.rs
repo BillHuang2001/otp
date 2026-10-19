@@ -61,6 +61,26 @@
 //! the door behaves identically on every execution tier. The default `false` keeps
 //! the plain [`call_bif`] path byte-identical.
 //!
+//! ## The BIF suspend channel
+//!
+//! [`call_bif`] can answer only a value or an error, so a BIF that cannot complete
+//! **without waiting** (a `erlang:port_command/2,3` aimed at a busy port, a blocking
+//! port write) has no way to park its caller and be re-issued. [`BifOutcome`] is that
+//! channel, and it has an outcome-aware door beside each of the two dispatch doors:
+//! [`call_bif_outcome`] (the plain twin of [`call_bif`]) and
+//! [`call_bif_in_machine_outcome`] (the twin of [`call_bif_in_machine`], which is what
+//! a host that opted into the in-machine door must override). Both **default** to
+//! forwarding and wrapping the value, so every existing implementor is
+//! byte-identical.
+//!
+//! A [`BifOutcome::Suspend`] means the BIF did not complete and the instruction was
+//! **not** applied: the engine parks the machine on that instruction (its own
+//! `(func, pc)`, nothing else — it neither copies the arguments nor remembers the
+//! BIF) and reports [`crate::RunOutcome::Suspend`]. Resumption **re-executes** the
+//! instruction, which re-reads its operands from `x`/`y`/literals/stack — i.e. from
+//! the frozen [`RootSet`] — so a suspended BIF's live operands are rooted by
+//! construction. It is the engine-side twin of ERTS's `ERTS_BIF_YIELD2/3`.
+//!
 //! ## The mailbox / message-receive seam
 //!
 //! The `receive` opcode family ([`crate::families::receive`]) never looks at a
@@ -112,6 +132,9 @@
 //! [`call_bif`]: ExecutionContext::call_bif
 //! [`wants_bif_in_machine`]: ExecutionContext::wants_bif_in_machine
 //! [`call_bif_in_machine`]: ExecutionContext::call_bif_in_machine
+//! [`call_bif_outcome`]: ExecutionContext::call_bif_outcome
+//! [`call_bif_in_machine_outcome`]: ExecutionContext::call_bif_in_machine_outcome
+//! [`RootSet`]: crate::context::RootSet
 //! [`atom_name`]: ExecutionContext::atom_name
 //!
 //! # `unsafe`
@@ -338,6 +361,82 @@ pub enum TraceEvent<'a> {
     },
 }
 
+/// The outcome of a BIF dispatch that is allowed to **wait**.
+///
+/// [`ExecutionContext::call_bif`] can only answer a value or an error, which leaves a
+/// BIF that *cannot complete without waiting* — a plain `erlang:port_command/2,3`
+/// aimed at a busy port, a blocking port write — with no way to park its caller and be
+/// re-issued: it can only raise a typed "cannot pump" error. This enum is the missing
+/// channel, the engine-side twin of ERTS's `ERTS_BIF_YIELD2/3` (`erts/emulator/beam/
+/// bif.h:330-337`), whose `BIF_TRAP_N` writes the BIF's arguments into
+/// `x_reg_array[0..N]`, points `c_p->i` at a synthetic **trap export for the same
+/// BIF** and returns `THE_NON_VALUE`.
+///
+/// * [`BifOutcome::Return`] — the ordinary answer, exactly what
+///   [`ExecutionContext::call_bif`] returns.
+/// * [`BifOutcome::Suspend`] — the BIF could not complete without waiting. The engine
+///   does **not** apply the instruction: it parks on it (the machine's own
+///   `(func, pc)`) and reports a suspend ([`crate::RunOutcome::Suspend`]). The host
+///   later resumes the process, and the BIF is **re-issued from the same instruction
+///   with the same operands** — so the caller sees *that* call's value, never a
+///   value the abandoned attempt computed.
+///
+/// # Rooting
+///
+/// The engine keeps **no** suspended-BIF state: it neither copies the arguments nor
+/// remembers the BIF's identity. Parking is the machine's `(func, pc)` plus its
+/// registers, its Erlang stack and its FR file — and resumption **re-executes the
+/// instruction**, which re-reads its operands from `x`/`y`/literals/stack. Those are
+/// exactly the frozen [`RootSet`] (`x[..live]`, the whole stack, the whole FR file), so
+/// a suspended BIF's live operands are rooted **by construction** and a moving
+/// collector may relocate them. (In C the equivalent is the process-private
+/// `c_arg_reg`/`arg_reg` array, saved by `copy_out_registers` and restored by
+/// `copy_in_registers` — `beam_common.c:306`/`:336`.)
+///
+/// # Where a suspend is honoured
+///
+/// Only the re-execution-idempotent dispatch sites turn a suspend into a park (its
+/// operand reads are pure and every write is success-only). A site that rewrites
+/// registers *before* dispatching — the `erlang:apply/3` route, which has already
+/// unpacked the argument list into `x(0..arity)` — reports a **typed error** instead of
+/// silently treating the suspend as a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BifOutcome {
+    /// The BIF completed; this is its value.
+    Return(Eterm),
+    /// The BIF could not complete without waiting; the instruction was **not** applied
+    /// and must be re-executed on resume (see the type docs).
+    Suspend,
+}
+
+impl BifOutcome {
+    /// Is this a [`BifOutcome::Suspend`]?
+    pub fn is_suspend(&self) -> bool {
+        matches!(self, BifOutcome::Suspend)
+    }
+
+    /// The returned value, or `None` for a suspend.
+    pub fn into_value(self) -> Option<Eterm> {
+        match self {
+            BifOutcome::Return(value) => Some(value),
+            BifOutcome::Suspend => None,
+        }
+    }
+
+    /// The returned value, or the typed suspend error `at` names.
+    ///
+    /// The bridge for a dispatch site that is **not** re-execution-idempotent (see
+    /// [`BifOutcome`]): a suspend cannot be honoured there, and it must never be
+    /// mistaken for a value, so it becomes a [`crate::error::unsupported`] naming the
+    /// site.
+    pub fn into_value_or_unsupported(self, at: &str) -> Result<Eterm> {
+        match self {
+            BifOutcome::Return(value) => Ok(value),
+            BifOutcome::Suspend => Err(crate::error::unsupported(at)),
+        }
+    }
+}
+
 /// Everything the engine needs from the runtime (BIF dispatch, heap/GC, limits).
 pub trait ExecutionContext {
     /// Dispatch `module:function/arity` with `args`, returning the result term.
@@ -352,6 +451,79 @@ pub trait ExecutionContext {
         args: &[Eterm],
     ) -> Result<Eterm>;
 
+    /// The **outcome-aware** BIF door: [`call_bif`](ExecutionContext::call_bif) that is
+    /// also allowed to answer [`BifOutcome::Suspend`].
+    ///
+    /// A host whose BIFs can **wait** — a `erlang:port_command/2,3` at a busy port, a
+    /// blocking port write — overrides this door; the engine then folds a
+    /// [`BifOutcome::Suspend`] into [`Step::Suspend`](crate::Step) at every
+    /// re-execution-idempotent dispatch site, parking the machine on the instruction
+    /// and reporting [`crate::RunOutcome::Suspend`] to a blocking-aware run entry.
+    ///
+    /// **Contract.**
+    /// * `Suspend` means the BIF did **not** complete and the instruction was **not**
+    ///   applied: the host resumes the process itself and the BIF is re-issued from
+    ///   the same instruction with the same operands, so it must be **re-execution
+    ///   safe** on the host side too (do not consume a one-shot resource on the
+    ///   suspending attempt).
+    /// * Only the sites listed on [`BifOutcome`] honour a suspend. The
+    ///   `erlang:apply/3` route (which rewrites `x(0..arity)` before dispatching)
+    ///   reports a typed error for one.
+    /// * A host that answered `true` from
+    ///   [`wants_bif_in_machine`](ExecutionContext::wants_bif_in_machine) must
+    ///   override [`call_bif_in_machine_outcome`](ExecutionContext::call_bif_in_machine_outcome)
+    ///   instead — the engine then calls **only** that door, exactly as it calls only
+    ///   [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine) today.
+    /// * [`crate::RunOutcome::Suspend`] is only reachable from a blocking-aware run
+    ///   entry; a non-blocking one folds it into the typed
+    ///   [`crate::error::suspended`] error.
+    ///
+    /// The default body forwards to [`call_bif`](ExecutionContext::call_bif) and wraps
+    /// the value, so **every existing implementor compiles and behaves
+    /// byte-identically**.
+    fn call_bif_outcome(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<BifOutcome> {
+        self.call_bif(module, function, arity, args)
+            .map(BifOutcome::Return)
+    }
+
+    /// The **in-machine outcome-aware** BIF door: the
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine) dispatch that is
+    /// also allowed to answer [`BifOutcome::Suspend`].
+    ///
+    /// The engine takes this door only when
+    /// [`wants_bif_in_machine`](ExecutionContext::wants_bif_in_machine) answered `true`
+    /// for the run, so a host that opts in must override **this** method (never only
+    /// [`call_bif_outcome`](ExecutionContext::call_bif_outcome)) to make its BIFs able
+    /// to wait. `machine` is the live process state, `entry_module` the module the run
+    /// was entered at, and the arguments are exactly
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine)'s.
+    ///
+    /// The suspend contract is [`call_bif_outcome`](ExecutionContext::call_bif_outcome)'s
+    /// verbatim: the engine keeps no suspended-BIF state, so parking is the machine's
+    /// own `(func, pc)` and its rooted registers/stack/FR file, and resumption
+    /// re-executes the instruction.
+    ///
+    /// The default body discards the two extra arguments, forwards to
+    /// [`call_bif_in_machine`](ExecutionContext::call_bif_in_machine) and wraps the
+    /// value, so every existing implementor is byte-identical.
+    fn call_bif_in_machine_outcome(
+        &mut self,
+        machine: &Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<BifOutcome> {
+        self.call_bif_in_machine(machine, entry_module, module, function, arity, args)
+            .map(BifOutcome::Return)
+    }
     /// The probe for the **in-machine** BIF-dispatch door
     /// ([`call_bif_in_machine`](ExecutionContext::call_bif_in_machine)).
     ///
@@ -983,6 +1155,17 @@ pub trait ExecutionContext {
 /// A BIF hook: maps `(module, function, arity, args)` to a result.
 pub type BifHook = Box<dyn FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm>>;
 
+/// An **outcome-aware** BIF hook: maps `(module, function, arity, args)` to a
+/// [`BifOutcome`], so a hook may answer [`BifOutcome::Suspend`].
+///
+/// This is the pluggable body of
+/// [`ExecutionContext::call_bif_outcome`]: it is consulted **instead of** the plain
+/// [`BifHook`] when it is installed (see
+/// [`MinimalContext::with_bif_outcome_hook`]). [`MinimalContext::new`] leaves it
+/// unset, so `call_bif_outcome` stays the trait default — forward to
+/// [`call_bif`](ExecutionContext::call_bif) and wrap the value.
+pub type BifOutcomeHook =
+    Box<dyn FnMut(&str, &str, u32, &[Eterm]) -> Result<BifOutcome>>;
 /// An apply hook: computes the result of applying a fun/closure value to `args`.
 ///
 /// This is the pluggable body of [`ExecutionContext::apply_fun`]: the `call_fun`/
@@ -1227,6 +1410,15 @@ impl ContextHeap {
 /// `unsupported`.
 pub struct MinimalContext {
     hook: BifHook,
+    /// An optional **outcome-aware** BIF hook (the
+    /// [`ExecutionContext::call_bif_outcome`] body).
+    ///
+    /// When installed it is consulted **instead of** `hook`, so a test host can answer
+    /// [`BifOutcome::Suspend`] and drive the engine's park/resume protocol. `None` out
+    /// of the box, which keeps `call_bif_outcome` the trait default (forward to
+    /// [`ExecutionContext::call_bif`] and wrap the value), byte-identical to the
+    /// pre-seam engine.
+    outcome_hook: Option<BifOutcomeHook>,
     /// An optional fun-application hook (the [`ExecutionContext::apply_fun`] body).
     apply_hook: Option<ApplyHook>,
     /// An optional cross-module-call resolver (the
@@ -1276,6 +1468,7 @@ impl MinimalContext {
     pub fn with_bif_hook(hook: BifHook) -> MinimalContext {
         MinimalContext {
             hook,
+            outcome_hook: None,
             apply_hook: None,
             external_resolver: None,
             local_fun_resolver: None,
@@ -1286,6 +1479,19 @@ impl MinimalContext {
         }
     }
 
+    /// A context with the given **outcome-aware** BIF hook and the default (rejecting)
+    /// plain BIF hook.
+    ///
+    /// The hook serves [`ExecutionContext::call_bif_outcome`], so it may answer
+    /// [`BifOutcome::Suspend`] and a test can drive the engine's park/resume protocol
+    /// (`RunOutcome::Suspend` → the host pumps → `Machine::resume_outcome` re-executes
+    /// the instruction). Combine with an ordinary BIF hook via
+    /// [`set_bif_hook`](MinimalContext::set_bif_hook) for the plain door.
+    pub fn with_bif_outcome_hook(hook: BifOutcomeHook) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.outcome_hook = Some(hook);
+        ctx
+    }
     /// A context with the given fun-application hook and the default (rejecting)
     /// BIF hook.
     ///
@@ -1310,6 +1516,11 @@ impl MinimalContext {
         self.hook = hook;
     }
 
+    /// Install (or replace) the **outcome-aware** BIF hook — the body of
+    /// [`ExecutionContext::call_bif_outcome`].
+    pub fn set_bif_outcome_hook(&mut self, hook: BifOutcomeHook) {
+        self.outcome_hook = Some(hook);
+    }
     /// Install (or replace) the fun-application hook.
     pub fn set_apply_hook(&mut self, hook: ApplyHook) {
         self.apply_hook = Some(hook);
@@ -1421,6 +1632,21 @@ impl ExecutionContext for MinimalContext {
         (self.hook)(module, function, arity, args)
     }
 
+    /// Answer from the installed **outcome-aware** hook when one was installed, else the
+    /// trait default (forward to [`call_bif`](ExecutionContext::call_bif) and wrap the
+    /// value) — the pre-seam behaviour exactly.
+    fn call_bif_outcome(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<BifOutcome> {
+        match self.outcome_hook.as_mut() {
+            Some(hook) => hook(module, function, arity, args),
+            None => self.call_bif(module, function, arity, args).map(BifOutcome::Return),
+        }
+    }
     /// Answer from the installed shared namespace, or the trait default (the running
     /// module's own snapshot) when none was installed.
     fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
@@ -2193,5 +2419,154 @@ mod tests {
         assert_eq!(ctx.receive_next().unwrap(), None);
         ctx.set_mailbox(Box::new(second));
         assert_eq!(ctx.receive_next().unwrap(), Some(Eterm::from_raw(0x42)));
+    }
+
+    // ---- the BIF suspend channel (`BifOutcome`) ---------------------------
+    //
+    // Both outcome-aware doors are **defaulted**, so a host that predates the channel
+    // is byte-identical to the pre-seam engine: each default forwards to its older
+    // twin and wraps the answer in `BifOutcome::Return`.
+
+    /// A host that knows nothing about the suspend channel: only the two required
+    /// methods, with `call_bif` answering a known small integer.
+    struct PlainBifHost;
+
+    impl ExecutionContext for PlainBifHost {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Ok(beam_term::make_small(7))
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_outcome_door_defaults_to_a_wrapped_return() {
+        // The defaulted `call_bif_outcome` forwards to `call_bif` and wraps the value,
+        // so a host that overrides only that door can never report a suspend and keeps
+        // the exact value it always answered.
+        let mut ctx = PlainBifHost;
+        assert_eq!(
+            ExecutionContext::call_bif_outcome(&mut ctx, "erlang", "self", 0, &[]).unwrap(),
+            BifOutcome::Return(beam_term::make_small(7)),
+            "the defaulted outcome door must forward to `call_bif` and wrap its value"
+        );
+    }
+
+    /// A host that opted into the **in-machine** door but knows nothing about the
+    /// suspend channel: the gate is on and only `call_bif_in_machine` is overridden
+    /// (`call_bif` rejects, so taking it would be observable).
+    struct InMachineBifHost;
+
+    impl ExecutionContext for InMachineBifHost {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Err(beam_common::BeamError::BadArg)
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn wants_bif_in_machine(&self) -> bool {
+            true
+        }
+
+        fn call_bif_in_machine(
+            &mut self,
+            _machine: &Machine,
+            _entry_module: &Module,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Ok(beam_term::make_small(9))
+        }
+    }
+
+    #[test]
+    fn the_in_machine_outcome_door_defaults_to_a_wrapped_return() {
+        // The in-machine twin forwards to `call_bif_in_machine` (never to `call_bif`)
+        // and wraps the value, so an opted-in host that predates the channel keeps its
+        // value route.
+        let mut ctx = InMachineBifHost;
+        let machine = Machine::new();
+        let entry = Module::default();
+
+        assert_eq!(
+            ExecutionContext::call_bif_in_machine_outcome(
+                &mut ctx,
+                &machine,
+                &entry,
+                "erlang",
+                "self",
+                0,
+                &[]
+            )
+            .unwrap(),
+            BifOutcome::Return(beam_term::make_small(9)),
+            "the defaulted in-machine outcome door must forward to `call_bif_in_machine`"
+        );
+        assert!(
+            ctx.call_bif("erlang", "self", 0, &[]).is_err(),
+            "`call_bif` rejects here, so the answer above came from the in-machine door"
+        );
+    }
+
+    #[test]
+    fn minimal_context_prefers_its_outcome_hook_and_falls_back_to_the_plain_one() {
+        // An installed outcome hook IS the door, so a suspend is expressible while the
+        // plain hook keeps answering the plain route.
+        let mut ctx = MinimalContext::with_bif_outcome_hook(Box::new(|_m, _f, _a, _args| {
+            Ok(BifOutcome::Suspend)
+        }));
+        ctx.set_bif_hook(Box::new(|_m, _f, _a, _args| Ok(beam_term::make_small(3))));
+        assert_eq!(
+            ctx.call_bif_outcome("erlang", "port_command", 2, &[])
+                .unwrap(),
+            BifOutcome::Suspend,
+            "an installed outcome hook must be consulted by the outcome door"
+        );
+        assert_eq!(
+            ctx.call_bif("erlang", "port_command", 2, &[]).unwrap(),
+            beam_term::make_small(3),
+            "the plain door must keep answering the plain hook"
+        );
+
+        // With no outcome hook the outcome door is the trait default: the plain answer,
+        // wrapped (so the pre-seam behaviour is exactly preserved).
+        let mut plain = MinimalContext::with_bif_hook(Box::new(|_m, _f, _a, _args| {
+            Ok(beam_term::make_small(4))
+        }));
+        assert_eq!(
+            plain.call_bif_outcome("lists", "reverse", 1, &[]).unwrap(),
+            BifOutcome::Return(beam_term::make_small(4)),
+            "without an outcome hook the door must forward and wrap"
+        );
     }
 }

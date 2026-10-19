@@ -75,3 +75,22 @@ pub fn unknown_label(label: beam_loader::Label) -> BeamError {
 pub fn blocked() -> BeamError {
     unsupported("run: process blocked (no message available)")
 }
+
+/// The typed error a **non-blocking** run surfaces when a BIF answered
+/// [`crate::BifOutcome::Suspend`].
+///
+/// The blocking-aware entries ([`crate::Machine::run_export_outcome`]/
+/// [`crate::Machine::run_label_outcome`]/[`crate::Machine::resume_outcome`] and their
+/// `*_with_tier` twins) report the park as a [`crate::RunOutcome::Suspend`] instead;
+/// the plain [`crate::Machine::run_export`]/[`crate::Machine::run_label`] (and the JIT
+/// backends' `run_export`) fold that outcome into this error, because a non-blocking
+/// entry cannot suspend the process and must never invent a result.
+///
+/// It is deliberately **not** [`blocked`]: a suspended BIF is not a `receive` with an
+/// empty mailbox, and the two must stay distinguishable to a host reading the reason
+/// atom. Like every other engine diagnostic it is a [`BeamError::Raise`] whose reason
+/// atom reads `unsupported_opcode: run: process suspended by a BIF (host must resume)`;
+/// this constructor is the **single definition** of that string.
+pub fn suspended() -> BeamError {
+    unsupported("run: process suspended by a BIF (host must resume)")
+}

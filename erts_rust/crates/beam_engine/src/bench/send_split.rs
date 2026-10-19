@@ -475,12 +475,24 @@ fn drive(module: &Arc<Module>, leg: &Leg, ops: usize, tier: Tier) -> beam_common
                 break;
             }
             RunOutcome::Wait { func, pc } => (func, pc),
+            // The bench host answers every BIF directly, so a suspend would mean the measuring
+            // context changed shape: the ping-pong is a park/resume workload only.
+            RunOutcome::Suspend { .. } => {
+                return Err(crate::error::unsupported(
+                    "send_split: the driver suspended on a BIF; the bench host never suspends",
+                ))
+            }
         };
         let worker_position = match worker_outcome {
             RunOutcome::Wait { func, pc } => (func, pc),
             RunOutcome::Returned(_) => {
                 return Err(crate::error::unsupported(
                     "send_split: the worker returned before the driver",
+                ))
+            }
+            RunOutcome::Suspend { .. } => {
+                return Err(crate::error::unsupported(
+                    "send_split: the worker suspended on a BIF; the bench host never suspends",
                 ))
             }
         };
@@ -680,7 +692,8 @@ fn per_op(count: u64, ops: usize) -> f64 {
 
 /// Print one leg's `key = value` block.
 fn print_leg(leg: &Leg, tier: Tier, measurement: &Measurement) {
-    let ops = measurement.ops;    let min = measurement.min();
+    let ops = measurement.ops;
+    let min = measurement.min();
     let median = measurement.median();
     let instr = per_op(measurement.driver.instructions, ops)
         + per_op(measurement.worker.instructions, ops);
@@ -874,7 +887,8 @@ fn send_recv_split_decomposition() {
         for leg in LEGS {
             let measurement = measure_leg(&module, leg, *tier, ops, batch, warmup)
                 .unwrap_or_else(|error| panic!("{} on {}: {error:?}", leg.name, tier.name()));
-            print_leg(leg, *tier, &measurement);            println!("loadavg_after_leg = {}", loadavg());
+            print_leg(leg, *tier, &measurement);
+            println!("loadavg_after_leg = {}", loadavg());
             measured.push((leg, *tier, measurement));
         }
     }
@@ -910,7 +924,8 @@ fn send_recv_split_decomposition() {
         };
         let (Some(plain), Some(heap)) = (pick("plain"), pick("heap")) else {
             continue;
-        };        let plain_instr = instr(plain);
+        };
+        let plain_instr = instr(plain);
         let heap_instr = instr(heap);
         let plain_words = words(plain);
         let heap_words = words(heap);

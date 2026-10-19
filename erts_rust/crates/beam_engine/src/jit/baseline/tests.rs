@@ -92,6 +92,7 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         ctx: &mut ctx,
         error: None,
         enter: None,
+        suspend: None,
         y_base: std::ptr::null_mut(),
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
@@ -2550,6 +2551,7 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
         ctx: &mut ctx,
         error: None,
         enter: None,
+        suspend: None,
         y_base: std::ptr::null_mut(),
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
@@ -2948,6 +2950,7 @@ fn run_ext_call(
         ctx: &mut ctx,
         error: None,
         enter: None,
+        suspend: None,
         y_base: std::ptr::null_mut(),
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
@@ -5303,12 +5306,24 @@ fn drive_probe(
         let (func, pc) = match driver_outcome {
             RunOutcome::Wait { func, pc } => (func, pc),
             RunOutcome::Returned(_) => unreachable!("handled above"),
+            // This probe's context answers every BIF directly, so a suspend is a harness
+            // mismatch, not a reachable outcome of the ping-pong.
+            RunOutcome::Suspend { .. } => {
+                return Err(crate::error::unsupported(
+                    "srbench probe: the driver suspended on a BIF; the probe host never suspends",
+                ))
+            }
         };
         let (worker_func, worker_pc) = match worker_outcome {
             RunOutcome::Wait { func, pc } => (func, pc),
             RunOutcome::Returned(_) => {
                 return Err(crate::error::unsupported(
                     "srbench probe: the worker returned before the driver",
+                ))
+            }
+            RunOutcome::Suspend { .. } => {
+                return Err(crate::error::unsupported(
+                    "srbench probe: the worker suspended on a BIF; the probe host never suspends",
                 ))
             }
         };

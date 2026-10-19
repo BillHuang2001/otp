@@ -221,6 +221,11 @@ fn foreign_long_append_decomposition() {
             RunOutcome::Wait { .. } => {
                 panic!("the fixture's input/1 blocked in a receive: it has none")
             }
+            // The bench host answers every BIF directly, so a suspend is a fixture/host
+            // mismatch rather than a measurable outcome.
+            RunOutcome::Suspend { .. } => {
+                panic!("the fixture's input/1 suspended on a BIF: the bench host never suspends")
+            }
         }
     };
 

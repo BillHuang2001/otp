@@ -288,7 +288,8 @@ impl ResultSnapshot {
     }
 }
 
-impl Measurement {    /// The fastest sub-run (the robust statistic under additive background load).
+impl Measurement {
+    /// The fastest sub-run (the robust statistic under additive background load).
     fn min(&self) -> f64 {
         self.samples.iter().copied().fold(f64::INFINITY, f64::min)
     }
@@ -440,6 +441,12 @@ fn run_calls(
                 RunOutcome::Wait { .. } => {
                     panic!("{} blocked in a receive: this fixture has none", tier.name())
                 }
+                // A bench host never answers `BifOutcome::Suspend`, so a park here means the
+                // measuring context changed shape -- fail loudly rather than time a park.
+                RunOutcome::Suspend { .. } => panic!(
+                    "{} suspended on a BIF: the counting host never suspends",
+                    tier.name()
+                ),
             }
         }
         elapsed += start.elapsed();

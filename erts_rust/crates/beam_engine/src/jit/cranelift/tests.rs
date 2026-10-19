@@ -155,6 +155,7 @@ fn the_compiled_function_runs_the_export_natively() {
         ctx: ctx_ptr,
         error: None,
         enter: None,
+        suspend: None,
         // No literal area is bound for this hand-built runtime block. The tier's
         // inline set never reads an `Operand::Literal` (a `move` with a literal
         // source is a shape the inline path declines and deopts to `jit_step_one`),

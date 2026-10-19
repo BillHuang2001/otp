@@ -50,8 +50,9 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   — by `Machine::drive` (`machine/drive.rs`) **and** by the native baseline tier's own driver
   (`jit/baseline/mod.rs`; its deopt helper reaches the same funnel via `jit_step_one` →
   `step_instruction_with_entry`). Every BIF dispatch funnels through `Machine::dispatch_bif_call`
-  (`interpreter/bif.rs`), which takes `ctx.call_bif_in_machine(self, entry_module, …)` when the gate is set
-  and `ctx.call_bif(…)` otherwise; a host that opts in must be reached on **every** tier, so keep the two
+  (`interpreter/bif.rs`), which takes `ctx.call_bif_in_machine_outcome(self, entry_module, …)` when the gate is set
+  and `ctx.call_bif_outcome(…)` otherwise (both `Result<BifOutcome>`, so the BIF suspend channel is available on
+  every tier); a host that opts in must be reached on **every** tier, so keep the two
   drivers latching the same answer (`tests/bif_in_machine.rs` is the tier-parity gate). The run's **entry
   module** (context `0`, the module `Machine::current_stacktrace`'s `module` parameter expects for a
   context-0 frame) is threaded from the driver through `step_instruction_with_entry` → `exec_bif` /

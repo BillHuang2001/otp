@@ -21,16 +21,21 @@
 //! BIF-argument marshalling and the BIF error/raise path (`impl Machine`).
 //!
 //! `exec_bif`/`call_import` marshal a `gc_bif`/`bif`/`call_ext*`'s arguments and
-//! call the BIF through [`ExecutionContext::call_bif`]; `raise_bif_error` folds a
+//! call the BIF through [`ExecutionContext::call_bif_outcome`]; `raise_bif_error` folds a
 //! BIF error into the catch-aware raise the dispatch loop expects.
-
+//!
+//! The BIF door is **outcome-aware** ([`BifOutcome`]), so a BIF that cannot complete
+//! without waiting can answer [`BifOutcome::Suspend`]: each call site decides whether it
+//! may park on the instruction ([`Step::Suspend`], honoured only where re-executing the
+//! instruction is idempotent) or must report a typed error instead.
 use beam_common::{BeamError, ExceptionClass, Result, StackTrace};
 use beam_loader::{ImportRef, Label, Module, Operand, NO_FAIL};
 use beam_term::{make_atom, Eterm, NIL};
 
-use crate::context::ExecutionContext;
+use crate::context::{BifOutcome, ExecutionContext};
 use crate::error;
-use crate::machine::{namespace_atom, Machine};use crate::operand::{read_operand, write_operand};
+use crate::machine::{namespace_atom, Machine};
+use crate::operand::{read_operand, write_operand};
 use crate::Step;
 use super::{resolve, LabelMap};
 
@@ -52,12 +57,12 @@ const EMPTY_ARGS: [Eterm; STACK_ARGS] = [NIL; STACK_ARGS];
 
 impl Machine {
     /// Read a `gc_bif`/`bif`/`bif0`'s **operand** arguments, call the BIF through
-    /// [`ExecutionContext::call_bif`] and fold the outcome into the control-flow
+    /// [`ExecutionContext::call_bif_outcome`] and fold the outcome into the control-flow
     /// [`Step`] the dispatch loop expects.
     ///
     /// The arguments are marshalled into a **stack array** for the common arities
     /// ([`STACK_ARGS`]) and into a heap `Vec` only beyond it, so the heap
-    /// allocation the old code paid on **every** BIF call is gone; `call_bif` keeps
+    /// allocation the old code paid on **every** BIF call is gone; the dispatch keeps
     /// its `&[Eterm]` shape either way. The BIF's `(module, function, arity)`
     /// target comes from the per-run import cache ([`LabelMap::import_target`]),
     /// which replaced the two per-call atom-table lookups the interpreter used to
@@ -69,6 +74,15 @@ impl Machine {
     /// **never** as a guard failure — only a **BIF** error raises
     /// ([`Machine::raise_bif_error`], which is the whole story when `fail == NO_FAIL`,
     /// i.e. for every `bif0`) or branches to `fail`.
+    ///
+    /// This site is **re-execution-idempotent**, so it is one of the places a
+    /// [`BifOutcome::Suspend`] is honoured: the operand reads are pure and
+    /// [`write_operand`] happens only on success, so the arm reports
+    /// [`Step::Suspend`] at its own `(func, pc)` — the instruction left completely
+    /// un-applied, to be re-executed verbatim on resume (neither `dst` is written nor
+    /// the guard-failure `Goto` taken). `func`/`pc` are the executing instruction's
+    /// address, threaded in by the three calling arms.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn exec_bif(
         &mut self,
         entry_module: &Module,
@@ -78,13 +92,15 @@ impl Machine {
         args: &[Operand],
         fail: Label,
         dst: &Operand,
+        func: u32,
+        pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Step> {
         let (module_name, function_name, arity) = labels.import_target(module, bif)?;
         // The common arities marshal through a **stack array** (no `Vec`, no heap
         // block); only a wider call touches the machine's reusable scratch buffer,
         // and that one allocates nothing after the first such call.
-        let bif_result: Result<Eterm> = if args.len() <= STACK_ARGS {
+        let bif_result: Result<BifOutcome> = if args.len() <= STACK_ARGS {
             let mut buf = EMPTY_ARGS;
             for (slot, arg) in buf.iter_mut().zip(args) {
                 *slot = read_operand(self, ctx, arg)?;
@@ -116,10 +132,13 @@ impl Machine {
             )?
         };
         match bif_result {
-            Ok(value) => {
+            Ok(BifOutcome::Return(value)) => {
                 write_operand(self, dst, value)?;
                 Ok(Step::Next)
             }
+            // The BIF could not complete without waiting: apply NOTHING and park on
+            // this instruction, which the resume re-executes (see `exec_bif`'s docs).
+            Ok(BifOutcome::Suspend) => Ok(Step::Suspend { func, pc }),
             // No fail label ⇒ a *raise*: land in a live catch frame (C falls
             // through to `find_func_info`/`handle_error`) or propagate the typed
             // error.
@@ -131,7 +150,6 @@ impl Machine {
             }
         }
     }
-
     /// Marshal a **wide** argument list (more than [`STACK_ARGS`] arguments) into
     /// the machine's reusable scratch buffer and dispatch it.
     ///
@@ -153,7 +171,7 @@ impl Machine {
         len: usize,
         ctx: &mut dyn ExecutionContext,
         fill: impl FnOnce(&mut Machine, &mut dyn ExecutionContext, &mut Vec<Eterm>) -> Result<()>,
-    ) -> Result<Result<Eterm>> {
+    ) -> Result<Result<BifOutcome>> {
         let mut scratch = std::mem::take(&mut self.args_scratch);
         scratch.clear();
         scratch.reserve(len);
@@ -179,6 +197,10 @@ impl Machine {
     /// shared helper. A marshalling error (a bad import or an out-of-range register)
     /// is handed back as an `Err` like a BIF failure — which the caller raises,
     /// exactly as before this seam.
+    ///
+    /// The [`BifOutcome`] channel flows through unchanged: whether the caller may
+    /// honour a [`BifOutcome::Suspend`] is **its** decision (the `call_ext*` and
+    /// local-call arms do, `apply/3` does not), not this helper's.
     pub(super) fn call_import(
         &mut self,
         entry_module: &Module,
@@ -187,7 +209,7 @@ impl Machine {
         target: ImportRef,
         arity: u32,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Eterm> {
+    ) -> Result<BifOutcome> {
         let (module_name, function_name, bif_arity) = labels.import_target(module, target)?;
         self.call_bif_named(
             entry_module,
@@ -200,7 +222,8 @@ impl Machine {
     }
 
     /// Marshal the register arguments `x(0..nregs)` and dispatch
-    /// `module_name:function_name/bif_arity` through [`ExecutionContext::call_bif`].
+    /// `module_name:function_name/bif_arity` through
+    /// [`ExecutionContext::call_bif_outcome`].
     ///
     /// The **one** definition of the register-marshalling shape every BIF-dispatching
     /// seam shares — a `call_ext*` ([`Machine::call_import`]) and the *local-call*
@@ -220,6 +243,10 @@ impl Machine {
     /// reusable scratch buffer beyond it, so no arity allocates a heap block per call
     /// (after the first wide one). A marshalling error (an out-of-range register) is an
     /// `Err`, exactly as the call sites expect.
+    ///
+    /// The register reads `x(0..nregs)` are pure and nothing is written, so every one of
+    /// its callers may honour a [`BifOutcome::Suspend`] by re-executing the *calling*
+    /// instruction — which is why the outcome (not a bare value) is what it returns.
     pub(crate) fn call_bif_named(
         &mut self,
         entry_module: &Module,
@@ -228,7 +255,7 @@ impl Machine {
         bif_arity: u32,
         nregs: u32,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Eterm> {
+    ) -> Result<BifOutcome> {
         if nregs as usize <= STACK_ARGS {
             let mut buf = EMPTY_ARGS;
             for (i, slot) in buf.iter_mut().enumerate().take(nregs as usize) {
@@ -276,13 +303,19 @@ impl Machine {
     /// call, so the two doors can never drift:
     ///
     /// * gate **off** (the default, every existing host): the plain
-    ///   [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif)
-    ///   with the same arguments — byte-identical to the pre-seam engine, one `bool`
-    ///   load and no extra vtable crossing;
-    /// * gate **on**: [`ExecutionContext::call_bif_in_machine`](crate::context::ExecutionContext::call_bif_in_machine)
+    ///   [`ExecutionContext::call_bif_outcome`](crate::context::ExecutionContext::call_bif_outcome)
+    ///   — which defaults to `call_bif` and the value wrapped, byte-identical to the
+    ///   pre-seam engine, one `bool` load and no extra vtable crossing;
+    /// * gate **on**: [`ExecutionContext::call_bif_in_machine_outcome`](crate::context::ExecutionContext::call_bif_in_machine_outcome)
     ///   with `self` (the live machine) and `entry_module` (the run's entry module,
     ///   which the host needs to name a context-`0` frame) handed in alongside the
     ///   same `module`/`function`/`arity`/`args`.
+    ///
+    /// Both doors are the **outcome-aware** ones, so the [`BifOutcome::Suspend`]
+    /// channel is available on every tier through this one funnel. The funnel itself
+    /// makes no suspend decision: it returns the host's [`BifOutcome`] and each call
+    /// site decides whether it may park (re-execution-idempotent) or must report a
+    /// typed error (`apply/3`, which has already rewritten `x(0..arity)`).
     ///
     /// `entry_module` is the module the run was entered at — the same one
     /// [`Machine::drive`](crate::machine::Machine::drive) threads down from its own
@@ -296,14 +329,13 @@ impl Machine {
         arity: u32,
         args: &[Eterm],
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Eterm> {
+    ) -> Result<BifOutcome> {
         if self.bif_in_machine_on {
-            ctx.call_bif_in_machine(self, entry_module, module, function, arity, args)
+            ctx.call_bif_in_machine_outcome(self, entry_module, module, function, arity, args)
         } else {
-            ctx.call_bif(module, function, arity, args)
+            ctx.call_bif_outcome(module, function, arity, args)
         }
     }
-
     /// Raise a BIF/`call_ext` error on the **no-fail-label** path, landing it in a
     /// live catch frame when there is one.
     ///
@@ -336,7 +368,8 @@ impl Machine {
     ///   or an atom **neither** the live namespace nor the module's atom table
     ///   holds. Substituting a *different* atom would be a wrong result, so the
     ///   caller's typed error is preferred (the engine never invents an atom index,
-    ///   because an index is valid only against the table it was read with).    ///
+    ///   because an index is valid only against the table it was read with).
+    ///
     /// A [`BeamError::Raise`] that carries a live reason term
     /// ([`beam_common::Raise::live_reason`], payload [`Eterm`]) is an exception
     /// whose reason is a compound term — the shape [`beam_bifs`]-backed BIFs raise
@@ -395,7 +428,8 @@ impl Machine {
     ///
     /// Both the **reason** atom and the **class** atom are resolved through the
     /// engine's live atom namespace
-    /// ([`crate::machine::namespace_atom`]): a name the host's live namespace    /// knows is nameable even when the running module's load-time snapshot is not
+    /// ([`crate::machine::namespace_atom`]): a name the host's live namespace
+    /// knows is nameable even when the running module's load-time snapshot is not
     /// (the runtime interns `badarg`/`error`/… into its shared table, and a module
     /// loaded earlier cannot see them). The default
     /// [`ExecutionContext::atoms`](crate::context::ExecutionContext::atoms) body is
@@ -431,7 +465,8 @@ impl Machine {
                 let reason = *reason;
                 if let Some(class_atom) = namespace_atom(ctx, module, class.as_str()) {
                     self.set_class_atom(class, make_atom(class_atom));
-                }                return self.throw_with_trace_headed(
+                }
+                return self.throw_with_trace_headed(
                     class,
                     reason,
                     trace,
@@ -470,7 +505,8 @@ impl Machine {
         // wrong atom.
         if let Some(class_atom) = namespace_atom(ctx, module, class.as_str()) {
             self.set_class_atom(class, make_atom(class_atom));
-        }        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
+        }
+        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
     }
 
     /// [`Machine::throw_with_trace`] that first arms the one-shot latches the raise
