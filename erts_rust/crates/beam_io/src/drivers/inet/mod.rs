@@ -764,6 +764,30 @@ pub struct TcpInetDriver {
     /// Whether the current command's caller-tag prefix has already been stripped from the output
     /// queue (see [`TcpInetDriver::caller_ref`]).
     caller_stripped: bool,
+    /// Whether read readiness may move bytes out of the kernel on the **reactor's** behalf — the
+    /// C's `FD_READ` **selection** state.
+    ///
+    /// `tcp_deliver` deselects the socket the moment a delivery spends its `{active, …}` grant
+    /// (`if (! desc->inet.active) { … sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0); … }`,
+    /// `inet_drv.c:13106`-`:13114`), so in the C a peer write during that window produces no read
+    /// callback at all and waits in the socket; `inet_set_opts` re-selects the socket when an
+    /// active grant is armed (`sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))`, `:7982`)
+    /// and a queued `TCP_REQ_RECV` selects it directly (`:12315`).
+    ///
+    /// This floor keeps the poller registration armed for the socket's whole life (`Interest` has
+    /// no empty mask and `mio`'s epoll is edge-triggered), so that gate has to live here: with
+    /// this flag `false`, [`TcpInetDriver::async_ready_input`] returns **without** reading, which
+    /// is what leaves the peer's bytes in the kernel for the next arm instead of spilling them
+    /// onto the passive [`PortNotification::Data`](crate::PortNotification::Data) channel and
+    /// losing them from the next `{active, …}` delivery.
+    ///
+    /// It is `true` by construction and on every fresh connection ([`TcpInetDriver::adopt`],
+    /// [`TcpInetDriver::adopt_prebound`], [`TcpInetDriver::mark_connected`],
+    /// [`TcpInetDriver::close_socket`]): a port that was never armed keeps this floor's eager
+    /// passive read, which is the one deliberate divergence from a C socket that is deselected
+    /// from the start. It gates the **reactor's** read only — every explicit/queued read
+    /// (the `recv` verbs, `TCP_REQ_RECV`) is unaffected.
+    read_armed: bool,
 }
 
 impl TcpInetDriver {
@@ -794,6 +818,7 @@ impl TcpInetDriver {
             async_ops: AsyncQueue::new(),
             caller_ref: None,
             caller_stripped: false,
+            read_armed: true,
         }
     }
 
@@ -846,6 +871,8 @@ impl TcpInetDriver {
             async_ops: AsyncQueue::new(),
             caller_ref: None,
             caller_stripped: false,
+            // A freshly adopted socket starts with its read side selected (see the field's note).
+            read_armed: true,
         })
     }
 
@@ -972,6 +999,9 @@ impl TcpInetDriver {
                 // A fresh socket starts a fresh byte stream: any partial frame buffered for
                 // the previous socket no longer belongs to this one.
                 self.pending_input.clear();
+                // ... and a fresh read side: nothing has been delivered on the new socket yet, so
+                // no `{active, …}` grant can be spent (see [`TcpInetDriver::read_armed`]).
+                self.read_armed = true;
                 // The C's `inet_ctl_open` records the family and type here
                 // (`inet_drv.c:5214`-`:5216`), and nothing clears them on a close: `inet.stype`
                 // is `SOCK_STREAM` from `open` on, which is what gates the `send_timeout`
@@ -1049,6 +1079,8 @@ impl TcpInetDriver {
         // A fresh socket starts a fresh byte stream: any partial frame buffered for the previous
         // socket no longer belongs to this one.
         self.pending_input.clear();
+        // The read side is selected again: the new socket has delivered nothing yet.
+        self.read_armed = true;
         self.state = if connected {
             InetState::Connected
         } else {
@@ -1072,6 +1104,8 @@ impl TcpInetDriver {
         // The new connection's byte stream begins now: drop any partial frame buffered for the
         // socket this one replaces.
         self.pending_input.clear();
+        // ... and nothing has been delivered on it yet, so its read side is selected again.
+        self.read_armed = true;
     }
     /// Changes the socket's registered interest mask (registering it the first time).
     ///
@@ -1137,6 +1171,9 @@ impl TcpInetDriver {
         self.peer_close = PeerClose::default();
         self.shutdown_wr_done = false;
         self.pending_shutdown = None;
+        // A torn-down port has no spent grant left to remember (see
+        // [`TcpInetDriver::read_armed`]).
+        self.read_armed = true;
     }
     /// De-registers **and** closes the current socket, returning the de-registration outcome.
     ///

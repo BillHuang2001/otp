@@ -355,6 +355,9 @@ impl TcpInetDriver {
         // armed (the port mirrors `next_timeout` into its `TIMEOUT` task right after this control
         // call) and the completion itself is produced at a later round — see the module docs.
         self.set_interest(ctx, Interest::READABLE)?;
+        // The enqueue selects the read side even out of a spent `{active, …}` grant's window —
+        // the C's `sock_select(INETP(desc), (FD_READ|FD_CLOSE), 1)` on `TCP_REQ_RECV` (`:12315`).
+        self.read_armed = true;
         Ok(async_ok_reply(id))
     }
 
@@ -520,7 +523,9 @@ impl TcpInetDriver {
 
     /// The read-readiness callback's body: serve the accepts a listener has queued, then either
     /// complete the pending receive or move the bytes into the port's input queue (the passive
-    /// floor's `{Port, {data, …}}` path).
+    /// floor's `{Port, {data, …}}` path) — that last step only while the descriptor's read side is
+    /// selected (see [`TcpInetDriver::read_armed`]), so a spent `{active, …}` grant leaves the
+    /// peer's bytes in the kernel for the next arm.
     pub(super) fn async_ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         self.serve_accepts(ctx)?;
         if !self.state.is_connected() {
@@ -534,6 +539,14 @@ impl TcpInetDriver {
         // owed to the user's next `recv` (see [`ReadReport`]). The C never reads in this state at
         // all — read interest is armed only by a queued `TCP_REQ_RECV` (`:12315`) — which is why
         // the reply has to be deferred rather than dropped.
+        //
+        // The reactor's read is additionally gated on the descriptor's read **selection**
+        // ([`TcpInetDriver::read_armed`]): a delivery that spent its `{active, …}` grant deselected
+        // the socket (`inet_drv.c:13106`-`:13114`), so the peer's later bytes must stay in the
+        // kernel for the next arm instead of being moved onto the passive channel here.
+        if !self.read_armed {
+            return Ok(());
+        }
         self.read_available(ctx, ReadReport::OwedToNextRecv)
             .map(|_read| ())
     }
@@ -595,6 +608,11 @@ impl TcpInetDriver {
         if !arg.is_empty() {
             return Err(error::badarg());
         }
+        // An explicit read is never gated by a spent `{active, …}` grant — `sock_select(…, 0)`
+        // drops only the *reactor's* read callback (`:13107`) — and the port's eager passive read
+        // resumes once it has run, so the read side is selected again (see
+        // [`TcpInetDriver::read_armed`]).
+        self.read_armed = true;
         if self.framed().is_some() {
             return self.verb_recv_framed(ctx);
         }
