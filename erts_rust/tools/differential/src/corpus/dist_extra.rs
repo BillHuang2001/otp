@@ -733,10 +733,11 @@ mod tests {
             };
             let peer = run.peer.expect("a peer leg");
             let client = args_of(run.oracle.args, "-eval");
+            let peer_script = args_of(peer.args, "-eval");
             assert!(client.starts_with("try "), "{}", case.id);
             assert!(client.contains("catch Cls:Rs ->"), "{}: catch as Cls:Rs", case.id);
-            assert!(peer.contains("catch Cls:Rs ->"), "{}: catch as Cls:Rs", case.id);
-            for script in [client, peer] {
+            assert!(peer_script.contains("catch Cls:Rs ->"), "{}: catch as Cls:Rs", case.id);
+            for script in [client, peer_script] {
                 // Only a *quoted atom* in a receive pattern is unevaluable; a fresh variable
                 // next to a literal atom (`receive {who, From}`) is fine.
                 assert!(!script.contains("receive {'"), "{}: no quoted-atom pattern", case.id);
@@ -754,7 +755,7 @@ mod tests {
             } else {
                 assert!(client.contains("register(dxcli, self())"), "{}", case.id);
             }
-            assert!(peer.contains("register(dxpeer, self())"), "{}", case.id);
+            assert!(peer_script.contains("register(dxpeer, self())"), "{}", case.id);
         }
         assert_eq!(super::CLIENT_NAME, "dxcli");
         assert_eq!(super::PEER_NAME, "dxpeer");
