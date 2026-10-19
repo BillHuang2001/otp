@@ -207,7 +207,7 @@ buy a deterministic `−9.12 %` dirty-set spill stores corpus-wide (1 496 158 �
   `AtomTable` names) each time — is the top row of the flat profile and lives **outside this node**
   (`src/machine/**`, `src/interpreter/dispatch.rs`). Any further entry-side change must be judged
   against the `list_walk` row above, since that workload is 7-instruction blocks.
-- **`list_walk` against the system oracle, same window, paired** (`tools/bench --quick`, 3 rounds, side order alternated, one process at a time, load 5.2–5.7): rust **21.03 ns/element** (min) / 21.45 (median) vs the oracle's **2.02** / 2.70 → **7.71× (min) / 7.99× (median)**. The m17 report's **11.80×** (30.55 vs 2.52 ns/element) was taken under load 40–55; both sides scale with load, so the ratio is the comparable figure and an absolute ns is a same-window reading only. Startup belongs to the boot path, not this node: it reads 3.64× in the same window (457.9 ms vs 122.2 ms) and a parent-vs-HEAD paired A/B puts these commits at **0.86–1.02×**, i.e. unchanged.
+- **`list_walk` against the system oracle, same window, paired** (`tools/bench --quick --workloads list_walk --runtime all`, 3 alternated rounds each, one process at a time): rust **20.37 ns/element** (min-of-runs) / 21.9 (median) against the oracle's **2.15** / 2.49–2.70 → **7.69× (min) / 8.80× (median)** under a load band of 8.6–16.9 (1-min), the round-by-round ratios 7.69 / 8.80 / 10.28. An earlier window at load 5.2–5.7 read **21.03 / 21.45** vs **2.02 / 2.70** → **7.71× / 7.99×**, so the min ratio is unchanged and the median moves with load; the m17 report's **11.80×** was taken under load 40–55. Both sides scale with load, so the ratio is the comparable figure and an absolute ns is a same-window reading only, with `case_list_walk_elements` (100 M sys / 50 M rust) the contention-immune anchor. Startup belongs to the boot path, not this node: it reads 3.64× in the quiet window and a parent-vs-HEAD paired A/B puts these commits at **0.86–1.02×**, i.e. unchanged.
 - **The in-crate `src/bench` decomposition harness** (`foreign_bstr_to_lower_decomposition`, release, pinned, same window): **min 5965.9 / median 6054.0 ns/call** at `instr_per_call = 438.00`, `local_call_requests_per_call = 61.00`, `driver_round_trips_per_call = 3.00`. The pre-work baseline read min 5521.5 / median 10394.7 in a far more loaded window, so those two are **not** comparable absolutes; the deterministic per-call counters are, and the whole-process instruction count is the figure that moved (130 439–130 466 → 126 812–126 842). What remains on this workload is **not** call setup: 438 IR instructions for a 30-byte lowercase (`~14.6` per byte) is the per-instruction execution cost, which is the tier's next lever and not a per-call one.
 - **Where the time goes now** (`perf record -e cpu_core/cycles/u -g`, flat self time, `list_walk` at
   N = 50 000, release, 73 945 samples): `jit_allocate` **16.63 %**, `Machine::local_call_seam`
@@ -218,16 +218,26 @@ buy a deterministic `−9.12 %` dirty-set spill stores corpus-wide (1 496 158 �
   `CountingContext::reduce` **2.12 %**. `probe_local_call` no longer appears at all, and the
   block-entry path (`drive`, `enter_compiled`, `CompiledModule::function`, `return_word`) is off the
   profile. Shares inflate as the total shrinks — compare only within one window.
-  What remains **in this node**: the **continuation sub-blocks** — a call's `pc+1` range sits *before*
-  the `call`, so its `Allocation` sees no frame helper and `prologue_publishes_y` is true there; that
-  is 2 of the 4 publishes `list_walk` used to pay per element, and closing it needs a **range-crossing**
-  witness (the transfer helper already republishes the window after its frame teardown, so the target's
-  prologue could skip), with `y_prologue_publishes` vs `y_blocks` as the counter that lever must move.
-  Then `jit_allocate` (a real heap/frame-admission door) and `enter_in_block` (the frozen
-  skipped-iteration reproduction). `Machine::local_call_seam` and
-  `CountingContext::resolve_local_call` are the host-owned seam (`src/machine/**`,
-  `src/interpreter/dispatch.rs`) and must not be short-circuited from the tier; `beam_rt`'s rooted
-  collection is the largest single owner outside this node.
+  What remains **in this node**: the **continuation sub-blocks'** publish was the named next lever and
+  has been **built and rejected** — a range-crossing witness elides 80.3 % of the window derivations
+  yet costs `list_walk` **+1.15 %** (`jit_tail_call`, which must clear, pays a store per element on the
+  linked-tail-call hot path) against `cowboy_bstr` −0.05 %, and its invalidation set is **unsound**
+  where a family raise's handler is its own `pc + 1` (`runtime.rs::fold_step` folds `Step::Next` and
+  `Step::Goto { pc: pc + 1 }` into one block-ABI word, so the handler block is linked into with no
+  driver iteration between `Machine::unwind_to_frame` and the `Y` read). `y_prologue_publishes` is
+  therefore **not** a counter to move. The remaining candidates are `jit_allocate` (a real
+  heap/frame-admission door) and `enter_in_block` (the frozen skipped-iteration reproduction).
+  `Machine::local_call_seam` and `CountingContext::resolve_local_call` are the host-owned seam
+  (`src/machine/**`, `src/interpreter/dispatch.rs`) and must not be short-circuited from the tier;
+  `beam_rt`'s rooted collection is the largest single owner outside this node.
+- **Latent base-tier hole, pinned and observationally correct today:** a family raise whose catch
+  handler sits at its **own `pc + 1`** skips the driver iteration entirely (no `set_current_code`, no
+  reduction charge, no prologue-state invalidation) because `runtime.rs::fold_step` encodes `Step::Next`
+  and `Step::Goto { pc: pc + 1 }` as the same word and `emit/link.rs::emit_exit` links straight into the
+  handler block. It is correct only because every prologue derivation is unconditional; a distinct
+  block-ABI word for a family `Goto` (in `runtime.rs` + the family arm) is the proper fix, and
+  `baseline/raise_tier_tests.rs::a_raise_at_its_own_pc_plus_one_reads_the_enclosing_frames_y_slot` is
+  the shape that must stay green for any change to prologue-carried state.
 - **The position store vs. the window derivation, split and measured** (`jit_publish_y` is two jobs):
   the `Machine::set_current_code` store is **3.58 %** of the per-rep count and the re-derivation is the
   majority of the row (frame deref + `stack` pointer + mul-add ≈42 %, `frames.len()` ≈8 %,
