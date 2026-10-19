@@ -95,9 +95,26 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     the term its own `read_ctx` already captured, re-reading the context operand only when the
     field read actually reserved a heap term (`read_integer_field_tracked`'s allocation
     witness) — the same one-sided rule `run_commands` follows.
+    `exec` tests `Instr::BsMatch` **before** the 18-arm jump table and hands everything else
+    to the outlined `exec_other`, so the dominant variant pays a `matches!` + a tail jump
+    instead of the table dispatch. Both `#[inline(never)]` markers are load-bearing: without
+    outlining, LLVM folds the pre-test back into the switch (no codegen change at all), and
+    without the outlined dispatcher the family entry grows past the inline budget and
+    `families::dispatch` stops inlining it (measured 1.03–1.06× slower).
   - `match_ctx.rs` → match entry (`enter_match`, the `reuse` path, `resolve_match4_fail`),
-    the context operand readers (`read_ctx`/`reread_ctx`) and `bs_set_position`
-    (`position_of`).
+    the context operand readers (`read_ctx`/`reread_ctx`) and the position ops
+    (`position_term`/`position_of`).
+    `enter_match`'s reuse arm returns the **same `Eterm`** the operand holds — C's
+    `$Dst = context` — so a re-entered match costs no reservation at all. The reuse predicate
+    is `raw::ctx_parts(value).is_some()` after a `raw::heap_bits` miss, which is exactly C's
+    `erl_sub_bits_is_match_context` because this engine never builds a non-match-context,
+    non-refc `ErlSubBits` (`make_binary` yields only an on-heap `ErlHeapBits` or the
+    `[BinRef][ErlSubBits]` pair). Identity is faithful: C re-reads neither `orig` nor
+    `start`/`end`. A `bs_start_match3`/`bs_start_match4`-resume whose `Dst` is its own `Src`
+    stays a no-op.
+    `Instr::BsGetPosition` publishes a **small integer** (`position_term` → `make_small`), C's
+    `$Dst = make_small(sb->start)` — zero allocation. The old whole-context snapshot survives
+    only as the over-large-position fallback, and `position_of` accepts both forms.
   - `commands.rs` → the flattened `bs_match` command interpreter (`run_commands`:
     `ensure_at_least`/`ensure_exactly`/`skip`/`integer`/`binary`/`get_tail`/`'=:='`) and
     the `commit` write-back discipline. `run_commands` captures the context term, its inner
