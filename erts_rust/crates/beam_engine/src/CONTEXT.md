@@ -121,7 +121,7 @@ That workload set is the in-crate tier set, not the OTP corpus, so the corpus-sc
 
 ## GC publication: which `src/**` engine→host calls can be intervened on
 The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`
-(`machine/mod.rs:643`), `Machine::alloc_rooted` (`:701`, → `ExecutionContext::alloc_words_rooted`) and
+(`machine/mod.rs:653`), `Machine::alloc_rooted` (`:711`, → `ExecutionContext::alloc_words_rooted`) and
 `Machine::ensure_heap`/`allocate_heap` → `ExecutionContext::ensure_heap_full`
 (`machine/frames.rs:283`).
 `with_roots` hands over the **whole** three files — `&mut self.x` (all `max_register` slots),
