@@ -71,31 +71,34 @@
 //! that one trailing `ok` line, and no binary is ever printed (the payload probe answers
 //! `byte_size`/`=:=` witnesses instead).
 //!
-//! # Known divergences (pinned, not papered over)
+//! # The one pinned divergence (pinned, not papered over)
 //!
-//! Neither of these is a `zlib` semantics difference, and both are pinned on **both** sides so a
-//! divergence cannot silently disappear or change shape. Neither can be fixed from this suite
-//! (`src/` is out of scope), so the assertions record today's pair of answers verbatim.
+//! It is not a `zlib` semantics difference, and it is pinned on **both** sides so a divergence
+//! cannot silently disappear or change shape. It cannot be fixed from this suite (`src/` is out of
+//! scope), so the assertions record today's pair of answers verbatim.
 //!
 //! | What | This runtime | The system `erl` |
 //! |---|---|---|
 //! | `zlib:set_controlling_process(Z, Pid)` on a **closed** stream | `{exception,error,not_initialized}` | `{value,ok}` |
-//! | a `not_initialized` / `already_initialized` / `stream_error` raise caught by `try … catch` in a module that does **not** name the atom | the raise is **not caught**: it escapes, exits **1**, `beam_rt: error not_initialized` (empty stdout) | `{exception,error,not_initialized}` |
 //!
-//! The first is the documented `Requires::Closable` deviation in `beam_bifs/src/zlib/CONTEXT.md`
+//! That is the documented `Requires::Closable` deviation in `beam_bifs/src/zlib/CONTEXT.md`
 //! (the C's `set_controller_nif` — `zlib_nif.c:583-602` — imposes **no** state precondition, so
 //! it answers `ok` even on a closed stream). The suite pins that the divergence is *exactly* the
 //! closed state: the ended and fresh states answer `ok` on both sides.
 //!
-//! The second is a **runtime** defect, not a `zlib` one: a guard atom that is absent from the
-//! raising module's atom table is not resolvable by the catch machinery, so the raise becomes
-//! fatal instead of catchable. `tests/fixtures/zlib_guards.erl` therefore **names** the six guard
-//! atoms (`zlib_guards:guard_atoms/0`) — that is what makes its transcripts comparable — and
-//! `tests/fixtures/zlib_guards_unnamed.erl` is the same probe shape *without* the reference, which
-//! [`a_guard_atom_absent_from_the_module_atom_table_escapes_try_catch`] pins. The defect is
-//! reported to the workspace root; when it is fixed, that test's two-sided assertions are what
-//! trips and tells the next agent to expect oracle parity there.
+//! # A guard atom the module does not name is still catchable
 //!
+//! A guard class raised by a NIF — `not_initialized` / `already_initialized` / `stream_error` /
+//! `not_on_controlling_process` — has **no atom literal in any module**: `zlib.beam` never spells
+//! them (the C NIF's own static atoms carry them), so the catching module's atom table cannot
+//! either. [`a_guard_atom_absent_from_the_module_atom_table_is_still_caught`] pins that such a
+//! raise is caught anyway, on both routes and both tiers, exactly as the oracle catches it:
+//! `beam_rt` names a BIF raise's reason atom in its **one shared** atom table
+//! (`RuntimeContext::name_raise_reason_atom`), which is the table the engine's atom-namespace seam
+//! reads, so catchability no longer depends on a module's load-time atom snapshot.
+//! `tests/fixtures/zlib_guards.erl` still names the six classes in `guard_atoms/0` — as
+//! documentation of the class set — but nothing depends on that any more, and the unnamed fixture
+//! answers the same lines.//!
 //! # Toolchain
 //!
 //! The oracle (`erl`) is resolved from the **filesystem** ([`support::require_oracle`], never by
@@ -125,9 +128,8 @@ const SUITE: &str = "zlib_guards";
 const MODULE: &str = "zlib_guards";
 
 /// The unnamed fixture module: the same probe shape **without** the guard atoms
-/// ([`a_guard_atom_absent_from_the_module_atom_table_escapes_try_catch`]).
+/// ([`a_guard_atom_absent_from_the_module_atom_table_is_still_caught`]).
 const UNNAMED_MODULE: &str = "zlib_guards_unnamed";
-
 /// The **real** executable under test (the test target's build guarantees it is current).
 const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
 
@@ -387,12 +389,12 @@ impl Drop for Fixture {
 ///
 /// The directory is unique per call (label + module + pid + a process-wide counter) and holds
 /// **only** that module's `.beam`, so it is safe to hand the oracle as a single `-pa`. Keeping
-/// the two fixtures in *separate* directories is load-bearing for
-/// [`a_guard_atom_absent_from_the_module_atom_table_escapes_try_catch`]: the named fixture's
-/// atom image must not be loaded beside the unnamed one, or the shared atom table would carry
-/// the guard atoms and mask the very defect that test pins.
-fn build_fixture(label: &str, module: &'static str) -> Option<Fixture> {
-    let Some(erlc) = resolve_erlc() else {
+/// the two fixtures in *separate* directories keeps
+/// [`a_guard_atom_absent_from_the_module_atom_table_is_still_caught`] honest: the named
+/// fixture's atom image must not be loaded beside the unnamed one, or the shared atom table
+/// would carry the guard atoms from a *module image* and the test would no longer be exercising a
+/// name only the raise's own table can supply.
+fn build_fixture(label: &str, module: &'static str) -> Option<Fixture> {    let Some(erlc) = resolve_erlc() else {
         support::skip_loudly(SUITE, "no `erlc` available (and none beside $ERTS_ORACLE)");
         return None;
     };
@@ -576,12 +578,11 @@ const EXPR_CLASSES: &str = concat!(
     "halt(0)."
 );
 
-/// The unnamed fixture's probes: `(function, what the class is, the oracle's transcript)`.
+/// The unnamed fixture's probes: `(function, what the class is, the transcript)`.
 ///
-/// The oracle's line is the whole transcript the unnamed fixture prints under the system `erl`;
-/// this runtime never gets that far (the raise escapes — see the module docs).
-const UNNAMED_PROBES: [(&str, &str, &str); 3] = [
-    (
+/// The transcript is the whole line the fixture prints, and it is what the system `erl` **and**
+/// this runtime must both answer: the class does not depend on the catching module's atom table.
+const UNNAMED_PROBES: [(&str, &str, &str); 3] = [    (
         "deflate_end_twice",
         "not_initialized",
         "deflateEnd_twice {exception,error,not_initialized}",
@@ -784,27 +785,28 @@ fn setting_the_controlling_process_on_a_closed_stream_is_a_known_divergence() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 5. The second divergence: a guard atom the module's atom table does not carry
+// 5. A guard atom the module's atom table does not carry is still catchable
 // ---------------------------------------------------------------------------------------
 
-/// Pins the **runtime** defect the module docs describe (divergence table 2), on both routes and
-/// both tiers, for all three affected classes.
+/// Pins that a NIF guard class is catchable **independently of the catching module's atom
+/// table**, on both routes and both tiers, for all three affected classes.
 ///
 /// `tests/fixtures/zlib_guards_unnamed.erl` is the same probe shape as the named fixture **minus**
 /// the atom reference, so `not_initialized` / `already_initialized` / `stream_error` never enter
-/// its atom table. On this runtime the raise is then not catchable by that module's own
-/// `try … catch`: it escapes `caught/1`, nothing is printed, and the process dies with
-/// `beam_rt: error <atom>` (exit 1). The system `erl` catches it and prints the class.
+/// its atom table — and `zlib.beam` never spells them either (the C NIF's static atoms carry
+/// them). The raise is nevertheless caught by that module's own `try … catch` and the class is
+/// printed, byte for byte what the system `erl` answers: `beam_rt` names a BIF raise's reason atom
+/// in its **one shared** atom table before the engine sees the error
+/// (`RuntimeContext::name_raise_reason_atom`), and the engine's atom-namespace seam reads that same
+/// live table, so the reason becomes a term a catch frame can bind.
 ///
-/// The **positive control** is the same class in the named fixture, which is caught — so this is
-/// an atom-table (name-resolution) dependence, not a difference in the raised reason. Both sides
-/// are asserted verbatim; when the runtime defect is fixed this test fails and the assertions
-/// become the oracle's lines (that is the signal to invert them).
+/// The **positive control** is the same class in the named fixture, which is (still) caught: the
+/// answer must not depend on the atom table on either side, so both fixtures print the same lines.
 ///
-/// Each fixture is compiled into its **own** scratch directory: loading the named fixture beside
-/// the unnamed one would put the guard atoms in the shared atom table and mask the defect.
+/// Each fixture is compiled into its **own** scratch directory, so the named fixture's atom image
+/// is never loaded beside the unnamed one.
 #[test]
-fn a_guard_atom_absent_from_the_module_atom_table_escapes_try_catch() {
+fn a_guard_atom_absent_from_the_module_atom_table_is_still_caught() {
     let Some(oracle) = oracle_or_skip() else {
         return;
     };
@@ -815,8 +817,7 @@ fn a_guard_atom_absent_from_the_module_atom_table_escapes_try_catch() {
         return;
     };
     // The positive control's transcript, computed once: the same classes in the module that
-    // *names* the guard atoms are caught, so the difference below is the atom table and nothing
-    // else.
+    // *names* the guard atoms are caught too, so the two fixtures answer identically.
     let control = ours_eval(
         Some(named.dir_str()),
         &format!("{MODULE}:classes(),halt(0)."),
@@ -829,7 +830,6 @@ fn a_guard_atom_absent_from_the_module_atom_table_escapes_try_catch() {
             theirs, oracle_line,
             "the oracle catches `{class}` in `{UNNAMED_MODULE}:{function}/0`"
         );
-        let fatal = format!("beam_rt: error {class}");
 
         for tier in TIERS {
             // The `-eval` driver over the compiled module.
@@ -847,32 +847,18 @@ fn a_guard_atom_absent_from_the_module_atom_table_escapes_try_catch() {
             );
             assert_eq!(
                 (eval.code, eval.out.as_str(), eval.err.as_str()),
-                (1, "", fatal.as_str()),
-                "the `{class}` raise escapes `try … catch` on the `-eval` driver on {} — the \
-                 module's atom table does not carry the atom, and the raise is not caught",
+                (0, oracle_line, ""),
+                "the `{class}` raise must be caught by `try … catch` on the `-eval` driver on \
+                 {} — the catching module never names the atom, so the runtime has to name it in \
+                 the shared table",
                 tier.label()
             );
 
             // The scheduled route over the same module.
-            let scheduled = run(
-                Path::new(BINARY),
-                &[
-                    "-noshell",
-                    "run",
-                    unnamed.beam_str(),
-                    &format!("{UNNAMED_MODULE}:{function}/0"),
-                ],
-                tier,
-                &format!("`{UNNAMED_MODULE}:{function}/0` through the scheduled `run` route"),
-            );
+            let scheduled = ours_run(&unnamed, function, tier);
             assert_eq!(
-                (
-                    scheduled.code,
-                    scheduled.out.as_str(),
-                    scheduled.err.as_str()
-                ),
-                (1, "", fatal.as_str()),
-                "the `{class}` raise escapes `try … catch` on the scheduled route on {}",
+                scheduled, oracle_line,
+                "the `{class}` raise must be caught by `try … catch` on the scheduled route on {}",
                 tier.label()
             );
         }
@@ -880,13 +866,11 @@ fn a_guard_atom_absent_from_the_module_atom_table_escapes_try_catch() {
         // The positive control: the same class in the module that *names* the atoms is caught.
         assert!(
             control.lines().any(|line| line == oracle_line),
-            "the named fixture must catch `{class}` in the same class shape the oracle prints \
-             (`{oracle_line}`), so the escape above is an atom-table dependence; transcript:\n\
-             {control}"
+            "the named fixture must catch `{class}` in the same class shape (`{oracle_line}`), \
+             so the two fixtures agree regardless of their atom tables; transcript:\n{control}"
         );
     }
 }
-
 // ---------------------------------------------------------------------------------------
 // 6. already_initialized is reachable from the wrapper (item 9)
 // ---------------------------------------------------------------------------------------
