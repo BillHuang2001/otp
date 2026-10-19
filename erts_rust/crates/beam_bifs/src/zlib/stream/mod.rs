@@ -445,10 +445,6 @@ pub(super) fn strategy_arg(term: Eterm) -> Result<Strategy> {
 /// This table is the one definition of the surface: [`register`] installs exactly these
 /// keys through the three submodules and [`is_nif_key`] answers the runtime's local-call
 /// predicate from it, so the two can never disagree.
-// Nothing in this crate calls them directly: the key table is read through
-// `crate::zlib::serves_local_call`, whose consumer is the host (see there), and by this
-// module's own tests.
-#[allow(dead_code)]
 pub(super) const NIF_KEYS: &[(&str, u32)] = &[
     ("close_nif", 1),
     ("open_nif", 0),
@@ -474,7 +470,6 @@ pub(super) const NIF_KEYS: &[(&str, u32)] = &[
 /// Whether `Function/Arity` is one of the 19 `zlib` stream keys.
 ///
 /// `crate::zlib::serves_local_call` short-circuits on the module name and delegates here.
-#[allow(dead_code)]
 pub(crate) fn is_nif_key(function: &str, arity: usize) -> bool {
     NIF_KEYS
         .iter()

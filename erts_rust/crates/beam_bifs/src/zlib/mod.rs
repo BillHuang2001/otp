@@ -160,10 +160,8 @@ use crate::registry::BifRegistry;
 /// Whether `Module:Function/Arity` is one of the `zlib` BIF-surface keys this crate
 /// serves — the six convenience functions plus the 19 stream keys.
 ///
-/// The local-call predicate a host consults before entering compiled code.
-// Nothing in this crate calls it: the consumer is the host (`beam_rt`'s
-// `resolve_local_call`, through the crate root's re-export), which the crate root owns.
-#[allow(dead_code)]
+/// The local-call predicate a host consults before entering compiled code; the crate
+/// root re-exports it as [`crate::serves_local_call`].
 pub fn serves_local_call(module: &str, function: &str, arity: usize) -> bool {
     module == "zlib" && stream::is_nif_key(function, arity)
 }

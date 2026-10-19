@@ -58,13 +58,14 @@ const DECLARED_HBIF: usize = 7;
 
 /// The pinned census of the registry against the table (see `CONTEXT.md`).
 /// Every declared `bif.tab` entry is now registered (the gap is fully closed); the
-/// registry additionally carries the stdlib fast paths and the two `erlang:memory/0,1`
-/// keys, which are real BIFs the table does not declare.
+/// registry additionally carries the stdlib fast paths — among them the two
+/// `erlang:memory/0,1` keys and the 19 undeclared `zlib` stream keys — which are real
+/// BIFs the table does not declare.
 const IMPLEMENTED_DECLARED: usize = 556;
 const MISSING_DECLARED: usize = 0;
-const FAST_PATHS: usize = 92;
+const FAST_PATHS: usize = 111;
 /// The registry size (declared-and-implemented + fast paths).
-const REGISTRY_SIZE: usize = 648;
+const REGISTRY_SIZE: usize = 667;
 
 #[test]
 fn the_committed_table_has_a_pinned_shape() {
