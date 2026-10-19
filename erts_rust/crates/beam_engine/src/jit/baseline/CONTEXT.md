@@ -317,24 +317,59 @@ overlap between the legs (≈520 000 units apart, each leg's own spread ≤0.007
 noise. `cowboy_bstr`'s are **0.997261 / 0.996398 / 0.996005 / 0.996766 / 0.996381**: sign-consistent with zero
 overlap but small, the entry-side saving diluted by the 1 098-instruction call body.
 
-The `list_walk` block that carried the cost is `sum/1`'s recursive block — `test is_nonempty_list`,
-`allocate 1 1`, `get_list {x,0} → {y,0},{x,0}`, `line`, `call 1 {f,2}`, `gc_bif '+'` over `{y,0}`,
-`deallocate 1`, `return` — which is entered twice per element (the driver/caller entry and the in-block
-recursive `call`), so it paid **two** `jit_publish_y` calls per element, both now skipped; the surviving
-window publish per element is the one `jit_allocate` does itself. The `to_lower/2` block has the same shape
-(`bs_start_match4`, `bs_match`, `allocate 2 3`, then every `Y` access).
+Corpus-wide static split (the deterministic counter, whole installed-OTP corpus via
+`the_static_deopt_census_over_the_corpus_is_printed`: 1 358 modules / 103 066 functions):
+`blocks = 185 113` (`y_blocks`, every emitted range whose body touches a `Y` slot), `publish = 132 881`
+(`y_prologue_publishes`), **`elided = 52 232` — 28.2 % of `Y`-touching emitted ranges no longer publish**;
+`y_invalidations = 544 248` (unchanged — the in-block refresh gate is untouched). Over the committed
+`erlc` fixtures the same split is **14** `Y`-touching blocks with **6** publishing prologues (**8** elided),
+`loads=4` / `stores=13` / `invalidations=19`
+(`tests.rs::the_y_window_traffic_of_the_committed_fixtures_is_measured`). Both are deterministic structural
+counts, not measurements.
+
+Why the workloads changed. `bench_list_walk` is `walk/1` → `walk/3` → `sum/1` (`LEN = 1000`), and **every**
+`Y`-touching IR block there opens with the frame push: `walk/1` (`allocate 1 1`, `move {x,0} → {y,0}`,
+`call build/2`, `call_last walk/3`), `walk/3` (`gc_bif '-'`, `allocate 3 3`, then every `Y` read/write) and
+`sum/1` (`allocate 1 1`, `get_list {x,0} → {y,0},{x,0}`, `call sum/1`, `gc_bif '+'` over `{y,0}`,
+`deallocate 1`, `return`) — so the gate removes every IR-block prologue publish. `to_lower/2` has the same
+shape (`bs_start_match4`, `bs_match`, `allocate 2 3`, then every `Y` access).
+
+**Residual — the remaining `jit_publish_y` self time is the continuation sub-blocks.** A call's continuation
+is emitted as its own range `[pc+1, next continuation address)`, whose `Allocation` sees no `allocate` (it
+sits *before* the `call`), so `prologue_publishes_y` is true there and the sub-block publishes. `list_walk`
+has two such ranges per element (after `walk/3`'s `call sum/1` and after `sum/1`'s recursive `call`), i.e.
+exactly half of the four publishes per element it paid before — which is what the flat profile shows
+`jit_publish_y` dropping by. Closing that needs a range-crossing witness (the enclosing block's prefix, or
+the callee's frame discipline), not this gate; the static census's `y_prologue_publishes` vs `y_blocks` is
+the counter a next lever has to move.
+
+Flat profile, `list_walk`, `perf record -e cpu_core/cycles/u -g --call-graph fp`, 73 945 samples, self time
+(`perf report --no-children`): `jit_allocate` **16.63 %**, `Machine::local_call_seam` 11.25 % (sibling-owned),
+**`jit_publish_y` 9.80 %** (was 20.45 %), `enter_in_block` 8.74 %, `call::call_store_impl` 7.61 %,
+`jit_deallocate_return` 4.99 %, `family::jit_family` 4.95 %, `call::jit_call_store` 4.63 %,
+`jit_set_position` 4.37 % (the blocks this lever demoted), `CountingContext::resolve_local_call` 2.18 %,
+`CountingContext::reduce` 2.12 %. Shares inflate as the total shrinks, so compare only across one window.
+
+### The position store vs the window derivation (the split, measured)
+`jit_publish_y` = `JitRuntime::refresh_y_base` (re-derive `[y_base, y_end)` from `Machine::frames.last()` +
+`machine.stack.as_mut_ptr()`) **then** `Machine::set_current_code(func, pc)`. Removing **only** the position
+store (a temporary variant, derive kept) gives a paired retired-instruction ratio of
+**0.964147 / 0.964160** on `list_walk` — so the store is **3.58 %** of the per-rep count. The inverse variant
+(derive removed, store kept) is **not a valid split**: with no window published, the emitted Y guard rejects,
+the tier deopts and the workload's result is wrong (`result_is_correct = false`), so its ratio is a deopt
+artifact and must not be quoted. The derivation is therefore the **majority** of the ≈20 % row — confirmed by
+`perf annotate` of the 190-byte function (79 K samples): the `#[cfg(test)]` counter probe plus its increment
+≈7.6 %, `frames.len()`/`×32` ≈8 %, the frame deref + `stack` pointer + mul-add ≈42 %, the `movl` position
+store ≈18.3 %. Note this ordering: the store is a **frozen** publication (`Machine::current_code` is what a
+resume and `process_info/2` read), so it was never a removal candidate — which is why the lever attacks the
+derivation (by not needing it) rather than the store.
 
 Honest attribution: about half of the measured refresh cost in a **test** build is the `#[cfg(test)]`
 structural counter probe (`Counters::record_publish_y` is the first statement of `jit_publish_y`), so the
 counter-borne saving is overstated relative to a production build; the sign and the mechanism are unaffected.
 
-The static split over the whole installed-OTP corpus
-(`census.rs::the_static_deopt_census_over_the_corpus_is_printed`, 1 358 modules / 103 066 functions) prints
-`Y prologue: blocks=185113 publish=132881 elided=52232 (71.8% of Y-touching blocks publish) invalidations=544248`;
-over the committed `erlc` fixtures the same split is **14** Y-touching blocks with **6** publishing prologues
-(**8** elided), `loads=4` / `stores=13` / `invalidations=19`
-(`tests.rs::the_y_window_traffic_of_the_committed_fixtures_is_measured`). Both are deterministic structural
-counts, not measurements.
+The split is printed by `census.rs::the_static_deopt_census_over_the_corpus_is_printed` as
+`Y prologue: blocks=… publish=… elided=… invalidations=…`.
 
 ## Known Issues
 - **The probed local call now costs code size, and its remaining per-call cost is the seam itself.** Baking a tail call's resolution into the probe's block-ABI immediates removes the per-call instruction re-decode and label resolution (measured −0.41 % / −0.66 % retired instructions) but adds three immediate setups per probed site: **+0.78 % emitted bytes** corpus-wide, recovered to +0.47 % by the single-spill exit. Both are accepted trades, and neither changes a result. What is left on the shape is `Machine::local_call_seam` — the host-owned seam the probe then calls — which the tier must not short-circuit (its own optimisation belongs to its owner, not to this node).- **The tier's per-slice cost on a message-passing workload is the entry-module resolution, NOT the deopts — and for a real `.beam` that resolution is O(1).** Every `run_baseline_cached*` slice entry/resume resolves the entry module through `CodeCache::compiled_handle(&Module)` (`../cache/mod.rs`), whose `ModuleKey::of` is a **two-variant** identity: `Digest([u8; 16])` = the module's **load-time MD5** (`Module::checksum`, read as a plain `Copy` — no hash, no allocation) for a real `.beam`, else `Content { name, fingerprint }` over the whole-IR hash (`module_fingerprint`, a full `Debug`-render hash of the decoded IR) for a synthetic all-zero-checksum `Module::default()`. A real `.beam` therefore resolves with **zero** IR hashes on every slice, primed or not, and only a synthetic module can fall to `module_fingerprint` per slice; the address memo (filled by `cached_module_blocks(&Arc<Module>)` on the cross-module *callee* path and by the host-facing `cache::remember_module(&Arc<Module>)` on the *entry* path) is a redundant micro-optimisation on that digest path. The interpreter tier never touches `CodeCache`. Measured by the two-process copy-bound probe (`tests.rs::the_entry_module_priming_is_measured_on_both_tiers`, both tiers named, with `/proc/loadavg` and the per-pass `module_fingerprint` count): the probe's **synthetic** modules take the `Content` fallback, so unprimed they re-hash per slice (the probe's printed ≈6.8×-of-interpreter reading) and primed they read ≈0.8× with **zero** hashes — both are **single-run estimates from that probe, not pinned results** (`tests.rs::the_entry_module_priming_is_measured_on_both_tiers` asserts the `module_fingerprint` counts only; the authoritative tier ratios live in `../../../MEASURED.md`) — the tier's own work is parity-or-better and the whole gap is that hash; a real `.beam` needs no priming to reach the same zero-hash result (`cache/tests.rs::a_real_loaded_beam_never_rehashes_its_ir_on_any_entry_path`). `remember_module` is the entry-path priming API and has **no production caller** — its only callers are tests (`jit/baseline/tests.rs`, `jit/cache/tests.rs`); a host would call it once per module it enters, and the tier cannot pre-empt it (`compiled_handle` is called before any `baseline::run_compiled*` body). Deopt inlining — including the natively-lowered receive family and the family arm — does **not** move the wall-clock on this shape: the deopt chain is cheap relative to that hash. (A same-function block entry does not re-resolve its lazy function at all: the driver hands the entry the function artifact its previous entry resolved — `DriverContext::entry_cached` for the context-`0` artifact, `CalleeCode::cached` for each callee — so it costs the two-entry block-table probe with no `RefCell` probe and no `Rc::clone`; only an entry into a *different* function (a cross-function transfer, a call into another function, a fresh slice) re-resolves through `CompiledModule::native_entry_cached`. The driver's one charge per **block entry** against the interpreter's one per **instruction** is a real unit divergence, but ≈1 ns per iteration.)- **Both levers reduce counts but have no measurable throughput effect on this host (honest negative).** Interleaved A/B (before = the pre-lever tree, after = the variable-length frame + the live-in prologue fill; 9 paired rounds with the order reversed between rounds, `bench run --quick --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound`, one benchmark process at a time, `/proc/loadavg` 8–123 recorded at every run): every case's paired after/before ratio flips sign across rounds and each side's own run-to-run spread is 1.5–5.2×, so no case clears the spread (the min-over-N ratios 0.86–1.98 are confounded, because the two minima come from different rounds). The same harness *can* resolve a per-instruction difference: the tier ratio (default JIT ÷ `BEAM_RT_TIER=interpreter`) is stable and reproduces `tools/bench/RESULTS.md` §5 (`list_walk` **6.87×** here vs 6.86× there; the default tier is cheaper on 9 of 10 cases), so a ≲2 % wall-clock effect — the counters are −62.2 % push/pop ops, −53.4 % prologue loads, −4.39 % emitted bytes — is below this host's resolution. Do not re-run this A/B expecting signal on a loaded host; the levers' evidence is the deterministic emitted-instruction/byte reduction.
