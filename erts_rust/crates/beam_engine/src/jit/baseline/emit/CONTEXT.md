@@ -509,6 +509,25 @@ arguments it now passes (the packed callee/arity word, the kind, the frame size:
 the −7-byte single-store saving the exit's `ExitSpill::Done` mode gives back (see
 `## Spill/fill discipline`); the corpus-wide totals are there too.
 
+## Measured
+
+### The dead prologue Y-window publish (measured)
+`emit/prologue.rs` emits `jit_publish_y` only when `Allocation::prologue_publishes_y` holds, so a block whose
+**every** `Y` access follows an in-block `allocate`/`allocate_heap`/`trim` (`emit/regalloc.rs`'s
+`y_first` vs `frame_republish_first`) emits the plain `jit_set_position` instead — the frame helper's own
+`JitRuntime::refresh_y_base` on its in-block continue arm makes the prologue's publish dead work (soundness:
+`## Spill/fill discipline` above; the full rule and its linear-control-flow argument in `../CONTEXT.md`).
+Two retired-user-instruction slopes, per-rep, two legs from the same tree with only this gate differing,
+sides interleaved and the order alternated, `taskset -c 3`, one process at a time: `list_walk`
+(`BENCH_TIER=baseline BENCH_K=20`, `i(4000) − i(500)`) **−2.33 %** (paired min / median **0.976676 /
+0.976684**, 5 rounds, zero overlap) and `foreign_cowboy_bstr`
+(`to_lower/1` 438 + `capitalize_token/1` 660 IR instructions, `i(101 000) − i(1 000)`) **−0.40 % / −0.36 %**
+(**0.996005 / 0.996398**) — small because the entry-side saving is diluted by the 1 098-instruction call
+body. About half of a **test** build's saving is the `#[cfg(test)]` counter probe in `jit_publish_y`, so the
+counter-borne figure overstates a production build; the sign and the mechanism do not depend on it. The
+per-workload rows, the round-by-round ratios and the corpus-wide `y_blocks` / `y_prologue_publishes` split are
+in `../CONTEXT.md`'s `## Measured`.
+
 ## Constraints
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder, and the
   attribute covers every submodule of this node; nothing here dereferences a raw pointer itself. The

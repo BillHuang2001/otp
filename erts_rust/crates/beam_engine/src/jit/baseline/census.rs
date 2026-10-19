@@ -393,6 +393,12 @@ fn the_static_deopt_census_over_the_corpus_is_printed() {
             row.instances,
         );
     }
+    assert!(
+        snapshot.y_prologue_publishes <= snapshot.y_blocks,
+        "a publishing prologue is one of the Y-touching blocks: {} > {}",
+        snapshot.y_prologue_publishes,
+        snapshot.y_blocks,
+    );
 
     // --- the tables ---------------------------------------------------------
     println!("=== baseline-JIT static deopt census ===");
@@ -410,6 +416,15 @@ fn the_static_deopt_census_over_the_corpus_is_printed() {
          distinct_variants={} variants_with_deopts={}",
         rows.len(),
         by_deopts.len(),
+    );
+    println!(
+        "Y prologue: blocks={} publish={} elided={} ({:.1}% of Y-touching blocks publish) \
+         invalidations={}",
+        snapshot.y_blocks,
+        snapshot.y_prologue_publishes,
+        snapshot.y_blocks.saturating_sub(snapshot.y_prologue_publishes),
+        snapshot.y_prologue_publishes as f64 * 100.0 / snapshot.y_blocks.max(1) as f64,
+        snapshot.y_invalidations,
     );
     println!(
         "deopt_weight: block-terminating dispatch (Jump/SelectVal/SelectTupleArity)=4, else 1"

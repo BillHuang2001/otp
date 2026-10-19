@@ -5434,6 +5434,13 @@ const Y_TRAFFIC_FIXTURES: [&str; 27] = [
 /// * `y_loads`/`y_stores` — the emitted guarded `Y` accesses (each is a frame-window guard
 ///   plus one load/store word) and `y_bytes`, the emitted size of all of them;
 /// * `y_blocks` — the emitted blocks whose body touches a `Y` slot at all;
+/// * `y_prologue_publishes` — the emitted block prologues that publish the frame's `Y`
+///   window (`Allocation::prologue_publishes_y`: the block touches `Y` and **not** every
+///   one of those accesses follows an in-block `allocate`/`allocate_heap`/`trim`, whose
+///   helper already re-published the window itself). Its complement within `y_blocks` is
+///   the dead publishes the gate elides: those blocks emit the plain position store
+///   instead, and the publish they drop is overwritten by the frame helper's own
+///   re-publish before any `Y` access reads the window;
 /// * `y_invalidations` — the in-block helper calls after which a **later** instruction of
 ///   the same block still touches `Y` (each is a re-publish site a `Y`-value cache would
 ///   also have to re-validate and reload through);
@@ -5503,7 +5510,8 @@ fn the_y_window_traffic_of_the_committed_fixtures_is_measured() {
         snap.blocks, snap.block_ir_instructions, snap.block_emitted_bytes,
     );
     println!(
-        "  Y: loads={} stores={} (accesses={}) bytes={} blocks={} invalidations={} slot_repeats={}",
+        "  Y: loads={} stores={} (accesses={}) bytes={} blocks={} invalidations={} slot_repeats={} \
+         prologue_publishes={}",
         snap.y_loads,
         snap.y_stores,
         accesses,
@@ -5511,6 +5519,7 @@ fn the_y_window_traffic_of_the_committed_fixtures_is_measured() {
         snap.y_blocks,
         snap.y_invalidations,
         snap.y_slot_repeats,
+        snap.y_prologue_publishes,
     );
     println!(
         "  Y accesses per 1000 IR instructions: {:.1}",
@@ -5532,6 +5541,12 @@ fn the_y_window_traffic_of_the_committed_fixtures_is_measured() {
         snap.y_slot_repeats <= accesses,
         "a reuse is one of the accesses: {} > {accesses}",
         snap.y_slot_repeats,
+    );
+    assert!(
+        snap.y_prologue_publishes <= snap.y_blocks,
+        "a publishing prologue is one of the Y-touching blocks: {} > {}",
+        snap.y_prologue_publishes,
+        snap.y_blocks,
     );
 }
 
