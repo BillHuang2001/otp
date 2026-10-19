@@ -763,6 +763,53 @@ impl<'a> RuntimeContext<'a> {
         Ok(())
     }
 
+    /// Sends one message to a **port** on this node — the C's `port_common` block
+    /// (`bif.c:2551-2613`), shared by the compiled `!`, the `-eval` `!` and the
+    /// `erlang:send/2,3` BIF.
+    ///
+    /// Three things happen here and nowhere else, so the two arities can never drift:
+    ///
+    /// 1. **One `send` trace event per attempted port send.** The C traces *before* the command
+    ///    (`trace_send(p, portid, msg)` and `seq_trace_output(…)` at `bif.c:2573-2579`, both in
+    ///    the `port_common` block that `send/2` and `send/3` reach through `do_send`), which is
+    ///    why the trace is emitted first and covers every verdict — including a dropped message
+    ///    and a busy port the caller refuses to wait for.
+    /// 2. **The C's message decomposition** (`erts_port_command`, `io.c:3981-4013`): only
+    ///    `{Pid, {command, Data}}` is written and only `{Pid, close}` closes the port; everything
+    ///    else is a bad port signal that writes nothing and succeeds silently
+    ///    ([`crate::port::busy_wait::send_message_to_port`], which owns the whole matrix).
+    /// 3. **The verdict**, which `send/2` discards (the message term is its value) and `send/3`
+    ///    reports (`ok`, or the atom `nosuspend` for a busy port under `[nosuspend]`).
+    ///
+    /// `nosuspend` is the caller's `[nosuspend]` option: it turns a busy port's wait into the
+    /// non-blocking [`PortWrite::Suspended`] verdict instead of suspending-and-retrying.
+    ///
+    /// # Errors
+    ///
+    /// The trace writers' own failures, and the typed capability gaps of the wait
+    /// ([`crate::port::busy_wait::issue`]: an expired deadline, a caller that cannot pump the
+    /// scheduler, a port busy again after the wait) — never a fabricated success.
+    pub(super) fn deliver_to_port(
+        &mut self,
+        id: PortId,
+        to: Eterm,
+        message: Eterm,
+        nosuspend: bool,
+    ) -> Result<crate::port::busy_wait::PortSend> {
+        // The C's trace site: `bif.c:2573-2579`, before `erts_port_command`, on both routes.
+        self.trace_send_events(to, message)?;
+        let may_pump = self.may_pump_scheduler;
+        let owner = self.mailbox_pid;
+        crate::port::busy_wait::send_message_to_port(
+            &mut *self.runtime,
+            may_pump,
+            owner,
+            id,
+            message,
+            nosuspend,
+        )
+    }
+
     /// The internal pid a `send` destination names, plus the **alias reference to consume**
     /// once the message has been delivered.
     ///
@@ -838,6 +885,10 @@ impl<'a> RuntimeContext<'a> {
     /// the connector's typed error, propagated rather than turned into a silent drop, so a real
     /// peer is never mis-served. `Local` is unreachable here and is rejected outright.
     ///
+    /// A **port** destination is the one arm whose trace does not come from the tail of this
+    /// method: [`Self::deliver_to_port`] emits it *before* the command, at the C's own site
+    /// (`bif.c:2573-2579`), so the send is traced exactly once.
+    ///
     /// This is also the seam's arm for [`SendDestination::Dropped`] — a `{Name, Node}` pair
     /// naming this node under which nothing is registered (`bif.c:2654`'s `return 0`): there is
     /// no local receiver to copy into and nothing to transmit, so the destination is spent
@@ -866,17 +917,15 @@ impl<'a> RuntimeContext<'a> {
             SendDestination::RemoteAlias { to: alias } => {
                 self.runtime.dist_send_alias(alias, from, message)?;
             }
-            // A **port** on this node: the C's `port_common` block (`bif.c:2551-2613`). The write
-            // is `port_command/2`'s decision and its suspend-and-retry loop, with the send route's
-            // silent-failure semantics (`send_to_port`), so a dead port and a non-iodata `Data`
-            // both report the message term instead of raising.
+            // A **port** on this node: the C's `port_common` block (`bif.c:2551-2613`), through
+            // the one shared port-send implementation ([`Self::deliver_to_port`]), so the `send/2`
+            // and `send/3` routes trace, classify and write identically. That method emits the
+            // arm's **one** `send` trace event itself — at the C's own site, *before* the command
+            // (`bif.c:2573-2579`) — so this arm returns rather than falling through to the trailing
+            // trace below, which would double-trace the send.
             SendDestination::Port { id } => {
-                let may_pump = self.may_pump_scheduler;
-                crate::port::busy_wait::send_to_port(&mut *self.runtime, may_pump, from, id, || {
-                    let mut bytes = Vec::new();
-                    crate::native::port::iodata_bytes(message, &mut bytes)?;
-                    Ok(bytes)
-                })?;
+                self.deliver_to_port(id, to, message, false)?;
+                return Ok(());
             }
             // Accepted and dropped: nothing to deliver and nothing to transmit.
             SendDestination::Dropped => {}

@@ -65,6 +65,7 @@ use std::time::{Duration, Instant};
 use beam_common::{BeamError, Result};
 use beam_io::{PortCommandOptions, PortCommandOutcome};
 use beam_process::{PortId, ProcessId};
+use beam_term::Eterm;
 
 use crate::error;
 use crate::Runtime;
@@ -119,6 +120,45 @@ pub(crate) enum PortWrite {
     /// written — the C's `ERTS_PORT_OP_BUSY` under `ERTS_PORT_SIG_FLG_NOSUSPEND`, which
     /// `port_command/3` renders as the atom `false` and `send/3` as the atom `nosuspend`.
     Suspended,
+}
+
+/// What the **send** route's port arm produced — [`PortWrite`] plus the one verdict only a `send`
+/// can produce.
+///
+/// `erlang:port_command`'s refusals are raises (`badarg`), so [`issue`] has no `Dropped` verdict;
+/// a `send`, by contrast, reports the C's `ERTS_PORT_OP_BADARG`/`ERTS_PORT_OP_DROPPED` as a
+/// **silent success** (`bif.c:2594-2600`), which is exactly this variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PortSend {
+    /// The port axis accepted the message: bytes written, or the port closed by `{Pid, close}`.
+    Write(PortWrite),
+    /// The port axis dropped the message: a port the runtime no longer holds, a payload that is
+    /// not iodata, or a message shape the C's `erts_port_command` does not decompose into a
+    /// command — the C's `ERTS_PORT_OP_BADARG`/`ERTS_PORT_OP_DROPPED`, both of which leave
+    /// `do_send`'s `port_common` block with `ret_val = 0`, so the BIF reports success and
+    /// nothing was written.
+    Dropped,
+}
+
+/// What the C's `erts_port_command` (`io.c:3981-4013`) decomposes a `send` message into.
+///
+/// `do_send`'s `port_common` block (`bif.c:2551-2613`) does **not** write the message it was
+/// given: it hands it to `erts_port_command`, which recognises exactly two shapes and treats
+/// everything else as a *bad port signal* — logged and dropped, with the BIF reporting success
+/// (`bad_port_signal` → `ERTS_PORT_OP_BADARG`, `bif.c:2594-2600`). Measured on the system oracle
+/// (erts-17.1 / OTP 29.1.1) with the `tests/fixtures/busy_driver.c` echo driver: on an **idle**
+/// port `Port ! {self(), {command, <<"a">>}}` writes `<<"a">>` (the driver echoes it) while
+/// `Port ! <<"a">>` writes **nothing**, and both report the message term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PortMessage {
+    /// `{Pid, {command, Data}}` with an **internal** pid — the one data shape the C writes
+    /// (`erts_port_command`'s `am_command` arm), with `Data` handed on to `erts_port_output`.
+    Command(Eterm),
+    /// `{Pid, close}` with an internal pid — the C's `erts_port_exit(…, am_normal, …)` arm.
+    Close,
+    /// Every other message: the C's `bad_port_signal`. Nothing is written and the send reports
+    /// success (the message term for `send/2`, `ok` for `send/3`).
+    Drop,
 }
 
 /// What the wait observed. Only [`IdleWait::Idle`] lets the command be re-issued.
@@ -270,12 +310,16 @@ fn port_state(runtime: &Runtime, id: PortId) -> Result<Option<bool>> {
     Ok(Some(registry.is_busy(id)))
 }
 
-/// The C's **`send` port arm**: every failure is a silent success.
+/// The C's **`send` port arm** (`bif.c:2551-2613`): decompose the message the way
+/// `erts_port_command` does, write the one data shape, and report every failure as a silent
+/// success.
 ///
-/// `do_send`'s `port_common` block (`bif.c:2551-2613`) treats a busy port exactly as
-/// [`issue`] does, but its *failures* are not raises: `ERTS_PORT_OP_DROPPED`, `BADARG` and
-/// `DONE` all fall out with `ret_val = 0`, so the BIF reports the **message term** and writes
-/// nothing. A dead / never-opened / wrong-incarnation port id never even enters the block
+/// `do_send`'s `port_common` block hands the message to `erts_port_command`
+/// (`io.c:3981-4013`), which recognises exactly two shapes — `{Pid, {command, Data}}` (write
+/// `Data`, `erts_port_output`'s busy/nosuspend matrix and all) and `{Pid, close}`
+/// (`erts_port_exit`) — and treats **everything else** as a bad port signal: the C logs it and
+/// drops it, and the block leaves with `ret_val = 0`, so the BIF reports success and nothing was
+/// written. A dead / never-opened / wrong-incarnation port id never even enters the block
 /// (`pt == NULL`), which is the same silent success — measured on the oracle: after
 /// `port_close(P)`, `erlang:send(P, hello)` answers `hello`, while `port_command(P, <<"x">>)`
 /// answers `error:badarg`.
@@ -288,22 +332,101 @@ fn port_state(runtime: &Runtime, id: PortId) -> Result<Option<bool>> {
 ///
 /// Only the capability gaps of [`issue`] and a genuine write failure (a child that closed its
 /// stdin is `EPIPE`, which the C reports through the port's failure channel rather than the BIF).
-pub(crate) fn send_to_port<F>(
+pub(crate) fn send_message_to_port(
     runtime: &mut Runtime,
     may_pump: bool,
     owner: ProcessId,
     id: PortId,
-    make_data: F,
-) -> Result<()>
-where
-    F: Fn() -> Result<Vec<u8>>,
-{
-    match issue(runtime, may_pump, owner, id, make_data, PortCommandOptions::EMPTY) {
-        // `DONE`, and the `nosuspend`/dropped arms: the message term is the BIF value.
-        Ok(_) => Ok(()),
-        // The C's silent success for a port that is not there and for whatever the port axis
-        // rejected.
-        Err(BeamError::BadArg) => Ok(()),
-        Err(other) => Err(other),
+    message: Eterm,
+    nosuspend: bool,
+) -> Result<PortSend> {
+    match classify_message(runtime, message) {
+        // The C's `bad_port_signal`: logged and dropped, and the send reports success.
+        PortMessage::Drop => Ok(PortSend::Dropped),
+        // `erts_port_exit(…, am_normal, …)`: the port axis accepted the message by closing it,
+        // and a port that is already gone is the block's silent success.
+        PortMessage::Close => match close_port(runtime, owner, id) {
+            Ok(()) => Ok(PortSend::Write(PortWrite::Written)),
+            Err(BeamError::BadArg) => Ok(PortSend::Dropped),
+            Err(other) => Err(other),
+        },
+        // `erts_port_output` behind `erts_port_command`: the whole `port_command` matrix,
+        // including the C's suspend-and-retry loop, with the send route's silent failures.
+        PortMessage::Command(data) => {
+            let options = PortCommandOptions::EMPTY.with_nosuspend(nosuspend);
+            let written = issue(runtime, may_pump, owner, id, || data_bytes(data), options);
+            match written {
+                // `DONE`, and the `nosuspend` arm: the caller folds the verdict into its answer.
+                Ok(write) => Ok(PortSend::Write(write)),
+                // The C's silent success for a port that is not there and for whatever the port
+                // axis rejected (a non-iodata `Data` is `bad_value` → `bad_port_signal` there).
+                Err(BeamError::BadArg) => Ok(PortSend::Dropped),
+                Err(other) => Err(other),
+            }
+        }
     }
+}
+
+/// One payload's iodata conversion, in the shape [`issue`] rebuilds on each attempt.
+///
+/// The C converts the iolist **after** the busy test (`io.c:1749-1754` against `:1790`), which is
+/// why the conversion is a closure there and here: a refused attempt never pays for it.
+fn data_bytes(data: Eterm) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    crate::native::port::iodata_bytes(data, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Classifies a `send` message exactly as `erts_port_command` (`io.c:3981-4013`) does.
+///
+/// The C's tests, in its own order: the message must be a 2-tuple; its first element must be an
+/// **internal** pid (`is_internal_pid`); and its second element is then either the atom `close`,
+/// a 2-tuple `{command, Data}`, or something the block cannot use. The atom comparisons are by
+/// **name** through the runtime's one shared table, so a message built on another heap/module
+/// classifies identically.
+fn classify_message(runtime: &Runtime, message: Eterm) -> PortMessage {
+    let pair = || {
+        if beam_engine::terms::tuple_arity(message).ok()? != 2 {
+            return None;
+        }
+        let from = beam_engine::terms::tuple_element(message, 0).ok()?;
+        let rest = beam_engine::terms::tuple_element(message, 1).ok()?;
+        Some((from, rest))
+    };
+    let Some((from, rest)) = pair() else {
+        return PortMessage::Drop;
+    };
+    if !ProcessId::is_process(from) {
+        // A remote pid (or any other term) as the "from": `bad_port_signal`.
+        return PortMessage::Drop;
+    }
+    if runtime.atom_name_of(rest) == Some("close") {
+        return PortMessage::Close;
+    }
+    if beam_engine::terms::tuple_arity(rest).ok() == Some(2) {
+        let command = || {
+            let tag = beam_engine::terms::tuple_element(rest, 0).ok()?;
+            let data = beam_engine::terms::tuple_element(rest, 1).ok()?;
+            Some((tag, data))
+        };
+        if let Some((tag, data)) = command() {
+            if runtime.atom_name_of(tag) == Some("command") {
+                return PortMessage::Command(data);
+            }
+        }
+    }
+    PortMessage::Drop
+}
+
+/// Closes `id` through the runtime's port seam — the C's `erts_port_exit` arm of
+/// `erts_port_command`.
+///
+/// A port the runtime no longer holds is [`BeamError::BadArg`], which [`send_message_to_port`]
+/// folds into the block's silent success (the C's `pt == NULL`).
+fn close_port(runtime: &mut Runtime, owner: ProcessId, id: PortId) -> Result<()> {
+    use beam_bifs::PortHook;
+
+    let atoms = runtime.code_server.atoms_handle();
+    let mut hook = crate::port::RuntimePorts::new(Rc::clone(&runtime.ports), atoms, owner);
+    hook.close_port(id)
 }
