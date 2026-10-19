@@ -84,6 +84,13 @@ This is the frozen public-API shape dependents design against; keep it stable.
 - `beam_process` → `Process`/`ProcessId`, `Scheduler`/run queue/`ProcessRunner`, signals/links/monitors;
   **resume-on-send** (`Process::deliver -> DeliverOutcome` + `ProcessTable::drain_woken` /
   `Scheduler::resume_woken`) wakes a receiver blocked in `receive`.
+- `beam_rt` (off-heap half) → one `beam_gc::BinVheap` per process (`ProcessEngine.off_heap`,
+  `src/context/gc/bin_vheap.rs`) and exactly ONE reclamation point: the runner's park arm
+  (`src/runner/run.rs`), after the rooted collection — reachable payloads from
+  `for_each_reachable_binary_payload`, then `Machine::retain_refc_binaries`, then
+  `Process::set_off_heap_binary_bytes(machine.off_heap_overhead_bytes())`.
+  The trigger is O(1) per slice (the overhead figure is re-derived only when the reservoir's handle
+  count moves); a declined prune retains the whole reservoir (a leak, never a dangle).
 - `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface, plus
   **fifteen** optional defaulted host seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/
   `PortHook`/`DictHook`/`PersistentTerm`/`NifLoader`/`RecordSource`/`LocalNode`/`LocalFunIdentity`/
