@@ -100,6 +100,12 @@
 //!   indistinguishable from the live object now living there — the same substitution hazard the
 //!   registry already carries for every `void*` operand (a `#Ref`-shaped id is substituted likewise;
 //!   see `resources.rs`'s module docs). Not closable while the C ABI's operand is a bare `void*`.
+//! * Both helpers consult the registry and then touch the block's header, so the caller must hold an
+//!   **outstanding reference** at call time — the C's own precondition for the pair
+//!   (`ASSERT(erts_refc_read(&bin->binary.intern.refc, 0) != 0)`, `erl_nif.c:3173`, and the select
+//!   route is reached from a live `enif_select` call on an object the calling NIF still references). A
+//!   caller with no reference at all can lose the object to a concurrent destroy between those two
+//!   steps, exactly as the C loses it between its `DATA_TO_RESOURCE(obj)` and its increment.
 //! * A **double** [`unkeep_resource`] of a still-live object (more releases than keeps) remains the C's
 //!   caller error; the guarded decrement only refuses to underflow, it does not make the extra release
 //!   meaningful.
