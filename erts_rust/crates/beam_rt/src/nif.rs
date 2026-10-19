@@ -56,11 +56,12 @@
 //! # The host's runtime services
 //!
 //! [`NifHostImpl`] serves a NIF call every runtime facility it can reach: the atom services
-//! (`intern_atom`/`atom_name`/`existing_atom`), the ETF codec (`term_to_binary`/`binary_to_term`,
-//! over the same `beam_codec` encoder/decoder and the same deferred-interner discipline the
-//! `erlang:term_to_binary/1` BIF uses), a unique-integer source (`unique_integer`, the C emulator's
-//! four counter sequences), the emulator information block (`system_info`) and the
-//! extra-environment family (`alloc_env`/`free_env`/`make_copy`).
+//! (`intern_atom`/`atom_name`/`existing_atom`), the ETF codec
+//! (`term_to_binary`/`binary_to_term`/`binary_to_term_used`, the last being the consumed-byte form
+//! `enif_binary_to_term` answers with, over the same `beam_codec` encoder/decoder and the same
+//! deferred-interner discipline the `erlang:term_to_binary/1` BIF uses), a unique-integer source
+//! (`unique_integer`, the C emulator's four counter sequences), the emulator information block
+//! (`system_info`) and the extra-environment family (`alloc_env`/`free_env`/`make_copy`).
 //!
 //! Eight hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name
 //! lookup (`enif_whereis_pid`), the two liveness answers (`enif_is_process_alive`,
@@ -567,8 +568,8 @@ impl<'a> NifHostImpl<'a> {
 // proves in constant time that the memo still names the same atom at every index it covers and the
 // steady state reads **no** atom name at all. The index-by-index [`prefix_matches`] survives only as
 // the fallback for a table the witness cannot vouch for (see [`with_decode_scratch`]). The image is
-// shared by **both** of this crate's decoding hosts — [`NifHostImpl`]'s `binary_to_term` (behind
-// `enif_binary_to_term`) and
+// shared by **all** of this crate's decoding sites — [`NifHostImpl`]'s `binary_to_term` /
+// `binary_to_term_used` (behind `enif_binary_to_term`),
 // [`DriverPort::binary_to_term`](crate::port::driver::DriverPort) (behind `erl_drv_binary_to_term` /
 // the term-data machine's `ERL_DRV_EXT2TERM`) — so the two cannot drift.
 //
@@ -875,6 +876,41 @@ impl NifHost for NifHostImpl<'_> {
                 let _ = interner.intern(name);
             }
             Some(term)
+        })
+    }
+
+    /// The **consumed-byte** form of [`NifHost::binary_to_term`] — `enif_binary_to_term`'s
+    /// `return bp - data` (`erts/emulator/beam/erl_nif.c:1543`).
+    ///
+    /// An External Term Format image may carry bytes **after** the encoded term: the C decodes one
+    /// term, counts it, and never checks that the image was exhausted. The count is therefore the
+    /// first term's own size, which may be *smaller* than `bytes.len()`; trailing bytes are tolerated
+    /// and simply not counted. This is the one observable [`binary_to_term`](Self::binary_to_term)
+    /// cannot serve — that hook finishes the decoder and so rejects the very same slice — which is
+    /// why the two are separate hooks and this one decodes through
+    /// [`beam_codec::decode_term_used`] (whose plain path deliberately does **not** call
+    /// `Decoder::finish`).
+    ///
+    /// Everything else mirrors the strict hook exactly, because the invariants are the same: the term
+    /// lands on **this host's** heap (the one the env exposes), a truncated or undecodable image is
+    /// the typed `None` (the C's `return 0`, `*term` untouched — never a half-decoded term), and a
+    /// name the image introduces is taken from the per-thread scratch image of the shared table and
+    /// recorded on the shared [`PendingInterner`] by `intern` (not `intern_atom` — the base was fixed
+    /// at host construction) on the `Ok` path only, so a failed decode commits nothing.
+    fn binary_to_term_used(&mut self, bytes: &[u8]) -> Option<(Eterm, usize)> {
+        // Disjoint field borrows: `heap` and `interner` are distinct fields of `self`.
+        let heap = &mut self.heap;
+        let interner = &mut self.interner;
+        with_decode_scratch(&self.atoms, |scratch| {
+            let known = scratch.len();
+            let (term, used) = beam_codec::decode_term_used(bytes, heap, scratch).ok()?;
+            for index in known..scratch.len() {
+                let Some(name) = scratch.name(beam_term::Atom::from_raw(index as u32)) else {
+                    continue;
+                };
+                let _ = interner.intern(name);
+            }
+            Some((term, used))
         })
     }
 
@@ -1473,6 +1509,69 @@ mod tests {
             &[130, 97, 42][..],         // the wrong version byte
         ] {
             assert_eq!(host.binary_to_term(bad), None, "rejected: {bad:?}");
+        }
+    }
+
+    /// **`enif_binary_to_term` reports the first term's own byte count**, tolerating trailing bytes —
+    /// the C's `return bp - data` (`erts/emulator/beam/erl_nif.c:1543`).
+    ///
+    /// An External Term Format image is allowed to carry bytes after the encoded term; the C decodes
+    /// one term, counts it and never checks that the image was exhausted. `term_to_binary(42)` is 3
+    /// bytes (`[131,97,42]`), so an image followed by `junk` must answer `(42, 3)` — a count
+    /// **smaller** than the slice. The strict [`NifHost::binary_to_term`] hook, by contrast, rejects
+    /// that same slice outright: it finishes the decoder, which is why the two hooks cannot be one.
+    ///
+    /// Oracle: `enif_binary_to_term` over a `term_to_binary(42)` image with junk appended answers `3`
+    /// (measured end to end through a real C NIF by `tests/nif_binary_to_term_used.rs`, which also
+    /// cross-checks the number against the system `erl`).
+    #[test]
+    fn binary_to_term_used_counts_the_first_term_and_tolerates_trailing_bytes() {
+        let (mut host, _atoms, _interner) = host_with(&["a"]);
+        let mut image = ORACLE_SMALL.to_vec();
+        image.extend_from_slice(b"junk");
+        assert!(image.len() > ORACLE_SMALL.len(), "trailing bytes present");
+
+        assert_eq!(
+            host.binary_to_term_used(&image),
+            Some((make_small(42), ORACLE_SMALL.len())),
+            "the consumed count is the first term's size, not the slice length"
+        );
+        // The very same slice through the strict hook is a rejection — the divergence the used-count
+        // hook exists to close.
+        assert_eq!(
+            host.binary_to_term(&image),
+            None,
+            "the strict hook refuses it"
+        );
+        // A complete image is fully consumed: the count is the whole slice and the term is the image's.
+        let (term, used) = host
+            .binary_to_term_used(ORACLE_TUPLE)
+            .expect("a complete image");
+        assert_eq!(
+            used,
+            ORACLE_TUPLE.len(),
+            "a complete image is fully consumed"
+        );
+        assert_eq!(
+            host.term_to_binary(term).as_deref(),
+            Some(ORACLE_TUPLE),
+            "and the decoded term is the image's own term"
+        );
+    }
+
+    /// A truncated or undecodable image is the typed `None` for the used-count hook too — the C's
+    /// `return 0` — so no half-decoded term is ever handed back.
+    #[test]
+    fn binary_to_term_used_refuses_truncated_images() {
+        let (mut host, _atoms, _interner) = host_with(&["a"]);
+        for bad in [
+            &[][..],
+            &[131][..],                  // no term after the version byte
+            &[131, 97][..],              // a small int with its byte missing
+            &[131, 107, 0, 3, 1, 2][..], // a list claiming 3 elements but holding 2
+            &[130, 97, 42][..],          // the wrong version byte
+        ] {
+            assert_eq!(host.binary_to_term_used(bad), None, "rejected: {bad:?}");
         }
     }
 
