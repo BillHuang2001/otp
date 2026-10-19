@@ -627,3 +627,16 @@ both sides matched, and the route was not turned into a case for the reason give
 - **`compile:forms/2` IS supported by `beam_rt`** — the two landed cases compile *and execute*
   through it — so the "measure first, drop if unsupported" rule did not bite there (recorded so a
   future pass does not re-measure it as a gap).
+
+### Widened live two-node traffic measured while filling in `dist_extra` (`beam_rt`, `beam_process`)
+
+Measured 2025-xx with the system `erl` (OTP 29.1.1 / erts-17.1) against `beam_rt`, each as a two-VM **self-pair** (client + a peer of the same program), exactly the shape `src/corpus/dist.rs` and `src/corpus/dist_extra.rs` use. None of these is pinned by a case (each disagreed, or is a capability gap); the eleven self-pair shapes that DO agree are `dist_extra/*`.
+
+- **`link/1` + `DOP_EXIT` across nodes** (owner `beam_process`/`beam_rt`): client traps exits and links a peer-side process that exits with `byname`. Oracle: `{\'EXIT\', Pid, byname}`; rust: no signal within 8 s, and at termination logs `dropping remote exit signal … distribution: no established connection to node …`.
+- **`erlang:monitor/2` of a remote process** (`DOP_MONITOR_P`/`DOP_MONITOR_P_EXIT`, owner `beam_process`): oracle `{\'DOWN\', Ref, process, Pid, byname}`; rust answers nothing when the monitored process lives on the **listener** (accepted-link) half — the reverse direction (`beam_rt` client monitoring an oracle peer) does answer `byname`. `demonitor/2` shares that path.
+- **Pid identity round trip** (owner `beam_term`/`beam_rt`): `Pid =:= self()` after the pid crossed the link and came back — oracle `true`, rust `false`; consequently an `alias/0` reference sent to the peer and written by the peer (`DOP_ALIAS_SEND`) is never delivered.
+- **Inbound term size bound:** a 100-element list and a 1 KiB binary round-trip; a 128-element list and a 128 KiB binary make the receiving rust VM die (`beam_rt: error scheduler: process … has no engine entry point`) and a 1 MiB binary gets no reply. The corpus stays at 80 elements / 1 KiB.
+- **`-hidden`** (owner `beam_rt`): a peer started `-hidden` gives `nodes()=0, nodes(hidden)=1` on the oracle and `nodes()=1, nodes(hidden)=0` on rust.
+- **`erlang:disconnect_node/1`** is `beam_rt: unsupported: erlang:disconnect_node/1 is a known BIF that is not implemented` (exit 3); **`erlang:spawn_request/5`** likewise (`unsupported`), so an `erpc:call/4` over a plain self-pair is unpinnable.
+- **Cookie-refusal latency:** a refused handshake costs ~5 s per attempt on rust (its connect timeout) vs instantly on the oracle, so `dist_extra/cookie_mismatch` uses three bounded attempts.
+- **`group_leader(RemotePid, self())`** could not be measured — the oracle's `-eval` wrapper silently refuses to evaluate it (no stdout, exit 1); not a proven divergence. `erlang:monitor_node(MissingNode, true)` answers `true` on both, too weak to pin.
