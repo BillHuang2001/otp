@@ -63,6 +63,40 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   what happens on a host with an `erl` on `$PATH` — the resolved default is the system install's
   script (see above).
 
+## Reachability of a `-sname` node from a real peer (A.5, cross-cutting: dist · eval · scheduler)
+Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, same cookie as this runtime);
+`node()` on both sides is `@<hostname>` (short), so no host-form mismatch is involved.
+- **`net_adm:ping(<this node>)` WORKS whenever a scheduler pass runs.** `run <fixture> …` answers `pong`
+  repeatedly (42–584 ms; three concurrent pongs) and `-eval` with repeated short receives answers `pong`.
+  The `'N'` responder handshake, the `net_kernel` service's `is_auth` answer (`native/net_kernel.rs`), the
+  alias reply (`dist/links.rs::route_alias` → `DOP_ALIAS_SEND`; `DFLAG_ALIAS` is negotiated by OTP 29) and
+  the peer binding (`runtime/scheduler.rs:999`) are all live. A **wrong cookie** answers `pang` in ~20 ms
+  (a real refusal) — that is the discriminator against the timeout form below.
+- **The `-eval` `receive … after T` route does not pump, so a peer dialling more than ~0.5 s after start is
+  never accepted.** `eval/mod.rs:1376` charges the whole remaining window to
+  `RuntimeContext::poll_port_messages(remaining)` → `PortRegistry::pump(timeout)` (`port.rs:1767`), which
+  loops in `PORT_POLL_SLICE` (25 ms) `epoll_wait` slices for as long as any port is live — the booted
+  kernel's `inet_gethost` child is (`port.rs:1802`). `scheduler_pass` therefore never runs, `pump_dist` /
+  `accept_one` never run, and the peer's connection sits unaccepted in the listen backlog (observed:
+  `LISTEN Recv-Q ≥ 1`, `CLOSE-WAIT … Recv-Q 31` = its unread `'N'`); the oracle gives up at its 7 s
+  `net_setuptime` and answers `pang` after 7005 ms. `wait_for_timer` (`eval/mod.rs:1399` →
+  `scheduler.rs:320`, sleeping to `min(next_deadline, until)`) is the second latent blocker on the same
+  loop. The fix shape is to bound **both** per-iteration waits to a 25 ms slice and to break only once the
+  caller's own deadline has elapsed.
+- **`DistNode::is_idle` (`dist.rs:744` → `links.rs:200`) means "no live LINK".** The listener and a pending
+  accept are not counted as work, so a distributed node with nothing to run is `is_quiescent`
+  (`scheduler.rs:581`). The `run` route only survives an idle `receive` because the live `inet_gethost`
+  port keeps `has_nothing_to_poll()` false; without it a long-lived server node would exit
+  `unsupported: run: process blocked`, and `RUN_DEADLINE` (60 s) bounds that route anyway.
+- **This runtime is a HIDDEN node to real peers.** The acceptor advertises
+  `preferred_flags()` (`dist.rs:273` → `ConnectionDriver::server` →
+  `beam_dist::handshake::preferred_flags`, the emulator's `erts_dflags.default`), which omits
+  `DFLAG_PUBLISHED` (`0x01`); a real node adds that bit per peer
+  (`lib/kernel/src/dist_util.erl:152-160`). Observed: a peer's `nodes()` is `[]` while
+  `nodes(hidden)`/`nodes(connected)` list this node, where oracle-vs-oracle `ping` puts the peer in
+  `nodes()`. `ConnectionDriver::server_with_flags(…, preferred_flags() | publish_flag(false, true))` (and
+  the client constructor) is the published form, to be used unless the node is started `-hidden`.
+
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's own test region — everything from its first test-module declaration to EOF, whether that declaration opens an inline module or a sibling `#[path]` one).
 - `src/port.rs` 4 076 lines, 4 020 of production (unit suite lives in `port/tests.rs`, 3 824 lines, plus the sibling `port/{driver_output_shape,inet_matrix,ram_file_matrix,completion,control_capability,monitor,spawn_driver,packet_framing,stream_shape}_tests.rs` and `port/test_support.rs`).
