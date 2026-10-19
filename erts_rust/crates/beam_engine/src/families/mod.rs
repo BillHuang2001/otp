@@ -119,7 +119,7 @@ pub(crate) fn dispatch(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
-    // The single seam every family-owned raise passes through on BOTH tiers (the
+    // The seam every family-owned raise passes through on BOTH tiers (the
     // interpreter calls this directly; the native baseline tier's `jit_family`
     // helper reaches the same call), so it is where the machine resolves the three
     // exception-**class** atoms from the engine's live atom namespace
@@ -133,7 +133,9 @@ pub(crate) fn dispatch(
     // steady state is one `bool` load and a not-taken branch, whereas an
     // unconditional call pays a function call per family-owned instruction (the
     // resolution itself runs at most once per run, so the call is pure overhead for
-    // every instruction after it).
+    // every instruction after it). A family whose entry has a second caller that
+    // bypasses this router installs the same latch in its own entry
+    // ([`bitstrings::exec`] does, for the native baseline tier's in-block helper).
     if !machine.class_atoms_live {
         machine.ensure_class_atoms(ctx, module);
     }
@@ -196,27 +198,12 @@ pub(crate) fn dispatch(
         | Instr::HasMapFields { .. }
         | Instr::PutMapAssoc(_)
         | Instr::PutMapExact(_) => maps::exec(machine, module, labels, instr, func, pc, ctx),
-        // bitstrings (the whole `Bs*` family)
-        Instr::BsStartMatch3 { .. }
-        | Instr::BsStartMatch4 { .. }
-        | Instr::BsGetPosition { .. }
-        | Instr::BsSetPosition { .. }
-        | Instr::BsGetTail { .. }
-        | Instr::BsTestTail2 { .. }
-        | Instr::BsGetInteger2(_)
-        | Instr::BsGetBinary2(_)
-        | Instr::BsSkipBits2 { .. }
-        | Instr::BsMatch { .. }
-        | Instr::BsMatchString { .. }
-        | Instr::BsGetFloat2(_)
-        | Instr::BsGetUtf8 { .. }
-        | Instr::BsGetUtf16 { .. }
-        | Instr::BsGetUtf32 { .. }
-        | Instr::BsSkipUtf8 { .. }
-        | Instr::BsSkipUtf16 { .. }
-        | Instr::BsSkipUtf32 { .. }
-        | Instr::BsInitWritable
-        | Instr::BsCreateBin { .. } => {
+        // bitstrings (the whole `Bs*` family). The variant set is the family's own
+        // [`bitstrings::claimed`] predicate — its one statement of what it owns — rather
+        // than a copy of the list here: the native baseline tier's emitted arm
+        // (`jit::baseline::emit::block`) and its in-block helper ask the same predicate,
+        // so the router, the tier and the family cannot drift apart.
+        _ if bitstrings::claimed(instr) => {
             bitstrings::exec(machine, module, labels, instr, func, pc, ctx)
         }
         // receive / message

@@ -35,7 +35,12 @@ field reader (`read_integer_field`, `read_wide_integer_field`, `read_float_field
 a `-native` field big-endian — a wrong value, which is the defect this rule prevents.
 
 ## Routing Table (file → responsibility)
-- `mod.rs` → the family `exec`, the shared `fail_step`/`goto_label`, the operand helpers
+- `mod.rs` → the family `exec` (the **only** entry: the router dispatches to it and the native
+  baseline tier's `jit_bitstr` calls it directly — it installs the `error`/`exit`/`throw` class-atom
+  anchor itself, so a caller that bypasses the router still gets a raise that lands),
+  `claimed` (the family's one statement of its 20 `Bs*` variants, which the router's arm, the tier's
+  emitted arm and `jit_bitstr` all share; `exec`'s `Ok(None)` contract is the authority it is pinned
+  against, in `jit/baseline/bitstr_tests.rs`), the shared `fail_step`/`goto_label`, the operand helpers
   (`read_size`, `is_all`, `decode_flags`/`flag_bit` + the `BSF_*` bits), the safe bit
   arithmetic (`read_uint_be`/`read_uint_le`/`read_uint_le_bits`/`sign_extend`/
   `extract_bits`), the wide-integer (`> 64` bit) byte model, and the `BitWriter` (two-mode: `Dest::Vec` copy-rebuild / `Dest::InPlace` writable accumulator) sink.

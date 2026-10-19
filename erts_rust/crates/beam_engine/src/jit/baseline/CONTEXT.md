@@ -99,16 +99,17 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   boxed `Result` re-boxed the 72-byte `Ok` payload too, i.e. two `malloc`/`free` pairs per instruction
   (`perf annotate`'s top row before the split). The context-`0` `with_uncaught_frames` decoration still
   runs on the `Err` arm, before the error is stored.
-- `bitstr.rs` — `jit_bitstr`: the bitstring family's own helper. The emitter claims the family's
-  **whole** variant set (20 `Bs*` variants, the `emit_block` arm) and reaches
+- `bitstr.rs` — `jit_bitstr`: the bitstring family's own helper. The emitter claims on the family's
+  own `families::bitstrings::claimed` predicate — the one function the router
+  (`families/mod.rs`'s `_ if bitstrings::claimed(instr)` arm) routes on — and reaches
   `crate::families::bitstrings::exec` **directly**, skipping `crate::families::dispatch`'s variant
-  re-match — same position store, same resolve-or-decline to `jit_step_one` (also for a variant the
+  re-match: same position store, same resolve-or-decline to `jit_step_one` (also for a variant the
   family answers `Ok(None)` for), same context-`0` raise decoration, same `fold_ok_step`/`fold_err`
-  encoding, and the router's `class_atoms_live` latch reproduced (`families/mod.rs:137-139`), which a
-  bypass must never skip. It runs **no** per-execution shape predicate: the route is decided at compile
-  time (re-testing it per execution measured ≈⅓ of the win). `claimed(instr)` and `bitstr_calls()`
-  are `#[cfg(test)]`-only — the first transcribes the router's bitstring arm so a pin can compare the
-  two, the second proves the helper actually ran.
+  encoding. The `class_atoms_live` latch is the **family entry's** own (`bitstrings::exec` installs it
+  before the variant check), so a direct caller gets it too and this helper performs no copy of it.
+  It runs **no** per-execution shape predicate: the route is decided at compile time (re-testing it
+  per execution measured ≈⅓ of the win). `bitstr_calls()` is `#[cfg(test)]`-only — it proves the
+  helper actually ran; the claim set itself has no test-build copy.
 - `test_helper.rs` — the comparison-`test` helper (`jit_test`, `TEST_TRUE`/`TEST_FALSE`): it resolves the instruction at `(func, pc)` in the active module and evaluates a two-operand comparison `test` through `beam_term`'s `cmp`/`cmp_arith`, reporting the outcome as a boolean (the block-ABI `ERROR` word on a propagating read error) and handing anything it does not own to `jit_step_one`.
 - `receive.rs` — `jit_receive`: the `send`/receive-control family's own body plus the interpreter step's position store and raise funnel.
 - `emit/` — `compile.rs` (the compilation entry points `compile_module`/`compile_function`, `emit_function`,
@@ -147,7 +148,9 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   (`Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage` via `emit::emit_receive` →
   `receive.rs::jit_receive`), the whole **family-owned surface** (`put_list`/`put_tuple2`, the native-record
   set, `make_fun3`/`call_fun`/`call_fun2`/`apply`/`apply_last`, the try/catch/raise set, the float set, the
-  map set, the bitstring set, `recv_marker_*` via `emit/family.rs::emit_family` → `family.rs::jit_family`),
+  map set, `recv_marker_*` via `emit/family.rs::emit_family` → `family.rs::jit_family`; the whole bitstring
+  family — the variants `families::bitstrings::claimed` names — via `emit/family.rs::emit_bitstr` →
+  `bitstr.rs::jit_bitstr`, its own arm),
   the frame-discipline trio (`Deallocate` via `frame.rs::emit_deallocate`, `Return` via `::emit_return`,
   `DeallocateReturn` via `::emit_deallocate_return`), and the **heap / frame-admission** family
   (`allocate` via `heap.rs::emit_allocate`, `allocate_heap` via `::emit_allocate_heap`, `test_heap` via
@@ -543,7 +546,7 @@ and the emitted-byte table with the same command and `--lib the_per_kind_emitted
 - `runtime.rs` → block ABI + `jit_step_one`/`jit_ext_call`/`jit_local_call`/`jit_tail_call`/`jit_deallocate`/`jit_return`/`jit_deallocate_return`/`jit_allocate`/`jit_allocate_heap`/`jit_test_heap`/`jit_trim`/`jit_set_position`/`jit_publish_y`/`jit_refresh_y`, the shared in-block resolver `enter_in_block` (`return_word` → `resume_in_block` → `resolve_resume_entry`/`cross_function_entry`) that both in-block transfers — a return's continuation and a non-tail `call`'s callee — go through; `jit_allocate`/`jit_allocate_heap`/`jit_trim`/`jit_deallocate` also re-publish the Y window on their success path (`JitRuntime::refresh_y_base`)
   + `RUNTIME_YBASE_DISP`/`RUNTIME_YEND_DISP`/`RUNTIME_LITERALS_DISP`/`RUNTIME_LITERALS_END_DISP` + `JitRuntime::refresh_literals`/`literal_bounds`; `tests.rs` → unit tests.
 - `bif_helper.rs` → `jit_bif_value` (the `StepHelper`-shaped native evaluation of `erlang:byte_size/1`/`length/1`: `byte_size_value` = `bitstring_size(t).div_ceil(8)`, `list_length` = the proper-list walk, both through the engine's own `read_operand`/`write_operand`; `read_is_allocation_free` gates the one operand kind that could allocate) + `evaluate_bif`; it reuses `emit::arith::import_names` (the one shared import→name resolver) and declines to `jit_step_one` for every shape it cannot prove. `bif_tests.rs` → the named-BIF tier-equivalence/deopt suite above.
-- `call.rs` → `jit_call_store` + `jit_call_store_linked` (the shared `call_store_impl` behind a private `CallMode`) + `CALL_STORED`/`CallOutcome`; `receive.rs` → the `jit_receive` `send`/receive-control helper; `family.rs` → `jit_family` (the shared family-owned-instruction helper, unboxed success path via `runtime.rs::fold_ok_step`/`fold_err`) + `tests.rs`'s pins; `bitstr.rs` → `jit_bitstr` + the test-build `claimed`/`bitstr_calls` (the bitstring family's own helper — the router bypass), `bitstr_tests.rs` → its pins (variant-set equality against the family's `Ok(None)` contract, tier agreement, the helper-actually-ran assertion); `test_helper.rs` → the comparison-`test` helper (`jit_test`, `TEST_TRUE`/`TEST_FALSE`) + its `jit_step_one` fallback for anything it does not own; `cross_tests.rs` → the in-block-transfer instrument's pins (cross-function resolutions/memo hits per call, the measured memo negative).
+- `call.rs` → `jit_call_store` + `jit_call_store_linked` (the shared `call_store_impl` behind a private `CallMode`) + `CALL_STORED`/`CallOutcome`; `receive.rs` → the `jit_receive` `send`/receive-control helper; `family.rs` → `jit_family` (the shared family-owned-instruction helper, unboxed success path via `runtime.rs::fold_ok_step`/`fold_err`) + `tests.rs`'s pins; `bitstr.rs` → `jit_bitstr` + the test-build `bitstr_calls` (the bitstring family's own helper — the router bypass; its claim set is the family's `families::bitstrings::claimed`, with no local copy), `bitstr_tests.rs` → its pins (the one shared claim-set assertion: emitted set == router ownership == the family's `Ok(None)` contract; the decline-reaches-`jit_step_one` pin; tier agreement; the helper-actually-ran assertion); `test_helper.rs` → the comparison-`test` helper (`jit_test`, `TEST_TRUE`/`TEST_FALSE`) + its `jit_step_one` fallback for anything it does not own; `cross_tests.rs` → the in-block-transfer instrument's pins (cross-function resolutions/memo hits per call, the measured memo negative).
 - `counters.rs` → the `#[cfg(test)]` structural counters (`Counters`, `record_*`, `snapshot`): the `jit_step_one`/`jit_step_ext` deopts (a `Test` deopt is keyed by kind — `"Test(IsEqExact)"`, `"Test(IsTuple)"`, … — in `deopts_by_variant`, so which `test` shapes still deopt is readable per predicate), the driver round-trips, the prologue position/publish calls, the **register-cache traffic** (`record_spill`/`record_fill`/`record_block`: per-block IR/byte/cache/write-set sizes + spill/fill stores by site), the **Y-window traffic** (`record_y_access`/`record_y_invalidation`/`record_block`: emitted guarded `Y` loads/stores + their emitted bytes, `Y`-touching blocks, the in-block refresh sites, and the same-block `Y`-slot reuse count) — one recorded run yields all **three** spill **store** models
   (the **dirty** set `spill` emits via `spill_slots_at(pc)`, the whole-block **written** set and the
   **full cache**) and both fill models, whose corpus-wide table is the test

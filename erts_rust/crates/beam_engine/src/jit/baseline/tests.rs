@@ -5945,7 +5945,7 @@ fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
 /// The [`MinimalContext`] owns the heap every boxed term is built on and is dropped at the
 /// end of this call, so the caller may only inspect an outcome that is an immediate or a
 /// typed error — which is exactly what the fixtures below return (`NIL` or a raise).
-fn run_counting(
+pub(crate) fn run_counting(
     module: &Module,
     name: Atom,
     tier: Tier,

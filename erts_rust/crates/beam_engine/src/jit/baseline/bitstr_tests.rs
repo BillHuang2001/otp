@@ -19,19 +19,25 @@
 // %CopyrightEnd%
 //! Pins for the bitstring-family helper (`super::bitstr`). A `#[path]` sibling of
 //! `super::tests`, so it reuses that module's harness (`body_module`,
-//! `assert_same_outcome`, the `MinimalContext` route).
+//! `assert_same_outcome`, `run_counting`, the `MinimalContext` route).
 //!
-//! Four claims, one per concern:
+//! Five claims, one per concern:
 //!
-//! * the **route predicate** [`bitstr::claimed`] agrees, instruction for instruction, with
-//!   the bitstring family's own statement of its variant set
-//!   ([`crate::families::bitstrings::exec`]'s `Ok(None)` contract) over the committed real
-//!   `.beam` fixtures — so the bypass can neither miss a `Bs*` variant (the router hop stays
-//!   paid) nor take one another family owns;
+//! * the **claim predicate** is the *family's* — one function,
+//!   [`crate::families::bitstrings::claimed`], which the router routes on and both the
+//!   emitter's arm and this helper's body call. One shared assertion pins it against the
+//!   three surfaces that have to agree: the emitted tier's claim set (the emitter's
+//!   `emit_bitstr` arm chooses on it), the **router's** ownership of the family (observed
+//!   by dispatching each instruction through [`crate::families::dispatch`] and watching
+//!   the family's own entry counter), and the family's authority
+//!   ([`crate::families::bitstrings::exec`]'s `Ok(None)` contract);
 //! * it covers **every** `Bs*` variant the router names — each one is asserted on a
 //!   hand-built instance, so a future `Instr` variant cannot silently fall out of the set;
-//! * every other family's instructions keep the generic family route (the predicate declines
-//!   them, and the specialised helper's counter does not move for them);
+//! * every other family's instructions keep their own route (the predicate declines them,
+//!   the router never sends them here, and the specialised helper's counter does not move
+//!   for them) — a claim/decline mismatch therefore cannot happen: what the shared entry
+//!   declines is either another family's instruction or a `jit_step_one` deopt, never a
+//!   `jit_bitstr` call;
 //! * the specialised path is **interpreter-identical** on real fixture functions covering
 //!   matching, string matching, tail reads and construction — while the helper's own counter
 //!   proves the emitted arm actually took it (a cross-tier agreement alone would also hold
@@ -41,10 +47,10 @@ use beam_common::Result;
 use beam_loader::{load_file, BsGetArgs, Instr, Label, Module, Operand, NO_FAIL};
 use beam_term::{Atom, Eterm};
 
-use super::bitstr::{self, bitstr_calls};
-use super::tests::{assert_same_outcome, body_module, with_both_tiers};
+use super::bitstr::bitstr_calls;
+use super::tests::{assert_same_outcome, body_module, run_counting, with_both_tiers};
 use crate::context::MinimalContext;
-use crate::families::bitstrings;
+use crate::families::bitstrings::{self, claimed};
 use crate::interpreter::LabelMap;
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
@@ -72,7 +78,7 @@ const FIXTURE_SET: [&str; 8] = [
 ];
 
 /// Whether the family itself claims `instr`: its own `Ok(None)` contract is the authority
-/// [`bitstr::claimed`] must agree with.
+/// [`claimed`] must agree with.
 fn family_claims(module: &Module, instr: &Instr) -> bool {
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
@@ -83,32 +89,66 @@ fn family_claims(module: &Module, instr: &Instr) -> bool {
     )
 }
 
+/// Whether the **router** sends `instr` to the bitstring family.
+///
+/// Observed rather than re-derived: [`crate::families::dispatch`] *is* the routing table,
+/// and the family's own entry counter
+/// ([`bitstrings::exec_calls`]) says whether the router arrived here. That is the effect of
+/// the router's `_ if bitstrings::claimed(instr)` arm, so the pin stays meaningful even
+/// though both callers name the same predicate.
+fn router_claims(instr: &Instr) -> bool {
+    let module = Module::default();
+    let labels = LabelMap::new();
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let before = bitstrings::exec_calls();
+    // The outcome is irrelevant: this function asks *where the router sent* the instruction,
+    // and a family raise still means the router claimed it.
+    let _ = crate::families::dispatch(
+        &mut machine,
+        &module,
+        &module,
+        &labels,
+        instr,
+        0,
+        0,
+        &mut ctx,
+    );
+    bitstrings::exec_calls() > before
+}
+
 /// **The predicate agrees with the family's own variant set, over real `.beam`s.**
 ///
-/// For every instruction of every fixture, `claimed(instr)` must equal the family's own
-/// answer. Both directions matter:
+/// For every instruction of every fixture, `claimed(instr)` must equal both the family's own
+/// answer **and** the router's decision. All directions matter:
 ///
 /// * a `Bs*` variant the predicate misses keeps paying the router hop (the whole point of the
-///   lever), and
+///   lever), and the router would not have sent it here either;
 /// * a variant the predicate claims but the family does not own would take the router's job
 ///   away from the emitter.
 #[test]
 fn the_route_predicate_agrees_with_the_family_on_real_beam_instructions() {
     let mut checked = 0usize;
-    let mut claimed = 0usize;
+    let mut claimed_count = 0usize;
     for name in FIXTURE_SET {
         let module = fixture(name);
         for (func, function) in module.functions.iter().enumerate() {
             for (pc, instr) in function.code.iter().enumerate() {
-                let ours = bitstr::claimed(instr);
+                let ours = claimed(instr);
                 let theirs = family_claims(&module, instr);
                 assert_eq!(
                     ours, theirs,
                     "{name}:{func}:{pc}: claimed() says {ours} but the family says {theirs} \
                      for {instr:?}"
                 );
+                assert_eq!(
+                    ours,
+                    router_claims(instr),
+                    "{name}:{func}:{pc}: claimed() says {ours} but the router says otherwise \
+                     for {instr:?}"
+                );
                 checked += 1;
-                claimed += usize::from(ours);
+                claimed_count += usize::from(ours);
             }
         }
     }
@@ -117,8 +157,9 @@ fn the_route_predicate_agrees_with_the_family_on_real_beam_instructions() {
         "the fixture set must cover a real instruction corpus (checked {checked})"
     );
     assert!(
-        claimed > 50,
-        "the fixture set must exercise the family's variant set (claimed {claimed} of {checked})"
+        claimed_count > 50,
+        "the fixture set must exercise the family's variant set (claimed {claimed_count} of \
+         {checked})"
     );
 }
 
@@ -268,16 +309,72 @@ fn the_predicate_claims_the_whole_bitstring_family_and_only_it() {
     );
     for instr in &variants {
         assert!(
-            bitstr::claimed(instr),
+            claimed(instr),
             "the predicate must claim every Bs* variant: {instr:?}"
         );
     }
+    for instr in &other_family_instructions() {
+        assert!(
+            !claimed(instr),
+            "the predicate must not claim another family's (or a core-arm) instruction: \
+             {instr:?}"
+        );
+    }
+}
 
-    // The converse: a representative of every **other** family, plus core-loop instructions,
-    // must keep its own route. `GetList`/`PutList` are the `lists` family's, `Try` the
-    // exceptions', `Send`/`LoopRec` the receive family's, `Fmove` the floats', `MakeFun3` the
-    // funs', `PutTuple2`/`GetTupleElement` the tuples', `Move`/`Return`/`Label` core arms.
-    let others = vec![
+/// **One shared assertion: the emitted tier's claim set *is* the router's bitstring
+/// ownership.**
+///
+/// [`claimed`] is the family's single statement of its variant set; the emitter's `emit_bitstr`
+/// arm chooses on it and the router's `_ if bitstrings::claimed(instr)` arm routes on it. This
+/// test is the one place that pins all three surfaces together, so no side can drift:
+///
+/// * **the family's authority** — [`bitstrings::exec`]'s `Ok(None)` contract
+///   ([`family_claims`]);
+/// * **the router's ownership** — observed by dispatching each instruction through the real
+///   [`crate::families::dispatch`] and watching the family's entry counter
+///   ([`router_claims`]), never by re-reading the router's arm; and
+/// * **the emitted tier's claim set** — the same [`claimed`] predicate the emitter's arm and
+///   [`super::bitstr::jit_bitstr`]'s body use.
+///
+/// The hand-built instances are the *set*, so a variant added to the family (or to the router)
+/// without the predicate fails here rather than silently disagreeing about who owns an opcode.
+#[test]
+fn the_emitted_claim_set_is_the_routers_bitstring_ownership() {
+    for instr in every_bitstring_variant() {
+        assert!(
+            claimed(&instr),
+            "the emitted arm must claim every Bs* variant: {instr:?}"
+        );
+        assert!(
+            router_claims(&instr),
+            "the router must route every claimed variant to the family: {instr:?}"
+        );
+        assert!(
+            family_claims(&Module::default(), &instr),
+            "the family must execute every claimed variant: {instr:?}"
+        );
+    }
+    for instr in other_family_instructions() {
+        assert!(
+            !claimed(&instr),
+            "the emitted arm must not claim another family's instruction: {instr:?}"
+        );
+        assert!(
+            !router_claims(&instr),
+            "the router must not route another family's instruction here: {instr:?}"
+        );
+    }
+}
+
+/// A representative of every **other** family, plus core-loop instructions: the converse of
+/// [`every_bitstring_variant`], so "claimed" is not just "always true".
+///
+/// `GetList`/`PutList` are the `lists` family's, `Try` the exceptions', `Send`/`LoopRec` the
+/// receive family's, `Fmove` the floats', `MakeFun3` the funs', `PutTuple2`/`GetTupleElement`
+/// the tuples', and `Move`/`Return`/`Label` are core-loop arms.
+fn other_family_instructions() -> Vec<Instr> {
+    vec![
         Instr::PutList {
             head: Operand::Integer(1),
             tail: Operand::Nil,
@@ -329,14 +426,7 @@ fn the_predicate_claims_the_whole_bitstring_family_and_only_it() {
         },
         Instr::Return,
         Instr::Label(Label(2)),
-    ];
-    for instr in &others {
-        assert!(
-            !bitstr::claimed(instr),
-            "the predicate must not claim another family's (or a core-arm) instruction: \
-             {instr:?}"
-        );
-    }
+    ]
 }
 
 /// The one argument a case row passes to the exported function under test, built **per side**
@@ -485,7 +575,7 @@ fn a_failing_match_agrees_with_the_interpreter_and_still_bypasses_the_router() {
 /// **A non-bitstring family instruction keeps the generic route.**
 ///
 /// The helper's counter must not move for a `put_list` body: the emitted arm claims only
-/// [`bitstr::claimed`]'s variants, and everything else keeps the shared `jit_family` helper.
+/// [`claimed`]'s variants, and everything else keeps the shared `jit_family` helper.
 #[test]
 fn a_non_bitstring_body_keeps_the_generic_family_route() {
     let (module, name) = body_module(vec![
@@ -501,7 +591,7 @@ fn a_non_bitstring_body_keeps_the_generic_family_route() {
     for function in &module.functions {
         for instr in &function.code {
             assert!(
-                !bitstr::claimed(instr),
+                !claimed(instr),
                 "a put_list body must not be claimed: {instr:?}"
             );
         }
@@ -514,5 +604,68 @@ fn a_non_bitstring_body_keeps_the_generic_family_route() {
         bitstr_calls(),
         before,
         "a put_list must not reach the bitstring helper"
+    );
+}
+
+/// **A claim/decline mismatch is impossible**: what the shared entry declines is executed by
+/// `jit_step_one` (the interpreter's own per-instruction path) and never by [`jit_bitstr`].
+///
+/// `bif0` is the representative — the bitstring family does not own it, the emitter has no
+/// inline lowering for it, so the instruction an emitted block meets must take the
+/// per-instruction deopt. The pin is the conjunction of three observations:
+///
+/// * [`claimed`] declines it, and so does the family's own `Ok(None)` and the router
+///   (the shared assertion above);
+/// * at run time it is **`jit_step_one`** that executed it — the tier's
+///   `deopts_by_variant` names `bif0` — so the route a declining instruction takes is the
+///   interpreter's, not the family's;
+/// * the bitstring helper's counter does not move, and both tiers produce the same outcome.
+///
+/// [`jit_bitstr`]: super::bitstr::jit_bitstr
+#[test]
+fn a_declined_variant_is_executed_by_jit_step_one_and_never_by_the_bitstring_helper() {
+    let module = crate::jit::baseline::tests::build_module(
+        "deopt",
+        &[("erlang", "self", 0)],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Bif0 {
+                    bif: beam_loader::ImportRef(0),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(2))],
+    );
+    let name = crate::jit::baseline::tests::export_atom(&module, "f");
+    for function in &module.functions {
+        for instr in &function.code {
+            assert!(!claimed(instr), "`bif0` is not the family's: {instr:?}");
+        }
+    }
+
+    let before = bitstr_calls();
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome("bif0", interpreter, baseline, &module.atom_table);
+    });
+    let (outcome, snapshot) = run_counting(&module, name, Tier::BaselineJit);
+    assert_eq!(
+        bitstr_calls(),
+        before,
+        "a declined variant must never reach the bitstring helper"
+    );
+    assert!(
+        matches!(outcome, Err(_)),
+        "the fixture's unserved BIF is a typed error; saw {outcome:?}"
+    );
+    assert!(
+        snapshot.deopts_by_variant.get("Bif0").copied().unwrap_or(0) > 0,
+        "a declined variant is executed by `jit_step_one`; deopts by variant: {:?}",
+        snapshot.deopts_by_variant,
     );
 }

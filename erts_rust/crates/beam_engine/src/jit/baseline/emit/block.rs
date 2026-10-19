@@ -45,6 +45,7 @@ use std::collections::BTreeMap;
 use beam_common::Result;
 use beam_loader::{ImportRef, Instr, Module};
 
+use crate::families::bitstrings;
 use crate::interpreter::LabelMap;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
@@ -879,22 +880,16 @@ pub(crate) fn emit_block(
             | Instr::WaitTimeout { .. }
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
-            // The **whole bitstring family** — every `Bs*` variant
-            // [`crate::families::dispatch`] routes to `families::bitstrings` — reaches the
-            // family's own body **directly** instead of routing through the dispatcher's
-            // variant match (see [`super::super::bitstr`]). A binary decoder executes these
-            // once per byte of its subject, so the removed hop is the family's most
-            // frequently paid cost. The emitted sequence is the generic family arm's
-            // (`emit_bitstr` and `emit_family` share one emission), so the two are
-            // interchangeable and the outcome is interpreter-identical.
-            Instr::BsStartMatch3 { .. } | Instr::BsStartMatch4 { .. }
-            | Instr::BsGetPosition { .. } | Instr::BsSetPosition { .. }
-            | Instr::BsGetTail { .. } | Instr::BsTestTail2 { .. }
-            | Instr::BsGetInteger2(_) | Instr::BsGetBinary2(_) | Instr::BsSkipBits2 { .. }
-            | Instr::BsMatch { .. } | Instr::BsMatchString { .. } | Instr::BsGetFloat2(_)
-            | Instr::BsGetUtf8 { .. } | Instr::BsGetUtf16 { .. } | Instr::BsGetUtf32 { .. }
-            | Instr::BsSkipUtf8 { .. } | Instr::BsSkipUtf16 { .. } | Instr::BsSkipUtf32 { .. }
-            | Instr::BsInitWritable | Instr::BsCreateBin { .. } => {
+            // The **whole bitstring family** — exactly the variants the family's own
+            // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
+            // also what [`crate::families::dispatch`] routes on — reaches the family's own
+            // body **directly** instead of routing through the dispatcher's variant match
+            // (see [`super::super::bitstr`]). A binary decoder executes these once per byte
+            // of its subject, so the removed hop is the family's most frequently paid cost.
+            // The emitted sequence is the generic family arm's (`emit_bitstr` and
+            // `emit_family` share one emission), so the two are interchangeable and the
+            // outcome is interpreter-identical.
+            _ if bitstrings::claimed(instr) => {
                 emit_bitstr(buffer, allocation, done, func, pc)?
             }
             // The **whole family-owned surface** the interpreter's `other` arm hands to

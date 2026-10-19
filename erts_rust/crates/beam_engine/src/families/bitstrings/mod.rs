@@ -31,11 +31,18 @@
 //!   [`Instr::BsSkipUtf8`], [`Instr::BsSkipUtf16`], [`Instr::BsSkipUtf32`]
 //! - construction: [`Instr::BsInitWritable`], [`Instr::BsCreateBin`]
 //!
-//! The work is split by responsibility: this file holds [`exec`] (the dispatch) and
-//! the helpers shared by both halves; [`matching`] holds the match side
+//! The work is split by responsibility: this file holds [`exec`] (the dispatch),
+//! [`claimed`] (the family's one statement of its variant set) and the helpers shared
+//! by both halves; [`matching`] holds the match side
 //! (`bs_start_match*`, `bs_match`, the reads); [`create`] holds construction
 //! (`bs_create_bin`); [`raw`] is the family's single `#[allow(unsafe_code)]` module
 //! for the `ErlSubBits`/`ErlHeapBits` raw layouts.
+//!
+//! [`exec`] is the **only** entry into the family, and it is what every caller uses:
+//! the router ([`crate::families::dispatch`], for a `Bs*` instruction the interpreter
+//! reaches from its catch-all arm) and the native baseline tier's in-block helper
+//! (`jit::baseline::bitstr::jit_bitstr`). The exception-class anchor and the
+//! operand/term work therefore live here once, never in a caller.
 //!
 //! # Match-context model
 //!
@@ -112,10 +119,60 @@ pub(super) const BSF_SIGNED: u32 = 4;
 /// the literal-atom-list route ([`decode_flags`]).
 pub(super) const BSF_NATIVE: u32 = 16;
 
+/// `true` for exactly the variants this family owns.
+///
+/// The family's **single source of truth** for its variant set. [`exec`] answers
+/// `Ok(None)` for every other instruction, and every caller that has to decide
+/// "does the bitstring family own this opcode?" *before* executing it asks this
+/// predicate instead of re-listing the variants: the router
+/// ([`crate::families::dispatch`]) and the native baseline tier (its emitted arm in
+/// `jit::baseline::emit::block` and its in-block helper in `jit::baseline::bitstr`)
+/// both do, so the three can never disagree about who owns an opcode.
+///
+/// The predicate is **purely syntactic** (the instruction's own variant), which is
+/// what lets the native tier take the decision at compile time and skip it at
+/// execution time.
+pub(crate) fn claimed(instr: &Instr) -> bool {
+    matches!(
+        instr,
+        Instr::BsStartMatch3 { .. }
+            | Instr::BsStartMatch4 { .. }
+            | Instr::BsGetPosition { .. }
+            | Instr::BsSetPosition { .. }
+            | Instr::BsGetTail { .. }
+            | Instr::BsTestTail2 { .. }
+            | Instr::BsGetInteger2(_)
+            | Instr::BsGetBinary2(_)
+            | Instr::BsSkipBits2 { .. }
+            | Instr::BsMatch { .. }
+            | Instr::BsMatchString { .. }
+            | Instr::BsGetFloat2(_)
+            | Instr::BsGetUtf8 { .. }
+            | Instr::BsGetUtf16 { .. }
+            | Instr::BsGetUtf32 { .. }
+            | Instr::BsSkipUtf8 { .. }
+            | Instr::BsSkipUtf16 { .. }
+            | Instr::BsSkipUtf32 { .. }
+            | Instr::BsInitWritable
+            | Instr::BsCreateBin { .. }
+    )
+}
+
 /// Execute a bitstring-family instruction.
 ///
 /// Returns `Ok(Some(step))` when `instr` is a `Bs*` opcode this family executes,
 /// `Ok(None)` when `instr` is not this family's variant, and `Err` on a raise.
+///
+/// This is the family's **one** entry, so it also owns the exception-class anchor
+/// (`Machine::ensure_class_atoms`): a raise that lands in a live `try`/`catch` frame
+/// names its class from the engine's live atom namespace (with the module snapshot
+/// as the fallback), and without the resolution a family raise whose class atom the
+/// *module's* table cannot name would select its catch frame and then abandon it
+/// with a typed `unsupported` instead of landing. The router runs the same latch
+/// before it routes to any family, so on the routed path this is one `bool` load and
+/// a not-taken branch — but the entry cannot assume it has a router in front of it:
+/// the native baseline tier's in-block helper
+/// (`jit::baseline::bitstr::jit_bitstr`) calls it directly.
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
@@ -125,6 +182,11 @@ pub(crate) fn exec(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
+    if !machine.class_atoms_live {
+        machine.ensure_class_atoms(ctx, module);
+    }
+    #[cfg(test)]
+    EXEC_CALLS.with(|calls| calls.set(calls.get() + 1));
     if let Some(step) = matching::exec(machine, module, labels, instr, func, pc, ctx)? {
         return Ok(Some(step));
     }
@@ -132,6 +194,25 @@ pub(crate) fn exec(
         return Ok(Some(step));
     }
     Ok(None)
+}
+
+/// How many times [`exec`] has been entered on this thread.
+///
+/// Test-only structural instrument (`#[cfg(test)]`-gated, so a production build
+/// carries no counter at all): it is how a test observes **where the router sent** an
+/// instruction — [`crate::families::dispatch`] reaching this family is the router's
+/// own statement that the bitstring family owns the variant — without re-deriving the
+/// router's routing table in the test. Per-thread and monotonic, so a caller takes a
+/// `before`/`after` pair around the dispatch it is describing.
+#[cfg(test)]
+pub(crate) fn exec_calls() -> u64 {
+    EXEC_CALLS.with(std::cell::Cell::get)
+}
+
+// The `exec_calls` counter's per-thread storage (test builds only).
+#[cfg(test)]
+thread_local! {
+    static EXEC_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1060,53 @@ impl BitWriter {
 mod tests {
     use super::*;
     use beam_loader::Module;
+
+    /// **The family entry installs the exception-class anchor itself**, so a caller that
+    /// bypasses the router (the native baseline tier's in-block helper) still gets a raise
+    /// that lands in a live `try`/`catch` frame.
+    ///
+    /// The three class atoms are resolved from the engine's live namespace on [`exec`]'s own
+    /// entry — not by a caller and not only by [`crate::families::dispatch`]'s pre-routing
+    /// latch — which is what makes the router an optimisation rather than a precondition.
+    #[test]
+    fn exec_installs_the_class_atom_anchor_for_a_direct_caller() {
+        // A module that names none of the class atoms; the host's live namespace names them.
+        let module = Module::default();
+        let mut live = module.atom_table.clone();
+        for name in ["error", "exit", "throw"] {
+            live.intern(name);
+        }
+        let error = live.lookup("error").expect("the namespace names error");
+        let mut ctx = crate::context::MinimalContext::with_shared_atoms(live);
+        let labels = LabelMap::new();
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("a frame");
+        machine.push_catch_frame(crate::machine::CatchFrame::new(2, 5, 0));
+        assert!(!machine.class_atoms_live, "a fresh machine has no anchor");
+
+        // An instruction this family **declines** is enough: the anchor is the entry's own
+        // responsibility and is installed before the variant check.
+        let declined = Instr::Move {
+            src: Operand::Nil,
+            dst: Operand::X(0),
+        };
+        assert!(!claimed(&declined), "a `move` is not the family's");
+        let step = exec(&mut machine, &module, &labels, &declined, 0, 0, &mut ctx)
+            .expect("a declined variant is `Ok(None)`, not an error");
+        assert!(step.is_none(), "the family declines a `move`");
+        assert!(
+            machine.class_atoms_live,
+            "the family entry installed the anchor itself"
+        );
+
+        // A class-`error` raise therefore lands in the live frame instead of being abandoned
+        // with a typed `unsupported`.
+        let step = machine
+            .throw_error(Eterm::from_raw(0x77))
+            .expect("the class atom came from the live namespace");
+        assert_eq!(step, Step::Goto { func: 2, pc: 5 });
+        assert_eq!(machine.x(3), Some(make_atom(error)), "x(3) = the class atom");
+    }
 
     /// Decode a single flag atom of `module` through [`flag_bit`].
     fn bit_of(module: &Module, name: &str) -> u32 {
