@@ -1187,7 +1187,239 @@ fn resolve_send_target_maps_pids_and_live_aliases_and_rejects_other_references()
     }
 }
 
-/// Puts the runtime's **own** reference allocator onto `id`, so its next draw mints exactly `id`.
+// ---------------------------------------------------------------------------
+// The **remote alias** send arm (contract A.5): a reference naming another node is
+// `{DOP_ALIAS_SEND, From, To} -- Msg` (`dist.c:2563`) — the wire form `gen:reply/2` needs to
+// answer a caller on another node (`../lib/stdlib/src/gen.erl:549-556`).
+// ---------------------------------------------------------------------------
+
+/// A runtime that **is** a distributed node, so [`Runtime::dist_client`] is `Some` and the
+/// outbound link table exists; `None` (the caller then skips **loudly**) when the sandbox cannot
+/// bind a listener — the same rule `src/info/dist.rs`'s node case and the link/unlink front-door
+/// case apply.
+fn distributed_runtime(label: &str) -> Option<Runtime> {
+    let node = format!("{label}@localhost");
+    match Runtime::new(RuntimeConfig::default().with_node_name(node.as_str())) {
+        Ok(rt) => {
+            assert!(
+                rt.dist_client().is_some(),
+                "a node name installs the connecting half — the premise of every case here"
+            );
+            Some(rt)
+        }
+        Err(error) => {
+            eprintln!("SKIP {label}: could not bind a distribution listener ({error})");
+            None
+        }
+    }
+}
+
+/// An **external reference** term for `node`, with `ids`/`creation` in its wire slots, plus the
+/// heap that owns it (the caller keeps it alive for as long as it reads the term).
+fn external_reference(
+    runtime: &mut Runtime,
+    node: &str,
+    ids: &[u32],
+    creation: u32,
+) -> (beam_alloc::Heap, Eterm) {
+    let node = make_atom(runtime.code_server_atoms_mut().intern(node));
+    let mut heap = beam_alloc::Heap::new(64).expect("a scratch heap");
+    let term = beam_codec::term::make_external_ref(&mut heap, node, ids, creation)
+        .expect("an external reference");
+    (heap, term)
+}
+
+/// A reference naming **another** node classifies as [`SendDestination::RemoteAlias`], carrying
+/// the destination term verbatim — the alias-send arm, reached only because the node in the
+/// reference's node slot is not this runtime's own.
+///
+/// That the peer's reply path works at all depends on it: `gen:reply/2` sends to the alias
+/// reference the caller put in `From`, so a caller on another node is unanswerable without a
+/// transmitted `DOP_ALIAS_SEND`.
+#[test]
+fn a_remote_reference_classifies_as_a_remote_alias() {
+    let Some(mut rt) = distributed_runtime("send_remote_alias") else {
+        return;
+    };
+    let local_node = rt.local_node();
+    let (_heap, remote) = external_reference(&mut rt, "peer@localhost", &[1, 2, 3], 7);
+    // The premise: the reference really names a *different* node than this runtime's own.
+    assert_ne!(
+        beam_codec::term::external_ref_parts(remote)
+            .expect("an external reference")
+            .0,
+        make_atom(local_node),
+        "the reference must name another node for this arm to apply"
+    );
+
+    let ctx = RuntimeContext::new(&mut rt);
+    let destination = ctx
+        .resolve_send_destination(remote)
+        .expect("a reference on another node is a destination");
+    assert!(
+        matches!(&destination, super::send::SendDestination::RemoteAlias { to } if *to == remote),
+        "an external reference for another node is the alias-send arm, carrying the term verbatim"
+    );
+    assert!(
+        !matches!(
+            &destination,
+            super::send::SendDestination::RemotePid { .. }
+                | super::send::SendDestination::Local { .. }
+        ),
+        "a reference is neither an external pid nor a local delivery"
+    );
+    // Nothing was delivered locally: the transmission is the only side effect, and it happens in
+    // `deliver_remote` (which needs `&mut Runtime`), never in the classification.
+    let owner = ctx.mailbox_pid;
+    assert_eq!(
+        queued_payloads(ctx.runtime, owner),
+        Vec::<Eterm>::new(),
+        "classification delivers nothing"
+    );
+}
+
+/// The **arm-ordering regression pin**: an external **pid** naming another node still classifies
+/// as [`SendDestination::RemotePid`] (the earlier arm), never as the new reference arm.
+#[test]
+fn an_external_pid_still_classifies_as_a_remote_pid() {
+    let Some(mut rt) = distributed_runtime("send_remote_pid") else {
+        return;
+    };
+    // `remote_pid` builds `[header, node, …]` with an external **pid** tag, so the reference arm
+    // must not claim it (the two things are both boxed and both name a node).
+    let (_heap, remote) = remote_pid(&mut rt, "peer@localhost");
+
+    let ctx = RuntimeContext::new(&mut rt);
+    let destination = ctx
+        .resolve_send_destination(remote)
+        .expect("a pid on another node is a destination");
+    assert!(
+        matches!(&destination, super::send::SendDestination::RemotePid { to } if *to == remote),
+        "an external pid keeps classifying as a remote pid"
+    );
+    assert!(
+        !matches!(
+            &destination,
+            super::send::SendDestination::RemoteAlias { .. }
+        ),
+        "an external pid is not an alias send"
+    );
+}
+
+/// A reference whose node **is** this runtime's node — and which names no live alias — stays the
+/// typed `badarg` the local rule has always answered: the new remote arm must not shadow it.
+///
+/// This is the distinction the differential corpus pins on a **node**: the local reference
+/// semantics are unchanged even where a link table exists.
+#[test]
+fn a_reference_on_this_node_that_is_not_a_live_alias_is_badarg() {
+    let Some(mut rt) = distributed_runtime("send_local_ref") else {
+        return;
+    };
+    let local_name = rt
+        .node_name()
+        .expect("this runtime is a node")
+        .to_string();
+    let (_heap, on_node) = external_reference(&mut rt, &local_name, &[9], 3);
+    assert_eq!(
+        beam_codec::term::external_ref_parts(on_node)
+            .expect("an external reference")
+            .0,
+        make_atom(rt.local_node()),
+        "the reference names this very node (the premise)"
+    );
+
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert!(
+        matches!(
+            ctx.resolve_send_destination(on_node),
+            Err(BeamError::BadArg)
+        ),
+        "a reference on this node that is not a live alias is badarg"
+    );
+    assert!(
+        matches!(ctx.resolve_send_target(on_node), Err(BeamError::BadArg)),
+        "the local-only resolver answers the same"
+    );
+    let owner = ctx.mailbox_pid;
+    assert!(
+        matches!(ctx.send_message(on_node, make_small(4)), Err(BeamError::BadArg)),
+        "the compiled send answers badarg too"
+    );
+    assert_eq!(
+        queued_payloads(ctx.runtime, owner),
+        Vec::<Eterm>::new(),
+        "nothing was delivered"
+    );
+}
+
+/// A **live** alias on this node still classifies as a local delivery carrying the reference to
+/// consume — the new arm did not shadow the local alias path (which `gen_server:reply/2`'s
+/// `Alias ! {Tag, Reply}` depends on, on a node too).
+#[test]
+fn a_live_local_alias_still_classifies_as_a_local_delivery() {
+    let Some(mut rt) = distributed_runtime("send_local_alias") else {
+        return;
+    };
+    let owner = rt.self_pid();
+    let alias = rt
+        .processes
+        .create_alias(owner, beam_process::UnaliasMode::ReplyDemonitor)
+        .expect("a live owner mints an alias");
+    let alias_term = alias_reference_term(&mut rt, alias);
+
+    let ctx = RuntimeContext::new(&mut rt);
+    let destination = ctx
+        .resolve_send_destination(alias_term)
+        .expect("a live alias is a destination");
+    assert!(
+        matches!(
+            &destination,
+            super::send::SendDestination::Local {
+                target,
+                reference: Some(reference),
+            } if *target == owner && *reference == alias
+        ),
+        "a live alias on this node is a local delivery that consumes its reference"
+    );
+    assert!(
+        !matches!(
+            &destination,
+            super::send::SendDestination::RemoteAlias { .. }
+        ),
+        "a live local alias is never transmitted"
+    );
+}
+
+/// On a runtime that is **not** a node (`dist_client()` is `None`) a reference naming another
+/// node keeps its existing typed `badarg`: there is no link table to transmit over, so a
+/// non-distributed runtime's observable behaviour is unchanged.
+#[test]
+fn a_remote_reference_on_a_non_distributed_runtime_is_still_badarg() {
+    let mut rt = runtime();
+    assert!(
+        rt.dist_client().is_none(),
+        "the default runtime is not a distributed node (the premise)"
+    );
+    let (_heap, remote) = external_reference(&mut rt, "peer@localhost", &[4], 1);
+
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert!(
+        matches!(ctx.resolve_send_destination(remote), Err(BeamError::BadArg)),
+        "without a node a remote reference is still badarg"
+    );
+    assert!(
+        matches!(ctx.send_message(remote, make_small(5)), Err(BeamError::BadArg)),
+        "the compiled send answers badarg too"
+    );
+    assert!(
+        matches!(
+            ctx.call_bif("erlang", "send", 2, &[remote, make_small(5)]),
+            Err(BeamError::BadArg)
+        ),
+        "and so does the erlang:send/2 BIF"
+    );
+}/// Puts the runtime's **own** reference allocator onto `id`, so its next draw mints exactly `id`.
 ///
 /// [`beam_process::RefAllocator`] is monotone from `0`, so advancing a fresh allocator `id` times
 /// lands the *next* draw on `id`: the deterministic way to force the runtime's reference id space
