@@ -85,7 +85,9 @@ use libc::c_void;
 /// ordered by the term word so a caller sees a deterministic list; the order carries no meaning.
 ///
 /// This is the reachability question's input, not its answer: which of these terms is still live is
-/// the caller's decision (see [`release_resource_terms`]).
+/// the caller's decision (see [`release_resource_terms`]). A returned word is only meaningful while
+/// the heap that backs it is alive — a caller that needs identity alone (the usual case, e.g.
+/// comparing against its root set) should compare [`Eterm::raw`] values rather than inspect the term.
 pub fn resource_terms() -> Vec<Eterm> {
     let mut words: Vec<usize> = with_registry(|r| r.terms.keys().copied().collect());
     // A `HashMap`'s iteration order is unspecified; sorting makes the snapshot reproducible.

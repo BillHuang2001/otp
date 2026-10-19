@@ -765,6 +765,22 @@ fn resource_terms_reports_the_live_set_and_shrinks_after_the_prune() {
     assert_eq!(RUNS.load(AtomicOrdering::Relaxed) - base, 1);
 }
 
+/// The seam is reachable at both documented public paths — `nif::enif::resources::*` (where it is
+/// implemented) and `nif::enif::*` (the family re-export) — because the next `beam_rt` round
+/// implements the caller side against them.
+#[test]
+fn the_release_seam_is_publicly_reachable() {
+    // Every live term is called reachable here, so nothing is released (and the shared registry of
+    // this test binary is left untouched).
+    assert_eq!(crate::nif::enif::resources::release_resource_terms(|_| true), 0);
+    assert_eq!(crate::nif::enif::release_resource_terms(|_| true), 0);
+    assert_eq!(
+        crate::nif::enif::resources::resource_terms(),
+        crate::nif::enif::resource_terms(),
+        "both paths designate the same live set"
+    );
+}
+
 /// Concurrent prunes of the same term release it **exactly once**: the binding removal under the
 /// registry lock hands it to one thread only.
 #[test]
