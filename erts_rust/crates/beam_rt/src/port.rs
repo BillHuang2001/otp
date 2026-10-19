@@ -183,10 +183,10 @@ use beam_engine::terms;
 use libc::c_int;
 use beam_io::{
     Driver, DriverRegistry, Event, Poller, PortCommandOptions, PortCommandOutcome, PortExitReason,
-    PortNotification, PortRegistry as IoPortRegistry, ReadMessage, SpawnDriver, SpawnOptions,
-    SpawnSpec, SpawnStream, StreamOptions, PORT_REDS_EXECUTE,
+    PortNotification, PortRegistry as IoPortRegistry, PortTaskOutcome, ReadMessage, SpawnDriver,
+    SpawnOptions, SpawnSpec, SpawnStream, StreamOptions, PORT_REDS_EXECUTE,
 };
-use beam_process::{PortId, PortTable, ProcessId, ProcessTable};
+use beam_process::{PortId, PortMonitor, PortTable, ProcessId, ProcessTable};
 use beam_term::{
     atom_val, is_atom, is_small, make_atom, make_small, signed_value, try_make_small, AtomTable,
     Eterm, NIL,
@@ -1101,6 +1101,24 @@ pub struct PortRegistry {
     /// inherits an entry: it is consumed by the read it was recorded for, dropped when the port's
     /// `Closed` report is folded, and cleared when a new port registers under that number.
     failed_read_recipients: HashMap<u64, FailedReadRecipient>,
+    /// Every live port's incoming monitor set, read from the authoritative
+    /// [`beam_process::PortTable`] **immediately before** each port-task round — the reading a
+    /// **driver-failed** port's `'DOWN'` messages are built from (see
+    /// [`PortRegistry::fail_port`](super::PortRegistry)).
+    ///
+    /// The failure channel needs it because a round that reaps a driver-failed port mints that
+    /// port's [`PortNotification::Closed`] report in the very same call, and minting is what
+    /// retires its **number** ([`beam_io::PortRegistry::execute_port_tasks`] →
+    /// `take_closed_notifications` → [`PortTable::release`]) — which drops the number's incoming
+    /// monitors along with its owner and links. [`PortRegistry::drain_failures`] therefore runs
+    /// strictly *after* the port has left the table, so this
+    /// [`PortRegistry::capture_round_monitors`] reading is the last truthful statement of who was
+    /// watching it.
+    ///
+    /// Replaced (never accumulated) by every round, so an entry belongs to the round that is
+    /// about to run and is consumed by the failure that round reaps; a port that survives the
+    /// round is simply re-read next time.
+    pre_round_monitors: HashMap<u64, Vec<PortMonitor>>,
 }
 
 impl PortRegistry {
@@ -1131,6 +1149,7 @@ impl PortRegistry {
             pending_events: Vec::new(),
             pending_port_signals: exit::PendingPortSignals::default(),
             failed_read_recipients: HashMap::new(),
+            pre_round_monitors: HashMap::new(),
         })
     }
 
@@ -1194,6 +1213,66 @@ impl PortRegistry {
         }
     }
 
+    /// Reads every live port's incoming monitor set into
+    /// [`PortRegistry::pre_round_monitors`] — **before** the round that may reap one of them.
+    ///
+    /// This is the failure channel's only chance: [`beam_io::PortRegistry::execute_port_tasks`]
+    /// reaps a driver-failed port and then mints its close report in the same call, and minting
+    /// retires the port's number, which is what drops its monitors from the
+    /// [`PortTable`](beam_process::PortTable). The drain that renders the failure's `'DOWN'`
+    /// messages runs after the round, so it must find them here.
+    ///
+    /// Only a port that actually has watchers takes an entry, so a runtime whose ports are
+    /// unmonitored pays one hash probe per live port and allocates nothing. (A round already
+    /// collects and sorts the whole port-number list twice, so the probe is not the cost.)
+    fn capture_round_monitors(&mut self) {
+        // Field-level destructuring keeps the three borrows disjoint: `PortTable` is reached
+        // through `registry`, the port list from `meta`, and the snapshot written here.
+        let PortRegistry {
+            registry,
+            meta,
+            pre_round_monitors,
+            ..
+        } = self;
+        pre_round_monitors.clear();
+        for number in meta.keys() {
+            let monitors = registry.port_table().monitors(PortId::new(*number));
+            if !monitors.is_empty() {
+                pre_round_monitors.insert(*number, monitors.to_vec());
+            }
+        }
+    }
+
+    /// Runs one `beam_io` port-task round — the crate's single entry to
+    /// [`beam_io::PortRegistry::execute_port_tasks`].
+    ///
+    /// The round is where a driver's own `driver_failure*`/`driver_exit` is reaped *and* where
+    /// the reaped port's close report retires its number, so the monitor snapshot that teardown
+    /// needs is taken first (see [`PortRegistry::capture_round_monitors`]). Every other step is
+    /// `beam_io`'s, unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As for [`beam_io::PortRegistry::execute_port_tasks`] — a driver error raised while a task
+    /// runs; the round's closes then stay queued for the next one.
+    fn run_port_tasks(&mut self, reds_budget: usize) -> Result<PortTaskOutcome> {
+        self.capture_round_monitors();
+        self.registry.execute_port_tasks(&mut self.poller, reds_budget)
+    }
+
+    /// Runs one `beam_io` readiness round — [`beam_io::PortRegistry::handle_events`], the round
+    /// that exists only to mint outstanding close reports.
+    ///
+    /// It reaps a driver-failed port exactly as [`PortRegistry::run_port_tasks`] does, so it
+    /// takes the same monitor snapshot first.
+    ///
+    /// # Errors
+    ///
+    /// As for [`beam_io::PortRegistry::handle_events`].
+    fn handle_port_events(&mut self, events: &[Event]) -> Result<PortTaskOutcome> {
+        self.capture_round_monitors();
+        self.registry.handle_events(&mut self.poller, events)
+    }
     /// Arms a **one-shot** read interest on the tty descriptor (fd 0) for `owner` — the
     /// `enif_select` half of `prim_tty:tty_select/2` (see [`tty`]).
     ///
@@ -1443,10 +1522,10 @@ impl PortRegistry {
         }
         // The command is only queued and its task scheduled; run the round now so the write really
         // happened (and so a driver port's `output` callback has answered) before the caller is
-        // told `true`.
-        let round = self
-            .registry
-            .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE);
+        // told `true`. A driver that closes its own port from that very callback is reaped and
+        // retired by this round, which is why the round is entered through
+        // [`PortRegistry::run_port_tasks`] (it snapshots the monitors the teardown owes).
+        let round = self.run_port_tasks(PORT_REDS_EXECUTE);
         let refused = match round {
             Ok(outcome) => {
                 // The round harvested the replies the drivers just wrote (and every other live
@@ -1993,9 +2072,7 @@ impl PortRegistry {
                     self.registry.schedule_events(&port_events);
                 }
             }
-            let outcome = self
-                .registry
-                .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
+            let outcome = self.run_port_tasks(PORT_REDS_EXECUTE)?;
             // The **completion channel** is drained on *every* round, immediately after the
             // tasks: a driver stages an `{inet_reply, …}`/`{inet_async, …}` from inside a task
             // (or from `output`/`control`), and the port keeps it until a drain takes it, so
