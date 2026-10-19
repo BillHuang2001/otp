@@ -125,12 +125,48 @@
 //! runtime, so it rides the per-round drive point `beam_io`'s port-task round already runs for a
 //! driver whose `has_pending_async` answers `true`: [`DriverPortAdapter::has_pending_async`] reports
 //! the tree, and [`DriverPortAdapter::drive_async`] fires one callback per monitor taken from it
-//! (taking it removes it, as the C does when a monitor fires). That hook is named for `driver_async`
-//! — which stays a typed gap, see below — but it is the one per-round driver entry point this
-//! runtime has, and both are "work that must be handed to the driver between rounds". The teardown
-//! guards are [`beam_io::Driver::stop`] and the `Drop` impl, each of which empties the tree before
-//! the library is unloaded. What marks a monitor pending is the *runtime's* observation of a process
-//! exit (a higher scope's obligation): the tree never fires anything on its own.
+//! (taking it removes it, as the C does when a monitor fires). That hook is the one per-round driver
+//! entry point this runtime has, and it carries both "work that must be handed to the driver
+//! between rounds" kinds — a fired monitor *and* a finished `driver_async` job (see the next
+//! section). The teardown guards are [`beam_io::Driver::stop`] and the `Drop` impl, each of which
+//! empties the tree before the library is unloaded. What marks a monitor pending is the *runtime's*
+//! observation of a process exit (a higher scope's obligation): the tree never fires anything on its
+//! own.
+//!
+//! # `driver_async` (the C async-job pool, `+A N`)
+//!
+//! `driver_async` is the C's asynchronous job submission (`erl_async.c:541-617`), and it is wired
+//! end to end:
+//!
+//! * [`DriverHost::async_pool`] answers the host's pool handle, which is
+//!   [`beam_abi`](beam_abi::driver::async_pool)'s implementation of the C's `ErtsAsync` machinery —
+//!   the threads, the monotonic job ids and the `async_free` bookkeeping. `driver_async` therefore
+//!   returns what the C returns: the **positive id** of a queued job (`:600`), or `0` when the pool
+//!   ran it inline on the calling thread — the `+A 0` configuration (`:603-616`). Without a pool
+//!   the frozen seam's legacy hook (default `-1`) would answer instead, which is exactly the
+//!   divergence this wiring closes.
+//! * The pool is drained once per **port round** by
+//!   [`PortRegistry::pump`](crate::port::PortRegistry::pump), which routes each completed job to the
+//!   port it belongs to through the shared [`AsyncReady`] handle; that port's
+//!   [`beam_io::Driver::drive_async`] point then calls the driver's `ready_async` — the C's
+//!   `call_async_ready` → `async_ready` (`erl_async.c:318-345`, `io.c:5374-5406`) — and applies the
+//!   completion policy: `ready_async` took the data (`need_free = 0`) ⇒ the job's `async_free` does
+//!   **not** run; no `ready_async` slot, or a port that is gone, ⇒ it does.
+//! * `+A 0`'s inline path hands the data off **before** this host can reach the entry (the entry and
+//!   the driver's private state are sibling fields of [`Driver`], not of the host), so
+//!   [`DriverHost::deliver_ready_async`] records the pair on the port's [`AsyncReady`] and
+//!   [`DriverPortAdapter::drive_async`] delivers it at the port's next drive point. A driver with
+//!   **no** `ready_async` slot is answered `NeedFree` on the spot, so its `async_free` runs exactly
+//!   as the C's does.
+//! * A port that closes with jobs still in flight keeps its library **mapped** until they are gone
+//!   ([`AsyncReady::defer_unload`]): `dlclose` under a worker thread that can still enter the
+//!   driver's `async_invoke` would be undefined behaviour. That is the C's own reference duty
+//!   (`erts_ddll_reference_referenced_driver` at submit, released at completion,
+//!   `erl_async.c:236-237`, `:343-344`), which the Rust pool cannot perform for itself.
+//!
+//! Bytes a `ready_async` writes through `driver_output` reach the owner as `{Port, {data, …}}` by
+//! the ordinary read path: [`DriverPortAdapter::drive_async`] ends with the same
+//! [`DriverPortAdapter::settle`] every other callback uses.
 //!
 //! # The liveness view behind `driver_monitor_process` (the C's `1`)
 //!
@@ -146,13 +182,6 @@
 //!
 //! # What is NOT wired yet (the typed gaps)
 //!
-//! * **`driver_async` / `driver_async_cancel`.** `Runtime` is `!Send` (it owns `Rc`/`RefCell`
-//!   tables, a `dlopen`ed library registry and pointer-stable term arenas), so a worker thread
-//!   cannot call back into it and there is no async pool to schedule on. The C's *in-band* path
-//!   (no pool ⇒ invoke in the caller, then `ready_async`, then `async_free` unless `ready_async`
-//!   is present — `erl_async.c:604-613`) needs the driver's private state and entry, which the
-//!   frozen [`DriverHost`] seam does not give the host. It is reported as the C's own failure code
-//!   (`-1`) rather than faked.
 //! * **`driver_control`'s reply *source*.** The entry's `control` callback behind `port_control/3`
 //!   **is** routed ([`DriverPortAdapter::control`]), but the C lets a driver answer from a buffer it
 //!   allocated itself (`*resp_bufp = driver_alloc(…)`, `io.c:4141-4168`), and reading that raw
@@ -177,6 +206,7 @@ use beam_abi::driver::types::{
     ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlIOVec,
     ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
+use beam_abi::driver::{AsyncPool, CompletedAsync, ReadyDelivery};
 use beam_abi::driver::types::ERL_DRV_FLAG_SOFT_BUSY;
 use beam_abi::driver::types::ErlDrvPDL;
 use beam_abi::{
@@ -202,6 +232,7 @@ use beam_io::{DriverContext, Interest, Token};
 use beam_process::{PortId, ProcessId};
 use beam_term::{make_atom, refc::ERL_ONHEAP_BINARY_LIMIT, Atom, AtomTable, Eterm};
 
+use super::async_ready::AsyncReady;
 use super::ProcessLiveness;
 /// The atoms a driver first interned inside a callback, awaiting the port layer's commit.
 ///

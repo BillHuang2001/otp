@@ -169,6 +169,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub mod driver;
+pub(crate) mod async_ready;
 pub(crate) mod completion;
 pub(crate) mod exit;pub(crate) mod info_extras;
 pub(crate) mod ops;
