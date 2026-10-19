@@ -342,6 +342,24 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   call actually interns a name; the `term_to_binary` fun-identity bridge reuses the code server's
   generation-cached module snapshot); dispatch/throughput figures and their measurement caveats live
   in `../tools/bench/RESULTS.md`.
+- **The off-heap refc-binary reclamation loop is closed end to end** (trigger + reachability sweep +
+  a host seam), across four crates: `beam_gc` owns the algorithm and the accounting model
+  (`BinVheap`, `for_each_reachable_binary_payload`, `HeapFootprint`), `beam_engine` exposes the
+  machine's reservoir, `beam_process` publishes/adopts the figure, and `beam_rt` drives all of it at
+  the runner's park arm. A payload an off-heap-building loop discards is released at the next park,
+  so a no-retention loop is flat in N instead of linear.
+- **Measured on the unmodified EMQX `emqx_base62:encode/1`** (identical `.beam` for every leg,
+  release builds, paired startup-cancelled rounds on a shared host, rust N=60 000 / oracle
+  N=3 000 000): with the prune disabled `erlang:memory(binary)` is a perfectly linear **1 072 B/call**
+  (1 072 000 B @N=1000 → 10 720 000 B @N=10000, `VmHWM` 132.1 MB → 878.7 MB @N=600 000 — ~10 GB at
+  10 M encodes); with it enabled it is flat (272 288 B → 315 168 B, i.e. +42 880 B over 9 000 extra
+  calls of one-off heap growth, `VmHWM` 119.8–119.9 MB at every N), the oracle sitting at ~21–32 KB.
+  ns/call ratio post/pre **0.885** (bound 0.885–0.958 over two sessions ≈ 4–12 %), post/oracle
+  **27.4×**. It is a **capacity** fix, not a throughput one — the leaked payloads were unreferenced
+  and never traversed, so no memory-pressure cliff existed. Per-node detail and the residuals
+  (the prune cadence is the park cadence; the `-eval` route never prunes; a `Wait` park declines)
+  live in `beam_rt/src/runner/CONTEXT.md`, `beam_gc/CONTEXT.md` and
+  `beam_rt/tests/off_heap_reclaim.rs`; the canonical benchmark table stays `../tools/bench/RESULTS.md`'s.
 - **Dependency edges beyond the scaffold:** `beam_message → beam_gc`, `beam_dist → beam_alloc`,
   **`beam_engine → beam_alloc`** (wave 0 → wave 4, directionally legal — for the off-heap refc binaries
   `bs_init_writable`/`append` hold); `RefCount` moved down into `beam_alloc` (the LCA) and re-exported
