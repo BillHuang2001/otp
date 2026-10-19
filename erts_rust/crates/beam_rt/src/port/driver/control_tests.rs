@@ -46,6 +46,13 @@
 //! reached the driver as the **parsed integer** and the request bytes with their **real length** —
 //! not a substituted command and not a truncated buffer.
 //!
+//! The `command` string therefore carries three fields — the object path, the address of the host's
+//! `set_port_control_flags` entry point and the marker path — of which only the first is required
+//! (see the fixture's `rt_start`). The address is there because a driver `.so` cannot *import*
+//! that symbol from this binary: a `--lib` unit-test harness publishes no global dynamic symbol at
+//! all, so `dlopen` would fail with `undefined symbol: set_port_control_flags`. The oracle probe in
+//! [`control_reply_oracle_tests`](super::control_reply_oracle_tests) compiles the **same** source
+//! and hands no address, because a real emulator does export the symbol (`nm -D beam.smp`).//!
 //! The reply verbs are chosen so the reply cannot be confused with the request: `RT_CTL_REVERSE`
 //! **reverses** the request (so a reply that happened to echo the caller's own buffer would fail),
 //! `RT_CTL_FIXED` answers a constant, `RT_CTL_NIL` nulls the reply pointer (the C's `NIL`),
@@ -70,10 +77,9 @@
 //! | `30` | clear | buffer kept | 0 | `[]` (`io.c:4163-4166`, `buf_to_intlist` of nothing) |
 //!
 //! `set_port_control_flags` (`io.c:5318`) needs the `ErlDrvPort` `start` is handed and the control
-//! callback never sees, so `start` stashes it in a file-static (`rt_port` in the fixture). The
-//! flag is per-port **state**, which is why every shape verb states it explicitly rather than
-//! relying on the row before it.
-//!
+//! callback never sees, so `start` stashes it in a file-static (`rt_port` in the fixture). The flag
+//! is per-port **state**, which is why every shape verb states it explicitly rather than relying on
+//! the row before it.//!
 //! A second build of the same source (`RT_CTL_HAS_CONTROL=0`) leaves the entry's `control` slot
 //! `NULL`, which is how the absent-slot `badarg` is discriminated.
 //!
@@ -103,6 +109,8 @@ use super::{DriverPort, DriverPortAdapter};
 const CONTROL_C: &str = r#"
 #include <erl_driver.h>
 
+#include <dlfcn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -133,31 +141,68 @@ static char rt_foreign[sizeof(RT_FOREIGN_REPLY)] = RT_FOREIGN_REPLY;
  * control callback only ever sees the opaque `ErlDrvData`, so the handle is kept here. */
 static ErlDrvPort rt_port = NULL;
 
+/* The `set_port_control_flags` entry point, resolved in `start`.
+ *
+ * A real driver just calls `set_port_control_flags` and lets the loader bind the import: an
+ * emulator publishes its driver C ABI as **dynamic** symbols (`nm -D beam.smp` shows
+ * `T set_port_control_flags`), which is how every shipped driver resolves it. The host `erl` probe
+ * below therefore needs nothing special from this fixture — and this suite compiles **one** source
+ * for both runtimes, so the import cannot simply be a direct call: this crate's `--lib` unit-test
+ * binary publishes **no** global dynamic symbol at all (cargo's `rustc-link-arg-tests` reaches
+ * `[[test]]` targets, not the lib's unit-test harness, so `readelf --dyn-syms` lists only
+ * `UND` entries), and a `.so` that *imports* the symbol cannot be `dlopen`ed there
+ * (`undefined symbol: set_port_control_flags`). The entry point is therefore looked up twice, and
+ * both routes call the host's own implementation — never a stub:
+ *
+ *   * the address the host hands in the `start` command (this runtime's suites, see `rt_start`),
+ *     which is the same convention `port_attributes_tests.rs` uses for `set_busy_port`;
+ *   * otherwise the loader (`dlsym(RTLD_DEFAULT, …)`), which is the route a real emulator takes. */
+typedef void (*rt_set_flags_fn)(ErlDrvPort, int);
+static rt_set_flags_fn rt_set_flags = NULL;
+
 /* The marker file, opened in `start` and appended to on every control call. */
 static FILE *rt_marker = NULL;
 
-/* Whether `path` ends in ".txt" — the marker paths this suite hands in do. A driver opened from
- * an Erlang probe (the end-to-end suite) is handed its own **name** or object path instead, and
- * `start` must not create a file beside it. */
-static int rt_is_marker_path(const char *path) {
-    size_t n = strlen(path);
-    return n > 4 && strcmp(path + n - 4, ".txt") == 0;
-}
-
+/* `start`'s `command` is "<object path or driver name> [<entry-point address in hex> [<marker>]]".
+ * Every argument after the first is optional: the end-to-end oracle probe opens the driver by bare
+ * name (no address, no marker) and relies on the loader lookup above, while this crate's own
+ * suites hand both. */
 static ErlDrvData rt_start(ErlDrvPort port, char *command) {
+    char object[RT_CTL_MARKER_MAX];
+    char marker[RT_CTL_MARKER_MAX];
+    unsigned long address = 0;
+    int fields;
+    object[0] = '\0';
+    marker[0] = '\0';
     rt_port = port;
+    fields = command == NULL ? 0 : sscanf(command, "%511s %lx %511s", object, &address, marker);
+    if (fields >= 2)
+        rt_set_flags = (rt_set_flags_fn) (intptr_t) address;
+    else
+        rt_set_flags = (rt_set_flags_fn) dlsym(RTLD_DEFAULT, "set_port_control_flags");
+    if (fields < 3)
+        marker[0] = '\0';
     /* A marker failure no longer fails `start`: the suites that care about the marker assert the
      * lines it wrote (an unopened marker shows up there), and the end-to-end suite opens the same
      * driver from an Erlang probe that passes no marker at all. */
-    if (command != NULL && rt_is_marker_path(command))
-        rt_marker = fopen(command, "w");
+    if (marker[0] != '\0')
+        rt_marker = fopen(marker, "w");
     return (ErlDrvData) 1;  /* any non-negative private state */
 }
-
 static void rt_stop(ErlDrvData drv_data) {
     (void) drv_data;
 }
 
+/* State the port's control flags through the resolved entry point — the C's
+ * `set_port_control_flags(prt, flags)` (`io.c:5318`). A host that supplied neither an address nor
+ * an exported symbol answers `0`, and the caller returns the C's rejected `cres` (`-1`,
+ * `io.c:4074`) rather than a row whose flag is silently not what the row claims. */
+static int rt_state_flags(int flags) {
+    if (rt_set_flags == NULL)
+        return 0;
+    rt_set_flags(rt_port, flags);
+    return 1;
+}
 static ErlDrvSSizeT rt_control(ErlDrvData drv_data, unsigned int cmd, char *buf,
                                ErlDrvSizeT len, char **rbuf, ErlDrvSizeT rlen) {
     ErlDrvSizeT i;
@@ -191,31 +236,36 @@ static ErlDrvSSizeT rt_control(ErlDrvData drv_data, unsigned int cmd, char *buf,
         return (ErlDrvSSizeT) (sizeof(RT_FOREIGN_REPLY) - 1);
     case RT_CTL_NULL_NO_FLAG:
         /* `NULL` reply pointer, flag clear, `cres == 0`: the C's `NIL` (`io.c:4134`). */
-        set_port_control_flags(rt_port, 0);
+        if (!rt_state_flags(0))
+            return (ErlDrvSSizeT) -1;
         if (rbuf != NULL)
             *rbuf = NULL;
         return (ErlDrvSSizeT) 0;
     case RT_CTL_NULL_NO_FLAG_LENGTH:
         /* The same `NULL` pointer with a **non-zero** `cres`: still `NIL`, because the pointer
          * test precedes any use of the length (`io.c:4134`). */
-        set_port_control_flags(rt_port, 0);
+        if (!rt_state_flags(0))
+            return (ErlDrvSSizeT) -1;
         if (rbuf != NULL)
             *rbuf = NULL;
         return (ErlDrvSSizeT) 5;
     case RT_CTL_NULL_BINARY:
         /* `PORT_CONTROL_FLAG_BINARY` set **and** `*rbuf = NULL`: the empty list `[]`, never `<<>>`
          * — the row a runtime that reads the flag alone gets wrong. */
-        set_port_control_flags(rt_port, PORT_CONTROL_FLAG_BINARY);
+        if (!rt_state_flags(PORT_CONTROL_FLAG_BINARY))
+            return (ErlDrvSSizeT) -1;
         if (rbuf != NULL)
             *rbuf = NULL;
         return (ErlDrvSSizeT) 0;
     case RT_CTL_EMPTY_BINARY:
         /* `PORT_CONTROL_FLAG_BINARY` set, zero bytes, the caller's buffer kept: `<<>>`. */
-        set_port_control_flags(rt_port, PORT_CONTROL_FLAG_BINARY);
+        if (!rt_state_flags(PORT_CONTROL_FLAG_BINARY))
+            return (ErlDrvSSizeT) -1;
         return (ErlDrvSSizeT) 0;
     case RT_CTL_EMPTY_LIST:
         /* Flag cleared, zero bytes, the caller's buffer kept: `[]` again. */
-        set_port_control_flags(rt_port, 0);
+        if (!rt_state_flags(0))
+            return (ErlDrvSSizeT) -1;
         return (ErlDrvSSizeT) 0;
     default:
         return (ErlDrvSSizeT) -1;
@@ -258,7 +308,7 @@ DRIVER_INIT(rt_control_init) {
 "#;
 
 /// Print a loud skip banner (never a silent pass).
-fn skip(reason: &str) {
+pub(super) fn skip(reason: &str) {
     println!("================================================================");
     println!("SKIP: {reason}");
     println!("================================================================");
@@ -382,20 +432,20 @@ fn cc_available() -> bool {
 }
 
 /// A compiled driver `.so` plus the marker file its `control` callback appends to.
-struct Fixture {
+pub(super) struct Fixture {
     /// The scratch directory holding the source, the `.so` and the marker.
-    dir: PathBuf,
+    pub(super) dir: PathBuf,
     /// The `.so` **without** its suffix (the `DriverPortAdapter::load` candidate).
-    stem: PathBuf,
+    pub(super) stem: PathBuf,
     /// The path the fixture records each `control` call in.
-    marker: PathBuf,
+    pub(super) marker: PathBuf,
     /// The `driver_name` the library is compiled under (the loader rejects a mismatch).
-    name: String,
+    pub(super) name: String,
 }
 
 impl Fixture {
     /// Removes the scratch directory (`cc` output and the marker are not source).
-    fn cleanup(self) {
+    pub(super) fn cleanup(self) {
         match std::fs::remove_dir_all(&self.dir) {
             Ok(()) => {}
             Err(error) => println!("note: could not remove {}: {error}", self.dir.display()),
@@ -405,7 +455,7 @@ impl Fixture {
     /// The `C:<cmd>:<len>` lines the fixture has written so far, in order.
     ///
     /// Read after the callback has returned — the fixture `fflush`es each line as it writes it.
-    fn marker_lines(&self) -> Vec<String> {
+    pub(super) fn marker_lines(&self) -> Vec<String> {
         match std::fs::read_to_string(&self.marker) {
             Ok(text) => text.lines().map(str::to_string).collect(),
             // A missing marker means the fixture never got as far as `start`: report it as no
@@ -418,7 +468,7 @@ impl Fixture {
 /// Compiles [`CONTROL_C`] as `<scratch>/<stem>.so`; `None` when a host facility is missing (the
 /// caller returns early — **loudly**). `with_control` selects the entry's `control` slot: `false`
 /// compiles the absent-slot build.
-fn build_fixture(stem: &str, with_control: bool) -> Option<Fixture> {
+pub(super) fn build_fixture(stem: &str, with_control: bool) -> Option<Fixture> {
     if !cc_available() {
         skip(&format!("control: no C compiler ({} / $CC) available", cc()));
         return None;
@@ -481,20 +531,41 @@ fn build_fixture(stem: &str, with_control: bool) -> Option<Fixture> {
 
 /// Loads `fixture`'s driver into an adapter — the port is **not** opened yet.
 ///
-/// The fixture is handed the marker path in the `command` string (see the module docs), which its
-/// `start` reads.
+/// `start` is handed `"<object> <entry-point address> <marker>"` (the fixture's `rt_start`): the
+/// marker path it records every control call in (see the module docs) and the address of the real
+/// [`set_port_control_flags`](beam_abi::driver::drv::lifecycle::set_port_control_flags) entry
+/// point, because this unit-test binary exports **no** dynamic symbol for the `.so` to import
+/// (`readelf --dyn-syms` lists only `UND` entries: cargo's `rustc-link-arg-tests` reaches
+/// `[[test]]` targets, not the lib's unit-test harness). The same source is compiled for the
+/// oracle probe in [`control_reply_oracle_tests`](super::control_reply_oracle_tests), which opens
+/// it by bare name and lets the loader find the emulator's exported symbol instead.
 fn load_adapter(fixture: &Fixture) -> DriverPortAdapter {
     // The same anchor `crate::port::PortRegistry::new` uses.
     let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
     let atoms = Rc::new(AtomTable::new());
     let host = DriverPort::new(Heap::new(256).expect("a test heap"), atoms, ProcessId::new(1, 0));
+    let command = format!(
+        "{} {:x} {}",
+        fixture.stem.with_extension("so").display(),
+        set_port_control_flags_address(),
+        fixture.marker.display()
+    );
     DriverPortAdapter::load(
         &[fixture.stem.display().to_string()],
         &fixture.name,
         host,
-        fixture.marker.display().to_string(),
+        command,
     )
     .expect("the fixture driver loads")
+}
+
+/// The address of the real `set_port_control_flags` entry point, handed to the fixture's `start`
+/// — the same convention `port_attributes_tests.rs` uses for `set_busy_port`/`erl_drv_set_os_pid`.
+pub(super) fn set_port_control_flags_address() -> usize {
+    beam_abi::driver::drv::driver_api_table()
+        .set_port_control_flags
+        .expect("the `set_port_control_flags` entry point is registered in the table")
+        as usize
 }
 
 /// Loads `fixture`'s driver and opens one port on it.

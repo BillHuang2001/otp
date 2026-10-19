@@ -3514,6 +3514,13 @@ mod stop_select_tests;
 #[cfg(test)]
 mod control_tests;
 
+/// The A.4 **`NULL`-reply `port_control/3` rows against the LIVE ORACLE**: the same `.so` (built
+/// from [`control_tests`]'s source) driven through `open_port/2` + `erlang:port_control/3` on both
+/// runtimes, so the C's two-fact rendering order (`io.c:4134` before `io.c:4136-4166`) is pinned
+/// against erts-17.1 itself and not only against a recorded expectation.
+#[cfg(test)]
+mod control_reply_oracle_tests;
+
 /// The A.4 **driver-private queue / one-PDL / port-flags hook regression suite** for
 /// [`DriverPort`]'s [`beam_abi::DriverHost`] implementation — the `prt->ioq` behind
 /// `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq`, the one-PDL rule behind
