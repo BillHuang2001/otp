@@ -61,6 +61,27 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   agree (`17` = `STOP_CALLED|READ_CANCELLED`, then `1` = `STOP_CALLED`), only the callback count
   differs, and `ERL_NIF_SELECT_STOP_SCHEDULED` is unobservable for the same reason. Owner:
   `beam_abi` / the `beam_rt` select hook (`crates/beam_rt/src/nif_select.rs`).
+- **`enif_schedule_nif`'s success path** — the documented "yield" seam. Measured with a real NIF
+  that re-schedules itself (`enif_schedule_nif(env, "sched_resumed", 0, sched_resumed, 0, NULL)`
+  from the first entry, the resumed entry returning the call counter): the oracle resumes the call
+  on the same scheduler and the module receives the resumed entry's value (`2`), and it does the
+  same for `ERL_NIF_DIRTY_JOB_CPU_BOUND` (`2`, so dirty dispatch works there too). The Rust runtime
+  leaves `NifHost::schedule_nif` at its `None` default, so the C raises `badarg`
+  (`crates/beam_abi/src/nif/enif/process.rs`) and the module observes `error:badarg` — i.e. the
+  same root cause as the already-recorded `dirty_scheduler_support = 0`. The **refusal** half
+  (`argc > 255`, a flags bit outside the dirty-job pair) agrees and is pinned
+  (`nif_abi/schedule_nif_rejects_*`); only the success path is unpinnable. Owner: `beam_rt`
+  (`NifHost::schedule_nif`, `crates/beam_rt/src/nif.rs`) / `beam_abi`.
+- **`enif_send` from a NIF-created thread** — the documented thread-safe form (`env == NULL` plus a
+  message env built with `enif_alloc_env`). Measured by spawning a thread that allocates a message
+  env and sends `{from_nif_thread, 11}` to pid passed in from the caller: the oracle delivers it
+  (`enif_send` answers `1`, the term reaches the mailbox), while the Rust runtime answers
+  `enif_alloc_env() == NULL` on a thread that is **not** inside a NIF call (the per-call host is
+  published thread-locally by `NifEnv`, `crates/beam_abi/src/nif/enif/envs.rs`), so this idiom
+  cannot be used at all and nothing is delivered (the receiver's bounded `receive` reports
+  `timeout`). The two in-call forms (`msg_env == NULL` and a message env on the calling thread)
+  are live and pinned (`nif_rt/send_null_env_*`, `nif_rt/send_message_env_*`). Owner: `beam_abi`
+  (`nif/enif/envs.rs`) / the runtime's host publication on non-scheduler threads.
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - `driver_async_port_key(port)` answers the port's opaque `ErlDrvData`/pointer word in the oracle while
   the Rust runtime's `DriverPort` keeps the `DriverHost` trait default (`0`,

@@ -139,6 +139,7 @@ mod nif_abi_extra;
 mod nif_res;
 mod nif_so;
 mod nif_state;
+mod nif_thread;
 mod ordered_walk;
 mod phash;
 mod printing;
@@ -651,6 +652,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(nif::group());
     cases.extend(nif_so::group());
     cases.extend(nif_state::group());
+    cases.extend(nif_thread::group());
     cases.extend(nif_res::group());
     cases.extend(nif_abi::group());
     cases.extend(nif_abi_extra::group());
