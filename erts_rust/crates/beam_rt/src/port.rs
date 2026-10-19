@@ -589,9 +589,12 @@ struct PortMeta {
     ///
     /// Read **after** a `control` callback to pick the reply's Erlang form: a list of byte
     /// integers, or a binary when `PORT_CONTROL_FLAG_BINARY` is set (`write_port_control_result`,
-    /// `io.c:4133-4175`). Seized from the host with [`driver::DriverPort::control_flags`] before
-    /// the host is moved into the port lifecycle (the boxed driver exposes no host), the same way
-    /// [`PortMeta::driver_terms`] and [`PortMeta::driver_atoms`] are.
+    /// `io.c:4133-4175`). It is the **second** discriminator — the driver's reply pointer is tested
+    /// first, and a `NULL` pointer is the empty list `[]` for **every** flag word (`io.c:4134`),
+    /// which is [`PortRegistry::control_reply_shape`]'s fact. Seized from the host with
+    /// [`driver::DriverPort::control_flags`] before the host is moved into the port lifecycle (the
+    /// boxed driver exposes no host), the same way [`PortMeta::driver_terms`] and
+    /// [`PortMeta::driver_atoms`] are.
     ///
     /// `None` for every port without a C driver (a `spawn`/`fd` port) — one whose `control` reply
     /// is the oracle's own `badarg`.
@@ -1777,6 +1780,12 @@ impl PortRegistry {
     /// `beam_io/src/abi/port.rs:716`), and for a [`PortName::SpawnDriverBuiltin`] port the built-in
     /// driver's own string verbs.
     ///
+    /// The answer is the driver's reply **bytes only**: rendering them as an Erlang term needs the
+    /// two facts the oracle reads after the callback — the reply buffer's shape
+    /// ([`PortRegistry::control_reply_shape`], whose `NULL` case is `[]` for every flag word,
+    /// `io.c:4134`) and the port's binary flag ([`PortRegistry::control_binary`]). Both are read
+    /// after this call, which is when the driver has had its say.
+    ///
     /// [`beam_io::PortControl::CLOSE`] (`"close"`) is **reserved** by that forwardee: it closes the
     /// port instead of reaching a driver. A C driver's verbs are integers, so the reserved verb can
     /// only arrive from a caller that meant the built-in drivers' close — and it closes the port
@@ -1868,10 +1877,14 @@ impl PortRegistry {
     /// Whether `id`'s C driver asked for a **binary** `erlang:port_control/3` reply
     /// (`PORT_CONTROL_FLAG_BINARY`).
     ///
-    /// The C reads the port's `control_flags` **after** the driver's `control` callback and renders
-    /// the reply as a binary when that bit is set, as a list of byte integers otherwise
-    /// (`write_port_control_result`, `io.c:4133-4175`). Call this after
-    /// [`PortRegistry::port_control`], which is when the driver has set its flags.
+    /// This is the **second** of the two facts the oracle's reply rendering decides on
+    /// (`write_port_control_result`, `io.c:4133-4175`). The first is the driver's reply pointer,
+    /// which it tests **before** this flag word: a `NULL` pointer is the empty **list** `[]` for
+    /// every flag setting (`io.c:4134`), while a real buffer splits on the bit — a binary when it
+    /// is set, a list of byte integers when it is clear (`io.c:4136-4166`). A renderer therefore
+    /// asks [`PortRegistry::control_reply_shape`] first and only then this.
+    ///
+    /// Call this after [`PortRegistry::port_control`], which is when the driver has set its flags.
     ///
     /// `false` for an unknown port and for every port without a C driver (a `spawn`/`fd` port),
     /// whose `control` reply is the oracle's `badarg` in the first place.
@@ -1880,6 +1893,36 @@ impl PortRegistry {
             .get(&id.number())
             .and_then(|meta| meta.driver_control_flags.as_ref())
             .is_some_and(|flags| flags.get() & PORT_CONTROL_FLAG_BINARY != 0)
+    }
+    /// How `id`'s C driver described the **reply buffer** of its most recent `control` call — the
+    /// first of the two facts the oracle's reply rendering decides on.
+    ///
+    /// The C tests the driver's reply pointer before the port's `PORT_CONTROL_FLAG_BINARY` word:
+    /// `write_port_control_result` opens with `if (!resp_bufp) return NIL;` (`io.c:4134`), so a
+    /// `NULL` reply is the empty **list** `[]` regardless of the flag, while a zero-byte *buffer*
+    /// under that flag is `<<>>` (`io.c:4136-4162`). [`beam_io::ControlReplyShape`] names the two
+    /// cases; [`beam_io::PortRegistry::control_reply_shape`] answers from the port's own driver,
+    /// which is where the pointer's `NULL`-ness survives (the reply bytes cannot carry it — both
+    /// cases are zero bytes).
+    ///
+    /// Call this after [`PortRegistry::port_control`], beside the flag
+    /// ([`PortRegistry::control_binary`]): it reads the **last** reply, so anything that drove the
+    /// port's `control` in between would describe that call instead.
+    ///
+    /// [`ControlReplyShape::Buffer`](beam_io::ControlReplyShape::Buffer) for an unknown port and for
+    /// every port without a C driver (a `spawn`/`fd` port, and a **built-in** driver port, whose
+    /// Rust driver answers a real `Vec`) — the honest default, and in the first two cases a port
+    /// whose `port_control` is the oracle's `badarg` anyway. The one residual is a port a driver
+    /// **reaped from inside its own `control` callback**: [`PortRegistry::port_control`] drains the
+    /// completion channel after the call, so the port is gone by the time this reads it and the
+    /// answer is that same default. `beam_io`'s own
+    /// [`port_control_reply`](beam_io::PortRegistry::port_control_reply) is the combined call, and
+    /// the shape it answers for that case is correct — a caller that must not lose it can use that
+    /// one directly.
+    pub fn control_reply_shape(&self, id: PortId) -> beam_io::ControlReplyShape {
+        self.registry
+            .control_reply_shape(id)
+            .unwrap_or(beam_io::ControlReplyShape::Buffer)
     }
 
     /// Whether `id`'s port is currently **busy** — the state the driver last reported through

@@ -364,12 +364,28 @@ impl RuntimeContext<'_> {
     /// declares one ([`PortRegistry::has_driver_control`]) — `{spawn_driver, "ram_file_drv"}`
     /// declares none (`ram_file_drv.c:116`), so it too is `badarg` for every verb.
     ///
-    /// The reply is an Erlang **list of byte integers** — `write_port_control_result`
-    /// (`io.c:4098-4175`) renders the bytes with `buf_to_intlist` whenever the driver did **not**
-    /// set `PORT_CONTROL_FLAG_BINARY`. A driver that *did* set the flag — `set_port_control_flags`
-    /// from its `control` callback, recorded in the port's control-flag cell — gets a **binary**
-    /// instead, which is the oracle's own shape for both modes (measured: a list reply is
-    /// `[97,98,99]`, a flagged reply `<<97,98,99>>`, and a `NULL` reply pointer `[]`).
+    /// The reply's **Erlang form** is decided by the two facts `write_port_control_result`
+    /// (`io.c:4098-4175`) reads **in this order**, both of them after the callback has returned:
+    ///
+    /// | Driver's reply pointer | `PORT_CONTROL_FLAG_BINARY` | Answer | C |
+    /// |---|---|---|---|
+    /// | `NULL` | set | `[]` | `io.c:4134` (`if (!resp_bufp) return NIL;`) |
+    /// | `NULL` | clear | `[]` | `io.c:4134` |
+    /// | buffer, 0 bytes | set | `<<>>` | `io.c:4136-4162` |
+    /// | buffer, 0 bytes | clear | `[]` | `io.c:4163-4166` (`buf_to_intlist`) |
+    /// | buffer, N bytes | clear | an int list of the bytes | `io.c:4163-4166` |
+    /// | buffer, N bytes | set | a binary of the bytes | `io.c:4136-4162` |
+    ///
+    /// The pointer test comes **first** and is why an empty byte slice is not enough to render the
+    /// answer: a `NULL` reply is the bare empty list for *every* flag word, while a zero-byte
+    /// *buffer* under the flag is `<<>>`. The shape is
+    /// [`PortRegistry::control_reply_shape`](crate::port::PortRegistry::control_reply_shape) and the
+    /// flag is [`PortRegistry::control_binary`](crate::port::PortRegistry::control_binary) — both
+    /// read beside each other, after the call.
+    ///
+    /// The flag itself is set by a driver from inside its `control` callback
+    /// (`set_port_control_flags`, recorded in the port's control-flag cell). Measured: a list reply
+    /// is `[97,98,99]`, a flagged reply `<<97,98,99>>`, and a `NULL` reply pointer `[]`.
     ///
     /// # Errors
     ///
@@ -382,11 +398,12 @@ impl RuntimeContext<'_> {
         let operation = Self::term_to_uint(*args.get(1).ok_or(BeamError::BadArg)?)?;
         let data = *args.get(2).ok_or(BeamError::BadArg)?;
         // The registry is reached through a cheap clone of its `Rc` handle, exactly as
-        // `port_command` does, so the reply term is built after the borrow is released. The
-        // binary/list decision is read *after* the call: that is when the driver's `control`
-        // callback has had its chance to set `PORT_CONTROL_FLAG_BINARY` (`io.c:4403-4411`).
+        // `port_command` does, so the reply term is built after the borrow is released. Both
+        // render decisions are read *after* the call — that is when the driver's `control`
+        // callback has had its chance to set `PORT_CONTROL_FLAG_BINARY` (`io.c:4403-4411`) and to
+        // leave the reply pointer it answered with.
         let ports = std::rc::Rc::clone(&self.runtime.ports);
-        let (reply, binary) = {
+        let (reply, binary, shape) = {
             let mut registry = ports
                 .try_borrow_mut()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
@@ -394,12 +411,20 @@ impl RuntimeContext<'_> {
             self.iodata_bytes(data, &mut bytes)?;
             let reply = registry.port_control(port, &operation.to_string(), &bytes)?;
             let binary = registry.control_binary(port);
-            (reply, binary)
+            let shape = registry.control_reply_shape(port);
+            (reply, binary, shape)
         };
-        if binary {
-            terms::make_heap_binary(self, &reply)
-        } else {
-            Self::int_list(self, &reply)
+        // `write_port_control_result` tests the driver's reply pointer **before** the port's flag
+        // word (`io.c:4134`: `if (!resp_bufp) return NIL;`), so a `NULL` reply is the bare empty
+        // list `[]` even on a binary-reply port; only a real buffer splits on the flag — a binary
+        // when it is set (zero bytes ⇒ `<<>>`, `io.c:4136-4162`), a list of byte integers when it
+        // is clear (`io.c:4163-4166`).
+        match shape {
+            beam_io::ControlReplyShape::Null => Ok(NIL),
+            beam_io::ControlReplyShape::Buffer if binary => {
+                terms::make_heap_binary(self, &reply)
+            }
+            beam_io::ControlReplyShape::Buffer => Self::int_list(self, &reply),
         }
     }
 
@@ -1619,6 +1644,105 @@ mod tests {
         );
     }
 
+    /// The **four rendering rows** of `write_port_control_result` (`io.c:4126-4175`), pinned end to
+    /// end at the BIF level over a fake driver that can declare each of them.
+    ///
+    /// The rule has an **order**, and that order is the whole point: the driver's reply pointer is
+    /// tested **first** (`if (!resp_bufp) return NIL;`, `io.c:4134`), so a `NULL` reply is the bare
+    /// empty **list** `[]` for **every** `PORT_CONTROL_FLAG_BINARY` setting; only a reply from a
+    /// real **buffer** splits on that flag — a binary when it is set (`io.c:4136-4162`, zero bytes
+    /// ⇒ `<<>>`) and a list of byte integers when it is clear (`io.c:4163-4166`, zero bytes ⇒
+    /// `[]`). Reading the flag alone therefore answers `<<>>` for the first row, where the oracle
+    /// answers `[]`.
+    ///
+    /// The four rows, in the order the calls below drive them (the flag is per-port state, so each
+    /// row states it explicitly rather than assuming a fresh port):
+    #[test]
+    fn port_control_renders_null_and_empty_buffer_replies_per_the_c_rule() {
+        use beam_abi::driver::types::PORT_CONTROL_FLAG_BINARY;
+        let mut runtime = runtime();
+        let (port, flags) = crate::port::test_support::register_control_port(
+            &mut runtime,
+            "native_port_ctl_shape",
+            vec![
+                // 1: a buffer reply with the flag **clear** — the starting state, a list.
+                crate::port::test_support::ControlVerb::setting(1, b"abc", 0),
+                // 2: a `NULL` reply with the flag clear — `io.c:4134`.
+                crate::port::test_support::ControlVerb::null(2),
+                // 3: a zero-byte **buffer** with the flag set — `io.c:4136-4162`, `<<>>`.
+                crate::port::test_support::ControlVerb::setting(3, b"", PORT_CONTROL_FLAG_BINARY),
+                // 4: a `NULL` reply with the flag **set** — still `[]` (`io.c:4134`).
+                crate::port::test_support::ControlVerb::null(4),
+                // 5: a zero-byte buffer with the flag cleared again — `io.c:4163-4166`, `[]`.
+                crate::port::test_support::ControlVerb::setting(5, b"", 0),
+            ],
+        );
+        let reply = |runtime: &mut Runtime, verb: i64| -> Eterm {
+            call(
+                runtime,
+                "erlang",
+                "port_control",
+                &[port.to_eterm(), make_small(verb), NIL],
+            )
+            .unwrap_or_else(|error| panic!("verb {verb} must answer: {error}"))
+        };
+        // The port's per-call flag word, read from the cell the fixture shares with the port's
+        // metadata — the same cell `control_binary` reads.
+        macro_rules! flag_set {
+            () => {
+                flags.get() & PORT_CONTROL_FLAG_BINARY != 0
+            };
+        }
+
+        // Row: buffer + N bytes + flag clear ⇒ the bytes as an int list.
+        assert_eq!(
+            terms::list_elements(reply(&mut runtime, 1)).expect("a list"),
+            vec![make_small(97), make_small(98), make_small(99)],
+            "a buffer reply with no flag is the int list (`io.c:4163-4166`)"
+        );
+        assert!(!flag_set!(), "verb 1 cleared the flag");
+
+        // Row: `NULL` + flag clear ⇒ `[]`.
+        assert_eq!(
+            reply(&mut runtime, 2),
+            NIL,
+            "a NULL reply pointer is the empty list (`io.c:4134`)"
+        );
+        assert!(!flag_set!(), "a NULL reply sets no flag");
+
+        // Row: buffer + 0 bytes + flag set ⇒ `<<>>`.
+        let empty_binary = reply(&mut runtime, 3);
+        assert_eq!(
+            terms::binary_bytes(empty_binary).expect("a zero-byte binary, not a list"),
+            b"",
+            "a zero-byte buffer under PORT_CONTROL_FLAG_BINARY is `<<>>` (`io.c:4136-4162`)"
+        );
+        assert!(flag_set!(), "verb 3 set PORT_CONTROL_FLAG_BINARY");
+
+        // Row: `NULL` + flag **set** ⇒ `[]`, the row a flag-only reading gets wrong.
+        let null_under_flag = reply(&mut runtime, 4);
+        assert_eq!(
+            null_under_flag, NIL,
+            "a NULL reply is the empty list even when PORT_CONTROL_FLAG_BINARY is set \
+             (`io.c:4134`, before the flag test at `io.c:4136`)"
+        );
+        assert!(
+            terms::binary_bytes(null_under_flag).is_err(),
+            "`[]` is a list: a binary here would be the flag-only reading of the same zero bytes"
+        );
+        assert!(
+            flag_set!(),
+            "the NULL reply left the port's binary flag alone — it is per-port state (`io.c:5318`)"
+        );
+
+        // Row: buffer + 0 bytes + flag clear ⇒ `[]` (the flag really can be cleared again).
+        assert_eq!(
+            reply(&mut runtime, 5),
+            NIL,
+            "a zero-byte buffer without the flag is `buf_to_intlist` of nothing (`io.c:4163-4166`)"
+        );
+        assert!(!flag_set!(), "verb 5 cleared the flag");
+    }
     /// The per-port byte counters `port_info(Port, input | output)` report are real: a write
     /// bumps the port's `output`, and a driver reply bumps nothing on the *input* side (a driver
     /// port's input is harvested by the pump, not by `port_control`).

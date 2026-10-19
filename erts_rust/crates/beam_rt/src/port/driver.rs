@@ -855,7 +855,10 @@ pub struct DriverPort {
     ///
     /// Shared with the runtime's `PortMeta`, which reads it **after** a `control` callback to pick
     /// the reply's Erlang form (`write_port_control_result`, `io.c:4133-4175`): a list of byte
-    /// integers normally, a **binary** when `PORT_CONTROL_FLAG_BINARY` is set. Seized with
+    /// integers normally, a **binary** when `PORT_CONTROL_FLAG_BINARY` is set. It is the
+    /// **second** discriminator: the reply pointer's `NULL`-ness is tested first and answers `[]`
+    /// for every flag word (`io.c:4134`), and
+    /// [`DriverPortAdapter::control_reply_shape`] is what reports that half. Seized with
     /// [`DriverPort::control_flags`] before the host is boxed into the port lifecycle.
     control_flags: Rc<Cell<c_int>>,
     /// The port's **busy state** — the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, as the
@@ -1658,9 +1661,13 @@ impl DriverHost for DriverPort {
     ///
     /// The C returns `void`, so the seam's `0` is always the answer. The recorded bit set is what
     /// the runtime reads back (`set_port_control_flags` → `get_port_flags` round-trips through
-    /// this seam, `beam_abi`'s `driver/drv/lifecycle.rs`) to render a `port_control` reply as a
-    /// **binary** when `PORT_CONTROL_FLAG_BINARY` is set and as a list of byte integers otherwise —
-    /// the C's own rule (`write_port_control_result`, `io.c:4133-4175`).
+    /// this seam, `beam_abi`'s `driver/drv/lifecycle.rs`) to render a `port_control` reply, and it
+    /// is the **second** of the two facts `write_port_control_result` decides on: the reply
+    /// pointer is tested first (`if (!resp_bufp) return NIL;`, `io.c:4134`), so a `NULL` reply is
+    /// the empty list `[]` for **every** flag word; only a real buffer splits on this bit — a
+    /// **binary** when `PORT_CONTROL_FLAG_BINARY` is set (`io.c:4136-4162`, so zero bytes is
+    /// `<<>>`) and a list of byte integers otherwise (`io.c:4163-4166`, so zero bytes is `[]`).
+    /// The pointer half is not this cell: it is [`DriverPortAdapter::control_reply_shape`].
     fn set_control_flags(&mut self, _mode: c_int, flags: c_int) -> c_int {
         self.control_flags.set(flags);
         0
@@ -2317,6 +2324,24 @@ pub struct DriverPortAdapter {
     ///
     /// `null` before `start` (and after `stop`), when the port cannot be addressed at all.
     port_handle: ErlDrvPort,
+    /// How the driver described the **reply buffer** of its most recent successful `control` call
+    /// — the C's `*rbuf` pointer, which `write_port_control_result` tests **before** the port's
+    /// `PORT_CONTROL_FLAG_BINARY` word (`io.c:4134`, `if (!resp_bufp) return NIL;`).
+    ///
+    /// This is a **second fact beside the bytes**, never a replacement for them:
+    /// [`DriverPortAdapter::control_reply`] still answers `Vec::new()` for a `NULL` pointer (the
+    /// C's `NIL`, `io.c:4126`), exactly as it does for a zero-byte buffer — and those two are
+    /// *not* the same answer at the Erlang level. A `NULL` reply is the empty **list** `[]` for
+    /// **every** flag word, while a zero-byte *buffer* under `PORT_CONTROL_FLAG_BINARY` is `<<>>`
+    /// (`io.c:4136-4162`). Only this latch can tell a renderer which of them it is holding, which
+    /// is why it is reported through [`beam_io::Driver::control_reply_shape`].
+    ///
+    /// Written by [`DriverPortAdapter::control`] as the driver's callback returns (and its `cres`
+    /// was accepted, so it describes the last **successful** call), and read by the caller after
+    /// that call — the same order in which the C reads the pointer once `call_driver_control` has
+    /// returned. It starts at [`beam_io::ControlReplyShape::Buffer`], the trait's own default: no
+    /// `control` call has been made yet, so there is no `NULL` pointer to report.
+    control_reply_shape: beam_io::ControlReplyShape,
 }
 
 /// One descriptor a driver selected, with the directions it armed.
@@ -2416,6 +2441,9 @@ impl DriverPortAdapter {
             monitors,
             busy,
             selected: Vec::new(),
+            // No `control` callback has run yet, so there is no reply pointer to describe: the
+            // trait default (a real buffer) is the honest starting answer.
+            control_reply_shape: beam_io::ControlReplyShape::Buffer,
         })
     }
     /// The driver name this port was loaded as.
@@ -2775,8 +2803,11 @@ impl DriverPortAdapter {
     /// reply would be a fabricated one.
     ///
     /// A `NULL` reply pointer is the C's `NIL` (`io.c:4126`) — an empty reply, which is what this
-    /// returns.
-    ///
+    /// returns. Zero bytes are **not** the whole answer: the pointer's `NULL`-ness is latched
+    /// separately by [`DriverPortAdapter::control`] (see
+    /// [`DriverPortAdapter::control_reply_shape`]), because the C tests it *before* the port's
+    /// `PORT_CONTROL_FLAG_BINARY` word (`io.c:4134`) while an empty **buffer** under that flag is
+    /// `<<>>`.    ///
     /// # Errors
     ///
     /// The typed capability gap for a reply from the driver's own memory.
@@ -2933,7 +2964,23 @@ impl beam_io::Driver for DriverPortAdapter {
             .as_ref()
             .is_some_and(|driver| driver.library().entry().control.is_some())
     }
-
+    /// How the driver described the reply buffer of its most recent successful `control` call —
+    /// the C's `*rbuf` test, which `write_port_control_result` makes **before** it reads the port's
+    /// `PORT_CONTROL_FLAG_BINARY` word (`io.c:4134`).
+    ///
+    /// A loaded C driver is the only [`beam_io::Driver`] whose reply pointer can be `NULL`, and the
+    /// reply bytes cannot say so (a `NULL` reply and an empty buffer are both zero bytes). So the
+    /// latch [`DriverPortAdapter::control`] writes is forwarded as-is; `beam_io`'s
+    /// [`Buffer`](beam_io::ControlReplyShape::Buffer) default remains the right answer for every
+    /// built-in driver — they all answer a real `Vec` — and no other opinion about the shape is
+    /// added anywhere in this crate.
+    ///
+    /// Read it **after** the `control` call whose reply is being rendered; before any such call it
+    /// is the default (`Buffer`), and after a call whose `cres` was rejected it still describes the
+    /// last successful one — which is also the last one whose reply could be rendered.
+    fn control_reply_shape(&self) -> beam_io::ControlReplyShape {
+        self.control_reply_shape
+    }
     /// The loaded `ErlDrvEntry`'s capability flags, in `beam_io`'s vocabulary: its
     /// `ERL_DRV_FLAG_SOFT_BUSY` bit (`beam_abi::driver::types`, `erl_driver.h`) ⇒
     /// [`beam_io::DriverFlags::SOFT_BUSY`].
@@ -3217,8 +3264,15 @@ impl beam_io::Driver for DriverPortAdapter {
     /// [`ERL_ONHEAP_BINARY_LIMIT`]-byte buffer (`char resp_buf[…]`, `io.c:4352-4354`), `*rbuf`
     /// initially pointing at it; the driver either writes into that buffer, re-points `*rbuf` at
     /// memory of its own, or leaves it `NULL` — which the C renders as `NIL`
-    /// (`write_port_control_result`, `io.c:4126`). The bytes it reports (`cres`) are the reply.
+    /// (`write_port_control_result`, `io.c:4126`).
     ///
+    /// Two facts come back, not one: the reply **bytes** (`cres` of them) and the **shape** of the
+    /// buffer they came from. The C tests the pointer *before* the port's flag word
+    /// (`io.c:4134`), so a `NULL` reply is the empty list `[]` for every `PORT_CONTROL_FLAG_BINARY`
+    /// setting, while a zero-byte *buffer* under that flag is `<<>>`. The bytes cannot express the
+    /// difference (both are zero bytes), so this method also latches the pointer's `NULL`-ness on
+    /// [`DriverPortAdapter::control_reply_shape`] — see
+    /// [`beam_io::Driver::control_reply_shape`] for the renderer's use of it.    ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] when the entry declares no `control` slot — the C's
@@ -3266,6 +3320,17 @@ impl beam_io::Driver for DriverPortAdapter {
             // The C's `if (cres < 0) return ERTS_PORT_OP_BADARG;` (`io.c:4074`).
             return Err(BeamError::BadArg);
         }
+        // The reply pointer the driver left, recorded as a fact **beside** the bytes: the C tests
+        // it first and answers `NIL` for a `NULL` one whatever the port's flag word says
+        // (`write_port_control_result`, `io.c:4134`), so a renderer cannot recover it from
+        // `cres == 0` (a zero-byte *buffer* is `<<>>` on a binary-reply port). Latched only for a
+        // call whose `cres` was accepted — the last **successful** call — and read back through
+        // [`beam_io::Driver::control_reply_shape`] once the runtime has the reply.
+        self.control_reply_shape = if rbuf.is_null() {
+            beam_io::ControlReplyShape::Null
+        } else {
+            beam_io::ControlReplyShape::Buffer
+        };
         let bytes = Self::control_reply(&reply, &buf, rbuf, cres as usize)?;
         // A `control` callback is an ordinary driver callback: whatever it asked of its port (a
         // `driver_select`, a `driver_set_timer`, a `driver_output`) is applied now, exactly as for
