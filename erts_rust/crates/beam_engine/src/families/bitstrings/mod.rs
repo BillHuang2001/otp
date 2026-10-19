@@ -63,6 +63,16 @@ mod matching;
 mod raw;
 #[cfg(test)]
 mod run_tests;
+/// The one narrow name a host's BIF floor adopts to serve `erlang:bit_size/1`: a BIF
+/// cannot reach this module's `pub(super)` family readers, so the frozen bitstring /
+/// `ErlSubBits` size is exposed as a single safe function that answers `None` (→ the
+/// caller's `badarg`) for a non-bitstring rather than a substituted size.
+///
+/// The lint allow is deliberate and temporary: the adopters are the runtime-side BIF
+/// floors (`src/bench/counting.rs`'s harness floor and `tests/support/bifs.rs`'s test
+/// host), which live outside this node.
+#[allow(unused_imports)]
+pub(crate) use raw::bit_size;
 
 use crate::interpreter::LabelMap;
 

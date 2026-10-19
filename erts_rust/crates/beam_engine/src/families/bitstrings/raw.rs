@@ -179,6 +179,27 @@ pub(super) fn ctx_parts(t: Eterm) -> Option<(Eterm, usize, usize)> {
     Some((orig, start, end))
 }
 
+/// `erlang:bit_size/1` — the bit size of a bitstring **or** of a live match context,
+/// or `None` when `t` is neither.
+///
+/// A heap-bits/binary subject (`ErlHeapBits`, on-heap binary) takes its `size` word; a
+/// refc-binary window and an `ErlSubBits` **match context** both take their remaining
+/// window `end - start`, which is exactly what `erts_bin_bits_size` (`erl_bits.h`) does
+/// for every `SUB_BITS` thing. A bare off-heap `BinRef` (a reference no
+/// `bs_start_match` has wrapped yet) and every non-bitstring are `None`, so a caller
+/// turns that into `badarg` rather than a substituted size.
+///
+/// This is the host-facing reader the BIF floors need (a BIF cannot reach this
+/// module's `pub(super)` family readers); the family's own readers keep their narrower
+/// [`heap_bits`]/[`ctx_parts`] shapes.
+#[allow(dead_code)]
+pub(crate) fn bit_size(t: Eterm) -> Option<usize> {
+    if let Some((_, bits, _)) = heap_bits(t) {
+        return Some(bits);
+    }
+    ctx_parts(t).map(|(_, start, end)| end - start)
+}
+
 /// The inner subject (`orig`, word 4) of a match-context term, or `None` when `t`
 /// is not one.
 ///
