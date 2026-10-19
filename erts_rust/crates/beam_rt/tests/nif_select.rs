@@ -1147,7 +1147,8 @@ fn rust_int(answers: &Answers, key: &str) -> Option<i32> {
 }
 
 /// The case's heading: its name and the one-line description of what it arms.
-fn heading(case: &str, detail: &str) {    println!();
+fn heading(case: &str, detail: &str) {
+    println!();
     println!("=============== nif_select :: {case} ===============");
     println!("fixture: {detail}");
 }
