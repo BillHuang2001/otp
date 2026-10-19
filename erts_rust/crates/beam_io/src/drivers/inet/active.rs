@@ -85,13 +85,13 @@
 //!
 //! The C arms read readiness only while `active > 0` (`sock_select(desc, FD_READ|FD_CLOSE,
 //! desc->active > 0)`, `:7944`-`:7986`) — going passive de-selects the socket. This crate's
-//! poller has no empty-interest mask (`crate::poller::Interest` is `READABLE`/`WRITABLE`/`BOTH`)
-//! and `mio`'s epoll is **edge-triggered**, so the registration is kept armed for the socket's
-//! life and the driver gates on `options.active` instead; a **passive → active** transition
-//! re-registers so already-buffered bytes produce a fresh edge
-//! ([`TcpInetDriver::after_setopts`](super::TcpInetDriver)). The consequence of keeping the
-//! registration armed is that bytes arriving **after** an `{active, N}` counter is spent are read
-//! into the port's input queue by the passive half of
+//! poller has no empty-interest mask (`crate::poller::Interest` is
+//! `READABLE`/`WRITABLE`/`BOTH`/`ERROR`) and `mio`'s epoll is **edge-triggered**, so the
+//! registration is kept armed for the socket's life and the driver gates on `options.active`
+//! instead; a **passive → active** transition re-registers so already-buffered bytes produce a
+//! fresh edge ([`TcpInetDriver::after_setopts`](super::TcpInetDriver)). The consequence of keeping
+//! the registration armed is that bytes arriving **after** an `{active, N}` counter is spent are
+//! read into the port's input queue by the passive half of
 //! [`Driver::ready_input`](crate::Driver::ready_input) rather than staying in the kernel buffer —
 //! they are still there for the owner's next passive read, and nothing is delivered on the active
 //! channel.
