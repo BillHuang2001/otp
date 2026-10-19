@@ -626,7 +626,6 @@ The `emqx_base62_encode` row of the `foreign` table above is the `bench` driver'
   Pinned end to end by `tests/signal_self_delivery.rs` over the committed `tests/fixtures/sigself.erl`: all eight shapes (`killed`, `natural`, `killed_after`, `ran_before_kill`, `spawn_monitor_kill`, `trapping_link` — the exit-signal class only the net can deliver — `bare_receive` with no `after` clause, and `not_matching`) print the live oracle's own line with exit 0, individually and as `all/0`'s list.
   The one residual is scheduling **granularity**, not the answer: a trapped `{'EXIT', …}` (or any other non-`Down` signal class) reaches the mailbox one schedule-out later than the oracle's in-scan fetch, because a **bounded** per-signal drain — FIFO up to the first `Terminate`, which needs `exit_policy` and so belongs to `beam_process` rather than a second copy of the policy table here — has no public entry point; the observable result and exit code agree in every shape.
   See the handoff in `../../crates/CONTEXT.md` for the exact seam that would close it.
-
 ## Known Issues / Handoffs
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like
   on an allocation-shaped loop.** Such a runtime runs **zero** collections — the admission declines and
