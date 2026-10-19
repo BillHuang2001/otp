@@ -246,6 +246,7 @@ fn register_driver_port(
         driver_atoms: None,
         driver_control_flags: Some(Rc::clone(&flags)),
         driver_busy,
+        driver_os_pid: None,
         driver_monitors,
         input: Cell::new(0),
         output: Cell::new(0),

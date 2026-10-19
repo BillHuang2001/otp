@@ -611,6 +611,26 @@ struct PortMeta {
     /// "never busy, no `SOFT_BUSY`" case, i.e. `force` ⇒ `notsup`, matching the oracle's own answers
     /// for `{spawn, Cmd}` and `{fd, N}` ports.
     driver_busy: Option<driver::BusyFlag>,
+    /// The **OS child pid** a `{spawn_driver, Name}` port's C driver recorded through
+    /// `erl_drv_set_os_pid` — the C's `prt->os_pid` (`io.c:2971`), which
+    /// `port_info(Port, os_pid)` reads back (`erl_bif_info.c:3814-3817`).
+    ///
+    /// The C starts the field at `-1` (`io.c:386`) and the BIF renders a negative value as the atom
+    /// `undefined`, so **unset is `None`** ([`driver::OsPidFlag`]): a driver that never called the
+    /// hook answers `undefined`, exactly like the oracle
+    /// (`open_port({spawn_driver,"ram_file_drv"},[])`).
+    ///
+    /// It is a shared handle, not a value, because the driver records the pid from inside its
+    /// `start` callback — which runs **after** the port is registered — so the reader has to see a
+    /// later write. Seized from the host with [`driver::DriverPort::os_pid_flag`] **before**
+    /// [`driver::DriverPortAdapter::load`] consumes it (the boxed driver exposes no host), the same
+    /// way [`PortMeta::driver_busy`], [`PortMeta::driver_terms`] and
+    /// [`PortMeta::driver_control_flags`] are.
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port, and a **built-in** driver
+    /// port, whose Rust driver declares no OS child of its own) — those answer from
+    /// [`PortMeta::os_pid`], the pid `beam_io` reports for the child it really forked.
+    driver_os_pid: Option<driver::OsPidFlag>,
     /// The monitor tree a `{spawn_driver, Name}` port's C driver holds on Erlang processes
     /// (`driver_monitor_process`) — the C's per-port monitor list.
     ///
@@ -2469,9 +2489,17 @@ impl PortRegistry {
         let parallelism = item("false")?;
         let os_pid = match meta.os_pid {
             Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
-            // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
-            // the oracle's own answer.
-            None => item("undefined")?,
+            // A **driver** port owns no child the emulator forked: its pid is whatever the driver
+            // recorded with `erl_drv_set_os_pid` (`io.c:2971`), and the C's `prt->os_pid` starts at
+            // `-1` (`io.c:386`), which the BIF renders as `undefined`
+            // (`erl_bif_info.c:3814-3817`) — the oracle's own answer for a port whose driver never
+            // called the hook.
+            None => match meta.driver_os_pid.as_ref().and_then(driver::OsPidFlag::get) {
+                Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
+                // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
+                // the oracle's own answer.
+                None => item("undefined")?,
+            },
         };
         Ok(vec![
             (item("name")?, name),
@@ -3063,6 +3091,16 @@ impl PortHook for RuntimePorts {
             None => PortOptions::default(),
         };
         resolved.overlay(self.port_options(options)?);
+        // `[exit_status]` is `badarg` for any port whose name resolves to a registered driver —
+        // the C's `(driver != &spawn_driver && opts->exit_status)` (`io.c:625-628`), applied to
+        // **both** name forms because the `{spawn, Cmd}` lookup runs first. The refusal is the whole
+        // truth, not a Milestone-1 shortcut: the only `{exit_status, N}` reporter is the
+        // emulator-internal `driver_report_exit` (`io.c:5554`), which `erl_driver.h` does not
+        // declare, so no Erlang-reachable driver can ever report one. Checked here, before any
+        // registry call, so a refused port consumes no id.
+        if resolved.exit_status && opens_a_driver_port(&spec) {
+            return Err(BeamError::BadArg);
+        }
 
         // `beam_io`'s driver constructor really starts the child (or adopts `{fd, N}`)
         // before anything is registered anywhere, so a failure here cannot leak an id; the
@@ -3127,6 +3165,9 @@ impl PortHook for RuntimePorts {
                     driver_atoms: None,
                     driver_control_flags: None,
                     driver_busy: None,
+                    // A built-in driver is this crate's Rust driver, not a loaded `ErlDrvEntry`:
+                    // it has no `erl_drv_set_os_pid` hook to record an OS child through.
+                    driver_os_pid: None,
                     driver_monitors: None,
                     input: Cell::new(0),
                     output: Cell::new(0),
@@ -3188,6 +3229,11 @@ impl PortHook for RuntimePorts {
             // bit, which `DriverPortAdapter::load` stamps onto this same handle once the library is
             // open — so the value is visible here without re-reading the entry.
             let driver_busy = host.busy_flag();
+            // And for the port's **OS child pid**: the driver records it from inside a callback
+            // through `erl_drv_set_os_pid` (`io.c:2971`), which `port_info(Port, os_pid)` reads
+            // back. Seized here for the same reason as the busy handle — the host is consumed by
+            // `load` below, and the write arrives *after* the port is registered.
+            let driver_os_pid = host.os_pid_flag();
             // And for the monitors the driver may install through `driver_monitor_process`: the
             // runtime sweeps this handle at the scheduler-pass boundary to mark a monitored process
             // that has died, and the port's own drive point fires the driver's `process_exit`.
@@ -3217,6 +3263,7 @@ impl PortHook for RuntimePorts {
                 driver_atoms: Some(driver_atoms),
                 driver_control_flags: Some(driver_control_flags),
                 driver_busy: Some(driver_busy),
+                driver_os_pid: Some(driver_os_pid),
                 driver_monitors: Some(driver_monitors),
                 input: Cell::new(0),
                 output: Cell::new(0),
@@ -3262,6 +3309,9 @@ impl PortHook for RuntimePorts {
             driver_atoms: None,
             driver_control_flags: None,
             driver_busy: None,
+            // A `spawn`/`fd` port has no C driver — its OS child pid is the one `beam_io` reports
+            // for the process it forked, carried in [`PortMeta::os_pid`].
+            driver_os_pid: None,
             driver_monitors: None,
             input: Cell::new(0),
             output: Cell::new(0),
@@ -3583,6 +3633,11 @@ impl Runtime {
         // same route — the same `table`, the same delivery seam, so the same receiver is woken
         // through `beam_process`'s wake list (see [`exit`]).
         delivered += self.deliver_port_signals(table)?;
+        // A driver that observed its **peer** closing owes its owner the oracle's own message
+        // (`{tcp_closed, Port}`, and the port's retirement when `exit_on_close` is set). It takes
+        // this same route — the same `table`, the same delivery seam — so a parked receiver is
+        // woken through `beam_process`'s wake list (see [`ops::peer_closed`]).
+        delivered += self.deliver_peer_closes(table)?;
         Ok(delivered)
     }
 }
@@ -3712,6 +3767,9 @@ impl RuntimeContext<'_> {
         // other recipient's stay queued for the scheduler route that owns a process table (see
         // [`exit`]).
         messages.extend(self.poll_port_signals()?);
+        // A peer close owed to the evaluator itself rides the same inline route (see
+        // [`ops::peer_closed`]); another process's report is left latched for the scheduler route.
+        messages.extend(self.poll_peer_closes()?);
         Ok(messages)
     }
 
@@ -4018,6 +4076,31 @@ fn driver_path_name(command: &str) -> &str {
     command.split(' ').next().unwrap_or(command)
 }
 
+/// Whether `spec` names a port the C would open **through a driver** — the predicate behind the
+/// `[exit_status]` refusal (`erts/emulator/beam/io.c:595-628`).
+///
+/// The C resolves the name against its loaded-driver list for **both** name forms: `{spawn, Cmd}`
+/// truncates the command at the first blank and searches for the token (`io.c:599-628`), and
+/// `{spawn_driver, Name}` searches for the name itself. A hit means the port is a *driver* port, for
+/// which `opts->exit_status` is `badarg` (`io.c:625-628`) — and an unresolved `{spawn_driver, Name}`
+/// is `badarg` a few lines later for the same input, so the answer does not depend on the lookup.
+///
+/// The membership gates are the emulator's own two: [`driver::is_static_driver`] (the `driver_tab.c`
+/// statics — `tcp_inet`, `udp_inet`, `ram_file_drv`) and [`driver::driver_is_loaded`] (a driver an
+/// `erl_ddll:load_driver/3` put on the loaded list). `fd`/`efile` are deliberately **not** members:
+/// OTP 21+ made them ordinary modules, so the oracle runs `{spawn,"fd"}` as a shell command and
+/// accepts `[exit_status]` for it (verified against erts-17.1). `{spawn_executable, Path}` skips the
+/// lookup entirely in the C (`spawn_type != ERTS_SPAWN_EXECUTABLE`), so it is never a driver port.
+fn opens_a_driver_port(spec: &NameSpec) -> bool {
+    match spec.kind {
+        PortName::SpawnDriver | PortName::SpawnDriverBuiltin => true,
+        PortName::Spawn => {
+            let name = driver_path_name(&spec.command);
+            driver::is_static_driver(name) || driver::driver_is_loaded(name)
+        }
+        PortName::SpawnExecutable | PortName::Fd => false,
+    }
+}
 /// The driver search a `{spawn_driver, Name}` name performs: the candidate object paths to try
 /// and the driver name the loaded entry must declare.
 ///
