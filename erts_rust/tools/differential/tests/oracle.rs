@@ -317,7 +317,10 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
 
 /// Every non-CLI **command** case must reproduce its golden under the oracle too: the oracle
 /// argv is spawned directly (no `erlc`, no helper needed — the oracle side is the system
-/// `erl`). Skips loudly (never a silent pass) when `erl` is unavailable.
+/// `erl`). A case that carries a **peer leg** gets that peer from the oracle's own program,
+/// exactly as [`differential::harness`] gives each side a peer of its own runtime, so a
+/// two-VM case's golden is still reproduced by the oracle alone. Skips loudly (never a silent
+/// pass) when `erl` is unavailable.
 #[test]
 fn command_cases_reproduce_their_golden_under_the_oracle() {
     let Some(oracle) = oracle_or_skip() else {
@@ -329,7 +332,28 @@ fn command_cases_reproduce_their_golden_under_the_oracle() {
             continue;
         };
         checked += 1;
-        let argv = run.oracle_argv();
+        // The node names of a two-VM case are derived per invocation (`epmd`'s name space is
+        // machine-global), so the templates must be expanded exactly as the harness does.
+        let nonce = differential::runtime::peer_nonce(case.id, differential::runtime::RuntimeId::Oracle);
+        let argv = differential::corpus::expand_nonce(&run.oracle_argv(), &nonce);
+        let _peer = match &run.peer {
+            None => None,
+            Some(peer) => {
+                let peer_argv = differential::corpus::expand_nonce(peer.args, &nonce);
+                match differential::runtime::spawn_peer(
+                    &oracle,
+                    &peer_argv,
+                    peer.ready_prefix,
+                    differential::runtime::PEER_READY_TIMEOUT,
+                ) {
+                    differential::runtime::PeerStart::Ready(peer) => Some(peer),
+                    differential::runtime::PeerStart::NotReady(reason) => {
+                        eprintln!("SKIP: case {}: {reason}", case.id);
+                        continue;
+                    }
+                }
+            }
+        };
         let observation = run_with_env(&oracle, &argv, &[]).unwrap_or_else(|error| {
             panic!("case {}: failed to run the oracle: {error}", case.id)
         });
