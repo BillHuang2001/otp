@@ -393,6 +393,10 @@ struct InflateRun {
     eos_seen: bool,
     /// `inflateEnd/1`'s answer for this run (see [`Nif::inflate_end_ok`]).
     end_ok: bool,
+    /// The first call that reported `Z_STREAM_END`, as `(call index, queue was drained)`.
+    /// The second element is the claim that the status arrives on the call that *drains* the
+    /// stream rather than one call later.
+    end_call: Option<(usize, bool)>,
 }
 
 /// `safeInflate/2`'s loop (`walk/3` in the module docs): enqueue the whole image on the
@@ -401,6 +405,7 @@ fn pump_inflate(window_bits: i8, image: &[u8], schedule: Schedule) -> InflateRun
     let mut nif = inflate_nif(window_bits, schedule);
     let mut out = Vec::new();
     let mut kinds = Vec::new();
+    let mut end_call = None;
     let mut feed: &[u8] = image;
     loop {
         let verdict = nif
@@ -408,6 +413,9 @@ fn pump_inflate(window_bits: i8, image: &[u8], schedule: Schedule) -> InflateRun
             .expect("inflate reports statuses, never errors");
         feed = &[];
         out.extend_from_slice(&verdict.out);
+        if verdict.status == Status::StreamEnd && end_call.is_none() {
+            end_call = Some((kinds.len(), nif.remaining() == 0));
+        }
         kinds.push(verdict.kind);
         match verdict.kind {
             Kind::Finished => break,
@@ -420,9 +428,9 @@ fn pump_inflate(window_bits: i8, image: &[u8], schedule: Schedule) -> InflateRun
         kinds,
         eos_seen: nif.eos_seen,
         end_ok: nif.inflate_end_ok(),
+        end_call,
     }
 }
-
 /// Everything a *fresh* inflater reads out of `image`, how much of it that consumed, and
 /// whether it reached the end of the stream: `(plaintext, consumed, ended)`.
 fn decode_prefix(window_bits: i8, image: &[u8]) -> (Vec<u8>, usize, bool) {
@@ -597,7 +605,21 @@ fn the_inflate_pump_reassembles_the_payload() {
                     run.eos_seen,
                     "{framing}/{size}/level {level}: Z_STREAM_END was reported"
                 );
+                // The status arrives on the call that *drains* the queue — the NIF's
+                // drain-then-flush call is where a stream ends, never a call that still has
+                // input queued behind it.
+                let (end_at, drained) = run.end_call.unwrap_or_else(|| {
+                    panic!("{framing}/{size}/level {level}: no call reported Z_STREAM_END")
+                });
                 assert!(
+                    drained,
+                    "{framing}/{size}/level {level}: Z_STREAM_END came on call {end_at} with input still queued"
+                );
+                assert!(
+                    end_at + 2 >= run.kinds.len(),
+                    "{framing}/{size}/level {level}: Z_STREAM_END on call {end_at} of {}",
+                    run.kinds.len()
+                );                assert!(
                     run.end_ok,
                     "{framing}/{size}/level {level}: `inflateEnd/1` would accept the stream"
                 );

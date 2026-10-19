@@ -76,8 +76,10 @@ use zsupport::hex;
 /// The oracle's `zlib:compress/1` image — `deflateInit(Z, default)` +
 /// `deflate(Z, Data, finish)` — of each [`zsupport::corpus_small`] input, in that order:
 /// empty, `abc`, 16 zeros, 300 `'a'`s, [`zsupport::mixed_kib`].
-const DEFAULT_COMPRESSION_IMAGES: [&str; 5] = [
-    // empty
+// Every entry keeps the `concat!` wrapper (even the one-chunk ones) so the whole table can
+// be pasted back from the golden regenerator below verbatim.
+#[allow(clippy::useless_concat)]
+const DEFAULT_COMPRESSION_IMAGES: [&str; 5] = [    // empty
     concat!("789c030000000001",),
     // abc
     concat!("789c4b4c4a0600024d0127",),
@@ -112,8 +114,9 @@ const DEFAULT_COMPRESSION_IMAGES: [&str; 5] = [
 /// Note that levels 2-5 share one image with level 1 (the `deflate_fast` path and the same
 /// header flags) and 8-9 share level 7's: at three bytes there is nothing for the level
 /// parameters to change but the header's `level_flags`.
-const ABC_LEVEL_IMAGES: [&str; 10] = [
-    // level 0
+// Pasted back from the golden regenerator verbatim, `concat!` wrapper included.
+#[allow(clippy::useless_concat)]
+const ABC_LEVEL_IMAGES: [&str; 10] = [    // level 0
     concat!("7801010300fcff616263024d0127",),
     // level 1
     concat!("78014b4c4a0600024d0127",),
@@ -190,8 +193,10 @@ fn repetitive(n: usize) -> Vec<u8> {
 /// The corpus: `(name, generator)` for each shape the round trip must survive. `lcg` is
 /// effectively incompressible (stored blocks), `repetitive` is pure matches, and the two
 /// constant runs sit at the extremes of the literal/run encodings.
-fn generators() -> [(&'static str, fn(usize) -> Vec<u8>); 4] {
-    [
+type Generator = (&'static str, fn(usize) -> Vec<u8>);
+
+/// The four corpus shapes.
+fn generators() -> [Generator; 4] {    [
         ("repetitive", repetitive),
         ("lcg", |n| lcg_bytes(n, 0x5eed)),
         ("zeros", |n| vec![0u8; n]),
