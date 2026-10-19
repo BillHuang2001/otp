@@ -2757,21 +2757,23 @@ impl Runtime {
         self.dist_client.as_ref()
     }
 
-    /// The full `node@host` names of every peer this runtime has **established** an outbound
-    /// link to. Empty for a runtime that is not a node.
+    /// The full `node@host` names of every peer this runtime has an **established** link to,
+    /// **in either direction**: the peers this runtime dialled and the peers that dialled into
+    /// it (the union [`DistClient::all_connected_nodes`] reports). Empty for a runtime that is
+    /// not a node.
     pub fn dist_connected_nodes(&self) -> Vec<String> {
         self.dist_client
             .as_ref()
-            .map(DistClient::connected_nodes)
+            .map(DistClient::all_connected_nodes)
             .unwrap_or_default()
     }
 
-    /// Whether this runtime's outbound link to `peer` completed its `'N'` handshake.
-    /// `false` for a runtime that is not a node.
+    /// Whether this runtime's link to `peer` — dialled by this runtime or opened by the peer —
+    /// completed its `'N'` handshake. `false` for a runtime that is not a node.
     pub fn dist_is_connected(&self, peer: &str) -> bool {
         self.dist_client
             .as_ref()
-            .is_some_and(|client| client.is_connected(peer))
+            .is_some_and(|client| client.is_connected_any_half(peer))
     }
 
     /// Dials `peer` and drives the connector handshake to completion (contract A.5, Phase 2).

@@ -560,6 +560,25 @@ impl DistClient {
         }
     }
 
+    /// Whether **either half's** link to `peer_name` completed its `'N'` handshake.
+    ///
+    /// The union exists because a link a peer **dialled into** this runtime is as much a link
+    /// to that node as one this runtime dialled — `erlang:nodes/0` and `net_adm:ping/1` must
+    /// see a peer that connected *us*, not only the peers we opened.
+    ///
+    /// The name is normalized through [`NodeName::parse`] exactly as
+    /// [`DistClient::is_connected`] does, and the membership test is over
+    /// [`DistLinks::established_names`] — the one union rule, so the two halves can never be
+    /// matched differently. A cell that cannot be borrowed answers `false`, the same
+    /// discipline [`DistClient::is_connected`] keeps.
+    pub fn is_connected_any_half(&self, peer_name: &str) -> bool {
+        let full = NodeName::parse(peer_name).full().to_string();
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.links.established_names().iter().any(|name| *name == full),
+            Err(_) => false,
+        }
+    }
+
     /// Whether an outbound link to the node named by `node` (its atom term) completed
     /// its `'N'` handshake.
     pub fn is_connected_to_node(&self, node: Eterm) -> bool {
@@ -581,6 +600,23 @@ impl DistClient {
                 .filter(|link| link.is_established())
                 .map(|link| link.name.clone())
                 .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The full `node@host` names of every peer this runtime has an **established** link to,
+    /// **either** half: the peers it dialled first, then the peers that dialled into it (the
+    /// union [`DistLinks::established_names`] reports).
+    ///
+    /// The union exists because a link a peer **opened into** this runtime reaches that node
+    /// just as an outbound one does, so `erlang:nodes/0` — which reads this — must not hide
+    /// the peers that connected to us. [`DistClient::connected_nodes`] stays the outbound-only
+    /// view. A client cell that cannot be borrowed answers `[]`, matching
+    /// [`DistClient::connected_nodes`]; an accepted cell that cannot be borrowed contributes no
+    /// accepted name (the union rule's own discipline, [`DistLinks::established_names`]).
+    pub fn all_connected_nodes(&self) -> Vec<String> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.links.established_names(),
             Err(_) => Vec::new(),
         }
     }
