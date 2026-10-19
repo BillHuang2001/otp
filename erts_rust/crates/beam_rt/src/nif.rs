@@ -63,15 +63,17 @@
 //! (`unique_integer`, the C emulator's four counter sequences), the emulator information block
 //! (`system_info`) and the extra-environment family (`alloc_env`/`free_env`/`make_copy`).
 //!
-//! Eight hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name
+//! Ten hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name
 //! lookup (`enif_whereis_pid`), the two liveness answers (`enif_is_process_alive`,
 //! `enif_is_current_process_alive`), the two port relations (`enif_is_port_alive`,
-//! `enif_port_command`), a message delivery (`enif_send`) and the `NEW_FUN_EXT` identity of a
-//! local closure (`enif_term_to_binary`) — and reach it through the optional
+//! `enif_port_command`), a message delivery (`enif_send`), the `NEW_FUN_EXT` identity of a
+//! local closure (`enif_term_to_binary`) and the two process-monitor hooks
+//! (`enif_monitor_process`/`enif_demonitor_process`, armed and delivered through
+//! [`crate::nif_monitor`]) — and reach it through the optional
 //! [`NifHostServices`] provider threaded in at construction. The **per-call** host (built by
 //! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) carries a
 //! [`RuntimeNifServices`] over the runtime, the pass's own process table and the calling module,
-//! so all eight are live there. The **load/unload** host (built by
+//! so all ten are live there. The **load/unload** host (built by
 //! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
 //! registry, so it cannot borrow the runtime and is built with `services = None`: those hooks then
 //! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
@@ -101,12 +103,6 @@
 //! * **`whereis_port`** (`:1182`) — resolves a name to a **port**. This runtime's name registry holds
 //!   pids only and `erlang:register/2` refuses a port (`ProcessId::from_eterm`), so no atom can ever
 //!   name a port here: `None` (⇒ `0`) is the *provable* answer, not a missing feature.
-//! * **`monitor_process`** / **`demonitor_process`** (`:3954-4011`, `:4019-4052`) — records the
-//!   monitor under the *resource* doing the watching and returns the internal reference it was
-//!   registered under. This runtime's monitors are keyed by a **process** watcher
-//!   (`ProcessTable::monitor(watcher, target, kind)`) and a NIF resource has no process identity;
-//!   registering would need `&mut ProcessTable` besides. Defaults: `1` (dead/undefined target), `1`
-//!   (not identified).
 //! * **`select`** (`erl_check_io.c`) — registers poll interest on a **raw fd** and delivers the C's
 //!   `{select, ResourceTerm, Ref, EventAtom}` to a pid. The refusal is `-1` (negative, so the C's
 //!   documented `retval < 0` idiom still holds). Two seams this crate cannot reach own it: the
