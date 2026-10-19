@@ -10,8 +10,10 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node).
 This directory holds only the sink submodule and this doc; the node half is the parent file `src/dist.rs`.
 
 ## API Surface
-- `dist.rs` (module `crate::dist`, FROZEN façade): `NodeName` (+ `local_hostname`), `DistConnection`,
-  `DistNode`, `resolve_cookie`, and the consts `NONODE_NAME`, `DIST_READ_SLICE`, `DIST_LISTEN_ADDR`
+- `dist.rs` (module `crate::dist`, FROZEN façade): `NodeName` (+ `local_hostname`), `DistConnection`
+  (+ `state`/`is_established`/`is_live`/`peer_name`/`peer_creation`/`peer_visibility`/`peer_addr`/
+  `bytes`/`has_pending_output`/`close`), `DistNode`, `resolve_cookie`, `epmd_addr`, and the consts
+  `NONODE_NAME`, `DIST_READ_SLICE`, `DIST_LISTEN_ADDR`
   (also `MAX_ACCEPTS_PER_PUMP`/`DIST_DISPATCH_HEAP_WORDS`).
 - `dist/inbound.rs`: `LocalDeliverySink` — the `impl InboundSink` sink plus its private `Target` enum and
   routing helpers (`envelope_from`, `receipt`, `remote_pid`, `small_uint`).
@@ -43,10 +45,20 @@ This directory holds only the sink submodule and this doc; the node half is the 
   connection or a link mid-handshake. A node therefore serves distribution only while some *other* wake
   source (a timer deadline, a runnable process, a port) keeps the pump stepping — which is why both live
   dist suites drive a keep-alive fixture's `receive … after 25`.
-- `DistConnection::pump` calls `self.driver.step()?`, which returns **before** the output flush, so a
-  driver that framed a refusal status (`not_allowed` on a mandatory-flag failure, an accept-decision
-  refusal) and then returned `Err` never gets those bytes written — the link is retired with them still in
-  the driver's buffer (contrary to `beam_dist`'s "the bytes survive even though `step` then returns `Err`").
+- `DistConnection::pump` flushes `take_output()` on **both** outcomes, so a refusal status the driver
+  framed (`not_allowed` on a mandatory-flag failure, an accept-decision refusal) still reaches the peer's
+  socket although `step` reports it as `Err`; only a write failure suppresses it, and it retires the link.
+- `DistConnection::close` shuts the socket down in both directions (`ENOTCONN` and the connection-lost
+  errors are the post-condition, not failures), and it is the first thing `DistNode::retire` does — on the
+  pump's error arm and on its dead-link (`!is_live()`) arm alike — so a retired link is never left
+  half-open.
+- `DistConnection::peer_visibility` reports how the peer's own flags classify it
+  (`PeerVisibility::Normal`/`Hidden`, `dist_util.erl:publish_type/1`), which is **recorded, never
+  refused**: both ends of an OTP connection may advertise themselves hidden (this runtime advertises
+  `preferred_flags`, which omits `DFLAG_PUBLISHED`).
+- `epmd_addr` is the node's one `epmd` address: `$ERL_EPMD_PORT` (a bare `N` ⇒ `127.0.0.1:N`, a value
+  containing `:` used verbatim) else `EPMD_DEFAULT_ADDR`, and it is what `DistNode::register_once`'s
+  `ALIVE2_REQ` connects to.
 
 ## Constraints
 - Errors are return-based (`beam_common::Result`); a link-level failure **retires that one link** and is
@@ -55,7 +67,8 @@ This directory holds only the sink submodule and this doc; the node half is the 
 - Never deliver to the wrong process: an addressed party not local to *this* node is `NoSuchProcess`, a
   party outside its opcode's wire contract is `Unsupported`, never a silent mis-delivery.
 - Do not hand-edit generated artifacts; Apache-2.0 header block required on every `.rs` file.
-- Keep each file ~1000 lines; `dist.rs` is ~796, `dist/inbound.rs` is ~865.
+- Keep each file ~1000 lines; `dist.rs` is 1278 (907 of production, the rest its inline unit suite —
+  loopback `DistConnection`/`DistNode` fixtures over a real socket pair), `dist/inbound.rs` is ~865.
 
 ## Missing sibling APIs (the still-`Unsupported` families)
 - **The distributed-spawn family** (`SpawnRequest`/`SpawnReply`) needs a `beam_process` spawn-responder/reservation API — a `DOP_SPAWN_REPLY` sender plus the reservation bookkeeping a `DOP_SPAWN_REQUEST` keys into.
