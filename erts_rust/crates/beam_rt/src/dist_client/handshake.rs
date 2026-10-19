@@ -76,6 +76,9 @@ impl ClientLink {
     }
 
     /// Whether the link can still make progress (handshaking or established).
+    ///
+    /// `pub(super)` because the client's drain (`DistClientInner::step_links`) asks it after
+    /// each pump to decide whether the link survives.
     pub(super) fn is_live(&self) -> bool {
         matches!(
             self.driver.state(),
