@@ -186,7 +186,9 @@ const EXPECTED_RESUMED: &str = "{ok,cleared,echoed}";
 
 /// The `beam_rt` reason for the one arm with no truthful answer (`src/native/port.rs`).
 const BUSY_UNSUPPORTED: &str =
-    "beam_rt: unsupported: port_command on a busy port: suspending the caller until the port is idle is not implemented";
+    "beam_rt: unsupported: port_command on a busy port: this caller runs inside a scheduler slice \
+     and cannot re-enter the scheduler to wait for the port (the runtime has no engine-side \
+     BIF-suspend channel that would park it and re-run the BIF)";
 
 /// Print a loud skip banner (never a silent pass).
 fn skip(reason: &str) {
