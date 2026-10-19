@@ -617,7 +617,7 @@ The `emqx_base62_encode` row of the `foreign` table above is the `bench` driver'
 * Crate gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt`.
   The off-heap prune's own suite lives with its module ([`../context/gc/bin_vheap.rs`](../context/gc/bin_vheap.rs)); what this node must keep true around it is the park contract — a non-publishing window is refused before any work, and the call sits after the boundary collection and before the heap-kill drain.
 
-## Known Issues / Handoffs
+## A process's own signal work before it sleeps
 * **A signal a process queues on ITSELF is delivered before its next schedule-in — two mechanisms, because the C has both.**
   **The in-scan fetch** ([`../context/execution.rs`](../context/execution.rs) `receive_next`, the C `i_loop_rec` → `erts_proc_sig_receive_helper` → `erts_proc_sig_fetch`, `../../erts/emulator/beam/emu/msg_instrs.tab:80-112`, `../../erts/emulator/beam/erl_proc_sig_queue.c:7729`, contract comment `:7739-7759`, splice + re-peek `:7771-7799`): an exhausted scan whose queue is *entirely* `PendingSignal::Down` applies it through the public `ProcessTable::service_signals` and re-reads the scan, so the awaited `'DOWN'` costs no extra scheduling round.
   The `Down`-only gate is what keeps that service non-fatal from **inside** the machine's instruction stream: a `Terminate(_)` verdict has no channel there to report a death or its propagation, so every other class is left to the net below rather than duplicating `exit_policy`.
