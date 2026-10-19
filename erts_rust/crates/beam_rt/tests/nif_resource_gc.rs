@@ -72,7 +72,13 @@
 //! pin and [`without_the_resource_prune_the_eval_route_is_linear`] its A/B control; both drive the
 //! `-eval` route **in process** (`Runtime::eval`), because the figures that make the claim
 //! falsifiable (`Runtime::resource_prune_stats()`) are runtime state rather than observable
-//! output.//!
+//! output. Those two legs are therefore the only ones here that are **not** differential: the
+//! oracle refcounts a resource term straight off its process heap, so it has no counterpart for a
+//! frontier, a release count or a live-term table. Every *observable* count in this file (the
+//! destructor totals) is still asserted against the live oracle's own answer for the identical
+//! `.beam`/`.so`, and the retention figures are asserted **exactly** (`live_after ==
+//! live_before`), never as a ceiling.
+//!
 //! # Everything here is real
 //!
 //! The C fixture (`tests/fixtures/nif_resource_gc.c`) is compiled at test time with the
@@ -938,10 +944,12 @@ fn load_average() -> String {
 ///   one-statement leak the design documents is *zero* in this shape rather than one term);
 /// * `released == ΣN` and `prunes == ΣN` — one walk per minting statement, releasing exactly that
 ///   statement's mint — and `declines == 0`, so no walk was refused;
-/// * `live_after <= live_before` — the table does not grow by a single entry, which is the "bounded"
-///   half stated on the table itself;
-/// * the sweep's own comparison: the table after `1 110` mints is no larger than it was after the
-///   first `10` (a linear table answers `1 110` there);
+/// * `live_after == live_before` — the table is left **exactly** as the leg found it, which is the
+///   "bounded" half stated on the table itself. Exact, not a ceiling: the guard at the top of the
+///   test proves the sweep starts from an empty registry and nothing else in this process mints or
+///   releases during the `EVAL_LEG`-serialised leg, so a shrink is as much a bug as the growth;
+/// * the sweep's own comparison: the table after `1 110` mints is **exactly** the size it was after
+///   the first `10` (a linear table answers `1 110` there);
 /// * `erlang:memory(total)` is printed, never asserted. Measured: it does **not** move either way
 ///   (`19 107` B after the first leg, `19 121` B after the last, in both legs) — a resource term's
 ///   object is a host `malloc` outside every runtime allocator, so this figure cannot see the table
@@ -1017,18 +1025,15 @@ fn the_eval_statement_boundary_keeps_the_resource_table_bounded() {
             leg.declines, 0,
             "this root graph is fully walkable, so a declined walk would be a bug: {leg:?}"
         );
-        assert!(
-            leg.live_after <= leg.live_before,
-            "the resource table must not grow ({} mints left {} live term(s) behind: {} -> {}): \
-             {leg:?}",
-            leg.mints,
-            leg.growth(),
-            leg.live_before,
-            leg.live_after
+        assert_eq!(
+            leg.live_after, leg.live_before,
+            "the resource table must be left EXACTLY as the leg found it: {} mint(s) must not add \
+             — or remove — a single entry ({} -> {} live term(s)): {leg:?}",
+            leg.mints, leg.live_before, leg.live_after
         );
     }
-    // Flat in N, stated as the sweep's own comparison: the table after a hundred-fold more mints may
-    // not be larger than it was after the smallest step (a linear table would answer 1 110 here).
+    // Flat in N, stated as the sweep's own comparison: the table after a hundred-fold more mints must
+    // be the very same size it was after the smallest step (a linear table would answer 1 110 here).
     let early_peak = series
         .iter()
         .take(2)
@@ -1036,12 +1041,13 @@ fn the_eval_statement_boundary_keeps_the_resource_table_bounded() {
         .max()
         .unwrap_or(0);
     let large = series.last().copied().expect("the sweep has a last leg");
-    assert!(
-        large.live_after <= early_peak,
-        "the table drifted upward across the sweep: {} live term(s) after {} mints vs an early \
-         peak of {early_peak}",
+    assert_eq!(
+        large.live_after, early_peak,
+        "the table drifted across the sweep: {} live term(s) after {} mints vs {early_peak} after \
+         the first {}",
         large.live_after,
-        cumulative
+        cumulative,
+        series.first().map(|leg| leg.mints).unwrap_or(0)
     );
     fixture.cleanup();
 }

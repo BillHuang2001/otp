@@ -3892,26 +3892,19 @@ impl ProcessTable {
         self.group_leaders.get(&to).copied()
     }
 
-    /// Mints a fresh reference from the table's own [`RefAllocator`] — the allocator every
-    /// monitor, alias and outgoing remote monitor reference in this crate is drawn from.
-    ///
-    /// This is an **additive** seam for HAZARD 2, the collision of the two independent
-    /// reference-id spaces (this table's [`RefAllocator`] and `beam_rt::Runtime::refs`, which
-    /// feeds `make_ref/0`, the NIF `make_ref`, the timers and `seq_trace`). `next_reference`
-    /// lets the host draw *those* references from the **same** id space, which makes an id
-    /// collision between a monitor/alias reference and a bare `make_ref/0` reference
-    /// impossible — the one closure avenue available from this crate. **Nothing in this crate
-    /// calls it**: it closes HAZARD 2 only once the host adopts it (draw `make_ref/0` and its
-    /// timer/`seq_trace` references from here instead of from its own allocator). The
-    /// alternative — a distinguishing `node`/`serial` word in
-    /// [`MonitorRef::to_eterm`](crate::monitor::MonitorRef::to_eterm)'s payload — is *not*
-    /// closable from `beam_process`: `beam_codec`'s internal-reference codec rebuilds through
-    /// `beam_term`'s `write_internal_ref` with both words zeroed, and
-    /// `beam_term::compare::cmp_refs` compares payload words only.
+    /// Mints a fresh reference from the runtime's **one shared local reference-id space** — the
+    /// same space every monitor, alias and outgoing remote monitor reference in this crate draws
+    /// from ([`RefAllocator`] is a zero-sized handle onto `beam_common::next_ref_id` — see
+    /// [`crate::monitor::RefAllocator`]).    ///
+    /// A host may use this for a reference that is not a monitor's — `erlang:make_ref/0`, a timer
+    /// or `seq_trace` reference — and it **cannot collide** with a monitor/alias reference: the ids
+    /// come from the one process-wide counter, which every local producer shares (`beam_common`'s
+    /// `refid` module is the single source of truth). **Nothing in this crate calls it**; it is
+    /// kept as the table-shaped spelling of a local reference mint for hosts that already hold the
+    /// table.
     pub fn next_reference(&mut self) -> MonitorRef {
         self.refs.next()
     }
-
     /// A whole remote **node** went away (its distribution connection dropped): every local
     /// relationship with that node is resolved the way the signals would have been, had the
     /// node been alive to send them, and then purged.

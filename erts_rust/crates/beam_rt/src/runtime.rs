@@ -553,12 +553,14 @@ pub struct Runtime {
     /// The reference id space `erlang:make_ref/0`, the NIF `make_ref` and the timer /
     /// `seq_trace` references draw from (see [`Runtime::refs_mut`]).
     ///
-    /// This is **not** the process table's reference allocator: `erlang:monitor/2,3` and
-    /// `erlang:alias/1` mint from [`ProcessTable`]'s **own** [`RefAllocator`], and the two
-    /// spaces are independent (both monotone `u64` from `0`). A term→reference resolution
-    /// must therefore key on the **term** ([`Runtime::references`], via
-    /// [`Runtime::local_reference`]) rather than on a decoded id — the same id can name a
-    /// `make_ref/0` term and a live monitor/alias reference.
+    /// [`RefAllocator`] is a zero-sized handle onto **one** process-wide local reference-id space
+    /// ([`beam_common::next_ref_id`]), and every other local reference producer draws from that
+    /// same space too: `erlang:monitor/2,3` and `erlang:alias/1` mint through [`ProcessTable`]'s
+    /// own [`RefAllocator`] handle, and a NIF resource term (`enif_make_resource`) draws through
+    /// `beam_abi`'s. So a reference id is never issued twice, and a term→reference resolution may
+    /// still key on the **term** ([`Runtime::references`], via [`Runtime::local_reference`])
+    /// because *provenance* (which producer minted it) is what distinguishes a bare
+    /// `make_ref/0` from a live monitor/alias — not the id.
     pub(crate) refs: RefAllocator,
     /// Every reference term the runtime minted, keyed by the term itself.
     ///
@@ -1496,9 +1498,10 @@ impl Runtime {
         self.arena.heap_available()
     }
 
-    /// The runtime's own reference id space — the source of `erlang:make_ref/0`, the NIF
-    /// `make_ref` and the timer / `seq_trace` references (see [`Runtime::refs`]). Monitor
-    /// and alias references mint from the process table's allocator instead.
+    /// The runtime's handle onto the **one** shared local reference-id space — the source of
+    /// `erlang:make_ref/0`, the NIF `make_ref` and the timer / `seq_trace` references (see
+    /// [`Runtime::refs`]). The process table's [`RefAllocator`] and `beam_abi`'s resource mint are
+    /// handles onto the same space, so no two local reference producers can issue the same id.
     pub fn refs_mut(&mut self) -> &mut RefAllocator {
         &mut self.refs
     }
@@ -2225,8 +2228,10 @@ impl Runtime {
     ///   `-eval` runtime). A narrower live-`x` seam on `beam_engine::Machine` would cut it; that is
     ///   another node's change.
     /// * A resource's identity is an ordinary internal reference, so the reference-identity match
-    ///   tier cannot tell a copy of a resource from an unrelated plain reference with an equal id —
-    ///   an id collision **retains** a dead resource term (`M1_GAPS.md` *The resource-identity collision*).
+    ///   tier treats a *copy* of a resource term (same words) as a match — which is the correct
+    ///   direction for a copy. An unrelated plain reference can never share its id: every locally
+    ///   minted reference id — resources included — is a draw of the one shared space
+    ///   ([`beam_common::next_ref_id`]).
     pub(crate) fn gather_off_heap_roots(&mut self, out: &mut Vec<Eterm>) {
         // The escaped closures' capture environments.
         for body in &self.eval_closures {

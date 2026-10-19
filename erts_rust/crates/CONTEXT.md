@@ -33,6 +33,20 @@ Inherited and refined from `../CONTEXT.md` — do not restate, obey:
 
 ### The seam types (the inter-crate interface each crate MUST expose for its dependents)
 This is the frozen public-API shape dependents design against; keep it stable.
+- `beam_common` → `next_ref_id() -> u64` (`src/refid.rs`): **the ONE local reference-id space** — a
+  process-wide monotone `AtomicU64`, first draw `0`. Every locally minted reference *term* draws its
+  `id` word from it: `erlang:make_ref/0`, the NIF `make_ref`, `erlang:monitor/2,3`, `alias/1`, timer and
+  `seq_trace` references, `beam_process::RefAllocator` (a ZST handle over it — so `Runtime::refs` and
+  `ProcessTable::refs` are one space), and NIF resource terms (`enif_make_resource`, narrowed to
+  `MAX_SMALL` by `beam_abi`). **No crate may keep a private reference-id counter.** A reference's
+  identity is the `id` word alone (`node`/`serial` are `0` in M1), so an overlapping space makes a
+  **dead** NIF resource term word-indistinguishable from a live plain reference and an identity-matching
+  reachability prune retains it — measured as a resource-retention ratchet until this space was shared
+  (`beam_rt/tests/nif_resource_nested.rs`'s dropped legs now answer `{10,0}` / `{200,0}`, the oracle's
+  exact figures, instead of `{1,9}` / `{164,36}`). `beam_process::MonitorRef::from_id` is the one
+  **explicit-id, non-mint** constructor, for a *derived* id (the unnamed-ETS tid, whose id must be the
+  table handle so the tid decodes back through `beam_bifs::access::ref_thing_id`); it draws nothing and
+  its uniqueness is the caller's claim. Reference ids decoded from another node are outside this space.
 - `beam_term` → frozen term layout; `map` (flat-map ↔ HAMT/CHAMP builder: `write_map`/`map_words_capacity`/
   `map_size`/`map_get`/`map_pairs`/`map_put`/`map_remove`), `bitstring` (`write_heap_bits`/`write_binary`/
   `write_sub_bits`/public `bitstring_parts`/`bit_at`/`float_bits`/`float_value`), `refc` (`BinRef`/`ErlSubBits`
@@ -588,6 +602,19 @@ in-process compiler route.
   refc binaries, and the runtime parity work (`func_info`→`function_clause`, the `DictHook` process
   dictionary, the `{minor_version}` `term_to_binary/2` adoption, sorted `-eval` map literals).
 ## Design Decisions
+- **One reference-id space, owned by the LCA.** Reference ids are minted by `beam_common::next_ref_id`
+  and by nothing else. `beam_common` hosts it because it is the lowest common ancestor: `beam_abi`
+  (wave 0) cannot host a type that `beam_process` (wave 3) draws from, and `beam_process` must not
+  depend on the NIF ABI crate. `beam_process::RefAllocator` survives as the typed handle
+  (`new()`/`next() -> MonitorRef`) so dependents are unchanged; `beam_abi` narrows the shared id to
+  `beam_term::MAX_SMALL` **checked** (an `as` cast would shift `1<<59` into the immediate's sign bit and
+  alias two ids) and refuses rather than writing a wrong id. The space is for *mints* only: a
+  fabricated/derived id (`MonitorRef::from_id`) is the caller's claim, and the one such id in the
+  workspace — an unnamed ETS table's tid — comes from `beam_ets`'s table-handle band so it decodes back
+  to its handle. Cross-producer collision-freedom is pinned end to end by
+  `beam_rt/tests/ref_id_space.rs` (NIF resource terms + monitors/aliases + `make_ref`/timers,
+  interleaved: pairwise distinct and strictly increasing) and per producer by
+  `beam_abi::resources_tests` / `beam_process::tests/reference_ids.rs`.
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`
   conversion is added **in `beam_term`**, so all 13 dependents get `?`-interop for free instead of

@@ -7,7 +7,8 @@ idiomatic**. It owns the workspace-wide **error/result strategy** (Part I §A.1;
 failure is **return-based** — no `setjmp`/`longjmp`), the OTP/ERTS **version constants**, the
 runtime **configuration / feature-flag / flavor skeleton**, a dependency-free **logging facade**,
 the **canonical definitions of ERTS constants genuinely shared by two or more workspace crates**
-(`constants`, currently `CONTEXT_REDS`), and the documented **`unsafe` marker convention**.
+(`constants`, currently `CONTEXT_REDS`), the **one local reference-id space** every locally minted
+reference term draws from (`refid`), and the documented **`unsafe` marker convention**.
 
 This is a **dependency sink**: it depends on `std` (and `libc` for ABI-sized integer aliases) and on
 **nothing else** — deliberately no `thiserror`, no `tracing`, no `bitflags`. Adding any dependency
@@ -53,6 +54,13 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   reduction quantum / context-switch threshold (`erts/emulator/beam/erl_vm.h:47`). This module is the
   designated home for any ERTS constant genuinely shared by ≥2 crates; a value used by a single crate
   stays in that crate. See *Cross-Crate Constant Ownership*.
+- `refid` — the **one local reference-id space**: `next_ref_id() -> u64`, a process-wide monotonic
+  id source over one private `static NEXT: AtomicU64` (`Ordering::Relaxed` `fetch_add`; first value
+  `0`; total — it never panics and its wrap point is unreachable in practice). Every reference
+  *term* minted locally draws its `id` word from it: `erlang:make_ref/0`, the NIF `make_ref`,
+  `erlang:monitor/2,3`, `erlang:alias/1`, timer references, `seq_trace` references and the NIF
+  **resource terms** of `enif_make_resource`. Term-independent by design (this crate names no term
+  type) — the small-int encoding of an id is the *caller's* check. See *Cross-Crate Reference Ids*.
 - `logging` — dependency-free facade: `init_logging`, `init_from_env`, `set_level`, `level`,
   `enabled`, plus the `beam_trace!`/`beam_debug!`/`beam_info!`/`beam_warn!`/`beam_error!` macros.
 - `safety` — documentation-only module stating the `unsafe` convention (see Constraints).
@@ -76,7 +84,8 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   marked modules; every `unsafe` block/`fn` carries a preceding `// SAFETY: <invariant/rationale>`
   comment; any `unsafe` gains a Miri/fuzz or differential test where feasible. `beam_common` itself
   contains none (`#![forbid(unsafe_code)]`).
-- Files target ~1000 lines; split by responsibility (`error`, `version`, `config`, `constants`, `logging`).
+- Files target ~1000 lines; split by responsibility (`error`, `version`, `config`, `constants`,
+  `refid`, `logging`).
 
 ## Cross-Crate Constant Ownership
 `constants` is the single owner of ERTS constants genuinely shared by **two or more** workspace
@@ -116,6 +125,33 @@ needs) a canonical owner **outside** `beam_common`; adopters listed — **none e
   (recomputed from `size_of::<Eterm>()` per crate); `POS_BIG_SUBTAG` / `REF_SUBTAG`
   (canonical in `beam_term::tag`; only `#[cfg(test)]` copies elsewhere).
 
+## Cross-Crate Reference Ids
+A reference term is the on-heap block
+`[make_header(3, REF_SUBTAG), node = small(0), serial = small(0), id = small(N)]`, so its
+**identity is the `id` word alone** — `node`/`serial` are constant in M1 (one node, one local
+space). Three producers currently mint ids independently (`beam_abi`'s resource terms over a private
+`static AtomicUsize`, `beam_rt`'s `RefAllocator`-backed `make_ref`/timer/`seq_trace` ids,
+`beam_process::ProcessTable`'s own `RefAllocator` for monitors/aliases); overlapping spaces make a
+**dead** NIF resource term word-indistinguishable from a live plain reference, so an
+identity-matching reachability predicate (the runner's park-arm resource prune) retains the dead
+object and a liveness/monitor check can treat it as live.
+
+`refid` owns the single id space, and **no crate may keep a private reference-id counter** — every
+locally minted reference term's `id` comes from `beam_common::next_ref_id()`. It lives here because
+this crate is the lowest common ancestor: `beam_abi` (wave 0, which mints resource terms) cannot
+host something `beam_process` (wave 3, monitors/aliases) draws from, and `beam_process` must not
+depend on the NIF ABI crate. The typed wrappers stay with their owners (`beam_process::RefAllocator`
+/`MonitorRef`, `beam_abi`'s checked resource mint); `beam_common` only hands out the id. Adoption is
+pending: the three producers above still run their own counters and move their mint onto
+`next_ref_id()` in the following wave (`beam_abi` first, then `beam_process`/`beam_rt`).
+
+Two documented boundaries: (a) the counter is **not** bounded to the small-int range here (this
+crate must not depend on `beam_term`) — a caller writing the id via `make_small` range-checks the
+encoding itself and refuses an id past `MAX_SMALL` (2^59) with `BeamError::SystemLimit` rather than
+truncating it, a bound unreachable in practice and far below the counter's wrap point; (b) ids
+decoded from **another node** (ETF, `beam_codec`) are not from this space — real ERTS separates
+those with `node`/`serial`, which M1 keeps at `0`, so the guarantee is over *locally minted* ids.
+
 ## Known Issues
 - **The `FeatureFlags` surface is largely inert.** Only `smp` is consumed anywhere (reported by
   `beam_rt`'s `system_info(smp_support)`, `info/system.rs:102`); `interpreter`, `jit`, `cranelift`,
@@ -142,6 +178,11 @@ needs) a canonical owner **outside** `beam_common`; adopters listed — **none e
   - `config`: `Default` values, `Flavor` parse/`as_str`, `FeatureFlags::for_flavor`, builder setters,
     `LogLevel` parse + ordering.
   - `constants`: `CONTEXT_REDS == 4000` (the frozen `erl_vm.h:47` value).
+  - `refid`: successive draws strictly increase; 4 threads × 512 concurrent draws are all distinct
+    and advance the one shared counter by exactly the draw count (a single contiguous run of ids, so
+    there is no per-caller space); a later draw exceeds every earlier one. The module's tests
+    serialize on a private `TEST_LOCK` because they share the process-wide counter and assert exact
+    draw counts.
   - `logging`: level round-trip (`set_level`/`level`/`enabled`); `init_from_env` default when unset.
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_common` GREEN.
   Full-workspace `cargo test --workspace` must stay green as dependents land.
@@ -158,6 +199,8 @@ needs) a canonical owner **outside** `beam_common`; adopters listed — **none e
 - `src/version.rs` → OTP/ERTS version constants, `Version` parsing/`Display`
 - `src/config.rs` → `Flavor`, `FeatureFlags`, `RuntimeConfig`, `LogLevel`
 - `src/constants.rs` → canonical cross-crate ERTS constants (`CONTEXT_REDS`)
+- `src/refid.rs` → the one local reference-id space (`next_ref_id`), shared by every locally minted
+  reference term (plain refs, monitors/aliases, timers, `seq_trace`, NIF resource terms)
 - `src/logging.rs` → dependency-free logging facade + log macros
 - `src/safety.rs` → the workspace `unsafe` marker convention (docs only)
 - `src/lib.rs` → crate docs, module wiring, root re-exports

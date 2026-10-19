@@ -118,10 +118,10 @@
 //!   arena-stable arguments rooted at the two **non-park** sites, never here. An **exempt** park
 //!   (every `receive`) never reaches this arm at all — gate 3 below declines it — so a machine
 //!   parked in one keeps its resource terms instead of having them freed behind its back;
-//! * **a reference id is not an identity**: a resource term is minted as an ordinary internal
-//!   reference, so a plain reference the walk reaches whose id equals a live resource's cannot be
-//!   told from a **copy** of that resource, and the resource is retained (`M1_GAPS.md`
-//!   *The resource-identity collision*);
+//! * **a copy is reached through its reference identity**: a resource term is minted as an ordinary
+//!   internal reference whose `id` comes from the one shared local reference-id space, so a
+//!   `copy_struct` copy of it (a different word, a different region) is still reached — which is
+//!   the correct direction — and no *unrelated* plain reference can carry that id;
 //! * a `persistent_term` value and an **ETS object** are not enumerated at all: their copies keep a
 //!   resource's reference identity, so a resource held *only* by one of them is answered
 //!   unreachable and released. Closing ETS needs an object iterator the `beam_bifs` table registry
