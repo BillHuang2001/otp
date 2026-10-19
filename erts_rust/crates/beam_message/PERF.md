@@ -26,7 +26,7 @@ unpinned run lands on either core type.
 Every release figure here is `taskset -c 3`.
 `/proc/loadavg` is recorded before and after every run; the host is *heavily* shared, so the load is part of the
 record, not noise to hide. Three sessions are quoted and must not be mixed:
-`m17` (the bench record this crate previously cited, 1-min load 3.3–92.6), and **this pass** which took
+`m17` (the sibling bench record, `../tools/bench/RESULTS.md`; 1-min load 3.3–92.6) and **this pass**, which took
 (a) the structural traversals run at load **50.1**, (b) the both-runtimes bench pass at **103.4 → 96.0**, and
 (c) the old-vs-new runtime A/B at **83.7 → 37.6** and **67.6 → 39.7** (pinned, alternating order).
 
@@ -61,7 +61,7 @@ The payload is the exact `copy_bound` 5-key map (**70 words / 27 objects / 21 co
 outer tuple only: a literal-area subterm is shared by identity). Reproduction:
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message --test traversals -- --nocapture`.
 
-**The "after" table** (this pass, `/proc/loadavg` 50.1 → 50.1, dev profile, identical across all 8 windows/row):
+**The per-shape table** (this pass, `/proc/loadavg` 50.1 → 50.1, dev profile, identical across all 8 windows/row):
 
 ```
 shape                       src_objs src_words   w_objs  w_words residency   blocks       bytes top-4 alloc sizes               ns_min
@@ -72,37 +72,24 @@ heap twin, full heap (frag)       28       73       28       73  fragment       
 ets_copy 233-w nursery            28       73        0        0   refused       10        1468 64-71B:2 128-135B:2 16-23B:1 48-55B:1      2849
 ```
 
-**Before → after, per row** (the "before" side is the same instrument on the pre-collapse commit):
-
-| row | residency | written words/objects | blocks | bytes |
-|---|---|---|---|---|
-| `literal {From,Lit}` (fits) | on-heap | 3 / 1 → 3 / 1 (unchanged) | 1 → **1** | 480 → **480** |
-| `heap twin {From,Map}` (fits) | on-heap | 73 / 28 → 73 / 28 (unchanged) | 3 → **3** | 672 → **672** |
-| `heap twin, 1 word short` | refused | 0 / 0 → 0 / 0 | 30 → **10** (−66.7 %) | 4 624 → **1 468** (−68.2 %) |
-| `heap twin, full heap (frag)` | fragment | 73 / 28 → 73 / 28 | 35 → **13** (−62.9 %) | 5 812 → **2 588** (−55.5 %) |
-| `ets_copy 233-w nursery` | refused | 0 / 0 → 0 / 0 | 30 → **10** (−66.7 %) | 4 624 → **1 468** (−68.2 %) |
-
 **Reading:**
 
-* **The two `fits` rows are unchanged to the byte** — exactly what the collapse predicts, because they never reach
-  the pricing walk: they are one copy traversal (`try_copy_fast`) and no preflight. Their blocks are the copy's
-  fix-up `Vec<Fixup>` ladder (64 B, 128 B) plus the enqueued message's queue buffer (480 B, once per mailbox); the
-  literal row writes no child, so it has no fix-up allocation at all.
-* **The three refusal/fragment rows are where the collapse shows**: **10 blocks / 1 468 B** for a refusal against
-  the retired composition's 30 / 4 624 (−67 % / −68 %), and 13 / 2 588 for the fragment path against 35 / 5 812
-  (−63 % / −55 %). This is the whole of the change: the same refusal now costs **one** pricing walk instead of the
-  retired bounded-walk → `is_acyclic` → `size_object_with` chain, and the fragment is sized from that walk's own
-  exact figure instead of a second `size_object`.
-* The 10 remaining blocks of a refusal decompose by size bucket, and every one is accounted for: the copy's trial
-  fix-up `Vec<Fixup>` (64 B, 128 B), `beam_term`'s **per-walk `Vec<Step>`** ladder (16 B → 512 B) and that walk's
-  SipHash **`HashSet` path-set** ladder (48 B, 88 B, 160 B). The fragment row adds the fragment's own backing region
-  (608 B = the 73-word payload plus the fragment header) and the queue buffer (480 B); the refusal rows enqueue
-  nothing, so they pay neither.
+* **Neither `fits` row reaches the pricing walk**: one copy traversal (`try_copy_fast`) and no preflight at all.
+  Their blocks are the copy's fix-up `Vec<Fixup>` ladder (64 B, 128 B) plus the enqueued message's queue buffer
+  (480 B, once per mailbox); the literal row writes no child, so it has no fix-up allocation and pays the queue
+  buffer alone.
+* **A refusal costs one abandoned optimistic trial plus one exact pricing walk**: **10 blocks / 1 468 B**.
+  The copy's own trial fix-up `Vec<Fixup>` is 2 blocks / 192 B — the same ladder a fit's copy half pays — and the
+  walk's own two ladders, a `Vec<Step>` stack and a SipHash `HashSet` path set, are the other **8 blocks / 1 276 B**.
+  The trial writes nothing (`used() == peak_used()`), the walk's count is exact, and the typed `Alloc(Message)`
+  refusal carries it — which is what lets a fragmenting caller size the fragment from that figure: the fragment row
+  is the same copy plus the fragment's own backing region (608 B = the 73-word payload plus the fragment header) and
+  the queue buffer (480 B), with nothing re-copied and no second sizing walk.
 * Deterministic, not timing: every counter window is asserted **identical** across `REPEATS = 8` runs and the
   histogram is asserted to sum to the block count, so a stray concurrent allocation fails the run instead of
   inflating a published figure.
 
-**Traversals per send shape, as the crate now performs it:**
+**Traversals per send shape:**
 
 | shape | copy trails | pricing trails | what happens |
 |---|---|---|---|
@@ -112,7 +99,7 @@ ets_copy 233-w nursery            28       73        0        0   refused       
 | **refused, then fragmented** (`send_fragmented`) | the above **+ 1** copy into the fragment | **1** | the fragment is sized from the refusal's **own** figure (`AllocFailure::requested / size_of::<Eterm>()`), so nothing is re-copied and no second sizing walk runs; `fragment_capacity_words` is a floor, not the price. |
 
 A whole `beam_rt` delivery still attempts once in `Process::deliver` before `beam_message` is asked again, so a
-*refused delivery* is **2 copy attempts + 1 pricing walk** by contract — the runtime's pre-attempt, the collapse, and
+*refused delivery* is **2 copy attempts + 1 pricing walk** by contract — the runtime's pre-attempt, the copy, and
 the runtime's `grow_nursery` retry (or the fragment fallback). That first attempt is the residual owner's to remove
 (§10).
 
@@ -146,7 +133,7 @@ Allocations per message — the counting `#[global_allocator]`, `allocs / bytes`
 **Reading:**
 
 * **The enqueue half allocates nothing**: warm `send` minus the bare copy is `0` allocations / `0` bytes for every
-  shape, so the `Message` build and the FIFO push are allocation-free.
+  shape, so the `Message` build and the FIFO push issue no allocation at all.
   The cold-queue `send` is exactly one allocation larger than the copy (480 B, identical for every shape) — that is the
   queue's **first buffer**, paid once per mailbox, never per message.
 * **The copy's allocations are the fix-up worklist `Vec<Fixup>` and nothing else** (§8). A `Fixup` is 16 B
@@ -239,7 +226,7 @@ Current record — this pass, `copy_bound`, both sides, the driver's paired esti
 The previous record (m17, 6 paired rounds/case, `../tools/bench/RESULTS.md` §3.3) read `etf_roundtrip` 2.21×,
 `ets_copy` 9.28×, `send_recv` 5.39×, `send_recv_plain` 3.16×. **The two sessions are not comparable in absolute terms**
 (m17's 1-min load band was 3.3–92.6, this pass's was 96–105, and the sys side alone moved 279.3 → 324.6 ns on
-`ets_copy`); every ratio above is paired within its own session, and §7 is the only "changed since" evidence.
+`ets_copy`); every ratio above is paired within its own session, and §7.2 is this file's only binary-vs-binary A/B.
 
 **The workload performs two payload sends per op, not one** — `send_recv_plain` sends `Worker ! {self(), T}` and the
 worker replies `From ! {self(), T}` — and each send is a 2-tuple (3 words) around the 70-word payload.
@@ -298,12 +285,12 @@ One row was **withheld by the driver** on the rust side in the earlier `--quick`
 at load 105; the `--full` pass above produced the figure. Read the ratios, never the absolutes: at this load the sys
 side alone is inflated ~16 % against m17.
 
-### 7.2 The runtime A/B (the only "changed since" evidence)
+### 7.2 The runtime A/B (two release `beam_rt` binaries, one tree)
 
-Two release `beam_rt` binaries from the **identical** tree except this crate's sources — `old` =
-the pre-collapse commit, `new` = HEAD — driven by the same `bench` binary via `$BEAM_RT`, `--full`, `--runtime rust`,
-`taskset -c 3`, **7 alternating passes** (5 in one set, order `old,new,old,new,old,new`; 2 in a second set with the
-order **reversed**, `new,old`), loads **83.7 → 37.6** and **67.6 → 39.7**:
+Two release `beam_rt` binaries built from the **identical** tree except this crate's copy path — `old` and `new` are
+two compositions of it — driven by the same `bench` binary via `$BEAM_RT`, `--full`, `--runtime rust`, `taskset -c 3`,
+**7 alternating passes** (5 in one set, order `old,new,old,new,old,new`; 2 in a second set with the order **reversed**,
+`new,old`), loads **83.7 → 37.6** and **67.6 → 39.7**:
 
 | case | old ns/op (median of 5) | new ns/op (median of 5) | ratio new/old | per-round paired ratios |
 |---|---|---|---|---|
@@ -324,15 +311,15 @@ inside it.
 | old | 319 194 037 273 / 319 675 490 376 | 76 840 725 051 / 76 838 845 995 | 25 338 / 24 986 ms |
 | new | 314 055 294 111 / 314 388 228 736 | 76 794 030 932 / 76 800 604 910 | 24 960 / 24 864 ms |
 
-**The new binary retires ~1.5 % *fewer* instructions and burns the same cycles over the whole run**, while the same
-runs reproduce the per-case split (`send_recv` 10 418/9 856 → 7 866/7 868; `send_recv_plain` 2 573/2 507 →
-3 022/3 103 ns/op). So the collapse did not add work anywhere; the `send_recv_plain` move is a redistribution inside
-the case mix (`send_recv_plain`'s copies are 3 words, so no copy-path change can explain it) whose mechanism is **not
-attributed here** — candidates are code placement in the thin-LTO binary and the changed fragment capacity the
-runtime's delivery mix now allocates (this crate sizes a fragment from the copier's exact price, so a literal payload's
-fragment went 73 words → 3). Attributing it needs instruction-level counters **inside `beam_rt`'s loop**, which is that
-node's to add; until then `send_recv_plain` must not be quoted as either an improvement or a regression, and note that
-the same case also reads 2 195.9 ns in m17 — i.e. it moves ±20 % across builds and sessions with no matching change in
+**The two binaries retire within 1.5 % of the same instruction count and burn the same cycles over the whole run**,
+while the same runs reproduce the per-case split (`send_recv` 10 418/9 856 vs 7 866/7 868; `send_recv_plain`
+2 573/2 507 vs 3 022/3 103 ns/op). So the copy path is not where the whole-run difference lives; the
+`send_recv_plain` split is a redistribution inside the case mix (`send_recv_plain`'s copies are 3 words, so no
+copy-path change can explain it) whose mechanism is **not attributed here** — candidates are code placement in the
+thin-LTO binary and the per-send fragment capacity, which the two compositions set differently for a literal payload
+(73 words vs 3). Attributing it needs instruction-level counters **inside `beam_rt`'s loop**, which is that node's
+to add; until then `send_recv_plain` must not be quoted as either an improvement or a regression, and note that the
+same case also reads 2 195.9 ns in m17 — i.e. it moves ±20 % across builds and sessions with no matching change in
 work, which makes it the least claim-worthy of the four rows.
 
 ## 8. The fix-up worklist is a `Vec<Fixup>` — and that is the right call in release
@@ -340,7 +327,7 @@ work, which makes it the least claim-worthy of the four rows.
 The copy loop's per-call worklist is `Vec<Fixup>` (`src/copy.rs`), 16 B per entry, and §3 shows it is the **only**
 per-message allocation: 0 / 1 / 2 / 4 allocation events for the four shapes.
 
-An allocation-free replacement (a `WorkStack`: `[MaybeUninit<Fixup>; WORK_INLINE]` inline plus a `Vec` spill) removes
+An allocation-avoiding replacement (a `WorkStack`: `[MaybeUninit<Fixup>; WORK_INLINE]` inline plus a `Vec` spill) removes
 those events deterministically (counters: **0** per `copy_struct` on every shape but the 64-key HAMT) and does **not**
 pay for itself.
 Measured in **release** (`opt-level = 3`, `lto = "thin"`, `taskset -c 3`, 6 interleaved pairs, `/proc/loadavg` 17–23,
@@ -374,7 +361,7 @@ one guard per cell on a 2-word object, is flat.
 Deterministic counters are unaffected (the payload is still 2 blocks / 192 B in the copy, 0 in the enqueue half), and the
 current measurement of the payload `send` (§4: ≈ 199 ns mean / 176 ns best) sits at the 210/181 column's cost.
 
-## 10. What remains (by owner, after the collapse)
+## 10. What remains (by owner)
 
 This crate's copy path is **one walk** on every shape it performs: no preflight for a fit, one exact pricing walk for a
 refusal, and the fragment sized from that same figure. Every remaining cost is somebody else's seam:
@@ -389,7 +376,7 @@ refusal, and the fragment sized from that same figure. Every remaining cost is s
 * **`beam_rt` (`src/context/calls.rs`, `src/runner/`) — the pre-attempt + `grow_nursery` retry.** A refused *delivery*
   is 2 copy attempts + 1 pricing walk by contract (§2): the runtime attempts in `Process::deliver`, then retries. The
   message-path analogue of the existing `copy_out_hint`/`hint_grow_gate` gate (`calls.rs:1313-1332`) is what would
-  stop the double attempt. That node's prose still describes the retired 3-walk/5-traversal path (`calls.rs:1280`,
+  stop the double attempt. That node's prose still describes a three-walk / five-traversal copy path (`calls.rs:1280`,
   `:1316`, `:1389`, `context/runtime_context.rs:159`, `context/calls/tests.rs:190`, `:529`, `PERF_DISPATCH.md:252`,
   `:279`, `:387`, `crates/beam_engine/src/bench/CONTEXT.md:242`, `:270`).
 * **`beam_process` (`src/ptab.rs:284`) — control-signal fragments.** `HeapFragment::new(size_object(payload) + 8)`
@@ -419,7 +406,7 @@ erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_mes
     --test send_perf -- --nocapture
 
 # the release regime (the one to quote for a per-send shape):
-erts_rust/scripts/cargo.sh build -p beam_message --manifest-path erts_rust/Cargo.toml --release --tests
+erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_message --release --tests
 taskset -c 3 erts_rust/target/release/deps/send_perf-* --nocapture
 taskset -c 3 erts_rust/target/release/deps/counters-*  --nocapture
 ```
