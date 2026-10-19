@@ -365,15 +365,6 @@ fn emit_sub_blocks(
         let entry = unsafe { buffer.code_ptr().add(offset) };
         // `start < end <= code.len()`, so the slot always exists.
         sub_entries[start] = Some(entry);
-        // Structural counter: this emitting range is a **continuation sub-block**, not an
-        // IR block. Its range lies *before* the containing `call`, so its own allocation
-        // contains no frame helper — `prologue_publishes_y` therefore cannot elide the
-        // publish and only the run-time Y-window witness can.
-        #[cfg(test)]
-        super::super::counters::record_sub_block(
-            allocation.y_last.is_some(),
-            allocation.prologue_publishes_y(),
-        );
     }
     Ok(())
 }
@@ -477,14 +468,6 @@ fn emit_shared_sub_blocks(
         let entry = unsafe { buffer.code_ptr().add(offset) };
         // `start < end <= code.len()`, so the slot always exists.
         sub_entries[start] = Some(entry);
-        // Structural counter — the eager twin of the lazy pass's (see `emit_sub_blocks`):
-        // this range is a continuation sub-block, whose own allocation can never satisfy
-        // `prologue_publishes_y`'s dead-publish gate.
-        #[cfg(test)]
-        super::super::counters::record_sub_block(
-            allocation.y_last.is_some(),
-            allocation.prologue_publishes_y(),
-        );
     }
     Ok(())
 }

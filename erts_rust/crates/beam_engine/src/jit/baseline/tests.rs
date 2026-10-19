@@ -99,7 +99,6 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         resume_entry: std::ptr::null(),
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
-        y_window_current: false,
     };
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
@@ -2430,7 +2429,6 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
         resume_entry: std::ptr::null(),
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
-        y_window_current: false,
     };
     assert_eq!(
         enter_compiled(&eager, &module, &mut rt as *mut JitRuntime<'_>, 0, f_pc),
@@ -2829,7 +2827,6 @@ fn run_ext_call(
         resume_entry: std::ptr::null(),
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
-        y_window_current: false,
     };
     // `caller_x`'s only import is `callee_x:g/0`, i.e. `ImportRef(0)`.
     let word = jit_ext_call(&mut rt as *mut JitRuntime<'_>, func, pc, 0, kind, deallocate);
@@ -5207,14 +5204,14 @@ fn drive_probe(
 
 /// `/proc/loadavg` as a string (empty when unreadable) — the probe's timing
 /// numbers are only meaningful next to the host load.
-pub(crate) fn probe_loadavg() -> String {
+fn probe_loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "<unavailable>".to_string())
 }
 
 /// The printed structural counter block for one tier's counting pass.
-pub(crate) fn print_probe_counters(label: &str, counters: &counters::Counters) {
+fn print_probe_counters(label: &str, counters: &counters::Counters) {
     println!("--- {label}: baseline structural counters (one pass, recording ON) ---");
     println!(
         "  jit_step_one={} jit_step_ext={} | block_entry lookups={} hits={} entered={} | \
@@ -5228,22 +5225,8 @@ pub(crate) fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.driver_interp_steps,
     );
     println!(
-        "  prologue: jit_set_position={} jit_publish_y={} jit_refresh_y={} | \
-         y-window skips: publish_y_skips={} refresh_y_skips={}",
-        counters.set_position,
-        counters.publish_y,
-        counters.refresh_y,
-        counters.publish_y_skips,
-        counters.refresh_y_skips,
-    );
-    println!(
-        "  emitting ranges: blocks={} sub_blocks={} ir_blocks={} | sub_blocks_y_touching={} \
-         sub_blocks_publish={}",
-        counters.blocks,
-        counters.emitted_sub_blocks,
-        counters.blocks.saturating_sub(counters.emitted_sub_blocks),
-        counters.sub_blocks_y_touching,
-        counters.sub_blocks_prologue_publishes,
+        "  prologue: jit_set_position={} jit_publish_y={} jit_refresh_y={}",
+        counters.set_position, counters.publish_y, counters.refresh_y
     );
     println!(
         "  call_ext: resolved={} declined={} fallback_to_step_one={}",
@@ -5962,7 +5945,7 @@ fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
 /// The [`MinimalContext`] owns the heap every boxed term is built on and is dropped at the
 /// end of this call, so the caller may only inspect an outcome that is an immediate or a
 /// typed error — which is exactly what the fixtures below return (`NIL` or a raise).
-pub(crate) fn run_counting(
+fn run_counting(
     module: &Module,
     name: Atom,
     tier: Tier,
@@ -6578,6 +6561,7 @@ mod operand_tests;
 #[cfg(test)]
 #[path = "bif_tests.rs"]
 mod bif_tests;
+
 #[cfg(test)]
-#[path = "y_witness_tests.rs"]
-mod y_witness_tests;
+#[path = "raise_tier_tests.rs"]
+mod raise_tier_tests;

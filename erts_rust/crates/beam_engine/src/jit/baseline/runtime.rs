@@ -262,81 +262,6 @@ pub(crate) struct JitRuntime<'a> {
     ///
     /// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
     pub(crate) compiled: *const CompiledModule,
-    /// The **Y-window witness**: [`Self::y_base`]/[`Self::y_end`] are *known to equal*
-    /// exactly the pair [`Self::refresh_y_base`] would derive right now.
-    ///
-    /// The witness is what lets the two emitted publish points skip a derivation that is
-    /// provably a no-op: a continuation sub-block's prologue
-    /// ([`jit_publish_y`]) and a gated in-block refresh ([`jit_refresh_y`]) run in the
-    /// very common case where no frame moved since the last derivation, and the
-    /// derivation — a `frames.last()` deref, the `stack` pointer and a mul-add — is the
-    /// majority of `refresh_y_base`'s cost. **Only the derivation may be skipped**, never
-    /// the position store: `jit_publish_y` still calls `Machine::set_current_code`
-    /// unconditionally (the frozen publication set, see `## Execution-position
-    /// bookkeeping`).
-    ///
-    /// # Invariant IW
-    ///
-    /// `y_window_current == true` **⇒** `(Self::y_base, Self::y_end)` are exactly the pair
-    /// [`Self::refresh_y_base`] would produce at that instant, in the machine's current
-    /// `Machine::stack` allocation and for its current top call frame.
-    ///
-    /// *Failure direction.* A **missed** invalidation makes a later emitted `Y` access
-    /// dereference a stale window — a miscompile (the emitted guard only compares against
-    /// the published pair, so a stale pair rejects or, worse, accepts and reads another
-    /// frame's slot). So the invalidation set must be **exhaustive**, and every site in it
-    /// is enumerated below and pinned by a test. A **spurious** invalidation costs exactly
-    /// one re-derivation, so the set is deliberately allowed to be conservative.
-    ///
-    /// The emitted Y-window guard ([`super::emit`]) is untouched and stays
-    /// **reject-only**, so "not published" (this flag false, or a null window) still means
-    /// one interpreter step via [`jit_step_one`] — never a wrong address.
-    ///
-    /// # The invalidation set
-    ///
-    /// Cleared by [`Self::invalidate_y_window`] at every site that can change the top call
-    /// frame, the frame stack's depth or `machine.stack`'s allocation *without*
-    /// republishing:
-    ///
-    /// * [`jit_step_one`] and [`jit_step_ext`] — they run an arbitrary interpreter
-    ///   instruction (`allocate`/`allocate_heap`/`trim`/`deallocate`/a raise's unwind), so
-    ///   the frame is arbitrary afterwards;
-    /// * [`jit_tail_call`] — [`Machine::pop_frame_checked`] (a `call_last`);
-    /// * [`jit_deallocate_return`] — [`Machine::pop_frame_checked`] before its continuation
-    ///   read;
-    /// * [`jit_ext_call`] — its `EXT_CALL_LAST` arm pops a frame
-    ///   (`resolve_ext_entry`'s frame discipline) and its two fallbacks run a full
-    ///   interpreter step;
-    /// * [`jit_test_heap`] — it reaches the host's heap-admission door with the whole
-    ///   `RootSet` (conservative: the frame itself does not move, but the door is the one
-    ///   host call that sees the stack);
-    /// * the **error** arm of [`jit_deallocate`]/[`jit_allocate`]/[`jit_allocate_heap`]/
-    ///   [`jit_trim`] (hygiene: nothing is mutated there today, but the arm must never be
-    ///   able to leave the witness describing a pre-change window).
-    ///
-    /// **Not** cleared (each with its own rationale on the helper):
-    /// [`jit_return`] (a `return` pops nothing — [`Machine::continuation`] only *reads*
-    /// the top frame), [`jit_set_position`]/[`jit_publish_y`]/[`jit_refresh_y`] themselves
-    /// (they publish), [`jit_test`]/[`jit_bif_value`] (pure reads of `machine`),
-    /// `jit_family`/`jit_receive` (see [`super::family::jit_family`]: the family surface
-    /// owes frame-neutrality on a `Next` outcome, and every other outcome leaves the block
-    /// before the emitted continue arm), and [`super::call::jit_call_store`] (storing a
-    /// continuation writes one field of the top frame; it cannot move `machine.stack`).
-    ///
-    /// # Who clears what the block cannot
-    ///
-    /// The one reachable path that changes the frame inside native code and is **not**
-    /// instrumented is a **family raise**: `exceptions`' `raise`/`badmatch` and friends
-    /// unwind the call-frame stack ([`Machine::unwind_to_frame`], which truncates
-    /// `machine.stack`) and then return a non-`Next` step, so the block leaves — but the
-    /// witness would survive into the *next* iteration's first block. The driver therefore
-    /// clears it at the head of **every** loop iteration ([`super::drive`]), which is the
-    /// iteration boundary a block return is: within one iteration the only frame changes
-    /// reachable from native code are the instrumented helpers above, and across an
-    /// iteration the witness is simply re-derived by the first block that publishes.
-    /// A resume rebuilds `JitRuntime` entirely, so a parked/resumed machine always starts
-    /// "not published" — always safe.
-    pub(crate) y_window_current: bool,
 }
 
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
@@ -476,25 +401,6 @@ impl JitRuntime<'_> {
                 self.y_end = std::ptr::null_mut();
             }
         }
-        // It has just been derived, so the witness is true by construction (Invariant IW
-        // on [`Self::y_window_current`]).
-        self.y_window_current = true;
-    }
-
-    /// Mark [`Self::y_base`]/[`Self::y_end`] as **no longer** known-current — the cheap
-    /// half of [`Self::refresh_y_base`], for every site that changes the top call frame,
-    /// the frame stack or `machine.stack`'s allocation without republishing.
-    ///
-    /// A spurious call only costs one re-derivation at the next publish point, so the
-    /// invalidation set is deliberately conservative; a **missing** call is a miscompile,
-    /// so it is exhaustive and every member is documented and pinned (see
-    /// [`Self::y_window_current`]'s invalidation-set section).
-    ///
-    /// `#[inline]`: one store, on the same per-instruction paths as the helpers that call
-    /// it.
-    #[inline]
-    pub(crate) fn invalidate_y_window(&mut self) {
-        self.y_window_current = false;
     }
 
     /// Re-publish the literal area the machine has bound into
@@ -728,12 +634,6 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
     // it holds points at an object the driver owns and keeps alive for the whole
     // loop (`machine`, `module`), or at a local (`labels`) that outlives the loop.
     let runtime = unsafe { &mut *rt };
-    // Invalidate the Y-window witness **before** the step: it runs an *arbitrary*
-    // instruction, so the top call frame, the frame stack and `machine.stack`'s allocation
-    // are all arbitrary afterwards (`allocate`/`allocate_heap` push and may grow the stack,
-    // `trim` moves the frame's base, `deallocate`/`call_last` pop, a raise unwinds). The
-    // emitted gated refresh that follows a deopt re-derives (Invariant IW).
-    runtime.invalidate_y_window();
     // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`;
     // no other `&mut Machine` exists while the helper runs (the driver is blocked in
     // the block call that reached us).
@@ -800,12 +700,6 @@ fn jit_step_ext(
         // for the whole loop (`machine`, `module`), or at a local (`labels`) that
         // outlives the loop.
         let runtime = unsafe { &mut *rt };
-        // Invalidate the Y-window witness before the instruction runs:
-        // `call_ext_dispatch` executes `call_ext`/`call_ext_only`/`call_ext_last` (the last
-        // one pops a frame) plus `erlang:apply/3` (which re-targets onto arbitrary code) and
-        // the `send/2` route, so the frame is arbitrary afterwards — the `jit_step_one`
-        // reason.
-        runtime.invalidate_y_window();
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
@@ -1000,15 +894,6 @@ pub(crate) extern "C" fn jit_ext_call(
         // for the whole loop (`machine`, `module`), or at a local (`labels`) that
         // outlives the loop.
         let runtime = unsafe { &mut *rt };
-        // Invalidate the Y-window witness before anything runs. `resolve_ext_entry`'s
-        // `EXT_CALL_LAST` arm pops a frame ([`Machine::pop_frame_checked`]) with no
-        // republish, and both fallbacks below (`jit_step_ext`, `jit_step_one`) execute the
-        // instruction in the interpreter; so the frame is arbitrary on every outcome except
-        // a resolved non-tail `EXT_CALL`/`EXT_CALL_ONLY`, which only stores a continuation
-        // ([`Machine::set_continuation`] cannot move `machine.stack`). A conservative clear
-        // therefore costs at most one extra derivation on the next publish point — and the
-        // callee's own prologue is the very publish that derives it.
-        runtime.invalidate_y_window();
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
@@ -1372,17 +1257,6 @@ pub(crate) extern "C" fn jit_set_position(rt: *mut JitRuntime<'_>, func: u32, pc
 ///
 /// Infallible, and it clobbers only caller-saved registers, so it is emitted before the
 /// prologue loads the cached x-registers (exactly like [`jit_set_position`]).
-///
-/// **The derivation is skipped when the witness holds.** A block reached from another
-/// block of the same driver iteration — a linked tail call into a callee whose prologue
-/// publishes, a continuation sub-block a `return` tail-jumped into, a frame-preserving
-/// `call`'s in-block transfer — runs with `machine.frames`/`machine.stack` exactly as the
-/// last publish left them, so `refresh_y_base` would re-derive the very same pair.
-/// [`JitRuntime::y_window_current`] records that, and this helper then keeps the position
-/// store and drops the derivation (Invariant IW). That is precisely the
-/// **range-crossing** case the compile-time `Allocation::prologue_publishes_y` gate cannot
-/// see: a continuation sub-block's range lies *before* the `call`, so its own allocation
-/// contains no frame helper and it must publish — but its predecessor already did.
 pub(crate) extern "C" fn jit_publish_y(rt: *mut JitRuntime<'_>, func: u32, pc: u32) {
     // Structural counter: one block prologue whose body accesses a `Y` slot.
     #[cfg(test)]
@@ -1392,14 +1266,7 @@ pub(crate) extern "C" fn jit_publish_y(rt: *mut JitRuntime<'_>, func: u32, pc: u
     // points at the driver's live `Machine`, and no other `&mut Machine` exists while
     // the helper runs (the driver is blocked in the block call that reached us).
     let runtime = unsafe { &mut *rt };
-    if runtime.y_window_current {
-        // The window is already exactly what `refresh_y_base` would derive (Invariant IW),
-        // so the derivation is a no-op — skip it and keep the position store below.
-        #[cfg(test)]
-        super::counters::record_publish_y_skip();
-    } else {
-        runtime.refresh_y_base();
-    }
+    runtime.refresh_y_base();
     // SAFETY: see above — `runtime.machine` is a non-null pointer to the driver's live
     // `Machine`; the `&mut JitRuntime` above is dead by now, so borrowing through the
     // field does not alias it.
@@ -1418,15 +1285,6 @@ pub(crate) extern "C" fn jit_publish_y(rt: *mut JitRuntime<'_>, func: u32, pc: u
 /// window the block published in its prologue. When no later instruction accesses a Y
 /// slot the call is not emitted at all, and when the block leaves to the driver the
 /// next block's prologue publishes instead (so a driver round-trip never refreshes).
-///
-/// **The derivation is skipped when the witness holds** ([`JitRuntime::y_window_current`]):
-/// the overwhelmingly common in-block helper is one that cannot change a frame at all —
-/// a family-bodied term build (`put_list`, `put_tuple2`, `bs_match`, a map op), a pure
-/// comparison `test`, a value-BIF fast path, a `call_ext`-less BIF call — so
-/// `refresh_y_base` would re-derive the pair the prologue (or the last frame helper)
-/// already published. The call then degenerates to a load, a test and a `ret` (Invariant
-/// IW): a *spurious* miss costs one derivation, a wrong skip would be a miscompile, which
-/// is why the invalidation set is exhaustive.
 pub(crate) extern "C" fn jit_refresh_y(rt: *mut JitRuntime<'_>) {
     // Structural counter: the gated in-block Y-window re-publish.
     #[cfg(test)]
@@ -1435,13 +1293,6 @@ pub(crate) extern "C" fn jit_refresh_y(rt: *mut JitRuntime<'_>) {
     // `JitRuntime` and never aliases it for the duration of the call (the driver is
     // blocked in the block call that reached us).
     let runtime = unsafe { &mut *rt };
-    if runtime.y_window_current {
-        // Already exactly what `refresh_y_base` would derive (Invariant IW): the helper
-        // that just ran changed no frame, so there is nothing to re-publish.
-        #[cfg(test)]
-        super::counters::record_refresh_y_skip();
-        return;
-    }
     runtime.refresh_y_base();
 }
 
@@ -1478,11 +1329,6 @@ pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, dea
     // it holds points at an object the driver owns and keeps alive for the whole
     // loop (`machine`, `module`), or at a local (`labels`) that outlives the loop.
     let runtime = unsafe { &mut *rt };
-    // Invalidate the Y-window witness: a `call_last` pops its frame
-    // ([`Machine::pop_frame_checked`]), which truncates `machine.stack` and makes the
-    // caller's frame the top one, so the published window no longer names the live frame.
-    // The successor block's own prologue re-derives it (Invariant IW).
-    runtime.invalidate_y_window();
     // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`;
     // no other `&mut Machine` exists while the helper runs (the driver is blocked in
     // the block call that reached us).
@@ -1840,12 +1686,7 @@ pub(crate) extern "C" fn jit_deallocate(
             runtime.refresh_y_base();
             encode_target(func, pc + 1)
         }
-        Err(err) => {
-            // Hygiene: nothing is mutated on a failed pop today, but the error arm must
-            // never be able to leave the witness describing a pre-change window.
-            runtime.invalidate_y_window();
-            report_frame_error(runtime, func, pc, err)
-        }
+        Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
 
@@ -1873,12 +1714,6 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         let machine = unsafe { &mut *runtime.machine };
         // The same position store `Machine::step_instruction` makes at entry.
         machine.set_current_code(func, pc);
-        // **No Y-window invalidation here**: `Instr::Return` pops *nothing* —
-        // [`Machine::continuation`] only *reads* `frames.last()`'s continuation field, and
-        // the continuation's frame **is** the current frame (the pop a caller-return needs
-        // is `deallocate`'s, done by [`jit_deallocate`]/[`jit_deallocate_return`], both of
-        // which do clear). `machine.stack` and the frame stack are therefore exactly as
-        // they were, so the published window still names the live frame.
         machine.continuation()
     };
     match continuation {
@@ -1922,13 +1757,6 @@ pub(crate) extern "C" fn jit_deallocate_return(
         let machine = unsafe { &mut *runtime.machine };
         // The same position store `Machine::step_instruction` makes at entry.
         machine.set_current_code(func, pc);
-        // Invalidate the Y-window witness **before** the pop: `deallocate` truncates
-        // `machine.stack` and makes the caller's frame the top one, so the published window
-        // names a frame that no longer exists. The target block's own prologue re-derives
-        // it — including the same-function continuation block this helper tail-jumps into
-        // ([`JitRuntime::resume_entry`]) and the returning caller's continuation sub-block
-        // (Invariant IW).
-        runtime.invalidate_y_window();
         machine.pop_frame_checked(deallocate).and_then(|()| machine.continuation())
     };
     match outcome {
@@ -1983,11 +1811,7 @@ pub(crate) extern "C" fn jit_allocate(
             runtime.refresh_y_base();
             encode_target(func, pc + 1)
         }
-        Err(err) => {
-            // Hygiene, exactly as in [`jit_deallocate`]'s error arm.
-            runtime.invalidate_y_window();
-            report_frame_error(runtime, func, pc, err)
-        }
+        Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
 
@@ -2040,11 +1864,7 @@ pub(crate) extern "C" fn jit_allocate_heap(
             runtime.refresh_y_base();
             encode_target(func, pc + 1)
         }
-        Err(err) => {
-            // Hygiene, exactly as in [`jit_deallocate`]'s error arm.
-            runtime.invalidate_y_window();
-            report_frame_error(runtime, func, pc, err)
-        }
+        Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
 
@@ -2075,21 +1895,11 @@ pub(crate) extern "C" fn jit_test_heap(
         let ctx = unsafe { &mut *runtime.ctx };
         // The same position store `Machine::step_instruction` makes at entry.
         machine.set_current_code(func, pc);
-        // Invalidate the Y-window witness conservatively: `test_heap` changes no frame
-        // itself, but [`Machine::ensure_heap`] is the one engine→host door that hands the
-        // host the whole `RootSet` (`stack` included), so the window must not be assumed
-        // current across it. The cost is one re-derivation on the block's gated continue
-        // arm, and only when a later instruction of the block still accesses a `Y` slot.
-        runtime.invalidate_y_window();
         machine.ensure_heap(heap_need, live, ctx)
     };
     match admitted {
         Ok(()) => encode_target(func, pc + 1),
-        Err(err) => {
-            // Hygiene, exactly as in [`jit_deallocate`]'s error arm.
-            runtime.invalidate_y_window();
-            report_frame_error(runtime, func, pc, err)
-        }
+        Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
 
@@ -2128,10 +1938,6 @@ pub(crate) extern "C" fn jit_trim(
             runtime.refresh_y_base();
             encode_target(func, pc + 1)
         }
-        Err(err) => {
-            // Hygiene, exactly as in [`jit_deallocate`]'s error arm.
-            runtime.invalidate_y_window();
-            report_frame_error(runtime, func, pc, err)
-        }
+        Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }

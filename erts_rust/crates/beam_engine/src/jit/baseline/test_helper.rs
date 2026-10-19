@@ -119,11 +119,6 @@ pub(crate) extern "C" fn jit_test(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -
     // `test` is an exact raise position, so the machine's saved instruction pointer
     // must name this instruction, not the block.
     machine.set_current_code(func, pc);
-    // **No Y-window invalidation here**: a comparison `test` only *reads* operands
-    // (`Y` slots included) — it pushes no frame, pops none, trims none and allocates
-    // nothing, and `evaluate_test` never touches `machine.stack`. The published window
-    // therefore stays exactly current, which is what lets the block's own gated refresh
-    // (`jit_refresh_y`) skip its derivation after this helper (Invariant IW).
 
     // The instruction this block emitted the helper for. An address outside the module
     // cannot be here (the block was compiled from this very code), so it is handed to

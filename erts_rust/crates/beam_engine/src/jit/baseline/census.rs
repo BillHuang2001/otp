@@ -426,31 +426,6 @@ fn the_static_deopt_census_over_the_corpus_is_printed() {
         snapshot.y_prologue_publishes as f64 * 100.0 / snapshot.y_blocks.max(1) as f64,
         snapshot.y_invalidations,
     );
-    // The **run-time** half of the Y-window story, printed beside the static one because
-    // neither is interpretable alone: the static gate says how many prologues *emit* a
-    // publish, the run-time witness says how many of those publishes (and of the gated
-    // in-block refreshes) then skipped the derivation. Sub-blocks are the range-crossing
-    // case the compile-time gate can never elide — a sub-block's range lies *before* the
-    // containing `call`, so `prologue_publishes_y` is true for it — hence their own split.
-    println!(
-        "Y witness: publish_y={} publish_y_skips={} refresh_y={} refresh_y_skips={}",
-        snapshot.publish_y,
-        snapshot.publish_y_skips,
-        snapshot.refresh_y,
-        snapshot.refresh_y_skips,
-    );
-    println!(
-        "Y ranges: emitting={} sub_blocks={} ir_blocks={} | sub_blocks_y_touching={} \
-         sub_blocks_publish={} ir_blocks_publish={}",
-        snapshot.blocks,
-        snapshot.emitted_sub_blocks,
-        snapshot.blocks.saturating_sub(snapshot.emitted_sub_blocks),
-        snapshot.sub_blocks_y_touching,
-        snapshot.sub_blocks_prologue_publishes,
-        snapshot
-            .y_prologue_publishes
-            .saturating_sub(snapshot.sub_blocks_prologue_publishes),
-    );
     println!(
         "deopt_weight: block-terminating dispatch (Jump/SelectVal/SelectTupleArity)=4, else 1"
     );
