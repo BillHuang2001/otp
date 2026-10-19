@@ -27,8 +27,11 @@
 //!
 //! * `enif_monitor_process` (`:3954-4011`) inserts a monitor record into the **resource object's own
 //!   monitor tree** (`erts_monitor_tree_insert(&rm->root, &mdp->origin)`, `:3983-3986`) and only
-//!   *then* copies the 24-byte reference block into the caller's `ErlNifMonitor`
-//!   (`erts_ref_to_driver_monitor(ref, monitor)`, `:4008-4009`).
+//!   *then* copies the reference block into the caller's `ErlNifMonitor`
+//!   (`erts_ref_to_driver_monitor(ref, monitor)`, `:4008-4009`). The block is the whole stored
+//!   reference block ([`REF_THING_BYTES`] bytes — the `ErlNifMonitor` payload — wider than the C's 24
+//!   because this tree's frozen internal-reference thing is 4 words, see
+//!   [`crate::nif::enif::process`]).
 //! * `erts_fire_nif_monitor` (`:3058-3115`) is how `down` is delivered. Under the resource's monitor
 //!   lock it computes `active = !is_dying && erts_monitor_is_in_table(omon)`; when active it
 //!   **deletes the monitor from the tree first** (`:3091`) and takes a protective reference on the
@@ -51,8 +54,9 @@
 //!
 //! One process-wide table in the crate's registry — the same [`Registry`] mutex the resource types and
 //! terms live under, **not** a second lock (a second lock would create a lock-order inversion with
-//! `destroy`/`Registry::forget_object` and can deadlock) — maps [`MonitorId`] (the C's 24-byte
-//! reference block) to the binding: the object, its type and the recorded target pid word.
+//! `destroy`/`Registry::forget_object` and can deadlock) — maps [`MonitorId`] (the whole stored
+//! reference block, [`REF_THING_BYTES`] bytes) to the binding: the object, its type and the recorded
+//! target pid word.
 //!
 //! [`deliver_resource_down_id`] is the ABI half of `erts_fire_nif_monitor`, in the C's own order:
 //! take the binding out **under the lock** (so only one caller can ever deliver a given monitor),
@@ -81,19 +85,25 @@ use libc::c_void;
 use crate::nif::enif::process::{holder_from_block, monitor_block, ref_block_of, REF_THING_BYTES};
 use crate::nif::types::{ErlNifMonitor, ErlNifPid};
 
-/// The identity of an armed process monitor: the C's 24-byte
-/// `ERTS_REF_THING_SIZE * sizeof(Eterm)` reference block (`io.c:6994-7010`), **not** the `Eterm` it
-/// was minted from.
+/// The identity of an armed process monitor: the whole stored reference block
+/// ([`REF_THING_BYTES`] bytes — the `ErlNifMonitor` payload), **not** the `Eterm` it was minted
+/// from.
 ///
 /// The difference matters: the reference term is a heap word that dies with the NIF-call heap,
-/// while the 24-byte block is what the C stores in the caller's `ErlNifMonitor` and what the
-/// resource's monitor tree is keyed by (`erts_monitor_tree_lookup(rm->root, ref)`,
-/// `erl_nif.c:4046`). A host that only kept the holder can still address the monitor through this
-/// type ([`MonitorId::from_holder`]).
+/// while the block is what the C stores in the caller's `ErlNifMonitor` and what the resource's
+/// monitor tree is keyed by (`erts_monitor_tree_lookup(rm->root, ref)`, `erl_nif.c:4046`). A host
+/// that only kept the holder can still address the monitor through this type
+/// ([`MonitorId::from_holder`]).
+///
+/// The width follows [`REF_THING_BYTES`] — this tree's frozen 4-word internal reference, whose id
+/// lives in word 3 — so two monitors armed from different references have different ids. A
+/// caller-supplied **C-layout** 3-word block is accepted too ([`crate::nif::enif::process`]'s
+/// `ref_block_of`), and it distinguishes just as well: its packed `num[]` ids live in its own
+/// payload words, which are copied whole (the block's zero tail carries no identity).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MonitorId([u8; REF_THING_BYTES]);
 
-/// A hand-written `Debug` (the derived one would print 24 decimal bytes) — the block is hex.
+/// A hand-written `Debug` (the derived one would print the bytes as decimals) — the block is hex.
 impl core::fmt::Debug for MonitorId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("MonitorId(0x")?;
@@ -124,7 +134,8 @@ impl MonitorId {
         unsafe { monitor_block(holder) }.map(MonitorId)
     }
 
-    /// The 24 payload bytes, for a caller that wants to compare against its own copy.
+    /// The whole stored reference block ([`REF_THING_BYTES`] bytes), for a caller that wants to
+    /// compare against its own copy.
     pub fn bytes(&self) -> [u8; REF_THING_BYTES] {
         self.0
     }
@@ -154,7 +165,7 @@ pub fn deliver_resource_down(monitor: Eterm, pid: Eterm) -> bool {
 }
 
 /// The [`MonitorId`] form of [`deliver_resource_down`] — the route a host takes when it only kept the
-/// 24-byte holder (the minted reference term lives on a NIF-call heap that has since gone).
+/// [`ErlNifMonitor`] holder (the minted reference term lives on a NIF-call heap that has since gone).
 ///
 /// The steps, and the `erl_nif.c` line each reproduces:
 ///
@@ -167,8 +178,8 @@ pub fn deliver_resource_down(monitor: Eterm, pid: Eterm) -> bool {
 ///    `erts_refc_inc_unless(&refc, 0, 0)` (`:3092`); a refusal means the resource is already dying
 ///    and `down` is **not** called (`brefc == 0`).
 /// 3. **Release the lock, then run the callback** — a re-entrant `enif_*` call from `down` must not
-///    deadlock. The operands are the object, the pid and the 24 reference bytes the arm stored
-///    (`:3105-3106`), and the environment comes from the **type's** host, exactly as `destroy` builds
+///    deadlock. The operands are the object, the pid and the whole stored reference block
+///    ([`REF_THING_BYTES`] bytes) the arm stored (`:3105-3106`), and the environment comes from the **type's** host, exactly as `destroy` builds
 ///    the destructor's (`pre_nif_noproc(&msg_env, type->owner, NULL)`, `:3107`).
 /// 4. **Drop the protective reference** (`:3110`) — which may synchronously run the destructor; that
 ///    is fine and expected, the lock is already released.

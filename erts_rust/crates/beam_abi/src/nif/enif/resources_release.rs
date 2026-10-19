@@ -84,12 +84,18 @@ use libc::c_void;
 /// under the registry lock, which is released before this function returns, and is ordered by the
 /// term word so a caller sees a deterministic list; the order carries no meaning.
 ///
+/// **One entry per MINT.** The registry is keyed by term *identity*
+/// ([`super::TermKey`]), so the words returned here are the ones the minting calls
+/// ([`super::enif_make_resource`] / [`super::enif_make_resource_binary`]) actually built; copies of
+/// them designate the same objects and the same single binding but are not reported (they hold no
+/// reference of their own, exactly as a copy of a magic ref holds none in the C).
+///
 /// This is the reachability question's input, not its answer: which of these terms is still live is
 /// the caller's decision (see [`release_resource_terms`]). A returned word is only meaningful while
 /// the heap that backs it is alive — a caller that needs identity alone (the usual case, e.g.
 /// comparing against its root set) should compare [`Eterm::raw`] values rather than inspect the term.
 pub fn resource_terms() -> Vec<Eterm> {
-    let mut words: Vec<usize> = with_registry(|r| r.terms.keys().copied().collect());
+    let mut words: Vec<usize> = with_registry(|r| r.terms.values().map(|entry| entry.word.raw()).collect());
     // A `HashMap`'s iteration order is unspecified; sorting makes the snapshot reproducible.
     words.sort_unstable();
     words.into_iter().map(Eterm::from_raw).collect()
@@ -100,12 +106,19 @@ pub fn resource_terms() -> Vec<Eterm> {
 ///
 /// For each live resource term for which `predicate(term)` returns `false`:
 ///
-/// 1. its term→object binding is removed (so `enif_get_resource` on that term answers `0` from then
-///    on — the binding removal is the structural guard that makes a repeated release a no-op), then
+/// 1. its term→object binding is removed (so `enif_get_resource` on that term — and on every copy of
+///    it, which shares the binding — answers `0` from then on; the binding removal is the structural
+///    guard that makes a repeated release a no-op), then
 /// 2. **exactly one** reference is dropped from the object — the reference the term took when it was
 ///    minted, through the same decrement path [`super::enif_release_resource`] uses; and
 /// 3. if that was the object's last reference, the type's destructor runs (synchronously) and the
 ///    block is freed.
+///
+/// The predicate is handed the term **word the mint built** (one per mint, see
+/// [`resource_terms`]), so a caller's root set keeps being compared word for word — a copy of the
+/// term designates the same object and keeps it reachable through the same binding, which is why a
+/// caller that answers a candidate's own word for a reachable *copy's* identity (`beam_rt`'s walk
+/// does exactly that) is still answering correctly.
 ///
 /// An object that still carries a user reference (the allocator's, or an `enif_keep_resource`)
 /// survives with its count reduced by exactly one and its destructor **not** run.
@@ -126,17 +139,19 @@ pub fn resource_terms() -> Vec<Eterm> {
 /// let released = release_resource_terms(|term| rooted.contains(&term.raw()));
 /// ```
 pub fn release_resource_terms<F: Fn(Eterm) -> bool>(predicate: F) -> usize {
-    // 1. Snapshot the live term words. The lock is released here: nothing below holds it while the
-    //    caller's predicate runs.
-    let snapshot: Vec<usize> = with_registry(|r| r.terms.keys().copied().collect());
+    // 1. Snapshot the live terms as (key, minted word). The lock is released here: nothing below
+    //    holds it while the caller's predicate runs.
+    let snapshot: Vec<(TermKey, usize)> =
+        with_registry(|r| r.terms.iter().map(|(key, entry)| (*key, entry.word.raw())).collect());
     if snapshot.is_empty() {
         return 0;
     }
 
-    // 2. The caller's reachability decision, lock-free.
-    let unreachable: Vec<usize> = snapshot
+    // 2. The caller's reachability decision, lock-free, on the word the mint built.
+    let unreachable: Vec<TermKey> = snapshot
         .into_iter()
-        .filter(|word| !predicate(Eterm::from_raw(*word)))
+        .filter(|(_, word)| !predicate(Eterm::from_raw(*word)))
+        .map(|(key, _)| key)
         .collect();
     if unreachable.is_empty() {
         return 0;
@@ -148,11 +163,10 @@ pub fn release_resource_terms<F: Fn(Eterm) -> bool>(predicate: F) -> usize {
     let objects: Vec<*mut c_void> = with_registry(|r| {
         unreachable
             .iter()
-            .filter_map(|word| r.terms.remove(word))
+            .filter_map(|key| r.terms.remove(key))
             .map(|entry| entry.obj)
             .collect()
     });
-
     // 4. Drop each term's own reference **outside** the lock: the decrement that reaches zero runs
     //    the destructor, which may call straight back into these entry points (it would deadlock on
     //    the registry lock) and which re-takes that lock itself to forget the object's bindings.

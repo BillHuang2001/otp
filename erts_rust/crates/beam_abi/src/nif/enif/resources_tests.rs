@@ -121,6 +121,31 @@ unsafe fn get_resource(env: &mut NifEnv, term: Eterm, ty: *mut ErlNifResourceTyp
     let matched = unsafe { enif_get_resource(env.as_ptr(), n(term), ty, &mut objp) };
     (matched, objp)
 }
+/// A **copy** of an internal-reference block: the same four words at a different heap address —
+/// exactly what `beam_message::copy_struct` (the send path, ETS) produces for one.
+///
+/// # Safety
+///
+/// `term` must be a live M1 internal-reference thing ([`prelude::is_internal_ref`]) whose block has
+/// exactly [`prelude::INTERNAL_REF_WORDS`] readable words.
+unsafe fn copy_reference(env: &mut NifEnv, term: Eterm) -> Eterm {
+    assert!(
+        unsafe { prelude::is_internal_ref(term) },
+        "the term must be an internal reference"
+    );
+    // SAFETY: `alloc` hands out exactly `INTERNAL_REF_WORDS` exclusively-owned, writable words from
+    // the host heap; every one of them is written below, before the pointer escapes.
+    let copy = unsafe { alloc(env, prelude::INTERNAL_REF_WORDS) }
+        .expect("the test heap can fit a four-word reference");
+    // SAFETY: `term` is a validated M1 reference, so its block holds exactly `INTERNAL_REF_WORDS`
+    // readable words; `copy` addresses exactly that many writable words, and the two blocks do not
+    // overlap (different allocations).
+    unsafe {
+        core::ptr::copy_nonoverlapping(prelude::boxed_val(term), copy, prelude::INTERNAL_REF_WORDS);
+    }
+    prelude::make_boxed(copy as *const Eterm)
+}
+
 /// **The A.3 divergence this file fixes.** `alloc → enif_make_resource → enif_release_resource →
 /// enif_get_resource` must still resolve to the live payload. The minted term takes its own
 /// reference (exactly the C magic ref's reference), so releasing the allocator's reference must
@@ -175,8 +200,17 @@ fn a_resource_term_keeps_the_object_alive_after_release() {
         42,
         "and the payload is intact"
     );
-}
 
+    // Leave the process-wide registry as it was. A term left behind here would keep a binding whose
+    // term block dies with this test's host arena — the very "reused address / dead mint" case the
+    // registry keys and evicts by identity — so this test cleans up after itself. (The count is not
+    // asserted: this registry is shared with every test in the binary.)
+    let minted_word = term.raw();
+    assert!(
+        release_resource_terms(|candidate| candidate.raw() != minted_word) >= 1,
+        "this test's own resource term is released"
+    );
+}
 /// An object that is **never** exported as a term is still destroyed on its last release, and its
 /// destructor runs (the documented synchronous timing).
 #[test]
@@ -848,4 +882,189 @@ fn concurrent_prunes_release_a_term_exactly_once() {
         1,
         "so the destructor runs exactly once"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Term IDENTITY, not the heap word: a copied resource term designates the same object
+//
+// A resource term is an internal reference whose identity is the `id` in its block's last word, so a
+// `copy_struct` copy (the send path, ETS) is a *different heap address with the same identity* and
+// designates the same resource. The C's magic refs are pointer-identified through `ErtsMRefThing.mb`,
+// which is copy-stable, so the oracle answers `1` for a copy — measured with
+// `tests/fixtures/nif_resource.c`'s `roundtrip/0` shape plus a `copy_struct` copy of the term.
+// ---------------------------------------------------------------------------------------------
+
+/// The registry key of a term (the private helper under test) — the one place binding and lookup
+/// derive identity from.
+fn key_of(term: Eterm) -> TermKey {
+    term_key(term)
+}
+
+/// A copy of a minted resource term resolves to the **same object**, and both copies share the one
+/// binding the mint created (so a single prune pass releases exactly one reference).
+#[test]
+fn a_copied_resource_term_resolves_to_the_same_object() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_dtor(_: *mut ErlNifEnv, _: *mut c_void) {
+        RUNS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    let mut host = RetainHost::new();
+    let mut env = NifEnv::new(&mut host);
+    let ty = open_type(&mut env, "copied_term_rt", counting_dtor);
+    let base = RUNS.load(AtomicOrdering::Relaxed);
+
+    // alloc (1) + the minted term (2); the allocator's reference is dropped below, so the term holds
+    // the only one from then on.
+    // SAFETY: `ty` came from `open_type`.
+    let obj = unsafe { alloc_object(ty, 4) };
+    // SAFETY: `obj` is a live 4-byte payload; the first byte is in bounds.
+    unsafe { *(obj as *mut u8) = 0x33 };
+    // SAFETY: `env` is live; `obj` is a live payload pointer.
+    let minted = unsafe { make_resource_term(&mut env, obj) };
+    // SAFETY: the term keeps the object alive from here on.
+    unsafe { enif_release_resource(obj) };
+
+    // The copy: four identical words at a different address — what `copy_struct` produces.
+    // SAFETY: `minted` is the internal reference `mint_resource_ref` just built.
+    let copy = unsafe { copy_reference(&mut env, minted) };
+    assert_ne!(
+        copy.raw(),
+        minted.raw(),
+        "the copy lives at a different heap address"
+    );
+    assert_eq!(
+        key_of(copy),
+        key_of(minted),
+        "but it carries the same reference identity"
+    );
+    // The minted term resolves (the C's behaviour, unchanged).
+    // SAFETY: `env` is live; `ty` is the object's type.
+    let (matched, got) = unsafe { get_resource(&mut env, minted, ty) };
+    assert_eq!((matched, got), (1, obj), "the minted term resolves");
+    // **The fix:** the copy resolves too. Before the identity key this answered `(0, null)` — the
+    // registry was keyed by the term WORD, so the copy's distinct address missed — while the oracle
+    // answers `1`.
+    // SAFETY: `env` is live; `ty` is the object's type.
+    let (copied_matched, copied_got) = unsafe { get_resource(&mut env, copy, ty) };
+    assert_eq!(
+        (copied_matched, copied_got),
+        (1, obj),
+        "a copy_struct copy of a resource term resolves to the same object"
+    );
+    assert_eq!(got, copied_got, "both idioms name one and the same payload");
+
+    // One binding per MINT: a copy shares the minted term's binding instead of adding one, so
+    // `resource_terms()` still reports the minted word (the caller's reachability input) and one
+    // prune pass drops exactly one reference.
+    assert_eq!(
+        resource_terms().iter().filter(|t| **t == minted).count(),
+        1,
+        "the minted term is in the live set exactly once"
+    );
+
+    let minted_word = minted.raw();
+    assert_eq!(
+        release_resource_terms(|candidate| candidate.raw() != minted_word),
+        1,
+        "one binding for this mint ⇒ one released reference"
+    );
+    assert_eq!(
+        RUNS.load(AtomicOrdering::Relaxed) - base,
+        1,
+        "the term held the last reference, so its destructor ran once"
+    );
+    // After the prune neither term designates anything — the copy included, because it resolved
+    // through the same binding.
+    // SAFETY: `env` is live; both terms are still readable words (their host arena is alive).
+    let after_minted = unsafe { get_resource(&mut env, minted, ty) };
+    let after_copy = unsafe { get_resource(&mut env, copy, ty) };
+    assert_eq!(after_minted.0, 0, "the pruned term no longer resolves");
+    assert_eq!(after_copy.0, 0, "nor does its copy");
+}
+
+/// A reference identity that was **never minted** is not a resource, and neither is any non-reference
+/// term: `enif_get_resource` answers `0` and leaves `*objp` untouched (the C's contract).
+#[test]
+fn an_unminted_reference_identity_is_not_a_resource() {
+    let mut host = RetainHost::new();
+    let mut env = NifEnv::new(&mut host);
+    let ty = open_type(&mut env, "unminted_ref_rt", silent_dtor);
+
+    // An ordinary internal reference (`erlang:make_ref/0`'s shape) whose id no `enif_make_resource`
+    // ever minted.
+    // SAFETY: `alloc` hands out exactly `INTERNAL_REF_WORDS` exclusively-owned words, which
+    // `write_internal_ref` fully initialises with an id that fits a small integer.
+    let unminted = unsafe { alloc(&mut env, prelude::INTERNAL_REF_WORDS) }
+        .expect("the test heap can fit a four-word reference");
+    // SAFETY: `unminted` addresses the four words just reserved; the id fits the small-integer slot.
+    let unminted = unsafe { prelude::write_internal_ref(unminted, 999_999) }
+        .expect("999_999 fits the reference id slot");
+    assert_eq!(
+        key_of(unminted),
+        TermKey::Ref(999_999),
+        "it is keyed by its reference identity like any other M1 reference"
+    );
+
+    // A not-a-resource sentinel that addresses a local byte, so "left untouched" is distinguishable
+    // from "written".
+    let mut placeholder: u8 = 0;
+    let sentinel: *mut c_void = (&mut placeholder as *mut u8).cast();
+    let atom = env.host().intern_atom("not_a_resource").expect("interns");
+    for term in [unminted, prelude::make_small(7), atom, NIL] {
+        let mut objp: *mut c_void = sentinel;
+        // SAFETY: `env` is live; `term` is a readable term; `ty` is a live type; `objp` is a live
+        // local.
+        let matched = unsafe { enif_get_resource(env.as_ptr(), n(term), ty, &mut objp) };
+        assert_eq!(
+            matched, 0,
+            "a term that is not one of this crate's resource terms never resolves"
+        );
+        assert_eq!(objp, sentinel, "*objp is left untouched");
+    }
+}
+
+/// The C's **type check**: a valid resource term of another type answers `0` (and leaves `*objp`
+/// untouched), for a copy as well as for the minted term.
+#[test]
+fn a_resource_term_of_another_type_does_not_resolve() {
+    let mut host = RetainHost::new();
+    let mut env = NifEnv::new(&mut host);
+    let ty = open_type(&mut env, "type_check_rt", silent_dtor);
+    let other = open_type(&mut env, "type_check_other_rt", silent_dtor);
+    assert_ne!(ty, other, "two distinct types");
+
+    // SAFETY: `ty` came from `open_type`; the term holds the only remaining reference.
+    let obj = unsafe { alloc_object(ty, 2) };
+    // SAFETY: `env` is live; `obj` is a live payload pointer.
+    let minted = unsafe { make_resource_term(&mut env, obj) };
+    // SAFETY: the term keeps the object alive from here on.
+    unsafe { enif_release_resource(obj) };
+    // SAFETY: `minted` is the internal reference `mint_resource_ref` just built.
+    let copy = unsafe { copy_reference(&mut env, minted) };
+
+    let mut placeholder: u8 = 0;
+    let sentinel: *mut c_void = (&mut placeholder as *mut u8).cast();
+    for term in [minted, copy] {
+        let mut objp: *mut c_void = sentinel;
+        // SAFETY: `env` is live; `term` is a resource term; `other` is a live type; `objp` is a live
+        // local.
+        let matched = unsafe { enif_get_resource(env.as_ptr(), n(term), other, &mut objp) };
+        assert_eq!(matched, 0, "the resource's type is not `other`");
+        assert_eq!(objp, sentinel, "*objp is left untouched");
+        // The same term against its own type does resolve — the type is what made the difference.
+        // SAFETY: `env` is live; `ty` is the object's real type.
+        assert_eq!(
+            unsafe { get_resource(&mut env, term, ty) },
+            (1, obj),
+            "the same term resolves against its own type"
+        );
+    }
+
+    // Leave the process-wide registry as it was.
+    let minted_word = minted.raw();
+    assert_eq!(release_resource_terms(|candidate| candidate.raw() != minted_word), 1);
 }

@@ -53,8 +53,8 @@ struct ProcHost {
     sent: Vec<(Eterm, Eterm)>,
     /// Every accepted `port_command`: `(port, data)`.
     port_cmds: Vec<(Eterm, Eterm)>,
-    /// The payloads of the monitors currently held.
-    monitors: Vec<(u64, u64)>,
+    /// The ids of the monitors currently held.
+    monitors: Vec<u64>,
     /// The next reference id `monitor_process` hands out.
     next_ref: u64,
     /// Whether `schedule_nif` is supported at all.
@@ -82,27 +82,62 @@ impl ProcHost {
     }
 }
 
-/// The internal reference `erts_make_ref_in_buffer` would build for `id`.
+/// The internal reference the arming host hands over — built with the crate's canonical writer, so it
+/// is byte-identical to what `beam_process::MonitorRef::to_eterm`, `beam_bifs`'s `make_ref_thing` and
+/// `beam_rt` mint (the frozen 4-word M1 block `[header, node, serial, id]`).
 fn ref_term(heap: &mut Heap, id: u64) -> Eterm {
     // SAFETY: `REF_THING_WORDS` fresh, exclusively owned words from `heap`.
     let p = unsafe { heap.alloc_words(REF_THING_WORDS) }.expect("the test heap has room");
-    // SAFETY: `p` addresses those words; the block is a valid ref thing.
+    // SAFETY: `p` addresses those words; `write_internal_ref` writes exactly `INTERNAL_REF_WORDS`
+    // of them before the root escapes.
+    unsafe { prelude::write_internal_ref(p, id) }.expect("the id fits the M1 60-bit slot")
+}
+
+/// `ERTS_REF_THING_SIZE` (`erl_term.h:990`): the C `ErtsORefThing`'s whole word count — the header
+/// plus its three packed `num[]` ids plus the marker, 24 bytes on 64-bit little-endian.
+const C_LAYOUT_REF_THING_WORDS: usize = C_LAYOUT_REF_PAYLOAD_WORDS + 1;
+
+/// The **other** internal-reference block shape: the C `ErtsORefThing`
+/// `[make_header(2, REF_SUBTAG), num[0..3] | marker]` (`erl_term.h:796-805`), three words, whose
+/// whole identity is the packed ids of its two payload words (`erl_term.h:828-869`).
+///
+/// Nothing in this tree mints it — `beam_term::boxed::write_internal_ref` writes the 4-word M1 block
+/// — but a host built on the C layout does (the crate's `tests/nif_process.rs` host is exactly that),
+/// so [`ref_block_of`] must accept it. The payload words are written as **raw** words, as the C
+/// packs its ids there, not as terms.
+fn c_layout_ref_term(heap: &mut Heap, id: u64) -> Eterm {
+    // SAFETY: `C_LAYOUT_REF_THING_WORDS` fresh, exclusively owned words from `heap`.
+    let p = unsafe { heap.alloc_words(C_LAYOUT_REF_THING_WORDS) }.expect("the test heap has room");
+    // SAFETY: `p` addresses those words and every one of them is written before the root escapes: the
+    // arity-`C_LAYOUT_REF_PAYLOAD_WORDS` header plus the two payload words that carry the id.
     unsafe {
-        *p = prelude::make_header(REF_THING_WORDS - 1, prelude::REF_SUBTAG);
+        *p = prelude::make_header(C_LAYOUT_REF_PAYLOAD_WORDS, prelude::REF_SUBTAG);
         *p.add(1) = Eterm::from_raw(id as usize);
         *p.add(2) = Eterm::from_raw(0);
     }
     prelude::make_boxed(p)
 }
 
-/// The `(w1, w2)` payload of an internal reference term (`None` when `term` is not one).
-fn ref_payload(term: Eterm) -> Option<(u64, u64)> {
-    if !is_term_word(term) || !unsafe { prelude::is_internal_ref(term) } {
+/// The block `words` would occupy on the heap, little-endian, right-zero-padded to
+/// [`REF_THING_BYTES`] — the exact bytes [`ref_block_of`] must produce for a block of that width.
+fn block_of_words(words: &[Eterm]) -> [u8; REF_THING_BYTES] {
+    let stride = core::mem::size_of::<Eterm>();
+    let mut expected = [0u8; REF_THING_BYTES];
+    for (i, word) in words.iter().enumerate() {
+        expected[i * stride..(i + 1) * stride].copy_from_slice(&word.raw().to_le_bytes());
+    }
+    expected
+}
+/// The id of an M1 internal-reference term (`None` when `term` is not one), read through the
+/// sanctioned accessor — which validates the header arity before it touches the id word, exactly as
+/// [`ref_block_of`] now does.
+fn ref_payload(term: Eterm) -> Option<u64> {
+    if !is_term_word(term) {
         return None;
     }
-    let p = prelude::boxed_val(term);
-    // SAFETY: `term` is a live internal reference, so its block's words 1 and 2 exist.
-    unsafe { Some(((*(p.add(1))).raw() as u64, (*(p.add(2))).raw() as u64)) }
+    // SAFETY: a non-boxed term is refused by the accessor, and a boxed one has its header word
+    // validated (subtag + arity) before any payload word is read.
+    unsafe { prelude::internal_ref_id(term) }.ok()
 }
 
 impl NifHost for ProcHost {
@@ -164,7 +199,7 @@ impl NifHost for ProcHost {
         }
         let id = self.next_ref;
         self.next_ref += 1;
-        self.monitors.push((id, 0));
+        self.monitors.push(id);
         Some(ref_term(&mut self.heap, id))
     }
     fn demonitor_process(&mut self, monitor: Eterm) -> Option<bool> {
@@ -403,7 +438,7 @@ fn monitors_round_trip_and_follow_the_c_codes() {
             enif_make_monitor_term(env.as_ptr(), &mon),
         )
     };
-    assert_eq!(same, 0, "the stored 24-byte block is what the comparison sees");
+    assert_eq!(same, 0, "the whole stored reference block is what the comparison sees");
     let payload = ref_payload(t(term));
     assert!(
         payload.is_some(),
@@ -452,9 +487,16 @@ fn compare_monitors_is_a_memcmp_style_ordering() {
         b.data[0] = 1;
         assert_eq!(enif_compare_monitors(&a, &b), -1);
         assert_eq!(enif_compare_monitors(&b, &a), 1);
-        // Bytes past the 3-word block are outside the C's comparison (`erl_nif.c:4057`).
+        // The compared range is the WHOLE stored reference block (`REF_THING_BYTES`), so the last
+        // byte of the holder is inside the comparison — there is no tail outside it any more.
         b.data[0] = 0;
         b.data[MONITOR_BYTES - 1] = 9;
+        assert_eq!(
+            enif_compare_monitors(&a, &b),
+            -1,
+            "`REF_THING_BYTES` == `MONITOR_BYTES`: no byte of the holder is outside the comparison"
+        );
+        b.data[MONITOR_BYTES - 1] = 0;
         assert_eq!(enif_compare_monitors(&a, &b), 0);
         // Nulls: the C faults; the documented substitute is a total order.
         assert_eq!(enif_compare_monitors(core::ptr::null(), core::ptr::null()), 0);
@@ -581,7 +623,197 @@ fn untouched_block(byte: u8) -> [u8; REF_THING_BYTES] {
     [byte; REF_THING_BYTES]
 }
 
-/// A `down` callback for monitor-capable test resource types: this crate only records its *presence*
+/// **Both internal-reference block shapes are accepted, each at its own width.**
+///
+/// The frozen M1 block is four words and fills the whole 32-byte payload, its identity in word 3; the
+/// C `ErtsORefThing` is three words (24 bytes) whose identity is its two payload words, so the block's
+/// last 8 bytes stay zeroed. Neither is over-read: each is copied as far as its header's arity says.
+#[test]
+fn both_reference_block_shapes_are_accepted_at_their_own_width() {
+    assert_eq!(
+        REF_THING_BYTES, MONITOR_BYTES,
+        "the stored block IS the whole `ErlNifMonitor` payload"
+    );
+    assert_eq!(REF_THING_BYTES, 32, "four machine words on LP64");
+    let mut heap = Heap::new(1024).expect("a test heap is allocatable");
+
+    // --- the C layout: three words, identity in the two payload words, zero tail ------------------
+    let c_a = c_layout_ref_term(&mut heap, 0x0000_0000_1122_3344);
+    let c_b = c_layout_ref_term(&mut heap, 0x0000_0000_5566_7788);
+    let block_a = ref_block_of(c_a).expect("a C-layout internal reference is accepted");
+    let block_b = ref_block_of(c_b).expect("a C-layout internal reference is accepted");
+    assert_eq!(
+        block_a,
+        block_of_words(&[
+            prelude::make_header(C_LAYOUT_REF_PAYLOAD_WORDS, prelude::REF_SUBTAG),
+            Eterm::from_raw(0x1122_3344),
+            Eterm::from_raw(0),
+        ]),
+        "exactly the C block's three words are copied and the rest stays zeroed"
+    );
+    assert_ne!(block_a, block_b, "the ids live in the payload words");
+    let stride = core::mem::size_of::<Eterm>();
+    assert_eq!(
+        block_a[..stride],
+        block_b[..stride],
+        "the headers are identical: both are `make_header(2, REF_SUBTAG)`"
+    );
+    assert_ne!(
+        block_a[stride..2 * stride],
+        block_b[stride..2 * stride],
+        "the ids live in the block's first payload word"
+    );
+    assert_eq!(
+        block_a[2 * stride..],
+        block_b[2 * stride..],
+        "…and nowhere else: every other byte of the two blocks agrees"
+    );
+    assert_eq!(
+        &block_a[REF_THING_BYTES - 8..],
+        &[0u8; 8][..],
+        "the C-layout block is one word shorter than `REF_THING_BYTES`: its tail is zeroed"
+    );
+    assert_eq!(
+        &block_b[REF_THING_BYTES - 8..],
+        &[0u8; 8][..],
+        "the same zero tail for every C-layout reference"
+    );
+
+    // --- the M1 layout: four words, identity in word 3, no tail ----------------------------------
+    let id = 0x0000_0000_0f0f_1234;
+    let m1 = ref_term(&mut heap, id);
+    let m1_block = ref_block_of(m1).expect("an M1 internal reference is accepted");
+    assert_eq!(
+        m1_block,
+        block_of_words(&[
+            prelude::make_header(prelude::INTERNAL_REF_PAYLOAD_WORDS, prelude::REF_SUBTAG),
+            prelude::make_small(0), // node
+            prelude::make_small(0), // serial
+            prelude::make_small(id as i64),
+        ]),
+        "all four M1 words are copied — the id word included"
+    );
+    assert_ne!(
+        &m1_block[REF_THING_BYTES - 8..],
+        &[0u8; 8][..],
+        "the M1 identity is the block's LAST word, so there is no zero tail here"
+    );
+    assert_eq!(
+        &m1_block[REF_THING_BYTES - 8..],
+        &prelude::make_small(id as i64).raw().to_le_bytes()[..],
+        "…and it is exactly the id word `write_internal_ref` wrote"
+    );
+    assert_ne!(
+        m1_block, block_a,
+        "the two shapes never collide: their headers differ (`make_header(3, …)` vs `make_header(2, …)`)"
+    );
+}
+
+/// **The never-over-read guarantee.** A word that is not a term, a boxed term of another kind, and an
+/// internal-reference-**shaped** header of any arity other than the two block shapes are all `None` —
+/// so the width-dispatched copy never reads a block whose size its header does not promise, and
+/// `enif_monitor_process` answers the C's `1` for all of them.
+#[test]
+fn a_reference_shaped_word_of_another_arity_is_refused() {
+    let mut heap = Heap::new(1024).expect("a test heap is allocatable");
+
+    // Not a term: a header-tagged word (`TAG_PRIMARY_HEADER`), which no term operand may be.
+    assert_eq!(
+        ref_block_of(Eterm::from_raw(0)),
+        None,
+        "a non-term word is refused"
+    );
+    // Immediates of every flavour.
+    assert_eq!(ref_block_of(prelude::make_small(7)), None, "a small int");
+    let mut atoms = AtomTable::new();
+    assert_eq!(
+        ref_block_of(prelude::make_atom(atoms.intern("an_atom"))),
+        None,
+        "an atom"
+    );
+    assert_eq!(ref_block_of(NIL), None, "the empty list");
+
+    // A tuple: a boxed term with payload words, but not an internal reference — refused on the
+    // subtag, not on the arity.
+    // SAFETY: three fresh, exclusively owned words.
+    let p = unsafe { heap.alloc_words(3) }.expect("the test heap has room");
+    // SAFETY: `p` addresses those words and all three are written before the root escapes.
+    unsafe {
+        *p = prelude::make_header(2, prelude::ARITYVAL_SUBTAG);
+        *p.add(1) = prelude::make_small(1);
+        *p.add(2) = prelude::make_small(2);
+    }
+    assert_eq!(
+        ref_block_of(prelude::make_boxed(p)),
+        None,
+        "a tuple is not an internal reference"
+    );
+
+    // Reference-shaped headers of an arity that is neither block shape: copying `REF_THING_BYTES` out
+    // of any of them would read past the block the header describes.
+    for arity in [0usize, 1, 4, prelude::INTERNAL_REF_WORDS] {
+        // SAFETY: `arity + 1` fresh, exclusively owned words.
+        let p = unsafe { heap.alloc_words(arity + 1) }.expect("the test heap has room");
+        // SAFETY: `p` addresses `arity + 1` words; the header plus every payload word is written
+        // before the root escapes.
+        unsafe {
+            *p = prelude::make_header(arity, prelude::REF_SUBTAG);
+            for i in 1..=arity {
+                *p.add(i) = prelude::make_small(i as i64);
+            }
+        }
+        assert_eq!(
+            ref_block_of(prelude::make_boxed(p)),
+            None,
+            "an internal-reference-shaped block of arity {arity} is neither accepted shape"
+        );
+    }
+}
+
+/// **The end-to-end effect of accepting the C shape:** a host that arms with a C-layout reference gets
+/// the C's `0`, and the holder receives that block's three words with a zeroed tail — the regression
+/// this shape's acceptance fixes (`enif_monitor_process` used to answer `1`, "could not establish").
+#[test]
+fn a_c_layout_arm_is_established_and_stores_its_three_words() {
+    let mut host = MonitorHost::new();
+    host.c_layout = true;
+    let armed = host.mint_ref();
+    host.result = Some(NifMonitorResult::Armed(armed));
+    let target = ErlNifPid {
+        pid: n(pid(8)),
+    };
+    let mut holder = filled_monitor(0xCC);
+    {
+        let mut env = NifEnv::new(&mut host);
+        // SAFETY: `env` is live and the locals are initialised and writable.
+        let code = unsafe {
+            enif_monitor_process(env.as_ptr(), core::ptr::null_mut(), &target, &mut holder)
+        };
+        assert_eq!(
+            code, MONITOR_ESTABLISHED,
+            "a C-layout reference is an arm: the C's 0, not the refusal 1"
+        );
+    }
+    // SAFETY: `holder` is an initialised local.
+    let stored = unsafe { monitor_block(&holder) }.expect("a non-null holder");
+    let expected = ref_block_of(armed).expect("the C-layout arm's block");
+    assert_eq!(stored, expected, "the holder is the arm's whole block");
+    assert_eq!(
+        &stored[REF_THING_BYTES - 8..],
+        &[0u8; 8][..],
+        "its zero tail is stored too, so two C-layout monitors stay distinct by their ids"
+    );
+    // The term route and the holder route name the same monitor — the invariant `beam_rt`'s
+    // `deliver_resource_down_id` relies on — for the C-layout shape too.
+    // SAFETY: `holder` is an initialised local.
+    let from_holder =
+        unsafe { crate::nif::enif::resources::MonitorId::from_holder(&holder) }.expect("non-null");
+    assert_eq!(
+        crate::nif::enif::resources::MonitorId::from_term(armed),
+        Some(from_holder),
+        "`MonitorId::from_term` and `MonitorId::from_holder` agree for a C-layout block"
+    );
+}/// A `down` callback for monitor-capable test resource types: this crate only records its *presence*
 /// (`resource_type_has_down`), it never calls it, so the body is intentionally empty.
 ///
 /// # Safety
@@ -658,6 +890,9 @@ struct MonitorHost {
     last_minted: Option<Eterm>,
     /// The next reference id the hooks mint.
     next_ref: u64,
+    /// Which block shape [`MonitorHost::mint_ref`] mints: `false` = this tree's 4-word M1 block,
+    /// `true` = the C's 3-word `ErtsORefThing` (what `tests/nif_process.rs`'s host builds).
+    c_layout: bool,
 }
 
 impl MonitorHost {
@@ -669,14 +904,20 @@ impl MonitorHost {
             legacy_asks: Vec::new(),
             last_minted: None,
             next_ref: 1,
+            c_layout: false,
         }
     }
 
-    /// Mint the internal reference `erts_make_ref_in_buffer` builds, with a fresh payload id.
+    /// Mint the internal reference `erts_make_ref_in_buffer` builds, with a fresh payload id — in
+    /// whichever block shape this host was configured for.
     fn mint_ref(&mut self) -> Eterm {
         let id = self.next_ref;
         self.next_ref += 1;
-        let term = ref_term(&mut self.heap, id);
+        let term = if self.c_layout {
+            c_layout_ref_term(&mut self.heap, id)
+        } else {
+            ref_term(&mut self.heap, id)
+        };
         self.last_minted = Some(term);
         term
     }
@@ -711,7 +952,8 @@ impl NifHost for MonitorHost {
 }
 
 /// **The arm path of the three-way seam.** `Armed(ref)` ⇒ the C's `0`, `*monitor` receives that
-/// reference's 3-word block, bytes 24..32 are zeroed, and the legacy hook is never consulted.
+/// reference's whole block (the frozen 4-word M1 block, `REF_THING_BYTES` = 32 bytes, all of the
+/// `ErlNifMonitor` payload), and the legacy hook is never consulted.
 ///
 /// Oracle measurement (OTP 29.1.1 / erts-17.1, a `cc`-built NIF arming on `enif_self` through a
 /// resource type opened with a `down` callback from the `load` callback): code `0`, holder written.
@@ -745,12 +987,12 @@ fn the_three_way_hook_arms_and_writes_the_reference_block() {
     assert_eq!(
         Some(stored),
         ref_block_of(armed),
-        "the 24 payload bytes are the hook's internal-reference block"
+        "the whole payload is the hook's internal-reference block"
     );
     assert_eq!(
         &holder.data[REF_THING_BYTES..],
         &filled_monitor(0).data[REF_THING_BYTES..],
-        "bytes 24..32 are zeroed (the C leaves them untouched and never reads them)"
+        "there is no tail: the block fills the holder exactly (`REF_THING_BYTES` == `MONITOR_BYTES`)"
     );
     assert!(
         host.legacy_asks.is_empty(),

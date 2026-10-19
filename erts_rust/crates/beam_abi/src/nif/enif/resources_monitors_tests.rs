@@ -23,7 +23,7 @@
 //!
 //! Every rule the C states about `erts_fire_nif_monitor` (`erts/emulator/beam/erl_nif.c:3058-3115`) is
 //! pinned in-process here: the callback runs **once** per armed monitor with the object, the target pid
-//! and the 24 reference bytes the arm stored; a second delivery is refused (the C unlinks the tree
+//! and the whole stored reference block the arm wrote; a second delivery is refused (the C unlinks the tree
 //! entry before it calls, `:3091`); a monitor whose resource was destroyed never fires
 //! (`run_resource_dtor` → `dtor_demonitor`, `:2974-3030`); and a `down` callback that calls back into
 //! the crate — `enif_get_resource`, `enif_release_resource`, even a destructor — does not deadlock,
@@ -67,9 +67,7 @@ use crate::nif::types::{
     ErlNifResourceTypeInit,
 };
 
-use beam_term::prelude::{
-    is_small, make_atom, make_boxed, make_header, make_internal_pid, make_pid_data, REF_SUBTAG,
-};
+use beam_term::prelude::{is_small, make_atom, make_internal_pid, make_pid_data};
 
 // ---------------------------------------------------------------------------------------------
 // The arming host
@@ -94,19 +92,21 @@ impl ArmingHost {
         }
     }
 
-    /// Mint the internal reference the C's `erts_make_ref_in_buffer` builds (`erl_nif.c:3978`) — a
-    /// 3-word `[header, id, 0]` block tagged `REF_SUBTAG` — and keep it on this host's heap, so the
-    /// 24 bytes stay readable for the whole test.
+    /// Mint the internal reference an arming host hands over — built with the crate's canonical writer,
+    /// so it is the frozen 4-word M1 block `[header, node, serial, id]` every producer in the tree
+    /// mints (`beam_process::MonitorRef`, `beam_bifs`'s `make_ref_thing`, `beam_rt`) — and keep it on
+    /// this host's heap, so the whole `REF_THING_BYTES` block stays readable for the whole test.
+    ///
+    /// The `id` is what makes two references distinct: `node`/`serial` are pinned to `make_small(0)`
+    /// for every reference, so the identity is entirely in word 3 — which is exactly why the stored
+    /// block has to be the whole 4 words.
     fn mint_ref(&mut self, id: usize) -> Eterm {
-        // SAFETY: three fresh, exclusively owned words from the test heap.
-        let p = unsafe { self.heap.alloc_words(3) }.expect("the test heap has room");
-        // SAFETY: `p` addresses those three words.
-        unsafe {
-            *p = make_header(2, REF_SUBTAG);
-            *p.add(1) = Eterm::from_raw(id);
-            *p.add(2) = Eterm::from_raw(0);
-        }
-        make_boxed(p)
+        // SAFETY: fresh, exclusively owned words from the test heap.
+        let p = unsafe { self.heap.alloc_words(prelude::INTERNAL_REF_WORDS) }
+            .expect("the test heap has room");
+        // SAFETY: `p` addresses those words; `write_internal_ref` writes exactly `INTERNAL_REF_WORDS`
+        // of them before the root escapes.
+        unsafe { prelude::write_internal_ref(p, id as u64) }.expect("the id fits the M1 id slot")
     }
 
     /// `enif_monitor_process` with `reference` as the armed monitor's identity:
@@ -161,7 +161,7 @@ impl NifHost for ArmingHost {
 // ---------------------------------------------------------------------------------------------
 
 /// One observation a `down` callback made: the object's unique marker, its address, the pid operand's
-/// raw word and the 24 monitor bytes.
+/// raw word and the whole stored reference block (`REF_THING_BYTES` bytes).
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Observed {
     marker: usize,
@@ -347,8 +347,8 @@ fn demonitor(host: &mut ArmingHost, obj: *mut c_void, holder: &ErlNifMonitor) ->
 // ---------------------------------------------------------------------------------------------
 
 /// The C `erts_fire_nif_monitor` contract (`erl_nif.c:3105-3108`): one delivery runs `down` **once**
-/// with the resource payload pointer, the target pid and the very 24 reference bytes the arm stored in
-/// the caller's holder.
+/// with the resource payload pointer, the target pid and the very reference block the arm stored in
+/// the caller's holder (the whole `REF_THING_BYTES`-byte block).
 #[test]
 fn a_delivered_down_reports_the_object_the_pid_and_the_stored_monitor_bytes() {
     let mut host = ArmingHost::new();
@@ -374,7 +374,7 @@ fn a_delivered_down_reports_the_object_the_pid_and_the_stored_monitor_bytes() {
     assert_eq!(
         seen[0].monitor,
         id.bytes(),
-        "the monitor operand carries the 24 bytes the arm stored"
+        "the monitor operand carries the reference block the arm stored"
     );
 
     // SAFETY: the allocator's one reference is still outstanding.
@@ -407,7 +407,7 @@ fn the_reference_term_form_delivers_the_same_way() {
     assert_eq!(
         seen[0].monitor,
         id.bytes(),
-        "both forms address the same 24 bytes"
+        "both forms address the same stored block"
     );
     assert!(
         !deliver_resource_down(reference, pid),
@@ -536,7 +536,7 @@ fn the_demonitor_codes_are_the_cs_once_our_tree_is_consulted() {
     );
 
     // `enif_compare_monitors` / `enif_make_monitor_term` still agree with the stored payload: the
-    // rebuilt holder carries the same 24 bytes the arm wrote.
+    // rebuilt holder carries the same block the arm wrote.
     let mut rebuilt = ErlNifMonitor {
         data: [0u8; MONITOR_BYTES],
     };
@@ -555,13 +555,133 @@ fn the_demonitor_codes_are_the_cs_once_our_tree_is_consulted() {
     assert_eq!(
         MonitorId::from_term(term),
         Some(id),
-        "the monitor term names the same 24 bytes"
+        "the monitor term names the same stored block"
     );
     assert!(
         !is_small(term),
         "the monitor term is a reference, not a small integer"
     );
     assert_eq!(observations_for(marker).len(), 1);
+
+    // SAFETY: the allocator's one reference is still outstanding.
+    unsafe { enif_release_resource(obj) };
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4b. Two monitors armed from different references stay distinct
+// ---------------------------------------------------------------------------------------------
+
+/// **The monitor identity is the WHOLE stored reference block, not the C's first 24 bytes.**
+///
+/// This tree's frozen internal reference is the 4-word M1 block `[header, node, serial, id]`
+/// (`beam_term::boxed::INTERNAL_REF_WORDS`): `node` and `serial` are pinned to `make_small(0)` for
+/// every reference in a runtime and the identity lives in **word 3**. A block that stopped at the C's
+/// 3 words (`ERTS_REF_THING_SIZE`, `erl_term.h:990`) would therefore be byte-identical for every
+/// monitor, so two distinct monitors would collapse into ONE tree entry — the first
+/// `enif_demonitor_process` would cancel the second's arm and its `down` could never fire.
+///
+/// Pinned here, in both directions:
+/// * two monitors minted from two **different** references have different `MonitorId` bytes (their
+///   first three words are identical — that is exactly what made the narrow block collapse them),
+///   demonitoring the first leaves the second armed, and the second's `down` still fires;
+/// * the **same** reference armed twice still compares equal (`enif_compare_monitors` == 0) and
+///   shares one tree entry — the legitimate "same monitor" case the widening must not break.
+#[test]
+fn two_monitors_minted_from_different_references_stay_distinct() {
+    let mut host = ArmingHost::new();
+    let (_ty, obj, marker) = type_and_object(&mut host, "down_two_refs_rt", recording_down);
+    let pid = pid_term();
+
+    // Two references that differ only in the id word (word 3).
+    let first_ref = host.mint_ref(0x11);
+    let second_ref = host.mint_ref(0x22);
+    let (first_code, first) = host.arm_with(obj, pid, first_ref);
+    let (second_code, second) = host.arm_with(obj, pid, second_ref);
+    assert_eq!((first_code, second_code), (0, 0), "both arms establish");
+
+    let first_id = id_of(&first);
+    let second_id = id_of(&second);
+    assert_eq!(
+        MonitorId::from_term(first_ref),
+        Some(first_id),
+        "the identity of the first arm is its reference's block"
+    );
+    assert_eq!(MonitorId::from_term(second_ref), Some(second_id));
+    assert_ne!(
+        first_id, second_id,
+        "two monitors minted from different references must have different identities"
+    );
+    assert_ne!(
+        first_id.bytes(),
+        second_id.bytes(),
+        "and different stored bytes"
+    );
+    // The blocks differ in the id word only — so a 3-word (C-width) block would have been identical
+    // for both and the two monitors would have been one entry.
+    let block_words_but_the_id = 3 * core::mem::size_of::<Eterm>();
+    assert_eq!(
+        first_id.bytes()[..block_words_but_the_id],
+        second_id.bytes()[..block_words_but_the_id],
+        "words 0..2 (header, node, serial) are identical for every reference in this tree"
+    );
+    assert_ne!(
+        first_id.bytes()[block_words_but_the_id..],
+        second_id.bytes()[block_words_but_the_id..],
+        "the identity lives in word 3, which only the widened block carries"
+    );
+
+    // The first demonitor must not take the second arm with it.
+    assert_eq!(
+        demonitor(&mut host, obj, &first),
+        0,
+        "the first monitor is identified and removed"
+    );
+    assert!(
+        resource_monitors().iter().any(|(m, _)| *m == second_id),
+        "the second monitor is still armed after the first was cancelled"
+    );
+    assert!(
+        deliver_resource_down(second_ref, pid),
+        "so the second monitor's `down` still fires"
+    );
+    let seen = observations_for(marker);
+    assert_eq!(seen.len(), 1, "exactly one `down` ran");
+    assert_eq!(
+        seen[0].monitor,
+        second_id.bytes(),
+        "and for the second monitor's block"
+    );
+    assert!(
+        !deliver_resource_down(first_ref, pid),
+        "the cancelled monitor never fires"
+    );
+
+    // The legitimate "same monitor" case: one reference armed twice is ONE monitor.
+    let same_ref = host.mint_ref(0x33);
+    let (again_code, again_a) = host.arm_with(obj, pid, same_ref);
+    let (twice_code, again_b) = host.arm_with(obj, pid, same_ref);
+    assert_eq!((again_code, twice_code), (0, 0), "both arms establish");
+    // SAFETY: both holders are initialised locals.
+    assert_eq!(
+        unsafe { enif_compare_monitors(&again_a, &again_b) },
+        0,
+        "the same reference armed twice is the same monitor"
+    );
+    assert_eq!(id_of(&again_a), id_of(&again_b), "and the same identity");
+    assert_eq!(
+        demonitor(&mut host, obj, &again_a),
+        0,
+        "one demonitor cancels it (a single tree entry)"
+    );
+    assert_eq!(
+        demonitor(&mut host, obj, &again_b),
+        1,
+        "and nothing is left to cancel"
+    );
+    assert!(
+        !deliver_resource_down(same_ref, pid),
+        "a cancelled monitor cannot deliver"
+    );
 
     // SAFETY: the allocator's one reference is still outstanding.
     unsafe { enif_release_resource(obj) };
