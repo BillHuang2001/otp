@@ -618,31 +618,12 @@ The `emqx_base62_encode` row of the `foreign` table above is the `bench` driver'
   The off-heap prune's own suite lives with its module ([`../context/gc/bin_vheap.rs`](../context/gc/bin_vheap.rs)); what this node must keep true around it is the park contract — a non-publishing window is refused before any work, and the call sits after the boundary collection and before the heap-kill drain.
 
 ## Known Issues / Handoffs
-* **A signal a process queues on ITSELF is applied only at its NEXT schedule-in, so a `'DOWN'`/`'EXIT'` it awaits in the same slice is missed (measured defect, no fix yet).**
-  `exit(P, kill)` on a monitored/linked `P` runs `ProcessTable::terminate_into`, which queues a
-  `PendingSignal::Down`/`Exit` on every receiver and then calls `schedule_service` — and
-  `schedule_service` **skips a receiver that is `Running`** (`../../beam_process/src/ptab.rs:2315`,
-  `:2482`, `:2498`), i.e. this very process, because the scheduler set it `Running` at slice begin
-  (`slice_begin_inner`, `../../beam_process/src/scheduler.rs:677`).
-  The queued signal is applied only by `slice_begin`'s `service_signals` at the next schedule-in
-  (`scheduler.rs:683-686`), and the `receive` `Wait` arm (`run.rs:1262`–`1363`) parks the process
-  **without servicing its own pending signals** — so a bare `receive {'DOWN', …}` / `{'EXIT', …}`
-  never sees it and takes its `after` branch (or blocks forever on `after infinity`).
-  Measured (`beam_rt run mon_kill.beam mon_kill:go/0`, oracle answers `down=killed` in every shape):
-  `spawn_monitor` + `exit(P,kill)` + `receive 'DOWN' after 1000` → `timeout`; the same with the child
-  having certainly run (`ready` handshake) → `timeout`; `spawn` + `monitor/2` + kill (child never
-  scheduled) → `timeout`; a trapping-link `exit(P,kill)` → `{'EXIT',…,killed}` also `timeout`.
-  A natural `P ! stop` delivers (`down=normal`), and an intervening `receive after 300 -> ok end`
-  makes the DOWN arrive (`message_queue_len` 0 → 1, matching the oracle's 0 → 1) — so the signal is
-  **queued, never lost or un-woken: it is materialised one schedule-in too late**.
-  The `-eval` route is immune (its action process is never set `Running` — `../runtime.rs:3078`
-  runs the body inline — so `schedule_service` serves it eagerly), which is why `tests/monitor.rs`
-  (all `-eval`) and `tests/spawn_monitor.rs` (its children die while the watcher is `Waiting`) stay
-  green, and why the differential corpus misses it (the `proc_signals/*` DOWN cases are `-eval` probes).
-  **Fix scope: one site** — service the process's own queue at the `Wait` arm (after `park_machine` /
-  `set_state(Waiting)` the window is relocation-exempt, so a delivery takes the heap-fragment
-  fallback), then re-check the mailbox instead of parking; a serviced queued `Exit` must return an
-  `Exit` outcome, not `Wait`.
+* **A signal a process queues on ITSELF is delivered before its next schedule-in — two mechanisms, because the C has both.**
+  **The in-scan fetch** ([`../context/execution.rs`](../context/execution.rs) `receive_next`, the C `i_loop_rec` → `erts_proc_sig_receive_helper` → `erts_proc_sig_fetch`, `../../erts/emulator/beam/emu/msg_instrs.tab:80-112`, `../../erts/emulator/beam/erl_proc_sig_queue.c:7729`, contract comment `:7739-7759`, splice + re-peek `:7771-7799`): an exhausted scan whose queue is *entirely* `PendingSignal::Down` applies it through the public `ProcessTable::service_signals` and re-reads the scan, so the awaited `'DOWN'` costs no extra scheduling round.
+  The `Down`-only gate is what keeps that service non-fatal from **inside** the machine's instruction stream: a `Terminate(_)` verdict has no channel there to report a death or its propagation, so every other class is left to the net below rather than duplicating `exit_policy`.
+  **The schedule-out net** ([`run.rs`](run.rs) `run`'s `EngineRunOutcome::Wait` arm, the C `schedule_out_process` / `active_sys_enqueue`, `../../erts/emulator/beam/erl_process.c:6777-6801` and `:7027-7094`, flag `erts_proc_notify_new_sig`, `../../erts/emulator/beam/erl_proc_sig_queue.h:2062-2075`): after every park bookkeeping step, a process whose `pending_signals` are non-zero returns `RunOutcome::Yield` instead of `Wait`, so the scheduler's `slice_end` `Yield` arm (`../../beam_process/src/scheduler.rs:745-759`) re-enqueues it and `slice_begin`'s `service_signals` applies the queue at its next entry — the C's re-enqueue-instead-of-sleep, which is also the only site that may terminate it.
+  Three invariants hold: the pid is put back on its run queue by exactly the arm that owns the `Runnable` transition (no double scheduling, no lost wakeup); the queue drains monotonically (every applied signal is popped, every fatal one terminates the pid at the next schedule-in), so a process cannot spin — one re-entry either matches the materialised message or parks again with an empty queue; and the `Waiting` + relocation-exempt window set by the park is overwritten to `Runnable` with no relocation site able to move the heap in between, so a delivered message takes the documented heap-fragment fallback at worst.
+  Pinned end to end by `tests/signal_self_delivery.rs` over the committed `tests/fixtures/sigself.erl`: all eight shapes (`killed`, `natural`, `killed_after`, `ran_before_kill`, `spawn_monitor_kill`, `trapping_link` — the exit-signal class only the net can deliver — `bare_receive` with no `after` clause, and `not_matching`) print the live oracle's own line with exit 0, individually and as `all/0`'s list.
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like
   on an allocation-shaped loop.** Such a runtime runs **zero** collections — the admission declines and
   the nursery grows instead, ≈150 words/call — whereas this one collects several times per call (7.67
