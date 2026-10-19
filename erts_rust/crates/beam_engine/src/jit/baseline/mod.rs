@@ -227,6 +227,7 @@ mod bitstr_tests;
 mod tests;
 
 #[cfg(test)]
+mod cross_tests;#[cfg(test)]
 #[path = "tail_exit_tests.rs"]
 mod tail_exit_tests;
 #[cfg(test)]
