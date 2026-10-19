@@ -155,10 +155,10 @@ fn ref_id_fits(id: u64) -> Result<()> {    // `MIN_SMALL` needs no test: a `u64`
 /// The `id` is drawn from the runtime's one shared local reference-id space
 /// ([`beam_common::next_ref_id`], through [`RefAllocator`]), so a monitor reference can never
 /// collide with another local reference — a bare `make_ref/0`, a timer or `seq_trace` reference or
-/// a NIF resource term.
+/// a NIF resource term. [`MonitorRef::from_id`] is the one exception, and deliberately not a mint:
+/// it names an id the caller derived from something else (see its docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MonitorRef {
-    id: u64,
+pub struct MonitorRef {    id: u64,
 }
 impl MonitorRef {
     /// The numeric reference id.
@@ -166,8 +166,45 @@ impl MonitorRef {
         self.id
     }
 
-    /// Builds the on-heap ref thing for this reference (see the module docs).
+    /// A reference naming an **explicit**, caller-derived id — **not** a mint.
     ///
+    /// # This is not a way to make a new reference
+    ///
+    /// Nothing here draws from the reference-id space, so this constructor **never** produces a
+    /// fresh identity and consumes no id. Every reference that is genuinely *minted* — this
+    /// crate's monitors and aliases, `erlang:make_ref/0`, the NIF `make_ref`, timers, `seq_trace`
+    /// and NIF resource terms — takes its id from the one shared process-wide space
+    /// ([`beam_common::next_ref_id`], through [`RefAllocator`]), which is what makes two mints
+    /// collide-free. `from_id` exists for the other case: a reference whose id is **derived from
+    /// something else**, where the caller must be able to name that id exactly.
+    ///
+    /// The live example is the unnamed-ETS-table tid: the table-taking BIFs decode a tid with
+    /// `beam_bifs::access::ref_thing_id` and use the decoded value as the table handle, so a tid
+    /// term must be built with the table's **handle** as its id — a drawn id would decode to some
+    /// unrelated number and address a different (or no) table. The same constructor is what lets a
+    /// regression test build a deliberately colliding reference term (two references with the very
+    /// same id) so a provenance/identity check can be probed.
+    ///
+    /// # The uniqueness contract does not transfer
+    ///
+    /// The shared space gives uniqueness only for *mints*. An id handed to `from_id` is the
+    /// caller's claim, and it must **never** be an id a live mint could also hand out — unless the
+    /// caller is deliberately reproducing or probing such an id (a test, or a fabricated tid under
+    /// its own handle). Nothing checks that claim here (this constructor is total), so an id
+    /// colliding with a live monitor reference would make a stale `{'DOWN', …}` indistinguishable
+    /// from that monitor's — the exact confusion [`RefAllocator`] exists to prevent.
+    ///
+    /// # Encoding stays checked at the writer
+    ///
+    /// `from_id` is total and infallible for any `u64`; the id-space bound is enforced where it
+    /// always was, by [`MonitorRef::to_eterm`] (`ref_id_fits`): an id past `MAX_SMALL` is refused
+    /// there with `BeamError::SystemLimit`, so a reference with such an id is nameable but never
+    /// encodable — never a truncated, wrapped or silently wrong term.
+    pub fn from_id(id: u64) -> MonitorRef {
+        MonitorRef { id }
+    }
+
+    /// Builds the on-heap ref thing for this reference (see the module docs).    ///
     /// The thing is `[make_header(3, REF_SUBTAG), node, serial, id]` — Milestone-1 has a single
     /// node, so `node` and `serial` are zero and the whole id lives in the last word (a `small`);
     /// the id itself comes from the one process-wide space [`beam_common::next_ref_id`] shared by

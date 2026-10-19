@@ -439,8 +439,7 @@ SMP pool:
     checked against the receiver's own nursery observables (`minor_gcs`, the young space's
     base/used words, the mature generation's used words); no sleeps / wall-clock bounds / oracle.
 
-41. `reference_ids.rs` (7 tests) — **PIN — the reference-id space is ONE shared, process-wide
-    source** (`beam_common::next_ref_id`). `beam_process::RefAllocator` is a **zero-sized handle**
+41. `reference_ids.rs` (10 tests) — **PIN — the reference-id space is ONE shared, process-wide    source** (`beam_common::next_ref_id`). `beam_process::RefAllocator` is a **zero-sized handle**
     onto it: `a_table_draw_is_the_shared_spaces_next_id` and
     `an_allocator_draw_is_the_shared_spaces_next_id` prove the exact relation (after a monitor, an
     alias or a bare table mint — and after a plain `RefAllocator` draw — one
@@ -459,10 +458,19 @@ SMP pool:
     which is why unique ids are the only honest guarantee, since `beam_codec`'s internal-reference
     codec is id-only); `a_real_draw_encodes_and_decodes_byte_exactly` keeps the encoder contract
     (a real draw round-trips; the `MAX_SMALL` check stays in `MonitorRef::to_eterm`, pinned in
-    `src/monitor.rs`). No absolute ids are asserted: the counter advances under every test in the
+    `src/monitor.rs`). The one **non-mint** constructor has its own three:
+    `from_id_names_its_explicit_id_and_encoding_stays_checked` (the id `0`/`1`/`MAX_SMALL` is echoed
+    verbatim, the boundary id still encodes and round-trips while `MAX_SMALL + 1`/`i64::MAX`/`u64::MAX`
+    are refused at the writer with `SystemLimit` and reserve no heap words, and `from_id` itself stays
+    total), `from_id_consumes_no_shared_id` (a bracket of two shared draws around a `from_id` call
+    proves it draws nothing — the second draw is the first `+ 1`, and a mint afterwards is still the
+    space's next id; the property that makes it O(1) where the odometer-walk was O(id)) and
+    `a_fabricated_reference_equals_a_minted_one_only_at_a_deliberately_shared_id` (a `from_id` term is
+    `=:=` a minted one iff the id is deliberately equal — the one remaining way to produce an equal-id
+    pair, since no two mints can collide — while the space's next id is already a different reference).
+    No absolute ids are asserted: the counter advances under every test in the
     binary. No oracle cross-check — the oracle has **one** id space, so it cannot express "two
-    producers, one id". Deterministic — no sleeps / wall-clock bounds / oracle.
-42. `off_heap_reachability.rs` (9 tests) — the **reachability-driven** liveness decision for the
+    producers, one id". Deterministic — no sleeps / wall-clock bounds / oracle.42. `off_heap_reachability.rs` (9 tests) — the **reachability-driven** liveness decision for the
     **process-owned** off-heap refc binaries (`Process::sweep_off_heap_binaries_reachable`, over
     `beam_gc::AnyCollector::for_each_reachable_object_view` + the read-only `gather_scan_roots` root
     set — every reported object is read through the **safe** `beam_gc::ReachableObject` view
@@ -620,12 +628,11 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **639 passed, 0 failed, 1 ignored** (214
-  in-module unit tests + 424 across the 49 integration test targets under `tests/` — one per top-level
+  `../../../tools/differential/` harness, not here. Current: **646 passed, 0 failed, 1 ignored** (215
+  in-module unit tests + 430 across the 49 integration test targets under `tests/` — one per top-level
   `tests/*.rs` file; the `common/mod.rs` support module contributes its 4 normalizer unit tests to each
   of its 7 includers — plus 1 doctest; the single ignore is the documented non-yielding-runner hang
   failure mode in `preemption.rs`).
-
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
