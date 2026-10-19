@@ -17,16 +17,20 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! The baseline tier's **specialised `bs_match` helper**: the in-block lowering for the one
-//! `bs_match` shape a binary comprehension / fixed-field decoder executes once per element.
+//! The baseline tier's **bitstring-family helper**: the in-block lowering for every `Bs*`
+//! opcode — the single most frequent family in a binary/`bstring` decoder, where a match
+//! and its field reads execute once per byte of the subject.
 //!
 //! Every family-owned instruction the emitter claims reaches its family through
 //! [`crate::families::dispatch`], the router that re-matches the instruction's variant (a
-//! jump table on the [`Instr`] discriminant) to find the **owning** family. For a `BsMatch`
-//! that router hop is pure overhead: this tier already knows the variant (it emitted the
-//! arm), so [`jit_bs_match`] calls the bitstring family's own body
-//! ([`crate::families::bitstrings::exec`]) directly — and only for the shape
-//! [`supported`] names, so every other `bs_match` keeps the generic family helper's route.
+//! jump table on the [`Instr`] discriminant) to find the **owning** family. For a `Bs*`
+//! instruction that hop is pure overhead: this tier already knows the variant (it emitted
+//! the arm), so [`jit_bitstr`] calls the bitstring family's own body
+//! ([`crate::families::bitstrings::exec`]) directly. The emitted arm claims the family's
+//! **whole** variant set ([`claimed`], the exact list the router owns for it), so the
+//! bypass covers `bs_start_match*`, `bs_get_position`, `bs_create_bin`, `bs_init_writable`,
+//! the `bs_get_integer*`/`bs_get_binary*` reads, `bs_match_string`, the UTF reads and every
+//! other member — not one hand-picked shape.
 //!
 //! Everything else is deliberately identical to [`super::family::jit_family`]: the same
 //! position store, the same instruction fetch (declining to [`jit_step_one`] on an address
@@ -34,88 +38,88 @@
 //! same context-`0` raise decoration, and the same [`fold_ok_step`]/[`fold_err`] encoding of
 //! the outcome. The helper therefore cannot produce a result the interpreter's
 //! per-instruction step would not — only reach it one dispatch hop sooner.
+//!
+//! **The helper runs no per-execution shape predicate.** The emit side decided the route at
+//! compile time ([`claimed`]); re-deciding it here would hand back a large part of the hop
+//! this helper exists to remove (the previous round measured a per-execution re-test at
+//! about a third of the win). An address that holds a variant the family does not own — an
+//! artifact/module mismatch, say — is answered by the family's own `Ok(None)` and handed to
+//! [`jit_step_one`], which is the interpreter's exact diagnostic for it.
 
-use beam_loader::{Instr, Operand};
+use beam_loader::Instr;
 
 use super::jit_step_one;
 use super::runtime::{fold_err, fold_ok_step, JitRuntime};
 use crate::families::bitstrings;
 
-/// The shape [`jit_bs_match`] lowers: the fixed-width field read a binary comprehension (and
-/// a `<<Len, Rest/bits>>` style decoder) runs once per element.
+/// `true` for exactly the variants [`crate::families::dispatch`] routes to the bitstring
+/// family.
 ///
-/// A `bs_match`'s `commands` operand is the raw flattened command list, so the decoded shape
-/// is `[ensure_at_least, Bits, Unit, integer, Live, Flags, Size, Unit, Dst]` — nine operands:
-/// a compile-time constant `ensure_at_least` skip, then an `integer` read of a compile-time
-/// constant size/unit into a register. That is exactly the pair the OTP compiler emits for
-/// `<< C >> <= B` (`bits/i`'s own `{ensure_at_least,8,1}` + `{integer,_,{literal,[]},8,1,Dst}`),
-/// and the only nine-operand command list the vocabulary has (the other commands are 2
-/// (`ensure_exactly`, `skip`), 4 (`get_tail`, `=:=`) or 6 (`integer`, `binary`) operands long).
+/// This is the router's own bitstring arm (`../families/mod.rs`, the `bitstrings::
+/// exec` arm) transcribed variant for variant, so the emitted arm and the router can never
+/// disagree about who owns an opcode; [`crate::families::bitstrings::exec`]'s `Ok(None)`
+/// contract — the family's own statement of its variant set — is what the pins compare it
+/// against.
 ///
-/// The predicate is **purely syntactic** — the instruction's own operands, never the module
-/// (so it cannot resolve the two command atoms): it only decides *which* of two routes reaches
-/// the **same** family body. A shape it wrongly accepts would still execute correctly through
-/// [`crate::families::bitstrings::exec`]; it could only fail to be the fast path.
-pub(crate) fn supported(instr: &Instr) -> bool {
-    let Instr::BsMatch { commands, .. } = instr else {
-        return false;
-    };
-    // `ensure_at_least Bits Unit` followed by `integer Live Flags Size Unit Dst`. The two
-    // command atoms are checked only as "an atom" (the predicate has no module to name them
-    // through); the constant fields and the register destination are the shape's real
-    // signature, and the operand count is what makes the pair unambiguous.
-    match commands.as_slice() {
-        [
-            Operand::Atom(_),
-            Operand::Integer(_),
-            Operand::Integer(_),
-            Operand::Atom(_),
-            Operand::Integer(_),
-            _flags,
-            Operand::Integer(_),
-            Operand::Integer(_),
-            dst,
-        ] => is_register(dst),
-        _ => false,
-    }
-}
-
-/// `true` for the destination forms a `bs_match` `integer` command can bind: an X register,
-/// a Y slot, or the `tr` typed wrapper around either.
-fn is_register(operand: &Operand) -> bool {
+/// The predicate is **purely syntactic** (the instruction's own variant), which is what lets
+/// the emitter take the decision at compile time and the helper skip it at execution time. A
+/// variant it wrongly accepted would still execute correctly through
+/// [`crate::families::bitstrings::exec`] (or decline to [`jit_step_one`]); it could only fail
+/// to be the fast path.
+pub(crate) fn claimed(instr: &Instr) -> bool {
     matches!(
-        operand,
-        Operand::X(_) | Operand::Y(_) | Operand::Typed { .. }
+        instr,
+        Instr::BsStartMatch3 { .. }
+            | Instr::BsStartMatch4 { .. }
+            | Instr::BsGetPosition { .. }
+            | Instr::BsSetPosition { .. }
+            | Instr::BsGetTail { .. }
+            | Instr::BsTestTail2 { .. }
+            | Instr::BsGetInteger2(_)
+            | Instr::BsGetBinary2(_)
+            | Instr::BsSkipBits2 { .. }
+            | Instr::BsMatch { .. }
+            | Instr::BsMatchString { .. }
+            | Instr::BsGetFloat2(_)
+            | Instr::BsGetUtf8 { .. }
+            | Instr::BsGetUtf16 { .. }
+            | Instr::BsGetUtf32 { .. }
+            | Instr::BsSkipUtf8 { .. }
+            | Instr::BsSkipUtf16 { .. }
+            | Instr::BsSkipUtf32 { .. }
+            | Instr::BsInitWritable
+            | Instr::BsCreateBin { .. }
     )
 }
 
-/// How many times [`jit_bs_match`] has actually executed on this thread.
+/// How many times [`jit_bitstr`] has actually executed on this thread.
 ///
 /// Test-only structural instrument (`#[cfg(test)]`-gated, so a production build carries no
 /// counter at all): a cross-tier result agreement alone would also hold if the emitted arm had
 /// kept the generic family route, so the pins assert this moved. Per-thread and monotonic, so a
 /// caller takes a `before`/`after` pair around the run it is describing.
 #[cfg(test)]
-pub(crate) fn specialised_calls() -> u64 {
-    SPECIALISED_CALLS.with(std::cell::Cell::get)
+pub(crate) fn bitstr_calls() -> u64 {
+    BITSTR_CALLS.with(std::cell::Cell::get)
 }
 
-// The `specialised_calls` counter's per-thread storage (test builds only).
+// The `bitstr_calls` counter's per-thread storage (test builds only).
 #[cfg(test)]
 thread_local! {
-    static SPECIALISED_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BITSTR_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-/// Run the `bs_match` at `(func, pc)` through the bitstring family's own body and encode its
-/// outcome as a block-ABI word.
+
+/// Run the bitstring-family instruction at `(func, pc)` through the family's own body and
+/// encode its outcome as a block-ABI word.
 ///
 /// The [`StepHelper`](super::runtime::StepHelper) signature, so the emitter drives it through
 /// the very emission sequence the generic family arm uses
 /// ([`emit_helper_call`](super::emit::emit_helper_call) +
-/// [`emit_continue_check`](super::emit::emit_continue_check)): a completed match reports
+/// [`emit_continue_check`](super::emit::emit_continue_check)): a completed instruction reports
 /// [`Step::Next`](crate::Step::Next) and the block continues in-block, a fail-label branch
 /// reports a `Goto` and a raise/`Wait` leaves the block with that word for the driver —
 /// exactly what [`jit_family`](super::family::jit_family) would have produced.
-pub(crate) extern "C" fn jit_bs_match(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+pub(crate) extern "C" fn jit_bitstr(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it holds
     // points at an object the driver owns and keeps alive for the whole loop (`machine`,
@@ -137,7 +141,8 @@ pub(crate) extern "C" fn jit_bs_match(rt: *mut JitRuntime<'_>, func: u32, pc: u3
         let ctx = unsafe { &mut *runtime.ctx };
 
         // The same position store `Machine::step_instruction` makes at entry: a `bs_match`
-        // raises `{badmatch, Subject}` at NO_FAIL and branches at a fail label, so the
+        // raises `{badmatch, Subject}` at NO_FAIL and branches at a fail label, and
+        // `bs_create_bin`/`bs_init_writable` are allocation (move/raise) positions, so the
         // machine's saved instruction pointer must name this instruction, not the block.
         machine.set_current_code(func, pc);
 
@@ -152,15 +157,6 @@ pub(crate) extern "C" fn jit_bs_match(rt: *mut JitRuntime<'_>, func: u32, pc: u3
             Some(instr) => instr,
             None => return jit_step_one(rt, func, pc),
         };
-        // The emitted arm decided the **shape** at compile time; the helper's own guard is
-        // only that this address really holds a `BsMatch` (a mismatch means the artifact is
-        // not the one the driver published). It deliberately does NOT re-run [`supported`]:
-        // the family body executes *every* `BsMatch` shape, so the shape predicate only ever
-        // chose between two routes to the same body, and re-deciding it per execution would
-        // hand back a large part of the hop this helper exists to remove.
-        if !matches!(instr, Instr::BsMatch { .. }) {
-            return jit_step_one(rt, func, pc);
-        }
 
         // The router's own `class_atoms_live` latch, reproduced because this helper bypasses
         // the router: without it a family raise whose class atom the *module's* table cannot
@@ -174,11 +170,11 @@ pub(crate) extern "C" fn jit_bs_match(rt: *mut JitRuntime<'_>, func: u32, pc: u3
         // for every `Bs*` variant), so the operand reads/writes, the match-context state, the
         // rooted term construction and every error landing are the family's, unchanged.
         #[cfg(test)]
-        SPECIALISED_CALLS.with(|calls| calls.set(calls.get() + 1));
+        BITSTR_CALLS.with(|calls| calls.set(calls.get() + 1));
         match bitstrings::exec(machine, module, labels, instr, func, pc, ctx) {
             Ok(Some(step)) => Ok(step),
             // Not this family's variant after all: the interpreter's own step, which reports
-            // the documented `unsupported` for an unclaimed variant.
+            // the exact diagnostic (or executes the instruction natively) for it.
             Ok(None) => return jit_step_one(rt, func, pc),
             // The uniform raise funnel's context-`0` half, exactly as
             // `Machine::step_instruction` runs it: in context `0` the active module IS the

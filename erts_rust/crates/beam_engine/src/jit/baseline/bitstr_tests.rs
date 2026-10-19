@@ -17,31 +17,38 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! Pins for the specialised `bs_match` helper (`super::bitstr`). A `#[path]` sibling of
+//! Pins for the bitstring-family helper (`super::bitstr`). A `#[path]` sibling of
 //! `super::tests`, so it reuses that module's harness (`body_module`,
 //! `assert_same_outcome`, the `MinimalContext` route).
 //!
-//! Three claims, one per concern:
+//! Four claims, one per concern:
 //!
-//! * the **shape predicate** accepts exactly the command list the shipped `erlc` emits for a
-//!   fixed-width field read, checked on a **committed real `.beam`** (`bssmall.beam`) rather
-//!   than on a hand-written IR, so the specialisation cannot silently stop firing;
-//! * every **other** `bs_match` command list keeps the generic family route (the predicate
-//!   must not claim a shape it would then have to execute anyway);
-//! * the specialised path is **interpreter-identical**: the same real fixture's reads return
-//!   the same value on both tiers, while the helper's own counter proves the emitted arm
-//!   actually took it (a cross-tier agreement alone would also hold if the arm never fired).
+//! * the **route predicate** [`bitstr::claimed`] agrees, instruction for instruction, with
+//!   the bitstring family's own statement of its variant set
+//!   ([`crate::families::bitstrings::exec`]'s `Ok(None)` contract) over the committed real
+//!   `.beam` fixtures — so the bypass can neither miss a `Bs*` variant (the router hop stays
+//!   paid) nor take one another family owns;
+//! * it covers **every** `Bs*` variant the router names — each one is asserted on a
+//!   hand-built instance, so a future `Instr` variant cannot silently fall out of the set;
+//! * every other family's instructions keep the generic family route (the predicate declines
+//!   them, and the specialised helper's counter does not move for them);
+//! * the specialised path is **interpreter-identical** on real fixture functions covering
+//!   matching, string matching, tail reads and construction — while the helper's own counter
+//!   proves the emitted arm actually took it (a cross-tier agreement alone would also hold
+//!   if the arm never fired).
 
 use beam_common::Result;
-use beam_loader::{load_file, Instr, Module, Operand};
-use beam_term::Atom;
+use beam_loader::{load_file, BsGetArgs, Instr, Label, Module, Operand, NO_FAIL};
+use beam_term::{Atom, Eterm};
 
-use super::tests::{assert_same_outcome, body_module};
-use super::bitstr::{self, specialised_calls};
+use super::bitstr::{self, bitstr_calls};
+use super::tests::{assert_same_outcome, body_module, with_both_tiers};
 use crate::context::MinimalContext;
+use crate::families::bitstrings;
+use crate::interpreter::LabelMap;
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
-use crate::terms::make_heap_binary;
+use crate::terms::{make_heap_binary, make_integer};
 
 /// Load one of the committed `erlc` fixtures (`tests/fixtures/*.beam`).
 fn fixture(name: &str) -> Module {
@@ -49,294 +56,463 @@ fn fixture(name: &str) -> Module {
     load_file(&path).unwrap_or_else(|error| panic!("load {path}: {error:?}"))
 }
 
-/// Every `bs_match` of `module` whose command list is the fixed-width field read:
-/// `[atom, Integer, Integer, atom, Integer, _, Integer, Integer, register]`.
-///
-/// Derived here **independently** of [`bitstr::supported`] (a plain recount of the shape) so
-/// the predicate is checked against the real bytes rather than against itself.
-fn hot_shaped_matches(module: &Module) -> usize {
-    let mut found = 0;
-    for function in &module.functions {
-        for instr in &function.code {
-            let Instr::BsMatch { commands, .. } = instr else {
-                continue;
-            };
-            let hot = matches!(
-                commands.as_slice(),
-                [
-                    Operand::Atom(_),
-                    Operand::Integer(_),
-                    Operand::Integer(_),
-                    Operand::Atom(_),
-                    Operand::Integer(_),
-                    _,
-                    Operand::Integer(_),
-                    Operand::Integer(_),
-                    Operand::X(_) | Operand::Y(_) | Operand::Typed { .. },
-                ]
-            );
-            if hot {
-                found += 1;
-            }
-        }
-    }
-    found
+/// The fixtures whose instructions the route predicate is checked against: the whole
+/// committed bitstring surface (matching, string matching, UTF, wide fields, construction,
+/// failure paths) plus one variant-proof module. They carry the family's real compiler output,
+/// so the comparison runs over the exact opcodes `erlc` emits — not a hand-written IR.
+const FIXTURE_SET: [&str; 8] = [
+    "bitstrings",
+    "bsmatch",
+    "bscreate",
+    "bssmall",
+    "bsstring",
+    "bsbig",
+    "bsfailseg",
+    "vb_bitstr",
+];
+
+/// Whether the family itself claims `instr`: its own `Ok(None)` contract is the authority
+/// [`bitstr::claimed`] must agree with.
+fn family_claims(module: &Module, instr: &Instr) -> bool {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let labels = LabelMap::new();
+    !matches!(
+        bitstrings::exec(&mut machine, module, &labels, instr, 0, 0, &mut ctx),
+        Ok(None)
+    )
 }
 
-/// Every `bs_match` of `module`, and how many of them [`bitstr::supported`] claims.
-fn supported_matches(module: &Module) -> (usize, usize) {
-    let mut total = 0;
-    let mut supported = 0;
-    for function in &module.functions {
-        for instr in &function.code {
-            if matches!(instr, Instr::BsMatch { .. }) {
-                total += 1;
-                if bitstr::supported(instr) {
-                    supported += 1;
-                }
-            }
-        }
-    }
-    (total, supported)
-}
-
-/// **The predicate accepts the shape the shipped compiler emits.**
+/// **The predicate agrees with the family's own variant set, over real `.beam`s.**
 ///
-/// `bssmall.beam` is committed `erlc` output, and every one of its `u<N>/1`/`s<N>/1`/`u<N>le/1`
-/// reads is `<<Y:N, _/bitstring>> = B` — `{ensure_at_least,N,1}` + `{integer,_,{literal,[]},N,1,Dst}`,
-/// the exact pair a binary comprehension runs once per element. The counts must agree with an
-/// independent recount of the real command lists, so a predicate that stopped matching the
-/// compiler's shape fails here rather than in a benchmark.
+/// For every instruction of every fixture, `claimed(instr)` must equal the family's own
+/// answer. Both directions matter:
+///
+/// * a `Bs*` variant the predicate misses keeps paying the router hop (the whole point of the
+///   lever), and
+/// * a variant the predicate claims but the family does not own would take the router's job
+///   away from the emitter.
 #[test]
-fn the_predicate_accepts_the_command_list_the_compiler_emits() {
-    let module = fixture("bssmall");
-    let expected = hot_shaped_matches(&module);
-    let (total, supported) = supported_matches(&module);
+fn the_route_predicate_agrees_with_the_family_on_real_beam_instructions() {
+    let mut checked = 0usize;
+    let mut claimed = 0usize;
+    for name in FIXTURE_SET {
+        let module = fixture(name);
+        for (func, function) in module.functions.iter().enumerate() {
+            for (pc, instr) in function.code.iter().enumerate() {
+                let ours = bitstr::claimed(instr);
+                let theirs = family_claims(&module, instr);
+                assert_eq!(
+                    ours, theirs,
+                    "{name}:{func}:{pc}: claimed() says {ours} but the family says {theirs} \
+                     for {instr:?}"
+                );
+                checked += 1;
+                claimed += usize::from(ours);
+            }
+        }
+    }
     assert!(
-        expected > 0,
-        "the fixture must carry at least one fixed-width field read (total bs_match: {total})"
+        checked > 1_000,
+        "the fixture set must cover a real instruction corpus (checked {checked})"
     );
-    assert_eq!(
-        supported, expected,
-        "the predicate must claim exactly the {expected} fixed-width reads \
-         (of {total} bs_match instructions)"
+    assert!(
+        claimed > 50,
+        "the fixture set must exercise the family's variant set (claimed {claimed} of {checked})"
     );
 }
 
-/// **Every other `bs_match` command list keeps the generic family route.**
+/// One hand-built instance per `Bs*` variant the router names, with plausible operands.
 ///
-/// The shapes are the vocabulary's remaining ones: the bare `integer` read (6 operands), the
-/// `ensure_exactly` test (2), the flattened multi-field list a `<<A:16, B:16, R/binary>>` head
-/// produces (19), and a fixed-width read whose destination is not a register. None of them may
-/// be claimed — the generic arm executes them through the same family body.
+/// The list is the router's bitstring arm transcribed **independently** of
+/// [`bitstr::claimed`] (a pin is only useful if it is written down separately), so a variant
+/// added to — or dropped from — the predicate without the router fails here.
+fn every_bitstring_variant() -> Vec<Instr> {
+    let ctx = || Operand::X(1);
+    vec![
+        Instr::BsStartMatch3 {
+            fail: Label(3),
+            bin: Operand::X(0),
+            live: 1,
+            dst: ctx(),
+        },
+        Instr::BsStartMatch4 {
+            fail: Operand::Integer(3),
+            live: 1,
+            src: Operand::X(0),
+            dst: ctx(),
+        },
+        Instr::BsGetPosition {
+            ctx: ctx(),
+            dst: Operand::X(2),
+            live: 2,
+        },
+        Instr::BsSetPosition {
+            ctx: ctx(),
+            pos: Operand::X(2),
+        },
+        Instr::BsGetTail {
+            ctx: ctx(),
+            dst: Operand::X(2),
+            live: 2,
+        },
+        Instr::BsTestTail2 {
+            fail: Label(3),
+            ctx: ctx(),
+            bits: 8,
+        },
+        Instr::BsGetInteger2(Box::new(BsGetArgs {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            size: Operand::Integer(8),
+            unit: 1,
+            flags: 0,
+            dst: Operand::X(2),
+        })),
+        Instr::BsGetBinary2(Box::new(BsGetArgs {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            size: Operand::Integer(8),
+            unit: 8,
+            flags: 0,
+            dst: Operand::X(2),
+        })),
+        Instr::BsGetFloat2(Box::new(BsGetArgs {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            size: Operand::Integer(64),
+            unit: 1,
+            flags: 0,
+            dst: Operand::X(2),
+        })),
+        Instr::BsSkipBits2 {
+            fail: Label(3),
+            ctx: ctx(),
+            size: Operand::Integer(8),
+            unit: 1,
+            flags: 0,
+        },
+        Instr::BsMatch {
+            fail: Label(3),
+            ctx: ctx(),
+            commands: vec![Operand::Atom(Atom::MAX), Operand::Integer(8)],
+        },
+        Instr::BsMatchString {
+            fail: Label(3),
+            ctx: ctx(),
+            bits: 8,
+            offset: 0,
+        },
+        Instr::BsGetUtf8 {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            flags: 0,
+            dst: Operand::X(2),
+        },
+        Instr::BsGetUtf16 {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            flags: 0,
+            dst: Operand::X(2),
+        },
+        Instr::BsGetUtf32 {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            flags: 0,
+            dst: Operand::X(2),
+        },
+        Instr::BsSkipUtf8 {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            flags: 0,
+        },
+        Instr::BsSkipUtf16 {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            flags: 0,
+        },
+        Instr::BsSkipUtf32 {
+            fail: Label(3),
+            ctx: ctx(),
+            live: 2,
+            flags: 0,
+        },
+        Instr::BsInitWritable,
+        Instr::BsCreateBin {
+            fail: NO_FAIL,
+            alloc: 0,
+            live: 1,
+            unit: 8,
+            dst: Operand::X(0),
+            segments: Vec::new(),
+        },
+    ]
+}
+
+/// **Every `Bs*` variant the router names is claimed, and nothing else is.**
 #[test]
-fn every_other_command_list_keeps_the_generic_family_route() {
-    let ctx_atom = Operand::Atom(beam_term::Atom::MAX);
-    let integer_atom = Operand::Atom(beam_term::Atom::MAX);
-    let cases: [(&str, Vec<Operand>); 5] = [
-        (
-            "an integer read alone",
-            vec![
-                integer_atom.clone(),
-                Operand::Integer(2),
-                Operand::Literal(0),
-                Operand::Integer(8),
-                Operand::Integer(1),
-                Operand::X(0),
-            ],
-        ),
-        (
-            "an ensure_exactly test",
-            vec![ctx_atom.clone(), Operand::Integer(64)],
-        ),
-        (
-            "a flattened multi-field list",
-            vec![
-                Operand::Atom(beam_term::Atom::MAX),
-                Operand::Integer(32),
-                Operand::Integer(8),
-                integer_atom.clone(),
-                Operand::Integer(2),
-                Operand::Literal(0),
-                Operand::Integer(16),
-                Operand::Integer(1),
-                Operand::X(0),
-                integer_atom.clone(),
-                Operand::Integer(2),
-                Operand::Literal(1),
-                Operand::Integer(16),
-                Operand::Integer(1),
-                Operand::X(1),
-                Operand::Atom(beam_term::Atom::MAX),
-                Operand::Integer(3),
-                Operand::Integer(1),
-                Operand::X(2),
-            ],
-        ),
-        (
-            "a fixed-width read into a non-register",
-            vec![
-                Operand::Atom(beam_term::Atom::MAX),
-                Operand::Integer(8),
-                Operand::Integer(1),
-                integer_atom,
-                Operand::Integer(2),
-                Operand::Literal(0),
-                Operand::Integer(8),
-                Operand::Integer(1),
-                Operand::Literal(3),
-            ],
-        ),
-        ("an empty command list", Vec::new()),
-    ];
-    for (label, commands) in cases {
-        let instr = Instr::BsMatch {
-            fail: beam_loader::NO_FAIL,
-            ctx: Operand::X(1),
-            commands,
-        };
-        assert!(!bitstr::supported(&instr), "{label} must not be claimed");
+fn the_predicate_claims_the_whole_bitstring_family_and_only_it() {
+    let variants = every_bitstring_variant();
+    assert_eq!(
+        variants.len(),
+        20,
+        "the router's bitstring arm names twenty variants"
+    );
+    for instr in &variants {
+        assert!(
+            bitstr::claimed(instr),
+            "the predicate must claim every Bs* variant: {instr:?}"
+        );
     }
-    // And the non-`bs_match` variants are of course not this helper's.
-    assert!(!bitstr::supported(&Instr::Return));
+
+    // The converse: a representative of every **other** family, plus core-loop instructions,
+    // must keep its own route. `GetList`/`PutList` are the `lists` family's, `Try` the
+    // exceptions', `Send`/`LoopRec` the receive family's, `Fmove` the floats', `MakeFun3` the
+    // funs', `PutTuple2`/`GetTupleElement` the tuples', `Move`/`Return`/`Label` core arms.
+    let others = vec![
+        Instr::PutList {
+            head: Operand::Integer(1),
+            tail: Operand::Nil,
+            dst: Operand::X(0),
+        },
+        Instr::GetList {
+            source: Operand::X(0),
+            head: Operand::X(1),
+            tail: Operand::X(2),
+        },
+        Instr::GetHd {
+            source: Operand::X(0),
+            head: Operand::X(1),
+        },
+        Instr::GetTl {
+            source: Operand::X(0),
+            tail: Operand::X(1),
+        },
+        Instr::PutTuple2 {
+            dst: Operand::X(0),
+            elements: vec![Operand::Integer(1)],
+        },
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 0,
+            dst: Operand::X(1),
+        },
+        Instr::Try {
+            frame: Operand::X(0),
+            fail: Label(4),
+        },
+        Instr::Send,
+        Instr::LoopRec {
+            fail: Label(3),
+            dst: Operand::X(0),
+        },
+        Instr::Fmove {
+            src: Operand::X(0),
+            dst: Operand::X(1),
+        },
+        Instr::MakeFun3 {
+            index: 0,
+            dst: Operand::X(0),
+            env: Vec::new(),
+        },
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+    ];
+    for instr in &others {
+        assert!(
+            !bitstr::claimed(instr),
+            "the predicate must not claim another family's (or a core-arm) instruction: \
+             {instr:?}"
+        );
+    }
 }
 
-/// Run exported `name/1` with one heap-binary argument on both tiers, handing the two
-/// outcomes to `check`.
+/// The one argument a case row passes to the exported function under test, built **per side**
+/// (each run owns its own `MinimalContext` heap).
+#[derive(Clone, Copy)]
+enum Arg {
+    Bytes(&'static [u8]),
+    Int(i64),
+}
+
+impl Arg {
+    fn build(self, ctx: &mut MinimalContext) -> Eterm {
+        match self {
+            Arg::Bytes(bytes) => make_heap_binary(ctx, bytes).expect("the argument builds"),
+            Arg::Int(value) => make_integer(ctx, value).expect("the argument builds"),
+        }
+    }
+}
+
+/// Run exported `name/1` with `arg` on both tiers, handing the two outcomes to `check`.
 ///
-/// The byte-argument twin of `tests`' `with_both_tiers_unary` (that one hard-codes a small int
-/// argument): each run builds its own [`MinimalContext`] heap, so the comparison happens
-/// *inside* this call — a returned boxed term points into that heap and the context must
-/// outlive it.
-fn with_both_tiers_bytes<R>(
+/// Each run builds its own heap (a returned boxed term points into it), so the comparison
+/// happens *inside* this call.
+fn with_both_tiers_arg<R>(
     module: &Module,
     name: Atom,
-    bytes: &[u8],
+    arg: Arg,
     check: impl FnOnce(&Result<RunOutcome>, &Result<RunOutcome>) -> R,
 ) -> R {
     let mut interpreter = Machine::new();
     let mut interpreter_ctx = MinimalContext::new();
-    let arg = make_heap_binary(&mut interpreter_ctx, bytes).expect("the argument builds");
+    let value = arg.build(&mut interpreter_ctx);
     let interpreter_outcome = interpreter.run_export_outcome_with_tier(
         module,
         name,
         1,
-        &[arg],
+        &[value],
         &mut interpreter_ctx,
         Tier::Interpreter,
     );
 
     let mut baseline = Machine::new();
     let mut baseline_ctx = MinimalContext::new();
-    let arg = make_heap_binary(&mut baseline_ctx, bytes).expect("the argument builds");
+    let value = arg.build(&mut baseline_ctx);
     let baseline_outcome = baseline.run_export_outcome_with_tier(
         module,
         name,
         1,
-        &[arg],
+        &[value],
         &mut baseline_ctx,
         Tier::BaselineJit,
     );
     check(&interpreter_outcome, &baseline_outcome)
 }
 
-/// **The specialised path is interpreter-identical, and it is the path the tier takes.**
-///
-/// `bssmall:u64/1` and `bssmall:u9le/1` are the committed fixture's fixed-width reads (the
-/// little-endian one carries a non-empty flags literal, which the predicate deliberately
-/// ignores because the family decodes it). Both must return the interpreter's value on the
-/// baseline tier, and the helper's own counter must have moved — a cross-tier agreement alone
-/// would also hold if the emitted arm had kept the generic route.
-#[test]
-fn the_specialised_helper_runs_and_agrees_with_the_interpreter() {
-    let module = fixture("bssmall");
-    let subject: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+/// The `name/1` of `module`, or a panic naming the fixture.
+fn export(module: &Module, fixture_name: &str, name: &str) -> Atom {
+    module
+        .atom_table
+        .lookup(name)
+        .unwrap_or_else(|| panic!("{fixture_name}:{name}/1 must be exported"))
+}
 
-    for (name, expected) in [
-        ("u64", 0x0123_4567_89ab_cdef_i64),
-        // `<<Y:9/little, _/bitstring>>` over the same subject: the low 9 bits of its first
-        // byte pair, read little-endian -- derived from the family's own definition, and the
-        // interpreter's answer is what the assertion compares against below anyway.
-        ("u9le", 0),
-    ] {
-        let atom = module
-            .atom_table
-            .lookup(name)
-            .unwrap_or_else(|| panic!("{name}/1 must be exported by the fixture"));
-        let before = specialised_calls();
-        with_both_tiers_bytes(&module, atom, &subject, |interpreter, baseline| {
-            assert_same_outcome(name, interpreter, baseline, &module.atom_table);
+/// **The helper executes every claimed shape on the real fixtures and is interpreter-identical.**
+///
+/// Each case is a committed `erlc`-compiled function whose body is a different member of the
+/// family — `bs_start_match3` + `bs_get_integer2` (`first8/1`), `bs_test_tail2` (`head16/1`),
+/// the fixed-width `bs_match` (`u64/1`), the standalone `bs_match_string` (`strlong/1`) and
+/// `bs_create_bin` (`u8/1`) — and each must return the interpreter's value on the baseline
+/// tier **with the helper's counter moving**, which is what proves the emitted arm (rather
+/// than the generic family arm) ran.
+#[test]
+fn every_claimed_shape_runs_through_the_helper_and_agrees_with_the_interpreter() {
+    // `<<1,2,3,4,5,6,7,8,...>>`: `first8`/`u64` read its first byte/eight bytes.
+    let subject: &'static [u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    // `head16/1` is the exhaustive `<<X:16>>` form, so its subject must be exactly two bytes.
+    let pair: &'static [u8] = &[1, 2];
+    // `bsmatch:strlong/1` starts with the literal `<<"abcdefghij", R/binary>>`.
+    let literal: &'static [u8] = b"abcdefghijk";
+    // (fixture, function, argument, the expected small-int result — `None` for a binary result,
+    // which the bit-exact cross-tier comparison covers on its own).
+    let cases: [(&str, &str, Arg, Option<i64>); 5] = [
+        ("bitstrings", "first8", Arg::Bytes(subject), Some(1)),
+        ("bitstrings", "head16", Arg::Bytes(pair), Some(0x0102)),
+        ("bssmall", "u64", Arg::Bytes(subject), Some(0x0102_0304_0506_0708)),
+        // `strlong/1` returns the tail **binary** after the 10-byte literal.
+        ("bsmatch", "strlong", Arg::Bytes(literal), None),
+        ("bscreate", "u8", Arg::Int(65), None),
+    ];
+    for (fixture_name, function, arg, expected) in cases {
+        let module = fixture(fixture_name);
+        let atom = export(&module, fixture_name, function);
+        let before = bitstr_calls();
+        with_both_tiers_arg(&module, atom, arg, |interpreter, baseline| {
+            assert_same_outcome(
+                &format!("{fixture_name}:{function}/1"),
+                interpreter,
+                baseline,
+                &module.atom_table,
+            );
             let returned = baseline
                 .as_ref()
-                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+                .unwrap_or_else(|error| panic!("{fixture_name}:{function}/1: {error:?}"));
             let RunOutcome::Returned(value) = returned else {
-                panic!("{name}: unexpected outcome {returned:?}");
+                panic!("{fixture_name}:{function}/1: unexpected outcome {returned:?}");
             };
-            if name == "u64" {
+            if let Some(expected) = expected {
                 assert_eq!(
                     beam_term::signed_value(*value),
                     expected,
-                    "u64/1 must read the fixture's first 8 bytes"
+                    "{fixture_name}:{function}/1 answered the wrong value"
                 );
             }
         });
-        let after = specialised_calls();
+        let after = bitstr_calls();
         assert!(
             after > before,
-            "{name}/1 must execute through the specialised helper (counter {before} -> {after})"
+            "{fixture_name}:{function}/1 must execute through the bitstring helper \
+             (counter {before} -> {after})"
         );
     }
 }
 
-/// **A `bs_match` shape the predicate declines still runs correctly.**
-///
-/// The same fixture's `u64x/1` is the compiler's exhaustive `<<Y:64>>` form — an
-/// `ensure_exactly` test, i.e. *not* the claimed shape — so it keeps the generic family arm.
-/// Its value must still be the interpreter's, and the specialised counter must not move.
+/// **A failing match takes the same path**: `first8/1` on an empty subject raises exactly
+/// what the interpreter raises, and the helper still ran (`bs_start_match3` succeeded, the
+/// `bs_get_integer2` failed into its fail label — a `Goto` the fold encodes for the driver).
 #[test]
-fn a_declined_shape_keeps_the_generic_route_and_still_agrees() {
-    let module = fixture("bssmall");
-    let subject: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 42];
-    let atom = module
-        .atom_table
-        .lookup("u64x")
-        .expect("u64x/1 must be exported by the fixture");
-    let before = specialised_calls();
-    with_both_tiers_bytes(&module, atom, &subject, |interpreter, baseline| {
-        assert_same_outcome("u64x", interpreter, baseline, &module.atom_table);
-        let RunOutcome::Returned(value) = baseline.as_ref().expect("the run completes") else {
-            panic!("u64x: unexpected outcome");
-        };
-        assert_eq!(
-            beam_term::signed_value(*value),
-            42,
-            "u64x/1 must read the fixture's last byte"
+fn a_failing_match_agrees_with_the_interpreter_and_still_bypasses_the_router() {
+    let module = fixture("bitstrings");
+    let atom = export(&module, "bitstrings", "first8");
+    let before = bitstr_calls();
+    with_both_tiers_arg(&module, atom, Arg::Bytes(&[]), |interpreter, baseline| {
+        assert_same_outcome(
+            "first8/1 on an empty subject",
+            interpreter,
+            baseline,
+            &module.atom_table,
         );
     });
-    assert_eq!(
-        specialised_calls(),
-        before,
-        "an `ensure_exactly` shape must not reach the specialised helper"
+    assert!(
+        bitstr_calls() > before,
+        "a failing match still reaches the bitstring family through the helper"
     );
 }
 
-/// A `put_list` body is not a `bs_match`: the helper's predicate must decline everything the
-/// generic family arm owns, so the four constructors keep their route.
+/// **A non-bitstring family instruction keeps the generic route.**
+///
+/// The helper's counter must not move for a `put_list` body: the emitted arm claims only
+/// [`bitstr::claimed`]'s variants, and everything else keeps the shared `jit_family` helper.
 #[test]
-fn a_non_match_body_is_never_claimed() {
-    let (module, _name) = body_module(vec![
-        beam_loader::Instr::Label(beam_loader::Label(1)),
-        beam_loader::Instr::Label(beam_loader::Label(2)),
-        beam_loader::Instr::PutList {
+fn a_non_bitstring_body_keeps_the_generic_family_route() {
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::PutList {
             head: Operand::Integer(1),
             tail: Operand::Nil,
             dst: Operand::X(0),
         },
-        beam_loader::Instr::Return,
+        Instr::Return,
     ]);
     for function in &module.functions {
         for instr in &function.code {
-            assert!(!bitstr::supported(instr));
+            assert!(
+                !bitstr::claimed(instr),
+                "a put_list body must not be claimed: {instr:?}"
+            );
         }
     }
+    let before = bitstr_calls();
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome("put_list", interpreter, baseline, &module.atom_table);
+    });
+    assert_eq!(
+        bitstr_calls(),
+        before,
+        "a put_list must not reach the bitstring helper"
+    );
 }
