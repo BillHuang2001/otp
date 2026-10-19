@@ -138,15 +138,19 @@ completion, and each completion is reported exactly once.
 An `{active, true|N|once}` socket owes its owner **incoming-message** notifications that are
 neither `{Port, {data, …}}` (the passive read path) nor the answer to a call (a completion): the
 `{tcp, S, Data}` of `tcp_message` (`inet_drv.c:3979`), its `{packet,N}` shape
-`packet_binary_message` (`:4110`), and `{tcp_passive, S}`/`{udp_passive, S}` from
-`packet_passive_message` (`:4215`). Built exactly like the two precedents (separate struct, separate
+`packet_binary_message` (`:4110`), `{tcp_passive, S}`/`{udp_passive, S}` from
+`packet_passive_message` (`:4215`), and the `{tcp_error, S, Reason}`/`{udp_error, S, Reason}` of
+`tcp_error_message` (`:4079`)/`packet_error_message` (`:4245`). Built exactly like the two precedents (separate struct, separate
 drain — `PortNotification` keeps its two variants and `CompletionEvent` gains no variant):
 - `port_task.rs` → `ActiveInput { port, event }` with `ActiveInputEvent { Data(ReadMessage),
-  Passive }`. `Data` is one delivered input with the header/body split kept (`header` = the
-  `{packet,N}` framing header of a stream port, empty for `{packet,0}`, or the 7-byte packed source
-  address of a datagram port), never merged with another and never also reported as a `Data`
-  notification; an empty body is still a real delivery. `Passive` is atom-free — the runtime picks
-  `{tcp_passive,_}` vs `{udp_passive,_}` from the port's driver name.
+  Passive, Error(InetReason) }`. `Data` is one delivered input with the header/body split kept
+  (`header` = the `{packet,N}` framing header of a stream port, empty for `{packet,0}`, or the
+  7-byte packed source address of a datagram port), never merged with another and never also
+  reported as a `Data` notification; an empty body is still a real delivery. `Passive` is atom-free
+  — the runtime picks `{tcp_passive,_}` vs `{udp_passive,_}` from the port's driver name. `Error`
+  carries an `InetReason` and is likewise name-free — the runtime picks `{tcp_error,_}` vs
+  `{udp_error,_}` the same way and renders the atom with `InetReason::atom_name()`; it is
+  delivered **before** the close it precedes, and a datagram port emits it without any close.
 - `driver.rs` → `DriverContext::deliver_active_input(event)` (+ the chainable
   `with_active(&mut VecDeque<ActiveInput>)`). It **stamps `ctx.port()` itself**, answers the typed
   `unsupported` with no sink, and refuses after a failure latched in the same callback — the same
@@ -282,7 +286,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - `registry_reply_tests.rs` → the write-path pin: the reply round trip (`port_command` ⇒ one `Data`) and the refused-command propagation (`Err(BadArg)` out of `execute_port_tasks`), a `#[path]` test module of `registry.rs`
 - `registry_busy_tests.rs` → the registry's busy/peer-close seams (4 tests), a `#[path]` test module of `registry.rs`: a live idle port taking the command, a busy port reported busy with the legacy `port_command` folding `Busy` into `Ok(())` **without** queueing, `port_closed` forwarding the driver's latch, and the unknown-id `BadArg` all three seams answer
 - `port_command_tests.rs` → the busy-port decision table's suite (8 tests), a `#[path]` test module of `port.rs`: idle ⇒ `Done` + one `OUTPUT` task, busy + plain/`[nosuspend]` ⇒ `Busy` with nothing queued, `[force]` ⇒ `notsup` without `SOFT_BUSY` and `Done` with it, the state cleared ⇒ `Done` again, `BadArg` on a non-`Open` port, and the `is_busy`/`port_closed` probes
-- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `ActiveInput`/`ActiveInputEvent` (the separate `{active,…}` channel), `PortTaskOutcome`
+- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `ActiveInput`/`ActiveInputEvent` (the separate `{active,…}` channel: `Data`/`Passive`/`Error(InetReason)`), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`
 - `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`is_busy`/`port_closed` (both defaulting `false`; the first is the `set_busy_port` state `Port::command` decides on, the second a latched peer/OS close)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async`/`take_exit_status`/`take_eof`), `DriverContext` (incl. the four sinks: `with_reads` + `deliver_read(header, body)`, `with_completions` + `deliver_completion(event)`, `with_active` + `deliver_active_input(event)`, `with_failure` + `signal_failure(failure)` — the first three stamp `ctx.port()` itself, and each answers a typed `unsupported` with no sink), `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors
