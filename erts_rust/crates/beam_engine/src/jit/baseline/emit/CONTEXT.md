@@ -528,8 +528,11 @@ by construction).
   byte-level linker unit tests (alongside `test.rs`'s own unit tests).
 - `frame.rs` -> `emit_deallocate`, `emit_return`, `emit_deallocate_return` (whose `position_pc` — the
   helper's recorded position — is separate from its `store_pc`, the pair's first pc), `emit_resume_or_exit`
-  (the three end-of-body lowerings + the shared `jmp done` exit), plus its unit tests (the
-  frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
+  (the three end-of-body lowerings: the helper's word is tested for a pending in-block continuation —
+  `mov rdi,[rsp+RUNTIME_SLOT_DISP]` / `mov r11,[rdi+RUNTIME_RESUME_DISP]` / `test r11,r11` /
+  `je done` — and, when one is published, the block tears its own frame down and `jmp r11` **tails**
+  into it, so a return chain does not grow the native stack; otherwise the word leaves for the driver),
+  plus its unit tests (the frame-discipline bytes and the emitter-side `Deallocate`+`Return` fusion).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
   frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers) and the private
   `emit_frame_change_continue` (the frame-only helpers' continue arm: compare against
