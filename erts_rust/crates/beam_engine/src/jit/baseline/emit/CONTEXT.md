@@ -79,13 +79,13 @@ Logical groups:
 | Comparisons | `Bif` (and `GcBif` fallback) | `compare.rs::try_inline_comparison` | `compare.rs::comparison_shape` |
 | BIF accessors | `Bif` (`hd`, `element`, `tuple_size`) | `bif.rs::try_inline_bif` -> the reused `aggregate.rs` cons/tuple read | `bif.rs::bif_shape` (the cons/tuple read shapes; `element/2` additionally needs a **compile-time small-int index `>= 1`**) |
 | BIF value accessors | `Bif` and `GcBif` (`byte_size`, `length`) | `bif.rs::try_inline_bif` -> `emit_helper_call(jit_bif_value)` (`../bif_helper.rs`) | `bif.rs::value_shape` (the operand is re-read and written through the engine's own `read_operand`/`write_operand`) |
-| Frame pop | `Deallocate` | `frame.rs::emit_deallocate` (an `emit_helper_call` to `jit_deallocate`) | always lowered (the instruction's own outcome is the helper's block-ABI word): continues in-block on `encode_target(func, pc+1)`, else leaves via `done` |
+| Frame pop | `Deallocate` | `frame.rs::emit_deallocate` (an `emit_helper_call` to `jit_deallocate`) | always lowered (the instruction's own outcome is the helper's block-ABI word): continues in-block on `encode_target(func, pc+1)` via `emit_frame_change_continue` (no refill; the helper re-published the Y window), else leaves via `done` |
 | Return | `Return` | `frame.rs::emit_return` (an `emit_helper_call` to `jit_return`) | always lowered — a `return` always transfers control: `emit_resume_or_exit` tail-jumps to the continuation entry the helper resolved (in this function, or in another function of the same module), else the block leaves with the helper's word in `rax` |
 | Fused frame pop + return | `DeallocateReturn` | `frame.rs::emit_deallocate_return` (an `emit_helper_call` to `jit_deallocate_return`); `emit_block` also fuses a separate adjacent `Deallocate`+`Return` pair into one such call | always lowered — always transfers control, leaves via `emit_resume_or_exit` (in-block tail-jump, else the helper's word) |
 | Frame push | `Allocate` | `heap.rs::emit_allocate` (an `emit_helper_call` to `jit_allocate`) | always lowered (the helper's `Machine::push_frame`; `allocate` performs no heap admission): continues in-block on `encode_target(func, pc+1)`, else leaves via `done` |
-| Frame push + heap admission | `AllocateHeap` | `heap.rs::emit_allocate_heap` (an `emit_helper_call` to `jit_allocate_heap`) | always lowered — one helper round-trip does the interpreter's two calls in order (`ensure_heap` **then** `push_frame`); continues in-block via the shared `emit_continue_check` (partial refill + gated Y refresh) |
-| Heap admission | `TestHeap` | `heap.rs::emit_test_heap` (an `emit_helper_call` to `jit_test_heap`) | always lowered — reaches the host's admission door exactly once with the instruction's own `heap_need`/`live`; continues in-block via `emit_continue_check` |
-| Frame trim | `Trim` | `heap.rs::emit_trim` (an `emit_helper_call` to `jit_trim`) | always lowered — an over-trim / frameless trim is the helper's `ERROR`; continues in-block on `encode_target(func, pc+1)` |
+| Frame push + heap admission | `AllocateHeap` | `heap.rs::emit_allocate_heap` (an `emit_helper_call` to `jit_allocate_heap`) | always lowered — one helper round-trip does the interpreter's two calls in order (`ensure_heap` **then** `push_frame`); continues in-block via `emit_continue_check_helper_refresh` (partial refill, **no** emitted `jit_refresh_y` — the helper re-publishes the window itself) |
+| Heap admission | `TestHeap` | `heap.rs::emit_test_heap` (an `emit_helper_call` to `jit_test_heap`) | always lowered — reaches the host's admission door exactly once with the instruction's own `heap_need`/`live`; continues in-block via `emit_continue_check` (partial refill + the gated Y refresh — this helper changes no frame) |
+| Frame trim | `Trim` | `heap.rs::emit_trim` (an `emit_helper_call` to `jit_trim`) | always lowered — an over-trim / frameless trim is the helper's `ERROR`; continues in-block on `encode_target(func, pc+1)` via `emit_frame_change_continue` (no refill; the helper re-published the Y window) |
 | Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label **in the block map** -> linked; otherwise return-to-driver (the target's function is compiled on entry) |
 | Local tail call | `CallLast` | `block.rs::emit_local_call_probe` then `link.rs::Linker::emit_tail_exit` (compiled successor) or `::emit_tail_exit_to_driver` (resolved but uncompiled successor) | `Linker::is_compiled`; an undefined label keeps the `emit_deopt` `unknown_label` |
 | Local tail call (no pop) | `CallOnly` | `block.rs::emit_local_call_probe` then `link.rs::Linker::emit_exit` | resolved label |
@@ -223,8 +223,9 @@ accessors are claimed from either variant and the three pure accessors from `Bif
    `CALL_STORED` arm continue in-block on the appropriate word (branching to `done` otherwise), while
    `emit_return`/`emit_deallocate_return` always transfer control and leave via `emit_resume_or_exit`;
    `heap.rs::emit_allocate_heap`/`emit_test_heap`, `emit_ext_call`, `emit_receive` and `emit_family`
-   continue through the shared `emit_continue_check` (a collecting host's admission rewrites
-   `machine.x`, so the cache is refilled before the block resumes). There are no guards to emit: every
+   continue through the shared refill arm (`emit_continue_check`, or `emit_continue_check_helper_refresh`
+   for the two frame changes, which re-publish the Y window inside the helper) — a collecting host's
+   admission rewrites `machine.x`, so the cache is refilled before the block resumes. There are no guards to emit: every
    operand shape is lowered (a frame size / heap need / live count / trim `n` is a `u32` the helper
    takes as an argument, and a `return` has no operand), and the only failure is a `CodeBuffer` that
    cannot hold the bytes — the shared typed `SystemLimit`.
@@ -274,15 +275,18 @@ trim). The four split into **two shapes**, by whether the helper can touch `mach
 
 - **frame-only** — `allocate`/`trim` (`emit_allocate`/`emit_trim`) push/shrink the frame and touch **no**
   x-register, so, like `frame.rs::emit_deallocate`, they emit **no** register refill (the block's cached
-  registers still hold exactly what `machine.x` does); because they *are* frame changes they re-publish
-  the Y window on the continue arm — the private `emit_frame_change_continue` (the shared
-  compare-and-branch **without** a refill), gated on `Allocation::refresh_y_after(pc)`.
+  registers still hold exactly what `machine.x` does); because they *are* the frame change they
+  re-publish the Y window **inside** the helper, so the continue arm is the private
+  `emit_frame_change_continue` (the shared compare-and-branch **without** a refill **and** without an
+  emitted `jit_refresh_y`) — it needs no `Allocation`, there is no gate left to consult.
 - **heap-admitting** — `allocate_heap`/`test_heap` (`emit_allocate_heap`/`emit_test_heap`) reach the
   host's admission door, and a **collecting** host relocates the young heap and rewrites every root **in
   place** (including `machine.x`), so the block's cached x-registers are stale the instant the helper
-  returns: both continue through the shared `emit_continue_check`, whose partial refill *is* the
-  post-admission contract, and whose gated Y refresh covers the frame change. `allocate_heap`'s single
-  round-trip does the interpreter's two calls in order (`ensure_heap` **then** `push_frame`).
+  returns: both continue through the partial refill, which *is* the post-admission contract —
+  `emit_continue_check_helper_refresh` for `allocate_heap` (no emitted `jit_refresh_y`, the helper
+  re-published the window) and `emit_continue_check` for `test_heap` (which changes no frame, so its
+  gated Y refresh survives). `allocate_heap`'s single round-trip does the interpreter's two calls in
+  order (`ensure_heap` **then** `push_frame`).
 
 **There are no guards to emit** — every operand shape is lowered (each of `stack_need`/`heap_need`/`live`
 is a `u32` the helper takes as an argument, computed at compile time by `HeapNeed::words()`, and `trim`'s
@@ -333,13 +337,25 @@ instruction's own operands.
   passes the exit pc `end`); the fused `deallocate N; return` pair stores at the pair's **first** `pc`
   (`emit_deallocate_return`'s `store_pc`) while the helper's recorded position is the `return`'s pc
   (`position_pc`).
-- **Gated Y-window refresh after an in-block helper.** `emit_continue_check` (the shared continue arm of
-  `emit_step_and_continue`, `emit_ext_call`, `emit_receive` and `emit_family`) emits `jit_refresh_y(rt)`
-  — after `fill`, on the continue-in-block path only — exactly when a later instruction of the block
-  still accesses a Y slot (`Allocation::refresh_y_after(pc)`), because the helper ran one instruction in
-  the interpreter, which may have pushed/`trim`med a frame or **reallocated** `machine.stack` and so
-  staled the prologue's window. When no later instruction accesses Y the call is not emitted at all, and
-  a helper that leaves the block to the driver pays nothing (the next block's prologue publishes).
+- **Gated Y-window refresh after an in-block helper — only for a helper that changed no frame.**
+  `emit_continue_check` (the shared continue arm of `emit_step_and_continue`, `emit_ext_call`,
+  `emit_receive`, `emit_family` and `test_heap`) emits `jit_refresh_y(rt)` — after `fill`, on the
+  continue-in-block path only — exactly when a later instruction of the block still accesses a Y slot
+  (`Allocation::refresh_y_after(pc)`), because the helper ran one instruction in the interpreter, which may
+  have **reallocated** `machine.stack` and so staled the prologue's window. When no later instruction
+  accesses Y the call is not emitted at all, and a helper that leaves the block to the driver pays nothing
+  (the next block's prologue publishes).
+  The **frame-changing** helpers (`jit_allocate`, `jit_allocate_heap`, `jit_trim`, `jit_deallocate`) do not
+  use this arm: they are the parties that invalidate the window (`push_frame`/`trim`/`pop_frame*` move
+  `frames.last()` and truncate `machine.stack`) and they re-publish it **inside** the helper on their success
+  path, via `JitRuntime::refresh_y_base` — a pure re-derivation from machine state. `emit/heap.rs::
+  emit_frame_change_continue` (frame-only: `allocate`/`trim`, no register refill) takes no `Allocation` for
+  that reason, and `emit/mod.rs::emit_continue_check_helper_refresh` is `emit_continue_check` **minus** the
+  refresh call but **keeping** the partial refill, used by `allocate_heap` because a collecting host's
+  admission rewrites `machine.x` in place. `test_heap` keeps the gated refresh (it changes no frame).
+  Removing the emitted call is sound because the emitted Y guard is **reject-only** (`jae` →
+  `jit_step_one`) and `y_base == y_end == null` rejects every slot, so the worst reachable state is
+  "not yet published", never a stale window.
 - `link.rs::emit_exit`, `link.rs::emit_tail_exit` and `link.rs::emit_tail_exit_to_driver` spill (the
   dirty set at their own `store_pc`) on **every** path — the linked and the return-to-driver ones alike.
   `link.rs::emit_in_block_call` deliberately emits **no** spill of its own: it only ever runs after the
@@ -478,7 +494,7 @@ by construction).
   — the canonical full callee-saved set — `CACHE_REGISTERS`/`RUNTIME_SLOT_DISP`/`MOVE_SCRATCH`/
   `MOVE_SCRATCH_2`), the variable-frame helpers `native_frame_regs`/`frame_slot_len`, `touch`,
   `emit_refresh_y`, `emit_helper_call` (which takes the instruction's own `pc` as the store pc),
-  `emit_step_and_continue`, `emit_continue_check`; re-exports
+  `emit_step_and_continue`, `emit_continue_check`, `emit_continue_check_helper_refresh`; re-exports
   `regs::{Allocation, SpillSite, FillSite}` and `pub(crate) use block::emit_block`, `compile_module`/
   `compile_function` (keeping every item path stable for `baseline/mod.rs`, `baseline/code.rs`, the
   sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`), plus
@@ -566,9 +582,9 @@ by construction).
 - `heap.rs` -> `emit_allocate`, `emit_allocate_heap`, `emit_test_heap`, `emit_trim` (the heap /
   frame-admission family — a direct `emit_helper_call` to the `../runtime.rs` helpers) and the private
   `emit_frame_change_continue` (the frame-only helpers' continue arm: compare against
-  `encode_target(func, pc+1)` then the gated Y refresh, no register refill), plus its unit tests (the
-  spill-first call order, the frame-only-vs-heap-admitting refill split, and the Y-window refresh
-  gating).
+  `encode_target(func, pc+1)`, no register refill and no emitted refresh — the helper re-published the
+  Y window), plus its unit tests (the spill-first call order, the frame-only-vs-heap-admitting refill
+  split, and `a_frame_changing_helper_emits_no_separate_refresh_call`).
 - `family.rs` -> `emit_family` (the shared helper arm for every family-owned variant: an
   `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`).
 - `../runtime.rs` -> `jit_step_one` / `jit_ext_call` / `jit_local_call` / `jit_tail_call` /
