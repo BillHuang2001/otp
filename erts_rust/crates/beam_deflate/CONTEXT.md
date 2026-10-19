@@ -154,9 +154,10 @@ parallel boots are what made early runs flaky). Oracle inputs are handed over th
 - Apache-2.0; the OTP `// %CopyrightBegin% … // %CopyrightEnd%` block on every `*.rs` file (byte-exact;
   the repo scanner checks it). `CONTEXT.md`/`Cargo.toml` are the crate's only non-`.rs` files and are out of
   that scanner's scope.
-- Files target ~1000 lines. Two are legitimately longer and one-to-one with the C they port:
-  `src/inflate/pump.rs` (1166, `inflate.c`), `tests/deflate_goldens.rs` (1062, embedded oracle bytes),
-  `src/deflate/trees.rs` (895, `trees.c`), `tests/roundtrip.rs` (941, the pump-loop harness + matrix).
+- Files target ~1000 lines. Two legitimately exceed it and are one-to-one with the C or the data they carry:
+  `src/inflate/pump.rs` (1166 lines, `inflate.c`'s state machine) and `tests/deflate_goldens.rs` (1062 lines,
+  embedded oracle bytes). Near the limit by design: `src/deflate/trees.rs` (895, `trees.c`) and
+  `tests/roundtrip.rs` (941, the `zlib_nif.c` pump-loop harness + its matrix).
 - Build/test from the repository root, never `cd`:
   `erts_rust/scripts/cargo.sh build|test --manifest-path erts_rust/Cargo.toml -p beam_deflate`
   (the sandbox `$HOME` is read-only; the wrapper sets a writable `CARGO_HOME`). Pass a long timeout
