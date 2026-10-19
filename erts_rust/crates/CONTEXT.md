@@ -63,6 +63,18 @@ This is the frozen public-API shape dependents design against; keep it stable.
   outcome (`RunOutcome { Returned, Wait }` + `run_export_outcome`/`run_label_outcome`/`resume_outcome`;
   the plain `run_export` folds a suspend into the typed `error::blocked()`), which `beam_rt` maps onto
   `beam_process`'s scheduler.
+- `beam_engine` (off-heap half) → the machine's reservoir of `RefcBinary` payload handles
+  (`Machine::refc_binaries`) plus its two host seams: `Machine::off_heap_overhead_bytes` (Σ
+  `RefcBinary::reserved_bytes`, the backing store `beam_gc::BinVheap` accounts in) and
+  `Machine::retain_refc_binaries(predicate)` (prune by reachability; a retained payload's `data_ptr`
+  is unchanged and the `writable_payloads` registry prunes in lockstep) — `src/machine/offheap.rs`.
+  The predicate IS the caller's soundness assertion (a false reject frees memory a live `BinRef.val`
+  names); a false accept is only a leak.
+- `beam_process` (off-heap half) → `Process::set_off_heap_binary_bytes`/`off_heap_binary_bytes` (the
+  host-asserted payload figure `max_heap_size`'s `include_shared_binaries` charges),
+  `Process::owned_off_heap()` (the `HeapFootprint::of` handle), the chain-summed `heap_used_words()`,
+  and the unlimited-setting early return in `record_max_heap_verdict` (no O(off-heap slots) walk per
+  collection when no limit is set).
 - `beam_ets` → `Table` handle + set/ordered_set/hash ops.
 - `beam_gc` → per-process copying collector entry (`gc`/`collect`) + `OffHeap` refcount interface
   (`OffHeapEntry::{Mso, Binary}`); re-exports `beam_alloc::RefCount`.
