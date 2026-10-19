@@ -2050,13 +2050,34 @@ impl Runtime {
     /// Appends every **root** that can name an off-heap payload to `out` — the prune's
     /// completeness half (`crate::eval::reclaim`).
     ///
-    /// What this function collects is the **named live sets**: the escaped closures' capture
-    /// environments, the sequential-trace tokens, every live process's dictionary and mailbox
-    /// queue, the pending-spawn records (entry fun + arguments), the arguments a live engine of a
-    /// stabilized spawn still holds, and every pending timer **delivery** (its message and its
-    /// sender). These hold terms no heap region necessarily holds. Every one of them is a **real
-    /// term**, so the walk started from them (`crate::eval::reclaim::walk`) may legitimately
-    /// dereference what it finds.
+    /// What this function collects is the **named live sets**, one clause each for why it is
+    /// gathered. Every one of them is a **real term**, so the walk started from them
+    /// (`crate::eval::reclaim::walk`) may legitimately dereference what it finds, and none of them
+    /// is named by any heap region the walk does not scan:
+    ///
+    /// * the escaped closures' capture environments (`Runtime::eval_closures`, via
+    ///   `FunBody::env_terms`) — a closure body's captures are named by nothing else, so a
+    ///   resource a `-eval` lambda closes over lives exactly as long as the closure does;
+    /// * the sequential-trace tokens (`SeqTrace::gather_off_heap_roots`) — `set_label`/`set_from`
+    ///   store the caller's term **unstabilized**, so a refc payload in one is named only here;
+    /// * every live process's **complete** published root set — its dictionary entries, its
+    ///   mailbox queue (`payload`/`token`/`from`), its registers (`x[0..live)`, the whole Erlang
+    ///   stack and the host-published extra roots), its saved arguments and its pending signals:
+    ///   the same five families `Process::collect` gathers, and the only names a process's terms
+    ///   have besides its own heap;
+    /// * the pending-spawn records — a spawn lives on the arena before it lives in the process
+    ///   table, so its entry fun and its arguments are named by no process yet;
+    /// * [`RunnerState::gather_off_heap_roots`]'s **two** sub-families: the arena-stable arguments
+    ///   (and entry fun) of an engine whose first run has not yet consumed them, and the **parked
+    ///   machine's own root set** for an engine parked in an **un-published** window whose pid is
+    ///   still in the process table;
+    /// * every pending timer **delivery** — its message and its sender (`Timers::gather_off_heap_roots`).
+    ///
+    /// A `receive` park contributes nothing through the registers: it opens a relocation-exempt
+    /// window, so `park_machine` skips the copy and the process's registers stay empty for the
+    /// whole window. That is exactly why the parked-machine sub-family consults the **machine** —
+    /// a parked machine's root set is a real root set (the engine's own), so publishing it is sound
+    /// where the process's empty registers name nothing.
     ///
     /// Two things make a family belong here. A **refc payload** needs a root when the term naming
     /// it may have been stored *unstabilized* (the sequential-trace tokens) or when it is an
@@ -2065,8 +2086,9 @@ impl Runtime {
     /// is — carries the same id: the resource prune's second match tier
     /// ([`crate::eval::reclaim::resource`]) recognises such a copy, so a family that is not
     /// enumerated makes a live resource look unreachable and releases it. That is why the pending
-    /// timers and a stabilized engine's arguments are here even though the refc half of both is
-    /// already flattened on-heap.
+    /// timers, a stabilized engine's arguments, an un-published parked machine's root set and every
+    /// live process's registers, saved arguments and signals are here even where the refc half of
+    /// them can need nothing.
     ///
     /// What it deliberately does **not** collect is the word image of the runtime's own term
     /// regions — [`Runtime::eval_heap`], its retired generations, the pooled BIF heaps and the
@@ -2100,12 +2122,25 @@ impl Runtime {
     ///   i.e. an all-immediate leaf block: it has no child slot that could name a payload.
     /// * the [`RuntimeContext`]/`DispatchMemo`/native-floor structs and every `thread_local!`
     ///   site — each holds either immediates, or a borrowed handle into state already enumerated
-    ///   here (the atom table, the process table, a table registry cell), or the x-register/stack
-    ///   set of a *live* engine during its own call. That last one is the only `Eterm` a prune can
-    ///   run between, and it is covered by the `RefCount > 1` belt (see
-    ///   [`Runtime::any_engine_ever`]) — a payload a live machine holds is still in
-    ///   [`Runtime::eval_off_heap`] or the machine's reservoir, so a candidate is retained rather
-    ///   than released.
+    ///   here (the atom table, the process table, a table registry cell).
+    ///
+    /// # Residuals
+    ///
+    /// * A **running** machine's root set cannot be enumerated from here. A scheduler pass *moves*
+    ///   [`RunnerState`] out of the [`Runtime`] for its duration, and the executing engine is
+    ///   removed from the engine table at `run()` entry (`src/runner/run.rs`), so neither its
+    ///   registers nor its machine is reachable while a process is actually running. During a pass
+    ///   the coverage is the in-pass park arm's own publication
+    ///   ([`crate::context::gc::resources::reclaim`], which parks the machine before it seeds its
+    ///   walk); this function's enumeration serves the two sites that run outside one — the `-eval`
+    ///   statement boundary and a nested run's epilogue.
+    /// * The parked-machine sub-family re-gathers a parked machine's **whole** live root set on
+    ///   every gather (measured: 33 parked boot engines, ~32 000 root words per gather, in a booted
+    ///   `-eval` runtime). A narrower live-`x` seam on `beam_engine::Machine` would cut it; that is
+    ///   another node's change.
+    /// * A resource's identity is an ordinary internal reference, so the reference-identity match
+    ///   tier cannot tell a copy of a resource from an unrelated plain reference with an equal id —
+    ///   an id collision **retains** a dead resource term (`M1_GAPS.md` *The resource-identity collision*).
     pub(crate) fn gather_off_heap_roots(&mut self, out: &mut Vec<Eterm>) {
         // The escaped closures' capture environments.
         for body in &self.eval_closures {

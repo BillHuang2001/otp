@@ -97,17 +97,31 @@
 //! # The residual (leak, never a dangle)
 //!
 //! The walk's roots are the process's own root set **plus** every host root source
-//! [`Runtime::gather_off_heap_roots`] enumerates (the escaped-closure environments, the `seq_trace`
-//! tokens, every process's dictionary and mailbox, the pending-spawn records and every pending timer
-//! **delivery**), so a resource named only by one of those stores is reached and retained. Two
-//! families stay outside this site and one is outside every site:
+//! [`Runtime::gather_off_heap_roots`] enumerates that is live **during a scheduler pass** — the
+//! escaped-closure environments, the `seq_trace` tokens, the pending-spawn records and every pending
+//! timer **delivery** — so a resource named only by one of those stores is reached and retained.
+//! The two families that live in a per-pid table are **empty at this arm**, and that is a property
+//! of the pass rather than of the enumeration: a scheduler pass moves the process table *and*
+//! [`crate::runner::RunnerState`] out of the [`Runtime`] for its duration
+//! (`Runtime::take_processes`), so the enumeration here sees an equivalent **empty** table and a
+//! default runner state. Both families are live at the two **non-park** sites
+//! ([`crate::eval::reclaim::resource`]'s statement boundary and nested-run epilogue), which run with
+//! the runtime's own tables. Consequences:
 //!
-//! * a **live engine's spawn arguments** are not visible here: [`crate::runner::RunnerState`] is
-//!   moved out of the [`Runtime`] for the duration of a scheduler pass, which is exactly when this
-//!   arm runs, so the family is empty at this site even though it is enumerated (a child spawned
-//!   through the pass's pending-spawn route keeps its arena-stable arguments rooted at the two
-//!   **non-park** sites, [`crate::eval::reclaim::resource`]'s statement boundary and nested-run
-//!   epilogue, never here);
+//! * **another live process's** registers, saved arguments, signals, mailbox and dictionary are not
+//!   visible at this arm, so a resource held *only* by another process's register is answered
+//!   unreachable here — the same class as one held only by another process's heap. The executing
+//!   process's own registers are this arm's **local** root list (below), not a host seed;
+//! * an **engine's** un-consumed spawn arguments and an un-published parked machine's root set
+//!   ([`crate::runner::RunnerState::gather_off_heap_roots`]'s two sub-families) are likewise empty
+//!   here, for the same reason: a child spawned through the pass's pending-spawn route keeps its
+//!   arena-stable arguments rooted at the two **non-park** sites, never here. An **exempt** park
+//!   (every `receive`) never reaches this arm at all — gate 3 below declines it — so a machine
+//!   parked in one keeps its resource terms instead of having them freed behind its back;
+//! * **a reference id is not an identity**: a resource term is minted as an ordinary internal
+//!   reference, so a plain reference the walk reaches whose id equals a live resource's cannot be
+//!   told from a **copy** of that resource, and the resource is retained (`M1_GAPS.md`
+//!   *The resource-identity collision*);
 //! * a `persistent_term` value and an **ETS object** are not enumerated at all: their copies keep a
 //!   resource's reference identity, so a resource held *only* by one of them is answered
 //!   unreachable and released. Closing ETS needs an object iterator the `beam_bifs` table registry
@@ -153,15 +167,16 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
     if candidates.is_empty() {
         return Ok(0);
     }
-    // The host's non-process root sources — the escaped-closure environments, the `seq_trace`
-    // tokens, every process's dictionary and mailbox, the pending-spawn records and every pending
-    // timer **delivery**. Gathered **before** the process borrow below, because `table` and
-    // `runtime` are separate parameters and only this order keeps both unborrowed at once.
+    // The host's root sources that are live **during** a scheduler pass — the escaped-closure
+    // environments, the `seq_trace` tokens, the pending-spawn records and every pending timer
+    // **delivery**. Gathered **before** the process borrow below, because `table` and `runtime` are
+    // separate parameters and only this order keeps both unborrowed at once.
     //
-    // The engine-args family is empty here: `RunnerState` is moved out of the `Runtime` for the
-    // duration of a scheduler pass, which is exactly when this arm runs. A child spawned through
-    // the pass's pending-spawn route keeps its arena-stable arguments rooted at the two **non-park**
-    // sites (`crate::eval::reclaim::resource`), never here.
+    // The two per-pid families are empty here and cannot be otherwise: the pass moved the process
+    // table (`Runtime::take_processes`, so the runtime's own is an equivalent empty placeholder) and
+    // `RunnerState` out of the runtime, which is exactly when this arm runs. They are live at the
+    // two **non-park** sites (`crate::eval::reclaim::resource`), which run with the runtime's own
+    // tables. The executing process's own root set is this arm's local list below.
     //
     // These words are handed to the **reachability walk only** (below), never to gate 5: a host
     // store lives outside this process's scanned heap by definition, so every one of its container
@@ -213,8 +228,8 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
     // cons cells (so a resource held in `[Res]` or in a message payload is found), and by **reference
     // identity** as well as by word — a `copy_struct` copy (the send path, ETS) is a different word with
     // the same id, and it designates the same object. The host root sources are seeded into the same
-    // walk, so a resource named **only** by a pending timer delivery (or a pending spawn, a mailbox, a
-    // process dictionary, a `seq_trace` token, an escaped closure's environment) is reached and kept.
+    // walk, so a resource named **only** by a pending timer delivery (or a pending spawn, a
+    // `seq_trace` token, an escaped closure's environment) is reached and kept.
     let reached = super::super::gc_walk::reachable_resource_words(
         runtime.walk_scratch(),
         process,

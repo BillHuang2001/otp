@@ -1105,9 +1105,10 @@ impl<'a> Walk<'a> {
 /// # `host` — the extra roots, and why they are a separate argument
 ///
 /// `host` is the caller's **host root sources** ([`Runtime::gather_off_heap_roots`]: the escaped
-/// closure environments, the `seq_trace` tokens, every process's dictionary and mailbox, the
-/// pending spawns and the pending timer deliveries). They are seeded into the *same* walk but are
-/// deliberately **not** part of `roots`: `roots` is also what
+/// closure environments, the `seq_trace` tokens, the pending spawns, every live process's
+/// dictionary/mailbox/registers/saved-args/signals, an engine's un-consumed arguments plus an
+/// un-published parked machine's root set, and the pending timer deliveries). They are seeded into
+/// the *same* walk but are deliberately **not** part of `roots`: `roots` is also what
 /// [`reaches_an_unscanned_word`] classifies, and that valve answers a *payload* question — "could
 /// a `BinRef` living in a region the collector does not scan name a payload this prune would
 /// free?" — for which **every** host root is a hit by construction, because a host store lives

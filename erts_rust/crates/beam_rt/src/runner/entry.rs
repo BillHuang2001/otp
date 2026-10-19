@@ -116,6 +116,11 @@ pub(super) struct ProcessEngine {
     /// `x(0..arity)`); nothing reads them again once that entry has consumed them, which is what
     /// [`ProcessEngine::args_consumed`] records. Their **provenance** decides whether they may be
     /// handed over as a reclamation root — see [`ProcessEngine::arena_args`].
+    ///
+    /// They are published as a reclamation root exactly while `arena_args && !args_consumed`: from
+    /// the spawn until the process's first run has consumed them, and never afterwards. The one
+    /// exception is a [`ProcessEntry::Fun { target: None }`](ProcessEntry::Fun), which re-applies
+    /// `args` on **every** run and so stays `!args_consumed` for the engine's life.
     pub(super) args: Vec<Eterm>,
     /// Whether the first run has already **consumed** [`ProcessEngine::args`] (and a
     /// [`ProcessEntry::Fun`]'s fun value), i.e. whether they are dead state.
@@ -128,7 +133,8 @@ pub(super) struct ProcessEngine {
     /// It is the liveness half of [`ProcessEngine::arena_args`]: a consumed argument set may not
     /// be published as a reclamation root, because a resource term standing only in dead state
     /// would be retained for the runtime's life (they are the child's *first* root set, and the
-    /// machine copies them into registers that are then the live roots).
+    /// machine copies them into registers that are then the live roots). So publication ends at the
+    /// end of the child's first run for every entry shape but `ProcessEntry::Fun { target: None }`.
     pub(super) args_consumed: bool,
     /// Whether `args` (and a [`ProcessEntry::Fun`]'s fun) are copies on the **pointer-stable
     /// arena** rather than terms of a heap a collection may move or a process's death may free.
@@ -336,9 +342,10 @@ impl RunnerState {
         self.spawn(pid, ProcessEntry::Fun { fun, target: None }, args);
     }
 
-    /// Appends every **stable** term a live engine still names to `out`: the arguments of a
-    /// [`ProcessEngine::arena_args`] engine, the fun term of its [`ProcessEntry::Fun`] entry, and
-    /// the root set of a machine parked in an **un-published** window.
+    /// Appends every **stable** term a live engine still names to `out`, in **two** sub-families:
+    /// the arguments (and the fun term) of a [`ProcessEngine::arena_args`] engine whose first run
+    /// has **not** consumed them, and the root set of a machine parked in an **un-published**
+    /// window.
     ///
     /// An engine outlives the slice that created it (a `receive` resumes in the same machine), and
     /// its first arguments are the child's **first root set** — the arena copies a spawn made
@@ -347,17 +354,20 @@ impl RunnerState {
     /// reclamation prunes (`crate::eval::reclaim`) answer a NIF resource a spawn argument carries
     /// unreachable and release it while the child still holds it. A **consumed** argument set is
     /// dead state and contributes nothing ([`ProcessEngine::args_consumed`]): the machine copied it
-    /// into registers, and those are published by the second family below.
+    /// into registers, and those are published by the second family below. This family has no
+    /// liveness gate — its terms are arena copies, dereferenceable whatever became of the process —
+    /// so a child that terminates before its first run keeps its arguments published (a leak).
     ///
     /// # The parked machine's root set — the live family
     ///
     /// A process parked in a **relocation-exempt** window (every `receive` park, and a `Yield` park
     /// whose slice ended with a live FR prefix) publishes **nothing** into its process
     /// [`Registers`](beam_process::Registers): nothing can relocate its heap for the window, so the
-    /// machine stays the authoritative root set (`ProcessEngine::parked_published` is `false`). Its
-    /// live terms are then named by nothing but `machine.x`/`machine.stack`/`machine.fr` — exactly
-    /// the `x(0)` a `receive` is about to match — so a resource a parked child holds in a register
-    /// is reachable **only** through this family.
+    /// machine stays the authoritative root set (`ProcessEngine::parked_published` is `false`). A
+    /// `receive` park therefore contributes nothing through the process's `registers()` — they are
+    /// empty for the window — and the parked machine's live terms are named by nothing but
+    /// `machine.x`/`machine.stack`/`machine.fr` — exactly the `x(0)` a `receive` is about to match —
+    /// so a resource a parked child holds in a register is reachable **only** through this family.
     ///
     /// A machine parked in a **publishing** window is the opposite case: its roots were copied into
     /// the process's `Registers`, which a collection may then relocate, leaving the machine's own
@@ -365,7 +375,7 @@ impl RunnerState {
     /// the process's registers are the truth there, and [`Runtime::gather_off_heap_roots`] gathers
     /// them (`crate::runtime::Runtime::gather_off_heap_roots`).
     ///
-    /// Both families are gated on the pid still being in `live` process table: an engine is not
+    /// This family is gated on the pid still being in the `live` process table: an engine is not
     /// removed when its process terminates, and a terminated process's heap is gone, so its
     /// machine's registers would be dangling words. Only **live**, **un-published** engines are
     /// enumerated, and the enumeration is `O(1)` when there are no engines at all.

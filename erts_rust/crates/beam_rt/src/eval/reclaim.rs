@@ -82,9 +82,10 @@
 //!    enter the walk, and the only real terms here are the named live sets below.
 //! 2. **Every root family that holds a term no heap region holds is enumerated** — the evaluator's
 //!    environment and reduced value (passed in as `extra`), the escaped closures' capture
-//!    environments, the sequential-trace tokens, every live process's dictionary and mailbox
-//!    queue, and the pending-spawn records. Every one of these is a real term, so the walk may
-//!    dereference what it reaches from them.
+//!    environments, the sequential-trace tokens, every live process's dictionary, mailbox queue,
+//!    registers, saved arguments and signals, the pending-spawn records, an engine's un-consumed
+//!    arguments plus an un-published parked machine's root set, and every pending timer delivery.
+//!    Every one of these is a real term, so the walk may dereference what it reaches from them.
 //! 3. **The walk is conservative.** Any doubt — an exhausted visit budget, a boxed header this
 //!    module does not know — **declines the whole prune** and retains everything. That is
 //!    deliberately the *opposite* of `RuntimeContext::graph_holds_reference`, whose exhaustion

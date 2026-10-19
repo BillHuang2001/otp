@@ -719,9 +719,11 @@ term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mail
 * `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`, the park's published
   FR-prefix count `fr_published`, the park's publish/skip flag `parked_published`, the per-process
   binary virtual heap `off_heap: Option<OffHeapReclaimer>` and the `arena_args` stability flag) +
-  `RunnerState::gather_off_heap_roots`, which publishes only an `arena_args` engine's arguments plus
-  a `ProcessEntry::Fun` entry's fun term and is **empty during a pass** (`RunnerState` is
-  `mem::take`n out of the runtime for the pass's duration), + `RunnerState`
+  `RunnerState::gather_off_heap_roots`, whose **two** sub-families are an `arena_args` engine's
+  **un-consumed** arguments (plus a `ProcessEntry::Fun` entry's fun term, which stays live for a fun
+  entry with no local target because that entry re-applies them on every run) and an **un-published**
+  parked machine's own root set for a pid still in the process table, and which is **empty during a
+  pass** (`RunnerState` is `mem::take`n out of the runtime for the pass's duration), + `RunnerState`
   (the `jit_mode` field, the `jit_mode()` accessor and the `reservoir_at(pid)` read-only off-heap
   roster seam).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
