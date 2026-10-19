@@ -399,3 +399,30 @@ pub(super) fn emit_continue_check(
     }
     Ok(())
 }
+
+/// [`emit_continue_check`] for a helper that has **already** re-published the Y window
+/// itself on its success path ([`jit_allocate_heap`](super::jit_allocate_heap): its
+/// `push_frame` is a frame change, and the admission before it may have collected).
+///
+/// Identical to [`emit_continue_check`] — the same "the next instruction" compare, the same
+/// typed-error passthrough on the block exit, the same register refill (mandatory: the
+/// helper reached the host's heap-admission door, which a collecting host answers by
+/// rewriting `machine.x` in place) — **without** the trailing `jit_refresh_y` call. The block
+/// therefore pays one helper call where it used to pay a helper call plus a refresh call, and
+/// the window is already live when the next instruction addresses a `Y` slot.
+///
+/// A helper that changes no frame keeps the plain [`emit_continue_check`] (and therefore the
+/// gated emitted refresh): its window is still the one the block published.
+pub(super) fn emit_continue_check_helper_refresh(
+    buffer: &mut CodeBuffer,
+    done: CodeLabel,
+    allocation: &Allocation,
+    func: u32,
+    pc: u32,
+) -> Result<()> {
+    // `rax` holds the helper's word; only "the next instruction" continues here.
+    buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
+    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+    buffer.jcc(Cond::Ne, done)?;
+    fill(buffer, allocation, FillSite::Helper, pc)
+}

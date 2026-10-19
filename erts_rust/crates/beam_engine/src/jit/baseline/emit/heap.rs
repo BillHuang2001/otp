@@ -78,7 +78,9 @@ use super::super::runtime::{
     encode_target, jit_allocate, jit_allocate_heap, jit_test_heap, jit_trim, AllocateHeapHelper,
     FrameSizeHelper, HeapNeedHelper,
 };
-use super::{emit_continue_check, emit_helper_call, emit_refresh_y, Allocation};
+use super::{
+    emit_continue_check, emit_continue_check_helper_refresh, emit_helper_call, Allocation,
+};
 
 /// Lower `allocate StackNeed Live` — push a stack frame, then continue in-block at
 /// `pc + 1`.
@@ -106,7 +108,7 @@ pub(super) fn emit_allocate(
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(stack_need)],
     pc)?;
-    emit_frame_change_continue(buffer, allocation, done, func, pc)
+    emit_frame_change_continue(buffer, done, func, pc)
 }
 
 /// Lower `allocate_heap StackNeed HeapNeed Live` — admit the heap need, then push the
@@ -140,7 +142,10 @@ pub(super) fn emit_allocate_heap(
             i64::from(live),
         ],
     pc)?;
-    emit_continue_check(buffer, done, allocation, func, pc)
+    // The push inside the helper is a frame change, so the helper re-publishes the Y
+    // window itself (see `jit_allocate_heap`): the continue arm keeps its register refill
+    // but emits no separate refresh call.
+    emit_continue_check_helper_refresh(buffer, done, allocation, func, pc)
 }
 
 /// Lower `test_heap HeapNeed Live` — admit the heap need, then continue in-block at
@@ -197,7 +202,7 @@ pub(super) fn emit_trim(
         helper as *const (),
         &[i64::from(func), i64::from(pc), i64::from(n)],
     pc)?;
-    emit_frame_change_continue(buffer, allocation, done, func, pc)
+    emit_frame_change_continue(buffer, done, func, pc)
 }
 
 /// The continue arm of a **frame-changing** helper that touches no x-register: continue
@@ -206,12 +211,12 @@ pub(super) fn emit_trim(
 ///
 /// Same compare-and-branch as [`super::emit_deallocate`] — deliberately **without** the
 /// register refill [`super::emit_continue_check`] emits, because the caller's helper wrote
-/// no x-register — and, because the helper changed the frame (`machine.stack` may have
-/// been grown or shifted under the window the block published), it re-publishes the Y
-/// window when a later instruction of the block still accesses a Y slot.
+/// no x-register. The Y window the frame change moved is re-published **inside** the helper
+/// (`jit_allocate`'s `push_frame`, `jit_trim`'s frame shift), on its success path, so the
+/// continue arm emits no refresh call: the window is already the live frame's when the next
+/// instruction of the block addresses a `Y` slot.
 fn emit_frame_change_continue(
     buffer: &mut CodeBuffer,
-    allocation: &Allocation,
     done: CodeLabel,
     func: u32,
     pc: u32,
@@ -220,9 +225,6 @@ fn emit_frame_change_continue(
     buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)?;
-    if allocation.refresh_y_after(pc) {
-        emit_refresh_y(buffer)?;
-    }
     Ok(())
 }
 
@@ -388,36 +390,48 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_changing_helper_refreshes_the_window_only_when_a_later_y_access_follows() {
+    fn a_frame_changing_helper_emits_no_separate_refresh_call() {
         let mut accessing = Allocation::default();
         accessing.y_last = Some(9);
-        let refreshed = lowered(|buffer, done| emit_allocate(buffer, &accessing, done, 0, 7, 2));
-        let plain =
-            lowered(|buffer, done| emit_allocate(buffer, &Allocation::default(), done, 0, 7, 2));
-        assert!(
-            contains(&refreshed, &refresh_immediate()),
-            "a later Y access in the same block must re-publish the window"
-        );
-        assert!(
-            !contains(&plain, &refresh_immediate()),
-            "a Y-free block pays nothing"
-        );
-        // The refresh is emitted *past* the continue check (the frame change it follows
-        // is what invalidated the window the next instruction would read).
+        // A frame-changing helper re-publishes the Y window **inside** itself: its
+        // `push_frame`/`trim` moves `machine.frames.last()`, and `JitRuntime::refresh_y_base`
+        // is a pure re-derivation from machine state, so the helper that just invalidated the
+        // window is exactly the party that can restore it for free. The emitted continue arm
+        // therefore never pays a second helper call for it — whether or not a later
+        // instruction of the block still accesses a Y slot. The window is never *stale* at a
+        // Y access (the helper leaves it live), and the emitted guard stays reject-only.
+        for (label, code) in [
+            (
+                "allocate",
+                lowered(|buffer, done| emit_allocate(buffer, &accessing, done, 0, 7, 2)),
+            ),
+            (
+                "trim",
+                lowered(|buffer, done| emit_trim(buffer, &accessing, done, 0, 7, 1)),
+            ),
+            (
+                "allocate_heap",
+                lowered(|buffer, done| emit_allocate_heap(buffer, &accessing, done, 0, 7, 2, 9, 3)),
+            ),
+        ] {
+            assert!(
+                !contains(&code, &refresh_immediate()),
+                "{label}: the helper re-published the window, so the arm emits no refresh call"
+            );
+        }
+        // The frame change is still followed by the continue check — that is what lets the
+        // block carry on in-block after it (and, for `allocate_heap`, still reload the
+        // x-registers a collecting host rewrote).
+        let allocate = lowered(|buffer, done| emit_allocate(buffer, &accessing, done, 0, 7, 2));
         let next = encoded(|buffer| buffer.mov_ri(Reg::R11, encode_target(0, 8)).unwrap());
-        let compare = refreshed
-            .windows(next.len())
-            .position(|window| window == next)
-            .expect("the continue arm compares against the next instruction");
-        let refresh = refreshed
-            .windows(refresh_immediate().len())
-            .position(|window| window == refresh_immediate())
-            .expect("the window is re-published");
         assert!(
-            refresh > compare,
-            "the refresh follows the continue check: {refresh} vs {compare}"
+            allocate
+                .windows(next.len())
+                .any(|window| window == next.as_slice()),
+            "the continue arm still compares against the next instruction"
         );
-        // …and the same gating holds for the two heap-admitting lowerings.
+        // `test_heap` changes no frame, so its window is still the one the block published
+        // and it keeps the gated emitted refresh.
         let heap_refreshed = lowered(|buffer, done| {
             emit_test_heap(buffer, &accessing, done, 0, 7, 9, 3)
         });

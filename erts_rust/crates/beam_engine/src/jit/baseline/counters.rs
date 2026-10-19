@@ -39,6 +39,10 @@
 //!   [`record_block_entered`] from `mod::enter_compiled_cached`, and
 //!   [`record_driver_round_trip`]/[`record_driver_interp_step`] from `mod::drive`
 //!   (every block-ABI word the driver had to decode, classified).
+//! * **In-block local-call transfers** — [`record_in_block_call`] from
+//!   [`jit_call_store_linked`](super::call::jit_call_store_linked), split into the taken
+//!   transfers (a driver round-trip the tier did not pay) and the declines (the honest
+//!   residual: the call kept the pre-existing round-trip).
 //! * **Prologue position/publish calls** — [`record_set_position`] /
 //!   [`record_publish_y`] / [`record_refresh_y`] from the three prologue helpers.
 //! * **`Y`-window traffic** — [`record_y_access`] (every emitted guarded `Y`-slot read
@@ -159,6 +163,18 @@ pub(crate) struct Counters {
     /// Block-ABI words the driver had to decode (a block ran and returned).
     pub(crate) driver_round_trips: u64,    /// Driver iterations with no native entry: one interpreter step each.
     pub(crate) driver_interp_steps: u64,
+    /// Frame-preserving local `call`s transferred **in-block** to a natively compiled
+    /// callee (`jit_call_store_linked` resolved an entry for the lazy artifact's
+    /// cross-function shape, so the block tail-jumped into it instead of returning a word
+    /// to the driver). Each one is a driver round-trip the tier did not pay.
+    pub(crate) in_block_calls: u64,
+    /// Frame-preserving local `call`s for which the transfer was requested but
+    /// **declined** — no published artifact, an address no block covers, a missing
+    /// function, a failed lazy compile or an unsatisfied register-file bound. A refused
+    /// pre-emption charge counts here too (it returns `ERROR`, with no entry published).
+    /// Each one paid the pre-existing driver round-trip, so this is the honest residual
+    /// of [`in_block_calls`](Counters::in_block_calls).
+    pub(crate) in_block_call_declines: u64,
     /// `jit_set_position` calls (every Y-free block prologue).
     pub(crate) set_position: u64,
     /// `jit_publish_y` calls (every block prologue whose body touches a `Y` slot).
@@ -386,6 +402,18 @@ pub(crate) fn record_driver_interp_step() {
     with(|c| c.driver_interp_steps += 1);
 }
 
+/// One **in-block** transfer of a frame-preserving local `call` to its callee: `taken`
+/// is whether the tier resolved a native entry (so the block tail-jumped into it) and
+/// `!taken` a decline that kept the pre-existing driver round-trip.
+pub(crate) fn record_in_block_call(taken: bool) {
+    with(|c| {
+        if taken {
+            c.in_block_calls += 1;
+        } else {
+            c.in_block_call_declines += 1;
+        }
+    });
+}
 /// A `jit_set_position` prologue call.
 pub(crate) fn record_set_position() {
     with(|c| c.set_position += 1);

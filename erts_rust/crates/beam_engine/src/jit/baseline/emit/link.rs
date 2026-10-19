@@ -100,6 +100,28 @@
 //! `call_ext_last` is *not* linked: it enters code outside this module's compiled
 //! blocks, so it keeps its own deopt.
 //!
+//! # The frame-preserving local `call` (a **non**-tail call)
+//!
+//! Its continuation store goes through a helper (`super::super::call`), and its transfer
+//! has two shapes, chosen at compile time:
+//!
+//! * the callee's block **is** in this compilation's map (the eager whole-module artifact,
+//!   or a call inside the function being compiled) — [`Linker::emit_exit`]'s linked path,
+//!   exactly as `call_only` uses it;
+//! * the callee is **another function of the same module** the lazy per-function artifact
+//!   has not compiled — the runtime path's shape — and the block asks for
+//!   [`jit_call_store_linked`](super::super::call::jit_call_store_linked) instead, which
+//!   stores the continuation **and** resolves the callee's native entry (lazily compiling
+//!   that function, checking its register-file bound and performing the skipped driver
+//!   iteration). [`Linker::emit_in_block_call`] then tail-jumps into it.
+//!
+//! [`Linker::emit_in_block_call`] is the frame-preserving call's counterpart of
+//! [`emit_resume_or_exit`](super::frame)'s return-side transfer, and it is a **decline-only**
+//! emitter: every outcome the helper could not resolve (no published artifact, an
+//! uncovered address, a failed lazy compile, an unsatisfied bound, a refused pre-emption
+//! charge) leaves the same `encode_target` word in `rax` that the unlinked exit produced
+//! before the transfer existed.
+//!
 //! # What is *not* linked
 //!
 //! `(func, pc)` is linked directly only when it is the start of a block **this
@@ -113,6 +135,12 @@
 //! epilogue so the driver decodes it and takes one interpreter step (an unexplained
 //! label — the interpreter's `unknown_label` — plus, for `jump`/`call_only`, an
 //! address inside a block, an empty block's start and the end of a function's code).
+//!
+//! A cross-**module** transfer (`call_ext*`) is never linked at all: the block ABI's only
+//! vocabulary for it is [`ENTER`](super::super::runtime::ENTER), because the driver owns the
+//! module-context registry (`Machine::switch_context`), the label-map and literal-area
+//! rebinding and the per-callee artifact publication, and a block's `rt.module`/`rt.labels`
+//! are baked for one module.
 //!
 //! # How the successor is resolved without post-`seal` patching
 //!
@@ -130,7 +158,7 @@ use beam_common::Result;
 
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
-use super::super::runtime::{encode_target, jit_tail_call, TailHelper};
+use super::super::runtime::{encode_target, jit_tail_call, TailHelper, RUNTIME_RESUME_DISP};
 use super::{native_frame_regs, frame_slot_len, spill, Allocation, SpillSite, RUNTIME_SLOT_DISP};
 
 /// The compiled blocks a branch may jump to directly, keyed by `(func, block
@@ -199,6 +227,85 @@ impl<'a> Linker<'a> {
         }
     }
 
+}
+
+/// Emit the **in-block transfer** of a frame-preserving local `call` whose callee
+    /// block is not part of this compilation.
+    ///
+    /// This is the shape the runtime path actually takes: `CodeCache::compiled_handle`
+    /// stages a **lazy** per-function artifact, so a `call` into another function of the
+    /// same module is never in this compilation's block map and
+    /// [`Linker::emit_exit`]'s `None` arm would hand the driver a word — one full driver
+    /// round-trip per call (position store, reduction bump, `reduce(1)`, block-entry
+    /// lookup, block prologue). The block instead asks for
+    /// [`jit_call_store_linked`](super::super::call::jit_call_store_linked), which stores
+    /// the continuation **and** resolves the callee's native entry, lazily compiling that
+    /// function on first entry, checking its register-file bound and performing the
+    /// skipped driver iteration's work.
+    ///
+    /// Entered with `rax == CALL_STORED`; the emitted sequence is
+    /// [`emit_resume_or_exit`](super::frame)'s return-side twin:
+    ///
+    /// ```text
+    ///   mov  rdi, [rsp + RUNTIME_SLOT_DISP] ; rt — reloaded, the helper may clobber rdi
+    ///   mov  r11, [rdi + RUNTIME_RESUME_DISP] ; the callee's entry, or null on a decline
+    ///   test r11, r11
+    ///   je   <declined>                   ; no entry: today's word exit
+    ///   lea  rsp, [rsp + slot] ; pop …    ; leave this block's native frame
+    ///   jmp  r11                          ; the callee's prologue rebuilds its own frame
+    /// <declined>:
+    ///   mov  rax, encode_target(func, pc) ; the pre-existing unlinked word
+    ///   jmp  <done>
+    /// ```
+    ///
+    /// The cached x-registers were **already spilled** by
+    /// [`emit_helper_call`](super::emit_helper_call) before the helper — that spill is the
+    /// tier's liveness/root-set model and it is mandatory, which is why this emitter emits
+    /// no second one.
+    ///
+    /// The transfer is a **tail** transfer: the frame is torn down before the jump, so the
+    /// native stack does not grow with Erlang non-tail recursion (each nested `call` leaves
+    /// its native frame behind before entering the callee, whose own prologue builds a
+    /// fresh one) and no stale frame is left behind. `rdi`/`r11` are caller-saved and the
+    /// teardown only pops the block's saved callee-saved set, so both survive it.
+    ///
+    /// Nothing here can produce a wrong result: the helper resolves an entry only for a
+    /// block of the artifact the driver published, inside the register-file bound it
+    /// checked, and every other outcome — no artifact (an interpreter-step iteration), an
+    /// address no block covers, a missing function, a failed lazy compile, an unsatisfied
+    /// bound, a **refused `ctx.reduce` charge** (`ERROR` in `rax`, the host's error in
+    /// `rt.error`) — leaves `resume_entry` null and takes the declined arm, which hands the
+    /// driver exactly the word it decoded before this transfer existed.
+    ///
+    /// [`jit_call_store_linked`]: super::super::call::jit_call_store_linked
+    pub(super) fn emit_in_block_call(
+        buffer: &mut CodeBuffer,
+        allocation: &Allocation,
+        done: CodeLabel,
+        func: u32,
+        pc: u32,
+    ) -> Result<()> {
+        let declined: CodeLabel = buffer.label();
+        // `rt`, reloaded from the block's own slot: `jit_call_store_linked` is an ordinary
+        // `extern "C"` call and `rdi` is caller-saved, so it may hold anything now. It is
+        // also what the callee block's prologue stores as *its* `rt` slot.
+        buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+        // The callee entry the helper resolved, or null on every decline.
+        buffer.mov_rm(Reg::R11, Reg::Rdi, RUNTIME_RESUME_DISP)?;
+        buffer.test_rr(Reg::R11, Reg::R11)?;
+        buffer.jcc(Cond::E, declined)?;
+        // A tail transfer: leave this block's native frame, then jump (the callee's own
+        // prologue rebuilds a frame), exactly `emit_exit`'s linked path.
+        emit_frame_teardown(buffer, allocation)?;
+        buffer.jmp_r(Reg::R11)?;
+        buffer.bind(declined)?;
+        // The declined path is byte-for-byte today's `emit_exit` unlinked arm: the resolved
+        // target's word in `rax` for the driver to decode.
+        buffer.mov_ri(Reg::Rax, encode_target(func, pc))?;
+        buffer.jmp(done)
+    }
+
+impl<'a> Linker<'a> {
     /// Emit the exit of a **linkable local tail call** (`call_last`): pop the current
     /// frame with the interpreter's exact semantics, then jump straight to the
     /// successor block's entry.

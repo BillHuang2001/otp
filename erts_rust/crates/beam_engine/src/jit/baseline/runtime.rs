@@ -1373,21 +1373,48 @@ fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 
                 runtime.enter = Some((context, func, pc));
                 return ENTER;
             }
-            match resume_in_block(runtime, func, pc) {
-                Ok(Some(entry)) => {
-                    runtime.resume_entry = entry;
-                    encode_target(func, pc)
-                }
-                Ok(None) => encode_target(func, pc),
-                // The pre-emption charge was refused: the machine is parked at
-                // `(func, pc)` and the host's error must reach it **unchanged**, exactly as
-                // the driver loop head's `ctx.reduce(1)?` would have returned it (no
-                // uncaught-raise funnel — the driver applies none on that path either).
-                Err(err) => {
-                    runtime.error = Some(err);
-                    ERROR
-                }
-            }
+            // The in-block transfer itself is shared with a frame-preserving `call`'s callee
+            // (see [`enter_in_block`]): both are "continue the driver's loop at `(func, pc)`
+            // without going back to the driver", so they must never diverge.
+            enter_in_block(runtime, func, pc)
+        }
+    }
+}
+
+/// Resolve `(func, pc)` to a native block entry of the artifact the driver published and
+/// perform the driver iteration the in-block transfer replaces — the **shared** helper body
+/// for the tier's two in-block transfers: a `return`'s continuation ([`return_word`]) and a
+/// frame-preserving `call`'s callee ([`super::call::jit_call_store_linked`]).
+///
+/// Clears [`JitRuntime::resume_entry`] on **every** call (so no emitted arm can observe a
+/// stale entry from an earlier transfer), then:
+///
+/// * a **resolved** entry is stored in [`JitRuntime::resume_entry`] and the target's
+///   `(func, pc)` word is returned — the arm tail-jumps to the entry;
+/// * a **decline** ([`resume_in_block`]'s `Ok(None)`: no published artifact, an address no
+///   block covers, a missing function, a failed lazy compile, an unsatisfied register-file
+///   bound) returns the same word with `resume_entry` still null — the arm leaves the word
+///   for the driver, which decodes it exactly as it did before the transfer existed;
+/// * a **refused pre-emption charge** stores the host's error in [`JitRuntime::error`] and
+///   returns [`ERROR`] — with **no** uncaught-raise funnel, exactly as the driver loop
+///   head's own `ctx.reduce(1)?` applies none on that path.
+///
+/// The position the transfer publishes is the target's entry — the address a driver
+/// iteration would have published — so a `ctx.reduce` refusal parks the machine exactly
+/// where a driver-side refusal parks it and the resumed slice executes each instruction
+/// exactly once.
+pub(crate) fn enter_in_block(runtime: &mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+    runtime.resume_entry = std::ptr::null();
+    let word = encode_target(func, pc);
+    match resume_in_block(runtime, func, pc) {
+        Ok(Some(entry)) => {
+            runtime.resume_entry = entry;
+            word
+        }
+        Ok(None) => word,
+        Err(err) => {
+            runtime.error = Some(err);
+            ERROR
         }
     }
 }
@@ -1557,7 +1584,14 @@ pub(crate) extern "C" fn jit_deallocate(
         machine.pop_frame_checked(deallocate)
     };
     match popped {
-        Ok(()) => encode_target(func, pc + 1),
+        // The pop is a frame change: `machine.stack` was truncated under the window the
+        // block published, so re-publish it here — the block may continue in-block with a
+        // later instruction that addresses a `Y` slot, and the emitted continue arm no
+        // longer pays a separate `jit_refresh_y` call for it.
+        Ok(()) => {
+            runtime.refresh_y_base();
+            encode_target(func, pc + 1)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -1675,7 +1709,14 @@ pub(crate) extern "C" fn jit_allocate(
         machine.push_frame(stack_need)
     };
     match framed {
-        Ok(()) => encode_target(func, pc + 1),
+        // The push is a frame change (`machine.stack` may have been grown, and the window
+        // now belongs to the *new* frame), so re-publish it here: the block continues
+        // in-block after an `allocate`, and the emitted continue arm no longer pays a
+        // separate `jit_refresh_y` call for it.
+        Ok(()) => {
+            runtime.refresh_y_base();
+            encode_target(func, pc + 1)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -1721,7 +1762,14 @@ pub(crate) extern "C" fn jit_allocate_heap(
             .and_then(|()| machine.push_frame(stack_need))
     };
     match framed {
-        Ok(()) => encode_target(func, pc + 1),
+        // The push is a frame change and the admission before it may have collected, so
+        // re-publish the Y window here; the emitted continue arm keeps its register refill
+        // (a collecting host rewrote `machine.x`) but no longer pays a separate
+        // `jit_refresh_y` call.
+        Ok(()) => {
+            runtime.refresh_y_base();
+            encode_target(func, pc + 1)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -1789,7 +1837,13 @@ pub(crate) extern "C" fn jit_trim(
         machine.trim(n)
     };
     match trimmed {
-        Ok(()) => encode_target(func, pc + 1),
+        // `trim` moves the frame's base, so re-publish the window here; the block continues
+        // in-block after it and the emitted continue arm no longer pays a separate
+        // `jit_refresh_y` call.
+        Ok(()) => {
+            runtime.refresh_y_base();
+            encode_target(func, pc + 1)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
