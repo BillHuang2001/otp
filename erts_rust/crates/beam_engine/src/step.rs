@@ -93,7 +93,8 @@ pub(crate) enum Step {
         pc: u32,
     },
     /// Switch the machine's **module context** and continue at `(func, pc)` in that
-    /// module.    ///
+    /// module.
+    ///
     /// Produced by the two places where control crosses a module boundary *inside*
     /// one machine: the `call_ext*` arms, when the host resolved the cross-module
     /// call through

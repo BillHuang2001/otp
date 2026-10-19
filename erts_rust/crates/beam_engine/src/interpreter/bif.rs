@@ -32,8 +32,10 @@ use beam_common::{BeamError, ExceptionClass, Result, StackTrace};
 use beam_loader::{ImportRef, Label, Module, Operand, NO_FAIL};
 use beam_term::{make_atom, Eterm, NIL};
 
-use crate::context::{BifOutcome, ExecutionContext};use crate::error;
-use crate::machine::{namespace_atom, Machine};use crate::operand::{read_operand, write_operand};
+use crate::context::{BifOutcome, ExecutionContext};
+use crate::error;
+use crate::machine::{namespace_atom, Machine};
+use crate::operand::{read_operand, write_operand};
 use crate::Step;
 use super::{resolve, LabelMap};
 
@@ -457,7 +459,8 @@ impl Machine {
                 let reason = *reason;
                 if let Some(class_atom) = namespace_atom(ctx, module, class.as_str()) {
                     self.set_class_atom(class, make_atom(class_atom));
-                }                return self.throw_with_trace_headed(
+                }
+                return self.throw_with_trace_headed(
                     class,
                     reason,
                     trace,

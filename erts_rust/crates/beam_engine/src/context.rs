@@ -1418,7 +1418,8 @@ pub struct MinimalContext {
     /// of the box, which keeps `call_bif_outcome` the trait default (forward to
     /// [`ExecutionContext::call_bif`] and wrap the value), byte-identical to the
     /// pre-seam engine.
-    outcome_hook: Option<BifOutcomeHook>,    /// An optional fun-application hook (the [`ExecutionContext::apply_fun`] body).
+    outcome_hook: Option<BifOutcomeHook>,
+    /// An optional fun-application hook (the [`ExecutionContext::apply_fun`] body).
     apply_hook: Option<ApplyHook>,
     /// An optional cross-module-call resolver (the
     /// [`ExecutionContext::resolve_external_call`] body).

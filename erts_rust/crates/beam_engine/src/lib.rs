@@ -116,7 +116,8 @@ mod supplied_stacktrace;
 #[allow(unsafe_code)]
 pub mod terms;
 pub use context::{BifOutcome, ExecutionContext, Mailbox, MinimalContext, TraceEvent};
-pub use error::{bad_register, blocked, suspended, unknown_label, unsupported};pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};
+pub use error::{bad_register, blocked, suspended, unknown_label, unsupported};
+pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};
 pub use machine::{CatchFrame, Machine, RunOutcome, MAX_REGISTER};
 pub use supplied_stacktrace::encode_supplied_stacktrace;
 pub(crate) use step::Step;

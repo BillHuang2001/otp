@@ -1365,7 +1365,8 @@ fn drive(
                     func: suspend_func,
                     pc: suspend_pc,
                 })
-            }            Step::Enter {
+            }
+            Step::Enter {
                 context,
                 func: target_func,
                 pc: target_pc,

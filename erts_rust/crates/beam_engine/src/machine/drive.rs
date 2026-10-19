@@ -249,7 +249,8 @@ impl Machine {
                 // operands.
                 Step::Suspend { func: f, pc: p } => {
                     return Ok(RunOutcome::Suspend { func: f, pc: p })
-                }                Step::Done => return self.finish().map(RunOutcome::Returned),
+                }
+                Step::Done => return self.finish().map(RunOutcome::Returned),
             }
         }
     }

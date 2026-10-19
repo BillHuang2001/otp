@@ -32,7 +32,8 @@ use beam_term::{
     atom_val, is_atom, is_internal_pid, is_list, is_nil, make_atom, Eterm, NIL,
 };
 
-use crate::context::{BifOutcome, ExecutionContext};use crate::error;
+use crate::context::{BifOutcome, ExecutionContext};
+use crate::error;
 use crate::families;
 use crate::families::exceptions::callee;
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};

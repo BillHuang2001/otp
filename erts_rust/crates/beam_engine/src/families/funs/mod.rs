@@ -120,7 +120,8 @@ use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Module, Operand};
 use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm};
 
-use crate::context::{BifOutcome, ExecutionContext, RootSet};use crate::error;
+use crate::context::{BifOutcome, ExecutionContext, RootSet};
+use crate::error;
 use crate::families::exceptions::callee;
 use crate::machine::{namespace_atom, Continuation, Machine};
 use crate::operand::{
@@ -534,7 +535,8 @@ fn call_fun(
         // its own typed `unsupported` — a degraded *diagnostic*, never a skipped
         // check.
         return raise_badarity(machine, module, &source, arity, ctx).map(Some);
-    }    let args = register_args(machine, arity)?;
+    }
+    let args = register_args(machine, arity)?;
     match ctx.resolve_local_fun(fun, &args) {
         Ok(Some((callee, label))) => {
             // C's free-variable layout: the call arguments stay in `x(0..arity)`,

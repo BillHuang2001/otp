@@ -162,7 +162,8 @@ impl Machine {
     /// mailbox.
     ///
     /// An out-of-range `(func, pc)` is the loop's own typed error, never a panic.
-    pub fn resume_outcome(        &mut self,
+    pub fn resume_outcome(
+        &mut self,
         module: &Module,
         func: u32,
         pc: u32,
@@ -174,7 +175,8 @@ impl Machine {
     /// Resume a suspended machine at a [`RunOutcome::Wait`] or
     /// [`RunOutcome::Suspend`] address on a selected execution tier, reporting whether
     /// the resumed slice returned or parked again.
-    ///    /// This is [`Machine::resume_outcome`] with the tier selection of
+    ///
+    /// This is [`Machine::resume_outcome`] with the tier selection of
     /// [`Machine::run_export_outcome_with_tier`]: a slice that suspended on a native
     /// tier (or on the interpreter) resumes on the **same** tier the caller names, so
     /// the tier seam survives a suspension. As with the first-entry tier entries, the
@@ -201,7 +203,8 @@ impl Machine {
     /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. A resume is handed
     ///   **no** compiled artifact and the tier has no path that would compile and
     ///   bind one at a parked address on demand, so resuming a mid-function
-    ///   `wait`/`suspend` address is unserviceable natively: this is a typed    ///   [`unsupported`](crate::error::unsupported) error (or, with the
+    ///   `wait`/`suspend` address is unserviceable natively: this is a typed
+    ///   [`unsupported`](crate::error::unsupported) error (or, with the
     ///   `jit-cranelift` feature off, the same typed error the first-entry Cranelift
     ///   path reports) — never a panic and never a silent fallback to another tier.
     pub fn resume_outcome_with_tier(
