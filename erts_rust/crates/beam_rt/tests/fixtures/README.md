@@ -961,3 +961,20 @@ A missing **committed** probe image is not a skip: `tests/fixtures/port_failure.
 repository artifact, so `require_probe_beam` panics with the regeneration recipe (and
 `the_probe_image_is_committed` fails alongside it), because skipping there would report nine green
 rows that compared nothing.
+### `zlib_stream.erl` — compiled at test time, never committed as a `.beam`
+`zlib_stream.erl` is the **`zlib` stream-API** image for `tests/zlib_stream_dict.rs`, driven through
+the scheduler `run` route (`beam_rt run <scratch>/zlib_stream.beam zlib_stream:<f>/0`). Unlike the
+committed images above it is **source only**: the suite copies it into a scratch directory and
+compiles it there with the system `erlc` at test time (the file is the source of truth, and a
+committed `.beam` would age independently of it). Five exported functions cover the five cases:
+`params_stash/0` (`deflateParams/3`'s stash path), `dict_protocol/0` (the `need_dictionary`
+protocol), `safe_inflate_chunks/0` (`safeInflate/2` chunking), `reset_and_dictionary/0`
+(`inflateReset/1`, `inflateGetDictionary/1`, `deflateReset/1`) and `truncated_stream/0` (a stream
+missing its Adler trailer is only caught by `inflateEnd/1`).
+
+Every function returns a term, **never a binary**: the `run` route prints its result with `~w`, and
+this runtime's binary printing is `<<55,56,…>>` where the oracle prints `<<"AB">>` for printable
+content (a pre-existing printer limitation, unrelated to `zlib`). Hex digests therefore travel as
+`binary_to_list(binary:encode_hex/1)` integer lists and payloads as sizes plus `=:=` booleans; the
+scratch directory holds **only** this module, so it is also a safe single `-pa` for the oracle.
+A missing `erlc` skips the `run`-route half **loudly** (the `-eval` half still runs).
