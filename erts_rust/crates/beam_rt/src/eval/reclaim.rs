@@ -247,10 +247,18 @@ pub(crate) trait Reach {
     /// A reached `[BinRef]` leaf: `val` is the payload's first data byte — the very value
     /// [`beam_alloc::RefcBinary::data_ptr`] reports.
     fn bin_ref(&mut self, _val: usize) {}
+    /// Whether this sink already has its answer, so the descent may stop early.
+    ///
+    /// Defaulted to `false` — a sink that has to see the *whole* graph never stops — and used by
+    /// [`crate::eval::scratch`]'s window probe, whose question ("does any reachable term stand in
+    /// this address range?") is answered by its first hit.
+    fn done(&self) -> bool {
+        false
+    }
 }
 
 /// The walk's verdict.
-enum Walk {
+pub(crate) enum Walk {
     /// Every root was walked: the sink saw every reachable word.
     Complete,
     /// The walk could not be completed, so nothing may be released.
@@ -447,11 +455,17 @@ fn collect_region_payloads(words: &[Eterm], live: &mut Live) {
 /// `[BinRef]` leaf's payload ([`Reach::bin_ref`]); everything the descent decides (which words are
 /// containers, which region they stand in, whether to decline) is unchanged by the sink, which is
 /// what lets the two questions this module answers share it.
-fn walk<R: Reach>(roots: &[Eterm], sink: &mut R) -> Walk {
+pub(crate) fn walk<R: Reach>(roots: &[Eterm], sink: &mut R) -> Walk {
     let mut work: Vec<Eterm> = Vec::with_capacity(roots.len().max(16));
     work.extend_from_slice(roots);
     let mut budget = WALK_VISIT_BUDGET;
     while let Some(item) = work.pop() {
+        if sink.done() {
+            // The sink already has its answer: a sink that stops early is one whose question is
+            // monotone ("found a hit"), so there is nothing left to learn from the rest of the
+            // graph. A sink that needs the whole graph leaves `done` at its `false` default.
+            return Walk::Complete;
+        }
         sink.word(item);
         // A literal is a frozen code constant (it can name nothing on these heaps), an
         // immediate is neither boxed nor a cons, and a bare header word is not a term at all.

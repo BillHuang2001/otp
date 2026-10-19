@@ -353,6 +353,13 @@ pub struct Runtime {
     /// difference is what it holds: only the terms the table-less route had to keep (a BIF's
     /// container results and the evaluator's own bitstrings), never a call's temporaries.
     pub(crate) eval_heap_retired: Vec<Heap>,
+    /// The `-eval` route's **statement window** on [`Runtime::eval_heap`]
+    /// ([`crate::eval::scratch`]): the mark the current expression's dead statement copies are
+    /// reclaimed from, the one-way pin that refuses a reset when a holder cannot be enumerated,
+    /// and the counters [`Runtime::eval_region_stats`] publishes.
+    ///
+    /// It is always present; its window is open only for the duration of one `-eval` driver run.
+    pub(crate) eval_scratch: crate::eval::scratch::ScratchState,
     /// The `-eval` route's escaped-payload store bookkeeping
     /// ([`crate::eval::reclaim::PruneState`]): the last observed handle count (the `O(1)`
     /// half of the prune trigger), the prune/decline counters and the most recent decline
@@ -1252,6 +1259,7 @@ impl Runtime {
             eval_heap: Heap::new(heap_words)?,
             eval_off_heap: beam_message::OffHeapTable::new(),
             eval_heap_retired: Vec::new(),
+            eval_scratch: crate::eval::scratch::ScratchState::default(),
             eval_prune: crate::eval::reclaim::PruneState::default(),
             eval_prune_enabled: true,
             resource_prune: crate::eval::reclaim::ResourcePruneState::default(),
@@ -1721,6 +1729,15 @@ impl Runtime {
     /// destination off-heap table ([`Runtime::eval_off_heap`]) adopts the handle, so the copied
     /// term points at the same bytes rather than at a materialized equivalent.
     pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
+        // A stabilized term is **runtime-lifetime** by construction — this is the gateway every
+        // store outside the enumerated root families goes through (a runner outcome, a
+        // `persistent_term` value, a pending timer's message, the exit reason, a native store) —
+        // so the `-eval` statement window must not reclaim the copy it is about to make
+        // (`crate::eval::scratch`).
+        crate::eval::scratch::pin(
+            self,
+            "a stabilized term may be kept by a store the statement window cannot enumerate",
+        );
         let copy = beam_message::copy_struct_simple(term, &mut self.eval_heap)
             .map_err(error::enforce_term_heap_limit)?;
         self.note_escaped_store_roots(term);
@@ -1832,6 +1849,12 @@ impl Runtime {
         if src.is_empty() {
             return self.stabilize_term(term);
         }
+        // As [`Runtime::stabilize_term`]: the copy below lands straight in the runtime store and
+        // is runtime-lifetime, so the statement window is latched (`crate::eval::scratch`).
+        crate::eval::scratch::pin(
+            self,
+            "a stabilized term may be kept by a store the statement window cannot enumerate",
+        );
         // The copy's source table: one clone (refcount++) per refc-binary handle (so the lookup
         // in `copy_refc_binary` resolves `term`'s `BinRef.val` to a live handle) and one clone per
         // MSO handle, pushed **in order** so the container terms' slots still name them.
@@ -1966,7 +1989,70 @@ impl Runtime {
     pub fn set_eval_prune_enabled(&mut self, enabled: bool) {
         self.eval_prune_enabled = enabled;
     }
-    /// Records that the store was rewritten and now holds `handles` payload handles, together
+
+    // -- the `-eval` route's statement window on the term store: the diagnostics and the kill
+    // switch (`crate::eval::scratch`) ------------------------------------------------------
+    /// The term store's region figures and the statement window's counters — the diagnostic a
+    /// measurement (and a test) reads instead of guessing.
+    ///
+    /// `used`/`capacity` are the **current** region ([`Runtime::eval_heap`]); `retired_*` are the
+    /// regions [`Runtime::grow_eval_heap`] replaced, which are never freed. `resets` and
+    /// `words_reclaimed` are what the window reclaimed, `declines`/`last_decline` why it did not.
+    ///
+    /// A run whose window works answers a `used` that does not move with the statement count —
+    /// that is the claim `src/eval/scratch/tests.rs` and `PERF.md` pin.
+    pub fn eval_region_stats(&self) -> crate::eval::scratch::EvalRegionStats {
+        let retired_regions = self.eval_heap_retired.len();
+        crate::eval::scratch::EvalRegionStats {
+            used: self.eval_heap.used(),
+            capacity: self.eval_heap.capacity(),
+            retired_regions,
+            retired_capacity_words: self
+                .eval_heap_retired
+                .iter()
+                .map(|heap| heap.capacity())
+                .sum(),
+            opens: self.eval_scratch.opens,
+            resets: self.eval_scratch.resets,
+            declines: self.eval_scratch.declines,
+            last_decline: self.eval_scratch.last_decline,
+            words_reclaimed: self.eval_scratch.words_reclaimed,
+        }
+    }
+
+    /// Turns the `-eval` route's statement window ([`crate::eval::scratch`]) on or off.
+    ///
+    /// It is **on** in every production route; this exists so a measurement can hold the
+    /// mechanism out of the picture and compare one expression against itself, which is what
+    /// falsifies a "bounded store" claim (`src/eval/scratch/tests.rs`, `PERF.md`). Nothing else
+    /// changes: every word stays valid either way — the only difference is that the words a
+    /// discarded statement copied are either reused or retained. Deliberately **not** a `-eval`
+    /// flag or an `ERL_*` switch, for the same reason as
+    /// [`Runtime::set_eval_prune_enabled`].
+    pub fn set_eval_scratch_enabled(&mut self, enabled: bool) {
+        self.eval_scratch.set_enabled(enabled);
+    }
+
+    /// Latches the statement window **only if** a nested run wrote on the store since
+    /// `used_before`, and answers whether it did.
+    ///
+    /// A nested [`RuntimeContext::run_export_blocking`] / `run_label_blocking` drives a `Machine`
+    /// whose registers and stack this module cannot enumerate — but that machine is dropped
+    /// inside the *same* top-level statement, so at the next statement boundary it names nothing
+    /// and the only survivors are its result (bound into the environment, or discarded) and any
+    /// runtime-lifetime store it wrote (which pins on its own). Latching on an actual write keeps
+    /// the window sound without paying a statement for a nested run that touched only
+    /// machine-heap terms, which is the common case for a plain Erlang helper call.
+    pub(crate) fn pin_window_if_store_written(&mut self, used_before: usize) -> bool {
+        if self.eval_heap.used() == used_before {
+            return false;
+        }
+        crate::eval::scratch::pin(
+            self,
+            "a nested run wrote on the store and its machine's roots cannot be enumerated",
+        );
+        true
+    }    /// Records that the store was rewritten and now holds `handles` payload handles, together
     /// with the budget verdict `over` derived from the store as the rewrite left it.
     pub(crate) fn note_eval_prune(&mut self, handles: usize, over: bool) {
         self.eval_prune.seen_handles = handles;

@@ -272,6 +272,11 @@ impl<'a> RuntimeContext<'a> {
             // minted (see [`RuntimeContext::adopt_nested_payloads`]). A per-run local, because
             // nested runs recurse.
             let frontier = crate::eval::reclaim::Frontier::snapshot();
+            // The `-eval` statement window's latch for this run: the machine below holds its roots
+            // where the window's descent cannot see them, so a run that **wrote** on the runtime
+            // store latches the window (see `crate::eval::scratch` and
+            // `Runtime::pin_window_if_store_written`).
+            let store_used_before = this.runtime.eval_heap.used();
             let mut machine = Machine::new();
             let result = match machine.run_export_outcome(module, function, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
@@ -285,6 +290,7 @@ impl<'a> RuntimeContext<'a> {
             // escaped-payload store **before** that drop, and release the ones this run built
             // that nothing names any more (see [`RuntimeContext::adopt_nested_payloads`]).
             this.adopt_nested_payloads(machine, &result, &frontier);
+            let _ = this.runtime.pin_window_if_store_written(store_used_before);
             result
         })
     }
@@ -343,6 +349,9 @@ impl<'a> RuntimeContext<'a> {
             // As [`Self::run_export_blocking`]: this run's NIF-resource prune scope, taken before
             // the body runs.
             let frontier = crate::eval::reclaim::Frontier::snapshot();
+            // As [`Self::run_export_blocking`]: the `-eval` statement window's latch for this run,
+            // because the closure's `Machine` holds its roots outside the window's descent.
+            let store_used_before = this.runtime.eval_heap.used();
             let mut machine = Machine::new();
             let result = match machine.run_label_outcome(module, label, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
@@ -354,6 +363,7 @@ impl<'a> RuntimeContext<'a> {
             // before the machine holding them is dropped, and release the ones this run built
             // that nothing names any more.
             this.adopt_nested_payloads(machine, &result, &frontier);
+            let _ = this.runtime.pin_window_if_store_written(store_used_before);
             result
         })
     }

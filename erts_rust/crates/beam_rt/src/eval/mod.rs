@@ -100,6 +100,8 @@ mod bits_decode;
 mod bits_match;
 mod parse;
 pub(crate) mod reclaim;
+pub(crate) mod scratch;
+
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -394,6 +396,10 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
     // this very pid can arrive.
     ctx.with_relocation_exempt(|ctx| {
         let tree = parse::parse(expr)?;
+        // The store's statement window (`scratch`): opened **above** everything this runtime has
+        // already copied, so the words this run's dead statements leave behind can be reclaimed
+        // while every earlier run's result — which the caller may still hold — stays put.
+        scratch::open(ctx.runtime);
         let mut evaluator = Evaluator {
             ctx,
             depth: 0,
@@ -408,6 +414,10 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
         // built containers are live and unnamed, so pruning must not be keyed off a recursion
         // depth alone — see [`Evaluator::prune_escaped`].
         let outcome = evaluator.run_top_level(&tree, &mut env);
+        // The window is closed **without** being reset: the run's result may stand in it, so its
+        // words must stay — dropping the window is what makes the next `-eval` run open above
+        // this result instead of reusing a mark that could free it (`scratch`).
+        scratch::close(evaluator.ctx.runtime);
         finish(outcome, evaluator.ctx)
     })
 }
@@ -498,6 +508,13 @@ pub(crate) fn apply_eval_closure(
     let Some(body) = ctx.runtime.eval_closures.get(index).cloned() else {
         return Err(BeamError::BadArg);
     };
+    // This application's copies onto the runtime store are held by whatever machine is driving
+    // it (e.g. `lists:map/2`'s own accumulator), which the `-eval` statement window cannot
+    // enumerate — so the window must not be reset across it (`crate::eval::scratch`).
+    scratch::pin(
+        ctx.runtime,
+        "a nested -eval closure's copies are held by the machine that applied it",
+    );
     let mut evaluator = Evaluator {
         ctx,
         depth: 0,
@@ -538,15 +555,18 @@ impl Evaluator<'_, '_> {
         result
     }
 
-    /// Evaluates the whole `-eval` expression, pruning the escaped-payload store between its
-    /// top-level statements.
+    /// Evaluates the whole `-eval` expression, reclaiming the store's dead statement copies and
+    /// pruning the escaped-payload store between its top-level statements.
     ///
     /// A comma sequence parses to [`Expr::Block`], so the driver runs the statements itself; any
-    /// other expression is a single statement. Both halves call [`Evaluator::prune_escaped`] with
-    /// exactly the terms the evaluator still holds — its environment and the statement's value —
-    /// which is what makes the prune's root enumeration complete.
+    /// other expression is a single statement. The payload prune is handed exactly the terms the
+    /// evaluator still holds — its environment and the statement's value — which is what makes
+    /// its root enumeration complete, while the store window ([`Evaluator::reset_scratch`]) runs
+    /// **before** each statement and is handed the environment alone, because a comma sequence
+    /// discards every statement value but the last.
     fn run_top_level(&mut self, tree: &Expr, env: &mut Env) -> EResult<Eterm> {
         let Expr::Block(body) = tree else {
+            self.reset_scratch(env);
             let value = self.expr(tree, env)?;
             self.prune_escaped(env, value);
             self.prune_resources(env, value);
@@ -554,6 +574,7 @@ impl Evaluator<'_, '_> {
         };
         let mut last = NIL;
         for expression in body {
+            self.reset_scratch(env);
             last = self.expr(expression, env)?;
             self.prune_escaped(env, last);
             self.prune_resources(env, last);
