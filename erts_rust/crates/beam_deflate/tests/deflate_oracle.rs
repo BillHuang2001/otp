@@ -214,25 +214,78 @@ fn every_strategy_matches_the_oracle() {
 /// `fill_window` zeroes `WIN_INIT`), so a sliding window that leaves stale bytes visible
 /// changes the stream and would be caught here.
 ///
-/// **Known divergence (byte exactness beyond one symbol buffer).** The one-shot bytes for
-/// a 70 000-byte input still disagree with the oracle at levels ≤ 1 (the oracle emits
-/// `Z_STORED` blocks and this port emits a dynamic-Huffman block, i.e. the level is not
-/// reaching the strategy dispatch for this input shape), so the strict comparison is
-/// `#[ignore]`d rather than weakened. The round-trip test below is the always-on
-/// guarantee: whatever this port emits, the oracle's inflater must reproduce the input
-/// exactly. Run the strict form with
-/// `cargo test -p beam_deflate --test deflate_oracle -- --ignored a_large_input`.
+/// The multi-pump path is the one that used to diverge: `deflate_stored` sizes its blocks
+/// from `avail_in`/`avail_out` (`deflate.c:1668-1780`), so the *pump schedule* is part of
+/// the level-0 byte string. [`Deflate::compress_with`] reproduces the `zlib` module's
+/// 8 KiB/8 KiB schedule (`zlib.erl`'s `?DEFLATE_IN_CHUNKSIZE`/`?DEFLATE_OUT_CHUNKSIZE`,
+/// driven by `zlib_nif.c:zlib_flush_queue`), which is what makes this matrix agree.
 #[test]
-#[ignore = "known divergence: >1 symbol buffer of input does not yet match the oracle byte for byte"]
 fn a_large_input_matches_the_oracle() {
     let data = large_input();
     let mut cases = Vec::new();
-    for level in [0i8, 1, 6, 9] {
+    for level in [-1i8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
         cases.push(Case::zlib(level, &data));
         cases.push(Case::raw(level, &data));
         cases.push(Case::gzip(level, &data));
     }
     check_matrix("large input", &cases);
+}
+
+/// The same 70 000-byte input at every `memLevel` (which moves `sym_end`, hence every
+/// block boundary) and at the narrow windows (which force repeated slides).
+#[test]
+fn a_large_input_matches_the_oracle_at_every_mem_level_and_window() {
+    let data = large_input();
+    let mut cases = Vec::new();
+    for mem_level in 1..=9u8 {
+        for level in [-1i8, 0, 1, 4, 6, 9] {
+            for window_bits in [15i8, -15, 16 + 15] {
+                cases.push(Case {
+                    mem_level,
+                    window_bits,
+                    ..Case::zlib(level, &data)
+                });
+            }
+        }
+    }
+    for window_bits in 9..=15i8 {
+        for level in [0i8, 1, 6, 9] {
+            cases.push(Case {
+                window_bits,
+                ..Case::zlib(level, &data)
+            });
+        }
+    }
+    for window_bits in -15..=-9i8 {
+        for level in [0i8, 1, 6, 9] {
+            cases.push(Case {
+                window_bits,
+                ..Case::zlib(level, &data)
+            });
+        }
+    }
+    for window_bits in (16 + 9)..=(16 + 15) {
+        for level in [0i8, 1, 6, 9] {
+            cases.push(Case {
+                window_bits,
+                ..Case::zlib(level, &data)
+            });
+        }
+    }
+    // Every strategy the `zlib` module can name (`Z_FIXED` is covered by the round-trip
+    // test below).
+    for strategy in 0..=3u8 {
+        for level in [0i8, 1, 6, 9] {
+            for window_bits in [15i8, -15, 16 + 15] {
+                cases.push(Case {
+                    strategy,
+                    window_bits,
+                    ..Case::zlib(level, &data)
+                });
+            }
+        }
+    }
+    check_matrix("large input x memLevel/window/strategy", &cases);
 }
 
 /// The always-on half of the test above: every stream this port produces for a large

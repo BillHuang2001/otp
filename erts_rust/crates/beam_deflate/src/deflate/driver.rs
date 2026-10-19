@@ -53,6 +53,12 @@ fn rank(f: i32) -> i32 {
     f * 2 - if f > 4 { 9 } else { 0 }
 }
 
+/// `adler32(0L, Z_NULL, 0)` (`adler32.c:52-54`) — the Adler-32 identity the C stores in
+/// `strm->adler` once the zlib header has been written: the *NULL-buffer* branch returns
+/// **1**. [`crate::checksum::adler32`] follows the C's other branch (a non-NULL empty
+/// buffer leaves the accumulator untouched), so the identity is spelled out here rather
+/// than asked of a zero-length call.
+const ADLER_IDENTITY: u32 = 1;
 impl DeflateState {
     /// `flush_pending(strm)` (`deflate.c:950`): drain `_tr_flush_bits` and as much of the
     /// pending buffer as the caller's output can take.
@@ -355,11 +361,13 @@ impl DeflateState {
                 self.put_short_msb(adler >> 16);
                 self.put_short_msb(adler & 0xffff);
             }
-            self.adler = crate::checksum::adler32(0, &[]);
+            // `s->strm->adler = adler32(0L, Z_NULL, 0);` — the C's *NULL-buffer* call is the
+            // Adler-32 identity, i.e. **1**, not `adler32(0, "")` (which leaves 0 in a
+            // non-NULL empty call and would put every trailer one low).
+            self.adler = ADLER_IDENTITY;
             self.status = BUSY_STATE;
             // Compression must start with an empty pending buffer.
-            self.flush_pending(io);
-            if self.pending != 0 {
+            self.flush_pending(io);            if self.pending != 0 {
                 self.last_flush = -1;
                 return Status::Ok;
             }

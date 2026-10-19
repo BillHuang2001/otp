@@ -825,15 +825,18 @@ mod tests {
             code = (code + u32::from(bl_count[bits - 1])) << 1;
         }
         assert_eq!(code + u32::from(bl_count[MAX_BITS]) - 1, (1 << MAX_BITS) - 1);
-        for (code, len) in STATIC_DTREE.iter() {
-            assert_eq!(*len, 5);
-            assert_eq!(*code, bi_reverse(u32::from(*code as u32 & 0x1f), 5) & 0x1f);
+        // `static_dtree[n].Code == bi_reverse(n, 5)`: the fixed distance codes are the
+        // canonical 5-bit codes in numeric order, bit-reversed for the LSB-first writer.
+        for (n, (code, len)) in STATIC_DTREE.iter().enumerate() {
+            assert_eq!(*len, 5, "distance code {n}");
+            assert_eq!(*code, bi_reverse(n as u32, 5), "distance code {n}");
         }
     }
 
-    /// `send_bits` spills whole 16-bit words least-significant-byte first, and `bi_windup`
-    /// pads the final partial byte with zeroes — the two rules that make the emitted
-    /// stream a byte string at all.
+    /// `send_bits` fills the 16-bit accumulator from the least significant bit and only
+    /// spills when a value would overflow it (`bi_valid > Buf_size - len`), so exactly 16
+    /// live bits stay in the buffer until the next `send_bits` or `bi_windup`; the spilled
+    /// word goes out little-endian first.
     #[test]
     fn the_bit_writer_spills_little_endian_words() {
         let mut st = DeflateState::new(6, 0, 0, 15, 8);
@@ -842,15 +845,21 @@ mod tests {
         assert_eq!(st.pending, 0);
         st.send_bits(0x1ff, 9);
         assert_eq!(st.bi_valid, 10);
+        // Bit 10 is the accumulator's last free one, so nothing spills yet.
         st.send_bits(0x3f, 6);
-        // 16 bits are now live: the first word went out LSB first.
+        assert_eq!(st.bi_valid, 16);
+        assert_eq!(st.bi_buf, 0xffff);
+        assert_eq!(st.pending, 0, "a full word waits for the next send or flush");
+        // One more bit overflows: the whole word goes out LSB first.
+        st.send_bits(0b1, 1);
         assert_eq!(st.pending, 2);
-        assert_eq!(&st.pending_buf[..2], &[0xff, 0x03]);
+        assert_eq!(&st.pending_buf[..2], &[0xff, 0xff]);
+        assert_eq!(st.bi_buf, 0b1);
+        assert_eq!(st.bi_valid, 1);
         st.bi_windup();
         assert_eq!(st.bi_valid, 0);
-        assert_eq!(st.pending, 2, "the remaining 10 bits fit in the word already sent");
+        assert_eq!(&st.pending_buf[..3], &[0xff, 0xff, 0x01], "the tail is padded");
     }
-
     /// A zero-length code (`Len == 0` in the C, i.e. `Code == 0` there too) contributes
     /// nothing; sending it must not corrupt the accumulator.
     #[test]

@@ -73,11 +73,12 @@ const MAX_MEM_LEVEL: i32 = 9;
 /// `deflateInit2_`'s 8 → 9 window bump: `if (windowBits == 8) windowBits = 9;  /* until
 /// 256-byte window bug fixed */`.
 const MIN_DEFLATE_WBITS: i32 = 9;
-/// The chunk size [`Deflate::compress_with`] hands each pump step. Any size works — the
-/// loop simply repeats — but a power of two keeps the allocations uniform and the number
-/// of steps small.
-const ONESHOT_CHUNK: usize = 32 * 1024;
-
+/// `?DEFLATE_IN_CHUNKSIZE` (`zlib.erl:141`) — the input piece the `zlib` module hands the
+/// NIF per `deflate` call (`8 bsl 10`).
+const ZLIB_IN_CHUNK: usize = 8 << 10;
+/// `?DEFLATE_OUT_CHUNKSIZE` (`zlib.erl:142`) — the output buffer the NIF allocates per
+/// `zlib:deflate/3` call (`8 bsl 10`). `deflate_stored`'s block sizes depend on it.
+const ZLIB_OUT_CHUNK: usize = 8 << 10;
 /// `deflateInit2`'s argument tuple.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DeflateConfig {
@@ -251,29 +252,77 @@ impl Deflate {
 
     /// One-shot `deflateInit` + `deflate(Z_FINISH)` + `deflateEnd`: the whole stream.
     ///
-    /// Byte-identical to the C's `compress2` for the same parameters — which is the
-    /// strongest single test of the streaming core, since `compress2` *is* this loop.
+    /// Byte-identical to `zlib:deflate(Z, Data, finish)` — the image `zlib:compress/1`,
+    /// `zlib:zip/1`, `zlib:gzip/1` and `zlib:deflate(Z, Data, finish)` return.
+    ///
+    /// The *pump schedule* is part of that contract, not an implementation detail:
+    /// `zlib.erl` hands the NIF `?DEFLATE_IN_CHUNKSIZE`/`?DEFLATE_OUT_CHUNKSIZE` (8 KiB
+    /// each), and the NIF (`zlib_nif.c:zlib_flush_queue`) calls `deflate(Z_NO_FLUSH)` once
+    /// per input piece until the queue is drained, then calls `deflate(flush)` with an
+    /// empty input in the *same* 8 KiB output buffer, and finally keeps re-entering with a
+    /// fresh 8 KiB buffer while the last call produced a full one. `deflate_stored` sizes
+    /// its blocks from `avail_in`/`avail_out` (`deflate.c:1668-1780`), so a level-0 stream
+    /// carries that schedule in its bytes; reproducing it is what makes
+    /// `Deflate::compress_with` agree with the oracle rather than merely inflate.
     pub fn compress_with(config: DeflateConfig, input: &[u8]) -> Result<Vec<u8>> {
+        Deflate::compress_pumped(config, input, ZLIB_IN_CHUNK, ZLIB_OUT_CHUNK)
+    }
+
+    /// [`Deflate::compress_with`] with an explicit pump schedule — the same `deflate()`
+    /// calls, with `in_chunk`/`out_chunk` standing in for the `zlib` module's 8 KiB.
+    ///
+    /// A smaller `out_chunk` makes the driver return `Z_OK` more often and a smaller
+    /// `in_chunk` feeds `fill_window` different pieces; neither changes the *bytes* for
+    /// levels 1..=9, but level 0's stored-block split is a function of both, exactly as in
+    /// the C. Kept private: the public one-shot shape is the oracle's.
+    fn compress_pumped(
+        config: DeflateConfig,
+        input: &[u8],
+        in_chunk: usize,
+        out_chunk: usize,
+    ) -> Result<Vec<u8>> {
         let mut stream = Deflate::new(config)?;
         let mut out = Vec::new();
-        let mut chunk = vec![0u8; ONESHOT_CHUNK];
-        let mut consumed = 0usize;
+        let mut buf = vec![0u8; out_chunk];
+        let mut at = 0usize;
         loop {
-            let pump = stream.deflate(&input[consumed..], &mut chunk, Flush::Finish)?;
-            out.extend_from_slice(&chunk[..pump.produced]);
-            consumed += pump.consumed;
-            match pump.status {
-                Status::StreamEnd => return Ok(out),
-                // `Z_OK` is the only other outcome a `Z_FINISH` pump loop can see: the
-                // stream is not finished yet because the output chunk filled up. Anything
-                // else cannot happen for a stream this module created, and is a
-                // configuration rejection rather than a mere "close enough" stream.
-                Status::Ok => {}
-                _ => return Err(BeamError::BadArg),
+            let mut produced = 0usize;
+            let mut consumed = 0usize;
+            // One `deflate(Z_NO_FLUSH)` per input piece, into a fresh output buffer.
+            if at < input.len() {
+                let end = (at + in_chunk).min(input.len());
+                let pump = stream.deflate(&input[at..end], &mut buf, Flush::None)?;
+                if pump.consumed == 0 && pump.produced == 0 {
+                    // The C's NIF turns "no progress with input outstanding" into
+                    // `Z_DATA_ERROR` (`zlib_nif.c:439`); it cannot happen for a stream this
+                    // module created, and it is a rejected configuration (a zero-sized
+                    // output buffer), never a merely-conforming stream.
+                    return Err(BeamError::BadArg);
+                }
+                at += pump.consumed;
+                consumed = pump.consumed;
+                produced = pump.produced;
+            }
+            if at == input.len() && produced < out_chunk {
+                // The flush pump rides in the same output buffer, as the NIF's does.
+                let pump = stream.deflate(&[], &mut buf[produced..], Flush::Finish)?;
+                produced += pump.produced;
+                out.extend_from_slice(&buf[..produced]);
+                match pump.status {
+                    Status::StreamEnd => return Ok(out),
+                    // `Z_OK` means the 8 KiB buffer filled: the caller comes back with a
+                    // fresh one, exactly as `dequeue_all_chunks/2` does.
+                    Status::Ok => {}
+                    _ => return Err(BeamError::BadArg),
+                }
+            } else {
+                out.extend_from_slice(&buf[..produced]);
+                if consumed == 0 && produced == 0 {
+                    return Err(BeamError::BadArg);
+                }
             }
         }
     }
-
     /// One `deflate()` pump step: consume at most `input.len()` bytes, write at most
     /// `output.len()` bytes, and report zlib's return code with both counts.
     ///

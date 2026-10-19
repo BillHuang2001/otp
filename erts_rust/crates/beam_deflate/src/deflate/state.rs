@@ -519,6 +519,23 @@ impl DeflateState {
     pub(super) fn lm_init(&mut self) {
         self.window_size = 2 * u64::from(self.w_size);
         self.clear_hash();
+        // `deflateInit2_`'s derived sizes (`deflate.c:453-521`) are fixed at construction
+        // and never change afterwards; every buffer this state hands out is sized by them,
+        // so a mismatch would silently mis-index the hash chains or the output. The three
+        // that only the *construction* reads are pinned here.
+        debug_assert_eq!(self.hash_size, 1usize << self.hash_bits, "hash_size");
+        debug_assert_eq!(
+            self.hash_shift,
+            (self.hash_bits + MIN_MATCH - 1) / MIN_MATCH,
+            "hash_shift"
+        );
+        debug_assert_eq!(self.head.len(), self.hash_size, "head is `hash_size` long");
+        debug_assert_eq!(
+            self.pending_buf.len(),
+            self.lit_bufsize * 4,
+            "pending_buf_size is `lit_bufsize * 4` (`LIT_BUFS`)"
+        );
+        debug_assert_eq!(self.sym_end, (self.lit_bufsize - 1) * 3, "sym_end");
         let cfg = CONFIGURATION_TABLE[self.level as usize];
         self.max_lazy_match = cfg.max_lazy;
         self.good_match = cfg.good_length;
@@ -536,7 +553,9 @@ impl DeflateState {
 
     /// `CLEAR_HASH` (`deflate.c:170`) — `prev[]` is initialized on the fly.
     pub(super) fn clear_hash(&mut self) {
-        self.head.iter_mut().for_each(|h| *h = NIL as u16);
+        // The C writes `head[hash_size - 1]` first and `zmemzero`s the other `hash_size - 1`
+        // entries; both are `NIL`, so this is one fill over exactly `hash_size` heads.
+        self.head[..self.hash_size].fill(NIL as u16);
     }
 
     /// The tree a [`TreeKind`] names.
@@ -589,10 +608,11 @@ impl DeflateState {
     /// and anything that would fall off the bottom becomes `NIL`.
     pub(super) fn slide_hash(&mut self) {
         let wsize = self.w_size as u16;
-        for h in self.head.iter_mut() {
+        // The C walks `n = s->hash_size` heads and then `n = w_size` chain links.
+        for h in self.head[..self.hash_size].iter_mut() {
             *h = if *h >= wsize { *h - wsize } else { NIL as u16 };
         }
-        for p in self.prev.iter_mut() {
+        for p in self.prev[..self.w_size as usize].iter_mut() {
             *p = if *p >= wsize { *p - wsize } else { NIL as u16 };
         }
     }

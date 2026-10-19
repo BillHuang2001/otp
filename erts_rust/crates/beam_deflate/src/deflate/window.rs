@@ -295,22 +295,53 @@ mod tests {
         assert_eq!(st.adler, crc32(0, data));
     }
 
-    /// The `insert` bookkeeping: bytes that the caller promised were already inserted get
-    /// inserted by `fill_window`, and the chain they build is the same one
-    /// `insert_string` would build byte by byte.
+    /// The `insert` bookkeeping: bytes the strategy consumed **without** hashing them get
+    /// inserted by the next `fill_window` (`deflate.c:315-334`), and the chain they build
+    /// is the one `insert_string` would have built byte by byte.
+    ///
+    /// `deflate_stored` leaves exactly this state behind — `s->strstart = used;
+    /// s->insert = used` (`deflate.c:1768-1769`) — so `insert <= strstart` always holds and
+    /// `strstart - insert` is the first byte still owed to the hash table.
     #[test]
     fn fill_window_inserts_the_pending_strings() {
         let mut st = DeflateState::new(6, Z_DEFAULT_STRATEGY, 0, 15, 8);
         let mut out = [];
+        // The whole input lands in the window first, so the three bytes we are about to
+        // declare "pending" are really there.
         let mut io = Io::new(b"abcabcabc", &mut out);
-        // Pretend the first three bytes are already in the window and uninserted.
-        st.insert = 3;
         st.fill_window(&mut io);
+        assert_eq!(st.lookahead, 9);
         assert_eq!(st.insert, 0);
-        // Positions 0, 1 and 2 were inserted; "abc" at 0 and at 3 hash together, so the
-        // bucket for it is the highest of the three inserted positions.
-        let h = (st.ins_h & st.hash_mask) as usize;
-        assert_ne!(st.head[h], NIL as u16);
+        // A level-0 pump that copied `abc` straight to the output leaves those bytes in
+        // the window unhashed, with `block_start == strstart`.
+        st.strstart = 3;
+        st.lookahead = 6;
+        st.insert = 3;
+        st.block_start = 3;
+        // The next fill owes the hash table positions 0, 1 and 2.
+        let mut io2 = Io::new(b"xyz", &mut out);
+        st.fill_window(&mut io2);
+        assert_eq!(st.insert, 0);
+        assert_eq!(st.strstart, 3, "fill_window never moves `strstart`");
+        // Each pending position now heads its own 3-byte-string bucket, in insertion
+        // order, and the old head is preserved as the chain link.
+        let hash_of = |s: &[u8]| {
+            let mut h = 0u32;
+            for &c in s {
+                h = ((h << st.hash_shift) ^ u32::from(c)) & st.hash_mask;
+            }
+            h as usize
+        };
+        for (pos, s) in [&b"abc"[..], &b"bca"[..], &b"cab"[..]].iter().enumerate() {
+            let h = hash_of(s);
+            assert_eq!(st.head[h], pos as u16, "{:?} heads its bucket", s);
+            assert_eq!(
+                st.prev[pos & st.w_mask as usize],
+                NIL as u16,
+                "{:?} has no predecessor",
+                s
+            );
+        }
     }
 
     /// `hi gh_water`/`WIN_INIT`: the bytes just past the data are zeroed, so the matcher's

@@ -30,6 +30,17 @@
 use std::io::Write;
 use std::process::Command;
 
+/// Integration tests in one test binary run in parallel threads, but each oracle call
+/// boots a whole `erl`; on a loaded host several boots at once fail sporadically (the
+/// runner reports "the oracle batch failed to run"). One oracle call at a time.
+pub fn oracle_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Lowercase hex, the form `binary:encode_hex/1` produces and `binary:decode_hex/1` eats.
 pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -109,6 +120,12 @@ fn erl_program() -> String {
 
 /// Is there a usable `erl` on this machine?
 pub fn have_oracle() -> bool {
+    let _guard = oracle_lock();
+    have_oracle_locked()
+}
+
+/// [`have_oracle`] for a caller that already holds [`oracle_lock`].
+fn have_oracle_locked() -> bool {
     Command::new(erl_program())
         .args(["-noshell", "-eval", "halt(0)."])
         .status()
@@ -134,13 +151,31 @@ const BATCH_SCRIPT: &str = concat!(
     "halt()."
 );
 
+/// A fresh, empty scratch directory for one oracle call.
+///
+/// Every call gets its **own** directory: the integration tests run in parallel threads of
+/// one process, so a `process::id()`-only name would let one test delete another's spec
+/// file mid-run.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "beam_deflate_{tag}_{}_{n}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Run a whole matrix through the oracle in **one** `erl` boot.
 ///
 /// `None` means "no oracle available" (the caller should print a SKIP line); `Some` holds
 /// one compressed stream per case, in order. A case the oracle rejects is reported as the
 /// (empty) `Err` variant so a caller can assert symmetric rejection.
 pub fn oracle_batch(cases: &[Case]) -> Option<Vec<Result<Vec<u8>, String>>> {
-    if !have_oracle() {
+    let _guard = oracle_lock();
+    if !have_oracle_locked() {
         return None;
     }
     let mut spec = String::new();
@@ -154,8 +189,7 @@ pub fn oracle_batch(cases: &[Case]) -> Option<Vec<Result<Vec<u8>, String>>> {
             hex(&c.data)
         ));
     }
-    let dir = std::env::temp_dir().join(format!("beam_deflate_oracle_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).ok()?;
+    let dir = scratch_dir("oracle");
     let path = dir.join("spec.csv");
     {
         let mut f = std::fs::File::create(&path).ok()?;
@@ -190,7 +224,8 @@ pub fn oracle_batch(cases: &[Case]) -> Option<Vec<Result<Vec<u8>, String>>> {
 /// Run an arbitrary `-eval` script and return its stdout, or `None` when there is no
 /// oracle (or it failed).
 pub fn erl_eval(script: &str) -> Option<String> {
-    if !have_oracle() {
+    let _guard = oracle_lock();
+    if !have_oracle_locked() {
         return None;
     }
     let out = Command::new(erl_program())
@@ -205,26 +240,41 @@ pub fn erl_eval(script: &str) -> Option<String> {
 
 /// `zlib:uncompress/1` in the oracle: the inverse check for a stream the oracle itself
 /// cannot produce (the `Z_FIXED` strategy).
+///
+/// The stream is handed over through a file, not through `argv`: a 70 000-byte input
+/// hex-encodes to 140 000 characters, past the kernel's `E2BIG` limit for a single
+/// argument.
 pub fn oracle_inflate(stream: &[u8]) -> Option<Vec<u8>> {
-    let script = format!(
-        concat!(
-            "Z=zlib:open(),",
-            "ok=zlib:inflateInit(Z),",
-            // `zlib:inflate/2` can return before Z_STREAM_END when its internal output
-            // buffer fills, so keep passing `finish` until `inflate` reports `finished`.
-            "L=fun F(In, Acc) ->",
-            "    case zlib:inflate(Z, In, finish) of",
-            "        {{finished, Out}} -> iolist_to_binary(lists:reverse([Out|Acc]));",
-            "        Out -> F(<<>>, [Out|Acc])",
-            "    end end,",
-            "O=L(binary:decode_hex(<<\"{}\">>), []),",
-            "ok=zlib:inflateEnd(Z),zlib:close(Z),",
-            "io:format(\"~s\",[binary:encode_hex(O)]),",
-            "halt()."
-        ),
-        hex(stream)
+    let _guard = oracle_lock();
+    let dir = scratch_dir("inflate");
+    let path = dir.join("stream.hex");
+    std::fs::write(&path, hex(stream)).ok()?;
+    let script = concat!(
+        "{ok,B}=file:read_file(os:getenv(\"BD_HEX\")),",
+        "Z=zlib:open(),",
+        "ok=zlib:inflateInit(Z),",
+        // `zlib:inflate/2` can return before Z_STREAM_END when its internal output
+        // buffer fills, so keep passing `finish` until `inflate` reports `finished`.
+        "L=fun F(In, Acc) ->",
+        "    case zlib:inflate(Z, In, finish) of",
+        "        {finished, Out} -> iolist_to_binary(lists:reverse([Out|Acc]));",
+        "        Out -> F(<<>>, [Out|Acc])",
+        "    end end,",
+        "O=L(binary:decode_hex(B), []),",
+        "ok=zlib:inflateEnd(Z),zlib:close(Z),",
+        "io:format(\"~s\",[binary:encode_hex(O)]),",
+        "halt()."
     );
-    erl_eval(&script).map(|s| unhex(&s))
+    let out = Command::new(erl_program())
+        .args(["-noshell", "-eval", script])
+        .env("BD_HEX", &path)
+        .output()
+        .ok()?;
+    std::fs::remove_dir_all(&dir).ok();
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok().map(|s| unhex(&s))
 }
 
 /// The inputs the golden matrix uses. Small enough to inline the expected bytes, varied
