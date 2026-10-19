@@ -418,7 +418,13 @@ impl PortRegistry {
 
     /// `id`'s mirrored `{exit_on_close, …}` flag, defaulting to the C's `true`
     /// (`desc->inet.exitf = 1`, `inet_drv.c:10929`).
-    fn inet_exit_on_close(&self, id: PortId) -> bool {
+    ///
+    /// Two readers: this module's retirement gate ([`PeerCloseReport::exit_on_close`]), and
+    /// [`PortRegistry::adopt_accepted`](super::PortRegistry) — which copies the *resolved* flag into
+    /// an accepted socket's mirror, exactly as the C's `tcp_inet_copy` copies `inet.exitf`
+    /// (`inet_drv.c:11812`), so an unset latch on the listener must seed the default rather than
+    /// nothing.
+    pub(crate) fn inet_exit_on_close(&self, id: PortId) -> bool {
         self.inet_options(id)
             .and_then(PortInetOptions::exit_on_close)
             .unwrap_or(true)

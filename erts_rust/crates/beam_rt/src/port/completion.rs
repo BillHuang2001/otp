@@ -84,8 +84,9 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 
+use beam_common::BeamError;
 use beam_io::{
-    CompletionEvent, Driver, FdDriver, InetAsyncResult, InetReason, InetReply, PortCompletion,
+    CompletionEvent, Driver, InetAsyncResult, InetReason, InetReply, PortCompletion,
     TcpInetDriver,
 };
 use beam_process::{PortId, ProcessId};
@@ -260,29 +261,54 @@ impl PortRegistry {
     ///
     /// The C's `tcp_inet_copy` copies the listening descriptor's whole option block into the
     /// accepted one (`inet_drv.c:11810-11827`). This crate's drivers cannot create a port
-    /// ([`InetAsyncResult::Accepted`] hands the bare descriptor up), so the block is **replayed**
-    /// onto the new port through the driver's own `setopts` surface after it is registered:
-    /// [`PortRegistry::seed_inet_mode`] first (the listener's *data* mode, which
-    /// [`PortMeta::stream`](super::PortMeta) does not carry — `prim_inet:open/6` always opens
-    /// `[binary]`), then [`PortRegistry::inherit_inet_options`], which resends the listener's
-    /// recorded records that [`is_inherited_record`](super::ops::inet_opts::is_inherited_record)
-    /// admits, in arrival order. `{active, …}` is deliberately **not** replayed: the C does not
-    /// copy it either, `prim_inet:accept_opts/3` re-applies it from the Erlang side, and the
-    /// driver's `INET_LOPT_ACTIVE` arm *adds* to the live counter (so a replay would double-arm).
+    /// ([`InetAsyncResult::Accepted`] hands the bare descriptor up), but the *copy itself* is the
+    /// driver's own: [`TcpInetDriver::from_accepted(fd, listener)`] adopts the descriptor and takes
+    /// the listener's option store (`SocketOptions::inherited_from`) plus the two cached socket tags
+    /// (`stype`/`family`) across in one call. So the **option store** half of `tcp_inet_copy` needs
+    /// nothing from this module — no record is retained for a replay and none is replayed.
     ///
-    /// A record the driver **rejects** during the replay means the new socket's option block
-    /// would silently disagree with the listener's, so the freshly adopted port is **closed**
-    /// (which releases the descriptor — nothing leaks) and the accept completes as
-    /// `{error, einval}`, the errno the driver itself answers for a bad option value.
+    /// Reaching that call is what [`beam_io::PortRegistry::driver_as`] exists for: a port owns its
+    /// driver as a `Box<dyn Driver>`, so the *listener's* `&TcpInetDriver` is recoverable only
+    /// through the read-only downcast ([`beam_io::Driver::downcast_ref`]). The downcast borrows the
+    /// registry **shared**; `from_accepted` is pure (no poller, no port table), so the driver is
+    /// built and the two copied latches are read while that borrow is held, and it ends before
+    /// [`PortRegistry::register`](super::PortRegistry) needs the registry exclusively.
+    ///
+    /// What the driver **cannot** carry across is the other half: the two fields that are this
+    /// runtime's mirror rather than the driver's option store. The C copies exactly those two —
+    /// `inet.mode` (`inet_drv.c:11811`) and `inet.exitf` (`:11812`) — so
+    /// [`PortRegistry::seed_inet_latches`] installs both on the new port. `inet.active` is
+    /// deliberately **not** copied: the C's copy list omits it (`:11814`-`:11844`), `inet_start`
+    /// resets it (`:10967`/`:10932`), and `prim_inet:accept_opts/3`
+    /// (`erts/preloaded/src/prim_inet.erl:502-517`) is what re-applies it from the Erlang side — the
+    /// accepted port therefore starts **passive**, exactly like the oracle's.
     ///
     /// # Reasons
     ///
-    /// A descriptor `beam_io` cannot describe as a socket answers `{error, ebadf}` — the errno
-    /// the kernel itself reports for a descriptor that is not one, and the only one available
-    /// here (the frozen [`beam_io::Driver`] constructor seam hands back a `BeamError`, not an
-    /// `errno`). A port table with no number left answers `{error, emfile}`, the C's own answer
-    /// to an `accept` on a node that cannot create another port. Neither is silent: the caller
-    /// sees the failure as the operation's result.
+    /// A descriptor the constructor refuses answers the **constructor's own** errno: `from_accepted`
+    /// reports the failing `getsockopt(2)`/`getpeername(2)` errno inside [`BeamError::Io`] and never
+    /// rewrites it, so a descriptor that is not a socket is `enotsock`, not a fabricated `ebadf`.
+    ///
+    /// The two shapes that carry **no** errno are the unreachable-but-honest ones, and both answer
+    /// `{error, closed}` — the C's own teardown reason (`async_error_am_all`,
+    /// `inet_reply_error_am(desc, am_closed)`), never an invented number:
+    ///
+    /// * the listener's driver is **not** a `tcp_inet` one, or its port is no longer live
+    ///   ([`beam_io::PortRegistry::driver_as`] answers `None`). Unreachable from `beam_io`'s accept
+    ///   path — [`InetAsyncResult::Accepted`] is staged **only** by `TcpInetDriver`
+    ///   (`beam_io/src/drivers/inet/accept.rs:345-384`), `UdpInetDriver` has no accept path, and the
+    ///   `INET_REQ_FDOPEN` prebound route (`adopt_prebound`) copies nothing and stages no accept
+    ///   completion (`inet_drv.c:5223`-`:5282`) — but a listener whose port has just been torn down
+    ///   would reach it, so it is a documented, tested, descriptor-releasing answer rather than an
+    ///   `unwrap`;
+    /// * a constructor failure that is not an [`BeamError::Io`] (nothing in today's
+    ///   `from_accepted`/`from_socket` produces one) — same route, for the same reason: no errno is
+    ///   fabricated to fill the gap.
+    ///
+    /// A port table with no number left answers `{error, emfile}` — `beam_io`'s `open` has already
+    /// torn the driver (and with it the descriptor) down, so nothing leaks there either.
+    ///
+    /// [`TcpInetDriver::from_accepted(fd, listener)`]: beam_io::TcpInetDriver::from_accepted
     fn adopt_accepted(
         &mut self,
         listener: PortId,
@@ -291,15 +317,20 @@ impl PortRegistry {
         stream: StreamType,
         line: Option<usize>,
     ) -> InetAsyncResult {
-        // The listener's *driver* mode, resolved before the registry is borrowed for the
-        // registration: `data_mode` falls back to the port stream option (which `prim_inet`
-        // always opens `[binary]`) when no `{mode, …}` record was ever seen.
-        let mode = self.data_mode(listener, stream);
-        let driver = match TcpInetDriver::from_socket(fd) {
-            Ok(driver) => driver,
-            Err(_) => {
-                discard_descriptor(fd);
-                return InetAsyncResult::Error(InetReason::from_errno(libc::EBADF));
+        // The listener's driver, its *data* mode and its `exit_on_close` latch — all read under one
+        // **shared** borrow of the registry, which ends here. `data_mode` falls back to the port
+        // stream option (which `prim_inet` always opens `[binary]`) when no `{mode, …}` record was
+        // ever seen; `inet_exit_on_close` falls back to the C's `exitf = 1`
+        // (`inet_drv.c:10929`).
+        let (mode, exit_on_close, driver) = {
+            let Some(listener_driver) = self.registry.driver_as::<TcpInetDriver>(listener) else {
+                return refuse_accepted(fd);
+            };
+            let mode = self.data_mode(listener, stream);
+            let exit_on_close = self.inet_exit_on_close(listener);
+            match TcpInetDriver::from_accepted(fd, listener_driver) {
+                Ok(driver) => (mode, exit_on_close, driver),
+                Err(error) => return refuse_accepted_error(fd, &error),
             }
         };
         let driver_has_control = driver.has_control();
@@ -333,40 +364,73 @@ impl PortRegistry {
         // which closes the descriptor — so this path leaks nothing either.
         match self.register(Box::new(driver), meta) {
             Ok(port) => {
-                self.seed_inet_mode(port, mode);
-                match self.inherit_inet_options(listener, port) {
-                    Ok(()) => InetAsyncResult::Port(port),
-                    Err(_) => {
-                        // A half-configured socket is worse than no socket: the inherited block
-                        // is what makes the accepted socket agree with its listener, so a
-                        // rejected record tears the new port down (its `close` runs the driver's
-                        // own teardown, which closes the descriptor) instead of leaving the
-                        // Erlang side with a socket that silently differs.
-                        let _ = self.close(port);
-                        InetAsyncResult::Error(InetReason::from_errno(libc::EINVAL))
-                    }
-                }
+                // The two latches the *driver* cannot carry across, because they are this
+                // runtime's mirror and not its option store: the C's `inet.mode`
+                // (`inet_drv.c:11811`) and `inet.exitf` (`:11812`). `inet.active` is deliberately
+                // absent from the C's copy list (`:11814`-`:11844`), so the accepted port starts
+                // passive.
+                self.seed_inet_latches(port, mode, exit_on_close);
+                InetAsyncResult::Port(port)
             }
             Err(_) => InetAsyncResult::Error(InetReason::from_errno(libc::EMFILE)),
         }
     }
 }
 
-/// Releases `fd`, discarding the outcome.
+/// Refuses an accepted descriptor for a reason that carries **no** errno, releasing it.
 ///
-/// This crate denies `unsafe_code`, so it cannot call `close(2)` itself; `beam_io`'s own
-/// descriptor-owning driver is the safe way to hand a raw descriptor over. `FdDriver::read_only`
-/// adopts it without duplicating it and closes it when dropped (its `close_fds` runs from
-/// `stop` and from `Drop`), and it touches no syscall in between — `Driver::start` is what puts
-/// the descriptor in non-blocking mode, and it is never started here.
-///
-/// Used on the two paths where an accepted descriptor cannot become a port. Both are unreachable
-/// for a descriptor `accept(2)` just produced, but a leaked descriptor is worse than a dropped
-/// one, so neither is left to chance.
-fn discard_descriptor(fd: RawFd) {
-    drop(FdDriver::read_only(fd));
+/// The answer is `{error, closed}` — the C's own teardown reason
+/// (`inet_reply_error_am(desc, am_closed)`, `inet_drv.c:12690`) — never an invented `ebadf`/`einval`
+/// (`InetReason::Closed`'s atom). Two shapes reach it, both documented on
+/// [`PortRegistry::adopt_accepted`]: a listener [`beam_io::PortRegistry::driver_as`] cannot resolve
+/// to a `TcpInetDriver`, and a constructor failure that carries no errno. Neither is reachable from
+/// `beam_io`'s accept path; both are truthful and neither leaks.
+fn refuse_accepted(fd: RawFd) -> InetAsyncResult {
+    discard_descriptor(fd);
+    InetAsyncResult::Error(InetReason::Closed)
 }
 
+/// Refuses an accepted descriptor a constructor **failure** produced, releasing it.
+///
+/// The errno is the constructor's own, read back from the error rather than defaulted:
+/// [`TcpInetDriver::from_accepted`] answers the failing `getsockopt(2)`/`getpeername(2)` errno
+/// inside [`BeamError::Io`] (`beam_io/src/drivers/inet/mod.rs:833-846`), so a descriptor that is
+/// not a socket is `enotsock` — the kernel's own answer, which is what the oracle would report for
+/// the same descriptor. A failure carrying no errno takes [`refuse_accepted`]'s route instead of
+/// borrowing one.
+///
+/// The descriptor is still the caller's on **every** `Err`: `from_socket` evaluates
+/// `is_listening`/`has_peer` *before* the struct literal whose `Drop` closes the socket, so a
+/// partial `TcpInetDriver` never exists and never closes anything
+/// (`beam_io/src/drivers/inet/mod.rs:918-920`).
+fn refuse_accepted_error(fd: RawFd, error: &BeamError) -> InetAsyncResult {
+    match error {
+        BeamError::Io(io) => match io.raw_os_error() {
+            Some(errno) => {
+                discard_descriptor(fd);
+                InetAsyncResult::Error(InetReason::from_errno(errno))
+            }
+            None => refuse_accepted(fd),
+        },
+        _ => refuse_accepted(fd),
+    }
+}
+
+/// Releases `fd`, discarding the outcome.
+///
+/// This crate denies `unsafe_code`, so it cannot call `close(2)` itself: [`beam_io::close_fd`] is
+/// `beam_io`'s public, errno-preserving close primitive, written for exactly this hand-off (its
+/// module docs name [`InetAsyncResult::Accepted`] as the caller). The outcome is dropped
+/// deliberately — the descriptor is released whatever `close(2)` answers, so a failure leaves the
+/// caller with nothing better to do than carry on with the refusal it is already reporting (and a
+/// destructor-like helper must not panic).
+///
+/// Used on every path where an accepted descriptor cannot become a port: the listener's driver is
+/// not a `tcp_inet` one, the constructor refused the descriptor, or a descriptor arrived with no
+/// recipient at all. Each arm is documented where it is taken, and every one releases.
+fn discard_descriptor(fd: RawFd) {
+    let _ = beam_io::close_fd(fd);
+}
 impl RuntimeContext<'_> {
     /// The message one [`CompletionPacket`] delivers to its owner.
     ///
@@ -544,9 +608,11 @@ pub(super) fn terms_tuple(
 
 
 /// The A.4 **accepted-socket option inheritance** suite: a real loopback `accept(2)` whose
-/// descriptor [`PortRegistry::adopt_accepted`] registers, the replayed `tcp_inet_copy` block read
-/// back through the driver's own `getopts`/framed `send`, the negative `setopts` rows, and the
-/// replay-failure rule (`{error, einval}` + nothing leaked) — see
+/// descriptor [`PortRegistry::adopt_accepted`] adopts through
+/// [`TcpInetDriver::from_accepted`](beam_io::TcpInetDriver::from_accepted), the inherited
+/// `tcp_inet_copy` block read back through the driver's own `getopts`/framed `send`, the two copied
+/// latches, the negative `setopts` rows, and the two descriptor-releasing refusals (a constructor
+/// failure's own errno, and the no-listener-driver arm) — see
 /// `src/port/accept_inherit_tests.rs`. A separate file so the wire vocabulary it spells does not
 /// grow this one.
 #[cfg(test)]

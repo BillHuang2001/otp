@@ -188,10 +188,9 @@ t1() ->
     ok.
 
 %% `{active, 2}`: two deliveries, exactly one `{tcp_passive, S}` at exhaustion, then silence until
-%% a re-arm. Nothing is written during the passive window on purpose: this runtime harvests those
-%% bytes out of the socket when it emits `{tcp_passive, S}` (they are never delivered, measured),
-%% while the oracle buffers them and hands them over after the next re-arm — a recorded fidelity
-%% difference this case deliberately does not depend on (`tests/inet_active.rs` module docs).
+%% a re-arm. Nothing is written during the passive window: the withheld-write shape (a write under a
+%% spent grant, handed over by the re-arm) is `t3`'s case, and keeping `t2` free of it leaves the
+%% counter's own passive message the only thing this case pins.
 t2() ->
     {L, C, A} = tcp_pair(),
     ok = setopts(A, [opt(?LOPT_MODE, ?MODE_BINARY), opt(?LOPT_ACTIVE, ?ACTIVE_MULTI, 2)]),
@@ -210,8 +209,9 @@ t2() ->
     erlang:port_close(A), erlang:port_close(C), erlang:port_close(L),
     ok.
 
-%% `{active, once}`: one delivery, silence for a write made while the grant is spent, then the
-%% re-arm's own delivery and silence again.
+%% `{active, once}`: the write under the grant is delivered, a write made while the grant is spent is
+%% withheld in the socket, the re-arm hands THAT write over (`bbbb`, never the fresh `cccc` written
+%% after it) and spends its own grant on it, and the next re-arm delivers `cccc`.
 t3() ->
     {L, C, A} = tcp_pair(),
     ok = setopts(A, [opt(?LOPT_MODE, ?MODE_BINARY), opt(?LOPT_ACTIVE, ?ACTIVE_ONCE)]),
@@ -221,10 +221,12 @@ t3() ->
     ok = send_data(C, <<"bbbb">>),
     io:format("t3_silent=~w~n", [norm(wait_socket(500))]),
     ok = setopts(A, [opt(?LOPT_ACTIVE, ?ACTIVE_ONCE)]),
-    ok = send_data(C, <<"bbbb">>),
+    ok = send_data(C, <<"cccc">>),
     M3 = wait_socket(5000),
     io:format("t3_second=~w~n", [norm(M3)]),
     io:format("t3_silent_again=~w~n", [norm(wait_socket(500))]),
+    ok = setopts(A, [opt(?LOPT_ACTIVE, ?ACTIVE_ONCE)]),
+    io:format("t3_third=~w~n", [norm(wait_socket(5000))]),
     erlang:port_close(A), erlang:port_close(C), erlang:port_close(L),
     ok.
 

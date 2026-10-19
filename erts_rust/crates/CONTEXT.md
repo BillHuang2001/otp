@@ -109,7 +109,7 @@ This is the frozen public-API shape dependents design against; keep it stable.
   ways and both must be served: as a local `call`, and as a local `make_fun3` closure (`zlib.erl`
   stores `fun deflate_nif/4` in a `#zlib_opts{}` record), which `beam_rt::context::apply` declines
   through the same predicate and dispatches via `call_bif`.
-- `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam).
+- `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam); plus the two additive seams a host needs to *reach* a built-in driver: `pub trait Driver: core::any::Any` with the one downcast path `dyn Driver::downcast_ref::<T>()` (safe, no `unsafe` fat-pointer work), surfaced as `Port::driver_as`/`PortRegistry::driver_as` — what lets `beam_rt` recover the concrete `TcpInetDriver` a port boxes and call `TcpInetDriver::from_accepted(fd, listener)` (the C's `tcp_inet_copy`) instead of replaying the option block — and `ControlReplyShape` (`Null`/`Buffer`) with `Driver::control_reply_shape`/`PortRegistry::port_control_reply`/`control_reply_shape`, because the C's `*rbuf == NULL` is `[]` for **every** flag word (`io.c:4134`, before the `PORT_CONTROL_FLAG_BINARY` split).
 - `beam_rt` → the runtime **binary**: boot sequence, CLI flags, `system_info`, and the concrete
   `ExecutionContext` wiring engine + bifs + process — including the `Mailbox` receive seam over the
   process mailbox, a single-threaded `ProcessRunner`/scheduler loop, and the `beam_bifs::PortHook`
@@ -552,14 +552,15 @@ in-process compiler route.
 
 ## Known Structural Debt (candidates for the next pass)
 - **A.4 port/driver residuals, each a typed error rather than a wrong result.**
-  (a) A `driver_output2`/`driver_output_binary` **DATA** reply's improper list (`[hdr|<<body>>]`) cannot
-  be rendered because `beam_io`'s stream layer flattens the header/body split producer-side
-  (`DriverContext::input()` is a flat `ByteQueue`; `PortNotification::Data` carries one `Vec<u8>`); the
-  seam needed is `(hbuf, hlen, buf, len)` on that notification, after which `beam_rt` routes it into its
-  existing `StreamShape` builder. Bytes and both counters already agree.
-  (b) The `PACKET_REQ_RECV`/`TCP_REQ_RECV`/`ACCEPT` **async-op queue** (`INET_MAX_ASYNC`,
-  `{inet_async, Port, Ref, Result}` delivery) needs a driver→owner message channel the frozen `Driver`
-  trait lacks, so `recv` is a synchronous read-now substitution.
+  (a) A **header-less** read of a built-in driver port — `tcp_inet`'s and `udp_inet`'s passive `recv`,
+  still on `beam_io`'s flat `DriverContext::input()` sink — arrives as list elements where the C answers
+  a binary on a `[binary]` port; every read that carries the C's `(hbuf, hlen, buf, len)` split does
+  render it (`PortNotification::Data` carries `ReadMessage { header, body: Option<Vec<u8>> }`, one
+  notification = one `driver_output*` call, so `[hdr|<<body>>]` reaches a `[binary]` owner and flat bytes
+  a `[list]` one). A line frame's derived header prefix also stays out of the input counters
+  (`io.c:6403`).
+  (b) A **raw-mode read of nothing** (`driver_output(NULL,0)`) is dropped where the oracle delivers
+  `{Port,{data,[]}}` — a proper empty list even on a `[binary]` port.
   (c) `INET_REQ_FDOPEN`'s adoption form (the C's `prebound` descriptor is never closed, while this
   floor's `stop`/`Drop` closes everything it owns), `ignorefd` (needs readiness suppression) and
   `tcp_sendfile` reproduce their refusals only.

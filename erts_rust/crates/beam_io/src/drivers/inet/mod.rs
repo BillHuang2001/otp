@@ -256,7 +256,7 @@ use std::time::Instant;
 use beam_common::Result;
 
 use crate::completion::InetReason;
-use crate::driver::{Driver, DriverContext};
+use crate::driver::{Driver, DriverContext, DriverFlags};
 use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
@@ -2305,6 +2305,20 @@ impl Driver for TcpInetDriver {
         DRIVER_NAME
     }
 
+    /// `ERL_DRV_FLAG_SOFT_BUSY` in the C's `tcp_inet` entry — together with
+    /// `ERL_DRV_FLAG_USE_PORT_LOCKING`, the entry's whole flag word (`inet_drv.c:1374`).
+    ///
+    /// It is the driver's answer to `erlang:port_command(Port, Data, [force])`: the BIF refuses
+    /// that option with `error:notsup` for any driver whose entry lacks the bit
+    /// (`erl_bif_port.c:195-198`), and with it the C clears its busy mask entirely
+    /// (`busy_flgs = 0` under `ERTS_PORT_SIG_FLG_FORCE`, `io.c:1731`), so a forced command is
+    /// never the busy arm. The measured oracle (`tcp_inet` vs its siblings):
+    /// `open_port({spawn_driver,"tcp_inet"},[])` + `port_command(P, <<"abc">>, [force])` answers
+    /// `true`, while the same call on a `"udp_inet"` or a `"ram_file_drv"` port raises `notsup`.
+    /// Pinned by `soft_busy_tests.rs`.
+    fn flags(&self) -> DriverFlags {
+        DriverFlags::SOFT_BUSY
+    }
     fn start(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         // A socket-less port (the `"tcp_inet"` factory) registers nothing here: its socket is
         // created by the `open` verb, exactly as the C's `tcp_inet_start` leaves the socket
@@ -2486,6 +2500,9 @@ mod open_reply_tests;
 #[cfg(test)]
 #[path = "peer_close_tests.rs"]
 mod peer_close_tests;
+#[cfg(test)]
+#[path = "soft_busy_tests.rs"]
+mod soft_busy_tests;
 #[cfg(test)]
 mod stat_tests;
 #[cfg(test)]

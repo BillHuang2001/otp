@@ -25,12 +25,12 @@
 //!
 //! # Why a matrix, and why a whole *session*
 //!
-//! `ram_file_drv` is the built-in driver whose reply path had no coverage before the fix this
-//! suite guards: its replies are harvested by the port-task round the write itself runs
-//! ([`PortRegistry::write_command`]), so the defect was a **lost reply** rather than a wrong one —
-//! the owner's `receive` timed out and `port_info(Port, input)` stayed `0`. A per-opcode unit test
-//! would not have caught it (every opcode's encoding was right); what catches it is driving the
-//! *same* sequence under both runtimes and comparing what the owner actually received.
+//! `ram_file_drv` is a built-in driver, so its replies are harvested by the port-task round the
+//! write itself runs ([`PortRegistry::write_command`]) rather than by a poller wakeup: a reply that
+//! round drops is a **lost reply**, and the owner's `receive` times out while
+//! `port_info(Port, input)` stays `0`. A per-opcode unit test would not catch that (every opcode's
+//! encoding can be right); what catches it is driving the *same* sequence under both runtimes and
+//! comparing what the owner actually received.
 //!
 //! Each test therefore runs one grouped session expression per side and compares the whole
 //! rendered session (one `~w` line per row, the way `frames_w` compares a frame sequence), plus
@@ -62,14 +62,12 @@
 //! # Honest scope
 //!
 //! Nothing here fabricates a reply or papers a difference over: a row that disagrees with the
-//! oracle fails on the session string (with the oracle's live output in the failure message). The
-//! `[binary]` stream's *term shape* is pinned per reply kind by its own test, which also pins the
-//! runtime's **builder** reproducing every shape and the runtime's **end-to-end** delivery of the
-//! header lists; the one thing it cannot reach — a `DATA` reply's binary tail, which `beam_io`
-//! folds away producer-side — is named loudly there and pinned by
-//! [`super::driver_output_shape_tests`].
+//! oracle fails on the session string (with the oracle's live output in the failure message).
+//! The `[binary]` stream's *term shape* is pinned per reply kind by its own test, which also pins
+//! the runtime's **builder** reproducing every shape and the runtime's **end-to-end** delivery of
+//! the whole session — header lists and the split `DATA` tail alike.
 use super::tests::{
-    counter, data_payload_bytes, erl_bytes, fixture, skip_oracle_check, text_of, Fixture,
+    counter, data_payload, erl_bytes, fixture, skip_oracle_check, text_of, Fixture, PayloadShape,
 };
 use super::*;
 use crate::config::RuntimeConfig;
@@ -236,13 +234,27 @@ const BINARY_SESSION: &[Row] = &[
     Row { name: "get", command: GET },
 ];
 
+/// That session as the oracle renders it on a `[binary]` port, one `~w` line per row plus the
+/// closing counter line (erts-17.1, and [`BINARY_SESSION`]'s own bytes).
+///
+/// A `DATA` reply is the **improper** `[header|<<data>>]` the C's `driver_output_binary` renders;
+/// every other reply is a proper header list, because `rfile_command` answers `OK`/`NUMBER`/`ERROR`
+/// through `driver_output2(hbuf, len, NULL, 0)` — a header with no data part at all.
+const BINARY_SESSION_GOLDEN: &str = "{open_fresh,[3,0,0,0,0],5,8}\n\
+     {read_data,[2,0,0,0,2|<<97,98>>],12,13}\n\
+     {size,[3,0,0,0,3],17,14}\n\
+     {truncate_seek,[3,0,0,0,1],22,23}\n\
+     {truncate,[0],23,24}\n\
+     {get,[2,0,0,0,1|<<97>>],29,25}\n\
+     {final,29,25}";
+
 /// A live runtime with a `{spawn_driver, "ram_file_drv"}` port opened on the runtime's **own**
 /// registry, so the reply the driver writes during the write's task round is the very one
-/// [`RuntimeContext::poll_port_messages`] (the `-eval` route's port half) reports — the path the
-/// defect starved.
+/// [`RuntimeContext::poll_port_messages`] (the `-eval` route's port half) reports.
 ///
 /// The session rendering it accumulates is what gets compared: `lines` holds one
-/// `{row, Reply, Input, Output}` per row plus the closing `{final, Input, Output}`.
+/// `{row, Reply, Input, Output}` per row plus the closing `{final, Input, Output}`, where `Reply`
+/// is the payload's **actual** `~w` rendering (see [`Matrix::render`]).
 struct Matrix {
     runtime: Runtime,
     fx: Fixture,
@@ -250,12 +262,22 @@ struct Matrix {
     port: PortId,
     stream: Stream,
     lines: Vec<String>,
-    replies: HashMap<&'static str, Vec<i64>>,
-    /// Whether a row's payload arrived as a **binary** rather than a char list.
-    binary_payloads: HashMap<&'static str, bool>,
+    rows: HashMap<&'static str, RowRecord>,
     /// The running totals: Σ delivered reply bytes and Σ `port_command` payload bytes.
     input: i64,
     output: i64,
+}
+
+/// One row's received payload, as the owner actually got it.
+struct RowRecord {
+    /// The payload's byte values, flattened out of whichever [`PayloadShape`] it arrived in.
+    bytes: Vec<i64>,
+    /// The shape the payload arrived in — the producing `driver_output*` call's, per
+    /// [`PayloadShape`].
+    shape: PayloadShape,
+    /// The payload's `~w` rendering by the runtime's own printer ([`Runtime::format_term_w`]),
+    /// which is what the session line prints.
+    rendered: String,
 }
 
 impl Matrix {
@@ -282,8 +304,7 @@ impl Matrix {
             port,
             stream,
             lines: Vec::new(),
-            replies: HashMap::new(),
-            binary_payloads: HashMap::new(),
+            rows: HashMap::new(),
             input: 0,
             output: 0,
         }
@@ -301,6 +322,8 @@ impl Matrix {
     /// The reply is taken through the runtime's poll route and its byte count is charged to
     /// `port_info(Port, input)` — asserted per row against the running total, so a lost or doubled
     /// reply fails here rather than being masked by the session's own sum.
+    /// The session line prints the payload's **actual** rendering ([`Matrix::render`]), so the
+    /// comparison with the oracle covers the term's shape and not only its bytes.
     fn step(&mut self, row: &Row) {
         self.runtime
             .ports
@@ -312,15 +335,17 @@ impl Matrix {
                     row.name, row.command
                 )
             });
-        let reply = self.take_reply(row.name);
-        self.input += i64::try_from(reply.len()).expect("a reply length fits an i64");
+        let message = self.take_reply(row.name);
+        let (bytes, shape) = data_payload(message);
+        let rendered = self.render(data_payload_term(message));
+        self.input += i64::try_from(bytes.len()).expect("a reply length fits an i64");
         self.output += i64::try_from(row.command.len()).expect("a command length fits an i64");
         assert_eq!(
             counter(&mut self.fx, &mut self.hook, self.port, "input"),
             self.input,
             "row {:?}: `port_info(Port, input)` must count the {} reply bytes exactly once",
             row.name,
-            reply.len()
+            bytes.len()
         );
         assert_eq!(
             counter(&mut self.fx, &mut self.hook, self.port, "output"),
@@ -329,16 +354,20 @@ impl Matrix {
             row.name,
             row.command.len()
         );
-        self.lines
-            .push(row_w(row.name, &reply, self.input, self.output));
-        self.replies.insert(row.name, reply);
+        self.lines.push(format!(
+            "{{{},{rendered},{},{}}}",
+            row.name, self.input, self.output
+        ));
+        self.rows
+            .insert(row.name, RowRecord { bytes, shape, rendered });
     }
 
-    /// Polls the runtime's own poller until `name`'s reply arrives, returning its byte values.
+    /// Polls the runtime's own poller until `name`'s reply arrives, returning the whole
+    /// `{Port, {data, Payload}}` message.
     ///
-    /// The message must be `{Port, {data, Payload}}` from **this** port, and there must be exactly
-    /// one: one command is one reply, so a second message — or a foreign port's — fails the row.
-    fn take_reply(&mut self, name: &'static str) -> Vec<i64> {
+    /// The message must come from **this** port and there must be exactly one: one command is one
+    /// reply, so a second message — or a foreign port's — fails the row.
+    fn take_reply(&mut self, name: &'static str) -> Eterm {
         let data_atom = make_atom(self.runtime.code_server_atoms_mut().intern("data"));
         let deadline = Instant::now() + RECEIVE_BOUND;
         let mut messages = Vec::new();
@@ -372,9 +401,17 @@ impl Matrix {
             data_atom,
             "row {name:?}: the message is `{{Port, {{data, Payload}}}}`"
         );
-        let (bytes, binary) = reply_payload(message);
-        self.binary_payloads.insert(name, binary);
-        bytes
+        message
+    }
+
+    /// `term` as the registered `~w` printer renders it — the oracle's own control, so a session
+    /// line's payload text is comparable with the oracle's character for character.
+    fn render(&mut self, term: Eterm) -> String {
+        self.runtime
+            .format_term_w(term, None)
+            .unwrap_or_else(|error| panic!("the `~w` printer refused a port payload: {error}"))
+            .trim_end_matches('\n')
+            .to_string()
     }
 
     /// The `port_info/1` value of `item`, read through the session's **own** hook.
@@ -406,23 +443,40 @@ impl Matrix {
             .push(format!("{{final,{},{}}}", self.input, self.output));
     }
 
-    /// A row's captured reply.
+    /// A row's captured reply, as byte values flattened out of its [`PayloadShape`].
     fn reply(&self, name: &str) -> Vec<i64> {
-        self.replies
-            .get(name)
-            .unwrap_or_else(|| panic!("no {name:?} row in this session"))
-            .clone()
+        self.record(name).bytes.clone()
     }
 
-    /// Whether a row's payload arrived as a **binary** (the `[binary]` stream) rather than a char
-    /// list (the default `list` stream).
-    fn reply_is_binary(&self, name: &str) -> bool {
-        *self
-            .binary_payloads
+    /// A row's captured reply, as the `~w` printer rendered it.
+    fn rendered(&self, name: &str) -> &str {
+        &self.record(name).rendered
+    }
+
+    /// The [`PayloadShape`] a row's payload arrived in.
+    fn shape(&self, name: &str) -> PayloadShape {
+        self.record(name).shape
+    }
+
+    /// A row's record, or a loud failure naming the session it is missing from.
+    fn record(&self, name: &str) -> &RowRecord {
+        self.rows
             .get(name)
             .unwrap_or_else(|| panic!("no {name:?} row in this session"))
     }
 
+    /// Asserts every row of `rows` arrived as the flat proper char list the `list` stream produces
+    /// (`PayloadShape::ProperList`) — one byte per element, the header/body split invisible.
+    fn assert_every_row_is_a_proper_list(&self, rows: &[Row]) {
+        for row in rows {
+            assert_eq!(
+                self.shape(row.name),
+                PayloadShape::ProperList,
+                "row {:?}: the default `list` stream renders every reply byte as a list element",
+                row.name
+            );
+        }
+    }
     /// The whole rendered session, one line per row.
     fn session(&self) -> String {
         self.lines.join("\n")
@@ -449,23 +503,14 @@ impl Matrix {
     }
 }
 
-/// A `{Port, {data, Payload}}` message's payload as byte values, and whether it arrived as a
-/// **binary**.
+/// The `Data` payload term of a `{Port, {data, Data}}` message.
 ///
-/// The default (`list`) stream shapes the payload as a char list (the oracle's own
-/// `{data,[3,0,0,0,0]}`) and a `[binary]` port as a binary; both are read here, so one session
-/// runner covers both streams.
-fn reply_payload(message: Eterm) -> (Vec<i64>, bool) {
+/// [`data_payload`] reads the same slot as bytes and shape; the term itself is what the session
+/// renders through the `~w` printer.
+fn data_payload_term(message: Eterm) -> Eterm {
     let inner = terms::tuple_element(message, 1).expect("the `{data, Payload}` pair");
-    let payload = terms::tuple_element(inner, 1).expect("the payload");
-    match terms::binary_bytes(payload) {
-        Ok(bytes) => (bytes.iter().map(|byte| i64::from(*byte)).collect(), true),
-        // `data_payload_bytes` re-reads the same payload as the char list it must then be, and
-        // fails loudly if it is neither shape.
-        Err(_) => (data_payload_bytes(message), false),
-    }
+    terms::tuple_element(inner, 1).expect("the payload")
 }
-
 /// Runs `expr` under the host `erl` and returns its trimmed stdout.
 ///
 /// [`erl_eval`] answers `None` for **any** non-success, which cannot tell "there is no toolchain
@@ -492,11 +537,6 @@ pub(super) fn oracle_output(expr: &str) -> Option<String> {
             Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
     }
-}
-
-/// A row rendered the way the oracle's `~w` prints it: `{row, [Reply], Input, Output}`.
-fn row_w(name: &str, reply: &[i64], input: i64, output: i64) -> String {
-    format!("{{{name},{},{input},{output}}}", erl_bytes(reply))
 }
 
 /// The `Data` payload [`RuntimeContext::port_data_message_shaped`] builds for `read` on `stream`
@@ -554,8 +594,8 @@ fn ascii_bytes(text: &str) -> Vec<i64> {
 }
 
 /// The oracle expression for a whole session: open `ram_file_drv` with `options`, send every `row`
-/// in order, and print one `{row, Reply, Input, Output}` line per row — the shape [`row_w`]
-/// renders on this side — then `tail` (if any) and the closing counter line.
+/// in order, and print one `{row, Reply, Input, Output}` line per row — the shape
+/// [`Matrix::step`] renders on this side — then `tail` (if any) and the closing counter line.
 ///
 /// `receive … after 2000 -> timeout end` is the oracle's own bound: a reply that never arrives
 /// prints `timeout` in that row's place, so the comparison fails on that row instead of hanging.
@@ -644,12 +684,9 @@ fn the_ram_file_driver_matrix_matches_the_oracle() {
         vec![2, 0, 0, 0, 6, 97, 98, 0, 0, 0, 0],
         "truncating past the end extends with zeros — the dropped `c`/`X`/`Y` do not come back"
     );
-    // The default stream is a char list — the oracle's own `{data,[3,0,0,0,0]}` shape.
-    assert!(
-        !session.reply_is_binary("open_fresh"),
-        "the default (list) stream delivers the reply as a char list"
-    );
-
+    // The default stream is a flat proper char list — the oracle's own `{data,[3,0,0,0,0]}` shape,
+    // with the driver's header/body split invisible.
+    session.assert_every_row_is_a_proper_list(MAIN_SESSION);
     session.assert_session_matches_the_oracle(
         MAIN_SESSION,
         "",
@@ -719,6 +756,9 @@ fn the_ram_file_driver_positional_matrix_matches_the_oracle() {
         );
     }
 
+    // Every row of a default-stream session is the flat proper char list, so the driver's
+    // header/body split never changes the term the owner sees.
+    session.assert_every_row_is_a_proper_list(EXTENDED_SESSION);
     session.assert_session_matches_the_oracle(
         EXTENDED_SESSION,
         "",
@@ -771,6 +811,7 @@ fn the_ram_file_driver_refusal_matrix_matches_the_oracle() {
         "TRUNCATE's gate is the WRITE mode bit, so an unopened port answers ERROR eacces"
     );
 
+    session.assert_every_row_is_a_proper_list(REFUSAL_SESSION);
     session.assert_session_matches_the_oracle(
         REFUSAL_SESSION,
         NAME_TAIL,
@@ -788,9 +829,8 @@ fn closing_a_ram_file_port_refuses_later_commands_like_the_oracle() {
         name: "reply",
         command: OPEN_ABC,
     });
-    let reply = session.reply("reply");
+    let reply = session.rendered("reply").to_string();
     let (input, output) = (session.input, session.output);
-
     session
         .hook
         .close_port(session.port)
@@ -815,8 +855,10 @@ fn closing_a_ram_file_port_refuses_later_commands_like_the_oracle() {
 
     // The four facts in the oracle's own shape, compared with the oracle's own output.
     let rendered = format!(
-        "{}\n{{close,true}}\n{{info_after_close,undefined}}\n{{command_after_close,badarg}}",
-        row_w("reply", &reply, input, output)
+        "{{reply,{reply},{input},{output}}}\n\
+         {{close,true}}\n\
+         {{info_after_close,undefined}}\n\
+         {{command_after_close,badarg}}"
     );
     let expr = "begin \
                 P = open_port({spawn_driver,\"ram_file_drv\"},[]), \
@@ -860,23 +902,20 @@ fn closing_a_ram_file_port_refuses_later_commands_like_the_oracle() {
 /// received, shaped by the driver call that produced them, and rendered by the registered `~w`
 /// printer (the oracle's own control).
 ///
-/// # End to end: the header lists, and the one residual
+/// # End to end
 ///
-/// A **built-in driver port** reports [`StreamShape::DriverOutput`] when it hands its bytes up
-/// through a flat byte queue, and that shape renders a header-less read as list elements on
-/// **either** stream — the C's header rendering — so a `[binary]` port's header-only replies
-/// (`OK`/`NUMBER`/`ERROR`) arrive as the oracle's proper lists. Every row is therefore asserted
-/// **non-binary** below.
-///
-/// The one row this delivery path cannot render as the oracle does is `DATA`: the oracle's
-/// `driver_output_binary` renders `[2,0,0,0,2|<<97,98>>]`, while this runtime's in-tree
-/// `ram_file_drv` pushes its reply through [`beam_io::DriverContext::input`] — a flat queue with no
-/// split — so the reply arrives as one header-less read and is delivered as a proper list. Bytes and
-/// both `port_info` counters are exact; the term shape is the documented residual, and the builder
-/// side of it (given a read that *does* carry the split) is asserted below and in
-/// [`super::stream_shape_tests`]. [`super::driver_output_shape_tests`] pins the end-to-end matrix and
-/// names that residual loudly; closing it is a `beam_io` change (this node's `CONTEXT.md`,
-/// *Handoffs*), not something this test may paper over.
+/// A **built-in driver port** reports [`StreamShape::DriverOutput`], which renders a
+/// **header-less** read as list elements on **either** stream — the C's header rendering — and
+/// leaves a read that carries a header to its own split.
+/// `beam_io`'s in-tree `ram_file` driver hands every reply up as one read carrying the C's
+/// header/body split (`driver_output2(hbuf, len, NULL, 0)` for `OK`/`NUMBER`/`ERROR`,
+/// `ram_file_drv.c:181-230`; `driver_output_binary(hdr, 5, bin, n)` for `DATA`, `:448-489`), so a
+/// `NUMBER`/`OK`/`ERROR` reply arrives as a header with **no** body and renders the oracle's proper
+/// list, and a `DATA` reply — empty or not — arrives as a five-byte header plus a body and renders
+/// the oracle's improper `[hdr|<<data>>]`.
+/// The whole `[binary]` session is asserted against the measured text below, per-row shape and both
+/// `port_info` counters included, and the **builder** half feeds
+/// [`RuntimeContext::port_data_message_shaped`] the same reads directly.
 #[test]
 fn a_binary_stream_port_delivers_the_oracles_header_lists() {
     let mut session = Matrix::new(Stream::Binary);
@@ -891,37 +930,46 @@ fn a_binary_stream_port_delivers_the_oracles_header_lists() {
         vec![2, 0, 0, 0, 1, 97],
         "GET after the truncate to 1 byte"
     );
-    // … and on a `[binary]` port every row is a **list**, not a binary: a built-in driver port
-    // reports `StreamShape::DriverOutput`, which renders the driver's bytes as list elements on
-    // either stream (the C's header rendering).
-    for row in BINARY_SESSION {
-        assert!(
-            !session.reply_is_binary(row.name),
-            "row {:?}: a `[binary]` built-in-driver port must deliver list elements, not one binary",
-            row.name
+    // … and each reply's term shape is the producing `driver_output*` call's: a header-only reply
+    // is a proper header list, a `DATA` reply the improper `[header|<<data>>]` with a five-byte
+    // header. Neither is ever a bare binary — no reply here is header-less.
+    let row_shapes = [
+        ("open_fresh", PayloadShape::ProperList),
+        ("read_data", PayloadShape::ImproperList { header_len: 5 }),
+        ("size", PayloadShape::ProperList),
+        ("truncate_seek", PayloadShape::ProperList),
+        ("truncate", PayloadShape::ProperList),
+        ("get", PayloadShape::ImproperList { header_len: 5 }),
+    ];
+    for (name, shape) in row_shapes {
+        assert_eq!(
+            session.shape(name),
+            shape,
+            "row {name:?}: a `[binary]` port renders the reply's own header/body split"
         );
     }
-    // … and the counters count the same bytes the oracle counts.
+    // … and the counters count the same bytes the oracle counts, header and body alike.
     assert_eq!(session.input, 5 + 7 + 5 + 5 + 1 + 6);
     assert_eq!(session.output, 8 + 5 + 1 + 9 + 1 + 1);
 
     // The measured matrix, whole session: the oracle's own rendering of these opcodes on a
-    // `[binary]` port, counters included. A toolchain-less host is a loud skip, never a pass.
+    // `[binary]` port, counters included. The golden is unconditional — it is a measurement, not a
+    // toolchain probe.
+    assert_eq!(
+        session.session(),
+        BINARY_SESSION_GOLDEN,
+        "the `[binary]` stream's measured reply shapes (erts-17.1)"
+    );
+    // …and the live oracle, where there is one, prints exactly that. A toolchain-less host is a
+    // loud skip, never a pass.
     match oracle_output(&oracle_session_expr("[binary]", BINARY_SESSION, "")) {
         Some(oracle) => assert_eq!(
             oracle,
-            "{open_fresh,[3,0,0,0,0],5,8}\n\
-             {read_data,[2,0,0,0,2|<<97,98>>],12,13}\n\
-             {size,[3,0,0,0,3],17,14}\n\
-             {truncate_seek,[3,0,0,0,1],22,23}\n\
-             {truncate,[0],23,24}\n\
-             {get,[2,0,0,0,1|<<97>>],29,25}\n\
-             {final,29,25}",
-            "the `[binary]` stream's measured reply shapes (erts-17.1)"
+            session.session(),
+            "the `[binary]` stream's session must match the live oracle, rendering and counters"
         ),
         None => skip_oracle_check("the `[binary]` stream's measured reply shapes"),
     }
-
     // ...and the runtime's **builder** renders each of those terms, from the bytes this session
     // really received, shaped by the driver output call that carried them.
     let shapes: [(&str, ReadMessage, &str, &str); 6] = [
@@ -1117,7 +1165,13 @@ fn a_builtin_driver_port_takes_a_plain_command_and_refuses_force() {
         round.notifications,
         vec![PortNotification::Data {
             port: id,
-            read: ReadMessage::body_only(OPEN_NUMBER_REPLY.to_vec()),
+            // `numeric_reply` answers through `driver_output2(hbuf, len, NULL, 0)`, so the reply
+            // travels up as the read's **header** with no data part at all — the split the owner
+            // later renders (`ram_file_drv.c:197`).
+            read: ReadMessage {
+                header: OPEN_NUMBER_REPLY.to_vec(),
+                body: None,
+            },
         }],
         "the command reached the driver: exactly one `{{data, …}}` notification carrying its reply"
     );

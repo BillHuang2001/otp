@@ -71,22 +71,24 @@
 //! |---|---|---|---|
 //! | [`active_true_delivers_every_peer_write_as_a_tcp_message`] | `t1` | `{active,true}` `{mode,binary}`: every write becomes a `{tcp, S, Data}` | `t1_first={tcp,'$port',<<104,101,108,108,111>>}` then `t1_second={tcp,'$port',<<97,103,97,105,110>>}` |
 //! | [`active_n_delivers_n_then_exactly_one_passive`] | `t2` | `{active,2}`: two deliveries, one `{tcp_passive, S}`, silence, then a re-armed delivery | `t2_passive={tcp_passive,'$port'}`, `t2_silent=timeout`, `t2_rearmed={tcp,'$port',<<116,104,114,101,101>>}` |
-//! | [`active_once_delivers_one_then_needs_a_rearm`] | `t3` | `{active,once}`: silence after the spent grant, a re-arm, one more delivery | `t3_silent=timeout`, `t3_second={tcp,'$port',<<98,98,98,98>>}`, `t3_silent_again=timeout` |
+//! | [`active_once_delivers_one_then_needs_a_rearm`] | `t3` | `{active,once}`: a withheld spent-grant write, the re-arm that hands it over, and the fresh write at the next re-arm | `t3_silent=timeout`, `t3_second={tcp,'$port',<<98,98,98,98>>}`, `t3_silent_again=timeout`, `t3_third={tcp,'$port',<<99,99,99,99>>}` |
 //! | [`mode_list_and_mode_binary_render_the_same_payload_differently`] | `t4` | `{mode,binary}` ⇒ binary, `{mode,list}` ⇒ charlist for the same `<<"hello">>` | `t4_binary={tcp,'$port',<<104,101,108,108,111>>}` / `t4_list={tcp,'$port',[104,101,108,108,111]}` |
 //! | [`packet_2_strips_the_framing_header_before_delivery`] | `t5` | `{packet,2}`: the peer's own header is stripped | `t5_stripped={tcp,'$port',<<104,101,108,108,111>>}` from a `<<5:16,"hello">>` write |
 //! | [`udp_active_delivers_the_datagram_with_its_real_source`] | `t6` | `{udp, S, {127,0,0,1}, Port, Data}` with the peer's real bound source port | `t6_datagram={udp,'$port',{127,0,0,1},'$source',<<104,105>>}`, `t6_source_is_real=true` |
 //! | [`an_accepted_socket_inherits_its_listeners_options`] | `t7` | an accepted socket inherits `{packet,2}` + `{mode,list}` (not `{active,_}`) and delivers charlists with the header stripped | `t7_first={tcp,'$port',[104,101,108,108,111]}`, `t7_passive={tcp_passive,'$port'}` |
 //!
-//! # The one measured difference this suite does not depend on
+//! # A spent grant keeps the peer's bytes in the socket
 //!
-//! This runtime harvests the bytes that arrive in a **passive window** out of the socket when it
-//! emits `{tcp_passive, S}`, and they are never delivered; the oracle keeps them queued and hands
-//! them over after the next re-arm, so a peer write made *while* the grant is spent appears as
-//! `<<"threethree">>` there and `<<"three">>` here. That is `src/port/active_input_e2e_tests.rs`'s
-//! recorded fidelity note, not something this suite may paper over — so `t2` deliberately writes
-//! **nothing** during its passive window (its `t2_silent=timeout` is the absence of a delivery,
-//! not the absence of a write) and `t3`'s spent-grant write is never read back. Both runtimes
-//! agree on every line as a result. Closing the gap belongs to the port provider, not here.
+//! A write that arrives while an `{active,once}` / `{active,N}` grant is spent is delivered to
+//! nobody: the socket's read interest is disarmed, so the bytes stay in the kernel until a re-arm's
+//! inline read hands them over — and that delivery spends the re-arm's own grant, so a write after
+//! it waits again. `t3` pins the whole sequence with **distinguishable** payloads, so the case
+//! cannot pass on the wrong write: `t3_silent` is the silence for the withheld `<<"bbbb">>`,
+//! `t3_second` is *that* write (never the `<<"cccc">>` written after the re-arm), `t3_silent_again`
+//! the silence for `<<"cccc">>`, and `t3_third` that `<<"cccc">>` at the next re-arm. `t2` writes
+//! nothing during its passive window — its `t2_silent=timeout` is the absence of a delivery, not
+//! the absence of a write — and re-arms `{active,true}`, so the counter's shape and the once-shape
+//! are pinned independently.
 //!
 //! # Bounds and skips
 //!
@@ -428,10 +430,9 @@ fn active_true_delivers_every_peer_write_as_a_tcp_message() {
 /// `{active, 2}`: exactly **two** deliveries, then exactly **one** `{tcp_passive, S}` at
 /// exhaustion, then silence until a re-arm, and a delivery after it.
 ///
-/// The re-arm is `{active, true}` and nothing is written during the passive window (see the module
-/// docs: this runtime harvests those bytes, the oracle keeps them, so writing there would make the
-/// two sides legitimately differ). `t2_silent=timeout` is therefore the pinned state — a socket
-/// still granting deliveries would have delivered the peer's next write without one.
+/// The re-arm is `{active, true}` and nothing is written during the passive window (the withheld-
+/// write shape is `t3`'s): `t2_silent=timeout` is therefore the pinned state — a socket still
+/// granting deliveries would have delivered the peer's next write without one.
 #[test]
 fn active_n_delivers_n_then_exactly_one_passive() {
     let Some(case) = run_case("t2") else { return };
@@ -462,8 +463,13 @@ fn active_n_delivers_n_then_exactly_one_passive() {
 // 3. {active, once}
 // ---------------------------------------------------------------------------------------------
 
-/// `{active, once}`: one delivery, then **silence** (the peer's next write must not be delivered
-/// while the grant is spent), then a `setopts` re-arm and a second delivery, then silence again.
+/// `{active, once}`: one delivery, then **silence** (the peer's write while the grant is spent is
+/// withheld in the socket), then a `setopts` re-arm that hands that withheld write over, then
+/// silence again for the fresh write, then a second re-arm that delivers the fresh write.
+///
+/// The four payloads are distinct on purpose (`<<"hello">>`, `<<"bbbb">>` withheld, `<<"cccc">>`
+/// fresh), so `t3_second` can only be the *withheld* write — a runtime that delivered the fresh
+/// write at the re-arm would print `<<99,99,99,99>>` there and fail.
 #[test]
 fn active_once_delivers_one_then_needs_a_rearm() {
     let Some(case) = run_case("t3") else { return };
@@ -475,6 +481,7 @@ fn active_once_delivers_one_then_needs_a_rearm() {
     expect(&case.rust, "t3_silent=", "timeout");
     expect(&case.rust, "t3_second=", "{tcp,'$port',<<98,98,98,98>>}");
     expect(&case.rust, "t3_silent_again=", "timeout");
+    expect(&case.rust, "t3_third=", "{tcp,'$port',<<99,99,99,99>>}");
     case.assert_agrees();
 }
 

@@ -96,6 +96,33 @@ impl DriverFlags {
     }
 }
 
+/// How a driver's most recent [`Driver::control`] call described its reply buffer.
+///
+/// The C's `write_port_control_result` (`erts/emulator/beam/io.c:4126-4175`) answers from **two**
+/// independent facts, and they are not interchangeable: whether the driver left `*rbuf` `NULL`, and
+/// whether it asked for a binary reply (`PORT_CONTROL_FLAG_BINARY`, `erl_driver.h:98`). The `NULL`
+/// test comes **first** and answers the empty **list** for every flag word:
+///
+/// | `*rbuf` | `PORT_CONTROL_FLAG_BINARY` | `port_control/3` answers | C |
+/// |---|---|---|---|
+/// | `NULL` | set | `[]` | `io.c:4134` (`if (!resp_bufp) return NIL;`) |
+/// | `NULL` | clear | `[]` | `io.c:4134` |
+/// | buffer, 0 bytes | set | `<<>>` | `io.c:4136-4162` (a zero-bit bitstring) |
+/// | buffer, 0 bytes | clear | `[]` | `io.c:4163-4166` (`buf_to_intlist`) |
+///
+/// Collapsing the two into one empty byte slice is exactly what loses the first row: the runtime
+/// then renders its `PORT_CONTROL_FLAG_BINARY` answer (`<<>>`) where the oracle answers `[]`. Hence
+/// this axis is reported **beside** the bytes, never instead of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ControlReplyShape {
+    /// `*rbuf == NULL`: the C answers `[]` for every flag word (`io.c:4134`).
+    Null,
+    /// A reply buffer (the pre-allocated one the emulator hands in, or the driver's own), `cres`
+    /// bytes long — so zero bytes with `PORT_CONTROL_FLAG_BINARY` set is `<<>>`.
+    #[default]
+    Buffer,
+}
+
 /// The readiness directions a driver has registered with the poller, as seen through its
 /// [`DriverContext`].
 ///
@@ -504,7 +531,17 @@ impl<'a> DriverContext<'a> {
 /// Implemented by the built-in drivers ([`crate::drivers::FdDriver`],
 /// [`crate::drivers::EfileDriver`]) and, later, by the frozen C-ABI bridge. Every method
 /// receives a [`DriverContext`] and nothing else.
-pub trait Driver {
+///
+/// # Why `core::any::Any` is a supertrait
+///
+/// A port holds its driver as a `Box<dyn Driver>` ([`crate::Port`]), so from the outside the concrete type is erased: the runtime can see a port, its id and its driver's *name*, but it cannot reach the driver itself.
+/// That is a problem for exactly one legitimate consumer — the C's `tcp_inet_copy` (`erts/emulator/drivers/common/inet_drv.c:11795`), where accepting a connection must build the second (connected) port's driver from the *listener's* option set.
+/// [`TcpInetDriver::from_accepted`](crate::drivers::TcpInetDriver::from_accepted) needs the listener's `&TcpInetDriver`, and only a downcast can produce it.
+///
+/// Making [`core::any::Any`] a supertrait is the cheapest seam for that: it adds **no** member a driver must implement, and the downcast itself lives on the trait object as the inherent `downcast_ref` below.
+/// An `as_any` method would put boilerplate in every implementation, and a blanket impl is unnecessary once `Any` is a supertrait.
+/// The one consequence is that **every driver is `'static`**, because `Any` requires it — which already held for every driver here (they are all owned value types, with no borrows in their fields).
+pub trait Driver: core::any::Any {
     /// The driver's registered name (the key it is looked up under in the
     /// [`DriverRegistry`]).
     fn name(&self) -> &str;
@@ -578,6 +615,25 @@ pub trait Driver {
         Ok(Vec::new())
     }
 
+    /// How the driver's most recent [`Driver::control`] call described its **reply buffer** — the
+    /// fact [`ControlReplyShape`] names, which the reply bytes alone cannot carry.
+    ///
+    /// The C answers a `control` reply from two independent facts and the reply pointer is tested
+    /// **first**: `write_port_control_result` opens with `if (!resp_bufp) return NIL;`
+    /// (`erts/emulator/beam/io.c:4134`), so a `NULL` `*rbuf` is the empty **list** `[]` *regardless*
+    /// of `PORT_CONTROL_FLAG_BINARY`; only a real buffer splits on that flag (zero bytes with the
+    /// flag set is `<<>>`, without it `[]`). A runtime that renders the empty byte slice as `<<>>`
+    /// whenever the port asked for binary replies therefore answers `[]` wrongly for the `NULL`
+    /// case — which is what this accessor exists to prevent.
+    ///
+    /// The default ([`ControlReplyShape::Buffer`]) is the honest answer for every built-in driver:
+    /// they return a real `Vec` from [`Driver::control`], so their reply is a buffer even when it is
+    /// empty. The C-ABI bridge ([`crate::abi::DriverPort`]) overrides it with the shape its `control`
+    /// callback's `*rbuf` really had. Read it **after** the [`Driver::control`] call whose reply is
+    /// being rendered; before any such call it is the default.
+    fn control_reply_shape(&self) -> ControlReplyShape {
+        ControlReplyShape::Buffer
+    }
     /// Whether the driver's C counterpart has a non-`NULL` `control` entry.
     ///
     /// This is the **control-capability answer** of the frozen C ABI: `erlang:port_control/3`
@@ -792,6 +848,31 @@ pub trait Driver {
     ///
     /// Returns a `beam_common::BeamError` when teardown fails.
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()>;
+}
+
+impl dyn Driver {
+    /// Downcasts this driver to its concrete type, answering `None` for another type.
+    ///
+    /// This is **the one downcast path** for a driver reached through a port.
+    /// The [`core::any::Any`] supertrait [`Driver`] carries is what makes it possible, and there is no `as_any` method to implement alongside it — a driver implements [`Driver`] and nothing more.
+    ///
+    /// The consumer is the C's `tcp_inet_copy` (`erts/emulator/drivers/common/inet_drv.c:11795`):
+    /// the runtime holds a listener port, needs its `&TcpInetDriver` to build the accepted connection's driver with
+    /// [`TcpInetDriver::from_accepted`](crate::drivers::TcpInetDriver::from_accepted), and can reach it only from the port's `Box<dyn Driver>`.
+    /// See [`crate::Port::driver_as`] and [`crate::PortRegistry::driver_as`] for the two call sites a runtime actually uses.
+    ///
+    /// `T` must be the driver's **exact** concrete type — `TcpInetDriver`, never a supertype of it — and a wrong guess is `None` rather than a panic.
+    ///
+    /// # Note
+    ///
+    /// This is a **read-only** downcast.
+    /// A port owns its driver exclusively and its [`crate::PortRegistry`] hands out only shared borrows, so there is deliberately no `downcast_mut` — mutating a driver from outside would race the port-task round that drives it.
+    pub fn downcast_ref<T: Driver + 'static>(&self) -> Option<&T> {
+        // Trait upcasting (`&dyn Driver` → `&dyn Any`) is a stable coercion since Rust 1.86 and
+        // this workspace is pinned at 1.98.1, so no `unsafe` transmute of the fat pointer is
+        // needed here.
+        (self as &dyn core::any::Any).downcast_ref::<T>()
+    }
 }
 
 /// A driver constructor: the function a [`DriverRegistry`] stores under a name.

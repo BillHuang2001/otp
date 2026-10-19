@@ -69,10 +69,8 @@
 //! (this floor's `[0]einval` where the C adopts the operand's descriptor and leaks the live
 //! socket).
 //!
-//! The asynchronous `PACKET_REQ_RECV` op-id used to be the table's third row — served here as a
-//! synchronous read-now substitution, answering the bare `[1]` — until `beam_io` grew the async-op
-//! queue and the driver→owner completion channel. Both sides now answer
-//! `[1] ++ <<Id:16/big>>`, so the shape is an ordinary agreement row
+//! The asynchronous receive slot is an ordinary agreement row: `PACKET_REQ_RECV`'s op id is
+//! `[1] ++ <<Id:16/big>>` on both sides
 //! ([`the_datagram_async_receive_slot_matches_the_oracle`]). Its stream sibling
 //! ([`the_queued_accept_stream_matches_the_oracle`]) is pinned the same way: a queued
 //! `INET_REQ_ACCEPT` keeps the port a listener, and the rows read in that state — the
@@ -773,14 +771,11 @@ fn bare_stream() -> Vec<Probe> {
 /// report the state *after* the queue drained (`[1,0,0,0,9]`), which is a different row. Two
 /// seconds cannot expire inside this session, so both sides read the queue while it is non-empty.
 ///
-/// This sequence used to be pinned on this runtime's side alone, as
-/// `INET_STATE_CONNECTED`(`[1,0,0,0,5]`) plus two typed capability gaps: the pre-async floor
-/// *substituted* a synchronous accept that took the connection here, so `ignorefd`/`sendfile`
-/// reached their "connected stream" arms. No `port_control/3`-only session can reach a connected
-/// stream on either runtime — a peer pending when the driver's round runs completes the C's accept
-/// but still leaves the port listening (`[1,0,0,0,9]`, measured) — so the connected-stream
-/// capability gaps of those two requests belong to `beam_io`, whose driver-seam suite pins them
-/// (`drivers/inet/opcode_tests.rs`, the `not_served` rows).
+/// No `port_control/3`-only session can reach a connected stream on either runtime — a peer
+/// pending when the driver's round runs completes the C's accept but still leaves the port
+/// listening (`[1,0,0,0,9]`, measured) — so the connected-stream refusals of those two requests
+/// belong to `beam_io`, whose driver-seam suite pins them (`drivers/inet/opcode_tests.rs`, the
+/// `not_served` rows).
 fn queued_accept_stream() -> Vec<Probe> {
     let mut sendfile = vec![0x7fu8, 0xff, 0xff, 0xff]; // an out-of-range file descriptor
     sendfile.extend_from_slice(&0u64.to_be_bytes()); // offset

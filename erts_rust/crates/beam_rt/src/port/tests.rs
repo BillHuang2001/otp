@@ -748,6 +748,87 @@ pub(super) fn data_payload_bytes(message: Eterm) -> Vec<i64> {
         .collect()
 }
 
+/// The three term shapes a `{Port, {data, Data}}` payload can arrive in — the C's
+/// `deliver_read_message` (`erts/emulator/beam/io.c:3363-3448`).
+///
+/// The C renders the driver's **header** bytes (`hbuf`/`hlen`) as list *elements* and its **data**
+/// bytes (`buf`/`len`) by the port's stream bit (`ERTS_PORT_SFLG_BINARY_IO`), so the payload's
+/// shape is a function of the producing `driver_output*` call, never of the bytes alone:
+///
+/// | driver call | `list` port | `binary` port |
+/// |---|---|---|
+/// | `driver_output2(hbuf, hlen, NULL, 0)` — no data part | a **proper** char list | a proper char list |
+/// | `driver_output_binary(hbuf, hlen, buf, len)` — both parts | a proper char list | the **improper** `[H1..Hh\|<<Data>>]` |
+/// | `driver_output(buf, len)` — no header | a proper char list | a bare **binary** |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PayloadShape {
+    /// A proper char list: every header and data byte is an element (the `list` stream's only
+    /// shape, and a `binary` stream's shape for a read that carried no data part).
+    ProperList,
+    /// A bare binary: the read carried data bytes and no header at all (`driver_output`).
+    Binary,
+    /// The improper list `[H1..Hh|<<Data>>]`: `header_len` is `h`, the number of leading elements
+    /// consed in front of the data binary (the C's `buf_to_intlist` over a header list whose tail
+    /// is the data binary, `io.c:3426-3428`).
+    ImproperList {
+        /// How many leading bytes are list elements rather than the binary tail's payload.
+        header_len: usize,
+    },
+}
+
+/// The payload of a `{Port, {data, Data}}` message: its byte values flattened, and the
+/// [`PayloadShape`] they arrived in.
+///
+/// Unlike [`data_payload_bytes`] — which insists on the proper char list a default-stream reply
+/// carries — this reads **all three** shapes the C's builders emit *and* reports which one it
+/// read, so a caller asserts the shape instead of silently flattening an improper term into a
+/// list.
+/// Anything else (a nested list, a float, an improper list whose tail is not a binary) is a loud
+/// panic: no shape is fabricated.
+pub(super) fn data_payload(message: Eterm) -> (Vec<i64>, PayloadShape) {
+    let inner = terms::tuple_element(message, 1).expect("the {data, Data} pair");
+    let payload = terms::tuple_element(inner, 1).expect("the payload");
+    if let Ok(body) = terms::binary_bytes(payload) {
+        let bytes = body.iter().map(|byte| i64::from(*byte)).collect();
+        return (bytes, PayloadShape::Binary);
+    }
+    if let Ok(elements) = terms::list_elements(payload) {
+        let bytes = elements.into_iter().map(payload_byte).collect();
+        return (bytes, PayloadShape::ProperList);
+    }
+    // Neither a binary nor a proper list, so the only shape left is the improper
+    // `[H1..Hh|<<Data>>]`: walk the cons cells and require the tail to be a binary.
+    let mut bytes = Vec::new();
+    let mut tail = payload;
+    while let Ok(head) = terms::cons_head(tail) {
+        bytes.push(payload_byte(head));
+        tail = terms::cons_tail(tail).expect("a cons cell's own tail");
+    }
+    match terms::binary_bytes(tail) {
+        Ok(body) => {
+            let header_len = bytes.len();
+            bytes.extend(body.iter().map(|byte| i64::from(*byte)));
+            (bytes, PayloadShape::ImproperList { header_len })
+        }
+        Err(_) => panic!(
+            "the `{{data, Data}}` payload is neither a char list, a binary nor `[header|binary]`: \
+             an improper list whose tail is not a binary ({payload:?})"
+        ),
+    }
+}
+
+/// One element of a port-message payload as the byte it must be.
+///
+/// A payload element is a small integer in `0..=255`; anything else is a loud panic rather than a
+/// `signed_value` reading of a term that is not a small at all.
+fn payload_byte(element: Eterm) -> i64 {
+    assert!(
+        is_small(element),
+        "a port-message payload element must be a byte integer, got {element:?}"
+    );
+    signed_value(element)
+}
+
 /// `bytes` as `~w`-rendered Erlang: `[3,0,0,0,0]`. Used to compare a payload against the
 /// oracle's printed one without depending on Rust's `Debug` spacing.
 pub(super) fn erl_bytes(bytes: &[i64]) -> String {

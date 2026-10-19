@@ -24,15 +24,17 @@
 //! re-derived per test module (Prevent-Duplication):
 //!
 //! * [`ControlDriver`] — a minimal, always-ready [`Driver`] whose `control` callback answers a
-//!   configured byte reply per verb, exactly as a real C driver's `control` slot would. It is the
-//!   safe-Rust stand-in for the C fixtures `src/port/driver/control_tests.rs` compiles, for tests
-//!   that must reach [`PortRegistry::port_control`] through a **registered** port rather than
-//!   through `beam_io`'s own registry.
+//!   configured byte reply per verb, exactly as a real C driver's `control` slot would, **and**
+//!   reports the reply-buffer shape that verb declares — [`ControlVerb::null`] is a `NULL` reply
+//!   pointer (`beam_io::ControlReplyShape::Null`), the case a zero-byte buffer cannot stand in for.
+//!   It is the safe-Rust stand-in for the C fixtures `src/port/driver/control_tests.rs` compiles,
+//!   for tests that must reach [`PortRegistry::port_control`] through a **registered** port rather
+//!   than through `beam_io`'s own registry.
 //! * [`register_control_port`] — registers such a port into a [`Runtime`]'s port table (the
 //!   provider's private `register`, reachable because this module is a descendant of the module
 //!   that defines it) and hands back the id and the port's shared control-flag cell, so a test can
-//!   drive `port_control` and observe [`PortRegistry::control_binary`] without an OS child, a poll
-//!   round or a C compiler.
+//!   drive `port_control` and observe [`PortRegistry::control_binary`] **and**
+//!   [`PortRegistry::control_reply_shape`] without an OS child, a poll round or a C compiler.
 //!
 //! Nothing here fabricates a port lifecycle: `start`/`output`/`ready_input` are the trait's own
 //! no-ops, so a registered port is genuinely live, registered with the poller and torn down by
@@ -56,6 +58,12 @@ const OWNER: ProcessId = ProcessId::new(1, 0);
 /// One verb [`ControlDriver`] answers: the reply bytes and, optionally, the control-flag bits the
 /// driver asks for **from inside the callback** — the C's `set_port_control_flags`
 /// (`io.c:5318`), recorded in the port's shared cell.
+///
+/// It also carries how the driver describes its **reply buffer**
+/// ([`beam_io::ControlReplyShape`]), which a C driver controls by leaving `*rbuf` `NULL` or not.
+/// That is a second fact beside the bytes: `write_port_control_result` tests the pointer *before*
+/// the port's `PORT_CONTROL_FLAG_BINARY` word (`io.c:4134`), so a `NULL` reply is the empty list
+/// for every flag setting while a zero-byte buffer under that flag is `<<>>`.
 pub(crate) struct ControlVerb {
     /// The verb (`command`) the driver recognises, as the decimal `c_uint` the runtime parses.
     pub(crate) command: u32,
@@ -64,6 +72,10 @@ pub(crate) struct ControlVerb {
     /// The bits to record in the port's control-flag cell as this callback runs, if any — the
     /// C's `set_port_control_flags(port, flags)`.
     pub(crate) set_flags: Option<libc::c_int>,
+    /// How this verb describes its reply buffer: `Null` models a driver that leaves `*rbuf` NULL
+    /// (`io.c:4134`, the empty list for every flag word), `Buffer` a driver that answers from a
+    /// real buffer (the shape every [`ControlVerb::replying`]/[`ControlVerb::setting`] reply has).
+    pub(crate) reply_shape: beam_io::ControlReplyShape,
 }
 
 impl ControlVerb {
@@ -73,6 +85,7 @@ impl ControlVerb {
             command,
             reply: reply.to_vec(),
             set_flags: None,
+            reply_shape: beam_io::ControlReplyShape::Buffer,
         }
     }
 
@@ -83,6 +96,21 @@ impl ControlVerb {
             command,
             reply: reply.to_vec(),
             set_flags: Some(flags),
+            reply_shape: beam_io::ControlReplyShape::Buffer,
+        }
+    }
+
+    /// A verb that answers a **`NULL` reply pointer** — the C's `NIL` (`io.c:4126`), which
+    /// `write_port_control_result` renders as the bare empty list `[]` for **every**
+    /// `PORT_CONTROL_FLAG_BINARY` setting (`io.c:4134`). No bytes are returned and no flag is set:
+    /// a `NULL` reply carries neither, and the port's flags are per-port state a previous verb may
+    /// already have set.
+    pub(crate) fn null(command: u32) -> ControlVerb {
+        ControlVerb {
+            command,
+            reply: Vec::new(),
+            set_flags: None,
+            reply_shape: beam_io::ControlReplyShape::Null,
         }
     }
 }
@@ -113,6 +141,15 @@ pub(crate) struct ControlDriver {
     /// How many times the driver's `output` callback ran — the fixture's evidence that a refused
     /// or dropped command reached **no write** at all.
     writes: Rc<Cell<usize>>,
+    /// How this fixture described the reply buffer of its last **successful** `control` call — the
+    /// C's `*rbuf` pointer, reported through [`Driver::control_reply_shape`] so the runtime can
+    /// render a `NULL` reply as `[]` even on a `PORT_CONTROL_FLAG_BINARY` port (`io.c:4134`).
+    ///
+    /// A plain [`Cell`] because it is the driver's own private state: the runtime reads it back
+    /// through the very `beam_io::Driver` it registered, exactly as it reads the C driver's
+    /// pointer from the loaded adapter. An unknown (rejected) verb leaves it alone — it belongs to
+    /// the last successful call.
+    reply_shape: Cell<beam_io::ControlReplyShape>,
 }
 
 impl Driver for ControlDriver {
@@ -174,10 +211,25 @@ impl Driver for ControlDriver {
                 if let Some(bits) = entry.set_flags {
                     self.flags.set(bits);
                 }
+                // The reply buffer this verb answers with — the fact the bytes cannot carry
+                // (a `NULL` reply and an empty buffer are both zero bytes, but the C renders the
+                // former as `[]` whatever the port's binary flag says, `io.c:4134`).
+                self.reply_shape.set(entry.reply_shape);
                 Ok(entry.reply.clone())
             }
             None => Err(BeamError::BadArg),
         }
+    }
+
+    /// How the last successful `control` call described its reply buffer — what a C driver's
+    /// `*rbuf` pointer says through [`DriverPortAdapter`](super::driver::DriverPortAdapter), and
+    /// the fact the runtime's `erlang:port_control/3` renders `[]` from when it is
+    /// [`Null`](beam_io::ControlReplyShape::Null) (`io.c:4134`).
+    ///
+    /// The trait default ([`Buffer`](beam_io::ControlReplyShape::Buffer)) is the starting point:
+    /// no verb has run yet.
+    fn control_reply_shape(&self) -> beam_io::ControlReplyShape {
+        self.reply_shape.get()
     }
 }
 
@@ -274,6 +326,9 @@ fn register_driver_port(
         flags: Rc::clone(&flags),
         busy: driver_busy.clone(),
         writes: Rc::clone(&writes),
+        // No verb has answered yet, so there is no reply pointer to describe: the trait's own
+        // `Buffer` default is the honest starting answer.
+        reply_shape: Cell::new(beam_io::ControlReplyShape::Buffer),
     };
     let meta = PortMeta {
         command: name.to_string(),
