@@ -30,14 +30,27 @@
 //! which extracts the three figures out (the process table borrow must end before a reply is
 //! built on the engine heap). That roster is the **deduped union** of the target's **engine
 //! reservoir** — [`Machine::refc_binaries`], the one holder of the payloads the process's own
-//! compiled bitstring code built, read through
-//! [`RunnerState::reservoir_at`](crate::runner::RunnerState::reservoir_at) — and the process's
-//! own off-heap table ([`Process::off_heap_binaries`], which stays the path for a host that
-//! registers a payload on the PCB directly; nothing in production does). A payload the running
-//! process built from **inside** its current slice is absent from the reservoir a query reads
-//! (the pass holds that engine out of the table for the whole slice) — an omission, never a
-//! dangle, since the reservoir owns the payload either way. This module only materializes the
-//! value, so it owns no state and touches no runtime table.
+//! compiled bitstring code built — and the process's own off-heap table
+//! ([`Process::off_heap_binaries`], which stays the path for a host that registers a payload on
+//! the PCB directly; nothing in production does).
+//!
+//! The reservoir half has **two** routes, one per query shape:
+//!
+//! * **another** pid — [`RunnerState::reservoir_at`](crate::runner::RunnerState::reservoir_at),
+//!   the engine the pass keeps in its state for every process it is not executing;
+//! * the **executing** pid — the in-machine BIF door
+//!   ([`in_machine_off_heap_binaries`](super::RuntimeContext::in_machine_off_heap_binaries)),
+//!   because a scheduler pass takes that one engine *out* of the runner state for the whole
+//!   slice. So `erlang:process_info(self(), binary)` lists the payload the process built
+//!   earlier in the very slice that asks, which is the oracle's answer; the door reads the
+//!   roster only when the query names `binary`, so no other item pays for it.
+//!
+//! A process this runtime holds no machine for — the `-eval` root process, a foreign pid —
+//! answers `[]` rather than a fabricated roster. Only **compiled bitstring code** feeds the
+//! reservoir: a binary a `beam_bifs` BIF builds (`binary:copy/2`, `base64:encode/1`, …) is an
+//! on-heap block on this runtime, so it is not listed here (`M1_GAPS.md`
+//! §`process_info/1,2`). This module only materializes the value, so it owns no state and
+//! touches no runtime table.
 //!
 //! Each of the three integers is built with [`terms::make_integer`], so a payload pointer
 //! outside the 60-bit small range materializes as an **exact bignum** rather than being
@@ -45,7 +58,6 @@
 //!
 //! [`Machine::refc_binaries`]: beam_engine::Machine::refc_binaries
 //! [`Process::off_heap_binaries`]: beam_process::Process::off_heap_binaries
-
 use beam_common::Result;
 use beam_engine::terms;
 use beam_term::Eterm;
