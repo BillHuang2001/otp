@@ -40,7 +40,8 @@
 //! * **the codes** — `INT_MIN | ERL_NIF_SELECT_INVALID_EVENT` (`:1264-1268`), `0` for an accepted
 //!   registration (`:1464`) and for a mask naming no direction (`:1467`), `INT_MIN |
 //!   ERL_NIF_SELECT_FAILED` when the poll set refuses the descriptor (`:1433`), the OR-ed
-//!   `*_CANCELLED` bits for a `CANCEL`, and `ERL_NIF_SELECT_STOP_CALLED` for a `STOP`.
+//!   `*_CANCELLED` bits for a `CANCEL` (`:1470-1482`), and `ERL_NIF_SELECT_STOP_CALLED` **plus** those
+//!   same `*_CANCELLED` bits for a `STOP` (`:1274`, `:1470-1482`, `:1497-1510`).
 //!
 //! # `ERL_NIF_SELECT_NOTSUP` is never emitted here, and why
 //!
@@ -59,9 +60,12 @@
 //! *minted* resource term ([`crate::port::select::SelectPayload`]) rather than this key — never
 //! rendered.
 //!
-//! `ERL_NIF_SELECT_STOP` answers `ERL_NIF_SELECT_STOP_CALLED` both when it really de-registered the
-//! descriptor and when no registration existed, which is the C's own fast track
-//! (`call_stop = CALL_STOP; ret = ERL_NIF_SELECT_STOP_CALLED;`, `:1283`). **Residual:** the
+//! `ERL_NIF_SELECT_STOP` answers `ERL_NIF_SELECT_STOP_CALLED` **plus the `*_CANCELLED` bit of every
+//! direction it cleared**: the C decides the stop before the mask is decoded, rewrites the mode to
+//! `ERL_DRV_READ | ERL_DRV_WRITE | ERL_DRV_USE` (`:1274-1276`) and runs its "off" path, which ORs
+//! those bits (`:1470-1482`) and then adds `ERL_NIF_SELECT_STOP_CALLED` (`:1497-1510`). A stop on a
+//! descriptor that was never armed is `ERL_NIF_SELECT_STOP_CALLED` alone — the C's own fast track
+//! (`call_stop = CALL_STOP; ret = ERL_NIF_SELECT_STOP_CALLED;`, `:1276-1280`). **Residual:** the
 //! resource type's `stop` callback has no seam on this side — it is the resource registry's
 //! (`beam_abi`), reached from the `enif_*` entry point rather than from a host hook — so no `stop`
 //! callback is invoked and `ERL_NIF_SELECT_STOP_SCHEDULED` (`:1500`) is never answered.
@@ -127,7 +131,11 @@ pub(crate) fn select(
             registry.stop_nif_select(fd, handle_of(fd))
         };
         return Some(match stopped {
-            Ok(_) => ERL_NIF_SELECT_STOP_CALLED,
+            // The C rewrites the mode to `ERL_DRV_READ | ERL_DRV_WRITE | ERL_DRV_USE` (`:1274`)
+            // and runs its "off" path, which ORs one `*_CANCELLED` bit per direction it really
+            // cleared (`:1470-1482`) *before* adding `ERL_NIF_SELECT_STOP_CALLED` (`:1497-1510`),
+            // so a stopped read interest answers `STOP_CALLED | READ_CANCELLED`.
+            Ok(cancelled) => ERL_NIF_SELECT_STOP_CALLED | cancel_code(cancelled),
             Err(_) => c_int::MIN | ERL_NIF_SELECT_FAILED,
         });
     }

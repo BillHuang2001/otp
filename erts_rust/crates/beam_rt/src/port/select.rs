@@ -53,15 +53,18 @@
 //!   queues it with `am_system` as the sender. `ERL_NIF_SELECT_CUSTOM_MSG` replaces that whole
 //!   tuple with the caller's own message term (`:716-731`), which is [`SelectPayload::Custom`].
 //! * **The event atom** — `ready_input` / `ready_output` / `ready_error` (`:1451-1463`), one per
-//!   observed direction, which is [`SelectEvent`].
+//!   observed direction, which is [`SelectEvent`]. The C keeps **one state per direction** and
+//!   clears each as it queues that direction's message (`:2126-2151`), then sends them in the
+//!   `input` → `output` → `error` order (`:2168-2175`), so one readiness can carry several events:
+//!   [`events_of`] is that report.
 //! * **The select is one-shot** — `erts_poll_wait`'s `ERTS_EV_TYPE_NIF` arm sets
 //!   `state->driver.nif->in.pid = NIL` and `state->events &= ~revents` (`:2135-2151`), so a
 //!   descriptor is reported for readiness exactly once per `enif_select` call.
-//!   [`SelectWatch::take_ready`] **de-registers** as it reports. For `prim_tty:reader/1`
-//!   (`lib/kernel/src/prim_tty.erl:440-452`), which calls `tty_select/2` **once** for its whole
-//!   lifetime, a level-triggered re-report would make an always-readable descriptor (stdin on
-//!   `/dev/null`, where the differential harness runs every case) wake the reader on every poll
-//!   round for ever.
+//!   [`SelectWatch::take_ready`] **de-registers** once it has reported every direction of a
+//!   readiness. For `prim_tty:reader/1` (`lib/kernel/src/prim_tty.erl:440-452`), which calls
+//!   `tty_select/2` **once** for its whole lifetime, a level-triggered re-report would make an
+//!   always-readable descriptor (stdin on `/dev/null`, where the differential harness runs every
+//!   case) wake the reader on every poll round for ever.
 //! * **`ERL_NIF_SELECT_STOP` / `ERL_NIF_SELECT_CANCEL`** address a registration by its
 //!   **descriptor** (`:1272-1284`, `:1292`): `STOP` deletes the fd from the poll set, `CANCEL`
 //!   clears the named interest bits and reports which of them really were armed (the
@@ -125,7 +128,10 @@ const TTY_KEY_FLOOR: u64 = 1 << 60;
 /// Both terms are **stabilised** (copied onto the runtime's never-reset arena by
 /// [`crate::Runtime::stabilize_term`] before they are stored): a raw `Eterm` held across a scheduler
 /// pass belongs to a heap a collection may relocate, so it is never stored here.
-#[derive(Debug)]
+///
+/// It is `Clone` because one registration can deliver more than one notification (one per observed
+/// direction, see [`events_of`]), and every one of them carries the same payload.
+#[derive(Clone, Debug)]
 pub(crate) enum SelectPayload {
     /// The C's own `{select, ResourceTerm, Reference, EventAtom}` (`prepare_select_msg`,
     /// `erl_check_io.c:699-800`), with `ERL_NIF_SELECT_CUSTOM_MSG` unset.
@@ -161,32 +167,78 @@ impl SelectEvent {
             SelectEvent::ReadyError => "ready_error",
         }
     }
+}
 
-    /// The event kind `ready` reports for a registration interested in `interest`.
-    ///
-    /// Error first, then readability, then writability — the C reports one atom per observed
-    /// direction, so a combined `READ | WRITE` mask delivers `ready_input` for a readable event and
-    /// `ready_output` for a writable one.
-    ///
-    /// A `Ready` that observed **no** direction at all (a bare hang-up, which
-    /// `beam_io::Poller::poll` reports as `read_closed` rather than as readability) falls back to
-    /// the direction the registration asked for: an EOF on a read select *is* the readable event the
-    /// C reports, which is what makes a closed pipe wake its reader instead of hanging for ever.
-    fn of(ready: Ready, interest: Interest) -> SelectEvent {
-        if ready.is_error() {
-            SelectEvent::ReadyError
-        } else if ready.readable() {
-            SelectEvent::ReadyInput
-        } else if ready.writable() {
-            SelectEvent::ReadyOutput
-        } else if interest.is_readable() {
+/// The directions one poll round observed — the C's three separate per-direction slots
+/// (`state->driver.nif->{in,out,err}`, `erts/emulator/sys/common/erl_check_io.c:1447-1463`).
+///
+/// It exists because [`beam_io::Ready`] is opaque (getters only, no constructor), while the
+/// classification below is exactly the part worth exercising for every combination of observed and
+/// requested directions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Observed {
+    /// The round reported readability.
+    pub(crate) readable: bool,
+    /// The round reported writability.
+    pub(crate) writable: bool,
+    /// The round reported an error condition.
+    pub(crate) error: bool,
+}
+
+impl Observed {
+    /// The directions `ready` observed.
+    fn of(ready: Ready) -> Observed {
+        Observed {
+            readable: ready.readable(),
+            writable: ready.writable(),
+            error: ready.is_error(),
+        }
+    }
+
+    /// Whether the round observed any direction at all.
+    fn any(self) -> bool {
+        self.readable || self.writable || self.error
+    }
+}
+
+/// The events one readiness report carries: **one per observed *and requested* direction**, in the
+/// C's `input` → `output` → `error` order.
+///
+/// The C keeps a separate recipient per direction (`state->driver.nif->{in,out,err}`,
+/// `erts/emulator/sys/common/erl_check_io.c:1447-1463`), takes each one whose direction the round
+/// observed (`:2126-2151`) and queues the messages in this order (`:2168-2175`), so a readiness
+/// carrying several directions really does produce several notifications — a reset socket reported
+/// as readable *and* errored delivers `ready_input` and then `ready_error`.
+///
+/// A direction the round observed but the registration did **not** ask for reports nothing, exactly
+/// as the C's `is_not_nil(...)` tests leave that direction's slot alone.
+///
+/// A readiness that observed **no** direction at all — a bare hang-up, which
+/// `beam_io::Poller::poll` reports as `read_closed` rather than as readability — falls back to the
+/// direction the registration asked for: an EOF on a read select *is* the readable event the C
+/// reports, which is what makes a closed pipe wake its reader instead of hanging for ever.
+fn events_of(observed: Observed, interest: Interest) -> Vec<SelectEvent> {
+    let mut events = Vec::with_capacity(3);
+    if observed.readable && interest.is_readable() {
+        events.push(SelectEvent::ReadyInput);
+    }
+    if observed.writable && interest.is_writable() {
+        events.push(SelectEvent::ReadyOutput);
+    }
+    if observed.error && interest.is_error() {
+        events.push(SelectEvent::ReadyError);
+    }
+    if events.is_empty() && !observed.any() {
+        // The EOF fallback (see the docs above).
+        events.push(if interest.is_readable() {
             SelectEvent::ReadyInput
         } else if interest.is_writable() {
             SelectEvent::ReadyOutput
         } else {
             SelectEvent::ReadyError
-        }
+        });
     }
+    events
 }
 
 /// The directions a [`SelectWatch::cancel`] really cleared — the C's `ERL_NIF_SELECT_*_CANCELLED`
@@ -209,6 +261,16 @@ impl Cancelled {
     /// Whether nothing was cancelled — the C's `0` answer to a `CANCEL`.
     pub(crate) fn is_empty(self) -> bool {
         !(self.readable || self.writable || self.error)
+    }
+}
+
+/// The directions `interest` held, as the [`Cancelled`] bits a stop/cancel reports — one
+/// `ERL_NIF_SELECT_*_CANCELLED` bit per direction really armed (`erl_check_io.c:1470-1482`).
+fn cancelled_of(interest: Interest) -> Cancelled {
+    Cancelled {
+        readable: interest.is_readable(),
+        writable: interest.is_writable(),
+        error: interest.is_error(),
     }
 }
 
@@ -373,8 +435,15 @@ impl SelectWatch {
         Ok(())
     }
 
-    /// De-registers the registration on `fd`, answering whether anything was armed — the C's
+    /// De-registers the registration on `fd`, answering the directions it had armed — the C's
     /// `ERL_NIF_SELECT_STOP` (`erl_check_io.c:1272-1284`).
+    ///
+    /// The C decides a `STOP` before the mask is decoded, rewriting the mode to
+    /// `ERL_DRV_READ | ERL_DRV_WRITE | ERL_DRV_USE` (`:1274-1276`) and running its "off" path, which
+    /// ORs one `ERL_NIF_SELECT_*_CANCELLED` bit per direction it really cleared (`:1470-1482`), so
+    /// the answer is the armed interest of the registration the stop removed. An empty
+    /// [`Cancelled`] is a descriptor that was never armed — the C's own fast track
+    /// (`:1276-1280`).
     ///
     /// `handle` narrows the lookup to the registration that call armed; the C addresses a
     /// registration by its **descriptor** alone, so a handle that names no registration on a
@@ -383,17 +452,24 @@ impl SelectWatch {
     /// # Errors
     ///
     /// The poller's own de-registration failure.
-    pub(crate) fn stop(&mut self, poller: &mut Poller, fd: RawFd, handle: Eterm) -> Result<bool> {
+    pub(crate) fn stop(
+        &mut self,
+        poller: &mut Poller,
+        fd: RawFd,
+        handle: Eterm,
+    ) -> Result<Cancelled> {
         let key = self
             .by_fd_handle
             .get(&(fd, handle_key(handle)))
             .copied()
             .or_else(|| self.by_fd.get(&fd).copied());
         let Some(key) = key else {
-            return Ok(false);
+            return Ok(Cancelled::default());
         };
-        let _ = self.remove(poller, key)?;
-        Ok(true)
+        let Some(registration) = self.remove(poller, key)? else {
+            return Ok(Cancelled::default());
+        };
+        Ok(cancelled_of(registration.interest))
     }
 
     /// Clears the `interest` directions armed on `fd` and answers which of them really were armed —
@@ -470,6 +546,11 @@ impl SelectWatch {
     /// The registrations the poll round observed ready, **disarming** each — the C's one-shot
     /// delivery (`erl_check_io.c:2135-2151` clears the interest as the message is queued).
     ///
+    /// One registration contributes **one delivery per observed-and-requested direction**, in the
+    /// C's `input` → `output` → `error` order (see [`events_of`]), and is de-registered **once**,
+    /// after all of them: an errored descriptor keeps reporting, so leaving the error direction
+    /// armed across rounds would spin the poll round for ever.
+    ///
     /// An event this watch does not own is skipped: a poll round's batch also carries live ports'
     /// and the signal self-pipe's events.
     ///
@@ -484,20 +565,14 @@ impl SelectWatch {
         let mut delivered = Vec::new();
         for event in polled {
             let key = event.key();
-            let Some(registration) = self.registrations.get(&key) else {
+            if !self.registrations.contains_key(&key) {
                 continue;
-            };
-            let kind = SelectEvent::of(event.ready(), registration.interest);
+            }
+            let observed = Observed::of(event.ready());
             let Some(registration) = self.remove(poller, key)? else {
                 continue;
             };
-            delivered.push(SelectDelivery {
-                owner: registration.owner,
-                payload: registration.payload,
-                event: kind,
-                handle: registration.handle,
-                obj: registration.obj,
-            });
+            delivered.extend(deliveries_of(registration, observed));
         }
         Ok(delivered)
     }
@@ -539,6 +614,21 @@ impl SelectWatch {
         poller.deregister(registration.fd, registration.token)?;
         Ok(Some(registration))
     }
+}
+
+/// The notifications one ready registration produces — **one per event** [`events_of`] reports, all
+/// carrying the registration's own owner, payload, handle and object.
+fn deliveries_of(registration: SelectRegistration, observed: Observed) -> Vec<SelectDelivery> {
+    events_of(observed, registration.interest)
+        .into_iter()
+        .map(|event| SelectDelivery {
+            owner: registration.owner,
+            payload: registration.payload.clone(),
+            event,
+            handle: registration.handle,
+            obj: registration.obj,
+        })
+        .collect()
 }
 
 /// The opaque index key of a handle term: its raw word, never interpreted as a term.
@@ -690,25 +780,38 @@ mod tests {
         }
     }
 
-    /// `ERL_NIF_SELECT_STOP` answers whether anything really was armed, and de-registers both the
-    /// descriptor and the `(fd, handle)` index — a handle that names no registration on an armed
-    /// descriptor still stops it (the C addresses a registration by its descriptor).
+    /// `ERL_NIF_SELECT_STOP` answers the directions the stopped registration had armed, and
+    /// de-registers both the descriptor and the `(fd, handle)` index — a handle that names no
+    /// registration on an armed descriptor still stops it (the C addresses a registration by its
+    /// descriptor).
     #[test]
     fn stop_de_registers_the_descriptor() {
         let (mut poller, mut watch, _owner, handle, _reference) = armed();
         let stale = make_small(99);
-        assert!(watch.stop(&mut poller, TTY_IFD, handle).expect("a stop"));
+        let stopped = watch.stop(&mut poller, TTY_IFD, handle).expect("a stop");
+        assert!(
+            stopped.readable && !stopped.writable && !stopped.error,
+            "the armed read interest is the one the stop reports: {stopped:?}"
+        );
         assert!(!watch.is_armed());
         assert_eq!(watch.by_fd.get(&TTY_IFD), None);
         assert_eq!(watch.by_fd_handle.get(&(TTY_IFD, handle_key(handle))), None);
         assert!(
-            !watch.stop(&mut poller, TTY_IFD, handle).expect("nothing armed"),
+            watch
+                .stop(&mut poller, TTY_IFD, handle)
+                .expect("nothing armed")
+                .is_empty(),
             "a second STOP reports that there was nothing to stop"
         );
 
         // A handle the store does not know stops the descriptor all the same.
         let (mut poller, mut watch, ..) = armed();
-        assert!(watch.stop(&mut poller, TTY_IFD, stale).expect("a stop"));
+        assert!(
+            !watch
+                .stop(&mut poller, TTY_IFD, stale)
+                .expect("a stop")
+                .is_empty()
+        );
         assert!(!watch.is_armed());
     }
 
@@ -775,5 +878,150 @@ mod tests {
             .prune_dead(&mut poller, |pid| live.contains(&pid))
             .expect("a prune");
         assert!(watch.is_armed(), "a live owner keeps its registration");
+    }
+
+    /// Every observed direction the registration asked for is reported, in the C's `input` →
+    /// `output` → `error` order, and a direction it did **not** ask for is not
+    /// (`erl_check_io.c:2126-2175`).
+    #[test]
+    fn each_observed_and_requested_direction_is_reported_in_the_c_order() {
+        let readable: Observed = Observed {
+            readable: true,
+            writable: false,
+            error: false,
+        };
+        let writable = Observed {
+            readable: false,
+            writable: true,
+            error: false,
+        };
+        let errored = Observed {
+            readable: false,
+            writable: false,
+            error: true,
+        };
+        let combinations: [(Observed, Vec<SelectEvent>); 7] = [
+            (readable, vec![SelectEvent::ReadyInput]),
+            (writable, vec![SelectEvent::ReadyOutput]),
+            (errored, vec![SelectEvent::ReadyError]),
+            (
+                Observed {
+                    readable: true,
+                    writable: true,
+                    error: false,
+                },
+                vec![SelectEvent::ReadyInput, SelectEvent::ReadyOutput],
+            ),
+            // The measured `READ | ERROR` shape: a reset socket is both readable and errored.
+            (
+                Observed {
+                    readable: true,
+                    writable: false,
+                    error: true,
+                },
+                vec![SelectEvent::ReadyInput, SelectEvent::ReadyError],
+            ),
+            (
+                Observed {
+                    readable: false,
+                    writable: true,
+                    error: true,
+                },
+                vec![SelectEvent::ReadyOutput, SelectEvent::ReadyError],
+            ),
+            (
+                Observed {
+                    readable: true,
+                    writable: true,
+                    error: true,
+                },
+                vec![
+                    SelectEvent::ReadyInput,
+                    SelectEvent::ReadyOutput,
+                    SelectEvent::ReadyError,
+                ],
+            ),
+        ];
+        for (observed, expected) in combinations {
+            assert_eq!(
+                events_of(observed, Interest::BOTH.add(Interest::ERROR)),
+                expected,
+                "a registration asking for everything reports every observed direction, in order"
+            );
+            // Each direction on its own reports only itself.
+            assert_eq!(events_of(observed, Interest::READABLE), {
+                let mut filtered = expected.clone();
+                filtered.retain(|event| *event == SelectEvent::ReadyInput);
+                // A readiness that observed *something* but nothing the mask asked for reports
+                // nothing at all (`:2144-2151` leaves that direction's slot alone).
+                filtered
+            });
+            assert_eq!(
+                events_of(observed, Interest::ERROR),
+                expected
+                    .iter()
+                    .copied()
+                    .filter(|event| *event == SelectEvent::ReadyError)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A readiness that observed no direction at all — a bare hang-up — still reports the direction
+    /// the registration asked for, which is what wakes a reader whose peer closed.
+    #[test]
+    fn a_bare_hang_up_falls_back_to_the_requested_direction() {
+        assert_eq!(
+            events_of(Observed::default(), Interest::READABLE),
+            vec![SelectEvent::ReadyInput]
+        );
+        assert_eq!(
+            events_of(Observed::default(), Interest::WRITABLE),
+            vec![SelectEvent::ReadyOutput]
+        );
+        assert_eq!(
+            events_of(Observed::default(), Interest::ERROR),
+            vec![SelectEvent::ReadyError]
+        );
+        assert_eq!(
+            events_of(Observed::default(), Interest::BOTH),
+            vec![SelectEvent::ReadyInput],
+            "a combined mask reports the readable direction first"
+        );
+    }
+
+    /// One registration that observed two requested directions delivers **two** notifications,
+    /// both carrying its own payload — the C's one message per direction.
+    #[test]
+    fn one_readiness_delivers_one_notification_per_direction() {
+        let (_poller, watch, owner, handle, reference) = armed();
+        let registration = SelectRegistration {
+            token: watch.registrations[&TTY_KEY_TOP].token,
+            fd: TTY_IFD,
+            interest: Interest::READABLE.add(Interest::ERROR),
+            owner,
+            payload: SelectPayload::Plain { reference },
+            handle,
+            obj: core::ptr::null_mut(),
+        };
+        let delivered = deliveries_of(
+            registration,
+            Observed {
+                readable: true,
+                writable: false,
+                error: true,
+            },
+        );
+        assert_eq!(delivered.len(), 2, "the readable and the errored direction");
+        assert_eq!(delivered[0].event, SelectEvent::ReadyInput);
+        assert_eq!(delivered[1].event, SelectEvent::ReadyError);
+        for delivery in &delivered {
+            assert_eq!(delivery.owner, owner);
+            assert_eq!(delivery.handle, handle);
+            match delivery.payload {
+                SelectPayload::Plain { reference: carried } => assert_eq!(carried, reference),
+                SelectPayload::Custom { .. } => panic!("a plain arming must not deliver a custom message"),
+            }
+        }
     }
 }

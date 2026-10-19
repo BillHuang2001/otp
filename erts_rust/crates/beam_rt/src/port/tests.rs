@@ -4079,16 +4079,20 @@ fn stop_and_cancel_report_what_was_really_armed() {
             !registry.has_nothing_to_poll(),
             "the read interest is still armed after a no-op cancel"
         );
+        let stopped = registry.stop_nif_select(fd, handle).expect("a stop");
         assert!(
-            registry.stop_nif_select(fd, handle).expect("a stop"),
-            "STOP reports that something was armed"
+            stopped.readable && !stopped.writable && !stopped.error,
+            "STOP reports the read interest it cleared, got {stopped:?}"
         );
         assert!(
             registry.has_nothing_to_poll(),
             "STOP really de-registered the descriptor"
         );
         assert!(
-            !registry.stop_nif_select(fd, handle).expect("a second stop"),
+            registry
+                .stop_nif_select(fd, handle)
+                .expect("a second stop")
+                .is_empty(),
             "a second STOP reports that nothing was armed"
         );
         let cancelled = registry

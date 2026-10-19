@@ -889,8 +889,10 @@ enum PortEvent {
     /// * A [`select::SelectPayload::Custom`] registration (`ERL_NIF_SELECT_CUSTOM_MSG`) delivers
     ///   the caller's own message term and nothing else — no tuple, no event atom (`:716-731`).
     ///
-    /// Either way the report is **one-shot**: the registration is de-registered as it is reported
-    /// (see [`select::SelectWatch::take_ready`]).
+    /// Either way the report is **one-shot**: the registration is de-registered once it has
+    /// reported, and **one readiness can produce several of these events** — one per observed
+    /// direction the registration asked for, in the C's `input` → `output` → `error` order
+    /// (`erl_check_io.c:2126-2175`; see [`select::SelectWatch::take_ready`]).
     Select {
         /// The process the select message belongs to — `enif_select`'s implicit recipient (the
         /// calling process).
@@ -1325,13 +1327,24 @@ impl PortRegistry {
             .arm(&mut self.poller, fd, interest, owner, payload, handle, obj)
     }
 
-    /// De-registers the interest armed on `fd`, answering whether anything really was armed — the
+    /// De-registers the interest armed on `fd`, answering which directions it had armed — the
     /// C's `ERL_NIF_SELECT_STOP` (`erl_check_io.c:1272-1284`, see [`select`]).
+    ///
+    /// The C decides a `STOP` before it decodes the mask, rewrites the mode to
+    /// `ERL_DRV_READ | ERL_DRV_WRITE | ERL_DRV_USE` (`:1274-1276`) and runs its "off" path, so the
+    /// answer is the armed interest of the registration the stop removed: one
+    /// `ERL_NIF_SELECT_*_CANCELLED` bit per direction really cleared (`:1470-1482`). An empty
+    /// [`select::Cancelled`] is a descriptor that was never armed — the C's own fast track
+    /// (`:1276-1280`).
     ///
     /// # Errors
     ///
     /// The poller's own de-registration failure.
-    pub(crate) fn stop_nif_select(&mut self, fd: RawFd, handle: Eterm) -> Result<bool> {
+    pub(crate) fn stop_nif_select(
+        &mut self,
+        fd: RawFd,
+        handle: Eterm,
+    ) -> Result<select::Cancelled> {
         self.select.stop(&mut self.poller, fd, handle)
     }
 
