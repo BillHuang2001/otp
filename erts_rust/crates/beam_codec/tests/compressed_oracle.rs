@@ -40,10 +40,10 @@
 //! runs, so `term_to_binary(T, [{compressed,Level}])` produced here is not merely
 //! decodable — it is the oracle's image, stream included. What the tests pin is the
 //! whole image (wrapper choice *and* stream) for binaries, lists, tuples, the boundary
-//! witnesses and payloads past 32 KiB, plus the derived rule behind the choice: `Z <=
-//! body - 5`, where `body` is the plain body length (plain image minus the version byte)
-//! and `Z` is the zlib stream over exactly those bytes. The equality case lands on the
-//! COMPRESSED side, `body < 5` never compresses, and level `0` never compresses at all
+//! witnesses and payloads past 32 KiB, plus the rule behind the choice: `Z <= body - 5`,
+//! where `body` is the plain body length (plain image minus the version byte) and `Z` is
+//! the zlib stream over exactly those bytes. The equality case lands on the COMPRESSED
+//! side, `body < 5` never compresses, and level `0` never compresses at all
 //! (`[{compressed,0}]` returns the plain image exactly).
 //!
 //! Every test resolves the oracle the same way [`tools/differential`] does
@@ -51,6 +51,12 @@
 //! **loudly** — never a silent pass — when no oracle is available. A large image never
 //! travels through `argv` or stdout: the oracle `file:write_file/2`s it into a unique
 //! path under `std::env::temp_dir()` and the test reads it back.
+//!
+//! The file is this long because each test is a **distinct** C path or witness family
+//! (both wrapper-decision paths, the level matrix, the two boundary crossings, payloads
+//! past 32 KiB, a real `.beam`) and every one of them compares whole images rather than a
+//! decoded term, several over their own file-based transport.
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -456,6 +462,14 @@ fn seq_list() -> (Heap, AtomTable, Eterm) {
 /// A test case: a label, a builder for the term, and the term's Erlang source text.
 type Case = (&'static str, fn() -> (Heap, AtomTable, Eterm), &'static str);
 
+/// A binary (`<<…>>`) term over exactly `data`, with the heap that owns it.
+fn bin_term(data: &[u8]) -> (Heap, AtomTable, Eterm) {
+    // Eight payload bytes per word plus slack for the bit-string header.
+    let mut h = heap(data.len() / 8 + 256);
+    let t = beam_codec::term::make_binary(&mut h, data).expect("an on-heap binary");
+    (h, AtomTable::new(), t)
+}
+
 const DUP_500_HELLO: &str = "lists:duplicate(500,hello)";
 const SEQ_1_1000: &str = "lists:seq(1,1000)";
 
@@ -695,16 +709,12 @@ fn boundary_witnesses_are_byte_identical() {
         "unexpected oracle output: {lines:?}"
     );
 
-    let mut witnesses: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut plain_imgs: Vec<Vec<u8>> = Vec::new();
+    let mut comp_imgs: Vec<Vec<u8>> = Vec::new();
     for (k, &n) in SIZES.iter().enumerate() {
         let oracle_plain = parse_hex(&lines[2 * k]);
         let oracle_comp = parse_hex(&lines[2 * k + 1]);
-        let data = vec![b'a'; n];
-        let (_h, atoms, term) = {
-            let mut h = heap(n / 8 + 64);
-            let t = beam_codec::term::make_binary(&mut h, &data).expect("an on-heap binary");
-            (h, AtomTable::new(), t)
-        };
+        let (_h, atoms, term) = bin_term(&vec![b'a'; n]);
         let our_plain = encode_term(term, &atoms).expect("plain encode");
         let our_comp = encode_term_compressed(term, &atoms, 6).expect("compressed encode");
         assert_image_eq(
@@ -736,25 +746,26 @@ fn boundary_witnesses_are_byte_identical() {
             pays,
             "N={n}: the oracle's wrapper choice contradicts `Z <= body - 5`"
         );
-        witnesses.push((n, our_plain, our_comp));
+        plain_imgs.push(our_plain);
+        comp_imgs.push(our_comp);
     }
 
-    let pick = |n: usize| {
-        witnesses
-            .iter()
-            .find(|(size, _, _)| *size == n)
-            .expect("a sized witness")
-            .clone()
-    };
+    // Indices into `SIZES`.
+    let (n14, n15, n16, n1024) = (0, 1, 2, 3);
 
     // N = 14: `Z = 15` cannot fit `body - 5 = 14`, so the plain image comes back verbatim.
-    let (_, p14, c14) = pick(14);
-    assert!(!is_compressed(&c14), "N=14 must NOT be compressed");
-    assert_eq!(c14, p14, "N=14 must revert to the plain image exactly");
+    assert!(!is_compressed(&comp_imgs[n14]), "N=14 must NOT be compressed");
+    assert_eq!(
+        comp_imgs[n14], plain_imgs[n14],
+        "N=14 must revert to the plain image exactly"
+    );
 
     // N = 15: the equality case, and it lands on the COMPRESSED side.
-    let (_, p15, c15) = pick(15);
-    assert!(is_compressed(&c15), "N=15 is the equality case and must be COMPRESSED");
+    let (p15, c15) = (&plain_imgs[n15], &comp_imgs[n15]);
+    assert!(
+        is_compressed(c15),
+        "N=15 is the equality case and must be COMPRESSED"
+    );
     assert_eq!(
         c15.len(),
         p15.len(),
@@ -766,14 +777,14 @@ fn boundary_witnesses_are_byte_identical() {
         "N=15: Z must equal body - 5 exactly (the equality case)"
     );
     assert_eq!(
-        to_hex(&c15),
+        to_hex(c15),
         "835000000014789ccb656060e04f4405003700062c",
         "N=15: the equality-case image is the oracle's, byte for byte"
     );
 
     // N = 16: strictly shorter than the plain image.
-    let (_, p16, c16) = pick(16);
-    assert!(is_compressed(&c16), "N=16 must be compressed");
+    let (p16, c16) = (&plain_imgs[n16], &comp_imgs[n16]);
+    assert!(is_compressed(c16), "N=16 must be compressed");
     assert!(
         c16.len() < p16.len(),
         "N=16: the compressed image must be shorter ({} vs {})",
@@ -782,11 +793,11 @@ fn boundary_witnesses_are_byte_identical() {
     );
 
     // N = 1024: the ordinary case — wrapped, the oracle's 27-byte image.
-    let (_, p1024, c1024) = pick(1024);
-    assert!(is_compressed(&c1024), "N=1024 must be compressed");
+    let (p1024, c1024) = (&plain_imgs[n1024], &comp_imgs[n1024]);
+    assert!(is_compressed(c1024), "N=1024 must be compressed");
     assert_eq!(c1024.len(), 27, "N=1024: the image is {} bytes", c1024.len());
     assert_eq!(
-        md5_hex(&c1024),
+        md5_hex(c1024),
         "29a8ebee49118a2c8d79005621b3627a",
         "N=1024: the image digest must be the oracle's"
     );
@@ -821,12 +832,7 @@ fn level_matrix_is_byte_identical() {
         "the oracle must reject levels 10 and -1"
     );
 
-    let data = vec![b'a'; 100];
-    let (_h, atoms, term) = {
-        let mut h = heap(data.len() / 8 + 64);
-        let t = beam_codec::term::make_binary(&mut h, &data).expect("an on-heap binary");
-        (h, AtomTable::new(), t)
-    };
+    let (_h, atoms, term) = bin_term(&[b'a'; 100]);
     let plain = encode_term(term, &atoms).expect("plain encode");
     let mut images: Vec<Vec<u8>> = Vec::new();
     for (i, level) in LEVELS.iter().copied().enumerate() {
@@ -936,12 +942,14 @@ fn the_second_path_boundary_is_byte_identical() {
         let image_len: usize = sizes[i][2].parse().expect("an image size");
         let mut payload = vec![0u8; p];
         payload.extend_from_slice(&tail);
-        let (_h, atoms, term) = {
-            let mut h = heap(payload.len() / 8 + 64);
-            let t = beam_codec::term::make_binary(&mut h, &payload).expect("an on-heap binary");
-            (h, AtomTable::new(), t)
-        };
+        let (_h, atoms, term) = bin_term(&payload);
+        let our_plain = encode_term(term, &atoms).expect("plain encode");
         let ours = encode_term_compressed(term, &atoms, 6).expect("compressed encode");
+        assert_eq!(
+            our_plain.len(),
+            plain_len,
+            "P={p}: our plain image size disagrees with the oracle's"
+        );
         let oracle_image = read_oracle_image(&dir.join(format!("p{p}.img")));
         assert_image_eq(&format!("zeros({p}) ++ lcg300"), &ours, &oracle_image);
         assert_eq!(
@@ -971,12 +979,7 @@ fn the_second_path_boundary_is_byte_identical() {
     // Two incompressible payloads: stored-block streams cost `N + 11`, so both stay plain
     // on both sides and the whole image is byte-identical.
     for (tag, n) in [("b1024", 1024usize), ("b10240", 10240)] {
-        let payload = lcg_bytes(n);
-        let (_h, atoms, term) = {
-            let mut h = heap(n / 8 + 256);
-            let t = beam_codec::term::make_binary(&mut h, &payload).expect("an on-heap binary");
-            (h, AtomTable::new(), t)
-        };
+        let (_h, atoms, term) = bin_term(&lcg_bytes(n));
         let our_plain = encode_term(term, &atoms).expect("plain encode");
         let our_comp = encode_term_compressed(term, &atoms, 6).expect("compressed encode");
         let oracle_plain = read_oracle_image(&dir.join(format!("{tag}.plain")));
@@ -1026,12 +1029,7 @@ fn large_payloads_are_byte_identical() {
     );
 
     // The 60000-byte binary.
-    let abc = b"abc".repeat(20000);
-    let (_h, atoms, term) = {
-        let mut h = heap(abc.len() / 8 + 1024);
-        let t = beam_codec::term::make_binary(&mut h, &abc).expect("an on-heap binary");
-        (h, AtomTable::new(), t)
-    };
+    let (_h, atoms, term) = bin_term(&b"abc".repeat(20000));
     let our_abc = encode_term_compressed(term, &atoms, 6).expect("compressed encode");
     assert_eq!(our_abc.len(), 95, "the abc image is {} bytes", our_abc.len());
     assert_eq!(
@@ -1140,11 +1138,7 @@ fn a_real_beam_payload_is_byte_identical() {
         beam.len()
     );
 
-    let (_h, atoms, term) = {
-        let mut h = heap(beam.len() / 8 + 256);
-        let t = beam_codec::term::make_binary(&mut h, &beam).expect("an on-heap binary");
-        (h, AtomTable::new(), t)
-    };
+    let (_h, atoms, term) = bin_term(&beam);
     let our_plain = encode_term(term, &atoms).expect("plain encode");
     let our_comp = encode_term_compressed(term, &atoms, 6).expect("compressed encode");
     assert_image_eq(
