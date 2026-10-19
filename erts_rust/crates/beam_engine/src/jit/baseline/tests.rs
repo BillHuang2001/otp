@@ -5207,14 +5207,14 @@ fn drive_probe(
 
 /// `/proc/loadavg` as a string (empty when unreadable) — the probe's timing
 /// numbers are only meaningful next to the host load.
-fn probe_loadavg() -> String {
+pub(crate) fn probe_loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "<unavailable>".to_string())
 }
 
 /// The printed structural counter block for one tier's counting pass.
-fn print_probe_counters(label: &str, counters: &counters::Counters) {
+pub(crate) fn print_probe_counters(label: &str, counters: &counters::Counters) {
     println!("--- {label}: baseline structural counters (one pass, recording ON) ---");
     println!(
         "  jit_step_one={} jit_step_ext={} | block_entry lookups={} hits={} entered={} | \
@@ -5962,7 +5962,7 @@ fn the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt() {
 /// The [`MinimalContext`] owns the heap every boxed term is built on and is dropped at the
 /// end of this call, so the caller may only inspect an outcome that is an immediate or a
 /// typed error — which is exactly what the fixtures below return (`NIL` or a raise).
-fn run_counting(
+pub(crate) fn run_counting(
     module: &Module,
     name: Atom,
     tier: Tier,
@@ -6578,3 +6578,6 @@ mod operand_tests;
 #[cfg(test)]
 #[path = "bif_tests.rs"]
 mod bif_tests;
+#[cfg(test)]
+#[path = "y_witness_tests.rs"]
+mod y_witness_tests;
