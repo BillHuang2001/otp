@@ -258,9 +258,11 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   is the typed `unsupported` naming the missing sink. `Port` here is the bare port (no registry) in
   the no-sink case, which is exactly the driver-driven-outside-a-port shape.
 - **The `{active, …}` input channel** is pinned structurally in `active_input_tests.rs` — a sibling
-  `#[path]` module of `port.rs` (10 tests, no `erl` needed): a hook driver stages a delivery from each
+  `#[path]` module of `port.rs` (12 tests, no `erl` needed): a hook driver stages a delivery from each
   of the nine interaction points and all nine reach `Port::take_active_inputs` exactly once, in call
-  order, each stamped with the port's own id; a `Passive` event crosses unchanged; an empty payload is
+  order, each stamped with the port's own id; an `Error(InetReason)` delivery crosses unchanged (one
+  per call, two calls never merged, the reason's atom read back through `InetReason::atom_name`); a
+  `Passive` event crosses unchanged; an empty payload is
   still a delivery; `deliver_active_input` stamps its own port, never merges two calls, answers the
   typed `unsupported` with no sink and refuses after a latched failure; `execute_port_tasks` reports
   what a round staged; two ports drain in port-number order and a second drain is empty; a delivery
@@ -280,7 +282,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`/`PortCommandOutcome`, `Port::command`/`is_busy`/`port_closed`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`), the completion stage (`completions` + `take_completions`), the `{active,…}` stage (`active_inputs` + `take_active_inputs`), and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`; suite `port_command_tests.rs`
 - `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_command_with`/`is_busy`/`port_closed`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`, `take_completions` + the `closed_completions` harvest, `take_active_inputs` + the `closed_active` harvest); suites `registry_reply_tests.rs`/`registry_busy_tests.rs`
 - `completion.rs` → the driver→owner completion side channel: `CompletionEvent` (`InetReply { caller_ref: Option<Vec<u8>>, reply }` / `InetAsync { id, result }`), `InetReply` (`Ok`/`Error(InetReason)`), `InetAsyncResult` (`Ok`/`Data`/`Port`/`Error`), `InetReason` (`Closed`/`Timeout`/`Errno` + `from_errno`/`atom_name`) and the port-stamped `PortCompletion { port, event }`
-- `active_input_tests.rs` → the `{active,…}` channel's structural suite (10 tests), a `#[path]` test module of `port.rs`
+- `active_input_tests.rs` → the `{active,…}` channel's structural suite (12 tests), a `#[path]` test module of `port.rs`
 - `completion_tests.rs` → the channel's structural suite (11 tests), a `#[path]` test module of `completion.rs`: all nine interaction points, the timer-only route, both round drivers, port-number ordering, the close harvest, exactly-once, and the no-sink `unsupported`
 - `driver_output2.rs` (`../tests/`) → the split-read pin over a real `PortRegistry`/`Poller`: one `Data` per call, header/body exact, `Some(vec![])` vs `None`, `input_len` = `hlen+len`, no re-report on a second round
 - `registry_reply_tests.rs` → the write-path pin: the reply round trip (`port_command` ⇒ one `Data`) and the refused-command propagation (`Err(BadArg)` out of `execute_port_tasks`), a `#[path]` test module of `registry.rs`

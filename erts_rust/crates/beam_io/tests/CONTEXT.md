@@ -87,8 +87,8 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 26 suites, **248
-passing / 0 failing**; the whole `-p beam_io` run is **1143** (892 lib + 248 integration + 3
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 26 suites, **249
+passing / 0 failing**; the whole `-p beam_io` run is **1188** (936 lib + 249 integration + 3
 doctests, 2 doctests `ignore`d). Per file:
 
 | Suite | Tests | Suite | Tests |
@@ -103,12 +103,12 @@ doctests, 2 doctests `ignore`d). Per file:
 | `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 9 |
 | `abi_busy.rs` | 8 | `inet.rs` | 10 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
-| `abi_failure.rs` | 11 | `active_mode.rs` | 9 |
+| `abi_failure.rs` | 11 | `active_mode.rs` | 10 |
 | `inet_accept.rs` | 7 | | |
 | `port_task.rs` | 5 | `udp_inet.rs` | 6 |
 | | | `port.rs` | 4 |
 
-`active_mode.rs` (9) is the **`{active, …}` input channel** through a real `PortRegistry` port and a
+`active_mode.rs` (10) is the **`{active, …}` input channel** through a real `PortRegistry` port and a
 real `Poller` round, with the traffic supplied by an **external** `std::net::UdpSocket`/
 `std::net::TcpStream` (never a second VM): ports open through `PortRegistry::open_named`, verbs go
 through the numeric `prim_inet` opcodes (`Op + 0x03f1a300`) — plus the named `accept` verb for the
