@@ -322,6 +322,13 @@ impl Machine {
         // module handle it must be resumed in.
         self.contexts.clear();
         self.context = 0;
+        // The local-callee identity memo is address-keyed, so its entries are only valid
+        // for the run that filled them: a fresh run must re-derive rather than answer
+        // with an image that is no longer the one being executed. This is also what keeps
+        // the key ABA-free (no address it holds can be recycled while it holds it). As
+        // with `contexts`, `resume_outcome` deliberately does **not** reset, and a
+        // suspended machine's modules are still alive.
+        self.local_callees.clear();
         // The raise-time snapshot belongs to the run that is starting too: it is the
         // pre-unwind frame chain of whichever raise last happened, and a fresh run
         // begins with no raise in flight. As with `contexts`, `resume_outcome`
