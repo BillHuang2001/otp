@@ -178,23 +178,19 @@ fn run_loop_case() -> counters::Counters {
 /// cross-function transfers — the `call` into `helper/1` and the callee's `return` onto
 /// the caller's continuation — and each of them names a function the *published*
 /// [`EntryTables`](super::runtime::EntryTables) do not describe (the driver entered the
-/// other one), so each one has to be resolved through the compiled artifact.
+/// other one), so each one has to resolve through the compiled artifact.
 ///
-/// Hence the exact total `2 * ELEMENTS` = **16**: [`ELEMENTS`] calls and [`ELEMENTS`]
+/// Hence the exact figure `2 * ELEMENTS` = **16**: [`ELEMENTS`] calls and [`ELEMENTS`]
 /// returns. Nothing else in the module transfers in-block (the `jump` is an
 /// intra-function branch the linker resolves, the `test`/`get_list`/`move` are inlined
 /// readers/writers and the `allocate`/`deallocate` are frame helpers), so the count is
 /// arithmetic rather than empirical — a change in it means the transfer shape itself
 /// changed.
 ///
-/// The memo splits that total into exactly **2 resolutions + 14 hits**. The two are the
-/// cold misses of an empty two-slot memo: the first transfer of the walk (the `call` into
-/// `helper/1`) and the first transfer back into `loop/1` (the `return`, which names a
-/// function the published tables — `helper/1`'s — do not describe). After those two the
-/// memo holds `{helper, loop}`, which is the whole alternation, so all `16 - 2 = 14`
-/// remaining transfers are answered by the memo. The cold count is a function of the
-/// *number of distinct functions in the cycle*, not of [`ELEMENTS`]: grow the walk and the
-/// hits grow with it while the resolutions stay at 2.
+/// Every one of the 16 is a **resolution** here: a transfer is answered by the artifact,
+/// and no per-run memo exists yet, so [`Counters::cross_function_memo_hits`] must stay
+/// exactly 0. When the memo lands it takes over the steady state and only this split
+/// moves — the total must stay 16.
 #[test]
 fn the_cross_function_transfers_of_a_loop_are_exactly_two_per_iteration() {
     let snapshot = run_loop_case();
@@ -220,29 +216,14 @@ fn the_cross_function_transfers_of_a_loop_are_exactly_two_per_iteration() {
         snapshot.cross_function_resolutions,
         snapshot.cross_function_memo_hits,
     );
-    // The memo changes WHERE a transfer is answered, never WHETHER one happens: the two
-    // counters above still sum to the total, and the split is now the memo's cold misses
-    // against its hits. This run is one `drive()`, i.e. one memo lifetime, so the two cold
-    // misses are this walk's only artifact lookups.
-    assert!(
-        snapshot.cross_function_memo_hits > 0,
-        "the per-run memo must answer the repeat transfers; hits: {}",
-        snapshot.cross_function_memo_hits
-    );
     assert_eq!(
         snapshot.cross_function_resolutions,
-        2,
-        "exactly the two cold misses of an empty two-slot memo reach the artifact; hits: {}",
-        snapshot.cross_function_memo_hits
+        2 * ELEMENTS as u64,
+        "no memo exists yet, so every one of the transfers reaches the artifact"
     );
     assert_eq!(
-        snapshot.cross_function_memo_hits,
-        2 * ELEMENTS as u64 - 2,
-        "every transfer after the two cold misses is answered by the memo"
-    );
-    assert!(
-        snapshot.cross_function_resolutions <= 2 * ELEMENTS as u64,
-        "the memo can only lower the resolution count, never raise it"
+        snapshot.cross_function_memo_hits, 0,
+        "there is no per-run memo yet, so nothing can be answered from one"
     );
 }
 // ---------------------------------------------------------------------------
@@ -363,24 +344,6 @@ fn to_lower_cross_function_transfers_per_call() {
         "every byte transfers twice (call + return); resolutions: {}, hits: {}",
         snapshot.cross_function_resolutions,
         snapshot.cross_function_memo_hits,
-    );
-    // The memo split. Each measured call is its own `run_export_outcome_with_tier`, hence
-    // its own `drive()` and its own memo lifetime, so each one pays exactly the two cold
-    // misses of an empty two-slot memo — `to_lower/1` → `char_to_lower/1` and the return
-    // back — and the memo answers the remaining `2 * len - 2` transfers of that call. The
-    // cold count is therefore a property of the caller/callee cycle, and the saving grows
-    // with the input: `2` artifact lookups instead of `2 * len`.
-    assert!(
-        snapshot.cross_function_memo_hits > 0,
-        "the per-run memo must answer the repeat per-byte transfers; hits: {}",
-        snapshot.cross_function_memo_hits
-    );
-    assert_eq!(
-        snapshot.cross_function_resolutions,
-        2 * measured as u64,
-        "one cold caller/callee cycle per call (each call is one memo lifetime); \
-         hits: {}",
-        snapshot.cross_function_memo_hits
     );
 }
 /// Stage `source` into a per-process temp dir and compile it with the system `erlc

@@ -262,26 +262,6 @@ pub(crate) struct JitRuntime<'a> {
     ///
     /// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
     pub(crate) compiled: *const CompiledModule,
-    /// The **per-run memo** of resolved cross-function transfer targets: the last two
-    /// `(artifact, function)` pairs [`cross_function_entry`] had to ask the artifact about,
-    /// with the block-entry tables it answered, so a repeat transfer resolves with a scan of
-    /// this array instead of a `RefCell` probe, an `Rc` clone and a table build.
-    ///
-    /// Two slots because the shapes that repeat alternate: a frame-preserving `call` into
-    /// another function and that callee's `return` onto the caller's continuation is a
-    /// two-function cycle (`cowboy_bstr:to_lower/1`'s per-byte `char_to_lower/1` call), so
-    /// `[caller, callee]` covers the steady state with a direct-mapped replacement policy.
-    /// The memo is filled **only** by a successful artifact resolution — a failed lazy
-    /// compile or an uncovered address keeps today's retry-every-time behaviour and is never
-    /// remembered as a decline.
-    ///
-    /// Per-run, not per-artifact: a fresh `drive()` starts from [`CrossEntry::EMPTY`] slots.
-    /// Read and written **only by Rust**; appended **after** [`Self::compiled`] so no
-    /// displacement generated code reads can move.
-    pub(crate) cross: [CrossEntry; 2],
-    /// The slot [`cross_function_entry`] fills next (0 or 1) — the direct-mapped
-    /// replacement cursor of [`Self::cross`].
-    pub(crate) cross_next: u8,
 }
 
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
@@ -376,67 +356,6 @@ impl EntryTables {
         None
     }
 }
-
-/// One remembered **cross-function transfer target**: the artifact, the function and the
-/// block-entry tables a previous [`cross_function_entry`] resolved, so a repeat transfer to
-/// the same function of the same artifact is answered as cheaply as the *same*-function
-/// shape the published [`EntryTables`] serve.
-///
-/// # Why the artifact pointer is part of the key
-///
-/// Two artifacts are two executable mappings with independent function tables, so a
-/// `(func, pc)` means different code in each: the memo is keyed by the **artifact** pointer
-/// as well as the function index. A hit therefore implies the tables in this entry are the
-/// tables of *that* artifact's function.
-///
-/// # Why an entry can never name a dropped artifact
-///
-/// The memo is per-[`JitRuntime`], i.e. per `drive()` call, and every artifact published
-/// into [`JitRuntime::compiled`] is kept alive by the driver for that whole call — the
-/// caller-owned one for module context `0` (`code`), a callee's `Arc<CompiledModule>` held
-/// by its `CalleeCode` otherwise, and `state.callees` only ever grows. Nothing clears the
-/// memo before the driver's loop exits, and the `JitRuntime` itself never outlives the
-/// loop, so no entry can outlive the artifact it names.
-///
-/// # Why the pointers inside it stay valid
-///
-/// The entry vectors this entry's [`EntryTables`] points into are built **before** their
-/// function's buffer is sealed and are never mutated afterwards, and the artifact that owns
-/// them outlives every run — exactly the argument [`EntryTables`] itself relies on.
-#[derive(Clone, Copy)]
-pub(crate) struct CrossEntry {
-    /// The artifact whose function tables this entry describes.
-    pub(crate) artifact: *const CompiledModule,
-    /// The function index inside that artifact.
-    pub(crate) func: u32,
-    /// The register-file bound the artifact reported for that function, re-checked on
-    /// every hit exactly as the miss path checks it.
-    pub(crate) bound: Option<u32>,
-    /// That function's block-entry tables.
-    pub(crate) tables: EntryTables,
-}
-
-impl CrossEntry {
-    /// An empty memo slot — a null artifact, which no published `compiled` can equal
-    /// (the driver publishes a real artifact or null, and the memo is only consulted after
-    /// the null check), so an empty slot never matches.
-    pub(crate) const EMPTY: CrossEntry = CrossEntry {
-        artifact: std::ptr::null(),
-        func: u32::MAX,
-        bound: None,
-        tables: EntryTables::NONE,
-    };
-
-    /// Whether this slot remembers `(artifact, func)`.
-    ///
-    /// `#[inline]`: the memo scan is two of these on the cross-function path, which is the
-    /// per-call shape a binary comprehension produces.
-    #[inline]
-    pub(crate) fn matches(&self, artifact: *const CompiledModule, func: u32) -> bool {
-        self.artifact == artifact && self.func == func
-    }
-}
-
 impl JitRuntime<'_> {
     /// Re-publish the current top frame's Y window into [`Self::y_base`]/[`Self::y_end`].
     ///
@@ -1703,28 +1622,12 @@ fn resume_in_block(
 /// module returns into the caller's function, whose blocks may be in another executable
 /// mapping of the same artifact).
 ///
-/// # The per-run memo ([`JitRuntime::cross`])
-///
-/// A repeat transfer to a function this run has already resolved is answered from the memo
-/// — the same two-entry table probe the same-function shape pays — instead of a `RefCell`
-/// probe, an `Rc` clone and a fresh [`EntryTables`] build. The memo is consulted **before**
-/// the artifact, and the two outcomes are counted separately (a hit is not also recorded as
-/// a resolution). A hit re-applies the *identical* work the miss path applies — the same
-/// register-file bound check and the same two-table entry precedence
-/// ([`EntryTables::entry`], whose answer is exactly what
-/// [`CompiledModule::native_entry_tables`] would have returned for that function) — so the
-/// memo can change **where** a transfer is answered, never **what** it answers.
-///
-/// A miss is remembered **only** when the artifact actually resolved the transfer. A failed
-/// lazy compile, a missing function and an uncovered address are retried every time, exactly
-/// as before the memo existed, so a decline is never cached.
-///
 /// Declines — `None` — on every shape today's return-to-driver path must keep: no artifact
 /// published (an interpreter step's iteration), an address the artifact compiled no block
 /// for, an address in a function this module does not have, and a function whose
 /// register-file bound the machine does not satisfy.
 fn cross_function_entry(
-    runtime: &mut JitRuntime<'_>,
+    runtime: &JitRuntime<'_>,
     func: u32,
     pc: u32,
 ) -> Option<(*const u8, Option<EntryTables>)> {
@@ -1732,33 +1635,7 @@ fn cross_function_entry(
     if compiled.is_null() {
         return None;
     }
-    // ── The memo: has this run already resolved this function of this artifact? ──
-    for slot in runtime.cross {
-        if !slot.matches(compiled, func) {
-            continue;
-        }
-        // Structural counter: a cross-function transfer the memo answered (the two
-        // counters are disjoint — this one does not reach the artifact).
-        #[cfg(test)]
-        super::counters::record_cross_function_memo_hit();
-        if let Some(highest) = slot.bound {
-            // The identical bound check the miss path applies: a memo can make the
-            // resolution cheaper, never skip a soundness guard.
-            // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
-            // `Machine`; no other `&mut Machine` exists while the helper runs.
-            let x_len = unsafe { (*runtime.machine).x.len() };
-            if x_len <= highest as usize {
-                return None;
-            }
-        }
-        // The same two-table precedence the artifact lookup uses; an address this
-        // function compiled no block for declines here exactly as it would there.
-        let entry = slot.tables.entry(func, pc)?;
-        return Some((entry, Some(slot.tables)));
-    }
-    // ── The miss: ask the artifact ──
     // Structural counter: one per cross-function transfer that has to ask the artifact.
-    // It sits **after** the memo scan, so a hit is never also counted as a resolution.
     #[cfg(test)]
     super::counters::record_cross_function_resolution();
     // SAFETY: `runtime.compiled` is the artifact the driver published for the module it is
@@ -1782,15 +1659,6 @@ fn cross_function_entry(
             return None;
         }
     }
-    // Remember the resolution for the rest of this run. Filled only here — a decline
-    // returned above, so the next transfer retries it exactly as it did before the memo.
-    runtime.cross[runtime.cross_next as usize] = CrossEntry {
-        artifact: compiled,
-        func,
-        bound,
-        tables,
-    };
-    runtime.cross_next = (runtime.cross_next + 1) % runtime.cross.len() as u8;
     Some((entry, Some(tables)))
 }
 
@@ -1798,7 +1666,7 @@ fn cross_function_entry(
 /// answers without touching the artifact, and no tables need re-publishing (they already
 /// describe that function).
 fn resolve_resume_entry(
-    runtime: &mut JitRuntime<'_>,
+    runtime: &JitRuntime<'_>,
     func: u32,
     pc: u32,
 ) -> Option<(*const u8, Option<EntryTables>)> {
