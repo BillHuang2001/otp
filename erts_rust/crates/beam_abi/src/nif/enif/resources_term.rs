@@ -49,7 +49,9 @@
 //!   recognise, where the C reads `DATA_TO_RESOURCE(obj)->type` unconditionally. That is the same
 //!   "is it mine?" rule [`enif_get_resource`](super::enif_get_resource) and
 //!   [`resource_type_has_down`](super::resource_type_has_down) already apply, and
-//! * a heap that cannot fit the reference block, and
+//! * a heap that cannot fit the reference block,
+//! * a reference id that does not fit the block's small-integer id word (unreachable in practice —
+//!   `2^59` draws — and a typed refusal, never a wrapped id; see "The id space" below), and
 //! * an object whose reference count has already reached **zero** (see below).
 //!
 //! # It takes a reference — and refuses to resurrect
@@ -69,14 +71,15 @@
 //! (`erl_check_io.c:1261`): a healthy mint is the only mint it allows, and a dying object must not be
 //! resurrected (its destructor is already queued, and a second one would run it twice).
 //!
-//! # Residual (honest)
+//! # The id space
 //!
-//! Like [`enif_make_resource`](super::enif_make_resource), the mint draws its id from this crate's
-//! **own** reference-id space ([`next_resource_ref_id`]), independent of `beam_process`'s
-//! `erlang:make_ref/0` id space — the same hazard class documented in the module header's
-//! substitution list. Two references from the two spaces can therefore share an id word; a caller
-//! that needs identity must compare [`Eterm::raw`] words (heap-address identity), not the printed
-//! `#Ref<…>`.
+//! Like [`enif_make_resource`](super::enif_make_resource), the mint draws its id from the **one**
+//! shared local reference-id space (`next_resource_ref_id` → `beam_common::next_ref_id`), the same
+//! source `erlang:make_ref/0`, the NIF `make_ref`, monitors, aliases, timers, `seq_trace` references
+//! and `beam_process`'s process table draw from. A resource term therefore never aliases a plain
+//! reference: a reachability predicate that matches reference *identity* (the id word) sees one
+//! unambiguous owner per id. The draw is narrowed to the block's small-integer slot with a
+//! **checked** conversion, and an unrepresentable id is a refusal (`None`), never a wrapped one.
 
 use super::*;
 
@@ -90,7 +93,8 @@ use libc::c_void;
 /// `obj` is the payload pointer a [`NifHost`] hook was handed (the `void* obj` operand of
 /// [`enif_select`](super::enif_select)); `host` is the host whose heap the reference block is built
 /// on. `None` means "no term" — the object is null, is not one this crate allocated, is already
-/// dying, or the heap is exhausted (module docs, "Refuse, never fabricate").
+/// dying, the heap is exhausted, or the drawn reference id is not representable in the block's id
+/// word (module docs, "Refuse, never fabricate").
 ///
 /// # The returned term
 ///
@@ -138,8 +142,10 @@ pub fn resource_term(host: &mut dyn NifHost, obj: *mut c_void) -> Option<Eterm> 
     // reported as `None`, and nothing is written before `write_resource_ref` fills the block.
     let hp = unsafe { host.heap().alloc_words(RESOURCE_REF_WORDS) }.ok()?;
     // SAFETY: `hp` addresses exactly the `RESOURCE_REF_WORDS` exclusively-owned, writable words just
-    // handed out, and they stay reachable from `host`'s heap for as long as the term is.
-    let reference = unsafe { write_resource_ref(hp) };
+    // handed out, and they stay reachable from `host`'s heap for as long as the term is. `None` (an
+    // unrepresentable reference id) writes no word and takes no reference, so the reserved words are
+    // simply abandoned.
+    let reference = unsafe { write_resource_ref(hp) }?;
     // The term takes its reference before it is published — the reference the C's magic ref holds.
     // SAFETY: `obj` was registered as live by `object_type` above (the registry removes the entry
     // before a block is freed, under that very lock), so its block is allocated and its header is

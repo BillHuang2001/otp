@@ -158,11 +158,15 @@
 //! destructor may call back in) — which is what a prune would have done, one park point earlier, and
 //! it keeps `resource_terms()`'s words unique.
 //!
-//! **Residual (reported, not closable from this file):** this crate's reference id space is its own
-//! (`next_resource_ref_id`), independent of the runtime's (`beam_process::ProcessTable::next_reference`,//! which feeds `make_ref/0`, monitors, aliases and timers). A *plain* reference whose id happens to
-//! equal a live resource term's id would resolve as that resource. `beam_process` documents the same
-//! hazard class ("HAZARD 2"); its closure is one shared id allocator at the host level (for instance a
-//! `NifHost` mint hook that draws from the runtime's allocator), which is a `beam_rt` change.
+//! **The id space is the ONE local reference-id space.** The minted reference's `id` is one draw from
+//! [`beam_common::next_ref_id`] (module `refid`), the single process-wide source every locally minted
+//! reference term draws from — `erlang:make_ref/0`, the NIF `make_ref`, monitor references and
+//! aliases, timer references, `seq_trace` references, `beam_process`'s process table, and this crate's
+//! resource terms. Because a reference's identity is its `id` word alone, two producers sharing one
+//! space can never hand out the same id, so a resource term can never alias a *live* plain reference
+//! (which a reachability predicate matching reference identity would read as "reached" and retain).
+//! The draw is narrowed to the block's small-integer id slot **checked** — an id past
+//! `beam_term::MAX_SMALL` is a typed refusal, never a wrapped id (see [`write_resource_ref`]).
 //!
 //! # The destructor's timing — the deviation the C does not let us close
 //!
@@ -1047,27 +1051,65 @@ const RESOURCE_REF_PAYLOAD_WORDS: usize = 3;
 
 /// The whole internal-reference block: the header word plus [`RESOURCE_REF_PAYLOAD_WORDS`].
 const RESOURCE_REF_WORDS: usize = RESOURCE_REF_PAYLOAD_WORDS + 1;
-/// The next resource-reference id.
+/// The id of a freshly minted resource reference: one draw from the process-wide local reference-id
+/// space, narrowed to the block's id slot.
 ///
-/// A process-wide monotonic counter, exactly like the C's reference id space: two
-/// `enif_make_resource` calls never mint the same id, so the two terms stay distinct (`#Ref<…>`
-/// answers differ), which is what the oracle does (measured).
-fn next_resource_ref_id() -> i64 {
-    static NEXT: AtomicUsize = AtomicUsize::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed) as i64
+/// The space is [`beam_common::next_ref_id`] — the **one** source every locally minted reference term
+/// draws from: `erlang:make_ref/0`, the NIF `make_ref`, monitor references and aliases, timer
+/// references, `seq_trace` references, `beam_process`'s process table, and this crate's resource
+/// terms. Two producers therefore never hand out the same id, so a resource term can never alias a
+/// live *plain* reference — which a reachability predicate matching reference *identity* (the id word
+/// alone) would read as "reached" and retain. A private counter here would reintroduce exactly that
+/// aliasing, which is why there is none.
+///
+/// `None` means "no representable id" — see [`narrow_ref_id`].
+fn next_resource_ref_id() -> Option<i64> {
+    narrow_ref_id(beam_common::next_ref_id())
+}
+
+/// [`beam_common::next_ref_id`]'s `u64` id narrowed to the **checked** `i64` small-integer range that
+/// [`write_resource_ref`]'s `make_small` id word can carry.
+///
+/// A reference's whole identity is that one `make_small(id)` word, so the representable range is
+/// `0..=`[`beam_term::MAX_SMALL`] (`2^59 - 1`); the bound is read from `beam_term`, which owns the
+/// term layout, and never transcribed here.
+///
+/// The narrowing is **checked on both ends** — `i64::try_from` rejects the whole upper half of the
+/// `u64` space and the `MAX_SMALL` test rejects the rest — because `make_small` is an unchecked
+/// `const fn` that only `debug_assert!`s its range (it mirrors the C macro on engine hot paths): an
+/// `as` cast would panic in a debug build and, in release, shift `1 << 59` into the immediate's sign
+/// bit, so the word would decode as a **negative** small and two distinct ids would collide. `None`
+/// is therefore a typed refusal — never a wrapped, truncated or substituted id.
+///
+/// # Is it reachable?
+///
+/// Only in principle. The shared counter hands out one id per locally minted reference term, so a
+/// process would need `2^59` (≈ `5.8e17`) of them — `make_ref/0`, monitors, aliases, timers and
+/// resource mints included — before this refused anything; and the counter's own `2^64` wrap lies far
+/// beyond that bound.
+fn narrow_ref_id(id: u64) -> Option<i64> {
+    // `MIN_SMALL` needs no test: a `u64` id is never negative, and `i64::try_from` already rejects
+    // everything above `i64::MAX`.
+    let id = i64::try_from(id).ok()?;
+    (id <= beam_term::MAX_SMALL).then_some(id)
 }
 
 /// Build the on-heap internal reference that designates a resource object (the C's magic ref).
 ///
 /// The block is `[make_header(3, REF_SUBTAG), node, serial, id]` on the host heap, with `node` and
-/// `serial` zero (Milestone 1 has one node and one id space) and a fresh monotonic `id`. Returns
-/// `None` only when the host heap cannot fit the four words.
+/// `serial` zero (Milestone 1 has one node, and every reference id comes from the one local space) and
+/// a fresh `id` from [`next_resource_ref_id`].
+///
+/// `None` when there is no faithful term to mint: the host heap cannot fit the four words, or the
+/// drawn id does not fit the block's small-integer id word ([`narrow_ref_id`], unreachable in
+/// practice). Either way **no reference is taken and no term is published**, so the caller's single
+/// release still frees the object.
 fn mint_resource_ref(e: &mut NifEnv) -> Option<Eterm> {
     // SAFETY: `alloc` hands out exactly `RESOURCE_REF_WORDS` exclusively-owned, writable words from
     // the host heap; `write_resource_ref` writes every one of them before the pointer escapes.
     let p = unsafe { alloc(e, RESOURCE_REF_WORDS) }?;
     // SAFETY: `p` addresses the `RESOURCE_REF_WORDS` words just handed out.
-    Some(unsafe { write_resource_ref(p) })
+    unsafe { write_resource_ref(p) }
 }
 
 /// Write the canonical internal-reference block for a resource term at `hp` and return the boxed
@@ -1078,20 +1120,30 @@ fn mint_resource_ref(e: &mut NifEnv) -> Option<Eterm> {
 /// passes words it obtained from a live env's host heap, and
 /// [`resource_term`](super::resource_term) passes words from the host it is handed.
 ///
+/// The `id` comes from [`next_resource_ref_id`], i.e. from the one shared local reference-id space
+/// (`beam_common::next_ref_id`), so a resource term never aliases a plain reference.
+///
 /// # Safety
 ///
 /// `hp` must point at [`RESOURCE_REF_WORDS`] **writable**, exclusively-owned words that stay valid
 /// (and reachable from the caller's heap) for as long as the returned term is.
-unsafe fn write_resource_ref(hp: *mut Eterm) -> Eterm {
+///
+/// Returns `None` — with **no word written**, so `hp`'s words stay untouched and unpublished — when
+/// the drawn id is not representable in the block's id word ([`narrow_ref_id`]). The caller then has
+/// no term to publish; the words it reserved may simply be abandoned (they are its own heap).
+unsafe fn write_resource_ref(hp: *mut Eterm) -> Option<Eterm> {
+    // The id is drawn and checked **before** any word is written, so a refusal cannot leave a
+    // half-built block behind.
+    let id = next_resource_ref_id()?;
     // SAFETY: the caller guarantees `RESOURCE_REF_WORDS` writable words at `hp`; every word of the
     // block is written below, before the pointer escapes.
     unsafe {
         *hp = prelude::make_header(RESOURCE_REF_PAYLOAD_WORDS, beam_term::REF_SUBTAG);
         *hp.add(1) = prelude::make_small(0); // node: the local node
-        *hp.add(2) = prelude::make_small(0); // serial: one id space in M1
-        *hp.add(3) = prelude::make_small(next_resource_ref_id());
+        *hp.add(2) = prelude::make_small(0); // serial: one local id space
+        *hp.add(3) = prelude::make_small(id);
     }
-    prelude::make_boxed(hp as *const Eterm)
+    Some(prelude::make_boxed(hp as *const Eterm))
 }
 /// Drop the reference an **evicted** (provably dead) binding held — outside the registry lock, so the
 /// destructor it may run can call straight back into these entry points.
@@ -1132,9 +1184,12 @@ pub unsafe extern "C" fn enif_make_resource(env: *mut ErlNifEnv, obj: *mut c_voi
         return bare_badarg();
     }
     let Some(reference) = mint_resource_ref(e) else {
-        // The host heap cannot fit a four-word reference term; fail loudly rather than minting a
-        // term that would not designate anything. (No reference is taken, so the caller's single
-        // release still frees the block — the term was never created.)
+        // No faithful term to mint: either the host heap cannot fit a four-word reference, or the
+        // drawn reference id does not fit the block's small-integer id word (`narrow_ref_id` — a
+        // typed refusal, never a wrapped id). Answer the C's `badarg` term, the failure this crate
+        // already gives for a mint that cannot happen, rather than minting a term that would
+        // designate something else. (No reference is taken, so the caller's single release still
+        // frees the block — the term was never created.)
         return bare_badarg();
     };
     // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
