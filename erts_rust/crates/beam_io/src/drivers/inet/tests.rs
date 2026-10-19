@@ -186,7 +186,11 @@ fn the_driver_registers_under_the_oracle_name() {
     assert_eq!(DRIVER_NAME, "tcp_inet");
     let driver = make_tcp_inet().expect("the factory builds a driver");
     assert_eq!(driver.name(), "tcp_inet");
-    assert!(driver.flags() == DriverFlags::empty());
+    // The entry's flag word is `ERL_DRV_FLAG_USE_PORT_LOCKING|ERL_DRV_FLAG_SOFT_BUSY`
+    // (`inet_drv.c:1374`); only `SOFT_BUSY` has a counterpart here, and it is what makes
+    // `port_command(P, D, [force])` answer `true` instead of raising `notsup`
+    // (`erl_bif_port.c:195-198`, pinned by `soft_busy_tests.rs`).
+    assert!(driver.flags().contains(DriverFlags::SOFT_BUSY));
 }
 
 #[test]

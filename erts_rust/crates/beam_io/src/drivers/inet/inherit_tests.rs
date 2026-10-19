@@ -42,11 +42,21 @@
 //!    `prim_inet:accept_opts/3`, which is the *Erlang* half that re-applies `{active, …}`) and
 //!    prints the `getopts` bytes of the accepted port and of the listener for comparison. It skips
 //!    **loudly** when `erl` is absent or does not answer.
+//! 4. **The registry route** (the last two tests): the same real accept, but every step through
+//!    [`crate::PortRegistry`] — the listener opened as a port, the reactor round producing the
+//!    completion, the listener reached as an `&TcpInetDriver` through
+//!    [`crate::PortRegistry::driver_as`], the descriptor adopted through
+//!    [`TcpInetDriver::from_accepted`], and the accepted driver opened as a **second** registry
+//!    port. That is the end-to-end shape the runtime runs, and the only route on which the copy
+//!    has to survive the port layer's `Box<dyn Driver>` erasure.
 
 use beam_common::BeamError;
 
+use super::make_tcp_inet;
 use super::op_queue::async_ok_reply;
-use super::opcode_tests::{erl_stdout, loopback_arg, op, open_arg, oracle_replies, CONTROL_MAGIC};
+use super::opcode_tests::{
+    erl_stdout, loopback_arg, op, open_arg, oracle_replies, Rig, CONTROL_MAGIC,
+};
 use super::opt::{
     SocketOptions, INET_LOPT_ACTIVE, INET_LOPT_BUFFER, INET_LOPT_DEBUG, INET_LOPT_DELIVER,
     INET_LOPT_EXITONCLOSE, INET_LOPT_HEADER, INET_LOPT_MODE, INET_LOPT_MSGQ_HIWTRMRK,
@@ -356,12 +366,11 @@ const ACCEPT_WAIT: Duration = Duration::from_secs(10);
 
 /// The driver plumbing a **bare** [`TcpInetDriver`] needs — its whole [`DriverContext`].
 ///
-/// The real-loopback half cannot use the `opcode_tests::Rig`: that owns the driver inside a
-/// [`crate::PortRegistry`], and [`TcpInetDriver::from_accepted`] needs `&TcpInetDriver` for the
-/// listener whose options are being inherited. So the driver stays in the test's hand and the
-/// context is built over these fields directly — the same shape
-/// [`crate::PortRegistry`] builds internally (one poller, the two byte queues, the arming mask and
-/// the four owner-side sinks).
+/// This half keeps the driver in the test's hand, so the two option stores can be compared
+/// directly. The registry route reaches the same listener through a port instead, via the
+/// downcast seam [`crate::PortRegistry::driver_as`] (see [`RegistryAccept`] below); the context
+/// built here is the same shape [`crate::PortRegistry`] builds internally (one poller, the two
+/// byte queues, the arming mask and the four owner-side sinks).
 struct Plumbing {
     poller: Poller,
     input: ByteQueue,
@@ -788,6 +797,230 @@ fn driver_only_options_are_reset_on_a_real_accepted_socket() {
     assert_ne!(
         child, listener,
         "none of the driver-only options may cross `accept(2)`"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The registry route: the same accept, every step through `PortRegistry`
+// ---------------------------------------------------------------------------
+
+/// The listener records the registry-route half installs: a non-default value in each inherited
+/// family the accepted socket reports, plus `{active, true}` for the negative half (`inet_start`
+/// resets it, so the copy must not carry it).
+const REGISTRY_RECORDS: &[(u8, i32)] = &[
+    (INET_LOPT_PACKET, 2),             // {packet, 2}
+    (INET_LOPT_PACKET_SIZE, 100),      // {packet_size, 100}
+    (INET_LOPT_HEADER, 1),             // {header, 1}
+    (INET_LOPT_MODE, MODE_BINARY),     // {mode, binary}
+    (INET_LOPT_TCP_HIWTRMRK, 4096),    // {high_watermark, 4096}
+    (INET_LOPT_TCP_LOWTRMRK, 2048),    // {low_watermark, 2048}
+    (INET_LOPT_TCP_SEND_TIMEOUT, 500), // {send_timeout, 500}
+    (INET_LOPT_ACTIVE, ACTIVE_TRUE),   // {active, true} — never copied
+];
+
+/// The `getopts` codes of the inherited block, in the order the reply reports them.
+const REGISTRY_INHERITED_CODES: &[u8] = &[
+    INET_LOPT_PACKET,
+    INET_LOPT_PACKET_SIZE,
+    INET_LOPT_HEADER,
+    INET_LOPT_MODE,
+    INET_LOPT_TCP_HIWTRMRK,
+    INET_LOPT_TCP_LOWTRMRK,
+    INET_LOPT_TCP_SEND_TIMEOUT,
+];
+
+/// Drives the registry's reactor rounds until the accept queued as `id` completes, returning the
+/// descriptor it handed over — a polled condition under [`ACCEPT_WAIT`], never a sleep-then-assert.
+///
+/// [`Rig::round`] alone would not do: the completion comes from a **readiness** event
+/// ([`TcpInetDriver::ready_input`]'s accept ladder), so the loop is the runtime's own
+/// `poller.poll` → [`crate::PortRegistry::handle_events`] → `take_completions`.
+fn drive_until_accepted_in_the_registry(rig: &mut Rig, id: u16) -> RawFd {
+    let deadline = Instant::now() + ACCEPT_WAIT;
+    loop {
+        let events = match rig.poller.poll(Some(Duration::from_millis(100))) {
+            Ok(events) => events,
+            Err(BeamError::Io(err)) if err.kind() == ErrorKind::Interrupted => Vec::new(),
+            Err(err) => panic!("the poll failed: {err:?}"),
+        };
+        rig.registry
+            .handle_events(&mut rig.poller, &events)
+            .expect("the ready events are dispatched");
+        for done in rig.registry.take_completions() {
+            if let CompletionEvent::InetAsync {
+                id: got,
+                result: InetAsyncResult::Accepted { fd },
+            } = done.event
+            {
+                assert_eq!(got, id, "the completion carries the accept's own id");
+                return fd;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the accept never completed within {ACCEPT_WAIT:?}"
+        );
+    }
+}
+
+/// One accept driven **entirely through** [`crate::PortRegistry`] — the C's `tcp_inet_copy` on the
+/// route the runtime runs.
+///
+/// The listener is a registry port (so its driver sits behind `Box<dyn Driver>`), the reactor
+/// round produces the accept completion, the descriptor is adopted through
+/// [`crate::PortRegistry::driver_as`]`::<TcpInetDriver>()` → [`TcpInetDriver::from_accepted`], and
+/// the accepted driver is opened as a **second** registry port whose `getopts` reply the
+/// assertions read. The driver-level half above cannot prove that part: there the listener is a
+/// `&mut TcpInetDriver` the test already owns.
+struct RegistryAccept {
+    rig: Rig,
+    /// The second port — the accepted connection's.
+    child: PortId,
+    /// The descriptor the accept handed over, now owned by the child port's driver.
+    fd: RawFd,
+    /// The far end, held so the connection is not closed under either driver.
+    _peer: TcpStream,
+}
+
+impl RegistryAccept {
+    fn new(records: &[(u8, i32)]) -> RegistryAccept {
+        let mut rig = Rig::new(make_tcp_inet().expect("the tcp_inet driver"));
+        assert_eq!(
+            rig.control(&op(OPEN), &open_arg()),
+            ctl_ok(),
+            "`open` answers `[1]`"
+        );
+        assert_eq!(
+            rig.control(&op(SETOPTS), &setopts_arg(records)),
+            ctl_ok(),
+            "the listener accepts its whole option list (`setopts` answers `[1]`)"
+        );
+        let bound = rig.control(&op(BIND), &loopback_arg(0));
+        assert_eq!(
+            bound.len(),
+            3,
+            "`bind` answers `[1, port_hi, port_lo]`, got {bound:?}"
+        );
+        assert_eq!(bound[0], INET_REP_OK, "`bind`'s result tag, got {bound:?}");
+        let bound = u16::from_be_bytes([bound[1], bound[2]]);
+        assert_ne!(bound, 0, "the kernel assigned an ephemeral port");
+        assert_eq!(
+            rig.control(&op(LISTEN), &[0, 5]),
+            ctl_ok(),
+            "`listen` answers `[1]`"
+        );
+        assert_eq!(
+            rig.control(&op(ACCEPT), &ACCEPT_TIMEOUT),
+            async_ok_reply(0),
+            "the accept queues and answers its id"
+        );
+        let peer = TcpStream::connect(("127.0.0.1", bound)).expect("a real loopback peer connects");
+        let fd = drive_until_accepted_in_the_registry(&mut rig, 0);
+        // The downcast is the seam: the listener is a registry port, so the only route to the
+        // `&TcpInetDriver` `from_accepted` wants is `driver_as`.
+        let child = {
+            let listener = rig
+                .registry
+                .driver_as::<TcpInetDriver>(rig.id)
+                .expect("the listener port's own tcp_inet driver");
+            TcpInetDriver::from_accepted(fd, listener)
+                .expect("the accepted descriptor is adopted with the listener's options")
+        };
+        let child = rig
+            .registry
+            .open(&mut rig.poller, Box::new(child))
+            .expect("the accepted connection opens as a second port");
+        assert_ne!(
+            child, rig.id,
+            "the accepted connection is a port of its own"
+        );
+        RegistryAccept {
+            rig,
+            child,
+            fd,
+            _peer: peer,
+        }
+    }
+
+    /// A `getopts`(8) reply from one of the two ports, through the registry's control seam.
+    fn getopts(&mut self, port: PortId, codes: &[u8]) -> Vec<u8> {
+        let Self { rig, .. } = self;
+        rig.registry
+            .port_control(&mut rig.poller, port, &op(GETOPTS), codes)
+            .unwrap_or_else(|err| panic!("the `getopts` call failed: {err:?}"))
+    }
+}
+
+/// The listener's inherited option block crosses `accept(2)` **through the registry**: the
+/// accepted driver (opened as a second registry port after a `driver_as` downcast) reports its
+/// listener's `{packet,_}`/`{packet_size,_}`/`{header,_}`/`{mode,_}`/watermark/send-timeout
+/// values, and the listener reports the identical bytes.
+///
+/// The value here is the **route**, not the mapping: `assert_inherited` above already proves
+/// `from_accepted` copies the store on a real accepted descriptor, but it holds the listener as a
+/// `&mut TcpInetDriver` the test owns. Here the listener is only reachable as
+/// [`crate::PortRegistry::driver_as`]`::<TcpInetDriver>()` — the port layer's `Box<dyn Driver>`
+/// really hands its concrete driver out, which is what the runtime's accept path depends on.
+#[test]
+fn the_registry_route_inherits_the_listeners_option_block() {
+    let mut accepted = RegistryAccept::new(REGISTRY_RECORDS);
+    let (child_id, listener_id, fd) = (accepted.child, accepted.rig.id, accepted.fd);
+    assert_eq!(
+        accepted
+            .rig
+            .registry
+            .driver_as::<TcpInetDriver>(child_id)
+            .expect("the accepted port's own driver")
+            .socket(),
+        Some(fd),
+        "the second port's driver owns the descriptor the accept handed over"
+    );
+
+    let child = accepted.getopts(child_id, REGISTRY_INHERITED_CODES);
+    let listener = accepted.getopts(listener_id, REGISTRY_INHERITED_CODES);
+    eprintln!("registry route: accepted {child:?}, listener {listener:?}");
+    assert_eq!(
+        child,
+        expected_getopts(&[
+            (INET_LOPT_PACKET, 2),
+            (INET_LOPT_PACKET_SIZE, 100),
+            (INET_LOPT_HEADER, 1),
+            (INET_LOPT_MODE, MODE_BINARY),
+            (INET_LOPT_TCP_HIWTRMRK, 4096),
+            (INET_LOPT_TCP_LOWTRMRK, 2048),
+            (INET_LOPT_TCP_SEND_TIMEOUT, 500),
+        ]),
+        "the accepted socket reports its listener's inherited block (`inet_drv.c:11809`-`:11844`)"
+    );
+    assert_eq!(
+        child, listener,
+        "the accepted port and its listener agree code for code"
+    );
+}
+
+/// The registry route is still the C's **selective** copy: the listener's `{active, true}` never
+/// reaches the accepted port, which reports `inet_start`'s passive start (`inet_drv.c:10929`).
+#[test]
+fn the_registry_route_leaves_the_activation_mode_behind() {
+    let mut accepted = RegistryAccept::new(REGISTRY_RECORDS);
+    let (child_id, listener_id) = (accepted.child, accepted.rig.id);
+
+    let child = accepted.getopts(child_id, &[INET_LOPT_ACTIVE]);
+    let listener = accepted.getopts(listener_id, &[INET_LOPT_ACTIVE]);
+    eprintln!("registry route: accepted {child:?}, listener {listener:?}");
+    assert_eq!(
+        child,
+        expected_getopts(&[(INET_LOPT_ACTIVE, 0)]),
+        "the accepted socket starts passive"
+    );
+    assert_eq!(
+        listener,
+        expected_getopts(&[(INET_LOPT_ACTIVE, ACTIVE_TRUE)]),
+        "the listener really was active, so the assertion above is not vacuous"
+    );
+    assert_ne!(
+        child, listener,
+        "`{{active, …}}` never crosses `accept(2)` — `prim_inet:accept_opts/3` re-applies it"
     );
 }
 
