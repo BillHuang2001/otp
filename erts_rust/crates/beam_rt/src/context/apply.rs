@@ -38,7 +38,8 @@ use std::sync::Arc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext};
-use beam_loader::{Atom, Function, FunDescriptor, ImportRef, Instr, Label, Module};use beam_term::Eterm;
+use beam_loader::{Atom, FunDescriptor, Function, ImportRef, Instr, Label, Module};
+use beam_term::Eterm;
 
 use super::bridges::descriptor_of;
 use super::runtime_context::RuntimeContext;
@@ -167,6 +168,7 @@ impl RuntimeContext<'_> {
             descriptor_of(module, uniq, index).map(|entry| (Arc::clone(module), entry))
         })
     }
+
     /// Applies a fun that has **no local label entry** — the fun kinds
     /// [`RuntimeContext::local_fun_target`] reports `Ok(None)` for.
     ///
