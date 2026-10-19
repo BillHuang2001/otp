@@ -1331,9 +1331,6 @@ impl PortRegistry {
     /// # Errors
     ///
     /// The poller's own de-registration failure.
-    // The `enif_select` half's caller (`NifHost::select`'s arm in [`crate::nif`]) is the next
-    // landing; the port layer owns the mechanism so the ABI layer needs no poller of its own.
-    #[allow(dead_code)]
     pub(crate) fn stop_nif_select(&mut self, fd: RawFd, handle: Eterm) -> Result<bool> {
         self.select.stop(&mut self.poller, fd, handle)
     }
@@ -1345,8 +1342,6 @@ impl PortRegistry {
     /// # Errors
     ///
     /// The poller's own re-registration or de-registration failure.
-    // As [`PortRegistry::stop_nif_select`]: the `enif_select` half's caller is not landed yet.
-    #[allow(dead_code)]
     pub(crate) fn cancel_nif_select(
         &mut self,
         fd: RawFd,
@@ -3771,7 +3766,12 @@ impl Runtime {
                         handle,
                         obj,
                     } => {
-                        let handle = select_notification_handle(*handle, *obj)?;
+                        let Some(handle) = select_notification_handle(*handle, *obj, *owner, ctx.runtime)?
+                        else {
+                            // The resource object is gone (released between arm and readiness):
+                            // nothing is delivered rather than a notification naming the wrong term.
+                            continue;
+                        };
                         let (from, message) = ctx.select_message(payload, *event, handle)?;
                         (*owner, from, message)
                     }
@@ -3803,21 +3803,35 @@ impl Runtime {
 /// from it.
 ///
 /// The C mints the interest object's magic reference when the notification is queued
-/// (`erts_mk_magic_ref`, `erts/emulator/sys/common/erl_check_io.c:746`), and keeps the object alive
-/// from arm time with a per-interest `enif_keep_resource` (`:1446`, `:1509`). The minting accessor
-/// is the NIF ABI layer's (`beam_abi`) and has no caller on this side yet, so a registration that
-/// carries an object is the **typed capability gap** rather than a notification whose second
-/// element names the wrong thing. A `prim_tty:tty_select/2` registration carries no object: its
-/// stored handle term is exactly the C's `argv[0]` resource term, so it is delivered as-is.
+/// (`erts_mk_magic_ref`, `erts/emulator/sys/common/erl_check_io.c:746`). The mint is
+/// [`crate::nif::resource_term_for`], which answers `None` for a null, foreign or already-dying
+/// object instead of fabricating one — and a refusal delivers **nothing**: a notification whose
+/// second element named the wrong thing would be a lie no caller can detect.
+///
+/// A `prim_tty:tty_select/2` registration carries no object: its stored handle term is exactly the
+/// C's `argv[0]` resource term, so it is delivered as-is.
+///
+/// The minted block is built on a scratch host's heap, so the term is copied onto the runtime's
+/// never-reset arena (`Runtime::stabilize_term`) before that host drops. The copy keeps the
+/// reference's identity word, which is what the resource registry is keyed by, so
+/// `enif_get_resource` still resolves it — and the reference the mint took is dropped by the
+/// ordinary park-arm resource prune ([`crate::context::gc::resources::reclaim`]) once the delivered
+/// message dies.
 ///
 /// This crate is `#![deny(unsafe_code)]`, so `obj` is only ever **moved** — never dereferenced.
-fn select_notification_handle(handle: Eterm, obj: *mut c_void) -> Result<Eterm> {
+fn select_notification_handle(
+    handle: Eterm,
+    obj: *mut c_void,
+    owner: beam_process::ProcessId,
+    runtime: &mut Runtime,
+) -> Result<Option<Eterm>> {
     if obj.is_null() {
-        return Ok(handle);
+        return Ok(Some(handle));
     }
-    Err(error::unsupported(
-        "enif_select: minting the notification's resource term is not implemented",
-    ))
+    let Some(minted) = crate::nif::resource_term_for(runtime, owner, obj) else {
+        return Ok(None);
+    };
+    Ok(Some(runtime.stabilize_term(minted)?))
 }
 
 impl RuntimeContext<'_> {
@@ -3948,7 +3962,13 @@ impl RuntimeContext<'_> {
                     if owner != self.pid() {
                         continue;
                     }
-                    let handle = select_notification_handle(handle, obj)?;
+                    let Some(handle) =
+                        select_notification_handle(handle, obj, owner, self.runtime)?
+                    else {
+                        // The resource object is gone (released between arm and readiness):
+                        // nothing is delivered rather than a notification naming the wrong term.
+                        continue;
+                    };
                     let (_from, message) = self.select_message(&payload, event, handle)?;
                     messages.push(message);
                 }
