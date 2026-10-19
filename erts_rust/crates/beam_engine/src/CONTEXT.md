@@ -57,6 +57,18 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   context-0 frame) is threaded from the driver through `step_instruction_with_entry` → `exec_bif` /
   `call_bif_named` / `dispatch_wide` / `families::dispatch` → `dispatch_bif_call`, and on the native tier
   through `JitRuntime.entry_module` (a field generated code never reads).
+- **The local-call seam's callee identity is memoized; the host's verdict is not.** `Machine::local_call_seam`
+  (`interpreter/dispatch.rs`) names the same-module callee of every local `call`/`call_only`/`call_last` and asks
+  `ExecutionContext::resolve_local_call(module, function, arity)` once per call. The three-value identity is a pure
+  function of the immutable module image, so `Machine::local_callees` (`machine/local_callee.rs`) memoizes it per
+  `(module address, function index)`; `Machine::reset` clears it, which is what keeps an address key ABA-free.
+  The host is still consulted **exactly once per call** — a host spends one reduction unit per consultation, and
+  `erlang:load_nif/2` can install a stub that a later call must be served from — so no verdict may ever be cached;
+  an un-nameable callee is consulted zero times (a memoized sentinel), exactly as before the memo existed.
+  A hit never reorders the memo and the keys live in a flat `[CalleeKey; 8]` beside the payloads, so the scan is
+  inlined and stays inside two cache lines (a move-to-front policy was measured as an instruction regression: an
+  alternating two-callee loop memmoved on every call). Both tiers drive this one definition, so the memo needs no
+  `src/jit/**` change, and the interpreter's three local-call arms plus the baseline tier's probe stay identical.
 - **`ExecutionContext::atoms` is the live atom namespace, for comparison AND for every raise.** The
   defaulted `fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable` (default body:
   `&module.atom_table`) is the namespace every **comparison** resolves names through: guards/
