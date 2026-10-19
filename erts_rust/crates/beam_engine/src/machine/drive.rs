@@ -51,7 +51,7 @@ use beam_loader::Module;
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::interpreter::{build_label_map, LabelMap};
+use crate::interpreter::LabelMap;
 use crate::Step;
 
 use super::{Continuation, Machine, ModuleContext, RunOutcome};
@@ -127,13 +127,15 @@ impl Machine {
         // process is scheduled in; the host reads the count when the slice returns).
         self.reductions = 0;
         // The entry module's label index. A run entry that already resolved its
-        // entry label hands its map in; otherwise it is built here (still exactly
-        // one build per run).
-        let built: LabelMap;
+        // entry label hands its map in; otherwise it comes from the machine's
+        // label-map cache, which builds the whole-module value only on a miss (a
+        // re-entered module answers from the entry `Machine::reset` deliberately
+        // keeps — it is content-keyed, not run-keyed).
+        let built: Arc<LabelMap>;
         let entry_labels: &LabelMap = match labels {
             Some(map) => map,
             None => {
-                built = build_label_map(module);
+                built = self.label_map(module);
                 &built
             }
         };

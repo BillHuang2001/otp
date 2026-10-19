@@ -380,6 +380,12 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // module handle it must be resumed in.
         self.contexts.clear();
         self.context = 0;
+        // The label-map cache is **deliberately not cleared**: unlike the entries above
+        // it is keyed on the module's content witness (digest + atom namespace) and its
+        // address, not on the run, so a map built for a module stays valid across every
+        // reset and a machine that runs one module repeatedly builds it once. A stale
+        // entry can never answer for another module (`label_cache.rs`).
+        //
         // The local-callee identity memo is address-keyed, so its entries are only valid
         // for the run that filled them: a fresh run must re-derive rather than answer
         // with an image that is no longer the one being executed. This is also what keeps

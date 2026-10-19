@@ -334,10 +334,13 @@ impl Machine {
     /// from `args`, the bottom frame is pushed, and the dispatch loop runs from the
     /// label's `(func, pc)`.
     ///
-    /// The module-wide label index is built **exactly once per run**: the entry
-    /// label is resolved against one [`interpreter::build_label_map`] and the very
-    /// same map is handed to the dispatch loop, instead of resolving the label with
-    /// one build and then rebuilding the identical map inside [`Machine::run_loop`].
+    /// The module-wide label index is built **at most once per module**, not once per
+    /// run: the entry label is resolved against [`Machine::label_map`]'s cache entry
+    /// and the very same map is handed to the dispatch loop, so a machine that runs one
+    /// module repeatedly pays the whole-module build (a traversal of every function's
+    /// label table plus the module's entire import table) on its first run only. A
+    /// synthetic module — the `Module::default()`-shaped image with no load-time digest
+    /// — is never cached and is built per run, exactly as before.
     pub fn run_label_outcome(
         &mut self,
         module: &Module,
@@ -352,7 +355,7 @@ impl Machine {
             self.set_x(i as u32, *arg)?;
         }
         self.push_frame(0)?;
-        let labels = interpreter::build_label_map(module);
+        let labels = self.label_map(module);
         let (func, pc) = interpreter::resolve(&labels, label)?;
         self.enter_run(module, func);
         self.run_loop_with_map(module, &labels, func, pc, ctx)

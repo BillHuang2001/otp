@@ -3388,11 +3388,15 @@ fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
         .expect("the exported run returns");
     assert_eq!(value, make_small(7), "the exported run returns the moved x(0)");
     let built_by_one_run = crate::interpreter::label_map_builds() - built_at_compilation;
-    assert!(
-        built_by_one_run <= 1,
-        "a run of an artifact that holds its own label map must NOT rebuild it in the \
-         driver: this run built {built_by_one_run} maps, and two would mean the \
-         driver's per-run build is back"
+    // `Machine::label_map` now caches the map per machine (`machine/label_cache.rs`),
+    // and this fixture is **synthetic** (all-zero checksum), which is never cached — so
+    // this run's count is exactly one *if* it consults the machine at all. It does not:
+    // the eager artifact holds its own map, so the export entry resolves against that
+    // and the run builds **zero**.
+    assert_eq!(
+        built_by_one_run, 0,
+        "a run of an artifact that holds its own label map must NOT build one in the \
+         driver: this run built {built_by_one_run} maps"
     );
 
     // Two more runs: the per-run cost is a constant, so nothing accumulates.

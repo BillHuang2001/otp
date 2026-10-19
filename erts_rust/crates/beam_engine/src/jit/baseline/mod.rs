@@ -710,7 +710,7 @@ fn enter_compiled_cached(
 }
 
 /// The module-wide label map a driver run resolves labels/imports through: the tier's
-/// own (built once with the artifact) when it holds one, else a fresh build.
+/// own (built once with the artifact) when it holds one, else the machine's cached one.
 ///
 /// `Deref`s to [`LabelMap`], so a driver call site passes it exactly as it passed the
 /// by-value map before ([`drive`] takes `&LabelMap`, [`interpreter::resolve`] too).
@@ -718,8 +718,9 @@ pub(crate) enum RunLabels<'a> {
     /// The map the tier's artifact already holds ([`NativeCode::labels`]): reused, so
     /// the run pays no per-run build.
     Stored(&'a interpreter::LabelMap),
-    /// The per-run map the driver built because the tier holds none.
-    Built(interpreter::LabelMap),
+    /// The map [`Machine::label_map`](crate::Machine) answered with because the tier
+    /// holds none — the machine's label-map cache, which builds on a miss only.
+    Built(std::sync::Arc<interpreter::LabelMap>),
 }
 
 impl std::ops::Deref for RunLabels<'_> {
@@ -737,8 +738,9 @@ impl std::ops::Deref for RunLabels<'_> {
 /// entry points share (it mirrors [`Machine::run_label`](crate::Machine)).
 ///
 /// The label map is **reused** from the tier's artifact when it holds one
-/// ([`NativeCode::labels`], i.e. the compiled map) and built here only otherwise: it is
-/// a per-module value, so rebuilding it on every run of the same artifact is pure
+/// ([`NativeCode::labels`], i.e. the compiled map) and taken from the machine's
+/// label-map cache otherwise ([`Machine::label_map`](crate::Machine)): it is a
+/// per-module value, so rebuilding it on every run of the same module is pure
 /// per-run overhead.
 fn enter_machine<'a>(
     machine: &mut Machine,
@@ -756,7 +758,7 @@ fn enter_machine<'a>(
     machine.set_literals(module.literals.clone());
     Ok(match code.labels(module) {
         Some(labels) => RunLabels::Stored(labels),
-        None => RunLabels::Built(interpreter::build_label_map(module)),
+        None => RunLabels::Built(machine.label_map(module)),
     })
 }
 
@@ -834,7 +836,10 @@ pub(crate) fn run_native_outcome(
         .ok_or_else(|| error::unsupported("jit: export not found"))?;
 
     let labels = enter_machine(machine, module, arity, args, code)?;
-    let (func, pc) = interpreter::resolve_label(module, entry)?;
+    // The entry label is resolved against the very map the run executes with (the
+    // tier's stored one, else the machine's cache entry), so the export path adds no
+    // whole-module build of its own.
+    let (func, pc) = interpreter::resolve(&labels, entry)?;
     // Record the run's entry call, exactly as every other run entry does
     // (`Machine::run_label_outcome`, `run_native_label_outcome`): without it the
     // export path would leave `Machine::entry_call` unset — the introspection
@@ -954,7 +959,7 @@ fn switch_into(
         // the wrong module.
         machine.set_literals(handle.module.literals.clone());
         let module = &*handle.module as *const Module;
-        let labels = &handle.labels as *const LabelMap;
+        let labels = Arc::as_ptr(&handle.labels);
         // Resolve the callee's compiled blocks once per context. A context the tier
         // has no blocks for keeps `active = None`: the driver runs that module on its
         // per-instruction interpreter step, exactly as it does an address its entry
