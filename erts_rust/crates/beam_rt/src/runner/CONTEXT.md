@@ -109,8 +109,8 @@ characterisation and figures are in `PERF.md`).
   decline, and jump a same-module local `call` straight into a non-exported callee's own body instead
   of letting the host that serves it dispatch it through `call_bif`
   (`RuntimeContext::resolve_local_call` → `crate::native::prim_tty::serves_local_call` for a built-in
-  NIF library's stub). Every other method of the seam is forwarded unchanged, so the redirect into
-  `inner` is purely mechanical.
+  NIF library's stub, then `beam_bifs::serves_local_call` for `zlib`'s 19 stream keys). Every other
+  method of the seam is forwarded unchanged, so the redirect into `inner` is purely mechanical.
 * **The slice's real context is built once per `run` call (one scheduler slice).** [`run`] constructs
   `RuntimeContext::for_process_with_engines` once, then wraps it in one `BudgetContext` and hands that
   wrapper to the whole machine run — so every BIF/`call_ext`/`call_bif` a slice makes shares **one**

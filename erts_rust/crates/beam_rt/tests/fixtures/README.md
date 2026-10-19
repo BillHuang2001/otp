@@ -961,6 +961,23 @@ A missing **committed** probe image is not a skip: `tests/fixtures/port_failure.
 repository artifact, so `require_probe_beam` panics with the regeneration recipe (and
 `the_probe_image_is_committed` fails alongside it), because skipping there would report nine green
 rows that compared nothing.
+### `zlib_stream_levels_fixture.erl` — compiled at test time, never committed as a `.beam`
+`zlib_stream_levels_fixture.erl` is the **`zlib` per-level / flush / init-form** image for
+`tests/zlib_stream_levels.rs`, driven through the scheduler `run` route
+(`beam_rt run <scratch>/zlib_stream_levels_fixture.beam zlib_stream_levels_fixture:<f>/0`). Like
+`zlib_stream.erl` it is **source only**: the suite compiles it into a per-fixture scratch directory
+holding only this module (a safe single `-pa` for the oracle) with the system `erlc` at test time.
+Six exported functions cover the six surfaces — `multi_sync/0` (the four-`sync`-then-`finish`
+transcript per compression level 0–9 with its per-call byte-count vector, total and md5),
+`flush_modes/0` (the whole payload with each flush), `init_forms/0` (`deflateInit/1,2,6`),
+`reset_mid_stream/0` (`deflateReset/1`), `deflate_params/0` (`deflateParams/3`) and `round_trip/0`
+(deflate → `inflate/2`).
+Every function **prints** its transcript with `io:format/2` and returns `ok`, never a binary: the
+`run` route renders its result with `~w`, and this runtime's binary printing is `<<55,56,…>>` where
+the oracle prints `<<"AB">>` for printable content (a pre-existing printer limitation, unrelated to
+`zlib`). Sizes are integers and digests are `binary:encode_hex/1` charlists, and the payload's own
+`bytes`/`md5` line pins it to the same 1 024 bytes the `-eval` probes build. A missing `erlc` skips
+the `run`-route half **loudly** (the `-eval` half still runs).
 ### `zlib_stream.erl` — compiled at test time, never committed as a `.beam`
 `zlib_stream.erl` is the **`zlib` stream-API** image for `tests/zlib_stream_dict.rs`, driven through
 the scheduler `run` route (`beam_rt run <scratch>/zlib_stream.beam zlib_stream:<f>/0`). Unlike the
