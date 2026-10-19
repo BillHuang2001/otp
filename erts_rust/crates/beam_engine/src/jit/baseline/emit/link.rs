@@ -897,8 +897,11 @@ mod tests {
     ///
     /// Four structural facts, each of which the exit would get wrong a different way:
     ///
-    /// * **(a) the spill comes first** — the tier's root-set contract, which no exit may
-    ///   skip ([`super::spill`]);
+    /// * **(a) the spill comes first** — the tier's root-set contract ([`super::spill`]).
+    ///   This emitter is called with [`ExitSpill::Required`] here, the shape whose caller
+    ///   emitted nothing that stored the cached x-registers; the probed local call passes
+    ///   [`ExitSpill::Done`], which skips only the *duplicate* store its own helper call
+    ///   already emitted (see `a_done_exit_emits_exactly_the_spill_it_skips_less`);
     /// * **(b) the helper gets the resolved successor word and then the frame size**, in
     ///   that order (the interpreter's `resolve`-then-`pop` order);
     /// * **(c) the exit does not leave the frame** — no [`emit_frame_teardown`], and the
@@ -1038,5 +1041,96 @@ mod tests {
             "a failed pop leaves for the epilogue with the helper's `ERROR`"
         );
         assert_eq!(exit[site], 0xE9, "a successful pop falls through to `jmp done`");
+    }
+
+    /// The **`ExitSpill::Done` saving**, byte for byte, on all three linked exits: `Done`
+    /// emits exactly the [`spill`] sequence it skips **less**, and nothing else changes.
+    ///
+    /// `Done` is the mode of the **probed local call** (`emit/block.rs`'s `call_last`,
+    /// `call_only` and the linked `call` arm): the arm called [`super::emit_helper_call`]
+    /// immediately before the exit, and that helper call's own [`SpillSite::Helper`] spill
+    /// — at the *same* `pc`, since [`Allocation::spill_slots_at`] is site-independent — had
+    /// already stored the same dirty set into `machine.x`. So the exit's store would write
+    /// those very words a second time, and `Done` is a pure removal of a **duplicated**
+    /// store: not a different exit shape, not a different ABI word, not a different
+    /// transfer. That is what the exact-length equality below pins.
+    ///
+    /// The allocation is the synthetic one the other exit tests use (its empty `spill_sets`
+    /// table falls back to the whole `written` set), so the spill here is **non-empty** and
+    /// the assertion cannot pass for the trivial "nothing was stored anyway" reason.
+    #[test]
+    fn a_done_exit_emits_exactly_the_spill_it_skips_less() {
+        let allocation = Allocation {
+            slots: vec![(0u32, Reg::R12)],
+            written: vec![0],
+            y_last: None,
+            ..Default::default()
+        };
+        let spill_len = spill_bytes(&allocation).len();
+        assert!(
+            spill_len > 0,
+            "the fixture's dirty x(0) must make the skipped spill non-empty"
+        );
+
+        // (a) `emit_exit` — `call_only`'s exit and the unlinked successor word.
+        let exit = |mode: ExitSpill| {
+            let mut buffer = CodeBuffer::new().unwrap();
+            let done = buffer.label();
+            let entries = BTreeMap::new();
+            Linker::new(&entries)
+                .emit_exit(&mut buffer, &allocation, done, 0, 7, 3, mode)
+                .unwrap();
+            buffer.len()
+        };
+        // (b) `emit_tail_exit` — the linked `call_last` transfer (it needs a landing entry).
+        let tail_exit = |mode: ExitSpill| {
+            let mut buffer = CodeBuffer::new().unwrap();
+            let target = buffer.label();
+            let done = buffer.label();
+            let mut entries = BTreeMap::new();
+            entries.insert((0u32, 7u32), target);
+            Linker::new(&entries)
+                .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3, 3, mode)
+                .unwrap();
+            buffer.len()
+        };
+        // (c) `emit_tail_exit_to_driver` — the resolved-but-uncompiled `call_last`, the
+        // lazy per-function artifact's common shape.
+        let tail_to_driver = |mode: ExitSpill| {
+            let mut buffer = CodeBuffer::new().unwrap();
+            let done = buffer.label();
+            let entries = BTreeMap::new();
+            Linker::new(&entries)
+                .emit_tail_exit_to_driver(&mut buffer, &allocation, done, 0, 7, 3, 3, mode)
+                .unwrap();
+            buffer.len()
+        };
+
+        for (what, required, done) in [
+            ("emit_exit", exit(ExitSpill::Required), exit(ExitSpill::Done)),
+            (
+                "emit_tail_exit",
+                tail_exit(ExitSpill::Required),
+                tail_exit(ExitSpill::Done),
+            ),
+            (
+                "emit_tail_exit_to_driver",
+                tail_to_driver(ExitSpill::Required),
+                tail_to_driver(ExitSpill::Done),
+            ),
+        ] {
+            assert!(done > 0, "{what}: the exit still emits code");
+            assert_eq!(
+                required,
+                done + spill_len,
+                "{what}: `Done` must emit exactly the helper call's already-stored spill \
+                 less — no other byte may change"
+            );
+        }
+
+        println!(
+            "=== ExitSpill::Done byte saving (one dirty cached x(0)) ===\n  \
+             skipped spill sequence: {spill_len} bytes"
+        );
     }
 }

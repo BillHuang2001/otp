@@ -491,3 +491,208 @@ fn the_undefined_label_variant_of_the_pin_still_deopts() {
         emitted.spill_calls_by_site,
     );
 }
+
+// ---------------------------------------------------------------------------
+// the probed local call spills ONCE, not twice
+// ---------------------------------------------------------------------------
+
+/// `f/0` — a **single-IR-block** function whose only exit is the probed local tail call
+/// `tail`, with one **dirty** cached x-register written in front of it.
+///
+/// Both halves are load-bearing for the pin:
+///
+/// * a **single block** means the probed exit is the *only* exit this function emits, so a
+///   `SpillSite::Exit` count can only come from it (a fall-through block end would
+///   contribute its own exit store);
+/// * the in-block `move 42 -> x(0)` makes that exit's dirty set **non-empty** — a spill of
+///   an empty set emits nothing, so the removed store would be unobservable both in the
+///   counters and in the emitted bytes.
+///
+/// `g/0` is a later **function**, so with a cache-free `compile_function` of `f/0` the tail
+/// call is resolved but unlinked (the lazy per-function artifact's own shape): `call_only`
+/// takes [`Linker::emit_exit`](super::emit::link)'s return-word arm and `call_last` takes
+/// [`Linker::emit_tail_exit_to_driver`](super::emit::link).
+fn probed_tail_call_module(name: &str, tail: Instr) -> (Module, Atom) {
+    let module = build_module(
+        name,
+        &[],
+        vec![
+            (
+                "f",
+                0u32,
+                vec![
+                    Instr::Label(Label(1)),
+                    Instr::Move {
+                        src: Operand::Integer(42),
+                        dst: Operand::X(0),
+                    },
+                    tail,
+                ],
+            ),
+            ("g", 0u32, vec![Instr::Label(Label(2)), Instr::Return]),
+        ],
+        &[("f", 0, Label(1))],
+    );
+    let name = export_atom(&module, "f");
+    (module, name)
+}
+
+/// **The pin for the redundant exit spill.** A probed local tail call emits the seam probe's
+/// helper call — whose `SpillSite::Helper` spill at the instruction's own `pc` is the tier's
+/// mandatory root-set contract — and then the block exit. Both used to store the same dirty
+/// cached x-registers at the same `pc`; the exit now passes
+/// [`ExitSpill::Done`](super::emit::link) and stores nothing.
+///
+/// The three assertions that matter, per shape:
+///
+/// * the probe's helper spill is still there — **exactly one** `Helper` spill call, storing
+///   the block's one dirty register (so the surviving store is real, not vacuous);
+/// * the exit records **zero** spill calls and zero stores at `SpillSite::Exit` (the
+///   redundant sequence is gone);
+/// * the instruction was lowered rather than deopted (`instr_instances`, no static deopt) —
+///   so the pin cannot pass because the arm never ran.
+///
+/// The exact byte saving is pinned in [`super::emit::link`]'s
+/// `a_done_exit_emits_exactly_the_spill_it_skips_less` (the `Required`-vs-`Done` length
+/// equality on all three exits); this test prints the shape's own emitted size, and the
+/// per-site store counts are its byte-level evidence (a store *is* one `mov`).
+#[test]
+fn the_probed_local_call_records_one_spill_call_and_none_at_the_exit() {
+    for (variant, what, tail) in [
+        (
+            "CallOnly",
+            "call_only",
+            Instr::CallOnly {
+                arity: 0,
+                target: Label(2),
+            },
+        ),
+        (
+            "CallLast",
+            "call_last",
+            Instr::CallLast {
+                arity: 0,
+                target: Label(2),
+                deallocate: 0,
+            },
+        ),
+    ] {
+        let (module, _name) = probed_tail_call_module(&format!("probed_exit_{what}"), tail);
+        let labels = crate::interpreter::build_label_map(&module);
+        crate::jit::cache::clear_baseline_cache();
+
+        counters::reset();
+        counters::set_enabled(true);
+        let compiled = compile_function(&module, &labels, 0).expect("f/0 compiles");
+        counters::set_enabled(false);
+        let emitted = counters::snapshot();
+
+        // The instruction was reached and lowered — otherwise "no exit spill" could be true
+        // for the wrong reason (a deopt that never reached the exit).
+        assert_eq!(
+            emitted.instr_instances.get(variant).copied(),
+            Some(1),
+            "{what}: the emitter must visit the instruction as an instance; visited: {:?}",
+            emitted.instr_instances,
+        );
+        assert_eq!(
+            emitted.instr_deopts.get(variant).copied().unwrap_or(0),
+            0,
+            "{what}: a resolved local tail call must not be deopted; static deopts: {:?}",
+            emitted.instr_deopts,
+        );
+        assert!(
+            compiled.entries.iter().any(|entry| entry.is_some()),
+            "{what}: the fixture's function must compile at least one block"
+        );
+
+        // The probe's own spill is the ONE the tier keeps: the helper is the interpreter and
+        // reads `machine.x`, and this is where the block's dirty `x(0)` reaches it.
+        assert_eq!(
+            emitted
+                .spill_calls_by_site
+                .get(&SpillSite::Helper)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "{what}: the local-call probe is the block's only helper call, and its spill is \
+             mandatory; spill calls by site: {:?}",
+            emitted.spill_calls_by_site,
+        );
+        assert_eq!(
+            emitted
+                .spill_stores_by_site
+                .get(&SpillSite::Helper)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "{what}: the probe's spill must really store the block's one dirty x(0) (so the \
+             removed exit store is non-empty); spill stores by site: {:?}",
+            emitted.spill_stores_by_site,
+        );
+
+        // … and the exit no longer stores the very same words a second time.
+        assert_eq!(
+            emitted
+                .spill_calls_by_site
+                .get(&SpillSite::Exit)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "{what}: the exit must emit no second spill — the probe already stored this pc's \
+             dirty set; spill calls by site: {:?}",
+            emitted.spill_calls_by_site,
+        );
+        assert_eq!(
+            emitted
+                .spill_stores_by_site
+                .get(&SpillSite::Exit)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "{what}: … and store no register at the exit site; spill stores by site: {:?}",
+            emitted.spill_stores_by_site,
+        );
+
+        println!("=== probed local call: {what} ({variant}) ===");
+        println!(
+            "  spill calls by site={:?} stores by site={:?} | block emitted bytes={}",
+            emitted.spill_calls_by_site,
+            emitted.spill_stores_by_site,
+            emitted.block_emitted_bytes,
+        );
+    }
+}
+
+/// The removed store is not observable: the probed `call_only` shape still returns the
+/// caller's `x(0)` on **both** tiers.
+///
+/// This is the shape-level counterpart of the [`link`](super::emit::link) byte pin — a value
+/// identity over the exact function the counters above are taken on, through the **runtime**
+/// path (the lazy per-function artifact + the driver), not just the cache-free compile.
+#[test]
+fn the_probed_tail_call_still_agrees_with_the_interpreter() {
+    let (module, name) = probed_tail_call_module(
+        "probed_exit_value",
+        Instr::CallOnly {
+            arity: 0,
+            target: Label(2),
+        },
+    );
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome(
+            "call_only/probed",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        assert_eq!(
+            (
+                returned("interpreter", interpreter),
+                returned("baseline", baseline)
+            ),
+            (make_small(42), make_small(42)),
+            "the probed tail call must reach the callee's own result on both tiers"
+        );
+    });
+}
