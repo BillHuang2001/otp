@@ -197,12 +197,19 @@ between sessions and up to 5× on a loaded one).
   match-context reuse + `bs_get_position` small integer `to_lower` 0.958 / `capitalize_token` 0.908
   (interpreter tier 0.963 / 0.963); `bs_create_bin` cold-body outlining `to_lower` 0.995 /
   `capitalize_token` 0.992 / `encode` 0.990 / `long_append` 0.982; the `bs_match` dispatch pre-test
-  `to_lower` 0.982 / `capitalize_token` 0.982 / `decode` 0.990 / `encode` 0.990. `list_walk` measures
+  `to_lower` 0.982 / `capitalize_token` 0.982 / `decode` 0.990 / `encode` 0.990; the
+  `read_size`/`decode_flags` hot/cold split `capitalize_token` **0.934**, `to_lower` **0.953**,
+  `encode` **0.971**, `decode` **0.972** (7 rounds, load band 8.43–10.25, 7/7 rounds below 1.0 on
+  all four, counters unchanged). `list_walk` measures
   0.995–1.005 medians against all of them (it executes no bitstring instruction), so the estimator
   carries no cross-workload bias.
-- **Measured negative, do not re-attempt:** recognising the six emitted `bs_match` command shapes as
+- **Measured negatives, do not re-attempt:** recognising the six emitted `bs_match` command shapes as
   whole-operand-list slice patterns ahead of the reference loop made `to_lower` **1.027×** *slower*
-  (`capitalize_token` 1.016, `encode` 1.012; 9 alternating rounds, 9/9 ≥ 1.0). The residual
+  (`capitalize_token` 1.016, `encode` 1.012; 9 alternating rounds, 9/9 ≥ 1.0); inlining
+  `matching::match_ctx::read_ctx`/`reread_ctx` regressed every bitstring workload (`to_lower` 1.026,
+  `capitalize_token` up to 1.050); and testing `small_value` before `raw::big_parts_safe` in
+  `create/mod.rs`'s integer-segment classification made `to_lower` 1.023 / `encode` 1.009 slower.
+  Full numbers: `bitstrings/CONTEXT.md` → `## Measured`. The residual
   `bs_match` cost belongs to the loader (see Handoffs).
 - The writable-accumulator growth curve is unchanged for 64 KiB of 512-byte appends from a 1 KiB hint:
   1 payload handle, 2 in-place grows, 4 moves and 61 440 bytes copied. `bitstrings/create/grow_tests.rs`
@@ -254,7 +261,7 @@ between sessions and up to 5× on a loaded one).
   (the match/dispatch/segment seams listed in `bitstrings/CONTEXT.md`) is unreachable from `src/jit/**`; a tier
   that wants a per-command entry needs `pub(crate) mod families` or targeted root re-exports. **OWNER: the
   parent `src/` node.**
-- **`src/exec_census.rs` is 1.24 % of `to_lower`'s self time while disabled** — the thread-local `bool`
+- **`src/exec_census.rs` is 2.12 % of `to_lower`'s self time while disabled** — the thread-local `bool`
   load sits on the per-instruction funnel. **OWNER: the parent `src/` node.**
 - **`Instr::SelectVal` materializes every pair operand** (`src/interpreter/dispatch.rs:353-362`): a `read_operand`
   per pair (`Operand::Integer`/`Operand::Character` → `terms::number::make_integer_unrooted`) followed by a full

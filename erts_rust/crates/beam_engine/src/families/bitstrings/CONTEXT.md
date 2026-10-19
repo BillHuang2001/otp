@@ -54,12 +54,19 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   oracle's error; the bit-at-a-time rule stands for every non-aligned shape, because a
   mid-byte destination needs `raw::InPlace::push_bit`'s byte-window handling (clearing an
   entered byte, and masking the one byte the accumulator's window ends inside).
-  `read_size` classifies a literal `Operand::Integer`/`Operand::Character` size directly
-  through `size_of_int` — it is by far the hottest size shape (`<<V:8>>` *is*
-  `Operand::Integer(8)`) and the general read would materialise an integer term only to read
-  that same value back; the reject case is the `#[cold] size_error`. `read_size`/`is_all`/
-  `decode_flags`/`flag_bit`/`small_value`/`sign_extend` and the hot `BitWriter` methods carry
-  `#[inline]`.
+  `read_size` and `decode_flags` are **hot/cold split**: an `#[inline(always)]` shell answers
+  the shape the compiler actually emits and forwards everything else to an `#[inline(never)]`
+  slow body, so the caller folds the decode into a discriminant test instead of paying a call
+  plus a `Result` returned through memory. `read_size`'s shell classifies a literal
+  `Operand::Integer`/`Operand::Character` size directly through `size_of_int` — it is by far the
+  hottest size shape (`<<V:8>>` *is* `Operand::Integer(8)`) and the general read would
+  materialise an integer term only to read that same value back — and forwards a runtime
+  `size(Expr)` register, a literal-area term and every reject case to `read_size_slow`. Its
+  reject case is the `#[cold] size_error`, shared by both halves. `decode_flags`'s shell answers
+  `Operand::Nil` (every flagless segment) with a plain zero and forwards a flag-atom list literal
+  to `decode_flags_slow`, which keeps the whole `flag_bit`/`native`-normalisation/`BSF_*` body
+  and the typed error unchanged. `is_all`/`flag_bit`/`small_value`/`sign_extend` and the hot
+  `BitWriter` methods carry `#[inline]`.
 - `raw.rs` → the family's **single** `#[allow(unsafe_code)]` module: `heap_bits` /
   `subject_bytes` (the subject triple), `ctx_parts`/`inner_orig`/`make_ctx`/
   `set_ctx_start` (the match context), `make_big`/`big_parts_safe` (bignums) and
@@ -303,7 +310,7 @@ add only their genuine results (`encode` additionally pays the `iolist_to_binary
 
 The three binary-comprehension workloads allocate **word-for-word what C allocates**, so **no
 avoidable allocation remains on these paths** — corroborated by a `perf` profile of `to_lower` in
-which no allocator symbol reaches the 1.2 % reporting floor.
+which no allocator symbol reaches the 1.1 % reporting floor.
 
 Wall clock (default tier, 19 alternating paired rounds, load band 1.23–2.12): `to_lower` 3 410.4 / 3 447.3 ns min/median at 7.87 ns per instruction,
 `capitalize_token` 4 376.7 / 4 404.2 at 6.67, `decode` 4 581.0 / 4 634.8 at 8.73, `encode`
@@ -312,23 +319,39 @@ Paired `post/pre` medians for the changes that landed (each its own ≥7-round a
 match-context reuse + `bs_get_position` small integer `to_lower` 0.958 / `capitalize_token` 0.908
 (interpreter 0.963 / 0.963), `bs_create_bin` cold-body outlining `to_lower` 0.995 /
 `capitalize_token` 0.992 / `encode` 0.990 / `long_append` 0.982, the `bs_match` dispatch pre-test
-`to_lower` 0.982 / `capitalize_token` 0.982 / `decode` 0.990 / `encode` 0.990.
+`to_lower` 0.982 / `capitalize_token` 0.982 / `decode` 0.990 / `encode` 0.990, and the
+`read_size`/`decode_flags` hot/cold split (7 alternating rounds, load band 8.43–10.25)
+`capitalize_token` **0.934** (per-round 0.897–0.957), `to_lower` **0.953** (0.941–0.998),
+`encode` **0.971** (0.944–0.980), `decode` **0.972** (0.959–0.981) — 7/7 rounds below 1.0 on all
+four, with every structural counter unchanged.
 `list_walk` measures 0.995–1.005 median against every one of them (it executes no bitstring
 instruction), so the estimator carries no cross-workload bias.
-Function-level self time on the current tree (`to_lower`, release, `perf record --call-graph dwarf`,
-`perf report --no-children`, ≥1.2 % self): `step_instruction_body` 13.37 %,
-`step_instruction_with_entry` 7.54 %, `run_commands` **6.35 %**, `create::assemble` **4.98 %**,
-`Machine::drive` 4.61 %, `interpreter::build_label_map` 3.16 %, `families::dispatch` 3.01 %,
-`beam_term::compare::cmp_impl` 2.92 %, `jit::baseline::bitstr::jit_bitstr` 2.76 %, `Machine::reset`
-2.67 %, `terms::number::make_integer_unrooted` 2.61 %, `matching::exec_other` 2.35 %,
-`jit::baseline::runtime::enter_in_block` 2.35 %, `matching::match_ctx::read_ctx` 2.13 %, `read_size`
-1.75 %, `decode_flags` 1.37 %, `exec_census::on_instruction` 1.24 % (while **disabled**).
+Function-level self time (`to_lower`, release, `perf record --call-graph dwarf`,
+`perf report --no-children`, ≥1.1 % self): `step_instruction_body` 15.43 %,
+`step_instruction_with_entry` 8.82 %, `create::assemble` **6.66 %**, `run_commands` **6.12 %**,
+`Machine::drive` 4.27 %, `beam_term::compare::cmp_impl` 3.96 %, `families::dispatch` 3.28 %,
+`jit::baseline::bitstr::jit_bitstr` 2.71 %, `interpreter::build_label_map` 2.33 %,
+`matching::exec_other` 2.27 %, `exec_census::on_instruction` 2.12 % (while **disabled**),
+`jit::baseline::runtime::enter_in_block` 1.99 %, `terms::number::make_integer_unrooted` 1.85 %,
+`create::exec` 1.80 %, `matching::match_ctx::read_ctx` 1.57 %, `Machine::reset` 1.28 %.
+`read_size` and `decode_flags` have no symbol of their own: both are folded into `run_commands`
+and `assemble` by their always-inlined shells (the inlined `size_of_int` is visible inside
+`run_commands`), so the two remaining in-node bodies are `assemble` and `run_commands`.
 Every remaining item is either outside this node (see `## Out-of-node findings`) or the
 `bs_match` interpretation C removes at load time.
-**Measured negative, do not re-attempt:** recognising the six emitted `bs_match` command shapes as
-whole-operand-list slice patterns ahead of the reference loop made `to_lower` **1.027×** *slower*
-(`capitalize_token` 1.016, `encode` 1.012; 9 alternating rounds, 9/9 rounds ≥ 1.0) — the shape test,
-`sizeable`/`atom_is` and the extra branch cost more than the two-iteration loop it replaced.
+**Measured negatives, do not re-attempt** (each reverted on its own paired evidence):
+- recognising the six emitted `bs_match` command shapes as whole-operand-list slice patterns ahead
+  of the reference loop made `to_lower` **1.027×** *slower* (`capitalize_token` 1.016, `encode`
+  1.012; 9 alternating rounds, 9/9 rounds ≥ 1.0) — the shape test, `sizeable`/`atom_is` and the
+  extra branch cost more than the two-iteration loop it replaced;
+- inlining `matching::match_ctx::read_ctx`/`reread_ctx` (7 rounds): `#[inline(always)]` on both
+  `to_lower` **1.026** / `capitalize_token` **1.024** / `decode` **1.020** / `long_append` 1.014,
+  and `#[inline]` plus a `#[cold] not_a_match_context` split `capitalize_token` **1.050** /
+  `long_append` 1.019 — the 4-tuple return plus the `raw::ctx_parts` validation is cheaper as a
+  call than folded into its three callers;
+- testing `small_value` before `raw::big_parts_safe` in `create/mod.rs`'s integer-segment
+  classification made `to_lower` **1.023** / `capitalize_token` **1.022** / `encode` 1.009
+  slower (7 rounds), so the bignum arm stays first.
 
 ## Remaining typed capability gaps
 Every gap is a typed error, never a wrong value. Each remaining site is a guard for a
@@ -390,7 +413,7 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
 - **`Machine::reset` 2.67 % + `interpreter::build_label_map` 3.16 %** are per-run entry costs in the
   parent's `run_label_outcome`/`reset` path, material at this harness' batch granularity.
   **OWNER: the parent `src/` node.**
-- **`src/exec_census.rs`** is 1.24 % of `to_lower`'s self time while **disabled** — the
+- **`src/exec_census.rs`** is 2.12 % of `to_lower`'s self time while **disabled** — the
   thread-local `bool` load sits on the per-instruction funnel; the instrument has no call site in
   this node.
 - **`tools/differential` corpus coverage hole** (see Test Strategy).
