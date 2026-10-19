@@ -2455,6 +2455,9 @@ mod accept_tests;
 #[path = "close_tests.rs"]
 mod close_tests;
 #[cfg(test)]
+#[path = "error_delivery_tests.rs"]
+mod error_delivery_tests;
+#[cfg(test)]
 mod fdopen_errno_tests;
 #[cfg(test)]
 mod frame_tests;
