@@ -96,8 +96,10 @@ use crate::nif::types::{ErlNifMonitor, ErlNifPid};
 /// ([`MonitorId::from_holder`]).
 ///
 /// The width follows [`REF_THING_BYTES`] — this tree's frozen 4-word internal reference, whose id
-/// lives in word 3 — so two monitors armed from different references have different ids (a C-width
-/// 3-word block would leave only `node`/`serial`, identical for every reference, in the key).
+/// lives in word 3 — so two monitors armed from different references have different ids. A
+/// caller-supplied **C-layout** 3-word block is accepted too ([`crate::nif::enif::process`]'s
+/// `ref_block_of`), and it distinguishes just as well: its packed `num[]` ids live in its own
+/// payload words, which are copied whole (the block's zero tail carries no identity).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MonitorId([u8; REF_THING_BYTES]);
 
