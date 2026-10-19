@@ -59,7 +59,7 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 - `maps/` (`mod.rs`, `read.rs`, `write.rs`) — `GetMapElements`/`HasMapFields`/`PutMapAssoc`/`PutMapExact`.
 - `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is this
   sub-node's `#[allow(unsafe_code)]` module (`records/raw.rs` is the other one in the node); `create/` =
-  `bs_create_bin` (with `create/whole.rs`, its whole-byte `integer` accumulator fast path), `matching/` = the
+  `bs_create_bin`, `matching/` = the
   match commands (with the allocation-aware context re-read elision). Endianness: `matching/reads.rs::field_is_little`
   is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit`
   normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand
@@ -175,9 +175,6 @@ with the host load, which is why `to_lower` appears twice.
   `match_ctx::read_ctx`'s profiled self-share 5.69 % → 1.77 %; the `dispatch` latch change moved no wall clock
   (post/pre medians 0.997 and 1.019 — inside a ±10 % noise band at load 20–35) but is deterministic:
   **−359 retired instructions per call (−0.19 %)** by `perf stat -e instructions` over the 180 000-call delta.
-- **Honest negative:** the `create/whole.rs` accumulator fast path is ~1.33–1.50× **slower** on `long_append`
-  than the generic walk. It is kept because it changes no result and leaves the general path untouched, not
-  because it wins that shape.
 - The writable-accumulator growth curve is unchanged for 64 KiB of 512-byte appends from a 1 KiB hint:
   1 payload handle, 2 in-place grows, 4 moves and 61 440 bytes copied. `bitstrings/create/grow_tests.rs`
   asserts the *shape*, not those exact figures (≤ 12 moves, `bytes_copied ≤ 2×` the appended bytes, ≥ 1
@@ -197,7 +194,7 @@ with the host load, which is why `to_lower` appears twice.
 ## Test Strategy
 - Per-family `#[cfg(test)]` unit tests over hand-built `Instr`s with a recording `ExecutionContext` stub:
   `mod.rs`, `receive.rs`, `records/tests/*`, `exceptions/tests/*`, `funs/tests.rs`,
-  `bitstrings/*/tests.rs`, `bitstrings/create/*_tests.rs` (incl. `create/whole/tests.rs`),
+  `bitstrings/*/tests.rs`, `bitstrings/create/*_tests.rs` ,
   `bitstrings/matching/*_tests.rs` (incl. the `matching/elision_tests.rs` re-read-elision suite), `bitstrings/raw.rs`.
 - The router's diagnostics contract is pinned by `mod.rs:321+` (`the_prefix_is_unchanged`); the receive
   family's tests assert an owned variant never reaches the sentinel again.

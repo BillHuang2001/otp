@@ -136,7 +136,6 @@
 
 mod segments;
 mod size;
-mod whole;
 
 use crate::interpreter::LabelMap;
 
@@ -226,11 +225,6 @@ pub(super) fn exec(
 ///
 /// `Err(step)` is a completed failure `Step` (a branch to `fail`, or a raise) — the
 /// caller returns it verbatim.
-///
-/// The compiler's whole-byte `integer` accumulator shape (every binary comprehension and
-/// `<<Acc/binary, …>>` loop) is resolved and written by [`whole::try_assemble`] instead of
-/// this walk, which then never runs; every other shape — and every runtime deviation from
-/// that shape — falls through to the generic loop below unchanged.
 #[allow(clippy::type_complexity)]
 fn assemble(
     machine: &mut Machine,
@@ -241,9 +235,6 @@ fn assemble(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<std::result::Result<Built, Step>> {
     let mut writer = BitWriter::default();
-    if let Some(done) = whole::try_assemble(&writer, machine, module, labels, fail, segments, ctx)? {
-        return Ok(done);
-    }
     let mut i = 0usize;
     while i < segments.len() {
         let Operand::Atom(type_atom) = &segments[i] else {

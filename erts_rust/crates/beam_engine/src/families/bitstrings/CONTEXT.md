@@ -126,37 +126,12 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     results.
 - `create/` → the construction side:
   - `mod.rs` → `exec` (`bs_init_writable`, `bs_create_bin`) and `assemble` (the flat
-    six-operand segment walk). `assemble` first offers the whole build to
-    [`whole::try_assemble`], which either writes the compiler's whole-byte accumulator shape
-    in one copy or answers `Ok(None)` **having written nothing**, so the walk below runs from
-    a pristine writer unchanged. A non-integer value is the bare `badarg` at **every**
+    six-operand segment walk).
+    A non-integer value is the bare `badarg` at **every**
     segment width (checked before the width dispatch, C's `erl_bits.c:952/1152`), and the
     `"integer"` arm routes a value to the shared `push_wide_int` (`mod.rs`, `> 64`-bit
     byte model) whenever `nbits > 64` **or** the value is a bignum, so a bignum is masked
     into a narrow field exactly as C's `fmt_big_be`/`fmt_big_le` do.
-  - `whole.rs` (+ `whole/tests.rs`) → the **whole-byte `integer` accumulator** fast path.
-    Every binary comprehension and every `<<Acc/binary, …>>` loop compiles to the same short
-    (`beam_ssa_codegen`'s two-to-four) group segment list, and `assemble`'s generic walk
-    re-derives on every execution a descriptor that is entirely compile-time constant
-    (type-atom names, unit, flags, the `all` test, the size, `size * unit`, the integer
-    classification) and then writes each field bit by bit.
-    `try_assemble` accepts only that shape: a **pristine** writer, a first group that is
-    `private_append` with size `all`, unit 1 or 8 bits and no flags, and then 1..=8 `integer`
-    groups naming the same type atom, each with unit 1, no flags and a **static** whole-byte
-    size in `8..=64` bits, over an accumulator that resolves to an in-place writable target
-    at a byte-aligned position (2..=9 groups in all). It resolves the plan once, reads every
-    field value into a stack buffer, then writes the whole run with ONE `push_bits_from` +
-    `finish_built()` (the fields are contiguous whole bytes, so their concatenation is
-    byte-identical to writing them one at a time). Every deviation — a rejected shape, a
-    `read_value` decline, a bignum or non-integer field, a non-writable accumulator, a
-    non-byte-aligned position — answers `Ok(None)` before a single bit is written, so the
-    general walk's bits, `fail` branch and typed errors all stand. The one failure the fast
-    path owns is the **non-bitstring accumulator** (the same `heap_bits` read reports the
-    generic walk's bare `badarg`). Its `#[cfg(test)]` thread-local tally `fast_builds` is the
-    only way a test can tell the two routes apart, since their results are identical by
-    construction; the writable-accumulator in-place/grow semantics are untouched. Measured:
-    ~1.33–1.50× slower on `long_append` than the generic walk — recorded as an honest negative
-    in `../CONTEXT.md` § Measured.
   - `segments.rs` → the per-segment-type sources and encoders (`segment_source`,
     `string_source`, `float_source`, `put_float`/`f64_to_f16`, `put_utf8/16/32`). The
     `float` source accepts a float, a small integer **or a bignum** (the nearest finite
