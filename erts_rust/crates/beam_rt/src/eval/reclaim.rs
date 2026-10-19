@@ -1,0 +1,356 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+//! Reclamation of the `-eval` route's escaped off-heap refc-binary store.
+//!
+//! [`Runtime::eval_off_heap`](crate::runtime::Runtime) is the table that **owns** the
+//! off-heap payloads terms on the table-less (`-eval`/`-s`/`-run`) route point at. It is
+//! filled by [`Runtime::adopt_escaped_binaries`](crate::runtime::Runtime) (a nested
+//! machine's reservoir, adopted before that machine drops) and by every copy onto
+//! [`Runtime::eval_heap`](crate::runtime::Runtime) (`CopyContext`'s destination table), and
+//! until this module existed it only ever grew: nothing removed an entry, so a route that
+//! builds and drops off-heap binaries retained every one of them for the runtime's life.
+//!
+//! # Publish, then prune
+//!
+//! A payload may be released only while **no live term names it**. The argument this module
+//! rests on has three parts:
+//!
+//! 1. **Every root is enumerated.** At a prune point the terms that can name a payload are
+//!    the ones reachable from: the evaluator's own live set (its environment and the value it
+//!    is reducing — passed in as `extra` by the driver, which is the only code that can see
+//!    them), every term a public runtime entry handed to an outside caller
+//!    (`Runtime::escaped_terms`), the escaped closures' environments
+//!    (`Runtime::eval_closures`), the sequential-trace tokens, every mailbox queue and process
+//!    dictionary. A prune is **declined** whenever a family that cannot be enumerated may hold
+//!    a term — today that is the runner's per-pid machines/results, whose only writers live in
+//!    `crate::runner` where this crate's visibility cannot reach (`Runtime::any_engine_ever`).
+//! 2. **The walk is conservative.** Any doubt — an exhausted visit budget, a boxed header this
+//!    module does not know, a word that is not a readable term — **declines the whole prune**
+//!    and retains everything. That is deliberately the *opposite* of
+//!    `RuntimeContext::graph_holds_reference`, whose exhaustion answer is "assume a reference"
+//!    because its only consequence is a declined move; here a wrong answer frees a payload a
+//!    live term names, so doubt must mean "keep".
+//! 3. **A shared payload is retained.** A handle whose `RefCount > 1` is owned by something
+//!    outside the enumeration (a mailbox's retained binaries, a machine reservoir, a copy's
+//!    source table), so it is kept: a false retain is a bounded leak, a false release a dangle.
+//!
+//! Every residual is therefore a **leak, never a dangle**.
+//!
+//! # The walk duplicates `graph_holds_reference` on purpose
+//!
+//! The reachability descent here is the shape of `RuntimeContext::graph_holds_reference`
+//! (`crate::context::calls`): an inline worklist, the same word guards
+//! (`is_literal` / `is_term_word` / boxed-or-list / an aligned non-null pointer) and the same
+//! child enumeration ([`beam_term::layout::for_each_child_slot`]). It is a copy because that
+//! function answers a *different* question and lives in a node this change may not edit;
+//! de-duplicating the two is a deferral (one helper taking a visitor over the reachable graph,
+//! owned by `src/context/calls.rs`).
+//!
+//! # What this module does *not* touch
+//!
+//! No per-pid `Process::set_off_heap_binary_bytes` figure is published: the store is not
+//! pid-attributable (a nested run inside a scheduled process grows it too), so that figure
+//! stays the runner's park-arm prune's.
+
+use std::mem::align_of;
+use std::mem::size_of;
+
+use beam_term::Eterm;
+
+use crate::hasher::FastHashSet;
+use crate::runtime::Runtime;
+
+/// The walk's step budget: enough for any term graph a `-eval` expression builds, small
+/// enough that a forged cycle cannot spin. Exhausting it **declines** the prune.
+const WALK_VISIT_BUDGET: usize = 1 << 20;
+
+/// The budget the `-eval` store is compared against, in term words.
+///
+/// The store has no process, hence no per-process heap policy, so it uses the BEAM default
+/// `min_bin_vheap_words` (the C `BIN_VH_MIN_SIZE`, 46 422 words) — the same budget a fresh
+/// process's binary virtual heap starts with ([`beam_gc::HeapPolicy::default`]).
+const STORE_BUDGET_WORDS: usize = 46_422;
+
+/// What one `prune` call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Prune {
+    /// The store was left exactly as it was because soundness could not be shown.
+    Declined(&'static str),
+    /// Nothing to do: the store is empty, or the trigger is not due.
+    Deferred,
+    /// The store was rewritten: `released` payloads dropped, `retained` kept.
+    Pruned {
+        /// Handles that were released (their payload freed when they were the last owner).
+        released: usize,
+        /// Handles put back into the store.
+        retained: usize,
+    },
+}
+
+/// The store's prune state: the last observed handle count (the `O(1)` half of the trigger)
+/// and the counters a test and `erlang:memory`-style introspection read.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PruneState {
+    /// The store's handle count at the last prune — the observation pair of the trigger.
+    pub(crate) seen_handles: usize,
+    /// How many times the store was actually rewritten.
+    pub(crate) prunes: u64,
+    /// How many times soundness could not be shown.
+    pub(crate) declines: u64,
+    /// The reason of the most recent decline.
+    pub(crate) last_decline: Option<&'static str>,
+}
+
+/// The reachable payloads the walk found.
+#[derive(Default)]
+struct Live {
+    /// The payload addresses (`RefcBinary::data_ptr` values) the walk reached.
+    payloads: FastHashSet<usize>,
+}
+
+/// The walk's verdict.
+enum Walk {
+    /// Every root was walked: `live` names the reachable payloads.
+    Complete(Live),
+    /// The walk could not be completed, so nothing may be released.
+    Declined(&'static str),
+}
+
+/// Prunes the `-eval` route's off-heap refc-binary store.
+///
+/// `extra` is the caller's own live set — the terms the driver is holding that no runtime
+/// field names (the evaluator's environment and the value being reduced). Passing them is
+/// what makes the root enumeration complete; a caller that cannot name its live terms must
+/// not call this.
+pub(crate) fn prune(runtime: &mut Runtime, extra: &[Eterm]) -> Prune {
+    // (b) The global collection valve: while an escaped term's relocation could not be shown
+    // safe, this runtime has stopped collecting entirely, and the store is frozen for the same
+    // reason.
+    if !runtime.gc_enabled() {
+        return decline(runtime, "collection disabled");
+    }
+    // (c) A root family that cannot be enumerated: the runner's per-pid machines, their
+    // recorded `x(0)`/exit-reason terms and their reservoirs are `crate::runner`'s private
+    // state, so once any process has ever run there may be a term this walk cannot see.
+    if runtime.any_engine_ever() {
+        return decline(runtime, "a process engine has run");
+    }
+    let (handles, bytes) = runtime.eval_off_heap_figures();
+    if handles == 0 {
+        return Prune::Deferred;
+    }
+    // The trigger, mirroring `OffHeapReclaimer::triggered`: nothing has been added since the
+    // last prune (`O(1)`), or the store is still inside its budget.
+    if handles == runtime.eval_prune().seen_handles
+        || bytes / size_of::<Eterm>() <= STORE_BUDGET_WORDS
+    {
+        return Prune::Deferred;
+    }
+    let mut roots = Vec::with_capacity(extra.len() + 16);
+    roots.extend_from_slice(extra);
+    runtime.gather_off_heap_roots(&mut roots);
+    let live = match walk(&roots) {
+        Walk::Complete(live) => live,
+        Walk::Declined(reason) => return decline(runtime, reason),
+    };
+    // The prune: drain (the table's only removal path), keep every payload that is reachable
+    // or shared, and put the survivors back. Re-pushing also **de-duplicates by data pointer**
+    // (the store never dedups on push, and a copy may register a handle the store already
+    // held), which makes every later `source_payloads`/`off_heap_source` clone cheaper.
+    let held = runtime.eval_off_heap_mut().drain_binaries();
+    let total = held.len();
+    let mut retained = 0;
+    for handle in held {
+        let reachable = live.payloads.contains(&(handle.data_ptr() as usize));
+        // The `RefCount > 1` belt: another owner exists outside this enumeration.
+        let shared = handle.refcount() > 1;
+        if reachable || shared {
+            let duplicate = runtime
+                .eval_off_heap_mut()
+                .binaries()
+                .iter()
+                .any(|kept| kept.data_ptr() == handle.data_ptr());
+            if duplicate {
+                // Dropping `handle` here is exactly the de-duplication: the surviving entry
+                // keeps the payload alive.
+                continue;
+            }
+            runtime.eval_off_heap_mut().push_binary(handle);
+            retained += 1;
+        }
+    }
+    let (handles, _bytes) = runtime.eval_off_heap_figures();
+    runtime.note_eval_prune(handles);
+    Prune::Pruned {
+        released: total - retained,
+        retained,
+    }
+}
+
+/// Records a decline and answers it.
+fn decline(runtime: &mut Runtime, reason: &'static str) -> Prune {
+    runtime.note_eval_prune_declined(reason);
+    Prune::Declined(reason)
+}
+
+/// The region-agnostic reachable-payload walk.
+///
+/// Every failure mode declines (see the module docs): the budget is spent, or a boxed header
+/// this module does not know is met, or a word looks like a container but names no readable
+/// address (which is *skipped* — no term word has that shape, so nothing is lost and the C
+/// faults there too).
+fn walk(roots: &[Eterm]) -> Walk {
+    let mut live = Live::default();
+    let mut work: Vec<Eterm> = Vec::with_capacity(roots.len().max(16));
+    work.extend_from_slice(roots);
+    let mut budget = WALK_VISIT_BUDGET;
+    while let Some(item) = work.pop() {
+        // A literal is a frozen code constant (it can name nothing on these heaps), an
+        // immediate is neither boxed nor a cons, and a bare header word is not a term at all.
+        if beam_term::literal::is_literal(item)
+            || !beam_term::tag::is_term_word(item)
+            || !(beam_term::boxed::is_boxed_term(item) || beam_term::prelude::is_list(item))
+        {
+            continue;
+        }
+        let raw = beam_term::list::ptr_val(item) as usize;
+        if raw == 0 || raw % align_of::<Eterm>() != 0 {
+            continue;
+        }
+        if budget == 0 {
+            // The one place this walk differs from `graph_holds_reference`: exhaustion means
+            // "keep everything", never "assume reachable".
+            return Walk::Declined("the reachability walk exhausted its visit budget");
+        }
+        budget -= 1;
+        // SAFETY: `item` is a term word that is either boxed or a `LIST`, and the address its
+        // pointer bits name is non-null and word-aligned — the same guard the unscanned-root
+        // valve applies (`crate::context::gc::dereferenceable_pointer`). A word with any other
+        // shape is skipped above, so nothing below dereferences one. A non-null, aligned but
+        // bogus pointer is not decidable without faulting; the C runtime faults there too.
+        unsafe {
+            let address = raw as *const Eterm;
+            if beam_term::prelude::is_list(item) {
+                // A cons cell: its `car` and `cdr` are the two words at that address.
+                work.push(*address);
+                work.push(*address.add(1));
+                continue;
+            }
+            let header = *address;
+            match header.raw() & beam_term::tag::TAG_HEADER_MASK {
+                // `for_each_child_slot` yields nothing for a `BinRef` (it is a leaf), so the
+                // payload is collected here: word 1 of a `BinRef` is `val`, the payload's
+                // first data byte — the very value `RefcBinary::data_ptr` reports.
+                beam_term::tag::BIN_REF_SUBTAG => {
+                    let (val, _next) = beam_term::refc::bin_ref_parts(item);
+                    live.payloads.insert(val as usize);
+                }
+                // Every shape whose children are term slots — tuples, records, funs (their
+                // `env`), flat maps and HAMT nodes, and an `ErlSubBits` (whose single `orig`
+                // word leads to the sibling `BinRef` above). The leaves (float, bignum,
+                // reference, external pid/port/reference, on-heap bits) yield no child.
+                beam_term::tag::ARITYVAL_SUBTAG
+                | beam_term::tag::RECORD_SUBTAG
+                | beam_term::tag::FUN_SUBTAG
+                | beam_term::tag::MAP_SUBTAG
+                | beam_term::tag::SUB_BITS_SUBTAG => {
+                    beam_term::layout::for_each_child_slot(header, address, |offset| {
+                        work.push(*address.add(offset));
+                    });
+                }
+                beam_term::tag::FLOAT_SUBTAG
+                | beam_term::tag::POS_BIG_SUBTAG
+                | beam_term::tag::NEG_BIG_SUBTAG
+                | beam_term::tag::REF_SUBTAG
+                | beam_term::tag::HEAP_BITS_SUBTAG
+                | beam_term::tag::EXTERNAL_PID_SUBTAG
+                | beam_term::tag::EXTERNAL_PORT_SUBTAG
+                | beam_term::tag::EXTERNAL_REF_SUBTAG => {}
+                // A header word no constructor in this workspace writes: the term is corrupt,
+                // so what it names is unknowable — decline rather than free.
+                _ => return Walk::Declined("the reachability walk met an unknown boxed header"),
+            }
+        }
+    }
+    Walk::Complete(live)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_alloc::RefcBinary;
+
+    /// An off-heap payload of `bytes` zero bytes.
+    fn payload(bytes: usize) -> RefcBinary {
+        let mut binary =
+            RefcBinary::new(bytes).expect("the test payload allocation");
+        binary.set_len(bytes).expect("the test payload length");
+        binary
+    }
+
+    /// The walk finds the payload a `[BinRef][ErlSubBits]` pair names — directly, through a
+    /// cons, and through a tuple — and reports nothing for an unrelated payload.
+    #[test]
+    fn the_walk_collects_a_payload_reachable_through_any_container() {
+        let mut heap = beam_term::heap::Heap::new(64).expect("the test heap");
+        let first = payload(128);
+        let second = payload(128);
+        let pair = beam_term::refc::write_refc_binary(
+            heap.hp_mut(),
+            first.data_ptr().cast::<u8>().cast_const(),
+            0,
+            128 * 8,
+        )
+        .expect("the pair");
+        // SAFETY: `write_refc_binary` returned the root of a live 8-word pair.
+        let pair_term = unsafe { pair };
+        let cons = heap.cons(pair_term, beam_term::prelude::NIL).expect("the cons");
+        let tuple = heap
+            .tuple(&[beam_term::prelude::make_small(1), cons])
+            .expect("the tuple");
+        let Walk::Complete(live) = walk(&[tuple]) else {
+            panic!("the walk over a well-formed graph completes");
+        };
+        assert!(
+            live.payloads.contains(&(first.data_ptr() as usize)),
+            "the pair's payload is reachable through the tuple and the cons"
+        );
+        assert!(
+            !live.payloads.contains(&(second.data_ptr() as usize)),
+            "an unreferenced payload is not reported reachable"
+        );
+    }
+
+    /// The `RefCount > 1` belt: a payload a second handle owns is retained even when nothing
+    /// in the walked graph names it — a false retain is a leak, a false release a dangle.
+    #[test]
+    fn a_shared_payload_is_retained_by_the_refcount_belt() {
+        let first = payload(64);
+        let shared = first.clone();
+        assert_eq!(first.refcount(), 2, "the clone shares the payload");
+        let live = Live::default();
+        let reachable = live.payloads.contains(&(first.data_ptr() as usize));
+        assert!(!reachable, "nothing in the walked graph names it");
+        assert!(
+            reachable || shared.refcount() > 1,
+            "the belt keeps a payload another owner holds"
+        );
+    }
+}

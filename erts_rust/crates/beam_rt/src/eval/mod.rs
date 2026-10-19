@@ -99,7 +99,7 @@ mod bits;
 mod bits_decode;
 mod bits_match;
 mod parse;
-
+pub(crate) mod reclaim;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -358,7 +358,11 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
     // this very pid can arrive.
     ctx.with_relocation_exempt(|ctx| {
         let tree = parse::parse(expr)?;
-        let mut evaluator = Evaluator { ctx };
+        let mut evaluator = Evaluator {
+            ctx,
+            depth: 0,
+            prune: true,
+        };
         let mut env = Env::new();
         let outcome = evaluator.expr(&tree, &mut env);
         finish(outcome, evaluator.ctx)
@@ -451,7 +455,11 @@ pub(crate) fn apply_eval_closure(
     let Some(body) = ctx.runtime.eval_closures.get(index).cloned() else {
         return Err(BeamError::BadArg);
     };
-    let mut evaluator = Evaluator { ctx };
+    let mut evaluator = Evaluator {
+        ctx,
+        depth: 0,
+        prune: false,
+    };
     let result = evaluator.apply_closure(&body, fun, args);
     finish(result, evaluator.ctx)
 }
@@ -460,13 +468,35 @@ pub(crate) fn apply_eval_closure(
 struct Evaluator<'a, 'b> {
     /// The host: the BIF registry, the shared atom table, the heap, the pid.
     ctx: &'a mut RuntimeContext<'b>,
+    /// How many `expr` frames are live right now.
+    ///
+    /// The escaped-payload prune ([`reclaim`]) is a **depth-0** operation: only at the top
+    /// level is the evaluator's live term set exactly its [`Env`] plus the value it is
+    /// reducing. Inside a nested expression the frames' partially built terms
+    /// ([`Evaluator::terms`]' `Vec<Eterm>`, [`Evaluator::list`]'s accumulator) are live and
+    /// unnamed, so a prune there could free a payload one of them still points at.
+    depth: usize,
+    /// Whether this evaluator may prune at all.
+    ///
+    /// Only the `-eval` **driver** ([`eval`]) enables it. [`apply_eval_closure`] builds a
+    /// fresh evaluator inside a running module's call, where the caller's terms are live
+    /// and unnameable from here, so a closure application never prunes.
+    prune: bool,
 }
 
 impl Evaluator<'_, '_> {
     // -- expressions ----------------------------------------------------------
 
-    /// Evaluates `expr` in `env`.
+    /// Evaluates `expr` in `env`, tracking the depth the escaped-payload prune depends on.
     fn expr(&mut self, expr: &Expr, env: &mut Env) -> EResult<Eterm> {
+        self.depth += 1;
+        let result = self.expr_inner(expr, env);
+        self.depth -= 1;
+        result
+    }
+
+    /// [`Evaluator::expr`] without the depth bookkeeping.
+    fn expr_inner(&mut self, expr: &Expr, env: &mut Env) -> EResult<Eterm> {
         match expr {
             Expr::Int(value) => self.integer(*value),
             Expr::Float(value) => Ok(heap!(terms::make_float(self.ctx, *value))),
