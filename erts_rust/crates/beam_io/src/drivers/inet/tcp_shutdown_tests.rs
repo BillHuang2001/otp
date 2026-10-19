@@ -345,10 +345,10 @@ fn an_unknown_how_defers_nothing_and_takes_the_shutdown_errno() {
 ///   (`INET_AF_LOOPBACK` = `4`, `:760`), **not** an address octet; a tag-less port-then-address
 ///   payload is refused (`[0]"eafnosupport"`) and the `accept` then blocks forever;
 /// * the connect completes asynchronously (`tcp_inet_ready_output` sets `INET_STATE_CONNECTED`
-///   before `async_ok`, `inet_drv.c:14284`/`:14287`), so the probe polls `GETSTATUS` until it reports
-///   [`CONNECTED`] instead of sleeping on it, bounded at 2000 polls (≈2 s) and loud when it runs
-///   out — an abnormal `-eval` exit loses the whole output (`opcode_tests::erl_stdout`'s note), so
-///   the give-up arm prints to `standard_error` and `halt(1)`.
+///   before `async_ok`, `inet_drv.c:14284`/`:14287`), so the probe polls `GETSTATUS` until it
+///   reports [`CONNECTED`] instead of sleeping on it, bounded at 2000 polls (≈2 s) and loud when it
+///   runs out — an abnormal `-eval` exit loses the whole output (`opcode_tests::erl_stdout`'s
+///   note), so the give-up arm prints to `standard_error` and `halt(1)`.
 ///
 /// **Skips loudly** when `erl` is not on `PATH` or does not answer within its budget.
 #[test]
