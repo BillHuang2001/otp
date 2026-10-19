@@ -80,13 +80,49 @@
 //! event: a traced run never enters native code at all, so there is nothing to emit
 //! here.
 //!
+//! # The two transfer shapes
+//!
+//! A local `call` has two of them, and the emitter picks one at compile time:
+//!
+//! * the callee's entry is a block **this** compilation emitted (`Linker::is_compiled`,
+//!   `super::emit::link`) — the eager whole-module artifact, or a call inside the function
+//!   being compiled — so the block transfers with the linker's linked exit, exactly as
+//!   `call_only`/`call_last` do, and the helper is [`jit_call_store`];
+//! * the callee lives in **another function of the same module** the lazy per-function
+//!   artifact has not compiled yet — the shape every cross-function non-tail `call` takes
+//!   on the runtime path (`CodeCache::compiled_handle`) — so the helper is
+//!   [`jit_call_store_linked`], which additionally resolves the callee's native entry
+//!   (lazily compiling that function on first entry, compile-on-entry exactly as the
+//!   driver does), performs the driver iteration the transfer replaces and hands the entry
+//!   back in `JitRuntime::resume_entry`. The block then tail-jumps into it
+//!   (`super::emit::link::emit_in_block_call`) instead of returning a word to the driver.
+//!
+//! The transfer is taken **only** on the `Stored` path, i.e. only when the host declined
+//! the local-call seam: a **served** callee's own code never runs, so it must get neither
+//! a return address nor a transfer. Every decline (no published artifact, an address no
+//! block covers, a failed lazy compile, an unsatisfied register-file bound) leaves the
+//! resolved target's `(func, pc)` word in `rax` — byte-for-byte the word the pre-existing
+//! unlinked exit produced — so the driver serves it exactly as before. A **cross-module**
+//! `call_ext*` is untouched: it needs the driver-owned module-context registry, the
+//! label-map and literal-area rebinding and the per-callee artifact publication, none of
+//! which the block ABI can express other than with [`ENTER`](super::runtime::ENTER).
+//!
+//! The position the transfer publishes is the **callee's entry** — the address a driver
+//! iteration would have published — so a `ctx.reduce` refusal parks the machine exactly
+//! where a driver-side refusal parks it and a resume executes each instruction exactly
+//! once. Resolution allocates no BEAM-heap term (only Rust/machine-code memory), so no GC
+//! root-set publication is involved.
+//!
 //! # The block ABI words
 //!
 //! * [`CALL_STORED`] — the continuation is in place; the emitted block transfers to the
-//!   callee (steps 5's transfer, through the linker).
+//!   callee (in-block through `resume_entry`, or through the linker for the compiled case).
 //! * the folded [`Step`](crate::Step) of a **served** callee (step 2 returned one), or
 //!   the interpreter's own typed diagnostic — the block leaves for the driver with that
 //!   word, exactly as it leaves with a deopt's.
+//! * [`ERROR`](super::runtime::ERROR) — the transfer's pre-emption charge was refused; the
+//!   host's error is in `JitRuntime::error` and the machine is parked at the callee's
+//!   entry.
 //!
 //! A served callee's continuation-store failure (`Machine::set_continuation`, an
 //! unreachable "no live frame" for a compiled `call`) is the folded typed error, reported
@@ -102,7 +138,7 @@ use crate::interpreter::{ImportFrame, LabelMap};
 use crate::machine::{Continuation, Machine};
 use crate::Step;
 
-use super::runtime::{fold_step, JitRuntime};
+use super::runtime::{encode_target, fold_step, JitRuntime};
 
 /// The block-ABI word [`jit_call_store`] answers when it has **stored the
 /// continuation**: "the `Call`'s `Continuation::Address` is in the live frame — transfer
@@ -122,13 +158,28 @@ use super::runtime::{fold_step, JitRuntime};
 /// reaches the driver's word decoder.
 pub(crate) const CALL_STORED: i64 = -5;
 
-/// The helper's two answers, in ordinary Rust types (see [`store_continuation`]).
+/// The helper's answers, in ordinary Rust types (see [`store_continuation`]).
 enum CallOutcome {
     /// The continuation is stored ([`CALL_STORED`]).
     Stored,
+    /// Leave this block-ABI word in `rax` as it is — the callee's `(func, pc)` target word
+    /// for a declined in-block transfer, or the transfer's [`ERROR`](super::runtime::ERROR).
+    Word(i64),
     /// Hand this folded step (a **served** callee's, or the interpreter's own error
     /// variant) back to the driver.
     Fold(std::result::Result<Step, Box<BeamError>>),
+}
+
+/// Which transfer the emitted block asked for — the only difference between the two
+/// `extern "C"` entry points, both of which share [`call_store_impl`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallMode {
+    /// [`jit_call_store`]: store and let the block transfer through the linker (the
+    /// callee's block is part of this compilation).
+    Store,
+    /// [`jit_call_store_linked`]: store **and** resolve the callee's native entry for an
+    /// in-block transfer (the lazy per-function artifact's cross-function shape).
+    StoreAndLink,
 }
 
 /// The compile-time-resolved facts about the local `call` a block emitted this helper
@@ -146,9 +197,10 @@ struct CallSite {
     /// The resolved target function (the interpreter's `callee`), i.e. the local-call
     /// seam's subject and the linker's transfer target.
     callee: u32,
-    /// The resolved target `pc` (the interpreter's `callee_pc`). Unused on the store path
-    /// — the transfer is the block linker's — and carried so the emitter hands over the
-    /// whole resolution and a debug build can prove the pair is the instruction's own.
+    /// The resolved target `pc` (the interpreter's `callee_pc`): the address the in-block
+    /// transfer enters when the emitted block asked for one, carried so the emitter hands
+    /// over the whole resolution and a debug build can prove the pair is the
+    /// instruction's own.
     callee_pc: u32,
     /// The instruction's `arity` operand: the callee's register-argument count, which
     /// only the local-call seam consumes.
@@ -156,7 +208,8 @@ struct CallSite {
 }
 
 /// Store the continuation of the local `call` at `(func, pc)` — or report what to do
-/// instead.
+/// instead. The **linked** sibling is [`jit_call_store_linked`]; both share
+/// [`call_store_impl`], so the store and the seam probe have one definition.
 ///
 /// Emitted by the block for `Instr::Call` (see `super::emit`), which passes the
 /// instruction's compile-time resolution as block-ABI arguments: `func`, `pc`, the
@@ -173,7 +226,7 @@ struct CallSite {
 ///   **one** definition of the block-ABI encoding.
 ///
 /// Nothing about the instruction is re-derived here: the emitter resolved the label at
-/// compile time (it had to, for the linker's transfer), so a release build trusts the
+/// compile time (it had to, for the transfer), so a release build trusts the
 /// arguments and a debug build re-checks them against the instruction and the driver's
 /// label map (see [`store_continuation`]).
 pub(crate) extern "C" fn jit_call_store(
@@ -183,6 +236,55 @@ pub(crate) extern "C" fn jit_call_store(
     callee: u32,
     callee_pc: u32,
     arity: u32,
+) -> i64 {
+    call_store_impl(rt, func, pc, callee, callee_pc, arity, CallMode::Store)
+}
+
+/// [`jit_call_store`] for a callee whose block is **not** part of this compilation (the
+/// lazy per-function artifact's cross-function `call`): store the continuation exactly as
+/// the plain helper does and then resolve the callee's native entry **in-block**, so the
+/// emitted arm tail-jumps into it instead of handing the driver a word.
+///
+/// Identical signature — `emit_helper_call` has only five argument registers and the plain
+/// helper already uses all five, so the mode cannot be an argument; the two entry points
+/// are the same function with a different [`CallMode`].
+///
+/// Ordering is load-bearing: the continuation store **and** the host's local-call seam run
+/// first, and the transfer is resolved only on the seam's **declined** path — a served
+/// callee never runs, so it must get neither a return address nor a transfer. On
+/// [`CALL_STORED`] the emitted arm reads
+/// [`JitRuntime::resume_entry`](super::runtime::JitRuntime); this helper has already
+/// published it, together with the callee's block-entry tables, and performed the skipped
+/// driver iteration (position store, reduction bump, pre-emption charge). Any other word is
+/// the pre-existing one: the resolved target for every decline, [`ERROR`](super::ERROR)
+/// for a refused charge.
+pub(crate) extern "C" fn jit_call_store_linked(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    callee: u32,
+    callee_pc: u32,
+    arity: u32,
+) -> i64 {
+    call_store_impl(rt, func, pc, callee, callee_pc, arity, CallMode::StoreAndLink)
+}
+
+/// The body both `extern "C"` entry points share: the store + the local-call seam
+/// ([`store_continuation`]), then — for [`CallMode::StoreAndLink`] only, and only when the
+/// continuation was actually stored — the in-block transfer resolution
+/// ([`enter_in_block`](super::runtime::enter_in_block)).
+///
+/// It allocates no BEAM-heap term: resolving the callee's entry may lazily **compile** that
+/// function, which allocates Rust/machine-code memory only, so no GC root-set publication
+/// is involved and the machine's registers are untouched.
+fn call_store_impl(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    callee: u32,
+    callee_pc: u32,
+    arity: u32,
+    mode: CallMode,
 ) -> i64 {
     let site = CallSite {
         func,
@@ -217,8 +319,33 @@ pub(crate) extern "C" fn jit_call_store(
 
         store_continuation(machine, entry_module, module, labels, site, ctx)
     };
+    // The transfer is resolved only for the linked entry point and only once the
+    // continuation is in place: a **served** callee's own code never runs, so it must get
+    // neither a return address nor a transfer, and a folded diagnostic has already left.
+    let outcome = match (outcome, mode) {
+        (CallOutcome::Stored, CallMode::StoreAndLink) => {
+            // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver
+            // owns; the borrows derived from it above are dead by now (the outcome owns no
+            // reference into it), so this borrow does not alias them.
+            let runtime = unsafe { &mut *rt };
+            let target = encode_target(callee, callee_pc);
+            let word = super::runtime::enter_in_block(runtime, callee, callee_pc);
+            // The in-block transfer was taken exactly when the resolver published an entry;
+            // a decline (no artifact, an uncovered address, a failed lazy compile, an
+            // unsatisfied register bound) and a refused pre-emption charge leave it null.
+            #[cfg(test)]
+            super::counters::record_in_block_call(!runtime.resume_entry.is_null());
+            if word == target {
+                CallOutcome::Stored
+            } else {
+                CallOutcome::Word(word)
+            }
+        }
+        (outcome, _) => outcome,
+    };
     match outcome {
         CallOutcome::Stored => CALL_STORED,
+        CallOutcome::Word(word) => word,
         CallOutcome::Fold(step) => {
             // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver
             // owns; the `&mut` derived from it above is dead by now, so this borrow does

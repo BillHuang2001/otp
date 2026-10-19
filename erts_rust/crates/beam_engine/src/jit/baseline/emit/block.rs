@@ -58,12 +58,12 @@ use super::compare::try_inline_comparison;
 use super::family;
 use super::frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use super::heap::{emit_allocate, emit_allocate_heap, emit_test_heap, emit_trim};
-use super::link::{emit_frame_teardown, Linker};
+use super::link::{emit_frame_teardown, emit_in_block_call, Linker};
 use super::operands;
 use super::prologue::emit_block_prologue;
 use super::r#move::{try_inline_move, try_inline_swap};
 use super::select::try_inline_select_val;
-use super::super::call::{jit_call_store, CALL_STORED};
+use super::super::call::{jit_call_store, jit_call_store_linked, CALL_STORED};
 use super::super::receive::jit_receive;
 use super::super::runtime::{
     ExtCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, LOCAL_DECLINE,
@@ -641,8 +641,7 @@ pub(crate) fn emit_block(
             // writes `Continuation::Address { func, pc: pc + 1, context }` into the
             // **live** frame, Rust-side `Machine` state (`Machine::frames`/`stack`) a
             // compiled block cannot address, so the store goes through the
-            // `jit_call_store` helper (`super::call`) while the transfer to the callee
-            // reuses the linker's exit exactly as `call_only` does.
+            // `jit_call_store*` helpers (`super::super::call`).
             //
             // The one helper call covers the store *and* the host's **local-call seam**
             // (`ExecutionContext::resolve_local_call`) — the interpreter's arm asks the
@@ -653,6 +652,21 @@ pub(crate) fn emit_block(
             // or the interpreter's own typed diagnostic) leaves the block for the driver
             // — the same probe-then-exit shape the two tail forms use through
             // [`emit_local_call_probe`].
+            //
+            // The **transfer** then has two shapes, chosen here at compile time:
+            //
+            // * the callee's block is part of **this** compilation (`linker.is_compiled` —
+            //   the eager whole-module artifact, or a call inside this very function), so
+            //   the block reuses the linker's linked exit exactly as `call_only` does;
+            // * it is **another function** of the same module that the **lazy**
+            //   per-function artifact has not compiled — the shape every cross-function
+            //   non-tail call takes on the runtime path (`CodeCache::compiled_handle`) — so
+            //   the arm asks for `jit_call_store_linked`, which stores the continuation
+            //   **and** resolves the callee's native entry (lazily compiling that function
+            //   on first entry, checking its register-file bound and performing the driver
+            //   iteration the transfer replaces), and then tail-jumps into it
+            //   ([`emit_in_block_call`]). Without this the call cost a full driver
+            //   round-trip per invocation — the last one left on the call path.
             //
             // The continuation check below is the **frame-only** body of `emit/heap.rs`'s
             // private `emit_frame_change_continue`, re-implemented here because the word
@@ -667,14 +681,24 @@ pub(crate) fn emit_block(
                 Ok((target_func, target_pc)) => {
                     // The helper is handed the **whole compile-time resolution** of the
                     // instruction — the call site, the resolved callee (and its `pc`,
-                    // which the linker exits to below) and the `arity` operand — so it
-                    // never re-reads `module.functions` nor re-resolves a label per call
-                    // (see `super::super::call`). `arity` is matched out of the pattern
-                    // here rather than ignored: it is the seam's register-argument count.
+                    // which the transfer enters) and the `arity` operand — so it never
+                    // re-reads `module.functions` nor re-resolves a label per call (see
+                    // `super::super::call`). `arity` is matched out of the pattern here
+                    // rather than ignored: it is the seam's register-argument count.
+                    //
+                    // The **linked** callee needs no resolution, so it keeps the plain
+                    // helper (byte-identical to before); an uncompiled one asks for the
+                    // linking twin.
+                    let linked = linker.is_compiled(target_func, target_pc);
+                    let helper: *const () = if linked {
+                        jit_call_store as *const ()
+                    } else {
+                        jit_call_store_linked as *const ()
+                    };
                     emit_helper_call(
                         buffer,
                         allocation,
-                        jit_call_store as *const (),
+                        helper,
                         &[
                             i64::from(func),
                             i64::from(pc),
@@ -687,7 +711,11 @@ pub(crate) fn emit_block(
                     buffer.mov_ri(Reg::R11, CALL_STORED)?;
                     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
                     buffer.jcc(Cond::Ne, done)?;
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
+                    if linked {
+                        linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
+                    } else {
+                        emit_in_block_call(buffer, allocation, done, target_func, target_pc)?;
+                    }
                     terminated = true;
                     break;
                 }
