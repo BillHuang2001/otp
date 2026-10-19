@@ -74,19 +74,29 @@
 //!   `tty_monitor_down` callback (`:1266-1276`) does `enif_select(..., ERL_NIF_SELECT_STOP, ...)`.
 //!   [`SelectWatch::prune_dead`] is that arm.
 //!
-//! # The resource term is minted at delivery, never at arm time
+//! # One reference per armed interest, released at disarm
 //!
 //! The C keeps the interest object alive with a per-interest `enif_keep_resource`
-//! (`:1446`, `:1509`) and mints the notification's magic reference when the event is queued. This
-//! module stores the **raw object pointer** the NIF handed over (`obj`, moved and never
-//! dereferenced — `beam_rt` is `#![deny(unsafe_code)]`) and mints the term at delivery through
-//! [`beam_abi::nif::enif::resource_term`], which refuses a null/foreign/dying pointer instead of
-//! fabricating one. A `resource_term` refusal delivers **nothing**.
+//! (`erts/emulator/sys/common/erl_check_io.c:1446`, and again for a postponed `stop_select` at
+//! `:1509`) and gives that reference back when the interest is dropped (`:1533`, `:913`, `:1834`,
+//! `:2242`).
+//! This module does the same: [`SelectWatch::arm`] takes one reference through
+//! [`keep_resource`], the registration owns it as a [`SelectHold`], and that hold gives it back
+//! **exactly once** at disarm.
 //!
-//! The residual that replaces `enif_keep_resource`: a registration holds no reference of its own, so
-//! an object released before its readiness arrives is destroyed and its select then delivers
-//! nothing, where the C would have kept it alive. It is a lost notification, never a dangling
-//! pointer.
+//! Holding it is what makes a released-but-armed object survive to its readiness: a NIF that arms a
+//! select and then drops its own reference still gets its notification, as it does in the C.
+//!
+//! The notification's resource term is minted **at delivery** through
+//! [`beam_abi::nif::enif::resource_term`], which refuses a null/foreign/dying pointer instead of
+//! fabricating one; a refusal delivers **nothing**.
+//! The interest's reference is released only **after** that mint, because the mint takes its own
+//! reference — releasing first would leave a window in which the object could be destroyed between
+//! the disarm and the mint.
+//!
+//! A non-null object this runtime cannot keep alive — one it never allocated, or one already dying —
+//! is refused at arm time, so no interest is armed for an object no notification could name.
+//! The raw pointer is moved and never dereferenced: `beam_rt` is `#![deny(unsafe_code)]`.
 //!
 //! # One registration per descriptor
 //!
@@ -100,6 +110,7 @@ use core::ffi::c_void;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 
+use beam_abi::nif::enif::resources::{keep_resource, unkeep_resource};
 use beam_common::Result;
 use beam_io::{Event, Interest, Poller, Ready, Token};
 use beam_process::ProcessId;
@@ -292,6 +303,85 @@ pub(crate) struct SelectDelivery {
     /// Moved, never dereferenced: it only ever flows into
     /// [`beam_abi::nif::enif::resource_term`].
     pub(crate) obj: *mut c_void,
+    /// The interest's own reference on [`SelectDelivery::obj`], carried to the **first** delivery of
+    /// a readiness.
+    ///
+    /// One reference per registration, so every later direction of the same readiness carries
+    /// `None`; an object-less registration (`prim_tty:tty_select/2`) carries `None` throughout. The
+    /// delivery releases it only after the resource term is minted (see [`SelectHold`]).
+    pub(crate) hold: Option<SelectHold>,
+}
+
+/// The reference one armed interest holds on its resource object — the C's per-interest
+/// `enif_keep_resource` (`erts/emulator/sys/common/erl_check_io.c:1446`).
+///
+/// It is held by the registration (and, across a delivery, by the [`SelectDelivery`] carrying the
+/// object) and released **exactly once**, when the hold drops: on [`SelectWatch::stop`], on a
+/// [`SelectWatch::cancel`] that leaves no direction armed, on [`SelectWatch::prune_dead`], on the
+/// delivery path after the notification's term is minted, or on the store's own teardown.
+/// "Exactly once" is by construction — one hold, one `Drop` — so a leaked interest is impossible.
+///
+/// The object is a raw `*mut c_void` that is only ever **moved**: [`keep_resource`] and
+/// [`unkeep_resource`] are safe functions, so this crate stays `#![deny(unsafe_code)]`.
+pub(crate) struct SelectHold {
+    /// The resource object the reference is held on.
+    obj: *mut c_void,
+    /// Whether the reference is still held (`false` once released, which is what makes the release
+    /// idempotent).
+    held: bool,
+}
+
+impl SelectHold {
+    /// Takes the interest's reference on `obj`.
+    ///
+    /// A null `obj` — the `prim_tty:tty_select/2` shape — carries nothing to keep, so `Ok(None)`.
+    /// A non-null object this runtime cannot keep alive (not one it allocated, or one already dying)
+    /// is refused, because arming an interest for an object nothing keeps alive could only deliver
+    /// nothing later; refusing here means no registration is created at all.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap for a non-null object [`keep_resource`] declines.
+    pub(crate) fn take(obj: *mut c_void) -> Result<Option<SelectHold>> {
+        if obj.is_null() {
+            return Ok(None);
+        }
+        if !keep_resource(obj) {
+            return Err(error::unsupported(
+                "select: the resource object is not one this runtime can keep alive (it never \
+                 allocated it, or it is already dying), so no interest was armed",
+            ));
+        }
+        Ok(Some(SelectHold { obj, held: true }))
+    }
+
+    /// Gives the reference back, at most once: an already-released hold — or one that never took a
+    /// reference — does nothing.
+    fn release(&mut self) {
+        if !self.held {
+            return;
+        }
+        self.held = false;
+        // A `false` answer means the object was destroyed (or was never this runtime's) without the
+        // count underflowing; it is tolerated and must never be followed by a second release.
+        let _ = unkeep_resource(self.obj);
+    }
+}
+
+impl Drop for SelectHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl core::fmt::Debug for SelectHold {
+    /// Never the bare pointer identity: what a reader needs is whether the interest still holds its
+    /// reference.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SelectHold")
+            .field("held", &self.held)
+            .finish()
+    }
 }
 
 /// One armed registration: the descriptor, its poller token, the owner, the interest mask and the
@@ -313,6 +403,8 @@ struct SelectRegistration {
     handle: Eterm,
     /// The resource object, or null.
     obj: *mut c_void,
+    /// The reference held on `obj` for this interest, or `None` when there is no object.
+    hold: Option<SelectHold>,
 }
 
 /// The runtime's registrations of `enif_select`/`prim_tty:tty_select/2` interests with its one port
@@ -370,10 +462,24 @@ impl SelectWatch {
     /// `obj` is the `void*` resource operand of `enif_select` (or null when the producer has none,
     /// as `prim_tty:tty_select/2` has). It is moved, never dereferenced.
     ///
+    /// # Take before commit
+    ///
+    /// The interest's own reference is taken **before** the poll set is touched, and a refusal
+    /// therefore arms nothing: a fresh arming that cannot keep its object registers no membership,
+    /// and a re-registration that cannot keep its new object leaves the existing registration
+    /// completely undisturbed (same key, same mask, same object, same hold). A poller failure then
+    /// drops the freshly taken hold, which releases the reference — so no route through this method
+    /// can leak one.
+    ///
+    /// A re-registration naming the **same** object keeps the existing hold rather than swapping
+    /// keep for unkeep: one interest, one reference, no window in which the object is unheld. A
+    /// different object replaces the hold only **after** the re-registration succeeded.
+    ///
     /// # Errors
     ///
-    /// The poller's own registration failure (the OS refuses the descriptor — a closed fd, say) or
-    /// the typed exhaustion of the key reservation.
+    /// The poller's own registration failure (the OS refuses the descriptor — a closed fd, say), the
+    /// typed exhaustion of the key reservation, or the typed refusal of a non-null object this
+    /// runtime cannot keep alive (see [`SelectHold::take`]).
     pub(crate) fn arm(
         &mut self,
         poller: &mut Poller,
@@ -394,6 +500,16 @@ impl SelectWatch {
                 ));
             };
             let widened = existing.interest.add(interest);
+            // The same object is already kept by this registration: one reference per interest, so
+            // it is neither released nor re-taken.
+            let same_obj = existing.obj == obj;
+            // Take **before** the commit: a refusal here leaves the existing registration exactly as
+            // it was, and a poller failure below drops `fresh` (releasing what it took).
+            let mut fresh = if same_obj {
+                None
+            } else {
+                SelectHold::take(obj)?
+            };
             poller.reregister(fd, existing.token, widened)?;
             let previous_handle = existing.handle;
             let _ = self.by_fd_handle.remove(&(fd, handle_key(previous_handle)));
@@ -407,6 +523,11 @@ impl SelectWatch {
             registration.payload = payload;
             registration.handle = handle;
             registration.obj = obj;
+            if !same_obj {
+                // Committed: the replaced hold drops here — after the successful re-registration —
+                // and releases the reference the old object's interest held.
+                registration.hold = fresh.take();
+            }
             self.by_fd_handle.insert((fd, handle_key(handle)), key);
             return Ok(());
         }
@@ -415,6 +536,9 @@ impl SelectWatch {
                 "select: the poller key reservation is exhausted",
             ));
         }
+        // Take before commit (see the docs above): a refused keep registers nothing with the poller,
+        // and a poller failure drops `hold`, releasing the reference.
+        let hold = SelectHold::take(obj)?;
         let key = self.next_key;
         let token = poller.register(fd, interest, key)?;
         self.next_key = key - 1;
@@ -428,6 +552,7 @@ impl SelectWatch {
                 payload,
                 handle,
                 obj,
+                hold,
             },
         );
         self.by_fd.insert(fd, key);
@@ -618,7 +743,13 @@ impl SelectWatch {
 
 /// The notifications one ready registration produces — **one per event** [`events_of`] reports, all
 /// carrying the registration's own owner, payload, handle and object.
+///
+/// The registration's [`SelectHold`] travels with the **first** delivery only: the interest took one
+/// reference, and that reference must outlive the mint that happens on the delivery path. Every later
+/// direction of the same readiness carries `None`, and a readiness that reports **no** direction drops
+/// the hold here (a disarm) — which is exactly right, since its reference must be given back too.
 fn deliveries_of(registration: SelectRegistration, observed: Observed) -> Vec<SelectDelivery> {
+    let mut hold = registration.hold;
     events_of(observed, registration.interest)
         .into_iter()
         .map(|event| SelectDelivery {
@@ -627,6 +758,7 @@ fn deliveries_of(registration: SelectRegistration, observed: Observed) -> Vec<Se
             event,
             handle: registration.handle,
             obj: registration.obj,
+            hold: hold.take(),
         })
         .collect()
 }

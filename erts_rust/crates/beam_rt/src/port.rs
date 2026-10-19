@@ -905,6 +905,13 @@ enum PortEvent {
         /// Moved out of the registration and never dereferenced: it only ever flows into
         /// [`beam_abi`]'s resource-term minting. A `prim_tty:tty_select/2` arming carries none.
         obj: *mut c_void,
+        /// The interest's **own reference** on [`PortEvent::Select::obj`], or `None`.
+        ///
+        /// It travels with the delivery so the object outlives the disarm that produced this event,
+        /// and it is released only **after** the notification's resource term is minted (the mint
+        /// takes its own reference): releasing it earlier could destroy the object between the
+        /// disarm and the mint. See [`select::SelectHold`].
+        hold: Option<select::SelectHold>,
     },
 }
 
@@ -2059,6 +2066,7 @@ impl PortRegistry {
                     event: delivery.event,
                     handle: delivery.handle,
                     obj: delivery.obj,
+                    hold: delivery.hold,
                 });
             }
             if !polled.is_empty() {
@@ -3658,7 +3666,7 @@ impl Runtime {
         // there is no `erl_signal_server`, so (like the C) nothing is sent.
         let signal_server = self.code_server.atoms().lookup("erl_signal_server");
         let mut delivered = 0;
-        for event in events {
+        for mut event in events {
             // An `{active, …}` delivery is rendered in the port's **effective** data mode — the
             // `{mode, …}` record its driver accepted (`inet_opts`), with the open-time stream as
             // the fallback — so a `{mode,list}` socket renders a char list as the oracle's does.
@@ -3670,6 +3678,14 @@ impl Runtime {
                         .map(|registry| registry.data_mode(packet.port, packet.data_mode))
                         .unwrap_or(packet.data_mode),
                 ),
+                _ => None,
+            };
+            // The interest's **own reference** on the select's resource object is lifted out here,
+            // before the arm borrows the event: it must be released only after that arm has minted
+            // the notification's term (which takes a reference of its own), so releasing it any
+            // earlier could destroy the object between the disarm and the mint.
+            let select_hold = match &mut event {
+                PortEvent::Select { hold, .. } => hold.take(),
                 _ => None,
             };
             // The term is built on the runtime's arena (the `RuntimeContext` the builders
@@ -3773,9 +3789,15 @@ impl Runtime {
                         event,
                         handle,
                         obj,
+                        ..
                     } => {
-                        let Some(handle) = select_notification_handle(*handle, *obj, *owner, ctx.runtime)?
-                        else {
+                        // The mint comes **first**: it takes its own reference on the object, so
+                        // the interest's reference (dropped right after) can never be the one that
+                        // destroys the object between the disarm and the mint.
+                        let minted =
+                            select_notification_handle(*handle, *obj, *owner, ctx.runtime)?;
+                        drop(select_hold);
+                        let Some(handle) = minted else {
                             // The resource object is gone (released between arm and readiness):
                             // nothing is delivered rather than a notification naming the wrong term.
                             continue;
@@ -3966,13 +3988,16 @@ impl RuntimeContext<'_> {
                     event,
                     handle,
                     obj,
+                    hold,
                 } => {
                     if owner != self.pid() {
                         continue;
                     }
-                    let Some(handle) =
-                        select_notification_handle(handle, obj, owner, self.runtime)?
-                    else {
+                    // The mint first, the interest's reference released only after it (see the
+                    // scheduler path's arm): the mint takes a reference of its own.
+                    let minted = select_notification_handle(handle, obj, owner, self.runtime)?;
+                    drop(hold);
+                    let Some(handle) = minted else {
                         // The resource object is gone (released between arm and readiness):
                         // nothing is delivered rather than a notification naming the wrong term.
                         continue;

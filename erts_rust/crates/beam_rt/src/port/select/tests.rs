@@ -29,7 +29,7 @@ use super::*;
 use beam_io::Ready;
 use beam_term::make_small;
 use std::collections::HashSet;
-
+use std::os::fd::AsRawFd;
 /// A poller and a watch with one `prim_tty:tty_select/2`-shaped registration (a read interest
 /// on [`TTY_IFD`], a plain payload, no resource object) armed, plus the terms it carries.
 fn armed() -> (Poller, SelectWatch, ProcessId, Eterm, Eterm) {
@@ -381,6 +381,7 @@ fn one_readiness_delivers_one_notification_per_direction() {
         payload: SelectPayload::Plain { reference },
         handle,
         obj: core::ptr::null_mut(),
+        hold: None,
     };
     let delivered = deliveries_of(
         registration,
@@ -401,4 +402,163 @@ fn one_readiness_delivers_one_notification_per_direction() {
             SelectPayload::Custom { .. } => panic!("a plain arming must not deliver a custom message"),
         }
     }
+}
+
+/// A dangling address this runtime never allocated: the "an object that is not ours" operand the
+/// keep refusal is about.
+fn dangling_obj() -> *mut c_void {
+    core::ptr::NonNull::<u8>::dangling().as_ptr().cast()
+}
+
+/// An arming with **no** resource object (`prim_tty:tty_select/2`'s shape) holds no reference at
+/// all — there is nothing to keep, and the registration must therefore carry no [`SelectHold`].
+#[test]
+fn an_arm_with_no_resource_object_takes_no_hold() {
+    let (_poller, watch, ..) = armed();
+    let registration = &watch.registrations[&TTY_KEY_TOP];
+    assert!(
+        registration.obj.is_null(),
+        "the tty arming carries no resource object"
+    );
+    assert!(
+        registration.hold.is_none(),
+        "so there is no reference to hold (or to release)"
+    );
+}
+
+/// A non-null object this runtime cannot keep alive is **refused**, and a refusal arms nothing: no
+/// registration, no descriptor index entries, and the key counter untouched — so the poller was
+/// never asked to register the descriptor and a later, keepable arming of the same descriptor still
+/// succeeds.
+///
+/// The descriptor is a socketpair end rather than an inherited one: the sandbox refuses `fcntl` on
+/// inherited descriptors (see `port/tests.rs`'s `armed_select`), while `UnixStream::pair` always
+/// accepts.
+#[test]
+fn an_object_this_runtime_cannot_keep_is_refused_and_arms_nothing() {
+    let (local, _peer) = std::os::unix::net::UnixStream::pair().expect("a socketpair");
+    let fd = local.as_raw_fd();
+    let mut poller = Poller::new().expect("a poller");
+    let mut watch = SelectWatch::new();
+    let refused = watch.arm(
+        &mut poller,
+        fd,
+        Interest::READABLE,
+        ProcessId::new(7, 0),
+        SelectPayload::Plain {
+            reference: make_small(22),
+        },
+        make_small(11),
+        dangling_obj(),
+    );
+    assert!(refused.is_err(), "an unkeepable object must not arm an interest");
+    assert!(!watch.is_armed(), "nothing was armed");
+    assert!(watch.by_fd.is_empty(), "no descriptor index entry");
+    assert!(watch.by_fd_handle.is_empty(), "no (fd, handle) index entry");
+    assert_eq!(
+        watch.next_key, TTY_KEY_TOP,
+        "a refused arming consumes no poller key"
+    );
+
+    // The poller was never touched by the refusal: the same descriptor is still registrable.
+    watch
+        .arm(
+            &mut poller,
+            fd,
+            Interest::READABLE,
+            ProcessId::new(7, 0),
+            SelectPayload::Plain {
+                reference: make_small(22),
+            },
+            make_small(11),
+            core::ptr::null_mut(),
+        )
+        .expect("the refused arming left the poller untouched");
+    assert!(watch.is_armed());
+    assert_eq!(watch.by_fd.get(&fd).copied(), Some(TTY_KEY_TOP));
+}
+
+/// The re-registration path refuses the same way and leaves the **existing** registration
+/// completely undisturbed: same key, same interest, same handle, same object, same (absent) hold —
+/// and the widened mask is never applied to the poll set.
+#[test]
+fn a_refused_re_registration_leaves_the_existing_registration_undisturbed() {
+    let (mut poller, mut watch, owner, handle, reference) = armed();
+    let before = &watch.registrations[&TTY_KEY_TOP];
+    let (token, interest, obj) = (before.token, before.interest, before.obj);
+    assert_eq!(watch.by_fd.len(), 1);
+
+    let refused = watch.arm(
+        &mut poller,
+        TTY_IFD,
+        Interest::WRITABLE,
+        owner,
+        SelectPayload::Custom {
+            message: make_small(44),
+        },
+        make_small(33),
+        dangling_obj(),
+    );
+    assert!(
+        refused.is_err(),
+        "an unkeepable object must not re-arm an interest"
+    );
+    assert!(watch.is_armed(), "the existing registration survives");
+    assert_eq!(watch.registrations.len(), 1);
+    assert_eq!(watch.by_fd.get(&TTY_IFD).copied(), Some(TTY_KEY_TOP));
+    let after = &watch.registrations[&TTY_KEY_TOP];
+    assert_eq!(after.token, token, "the poller token is unchanged");
+    assert_eq!(after.interest, interest, "the widened mask was not applied");
+    assert_eq!(after.handle, handle, "the handle is unchanged");
+    assert_eq!(after.obj, obj, "the object is unchanged");
+    assert!(after.obj.is_null(), "the tty arming carried no object");
+    assert!(
+        after.hold.is_none(),
+        "so the existing registration still holds no reference"
+    );
+    match after.payload {
+        SelectPayload::Plain { reference: carried } => assert_eq!(
+            carried, reference,
+            "the payload was not replaced by the refused call's"
+        ),
+        SelectPayload::Custom { .. } => panic!("the refused call must not replace the payload"),
+    }
+}
+
+/// One reference per **registration**, so it travels with the first delivery of a readiness and the
+/// later directions of the same readiness carry none. (The hold here is already released —
+/// `held: false` — so no real object is needed to exercise the travel.)
+#[test]
+fn the_interest_reference_travels_with_the_first_delivery_only() {
+    let (_poller, watch, owner, handle, reference) = armed();
+    let registration = SelectRegistration {
+        token: watch.registrations[&TTY_KEY_TOP].token,
+        fd: TTY_IFD,
+        interest: Interest::READABLE.add(Interest::ERROR),
+        owner,
+        payload: SelectPayload::Plain { reference },
+        handle,
+        obj: dangling_obj(),
+        hold: Some(SelectHold {
+            obj: dangling_obj(),
+            held: false,
+        }),
+    };
+    let delivered = deliveries_of(
+        registration,
+        Observed {
+            readable: true,
+            writable: false,
+            error: true,
+        },
+    );
+    assert_eq!(delivered.len(), 2, "the readable and the errored direction");
+    assert!(
+        delivered[0].hold.is_some(),
+        "the interest's reference travels with the first delivery"
+    );
+    assert!(
+        delivered[1].hold.is_none(),
+        "the second direction of the same readiness carries no second reference"
+    );
 }
