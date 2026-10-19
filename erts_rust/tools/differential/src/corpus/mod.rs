@@ -116,6 +116,7 @@ mod driver_ports;
 mod ddll;
 mod decode_packet;
 mod dist;
+mod dist_extra;
 mod errors;
 mod etf;
 mod ets;
@@ -126,6 +127,7 @@ mod flags_apply;
 mod format_limit;
 mod gc;
 mod inet_control;
+mod inet_write;
 mod maps;
 mod math_bifs;
 mod mexec;
@@ -136,6 +138,7 @@ mod nif_abi;
 mod nif_abi_extra;
 mod nif_res;
 mod nif_so;
+mod nif_state;
 mod ordered_walk;
 mod phash;
 mod printing;
@@ -145,6 +148,7 @@ mod ram_file;
 mod re;
 mod records;
 mod selfhost;
+mod selfhost_chain;
 mod semantics;
 mod system_info;
 mod terms;
@@ -646,6 +650,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(errors::group());
     cases.extend(nif::group());
     cases.extend(nif_so::group());
+    cases.extend(nif_state::group());
     cases.extend(nif_res::group());
     cases.extend(nif_abi::group());
     cases.extend(nif_abi_extra::group());
@@ -659,6 +664,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(wire_ids::group());
     cases.extend(wire_extra::group());
     cases.extend(dist::group());
+    cases.extend(dist_extra::group());
     cases.extend(ddll::group());
     cases.extend(decode_packet::group());
     cases.extend(bifs::group());
@@ -686,11 +692,13 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(mexec_extra::group());
     cases.extend(modules::group());
     cases.extend(selfhost::group());
+    cases.extend(selfhost_chain::group());
     cases.extend(zlib::group());
     cases.extend(bits::group());
     cases.extend(udp::group());
     cases.extend(ram_file::group());
     cases.extend(inet_control::group());
+    cases.extend(inet_write::group());
     cases
 }
 
