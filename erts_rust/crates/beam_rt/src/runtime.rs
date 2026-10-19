@@ -330,6 +330,14 @@ pub struct Runtime {
     /// half of the prune trigger), the prune/decline counters and the most recent decline
     /// reason.
     pub(crate) eval_prune: crate::eval::reclaim::PruneState,
+    /// Whether [`crate::eval::reclaim`] may prune the escaped-payload store at all.
+    ///
+    /// **On by default**, and a diagnostic/A-B lever only: the suite that measures the store's
+    /// envelope ([`Runtime::set_eval_prune_enabled`]) needs the *same* loop with the mechanism
+    /// out of the picture, or its "bounded" claim would be unfalsifiable. Turning it off does not
+    /// weaken any guard — it disables the reclaim, so the store simply grows, which is what the
+    /// measurement compares against.
+    eval_prune_enabled: bool,
     /// Whether a process **engine** has ever been registered on this runtime — a sticky,
     /// `O(1)` signal (there is no way to enumerate
     /// [`Runtime::runner_state`](crate::runner::RunnerState)'s engines from outside
@@ -1044,6 +1052,7 @@ impl Runtime {
             eval_off_heap: beam_message::OffHeapTable::new(),
             eval_heap_retired: Vec::new(),
             eval_prune: crate::eval::reclaim::PruneState::default(),
+            eval_prune_enabled: true,
             engine_registered: false,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
@@ -1702,6 +1711,27 @@ impl Runtime {
     pub(crate) fn eval_prune(&self) -> &crate::eval::reclaim::PruneState {
         &self.eval_prune
     }
+    /// Whether the escaped-payload store may be pruned at all — see
+    /// [`Runtime::set_eval_prune_enabled`].
+    pub(crate) fn eval_prune_enabled(&self) -> bool {
+        self.eval_prune_enabled
+    }
+    /// Turns the `-eval` route's escaped-payload reclamation ([`crate::eval::reclaim`]) on or off.
+    ///
+    /// It is **on** in every production route; this exists so a measurement can hold the
+    /// mechanism out of the picture and compare one loop against itself. Nothing else changes:
+    /// the store's contents, its `erlang:memory(binary)` accounting and every bound stay exactly
+    /// as they are — only the release step stops running, so the store grows.
+    ///
+    /// # When to use it
+    ///
+    /// Only to falsify a "bounded store" claim: the same expression with the reclaim off is
+    /// linear in the payload count, and that pair is what proves the reclaim is doing the work
+    /// (`tests/eval_off_heap_reclaim.rs`). It is deliberately **not** a `-eval` flag or an
+    /// `ERL_*` switch — a user-facing kill switch for a memory reclaim would be a footgun.
+    pub fn set_eval_prune_enabled(&mut self, enabled: bool) {
+        self.eval_prune_enabled = enabled;
+    }
     /// Records that the store was rewritten and now holds `handles` payload handles.
     pub(crate) fn note_eval_prune(&mut self, handles: usize) {
         self.eval_prune.seen_handles = handles;
@@ -1755,19 +1785,23 @@ impl Runtime {
     /// Appends every **root** that can name an off-heap payload to `out` — the prune's
     /// completeness half (`crate::eval::reclaim`).
     ///
-    /// Two kinds of region are covered, for two different reasons:
+    /// What this function collects is the **named live sets**: the escaped closures' capture
+    /// environments, the sequential-trace tokens, every live process's dictionary and mailbox
+    /// queue, and the pending-spawn records (entry fun + arguments). These hold terms no heap
+    /// region necessarily holds. Every one of them is a **real term**, so the walk started from
+    /// them (`crate::eval::reclaim::walk`) may legitimately dereference what it finds.
     ///
-    /// * **Whole regions, word by word** — [`Runtime::eval_heap`], its retired generations, the
-    ///   pooled BIF heaps and the `system_info` scratch heap. A payload-bearing term here is a
-    ///   `[BinRef][ErlSubBits]` pair, and pushing *every* written word (not just the "top-level"
-    ///   term) is what makes the walk independent of who points at the pair: a container on a
-    ///   region this function cannot read (the engine arena, a machine heap) still cannot hide a
-    ///   pair that lives on one of these. That property is the reason the arena's missing
-    ///   word-range accessor (`beam_engine::MinimalContext`'s `ContextHeap` is private) is a
-    ///   *reported* gap and not a soundness hole for store-owned payloads.
-    /// * **Named live sets** — the escaped closures' capture environments, the sequential-trace
-    ///   tokens, every live process's dictionary and mailbox queue, and the pending-spawn records
-    ///   (entry fun + arguments). These hold terms no heap region above necessarily holds.
+    /// What it deliberately does **not** collect is the word image of the runtime's own term
+    /// regions — [`Runtime::eval_heap`], its retired generations, the pooled BIF heaps and the
+    /// `system_info` scratch heap. Those regions are *not* an array of terms: a region also holds
+    /// the **payload words of on-heap binaries** (and the payload word of a float), which are raw
+    /// data. A run of `0x01` bytes — the body of `binary:copy(<<1>>, 40000)`, an off-heap
+    /// producer's own input — reads as `0x0101_0101_0101_0101`, whose low bits are `TAG_PRIMARY_LIST`
+    /// and whose "pointer" is `0x0101_0101_0101_0100`: pushing region words as roots made the walk
+    /// dereference that address (measured: `SIGSEGV`/`General Protection Fault` in
+    /// `reclaim::walk` on the fourth `-eval` of that expression). Region words are therefore
+    /// handled by [`Runtime::for_each_off_heap_region`] instead, whose scan reads word *patterns*
+    /// only and dereferences nothing.
     ///
     /// Terms that **cannot** name a payload are deliberately not rooted, each for a stated reason:
     ///
@@ -1784,15 +1818,6 @@ impl Runtime {
     ///   a *live* engine, which the `RefCount > 1` belt covers (see
     ///   [`Runtime::any_engine_ever`]).
     pub(crate) fn gather_off_heap_roots(&mut self, out: &mut Vec<Eterm>) {
-        // The regions whose every written word is a root (see the docs above).
-        out.extend_from_slice(self.eval_heap.used_words_mut());
-        for heap in &mut self.eval_heap_retired {
-            out.extend_from_slice(heap.used_words_mut());
-        }
-        for heap in &mut self.bif_heaps {
-            out.extend_from_slice(heap.used_words_mut());
-        }
-        out.extend_from_slice(self.info_heap.used_words_mut());
         // The escaped closures' capture environments.
         for body in &self.eval_closures {
             body.env_terms(out);
@@ -1821,6 +1846,34 @@ impl Runtime {
                 out.push(*fun);
             }
         }
+    }
+    /// Hands `visit` the **word image** of every term region this runtime owns: the never-reset
+    /// `-eval`/single-pass store ([`Runtime::eval_heap`]), its retired generations, the pooled BIF
+    /// heaps and the `system_info` scratch heap. Only the written prefix (`[0, used)`) is handed
+    /// over — the words past `hp` are uninitialised.
+    ///
+    /// This is the region half of the escaped-payload prune (`crate::eval::reclaim`), and its
+    /// contract is narrow on purpose: **`visit` must not dereference a word.** A region holds the
+    /// payload of every on-heap binary it carries (`binary:copy/2`'s 40 000 `0x01` bytes read as
+    /// `0x0101_0101_0101_0101`, low bits `TAG_PRIMARY_LIST`), so treating its words as terms is a
+    /// memory-safety defect, not an approximation — see
+    /// [`Runtime::gather_off_heap_roots`] for the measured fault.
+    ///
+    /// What the region scan buys is independence from *who points at* a
+    /// `[BinRef][ErlSubBits]` pair: a pair standing on one of these regions is found by its own
+    /// header word, so a container the prune cannot read (the engine arena's `ContextHeap` is
+    /// private, a machine heap is another crate's) can never hide one. That is why the arena's
+    /// missing word-range accessor stays a *reported* gap
+    /// (`beam_engine::MinimalContext`) rather than a soundness hole for store-owned payloads.
+    pub(crate) fn for_each_off_heap_region(&mut self, mut visit: impl FnMut(&[Eterm])) {
+        visit(self.eval_heap.used_words_mut());
+        for heap in &mut self.eval_heap_retired {
+            visit(heap.used_words_mut());
+        }
+        for heap in &mut self.bif_heaps {
+            visit(heap.used_words_mut());
+        }
+        visit(self.info_heap.used_words_mut());
     }
     /// The **source** off-heap table a transport copy of a term leaving a process resolves its
     /// refc binaries against: `extra` (the sending **machine's** own handles,

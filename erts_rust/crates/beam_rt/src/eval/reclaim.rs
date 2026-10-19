@@ -43,18 +43,33 @@
 //! A payload may be released only while **no live term names it**. The argument this module
 //! rests on has four parts:
 //!
-//! 1. **Every region that can hold a store-owned pair is read word by word.**
-//!    [`Runtime::gather_off_heap_roots`](crate::runtime::Runtime) pushes *every* written word of
-//!    `eval_heap`, its retired generations, the pooled BIF heaps and the `system_info` scratch
-//!    heap — not just their "top-level" terms. A `[BinRef][ErlSubBits]` pair therefore can never
-//!    be hidden behind a container this module cannot read: the pair is found wherever it stands.
+//! 1. **Every region that can hold a store-owned pair is read word by word — as words, never as
+//!    terms.** [`Runtime::for_each_off_heap_region`](crate::runtime::Runtime) hands over the whole
+//!    written prefix of `eval_heap`, its retired generations, the pooled BIF heaps and the
+//!    `system_info` scratch heap, and [`collect_region_payloads`] reads each word's *pattern*
+//!    ([`beam_term::boxed::HEADER_BIN_REF`], whose neighbour is a payload pointer) without
+//!    dereferencing anything. A `[BinRef][ErlSubBits]` pair therefore can never be hidden behind a
+//!    container this module cannot read: the pair is found wherever it stands, by its own header.
 //!    (That is also why the engine arena's missing word-range accessor is a *reported* gap and
-//!    not a hole here: no constructor in this workspace writes a pair onto the arena, and a pair
-//!    on `eval_heap` is reached whether or not an arena container points at it.)
+//!    not a hole here: no constructor in this workspace writes a pair onto the arena — the pair
+//!    writers are `beam_term::refc::write_refc_binary`'s callers, all of which write into a copy's
+//!    *destination* heap — and a pair on `eval_heap` is reached whether or not an arena container
+//!    points at it.)
+//!
+//!    **Region words are never pushed as roots.** That was this module's first shape and it was
+//!    unsound: a region also holds the **payload words of on-heap binaries**, which are data — the
+//!    40 000 `0x01` bytes `binary:copy(<<1>>, 40000)` materializes read as
+//!    `0x0101_0101_0101_0101`, whose low bits are `TAG_PRIMARY_LIST` and whose "pointer" is
+//!    `0x0101_0101_0101_0100`, so the walk dereferenced it and the process died with `SIGSEGV`
+//!    (`General Protection Fault`) inside `walk` on the **fourth** `-eval` of
+//!    `base64:encode(binary:copy(<<1>>, 40000))` — the first statement whose summed payload bytes
+//!    crossed [`STORE_BUDGET_WORDS`] and so the first that ran a prune at all. Only real terms may
+//!    enter the walk, and the only real terms here are the named live sets below.
 //! 2. **Every root family that holds a term no heap region holds is enumerated** — the evaluator's
 //!    environment and reduced value (passed in as `extra`), the escaped closures' capture
 //!    environments, the sequential-trace tokens, every live process's dictionary and mailbox
-//!    queue, and the pending-spawn records.
+//!    queue, and the pending-spawn records. Every one of these is a real term, so the walk may
+//!    dereference what it reaches from them.
 //! 3. **The walk is conservative.** Any doubt — an exhausted visit budget, a boxed header this
 //!    module does not know — **declines the whole prune** and retains everything. That is
 //!    deliberately the *opposite* of `RuntimeContext::graph_holds_reference`, whose exhaustion
@@ -196,6 +211,12 @@ enum Walk {
 /// what makes the root enumeration complete; a caller that cannot name its live terms must
 /// not call this.
 pub(crate) fn prune(runtime: &mut Runtime, extra: &[Eterm]) -> Prune {
+    // The diagnostic kill switch (`Runtime::set_eval_prune_enabled`) is checked before anything
+    // else, so the trigger's own observation is not recorded while it is off: turning the reclaim
+    // back on then starts from a clean slate instead of a half-observed store.
+    if !runtime.eval_prune_enabled() {
+        return Prune::Deferred;
+    }
     // The trigger's `O(1)` half: the handle count, and whether it moved at all.
     let handles = runtime.eval_off_heap_handle_count();
     if handles == 0 {
@@ -214,10 +235,14 @@ pub(crate) fn prune(runtime: &mut Runtime, extra: &[Eterm]) -> Prune {
     let mut roots = Vec::with_capacity(extra.len() + 16);
     roots.extend_from_slice(extra);
     runtime.gather_off_heap_roots(&mut roots);
-    let live = match walk(&roots) {
+    // The two halves of the enumeration: the named live sets, walked as terms (which may
+    // decline), and the runtime's own term regions, scanned as **words** (which cannot fault
+    // and cannot decline). See the module docs for why region words must never be roots.
+    let mut live = match walk(&roots) {
         Walk::Complete(live) => live,
         Walk::Declined(reason) => return decline(runtime, reason),
     };
+    runtime.for_each_off_heap_region(|words| collect_region_payloads(words, &mut live));
     // The prune: drain (the table's only removal path), keep every payload that is reachable
     // or shared, and put the survivors back. Re-pushing also **de-duplicates by data pointer**
     // (the store never dedups on push, and a copy may register a handle the store already
@@ -258,6 +283,34 @@ fn decline(runtime: &mut Runtime, reason: &'static str) -> Prune {
     Prune::Declined(reason)
 }
 
+/// Collects the payload pointers the runtime's own term regions name, **without dereferencing a
+/// single region word**.
+///
+/// `words` is the written prefix of one region
+/// ([`Runtime::for_each_off_heap_region`](crate::runtime::Runtime)). A region is *not* an array of
+/// terms: it interleaves heap objects with the **payload words of on-heap binaries** and floats,
+/// which are raw data. So this scan reads a *pattern*, never a pointer:
+/// [`beam_term::refc`]'s pinned 8-word layout puts `HEADER_BIN_REF` at the pair's first word and
+/// the payload pointer (`BinRef.val`, the very value `RefcBinary::data_ptr` reports) immediately
+/// after it, so a window whose first word **is** that header names a payload at its second word.
+///
+/// # Why a pattern match, and why a false positive is safe
+///
+/// The header is a *value*, so no address is touched: payload data that happens to spell
+/// `HEADER_BIN_REF` (a `1`-in-`2^60`-ish accident, and even then only in a region that already
+/// holds arbitrary bytes) inserts a **bogus payload address** into `live.payloads`, which can only
+/// *retain* a handle the store does not hold — a no-op. The reverse mistake is impossible: the
+/// only writer of the pair is `beam_term::refc::write_refc_binary` (through
+/// `beam_message`'s copier), and it always writes the header, so a live pair's payload is always
+/// found. A false release is what a dangle looks like, and this scan cannot produce one.
+fn collect_region_payloads(words: &[Eterm], live: &mut Live) {
+    let header = beam_term::boxed::HEADER_BIN_REF.raw();
+    for window in words.windows(2) {
+        if window[0].raw() == header {
+            live.payloads.insert(window[1].raw());
+        }
+    }
+}
 /// The region-agnostic reachable-payload walk.
 ///
 /// Every failure mode declines (see the module docs): the budget is spent, or a boxed header
