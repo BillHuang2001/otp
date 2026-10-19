@@ -74,11 +74,11 @@ use crate::compare::{
 };
 use crate::corpus::{
     self, Case, CaseKind, CommandProgram, CommandRun, Contract, EmbeddedModule, Golden, ModuleRun,
-    Probe,
+    PeerRun, Probe,
 };
 use crate::error::Result;
 use crate::module_build;
-use crate::runtime::{self, RuntimeSpec};
+use crate::runtime::{self, RuntimeId, RuntimeSpec};
 
 /// The two resolved runtimes a run observes (resolved once per invocation).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +183,7 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
                 probe_wrapped: true,
                 env: Vec::new(),
                 rust_spec: context.rust.clone(),
+                peer: None,
             };
             execute(context, plan, None)
         }
@@ -209,6 +210,7 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
                 probe_wrapped: true,
                 env: runtime::own_env(env),
                 rust_spec: context.rust.clone(),
+                peer: None,
             };
             execute(context, plan, None)
         }
@@ -240,6 +242,7 @@ pub fn compare_expr(expr: &str, pa: &[String]) -> Result<CaseOutcome> {
         probe_wrapped: true,
         env: Vec::new(),
         rust_spec: context.rust.clone(),
+        peer: None,
     };
     execute(&context, plan, None)
 }
@@ -276,12 +279,31 @@ pub fn rust_unsupported_reason() -> String {
 /// `_module_guard` (a [`module_build::CompiledModule`]) owns the compiled module's
 /// temporary directory and must stay alive for the whole call, so it is dropped only
 /// after both runtimes have been observed.
+///
+/// A plan that carries a [`PeerRun`] observes each side as a **self-pair**: that side's peer
+/// (a second process of the *same* program, see [`observe_side`]) is started before the side
+/// and killed after it, so the two compared runtimes still never coexist. A peer that never
+/// becomes ready skips the whole case (loudly) — it can never turn into agreement.
 fn execute(
     context: &RuntimeContext,
     plan: RunPlan,
     _module_guard: Option<module_build::CompiledModule>,
 ) -> Result<CaseOutcome> {
-    let oracle_observation = runtime::run_with_env(&context.oracle, &plan.oracle_argv, &plan.env)?;
+    let oracle_nonce = runtime::peer_nonce(&plan.case_id, RuntimeId::Oracle);
+    let rust_nonce = runtime::peer_nonce(&plan.case_id, RuntimeId::Rust);
+    let oracle_argv = side_argv(&plan.oracle_argv, plan.peer, &oracle_nonce);
+    let rust_argv = side_argv(&plan.rust_argv, plan.peer, &rust_nonce);
+
+    let oracle_observation = match observe_side(
+        &context.oracle,
+        &oracle_argv,
+        &plan.env,
+        plan.peer,
+        &oracle_nonce,
+    )? {
+        SideObservation::Observed(observation) => observation,
+        SideObservation::Skipped(reason) => return Ok(skipped_plan_outcome(context, &plan, &reason)),
+    };
     let golden_check = match &plan.golden {
         Some(golden) => check_golden(&oracle_observation, golden),
         None => GoldenCheck::not_asserted(),
@@ -289,10 +311,14 @@ fn execute(
     let oracle = SideResult::observed(oracle_observation);
 
     let rust = match &plan.rust_spec {
-        Some(spec) => classify_rust(
-            runtime::run_with_env(spec, &plan.rust_argv, &plan.env)?,
-            plan.probe_wrapped,
-        ),
+        Some(spec) => match observe_side(spec, &rust_argv, &plan.env, plan.peer, &rust_nonce)? {
+            SideObservation::Observed(observation) => {
+                classify_rust(observation, plan.probe_wrapped)
+            }
+            SideObservation::Skipped(reason) => {
+                return Ok(skipped_plan_outcome(context, &plan, &reason))
+            }
+        },
         None => SideResult::unsupported(rust_unsupported_reason()),
     };
 
@@ -309,8 +335,8 @@ fn execute(
         description: plan.description,
         contracts: plan.contracts,
         eval: plan.eval,
-        oracle_argv: plan.oracle_argv,
-        rust_argv: plan.rust_argv,
+        oracle_argv,
+        rust_argv,
         oracle,
         rust,
         golden: golden_check,
@@ -320,6 +346,64 @@ fn execute(
         oracle_spec: context.oracle.clone(),
         rust_spec: plan.rust_spec.clone(),
     })
+}
+
+/// One side's outcome before it becomes a [`SideResult`].
+enum SideObservation {
+    /// The side ran (with its peer leg alive, when the case has one).
+    Observed(runtime::Observation),
+    /// The side could not be observed at all because its **peer leg** never became ready. The
+    /// payload is the loud skip reason — never a fabricated result.
+    Skipped(String),
+}
+
+/// Observe one side of a case: when the case carries a [`PeerRun`], start the side's **peer
+/// leg** first, wait (bounded) for it to be ready, run the side, and kill + reap the peer
+/// afterwards (on every path — the peer owns itself through [`runtime::PeerProcess`]'s `Drop`).
+///
+/// The peer is spawned from **the side's own program**, so the pairing is a *self*-pair by
+/// construction: the oracle leg pairs with an oracle peer and the Rust leg with a Rust peer.
+/// The peer never becomes a compared observable — only the side's own stdout is — so both
+/// sides must produce the same line from their own runtime's two VMs.
+fn observe_side(
+    spec: &RuntimeSpec,
+    argv: &[String],
+    env: &[(String, String)],
+    peer: Option<PeerRun>,
+    nonce: &str,
+) -> Result<SideObservation> {
+    let Some(peer) = peer else {
+        return Ok(SideObservation::Observed(runtime::run_with_env(
+            spec, argv, env,
+        )?));
+    };
+    let peer_argv = corpus::expand_nonce(peer.args, nonce);
+    let started = runtime::spawn_peer(
+        spec,
+        &peer_argv,
+        peer.ready_prefix,
+        runtime::PEER_READY_TIMEOUT,
+    );
+    // `_peer` (not `_`) keeps the peer alive for the whole client run and kills it here.
+    let _peer = match started {
+        runtime::PeerStart::Ready(peer) => peer,
+        runtime::PeerStart::NotReady(reason) => return Ok(SideObservation::Skipped(reason)),
+    };
+    Ok(SideObservation::Observed(runtime::run_with_env(
+        spec, argv, env,
+    )?))
+}
+
+/// The argv one side is spawned with: the plan's argv, with the case's per-invocation
+/// [`corpus::PEER_NONCE_PLACEHOLDER`] resolved to `nonce` when the case carries a peer leg.
+///
+/// A peer-less case's argv is handed over **unchanged** (a command case's argv never contains
+/// the placeholder), so nothing about the existing corpus changes.
+fn side_argv(argv: &[String], peer: Option<PeerRun>, nonce: &str) -> Vec<String> {
+    match peer {
+        Some(_) => corpus::expand_nonce(argv, nonce),
+        None => argv.to_vec(),
+    }
 }
 
 /// The optional case environment of a **module-run** case
@@ -392,6 +476,7 @@ fn run_module_case(
         probe_wrapped: false,
         env,
         rust_spec: context.rust.clone(),
+        peer: None,
     };
     execute(context, plan, Some(compiled))
 }
@@ -406,23 +491,21 @@ fn skipped_module_outcome(
     run: &ModuleRun,
     reason: &'static str,
 ) -> CaseOutcome {
-    let side = SideResult::unsupported(reason);
-    CaseOutcome {
+    let plan = RunPlan {
         case_id: case.id.to_string(),
         description: case.description.to_string(),
         contracts: case.contracts.to_vec(),
         eval: run.oracle_eval(),
         oracle_argv: Vec::new(),
         rust_argv: Vec::new(),
-        oracle: side.clone(),
-        rust: side,
-        golden: GoldenCheck::not_asserted(),
-        golden_asserted: false,
-        verdict: Verdict::Skipped,
-        diffs: Vec::new(),
-        oracle_spec: context.oracle.clone(),
+        observables: Observables::StdoutAndExit,
+        golden: None,
+        probe_wrapped: false,
+        env: Vec::new(),
+        peer: None,
         rust_spec: context.rust.clone(),
-    }
+    };
+    skipped_plan_outcome(context, &plan, reason)
 }
 
 /// Run a non-CLI command case ([`CaseKind::Command`]): spawn each side's resolved program
@@ -490,6 +573,7 @@ fn run_command_case(context: &RuntimeContext, case: &Case, run: &CommandRun) -> 
         probe_wrapped: false,
         env: Vec::new(),
         rust_spec: Some(rust_spec),
+        peer: run.peer,
     };
     execute(context, plan, None)
 }
@@ -497,21 +581,45 @@ fn run_command_case(context: &RuntimeContext, case: &Case, run: &CommandRun) -> 
 /// The outcome of a command case whose Rust-side program could not be resolved.
 ///
 /// Nothing was observed, so this is a loud [`Verdict::Skipped`] carrying `reason` — never a
-/// pass and never agreement. It mirrors [`skipped_module_outcome`] (both sides
-/// `SideResult::unsupported`, empty argv, no golden asserted) and is non-fatal by default,
-/// fatal under `--strict`.
+/// pass and never agreement. It is non-fatal by default and fatal under `--strict`. It mirrors
+/// [`skipped_module_outcome`] (both sides `SideResult::unsupported`, empty argv, no golden
+/// asserted) and is non-fatal by default, fatal under `--strict`.
 fn skipped_command_outcome(
     context: &RuntimeContext,
     case: &Case,
     run: &CommandRun,
     reason: &str,
 ) -> CaseOutcome {
-    let side = SideResult::unsupported(reason);
-    CaseOutcome {
+    let plan = RunPlan {
         case_id: case.id.to_string(),
         description: case.description.to_string(),
         contracts: case.contracts.to_vec(),
         eval: run.oracle_command_line(),
+        oracle_argv: Vec::new(),
+        rust_argv: Vec::new(),
+        observables: Observables::StdoutAndExit,
+        golden: None,
+        probe_wrapped: false,
+        env: Vec::new(),
+        peer: run.peer,
+        rust_spec: context.rust.clone(),
+    };
+    skipped_plan_outcome(context, &plan, reason)
+}
+
+/// The outcome of a case that could not be evaluated at all — its peer leg never became ready,
+/// or a host tool is missing.
+///
+/// Nothing was observed, so this is a loud [`Verdict::Skipped`] carrying `reason` — never a
+/// pass and never agreement: the report keeps both sides `SideResult::unsupported`, no argv
+/// and no asserted golden, and the case stays fatal under `--strict`.
+fn skipped_plan_outcome(context: &RuntimeContext, plan: &RunPlan, reason: &str) -> CaseOutcome {
+    let side = SideResult::unsupported(reason);
+    CaseOutcome {
+        case_id: plan.case_id.clone(),
+        description: plan.description.clone(),
+        contracts: plan.contracts.clone(),
+        eval: plan.eval.clone(),
         oracle_argv: Vec::new(),
         rust_argv: Vec::new(),
         oracle: side.clone(),
@@ -521,7 +629,7 @@ fn skipped_command_outcome(
         verdict: Verdict::Skipped,
         diffs: Vec::new(),
         oracle_spec: context.oracle.clone(),
-        rust_spec: context.rust.clone(),
+        rust_spec: plan.rust_spec.clone(),
     }
 }
 
@@ -672,6 +780,11 @@ struct RunPlan {
     /// ([`runtime::resolve_helper`]) as its Rust side. `None` means no Rust-side program
     /// exists and the side is reported *unsupported*.
     rust_spec: Option<RuntimeSpec>,
+    /// The case's optional **peer leg** (see [`PeerRun`]): a second process of *each side's own*
+    /// program, started before that side and killed after it, so a two-VM observable can be
+    /// compared without the two runtimes ever coexisting. Its argv still carries the
+    /// per-invocation `{nonce}` placeholder, which [`side_argv`] resolves per side.
+    peer: Option<PeerRun>,
 }
 
 /// Build the argv an expression case gets: any `-pa <dir>` code paths, the case's own
