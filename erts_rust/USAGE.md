@@ -133,10 +133,11 @@ Compile your own module with the system `erlc` and run it the same way:
 ```sh
 $ cat hello.erl
 -module(hello).
--export([add/2, show/1, greet/1, bounce/0]).
+-export([add/2, show/1, greet/1, bounce/0, kind/1]).
 add(A, B) -> A + B.
 show(X) -> io:format("~p~n", [X]).
 greet(Name) -> io:format("hello ~s~n", [Name]).
+kind(X) -> io:format("is_list=~p is_binary=~p~n", [is_list(X), is_binary(X)]).
 bounce() ->
     Self = self(),
     spawn(fun() -> Self ! {pong, 42} end),
@@ -148,20 +149,34 @@ $ erts_rust/target/release/beam_rt run /tmp/demo/hello.beam hello:add/2 2 3
 $ erts_rust/target/release/beam_rt run /tmp/demo/hello.beam hello:show/1 '[1,2,3]'
 [1,2,3]
 ok
+$ erts_rust/target/release/beam_rt run /tmp/demo/hello.beam hello:show/1 '[1, atom, "x", [2]]'
+[1,atom,"x",[2]]
+ok
 $ erts_rust/target/release/beam_rt run /tmp/demo/hello.beam hello:add/2 -2 3
 1
 ```
 
-The argument grammar is deliberately small — **integer literals (including negative)**, **atoms**
-(a bare word such as `world`), and **list literals** (`[1,2,3]`).
-Two consequences a user will hit:
+The argument grammar is exactly what `beam_rt`'s own usage block prints — four forms, applied
+recursively inside a list:
+
+* a **small integer** literal, including negative (`42`, `-3`);
+* a **bare atom** name (`world`, `atom`);
+* a **double-quoted string**, which becomes an Erlang **char list** (`"world"` → `"world"`, i.e.
+  `[119,111,114,108,100]` — there is no binary literal);
+* a **bracketed list** of the above (`[1, atom, "x", [2]]`), optionally empty (`[]`).
+
+Three consequences a user will hit:
 
 * **floats are rejected** — `… hello:add/2 2.5 3` exits **2** with
   `beam_rt: error "2.5" is not a valid run argument` plus the usage block;
-* **there is no binary literal** — `… hello:kind/1 world` arrives as the **atom** `world`
-  (`is_list=false is_binary=false`), and `… hello:greet/1 world` reaches a `~s` format as an atom.
-  To exercise a function that takes a binary or a string, call it from a wrapper module (see §4) or
-  through `-eval` with a literal.
+* **a tuple is silently an atom** — `{1,2}` is not a form, so the parser falls through to the atom
+  case and the callee receives `'{1,2}'` (`hello:show/1 '{1,2}'` prints `'{1,2}'`, exit 0, no
+  diagnostic), and a spaced word such as `foo bar` likewise arrives as `'foo bar'`;
+* **a bare word is an atom, not a string** — `… hello:kind/1 world` prints
+  `is_list=false is_binary=false`, while `… hello:kind/1 '"world"'` prints
+  `is_list=true is_binary=false`; `… hello:greet/1 world` therefore hits a `~s` format with an atom.
+  To exercise a function that takes a binary, call it from a wrapper module (see §4) or through
+  `-eval` with a literal.
 
 Arity is checked: `run hello.beam hello:add/2 2` exits **2** with
 `beam_rt: error hello:add/2 takes 2 argument(s), 1 given`.
@@ -449,12 +464,10 @@ $ cat ebin/myapp.app
 
 $ beam_rt -noshell -pa /tmp/demo/ebin \
     -eval 'io:format("load=~p~n",[application:load(myapp)]),
-           io:format("start=~p~n",[application:start(myapp)]),
-           io:format("env=~p~n",[application:get_env(myapp,greeting)])'
+           io:format("start=~p~n",[application:start(myapp)])'
 load=ok
 myapp starting
 start=ok
-env=undefined
 
 $ beam_rt -noshell -pa /tmp/demo/ebin -eval 'application:ensure_all_started(myapp), io:format("~s~n",[myapp:hello("there")])'
 myapp starting
@@ -467,12 +480,34 @@ $ beam_rt -noshell -eval 'io:format("~p~n",[application:ensure_all_started(nosuc
 `application:which_applications/0` reports the real booted set, e.g.
 `[{stdlib,"ERTS  CXC 138 10","8.1"},{kernel,"ERTS  CXC 138 10","11.0.4"}]`, and dependency
 resolution works for real applications: `application:ensure_all_started(ssl)` →
-`{ok,[crypto,asn1,public_key,ssl]}`.
+`{ok,[crypto,asn1,public_key,ssl]}` (verified; `crypto` → `{ok,[crypto]}` and `sasl` →
+`{ok,[sasl]}` likewise).
 
-**The gap to know about:** `application:get_env/2,3` does **not** read the `.app` `env` list —
-it answers `undefined` (and `get_all_env/1` answers `[]`), where the oracle answers `{ok,true}` /
-`{ok,"yo"}`. A library that reads its configuration through `application:get_env/2` will therefore
-see `undefined` and must be configured another way.
+**Where a project's `env` comes from — the one layout rule to get right.** `application:get_env/2,3`,
+`get_all_env/1` and `get_key(App, env)` read the `.app` file's `env` list **when the application
+resolves through the standard release layout** `<lib>/<app>-<vsn>/ebin/<app>.app`:
+
+```sh
+$ beam_rt -noshell -pa /tmp/demolib/myapp-1.0/ebin -eval 'io:format("load=~p get_env=~p env3=~p all=~p~n",[application:load(myapp), application:get_env(myapp,greeting), application:get_env(myapp,greeting,def), application:get_all_env(myapp)])'
+load=ok get_env={ok,"yo"} env3="yo" all=[{greeting,"yo"}]
+```
+
+A **flat** `ebin` directory that merely contains the `.app` file is a different story: it loads
+(`load=ok`, and `application:start/1` runs its start function), but the env is not reachable, so
+`get_env/2` → `undefined` and `get_env/3` → your default, where the oracle returns the declared value:
+
+```sh
+$ beam_rt -noshell -pa /tmp/demo/ebin -eval 'io:format("load=~p get_env=~p env3=~p~n",[application:load(myapp), application:get_env(myapp,greeting), application:get_env(myapp,greeting,def)])'
+load=ok get_env=undefined env3=def                                    # divergence
+$ erl -noshell -pa /tmp/demo/ebin -eval 'io:format("load=~p get_env=~p env3=~p~n",[application:load(myapp), application:get_env(myapp,greeting), application:get_env(myapp,greeting,def)]), erlang:halt(0).'
+load=ok get_env={ok,"yo"} env3="yo"                                   # the oracle reads it either way
+```
+
+So lay a project out as `<lib>/<app>-<vsn>/ebin` (what `rebar3`/`mix` produce) rather than pointing
+`-pa` at a bare `ebin`, or the project's configuration will look empty.
+For a booted OTP application the values agree: `application:get_env(kernel, net_ticktime, def)` →
+`60`, and `get_all_env(kernel)` returns the file's seven declared pairs (the oracle's started kernel
+also injects two more) — while `get_all_env(stdlib)` is `[]` on both sides.
 
 ### 5.2 The native floor (what a project's start-up actually leans on)
 
@@ -483,12 +518,12 @@ the real Erlang `code_server`/`file_server`/`prim_loader` chain:
 |---|---|
 | `code:*` | `which/1`, `get_object_code/1`, `is_loaded/1`, `load_file/1`, `load_binary/3`, `ensure_loaded/1`, `ensure_modules_loaded/1`, `get_mode/0`, `lib_dir/0,1,2`, `priv_dir/1`, `where_is_file/1`, `all_loaded/0`, `purge/1`, `soft_purge/1`, `add_patha/z/1,2`, `add_path/1,2`, `del_path/1` |
 | `init:*` | the automatic `get_argument/1` flags (`root`/`home`/`progname`), `script_id/0`, `boot/1`, `stop/0,1`, `restart/0`, `get_arguments/0` |
-| `application:*` | **read-only** queries plus real `load`/`start`/`stop`/`ensure_all_started` for apps found on the code path |
+| `application:*` | read queries (`get_env/1,2,3`, `get_all_env/1`, `get_all_key/1`, `get_key/1,2`, `get_application/0,1`, `loaded_applications/0`, `which_applications/0`) plus real `load`/`start`/`stop`/`ensure_all_started` for apps that resolve on the code path — `env` needs the `<lib>/<app>-<vsn>/ebin` layout (§5.1) |
 | `file_server_2` | a native service process answering `{write_file,…}`, write-mode `{open,…}`, `{get_until,…}`, `{get_line,…}`, `{get_chars,…}`, `getopts`/`setopts`, `{read_handle_info,_}`, `{list_dir,…}` — everything else is a typed `unsupported` |
 | `net_kernel` | only on a `-name`/`-sname` node, and only `{is_auth,_}`; `gen:reply/2` alias routing |
 | `io` | the stdio device floor (`put_chars`/`format`/`write`/`nl`/`fwrite`) |
 | `prim_file`, `prim_tty`, `erl_ddll`, `erts_internal` | the served sets described in `crates/beam_rt/src/native/CONTEXT.md` |
-| `erl_prim_loader` | a stand-in process only — **no`get_file`/`get_path` protocol** |
+| `erl_prim_loader` | a native stand-in *process* whose requests are answered natively: `get_loader_config/0`, `set_loader_config/1`, **`get_path/0`**, `set_path/1`, `list_dir/1`, `list_dir_all/1`, `read_file/1`, `read_file_info/1,2`, `read_link_info/1,2`, `get_cwd/0`; `get_file/1`, `get_modules/2,3`, `set_primary_archive/4` and `purge_archive_cache/0` fall through |
 
 ### 5.3 The honest list, by contract
 
@@ -517,15 +552,21 @@ runtime does not return silently wrong results.
   subset, a few flag-driven `system_info` literals report defaults.
 * **A.7 OTP app contracts** — 22 preloaded modules, `erts_internal:*`, `prim_file`/`prim_tty`,
   `erl_ddll`, and the floors above. Gaps: `prim_file`'s `write_file_info/2,3`, `advise/4`,
-  `allocate/3`, `read_line/1`; `erl_prim_loader`/`prim_inet`/`prim_socket`/`prim_zip` fall through to
-  preloaded bodies whose `-nifs()` entries are `erlang:nif_error(undef)`; `logger` reports reach no
-  sink.
+  `allocate/3`, `read_line/1`; `erl_prim_loader`'s `get_file/1`/`get_modules/2,3` (and the archive
+  entries) — the rest of its protocol *is* served (§5.2); `prim_inet`/`prim_socket`/`prim_zip` fall
+  through to preloaded bodies whose `-nifs()` entries are `erlang:nif_error(undef)`; `logger`
+  reports reach no sink.
 * **A.8 introspection/tooling** — `system_info/1` (88 keys + 2 tuple keys), `process_info/1,2`
   (≈28 items), `erlang:memory/0,1`, live process tracing. Gaps: the 27 oracle-accepted
-  `system_info` keys naming facilities this runtime lacks raise the typed gap (e.g.
-  `system_info(microstate_accounting)` → `beam_rt: error badarg`, exit 1 — verified);
-  `statistics/0`, `scheduler_wall_time`, `process_info(P, backtrace|parent|label|…)`, the
-  debugger/trace-session surface.
+  `system_info` keys naming facilities this runtime lacks raise the **typed gap (exit 3)** with a
+  message naming the missing facility — `system_info(allocator)` →
+  `beam_rt: unsupported: erlang:system_info(allocator): this runtime does not identify the host C
+  allocator`, the same shape for `check_io`, `max_integer`, `emu_args`, `snifs`. A key the oracle
+  rejects too answers `badarg` (exit 1): `allocator_sizes`, `module_count`, `wall_clock`, and
+  `microstate_accounting` — which is a `statistics/1` key on the oracle as well, not a
+  `system_info` one. Also missing: `statistics/0`, `scheduler_wall_time`
+  (`statistics(scheduler_wall_time)` → `undefined`), `process_info(P, backtrace|parent|label|…)`,
+  the debugger/trace-session surface.
 * **A.9 build/bootstrapping** — boot completes (22 directives, exit 0), and in-process compilation
   reproduces the oracle's `.beam` bytes for all **755** oracle-compilable `lib/*/src/*.erl` sources
   (772 swept, 17 fail on the oracle too). Gap: **no self-hosted build** — the runtime does not
@@ -669,12 +710,17 @@ The default is the native **baseline JIT** tier, compiled lazily per function at
 $ BEAM_RT_TIER=interpreter erts_rust/target/release/beam_rt run foo.beam foo:f/1 1
 ```
 
-The baseline tier is cheaper than the interpreter on every workload the bench can measure at its
-default calibration; the interpreter is worth selecting when you want the simplest semantics (e.g.
-to decide whether a failure is a JIT-tier issue) or a faster cold start for a one-shot call
-(lazy per-function compilation costs ≈1.2–1.25× over the interpreter at start-up).
+The baseline tier is the faster of the two on the in-crate `jit_bench` table (12/12 workloads, the
+narrowest margin 1.03× on `cross/2`), and on the two larger instruments it wins 11/12
+(`crates/beam_rt/PERF.md:197`) and 9/10
+(`crates/beam_engine/src/jit/baseline/CONTEXT.md:466`), with parity rather than a loss on the
+deopt-dominated `build/0` and the cross-module `cross/2`.
+The interpreter is worth selecting when you want the simplest semantics (e.g. to decide whether a
+failure is a JIT-tier issue) or a faster cold start for a one-shot call (lazy per-function
+compilation costs ≈1.2–1.25× over the interpreter at start-up).
 The Cranelift hot tier exists but is **default-OFF and not on `beam_rt`'s path** — it is not a
-performance option (see [`BOTTLENECKS.md`](BOTTLENECKS.md) §4).
+performance option (it loses on every workload except `walk/2`; see
+[`BOTTLENECKS.md`](BOTTLENECKS.md) §5).
 
 ### 7.4 Common misreadings
 
@@ -682,9 +728,12 @@ performance option (see [`BOTTLENECKS.md`](BOTTLENECKS.md) §4).
 * Without `-noshell` you get the booted kernel's slogan (`Erlang/OTP 30 [erts-17.1] [source] [64-bit]`)
   on stdout before your own output; the `run` action sets `-noshell` for itself, so it is banner-free.
 * `-s` passes **atoms**, `-run` passes **char lists** — `-run mod f 2 3` gives you `"2"` and `"3"`.
-* A `run` argument is an integer, an atom or a list — **not** a float and **not** a binary.
+* A `run` argument is an integer, an atom, a `"string"` or a list — **not** a float; a tuple is
+  silently taken as an atom (`'{1,2}'`).
 * `beam_rt: error undef` after adding a directory usually means the module is not on the path: check
   `-pa`, or `code:which(Mod)`.
+* `application:get_env/2` answering `undefined` for a value you declared in a `.app` file usually
+  means the app is on a bare `ebin` path rather than `<lib>/<app>-<vsn>/ebin` (§5.1).
 
 ---
 

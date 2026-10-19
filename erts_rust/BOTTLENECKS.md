@@ -538,7 +538,8 @@ Consolidated so a future round does not spend a day re-measuring a dead end.
   0.988–1.009× (tie), `arith/2` **1.616–1.621×**, `cmp` **1.364–1.422×**. One-time compile is
   **6.5–60×** the baseline's. `jit-cranelift` stays default-OFF and is **not reachable end-to-end**:
   `beam_rt/src/runner/tier.rs` maps `BEAM_RT_TIER` only to `JitMode::{Auto,Interpreter,Baseline}`.
-* The five dispatch/memoisation ideas and the Y-window witness in B4.
+* The four dispatch/memoisation ideas, the invalid register-window split and the range-crossing
+  Y-window witness in B4.
 * **Block register-cache traffic — below this host's resolution.** Spill stores **4 678 655
   (written-set) → 1 594 678 (dirty-set)** (−65.9 %) and bytes 341 653 629 → 320 065 790 (−6.32 %);
   prologue/push+pop ops 7 167 996 → 2 707 930 (−62.2 %) — yet 9 paired rounds across loadavg 8 → 123
