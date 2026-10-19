@@ -60,7 +60,14 @@ load-time snapshot as the fallback) **before** the routing `match` runs.
 - `bitstrings/` (`mod.rs`, `raw.rs`, `create/`, `matching/`) — the whole `Bs*` family; `raw.rs` is this
   sub-node's `#[allow(unsafe_code)]` module (`records/raw.rs` is the other one in the node); `create/` =
   `bs_create_bin`, `matching/` = the
-  match commands (with the allocation-aware context re-read elision). Endianness: `matching/reads.rs::field_is_little`
+  match commands (with the allocation-aware context re-read elision). A re-entered match costs nothing:
+  `enter_match`'s reuse arm returns the **same `Eterm`** (C's `$Dst = context`), and `bs_get_position`
+  publishes a **small integer** rather than a context snapshot — the binary-comprehension loop therefore
+  reserves no match context at all. `matching/mod.rs::exec` pre-tests `Instr::BsMatch` ahead of its 18-arm
+  jump table and hands the rest to an outlined `exec_other`; `matching/commands.rs` keeps its cold command
+  bodies (`skip`/`binary`/`get_tail`/`'=:='`) out of line, and `create/segments.rs` hosts the outlined
+  `binary`/`string`/`float`/`utf` segment bodies (`SegOutcome`), which `assemble` calls.
+  Endianness: `matching/reads.rs::field_is_little`
   is the single rule for **reads**, `mod.rs::BitWriter::push_le_groups` for **writes**, and `mod.rs::flag_bit`
   normalizes a `native` flag atom; `BSF_NATIVE` is a **live** flag (a standalone read's raw `u32` flags operand
   carries it). Whole-byte fast paths on both sides: the writers (`push_uint`/`push_uint_le`/`push_le_groups`/
