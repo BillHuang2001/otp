@@ -47,8 +47,13 @@
 //!   [`LineNotification`]: an active-mode socket's incoming message is a message to the *owner*
 //!   (`{tcp, S, Data}` / `{tcp_error, S, Reason}` / `{udp_passive, S}` / …), never
 //!   `{Port, {data, …}}`, so it does not ride [`PortNotification`] and that enum keeps its two
-//!   variants.
-//!
+//!   variants;
+//! * [`ActiveMode`] / [`ActiveSpend`] — the **read side** of the same state machine: the
+//!   `{active, false | true | once | N}` mode a driver holds right now, and the grants a delivery
+//!   spent to exhaustion (which the C clears *silently* for `{active, once}`). Both are
+//!   driver-agnostic value types; the driver publishes them through
+//!   [`crate::Driver::active_mode`] / [`crate::Driver::take_active_spends`], never by writing a
+//!   mode of its own into this layer.//!
 //! # Reductions
 //!
 //! Running a task costs reductions, with the C's per-kind constants:
@@ -634,6 +639,129 @@ pub enum ActiveInputEvent {
     /// [`crate::InetReason::atom_name`], resolved by the runtime like every other reason.
     Error(crate::completion::InetReason),
 }
+
+/// The `{active, Mode}` state a socket driver holds — the C's `desc->inet.active` plus
+/// `desc->inet.active_count` (`erts/emulator/drivers/common/inet_drv.c:786-789`).
+///
+/// This is the **read side** of the `{active, …}` state machine whose deliveries
+/// [`ActiveInputEvent`] reports: a driver spends one grant per delivered packet
+/// (`INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:1552-1560`) inside its own option store, so
+/// without an accessor a runtime can only *mirror* the mode and never learn the running
+/// `{active, N}` count. [`crate::Driver::active_mode`] is where a driver publishes it
+/// ([`crate::Port::active_mode`] / [`crate::PortRegistry::active_mode`] forward it), and
+/// [`ActiveSpend`] is the notification for the grants a delivery *spent*.
+///
+/// The mapping from the driver's store lives in exactly one place,
+/// [`ActiveMode::from_parts`]: `active` is an `i32` whose four values are `0`
+/// (`INET_PASSIVE`, the default), `1` (`INET_ACTIVE`), `2` (`INET_ONCE`) and `3`
+/// (`INET_MULTI` — the one carrying the trailing `i16` counter).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ActiveMode {
+    /// `{active, false}` (`INET_PASSIVE`): the default, and what a spent grant falls back to.
+    ///
+    /// The socket's bytes wait in the port's input queue for the owner's next read — the
+    /// [`PortNotification::Data`] path — instead of being delivered as an [`ActiveInput`].
+    #[default]
+    False,
+    /// `{active, true}` (`INET_ACTIVE`): every delivered packet is a message, forever. Never
+    /// spent, so it has no [`ActiveSpend`] variant.
+    True,
+    /// `{active, once}` (`INET_ONCE`): the next delivered packet is a message and the mode then
+    /// falls back to [`ActiveMode::False`] — **silently**, with no `{tcp_passive, S}`
+    /// (`inet_drv.c:1552-1556`) — which is the transition [`ActiveSpend::Once`] reports.
+    Once,
+    /// `{active, N}` (`INET_MULTI`): up to `N` further packets are messages, and the mode returns
+    /// to [`ActiveMode::False`] when the counter reaches zero (with the `{tcp_passive, S}` of
+    /// `packet_passive_message`, `inet_drv.c:4215`, already carried as
+    /// [`ActiveInputEvent::Passive`]).
+    ///
+    /// `remaining` is the **running** counter — the C's `active_count`, which the driver
+    /// decrements per delivery — **not** the `N` originally granted. It is what is left of the
+    /// grant right now, so `Multi { remaining: 3 }` after `{active, 5}` has already spent two.
+    ///
+    /// A `remaining` of zero is not a store state the driver ever holds: the decrement and the
+    /// fall back to [`ActiveMode::False`] happen in the same step, so a zero counter and an
+    /// active mode are never observed together. A hand-built `Multi { remaining: 0 }` is
+    /// therefore still [`is_active`](ActiveMode::is_active), because the C's test
+    /// (`if (!desc->inet.active)`, `inet_drv.c:13106`) reads the *mode* field, which is still
+    /// `INET_MULTI` there.
+    Multi {
+        /// The running `{active, N}` counter (`active_count`): grants still unspent.
+        remaining: i16,
+    },
+}
+
+impl ActiveMode {
+    /// Maps the driver's raw store — `active` (`i32`) and `active_count` (`i16`) — onto the
+    /// [`ActiveMode`] it means.
+    ///
+    /// This is the **single** place the numeric encoding lives: `1` is
+    /// [`True`](ActiveMode::True), `2` [`Once`](ActiveMode::Once), `3`
+    /// [`Multi`](ActiveMode::Multi) carrying `active_count` as its `remaining`, and anything else
+    /// (including the `INET_PASSIVE` `0`) is [`False`](ActiveMode::False). The driver never stores
+    /// a fifth value, so an out-of-range `active` is a store that was never written rather than a
+    /// mode; treating it as passive is the only safe reading.
+    pub const fn from_parts(active: i32, active_count: i16) -> ActiveMode {
+        match active {
+            1 => ActiveMode::True,
+            2 => ActiveMode::Once,
+            3 => ActiveMode::Multi {
+                remaining: active_count,
+            },
+            _ => ActiveMode::False,
+        }
+    }
+
+    /// Whether the socket is in one of the active modes — the C's `active > 0` test
+    /// (`if (! desc->inet.active)`, `erts/emulator/drivers/common/inet_drv.c:13106`).
+    ///
+    /// `false` only for [`ActiveMode::False`]: [`True`](ActiveMode::True),
+    /// [`Once`](ActiveMode::Once) and [`Multi`](ActiveMode::Multi) — whatever its counter — are
+    /// all active, because the test reads the mode field and not the counter.
+    pub const fn is_active(self) -> bool {
+        !matches!(self, ActiveMode::False)
+    }
+
+    /// The running `{active, N}` counter — `Some` only for [`ActiveMode::Multi`].
+    ///
+    /// See [`ActiveMode::Multi`] for why a `Some(0)` cannot come from a driver's own store, and
+    /// why `remaining` is what is left rather than the granted `N`.
+    pub const fn remaining(self) -> Option<i16> {
+        match self {
+            ActiveMode::Multi { remaining } => Some(remaining),
+            _ => None,
+        }
+    }
+}
+
+/// The `{active, …}` grant a single delivery spent to exhaustion.
+///
+/// A socket driver spends one grant per packet it delivers as an [`ActiveInput`], inside its own
+/// option store (`inet_drv.c:1552-1560`), and in two of the four modes that spend changes what the
+/// owner will see next. [`crate::Driver::take_active_spends`] reports them (drained by
+/// [`crate::PortRegistry::take_active_spends`]), so a runtime does not have to infer the transition
+/// from the deliveries alone.
+///
+/// [`ActiveMode::True`] and [`ActiveMode::False`] have no variant because they are never spent: a
+/// permanently active socket has no counter, and a passive one spends nothing by definition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActiveSpend {
+    /// An `{active, once}` grant was spent: that delivery was the only one it granted, and the mode
+    /// is now [`ActiveMode::False`].
+    ///
+    /// The C flips the mode **silently** (`inet_drv.c:1552-1556`) — no `{tcp_passive, S}` follows
+    /// — so this notification is the only signal the transition happened.
+    Once,
+    /// An `{active, N}` counter reached zero: the mode is now [`ActiveMode::False`]
+    /// (`inet_drv.c:1557-1560`).
+    ///
+    /// The C also sends one `{tcp_passive, S}` for this transition
+    /// (`packet_passive_message`, `inet_drv.c:4215`), which already rides the `{active, …}` channel
+    /// as [`ActiveInputEvent::Passive`]; this variant adds the *reason* (the counter ran out, as
+    /// opposed to a `setopts` that went passive of its own accord).
+    Multi,
+}
+
 /// What one [`crate::PortRegistry::execute_port_tasks`] round did.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct PortTaskOutcome {

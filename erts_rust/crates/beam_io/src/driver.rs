@@ -45,7 +45,8 @@ use crate::completion::{CompletionEvent, PortCompletion};
 use crate::error;
 use crate::poller::{Interest, Poller, Token};
 use crate::port_failure::DriverFailure;
-use crate::port_task::{ActiveInput, ActiveInputEvent, ReadMessage};use crate::queue::ByteQueue;
+use crate::port_task::{ActiveInput, ActiveInputEvent, ActiveMode, ActiveSpend, ReadMessage};
+use crate::queue::ByteQueue;
 /// Why a port is exiting, as reported to a driver through [`Driver::port_exit`].
 ///
 /// This is a small, closed vocabulary — deliberately *not* an Erlang term — because it is the
@@ -699,6 +700,47 @@ pub trait Driver: core::any::Any {
         false
     }
 
+    /// The port's current `{active, Mode}` — the C's `desc->inet.active` plus
+    /// `desc->inet.active_count` (`erts/emulator/drivers/common/inet_drv.c:786-789`).
+    ///
+    /// This is the **read** accessor of the `{active, …}` state machine whose deliveries a driver
+    /// reports through [`DriverContext::deliver_active_input`]: the driver owns the mode, spends a
+    /// grant per delivered packet inside its own option store
+    /// (`INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:1552-1560`), and this is how a runtime learns
+    /// the resulting state instead of mirroring the `setopts` walk itself. For an
+    /// `{active, N}` socket it also reports the **running** counter
+    /// ([`ActiveMode::remaining`] — what is left of the grant, not the granted `N`), which no
+    /// owner-facing message carries.
+    ///
+    /// The default ([`ActiveMode::False`]) is the honest answer for a driver with no active mode
+    /// at all, and correct for every built-in but the `inet` pair, so this capability is purely
+    /// additive. Read it through [`crate::Port::active_mode`] /
+    /// [`crate::PortRegistry::active_mode`].
+    fn active_mode(&self) -> ActiveMode {
+        ActiveMode::False
+    }
+
+    /// Takes the `{active, …}` grants this driver has spent since the previous call, **oldest
+    /// first** (see [`ActiveSpend`]).
+    ///
+    /// A driver spends a grant per delivered packet (`inet_drv.c:1552-1560`) and, for the two
+    /// modes that *end* at that spend, the transition is invisible in the delivered terms:
+    /// an `{active, once}` grant is cleared **silently** (no `{tcp_passive, S}` follows), and an
+    /// `{active, N}` counter that reaches zero is only inferable from a subsequent `setopts`. So
+    /// the driver reports the spend here rather than leaving the runtime to guess.
+    ///
+    /// Taking is what **consumes**: every spend is returned exactly once and the driver's queue is
+    /// emptied, so a caller drains after every round (and after every explicit driver
+    /// interaction) — the rule the crate's other owner-facing channels follow. Drained through
+    /// [`crate::Port::take_active_spends`] /
+    /// [`crate::PortRegistry::take_active_spends`].
+    ///
+    /// The default answers an **empty `Vec`**, which allocates nothing: a driver that never enters
+    /// an active mode (every built-in today) is unaffected, and the common "nothing was spent"
+    /// path costs no allocation.
+    fn take_active_spends(&mut self) -> Vec<ActiveSpend> {
+        Vec::new()
+    }
     /// Declares the deadline at which this driver next wants [`Driver::timeout`] to run.
     ///
     /// This is the driver-facing **timer-arming seam**: a driver that needs a port timer (an
