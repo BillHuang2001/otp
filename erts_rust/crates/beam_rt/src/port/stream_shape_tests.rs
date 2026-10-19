@@ -42,13 +42,12 @@
 //! # What this suite does and does not prove
 //!
 //! It proves the *builder*: given a read's header/body split, the runtime renders the oracle's
-//! exact term, on both streams. It cannot prove the *producer*: whether a real driver's
-//! `driver_output2` reaches the builder with the split intact is pinned end to end by
+//! exact term, on both streams. The *producer* half — whether a real driver's `driver_output2`
+//! reaches the builder with the split intact — is pinned end to end by
 //! [`super::driver_output_shape_tests`] (a registered driver staging split reads through a real
-//! port-task round). The one producer shape no read can carry — a **built-in** driver port's flat
-//! byte queue — stays [`StreamShape::DriverOutput`]'s, pinned by
-//! [`super::ram_file_matrix_tests`]; the exact `beam_io` change that closes it is recorded in this
-//! node's `CONTEXT.md` (*Handoffs*).
+//! port-task round, plus the in-tree `ram_file_drv` reply matrix). A **built-in** driver port's
+//! header-less read is [`StreamShape::DriverOutput`]'s, pinned by
+//! [`super::ram_file_matrix_tests`] and [`super::driver_output_shape_tests`].
 use super::ram_file_matrix_tests::oracle_output;
 use super::tests::{skip_oracle_check, text_of};
 use super::*;
@@ -459,8 +458,8 @@ fn a_headerless_call_is_still_a_binary() {
     );
 }
 /// A **built-in driver port**'s header-less read ([`StreamShape::DriverOutput`]) is list elements
-/// on **either** stream: its flat byte queue cannot carry a split, so the C's header rendering is
-/// the honest answer.
+/// on **either** stream: that shape renders its producer's bytes as the C's header half, whatever
+/// the port's stream option asks for.
 ///
 /// A read that *does* carry a header keeps its own split even for such a port — the shape may
 /// never hide bytes a producer really delivered as a header.

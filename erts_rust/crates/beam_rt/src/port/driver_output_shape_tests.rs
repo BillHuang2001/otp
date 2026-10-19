@@ -23,9 +23,11 @@
 //! The C renders a driver output call's **header** bytes as list *elements* and only its **data**
 //! bytes through the port's stream bit (`deliver_read_message`, `erts/emulator/beam/io.c:3363-3448`,
 //! `deliver_vec_message`, `:3501-3617`), so a `[binary]` port does **not** always deliver a binary:
-//! a driver reply whose call was header-only arrives as a proper list of byte integers. `ram_file_drv`
-//! answers exactly that way — `numeric_reply`/`reply`/`error_reply` all go through
-//! `driver_output2(port, buf, len, NULL, 0)` (`erts/emulator/drivers/common/ram_file_drv.c:181-228`).
+//! a reply whose call was header-only arrives as a proper list of byte integers, and one that
+//! carried a data part as the improper `[H1..Hh|<<Data>>]`. `ram_file_drv` answers both ways —
+//! `numeric_reply`/`reply`/`error_reply` go through `driver_output2(port, buf, len, NULL, 0)`
+//! (`erts/emulator/drivers/common/ram_file_drv.c:181-228`), a `DATA` reply through
+//! `driver_output_binary(port, hdr, 5, bin, 0, n)` (`:448-489`).
 //!
 //! # What this suite pins, and where it differs from its two siblings
 //!
@@ -43,16 +45,14 @@
 //! ([`beam_io::DriverContext::deliver_read`]) through a **real** port-task round, and every one of
 //! the C's four shapes — plus a line frame's header prefix — reaches the owner unchanged.
 //!
-//! # The one residual, named loudly
+//! # Exact, two-sided, on both streams
 //!
-//! A **built-in driver port**'s reply still arrives through [`beam_io::DriverContext::input`], a
-//! flat byte queue that carries **no** header/data split, so the port layer reports
-//! [`StreamShape::DriverOutput`] — "the C's header rendering, split unknown". That is *exact* for a
-//! header-only reply and loses the binary tail of a `DATA` reply (`driver_output_binary`,
-//! `ram_file_drv.c:448`): the oracle delivers `[2,0,0,0,2|<<97,98>>]`, this runtime
-//! `[2,0,0,0,2,97,98]` — the same bytes, as list elements. [`report_residual`] prints those two
-//! rows on every run, and the matrix comparison below is aligned on exactly those two rows (never
-//! silently).
+//! Every [`MATRIX`] row carries the term its output call must produce on **each** stream, the row
+//! asserts the runtime produced exactly that term (with its byte integers and their header/data
+//! split, so the structural kind is checked as well as the text), and the finished session is then
+//! compared line for line with the oracle's own output for the same command sequence. No row is
+//! substituted on the way to that comparison, so a reply that arrived as a flat list where the
+//! oracle conses a binary tail fails both its own row and the session.
 use super::ram_file_matrix_tests::oracle_output;
 use super::tests::{counter, erl_bytes, fixture, skip_oracle_check, Fixture};
 use super::*;
@@ -77,7 +77,8 @@ const CHILD_BOUND: Duration = Duration::from_secs(10);
 /// `erlang:port_control(P, 200, <<>>)`).
 const EXBADPORT: &[u8] = &[0, 101, 120, 98, 97, 100, 112, 111, 114, 116];
 
-/// One matrix row: the reply's provoking command, its bytes, and the two renderings.
+/// One matrix row: the reply's provoking command, its bytes, the split of the output call that
+/// carried them, and that call's rendering on each stream.
 struct Row {
     /// The row label both sides print for it.
     name: &'static str,
@@ -85,70 +86,96 @@ struct Row {
     command: &'static [u8],
     /// The reply bytes exactly as the driver emits them.
     bytes: &'static [u8],
-    /// The `[binary]` port's rendering in this runtime — the C's header rule, on **either** stream:
-    /// every delivered byte a list element, because the driver answered header-only.
-    rendered: &'static str,
-    /// The oracle's own `[binary]` rendering where it differs — the improper `[header|<<data>>]`
-    /// form of a `DATA` reply, whose binary tail the `beam_io` seam does not carry. `None` means
-    /// "the oracle renders `rendered` too", i.e. that row is *exact*.
-    oracle_binary: Option<&'static str>,
+    /// The call's **data part** — the C's `driver_output2`/`driver_output_binary` `buf`/`len`
+    /// operands. `None` is a `NULL` `buf` (a header-only reply), which the C renders as a proper
+    /// list rather than as a list with an empty binary tail.
+    body: Option<&'static [u8]>,
+    /// The reply's rendering on a `[binary]` port — the oracle's own term.
+    binary: &'static str,
+    /// The reply's rendering on the default `[]` stream — the oracle's own term.
+    list: &'static str,
+}
+
+impl Row {
+    /// The rendering this row's output call must produce on `stream`.
+    fn expected(&self, stream: StreamType) -> &'static str {
+        match stream {
+            StreamType::Binary => self.binary,
+            StreamType::List => self.list,
+        }
+    }
+
+    /// The call's **header** bytes: everything the reply carries that is not its data part.
+    fn header(&self) -> &'static [u8] {
+        let body = self.body.map_or(0, <[u8]>::len);
+        &self.bytes[..self.bytes.len() - body]
+    }
 }
 
 /// The seven-row matrix: a fresh `OPEN` of `"abc"`, a two-byte `READ`, the `SIZE`, the whole-file
 /// `GET`, a `TRUNCATE` at the position the reads left, and the two refusals.
 ///
 /// `OPEN`/`SIZE`/`TRUNCATE`/`PREAD`/`LSEEK` are header-only replies (`numeric_reply`, `reply`,
-/// `error_reply`), which is what makes them *exact* below; `READ`/`GET` carry a data part.
+/// `error_reply`), so the whole reply is the call's header and a `[binary]` port renders it as a
+/// **proper** list; `READ`/`GET` carry a data part, so the same stream renders them as the improper
+/// `[header|<<data>>]`.
 #[rustfmt::skip] // one row per line: the matrix is read as a table, not as code.
 const MATRIX: &[Row] = &[
     Row {
         name: "open_fresh",
         command: &[1, 0, 0, 0, 3, 97, 98, 99],
         bytes: &[3, 0, 0, 0, 0],
-        rendered: "[3,0,0,0,0]",
-        oracle_binary: None,
+        body: None,
+        binary: "[3,0,0,0,0]",
+        list: "[3,0,0,0,0]",
     },
     Row {
         name: "read_data",
         command: &[2, 0, 0, 0, 2],
         bytes: &[2, 0, 0, 0, 2, 97, 98],
-        rendered: "[2,0,0,0,2,97,98]",
-        oracle_binary: Some("[2,0,0,0,2|<<97,98>>]"),
+        body: Some(&[97, 98]),
+        binary: "[2,0,0,0,2|<<97,98>>]",
+        list: "[2,0,0,0,2,97,98]",
     },
     Row {
         name: "size",
         command: &[37],
         bytes: &[3, 0, 0, 0, 3],
-        rendered: "[3,0,0,0,3]",
-        oracle_binary: None,
+        body: None,
+        binary: "[3,0,0,0,3]",
+        list: "[3,0,0,0,3]",
     },
     Row {
         name: "get",
         command: &[30],
         bytes: &[2, 0, 0, 0, 3, 97, 98, 99],
-        rendered: "[2,0,0,0,3,97,98,99]",
-        oracle_binary: Some("[2,0,0,0,3|<<97,98,99>>]"),
+        body: Some(&[97, 98, 99]),
+        binary: "[2,0,0,0,3|<<97,98,99>>]",
+        list: "[2,0,0,0,3,97,98,99]",
     },
     Row {
         name: "truncate",
         command: &[14],
         bytes: &[0],
-        rendered: "[0]",
-        oracle_binary: None,
+        body: None,
+        binary: "[0]",
+        list: "[0]",
     },
     Row {
         name: "pread_neg",
         command: &[17, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 3],
         bytes: &[1, 101, 105, 110, 118, 97, 108],
-        rendered: "[1,101,105,110,118,97,108]",
-        oracle_binary: None,
+        body: None,
+        binary: "[1,101,105,110,118,97,108]",
+        list: "[1,101,105,110,118,97,108]",
     },
     Row {
         name: "lseek_bad_whence",
         command: &[3, 0, 0, 0, 0, 0, 0, 0, 9],
         bytes: &[1, 101, 105, 110, 118, 97, 108],
-        rendered: "[1,101,105,110,118,97,108]",
-        oracle_binary: None,
+        body: None,
+        binary: "[1,101,105,110,118,97,108]",
+        list: "[1,101,105,110,118,97,108]",
     },
 ];
 
@@ -211,10 +238,12 @@ impl Session {
 
     /// Sends one row's command and records the payload its owner received.
     ///
-    /// Every row asserts its own three facts, so a divergence names the row instead of only the
-    /// session's last line: the payload is a **proper list** of the reply's byte integers, its
-    /// rendered form is the C's header rendering, and both byte counters (`port_info(P, input)` and
-    /// the node-global `erlang:statistics(io)`) charge the reply exactly once.
+    /// Every row asserts its own four facts, so a divergence names the row instead of only the
+    /// session's last line: the payload carries exactly the reply's bytes, on a `[binary]` port with
+    /// the output call's header/data split (a proper list for a header-only reply, an improper list
+    /// ending in the data binary otherwise) and on the default stream as one proper list, its
+    /// rendered form is the C's term for that split, and both byte counters (`port_info(P, input)`
+    /// and the node-global `erlang:statistics(io)`) charge the reply exactly once.
     fn step(&mut self, row: &Row) {
         self.runtime
             .ports
@@ -227,25 +256,50 @@ impl Session {
                 )
             });
         let payload = self.take_payload(row.name);
-        let bytes: Vec<i64> = terms::list_elements(payload)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "row {:?}: a built-in driver port delivers the C's header as list elements, \
-                     got {} ({error})",
-                    row.name,
-                    self.render(payload)
-                )
-            })
-            .into_iter()
-            .map(signed_value)
-            .collect();
-        let expected: Vec<i64> = row.bytes.iter().map(|byte| i64::from(*byte)).collect();
-        assert_eq!(bytes, expected, "row {:?}: the reply's bytes", row.name);
+        match row.body {
+            // The `[binary]` stream's reply with a data part: the list is improper and ends in the
+            // data binary, with the call's header as its elements.
+            Some(body) if self.stream == StreamType::Binary => {
+                let (header, tail) = split_payload(payload).unwrap_or_else(|| {
+                    panic!(
+                        "row {:?}: a reply that carries a data part must end in a binary tail, got \
+                         {} — a flat list loses the C's `driver_output_binary` split",
+                        row.name,
+                        self.render(payload)
+                    )
+                });
+                let want_header: Vec<i64> =
+                    row.header().iter().map(|byte| i64::from(*byte)).collect();
+                assert_eq!(
+                    header, want_header,
+                    "row {:?}: the call's header bytes",
+                    row.name
+                );
+                assert_eq!(tail, body, "row {:?}: the call's data part", row.name);
+            }
+            // Every other shape — a header-only reply on either stream, any reply on the default
+            // stream — is a proper list of every byte the reply carries.
+            _ => {
+                let bytes: Vec<i64> = terms::list_elements(payload)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "row {:?}: this reply is a proper list of its bytes, got {} ({error})",
+                            row.name,
+                            self.render(payload)
+                        )
+                    })
+                    .into_iter()
+                    .map(signed_value)
+                    .collect();
+                let expected: Vec<i64> = row.bytes.iter().map(|byte| i64::from(*byte)).collect();
+                assert_eq!(bytes, expected, "row {:?}: the reply's bytes", row.name);
+            }
+        }
+        let rendered = self.render(payload);
         assert_eq!(
-            self.render(payload),
-            row.rendered,
-            "row {:?}: a built-in driver port renders a driver output call's header as list \
-             elements on either stream",
+            rendered,
+            row.expected(self.stream),
+            "row {:?}: the C's rendering of the output call that produced these bytes",
             row.name
         );
         self.input += i64::try_from(row.bytes.len()).expect("a reply length fits an i64");
@@ -275,8 +329,7 @@ impl Session {
             "row {:?}: `erlang:statistics(io)` counts the same bytes",
             row.name
         );
-        self.lines
-            .push(format!("{{{},{}}}", row.name, row.rendered));
+        self.lines.push(format!("{{{},{rendered}}}", row.name));
     }
 
     /// Polls the runtime's own poll route until `name`'s reply arrives, returning its payload term.
@@ -343,6 +396,20 @@ impl Session {
     }
 }
 
+/// `payload` as the C's `(header, data)` pair: the byte integers the list conses in front, and the
+/// binary it ends in. `None` when the payload is a proper list — no data part at all, which is what
+/// a flat rendering of a `driver_output_binary` reply looks like.
+fn split_payload(payload: Eterm) -> Option<(Vec<i64>, Vec<u8>)> {
+    let mut header = Vec::new();
+    let mut cell = payload;
+    while let (Ok(head), Ok(tail)) = (terms::cons_head(cell), terms::cons_tail(cell)) {
+        header.push(signed_value(head));
+        cell = tail;
+    }
+    let data = terms::binary_bytes(cell).ok()?;
+    Some((header, data.to_vec()))
+}
+
 /// `bytes` as an Erlang binary literal: `<<1,0,0,0,3,97,98,99>>`.
 fn erl_binary(bytes: &[u8]) -> String {
     let rendered: Vec<String> = bytes.iter().map(u8::to_string).collect();
@@ -370,67 +437,14 @@ fn oracle_matrix_expr(options: &str) -> String {
     expr
 }
 
-/// `oracle`'s `[binary]` matrix with the two declared `DATA` tails folded to the proper-list form
-/// this runtime renders, so the whole session — counters included — can be compared line for line.
+/// A `[binary]` **built-in driver** port delivers the C's term for every reply, end to end.
 ///
-/// The substitution is *row-scoped and counted*: only a row that [MATRIX] declares as a residual
-/// may change, and every declared residual must actually have been present (a `DATA` reply that
-/// started arriving as the oracle's improper list would make this fail rather than silently align).
-fn aligned_with_this_runtime(oracle: &str) -> String {
-    let mut aligned = oracle.to_string();
-    for row in MATRIX {
-        let Some(improper) = row.oracle_binary else {
-            continue;
-        };
-        let expected = format!("{{{},{}", row.name, improper);
-        assert!(
-            aligned.contains(&expected),
-            "the oracle must still answer {expected:?} for this row:\n{aligned}"
-        );
-        aligned = aligned.replace(
-            &format!("{{{},{improper}}}", row.name),
-            &format!("{{{},{}}}", row.name, row.rendered),
-        );
-    }
-    aligned
-}
-
-/// Prints the residual this suite cannot close, naming every row it covers.
-///
-/// An **in-tree driver** hands its bytes up through [`beam_io::DriverContext::input`], a flat byte
-/// queue with no split attached, so a `DATA` reply's binary tail is unreachable from this crate;
-/// the bytes and both byte counters agree exactly.
-fn report_residual() {
-    println!("================================================================");
-    println!(
-        "RESIDUAL (reported, not papered over): a built-in driver port's `DATA` reply term shape."
-    );
-    for row in MATRIX {
-        if let Some(improper) = row.oracle_binary {
-            println!("  row {}:", row.name);
-            println!("    oracle:       {improper} — header list ++ a binary tail");
-            println!(
-                "    this runtime: {} — the same bytes as one proper list",
-                row.rendered
-            );
-        }
-    }
-    println!(
-        "  cause: an in-tree driver hands its bytes up through `beam_io`'s flat byte queue \
-         (`DriverContext::input`), which carries no split; owner: `beam_io`, bytes and counters \
-         agree."
-    );
-    println!("================================================================");
-}
-
-/// A `[binary]` **built-in driver** port delivers the C's header list, end to end.
-///
-/// The seven-row matrix through a real `{spawn_driver, "ram_file_drv"}` port: every reply is a
-/// proper list of byte integers (never a binary), both byte counters are exact, and the whole
-/// rendered session agrees with the live oracle's for the same command sequence — except the two
-/// declared `DATA` rows this runtime's seam cannot split, which [`report_residual`] prints.
+/// The seven-row matrix through a real `{spawn_driver, "ram_file_drv"}` port: a header-only reply is
+/// a proper list of byte integers, a reply carrying a data part is the improper `[header|<<data>>]`,
+/// neither is ever one binary, both byte counters are exact, and the whole rendered session equals
+/// the live oracle's output for the same command sequence — side by side, with nothing substituted.
 #[test]
-fn a_binary_stream_builtin_driver_reply_is_the_cs_header_list() {
+fn a_binary_stream_builtin_driver_reply_is_the_cs_term() {
     let mut session = Session::new(StreamType::Binary);
     session.run();
     assert_eq!(session.rendered().lines().count(), MATRIX.len() + 1);
@@ -438,8 +452,8 @@ fn a_binary_stream_builtin_driver_reply_is_the_cs_header_list() {
 
     match oracle_output(&oracle_matrix_expr(session.options())) {
         Some(oracle) => {
-            // The oracle's own matrix, spelled out: the header-only rows are exactly what this
-            // runtime delivers (which is the fix), and the two `DATA` rows are its improper form.
+            // The oracle's own matrix, spelled out: the header-only rows are proper lists and the
+            // two `DATA` rows are its improper `[header|<<data>>]` form (erts-17.1).
             assert_eq!(
                 oracle,
                 "{open_fresh,[3,0,0,0,0]}\n\
@@ -452,21 +466,17 @@ fn a_binary_stream_builtin_driver_reply_is_the_cs_header_list() {
                  {final,40,34}",
                 "the `[binary]` stream's measured matrix (erts-17.1)"
             );
-            // ... and the whole session — every row's term and both counters — is the oracle's,
-            // aligned on exactly the two rows [MATRIX] declares as residuals.
+            // ... and the whole session — every row's term and both counters — is the oracle's.
             assert_eq!(
-                ours,
-                aligned_with_this_runtime(&oracle),
-                "the `[binary]` matrix must agree with the oracle apart from the declared `DATA` \
-                 rows"
+                ours, oracle,
+                "the `[binary]` matrix must agree with the oracle row for row"
             );
         }
         None => skip_oracle_check("a `[binary]` built-in driver port's reply shapes"),
     }
-    report_residual();
 }
 
-/// The default `[]` stream renders the same bytes as a proper list — unchanged by this shape.
+/// The default `[]` stream renders every reply as a proper list of all its bytes.
 ///
 /// The default stream is insensitive to the split (header and data are both list elements there),
 /// so a list-stream session agrees with the oracle **whole**: every row and both counters.
@@ -489,11 +499,12 @@ fn the_default_stream_renders_the_same_bytes_as_a_proper_list() {
     );
 }
 
-/// The **builder** renders a [`StreamShape::DriverOutput`] payload as list elements on *both*
-/// streams — the one shape whose rendering ignores the port's "binary" bit.
+/// The **builder** renders a **header-less** [`StreamShape::DriverOutput`] read as list elements on
+/// *both* streams — the one shape whose rendering ignores the port's "binary" bit.
 ///
-/// [`super::stream_shape_tests`] covers the header shapes; this is the split-unknown one the
-/// producer really reports, pinned on the binary stream too (a driver reply is not a binary there).
+/// [`super::stream_shape_tests`] covers the four header shapes; this is the built-in-driver shape
+/// that carries no header at all, pinned on the binary stream too (such a reply is not a binary
+/// there).
 #[test]
 fn the_builder_renders_a_driver_output_payload_as_list_elements_on_either_stream() {
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
@@ -873,7 +884,7 @@ fn rendered_data(runtime: &mut Runtime, message: Eterm) -> String {
 ///
 /// The rows are the oracle's table ([`ReadMessage`]'s rustdoc; measured on a real C driver against
 /// erts-17.1 and, for the header-only and `DATA` rows, by
-/// [`a_binary_stream_builtin_driver_reply_is_the_cs_header_list`]): `[72,68,82|<<97,98,99>>]` for a
+/// [`a_binary_stream_builtin_driver_reply_is_the_cs_term`]): `[72,68,82|<<97,98,99>>]` for a
 /// header **with** a data part, the proper `[72,68,82]` for one **without**, `[72,68,82|<<>>]` for a
 /// present-but-empty data part, the bare `<<97,98,99>>` for a header-less `driver_output`, and the
 /// flat list form on the default stream. Accounting counts `hlen + len` on every carried read.
