@@ -3241,9 +3241,9 @@ impl PortHook for RuntimePorts {
         };
         resolved.overlay(self.port_options(options)?);
         // `[exit_status]` is `badarg` for any port whose name resolves to a registered driver —
-        // the C's `(driver != &spawn_driver && opts->exit_status)` (`io.c:625-628`), applied to
-        // **both** name forms because the `{spawn, Cmd}` lookup runs first. The refusal is the whole
-        // truth, not a Milestone-1 shortcut: the only `{exit_status, N}` reporter is the
+        // the C's `(driver != &spawn_driver && opts->exit_status)` (`io.c:623-626`), applied to
+        // **both** spawn name forms because the `{spawn, Cmd}` lookup runs first. The refusal is the
+        // whole truth, not a Milestone-1 shortcut: the only `{exit_status, N}` reporter is the
         // emulator-internal `driver_report_exit` (`io.c:5554`), which `erl_driver.h` does not
         // declare, so no Erlang-reachable driver can ever report one. Checked here, before any
         // registry call, so a refused port consumes no id.
@@ -4228,18 +4228,26 @@ fn driver_path_name(command: &str) -> &str {
 /// Whether `spec` names a port the C would open **through a driver** — the predicate behind the
 /// `[exit_status]` refusal (`erts/emulator/beam/io.c:595-628`).
 ///
-/// The C resolves the name against its loaded-driver list for **both** name forms: `{spawn, Cmd}`
-/// truncates the command at the first blank and searches for the token (`io.c:599-628`), and
-/// `{spawn_driver, Name}` searches for the name itself. A hit means the port is a *driver* port, for
-/// which `opts->exit_status` is `badarg` (`io.c:625-628`) — and an unresolved `{spawn_driver, Name}`
-/// is `badarg` a few lines later for the same input, so the answer does not depend on the lookup.
+/// The C resolves the name against its loaded-driver list for **both** spawn name forms:
+/// `{spawn, Cmd}` truncates the command at the first blank and searches for the token
+/// (`io.c:599-628`), and `{spawn_driver, Name}` searches for the name itself. A hit means the port
+/// is a *driver* port, for which `opts->exit_status` is `badarg` (`io.c:623-626`) — and an
+/// unresolved `{spawn_driver, Name}` is `badarg` a few lines later for the same input, so the answer
+/// does not depend on the lookup.
 ///
 /// The membership gates are the emulator's own two: [`driver::is_static_driver`] (the `driver_tab.c`
 /// statics — `tcp_inet`, `udp_inet`, `ram_file_drv`) and [`driver::driver_is_loaded`] (a driver an
 /// `erl_ddll:load_driver/3` put on the loaded list). `fd`/`efile` are deliberately **not** members:
 /// OTP 21+ made them ordinary modules, so the oracle runs `{spawn,"fd"}` as a shell command and
-/// accepts `[exit_status]` for it (verified against erts-17.1). `{spawn_executable, Path}` skips the
-/// lookup entirely in the C (`spawn_type != ERTS_SPAWN_EXECUTABLE`), so it is never a driver port.
+/// accepts `[exit_status]` for it (verified against erts-17.1).
+///
+/// The `{fd, N}` **name form** is a driver port, and a different driver from `spawn_driver`: it is
+/// the emulator's own `fd_driver` (`erts/emulator/sys/unix/sys_drivers.c:257`, registered at
+/// `io.c:86`), so the same test refuses `[exit_status]` for it — measured on erts-17.1,
+/// `open_port({fd,1},[exit_status])` raises `error:badarg`. It is refused here for the same reason
+/// the driver names are: no Erlang-reachable driver can report a status (see the `open_port` site).
+/// `{spawn_executable, Path}` skips the lookup entirely in the C
+/// (`spawn_type != ERTS_SPAWN_EXECUTABLE`), so it is never a driver port.
 fn opens_a_driver_port(spec: &NameSpec) -> bool {
     match spec.kind {
         PortName::SpawnDriver | PortName::SpawnDriverBuiltin => true,
@@ -4247,7 +4255,8 @@ fn opens_a_driver_port(spec: &NameSpec) -> bool {
             let name = driver_path_name(&spec.command);
             driver::is_static_driver(name) || driver::driver_is_loaded(name)
         }
-        PortName::SpawnExecutable | PortName::Fd => false,
+        PortName::SpawnExecutable => false,
+        PortName::Fd => true,
     }
 }
 
@@ -4409,6 +4418,18 @@ mod tests;
 /// oracle-expression builder do not grow the provider's unit suite.
 #[cfg(test)]
 mod ram_file_matrix_tests;
+/// The `[exit_status]` **name-form matrix** against the live oracle: which `open_port/2` `Name`
+/// forms accept the option and which are `badarg`, plus the "a refusal consumes no port number"
+/// property (see `src/port/exit_status_matrix_tests.rs`). A separate file so the matrix does not
+/// grow this one.
+#[cfg(test)]
+mod exit_status_matrix_tests;
+/// The `erlang:port_command/2,3` **row matrix** against the live oracle: the idle-port rows both
+/// runtimes can reach, and the busy-port arms this runtime can only reach through its own
+/// controllable driver fixture (see `src/port/command_matrix_tests.rs`). A separate file so the
+/// matrix does not grow this one.
+#[cfg(test)]
+mod command_matrix_tests;
 /// The A.4 **driver-monitor marking** suite: the runtime's pass-boundary sweep over every live
 /// port's C-driver monitor tree (see `src/port/monitor_tests.rs`). A separate file so the suite
 /// does not grow this one.

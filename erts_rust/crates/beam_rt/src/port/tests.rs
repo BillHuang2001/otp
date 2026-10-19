@@ -181,6 +181,40 @@ pub(super) fn assert_badarg<T: std::fmt::Debug>(result: Result<T>) {
         "expected badarg, got {result:?}"
     );
 }
+/// A raise as the text the oracle prints for it: `error:<Reason>` — the shape the probes build
+/// with `"error:" ++ lists:flatten(io_lib:format("~p", [E]))`.
+///
+/// The reason is the bare atom whenever the raise carries one, so `notsup` renders
+/// `error:notsup` and `badarg` renders `error:badarg` — never the `Display` form
+/// (`"error notsup"`), which is a diagnostic string rather than the BEAM reason. A reason backed
+/// by an owned `String` (the `unsupported` capability gaps) has no atom to render, so it is
+/// rendered whole.
+pub(super) fn raised_text(error: &BeamError) -> String {
+    match error {
+        BeamError::Raise(raise) => {
+            let reason = raise
+                .reason
+                .as_atom()
+                .map(str::to_string)
+                .unwrap_or_else(|| raise.reason.to_string());
+            format!("error:{reason}")
+        }
+        other => format!("error:{other}"),
+    }
+}
+/// `[elements…]` as a list on the runtime's own heap.
+///
+/// The runtime-based suites ([`super::exit_status_matrix_tests`],
+/// [`super::command_matrix_tests`]) drive the BIFs through the runtime's **own** dispatch rather
+/// than the fixture's hook, so their operands are built through [`RuntimeContext`] exactly as the
+/// native floor's own tests do — and both suites need the same two constructors.
+pub(super) fn runtime_list(runtime: &mut Runtime, elements: &[Eterm]) -> Eterm {
+    terms::make_list(&mut RuntimeContext::new(runtime), elements).expect("a list")
+}
+/// `{elements…}` as a tuple on the runtime's own heap (see [`runtime_list`]).
+pub(super) fn runtime_tuple(runtime: &mut Runtime, elements: &[Eterm]) -> Eterm {
+    terms::make_tuple(&mut RuntimeContext::new(runtime), elements).expect("a tuple")
+}
 
 /// Drains the fixture's port poller until `port` produces stream data, returning it.
 ///
