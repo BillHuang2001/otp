@@ -614,25 +614,151 @@ mod tests {
     }
 
     #[test]
-    fn a_root_handoff_escapes_the_register_files() {
-        // `with_roots` hands a receiver mutable slices of both files, so the marks
-        // cannot be trusted afterwards: the next reset must refill in full. Prove it by
-        // escaping, writing a deep slot through the handed slice, and resetting — a
-        // mark-bounded refill would leave the write behind.
+    fn a_root_handoff_hands_the_used_prefix_and_every_slot_it_hands_is_refilled() {
+        // `with_roots` hands the receiver the machine's **writable root prefix** of each
+        // file — one past the highest slot the run has actually written — not the whole
+        // file. The narrowing is sound *by construction*: every slot at or beyond the
+        // prefix is NIL by the refill invariant, so it holds no term and cannot be a root,
+        // and the host physically cannot write outside the slice it received.
+        //
+        // Both halves have to hold, so both are asserted: the slice is exactly the used
+        // prefix, and every slot in it is refilled even though the writes went around the
+        // `set_x`/`set_fr` seams (which never saw them) — the host reports its reach
+        // through the `x_dirty`/`fr_dirty` extent instead.
         let mut machine = Machine::new();
+        machine.set_x(1, Eterm::from_raw(0x1111)).unwrap();
+        machine.set_fr(2, Eterm::from_raw(0x2222)).unwrap();
+        let mut handed = (0usize, 0usize);
         machine.with_roots(u32::MAX, |roots| {
-            roots.x[800] = Eterm::from_raw(0x5A5A);
-            roots.fr[801] = Eterm::from_raw(0x5B5B);
+            handed = (roots.x.len(), roots.fr.len());
+            // The widest write a host can make: every slot it was handed.
+            for slot in roots.x.iter_mut() {
+                *slot = Eterm::from_raw(0x5A5A);
+            }
+            for slot in roots.fr.iter_mut() {
+                *slot = Eterm::from_raw(0x5B5B);
+            }
+            assert!(
+                roots.x.get_mut(roots.x.len()).is_none(),
+                "the x slice stops at the used prefix — a host cannot reach past it"
+            );
+            assert!(
+                roots.fr.get_mut(roots.fr.len()).is_none(),
+                "the FR slice stops at the live prefix — a host cannot reach past it"
+            );
         });
-        assert_eq!(machine.x(800), Some(Eterm::from_raw(0x5A5A)));
-        assert_eq!(machine.get_fr(801), Some(Eterm::from_raw(0x5B5B)));
+        // One past the highest written x slot (x1) and FR slot (fr2).
+        assert_eq!(
+            handed,
+            (2, 3),
+            "the hand-off is the used prefix of each file, not the whole 1024-word file"
+        );
+        assert_eq!(machine.x(1), Some(Eterm::from_raw(0x5A5A)));
+        assert_eq!(machine.get_fr(2), Some(Eterm::from_raw(0x5B5B)));
+        // Only the hand-off is narrow: the files themselves are whole.
+        assert_eq!(machine.x.len(), MAX_REGISTER as usize);
+        assert_eq!(machine.fr.len(), MAX_FLOAT_REGISTER as usize);
+
         machine.reset();
-        assert_eq!(machine.x(800), Some(Eterm::default()));
-        assert_eq!(machine.get_fr(801), Some(Eterm::default()));
-        assert!(machine.x.iter().all(|slot| *slot == Eterm::default()));
-        assert!(machine.fr.iter().all(|slot| *slot == Eterm::default()));
+        assert!(
+            machine.x.iter().all(|slot| *slot == Eterm::default()),
+            "a slot written through the handed slice survived the refill"
+        );
+        assert!(
+            machine.fr.iter().all(|slot| *slot == Eterm::default()),
+            "an FR slot written through the handed slice survived the refill"
+        );
     }
 
+    #[test]
+    fn an_extent_bounded_refill_never_leaves_a_stale_register() {
+        // The extent path (a writer that reports the slots it may have reached, i.e. a
+        // native block or a root hand-off) must be as sound as the mark path: a deep
+        // reported extent is refilled in full, and the *next* run — which reports a tiny
+        // extent of its own — still leaves every slot of both files NIL.
+        let mut machine = Machine::new();
+        for round in 0..8u32 {
+            let deep = 40 * round + 5;
+            // A run that reports a deep extent and writes the slot at its edge.
+            machine.note_x_dirty(deep + 1);
+            machine.note_fr_dirty(deep + 2);
+            machine.x[deep as usize] = Eterm::from_raw(0xC0DE + round as usize);
+            machine.fr[deep as usize] = Eterm::from_raw(0xC0DF);
+            machine.reset();
+            assert!(
+                machine.x.iter().all(|slot| *slot == Eterm::default()),
+                "round {round}: a stale x register survived the extent-bounded refill"
+            );
+            assert!(
+                machine.fr.iter().all(|slot| *slot == Eterm::default()),
+                "round {round}: a stale FR register survived the extent-bounded refill"
+            );
+
+            // The shallow run: two x slots and one FR slot, and its own reset must leave
+            // both files exactly as a full 2048-word refill would.
+            machine.set_x(1, Eterm::from_raw(0x11)).unwrap();
+            machine.set_fr(0, Eterm::from_raw(0x22)).unwrap();
+            machine.reset();
+            assert!(
+                machine.x.iter().all(|slot| *slot == Eterm::default()),
+                "round {round}: the shallow run left a stale x register"
+            );
+            assert!(
+                machine.fr.iter().all(|slot| *slot == Eterm::default()),
+                "round {round}: the shallow run left a stale FR register"
+            );
+        }
+    }
+
+    #[test]
+    fn a_three_register_run_refills_three_words_not_the_whole_file() {
+        // The deterministic work counter: the refill is proportional to what the run used,
+        // not to the 2048 words of the two files.
+        let mut machine = Machine::new();
+        machine.set_x(0, Eterm::from_raw(1)).unwrap();
+        machine.set_x(1, Eterm::from_raw(2)).unwrap();
+        machine.set_x(2, Eterm::from_raw(3)).unwrap();
+        machine.reset();
+        assert_eq!(
+            machine.refilled_words(),
+            3,
+            "three written x registers and no FR slot cost three words, not 2048"
+        );
+        assert!(machine.x.iter().all(|slot| *slot == Eterm::default()));
+        assert!(machine.fr.iter().all(|slot| *slot == Eterm::default()));
+
+        // A run that reports an extent (the native / root-hand-off door) is priced the
+        // same way, by the extent it names.
+        machine.note_x_dirty(7);
+        machine.note_fr_dirty(2);
+        machine.reset();
+        assert_eq!(machine.refilled_words(), 9, "the reported extent, x7 + fr2");
+    }
+
+    #[test]
+    fn all_live_hands_at_least_the_written_prefix_and_a_deep_write_is_refilled() {
+        // `ALL_LIVE` stays a *hint*: what the host receives is the used prefix of the file,
+        // which for a run that has written 500 registers is at least 500 slots — so every
+        // live root is inside the slice — and a deep write through it is refilled.
+        let mut machine = Machine::new();
+        for register in 0..500u32 {
+            machine
+                .set_x(register, Eterm::from_raw(0x1000 + register as usize))
+                .unwrap();
+        }
+        let handed = machine.with_roots(u32::MAX, |roots| {
+            roots.x[499] = Eterm::from_raw(0xDEAD);
+            roots.x.len()
+        });
+        assert!(
+            handed >= 500,
+            "ALL_LIVE hands every written register, got {handed}"
+        );
+        assert_eq!(machine.x(499), Some(Eterm::from_raw(0xDEAD)));
+        machine.reset();
+        assert_eq!(machine.x(499), Some(Eterm::default()));
+        assert!(machine.x.iter().all(|slot| *slot == Eterm::default()));
+    }
     #[test]
     fn repeated_resets_never_reallocate_the_register_files() {
         // The reset must retain capacity across runs: a `Machine` is reused for

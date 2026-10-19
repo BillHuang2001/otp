@@ -55,7 +55,7 @@
 //! describe the *whole* module ([`CompiledModule::code_map`]) forces the remaining
 //! functions to be compiled first, which is why it takes the [`Module`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use beam_loader::Module;
@@ -140,6 +140,15 @@ struct LazyLayout {
     /// cross-function transfer, a call into another function, a fresh slice) pays the
     /// borrow and the `Rc` clone.
     functions: RefCell<Vec<Option<Rc<CompiledFunction>>>>,
+    /// The running maximum of `summary.highest_native_register + 1` over the functions
+    /// compiled so far — the x-register **write extent** the generated code can reach.
+    ///
+    /// Maintained at the one place a compiled function is inserted (see
+    /// [`CompiledModule::function`]) rather than recomputed by
+    /// [`CompiledModule::aggregate`], which allocates and sorts a `Vec` and is therefore
+    /// unusable on the driver's per-block-entry path. A `Cell` because the insert happens
+    /// through `&self` (compile-on-entry), exactly like `functions`.
+    native_extent: Cell<Option<u32>>,
 }
 
 /// One function lowered into its own sealed mapping (the lazy layout's unit of work).
@@ -252,6 +261,7 @@ impl CompiledModule {
             fingerprint: module_fingerprint(module),
             layout: Layout::Lazy(LazyLayout {
                 functions: RefCell::new(vec![None; module.functions.len()]),
+                native_extent: Cell::new(None),
             }),
         }
     }
@@ -519,6 +529,17 @@ impl CompiledModule {
         if slot.is_none() {
             *slot = Some(Rc::clone(&compiled));
         }
+        // Fold this function's native register extent into the artifact's running
+        // maximum **here**, at the one place a function becomes part of the artifact, so
+        // [`CompiledModule::native_write_extent`] can answer without the allocating
+        // [`CompiledModule::aggregate`]. A block may reach a register `highest` names,
+        // so the *extent* is `highest + 1`.
+        if let Some(highest) = compiled.summary.highest_native_register {
+            let extent = highest + 1;
+            if lazy.native_extent.get().map_or(true, |previous| extent > previous) {
+                lazy.native_extent.set(Some(extent));
+            }
+        }
         Some(compiled)
     }
 
@@ -565,6 +586,38 @@ impl CompiledModule {
         }
     }
 
+    /// The **x-register write extent** of the code this artifact can run: one past the
+    /// highest x slot any compiled block stores into
+    /// ([`Summary::highest_native_register`]) — `None` when the artifact compiled no
+    /// block that touches a register at all.
+    ///
+    /// This is the figure the native driver reports to
+    /// [`Machine::note_x_dirty`](crate::machine::Machine) so the next
+    /// [`Machine::reset`](crate::machine::Machine) refills exactly the slots generated
+    /// code could have written instead of both 1024-word files. It is sound for the
+    /// whole artifact rather than for the entered function because the summary's
+    /// `highest_native_register` already subsumes every writer: the register cache's
+    /// loads and exit spills (`Allocation::written`), the direct `machine.x` accesses a
+    /// register beyond the cache budget takes, and an in-block continuation sub-block. A
+    /// block may reach register `highest`, hence the `+ 1`.
+    ///
+    /// **The FR file is deliberately absent.** Generated code never stores into the FR
+    /// file: `rbx` is the `machine.x` base, no emitter module in `src/jit/**` emits an FR
+    /// store (`emit/move.rs` refuses an `Operand::FloatReg` destination), and the one
+    /// interpreter-side FR writer is [`Machine::set_fr`](crate::machine::Machine), which
+    /// raises the FR high-water mark itself. So an FR slot is covered by the mark even on
+    /// this tier, and the driver notes no FR extent here.
+    ///
+    /// O(1) for both layouts — the eager summary is a field and the lazy layout keeps a
+    /// running maximum (`LazyLayout::native_extent`) — so the driver can call it on
+    /// every block entry; [`CompiledModule::highest_native_register`], by contrast, must
+    /// run the allocating `aggregate` for the lazy layout.
+    pub fn native_write_extent(&self) -> Option<u32> {
+        match &self.layout {
+            Layout::Eager(eager) => eager.summary.highest_native_register.map(|highest| highest + 1),
+            Layout::Lazy(lazy) => lazy.native_extent.get(),
+        }
+    }
     /// The number of bytes of machine code emitted by the compiled functions.
     pub fn code_len(&self) -> usize {
         match &self.layout {
