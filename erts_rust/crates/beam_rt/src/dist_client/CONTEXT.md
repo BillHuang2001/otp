@@ -11,8 +11,8 @@ What this node adds is the *driving state* the runtime owns: a socket per peer, 
 `pub(crate) use router::DistRouter;` — the `beam_process::DistSignalRouter` implementation installed on the runtime's process table.
 `pub const DIST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);` — the bound `Runtime::dist_connect` drives the handshake under.
 ## Constraints
-No behaviour change from the former single-file `src/dist_client.rs`: every item keeps its access level and its doc comment, and every path (`crate::dist_client::X`, `beam_rt::dist_client::X`, `super::X` from a sibling submodule) resolves as before.
-Helpers a sibling file calls carry `pub(super)`, which inside a directory module is exactly the scope a private item of the former single-file module had.
+Every path (`crate::dist_client::X`, `beam_rt::dist_client::X`, `super::X` from a sibling submodule) resolves through the `mod.rs` façade.
+Helpers a sibling file calls carry `pub(super)`.
 No `unsafe` (the crate is `#![deny(unsafe_code)]`); every fallible API returns `beam_common::Result` and no failure is swallowed.
 No item here is re-implemented from the lower crates: terms come from `beam_term`/`beam_codec`, signals from `beam_process`, bytes from `beam_dist`.
 # File layout

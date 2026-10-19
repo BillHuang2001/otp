@@ -4,7 +4,7 @@
 The crate's implementation root: the `main.rs` shim, the `Runtime` façade (`runtime.rs`, `runtime/`),
 the CLI (`cli.rs`, `cli/`), the concrete `ExecutionContext` glue (`context/`), the runtime-native BIF
 floor (`native.rs`, `native/`), the A.4 port layer (`port.rs`, `port/`), the A.8 introspection surface
-(`info.rs`, `info/`), the distribution node (`dist.rs`, `dist/`, `dist_client.rs`), and the
+(`info.rs`, `info/`), the distribution node (`dist.rs`, `dist/`, `dist_client/`), and the
 observability modules (`trace.rs`, `seq_trace.rs`, `crash_dump.rs`, `perf_map.rs`, `debug_trace.rs`).
 The crate-level API surface (CLI table, exit codes, `system_info` keys, boot status, gaps) lives in
 `../CONTEXT.md`; the per-module detail lives in the child `CONTEXT.md`s below.
@@ -78,20 +78,17 @@ Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, sa
   only once the **caller's** deadline has elapsed: `poll_port_messages(remaining.min(PORT_POLL_SLICE))`
   and `wait_for_timer(min(deadline, now + PORT_POLL_SLICE), …)` (`eval/mod.rs`, the `after` arm of
   `Evaluator::receive`), so `Runtime::pump_scheduler` — and with it `pump_dist` → `DistNode::pump` →
-  `accept_one` — is re-entered every slice. Before that, one iteration charged the whole window to
-  `poll_port_messages(remaining)` → `PortRegistry::pump(timeout)` (`port.rs:1767`), which loops in
-  `PORT_POLL_SLICE` `epoll_wait` slices for as long as any port is live (the booted kernel's
-  `inet_gethost` child never closes, `port.rs:1802`), so `scheduler_pass` never ran and the peer's
-  connection sat unaccepted in the listen backlog until `net_setuptime` (measured: `pang` after 7005 ms,
-  `LISTEN Recv-Q 1`, `CLOSE-WAIT … Recv-Q 31` = its unread `'N'`). Now measured
+  `accept_one` — is re-entered every slice, instead of charging the whole window to
+  `PortRegistry::pump(timeout)` (which loops in `PORT_POLL_SLICE` `epoll_wait` slices for as long as any
+  port is live — the booted kernel's `inet_gethost` child never closes, `port.rs:1802` — and would leave a
+  peer's connection unaccepted in the listen backlog until `net_setuptime`). Measured
   `beam_rt -sname rustnode -setcookie c123 -noshell -eval 'receive after 25000 -> ok end.'` +
-  `erl -sname peerpos … net_adm:ping(rustnode@billmini)` ⇒ **`pong` in 0.38 s**, against `pang` after
-  7.2 s for the pre-fix build. The observable timing of the arm is unchanged (the window still ends it; a
-  message that arrives in a slice still wins over the timeout, and a pending timer inside a slice is still
-  slept to exactly), pinned structurally by the colocated
+  `erl -sname peerpos … net_adm:ping(rustnode@billmini)` ⇒ **`pong` in 0.38 s**. The observable timing of
+  the arm is exact (the window still ends it; a message that arrives in a slice still wins over the
+  timeout, and a pending timer inside a slice is still slept to), pinned structurally by the colocated
   `eval::tests::{a_long_after_window_is_waited_out_in_port_poll_slices,
   a_sub_slice_after_window_never_loops}` over a test-only per-thread iteration counter.
-- **`DistNode::is_idle` (`dist.rs:744` → `links.rs:200`) means "no live LINK".** The listener and a pending
+- **`DistNode::is_idle` (`dist/node.rs:273` → `links.rs:200`) means "no live LINK".** The listener and a pending
   accept are not counted as work, so a distributed node with nothing to run is `is_quiescent`
   (`scheduler.rs:581`). The `run` route only survives an idle `receive` because the live `inet_gethost`
   port keeps `has_nothing_to_poll()` false; without it a long-lived server node would exit
@@ -103,7 +100,7 @@ Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, sa
   was started `-hidden` (a real node adds that bit per peer, `lib/kernel/src/dist_util.erl:152-160`;
   `net_kernel.erl:hidden_argument/0` reads the `-hidden` init argument). The acceptor
   (`DistConnection::new` → `ConnectionDriver::server_with_flags`) and the connector
-  (`dist_client.rs::connect_addr` → `ConnectionDriver::client_with_flags`) are told the same value by
+  (`dist_client/client.rs::connect_addr` → `ConnectionDriver::client_with_flags`) are told the same value by
   `Runtime::new` through the additive `DistNode::set_hidden`/`DistClient::set_hidden`, since visibility
   is a property of the node, not of who dialled. Measured against an OTP 29.1.1 peer: a pinged
   **published** node now appears in the peer's `nodes()` (`[pubprobe@billmini]`, was `[]`), a pinged
@@ -124,7 +121,7 @@ Measured against a real system `erl` (`-sname` only on this host). Facts that bi
 - **`rpc:call` is unachievable in both directions** until the distributed-spawn family exists: OTP 29 `rpc:call/5` is `erpc` (`lib/kernel/src/rpc.erl:492` → `erpc:call`), which is `spawn_request/5` + `DOP_SPAWN_REQUEST`/`DOP_SPAWN_REPLY` — not the legacy `rex` `{call,M,F,A,Gleader}` shape. Both halves are missing: `erlang:spawn_request/1..5` are in `error.rs`'s `KNOWN_UNIMPLEMENTED_ERLANG_BIFS`, `erlang:spawn/4` is absent from `native/process.rs`'s dispatch (⇒ bare `undef`), and the inbound family is `Unsupported` at `dist/inbound.rs`'s `SpawnRequest`/`SpawnReply` arm (no `beam_process` spawn-at/reservation API and no reply channel on `InboundSink`).
 - **Cross-node monitors are one-directional**: us→oracle works (`DOP_MONITOR_P` out, `DOP_MONITOR_P_EXIT` back, ref/pid `=:=`, reason `normal`); oracle→us on `{Name,Node}` is the documented gap at `native/process/monitor.rs::named_node_target` (`unsupported: erlang:monitor/2 on a {Name, Node} of another node`, exit 3).
 - **Oracle `monitor_node/2` on us WORKS**: `{nodedown,'rustnode@billmini'}` (bare 2-tuple, no reason) arrives on our death; no `{nodeup,_}` is emitted on a later connect — a real-OTP↔real-OTP **control reproduces exactly this**, so it is oracle behaviour, not a divergence.
-- **A `-sname` node survives a connected peer**: `kernel_sup`'s `global_name_server` → `net_kernel:monitor_nodes(true, #{connection_id => true})` → `nodes(visible, #{connection_id => true})` answers the peer with its **real per-link integer** (`native/net.rs::nodes_2` over `Runtime::dist_connection_id`), never a capability gap, so the peer can dial in and outlive any pass (measured: `erl -sname peerprobe -setcookie c123` pings `rustnode@…` ⇒ `pong` with `kernel_sup`/`global_name_server` still live, and the fixture module's own `nodes(visible, #{connection_id => true})` prints `[{peerprobe3@billmini,#{connection_id => 1}}]`).
+- **A `-sname` node survives a connected peer**: `kernel_sup`'s `global_name_server` → `net_kernel:monitor_nodes(true, #{connection_id => true})` → `nodes(visible, #{connection_id => true})` answers the peer with its **real per-link integer** (`native/net/nodes.rs::nodes_2` over `Runtime::dist_connection_id`), never a capability gap, so the peer can dial in and outlive any pass (measured: `erl -sname peerprobe -setcookie c123` pings `rustnode@…` ⇒ `pong` with `kernel_sup`/`global_name_server` still live, and the fixture module's own `nodes(visible, #{connection_id => true})` prints `[{peerprobe3@billmini,#{connection_id => 1}}]`).
 
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's own test region — everything from its first test-module declaration to EOF, whether that declaration opens an inline module or a sibling `#[path]` one).
@@ -163,8 +160,8 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
   `timer_resumes`) and the `runtime/timer_wakes.rs` `TimerWakes` mirror are `crate::hasher` maps.
 - `runner/` → the `beam_process::ProcessRunner` (`runner/CONTEXT.md`); `RunnerState`'s four pid-keyed
   maps (`engines`/`results`/`exits`/`errors`) are `crate::hasher::FastHashMap`.
-- `dist.rs` + `dist/` + `dist_client.rs` → the distributed node, accepting and connecting halves
-  (`dist/CONTEXT.md`).
+- `dist.rs` + `dist/` + `dist_client/` → the distributed node, accepting and connecting halves
+  (`dist/CONTEXT.md`, `dist_client/CONTEXT.md`).
 - `eval/` → the `-eval` evaluator (AST/parser/`Flow`) (`eval/CONTEXT.md`).
 - `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `mailbox.rs`, `timers.rs` (a min-heap of
   absolute deadlines over `crate::hasher::FastHashMap` indexes, whose `prune_cancelled` reclaims
