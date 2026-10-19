@@ -28,12 +28,10 @@
 //! `used` count (`external.c:1797-1801`).
 //!
 //! The property that matters is that the count **stops at the term**: trailing bytes
-//! after a plain image and after a `COMPRESSED` image are neither read nor counted
-//! (for a compressed image the count is `6 + <zlib stream length>`, the stream ending
-//! at its Adler-32 trailer). This is exactly why `is_compressed_image` and the
-//! consumed-count API are public and why `beam_bifs::binconv`'s old
-//! re-inflate-and-binary-search workaround (`consumed_compressed_len`) is no longer
-//! needed.
+//! after a plain image and after a `COMPRESSED` image are neither read nor counted.
+//! `beam_codec::compress::decompress_bounded_used` returns the consumed input bytes,
+//! and `binary_to_term/2`'s `[used]` option reports `6 + <zlib stream length>` for a
+//! `COMPRESSED` image, the stream ending at its Adler-32 trailer.
 //!
 //! Every oracle-dependent test resolves the oracle the same way [`tools/differential`]
 //! does (`$ERTS_ORACLE` if it is an existing executable, else `erl` on `$PATH`) and
@@ -175,8 +173,8 @@ fn heap(words: usize) -> Heap {
     Heap::new(words).expect("the carrier allocator never fails for these sizes")
 }
 
-/// Trailing bytes that follow the image; long enough that a re-inflating binary search
-/// over the whole input would be a real (multi-step) search.
+/// Trailing bytes that follow the image; long enough that a count stopping at the image
+/// end is plainly distinguishable from the input length.
 const JUNK: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// `C` (compressed) and `P` (plain) images of `lists:duplicate(500,hello)` from the

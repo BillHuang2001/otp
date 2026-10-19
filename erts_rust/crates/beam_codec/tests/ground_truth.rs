@@ -747,16 +747,38 @@ fn seed_compressed_image_decodes_and_its_inner_body_matches() {
 
 #[test]
 fn compressed_option_falls_back_when_it_does_not_help() {
-    // The C only emits the `COMPRESSED` wrapper when zlib actually shrinks the term;
-    // otherwise it reverts to the plain image (`external.c:2284-2293`). `{ok,17}` is
-    // small enough that `term_to_binary({ok,17}, [compressed])` is byte-identical to
-    // the uncompressed `OK_17` vector (verified with the oracle).
+    // The wrapper rule, both directions (C `external.c:2276-2298`): with `body` = the
+    // plain image length − 1 (the version byte excluded) and `Z` = the zlib stream
+    // length over exactly those bytes, the image is `[131][80][body:4 BE][zlib]` iff
+    // `Z <= body - 5` — equality lands on the `COMPRESSED` side — while `body < 5`
+    // never fits the wrapper and level 0 never compresses at all.
     //
-    // Our `encode_term_compressed` deliberately *always* writes the wrapper — the
-    // caller asked for compression — so it is not the same bytes for this term; the
-    // oracle's (uncompressed) image must nevertheless decode, which this asserts.
-    let (_heap, _atoms, term) = round_trip(OK_17);
+    // `{ok,17}`'s body is 8 bytes, so no stream of it can fit the 3-byte budget: the
+    // plain `OK_17` vector is the answer at every level, byte for byte.
+    let (_heap, atoms, term) = round_trip(OK_17);
     assert_eq!(tuple_arity(term).unwrap(), 2);
+    for level in [0u8, 1, 6, 9] {
+        let image = encode_term_compressed(term, &atoms, level)
+            .unwrap_or_else(|err| panic!("compressing at level {level}: {err:?}"));
+        assert_eq!(image, OK_17, "level {level} must revert to the plain image");
+    }
+
+    // The other direction: `lists:duplicate(500, hello)` does compress, so level 6 must
+    // wrap it (`image[1] == 80`) and reproduce the `COMPRESSED_DUP_500_HELLO` vector —
+    // whose full byte-for-byte treatment is the neighbouring `seed_compressed_*` test's.
+    let mut heap = Heap::new(4096).expect("a 4096-word heap holds 500 cons cells");
+    let mut list_atoms = AtomTable::new();
+    let hello = make_atom(list_atoms.intern("hello"));
+    let mut acc = NIL;
+    for _ in 0..500 {
+        acc = heap.cons(hello, acc).expect("heap sized for the list");
+    }
+    let image = encode_term_compressed(acc, &list_atoms, 6).expect("compressing a large term");
+    assert_eq!(
+        image[1], COMPRESSED_EXT,
+        "a term whose stream fits the budget must be wrapper-tagged"
+    );
+    assert_eq!(image, COMPRESSED_DUP_500_HELLO);
 }
 
 // ---------------------------------------------------------------------------
