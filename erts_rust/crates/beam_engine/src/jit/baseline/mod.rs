@@ -1111,7 +1111,8 @@ fn drive(
         ctx: ctx_ptr,
         error: None,
         enter: None,
-        suspend: None,        y_base: std::ptr::null_mut(),
+        suspend: None,
+        y_base: std::ptr::null_mut(),
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
@@ -1206,7 +1207,8 @@ fn drive(
                 // Disjoint field borrows: the artifact comes out of the callee entry and
                 // its cache is a different field of the same entry.
                 let CalleeCode { compiled, cached, .. } = &mut state.callees[index];
-                match compiled {                    // SAFETY: `active_module` points at the live active module (see the
+                match compiled {
+                    // SAFETY: `active_module` points at the live active module (see the
                     // context-0 arm above); no `&mut` aliases it while native code runs.
                     Some(compiled) => enter_compiled_cached(
                         &**compiled,
@@ -1261,7 +1263,8 @@ fn drive(
                 rt.labels = state.labels;
                 // The active module changed, so the published literal area did too
                 // (see the publication note at the `JitRuntime` construction above).
-                rt.refresh_literals();                func = target_func;
+                rt.refresh_literals();
+                func = target_func;
                 pc = target_pc;
                 continue;
             }
@@ -1280,7 +1283,8 @@ fn drive(
                     pc: suspend_pc,
                 });
             }
-            if let Some((wait_func, wait_pc)) = decode_wait(word) {                // A block deopted at a `wait`/`wait_timeout`: its exit already spilled
+            if let Some((wait_func, wait_pc)) = decode_wait(word) {
+                // A block deopted at a `wait`/`wait_timeout`: its exit already spilled
                 // the cached registers, so the machine is exactly as the interpreter's
                 // own suspension leaves it and the host can resume at this address.
                 return Ok(RunOutcome::Wait {
@@ -1385,7 +1389,8 @@ fn drive(
                 rt.labels = state.labels;
                 // The active module changed, so the published literal area did too
                 // (see the publication note at the `JitRuntime` construction above).
-                rt.refresh_literals();                func = target_func;
+                rt.refresh_literals();
+                func = target_func;
                 pc = target_pc;
             }
             Step::Done => {

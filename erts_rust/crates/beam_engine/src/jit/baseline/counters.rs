@@ -177,7 +177,8 @@ pub(crate) struct Counters {
     /// disjoint (a transfer records exactly one of them).
     pub(crate) cross_function_memo_hits: u64,
     /// Block-ABI words the driver had to decode (a block ran and returned).
-    pub(crate) driver_round_trips: u64,    /// Driver iterations with no native entry: one interpreter step each.
+    pub(crate) driver_round_trips: u64,
+    /// Driver iterations with no native entry: one interpreter step each.
     pub(crate) driver_interp_steps: u64,
     /// Frame-preserving local `call`s transferred **in-block** to a natively compiled
     /// callee (`jit_call_store_linked` resolved an entry for the lazy artifact's

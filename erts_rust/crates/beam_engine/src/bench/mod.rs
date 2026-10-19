@@ -288,7 +288,8 @@ impl ResultSnapshot {
     }
 }
 
-impl Measurement {    /// The fastest sub-run (the robust statistic under additive background load).
+impl Measurement {
+    /// The fastest sub-run (the robust statistic under additive background load).
     fn min(&self) -> f64 {
         self.samples.iter().copied().fold(f64::INFINITY, f64::min)
     }

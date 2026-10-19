@@ -417,7 +417,8 @@ impl Machine {
                 ..
             } => self
                 .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, func, pc, ctx)
-                .map_err(Box::new),            Instr::Call { target, arity } => {
+                .map_err(Box::new),
+            Instr::Call { target, arity } => {
                 let (callee, callee_pc) = resolve(labels, *target)?;
                 // The local-call seam: a host that serves this same-module callee as a
                 // BIF answers `true` and the callee's code never runs (see
@@ -1073,7 +1074,8 @@ impl Machine {
                         // (it is handled by `resolve_call_ext_apply` above, the site
                         // that must NOT park).
                         Ok(BifOutcome::Suspend) => return Ok(Step::Suspend { func, pc }),
-                        Err(e) => {                            // An import the host cannot resolve raises `undef`, and the
+                        Err(e) => {
+                            // An import the host cannot resolve raises `undef`, and the
                             // oracle's cooked trace then names the **callee** with its
                             // argument list as the innermost item (C's
                             // `erts_build_mfa_item` with the exception's saved args —
@@ -1192,7 +1194,8 @@ impl Machine {
             // re-issues the BIF with the same registers.
             Ok(BifOutcome::Suspend) => return Ok(Some(Step::Suspend { func, pc })),
             Err(e) => return self.raise_bif_error(module, e, ctx).map_err(Box::new).map(Some),
-        };        self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
+        };
+        self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
             .map(Some)
     }
     /// Apply an arm's own frame discipline to the [`ApplyTarget`]

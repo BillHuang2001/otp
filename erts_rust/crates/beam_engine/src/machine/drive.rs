@@ -74,7 +74,8 @@ impl Machine {
     /// [`Machine::current_context`] for the resume), a BIF that answered
     /// [`crate::BifOutcome::Suspend`] as [`RunOutcome::Suspend`] (likewise untouched, at
     /// the *un-applied* instruction's own address), and a `return`/halt as
-    /// [`RunOutcome::Returned`].    ///
+    /// [`RunOutcome::Returned`].
+    ///
     /// Also latches the A.8 tracing gate **once per run**: the per-instruction
     /// call/return arms read the plain `Machine::trace_on` `bool` instead of making a
     /// `trace_enabled()` vtable call per instruction, so an untraced run pays a

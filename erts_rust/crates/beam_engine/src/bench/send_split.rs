@@ -692,7 +692,8 @@ fn per_op(count: u64, ops: usize) -> f64 {
 
 /// Print one leg's `key = value` block.
 fn print_leg(leg: &Leg, tier: Tier, measurement: &Measurement) {
-    let ops = measurement.ops;    let min = measurement.min();
+    let ops = measurement.ops;
+    let min = measurement.min();
     let median = measurement.median();
     let instr = per_op(measurement.driver.instructions, ops)
         + per_op(measurement.worker.instructions, ops);
@@ -886,7 +887,8 @@ fn send_recv_split_decomposition() {
         for leg in LEGS {
             let measurement = measure_leg(&module, leg, *tier, ops, batch, warmup)
                 .unwrap_or_else(|error| panic!("{} on {}: {error:?}", leg.name, tier.name()));
-            print_leg(leg, *tier, &measurement);            println!("loadavg_after_leg = {}", loadavg());
+            print_leg(leg, *tier, &measurement);
+            println!("loadavg_after_leg = {}", loadavg());
             measured.push((leg, *tier, measurement));
         }
     }
@@ -922,7 +924,8 @@ fn send_recv_split_decomposition() {
         };
         let (Some(plain), Some(heap)) = (pick("plain"), pick("heap")) else {
             continue;
-        };        let plain_instr = instr(plain);
+        };
+        let plain_instr = instr(plain);
         let heap_instr = instr(heap);
         let plain_words = words(plain);
         let heap_words = words(heap);

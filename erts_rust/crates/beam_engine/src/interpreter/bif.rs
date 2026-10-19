@@ -171,7 +171,8 @@ impl Machine {
         len: usize,
         ctx: &mut dyn ExecutionContext,
         fill: impl FnOnce(&mut Machine, &mut dyn ExecutionContext, &mut Vec<Eterm>) -> Result<()>,
-    ) -> Result<Result<BifOutcome>> {        let mut scratch = std::mem::take(&mut self.args_scratch);
+    ) -> Result<Result<BifOutcome>> {
+        let mut scratch = std::mem::take(&mut self.args_scratch);
         scratch.clear();
         scratch.reserve(len);
         let marshalled = fill(self, &mut *ctx, &mut scratch);
@@ -208,7 +209,8 @@ impl Machine {
         target: ImportRef,
         arity: u32,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<BifOutcome> {        let (module_name, function_name, bif_arity) = labels.import_target(module, target)?;
+    ) -> Result<BifOutcome> {
+        let (module_name, function_name, bif_arity) = labels.import_target(module, target)?;
         self.call_bif_named(
             entry_module,
             module_name,
@@ -221,7 +223,8 @@ impl Machine {
 
     /// Marshal the register arguments `x(0..nregs)` and dispatch
     /// `module_name:function_name/bif_arity` through
-    /// [`ExecutionContext::call_bif_outcome`].    ///
+    /// [`ExecutionContext::call_bif_outcome`].
+    ///
     /// The **one** definition of the register-marshalling shape every BIF-dispatching
     /// seam shares — a `call_ext*` ([`Machine::call_import`]) and the *local-call*
     /// seam's synchronous route (the three local call arms, which serve a same-module
@@ -252,7 +255,8 @@ impl Machine {
         bif_arity: u32,
         nregs: u32,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<BifOutcome> {        if nregs as usize <= STACK_ARGS {
+    ) -> Result<BifOutcome> {
+        if nregs as usize <= STACK_ARGS {
             let mut buf = EMPTY_ARGS;
             for (i, slot) in buf.iter_mut().enumerate().take(nregs as usize) {
                 *slot = self
@@ -364,7 +368,8 @@ impl Machine {
     ///   or an atom **neither** the live namespace nor the module's atom table
     ///   holds. Substituting a *different* atom would be a wrong result, so the
     ///   caller's typed error is preferred (the engine never invents an atom index,
-    ///   because an index is valid only against the table it was read with).    ///
+    ///   because an index is valid only against the table it was read with).
+    ///
     /// A [`BeamError::Raise`] that carries a live reason term
     /// ([`beam_common::Raise::live_reason`], payload [`Eterm`]) is an exception
     /// whose reason is a compound term — the shape [`beam_bifs`]-backed BIFs raise
@@ -423,7 +428,8 @@ impl Machine {
     ///
     /// Both the **reason** atom and the **class** atom are resolved through the
     /// engine's live atom namespace
-    /// ([`crate::machine::namespace_atom`]): a name the host's live namespace    /// knows is nameable even when the running module's load-time snapshot is not
+    /// ([`crate::machine::namespace_atom`]): a name the host's live namespace
+    /// knows is nameable even when the running module's load-time snapshot is not
     /// (the runtime interns `badarg`/`error`/… into its shared table, and a module
     /// loaded earlier cannot see them). The default
     /// [`ExecutionContext::atoms`](crate::context::ExecutionContext::atoms) body is
@@ -499,7 +505,8 @@ impl Machine {
         // wrong atom.
         if let Some(class_atom) = namespace_atom(ctx, module, class.as_str()) {
             self.set_class_atom(class, make_atom(class_atom));
-        }        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
+        }
+        self.throw_with_trace_headed(class, make_atom(atom), trace, has_head, supplied_trace)
     }
 
     /// [`Machine::throw_with_trace`] that first arms the one-shot latches the raise

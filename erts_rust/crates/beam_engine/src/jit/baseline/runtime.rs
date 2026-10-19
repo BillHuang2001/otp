@@ -230,7 +230,8 @@ pub(crate) struct JitRuntime<'a> {
     /// generated code; its position in the struct is immaterial because every offset
     /// emitted code uses is computed with [`mem::offset_of!`].
     pub(crate) suspend: Option<(u32, u32)>,
-    /// The base of the **literal area** the machine currently has bound — the first    /// word of `Module::literals.terms()` for the active module.
+    /// The base of the **literal area** the machine currently has bound — the first
+    /// word of `Module::literals.terms()` for the active module.
     ///
     /// A compiled block loads `Operand::Literal(n)` through this field
     /// (`[literals_base + n*8]`, behind the guard below) instead of materialising the
@@ -645,7 +646,8 @@ pub(crate) fn fold_ok_step(runtime: &mut JitRuntime<'_>, step: Step, func: u32, 
         Step::Suspend { func, pc } => {
             runtime.suspend = Some((func, pc));
             SUSPEND
-        }        // A module-context transfer (a `call_ext*` the host resolved through
+        }
+        // A module-context transfer (a `call_ext*` the host resolved through
         // `ExecutionContext::resolve_external_call`, a `return` onto a
         // caller-context continuation, or a raise landing in another context's catch
         // frame). A compiled block's code, label map and literal area are all bound
