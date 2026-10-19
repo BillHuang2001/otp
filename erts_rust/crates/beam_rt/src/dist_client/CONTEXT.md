@@ -64,7 +64,8 @@ No item here is re-implemented from the lower crates: terms come from `beam_term
 - **`mod.rs`'s "Correction to a sibling's inline gloss" paragraph (`mod.rs:109-119`) is stale.** `beam_process/src/remote.rs:53-58` now states exactly these argument orders (the wrong `&[to_term, watcher.to_eterm(), ref_term]` / `&[from, to]` table was corrected in commit `645b2b6992`), so the paragraph describes a disagreement that no longer exists. Drop it; do not act on it.
 - **A signal routed while the client cell is borrowed is a typed error, not a deferral** (`router.rs:50-53`): `route` cannot queue during a pump/dispatch.
 - **`DistClientInner::next_unlink_id` advances per encoded signal** (`client.rs:766`), not per unlink.
-- **`step_links`' retirement of a cleanly-closed link records `BadArg`** (`client.rs:589`) — the diagnostic reads as a bad-argument error for an orderly EOF.
+- **No pending-unlink record is kept** — the id is minted and forgotten, so an inbound `DOP_UNLINK_ID_ACK` has nothing here to match (the inbound side likewise has no reply channel to emit one).
+- **`DistSignal::Monitor`'s `kind` (`MonitorKind`) is dropped** by the `..` at `client.rs:795`: a **port** monitor encodes as `Dop::MonitorP` with no gate and no typed refusal.- **`step_links`' retirement of a cleanly-closed link records `BadArg`** (`client.rs:589`) — the diagnostic reads as a bad-argument error for an orderly EOF.
 - **No test in this node's suite covers `flush_pending`'s two branches** (still-handshaking ⇒ keep queued; link retired ⇒ drop-and-record). The drop branch is exercised from the sibling suite `../dist/links/tests.rs:376`; the keep-queued branch is unexercised anywhere.
 
 ## Test Strategy
@@ -80,4 +81,4 @@ The compatibility gate `../tools/differential/`'s `wire` group covers the ETF co
 - `router.rs` → `DistRouter` and its `impl DistSignalRouter`.
 - `signals.rs` → `signal_node`, `monitor_ref_term`, `unlink_id_term` (all `pub(super)`).
 - `lookup.rs` → `host_part`, `lookup_dist_port`, `lookup_dist_port_at` (all `pub(super)`).
-- `tests.rs` → the colocated suite.
+- `tests.rs` → the colocated suite (handshake against a server driver, node visibility, the outbound message and routed-signal path, the `epmd` lookup).
