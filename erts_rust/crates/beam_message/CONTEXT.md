@@ -155,7 +155,7 @@ Gaps whose owner is another crate, each with the exact API this crate adopts onc
 - **The sender's copy charge** — owner `beam_rt`, with `beam_common` + `beam_process` supplying the parts.
   `beam_common::ERTS_MSG_COPY_WORDS_PER_REDUCTION: usize = 64` (a new constant beside `beam_common::CONTEXT_REDS`; the C divisor, `erl_message.c:881-886`).
   `beam_process::Process::charge_reductions(&mut self, reds: u32) -> u64` — saturating add to the process's reduction count, returning the new total.
-  `beam_rt` then charges `beam_common::CONTEXT_REDS.min(4 + Message::heap_words() / ERTS_MSG_COPY_WORDS_PER_REDUCTION) as u32` to the **sender** at every send site (`src/context/send.rs`).
+  `beam_rt` must then charge `beam_common::CONTEXT_REDS.min(4 + Message::heap_words() / ERTS_MSG_COPY_WORDS_PER_REDUCTION) as u32` to the **sender** at every send site — none does today, and `ERTS_MSG_COPY_WORDS_PER_REDUCTION` does not exist as an identifier yet (`src/context/send.rs` has no reduction charge at all).
   No `beam_message` change is needed: `Message::heap_words()` is the input.
 - **The holder's virtual binary heap** — owner `beam_process`.
   `Process::charge_virtual_binary_heap(&mut self, bytes: usize) -> usize` — `bin_vheap += bytes / size_of::<Eterm>()`, saturating, returning the new word total — and `Process::virtual_binary_heap_words(&self) -> usize`, fed from `Message::logical_binary_bytes()` the moment a message becomes the process's and surfaced as the oracle's `bin_vheap_size`/`virtual_reds` (`erl_gc.c:3046,3051`).
