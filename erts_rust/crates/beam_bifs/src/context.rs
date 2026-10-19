@@ -53,7 +53,9 @@
 //!   `erl_debugger`, `re`, `erl_ddll` and distribution) and a
 //!   [`beam_codec::ExportGate`] (the active-export registry the `[safe]`
 //!   `binary_to_term/2` decode consults before it accepts an `EXPORT_EXT` fun — a
-//!   *shared* reference, because the codec lends it to the decoder unchanged).
+//!   *shared* reference, because the codec lends it to the decoder unchanged) plus
+//!   the table-alias witness ([`BifContext::with_table_aliasing`] — a `Cell<bool>`
+//!   the `ets` copy-out helpers set instead of copying, see `src/ets.rs`).
 //!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
 //!   concrete implementations; an unset seam means `io:format` writes to stdout
 //!   and the `send`/`ets`/`call_fun`/port/dict/nif/process BIFs report
@@ -927,6 +929,7 @@ pub struct BifContext<'a> {
     output: Option<&'a mut dyn OutputSink>,
     sender: Option<&'a mut dyn SendHook>,
     tables: Option<&'a mut TableRegistry>,
+    table_alias: Option<&'a std::cell::Cell<bool>>,
     interner: Option<&'a mut dyn AtomInterner>,
     fun_caller: Option<&'a mut dyn FunCaller>,
     port: Option<&'a mut dyn PortHook>,
@@ -955,6 +958,7 @@ impl<'a> BifContext<'a> {
             output: None,
             sender: None,
             tables: None,
+            table_alias: None,
             interner: None,
             fun_caller: None,
             port: None,
@@ -990,6 +994,15 @@ impl<'a> BifContext<'a> {
         self
     }
 
+    /// Installs the table-alias witness. With a witness installed the `ets` copy-out
+    /// helpers hand the caller a term that still aliases `beam_ets` table storage and
+    /// set this cell; the host must copy the result out (exactly once) before any
+    /// other table operation or heap collection. With none installed the helpers
+    /// copy onto `heap()` exactly as before.
+    pub fn with_table_aliasing(mut self, witness: &'a std::cell::Cell<bool>) -> Self {
+        self.table_alias = Some(witness);
+        self
+    }
     /// Installs the atom-interning hook used by `list_to_atom`/`binary_to_atom`.
     pub fn with_atom_interner(mut self, interner: &'a mut dyn AtomInterner) -> Self {
         self.interner = Some(interner);
@@ -1101,6 +1114,17 @@ impl<'a> BifContext<'a> {
     /// The destination heap.
     pub fn heap(&mut self) -> &mut Heap {
         &mut *self.heap
+    }
+
+    /// The installed table-alias witness, if any.
+    ///
+    /// `Some(witness)` tells the `ets` copy-out helpers (`ets::copy_out` and
+    /// `ets::copy_out_list`) to hand back a term that still aliases `beam_ets` table
+    /// storage — setting `witness` — instead of copying it onto
+    /// [`BifContext::heap`]; the host then performs that one copy itself. `None`
+    /// (the default) is the unconditional copy-onto-`heap()` behaviour.
+    pub(crate) fn alias_table_storage(&self) -> Option<&std::cell::Cell<bool>> {
+        self.table_alias
     }
 
     /// The atom table.

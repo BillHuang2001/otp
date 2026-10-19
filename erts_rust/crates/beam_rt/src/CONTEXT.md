@@ -25,8 +25,11 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   `STANDARD_OTP_ROOTS`; each tried as itself and as `<seed>/lib/erlang`). The first root passing the
   `SYSTEM_APPS` probe (`stdlib`/`lists.beam` is the hard requirement) wins
   (`native_system_ebins:644-646`, `system_ebins_under:693-713`, `SYSTEM_APPS:825`). `bootstrap/` is
-  never a candidate root nor on the resolved code path. So with an `erl` on `$PATH`, the consumed
-  root is ALWAYS that system install's root (`CodeServer::lib_root` at `codeserver.rs:335-340`).
+  never a candidate root. So with an `erl` on `$PATH`, the consumed
+  root is ALWAYS that system install's root (`CodeServer::lib_root` at `codeserver.rs:335-340`), and
+  that root then yields the whole release's ebin list through `codeserver/path.rs`
+  (`release_ebins`/`user_lib_ebins`/`system_path`, the `code_server.erl` port), which reproduces the
+  oracle's `code:get_path/0` exactly (`../../tests/code_path.rs`).
 - **The default route loads THIS runtime's own release's boot script.** With no `-boot`,
   `cli.rs`'s `boot_script_to_drive` prefers `CodeServer::own_bootstrap_boot_script()` — the committed
   `bootstrap/bin/start.boot` of the source tree the binary runs from — so the default route drives the

@@ -26,8 +26,9 @@
 //! not treat it as its own integration-test target: it is compiled into each test binary that pulls
 //! it in with `mod cdriver;`.
 //!
-//! The helpers here are the ones both C-driver suites need: compiling the fixture (and its
-//! `ready_async`-less variant) into a loadable `.so`, loading it as a [`DriverPort`] over a test
+//! The helpers here are the ones the C-driver suites need: compiling the fixture (and its
+//! variant builds: `ready_async`-less, `process_exit`-less, `outputv`-only, both-write-callbacks and
+//! `ERL_DRV_FLAG_SOFT_BUSY`) into a loadable `.so`, loading it as a [`DriverPort`] over a test
 //! [`PortHost`], opening it as a real port in a [`PortRegistry`] over a real [`Poller`], driving
 //! port-task rounds, and reading the fixture's callback log. The `#![allow(dead_code)]` above is
 //! the same convention `tests/support/mod.rs` uses (a helper unused by one binary must not warn).
@@ -49,6 +50,13 @@ use beam_term::immediate::atom_val;
 use beam_term::prelude::{make_atom, Eterm};
 
 use support::{cc_available, compile_so, erl_include_dir, scratch_dir, skip};
+
+/// The path to hand [`beam_abi::driver::loader::load`] for the compiled artifact a `*_fixture_so`
+/// helper returned (the loader appends the `.so` suffix itself — see `support::load_path`).
+///
+/// Re-exported because a suite that drives the loaded library directly (`library.start(...)`,
+/// `library.control(...)`) loads it itself instead of going through [`load_named_driver`].
+pub use support::load_path;
 
 // ---------------------------------------------------------------------------------------------
 // The runtime hook the driver needs: a [`PortHost`] over a private atom table
@@ -129,6 +137,13 @@ pub fn both_fixture_source() -> PathBuf {
     fixture_dir().join("host_driver_both.c")
 }
 
+/// The committed `ERL_DRV_FLAG_SOFT_BUSY` fixture (`host_driver_soft_busy.c`): `host_driver.c` with
+/// the entry's `driver_flags` set to the flag that lets `port_command/3`'s `[force]` bypass a busy
+/// port instead of being refused with `error:notsup` (`erl_bif_port.c:195-198`).
+pub fn soft_busy_fixture_source() -> PathBuf {
+    fixture_dir().join("host_driver_soft_busy.c")
+}
+
 /// The committed **shape** fixture (`output_shape_driver.c`): a self-contained driver whose
 /// `output` callback makes the `driver_output*`/`driver_failure*` call that the **first command
 /// byte** names (its opcode table is in the fixture's own file header). It is the object
@@ -170,6 +185,11 @@ pub fn vector_fixture_so() -> Option<PathBuf> {
 /// The same for the both-write-callbacks fixture (`host_driver_both.c`).
 pub fn both_fixture_so() -> Option<PathBuf> {
     compile_fixture(&both_fixture_source(), "host_driver_both")
+}
+
+/// The same for the `ERL_DRV_FLAG_SOFT_BUSY` fixture (`host_driver_soft_busy.c`).
+pub fn soft_busy_fixture_so() -> Option<PathBuf> {
+    compile_fixture(&soft_busy_fixture_source(), "host_driver_soft_busy")
 }
 
 /// The same for the shape fixture (`output_shape_driver.c`), whose entry's `driver_name` is
@@ -230,6 +250,9 @@ pub fn load_driver(so: &Path, command: &str, host: Box<dyn PortHost>) -> DriverP
 }
 
 /// The same, for a driver whose `ErlDrvEntry.driver_name` is `name` (the loader validates it).
+///
+/// `so` is the **compiled artifact** path (`<scratch>/<stem>.so`); [`load_path`] strips the suffix
+/// the loader appends itself, so a caller never has to know that rule.
 pub fn load_named_driver(
     so: &Path,
     name: &str,
@@ -237,7 +260,7 @@ pub fn load_named_driver(
     host: Box<dyn PortHost>,
 ) -> DriverPort {
     force_driver_symbols_link();
-    let path = so.to_str().expect("the fixture path is valid UTF-8");
+    let path = load_path(so);
     match beam_abi::driver::loader::load(path, name) {
         Ok(library) => assert_eq!(
             library.name(),

@@ -21,7 +21,7 @@
 //! The `inet` drivers' statistics counters — the C's `inet_input_count`/`inet_output_count`.
 //!
 //! Both socket drivers keep one of these on their descriptor, exactly as the C's
-//! `inet_descriptor` does (`inet_drv.c:11560`-`:11623`), and `INET_REQ_GETSTAT` renders it
+//! `inet_descriptor` does (`inet_drv.c:11560`-`:11617`), and `INET_REQ_GETSTAT` renders it
 //! (`inet_fill_stat`, `:10732`-`:10792`). The arithmetic is shared here rather than duplicated
 //! per driver, because the two drivers differ only **where** they call it:
 //!
@@ -39,9 +39,31 @@
 //!   sequence at `n = 1` (the "WRAP, use old avg as input to a new sequence" comment at
 //!   `:11576`/`:11603`) — the new value then becomes the next average outright.
 //!
+//! # What length each path counts
+//!
+//! The C has exactly one input-counting call site per delivery, and the length it passes is the
+//! length of the unit it delivers — **not** the length of the payload a caller ends up seeing:
+//!
+//! | read path | C site | counted length |
+//! |---|---|---|
+//! | stream, any `{packet, N}` (raw included) | `tcp_deliver` (`:13064`) | `len` from `tcp_remain` (`:12967`/`:13052`) = `packet_get_length`'s **total packet length** |
+//! | stream, `TCP_REQ_RECV` with a non-zero `Length` | `tcp_deliver` via `tcp_recv` (`:13162`) | `request_len`, i.e. exactly the bytes asked for |
+//! | datagram | `packet_inet_input` (`:15526`) | the datagram **payload** |
+//!
+//! So a framed stream read counts the **whole frame, framing header included** — a
+//! `{packet,2}` + `<<0,3,"abc">>` frame credits `recv_oct`/`recv_max`/`recv_avg` with **5**, not
+//! 3 (measured on OTP 29.1.1 / erts-17.1: `{recv_cnt,1}`, `{recv_max,5}`, `{recv_avg,5}`,
+//! `{recv_dvi,0}`, `{recv_oct,5}`). [`take_frame`] is the one place that reproduces it for the
+//! three framed stream sites.
+//!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`.
 
-/// The C's `inet_descriptor` statistics block (`inet_drv.c:11560`-`:11623`).
+use beam_common::Result;
+
+use super::frame;
+use super::packet::PacketOptions;
+
+/// The C's `inet_descriptor` statistics block (`inet_drv.c:11560`-`:11617`).
 ///
 /// [`Default`] is the state `inet_init_desc` builds (every counter zero), which is why a
 /// socket-less port answers a fully zeroed `INET_REQ_GETSTAT` reply.
@@ -113,6 +135,42 @@ impl InetStat {
         }
         self.send_cnt = n;
     }
+}
+
+/// Takes **one** whole frame off the front of `pending`, counts it and returns its payload.
+///
+/// This is [`frame::extract`] (the C's `tcp_remain`/`tcp_reply_data` pair) plus the count
+/// `tcp_deliver` performs on the frame it is about to deliver —
+/// `inet_input_count(INETP(desc), len)` (`inet_drv.c:13064`), whose `len` came out of
+/// `tcp_remain(desc, &len)` (`:12967`) as `packet_get_length`'s **total packet length**. The
+/// framing header is therefore part of the counted length even though it is stripped from the
+/// payload, and a line-mode frame (whose "header" is nothing — its delimiter rides the payload)
+/// counts exactly its payload.
+///
+/// The count is the buffer's shrinkage, which is exactly the frame's `total`:
+/// [`frame::extract`] consumes one whole frame per [`Some`] and leaves the buffer untouched for
+/// [`None`] and for its typed failures, so a partial frame credits nothing until it completes.
+///
+/// All three framed stream sites (`active.rs`'s `deliver_framed`, `async.rs`'s
+/// `try_complete_recv` and `verb_recv_framed`) go through here, so the rule cannot drift per
+/// call site again.
+///
+/// # Errors
+///
+/// The decoder's own typed failure ([`frame::extract`]: `badarg` for bytes that cannot be a
+/// frame, `notsup` for the types this floor does not decode) — nothing is counted then.
+pub(super) fn take_frame(
+    stat: &mut InetStat,
+    pending: &mut Vec<u8>,
+    framing: &PacketOptions,
+) -> Result<Option<Vec<u8>>> {
+    let before = pending.len();
+    let Some(payload) = frame::extract(pending, framing)? else {
+        return Ok(None);
+    };
+    // The C's `len`: the complete packet, header included (`inet_drv.c:12967`/`:13064`).
+    stat.input(before - pending.len());
+    Ok(Some(payload))
 }
 
 #[cfg(test)]

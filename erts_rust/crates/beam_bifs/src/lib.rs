@@ -112,6 +112,7 @@ mod time;
 mod type_test;
 mod unicode;
 mod zlib;
+mod zlib_deflate;
 pub use crate::context::{
     AtomInterner, BifContext, BytesSink, DictHook, FunCaller, LocalFunIdentity, LocalNode,
     MemoryHook, ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PersistentTerm,

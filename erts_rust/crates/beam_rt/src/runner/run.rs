@@ -338,6 +338,50 @@ impl<'a> RuntimeRunner<'a> {
         outcome
     }
 
+    /// Reclaims the off-heap refc-binary payloads the just-parked machine built that nothing
+    /// reachable from `pid`'s root set names — the slice-boundary prune of
+    /// [`crate::context::gc::reclaim`] (see `crate::context::gc::bin_vheap` for the whole design).
+    ///
+    /// # Why here, and nowhere else
+    ///
+    /// A prune is sound only against the process's **complete** root set, and this is the one site
+    /// that holds `&mut Machine` (the runner just drove it), `&mut Process` (through the table) and
+    /// `&mut Runtime` at the same time. The heap-admission doors run *inside* a slice, where the
+    /// engine is held out of [`RunnerState::engines`] and the `ExecutionContext` seam exposes no
+    /// `&mut Machine` at all — the twin-borrow this split exists to avoid.
+    ///
+    /// # The window must be a publishing one
+    ///
+    /// `park_machine` publishes the machine's whole root set only for a **non-exempt** window, so
+    /// an exempt park's process registers are stale by construction;
+    /// `engine.parked_published` is exactly that answer, and it is refused before any work. (The
+    /// reclamation's own `is_relocation_exempt` valve also declines, but the flag is the runner's
+    /// own contract with the park and costs nothing.) `Process::has_unpublished_roots` is **not**
+    /// the gate to use: it is `true` for a `Running` process, which is what a pre-empted process
+    /// still is.
+    ///
+    /// # Errors
+    ///
+    /// None reachable: every failure mode of the reclamation is the documented decline. The
+    /// `Result` matches the sibling doors' shape.
+    fn reclaim_off_heap_binaries(
+        &mut self,
+        table: &mut ProcessTable,
+        pid: ProcessId,
+        engine: &mut ProcessEngine,
+    ) -> Result<()> {
+        if !engine.parked_published {
+            return Ok(());
+        }
+        gc::reclaim(
+            &mut *self.runtime,
+            table,
+            pid,
+            &mut engine.machine,
+            &mut engine.off_heap,
+        )?;
+        Ok(())
+    }
     /// Drains `pid`'s latched `max_heap_size` **kill** — the runner's half of the verdict the
     /// collection sites latch ([`crate::context::gc::drain_max_heap_verdict`]).
     ///
@@ -1090,13 +1134,19 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // The off-heap refc binaries this machine built need no registration step.
         //
         // `Machine::refc_binaries` is the one holder of the payloads a process's compiled
-        // bitstring code builds (it is append-only and `Machine::reset` never clears it), so it
-        // already *is* the process's off-heap roster and `erlang:process_info(Pid, binary)` reads
-        // it straight through `RunnerState::reservoir_at`. The process's own off-heap table is
-        // therefore left empty, which is what keeps `beam_gc::OffHeap`'s never-compacted slot
-        // space out of the per-call path: mirroring the reservoir onto it fed that space a slot
-        // per payload on every slice, and the O(slots) `overhead_bytes`/`sweep` walks it implies
-        // made a build-a-binary loop quadratic in its own iteration count.
+        // bitstring code builds, so it *is* the process's off-heap roster and
+        // `erlang:process_info(Pid, binary)` reads it straight through `RunnerState::reservoir_at`.
+        // The process's own off-heap table is therefore left empty, which is what keeps
+        // `beam_gc::OffHeap`'s never-compacted slot space out of the per-call path: mirroring the
+        // reservoir onto it fed that space a slot per payload on every slice, and the O(slots)
+        // `overhead_bytes`/`sweep` walks it implies made a build-a-binary loop quadratic in its
+        // own iteration count.
+        //
+        // The reservoir is **not** append-only: the `Yield` arm below prunes it at the slice
+        // boundary (`RuntimeRunner::reclaim_off_heap_binaries`) whenever the process's binary
+        // virtual heap triggers, releasing every payload its live roots no longer reach — so a
+        // loop building one off-heap binary per iteration no longer keeps one handle per
+        // iteration for the life of the process.
 
         // Pre-emption: the budget ran out at a charging point of this slicing machine
         // (an interpreted instruction's per-instruction charge, or a heap-admission
@@ -1154,6 +1204,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // park outright (nothing was published for that window, so the machine stays the
             // authoritative root set). See `RuntimeRunner::collect_at_reds_boundary`.
             self.collect_at_reds_boundary(table, pid, &mut engine, fr_count, used)?;
+            // The **off-heap refc-binary reclamation** point: the machine's payload reservoir is
+            // pruned against the root set this park just published, so a process that builds one
+            // off-heap binary per iteration stops accumulating one handle per iteration. Its own
+            // gates (the relocation exemption, the runtime's GC valves, the binary-virtual-heap
+            // trigger, the unscanned-root valve, the reachability walk) keep it off the per-slice
+            // path, and every decline retains the whole reservoir (leak-not-dangle). See
+            // `RuntimeRunner::reclaim_off_heap_binaries` and `crate::context::gc::bin_vheap`.
+            self.reclaim_off_heap_binaries(table, pid, &mut engine)?;
             // A `max_heap_size` **kill** either collection point above latched on the PCB is
             // performed here, at the slice boundary the latch was designed for: the process is
             // terminated through the ordinary exit path (`RunOutcome::Exit`), so the scheduler's

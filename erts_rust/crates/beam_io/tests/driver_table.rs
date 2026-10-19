@@ -55,7 +55,7 @@ use beam_abi::driver::types::ErlDrvEntry;
 use beam_io::prelude::*;
 use beam_process::PortId;
 
-use support::{cc_available, compile_so, erl_include_dir, scratch_dir, skip};
+use support::{cc_available, compile_so, erl_include_dir, load_path, scratch_dir, skip};
 
 /// The committed C fixture.
 fn fixture_source() -> PathBuf {
@@ -102,7 +102,7 @@ fn force_driver_symbols_link() {
 /// the panic.
 fn register_fixture(table: &DriverTable, so: &Path) -> *mut ErlDrvEntry {
     force_driver_symbols_link();
-    let path = so.to_str().expect("the fixture path is valid UTF-8");
+    let path = load_path(so);
     let library = match beam_abi::driver::loader::load(path, "host_driver") {
         Ok(library) => library,
         Err(err) => panic!(

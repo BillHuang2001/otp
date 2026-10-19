@@ -19,7 +19,7 @@ Everything below is the runtime in `beam_rt` (`src/context/memory_hook.rs`), the
 | `processes_used` | every live pid's **occupied** heap | `Σ_pid (young().used_words() + mature_used_words()) × 8` — `young()` is the **current** nursery space only | same | **this crate** (`HeapFootprint::used_bytes`; the `young()` read is the hole — see *Known issues*) |
 | `system` | `atom + binary + code + ets + emulator` | the sum of the five below | — | `beam_rt` |
 | `atom` / `atom_used` | the one shared atom table: one index word per atom plus the name text | `WORD_BYTES × atoms.len() + Σ name.len()` | `beam_term::AtomTable` | `beam_term` |
-| `binary` | **live payload bytes** of the off-heap binaries | `Σ live_bytes` over `AllocType::Binary` | `beam_alloc::RefcBinary` payloads (this crate registers them; `beam_process` owns the roster) | `beam_alloc` registry |
+| `binary` | **live payload bytes** of the off-heap binaries | `Σ live_bytes` over `AllocType::Binary` | `beam_alloc::RefcBinary` payloads (their handles live in the engine machine's reservoir and in `beam_process`'s PCB roster) | `beam_alloc` registry |
 | `code` | each loaded module's `.beam` image size | `Σ fs::metadata(path).len()` over the code server's loaded names | `beam_rt` code server (file paths, not allocations) | `beam_rt` |
 | `ets` | the ETS registry's table count, **one index word each** — a slot count, not a footprint | `registry.len() × 8` | `beam_bifs` table registry (`beam_ets` interiors are allocated from `AllocType::Ets`) | `beam_bifs` |
 | `emulator` | everything allocated outside a process heap | `Σ live_bytes` over **every** allocator type except `Binary`, `Standard`, `EHeap` | `beam_alloc` registry (`Ets`, `Literal`, `LongLived`, `ShortLived`, `Temporary`, `FixedSize`, `Driver`, `System`) | `beam_alloc` registry |
@@ -64,12 +64,12 @@ Neither is an RSS estimate — they are reserved capacity plus payload.
 - **Port/driver buffers and distribution buffers** (`beam_io`, `beam_dist`).
 
 ## Known issues
-- **`processes_used` drops every retired nursery space.** Reading `collector.young().used_words()` reads the **current** space only, and the nursery is a chain once `grow_nursery` has run, so each retired space contributes 0 occupied words while its live terms are still there.
-  `HeapObservable::heap_used_words`/`total_heap_used_words` are the chain-summed readings; the runtime's handoff is in *Handoffs* below.
-  `beam_process::Process::heap_used_words()` has the same current-space-only read.
+- **`processes_used` drops every retired nursery space.** The reporting site reads `collector.young().used_words()`, i.e. the **current** space only, and the nursery is a chain once `grow_nursery` has run, so each retired space contributes 0 occupied words while its live terms are still there.
+  `HeapObservable::heap_used_words`/`total_heap_used_words` are the chain-summed readings, and `Process::heap_used_words()` already answers with the chain sum — only the reporting site still reads the current space (handoff 1 below).
+- **A footprint's off-heap payload half is the process's *own* roster, which production leaves empty.** A process's refc-binary payloads live in the engine machine's reservoir, outside the PCB (no production site registers a payload in `Process`'s roster), so `HeapFootprint::of(collector, process.owned_off_heap())` reports `off_heap_payload_bytes` 0 for a running process.
+  The figure the process is actually charged for is `Process::off_heap_binary_bytes()`: the host's published figure (`Process::set_off_heap_binary_bytes`, what the runtime's reservoir prune republishes) takes precedence over the roster sum.
 - **`ets` is a slot count, not a footprint**, so a table with a million rows reports the same 8 bytes as an empty one.
 - **No key counts the off-heap roster's slot array**, so the bytes in part 3 above are reported by nothing today.
-
 ## Why a reported total can fall while RSS rises (the m16 A/B)
 `erts_rust/tools/bench/results/m16-ab-{old,new}-r{1,2,3}.json` is a rust-only A/B of two `beam_rt` binaries: `old` = the m15-era runtime at commit `a34ca61332`, `new` = the HEAD of that session.
 The metric and the OS figure move in opposite directions on exactly one case, `baseline` (`vm_memory_total_bytes` is probed by a separate `-eval` run, whose peak RSS is not the same process, so the pair is per-case, not per-process):
@@ -107,20 +107,12 @@ See `../MEASURED.md` for this crate's own cadence measurements (collection count
 Owned by other nodes — each is a proposal with the exact current call and the exact replacement.
 
 1. **`beam_rt/src/context/memory_hook.rs`, `RuntimeMemory::new`** (the `processes_used` hole).
-   Before: `process_used += (collector.young().used_words() + collector.mature_used_words()) as u64 * word;`
-   After: `process_used += collector.total_heap_used_words() as u64 * word;`
-   Before: `process_bytes += collector.total_heap_size_words() as u64 * word;`
-   After: `process_bytes += footprint.capacity_bytes() as u64;` with `let footprint = beam_gc::HeapFootprint::of(collector, process.owned_off_heap());` — one call per process, no formula re-derived at the reporting site.
-   The hook needs handoff 3 for `owned_off_heap`; without it, `HeapFootprint::of(collector, &beam_gc::OffHeap::new())` is the same call minus the off-heap halves.
+   Today: `process_used += (collector.young().used_words() + collector.mature_used_words()) as u64 * word;`
+   Replacement: `process_used += collector.total_heap_used_words() as u64 * word;`
+   The `processes` half already reads `collector.total_heap_size_words()`, which is the figure `HeapFootprint::of(collector, process.owned_off_heap()).capacity_bytes()` derives (chain-summed nursery capacity plus the mature generation), so routing it through the footprint changes no byte — it only makes the whole per-process account one call. A reporter must not add the footprint's off-heap halves to this figure: they **are** `binary`.
 2. **`beam_rt/src/context/memory_hook.rs`, `MemoryHook::memory`** (the uncounted roster array).
-   Today `system = atom + binary + self.code + self.ets + emulator`. `emulator` is derived from `all_stats()`; the roster's slot array is in no allocator type, so a reporter wanting it adds `Σ_pid footprint.off_heap_slot_bytes()` as a named term of the `emulator` half — never to `processes` (payload double count) and never to `binary` (it is not a payload).
-3. **`beam_process/src/process.rs`** — expose the roster for a reporter:
-   `pub fn owned_off_heap(&self) -> &beam_gc::OffHeap { &self.owned_binaries }` (the field already exists; only the accessor is missing), so `HeapFootprint::of` can be called without re-deriving the payload bytes.
-4. **`beam_process/src/process.rs`, `Process::heap_used_words`** (the same current-space-only read).
-   Before: `self.collector.young().used_words()`
-   After: `self.collector.heap_used_words()`
-5. **`beam_process/src/process.rs`, the `owned_binary_slots` mirror** — `beam_gc::OffHeap::slot_count()` now exists, so the mirror field and its `debug_assert` can be replaced by `self.owned_binaries.slot_count()`.
-
+   Today `system = atom + binary + self.code + self.ets + emulator`, and `emulator` is derived from `beam_alloc::registry::all_stats()`; the roster's slot array is in no allocator type, so a reporter wanting it adds `Σ_pid process.owned_off_heap().slot_bytes()` (or `HeapFootprint::of(...).off_heap_slot_bytes()`) as a named term of the `emulator` half — never to `processes` (payload double count) and never to `binary` (it is not a payload).
+3. **`beam_process/src/process.rs`, the `owned_binary_slots` mirror** — `beam_gc::OffHeap::slot_count()` exists, so the mirror field and its `debug_assert` can be replaced by `self.owned_binaries.slot_count()`.
 ## Rules for anyone reporting these figures
 - Report **capacity** (`processes`) and **occupancy** (`processes_used`) as separate figures; never present one as evidence about the other.
 - Never add `off_heap_payload_bytes` to `processes` while `binary` is also reported.

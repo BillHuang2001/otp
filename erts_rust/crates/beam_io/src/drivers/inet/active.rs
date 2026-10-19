@@ -106,7 +106,8 @@ use crate::port_task::{ActiveInputEvent, ReadMessage};
 
 use super::frame;
 use super::opt::{set_options_tracked, OptScope};
-use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, TcpInetDriver};
+use super::stat;
+use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, ReadReport, TcpInetDriver};
 
 impl TcpInetDriver {
     /// Whether the port is in one of the active modes (`active > INET_PASSIVE`).
@@ -204,11 +205,13 @@ impl TcpInetDriver {
     fn deliver_framed(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         loop {
             let framing = frame::options(&self.options);
-            match frame::extract(&mut self.pending_input, &framing)? {
+            match stat::take_frame(&mut self.stat, &mut self.pending_input, &framing)? {
                 Some(payload) => {
-                    // `inet_input_count(INETP(desc), len)` (`:13064`): the bytes **delivered**,
-                    // i.e. the payload with the framing header already stripped.
-                    self.stat.input(payload.len());
+                    // The count is [`stat::take_frame`]'s, not this loop's: `tcp_deliver`
+                    // credits `inet_input_count(INETP(desc), len)` with `len` =
+                    // `packet_get_length`'s **total packet length** (`:12967`/`:13064`), so a
+                    // framed delivery counts the framing header too even though the payload
+                    // handed to the owner has it stripped.
                     self.deliver_data(ctx, payload)?;
                     // `if (! desc->inet.active)` (`:13108`): the mode the last delivery spent
                     // ends the burst here.
@@ -218,7 +221,10 @@ impl TcpInetDriver {
                 }
                 None => {
                     let mut bytes = Vec::new();
-                    let read = self.read_bytes(ctx, &mut bytes)?;
+                    // An active-mode discovery is reported to the owner (`{tcp_closed, S}` /
+                    // `{tcp_error, S, Reason}`, `inet_drv.c:12841`/`:12871`), not owed to a
+                    // receive, so it arms no receive one-shot.
+                    let read = self.read_bytes(ctx, &mut bytes, ReadReport::Answered)?;
                     if read == 0 {
                         // `EAGAIN`, or a peer close the read latched: the socket is drained and
                         // the retained bytes are not a whole frame yet.
@@ -240,7 +246,9 @@ impl TcpInetDriver {
     /// follows (see the `pending_input` field's note).
     fn deliver_raw(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         let mut bytes = core::mem::take(&mut self.pending_input);
-        self.read_bytes(ctx, &mut bytes)?;
+        // Same rule as [`TcpInetDriver::deliver_framed`]: an active-mode close is reported to the
+        // owner, so it owes no receive reply.
+        self.read_bytes(ctx, &mut bytes, ReadReport::Answered)?;
         if bytes.is_empty() {
             return Ok(());
         }

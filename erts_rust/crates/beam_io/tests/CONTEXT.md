@@ -22,7 +22,9 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
   `round_data` asserts a round reported **exactly one** `Data` (the no-coalescing rule for a
   call site that makes one `driver_output*` call); `drain_data` returns every frame the rounds
   report until a round reports none, and `await_trailing_data` collects frames until `expected`
-  is the **newest** one — the shape a `driver_async` site needs (see *Known Issues*).
+  is the **newest** one — the shape a `driver_async` site needs (see *Known Issues*). The
+  `soft_busy_fixture_source`/`soft_busy_fixture_so` builders are the `ERL_DRV_FLAG_SOFT_BUSY` twin
+  `abi_busy.rs`'s `[force]` rows need.
 - `fixtures/*.c` — the C driver objects. `host_driver.c` is the base; the others `#include` it
   after defining a `HOST_DRIVER_*_SLOT` override macro, so one file carries the whole vocabulary.
 
@@ -44,6 +46,9 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
   default flipped to `NULL` (the base entry is an `output`-only driver).
 - **`host_driver_no_ready_async.c`** — `ready_async = NULL` (the `async_free` arm).
 - **`host_driver_no_process_exit.c`** — `process_exit = NULL` (the `emergency_close` fallback).
+- **`host_driver_soft_busy.c`** — `HOST_DRIVER_DRIVER_FLAGS_SLOT = ERL_DRV_FLAG_SOFT_BUSY`, the
+  flagged twin of the base entry (zero flags): with the flag a `[force]` command bypasses the port's
+  busy state and is written, without it the same command is `error:notsup`.
 - **`vector_driver.c`** — the `outputv`-only entry (`outputv` set, `ready_output = NULL`).
 - **`host_driver_both.c`** — `host_driver.c` with `HOST_DRIVER_OUTPUTV_SLOT = host_outputv`, the one
   build whose entry declares `outputv` **and** `output` **and** `ready_output` at once: the shape
@@ -82,8 +87,8 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
-bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 25 suites, **232
-passing / 0 failing**; the whole `-p beam_io` run is **1032** (797 lib + 232 integration + 3
+bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 26 suites, **248
+passing / 0 failing**; the whole `-p beam_io` run is **1143** (892 lib + 248 integration + 3
 doctests, 2 doctests `ignore`d). Per file:
 
 | Suite | Tests | Suite | Tests |
@@ -95,8 +100,8 @@ doctests, 2 doctests `ignore`d). Per file:
 | `driver_table.rs` | 5 | `ddll.rs` | 11 |
 | `driver_seams.rs` | 7 | `poller.rs` | 11 |
 | `abi_lifecycle.rs` | 3 | `cpu_time.rs` | 8 |
-| `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 8 |
-| `abi_busy.rs` | 2 | `inet.rs` | 8 |
+| `driver_registry_slots.rs` | 3 | `fixture_builds.rs` | 9 |
+| `abi_busy.rs` | 8 | `inet.rs` | 10 |
 | `abi_start_failure.rs` | 2 | `inet_async.rs` | 8 |
 | `abi_failure.rs` | 11 | `active_mode.rs` | 9 |
 | `inet_accept.rs` | 7 | | |
@@ -198,7 +203,11 @@ rot.
   `input_len` counting the header, the `{line, N}` frame header stamp, and the flat
   `DriverContext::input()` view
 - `abi_busy.rs` → the `set_busy_port` state half (the raw API-table hook + the fixture's `busy`
-  token and verbs 25/26)
+  token and verbs 25/26) **and** the port layer's busy-port decision table over that real loaded
+  driver: an idle port really writing, the `busy` token making the first command `Busy` with nothing
+  queued, `[nosuspend]` on it `Busy` too, verb 26 letting the command through, `[force]` raising
+  `notsup` without `ERL_DRV_FLAG_SOFT_BUSY` and reaching the driver with it
+  (`fixtures/host_driver_soft_busy.c`)
 - `abi_async.rs`, `abi_vector.rs`, `abi_lifecycle.rs`, `abi_start_failure.rs` → the `driver_async`
   completion arms, the `outputv`-only entry, the port-exit adapter, a failing `start`
 - `abi_failure.rs` → the `driver_output*` shapes + the driver-failure channel over
@@ -231,10 +240,10 @@ rot.
   passive port and after a close
 - `signal.rs`, `cpu_time.rs`, `ddll.rs` → the OS-signal facility, the CPU-time facility, `dlopen`
 - `fixture_builds.rs` → builds + loads the `host_driver`-family fixtures (the base, the two
-  `ready_async`/`process_exit` variants, the `vector` and `both` write-side shapes) plus the
-  negative cases (a `cc` failure is reported, a missing object is an error, the OTP header is
-  locatable); a broken fixture is a hard failure. `output_shape_driver.c` is built by its own suite
-  (`abi_failure.rs`)
+  `ready_async`/`process_exit` variants, the `soft_busy` flag variant, the `vector` and `both`
+  write-side shapes) plus the negative cases (a `cc` failure is reported, a missing object is an
+  error, the OTP header is locatable); a broken fixture is a hard failure. `output_shape_driver.c` is
+  built by its own suite (`abi_failure.rs`)
 - `support/mod.rs`, `cdriver/mod.rs` → the shared toolchain + fixture helpers
 - `fixtures/` → the C driver objects (see above)
 - **`inet_accept.rs` (7)** — the **TCP accept chain** end to end over a foreign `std::net::TcpStream` peer:

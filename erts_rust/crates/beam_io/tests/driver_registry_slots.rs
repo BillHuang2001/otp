@@ -83,7 +83,7 @@ use beam_abi::driver::types::{ErlDrvEntry, ERTS_INVALID_ERL_DRV_PORT};
 use beam_io::prelude::*;
 use beam_io::DriverPort;
 
-use support::{cc_available, compile_so, erl_include_dir, scratch_dir, skip};
+use support::{cc_available, compile_so, erl_include_dir, load_path, scratch_dir, skip};
 
 /// The committed C fixture.
 fn fixture_source() -> PathBuf {
@@ -150,7 +150,7 @@ fn the_registry_slots_answer_the_cs_codes_for_a_live_loaded_port() {
         return;
     };
     force_driver_symbols_link();
-    let path = so.to_str().expect("the fixture path is valid UTF-8");
+    let path = load_path(&so);
 
     let api = beam_abi::driver::drv::driver_api_table();
     let add = api.add_driver_entry.expect("add_driver_entry is populated");
@@ -299,7 +299,7 @@ fn the_four_registry_slots_reproduce_the_oracles_0_1_0_minus_1_sequence() {
         return;
     };
     force_driver_symbols_link();
-    let path = so.to_str().expect("the fixture path is valid UTF-8");
+    let path = load_path(&so);
 
     let api = beam_abi::driver::drv::driver_api_table();
     let add = api.add_driver_entry.expect("add_driver_entry is populated");

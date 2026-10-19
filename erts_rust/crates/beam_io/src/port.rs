@@ -64,7 +64,7 @@ use beam_common::Result;
 use beam_process::PortId;
 
 use crate::completion::PortCompletion;
-use crate::driver::{Driver, DriverContext, PortArms, PortExitReason};
+use crate::driver::{Driver, DriverContext, DriverFlags, PortArms, PortExitReason};
 use crate::drivers::line_buffer::LineBuffer;
 use crate::error;
 use crate::poller::Poller;
@@ -390,6 +390,86 @@ impl Port {
             self.schedule_task(PortTaskKind::Output);
         }
         Ok(written)
+    }
+
+    /// Hands `data` to the port the way `erlang:port_command/2,3` does, answering the decision the
+    /// **busy state** and the command options produce.
+    ///
+    /// This is the port layer's whole implementation of the C's `erts_port_output` busy arm, and
+    /// the single place the decision table lives:
+    ///
+    /// | state | options | outcome | C |
+    /// |---|---|---|---|
+    /// | any | `force`, driver **without** [`DriverFlags::SOFT_BUSY`] | `Err` = `error:notsup`, nothing queued | `erl_bif_port.c:195-198` |
+    /// | idle | any (incl. `force` with `SOFT_BUSY`) | [`PortCommandOutcome::Done`]: queued + an `OUTPUT` task | `io.c:1763` (`ERTS_PORT_OP_DONE`) |
+    /// | busy | `force` + `SOFT_BUSY` | [`PortCommandOutcome::Done`]: the state is bypassed | `io.c:1731` (`busy_flgs = 0` under `FORCE`) |
+    /// | busy | plain or `nosuspend` | [`PortCommandOutcome::Busy`], **nothing queued** | `io.c:1763-1769` (`ERTS_PORT_OP_BUSY`) |
+    ///
+    /// The two checks are in the C's order: `[force]`'s capability refusal comes **before** any
+    /// output is attempted (`erl_bif_port.c` checks the flag, then calls `erts_port_output`), and it
+    /// is a check of the **driver's flag word, never of the busy state** — so `[force]` is `notsup`
+    /// for such a driver whether or not its port is busy.
+    ///
+    /// A `Busy` answer deliberately leaves the bytes out of the output queue: the oracle suspends
+    /// the caller and re-issues the command when the driver clears the state
+    /// (`erts_port_resume_procs`, `io.c:5265`), so queueing now would deliver it twice or in the
+    /// wrong order. The caller owns the data and retries; the caller-blocking half is the
+    /// runtime's, since only it has the process.
+    ///
+    /// The `notsup` answer is the crate's existing [`crate::error::notsup`] raise (the oracle's own
+    /// `error:notsup`), not a bespoke outcome: a runtime that gets an `Err` here raises it, which is
+    /// exactly what the C BIF does, and there is then no way to mistake it for a busy port.
+    ///
+    /// # Errors
+    ///
+    /// `BeamError::BadArg` when the port is not [`PortState::Open`] (the C's `ERTS_PORT_OP_BADARG`
+    /// for a dead port), and the `notsup` raise for a `[force]` command on a driver without
+    /// [`DriverFlags::SOFT_BUSY`].
+    pub fn command(
+        &mut self,
+        data: &[u8],
+        options: PortCommandOptions,
+    ) -> Result<PortCommandOutcome> {
+        if self.state != PortState::Open {
+            return Err(error::badarg());
+        }
+        if options.is_force() {
+            // The C: `[force]` with a driver that does not advertise `ERL_DRV_FLAG_SOFT_BUSY` is
+            // `notsup`, decided from the entry's flag word before `erts_port_output` is reached
+            // (`erl_bif_port.c:195-198`) — never from the busy state.
+            if !self.driver.flags().contains(DriverFlags::SOFT_BUSY) {
+                return Err(error::notsup());
+            }
+            // …and with the flag set the busy state is skipped entirely: `busy_flgs` is 0 under
+            // `ERTS_PORT_SIG_FLG_FORCE`, so the `ERTS_PORT_OP_BUSY` arms are unreachable
+            // (`io.c:1731`, `:1763`).
+        } else if self.driver.is_busy() {
+            // `ERTS_PORT_OP_BUSY`: nothing is queued and no task is scheduled — the caller is
+            // expected to retry once the driver clears the state (`io.c:1763-1769`).
+            return Ok(PortCommandOutcome::Busy);
+        }
+        self.queue_output(data);
+        self.schedule_task(PortTaskKind::Output);
+        Ok(PortCommandOutcome::Done)
+    }
+
+    /// Whether this port is currently **busy** — the driver's `set_busy_port(port, 1)` state.
+    ///
+    /// Forwards to [`Driver::is_busy`]; the effect a command sees is
+    /// [`Port::command`]'s decision table. `false` for every built-in driver (none of them reports a
+    /// busy state) and for a port no driver has marked busy.
+    pub fn is_busy(&self) -> bool {
+        self.driver.is_busy()
+    }
+
+    /// Whether the peer/OS side has closed this port's underlying endpoint.
+    ///
+    /// Forwards to [`Driver::port_closed`], the **latched** accessor a runtime reads once per
+    /// round to deliver the oracle's peer-close message (`{tcp_closed, Port}`, …). `false` for a
+    /// driver that cannot know — every built-in except the `tcp_inet` driver, whose
+    /// [`TcpInetDriver::peer_closed`](crate::drivers::TcpInetDriver::peer_closed) it mirrors.
+    pub fn port_closed(&self) -> bool {
+        self.driver.port_closed()
     }
 
     /// Schedules a task of `kind`, reporting whether it was newly scheduled.
@@ -1132,14 +1212,46 @@ impl PortControl {
     pub const CLOSE: &'static str = "close";
 }
 
+/// The outcome of handing a command to a port — what `erlang:port_command/2,3` turns into its own
+/// return value.
+///
+/// The C has one opcode vocabulary for this (`ErtsPortOpResult`, `erts/emulator/beam/io.c:1712`):
+/// `ERTS_PORT_OP_DONE` ⇒ `true`, `ERTS_PORT_OP_BUSY` ⇒ `false` for `[nosuspend]` and a **caller
+/// suspension** otherwise. Only the two outcomes the port layer decides are modelled here; the
+/// caller-blocking half of `Busy` is the runtime's (it owns the process), and the two refusal
+/// opcodes (`ERTS_PORT_OP_BADARG`/`DROPPED` ⇒ `badarg`) and `[force]` without
+/// [`DriverFlags::SOFT_BUSY`] (⇒ `error:notsup`) are typed errors, not outcomes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PortCommandOutcome {
+    /// The command was queued and an [`PortTaskKind::Output`] task scheduled: the driver writes it
+    /// when the task runs (or when an already-armed write-readiness event does). The oracle answers
+    /// `true` — the C's `ERTS_PORT_OP_DONE`/`_SCHEDULED`.
+    Done,
+    /// The port is busy and the command was **not** queued — the C's `ERTS_PORT_OP_BUSY`
+    /// (`io.c:1764`, `:1926`, `:2086`, `:2152-2155`).
+    ///
+    /// The oracle answers `false` for `[nosuspend]` and otherwise **suspends the caller** until
+    /// the driver clears the busy state, at which point the command is retried and answers `true`.
+    /// Both of those need the process that issued the command, so this layer reports the state and
+    /// the runtime decides: `false`, or park the caller and re-issue.
+    Busy,
+}
+
 /// The options `erlang:port_command/3` accepts, as a small flag set.
 ///
-/// `nosuspend` and `force` mirror the Erlang options. Milestone-1 ports have **no** busy
-/// state, no command queue and never suspend the caller (there is only one OS thread and
-/// the command is queued unconditionally), so both flags are validated and carried but
-/// change nothing yet: the runtime's `port_command/3` BIF layer owns their effect once a
-/// busy-port command queue exists. They are modeled here rather than dropped so that the
-/// flag plumbing is in place.
+/// `nosuspend` and `force` are the only two options the oracle accepts — anything else in the list
+/// is `badopt` (`erts_internal_port_command_3`, `erts/emulator/beam/erl_bif_port.c:175-190`), which
+/// is the runtime's argument decoding. Both change the **busy** arm of the decision table
+/// [`Port::command`] implements:
+///
+/// | option | effect at the port layer |
+/// |---|---|
+/// | (none) | busy ⇒ [`PortCommandOutcome::Busy`] (the runtime suspends the caller and retries) |
+/// | `nosuspend` | busy ⇒ [`PortCommandOutcome::Busy`] (the runtime answers `false`) |
+/// | `force` | the busy state is **ignored** — but the driver must advertise [`DriverFlags::SOFT_BUSY`], else the command is the oracle's `error:notsup` (`erl_bif_port.c:195-198`) |
+///
+/// The flag set is a plain `Copy` value: the runtime validates the option list once and carries the
+/// result through every retry of a suspended command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PortCommandOptions {
     /// The `nosuspend` option.
@@ -1642,3 +1754,9 @@ mod tests {
 #[cfg(test)]
 #[path = "active_input_tests.rs"]
 mod active_input_tests;
+
+// The busy-port backpressure decision table (`Port::command`) plus the two state probes: a
+// `#[path]` sibling for the same reason as `active_input_tests.rs`.
+#[cfg(test)]
+#[path = "port_command_tests.rs"]
+mod port_command_tests;

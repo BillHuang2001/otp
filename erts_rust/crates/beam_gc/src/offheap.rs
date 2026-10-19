@@ -53,6 +53,10 @@
 //! precisely the "no duplication across crates" hazard the crate-layer contracts forbid: a
 //! wrong word index silently leaks every off-heap binary of the process, which is the very
 //! retention bug these functions exist to remove.
+//! Its production consumer is `beam_rt`'s slice-boundary prune
+//! (`beam_rt/src/context/gc/bin_vheap.rs`), which feeds this walk's payload set to the engine's
+//! `Machine::retain_refc_binaries`; [`sweep_unreachable_binaries`] is the roster-owning form (a
+//! caller that keeps a `beam_gc::OffHeap`), which the reservoir path does not need.
 //!
 //! # Contracts honoured here
 //!

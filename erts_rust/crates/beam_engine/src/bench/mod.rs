@@ -36,9 +36,9 @@
 //! Measurement discipline (inherited from `TEST_NOTES.md`): a **fresh** [`Machine`] and a
 //! **fresh** inner host per batch of `BENCH_BATCH` calls, an untimed warmup phase, and a
 //! measured phase split into five sub-runs of which the **minimum** and **median** are
-//! reported. `Machine::refc_binaries` and the inner host's region heap grow monotonically and
-//! are never given back, so one 20 000-call machine would leak roughly 600k payloads instead of
-//! measuring anything.
+//! reported. `Machine::refc_binaries` and the inner host's region heap grow monotonically within
+//! a batch and this harness never prunes them (a host may, with `retain_refc_binaries`), so one
+//! 20 000-call machine would leak roughly 600k payloads instead of measuring anything.
 //!
 //! ## The workload, verbatim
 //!

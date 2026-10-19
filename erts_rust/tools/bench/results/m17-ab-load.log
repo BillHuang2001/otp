@@ -1,0 +1,20 @@
+before ab side=new round=1 load=51.36 47.21 25.89 34/1056 5
+after  ab side=new round=1 rc=0 load=53.46 48.24 27.46 62/1254 603
+before ab side=old round=1 load=53.46 48.24 27.46 63/1254 604
+after  ab side=old round=1 rc=0 load=66.35 52.93 30.48 85/1238 1046
+before ab side=old round=2 load=66.35 52.93 30.48 76/1237 1049
+after  ab side=old round=2 rc=0 load=87.98 60.19 34.42 227/1743 1491
+before ab side=new round=2 load=87.98 60.19 34.42 232/1742 1492
+after  ab side=new round=2 rc=0 load=92.60 68.77 39.11 21/963 2090
+before ab side=new round=3 load=92.60 68.77 39.11 20/963 2093
+after  ab side=new round=3 rc=0 load=68.16 65.57 39.56 4/913 2691
+before ab side=old round=3 load=68.16 65.57 39.56 4/913 2692
+after  ab side=old round=3 rc=0 load=38.44 57.58 38.19 47/1033 3134
+before ab side=new round=4 load=41.95 38.77 35.08 42/1048 13
+after  ab side=new round=4 rc=0 load=33.93 37.19 34.77 50/1081 611
+before ab side=old round=4 load=33.93 37.19 34.77 49/1080 612
+after  ab side=old round=4 rc=0 load=51.31 41.92 36.58 50/1175 1054
+before ab side=old round=5 load=51.31 41.92 36.58 51/1174 1057
+after  ab side=old round=5 rc=0 load=61.71 48.30 39.30 47/1204 1499
+before ab side=new round=5 load=61.71 48.30 39.30 50/1204 1500
+after  ab side=new round=5 rc=0 load=73.15 55.80 42.63 95/1331 2097

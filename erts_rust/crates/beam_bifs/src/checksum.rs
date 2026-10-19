@@ -335,7 +335,11 @@ fn adler_pack(adler: u64, sum2: u64) -> u32 {
 /// The one-byte and shorter-than-16-byte fast paths are reproduced literally, so a
 /// caller-supplied *non-canonical* accumulator (`adler32/2`) reduces exactly as the
 /// oracle reduces it.
-fn adler32_step(prev: u32, data: &[u8]) -> u32 {
+///
+/// `pub(crate)` because the deflate port's trailer is the same checksum over the same
+/// bytes: `zlib::compress/1` appends `strm->adler` exactly as the C does, so it must be
+/// this one implementation rather than a second copy.
+pub(crate) fn adler32_step(prev: u32, data: &[u8]) -> u32 {
     let mut sum2 = u64::from((prev >> 16) & 0xFFFF);
     let mut adler = u64::from(prev & 0xFFFF);
     let len = data.len();

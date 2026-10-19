@@ -59,7 +59,8 @@ use super::super::opt::{
     INET_PASSIVE,
 };
 use super::super::wire::{
-    ctl_ok, ctl_xerror, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_TYPE_DGRAM,
+    ctl_ok, ctl_xerror, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK, INET_PROTO_DEFAULT,
+    INET_TYPE_DGRAM,
 };
 use super::UdpInetDriver;
 use crate::poller::Poller;
@@ -76,6 +77,9 @@ const INET_REQ_SETOPTS: u32 = 7;
 const INET_REQ_GETOPTS: u32 = 8;
 /// `INET_REQ_GETSTAT` (`:11550`).
 const INET_REQ_GETSTAT: u32 = 11;
+/// `INET_REQ_NAME` (`inet_drv.c:809`, the `sockname` arm at `:11360`) — the port's own endpoint as
+/// a packed address.
+const INET_REQ_NAME: u32 = 5;
 /// The C's `INET_STAT_RECV_CNT` counter op (a 5-byte `[op, u32_be]` record).
 const INET_STAT_RECV_CNT: u8 = 1;
 /// The C's `INET_STAT_RECV_OCT` counter op (a 9-byte `[op, u64_be]` record).
@@ -141,6 +145,13 @@ impl Rig {
     /// Opens a `udp_inet` port, creates its datagram socket (`INET_REQ_OPEN`) and binds it to an
     /// ephemeral loopback port (`INET_REQ_BIND`).
     fn new() -> Rig {
+        Rig::with_bind(INET_AF_LOOPBACK)
+    }
+
+    /// [`Rig::new`] with the bind's packed-address **tag** chosen by the caller: `INET_AF_LOOPBACK`
+    /// (`127.0.0.1`) or `INET_AF_ANY` (`INADDR_ANY`), the two forms
+    /// [`super::super::wire::parse_address`] serves.
+    fn with_bind(tag: u8) -> Rig {
         let mut poller = Poller::new().expect("a poll set");
         let mut registry = PortRegistry::new();
         let id = registry
@@ -161,7 +172,7 @@ impl Rig {
             ctl_ok(),
             "the datagram socket opens"
         );
-        let reply = rig.control(op(INET_REQ_BIND), &[INET_AF_LOOPBACK, 0, 0]);
+        let reply = rig.control(op(INET_REQ_BIND), &[tag, 0, 0]);
         assert_eq!(reply.first(), Some(&1), "the bind succeeds: {reply:?}");
         rig.bound = u16::from_be_bytes([reply[1], reply[2]]);
         assert_ne!(rig.bound, 0, "the kernel assigned a port");
@@ -392,6 +403,45 @@ fn an_active_port_delivers_the_datagram_with_its_packed_source_address() {
     assert_eq!(read.body.as_deref(), Some(b"abc".as_slice()), "the payload");
     // `inet_input_count(desc, n)` counted the payload, once (`:15513`).
     assert_eq!(rig.recv_stats(), (1, 3), "one datagram of three octets");
+}
+
+/// The delivered header names the **sender**, not the receiver — address included.
+///
+/// The port is bound to `INADDR_ANY` (`INET_AF_ANY`, the wildcard form of the bind's packed
+/// address), so the receiver's own endpoint is `0.0.0.0:<bound>` and cannot be confused with the
+/// delivered source: the seven packed bytes are `recvfrom(2)`'s `other` address, rendered by
+/// `packet_binary_message` (`inet_drv.c:4106`) in front of the payload. The system driver agrees —
+/// [`the_binary_delivery_shape_agrees_with_the_oracle`] pins the oracle's
+/// `{udp,S,{127,0,0,1},SrcPort,Data}` for a `gen_udp:open/2` socket, whose bind is the wildcard too.
+#[test]
+fn the_delivered_header_names_the_sender_not_the_receiver() {
+    let mut rig = Rig::with_bind(INET_AF_ANY);
+    // The receiver's own endpoint (`INET_REQ_NAME`): the wildcard address, on the bound port.
+    let name = rig.control(op(INET_REQ_NAME), &[]);
+    assert_eq!(name.len(), 8, "`[1] ++ packed address`: {name:?}");
+    assert_eq!(
+        (name[0], name[1]),
+        (1, INET_AF_INET),
+        "a success reply with the IPv4 tag"
+    );
+    assert_eq!(
+        split_packed(&name[1..]),
+        ([0, 0, 0, 0], rig.bound),
+        "the receiver is bound to INADDR_ANY, not to 127.0.0.1"
+    );
+
+    rig.arm(INET_ACTIVE);
+    let sender = rig.inject(b"abc");
+    let source = sender.local_addr().expect("the sender's address").port();
+    let drained = rig.drain_until_quiet();
+    let data = data_of(&drained.inputs);
+    assert_eq!(data.len(), 1, "one delivery: {:?}", drained.per_round);
+    assert_eq!(
+        split_packed(&data[0].header),
+        ([127, 0, 0, 1], source),
+        "the sender's address and its own source port, never the receiver's wildcard"
+    );
+    assert_ne!(source, rig.bound, "the source port is not the receiving port");
 }
 
 // ---------------------------------------------------------------------------

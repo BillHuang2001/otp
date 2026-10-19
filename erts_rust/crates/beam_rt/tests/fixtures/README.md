@@ -85,6 +85,76 @@ erl -noshell -pa "$DIR" -eval 'io:format("~w~n",[epp_forms:go("'$DIR'/epp_input.
 # {5,[attribute,attribute,attribute,function,eof]}
 ```
 
+## The `{active, …}` socket-input fixture (`inet_active.erl`, compiled at test time)
+`tests/inet_active.rs` pins the driver's **active-input channel** end to end (contract A.4): a
+socket in `{active, true | once | N}` really delivers `{tcp, S, Data}` / `{udp, S, IP, Port, Data}`
+and `{tcp_passive, S}` / `{udp_passive, S}` to its owner's mailbox, and a compiled `receive` gets
+it. The single committed source `inet_active.erl` (module `inet_active`, exports `t1/0 … t7/0`) is
+`include_str!`-embedded and compiled by the suite into a **per-case scratch directory** with the
+system `erlc`, and only that directory is ever named on a `-pa` (`tests/fixtures/` holds a
+`lists.beam` that would shadow stdlib).
+
+### The transport is the driver itself — exactly what `prim_inet` does
+Every case opens its socket with `erlang:open_port({spawn_driver, "tcp_inet" | "udp_inet"},
+[binary])` and drives it with **numeric** `erlang:port_control/3` requests, each offset by
+`ERTS_INET_DRV_CONTROL_MAGIC_NUMBER` (`16#03f1a300`): `INET_REQ_OPEN` 1, `INET_REQ_CONNECT` 3,
+`INET_REQ_BIND` 6, `INET_REQ_SETOPTS` 7, `INET_REQ_ACCEPT` 26, `INET_REQ_LISTEN` 27. No
+`gen_tcp`/`gen_udp`/`prim_inet` is involved, so the identical source runs under both runtimes with
+nothing library-level that could differ. The helpers mirror the driver's own encodings:
+* an option record is `[code, value_be32]` (`{mode,list}` = `[24,0,0,0,0]`, `{mode,binary}` =
+  `[24,0,0,0,1]`, `{packet,2}` = `[23,0,0,0,2]`), with a trailing **16-bit counter only for
+  `{active, N}`** (`{active,true}` = `[22,0,0,0,1]`, `{active,once}` = `[22,0,0,0,2]`,
+  `{active,2}` = `[22,0,0,0,3,0,2]` — `prim_inet:enc_opt_val/2`'s exact split);
+* `bind` answers `[1] ++ <<Port:16/big>>` (the kernel-assigned port, bound on `127.0.0.1` with
+  port `0` — the address record `[4]` is `INET_AF_LOOPBACK`);
+* `connect` normally completes inside the call (a bare `[1]`) and otherwise answers
+  `[1] ++ <<Id:16/big>>` plus `{inet_async, P, Id, ok}`; `accept` is always the async form, ending
+  in `{inet_async, L, Id, {ok, Port2}}`;
+* a send is `prim_inet:send/3`'s wire shape — `[<<Size:16, TagBin/binary>>, Data]` where `TagBin` is
+  `term_to_binary(Ref, [local])`, the driver echoing the decoded tag as the fourth element of
+  `{inet_reply, S, ok, Tag}`; a datagram's destination record is
+  `[INET_AF_INET, Port:16, A, B, C, D, 0:32]` (a zero ancillary-data length).
+
+### Every case is self-contained in one VM
+The fixture binds a listener, reads the assigned port out of the `bind` reply and opens its **own
+peer** socket in the same run — so no external peer is needed and the bytes the owner receives are
+bytes a real loopback socket carried. The last line of every case is `ok` (the `run` action's
+printed result on this runtime's side, the fixture's own `~w`-printed return value on the oracle's).
+
+### What each case pins, and the oracle's rendering of it (OTP 29.1.1 / erts-17.1)
+`'$port'` stands for the port term (a per-runtime table slot) and `'$source'` for a UDP source port
+(a per-run value); **everything else is compared byte for byte**.
+
+| case | configuration | pinned shape | oracle output |
+|---|---|---|---|
+| `t1` | `{active,true}` `{mode,binary}`, peer writes `<<"hello">>` then `<<"again">>` | every write becomes a `{tcp, S, Data}` | `t1_first={tcp,'$port',<<104,101,108,108,111>>}`, `t1_socket_is_port=true`, `t1_second={tcp,'$port',<<97,103,97,105,110>>}` |
+| `t2` | `{active,2}` | two deliveries, exactly one `{tcp_passive, S}`, silence, then a re-armed delivery | `t2_one={tcp,'$port',<<111,110,101>>}`, `t2_two={tcp,'$port',<<116,119,111>>}`, `t2_passive={tcp_passive,'$port'}`, `t2_silent=timeout`, `t2_rearmed={tcp,'$port',<<116,104,114,101,101>>}` |
+| `t3` | `{active,once}` | one delivery, silence while the grant is spent, a re-arm, one more delivery | `t3_first={tcp,'$port',<<104,101,108,108,111>>}`, `t3_silent=timeout`, `t3_second={tcp,'$port',<<98,98,98,98>>}`, `t3_silent_again=timeout` |
+| `t4` | `{mode,binary}` vs `{mode,list}`, same `<<"hello">>` | binary vs charlist for one payload | `t4_binary={tcp,'$port',<<104,101,108,108,111>>}`, `t4_list={tcp,'$port',[104,101,108,108,111]}`, `t4_list_is_hello=true` |
+| `t5` | `{packet,2}`, peer writes `<<5:16,"hello">>` | the framing header is stripped before delivery | `t5_stripped={tcp,'$port',<<104,101,108,108,111>>}`, `t5_body_is_hello=true` |
+| `t6` | UDP `{active,true}`, one datagram | `{udp, S, {127,0,0,1}, SourcePort, Data}` with the peer's real bound port | `t6_datagram={udp,'$port',{127,0,0,1},'$source',<<104,105>>}`, `t6_source_is_peer=true`, `t6_source_is_real=true`, `t6_address={127,0,0,1}` |
+| `t7` | listener `{packet,2}` + `{mode,list}` + `{active,2}`, one accepted connection | the listener's options reach the accepted port (charlist, header stripped), and its own re-armed `{active,2}` reports `{tcp_passive, S}` | `t7_accepted_is_port=true`, `t7_first={tcp,'$port',[104,101,108,108,111]}`, `t7_second={tcp,'$port',[119,111,114,108,100]}`, `t7_passive={tcp_passive,'$port'}` |
+
+The two content rules the table encodes: `{mode,binary}` must be **asked for** (the driver's
+effective default for a `[binary]` port is a *list* — measured, which is why `prim_inet:open/5`'s
+`[binary]` alone is not enough), and `{active, …}` is the one option block an accepted socket does
+**not** inherit (the C copies everything else), so `t7` re-arms the accepted port itself.
+
+### The one measured difference the fixture avoids on purpose
+This runtime harvests a passive window's bytes out of the socket when it emits `{tcp_passive, S}`
+and never delivers them, while the oracle keeps them queued and hands them over after the next
+re-arm (a peer write made while the grant is spent shows up as `<<"threethree">>` there and
+`<<"three">>` here — the note recorded in `src/port/active_input_e2e_tests.rs`). `t2` therefore
+writes **nothing** during its passive window and `t3` never reads back its spent-grant write, so
+every line agrees; making the window byte-faithful is the port provider's work, not the fixture's.
+
+### Skip-loudly rule
+Each test skips **loudly** (`beam_rt inet_active SKIPPED` plus a return, never a silent pass) when
+`erlc` or `erl` is missing — a **toolchain** absence the host may legitimately have. A fixture that
+fails to compile, a non-zero exit, a run that outlives the harness's 30 s probe bound
+(`support::PROBE_TIMEOUT`) or any line that differs from the oracle's is a **failure**: the fixture
+is part of this repository.
+
 ## Driver fixtures (never committed — compiled at test time)
 
 `event_driver.c` and `event_driver.erl` are the **driver event/timer** pair for

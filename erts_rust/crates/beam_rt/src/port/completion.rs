@@ -222,7 +222,7 @@ impl PortRegistry {
                     result: InetAsyncResult::Accepted { fd },
                 } => CompletionEvent::InetAsync {
                     id,
-                    result: self.adopt_accepted(fd, owner, stream, line),
+                    result: self.adopt_accepted(port, fd, owner, stream, line),
                 },
                 other => other,
             };
@@ -256,6 +256,25 @@ impl PortRegistry {
     /// the driver port `[binary]` and `prim_inet:accept_opts/3` then sets the accepted socket's
     /// mode, so inheriting is what makes the two agree.
     ///
+    /// # Accepted-socket option inheritance
+    ///
+    /// The C's `tcp_inet_copy` copies the listening descriptor's whole option block into the
+    /// accepted one (`inet_drv.c:11810-11827`). This crate's drivers cannot create a port
+    /// ([`InetAsyncResult::Accepted`] hands the bare descriptor up), so the block is **replayed**
+    /// onto the new port through the driver's own `setopts` surface after it is registered:
+    /// [`PortRegistry::seed_inet_mode`] first (the listener's *data* mode, which
+    /// [`PortMeta::stream`](super::PortMeta) does not carry — `prim_inet:open/6` always opens
+    /// `[binary]`), then [`PortRegistry::inherit_inet_options`], which resends the listener's
+    /// recorded records that [`is_inherited_record`](super::ops::inet_opts::is_inherited_record)
+    /// admits, in arrival order. `{active, …}` is deliberately **not** replayed: the C does not
+    /// copy it either, `prim_inet:accept_opts/3` re-applies it from the Erlang side, and the
+    /// driver's `INET_LOPT_ACTIVE` arm *adds* to the live counter (so a replay would double-arm).
+    ///
+    /// A record the driver **rejects** during the replay means the new socket's option block
+    /// would silently disagree with the listener's, so the freshly adopted port is **closed**
+    /// (which releases the descriptor — nothing leaks) and the accept completes as
+    /// `{error, einval}`, the errno the driver itself answers for a bad option value.
+    ///
     /// # Reasons
     ///
     /// A descriptor `beam_io` cannot describe as a socket answers `{error, ebadf}` — the errno
@@ -266,11 +285,16 @@ impl PortRegistry {
     /// sees the failure as the operation's result.
     fn adopt_accepted(
         &mut self,
+        listener: PortId,
         fd: RawFd,
         owner: ProcessId,
         stream: StreamType,
         line: Option<usize>,
     ) -> InetAsyncResult {
+        // The listener's *driver* mode, resolved before the registry is borrowed for the
+        // registration: `data_mode` falls back to the port stream option (which `prim_inet`
+        // always opens `[binary]`) when no `{mode, …}` record was ever seen.
+        let mode = self.data_mode(listener, stream);
         let driver = match TcpInetDriver::from_socket(fd) {
             Ok(driver) => driver,
             Err(_) => {
@@ -305,7 +329,21 @@ impl PortRegistry {
         // A failed `register` tears its driver down (`beam_io::PortRegistry::open`'s contract),
         // which closes the descriptor — so this path leaks nothing either.
         match self.register(Box::new(driver), meta) {
-            Ok(port) => InetAsyncResult::Port(port),
+            Ok(port) => {
+                self.seed_inet_mode(port, mode);
+                match self.inherit_inet_options(listener, port) {
+                    Ok(()) => InetAsyncResult::Port(port),
+                    Err(_) => {
+                        // A half-configured socket is worse than no socket: the inherited block
+                        // is what makes the accepted socket agree with its listener, so a
+                        // rejected record tears the new port down (its `close` runs the driver's
+                        // own teardown, which closes the descriptor) instead of leaving the
+                        // Erlang side with a socket that silently differs.
+                        let _ = self.close(port);
+                        InetAsyncResult::Error(InetReason::from_errno(libc::EINVAL))
+                    }
+                }
+            }
             Err(_) => InetAsyncResult::Error(InetReason::from_errno(libc::EMFILE)),
         }
     }
@@ -494,7 +532,20 @@ impl RuntimeContext<'_> {
 /// # Errors
 ///
 /// The arena's allocation failure when the tuple does not fit.
-fn terms_tuple(ctx: &mut RuntimeContext<'_>, elements: &[Eterm]) -> beam_common::Result<Eterm> {
+pub(super) fn terms_tuple(
+    ctx: &mut RuntimeContext<'_>,
+    elements: &[Eterm],
+) -> beam_common::Result<Eterm> {
     beam_engine::terms::make_tuple(ctx, elements)
 }
 
+
+/// The A.4 **accepted-socket option inheritance** suite: a real loopback `accept(2)` whose
+/// descriptor [`PortRegistry::adopt_accepted`] registers, the replayed `tcp_inet_copy` block read
+/// back through the driver's own `getopts`/framed `send`, the negative `setopts` rows, and the
+/// replay-failure rule (`{error, einval}` + nothing leaked) — see
+/// `src/port/accept_inherit_tests.rs`. A separate file so the wire vocabulary it spells does not
+/// grow this one.
+#[cfg(test)]
+#[path = "accept_inherit_tests.rs"]
+mod accept_inherit_tests;

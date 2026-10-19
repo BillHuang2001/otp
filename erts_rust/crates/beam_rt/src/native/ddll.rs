@@ -141,9 +141,13 @@ impl RuntimeContext<'_> {
         if driver::driver_is_loaded(&name) {
             return self.ddll_ok_atom("already_loaded");
         }
-        // One candidate, `<Path>/<Name>`: the loader appends the platform's shared-object suffix
-        // when the candidate does not already carry it, exactly as `beam_bifs`'s mirror loads it, so
-        // a `Name` written with or without `.so` resolves the same object.
+        // One candidate, `<Path>/<Name>` — a **suffix-free spelling**, because the `dlopen` loader
+        // appends the platform's shared-object suffix unconditionally, exactly as the oracle's
+        // `erts_sys_ddll_open` copies `FILE_EXT` after the given path
+        // (`erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`; `beam_abi::driver::loader::load`),
+        // and as `beam_bifs`'s mirror (`runtime::ddll::live`) hands it over. A `Name` that still
+        // carried `.so` would be opened as `<Path>/<Name>.so.so`, which is the oracle's own answer
+        // for such a name.
         let candidate = format!("{path}/{name}");
         match driver::load_driver_at(&[candidate], &name) {
             Ok((library, loaded_path)) => {

@@ -1,0 +1,25 @@
+5.98 4.62 4.85 2/884 4
+before side=rust round=1 load=5.14 4.49 4.81 3/895 5
+after  side=rust round=1 rc=0 load=3.33 4.06 4.63 1/889 1133
+before side=sys round=1 load=3.33 4.06 4.63 1/889 1134
+after  side=sys round=1 rc=0 load=12.08 6.31 5.37 18/961 9744
+before side=sys round=2 load=12.64 6.53 5.44 15/931 5
+after  side=sys round=2 rc=0 load=9.53 6.73 5.57 17/1010 8615
+before side=rust round=2 load=9.53 6.73 5.57 15/1010 8616
+after  side=rust round=2 rc=0 load=49.54 19.22 10.01 4/886 9744
+before side=rust round=3 load=65.79 27.76 13.45 110/1504 5
+after  side=rust round=3 rc=0 load=58.11 32.30 16.17 152/1642 1133
+before side=sys round=3 load=58.11 32.30 16.17 167/1643 1134
+after  side=sys round=3 rc=0 load=65.76 40.80 20.34 65/1299 9744
+before side=rust round=4 load=8.25 33.45 32.75 16/1023 5
+after  side=rust round=4 rc=0 load=28.13 32.55 32.44 46/1083 1133
+before side=sys round=4 load=28.13 32.55 32.44 46/1083 1134
+after  side=sys round=4 rc=0 load=33.58 33.18 32.66 17/1035 9744
+before side=sys round=5 load=33.58 33.18 32.66 19/1034 9747
+after  side=sys round=5 rc=0 load=18.84 29.31 31.37 2/889 18357
+before side=rust round=5 load=18.84 29.31 31.37 2/889 18358
+after  side=rust round=5 rc=0 load=42.46 32.40 32.12 37/1073 19486
+before side=rust round=6 load=42.46 32.40 32.12 39/1084 5
+after  side=rust round=6 rc=0 load=51.40 38.34 34.27 34/1126 1133
+before side=sys round=6 load=51.40 38.34 34.27 31/1126 1134
+after  side=sys round=6 rc=0 load=37.55 36.98 34.08 40/1093 9744

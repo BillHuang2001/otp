@@ -180,7 +180,8 @@ allocation — not dispatch, and not the append path.
   (`07a5720639` + `7d84b12b44`) and re-verified; `../../../../tools/bench/RESULTS.md` §8 withdraws the
   pre-m15 `foreign` figures (different `N` and an estimator fix).
 - **Batch lifecycle is load-bearing.** `Machine::refc_binaries` and the `MinimalContext` region heap grow
-  monotonically and are never freed, so every batch builds a fresh `Machine` + context (default 500 calls
+  monotonically within a batch and are never pruned here (only a host reachability sweep, `Machine::retain_refc_binaries`,
+  or dropping the machine releases them), so every batch builds a fresh `Machine` + context (default 500 calls
   for `bstr_to_lower`, 5 for `long_append`) and drops both at batch end.
 - The **census pass reloads the module** (a second `load_file`): the per-thread compiled-block cache would
   otherwise answer the pass from an artifact compiled while recording was off, leaving `instr_instances`

@@ -32,8 +32,8 @@ Sections:
 * [Post-fullsweep nursery sizing](#post-fullsweep-nursery-sizing-the-gc_boundchurn-win) — sizing the
   young heap from the round's observed demand instead of from zero: the counters and the A/B.
 * [The off-heap binary roster](#the-off-heap-binary-roster-reachability-reclaim-and-the-binary-virtual-heap-trigger)
-  — the reachability sweep flat in N, and the runtime probe that shows the missing virtual-heap
-  trigger costs one retained 64 KiB payload per call.
+  — the reachability sweep flat in N, and the pre-wiring runtime probe that shows what the missing
+  trigger costs (one retained 64 KiB payload per call).
 
 ## The allocation-heavy workload
 
@@ -829,8 +829,8 @@ surviving overhead's word count against `limit_words`, i.e. the C `ERTS_IS_GC_DE
 `off_heap.overhead > bin_vheap_sz` clause, with `record_collection` re-seeding the limit through the
 C `do_next_vheap_size` rule (grow at ≈1.618, shrink by half, floored by
 `HeapPolicy::min_bin_vheap_words`). The ladder isolates the reclaim by building a fresh collector per
-N; the runtime probe shows what the **missing trigger** costs when the roster is owned outside this
-crate.
+N; the runtime probe below (taken before the runtime drove the pair) shows what the **missing
+trigger** costs when the roster's owner does not drive it.
 
 ### The in-crate ladder — flat in N
 
@@ -902,7 +902,8 @@ A collection reclaims **no** off-heap payload whose owning handle lives outside 
 collector can only report which on-heap `BinRef`s are reachable, and the owner must act on that
 report. That is what the two seams above are for, and it is also why the roster needs a **trigger**
 that reaches it at all — a loop that reaches no heap-admission door runs no collection of either kind
-to offer the reclamation, which is the role of `BinVheap::triggered_for` at the allocation site.
+to offer the reclamation, which is the role of the `BinVheap` trigger — in the runtime, at the
+slice-boundary park (`beam_rt/src/context/gc/bin_vheap.rs`).
 
 **Caveats.** The host is shared, so only **structural** figures are quoted as assertions: the
 allocator's `live_bytes`/`carrier_bytes`, the roster length and its peak, the heap capacity and space
@@ -913,10 +914,12 @@ never their absolute value; the in-crate ladder's 3 600 → 4 296 KiB span is fo
 runs (one collector each, serialized because the allocator registry is process-global), not one
 process growing. And the reader must not conclude from the runtime probe that this crate's collector
 retains anything — the flat `erlang:memory(processes)` figure between N = 200 and N = 800 is the
-counter-evidence. This crate's half (the walk, the sweep and the virtual-heap rule) is complete and
-measured in isolation, but the end-to-end figure stays exactly what the table shows until the owner of
-the per-process roster adopts the seam where its full root set is scanned: **no number above is a
-claim that the runtime no longer retains those payloads.**
+counter-evidence. Every figure in this section is the pre-wiring one, and the table above is the
+A/B's *before* side: the runtime now drives both halves per process at its slice-boundary park, so its
+`erlang:memory(binary)` is flat in the iteration count — the end-to-end figure, its
+capacity-not-latency reading and the attribution live in `CONTEXT.md`'s `## Measured` bullet and are
+measured by `beam_rt`'s `tests/off_heap_reclaim.rs`, not here. The in-crate ladder above remains this
+crate's own counter contract.
 
 ## The accounting band (a footprint against the allocator's own live bytes)
 `tests/heap_accounting.rs::accounted_bytes_track_the_allocators_live_bytes` builds a synthetic

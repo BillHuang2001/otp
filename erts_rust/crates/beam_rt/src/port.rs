@@ -828,6 +828,18 @@ enum PortEvent {
         /// The drained completion, its recipient resolved.
         packet: completion::CompletionPacket,
     },
+    /// An **`{active, …}` input delivery**: the `{tcp, S, Data}` / `{udp, S, IP, Port, Data}` /
+    /// `{tcp_passive, S}` / `{udp_passive, S}` message a socket port's driver hands up while the
+    /// port is in an active mode (see [`ops::active_input`]).
+    ///
+    /// Like [`PortEvent::Completion`] it carries its **recipient already resolved**
+    /// ([`ops::active_input::ActiveInputPacket::owner`], together with the stream mode and the
+    /// socket kind bound at drain time), so nothing is read from a port table the delivering
+    /// route may no longer hold — which is why [`PortEvent::port`] answers `None` for it.
+    ActiveInput {
+        /// The drained delivery, its recipient resolved.
+        packet: ops::active_input::ActiveInputPacket,
+    },
     /// A **handled signal** arrived (`os:set_signal(Sig, handle)`) — the delivery half of the
     /// A.4/A.8 signal surface, drained from the self-pipe [`watch::SignalWatch`] registers.
     ///
@@ -863,8 +875,9 @@ enum PortEvent {
 }
 
 impl PortEvent {
-    /// The port this event is **about**, or `None` for the two node-global / owner-keyed kinds
-    /// that no port carries (a handled signal and a `tty_select/2` report).
+    /// The port this event is **about**, or `None` for the events that already carry their
+    /// recipient resolved (a completion, an `{active, …}` delivery) and for the two node-global
+    /// kinds that no port carries (a handled signal and a `tty_select/2` report).
     ///
     /// Used where an event has to be checked against the registry's live ports before it is
     /// reported — [`PortRegistry::drain_pending_events`], which drops a retained event whose port
@@ -882,6 +895,11 @@ impl PortEvent {
             // ones its owner is still owed. It carries its own owner, so a recycled port number
             // cannot mis-deliver it either.
             PortEvent::Completion { .. } => None,
+            // An `{active, …}` delivery is bound to its owner, mode and kind at drain time (see
+            // [`ops::active_input`]), so — like a completion — filtering it against
+            // [`PortRegistry::meta`] would drop exactly the deliveries a closing port's owner is
+            // still owed, and a recycled port number could not mis-deliver it either.
+            PortEvent::ActiveInput { .. } => None,
             PortEvent::Signal { .. } | PortEvent::Select { .. } => None,
         }
     }
@@ -1317,6 +1335,12 @@ impl PortRegistry {
             // reason to fail the command.
             let completions = self.drain_io_completions(None);
             self.pending_events.extend(completions);
+            // The same `output` callback is where a socket driver stages an `{active, …}`
+            // delivery, so that channel is drained beside the completions and held as pending
+            // work until a pump reports it (see [`ops::active_input`]).
+            let active = self.drain_active_inputs();
+            self.pending_events
+                .extend(active.into_iter().map(|packet| PortEvent::ActiveInput { packet }));
             written?;
             return Ok(());
         }
@@ -1348,6 +1372,10 @@ impl PortRegistry {
         // command is exactly where a socket driver stages `gen_udp:send`'s `{inet_reply, …}`.
         let completions = self.drain_io_completions(None);
         self.pending_events.extend(completions);
+        // …and where it stages an `{active, …}` delivery too.
+        let active = self.drain_active_inputs();
+        self.pending_events
+            .extend(active.into_iter().map(|packet| PortEvent::ActiveInput { packet }));
         Ok(())
     }
 
@@ -1416,6 +1444,21 @@ impl PortRegistry {
         // it staged.
         let completions = self.drain_io_completions(None);
         self.pending_events.extend(completions);
+        // The same callback is where a socket driver stages an `{active, …}` delivery (a
+        // `setopts` that reads inline does), so that channel is drained here too.
+        let active = self.drain_active_inputs();
+        self.pending_events
+            .extend(active.into_iter().map(|packet| PortEvent::ActiveInput { packet }));
+        // A `setopts` control op is also where a socket port's option block becomes part of its
+        // mirror: record the argument the driver **accepted** — its reply's leading
+        // `INET_REP_OK` tag (`inet_drv.c:870`) — so an accepted socket can inherit it (see
+        // [`ops::inet_opts`]). The reply is read, never consumed: a refused `setopts` is the
+        // `Ok([0]einval)` reply and records nothing, and a failing call keeps its own path.
+        if ops::inet_opts::is_setopts_control(op) {
+            if let Ok(bytes) = &reply {
+                let _ = self.note_inet_setopts(id, arg, ops::inet_opts::setopts_succeeded(bytes));
+            }
+        }
         reply
     }
 
@@ -1674,6 +1717,13 @@ impl PortRegistry {
         // snapshot, because the port's metadata is already gone — is what keeps that reply.
         let completions = self.drain_io_completions(snapshot);
         self.pending_events.extend(completions);
+        // The teardown's round is a drive point for the `{active, …}` channel as well. A delivery
+        // staged for **this** port has no metadata any more, so the drain drops it — the
+        // completion channel's rule — while a delivery staged for another live port is held like
+        // any other pending work (see [`ops::active_input`]).
+        let active = self.drain_active_inputs();
+        self.pending_events
+            .extend(active.into_iter().map(|packet| PortEvent::ActiveInput { packet }));
         // `and` returns the teardown's error when it failed, and the notification's
         // otherwise — so a failure on either path reaches the caller.
         closed.and(notified)
@@ -1759,6 +1809,13 @@ impl PortRegistry {
             // is drained here — otherwise a completion awaiting the last port's teardown would
             // be stranded for ever.
             events.extend(self.drain_io_completions(None));
+            // That round minted the last port's close report, which is also a drive point for the
+            // `{active, …}` channel (see [`ops::active_input`]).
+            events.extend(
+                self.drain_active_inputs()
+                    .into_iter()
+                    .map(|packet| PortEvent::ActiveInput { packet }),
+            );
             return Ok(events);
         }
         let deadline = Instant::now() + timeout;
@@ -1825,6 +1882,13 @@ impl PortRegistry {
             // deferring the drain until something else looked non-empty would starve a caller
             // blocked on that very message (see [`completion`]).
             events.extend(self.drain_io_completions(None));
+            // The `{active, …}` channel is drained here too: a driver stages a delivery from the
+            // same `ready_input` callback a completion comes from (see [`ops::active_input`]).
+            events.extend(
+                self.drain_active_inputs()
+                    .into_iter()
+                    .map(|packet| PortEvent::ActiveInput { packet }),
+            );
             // The **line channel** is drained on *every* round, immediately after the tasks:
             // `take_line_notifications` empties every line-mode port's staged frames, so
             // deferring it until something else looked non-empty would lose them (see
@@ -3018,7 +3082,7 @@ impl PortHook for RuntimePorts {
         if spec.kind == PortName::SpawnDriver {
             // The driver name is the prefix up to the first blank — the C's own rule (`io.c` walks
             // the name to the first blank before matching `driver_name`), the same rule
-            // [`driver_lookup`] applies to build the `.so` candidates.
+            // [`driver_lookup`] applies to build the driver-object candidates.
             let (candidates, driver_name) = driver_lookup(&spec.command);
             // The registry borrow is taken for the **whole** arm: neither branch re-enters a port
             // operation (`register` starting a driver cannot re-enter the port table, and the
@@ -3387,6 +3451,19 @@ impl Runtime {
         let signal_server = self.code_server.atoms().lookup("erl_signal_server");
         let mut delivered = 0;
         for event in events {
+            // An `{active, …}` delivery is rendered in the port's **effective** data mode — the
+            // `{mode, …}` record its driver accepted (`inet_opts`), with the open-time stream as
+            // the fallback — so a `{mode,list}` socket renders a char list as the oracle's does.
+            // Resolved here, before `RuntimeContext` borrows `self`.
+            let active_mode = match &event {
+                PortEvent::ActiveInput { packet } => Some(
+                    self.ports
+                        .try_borrow()
+                        .map(|registry| registry.data_mode(packet.port, packet.data_mode))
+                        .unwrap_or(packet.data_mode),
+                ),
+                _ => None,
+            };
             // The term is built on the runtime's arena (the `RuntimeContext` the builders
             // need) *after* the registry borrow has been released — the same snapshot rule
             // the `-eval` poller follows. A driver-emitted term is stabilised the same way:
@@ -3447,6 +3524,25 @@ impl Runtime {
                         packet.port.to_eterm(),
                         ctx.completion_message(packet)?,
                     ),
+                    // An `{active, …}` delivery is rendered in the port's **effective** data mode —
+                    // the `{mode, …}` record its driver accepted ([`ops::inet_opts`]), with the
+                    // open-time stream as the fallback — so a `{mode,list}` socket renders a char
+                    // list as the oracle's does (see [`ops::active_input`]).
+                    PortEvent::ActiveInput { packet } => {
+                        let mode = active_mode.unwrap_or(packet.data_mode);
+                        let resolved = ops::active_input::ActiveInputPacket {
+                            port: packet.port,
+                            owner: packet.owner,
+                            data_mode: mode,
+                            kind: packet.kind,
+                            event: packet.event.clone(),
+                        };
+                        (
+                            packet.owner,
+                            packet.port.to_eterm(),
+                            ctx.active_input_message(&resolved)?,
+                        )
+                    }
                     // A handled signal goes to the `erl_signal_server` process by name, with the
                     // emulator (`system`) as the sender. An unregistered name resolves to no pid,
                     // in which case there is nobody to notify and the signal is dropped.
@@ -3580,6 +3676,29 @@ impl RuntimeContext<'_> {
                         continue;
                     }
                     messages.push(self.completion_message(&packet)?);
+                }
+                // An `{active, …}` input delivery. Same rule as the completion arm above: the
+                // evaluator observes only its **own** mailbox, so one addressed to another
+                // process is left to the scheduler route. The mode is resolved from the inet
+                // mirror, exactly as the scheduler route resolves it (see [`ops::inet_opts`]).
+                PortEvent::ActiveInput { packet } => {
+                    if packet.owner != self.pid() {
+                        continue;
+                    }
+                    let mode = self
+                        .runtime
+                        .ports
+                        .try_borrow()
+                        .map(|registry| registry.data_mode(packet.port, packet.data_mode))
+                        .unwrap_or(packet.data_mode);
+                    let resolved = ops::active_input::ActiveInputPacket {
+                        port: packet.port,
+                        owner: packet.owner,
+                        data_mode: mode,
+                        kind: packet.kind,
+                        event: packet.event.clone(),
+                    };
+                    messages.push(self.active_input_message(&resolved)?);
                 }
                 PortEvent::Signal { .. } => continue,
                 // A ready `tty_select/2` interest belongs in the **owning reader's** mailbox, which
@@ -3911,28 +4030,49 @@ fn driver_path_name(command: &str) -> &str {
 /// * a name that contains `/` is taken as the object's path, and the driver name validated against
 ///   the entry is the path's file stem with the platform suffix removed (`…/t` and `…/t.so` both
 ///   name the driver `t`). This is what lets a driver outside the loader's search path be reached;
-/// * a bare name is tried as itself, as `<name>.so` and as `./<name>` (the runtime's own
-///   directory), with `<name>` as the driver name — the C's answer for a name in its search path.
+/// * a bare name is tried as itself and as `./<name>` (the runtime's own directory), with `<name>`
+///   as the driver name — the C's answer for a name in its search path.
 ///
-/// `load_driver` appends the platform's shared-object suffix to a candidate that does not already
-/// carry it, so the `<name>` candidate resolves `<name>.so`. A name that reaches no object, or an
-/// object whose entry declares another name, is [`BeamError::BadArg`] at the call site — the oracle's
-/// own reason for an unknown driver.
+/// Every candidate is a **suffix-free spelling**, because the `dlopen` loader appends the platform's
+/// shared-object suffix unconditionally, exactly as the oracle does (`beam_abi::driver::loader::load`;
+/// `erts_sys_ddll_open` copies `FILE_EXT` after the given path,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`). So `…/t` and `…/t.so` both yield the
+/// candidate `…/t` (which the loader opens as `…/t.so`, never `…/t.so.so`), and a bare `foo.so` is
+/// searched as `foo`/`./foo` instead of as `foo.so.so` (the bare-name driver name stays the name as
+/// written). A name that reaches no object, or an object whose entry declares another name, is
+/// [`BeamError::BadArg`] at the call site — the oracle's own reason for an unknown driver.
 fn driver_lookup(name: &str) -> (Vec<String>, String) {
     let path = driver_path_name(name);
-    let mut candidates = vec![path.to_string(), format!("{path}.so")];
+    // The suffix-free spelling the loader expects — it appends the suffix itself, so a candidate
+    // that still carried one would be handed to `dlopen` as `<path>.so.so`.
+    let object = strip_shared_object_suffix(path);
+    let mut candidates = vec![object.to_string()];
     let driver_name = if path.contains('/') {
-        let base = std::path::Path::new(path)            .file_name()
+        let base = std::path::Path::new(path)
+            .file_name()
             .and_then(|stem| stem.to_str())
             .unwrap_or(path);
-        base.strip_suffix(".so").unwrap_or(base).to_string()
+        strip_shared_object_suffix(base).to_string()
     } else {
         // `dlopen` searches the loader's path for a name without a slash, never the current
         // directory, so the runtime's own directory is an explicit candidate.
-        candidates.push(format!("./{path}"));
+        candidates.push(format!("./{object}"));
         path.to_string()
     };
     (candidates, driver_name)
+}
+
+/// The platform shared-object suffix, i.e. what [`beam_abi::driver::loader::load`] appends to every
+/// path it is handed (`std::env::consts::DLL_SUFFIX`: `.so` on Unix, the oracle's `FILE_EXT`).
+const SHARED_OBJECT_SUFFIX: &str = std::env::consts::DLL_SUFFIX;
+
+/// `path` with one trailing shared-object suffix removed — the **suffix-free spelling** the driver
+/// loader expects, since [`beam_abi::driver::loader::load`] appends the platform's suffix
+/// unconditionally (`erts_sys_ddll_open`, `erl_unix_sys_ddll.c:104-118`). Only an *exact* trailing
+/// suffix is removed, so a driver object legitimately named `foo.so.1` is left alone (the oracle
+/// would open `foo.so.1.so`).
+fn strip_shared_object_suffix(path: &str) -> &str {
+    path.strip_suffix(SHARED_OBJECT_SUFFIX).unwrap_or(path)
 }
 
 /// The validated **non-empty** command/path a `{spawn, Cmd}`/`{spawn_executable, Path}` name

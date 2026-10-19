@@ -1891,13 +1891,34 @@ impl DriverHost for DriverPort {
     }
 }
 
+/// The shared-object suffix the `dlopen` loader appends to **every** candidate it is handed —
+/// `FILE_EXT` in the oracle (`erts_sys_ddll_open`, `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`)
+/// and `beam_abi::driver::loader`'s private `SHARED_OBJECT_SUFFIX`
+/// (`beam_abi/src/driver/loader.rs:111`, not re-exported — restated here as the platform fact it is,
+/// the same class as the hand-maintained `inet` wire codes).
+const DRIVER_SHARED_OBJECT_SUFFIX: &str = ".so";
+
+/// `candidate` with one trailing [`DRIVER_SHARED_OBJECT_SUFFIX`] removed — the **inverse** of what the
+/// loader does, so handing the result to the loader opens the file the candidate names.
+///
+/// Idempotent in the only sense that matters: `strip("x.so")` + the loader's append re-opens `x.so`,
+/// and `strip("x")` leaves `x` alone (the loader appends), so both spellings name one object.
+fn shared_object_stem(candidate: &str) -> &str {
+    candidate
+        .strip_suffix(DRIVER_SHARED_OBJECT_SUFFIX)
+        .unwrap_or(candidate)
+}
+
 /// Loads the driver shared object for `name`, trying each of `candidates` in order.
 ///
 /// The candidate spellings are the caller's (typically the driver name as written in
-/// `open_port({spawn_driver, Name}, …)`, then the explicit `<Name>.so`); the `dlopen` loader appends
-/// the platform's shared-object suffix when a candidate does not already carry it
-/// (`beam_abi::driver::loader::load`), so `["t", "t.so"]` resolves `<dir>/t.so` on the first and the
-/// second attempt alike, and `["/abs/t"]` resolves `/abs/t.so`.
+/// `open_port({spawn_driver, Name}, …)`, then the explicit `<Name>.so`). The `dlopen` loader appends
+/// the platform's shared-object suffix to **every** candidate unconditionally (the oracle's
+/// `erts_sys_ddll_open` copies `FILE_EXT` after the given name), so each candidate is normalized to
+/// its [`shared_object_stem`] first: `["t", "t.so"]` both resolve `<dir>/t.so`, and `["/abs/t"]`
+/// resolves `/abs/t.so`. Without that normalization a caller who spells the suffix — the runtime's
+/// own documented `…/t.so` form, and every fixture that loads a test driver by its object path —
+/// would ask the loader for `<dir>/t.so.so`.
 ///
 /// A failure is the loader's own typed [`DriverLoadError`] (its [`DriverLoadError::reason_atom`] is
 /// the oracle's `{error, Reason}` atom) — never a fabricated success and never a panic. The **last**
@@ -1921,7 +1942,7 @@ pub(crate) fn load_driver_at(
 ) -> std::result::Result<(DriverLibrary, String), DriverLoadError> {
     let mut last: Option<DriverLoadError> = None;
     for candidate in candidates {
-        match loader::load(candidate, name) {
+        match loader::load(shared_object_stem(candidate), name) {
             Ok(library) => return Ok((library, candidate.clone())),
             Err(error) => last = Some(error),
         }

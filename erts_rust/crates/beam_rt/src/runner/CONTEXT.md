@@ -66,13 +66,15 @@ characterisation and figures are in `PERF.md`).
   rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
   (the exit path) — whether the process **built** it or **received** it.
   The machine's `refc_binaries()` reservoir is **not** copied onto the running process: it is the one
-  holder of every payload the process's own compiled bitstring code built (it is append-only and
-  `Machine::reset` never clears it), so `erlang:process_info(Pid, binary)` reads it straight through
-  `RunnerState::reservoir_at(pid)` and the process's own off-heap table stays empty. That is what keeps
-  `beam_gc::OffHeap`'s never-compacted slot space out of the per-call path — mirroring the reservoir
-  onto the PCB handed that space a slot per payload per slice, and the O(slots)
-  `overhead_bytes`/`sweep` walks it implies made a build-a-binary loop quadratic in its own iteration
-  count. `Runtime::eval_off_heap` is likewise not attributed to any process: it is the pid-less
+  holder of every payload the process's own compiled bitstring code built, so
+  `erlang:process_info(Pid, binary)` reads it straight through `RunnerState::reservoir_at(pid)` and the
+  process's own off-heap table stays empty. That is what keeps `beam_gc::OffHeap`'s never-compacted slot
+  space out of the per-call path — mirroring the reservoir onto the PCB hands that space a slot per
+  payload per slice, and the O(slots) `overhead_bytes`/`sweep` walks it implies make a build-a-binary
+  loop quadratic in its own iteration count. The reservoir is **pruned, not accumulated**: the `Yield`
+  arm reclaims every payload the parked process's roots no longer reach once its binary virtual heap
+  triggers (see *The off-heap refc-binary reclamation at the slice boundary*).
+  `Runtime::eval_off_heap` is likewise not attributed to any process: it is the pid-less
   `-eval` store.
 * [`budget`] — the slice's reduction budget and the wrapper context that charges it: `BudgetProbe`
   with **two** charging primitives, `charge()` (the **refusing** one: spends a unit or hands back the
@@ -258,6 +260,19 @@ so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved an
 instead of tripping the valve, whether the process built it or received it; a reason that genuinely
 cannot be copied is still the honest `error:system_limit`, never a stored dangling word.
 
+## The off-heap refc-binary reclamation at the slice boundary
+`run.rs`'s `Yield` arm is the **one** site that prunes the machine's payload reservoir: `RuntimeRunner::reclaim_off_heap_binaries` (`run.rs:367`) → `context::gc::reclaim`, called immediately after `collect_at_reds_boundary` and before `take_max_heap_kill` on the same park (`run.rs:1214`).
+It is here because a prune is sound only against the process's **complete** root set, and the park is the one site holding `&mut Machine` (the runner just drove it), `&mut Process` (through the table) and `&mut Runtime` at once; a heap-admission door runs *inside* a slice, where the engine is held out of `RunnerState::engines` and the `ExecutionContext` seam exposes no `&mut Machine` at all.
+`reclaim_off_heap_binaries` refuses unless `engine.parked_published` — the park's own contract that the machine's whole root set was handed to the process.
+`Process::has_unpublished_roots()` is deliberately **not** the gate: it is `true` for a `Running` process, which a pre-empted process still is.
+The state it needs is per process engine (`ProcessEngine::off_heap`, built lazily from `process.collector().policy()` so a `+hms`/`+hbm*` policy is honoured and dead with the machine), so one call reaches `&mut machine` and `&mut off_heap` without a second table.
+The gates themselves — relocation exemption, `gc_process_enabled`, the bin-vheap trigger, the collection valve, the prune-only valve, the reachability walk — and the release predicate are [`../context/CONTEXT.md`](../context/CONTEXT.md) *The off-heap refc-binary reclamation*; every one of them is a decline, so this call never fails a program.
+Per-slice cost on a non-triggered bin vheap is **one cached observation**: `OffHeapReclaimer::observe` returns the recorded overhead while the reservoir's handle count has not moved, so `Machine::off_heap_overhead_bytes` (`O(reservoir)`) is read only when it moved or once per triggered prune.
+**Residuals — each a leak, never a dangle.** The `Wait` arm does not prune: a `receive` park is relocation-exempt and publishes nothing, so the machine stays the authoritative root set and the process's roots would be stale by construction — a process that blocks forever keeps its reservoir until its machine drops, and one that wakes and yields again prunes then.
+A declined prune retains the whole reservoir, and the `-eval` route never prunes at all (its machine is not in `RunnerState` and allocates on the pointer-stable arena, so its park publishes nothing).
+A slice that never pre-empts never prunes either — the cadence is the **park** cadence, so a payload-building loop whose body crosses no refusing seam at all is not pruned until it parks, its envelope then bounded by one slice's worth of payloads.
+What is measured, and where the figures live: `erlang:memory(binary)` (`binary_alloc`'s live bytes) and the process's RSS across a build-a-binary loop, against the oracle's — the measured envelope and its caveats are [`../../CONTEXT.md`](../../CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, whose suite is [`../../tests/off_heap_reclaim.rs`](../../tests/off_heap_reclaim.rs) (the bench driver's [`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md) carries the loop workloads' RSS).
+The end-to-end figures on a real workload — `emqx_base62:encode/1` on the unmodified EMQX module, `PRE-FIX` vs `POST-FIX` vs the oracle, all from the identical `.beam` — are *Measured* below.
 ## Per-slice (not per-instruction) host cost
 Beyond the `BudgetContext` charges (a per-instruction `reduce` on the interpreter tier, the two
 `ensure_heap` doors, and a per-BIF/per-call `spend` on the native tier), one slice's prologue/epilogue
@@ -277,10 +292,12 @@ per-iteration):
   (`min(x.len(), MAX_REG)` = up to 1024 words, `beam_process::registers::MAX_REG`) plus the whole
   Erlang stack plus the live FR prefix onto the process's root set. An exempt window — the `Wait`
   arm, and a `Yield` arm whose slice ended with a live FR prefix — skips the copy entirely.
-* **Amortized O(1):** nothing — the off-heap payloads a machine builds need no per-slice work at all:
-  its `Machine::refc_binaries` reservoir is the roster `process_info(Pid, binary)` reads
-  (`RunnerState::reservoir_at`), so no slot is ever handed out on the process's own (never-compacted)
-  off-heap table.
+* **Amortized O(1):** the off-heap trigger — `Machine::off_heap_overhead_bytes` is `O(reservoir)` and is
+  read only when the reservoir's handle count moved, or once per triggered prune, so a slice that built
+  no off-heap payload pays one cached observation; the payloads themselves need no per-slice work at all,
+  since no slot is ever handed out on the process's own (never-compacted) off-heap table, and the
+  reservoir is pruned only on a triggered `Yield` park (see *The off-heap refc-binary reclamation at the
+  slice boundary*).
 * **First entry / flag-gated only:** `record_baseline_code` (`run.rs:692-694`, `+JPperf` only), the
   `Arc::clone` of the entry module (`run.rs:413-420`), and `describe_site` (debug-trace only).
   `source_payloads` (`run.rs:840-842`/`970-971`) runs only on the terminating `Returned`/`Err` arms.
@@ -490,8 +507,8 @@ the rounds; host `/proc/loadavg` 1.0–2.5):
 | `emqx_base62_encode` | 10 512 ns | 206.3 ns | 51.0× |
 | `emqx_base62_decode` | 10 111 ns | 282.5 ns | 35.8× |
 
-The per-call cost of a build-a-binary loop is **no longer this table's figure** — the per-slice off-heap
-mirror is gone — so the current controlled A/B is [`../../PERF.md`](../../PERF.md) *The per-call cost is
+The per-call cost of a build-a-binary loop is **not** this table's figure — there is no per-slice
+off-heap mirror — so the controlled A/B is [`../../PERF.md`](../../PERF.md) *The per-call cost is
 independent of the iteration count* (`BEFORE` `3aa42c0e41` → `AFTER` `72d778dcf1`:
 `emqx_base62_encode` **138 544.3 → 5 667.6 ns/call** at `loadavg` 18–89, `decode` 20 698.3 → 10 028.7).
 
@@ -509,6 +526,26 @@ off-heap literal — not a container in a region the collector does not scan at 
 valve never declines, the descent latch stays closed, and the retired chain stays collapsed
 instead of growing with the iteration count. A constant payload a module *builds* would instead be
 a foreign container that forwards nothing scanned: also inert, so also collected.
+
+### The off-heap reclamation end to end — `emqx_base62:encode/1` on the unmodified EMQX module (`PRE-FIX` `dc63fd7f49` → `POST-FIX`)
+All three legs run the **identical** `.beam` — the unmodified `emqx_base62.erl` plus a driver loop — release builds, this runtime's default execution tier, **21 interleaved rounds** each.
+`PRE-FIX` is `dc63fd7f49`, the commit immediately before the reclamation change; the oracle is the system ERTS (`erl` on `PATH`, OTP 29.1.1 / erts-17.1) at its own loop count.
+The estimator is the **startup-cancelled paired marginal**, `median(wall@N − wall@0)/N`, each round sampling the `N`-op and the `0`-op pass **back to back**; rust loops are `N` = **60 000**, the oracle's `N` = **3 000 000**.
+The host is **shared and loaded** (`/proc/loadavg` 7–19 across the session), so the ratios here and the memory figures are the durable signal and the absolute wall times are not.
+These are **measured** figures rather than ones a test asserts: the mechanism's in-repo pin is the per-fixture suite named at the end of this section.
+
+| leg | ns/call | `erlang:memory(binary)` @N=1 000 | @N=10 000 | `VmHWM` @N=10 000 | `VmHWM` @N=600 000 |
+|---|---:|---:|---:|---:|---:|
+| `PRE-FIX` (`dc63fd7f49`) | 6 901.8 | 1 072 000 B | 10 720 000 B | 132.1 MB | 878.7 MB |
+| `POST-FIX` (HEAD) | 6 110.6 | 272 288 B | 315 168 B | 119.9 MB | 119.8 MB |
+| system-ERTS oracle | 223.4 | ~22 000 B | ~21 000–32 000 B | 69.9–70.9 MB | — |
+
+**The leak removed is exactly 1 072 B per call** — a 1 024-byte payload plus its 48-byte off-heap header — and it is perfectly linear pre-fix (`1 072 000` → `10 720 000` over the 10× step), so a process doing 10 M encodes holds ~10 GB.
+Post-fix that same step — **9 000 extra calls** — adds **42 880 B**, a one-off heap growth and not a per-call trend, and the RSS is **flat**: `VmHWM` 119.9 MB at N = 10 000 against 119.8 MB at N = 600 000 (a 60× step), where the pre-fix side goes 132.1 → 878.7 MB.
+**Throughput:** `POST/PRE` = **0.885** and the independent 9-round pass' **0.958** agree in direction, but the size is load-dominated, so only a **4–12 %** speed-up is claimed; `POST/oracle` is **27.4×** against `PRE/oracle`'s **30.9×**.
+**This is a memory fix, not a throughput fix**: the leaked payloads were unreferenced and never traversed, so the pre-fix leak cost no measurable time and there is **no throughput cliff at 878 MB**.
+The per-fixture envelope — the N-step figures, the sawtooth ladder, the disabled-site A/B and the retained-payload half of [`../../tests/off_heap_reclaim.rs`](../../tests/off_heap_reclaim.rs) — lives in [`../../CONTEXT.md`](../../CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, which owns those figures.
+The `emqx_base62_encode` row of the `foreign` table above is the `bench` driver's own 8-round minimum-of-rounds pass at its own loop count, so its `rust/sys` ratio is not a like-for-like pair with this table's interleaved paired marginal; read each with its own method paragraph.
 
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.
@@ -578,6 +615,7 @@ a foreign container that forwards nothing scanned: also inert, so also collected
   show at least one — the run route's "never sleep while it has work" half and the anti-spin half. The
   syscall test skips loudly without `strace`; the value test skips loudly without an oracle.
 * Crate gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt`.
+  The off-heap prune's own suite lives with its module ([`../context/gc/bin_vheap.rs`](../context/gc/bin_vheap.rs)); what this node must keep true around it is the park contract — a non-publishing window is refused before any work, and the call sits after the boundary collection and before the heap-kill drain.
 
 ## Known Issues / Handoffs
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like
@@ -642,6 +680,7 @@ dispatch — the invariant `../context/position.rs:67-69` relies on.
 | `../context/gc.rs:1034` `ensure_heap` (narrow) | **no engine call site** (`gc.rs:1807`) | `x[..live]` + stack, **no FR file**; float-guarded | `armed` |
 | `../context/gc/reds_door.rs:176` `collect_at_reds_boundary` | `run.rs:1249` (the `Yield` arm only) | `RootSet::ALL_LIVE`: **all 1024 x slots** + whole stack + `fr[..fr_count]` (`reds_door.rs:279` → `gc.rs:786`) | `run.rs:337 parked_published`, `gc_process_enabled`, 4 000-red interval, `is_relocation_exempt`, 7/8 occupancy or `collection_debt`, valve |
 | `../context/gc.rs:1465` `alloc_words` | anywhere | **never collects** (grow + retry, else arena) | — |
+The slice-boundary off-heap prune is **not** a collection site and gets no row: it relocates nothing and publishes nothing of its own, it runs immediately after `collect_at_reds_boundary` on the same `Yield` park, and it prunes the machine's payload reservoir rather than a heap — see *The off-heap refc-binary reclamation at the slice boundary*.
 Out of slice, `ProcessTable::deliver`/`enqueue_exit_signal`/`grow_receiver_for_signal` relocate a
 **non-running** receiver only (`beam_process/src/ptab.rs:197`, `:243`, `:2661`, `:2715` all refuse on
 `has_unpublished_roots()`, which is `relocation_exempt || Running`), so they cannot touch a running
@@ -664,7 +703,8 @@ term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mail
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
   `RuntimeRunner`).
 * `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`, the park's published
-  FR-prefix count `fr_published` and the park's publish/skip flag `parked_published`) + `RunnerState`
+  FR-prefix count `fr_published`, the park's publish/skip flag `parked_published` and the per-process
+  binary virtual heap `off_heap: Option<OffHeapReclaimer>`) + `RunnerState`
   (the `jit_mode` field, the `jit_mode()` accessor and the `reservoir_at(pid)` read-only off-heap
   roster seam).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
@@ -674,7 +714,8 @@ term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mail
   the
   return-value / exit-reason stabilization (whose `SourcePayloads` come from
   `Runtime::source_payloads` — the machine's handles unioned with the pid's retained mailbox
-  off-heap families).
+  off-heap families), and the `Yield` arm's slice-boundary off-heap prune
+  (`reclaim_off_heap_binaries`).
 * `budget.rs` → the reduction budget + the charging wrapper context: `BudgetProbe::charge` (the
   **refusing** primitive — one charge per interpreted instruction and per `ensure_heap` door, the only
   charge a native block's *slice* can end on) and `BudgetProbe::spend` (the **pricing**, never-refusing

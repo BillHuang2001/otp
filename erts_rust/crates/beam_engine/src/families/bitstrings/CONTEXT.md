@@ -238,7 +238,7 @@ registry entry's capacity is refreshed); a `Moved(rel)` outcome reallocates at `
 `raw::republish_over` rewrites the accumulator's own `[BinRef][ErlSubBits]` pair over the new base
 (the same `Eterm`, the same `start`/`end` window) and the registry is re-keyed
 (`Machine::rekey_writable`). The door is consulted **only on a shortfall** (it scans the machine's
-payload roster), and `compact()` is deliberately not on the append path.
+payload roster), and `Machine::retain_refc_binaries` is deliberately not on the append path.
 
 Promotion, not failure, covers what growth cannot do. A payload `beam_alloc` will not relocate (a
 shared handle — C's `erts_pin_writable_binary` situation — or the `max_capacity` cap), a payload a

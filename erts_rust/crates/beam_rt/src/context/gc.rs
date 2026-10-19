@@ -158,12 +158,17 @@ use crate::RuntimeContext;
 ///
 /// It is re-exported here (rather than called by its own path at each site) so the three
 /// admission-point call sites and the runner's park arm cannot drift onto different valves.
-pub(crate) use super::gc_walk::{any_root_is_unscanned, valve_verdict};
+pub(crate) use super::gc_walk::{any_root_is_unscanned, reaches_an_unscanned_word, valve_verdict};
 mod reds_door;
 /// The **reduction/yield-boundary** collection point — the slice-end door a workload whose loop
 /// reaches no heap-admission point still gets collected at (see the module docs of
 /// [`reds_door`], and [`crate::runner::RuntimeRunner`]'s pre-emption arm for the call site).
 pub(crate) use reds_door::collect_at_reds_boundary;
+mod bin_vheap;
+/// The **off-heap refc-binary reclamation** point — the slice-end prune of the engine machine's
+/// payload reservoir, gated by the process's binary virtual heap (see [`bin_vheap`]'s module docs
+/// for why the park arm is its only sound site).
+pub(crate) use bin_vheap::{reclaim, OffHeapReclaimer};
 /// Whether `module`'s code contains any **float-family** instruction, i.e. anything that
 /// reads or writes the machine's float-register file
 /// ([`Machine::fr`](beam_engine::Machine)).

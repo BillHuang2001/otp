@@ -389,9 +389,11 @@ fn open_bind_and_close_round_trip() {
 fn open_rejects_a_second_socket() {
     let mut rig = Rig::new();
     rig.open();
+    // The C's `inet_ctl_open` answers its sequence error while the state is not `CLOSED`
+    // (`inet_drv.c:5130`-`:5131`), and the datagram driver calls that same function.
     assert_eq!(
         rig.control("open", &open_arg()).expect("second open"),
-        ctl_xerror("einval"),
+        ctl_xerror("exbadseq"),
     );
 }
 

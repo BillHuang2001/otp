@@ -28,9 +28,9 @@
 use super::wire::InetAddr;
 use super::{
     ctl_error, ctl_ok, ctl_xerror, errno_name, make_tcp_inet, parse_address, socket_fd, InetState,
-    PeerClose, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK,
-    INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT, INET_REP_OK,
-    INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
+    PeerClose, CloseSource, ReadReport, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET,
+    INET_AF_LOOPBACK, INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT,
+    INET_REP_OK, INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 use crate::completion::{CompletionEvent, InetReason, InetReply, PortCompletion};
 use crate::driver::{Driver, DriverContext, DriverFlags, PortArms};
@@ -296,31 +296,59 @@ fn the_peer_close_answers_once_per_direction() {
     assert_eq!(close.recv_reply(), None);
     assert_eq!(close.send_reply(), None);
 
-    // The close is observed: each direction reports it exactly once, then `enotconn` forever.
-    close.observe();
-    assert_eq!(close.recv_reply(), Some("closed"));
+    // A **write** discovers a clean close: it arms both one-shots
+    // (`tcp_send_or_shutdown_error`, `inet_drv.c:13662`/`:13678`), so each direction reports
+    // `closed` exactly once and `enotconn` forever after.
+    close.observe(CloseSource::Write { reset: false });
     assert_eq!(close.send_reply(), Some("closed"));
-    assert_eq!(close.recv_reply(), Some("enotconn"));
+    assert_eq!(close.recv_reply(), Some("closed"));
     assert_eq!(close.send_reply(), Some("enotconn"));
     assert_eq!(close.recv_reply(), Some("enotconn"));
+    assert_eq!(close.send_reply(), Some("enotconn"));
 
     // The two directions are independent: a `send` that is what discovered the close does not
     // consume the receive direction's one-shot `closed` (the C's `tcp_send_error` ->
     // `tcp_recv_closed` path, which is how a caller that ignores its send errors still learns
     // about the close from its next receive).
     let mut close = PeerClose::default();
-    close.observe();
+    close.observe(CloseSource::Write { reset: false });
     assert_eq!(close.send_reply(), Some("closed"));
     assert_eq!(close.recv_reply(), Some("closed"));
     assert_eq!(close.send_reply(), Some("enotconn"));
     assert_eq!(close.recv_reply(), Some("enotconn"));
+
+    // A **reset** under `{show_econnreset,true}` turns both `closed`s into `econnreset`, and the
+    // send ladder deliberately leaves `TCP_ADDF_DELAYED_ECONNRESET` armed for the next receive
+    // (`inet_drv.c:12685`'s comment), so a receive after a send still reports the reset.
+    let mut close = PeerClose::default();
+    close.observe(CloseSource::Write { reset: true });
+    assert_eq!(close.observed_atom(), "econnreset");
+    assert_eq!(close.send_reply(), Some("econnreset"));
+    assert_eq!(close.recv_reply(), Some("econnreset"), "the reset bit survives a send");
+    assert_eq!(close.send_reply(), Some("enotconn"));
+    assert_eq!(close.recv_reply(), Some("enotconn"));
+
+    // A **read**-discovered reset (`tcp_recv_error`, `inet_drv.c:12849`) arms nothing at all: the
+    // operation that found it reports `econnreset` inline, and both ladders are `enotconn` after.
+    let mut close = PeerClose::default();
+    close.observe(CloseSource::Read {
+        reset: true,
+        report: ReadReport::Answered,
+    });
+    assert_eq!(close.observed_atom(), "econnreset");
+    assert_eq!(close.recv_reply(), Some("enotconn"));
+    assert_eq!(close.send_reply(), Some("enotconn"));
 }
 
 /// Once the peer's end goes away the driver **latches** the close: the
 /// [`TcpInetDriver::peer_closed`] accessor the runtime reads becomes true, the socket's poller
 /// registration is released (a dead descriptor must not keep reporting readiness), and the
-/// connection's [`InetState`] is deliberately **unchanged** — only the read half is gone, so
-/// answering `closed` the way the oracle does stays the verb layer's job.
+/// connection is **torn down** — a passive socket reads a close under the default
+/// `{exit_on_close,true}`, so the C runs `tcp_desc_close` → `erl_inet_close` (`inet_drv.c:12825`,
+/// `:5098`-`:5117`), which clears `INET_STATE_CONNECTED` (`:5078`) and sets
+/// `INET_STATE_CLOSED` (`:5106`). The reply ladders survive that teardown: the C keeps
+/// `desc->tcp_add_flags` across `tcp_desc_close`, so each direction still answers its one-shot
+/// `closed` before the bare `enotconn`.
 #[test]
 fn a_peer_close_is_observable_through_the_accessor() {
     let listener = loopback_listener();
@@ -360,8 +388,10 @@ fn a_peer_close_is_observable_through_the_accessor() {
     assert!(driver.eof());
     assert_eq!(
         driver.state(),
-        InetState::Connected,
-        "only the read half is gone, so the state is unchanged"
+        InetState::Closed,
+        "a passive close under the default `{{exit_on_close,true}}` tears the descriptor down \
+         (`inet_drv.c:12825` -> `erl_inet_close` `:5098`-`:5117`: `:5078` clears CONNECTED, \
+         `:5106` sets CLOSED), so the connection state is gone, not merely half-closed"
     );
     assert_eq!(
         driver.control(&mut ctx, "recv", b"").expect("the recv verb"),
@@ -484,11 +514,12 @@ fn unknown_verbs_and_malformed_arguments_are_bad_arg() {
     assert!(matches!(verb("listen", &[9]), Err(BeamError::BadArg)));
     assert!(matches!(verb("bind", &[]), Err(BeamError::BadArg)));
     assert!(matches!(verb("connect", b""), Err(BeamError::BadArg)));
-    // A second `open` is the operational `einval` (the C would leak the first socket
-    // here, so this floor refuses instead).
+    // A second `open` is the C's sequence error (`inet_ctl_open`'s
+    // `state != INET_STATE_CLOSED ⇒ ctl_xerror(EXBADSEQ)`, `inet_drv.c:5130`-`:5131`),
+    // and a live socket is never replaced (so never leaked).
     assert_eq!(
         verb("open", &open_arg()).expect("a reply"),
-        b"\x00einval".to_vec()
+        b"\x00exbadseq".to_vec()
     );
     registry.close(&mut poller, id).expect("closes");
 }

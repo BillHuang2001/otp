@@ -52,7 +52,11 @@
 //! terms a table hands back: a [`beam_ets::Table`]'s term storage is a
 //! **never-relocating bump arena** of stable block pointers, so moving the `Table`
 //! handle does not move any term, and the aliased object/key is copied onto the
-//! caller's heap ([`beam_message::copy_struct_simple`]) before it is returned.
+//! caller's heap ([`beam_message::copy_struct_simple`], [`copy_out`]/
+//! [`copy_out_list`]) before it is returned — unless the host installed the
+//! table-alias witness ([`BifContext::with_table_aliasing`]), in which case the
+//! helpers return the table's own terms and the **host** performs that one copy
+//! (see [`copy_out`]).
 //!
 //! # `ets:info/1,2` and the info-field set
 //!
@@ -1599,14 +1603,54 @@ pub(super) fn restore_table(ctx: &mut BifContext<'_>, handle: u64, table: Table)
     Ok(())
 }
 
-/// Copies `term` — which may alias table-owned storage — onto the caller's heap.
+/// Returns `term` — which may alias table-owned storage — as the BIF's result.
+///
+/// With a table-alias witness installed ([`BifContext::alias_table_storage`],
+/// i.e. [`BifContext::with_table_aliasing`]) the term is handed back **unchanged**
+/// and the witness is set: it still points into `beam_ets`'s `TermStore`, so the
+/// host must copy it out exactly once before any other table operation or heap
+/// collection (and nothing may be allocated on `ctx.heap()` for it). That is the
+/// single-copy route: the host's own copy-out is the only copy.
+///
+/// Without a witness the term is copied onto `ctx.heap()`
+/// ([`beam_message::copy_struct_simple`]) exactly as before, so no returned `Eterm`
+/// aliases table storage — the invariant of `./ets/CONTEXT.md`.
+///
+/// The witness is set even when `term` happens to hold no table-owned words (an
+/// immediate: a small int, an atom, `[]`), so the host's copy-out is unconditional
+/// rather than a guess.
+///
+/// # Errors
+///
+/// Propagates the copying path's allocation failure (`beam_message`).
 pub(super) fn copy_out(term: Eterm, ctx: &mut BifContext<'_>) -> Result<Eterm> {
+    if let Some(witness) = ctx.alias_table_storage() {
+        witness.set(true);
+        return Ok(term);
+    }
     beam_message::copy_struct_simple(term, ctx.heap())
 }
 
-/// Copies every object of a table-aliasing vector onto the caller's heap and
-/// returns them as a list.
+/// Returns every object of a table-aliasing vector as a list.
+///
+/// With a table-alias witness installed the objects are **not** copied: the result
+/// is only the list **spine** ([`BifContext::list`], 2 words per object) over the
+/// table's own object roots, and the witness is set so the host copies the graph
+/// out exactly once (before any other table operation or heap collection).
+///
+/// Without a witness every object is copied onto `ctx.heap()`
+/// ([`beam_message::copy_struct_simple`]) and the spine is built over those copies
+/// — today's behaviour, with no returned `Eterm` aliasing table storage.
+///
+/// # Errors
+///
+/// Propagates the copying path's per-object failure and the spine's allocation
+/// failure.
 pub(super) fn copy_out_list(objects: Vec<Eterm>, ctx: &mut BifContext<'_>) -> Result<Eterm> {
+    if let Some(witness) = ctx.alias_table_storage() {
+        witness.set(true);
+        return ctx.list(&objects);
+    }
     let mut copied = Vec::with_capacity(objects.len());
     for object in objects {
         copied.push(beam_message::copy_struct_simple(object, ctx.heap())?);

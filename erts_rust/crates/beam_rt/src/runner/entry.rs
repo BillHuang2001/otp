@@ -181,6 +181,22 @@ pub(super) struct ProcessEngine {
     /// [`Tier::Interpreter`] (its first entry overwrites it), which is also the always-correct
     /// value if a tier were ever read before that entry.
     pub(super) tier: Tier,
+    /// The process's off-heap **binary virtual heap** state — the budget
+    /// (`beam_gc::BinVheap`, the C `p->bin_vheap_sz`) and the running overhead figure the
+    /// slice-boundary reclamation compares it against, plus the reservoir observation pair that
+    /// keeps that comparison `O(1)`.
+    ///
+    /// It lives **here** because this struct is the one per-pid runtime state the runtime owns: it
+    /// is created with the machine ([`RunnerState::spawn`]) and dies with it, so the budget's
+    /// lifetime is exactly the payload reservoir's — and the reclamation site
+    /// ([`RuntimeRunner::reclaim_off_heap_binaries`](super::RuntimeRunner)) already holds
+    /// `&mut ProcessEngine`, hence both `&mut machine` and `&mut off_heap` in one call without a
+    /// second table.
+    ///
+    /// `None` until the first park reaches the reclamation, which builds it from
+    /// `process.collector().policy()` — so a `+hms`/`+hbm*`/`spawn_opt` heap policy is honoured and
+    /// a process that never builds off-heap payloads never pays for one.
+    pub(super) off_heap: Option<crate::context::gc::OffHeapReclaimer>,
 }
 
 /// The per-pid engine state and recorded outcomes of every process the runtime spawned.
@@ -246,6 +262,9 @@ impl RunnerState {
                 // Only a placeholder: the process's first entry selects the real tier and
                 // writes it here (see the field docs).
                 tier: Tier::Interpreter,
+                // Built on the first park that reaches the reclamation, from the process's own
+                // heap policy (see the field docs).
+                off_heap: None,
             },
         );
     }
@@ -298,8 +317,12 @@ impl RunnerState {
     /// [`Machine::refc_binaries`] is the one holder of the off-heap payloads a process's
     /// compiled bitstring code builds: the engine appends every binary it materializes above
     /// [`ERL_ONHEAP_BINARY_LIMIT`](beam_term::refc::ERL_ONHEAP_BINARY_LIMIT) and
-    /// [`Machine::reset`] never clears them, so the reservoir is the process's cumulative
-    /// off-heap payload roster. It is what `erlang:process_info(Pid, binary)` reports
+    /// [`Machine::reset`] never clears them, so the reservoir is the process's off-heap payload
+    /// roster. It is **not** append-only in practice: it is pruned at the slice boundary
+    /// whenever the process's binary virtual heap triggers
+    /// ([`crate::context::gc::reclaim`] via `RuntimeRunner::reclaim_off_heap_binaries`), which
+    /// releases every payload no live root reaches — so the roster no longer grows with the
+    /// process's whole allocation history. It is what `erlang:process_info(Pid, binary)` reports
     /// ([`crate::native::memory`]) — read here rather than mirrored onto the process, because
     /// the PCB's own off-heap table is a never-compacted slot space whose per-call scans
     /// would otherwise grow with every payload the process ever built.

@@ -22,21 +22,17 @@
 //! `zlib:gzip/1` and `zlib:gunzip/1`.
 //!
 //! `zlib:zip/1`/`zlib:unzip/1` are the **raw** (RFC 1951, header-less and
-//! checksum-less) pair, and the bytes of what `zip/1` emits are the encoder's, not
-//! zlib's, so what is pinned here is:
+//! checksum-less) pair. Every encoder byte is the oracle's, so what is pinned here is:
 //!
-//! * the two oracle goldens, byte for byte (`zlib:zip(<<"hello">>)` is
+//! * the oracle goldens, byte for byte (`zlib:zip(<<"hello">>)` is
 //!   `<<203,72,205,201,201,7,0>>` and `zlib:zip(<<>>)` is `<<3,0>>`, verified live
 //!   against OTP 29.1.1 / erts-17.1);
-//! * `zlib:compress/1`'s byte-exact goldens for **short** bodies (
-//!   `compress_matches_the_oracle_byte_for_byte_on_short_bodies`) and, for a
-//!   repetitive body, the *shape* instead of the bytes: the RFC 1950 header, the
-//!   Adler-32 trailer and both round trips
-//!   (`a_repetitive_body_diverges_in_size_but_stays_a_valid_stream_both_ways`).
-//!   The size divergence on repetitive bodies is the documented A.7 gap — the
-//!   deflate body is `miniz_oxide`'s block-type choice, not the oracle's
-//!   `deflate_slow` one; no level reproduces it and no input is special-cased
-//!   (`src/zlib.rs`, "Byte identity is not promised; interoperability is");
+//! * `zlib:compress/1`'s byte-exact goldens for short bodies
+//!   (`compress_matches_the_oracle_byte_for_byte_on_short_bodies`) **and** for
+//!   repetitive ones, where the block-type choice is the interesting part
+//!   (`a_repetitive_body_is_the_oracles_bytes_whole` pins the oracle's 17-byte
+//!   fixed-Huffman stream for 1024 zero bytes, and the 108-byte stream for
+//!   `list_to_binary(lists:seq(1,100))`);
 //! * the full error-class matrix (`badarg` for a non-iodata argument, the bare
 //!   `error:data_error` for a stream the inflater cannot finish — with **no** length
 //!   arm, unlike `uncompress/1`);
@@ -47,6 +43,7 @@
 //!   reaches a dynamic block, rather than assuming it);
 //! * a **live cross-check against the system oracle** — streams the system `erl`'s own
 //!   `zlib:zip/1` produced, one of them long enough (> 1 KiB) to need dynamic Huffman.
+//!   `tests/zlib_oracle.rs` extends that to all six functions over a bounded corpus.
 //!
 //! The tests drive only the public API — [`BifRegistry`]/[`BifContext`] plus the
 //! declared dependency crates (`beam_alloc` for the heap, `beam_codec` for the zlib
@@ -202,13 +199,12 @@ fn assert_data_error(result: Result<Vec<u8>>, what: &str) {
 // `zlib:compress/1` — the zlib-wrapped encoder
 // ---------------------------------------------------------------------------
 
-/// `zlib:compress/1` is byte-identical to the oracle **only** for bodies both encoders
-/// turn into a single fixed-Huffman block.
+/// `zlib:compress/1` reproduces the oracle's bytes for short bodies.
 ///
 /// All six payloads are oracle-verified goldens (OTP 29.1.1 / erts-17.1, real libz):
-/// a short body is one fixed-Huffman block in zlib's `deflate_slow` *and* in
-/// miniz_oxide, so the two agree byte for byte. The block type is asserted as the
-/// *reason* the bytes coincide, not as an extra guess.
+/// a short body is one fixed-Huffman block in zlib's `deflate_slow` *and* in this
+/// crate's port of it, so the two agree byte for byte. The block type is asserted as
+/// the *reason* the bytes coincide, not as an extra guess.
 #[test]
 fn compress_matches_the_oracle_byte_for_byte_on_short_bodies() {
     let mut fx = Fixture::new();
@@ -242,19 +238,16 @@ fn compress_matches_the_oracle_byte_for_byte_on_short_bodies() {
     }
 }
 
-/// The **documented A.7 divergence** for a repetitive body, pinned by shape rather than
-/// by bytes.
+/// A repetitive body is the oracle's bytes too, not just a stream of the right shape.
 ///
 /// `zlib:compress(<<0:8192>>)` (`<<0:8192>>` is 8192 *bits* = 1024 zero bytes) is 17 bytes
-/// in the oracle — one **fixed-Huffman** block — and 23 bytes here — one **dynamic-Huffman**
-/// block (`miniz_oxide` 0.9.1 at the default level 6 of `zlib:compress/1`). The zero run
-/// is not special-cased anywhere: the whole level range was swept (`src/zlib.rs` module
-/// docs) and no level reproduces the oracle's 17 bytes, because the block-type/lazy-match
-/// choice is the encoder's, not a knob `flate2`'s `rust_backend` exposes. What *is* pinned
-/// is the RFC 1950 framing (header and Adler-32 trailer, the latter taken from the crate's
-/// own `erlang:adler32/1` BIF) and both round trips — including the oracle's own stream.
+/// under OTP 29.1.1 / erts-17.1 — one **fixed-Huffman** block — and the encoder here
+/// picks the same block for the same reason (`static_lenb == opt_lenb`), so both the
+/// bytes and the block type are pinned. The same holds for the medium body
+/// `list_to_binary(lists:seq(1,100))`, which is a 108-byte fixed-Huffman stream in the
+/// oracle.
 #[test]
-fn a_repetitive_body_diverges_in_size_but_stays_a_valid_stream_both_ways() {
+fn a_repetitive_body_is_the_oracles_bytes_whole() {
     let mut fx = Fixture::new();
     let data = vec![0u8; 1024];
 
@@ -270,38 +263,18 @@ fn a_repetitive_body_diverges_in_size_but_stays_a_valid_stream_both_ways() {
 
     let stream = fx.compress(&data);
     assert_eq!(
-        stream.len(),
-        23,
-        "miniz_oxide's size for this body (the oracle's is {})",
-        ORACLE.len()
+        stream,
+        ORACLE.to_vec(),
+        "the whole stream — block type, body and Adler-32 trailer — is the oracle's"
     );
-    assert_eq!(&stream[..2], &[120, 156], "the RFC 1950 header");
     assert_eq!(
         first_block_type(&stream[2..]),
-        2,
-        "a dynamic-Huffman block, where the oracle emits a fixed one"
-    );
-    assert_ne!(
-        &stream[..],
-        &ORACLE[..],
-        "the bodies must differ — this is the divergence"
+        1,
+        "and the block is fixed-Huffman for the same reason"
     );
 
-    // The trailer is the big-endian Adler-32 of the *payload*, so the stream is a
-    // conforming RFC 1950 stream whatever block the encoder chose. Both streams carry
-    // the same 2-byte header and the same trailer — only the body differs.
     let trailer = u32::from_be_bytes(stream[stream.len() - 4..].try_into().expect("four bytes"));
     assert_eq!(trailer, fx.adler32(&data), "the RFC 1950 Adler-32 trailer");
-    assert_eq!(
-        &ORACLE[..2],
-        &stream[..2],
-        "both streams open with the same RFC 1950 header"
-    );
-    assert_eq!(
-        &ORACLE[ORACLE.len() - 4..],
-        &stream[stream.len() - 4..],
-        "both streams close with the same Adler-32 trailer"
-    );
 
     assert_eq!(
         fx.uncompress(&stream).expect("this crate's stream"),
@@ -314,16 +287,10 @@ fn a_repetitive_body_diverges_in_size_but_stays_a_valid_stream_both_ways() {
         "the oracle's fixed-Huffman stream must inflate here too"
     );
 
-    // The same divergence for a medium body: `list_to_binary(lists:seq(1,100))` is a
-    // 108-byte fixed-Huffman stream in the oracle and a 111-byte stored-block stream here
-    // (miniz_oxide 0.9.1 at level 6); the round trip holds regardless.
+    // `list_to_binary(lists:seq(1,100))`: 108 bytes in the oracle, and here.
     let seq: Vec<u8> = (1..=100u8).collect();
     let ours = fx.compress(&seq);
-    assert_eq!(
-        ours.len(),
-        111,
-        "miniz_oxide's size for this body (oracle: 108)"
-    );
+    assert_eq!(ours.len(), 108, "the oracle's size for this body");
     assert_eq!(
         fx.uncompress(&ours).expect("round trip"),
         seq,
@@ -740,9 +707,9 @@ fn unzip_cross_checks_the_live_oracle() {
             *data,
             "the oracle's stream {index} must inflate to its payload"
         );
-        // … and for the first payload the oracle's bytes are this crate's too: miniz's
-        // raw DEFLATE is zlib's for `<<"hello">>` (the goldens above pin the same thing
-        // without an oracle).
+        // … and for the first payload the oracle's bytes are this crate's too: the port
+        // of zlib's raw DEFLATE is zlib's for `<<"hello">>` (the goldens above pin the
+        // same thing without an oracle).
         if index == 0 {
             assert_eq!(fx.zip(data), *stream);
         }
@@ -836,8 +803,9 @@ fn gzip_and_gunzip_cross_check_the_live_oracle() {
     }
 
     // Direction 2: this crate's `gzip/1`, gunzipped by the oracle — the interoperability
-    // the gzip framing exists for. Byte identity of the deflate payload is *not*
-    // asserted (miniz_oxide differs); the oracle's own answer is.
+    // the gzip framing exists for. Byte identity of the deflate payload is asserted
+    // for the empty and `<<"hello">>` members only (the goldens above); for the rest the
+    // oracle's own answer is.
     let mut ours = Vec::new();
     for (index, data) in payloads.iter().enumerate() {
         let member = fx.gzip(data);

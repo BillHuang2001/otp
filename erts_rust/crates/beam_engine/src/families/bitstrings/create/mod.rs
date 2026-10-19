@@ -105,8 +105,9 @@
 //! roster, so a per-append call would itself be an O(#payloads) regression. The resulting
 //! curve is amortised, not quadratic: 64 KiB of 512-byte appends from a 1 KiB hint costs 2
 //! in-place grows + 4 moves and copies 61 440 bytes in total (`create/grow_tests.rs`).
-//! `compact()` is deliberately not on the append path — there is no "accumulator finished"
-//! signal, and compacting per append would re-introduce the quadratic behaviour.
+//! `Machine::retain_refc_binaries` (the host's reachability pruning) is deliberately not on
+//! the append path — there is no "accumulator finished" signal, and pruning per append
+//! would re-introduce the quadratic behaviour.
 //!
 //! What stays unmodelled (typed results only, never a wrong value):
 //! `BIN_FLAG_WRITABLE`/`BIN_FLAG_ACTIVE_WRITER` introspection,
