@@ -41,7 +41,12 @@
 //!    **closure** built with `make_fun3` and boxed free variables) each move off the fragment onto
 //!    the receiver heap and stay `=:=` their source,
 //! 8. [`Fragments::move_into`] gives up **no** fragment's off-heap ownership until the whole chain
-//!    has moved: a mid-move failure leaves the chain intact.
+//!    has moved: a mid-move failure leaves the chain intact,
+//! 9. the **traversal collapse** of the oversized path (structurally, never by wall clock): the
+//!    fragment is reserved from the receiver-heap refusal's own exact destination price — one
+//!    pricing walk and one fragment copy, with no re-copy and no separate `size_object` walk — a
+//!    fitting payload never fragments, a non-`Message` failure propagates without a fragment, and a
+//!    forged cyclic payload is a typed refusal rather than a hang.
 
 use beam_alloc::{Heap, RefcBinary};
 use beam_common::{AllocKind, BeamError};
@@ -809,4 +814,182 @@ fn a_failed_move_into_leaves_the_chain_intact() {
         "source + fragment A + the partial destination copy"
     );
     assert_eq!(dst.used(), size_of_copy(with_mso), "root A's words were written");
+}
+
+// ---------------------------------------------------------------------------
+// 9. The oversized-message retry prices the payload exactly once
+// ---------------------------------------------------------------------------
+
+/// The destination words a copy of `payload` needs, read off the refusals' own figure — the
+/// `AllocFailure::requested` byte count the message-heap exhaustion carries.
+fn refused_price_words(error: &BeamError) -> usize {
+    match error {
+        BeamError::Alloc(failure) => {
+            assert_eq!(failure.kind, AllocKind::Message, "not a message-heap refusal: {error:?}");
+            let word = core::mem::size_of::<Eterm>();
+            assert_eq!(failure.requested % word, 0, "the figure is a whole number of words");
+            failure.requested / word
+        }
+        other => panic!("expected a message allocation failure, got {other:?}"),
+    }
+}
+
+/// A payload whose **copy price is smaller than its `size_object` count**: `{Literal, 9}`, where the
+/// literal-area child is shared by identity and therefore costs no destination word.
+///
+/// The two numbers differ (`size_of_copy` = 7 source words, the copy = 3 destination words), which
+/// is what makes the fragment's capacity an observable witness of *which* figure sized it: the
+/// refusal's own price, or a separate `size_object` walk.
+fn literal_child_payload(src: &mut Heap) -> Eterm {
+    let inner = src
+        .tuple(&[make_small(1), make_small(2), make_small(3)])
+        .expect("the inner tuple fits");
+    let literal = make_literal(inner);
+    src.tuple(&[literal, make_small(9)]).expect("the outer tuple fits")
+}
+
+/// The fragmented send reserves the fragment from the **receiver-heap refusal's own figure** and one
+/// copy fills it: no re-run of the copy, no separate `size_object` sizing walk.
+///
+/// Structurally pinned, with no timing: for a literal-carrying payload the copier's price (3 words)
+/// is strictly smaller than `size_object` (7 words), so a fragment sized by `size_object` — what the
+/// pre-collapse path did — would report `capacity() == 7` while writing `used() == 3`. After the
+/// collapse `capacity() == used() == the refusal's figure`, i.e. the fragment is neither
+/// over-reserved nor under-reserved, which can only happen if the reservation came from the exact
+/// price the refusal already carried.
+#[test]
+fn a_fragmented_send_is_reserved_from_the_refusals_own_exact_price() {
+    let mut src = Heap::new(32).expect("source heap");
+    let payload = literal_child_payload(&mut src);
+    let from = make_small(0);
+
+    // The source count and the copy price genuinely differ for this shape.
+    assert_eq!(size_of_copy(payload), 7, "`size_object`: outer tuple + the literal's interior");
+    let price = 3;
+
+    let src_off = OffHeapTable::new();
+    let mut dst_off = OffHeapTable::new();
+
+    // 1. The plain send's refusal already carries the exact destination price, in bytes.
+    let mut to_heap = Heap::new(1).expect("far too small for the payload");
+    let mut queue = Queue::new();
+    let error = {
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        send(from, payload, &mut to_heap, &mut queue, &mut ctx).expect_err("the payload cannot fit")
+    };
+    assert_eq!(refused_price_words(&error), price, "the refusal reports the exact copy price");
+    assert!(queue.is_empty(), "a refused send enqueues nothing");
+    assert_eq!(to_heap.used(), 0, "a refused send writes nothing");
+
+    // 2. `send_fragmented` reserves exactly that figure (not `size_object`, not the hint) and the
+    //    single copy fills it.
+    let mut queue = Queue::new();
+    {
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        send_fragmented(from, payload, &mut to_heap, &mut queue, &mut ctx, 0)
+            .expect("the fragmented send succeeds");
+    }
+    let message = queue.peek().expect("one queued message");
+    let fragments = message.fragments().expect("a fragmented message");
+    assert_eq!(fragments.len(), 1, "one fragment, never a chain");
+    assert_eq!(fragments.total_used_words(), price, "the copy wrote exactly the priced words");
+    let only = fragments.iter().next().expect("one fragment");
+    assert_eq!(only.capacity(), price, "reserved from the refusal's own figure");
+    assert_eq!(only.used(), price, "the whole payload, in one copy");
+    assert_eq!(only.available(), 0, "the reservation is exact: nothing spare, nothing missing");
+    assert_ne!(
+        only.capacity(),
+        size_of_copy(payload),
+        "the fragment was NOT sized by a separate `size_object` walk"
+    );
+    assert_eq!(only.roots(), &[message.payload()], "the payload root is in the fragment");
+    assert!(only.contains(message.payload()), "the payload points into the fragment");
+    assert!(
+        compare::eq(payload, message.payload(), &AtomTable::new()),
+        "the fragment-resident payload is structurally equal to the source"
+    );
+    assert_eq!(to_heap.used(), 0, "the abandoned trial committed no receiver-heap word");
+    assert!(dst_off.is_empty(), "the fragment path never touches the receiver's off-heap table");
+}
+
+/// A payload that **fits** the receiver heap still lands there: the fragment path is reached only by
+/// a message-heap refusal, never pre-emptively.
+#[test]
+fn a_payload_that_fits_the_receiver_heap_is_never_fragmented() {
+    let mut src = Heap::new(32).expect("source heap");
+    let payload = build_list(&mut src, &[make_small(1), make_small(2), make_small(3)]);
+    let needed = size_of_copy(payload);
+    assert_eq!(needed, 6, "three cons cells");
+
+    let mut to_heap = Heap::new(needed).expect("exactly enough for the payload");
+    let mut queue = Queue::new();
+    let src_off = OffHeapTable::new();
+    let mut dst_off = OffHeapTable::new();
+    {
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        send_fragmented(make_small(0), payload, &mut to_heap, &mut queue, &mut ctx, 0)
+            .expect("the ordinary receiver-heap copy succeeds");
+    }
+
+    assert_eq!(to_heap.used(), needed, "the whole payload is on the receiver heap");
+    let message = queue.peek().expect("one queued message");
+    assert!(message.fragments().is_none(), "a fitting payload is never fragmented");
+    assert!(on_heap(&to_heap, message.payload()), "the payload lives in the receiver heap");
+    assert!(
+        compare::eq(payload, message.payload(), &AtomTable::new()),
+        "the heap-resident payload is structurally equal to the source"
+    );
+}
+
+/// Any failure that is **not** a message-heap exhaustion propagates unchanged — no fragment is built
+/// and nothing is enqueued.
+///
+/// The fixture is a copy failure the crate classes differently: an off-heap reference container
+/// whose slot no source table holds (the malformed-graph `BadArg`), on a receiver heap with room to
+/// spare so the refusal cannot be a capacity one.
+#[test]
+fn a_non_message_failure_propagates_and_fragments_nothing() {
+    let mut src = Heap::new(8).expect("source heap");
+    let container = bin_ref(&mut src, 3);
+    let src_off = OffHeapTable::new();
+    let mut dst_off = OffHeapTable::new();
+    let mut to_heap = Heap::new(8).expect("room to spare: the failure is not a capacity one");
+    let mut queue = Queue::new();
+
+    let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+    match send_fragmented(make_small(0), container, &mut to_heap, &mut queue, &mut ctx, 0) {
+        Err(BeamError::BadArg) => {}
+        other => panic!("expected the malformed-graph BadArg, got {other:?}"),
+    }
+    assert!(queue.is_empty(), "no fragment path for a non-message failure");
+    assert_eq!(to_heap.used(), 0, "the refused copy wrote no receiver-heap word");
+    assert!(dst_off.is_empty(), "and registered no off-heap object");
+}
+
+/// A forged **cyclic** payload is refused as a typed error by the fragmented send too — on every
+/// hint — instead of hanging the fragment sizing. The test returning at all is the "never hangs"
+/// evidence; it is prompt because the one pricing walk detects the back-edge itself.
+#[test]
+fn a_forged_cyclic_payload_is_refused_by_the_fragmented_send() {
+    let mut src = Heap::new(8).expect("source heap");
+    let cyclic = src.cons(make_small(1), NIL).expect("the cons fits");
+    // SAFETY: `heap.cons` just reserved this cell, which the heap exclusively owns; `cyclic` is the
+    // tagged pointer to it, so `list_val(cyclic).add(1)` is the cell's own `cdr` word. The write
+    // makes the graph cyclic on purpose — exactly the malformed payload the guard must survive.
+    unsafe { *list_val(cyclic).add(1) = cyclic };
+    let src_off = OffHeapTable::new();
+    let mut to_heap = Heap::new(4).expect("a receiver heap the payload cannot fit");
+
+    for hint in [0usize, 64] {
+        let mut dst_off = OffHeapTable::new();
+        let mut queue = Queue::new();
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        match send_fragmented(make_small(0), cyclic, &mut to_heap, &mut queue, &mut ctx, hint) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("expected BadArg for a forged cycle (hint={hint}), got {other:?}"),
+        }
+        assert!(queue.is_empty(), "no message was enqueued (hint={hint})");
+        assert_eq!(to_heap.used(), 0, "the refused copy wrote nothing (hint={hint})");
+        assert!(dst_off.is_empty(), "and registered no off-heap object (hint={hint})");
+    }
 }

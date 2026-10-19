@@ -58,7 +58,8 @@ pub fn copy_struct_shared(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>)
     // The flat word count is a safe upper bound on the shared copy's size, so the same preflight
     // as `copy_struct` applies: the common exhaustion is attributed to the message heap
     // (`AllocKind::Message`) up front rather than surfacing mid-copy as a bare heap failure — and a
-    // forged cyclic graph is a typed error (via `preflight_words`), never an unbounded walk.
+    // forged cyclic graph is a typed error (the preflight's one walk detects the back-edge itself),
+    // never a hang.
     let needed = preflight_words(term, to.available(), ctx)?;
     if to.available() < needed {
         return Err(error::heap_exhausted(needed));

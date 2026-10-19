@@ -42,8 +42,8 @@
 //!
 //! # One traversal whenever the destination's off-heap table is empty (the single-pass fast path)
 //!
-//! The copier's default shape is **two traversals**: [`preflight_words`] sizes the graph against
-//! the destination's free words, then [`shallow`] + the worklist loop write it. A destination whose
+//! The copier's default shape is **two traversals**: [`preflight_words`] prices the whole graph in
+//! one walk, then [`shallow`] + the worklist loop write it. A destination whose
 //! **off-heap table** holds nothing in any of its three lists (no MSO handle, no refc binary, no
 //! node reference) has no partially-built state a failed attempt could not wholly roll back, and is
 //! the shape the common case actually has (a fresh
@@ -94,25 +94,31 @@
 //! Every other shape keeps the canonical answer, including a `SUB_BITS` **match context**, whose
 //! `beam_term::layout::object_words` already *is* the flattened window [`copy_match_context`] writes.
 //!
-//! # Cycle guard on the preflight
+//! # One sizing walk, and the cycle guard on it
 //!
 //! A term the engine builds is always acyclic, but a *forged* term (a raw write into the heap)
-//! can point back at one of its own ancestors, and an unbounded walk of such a graph would loop
-//! forever (or exhaust memory). [`preflight_words`] therefore takes the **bounded** form of the
-//! shared walk, `size_object_bounded_with`: a graph that fits `limit` is sized exactly, and one that
-//! does not is either **too large** — the walk is re-run unbounded for the exact count, so the
-//! caller's refusal is total, never a partial write — or **cyclic**, which the walk itself
-//! distinguishes at the same policy ([`TermError::TermGraphCyclic`]), so the copier maps it to a typed
-//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) instead of hanging. The fast path inherits
-//! the same guarantee from the other direction: its trial target hands out only the destination's
-//! finite free words, so a forged cycle exhausts them (in at most `available / 2` objects), the
-//! attempt is abandoned and the preflight path re-derives the typed `BadArg`.
+//! can point back at one of its own ancestors, and a naive walk of such a graph would loop
+//! forever (or exhaust memory). [`preflight_words`] therefore runs the shared walk **unbounded**
+//! (`limit = usize::MAX`), the one mode in which the walk detects the back-edge itself through its
+//! DFS path set and reports [`TermError::TermGraphCyclic`] — which the copier maps to a typed
+//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) instead of hanging. That single walk is
+//! also **exact**: at `usize::MAX` the running total saturates rather than passing the limit, so
+//! the walk's over-limit arm is unreachable and an acyclic graph always comes back with its true
+//! destination price. One walk is the whole gate: the caller compares that figure against the
+//! destination's free words, and — on the fragment path — reuses the very same figure to size the
+//! message buffer (see [`crate::send_fragmented`]). This is the C's shape, two walks per send
+//! (`size_object_litopt` then `copy_struct_litopt`, `erl_message.c:771,797,839,860`).
+//!
+//! The fast path inherits the same guarantee from the other direction: its trial target hands out
+//! only the destination's finite free words, so a forged cycle exhausts them (in at most
+//! `available / 2` objects), the attempt is abandoned and the preflight path re-derives the typed
+//! `BadArg`.
 
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::error::TermError;
 use beam_term::prelude::*;
-use beam_term::size::{size_object_bounded_with, size_object_with, SizingPolicy};
+use beam_term::size::{size_object_bounded_with, SizingPolicy};
 
 use crate::layout;
 use crate::off_heap::OffHeapTable;
@@ -329,27 +335,49 @@ impl SizingPolicy for CopyPricing<'_> {
     }
 }
 
-/// Sizes the **destination** for a copy of `term` against a destination holding `limit` free words,
-/// returning the flat word count to reserve — the copy engine's destination-capacity gate.
+/// Prices the **destination** for a copy of `term`, returning the flat word count to reserve — the
+/// copy engine's destination-capacity gate, in **exactly one traversal** of the graph.
 ///
-/// The count is [`CopyPricing`]'s over `beam_term::size`'s **bounded** walk
-/// (`size_object_bounded_with`), which is both exact and total:
+/// The count is [`CopyPricing`]'s over `beam_term::size`'s walk, run **unbounded**
+/// (`size_object_bounded_with(term, usize::MAX, …)`), which is both exact and total in that one
+/// pass:
 ///
-/// * a graph whose copy fits `limit` is sized exactly, by an allocation-free bounded walk that
-///   cannot hang;
-/// * a graph that does not fit is either **cyclic** — a typed
-///   [`BeamError::BadArg`](beam_common::BeamError::BadArg), never a hang — or simply too big, in
-///   which case the same policy's walk is re-run **unbounded** for the exact count.
+/// * an **acyclic** graph comes back exact — the walk's over-limit arm cannot fire at
+///   `usize::MAX` (the running total saturates instead of passing the limit), so `Complete(n)` is
+///   the true destination price for a graph that fits *and* for one that does not. That matters
+///   for the refusal: the typed [`AllocKind::Message`](beam_common::AllocKind) failure carries this
+///   exact figure as its `requested` byte count, and [`crate::send_fragmented`] sizes the message
+///   buffer from it, so a bounded accept/too-large split would only have to re-walk for the same
+///   number;
+/// * a **cyclic** or otherwise malformed graph is a typed
+///   [`BeamError::BadArg`](beam_common::BeamError::BadArg), never a hang: the unbounded walk is
+///   exactly the mode whose DFS path set is what detects a back-edge
+///   ([`TermError::TermGraphCyclic`]).
 ///
-/// Either way the caller compares the result against `limit`: a graph the bounded walk accepted is
-/// guaranteed `<= limit`, and a rejected one yields a count **above** `limit`, so the caller's
-/// refusal is total and never leaves a partial write.
-pub(crate) fn preflight_words(term: Eterm, limit: usize, ctx: &CopyContext<'_>) -> Result<usize> {
+/// One walk costs `O(objects visited)` time and, like every `beam_term::size` walk, two heap
+/// allocations: the explicit-stack `Vec` (one frame per pending step) and the DFS path-set
+/// `HashSet`, which allocates on its first insert and holds one entry per object on the current
+/// path. It is *not* allocation-free, and there is no second or third traversal behind it — this is
+/// the whole gate.
+///
+/// The caller compares the returned figure against the destination's free words
+/// ([`copy_struct`] does: `to.available() < needed` ⇒ `heap_exhausted(needed)`, so the refusal is
+/// total and never leaves a partial write).
+///
+/// `limit` is the caller's capacity target and is **not consulted**, deliberately: the figure must
+/// be exact whether or not the graph fits, so bounding the walk could only buy an early refusal
+/// that then has to be re-priced. It stays in the signature because it is the capacity the caller
+/// is gating against, and because the recorded equivalence oracle (`copy_reference`) drives both
+/// this walk and the retired bounded one at every limit from `0` to past each graph's exact count.
+pub(crate) fn preflight_words(term: Eterm, _limit: usize, ctx: &CopyContext<'_>) -> Result<usize> {
     let policy = CopyPricing { ctx };
-    match size_object_bounded_with(term, limit, &policy) {
-        Ok(n) => Ok(n),
+    match size_object_bounded_with(term, usize::MAX, &policy) {
+        Ok(words) => Ok(words),
+        // The only error the unbounded walk can report (see above): a back-edge, i.e. a forged or
+        // otherwise malformed graph.
         Err(TermError::TermGraphCyclic) => Err(crate::error::bad_term()),
-        Err(TermError::TermGraphTooLarge) => Ok(size_object_with(term, &policy)),
+        // Unreachable today (`usize::MAX` cannot be exceeded), kept so a future change to
+        // `beam_term::size`'s verdict machinery surfaces as a typed error rather than a wrong count.
         Err(e) => Err(e.into()),
     }
 }
@@ -689,9 +717,10 @@ pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Res
     // surfacing mid-copy as a bare heap failure — and so a graph too large for `to` is refused
     // **before** any word is written (the destination is left untouched).
     //
-    // `preflight_words` prices the graph with the copier's own `SizingPolicy` — not
-    // `beam_term::size_object`, which sizes the source graph — and bounds that walk by `to`'s
-    // capacity, so a forged cyclic graph is a typed error instead of an unbounded walk.
+    // `preflight_words` prices the graph in ONE walk with the copier's own `SizingPolicy` — not
+    // `beam_term::size_object`, which sizes the source graph — and that walk is the one mode that
+    // also detects a forged cyclic graph (a typed error instead of a hang). The comparison below is
+    // the gate: the figure is exact, and the refusal carries it.
     let needed = preflight_words(term, to.available(), ctx)?;
     if to.available() < needed {
         return Err(crate::error::heap_exhausted(needed));
