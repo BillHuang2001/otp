@@ -334,14 +334,38 @@ Why the workloads changed. `bench_list_walk` is `walk/1` → `walk/3` → `sum/1
 `deallocate 1`, `return`) — so the gate removes every IR-block prologue publish. `to_lower/2` has the same
 shape (`bs_start_match4`, `bs_match`, `allocate 2 3`, then every `Y` access).
 
-**Residual — the remaining `jit_publish_y` self time is the continuation sub-blocks.** A call's continuation
-is emitted as its own range `[pc+1, next continuation address)`, whose `Allocation` sees no `allocate` (it
-sits *before* the `call`), so `prologue_publishes_y` is true there and the sub-block publishes. `list_walk`
-has two such ranges per element (after `walk/3`'s `call sum/1` and after `sum/1`'s recursive `call`), i.e.
-exactly half of the four publishes per element it paid before — which is what the flat profile shows
-`jit_publish_y` dropping by. Closing that needs a range-crossing witness (the enclosing block's prefix, or
-the callee's frame discipline), not this gate; the static census's `y_prologue_publishes` vs `y_blocks` is
-the counter a next lever has to move.
+**The remaining `jit_publish_y` self time (the continuation sub-blocks) is NOT a live lever — the
+range-crossing witness was evaluated and is rejected.** A call's continuation is emitted as its own range
+`[pc+1, next continuation address)`, whose `Allocation` sees no `allocate` (it sits *before* the `call`), so
+`prologue_publishes_y` is true there and the sub-block publishes; `list_walk` has two such ranges per element
+(after `walk/3`'s `call sum/1` and after `sum/1`'s recursive `call`). A **range-crossing witness** — a
+`JitRuntime` flag meaning "the published `[y_base, y_end)` already belongs to the frame the next range will
+run in", set wherever the window is derived and cleared wherever the frame or the position can change
+without republishing — does eliminate most of those derivations: over the `jit::bench` workload set on this
+tier, `publish_y_skips = 325/640` (**51 %**) and `refresh_y_skips = 960/960` (**100 %**), i.e. **80 %** of
+the 1600 derivations. It is still rejected, on two independent grounds.
+1. **It is a net regression.** Paired retired-user-instruction A/B (7 rounds, side order alternated,
+   `taskset -c 3`, one process at a time, load band 5.6–28.2): `list_walk` **+1.15 %** (post/pre min
+   1.011495, median 1.011502, zero leg overlap) against `cowboy_bstr` **−0.05 %** (min 0.999229, median
+   0.999515, legs overlapping — 4–6× below the 0.3 % keep bar). `list_walk`'s hot path is linked
+   `call_last`/`call_only` chains, so `jit_tail_call` (which *must* clear — it pops a frame) charges a store
+   per element while each successor prologue still derives: ≈+1 retired instruction per element. Only
+   long-block code like `to_lower/1` reaches the skips, and there the effect is inside the noise.
+2. **Its invalidation set cannot be made exhaustive in-node.** `runtime.rs::fold_step` encodes `Step::Next`
+   and `Step::Goto { pc: pc + 1 }` as the **same** block-ABI word, so a **family raise whose catch handler
+   is its own `pc + 1`** is folded into an in-block continue; the block then runs off its end and
+   `emit/link.rs::emit_exit` links **straight into the handler block**, so no driver-loop iteration runs
+   between `Machine::unwind_to_frame` (which truncates `machine.frames` *and* `machine.stack`) and the
+   handler. A handler `Y` read then resolves through the destroyed frame's window: observed interpreter
+   `11` vs this tier `59` (`0x3B` — a word read past the truncated stack). Closing it needs either a
+   family-`Goto` block-ABI word distinct from `encode_target(func, pc + 1)` or an invalidation on that
+   route, i.e. a change in the family arm (`family.rs`/`emit/family.rs`) plus the shared `fold_step`.
+`raise_tier_tests.rs` pins that shape as a **frame-discipline** requirement. It passes today because the two
+emitted window derivations (the block prologue's publish and the gated in-block refresh after a family
+helper) are **both unconditional** — a variant that made either one conditional alone still read correctly,
+and only making both conditional diverged — so any future lever that makes a window derivation, the
+`Machine::set_current_code` store or the reduction charge depend on prior state must close the `pc + 1` hole
+first. `y_prologue_publishes` vs `y_blocks` is therefore **not** a counter to move.
 
 Flat profile, `list_walk`, `perf record -e cpu_core/cycles/u -g --call-graph fp`, 73 945 samples, self time
 (`perf report --no-children`): `jit_allocate` **16.63 %**, `Machine::local_call_seam` 11.25 % (sibling-owned),
@@ -388,6 +412,7 @@ The node's newer suites are `#[path]` submodules of `tests.rs` (so they keep `te
 - `family_tests.rs` — the family-owned constructors (`the_family_owned_constructors_agree_across_the_tiers`, a family raise identical on both tiers, `the_family_owned_constructors_are_lowered_without_a_jit_step_one_deopt`, and a family-built term reaching a later native read through the cache refill).
 - `tail_exit_tests.rs` — the unlinked tail-call path (`emit/link.rs::emit_tail_exit_to_driver`: forward/backward/self tail calls, a raise inside the tail callee, a frame-size mismatch, an undefined label keeping the interpreter's error, and `the_unlinked_tail_exit_records_no_call_last_deopt`).
 - `y_operand_tests.rs` — the Y-operand `test`/`select_val`/`select_tuple_arity` lowerings, asserting tier agreement and the `Loc` gate (`the_y_gate_is_true_for_a_y_source_and_false_for_an_x_source`).
+- `raise_tier_tests.rs` — the **frame-discipline** pin `a_raise_at_its_own_pc_plus_one_reads_the_enclosing_frames_y_slot`: `allocate 2` (frame A) → `y(0) := 11` → `try` → `allocate 1` (frame B) → `case_end` raising → the handler at the raise's **own `pc + 1`** → `try_case` → `y(0) → x(0)`. Asserts this tier returns `11` (not the destroyed frame's word), `step_one == 0` (nothing is masked by an interpreter step), and interpreter/baseline agreement. `fold_step` encodes `Step::Next` and `Step::Goto { pc: pc + 1 }` identically, so the raising block links straight into the handler block with **no** driver iteration between the unwind and the handler; the read is correct only because both emitted window derivations are unconditional (see `## Measured`).
 - `operand_tests.rs` — `the_move_deopt_breakdown_over_the_corpus_is_printed`, the move-shape deopt census.
 - `bif_tests.rs` — the named-BIF fast paths (its own `bif_host()` supplies the interpreter tier's BIF semantics, since no BIF is engine-native). Per lowered accessor a tier-equivalence value test plus its deopt shapes: `hd_is_lowered_to_the_cons_read` / `element_is_lowered_to_the_tuple_read` / `tuple_size_is_lowered_to_the_tuple_header_read`, with `the_declined_bif_shapes_raise_the_interpreters_badarg` (non-cons, non-tuple, `element(0, T)`/`element(9, {a})`, non-immediate index); `the_bitwise_and_shift_gc_bifs_are_lowered_to_the_bifs_value`, `the_bitwise_fast_path_agrees_with_the_bif_over_a_small_grid`, `the_bsr_count_bounds_are_exact_on_both_tiers` (`0`/`64`/negative/register counts), `the_declined_bitwise_and_shift_shapes_are_the_interpreters_outcome` (bignum/float); `byte_size_is_lowered_to_the_bit_size_rounded_up` / `length_is_lowered_to_the_proper_list_walk` / `the_collecting_value_bifs_are_lowered_on_both_tiers`, with `the_declined_value_bif_shapes_raise_the_interpreters_badarg` and `the_declined_collecting_value_shapes_raise_the_interpreters_badarg` (non-bitstring, improper list, a bignum constant); the Y-operand shapes (`the_y_operand_shapes_are_lowered_and_agree_across_the_tiers`, `the_value_bif_y_operand_shapes_agree_across_the_tiers`, `the_bitwise_gc_bif_y_operand_shape_agrees_across_the_tiers`); and the three structural pins `the_lowered_bif_fast_paths_record_no_static_deopt` / `the_lowered_value_bif_fast_paths_record_no_static_deopt` / `the_lowered_bitwise_gc_bifs_record_no_static_deopt`.
 - `emit/test/refusal_census.rs` (`#[cfg(test)] mod refusal_census` from `emit/test.rs`) — `the_refusal_attribution_census_is_printed`, attributing `test`/`select_val`/`select_tuple_arity` refusals to exact predicates/operand shapes and listing the `bif`/`gc_bif`/`bif0` deopt pools by BIF name. The pools are **self-maintaining**: `already_inlined(module, instr)` consults the emitters' real shape predicates (`comparison_shape`/`fast_arith`/`bif_shape`) rather than a name allowlist, so a newly lowered name leaves its pool automatically (the `bif0` pool has no arm to consult — nothing lowers `Bif0`).
