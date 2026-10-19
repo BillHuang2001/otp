@@ -1125,7 +1125,9 @@ fn a_binary_named_only_by_a_pending_timer_survives_the_eval_statement_prune_byte
         .unwrap_or_else(|error| panic!("the pending-timer expression failed: {error:?}"));
     let answer = runtime
         .format_term_w(value, None)
-        .expect("the witnesses format");
+        .expect("the witnesses format")
+        .trim()
+        .to_string();
     let stats = runtime.eval_off_heap_stats();
     let oracle_line =
         support::oracle_eval(&toolchain.oracle, Some(&toolchain.fixture.dir), &{
