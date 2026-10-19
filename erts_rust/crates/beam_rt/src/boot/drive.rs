@@ -394,7 +394,9 @@ pub(super) fn apply_boot_call(
             match outcome {
                 // `init` discards an `apply` directive's value, exactly as it discards `-s`'s.
                 RunOutcome::Returned(_) => return Ok(()),
-                RunOutcome::Wait { func, pc } => {
+                // A BIF park re-executes its own instruction once the host re-enters, so it is
+                // driven exactly like a `receive` park: one scheduler round, then resume.
+                RunOutcome::Wait { func, pc } | RunOutcome::Suspend { func, pc } => {
                     // The process suspended in a `receive`: let the scheduler advance (the
                     // boot-spawned process that must answer it is on the run queue), then resume
                     // the same machine at the reported address.

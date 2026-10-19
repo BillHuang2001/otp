@@ -8394,7 +8394,6 @@ fn the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve() {
         full.published_words,
         full.declared_words,
         full.reached,
-        full.machine_words as f64 / full.reached as f64,
     );
     assert!(
         rooted.published_words <= rooted.declared_words,

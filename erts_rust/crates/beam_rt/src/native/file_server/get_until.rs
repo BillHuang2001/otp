@@ -318,7 +318,7 @@ impl EngineContinuation<'_> {
             // The oracle would leave the *device process* blocked in the user function's
             // `receive` until a message arrives; a native service process cannot suspend
             // mid-request, so this is the typed gap rather than a fabricated `{more, …}`.
-            RunOutcome::Wait { .. } => Err(error::unsupported(
+            RunOutcome::Wait { .. } | RunOutcome::Suspend { .. } => Err(error::unsupported(
                 "file_server: the `{get_until,…}` continuation suspended in a `receive`",
             )),
         }

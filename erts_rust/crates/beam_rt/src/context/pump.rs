@@ -130,7 +130,7 @@ where
     loop {
         match outcome {
             RunOutcome::Returned(value) => return Ok(value),
-            RunOutcome::Wait { func, pc } => {
+            RunOutcome::Wait { func, pc } | RunOutcome::Suspend { func, pc } => {
                 if Instant::now() >= deadline {
                     return Err(error::message(format!(
                         "blocking pump: the scheduler was still runnable after {} ms",
@@ -572,7 +572,8 @@ impl<'a> RuntimeContext<'a> {
                 let outcome = machine.resume_outcome(module, func, pc, self)?;
                 match outcome {
                     RunOutcome::Returned(_) => return Ok(Some(outcome)),
-                    RunOutcome::Wait { func: f, pc: p } => {
+                    RunOutcome::Wait { func: f, pc: p }
+                    | RunOutcome::Suspend { func: f, pc: p } => {
                         // The machine re-parked. If it is no longer waiting on **this** receive
                         // (the message arrived and its body blocked in a new one), hand the new
                         // position back to the driver: it re-enters here and recovers the new

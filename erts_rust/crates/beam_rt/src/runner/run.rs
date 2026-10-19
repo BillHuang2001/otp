@@ -1416,6 +1416,41 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 }
                 Ok(RunOutcome::Wait)
             }
+            Ok(EngineRunOutcome::Suspend { func, pc }) => {
+                // A BIF park (`BifOutcome::Suspend`): the machine stopped on its own instruction
+                // without applying it, and re-executing that instruction after the yield is the
+                // whole protocol — the operand reads are pure and the writes success-only, so the
+                // parked state is exactly `(func, pc)` plus the machine's root set, with no
+                // Rust-local state to keep alive. This is the C's `ERTS_BIF_YIELD*` re-run
+                // (`erts/emulator/beam/bif.c`, `erl_bif_port.c:205-220`).
+                //
+                // The process stays **runnable** rather than `Waiting`: nothing has to be
+                // delivered for it to proceed, the scheduler's next round is what re-issues the
+                // BIF (a busy port's driver `output`/`timeout` callback is where the state it
+                // waits on clears). `RunOutcome::Yield` is therefore the right verdict, and the
+                // BIF's own deadline (e.g. `port::busy_wait::BUSY_PORT_DEADLINE`) bounds the
+                // retries instead of a spin.
+                if let Some(outcome) = self.take_max_heap_kill(pid) {
+                    return Ok(outcome);
+                }
+                if crate::debug_trace::enabled() {
+                    crate::debug_trace::trace(format_args!(
+                        "process {pid:?} yielded (BIF suspend) parked=+{pc} (func {func})"
+                    ));
+                }
+                engine.parked = Some((func, pc));
+                engine.parked_timeout = None;
+                // The window is publisher-or-exempt on the same rule the pre-emption arm uses:
+                // a live FR prefix carries the exemption (nothing may move the heap), otherwise
+                // the whole root set is published so a collection driven by another process
+                // relocates exactly what is live.
+                park_machine(table, pid, &mut engine, fr_count, fr_count > 0);
+                self.runtime.serve_gc_request(table, pid);
+                self.state.engines.insert(pid, engine);
+                #[cfg(test)]
+                note_slice_parked(true);
+                Ok(RunOutcome::Yield)
+            }
             Err(error) => {
                 // A `max_heap_size` kill latched in the same slice the process raised is
                 // **performed**, so the exit reason and its propagation are the real ones. The
